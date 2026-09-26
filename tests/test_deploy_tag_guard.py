@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -48,7 +49,11 @@ import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-from tools.engine.deploy_tag import deployable_tag_at, refresh_and_check_deployable_tag_at
+from tools.engine.deploy_tag import (
+    deployable_tag_at,
+    parse_timeout_seconds,
+    refresh_and_check_deployable_tag_at,
+)
 from tools.engine.flows import upgrade_flow, _apply_marketplace_rebuilt
 from tools.engine.steps import run_flow, Done, Paused, Failed
 from tools.engine.cli import build_command
@@ -67,6 +72,41 @@ def _git(args: list[str], cwd: str, check: bool = True) -> subprocess.CompletedP
 
 def _checkout(repo: str, ref: str) -> None:
     _git(["checkout", "-q", ref], repo)
+
+
+def _process_is_running(pid: int) -> bool:
+    """Return whether a known fixture PID is still live (not a zombie)."""
+    status = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True
+    )
+    return status.returncode == 0 and not status.stdout.strip().startswith("Z")
+
+
+class _TrackedPipe:
+    """Minimal fake pipe recording whether close() was called -- used to
+    verify the #3133 fold #1 pipe-lifecycle fix (one finally around the
+    ENTIRE killpg+wait sequence, not just wait())."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _kill_fixture_process_group(pid: int) -> None:
+    """Kill only the process group containing our PID-file fixture child."""
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return
+    # The PID comes only from the fake SSH fixture.  It must never resolve to
+    # pytest's shared group; that would make a broken fixture unsafe to clean.
+    if pgid != os.getpgrp():
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -229,51 +269,342 @@ class TestDeployableTagAtPurePredicate:
 
 
 class TestRefreshAndCheckWrapper:
-    def test_successful_fetch_then_check(self, tmp_path):
+    def test_successful_fetch_then_check_is_quiet(self, tmp_path, capsys):
         repo, commits = _make_ancestry_repo(tmp_path)
         _checkout(repo, "v1.0.0-a")
         assert refresh_and_check_deployable_tag_at(repo, timeout=5.0) == "v1.0.0-a"
+        assert capsys.readouterr().err == ""
 
-    def test_missing_origin_remote_falls_through_no_crash(self, tmp_path):
+    def test_missing_origin_remote_warns_then_falls_through_no_crash(self, tmp_path, capsys):
         """Fetch fails (no 'origin' configured) -> falls through to
         deployable_tag_at() against local refs (also absent) -> None, and
         the call must not raise."""
         repo = _make_simple_repo(tmp_path, tags=["v1.0.0-solo"], configure_origin=False)
         assert refresh_and_check_deployable_tag_at(repo, timeout=5.0) is None
+        stderr = capsys.readouterr().err
+        assert stderr.count("WARNING") == 1
+        assert "LOCAL cached refs" in stderr
 
-    def test_broken_origin_url_falls_through_to_stale_but_valid_local_refs(self, tmp_path):
+    def test_broken_origin_url_warns_and_falls_through_to_cached_valid_local_refs(
+        self, tmp_path, capsys
+    ):
         """Fetch fails (origin URL now broken) but the ALREADY-fetched local
         origin/dev ref from fixture setup is still genuinely accurate (no
         reversion happened) -- the wrapper still grants the exception, since
         deployable_tag_at() trusts whatever local refs currently exist. This
-        is the documented, accepted design for the ENGINE's wrapper (#3092
-        design decision) -- the shell script's own caller is the stricter,
-        fetch-gated one; see install-local-marketplace.sh."""
+        is the documented, accepted design for the shared wrapper used by
+        both engine and shell callers (#3133)."""
         repo, commits = _make_ancestry_repo(tmp_path)
         _checkout(repo, "v1.0.0-a")
         _git(["remote", "set-url", "origin", str(tmp_path / "does-not-exist.git")], repo)
         assert refresh_and_check_deployable_tag_at(repo, timeout=5.0) == "v1.0.0-a"
+        stderr = capsys.readouterr().err
+        assert stderr.count("WARNING") == 1
+        assert "LOCAL cached refs" in stderr
 
-    def test_hanging_fetch_is_bounded_by_timeout(self, tmp_path, monkeypatch):
-        """A hanging fetch (fake ssh transport that sleeps) must be bounded
-        by the timeout= kwarg, not hang the caller -- subprocess.run's own
-        timeout=, not a reimplementation of bash's timeout/gtimeout dance."""
+    def test_launch_oserror_warns_then_uses_cached_predicate(self, monkeypatch, capsys):
+        """A failure to create git is the launch-only offline fallback."""
+        from tools.engine import deploy_tag
+
+        def cannot_launch(*args, **kwargs):
+            raise OSError("git is unavailable")
+
+        predicate_calls = []
+
+        def cached_predicate(repo_path, head):
+            predicate_calls.append((repo_path, head))
+            return "v1.0.0-cached"
+
+        monkeypatch.setattr(deploy_tag.subprocess, "Popen", cannot_launch)
+        monkeypatch.setattr(deploy_tag, "deployable_tag_at", cached_predicate)
+
+        assert (
+            refresh_and_check_deployable_tag_at("not-a-repository", head="cached-head")
+            == "v1.0.0-cached"
+        )
+        assert predicate_calls == [("not-a-repository", "cached-head")]
+        stderr = capsys.readouterr().err
+        assert stderr.count("WARNING") == 1
+        assert "could not start" in stderr
+
+    def test_timeout_cleanup_permission_error_fails_without_cached_fallback(
+        self, monkeypatch, capsys
+    ):
+        """Cleanup failure is not evidence that a refresh never launched --
+        and the capture pipes must still close on this path (#3133 fold #1:
+        one finally around the ENTIRE killpg+wait sequence, not just wait).
+        This is the cleanup-closure test: under the pre-fold shape (finally
+        wrapped only wait()), a genuine killpg OSError raises RuntimeError
+        before that inner finally is ever reached, leaking both pipes."""
+        from tools.engine import deploy_tag
+
+        class TimedOutProcess:
+            pid = 12345
+
+            def __init__(self):
+                self.stdout = _TrackedPipe()
+                self.stderr = _TrackedPipe()
+
+            def communicate(self, timeout):
+                raise subprocess.TimeoutExpired(["git", "fetch"], timeout)
+
+            def wait(self, timeout):
+                raise AssertionError("must not reap after group cleanup failed")
+
+        process_holder: dict[str, Any] = {}
+
+        def make_process(*args, **kwargs):
+            process = TimedOutProcess()
+            process_holder["process"] = process
+            return process
+
+        predicate_calls = []
+
+        def cached_predicate(*args):
+            predicate_calls.append(args)
+            return "v1.0.0-cached"
+
+        monkeypatch.setattr(deploy_tag.subprocess, "Popen", make_process)
+        monkeypatch.setattr(
+            deploy_tag.os,
+            "killpg",
+            lambda *args: (_ for _ in ()).throw(PermissionError("cleanup denied")),
+        )
+        monkeypatch.setattr(deploy_tag, "deployable_tag_at", cached_predicate)
+
+        with pytest.raises(RuntimeError, match="cleanup"):
+            refresh_and_check_deployable_tag_at("not-a-repository", timeout=0.1)
+        assert predicate_calls == []
+        assert capsys.readouterr().err == ""
+        process = process_holder["process"]
+        assert process.stdout.closed is True
+        assert process.stderr.closed is True
+
+    def test_timeout_cleanup_wait_failure_still_closes_pipes(self, monkeypatch, capsys):
+        """Reaping the direct child after a successful group-kill can itself
+        time out -- the RuntimeError must still propagate, and the capture
+        pipes must still close before it does (#3133 fold #1's finally
+        covers this branch too, not only the killpg-OSError branch above).
+        This branch was already inside the pre-fold finally, so it is added
+        coverage rather than a fold-#1 discriminator."""
+        from tools.engine import deploy_tag
+
+        class TimedOutProcess:
+            pid = 12345
+
+            def __init__(self):
+                self.stdout = _TrackedPipe()
+                self.stderr = _TrackedPipe()
+
+            def communicate(self, timeout):
+                raise subprocess.TimeoutExpired(["git", "fetch"], timeout)
+
+            def wait(self, timeout):
+                raise subprocess.TimeoutExpired(["git", "wait"], timeout)
+
+        process_holder: dict[str, Any] = {}
+
+        def make_process(*args, **kwargs):
+            process = TimedOutProcess()
+            process_holder["process"] = process
+            return process
+
+        predicate_calls = []
+
+        def cached_predicate(*args):
+            predicate_calls.append(args)
+            return "v1.0.0-cached"
+
+        monkeypatch.setattr(deploy_tag.subprocess, "Popen", make_process)
+        monkeypatch.setattr(deploy_tag.os, "killpg", lambda *args: None)
+        monkeypatch.setattr(deploy_tag, "deployable_tag_at", cached_predicate)
+
+        with pytest.raises(RuntimeError, match="could not reap"):
+            refresh_and_check_deployable_tag_at("not-a-repository", timeout=0.1)
+        assert predicate_calls == []
+        assert capsys.readouterr().err == ""
+        process = process_holder["process"]
+        assert process.stdout.closed is True
+        assert process.stderr.closed is True
+
+    @pytest.mark.parametrize(
+        "killpg_effect",
+        [
+            pytest.param(lambda *a: None, id="normal-timeout"),
+            pytest.param(
+                lambda *a: (_ for _ in ()).throw(ProcessLookupError()),
+                id="already-gone",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("predicate_result", "expected_return"),
+        [
+            pytest.param("v1.0.0-cached", "v1.0.0-cached", id="predicate-passes"),
+            pytest.param(None, None, id="predicate-refuses"),
+        ],
+    )
+    def test_timeout_cleanup_then_local_predicate_result_closes_pipes_once(
+        self, monkeypatch, capsys, killpg_effect, predicate_result, expected_return
+    ):
+        """A successfully cleaned-up timeout (freshly killed, or the group
+        was already gone) retains the local-ref contract regardless of what
+        the local predicate decides -- including refusal (#3133 fold #3: a
+        timeout plus a refusing local predicate must return None, call the
+        predicate exactly once, and still print exactly one bounded
+        warning). Also covers fold #1's positive controls: both capture
+        pipes must close exactly once on this path too."""
+        from tools.engine import deploy_tag
+
+        class TimedOutProcess:
+            pid = 12345
+
+            def __init__(self):
+                self.stdout = _TrackedPipe()
+                self.stderr = _TrackedPipe()
+
+            def communicate(self, timeout):
+                raise subprocess.TimeoutExpired(["git", "fetch"], timeout)
+
+            def wait(self, timeout):
+                return 0
+
+        process_holder: dict[str, Any] = {}
+
+        def make_process(*args, **kwargs):
+            process = TimedOutProcess()
+            process_holder["process"] = process
+            return process
+
+        predicate_calls = []
+
+        def local_predicate(*args):
+            predicate_calls.append(args)
+            return predicate_result
+
+        monkeypatch.setattr(deploy_tag.subprocess, "Popen", make_process)
+        monkeypatch.setattr(deploy_tag.os, "killpg", killpg_effect)
+        monkeypatch.setattr(deploy_tag, "deployable_tag_at", local_predicate)
+
+        assert (
+            refresh_and_check_deployable_tag_at("not-a-repository", timeout=0.1)
+            == expected_return
+        )
+        assert len(predicate_calls) == 1
+        process = process_holder["process"]
+        assert process.stdout.closed is True
+        assert process.stderr.closed is True
+        stderr = capsys.readouterr().err
+        assert stderr.count("WARNING") == 1
+        assert "timed out" in stderr
+
+    @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+    def test_hanging_fetch_kills_owned_ssh_child_and_falls_through(self, tmp_path):
+        """Timeout kills this call's private fetch group, not only git.
+
+        The fake SSH helper leaves a child holding inherited descriptors.  A
+        direct-child-only timeout either leaves that child running or blocks
+        waiting for its pipe; both are failures.  The outer runner and the
+        fixture PID-file cleanup make a mutant failure bounded and safe.
+        """
         repo, commits = _make_ancestry_repo(tmp_path)
         _checkout(repo, "v1.0.0-a")
         fake_ssh = tmp_path / "fake-ssh.sh"
-        fake_ssh.write_text("#!/usr/bin/env bash\nexec sleep 9999\n")
+        child_pid_file = tmp_path / "fake-ssh-child.pid"
+        fake_ssh.write_text(
+            "#!/usr/bin/env bash\n"
+            "sleep 30 &\n"
+            "child=$!\n"
+            "printf '%s\\n' \"$child\" > \"$FAKE_SSH_CHILD_PID_FILE\"\n"
+            "wait \"$child\"\n"
+        )
         fake_ssh.chmod(0o755)
         _git(["remote", "set-url", "origin", "ssh://localhost/nonexistent-repo.git"], repo)
-        monkeypatch.setenv("GIT_SSH_COMMAND", str(fake_ssh))
 
+        runner = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from tools.engine.deploy_tag import "
+                    "refresh_and_check_deployable_tag_at; "
+                    f"print(refresh_and_check_deployable_tag_at({repo!r}, timeout=0.2))"
+                ),
+            ],
+            cwd=REPO_ROOT,
+            env={
+                **os.environ,
+                "GIT_SSH_COMMAND": str(fake_ssh),
+                "FAKE_SSH_CHILD_PID_FILE": str(child_pid_file),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
         start = time.monotonic()
-        result = refresh_and_check_deployable_tag_at(repo, timeout=2.0)
-        elapsed = time.monotonic() - start
+        try:
+            try:
+                stdout, stderr = runner.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                # A broken implementation must not leave this test's outer
+                # runner or fake-SSH process group alive.
+                os.killpg(runner.pid, signal.SIGKILL)
+                runner.wait(timeout=2)
+                pytest.fail("wrapper did not return after its 0.2s timeout")
+            elapsed = time.monotonic() - start
+            assert runner.returncode == 0, stderr
+            assert elapsed < 3, f"took {elapsed:.1f}s -- fetch was not bounded"
+            assert stdout.strip() == "v1.0.0-a"
+            assert stderr.count("WARNING") == 1
+            assert "LOCAL cached refs" in stderr
+            assert child_pid_file.exists(), "fake SSH child did not start"
+            child_pid = int(child_pid_file.read_text().strip())
+            assert not _process_is_running(child_pid), (
+                "timeout returned while its owned fake-SSH child still ran"
+            )
+        finally:
+            # In a direct-kill-only mutant, the PID-file child remains in the
+            # wrapper's private group; clean only that known fixture group.
+            if child_pid_file.exists():
+                _kill_fixture_process_group(int(child_pid_file.read_text().strip()))
+            try:
+                os.killpg(runner.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
-        assert elapsed < 8, f"took {elapsed:.1f}s -- fetch was not bounded"
-        # Falls through to local (stale-but-still-valid, never actually
-        # re-fetched after fixture setup) refs -> still returns the tag.
-        assert result == "v1.0.0-a"
+    @pytest.mark.parametrize(
+        ("raw", "seconds"),
+        [
+            ("2", 2.0),
+            ("2s", 2.0),
+            ("0.5m", 30.0),
+            ("1h", 3600.0),
+            ("0.01d", 864.0),
+        ],
+    )
+    def test_parse_timeout_seconds_accepts_positive_decimal_and_gnu_suffixes(
+        self, raw, seconds
+    ):
+        assert parse_timeout_seconds(raw) == seconds
+
+    @pytest.mark.parametrize("raw", ["", "s", "0", "-1", "nan", "inf", "-inf", "2ms"])
+    def test_parse_timeout_seconds_rejects_invalid_values(self, raw):
+        with pytest.raises(ValueError, match="invalid timeout"):
+            parse_timeout_seconds(raw)
+
+    @pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf"), float("-inf")])
+    def test_wrapper_rejects_non_positive_or_non_finite_timeout_before_fetch(
+        self, monkeypatch, timeout
+    ):
+        from tools.engine import deploy_tag
+
+        def fetch_must_not_start(*args, **kwargs):
+            raise AssertionError("invalid timeout reached fetch")
+
+        monkeypatch.setattr(deploy_tag.subprocess, "Popen", fetch_must_not_start)
+        with pytest.raises(ValueError, match="invalid timeout"):
+            refresh_and_check_deployable_tag_at("not-a-repository", timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
