@@ -193,6 +193,10 @@
       "tier": "essential"
     },
     {
+      "path": "engramd_client.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_confidence.py",
       "tier": "essential"
     },
