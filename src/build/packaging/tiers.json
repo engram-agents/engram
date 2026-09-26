@@ -627,6 +627,12 @@
       "note": "rec-4 unified before/after in-turn-recall measurement harness (#266 / #1780) -- measurement/benchmarking tool for ENGRAM-development use, same class as (and reuses) tools/recall_repetition_analysis.py. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly to avoid a false dangling-source flag."
     },
     {
+      "path": "tools/write_op_census.py",
+      "tier": "dev",
+      "source": "tools/write_op_census.py",
+      "note": "call-path write-operation census generator (#3095, phase-1 build unit U2 of #2652) -- a static-analysis measurement tool for ENGRAM-development use, same class as tools/recall_repetition_analysis.py. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly to avoid a false dangling-source flag."
+    },
+    {
       "path": "tools/deference_baseline.py",
       "tier": "dev"
     },
