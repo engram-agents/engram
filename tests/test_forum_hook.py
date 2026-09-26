@@ -967,10 +967,17 @@ class _TricklingServer:
     convergence on raw sockets is itself mild evidence it's the only way.
     """
 
-    def __init__(self, nbytes_before_stall: int, gap: float, content_length: int = 10000):
+    def __init__(
+        self,
+        nbytes_before_stall: int,
+        gap: float,
+        content_length: int = 10000,
+        closing: bool = False,
+    ):
         self._nbytes_before_stall = nbytes_before_stall
         self._gap = gap
         self._content_length = content_length
+        self._closing = closing
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind(("127.0.0.1", 0))
@@ -998,8 +1005,10 @@ class _TricklingServer:
             return
         try:
             conn.recv(4096)
+            close_header = "Connection: close\r\n" if self._closing else ""
             conn.sendall(
-                f"HTTP/1.1 200 OK\r\nContent-Length: {self._content_length}\r\n\r\n".encode()
+                f"HTTP/1.1 200 OK\r\n{close_header}"
+                f"Content-Length: {self._content_length}\r\n\r\n".encode()
             )
             for _ in range(self._nbytes_before_stall):
                 if self._stop.is_set():
@@ -1134,6 +1143,208 @@ def test_shared_deadline_checked_between_reads_not_just_between_calls():
         f"trickle's own 30s length (measured: 34.49s for that mutation), "
         f"because the between-CALLS deadline check never gets a chance to "
         f"fire while one .read(4096) call is trapped looping internally"
+    )
+
+
+class _ClosingResponseServer:
+    """Raw-socket server: sends a valid 200 with `Connection: close` and a
+    real JSON body, then closes its end of the socket immediately after the
+    last byte — the actual shape a real server (measured live against this
+    repo's own forum, engram-alpha#3143) uses, not a mocked keep-alive
+    connection. This is the shape that makes CPython's http.client null out
+    `HTTPConnection.sock` before the caller's own read loop ever runs: once
+    `getresponse()`'s internal `begin()` sees `Connection: close` and a
+    fully-satisfiable Content-Length, it marks the response `will_close` and
+    tears down the connection's socket right there, well before the caller
+    gets a chance to read the body.
+
+    Raw socket, not http.server.BaseHTTPRequestHandler, for the same reason
+    _TricklingServer above is raw: a buffered handler doesn't reproduce a
+    server actually closing its end of the wire the instant it's done, which
+    is exactly the condition under test.
+    """
+
+    def __init__(self, body: bytes):
+        self._body = body
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(1)
+        self._sock.settimeout(10)
+        self.port = self._sock.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=2)
+
+    def _serve(self):
+        try:
+            conn, _ = self._sock.accept()
+        except OSError:
+            return
+        try:
+            conn.recv(4096)
+            header = (
+                f"HTTP/1.1 200 OK\r\nConnection: close\r\n"
+                f"Content-Length: {len(self._body)}\r\n\r\n"
+            ).encode()
+            conn.sendall(header + self._body)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def test_fetch_with_deadline_handles_a_real_closing_response(monkeypatch):
+    """gh#3143: a real `Connection: close` response (measured live against
+    this repo's own forum server) leaves `HTTPConnection.sock` as `None`
+    immediately after `getresponse()` returns -- BEFORE `_fetch_with_deadline`'s
+    read loop ever runs. The loop's unconditional `conn.sock.settimeout(...)`
+    at the top of every iteration then raises `AttributeError: 'NoneType'
+    object has no attribute 'settimeout'`, caught by the function's own bare
+    `except Exception: return None` -- silently returning None exactly like
+    any genuine failure, indistinguishable to every caller from a real
+    timeout or a dead server.
+
+    Written before the fix landed: this test must FAIL (result is None,
+    where it should be the real body) against the code as shipped in #3110,
+    and PASS once the settimeout() call is guarded on `conn.sock is not
+    None`. See this test file's own mutation-control convention (the
+    _TricklingServer tests above) -- the mutation here is simply reverting
+    the guard, which the PR body verifies separately reddens exactly this
+    test and no other.
+    """
+    hook = _load_hook()
+    body = b'{"threads": [{"id": 431, "title": "gh3143 regression body"}]}'
+    server = _ClosingResponseServer(body=body)
+    server.start()
+    try:
+        url = f"http://127.0.0.1:{server.port}/api/threads"
+        deadline = time.monotonic() + 5.0
+        result = hook._fetch_with_deadline(url, deadline, per_op_cap=2.0)
+    finally:
+        server.stop()
+
+    assert result == body, (
+        f"expected the real Connection:close body to come through intact, "
+        f"got {result!r} -- a None here means the AttributeError on "
+        f"conn.sock.settimeout(None-check-missing) was silently swallowed "
+        f"by the bare except, exactly gh#3143's reported symptom"
+    )
+
+
+def test_fetch_with_deadline_handles_a_zero_length_closing_response(monkeypatch):
+    """Narrower sibling of the test above, isolating the SPECIFIC shape that
+    makes CPython null the socket synchronously inside getresponse() itself
+    (measured directly: a zero-length body triggers this even before the
+    read loop's first iteration, not merely after the last chunk) -- the
+    most immediate trigger for the reported AttributeError, and a real shape
+    a forum endpoint can return (e.g. a 200 with an empty JSON array
+    serialized to zero bytes is not this repo's actual behavior, but a
+    HEAD-shaped or 204-adjacent empty-body 200 is a legitimate HTTP
+    response this client must not crash on).
+    """
+    hook = _load_hook()
+    server = _ClosingResponseServer(body=b"")
+    server.start()
+    try:
+        url = f"http://127.0.0.1:{server.port}/api/threads"
+        deadline = time.monotonic() + 5.0
+        result = hook._fetch_with_deadline(url, deadline, per_op_cap=2.0)
+    finally:
+        server.stop()
+
+    assert result == b"", (
+        f"a zero-length Connection:close body is a valid empty success "
+        f"response, not a failure -- got {result!r}"
+    )
+
+
+def test_closing_response_mid_body_stall_still_bounded_by_remaining_budget():
+    """gh#3143 round 2 (Aleph's + Mira's colleague-review correction): the
+    first fix guarded `conn.sock.settimeout(...)` on `conn.sock is not None`
+    -- which made the two tests above pass, but is wrong in a way neither of
+    them could catch, because neither has a body still arriving after
+    `getresponse()` returns. On a `Connection: close` response, `conn.sock`
+    goes `None` immediately (per CPython's own http.client source: this
+    "effectively passes the connection to the response", not "the body is
+    already fully buffered") -- the response keeps reading from the SAME
+    socket object, with real network reads still ahead of it. Guarding on
+    `conn.sock` skips the re-arm entirely from that point on, freezing every
+    subsequent read1() at whatever timeout the connection was constructed
+    with -- so a mid-body stall on a Connection:close response can overshoot
+    the shared deadline by up to one full `per_op_cap`, the exact class of
+    unbounded-block #3107 exists to prevent, just gated behind a different
+    trigger (any Connection:close response, not merely a slow trickle).
+
+    Measured directly against the guarded form (Aleph, PR review on
+    883e5ac9): per_op_cap=1.5, budget=3.0, a fast trickle draining most of
+    the budget then a genuine (indefinite) stall -- guarded elapsed 4.376s
+    (overshoot +1.376s); capturing the socket before getresponse() and
+    re-arming that captured reference instead: 3.003s (overshoot +0.003s).
+    This test reproduces that shape at smaller, CI-friendly numbers, tuned
+    (per this file's own test_shared_deadline_bounds_a_trickling_fetch
+    docstring on why this matters) so the remaining budget at the moment of
+    the stall is meaningfully SMALLER than per_op_cap -- otherwise a frozen
+    fixed-at-construction cap and a correctly-shrinking one land close
+    enough together that jitter alone can make a wrong fix look right (the
+    exact trap that test's own docstring names, and that an earlier,
+    looser-toleranced version of THIS test fell into: it passed under both
+    the correct fix and the wrong guarded one).
+
+    Written to redden against the guarded fix and pass once the socket is
+    captured BEFORE getresponse() and that captured reference is re-armed
+    unconditionally (no `is not None` check needed, since the object itself
+    never becomes None -- only the `conn.sock` attribute pointing at it
+    does).
+    """
+    hook = _load_hook()
+    per_op_cap = 0.5
+    budget = 1.0
+    # Trickle 16 bytes at 0.05s/byte (~0.8s) -- draining budget down to
+    # ~0.2s remaining, well under per_op_cap=0.5s -- THEN a genuine
+    # indefinite stall (the server's built-in behavior once nbytes_before_
+    # stall is exhausted: hold the connection open, send nothing further).
+    # Correct fix: the between-reads recheck shrinks the next settimeout()
+    # toward the ~0.2s actually remaining, aborting near budget (~1.0s
+    # total). Guarded/frozen fix: the connection's timeout stays at its
+    # CONSTRUCTION-time value (min(per_op_cap, budget) = 0.5s, computed
+    # before any bytes were read), so the stalled read -- starting at
+    # ~0.8s -- doesn't time out until ~0.8+0.5 = 1.3s, a clearly
+    # distinguishable ~0.3s past this test's tolerance.
+    server = _TricklingServer(nbytes_before_stall=16, gap=0.05, closing=True)
+    server.start()
+    try:
+        url = f"http://127.0.0.1:{server.port}/api/threads"
+        deadline = time.monotonic() + budget
+        t0 = time.monotonic()
+        result = hook._fetch_with_deadline(url, deadline, per_op_cap)
+        elapsed = time.monotonic() - t0
+    finally:
+        server.stop()
+
+    assert result is None, (
+        f"a stalled-then-abandoned Connection:close body must never "
+        f"complete -- got {result!r}"
+    )
+    assert elapsed < budget + 0.15, (
+        f"elapsed {elapsed:.2f}s overshot the {budget}s shared deadline by "
+        f"more than a small jitter margin -- a settimeout() call frozen at "
+        f"connection-construction time (guarded on conn.sock, which goes "
+        f"None immediately on a Connection:close response) would instead "
+        f"run close to the full {per_op_cap}s per-op cap regardless of how "
+        f"little budget remained, which is exactly what capturing the "
+        f"socket before getresponse() and re-arming THAT reference fixes"
     )
 
 
