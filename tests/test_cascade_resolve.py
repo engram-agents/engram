@@ -1341,6 +1341,133 @@ def test_replacement_id_required_iff_superseded():
     assert len(_markers(core, dv1, "pending")) == 1, _markers(core, dv1)
 
 
+# ---------------------------------------------------------------------------
+# #3125 — replacement_absent_because / replacement_absent_note are
+# retracted-only. The prior guard only refused them for "acknowledged", so
+# passing them alongside a "superseded" resolution was silently accepted and
+# dropped on the floor, despite the docstring's own "REQUIRED iff
+# resolution_kind is 'retracted'" contract. C1/C2 below are the gap and its
+# discriminating control; C3/C4 pin the unchanged acknowledged/retracted
+# behaviour so a later change to this guard cannot regress either without
+# being caught here.
+# ---------------------------------------------------------------------------
+
+
+def test_superseded_refuses_spurious_replacement_absent_because():
+    """C1a (the gap, now fixed). A legitimate 'superseded' resolution with a
+    valid replacement_id must still be refused if it also carries a
+    replacement_absent_because — that field is retracted-only, and silently
+    accepting it here means it is validated nowhere and simply dropped.
+    """
+    rev, obs, derive, core = _make_fresh_mods()
+
+    ob = _seed_ob(obs, "Chain premise.")
+    dv1 = _seed_dv(derive, "Direct dependent.", [ob])
+    dv1b = _seed_dv(derive, "Direct dependent, restated.", [ob])
+    json.loads(rev._retract_impl(
+        node_id=ob, error_type="hallucinated_claim", reason="wrong", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
+
+    resp = json.loads(rev._cascade_resolve_impl(
+        node_id=dv1, resolution_kind="superseded", replacement_id=dv1b,
+        replacement_absent_because="NONE_BECAUSE_NO_SUCCESSOR"))
+    assert "error" in resp, resp
+    assert "only meaningful" in resp["error"], resp
+    assert len(_markers(core, dv1, "pending")) == 1, _markers(core, dv1)
+
+
+def test_superseded_refuses_spurious_replacement_absent_note():
+    """C1b — the replacement_absent_note twin of the test above."""
+    rev, obs, derive, core = _make_fresh_mods()
+
+    ob = _seed_ob(obs, "Chain premise.")
+    dv1 = _seed_dv(derive, "Direct dependent.", [ob])
+    dv1b = _seed_dv(derive, "Direct dependent, restated.", [ob])
+    json.loads(rev._retract_impl(
+        node_id=ob, error_type="hallucinated_claim", reason="wrong", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
+
+    resp = json.loads(rev._cascade_resolve_impl(
+        node_id=dv1, resolution_kind="superseded", replacement_id=dv1b,
+        replacement_absent_note="not applicable"))
+    assert "error" in resp, resp
+    assert "only meaningful" in resp["error"], resp
+    assert len(_markers(core, dv1, "pending")) == 1, _markers(core, dv1)
+
+
+def test_superseded_with_only_replacement_id_still_accepted():
+    """C2 — the discriminating control. A legitimate 'superseded' resolution
+    that supplies ONLY replacement_id (no replacement_absent_* fields) must
+    stay accepted. This is the test that goes RED under the naive/wrong fix
+    shape (widening the single existing acknowledged-only check to
+    `resolution_kind != "retracted"` across all three fields) — that
+    widening would also catch replacement_id itself and refuse every
+    legitimate superseded resolve, since superseded REQUIRES replacement_id.
+    """
+    rev, obs, derive, core = _make_fresh_mods()
+
+    ob = _seed_ob(obs, "Chain premise.")
+    dv1 = _seed_dv(derive, "Direct dependent.", [ob])
+    dv1b = _seed_dv(derive, "Direct dependent, restated.", [ob])
+    json.loads(rev._retract_impl(
+        node_id=ob, error_type="hallucinated_claim", reason="wrong", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
+
+    resp = json.loads(rev._cascade_resolve_impl(
+        node_id=dv1, resolution_kind="superseded", replacement_id=dv1b))
+    assert "error" not in resp, resp
+    assert resp["resolution_kind"] == "superseded", resp
+
+
+def test_acknowledged_still_refuses_all_three_replacement_fields():
+    """C3 — unchanged behaviour. This should already pass without any code
+    change to the guard under test: it is a regression guard confirming the
+    acknowledged-side check was not accidentally loosened while fixing the
+    gap above.
+    """
+    rev, obs, derive, core = _make_fresh_mods()
+
+    ob = _seed_ob(obs, "Original premise.", quote_type="official_statement")
+    ob2 = _seed_ob(obs, "Refined premise.", quote_type="editorial")
+    dv1 = _seed_dv(derive, "Depends on the premise.", [ob])
+    json.loads(rev._supersede_impl(
+        old_node_id=ob, new_node_id=ob2, supersede_reason="refined"))
+
+    with_id = json.loads(rev._cascade_resolve_impl(
+        node_id=dv1, resolution_kind="acknowledged", replacement_id=ob2))
+    assert "error" in with_id, with_id
+    assert "only meaningful" in with_id["error"], with_id
+
+    with_because = json.loads(rev._cascade_resolve_impl(
+        node_id=dv1, resolution_kind="acknowledged",
+        replacement_absent_because="NONE_BECAUSE_NO_SUCCESSOR"))
+    assert "error" in with_because, with_because
+    assert "only meaningful" in with_because["error"], with_because
+
+    with_note = json.loads(rev._cascade_resolve_impl(
+        node_id=dv1, resolution_kind="acknowledged",
+        replacement_absent_note="not applicable"))
+    assert "error" in with_note, with_note
+    assert "only meaningful" in with_note["error"], with_note
+
+    assert len(_markers(core, dv1, "pending")) == 1, _markers(core, dv1)
+
+
+def test_retracted_with_replacement_absent_because_still_accepted():
+    """C4 — unchanged behaviour on the retracted path, following the same
+    fixture/acceptance shape as
+    test_retract_resolution_opens_no_new_DERIVATION_cascade_event above."""
+    rev, obs, derive, core = _make_fresh_mods()
+
+    ob = _seed_ob(obs, "Chain premise.")
+    dv1 = _seed_dv(derive, "Direct dependent.", [ob])
+    json.loads(rev._retract_impl(
+        node_id=ob, error_type="hallucinated_claim", reason="wrong", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
+
+    resp = json.loads(rev._cascade_resolve_impl(
+        node_id=dv1, resolution_kind="retracted",
+        replacement_absent_because="NONE_BECAUSE_NO_SUCCESSOR"))
+    assert "error" not in resp, resp
+    assert resp["resolution_kind"] == "retracted", resp
+
+
 def test_unmarked_and_non_current_nodes_are_refused():
     rev, obs, derive, core = _make_fresh_mods()
     ob = _seed_ob(obs, "Premise.")

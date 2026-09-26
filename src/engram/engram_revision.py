@@ -1422,6 +1422,23 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
                      f"resolution_kind is 'superseded' or 'retracted' "
                      f"(got {resolution_kind!r}).",
         })
+    # #3125: replacement_absent_because / replacement_absent_note are
+    # retracted-only (per this function's own docstring in server.py:
+    # "only meaningful when resolution_kind is 'retracted'") — a SEPARATE
+    # rule from the replacement_id check above, which is meaningful for both
+    # 'superseded' and 'retracted'. Do NOT fold this into the acknowledged
+    # check above by widening it to `resolution_kind != "retracted"` across
+    # all three fields — replacement_id is REQUIRED for 'superseded' (the
+    # check a few lines above), so that widening would refuse every
+    # legitimate superseded resolve.
+    if resolution_kind != "retracted" and (
+        replacement_absent_because or replacement_absent_note
+    ):
+        return json.dumps({
+            "error": f"replacement_absent_because / replacement_absent_note "
+                     f"are only meaningful when resolution_kind is "
+                     f"'retracted' (got {resolution_kind!r}).",
+        })
 
     conn = core._get_db()
     try:
