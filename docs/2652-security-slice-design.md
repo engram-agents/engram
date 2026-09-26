@@ -518,11 +518,19 @@ SELECT n FROM plain WHERE n > ?                READ (plain,n)                   
 It reuses the authorizer machinery P6 already depends on, so it adds no second instrument. **Scope, stated
 because this part is not measured by me:** the vec0 row is **not** first-hand. On the author's seat vec0
 cannot load at all — the interpreter lacks `enable_load_extension`, and ENGRAM's loader then disables the
-vector backend silently (a separate finding, to be filed) — so whether a vec0 read surfaces as a
-`SQLITE_READ` event at prepare time is **unverified**. The *rule* does not depend on that (vec0 is a
-virtual table, so it gets no implicit safety); only the automatic *detection* does. Until it is measured,
-registration **also** denies any template whose text names a virtual table from `sqlite_master` — a token
-match that can over-deny but never under-deny.
+vector backend silently (filed as #3142) — so the author has not measured whether a
+vec0 read surfaces as a `SQLITE_READ` event at prepare time. **Mira has, on Linux** (SQLite 3.45.1,
+sqlite-vec 0.1.9, a one-row `vec0(embedding float[2])` table): an auditing authorizer records
+`SQLITE_READ` on the real vec0 table for a direct `MATCH` + `k` query, the same through a table alias,
+and through an ordinary view wrapping it. That supports schema-crossed detection on that runtime,
+including indirection; it does not establish every module or platform. The *rule* does not depend on
+it (vec0 is a virtual table, so it gets no implicit safety); only the automatic *detection* does.
+
+**The audited schema route is authoritative.** Registration **also** denies any template whose text
+names a virtual table from `sqlite_master`, but that token match is a **backstop, not a proof**: a
+lexical match can miss a table reached through quoting or a view, so it makes **no** never-under-deny
+claim. When the audited classification is incomplete — the authorizer pass cannot account for every
+table a template reads — registration **fails closed** and denies.
 
 **Both examples are now negative registration cases** (§5 test 21).
 
@@ -599,7 +607,7 @@ one above — revision 1 conflated the two.
 | write-capable `PRAGMA` | authorizer denies action 19 | P6, P13; ⚠ see the caveat below |
 | stacked statements | the owner uses `execute()`, which refuses them, and **never** calls `executescript`; no statement built by concatenation | P11 refused, **P12** permits — hence the rule |
 | a template matching only because of its parameters | **DOES apply** at a virtual-table boundary | **P14** — §3.5 |
-| **resource exhaustion** (fifth) | **three bounds on three axes, none sufficient alone** (revision 5): a `progress_handler` bounds VM-instruction cost; `SQLITE_LIMIT_LENGTH` bounds allocation; **one end-to-end request deadline** bounds wall clock across frame I/O | reviewer (cartesian, `zeroblob`); me (per-op socket timeout, `setlimit`) — see below |
+| **resource exhaustion** (fifth) | **three bounds on three axes, none sufficient alone** (revision 5): a `progress_handler` bounds VM-instruction cost; `SQLITE_LIMIT_LENGTH` bounds the size of any **single** string, blob or row (not total memory); **one end-to-end request deadline** bounds wall clock across frame I/O | reviewer (cartesian, `zeroblob`); me (per-op socket timeout, `setlimit`) — see below |
 
 ⚠ **The `PRAGMA` caveat, and revision 1's remedy for it was unsafe.** The authorizer sees
 `SQLITE_PRAGMA` for *every* pragma, read-only ones included, so denying the code denies harmless
@@ -637,8 +645,10 @@ fix, measured: setlimit(SQLITE_LIMIT_LENGTH, 1_000_000) -> zeroblob(8 MB) refuse
 
 So the owner sets **`SQLITE_LIMIT_LENGTH`** (and considers `SQLITE_LIMIT_SQL_LENGTH` for the input side)
 on the client-read connection, at a value chosen against the owner contract rather than guessed (§8).
-That bounds the **allocation class** the probe demonstrates. It is not a claim to have enumerated every
-resource a read can consume, and a small probe is not a measured denial of service.
+That bounds the **allocation class** the probe demonstrates. **Precisely: it caps each single string,
+blob or row, not aggregate memory** — many values each under the cap are not bounded by it. It is not a
+claim to have enumerated every resource a read can consume, and a small probe is not a measured denial
+of service.
 
 **Wall clock across the socket is bounded by neither.** My own 18:13Z comment on this PR, now folded
 rather than left as a note: a socket timeout is **per-op**, not end-to-end. Measured on Darwin, a peer
@@ -728,7 +738,7 @@ Contract-first — each test names the mutation that must turn it red.
     connection's authorizer is **unchanged** across a snapshot. This is the test that would have caught
     revision 2's false answer.
 18. *(Retired in revision 5 — it tested option (a), which is rejected. See test 22.)*
-19. **Allocation is bounded independently of the progress handler.** `SELECT zeroblob(N)` above the
+19. **Single-value size is bounded independently of the progress handler.** `SELECT zeroblob(N)` above the
     configured `SQLITE_LIMIT_LENGTH` is refused on the client-read connection, while a result under the
     limit succeeds. *Mutation: remove the `setlimit` call — the oversized result must then be returned.*
     Include the control that makes the point: with the progress handler armed and the limit removed, the
@@ -787,7 +797,8 @@ important thing the review produced.
 | **Which connection serves `snapshot()`** (§3.1) | **Answered in revision 5 (Mira).** An owner-internal serialized/quiesced path, not the client-read path; preserves `BEGIN`/`READ`/`COMMIT`, fails loudly, never toggles the client-read authorizer. The concrete lifecycle is owed to §5 test 17. |
 | **One connection with a swapped authorizer, or two in the one owner process** (§3.1) | **DECIDED — (b), Mira's ruling.** Client-read connection permanently restrictive; no authorizer swapping. |
 | **The parent's "only open handle" wording** (§3.1) | `docs/2652-engrammanager-design.md:677` literally says one handle; (b) is two. Read as process-scoped by both author and reviewer — but **the words need clarifying by that document's owner**, and this slice does not edit it. |
-| **vec0 detection at registration** (§3.5) | The rule is decided; the automatic detection is measured for FTS5 only. vec0 cannot load on the author's seat, so whether its reads surface to the authorizer is unverified. Until measured, registration also denies any template whose text names a virtual table — over-denies, never under-denies. |
+| **vec0 detection at registration** (§3.5) | The rule is decided. Detection is measured for FTS5 (author, Darwin) and for vec0 on one runtime (Mira: Linux, SQLite 3.45.1, sqlite-vec 0.1.9 — direct, alias and view all surface). Not established for every module or platform. The schema route is authoritative; the token-match backstop can miss quoting or view indirection, so it is not a never-under-deny guarantee, and incomplete classification fails closed. |
+| **How incomplete classification is DETECTED** (§3.5) | Owed by U4, and it must be **measured**, not asserted. "Fails closed" is only as good as the check that notices a classification is incomplete; the build must show a template whose reads the audit cannot fully account for, and show that registration denies it. (Mira, at approval.) |
 | **Two new budgets with no number** (§4) | `SQLITE_LIMIT_LENGTH` and the end-to-end request deadline both need values chosen against the owner contract (§8). |
 | **Tier 2 is DEFERRED, not designed** (§3.2) | U4's own surface is 21/21 byte-stable, so tier 2 is off its path. Outline only; it gets specified by the unit that needs it. Deferring it is deliberate — revision 2 specified it speculatively and that was the larger error of the two in §3.2. |
 | **The authorizer's action allowlist is an OBLIGATION, not a finished list** (§3.1) | Owed by U4: derive it from the census plus the owner's operations, and check every denied action for a caller that swallows the denial. `SQLITE_TRANSACTION` is the first known member, not the last. |
@@ -811,6 +822,13 @@ important thing the review produced.
 ## 9. What changed, revision by revision, and who found it
 
 Recorded because a reader should be able to see which parts survived attack.
+
+### Follow-up to revision 5 — two overclaims Mira flagged at approval
+
+| § | change | found by |
+|---|---|---|
+| §3.5, §7 | **"Never under-deny" withdrawn** for the token-match fallback: a lexical match can miss quoting or view indirection. The audited schema route is authoritative, and incomplete classification fails closed. Mira's Linux vec0 control folded into the scope note. §7 gains an open item: the build must measure how incomplete classification is detected. | Mira (claim, vec0 control, open item) |
+| §4, §5 | **`SQLITE_LIMIT_LENGTH` scoped precisely**: it caps a single string, blob or row, not aggregate memory. Table row, prose and test 19's title corrected. | Mira |
 
 ### Revision 5 — answering Mira's review at `0d3aecf8`
 
