@@ -497,7 +497,7 @@ def test_cornerstone_exemplifies_edge_counts_as_live_support():
         node_id=sole_premise,
         error_type="hallucinated_claim",
         reason="Sole premise retracted — exemplifies edge should prevent support_lost.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     support_lost_ids = [n["id"] for n in ret.get("support_lost", [])]
@@ -529,7 +529,7 @@ def test_cornerstone_support_lost_when_no_exemplifies_either():
         node_id=sole_premise,
         error_type="hallucinated_claim",
         reason="Sole premise retracted — no exemplifies edge, should trigger support_lost.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     support_lost_ids = [n["id"] for n in ret.get("support_lost", [])]

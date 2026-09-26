@@ -622,13 +622,13 @@ def test_retracting_a_marked_node_is_refused_and_resolves_via_the_verb():
     refused = json.loads(rev._retract_impl(
         node_id=marked, error_type="wrong_evidence",
         reason="withdrawn rather than fixed",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" in refused and "engram_cascade_resolve" in refused["error"], refused
 
     r = json.loads(rev._cascade_resolve_impl(
         node_id=marked, resolution_kind="retracted",
         error_type="wrong_evidence", note="withdrawn rather than fixed",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in r, r
     assert r.get("resolved_marker_count") == 1, r
 

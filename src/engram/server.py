@@ -2628,6 +2628,7 @@ def engram_cascade_frontier(payload_json: str) -> str:
 # it could silently disarm the cascade on an ordinary revision.
 _CASCADE_RESOLVE_FIELDS = frozenset({
     "node_id", "resolution_kind", "replacement_id", "note", "error_type",
+    "replacement_absent_because", "replacement_absent_note",
 })
 
 
@@ -2709,8 +2710,21 @@ def engram_cascade_resolve(payload_json: str) -> str:
             resolution_kind (str, REQUIRED): one of "retracted",
                 "superseded", "acknowledged".
             replacement_id (str): REQUIRED iff resolution_kind is
-                "superseded"; refused otherwise. Must already exist — this
-                tool never creates it.
+                "superseded"; PERMITTED (not required by itself) when
+                resolution_kind is "retracted" — #2613: a retraction reached
+                through the frontier can name a successor when one
+                demonstrably exists, the normal case in a sweep. Refused for
+                "acknowledged". Must already exist — this tool never creates
+                it.
+            replacement_absent_because (str): only meaningful when
+                resolution_kind is "retracted". #2613: a replacement
+                decision is required-always on the retract path — supply
+                EITHER this OR replacement_id, never neither, never both.
+                One of: NONE_BECAUSE_NO_SUCCESSOR, NONE_BECAUSE_DUPLICATE,
+                NONE_BECAUSE_SUPERSEDED_ELSEWHERE, NONE_BECAUSE_UNKNOWN
+                (requires replacement_absent_note).
+            replacement_absent_note (str, optional): free-text note,
+                required iff replacement_absent_because='NONE_BECAUSE_UNKNOWN'.
             note (str, optional): your reasoning, recorded with the
                 resolution.
             error_type (str, optional): only read when resolution_kind is
@@ -6762,6 +6776,7 @@ def engram_supersede(payload_json: str) -> str:
 # Set of legitimate field names for the engram_retract payload.
 _RETRACT_FIELDS = frozenset({
     "node_id", "error_type", "reason", "replacement_id",
+    "replacement_absent_because", "replacement_absent_note",
     "initiation", "initiation_gate",
 })
 
@@ -6782,13 +6797,14 @@ _RETRACT_FIELDS = frozenset({
 # hallucinated_claim, duplicate, other. These name the failure modes — agents
 # can later scan-by-error-type to learn which kinds of errors they make.
 #
-# Optional replacement (replacement_id field): the retract can be paired with
-# a corrected node, named by id. #2612 retired the earlier mint-inside-
-# retraction path (a nested replacement_json field that minted the
-# replacement inline) — this is a purely relational operation, like
-# engram_supersede's new_node_id: the caller creates the replacement first,
-# via its own canonical creation tool (engram_add_observation for
-# observations), then names it here.
+# Replacement decision (#2613 — REQUIRED-ALWAYS, not optional): every
+# retraction records either replacement_id (the replacement node, already
+# created via its own canonical creation tool — #2612 retired the earlier
+# mint-inside-retraction path) or replacement_absent_because (a closed-set
+# reason nothing replaces the claim). Mutually exclusive; exactly one
+# required. The obligation attaches to the retraction EVENT (edit_history),
+# not just the optional `retracts` edge, so it is checkable even when no
+# replacement exists. See docs/2613-retraction-replacement-contract.md.
 #
 # Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
@@ -6830,14 +6846,31 @@ def engram_retract(payload_json: str) -> str:
             error_type (str, required): One of: fabricated_quote, wrong_citation,
                 wrong_evidence, hallucinated_claim, duplicate, other.
             reason (str, required): Human-readable explanation of the error.
-            replacement_id (str, optional): The replacement node's id, already
+            replacement_id (str): REQUIRED unless replacement_absent_because
+                is supplied instead (#2613 — a replacement decision is
+                always required). The replacement node's id, already
                 created via its type's canonical creation tool
                 (engram_add_observation, for observations) BEFORE calling
                 engram_retract — a purely relational operation, it does NOT
                 create a new node (matches engram_supersede's new_node_id
                 convention). Must name a node that exists, is_current=1,
-                differs from node_id, and is not older than node_id (the
-                retracts edge it lands on is temporal_causal=True).
+                differs from node_id, is not older than node_id (the
+                retracts edge it lands on is temporal_causal=True), and is
+                claim-bearing iff node_id is (a floor, not same-kind —
+                permits conjecture->derivation, refuses task->observation).
+                Mutually exclusive with replacement_absent_because.
+            replacement_absent_because (str): REQUIRED unless replacement_id
+                is supplied instead. The stated reason nothing replaces this
+                claim, one of: NONE_BECAUSE_NO_SUCCESSOR (the claim was
+                simply wrong), NONE_BECAUSE_DUPLICATE (a surviving node
+                already existed), NONE_BECAUSE_SUPERSEDED_ELSEWHERE (a
+                successor exists but is not this retraction's to name),
+                NONE_BECAUSE_UNKNOWN (no successor could be determined — the
+                escape hatch; requires replacement_absent_note).
+            replacement_absent_note (str, optional): free-text note,
+                REQUIRED iff replacement_absent_because='NONE_BECAUSE_UNKNOWN'.
+                Recorded on the retraction event in its own field — never
+                folded into reason, which is truncated at [:200].
             initiation (str, optional): Who initiated the retraction. One of:
                 user_prompted, gate_prompted, unprompted.
             initiation_gate (str, optional): Which gate triggered the

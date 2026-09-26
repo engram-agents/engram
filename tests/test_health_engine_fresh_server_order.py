@@ -62,7 +62,9 @@ def test_reported_broken_order_passes():
     # engram-alpha#2720 added 4 new tests to test_health_engine.py's
     # TestWriteSnapshot (explicit umask-independent file/dir permissions):
     # 90 -> 94.
-    assert "94 passed" in proc.stdout, proc.stdout
+    # engram-alpha#3124 (#3126) added a row_factory-independence test to
+    # test_health_engine.py: 94 -> 95.
+    assert "95 passed" in proc.stdout, proc.stdout
 
 
 def test_normal_order_still_passes():
@@ -79,7 +81,9 @@ def test_normal_order_still_passes():
     # skipped test in either file) -- that's the fix, not a sign the
     # ordering regression itself came back.
     # engram-alpha#2720: 90 -> 94 (see identical note above).
-    assert "94 passed" in proc.stdout, proc.stdout
+    # engram-alpha#3124 (#3126) added a row_factory-independence test to
+    # test_health_engine.py: 94 -> 95.
+    assert "95 passed" in proc.stdout, proc.stdout
 
 
 def test_sibling_fresh_server_file_ordering_also_passes():
@@ -98,4 +102,6 @@ def test_sibling_fresh_server_file_ordering_also_passes():
     # unrelated to this ordering regression -- see the identical note on
     # test_reported_broken_order_passes above.
     # engram-alpha#2720: 83 -> 87 (see identical note above).
-    assert "87 passed" in proc.stdout, proc.stdout
+    # engram-alpha#3124 (#3126) added a row_factory-independence test to
+    # test_health_engine.py: 87 -> 88.
+    assert "88 passed" in proc.stdout, proc.stdout

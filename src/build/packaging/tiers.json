@@ -193,6 +193,10 @@
       "tier": "essential"
     },
     {
+      "path": "engramd_client.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_confidence.py",
       "tier": "essential"
     },
@@ -1177,6 +1181,10 @@
     {
       "path": "tools/test_id_set_check.py",
       "reason": "repo-CI infrastructure consumed only by .github/workflows/pr-checks.yml's test-id-set-check step (#2350, blocking base-vs-head test-id set diff); runs in GitHub Actions, not shipped in any install tier"
+    },
+    {
+      "path": "tools/check_stubbed_signatures.py",
+      "reason": "repo-CI infrastructure consumed only by .github/workflows/pr-checks.yml's check-stubbed-signatures step (#3118, blocking bare-name-stub-affected-tests gate); runs in GitHub Actions, not shipped in any install tier"
     },
     {
       "path": "src/forum/",

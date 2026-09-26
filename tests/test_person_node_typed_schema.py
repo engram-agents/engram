@@ -871,6 +871,7 @@ def test_add_special_moment_tool_person_not_current():
         "node_id": pid,
         "error_type": "hallucinated_claim",
         "reason": "Test retraction — MCP wrapper is_current guard test.",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN", "replacement_absent_note": "test fixture -- replacement decision not under test",
     })))
     assert "error" not in retract, retract
 
@@ -900,6 +901,7 @@ def test_add_special_moment_tool_anchor_not_found_or_not_current():
         "node_id": obs_id,
         "error_type": "hallucinated_claim",
         "reason": "Test retraction — anchor not-current guard test.",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN", "replacement_absent_note": "test fixture -- replacement decision not under test",
     })))
     assert "error" not in retract, retract
 

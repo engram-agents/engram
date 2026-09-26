@@ -170,6 +170,8 @@ def test_retract_basic():
         "node_id": ob_id,
         "error_type": "fabricated_quote",
         "reason": "The quoted text was not actually in the source.",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     })
     assert ret["status"] == "retracted"
     assert ret["node_id"] == ob_id
@@ -200,6 +202,8 @@ def test_retract_invalid_error_type():
         "node_id": r["observation_id"],
         "error_type": "invalid_type",
         "reason": "Test.",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     })
     assert "error" in ret
 
@@ -238,6 +242,8 @@ def test_retract_cascades_taint():
         "node_id": r1["observation_id"],
         "error_type": "fabricated_quote",
         "reason": "Quote was fabricated.",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     })
     assert ret["tainted_count"] >= 1, f"Expected tainted downstream, got {ret}"
     tainted_ids = [t["id"] for t in ret["tainted_downstream"]]
@@ -283,6 +289,8 @@ def test_retract_multi_level_cascade():
         "node_id": r1["observation_id"],
         "error_type": "hallucinated_claim",
         "reason": "Claim was hallucinated.",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     })
     tainted_ids = [t["id"] for t in ret["tainted_downstream"]]
     assert d1["derivation_id"] in tainted_ids, "Level 1 should be tainted"
@@ -356,6 +364,8 @@ def test_reflect_shows_tainted_and_retracted():
         "node_id": r["observation_id"],
         "error_type": "fabricated_quote",
         "reason": "Test retraction.",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     })
 
     reflect = client.call("engram_reflect", {})

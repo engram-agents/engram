@@ -1796,3 +1796,19 @@ class TestCountNullEmbeddings:
         conn = _make_conn()
         with pytest.raises(ValueError, match="observations"):
             health_engine._count_null_embeddings(conn, "observations")
+
+    def test_works_on_plain_connection_without_row_factory(self):
+        """engram-alpha#3124: the real caller (the dream-master sub-agent's
+        own connection, per engram-dream-master.md) opens a PLAIN
+        sqlite3.connect(...) with row_factory left at its sqlite3 default
+        (bare tuples) -- NOT sqlite3.Row, unlike every other test in this
+        class via _make_conn(). The function's contract does not require
+        any particular row_factory; it must return the correct count on
+        both connection shapes."""
+        conn = sqlite3.connect(":memory:")
+        assert conn.row_factory is None  # explicitly NOT sqlite3.Row
+        conn.executescript(_NODES_DDL)
+        _insert(conn, "dv_1", "derivation", embedding=None)
+        _insert(conn, "dv_2", "derivation", embedding="[0.1, 0.2]")
+        _insert(conn, "ob_1", "observation_factual", embedding=None)
+        assert health_engine._count_null_embeddings(conn, "claim_bearing_nodes") == 2

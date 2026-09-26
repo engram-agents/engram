@@ -304,14 +304,26 @@ class Playbox:
             )
         )
 
-    def retract(self, node: Handle, reason: str = "", error_type: str = "other") -> dict:
-        return json.loads(
-            self._rev._retract_impl(
-                node_id=self.id_of(node),
-                error_type=error_type,
-                reason=reason or f"playbox retract {node.name}",
-            )
+    def retract(self, node: Handle, reason: str = "", error_type: str = "other",
+                replacement: Optional[Handle] = None) -> dict:
+        # #2613: a replacement decision is required-always. Scenarios that
+        # pass `replacement=` get replacement_id; everything else (the
+        # overwhelming majority of this playbox's existing call sites,
+        # which are about cascade/marker behavior, not the replacement
+        # contract) gets a neutral default so they keep testing what they
+        # were written to test.
+        replacement_id = self.id_of(replacement) if replacement is not None else ""
+        kwargs = dict(
+            node_id=self.id_of(node),
+            error_type=error_type,
+            reason=reason or f"playbox retract {node.name}",
         )
+        if replacement_id:
+            kwargs["replacement_id"] = replacement_id
+        else:
+            kwargs["replacement_absent_because"] = "NONE_BECAUSE_UNKNOWN"
+            kwargs["replacement_absent_note"] = "playbox fixture -- replacement decision not under test"
+        return json.loads(self._rev._retract_impl(**kwargs))
 
     def frontier(self, node: Optional[Handle] = None, limit: Optional[int] = None) -> dict:
         node_id = self.id_of(node) if node is not None else None
@@ -326,15 +338,19 @@ class Playbox:
         error_type: str = "other",
     ) -> dict:
         replacement_id = self.id_of(replacement) if replacement is not None else ""
-        return json.loads(
-            self._rev._cascade_resolve_impl(
-                node_id=self.id_of(node),
-                resolution_kind=kind,
-                replacement_id=replacement_id,
-                note=note,
-                error_type=error_type,
-            )
+        kwargs = dict(
+            node_id=self.id_of(node),
+            resolution_kind=kind,
+            replacement_id=replacement_id,
+            note=note,
+            error_type=error_type,
         )
+        # #2613: same required-always decision on the resolution path's
+        # 'retracted' shape as the organic retract() above.
+        if kind == "retracted" and not replacement_id:
+            kwargs["replacement_absent_because"] = "NONE_BECAUSE_UNKNOWN"
+            kwargs["replacement_absent_note"] = "playbox fixture -- replacement decision not under test"
+        return json.loads(self._rev._cascade_resolve_impl(**kwargs))
 
     # -- Assert -------------------------------------------------------------
 

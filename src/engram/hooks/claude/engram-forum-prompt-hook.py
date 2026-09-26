@@ -351,6 +351,21 @@ def _fetch_with_deadline(
         if parsed.query:
             path += "?" + parsed.query
         conn.request(method, path, body=body, headers=headers or {})
+        # gh#3143 (Mira's + Aleph's correction to this line's first draft):
+        # capture the socket BEFORE getresponse(), not after. On a
+        # `Connection: close` response, getresponse() sets conn.sock = None
+        # -- but per CPython's own http.client source, this "effectively
+        # passes the connection to the response": the response keeps
+        # reading from the SAME socket object, it has not consumed the
+        # body and there are real network reads still ahead of it. Re-arming
+        # a captured reference to that same object keeps every read1()
+        # bounded by min(per_op_cap, remaining) exactly as before; guarding
+        # the re-arm on conn.sock (this line's first, wrong draft) instead
+        # skips it entirely once conn.sock goes None, freezing every
+        # subsequent read at whatever timeout the connection started with --
+        # for a mid-body stall that is a full per_op_cap of unbounded
+        # overshoot, the exact class of failure #3107 exists to prevent.
+        sock = conn.sock
         resp = conn.getresponse()
         if resp.status < 200 or resp.status >= 300:
             return None
@@ -359,7 +374,25 @@ def _fetch_with_deadline(
             remaining = _remaining_budget(deadline)
             if remaining <= 0:
                 return None
-            conn.sock.settimeout(min(per_op_cap, remaining))
+            # The captured `sock` re-arms the timeout for as long as the
+            # underlying fd is genuinely still open -- including mid-stall
+            # on a `Connection: close` response, where the server hasn't
+            # finished sending and the fd is very much alive despite
+            # `conn.sock` already reading None (this is the property the
+            # capture exists to preserve). But once the body has been FULLY
+            # drained (the common case: a short response read to completion
+            # in one prior read1() call), HTTPResponse's own EOF handling
+            # closes the underlying fd for real on ITS next internal step --
+            # and a `settimeout()` call against an already-closed fd raises
+            # OSError ("Bad file descriptor"), not the AttributeError this
+            # function used to guard against. Swallow it here rather than
+            # via the function's own bare except below: at that point there
+            # is nothing left to bound a timeout against, and resp.read1()
+            # immediately below correctly signals EOF (b"") without one.
+            try:
+                sock.settimeout(min(per_op_cap, remaining))
+            except OSError:
+                pass
             # read1(), NOT read(): HTTPResponse.read(n) loops internally,
             # making as many underlying raw socket reads as needed to
             # accumulate n bytes (or EOF) BEFORE returning -- so the deadline

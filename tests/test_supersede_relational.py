@@ -311,6 +311,8 @@ def test_supersede_relational():
             node_id=ob_retracted,
             error_type="hallucinated_claim",
             reason="test",
+            replacement_absent_because="NONE_BECAUSE_UNKNOWN",
+            replacement_absent_note="test fixture -- replacement decision not under test",
         ))
         ob_replacement = _mk_observation("Replacement")
         r = json.loads(engram_revision._supersede_impl(ob_retracted, ob_replacement))

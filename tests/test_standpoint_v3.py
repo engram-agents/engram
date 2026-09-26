@@ -408,6 +408,7 @@ def test_retracted_cross_lineage_does_not_activate_gate():
         "node_id": o9,
         "error_type": "hallucinated_claim",
         "reason": "test: make the only cross-lineage row non-current",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN", "replacement_absent_note": "test fixture -- replacement decision not under test",
     })
     assert r.get("status") in ("retracted", "created", "ok") or "retract" in str(r).lower(), \
         f"retract failed: {r}"

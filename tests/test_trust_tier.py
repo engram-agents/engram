@@ -247,7 +247,7 @@ def test_set_trust_tier_invalid_justification_obs_id():
         node_id=ob_id,
         error_type="fabricated_quote",
         reason="Test retract for validation check.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert ret.get("status") == "retracted", ret
 
     r3 = json.loads(tru._set_trust_tier_impl(
@@ -403,7 +403,7 @@ def test_add_trust_signal_invalid_source_obs_id():
         node_id=ob_id,
         error_type="fabricated_quote",
         reason="Test.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     r3 = json.loads(tru._add_trust_signal_impl(
         subject_pn=pn_id,
         source_obs_id=ob_id,
@@ -502,7 +502,7 @@ def test_retract_source_obs_does_not_taint_trust_signal():
         node_id=ob_id,
         error_type="fabricated_quote",
         reason="Test retract to verify the walk stops at ts_.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert ret_r.get("status") == "retracted", ret_r
 
     # Migrated off metadata.tainted_by to cascade_markers (#2013/#2009

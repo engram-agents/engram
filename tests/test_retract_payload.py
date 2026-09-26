@@ -68,6 +68,8 @@ def test_payload_json_retracts_node():
         "node_id": ob_id,
         "error_type": "hallucinated_claim",
         "reason": "Claim isn't supported by the cited evidence.",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     }
     r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
     assert "error" not in r, r
@@ -151,6 +153,8 @@ def test_payload_json_unknown_fields_rejected():
     payload = {
         "node_id": ob_id, "error_type": "other", "reason": "x",
         "bogus_field": "should reject",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     }
     r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
     assert "error" in r and "Unknown fields" in r["error"], r
@@ -190,6 +194,8 @@ def test_payload_json_invalid_error_type_rejected():
         "node_id": "ob_0001",
         "error_type": "bogus_error_type",
         "reason": "x",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     }
     r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
     assert "error" in r and "Invalid error_type" in r["error"], r
@@ -205,6 +211,8 @@ def test_impl_callable_with_kwargs():
         node_id=ob_id,
         error_type="other",
         reason="kwargs-path test",
+        replacement_absent_because="NONE_BECAUSE_UNKNOWN",
+        replacement_absent_note="test fixture -- replacement decision not under test",
     ))
     assert "error" not in r, r
 
@@ -273,6 +281,8 @@ def test_retract_resolution_deletes_resolves_edges():
         node_id=dv_id,
         error_type="hallucinated_claim",
         reason="Resolver derivation was based on a hallucinated premise.",
+        replacement_absent_because="NONE_BECAUSE_UNKNOWN",
+        replacement_absent_note="test fixture -- replacement decision not under test",
     ))
     assert "error" not in ret, ret
 
@@ -317,6 +327,8 @@ def test_retract_resolution_with_other_valid_resolution_preserves_others():
         node_id=dv_id_first,
         error_type="wrong_evidence",
         reason="First resolver cited the wrong source.",
+        replacement_absent_because="NONE_BECAUSE_UNKNOWN",
+        replacement_absent_note="test fixture -- replacement decision not under test",
     ))
     assert "error" not in ret, ret
 
@@ -386,6 +398,8 @@ def test_retract_resolution_multiple_targets_deletes_all_own_edges():
         node_id=dv_id,
         error_type="hallucinated_claim",
         reason="Derivation was hallucinated.",
+        replacement_absent_because="NONE_BECAUSE_UNKNOWN",
+        replacement_absent_note="test fixture -- replacement decision not under test",
     ))
     assert "error" not in ret, ret
 
@@ -430,6 +444,8 @@ def test_retract_non_resolution_node_no_resolves_deletion():
         node_id=ob1_id,
         error_type="other",
         reason="Sanity check retraction of non-resolver node.",
+        replacement_absent_because="NONE_BECAUSE_UNKNOWN",
+        replacement_absent_note="test fixture -- replacement decision not under test",
     ))
     assert "error" not in ret, ret
 
@@ -455,6 +471,8 @@ def test_retract_self_anchor_warns():
         "node_id": person_id,
         "error_type": "other",
         "reason": "Filed in error — test",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     })))
     assert result.get("status") == "retracted", f"expected retracted, got {result}"
     assert "warning" in result, f"expected warning key in result, got {result}"
@@ -474,6 +492,8 @@ def test_retract_non_self_person_no_warning():
         "node_id": person_id,
         "error_type": "other",
         "reason": "Filed in error — test",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     })))
     assert result.get("status") == "retracted"
     assert "warning" not in result, f"unexpected warning in result: {result.get('warning')}"
@@ -491,6 +511,8 @@ def test_retract_self_anchor_still_retracts():
         "node_id": person_id,
         "error_type": "other",
         "reason": "Filed in error — test",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     })))
     assert result.get("status") == "retracted"
     # Verify the DB row is actually retracted
@@ -514,6 +536,8 @@ def test_initiation_user_prompted_stored():
         "error_type": "other",
         "reason": "Test initiation field.",
         "initiation": "user_prompted",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     }
     r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
     assert "error" not in r, r
@@ -538,6 +562,8 @@ def test_initiation_gate_prompted_with_gate():
         "reason": "Gate flagged this as unsupported.",
         "initiation": "gate_prompted",
         "initiation_gate": "honesty_axiom",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     }
     r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
     assert "error" not in r, r
@@ -562,6 +588,8 @@ def test_initiation_unprompted_stored():
         "error_type": "duplicate",
         "reason": "Self-identified as duplicate during routine scan.",
         "initiation": "unprompted",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     }
     r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
     assert "error" not in r, r
@@ -576,6 +604,8 @@ def test_initiation_omitted_leaves_no_key():
         "node_id": ob_id,
         "error_type": "other",
         "reason": "No initiation supplied.",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     }
     r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
     assert "error" not in r, r
@@ -591,6 +621,8 @@ def test_initiation_invalid_value_rejected():
         "error_type": "other",
         "reason": "x",
         "initiation": "self_initiated",  # invalid — not in VALID_INITIATION_TYPES
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     }
     r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
     assert "error" in r, r
@@ -610,6 +642,8 @@ def test_initiation_ref_auto_captured_in_metadata():
             "error_type": "other",
             "reason": "Test session capture.",
             "initiation": "unprompted",
+            "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+            "replacement_absent_note": "test fixture -- replacement decision not under test",
         }
         r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
         assert "error" not in r, r
@@ -635,6 +669,8 @@ def test_initiation_ref_not_user_supplied():
         "error_type": "other",
         "reason": "x",
         "initiation_ref": "user-tried-to-supply-this",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     }
     r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
     assert "error" in r and "Unknown fields" in r["error"], r
@@ -652,6 +688,8 @@ def test_initiation_gate_without_gate_prompted_rejected():
         "reason": "x",
         "initiation": "user_prompted",
         "initiation_gate": "honesty_axiom",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     }
     r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
     assert "error" in r, r
@@ -667,6 +705,8 @@ def test_initiation_gate_without_initiation_rejected():
         "error_type": "other",
         "reason": "x",
         "initiation_gate": "honesty_axiom",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+        "replacement_absent_note": "test fixture -- replacement decision not under test",
     }
     r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
     assert "error" in r, r
@@ -684,6 +724,8 @@ def test_initiation_ref_captured_without_initiation_field():
             "node_id": ob_id,
             "error_type": "other",
             "reason": "No initiation label, but session should still be captured.",
+            "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+            "replacement_absent_note": "test fixture -- replacement decision not under test",
         }
         r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
         assert "error" not in r, r
@@ -711,6 +753,8 @@ def test_initiation_ref_anthropic_session_id_fallback():
             "error_type": "other",
             "reason": "Test ANTHROPIC_SESSION_ID fallback path.",
             "initiation": "unprompted",
+            "replacement_absent_because": "NONE_BECAUSE_UNKNOWN",
+            "replacement_absent_note": "test fixture -- replacement decision not under test",
         }
         r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
         assert "error" not in r, r
@@ -763,6 +807,8 @@ def test_replacement_id_non_current_node_rejected():
         node_id=stale_repl_id,
         error_type="other",
         reason="Make this node non-current for the test.",
+        replacement_absent_because="NONE_BECAUSE_UNKNOWN",
+        replacement_absent_note="test fixture -- replacement decision not under test",
     ))
     assert "error" not in stale_retract, stale_retract
 

@@ -269,7 +269,7 @@ def test_rewrite_then_retract_leaves_zero_orphans():
     ret = json.loads(rev._retract_impl(
         node_id=a_id, error_type="other",
         reason="FTS rewrite-resync test 2 — retract after rewrite",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert ret.get("status") == "retracted", f"retract failed: {ret}"
 
     assert _fts_hit_count(dropped_token) == 0, (

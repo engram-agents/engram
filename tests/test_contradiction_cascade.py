@@ -251,7 +251,7 @@ def test_retract_marks_contradiction_tainted_by():
         node_id=ob_a,
         error_type="fabricated_quote",
         reason="Test retract — claim was fabricated.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert r.get("status") == "retracted", r
     assert r["tainted_contradiction_count"] == 1, r
     assert r["tainted_contradictions"][0]["id"] == ct_id
@@ -270,7 +270,7 @@ def test_retract_unrelated_node_does_not_taint_contradiction():
         node_id=ob_c,
         error_type="fabricated_quote",
         reason="Test.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert r["tainted_contradiction_count"] == 0
 
 
@@ -286,7 +286,7 @@ def test_retract_cascades_to_multiple_contradictions():
         node_id=ob_a,
         error_type="hallucinated_claim",
         reason="Test.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert r["tainted_contradiction_count"] == 2
     flagged_ids = {tc["id"] for tc in r["tainted_contradictions"]}
     assert flagged_ids == {ct_ab, ct_ac}
@@ -545,7 +545,7 @@ def test_taint_dominates_contradiction():
 
     ret = json.loads(rev._retract_impl(
         node_id=ob_a, error_type="other", reason="test: proven wrong",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert ret.get("status") == "retracted", ret
 
     r = json.loads(derive._derive_impl(

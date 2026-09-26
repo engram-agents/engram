@@ -157,6 +157,25 @@ survives the PR closing, it's versioned in the repo, and a future reader of
 the file finds it where the removal actually happened, none of which is
 true of a PR body. The gate does not care which surface an author picks.
 
+A THIRD surface, release-PR only (#3117): on a `dev`->`main` release PR, the
+base..head range spans many already-merged dev PRs, each of which already
+carried its own `Removed-test:` marker on ITS OWN PR body — but that body is
+gone once squashed; only the squash-commit message + GitHub's own `(#N)`
+title suffix survives. `collect_markers_from_merged_range` re-fetches each
+such PR's body (via `gh pr view <N> --json body -q .body`) and parses it the
+same way `parse_removed_test_markers` does, so the release cutter no longer
+has to hand-retype every already-accounted-for marker from every dev PR in
+the range. This is deliberately a THIRD, separate source, not a change to
+the body/diff parsers above: it is unioned into `main()`'s marker list only
+when the first two sources already leave something unaccounted (a release
+PR is the rare case that ever needs it — an ordinary dev PR's own body/diff
+almost always already accounts for everything, so this never touches the
+network on the common path). A PR whose body can't be fetched at all (auth,
+rate limit, not found) is never silently treated as "nothing to account
+for" — its markers are treated as ABSENT (fail-safe, same posture as every
+other LIMIT in this module), and the failed fetch is named explicitly on
+stderr.
+
 Usage:
     python3 tools/test_id_set_check.py \
         --base "$(git merge-base origin/dev HEAD)" --head HEAD \
@@ -190,7 +209,7 @@ import json
 import re
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -236,6 +255,20 @@ class ParseError(Exception):
 
 class GitReadError(Exception):
     """A git ls-tree/show invocation failed while reading base or head."""
+
+
+class GhFetchError(Exception):
+    """#3117: a `gh` invocation to fetch an already-merged PR's body failed
+    (auth, rate limit, PR not found, `gh` not installed/authenticated, ...).
+
+    Always surfaced to the caller — never swallowed into a sentinel empty
+    string. An empty string is indistinguishable from "this PR's body
+    genuinely carries no Removed-test marker", and returning one on failure
+    would silently satisfy the fail-safe-absent contract by accident rather
+    than by the caller's own explicit handling. See
+    collect_markers_from_merged_range's docstring for how the caller must
+    treat this: the PR's markers become ABSENT, and the failure itself is
+    named on stderr — never a silent pass."""
 
 
 # ---------------------------------------------------------------------------
@@ -995,6 +1028,177 @@ def warn_if_base_is_not_ancestor(repo_root: Path, base: str, head: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# #3117 -- release-PR marker aggregation: the THIRD marker source, sourced
+# from already-merged PRs' own bodies in the base..head range. See the
+# module docstring's "#3117" paragraph for why this exists and how it
+# relates to the body/diff sources above (a separate, unioned-in source,
+# never a change to parse_removed_test_markers/_from_diff themselves).
+# ---------------------------------------------------------------------------
+
+
+def _fetch_pr_body(owner: str, repo: str, pr_number: int) -> str:
+    """Shell out to `gh pr view <N> --repo <owner>/<repo> --json body -q
+    .body` and return the PR's body text.
+
+    THE sole network-touching unit in this module -- kept small and
+    separately named (#3117) so `collect_markers_from_merged_range` can
+    have a fake injected in its place (via that function's `gh_runner`
+    parameter) without any test ever reaching the real network.
+
+    Raises GhFetchError on any non-zero `gh` exit (auth failure, rate
+    limit, PR not found, `gh` not installed/authenticated, ...) -- never
+    returns a sentinel empty string on failure. See GhFetchError's own
+    docstring for why that distinction matters.
+    """
+    result = subprocess.run(
+        ["gh", "pr", "view", str(pr_number), "--repo", f"{owner}/{repo}", "--json", "body", "-q", ".body"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise GhFetchError(f"gh pr view {pr_number} --repo {owner}/{repo} failed: {result.stderr.strip()}")
+    return result.stdout
+
+
+# GitHub's own squash-commit-title convention (this repo's
+# squash_merge_commit_title: PR_TITLE, per CLAUDE.md's "PR — issue closure"
+# section) stamps every squash commit's SUBJECT as "<PR title> (#N)". `git
+# log --oneline` prints exactly that subject, so the trailing "(#N)" is the
+# only surviving pointer, post-squash, back to the PR whose body once
+# carried its own Removed-test markers.
+_SQUASH_PR_NUMBER_RE = re.compile(r"\(#(\d+)\)\s*$")
+
+
+def _extract_merged_pr_numbers(repo_root: Path, base: str, head: str) -> list[int]:
+    """Return the PR numbers named by every squash-commit subject in
+    base..head, in `git log`'s own order (newest first), de-duplicated
+    while preserving that order. A commit whose subject carries no `(#N)`
+    suffix (a non-squash commit, or a squash merge predating this
+    convention) is silently skipped -- it names no PR to fetch, which is a
+    different case from a fetch failure and must not be treated as one."""
+    log_text = _run_git(repo_root, ["log", f"{base}..{head}", "--oneline"])
+    numbers: list[int] = []
+    for line in log_text.splitlines():
+        m = _SQUASH_PR_NUMBER_RE.search(line)
+        if m:
+            numbers.append(int(m.group(1)))
+    return list(dict.fromkeys(numbers))
+
+
+def collect_markers_from_merged_range(
+    repo_root: Path,
+    base: str,
+    head: str,
+    gh_owner: str,
+    gh_repo: str,
+    *,
+    gh_runner: Callable[[str, str, int], str] | None = None,
+) -> tuple[list[Marker], list[str]]:
+    """#3117 -- the THIRD marker source: every already-merged PR's own body
+    in the base..head range, identified via `_extract_merged_pr_numbers` and
+    fetched via `gh_runner` (defaults to the real `_fetch_pr_body`;
+    injectable so tests never touch the network).
+
+    `gh_runner` defaults to `None` rather than binding `_fetch_pr_body`
+    directly as the parameter default -- a default bound at function-
+    definition time captures that FUNCTION OBJECT once, so a test that
+    monkeypatches the module-level `_fetch_pr_body` name afterward (the
+    natural thing to do when exercising `main()`'s own argv-driven path,
+    which has no way to pass a Python callable) would silently keep calling
+    the ORIGINAL, real implementation. `None` defers the lookup to call
+    time, inside the function body, so a monkeypatched module attribute is
+    honored by any caller that does not explicitly pass its own `gh_runner`.
+
+    Deliberately a NEW, separate function -- not a change to
+    `parse_removed_test_markers` or `parse_removed_test_markers_from_diff`,
+    which stay exactly as they are. Each fetched body is parsed with the
+    UNCHANGED `parse_removed_test_markers` (same fence-aware, backtick-safe
+    parsing every other body-shaped source gets) -- this function's own job
+    is only to find WHICH bodies to fetch and hand each one to that parser.
+
+    Fail-safe direction (load-bearing, #3117): a PR whose body can't be
+    fetched at all (GhFetchError from `gh_runner`) contributes NO markers --
+    its disappearances, if any, are treated as if no marker was ever
+    written for them, exactly like a genuinely marker-less PR. This is
+    never a silent pass: the caller (see `collect_range_markers_if_needed`
+    and `main()`) surfaces the failed fetch explicitly via the returned
+    warnings list, and the disappearance itself still fails the gate
+    through the ordinary unaccounted-disappearance path -- there is no
+    separate "trust the fetch failure" leniency anywhere in this function.
+
+    Returns (markers, warnings) -- warnings names each PR whose body could
+    not be fetched, one entry per failure, so a caller can report exactly
+    which fetch failed rather than a caller having to infer it from an
+    empty marker list.
+    """
+    runner = gh_runner if gh_runner is not None else _fetch_pr_body
+    markers: list[Marker] = []
+    warnings: list[str] = []
+    for pr_number in _extract_merged_pr_numbers(repo_root, base, head):
+        try:
+            body = runner(gh_owner, gh_repo, pr_number)
+        except GhFetchError as exc:
+            warnings.append(
+                f"could not fetch PR #{pr_number}'s body ({exc}) -- its "
+                f"Removed-test markers, if any, are being treated as ABSENT "
+                f"(fail-safe: a fetch failure never counts as accounted-for)."
+            )
+            continue
+        markers.extend(parse_removed_test_markers(body))
+    return markers, warnings
+
+
+def collect_range_markers_if_needed(
+    preliminary_report: Report,
+    repo_root: Path,
+    base: str,
+    head: str,
+    gh_owner: str | None,
+    gh_repo: str | None,
+    *,
+    gh_runner: Callable[[str, str, int], str] | None = None,
+) -> tuple[list[Marker], list[str]]:
+    """#3117's "only fetch what's actually needed" gate: `main()` calls this
+    with a PRELIMINARY report (evaluated from the body + diff sources only,
+    before this module's range source exists at all) and this function
+    decides whether the network-touching range source is worth running.
+
+    Never calls `gh_runner` (nor even resolves which PRs are in range) when
+    `preliminary_report.unaccounted` is already empty -- an ordinary dev PR,
+    whose body/diff markers already account for every disappearance in the
+    vast majority of cases, never touches the network. Only a release-
+    shaped PR with a genuine unaccounted-for disappearance reaches the
+    `collect_markers_from_merged_range` call below. Kept as its own small
+    function (rather than this logic living inline in `main()`) precisely
+    so the "never fetches when nothing is unaccounted" contract is directly
+    testable via a call-counting fake, independent of `main()`'s CLI/argv
+    plumbing.
+
+    `gh_owner`/`gh_repo` being `None` (i.e. `--gh-repo` was not passed) is
+    NOT treated as a hard usage error even when the range source would
+    otherwise be needed -- it reproduces today's pre-#3117 behavior
+    (unaccounted disappearances simply stay unaccounted and the gate fails,
+    exactly as it always has), with a warning naming why the range source
+    was skipped, rather than turning an ordinary dev PR that happens to hit
+    this branch into a hard crash over a flag it was never told to pass.
+
+    Returns (markers, warnings), same shape as
+    `collect_markers_from_merged_range` -- the empty-markers/single-warning
+    "skipped, no --gh-repo" case included.
+    """
+    if not preliminary_report.unaccounted:
+        return [], []
+    if gh_owner is None or gh_repo is None:
+        return [], [
+            "unaccounted disappearances found and --gh-repo was not provided -- "
+            "skipping the merged-range PR-body source (#3117); pass "
+            "--gh-repo OWNER/REPO to also check already-merged PRs' own "
+            "bodies for Removed-test markers."
+        ]
+    return collect_markers_from_merged_range(repo_root, base, head, gh_owner, gh_repo, gh_runner=gh_runner)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1022,6 +1226,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo-root", metavar="PATH", default=".", help="Repository root (default: current directory).")
     parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format (default: text).")
+    parser.add_argument(
+        "--gh-repo",
+        metavar="OWNER/REPO",
+        default=None,
+        help="GitHub OWNER/REPO to fetch already-merged PRs' bodies from, for the "
+        "#3117 release-PR marker-aggregation source. Only used when the "
+        "existing body/diff sources leave a disappearance unaccounted for "
+        "(e.g. a dev->main release PR whose range spans many already-merged "
+        "dev PRs) -- an ordinary dev PR never needs it and never hits the "
+        "network. Required only in that case; safely omitted otherwise.",
+    )
     return parser
 
 
@@ -1075,6 +1290,43 @@ def main(argv: list[str] | None = None) -> int:
 
     markers = parse_removed_test_markers(pr_body) + diff_markers
     unparsed_removed_test_lines = find_unparsed_removed_test_lines(pr_body) + diff_unparsed
+
+    # #3117: the range source (already-merged PRs' own bodies) is a THIRD,
+    # separate source, unioned in here -- never a change to evaluate() or to
+    # the two parsers above. It is consulted only when the first two
+    # sources leave something unaccounted (see collect_range_markers_if_
+    # needed's docstring for the "only fetch what's needed" contract).
+    preliminary_report = evaluate(base_ids, head_ids, markers, tuple(unparsed_removed_test_lines))
+    gh_owner: str | None = None
+    gh_repo_name: str | None = None
+    if args.gh_repo:
+        if "/" not in args.gh_repo:
+            print(
+                f"test_id_set_check: error — --gh-repo must be OWNER/REPO, got {args.gh_repo!r}",
+                file=sys.stderr,
+            )
+            return 2
+        gh_owner, gh_repo_name = args.gh_repo.split("/", 1)
+
+    try:
+        range_markers, range_warnings = collect_range_markers_if_needed(
+            preliminary_report, repo_root, args.base, args.head, gh_owner, gh_repo_name
+        )
+    except GitReadError as exc:
+        print(f"test_id_set_check: error — {exc}", file=sys.stderr)
+        return 2
+
+    # A missing --gh-repo (only possible when the range source was actually
+    # needed — see collect_range_markers_if_needed) is a benign skip, not a
+    # fetch failure: print it as a warning. A genuine per-PR fetch failure
+    # (gh_owner/gh_repo_name were provided; the failure happened inside
+    # collect_markers_from_merged_range) is the fail-safe-absent case the
+    # spec calls loud — print it as an error.
+    range_annotation = "::warning::" if gh_owner is None else "::error::"
+    for warning in range_warnings:
+        print(f"{range_annotation}test_id_set_check: {warning}", file=sys.stderr)
+
+    markers = markers + range_markers
     report = evaluate(base_ids, head_ids, markers, tuple(unparsed_removed_test_lines))
 
     if args.format == "json":

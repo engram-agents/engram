@@ -11,6 +11,97 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [v0.5.2] - 2026-09-25
 
+### rc2 fix round — 2026-09-26 (found on the rc1 soak)
+
+- **Forum prompt-hook `Connection: close` crash fixed — the reason for
+  this re-cut.** rc1's forum server answers with `Connection: close`,
+  which nulls `conn.sock` as soon as `getresponse()` returns — the
+  connection has merely dropped its own reference; the socket itself
+  stays open, owned by the response, with real reads still ahead of it;
+  the end-to-end deadline code added by #3110 called
+  `conn.sock.settimeout(...)` unconditionally on every read-loop
+  iteration, raised `AttributeError` on that path, and a bare `except`
+  swallowed it — so the hook silently fell back to stale cached
+  threads/mentions on every single prompt. The fix now captures the
+  socket reference before `getresponse()` and re-arms that captured
+  reference's timeout on every read iteration (catching `OSError` for
+  the case where the fd has since genuinely closed), so the
+  remaining-budget deadline still holds on a `Connection: close`
+  response (#3144, closes #3143).
+- **`engram-sleep`'s cohort-boundary snippet reads `completed_at`, not
+  the never-written `cohort_end_at` key.** The `KeyError` was swallowed
+  by a `2>/dev/null || echo ""` fallback, silently collapsing the cohort
+  boundary to empty and making the dream-master's cohort filter match
+  every node ever created; a marker missing the key now fails loudly
+  instead (#3132, closes #3123).
+- **The install-script untagged guard now decides on confirmed
+  ancestry, not raw tag presence.** A local tag on an unpushed/unmerged
+  commit passed the untagged guard even though the separate ancestry
+  check had already failed, disagreeing with the engine's own `cli run
+  upgrade` path on the identical case; both now refuse consistently
+  (#3131, closes #3103).
+- **Health-series declarations gate no longer false-positives on a
+  layout-dependent module prefix.** Two declarations rows seeded from a
+  `src/`-layout checkout carried `engram.health.` instead of the
+  deployed plugin's `health.` prefix, so the affected seat's very first
+  snapshot ingest raised `SeriesIntegrityError`; both serialization and
+  the ingest-time comparison now canonicalize the prefix, and a
+  migration heals stored rows (#3127, closes #3122).
+- **`_count_null_embeddings` no longer requires `row_factory =
+  sqlite3.Row`.** The health-engine helper indexed its query result by
+  column name, which only works when the caller sets `row_factory`; the
+  dream-master's own connection doesn't, so the only real caller hit a
+  `TypeError` in production the test suite's connection shape never
+  exercised (#3126, closes #3124).
+- **Forum monitors now announce during their seed loop, not just their
+  poll loop.** #3065's edge-triggered outage announce lived only in the
+  poll loop, reached only after a seed loop that blocks silently until
+  the first successful poll — so a monitor armed while the forum is down
+  (the routine case at session start) was completely mute. Both seed
+  loops now announce the first failed attempt and the eventual success
+  (#3111, closes #3067).
+- **EngramManager U1: the owner wire-contract client library.** A pure
+  client speaking the new AF_UNIX wire protocol for the future `engramd`
+  owner process, with three result states (`Ok`/`Unavailable`/
+  `Rejected`) distinct at the type level, and a `request_id` threaded
+  through every write so a caller that got `Unavailable` can retry
+  safely. Nothing calls it yet (#3102, closes #3094).
+- **Retraction replacement contract implemented.** Every
+  author-initiated retraction now records a replacement decision — the
+  node that replaces the claim, or one of four stated reasons why
+  nothing does — through the single chokepoint both the organic retract
+  path and cascade-resolve delegate to; also fixes a bare `except
+  IntegrityError: pass` that let a retraction commit while its
+  replacement edge was never written (#3090, implements #2613).
+- **`test-id-set-check` no longer re-demands markers already carried by
+  merged dev PRs.** The release-PR gate re-demanded a `Removed-test:`
+  marker for every test id that disappeared anywhere in the dev range,
+  even when the deleting dev PR already carried its own marker; the gate
+  now unions a third marker source, the already-merged PR's own body
+  (#3139, closes #3117).
+- **A CI gate now catches a stubbed test that a stale signature change
+  breaks silently.** #3110 changed two function signatures and moved a
+  call off `urlopen`; two test files that monkeypatch those names by
+  bare name were invisible to the existing affected-tests heuristic. A
+  new blocking CI step finds every signature that genuinely changed in
+  a PR's diff and greps `tests/` for bare-name references (#3129, closes
+  #3118).
+- **Lane prioritization rubric v0.** `docs/LANE-PRIORITIZATION.md`, the
+  commander's ranking policy for open engram-alpha/umwelt issues into
+  seat lanes: five 0-2 axes, four standing overrides, a day-end re-rank
+  rule, and a changelog section for revising the rubric with history.
+  Docs only (#3140).
+- **EngramManager security-slice design: read-template registry + socket
+  permission model.** Settles the #2652 security slice's four open
+  questions against measurement: `SO_PEERCRED` doesn't exist on Darwin,
+  a mismatched socket-option level silently returns uid 0, and a
+  read-only SQLite handle permits `ATTACH`/`PRAGMA`. Proposes a
+  two-layer floor — SQLite's own `set_authorizer` plus a build-time-
+  frozen template registry. Design only (#3100, part of #3097); a
+  follow-up (#3145) withdraws two overclaims flagged at approval — the
+  token-match fallback can under-deny, and `SQLITE_LIMIT_LENGTH` caps a
+  single string/blob/row, not aggregate memory.
+
 ### Added
 
 - **`deductive_conjunction` reasoning type** (#3082, closes #3080) — a new
@@ -50,6 +141,8 @@ with an `-alpha` suffix during the alpha phase.
   arithmetic assumed a call with `timeout=T` takes at most T, which is
   false against a server that trickles data (the per-op timeout re-arms
   on every partial read). Both now enforce a genuine wall-clock deadline.
+  Its `Connection: close` crash — the reason for the rc2 re-cut — is
+  fixed in the rc2 fix round above (#3144).
 - **Health-exam liveness checks could not report failure** (#3070) — the
   agent-facing health-exam skill's `pgrep`-based checks counted other
   seats' processes, could never detect a dead daemon on Darwin, silently

@@ -148,6 +148,7 @@ def _retract_node(server, node_id):
         "node_id": node_id,
         "error_type": "hallucinated_claim",
         "reason": "Test retraction — is_current guard test.",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN", "replacement_absent_note": "test fixture -- replacement decision not under test",
     })))
     assert "error" not in r, f"retract failed: {r}"
 

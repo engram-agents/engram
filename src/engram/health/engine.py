@@ -889,6 +889,36 @@ def _to_jsonable(value: float | _Unavailable):
     return value
 
 
+# Module-layout prefix a `health.*` function's `__module__` can carry,
+# depending on how the `health` package was imported (engram-alpha#3122):
+# `engram.health.metrics` when imported from the source-tree `src/` layout
+# (top-level package `engram` on sys.path), `health.metrics` in the
+# deployed plugin (the build flattens `src/engram/` away -- see this
+# repo's CLAUDE.md "Plugin build restructures code paths"). `_dotted_name`
+# below canonicalizes to the LATTER form, because every snapshot file
+# already on disk uses it (borges-funes's diagnosis, issue #3122 comment,
+# 2026-09-26) -- via `health.version.canonical_health_dotted`, the ONE
+# shared implementation of this rule (engram-alpha#3122 round 2 should-fix
+# 1; `health/series.py`'s `_normalize_layout_prefix` routes through the
+# same function rather than carrying its own copy of the prefix constants).
+
+
+def _dotted_name(fn) -> str:
+    """Layout-independent dotted name for a metric/aspect def's
+    ``signal_fn``/``scoring_fn``. A pure function of ``fn.__module__`` +
+    ``fn.__qualname__`` -- given the SAME function, returns the
+    byte-identical string whether ``fn.__module__`` reads
+    ``engram.health.metrics`` (source-tree layout) or ``health.metrics``
+    (deployed-plugin layout): the raw dotted name is canonicalized through
+    ``health.version.canonical_health_dotted``, which strips a leading
+    ``engram.`` from an ``engram.health.`` prefix, so both layouts collapse
+    to the ``health.metrics.x`` form. This is the producer-side half of the
+    engram-alpha#3122 fix -- see ``health/series.py``'s
+    ``_canonicalize_declared_blob`` for the consumer-side half
+    (declarations already stored under the OLD, un-canonicalized prefix)."""
+    return health_version.canonical_health_dotted(f"{fn.__module__}.{fn.__qualname__}")
+
+
 def _metric_def_to_dict(metric: MetricDef) -> dict:
     return {
         "name": metric.name,
@@ -897,7 +927,7 @@ def _metric_def_to_dict(metric: MetricDef) -> dict:
         "scored": metric.scored,
         "state_valued": metric.state_valued,
         "dive_target": metric.dive_target,
-        "signal_fn": f"{metric.signal_fn.__module__}.{metric.signal_fn.__qualname__}",
+        "signal_fn": _dotted_name(metric.signal_fn),
     }
 
 
@@ -905,7 +935,7 @@ def _aspect_def_to_dict(aspect: AspectDef) -> dict:
     return {
         "name": aspect.name,
         "weight": aspect.weight,
-        "scoring_fn": f"{aspect.scoring_fn.__module__}.{aspect.scoring_fn.__qualname__}",
+        "scoring_fn": _dotted_name(aspect.scoring_fn),
         "metrics": [_metric_def_to_dict(m) for m in aspect.metrics],
     }
 
@@ -2511,4 +2541,4 @@ def _count_null_embeddings(conn: sqlite3.Connection, population: str) -> int:
         f"SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND type IN "
         f"({placeholders}) AND embedding IS NULL",
         claim_bearing_types,
-    ).fetchone()["c"]
+    ).fetchone()[0]

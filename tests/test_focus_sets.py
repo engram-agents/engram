@@ -413,6 +413,7 @@ def test_load_cascade_supersede_and_retract():
         "node_id": "ob_0002",
         "error_type": "hallucinated_claim",
         "reason": "test",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN", "replacement_absent_note": "test fixture -- replacement decision not under test",
     })
     # Clear active explicitly, then load
     client.call("engram_unfocus", {"node_ids": "ob_0003"})

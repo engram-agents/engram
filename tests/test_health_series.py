@@ -314,6 +314,27 @@ def _write_snapshot_file(
     return path
 
 
+def _add_src_tree_prefix(value):
+    """Test helper for the layout-prefix bug (engram-alpha#3122) -- the
+    INVERSE of series.py's own ``_normalize_layout_prefix``. Recursively
+    rewrites any string starting with the deployed-layout ``"health."``
+    module prefix to the source-tree ``"engram.health."`` form, simulating
+    what a manual ``derive``/``ingest`` run from a `src/`-layout checkout
+    declared (per the issue's diagnosis: ``engine.py``'s
+    ``signal_fn.__module__`` reads ``engram.health.metrics`` there, vs.
+    ``health.metrics`` in the deployed plugin). Deliberately NOT implemented
+    by importing/reusing series.py's own normalization helper -- the test
+    fixture must be built independently of the code under test, or a bug in
+    the shared helper could cancel out between fixture and implementation."""
+    if isinstance(value, str) and value.startswith("health."):
+        return "engram." + value
+    if isinstance(value, list):
+        return [_add_src_tree_prefix(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _add_src_tree_prefix(v) for k, v in value.items()}
+    return value
+
+
 _OLD_FORMAT_SNAPSHOT = {
     "schema_version": "1",
     "turn": 12,
@@ -3202,6 +3223,149 @@ def test_declarations_gate_differing_model_defs_raises(tmp_path):
     assert "model_defs" in str(excinfo.value)
 
 
+# ---------------------------------------------------------------------------
+# C2/C3/C4 (engram-alpha#3122): layout-prefix false positive on the D4.1 gate
+# ---------------------------------------------------------------------------
+#
+# engine.py's _metric_def_to_dict/_aspect_def_to_dict serialize a metric/
+# aspect's signal_fn/scoring_fn as f"{fn.__module__}.{fn.__qualname__}".
+# fn.__module__ depends on the health package's import layout:
+# `engram.health.metrics` from a `src/`-tree checkout, `health.metrics` in
+# the deployed plugin. Two `declarations` rows on the reporting seat were
+# seeded by manual `derive` runs from a `src/`-layout checkout and carry
+# the `engram.health.` prefix, while every snapshot file ever written on
+# disk carries `health.` -- so the D4.1 gate raised SeriesIntegrityError on
+# the very first file it ever processed, and NO snapshot has ever been
+# ingested with source='stored' on that seat (issue #3122, borges-funes,
+# 2026-09-26).
+
+
+def test_declarations_gate_ignores_layout_prefix_only_difference(tmp_path):
+    """C2: a stored declaration whose config blob names
+    `engram.health.metrics.x`-shaped function paths (the src-tree layout --
+    what a manual derive run from that checkout would have written) must
+    NOT raise SeriesIntegrityError against a later snapshot whose config
+    names the `health.metrics.x` equivalent (same function, only the
+    module-layout prefix differs, otherwise byte-identical). The second
+    file must still be ingested as `stored` -- not skipped, not routed to
+    git_replay."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "k1", _committer_iso(t0))
+    _commit_knowledge(repo_dir, "k2", _committer_iso(t0 + timedelta(minutes=1)))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+
+    # First file (seeds the stored declaration): src-tree-shaped config.
+    snap1 = _build_v2_snapshot(anchor=None, turn=1)
+    snap1["config"] = _add_src_tree_prefix(snap1["config"])
+    ts1 = t0.strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 1, "nap", ts1, snap1)
+
+    # Second file: deployed-layout config -- same function names, only the
+    # prefix differs; otherwise byte-identical to snap1's PRE-mutation
+    # config (both come from the same _build_v2_snapshot fixture, and
+    # `turn` is not part of `config`).
+    snap2 = _build_v2_snapshot(anchor=None, turn=2)
+    ts2 = (t0 + timedelta(minutes=1)).strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 2, "nap", ts2, snap2)
+
+    db_path = tmp_path / "series.db"
+    result = series.ingest(snapshots_dir, repo_dir, db_path)  # must not raise
+
+    assert result["collided"] == 0
+    assert result["unresolved"] == 0
+
+    conn = series.open_store(db_path)
+    row = conn.execute(
+        "SELECT source FROM l0_points WHERE snapshot_file = ?",
+        (f"2-nap-{ts2}.json",),
+    ).fetchone()
+    conn.close()
+    assert row is not None
+    assert row["source"] == "stored"
+
+
+def test_declarations_gate_still_raises_on_genuine_config_difference(tmp_path):
+    """C3 (discrimination control): a genuine config difference -- one
+    aspect's weight value changed, NOT just the function-name prefix --
+    must still raise SeriesIntegrityError after the layout-prefix fix.
+    See this file's own mutation-check note in the PR report: a fix that
+    canonicalizes the WHOLE blob (rather than just the module-path prefix)
+    would make this test wrongly pass."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "k1", _committer_iso(t0))
+    _commit_knowledge(repo_dir, "k2", _committer_iso(t0 + timedelta(minutes=1)))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+
+    snap1 = _build_v2_snapshot(anchor=None, turn=1)
+    ts1 = t0.strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 1, "nap", ts1, snap1)
+
+    snap2 = _build_v2_snapshot(anchor=None, turn=2)
+    mutated_config = json.loads(json.dumps(snap2["config"]))
+    mutated_config["aspects"][0]["weight"] += 1.0
+    snap2["config"] = mutated_config
+    ts2 = (t0 + timedelta(minutes=1)).strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 2, "nap", ts2, snap2)
+
+    db_path = tmp_path / "series.db"
+    with pytest.raises(series.SeriesIntegrityError) as excinfo:
+        series.ingest(snapshots_dir, repo_dir, db_path)
+    assert "config" in str(excinfo.value)
+
+
+def test_declarations_gate_prefix_only_difference_is_idempotent_on_reingest(tmp_path):
+    """C4: after the fix, ingesting a declarations row + snapshot pair that
+    disagree ONLY on the layout prefix must leave the store in the same
+    state as if they'd agreed from the start -- re-running ingest() a
+    second time on the same inputs raises nothing, and creates no
+    duplicate rows."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "k1", _committer_iso(t0))
+    _commit_knowledge(repo_dir, "k2", _committer_iso(t0 + timedelta(minutes=1)))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+
+    snap1 = _build_v2_snapshot(anchor=None, turn=1)
+    snap1["config"] = _add_src_tree_prefix(snap1["config"])
+    ts1 = t0.strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 1, "nap", ts1, snap1)
+
+    snap2 = _build_v2_snapshot(anchor=None, turn=2)
+    ts2 = (t0 + timedelta(minutes=1)).strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 2, "nap", ts2, snap2)
+
+    db_path = tmp_path / "series.db"
+    series.ingest(snapshots_dir, repo_dir, db_path)  # must not raise
+
+    conn = series.open_store(db_path)
+    row_count_1 = conn.execute("SELECT COUNT(*) c FROM l0_points").fetchone()["c"]
+    decl_count_1 = conn.execute("SELECT COUNT(*) c FROM declarations").fetchone()["c"]
+    conn.close()
+
+    result2 = series.ingest(snapshots_dir, repo_dir, db_path)  # idempotent re-run
+
+    conn2 = series.open_store(db_path)
+    row_count_2 = conn2.execute("SELECT COUNT(*) c FROM l0_points").fetchone()["c"]
+    decl_count_2 = conn2.execute("SELECT COUNT(*) c FROM declarations").fetchone()["c"]
+    conn2.close()
+
+    assert row_count_1 == row_count_2 == 2
+    assert decl_count_1 == decl_count_2 == 1
+    assert result2["already_present"] == 2
+    assert result2["commits_done"] == 0
+
+
 # --- 8.6: never-mutate + export preference -----------------------------------
 
 
@@ -3615,6 +3779,57 @@ def test_migration_declarations_model_defs_added(tmp_path):
     row = conn.execute("SELECT model_defs FROM declarations WHERE health_version = 'health-v1.0'").fetchone()
     conn.close()
     assert row["model_defs"] is None
+
+
+def test_migration_declarations_prefix_heal(tmp_path):
+    """Migration 6 (engram-alpha#3122 round 2, should-fix/coverage gap):
+    a `declarations` row seeded with an `engram.health.`-prefixed `config`
+    blob (the src-tree layout artifact the issue diagnosed -- the same
+    shape as the issue's own reported example) is healed in place by
+    `open_store()`: the row's `config` blob no longer contains
+    `"engram.health."`, does contain the canonicalized `"health."` form,
+    the row's `health_version` PK is unchanged (same row, not a
+    duplicate -- exactly 1 row), and `_declarations_needs_prefix_heal`
+    flips to `False` afterward. Seeded via the CURRENT schema's DDL (this
+    migration doesn't need the OLD pre-migration-4/5 shape -- unlike
+    `test_migration_declarations_model_defs_added` immediately above,
+    whose sibling pattern (raw sqlite3 DDL + INSERT, close, then
+    `series.open_store()`) this test otherwise follows)."""
+    db_path = tmp_path / "series.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE declarations (
+            health_version TEXT PRIMARY KEY,
+            signal_defs TEXT,
+            curve_defs TEXT,
+            config TEXT,
+            model_defs TEXT,
+            first_seen_commit TEXT,
+            first_seen_file TEXT,
+            engine_build TEXT
+        );
+        """
+    )
+    bad_config = '{"aspects":[{"scoring_fn":"engram.health.metrics.some_fn"}]}'
+    conn.execute(
+        "INSERT INTO declarations (health_version, signal_defs, curve_defs, config, "
+        "model_defs, first_seen_commit, first_seen_file, engine_build) "
+        "VALUES ('health-v1.0', '{}', '{}', ?, NULL, NULL, 'f.json', 'unknown')",
+        (bad_config,),
+    )
+    conn.commit()
+    conn.close()
+
+    conn = series.open_store(db_path)
+    rows = conn.execute("SELECT health_version, config FROM declarations").fetchall()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["health_version"] == "health-v1.0"
+    assert "engram.health." not in row["config"]
+    assert "health." in row["config"]
+    assert series._declarations_needs_prefix_heal(conn) is False
+    conn.close()
 
 
 # --- 8.11: CLI as script -------------------------------------------------------

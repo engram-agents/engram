@@ -574,8 +574,25 @@ agents inflating past the presented 140 target, or an unusually
 resolve-heavy day) — not something to silently keep absorbing.
 
 ```bash
-# Previous sleep's cohort_end_at (your install's marker path may vary):
-PREV_SLEEP=$(python3 -c "import json; print(json.load(open('$HOME/.engram/sessions/last-sleep-success.json'))['cohort_end_at'])" 2>/dev/null || echo "")
+# Previous sleep's completed_at IS the cohort boundary (the marker's only
+# writer, tools/write_sleep_marker.py, never writes any other boundary key —
+# your install's marker path may vary). No marker file at all is the
+# DOCUMENTED, legitimate first-ever-sleep case (write_sleep_marker.py's own
+# docstring: "or first node in cohort if no prior sleep") — there is no
+# prior cohort boundary, so an empty PREV_SLEEP correctly matches every
+# node. A marker that EXISTS but is missing completed_at is a DIFFERENT
+# situation — a corrupted or old-format marker — and must fail loudly
+# rather than silently collapsing into the same empty string (#3123: that
+# collapse is what silently re-enumerated every node ever created).
+MARKER="$HOME/.engram/sessions/last-sleep-success.json"
+if [ ! -f "$MARKER" ]; then
+  PREV_SLEEP=""
+else
+  PREV_SLEEP=$(python3 -c "import json; print(json.load(open('$MARKER'))['completed_at'])") || {
+    echo "ERROR: $MARKER exists but has no usable 'completed_at' key — cannot compute the cohort boundary. Fix or delete the marker before continuing." >&2
+    exit 1
+  }
+fi
 ```
 
 Use `engram_list` in structured-filter mode to enumerate today's-cohort node IDs directly: `created_at >= PREV_SLEEP` AND `is_current = 1` AND `type != 'evidence'` AND (`needs_tightening = 1` OR `recall_summary IS NULL`) (the `is_current` guard skips superseded tails — their chain-head carries the recall_summary, and summarizing a superseded node wastes fairy compute). Example `filters_json`:

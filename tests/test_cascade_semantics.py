@@ -204,7 +204,7 @@ def test_retract_ob_with_downstream_dv_propagates_taint():
         node_id=ob_id,
         error_type="hallucinated_claim",
         reason="Premise was fabricated.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     assert _is_tainted(core, dv_id, ob_id), (
@@ -225,7 +225,7 @@ def test_retract_dv_with_downstream_dv_propagates_taint():
         node_id=dv1_id,
         error_type="hallucinated_claim",
         reason="Intermediate derivation was wrong.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
     assert _is_tainted(core, dv2_id, dv1_id), (
         f"dv2_id {dv2_id} should be tainted_by {dv1_id}"
@@ -252,7 +252,7 @@ def test_retract_ob_with_supported_by_edge_from_cs_does_NOT_taint_cs():
         node_id=ob1,
         error_type="hallucinated_claim",
         reason="ob1 was fabricated.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     assert not _is_tainted(core, cs_id, ob1), (
@@ -278,7 +278,7 @@ def test_retract_ob_with_exemplifies_edge_to_ls_does_NOT_taint_ls():
         node_id=ob1,
         error_type="hallucinated_claim",
         reason="ob1 was fabricated.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     assert not _is_tainted(core, ls_id, ob1), (
@@ -325,7 +325,7 @@ def test_retract_ob_does_not_recurse_through_cs():
         node_id=ob_a,
         error_type="hallucinated_claim",
         reason="ob_a was wrong.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     # cs not tainted
@@ -423,7 +423,7 @@ def test_retract_last_supporter_of_cs_sets_support_lost():
         node_id=ob_id,
         error_type="hallucinated_claim",
         reason="Sole supporter was fabricated.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     # support_lost must be in return value
@@ -456,7 +456,7 @@ def test_retract_one_of_many_supporters_does_NOT_set_support_lost():
         node_id=obs_list[0],
         error_type="hallucinated_claim",
         reason="First supporter was fabricated.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     assert ret.get("support_lost_count", 0) == 0, (
@@ -478,7 +478,7 @@ def test_retract_last_supporter_via_exemplifies_sets_support_lost():
         node_id=ob_id,
         error_type="hallucinated_claim",
         reason="Incident was fabricated.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     assert ret.get("support_lost_count", 0) == 1, (
@@ -537,7 +537,7 @@ def test_support_lost_logged_in_edit_log():
         node_id=ob_id,
         error_type="hallucinated_claim",
         reason="Fabricated.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
 
     conn = core._get_db()
     try:
@@ -575,7 +575,7 @@ def test_reflect_surfaces_support_lost_node_ids():
         node_id=ob_id,
         error_type="hallucinated_claim",
         reason="Fabricated.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
 
     reflect_result = json.loads(lifecycle._reflect_impl())
     assert "error" not in reflect_result, reflect_result
@@ -605,7 +605,7 @@ def test_reflect_does_not_surface_cs_ls_as_tainted_when_skip_rule_applies():
         node_id=ob1,
         error_type="hallucinated_claim",
         reason="ob1 fabricated.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
 
     reflect_result = json.loads(lifecycle._reflect_impl())
     assert "error" not in reflect_result, reflect_result
@@ -640,7 +640,7 @@ def test_retract_ls_with_supported_by_from_cs_does_NOT_taint_cs():
         node_id=ls_y,
         error_type="hallucinated_claim",
         reason="Lesson was incorrect.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     assert not _is_tainted(core, cs_x, ls_y), (
@@ -671,7 +671,7 @@ def test_retract_cs_with_supported_by_from_other_cs_does_NOT_taint_source_cs():
         node_id=cs_y,
         error_type="hallucinated_claim",
         reason="cs_y was wrong.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     assert not _is_tainted(core, cs_x, cs_y), (
@@ -718,7 +718,7 @@ def test_skip_rule_does_not_recurse_through_cs_or_ls():
         node_id=ob_a,
         error_type="hallucinated_claim",
         reason="ob_a was fabricated.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     # cs_mid: cascade skip rule fires — NOT tainted.
@@ -765,7 +765,7 @@ def test_diamond_cascade_retract_visits_each_node_exactly_once():
         node_id=ob_x,
         error_type="hallucinated_claim",
         reason="ob_x was fabricated.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     # dv_Z should appear exactly once in tainted_downstream.
@@ -840,7 +840,7 @@ def test_three_path_cascade_visits_node_once():
         node_id=ob_x,
         error_type="hallucinated_claim",
         reason="ob_x fabricated — 3-parent test.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     tainted_ids = [t["id"] for t in ret.get("tainted_downstream", [])]
@@ -879,7 +879,7 @@ def test_cascade_stops_at_retracted_downstream_node():
         node_id=dv_a,
         error_type="hallucinated_claim",
         reason="dv_a pre-retracted to set up parity test.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in pre, pre
 
     # Now retract ob_X. The cascade should not include dv_A (already retracted)
@@ -888,7 +888,7 @@ def test_cascade_stops_at_retracted_downstream_node():
         node_id=ob_x,
         error_type="hallucinated_claim",
         reason="ob_x retracted — parity guard test.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     tainted_ids = {t["id"] for t in ret.get("tainted_downstream", [])}
@@ -1323,7 +1323,7 @@ def test_support_lost_mark_restore_remark_round_trip_idempotent():
     # 1. Mark: retract the sole supporter.
     ret1 = json.loads(rev._retract_impl(
         node_id=ob1, error_type="hallucinated_claim", reason="fabricated 1",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert ret1.get("support_lost_count", 0) == 1, ret1
     assert _get_meta(core, cs_id).get("support_lost") is True
 
@@ -1351,7 +1351,7 @@ def test_support_lost_mark_restore_remark_round_trip_idempotent():
     # cs; ob2 is still live, so this should CLEAR support_lost (Part 2).
     ret2 = json.loads(rev._retract_impl(
         node_id=ob3, error_type="hallucinated_claim", reason="fabricated 3",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret2, ret2
     assert _get_meta(core, cs_id).get("support_lost") is not True, (
         f"cs {cs_id} should be restored (ob2 still live), meta: {_get_meta(core, cs_id)}"
@@ -1362,7 +1362,7 @@ def test_support_lost_mark_restore_remark_round_trip_idempotent():
     # 4. Re-mark: retract the last live supporter ob2.
     ret3 = json.loads(rev._retract_impl(
         node_id=ob2, error_type="hallucinated_claim", reason="fabricated 2",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert ret3.get("support_lost_count", 0) == 1, ret3
     assert _get_meta(core, cs_id).get("support_lost") is True
 
@@ -1392,7 +1392,7 @@ def test_register_exemplar_clears_support_lost_marker():
 
     ret = json.loads(rev._retract_impl(
         node_id=ob_incident, error_type="hallucinated_claim", reason="fabricated incident",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert ret.get("support_lost_count", 0) == 1, ret
     assert _get_meta(core, ls_id).get("support_lost") is True
 
@@ -1415,7 +1415,7 @@ def test_genuinely_unsupported_node_stays_marked_through_all_paths():
 
     ret = json.loads(rev._retract_impl(
         node_id=ob_id, error_type="hallucinated_claim", reason="fabricated",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert ret.get("support_lost_count", 0) == 1, ret
     assert _get_meta(core, cs_id).get("support_lost") is True
 

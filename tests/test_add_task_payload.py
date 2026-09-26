@@ -130,6 +130,8 @@ def _retract_node(server, node_id):
         node_id=node_id,
         error_type="other",
         reason="test: verify non-current guard",
+        replacement_absent_because="NONE_BECAUSE_UNKNOWN",
+        replacement_absent_note="test fixture -- replacement decision not under test",
     ))
     assert "error" not in r, r
 

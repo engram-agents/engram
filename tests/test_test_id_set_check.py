@@ -67,6 +67,11 @@ list_test_files = _mod.list_test_files
 read_sources_at_rev = _mod.read_sources_at_rev
 _parse_workflow_scan_roots = _mod._parse_workflow_scan_roots
 TEST_SCAN_ROOTS = _mod.TEST_SCAN_ROOTS
+GhFetchError = _mod.GhFetchError
+_fetch_pr_body = _mod._fetch_pr_body
+_extract_merged_pr_numbers = _mod._extract_merged_pr_numbers
+collect_markers_from_merged_range = _mod.collect_markers_from_merged_range
+collect_range_markers_if_needed = _mod.collect_range_markers_if_needed
 
 
 # ---------------------------------------------------------------------------
@@ -1728,3 +1733,365 @@ def test_2950_pytest_text_embedded_in_a_different_command_is_not_treated_as_real
     )
     with pytest.raises(ValueError, match="no 'run: pytest"):
         _parse_workflow_scan_roots(workflow_shaped_text)
+
+
+# ---------------------------------------------------------------------------
+# #3117 -- release-PR marker aggregation: a THIRD marker source, sourced from
+# already-merged PRs' own bodies in the base..head range (identified via
+# GitHub's own squash-commit-title '(#N)' suffix), fetched via an injectable
+# `gh_runner` so this suite never touches the real network. Real git
+# repos + commit messages (per the file's own #2381/#2568 precedent for
+# anything inherently about git history), fake PR bodies via a plain
+# Python callable injected as `gh_runner` -- no monkeypatch needed for the
+# collection-function tests below; monkeypatch is used ONLY for the one
+# test that exercises `_fetch_pr_body`'s own subprocess plumbing directly,
+# and the one end-to-end test that exercises main()'s own argv-driven path.
+# ---------------------------------------------------------------------------
+
+
+def _make_merged_range_fixture(tmp_path: Path) -> dict[str, str]:
+    """Three squash-commit-shaped commits in a row, each removing ONE test
+    id and each carrying a real GitHub squash-commit-title suffix
+    ('(#101)', '(#102)', '(#103)') -- the only surviving pointer, post-
+    squash, back to the PR whose OWN body (never stored in git; supplied by
+    each test's own fake gh_runner) once carried its own Removed-test
+    marker. Mirrors #3117's real motivating shape: three already-merged dev
+    PRs landing in the range a release PR's base..head spans."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.com")
+
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_mod.py").write_text(
+        "def test_a():\n    assert True\n\n\ndef test_b():\n    assert True\n\n\ndef test_c():\n    assert True\n"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    (tests_dir / "test_mod.py").write_text("def test_b():\n    assert True\n\n\ndef test_c():\n    assert True\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "Remove test_a (#101)")
+
+    (tests_dir / "test_mod.py").write_text("def test_c():\n    assert True\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "Remove test_b (#102)")
+
+    (tests_dir / "test_mod.py").write_text("")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "Remove test_c (#103)")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    return {"repo": str(repo), "base": base, "head": head}
+
+
+def _ids_at(repo: str, base: str, head: str) -> tuple[set[str], set[str]]:
+    base_ids = collect_ids(read_sources_at_rev(Path(repo), base))
+    head_ids = collect_ids(read_sources_at_rev(Path(repo), head))
+    return base_ids, head_ids
+
+
+# --- _extract_merged_pr_numbers -------------------------------------------
+
+
+def test_3117_extract_merged_pr_numbers_reads_squash_commit_suffixes(tmp_path: Path):
+    fx = _make_merged_range_fixture(tmp_path)
+    numbers = _extract_merged_pr_numbers(Path(fx["repo"]), fx["base"], fx["head"])
+    assert numbers == [103, 102, 101], "git log --oneline order is newest-first"
+
+
+def test_3117_extract_merged_pr_numbers_skips_commits_without_a_suffix(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.com")
+    (repo / "a.txt").write_text("x\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "a.txt").write_text("y\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "a plain commit, no PR suffix")
+    (repo / "a.txt").write_text("z\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "Fix something (#55)")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert _extract_merged_pr_numbers(repo, base, head) == [55]
+
+
+# --- _fetch_pr_body --------------------------------------------------------
+
+
+def test_3117_fetch_pr_body_raises_ghfetcherror_on_non_zero_exit(monkeypatch: pytest.MonkeyPatch):
+    """The one test in this section that touches `_fetch_pr_body` itself
+    rather than injecting a fake in its place -- `subprocess.run` is faked
+    (monkeypatch, auto-restored) so this never reaches the real network,
+    while still exercising the actual raise-on-failure behavior the rest of
+    this section's tests take on faith via their own injected `gh_runner`."""
+
+    class _FakeResult:
+        returncode = 1
+        stdout = ""
+        stderr = "gh: authentication required"
+
+    def fake_run(cmd, capture_output=True, text=True):
+        return _FakeResult()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(GhFetchError, match="authentication required"):
+        _fetch_pr_body("engram-agents", "engram-alpha", 999)
+
+
+# --- collect_markers_from_merged_range (spec item 1 & 3) -------------------
+
+
+def test_3117_real_motivating_case_two_marked_one_unmarked(tmp_path: Path):
+    """The real motivating case, reconstructed (spec item 1): #101 and #102's
+    (mocked) bodies each carry a Removed-test marker for their own removed
+    id; #103's carries none. #101/#102's disappearances are accounted for
+    via this new range source; #103's stays unaccounted -- this is the real
+    leak case #3117 exists to keep catching, not paper over."""
+    fx = _make_merged_range_fixture(tmp_path)
+
+    def fake_gh_runner(owner: str, repo: str, pr_number: int) -> str:
+        assert (owner, repo) == ("engram-agents", "engram-alpha")
+        return {
+            101: "Removed-test: tests/test_mod.py::test_a — no longer needed.\n",
+            102: "Removed-test: tests/test_mod.py::test_b — no longer needed.\n",
+            103: "",
+        }[pr_number]
+
+    markers, warnings = collect_markers_from_merged_range(
+        Path(fx["repo"]), fx["base"], fx["head"], "engram-agents", "engram-alpha", gh_runner=fake_gh_runner
+    )
+    assert warnings == []
+
+    base_ids, head_ids = _ids_at(fx["repo"], fx["base"], fx["head"])
+    report = evaluate(base_ids, head_ids, markers)
+    assert report.unaccounted == ("tests/test_mod.py::test_c",)
+
+
+def test_3117_fetch_failure_fails_loud_not_silent_pass(tmp_path: Path):
+    """Spec item 3: PR #101's fetch fails outright. Its disappearance
+    (test_a) must stay unaccounted and the overall report must FAIL -- never
+    a silent pass just because the failure happened inside a network call
+    rather than because nobody wrote a marker."""
+    fx = _make_merged_range_fixture(tmp_path)
+
+    def failing_gh_runner(owner: str, repo: str, pr_number: int) -> str:
+        if pr_number == 101:
+            raise GhFetchError("simulated: gh not authenticated")
+        return {
+            102: "Removed-test: tests/test_mod.py::test_b — no longer needed.\n",
+            103: "Removed-test: tests/test_mod.py::test_c — no longer needed.\n",
+        }[pr_number]
+
+    markers, warnings = collect_markers_from_merged_range(
+        Path(fx["repo"]), fx["base"], fx["head"], "engram-agents", "engram-alpha", gh_runner=failing_gh_runner
+    )
+    assert len(warnings) == 1
+    assert "#101" in warnings[0]
+
+    base_ids, head_ids = _ids_at(fx["repo"], fx["base"], fx["head"])
+    report = evaluate(base_ids, head_ids, markers)
+    assert report.passed is False
+    assert report.unaccounted == ("tests/test_mod.py::test_a",), (
+        "the FAILED fetch's own disappearance must be the one left unaccounted -- "
+        "not silently dropped, not silently accounted-for"
+    )
+
+
+def test_3117_stale_marker_from_range_source_warns_like_any_other_source(tmp_path: Path):
+    """A range-sourced marker naming an id that did NOT disappear must warn,
+    not fail -- same posture `evaluate()` already gives a stale body/diff
+    marker. Exercised through evaluate() (the range source's markers are
+    plain Marker objects flowing through the same unchanged accounting
+    path), not a special case in the collection function itself."""
+    fx = _make_merged_range_fixture(tmp_path)
+
+    def fake_gh_runner(owner: str, repo: str, pr_number: int) -> str:
+        return {
+            101: "Removed-test: tests/test_mod.py::test_a — no longer needed.\n",
+            102: "Removed-test: tests/test_mod.py::test_does_not_exist — stale.\n",
+            103: "Removed-test: tests/test_mod.py::test_c — no longer needed.\n",
+        }[pr_number]
+
+    markers, warnings = collect_markers_from_merged_range(
+        Path(fx["repo"]), fx["base"], fx["head"], "engram-agents", "engram-alpha", gh_runner=fake_gh_runner
+    )
+    assert warnings == []  # collect_markers_from_merged_range itself has nothing to warn about here
+
+    base_ids, head_ids = _ids_at(fx["repo"], fx["base"], fx["head"])
+    report = evaluate(base_ids, head_ids, markers)
+    assert report.unaccounted == ("tests/test_mod.py::test_b",)
+    assert any("test_does_not_exist" in w for w in report.warnings)
+
+
+# --- collect_range_markers_if_needed ("only fetch what's needed") ---------
+
+
+def test_3117_no_network_when_nothing_unaccounted():
+    """Spec item 2: when the existing two sources already account for
+    everything, `gh_runner` must NEVER be called -- asserted by call count,
+    not merely by the resulting report staying empty. `repo_root`/`base`/
+    `head` are deliberately nonsense values: if this test ever regresses to
+    calling the network path, `_run_git` would raise on them long before
+    any assertion below could tell the difference, which is itself a
+    second, independent signal that the call-count assertion is doing real
+    work here."""
+    calls: list[int] = []
+
+    def counting_gh_runner(owner: str, repo: str, pr_number: int) -> str:
+        calls.append(pr_number)
+        return ""
+
+    preliminary_report = evaluate({"a"}, {"a"}, markers=[])
+    assert preliminary_report.unaccounted == ()
+
+    markers, warnings = collect_range_markers_if_needed(
+        preliminary_report,
+        Path("/nonexistent/not-a-repo"),
+        "not-a-real-base",
+        "not-a-real-head",
+        "engram-agents",
+        "engram-alpha",
+        gh_runner=counting_gh_runner,
+    )
+    assert calls == [], "gh_runner must never be called when nothing is unaccounted"
+    assert markers == []
+    assert warnings == []
+
+
+def test_3117_network_used_when_something_unaccounted(tmp_path: Path):
+    """The other half of the same contract: when the preliminary report DOES
+    have an unaccounted disappearance, the range source IS consulted --
+    proven by call count, not merely by the resulting report."""
+    fx = _make_merged_range_fixture(tmp_path)
+    calls: list[int] = []
+
+    def counting_gh_runner(owner: str, repo: str, pr_number: int) -> str:
+        calls.append(pr_number)
+        return {
+            101: "Removed-test: tests/test_mod.py::test_a — no longer needed.\n",
+            102: "Removed-test: tests/test_mod.py::test_b — no longer needed.\n",
+            103: "Removed-test: tests/test_mod.py::test_c — no longer needed.\n",
+        }[pr_number]
+
+    base_ids, head_ids = _ids_at(fx["repo"], fx["base"], fx["head"])
+    preliminary_report = evaluate(base_ids, head_ids, markers=[])
+    assert preliminary_report.unaccounted, "sanity: the fixture must genuinely leave something unaccounted"
+
+    markers, warnings = collect_range_markers_if_needed(
+        preliminary_report,
+        Path(fx["repo"]),
+        fx["base"],
+        fx["head"],
+        "engram-agents",
+        "engram-alpha",
+        gh_runner=counting_gh_runner,
+    )
+    assert sorted(calls) == [101, 102, 103]
+    assert warnings == []
+    report = evaluate(base_ids, head_ids, markers)
+    assert report.passed
+
+
+def test_3117_missing_gh_repo_skips_the_range_source_without_crashing(tmp_path: Path):
+    """`--gh-repo` (here: gh_owner/gh_repo being None) is not required up
+    front -- when the range source would be needed but no OWNER/REPO was
+    given, this must reproduce today's pre-#3117 behavior (unaccounted stays
+    unaccounted, gate still fails) rather than crashing, and it must name
+    WHY the range source was skipped."""
+    fx = _make_merged_range_fixture(tmp_path)
+    base_ids, head_ids = _ids_at(fx["repo"], fx["base"], fx["head"])
+    preliminary_report = evaluate(base_ids, head_ids, markers=[])
+    assert preliminary_report.unaccounted
+
+    markers, warnings = collect_range_markers_if_needed(
+        preliminary_report, Path(fx["repo"]), fx["base"], fx["head"], None, None
+    )
+    assert markers == []
+    assert len(warnings) == 1
+    assert "--gh-repo" in warnings[0]
+
+
+# --- main() end-to-end (the real CLI wiring) -------------------------------
+
+
+def test_3117_main_end_to_end_accounts_two_fails_one_via_gh_repo(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+):
+    """End-to-end through main() itself, matching the real CI invocation
+    shape (`--gh-repo owner/repo` wired in per this PR's pr-checks.yml
+    change): `_fetch_pr_body` is monkeypatched (module-level, the actual
+    default `gh_runner`) so main()'s own argv-driven code path -- which has
+    no way to accept a Python callable -- is exercised without any real
+    network call."""
+
+    def fake_fetch_pr_body(owner: str, repo: str, pr_number: int) -> str:
+        assert (owner, repo) == ("test-owner", "test-repo")
+        return {
+            101: "Removed-test: tests/test_mod.py::test_a — no longer needed.\n",
+            102: "Removed-test: tests/test_mod.py::test_b — no longer needed.\n",
+            103: "Removed-test: tests/test_mod.py::test_c — no longer needed.\n",
+        }[pr_number]
+
+    monkeypatch.setattr(_mod, "_fetch_pr_body", fake_fetch_pr_body)
+
+    fx = _make_merged_range_fixture(tmp_path)
+    exit_code = main(
+        [
+            "--base",
+            fx["base"],
+            "--head",
+            fx["head"],
+            "--repo-root",
+            fx["repo"],
+            "--gh-repo",
+            "test-owner/test-repo",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0, captured.out + captured.err
+    assert "PASS" in captured.out
+
+
+def test_3117_main_end_to_end_fails_loud_on_a_fetch_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+):
+    """Same end-to-end wiring, but PR #101's fetch fails: main() must exit
+    1 (not 0) and name the failed fetch on stderr as an ::error::, never
+    silently pass because the failure happened in the network layer."""
+
+    def failing_fetch_pr_body(owner: str, repo: str, pr_number: int) -> str:
+        if pr_number == 101:
+            raise GhFetchError("simulated: gh rate-limited")
+        return {
+            102: "Removed-test: tests/test_mod.py::test_b — no longer needed.\n",
+            103: "Removed-test: tests/test_mod.py::test_c — no longer needed.\n",
+        }[pr_number]
+
+    monkeypatch.setattr(_mod, "_fetch_pr_body", failing_fetch_pr_body)
+
+    fx = _make_merged_range_fixture(tmp_path)
+    exit_code = main(
+        [
+            "--base",
+            fx["base"],
+            "--head",
+            fx["head"],
+            "--repo-root",
+            fx["repo"],
+            "--gh-repo",
+            "test-owner/test-repo",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "::error::" in captured.err
+    assert "#101" in captured.err
+    assert "tests/test_mod.py::test_a" in captured.out
