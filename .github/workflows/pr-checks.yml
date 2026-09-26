@@ -50,6 +50,18 @@ name: pr-checks
 #      step is waiting on. `continue-on-error` on the checkout keeps this
 #      advisory (a loud ::warning::, never a silent pass) until then, so
 #      it does not block every PR to this repo on an org-admin item.)
+#   11. check-stubbed-signatures  (#3118 — BLOCKING; a signature change to a
+#      function stubbed BY BARE NAME in a test (monkeypatch.setattr, or a
+#      removed stdlib-transport call a stub relies on going away) is
+#      invisible to tools/run_touched_tests.py's import-graph +
+#      convention-map selection, which resolves by import/path, never by the
+#      bare names a stub binds. #3110 changed _fetch_threads/_fetch_inbox's
+#      signatures and moved a POST call off urlopen onto http.client; the
+#      two test files stubbing those exact names were never selected by the
+#      hand-picked "affected tests" list and the gap was only caught when
+#      the full suite ran on the release PR. tools/check_stubbed_signatures.py
+#      is additive, not a replacement for run_touched_tests.py — see that
+#      tool's own module docstring.)
 
 on:
   pull_request:
@@ -893,6 +905,73 @@ jobs:
           else
             echo "::warning::team-practice-drift-gate could not check out engram-agents/team-practice, and this is NOT a fork PR — that means the secret was deleted, renamed, or mis-scoped. CLAUDE.md's generated-region drift is NOT being checked on this run — see umwelt#811."
           fi
+
+      # ── 11. check-stubbed-signatures ────────────────────────────────────
+      # #3118 — see this file's header comment (step 11) and
+      # tools/check_stubbed_signatures.py's own module docstring for the
+      # full rationale. BLOCKING: a stub-shadowed signature regression is
+      # currently free at PR time (only caught hours later on the
+      # dev->main release cut); an advisory posture would leave it free,
+      # same reasoning as test-id-set-check / hooks-stdout-audit above.
+      #
+      # The tool itself needs nothing beyond stdlib (argparse/re/subprocess/
+      # sys/pathlib — confirmed via its own imports) and runs real `git`
+      # subprocess calls against THIS checkout, which the job's
+      # actions/checkout@v4 step already provides with fetch-depth: 0. No
+      # extra install step for the tool's own run. Dependencies for the
+      # AFFECTED TESTS it selects (if any) are installed separately below,
+      # conditionally — most PRs touch nothing this gate flags, and paying
+      # requirements-dev.txt's install cost on every PR regardless would be
+      # the wrong trade (mirrors the roster-check / scan pair idiom used by
+      # name-leak-warn / hooks-stdout-audit above: an id: + $GITHUB_OUTPUT
+      # flag gates the heavier steps that follow).
+      - name: check-stubbed-signatures — compute stub-affected test files
+        id: stub-check
+        run: |
+          set +e
+          python3 tools/check_stubbed_signatures.py --base "origin/${{ github.base_ref }}" > /tmp/stub_affected_tests.txt
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::check_stubbed_signatures.py failed (exit $STATUS) — see the log above for the stderr message."
+            exit "$STATUS"
+          fi
+          if [ -s /tmp/stub_affected_tests.txt ]; then
+            echo "has_hits=true" >> "$GITHUB_OUTPUT"
+            echo "Stub-affected test files for this diff:"
+            cat /tmp/stub_affected_tests.txt
+          else
+            echo "has_hits=false" >> "$GITHUB_OUTPUT"
+            echo "No stub-affected test files for this diff. ✓"
+          fi
+
+      - name: Set up Python 3.12 (check-stubbed-signatures)
+        if: steps.stub-check.outputs.has_hits == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/requirements-dev.txt
+
+      - name: check-stubbed-signatures — install dependencies for affected tests
+        if: steps.stub-check.outputs.has_hits == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements/requirements-dev.txt
+          # src/forum/tests/ imports forum.server (Flask + bleach +
+          # markdown-it-py + beautifulsoup4 + html5lib); those deps live in
+          # src/forum/requirements.txt — same rationale as affected-tests.yml's
+          # identical install step. Installed unconditionally here (rather
+          # than a second path-scoped conditional) since it's cheap relative
+          # to requirements-dev.txt and this step already only runs when
+          # there are hits to test.
+          if grep -q '^src/forum/tests/' /tmp/stub_affected_tests.txt; then
+            pip install -r src/forum/requirements.txt
+          fi
+
+      - name: check-stubbed-signatures — run stub-affected tests
+        if: steps.stub-check.outputs.has_hits == 'true'
+        run: python3 -m pytest $(cat /tmp/stub_affected_tests.txt) -v --tb=short
 
   # ── macos-bash32-syntax (#2979) ─────────────────────────────────────────
   # A separate job, not a step in pr-checks above, because it needs a
