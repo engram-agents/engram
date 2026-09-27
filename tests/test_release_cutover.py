@@ -200,6 +200,170 @@ class TestMinusSetApplication:
 
 
 # ---------------------------------------------------------------------------
+# 1b. Gitignore-style anchoring (#2516) — contract tests, written before the
+#     implementation per CLAUDE.md's contract-first-tests convention.
+#
+#     Directory entries root-anchor only when they carry a non-trailing slash
+#     (or a leading slash); a bare `name/` entry matches a directory named
+#     `name` at ANY depth, matching the minus-set file's own documented
+#     "gitignore-style globs" header. `*` never crosses a `/` boundary.
+# ---------------------------------------------------------------------------
+
+class TestMinusSetGitignoreAnchoring:
+    def _make_tree(self, tmp_path: Path, files: dict[str, str]) -> Path:
+        d = tmp_path / "snap"
+        d.mkdir()
+        for relpath, content in files.items():
+            p = d / relpath
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+        return d
+
+    def test_c1_unanchored_dir_entry_matches_any_depth(self, tmp_path):
+        """C1: a `tests/` entry removes a nested a/b/tests/x.py AND a
+        top-level tests/y.py."""
+        snap = self._make_tree(tmp_path, {
+            "a/b/tests/x.py": "# nested test fixture",
+            "tests/y.py": "# top-level test",
+        })
+        removed, warned = apply_minus_set(snap, ["tests/"])
+        assert not (snap / "a" / "b" / "tests").exists()
+        assert not (snap / "tests").exists()
+        assert warned == []
+
+    def test_c2_anchored_dir_entry_matches_root_only(self, tmp_path):
+        """C2: a `/deploy/` entry removes top-level deploy/z.sh but NOT
+        src/forum/deploy/install.sh."""
+        snap = self._make_tree(tmp_path, {
+            "deploy/z.sh": "# top-level deploy",
+            "src/forum/deploy/install.sh": "# nested deploy — must survive",
+        })
+        removed, warned = apply_minus_set(snap, ["/deploy/"])
+        assert not (snap / "deploy").exists()
+        assert (snap / "src" / "forum" / "deploy" / "install.sh").exists()
+
+    def test_c3_sibling_of_nested_matched_dir_still_ships(self, tmp_path):
+        """C3 positive control: with `tests/` in the list, a sibling file of
+        the nested tests dir still ships."""
+        snap = self._make_tree(tmp_path, {
+            "src/forum/tests/x.py": "# nested test fixture",
+            "src/forum/server.py": "# sibling — must survive",
+        })
+        removed, warned = apply_minus_set(snap, ["tests/"])
+        assert not (snap / "src" / "forum" / "tests").exists()
+        assert (snap / "src" / "forum" / "server.py").exists()
+
+    def test_c4_anchored_file_entry_matches_root_only(self, tmp_path):
+        """C4: an anchored file entry `tools/foo.py` removes top-level
+        tools/foo.py but NOT src/engram/tools/foo.py."""
+        snap = self._make_tree(tmp_path, {
+            "tools/foo.py": "# top-level",
+            "src/engram/tools/foo.py": "# nested — must survive",
+        })
+        removed, warned = apply_minus_set(snap, ["tools/foo.py"])
+        assert not (snap / "tools" / "foo.py").exists()
+        assert (snap / "src" / "engram" / "tools" / "foo.py").exists()
+
+    def test_c5_bare_file_entry_matches_any_depth(self, tmp_path):
+        """C5: a bare file entry `CLAUDE.md` removes both top-level and
+        nested CLAUDE.md (unchanged behavior, pinned)."""
+        snap = self._make_tree(tmp_path, {
+            "CLAUDE.md": "# top-level",
+            "sub/CLAUDE.md": "# nested",
+        })
+        removed, warned = apply_minus_set(snap, ["CLAUDE.md"])
+        assert not (snap / "CLAUDE.md").exists()
+        assert not (snap / "sub" / "CLAUDE.md").exists()
+
+    def test_c6_dir_entry_never_removes_same_named_file(self, tmp_path):
+        """C6: a dir entry never removes a same-named FILE (a `tests` file
+        at root is not removed by `tests/`)."""
+        snap = self._make_tree(tmp_path, {
+            "tests": "# this is a FILE named tests, not a directory",
+            "other.py": "# unrelated",
+        })
+        removed, warned = apply_minus_set(snap, ["tests/"])
+        assert (snap / "tests").exists()
+        assert (snap / "other.py").exists()
+
+    def test_c7_glob_does_not_cross_slash(self, tmp_path):
+        """C7: `*` does not cross `/`: an entry `docs/*.md` removes
+        docs/a.md but not docs/sub/b.md."""
+        snap = self._make_tree(tmp_path, {
+            "docs/a.md": "# direct child — should be removed",
+            "docs/sub/b.md": "# grandchild — must survive",
+        })
+        removed, warned = apply_minus_set(snap, ["docs/*.md"])
+        assert not (snap / "docs" / "a.md").exists()
+        assert (snap / "docs" / "sub" / "b.md").exists()
+
+    def test_c8_entry_matching_nothing_warns(self, tmp_path):
+        """C8: an entry matching nothing lands in `warned`."""
+        snap = self._make_tree(tmp_path, {"server.py": "# server"})
+        removed, warned = apply_minus_set(snap, ["nonexistent/"])
+        assert "nonexistent/" in warned
+        assert removed == []
+
+
+# ---------------------------------------------------------------------------
+# 1c. Symlink-in-removal-loop (PR #3164 review, round 1) — contract tests
+#     written before the fix per CLAUDE.md's contract-first-tests convention.
+#
+#     A matched path that is itself a symlink (to a directory OR a file) must
+#     be removed as a link (p.unlink()), never followed into via rmtree/read.
+#     A matched real directory is still removed with rmtree; a matched real
+#     file with unlink (unchanged). A broken symlink that matches is removed
+#     without error. `is_symlink()` must be checked BEFORE `is_dir()`, since
+#     `is_dir()` follows links.
+# ---------------------------------------------------------------------------
+
+class TestMinusSetSymlinkRemoval:
+    def _make_tree(self, tmp_path: Path, files: dict[str, str]) -> Path:
+        d = tmp_path / "snap"
+        d.mkdir()
+        for relpath, content in files.items():
+            p = d / relpath
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+        return d
+
+    def test_symlink_to_dir_matched_removed_as_link_not_rmtree(self, tmp_path):
+        """A dir-entry match against a directory SYMLINK removes the link
+        itself; the link's target directory and its contents survive.
+
+        Regression test for shutil.rmtree(p) crashing with OSError when p is
+        a symlink to a directory (reviewer-flagged, PR #3164 round 1 --
+        `tools/engine` and `tools/engram-pkg` are real instances of this
+        shape in the repo, and this PR's any-depth unanchored matching
+        widens the reachable surface vs. the old root-only matching)."""
+        snap = self._make_tree(tmp_path, {
+            "real_target/file.txt": "# lives inside the real dir",
+        })
+        link = snap / "engine"
+        link.symlink_to(snap / "real_target", target_is_directory=True)
+
+        removed, warned = apply_minus_set(snap, ["engine/"])
+
+        assert not link.is_symlink(), "the symlink itself must be gone"
+        assert (snap / "real_target").is_dir(), "the link's target directory must survive"
+        assert (snap / "real_target" / "file.txt").exists(), "the target's contents must survive"
+        assert warned == []
+
+    def test_broken_symlink_matched_removed_without_error(self, tmp_path):
+        """A matched symlink whose target no longer exists (a broken/dangling
+        symlink) is removed without raising."""
+        snap = self._make_tree(tmp_path, {"other.py": "# unrelated"})
+        link = snap / "dangling"
+        link.symlink_to(snap / "does_not_exist")
+
+        removed, warned = apply_minus_set(snap, ["dangling"])
+
+        assert not link.is_symlink(), "the broken symlink must be removed"
+        assert (snap / "other.py").exists()
+        assert warned == []
+
+
+# ---------------------------------------------------------------------------
 # 2. Snapshot excludes untracked + gitignored files
 # ---------------------------------------------------------------------------
 
