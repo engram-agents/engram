@@ -38,9 +38,12 @@ what lets it ship at convenience tier instead of dev (see
 `src/build/packaging/tiers.json`'s own entry/note for this module).
 
 Nothing in this module writes any `l0_records` row, ingests any JSONL file,
-schedules any daemon, or renders any CLI-consumed single-line health-status
-summary — WS6 (#3135) and WS8 (not yet built) own those, respectively. This
-module's own `main()` CLI is a raw per-site table, not WS8's rendering.
+or schedules any daemon — WS6 (#3135) owns those. This module's own `main()`
+CLI is a raw per-site table; `summary_line()` (WS8, issue #3137) is the
+separate one-line rendering that engram_diagnose (engram_stats.py) and the
+nightly dream record (agents/claude/engram-dream-master.md) put on their own
+surfaces — see that function's own docstring/section comment, further down
+in this file.
 """
 
 from __future__ import annotations
@@ -51,13 +54,13 @@ import os
 import re
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from engram_telemetry_store import open_store
 
-__all__ = ["compute_verdicts", "brute_force_verdicts"]
+__all__ = ["compute_verdicts", "brute_force_verdicts", "summary_line"]
 
 REACHED_EVENT_TYPE = "engram.telemetry.reached"
 
@@ -513,12 +516,191 @@ def compute_verdicts(conn: sqlite3.Connection, targets_map: dict, window: str) -
 
 
 # ---------------------------------------------------------------------------
+# summary_line -- WS8 (issue #3137, epic #2574 phase 2): the ONE summary line
+# rendered onto engram_diagnose's output (engram_stats.py) and the nightly
+# dream record. compute_verdicts()/the CLI above are a raw per-site table;
+# nobody reading engram_diagnose or the dream record opens records.db
+# directly, so this is the one line that surfaces telemetry health on the
+# two surfaces people already read.
+#
+# THE ONE INVARIANT THIS UNIT EXISTS FOR: "we could not check" must NEVER
+# render as "everything is healthy". A missing records.db, a missing
+# verdicts table, a stale ingest, or zero rows for the requested window must
+# ALL render as a "not aggregated" line -- never a line of zero counts,
+# which would be indistinguishable from a genuinely healthy, fully-checked
+# window. See this module's own contract tests
+# (tests/test_telemetry_ws8_summary_line.py) for the C2 class that pins this
+# down directly.
+#
+# The 7 named counts in the rendered line use their STORED verdict-column
+# values character-for-character (issue #3137's own amendment, mid-review:
+# an earlier draft of the issue showed a display-only rename of
+# UNWIRED-SILENT to "NOT WIRED" in its example line -- that was the issue
+# author's own typo/slip, not a design decision; no renaming happens here).
+# `DELIVERING` (the fully-healthy verdict) is not one of the 7 named counts
+# but still contributes to the `<N> sites` total.
+# ---------------------------------------------------------------------------
+
+_SUMMARY_NAMED_VERDICTS: list[str] = [
+    "DARK",
+    "DEGRADED",
+    "INIT-FAILED",
+    "INCONSISTENT",
+    "NOT REACHED",
+    "GUARDED OUT",
+    "UNWIRED-SILENT",
+]
+
+_SUMMARY_NOT_AGGREGATED_MISSING = "telemetry: not aggregated (records.db missing)"
+_SUMMARY_NOT_AGGREGATED_NO_INGEST_TIMESTAMP = (
+    "telemetry: not aggregated (ingest timestamp unavailable)"
+)
+
+_SUMMARY_STALE_INGEST_DAYS = 2
+
+
+def _summary_table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone()
+    return row is not None
+
+
+def _summary_parse_iso_utc(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 UTC timestamp in the shape `_now_utc_iso` writes
+    (e.g. "2026-09-25T10:00:00.000Z"). Returns None (never raises) on
+    anything unparseable -- an unparseable stored timestamp is treated the
+    same as "no timestamp available" by the caller (`summary_line`), per
+    this function's own docstring contract: a corrupt/foreign timestamp
+    string in `ingest_offsets` must not crash the summary line, and must
+    not be silently treated as "fresh" either."""
+    if not isinstance(value, str) or not value:
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def summary_line(db_path, window: Optional[str] = None) -> str:
+    """Render the ONE telemetry summary line for `db_path`'s `verdicts`
+    table -- issue #3137 (WS8, epic #2574 phase 2).
+
+    Opens `db_path` read-only (never writes, never creates). Resolves
+    `window` to the most recent window present when not given explicitly
+    (a caller-supplied `window` that fails `_validate_window` raises
+    ValueError -- a caller bug, not a data-quality question this function
+    answers). Cross-checks staleness against `ingest_offsets` (WS6's own
+    ingest-timestamp table, populated independently of `compute_verdicts`):
+    a store whose most recent ingest is more than
+    `_SUMMARY_STALE_INGEST_DAYS` days old, or that carries zero `verdicts`
+    rows for the resolved window specifically, is reported as
+    "not aggregated" rather than rendered as a (misleadingly healthy) line
+    of zero counts.
+
+    Never writes anything; always closes the connection it opens
+    (try/finally). May raise (a malformed `window`, or an unexpected sqlite
+    error) -- callers that need a never-raises guarantee wrap the call
+    themselves (see engram_stats.py's `_diagnose_impl`, which converts any
+    exception here into a `"telemetry: unavailable (...)"` string).
+    """
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        except sqlite3.OperationalError:
+            return _SUMMARY_NOT_AGGREGATED_MISSING
+
+        if not _summary_table_exists(conn, "verdicts"):
+            return _SUMMARY_NOT_AGGREGATED_MISSING
+
+        if window is not None:
+            _validate_window(window)  # ValueError propagates -- caller bug
+            resolved_window = window
+        else:
+            row = conn.execute("SELECT MAX(window) FROM verdicts").fetchone()
+            resolved_window = row[0] if row else None
+            if resolved_window is None:
+                # Table exists but carries zero rows at all -- fresh/empty
+                # store, same as "nothing has aggregated yet".
+                return _SUMMARY_NOT_AGGREGATED_MISSING
+
+        last_ingest_raw: Optional[str] = None
+        if _summary_table_exists(conn, "ingest_offsets"):
+            row = conn.execute("SELECT MAX(last_ingested_at) FROM ingest_offsets").fetchone()
+            last_ingest_raw = row[0] if row else None
+
+        if not last_ingest_raw:
+            # No ingest_offsets table, or an empty one -- "no timestamp
+            # available". Reviewer-fairy round 1 (PR-3170) caught that this
+            # used to reuse _SUMMARY_NOT_AGGREGATED_MISSING, which reads
+            # "records.db missing" even when records.db and verdicts both
+            # genuinely exist with healthy data -- misleading about which
+            # table is actually the problem, even though it never produces a
+            # fake-healthy line either way. A distinct message names the
+            # real cause.
+            return _SUMMARY_NOT_AGGREGATED_NO_INGEST_TIMESTAMP
+
+        last_ingest_dt = _summary_parse_iso_utc(last_ingest_raw)
+        if last_ingest_dt is None:
+            # Stored timestamp exists but is not parseable -- same "ingest
+            # timestamp unavailable" case as a missing one, not a missing
+            # records.db.
+            return _SUMMARY_NOT_AGGREGATED_NO_INGEST_TIMESTAMP
+
+        window_count_row = conn.execute(
+            "SELECT COUNT(*) FROM verdicts WHERE window = ?", (resolved_window,)
+        ).fetchone()
+        window_count = window_count_row[0] if window_count_row else 0
+
+        is_stale = (datetime.now(timezone.utc) - last_ingest_dt) > timedelta(days=_SUMMARY_STALE_INGEST_DAYS)
+        if is_stale or window_count == 0:
+            return f"telemetry: not aggregated (last ingest {last_ingest_raw})"
+
+        counts = {name: 0 for name in _SUMMARY_NAMED_VERDICTS}
+        unrecognized: list[tuple[str, int]] = []
+        cur = conn.execute(
+            "SELECT verdict, COUNT(*) as c FROM verdicts WHERE window = ? GROUP BY verdict",
+            (resolved_window,),
+        )
+        for verdict, c in cur.fetchall():
+            if verdict in counts:
+                counts[verdict] = c
+            elif verdict != "DELIVERING":
+                # Design-conformance read (PR-3170, Borges): a verdict that
+                # is neither one of the named 7 nor the fully-healthy
+                # DELIVERING is exactly the case _SUMMARY_NAMED_VERDICTS
+                # drifting out of sync with WS7's _VERDICT_CONDITIONS would
+                # produce -- a NEW fault verdict silently counted into
+                # `window_count` but rendered nowhere. Render it too, so an
+                # unpinned drift shows up on the line instead of
+                # disappearing into the total.
+                unrecognized.append((verdict, c))
+            # DELIVERING itself (fully healthy) still counted toward
+            # window_count above via the separate COUNT(*) query, by design.
+
+        breakdown = " · ".join(f"{name} {counts[name]}" for name in _SUMMARY_NAMED_VERDICTS)
+        for verdict, c in sorted(unrecognized):
+            breakdown += f" · {verdict} {c}"
+        return f"telemetry {resolved_window}: {window_count} sites · {breakdown}"
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
 # CLI -- python -m engram_telemetry_verdicts [--window YYYY-MM-DD] [--db PATH]
 #        [--targets-map PATH]
 # Exits 0 always: it's a report, not a gate (§8: telemetry gates nothing T1).
-# WS8 (not yet built) is what reads these rows to render a health-status
-# surface; this CLI is a raw per-site table for a human/operator to read
-# directly in the meantime.
+# The CLI above is a raw per-site table for a human/operator to read
+# directly; `summary_line` (just above) is the one-line rendering WS8 puts
+# onto engram_diagnose's output and the nightly dream record.
 # ---------------------------------------------------------------------------
 
 

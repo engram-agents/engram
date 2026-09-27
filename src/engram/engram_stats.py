@@ -1402,6 +1402,24 @@ def _diagnose_impl() -> str:
         banner = core._walguard_degraded_banner()
         if banner:
             metrics["_walguard_warning"] = banner
+
+        # ── Telemetry (WS8, issue #3137, epic #2574) ─────────────────────
+        # Guarded import: engram_telemetry_verdicts.py ships at convenience
+        # tier; engram_stats.py is essential — this repo's established
+        # shape for an essential-tier module optionally consuming a
+        # convenience-tier one (see src/engram/tools/_status_derive.py's own
+        # lazy guarded import, same pattern). _diagnose_impl() must return
+        # normally no matter what happens in this block.
+        try:
+            import engram_telemetry_verdicts as _telemetry_mod
+        except ImportError:
+            metrics["telemetry"] = "telemetry: not installed (convenience tier)"
+        else:
+            try:
+                metrics["telemetry"] = _telemetry_mod.summary_line(_telemetry_mod._default_db_path())
+            except Exception as exc:
+                metrics["telemetry"] = f"telemetry: unavailable ({exc!r})"
+
         return json.dumps(metrics)
     finally:
         conn.close()
