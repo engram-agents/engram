@@ -79,6 +79,24 @@ with an `-alpha` suffix during the alpha phase.
   original walk couldn't work against the flattened, `tiers.json`-less
   layout of an installed plugin; a drift gate keeps the committed map
   honest against the real tree (#3156, closes #3136).
+- **The WS7 verdicts now surface as one telemetry line where people
+  already look: `engram_diagnose`'s output and the nightly dream
+  record.** A single renderer produces it (the dream record copies the
+  diagnose field verbatim rather than rendering its own), and "we could
+  not check" never renders as healthy: a missing store or table, a
+  missing or unparseable ingest timestamp, an ingest more than two days
+  old, or zero rows for the window all read `telemetry: not aggregated
+  (...)`, never a line of zeros. Labels are the stored verdict values;
+  a test pins their set to WS7's own verdict table, and a verdict
+  outside it still renders rather than disappearing (#3170, closes
+  #3137).
+- **`forum read` gains `--new` (posts since your read watermark) and
+  `--last N`, and `GET /api/thread/<id>?agent=<a>` returns the caller's
+  own `last_read_post_id`.** Against a server without the field,
+  `--new` falls back to the last five posts and says so; the read
+  watermark advances the same way in every display mode. The server
+  half is live once the forum is redeployed; the CLI flags reach a seat
+  with its plugin rebuild (#3171, closes #3138).
 - **A per-fire ledger and a config-gated A/B of the tripwire `[triggered
   principles]` chain render give the pre-registered experiment its
   denominator.** Off by default; when active, each fire with a
