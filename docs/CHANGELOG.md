@@ -185,6 +185,23 @@ with an `-alpha` suffix during the alpha phase.
   counts, and per-arm privacy-drop counts. Read-only on the ledger,
   transcripts and `knowledge.db`; ships in no install tier (#3175, part
   of #2753).
+- **The WS4 adjudication report now counts every fire-ledger row,
+  including the `error` and `na` rows it used to skip without a trace.**
+  `compute_denominators()` in `tools/ws4/analyze.py` gains
+  `ledger_rows_by_arm` (per seat and pooled; `chain`, `control`, `na`
+  and `error` always present, 0 when absent) and an `error_rows` count
+  with a per-error breakdown, and the report always prints its
+  `error rows` line, including when the count is 0. The
+  `extract_spans.py` selection and every existing O1, O2 and
+  length-control number are unchanged (#3179, part of #2753).
+- **`engram_retype_edge` was missing from the two hand-kept registries
+  that must list every write-capable tool, which turned the rc3
+  release-gate full suite red.** The Stop hook's `_ENGRAM_WRITE_VERBS`
+  now includes `retype_edge`, so a turn whose only ENGRAM write is a
+  retype counts as a write for the write check. The checked-in
+  `tool_capability_index.txt` is regenerated with the new tool's entry.
+  Mechanical sync of #3160; no behaviour change beyond those two
+  lists (#3183, part of #2265).
 
 ### rc2 fix round — 2026-09-26 (found on the rc1 soak)
 
