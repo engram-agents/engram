@@ -1131,6 +1131,23 @@ DAG_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c["dag"]
 
 
 # ---------------------------------------------------------------------------
+# engram_retype_edge's allowed-move table (issue #2265, epic #2252).
+# docs/2265-2347-edge-correction-design.md sec.2: "a re-type may only move an
+# edge to a relation that claims LESS" -- supported_by/derives_from/cites are
+# all provenance-bearing; about/exemplifies are not. Any move not in this
+# table is refused, including every move in the opposite (stronger)
+# direction. The value is None (no extra condition) or a tuple of node
+# `type` values the TARGET must already be one of.
+# ---------------------------------------------------------------------------
+RETYPE_ALLOWED_MOVES: "dict[tuple[str, str], tuple[str, ...] | None]" = {
+    ("supported_by", "about"): None,
+    ("derives_from", "about"): None,
+    ("derives_from", "exemplifies"): ("lesson", "cornerstone"),
+    ("cites", "about"): None,
+}
+
+
+# ---------------------------------------------------------------------------
 # `generalizes` substrate (#2753 epic, WS1).
 # ---------------------------------------------------------------------------
 
