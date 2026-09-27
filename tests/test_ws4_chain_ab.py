@@ -284,6 +284,19 @@ class TestWs4ContractAInactiveVariants(unittest.TestCase):
         self.assertEqual(out, baseline)
         self.assertFalse(self._ledger_path().exists())
 
+    def test_non_utc_offset_start_is_malformed(self):
+        """Round 2 (item 4) -- a VALID ISO-8601 timestamp that carries an
+        explicit but non-zero UTC offset (here +05:00) is not "ISO-8601
+        UTC" either -- `_ws4_config()`'s own docstring says a non-UTC
+        offset is treated as malformed, same bucket as the naive case
+        above, not silently reinterpreted as if it meant UTC."""
+        baseline = self._baseline()
+        out = self._run_with_config({"experiments": {"ws4_chain_ab": {
+            "enabled": True, "start": "2026-09-28T00:00:00+05:00", "end": "2099-01-01T00:00:00Z", "seed": "s",
+        }}})
+        self.assertEqual(out, baseline)
+        self.assertFalse(self._ledger_path().exists())
+
 
 # ---------------------------------------------------------------------------
 # 2. ACTIVE + participating -- chain vs control arms
@@ -573,6 +586,312 @@ class TestWs4NoHitsNoRow(unittest.TestCase):
         hook_input = {"tool_name": "Bash", "tool_input": {"command": "echo hello"}}
         _run_hook_main(hook_input, tripwires=[], engram_home=self.home)
         self.assertFalse(self.ledger_path.exists())
+
+
+# ---------------------------------------------------------------------------
+# 9. Round 2 item 1 -- WS4 failures become visible ledger rows, not silent.
+#    Arm computation and row construction each get their OWN narrow guard
+#    now (reviewer-fairy suggestion #1 on PR #3166); a bug in either must
+#    still leave a visible row behind instead of silently dropping the fire.
+# ---------------------------------------------------------------------------
+
+class TestWs4ArmComputationErrorVisible(unittest.TestCase):
+    """A bug in arm computation (e.g. the hash helper raising) must render
+    dev-parity output -- exactly what the INACTIVE branch would produce,
+    append the chain iff non-empty -- AND leave a visible arm="error" row
+    behind, rather than silently dropping the fire from the ledger."""
+
+    def setUp(self):
+        self.server = fresh_server()
+        cs_head = _seed_cornerstone(self.server, "Ws4HeadCSArmError", recall_summary="head summary arm error")
+        self.ls1 = _seed_lesson(
+            self.server, pattern=r"rm -rf", nudge="Think twice before rm -rf.",
+            recall_summary="lesson summary arm error", generalized_by=cs_head,
+        )
+        self.tripwires = [(r"rm -rf", "Think twice before rm -rf.", self.ls1)]
+        self.hook_input = {
+            "tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"},
+            "tool_use_id": "toolu_arm_error",
+        }
+        self.home = tempfile.mkdtemp(prefix="engram_test_ws4_armerror_")
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        _write_config(Path(self.home), {"experiments": {"ws4_chain_ab": {
+            "enabled": True, "start": "2020-01-01T00:00:00Z", "end": "2099-01-01T00:00:00Z",
+            "seed": "arm-error-seed",
+        }}})
+        self.ledger_path = Path(self.home) / "tripwire-fire-ledger.jsonl"
+
+    def test_hash_helper_raising_still_renders_dev_parity_and_logs_error_arm(self):
+        baseline = _run_hook_main(self.hook_input, tripwires=self.tripwires, db_path=_db_path())
+        with unittest.mock.patch("hashlib.sha256", side_effect=RuntimeError("boom")):
+            out = _run_hook_main(
+                self.hook_input, tripwires=self.tripwires, db_path=_db_path(), engram_home=self.home,
+            )
+        self.assertEqual(out, baseline)
+        rows = _read_ledger(self.ledger_path)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["arm"], "error")
+        self.assertIn("error", row)
+        self.assertIn("RuntimeError", row["error"])
+        self.assertIn("boom", row["error"])
+
+
+class TestWs4RowConstructionErrorVisible(unittest.TestCase):
+    """A bug specifically in ROW construction (assembling the ledger dict,
+    separate from the arm-computation decision already applied to `parts`)
+    must still leave a MINIMAL row behind (the fixed 8-field shape) so the
+    fire is counted, without ever crashing main() or dropping the nudge."""
+
+    def setUp(self):
+        self.server = fresh_server()
+        cs_head = _seed_cornerstone(self.server, "Ws4HeadCSRowError", recall_summary="head summary row error")
+        self.ls1 = _seed_lesson(
+            self.server, pattern=r"rm -rf", nudge="Think twice before rm -rf.",
+            recall_summary="lesson summary row error", generalized_by=cs_head,
+        )
+        self.tripwires = [(r"rm -rf", "Think twice before rm -rf.", self.ls1)]
+        self.hook_input = {
+            "tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"},
+            "tool_use_id": "toolu_row_error",
+        }
+        self.home = tempfile.mkdtemp(prefix="engram_test_ws4_rowerror_")
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        _write_config(Path(self.home), {"experiments": {"ws4_chain_ab": {
+            "enabled": True, "start": "2020-01-01T00:00:00Z", "end": "2099-01-01T00:00:00Z",
+            "seed": "row-error-seed",
+        }}})
+        self.ledger_path = Path(self.home) / "tripwire-fire-ledger.jsonl"
+
+    def test_row_construction_raising_still_writes_minimal_row(self):
+        with unittest.mock.patch.object(_hook, "_build_ws4_ledger_entry", side_effect=RuntimeError("row boom")):
+            out = _run_hook_main(
+                self.hook_input, tripwires=self.tripwires, db_path=_db_path(), engram_home=self.home,
+            )
+        response = json.loads(out)
+        self.assertIn("Think twice before rm -rf.", response["hookSpecificOutput"]["additionalContext"])
+        rows = _read_ledger(self.ledger_path)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(
+            set(row.keys()),
+            {"schema_version", "experiment", "ts", "ts_iso", "session_id", "tool_use_id", "arm", "error"},
+        )
+        self.assertIn("RuntimeError", row["error"])
+        self.assertIn("row boom", row["error"])
+
+
+# ---------------------------------------------------------------------------
+# 10. Round 2 item 2 -- Contract B, two shown hits (one real head, one
+#     headless) in the SAME fire.
+# ---------------------------------------------------------------------------
+
+class TestWs4ContractBTwoHitsOneHeadless(unittest.TestCase):
+    """Contract B ("heads_by_lesson comes from the SAME walk that produces
+    the rendered block") was only ever exercised through the trivial
+    single-hit/single-head fixture every other class in this file uses.
+    This reuses the exact truncated-hit-alongside-a-healthy-hit graph
+    shape from
+    tests/test_generalizes_tripwire_render.py::TestTruncatedRendersPartialNotice
+    (do not invent a new graph shape), run through the WS4 ledger path."""
+
+    def _stub_chain(self, truncated_ids, normal_chains=None):
+        truncated_ids = set(truncated_ids)
+        normal_chains = normal_chains or {}
+
+        def _chain(conn, node_id):
+            if node_id in truncated_ids:
+                return {
+                    "start_id": node_id, "start_resolved_id": node_id,
+                    "roots": [node_id],
+                    "nodes": {node_id: {"original_id": node_id, "parents": [], "depth": 0}},
+                    "heads": [], "truncated": True, "cycle_detected": False,
+                }
+            if node_id in normal_chains:
+                return normal_chains[node_id]
+            return {
+                "start_id": node_id, "start_resolved_id": node_id,
+                "roots": [node_id],
+                "nodes": {node_id: {"original_id": node_id, "parents": [], "depth": 0}},
+                "heads": [node_id], "truncated": False, "cycle_detected": False,
+            }
+        return _chain
+
+    def setUp(self):
+        self.server = fresh_server()
+        _seed_lesson(self.server, pattern=r"unused", nudge="unused")  # forces the DB file to exist
+        self.seed = "ws4-contractb-seed"
+        self.home = tempfile.mkdtemp(prefix="engram_test_ws4_contractb_")
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        _write_config(Path(self.home), {"experiments": {"ws4_chain_ab": {
+            "enabled": True, "start": "2020-01-01T00:00:00Z", "end": "2099-01-01T00:00:00Z", "seed": self.seed,
+        }}})
+        self.ledger_path = Path(self.home) / "tripwire-fire-ledger.jsonl"
+        self.tripwires = [
+            (r"sudo", "Careful with sudo.", "ls_truncated"),
+            (r"rm -rf", "Think twice before rm -rf.", "ls_healthy"),
+        ]
+        self.hook_input = {"tool_name": "Bash", "tool_input": {"command": "sudo rm -rf /tmp/x"}}
+
+    def test_heads_by_lesson_and_chain_rendered_for_two_hits(self):
+        healthy_chain = {
+            "start_id": "ls_healthy", "start_resolved_id": "ls_healthy",
+            "roots": ["ls_healthy"],
+            "nodes": {
+                "cs_head": {
+                    "original_id": "cs_head", "parents": [], "depth": 1,
+                    "recall_summary": "head summary", "claim": "HeadClaim",
+                },
+                "ls_healthy": {
+                    "original_id": "ls_healthy", "parents": ["cs_head"], "depth": 0,
+                    "recall_summary": "healthy lesson summary",
+                },
+            },
+            "heads": ["cs_head"], "truncated": False, "cycle_detected": False,
+        }
+        self.hook_input["tool_use_id"] = _find_nonce_for_arm(self.seed, "chain")
+        with unittest.mock.patch.object(
+            _hook, "_import_generalization_chain",
+            return_value=self._stub_chain({"ls_truncated"}, normal_chains={"ls_healthy": healthy_chain}),
+        ):
+            out = _run_hook_main(
+                self.hook_input, tripwires=self.tripwires, db_path=_db_path(), engram_home=self.home,
+            )
+
+        rows = _read_ledger(self.ledger_path)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["arm"], "chain")
+        self.assertTrue(row["chain_rendered"])
+        self.assertEqual(row["heads_by_lesson"], {"ls_truncated": [], "ls_healthy": ["cs_head"]})
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("truncated", ctx.lower())
+        self.assertIn("↑ cs_head — HeadClaim", ctx)
+
+
+# ---------------------------------------------------------------------------
+# 11. Round 3 item 1 (#3173 reviewer comment 5858155739) -- the timestamp
+#     computation between the two guards must be guarded too: a failure
+#     there must not reach main()'s outer except and drop the nudge.
+# ---------------------------------------------------------------------------
+
+class TestWs4TimestampComputationErrorVisible(unittest.TestCase):
+    """The `now = _time.time()` / `ts_iso = ...isoformat()` computation
+    used to sit BETWEEN the arm-computation guard and the row-construction
+    guard, covered by neither. A failure there reached main()'s outer
+    `except Exception: sys.exit(0)`, printing nothing -- silently dropping
+    the nudge already appended to `parts`, not just the WS4 ledger row.
+    It now lives inside the row-construction guard, so a failure there
+    must (a) still render the nudge, byte-identical to the same failure
+    with the experiment INACTIVE (dev parity -- in the INACTIVE branch
+    this code never runs at all, so breaking it can't change that
+    branch's output), and (b) still leave exactly one ledger row behind
+    with an `error` string, instead of silently dropping the fire."""
+
+    def setUp(self):
+        self.server = fresh_server()
+        cs_head = _seed_cornerstone(self.server, "Ws4HeadCSTsError", recall_summary="head summary ts error")
+        self.ls1 = _seed_lesson(
+            self.server, pattern=r"rm -rf", nudge="Think twice before rm -rf.",
+            recall_summary="lesson summary ts error", generalized_by=cs_head,
+        )
+        self.tripwires = [(r"rm -rf", "Think twice before rm -rf.", self.ls1)]
+        self.seed = "ts-error-seed"
+        # Pin the arm to "chain" (not "control") so the dev-parity
+        # baseline below is the block-INCLUDED rendering -- the time bug
+        # sits downstream of the arm decision, so a "control" draw would
+        # correctly omit the block regardless of the bug, which would make
+        # the (a) comparison below compare an unrelated experimental
+        # difference rather than the bug this test targets.
+        self.hook_input = {
+            "tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"},
+            "tool_use_id": _find_nonce_for_arm(self.seed, "chain", prefix="toolu_ts_error_"),
+        }
+        self.active_home = tempfile.mkdtemp(prefix="engram_test_ws4_tserror_active_")
+        self.addCleanup(shutil.rmtree, self.active_home, ignore_errors=True)
+        _write_config(Path(self.active_home), {"experiments": {"ws4_chain_ab": {
+            "enabled": True, "start": "2020-01-01T00:00:00Z", "end": "2099-01-01T00:00:00Z",
+            "seed": self.seed,
+        }}})
+        # No `experiments` key at all -> _ws4_config() returns INACTIVE, so
+        # this run never reaches the timestamp computation in the first
+        # place -- it's the dev-parity reference point for (a) below.
+        self.inactive_home = tempfile.mkdtemp(prefix="engram_test_ws4_tserror_inactive_")
+        self.addCleanup(shutil.rmtree, self.inactive_home, ignore_errors=True)
+        _write_config(Path(self.inactive_home), {})
+        self.ledger_path = Path(self.active_home) / "tripwire-fire-ledger.jsonl"
+
+    def test_time_source_raising_still_renders_nudge_and_logs_error_row(self):
+        with unittest.mock.patch("time.time", side_effect=RuntimeError("clock boom")):
+            out_active = _run_hook_main(
+                self.hook_input, tripwires=self.tripwires, db_path=_db_path(),
+                engram_home=self.active_home,
+            )
+            out_inactive = _run_hook_main(
+                self.hook_input, tripwires=self.tripwires, db_path=_db_path(),
+                engram_home=self.inactive_home,
+            )
+        self.assertEqual(out_active, out_inactive)
+        self.assertIn("Think twice before rm -rf.", out_active)
+        rows = _read_ledger(self.ledger_path)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertIn("arm", row)
+        self.assertIn("error", row)
+        self.assertIn("RuntimeError", row["error"])
+        self.assertIn("clock boom", row["error"])
+
+
+# ---------------------------------------------------------------------------
+# 12. Round 3 item 2 (#3173 reviewer comment 5858155739) -- pin the
+#     double-failure precedence: when BOTH guards fail on the same fire,
+#     the ARM error wins over the row-construction error.
+# ---------------------------------------------------------------------------
+
+class TestWs4DoubleFailureKeepsArmError(unittest.TestCase):
+    """`"error": arm_error or f"{type(row_exc).__name__}: ..."` short-
+    circuits on `arm_error` when it is already a truthy string, so when
+    BOTH the arm-computation guard and the row-construction guard fail on
+    the same fire, the row's `error` field is the ARM error, not the row-
+    construction error. This is deliberate (see the comment at that `or`
+    in main()): the arm failure means the coin-flip decision itself was
+    corrupted, the more informative of the two to surface."""
+
+    def setUp(self):
+        self.server = fresh_server()
+        cs_head = _seed_cornerstone(self.server, "Ws4HeadCSDoubleError", recall_summary="head summary double error")
+        self.ls1 = _seed_lesson(
+            self.server, pattern=r"rm -rf", nudge="Think twice before rm -rf.",
+            recall_summary="lesson summary double error", generalized_by=cs_head,
+        )
+        self.tripwires = [(r"rm -rf", "Think twice before rm -rf.", self.ls1)]
+        self.hook_input = {
+            "tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"},
+            "tool_use_id": "toolu_double_error",
+        }
+        self.home = tempfile.mkdtemp(prefix="engram_test_ws4_doubleerror_")
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        _write_config(Path(self.home), {"experiments": {"ws4_chain_ab": {
+            "enabled": True, "start": "2020-01-01T00:00:00Z", "end": "2099-01-01T00:00:00Z",
+            "seed": "double-error-seed",
+        }}})
+        self.ledger_path = Path(self.home) / "tripwire-fire-ledger.jsonl"
+
+    def test_both_guards_failing_keeps_arm_error_not_row_error(self):
+        with unittest.mock.patch("hashlib.sha256", side_effect=RuntimeError("arm boom")), \
+             unittest.mock.patch.object(_hook, "_build_ws4_ledger_entry", side_effect=RuntimeError("row boom")):
+            out = _run_hook_main(
+                self.hook_input, tripwires=self.tripwires, db_path=_db_path(), engram_home=self.home,
+            )
+        response = json.loads(out)
+        self.assertIn("Think twice before rm -rf.", response["hookSpecificOutput"]["additionalContext"])
+        rows = _read_ledger(self.ledger_path)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["arm"], "error")
+        self.assertIn("RuntimeError", row["error"])
+        self.assertIn("arm boom", row["error"])
+        self.assertNotIn("row boom", row["error"])
 
 
 if __name__ == "__main__":
