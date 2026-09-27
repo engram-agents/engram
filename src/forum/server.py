@@ -804,12 +804,23 @@ def create_app(
     @app.route("/api/thread/<int:tid>")
     def api_thread(tid: int):
         agent_name = request.args.get("agent")
+        agent_id = None
         if agent_name and db.is_valid_agent_name(agent_name):
-            db.upsert_agent(g.conn, agent_name)
+            agent_id = db.upsert_agent(g.conn, agent_name)
 
         thread_dict, posts = db.get_thread(g.conn, tid)
         if thread_dict is None:
             return jsonify({"error": "thread not found"}), 404
+
+        # engram-alpha#3138: expose the caller's own read-state watermark so
+        # a client can render "what's new" without re-fetching the whole
+        # thread by hand. Additive only — every other field on `thread_dict`
+        # is untouched, and with no (or an invalid) `agent` param this is
+        # simply `null`, matching "no watermark to report" rather than
+        # inventing a 0 that would read as "everything is new."
+        thread_dict["last_read_post_id"] = (
+            db.get_thread_read_watermark(g.conn, agent_id, tid) if agent_id is not None else None
+        )
 
         # Render body_md → safe HTML for posts before returning to client.
         # Also sanitize each verification note through the same render pipeline

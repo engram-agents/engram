@@ -1520,6 +1520,25 @@ def mark_thread_read(
     conn.commit()
 
 
+def get_thread_read_watermark(
+    conn: sqlite3.Connection,
+    agent_id: int,
+    thread_id: int,
+) -> int | None:
+    """Return the agent's stored ``last_read_post_id`` watermark for this
+    thread, or ``None`` if the agent has never read it (no ``reads`` row).
+
+    Read-only counterpart to ``mark_thread_read`` — added for
+    engram-alpha#3138 so a client can see its own read state instead of only
+    ever writing it blind.
+    """
+    row = conn.execute(
+        "SELECT last_read_post_id FROM reads WHERE agent_id = ? AND thread_id = ?",
+        (agent_id, thread_id),
+    ).fetchone()
+    return row[0] if row else None
+
+
 def get_inbox(
     conn: sqlite3.Connection,
     agent_id: int,
