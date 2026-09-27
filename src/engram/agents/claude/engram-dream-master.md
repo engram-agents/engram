@@ -548,7 +548,7 @@ You may call `engram_advance_turn` ONLY when ALL of these are true:
 - [ ] Dream record file written and committed in .engram git
 - [ ] Sleep-success marker written via `~/.engram/tools/write_sleep_marker.py`
 - [ ] ask-{{USER_NAME}}.md updated with this cycle's flagged-for-user items (or skipped if surface not deployed) — post-advance, non-blocking
-- [ ] Health score check completed
+- [ ] Health score check completed (via `engram_diagnose`; also copy its `telemetry` field's line into the dream record)
 
 If any box is unchecked, you are not done. Continue working.
 
@@ -595,6 +595,7 @@ Format:
 **Turn:** N → N+1 (advanced at HH:MM EDT)
 **Cohort scope:** K nodes since prev sleep YYYY-MM-DD HH:MM EDT
 **Health score:** before X.XX → after Y.YY (delta +/-Z.ZZ)
+**Telemetry:** <the `telemetry` field's line from `engram_diagnose`, copied verbatim — issue #3137, WS8>
 
 ## Fairy contribution
 - Dispatched: <N>

@@ -598,6 +598,14 @@ def cmd_list(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_read(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    # Suggestion (Ariadne's fairy round, PR-3171): --last 0 or a negative N
+    # used to silently render zero posts, indistinguishable from a typo
+    # that happened to "work". Refuse loudly instead.
+    last_n = getattr(args, "last", None)
+    if last_n is not None and last_n <= 0:
+        print(f"forum read: --last must be a positive integer, got {last_n}", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
     forum_url = _resolve_forum_url(config)
 
     params: dict = {}
@@ -609,18 +617,84 @@ def cmd_read(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     thread = data.get("thread", {})
     posts = data.get("posts", [])
 
-    if args.format == "json":
-        print(json.dumps({"thread": thread, "posts": posts}, indent=2))
-    else:
-        _render_thread_human(thread, posts)
+    # engram-alpha#3138: --new / --last narrow what's DISPLAYED only. The
+    # full `posts` list from the server is always what watermark
+    # advancement below uses — item 7 ("watermark advancement is
+    # unchanged") holds regardless of which display path is taken.
+    display_posts = posts
+    pre_render_note: str | None = None
+    # Round-1 blocker fix (Ariadne's fairy round): a machine-readable
+    # counterpart to pre_render_note for --format json, so a JSON consumer
+    # sees the same "nothing new" / "degraded server" information a human
+    # reader gets from pre_render_note, instead of either an invalid
+    # non-JSON string (the original bug) or the notice silently vanishing.
+    json_notice: str | None = None
+    # True only for the "--new, nothing new" case, where pre_render_note IS
+    # the entire human-format output (no thread/posts to render below it) --
+    # every other path (old-server fallback, --new with real results, plain
+    # read, --last) renders normally.
+    skip_human_render = False
 
-    # v2 read-state: post the watermark server-side (max post id in this thread).
-    # forum-read-cursor.txt is deprecated/vestigial — read-state is pure-server now.
+    if getattr(args, "new", False):
+        # Item 6: distinguish "server doesn't report read state at all" (key
+        # absent — an un-redeployed server) from "reports null" (key
+        # present, agent has simply never read this thread — treated as
+        # everything being new, since there is no floor to filter against).
+        # Never silently show everything (that would be indistinguishable
+        # from the flag doing nothing) and never silently show nothing.
+        if "last_read_post_id" not in thread:
+            pre_render_note = "server does not report read state; showing last 5 — use --last N"
+            json_notice = pre_render_note
+            display_posts = posts[-5:]
+        else:
+            watermark = thread.get("last_read_post_id")
+            if watermark is None:
+                watermark = 0
+            new_posts = [p for p in posts if isinstance(p.get("id"), int) and p["id"] > watermark]
+            total = len(posts)
+            shown = len(new_posts)
+            if shown == 0:
+                # Round-1 blocker (Ariadne's fairy round): this used to
+                # print a plain-text line and return before the --format
+                # check ever ran, so `--new --format json` on the
+                # nothing-new case emitted invalid JSON. Route through the
+                # SAME format branch as every other case instead.
+                json_notice = f"no new posts since your last read ({total} total)"
+                pre_render_note = json_notice
+                display_posts = []
+                skip_human_render = True
+            else:
+                hidden = total - shown
+                pre_render_note = f"(showing {shown} new of {total}; {hidden} earlier hidden)"
+                display_posts = new_posts
+    elif last_n is not None:
+        # Item 5: pure client-side slice, no server dependency at all.
+        display_posts = posts[-last_n:]
+
+    if args.format == "json":
+        payload = {"thread": thread, "posts": display_posts}
+        if json_notice is not None:
+            payload["notice"] = json_notice
+        print(json.dumps(payload, indent=2))
+    else:
+        if pre_render_note:
+            print(pre_render_note)
+        if not skip_human_render:
+            _render_thread_human(thread, display_posts)
+
+    _advance_watermark(forum_url, args.thread_id, agent_name, posts)
+
+
+def _advance_watermark(forum_url: str, thread_id: int, agent_name: str, posts: list) -> None:
+    """v2 read-state: post the watermark server-side (max post id in this
+    thread). forum-read-cursor.txt is deprecated/vestigial — read-state is
+    pure-server now. Always computed from the FULL post list, never a
+    --new/--last-narrowed subset (engram-alpha#3138 item 7)."""
     if agent_name and posts:
         max_post_id = max(p.get("id", 0) for p in posts if isinstance(p.get("id"), int))
         if max_post_id > 0:
             _api_post(
-                f"{forum_url}/api/thread/{args.thread_id}/read",
+                f"{forum_url}/api/thread/{thread_id}/read",
                 {"agent": agent_name, "last_read_post_id": max_post_id},
             )
 
@@ -1502,6 +1576,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_read.add_argument(
         "--format", choices=["human", "json"], default="human",
         help="Output format: human (default) or json",
+    )
+    p_read.add_argument(
+        "--new", action="store_true",
+        help="Show only posts since your server-side read watermark (engram-alpha#3138). "
+             "Takes precedence over --last if both are given.",
+    )
+    p_read.add_argument(
+        "--last", type=int, metavar="N", default=None,
+        help="Show only the last N posts (pure client-side, works on any server). "
+             "Ignored if --new is also given.",
     )
 
     # -- post --

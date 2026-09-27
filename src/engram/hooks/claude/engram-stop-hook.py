@@ -287,6 +287,8 @@ _ENGRAM_WRITE_VERBS = frozenset({
     "reflect",
     # --- #2013 slice 4 (PR #2342): the cascade adjudication verb ---
     "cascade_resolve",
+    # --- #2265 (PR #3160): correct a wrong edge by making it weaker ---
+    "retype_edge",
 })
 
 # Known engram tool name prefixes from production transcripts. Both forms are

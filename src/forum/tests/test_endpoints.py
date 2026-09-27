@@ -302,6 +302,63 @@ class TestGetThread:
         resp = client.get("/api/thread/9999")
         assert resp.status_code == 404
 
+    def test_last_read_post_id_reflects_the_agents_own_watermark(self, client):
+        """engram-alpha#3138 contract item 1/2: GET ?agent=<a> adds
+        last_read_post_id -- the agent's stored watermark, updated by the
+        existing POST /read route, or null if never read."""
+        resp = client.post(
+            "/api/post",
+            json={
+                "agent": "agent-a",
+                "category_slug": "inter-agent",
+                "title": "Watermark thread",
+                "body_md": "post 1",
+            },
+        )
+        thread_id = json.loads(resp.data)["thread_id"]
+        client.post(
+            "/api/post",
+            json={"agent": "agent-a", "thread_id": thread_id, "body_md": "post 2"},
+        )
+
+        # Never read by agent-b: null, not 0 (0 would misread as "read up
+        # to a real post" rather than "no watermark at all").
+        resp_unread = client.get(f"/api/thread/{thread_id}?agent=agent-b")
+        assert json.loads(resp_unread.data)["thread"]["last_read_post_id"] is None
+
+        # No agent param at all: also null.
+        resp_no_agent = client.get(f"/api/thread/{thread_id}")
+        assert json.loads(resp_no_agent.data)["thread"]["last_read_post_id"] is None
+
+        # Mark read at the first post's id, then GET must return exactly that.
+        first_post_id = json.loads(resp_unread.data)["posts"][0]["id"]
+        mark_resp = client.post(
+            f"/api/thread/{thread_id}/read",
+            json={"agent": "agent-b", "last_read_post_id": first_post_id},
+        )
+        assert mark_resp.status_code == 200
+        resp_after = client.get(f"/api/thread/{thread_id}?agent=agent-b")
+        assert json.loads(resp_after.data)["thread"]["last_read_post_id"] == first_post_id
+
+    def test_last_read_post_id_does_not_change_any_other_field(self, client):
+        """Additive-only: every other key already present in `thread` before
+        this feature must still be present and unchanged."""
+        resp = client.post(
+            "/api/post",
+            json={
+                "agent": "agent-a",
+                "category_slug": "inter-agent",
+                "title": "Unaffected thread",
+                "body_md": "post 1",
+            },
+        )
+        thread_id = json.loads(resp.data)["thread_id"]
+        no_agent = json.loads(client.get(f"/api/thread/{thread_id}").data)["thread"]
+        with_agent = json.loads(client.get(f"/api/thread/{thread_id}?agent=agent-a").data)["thread"]
+        no_agent_minus_watermark = {k: v for k, v in no_agent.items() if k != "last_read_post_id"}
+        with_agent_minus_watermark = {k: v for k, v in with_agent.items() if k != "last_read_post_id"}
+        assert no_agent_minus_watermark == with_agent_minus_watermark
+
 
 class TestGetAgentsOnline:
     def test_returns_online_structure(self, client):

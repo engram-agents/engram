@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # Project root is the parent of tests/
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -239,6 +241,301 @@ class TestEmitIfInitialized(EmitterTestBase):
         self.assertIsNotNone(uuid)
         p = self.logs_dir / "sessions" / "sess_Q.l1.jsonl"
         self.assertTrue(p.exists())
+
+
+class FsyncTestBase(EmitterTestBase):
+    """Shared setUp/tearDown for the fsync-durability contract (alpha #2801).
+
+    Resets the module-level once-per-process warning flags so tests don't
+    leak state into one another (contract requirement: "tests must reset it
+    between tests").
+    """
+
+    def setUp(self):
+        super().setUp()
+        engram_log_emitter._FSYNC_WARNED = False
+        engram_log_emitter._DIR_FSYNC_WARNED = False
+
+    def tearDown(self):
+        engram_log_emitter._FSYNC_WARNED = False
+        engram_log_emitter._DIR_FSYNC_WARNED = False
+        super().tearDown()
+
+
+class TestFsyncDurability(FsyncTestBase):
+    """Contract item 1: fsync the written fd after the write, before return,
+    inside _write_lock."""
+
+    def setUp(self):
+        super().setUp()
+        self.emitter = Emitter.init("sess_FS1", "/tmp/t.jsonl", initial_turn=1, logs_dir=self.logs_dir)
+
+    def test_fsync_called_on_target_fd_after_write(self):
+        # Seed the file with a normal (unmocked) first emit so the file
+        # already exists -- isolates this test to the PER-EVENT fsync call
+        # (item 1) without also exercising the one-time directory fsync
+        # (item 3), which only fires on the creating emit.
+        self.emitter.emit("engram.surface.fire", 1, {"k": "seed"})
+
+        target = self.logs_dir / "sessions" / "sess_FS1.l1.jsonl"
+        real_fsync = os.fsync
+        calls = []
+
+        def fake_fsync(fd):
+            # Verify the fd belongs to the target file (same inode/device)
+            # and that the write already landed (post-flush) by the time
+            # fsync is invoked -- i.e. fsync happens AFTER the write.
+            fd_stat = os.fstat(fd)
+            target_stat = os.stat(target)
+            calls.append(
+                {
+                    "same_file": (fd_stat.st_ino, fd_stat.st_dev) == (target_stat.st_ino, target_stat.st_dev),
+                    "content_at_fsync_time": target.read_text(),
+                }
+            )
+            return real_fsync(fd)
+
+        with mock.patch("os.fsync", side_effect=fake_fsync):
+            uuid = self.emitter.emit("engram.surface.fire", 1, {"k": "second"})
+
+        self.assertIsNotNone(uuid)
+        self.assertEqual(len(calls), 1, "expected exactly one fsync call for this event")
+        self.assertTrue(calls[0]["same_file"], "fsync fd did not resolve to the target .l1.jsonl file")
+        self.assertIn(uuid, calls[0]["content_at_fsync_time"], "write must land before fsync is called")
+
+
+class TestFsyncFailureNotADrop(FsyncTestBase):
+    """Contract item 2: a failed fsync must not be treated as a dropped
+    event -- the line is still written, emit() still returns the uuid, and
+    a warning fires once per process (not once per event)."""
+
+    def setUp(self):
+        super().setUp()
+        self.emitter = Emitter.init("sess_FS2", "/tmp/t.jsonl", initial_turn=1, logs_dir=self.logs_dir)
+        # Seed the file so the two OSError-raising emits below exercise
+        # ONLY the per-event fsync path, not the one-time directory fsync
+        # (which only fires on the creating emit -- item 3's concern).
+        self.emitter.emit("engram.surface.fire", 1, {"k": "seed"})
+
+    def test_fsync_oserror_does_not_drop_event(self):
+        warnings = []
+        self.emitter._stderr = warnings.append
+
+        with mock.patch("os.fsync", side_effect=OSError("simulated fsync failure")):
+            uuid = self.emitter.emit("engram.surface.fire", 1, {"k": "v"})
+
+        self.assertIsNotNone(uuid, "emit() must still return the uuid when fsync fails")
+        target = self.logs_dir / "sessions" / "sess_FS2.l1.jsonl"
+        lines = target.read_text().strip().split("\n")
+        self.assertEqual(json.loads(lines[-1])["uuid"], uuid, "the line must still be written")
+        self.assertFalse(
+            any("event dropped" in w for w in warnings),
+            "a failed fsync must not fall into emit()'s catch-all 'event dropped' path",
+        )
+
+    def test_fsync_oserror_warns_once_per_process(self):
+        warnings = []
+        self.emitter._stderr = warnings.append
+
+        with mock.patch("os.fsync", side_effect=OSError("simulated fsync failure")):
+            u1 = self.emitter.emit("engram.surface.fire", 1, {"k": "one"})
+            u2 = self.emitter.emit("engram.surface.fire", 1, {"k": "two"})
+
+        self.assertIsNotNone(u1)
+        self.assertIsNotNone(u2)
+        fsync_warnings = [w for w in warnings if w.startswith("fsync failed")]
+        self.assertEqual(
+            len(fsync_warnings), 1,
+            f"expected exactly one fsync-failure warning across two emits, got {warnings!r}",
+        )
+
+    def test_warn_fsync_once_helper_fires_only_once(self):
+        # Unit-level check of the once-per-process mechanism itself,
+        # decoupled from the integration path above.
+        calls = []
+        engram_log_emitter._warn_fsync_once(calls.append, OSError("a"))
+        engram_log_emitter._warn_fsync_once(calls.append, OSError("b"))
+        self.assertEqual(len(calls), 1)
+
+
+class TestDirectoryFsyncOnCreate(FsyncTestBase):
+    """Contract item 3: a newly-created file also gets its parent directory
+    fsynced once (not on subsequent appends to the same file). A failed
+    directory fsync follows the same not-a-drop / warn-once rule as item 2."""
+
+    def setUp(self):
+        super().setUp()
+        self.emitter = Emitter.init("sess_FS3", "/tmp/t.jsonl", initial_turn=1, logs_dir=self.logs_dir)
+
+    def test_directory_fsync_only_on_creating_emit(self):
+        dir_fsync_count = [0]
+        real_fsync = os.fsync
+
+        def fake_fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                dir_fsync_count[0] += 1
+            return real_fsync(fd)
+
+        with mock.patch("os.fsync", side_effect=fake_fsync):
+            self.emitter.emit("engram.surface.fire", 1, {"k": "first"})  # creates the file
+            self.assertEqual(dir_fsync_count[0], 1, "expected exactly one directory fsync on the creating emit")
+            self.emitter.emit("engram.surface.fire", 1, {"k": "second"})  # file already exists
+            self.assertEqual(dir_fsync_count[0], 1, "directory fsync must not repeat on subsequent appends")
+
+    def test_directory_fsync_oserror_does_not_drop_event(self):
+        warnings = []
+        self.emitter._stderr = warnings.append
+        real_fsync = os.fsync
+
+        def selective_fail_fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("simulated directory fsync failure")
+            return real_fsync(fd)
+
+        with mock.patch("os.fsync", side_effect=selective_fail_fsync):
+            uuid = self.emitter.emit("engram.surface.fire", 1, {"k": "v"})
+
+        self.assertIsNotNone(uuid, "a failed directory fsync must not drop the event")
+        target = self.logs_dir / "sessions" / "sess_FS3.l1.jsonl"
+        self.assertTrue(target.exists())
+        self.assertFalse(any("event dropped" in w for w in warnings))
+        dir_warnings = [w for w in warnings if w.startswith("directory fsync failed")]
+        self.assertEqual(len(dir_warnings), 1)
+
+    def test_directory_fsync_warning_distinct_from_file_fsync_warning(self):
+        # Both the file fsync AND the directory fsync fail on this (creating)
+        # emit -- confirm both once-per-process flags are independent, i.e.
+        # each warning fires (this test intentionally uses a distinct flag
+        # for the directory case; see the implementation note in
+        # engram_log_emitter.py).
+        warnings = []
+        self.emitter._stderr = warnings.append
+
+        with mock.patch("os.fsync", side_effect=OSError("simulated failure")):
+            uuid = self.emitter.emit("engram.surface.fire", 1, {"k": "v"})
+
+        self.assertIsNotNone(uuid)
+        file_warnings = [w for w in warnings if w.startswith("fsync failed")]
+        dir_warnings = [w for w in warnings if w.startswith("directory fsync failed")]
+        self.assertEqual(len(file_warnings), 1)
+        self.assertEqual(len(dir_warnings), 1)
+
+
+class _CountingWriteProxy:
+    """Wraps a real file handle and counts .write() calls made through it,
+    while delegating everything else (including .flush()/.fileno(), needed
+    by the fsync path) to the real handle."""
+
+    def __init__(self, fh):
+        self._fh = fh
+        self.write_calls = 0
+
+    def write(self, data):
+        self.write_calls += 1
+        return self._fh.write(data)
+
+    def __getattr__(self, name):
+        return getattr(self._fh, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._fh.__exit__(*exc_info)
+
+
+class TestWriteCallUnchanged(EmitterTestBase):
+    """Contract item 4: the single f.write(line + "\\n") call stays one call.
+
+    Behavioural form (round-1 review, PR #3168): wrap builtins.open to
+    return a counting proxy around the real handle and assert exactly one
+    .write() call happens during one emit() -- the reviewer verified this
+    survives a comment/docstring containing the literal text ".write(" and
+    still fails if a second real write call is added, which the earlier
+    inspect.getsource(...).count(".write(") source-text form could not
+    distinguish either way.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.emitter = Emitter.init("sess_WC", "/tmp/t.jsonl", initial_turn=1, logs_dir=self.logs_dir)
+
+    def test_emit_makes_exactly_one_write_call(self):
+        target = self.logs_dir / "sessions" / "sess_WC.l1.jsonl"
+        real_open = open
+        proxies = []
+
+        def fake_open(file, mode="r", *args, **kwargs):
+            fh = real_open(file, mode, *args, **kwargs)
+            if str(file) == str(target) and "a" in mode:
+                proxy = _CountingWriteProxy(fh)
+                proxies.append(proxy)
+                return proxy
+            return fh
+
+        with mock.patch("builtins.open", side_effect=fake_open):
+            uuid = self.emitter.emit("engram.surface.fire", 1, {"k": "v"})
+
+        self.assertIsNotNone(uuid)
+        self.assertEqual(len(proxies), 1, "expected exactly one open() call on the target file")
+        self.assertEqual(proxies[0].write_calls, 1, "expected exactly one .write() call during one emit()")
+
+
+class TestFlushFailureRoutesToDrop(FsyncTestBase):
+    """Documents the deliberate flush/fsync boundary (round-1 review, PR
+    #3168): f.flush() is NOT covered by contract item 2's not-a-drop
+    carve-out. A flush() failure means the bytes plausibly never left the
+    process, so it correctly falls into emit()'s generic "event dropped"
+    catch-all -- unlike a post-write fsync failure (item 2), where the bytes
+    are already out and dropping would be wrong."""
+
+    def setUp(self):
+        super().setUp()
+        self.emitter = Emitter.init("sess_FLUSH", "/tmp/t.jsonl", initial_turn=1, logs_dir=self.logs_dir)
+
+    def test_flush_oserror_is_dropped_not_warned(self):
+        warnings = []
+        self.emitter._stderr = warnings.append
+        target = self.logs_dir / "sessions" / "sess_FLUSH.l1.jsonl"
+        real_open = open
+
+        class _FlushFailProxy:
+            def __init__(self, fh):
+                self._fh = fh
+
+            def write(self, data):
+                return self._fh.write(data)
+
+            def flush(self):
+                raise OSError("simulated flush failure")
+
+            def __getattr__(self, name):
+                return getattr(self._fh, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return self._fh.__exit__(*exc_info)
+
+        def fake_open(file, mode="r", *args, **kwargs):
+            fh = real_open(file, mode, *args, **kwargs)
+            if str(file) == str(target) and "a" in mode:
+                return _FlushFailProxy(fh)
+            return fh
+
+        with mock.patch("builtins.open", side_effect=fake_open):
+            result = self.emitter.emit("engram.surface.fire", 1, {"k": "v"})
+
+        self.assertIsNone(result, "a flush() failure must be treated as a dropped event")
+        self.assertTrue(
+            any("event dropped" in w for w in warnings),
+            f"expected the generic 'event dropped' message, got {warnings!r}",
+        )
+        self.assertFalse(
+            any(w.startswith("fsync failed") for w in warnings),
+            "a flush() failure must not be misreported as an fsync-failure warning",
+        )
 
 
 if __name__ == "__main__":

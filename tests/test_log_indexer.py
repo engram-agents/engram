@@ -1273,5 +1273,288 @@ class TestOrphanFileStatePruning(IndexerTestBase):
         )
 
 
+class TestIncompleteTailAndNulRuns(IndexerTestBase):
+    """alpha #2801 (reader half): a final line missing its trailing "\\n" is
+    an incomplete tail (an in-flight/unflushed append), never a record --
+    stop silently rather than warn. A TERMINATED NUL run is the crash-induced
+    unflushed-append signature (Ariadne, 2026-09-09 on #2785) and gets its
+    own named warning, never "malformed JSON". str.strip() alone does not
+    strip \\x00, which is the bug this file's parse loop had before #2801."""
+
+    # ------------------------------------------------------------------
+    # T1 -- incomplete tail, NUL-only: no row, no warning of any kind.
+    # ------------------------------------------------------------------
+    def test_t1_incomplete_tail_nul_only_silent(self):
+        session_id = "sess-t1"
+        path = self.sessions_dir / f"{session_id}.l1.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # 1,243 bytes of NUL, no trailing newline -- the measured ext4
+        # unclean-shutdown signature (alpha #2801 issue body).
+        path.write_bytes(b"\x00" * 1243)
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            result = Indexer.run_once(logs_dir=self.logs_dir)
+
+        self.assertEqual(result["rows_inserted"], 0)
+        self.assertEqual(_get_all_rows(self.db_path), [])
+        self.assertEqual(
+            buf.getvalue(), "",
+            "an incomplete NUL-only tail must produce ZERO warnings of any kind",
+        )
+
+    # ------------------------------------------------------------------
+    # T2 -- incomplete tail, partial JSON: no row, no warning; once
+    # completed (rest of the record + "\n" appended), inserted exactly once.
+    # ------------------------------------------------------------------
+    def _t2_full_and_prefix(self, session_id: str) -> tuple[str, str]:
+        full_json = (
+            '{"ts": "2026-09-01T00:00:01.000Z", "sessionId": "%s", "turn": 1, '
+            '"uuid": "11111111-1111-1111-1111-111111111111", "parentUuid": '
+            'null, "event_type": "engram.x.y", "tool_use_id": null, '
+            '"level": 1, "data": {}}' % session_id
+        )
+        prefix = '{"ts": "2026-'
+        self.assertTrue(full_json.startswith(prefix))
+        return full_json, prefix
+
+    def test_t2_incomplete_tail_partial_json_then_completed(self):
+        session_id = "sess-t2"
+        path = self.sessions_dir / f"{session_id}.l1.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        full_json, prefix = self._t2_full_and_prefix(session_id)
+
+        # Step 1: only the partial prefix on disk, no trailing newline.
+        path.write_text(prefix, encoding="utf-8")
+
+        buf1 = io.StringIO()
+        with redirect_stderr(buf1):
+            result1 = Indexer.run_once(logs_dir=self.logs_dir)
+        self.assertEqual(result1["rows_inserted"], 0)
+        self.assertEqual(_get_all_rows(self.db_path), [])
+        self.assertEqual(buf1.getvalue(), "", "a partial-JSON tail must warn nothing")
+
+        # Step 2: append the rest of the record plus "\n" -- now a complete,
+        # terminated line -- and run again.
+        rest = full_json[len(prefix):]
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(rest + "\n")
+
+        result2 = Indexer.run_once(logs_dir=self.logs_dir)
+        self.assertEqual(result2["rows_inserted"], 1)
+        rows = _get_all_rows(self.db_path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["sessionId"], session_id)
+
+    # ------------------------------------------------------------------
+    # T3 -- incomplete tail, complete JSON but no trailing "\n": a complete,
+    # parseable record IS a record (alpha #2801 review regression fix,
+    # PR #3161) -- indexed on the same tick it's found, same insert path
+    # as a terminated line, no new warning. If the trailing "\n" lands
+    # later and the file is re-indexed, still exactly one row -- dedup via
+    # the ts high-water mark or uuid INSERT OR IGNORE, either is fine, only
+    # the resulting row count is asserted here.
+    # ------------------------------------------------------------------
+    def test_t3_complete_json_no_newline_then_completed(self):
+        session_id = "sess-t3"
+        path = self.sessions_dir / f"{session_id}.l1.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        full_json, _ = self._t2_full_and_prefix(session_id)
+
+        # Step 1: the full record on disk, but with NO trailing newline --
+        # a complete, parseable record, missing only its trailing "\n".
+        path.write_text(full_json, encoding="utf-8")
+
+        buf1 = io.StringIO()
+        with redirect_stderr(buf1):
+            result1 = Indexer.run_once(logs_dir=self.logs_dir)
+        self.assertEqual(
+            result1["rows_inserted"], 1,
+            "a complete, parseable record missing only its trailing "
+            "newline must be indexed on the same tick it's found",
+        )
+        rows = _get_all_rows(self.db_path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            buf1.getvalue(), "",
+            "recovering a complete record from an unterminated tail must not warn",
+        )
+
+        # Step 2: append just the newline -- now terminated -- run again.
+        # The file's size changed, so it is re-opened and re-parsed from
+        # scratch; the already-indexed record must not be duplicated.
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n")
+
+        Indexer.run_once(logs_dir=self.logs_dir)
+        rows = _get_all_rows(self.db_path)
+        self.assertEqual(len(rows), 1, "the record must not be duplicated once terminated")
+
+    # ------------------------------------------------------------------
+    # C4 (alpha #2801 review regression fix, PR #3161) -- a dead tail: a
+    # complete, parseable record missing its trailing "\n", where the
+    # writer never resumes and the file never changes again. Indexing
+    # twice with no file change between runs must still produce exactly
+    # one row, inserted on the FIRST run -- the second run must not
+    # re-open the file at all (the size gate skips it) and must not
+    # insert a second row.
+    # ------------------------------------------------------------------
+    def test_t3_dead_tail_no_newline_indexed_once(self):
+        session_id = "sess-t3-dead"
+        path = self.sessions_dir / f"{session_id}.l1.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        full_json, _ = self._t2_full_and_prefix(session_id)
+        path.write_text(full_json, encoding="utf-8")
+
+        result1 = Indexer.run_once(logs_dir=self.logs_dir)
+        self.assertEqual(result1["rows_inserted"], 1, "must be indexed on the first run")
+
+        # No file change between runs -- the size gate must skip it.
+        result2 = Indexer.run_once(logs_dir=self.logs_dir)
+        self.assertEqual(result2["rows_inserted"], 0)
+        self.assertEqual(result2["files_processed"], 0, "the size gate must skip an unchanged dead tail")
+        self.assertEqual(result2["files_skipped"], 1)
+
+        rows = _get_all_rows(self.db_path)
+        self.assertEqual(len(rows), 1, "exactly one row total, inserted on the first run")
+
+    # ------------------------------------------------------------------
+    # T4 -- terminated NUL-only line MID-FILE: both surrounding valid
+    # records are inserted; the NUL line produces exactly one warning naming
+    # it a NUL run (byte count + unflushed-append/data-loss framing), never
+    # "malformed JSON".
+    # ------------------------------------------------------------------
+    def test_t4_terminated_nul_only_line_mid_file(self):
+        session_id = "sess-t4"
+        path = self.sessions_dir / f"{session_id}.l1.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        event1 = _make_event(session_id=session_id, turn=1, event_type="engram.x.y",
+                              ts="2026-09-01T00:00:01.000Z")
+        event2 = _make_event(session_id=session_id, turn=2, event_type="engram.x.y",
+                              ts="2026-09-01T00:00:02.000Z")
+        nul_run = "\x00" * 50
+        content = (
+            json.dumps(event1, separators=(",", ":")) + "\n"
+            + nul_run + "\n"
+            + json.dumps(event2, separators=(",", ":")) + "\n"
+        )
+        path.write_text(content, encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            result = Indexer.run_once(logs_dir=self.logs_dir)
+
+        self.assertEqual(result["rows_inserted"], 2, "both surrounding valid records must be indexed")
+        rows = _get_all_rows(self.db_path)
+        self.assertEqual({r["uuid"] for r in rows}, {event1["uuid"], event2["uuid"]})
+
+        stderr_out = buf.getvalue()
+        self.assertNotIn("malformed", stderr_out.lower(), "a NUL run must NEVER be reported as malformed JSON")
+        self.assertIn("50", stderr_out, "the warning must name the byte count")
+        self.assertIn("nul", stderr_out.lower(), "the warning must identify this as a NUL run")
+        self.assertTrue(
+            "unflushed" in stderr_out.lower() or "data loss" in stderr_out.lower(),
+            "the warning must indicate an unflushed append / possible data loss",
+        )
+        # Exactly one warning line for the NUL run.
+        self.assertEqual(stderr_out.count("\n"), 1, "exactly one warning must be emitted")
+
+    # ------------------------------------------------------------------
+    # T5 -- NUL-prefixed record (writer resumed onto a NUL tail): the
+    # record IS inserted (leading NULs stripped, remainder parsed), with one
+    # NUL-run warning as in T4.
+    # ------------------------------------------------------------------
+    def test_t5_nul_prefixed_record_is_recovered(self):
+        session_id = "sess-t5"
+        path = self.sessions_dir / f"{session_id}.l1.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        event = _make_event(session_id=session_id, turn=1, event_type="engram.x.y",
+                             ts="2026-09-01T00:00:01.000Z")
+        nul_prefix = "\x00" * 50
+        content = nul_prefix + json.dumps(event, separators=(",", ":")) + "\n"
+        path.write_text(content, encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            result = Indexer.run_once(logs_dir=self.logs_dir)
+
+        self.assertEqual(result["rows_inserted"], 1, "the NUL-prefixed record must still be recovered")
+        rows = _get_all_rows(self.db_path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["uuid"], event["uuid"])
+
+        stderr_out = buf.getvalue()
+        self.assertNotIn("malformed", stderr_out.lower())
+        self.assertIn("50", stderr_out)
+        self.assertIn("nul", stderr_out.lower())
+        self.assertEqual(stderr_out.count("\n"), 1, "exactly one warning must be emitted")
+
+    # ------------------------------------------------------------------
+    # T6 -- regression: blank / whitespace-only TERMINATED lines still skip
+    # silently.
+    # ------------------------------------------------------------------
+    def test_t6_regression_blank_lines_still_silent(self):
+        session_id = "sess-t6"
+        path = self.sessions_dir / f"{session_id}.l1.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        event = _make_event(session_id=session_id, turn=1, event_type="engram.x.y",
+                             ts="2026-09-01T00:00:01.000Z")
+        content = "\n" + "   \n" + json.dumps(event, separators=(",", ":")) + "\n" + "\t \n"
+        path.write_text(content, encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            result = Indexer.run_once(logs_dir=self.logs_dir)
+
+        self.assertEqual(result["rows_inserted"], 1)
+        self.assertEqual(buf.getvalue(), "", "blank/whitespace-only lines must remain silent")
+
+    # ------------------------------------------------------------------
+    # T7 -- regression: real malformation is still loud, exactly as today.
+    # ------------------------------------------------------------------
+    def test_t7_regression_real_malformation_still_warns(self):
+        session_id = "sess-t7"
+        path = self.sessions_dir / f"{session_id}.l1.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json}\n", encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            result = Indexer.run_once(logs_dir=self.logs_dir)
+
+        self.assertEqual(result["rows_inserted"], 0)
+        self.assertIn("malformed", buf.getvalue().lower())
+
+    # ------------------------------------------------------------------
+    # Pins the "no repair" boundary named in the #2801 implementation
+    # guidance: a NUL byte in the MIDDLE of otherwise-JSON text is left
+    # alone by the edge-only NUL strip and still falls through to the
+    # ordinary malformed-JSON path -- never treated as a NUL run, never
+    # inserted, no repair attempted.
+    # ------------------------------------------------------------------
+    def test_middle_nul_still_malformed_not_repaired(self):
+        session_id = "sess-mid-nul"
+        path = self.sessions_dir / f"{session_id}.l1.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        event = _make_event(session_id=session_id, turn=1, event_type="engram.x.y",
+                             ts="2026-09-01T00:00:01.000Z")
+        full_json = json.dumps(event, separators=(",", ":"))
+        mid = len(full_json) // 2
+        # Insert the NUL strictly inside the text -- not at either edge --
+        # so the edge-only `.strip("\x00")` cannot touch it.
+        corrupted = full_json[:mid] + "\x00" + full_json[mid:]
+        path.write_text(corrupted + "\n", encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            result = Indexer.run_once(logs_dir=self.logs_dir)
+
+        self.assertEqual(result["rows_inserted"], 0, "a mid-string NUL must not be repaired/inserted")
+        self.assertEqual(_get_all_rows(self.db_path), [])
+        stderr_out = buf.getvalue()
+        self.assertIn("malformed", stderr_out.lower(), "a mid-string NUL is real malformation, not a NUL run")
+        self.assertNotIn("nul run", stderr_out.lower(), "must not be reported as the NUL-run case")
+
+
 if __name__ == "__main__":
     unittest.main()

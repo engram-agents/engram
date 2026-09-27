@@ -231,6 +231,14 @@ from tools.recall_summary_validator import (
 
 # ---- #872 wave-1 compat layer: moved to engram_core -----------------
 import engram_core as core  # noqa: E402
+# #2635 unit 2: SubstrateDisplaced is caught once, in _timing_mcp_tool's
+# timed() wrapper below — the single dispatch-wide catch point for every
+# @mcp.tool()-decorated function (mcp.tool = _timing_mcp_tool re-binds the
+# decorator for the whole file). Imported at module level (not the lazy
+# per-function `import engram_walguard as _wg` pattern engram_core.py uses)
+# because this one is referenced from the hottest, most-common path in the
+# file — every single tool call — not from a rarely-hit branch.
+import engram_walguard as _walguard  # noqa: E402
 
 EmbeddingManager = core.EmbeddingManager
 _embedder = core._embedder
@@ -537,6 +545,9 @@ def _remove_edge_impl(*args, **kwargs):
 
 def _add_edge_impl(*args, **kwargs):
     return _cornerstone_mod._add_edge_impl(*args, **kwargs)
+
+def _retype_edge_impl(*args, **kwargs):
+    return _cornerstone_mod._retype_edge_impl(*args, **kwargs)
 # ---- end #872 wave-4 compat forwarders --------------------------------
 
 # ---- #872 wave-5 family imports --------------------------------------
@@ -1554,6 +1565,22 @@ def _timing_mcp_tool(*args, **kwargs):
             result_value = None
             try:
                 result_value = func(*a, **kw)
+                return result_value
+            except _walguard.SubstrateDisplaced as sd:
+                # #2635 unit 2: the ONE catch point for the whole tool-
+                # dispatch surface (every @mcp.tool() function is wrapped by
+                # this closure) — not a per-tool try/except. Raised from deep
+                # inside core._get_db() (via engram_walguard.
+                # assert_not_displaced), unthrottled, on every dispatch. Never
+                # a raw traceback to the caller: a structured refusal that
+                # names the remedy, and — same as any other refusal path —
+                # this call never ran and never returns "created".
+                timing_status = "error"
+                result_value = json.dumps({
+                    "error": "substrate_displaced",
+                    "reason": sd.detection.get("reason"),
+                    "remedy": sd.remedy,
+                })
                 return result_value
             except Exception:
                 timing_status = "error"
@@ -5353,6 +5380,113 @@ def engram_add_edge(payload_json: str) -> str:
         })
 
     return _attach_walguard_banner(_add_edge_impl(**params))
+
+
+# Set of legitimate field names for the engram_retype_edge payload.
+_RETYPE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation", "new_relation", "reason"})
+
+
+# DESIGN INTENT — engram_retype_edge
+# -----------------------------------
+# Corrects a provably-wrong edge by making it WEAKER, never stronger (issue
+# #2265, design doc docs/2265-2347-edge-correction-design.md sec.2). Neither
+# engram_remove_edge nor engram_add_edge can do this: supported_by,
+# derives_from and cites are all removable=False/addable_after_creation=False,
+# so today the only routes are ad-hoc SQL (banned) or engram-surgical (dev
+# tier, requires Lei's explicit agreement, and remove-then-add doesn't
+# recompute confidence). This tool is Essential tier — it repairs the core
+# graph, so it ships with it — and does the whole correction as one audited
+# transaction rather than two unaudited steps.
+#
+# Allowed moves (core.RETYPE_ALLOWED_MOVES, a fixed table — never free-form):
+#   supported_by -> about
+#   derives_from -> about
+#   derives_from -> exemplifies   (target must be a lesson or cornerstone)
+#   cites        -> about
+# Any move outside this table is refused, INCLUDING the reverse (stronger)
+# direction of any of the four above — a re-type may only take a claim of
+# support AWAY, never add one after the fact (the same invariant
+# addable_after_creation=False already protects).
+#
+# Refusals (in order): missing/empty required field (including `reason` —
+# the correction is never silent); move not in RETYPE_ALLOWED_MOVES; target
+# type mismatch for a conditional move; source/target node not found; no
+# edge of the stated relation between them; a pending cascade marker on
+# EITHER endpoint (settle the cascade first via engram_cascade_resolve).
+#
+# Confidence: if the OLD relation is cascade-bearing (core.CASCADE_RELATIONS
+# — today only derives_from and acknowledged_derives_from), retyping it away
+# removes a real premise from the source's confidence formula, so the source
+# node's confidence is recomputed (core._recompute_node_confidence) and
+# old -> new is reported. supported_by and cites are NOT cascade-bearing
+# (#2252 Stage 1.3 flipped supported_by's cascade flag), so retyping either
+# is a confidence no-op by construction — reported as such, never silently
+# skipped.
+#
+# Atomicity: one sqlite transaction. A failure at any step (including the
+# confidence recompute) rolls back everything already issued in this call —
+# the edge is never left half-retyped.
+#
+# Single-payload signature.
+@mcp.tool(
+    name="engram_retype_edge",
+    capability=(
+        "Corrects a wrong edge relation by making it WEAKER (never stronger) "
+        "in one audited transaction — e.g. a supported_by/derives_from/cites "
+        "edge that was really only 'about' or an 'exemplifies' case. "
+        "Refuses moves outside a fixed allowed-move table, a pending-marker "
+        "endpoint, or a missing reason."
+    ),
+    annotations={
+        "title": "Correct a Wrong Edge's Relation (Weaker Only)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_retype_edge(payload_json: str) -> str:
+    """Correct a provably-wrong edge by re-typing it to a weaker relation.
+
+    Pass all fields as one JSON object string in payload_json.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            source_id (str, required): The source node of the edge.
+            target_id (str, required): The target node of the edge.
+            relation (str, required): The edge's CURRENT relation.
+            new_relation (str, required): The relation to retype it to. The
+                (relation, new_relation) pair must be one of the allowed
+                moves: supported_by->about, derives_from->about,
+                derives_from->exemplifies (target must be a lesson or
+                cornerstone), cites->about. Any other pair — including the
+                reverse of any of these — is refused.
+            reason (str, required): Why this edge was wrong. Required and
+                cannot be empty; recorded in the edit-history audit trail
+                alongside both the old and new relation.
+
+    Returns:
+        JSON with `status`:
+          - 'retyped': the edge's relation was changed; audit-logged; a
+            `confidence_recompute` block reports {old, new, disposition} for
+            the source node (disposition is 'no_op_not_cascade_bearing' when
+            the old relation never fed the confidence formula).
+          - 'error': payload invalid, move not allowed, nodes/edge missing,
+            a pending cascade marker on either endpoint, or a failure during
+            the transaction (rolled back — nothing is half-applied).
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+
+    unknown = set(params.keys()) - _RETYPE_EDGE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_RETYPE_EDGE_FIELDS)}"
+        })
+
+    return _attach_walguard_banner(_retype_edge_impl(**params))
 
 
 _SCAN_EMERGENCE_FIELDS = frozenset({

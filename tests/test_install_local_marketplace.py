@@ -6,6 +6,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -25,9 +26,28 @@ def _env(tmp_path, **overrides):
     return env
 
 
+def _fixture_pid_is_running(pid):
+    status = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True
+    )
+    return status.returncode == 0 and not status.stdout.strip().startswith("Z")
+
+
+def _cleanup_fixture_process_group(pid):
+    """Clean only a process group named by this test's fake SSH PID file."""
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return
+    if pgid != os.getpgrp():
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def _path_without_timeout_wrappers(dest_dir):
-    """Build a PATH value that genuinely has no `timeout` or `gtimeout`
-    binary reachable anywhere on it, for engram-alpha#2810's falsifier.
+    """Build a PATH value with no `timeout` or `gtimeout` binary.
 
     `command -v timeout` (what the installer itself checks) only fails when
     NO directory anywhere on PATH carries an executable named `timeout` —
@@ -59,6 +79,12 @@ def _path_without_timeout_wrappers(dest_dir):
             except OSError:
                 continue
             seen.add(name)
+    # The installer now delegates its portable timeout to Python. The active
+    # test interpreter may not have been discoverable from PATH (for example,
+    # a venv invoked by absolute path), so expose it explicitly as python3.
+    python3 = dest_dir / "python3"
+    if not python3.exists():
+        python3.symlink_to(sys.executable)
     return str(dest_dir)
 
 
@@ -1065,17 +1091,10 @@ def _make_scratch_repo(tmp_path, *, tags=(), configure_origin=False):
     tags: tag names to apply to the single commit at HEAD.
 
     configure_origin (#3103): when True, wires up a real bare 'origin'
-    remote (dev + main both pushed to HEAD) plus a copy of
-    src/build/engine/deploy_tag.py, so a deployable-pattern tag at HEAD can
-    pass the confirmed-ancestor guard (HEAD is trivially its own ancestor of
-    origin/dev once pushed). Needed by the "accepts a deployable tag" tests
-    below now that the untagged/#2586 guard decides on CONFIRMED ancestry,
-    not on raw tag presence alone (#3103) — without a real origin, the
-    installer's own fetch fails outright (no 'origin' remote configured at
-    all) and the guard fails closed exactly as it should. Tests that stay on
-    the untagged path (no deployable-pattern tag at HEAD) don't need this —
-    the ancestor-check block never even attempts a fetch when DEPLOY_TAGS is
-    empty, so their behavior is unchanged either way. Mirrors
+    remote (dev + main both pushed to HEAD), so a deployable-pattern tag at
+    HEAD can pass the confirmed-ancestor guard. The helper always copies the
+    shared wrapper because the installer invokes it for tagged guard checks.
+    Without local origin refs, the wrapper fails closed. Mirrors
     test_deploy_tag_guard.py's own `_make_simple_repo(..., configure_origin=...)`
     convention.
     """
@@ -1083,18 +1102,16 @@ def _make_scratch_repo(tmp_path, *, tags=(), configure_origin=False):
     (repo / "tools").mkdir(parents=True)
     (repo / "src" / "engram").mkdir(parents=True)
     (repo / "src" / "engram" / "server.py").write_text("# stub\n")
+    (repo / "src" / "build" / "engine").mkdir(parents=True)
+    (repo / "src" / "build" / "engine" / "__init__.py").write_text(
+        DEPLOY_TAG_INIT.read_text()
+    )
+    (repo / "src" / "build" / "engine" / "deploy_tag.py").write_text(
+        DEPLOY_TAG_MODULE.read_text()
+    )
     scratch_installer = repo / "tools" / "install-local-marketplace.sh"
     scratch_installer.write_text(INSTALLER.read_text())
     scratch_installer.chmod(0o755)
-
-    if configure_origin:
-        (repo / "src" / "build" / "engine").mkdir(parents=True)
-        (repo / "src" / "build" / "engine" / "__init__.py").write_text(
-            DEPLOY_TAG_INIT.read_text()
-        )
-        (repo / "src" / "build" / "engine" / "deploy_tag.py").write_text(
-            DEPLOY_TAG_MODULE.read_text()
-        )
 
     def _git(*args):
         subprocess.run(
@@ -1136,11 +1153,9 @@ def _run_scratch_installer(repo, engram_home, *, extra_args=(), build_dir=None, 
     preserves every existing caller's behavior exactly — no bound at all,
     same as before this parameter existed, and the plain `subprocess.run(...,
     timeout=None)` path below (no process-group machinery) is used unchanged.
-    Callers that exercise a path where the shell's own `timeout`/`gtimeout`
-    wrapper might be unavailable (engram-alpha #2810: a stock-macOS seat
-    lacking both binaries degrades the installer's own fetch to genuinely
-    UNBOUNDED, by documented design) should pass a generous-but-finite value
-    here so a hang fails the test loudly instead of hanging the whole suite.
+    Callers that exercise a deliberately hanging fetch should pass a
+    generous-but-finite value here so a regression fails loudly instead of
+    hanging the whole suite.
     On expiry this raises subprocess.TimeoutExpired, which callers may catch
     or let propagate as a (loud, non-hanging) test failure/error.
 
@@ -1267,6 +1282,26 @@ def test_tag_guard_override_records_none_and_warns(tmp_path):
     assert "alpha_untagged_override=1" in marker
 
 
+def test_tagged_head_without_local_origin_refs_fails_closed_but_override_records_none(tmp_path):
+    """T5: a tagged HEAD without local origin refs is not deployable."""
+    repo = _make_scratch_repo(tmp_path, tags=["v9.9.9-no-local-origin"])
+    engram_home = tmp_path / "engram-home"
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+
+    refused = _run_scratch_installer(repo, engram_home)
+    assert refused.returncode != 0
+    assert "NOT confirmed" in refused.stderr
+
+    allowed = _run_scratch_installer(
+        repo, engram_home, extra_args=["--allow-untagged"], build_dir=build_root
+    )
+    assert allowed.returncode == 0, allowed.stderr
+    marker = (engram_home / ".deployed-version").read_text()
+    assert "alpha_tag=none" in marker
+    assert "alpha_untagged_override=1" in marker
+
+
 def test_tag_guard_multiple_tags_joined(tmp_path):
     repo = _make_scratch_repo(
         tmp_path, tags=["v1.0.0-a", "deploy/2026-09-05-b"], configure_origin=True
@@ -1304,7 +1339,7 @@ def test_tag_guard_runs_before_target_dispatch(tmp_path):
 # deployable_tag_at()/refresh_and_check_deployable_tag_at() predicate, which
 # requires BOTH a deployable-pattern tag AND confirmed ancestry (HEAD is an
 # ancestor of origin/dev or origin/main). The shell's #794 branch guard
-# (DEPLOYABLE_ANCESTOR, above) already consulted that same predicate — but
+# (the shared wrapper result, above) already consulted that same predicate — but
 # the SEPARATE #2586 untagged guard a few lines below it still decided on
 # raw `DEPLOY_TAGS` presence alone, independent of ancestry. The gap: on
 # branch 'dev' itself, #794 passes trivially (branch name IS 'dev'), so the
@@ -1730,238 +1765,209 @@ def test_ancestor_tag_checkout_forwards_allow_branch_to_build_plugin(tmp_path):
     assert "--allow-branch" in log
 
 
-# ── #2711 round 2 — fail-closed on a failed origin refresh ───────────────────
-#
-# The ancestry check trusts refs/remotes/origin/{dev,main} without ever
-# re-fetching them, so a LOCAL remote-tracking ref that was correct at
-# fetch-time but is now stale (e.g. upstream force-pushed 'dev' back past a
-# bad merge) can still report ancestry for a commit that is no longer merged
-# history. The fix refreshes both refs immediately before trusting them, and
-# must FAIL CLOSED (never grant the exception) if that refresh itself fails
-# — an unreachable network must make the guard STRICTER, never looser.
+# ── #3133 — bounded refresh falls through to local tracked refs ──────────────
 
 
-def test_fetch_failure_fails_closed_refuses_ancestor_tag_without_allow_branch(tmp_path):
-    """If the pre-check `git fetch origin dev main` fails (offline / no
-    remote / auth failure / ...), DEPLOYABLE_ANCESTOR must stay 0 — a
-    detached HEAD at a tag that WOULD otherwise pass the ancestor check
-    (v1.0.0-ancestor-test, genuinely merged into origin/dev) must still
-    REFUSE without --allow-branch. This is the mutation-control case: a
-    fail-OPEN implementation (leaving DEPLOYABLE_ANCESTOR=1 when the fetch
-    fails) makes this test go green->red; see the round-2 handoff for the
-    confirmed mutation result."""
+def test_offline_origin_uses_local_refs_for_merged_tag_in_shell_and_wrapper(tmp_path):
+    """T1: a failed refresh still permits a tagged local ancestor."""
     repo, commits = _make_scratch_repo_with_ancestry(tmp_path)
     _checkout(repo, "v1.0.0-ancestor-test")
-    # Break the fetch deliberately by pointing 'origin' at a path that does
-    # not exist. No test can safely sever real network access, so this is
-    # the local-filesystem-remote equivalent: `git fetch origin ...` fails
-    # the same way (non-zero exit, no refs updated) whether the remote is
-    # unreachable over a network or simply absent on disk.
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", str(tmp_path / "does-not-exist.git")],
+        cwd=repo, check=True, capture_output=True, text=True,
+    )
+    engram_home = tmp_path / "engram-home"
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+
+    from tools.engine.deploy_tag import refresh_and_check_deployable_tag_at
+
+    assert refresh_and_check_deployable_tag_at(str(repo), timeout=2.0) == "v1.0.0-ancestor-test"
+
+    result = _run_scratch_installer(repo, engram_home, build_dir=build_root)
+
+    assert result.returncode == 0, result.stderr
+    marker = (engram_home / ".deployed-version").read_text()
+    assert "alpha_tag=v1.0.0-ancestor-test" in marker
+    assert "alpha_untagged_override=1" not in marker
+
+
+def test_offline_origin_refuses_tagged_child_outside_local_refs(tmp_path):
+    """T2: local tracked refs cannot authorize an unpushed tagged child."""
+    repo, commits = _make_scratch_repo_with_ancestry(tmp_path)
+    _checkout(repo, "deploy/2026-09-07-stray")
     subprocess.run(
         ["git", "remote", "set-url", "origin", str(tmp_path / "does-not-exist.git")],
         cwd=repo, check=True, capture_output=True, text=True,
     )
     engram_home = tmp_path / "engram-home"
 
+    from tools.engine.deploy_tag import refresh_and_check_deployable_tag_at
+
+    assert refresh_and_check_deployable_tag_at(str(repo), timeout=2.0) is None
+
     result = _run_scratch_installer(repo, engram_home)
 
     assert result.returncode != 0
     assert "not 'dev'" in result.stderr
     assert "#794" in result.stderr
+    assert not (engram_home / ".deployed-version").exists()
 
 
-# ── #2711 round 3 — bound the fetch, fail closed on a TIMEOUT specifically ──
-#
-# Round 2 fixed the fail-closed direction (above) but introduced a new hang
-# risk: `git fetch origin dev main` carried no timeout, so a silently-dropped
-# network (packets unrouted rather than refused) could leave it hanging
-# indefinitely instead of failing fast. This section covers the fix: the
-# fetch is now wrapped in `timeout $FETCH_TIMEOUT_SECS`, and a timeout must
-# land in the SAME fail-closed branch as any other fetch failure.
+# ── #3133 — timeout remains bounded without shell timeout binaries ───────────
 
 
-@pytest.mark.skipif(
-    shutil.which("timeout") is None and shutil.which("gtimeout") is None,
-    reason="installer degrades to an unbounded fetch with no timeout binary; this test would hang (see engram-alpha#2810)",
+@pytest.mark.parametrize("timeout_value", ["2", "2s", "0.5m", "1h", "0.01d"])
+def test_installer_accepts_positive_numeric_and_gnu_suffix_fetch_timeouts(
+    tmp_path, timeout_value
+):
+    """The shell passes the shared parser's positive decimal/suffix contract."""
+    repo = _make_scratch_repo(
+        tmp_path, tags=["v9.9.9-timeout-value"], configure_origin=True
+    )
+    engram_home = tmp_path / "engram-home"
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+
+    result = _run_scratch_installer(
+        repo,
+        engram_home,
+        extra_env={"ENGRAM_INSTALL_FETCH_TIMEOUT_SECS": timeout_value},
+        build_dir=build_root,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "alpha_tag=v9.9.9-timeout-value" in (engram_home / ".deployed-version").read_text()
+
+
+@pytest.mark.parametrize(
+    "timeout_value", ["", "s", "0", "-1", "nan", "inf", "-inf", "garbage"]
 )
-def test_fetch_timeout_fails_closed_refuses_ancestor_tag_without_allow_branch(tmp_path):
-    """A silently-dropped network can't be produced with a real socket in a
-    test without flakiness, so this simulates it the same way the coreutils
-    `timeout` documentation itself frames the failure: a subprocess that
-    accepts control but never returns. `GIT_SSH_COMMAND` swaps git's ssh
-    transport for a script that just sleeps, and the origin URL is switched
-    to an `ssh://` form so that transport is actually used (a bare local
-    path, as the round-2 test above uses, fails instantly rather than
-    hanging — it can't stand in for this case).
+def test_installer_rejects_invalid_fetch_timeout_before_fetch(tmp_path, timeout_value):
+    """Bad config is a config error, never an offline authorization fallback."""
+    repo = _make_scratch_repo(
+        tmp_path, tags=["v9.9.9-invalid-timeout"], configure_origin=True
+    )
+    fetch_started = tmp_path / "fetch-started"
+    fake_ssh = tmp_path / "fake-ssh.sh"
+    fake_ssh.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf started > \"$FETCH_STARTED_FILE\"\n"
+        "exit 1\n"
+    )
+    fake_ssh.chmod(0o755)
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "ssh://localhost/nonexistent-repo.git"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
-    ENGRAM_INSTALL_FETCH_TIMEOUT_SECS overrides the installer's real 15s
-    default down to 2s purely so this test doesn't itself take 15s+ to run;
-    it asserts the override mechanism plus the fail-closed OUTCOME, not the
-    production duration (see the handoff for the chosen 15s figure and its
-    reasoning).
+    result = _run_scratch_installer(
+        repo,
+        tmp_path / "engram-home",
+        extra_env={
+            "ENGRAM_INSTALL_FETCH_TIMEOUT_SECS": timeout_value,
+            "GIT_SSH_COMMAND": str(fake_ssh),
+            "FETCH_STARTED_FILE": str(fetch_started),
+        },
+        timeout=10,
+    )
 
-    Mutation-control result for this test (fail OPEN on a timeout instead of
-    fail-closed): documented in the round-3 handoff rather than executed as
-    a second test here — the natural fail-open mutation (treating rc=124
-    the same as rc=0) does not hang this test, but a mutation that instead
-    DROPS the `timeout` wrapper entirely reintroduces the very hang this
-    fix exists to bound, and a test that can hang the suite is worse than
-    one that doesn't exist. The 2s cap plus this test's own runtime assertion
-    below is the safeguard against that specific mutation shape.
+    assert result.returncode != 0
+    assert "Invalid ENGRAM_INSTALL_FETCH_TIMEOUT_SECS" in result.stderr
+    assert "WARNING" not in result.stderr
+    assert not fetch_started.exists(), "invalid timeout reached git fetch"
 
-    engram-alpha#2810: on a seat with NEITHER `timeout` nor `gtimeout` on
-    PATH, the installer's own fetch is genuinely unbounded by documented
-    design (see the WARNING added to the script's no-wrapper branch), and
-    this test — which relies entirely on the shell's own wrapper to cap the
-    hanging fake-ssh transport below — would hang the whole suite. The
-    skipif above guards that; the `timeout=` kwarg below is an independent,
-    unconditional second line of defense (belt-and-suspenders, not a
-    substitute for the skip) in case the wrapper resolves but somehow fails
-    to actually bound the child."""
+
+def test_installer_fetch_timeout_default_is_fifteen_seconds():
+    assert 'FETCH_TIMEOUT_INPUT="15"' in INSTALLER.read_text()
+
+
+def test_fetch_timeout_falls_through_to_local_refs_without_shell_wrapper(tmp_path):
+    """T4: a real fake-SSH hang falls through to local refs and preserves the tag."""
     repo, commits = _make_scratch_repo_with_ancestry(tmp_path)
     _checkout(repo, "v1.0.0-ancestor-test")
 
     fake_ssh = tmp_path / "fake-ssh.sh"
-    fake_ssh.write_text("#!/usr/bin/env bash\nexec sleep 9999\n")
+    child_pid_file = tmp_path / "fake-ssh-child.pid"
+    fake_ssh.write_text(
+        "#!/usr/bin/env bash\n"
+        "sleep 30 &\n"
+        "child=$!\n"
+        "printf '%s\\n' \"$child\" > \"$FAKE_SSH_CHILD_PID_FILE\"\n"
+        "wait \"$child\"\n"
+    )
     fake_ssh.chmod(0o755)
     subprocess.run(
         ["git", "remote", "set-url", "origin", "ssh://localhost/nonexistent-repo.git"],
         cwd=repo, check=True, capture_output=True, text=True,
     )
     engram_home = tmp_path / "engram-home"
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    masked_path = _path_without_timeout_wrappers(tmp_path / "masked-path-bin-timeout")
 
-    start = time.monotonic()
-    result = _run_scratch_installer(
-        repo, engram_home,
-        extra_env={
-            "ENGRAM_INSTALL_FETCH_TIMEOUT_SECS": "2",
-            "GIT_SSH_COMMAND": str(fake_ssh),
-        },
-        timeout=30,
+    try:
+        start = time.monotonic()
+        result = _run_scratch_installer(
+            repo, engram_home,
+            extra_env={
+                "ENGRAM_INSTALL_FETCH_TIMEOUT_SECS": "2",
+                "GIT_SSH_COMMAND": str(fake_ssh),
+                "FAKE_SSH_CHILD_PID_FILE": str(child_pid_file),
+                "PATH": masked_path,
+            },
+            build_dir=build_root,
+            timeout=30,
+        )
+        elapsed = time.monotonic() - start
+
+        # Generous ceiling above the 2s cap (not a tight bound — CI/sandboxed
+        # hosts vary) but far below the fixture's 30s sleeper.  This is a real
+        # unreachable-origin hang, not a fast failure substituted for it.
+        assert elapsed < 8, f"installer took {elapsed:.1f}s — the fetch was not bounded"
+        assert result.returncode == 0, result.stderr
+        assert "UNBOUNDED" not in (result.stdout + result.stderr)
+        marker = (engram_home / ".deployed-version").read_text()
+        assert "alpha_tag=v1.0.0-ancestor-test" in marker
+        assert child_pid_file.exists()
+        assert not _fixture_pid_is_running(int(child_pid_file.read_text().strip()))
+    finally:
+        # A direct-kill-only mutant can leave this known fake-SSH group alive.
+        if child_pid_file.exists():
+            _cleanup_fixture_process_group(int(child_pid_file.read_text().strip()))
+
+
+# ── #3133 — no timeout/gtimeout prerequisite ─────────────────────────────────
+
+
+def test_fetch_without_shell_timeout_binaries_uses_python_wrapper(tmp_path):
+    """T4: PATH without timeout/gtimeout remains bounded by Python."""
+    repo = _make_scratch_repo(
+        tmp_path, tags=["v9.9.9-nowrapper-test"], configure_origin=True
     )
-    elapsed = time.monotonic() - start
-
-    # Generous ceiling above the 2s cap (not a tight bound — CI/sandboxed
-    # hosts vary) but far below the 9999s the fake ssh sleeps for; this is
-    # what actually distinguishes "bounded" from "the timeout silently
-    # didn't apply" for a reader of this test's result, not just the exit
-    # code (which a hang would never even produce within a sane test run).
-    assert elapsed < 8, f"installer took {elapsed:.1f}s — the fetch was not bounded"
-    assert result.returncode != 0
-    assert "not 'dev'" in result.stderr
-    assert "#794" in result.stderr
-    assert "TIMED OUT" in result.stdout
-    assert not (engram_home / ".deployed-version").exists()
-    assert not (engram_home / ".deployed-version").exists()
-
-
-# ── engram-alpha#2810 — falsifiers for the skipif guard + the new WARNING ──
-#
-# #2810: on a seat with NEITHER `timeout` nor `gtimeout` on PATH (stock
-# macOS), the installer's fetch above degrades to genuinely UNBOUNDED, by
-# documented design (see the block comment above FETCH_TIMEOUT_SECS in the
-# script). The round-3 test above relies entirely on the shell's own
-# wrapper to cap a deliberately-hanging fake ssh transport — on a seat
-# lacking both binaries it would hang the whole suite, hence the skipif
-# marker added to it. A `skipif` marker is evaluated once, at COLLECTION
-# time, from a real `shutil.which()` call — it is not something a
-# per-test mock can exercise — so the falsifier for it is necessarily a
-# different, lower-level probe: does the PRODUCTION SCRIPT itself actually
-# detect "no wrapper resolves" and take the documented no-wrapper branch
-# (WARNING + genuinely unbounded fetch), using a fetch target that fails
-# FAST (not the slow-ssh hang trick, which needs the very wrapper this
-# test masks away).
-
-
-def test_fetch_no_wrapper_warns_and_takes_documented_unbounded_branch(tmp_path):
-    """Falsifier for fix 1 (skipif) and fix 3 (WARNING text).
-
-    Builds a PATH with every real, currently-resolvable executable name
-    EXCEPT `timeout`/`gtimeout` (see _path_without_timeout_wrappers), so
-    `command -v timeout` / `command -v gtimeout` inside the real installer
-    genuinely fail — the same predicate a stock-macOS seat hits, produced
-    without needing one. Uses `_make_scratch_repo` (no 'origin' remote
-    configured at all) with a deploy tag at HEAD, so the fetch block runs
-    but `git fetch origin ...` fails FAST ("'origin' does not appear to be
-    a git repository") rather than hanging — proving the WARNING fires and
-    the script proceeds through its documented degraded path, not proving
-    anything about the (separately-tested) timeout-wrapper-present case.
-    """
-    repo = _make_scratch_repo(tmp_path, tags=["v9.9.9-nowrapper-test"])
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", str(tmp_path / "does-not-exist.git")],
+        cwd=repo, check=True, capture_output=True, text=True,
+    )
     engram_home = tmp_path / "engram-home"
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
     masked_path = _path_without_timeout_wrappers(tmp_path / "masked-path-bin")
 
     result = _run_scratch_installer(
         repo, engram_home,
         extra_env={"PATH": masked_path},
+        build_dir=build_root,
         timeout=30,
     )
 
-    assert (
-        "neither 'timeout' nor 'gtimeout' is on PATH" in result.stdout
-    ), result.stdout
-    assert "brew install coreutils" in result.stdout, result.stdout
-    # The fetch itself still ran (and failed fast, per the no-'origin'-remote
-    # scratch repo) and routed into the SAME fail-closed WARNING branch as
-    # any other fetch failure -- confirming the masked PATH didn't silently
-    # skip the fetch attempt entirely.
-    assert "could not refresh origin/dev + origin/main" in result.stdout, result.stdout
-
-
-def test_run_scratch_installer_timeout_kwarg_bounds_a_genuine_hang(tmp_path):
-    """Falsifier for fix 2 (the hard, unconditional test-side timeout bound).
-
-    Reuses the round-3 test's own hanging-ssh trick (GIT_SSH_COMMAND pointed
-    at a script that `exec sleep 9999`), but WITHOUT any shell-side
-    `timeout`/`gtimeout` protection — the fetch is masked to genuinely
-    unbounded here, same predicate as the falsifier above, plus a real hang
-    source. Proves it is `_run_scratch_installer()`'s OWN `timeout=` kwarg
-    that bounds the call (rather than a shell wrapper, which is deliberately
-    absent here): it must raise subprocess.TimeoutExpired well under 9999s.
-
-    This is the test that would have caught #2810 directly: pre-fix (no
-    `timeout=` kwarg reaching `_run_scratch_installer()`'s own subprocess
-    call at all), this exact call hangs for the full 9999s. See the handoff
-    for the re-verification that actually exercised this by temporarily
-    reverting the production `timeout=` wiring.
-
-    Calls `_run_scratch_installer()` directly (matching the round-3 test's
-    own call shape above) rather than driving subprocess.Popen by hand — an
-    earlier version of this test bypassed the shared helper entirely and so
-    never actually exercised the kwarg it claimed to falsify. The helper
-    itself is what now does the orphan-safe process-group cleanup (see its
-    docstring): on TimeoutExpired it SIGKILLs the whole process group
-    (bash, the git fetch it spawns, the fake-ssh script, and the sleep 9999
-    underneath) via `os.killpg`, launched with `start_new_session=True` — a
-    PID-scoped cleanup of exactly this call's own subtree, never a
-    name/pattern match over the host's process table.
-    """
-    repo = _make_scratch_repo(tmp_path, tags=["v9.9.9-hang-test"])
-    engram_home = tmp_path / "engram-home"
-    masked_path = _path_without_timeout_wrappers(tmp_path / "masked-path-bin-hang")
-
-    fake_ssh = tmp_path / "fake-ssh-hang.sh"
-    fake_ssh.write_text("#!/usr/bin/env bash\nexec sleep 9999\n")
-    fake_ssh.chmod(0o755)
-    subprocess.run(
-        ["git", "remote", "add", "origin", "ssh://localhost/nonexistent-repo.git"],
-        cwd=repo, check=True, capture_output=True, text=True,
-    )
-
-    start = time.monotonic()
-    with pytest.raises(subprocess.TimeoutExpired):
-        _run_scratch_installer(
-            repo, engram_home,
-            extra_env={"PATH": masked_path, "GIT_SSH_COMMAND": str(fake_ssh)},
-            timeout=5,
-        )
-    elapsed = time.monotonic() - start
-
-    # Confirms the discrimination this test exists for: the call actually
-    # returned (via the raised TimeoutExpired) near the 5s bound, not near
-    # the 9999s the fake ssh sleeps for.
-    assert elapsed < 9999, f"took {elapsed:.1f}s — did not discriminate a real hang"
-    assert elapsed < 15, f"took {elapsed:.1f}s — timeout= did not bound the wait"
+    assert result.returncode == 0, result.stderr
+    assert "UNBOUNDED" not in (result.stdout + result.stderr)
+    assert "alpha_tag=v9.9.9-nowrapper-test" in (engram_home / ".deployed-version").read_text()
 
 
 # ── #2979 — regression: shipped .sh scripts must parse under real bash 3.2 ──

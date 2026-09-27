@@ -317,8 +317,10 @@ claude-code's numbers). New hooks route `additionalContext` through
 ## PR merge authority — the substrate-feature gate
 
 Once a PR is merge-ready (next section), **who merges it** depends on what it
-changes: **substrate-concept features → Lei reads the PR first**; **fixes +
-non-substrate → the team merges after peer review**. This gate is
+changes: **substrate-concept features → Lei reads the PR first**, unless the PR
+implements a design he already read (Lei, 2026-09-27 — then the team merges
+after a written conformance check); **fixes + non-substrate → the team merges
+after peer review**. This gate is
 **engram-alpha-only** — other repos (umwelt, soma) carry their own delegated
 authority. During an explicit Lei-absence day-grant, a settled substrate PR may
 be merged to `dev` (revertible) while the irreversible live-deploy stays Lei's.
@@ -459,7 +461,38 @@ enters the maintainer's merge queue:
    No fairy delta round, and no patch-identity argument that a later diff is
    "equivalent" to what the fairy approved, substitutes for the merge gate
    below.
-2. **Counterpart-agent colleague fresh-eye** — after the fairy converges, the
+   **Cap: three pre-peer fairy rounds per contributed tip** (Kepler, ruled
+   for the fleet 2026-09-20, forum #422 — posts 10344 and 10347, refined to
+   rule v4 in posts 10354–10356 and closed at 10364). Round 1 is the
+   mandatory self-check; rounds 2 and 3 are for blockers the author agrees
+   are defects of the artifact. After round 3 the author stops, lists every
+   still-open finding in the PR body with one line on why it is or is not a
+   defect, and sends the PR to the peer, who reads that list first. A fourth
+   round needs a written reason: a blocker whose fix changed more than the
+   blocker. The stopping signal is where a finding came from. A finding
+   that arrived from a contributor, from use, or from a trap set on a live
+   seat is a defect; one that exists only because the previous round's fix
+   created it is review-authored, and a chain of those is the process
+   reviewing itself.
+   **Reset (v4):** a contributed tip is a NON-MERGE commit
+   (`git log --no-merges --format='%an'`) whose git author is not the PR
+   author, landed after the PR's first review object
+   (`gh pr view --json reviews,comments`); it resets the three-round count.
+   Merge commits never count regardless of who clicked (a web-UI "Update
+   branch" is a merge), the committer field never counts (every squash merge
+   here reads `GitHub`), and the author's own fold of a peer finding never
+   resets. Named field, named anchor, both read off artifacts, never
+   recalled. One duty added when this was written into the repo on
+   2026-09-26, not part of the forum ruling: the merge seat records in its
+   merge comment when a PR merged under the cap. **This cap qualifies
+   "iterate to convergence" above and the "reached APPROVE" clause of the
+   merge seat's mechanical check below:** a PR whose third round still
+   returns REQUEST_CHANGES goes to the peer with its open findings listed,
+   and that list is the round's stopping point. Written in after
+   engram-alpha #3100 merged under the cap (three REQUEST_CHANGES rounds)
+   and the merge seat had to find the rule on the forum (forum #431, post
+   10837).
+2. **Counterpart-agent colleague fresh-eye** — after the fairy converges (or item 1's three-round cap is reached with the open findings listed), the
    author sends the counterpart a letter (via `ia write`, the inter-agent
    letter CLI) requesting review and iterates on their findings. The
    counterpart catches pattern-level / cross-issue / structural-discipline
@@ -670,15 +703,18 @@ the reviewer-fairy round — and merging on a colleague approval that landed
 first, without the fairy round ever converging, or running at all.
 
 **Named anti-pattern: a colleague approval obtained while the fairy round is
-absent or unconverged does not count as the colleague box.** The colleague pass
+absent, or unconverged short of item 1's cap-reached-with-listed-findings
+state, does not count as the colleague box.** The colleague pass
 starts only once the reviewer-fairy round has converged on the tip being
-reviewed — not before, not in parallel, no exception for a PR that requests
-both at once. Lei's reasoning, stated because it should carry the rule rather
+reviewed — or has reached item 1's three-round cap with its open findings
+listed in the PR body, which is the sequence's stopping point — not before,
+not in parallel, no exception for a PR that requests both at once. Lei's reasoning, stated because it should carry the rule rather
 than just accompany it: (1) the fairy round is *within the author's own
 control* — a self-check by a fresh-eyed, context-less reviewer that interrupts
 nobody's workflow, a sanity check and a courtesy to peers, not a cost worth
 working around. (2) Peer review *assumes* fairy convergence — implementation
-most-likely-correct — so the peer spends their read on what a context-less
+most-likely-correct — or, under the cap, starts from the listed open
+findings, which the author has already answered one line each; so the peer spends their read on what a context-less
 fairy structurally cannot catch: subtle tensions with other in-flight designs,
 team conventions, the larger picture. Sending a PR to a colleague before that
 assumption holds wastes the colleague's attention on ground a fairy would have
@@ -716,7 +752,8 @@ arguing for.
 
 **Mechanical check at the merge seat.** Before merging, confirm two separate
 things. (1) A reviewer-fairy round *exists and reached APPROVE before the PR
-was sent to the peer* (per "The colleague converged gate" above — the fairy
+was sent to the peer, or reached the three-round cap with its open findings
+listed in the PR body* (item 1's cap, above) (per "The colleague converged gate" above — the fairy
 round need not match the tip being merged; a later commit folding peer
 feedback does not un-converge it) by reading the PR's own review/comment
 record directly (`gh pr view <N> --comments`, or the REST fallback documented

@@ -37,6 +37,34 @@ _INIT_LOCK = threading.Lock()
 # knowledge.db every emit() would be wasteful. Cache for 60s; lazy refresh.
 _TURN_CACHE_TTL_SECONDS = 60
 
+# Once-per-process warning sentinels for the durability path (alpha #2801).
+# Two DISTINCT flags (not a shared one) -- the per-event fsync and the
+# one-time directory fsync are different failure surfaces, and keeping them
+# separate lets each condition be warned about at least once even if the
+# other has already fired. Tests reset both between runs.
+_FSYNC_WARNED: bool = False
+_DIR_FSYNC_WARNED: bool = False
+
+
+def _warn_fsync_once(stderr_fn, exc: OSError) -> None:
+    """Warn once per process that a per-event fsync failed. The line was
+    still written -- this is NOT a dropped event, just reduced durability."""
+    global _FSYNC_WARNED
+    if _FSYNC_WARNED:
+        return
+    _FSYNC_WARNED = True
+    stderr_fn(f"fsync failed ({exc!r}); durability not guaranteed")
+
+
+def _warn_dir_fsync_once(stderr_fn, exc: OSError) -> None:
+    """Warn once per process that a directory fsync (on file creation)
+    failed. Same not-a-drop rule as _warn_fsync_once, distinct flag."""
+    global _DIR_FSYNC_WARNED
+    if _DIR_FSYNC_WARNED:
+        return
+    _DIR_FSYNC_WARNED = True
+    stderr_fn(f"directory fsync failed ({exc!r}); durability not guaranteed")
+
 # Event-type namespace check. All event types must match engram.<domain>.<action>.
 # Cheap regex equivalent without importing re — three dots required, all
 # segments non-empty, starts with "engram.".
@@ -220,10 +248,50 @@ class Emitter:
         line = json.dumps(event, separators=(",", ":"))
 
         # Append (atomic on POSIX for sub-PIPE_BUF line writes; explicit
-        # lock for larger lines to avoid interleave from concurrent threads)
+        # lock for larger lines to avoid interleave from concurrent threads).
+        #
+        # fsync the fd before returning (alpha #2801): flush first so the
+        # written bytes actually reach the fd, then fsync so they reach disk
+        # before emit() reports success back to the caller. A failed fsync
+        # is NOT a dropped event -- the line IS written -- so its OSError is
+        # caught here (never allowed to propagate into emit()'s catch-all,
+        # which would wrongly log "event dropped" and return None) and
+        # warned about once per process, not once per event.
         with self._write_lock:
+            file_existed = target.exists()
             with open(target, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
+                # NOT wrapped in the not-a-drop carve-out below (round-1
+                # review, PR #3168): a flush() failure means the bytes
+                # plausibly never left the process, so it's routed to
+                # emit()'s generic "event dropped" catch-all -- unlike a
+                # post-write fsync failure, where the bytes are already out.
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError as exc:
+                    _warn_fsync_once(self._stderr, exc)
+
+            # If this append CREATED the file (first event of this session
+            # and level), also fsync the parent directory once so the
+            # directory ENTRY is durable too -- otherwise an unclean
+            # shutdown can lose the whole file, not just its tail. Only
+            # needed on the creating emit; every later append to the same
+            # file is a no-op here.
+            #
+            # os.open(dir, O_RDONLY) + os.fsync + close is the POSIX
+            # directory-fsync idiom (Linux/macOS). On Windows this raises
+            # (no Windows-specific branch beyond that) -- treated the same
+            # as any other fsync failure: warn once, continue.
+            if not file_existed:
+                try:
+                    dir_fd = os.open(str(target.parent), os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except OSError as exc:
+                    _warn_dir_fsync_once(self._stderr, exc)
 
         return event_uuid
 

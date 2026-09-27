@@ -26,6 +26,19 @@ health/ imports" rule exists to avoid (re-deriving another module's
 contract instead of calling it). Every OTHER function in this file keeps
 the plain-JSON-file contract described above unchanged.
 
+**A second deliberate exception (engram-alpha#2518, live-score slice):
+``get_health_v2_live_data`` imports ``health.engine`` (for
+``build_snapshot``) and ``engram_core`` (for a cheap, no-model-load
+embedder-availability check) lazily.** This is the ``/api/health/v2/live``
+route's own backend: it recomputes a health-v2 snapshot IN-MEMORY, on every
+call, straight from the requested agent's own ``knowledge.db`` -- never
+from a stored JSON file -- and is never persisted (see
+``health.engine.write_snapshot``'s refusal of ``checkpoint_mode="live"``).
+The snapshot-dict -> row/tile/status assembly is shared with
+``get_health_v2_data`` via ``_assemble_health_v2_payload`` below, so both
+callers (load-from-file, build-fresh-live) produce the exact same payload
+shape from whichever snapshot dict they hand it.
+
 No HTTP, no HTML -- unit-testable in isolation, same convention as this
 package's sibling loaders (``stats.py``, ``health.py``, ``calibration.py``).
 
@@ -43,6 +56,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
+import threading
 from datetime import datetime, timezone
 
 from .. import agents as viz_agents
@@ -357,6 +372,85 @@ def _signal_row(name: str, snapshot: dict, metric_to_aspect: dict) -> dict:
     }
 
 
+def _assemble_health_v2_payload(
+    snapshot: dict, snapshot_id: "str | None", written_at: str
+) -> dict:
+    """The snapshot-dict -> row/tile/status assembly shared by
+    ``get_health_v2_data`` (a snapshot loaded from a stored JSON file) and
+    ``get_health_v2_live_data`` (a snapshot freshly built in-memory by
+    ``health.engine.build_snapshot(mode="live")``) -- engram-alpha#2518's
+    live-score slice, extracted so both callers produce the exact same
+    payload shape from whichever snapshot dict they hand it, per that
+    slice's contract ("one caller becomes 'load from file, call the
+    assembler', the other becomes 'call build_snapshot(mode=live), call the
+    assembler'").
+
+    *snapshot_id* is the stored-file caller's own filename-derived id (e.g.
+    ``"5-nap-20260904T120000Z"``), or ``None`` for a live build (nothing was
+    written, so there is no filename to derive an id from). *written_at* is
+    an ISO-8601 string either caller resolves its own way -- the stored
+    caller from the filename's own timestamp / the file's mtime
+    (``_written_at``); the live caller from ``computed_at``, the instant
+    this particular live build finished, since nothing was "written" in the
+    persisted-checkpoint sense.
+
+    Caller must have already confirmed ``"measurements" in snapshot`` (or
+    equivalent) -- this function does not itself guard against an
+    old-format snapshot; that guard is caller-specific (the stored path's
+    own "old-format" reason message doesn't make sense for a freshly-built
+    live snapshot, which is always current-format by construction)."""
+    scores = snapshot.get("scores") or {}
+    config = snapshot.get("config") or {}
+    signal_defs = snapshot.get("signal_defs") or {}
+    metric_to_aspect = _metric_to_aspect_map(config)
+
+    provenance = {
+        "snapshot_id": snapshot_id,
+        "turn": snapshot.get("turn"),
+        "checkpoint_mode": snapshot.get("checkpoint_mode"),
+        "written_at": written_at,
+        "health_version": snapshot.get("health_version"),
+        "raw_schema_version": snapshot.get("raw_schema_version"),
+        "model_version": snapshot.get("model_version"),
+        "anchor": snapshot.get("anchor"),
+    }
+
+    signal_rows = [
+        _signal_row(name, snapshot, metric_to_aspect) for name in signal_defs
+    ]
+
+    aspects_scores = scores.get("aspects") or {}
+    unscored_aspects = scores.get("unscored_aspects") or []
+    aspect_coverage = scores.get("aspect_coverage") or {}
+    aspect_tile = []
+    for aspect_name, score in aspects_scores.items():
+        entry = {"name": aspect_name, "score": score}
+        # "unscored"/"coverage" are additive -- both read straight off
+        # existing snapshot fields with no invented shape (JUDGMENT CALL,
+        # flagged in the dispatching report); "points" was deliberately
+        # left off -- see that report's ambiguous-decision log.
+        entry["unscored"] = aspect_name in unscored_aspects
+        cov = aspect_coverage.get(aspect_name)
+        if cov is not None:
+            entry["coverage"] = cov.get("coverage")
+        aspect_tile.append(entry)
+
+    composed = {
+        "value": scores.get("composed"),
+        "points_in_play": scores.get("points_in_play"),
+        "composed_coverage": scores.get("composed_coverage"),
+        "unscored_aspects": unscored_aspects,
+    }
+
+    return {
+        "has_snapshot": True,
+        "provenance": provenance,
+        "signal_rows": signal_rows,
+        "aspect_tile": aspect_tile,
+        "composed": composed,
+    }
+
+
 def get_health_v2_data(agent_name: str) -> dict:
     """Load the latest health-v2 snapshot for *agent_name* and assemble the
     detail-view payload. Never raises -- always returns a dict, with
@@ -411,58 +505,9 @@ def get_health_v2_data(agent_name: str) -> dict:
             ),
         }
 
-    scores = snapshot.get("scores") or {}
-    config = snapshot.get("config") or {}
-    signal_defs = snapshot.get("signal_defs") or {}
-    metric_to_aspect = _metric_to_aspect_map(config)
-
     snapshot_id = filename[:-len(".json")] if filename.endswith(".json") else filename
-
-    provenance = {
-        "snapshot_id": snapshot_id,
-        "turn": snapshot.get("turn"),
-        "checkpoint_mode": snapshot.get("checkpoint_mode"),
-        "written_at": _written_at(snapshot_path, filename),
-        "health_version": snapshot.get("health_version"),
-        "raw_schema_version": snapshot.get("raw_schema_version"),
-        "model_version": snapshot.get("model_version"),
-        "anchor": snapshot.get("anchor"),
-    }
-
-    signal_rows = [
-        _signal_row(name, snapshot, metric_to_aspect) for name in signal_defs
-    ]
-
-    aspects_scores = scores.get("aspects") or {}
-    unscored_aspects = scores.get("unscored_aspects") or []
-    aspect_coverage = scores.get("aspect_coverage") or {}
-    aspect_tile = []
-    for aspect_name, score in aspects_scores.items():
-        entry = {"name": aspect_name, "score": score}
-        # "unscored"/"coverage" are additive -- both read straight off
-        # existing snapshot fields with no invented shape (JUDGMENT CALL,
-        # flagged in the dispatching report); "points" was deliberately
-        # left off -- see that report's ambiguous-decision log.
-        entry["unscored"] = aspect_name in unscored_aspects
-        cov = aspect_coverage.get(aspect_name)
-        if cov is not None:
-            entry["coverage"] = cov.get("coverage")
-        aspect_tile.append(entry)
-
-    composed = {
-        "value": scores.get("composed"),
-        "points_in_play": scores.get("points_in_play"),
-        "composed_coverage": scores.get("composed_coverage"),
-        "unscored_aspects": unscored_aspects,
-    }
-
-    return {
-        "has_snapshot": True,
-        "provenance": provenance,
-        "signal_rows": signal_rows,
-        "aspect_tile": aspect_tile,
-        "composed": composed,
-    }
+    written_at = _written_at(snapshot_path, filename)
+    return _assemble_health_v2_payload(snapshot, snapshot_id, written_at)
 
 
 def get_health_v2_series(agent_name: str, version: "str | None" = None, signal: "str | None" = None) -> dict:
@@ -505,3 +550,234 @@ def get_health_v2_series(agent_name: str, version: "str | None" = None, signal: 
         return {"error": str(exc), "reason": "series_module_unavailable"}
 
     return health_series.export(db_path, version, signal)
+
+
+# ---------------------------------------------------------------------------
+# /api/health/v2/live (engram-alpha#2518, live-score slice) -- Lei's
+# direction: "always recompute on page refresh and don't even show a
+# 'snapshot now' button at all ... the health dashboard is basically
+# showing the realtime health score all the time, snapshotting and history
+# maintenance is totally a different thing, independent of the scores
+# panels shown on the page". This section builds a health-v2 snapshot
+# FRESH, in-memory, per request, against the requested agent's own
+# knowledge.db -- never a stored file, never persisted -- and hands it to
+# ``_assemble_health_v2_payload`` above.
+# ---------------------------------------------------------------------------
+
+
+class _InFlightLiveBuild:
+    """One in-flight ``get_health_v2_live_data`` build for a single agent --
+    the per-agent single-flight unit (contract item 4: N concurrent
+    requests for the SAME agent while a build is running must trigger
+    exactly ONE build and all reuse its result; a request arriving AFTER
+    the previous build finished must always trigger a genuinely NEW one).
+    ``event`` is set once ``result`` is populated; a waiter blocks on
+    ``event.wait()`` rather than polling."""
+
+    __slots__ = ("event", "result")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.result: "dict | None" = None
+
+
+# Module-level single-flight state. ``_live_build_state_lock`` guards ONLY
+# the dict itself (a fast in/out check-and-set, never held across an
+# actual build) -- the long-running work (build_snapshot + the assembler)
+# happens OUTSIDE the lock, on the single builder thread, while every other
+# concurrent thread for the SAME agent waits on that builder's own
+# ``_InFlightLiveBuild.event``. Threaded server (viz.server / viz.workbench
+# both run on ``ThreadingHTTPServer`` -- real concurrent requests, not
+# merely interleaved), so this must be genuinely thread-safe, not just
+# async-safe.
+_live_build_state_lock = threading.Lock()
+_live_build_inflight: "dict[str, _InFlightLiveBuild]" = {}
+
+
+def _resolve_effective_embedding_enabled(agent_config: dict) -> "tuple[bool, str]":
+    """(effective_enabled, embedding_gate_source) for the live route's
+    ``embedding_enabled`` override to ``health.engine.build_snapshot``.
+
+    Combines the REQUESTED agent's own config (per-agent, read off disk --
+    exactly the fact the process-global ``core._get_embedding_config()``
+    read used to silently get wrong for any agent other than the viz
+    process's own) with a cheap, no-model-load install check
+    (``core._embedder.is_available()`` -- already guaranteed cheap: it only
+    checks an env var and whether ``sentence_transformers`` is importable,
+    never loads a model; see ``EmbeddingManager.is_available``'s own
+    docstring). This is a PROCESS fact, not a per-agent one -- the viz
+    server cannot introspect a different agent's OWN process env/venv --
+    so it is necessarily shared across every agent this call serves; the
+    per-agent half comes entirely from ``agent_config``.
+
+    JUDGMENT CALL (flagged in the dispatching report): the spec's grounding
+    section names the config key as "embeddings.enabled"; the actual schema
+    (``engram_core._get_embedding_config``) reads ``config["embedding"]``
+    (singular) -- this function reads the REAL key, matching every other
+    reader of this same config file (``engram_core.py``,
+    ``viz/data/health.py``'s own ``current_turn`` read)."""
+    import engram_core as core  # lazy -- see module docstring
+
+    config_enabled = bool(
+        (agent_config.get("embedding") or {}).get("enabled", True)
+    )
+    installed_available = bool(core._embedder.is_available())
+    effective = config_enabled and installed_available
+    source = (
+        f"agent_config.embedding.enabled={config_enabled} "
+        f"and core._embedder.is_available()={installed_available}"
+    )
+    return effective, source
+
+
+def _build_live_health_v2_payload(agent_name: str, db_path: str) -> dict:
+    """Do the actual work for ONE live build -- called by exactly one
+    thread per in-flight build (see ``get_health_v2_live_data``'s
+    single-flight wrapper below). Never raises -- every failure mode
+    (missing DB, unreadable config, a ``build_snapshot`` exception) is
+    folded into the same fail-honest ``{"has_snapshot": False, "reason":
+    ...}`` shape ``get_health_v2_data`` already uses (contract item 6:
+    never fall back to serving a stale stored snapshot dressed up as
+    live)."""
+    if not os.path.exists(db_path):
+        return {
+            "has_snapshot": False,
+            "reason": f"Database not found: {db_path}",
+        }
+
+    # Per-agent config reads (engram-alpha#2518 contract item 2) -- mirrors
+    # viz/data/health.py's own current_turn read exactly (same key path,
+    # same silent-default-on-missing/unreadable-file posture), applied to
+    # the REQUESTED agent's config.json rather than assuming a single
+    # process-global config.
+    config_path = os.path.join(os.path.dirname(db_path), "config.json")
+    current_turn = 0
+    turn_source = "agent_config_default(no config.json or unreadable)"
+    agent_config: dict = {}
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                agent_config = json.loads(f.read())
+            current_turn = int((agent_config.get("memory") or {}).get("current_turn", 0))
+            turn_source = "agent_config.memory.current_turn"
+        except Exception:
+            pass  # keep the default + default-source label above
+
+    embedding_enabled, embedding_gate_source = _resolve_effective_embedding_enabled(
+        agent_config
+    )
+
+    try:
+        # Read-only via mode=ro -- same multi-agent peer-DB safety pattern
+        # viz/data/health.py's get_health_data already uses (comment there:
+        # "multi-agent peer-DB safety is enforced by OS file permissions
+        # ... not by this URI flag").
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.OperationalError as exc:
+        return {
+            "has_snapshot": False,
+            "reason": f"Failed to open database read-only: {exc}",
+        }
+
+    try:
+        from health import engine as health_engine  # lazy -- see module docstring
+
+        snapshot = health_engine.build_snapshot(
+            conn,
+            "live",
+            current_turn=current_turn,
+            embedding_enabled=embedding_enabled,
+        )
+    except Exception as exc:
+        return {
+            "has_snapshot": False,
+            "reason": f"Live health build failed: {exc}",
+        }
+    finally:
+        conn.close()
+
+    computed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload = _assemble_health_v2_payload(snapshot, None, computed_at)
+    # Top-level, not just provenance.written_at (which this same value also
+    # populates, for internal consistency) -- contract item 4: "the payload
+    # must always carry computed_at", read directly off the response by the
+    # frontend rather than reached for via provenance.
+    payload["computed_at"] = computed_at
+    payload["live_inputs"] = {
+        "turn_source": turn_source,
+        "embedding_gate_source": embedding_gate_source,
+    }
+    return payload
+
+
+def get_health_v2_live_data(agent_name: str) -> dict:
+    """The ``/api/health/v2/live`` payload (engram-alpha#2518, live-score
+    slice) -- recomputes a health-v2 snapshot FRESH on every call, against
+    the requested agent's own ``knowledge.db``, and returns the SAME
+    payload shape ``get_health_v2_data`` does (plus ``computed_at`` and
+    ``live_inputs``, see ``_build_live_health_v2_payload``). Never raises,
+    never persists anything, never falls back to a stale stored snapshot.
+
+    Per-agent single-flight (contract item 4): N concurrent requests for
+    the SAME agent, arriving while a build is already in flight, all wait
+    on and reuse THAT build's result -- exactly one ``build_snapshot`` call
+    for however many requests overlap. A request arriving after the
+    in-flight build has already finished always starts a genuinely NEW
+    build (the in-flight entry is removed the moment its build completes),
+    so "every refresh is live" stays literally true -- this dedupes
+    concurrent stampedes, it never caches or staleness-windows the result.
+    """
+    agent_meta = viz_agents.AGENTS.get(agent_name)
+    if not agent_meta:
+        return {"has_snapshot": False, "reason": f"Unknown agent: {agent_name!r}"}
+    db_path = agent_meta.get("db", "")
+    if not db_path:
+        return {"has_snapshot": False, "reason": f"Unknown agent: {agent_name!r}"}
+
+    with _live_build_state_lock:
+        inflight = _live_build_inflight.get(agent_name)
+        is_builder = inflight is None
+        if is_builder:
+            inflight = _InFlightLiveBuild()
+            _live_build_inflight[agent_name] = inflight
+
+    if not is_builder:
+        inflight.event.wait()
+        return inflight.result
+
+    try:
+        # _build_live_health_v2_payload is documented to never raise (every
+        # failure mode folds into a {"has_snapshot": False, "reason": ...}
+        # return) -- this except is defense-in-depth ONLY, so a genuinely
+        # unexpected exception still sets the event and populates a result
+        # rather than hanging every waiter on inflight.event.wait() forever.
+        try:
+            result = _build_live_health_v2_payload(agent_name, db_path)
+        except Exception as exc:  # noqa: BLE001 -- see comment above
+            result = {
+                "has_snapshot": False,
+                "reason": f"Unexpected error building live health data: {exc}",
+            }
+        inflight.result = result
+    finally:
+        # Defense-in-depth for a BaseException subclass that is NOT an
+        # Exception subclass (SystemExit, KeyboardInterrupt, or a raw
+        # BaseException) escaping the inner except-Exception above:
+        # inflight.result would otherwise stay at its __init__ default of
+        # None, and every OTHER thread waiting on inflight.event.wait()
+        # would wake up and return None instead of a dict. Safe sentinel:
+        # inflight.result is only ever assigned a dict on every real code
+        # path (_build_live_health_v2_payload's own contract is "never
+        # raises, always returns a dict"), so None at this point can only
+        # mean the assignment above never happened.
+        if inflight.result is None:
+            inflight.result = {
+                "has_snapshot": False,
+                "reason": "Unexpected error building live health data (non-Exception failure)",
+            }
+        with _live_build_state_lock:
+            if _live_build_inflight.get(agent_name) is inflight:
+                del _live_build_inflight[agent_name]
+        inflight.event.set()
+    return result

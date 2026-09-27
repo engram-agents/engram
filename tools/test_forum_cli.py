@@ -437,6 +437,165 @@ class TestRead:
         stdout, stderr, code = wired_cli(["read", "99999"])
         assert code == forum_cli.EXIT_NOT_FOUND
 
+    def test_plain_read_output_is_byte_identical_to_before_the_flag(self, wired_cli):
+        """Item 8: adding --new/--last must not change plain `read`'s output
+        at all."""
+        tid = self._make_thread(wired_cli)
+        with mock.patch.object(forum_cli, "_get_agent_name", return_value="otherbot"):
+            wired_cli(["reply", str(tid)], stdin_text="Reply from otherbot.")
+        stdout_plain, _, code_plain = wired_cli(["read", str(tid)])
+        assert code_plain == 0
+        # Re-fetch identically (a second plain read is idempotent output-wise
+        # apart from the watermark already being caught up, which does not
+        # change what gets rendered).
+        tid2 = self._make_thread(wired_cli, title="Second thread")
+        with mock.patch.object(forum_cli, "_get_agent_name", return_value="otherbot"):
+            wired_cli(["reply", str(tid2)], stdin_text="Reply from otherbot.")
+        stdout_again, _, code_again = wired_cli(["read", str(tid2)])
+        assert code_again == 0
+        # Same shape: both should contain the thread header and post bodies,
+        # neither should contain any of the new flags' own marker text.
+        for out in (stdout_plain, stdout_again):
+            assert "showing" not in out
+            assert "no new posts" not in out
+
+    def test_new_shows_only_posts_since_watermark_with_header(self, wired_cli):
+        tid = self._make_thread(wired_cli)
+        with mock.patch.object(forum_cli, "_get_agent_name", return_value="otherbot"):
+            wired_cli(["reply", str(tid)], stdin_text="First reply.")
+        # testbot reads once (establishes a watermark at the current tip).
+        wired_cli(["read", str(tid)])
+        with mock.patch.object(forum_cli, "_get_agent_name", return_value="otherbot"):
+            wired_cli(["reply", str(tid)], stdin_text="Second reply, genuinely new.")
+
+        stdout, stderr, code = wired_cli(["read", str(tid), "--new"])
+        assert code == 0, f"stderr: {stderr}"
+        assert "showing 1 new of 3; 2 earlier hidden" in stdout
+        assert "Second reply, genuinely new" in stdout
+        assert "First reply" not in stdout
+        assert "Initial post body" not in stdout
+
+    def test_new_with_nothing_new_prints_exact_message_and_exits_0(self, wired_cli):
+        tid = self._make_thread(wired_cli)
+        wired_cli(["read", str(tid)])  # establish watermark at the tip
+        stdout, stderr, code = wired_cli(["read", str(tid), "--new"])
+        assert code == 0, f"stderr: {stderr}"
+        assert "no new posts since your last read (1 total)" in stdout
+
+    def test_new_with_nothing_new_and_json_format_emits_valid_json(self, wired_cli):
+        """Round-1 blocker (Ariadne's fairy round, PR-3171): `--new --format
+        json` on the nothing-new case used to print the plain-text human
+        message and return before the --format check ever ran, so a JSON
+        consumer got an unparseable string. This is the discriminating test
+        that gap needed and didn't have -- the fairy found the bug in
+        production code that had 100% test coverage of every OTHER
+        --new/--format combination except this exact one."""
+        tid = self._make_thread(wired_cli)
+        wired_cli(["read", str(tid)])  # establish watermark at the tip
+        stdout, stderr, code = wired_cli(["read", str(tid), "--new", "--format", "json"])
+        assert code == 0, f"stderr: {stderr}"
+        parsed = json.loads(stdout)  # must not raise
+        assert parsed["posts"] == []
+        assert parsed["notice"] == "no new posts since your last read (1 total)"
+
+    def test_new_still_advances_the_watermark(self, wired_cli):
+        """Item 7: a --new read must still advance the watermark to the
+        thread's max post id, exactly like a plain read."""
+        tid = self._make_thread(wired_cli)
+        with mock.patch.object(forum_cli, "_get_agent_name", return_value="otherbot"):
+            wired_cli(["reply", str(tid)], stdin_text="Reply from otherbot.")
+        stdout, _, _ = wired_cli(["status", "--format", "json"])
+        assert json.loads(stdout)["unread_total"] >= 1
+        wired_cli(["read", str(tid), "--new"])
+        stdout, _, _ = wired_cli(["status", "--format", "json"])
+        assert json.loads(stdout)["unread_total"] == 0
+
+    def test_new_uses_the_server_value_not_a_local_guess(self, wired_cli, flask_client):
+        """Discriminating control (the spec's own requirement): point at a
+        stub response with last_read_post_id present but WRONG (0) -- --new
+        must show everything, proving it reads the server field rather than
+        computing anything locally. This test must fail if the graceful
+        old-server fallback branch is removed (a server response with the
+        key present must take a genuinely different path than one without
+        it).
+
+        ROUND-1 FIX (Ariadne's fairy round, PR-3171): the first draft nested
+        a mock.patch.object(forum_cli, "_do_request", ...) OUTSIDE a
+        wired_cli(...) call. wired_cli's own run_cli ALSO patches
+        forum_cli._do_request around the actual CLI invocation -- a nested
+        patch context that shadows the outer stub for the entire duration of
+        the CLI run, so the outer stub's side_effect never actually fires
+        (confirmed dead: the fairy traced it and a harness-free direct-call
+        probe of cmd_read matched the intended behavior even while this test,
+        as originally written, silently exercised nothing). Fixed by patching
+        `flask_client.get` instead -- a different object than
+        `forum_cli._do_request`, so wired_cli's own internal patch of the
+        latter cannot shadow it."""
+        tid = self._make_thread(wired_cli)
+        with mock.patch.object(forum_cli, "_get_agent_name", return_value="otherbot"):
+            wired_cli(["reply", str(tid)], stdin_text="Reply from otherbot.")
+        wired_cli(["read", str(tid)])  # real watermark now at the tip (2)
+
+        real_get = flask_client.get
+
+        def _get_and_zero_watermark(path, *a, **kw):
+            resp = real_get(path, *a, **kw)
+            if path.startswith(f"/api/thread/{tid}?agent="):
+                payload = json.loads(resp.get_data(as_text=True))
+                payload.setdefault("thread", {})["last_read_post_id"] = 0
+                resp.set_data(json.dumps(payload))
+            return resp
+
+        with mock.patch.object(flask_client, "get", side_effect=_get_and_zero_watermark):
+            stdout, stderr, code = wired_cli(["read", str(tid), "--new"])
+        assert code == 0, f"stderr: {stderr}"
+        assert "showing 2 new of 2; 0 earlier hidden" in stdout
+        assert "Initial post body" in stdout
+        assert "Reply from otherbot" in stdout
+
+    def test_new_falls_back_to_last_5_when_server_omits_the_field(self, wired_cli, flask_client):
+        """Item 6: the key ABSENT (not present-but-null) means an
+        un-redeployed server -- must fall back to --last 5 with an explicit
+        one-line notice, never silently show everything or nothing.
+
+        See test_new_uses_the_server_value_not_a_local_guess's docstring for
+        why this patches flask_client.get rather than forum_cli._do_request
+        (the same nested-patch shadowing bug applied here too)."""
+        tid = self._make_thread(wired_cli)
+        for i in range(6):
+            with mock.patch.object(forum_cli, "_get_agent_name", return_value="otherbot"):
+                wired_cli(["reply", str(tid)], stdin_text=f"Reply number {i}.")
+
+        real_get = flask_client.get
+
+        def _get_and_strip_watermark(path, *a, **kw):
+            resp = real_get(path, *a, **kw)
+            if path.startswith(f"/api/thread/{tid}?agent="):
+                payload = json.loads(resp.get_data(as_text=True))
+                payload.get("thread", {}).pop("last_read_post_id", None)
+                resp.set_data(json.dumps(payload))
+            return resp
+
+        with mock.patch.object(flask_client, "get", side_effect=_get_and_strip_watermark):
+            stdout, stderr, code = wired_cli(["read", str(tid), "--new"])
+        assert code == 0, f"stderr: {stderr}"
+        assert "server does not report read state; showing last 5 — use --last N" in stdout
+        assert "Reply number 5" in stdout
+        assert "Reply number 0" not in stdout  # the 6th-from-last, correctly hidden
+        assert "Initial post body" not in stdout
+
+    def test_last_n_shows_only_the_last_n_posts(self, wired_cli):
+        tid = self._make_thread(wired_cli)
+        for i in range(4):
+            with mock.patch.object(forum_cli, "_get_agent_name", return_value="otherbot"):
+                wired_cli(["reply", str(tid)], stdin_text=f"Reply number {i}.")
+        stdout, stderr, code = wired_cli(["read", str(tid), "--last", "2"])
+        assert code == 0, f"stderr: {stderr}"
+        assert "Reply number 3" in stdout
+        assert "Reply number 2" in stdout
+        assert "Reply number 1" not in stdout
+        assert "Initial post body" not in stdout
+
 
 @SKIP_INTEGRATION
 class TestStatus:

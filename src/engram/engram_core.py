@@ -1131,6 +1131,23 @@ DAG_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c["dag"]
 
 
 # ---------------------------------------------------------------------------
+# engram_retype_edge's allowed-move table (issue #2265, epic #2252).
+# docs/2265-2347-edge-correction-design.md sec.2: "a re-type may only move an
+# edge to a relation that claims LESS" -- supported_by/derives_from/cites are
+# all provenance-bearing; about/exemplifies are not. Any move not in this
+# table is refused, including every move in the opposite (stronger)
+# direction. The value is None (no extra condition) or a tuple of node
+# `type` values the TARGET must already be one of.
+# ---------------------------------------------------------------------------
+RETYPE_ALLOWED_MOVES: "dict[tuple[str, str], tuple[str, ...] | None]" = {
+    ("supported_by", "about"): None,
+    ("derives_from", "about"): None,
+    ("derives_from", "exemplifies"): ("lesson", "cornerstone"),
+    ("cites", "about"): None,
+}
+
+
+# ---------------------------------------------------------------------------
 # `generalizes` substrate (#2753 epic, WS1).
 # ---------------------------------------------------------------------------
 
@@ -4509,7 +4526,55 @@ def _get_db() -> sqlite3.Connection:
     _ensure_data_dir()
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        # #2635 unit 2: measured empirically -- a BRAND-NEW connection's own
+        # PRAGMA journal_mode=WAL can itself raise a raw, uninformative
+        # sqlite3 "disk I/O error" the instant this process already holds a
+        # STALE fd on an already-deleted/replaced -wal/-shm pair (e.g. the
+        # server's long-lived _timing_conn survived the displacement) --
+        # every later statement on such a doomed connection fails
+        # identically, not just this one. Converting that into the same
+        # structured SubstrateDisplaced the rest of this gate raises below
+        # means a caller never sees a raw, unactionable traceback here
+        # instead of a clean refusal. A caught error that does NOT
+        # correlate with a CONFIRMED displacement is a genuine, unrelated
+        # disk problem -- re-raised untouched, unexamined further.
+        #
+        # Round-2 fix (reviewer-fairy finding on the round-1 PR): this is
+        # the path that actually fires for #2635's own primary/motivating
+        # scenario -- a stale long-lived connection (e.g. the server's real
+        # _timing_conn) already holding a displaced -wal/-shm pair, so even
+        # this brand-new connection's own PRAGMA fails before it ever
+        # reaches the main gate below. Mirror that main gate's ordering
+        # exactly: run the throttled marker+forensic-capture+dump path
+        # FIRST, then raise. _run_walguard_check() is documented "MUST NOT
+        # raise" and internally guards every sub-step in its own
+        # try/except (including a connection that's already broken), so it
+        # is safe to call here even though conn's own PRAGMA just failed --
+        # the dump portion may fail (logged, non-fatal) but the
+        # marker-write and forensic-capture, which don't need a working
+        # conn at all, still succeed. Without this call, the exact incident
+        # this whole feature exists to make diagnosable (#786, #2653)
+        # produced no degraded marker and no forensic capture -- only the
+        # raised exception.
+        if not bootstrap_mode:
+            _run_walguard_check(conn)
+        try:
+            # Note: closing this doomed connection can silently recreate an
+            # empty 0-byte -wal stub on disk that wasn't there before this
+            # close (SQLite's own connection-close behavior). Not dangerous,
+            # but it can change what a SECOND failed attempt later reports
+            # (wal_deleted -> wal_replaced) -- reviewer-fairy observation,
+            # round-1 review.
+            conn.close()
+        except Exception:
+            pass
+        if not bootstrap_mode:
+            import engram_walguard as _wg_early
+            _wg_early.assert_not_displaced(str(DB_PATH))  # raises if confirmed
+        raise
     # #1672 (blueprint H6): conservative SQLite defaults measured in effect
     # (synchronous=FULL, mmap_size=0, cache_size~2MB, temp_store=file). Each
     # change below is faster-never-looser: it does not weaken graph
@@ -4631,6 +4696,27 @@ def _get_db() -> sqlite3.Connection:
         # Throttled (≥30 s interval): detect shm displacement, emergency-dump
         # if detected, write degraded marker.  Must not raise.
         _run_walguard_check(conn)
+
+        # Unthrottled fail-closed gate (#2635 unit 2), on EVERY dispatch —
+        # separate cadence from the throttled marker/dump path just above,
+        # which always runs FIRST (unchanged) to secure the orphan state
+        # (forensics + emergency dump) before this gate can refuse the call.
+        # The two are additive: the throttled path keeps its own 30s/storm-
+        # gated cadence for the expensive dump/marker work regardless of how
+        # often this cheap check fires. Never caught here — SubstrateDisplaced
+        # is meant to propagate all the way to the MCP tool-dispatch wrapper
+        # (server.py's _timing_mcp_tool), the single place it is converted
+        # into a structured {"error": "substrate_displaced", ...} response.
+        import engram_walguard as _wg_gate
+        try:
+            _wg_gate.assert_not_displaced(str(DB_PATH))
+        except _wg_gate.SubstrateDisplaced:
+            # The connection this call just opened is itself compromised
+            # (this process holds a stale fd on the displaced pair) — close
+            # it before propagating, same discipline as the seed-missing
+            # fail-loud path just above (don't leak the connection).
+            conn.close()
+            raise
     else:
         # Emit one stderr line on the FIRST skipped check so that a production
         # server accidentally started with ENGRAM_NO_DB_GUARDS=1 is visible

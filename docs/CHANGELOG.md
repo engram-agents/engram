@@ -11,6 +11,181 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [v0.5.2] - 2026-09-25
 
+### rc3 round — 2026-09-27 (fixes plus new capabilities)
+
+- **A tool call can no longer report success on a live connection whose
+  `-wal`/`-shm` sidecar files have been silently displaced.** A new
+  predicate is checked, unthrottled, on every `_get_db()` dispatch; when
+  displacement is confirmed the call fails loudly and names the remedy
+  instead of returning `created` on a corrupted connection. The existing
+  marker/forensic-capture/dump path still runs first, unchanged; Darwin
+  (no `/proc`) is treated as healthy and gets no protection from this unit
+  (#3158, part of #2635).
+- **A `"superseded"` cascade resolution could silently carry a spurious
+  `replacement_absent_because`/`replacement_absent_note`, in violation of
+  the function's own documented contract.** The guard only ever checked
+  those two fields against `resolution_kind == "acknowledged"`; a
+  separate, `"superseded"`-scoped check now refuses them independently,
+  while the existing `replacement_id` requirement for `"superseded"` is
+  left untouched (#3130, closes #3125).
+- **The session-log indexer no longer reports every unflushed-append NUL
+  run as "malformed JSON", and the emitter now fsyncs each event so
+  fewer of those NUL runs happen at all.** The reader half adds a
+  NUL-aware guard plus an incomplete-tail rule: a terminated line with
+  leading/trailing NULs is stripped and recovered with a single
+  "unflushed append" warning, and an unterminated final line is indexed
+  if it already parses as a complete record (a writer that died after
+  the record landed but before its newline did — otherwise the size gate
+  would freeze that file and lose the record for good) and is otherwise
+  treated as the live tail of an in-progress write. The writer half closes the
+  other side of the same window — each event is flushed and `fsync`'d
+  before `emit()` returns (about 1.16ms per event on ext4), with a new
+  file's directory entry also made durable, and a failed fsync degrades
+  to a stderr warning rather than a dropped event (#3161, part of #2801;
+  #3168, closes #2801).
+- **The installer now shares the engine's single bounded offline
+  deploy-tag refresh, so a failed fetch still falls through to local
+  tracked ancestry instead of refusing outright.** It also owns and
+  terminates the fetch's private process group, validates timeout
+  inputs, and warns on every failed refresh while keeping the
+  distinction between cached ancestry and confirmed remote freshness
+  explicit; private/unmerged tagged heads are still refused (#3153,
+  closes #3133).
+- **New MCP tool `engram_retype_edge`: corrects a provably-wrong
+  `supported_by`/`derives_from`/`cites` edge by making it weaker, never
+  stronger, in one audited transaction.** Allowed moves come from a
+  fixed table; the call refuses on a pending cascade marker, an
+  already-existing target relation, or a `derives_from` retype that
+  would strip a derivation's last remaining cascade premise, and it
+  recomputes the source's confidence and its full downstream cascade
+  when the old relation was cascade-bearing. A fast-follow (#3167) fixed
+  a test fixture whose seeding order let an unrelated `temporal_causal`
+  guard mask what `test_stronger_move_refused` was meant to isolate
+  (#3160, closes #2265).
+- **The viz "Snapshot now" button is gone; every page load now computes
+  a live, uncached, never-persisted health score instead.** A new `GET
+  /api/health/v2/live?agent=<a>` route opens the requested agent's DB
+  read-only and never writes anything; concurrent requests for one
+  agent collapse into a single build; two new optional per-agent
+  overrides close a real multi-tenant bug where a shared viz process
+  would otherwise silently score using the server's own process-global
+  turn/embedder facts (#3155, part of #2518).
+- **A new runtime verdicts report classifies every tripwire site's
+  recent window into one of the design doc's eight VERDICTS lines, and
+  a new static check catches a typo'd `reached` literal at CI time
+  instead of it silently reading "NOT REACHED" forever.** The dispatch
+  map that drives it is now a committed, generated source file rather
+  than a runtime tree-walk, after a design-conformance read found the
+  original walk couldn't work against the flattened, `tiers.json`-less
+  layout of an installed plugin; a drift gate keeps the committed map
+  honest against the real tree (#3156, closes #3136).
+- **The WS7 verdicts now surface as one telemetry line where people
+  already look: `engram_diagnose`'s output and the nightly dream
+  record.** A single renderer produces it (the dream record copies the
+  diagnose field verbatim rather than rendering its own), and "we could
+  not check" never renders as healthy: a missing store or table, a
+  missing or unparseable ingest timestamp, an ingest more than two days
+  old, or zero rows for the window all read `telemetry: not aggregated
+  (...)`, never a line of zeros. Labels are the stored verdict values;
+  a test pins their set to WS7's own verdict table, and a verdict
+  outside it still renders rather than disappearing (#3170, closes
+  #3137).
+- **`forum read` gains `--new` (posts since your read watermark) and
+  `--last N`, and `GET /api/thread/<id>?agent=<a>` returns the caller's
+  own `last_read_post_id`.** Against a server without the field,
+  `--new` falls back to the last five posts and says so; the read
+  watermark advances the same way in every display mode. The server
+  half is live once the forum is redeployed; the CLI flags reach a seat
+  with its plugin rebuild (#3171, closes #3138).
+- **A per-fire ledger and a config-gated A/B of the tripwire `[triggered
+  principles]` chain render give the pre-registered experiment its
+  denominator.** Off by default; when active, each fire with a
+  `generalizes` head is assigned an arm from `sha256(seed:nonce)` and
+  logged with its shown/cut lesson ids and render sizes, so every
+  assignment is reconstructable before any real run begins (#3166, part
+  of #2753).
+- **A new tool mechanically BFS-walks a package's call graph from
+  declared root entry points and records every recognized database
+  write site reached, at the file:line level rather than the (verb,
+  table) level** — closing the gap where a union over pairs can hide
+  one specific site going unreached. Proven against small synthetic
+  fixtures only; it does not yet run against the real `src/engram` tree
+  (#3134, closes #3095).
+- **The EngramManager owner-process skeleton: the one process that will
+  hold `knowledge.db` open, speaking U1's existing AF_UNIX wire
+  contract.** Handles the handshake/version check, `ping`, and a
+  quiesced `snapshot()` over SQLite's backup API, with a
+  confirmably-dead-PID stale-socket recovery, an end-to-end
+  per-request deadline measured from accept, and thread-per-connection
+  concurrency so one slow client can't block another. No domain
+  operations yet, and nothing calls it (#3151, closes #3096).
+- **A macOS `launchd` LaunchAgent ports the existing Linux
+  systemd-timer autostart mechanism to single-user Mac seats**,
+  periodically checking for a live session and starting one via the
+  same charge-file invocation if none exists; the wake announces
+  itself to the forum before anything else but does not auto-resume
+  stale loop state. The live-fire install step and on-seat dry run are
+  still blocked on an unrelated seat issue (#3162, part of #3002).
+- **Design note settling the edge-correction contract for
+  `engram_retype_edge` (#2265) and the remainder of #2347, for Lei's
+  read.** Proposes the weaker-only retype move table, closes #2347 as
+  solved while keeping the per-node acknowledge guard, and narrows the
+  Stage-3 exit query to `temporal_causal: True` relations only. Docs
+  only; this is the design #3160 implements (#3093, part of #2252).
+- **`docs/PR-MERGE-POLICY.md` gains Lei's 2026-09-27 delegation: the
+  team may merge a substrate PR without his read when it implements a
+  design he already read, provided the merge seat links that read and
+  writes a short conformance check**, and an issue may be closed with
+  code evidence attached. A new substrate concept still goes to him
+  first (#3157).
+- **The three-pre-peer-fairy-round cap ruled on the forum on
+  2026-09-20 is now written into `CLAUDE.md`'s colleague-converged
+  gate**, including its stopping signal, the written-reason exception
+  for a fourth round, and the contributor-commit reset rule read off
+  `git log`. Closes the gap where the cap was load-bearing at the merge
+  seat but had no single-source-of-truth home in the repo (#3146).
+- **A cancelled or interrupted live-health build could leave every
+  waiting thread reading `None` instead of a payload, crashing one
+  level up.** The per-agent single-flight guard in
+  `get_health_v2_live_data()` only ever caught `Exception`; the
+  `finally` block now backfills a fail-honest placeholder result before
+  firing the event if a `BaseException` escaped the build (#3163, part
+  of #2518).
+- **A release build could ship files the minus-set's own header said it
+  excludes — including 45 files under `src/forum/tests/` present in
+  every public release since at least v0.3.1.** `_apply_minus_set` now
+  implements the documented gitignore-style rules: a directory entry
+  matches at any depth unless anchored with a leading `/`, `*` never
+  crosses `/`, and a matched symlink is removed as a link rather than
+  followed. The `deploy/` entry becomes `/deploy/` so the new any-depth
+  semantics don't also swallow the shipped `src/forum/deploy/` install
+  path (#3164, closes #2516).
+- **Loading the viz dashboard no longer ships every field of every node
+  over the wire.** `/api/graph` now serves index nodes only (the 13
+  fields the page reads outside the detail panel — about 7x less on the
+  wire on the author's own graph), and a new `GET
+  /api/node?id=&agent=` fetches one full node on click, 404ing with an
+  empty body on an unknown id and 400 on a missing one; `get_graph`
+  itself is unchanged (#3165, part of #2866).
+- **A failed WS4 arm computation or ledger-row build used to vanish
+  silently instead of showing up as a fire.** Each now gets its own
+  narrow guard: an arm-computation failure still renders the block the
+  way dev does today but logs the row with `arm: "error"` plus the
+  error text, and a row-construction failure still writes a minimal row
+  so the fire is counted; the nudge, exit code and deny path are all
+  untouched. Folds in the round-2 review suggestions from #3166, which
+  merged before they landed (#3173, part of #2753).
+- **A new offline adjudication kit lets a human score the
+  pre-registered chain-render A/B without seeing which arm a fire
+  belongs to.** `tools/ws4/extract_spans.py` cuts one blinded
+  heeding-window span per fire from the fire ledger and transcript,
+  redacting the `[triggered principles]` block and flagging any span
+  that still names a head after redaction; `tools/ws4/analyze.py`
+  computes O1-at-K via a `corrective_at` verdict field, O2 raw/transfer
+  counts, and per-arm privacy-drop counts. Read-only on the ledger,
+  transcripts and `knowledge.db`; ships in no install tier (#3175, part
+  of #2753).
+
 ### rc2 fix round — 2026-09-26 (found on the rc1 soak)
 
 - **Forum prompt-hook `Connection: close` crash fixed — the reason for
