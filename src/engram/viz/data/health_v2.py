@@ -761,6 +761,21 @@ def get_health_v2_live_data(agent_name: str) -> dict:
             }
         inflight.result = result
     finally:
+        # Defense-in-depth for a BaseException subclass that is NOT an
+        # Exception subclass (SystemExit, KeyboardInterrupt, or a raw
+        # BaseException) escaping the inner except-Exception above:
+        # inflight.result would otherwise stay at its __init__ default of
+        # None, and every OTHER thread waiting on inflight.event.wait()
+        # would wake up and return None instead of a dict. Safe sentinel:
+        # inflight.result is only ever assigned a dict on every real code
+        # path (_build_live_health_v2_payload's own contract is "never
+        # raises, always returns a dict"), so None at this point can only
+        # mean the assignment above never happened.
+        if inflight.result is None:
+            inflight.result = {
+                "has_snapshot": False,
+                "reason": "Unexpected error building live health data (non-Exception failure)",
+            }
         with _live_build_state_lock:
             if _live_build_inflight.get(agent_name) is inflight:
                 del _live_build_inflight[agent_name]

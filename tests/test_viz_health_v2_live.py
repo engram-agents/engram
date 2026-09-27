@@ -416,6 +416,116 @@ class TestLiveSingleFlight(unittest.TestCase):
         self.assertEqual(call_count["n"], 3, "each sequential call (no overlap) must be a fresh build")
 
 
+class TestLiveSingleFlightBaseExceptionGap(unittest.TestCase):
+    """Fast-follow fix for PR-3155's deferred, non-blocking review finding:
+    the builder thread's inner ``except Exception`` does not catch a
+    ``BaseException`` subclass that is NOT an ``Exception`` subclass
+    (``SystemExit``, ``KeyboardInterrupt``, or a raw ``BaseException``). If
+    one of those escapes ``_build_live_health_v2_payload``, ``result`` is
+    never assigned inside the builder's try/except, but the outer
+    ``finally`` still removes the in-flight dict entry and fires
+    ``inflight.event.set()`` regardless. Every OTHER (waiter) thread blocked
+    on ``inflight.event.wait()`` then wakes and returns ``inflight.result``,
+    which is still its ``__init__`` default of ``None`` -- not a dict.
+
+    The reported bug is specifically about a WAITER thread receiving
+    ``None``, not about the builder thread's own exception propagating (that
+    propagation is expected/correct -- the builder is the one thread that
+    actually hit the rare BaseException, and letting it see that exception
+    is correct; only the *other* threads waiting on the same in-flight build
+    must never see ``None``). This test constructs a genuine concurrent
+    builder+waiter scenario to target exactly that waiter-side behavior."""
+
+    def setUp(self):
+        self._saved_agents = viz_agents.AGENTS
+        self.tmpdir = tempfile.mkdtemp(prefix="engram_health_v2_live_baseexc_")
+        self.engram_home = Path(self.tmpdir) / "agent_dir"
+        self.engram_home.mkdir()
+        self.db_path = self.engram_home / "knowledge.db"
+        _make_file_db(str(self.db_path))
+        viz_agents.AGENTS = {
+            "test": {"name": "test", "label": "Test", "db": str(self.db_path)}
+        }
+        viz_health_v2_data._live_build_inflight.clear()
+
+    def tearDown(self):
+        viz_agents.AGENTS = self._saved_agents
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        viz_health_v2_data._live_build_inflight.clear()
+
+    def test_waiter_gets_fail_honest_dict_not_none_when_builder_hits_non_exception_baseexception(self):
+        builder_entered = threading.Event()
+        release_builder = threading.Event()
+
+        def _raise_system_exit(agent_name, db_path):
+            builder_entered.set()
+            release_builder.wait(timeout=10)
+            raise SystemExit("simulated non-Exception failure")
+
+        results = {}
+        results_lock = threading.Lock()
+
+        def _builder_thread():
+            try:
+                r = viz_health_v2_data.get_health_v2_live_data("test")
+                with results_lock:
+                    results["builder"] = r
+            except BaseException as exc:  # noqa: BLE001 -- expected: the
+                # builder's own SystemExit propagates out of the builder's
+                # own call -- that is correct behavior, not the gap under
+                # test (see class docstring).
+                with results_lock:
+                    results["builder_exc"] = exc
+
+        def _waiter_thread():
+            # Wait until the builder has registered itself as in-flight
+            # (builder_entered fires from INSIDE the mocked builder call,
+            # which only happens after the dict entry is already
+            # registered) before this thread calls in, so it takes the
+            # waiter branch (is_builder=False) rather than racing to
+            # become a second builder.
+            builder_entered.wait(timeout=10)
+            r = viz_health_v2_data.get_health_v2_live_data("test")
+            with results_lock:
+                results["waiter"] = r
+
+        with mock.patch.object(
+            viz_health_v2_data, "_build_live_health_v2_payload",
+            side_effect=_raise_system_exit,
+        ):
+            t_builder = threading.Thread(target=_builder_thread)
+            t_builder.start()
+            builder_entered.wait(timeout=10)
+            t_waiter = threading.Thread(target=_waiter_thread)
+            t_waiter.start()
+            # Give the waiter time to register itself in the in-flight dict
+            # and block on inflight.event.wait() before we let the builder
+            # raise -- otherwise the waiter might not yet be blocked when
+            # the event fires.
+            time.sleep(0.1)
+            release_builder.set()
+            t_builder.join(timeout=10)
+            t_waiter.join(timeout=10)
+
+        self.assertIn(
+            "builder_exc", results,
+            "the builder thread's own SystemExit should propagate out of "
+            "its own get_health_v2_live_data call",
+        )
+        self.assertIsInstance(results["builder_exc"], SystemExit)
+
+        self.assertIn("waiter", results, "the waiter thread never returned")
+        waiter_result = results["waiter"]
+        self.assertIsNotNone(
+            waiter_result,
+            "waiter received None instead of a dict -- the BaseException "
+            "single-flight gap this test targets",
+        )
+        self.assertIsInstance(waiter_result, dict)
+        self.assertFalse(waiter_result["has_snapshot"])
+        self.assertIn("reason", waiter_result)
+
+
 class TestLiveFailHonest(unittest.TestCase):
     """Contract item 6: on any raise from the live build, the SAME
     {has_snapshot: False, reason: ...} shape -- never a stale stored
