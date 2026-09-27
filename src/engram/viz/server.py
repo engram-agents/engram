@@ -270,9 +270,42 @@ class Handler(BaseHTTPRequestHandler):
                             "error": f"Unknown agent: {agent_name!r}",
                             "agent": agent_name})
             else:
-                resp = viz_graph_data.get_graph(db_path)
+                # engram-alpha#2866 fix 4: serve the INDEX payload here, not
+                # get_graph's full one -- ~7x smaller on the wire. A clicked
+                # node's full data is fetched on demand via /api/node below.
+                resp = viz_graph_data.get_graph_index(db_path)
                 resp["agent"] = agent_name
                 self._json(resp)
+        elif path == "/api/node":
+            # engram-alpha#2866 fix 4: GET /api/node?id=<id>&agent=<a> --
+            # the full node /api/graph's index no longer carries. Same
+            # tenant (db_path/?agent=) resolution as /api/graph above (both
+            # read agent_name/db_path off the single _resolve_agent() call
+            # made once for every agent-scoped endpoint, a few lines up).
+            qs = parse_qs(parsed.query or "")
+            node_id = (qs.get("id", [None])[0] or "").strip()
+            if not node_id:
+                self._json({"error": "id parameter is required",
+                            "agent": agent_name}, status=400)
+            elif not db_path:
+                # Mirrors /api/graph's own unknown-agent convention exactly
+                # (fail-honest 200 + error, not a 404) -- deliberately NOT
+                # the same as the unknown-NODE-id case below, which IS a 404.
+                self._json({"error": f"Unknown agent: {agent_name!r}",
+                            "agent": agent_name})
+            else:
+                node = viz_graph_data.get_node(db_path, node_id)
+                if node is None:
+                    # Same body-less 404 shape as the catch-all route below
+                    # (#2926's lesson): a keep-alive HTTP/1.1 client hangs on
+                    # a body-less response with no Content-Length.
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                else:
+                    resp = dict(node)
+                    resp["agent"] = agent_name
+                    self._json(resp)
         elif path == "/api/schema":
             # Schema is static (no DB required) — return the SSoT dict built
             # from engram_core / engram_query / engram_stats constants.

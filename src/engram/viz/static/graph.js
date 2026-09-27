@@ -303,15 +303,17 @@ function nodeColor(d) {
   return (NODE_STYLE[d.type] || { color: '#888' }).color;
 }
 
+// engram-alpha#2866 fix 4: rawData.nodes are now INDEX nodes (id, type,
+// status, is_current, confidence, importance_score, created_at,
+// tainted_by, stale_by, source_domain, source_title, label, and — for
+// definitions only — term). This function is called from render()/
+// showTooltip()/selectNode's edge-chip rendering, all of which operate on
+// index data, never the full node -- so it must read ONLY whitelisted
+// index fields (d.metadata / d.claim are no longer present here at all).
 function nodeDisplayText(d) {
   if (d.type === 'evidence') return d.source_domain || d.source_title || d.id;
-  if (d.type === 'definition') {
-    try {
-      const meta = typeof d.metadata === 'string' ? JSON.parse(d.metadata) : d.metadata;
-      if (meta && meta.term) return meta.term;
-    } catch(e) {}
-  }
-  return d.claim || d.id;
+  if (d.type === 'definition' && d.term) return d.term;
+  return d.label || d.id;
 }
 
 function truncate(s, n) {
@@ -644,14 +646,60 @@ function hideTooltip() { tooltip.style.opacity = '0'; }
 // Node detail panel
 // ═══════════════════════════════════════════════════════════════════
 
+// Per-page-load cache of fetched full nodes (engram-alpha#2866 fix 4 item
+// 10) -- keyed by id, so re-clicking an already-opened node re-renders from
+// cache instead of re-fetching /api/node. Cleared on every successful
+// /api/graph refresh (engram-alpha#2866 fix 4 round 2 item 1) so a cache hit
+// is only ever served within the epoch it was fetched in -- otherwise the
+// detail panel freezes on the data from the first click while the
+// dot/tooltip continue to update on every auto-refresh tick. A fetch that
+// resolves after its epoch has ended never populates the cache (fix 4 round
+// 3), so a stale in-flight response can neither read back as a hit nor
+// clobber a fresher epoch's entry.
+const _nodeDetailCache = new Map();
+
+// Bumped once per successful /api/graph refresh, right alongside the
+// _nodeDetailCache clear. Each selectNode() call captures the epoch active
+// at invocation time and re-checks it when its /api/node fetch resolves, so
+// a slow in-flight response from an OLDER epoch can never overwrite the
+// panel after a newer epoch's own (faster) response already rendered.
+let _graphEpoch = 0;
+
+function fetchNodeDetail(id) {
+  if (_nodeDetailCache.has(id)) {
+    return Promise.resolve(_nodeDetailCache.get(id));
+  }
+  const epoch = _graphEpoch; // frozen at invocation; see _graphEpoch comment above
+  return fetch(withAgent(`/api/node?id=${encodeURIComponent(id)}`))
+    .then(res => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    })
+    .then(full => {
+      if (full && full.error) throw new Error(full.error);
+      if (epoch === _graphEpoch) {
+        _nodeDetailCache.set(id, full);
+      }
+      return full;
+    });
+}
+
+// selectNode(d) takes an INDEX node (rawData.nodes are index nodes as of
+// engram-alpha#2866 fix 4 -- id/type/label/etc, never the heavy fields) and
+// fetches the FULL node via /api/node before rendering the detail-panel
+// body (fix 4 item 9). The header (id/type badge/color) renders
+// immediately off the index fields already in hand; the body shows a
+// loading state until the fetch resolves, and an explicit error message on
+// failure -- never a silently-empty panel.
 function selectNode(d) {
   selectedNodeId = d.id;
+  const epoch = _graphEpoch; // frozen at invocation; see _graphEpoch comment above
 
   // Highlight
   nodeGroup.selectAll('circle.node-circle')
     .classed('selected', nd => nd.id === d.id);
 
-  // Panel header
+  // Panel header (index-level fields only -- id/type are always present)
   document.getElementById('detail-id').textContent = d.id;
   const badge = document.getElementById('detail-type-badge');
   badge.textContent = NODE_STYLE[d.type]?.label || d.type;
@@ -659,7 +707,24 @@ function selectNode(d) {
   badge.style.color = nodeColor(d);
   badge.style.border = `1px solid ${nodeColor(d)}55`;
 
-  // Build body
+  const body = document.getElementById('detail-body');
+  body.innerHTML = '<div class="detail-loading" style="padding:8px;color:#7788aa">Loading…</div>';
+  document.getElementById('detail-panel').classList.add('open');
+
+  fetchNodeDetail(d.id).then(full => {
+    if (selectedNodeId !== d.id || epoch !== _graphEpoch) return; // superseded by a later click or a newer graph refresh
+    renderDetailBody(full);
+  }).catch(err => {
+    if (selectedNodeId !== d.id || epoch !== _graphEpoch) return;
+    body.innerHTML = `<div class="detail-error" style="padding:8px;color:#e05252">` +
+      `Failed to load node detail: ${escHtml(String((err && err.message) || err))}</div>`;
+  });
+}
+
+// renderDetailBody(d) renders the detail-panel BODY from the FULL node (the
+// /api/node response) -- everything selectNode used to do synchronously
+// with the click-target datum now runs here, off the fetched full node.
+function renderDetailBody(d) {
   const body = document.getElementById('detail-body');
   body.innerHTML = '';
 
@@ -1500,6 +1565,15 @@ async function fetchGraph() {
 
     rawData = data;
 
+    // Invalidate the per-node detail cache and start a new epoch (fix 4
+    // round 2 item 1): the detail panel must never show data older than
+    // this, the most recent successful /api/graph refresh. Must run BEFORE
+    // the "Refresh detail panel if a node is selected" re-render below, so
+    // that re-render's own fetchNodeDetail() call is forced to re-fetch
+    // rather than being served the pre-refresh cached value.
+    _nodeDetailCache.clear();
+    _graphEpoch++;
+
     // What's new since last visit (#1169 slice-2): initialise ONCE on first
     // fetch so the new-set is stable across auto-refresh re-renders.
     if (!_whatsNewInitialised) {
@@ -1558,7 +1632,19 @@ async function fetchGraph() {
     // Refresh detail panel if a node is selected
     if (selectedNodeId) {
       const updated = rawData.nodes.find(n => n.id === selectedNodeId);
-      if (updated) selectNode(updated);
+      if (updated) {
+        selectNode(updated);
+      } else {
+        // The selected node fell out of the refreshed index. Its in-flight
+        // detail fetch (if any) belongs to a stale epoch and will be
+        // dropped by the epoch guard in selectNode/fetchNodeDetail, so
+        // nothing else will ever resolve this panel out of "Loading…" --
+        // replace the body explicitly instead of leaving it stuck.
+        document.getElementById('detail-body').innerHTML =
+          `<div class="detail-error" style="padding:8px;color:#e05252">` +
+          `This node is no longer in the graph.</div>`;
+        selectedNodeId = null;
+      }
     }
   } catch (err) {
     console.error('Fetch error:', err);
