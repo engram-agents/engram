@@ -317,8 +317,10 @@ claude-code's numbers). New hooks route `additionalContext` through
 ## PR merge authority — the substrate-feature gate
 
 Once a PR is merge-ready (next section), **who merges it** depends on what it
-changes: **substrate-concept features → Lei reads the PR first**; **fixes +
-non-substrate → the team merges after peer review**. This gate is
+changes: **substrate-concept features → Lei reads the PR first**, unless the PR
+implements a design he already read (Lei, 2026-09-27 — then the team merges
+after a written conformance check); **fixes + non-substrate → the team merges
+after peer review**. This gate is
 **engram-alpha-only** — other repos (umwelt, soma) carry their own delegated
 authority. During an explicit Lei-absence day-grant, a settled substrate PR may
 be merged to `dev` (revertible) while the irreversible live-deploy stays Lei's.
