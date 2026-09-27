@@ -144,6 +144,47 @@ with an `-alpha` suffix during the alpha phase.
   for a fourth round, and the contributor-commit reset rule read off
   `git log`. Closes the gap where the cap was load-bearing at the merge
   seat but had no single-source-of-truth home in the repo (#3146).
+- **A cancelled or interrupted live-health build could leave every
+  waiting thread reading `None` instead of a payload, crashing one
+  level up.** The per-agent single-flight guard in
+  `get_health_v2_live_data()` only ever caught `Exception`; the
+  `finally` block now backfills a fail-honest placeholder result before
+  firing the event if a `BaseException` escaped the build (#3163, part
+  of #2518).
+- **A release build could ship files the minus-set's own header said it
+  excludes — including 45 files under `src/forum/tests/` present in
+  every public release since at least v0.3.1.** `_apply_minus_set` now
+  implements the documented gitignore-style rules: a directory entry
+  matches at any depth unless anchored with a leading `/`, `*` never
+  crosses `/`, and a matched symlink is removed as a link rather than
+  followed. The `deploy/` entry becomes `/deploy/` so the new any-depth
+  semantics don't also swallow the shipped `src/forum/deploy/` install
+  path (#3164, closes #2516).
+- **Loading the viz dashboard no longer ships every field of every node
+  over the wire.** `/api/graph` now serves index nodes only (the 13
+  fields the page reads outside the detail panel — about 7x less on the
+  wire on the author's own graph), and a new `GET
+  /api/node?id=&agent=` fetches one full node on click, 404ing with an
+  empty body on an unknown id and 400 on a missing one; `get_graph`
+  itself is unchanged (#3165, part of #2866).
+- **A failed WS4 arm computation or ledger-row build used to vanish
+  silently instead of showing up as a fire.** Each now gets its own
+  narrow guard: an arm-computation failure still renders the block the
+  way dev does today but logs the row with `arm: "error"` plus the
+  error text, and a row-construction failure still writes a minimal row
+  so the fire is counted; the nudge, exit code and deny path are all
+  untouched. Folds in the round-2 review suggestions from #3166, which
+  merged before they landed (#3173, part of #2753).
+- **A new offline adjudication kit lets a human score the
+  pre-registered chain-render A/B without seeing which arm a fire
+  belongs to.** `tools/ws4/extract_spans.py` cuts one blinded
+  heeding-window span per fire from the fire ledger and transcript,
+  redacting the `[triggered principles]` block and flagging any span
+  that still names a head after redaction; `tools/ws4/analyze.py`
+  computes O1-at-K via a `corrective_at` verdict field, O2 raw/transfer
+  counts, and per-arm privacy-drop counts. Read-only on the ledger,
+  transcripts and `knowledge.db`; ships in no install tier (#3175, part
+  of #2753).
 
 ### rc2 fix round — 2026-09-26 (found on the rc1 soak)
 
