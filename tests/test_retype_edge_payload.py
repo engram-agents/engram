@@ -239,6 +239,10 @@ def test_move_not_in_table_refused():
 
     r = _retype(server, a, b, "supported_by", "cites", reason="not an allowed move")
     assert "error" in r, r
+    assert "is not an allowed re-type move" in r["error"], (
+        "pin the move-table guard's own message -- a different guard "
+        "standing in for it must not pass this assertion"
+    )
 
     edge = _get_edge(a, b)
     assert edge is not None
@@ -249,13 +253,29 @@ def test_move_not_in_table_refused():
 
 
 def test_stronger_move_refused():
+    # Kepler's merge-seat mutation (PR-3160 conclusion warrant, fast-follow):
+    # adding ("about", "supported_by") to RETYPE_ALLOWED_MOVES did NOT redden
+    # this test when the fixture seeded the source (a) before the target (b)
+    # -- the call was still refused, but by the UNRELATED temporal_causal
+    # guard ("supported_by requires the source to be created at-or-after the
+    # target"), not by the table check this test claims to discriminate.
+    # Seeding the TARGET first (b, then a) satisfies temporal_causal's
+    # at-or-after requirement, so that guard passes silently and the move
+    # table is the only thing left that can refuse the call.
     server = fresh_server()
-    a = _seed_observation(server, "A", suffix="c")
     b = _seed_observation(server, "B", suffix="d")
+    a = _seed_observation(server, "A", suffix="c")
     _seed_raw_edge("about", a, b)
 
     r = _retype(server, a, b, "about", "supported_by", reason="trying to strengthen")
     assert "error" in r, r
+    assert "is not an allowed re-type move" in r["error"], (
+        "pin the move-table guard's own message (Borges's PR-3167 colleague "
+        "review, round 1) -- 'error in r' alone lets ANY guard that fires "
+        "first stand in for the one this test names, which is exactly how "
+        "the temporal_causal confound this test already fixed once slipped "
+        "through undetected"
+    )
 
     edge = _get_edge(a, b)
     assert edge is not None
@@ -274,6 +294,9 @@ def test_pending_marker_on_source_refused():
 
     r = _retype(server, source_id, premise_id, "supported_by", "about", reason="x")
     assert "error" in r, r
+    assert "carries a pending cascade marker" in r["error"], (
+        "pin the pending-marker guard's own message"
+    )
 
     edge = _get_edge(source_id, premise_id)
     assert edge["relation"] == "supported_by"
@@ -288,6 +311,9 @@ def test_pending_marker_on_target_refused():
 
     r = _retype(server, source_id, premise_id, "supported_by", "about", reason="x")
     assert "error" in r, r
+    assert "carries a pending cascade marker" in r["error"], (
+        "pin the pending-marker guard's own message"
+    )
 
     edge = _get_edge(source_id, premise_id)
     assert edge["relation"] == "supported_by"
@@ -388,6 +414,9 @@ def test_missing_reason_refused():
 
     r = _retype(server, a, b, "supported_by", "about", reason=None)
     assert "error" in r, r
+    assert "reason is required and cannot be empty" in r["error"], (
+        "pin the reason guard's own message"
+    )
 
     edge = _get_edge(a, b)
     assert edge["relation"] == "supported_by", "refusal must not touch the edge"
@@ -401,6 +430,9 @@ def test_empty_string_reason_refused():
 
     r = _retype(server, a, b, "supported_by", "about", reason="   ")
     assert "error" in r, r
+    assert "reason is required and cannot be empty" in r["error"], (
+        "pin the reason guard's own message"
+    )
 
 
 # ── 7. Atomicity: a forced step-5 failure leaves the edge unchanged ─────────
@@ -422,6 +454,10 @@ def test_atomicity_forced_confidence_recompute_failure_leaves_edge_unchanged(mon
 
     r = _retype(server, deriv_id, p2, "derives_from", "about", reason="x")
     assert "error" in r, r
+    assert "forced failure for atomicity test" in r["error"], (
+        "pin the specific forced exception, not just any refusal -- confirms "
+        "the atomicity path was actually exercised by THIS mutation"
+    )
 
     edge = _get_edge(deriv_id, p2)
     assert edge is not None
@@ -565,6 +601,9 @@ def test_last_cascade_premise_retype_refused():
     r = _retype(server, deriv_id, p1, "derives_from", "about",
                 reason="trying to remove the only premise")
     assert "error" in r, r
+    assert "has no other cascade premise besides" in r["error"], (
+        "pin the last-cascade-premise guard's own message"
+    )
 
     edge = _get_edge(deriv_id, p1)
     assert edge is not None
