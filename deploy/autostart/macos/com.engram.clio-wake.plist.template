@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.engram.clio-wake.plist — macOS launchd analog of the Linux
+  agent-sessions.timer/agent-session@.service pair, scoped to this one seat
+  (engram-alpha#3002).
+
+  Install as a user-level LaunchAgent (~/Library/LaunchAgents/) — NO SUDO,
+  unlike the Linux side's system units. Runs as the invoking user only.
+
+  Substitute __CLIO_WAKE_LAUNCH_SH__ and __HOME__ below (launchd does not
+  expand ~ or $HOME) before loading — see this directory's README.md.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.engram.clio-wake</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__CLIO_WAKE_LAUNCH_SH__</string>
+    </array>
+
+    <!--
+      StartInterval, NOT StartCalendarInterval: the two measured incidents
+      (engram-alpha#3002 — 34h and 36h dark windows) were driven by "no wake
+      path exists at all" after correct sleep teardown, not a missed
+      once-daily boot window. A periodic check (every 2h = 7200s) catches a
+      dark seat far sooner than a fixed daily clock time would, and
+      StartInterval has documented catch-up-on-wake behavior (launchd fires
+      promptly once the Mac wakes if an interval was missed during sleep),
+      which fits a laptop's sleep/wake cycle better than a fixed hour.
+    -->
+    <key>StartInterval</key>
+    <integer>7200</integer>
+
+    <!--
+      RunAtLoad is false on purpose: a manual `launchctl load` is an install
+      action, not itself evidence the seat was dark. Firing immediately on
+      every load would also make iterating on this plist during development
+      noisy (each reload = an immediate spurious wake attempt).
+    -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!--
+      launchd's own stdout/stderr capture — separate from clio-wake.log,
+      which is the script's own structured, timestamped log (see
+      clio-wake-launch.sh / clio-wake-run.sh). This file only catches
+      anything launchd itself can't hand off (e.g. the launch script failing
+      to exec at all).
+    -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/.engram/logs/clio-wake-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.engram/logs/clio-wake-launchd.log</string>
+</dict>
+</plist>
