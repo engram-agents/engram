@@ -1057,3 +1057,300 @@ def test_telemetry_dynamic_dispatch_discriminating_control():
             "expected check_ok() == False (unresolved dynamic-dispatch hit "
             "must fail CI even though the target set is non-empty)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Reached-literal <-> derived-dispatch-target join-key check (issue #3136,
+# WS7). §1: "The fix is to DERIVE it" gives R its join key; these tests
+# exercise the STATIC half of that join, added to the gate by WS7 --
+# tools/telemetry_manifest_gate.py's find_reached_literals /
+# derived_target_ids_over_declared_sites / reached_literal_mismatches.
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_target_id_matches_real_manifest_id_literal():
+    """`dispatch_target_id` (issue #3136's promoted-public rename of this
+    module's former private `_format_key`) must produce EXACTLY the literal
+    shape every real reached-write call carries in source -- verified here
+    against engram-surface-hook.py's own `_MAIN_MANIFEST_ID` constant, the
+    example the issue itself cites."""
+    assert telemetry_gate.dispatch_target_id(
+        ("hooks/claude/engram-surface-hook.py", "main")
+    ) == "hooks/claude/engram-surface-hook.py:main"
+
+
+def test_reached_join_key_clean_on_real_tree():
+    """The real manifest + real source tree must satisfy the reached
+    join-key check in BOTH directions: every hand-written `reached` literal
+    (each hook's `_MAIN_MANIFEST_ID`, every server.py inline literal) must
+    equal, as a set, the union of every declared site's own derived
+    dispatch-target set."""
+    manifest = _load_manifest()
+    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+    report = telemetry_gate.run_gate(src_root, manifest)
+
+    assert not report.reached_not_derived, (
+        f"REACHED_NOT_DERIVED (a `reached` literal in source names no "
+        f"derived dispatch target -- typo'd or orphaned): {sorted(report.reached_not_derived)}"
+    )
+    assert not report.derived_not_reached, (
+        f"DERIVED_NOT_REACHED (a declared site's derived dispatch target has "
+        f"no matching `reached` literal in source): {sorted(report.derived_not_reached)}"
+    )
+    assert telemetry_gate.check_ok(report), (
+        "expected check_ok()==True on the real tree with a clean reached "
+        f"join-key check; not_wired={report.not_wired} undeclared={report.undeclared} "
+        f"unresolved_dynamic_hits={report.unresolved_dynamic_hits} "
+        f"reached_not_derived={report.reached_not_derived} "
+        f"derived_not_reached={report.derived_not_reached}"
+    )
+
+
+def test_reached_join_key_typo_control():
+    """Issue #3136's own contract test: plant a `reached` literal with a
+    typo (it does not match its own site's derived dispatch target), and
+    assert the static check fails NAMING it in REACHED_NOT_DERIVED."""
+    with tempfile.TemporaryDirectory(prefix="telemetry-gate-join-typo-") as tmp:
+        with open(os.path.join(tmp, "join1_impl.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "def emit_if_initialized(event_type, level, data, site=None):\n"
+                "    pass\n\n"
+                "def _join1_impl():\n"
+                '    emit_if_initialized("engram.join1.fired", 1, {}, site="join1.fired")\n'
+            )
+        with open(os.path.join(tmp, "join1_server.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "import join1_impl as _impl_mod\n\n"
+                "def write_telemetry_record(manifest_id, event_type, fields=None):\n"
+                "    pass\n\n"
+                "class mcp:\n"
+                "    @staticmethod\n"
+                "    def tool():\n"
+                "        def deco(f):\n"
+                "            return f\n"
+                "        return deco\n\n"
+                "@mcp.tool()\n"
+                "def join1_tool():\n"
+                '    write_telemetry_record(manifest_id="join1_server.py:join1_toolTYPO", '
+                'event_type="engram.telemetry.reached", fields={})\n'
+                "    return _impl_mod._join1_impl()\n"
+            )
+
+        manifest = {
+            "mechanisms": [
+                {"path": "join1_impl.py", "telemetry": [{"site": "join1.fired", "trigger": "MCP tool body"}]},
+            ],
+        }
+        report = telemetry_gate.run_gate(tmp, manifest)
+
+        assert not report.not_wired
+        assert not report.undeclared
+        assert "join1_server.py:join1_toolTYPO" in report.reached_not_derived, (
+            f"expected the typo'd literal named in REACHED_NOT_DERIVED, got {report.reached_not_derived}"
+        )
+        assert not telemetry_gate.check_ok(report), (
+            "expected check_ok() == False on a typo'd reached literal"
+        )
+
+
+def test_reached_join_key_missing_control():
+    """Issue #3136's own contract test: plant a declared site whose derived
+    dispatch target has NO reached literal at all, and assert the static
+    check fails 'the other way' -- DERIVED_NOT_REACHED names the target,
+    while REACHED_NOT_DERIVED stays empty (isolating the OTHER direction
+    from the typo control above)."""
+    with tempfile.TemporaryDirectory(prefix="telemetry-gate-join-missing-") as tmp:
+        with open(os.path.join(tmp, "join2_impl.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "def emit_if_initialized(event_type, level, data, site=None):\n"
+                "    pass\n\n"
+                "def _join2_impl():\n"
+                '    emit_if_initialized("engram.join2.fired", 1, {}, site="join2.fired")\n'
+            )
+        with open(os.path.join(tmp, "join2_server.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "import join2_impl as _impl_mod\n\n"
+                "class mcp:\n"
+                "    @staticmethod\n"
+                "    def tool():\n"
+                "        def deco(f):\n"
+                "            return f\n"
+                "        return deco\n\n"
+                "@mcp.tool()\n"
+                "def join2_tool():\n"
+                "    return _impl_mod._join2_impl()\n"
+            )
+
+        manifest = {
+            "mechanisms": [
+                {"path": "join2_impl.py", "telemetry": [{"site": "join2.fired", "trigger": "MCP tool body"}]},
+            ],
+        }
+        report = telemetry_gate.run_gate(tmp, manifest)
+
+        assert not report.not_wired
+        assert not report.undeclared
+        assert not report.reached_not_derived, (
+            f"expected REACHED_NOT_DERIVED empty (no reached literal exists "
+            f"at all in this fixture), got {report.reached_not_derived}"
+        )
+        assert "join2_server.py:join2_tool" in report.derived_not_reached, (
+            f"expected 'join2_server.py:join2_tool' named in DERIVED_NOT_REACHED, "
+            f"got {report.derived_not_reached}"
+        )
+        assert not telemetry_gate.check_ok(report), (
+            "expected check_ok() == False on a declared site with no reached literal"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dispatch map builder + drift gate (issue #3136 D1 fix, "REVISION
+# 2026-09-27"): the backward call-graph walk moved from a runtime import
+# (broken on a deployed, flattened plugin install) to a build-time-ish walk
+# whose result ships as the committed src/engram/telemetry_targets.json.
+# `build_dispatch_map` is the walk; the drift-gate test below is what keeps
+# the committed file from silently going stale.
+# ---------------------------------------------------------------------------
+
+SRC_ENGRAM = os.path.join(REPO_ROOT, "src", "engram")
+TELEMETRY_TARGETS_PATH = os.path.join(SRC_ENGRAM, "telemetry_targets.json")
+
+
+def test_build_dispatch_map_shape_and_correctness_on_real_tree():
+    """`build_dispatch_map` must return one key per DECLARED site (every
+    site literal in compute_M(manifest)), each value the SORTED list of
+    that site's own derived-target-id strings -- matching, site-for-site,
+    what `run_gate`'s own per-site `dispatch_targets` computes (just
+    captured as JSON-serializable data instead of a set of (file, name)
+    tuples)."""
+    manifest = _load_manifest()
+    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+
+    dispatch_map = telemetry_gate.build_dispatch_map(src_root, manifest)
+
+    assert dispatch_map["schema"] == 1
+    assert dispatch_map["degraded_threshold"] == manifest["telemetry"]["degraded_threshold"]
+
+    report = telemetry_gate.run_gate(src_root, manifest)
+    M = telemetry_gate.compute_M(manifest)
+    assert set(dispatch_map["sites"].keys()) == M, (
+        "expected one dispatch-map entry per declared site literal"
+    )
+
+    sites = telemetry_gate.find_emit_call_sites(src_root)
+    for site_literal in M:
+        expected_ids = sorted(
+            telemetry_gate.dispatch_target_id(t)
+            for key, targets in report.dispatch_targets.items()
+            for t in targets
+            if any(s.key == key and s.site_literal == site_literal for s in telemetry_gate.declarable_sites(sites))
+        )
+        assert dispatch_map["sites"][site_literal] == expected_ids, (
+            f"site {site_literal!r}: dispatch map says {dispatch_map['sites'][site_literal]}, "
+            f"run_gate's own per-site walk says {expected_ids}"
+        )
+
+
+def test_build_dispatch_map_raises_on_missing_degraded_threshold():
+    """Issue #3136 D5: a missing `telemetry.degraded_threshold` key must be
+    a LOUD failure at map-generation time, never a silent runtime default."""
+    with tempfile.TemporaryDirectory(prefix="telemetry-gate-map-thr-") as tmp:
+        manifest_no_thr = {"mechanisms": [], "telemetry": {}}
+        with pytest.raises(KeyError):
+            telemetry_gate.build_dispatch_map(tmp, manifest_no_thr)
+
+        manifest_no_telemetry_key = {"mechanisms": []}
+        with pytest.raises(KeyError):
+            telemetry_gate.build_dispatch_map(tmp, manifest_no_telemetry_key)
+
+
+def test_emit_dispatch_map_writes_matching_json(tmp_path):
+    """`emit_dispatch_map` writes exactly what `build_dispatch_map` returns
+    (round-tripped through JSON)."""
+    manifest = _load_manifest()
+    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+    out_path = tmp_path / "emitted_map.json"
+
+    built = telemetry_gate.build_dispatch_map(src_root, manifest)
+    returned = telemetry_gate.emit_dispatch_map(str(out_path), src_root, manifest)
+    assert returned == built
+
+    with open(out_path, encoding="utf-8") as f:
+        on_disk = json.load(f)
+    assert on_disk == built
+
+
+def test_committed_telemetry_targets_json_matches_fresh_walk():
+    """THE DRIFT GATE (issue #3136 D1 item 3 / "REVISION 2026-09-27" item
+    3): the committed `src/engram/telemetry_targets.json` must equal a
+    FRESH walk of the current tree (`build_dispatch_map`), naming any
+    differing sites. Same default-deny discipline as §4a's own
+    NOT_WIRED/UNDECLARED check -- a PR that changes a call path must show
+    the map change in its own diff, or this test fails.
+    """
+    assert os.path.isfile(TELEMETRY_TARGETS_PATH), (
+        f"src/engram/telemetry_targets.json does not exist -- generate it via "
+        f"`python3 tools/telemetry_manifest_gate.py --emit-map {TELEMETRY_TARGETS_PATH}` "
+        f"from the repo root."
+    )
+    with open(TELEMETRY_TARGETS_PATH, encoding="utf-8") as f:
+        committed = json.load(f)
+
+    manifest = _load_manifest()
+    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+    fresh = telemetry_gate.build_dispatch_map(src_root, manifest)
+
+    assert committed == fresh, _describe_dispatch_map_drift(committed, fresh)
+
+
+def _describe_dispatch_map_drift(committed: dict, fresh: dict) -> str:
+    """Name the differing sites for a failed drift-gate assertion (rather
+    than dumping two full dicts) -- both top-level scalar drift
+    (schema/degraded_threshold) and per-site drift are named explicitly."""
+    lines = ["committed telemetry_targets.json has drifted from a fresh walk:"]
+    if committed.get("schema") != fresh.get("schema"):
+        lines.append(f"  schema: committed={committed.get('schema')!r} fresh={fresh.get('schema')!r}")
+    if committed.get("degraded_threshold") != fresh.get("degraded_threshold"):
+        lines.append(
+            f"  degraded_threshold: committed={committed.get('degraded_threshold')!r} "
+            f"fresh={fresh.get('degraded_threshold')!r}"
+        )
+    committed_sites = committed.get("sites", {})
+    fresh_sites = fresh.get("sites", {})
+    for site in sorted(set(committed_sites) | set(fresh_sites)):
+        if committed_sites.get(site) != fresh_sites.get(site):
+            lines.append(
+                f"  site {site!r}: committed={committed_sites.get(site)!r} fresh={fresh_sites.get(site)!r}"
+            )
+    return "\n".join(lines)
+
+
+def test_committed_telemetry_targets_json_drift_gate_mutation_control():
+    """Can-it-fail control for the drift gate above: mutate ONE target id in
+    a COPY of the committed map (never the real file) and confirm the SAME
+    comparison the drift gate runs fails, naming that site -- then the
+    unmutated re-comparison passes, proving the mutation (not some other
+    difference) was what failed it."""
+    with open(TELEMETRY_TARGETS_PATH, encoding="utf-8") as f:
+        committed = json.load(f)
+
+    manifest = _load_manifest()
+    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+    fresh = telemetry_gate.build_dispatch_map(src_root, manifest)
+
+    assert committed == fresh, "precondition: the real committed file must already match a fresh walk"
+
+    mutated = json.loads(json.dumps(committed))  # deep copy
+    some_site = next(s for s, ids in mutated["sites"].items() if ids)
+    mutated["sites"][some_site] = ["totally-bogus-mutated-target-id"]
+
+    assert mutated != fresh, "mutation control: the mutated copy must differ from the fresh walk"
+    drift_msg = _describe_dispatch_map_drift(mutated, fresh)
+    assert some_site in drift_msg, (
+        f"expected the mutated site {some_site!r} named in the drift message, got:\n{drift_msg}"
+    )
+
+    # Revert (redundant given `mutated` was a deep copy of `committed`, not
+    # the file itself -- asserted explicitly so a future refactor that
+    # accidentally starts mutating the real file in place is caught here).
+    assert committed == fresh, "the real committed file must be untouched by this mutation control"
