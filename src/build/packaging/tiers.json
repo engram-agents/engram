@@ -537,6 +537,11 @@
       "reason": "shared process-identity verification (#2321), extracted from forum-mention-monitor.sh/forum-updates-monitor.sh -- ships alongside both, same tier"
     },
     {
+      "path": "tools/monitor-supervisor.py",
+      "tier": "convenience",
+      "reason": "wraps forum-mention-monitor.sh/forum-updates-monitor.sh/umwelt-bell.py (#2982 step 1) -- same collab-loop convenience tier as the scripts it wraps, not a core (T1) mechanism"
+    },
+    {
       "path": "tools/codex-umwelt-wake.py",
       "tier": "convenience"
     },
