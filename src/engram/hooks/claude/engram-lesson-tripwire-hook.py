@@ -59,6 +59,23 @@ format (node_id-keyed, one block per cut hit) — it is invoked from a small
 overflow_writer adapter that reconstructs the cut hit dicts BY POSITION
 from emit_context()'s own selection (see main()'s own comments at the
 call site for why position, not string value).
+
+#2753 WS4 — the "[triggered principles]" chain rendered above (WS2) is
+now the subject of a pre-registered experiment (issue #2753 comments
+5602340998 + 5602392744): does rendering that chain change whether an
+agent walks past the nudge? Gated by `experiments.ws4_chain_ab` in
+config.json (see `_ws4_config()`); OFF by default and OFF whenever the
+gate config is missing/malformed/out-of-window (CONTRACT A — inactive
+means byte-identical stdout/exit-code to a build with none of this code,
+and no ledger file touched at all). When ACTIVE, every tripwire fire (a
+fire = check_command() returning at least one hit) is independently
+coin-flipped — chain rendered or withheld — via a seeded sha256 draw over
+a per-fire nonce (the pending call's tool_use_id when present, else a
+fresh uuid4), and exactly one JSONL row is appended to
+`$ENGRAM_HOME/tripwire-fire-ledger.jsonl` recording the draw inputs, the
+assigned arm, and the rendered/would-render chain length — the fire
+ledger the pre-registration assumed already existed but didn't (see
+`_ws4_config()` / `_append_ws4_fire_ledger()` docstrings for schema).
 """
 import json
 import math
@@ -289,7 +306,9 @@ def _truncate_for_label(text: str, limit: int = 60) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def render_triggered_principles(hits: list, db_path: "Path | None" = None) -> str:
+def render_triggered_principles(
+    hits: list, db_path: "Path | None" = None, heads_out: "dict | None" = None,
+) -> str:
     """#2753 epic WS2, D3 point 1: for this ONE tripwire fire, walk each
     hit's generalization_chain() and render ONE additive "[triggered
     principles]" section, deduped by HEAD across all of this fire's hits
@@ -354,6 +373,18 @@ def render_triggered_principles(hits: list, db_path: "Path | None" = None) -> st
     would instead freeze at the value DB_PATH held at function-definition
     time (import time), same footgun load_tripwires's own default already
     carries (harmless there since every caller passes db_path explicitly).
+
+    heads_out (#2753 WS4): optional caller-supplied dict, mutated IN PLACE
+    to map each hit's own node_id -> the list of head ids THAT hit
+    contributed to -- the exact `heads` list already used below to update
+    heads_seen, never a second independent walk (CONTRACT B: this must
+    read off the SAME computation that produces the string this function
+    returns, not a walk that could disagree with it). A hit that renders
+    nothing here (no ancestor, cycle_detected, or truncated-with-no-head)
+    is simply never written to heads_out -- left at whatever the caller
+    pre-set (conventionally `[]`) for that node_id. Ignored entirely when
+    None (the default); passing it never changes this function's own
+    return value.
     """
     if not hits:
         return ""
@@ -413,6 +444,10 @@ def render_triggered_principles(hits: list, db_path: "Path | None" = None) -> st
             if not heads or (len(nodes) <= 1 and start_resolved in nodes):
                 continue
             relevant_hit_count += 1
+            if heads_out is not None:
+                # #2753 WS4 CONTRACT B -- the SAME `heads` list about to be
+                # walked below to update heads_seen, not a second walk.
+                heads_out[node_id] = list(heads)
             for head_id in heads:
                 if head_id not in heads_seen:
                     heads_seen[head_id] = {"nodes": {}, "hit_ids": []}
@@ -465,6 +500,97 @@ def render_triggered_principles(hits: list, db_path: "Path | None" = None) -> st
         head_claim = head_entry.get("claim") or ""
         lines.append(f"  ↑ {head_id} — {head_claim}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# #2753 WS4 -- pre-registered chain-render A/B (issue #2753 comments
+# 5602340998 + 5602392744, ratified)
+# ---------------------------------------------------------------------------
+# Does rendering the "[triggered principles]" chain built above change
+# whether an agent walks past the nudge? Design: PER-FIRE randomization --
+# each fire independently renders the chain or not, via a coin flip whose
+# inputs (seed + nonce) are logged so the assignment is reconstructable
+# after the fact. The pre-registration also requires logging the RENDERED
+# LENGTH per fire (the chain lengthens every nudge, so length is a
+# confound) -- see _append_ws4_fire_ledger's schema below.
+#
+# Measured gap this PR closes: the pre-registration assumed "the hook
+# already logs every fire." It did not -- before this PR the hook's only
+# JSONL writes were the prevention ledger (_append_prevention_ledger,
+# below) and the in-turn recall ledger (_append_ledger, further below).
+# Neither logs the general tripwire-fire event this experiment needs a
+# denominator over.
+#
+# CONTRACT A (load-bearing): when the gate below is INACTIVE, main()'s
+# stdout and exit code are byte-identical to pre-WS4 dev for every input,
+# and this ledger file is never created or written. This is what makes
+# this PR safe to merge and deploy before anyone flips the config switch
+# on -- see _ws4_config()'s own docstring for the exact ACTIVE predicate.
+
+WS4_LEDGER_PATH = Path(ENGRAM_HOME) / "tripwire-fire-ledger.jsonl"
+
+
+def _ws4_config() -> dict:
+    """Read experiments.ws4_chain_ab from config.json; safe default
+    INACTIVE (never raises -- same posture as _demotion_config()/
+    _in_turn_config() above/below).
+
+    ACTIVE (returns {"active": True, "seed": <str>}) iff ALL hold:
+      - `enabled` is the boolean True (not merely truthy -- the string
+        "true" or the integer 1 does NOT activate the experiment);
+      - `start` and `end` are both strings that parse as ISO-8601 WITH an
+        explicit UTC offset (`Z` or `+00:00`) -- a naive/offset-less or
+        non-UTC-offset timestamp does not count as "parses as ISO-8601
+        UTC" and is treated as malformed;
+      - `start <= now < end` (now = the real wall clock at call time, UTC);
+      - `seed` is a non-empty string.
+    Anything missing, wrong-typed, or malformed -- including the whole
+    `experiments` or `ws4_chain_ab` section being absent -- returns
+    INACTIVE ({"active": False, "seed": None}). This is CONTRACT A's gate:
+    every caller below must treat INACTIVE as "behave exactly as if none
+    of this WS4 code existed at all."
+    """
+    inactive = {"active": False, "seed": None}
+    try:
+        with open(Path(ENGRAM_HOME) / "config.json", "r", encoding="utf-8") as f:
+            config = json.load(f)
+        section = (config.get("experiments", {}) or {}).get("ws4_chain_ab", {}) or {}
+        if section.get("enabled") is not True:
+            return inactive
+        seed = section.get("seed")
+        if not isinstance(seed, str) or not seed:
+            return inactive
+        start_raw = section.get("start")
+        end_raw = section.get("end")
+        if not isinstance(start_raw, str) or not isinstance(end_raw, str):
+            return inactive
+        from datetime import datetime, timezone, timedelta
+        try:
+            start_dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+        except Exception:
+            return inactive
+        if start_dt.utcoffset() != timedelta(0) or end_dt.utcoffset() != timedelta(0):
+            return inactive
+        now_dt = datetime.now(timezone.utc)
+        if not (start_dt <= now_dt < end_dt):
+            return inactive
+        return {"active": True, "seed": seed}
+    except Exception:
+        return inactive
+
+
+def _append_ws4_fire_ledger(entry: dict) -> None:
+    """Best-effort append of one JSONL row per WS4 fire (CONTRACT C): a
+    write failure here (unwritable path, disk error, ...) must never
+    change stdout or the exit code, and must never suppress the nudge or
+    the chain block main() already decided to render or withhold -- this
+    call always happens strictly AFTER that decision, purely to log it."""
+    try:
+        with open(WS4_LEDGER_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1382,12 +1508,96 @@ def main() -> None:
         # text was cut from the visible block above would reference
         # something the reader can't see the reason for.
         if hits:
+            shown_lesson_ids = [
+                h.get("node_id") for h in shown_hits if isinstance(h, dict)
+            ]
+            heads_by_lesson = {nid: [] for nid in shown_lesson_ids if nid}
             try:
-                principles_block = render_triggered_principles(shown_hits)
+                principles_block = render_triggered_principles(
+                    shown_hits, heads_out=heads_by_lesson,
+                )
             except Exception:
                 principles_block = ""
-            if principles_block:
-                parts.append(principles_block)
+
+            # #2753 WS4 -- pre-registered chain A/B (issue #2753 comments
+            # 5602340998 + 5602392744). CONTRACT A: whenever the gate below
+            # is INACTIVE, this reduces to EXACTLY the pre-WS4 two lines it
+            # replaces (the `if principles_block: parts.append(...)` in the
+            # `if not ws4_cfg["active"]:` branch) -- heads_by_lesson is
+            # computed unconditionally above because render_triggered_
+            # principles' own returned string is never affected by
+            # heads_out (CONTRACT B, see that function's docstring), so
+            # populating it costs nothing and needs no gate of its own.
+            ws4_cfg = _ws4_config()
+            if not ws4_cfg["active"]:
+                if principles_block:
+                    parts.append(principles_block)
+            else:
+                # Everything below is best-effort and independently
+                # guarded, same posture as every other advisory-only path
+                # in this function: a failure here must never suppress the
+                # nudge already appended above, never change stdout/exit
+                # code beyond the chain-render decision itself, and never
+                # crash main(). CONTRACT C covers the ledger write
+                # specifically; this try/except extends the same posture
+                # to the coin-flip computation around it.
+                try:
+                    nudge_chars = len(parts[-1]) if parts else 0
+                    cut_lesson_ids = [
+                        h.get("node_id") for h in cut_hits if isinstance(h, dict)
+                    ]
+                    raw_tool_use_id = hook_input.get("tool_use_id")
+                    participating = bool(principles_block)
+                    arm = "na"
+                    nonce = None
+                    draw_basis = None
+                    chain_rendered = False
+                    if participating:
+                        if isinstance(raw_tool_use_id, str) and raw_tool_use_id:
+                            nonce = raw_tool_use_id
+                            draw_basis = "tool_use_id"
+                        else:
+                            import uuid as _uuid
+                            nonce = _uuid.uuid4().hex
+                            draw_basis = "uuid4"
+                        import hashlib as _hashlib
+                        draw = int(
+                            _hashlib.sha256(
+                                f"{ws4_cfg['seed']}:{nonce}".encode()
+                            ).hexdigest(),
+                            16,
+                        ) & 1
+                        arm = "chain" if draw == 1 else "control"
+                        if arm == "chain":
+                            parts.append(principles_block)
+                            chain_rendered = True
+                        # control arm: principles_block computed but withheld.
+
+                    import time as _time
+                    from datetime import datetime as _ws4_dt, timezone as _ws4_tz
+                    now = _time.time()
+                    _append_ws4_fire_ledger({
+                        "schema_version": 1,
+                        "experiment": "ws4_chain_ab",
+                        "ts": now,
+                        "ts_iso": _ws4_dt.fromtimestamp(now, tz=_ws4_tz.utc).isoformat(),
+                        "session_id": hook_input.get("session_id"),
+                        "transcript_path": hook_input.get("transcript_path"),
+                        "tool_name": hook_input.get("tool_name"),
+                        "tool_use_id": raw_tool_use_id,
+                        "nonce": nonce,
+                        "draw_basis": draw_basis,
+                        "seed": ws4_cfg["seed"],
+                        "arm": arm,
+                        "shown_lesson_ids": shown_lesson_ids,
+                        "cut_lesson_ids": cut_lesson_ids,
+                        "heads_by_lesson": heads_by_lesson,
+                        "nudge_chars": nudge_chars,
+                        "chain_chars": len(principles_block),
+                        "chain_rendered": chain_rendered,
+                    })
+                except Exception:
+                    pass
 
         # alpha#1944 step 2 — shadow-block logging. Independently guarded,
         # same posture as in-turn recall below: a logging failure must never
