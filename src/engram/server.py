@@ -231,6 +231,14 @@ from tools.recall_summary_validator import (
 
 # ---- #872 wave-1 compat layer: moved to engram_core -----------------
 import engram_core as core  # noqa: E402
+# #2635 unit 2: SubstrateDisplaced is caught once, in _timing_mcp_tool's
+# timed() wrapper below — the single dispatch-wide catch point for every
+# @mcp.tool()-decorated function (mcp.tool = _timing_mcp_tool re-binds the
+# decorator for the whole file). Imported at module level (not the lazy
+# per-function `import engram_walguard as _wg` pattern engram_core.py uses)
+# because this one is referenced from the hottest, most-common path in the
+# file — every single tool call — not from a rarely-hit branch.
+import engram_walguard as _walguard  # noqa: E402
 
 EmbeddingManager = core.EmbeddingManager
 _embedder = core._embedder
@@ -1554,6 +1562,22 @@ def _timing_mcp_tool(*args, **kwargs):
             result_value = None
             try:
                 result_value = func(*a, **kw)
+                return result_value
+            except _walguard.SubstrateDisplaced as sd:
+                # #2635 unit 2: the ONE catch point for the whole tool-
+                # dispatch surface (every @mcp.tool() function is wrapped by
+                # this closure) — not a per-tool try/except. Raised from deep
+                # inside core._get_db() (via engram_walguard.
+                # assert_not_displaced), unthrottled, on every dispatch. Never
+                # a raw traceback to the caller: a structured refusal that
+                # names the remedy, and — same as any other refusal path —
+                # this call never ran and never returns "created".
+                timing_status = "error"
+                result_value = json.dumps({
+                    "error": "substrate_displaced",
+                    "reason": sd.detection.get("reason"),
+                    "remedy": sd.remedy,
+                })
                 return result_value
             except Exception:
                 timing_status = "error"
