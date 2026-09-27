@@ -278,6 +278,11 @@
       "note": "engram-alpha#2555 PR A folder move: relocated from root-level viz_server.py into the viz/ package. Same tier the single-file original carried."
     },
     {
+      "path": "viz/version_info.py",
+      "tier": "convenience",
+      "note": "engram-alpha#2531: startup-captured git version report (sha/branch/dirty/started_at) served by viz/server.py's GET /api/version. Same tier as viz/server.py, the only module that imports it."
+    },
+    {
       "path": "viz/workbench.py",
       "tier": "dev",
       "note": "engram-alpha#2754 PR B: standalone Curve Workbench entry point (python -m viz.workbench, :5021 by default) -- the editable dev-tool page moved off the shared :5001 viz.server process onto its own port per the issue's own ruling ('Port, not file'). Dev tier because it top-level-imports viz/data/health_workbench.py (also dev tier) and viz/templates/health_workbench.html (also dev tier) -- both already dev-tier-only per their own manifest entries below -- and fails loud at import time if either is missing from the install, rather than gating per-request the way the old, now-removed viz.server._workbench_available() had to (this module's own invocation IS the gate; see its module docstring's JUDGMENT CALL 1 for the full reasoning)."
