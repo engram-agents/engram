@@ -1107,6 +1107,10 @@
       "reason": "one-shot adjudicated migration proposer for the `generalizes` relation (epic #2753, decision D5): opens the graph READ-ONLY and emits a candidate report that an agent adjudicates row by row via engram_add_edge, so it writes nothing itself and is run once per graph when the relation is introduced. Maintainer/migration tooling rather than a recurring shipped mechanism — same shape as the migrate_*/backfill one-shots already listed here (migrate_stranded_supported_by.py, migrate_prediction_pairing_edges.py, migrate_person_nodes.py, engram-backfill-special-moment-edges.py)."
     },
     {
+      "path": "tools/ws4",
+      "reason": "offline, read-only, stdlib-only adjudication kit for the WS4 chain-A/B tripwire experiment (epic #2753): extract_spans.py cuts blinded heeding-window spans from a fire ledger + transcripts for a human adjudicator, analyze.py computes the pre-registered O1/O2/length-control statistics from the adjudicator's verdicts. Never imported by the shipped hook or server; run by hand by the researcher analyzing one experiment. Same shape as tools/propose-generalizes-migration.py's entry directly above: an offline analyst tool for this epic, never shipped in any install tier."
+    },
+    {
       "path": "tools/selftest.py",
       "reason": "developer pre-deploy test runner — wraps pytest for quick confidence checks; not shipped in any install tier"
     },
