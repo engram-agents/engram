@@ -15,8 +15,11 @@ here. These tests cover:
      seat, same constraint noted in test_viz_frozen_header.py), this is a
      static check on the served inline script rather than a live DOM
      assertion.
-  4. The "Snapshot now" button is present, disabled, and shell-only (no
-     click-handler logic).
+  4. The "Snapshot now" button and its dead CSS class are ABSENT
+     (engram-alpha#2518, live-score slice -- Lei's direction: the health
+     dashboard always recomputes live on page refresh, so there is no
+     "snapshot now" action to trigger any more; see
+     TestSnapshotNowButtonRemoved below).
   5. Sanity check: the existing dashboard's #dashboard/#cards structure
      (and #loading) survive untouched.
 """
@@ -234,20 +237,21 @@ class TestLocalStorageGuarded(_LiveServerBase):
             "unguarded fixture must have no try block to find")
 
 
-class TestSnapshotNowButton(_LiveServerBase):
-    def test_button_present_and_disabled(self):
-        body = self._get("/health")
-        m = re.search(r'<button[^>]*id="snapshot-now-btn"[^>]*>', body)
-        self.assertIsNotNone(m, "snapshot-now-btn not found")
-        tag = m.group(0)
-        self.assertIn("disabled", tag)
-        self.assertIn("title=", tag)
+class TestSnapshotNowButtonRemoved(_LiveServerBase):
+    """engram-alpha#2518, live-score slice: the disabled "Snapshot now"
+    button (and its dead ``.snapshot-now-btn`` CSS class) is gone -- Lei's
+    direction ("always recompute on page refresh and don't even show a
+    'snapshot now' button at all") retires the placeholder this class used
+    to pin. Supersedes the old ``TestSnapshotNowButton`` (button-present)
+    class, which asserted exactly the shell this slice removes."""
 
-    def test_button_has_no_click_handler_wired(self):
+    def test_button_markup_absent(self):
         body = self._get("/health")
-        script = _extract_inline_script(body)
-        self.assertNotIn("snapshot-now-btn').addEventListener", script)
-        self.assertNotIn("getElementById('snapshot-now-btn').onclick", script)
+        self.assertNotIn('id="snapshot-now-btn"', body)
+
+    def test_dead_css_class_absent(self):
+        body = self._get("/health")
+        self.assertNotIn(".snapshot-now-btn", body)
 
 
 class TestExistingDashboardUnchanged(_LiveServerBase):

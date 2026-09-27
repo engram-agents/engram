@@ -1170,6 +1170,191 @@ class TestBuildSnapshot:
 
 
 # ---------------------------------------------------------------------------
+# 7. Live checkpoint mode + per-agent overrides (engram-alpha#2518,
+#    live-score slice). Contract-first tests (repo convention,
+#    engram-alpha#3045) -- written against the STATED contract before this
+#    slice's implementation, per the dispatching spec.
+# ---------------------------------------------------------------------------
+
+
+class TestLiveCheckpointMode:
+    def test_build_snapshot_accepts_live_mode(self):
+        """Contract item 1: build_snapshot(conn, "live", ...) returns a
+        snapshot successfully."""
+        conn = _make_conn()
+        snap = health_engine.build_snapshot(conn, "live")
+        assert snap["checkpoint_mode"] == "live"
+
+    def test_live_is_listed_alongside_the_other_three_modes(self):
+        conn = _make_conn()
+        for mode in ("nap", "pre_sleep", "post_dream", "live"):
+            snap = health_engine.build_snapshot(conn, mode)
+            assert snap["checkpoint_mode"] == mode
+
+    def test_still_rejects_a_genuinely_invalid_mode(self):
+        conn = _make_conn()
+        with pytest.raises(ValueError):
+            health_engine.build_snapshot(conn, "not_a_real_mode")
+
+
+class TestWriteSnapshotRefusesLiveMode:
+    def test_write_snapshot_raises_for_live_mode(self, tmp_path, monkeypatch):
+        """Contract item 1: write_snapshot given a snapshot whose mode is
+        "live" raises (does not persist it)."""
+        monkeypatch.setattr(engram_core, "DATA_DIR", tmp_path)
+        conn = _make_conn()
+        with pytest.raises(ValueError):
+            health_engine.write_snapshot(conn, "live")
+
+    def test_write_snapshot_live_refusal_writes_nothing_to_disk(self, tmp_path, monkeypatch):
+        """THE DISCRIMINATING CHECK for the refusal itself: confirm no
+        health-snapshots directory (nor any file under it) is created when
+        write_snapshot refuses "live" -- distinguishing "raises before
+        doing anything" from "raises after a partial write"."""
+        monkeypatch.setattr(engram_core, "DATA_DIR", tmp_path)
+        conn = _make_conn()
+        with pytest.raises(ValueError):
+            health_engine.write_snapshot(conn, "live")
+        assert not (tmp_path / "health-snapshots").exists()
+
+
+class TestPerAgentOverrides:
+    """Contract item 2: current_turn / embedding_enabled are OPTIONAL
+    per-agent overrides -- used directly when given, falling through to
+    today's core reads (byte-identical to before this slice) when None."""
+
+    def test_current_turn_override_used_directly(self):
+        conn = _make_conn()
+        snap = health_engine.build_snapshot(conn, "live", current_turn=12345)
+        assert snap["turn"] == 12345
+        # _compute_diagnostics also takes the resolved turn, not a second
+        # independent core read -- pin that it received the SAME value.
+        assert snap["diagnostics"]["cascade_marker_age"]["count"] == 0  # sanity: empty graph
+
+    def test_two_conns_same_process_return_their_own_turn(self):
+        """Test named in the spec: two fixture 'agents' (here: two separate
+        conns/overrides within ONE process) must each return their OWN
+        turn -- the process-global bug this slice exists to fix would have
+        collapsed both onto whichever the process's own core._get_current_
+        turn() happened to return."""
+        conn_a = _make_conn()
+        conn_b = _make_conn()
+        snap_a = health_engine.build_snapshot(conn_a, "live", current_turn=7)
+        snap_b = health_engine.build_snapshot(conn_b, "live", current_turn=99)
+        assert snap_a["turn"] == 7
+        assert snap_b["turn"] == 99
+
+    def test_current_turn_none_falls_through_to_core_read(self):
+        """Existing nap/sleep/MCP callers pass neither kwarg -- must be
+        byte-identical to before this parameter pair existed. Mocking
+        core._get_current_turn to a sentinel and confirming build_snapshot
+        picks it up (default path, no override) demonstrates the fallback
+        is intact, not silently bypassed."""
+        conn = _make_conn()
+        with mock.patch("engram_core._get_current_turn", return_value=54321):
+            snap = health_engine.build_snapshot(conn, "nap")
+        assert snap["turn"] == 54321
+
+    def test_existing_caller_with_no_new_args_unchanged(self):
+        """Contract item 2's explicit test: an existing caller (nap/sleep
+        path) with no new args produces the same result as before this
+        change -- pinned by comparing a plain build_snapshot(conn, "nap")
+        call against one that explicitly passes current_turn/embedding_
+        enabled overrides EQUAL to what the mocked core reads would have
+        produced anyway; the two must be byte-identical."""
+        conn = _make_conn()
+        _insert(conn, "obs_1", "observation_factual")
+        with mock.patch("engram_core._get_current_turn", return_value=8), \
+             mock.patch("engram_core._embedder.is_available", return_value=False), \
+             mock.patch("engram_core._get_embedding_config", return_value={"enabled": False}):
+            default_call = health_engine.build_snapshot(conn, "nap")
+            explicit_call = health_engine.build_snapshot(
+                conn, "nap", current_turn=8, embedding_enabled=False,
+            )
+        assert default_call == explicit_call
+
+    def test_embedding_enabled_override_true_forces_measurements_true(self):
+        conn = _make_conn()
+        snap = health_engine.build_snapshot(conn, "live", embedding_enabled=True)
+        assert snap["measurements"]["embedder_installed_available"] is True
+        assert snap["measurements"]["embedder_config_enabled"] is True
+
+    def test_embedding_enabled_override_false_forces_measurements_false(self):
+        conn = _make_conn()
+        snap = health_engine.build_snapshot(conn, "live", embedding_enabled=False)
+        assert snap["measurements"]["embedder_installed_available"] is False
+        assert snap["measurements"]["embedder_config_enabled"] is False
+
+    def test_embedding_enabled_none_falls_through_to_core_reads(self):
+        conn = _make_conn()
+        with mock.patch("engram_core._embedder.is_available", return_value=True), \
+             mock.patch("engram_core._get_embedding_config", return_value={"enabled": True}):
+            snap = health_engine.build_snapshot(conn, "nap")
+        assert snap["measurements"]["embedder_installed_available"] is True
+        assert snap["measurements"]["embedder_config_enabled"] is True
+
+    def test_stored_vs_live_snapshot_equal_given_same_inputs(self):
+        """Kepler's stated merge condition: a stored-vs-live snapshot built
+        from the same graph with the same inputs are equal (modulo the
+        checkpoint_mode field itself, which legitimately differs)."""
+        conn = _make_conn()
+        _insert(conn, "obs_1", "observation_factual")
+        with mock.patch("engram_core._get_current_turn", return_value=42), \
+             mock.patch("engram_core._embedder.is_available", return_value=False), \
+             mock.patch("engram_core._get_embedding_config", return_value={"enabled": False}):
+            stored = health_engine.build_snapshot(conn, "nap")
+        live = health_engine.build_snapshot(
+            conn, "live", current_turn=42, embedding_enabled=False,
+        )
+        stored_copy = dict(stored)
+        live_copy = dict(live)
+        assert stored_copy.pop("checkpoint_mode") == "nap"
+        assert live_copy.pop("checkpoint_mode") == "live"
+        assert stored_copy == live_copy
+
+    def test_embedding_override_mismatched_with_process_env_does_not_raise(self):
+        """The load-bearing judgment call flagged in the handoff: when
+        embedding_enabled is overridden to a value that DISAGREES with
+        this process's own core._embedder/_get_embedding_config (exactly
+        the multi-tenant-viz scenario this override exists for), the SSoT
+        equality control must NOT raise -- its premise ("L0 and the live
+        SQL path read the SAME environment") is deliberately broken by
+        the override, so embedding_coverage is excluded from that one
+        cross-check. Populate a node so the OTHER (non-embedding) signals
+        have a real, non-degenerate value to verify too."""
+        conn = _make_conn()
+        _insert(conn, "obs_1", "observation_factual")
+        with mock.patch("engram_core._embedder.is_available", return_value=False), \
+             mock.patch("engram_core._get_embedding_config", return_value={"enabled": False}):
+            # Process env says "no embeddings"; override says "yes" -- a
+            # deliberate mismatch.
+            snap = health_engine.build_snapshot(conn, "live", embedding_enabled=True)
+        assert snap["measurements"]["embedder_installed_available"] is True
+        assert snap["measurements"]["embedder_config_enabled"] is True
+
+    def test_discriminating_check_without_the_skip_this_would_raise(self):
+        """THE DISCRIMINATING CHECK for the skip mechanism itself: calling
+        _verify_l1_against_live_signal_fns directly WITHOUT the skip
+        parameter, on the same mismatched setup, DOES raise -- proving the
+        skip in build_snapshot is load-bearing, not a no-op."""
+        conn = _make_conn()
+        _insert(conn, "obs_1", "observation_factual")
+        with mock.patch("engram_core._embedder.is_available", return_value=False), \
+             mock.patch("engram_core._get_embedding_config", return_value={"enabled": False}):
+            l0 = health_measurements.compute_all_measurements(conn)
+            l0 = dict(l0)
+            l0["embedder_installed_available"] = True
+            l0["embedder_config_enabled"] = True
+            l1 = health_signals.compute_all_signals(l0)
+            with pytest.raises(health_engine.HealthEngineSSoTError, match="embedding_coverage"):
+                health_engine._verify_l1_against_live_signal_fns(conn, l1)
+            # And, symmetrically: WITH the skip, it does not raise.
+            health_engine._verify_l1_against_live_signal_fns(
+                conn, l1, skip=frozenset({"embedding_coverage"})
+            )
+
+
+# ---------------------------------------------------------------------------
 # 6. Diagnostics (PR3) — activity metrics + cascade-marker age. Never wired
 #    into scoring — see health/engine.py's module docstring.
 # ---------------------------------------------------------------------------

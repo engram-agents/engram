@@ -338,6 +338,20 @@ class Handler(BaseHTTPRequestHandler):
                 resp = viz_health_v2_data.get_health_v2_series(agent_name, version, signal)
                 resp["agent"] = agent_name
                 self._json(resp)
+        elif path == "/api/health/v2/live":
+            # health-v2 LIVE score panel (engram-alpha#2518, live-score
+            # slice) -- recomputes a fresh snapshot on EVERY call, straight
+            # off the requested agent's own knowledge.db; never reads or
+            # writes a stored snapshot file. Lei's direction: "always
+            # recompute on page refresh ... the health dashboard is
+            # basically showing the realtime health score all the time".
+            if not db_path:
+                self._json({"error": f"Unknown agent: {agent_name!r}",
+                            "agent": agent_name}, status=404)
+            else:
+                resp = viz_health_v2_data.get_health_v2_live_data(agent_name)
+                resp["agent"] = agent_name
+                self._json(resp)
         elif path == "/api/health/v2/model":
             # Curve Workbench (engram-alpha#2727) -- the SHIPPED scoring
             # model's curve/importance/aspect-points declarations. NOT

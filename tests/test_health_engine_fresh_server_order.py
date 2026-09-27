@@ -64,7 +64,10 @@ def test_reported_broken_order_passes():
     # 90 -> 94.
     # engram-alpha#3124 (#3126) added a row_factory-independence test to
     # test_health_engine.py: 94 -> 95.
-    assert "95 passed" in proc.stdout, proc.stdout
+    # engram-alpha#2518 (live-score slice) added 15 new tests to
+    # test_health_engine.py (TestLiveCheckpointMode,
+    # TestWriteSnapshotRefusesLiveMode, TestPerAgentOverrides): 95 -> 110.
+    assert "110 passed" in proc.stdout, proc.stdout
 
 
 def test_normal_order_still_passes():
@@ -83,7 +86,9 @@ def test_normal_order_still_passes():
     # engram-alpha#2720: 90 -> 94 (see identical note above).
     # engram-alpha#3124 (#3126) added a row_factory-independence test to
     # test_health_engine.py: 94 -> 95.
-    assert "95 passed" in proc.stdout, proc.stdout
+    # engram-alpha#2518 (live-score slice): 95 -> 110 (see identical note
+    # on test_reported_broken_order_passes above).
+    assert "110 passed" in proc.stdout, proc.stdout
 
 
 def test_sibling_fresh_server_file_ordering_also_passes():
@@ -104,4 +109,6 @@ def test_sibling_fresh_server_file_ordering_also_passes():
     # engram-alpha#2720: 83 -> 87 (see identical note above).
     # engram-alpha#3124 (#3126) added a row_factory-independence test to
     # test_health_engine.py: 87 -> 88.
-    assert "88 passed" in proc.stdout, proc.stdout
+    # engram-alpha#2518 (live-score slice): 88 -> 103 (see identical note
+    # on test_reported_broken_order_passes above).
+    assert "103 passed" in proc.stdout, proc.stdout

@@ -2,7 +2,9 @@
 composed score (engram-alpha#2757, part of #2518).
 
 Scope: the normal (default) view's top "Health Score" card must render the
-health-v2 composed score (with its snapshot's ``written_at``), not the v1
+health-v2 composed score (with its LIVE build's ``computed_at``, per
+engram-alpha#2518's live-score slice -- see TestLoadHealthFetchesV2 and
+TestRenderFailHonestBranch.test_computed_at_rendered below), not the v1
 ``d.health_score`` -- and must expose an in-panel link that jumps straight
 to the Detail view. Both are pure client-side JS changes to the same inline
 `<script>` block `test_viz_health_view_toggle.py` and
@@ -69,20 +71,23 @@ def _extract_function(script: str, name: str) -> str:
 
 
 class TestLoadHealthFetchesV2(_LiveServerBase):
-    def test_load_health_fetches_health_v2(self):
+    def test_load_health_fetches_health_v2_live(self):
+        """engram-alpha#2518, live-score slice: the score panel switched
+        from the stored-snapshot endpoint to the always-recompute LIVE
+        endpoint -- Lei's direction ("always recompute on page refresh")."""
         body = self._get("/health")
         script = _extract_inline_script(body)
         fn_body = _extract_function(script, "loadHealth")
-        self.assertIn("_withAgent('/api/health/v2')", fn_body)
+        self.assertIn("_withAgent('/api/health/v2/live')", fn_body)
 
     def test_v2_fetch_has_non_fatal_catch(self):
         """Per the spec: like the existing /api/calibration fetch, a failed
-        /api/health/v2 fetch must never break the rest of the normal-view
-        render."""
+        /api/health/v2/live fetch must never break the rest of the
+        normal-view render."""
         body = self._get("/health")
         script = _extract_inline_script(body)
         fn_body = _extract_function(script, "loadHealth")
-        v2_idx = fn_body.find("_withAgent('/api/health/v2')")
+        v2_idx = fn_body.find("_withAgent('/api/health/v2/live')")
         self.assertGreater(v2_idx, -1)
         tail = fn_body[v2_idx:v2_idx + 200]
         self.assertIn(".catch(() => null)", tail)
@@ -153,12 +158,18 @@ class TestRenderFailHonestBranch(_LiveServerBase):
         # scoreColor still receives the raw value, not the rounded string
         self.assertIn("scoreColor(v2Score)", fn_body)
 
-    def test_provenance_written_at_rendered(self):
+    def test_computed_at_rendered(self):
+        """engram-alpha#2518, live-score slice: the score panel's provenance
+        line reads the LIVE endpoint's ``computed_at`` field, not the
+        stored-snapshot ``provenance.written_at`` -- and the label says
+        "LIVE" explicitly so it can never be mistaken for a stored
+        checkpoint's timestamp."""
         body = self._get("/health")
         script = _extract_inline_script(body)
         fn_body = _extract_function(script, "render")
-        self.assertIn("v2.provenance", fn_body)
-        self.assertIn("written_at", fn_body)
+        self.assertIn("v2.computed_at", fn_body)
+        self.assertIn("LIVE", fn_body)
+        self.assertNotIn("v2.provenance && v2.provenance.written_at", fn_body)
 
 
 class TestScorePanelCoverageCaveat(_LiveServerBase):
