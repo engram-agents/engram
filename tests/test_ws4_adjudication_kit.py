@@ -995,5 +995,196 @@ class HookBridgeImportTests(unittest.TestCase):
         self.assertTrue(target.startswith("mcp__x__engram_add_observation "))
 
 
+class ErrorAndNaRowCountingTests(unittest.TestCase):
+    """engram-alpha#2753: PR #3173's `error` ledger rows (arm draw or row
+    construction failed) and the pre-existing `na` rows are not adjudicable
+    -- ADJUDICATION_ARMS = {"chain", "control"} in extract_spans.py is
+    correct and untouched here -- but they must never disappear from the
+    denominator entirely. compute_denominators() counts every RAW ledger
+    row (joined by nothing -- error/na rows have no key.jsonl entry) into
+    ledger_rows_by_arm, and separately tallies error_rows so a failure
+    stays VISIBLE. See compute_denominators's docstring for the exact
+    contract this class tests."""
+
+    def _row(self, ts, tool_use_id, arm=None, error=None, transcript_path="x"):
+        row = {
+            "ts": ts,
+            "transcript_path": transcript_path,
+            "tool_use_id": tool_use_id,
+            "nonce": tool_use_id,
+            "shown_lesson_ids": [],
+            "heads_by_lesson": {},
+        }
+        if arm is not None:
+            row["arm"] = arm
+        if error is not None:
+            row["error"] = error
+        return row
+
+    def _mixed_rows(self):
+        return [
+            self._row(1.0, "c1", arm="chain"),
+            self._row(2.0, "c2", arm="chain"),
+            self._row(3.0, "k1", arm="control"),
+            self._row(4.0, "n1", arm="na"),
+            self._row(5.0, "n2", arm="na"),
+            self._row(6.0, "n3", arm="na"),
+            self._row(7.0, "e1", arm="error", error="boom-one"),
+            self._row(8.0, "e2", arm="error", error="boom-two"),
+            self._row(9.0, "m1"),  # no "arm" key at all -> "missing"
+        ]
+
+    def test_pooled_ledger_rows_by_arm_counts_every_row_exactly_once(self):
+        rows = self._mixed_rows()
+        seat = ws4_analyze.SeatInputs(seat="seat-fixture", ledger_rows=rows, key={}, verdicts={}, flags={})
+        denominators = ws4_analyze.compute_denominators([seat])
+        pooled = denominators["ledger_rows_by_arm"]["pooled"]
+        self.assertEqual(pooled, {"chain": 2, "control": 1, "na": 3, "error": 2, "missing": 1})
+        self.assertEqual(sum(pooled.values()), len(rows))
+        self.assertEqual(sum(pooled.values()), 9)
+
+    def test_per_seat_counts_and_pooled_equals_sum_of_per_seat(self):
+        rows_a = self._mixed_rows()
+        rows_b = [
+            self._row(10.0, "b1", arm="chain"),
+            self._row(11.0, "b2", arm="error", error="boom-three"),
+        ]
+        seat_a = ws4_analyze.SeatInputs(seat="seat-A", ledger_rows=rows_a, key={}, verdicts={}, flags={})
+        seat_b = ws4_analyze.SeatInputs(seat="seat-B", ledger_rows=rows_b, key={}, verdicts={}, flags={})
+        denominators = ws4_analyze.compute_denominators([seat_a, seat_b])
+        per_seat = denominators["ledger_rows_by_arm"]["per_seat"]
+        pooled = denominators["ledger_rows_by_arm"]["pooled"]
+
+        self.assertEqual(sum(per_seat["seat-A"].values()), len(rows_a))
+        self.assertEqual(sum(per_seat["seat-B"].values()), len(rows_b))
+        self.assertEqual(per_seat["seat-A"]["chain"], 2)
+        self.assertEqual(per_seat["seat-B"]["chain"], 1)
+        self.assertEqual(per_seat["seat-B"]["error"], 1)
+
+        for arm_key in set(per_seat["seat-A"]) | set(per_seat["seat-B"]):
+            self.assertEqual(
+                pooled.get(arm_key, 0),
+                per_seat["seat-A"].get(arm_key, 0) + per_seat["seat-B"].get(arm_key, 0),
+            )
+
+    def test_error_rows_count_and_by_error_with_truncation(self):
+        long_error = "x" * 300
+        rows = [
+            self._row(1.0, "e1", arm="error", error="boom-one"),
+            self._row(2.0, "e2", arm="error", error=long_error),
+        ]
+        seat = ws4_analyze.SeatInputs(seat="seat-fixture", ledger_rows=rows, key={}, verdicts={}, flags={})
+        denominators = ws4_analyze.compute_denominators([seat])
+        error_rows = denominators["error_rows"]
+        self.assertEqual(error_rows["count"], 2)
+        self.assertIn("boom-one", error_rows["by_error"])
+        truncated_keys = [k for k in error_rows["by_error"] if k.startswith("x")]
+        self.assertEqual(len(truncated_keys), 1)
+        self.assertEqual(len(truncated_keys[0]), 120)
+
+    def test_error_never_counted_in_o1_o2_or_length_control(self):
+        rows = self._mixed_rows()
+        # Chain/control rows get a key entry + verdict (adjudicable); na/
+        # error rows deliberately get NO key entry, exactly as
+        # extract_spans.py's ADJUDICATION_ARMS filter leaves them.
+        key = {}
+        verdicts = {}
+        for row in rows:
+            if row.get("arm") in ("chain", "control"):
+                fire_id = compute_fire_id(row)
+                key[fire_id] = {"fire_id": fire_id, "arm": row["arm"]}
+                verdicts[fire_id] = {"verdict": "walked_past", "corrective_at": None}
+        seat = ws4_analyze.SeatInputs(seat="seat-fixture", ledger_rows=rows, key=key, verdicts=verdicts, flags={})
+
+        o1 = ws4_analyze.compute_o1([seat])
+        self.assertEqual(o1["pooled"]["tally"]["chain"]["walked_past"], 2)
+        self.assertEqual(o1["pooled"]["tally"]["control"]["walked_past"], 1)
+        total_counted = sum(sum(bucket.values()) for bucket in o1["pooled"]["tally"].values())
+        # Only the 2 chain + 1 control rows -- never the 3 na, 2 error, 1 missing.
+        self.assertEqual(total_counted, 3)
+
+        length_control = ws4_analyze.compute_length_control([seat])
+        total_in_bins = sum(b["n"] for b in length_control["bins"])
+        self.assertEqual(total_in_bins, 3)
+
+        o2 = ws4_analyze.compute_o2([seat], None)
+        total_participating = sum(v["participating"] for v in o2["per_arm"].values())
+        self.assertEqual(total_participating, 0)  # unlocatable fixture transcript, but never errors on error/na rows
+
+    def test_o1_tally_unchanged_by_presence_of_error_and_na_rows(self):
+        chain_row = self._row(1.0, "c1", arm="chain")
+        control_row = self._row(2.0, "k1", arm="control")
+        key = {}
+        verdicts = {}
+        for row, verdict, corrective_at in ((chain_row, "walked_past", None), (control_row, "heeded", 1)):
+            fire_id = compute_fire_id(row)
+            key[fire_id] = {"fire_id": fire_id, "arm": row["arm"]}
+            verdicts[fire_id] = {"verdict": verdict, "corrective_at": corrective_at}
+
+        seat_without_noise = ws4_analyze.SeatInputs(
+            seat="seat-fixture", ledger_rows=[chain_row, control_row], key=key, verdicts=verdicts, flags={},
+        )
+        o1_without_noise = ws4_analyze.compute_o1([seat_without_noise])
+
+        noisy_rows = [
+            chain_row,
+            control_row,
+            self._row(3.0, "n1", arm="na"),
+            self._row(4.0, "e1", arm="error", error="boom"),
+            self._row(5.0, "m1"),
+        ]
+        seat_with_noise = ws4_analyze.SeatInputs(
+            seat="seat-fixture", ledger_rows=noisy_rows, key=key, verdicts=verdicts, flags={},
+        )
+        o1_with_noise = ws4_analyze.compute_o1([seat_with_noise])
+
+        self.assertEqual(o1_without_noise["pooled"]["tally"], o1_with_noise["pooled"]["tally"])
+        self.assertEqual(o1_without_noise["pooled"]["arm_difference"], o1_with_noise["pooled"]["arm_difference"])
+
+    def test_printed_report_error_rows_line_with_nonzero_and_zero_counts(self):
+        import contextlib
+        import io
+
+        rows_with_errors = [
+            self._row(1.0, "c1", arm="chain"),
+            self._row(2.0, "e1", arm="error", error="boom-one"),
+            self._row(3.0, "e2", arm="error", error="boom-two"),
+        ]
+        fire_id = compute_fire_id(rows_with_errors[0])
+        key = {fire_id: {"fire_id": fire_id, "arm": "chain"}}
+        verdicts = {fire_id: {"verdict": "walked_past", "corrective_at": None}}
+        seat = ws4_analyze.SeatInputs(
+            seat="seat-fixture", ledger_rows=rows_with_errors, key=key, verdicts=verdicts, flags={},
+        )
+        o1_headline = ws4_analyze.compute_o1([seat])
+        o1_k_sweep = ws4_analyze.compute_o1_k_sweep([seat])
+        length_control = ws4_analyze.compute_length_control([seat])
+        o2 = ws4_analyze.compute_o2([seat], None)
+        denominators = ws4_analyze.compute_denominators([seat])
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ws4_analyze._print_report(o1_headline, o1_k_sweep, length_control, o2, denominators)
+        output = buf.getvalue()
+        self.assertIn("error rows (arm unknown; in no O1/O2/length table): 2", output)
+
+        # Zero case -- no error rows at all.
+        rows_no_errors = [rows_with_errors[0]]
+        seat_clean = ws4_analyze.SeatInputs(
+            seat="seat-fixture", ledger_rows=rows_no_errors, key=key, verdicts=verdicts, flags={},
+        )
+        o1_headline_c = ws4_analyze.compute_o1([seat_clean])
+        o1_k_sweep_c = ws4_analyze.compute_o1_k_sweep([seat_clean])
+        length_control_c = ws4_analyze.compute_length_control([seat_clean])
+        o2_c = ws4_analyze.compute_o2([seat_clean], None)
+        denominators_c = ws4_analyze.compute_denominators([seat_clean])
+
+        buf_c = io.StringIO()
+        with contextlib.redirect_stdout(buf_c):
+            ws4_analyze._print_report(o1_headline_c, o1_k_sweep_c, length_control_c, o2_c, denominators_c)
+        output_c = buf_c.getvalue()
+        self.assertIn("error rows (arm unknown; in no O1/O2/length table): 0", output_c)
+
+
 if __name__ == "__main__":
     unittest.main()

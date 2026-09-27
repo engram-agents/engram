@@ -30,8 +30,15 @@ Pre-registration rules enforced here:
   - Per-lesson counting on multi-lesson fires: a fire with N shown lessons
     contributes N counting units (see tools/ws4/ledger.py's
     expand_per_lesson), each carrying just that lesson's own heads.
-  - Denominators (fires by arm, unlocatable, unclear, dropped_privacy) are
-    reported alongside every table.
+  - Denominators (fires by arm, unlocatable, unclear, dropped_privacy,
+    ledger_rows_by_arm, error_rows) are reported alongside every table.
+    ledger_rows_by_arm counts every RAW ledger row (chain, control, na,
+    error, and any missing/non-string arm as "missing") -- including the
+    na/error rows that never get a key.jsonl entry and so never appear in
+    any chain/control table. error_rows separately surfaces the count and
+    per-error-string breakdown of PR #3173's `error` rows, so an arm-draw
+    or row-construction failure stays VISIBLE in the denominator instead
+    of silently vanishing.
   - Fires flagged by the leak audit (head_named_in_span) are excluded from
     the main tally and reported as a SEPARATE row, never silently mixed in.
     Same treatment for fires dropped by a seat's privacy screener
@@ -452,12 +459,58 @@ def compute_o2(seats: "list[SeatInputs]", db_path):
     return {"per_arm": per_arm, "flagged_excluded": flagged_counts, "dropped_excluded": dropped_counts}
 
 
+_KNOWN_LEDGER_ARMS = ("chain", "control", "na", "error")
+_ERROR_STRING_MAX_LEN = 120
+
+
 def compute_denominators(seats: "list[SeatInputs]", unlocatable_paths=None):
+    """... (fires_by_arm / unclear / dropped_privacy / unlocatable, as
+    before, joined through each seat's key.jsonl -- chain/control fires
+    only).
+
+    Also computed here, from the RAW ledger rows of each seat (never
+    joined through the key -- na/error rows have no key.jsonl entry at
+    all, by design: extract_spans.py's ADJUDICATION_ARMS = {"chain",
+    "control"} is correct and untouched):
+
+    ledger_rows_by_arm: {"pooled": {arm_value: count}, "per_seat":
+    {seat: {arm_value: count}}}, over EVERY ledger row of every seat. The
+    row's own "arm" field is used as-is; a missing or non-string "arm"
+    counts under the key "missing". chain/control/na/error are always
+    present (0 when absent) so a reader sees a zero rather than a missing
+    key. Contract: every ledger row is counted exactly once -- per seat,
+    the values sum to len(ledger_rows) for that seat, and pooled sums to
+    the grand total. An "error" row is never counted in any chain/control
+    tally (O1, O2, length control) -- those all join through the key,
+    which na/error rows never have.
+
+    error_rows: {"count": N, "by_error": {error_string_truncated_to_120:
+    count}}, pooled across all seats -- PR #3173's `error` rows (arm draw
+    or row construction failed) surfaced by error string, so a failure
+    stays visible in the denominator instead of disappearing."""
     fires_by_arm = {arm: 0 for arm in ARMS}
     unclear = 0
     dropped_privacy = {arm: 0 for arm in ARMS}
+    ledger_rows_by_arm_pooled = {arm: 0 for arm in _KNOWN_LEDGER_ARMS}
+    ledger_rows_by_arm_per_seat = {}
+    error_row_count = 0
+    error_by_string: dict = {}
+
     for seat_inputs in seats:
+        seat_arm_counts = {arm: 0 for arm in _KNOWN_LEDGER_ARMS}
         for row in seat_inputs.ledger_rows:
+            raw_arm = row.get("arm")
+            arm_key = raw_arm if isinstance(raw_arm, str) else "missing"
+            seat_arm_counts[arm_key] = seat_arm_counts.get(arm_key, 0) + 1
+            ledger_rows_by_arm_pooled[arm_key] = ledger_rows_by_arm_pooled.get(arm_key, 0) + 1
+            if arm_key == "error":
+                error_row_count += 1
+                error_string = row.get("error")
+                if not isinstance(error_string, str):
+                    error_string = str(error_string)
+                error_string = error_string[:_ERROR_STRING_MAX_LEN]
+                error_by_string[error_string] = error_by_string.get(error_string, 0) + 1
+
             fire_id = compute_fire_id(row)
             key_entry = seat_inputs.key.get(fire_id)
             if key_entry is None:
@@ -473,6 +526,7 @@ def compute_denominators(seats: "list[SeatInputs]", unlocatable_paths=None):
             verdict_row = seat_inputs.verdicts.get(fire_id)
             if verdict_row and verdict_row.get("verdict") == "unclear":
                 unclear += 1
+        ledger_rows_by_arm_per_seat[seat_inputs.seat] = seat_arm_counts
 
     unlocatable = None
     if unlocatable_paths:
@@ -485,6 +539,8 @@ def compute_denominators(seats: "list[SeatInputs]", unlocatable_paths=None):
         "unclear": unclear,
         "dropped_privacy": dropped_privacy,
         "unlocatable": unlocatable,
+        "ledger_rows_by_arm": {"pooled": ledger_rows_by_arm_pooled, "per_seat": ledger_rows_by_arm_per_seat},
+        "error_rows": {"count": error_row_count, "by_error": error_by_string},
     }
 
 
@@ -498,6 +554,11 @@ def _print_report(o1_headline, o1_k_sweep, length_control, o2, denominators, no_
 
     print("== Denominators ==")
     print(json.dumps(denominators, indent=2))
+    error_rows = denominators["error_rows"]
+    print(f"error rows (arm unknown; in no O1/O2/length table): {error_rows['count']}")
+    if error_rows["count"] > 0:
+        for error_string, count in error_rows["by_error"].items():
+            print(f"  {count}x {error_string}")
     # Reviewer note (PR #3175 round-3 comment): flagged/dropped_privacy
     # counts below are per-fire, but every table they guard tallies per
     # shown-lesson-unit (expand_per_lesson) -- a multi-lesson fire is one
