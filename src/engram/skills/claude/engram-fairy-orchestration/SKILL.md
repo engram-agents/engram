@@ -143,6 +143,59 @@ git branch -f <expected-branch> <fairy-commit-sha>
 - **Weekly bulk-prune**: worktrees on merged or origin-absent branches. Without periodic pruning, hanging worktrees accumulate (39+ in one incident — see §7).
 - **The stash stack is shared across every worktree, and a fairy can reach it without escaping.** Worktree isolation is a *path* boundary; refs, branches and `refs/stash` live in the common `.git` dir, so `git stash` inside a worktree touches state every other worktree and agent shares. On a clean tree the stash is a no-op and the paired `pop` takes — and **drops** — the top of the pre-existing stack. Measured 2026-08-15: a coder-fairy that obeyed every isolation rule and never left its worktree applied a stranger's five-week-old WIP into its tree. **The rule now lives in the two `isolation: worktree` agent specs (`engram-coder-fairy`, `engram-pr-reviewer`), which is where it reaches the fairy — do NOT restate it in individual briefs.** A hand-copied rule in N briefs is the drift hazard, not the fix. Safe alternatives, in the specs: `git show <ref>:<path>`, a real second worktree, commit-then-reset.
 
+### Cross-repo dispatch — the PARENT provisions the worktree (#536)
+
+`isolation: worktree` cuts the fairy's sandbox from the **dispatching session's cwd
+repo**, not from whatever repo the spec names — so a same-repo dispatch is fine
+unchanged, but a **cross-repo** dispatch (target repo != cwd repo) hands the fairy a
+worktree of the wrong repo, holding none of the target's files. Root cause measured
+2026-08-06, corroborated 2026-09-28 (#536); Lei's read: intended behaviour for the
+one-session-one-project model, with a capability request filed upstream. Until that
+lands, the convention is: **the parent provisions the worktree before dispatch and
+hands the path in the prompt as explicit authorization.**
+
+1. **Same-repo dispatch**: nothing changes — `isolation: worktree` as normal.
+2. **Cross-repo dispatch**: before dispatching, the parent runs (from a local clone
+   of the TARGET repo):
+   ```
+   cd <local clone of the target repo> && git fetch -q origin <base>
+   git worktree add -b <branch> <path under the session scratchpad> origin/<base>
+   (cd <path> && git rev-parse --abbrev-ref HEAD && git remote get-url origin && git rev-parse --short HEAD)   # verify before dispatch
+   ```
+   The dispatch prompt then carries a `## Worktree (authoritative)` block naming the
+   path, branch, remote, and: *"the parent has already provisioned your worktree; if
+   the harness handed you a different sandbox, ignore it; this path is your
+   authorization; never write into any other checkout."*
+3. **Fairy's first action**: `cd` to the given path and assert `git rev-parse
+   --abbrev-ref HEAD` and `git remote get-url origin` match the block. On mismatch,
+   STOP and report — zero writes.
+4. **Why the parent, not the fairy**: the fairy's harness sandbox is a worktree of
+   the wrong repo, so it cannot cut a target-repo worktree from *there*. Both fairy
+   specs already carry a self-recovery for that case (`git -C <spec's repo path>
+   worktree add <fresh path> --detach origin/<base>`), which does yield a proper
+   worktree with the shared object store — but only when a local clone of the
+   target exists on the seat (a seat without one falls back to a scratch `git
+   clone`, as a Mac seat did on 2026-09-28), and it leaves branch, base and remote
+   chosen inside the fairy. Parent provisioning moves that choice and its
+   verification to the dispatcher, before any tokens are spent, and gives the parent
+   a known branch to publish from; the self-recovery stays the fallback for a
+   dispatch nobody foresaw was cross-repo.
+5. **Cleanup**: the parent removes only that worktree path after the fairy's
+   completion notification (`git worktree remove --force <path>`; `git worktree
+   prune`) — never a pattern sweep (see the hanging-worktrees incident above).
+6. **Reviewer fairies on a cross-repo PR**: hand a read-only worktree of the PR
+   HEAD, not of the base — a branch cut from `origin/<base>` "the same way" as
+   step 2 would give the reviewer the base tree. Provision it as:
+   ```
+   cd <local clone of the target repo> && git fetch -q origin '+refs/pull/<N>/head:refs/pr/<N>'
+   git worktree add --detach <path under the session scratchpad> refs/pr/<N>
+   (cd <path> && git rev-parse HEAD)   # must equal `gh pr view <N> --json headRefOid -q .headRefOid`; STOP if not
+   ```
+   The `## Worktree (authoritative)` block then names path, remote, the PR number and
+   the expected head SHA, plus "make no commits or edits there"; the fairy's first
+   action asserts remote and `HEAD == <sha>`. Any mutation the fairy needs goes to a
+   copy under its own scratch, not the handed path.
+
 ### Recovery procedures (when things go wrong)
 
 | Symptom | Diagnosis | Fix |
