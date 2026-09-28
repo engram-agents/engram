@@ -2067,9 +2067,11 @@ def test_shipped_shell_scripts_parse_under_macos_bash32():
     Skips cleanly (never fails, never vacuously passes) on any host where
     /bin/bash isn't confirmed genuinely 3.2.x -- Linux CI runners (this
     repo's pr-checks.yml / tests.yml both run ubuntu-latest) ship a modern
-    /bin/bash and structurally cannot exercise this bug class; a
-    macos-latest GitHub-hosted runner (or a real macOS dev seat) does, and
-    is where this test actually runs for-real.
+    /bin/bash and structurally cannot exercise this bug class. A real
+    macOS machine's frozen bash 3.2 does: this test runs for-real only on a
+    Mac seat, run locally whenever a shipped shell script changes. Hosted
+    macOS runners are banned from CI (CLAUDE.md, "No macOS runners in CI",
+    #3192).
 
     On a confirmed 3.2.x host: runs `/bin/bash -n <script>` against every
     .sh mechanism the tier manifest says this repo ships (see
