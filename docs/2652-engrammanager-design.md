@@ -491,7 +491,7 @@ in the concept vocabulary — `NodeRef`, `RelationName`, `MarkerKind` — never 
 
 | mechanism | signature | structural invariants the engine enforces | which domain engine's construction required it |
 |---|---|---|---|
-| **traverse** | `traverse(from: NodeRef, relations: [RelationName], direction: Direction, stop_when: AttributePredicate) -> [Path]` | every name in `relations` is a declared relation; `stop_when` references **only declared node attributes** — §2.0's size guard, in force at the signature; each node visited at most once, so the walk terminates on a cyclic graph — ****SET-COMPLETE, POSITION-FREE**: every node reachable under `relations` and not cut off by `stop_when` appears in SOME returned path — which is the guarantee cascade's frontier walk rests on — but NO guarantee is made about WHERE a given node appears, so nothing may be read off a fixed index.** The second half is what a depth-bounded read would need, and supplying it would require ordering the walk by depth rather than by reachability, which is a different traversal. **The `Path` contract, stated because more than one argument in this section turns on it — and one of them turned the other way once it was read precisely:** a `Path` is the ordered `NodeRef` sequence from `from` to a terminal node, carrying nodes and NOT the edges between them; `stop_when` is evaluated at each node **as it is reached**, the origin included; and **the node on which it fires IS the last element of its path** — which is what lets a caller read the stopping node rather than only the nodes before it. | cascade — the frontier walk outward from a resolved node through its dependents |
+| **traverse** | `traverse(from: NodeRef, relations: [RelationName], direction: Direction, stop_when: AttributePredicate) -> [Path]` | every name in `relations` is a declared relation; `stop_when` references **only declared node attributes** — §2.0's size guard, in force at the signature; each node visited at most once, so the walk terminates on a cyclic graph — **SET-COMPLETE, POSITION-FREE:** every node reachable under `relations` and not cut off by `stop_when` appears in SOME returned path — which is the guarantee cascade's frontier walk rests on — but **no guarantee is made about which path a node appears in, or at what depth, so no node may be read off a fixed index** (the one position fact the contract does grant, stated below, is where the stopping node sits). The second half is what a depth-bounded read would need, and supplying it would require ordering the walk by depth rather than by reachability, which is a different traversal. **The `Path` contract, stated because more than one argument in this section turns on it:** a `Path` is the ordered `NodeRef` sequence from `from` to a terminal node, carrying nodes and NOT the edges between them; `stop_when` is evaluated at each node **as it is reached**, the origin included; and **the node on which it fires IS the last element of its path** — which is what lets a caller read the stopping node rather than only the nodes before it. | cascade — the frontier walk outward from a resolved node through its dependents |
 | **attach_marker** / **read_markers** | `attach_marker(node: NodeRef, event: EventRef, kind: MarkerKind, fields: Fields) -> (MarkerRef, EventRef)` · `read_markers(node: NodeRef, state?: MarkerState) -> [Marker]` | referenced node and event both exist; at most one PENDING marker per (node, event); `kind` within the schema's enumerated set | cascade — writes the marker, and the frontier rule reads marker state at every step |
 | **transaction** | `transaction(fn) -> Result` | atomicity over the mechanism calls inside the unit, and read-your-own-writes within it | cascade — "flip currency + write N markers" is one unit (§2.3) |
 
@@ -530,8 +530,12 @@ and guaranteed nothing about WHERE — so it can sit at the end of a transitive 
 §2.0's rule the consequence is not that `read_edges` enters as specified — its FIELDS warrant is
 still dead — but that **a bounded-depth neighbour read is a mechanism the inventory lacks**, which is
 where it is recorded. The alternative repair is to make `traverse` depth-ORDERED as well as
-set-complete; §2.0 would then refuse the gap, at the cost of a traversal ordered by depth rather than
-by reachability.
+set-complete, and it is rejected on principle rather than on cost. A BFS-shaped walk is naturally
+both, so the two properties are not in tension mechanically. But depth-order is a guarantee only ONE
+caller needs (the premise check), while cascade's frontier rule needs only completeness. Baking the
+stronger guarantee into `traverse` for one domain engine's need would break the same minimality rule
+§2.0 applies to which mechanisms exist, applied one level down: to how strong each mechanism's
+contract is. *(This framing is Luria's, from her colleague pass on #2828, via #2840.)*
 
 **Derived from `create_node(derivation)` (§2.3a's requirement check plus §3.1's write set):**
 
@@ -674,7 +678,7 @@ this table warns about.
 
 | side | members |
 |---|---|
-| **owner process hosts** | **concept** (the epistemic vocabulary) · **domain engines** (cascade, confidence, retrieval fusion) · **manager** (`EngramManager` and §2.7's inventory) · **impl** (`SqliteEngramStore`, holding the only open handle on `knowledge.db`) |
+| **owner process hosts** | **concept** (the epistemic vocabulary) · **domain engines** (cascade, confidence, retrieval fusion) · **manager** (`EngramManager` and §2.7's inventory) · **impl** (`SqliteEngramStore`, in the one process that holds `knowledge.db` open; that process may hold more than one connection, and does: the security slice's permanently-restrictive client-read connection plus an owner-internal one, `docs/2652-security-slice-design.md` §3.1) |
 | **clients, over the socket** | the MCP tool bodies (`src/engram/server.py`) · the hooks (`src/engram/hooks/claude/*`) · the dream master and dispatched fairies · the `tools/*` CLIs · the sleep skill's cohort tooling · viz, the health snapshots and the sleep backup (readers, through `snapshot()`) |
 
 **Why this has to be written down rather than left implied.** A builder who reads §2.0's *"mechanisms
