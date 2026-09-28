@@ -3162,8 +3162,9 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
         ("focused_at", "TEXT"),
         ("focus_reason", "TEXT"),
         # ── recall quality columns ──
-        # Curated ≤120-char summary string authored by Sonnet for fast agent
-        # recognition (PR A substrate; backfill via PR B sleep-fairy).
+        # Curated ≤140-char (RECALL_SUMMARY_TARGET) summary string authored by
+        # Sonnet for fast agent recognition (PR A substrate; backfill via PR
+        # B sleep-fairy).
         # NULL on existing rows and when not yet generated.
         ("recall_summary", "TEXT"),
         # JSON-encoded list of 3 short keyword strings for structural recognition
@@ -8848,7 +8849,23 @@ def _classify_pending_markers(conn: sqlite3.Connection, node_id: str) -> tuple:
 # for Borges that 200 vs 280 IS deliberate). Target: agents should aim for
 # ≤140 chars; soft-accept (needs_tightening=1) up to 279; hard-reject at
 # 280+.
-RECALL_SUMMARY_TARGET = 140
+#
+# RECALL_SUMMARY_TARGET now LIVES in tools/recall_summary_validator.py
+# (#2736 defect 2 — "140" had drifted into 8 sites as an unruled "≤120").
+# Imported here rather than redefined: the dependency direction is
+# core -> tools ON PURPOSE, because tools/ is DB-free and embeddings-free
+# and cannot import engram_core (would create a cycle), so the constant has
+# to live on the side both the heavy runtime and the lightweight tools can
+# reach. Do not move it back into core.
+# Inherited constraint (#2565 tools-package name clash): importing engram_core
+# now imports `tools`, binding it in sys.modules to whichever `tools` package is
+# first on sys.path. Standalone scripts that put src/engram first (e.g.
+# tools/anchoring_report.py, tools/surgical.py) therefore bind the runtime's
+# tools/, and a LATER `import tools.engine` (repo-root dev tooling) in the same
+# process fails. Nothing does that today; the pytest suite puts the repo root
+# first and is guarded by conftest.py's #2565 check, and the installed plugin
+# has only one `tools` package.
+from tools.recall_summary_validator import RECALL_SUMMARY_TARGET  # noqa: E402
 RECALL_SUMMARY_HARD_REJECT_AT = 280
 
 # Write-time recall_keywords bounds (#1952 PR1) — distinct from the older

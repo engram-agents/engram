@@ -870,7 +870,7 @@ Go back to shell step 1.
 If `retry_payload.json` still exists after the loop (failures survive the single fairy retry), the awake Opus agent writes recall summaries for the remaining items directly:
 
 1. Read `$COHORT_DIR/retry_payload.json` — this is the `{"items": [...]}` list of still-failing nodes (same schema as the batch-summary fairy's input).
-2. For each item in `retry_payload.json`: write a recall_summary (≤120 chars, hard cap 200) and recall_keywords list following the batch-summary spec. Prefer concision over completeness — these are the hard nodes the fairy couldn't compress; compress them yourself.
+2. For each item in `retry_payload.json`: write a recall_summary (≤140 chars target, `RECALL_SUMMARY_TARGET`; hard cap 200) and recall_keywords list following the batch-summary spec. Prefer concision over completeness — these are the hard nodes the fairy couldn't compress; compress them yourself.
 3. Write your output to `$COHORT_DIR/agent_residual_output.json` as `{"items": [{node_id, recall_summary, recall_keywords}, ...]}`.
 4. Run incorporate:
    ```bash
