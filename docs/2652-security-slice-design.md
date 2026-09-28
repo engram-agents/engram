@@ -134,8 +134,11 @@ is excluded.
 
 ### 2.1 The filesystem is the primary gate — a 0700 directory, not the socket's own mode
 
-The socket lives at `$ENGRAM_HOME/run/owner.sock`. **`$ENGRAM_HOME/run/` is created mode 0700
-before the bind**, and the socket's own mode is not relied on.
+The socket lives at `$ENGRAM_HOME/run/engramd.sock`. **`$ENGRAM_HOME/run/` is created mode 0700
+before the bind**, and the socket's own mode is not relied on as the gate (it is still set explicitly,
+see below). The filename is the shipped one (`DEFAULT_SOCKET_NAME`, single-sourced in
+`engramd_client.py`); earlier revisions said `owner.sock`. The property is the directory, not the name
+(Borges's ruling on #3194).
 
 The load-bearing reason is measured: P5 shows a plain `bind()` leaves the socket at **0755**.
 `chmod` after bind closes it, but between bind and chmod there is a window in which the socket is
@@ -151,6 +154,29 @@ conclusion on its own.
 
 `umask` is set explicitly around the directory creation rather than inherited, since an inherited
 umask is a setting some other part of the process can change.
+
+**Mode bits are not the whole access rule where the parent carries an inheritable ACL.** A `chmod 0700`
+does not remove ACL entries, and a subdirectory inherits its parent's inheritable ones:
+
+- **Linux, measured by Borges on #3194:** `~/.engram` carries `default:user:spt:rw-` with
+  `default:mask::rwx`. A fresh `run/` at mode 0700 keeps the inherited default ACL, so a socket created
+  inside it gets `spt rw-`. The directory's own `x` is masked for `spt` today, so the path is not
+  traversable, but the rule is one mask change away from opening.
+- **Darwin, measured by me (2026-09-28):** a parent with an inheritable `allow read,write` entry gives a
+  `mkdir -m 0700` child the entry (`drwx------+`, *inherited*), and a socket bound inside inherits it
+  too. `chmod -N` on `run/` removes it, and a socket bound **after** the strip carries no ACL. A socket
+  bound before the strip keeps its copy. The cross-user connect effect was not measured (that needs a
+  second account).
+
+So the owner must **strip ACLs on `run/` before the bind**: remove the default ACL and any named
+entries on Linux, and `chmod -N` on Darwin. It does this through a directory fd opened with
+`O_DIRECTORY|O_NOFOLLOW` and `fstat`-checked, never by path. It then **sets the socket's own mode
+explicitly** rather than inheriting it from the umask.
+
+**Build scope.** The U4a build (#3194, #3201) implements the **Linux arm only**. On any other platform,
+or on a Linux seat without `setfacl` or `SO_PEERCRED`, the owner **refuses to start** (§2.2's posture)
+rather than running without the strip. The Darwin `chmod -N` step above specifies what a later Darwin
+build must do; no Darwin build does it today.
 
 ### 2.2 Peer credentials — defence in depth, and the assertion that makes it real
 
@@ -708,8 +734,11 @@ Contract-first — each test names the mutation that must turn it red.
    records that the clause changes no outcome in any owner configuration. The property is kept; the
    claim of discrimination is withdrawn. Identity mismatch is tested through **test 1**, malformed-buffer
    acceptance through **test 2** (parse form). Neither check is weakened.
-4. **The socket's parent directory is 0700 at bind time**, asserted by `stat` on the directory.
-   *Mutation: create it 0755.*
+4. **The socket's parent directory is 0700 at bind time and carries no ACL**: no named user or group
+   entries and no default ACL, asserted on the ACL itself, not only via `stat`. The fixture gives
+   the parent an inheritable ACL, as `~/.engram` has on the Linux host, because on a parent without
+   one this test passes whether or not the strip happens. *Mutations: create it 0755; skip the ACL
+   strip.*
 5. **Stale-socket replacement refuses a symlink and a non-socket.** *Mutation: remove the checks.*
 6. **A one-byte mutation of a registered tier-1 statement → `Rejected(unregistered_template)`.**
    *Mutation: normalise whitespace before hashing — must go red, and that it does is the point: it is
@@ -855,6 +884,13 @@ important thing the review produced.
 ## 9. What changed, revision by revision, and who found it
 
 Recorded because a reader should be able to see which parts survived attack.
+
+### Follow-up — U4a build findings (Borges, #3194)
+
+| § | change | found by |
+|---|---|---|
+| §2.1 | **Socket path corrected to `$ENGRAM_HOME/run/engramd.sock`** (the shipped `DEFAULT_SOCKET_NAME`); `owner.sock` was never shipped. | Borges (ruling) |
+| §2.1, §5 | **ACLs, not only mode bits.** An inheritable parent ACL survives `chmod 0700` on `run/` and reaches the socket. The owner strips ACLs on `run/` through an `O_NOFOLLOW` fd before the bind and sets the socket mode explicitly. Test 4 now asserts on the ACL, with a fixture parent that carries one. | Borges (Linux measurement, requirement); Aleph (Darwin measurement) |
 
 ### Follow-up to revision 5 — two overclaims Mira flagged at approval
 
