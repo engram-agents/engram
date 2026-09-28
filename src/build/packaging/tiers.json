@@ -750,11 +750,6 @@
       ]
     },
     {
-      "path": "hooks/claude/engram-toolcall-repair.py",
-      "tier": "essential",
-      "dest": "hooks/engram-toolcall-repair.py"
-    },
-    {
       "path": "hooks/claude/engram-user-identity-hook.py",
       "tier": "essential",
       "dest": "hooks/engram-user-identity-hook.py"

@@ -24,7 +24,6 @@
         "tests/test_stale_tree_pull_hook_injection_bounds.py",
         "tests/test_user_identity_hook_injection_bounds.py",
         "tests/test_lesson_tripwire_injection_bounds.py",
-        "tests/test_toolcall_repair_injection_bounds.py",
         "tests/test_deference_detector_injection_bounds.py",
         "tests/test_forum_hook_injection_bounds.py"
       ],
@@ -40,7 +39,6 @@
         "tests/test_stale_tree_pull_hook_injection_bounds.py",
         "tests/test_user_identity_hook_injection_bounds.py",
         "tests/test_lesson_tripwire_injection_bounds.py",
-        "tests/test_toolcall_repair_injection_bounds.py",
         "tests/test_deference_detector_injection_bounds.py",
         "tests/test_forum_hook_injection_bounds.py",
         "tests/test_forum_hook.py"
@@ -243,14 +241,6 @@
         "tests/test_codex_hook_envelopes.py",
         "tests/test_tier_build_filter.py"
       ]
-    },
-    {
-      "path_prefix_or_glob": "hooks/claude/engram-toolcall-repair.py",
-      "test_globs": [
-        "tests/test_add_observation_payload.py",
-        "tests/test_toolcall_repair_injection_bounds.py"
-      ],
-      "note": "toolcall-repair is exercised in test_add_observation_payload (antml repair path). engram-alpha#2863 WS2 batch C: test_toolcall_repair_injection_bounds.py added -- drives this hook's new emit_context() migration end-to-end (same dynamic-load invisibility as this file's existing entry)."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-user-identity-hook.py",
