@@ -18,6 +18,7 @@ Covers (spec, Piece 4's minimum list):
 Plus: extract_spans.py end-to-end (spans + key.jsonl content), and a smoke
 test of analyze.py's O1 pooled arm-difference + O2 wiring.
 """
+import hashlib
 import json
 import os
 import sqlite3
@@ -1184,6 +1185,166 @@ class ErrorAndNaRowCountingTests(unittest.TestCase):
             ws4_analyze._print_report(o1_headline_c, o1_k_sweep_c, length_control_c, o2_c, denominators_c)
         output_c = buf_c.getvalue()
         self.assertIn("error rows (arm unknown; in no O1/O2/length table): 0", output_c)
+
+
+class SampleAmendment3Tests(unittest.TestCase):
+    """Amendment 3 (#2753), adopted by Kepler 2026-09-27 18:47Z: per seat per
+    UTC day, at most N chain+control fires are adjudicated -- the sample is
+    the N fires with the lowest sha256(f"{sample_seed}:{fire_id}") hex
+    digest. fire_id carries no arm and the arm draw uses a different seed
+    (ledger.compute_fire_id's own docstring), so the sample is arm-blind by
+    construction. Every unsampled fire is still counted."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tmp_path = Path(self.tmp.name)
+
+    def _make_row(self, idx, arm, shown_lesson_ids=None):
+        records = [
+            _assistant_tool_use(0, f"toolu_fire_{idx}", "Bash", {"command": "ls"}, "2026-09-28T00:00:00Z"),
+            _tripwire_attachment(f"toolu_fire_{idx}", NUDGE_BLOCK, "2026-09-28T00:00:00Z"),
+            _assistant_tool_use(2, f"toolu_after_{idx}", "Bash", {"command": "echo hi"}, "2026-09-28T00:00:01Z"),
+        ]
+        transcript_path = self.tmp_path / f"t_{idx}.jsonl"
+        _write_jsonl(transcript_path, records)
+        shown = shown_lesson_ids if shown_lesson_ids is not None else ["lesson-fixture-A"]
+        return {
+            "ts": float(idx), "ts_iso": "2026-09-28T00:00:00Z", "session_id": f"s{idx}",
+            "transcript_path": str(transcript_path), "tool_name": "Bash",
+            "tool_use_id": f"toolu_fire_{idx}", "nonce": f"toolu_fire_{idx}",
+            "draw_basis": "tool_use_id", "seed": "abc", "arm": arm,
+            "shown_lesson_ids": shown, "cut_lesson_ids": [],
+            "heads_by_lesson": {lid: ["head-fixture-1"] for lid in shown},
+            "nudge_chars": len(NUDGE_BLOCK), "chain_chars": 0, "chain_rendered": False,
+        }
+
+    def _write_ledger(self, rows, name="ledger.jsonl"):
+        ledger_path = self.tmp_path / name
+        write_jsonl(ledger_path, rows)
+        return ledger_path
+
+    def test_25_eligible_n10_yields_10_spans_and_correct_sample_file(self):
+        rows = [self._make_row(i, "chain" if i % 2 == 0 else "control") for i in range(25)]
+        ledger_path = self._write_ledger(rows)
+        out_dir = self.tmp_path / "out"
+
+        report = ws4_extract_spans.run("2026-09-28", 3, str(out_dir), str(ledger_path))
+
+        self.assertEqual(report["eligible"], 25)
+        self.assertEqual(report["sampled"], 10)
+        self.assertEqual(report["spans_out"], 10)
+
+        key_rows = load_jsonl(out_dir / "key.jsonl")
+        self.assertEqual(len(key_rows), 10)
+
+        sample_rows = load_jsonl(out_dir / "sample.jsonl")
+        self.assertEqual(len(sample_rows), 25)
+        sampled_ids = {r["fire_id"] for r in sample_rows if r["sampled"]}
+        self.assertEqual(len(sampled_ids), 10)
+
+        # Independently compute the 10 lowest hashes in the test itself.
+        expected = sorted(
+            (
+                hashlib.sha256(f"{ws4_constants.SAMPLE_SEED}:{compute_fire_id(r)}".encode("utf-8")).hexdigest(),
+                compute_fire_id(r),
+            )
+            for r in rows
+        )
+        expected_sampled_ids = {fid for _digest, fid in expected[:10]}
+        self.assertEqual(sampled_ids, expected_sampled_ids)
+
+    def test_arm_blindness_swap_chain_and_control_yields_identical_sample(self):
+        rows = [self._make_row(i, "chain" if i % 2 == 0 else "control") for i in range(25)]
+        swapped = [dict(r, arm=("control" if r["arm"] == "chain" else "chain")) for r in rows]
+
+        ledger_path_a = self._write_ledger(rows, "ledger_a.jsonl")
+        out_dir_a = self.tmp_path / "out_a"
+        ws4_extract_spans.run("2026-09-28", 3, str(out_dir_a), str(ledger_path_a))
+        sample_a = load_jsonl(out_dir_a / "sample.jsonl")
+        sampled_ids_a = {r["fire_id"] for r in sample_a if r["sampled"]}
+
+        ledger_path_b = self._write_ledger(swapped, "ledger_b.jsonl")
+        out_dir_b = self.tmp_path / "out_b"
+        ws4_extract_spans.run("2026-09-28", 3, str(out_dir_b), str(ledger_path_b))
+        sample_b = load_jsonl(out_dir_b / "sample.jsonl")
+        sampled_ids_b = {r["fire_id"] for r in sample_b if r["sampled"]}
+
+        self.assertEqual(sampled_ids_a, sampled_ids_b)
+
+    def test_determinism_two_runs_identical_sample_and_seed_changes_sample(self):
+        rows = [self._make_row(i, "chain" if i % 2 == 0 else "control") for i in range(25)]
+        ledger_path = self._write_ledger(rows)
+
+        out_dir_1 = self.tmp_path / "out1"
+        ws4_extract_spans.run("2026-09-28", 3, str(out_dir_1), str(ledger_path))
+        out_dir_2 = self.tmp_path / "out2"
+        ws4_extract_spans.run("2026-09-28", 3, str(out_dir_2), str(ledger_path))
+
+        sample_1 = load_jsonl(out_dir_1 / "sample.jsonl")
+        sample_2 = load_jsonl(out_dir_2 / "sample.jsonl")
+        self.assertEqual(sample_1, sample_2)
+
+        out_dir_3 = self.tmp_path / "out3"
+        ws4_extract_spans.run(
+            "2026-09-28", 3, str(out_dir_3), str(ledger_path),
+            sample_seed="a-different-published-seed-000000",
+        )
+        sample_3 = load_jsonl(out_dir_3 / "sample.jsonl")
+        sampled_1 = {r["fire_id"] for r in sample_1 if r["sampled"]}
+        sampled_3 = {r["fire_id"] for r in sample_3 if r["sampled"]}
+        self.assertNotEqual(sampled_1, sampled_3)
+
+    def test_n_larger_than_eligible_samples_everything(self):
+        rows = [self._make_row(i, "chain") for i in range(3)]
+        ledger_path = self._write_ledger(rows)
+        out_dir = self.tmp_path / "out"
+        report = ws4_extract_spans.run("2026-09-28", 3, str(out_dir), str(ledger_path))
+        self.assertEqual(report["eligible"], 3)
+        self.assertEqual(report["sampled"], 3)
+        sample_rows = load_jsonl(out_dir / "sample.jsonl")
+        self.assertTrue(all(r["sampled"] for r in sample_rows))
+
+    def test_sample_zero_samples_everything_old_behaviour(self):
+        rows = [self._make_row(i, "chain" if i % 2 == 0 else "control") for i in range(25)]
+        ledger_path = self._write_ledger(rows)
+        out_dir = self.tmp_path / "out"
+        report = ws4_extract_spans.run("2026-09-28", 3, str(out_dir), str(ledger_path), sample_n=0)
+        self.assertEqual(report["eligible"], 25)
+        self.assertEqual(report["sampled"], 25)
+        self.assertEqual(report["spans_out"], 25)
+        sample_rows = load_jsonl(out_dir / "sample.jsonl")
+        self.assertTrue(all(r["sampled"] for r in sample_rows))
+
+    def test_per_lesson_composition_multi_lesson_and_no_lesson_fire(self):
+        rows = [
+            self._make_row(0, "chain", shown_lesson_ids=["lesson-fixture-A", "lesson-fixture-B"]),
+            self._make_row(1, "control", shown_lesson_ids=[]),
+            self._make_row(2, "chain", shown_lesson_ids=["lesson-fixture-A"]),
+        ]
+        ledger_path = self._write_ledger(rows)
+        out_dir = self.tmp_path / "out"
+        # sample_n larger than eligible so composition is fully deterministic
+        # regardless of hash order (every fire is sampled).
+        ws4_extract_spans.run("2026-09-28", 3, str(out_dir), str(ledger_path), sample_n=10)
+        summary = json.loads((out_dir / "sample_summary.json").read_text(encoding="utf-8"))
+        per_lesson = summary["per_lesson"]
+        self.assertEqual(per_lesson["lesson-fixture-A"], {"eligible": 2, "sampled": 2})
+        self.assertEqual(per_lesson["lesson-fixture-B"], {"eligible": 1, "sampled": 1})
+        self.assertEqual(per_lesson["(none)"], {"eligible": 1, "sampled": 1})
+
+    def test_no_arm_field_anywhere_in_sample_files(self):
+        rows = [self._make_row(i, "chain" if i % 2 == 0 else "control") for i in range(25)]
+        ledger_path = self._write_ledger(rows)
+        out_dir = self.tmp_path / "out"
+        ws4_extract_spans.run("2026-09-28", 3, str(out_dir), str(ledger_path))
+
+        sample_rows = load_jsonl(out_dir / "sample.jsonl")
+        for row in sample_rows:
+            self.assertNotIn("arm", row)
+
+        summary_text = (out_dir / "sample_summary.json").read_text(encoding="utf-8")
+        self.assertNotIn('"arm"', summary_text)
 
 
 if __name__ == "__main__":
