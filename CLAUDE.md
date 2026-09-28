@@ -1632,14 +1632,19 @@ incident below).
 3. **No commit-message auto-close** (always): `closingIssuesReferences` reads
    the PR BODY only — a merge commit's own message is a THIRD close surface
    GitHub's parser reads independently, invisible to checks 1 and 2. **This
-   repo's exposure is currently LOWER than umwelt's, and say so precisely:**
-   engram-alpha's `squash_merge_commit_message` is `BLANK` (measured
-   2026-08-22 — three real recent squash merges carry no branch-commit
-   content, only PR title + co-author lines), so branch commit messages do
-   NOT ride into the merge commit here today. The check stays anyway, as
+   repo's exposure is currently LOWER than umwelt's and soma's, and say so
+   precisely:** engram-alpha's `squash_merge_commit_message` is `BLANK`
+   (measured 2026-08-22 — three real recent squash merges carry no
+   branch-commit content, only PR title + co-author lines; the setting
+   re-read `BLANK` on 2026-09-03 and 2026-09-28), so branch commit messages
+   do NOT ride into the merge commit here today. The check stays anyway, as
    defense-in-depth against the three ways the exposure appears without any
    code change: a repo-settings flip to `COMMIT_MESSAGES` (silent, and
-   exactly what makes umwelt exposed), a merger hand-editing the squash
+   exactly what makes **umwelt and soma** exposed — both read
+   `COMMIT_MESSAGES`, measured 2026-09-03 and re-read 2026-09-28 via
+   `gh api repos/engram-agents/<repo> --jq .squash_merge_commit_message`;
+   a seat reading only "umwelt" here would skip the commit-message grep on
+   a soma PR), a merger hand-editing the squash
    message at merge time, and copy-paste of commit text into a PR body.
    The incident that makes this real is umwelt#674/#632 (2026-08-22): empty
    array there, merge concluded safe, the issue closed **by the commit**,
