@@ -607,7 +607,7 @@ one above — revision 1 conflated the two.
 | write-capable `PRAGMA` | authorizer denies action 19 | P6, P13; ⚠ see the caveat below |
 | stacked statements | the owner uses `execute()`, which refuses them, and **never** calls `executescript`; no statement built by concatenation | P11 refused, **P12** permits — hence the rule |
 | a template matching only because of its parameters | **DOES apply** at a virtual-table boundary | **P14** — §3.5 |
-| **resource exhaustion** (fifth) | **three bounds on three axes, none sufficient alone** (revision 5): a `progress_handler` bounds VM-instruction cost; `SQLITE_LIMIT_LENGTH` bounds the size of any **single** string, blob or row (not total memory); **one end-to-end request deadline** bounds wall clock across frame I/O | reviewer (cartesian, `zeroblob`); me (per-op socket timeout, `setlimit`) — see below |
+| **resource exhaustion** (fifth) | **three bounds on three axes, none sufficient alone** (revision 5): a `progress_handler` bounds VM-instruction cost; `SQLITE_LIMIT_LENGTH` bounds the size of any **single** string, blob or row (not total memory); **one end-to-end request deadline** bounds wall clock across frame I/O and execution | reviewer (cartesian, `zeroblob`); me (per-op socket timeout, `setlimit`) — see below |
 
 ⚠ **The `PRAGMA` caveat, and revision 1's remedy for it was unsafe.** The authorizer sees
 `SQLITE_PRAGMA` for *every* pragma, read-only ones included, so denying the code denies harmless
@@ -662,6 +662,22 @@ to every other client on the seat. Borges found the class on U1; the Darwin numb
 > response delivery. A per-socket-call timeout is **not** this requirement. A trickling peer must fail
 > within the total budget; a silent peer is the control; a subsequent client must still be serviced.
 
+**The deadline covers execution for every client-facing method, not only framing — including
+`snapshot`.** The budget may differ by method, chosen once the method is parsed, but it is always
+measured from accept, never resets, and is always a named finite number; "no budget for internal
+operations" is not an allowed value. On overrun the owner stops the **work**, not merely the wait: no
+success response, the lock is released, the destination is left untouched — a pre-existing file stays
+byte-for-byte identical and an absent one stays absent — no partial file is left anywhere, and a
+subsequent client is served. The owner stages the backup into a temporary file in the destination's own
+directory, created exclusively; on success it is made durable (fsync) then atomically swapped in for the
+destination via `os.replace`, and on abort or any failure only the temp file is removed. This is what
+keeps the promise: readers such as viz, health snapshots and the sleep backup may re-read a fixed path,
+and must never see a half-written file. Overrun is tolerated up to one step of whatever stop mechanism is
+used. The implementation names that step (for example, a `backup()` page count or a progress-callback
+cadence) and states its maximum wall time; that stated figure, not an open-ended "one step", is the
+allowance. The stop mechanism itself is left to the builder. (Found by Mira's security pre-review on
+#3194.)
+
 Two implementation traps, both measured on this fleet and both easy to walk into. The load-bearing
 element is **`min(per-op cap, time remaining)`** on every blocking call, not a check between calls — a
 naive "remaining time as the timeout" ran 101 s against a 3 s budget. And **a read primitive that loops
@@ -709,7 +725,9 @@ Contract-first — each test names the mutation that must turn it red.
     the authorizer's return. *Mutation: drop the `arg2 is None` clause — must go red.* (P16.)
 12. **A deliberately expensive read is aborted by the deadline**, and a cheap read is not. *Mutation:
     remove the `progress_handler` — the expensive read must then complete.* ⚠ This bounds
-    **VM-instruction cost only**; tests 19 and 20 cover the other two axes (§4).
+    **VM-instruction cost only**; tests 19 and 20 cover the other two axes (§4). The `progress_handler`
+    must stop against the **same** request deadline, passed in — not an independent timer or constant —
+    so shortening the request deadline must shorten the abort point.
 13. **A tier-2 read spec with an undeclared field or operator → `Rejected(invalid_read_spec)`**, and
     the emitted SQL is built by the owner, never taken from the caller.
 14. **A site that is neither a readable literal nor a declared typed operation fails the BUILD.**
@@ -746,6 +764,20 @@ Contract-first — each test names the mutation that must turn it red.
 20. **One end-to-end request deadline.** A peer trickling bytes fails within the **total** budget; a
     silent peer is the control; a **subsequent** client is serviced afterwards. *Mutation: replace the
     end-to-end deadline with a per-socket-call timeout — the trickling peer must then exceed the budget.*
+
+    **20b. A `snapshot()` that cannot finish inside its budget is aborted, and the lock is released.**
+    Use a small constructor budget, or a store slow enough that no small budget is generous; do not
+    inject a sleep into the owner. The test names the chosen stop step (for example, `backup()` page
+    count or progress-callback cadence) and measures or bounds its wall-time allowance; by
+    `deadline + that stated allowance`, assert: no success
+    response; an absent destination stays absent and a pre-existing destination (with a sentinel row) is
+    byte-identical by sha256; no temp file remains in the directory; a **second** `snapshot()` that fits
+    its own budget then succeeds within it — this is the lock-release proof, not a `ping` (`ping` never
+    takes `_store_lock`). *Mutation (a): restore the U3 shape — the deadline checked only after dispatch
+    returns. Test 20b must go red; test 20 must stay green.* *Mutation (b): abort the work but leak the
+    lock (skip the release on the abort path). The second `snapshot()` must then time out and test 20b
+    must go red, while a `ping`-only check would stay green.* *Mutation (c): back up straight into `dest`
+    and `unlink` it on abort (the U3 shape) — the pre-existing-destination case must go red.*
 21. **Virtual-table templates get no implicit safety at registration.** Negative cases: `docs = ?` on an
     FTS5 table and `k = ?` on vec0 must each be REFUSED implicit safe status, while `notes = ?` on an
     ordinary table is admitted. *Mutation: classify placeholders by operator spelling alone — both
@@ -756,7 +788,7 @@ Contract-first — each test names the mutation that must turn it red.
     authorizer, so it isolates routing from the floor (test 7) instead of re-testing it.
 
 **Overall discrimination control:** replace the authorizer with an allow-all and delete the registry
-lookup, together. Tests 6, 7, 11, 15 and 16 must go red; 1–5, 8–10, 17 and 19–22 must stay green.
+lookup, together. Tests 6, 7, 11, 15 and 16 must go red; 1–5, 8–10, 17, 19–22 and 20b must stay green.
 Test 21 stays green because registration-time classification is a separate mechanism from request-time
 lookup — which is itself the property this control exists to show. Two independent
 mechanisms failing must show as two independent failures — if one mutation reds everything, the layers
@@ -799,7 +831,7 @@ important thing the review produced.
 | **The parent's "only open handle" wording** (§3.1) | `docs/2652-engrammanager-design.md:677` literally says one handle; (b) is two. Read as process-scoped by both author and reviewer — but **the words need clarifying by that document's owner**, and this slice does not edit it. |
 | **vec0 detection at registration** (§3.5) | The rule is decided. Detection is measured for FTS5 (author, Darwin) and for vec0 on one runtime (Mira: Linux, SQLite 3.45.1, sqlite-vec 0.1.9 — direct, alias and view all surface). Not established for every module or platform. The schema route is authoritative; the token-match backstop can miss quoting or view indirection, so it is not a never-under-deny guarantee, and incomplete classification fails closed. |
 | **How incomplete classification is DETECTED** (§3.5) | Owed by U4, and it must be **measured**, not asserted. "Fails closed" is only as good as the check that notices a classification is incomplete; the build must show a template whose reads the audit cannot fully account for, and show that registration denies it. (Mira, at approval.) |
-| **Two new budgets with no number** (§4) | `SQLITE_LIMIT_LENGTH` and the end-to-end request deadline both need values chosen against the owner contract (§8). |
+| **Two new budgets with no number** (§4) | `SQLITE_LIMIT_LENGTH` and the end-to-end request deadline — including its per-method variant for `snapshot` — both need values chosen against the owner contract (§8). |
 | **Tier 2 is DEFERRED, not designed** (§3.2) | U4's own surface is 21/21 byte-stable, so tier 2 is off its path. Outline only; it gets specified by the unit that needs it. Deferring it is deliberate — revision 2 specified it speculatively and that was the larger error of the two in §3.2. |
 | **The authorizer's action allowlist is an OBLIGATION, not a finished list** (§3.1) | Owed by U4: derive it from the census plus the owner's operations, and check every denied action for a caller that swallows the denial. `SQLITE_TRANSACTION` is the first known member, not the last. |
 | **The Linux peer-credential arm is UNMEASURED by me** (§2.2) | **Partly measured by the reviewer in revision 5** — a same-uid `SO_PEERCRED` read, 12 bytes, correct decode (§6). The foreign-uid rejection is measured by no one. Needs a first-hand run on a Linux seat before U4 builds. Documented is not measured — the whole of §1 exists because that distinction has cost this fleet real rounds. |
@@ -817,7 +849,8 @@ important thing the review produced.
   as #3095's call-path walk and should reuse it rather than grow a second instrument with its own
   blind spots — and #3095's walk is also what could classify §3.2's 37 unclassifiable sites.
 - **Three budgets have no number** — the `progress_handler` deadline, `SQLITE_LIMIT_LENGTH`, and the
-  end-to-end request deadline. Each needs measuring against real reads and real frames, not choosing.
+  end-to-end request deadline (including its per-method variant for `snapshot`). Each needs measuring
+  against real reads and real frames, not choosing.
 
 ## 9. What changed, revision by revision, and who found it
 
@@ -829,6 +862,7 @@ Recorded because a reader should be able to see which parts survived attack.
 |---|---|---|
 | §3.5, §7 | **"Never under-deny" withdrawn** for the token-match fallback: a lexical match can miss quoting or view indirection. The audited schema route is authoritative, and incomplete classification fails closed. Mira's Linux vec0 control folded into the scope note. §7 gains an open item: the build must measure how incomplete classification is detected. | Mira (claim, vec0 control, open item) |
 | §4, §5 | **`SQLITE_LIMIT_LENGTH` scoped precisely**: it caps a single string, blob or row, not aggregate memory. Table row, prose and test 19's title corrected. | Mira |
+| §4, §5, §7, §8 | **Deadline scope extended to cover execution, not only framing.** `snapshot()` runs under the same monotonic end-to-end deadline, as a per-method budget chosen once the method is parsed; on overrun the owner stops the work rather than the wait — no success response, lock released, destination left untouched. Test 12 requires the `progress_handler` to share the request deadline rather than an independent timer; test 20b added, with the lock-release proof restated as a second `snapshot()`, not a `ping`. Stop-step allowance must be named and bounded by the test, not left open-ended. Snapshot destination staged and atomically replaced; abort leaves a pre-existing destination byte-identical (it previously read as deleting it). | Mira (security pre-review, #3194); Borges (ruling); Mira (stop-step bound, PR #3200 security read); Mira (destination deletion, #3201 security read) |
 
 ### Revision 5 — answering Mira's review at `0d3aecf8`
 
