@@ -918,7 +918,10 @@ class FlagsRequiredTests(unittest.TestCase):
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            rc = ws4_analyze.main(self._argv(["--no-flags"]))
+            # --no-sample-summary: this test's argv predates amendment 3's
+            # --sample-summary/--no-sample-summary required choice, and
+            # doesn't exercise it -- added only so main() doesn't error out.
+            rc = ws4_analyze.main(self._argv(["--no-flags", "--no-sample-summary"]))
         self.assertEqual(rc, 0)
         output = buf.getvalue()
         self.assertIn("WARNING", output)
@@ -934,7 +937,9 @@ class FlagsRequiredTests(unittest.TestCase):
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            rc = ws4_analyze.main(self._argv(["--no-flags"]))
+            # --no-sample-summary: same as above, added only for the new
+            # required choice, not under test here.
+            rc = ws4_analyze.main(self._argv(["--no-flags", "--no-sample-summary"]))
         self.assertEqual(rc, 0)
         output = buf.getvalue()
         self.assertIn("per-fire", output)
@@ -1345,6 +1350,339 @@ class SampleAmendment3Tests(unittest.TestCase):
 
         summary_text = (out_dir / "sample_summary.json").read_text(encoding="utf-8")
         self.assertNotIn('"arm"', summary_text)
+
+
+class SampleReportComputeTests(unittest.TestCase):
+    """engram-alpha#2753, Kepler's amendment-3 ruling (2026-09-27 18:47Z):
+    analyze.py's compute_sample_report() aggregates a seat's
+    sample_summary.json files (one per UTC day) into per-seat totals,
+    per-lesson composition (summed over days), a per-day breakdown sorted
+    by date, and a pooled total across seats."""
+
+    def _summary(self, date, sample_n, sample_seed, eligible, sampled, per_lesson):
+        return {
+            "date": date, "sample_n": sample_n, "sample_seed": sample_seed,
+            "eligible": eligible, "sampled": sampled, "per_lesson": per_lesson,
+        }
+
+    def test_two_seats_multi_day_sums_fraction_per_day_per_lesson_pooled(self):
+        # Seat-A: three day-files, deliberately out of date order, to check
+        # per_day is sorted by date rather than input order.
+        seat_a_summaries = [
+            self._summary(
+                "2026-09-01", 10, "seed-a", 20, 10,
+                {"lesson-fixture-A": {"eligible": 12, "sampled": 6}, "lesson-fixture-B": {"eligible": 8, "sampled": 4}},
+            ),
+            self._summary("2026-09-03", 10, "seed-a", 15, 10, {"lesson-fixture-A": {"eligible": 15, "sampled": 10}}),
+            self._summary("2026-09-02", 10, "seed-a", 5, 5, {"lesson-fixture-B": {"eligible": 5, "sampled": 5}}),
+        ]
+        # Seat-B: two day-files.
+        seat_b_summaries = [
+            self._summary("2026-09-01", 10, "seed-b", 8, 8, {"lesson-fixture-C": {"eligible": 8, "sampled": 8}}),
+            self._summary("2026-09-02", 10, "seed-b", 12, 6, {"lesson-fixture-C": {"eligible": 12, "sampled": 6}}),
+        ]
+        seat_a = ws4_analyze.SeatInputs(
+            seat="seat-A", ledger_rows=[], key={}, verdicts={}, flags={}, sample_summaries=seat_a_summaries,
+        )
+        seat_b = ws4_analyze.SeatInputs(
+            seat="seat-B", ledger_rows=[], key={}, verdicts={}, flags={}, sample_summaries=seat_b_summaries,
+        )
+
+        report = ws4_analyze.compute_sample_report([seat_a, seat_b])
+
+        seat_a_report = report["per_seat"]["seat-A"]
+        self.assertEqual(seat_a_report["days"], 3)
+        self.assertEqual(seat_a_report["eligible"], 40)
+        self.assertEqual(seat_a_report["sampled"], 25)
+        self.assertAlmostEqual(seat_a_report["sampled_fraction"], 25 / 40)
+        self.assertEqual(
+            [d["date"] for d in seat_a_report["per_day"]],
+            ["2026-09-01", "2026-09-02", "2026-09-03"],
+        )
+        self.assertEqual(seat_a_report["per_lesson"]["lesson-fixture-A"], {"eligible": 27, "sampled": 16})
+        self.assertEqual(seat_a_report["per_lesson"]["lesson-fixture-B"], {"eligible": 13, "sampled": 9})
+        self.assertFalse(seat_a_report["config_changed"])
+
+        seat_b_report = report["per_seat"]["seat-B"]
+        self.assertEqual(seat_b_report["days"], 2)
+        self.assertEqual(seat_b_report["eligible"], 20)
+        self.assertEqual(seat_b_report["sampled"], 14)
+        self.assertAlmostEqual(seat_b_report["sampled_fraction"], 14 / 20)
+
+        pooled = report["pooled"]
+        self.assertEqual(pooled["eligible"], 60)
+        self.assertEqual(pooled["sampled"], 39)
+        self.assertAlmostEqual(pooled["sampled_fraction"], 39 / 60)
+
+    def test_zero_eligible_fraction_is_none_not_zero_division(self):
+        summaries = [self._summary("2026-09-01", 10, "seed-a", 0, 0, {})]
+        seat = ws4_analyze.SeatInputs(
+            seat="seat-fixture", ledger_rows=[], key={}, verdicts={}, flags={}, sample_summaries=summaries,
+        )
+        report = ws4_analyze.compute_sample_report([seat])
+        self.assertIsNone(report["per_seat"]["seat-fixture"]["sampled_fraction"])
+        self.assertIsNone(report["pooled"]["sampled_fraction"])
+
+
+class SampleConfigChangedTests(unittest.TestCase):
+    """Amendment 3 forbids changing sample_n/sample_seed mid-window: a
+    seat whose summaries carry more than one distinct sample_n or
+    sample_seed must be reported loudly (config_changed=True plus the
+    distinct values seen) and print a WARNING line -- never silently
+    averaged over."""
+
+    def _summary(self, date, sample_n, sample_seed, eligible=5, sampled=5):
+        return {
+            "date": date, "sample_n": sample_n, "sample_seed": sample_seed,
+            "eligible": eligible, "sampled": sampled, "per_lesson": {},
+        }
+
+    def test_two_different_sample_n_values_flags_config_changed(self):
+        summaries = [
+            self._summary("2026-09-01", 10, "seed-a"),
+            self._summary("2026-09-02", 15, "seed-a"),
+        ]
+        seat = ws4_analyze.SeatInputs(
+            seat="seat-fixture", ledger_rows=[], key={}, verdicts={}, flags={}, sample_summaries=summaries,
+        )
+        report = ws4_analyze.compute_sample_report([seat])
+        seat_report = report["per_seat"]["seat-fixture"]
+        self.assertTrue(seat_report["config_changed"])
+        self.assertEqual(seat_report["sample_n_values"], [10, 15])
+
+    def test_stable_config_is_not_flagged(self):
+        summaries = [
+            self._summary("2026-09-01", 10, "seed-a"),
+            self._summary("2026-09-02", 10, "seed-a"),
+        ]
+        seat = ws4_analyze.SeatInputs(
+            seat="seat-fixture", ledger_rows=[], key={}, verdicts={}, flags={}, sample_summaries=summaries,
+        )
+        report = ws4_analyze.compute_sample_report([seat])
+        self.assertFalse(report["per_seat"]["seat-fixture"]["config_changed"])
+        self.assertNotIn("sample_n_values", report["per_seat"]["seat-fixture"])
+
+    def test_printed_report_shows_warning_line_for_config_changed_seat(self):
+        import contextlib
+        import io
+
+        summaries = [
+            self._summary("2026-09-01", 10, "seed-a"),
+            self._summary("2026-09-02", 20, "seed-a"),
+        ]
+        seat = ws4_analyze.SeatInputs(
+            seat="seat-fixture", ledger_rows=[], key={}, verdicts={}, flags={}, sample_summaries=summaries,
+        )
+        sample_report = ws4_analyze.compute_sample_report([seat])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ws4_analyze._print_sample_report(sample_report)
+        output = buf.getvalue()
+        self.assertIn("WARNING", output)
+        self.assertIn("seat-fixture", output)
+
+
+class SampleSummaryCliTests(unittest.TestCase):
+    """--sample-summary/--no-sample-summary CLI wiring (amendment 3): same
+    pairing/count validation as --ledger/--verdicts/--key; a glob matching
+    zero files fails loud naming the seat; the two flags are mutually
+    exclusive and (like --flags/--no-flags) one of them is required."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tmp_path = Path(self.tmp.name)
+        row = {
+            "ts": 1.0, "transcript_path": "x", "tool_use_id": "a", "nonce": "a",
+            "shown_lesson_ids": ["lesson-fixture-A"], "heads_by_lesson": {},
+        }
+        self.ledger_path = self.tmp_path / "ledger.jsonl"
+        write_jsonl(self.ledger_path, [row])
+        fire_id = compute_fire_id(row)
+        self.key_path = self.tmp_path / "key.jsonl"
+        write_jsonl(self.key_path, [{"fire_id": fire_id, "arm": "chain"}])
+        self.verdicts_path = self.tmp_path / "verdicts.jsonl"
+        write_jsonl(
+            self.verdicts_path,
+            [{"fire_id": fire_id, "adjudicator": "adj1", "verdict": "walked_past", "corrective_at": None, "note": ""}],
+        )
+
+    def _argv(self, extra):
+        return [
+            "--seat", "seat-fixture",
+            "--ledger", str(self.ledger_path),
+            "--verdicts", str(self.verdicts_path),
+            "--key", str(self.key_path),
+            "--no-flags",
+        ] + extra
+
+    def test_glob_matching_nothing_errors_naming_the_seat(self):
+        pattern = str(self.tmp_path / "does-not-exist" / "*" / "sample_summary.json")
+        with self.assertRaises(ValueError) as ctx:
+            ws4_analyze.load_sample_summaries(pattern, "seat-fixture")
+        self.assertIn("seat-fixture", str(ctx.exception))
+
+    def test_cli_glob_matching_nothing_is_a_fail_loud_error_naming_the_seat(self):
+        pattern = str(self.tmp_path / "does-not-exist" / "*" / "sample_summary.json")
+        with self.assertRaises(ValueError) as ctx:
+            ws4_analyze.main(self._argv(["--sample-summary", pattern]))
+        self.assertIn("seat-fixture", str(ctx.exception))
+
+    def test_no_sample_summary_runs_and_prints_warning(self):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = ws4_analyze.main(self._argv(["--no-sample-summary"]))
+        self.assertEqual(rc, 0)
+        output = buf.getvalue()
+        self.assertIn("WARNING", output)
+        self.assertIn("sample report", output)
+        self.assertNotIn("== Sample (amendment 3) ==", output)
+
+    def test_sample_summary_and_no_sample_summary_together_is_argparse_error(self):
+        summary_dir = self.tmp_path / "day1"
+        summary_dir.mkdir()
+        (summary_dir / "sample_summary.json").write_text(
+            json.dumps(
+                {"date": "2026-09-01", "sample_n": 10, "sample_seed": "s", "eligible": 1, "sampled": 1, "per_lesson": {}}
+            ),
+            encoding="utf-8",
+        )
+        pattern = str(summary_dir / "sample_summary.json")
+        with self.assertRaises(SystemExit):
+            ws4_analyze.main(self._argv(["--sample-summary", pattern, "--no-sample-summary"]))
+
+    def test_missing_sample_summary_and_missing_no_sample_summary_errors_out(self):
+        with self.assertRaises(SystemExit):
+            ws4_analyze.main(self._argv([]))
+
+    def test_full_report_prints_sample_section_with_real_glob(self):
+        import contextlib
+        import io
+
+        summary_dir = self.tmp_path / "2026-09-01"
+        summary_dir.mkdir()
+        (summary_dir / "sample_summary.json").write_text(
+            json.dumps({
+                "date": "2026-09-01", "sample_n": 10, "sample_seed": "s",
+                "eligible": 5, "sampled": 5, "per_lesson": {"lesson-fixture-A": {"eligible": 5, "sampled": 5}},
+            }),
+            encoding="utf-8",
+        )
+        pattern = str(self.tmp_path / "*" / "sample_summary.json")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = ws4_analyze.main(self._argv(["--sample-summary", pattern]))
+        self.assertEqual(rc, 0)
+        output = buf.getvalue()
+        self.assertIn("== Sample (amendment 3) ==", output)
+        self.assertIn("seat=seat-fixture", output)
+        self.assertIn("fraction=1.0", output)
+
+
+class UnlocatableByArmTests(unittest.TestCase):
+    """Unlocatable fires never get a key.jsonl row -- unlocatable_by_arm is
+    the only way to see whether location failures cluster in one arm.
+    Joins each unlocatable row's fire_id to an arm by recomputing
+    compute_fire_id() over the RAW ledger rows of ALL seats (never through
+    key.jsonl)."""
+
+    def _row(self, ts, tool_use_id, arm, transcript_path="x"):
+        return {
+            "ts": ts, "transcript_path": transcript_path, "tool_use_id": tool_use_id,
+            "nonce": tool_use_id, "arm": arm, "shown_lesson_ids": [], "heads_by_lesson": {},
+        }
+
+    def test_chain_control_and_one_unmatched_fire_id(self):
+        chain_row = self._row(1.0, "c1", "chain")
+        control_row = self._row(2.0, "k1", "control")
+        seat = ws4_analyze.SeatInputs(
+            seat="seat-fixture", ledger_rows=[chain_row, control_row], key={}, verdicts={}, flags={},
+        )
+
+        unlocatable_rows = [
+            {"fire_id": compute_fire_id(chain_row), "reason": "transcript_missing"},
+            {"fire_id": compute_fire_id(control_row), "reason": "transcript_missing"},
+            {"fire_id": "fire-does-not-exist-anywhere", "reason": "transcript_missing"},
+        ]
+        unlocatable_path = self._write_unlocatable(unlocatable_rows)
+
+        denominators = ws4_analyze.compute_denominators([seat], [str(unlocatable_path)])
+        self.assertEqual(denominators["unlocatable"], 3)
+        self.assertEqual(denominators["unlocatable_by_arm"], {"chain": 1, "control": 1, "unmatched": 1})
+
+    def test_join_spans_ledgers_of_all_seats(self):
+        chain_row_a = self._row(1.0, "c1", "chain", transcript_path="a")
+        control_row_b = self._row(2.0, "k1", "control", transcript_path="b")
+        seat_a = ws4_analyze.SeatInputs(seat="seat-A", ledger_rows=[chain_row_a], key={}, verdicts={}, flags={})
+        seat_b = ws4_analyze.SeatInputs(seat="seat-B", ledger_rows=[control_row_b], key={}, verdicts={}, flags={})
+
+        # control_row_b belongs to seat-B's ledger -- the unlocatable row
+        # under test carries no seat of its own, so the join must reach
+        # across BOTH seats' ledgers to resolve it.
+        unlocatable_rows = [{"fire_id": compute_fire_id(control_row_b), "reason": "x"}]
+        unlocatable_path = self._write_unlocatable(unlocatable_rows)
+
+        denominators = ws4_analyze.compute_denominators([seat_a, seat_b], [str(unlocatable_path)])
+        self.assertEqual(denominators["unlocatable_by_arm"], {"chain": 0, "control": 1, "unmatched": 0})
+
+    def test_none_when_unlocatable_paths_not_given(self):
+        seat = ws4_analyze.SeatInputs(seat="seat-fixture", ledger_rows=[], key={}, verdicts={}, flags={})
+        denominators = ws4_analyze.compute_denominators([seat])
+        self.assertIsNone(denominators["unlocatable_by_arm"])
+
+    def test_printed_next_to_unlocatable_total(self):
+        import contextlib
+        import io
+
+        chain_row = self._row(1.0, "c1", "chain")
+        seat = ws4_analyze.SeatInputs(seat="seat-fixture", ledger_rows=[chain_row], key={}, verdicts={}, flags={})
+        unlocatable_rows = [{"fire_id": compute_fire_id(chain_row), "reason": "x"}]
+        unlocatable_path = self._write_unlocatable(unlocatable_rows)
+
+        o1_headline = ws4_analyze.compute_o1([seat])
+        o1_k_sweep = ws4_analyze.compute_o1_k_sweep([seat])
+        length_control = ws4_analyze.compute_length_control([seat])
+        o2 = ws4_analyze.compute_o2([seat], None)
+        denominators = ws4_analyze.compute_denominators([seat], [str(unlocatable_path)])
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ws4_analyze._print_report(o1_headline, o1_k_sweep, length_control, o2, denominators)
+        output = buf.getvalue()
+        self.assertIn("unlocatable by arm:", output)
+        self.assertIn("'chain': 1", output)
+
+    def _write_unlocatable(self, rows):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "unlocatable.jsonl"
+        write_jsonl(path, rows)
+        return path
+
+
+class CosmeticFixesTests(unittest.TestCase):
+    """PR #3179 review, two cosmetic fixes: compute_denominators's
+    docstring no longer starts with a stray "...", and an `error` row with
+    no `error` key buckets as the literal string "(no error string)", not
+    the misleading "None"."""
+
+    def test_compute_denominators_docstring_does_not_start_with_ellipsis(self):
+        doc = ws4_analyze.compute_denominators.__doc__
+        self.assertIsNotNone(doc)
+        self.assertFalse(doc.lstrip().startswith("..."))
+
+    def test_error_row_with_no_error_key_buckets_as_no_error_string(self):
+        row = {
+            "ts": 1.0, "transcript_path": "x", "tool_use_id": "e1", "nonce": "e1",
+            "arm": "error", "shown_lesson_ids": [], "heads_by_lesson": {},
+        }
+        seat = ws4_analyze.SeatInputs(seat="seat-fixture", ledger_rows=[row], key={}, verdicts={}, flags={})
+        denominators = ws4_analyze.compute_denominators([seat])
+        self.assertIn("(no error string)", denominators["error_rows"]["by_error"])
+        self.assertNotIn("None", denominators["error_rows"]["by_error"])
 
 
 if __name__ == "__main__":
