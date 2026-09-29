@@ -86,6 +86,75 @@ Thread-per-connection (one thread per accepted connection) is this
 module's answer to contract item 9 ("one slow client does not block
 another") -- concurrency, not a bounded-wait argument; the design doc's
 own item 9 asks the build to say which.
+
+## Two connections, not one (#2652 Phase-1 Unit 4b, issue #3195)
+
+Per Mira's ruling in revision 5 of docs/2652-security-slice-design.md SS3.1
+("(b), two connections inside the one owner process"), this module holds
+TWO sqlite3 connections against the same `store_path`, never one:
+
+- `self._owner_conn` (was `self._store_conn` in U3) -- owner-internal.
+  Serves `snapshot()` and any future owner-internal operation. Client SQL
+  never dispatches onto it. Its authorizer (`_owner_internal_authorizer`
+  below) is deliberately PERMISSIVE, set explicitly rather than left
+  authorizer-less -- a placeholder for future owner-internal operations
+  that may need one, not a security boundary. **Not currently exercised
+  by any test**: `snapshot()`'s `.backup()` call never consults an
+  authorizer at all (measured; see "A measured, load-bearing surprise"
+  below), so this authorizer's own behavior is unfalsifiable by any test
+  in this build. (An earlier draft of this comment claimed the opposite
+  -- that this authorizer exists "for testability" -- which Mira's
+  review of PR #3221 measured false: removing the `set_authorizer` call
+  entirely leaves every test green. See
+  docs/2652-security-slice-design.md SS3.1 revision 6.)
+- `self._client_read_conn` -- the permanently restrictive connection.
+  Its authorizer (`_client_read_authorizer` below) is the measured
+  baseline floor (SS3.1, SS4) and is set ONCE at connection-open time in
+  `start()`, never swapped, toggled, or reset for any operation. **No
+  operation in this build dispatches a client SQL statement onto this
+  connection yet** -- that is U4c's job (the read-template registry) and
+  U4d's (wiring real clients). This build's job is the plumbing: the
+  connection exists, its authorizer is correct and tested
+  (`_ClientReadGate` below is the structurally-isolated object a future
+  client-facing read would call through), and nothing in `_dispatch()`
+  reaches it.
+
+## A measured, load-bearing surprise: `sqlite3.Connection.backup()` never
+## invokes the authorizer, on either side, at all
+
+Measured directly (see the PR body / fairy handoff for the full probe):
+with a DENY-ALL authorizer set on the source connection, `.backup()` still
+completes successfully with every row copied, and the authorizer callback
+is invoked ZERO times. This holds on both Python 3.9/sqlite 3.54.0 and
+Python 3.12/sqlite 3.53.4 -- it is the C-level backup API bypassing SQL
+statement preparation entirely (the authorizer fires only from
+`sqlite3_prepare`), not a version artifact. Consequence: denying
+`SQLITE_TRANSACTION` (or anything else) on `_owner_conn`'s authorizer has
+NO EFFECT on `_handle_snapshot()`'s current bare-`.backup()`-call shape --
+the snapshot succeeds regardless of what the authorizer says, because
+`.backup()` never asks it anything. This is flagged prominently in the
+fairy handoff as a spec/reality mismatch for test 17's literal mutation,
+per this build's escape valve, rather than silently worked around by
+adding new SQL-statement scope this unit's spec explicitly says does not
+apply to this file.
+
+## Resource bounds on the client-read connection (SS4: three axes, no one
+## of them sufficient alone)
+
+`_arm_read_deadline()` below installs a `progress_handler` that aborts
+once a caller-supplied ABSOLUTE `time.monotonic()` deadline has passed --
+bounding VM-instruction cost. `CLIENT_READ_LIMIT_LENGTH`, set via
+`conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, ...)` in `start()`, bounds the
+size of any single string/blob/row -- independently of the progress
+handler, which does not see allocation at all (SS4's own zeroblob
+control, reproduced in this build's test 19). The THIRD axis -- one
+end-to-end request deadline covering wall clock across framing and
+execution -- is U4a's (issue #3194 / PR #3201), not built here: no client
+dispatch operation exists yet to enforce it against.  `_arm_read_deadline`
+is designed so that whichever deadline U4a eventually computes can be
+passed straight through as its `deadline` parameter -- the mechanism does
+not care where the number came from, and must never own an independent
+timer or module constant in its place.
 """
 
 from __future__ import annotations
@@ -172,11 +241,204 @@ def _rejected_wire(rejected: ec.Rejected) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# The client-read connection's authorizer floor (#2652 Phase-1 Unit 4b,
+# issue #3195) -- docs/2652-security-slice-design.md SS3.1, SS4.
+# ---------------------------------------------------------------------------
+
+# Baseline allowlist, DERIVED by measurement rather than copied verbatim
+# from the design doc's own cited names (see the module docstring's "A
+# measured..." section and the fairy handoff / PR body for the full
+# measurement output). A representative SELECT against ENGRAM's real
+# nodes/edges schema (a WHERE clause, a LIKE predicate, a projection
+# touching several columns) was run under an AUDITING authorizer that
+# logs every action_code it is asked about, against a fixture DB built
+# from the real DDL (src/engram/engram_core.py's `CREATE TABLE nodes` /
+# `CREATE TABLE edges`). Only three actions fired: SQLITE_SELECT,
+# SQLITE_READ (once per column touched), and SQLITE_FUNCTION (LIKE's
+# implicit function call). Nothing beyond these three fired for an
+# ordinary read; if a future caller's read pattern fires something else,
+# that is real information to report, not a signal to silently widen this
+# allowlist.
+CLIENT_READ_ALWAYS_ALLOWED_ACTIONS = frozenset(
+    {
+        sqlite3.SQLITE_SELECT,
+        sqlite3.SQLITE_READ,
+        sqlite3.SQLITE_FUNCTION,
+    }
+)
+
+# No real caller is wired to a pragma yet -- this build adds no client
+# dispatch path at all (see the module docstring's "Two connections"
+# section). `user_version` is kept as the one harmless read-only pragma
+# with an obvious future use (a census / health-check probe of the
+# store's schema version). Add more names here only once a real caller
+# needs them, through the same measurement discipline as the baseline
+# above -- this is a builder's-call design choice, not a measured set.
+CLIENT_READ_PRAGMA_ALLOWLIST = frozenset({"user_version"})
+
+
+def _client_read_authorizer(action_code, arg1, arg2, db_name, trigger_or_view):
+    """The restrictive floor -- set ONCE on `_client_read_conn` at
+    connection-open time in `start()` and NEVER swapped, toggled, or reset
+    for any operation (docs/2652-security-slice-design.md SS3.1, Mira's
+    revision-5 ruling: "no authorizer swapping"). Allows the measured
+    baseline read action set; denies everything else, with two explicit,
+    measured exceptions for PRAGMA and TRANSACTION below."""
+    if action_code in CLIENT_READ_ALWAYS_ALLOWED_ACTIONS:
+        return sqlite3.SQLITE_OK
+
+    if action_code == sqlite3.SQLITE_PRAGMA:
+        # P16 (docs/2652-security-slice-design.md SS4, quoted in the fairy
+        # spec): a naive "allow by name at arg1" lets a PRAGMA WRITE
+        # through, because arg1 carries the pragma's NAME for both a read
+        # and a write -- only arg2 (the assigned value) distinguishes
+        # them, and it is None for a read. Deny outright whenever arg2 is
+        # not None, REGARDLESS of whether arg1 is allowlisted -- test 11's
+        # mutation (dropping this clause) exists to catch exactly this
+        # ordering regressing.
+        if arg2 is not None:
+            return sqlite3.SQLITE_DENY
+        if arg1 in CLIENT_READ_PRAGMA_ALLOWLIST:
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+
+    if action_code == sqlite3.SQLITE_TRANSACTION:
+        # A bare autocommit SELECT never needs a transaction, so the
+        # client-read connection never allows one "just in case". (An
+        # earlier draft of this comment justified the denial by contrast
+        # with the owner-internal connection allowing SQLITE_TRANSACTION
+        # for snapshot()'s BEGIN DEFERRED read-mark -- that read-mark
+        # never existed on this build's snapshot() RPC; see
+        # docs/2652-security-slice-design.md SS3.1 revision 6.)
+        return sqlite3.SQLITE_DENY
+
+    return sqlite3.SQLITE_DENY
+
+
+def _owner_internal_authorizer(action_code, arg1, arg2, db_name, trigger_or_view):
+    """Set explicitly on `_owner_conn` -- PERMISSIVE (allows everything)
+    BY DESIGN, not left authorizer-less. This callback is NOT a security
+    boundary -- `_client_read_authorizer` above is where that boundary
+    lives; this one is a placeholder for future owner-internal
+    operations.
+
+    NOT exercised by any test in this build: `snapshot()`'s `.backup()`
+    call never consults an authorizer at all (measured -- see "A
+    measured, load-bearing surprise" in the module docstring), so this
+    callback's own behavior is currently unfalsifiable. (Mira's review of
+    PR #3221 measured this directly: removing this `set_authorizer` call
+    entirely leaves every test green. An earlier version of this
+    docstring claimed the opposite -- that this authorizer was needed to
+    make test 17 falsifiable -- which was true only under the design
+    doc's now-retracted BEGIN/READ/COMMIT requirement; see
+    docs/2652-security-slice-design.md SS3.1 revision 6.)"""
+    return sqlite3.SQLITE_OK
+
+
+# ---------------------------------------------------------------------------
+# Resource bounds on the client-read connection (SS4: three axes, no one
+# of them sufficient alone -- see the module docstring's "Resource
+# bounds" section for the full reasoning).
+# ---------------------------------------------------------------------------
+
+# Measured (see the PR body / fairy handoff for the full measurement
+# output): against a fixture DB built from ENGRAM's real nodes/edges
+# schema, an expensive WITH RECURSIVE query (~0.3s unbounded) aborted
+# within single-digit microseconds of its deadline at candidate n=100,
+# 500, and 1000 alike; a cheap single-row SELECT showed no measurable
+# overhead at any of the three. 1000 is chosen for the lowest
+# per-instruction-check overhead on a legitimate long read, since all
+# three candidates were otherwise indistinguishable at this query's
+# instruction density.
+PROGRESS_HANDLER_INSTRUCTION_COUNT = 1000
+
+# Measured (see the PR body / fairy handoff): the real, live
+# ~/.engram/knowledge.db (3,324 rows in `nodes`, per the fairy spec) has
+# max LENGTH(embedding)=8,474B, max LENGTH(metadata)=21,272B,
+# max LENGTH(claim)=2,462B. 2,000,000 gives ~94x headroom over the
+# largest of those (metadata) -- room for embedding-dimension growth and
+# larger metadata blobs -- while still bounding a zeroblob-style
+# single-value allocation (SS4: a progress handler armed with NO setlimit
+# lets an 8 MiB zeroblob return in full, 0 progress callbacks -- measured
+# again in this build's test 19 control).
+CLIENT_READ_LIMIT_LENGTH = 2_000_000
+
+
+def _arm_read_deadline(
+    conn: sqlite3.Connection,
+    deadline: float,
+    *,
+    n: int = PROGRESS_HANDLER_INSTRUCTION_COUNT,
+) -> None:
+    """Install a progress_handler on `conn` that aborts (SQLite treats any
+    truthy return from the callback as an interrupt request, raising
+    sqlite3.OperationalError("interrupted") from the in-flight statement)
+    once `deadline` -- an ABSOLUTE time.monotonic() value -- has passed.
+
+    `deadline` is ALWAYS an explicit parameter, never a connection-level
+    stored timer or a module constant: this is designed to accept
+    whatever deadline the eventual client-dispatch path passes in (U4a's
+    end-to-end request deadline, issue #3194 / PR #3201, once wired --
+    see docs/2652-security-slice-design.md SS4's own wording: "the
+    progress_handler must stop against the SAME request deadline, passed
+    in -- not an independent timer or constant"). No caller exists yet in
+    this build (no operation in `_dispatch()` reaches `_client_read_conn`
+    at all), so this build's own tests call this helper directly with an
+    explicit deadline rather than going through the socket.
+    """
+
+    def _check() -> int:
+        return 1 if time.monotonic() >= deadline else 0
+
+    conn.set_progress_handler(_check, n)
+
+
+class _ClientReadGate:
+    """Holds ONLY the client-read connection. Any future client-facing
+    read operation (U4c's read-template registry, U4d's real client
+    wiring) dispatches through an object shaped like this one, never
+    through EngramdOwner directly -- so it is structurally impossible for
+    a client-facing read to reach the owner-internal connection even by
+    accident (test 22). Deliberately independent of the authorizer: this
+    isolates ROUTING, not the floor (`_client_read_authorizer` above is
+    the floor itself; test 7 in the design doc's own numbering, not owned
+    by this unit, is what checks the floor can't be bypassed by a
+    registry bug)."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def execute(self, sql: str, params: tuple = (), *, deadline: float) -> list:
+        """Minimal execute-with-deadline path, exercised by this build's
+        own tests (12, 19, 22) standing in for the not-yet-built real
+        client dispatch. Not a public operation of this build -- no
+        `method` in `EngramdOwner._dispatch()` calls this; nothing wires
+        a real client to it yet."""
+        _arm_read_deadline(self._conn, deadline)
+        try:
+            return self._conn.execute(sql, params).fetchall()
+        finally:
+            # Progress handlers persist on the connection until replaced
+            # or cleared -- clear it so a later call (with its own,
+            # different deadline) always starts from a clean slate rather
+            # than silently inheriting a deadline that has already
+            # passed.
+            self._conn.set_progress_handler(None, 0)
+
+
 class EngramdOwner:
-    """The owner process skeleton -- one per seat, sole handle on
-    `knowledge.db` within this build's scope (handshake + `ping` +
-    `snapshot()` only). See the module docstring for the full design
-    context and what is deliberately not built yet."""
+    """The owner process skeleton -- one per seat, sole PROCESS holding
+    `knowledge.db` open within this build's scope (handshake + `ping` +
+    `snapshot()` only). Per Mira's revision-5 ruling
+    (docs/2652-security-slice-design.md SS3.1), this process holds TWO
+    connections against that one store, never one: `_owner_conn`
+    (permissive, owner-internal -- serves `snapshot()`) and
+    `_client_read_conn` (the permanently restrictive floor -- see the
+    module docstring's "Two connections" section for the full reasoning;
+    nothing in this build's `_dispatch()` reaches the latter yet). See
+    the module docstring for the full design context and what is
+    deliberately not built yet."""
 
     def __init__(
         self,
@@ -197,8 +459,26 @@ class EngramdOwner:
         self.contract_version = contract_version
 
         self._server: socket.socket | None = None
-        self._store_conn: sqlite3.Connection | None = None
-        self._store_lock = threading.Lock()
+        # Owner-internal connection (was `_store_conn` in U3) -- serves
+        # snapshot() and any future owner-internal operation. Client SQL
+        # never dispatches onto it.
+        self._owner_conn: sqlite3.Connection | None = None
+        # The permanently-restrictive client-read connection. Opened
+        # alongside `_owner_conn` in start(), against the same
+        # store_path. No operation in this build dispatches client SQL
+        # onto it yet -- see the module docstring.
+        self._client_read_conn: sqlite3.Connection | None = None
+        # The structurally-isolated object a future client-facing read
+        # would call through (test 22) -- holds ONLY `_client_read_conn`.
+        # Constructed in start(), once that connection exists; None
+        # before start() / after stop(), mirroring the connection
+        # attributes' own None-until-started lifecycle.
+        self._client_read_gate: _ClientReadGate | None = None
+        # Guards BOTH connections' lifecycle -- was `_store_lock` in U3,
+        # renamed because it now protects two connections, not one (see
+        # _cleanup() and _handle_snapshot() below; folds #3152 item 1 for
+        # both).
+        self._owner_lock = threading.Lock()
         self._shutdown = threading.Event()
         self._bound_socket = False
         self._accept_thread: threading.Thread | None = None
@@ -238,15 +518,35 @@ class EngramdOwner:
             except OSError:
                 pass
 
-        # One process, one open handle on the store (design doc SS3) --
-        # opened once here and held for this owner's lifetime; snapshot()
-        # backs up FROM this same connection object (contract item 5). No
-        # domain-engine/manager machinery sits on top of it in this build.
-        # sqlite3.connect() creates an empty file if store_path doesn't yet
-        # exist -- acceptable here: nothing in this build's contract
-        # requires the store to pre-exist, and a real seat's bootstrap
-        # already creates knowledge.db before any daemon starts.
-        self._store_conn = sqlite3.connect(str(self.store_path), check_same_thread=False)
+        # One process, TWO open connections on the store (design doc SS3;
+        # docs/2652-security-slice-design.md SS3.1) -- opened once here
+        # and held for this owner's lifetime; snapshot() backs up FROM
+        # the owner-internal connection object (contract item 5). No
+        # domain-engine/manager machinery sits on top of either in this
+        # build. sqlite3.connect() creates an empty file if store_path
+        # doesn't yet exist -- acceptable here: nothing in this build's
+        # contract requires the store to pre-exist, and a real seat's
+        # bootstrap already creates knowledge.db before any daemon
+        # starts.
+        self._owner_conn = sqlite3.connect(str(self.store_path), check_same_thread=False)
+        # Permissive by DESIGN, not authorizer-less -- see the module
+        # docstring's "Two connections" section and
+        # _owner_internal_authorizer's own docstring for why.
+        self._owner_conn.set_authorizer(_owner_internal_authorizer)
+
+        # The permanently-restrictive client-read connection -- opened
+        # against the SAME store_path, its authorizer set ONCE here and
+        # never swapped/toggled/reset for any operation. Its
+        # SQLITE_LIMIT_LENGTH bound (the size axis of SS4's three
+        # resource bounds) is likewise set once, at open time.
+        self._client_read_conn = sqlite3.connect(str(self.store_path), check_same_thread=False)
+        self._client_read_conn.set_authorizer(_client_read_authorizer)
+        self._client_read_conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, CLIENT_READ_LIMIT_LENGTH)
+
+        # The structurally-isolated object a future client-facing read
+        # would call through (test 22) -- holds ONLY the connection just
+        # opened above, never `_owner_conn`.
+        self._client_read_gate = _ClientReadGate(self._client_read_conn)
 
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server.bind(str(self.socket_path))
@@ -318,12 +618,27 @@ class EngramdOwner:
                 self.socket_path.unlink()
             except FileNotFoundError:
                 pass
-        if self._store_conn is not None:
-            try:
-                self._store_conn.close()
-            except sqlite3.Error:
-                pass
-            self._store_conn = None
+        # #3152 item 1, folded into this build for BOTH connections:
+        # close under the SAME lock _handle_snapshot() holds during
+        # .backup() -- acquiring it here BLOCKS until any in-flight
+        # snapshot's critical section has finished, so a .stop() (signal-
+        # triggered or direct) can never close a connection out from
+        # under a running backup(); it waits for it, then closes. No
+        # in-flight _handle_snapshot() call can race this close.
+        with self._owner_lock:
+            if self._owner_conn is not None:
+                try:
+                    self._owner_conn.close()
+                except sqlite3.Error:
+                    pass
+                self._owner_conn = None
+            if self._client_read_conn is not None:
+                try:
+                    self._client_read_conn.close()
+                except sqlite3.Error:
+                    pass
+                self._client_read_conn = None
+        self._client_read_gate = None
 
     def wait_forever(self) -> None:
         """Block the calling thread until shutdown (a signal, or .stop()
@@ -477,8 +792,10 @@ class EngramdOwner:
     def _handle_snapshot(self, params: dict) -> dict:
         """Contract item 5: writes a quiesced, consistent copy of the
         store to a caller-named destination path, using SQLite's backup
-        API (sqlite3.Connection.backup(), stdlib) FROM this owner's own
-        persistent connection. A client-facing service, not a manager
+        API (sqlite3.Connection.backup(), stdlib) FROM the owner-internal
+        connection (`_owner_conn` -- docs/2652-security-slice-design.md
+        SS3.1: snapshot() runs on the owner-internal path, never the
+        client-read one). A client-facing service, not a manager
         mechanism -- no domain-engine machinery here, just a direct
         sqlite3 operation.
 
@@ -519,12 +836,12 @@ class EngramdOwner:
                 "remedy": "choose a destination whose parent directory is writable",
             }
 
-        with self._store_lock:
+        with self._owner_lock:
             try:
                 dest_conn = sqlite3.connect(str(dest))
                 try:
-                    assert self._store_conn is not None
-                    self._store_conn.backup(dest_conn)
+                    assert self._owner_conn is not None
+                    self._owner_conn.backup(dest_conn)
                 finally:
                     dest_conn.close()
             except sqlite3.Error as exc:

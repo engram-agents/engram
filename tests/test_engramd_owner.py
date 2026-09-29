@@ -487,3 +487,421 @@ def test_oversized_incoming_request_is_dropped_and_owner_stays_up(owner_running)
     # The owner itself remains alive and serving other clients.
     result = ec.read("ping", {}, timeout=1.0, socket_path=owner_running.socket_path)
     assert isinstance(result, ec.Ok)
+
+
+# ---------------------------------------------------------------------------
+# #2652 Phase-1 Unit 4b (issue #3195) -- the owner's two connections and the
+# authorizer floor. Test numbers below are docs/2652-security-slice-design.md
+# SS5's own numbering (a SEPARATE list from the 10 numbered contract items in
+# this file's own module docstring, which are issue #3096's original items 1-
+# 10 for the U3 skeleton build) -- 10, 11, 12, 17, 19, 22 are the subset this
+# unit owns.
+#
+# LOAD-BEARING MEASURED DEVIATION, flagged per this unit's own escape valve
+# (see the fairy handoff for the full writeup): sqlite3.Connection.backup()
+# never invokes ANY authorizer action, on either connection, at all --
+# confirmed with a deny-all authorizer (0 callbacks fired, backup succeeds in
+# full) on both Python 3.9/sqlite 3.54.0 and Python 3.12/sqlite 3.53.4. This
+# is the C-level backup API bypassing SQL-statement preparation entirely, not
+# a version artifact. Consequence: test 17's own literal mutation ("deny
+# SQLITE_TRANSACTION on the owner-internal authorizer -- the snapshot must
+# fail loudly") CANNOT discriminate against this build's `_handle_snapshot()`
+# shape, because denying anything on that authorizer has zero effect on
+# `.backup()`'s outcome. test_snapshot_runs_on_owner_internal_path_and_error_
+# is_not_swallowed below tests the same underlying "fail loudly, never
+# swallowed" property through a mutation that DOES discriminate (corrupting
+# the except clause), and documents the measured mismatch rather than
+# silently pretending the literal mutation works.
+# ---------------------------------------------------------------------------
+
+
+def test_owner_module_never_calls_executescript():
+    """Design doc test 10: a repo-level grep assertion over
+    src/engram/engramd_owner.py ONLY -- the census over the whole owner
+    PACKAGE is a later unit's job once more files exist (this unit's own
+    spec is explicit about that scope bound). Mutation: add an
+    `executescript` call anywhere in the file -- this test must go red."""
+    source = (REPO_ROOT / "src" / "engram" / "engramd_owner.py").read_text()
+    assert "executescript" not in source
+
+
+def test_pragma_write_is_refused_even_when_its_name_is_allowed():
+    """Design doc test 11 (P16): `PRAGMA user_version = 99` under an
+    allowlist containing `user_version` must be denied, asserted on the
+    VALUE (still 0 after the attempt), not merely on the authorizer's
+    return code. Mutation: drop the `arg2 is None` clause from
+    eo._client_read_authorizer's pragma branch -- without it, the value
+    changes 0 -> 99 even though only `user_version` was allowlisted, and
+    this test must go red."""
+    conn = sqlite3.connect(":memory:")
+    conn.set_authorizer(eo._client_read_authorizer)
+
+    before = conn.execute("PRAGMA user_version").fetchone()[0]
+    assert before == 0
+
+    with pytest.raises(sqlite3.Error):
+        conn.execute("PRAGMA user_version = 99")
+
+    after = conn.execute("PRAGMA user_version").fetchone()[0]
+    assert after == 0, "a pragma WRITE must never take effect, even for an allowlisted name"
+
+
+# A non-recursive VALUES-based CTE cross-joined 3 ways -- 300**3 = 27M
+# combinations, ~0.5s unbounded. Deliberately NOT a `WITH RECURSIVE` CTE:
+# that shape fires SQLITE_RECURSIVE, an action outside this build's
+# measured baseline allowlist (SQLITE_SELECT/READ/FUNCTION only) that
+# would be denied outright by the authorizer floor before the progress
+# handler ever got a chance to matter -- caught while writing this test
+# (see the fairy handoff). This shape fires only SQLITE_SELECT and
+# SQLITE_FUNCTION (measured), so it exercises the deadline axis in
+# isolation from the authorizer floor, as test 12 intends.
+_EXPENSIVE_CARTESIAN_SQL = (
+    "WITH nums(x) AS (VALUES " + ", ".join("(%d)" % i for i in range(300)) + ") "
+    "SELECT COUNT(*) FROM nums a, nums b, nums c WHERE a.x + b.x + c.x >= 0"
+)
+
+
+def test_expensive_read_is_aborted_by_deadline_and_cheap_read_is_not(owner_running):
+    """Design doc test 12: a deliberately expensive read is aborted by the
+    deadline, and a cheap read is not. Bounds VM-instruction cost only
+    (test 19 covers the size axis; the end-to-end-deadline axis, test 20,
+    is out of scope -- no dispatch operation exists yet to test it
+    against). Mutation: remove the progress_handler registration in
+    eo._arm_read_deadline -- the expensive read must then complete
+    instead of aborting, and this test must go red.
+
+    Also asserts the abort point tracks the PASSED-IN deadline parameter,
+    not a fixed constant: shortening the deadline must shorten the abort
+    point.
+    """
+    gate = owner_running._client_read_gate
+
+    # Cheap read: comfortably under a generous deadline, completes.
+    rows = gate.execute("SELECT 1", deadline=time.monotonic() + 5.0)
+    assert rows == [(1,)]
+
+    # Expensive read: aborted once the deadline passes, rather than
+    # running to its own ~0.3s completion.
+    start = time.monotonic()
+    with pytest.raises(sqlite3.OperationalError):
+        gate.execute(_EXPENSIVE_CARTESIAN_SQL, deadline=time.monotonic() + 0.05)
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.25, f"abort should happen near the deadline, not run to completion: {elapsed}"
+
+    # The abort point tracks the DEADLINE PARAMETER: a shorter deadline
+    # aborts sooner than a longer one, on the SAME expensive query.
+    start_short = time.monotonic()
+    with pytest.raises(sqlite3.OperationalError):
+        gate.execute(_EXPENSIVE_CARTESIAN_SQL, deadline=time.monotonic() + 0.02)
+    elapsed_short = time.monotonic() - start_short
+
+    start_long = time.monotonic()
+    with pytest.raises(sqlite3.OperationalError):
+        gate.execute(_EXPENSIVE_CARTESIAN_SQL, deadline=time.monotonic() + 0.15)
+    elapsed_long = time.monotonic() - start_long
+
+    assert elapsed_short < elapsed_long, (elapsed_short, elapsed_long)
+
+
+def test_snapshot_runs_on_owner_internal_path_and_error_is_not_swallowed(engram_home):
+    """Design doc test 17, WITH A DOCUMENTED MEASURED DEVIATION from its
+    literal mutation -- see this section's module-level comment above and
+    the fairy handoff for the full writeup. sqlite3.Connection.backup()
+    never invokes the authorizer at all, on either connection, so denying
+    SQLITE_TRANSACTION on the owner-internal authorizer cannot make this
+    build's _handle_snapshot() fail (there is nothing for the denial to
+    interrupt). What IS faithfully tested, matching the underlying "runs
+    on the owner-internal path, fails loudly, never swallowed" property:
+
+      1. snapshot() succeeds via the owner-internal connection under its
+         normal (permissive) authorizer.
+      2. A genuine sqlite3.Error raised BY backup() itself -- triggered
+         here the one way this build found that actually makes backup()
+         raise (a destination file that exists but is not a valid sqlite
+         database; an authorizer denial cannot, per the measurement
+         above) -- surfaces as the EXISTING
+         Rejected(reason="snapshot_failed", ...) response. Mutation:
+         change the `except sqlite3.Error` block in _handle_snapshot to
+         swallow the error (e.g. `except sqlite3.Error: pass`, falling
+         through to the success response) -- this test must go red.
+      3. The client-read connection's authorizer is never touched by a
+         snapshot() call (docs/2652-security-slice-design.md SS3.1: "no
+         authorizer swapping").
+    """
+    store_path = engram_home / eo.DEFAULT_STORE_NAME
+    seed = sqlite3.connect(str(store_path))
+    seed.execute("CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT)")
+    seed.executemany("INSERT INTO widgets (name) VALUES (?)", [("a",), ("b",)])
+    seed.commit()
+    seed.close()
+
+    owner = eo.EngramdOwner(engram_home, request_deadline=REQUEST_DEADLINE)
+    owner.start(install_signal_handlers=False)
+    try:
+        # -- part 1: snapshot() succeeds on the owner-internal connection.
+        good_dest = engram_home / "snap-good.db"
+        result = ec.read(
+            "snapshot",
+            {"dest_path": str(good_dest)},
+            timeout=3.0,
+            socket_path=owner.socket_path,
+        )
+        assert isinstance(result, ec.Ok)
+
+        # -- part 2: a genuine sqlite3.Error during backup() surfaces as
+        # Rejected(reason="snapshot_failed"), not swallowed.
+        bad_dest = engram_home / "snap-bad.db"
+        bad_dest.write_bytes(b"not a sqlite database, just garbage bytes" * 4)
+        result2 = ec.read(
+            "snapshot",
+            {"dest_path": str(bad_dest)},
+            timeout=3.0,
+            socket_path=owner.socket_path,
+        )
+        assert isinstance(result2, ec.Rejected)
+        assert result2.reason == "snapshot_failed"
+
+        # -- part 3: the client-read connection's authorizer is never
+        # touched by snapshot() -- proven by identity, not "coincidentally
+        # still permissive": install a distinguishable marker authorizer
+        # directly on the connection, run a snapshot, then confirm the
+        # SAME marker (not merely a same-behaving one) is still what
+        # fires.
+        marker_calls: list = []
+
+        def _marker_authorizer(action_code, arg1, arg2, db_name, trigger_or_view):
+            marker_calls.append(action_code)
+            return sqlite3.SQLITE_DENY
+
+        owner._client_read_conn.set_authorizer(_marker_authorizer)
+
+        result3 = ec.read(
+            "snapshot",
+            {"dest_path": str(engram_home / "snap-3.db")},
+            timeout=3.0,
+            socket_path=owner.socket_path,
+        )
+        assert isinstance(result3, ec.Ok)
+        assert marker_calls == [], "snapshot() must never touch the client-read connection at all"
+
+        with pytest.raises(sqlite3.Error):
+            owner._client_read_conn.execute("SELECT 1")
+        assert marker_calls == [
+            sqlite3.SQLITE_SELECT
+        ], "the marker installed before snapshot() must still be the one firing after it"
+    finally:
+        owner.stop()
+
+
+def test_snapshot_copies_from_the_owner_internal_connection_not_client_read(engram_home):
+    """Mira's finding on PR #3221 (round 4): nothing previously distinguished WHICH
+    connection `.backup()` runs on. Both connections point at the same
+    `store_path` and `.backup()` never consults an authorizer (measured
+    above), so a wrong-connection bug would silently copy the same data
+    and pass every existing test -- including test 17's marker-authorizer
+    check, which only proves the CLIENT-READ authorizer is untouched, not
+    which connection actually served the copy. Confirmed directly: with
+    `self._owner_conn.backup(dest_conn)` in `_handle_snapshot()` swapped
+    for `self._client_read_conn.backup(dest_conn)`, all pre-existing tests
+    stayed green.
+
+    Discriminator: close `_client_read_conn` before calling snapshot(). If
+    `_handle_snapshot()` correctly calls `.backup()` on `_owner_conn`
+    (which stays open), the snapshot succeeds regardless of the
+    client-read connection's state. If it were mutated to call `.backup()`
+    on `_client_read_conn` instead, that connection is closed --
+    `sqlite3.ProgrammingError` (a `sqlite3.Error` subclass, measured
+    directly against both `.execute()` and `.backup()` on a closed
+    connection) would raise, which `_handle_snapshot()`'s existing
+    `except sqlite3.Error` catches and reports as
+    `Rejected(reason="snapshot_failed")` rather than `Ok`.
+
+    Mutation: change `self._owner_conn.backup(dest_conn)` to
+    `self._client_read_conn.backup(dest_conn)` in `_handle_snapshot()` --
+    this test must go red (`Ok` -> `Rejected`)."""
+    store_path = engram_home / eo.DEFAULT_STORE_NAME
+    seed = sqlite3.connect(str(store_path))
+    seed.execute("CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT)")
+    seed.commit()
+    seed.close()
+
+    owner = eo.EngramdOwner(engram_home, request_deadline=REQUEST_DEADLINE)
+    owner.start(install_signal_handlers=False)
+    try:
+        owner._client_read_conn.close()
+
+        result = ec.read(
+            "snapshot",
+            {"dest_path": str(engram_home / "snap-source-check.db")},
+            timeout=3.0,
+            socket_path=owner.socket_path,
+        )
+        assert isinstance(result, ec.Ok), (
+            "snapshot() must succeed from the owner-internal connection "
+            "even when the client-read connection is closed -- a failure "
+            "here means the wrong connection is being used as the copy source"
+        )
+    finally:
+        owner.stop()
+
+
+def test_single_value_size_is_bounded_independently_of_progress_handler(owner_running):
+    """Design doc test 19: single-value size is bounded independently of
+    the progress handler. `SELECT zeroblob(N)` above the configured
+    SQLITE_LIMIT_LENGTH is refused on the client-read connection; a
+    result under the limit succeeds. Mutation: remove the `setlimit`
+    call in start() -- the oversized result must then be returned, and
+    this test must go red.
+
+    Includes the control that makes the point (design doc SS4,
+    reproduced here): with a progress handler armed (deadline far in the
+    future, so it never fires) and NO setlimit call, the oversized
+    zeroblob STILL returns in full -- proving the handler is not what
+    bounds size.
+    """
+    gate = owner_running._client_read_gate
+    limit = eo.CLIENT_READ_LIMIT_LENGTH
+
+    under = gate.execute("SELECT length(zeroblob(?))", (limit - 1,), deadline=time.monotonic() + 5.0)
+    assert under == [(limit - 1,)]
+
+    with pytest.raises(sqlite3.Error):
+        gate.execute("SELECT zeroblob(?)", (limit + 1,), deadline=time.monotonic() + 5.0)
+
+    # Control: progress handler armed but never firing (generous
+    # deadline), and NO setlimit anywhere on this bare connection -- the
+    # oversized value still comes back in full.
+    control_conn = sqlite3.connect(":memory:")
+    try:
+        deadline = time.monotonic() + 5.0
+
+        def _never_fires() -> int:
+            return 1 if time.monotonic() >= deadline else 0
+
+        control_conn.set_progress_handler(_never_fires, eo.PROGRESS_HANDLER_INSTRUCTION_COUNT)
+        oversized = 8 * 1024 * 1024
+        row = control_conn.execute("SELECT length(zeroblob(?))", (oversized,)).fetchone()
+        assert row == (oversized,), "the progress handler alone must not bound single-value size"
+    finally:
+        control_conn.close()
+
+
+def test_client_read_gate_holds_no_reference_to_owner_internal_connection(owner_running):
+    """Design doc test 22: client SQL cannot reach the unrestricted
+    connection, asserted STRUCTURALLY -- the object a future client-facing
+    read would dispatch through holds no reference to the owner-internal
+    connection. Deliberately independent of the authorizer (it isolates
+    routing, not the floor). Mutation: change start() to construct
+    `self._client_read_gate = _ClientReadGate(self._owner_conn)` instead
+    of `self._client_read_conn` -- this test must go red (run by hand;
+    see the fairy handoff)."""
+    gate = owner_running._client_read_gate
+    assert gate is not None
+    assert vars(gate).get("_conn") is owner_running._client_read_conn
+
+    for attr_name, value in vars(gate).items():
+        assert value is not owner_running._owner_conn, (
+            f"_ClientReadGate.{attr_name} holds the owner-internal connection"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Round-2 fix (PR #3221, Sol's review) -- nothing above tests that start()
+# actually wires the RESTRICTIVE authorizer onto the REAL
+# owner._client_read_conn. Test 11 opens its own bare :memory: connection
+# and calls eo._client_read_authorizer directly, never touching
+# owner._client_read_conn; tests 12, 19, and 22 use the real connection but
+# only check the deadline, the size limit, and the gate's structural
+# isolation -- none of them check the connection's *authorizer*. Confirmed
+# by hand: swapping start()'s
+# `self._client_read_conn.set_authorizer(_client_read_authorizer)` for
+# `self._client_read_conn.set_authorizer(_owner_internal_authorizer)`
+# (silently wiring the PERMISSIVE owner-internal authorizer instead of the
+# restrictive one) leaves all 19 pre-existing tests green. Mutation: that
+# same swap -- this test must go red; tests 12, 19, and 22 must stay green.
+# ---------------------------------------------------------------------------
+
+
+def test_start_wires_the_restrictive_authorizer_onto_the_real_client_read_conn(owner_running):
+    """Exercises owner_running._client_read_conn directly -- the actual
+    connection object opened and authorizer-wired by start(), not an
+    isolated :memory: connection with the authorizer function called by
+    hand (that is test 11, above). A table is created via the
+    owner-internal connection (owner._owner_conn, permissive by design)
+    since CREATE TABLE is itself denied on the client-read connection --
+    this test only needs a table to exist, not to exercise CREATE TABLE's
+    own denial."""
+    conn = owner_running._client_read_conn
+    owner_running._owner_conn.execute("CREATE TABLE t (x)")
+    owner_running._owner_conn.commit()
+
+    with pytest.raises(sqlite3.Error):
+        conn.execute("INSERT INTO t VALUES (1)")
+
+    with pytest.raises(sqlite3.Error):
+        conn.execute("ATTACH DATABASE ':memory:' AS aux")
+
+    # Pragma WRITE: measured directly against this REAL connection before
+    # writing this test -- execute() DOES raise for a denied pragma write
+    # here, matching test 11's own isolated-connection measurement. Assert
+    # both the raise AND the unchanged value, mirroring test 11's own
+    # pattern for the isolated-connection case.
+    before = conn.execute("PRAGMA user_version").fetchone()[0]
+    with pytest.raises(sqlite3.Error):
+        conn.execute("PRAGMA user_version = 5")
+    after = conn.execute("PRAGMA user_version").fetchone()[0]
+    assert after == before, "a pragma WRITE must never take effect on the real wired connection"
+
+    with pytest.raises(sqlite3.Error):
+        conn.execute("BEGIN")
+
+    # The connection is denying dangerous things, not everything.
+    assert conn.execute("SELECT 1").fetchall() == [(1,)]
+
+
+# ---------------------------------------------------------------------------
+# Round-2 fix (PR #3221, Sol's review) -- issue #3152 item 1's lock fold in
+# _cleanup() (both connections closed under self._owner_lock, so a .stop()
+# cannot race an in-flight _handle_snapshot()) has no test proving the lock
+# actually does anything. Confirmed by hand: replacing
+# `with self._owner_lock:` in _cleanup() with `if True:` (removing the
+# lock's blocking behavior while keeping the code structurally parseable)
+# leaves all 19 pre-existing tests green. Mutation: that same swap -- this
+# test must go red (the cleanup thread would close the connections
+# immediately, without waiting for the lock, so the "still open while held"
+# assertion below fails).
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_blocks_on_owner_lock_held_by_an_in_flight_operation(owner_running):
+    """Simulates an in-flight _handle_snapshot() by acquiring
+    owner._owner_lock directly in THIS test's own thread, then calling
+    owner._cleanup() from a second thread. Calls ._cleanup() directly
+    rather than .stop() -- .stop() blocks on _accept_thread.join() first,
+    a real but separate join-timing concern this test doesn't need to
+    exercise; ._cleanup() is the more direct way to check the lock fold
+    itself (documented choice, per this fix's spec)."""
+    owner = owner_running
+    owner._owner_lock.acquire()
+    try:
+        cleanup_thread = threading.Thread(target=owner._cleanup, daemon=True)
+        cleanup_thread.start()
+
+        # The cleanup thread is blocked waiting for the lock this test
+        # thread holds. This sleep only needs to be "long enough for a
+        # thread switch", not exact timing -- a real threading.Lock
+        # genuinely blocks the second thread for as long as this test
+        # thread holds it, so there is no race to lose regardless of how
+        # long the switch actually takes; 0.2s is comfortably longer than
+        # a scheduler switch on any platform this suite runs on.
+        time.sleep(0.2)
+        assert owner._owner_conn is not None, "cleanup must not have closed this yet"
+        assert owner._client_read_conn is not None, "cleanup must not have closed this yet"
+        assert cleanup_thread.is_alive(), "the cleanup thread should still be blocked on the lock"
+    finally:
+        owner._owner_lock.release()
+
+    cleanup_thread.join(timeout=5.0)
+    assert not cleanup_thread.is_alive()
+    assert owner._owner_conn is None
+    assert owner._client_read_conn is None

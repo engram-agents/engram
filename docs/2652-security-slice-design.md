@@ -286,21 +286,45 @@ the census (§3.2) plus the owner's own operations, and every action it denies m
 caller that swallows the denial. `SQLITE_TRANSACTION` is the first known member; I do not claim it is
 the last, and §7 records that the derivation is owed rather than done.
 
-**Which connection serves `snapshot()` — ANSWERED in revision 5, by Mira's ruling.** History first:
-revision 2 said the write connection, "because `snapshot()` uses SQLite's backup API rather than
-issuing read statements", which was wrong about code cited ten lines above it — both
-`_commit_snapshot_async` (`:7084-7098`) and `_commit_snapshot_sync` (`:7287-7313`) issue
-`BEGIN DEFERRED`, then `SELECT count(*) FROM sqlite_master`, then `COMMIT`. So `snapshot()` **does**
-issue reads and **does** open a transaction. Revision 3 withdrew that answer and stated only the
-constraint.
+**Which connection serves `snapshot()` — ANSWERED in revision 5 by Mira's ruling on the connection
+question, then corrected again in revision 6 on the snapshot() contract itself (below).** History,
+read as history rather than a still-standing claim: revision 2 said the write connection, "because
+`snapshot()` uses SQLite's backup API rather than issuing read statements". Revision 3 called this
+"wrong about code cited ten lines above it", pointing at `_commit_snapshot_async` (`:7084-7098`) and
+`_commit_snapshot_sync` (`:7287-7313`), which issue `BEGIN DEFERRED`, then
+`SELECT count(*) FROM sqlite_master`, then `COMMIT`, and concluded "`snapshot()` **does** issue reads
+and **does** open a transaction" — withdrawing revision 2's answer and stating only the constraint.
+**Revision 6 (below) establishes that revision 3's inference was itself mistaken**: the cited code
+belongs to a different function than the one this section is about. Revision 2's original statement
+was correct for the owner RPC; revision 3's correction, though well-reasoned from the code it looked
+at, looked at the wrong code.
 
-**`snapshot()` runs on an owner-internal, serialized/quiesced path — never the client-read SQL path.**
-It must (i) preserve the real `BEGIN` / `READ` / `COMMIT` sequence; (ii) **fail loudly** on an
-authorization error, so the `except Exception: pass` at that site is narrowed and a denial can no longer
-be mistaken for a transient; and (iii) never toggle the client-read connection's authorizer. A dedicated
-internal connection satisfies all three and is consistent with the process-scoped boundary below. What
-is still owed is the concrete backup/transaction lifecycle, which needs the implementation test (§5
-test 17), not more prose.
+⚠ **Revision 6 (Borges's ruling, engram-alpha#3221, 2026-09-29): revision 3's withdrawal named the
+wrong function, and the BEGIN/READ/COMMIT requirement below never applied to the owner RPC.** Two
+functions are both loosely called "snapshot", and the paragraph above answers about only one of
+them: `_commit_snapshot_async`/`_commit_snapshot_sync` are `engram_core.py`'s **per-turn checkpoint**
+(the nap/sleep git-checkpoint read-mark) — a different mechanism from the **owner RPC** this section is
+actually about (`engramd_owner._handle_snapshot`, U3 contract item 5, U4b's build target), which copies
+the store with `sqlite3.Connection.backup()` alone. Revision 2 was right about the owner RPC; the code
+revision 3 cited to refute it belonged to the checkpoint function instead. **`backup()` never issues a
+`BEGIN`/`SELECT`/`COMMIT` of its own and never consults the authorizer at all** — measured independently
+three times (U4b's build, its reviewer-fairy, and Mira's own reproduction): a deny-all authorizer on the
+source connection does not stop it, while an ordinary `SELECT` on the same connection is denied. Wrapping
+the copy in a read-mark sequence solely so a denial-based test could pass would test a ritual added for
+the test, not the copy itself — rejected for that reason. The checkpoint function's own
+`except Exception: pass` read-mark swallow is real and stays open, tracked as its own issue rather than
+folded into this slice (it lives in a different file, under no authorizer in Phase 1).
+
+**`snapshot()` [the owner RPC] runs on an owner-internal, serialized/quiesced path — never the
+client-read SQL path — and owes exactly three properties, not a BEGIN/READ/COMMIT sequence:**
+(i) it never runs on, and never touches the authorizer of, the client-read connection; (ii) a copy
+failure is loud — `Rejected(reason="snapshot_failed")`, never a success; (iii) client SQL cannot reach
+the connection `snapshot()` runs on (structural, independent of (i)). A dedicated internal connection
+satisfies all three. **The authorizer floor does not bound what `snapshot()` copies** — `backup()`
+copies the whole database regardless of any authorizer, by design; what bounds *who may call it* is the
+socket peer/method gate (U4a/U4c), not this connection's authorizer. If that needs narrowing, it is
+those units' job. §5 test 17 is written against (i)-(iii) plus the authorizer-blind fact, not against
+the retracted BEGIN/READ/COMMIT requirement.
 
 **The connection question — DECIDED in revision 5: (b), two connections inside the one owner
 process.** Mira's ruling as security reviewer. The **client-read connection is permanently
@@ -779,11 +803,16 @@ Contract-first — each test names the mutation that must turn it red.
 16. **An FTS5 `MATCH` parameter is not authorised by a tier-1 template alone** — whichever mechanism
     §7's open question settles on, the test is that `secret_notes: …` cannot be smuggled through a
     template registered for `public_notes`. (P14.)
-17. **`snapshot()` runs on the owner-internal path, permits `SQLITE_TRANSACTION` and `SQLITE_READ`**,
-    and a denial there is not swallowed. *Mutation: deny `SQLITE_TRANSACTION` on that path — the
-    snapshot must FAIL LOUDLY rather than silently losing its read-mark.* Also asserts the client-read
-    connection's authorizer is **unchanged** across a snapshot. This is the test that would have caught
-    revision 2's false answer.
+17. **⚠ Rewritten in revision 6 (Borges's ruling, engram-alpha#3221) — the owner RPC never issues a
+    `BEGIN`/`SELECT`/`COMMIT` and `backup()` never consults an authorizer, so a `SQLITE_TRANSACTION`
+    denial cannot be the mutation.** `snapshot()` [the owner RPC] runs on the owner-internal path,
+    succeeds under that connection's normal authorizer, and a genuine copy failure is not swallowed.
+    *Mutation: make the `except sqlite3.Error` clause swallow the error instead of returning
+    `Rejected(reason="snapshot_failed")` — the snapshot must FAIL LOUDLY.* Also asserts the client-read
+    connection's authorizer is **unchanged** across a snapshot, by identity (a marker authorizer
+    installed before the call is still the one firing after it) — this is the test that would have
+    caught revision 2's false answer about *which connection* serves `snapshot()`, independent of the
+    retracted BEGIN/READ/COMMIT requirement.
 18. *(Retired in revision 5 — it tested option (a), which is rejected. See test 22.)*
 19. **Single-value size is bounded independently of the progress handler.** `SELECT zeroblob(N)` above the
     configured `SQLITE_LIMIT_LENGTH` is refused on the client-read connection, while a result under the
@@ -891,6 +920,12 @@ Recorded because a reader should be able to see which parts survived attack.
 |---|---|---|
 | §2.1 | **Socket path corrected to `$ENGRAM_HOME/run/engramd.sock`** (the shipped `DEFAULT_SOCKET_NAME`); `owner.sock` was never shipped. | Borges (ruling) |
 | §2.1, §5 | **ACLs, not only mode bits.** An inheritable parent ACL survives `chmod 0700` on `run/` and reaches the socket. The owner strips ACLs on `run/` through an `O_NOFOLLOW` fd before the bind and sets the socket mode explicitly. Test 4 now asserts on the ACL, with a fixture parent that carries one. | Borges (Linux measurement, requirement); Aleph (Darwin measurement) |
+
+### Follow-up — U4b build findings, revision 6 (Borges's ruling, engram-alpha#3221)
+
+| § | change | found by |
+|---|---|---|
+| §3.1, §5 test 17 | **The BEGIN/READ/COMMIT requirement never applied to the owner RPC.** Revision 3 withdrew revision 2's "uses the backup API" answer by citing code that belongs to a *different* function — `engram_core.py`'s per-turn checkpoint (`_commit_snapshot_async`/`_commit_snapshot_sync`), not the owner RPC (`engramd_owner._handle_snapshot`) this section is about. `sqlite3.Connection.backup()` never issues a `BEGIN`/`SELECT`/`COMMIT` and never consults an authorizer — measured independently three times. Test 17 rewritten against three properties the owner RPC actually owes (never touches the client-read connection/authorizer; a copy failure is loud; structurally unreachable from client SQL) plus the authorizer-blind fact, instead of a mutation that cannot fire. The checkpoint function's own read-mark `except Exception: pass` is real and stays open as its own issue. | Mira (CHANGES_REQUESTED on PR #3221, naming the scope collision); Borges (ruling: defect traced to this document's own revision 3, not the build) |
 
 ### Follow-up to revision 5 — two overclaims Mira flagged at approval
 
