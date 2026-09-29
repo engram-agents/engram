@@ -811,11 +811,14 @@ Use the model family of the fairy's assigned runtime. If the fairy's model famil
 
 ```bash
 python3 -m tools.cohort_dispatch validate --out "$COHORT_DIR"
-# Exit code 0 → no failures; final_payload.json written automatically; proceed to Step 8.
+# Exit code 0 → no failures; final_payload.json written automatically (ids the fairy returned that were never sent are discarded, listed on stderr + as `unexpected` in the summary); proceed to Step 8.
 # Exit code 1 → failures present; retry_payload.json written; continue retry loop below.
+# Exit code 2 → pipeline/validate error; neither file written; STOP (see the Exit 2 branch below).
 ```
 
-If validate exits 0 (no failures), `final_payload.json` is written automatically by `cmd_validate` — proceed directly to Step 8.
+If validate exits 0 (no failures), `final_payload.json` is written automatically by `cmd_validate` — proceed directly to Step 8. `validate` deletes any `final_payload.json` / `retry_payload.json` left by an earlier run before it starts, so a file present afterwards was written by this run.
+
+**Exit 2 = pipeline/validate error: STOP the batch-summary step, record the error text verbatim in the dream record, and do NOT run Step 7.5.** An exit 2 leaves no `final_payload.json`; that absence is NOT "substrate not deployed" — do not read it that way, and do not silently continue.
 
 If validate exits 1 (failures present), run the mechanical retry loop. The loop alternates between shell steps and a Claude dispatch step:
 
@@ -855,6 +858,7 @@ python3 -m tools.cohort_dispatch incorporate \
   --out "$COHORT_DIR"
 # When still-failing items remain: writes retry_payload.json → loop continues.
 # When all resolved: DELETES retry_payload.json → [ -f ] check exits the loop.
+# Exit code 2 → pipeline error: apply the Exit 2 rule above (STOP, record verbatim, no Step 7.5).
 # Also writes/updates: final_payload.json, clean_items.json, failures.json,
 #   unfixable.json, attempt_count in manifest.json.
 ```
@@ -900,7 +904,7 @@ This is the **wait-then-spawn pattern** using filesystem-as-channel. Claude Code
 
 ### Step 7.5 — Apply the batch-summary payload directly (before spawning the dream master)
 
-**Skip this step if the recall-summary substrate is not deployed.** If batch-summary fairies were skipped in Step 5 (no `recall_summary` column or no `engram_set_recall_summaries` tool), `final_payload.json` will not exist — do not attempt to apply it; proceed directly to Step 8.
+**Skip this step if the recall-summary substrate is not deployed.** If batch-summary fairies were skipped in Step 5 (no `recall_summary` column or no `engram_set_recall_summaries` tool), `final_payload.json` will not exist — do not attempt to apply it; proceed directly to Step 8. **This skip applies only when the batch-summary step never ran.** If `validate` or `incorporate` exited 2, you are on the Exit 2 branch above (STOP, record the error, no Step 7.5) — an absent `final_payload.json` after an exit 2 is never "substrate not deployed".
 
 ```bash
 # Guard: substrate check (parallel to Step 5's substrate-absent skip)
