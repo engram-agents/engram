@@ -58,6 +58,8 @@ ALLOWED_FAIRIES: dict[str, tuple[str, ...]] = {
     "coder": ("engram-coder-fairy", "coder-fairies"),
     "batch-summary": ("engram-batch-summary-fairy", "summary-fairies"),
     "dream": ("engram-dream-fairy", "dream-fairies"),
+    "dream-master": ("engram-dream-master",),
+    "person-node": ("engram-person-node-fairy",),
 }
 
 # The three surfaces this fact table governs, relative to repo root.
