@@ -928,9 +928,9 @@ _CASCADE_RELATION_PLACEHOLDERS = ",".join("?" * len(_CASCADE_RELATIONS_SORTED))
 # question that ONLY COINCIDENTALLY SHARED, pre-#2252-Stage-1.3, the same tuple
 # as CASCADE_RELATIONS. #2252 Stage 1.3 (now landed) removed `cascade` from
 # `supported_by`, so the two sets are no longer even numerically equal —
-# CASCADE_RELATIONS is now the strict subset {derives_from}, while this
-# constant deliberately still includes `supported_by` for citation-coverage
-# purposes. Had this constant been derived from CASCADE_RELATIONS instead of
+# CASCADE_RELATIONS no longer contains `supported_by` (see that constant for
+# its current members), while this constant deliberately still includes
+# `supported_by` for citation-coverage purposes. Had this constant been derived from CASCADE_RELATIONS instead of
 # hand-enumerated, the uncited-observation metric would have silently changed
 # meaning on the day Stage 1.3 landed, with no test to catch it — the
 # now-realized divergence is exactly why it stays hand-enumerated.
@@ -9464,8 +9464,8 @@ def _trace_observation_leaves(
     SAME one by construction: a node's evidential lineage is exactly its
     cascade ancestry, so "premise" should derive from ``cascade``, not merely
     coincide with it. ``supported_by`` drops out of the walked set as a
-    consequence (``CASCADE_RELATIONS`` is now the strict subset
-    ``{derives_from}``) — behavior-preserving today, though the reason is
+    consequence (``CASCADE_RELATIONS`` no longer contains it — see that constant
+    for the current members) — behavior-preserving today, though the reason is
     about the edge's SOURCE, not its target (reviewer-fairy catch, PR #2329:
     an earlier draft of this note wrongly reasoned from the target side).
     Every ``supported_by`` edge is minted with a cornerstone or lesson as its

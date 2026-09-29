@@ -1747,12 +1747,14 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
 
 
 def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
-    """Walk downstream from node_id following CASCADE_RELATIONS edges
-    (engram_core.EDGE_CLASSIFICATIONS' cascade flag — today just
-    derives_from; supported_by lost its cascade flag in #2252 Stage 1.3,
-    and the W6 pairing edge predicted_by was minted cascade:False from the
-    start, so neither ever reaches this walk). Visits each downstream node
-    at most once. For each live
+    """Walk downstream from node_id following engram_core.CASCADE_RELATIONS
+    edges (the relations whose EDGE_CLASSIFICATIONS entry sets cascade=True —
+    today derives_from and acknowledged_derives_from, the latter
+    cascade-bearing by design per #2013 §12.5; the constant is the source of
+    truth, not this list). supported_by lost its cascade flag in #2252
+    Stage 1.3, and the W6 pairing edge predicted_by was minted cascade:False
+    from the start, so neither ever reaches this walk. Visits each
+    downstream node at most once. For each live
     claim-bearing node visited, calls on_live_node(node) — the caller
     decides what to write. Stops cascade at retracted/superseded nodes
     (node not is_current) AND at any non-claim-bearing (NCB) node — an NCB
@@ -2229,7 +2231,8 @@ def _supersede_impl(
     Cascade behavior (parallel cascades for derivation and contradiction
     dependents; #2013/#2009 slice 1 — the cascade machine):
       - Derivation cascade: every node reachable via CASCADE_RELATIONS
-        edges (today just derives_from — supported_by lost its cascade
+        edges (engram_core.CASCADE_RELATIONS — today derives_from and
+        acknowledged_derives_from; supported_by lost its cascade
         flag in #2252 Stage 1.3) gets a pending cascade_markers row
         (root_node=old_node_id, root_op='supersede'). The walk stops at
         non-claim-bearing nodes, so an NCB dependent gets no marker at
@@ -2784,7 +2787,8 @@ def _retract_impl(
 
     Cascade behavior (#2013/#2009 slice 1 — the cascade machine):
       - Derivation cascade: every node reachable via CASCADE_RELATIONS
-        edges (today just derives_from — supported_by lost its cascade
+        edges (engram_core.CASCADE_RELATIONS — today derives_from and
+        acknowledged_derives_from; supported_by lost its cascade
         flag in #2252 Stage 1.3) gets a pending cascade_markers row
         (root_node=the retracted node, root_op='retract'). The walk stops
         at non-claim-bearing nodes, so an NCB dependent gets no marker at
@@ -3384,9 +3388,10 @@ def _retract_impl(
                 core._log_edit(conn, "retracted", pred_id, "prediction", _pred_event_details)
                 retracted_predictions.append({"id": pred_id, "type": "prediction"})
 
-        # 2. Find all downstream nodes via CASCADE_RELATIONS (today just
-        #    derives_from — supported_by lost its cascade flag in #2252
-        #    Stage 1.3, so it no longer reaches anything through this walk).
+        # 2. Find all downstream nodes via CASCADE_RELATIONS (the constant in
+        #    engram_core is the source of truth for the set — supported_by lost
+        #    its cascade flag in #2252 Stage 1.3, so it no longer reaches
+        #    anything through this walk).
         # Uses shared walker (_walk_cascade_downstream) — PR-AA SSoT refactor.
         # Cascade machine (#2013/#2009 slice 1): one cascade_event per this
         # call, shared by the derivation-cascade write below AND the
