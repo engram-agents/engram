@@ -38,6 +38,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -622,6 +623,12 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         print(err, file=sys.stderr)
         sys.exit(EXIT_VALIDATION)
 
+    # argparse accepts an empty/whitespace positional; refuse before any
+    # remedy text could print a command with a missing argument.
+    if not to_agent:
+        print("baton flip: recipient handle is empty.", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
     raw = _api_get_raw(client, project_id)
     fields, body = _parse_frontmatter(raw)
     if not fields:
@@ -637,10 +644,22 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     participants = _parse_participants(participants_str) if participants_str else []
 
     if not _is_pool_sentinel(to_agent) and to_agent not in participants:
+        # add-participant is server-gated to existing participants, so the
+        # remedy line depends on whether THIS invoker is one.
+        if (agent_name or "").strip().lower() in participants:
+            who_adds = "add them first:"
+        else:
+            who_adds = (
+                f"a participant of {project_id} must add them first "
+                "(you are not one):"
+            )
         print(
             f"baton flip: '{to_agent}' is not a participant in {project_id}. "
-            f"Participants: {participants}. "
-            "Only participants (or the pool sentinel) can receive the baton.",
+            f"Participants: {participants}.\n"
+            f"If '{to_agent}' is the intended recipient (e.g. an escape-seat "
+            f"review), {who_adds}\n"
+            f"  baton add-participant {shlex.quote(project_id)} {shlex.quote(to_agent)}\n"
+            "then re-run the flip. If it is a typo, check the handle.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -1101,7 +1120,10 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str, client: F
     if agent_name.lower() not in participants:
         print(
             f"baton claim: '{agent_name}' is not a participant in {project_id}. "
-            f"Participants: {participants}.",
+            f"Participants: {participants}.\n"
+            f"add-participant is participant-only, so ask a participant of "
+            f"{project_id} to run:\n"
+            f"  baton add-participant {shlex.quote(project_id)} {shlex.quote(agent_name.lower())}",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)

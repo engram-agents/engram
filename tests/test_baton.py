@@ -528,6 +528,107 @@ class TestValidation:
         captured = capsys.readouterr()
         assert "not a participant" in captured.err or "participant" in captured.err
 
+    def test_flip_non_participant_refusal_names_working_remedy(self, monkeypatch, capsys):
+        """#2901: the refusal prints the exact `baton add-participant` command
+        with the real project id and recipient filled in, and that command
+        actually works: parse it with the real parser, run it, re-flip, succeed.
+        """
+        import shlex
+
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr: ("unknown", "no gh"))
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton("PR-2898", participants="[luria, borges]")},
+        )
+        flip_args = argparse.Namespace(
+            project_id="PR-2898", to="sol", reason="escape-seat review", force=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(flip_args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+
+        err = capsys.readouterr().err
+        assert "baton add-participant PR-2898 sol" in err
+        cmd_lines = [ln.strip() for ln in err.splitlines()
+                     if ln.strip().startswith("baton add-participant")]
+        assert cmd_lines == ["baton add-participant PR-2898 sol"]
+
+        # The printed command must parse and run against the real CLI surface.
+        argv = shlex.split(cmd_lines[0])[1:]
+        parsed = _baton.build_parser().parse_args(argv)
+        assert parsed.subcommand == "add-participant"
+        client.post.return_value = {"seq": 2, "added": True}
+        _baton.cmd_add_participant(parsed, MULTI_CONFIG, "borges", client)
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-2898/participants"
+        assert body["participant"] == "sol"
+
+        # Server-side state after the add; re-running the flip now succeeds.
+        client.get.return_value = {
+            "raw": _make_raw_baton("PR-2898", participants="[luria, borges, sol]"),
+        }
+        client.post.reset_mock()
+        client.post.return_value = {"seq": 3}
+        _baton.cmd_flip(flip_args, MULTI_CONFIG, "borges", client)
+        _, flip_body = client.post.call_args[0]
+        assert flip_body["to_agent"] == "sol"
+
+    def _flip_refusal(self, monkeypatch, capsys, *, to, invoker="borges",
+                      participants="[luria, borges]"):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr: ("unknown", "no gh"))
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton("PR-2901", participants=participants)},
+        )
+        args = argparse.Namespace(project_id="PR-2901", to=to, reason="x", force=False)
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, invoker, client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        return capsys.readouterr().err
+
+    @pytest.mark.parametrize("handle", ["so l", "o'neil", "a b'c"])
+    def test_flip_refusal_command_is_shell_quoted(self, monkeypatch, capsys, handle):
+        """Q1 (#2901 fold): the printed command round-trips through shlex.split."""
+        import shlex
+
+        err = self._flip_refusal(monkeypatch, capsys, to=handle)
+        cmd_lines = [ln.strip() for ln in err.splitlines()
+                     if ln.strip().startswith("baton add-participant")]
+        assert len(cmd_lines) == 1
+        assert shlex.split(cmd_lines[0]) == [
+            "baton", "add-participant", "PR-2901", handle,
+        ]
+
+    @pytest.mark.parametrize("to", ["   ", "\t"])
+    def test_flip_whitespace_only_recipient_refused_early(self, monkeypatch, capsys, to):
+        """Q2: whitespace-only --to gets the empty-recipient refusal and no
+        command with a missing argument is printed."""
+        err = self._flip_refusal(monkeypatch, capsys, to=to)
+        assert "baton flip: recipient handle is empty" in err
+        assert "add-participant" not in err
+
+    def test_flip_refusal_non_participant_invoker_wording(self, monkeypatch, capsys):
+        """P1: an invoker outside the participants cannot run add-participant
+        themselves, so the message says a participant must."""
+        err = self._flip_refusal(monkeypatch, capsys, to="sol", invoker="zed")
+        assert "a participant of PR-2901 must add them first (you are not one)" in err
+        assert "baton add-participant PR-2901 sol" in err
+        assert "add them first:" not in err
+
+    def test_flip_refusal_participant_invoker_wording(self, monkeypatch, capsys):
+        """P2: a participant invoker is told to add them first."""
+        err = self._flip_refusal(monkeypatch, capsys, to="sol", invoker="borges")
+        assert "add them first:" in err
+        assert "you are not one" not in err
+        assert "baton add-participant PR-2901 sol" in err
+
     def test_flip_to_casey_allowed(self, monkeypatch):
         """flip to 'casey' (pool sentinel) is always valid regardless of participants."""
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
@@ -2158,6 +2259,31 @@ class TestClaim:
         assert exc_info.value.code == EXIT_VALIDATION
         captured = capsys.readouterr()
         assert "participant" in captured.err
+
+    def test_claim_refusal_non_participant_names_remedy(self, monkeypatch, capsys):
+        """C1 (#2901 fold): a non-participant claimant is told to ask a
+        participant, with a real, parseable add-participant command."""
+        import shlex
+
+        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda n: n == "casey")
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-1003", turn="casey", participants="[ariadne, mneme]",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-1003")
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_claim(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        err = capsys.readouterr().err
+        assert "ask a participant of PR-1003 to run:" in err
+        cmd_lines = [ln.strip() for ln in err.splitlines()
+                     if ln.strip().startswith("baton add-participant")]
+        assert len(cmd_lines) == 1
+        parsed = _baton.build_parser().parse_args(shlex.split(cmd_lines[0])[1:])
+        assert parsed.subcommand == "add-participant"
+        assert parsed.project_id == "PR-1003"
+        assert parsed.participant == "borges"
 
     def test_claim_refuse_missing_project(self, capsys):
         """Claim of non-existent project → EXIT_VALIDATION, not-found error."""
