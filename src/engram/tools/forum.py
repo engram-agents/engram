@@ -28,7 +28,9 @@ import argparse
 import json
 import os
 import pwd
+import re
 import socket
+import stat
 import sys
 import urllib.error
 import urllib.request
@@ -746,8 +748,8 @@ def _render_thread_human(thread: dict, posts: list) -> None:
 def cmd_post(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     forum_url = _resolve_forum_url(config)
 
-    # Read body from stdin
-    body_md = sys.stdin.read().strip()
+    # Read body from stdin (never blocks on a socket stdin — #2906)
+    body_md = _read_stdin_body("post")
     if not body_md:
         print(
             "forum post: body is required — pipe markdown body via stdin.\n"
@@ -775,14 +777,84 @@ def cmd_post(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # Subcommand: reply
 # ---------------------------------------------------------------------------
 
+def _stdin_kind() -> str:
+    """Classify fd 0: ``"file" | "fifo" | "chardev" | "tty" | "other"``.
+
+    ``file`` / ``fifo`` / non-tty ``chardev`` (``< /dev/null``) are the kinds a
+    ``read()`` on which normally reaches EOF (heredoc, pipe, ``< file``); a
+    ``fifo`` only if its writer closes, which the caller cannot know.  ``tty``
+    is an interactive terminal.  ``other`` (a socket — the Claude Code Bash
+    harness — or an unreadable fd 0) can block forever and is never read (#2906).
+    """
+    try:
+        mode = os.fstat(0).st_mode
+    except OSError:
+        return "other"
+    if os.isatty(0):
+        return "tty"
+    if stat.S_ISREG(mode):
+        return "file"
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    if stat.S_ISCHR(mode):
+        return "chardev"
+    return "other"
+
+
+def _stdin_is_readable_redirect() -> bool:
+    """True iff fd 0 is a regular file, FIFO or non-tty character device."""
+    return _stdin_kind() in ("file", "fifo", "chardev")
+
+
+def _read_stdin_body(subcommand: str) -> str:
+    """Read a body from stdin for ``reply`` (no BODY), ``post`` and ``verify``.
+
+    Redirects are read; a tty is read interactively; anything else (a socket)
+    is refused at once rather than blocking forever (#2906).  Returns the
+    stripped text (possibly empty — the caller owns the empty-body message).
+    """
+    if _stdin_is_readable_redirect() or _stdin_kind() == "tty":
+        return sys.stdin.read().strip()
+    if subcommand == "reply":
+        msg = (
+            "forum reply: no body — pass it as an argument "
+            '(forum reply ID "text") or pipe it on stdin'
+        )
+    else:
+        msg = f"forum {subcommand}: no body on stdin — pipe it in (e.g. heredoc)"
+    print(msg, file=sys.stderr)
+    sys.exit(EXIT_VALIDATION)
+
+
 def cmd_reply(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     forum_url = _resolve_forum_url(config)
 
-    # Read body from stdin
-    body_md = sys.stdin.read().strip()
+    # Body: a positional BODY is authoritative and nothing here may block
+    # (#2906).  With a BODY, stdin is only *looked at*: a regular file always
+    # reaches EOF, so a non-empty one is refused as a second source; a FIFO may
+    # never close, so it is not read and a note says it was ignored; anything
+    # else (socket, tty, char device) is neither read nor mentioned.  Without a
+    # BODY, stdin is the body (_read_stdin_body).
+    if args.body is not None:
+        kind = _stdin_kind()
+        if kind == "file" and sys.stdin.read().strip():
+            print(
+                "forum reply: body given both as argument and on stdin; use one",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        if kind == "fifo":
+            print(
+                "forum reply: note: stdin ignored because a body argument was given",
+                file=sys.stderr,
+            )
+        body_md = args.body.strip()
+    else:
+        body_md = _read_stdin_body("reply")
     if not body_md:
         print(
-            "forum reply: body is required — pipe markdown body via stdin.\n"
+            "forum reply: body is required — pass it as an argument or pipe it via stdin.\n"
+            "  example: forum reply 42 'Great point!'\n"
             "  example: echo 'Great point!' | forum reply 42",
             file=sys.stderr,
         )
@@ -837,7 +909,7 @@ def cmd_verify(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
     # Read verification note from stdin (the established body-from-stdin
     # workflow, same pattern as forum post / forum reply).
-    note = sys.stdin.read().strip()
+    note = _read_stdin_body("verify")
     if not note:
         print(
             "forum verify: a verification note is required — "
@@ -1492,8 +1564,85 @@ def cmd_mark_read(args: argparse.Namespace, config: dict, agent_name: str) -> No
 # Argument parser
 # ---------------------------------------------------------------------------
 
+# argparse formats offending values with %r, so a value is a '...' span (or a
+# "..." span when it contains an apostrophe).  Values longer than this are
+# replaced by their length; short ones ("pakc") stay, they help the caller.
+_REDACT_OVER = 24
+_QUOTED_SPAN = re.compile(r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"")
+
+
+# The one argparse message that repeats user text WITHOUT %r: the ambiguous
+# option ("ambiguous option: --s=<value> could match --sort, --since").  The
+# value may contain spaces or quotes, so match up to the last " could match ".
+_AMBIGUOUS_OPTION = re.compile(
+    r"(ambiguous option: )(.*)( could match )", re.DOTALL
+)
+
+
+def _redact_ambiguous_option(m: "re.Match[str]") -> str:
+    opt, sep, value = m.group(2).partition("=")
+    if sep and len(value) > _REDACT_OVER:
+        opt = f"{opt}={'<%d chars, not shown>' % len(value)}"
+    else:
+        opt = m.group(2)
+    return f"{m.group(1)}{opt}{m.group(3)}"
+
+
+def _redact_long_values(message: str) -> str:
+    message = _AMBIGUOUS_OPTION.sub(_redact_ambiguous_option, message)
+
+    def repl(m: "re.Match[str]") -> str:
+        inner = m.group(1) if m.group(1) is not None else m.group(2)
+        if len(inner) > _REDACT_OVER:
+            return f"'<{len(inner)} chars, not shown>'"
+        return m.group(0)
+
+    return _QUOTED_SPAN.sub(repl, message)
+
+
+class _NoEchoArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that never echoes long user text in an error.
+
+    argparse's messages repeat the rejected value ("invalid int value: '<whole
+    body>'", "invalid choice: ...").  For a post body passed by mistake as an
+    argument that echoes the caller's whole message, which reads as a send
+    confirmation under ``| tail`` (#2906).  Two routes, both covered:
+    ``error()`` redacts every quoted value over ``_REDACT_OVER`` characters;
+    ``parse_args`` reports leftover ("unrecognized") arguments by count only.
+    Subparsers are created with this class too (``add_subparsers`` uses
+    ``type(parser)``), so their ``error()`` is this override.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: {_redact_long_values(message)}\n")
+
+    def parse_args(self, args=None, namespace=None):
+        ns, extras = self.parse_known_args(args, namespace)
+        if extras:
+            sub = getattr(ns, "subcommand", None) or "command"
+            sub_sub = getattr(ns, "pack_subcommand", None)
+            if sub_sub:
+                sub = f"{sub} {sub_sub}"
+            if sub == "reply":
+                hint = (
+                    "; the body may be a positional argument "
+                    "(forum reply THREAD-ID 'text') or piped on stdin"
+                )
+            elif sub in ("post", "verify"):
+                hint = f"; a {sub} body goes on stdin, not as an argument"
+            else:
+                hint = ""
+            self.exit(
+                2,
+                f"{self.prog}: {sub}: {len(extras)} unexpected argument(s) "
+                f"(text not shown){hint}.\n",
+            )
+        return ns
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _NoEchoArgumentParser(
         prog="forum",
         description=(
             "Agent-first LAN forum CLI — post, read, list, reply, and check "
@@ -1609,15 +1758,23 @@ def build_parser() -> argparse.ArgumentParser:
     # -- reply --
     p_reply = subparsers.add_parser(
         "reply",
-        help="Reply to a thread; body from stdin",
+        help="Reply to a thread; body as argument or from stdin",
         description=(
-            "Post a reply to an existing thread. Reads the post body from stdin "
-            "(pipe markdown content). Prints the thread_id and new post_id."
+            "Post a reply to an existing thread. The body is the optional BODY "
+            "argument, or, if absent, stdin (pipe markdown content). Giving both "
+            "is refused. On success prints 'forum reply: created  thread_id=N  "
+            "post_id=M' — that line is the ONLY confirmation the reply was sent; "
+            "if you did not see it, the reply was not posted."
         ),
     )
     p_reply.add_argument(
         "thread_id", type=int, metavar="THREAD-ID",
         help="Numeric thread ID to reply to",
+    )
+    p_reply.add_argument(
+        "body", nargs="?", default=None, metavar="BODY",
+        help="Reply body (markdown). If omitted, read from stdin. A body "
+             "starting with '-' needs '--' first: forum reply 42 -- \"-1 from me\"",
     )
 
     # -- online --
