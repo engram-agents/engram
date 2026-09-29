@@ -46,6 +46,23 @@ def _load_hook_module(engram_home: Path):
     spec = importlib.util.spec_from_file_location("engram_session_start_hook", _HOOK_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # engram-alpha#127: pin detect_harness() to "claude-code" (measured
+    # budget=9,500) -- this dev/source checkout has no baked platform.json
+    # (see _harness.py's own docstring), so the hook's own detect_harness()
+    # would otherwise return None and get_harness_budgets(None) would fall
+    # through to UNMEASURED_HARNESS_FLOOR (4,000), which is smaller than
+    # this file's fixtures were written against. Same discipline as
+    # tests/test_lesson_tripwire_injection_bounds.py's own
+    # _load_harness_budgets() docstring.
+    module.detect_harness = lambda: "claude-code"
+    # engram-alpha#127: stub out the tool-capability-index block so these
+    # tests are not incidentally coupled to the REAL checked-in
+    # tool_capability_index.txt artifact's size (measured 11,049 bytes on
+    # this checkout -- alone bigger than the hook's own 9,500-char TOTAL
+    # budget, which would starve every lower-priority block sorted after
+    # it, including the calibration block this file's own ordering tests
+    # check against).
+    module.tool_capability_index_block = lambda: ""
     return module
 
 
