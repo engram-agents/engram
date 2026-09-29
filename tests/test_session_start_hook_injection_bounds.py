@@ -92,6 +92,13 @@ def _load_hook_module(engram_home: Path):
       checkout -- bigger than the hook's own total budget by itself, which
       would starve every block sorted after it and has nothing to do with
       what any test in this file exercises).
+    - #3217: tool_capability_short_block() is stubbed to "" by the same
+      reasoning -- this file's fixtures are about the cap MECHANISM, not
+      the real, size-varying checked-in artifact the short block also
+      reads from. Individual tests that need the real-seat shape (both a
+      full and a short tool-caps block present) override this default with
+      a realistic ~800-char stub, same as they already do for
+      tool_capability_index_block.
     """
     os.environ["ENGRAM_HOME"] = str(engram_home)
     stub_ct = MagicMock()
@@ -107,6 +114,7 @@ def _load_hook_module(engram_home: Path):
     spec.loader.exec_module(module)
     module.detect_harness = lambda: "claude-code"
     module.tool_capability_index_block = lambda: ""
+    module.tool_capability_short_block = lambda: ""
     return module
 
 
@@ -440,6 +448,12 @@ class TestRealSeatShape:
         mod.starred_block = lambda home: "MARK-STARRED-" + ("t" * 100)
         huge_tool_caps = "MARK-TOOLCAPS-" + ("c" * 11_000)  # ~11K, matches the spec's tool-caps figure
         mod.tool_capability_index_block = lambda: huge_tool_caps
+        # #3217: realistic ~800-char short-tool-caps stub (owner's own
+        # measurement, issue comment 5881294279: names-only form is 803
+        # chars against the real artifact) -- both the full and short
+        # tool-caps blocks are present under the real-seat shape.
+        short_tool_caps_stub = "MARK-SHORTCAPS-" + ("k" * 800)
+        mod.tool_capability_short_block = lambda: short_tool_caps_stub
 
         with _mock_engram_client():
             result = _run_hook_main(mod, {
@@ -464,6 +478,10 @@ class TestRealSeatShape:
         # must be inline. If tool-caps is moved back ahead of calibration
         # (mutation (b)), this line goes red.
         assert "ENGRAM Calibration" in ctx, "calibration (small P3) must be inline"
+        # #3217: the SHORT tool-caps block is small enough to survive
+        # inline even under the real-seat shape, unlike the full index
+        # (asserted absent below).
+        assert short_tool_caps_stub in ctx, "short tool-caps block must be inline"
 
         # The focus marker appears with the correct K.
         match_marker = re.search(r"\(\+(\d+) more focused nodes cut", ctx)
@@ -618,6 +636,9 @@ class TestHeadWindowRealSeatShape:
         mod.starred_block = lambda home: "MARK-STARRED-" + ("t" * 100)
         huge_tool_caps = "MARK-TOOLCAPS-" + ("c" * 11_000)
         mod.tool_capability_index_block = lambda: huge_tool_caps
+        # #3217: realistic ~800-char short-tool-caps stub, same as
+        # TestRealSeatShape above.
+        mod.tool_capability_short_block = lambda: "MARK-SHORTCAPS-" + ("k" * 800)
 
         with _mock_engram_client():
             result = _run_hook_main(mod, {
@@ -683,6 +704,9 @@ class TestUnmeasuredFloorRealSeatShape:
         mod.starred_block = lambda home: "MARK-STARRED-" + ("t" * 100)
         huge_tool_caps = "MARK-TOOLCAPS-" + ("c" * 11_000)
         mod.tool_capability_index_block = lambda: huge_tool_caps
+        # #3217: realistic ~800-char short-tool-caps stub, same as
+        # TestRealSeatShape above.
+        mod.tool_capability_short_block = lambda: "MARK-SHORTCAPS-" + ("k" * 800)
 
         with _mock_engram_client():
             result = _run_hook_main(mod, {

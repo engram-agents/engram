@@ -2117,6 +2117,80 @@ def tool_capability_index_block() -> str:
         return ""
 
 
+# #3217: measured by the owner (issue comment 5881294279) against the real
+# checked-in tool_capability_index.txt (60 tools) — a names-only,
+# comma-separated form with the "engram_" prefix stripped is 803 chars;
+# every form that keeps even a truncated purpose (40-char cap: 3,684 chars;
+# 60-char cap: 4,884 chars) is far bigger than the ~1,213 chars of slack a
+# real seat has left in its 9,500-char budget after #3214's other blocks
+# (8,287 of 9,500 used). 1,200 is the cap this function's OWN rendered
+# output (header text + comma-joined names) must stay under — comfortably
+# above the measured 803/948-ish range, so ordinary artifact growth (a few
+# more tools) doesn't immediately trip it, while still catching the
+# structural regression (e.g. purposes creeping back in) that would blow
+# the budget the short form exists to fit inside.
+#
+# If the cap test fails because the tool count grew (at ~15 chars per name,
+# 1,200 holds roughly 78 tools): do not just raise the number. Re-measure
+# the real-seat slack first (the session-start budget is shared with the
+# focus list, which pays for every char here), then either raise the cap
+# within that slack or group the names by verb family.
+TOOL_SHORT_BLOCK_MAX = 1200
+
+
+def tool_capability_short_block() -> str:
+    """Render a SHORT, names-only index of every registered ENGRAM tool.
+
+    Companion to tool_capability_index_block() (#1958): that block carries
+    one-line purposes per tool and is, by itself, bigger than this hook's
+    entire emission budget (11,049 bytes checked in), so it always lands in
+    the overflow file and an agent sees no inline tool list at all (#3217).
+    This function reads the SAME checked-in artifact via
+    _resolve_tool_capability_index_path() — there is no second artifact, so
+    the short form cannot drift from the index the drift/coverage tests
+    already keep honest — and renders just the tool NAMES, comma-separated,
+    with the "engram_" prefix stripped (every registered tool carries that
+    prefix; stripping it saves ~7 chars per name for free).
+
+    Tool name = the text before the first ":" on each non-blank artifact
+    line, in file order (the artifact's own order, not re-sorted here).
+
+    Returns "" when the artifact is missing, unreadable, or empty — same
+    never-raise contract as tool_capability_index_block(): this is optional
+    context, never allowed to block session start.
+
+    Does NOT truncate to TOOL_SHORT_BLOCK_MAX — growth past the cap is
+    caught by a test (tests/test_session_start_hook_tool_capability_block.py),
+    so it fails loudly in CI, not silently at runtime.
+    """
+    try:
+        path = _resolve_tool_capability_index_path()
+        if not os.path.exists(path):
+            return ""
+        with open(path, encoding="utf-8") as f:
+            raw_lines = [ln.rstrip("\n") for ln in f]
+        entries = [ln for ln in raw_lines if ln.strip()]
+        if not entries:
+            return ""
+
+        names = []
+        for entry in entries:
+            name = entry.split(":", 1)[0]
+            if name.startswith("engram_"):
+                name = name[len("engram_"):]
+            names.append(name)
+
+        return (
+            f"ENGRAM tools ({len(names)}; fetch a tool's schema before first "
+            "use; one-line purposes for each are in the overflow file named "
+            "on the first line): " + ", ".join(names)
+        )
+    except Exception:
+        # Hook discipline: never surface tool-capability-index errors at
+        # session start — this block is optional context, not load-bearing.
+        return ""
+
+
 SESSION_ROLE = os.environ.get("ENGRAM_SESSION_ROLE", "interactive").strip().lower()
 # Effective session role — updated by main() after write_marker() resolves CWD.
 # Starts equal to SESSION_ROLE (env-var), may be promoted to "fairy" by CWD detection.
@@ -3634,12 +3708,32 @@ def main() -> None:
     # body list decides only which blocks it hides BEHIND it (rule 1 of
     # #127 r2). Held in `_tool_caps_text` and appended as the LAST body
     # item, after every other block including calibration, right before the
-    # final emit_context() call.
+    # final emit_context() call. #3217: since this full block almost never
+    # fits, a SHORT names-only companion (tool_capability_short_block(),
+    # immediately below) is queued as an ORDINARY _P_REST block instead --
+    # it is small enough to actually survive Stage-2 selection, so an agent
+    # gets an inline tool-name list even when the full per-tool-purpose
+    # index is cut to the overflow file.
     _tool_caps_text = ""
     try:
         _tool_caps_text = tool_capability_index_block()
     except Exception:
         pass
+
+    # ── Short tool-capability index (#3217) ────────────────────────────────
+    # Names-only companion to the full index above, small enough (measured
+    # 948 chars against the real artifact, capped at TOOL_SHORT_BLOCK_MAX)
+    # to actually survive inline. Unlike `_tool_caps_text`, this IS appended
+    # to `_blocks` here, as an ordinary _P_REST item -- so the focus
+    # sub-cap's `_reserve` computation below (which sums `_blocks`) counts
+    # it like every other small rest block, rather than being held aside
+    # the way the full index deliberately is.
+    try:
+        _tool_caps_short_text = tool_capability_short_block()
+    except Exception:
+        _tool_caps_short_text = ""
+    if _tool_caps_short_text:
+        _blocks.append((_P_REST, _tool_caps_short_text))
 
     # ── ENGRAM Calibration block (EXPENSIVE — must stay last, see #1819) ───
     # Inject per-type distribution anchors on every SessionStart so fresh-wake
