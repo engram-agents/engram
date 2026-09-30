@@ -44,6 +44,15 @@ Pre-registration rules enforced here:
     Same treatment for fires dropped by a seat's privacy screener
     (drops.jsonl) -- excluded from O1/O2, counted per arm (Amendment 2).
 
+Amendment 3 (#2753, Kepler's ruling 2026-09-27 18:47Z): the report states the
+sampled fraction per seat, and the per-lesson composition of each seat's
+sample (so a two-lesson seat is not read as a fleet result). This reads
+extract_spans.py's own sample_summary.json (date, sample_n, sample_seed,
+eligible, sampled, per_lesson), one file per UTC day, via --sample-summary
+(a glob per seat, repeatable, paired with --seat like --ledger/--verdicts/
+--key) or its explicit opt-out --no-sample-summary. Never a walked-past
+rate -- counts and fractions of the SAMPLE only.
+
 O1's "per K in K_SWEEP ...; report sign stability across K" (round 2, item 1)
 measures the SAME outcome (heeded vs walked past) at every K, from the
 verdicts.jsonl's own corrective_at field -- never round 1's proxy
@@ -59,20 +68,27 @@ adjudicator-facing file. Stdlib only.
 
 Usage:
     python -m tools.ws4.analyze --ledger LEDGER --verdicts VERDICTS --key KEY \\
-        --flags FLAGS --db knowledge.db --seat SEAT-A \\
+        --flags FLAGS --sample-summary "out/seatA/*/sample_summary.json" \\
+        --db knowledge.db --seat SEAT-A \\
         [--drops DROPS] [--unlocatable OUT/unlocatable.jsonl]
     # or, explicitly opting out of the leak audit (round 2, item 3):
     python -m tools.ws4.analyze --no-flags --ledger LEDGER --verdicts VERDICTS \\
-        --key KEY --seat SEAT-A
+        --key KEY --sample-summary "out/seatA/*/sample_summary.json" --seat SEAT-A
+    # or, explicitly opting out of the sample report (amendment 3):
+    python -m tools.ws4.analyze --no-sample-summary --ledger LEDGER --verdicts VERDICTS \\
+        --key KEY --flags FLAGS --seat SEAT-A
 
     # multiple seats, pooled + per-seat:
     python -m tools.ws4.analyze --seat SEAT-A --ledger L1 --verdicts V1 --key K1 --flags F1 \\
+                                 --sample-summary "out/seatA/*/sample_summary.json" \\
                                  --seat SEAT-B --ledger L2 --verdicts V2 --key K2 --flags F2 \\
+                                 --sample-summary "out/seatB/*/sample_summary.json" \\
                                  --db knowledge.db
 """
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import sys
 from pathlib import Path
@@ -154,14 +170,34 @@ def load_drops(path) -> dict:
     return {row["fire_id"]: row for row in load_jsonl(path)}
 
 
+def load_sample_summaries(pattern: str, seat: str) -> list:
+    """Amendment 3 (#2753): expands one --sample-summary glob (one pattern
+    per --seat, e.g. "out/seatA/*/sample_summary.json" -- one file per UTC
+    day) and parses each matched file as extract_spans.py's
+    sample_summary.json (date, sample_n, sample_seed, eligible, sampled,
+    per_lesson). A pattern matching zero files is a fail-loud error naming
+    the seat -- an empty match is far more likely a mistyped path or date
+    range than "no data for this seat" and must never be silently treated
+    as zero days."""
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        raise ValueError(f"--sample-summary glob matched no files for seat {seat!r}: {pattern!r}")
+    summaries = []
+    for match in matches:
+        with open(match, "r", encoding="utf-8") as f:
+            summaries.append(json.load(f))
+    return summaries
+
+
 class SeatInputs:
-    def __init__(self, seat, ledger_rows, key, verdicts, flags, drops=None):
+    def __init__(self, seat, ledger_rows, key, verdicts, flags, drops=None, sample_summaries=None):
         self.seat = seat
         self.ledger_rows = ledger_rows
         self.key = key
         self.verdicts = verdicts
         self.flags = flags
         self.drops = drops if drops is not None else {}
+        self.sample_summaries = sample_summaries if sample_summaries is not None else []
 
 
 def _transcript_cache_get(cache: dict, path: str):
@@ -459,14 +495,79 @@ def compute_o2(seats: "list[SeatInputs]", db_path):
     return {"per_arm": per_arm, "flagged_excluded": flagged_counts, "dropped_excluded": dropped_counts}
 
 
+def compute_sample_report(seats: "list[SeatInputs]") -> dict:
+    """Amendment 3 (#2753), Kepler's ruling 2026-09-27 18:47Z: reports the
+    sampled fraction per seat, and the per-lesson composition of each
+    seat's sample -- so a two-lesson seat is never read as a fleet result.
+    Aggregates each seat's sample_summary.json files (one per UTC day, via
+    SeatInputs.sample_summaries) into per-seat totals, per-lesson
+    composition (summed over days), a per-day breakdown (sorted by date),
+    and a pooled total across seats. sampled_fraction is None when
+    eligible==0 (never a bogus 0/0), and these are always counts/fractions
+    of the SAMPLE only, never a walked-past rate.
+
+    A seat whose summaries carry more than one distinct sample_n or
+    sample_seed is reported loudly via config_changed=True plus the
+    distinct values seen -- the ruling forbids changing N mid-window, and
+    this is never silently averaged over or ignored."""
+    per_seat = {}
+    pooled_eligible = 0
+    pooled_sampled = 0
+
+    for seat_inputs in seats:
+        summaries = seat_inputs.sample_summaries
+        eligible = 0
+        sampled = 0
+        per_lesson: dict = {}
+        per_day = []
+        sample_ns = set()
+        sample_seeds = set()
+        for summary in summaries:
+            summary_eligible = summary.get("eligible", 0)
+            summary_sampled = summary.get("sampled", 0)
+            eligible += summary_eligible
+            sampled += summary_sampled
+            sample_ns.add(summary.get("sample_n"))
+            sample_seeds.add(summary.get("sample_seed"))
+            for lesson_id, counts in (summary.get("per_lesson") or {}).items():
+                bucket = per_lesson.setdefault(lesson_id, {"eligible": 0, "sampled": 0})
+                bucket["eligible"] += counts.get("eligible", 0)
+                bucket["sampled"] += counts.get("sampled", 0)
+            per_day.append({"date": summary.get("date"), "eligible": summary_eligible, "sampled": summary_sampled})
+        per_day.sort(key=lambda d: d["date"])
+
+        seat_report = {
+            "days": len(summaries),
+            "eligible": eligible,
+            "sampled": sampled,
+            "sampled_fraction": (sampled / eligible) if eligible else None,
+            "per_lesson": per_lesson,
+            "per_day": per_day,
+            "config_changed": len(sample_ns) > 1 or len(sample_seeds) > 1,
+        }
+        if seat_report["config_changed"]:
+            seat_report["sample_n_values"] = sorted(sample_ns, key=lambda v: (v is None, v))
+            seat_report["sample_seed_values"] = sorted(sample_seeds, key=lambda v: (v is None, v))
+        per_seat[seat_inputs.seat] = seat_report
+
+        pooled_eligible += eligible
+        pooled_sampled += sampled
+
+    pooled = {
+        "eligible": pooled_eligible,
+        "sampled": pooled_sampled,
+        "sampled_fraction": (pooled_sampled / pooled_eligible) if pooled_eligible else None,
+    }
+    return {"per_seat": per_seat, "pooled": pooled}
+
+
 _KNOWN_LEDGER_ARMS = ("chain", "control", "na", "error")
 _ERROR_STRING_MAX_LEN = 120
 
 
 def compute_denominators(seats: "list[SeatInputs]", unlocatable_paths=None):
-    """... (fires_by_arm / unclear / dropped_privacy / unlocatable, as
-    before, joined through each seat's key.jsonl -- chain/control fires
-    only).
+    """fires_by_arm / unclear / dropped_privacy / unlocatable, as before,
+    joined through each seat's key.jsonl -- chain/control fires only.
 
     Also computed here, from the RAW ledger rows of each seat (never
     joined through the key -- na/error rows have no key.jsonl entry at
@@ -487,7 +588,18 @@ def compute_denominators(seats: "list[SeatInputs]", unlocatable_paths=None):
     error_rows: {"count": N, "by_error": {error_string_truncated_to_120:
     count}}, pooled across all seats -- PR #3173's `error` rows (arm draw
     or row construction failed) surfaced by error string, so a failure
-    stays visible in the denominator instead of disappearing."""
+    stays visible in the denominator instead of disappearing. An `error`
+    row with no `error` key (or an explicit null) is bucketed under the
+    literal string "(no error string)", never the misleading "None".
+
+    unlocatable_by_arm: {arm_value: count, "unmatched": count} -- each
+    unlocatable row (from unlocatable_paths) joined to an arm by
+    recomputing compute_fire_id() over the RAW ledger rows of ALL seats
+    (never through key.jsonl -- an unlocatable fire never gets a
+    key.jsonl row, so this join is the only way to see whether location
+    failures cluster in one arm). A fire_id with no matching ledger row
+    counts under "unmatched". None (not computed) when unlocatable_paths
+    is not given, mirroring "unlocatable" itself."""
     fires_by_arm = {arm: 0 for arm in ARMS}
     unclear = 0
     dropped_privacy = {arm: 0 for arm in ARMS}
@@ -506,7 +618,9 @@ def compute_denominators(seats: "list[SeatInputs]", unlocatable_paths=None):
             if arm_key == "error":
                 error_row_count += 1
                 error_string = row.get("error")
-                if not isinstance(error_string, str):
+                if error_string is None:
+                    error_string = "(no error string)"
+                elif not isinstance(error_string, str):
                     error_string = str(error_string)
                 error_string = error_string[:_ERROR_STRING_MAX_LEN]
                 error_by_string[error_string] = error_by_string.get(error_string, 0) + 1
@@ -529,27 +643,84 @@ def compute_denominators(seats: "list[SeatInputs]", unlocatable_paths=None):
         ledger_rows_by_arm_per_seat[seat_inputs.seat] = seat_arm_counts
 
     unlocatable = None
+    unlocatable_by_arm = None
     if unlocatable_paths:
         unlocatable = 0
+        unlocatable_by_arm = {arm: 0 for arm in ARMS}
+        unlocatable_by_arm["unmatched"] = 0
+        # Join basis for unlocatable_by_arm: fire_id -> arm, recomputed from
+        # the RAW ledger rows of every seat (never through key.jsonl -- an
+        # unlocatable fire never gets a key.jsonl row).
+        fire_id_to_arm = {}
+        for seat_inputs in seats:
+            for row in seat_inputs.ledger_rows:
+                fire_id_to_arm[compute_fire_id(row)] = row.get("arm")
         for p in unlocatable_paths:
             if p and Path(p).exists():
-                unlocatable += len(load_jsonl(p))
+                unlocatable_rows = load_jsonl(p)
+                unlocatable += len(unlocatable_rows)
+                for row in unlocatable_rows:
+                    arm = fire_id_to_arm.get(row.get("fire_id"))
+                    if arm in ARMS:
+                        unlocatable_by_arm[arm] += 1
+                    else:
+                        unlocatable_by_arm["unmatched"] += 1
     return {
         "fires_by_arm": fires_by_arm,
         "unclear": unclear,
         "dropped_privacy": dropped_privacy,
         "unlocatable": unlocatable,
+        "unlocatable_by_arm": unlocatable_by_arm,
         "ledger_rows_by_arm": {"pooled": ledger_rows_by_arm_pooled, "per_seat": ledger_rows_by_arm_per_seat},
         "error_rows": {"count": error_row_count, "by_error": error_by_string},
     }
 
 
-def _print_report(o1_headline, o1_k_sweep, length_control, o2, denominators, no_flags_warning=False) -> None:
+def _print_sample_report(sample_report: dict) -> None:
+    """Amendment 3's printed section (#2753): one line per seat with
+    eligible / sampled / fraction / days, then that seat's per-lesson
+    lines, then the pooled line. Counts and fractions of the SAMPLE only
+    -- never a walked-past rate."""
+    print("\n== Sample (amendment 3) ==")
+    for seat, info in sample_report["per_seat"].items():
+        print(
+            f"  seat={seat} eligible={info['eligible']} sampled={info['sampled']} "
+            f"fraction={info['sampled_fraction']} days={info['days']}"
+        )
+        for lesson_id, counts in info["per_lesson"].items():
+            print(f"    lesson={lesson_id} eligible={counts['eligible']} sampled={counts['sampled']}")
+        if info["config_changed"]:
+            print(
+                f"  WARNING: seat={seat} sample_n/sample_seed changed mid-window -- "
+                f"sample_n values={info['sample_n_values']} sample_seed values={info['sample_seed_values']}"
+            )
+    pooled = sample_report["pooled"]
+    print(
+        f"  pooled eligible={pooled['eligible']} sampled={pooled['sampled']} "
+        f"fraction={pooled['sampled_fraction']}"
+    )
+
+
+def _print_report(
+    o1_headline,
+    o1_k_sweep,
+    length_control,
+    o2,
+    denominators,
+    no_flags_warning=False,
+    sample_report=None,
+    no_sample_summary_warning=False,
+) -> None:
     if no_flags_warning:
         print(
             "WARNING: --no-flags was passed -- the leak audit is disabled; head-named "
             "spans (where a fired lesson's head id still appears in the span) will be "
             "silently mixed into every table below.\n"
+        )
+    if no_sample_summary_warning:
+        print(
+            "WARNING: --no-sample-summary was passed -- the sample report (amendment 3) is "
+            "disabled; this run's report will not show the sampled fraction per seat.\n"
         )
 
     print("== Denominators ==")
@@ -559,6 +730,9 @@ def _print_report(o1_headline, o1_k_sweep, length_control, o2, denominators, no_
     if error_rows["count"] > 0:
         for error_string, count in error_rows["by_error"].items():
             print(f"  {count}x {error_string}")
+    unlocatable_by_arm = denominators.get("unlocatable_by_arm")
+    if unlocatable_by_arm is not None:
+        print(f"unlocatable by arm: {unlocatable_by_arm}")
     # Reviewer note (PR #3175 round-3 comment): flagged/dropped_privacy
     # counts below are per-fire, but every table they guard tallies per
     # shown-lesson-unit (expand_per_lesson) -- a multi-lesson fire is one
@@ -567,6 +741,9 @@ def _print_report(o1_headline, o1_k_sweep, length_control, o2, denominators, no_
     # shown_lesson_ids is empty, today's fallback), but the two counts are
     # in different units and must not be summed against each other.
     print("(note: flagged/dropped_privacy counts are per-fire; all other counts below are per-lesson-unit)")
+
+    if sample_report is not None:
+        _print_sample_report(sample_report)
 
     print(
         f"\n== O1: walked-past share, arm difference at K_PRIMARY={K_PRIMARY} "
@@ -627,6 +804,25 @@ def main(argv=None) -> int:
         help="drops.jsonl path from a seat's privacy screener (Amendment 2; repeatable, paired with --seat; optional)",
     )
     parser.add_argument("--unlocatable", action="append", default=None, help="unlocatable.jsonl path(s), for the denominators table (optional)")
+    parser.add_argument(
+        "--sample-summary",
+        action="append",
+        default=None,
+        help=(
+            "sample_summary.json GLOB from extract_spans.py (repeatable, paired with --seat; "
+            "one glob per --seat, e.g. out/seatA/*/sample_summary.json -- one file per UTC "
+            "day). Required unless --no-sample-summary is explicitly passed (amendment 3). "
+            "A glob matching zero files is a fail-loud error naming the seat."
+        ),
+    )
+    parser.add_argument(
+        "--no-sample-summary",
+        action="store_true",
+        help=(
+            "Explicitly run WITHOUT the amendment-3 sample report. Prints a warning naming "
+            "the consequence. Mutually exclusive with --sample-summary."
+        ),
+    )
     parser.add_argument("--db", default=None, help="knowledge.db path, read-only (for O2 situation_pattern lookups)")
     args = parser.parse_args(argv)
 
@@ -657,9 +853,28 @@ def main(argv=None) -> int:
     if len(drops_list) != n:
         parser.error(f"--drops must be given once per --seat (got {len(drops_list)}, expected {n})")
 
+    # Amendment 3: --sample-summary is required unless --no-sample-summary is
+    # explicitly passed. Omitting it silently would leave the sample report
+    # missing with no indication why.
+    if args.no_sample_summary:
+        if args.sample_summary:
+            parser.error("--sample-summary and --no-sample-summary are mutually exclusive")
+        sample_summary_list = [None] * n
+    else:
+        if not args.sample_summary:
+            parser.error(
+                "--sample-summary is required (once per --seat) unless --no-sample-summary "
+                "is explicitly passed -- omitting it silently would disable the sample report"
+            )
+        if len(args.sample_summary) != n:
+            parser.error(
+                f"--sample-summary must be given once per --seat (got {len(args.sample_summary)}, expected {n})"
+            )
+        sample_summary_list = args.sample_summary
+
     seats = []
-    for seat, ledger_path, verdicts_path, key_path, flags_path, drops_path in zip(
-        args.seat, args.ledger, args.verdicts, args.key, flags_list, drops_list
+    for seat, ledger_path, verdicts_path, key_path, flags_path, drops_path, sample_summary_pattern in zip(
+        args.seat, args.ledger, args.verdicts, args.key, flags_list, drops_list, sample_summary_list
     ):
         seats.append(
             SeatInputs(
@@ -669,6 +884,11 @@ def main(argv=None) -> int:
                 verdicts=load_verdicts(verdicts_path),
                 flags=load_flags(flags_path),
                 drops=load_drops(drops_path),
+                sample_summaries=(
+                    load_sample_summaries(sample_summary_pattern, seat)
+                    if sample_summary_pattern is not None
+                    else []
+                ),
             )
         )
 
@@ -677,8 +897,18 @@ def main(argv=None) -> int:
     length_control = compute_length_control(seats)
     o2 = compute_o2(seats, args.db)
     denominators = compute_denominators(seats, args.unlocatable)
+    sample_report = None if args.no_sample_summary else compute_sample_report(seats)
 
-    _print_report(o1_headline, o1_k_sweep, length_control, o2, denominators, no_flags_warning=args.no_flags)
+    _print_report(
+        o1_headline,
+        o1_k_sweep,
+        length_control,
+        o2,
+        denominators,
+        no_flags_warning=args.no_flags,
+        sample_report=sample_report,
+        no_sample_summary_warning=args.no_sample_summary,
+    )
     return 0
 
 

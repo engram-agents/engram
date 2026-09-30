@@ -536,7 +536,8 @@ def test_validate_missing_agent_output_warns_and_continues():
         chunk_1.mkdir(parents=True)
 
         _write_agent_output(chunk_0, [_valid_item("ob_0001")])
-        _write_manifest(out_dir, [chunk_0, chunk_1])
+        # No manifest.json: ad-hoc mode, where a missing payload only warns
+        # (in manifest mode it is a pipeline bug -> exit 2, #3045).
 
         # chunk-1 intentionally has no agent_output.json or payload.json
         exit_code = _run(["validate", "--out", str(out_dir)])

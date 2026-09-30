@@ -63,6 +63,16 @@ LOOP_MODE_MARKER = "loop-mode.json"
 # (amendment 1, O2 situation paragraph).
 ENGRAM_NODE_CREATING_MARKERS = ("engram_add_", "engram_derive")
 
+# amendment 3, #2753 (adopted by Kepler 2026-09-27 18:47Z) -- per seat per
+# UTC day, at most SAMPLE_N chain+control fires are adjudicated. The sample
+# is the SAMPLE_N fires with the lowest sha256(f"{SAMPLE_SEED}:{fire_id}")
+# hex digest. fire_id carries no arm and the arm draw uses a different seed
+# (ledger.compute_fire_id's own docstring), so the sample is arm-blind by
+# construction. Every unsampled fire is still counted, never silently
+# dropped -- see extract_spans.py's sample.jsonl / sample_summary.json.
+SAMPLE_N = 10
+SAMPLE_SEED = "8659083e0530349eca0d57147420814e"
+
 
 def is_outbound_bash(command: str) -> bool:
     """Bash-category outbound-act check (amendment 1, category 1)."""

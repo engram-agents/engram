@@ -366,6 +366,32 @@ def _ambient_repo_untouched_guard():
     )
 
 
+def _is_family_module_key(key: str) -> bool:
+    return key == "server" or key.startswith("engram_")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _restore_sys_modules_per_file():
+    """Undo ``fresh_module``'s sys.modules purge at the end of each test file (#3225).
+
+    ``fresh_module`` deletes every ``server`` / ``engram_*`` entry and re-imports,
+    orphaning the objects a later test file bound at import time (its
+    ``patch.object`` then patches a module the code under test never resolves).
+    Snapshot at file start; at file end put every original back and drop any
+    family key that was absent at snapshot time.
+
+    Module scope on purpose: files that call ``fresh_module`` once in a module-
+    or class-level setup rely on the fresh siblings (carrying the temp DATA_DIR)
+    for lazy in-function imports across all their tests; a per-test restore
+    would point those back at the original modules mid-file.
+    """
+    snapshot = {k: v for k, v in sys.modules.items() if _is_family_module_key(k)}
+    yield
+    for key in [k for k in sys.modules if _is_family_module_key(k) and k not in snapshot]:
+        del sys.modules[key]
+    sys.modules.update(snapshot)
+
+
 def fresh_module(mod: types.ModuleType) -> types.ModuleType:
     """Return a freshly reloaded copy of a repo module, isolated for testing.
 
@@ -386,6 +412,10 @@ def fresh_module(mod: types.ModuleType) -> types.ModuleType:
     function returns — ``fresh_module`` does not know which temp dir to use.
     See ``tests/IMPORT_RUBRIC.md`` §R4 for the full usage pattern.
 
+    The purge is NOT permanent: the autouse module-scoped fixture
+    ``_restore_sys_modules_per_file`` restores the original ``server`` /
+    ``engram_*`` entries at the end of each test file (#3225).
+
     Args:
         mod: The imported module object whose family should be reloaded.
 
@@ -394,7 +424,7 @@ def fresh_module(mod: types.ModuleType) -> types.ModuleType:
     """
     mod_name = mod.__name__
     for key in list(sys.modules):
-        if key == "server" or key.startswith("engram_"):
+        if _is_family_module_key(key):
             del sys.modules[key]
     import importlib
     return importlib.import_module(mod_name)

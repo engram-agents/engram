@@ -134,8 +134,11 @@ is excluded.
 
 ### 2.1 The filesystem is the primary gate — a 0700 directory, not the socket's own mode
 
-The socket lives at `$ENGRAM_HOME/run/owner.sock`. **`$ENGRAM_HOME/run/` is created mode 0700
-before the bind**, and the socket's own mode is not relied on.
+The socket lives at `$ENGRAM_HOME/run/engramd.sock`. **`$ENGRAM_HOME/run/` is created mode 0700
+before the bind**, and the socket's own mode is not relied on as the gate (it is still set explicitly,
+see below). The filename is the shipped one (`DEFAULT_SOCKET_NAME`, single-sourced in
+`engramd_client.py`); earlier revisions said `owner.sock`. The property is the directory, not the name
+(Borges's ruling on #3194).
 
 The load-bearing reason is measured: P5 shows a plain `bind()` leaves the socket at **0755**.
 `chmod` after bind closes it, but between bind and chmod there is a window in which the socket is
@@ -151,6 +154,29 @@ conclusion on its own.
 
 `umask` is set explicitly around the directory creation rather than inherited, since an inherited
 umask is a setting some other part of the process can change.
+
+**Mode bits are not the whole access rule where the parent carries an inheritable ACL.** A `chmod 0700`
+does not remove ACL entries, and a subdirectory inherits its parent's inheritable ones:
+
+- **Linux, measured by Borges on #3194:** `~/.engram` carries `default:user:spt:rw-` with
+  `default:mask::rwx`. A fresh `run/` at mode 0700 keeps the inherited default ACL, so a socket created
+  inside it gets `spt rw-`. The directory's own `x` is masked for `spt` today, so the path is not
+  traversable, but the rule is one mask change away from opening.
+- **Darwin, measured by me (2026-09-28):** a parent with an inheritable `allow read,write` entry gives a
+  `mkdir -m 0700` child the entry (`drwx------+`, *inherited*), and a socket bound inside inherits it
+  too. `chmod -N` on `run/` removes it, and a socket bound **after** the strip carries no ACL. A socket
+  bound before the strip keeps its copy. The cross-user connect effect was not measured (that needs a
+  second account).
+
+So the owner must **strip ACLs on `run/` before the bind**: remove the default ACL and any named
+entries on Linux, and `chmod -N` on Darwin. It does this through a directory fd opened with
+`O_DIRECTORY|O_NOFOLLOW` and `fstat`-checked, never by path. It then **sets the socket's own mode
+explicitly** rather than inheriting it from the umask.
+
+**Build scope.** The U4a build (#3194, #3201) implements the **Linux arm only**. On any other platform,
+or on a Linux seat without `setfacl` or `SO_PEERCRED`, the owner **refuses to start** (§2.2's posture)
+rather than running without the strip. The Darwin `chmod -N` step above specifies what a later Darwin
+build must do; no Darwin build does it today.
 
 ### 2.2 Peer credentials — defence in depth, and the assertion that makes it real
 
@@ -260,21 +286,45 @@ the census (§3.2) plus the owner's own operations, and every action it denies m
 caller that swallows the denial. `SQLITE_TRANSACTION` is the first known member; I do not claim it is
 the last, and §7 records that the derivation is owed rather than done.
 
-**Which connection serves `snapshot()` — ANSWERED in revision 5, by Mira's ruling.** History first:
-revision 2 said the write connection, "because `snapshot()` uses SQLite's backup API rather than
-issuing read statements", which was wrong about code cited ten lines above it — both
-`_commit_snapshot_async` (`:7084-7098`) and `_commit_snapshot_sync` (`:7287-7313`) issue
-`BEGIN DEFERRED`, then `SELECT count(*) FROM sqlite_master`, then `COMMIT`. So `snapshot()` **does**
-issue reads and **does** open a transaction. Revision 3 withdrew that answer and stated only the
-constraint.
+**Which connection serves `snapshot()` — ANSWERED in revision 5 by Mira's ruling on the connection
+question, then corrected again in revision 6 on the snapshot() contract itself (below).** History,
+read as history rather than a still-standing claim: revision 2 said the write connection, "because
+`snapshot()` uses SQLite's backup API rather than issuing read statements". Revision 3 called this
+"wrong about code cited ten lines above it", pointing at `_commit_snapshot_async` (`:7084-7098`) and
+`_commit_snapshot_sync` (`:7287-7313`), which issue `BEGIN DEFERRED`, then
+`SELECT count(*) FROM sqlite_master`, then `COMMIT`, and concluded "`snapshot()` **does** issue reads
+and **does** open a transaction" — withdrawing revision 2's answer and stating only the constraint.
+**Revision 6 (below) establishes that revision 3's inference was itself mistaken**: the cited code
+belongs to a different function than the one this section is about. Revision 2's original statement
+was correct for the owner RPC; revision 3's correction, though well-reasoned from the code it looked
+at, looked at the wrong code.
 
-**`snapshot()` runs on an owner-internal, serialized/quiesced path — never the client-read SQL path.**
-It must (i) preserve the real `BEGIN` / `READ` / `COMMIT` sequence; (ii) **fail loudly** on an
-authorization error, so the `except Exception: pass` at that site is narrowed and a denial can no longer
-be mistaken for a transient; and (iii) never toggle the client-read connection's authorizer. A dedicated
-internal connection satisfies all three and is consistent with the process-scoped boundary below. What
-is still owed is the concrete backup/transaction lifecycle, which needs the implementation test (§5
-test 17), not more prose.
+⚠ **Revision 6 (Borges's ruling, engram-alpha#3221, 2026-09-29): revision 3's withdrawal named the
+wrong function, and the BEGIN/READ/COMMIT requirement below never applied to the owner RPC.** Two
+functions are both loosely called "snapshot", and the paragraph above answers about only one of
+them: `_commit_snapshot_async`/`_commit_snapshot_sync` are `engram_core.py`'s **per-turn checkpoint**
+(the nap/sleep git-checkpoint read-mark) — a different mechanism from the **owner RPC** this section is
+actually about (`engramd_owner._handle_snapshot`, U3 contract item 5, U4b's build target), which copies
+the store with `sqlite3.Connection.backup()` alone. Revision 2 was right about the owner RPC; the code
+revision 3 cited to refute it belonged to the checkpoint function instead. **`backup()` never issues a
+`BEGIN`/`SELECT`/`COMMIT` of its own and never consults the authorizer at all** — measured independently
+three times (U4b's build, its reviewer-fairy, and Mira's own reproduction): a deny-all authorizer on the
+source connection does not stop it, while an ordinary `SELECT` on the same connection is denied. Wrapping
+the copy in a read-mark sequence solely so a denial-based test could pass would test a ritual added for
+the test, not the copy itself — rejected for that reason. The checkpoint function's own
+`except Exception: pass` read-mark swallow is real and stays open, tracked as its own issue rather than
+folded into this slice (it lives in a different file, under no authorizer in Phase 1).
+
+**`snapshot()` [the owner RPC] runs on an owner-internal, serialized/quiesced path — never the
+client-read SQL path — and owes exactly three properties, not a BEGIN/READ/COMMIT sequence:**
+(i) it never runs on, and never touches the authorizer of, the client-read connection; (ii) a copy
+failure is loud — `Rejected(reason="snapshot_failed")`, never a success; (iii) client SQL cannot reach
+the connection `snapshot()` runs on (structural, independent of (i)). A dedicated internal connection
+satisfies all three. **The authorizer floor does not bound what `snapshot()` copies** — `backup()`
+copies the whole database regardless of any authorizer, by design; what bounds *who may call it* is the
+socket peer/method gate (U4a/U4c), not this connection's authorizer. If that needs narrowing, it is
+those units' job. §5 test 17 is written against (i)-(iii) plus the authorizer-blind fact, not against
+the retracted BEGIN/READ/COMMIT requirement.
 
 **The connection question — DECIDED in revision 5: (b), two connections inside the one owner
 process.** Mira's ruling as security reviewer. The **client-read connection is permanently
@@ -607,7 +657,7 @@ one above — revision 1 conflated the two.
 | write-capable `PRAGMA` | authorizer denies action 19 | P6, P13; ⚠ see the caveat below |
 | stacked statements | the owner uses `execute()`, which refuses them, and **never** calls `executescript`; no statement built by concatenation | P11 refused, **P12** permits — hence the rule |
 | a template matching only because of its parameters | **DOES apply** at a virtual-table boundary | **P14** — §3.5 |
-| **resource exhaustion** (fifth) | **three bounds on three axes, none sufficient alone** (revision 5): a `progress_handler` bounds VM-instruction cost; `SQLITE_LIMIT_LENGTH` bounds the size of any **single** string, blob or row (not total memory); **one end-to-end request deadline** bounds wall clock across frame I/O | reviewer (cartesian, `zeroblob`); me (per-op socket timeout, `setlimit`) — see below |
+| **resource exhaustion** (fifth) | **three bounds on three axes, none sufficient alone** (revision 5): a `progress_handler` bounds VM-instruction cost; `SQLITE_LIMIT_LENGTH` bounds the size of any **single** string, blob or row (not total memory); **one end-to-end request deadline** bounds wall clock across frame I/O and execution | reviewer (cartesian, `zeroblob`); me (per-op socket timeout, `setlimit`) — see below |
 
 ⚠ **The `PRAGMA` caveat, and revision 1's remedy for it was unsafe.** The authorizer sees
 `SQLITE_PRAGMA` for *every* pragma, read-only ones included, so denying the code denies harmless
@@ -662,6 +712,26 @@ to every other client on the seat. Borges found the class on U1; the Darwin numb
 > response delivery. A per-socket-call timeout is **not** this requirement. A trickling peer must fail
 > within the total budget; a silent peer is the control; a subsequent client must still be serviced.
 
+**The deadline covers execution for every client-facing method, not only framing — including
+`snapshot`.** The budget may differ by method, chosen once the method is parsed, but it is always
+measured from accept, never resets, and is always a named finite number; "no budget for internal
+operations" is not an allowed value. On overrun the owner stops the **work**, not merely the wait: no
+success response, the lock is released, the destination is left untouched — a pre-existing file stays
+byte-for-byte identical and an absent one stays absent — no partial file is left anywhere, and a
+subsequent client is served. The owner stages the backup into a temporary file in the destination's own
+directory, created exclusively; on success it is made durable (fsync) then atomically swapped in for the
+destination via `os.replace`, and on abort or any failure only the temp file is removed. This is what
+keeps the promise: readers such as viz, health snapshots and the sleep backup may re-read a fixed path,
+and must never see a half-written file. Overrun is tolerated up to one step of whatever stop mechanism is
+used. The implementation names that step (for example, a `backup()` page count or a progress-callback
+cadence) and states its maximum wall time; that stated figure, not an open-ended "one step", is the
+allowance. The stop mechanism itself is left to the builder. (Found by Mira's security pre-review on
+#3194.)
+
+> The store lock covers only the backup into the temp file. Durability (`fsync`) and the atomic swap (`os.replace`) run on a bounded finalize worker: the request waits on it only until the deadline, and at most `SNAPSHOT_FINALIZE_SLOTS` finalizes may be outstanding, with a call that finds none free refused at once. `os.replace` is issued only while the call is neither abandoned nor past its deadline, and temp cleanup is owned by a single `finally`. Three residuals are outside any in-process owner's control and are stated as exceptions: a pre-deadline commit reservation whose rename may be both issued and completed after the deadline (the worker can be descheduled between reserving and the syscall; reported `commit: indeterminate`, never success; the destination is atomically old or new); a hung `fsync` or `os.replace` holds one slot and one temp until the kernel returns (bounded in count, not time); and process death mid-finalize orphans a temp file beside the destination.
+
+Response delivery gets a reserve of its own, and the send gate stays. Because the one deadline covers response delivery too, `snapshot()` splits it: execution stops at `request deadline − SNAPSHOT_RESPONSE_RESERVE` (a named constant, measured on the owner's own socket), and the backup progress check, the request thread's wait on the worker, and the worker's abandon-or-commit gate all use that earlier execution deadline. A timeout-driven `deadline_exceeded` or `commit: indeterminate` response is therefore composed with the reserve still in hand, and the send gate, which still compares against the request deadline and is unchanged, lets it through. **Client contract: for `snapshot()`, an `Unavailable` (a dropped connection) must be read as indeterminate.** The reserve makes a missed delivery rare, not impossible (scheduler stalls). The destination is atomically either the old file or the complete new snapshot, so the client-visible form of the late-rename residual is `commit: "indeterminate"` **or** `Unavailable`. Both mean "go look at the destination"; neither ever means success. In the typed client, `Rejected.commit == "indeterminate"` is the marker for the committing outcome, `commit is None` on a `deadline_exceeded` rejection means the destination was not touched, and `Unavailable` remains indeterminate.
+
 Two implementation traps, both measured on this fleet and both easy to walk into. The load-bearing
 element is **`min(per-op cap, time remaining)`** on every blocking call, not a check between calls — a
 naive "remaining time as the timeout" ran 101 s against a 3 s budget. And **a read primitive that loops
@@ -692,8 +762,11 @@ Contract-first — each test names the mutation that must turn it red.
    records that the clause changes no outcome in any owner configuration. The property is kept; the
    claim of discrimination is withdrawn. Identity mismatch is tested through **test 1**, malformed-buffer
    acceptance through **test 2** (parse form). Neither check is weakened.
-4. **The socket's parent directory is 0700 at bind time**, asserted by `stat` on the directory.
-   *Mutation: create it 0755.*
+4. **The socket's parent directory is 0700 at bind time and carries no ACL**: no named user or group
+   entries and no default ACL, asserted on the ACL itself, not only via `stat`. The fixture gives
+   the parent an inheritable ACL, as `~/.engram` has on the Linux host, because on a parent without
+   one this test passes whether or not the strip happens. *Mutations: create it 0755; skip the ACL
+   strip.*
 5. **Stale-socket replacement refuses a symlink and a non-socket.** *Mutation: remove the checks.*
 6. **A one-byte mutation of a registered tier-1 statement → `Rejected(unregistered_template)`.**
    *Mutation: normalise whitespace before hashing — must go red, and that it does is the point: it is
@@ -709,7 +782,9 @@ Contract-first — each test names the mutation that must turn it red.
     the authorizer's return. *Mutation: drop the `arg2 is None` clause — must go red.* (P16.)
 12. **A deliberately expensive read is aborted by the deadline**, and a cheap read is not. *Mutation:
     remove the `progress_handler` — the expensive read must then complete.* ⚠ This bounds
-    **VM-instruction cost only**; tests 19 and 20 cover the other two axes (§4).
+    **VM-instruction cost only**; tests 19 and 20 cover the other two axes (§4). The `progress_handler`
+    must stop against the **same** request deadline, passed in — not an independent timer or constant —
+    so shortening the request deadline must shorten the abort point.
 13. **A tier-2 read spec with an undeclared field or operator → `Rejected(invalid_read_spec)`**, and
     the emitted SQL is built by the owner, never taken from the caller.
 14. **A site that is neither a readable literal nor a declared typed operation fails the BUILD.**
@@ -732,11 +807,16 @@ Contract-first — each test names the mutation that must turn it red.
 16. **An FTS5 `MATCH` parameter is not authorised by a tier-1 template alone** — whichever mechanism
     §7's open question settles on, the test is that `secret_notes: …` cannot be smuggled through a
     template registered for `public_notes`. (P14.)
-17. **`snapshot()` runs on the owner-internal path, permits `SQLITE_TRANSACTION` and `SQLITE_READ`**,
-    and a denial there is not swallowed. *Mutation: deny `SQLITE_TRANSACTION` on that path — the
-    snapshot must FAIL LOUDLY rather than silently losing its read-mark.* Also asserts the client-read
-    connection's authorizer is **unchanged** across a snapshot. This is the test that would have caught
-    revision 2's false answer.
+17. **⚠ Rewritten in revision 6 (Borges's ruling, engram-alpha#3221) — the owner RPC never issues a
+    `BEGIN`/`SELECT`/`COMMIT` and `backup()` never consults an authorizer, so a `SQLITE_TRANSACTION`
+    denial cannot be the mutation.** `snapshot()` [the owner RPC] runs on the owner-internal path,
+    succeeds under that connection's normal authorizer, and a genuine copy failure is not swallowed.
+    *Mutation: make the `except sqlite3.Error` clause swallow the error instead of returning
+    `Rejected(reason="snapshot_failed")` — the snapshot must FAIL LOUDLY.* Also asserts the client-read
+    connection's authorizer is **unchanged** across a snapshot, by identity (a marker authorizer
+    installed before the call is still the one firing after it) — this is the test that would have
+    caught revision 2's false answer about *which connection* serves `snapshot()`, independent of the
+    retracted BEGIN/READ/COMMIT requirement.
 18. *(Retired in revision 5 — it tested option (a), which is rejected. See test 22.)*
 19. **Single-value size is bounded independently of the progress handler.** `SELECT zeroblob(N)` above the
     configured `SQLITE_LIMIT_LENGTH` is refused on the client-read connection, while a result under the
@@ -746,6 +826,20 @@ Contract-first — each test names the mutation that must turn it red.
 20. **One end-to-end request deadline.** A peer trickling bytes fails within the **total** budget; a
     silent peer is the control; a **subsequent** client is serviced afterwards. *Mutation: replace the
     end-to-end deadline with a per-socket-call timeout — the trickling peer must then exceed the budget.*
+
+    **20b. A `snapshot()` that cannot finish inside its budget is aborted, and the lock is released.**
+    Use a small constructor budget, or a store slow enough that no small budget is generous; do not
+    inject a sleep into the owner. The test names the chosen stop step (for example, `backup()` page
+    count or progress-callback cadence) and measures or bounds its wall-time allowance; by
+    `deadline + that stated allowance`, assert: no success
+    response; an absent destination stays absent and a pre-existing destination (with a sentinel row) is
+    byte-identical by sha256; no temp file remains in the directory; a **second** `snapshot()` that fits
+    its own budget then succeeds within it — this is the lock-release proof, not a `ping` (`ping` never
+    takes `_store_lock`). *Mutation (a): restore the U3 shape — the deadline checked only after dispatch
+    returns. Test 20b must go red; test 20 must stay green.* *Mutation (b): abort the work but leak the
+    lock (skip the release on the abort path). The second `snapshot()` must then time out and test 20b
+    must go red, while a `ping`-only check would stay green.* *Mutation (c): back up straight into `dest`
+    and `unlink` it on abort (the U3 shape) — the pre-existing-destination case must go red.*
 21. **Virtual-table templates get no implicit safety at registration.** Negative cases: `docs = ?` on an
     FTS5 table and `k = ?` on vec0 must each be REFUSED implicit safe status, while `notes = ?` on an
     ordinary table is admitted. *Mutation: classify placeholders by operator spelling alone — both
@@ -756,7 +850,7 @@ Contract-first — each test names the mutation that must turn it red.
     authorizer, so it isolates routing from the floor (test 7) instead of re-testing it.
 
 **Overall discrimination control:** replace the authorizer with an allow-all and delete the registry
-lookup, together. Tests 6, 7, 11, 15 and 16 must go red; 1–5, 8–10, 17 and 19–22 must stay green.
+lookup, together. Tests 6, 7, 11, 15 and 16 must go red; 1–5, 8–10, 17, 19–22 and 20b must stay green.
 Test 21 stays green because registration-time classification is a separate mechanism from request-time
 lookup — which is itself the property this control exists to show. Two independent
 mechanisms failing must show as two independent failures — if one mutation reds everything, the layers
@@ -799,7 +893,7 @@ important thing the review produced.
 | **The parent's "only open handle" wording** (§3.1) | `docs/2652-engrammanager-design.md:677` literally says one handle; (b) is two. Read as process-scoped by both author and reviewer — but **the words need clarifying by that document's owner**, and this slice does not edit it. |
 | **vec0 detection at registration** (§3.5) | The rule is decided. Detection is measured for FTS5 (author, Darwin) and for vec0 on one runtime (Mira: Linux, SQLite 3.45.1, sqlite-vec 0.1.9 — direct, alias and view all surface). Not established for every module or platform. The schema route is authoritative; the token-match backstop can miss quoting or view indirection, so it is not a never-under-deny guarantee, and incomplete classification fails closed. |
 | **How incomplete classification is DETECTED** (§3.5) | Owed by U4, and it must be **measured**, not asserted. "Fails closed" is only as good as the check that notices a classification is incomplete; the build must show a template whose reads the audit cannot fully account for, and show that registration denies it. (Mira, at approval.) |
-| **Two new budgets with no number** (§4) | `SQLITE_LIMIT_LENGTH` and the end-to-end request deadline both need values chosen against the owner contract (§8). |
+| **Two new budgets with no number** (§4) | `SQLITE_LIMIT_LENGTH` and the end-to-end request deadline — including its per-method variant for `snapshot` — both need values chosen against the owner contract (§8). |
 | **Tier 2 is DEFERRED, not designed** (§3.2) | U4's own surface is 21/21 byte-stable, so tier 2 is off its path. Outline only; it gets specified by the unit that needs it. Deferring it is deliberate — revision 2 specified it speculatively and that was the larger error of the two in §3.2. |
 | **The authorizer's action allowlist is an OBLIGATION, not a finished list** (§3.1) | Owed by U4: derive it from the census plus the owner's operations, and check every denied action for a caller that swallows the denial. `SQLITE_TRANSACTION` is the first known member, not the last. |
 | **The Linux peer-credential arm is UNMEASURED by me** (§2.2) | **Partly measured by the reviewer in revision 5** — a same-uid `SO_PEERCRED` read, 12 bytes, correct decode (§6). The foreign-uid rejection is measured by no one. Needs a first-hand run on a Linux seat before U4 builds. Documented is not measured — the whole of §1 exists because that distinction has cost this fleet real rounds. |
@@ -817,11 +911,25 @@ important thing the review produced.
   as #3095's call-path walk and should reuse it rather than grow a second instrument with its own
   blind spots — and #3095's walk is also what could classify §3.2's 37 unclassifiable sites.
 - **Three budgets have no number** — the `progress_handler` deadline, `SQLITE_LIMIT_LENGTH`, and the
-  end-to-end request deadline. Each needs measuring against real reads and real frames, not choosing.
+  end-to-end request deadline (including its per-method variant for `snapshot`). Each needs measuring
+  against real reads and real frames, not choosing.
 
 ## 9. What changed, revision by revision, and who found it
 
 Recorded because a reader should be able to see which parts survived attack.
+
+### Follow-up — U4a build findings (Borges, #3194)
+
+| § | change | found by |
+|---|---|---|
+| §2.1 | **Socket path corrected to `$ENGRAM_HOME/run/engramd.sock`** (the shipped `DEFAULT_SOCKET_NAME`); `owner.sock` was never shipped. | Borges (ruling) |
+| §2.1, §5 | **ACLs, not only mode bits.** An inheritable parent ACL survives `chmod 0700` on `run/` and reaches the socket. The owner strips ACLs on `run/` through an `O_NOFOLLOW` fd before the bind and sets the socket mode explicitly. Test 4 now asserts on the ACL, with a fixture parent that carries one. | Borges (Linux measurement, requirement); Aleph (Darwin measurement) |
+
+### Follow-up — U4b build findings, revision 6 (Borges's ruling, engram-alpha#3221)
+
+| § | change | found by |
+|---|---|---|
+| §3.1, §5 test 17 | **The BEGIN/READ/COMMIT requirement never applied to the owner RPC.** Revision 3 withdrew revision 2's "uses the backup API" answer by citing code that belongs to a *different* function — `engram_core.py`'s per-turn checkpoint (`_commit_snapshot_async`/`_commit_snapshot_sync`), not the owner RPC (`engramd_owner._handle_snapshot`) this section is about. `sqlite3.Connection.backup()` never issues a `BEGIN`/`SELECT`/`COMMIT` and never consults an authorizer — measured independently three times. Test 17 rewritten against three properties the owner RPC actually owes (never touches the client-read connection/authorizer; a copy failure is loud; structurally unreachable from client SQL) plus the authorizer-blind fact, instead of a mutation that cannot fire. The checkpoint function's own read-mark `except Exception: pass` is real and stays open as its own issue. | Mira (CHANGES_REQUESTED on PR #3221, naming the scope collision); Borges (ruling: defect traced to this document's own revision 3, not the build) |
 
 ### Follow-up to revision 5 — two overclaims Mira flagged at approval
 
@@ -829,6 +937,8 @@ Recorded because a reader should be able to see which parts survived attack.
 |---|---|---|
 | §3.5, §7 | **"Never under-deny" withdrawn** for the token-match fallback: a lexical match can miss quoting or view indirection. The audited schema route is authoritative, and incomplete classification fails closed. Mira's Linux vec0 control folded into the scope note. §7 gains an open item: the build must measure how incomplete classification is detected. | Mira (claim, vec0 control, open item) |
 | §4, §5 | **`SQLITE_LIMIT_LENGTH` scoped precisely**: it caps a single string, blob or row, not aggregate memory. Table row, prose and test 19's title corrected. | Mira |
+| §4, §5, §7, §8 | **Deadline scope extended to cover execution, not only framing.** `snapshot()` runs under the same monotonic end-to-end deadline, as a per-method budget chosen once the method is parsed; on overrun the owner stops the work rather than the wait — no success response, lock released, destination left untouched. Test 12 requires the `progress_handler` to share the request deadline rather than an independent timer; test 20b added, with the lock-release proof restated as a second `snapshot()`, not a `ping`. Stop-step allowance must be named and bounded by the test, not left open-ended. Snapshot destination staged and atomically replaced; abort leaves a pre-existing destination byte-identical (it previously read as deleting it). | Mira (security pre-review, #3194); Borges (ruling); Mira (stop-step bound, PR #3200 security read); Mira (destination deletion, #3201 security read) |
+| §4 | **`snapshot()`'s deadline split so timeout responses can reach the client.** Round 5's finalize protocol composed every timeout-driven response AT the request deadline, so the (correct) send gate dropped all of them and a real client only ever saw `Unavailable`. Execution now stops at `request deadline − SNAPSHOT_RESPONSE_RESERVE` (measured on the owner's own socket); the send gate is unchanged. Client contract stated: for `snapshot()`, `Unavailable` is read as indeterminate, and the client-visible form of the late-rename residual is `commit: "indeterminate"` or `Unavailable`. The bounded-finalize paragraph (protocol and three residuals) is now recorded in §4. | Sol (finding, deterministic 5/5); Borges (ruling); Mira (send-gate finding, on the round-5 protocol) |
 
 ### Revision 5 — answering Mira's review at `0d3aecf8`
 

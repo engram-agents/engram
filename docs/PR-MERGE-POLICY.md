@@ -236,6 +236,20 @@ Merge once colleague-converged + CI-green, **no per-PR Lei permission needed**:
 
 - **bug fixes / regressions / test fixes**
 - **tooling, infra, CI** — backup, baton, forum, hooks, packaging, the affected-tests gate, install/upgrade
+  - **The baton system is on this side in full, its design included (Lei, 2026-09-30,
+    in session, verbatim: "baton system can be considered convention and convenience,
+    not substrate, feel free to improve it based on your real experience").** That
+    covers the CLI, the gates, the forum's project store, the file format and the
+    design notes for any of them. Before this ruling a baton *redesign* was held for
+    his read as if it were substrate (#3055, the phase-and-turn design note for #3039,
+    sat approved from 2026-09-27 to 2026-09-30 on that reading); it no longer is. A
+    baton PR merges at the seat after the normal pipeline. Two limits. **A baton PR
+    that also alters a concept on the ⛔ list is judged on that concept**, exactly as
+    the "Gray areas" line on a fix that changes a substrate behavior says; "in full"
+    describes the baton system, not whatever else a PR carries. **A change that makes
+    the forum or the baton authenticate its callers is a security PR** under "Security
+    PRs" above: Mira's approval is its merge gate, and it goes to Lei only if it also
+    changes a ⛔-listed concept outside her review scope.
 - **docs, brand, i18n**
 - **refactors** that don't change a substrate concept
 - **substrate PRs that implement a design Lei already read** — only after the merge seat has linked his read and written the conformance check ("Delegated by Lei, 2026-09-27" above)

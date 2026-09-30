@@ -315,7 +315,7 @@ def test_substrate_health_warning_renders_within_head_preview(tmp_path, engram_h
             {
                 "session_id": "substrate-health-early",
                 "transcript_path": str(tmp_path / "transcript.jsonl"),
-                "source": "startup",
+                "source": "compact"  # #3202: OFFLINE is the compact/clear alarm; startup is soft,
             },
         )
     ctx = result["hookSpecificOutput"]["additionalContext"]
@@ -336,7 +336,9 @@ def test_substrate_health_warning_precedes_startup_only_blocks(tmp_path, engram_
     group (sleep status / fairy policy / .../ Piece C), matching item 3's
     position ahead of item 4 in the spec's ordered list."""
     mod = _load_hook_module(engram_home)
-    mod._check_mcp_health = lambda engram_home: (False, "forced-unhealthy for test")
+    # #3202: an MCP miss at startup is now a soft ℹ️ line, not the ⚠️ header;
+    # force a different ⚠️ condition to keep testing the header's position.
+    mod._check_backup_staleness = lambda home: (False, "forced-stale for test")
 
     mock_client_class = MagicMock(return_value=_make_mock_engram_client())
     with patch.dict("sys.modules", {"engram_client": MagicMock(EngramClient=mock_client_class)}):

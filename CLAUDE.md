@@ -35,6 +35,17 @@ the unified payload_json signature as of 2026-05-27.
   locally** and paste the result in your review. The full suite runs once, on
   the dev→main release PR (above). `affected-tests.yml` is `workflow_dispatch`
   only.
+- **No macOS runners in CI — ever (Lei, 2026-09-28).** A `runs-on: macos-*` job
+  bills at **ten times** the Linux minute rate, and `pr-checks` fires on every
+  PR event (99 times on 2026-09-27 alone). The one macOS job this repo ever had,
+  `macos-bash32-syntax` (added 2026-09-18 by #3000 to run a single bash-3.2
+  parse test), produced $5.85 of a $8.84 day — two-thirds of the bill for one
+  test that takes seconds. Removed 2026-09-28. **macOS coverage comes from the
+  Mac seats**: the test stays in the suite and skips on Linux; a seat on a real
+  Mac (Aleph, Clio) runs it locally whenever a shipped shell script changes and
+  pastes the result in the review, exactly like affected-tests above. If a
+  future change genuinely needs a hosted macOS runner, it is Lei's call, opened
+  as a question with the per-run cost stated — never added inside a fix PR.
 - Verify before specifying a PR base: `gh repo view --json defaultBranchRef`
   returns `dev`, and recent merged PRs (`gh pr list --state merged --json baseRefName`)
   all show `dev`. If your session-start banner shows a branch other than `dev`
@@ -200,11 +211,31 @@ nothing here substantiates. The stronger control is a mutation where **the new a
 and the pre-existing checks stay green.** For #3045's own fix, that is a chunk whose
 returned items are each individually valid and simply one short.
 
-**Adoption status:** trialling. #3045's fix is the first case — its two assertions are
-to be written before `cmd_validate` is touched, so the style meets one real bug before
-we adopt it more widely. **Revisit when #3045's fix merges**, so the trial is
-terminable: if the assertions caught nothing a normal review round would have caught,
-drop the convention rather than widening it.
+**Adoption status: adopted (Lei, 2026-09-30, in session, verbatim: "let's keep the
+contract tests convention").** The trial ran on one case, #3045's fix, merged as #3235
+(`307bdd04`), and ended with that ruling.
+
+*What the one trial case showed, so the convention is not remembered as more than it
+is.* The evidence is in #3235's own thread: the PR body's "Contract-first" section,
+the reviewer-fairy rounds and the merge-seat comment. The assertions written first caught the defect the issue
+named (R1 in that PR: fifteen ids sent, fourteen valid returned, exit 0) and one gap
+the issue did not name (R3: an id the payload never contained landing in the clean
+set). The reviewer-fairy rounds then raised two defects that the tests written first
+had not caught, and they are different kinds. **The first was a defect in a contract
+the tests had pinned:** the contract said an unexpected-only run exits 1 and writes no
+final payload, R3 asserted it, and that state stalled the sleep skill. R3's assertions
+about the missing files were guarded by `if final is not None:`, so they were vacuous
+in exactly the state that mattered, which is the non-discriminating-test caveat above,
+met on the convention's own first case. **The second was a case the contract never
+covered:** an uncaught exception exiting 1, which the skill read as "retry payload
+written". This is not a full count of what review found; round 1 also filed a
+manifest-mode gap as a suggestion, and the author found a missing exit-2 branch while
+folding.
+
+Whether a review round alone would have caught R3's gap was not tested: no round ran
+without the tests, and #3235's own body declines the counterfactual. **The convention
+is a complement to the review rounds, never a replacement for one.** That is n=1;
+nothing here measures how often either half will repeat.
 
 ## Plugin build restructures code paths — never rely on the `src/` layout
 
@@ -1327,9 +1358,16 @@ Kepler's own amendment on alpha#2270 states the relation between this test and t
 1. **A bare agent handle as attribution** (Ariadne, Borges, Kepler, Clio, …) in a shipped comment or PR body ("Ariadne's catch, PR #2618") — **fine.** It's a marker: it credits, it invites nothing a general user's install can act on or fail against. An **`@handle` mention**, by contrast, is functional — it renders as a live notification to a real GitHub account the moment the text is quoted anywhere on the platform, which is a different case from a bare name and not covered by this paragraph.
 2. **A human name** other than Lei's own, inside a shipped artifact — held open deliberately pending Lei's explicit confirmation, though Lei's own "same rule as my name" arguably already reaches it. Do not extend the agent-handle answer to this case by inference.
 
-**Why the two related gates differ in severity, and that difference is principled, not accidental:** `no-new-shipped-node-ids` **blocks** because a shipped concrete node ID is functional-and-dead — it invites an `engram_inspect` that fails on every install but the author's, by construction (see "PR — issue closure" §Body-text trap discipline for the sibling case of a keyword the parser *does* act on). `name-leak-warn` **advises, never blocks** — because, unlike the node-ID gate, it cannot itself tell a citation from a leak (its own comment says so: "these may be valid citations or unintended leaks — please review each one"), so it asks the seat to decide rather than ruling.
+**Why the two related gates differ in severity, and that difference is principled, not accidental — on engram-alpha, where both gates run today:** `no-new-shipped-node-ids` **blocks** because a shipped concrete node ID is functional-and-dead — it invites an `engram_inspect` that fails on every install but the author's, by construction (see engram-alpha's `CLAUDE.md` "PR — issue closure" section, Body-text trap discipline, for the sibling case of a keyword the parser *does* act on). `name-leak-warn` **advises, never blocks** — because, unlike the node-ID gate, it cannot itself tell a citation from a leak (its own comment says so: "these may be valid citations or unintended leaks — please review each one"), so it asks the seat to decide rather than ruling. Both are CI steps in engram-alpha's `pr-checks.yml`; umwelt runs its own separate node-ID gate, and neither umwelt nor soma runs a `name-leak-warn` gate — a merge seat there applies Lei's rule below by reading the PR, not from a gate hit.
 
-**For the merge seat:** an advisory `name-leak-warn` hit on a **bare agent handle** is never, by itself, grounds to hold a PR — not because the gate has ruled (it explicitly hasn't; see above), but because Lei's 2026-08-15 ruling already has, for this one case. The seat's job on a hit is first to identify *which* name matched — the gate reports one pattern per line and does not name the category, so a line with several candidate names does not tell you which one tripped it — and only then apply this rule to a bare agent handle specifically. Scrubbing a colleague's attribution under a self-invented "cite the PR, not the person" habit is the exact over-application this section exists to name: it happened twice on this repo (engram-alpha#2618, #2697) before this paragraph landed, both scrubbing the same colleague's credit, both against Lei's already-ruled test.
+**For the merge seat:** an advisory `name-leak-warn` hit on a **bare agent handle** is never, by itself, grounds to hold a PR — not because the gate has ruled (it explicitly hasn't; see above), but because Lei's 2026-08-15 ruling already has, for this one case. The seat's job on a hit is first to identify *which* name matched — the gate reports one pattern per line and does not name the category, so a line with several candidate names does not tell you which one tripped it — and only then apply this rule to a bare agent handle specifically. Scrubbing a colleague's attribution under a self-invented "cite the PR, not the person" habit is the exact over-application this section exists to name: it happened twice on engram-alpha (#2618, #2697), both scrubbing the same colleague's credit, both against Lei's already-ruled test.
+
+> **Duplicated by hand in engram-alpha, umwelt, and soma `CLAUDE.md`**, with no
+> generator or test binding the copies. Change one, change all three in the same
+> pass. The gates themselves are CI steps in engram-alpha's `pr-checks.yml`
+> (umwelt has its own separate node-ID gate; neither umwelt nor soma runs a
+> `name-leak-warn` gate) — these three copies document Lei's rule, not the
+> gates that happen to enforce a slice of it on engram-alpha today.
 
 ## Project-as-bunch coordination (multi-agent mode)
 
@@ -1621,14 +1659,19 @@ incident below).
 3. **No commit-message auto-close** (always): `closingIssuesReferences` reads
    the PR BODY only — a merge commit's own message is a THIRD close surface
    GitHub's parser reads independently, invisible to checks 1 and 2. **This
-   repo's exposure is currently LOWER than umwelt's, and say so precisely:**
-   engram-alpha's `squash_merge_commit_message` is `BLANK` (measured
-   2026-08-22 — three real recent squash merges carry no branch-commit
-   content, only PR title + co-author lines), so branch commit messages do
-   NOT ride into the merge commit here today. The check stays anyway, as
+   repo's exposure is currently LOWER than umwelt's and soma's, and say so
+   precisely:** engram-alpha's `squash_merge_commit_message` is `BLANK`
+   (measured 2026-08-22 — three real recent squash merges carry no
+   branch-commit content, only PR title + co-author lines; the setting
+   re-read `BLANK` on 2026-09-03 and 2026-09-28), so branch commit messages
+   do NOT ride into the merge commit here today. The check stays anyway, as
    defense-in-depth against the three ways the exposure appears without any
    code change: a repo-settings flip to `COMMIT_MESSAGES` (silent, and
-   exactly what makes umwelt exposed), a merger hand-editing the squash
+   exactly what makes **umwelt and soma** exposed — both read
+   `COMMIT_MESSAGES`, measured 2026-09-03 and re-read 2026-09-28 via
+   `gh api repos/engram-agents/<repo> --jq .squash_merge_commit_message`;
+   a seat reading only "umwelt" here would skip the commit-message grep on
+   a soma PR), a merger hand-editing the squash
    message at merge time, and copy-paste of commit text into a PR body.
    The incident that makes this real is umwelt#674/#632 (2026-08-22): empty
    array there, merge concluded safe, the issue closed **by the commit**,

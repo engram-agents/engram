@@ -26,6 +26,7 @@ from forum.coordination import (
     set_status,
 )
 from forum.coordination import markdown as md
+from forum.coordination import projects as _projects_mod
 
 
 def _baton(turn="ariadne"):
@@ -38,6 +39,26 @@ def _baton(turn="ariadne"):
         "turn_since: 2026-06-26T00:00:00Z\n"
         'turn_reason: "start"\n'
         "participants: [ariadne, borges]\n"
+        "---\n"
+        "# PR-1\n\nsome body\n"
+    )
+
+
+def _baton_with_phase(turn="ariadne", phase=None):
+    """Same shape as ``_baton()``, with an optional explicit ``phase:``
+    frontmatter field (#3039 U2a) -- used to exercise the "already-explicit,
+    don't clobber" half of ``_maybe_stamp_phase``'s contract."""
+    phase_line = f"phase: {phase}\n" if phase is not None else ""
+    return (
+        "---\n"
+        "project_id: PR-1\n"
+        "title: a title\n"
+        "status: in-progress\n"
+        f"turn: {turn}\n"
+        "turn_since: 2026-06-26T00:00:00Z\n"
+        'turn_reason: "start"\n'
+        "participants: [ariadne, borges]\n"
+        f"{phase_line}"
         "---\n"
         "# PR-1\n\nsome body\n"
     )
@@ -1195,3 +1216,913 @@ def test_read_projects_turn_by_field_absent_legacy_baton(tmp_path):
     records = s.read_projects()
     assert len(records) == 1
     assert records[0].turn_by == ""
+
+
+# ===========================================================================
+# _maybe_stamp_phase() + phase= kwarg tests (#3039 U2a -- the WRITE side)
+# ===========================================================================
+#
+# U1 built the READ side only (_resolve_phase, tested in tools/baton.py's
+# TestResolvePhase -- there is no projects.py-level read helper). U2a adds
+# the write side: every phase-defining transition stamps an explicit
+# `phase:` field, and any write to a still-legacy baton (no `phase:` yet)
+# also converts it. Contract-first (this repo's CLAUDE.md "Contract-first
+# tests"): written against the pre-U2a `dev` code, where every test below
+# goes RED -- `_maybe_stamp_phase` does not exist yet, and
+# flip/claim/release/init accept no `phase` keyword argument at all.
+
+
+class TestMaybeStampPhase:
+    """`_maybe_stamp_phase(fields, phase, now) -> (updates_dict, log_suffix)`
+    -- pure function, no I/O."""
+
+    def test_stamps_when_existing_empty(self):
+        updates, suffix = _projects_mod._maybe_stamp_phase(
+            {}, "peer", "2026-09-30T12:00:00Z",
+        )
+        assert updates == {"phase": "peer"}
+        assert suffix != ""
+        assert "peer" in suffix
+        assert "2026-09-30T12:00:00Z" in suffix
+        assert "#3039 U2a" in suffix
+
+    def test_stamps_when_phase_field_present_but_blank(self):
+        # A "phase:" frontmatter line present but blank/whitespace-only
+        # still counts as "no explicit phase yet".
+        updates, suffix = _projects_mod._maybe_stamp_phase(
+            {"phase": "   "}, "pool", "2026-09-30T12:00:00Z",
+        )
+        assert updates == {"phase": "pool"}
+        assert suffix != ""
+
+    def test_noop_when_existing_non_empty_same_value(self):
+        updates, suffix = _projects_mod._maybe_stamp_phase(
+            {"phase": "peer"}, "peer", "2026-09-30T12:00:00Z",
+        )
+        assert updates == {}
+        assert suffix == ""
+
+    def test_noop_when_existing_non_empty_disagreeing_value(self):
+        # existing "merge" disagrees with the passed "peer" -- still a
+        # no-op; a stale client-computed guess must never clobber an
+        # already-explicit phase (this write's job is never to resolve
+        # that disagreement).
+        updates, suffix = _projects_mod._maybe_stamp_phase(
+            {"phase": "merge"}, "peer", "2026-09-30T12:00:00Z",
+        )
+        assert updates == {}
+        assert suffix == ""
+
+    def test_noop_when_phase_is_none(self):
+        updates, suffix = _projects_mod._maybe_stamp_phase(
+            {}, None, "2026-09-30T12:00:00Z",
+        )
+        assert updates == {}
+        assert suffix == ""
+
+    def test_noop_when_phase_is_empty_string(self):
+        updates, suffix = _projects_mod._maybe_stamp_phase(
+            {}, "", "2026-09-30T12:00:00Z",
+        )
+        assert updates == {}
+        assert suffix == ""
+
+
+class TestPhaseWrites:
+    """flip/claim/release/init, called with a `phase` kwarg (#3039 U2a).
+
+    Test obligation 2: on a baton with NO `phase:` field, the written file
+    has `phase: <value>` and the turn log's last line matches the
+    conversion-note shape. Test obligation 3: on a baton that ALREADY has
+    an explicit (and DIFFERENT) `phase:` field, the written file's
+    `phase:` is UNCHANGED, and no conversion note is appended -- only
+    whichever ordinary log line that write-body already produces. (Not
+    applicable to `init()`: it raises ProjectAlreadyExists on a baton that
+    already has a file, so there is no "already-explicit" case to exercise
+    for it -- it is exercised only for its own obligation-2 case below.)
+    """
+
+    # --- flip() ---
+
+    def test_flip_stamps_phase_on_legacy_baton(self, store, allocator):
+        flip(
+            store, allocator, "PR-1", to_agent="borges", reason="please review",
+            phase="peer", ts="2026-06-26T12:00:00Z",
+        )
+        raw = store.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "peer"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped: 'peer'" in lines[-1]
+        assert "#3039 U2a" in lines[-1]
+
+    def test_flip_does_not_clobber_existing_different_phase(self, tmp_path):
+        s = FileStore(tmp_path)
+        s.write_project("PR-1", _baton_with_phase(turn="ariadne", phase="merge"), seq=0)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        flip(
+            s, a, "PR-1", to_agent="borges", reason="please review",
+            phase="peer", ts="2026-06-26T12:00:00Z",
+        )
+        raw = s.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "merge"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped" not in lines[-1]
+
+    # --- claim() ---
+
+    def test_claim_stamps_phase_on_legacy_baton(self, store, allocator):
+        claim(
+            store, allocator, "PR-1", claimer="luria", pool_sentinel="lei",
+            phase="claimed", ts="2026-06-26T12:00:00Z",
+        )
+        raw = store.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "claimed"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped: 'claimed'" in lines[-1]
+
+    def test_claim_does_not_clobber_existing_different_phase(self, tmp_path):
+        s = FileStore(tmp_path)
+        s.write_project("PR-1", _baton_with_phase(turn="ariadne", phase="pool"), seq=0)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        claim(
+            s, a, "PR-1", claimer="luria", pool_sentinel="lei",
+            phase="claimed", ts="2026-06-26T12:00:00Z",
+        )
+        raw = s.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "pool"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped" not in lines[-1]
+
+    # --- release() ---
+
+    def test_release_stamps_phase_on_legacy_baton(self, store, allocator):
+        release(
+            store, allocator, "PR-1", holder="ariadne", pool_sentinel="lei",
+            reason="all done", phase="pool", ts="2026-06-26T12:00:00Z",
+        )
+        raw = store.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "pool"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped: 'pool'" in lines[-1]
+
+    def test_release_done_stamps_phase_as_the_last_log_line(self, store, allocator):
+        # Multi-line log entry (release --done already appends a "title
+        # marked (done)" line): the conversion note must be the LAST line,
+        # after that one.
+        release(
+            store, allocator, "PR-1", holder="ariadne", pool_sentinel="lei",
+            reason="finished", done=True, phase="done", ts="2026-06-26T12:00:00Z",
+        )
+        raw = store.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "done"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "title marked (done)" in lines[-2]
+        assert "phase stamped: 'done'" in lines[-1]
+
+    def test_release_does_not_clobber_existing_different_phase(self, tmp_path):
+        s = FileStore(tmp_path)
+        s.write_project("PR-1", _baton_with_phase(turn="ariadne", phase="claimed"), seq=0)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        release(
+            s, a, "PR-1", holder="ariadne", pool_sentinel="lei",
+            reason="done", phase="pool", ts="2026-06-26T12:00:00Z",
+        )
+        raw = s.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "claimed"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped" not in lines[-1]
+
+    def test_release_done_does_not_clobber_existing_different_phase(self, tmp_path):
+        # The --done branch has its own, separate code path merging
+        # phase_updates into `updates` alongside the title rename -- covered
+        # independently from the ordinary-release no-clobber case above.
+        s = FileStore(tmp_path)
+        s.write_project("PR-1", _baton_with_phase(turn="ariadne", phase="claimed"), seq=0)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        release(
+            s, a, "PR-1", holder="ariadne", pool_sentinel="lei",
+            reason="done", done=True, phase="done", ts="2026-06-26T12:00:00Z",
+        )
+        raw = s.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "claimed"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped" not in lines[-1]
+
+    # --- init() ---
+
+    def test_init_stamps_phase(self, tmp_path):
+        s = FileStore(tmp_path)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        init(
+            s, a, "PR-42",
+            title="T", status="in-progress", turn="borges",
+            participants=["borges"], turn_reason="init",
+            phase="fairy", ts="2026-06-26T12:00:00Z",
+        )
+        raw = s.read_project("PR-42")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "fairy"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped: 'fairy'" in lines[-1]
+
+    def test_init_without_phase_omits_field(self, tmp_path):
+        s = FileStore(tmp_path)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        init(
+            s, a, "PR-42",
+            title="T", status="in-progress", turn="borges",
+            participants=["borges"], turn_reason="init",
+            ts="2026-06-26T12:00:00Z",
+        )
+        raw = s.read_project("PR-42")
+        fields, _ = md.parse_frontmatter(raw)
+        assert "phase" not in fields
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped" not in lines[-1]
+
+    # --- sequential idempotency (test obligation 4) ---
+
+    def test_flip_twice_in_a_row_stamps_exactly_once(self, store, allocator):
+        """Two SEQUENTIAL calls to flip(), both phase="peer", on a baton
+        with no initial `phase:` -- simulating two successive
+        legacy-conversion attempts (#3039 U2a obligation 4, adapted for
+        U2a). After BOTH calls, the file has exactly ONE conversion-note
+        log line (not two): the second call's own freshly-read `fields`
+        (via its own `store.read_project` at the top of `flip()`) already
+        sees the first call's already-committed write and no-ops -- here,
+        both calls pass the same value ("peer"), so the file simply ends
+        at "peer" with a single stamp. This pins sequential idempotency,
+        not safety under genuinely overlapping concurrent callers -- see
+        `_maybe_stamp_phase`'s docstring and issue #3255."""
+        flip(
+            store, allocator, "PR-1", to_agent="borges", reason="one",
+            phase="peer", ts="2026-06-26T12:00:00Z",
+        )
+        flip(
+            store, allocator, "PR-1", to_agent="ariadne", reason="two",
+            phase="peer", ts="2026-06-26T12:05:00Z",
+        )
+        raw = store.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "peer"
+        assert raw.count("phase stamped") == 1
+
+    def test_claim_then_flip_sequential_stamps_only_the_first(self, store, allocator):
+        """Sibling of the above with two DIFFERENT write-bodies (claim then
+        flip), called SEQUENTIALLY, and two DIFFERENT phase values, to
+        confirm the no-clobber contract holds ACROSS write-body types, not
+        just within repeated calls to the same one: the second call's
+        phase never overwrites the first's, regardless of which verb
+        produced it. This pins sequential idempotency across verbs, not
+        safety under genuinely overlapping concurrent callers."""
+        claim(
+            store, allocator, "PR-1", claimer="luria", pool_sentinel="lei",
+            phase="claimed", ts="2026-06-26T12:00:00Z",
+        )
+        flip(
+            store, allocator, "PR-1", to_agent="ariadne", reason="handoff",
+            phase="peer", ts="2026-06-26T12:05:00Z",
+        )
+        raw = store.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "claimed"
+        assert raw.count("phase stamped") == 1
+
+
+# ---------------------------------------------------------------------------
+# #3039 U2a round 3 -- the two-step conversion/transition design (Kepler's
+# round-3 ruling, Borges's colleague review on PR #3254: the live
+# double-claim race, independently reproduced by the dispatching agent).
+#
+# Contract-first (this repo's CLAUDE.md "Contract-first tests"): written
+# against `2398270` (round 2's stamp-if-absent-everywhere `_maybe_stamp_phase`
+# mechanism -- no `transition_phase` parameter existed on any write-body).
+# The mutation control (confirming these three sequence tests go RED
+# against that mechanism, while everything else in this file stays green)
+# is run and reported in the PR handoff, not checked in as a second
+# parallel test file -- see Borges's test obligation 5.
+# ---------------------------------------------------------------------------
+
+class TestU2aRound3PhaseSequences:
+    """Borges's exact contract-first sequence tests (test obligations 1, 2,
+    4), exercising the two-step conversion/transition design end-to-end
+    against a real FileStore + SeqAllocator."""
+
+    def test_pr_sequence_fairy_peer_peer_peer_merge(self, tmp_path):
+        """init -> flip to colleague -> return-to-author (#2961) -> flip
+        back to colleague -> flip to merge seat. Expected phase after each
+        step: fairy, peer, peer, peer, merge (test obligation 1)."""
+        s = FileStore(tmp_path)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        pid = "PR-9900"
+
+        init(
+            s, a, pid,
+            title="T", status="in-progress", turn="clio",
+            participants=["clio", "ariadne"], turn_reason="start",
+            by_agent="clio", author="clio", colleague="ariadne",
+            transition_phase="fairy", ts="2026-09-30T00:00:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "fairy"
+
+        # clio -> ariadne: fairy -> peer (send-for-review transition)
+        flip(
+            s, a, pid, to_agent="ariadne", reason="please review",
+            by_agent="clio", transition_phase="peer", ts="2026-09-30T00:01:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "peer"
+
+        # ariadne -> clio: #2961 return-to-author -- conversion-only,
+        # preserves "peer" (NOT a phase regression to "fairy").
+        flip(
+            s, a, pid, to_agent="clio", reason="one blocker",
+            by_agent="ariadne", phase="peer", ts="2026-09-30T00:02:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "peer"
+
+        # clio -> ariadne again: still within peer phase -- conversion-only.
+        flip(
+            s, a, pid, to_agent="ariadne", reason="fixed",
+            by_agent="clio", phase="peer", ts="2026-09-30T00:03:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "peer"
+
+        # ariadne -> pool sentinel: maintainer-flip-to-merge-seat transition.
+        flip(
+            s, a, pid, to_agent="lei shi", reason="approved, ready",
+            by_agent="ariadne", transition_phase="merge", ts="2026-09-30T00:04:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "merge"
+
+    def test_bunch_sequence_pool_claimed_pool_claimed_done(self, tmp_path):
+        """init -> claim -> release -> claim -> release --done. Expected
+        phase after each step: pool, claimed, pool, claimed, done (test
+        obligation 2)."""
+        s = FileStore(tmp_path)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        pid = "pool-9901"
+
+        init(
+            s, a, pid,
+            title="T", status="planning", turn="lei shi",
+            participants=["borges", "ariadne"], turn_reason="start",
+            by_agent="borges", transition_phase="pool", ts="2026-09-30T00:00:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "pool"
+
+        claim(
+            s, a, pid, claimer="borges", pool_sentinel="lei shi",
+            transition_phase="claimed", ts="2026-09-30T00:01:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "claimed"
+
+        release(
+            s, a, pid, holder="borges", pool_sentinel="lei shi",
+            reason="done for now", transition_phase="pool", ts="2026-09-30T00:02:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "pool"
+
+        claim(
+            s, a, pid, claimer="ariadne", pool_sentinel="lei shi",
+            transition_phase="claimed", ts="2026-09-30T00:03:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "claimed"
+
+        release(
+            s, a, pid, holder="ariadne", pool_sentinel="lei shi",
+            reason="finished", done=True, transition_phase="done", ts="2026-09-30T00:04:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "done"
+
+    def test_pr_sequence_from_genuinely_legacy_baton(self, tmp_path):
+        """Test obligation 4: the PR sequence's post-init steps, replayed
+        against a genuinely legacy baton (no `phase:` field at all, seeded
+        directly rather than via `init()`) -- confirming conversion-then-
+        transition composes correctly on a real legacy baton, not just a
+        freshly-`transition_phase`-inited one.
+
+        There is no legacy equivalent of the init() step itself (init's
+        `transition_phase` is ALWAYS written when given -- see init()'s own
+        docstring: there is no pre-existing `phase:` to check against, so a
+        truthy value is always stamped), so this replays only the four
+        POST-init steps. A legacy PR baton whose `turn` is NOT at the pool
+        sentinel resolves via `_resolve_phase`'s legacy fallback to ""
+        (empty/indeterminate) -- cmd_flip's own comment treats that
+        identically to an explicit "fairy" for the fairy->peer transition
+        gate (`_flip_current_phase in ("fairy", "")`), so the first flip
+        below still correctly fires as a TRANSITION, exactly as it would
+        against a freshly-inited "fairy" baton. Expected phase after each
+        of the four steps: peer, peer, peer, merge -- the same tail
+        Borges's 5-value sequence produces after its own "fairy" entry."""
+        s = FileStore(tmp_path)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        pid = "PR-9910"
+        s.write_project(
+            pid,
+            "---\n"
+            f"project: {pid}\n"
+            "title: legacy PR\n"
+            "status: in-progress\n"
+            "turn: clio\n"
+            "turn_since: 2026-09-29T00:00:00Z\n"
+            'turn_reason: "start"\n'
+            'turn_by: ""\n'
+            "participants: [clio, ariadne]\n"
+            "colleague: ariadne\n"
+            "author: clio\n"
+            "---\n"
+            f"\n# {pid}\n\n## Turn log\n\n"
+            "- 2026-09-29T00:00:00Z initialized → clio: start\n",
+            seq=0,
+        )
+
+        flip(
+            s, a, pid, to_agent="ariadne", reason="please review",
+            by_agent="clio", transition_phase="peer", ts="2026-09-30T00:01:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "peer"
+
+        flip(
+            s, a, pid, to_agent="clio", reason="one blocker",
+            by_agent="ariadne", phase="peer", ts="2026-09-30T00:02:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "peer"
+
+        flip(
+            s, a, pid, to_agent="ariadne", reason="fixed",
+            by_agent="clio", phase="peer", ts="2026-09-30T00:03:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "peer"
+
+        flip(
+            s, a, pid, to_agent="lei shi", reason="approved, ready",
+            by_agent="ariadne", transition_phase="merge", ts="2026-09-30T00:04:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "merge"
+
+    def test_bunch_sequence_from_genuinely_legacy_baton(self, tmp_path):
+        """Test obligation 4, bunch half: the SAME 4-step machine (claim ->
+        release -> claim -> release --done), replayed against a genuinely
+        legacy bunch baton (no `phase:` field, turn at the legacy pool
+        sentinel) -- confirming the same final tail as Borges's 5-value
+        bunch sequence (claimed, pool, claimed, done) composes correctly
+        without ever going through init(). `claim`/`release` are ALWAYS
+        transitions regardless of the baton's starting state (see their
+        own docstrings), so the legacy-vs-fresh-inited distinction does
+        not change which channel any of these four calls use -- only
+        whether the FIRST call's stamp-if-absent-shaped predecessor
+        (init's transition) ever ran."""
+        s = FileStore(tmp_path)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        pid = "pool-9911"
+        s.write_project(
+            pid,
+            "---\n"
+            f"project: {pid}\n"
+            "title: legacy bunch\n"
+            "status: planning\n"
+            "turn: lei shi\n"
+            "turn_since: 2026-09-29T00:00:00Z\n"
+            'turn_reason: "start"\n'
+            'turn_by: ""\n'
+            "participants: [borges, ariadne]\n"
+            "---\n"
+            f"\n# {pid}\n\n## Turn log\n\n"
+            "- 2026-09-29T00:00:00Z initialized → lei shi: start\n",
+            seq=0,
+        )
+
+        claim(
+            s, a, pid, claimer="borges", pool_sentinel="lei shi",
+            transition_phase="claimed", ts="2026-09-30T00:01:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "claimed"
+
+        release(
+            s, a, pid, holder="borges", pool_sentinel="lei shi",
+            reason="done for now", transition_phase="pool", ts="2026-09-30T00:02:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "pool"
+
+        claim(
+            s, a, pid, claimer="ariadne", pool_sentinel="lei shi",
+            transition_phase="claimed", ts="2026-09-30T00:03:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "claimed"
+
+        release(
+            s, a, pid, holder="ariadne", pool_sentinel="lei shi",
+            reason="finished", done=True, transition_phase="done", ts="2026-09-30T00:04:00Z",
+        )
+        fields, _ = md.parse_frontmatter(s.read_project(pid))
+        assert fields["phase"] == "done"
+
+
+class TestU2aRound3EightNewlyWiredConversions:
+    """Minimal per-function coverage for the eight newly-wired write-bodies
+    (#3039 U2a round 3, Kepler's "all twelve write bodies" scope ruling):
+    one test per function confirming a still-legacy baton converts (stamps
+    the legacy-derived phase) when touched by that verb, and a second test
+    confirming an already-explicit-phase baton is left untouched -- mirrors
+    the existing TestPhaseWrites pattern pinned for the original four.
+    None of these eight ever pass `transition_phase` (per Kepler's ruling,
+    none of them defines a transition) -- only the `phase` (conversion)
+    channel is exercised here."""
+
+    # -- set_status (no real caller today; wired for completeness) --
+
+    def test_set_status_stamps_phase_on_legacy_baton(self, store, allocator):
+        set_status(
+            store, allocator, "PR-1", new_status="in-review", reason="review",
+            phase="peer", ts="2026-09-30T00:00:00Z",
+        )
+        raw = store.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "peer"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped: 'peer'" in lines[-1]
+
+    def test_set_status_does_not_clobber_existing_different_phase(self, tmp_path):
+        s = FileStore(tmp_path)
+        s.write_project("PR-1", _baton_with_phase(turn="ariadne", phase="merge"), seq=0)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        set_status(
+            s, a, "PR-1", new_status="in-review", reason="review",
+            phase="peer", ts="2026-09-30T00:00:00Z",
+        )
+        raw = s.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "merge"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped" not in lines[-1]
+
+    # -- close (per Kepler's ruling: conversion only, writes no transition) --
+
+    def test_close_stamps_phase_on_legacy_baton(self, store, allocator):
+        close(
+            store, allocator, "PR-1", new_status="merged", reason="closing",
+            phase="merge", ts="2026-09-30T00:00:00Z",
+        )
+        raw = store.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "merge"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped: 'merge'" in lines[-1]
+
+    def test_close_does_not_clobber_existing_different_phase(self, tmp_path):
+        s = FileStore(tmp_path)
+        s.write_project("PR-1", _baton_with_phase(turn="ariadne", phase="peer"), seq=0)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        close(
+            s, a, "PR-1", new_status="merged", reason="closing",
+            phase="merge", ts="2026-09-30T00:00:00Z",
+        )
+        raw = s.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "peer"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped" not in lines[-1]
+
+    # -- reopen (per Kepler's ruling: conversion only) --
+
+    def test_reopen_stamps_phase_on_legacy_baton(self, closed_store, closed_allocator):
+        reopen(
+            closed_store, closed_allocator, "PR-2", invoker="ariadne",
+            new_status="in-progress", phase="merge", ts="2026-09-30T00:00:00Z",
+        )
+        raw = closed_store.read_project("PR-2")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "merge"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped: 'merge'" in lines[-1]
+
+    def test_reopen_does_not_clobber_existing_different_phase(self, tmp_path):
+        s = FileStore(tmp_path)
+        raw_seed = _baton_with_phase(turn="ariadne", phase="peer").replace(
+            "status: in-progress", "status: merged",
+        )
+        s.write_project("PR-1", raw_seed, seq=0)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        reopen(
+            s, a, "PR-1", invoker="ariadne", new_status="in-progress",
+            phase="merge", ts="2026-09-30T00:00:00Z",
+        )
+        raw = s.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "peer"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped" not in lines[-1]
+
+    # -- rename (never a phase-machine edge) --
+
+    def test_rename_stamps_phase_on_legacy_baton(self, store, allocator):
+        rename(
+            store, allocator, "PR-1", new_title="new title",
+            phase="peer", ts="2026-09-30T00:00:00Z",
+        )
+        raw = store.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "peer"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped: 'peer'" in lines[-1]
+
+    def test_rename_does_not_clobber_existing_different_phase(self, tmp_path):
+        s = FileStore(tmp_path)
+        s.write_project("PR-1", _baton_with_phase(turn="ariadne", phase="merge"), seq=0)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        rename(
+            s, a, "PR-1", new_title="new title",
+            phase="peer", ts="2026-09-30T00:00:00Z",
+        )
+        raw = s.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "merge"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped" not in lines[-1]
+
+    # -- anchor (never a phase-machine edge) --
+
+    def test_anchor_stamps_phase_on_legacy_baton(self, store, allocator):
+        anchor(
+            store, allocator, "PR-1", github_anchor="pr/490",
+            phase="peer", ts="2026-09-30T00:00:00Z",
+        )
+        raw = store.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "peer"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped: 'peer'" in lines[-1]
+
+    def test_anchor_does_not_clobber_existing_different_phase(self, tmp_path):
+        s = FileStore(tmp_path)
+        s.write_project("PR-1", _baton_with_phase(turn="ariadne", phase="merge"), seq=0)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        anchor(
+            s, a, "PR-1", github_anchor="pr/490",
+            phase="peer", ts="2026-09-30T00:00:00Z",
+        )
+        raw = s.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "merge"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped" not in lines[-1]
+
+    # -- add_participant (never a phase-machine edge; conversion only fires
+    # on the real-write path, never the idempotent no-op -- see its own
+    # docstring) --
+
+    def test_add_participant_stamps_phase_on_legacy_baton(self, store, allocator):
+        add_participant(
+            store, allocator, "PR-1", agent="ariadne", participant="luria",
+            phase="peer", ts="2026-09-30T00:00:00Z",
+        )
+        raw = store.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "peer"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped: 'peer'" in lines[-1]
+
+    def test_add_participant_does_not_clobber_existing_different_phase(self, tmp_path):
+        s = FileStore(tmp_path)
+        s.write_project("PR-1", _baton_with_phase(turn="ariadne", phase="merge"), seq=0)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        add_participant(
+            s, a, "PR-1", agent="ariadne", participant="luria",
+            phase="peer", ts="2026-09-30T00:00:00Z",
+        )
+        raw = s.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "merge"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped" not in lines[-1]
+
+    def test_add_participant_idempotent_no_op_never_touches_phase(self, store, allocator):
+        """The idempotent no-op path (participant already present) performs
+        NO write at all -- conversion must not fire there either (#3039
+        U2a round 3: nothing to attach a stamp to)."""
+        seq_before, added = add_participant(
+            store, allocator, "PR-1", agent="ariadne", participant="borges",
+            phase="peer", ts="2026-09-30T00:00:00Z",
+        )
+        assert added is False
+        raw = store.read_project("PR-1")
+        assert "phase" not in md.parse_frontmatter(raw)[0]
+        assert "phase stamped" not in raw
+
+    # -- set_colleague (never a phase-machine edge) --
+
+    def test_set_colleague_stamps_phase_on_legacy_baton(self, store, allocator):
+        set_colleague(
+            store, allocator, "PR-1", agent="ariadne", colleague="luria",
+            phase="peer", ts="2026-09-30T00:00:00Z",
+        )
+        raw = store.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "peer"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped: 'peer'" in lines[-1]
+
+    def test_set_colleague_does_not_clobber_existing_different_phase(self, tmp_path):
+        s = FileStore(tmp_path)
+        s.write_project("PR-1", _baton_with_phase(turn="ariadne", phase="merge"), seq=0)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        set_colleague(
+            s, a, "PR-1", agent="ariadne", colleague="luria",
+            phase="peer", ts="2026-09-30T00:00:00Z",
+        )
+        raw = s.read_project("PR-1")
+        fields, _ = md.parse_frontmatter(raw)
+        assert fields["phase"] == "merge"
+        lines = [l for l in raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped" not in lines[-1]
+
+    # -- merge (per Kepler's ruling: conversion only; also archives the
+    # project after write, so the assertions read from archive/) --
+
+    def test_merge_stamps_phase_on_legacy_baton(self, store, allocator):
+        merge(
+            store, allocator, "PR-1", merged_by="luria",
+            phase="merge", ts="2026-09-30T00:00:00Z",
+        )
+        archive_raw = (store.root / "archive" / "PR-1.md").read_text()
+        fields, _ = md.parse_frontmatter(archive_raw)
+        assert fields["phase"] == "merge"
+        lines = [l for l in archive_raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped: 'merge'" in lines[-1]
+
+    def test_merge_does_not_clobber_existing_different_phase(self, tmp_path):
+        s = FileStore(tmp_path)
+        s.write_project("PR-1", _baton_with_phase(turn="ariadne", phase="peer"), seq=0)
+        a = SeqAllocator(recover=s.recover_max_seq)
+        merge(
+            s, a, "PR-1", merged_by="luria",
+            phase="merge", ts="2026-09-30T00:00:00Z",
+        )
+        archive_raw = (s.root / "archive" / "PR-1.md").read_text()
+        fields, _ = md.parse_frontmatter(archive_raw)
+        assert fields["phase"] == "peer"
+        lines = [l for l in archive_raw.splitlines() if l.startswith("- ")]
+        assert "phase stamped" not in lines[-1]
+
+
+# ---------------------------------------------------------------------------
+# #3039 U2a round 4 -- conversion THEN transition, asserted on the LOG
+# ---------------------------------------------------------------------------
+#
+# Round 3's two-step write-body (conversion = stamp-if-absent, then transition
+# = unconditional overwrite) is exercised here through the REAL write-bodies,
+# with BOTH `phase` (conversion) and `transition_phase` given on the same call
+# -- which is what the CLI now sends for the five transition verbs (claim /
+# release / release --done / flip fairy->peer / flip ->merge seat).
+#
+# CONTRACT (what round 4 fixes; stated here because prose does not execute):
+#   * legacy baton (no `phase:`): the turn log carries the conversion line
+#     (`phase stamped: '<legacy phase>' (legacy conversion ...`) FOLLOWED BY
+#     the transition line (`phase: '<new>' (transition)`), in that order, and
+#     the stored `phase:` ends at the transition value.
+#   * baton that already has an explicit `phase:`: conversion is a no-op --
+#     ONLY the transition line appears, no conversion line, no duplicates.
+#
+# Earlier tests assert the request body or the stored field, never the log
+# SEQUENCE -- that gap is how round 3 shipped legacy transitions with no
+# conversion record.
+
+def _phase_log(store, pid):
+    """The turn-log lines (``- ...``) that mention phase, in file order."""
+    content = store.read_project(pid)
+    return [
+        l for l in content.splitlines()
+        if l.startswith("- ") and "phase" in l
+    ]
+
+
+def _seed_round4(tmp_path, pid, *, turn, phase=None):
+    s = FileStore(tmp_path)
+    content = _baton_with_phase(turn=turn, phase=phase).replace("PR-1", pid)
+    s.write_project(pid, content, seq=0)
+    return s, SeqAllocator(recover=s.recover_max_seq)
+
+
+# (label, call(store, allocator, pid, phase, transition_phase), turn,
+#  legacy conversion phase, transition value)
+def _r4_claim(s, a, pid, phase, tp):
+    claim(s, a, pid, claimer="borges", pool_sentinel="lei shi",
+          phase=phase, transition_phase=tp, ts="2026-09-30T01:00:00Z")
+
+
+def _r4_release(s, a, pid, phase, tp):
+    release(s, a, pid, holder="borges", pool_sentinel="lei shi", reason="r",
+            phase=phase, transition_phase=tp, ts="2026-09-30T01:00:00Z")
+
+
+def _r4_release_done(s, a, pid, phase, tp):
+    release(s, a, pid, holder="borges", pool_sentinel="lei shi", reason="r",
+            done=True, phase=phase, transition_phase=tp, ts="2026-09-30T01:00:00Z")
+
+
+def _r4_flip(s, a, pid, phase, tp):
+    flip(s, a, pid, to_agent="borges", reason="r", by_agent="ariadne",
+         phase=phase, transition_phase=tp, ts="2026-09-30T01:00:00Z")
+
+
+_ROUND4_CASES = [
+    # id,              call,             turn,       legacy conv, transition
+    ("claim",          _r4_claim,        "lei shi",  "pool",      "claimed"),
+    ("release",        _r4_release,      "borges",   "claimed",   "pool"),
+    ("release_done",   _r4_release_done, "borges",   "claimed",   "done"),
+    ("flip_to_peer",   _r4_flip,         "ariadne",  "fairy",     "peer"),
+    ("flip_to_merge",  _r4_flip,         "ariadne",  "peer",      "merge"),
+]
+
+
+class TestU2aRound4ConversionThenTransitionLog:
+
+    @pytest.mark.parametrize(
+        "call,turn,conv,trans",
+        [c[1:] for c in _ROUND4_CASES], ids=[c[0] for c in _ROUND4_CASES],
+    )
+    def test_legacy_baton_logs_conversion_line_then_transition_line(
+        self, tmp_path, call, turn, conv, trans,
+    ):
+        s, a = _seed_round4(tmp_path, "PR-1", turn=turn, phase=None)
+        call(s, a, "PR-1", conv, trans)
+
+        log = _phase_log(s, "PR-1")
+        assert len(log) == 2, log
+        assert f"phase stamped: {conv!r} (legacy conversion" in log[0]
+        assert f"phase: {trans!r} (transition)" in log[1]
+        # ...and they sit in the SAME write, in this order, at the tail.
+        all_lines = [l for l in s.read_project("PR-1").splitlines() if l.startswith("- ")]
+        assert all_lines[-2:] == log
+        fields, _ = md.parse_frontmatter(s.read_project("PR-1"))
+        assert fields["phase"] == trans
+
+    @pytest.mark.parametrize(
+        "call,turn,conv,trans",
+        [c[1:] for c in _ROUND4_CASES], ids=[c[0] for c in _ROUND4_CASES],
+    )
+    def test_explicit_phase_baton_logs_only_the_transition_line(
+        self, tmp_path, call, turn, conv, trans,
+    ):
+        """The CLI sends conversion = the explicit value (what
+        `_conversion_phase` returns when `phase:` is present); the write-body
+        no-ops it -- no conversion line, no duplicate, just the transition."""
+        explicit = "peer" if trans != "peer" else "fairy"
+        s, a = _seed_round4(tmp_path, "PR-1", turn=turn, phase=explicit)
+        call(s, a, "PR-1", explicit, trans)
+
+        log = _phase_log(s, "PR-1")
+        assert len(log) == 1, log
+        assert f"phase: {trans!r} (transition)" in log[0]
+        assert "legacy conversion" not in log[0]
+        fields, _ = md.parse_frontmatter(s.read_project("PR-1"))
+        assert fields["phase"] == trans
+
+    def test_legacy_baton_with_no_conversion_value_still_transitions(self, tmp_path):
+        """`_conversion_phase` can return None (pool sentinel unresolvable):
+        the CLI then sends `phase: None`. The transition must still apply,
+        with no conversion line and no crash."""
+        s, a = _seed_round4(tmp_path, "PR-1", turn="lei shi", phase=None)
+        _r4_claim(s, a, "PR-1", None, "claimed")
+        log = _phase_log(s, "PR-1")
+        assert len(log) == 1 and "(transition)" in log[0]
+        fields, _ = md.parse_frontmatter(s.read_project("PR-1"))
+        assert fields["phase"] == "claimed"
+
+    def test_conversion_only_flip_is_unchanged(self, tmp_path):
+        """#2961 return-to-author / self-flip shape: `phase` alone, no
+        `transition_phase` -- one conversion line on a legacy baton, nothing
+        else, and the stored phase is the conversion value."""
+        s, a = _seed_round4(tmp_path, "PR-1", turn="ariadne", phase=None)
+        _r4_flip(s, a, "PR-1", "peer", None)
+        log = _phase_log(s, "PR-1")
+        assert len(log) == 1
+        assert "phase stamped: 'peer' (legacy conversion" in log[0]
+        assert "(transition)" not in log[0]
+        fields, _ = md.parse_frontmatter(s.read_project("PR-1"))
+        assert fields["phase"] == "peer"

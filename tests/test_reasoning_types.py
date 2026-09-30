@@ -95,7 +95,7 @@ def setup_base_graph(client):
 
 
 # ---------------------------------------------------------------------------
-# Test: All 14 reasoning types accepted
+# Test: All reasoning types accepted
 # ---------------------------------------------------------------------------
 
 def test_all_reasoning_types_accepted():
@@ -107,11 +107,17 @@ def test_all_reasoning_types_accepted():
         "deductive_modus_ponens", "deductive_modus_tollens",
         "deductive_hypothetical_syllogism", "deductive_disjunctive",
         "deductive_reductio", "deductive_conjunction",
-        "inductive_generalization", "inductive_statistical",
+        "inductive_generalization", "inductive_enumeration", "inductive_statistical",
         "inductive_analogy", "inductive_causal",
         "abductive_best_explanation", "abductive_elimination",
         "authority_expert", "authority_consensus",
     ]
+    import engram_confidence
+    assert set(all_types) == engram_confidence.REASONING_TYPES, (
+        f"all_types drifted from REASONING_TYPES: "
+        f"missing={sorted(engram_confidence.REASONING_TYPES - set(all_types))}, "
+        f"extra={sorted(set(all_types) - engram_confidence.REASONING_TYPES)}"
+    )
 
     for rtype in all_types:
         result = client.call("engram_derive", {

@@ -11,6 +11,199 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [v0.5.2] - 2026-09-25
 
+### rc4 round — 2026-09-30 (fixes, the telemetry ingest, and inert EngramManager units)
+
+**Read these three before upgrading.**
+
+- **`hooks.json` changed: the retired `engram-toolcall-repair.py` hook is
+  no longer registered, so restart Claude Code fully after upgrading.**
+  Both of its PreToolUse registrations are removed (#3213, closes #172). A
+  session reads hook registrations when it starts, so `/reload-plugins` is
+  not enough. The rebuild deletes and recreates the plugin tree, so a
+  session that is still running keeps the old registration after the
+  upgrade. The script is therefore still shipped, as an unregistered no-op
+  that reads its input, prints nothing and exits 0 (#3251, closes #3249).
+  Without it, that session would run python on a missing file (exit 2),
+  which Claude Code treats as a PreToolUse block on every ENGRAM tool
+  call. That hazard was reasoned, not observed on a seat. The no-op ships
+  for this release only and may be deleted in the first release after
+  v0.5.2, because sessions started on v0.5.2-rc4 or later no longer
+  register it. The hook had repaired nothing since at least 2026-06-30:
+  its own table of protected tools used the pre-plugin `mcp__engram__`
+  prefix, and every tool now takes one `payload_json` string, so the fault
+  it repaired can no longer occur. `tools/borges_session_eval.py` drops
+  its `T2_antml_repair_rate` metric, whose only source logs this hook
+  wrote (#3216, part of #3215).
+- **The telemetry verdict line is real for the first time.** Until now
+  nothing called `engram_telemetry_store.ingest()`, so no seat had a
+  `records.db`, and the telemetry line in `engram_diagnose` and the dream
+  record (rc3, #3170) could only read `telemetry: not aggregated`. The
+  surface daemon now runs the ingest on its indexer tick, in its own
+  `try`, so a failed ingest never skips the log indexer. A seat that has
+  never written telemetry is skipped quietly, and an Essential-only build
+  skips the step (#3226, closes #3135). The first pass also ingests and
+  sweeps the backlog of per-process files: on one seat, 9,020 files in
+  0.37 s. A surface daemon that is already running keeps the code it
+  started with, so restart it after upgrading (on a seat with the systemd
+  unit: `systemctl --user restart engram-surface-daemon`). The same PR
+  adds a nullable `swept_at` column to an existing `records.db` through an
+  idempotent `ALTER`, the round's one on-disk schema change. A
+  companion fix keeps a swept file's offset row and marks it swept, so a
+  file recreated under the same name is read from the start rather than
+  from the old offset, and the line's staleness signal survives the sweep
+  (#3228, closes #3227).
+- **The EngramManager units in this round are inert: nothing calls
+  them.** The owner process gains its socket permission layer: the socket
+  moves to `$ENGRAM_HOME/run/engramd.sock` in a 0700 directory with its
+  ACLs stripped, peer credentials are checked on every connection, a
+  symlink or non-socket at the path is refused, and the request deadline
+  covers execution as well as framing. `snapshot()` now stages into a
+  private temp file and replaces the destination atomically, so an
+  aborted snapshot never damages an existing file (#3201, closes #3194).
+  It also gains its two connections: an owner-internal one for
+  `snapshot()`, and a permanently restrictive client-read one behind an
+  authorizer floor with size and instruction limits (#3221, closes
+  #3195). No code outside `engramd_owner.py` and `engramd_client.py`
+  imports either module, and the owner still serves no domain
+  operations. Linux only for now: on another platform, or without
+  `setfacl`, the owner refuses to start.
+
+**Fixes and changes.**
+
+- **A snapshot read-mark failure is now visible instead of swallowed.**
+  `engram_core`'s per-turn snapshot capture still runs when its WAL
+  read-mark fails, but the result says so (`read_mark` is `held`,
+  `failed` or `inherited`, with the error), and a failed release is
+  reported and rolled back. The same PR adds a missing module-level
+  `import sys` that had turned two error handlers into `NameError`
+  crashes: the snapshot worker's unavailable-fallback, and the NLI
+  classifier's model-load failure (#3224, closes #3222).
+- **`cohort_dispatch validate` now checks that every node sent comes
+  back.** It checked the quality of each returned item but never compared
+  the returned ids with the payload, so a fairy that dropped one node of
+  fifteen passed with `failures: 0`. A dropped id is now a failure and
+  flows into the retry payload; an id returned but never sent is refused
+  and validate exits 1; a duplicate is retried (#3235, closes #3045).
+  This was the first fix built under the contract-first convention.
+- **The session-start hook's total injection is now capped.** It had no
+  total cap and injected 53,558 characters on one seat. Its output now
+  goes through `emit_context()` under the claude-code budget of 9,500
+  characters. Blocks that don't fit go to an overflow file named on the
+  first line, the must-not-miss lines stay within the first 1,800
+  characters, and the focus block is cut at whole entries with a marker
+  (#3214, closes #127). The full tool-capability index is now larger than
+  the whole budget, so it always goes to the overflow file; a names-only
+  tool list of about 950 characters, derived at runtime from the same
+  index, is shown inline instead (#3218, closes #3217).
+- **`forum reply` accepts the body as a positional argument.** Its
+  argument errors no longer echo the message text, which under `| tail`
+  read like a send confirmation, and stdin is read only when it is a real
+  redirect, so a socket on stdin can no longer hang the command (#3234,
+  closes #2906).
+- **`baton flip` to a non-participant now prints the fix:** the exact
+  `baton add-participant` command to run. The refusal itself is unchanged
+  (#3236, closes #2901).
+- **Batons now carry an explicit `phase:` that every transition writes,
+  so whether a baton is free to claim no longer depends on this seat's
+  `primary_user`.** `baton claim` asks `_resolve_phase()`: an explicit
+  `phase:` wins, and without one the old comparison (renamed
+  `_is_legacy_pool_sentinel()`) is the fallback and says so on stderr
+  (#3243). Every transition now writes its phase: `init` writes `fairy`
+  on a PR baton and `pool` on a bunch, the flip to the colleague writes
+  `peer`, the flip to the merge seat writes `merge`, `claim` writes
+  `claimed`, `release` writes `pool`, and `release --done` writes `done`.
+  When a transition meets a baton that has no `phase:` yet, it first logs
+  a `(legacy conversion)` line naming the phase the baton was in, then the
+  transition, so the change is readable in the baton's own turn log. Other
+  writes convert such a baton only when the old resolver can name its
+  phase. `close`, `merge` and
+  `reopen` write no phase; terminal states stay in `status` (#3254). Two
+  visible changes: `baton claim` refuses a PR baton sitting at the pool
+  marker, because that baton is in its merge phase (#3243); and a second
+  claim on a claimed bunch baton is refused because it reads `claimed`.
+  Both are part of #3039. The design note is
+  `docs/design/3039-baton-phase-turn.md` (#3055).
+- **The recall_summary authoring target is one number, 140, defined
+  once** as `RECALL_SUMMARY_TARGET` in
+  `tools/recall_summary_validator.py`. A second, never-ruled "≤120" limit
+  sat in eight places, including the fairy prompt and the validator's
+  message. The 200 and 280 gates are unchanged (#3191, closes #2736).
+- **The agent allowlist names all six shipped `engram-*` agents,
+  including `engram-dream-master`,** in the CLAUDE.md template, both boot
+  charges and the instruction-manifestation policy; a test binds the list
+  to the shipped agent specs. Deployed boot charges change only on
+  redeploy (#3220, closes #3219).
+- **Under `comms_surface: umwelt`, the Claude boot charges keep both
+  forum monitors armed as a safety net,** with the umwelt bell as
+  primary, until the forum-to-world bridge is live. Deployed copies change
+  only on redeploy (#3190).
+- **The CLAUDE.md template's write discipline now says to err on the side
+  of writing more,** and that the stop hook's Write Check reminder is
+  muted by design once the graph is mature. An existing seat's CLAUDE.md
+  is not changed (#3245, part of #3238).
+- **The session-start hook no longer raises a false `MCP server: OFFLINE`
+  on startup.** At a startup or resume, the MCP server is launched beside
+  the hook, and a single `pgrep` could run before the process was visible.
+  On one seat this fired on 12 of 12 automated boots after rc2. Now a miss
+  at startup or resume prints an informational `MCP liveness: unknown …
+  will confirm on first prompt`, with no `⚠️` header. A miss at a compact
+  or clear start still raises the hard alarm, and a probe that errors
+  names its cause (#3250, closes #3202). A follow-up test pins that any
+  unrecognised session source also gets the soft line (#3256, part of
+  #3252).
+- **viz: `GET /api/version` reports which commit the running `:5001`
+  server loaded,** captured once at startup (sha, branch, dirty,
+  started_at). It adds a warning off `dev`/`main` or on a dirty tree, and
+  with no git the server still starts and the endpoint returns nulls with
+  a reason (#3174, part of #2531).
+- **New `tools/monitor-supervisor.py` runs the two forum monitors and the
+  umwelt bell as children under one Monitor,** so a seat re-arms one
+  watch instead of three. It refuses to reap an earlier instance whose
+  identity it cannot confirm. Nothing arms it yet (#3177, part of #2982).
+- **macOS wake (repo-side only):** a throwaway credential probe for
+  checking, once, whether a LaunchDaemon can read the Claude Code Keychain
+  entry, and a fail-loud credential check as the first action of the
+  wake launch script, so a credential failure is logged instead of looking
+  like a quiet skip. The same PR fixes a `PATH` ordering bug in that
+  script found by its tests (#3246, part of #3002).
+- **WS4 adjudication kit (repo-only, in no install tier):**
+  `extract_spans.py` adjudicates at most 10 fires per seat per UTC day,
+  picked by a seeded hash that never sees the arm (#3181), and
+  `analyze.py` reports each seat's sampled fraction and per-lesson
+  composition (#3182); part of #2753.
+
+**Docs, CI and tests.**
+
+- `CLAUDE.md`: the contract-first tests convention is adopted, and
+  `docs/PR-MERGE-POLICY.md` puts the whole baton system, design included,
+  on the team-merge side (#3241). The macOS CI runner is removed and
+  macOS coverage comes from the Mac seats (#3192, #3193). Check 3 names
+  soma alongside umwelt as exposed to commit-message auto-close (#3189,
+  closes #2515 and #2514). The attribution section gains its
+  duplicated-by-hand footer (#3206, closes #2707).
+- Cross-repo fairy dispatch: the parent provisions the worktree and
+  passes it by path (#3212).
+- `docs/RELEASING.md`: reconciling `main` into `dev` is now a standing,
+  command-checked step before every cut, not only a fix for a `DIRTY`
+  release PR (#3258, closes #3116).
+- #2652 design docs: the owner is one process that may hold two
+  connections (#3198, closes #2840); the deadline covers execution
+  (#3200); the socket path and the inherited-ACL gap (#3211). Three
+  comments in `engramd_owner.py` name the right U3 identifiers (#3239).
+- Cascade docstrings name `CASCADE_RELATIONS` instead of "just
+  derives_from" (#3233, closes #3229).
+- Chinese: `docs/ZH-TERMINOLOGY.md` records the terminology ruling
+  (#3207), and the `README.zh.md` title renders "epistemic" as 认知
+  (#3203).
+- Tests: `fresh_module`'s `sys.modules` purge is restored at the end of
+  each test file, which turns dev's full suite green again after #3226
+  (#3230, closes #3225); a `tools` package cached from the wrong path is
+  purged after `sys.path` is restored (#3205, closes #3204);
+  `test_all_reasoning_types_accepted` covers `inductive_enumeration` and
+  now fails if its list drifts from `REASONING_TYPES` (#3231, closes
+  #3081); the tripwire ceiling test is tightened now that #2893 is fixed
+  (#3185).
+
 ### rc3 round — 2026-09-27 (fixes plus new capabilities)
 
 - **A tool call can no longer report success on a live connection whose
@@ -185,6 +378,23 @@ with an `-alpha` suffix during the alpha phase.
   counts, and per-arm privacy-drop counts. Read-only on the ledger,
   transcripts and `knowledge.db`; ships in no install tier (#3175, part
   of #2753).
+- **The WS4 adjudication report now counts every fire-ledger row,
+  including the `error` and `na` rows it used to skip without a trace.**
+  `compute_denominators()` in `tools/ws4/analyze.py` gains
+  `ledger_rows_by_arm` (per seat and pooled; `chain`, `control`, `na`
+  and `error` always present, 0 when absent) and an `error_rows` count
+  with a per-error breakdown, and the report always prints its
+  `error rows` line, including when the count is 0. The
+  `extract_spans.py` selection and every existing O1, O2 and
+  length-control number are unchanged (#3179, part of #2753).
+- **`engram_retype_edge` was missing from the two hand-kept registries
+  that must list every write-capable tool, which turned the rc3
+  release-gate full suite red.** The Stop hook's `_ENGRAM_WRITE_VERBS`
+  now includes `retype_edge`, so a turn whose only ENGRAM write is a
+  retype counts as a write for the write check. The checked-in
+  `tool_capability_index.txt` is regenerated with the new tool's entry.
+  Mechanical sync of #3160; no behaviour change beyond those two
+  lists (#3183, part of #2265).
 
 ### rc2 fix round — 2026-09-26 (found on the rc1 soak)
 

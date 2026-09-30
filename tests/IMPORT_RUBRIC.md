@@ -179,6 +179,12 @@ def test_something():
 The `fresh_module` helper lives in `tests/conftest.py` but is a **plain function**,
 not a `@pytest.fixture` — pytest's conftest auto-discovery applies to fixtures and
 hooks, not plain helpers. Each test file that uses it must import it explicitly.
+
+The purge is not permanent: the autouse module-scoped fixture
+`_restore_sys_modules_per_file` in `tests/conftest.py` restores the original
+`server` / `engram_*` entries at the end of each test file (#3225), so a later
+file's import-time bindings are not orphaned. Within a file the fresh modules
+persist.
 Use the two-line pattern from the pilot (`tests/test_fts_retract_trigger.py`):
 
 ```python

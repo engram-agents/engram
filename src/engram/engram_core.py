@@ -28,6 +28,7 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import sys
 import textwrap
 import threading
 import time
@@ -927,9 +928,9 @@ _CASCADE_RELATION_PLACEHOLDERS = ",".join("?" * len(_CASCADE_RELATIONS_SORTED))
 # question that ONLY COINCIDENTALLY SHARED, pre-#2252-Stage-1.3, the same tuple
 # as CASCADE_RELATIONS. #2252 Stage 1.3 (now landed) removed `cascade` from
 # `supported_by`, so the two sets are no longer even numerically equal —
-# CASCADE_RELATIONS is now the strict subset {derives_from}, while this
-# constant deliberately still includes `supported_by` for citation-coverage
-# purposes. Had this constant been derived from CASCADE_RELATIONS instead of
+# CASCADE_RELATIONS no longer contains `supported_by` (see that constant for
+# its current members), while this constant deliberately still includes
+# `supported_by` for citation-coverage purposes. Had this constant been derived from CASCADE_RELATIONS instead of
 # hand-enumerated, the uncited-observation metric would have silently changed
 # meaning on the day Stage 1.3 landed, with no test to catch it — the
 # now-realized divergence is exactly why it stays hand-enumerated.
@@ -3162,8 +3163,9 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
         ("focused_at", "TEXT"),
         ("focus_reason", "TEXT"),
         # ── recall quality columns ──
-        # Curated ≤120-char summary string authored by Sonnet for fast agent
-        # recognition (PR A substrate; backfill via PR B sleep-fairy).
+        # Curated ≤140-char (RECALL_SUMMARY_TARGET) summary string authored by
+        # Sonnet for fast agent recognition (PR A substrate; backfill via PR
+        # B sleep-fairy).
         # NULL on existing rows and when not yet generated.
         ("recall_summary", "TEXT"),
         # JSON-encoded list of 3 short keyword strings for structural recognition
@@ -7123,6 +7125,69 @@ def _commit_snapshot(
     return result
 
 
+def _acquire_read_mark(
+    conn: sqlite3.Connection, fn_name: str
+) -> "tuple[bool, str, Optional[str]]":
+    """#786 WAL read-mark acquire, shared by the async and sync snapshot paths (#3222).
+
+    Returns ``(held_txn, read_mark, read_mark_error)``:
+      - ``(False, "inherited", None)`` when conn is already in a transaction (no BEGIN
+        is issued; sqlite3's default isolation is non-autocommit, so any uncommitted
+        DML leaves ``in_transaction`` True).
+      - ``(True, "held", None)`` when BEGIN DEFERRED and the sqlite_master read both
+        succeed. A real-page read is what forces a genuine WAL read mark; ``SELECT 1``
+        touches no page and would not.
+      - ``(held, "failed", <error text>)`` when either statement raises, plus one
+        stderr line naming ``fn_name``. ``held`` is True if the BEGIN itself succeeded
+        (the read after it failed), so the caller's release still COMMITs.
+    Never raises. The capture still runs on failure (durability wins).
+    """
+    if conn.in_transaction:
+        return False, "inherited", None
+    held_txn = False
+    try:
+        conn.execute("BEGIN DEFERRED")
+        # Set immediately after BEGIN so the release always fires, even if the
+        # read statement below raises: BEGIN opened a transaction.
+        held_txn = True
+        conn.execute("SELECT count(*) FROM sqlite_master")
+        return held_txn, "held", None
+    except Exception as e:
+        print(
+            f"[engram snapshot] read-mark FAILED ({fn_name}): {e}"
+            " \u2014 capture will run without a consistent WAL view",
+            file=sys.stderr,
+        )
+        return held_txn, "failed", str(e)
+
+
+def _release_read_mark(
+    conn: sqlite3.Connection, held_txn: bool, fn_name: str
+) -> Optional[str]:
+    """Release the read-mark taken by ``_acquire_read_mark`` (#3222).
+
+    No-op (returns None) when ``held_txn`` is False. Otherwise COMMIT; if that raises,
+    print one stderr line naming ``fn_name``, attempt a ROLLBACK, and return the error
+    text (with the ROLLBACK failure appended if that also fails). Never raises.
+    """
+    if not held_txn:
+        return None
+    try:
+        conn.execute("COMMIT")
+        return None
+    except Exception as e:
+        release_error = str(e)
+        print(
+            f"[engram snapshot] read-mark release COMMIT FAILED ({fn_name}): {e}",
+            file=sys.stderr,
+        )
+        try:
+            conn.execute("ROLLBACK")
+        except Exception as e2:
+            release_error += f"; ROLLBACK also failed: {e2}"
+        return release_error
+
+
 def _commit_snapshot_async(
     conn: sqlite3.Connection,
     message: str,
@@ -7141,6 +7206,10 @@ def _commit_snapshot_async(
       5. Durably enqueue + fsync the async commit job; return only after the fsync.
     The worker then regenerates knowledge.sql + graph_snapshot.md from the captured
     immutable snapshot and commits/pushes them (R5: it never touches the live WAL).
+
+    #3222: when this returns None (fallback to sync), its own read-mark outcome
+    (read_mark_error / read_mark_release_error) appears only on stderr; the caller
+    sees the sync path's ``read_mark``.
     """
     global _git_available
 
@@ -7164,26 +7233,25 @@ def _commit_snapshot_async(
     #    the capture sees a consistent committed view (identical discipline to the
     #    sync dump; verified conn.backup() works while this txn is open). Guard: don't
     #    BEGIN if conn already has an open transaction.
-    _held_read_txn = False
-    if not conn.in_transaction:
-        try:
-            conn.execute("BEGIN DEFERRED")
-            _held_read_txn = True
-            conn.execute("SELECT count(*) FROM sqlite_master")
-        except Exception:
-            pass  # best-effort; capture still runs
+    #    #3222: a failure here is NOT silent. The capture still runs (durability
+    #    wins) but the result dict carries read_mark="failed" + read_mark_error and
+    #    stderr gets one line. "inherited" = conn was already in a transaction.
+    _held_read_txn, _read_mark, _read_mark_error = _acquire_read_mark(
+        conn, "_commit_snapshot_async"
+    )
 
     # 2. Per-turn durable binary snapshot (R1/R2) under the read-mark.
-    seq = _sw.next_seq()
-    capture = _sw.write_durable_snapshot(conn, turn, seq)
-
-    # 3a. Release the read-mark before the RESTART checkpoint (RESTART needs all
-    #     WAL readers gone).
-    if _held_read_txn:
-        try:
-            conn.execute("COMMIT")
-        except Exception:
-            pass
+    #    3a. Release the read-mark before the RESTART checkpoint (RESTART needs all
+    #    WAL readers gone). try/finally so an exception from next_seq() /
+    #    write_durable_snapshot() cannot strand the read transaction; it still
+    #    propagates unchanged.
+    try:
+        seq = _sw.next_seq()
+        capture = _sw.write_durable_snapshot(conn, turn, seq)
+    finally:
+        _read_mark_release_error = _release_read_mark(
+            conn, _held_read_txn, "_commit_snapshot_async"
+        )
 
     # If the sync capture failed, we have NOT secured this turn — fall back to sync
     # so durability is not silently dropped.
@@ -7231,7 +7299,12 @@ def _commit_snapshot_async(
         "db_backup": _db_backup_result,
         "git_gc": _git_gc_result,
         "snapshot_lag": _sw.compute_snapshot_lag(),
+        "read_mark": _read_mark,
     }
+    if _read_mark_error is not None:
+        result["read_mark_error"] = _read_mark_error
+    if _read_mark_release_error is not None:
+        result["read_mark_release_error"] = _read_mark_release_error
     if wal_warning:
         result["wal_warning"] = wal_warning
     return result
@@ -7367,17 +7440,13 @@ def _commit_snapshot_sync(
     # Guard: don't issue BEGIN if conn already has an open transaction
     # (sqlite3 default isolation_level is non-autocommit — implicit BEGIN fires
     # on first DML, so in_transaction is True after any uncommitted write).
-    _held_read_txn = False
-    if not conn.in_transaction:
-        try:
-            conn.execute("BEGIN DEFERRED")
-            # Set immediately after BEGIN so the finally-COMMIT always fires,
-            # even if the read statement below raises.  BEGIN opened a
-            # transaction; cleanup must be airtight regardless of what follows.
-            _held_read_txn = True
-            conn.execute("SELECT count(*) FROM sqlite_master")
-        except Exception:
-            pass  # best-effort; the dump still runs; #786 race window stays small
+    # #3222: a failure here is NOT silent. The dump still runs (durability wins)
+    # but every returned dict carries read_mark="failed" + read_mark_error and
+    # stderr gets one line.  "inherited" = conn was already in a transaction.
+    _read_mark_release_error = None
+    _held_read_txn, _read_mark, _read_mark_error = _acquire_read_mark(
+        conn, "_commit_snapshot_sync"
+    )
 
     try:
         import engram_backup  # local import: server.py's dir is on sys.path; dodges import-order
@@ -7393,11 +7462,9 @@ def _commit_snapshot_sync(
         # Release the WAL read mark before the RESTART checkpoint below.
         # RESTART needs all WAL readers gone; holding the mark past this point
         # would silently downgrade RESTART to a partial checkpoint.
-        if _held_read_txn:
-            try:
-                conn.execute("COMMIT")
-            except Exception:
-                pass
+        _read_mark_release_error = _release_read_mark(
+            conn, _held_read_txn, "_commit_snapshot_sync"
+        )
 
     # 2b. Binary backup: timestamped hot-copy of knowledge.db for fast point-in-time
     #     restore without re-running the full pipeline.  Best-effort (#1142): never
@@ -7445,6 +7512,12 @@ def _commit_snapshot_sync(
         _dump_fields["sql_dump_error"] = _dump_error
     _dump_fields["db_backup"] = _db_backup_result
     _dump_fields["git_gc"] = _git_gc_result
+    # #3222: read-mark outcome rides on every return path after this point.
+    _dump_fields["read_mark"] = _read_mark
+    if _read_mark_error is not None:
+        _dump_fields["read_mark_error"] = _read_mark_error
+    if _read_mark_release_error is not None:
+        _dump_fields["read_mark_release_error"] = _read_mark_release_error
 
     # 3. Stage explicit files only (never `git add .` — would pull in backups,
     #    daemon sockets, etc.)
@@ -8848,7 +8921,23 @@ def _classify_pending_markers(conn: sqlite3.Connection, node_id: str) -> tuple:
 # for Borges that 200 vs 280 IS deliberate). Target: agents should aim for
 # ≤140 chars; soft-accept (needs_tightening=1) up to 279; hard-reject at
 # 280+.
-RECALL_SUMMARY_TARGET = 140
+#
+# RECALL_SUMMARY_TARGET now LIVES in tools/recall_summary_validator.py
+# (#2736 defect 2 — "140" had drifted into 8 sites as an unruled "≤120").
+# Imported here rather than redefined: the dependency direction is
+# core -> tools ON PURPOSE, because tools/ is DB-free and embeddings-free
+# and cannot import engram_core (would create a cycle), so the constant has
+# to live on the side both the heavy runtime and the lightweight tools can
+# reach. Do not move it back into core.
+# Inherited constraint (#2565 tools-package name clash): importing engram_core
+# now imports `tools`, binding it in sys.modules to whichever `tools` package is
+# first on sys.path. Standalone scripts that put src/engram first (e.g.
+# tools/anchoring_report.py, tools/surgical.py) therefore bind the runtime's
+# tools/, and a LATER `import tools.engine` (repo-root dev tooling) in the same
+# process fails. Nothing does that today; the pytest suite puts the repo root
+# first and is guarded by conftest.py's #2565 check, and the installed plugin
+# has only one `tools` package.
+from tools.recall_summary_validator import RECALL_SUMMARY_TARGET  # noqa: E402
 RECALL_SUMMARY_HARD_REJECT_AT = 280
 
 # Write-time recall_keywords bounds (#1952 PR1) — distinct from the older
@@ -9375,8 +9464,8 @@ def _trace_observation_leaves(
     SAME one by construction: a node's evidential lineage is exactly its
     cascade ancestry, so "premise" should derive from ``cascade``, not merely
     coincide with it. ``supported_by`` drops out of the walked set as a
-    consequence (``CASCADE_RELATIONS`` is now the strict subset
-    ``{derives_from}``) — behavior-preserving today, though the reason is
+    consequence (``CASCADE_RELATIONS`` no longer contains it — see that constant
+    for the current members) — behavior-preserving today, though the reason is
     about the edge's SOURCE, not its target (reviewer-fairy catch, PR #2329:
     an earlier draft of this note wrongly reasoned from the target side).
     Every ``supported_by`` edge is minted with a cornerstone or lesson as its

@@ -7501,8 +7501,9 @@ def engram_set_recall_summaries(payload_json: str) -> str:
         payload_json: JSON object string with EXACTLY ONE of:
             summaries (list): list of entry objects, each with:
                 node_id (str): target node. Must exist + is_current=1.
-                recall_summary (str): curated summary. Authoring target ≤120
-                    chars; hard cap 200 chars (defensive guard).
+                recall_summary (str): curated summary. Authoring target ≤140
+                    chars (RECALL_SUMMARY_TARGET); hard cap 200 chars
+                    (defensive guard).
                 recall_keywords (list[str]): 3–5 strings, each ≤30 chars,
                     no duplicates (case-sensitive).
             summaries_file (str): ABSOLUTE path to a JSON file on disk with

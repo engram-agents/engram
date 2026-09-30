@@ -25,10 +25,29 @@ For each ledger row (in $ENGRAM_HOME/tripwire-fire-ledger.jsonl, schema_version
   4. Write a separate key.jsonl (fire_id -> arm) for the ANALYST, never
      given to the adjudicator.
 
+Amendment 3 (#2753, adopted by Kepler 2026-09-27 18:47Z): per seat per UTC
+day, at most --sample fires (default tools/ws4/constants.py's SAMPLE_N) are
+adjudicated -- the sample is the N eligible (chain+control) fires with the
+LOWEST sha256(f"{sample_seed}:{fire_id}") hex digest, --sample-seed
+defaulting to constants.SAMPLE_SEED. fire_id never hashes arm (see
+ledger.compute_fire_id) and the arm draw uses its own separate seed, so the
+sample is arm-blind by construction -- the same fire_ids with the arms
+swapped give the identical sample. --sample 0 disables sampling entirely
+(every eligible fire is extracted, the pre-amendment-3 behaviour; for tests
+and audits). Only SAMPLED fires are extracted (spans/, key.jsonl,
+flags.jsonl, unlocatable.jsonl rows); unsampled fires get no span and no key
+row, but are never dropped from accounting. Two new analyst-only files
+record every eligible fire regardless of sampling outcome -- sample.jsonl
+(fire_id, sampled, rank, shown_lesson_ids; NO arm field) and
+sample_summary.json (date, sample_n, sample_seed, eligible, sampled,
+per-lesson eligible/sampled composition). Like key.jsonl, NEITHER file is
+ever given to an adjudicator or a screener.
+
 If the transcript can't be read or the call can't be located, the row is
 recorded in unlocatable.jsonl with a reason instead of being silently
-dropped. Piece 1's invariant: rows_in == spans_out + unlocatable, printed at
-the end of every run.
+dropped. Piece 1's invariant (amendment 3: over SAMPLED fires, not every
+eligible fire): sampled == spans_out + unlocatable, and eligible ==
+sampled + unsampled, both printed at the end of every run.
 
 Read-only: never writes to the ledger or to knowledge.db. Stdlib only.
 
@@ -36,15 +55,19 @@ Usage:
     python -m tools.ws4.extract_spans --date 2026-09-28 --out /tmp/ws4-out
     python -m tools.ws4.extract_spans --date 2026-09-28 --k 6 --out /tmp/ws4-out \\
         --ledger /path/to/tripwire-fire-ledger.jsonl   # override for testing
+    python -m tools.ws4.extract_spans --date 2026-09-28 --out /tmp/ws4-out \\
+        --sample 0   # no sampling -- every eligible fire (tests/audits)
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import sys
 from pathlib import Path
 
-from .constants import MAX_K_SWEEP, REDACT_CHAIN
+from .constants import MAX_K_SWEEP, REDACT_CHAIN, SAMPLE_N, SAMPLE_SEED
 from .ledger import (
     append_jsonl,
     compute_fire_id,
@@ -118,7 +141,25 @@ def extract_one(row: dict, k: int, redact_chain: bool = REDACT_CHAIN):
     }
 
 
-def run(date_str: str, k: int, out_dir: str, ledger_path: str, redact_chain: bool = REDACT_CHAIN) -> dict:
+def _sample_sort_key(fire_id: str, sample_seed: str):
+    """Amendment 3's ranking key: sha256(f"{sample_seed}:{fire_id}") hex
+    digest, with fire_id itself as the tiebreaker so the order is total
+    (ties are impossible in practice). Never hashes arm -- fire_id itself
+    never carries arm (ledger.compute_fire_id) -- so this ranking is
+    arm-blind by construction."""
+    digest = hashlib.sha256(f"{sample_seed}:{fire_id}".encode("utf-8")).hexdigest()
+    return (digest, fire_id)
+
+
+def run(
+    date_str: str,
+    k: int,
+    out_dir: str,
+    ledger_path: str,
+    redact_chain: bool = REDACT_CHAIN,
+    sample_n: int = SAMPLE_N,
+    sample_seed: str = SAMPLE_SEED,
+) -> dict:
     rows = load_jsonl(ledger_path)
     selected = rows_for_date_and_arms(rows, date_str, ADJUDICATION_ARMS)
 
@@ -126,14 +167,54 @@ def run(date_str: str, k: int, out_dir: str, ledger_path: str, redact_chain: boo
     spans_dir = out / "spans"
     spans_dir.mkdir(parents=True, exist_ok=True)
 
+    eligible = len(selected)
+
+    # Amendment 3: rank every eligible fire by the hash above and keep the
+    # lowest sample_n. sample_n <= 0 ("--sample 0") means no sampling --
+    # every eligible fire is kept (the pre-amendment-3 behaviour).
+    fire_ids = [compute_fire_id(row) for row in selected]
+    ranked_idx = sorted(range(eligible), key=lambda i: _sample_sort_key(fire_ids[i], sample_seed))
+    effective_n = eligible if sample_n <= 0 else min(sample_n, eligible)
+
+    sampled_fire_ids = set()
+    sample_rows = []
+    per_lesson = {}
+    for rank, idx in enumerate(ranked_idx):
+        row = selected[idx]
+        fire_id = fire_ids[idx]
+        is_sampled = rank < effective_n
+        if is_sampled:
+            sampled_fire_ids.add(fire_id)
+        shown = list(row.get("shown_lesson_ids") or [])
+        sample_rows.append(
+            {
+                "fire_id": fire_id,
+                "sampled": is_sampled,
+                "rank": rank,
+                "shown_lesson_ids": shown,
+            }
+        )
+        lesson_keys = shown if shown else ["(none)"]
+        for lesson_id in lesson_keys:
+            bucket = per_lesson.setdefault(lesson_id, {"eligible": 0, "sampled": 0})
+            bucket["eligible"] += 1
+            if is_sampled:
+                bucket["sampled"] += 1
+
     key_rows = []
     unlocatable_rows = []
     flags_rows = []
     spans_out = 0
 
-    for row in selected:
+    for idx, row in enumerate(selected):
+        fire_id = fire_ids[idx]
+        if fire_id not in sampled_fire_ids:
+            # Unsampled fires get no span and no key row (amendment 3) --
+            # they are still accounted for in sample.jsonl / summary above,
+            # just never extracted.
+            continue
+
         result = extract_one(row, k, redact_chain=redact_chain)
-        fire_id = result["fire_id"]
         if not result["ok"]:
             unlocatable_rows.append(
                 {
@@ -167,16 +248,44 @@ def run(date_str: str, k: int, out_dir: str, ledger_path: str, redact_chain: boo
     write_jsonl(out / "key.jsonl", key_rows)
     write_jsonl(out / "unlocatable.jsonl", unlocatable_rows)
     write_jsonl(out / "flags.jsonl", flags_rows)
+    write_jsonl(out / "sample.jsonl", sample_rows)
 
-    rows_in = len(selected)
+    sampled_n = len(sampled_fire_ids)
+    # Counted from the rows actually written to sample.jsonl, not derived as
+    # eligible - sampled_n, so the second invariant below can fail: a dropped
+    # or duplicated eligible fire, or a fire_id collision, breaks it.
+    unsampled_n = sum(1 for r in sample_rows if not r["sampled"])
     unlocatable_n = len(unlocatable_rows)
-    assert rows_in == spans_out + unlocatable_n, (
-        f"WS4 extract_spans invariant violated: rows_in={rows_in} spans_out={spans_out} "
+
+    # Amendment 3's invariant supersedes Piece 1's: it now holds over the
+    # SAMPLED set, not every eligible fire (unsampled fires are never
+    # extracted, so they can never appear as spans_out or unlocatable).
+    assert sampled_n == spans_out + unlocatable_n, (
+        f"WS4 extract_spans invariant violated: sampled={sampled_n} spans_out={spans_out} "
         f"unlocatable={unlocatable_n}"
+    )
+    assert eligible == len(sample_rows) == sampled_n + unsampled_n, (
+        f"WS4 extract_spans invariant violated: eligible={eligible} sampled={sampled_n} "
+        f"unsampled={unsampled_n}"
+    )
+
+    summary = {
+        "date": date_str,
+        "sample_n": sample_n,
+        "sample_seed": sample_seed,
+        "eligible": eligible,
+        "sampled": sampled_n,
+        "per_lesson": per_lesson,
+    }
+    (out / "sample_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
     return {
-        "rows_in": rows_in,
+        "rows_in": eligible,
+        "eligible": eligible,
+        "sampled": sampled_n,
+        "unsampled": unsampled_n,
         "spans_out": spans_out,
         "unlocatable": unlocatable_n,
         "flagged": sum(1 for r in flags_rows if r["head_named_in_span"]),
@@ -196,19 +305,50 @@ def main(argv=None) -> int:
             "the sweep from one adjudication pass; override for tests only)"
         ),
     )
-    parser.add_argument("--out", required=True, help="output directory (spans/, key.jsonl, unlocatable.jsonl, flags.jsonl)")
+    parser.add_argument(
+        "--out",
+        required=True,
+        help="output directory (spans/, key.jsonl, unlocatable.jsonl, flags.jsonl, sample.jsonl, sample_summary.json)",
+    )
     parser.add_argument(
         "--ledger",
         default=None,
         help="override the fire-ledger path (default: $ENGRAM_HOME/tripwire-fire-ledger.jsonl)",
     )
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=SAMPLE_N,
+        help=(
+            f"amendment 3 (#2753): sample at most N chain+control fires per run, "
+            f"ranked by sha256(sample_seed:fire_id) (default: SAMPLE_N={SAMPLE_N}). "
+            "0 means no sampling -- every eligible fire is extracted "
+            "(pre-amendment-3 behaviour; for tests and audits)."
+        ),
+    )
+    parser.add_argument(
+        "--sample-seed",
+        default=SAMPLE_SEED,
+        help=f"amendment 3 (#2753): published sample seed (default: SAMPLE_SEED={SAMPLE_SEED!r}).",
+    )
     args = parser.parse_args(argv)
 
     ledger_path = args.ledger or default_ledger_path()
-    report = run(args.date, args.k, args.out, ledger_path)
+    report = run(
+        args.date, args.k, args.out, ledger_path,
+        sample_n=args.sample, sample_seed=args.sample_seed,
+    )
 
-    print(f"rows_in={report['rows_in']} spans_out={report['spans_out']} unlocatable={report['unlocatable']}")
-    print(f"invariant rows_in == spans_out + unlocatable: {report['rows_in']} == {report['spans_out']} + {report['unlocatable']}")
+    print(f"eligible={report['eligible']} sampled={report['sampled']} unsampled={report['unsampled']}")
+    print(f"spans_out={report['spans_out']} unlocatable={report['unlocatable']}")
+    print(
+        "invariant sampled == spans_out + unlocatable: "
+        f"{report['sampled']} == {report['spans_out']} + {report['unlocatable']}"
+    )
+    print(
+        "invariant eligible == sampled + unsampled: "
+        f"{report['eligible']} == {report['sampled']} + {report['unsampled']}"
+    )
     print(f"flagged (head_named_in_span): {report['flagged']}")
     return 0
 

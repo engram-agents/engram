@@ -119,7 +119,7 @@ def _make_raw_baton(project_id: str, **frontmatter) -> str:
 class TestCmdFlip:
     @pytest.fixture(autouse=True)
     def _sentinel(self, monkeypatch):
-        # cmd_flip's turn validation calls _is_pool_sentinel → _pool_sentinel,
+        # cmd_flip's turn validation calls _is_legacy_pool_sentinel → _pool_sentinel,
         # which reads the ambient $ENGRAM_HOME/config.json (NOT the passed config
         # dict). Mock it so these tests don't depend on a primary_user being set
         # in the CI env.
@@ -317,7 +317,7 @@ class TestCmdClaim:
                               turn="lei",
                               participants="[borges, ariadne]")
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei")
-        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda name: name in ("lei",))
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda name: name in ("lei",))
 
         client = _make_client(
             post_return={"seq": 3},
@@ -336,7 +336,7 @@ class TestCmdClaim:
     def test_network_error_maps_to_exit_io(self, monkeypatch):
         raw = _make_raw_baton("pool-x", turn="lei", participants="[borges]")
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei")
-        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda name: name == "lei")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda name: name == "lei")
 
         client = _make_client(get_return={"raw": raw})
         client.post.side_effect = ForumNetworkError("timeout")
@@ -453,7 +453,7 @@ class TestCmdInit:
         baton is never created.
         """
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei")
-        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda name: name == "lei")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda name: name == "lei")
 
         client = _make_client({"seq": 1, "project_id": "PR-101"})
         args = _ns(
@@ -482,7 +482,7 @@ class TestCmdInit:
     def test_github_anchor_included_when_provided(self, monkeypatch):
         """cmd_init passes github anchor to API when --github is provided."""
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei")
-        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda name: name == "lei")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda name: name == "lei")
 
         client = _make_client({"seq": 2})
         args = _ns(
@@ -503,7 +503,7 @@ class TestCmdInit:
     def test_409_conflict_maps_to_exit_validation(self, monkeypatch):
         """ForumHttpError 409 (project already exists) → EXIT_VALIDATION."""
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei")
-        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda name: name == "lei")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda name: name == "lei")
 
         client = _make_client()
         client.post.side_effect = ForumHttpError(409, '{"error": "already exists"}')
@@ -523,7 +523,7 @@ class TestCmdInit:
 
     def test_network_error_maps_to_exit_io(self, monkeypatch):
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei")
-        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda name: name == "lei")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda name: name == "lei")
 
         client = _make_client()
         client.post.side_effect = ForumNetworkError("refused")
@@ -721,7 +721,7 @@ class TestForumConfiguredGate:
 
     def test_init_no_forum_configured_exits_state(self, capsys, monkeypatch):
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei")
-        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda name: name == "lei")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda name: name == "lei")
         client = _make_client()
         args = _ns(project_id="PR-101", title="t", participants="borges", turn="borges")
 

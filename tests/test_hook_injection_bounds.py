@@ -198,18 +198,18 @@ class TestHeadSurvives:
 # Item 3 -- No writer outside the helper (structural).
 # ---------------------------------------------------------------------------
 # ENFORCED (live gate, no xfail): WS2 (the bulk migration, engram-alpha#2863)
-# has landed, and #2859 (SessionStart restructure) closed on 2026-09-24 via
-# PR#2925. All 5 previously-tracked hook emitters that don't route their
-# additionalContext content through emit_context() are now named,
-# rationale-carrying entries in `_EXCLUDED` below -- 4 are deliberate
-# atomic fixed-format emitters never meant to migrate onto emit_context()
-# by design; the 5th, engram-session-start-hook.py, is excluded for a
-# different, explicitly-disclosed reason (its own inline comment in
-# `_EXCLUDED` below) -- it is NOT a claim that hook is within budget; that
-# gap is separately tracked at engram-alpha#127. With all 5 named and
-# excluded, `_find_violators()` returns `[]` and
-# `test_every_additionalContext_emitter_routes_through_emit_context` below
-# is a normal, enforced, passing assertion -- a NEW hook that builds
+# has landed, #2859 (SessionStart restructure) closed on 2026-09-24 via
+# PR#2925, and #127 (the SessionStart TOTAL-emission cap) has now landed
+# too -- engram-session-start-hook.py routes its own final assembly through
+# _hooklib.emit_context() (see that hook's own main(), the block-collection
+# + emission comments near its tail). The 4 remaining hook emitters that
+# don't route their additionalContext content through emit_context() are
+# named, rationale-carrying entries in `_EXCLUDED` below -- all 4 are
+# deliberate atomic fixed-format emitters never meant to migrate onto
+# emit_context() by design (no head/body split to make of a single fixed
+# string). With all 4 named and excluded, `_find_violators()` returns `[]`
+# and `test_every_additionalContext_emitter_routes_through_emit_context`
+# below is a normal, enforced, passing assertion -- a NEW hook that builds
 # `additionalContext` without calling `emit_context()` fails this test on
 # sight, with no exemption to reach for.
 class TestNoBareJoinOutsideHelper:
@@ -261,29 +261,15 @@ class TestNoBareJoinOutsideHelper:
         "engram-end-of-day-hook.py",
         "engram-stale-tree-warn-hook.py",
         "engram-time-bar-hook.py",
-        # engram-session-start-hook.py: different rationale from the 4
-        # above -- NOT a claim of byte-budget compliance. #2859 (its
-        # SessionStart restructure) closed 2026-09-24 via PR#2925, but that
-        # PR's own body explicitly says "this hook doesn't use
-        # emit_context()" and explicitly deferred the question of whether
-        # this hook should ever migrate onto the shared helper. The hook's
-        # own main() comment block (the "ORDERING INVARIANT #1819, extended
-        # #2150" section) self-documents that its TOTAL additionalContext
-        # emission has NO cap at all -- only per-block caps exist (e.g.
-        # HISTORY_ARC_CHAR_CAP=32000, which alone exceeds #2863's 9,500-char
-        # total budget) -- with a real measured case hitting 62,859 bytes
-        # (#2150). This total-emission-cap problem is separately tracked at
-        # engram-alpha#127, explicitly out of scope for #2863. Excluded here
-        # because: (a) it predates the #2863 mandate and its 20+ separate
-        # block-function architecture makes a full emit_context() migration
-        # a large, separate restructuring effort, not safely doable as a
-        # drop-in; (b) its actual byte-budget compliance is a known,
-        # disclosed, SEPARATELY TRACKED gap at #127, not silently accepted
-        # or hidden here; (c) the #1819/#2150 ordering invariant (already
-        # shipped) is a partial mitigation -- it protects must-survive
-        # content from being truncated by a downstream reader, but does not
-        # cap total size.
-        "engram-session-start-hook.py",
+        # engram-session-start-hook.py: NO LONGER excluded (engram-alpha#127
+        # closed this gap) -- its main() now routes the whole
+        # priority-tagged block assembly through _hooklib.emit_context(),
+        # same as every other migrated hook. Previously excluded here
+        # because #2859's own SessionStart restructure (PR#2925) explicitly
+        # deferred the question of whether this hook should ever migrate
+        # onto the shared helper, and its TOTAL additionalContext emission
+        # had no cap at all (a real measured case hit 62,859 bytes, #2150).
+        # #127 is that migration.
     }
 
     # A quoted `additionalContext` immediately followed by a colon -- the

@@ -74,6 +74,16 @@ from typing import Any
 CONTRACT_VERSION = "1.0"  # MAJOR.MINOR -- this client's own wire-contract version.
 DEFAULT_TIMEOUT = 2.0  # seconds -- matches _query_recall_daemon's sock.settimeout(2) precedent.
 DEFAULT_SOCKET_NAME = "engramd.sock"  # distinct from the existing recall-daemon.sock (a different service).
+# The socket's containing subdirectory, relative to $ENGRAM_HOME (#3194,
+# P1-U4a -- the owner socket permission layer). $ENGRAM_HOME itself must
+# stay group/ACL-readable (the viz server still reads each seat's DB
+# directly there), so the socket cannot live directly in $ENGRAM_HOME --
+# it needs its own dedicated, ACL-stripped, 0700 directory. Borges's
+# ruling on issue #3194: keep the shipped socket FILENAME
+# (DEFAULT_SOCKET_NAME) and move only its parent directory -- the property
+# §2.1 of docs/2652-security-slice-design.md asks for is the directory,
+# not the name.
+SOCKET_DIR_NAME = "run"
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MiB -- generous for a JSON control-plane response,
 # small enough to bound a misbehaving owner that never completes a line (round-5 should-fix 1).
 
@@ -138,6 +148,13 @@ class Rejected:
     detail: str
     remedy: str
     request_id: str | None = None
+    # The owner's optional top-level `commit` key, verbatim. Today only
+    # snapshot()'s timeout response sets it, to "indeterminate" (a commit was
+    # reserved before the deadline; dest is atomically old or new). None on
+    # every other rejection -- for a `deadline_exceeded` rejection that means
+    # the destination was not touched. Added LAST, defaulted, so positional
+    # construction and equality of existing callers are unchanged.
+    commit: str | None = None
 
     @property
     def value(self) -> Any:
@@ -209,14 +226,17 @@ def _parse_major_minor(version: str) -> tuple[int, int] | None:
 
 
 def _resolve_socket_path(socket_path: Path | None) -> Path:
-    """Default socket path is $ENGRAM_HOME/engramd.sock, falling back to
-    ~/.engram when ENGRAM_HOME is unset -- the same resolution idiom already
-    used elsewhere in this codebase (see
+    """Default socket path is $ENGRAM_HOME/run/engramd.sock (#3194 -- the
+    socket moved into a dedicated subdirectory so the permission layer can
+    give it its own 0700, ACL-stripped directory without touching
+    $ENGRAM_HOME's own mode/ACLs, which other consumers, e.g. viz, still
+    need to read), falling back to ~/.engram when ENGRAM_HOME is unset --
+    the same resolution idiom already used elsewhere in this codebase (see
     src/engram/hooks/claude/engram-lesson-tripwire-hook.py:77)."""
     if socket_path is not None:
         return socket_path
     engram_home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
-    return Path(engram_home) / DEFAULT_SOCKET_NAME
+    return Path(engram_home) / SOCKET_DIR_NAME / DEFAULT_SOCKET_NAME
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +439,7 @@ def _call(
             detail=response.get("detail", ""),
             remedy=response.get("remedy", ""),
             request_id=request_id,
+            commit=response.get("commit"),
         )
     return _unavailable(
         socket_path=sp,
@@ -443,7 +464,23 @@ def read(
     """No request_id concept at all -- the read path structurally cannot
     carry one, which is half of what makes 'impossible to send a write
     without a request_id' true (the other half is write()'s own guarantee
-    below)."""
+    below).
+
+    `snapshot()` (there is no separate wrapper: it is `read("snapshot",
+    {"dest_path": ...})`): an `Unavailable` result -- a dropped connection --
+    must be read as INDETERMINATE, never as "nothing happened" and never as
+    success. The owner stops snapshot execution `SNAPSHOT_RESPONSE_RESERVE`
+    before the request deadline so its timeout responses (`Rejected` with
+    reason `deadline_exceeded`, whose wire form may carry `commit:
+    "indeterminate"`) normally arrive; the reserve makes a missed delivery
+    rare, not impossible (scheduler stalls). The destination is atomically
+    either the old file or the complete new snapshot, never partial, so
+    the client-visible forms `commit: "indeterminate"` and `Unavailable`
+    both mean "go look at dest_path"; neither ever means success.
+    `Rejected.commit == "indeterminate"` is the typed marker for the
+    committing outcome; `commit is None` on a `deadline_exceeded` rejection
+    means the destination was not touched; `Unavailable` remains
+    indeterminate."""
     return _call(
         method,
         params,

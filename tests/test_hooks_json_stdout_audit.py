@@ -65,7 +65,6 @@ SHELL_HOOK_REFS = [
 PRETOOL_ACTIVE_FIXTURES = {
     "engram-bash-pipe-exit-warn.py",
     "engram-lesson-tripwire-hook.py",
-    "engram-toolcall-repair.py",
 }
 
 
@@ -122,18 +121,6 @@ def _payload_for(event_name: str, script_name: str, transcript_path: Path) -> di
                 "tool_name": "Bash",
                 "tool_input": {"command": "forum reply 42"},
                 "input": {"command": "forum reply 42"},
-            }
-        if script_name == "engram-toolcall-repair.py":
-            return {
-                **base,
-                "tool_name": "mcp__engram__engram_add_observation",
-                "tool_input": {
-                    "quoted_text": "Q",
-                    "interpretation": 'I</interpretation><parameter name="claim">C</parameter>',
-                    "quote_type": "personal_communication",
-                    "url": "https://example.com",
-                    "title": "repair test",
-                },
             }
         return {
             **base,
@@ -274,10 +261,6 @@ def test_referenced_python_hook_stdout_is_empty_or_json_object(
             f"{script_name} ({event_name}) emitted updatedInput without "
             "permissionDecision='allow'"
         )
-        if script_name == "engram-toolcall-repair.py":
-            assert hook_specific["updatedInput"].get("claim") == "C", (
-                "toolcall-repair fixture must prove the rewrite path restored claim"
-            )
 
 
 # --- return-by-stdout shell helper skip-list -------------------------------

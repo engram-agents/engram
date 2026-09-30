@@ -1047,7 +1047,26 @@ def _fresh_core_with_data_dir(tmp_path, monkeypatch):
     THIS import, so `sys.path` is snapshotted before the mutation and
     restored verbatim in a `finally` -- once `import engram_core`
     completes, the module is already cached in `sys.modules` regardless
-    of `sys.path`'s later state, so restoring costs nothing here."""
+    of `sys.path`'s later state, so restoring costs nothing here.
+
+    #3204: restoring `sys.path` alone stopped being sufficient once
+    `engram_core.py` (PR-3191, #2736) gained its own top-level `from
+    tools.recall_summary_validator import RECALL_SUMMARY_TARGET`. That
+    import now fires DURING this function's own polluted window (`sys.
+    path[0] == src_engram`), so `tools` resolves against `src/engram/
+    tools` -- the wrong package -- and gets cached there in
+    `sys.modules['tools']` regardless of `sys.path` being restored
+    afterward. The accidental protection this docstring describes above
+    (an earlier `import server` caching the CORRECT `tools` first) is no
+    longer reliable, because THIS function can now be the very first
+    thing in the session to import anything under `tools` at all. Purging
+    `tools` and any `tools.*` submodules from `sys.modules` after the
+    `sys.path` restore -- not before, and not in the same purge as
+    `server`/`engram_*` above -- discards whatever got cached (correctly
+    or not) during the polluted window, so the next real import of
+    `tools.anything` (by this function's own caller, or by a later test
+    file such as test_engine_phase3.py) resolves fresh against the
+    already-restored, correct `sys.path`."""
     for key in list(sys.modules):
         if key == "server" or key.startswith("engram_"):
             del sys.modules[key]
@@ -1064,6 +1083,9 @@ def _fresh_core_with_data_dir(tmp_path, monkeypatch):
         )
     finally:
         sys.path[:] = _prior_sys_path
+        for key in list(sys.modules):
+            if key == "tools" or key.startswith("tools."):
+                del sys.modules[key]
     monkeypatch.setattr(core, "DATA_DIR", str(tmp_path))
     return core
 

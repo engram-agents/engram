@@ -283,57 +283,76 @@ class TestCommonCaseSanity(unittest.TestCase):
         self.assertEqual(out, "", "expected no stdout when nothing fires")
 
 
-class TestBoundaryMarginKnownSizingGap(unittest.TestCase):
-    """Documented regression guard for the known #2893 sizing gap (found by
-    reviewer-fairy round 1 on PR #2890, systematic 3500-fixture sweep):
-    `_hooklib.emit_context()`'s sizing loop measures against a generic
-    13-char placeholder overflow-path name, but this hook's real
-    `write_tripwire_overflow()` persists to a 17-char-named directory -- a
-    4-char measurement/render delta that lets the rendered
-    `additionalContext` land a few characters OVER the soft
-    `target`/`TRIPWIRE_BLOCK_CHAR_CEILING` (1800) on some inputs, though
-    NEVER over the hard `budget`. This is a pre-existing gap in the
-    already-merged WS1 `_hooklib.py`, not introduced by this hook's
-    migration and not this PR's to fix.
+class TestNeverExceedsCeilingAfterFix(unittest.TestCase):
+    """Regression guard for #2893 (closed 2026-09-13, fixed by PR #2898),
+    now that the gap it names is actually fixed. `_hooklib.emit_context()`'s
+    sizing loop used to measure candidate renders against a generic 13-char
+    placeholder overflow-path name, while this hook's real
+    `write_tripwire_overflow()` persists to a 17-char-named path -- a
+    measurement/render delta that let the rendered `additionalContext` land
+    a few characters OVER the soft `target`/`TRIPWIRE_BLOCK_CHAR_CEILING`
+    (1800) on some inputs (though never over the hard `budget`). That was
+    the known, accepted gap this class used to document and tolerate.
 
-    Deliberately asserts neither `<= TRIPWIRE_BLOCK_CHAR_CEILING` (would
-    fail intermittently given the known gap -- this fixture is chosen
-    specifically because it lands at/past the ceiling) NOR `<= budget` (far
-    too loose -- the hard budget is 9500 and is never at risk here; that
-    assertion would pass even if the soft-ceiling overshoot grew far
-    larger than the known gap). The margin below is chosen to comfortably
-    cover the known 2-4 char overshoot with buffer, so this test is a real
-    regression guard against the overshoot growing unexpectedly larger,
-    not a rubber stamp on the current gap.
+    PR #2898 closed the gap: `emit_context()` now re-validates the render
+    against the REAL overflow path once Stage 3 resolves it, and -- if that
+    re-validated render still doesn't fit -- shrinks `shown_n` and
+    re-renders, retrying (never below 1 shown item) until the render
+    actually fits under `target`, degrading to the `truncated_first` path
+    at the floor if even one item doesn't fit. The render can no longer
+    exceed `TRIPWIRE_BLOCK_CHAR_CEILING`; this is now a hard, re-validated
+    guarantee, not a few-char overshoot to tolerate.
 
-    Note on exactness: `write_tripwire_overflow()`'s on-disk path
-    (`ENGRAM_HOME/tripwire-overflow/<unix-ts>-<pid>.txt`) feeds into the
-    rendered trailer, so the EXACT overshoot for a given fixture shifts by
-    a couple of characters with `ENGRAM_HOME`'s path length and the
-    running process's pid digit-width (both environment-dependent, e.g.
-    this repo's own conftest.py points `ENGRAM_HOME` at a per-invocation
-    tempdir). The fixture below was chosen, and is checked, to land WITHIN
-    a documented near-boundary band regardless of that variance -- the
-    upper-bound assertion is the actual regression guard; the lower-bound
-    sanity check only confirms the fixture is still meaningfully close to
-    the boundary, without requiring it to literally cross 1800 on every
-    machine.
+    So this test is now a straightforward regression guard: the render
+    must never exceed `TRIPWIRE_BLOCK_CHAR_CEILING`, full stop (strict
+    `<=`, no margin) -- plus a lower-bound sanity check that the fixture
+    still meaningfully exercises a near-full render, so a future change
+    that accidentally makes this fixture trivially small still fails
+    loudly rather than passing vacuously.
 
-    # TODO(#2893): tighten to exact TRIPWIRE_BLOCK_CHAR_CEILING once the
-    # WS1 sizing gap is fixed.
+    Fixture: 90 hits, nudge_len=8, chosen by directly probing this hook's
+    own main() through the real pytest harness (not a standalone script --
+    ENGRAM_HOME differs outside conftest.py's setup, per this file's own
+    harness-pinning discipline elsewhere). Renders at 1781 chars in this
+    repo's test harness, confirmed stable across 5 separate pytest-process
+    invocations (varying the running PID, which factors into the on-disk
+    overflow path and therefore the exact render length) -- always exactly
+    1781, never varying.
+
+    This fixture was deliberately chosen (over several other near-1800
+    candidates found while re-probing, e.g. 13 hits/nudge_len=188 -> 1793,
+    or 13 hits/nudge_len=148 -> exactly 1800, a "local maximum" consistent
+    with the shrink-loop's fits-under-target guarantee) because it is the
+    one demonstrated -- by direct mutation, not merely fitting the band --
+    to actually exercise the #2898 shrink-and-retry loop: many small
+    (nudge_len=8) hits give Stage 3's real-path re-validation fine enough
+    granularity that a single shrunk item costs only ~20-odd characters
+    rather than 100+, so the post-shrink render can land close to the
+    ceiling instead of far below it. Confirmed by temporarily disabling
+    the shrink loop (`while shown_n > 1 and len(rendered) > target:` ->
+    `while False and ...`) in a local, uncommitted probe: this exact
+    fixture renders 1804 chars (over TRIPWIRE_BLOCK_CHAR_CEILING) with the
+    loop disabled, versus 1781 with it enabled -- i.e. this specific
+    fixture would have caught the original #2893 bug, not merely happened
+    to sit in the right numeric band. (Most near-1800 fixtures with fewer,
+    larger items -- e.g. the ones above -- do NOT discriminate this way:
+    either the naive Stage-2 pass already fits without correction, or a
+    triggered shrink drops a whole large item and overshoots far past the
+    near-boundary tolerance below.)
+
+    # Resolved: see PR #2898 (closed #2893) -- the WS1 sizing gap this
+    # class used to name is fixed; the assertions below were tightened
+    # accordingly rather than left stale.
     """
 
-    # Margin above the soft ceiling: covers the known 2-4 char overshoot
-    # (see #2893) plus buffer, while staying far below the hard budget
-    # (9500) so a real regression (uncapped growth) still fails loudly.
-    _KNOWN_SIZING_GAP_MARGIN = 10
-
     # How far below the ceiling the fixture is still considered
-    # "near-boundary" for the sanity check -- wide enough to absorb the
-    # environment-dependent path-length variance described above, narrow
+    # "near-boundary" for the lower-bound sanity check -- wide enough to
+    # absorb minor environment-dependent variance in the exact render
+    # length (on-disk overflow path length, pid digit-width), narrow
     # enough that a fixture which drifted far from the boundary (e.g. due
     # to an unrelated future change to emit_context()'s sizing) still
-    # fails this check rather than passing vacuously.
+    # fails this check rather than passing vacuously. Kept at the same
+    # value the class previously used; no reason found to change it.
     _NEAR_BOUNDARY_TOLERANCE = 30
 
     def test_near_boundary_fixture_stays_within_documented_margin(self):
@@ -343,45 +362,43 @@ class TestBoundaryMarginKnownSizingGap(unittest.TestCase):
 
         # Fixture chosen (by direct probe against this hook's own main(),
         # run through THIS repo's actual test harness/conftest.py) to land
-        # at/just past TRIPWIRE_BLOCK_CHAR_CEILING under the known #2893
-        # gap -- 13 hits, nudge_len=121 renders at ~1802 chars under this
-        # test suite's ENGRAM_HOME, matching the reviewer's 1802-1803-char
-        # range from the broader sweep.
-        n = 13
-        tripwires, command, patterns, nudges, node_ids = _seeded_hits(n, nudge_len=121)
+        # near TRIPWIRE_BLOCK_CHAR_CEILING under the now-fixed #2893
+        # sizing loop, AND to genuinely exercise the shrink-and-retry loop
+        # -- 90 hits, nudge_len=8 renders at 1781 chars under this test
+        # suite's ENGRAM_HOME, confirmed stable across repeated probes and
+        # confirmed discriminating under a local mutation probe (see class
+        # docstring).
+        n = 90
+        tripwires, command, patterns, nudges, node_ids = _seeded_hits(n, nudge_len=8)
 
         out = _run_hook_main(
             mod, {"tool_name": "Bash", "tool_input": {"command": command}},
             tripwires=tripwires,
         )
-        self.assertTrue(out.strip(), "expected JSON output given 13 seeded matches")
+        self.assertTrue(out.strip(), "expected JSON output given 90 seeded matches")
         response = json.loads(out.strip())
         additional_context = response["hookSpecificOutput"]["additionalContext"]
 
         self.assertLessEqual(
             len(additional_context),
-            mod.TRIPWIRE_BLOCK_CHAR_CEILING + self._KNOWN_SIZING_GAP_MARGIN,
+            mod.TRIPWIRE_BLOCK_CHAR_CEILING,
             f"additionalContext ({len(additional_context)} chars) exceeded "
             f"TRIPWIRE_BLOCK_CHAR_CEILING ({mod.TRIPWIRE_BLOCK_CHAR_CEILING}) "
-            f"+ the documented #2893 sizing-gap margin "
-            f"({self._KNOWN_SIZING_GAP_MARGIN})",
+            "-- the render must never exceed TRIPWIRE_BLOCK_CHAR_CEILING now "
+            "that #2893's re-validation-and-shrink fix (PR #2898) makes this "
+            "a hard guarantee, not the few-char overshoot this test used to "
+            "tolerate",
         )
         # Sanity on the fixture itself: this case is only a meaningful
         # regression guard if it actually lands near the boundary --
         # otherwise it would be indistinguishable from a fixture that
-        # never approached the boundary at all. Uses a tolerance band
-        # (rather than a strict `> ceiling`) because the exact overshoot
-        # is environment-sensitive (see class docstring); a fixture that
-        # renders a few chars UNDER the ceiling on some machine is still a
-        # valid near-boundary case, just not a demonstrated-overshoot one.
+        # never approached the boundary at all.
         self.assertGreaterEqual(
             len(additional_context),
             mod.TRIPWIRE_BLOCK_CHAR_CEILING - self._NEAR_BOUNDARY_TOLERANCE,
             "fixture no longer lands near the boundary -- if emit_context()'s "
             "sizing changed, re-probe for a fixture that lands near "
-            f"TRIPWIRE_BLOCK_CHAR_CEILING ({mod.TRIPWIRE_BLOCK_CHAR_CEILING}); "
-            "if the #2893 sizing gap itself was fixed, tighten this test per "
-            "the TODO(#2893) above instead of leaving it stale",
+            f"TRIPWIRE_BLOCK_CHAR_CEILING ({mod.TRIPWIRE_BLOCK_CHAR_CEILING})",
         )
 
 

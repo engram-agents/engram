@@ -6,8 +6,6 @@ support; leaves explicit placeholders for metrics that need external
 input (Lei-correction rate, bias audits, post-session reflection).
 
 Reads:
-  - ~/.engram/toolcall-invocations.jsonl  (T2 baseline)
-  - ~/.engram/toolcall-repairs.jsonl      (T2 historical)
   - ~/.engram/deference-detector.log      (T1 — empty until PR #31 deploys)
   - ~/.engram/knowledge.db                (outcome metrics: nodes added,
                                             question states, lessons, etc.)
@@ -38,54 +36,18 @@ ENGRAM_HOME = Path(
     os.environ.get("ENGRAM_HOME")
     or str(Path.home() / ".engram")
 )
-INVOCATION_LOG = ENGRAM_HOME / "toolcall-invocations.jsonl"
-REPAIR_LOG = ENGRAM_HOME / "toolcall-repairs.jsonl"
 DEFERENCE_LOG = ENGRAM_HOME / "deference-detector.log"
 KNOWLEDGE_DB = ENGRAM_HOME / "knowledge.db"
 
 
-def _read_jsonl(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    out: list[dict] = []
-    try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    out.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        pass
-    return out
+def trajectory_metrics() -> dict:
+    """T1-T6 — was reasoning sound in process?
 
-
-def _parse_date(stamp: str) -> date | None:
-    try:
-        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).date()
-    except (ValueError, TypeError, AttributeError):
-        return None
-
-
-def _filter_since(entries: list[dict], since: date | None) -> list[dict]:
-    if since is None:
-        return entries
-    return [e for e in entries if (d := _parse_date(e.get("timestamp", ""))) and d >= since]
-
-
-def trajectory_metrics(since: date | None) -> dict:
-    """T1-T6 — was reasoning sound in process?"""
-    invocations = _filter_since(_read_jsonl(INVOCATION_LOG), since)
-    repairs = _filter_since(_read_jsonl(REPAIR_LOG), since)
-
-    # T2: antml-repair rate (computable)
-    total_calls = len(invocations)
-    repaired_calls = sum(1 for e in invocations if e.get("repaired"))
-    t2_rate = (repaired_calls / total_calls) if total_calls else None
-
+    A metric that used to live here was retired [part of #3215]: its two
+    source logs had no producer left once the hook that wrote them was
+    deprecated and removed (closed #172). The numbering gap (T1, T3-T6) is
+    left as-is rather than renumbered.
+    """
     # T1: deference-detector fire rate (PR #31 not yet deployed → log absent)
     t1_data = "unavailable: PR #31 not yet deployed"
     if DEFERENCE_LOG.exists():
@@ -98,21 +60,6 @@ def trajectory_metrics(since: date | None) -> dict:
 
     return {
         "T1_deference_rate": t1_data,
-        "T2_antml_repair_rate": {
-            "total_invocations": total_calls,
-            "repaired": repaired_calls,
-            "rate": round(t2_rate, 4) if t2_rate is not None else None,
-            # Total entries in toolcall-repairs.jsonl (since-filtered).
-            # NOT subtracted from `repaired` — the two logs have different
-            # schemas (invocation log: every tool call ± repaired flag;
-            # repair log: only firings with no invocation tie-back), so
-            # subtraction was meaningless. Report both side-by-side and
-            # let the consumer interpret. Pre-PR-#27 repairs (before the
-            # invocation counter shipped) populate repair-log only and
-            # thus inflate this number relative to `repaired`; that is
-            # a known artifact, not a bug.
-            "repair_log_entries": len(repairs),
-        },
         "T3_structural_stop_catches": "pending: needs JSONL post-hoc analysis tooling",
         "T4_observation_derivation_ratio": "see outcome.O1 — ratio computed there",
         "T5_retraction_within_N_turns": "pending: needs ENGRAM history scan",
@@ -264,7 +211,7 @@ def main() -> int:
         "schema_version": "0.1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "since": since.isoformat() if since else "all-time",
-        "trajectory": trajectory_metrics(since),
+        "trajectory": trajectory_metrics(),
         "outcome": outcome_metrics(since),
         "meta": meta_metrics(),
         "rubric_source": "ob_NNNN — candidate Borges self-evaluation rubric (2026-05-06)",
@@ -281,15 +228,6 @@ def main() -> int:
     print()
     print("--- Trajectory (was reasoning sound?) ---")
     t = report["trajectory"]
-    t2 = t["T2_antml_repair_rate"]
-    if t2["rate"] is not None:
-        print(f"  T2 antml-repair-rate: {t2['repaired']}/{t2['total_invocations']} = "
-              f"{(t2['rate'] * 100):.2f}%")
-        if t2.get("repair_log_entries"):
-            print(f"     ({t2['repair_log_entries']} total entries in repair-log "
-                  "— pre-PR-#27 repairs without invocation tie-back are included here.)")
-    else:
-        print("  T2: no data")
     print(f"  T1 deference-rate: {t['T1_deference_rate']}")
     print(f"  T3-T6: pending (see JSON for status)")
     print()

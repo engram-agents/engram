@@ -150,7 +150,7 @@
 |---|---|---|---|---|
 | `hooks/hooks.json` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
 
-## hooks/claude (19 files)
+## hooks/claude (20 files)
 
 | file | ship | tier/reason | mechanism | status |
 |---|---|---|---|---|
@@ -169,7 +169,7 @@
 | `hooks/claude/engram-surface-daemon.py` | shipped | essential | _?_ | _unswept_ |
 | `hooks/claude/engram-surface-hook.py` | shipped | essential | _?_ | _unswept_ |
 | `hooks/claude/engram-time-bar-hook.py` | shipped | convenience | _?_ | _unswept_ |
-| `hooks/claude/engram-toolcall-repair.py` | shipped | essential | _?_ | _unswept_ |
+| `hooks/claude/engram-toolcall-repair.py` | shipped | essential (unregistered no-op tombstone, #3249; not a hook; delete in first release after v0.5.2) | _?_ | _unswept_ |
 | `hooks/claude/engram-user-identity-hook.py` | shipped | essential | _?_ | _unswept_ |
 | `hooks/claude/engram-utility-credit-mention-stop.py` | shipped | convenience | _?_ | _unswept_ |
 | `hooks/claude/start-engram-daemon.sh` | shipped | essential | _?_ | _unswept_ |

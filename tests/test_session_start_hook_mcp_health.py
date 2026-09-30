@@ -161,6 +161,8 @@ def test_session_start_codex_does_not_emit_mcp_offline_false_alarm(
 def test_session_start_claude_still_emits_mcp_offline_when_probe_reliable(
     tmp_path, monkeypatch
 ):
+    # #3202: a startup/resume miss races the server launch and is soft; a
+    # compact start keeps the running server, so a miss there is the alarm.
     engram_home = tmp_path / "engram"
     (engram_home / "sessions").mkdir(parents=True)
     mod = _load_hook_module(monkeypatch, engram_home)
@@ -174,7 +176,7 @@ def test_session_start_claude_still_emits_mcp_offline_when_probe_reliable(
         {
             "session_id": "claude-session",
             "transcript_path": str(tmp_path / "transcript.jsonl"),
-            "source": "startup",
+            "source": "compact",
         },
     )
 
@@ -235,7 +237,7 @@ def test_session_start_pgrep_timeout_emits_soft_note_not_offline(tmp_path, monke
     assert "MCP server: OFFLINE" not in ctx
     assert "Tell the user immediately" not in ctx
     # A soft, honest note IS emitted instead.
-    assert "MCP liveness: inconclusive (pgrep timed out)" in ctx
+    assert "MCP liveness: unknown (pgrep timed out)" in ctx
 
 
 def test_marker_absent_returns_false(tmp_path, monkeypatch):

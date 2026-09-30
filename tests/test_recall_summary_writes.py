@@ -69,6 +69,21 @@ Prompts module tests (carried over from PR #223):
   26. test_build_prompt_per_type_guidance  — type-specific guidance in prompt
   27. test_build_prompt_unknown_type_falls_back — DEFAULT_GUIDANCE used for unknown type
   28. test_build_prompt_includes_claim_text — claim text verbatim in prompt
+
+#2736 defect 2 — RECALL_SUMMARY_TARGET single source (140, not a stale 120):
+  29. test_no_stale_120_char_limit_in_prompt_or_validator_message — rendered
+                                             prompt + validator rejection message
+                                             carry no "120" character limit
+  30. test_prompt_self_check_renders_recall_summary_target_value — monkeypatch
+                                             the validator constant to a sentinel;
+                                             a fresh render reflects it
+  31. test_validator_message_renders_recall_summary_target_value — same
+                                             sentinel discrimination on the
+                                             validator's own rejection message
+  32. test_recall_summary_target_single_source_of_truth — engram_core's
+                                             constant IS (identity) the
+                                             validator's; exactly one
+                                             assignment site exists under src/
 """
 
 from __future__ import annotations
@@ -77,6 +92,7 @@ import atexit
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -1061,4 +1077,126 @@ def test_build_prompt_includes_claim_text():
         f"Claim text not found verbatim in prompt.\n"
         f"Claim: {distinctive_claim!r}\n"
         f"Prompt snippet: {prompt[:500]!r}"
+    )
+
+
+# ===========================================================================
+# Section 5 — #2736 defect 2: RECALL_SUMMARY_TARGET single source (140, not 120)
+# ===========================================================================
+#
+# The recall_summary authoring target is 140 (#1952 ruling — the only limit
+# agents see). "≤120" had drifted into 8 sites as a second, unruled number
+# (Kepler's ruling on #2736). RECALL_SUMMARY_TARGET now lives in
+# tools/recall_summary_validator.py; engram_core.py imports it rather than
+# redefining it.
+
+import ast as _ast_2736  # noqa: E402
+
+
+# Test 29 (T1)
+def test_no_stale_120_char_limit_in_prompt_or_validator_message():
+    """Neither the rendered prompt text nor the validator's rejection
+    message still names 120 as a character limit."""
+    prompts = _load_prompts()
+    prompt_text = prompts.build_prompt("observation_factual", "A test claim.")
+    assert not re.search(r"\b120\b", prompt_text), (
+        f"Stale 120-char limit found in rendered prompt text:\n{prompt_text}"
+    )
+
+    # A >200-char summary triggers the validator's hard-cap rejection
+    # branch — the one whose prose used to say "≤120 chars".
+    entry = _valid_dict(summary="X" * 201)
+    err = validate_summary_entry(entry)
+    assert err is not None, "Expected rejection for a 201-char summary"
+    assert not re.search(r"\b120\b", err["error"]), (
+        f"Stale 120-char limit found in validator rejection message:\n{err['error']}"
+    )
+
+
+# Test 30 (T2)
+def test_prompt_self_check_renders_recall_summary_target_value(monkeypatch):
+    """The prompt's self-check line renders whatever value
+    RECALL_SUMMARY_TARGET currently holds, not a hard-coded literal.
+
+    recall_summary_prompts.py binds RECALL_SUMMARY_TARGET via a top-level
+    `from tools.recall_summary_validator import RECALL_SUMMARY_TARGET`, so
+    picking up a monkeypatched value requires re-executing that import —
+    which is exactly what _load_prompts() does (spec_from_file_location +
+    a fresh exec_module on every call). Re-imported here, explicitly.
+    """
+    import tools.recall_summary_validator as _validator_mod
+
+    sentinel = 137
+    monkeypatch.setattr(_validator_mod, "RECALL_SUMMARY_TARGET", sentinel)
+
+    prompts = _load_prompts()  # fresh exec_module -> re-reads the patched value
+    prompt = prompts.build_prompt("observation_factual", "A test claim.")
+    assert str(sentinel) in prompt, (
+        f"Expected sentinel {sentinel} in prompt after monkeypatching "
+        f"RECALL_SUMMARY_TARGET; prompt:\n{prompt}"
+    )
+    assert not re.search(r"\b140\b", prompt), (
+        "Prompt still carries the old 140 value after monkeypatch + reload — "
+        "the import must not be cached across the re-exec."
+    )
+
+
+# Test 31 (T3)
+def test_validator_message_renders_recall_summary_target_value(monkeypatch):
+    """The validator's own rejection message renders RECALL_SUMMARY_TARGET's
+    CURRENT value at call time — no reload needed, since
+    validate_summary_entry references the module-level name directly."""
+    import tools.recall_summary_validator as _validator_mod
+
+    sentinel = 133
+    monkeypatch.setattr(_validator_mod, "RECALL_SUMMARY_TARGET", sentinel)
+
+    entry = _valid_dict(summary="X" * 201)
+    err = _validator_mod.validate_summary_entry(entry)
+    assert err is not None
+    assert str(sentinel) in err["error"], (
+        f"Expected sentinel {sentinel} in validator message; got:\n{err['error']}"
+    )
+
+
+# Test 32 (T4)
+def test_recall_summary_target_single_source_of_truth():
+    """engram_core.RECALL_SUMMARY_TARGET IS (identity, not equality) the
+    validator's constant — imported, not redefined — and exactly one
+    `RECALL_SUMMARY_TARGET = ` assignment exists anywhere under src/. This
+    is what stops a second definition from silently reappearing."""
+    import engram_core
+    from tools.recall_summary_validator import RECALL_SUMMARY_TARGET as _validator_target
+
+    assert engram_core.RECALL_SUMMARY_TARGET is _validator_target, (
+        "engram_core.RECALL_SUMMARY_TARGET must be the SAME object as "
+        "tools.recall_summary_validator.RECALL_SUMMARY_TARGET (imported, "
+        "not a second definition)."
+    )
+
+    src_root = os.path.join(PROJECT_ROOT, "src")
+    assignment_sites = []
+    for dirpath, _dirnames, filenames in os.walk(src_root):
+        for fname in filenames:
+            if not fname.endswith(".py"):
+                continue
+            fpath = os.path.join(dirpath, fname)
+            with open(fpath, "r", encoding="utf-8") as fh:
+                try:
+                    tree = _ast_2736.parse(fh.read(), filename=fpath)
+                except SyntaxError:
+                    continue
+            for node in _ast_2736.walk(tree):
+                if isinstance(node, _ast_2736.Assign):
+                    for target in node.targets:
+                        if isinstance(target, _ast_2736.Name) and target.id == "RECALL_SUMMARY_TARGET":
+                            assignment_sites.append(f"{fpath}:{node.lineno}")
+
+    assert len(assignment_sites) == 1, (
+        f"Expected exactly one `RECALL_SUMMARY_TARGET = ...` assignment "
+        f"under src/, found {len(assignment_sites)}: {assignment_sites}"
+    )
+    assert "recall_summary_validator.py" in assignment_sites[0], (
+        f"The single assignment site must be in recall_summary_validator.py, "
+        f"got: {assignment_sites}"
     )

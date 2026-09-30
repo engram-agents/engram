@@ -17,6 +17,12 @@ import re
 # ---------------------------------------------------------------------------
 
 RECALL_SUMMARY_HARD_CAP = 200
+
+# Authoring target (#1952 ruling; #2736 defect 2 — the only limit agents see).
+# Single source of truth: engram_core.py imports this rather than defining
+# its own copy (tools/ is DB-free and embeddings-free, so it is the one
+# module both the heavy runtime and the lightweight tools can reach).
+RECALL_SUMMARY_TARGET = 140
 RECALL_KEYWORDS_MIN = 3
 RECALL_KEYWORDS_MAX = 5
 RECALL_KEYWORD_MAX_LEN = 30
@@ -74,9 +80,9 @@ def validate_summary_entry(entry: dict) -> "dict | None":
             "error": (
                 f"recall_summary exceeds the {RECALL_SUMMARY_HARD_CAP} char "
                 f"hard cap (got {len(recall_summary)} chars). The authoring "
-                "target is ≤120 chars; the hard cap is a defensive guard at "
-                f"{RECALL_SUMMARY_HARD_CAP}. Caller may truncate, regenerate, "
-                "or accept-as-truncated."
+                f"target is ≤{RECALL_SUMMARY_TARGET} chars; the hard cap is a "
+                f"defensive guard at {RECALL_SUMMARY_HARD_CAP}. Caller may "
+                "truncate, regenerate, or accept-as-truncated."
             ),
             "field": "recall_summary",
             "hard_cap": RECALL_SUMMARY_HARD_CAP,

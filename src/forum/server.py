@@ -1985,8 +1985,15 @@ def create_app(
     def api_project_init():
         """Create a new project baton.
 
-        JSON body: {agent, project_id, title, status, turn, participants, turn_reason, github?, colleague?, author?}
+        JSON body: {agent, project_id, title, status, turn, participants, turn_reason, github?, colleague?, author?, phase?, transition_phase?}
         ``participants`` may be a list of strings OR a comma-separated string.
+        ``phase?`` / ``transition_phase?`` (#3039 U2a round 3): optional,
+        client-computed, trusted verbatim -- no validation/interpretation
+        here, same trust boundary as ``pool_sentinel`` on the claim/release
+        endpoints below. ``init`` is always a transition (the baton's very
+        first phase), so the client sends ``transition_phase`` here, not
+        ``phase`` -- both are threaded through regardless, for uniformity
+        with the other endpoints.
         Response: {seq, project_id}, 201.
         Errors: 400 (missing/invalid fields), 409 (already exists), 503 (store not configured).
         """
@@ -2013,6 +2020,14 @@ def create_app(
         github = (data.get("github") or "").strip() or None
         colleague = (data.get("colleague") or "").strip() or None
         author = (data.get("author") or "").strip() or None
+        # #3039 U2a round 3: optional, trusted verbatim -- the client
+        # (baton.py) computes this baton's intended initial phase and sends
+        # it under transition_phase (init is always a transition); this
+        # endpoint does no validation/interpretation, same trust boundary as
+        # pool_sentinel below. phase (conversion) is threaded through too,
+        # for API uniformity, though a client should never need it here.
+        phase = (data.get("phase") or "").strip().lower() or None
+        transition_phase = (data.get("transition_phase") or "").strip().lower() or None
 
         raw_parts = data.get("participants") or []
         if isinstance(raw_parts, str):
@@ -2029,7 +2044,7 @@ def create_app(
                 title=title, status=status, turn=turn,
                 participants=participants, turn_reason=turn_reason,
                 by_agent=agent, github=github, colleague=colleague,
-                author=author,
+                author=author, phase=phase, transition_phase=transition_phase,
             )
         except ProjectAlreadyExists:
             return jsonify({"error": f"project already exists: {project_id}"}), 409
@@ -2040,7 +2055,13 @@ def create_app(
     def api_project_flip(pid: str):
         """Flip a baton's turn.
 
-        JSON body: {agent, to_agent, reason}
+        JSON body: {agent, to_agent, reason, phase?, transition_phase?}
+        ``phase?`` / ``transition_phase?`` (#3039 U2a round 3): optional,
+        client-computed, trusted verbatim -- see api_project_init's
+        docstring note. The two transition-defining flip branches send
+        BOTH (round 4: ``phase`` = the legacy-conversion value, applied
+        first, then ``transition_phase`` overwrites); conversion-only flips
+        send ``phase`` alone.
         Response: {seq, turn, status}, 201.
 
         Gate (#2884, second half): when the current project state + this
@@ -2080,6 +2101,10 @@ def create_app(
         reason = (data.get("reason") or "").strip()
         if not to_agent or not reason:
             return jsonify({"error": "to_agent and reason are required"}), 400
+        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # api_project_init's note.
+        phase = (data.get("phase") or "").strip().lower() or None
+        transition_phase = (data.get("transition_phase") or "").strip().lower() or None
 
         gate_refusal = _check_flip_gate(store, pid, to_agent)
         if gate_refusal is not None:
@@ -2087,7 +2112,10 @@ def create_app(
             return jsonify({"error": message}), gate_status
 
         try:
-            seq = _flip(store, allocator, pid, to_agent=to_agent, reason=reason, by_agent=agent)
+            seq = _flip(
+                store, allocator, pid, to_agent=to_agent, reason=reason,
+                by_agent=agent, phase=phase, transition_phase=transition_phase,
+            )
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
@@ -2098,7 +2126,12 @@ def create_app(
     def api_project_claim(pid: str):
         """Claim a project baton from the pool.
 
-        JSON body: {agent, pool_sentinel}
+        JSON body: {agent, pool_sentinel, phase?, transition_phase?}
+        ``phase?`` / ``transition_phase?`` (#3039 U2a round 3): optional,
+        client-computed, trusted verbatim -- see api_project_init's
+        docstring note. ``claim`` is always a transition, so the client
+        sends ``transition_phase`` here -- together with ``phase`` (the
+        legacy-conversion value, round 4), applied first.
         Response: {seq, turn, status}, 201.
         """
         from forum.coordination import claim as _claim, ProjectNotFound
@@ -2119,9 +2152,16 @@ def create_app(
         pool_sentinel = (data.get("pool_sentinel") or "").strip().lower()
         if not pool_sentinel:
             return jsonify({"error": "pool_sentinel is required"}), 400
+        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # api_project_init's note.
+        phase = (data.get("phase") or "").strip().lower() or None
+        transition_phase = (data.get("transition_phase") or "").strip().lower() or None
 
         try:
-            seq = _claim(store, allocator, pid, claimer=agent, pool_sentinel=pool_sentinel)
+            seq = _claim(
+                store, allocator, pid, claimer=agent, pool_sentinel=pool_sentinel,
+                phase=phase, transition_phase=transition_phase,
+            )
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
@@ -2132,8 +2172,13 @@ def create_app(
     def api_project_release(pid: str):
         """Release a project baton back to the pool.
 
-        JSON body: {agent, pool_sentinel, reason, done?}
+        JSON body: {agent, pool_sentinel, reason, done?, phase?, transition_phase?}
         ``done`` (bool, default false) appends "(done)" to the project title.
+        ``phase?`` / ``transition_phase?`` (#3039 U2a round 3): optional,
+        client-computed, trusted verbatim -- see api_project_init's
+        docstring note. ``release`` is always a transition, so the client
+        sends ``transition_phase`` here -- together with ``phase`` (the
+        legacy-conversion value, round 4), applied first.
         Response: {seq, turn, status}, 201.
         """
         from forum.coordination import release as _release, ProjectNotFound
@@ -2157,9 +2202,16 @@ def create_app(
             return jsonify({"error": "pool_sentinel and reason are required"}), 400
 
         done = bool(data.get("done", False))
+        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # api_project_init's note.
+        phase = (data.get("phase") or "").strip().lower() or None
+        transition_phase = (data.get("transition_phase") or "").strip().lower() or None
 
         try:
-            seq = _release(store, allocator, pid, holder=agent, pool_sentinel=pool_sentinel, reason=reason, done=done)
+            seq = _release(
+                store, allocator, pid, holder=agent, pool_sentinel=pool_sentinel,
+                reason=reason, done=done, phase=phase, transition_phase=transition_phase,
+            )
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
@@ -2170,9 +2222,13 @@ def create_app(
     def api_project_status(pid: str):
         """Close or reopen a project baton (dispatches on new_status).
 
-        JSON body: {agent, new_status, reason}
+        JSON body: {agent, new_status, reason, phase?}
         Dispatch: if new_status in (planning, in-progress, in-review) → reopen;
                   otherwise → close.
+        ``phase?`` (#3039 U2a round 3): optional, client-computed CONVERSION
+        phase, trusted verbatim -- see api_project_init's docstring note.
+        Neither ``close`` nor ``reopen`` ever writes a transition phase
+        (Kepler's ruling), so there is no ``transition_phase`` field here.
         Response: {seq, turn, status}, 201.
         """
         from forum.coordination import close as _close, reopen as _reopen, ProjectNotFound
@@ -2194,14 +2250,17 @@ def create_app(
         reason = (data.get("reason") or "").strip()
         if not new_status or not reason:
             return jsonify({"error": "new_status and reason are required"}), 400
+        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # api_project_init's note.
+        phase = (data.get("phase") or "").strip().lower() or None
 
         _ACTIVE_STATUSES = frozenset({"planning", "in-progress", "in-review"})
 
         try:
             if new_status in _ACTIVE_STATUSES:
-                seq = _reopen(store, allocator, pid, invoker=agent, new_status=new_status)
+                seq = _reopen(store, allocator, pid, invoker=agent, new_status=new_status, phase=phase)
             else:
-                seq = _close(store, allocator, pid, new_status=new_status, reason=reason)
+                seq = _close(store, allocator, pid, new_status=new_status, reason=reason, phase=phase)
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
@@ -2212,7 +2271,11 @@ def create_app(
     def api_project_rename(pid: str):
         """Rename a project baton's title.
 
-        JSON body: {agent, new_title}
+        JSON body: {agent, new_title, phase?}
+        ``phase?`` (#3039 U2a round 3): optional, client-computed CONVERSION
+        phase, trusted verbatim -- see api_project_init's docstring note.
+        ``rename`` never writes a transition phase (never a phase-machine
+        edge), so there is no ``transition_phase`` field here.
         Response: {seq, turn, status}, 201.
         """
         from forum.coordination import rename as _rename, ProjectNotFound
@@ -2233,9 +2296,12 @@ def create_app(
         new_title = (data.get("new_title") or "").strip()
         if not new_title:
             return jsonify({"error": "new_title is required"}), 400
+        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # api_project_init's note.
+        phase = (data.get("phase") or "").strip().lower() or None
 
         try:
-            seq = _rename(store, allocator, pid, new_title=new_title)
+            seq = _rename(store, allocator, pid, new_title=new_title, phase=phase)
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
@@ -2246,7 +2312,11 @@ def create_app(
     def api_project_anchor(pid: str):
         """Set or update the github anchor on a project baton.
 
-        JSON body: {agent, github}
+        JSON body: {agent, github, phase?}
+        ``phase?`` (#3039 U2a round 3): optional, client-computed CONVERSION
+        phase, trusted verbatim -- see api_project_init's docstring note.
+        ``anchor`` never writes a transition phase (never a phase-machine
+        edge), so there is no ``transition_phase`` field here.
         Response: {seq, turn, status}, 201.
         """
         from forum.coordination import anchor as _anchor, ProjectNotFound
@@ -2267,9 +2337,12 @@ def create_app(
         github_anchor = (data.get("github") or "").strip()
         if not github_anchor:
             return jsonify({"error": "github is required"}), 400
+        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # api_project_init's note.
+        phase = (data.get("phase") or "").strip().lower() or None
 
         try:
-            seq = _anchor(store, allocator, pid, github_anchor=github_anchor)
+            seq = _anchor(store, allocator, pid, github_anchor=github_anchor, phase=phase)
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
@@ -2280,12 +2353,16 @@ def create_app(
     def api_project_add_participant(pid: str):
         """Add a participant to a project baton.
 
-        JSON body: {agent, participant}
+        JSON body: {agent, participant, phase?}
         ``agent`` is the agent performing the add — server-side authorization
         requires ``agent`` to already be a current participant of the baton
         (LOAD-BEARING: this check lives in the coordination write-fn, not
         here, so it can't be bypassed by a direct API call). ``participant``
-        is the agent being added.
+        is the agent being added. ``phase?`` (#3039 U2a round 3): optional,
+        client-computed CONVERSION phase, trusted verbatim -- see
+        api_project_init's docstring note. ``add_participant`` never writes
+        a transition phase (never a phase-machine edge), so there is no
+        ``transition_phase`` field here.
         Response: {seq, added}, 201. ``added`` is false on an idempotent
         no-op (participant was already a participant).
         Errors: 400 (missing/invalid fields), 403 (agent not a participant),
@@ -2313,9 +2390,14 @@ def create_app(
         participant = (data.get("participant") or "").strip().lower()
         if not participant or not db.is_valid_agent_name(participant):
             return jsonify({"error": f"invalid participant name {participant!r}"}), 400
+        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # api_project_init's note.
+        phase = (data.get("phase") or "").strip().lower() or None
 
         try:
-            seq, added = _add_participant(store, allocator, pid, agent=agent, participant=participant)
+            seq, added = _add_participant(
+                store, allocator, pid, agent=agent, participant=participant, phase=phase,
+            )
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
         except NotAParticipant:
@@ -2327,13 +2409,17 @@ def create_app(
     def api_project_set_colleague(pid: str):
         """Set or change the colleague: field on a project baton (#2764).
 
-        JSON body: {agent, colleague}
+        JSON body: {agent, colleague, phase?}
         ``agent`` is the agent performing the set — server-side authorization
         requires ``agent`` to already be a current participant OR the
         baton's current turn holder (LOAD-BEARING: lives in the coordination
         write-fn, not here, so it can't be bypassed by a direct API call).
         ``colleague`` is the agent being named; also added to ``participants``
-        (dedup) in the same atomic write.
+        (dedup) in the same atomic write. ``phase?`` (#3039 U2a round 3):
+        optional, client-computed CONVERSION phase, trusted verbatim -- see
+        api_project_init's docstring note. ``set_colleague`` never writes a
+        transition phase (never a phase-machine edge), so there is no
+        ``transition_phase`` field here.
         Response: {seq, participant_added}, 201.
         Errors: 400 (missing/invalid fields), 403 (agent not authorized),
                 404 (project not found), 503 (store not configured).
@@ -2360,10 +2446,13 @@ def create_app(
         colleague = (data.get("colleague") or "").strip().lower()
         if not colleague or not db.is_valid_agent_name(colleague):
             return jsonify({"error": f"invalid colleague name {colleague!r}"}), 400
+        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # api_project_init's note.
+        phase = (data.get("phase") or "").strip().lower() or None
 
         try:
             seq, participant_added = _set_colleague(
-                store, allocator, pid, agent=agent, colleague=colleague,
+                store, allocator, pid, agent=agent, colleague=colleague, phase=phase,
             )
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
@@ -2379,8 +2468,14 @@ def create_app(
     def api_project_gc(pid: str):
         """GC-close a project baton (client has already queried gh state).
 
-        JSON body: {agent, new_status, reason}
+        JSON body: {agent, new_status, reason, phase?}
         ``new_status`` must be a closed status (merged or cancelled).
+        ``phase?`` (#3039 U2a round 3): optional, client-computed CONVERSION
+        phase, trusted verbatim -- see api_project_init's docstring note.
+        This is the SAME write-body as ``/status``'s close branch (``gc`` is
+        a second caller of ``close()``, not a separate write-body) --
+        ``close`` never writes a transition phase, so there is no
+        ``transition_phase`` field here either.
         Response: {seq, turn, status}, 201.
         """
         from forum.coordination import close as _close, ProjectNotFound
@@ -2402,9 +2497,12 @@ def create_app(
         reason = (data.get("reason") or "").strip()
         if not new_status or not reason:
             return jsonify({"error": "new_status and reason are required"}), 400
+        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # api_project_init's note.
+        phase = (data.get("phase") or "").strip().lower() or None
 
         try:
-            seq = _close(store, allocator, pid, new_status=new_status, reason=reason)
+            seq = _close(store, allocator, pid, new_status=new_status, reason=reason, phase=phase)
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
@@ -2418,8 +2516,13 @@ def create_app(
         Called AFTER gh pr merge succeeds client-side. Sets status→merged with the
         correct log format and moves the baton to archive/.
 
-        JSON body: {agent, forced?}
+        JSON body: {agent, forced?, phase?}
         ``forced`` (bool, default false) adds "(FORCED past gates 3-4)" to the log.
+        ``phase?`` (#3039 U2a round 3): optional, client-computed CONVERSION
+        phase, trusted verbatim -- see api_project_init's docstring note.
+        ``merge`` never writes a transition phase (terminal states live in
+        ``status``, never ``phase``), so there is no ``transition_phase``
+        field here.
         Response: {seq, status: "merged"}, 201. (turn omitted — file is in archive/).
         """
         from forum.coordination import merge as _merge, ProjectNotFound
@@ -2438,9 +2541,12 @@ def create_app(
             return jsonify({"error": "agent is required and must be valid"}), 400
 
         forced = bool(data.get("forced", False))
+        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # api_project_init's note.
+        phase = (data.get("phase") or "").strip().lower() or None
 
         try:
-            seq = _merge(store, allocator, pid, merged_by=agent, forced=forced)
+            seq = _merge(store, allocator, pid, merged_by=agent, forced=forced, phase=phase)
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 

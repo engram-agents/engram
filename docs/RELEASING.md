@@ -109,8 +109,10 @@ merge conflict. The disciplines that prevent it:
 
 - **All changes land on `dev` first**, via the normal PR workflow — including
   fixes. `main` only advances via the `dev→main` release merge. If you never
-  commit directly to `main`, `main` stays an ancestor of `dev` and the
-  release PR never conflicts. This is the default; prefer it.
+  commit directly to `main`, the release PR never CONFLICTS — but every
+  merge-commit release still leaves `main` one merge commit ahead of `dev`,
+  so `main` is an ancestor of `dev` only after the reconcile pre-step (see
+  "Open the release PR", step 4, below). This is the default; prefer it.
 - **A hotfix needed on an already-released `main`** (can't wait for the next
   full cut): author the fix on `dev` first (normal PR), then **cherry-pick that
   commit onto `main`** via a hotfix PR + a patch-tag bump. Cherry-pick copies
@@ -219,6 +221,28 @@ accumulate the changelog incrementally as PRs land.*
 
 ### 4. Open the release PR (dev → main) — the full CI gate
 
+**First, reconcile `main` into `dev` (every cut).** Before opening the
+release PR, check whether `main` holds any commit `dev` lacks:
+
+```bash
+git fetch origin && git log --oneline origin/dev..origin/main
+```
+
+This must print nothing. It usually isn't empty: the previous release's
+merge commit lives on `main` only, and under `main`'s strict status-check
+ruleset the release PR would read `BEHIND` and cannot merge.
+
+If it lists commits, reconcile first: on a branch off `origin/dev` named
+`reconcile/<short-name>` (e.g. `reconcile/rc3-merge-commit-into-dev`, as in
+#3257), run `git merge --no-ff origin/main`. Verify `git rev-parse
+HEAD^{tree}` equals `git rev-parse origin/dev^{tree}` — history only, no
+file change. If they differ, STOP: `main` has independent content, which is
+the `DIRTY` case below. PR the reconcile branch to `dev` and merge it **as a
+merge commit** (not squash, not rebase, or the ancestry it exists to create
+is lost); one fresh-eye approval on the tree identity is the whole review,
+no fairy round. Re-run the check above; it must now print nothing. Only then
+open the release PR.
+
 Cut the release by opening a **PR from `dev` → `main`** (not a direct
 push). This PR **is** the release gate: the full `tests.yml` suite +
 `pr-checks` run on it — the thorough validation that
@@ -230,11 +254,17 @@ gh pr create --base main --head dev \
   --body "Release cut to main. The full CI gate runs on this PR."
 ```
 
-**If the release PR is CONFLICTING** (`mergeStateStatus: DIRTY`): `main` has
-diverged from `dev` (independent commits on `main`). Reconcile it once — merge
-`origin/main` into `dev` on a branch (a **merge commit**, so `main` becomes
-an ancestor of `dev`; union any CHANGELOG sections), PR that to `dev`, then the
-release PR goes clean. See "Keeping `main` and `dev` from diverging" above.
+**If the release PR reads `BEHIND`:** the reconcile pre-step above was
+skipped. Run it now; the release PR updates once `main` is merged back into
+`dev`.
+
+**If the release PR is CONFLICTING** (`mergeStateStatus: DIRTY`): this is the
+different case — `main` has diverged from `dev` with real independent
+content (the tree is NOT identical, unlike the reconcile above). Reconcile
+it once — merge `origin/main` into `dev` on a branch (a **merge commit**, so
+`main` becomes an ancestor of `dev`; union any CHANGELOG sections), PR that
+to `dev`, then the release PR goes clean. See "Keeping `main` and `dev` from
+diverging" above.
 
 **If CI is red on the release PR**: treat it exactly like any blocked PR — fix
 on `dev` via a normal PR, and the release PR re-runs the full gate on the new
@@ -572,6 +602,9 @@ or recalled.
 
 ## Anti-patterns
 
+- **Don't open the release PR before `git log origin/dev..origin/main` is
+  empty.** See the reconcile pre-step at the top of "Open the release PR"
+  (step 4).
 - **Don't squash-merge the `dev→main` release PR.** Use `--merge` (a merge
   commit). Squash collapses the release history into one commit and drops the
   ancestry link to `dev`, so the *next* cut conflicts. (This needs "Allow merge

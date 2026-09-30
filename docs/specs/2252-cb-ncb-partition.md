@@ -272,7 +272,7 @@ doctrine for it specifically — see the history note after item 1 below.
    citation-coverage question ("is this observation cited by anything?"), which is NOT the
    same question as cascade, and — since Stage 1.3 (#2289, merged) — no longer even
    numerically the same set: `CASCADE_RELATIONS` is now the strict subset `{derives_from}`,
-   while this constant still deliberately includes `supported_by`. Re-verified directly in
+   while this constant still deliberately includes `supported_by`. [Later: acknowledged_derives_from was added as a cascade relation by #2013 §12.5; see engram_core.CASCADE_RELATIONS.] Re-verified directly in
    source (2026-08-27, issue #2299): the constant's own comment was itself updated by #2289's
    own commit to describe this in the past tense, not left stale —
    *"#2252 Stage 1.3 (now landed) removed `cascade` from `supported_by`, so the two sets are no

@@ -10,6 +10,23 @@ but the third was load-bearing). Min 3 max 5 is the sweet spot.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Locate SSoT modules — support both "run as module" (tools.recall_summary_prompts,
+# sys.path already has src/engram on it) and the test-harness loader
+# (importlib.util.spec_from_file_location, which execs this file standalone).
+# Same pattern as tools/cohort_dispatch.py's _REPO_ROOT bootstrap.
+# ---------------------------------------------------------------------------
+
+_HERE = Path(__file__).resolve().parent
+_REPO_ROOT = _HERE.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.recall_summary_validator import RECALL_SUMMARY_TARGET  # noqa: E402
+
 # Per-type guidance (used in the prompt template)
 TYPE_GUIDANCE: dict[str, str] = {
     "observation_factual": (
@@ -129,7 +146,7 @@ Claim:
 ## Output rules
 
 ### Summary
-- Single line, ≤120 characters. Aim for this target. Don't pad to fill the
+- Single line, ≤{target} characters. Aim for this target. Don't pad to fill the
   budget — shorter is fine when the claim is simple.
 - Active voice. No hedging. No meta-language ("this node says..."). No source attribution unless the source is the load-bearing fact.
 - Keep technical terms verbatim if load-bearing
@@ -147,7 +164,7 @@ Output ONLY a valid JSON object to stdout, no other text:
 
 {{"recall_summary": "...", "recall_keywords": ["kw1", "kw2", "kw3"]}}
 
-Self-check before output: summary chars ≤120; keyword count 3 to 5 inclusive; no duplicates."""
+Self-check before output: summary chars ≤{target}; keyword count 3 to 5 inclusive; no duplicates."""
 
 
 def build_prompt(node_type: str, claim: str) -> str:
@@ -166,4 +183,5 @@ def build_prompt(node_type: str, claim: str) -> str:
         type_guidance=guidance,
         claim=claim,
         keyword_guidance=KEYWORD_GUIDANCE,
+        target=RECALL_SUMMARY_TARGET,
     )
