@@ -389,6 +389,12 @@ findings verified against 6,981 real logged invocations spanning three months:
 zero repairs, zero calls that could have matched the stale dict. See #172 for
 the full evidence.
 
+The file `hooks/claude/engram-toolcall-repair.py` still ships in v0.5.2 as an
+unregistered no-op tombstone (#3249), not a hook: sessions started before
+v0.5.2-rc4 still register the old PreToolUse entry, and a missing file would
+exit 2 (a block) on every ENGRAM tool call. It is deleted in the first release
+after v0.5.2; do not remove it earlier as dead code.
+
 ---
 
 ### **6.2 engram-write-yield-hook.py** *(retired)*

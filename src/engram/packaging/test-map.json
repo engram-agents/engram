@@ -243,6 +243,13 @@
       ]
     },
     {
+      "path_prefix_or_glob": "hooks/claude/engram-toolcall-repair.py",
+      "test_globs": [
+        "tests/test_toolcall_repair_tombstone_3249.py"
+      ],
+      "note": "#3249 tombstone: no-op hook kept unregistered for one release; delete with the tombstone in the first release after v0.5.2 (only sessions started on v0.5.2-rc4 or later carry no registration)."
+    },
+    {
       "path_prefix_or_glob": "hooks/claude/engram-user-identity-hook.py",
       "test_globs": [
         "tests/test_codex_hook_envelopes.py",

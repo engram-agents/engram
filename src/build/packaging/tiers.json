@@ -750,6 +750,12 @@
       ]
     },
     {
+      "path": "hooks/claude/engram-toolcall-repair.py",
+      "tier": "essential",
+      "dest": "hooks/engram-toolcall-repair.py",
+      "note": "TOMBSTONE for #3249 (no-op, unregistered), shipped in v0.5.2 so sessions started on older releases, which still register it as a PreToolUse hook, do not exit 2 on every ENGRAM tool call. May be deleted in the first release AFTER v0.5.2 (v0.5.2 final carries it); only sessions started on v0.5.2-rc4 or later carry no registration."
+    },
+    {
       "path": "hooks/claude/engram-user-identity-hook.py",
       "tier": "essential",
       "dest": "hooks/engram-user-identity-hook.py"
