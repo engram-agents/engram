@@ -105,3 +105,58 @@ def test_component_file_absent_from_every_manifest_raises_as_dead():
             tcr.render("claude-code", "CLAUDE.md")
     finally:
         orphan_path.unlink()
+
+
+# --- #3238: write-discipline says "err on the side of writing more" ---------
+
+TEMPLATES_DIR = REPO_ROOT / "src" / "engram" / "templates"
+WRITE_MORE_HANDLE = "**Err on the side of writing more than I think I will need.**"
+WRITE_NOW_HANDLE = "**Write now, don't defer.**"
+FULL_AGENCY_HANDLE = "**Full agency, no permission-asking.**"
+WRITE_DISCIPLINE_HEADING = "## ENGRAM Write Discipline"
+
+
+def _write_discipline_sources():
+    """Every source template file that carries the Write Discipline section."""
+    paths = [TEMPLATES_DIR / "components" / "engram-write-discipline.md"]
+    paths += sorted(TEMPLATES_DIR.glob("template.*"))
+    found = [
+        p for p in paths
+        if WRITE_DISCIPLINE_HEADING in p.read_text(encoding="utf-8")
+    ]
+    assert found, "no template carries the Write Discipline section"
+    return found
+
+
+def test_write_discipline_carries_write_more_bullet_in_position():
+    sources = _write_discipline_sources()
+    # Guard against the enumeration silently shrinking: the component and the
+    # whole-file CLAUDE.md template must both be covered.
+    names = {p.name for p in sources}
+    assert {"engram-write-discipline.md", "template.CLAUDE.md"} <= names
+    for p in sources:
+        text = p.read_text(encoding="utf-8")
+        assert text.count(WRITE_MORE_HANDLE) == 1, p.name
+        i_now = text.index(WRITE_NOW_HANDLE)
+        i_more = text.index(WRITE_MORE_HANDLE)
+        i_agency = text.index(FULL_AGENCY_HANDLE)
+        assert i_now < i_more < i_agency, p.name
+
+
+def test_write_discipline_never_restores_hard_trigger_sentence():
+    for p in _write_discipline_sources():
+        assert "write nudge is a hard trigger" not in p.read_text(
+            encoding="utf-8"
+        ).lower(), p.name
+
+
+def test_write_more_bullet_line_identical_across_sources():
+    lines = set()
+    for p in _write_discipline_sources():
+        matches = [
+            ln for ln in p.read_text(encoding="utf-8").splitlines()
+            if ln.startswith("- " + WRITE_MORE_HANDLE)
+        ]
+        assert len(matches) == 1, p.name
+        lines.add(matches[0])
+    assert len(lines) == 1, "write-more bullet differs between sources"
