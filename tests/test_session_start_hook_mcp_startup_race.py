@@ -13,7 +13,8 @@ The contract (Kepler, 2026-09-30, riders included):
 1. A live process with a dead marker PID says the marker is stale and the
    server was found. Never OFFLINE.
 2. No process at a compact or clear start prints the hard OFFLINE alarm.
-3. No process at a startup, resume or unknown-source start prints a soft line
+3. No process at a startup, resume or any unrecognised source (including an
+   invented non-empty one, not only a missing one) prints a soft line
    that names "no match" and points at the first prompt. It must not contain
    the word OFFLINE or the tell-the-user instruction. The prompt hook is the
    alarm of record for that case (see
@@ -168,7 +169,14 @@ def test_no_server_at_compact_or_clear_is_offline(tmp_path, monkeypatch, source)
 
 # ── 3. no process at a launch → soft line, names the cause, no alarm ─────────
 
-@pytest.mark.parametrize("source", ["startup", "resume", None, ""])
+# An invented, non-empty source. The hook's rule is an allowlist of
+# server-keeping sources (compact, clear), so any unrecognised source must be
+# soft. A denylist ("startup", "resume") is already caught by the None/""
+# cells, but one that also lists "" (the hook maps a missing source to "")
+# passes every other cell; this is the only cell that catches it (#3252).
+@pytest.mark.parametrize(
+    "source", ["startup", "resume", None, "", "reload-from-future-harness"]
+)
 def test_no_server_at_launch_is_soft_not_offline(tmp_path, monkeypatch, source):
     ctx = _session_start_ctx(
         tmp_path, monkeypatch, source=source, pgrep=1, marker=_dead_marker()
