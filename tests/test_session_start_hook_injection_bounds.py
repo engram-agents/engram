@@ -196,8 +196,10 @@ class TestOversizedInputStaysBounded:
         # assertion below has real P0 content to check against. Direct
         # attribute assignment on this per-test, freshly-loaded module
         # (discarded at test end) -- no mock.patch bookkeeping needed.
-        mod._check_mcp_health = lambda home: (False, "forced offline for this test")
-        mod._check_backup_staleness = lambda home: (True, None)
+        # #3202: at source=startup an MCP miss is only a soft ℹ️ line, so
+        # force a genuine ⚠️ condition (stale git backup) instead.
+        mod._check_mcp_health = lambda home: (True, None)
+        mod._check_backup_staleness = lambda home: (False, "forced-stale for test")
         mod._check_viz_server_health = lambda home: ("not-configured", None)
         mod._check_embedding_restore_flag = lambda home: (True, None)
 
@@ -232,7 +234,11 @@ class TestOversizedInputStaysBounded:
         assert lines[0].startswith("▸ "), f"trailer must be line 1: {lines[0]!r}"
 
         head_region = ctx[:1_800]
-        assert "MCP server: OFFLINE" in head_region, (
+        assert "⚠️  ENGRAM substrate health" in head_region, (
+            f"P0 warning header missing from the first head_budget (1,800) "
+            f"chars: {ctx[:300]!r}"
+        )
+        assert "Git backup: forced-stale for test" in head_region, (
             f"P0 warning line missing from the first head_budget (1,800) "
             f"chars: {ctx[:300]!r}"
         )

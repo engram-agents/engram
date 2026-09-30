@@ -198,19 +198,22 @@ def _check_mcp_health(engram_home: str) -> tuple[bool | None, str | None]:
 
     Uses pgrep -f to search for the resolved server.py path in process
     command lines only when the current platform has a reliable hook/server
-    path relationship. Hard timeout of 1s. Any unexpected exception is treated
-    as ok=True (advisory probe — never block session start).
+    path relationship. Hard timeout of 1s. This is a pure function of the
+    pgrep outcome; the source-dependent downgrade of a miss and the
+    stale-marker note live in main() (#3202).
 
-    Tri-state result (see #1754):
-        True  — server process found (up), the platform defers startup
-                probing, or the probe itself errored (advisory fail-open).
-        False — pgrep completed and found NO process (confirmed absent).
-        None  — the probe was INDETERMINATE (pgrep timed out under
-                cold-start contention). A timeout is not evidence of
-                absence, so the caller must NOT render the hard "OFFLINE →
-                tell the user immediately" alarm for this case — that is a
-                cry-wolf false-negative. The per-prompt write-tool marker
-                check confirms real liveness on the first prompt.
+    Tri-state result (see #1754, #3202):
+        True  — server process found (pgrep rc 0), or the platform defers
+                startup probing.
+        False — pgrep completed with rc 1 (no match). The caller decides
+                whether that is evidence (compact/clear) or a launch race
+                (startup/resume).
+        None  — the probe was INDETERMINATE and is never evidence of
+                absence: pgrep timed out ("pgrep timed out"), exited with
+                an error rc >= 2 ("pgrep error (exit N)"), or the probe
+                itself raised ("probe error (<ExceptionTypeName>)"). The
+                per-prompt write-tool marker check confirms real liveness
+                on the first prompt.
 
     Returns:
         (status, reason): status per the tri-state above; reason is a
@@ -234,15 +237,43 @@ def _check_mcp_health(engram_home: str) -> tuple[bool | None, str | None]:
         )
         if result.returncode == 0:
             return True, None
-        return False, "no engram server process found"
+        if result.returncode == 1:
+            return False, "no engram server process found"
+        # rc >= 2 (or negative): pgrep itself failed -- not a "no match".
+        return None, f"pgrep error (exit {result.returncode})"
     except subprocess.TimeoutExpired:
         # Indeterminate, NOT absent: the probe never completed (busy box at
         # cold start). Signal the third state so the caller renders a soft
-        # "inconclusive" note instead of a false OFFLINE alarm (#1754).
+        # informational "unknown" line instead of a false OFFLINE alarm
+        # (#1754, #3202).
         return None, "pgrep timed out"
+    except Exception as exc:
+        # #3202: a probe that raised is unknown, not up -- fail-open to True
+        # hid real probe failures. Still never blocks session start.
+        return None, f"probe error ({type(exc).__name__})"
+
+
+def _dead_marker_pid(engram_home: str) -> int | None:
+    """Return the PID named by mcp-tools-ready.json iff that PID is dead.
+
+    Best-effort, no subprocess (the hook runs under a tight harness kill).
+    Any problem -- absent/unreadable/invalid marker, pid <= 0, a live PID,
+    EPERM (exists, not ours) -- returns None.
+    """
+    try:
+        with open(os.path.join(engram_home, "mcp-tools-ready.json")) as f:
+            pid = json.load(f).get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return pid
+        except PermissionError:
+            return None
+        return None
     except Exception:
-        # Advisory: probe errors are treated as ok to avoid blocking session start.
-        return True, None
+        return None
 
 
 def _is_any_server_py_running() -> bool:
@@ -3331,6 +3362,22 @@ def main() -> None:
     # (e.g. a single wall-clock deadline shared across all three checks)
     # is a real follow-up if this worst case is ever observed to bite.
     mcp_status, mcp_reason = _check_mcp_health(ENGRAM_HOME)
+    # #3202: at startup/resume the MCP server is launched concurrently with
+    # this hook, so a single pgrep miss can precede the process existing --
+    # a false OFFLINE on every boot. A compact/clear start keeps the running
+    # server, so a miss there IS evidence and stays the hard alarm. Anything
+    # else downgrades to the soft "unknown" state; the first-prompt marker
+    # check is the alarm of record. This is an allowlist of server-keeping
+    # sources, so an unrecognised or future source defaults to the soft line,
+    # and the first-prompt marker check backstops it.
+    if mcp_status is False and source not in ("compact", "clear"):
+        mcp_status = None
+        mcp_reason = "pgrep found no match; the server launches alongside this session"
+    # #3202: live process but the marker names a dead PID -> stale marker
+    # (informational only; never OFFLINE). Skipped where the probe is deferred.
+    _mcp_stale_pid = None
+    if mcp_status is True and _startup_mcp_health_probe_allowed():
+        _mcp_stale_pid = _dead_marker_pid(ENGRAM_HOME)
     stale_ok, stale_reason = _check_backup_staleness(ENGRAM_HOME)
     viz_status, viz_reason = _check_viz_server_health(ENGRAM_HOME)
     embed_restore_ok, embed_restore_reason = _check_embedding_restore_flag(ENGRAM_HOME)
@@ -3361,15 +3408,13 @@ def main() -> None:
     # (a local list instead of a direct `lines.append`).
     _health_lines: list[str] = []
     if (
-        mcp_offline or mcp_inconclusive or not stale_ok or viz_down
+        mcp_offline or not stale_ok or viz_down
         or viz_inconclusive or not embed_restore_ok
     ):
         _health_lines.append("⚠️  ENGRAM substrate health:")
         if mcp_offline:
             _health_lines.append(f"  MCP server: OFFLINE ({mcp_reason})")
             _health_lines.append("  → Tell the user immediately. ENGRAM tool calls will fail.")
-        elif mcp_inconclusive:
-            _health_lines.append(f"  MCP liveness: inconclusive ({mcp_reason}) — will confirm on first prompt")
         if not stale_ok:
             _health_lines.append(f"  Git backup: {stale_reason}")
             _health_lines.append("  → Run engram-nap or engram-sleep to update the git backup.")
@@ -3390,6 +3435,19 @@ def main() -> None:
                 "embedder is available (or wait — a regeneration may "
                 "already be running in the background)."
             )
+    if mcp_inconclusive:
+        # #3202: unknown liveness is informational, NOT a ⚠️ alarm -- seats
+        # surface any ⚠️ substrate-health block to the user immediately, so
+        # the header itself would be the false alarm. First prompt confirms.
+        _health_lines.append(
+            f"ℹ️  ENGRAM substrate health: MCP liveness: unknown "
+            f"({mcp_reason}) — will confirm on first prompt"
+        )
+    if _mcp_stale_pid is not None:
+        _health_lines.append(
+            f"ℹ️  ENGRAM substrate health: MCP server up (marker stale "
+            f"(PID {_mcp_stale_pid} no longer running); live server found)."
+        )
     _health_text = "\n".join(_health_lines)
 
     if source == "startup":
