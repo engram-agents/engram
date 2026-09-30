@@ -45,6 +45,32 @@ _TOOLS_DIR = str(Path(__file__).parent.parent / "tools")
 if _TOOLS_DIR not in sys.path:
     sys.path.append(_TOOLS_DIR)
 
+# #3039 U2a round 3: the double-claim end-to-end regression test below needs
+# the REAL `forum` package (server.create_app + coordination.projects write
+# bodies) -- a MagicMock ForumClient with a fixed get_return can't see its
+# own prior POST's effect, which is exactly what that test exercises. `src/`
+# is normally put on sys.path as a side effect of pytest also collecting a
+# `src/forum/tests/*.py` file in the same run (which sits under a
+# non-package `tests/` dir, triggering pytest's own rootdir insertion) --
+# but that is collection-ORDER-dependent, not guaranteed when this file runs
+# alone or first on the command line (verified: `import forum` fails here in
+# isolation without this).
+#
+# insert(0), NOT append: `tools/` (added above) also has its own flat,
+# NON-package `tools/forum.py` (the old thick CLI) -- with `_SRC_DIR` merely
+# appended, `tools/` still precedes it in sys.path (append preserves
+# insertion order), so `import forum` resolved to `tools/forum.py` first
+# and `forum.coordination` failed with "'forum' is not a package" (measured
+# while writing this test). Inserting `_SRC_DIR` at position 0 is exactly
+# what the `_TOOLS_DIR` comment above already wants ("outranking src/forum
+# ... shadowing the real forum package" is the failure mode THAT comment is
+# refusing to cause) -- this makes it actually hold, rather than merely
+# asserting it in prose. `src/` contains no `tools/` package of its own, so
+# this cannot affect the #2565 `import tools` collision guard.
+_SRC_DIR = str(Path(__file__).parent.parent / "src")
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
 import baton as _baton  # noqa: E402
 from forum_api import ForumHttpError, ForumNetworkError  # noqa: E402
 
@@ -5958,3 +5984,1073 @@ class TestResolvePhase:
         phase, used_legacy = _baton._resolve_phase(fields, is_bunch=True)
         assert phase == "pool"
         assert used_legacy is False
+
+
+# ===========================================================================
+# CATEGORY 18: phase WRITES -- the write side of #3039 (U2a)
+# ===========================================================================
+#
+# U1 (CATEGORY 17 above) built the READ side only. U2a is the WRITE side:
+# every phase-defining transition stamps an explicit `phase:` field, and any
+# write to a still-legacy baton (no `phase:` yet) also converts it. These
+# tests cover the CLIENT-side (baton.py) half of that contract -- computing
+# and SENDING the right `phase` value in each POST body. The pure write-body
+# (`_maybe_stamp_phase` + its wiring into flip/claim/release/init) is tested
+# directly against `forum.coordination.projects` in
+# `src/forum/tests/test_coordination_projects.py`.
+
+class TestGcPhaseClassificationFix:
+    """Test obligation 5 (#3039 U2a): cmd_gc's own PR-vs-bunch branch, after
+    swapping its narrow, order-swapped `_PR_BATON_NAME_RE.match(pid.upper())`
+    test for `_is_pr_baton`, no longer misclassifies a `pool-pr-*`-shaped
+    bunch baton as a PR baton. Mirrors TestClaim's
+    `test_claim_allow_project_anchored_pool_pr_shaped_id_at_legacy_sentinel`
+    and `test_claim_allow_unanchored_pool_pr_shaped_id_at_legacy_sentinel`,
+    exercised through cmd_gc's classification branch instead of cmd_claim's
+    gate.
+
+    Contract-first (this repo's CLAUDE.md "Contract-first tests"): written
+    against the PRE-fix `dev` code (cmd_gc's own inline
+    `_PR_BATON_NAME_RE.match(pid.upper())`), where both tests below go RED
+    -- "POOL-" reads as _PR_BATON_NAME_RE's optional type-prefix segment, so
+    both real bunch batons are misclassified as PR-shaped and counted
+    `ungauged` (with a spurious "run baton anchor ... to make them
+    gc-eligible" warning), instead of being silently skipped as the
+    non-PR bunch batons they are."""
+
+    def test_project_anchored_pool_pr_shaped_id_not_ungauged(self, monkeypatch, capsys):
+        """A `project/`-anchored bunch baton whose id is PR-shaped
+        ("pool-pr-discipline") must NOT be counted as an ungauged PR-baton
+        by cmd_gc -- an anchor decides when there is one (`project/` is a
+        bunch, whatever the name contains)."""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "pool-pr-discipline", "github": "project/11"},
+        ]})
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "would close 0, still-open 0, ungauged 0, failed 0" in captured.out
+        assert "ungauged 1" not in captured.out
+
+    def test_unanchored_pool_pr_shaped_id_not_ungauged(self, monkeypatch, capsys):
+        """An UNANCHORED bunch baton whose id is PR-shaped
+        ("pool-pr-followups", no `github:` field) must also NOT be counted
+        as ungauged -- for an unanchored baton, a bunch-naming-convention
+        id ("pool-...") is a bunch whatever else its name contains."""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "pool-pr-followups", "github": ""},
+        ]})
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "would close 0, still-open 0, ungauged 0, failed 0" in captured.out
+        assert "ungauged 1" not in captured.out
+
+
+class TestClaimPhaseWrite:
+    """Test obligation 6 companion (#3039 U2a): pins cmd_claim's own flagged
+    deviation from this unit's spec -- the POST body sends phase: "claimed",
+    not the spec's literal "pool". Mirrors TestFlipPhaseWrite /
+    TestInitPhaseWrite's style: monkeypatch the pool sentinel, build a
+    claimable baton via _make_raw_baton (same shape as test_claim_happy_path
+    in TestClaim above), call cmd_claim directly, assert the POST body's
+    phase value.
+
+    Reviewer-fairy finding on #3254 (round 2): the PR's own body flagged
+    this "claimed"-not-"pool" divergence as the one thing most worth
+    scrutiny, and nothing in this file actually pinned it -- the existing
+    test_claim_happy_path asserts body["agent"]/body["pool_sentinel"] but
+    never body["phase"].
+
+    Round 3 (#3039 U2a, the double-claim race Borges found + the dispatching
+    agent independently reproduced): this value is now sent under
+    `transition_phase` (an unconditional overwrite), not `phase`
+    (stamp-if-absent) -- see cmd_claim's own inline comment for the full
+    trace of why round 2's `phase`-channel send WAS the bug. Round 4: the
+    legacy-conversion `phase` rides ALONGSIDE it -- see
+    TestRound4TransitionsSendBothPhaseFields."""
+
+    def test_claim_writes_phase_claimed_not_pool(self, monkeypatch):
+        """Sending phase: "claimed" (not "pool") is what closes the
+        double-claim race: stamping "pool" onto a baton that is now HELD
+        would let a second concurrent `claim` read that stamped phase as an
+        EXPLICIT value (bypassing legacy fallback) and be let through -- see
+        baton.py's inline comment at this call site, and the PR body's own
+        "One deliberate deviation" section, for the full trace."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n == "casey")
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "pool-9700", title="pool project", turn="casey",
+                participants="[borges, ariadne]", turn_reason="released",
+            )},
+        )
+        args = argparse.Namespace(project_id="pool-9700")
+        _baton.cmd_claim(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/pool-9700/claim"
+        assert body["transition_phase"] == "claimed"
+
+
+class TestReleasePhaseWrite:
+    """Test obligation 6 companion (#3039 U2a): pins cmd_release's
+    result-phase write per Kepler's own ruling ("the bunch machine's
+    writes: claim -> claimed, release -> pool, release --done -> done") --
+    mirrors TestFlipPhaseWrite / TestInitPhaseWrite's style, and the fixture
+    shape of test_release_happy_path in TestRelease above.
+
+    Round 3 (#3039 U2a): this value is now sent under `transition_phase`
+    (an unconditional overwrite), not `phase` (stamp-if-absent) -- release
+    is ALWAYS a transition, same reasoning as cmd_claim's own round-3 fix.
+    Round 4: the legacy-conversion `phase` rides ALONGSIDE it -- see
+    TestRound4TransitionsSendBothPhaseFields."""
+
+    def test_release_writes_phase_pool(self, monkeypatch):
+        """An ordinary release (no --done) sends phase: "pool" -- the baton
+        goes back to the pool, free for the next claim."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9701", title="claimed project", turn="borges",
+                participants="[borges, ariadne]",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-9701", done=False, reason="released")
+        _baton.cmd_release(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-9701/release"
+        assert body["transition_phase"] == "pool"
+
+    def test_release_done_writes_phase_done(self, monkeypatch):
+        """release --done sends phase: "done" -- the terminal bunch-machine
+        state, distinct from an ordinary release's "pool"."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9702", title="claimed project", turn="borges",
+                participants="[borges, ariadne]",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-9702", done=True, reason="released")
+        _baton.cmd_release(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-9702/release"
+        assert body["transition_phase"] == "done"
+
+
+class TestFlipPhaseWrite:
+    """Test obligation 6 (#3039 U2a): the full invariant, end-to-end
+    through cmd_flip. Kepler's own words: 'the existing flip to the merge
+    seat, with today's approval gate unchanged, writes phase: merge until
+    U2b replaces that edge.'
+
+    Contract-first: written against the pre-U2a `dev` code, where this test
+    goes RED (cmd_flip's POST body carries no `phase` key at all). Modeled
+    directly on the pre-existing `test_flip_repo_qualified_ci_green_proceeds`
+    (TestFlipRepoQualifiedGuard) -- same fixture shape, same CI-green/
+    approval-fresh mocking convention -- with the phase assertion added.
+
+    Round 3 (#3039 U2a): the two transition-defining branches below
+    (merge-seat, fairy->peer) now send their value under `transition_phase`
+    (an unconditional overwrite), not `phase` (stamp-if-absent) -- see
+    projects.py's flip() docstring for the two-step design. Round 4: the
+    legacy-conversion `phase` rides ALONGSIDE it -- see
+    TestRound4TransitionsSendBothPhaseFields."""
+
+    def test_flip_to_merge_seat_writes_phase_merge(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("green", "mergeStateStatus=CLEAN"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr, repo=None: ("fresh", "approved at current tip"))
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9500", github="pr/engram-agents/engram-paper/9500",
+                turn="borges", participants="[borges, ariadne]",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9500", to="casey", reason="ready", force=False,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-9500/flip"
+        assert body["transition_phase"] == "merge"
+
+    def test_flip_to_colleague_from_fairy_writes_phase_peer(self, monkeypatch):
+        """The author's own 'send it out for colleague review' verb --
+        NOT a new subcommand (design note / Kepler's ruling): the ordinary
+        flip, when its target is the registered colleague and the baton's
+        current phase is 'fairy' (or its legacy-equivalent, the common
+        in-flight indeterminate case -- see _resolve_phase). Flags one of
+        this PR's own ambiguous decisions: the spec named this the ONE
+        point it was least certain of."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9501", github="pr/engram-agents/engram-paper/9501",
+                turn="borges", participants="[borges, ariadne, sol]",
+                colleague="sol",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9501", to="sol", reason="please review", force=False,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-9501/flip"
+        assert body["transition_phase"] == "peer"
+
+    def test_ordinary_self_flip_sends_legacy_conversion_phase_not_a_new_one(self, monkeypatch):
+        """An ordinary flip that is NEITHER the merge-seat presentation NOR
+        the fairy->peer review request (here: a self-flip) sends whatever
+        _resolve_phase already derives for this baton -- legacy-conversion
+        only, never inventing a new phase value. This baton's turn does
+        NOT match the legacy sentinel, so the pre-existing resolved phase
+        is indeterminate ("") and no phase key advances the baton."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9502", github="pr/engram-agents/engram-paper/9502",
+                turn="borges", participants="[borges, ariadne]",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9502", to="borges", reason="still working", force=False,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-9502/flip"
+        assert body["phase"] is None
+
+    def test_colleague_return_to_author_preserves_peer_phase(self, monkeypatch):
+        """#2961 return-to-author: a colleague ("ariadne") holding the
+        baton at explicit phase: "peer" finds a blocker and flips it back
+        to the PR's author ("clio") -- the PR-2926 real shape (see
+        TestIsMaintainerFlip.test_flip_to_author_is_not_maintainer_flip).
+        Per the design note's target model (§2), `turn: author <-> peer` is
+        explicit: turn moving BACK to the author WITHIN `peer` phase is the
+        OTHER direction of the same ping-pong, not a phase regression. So
+        the POST body's phase must stay "peer" (preserved, not None, not
+        "fairy") -- a legacy-conversion-style send of the CURRENT phase,
+        confirming `_maybe_stamp_phase`'s no-clobber guard correctly makes
+        this a true no-op server-side (phase stays "peer", no spurious log
+        line). Reviewer-fairy finding on #3254 (round 2): this edge had no
+        explicit test and no comment explaining it was deliberate rather
+        than an oversight -- see the comment added above cmd_flip's
+        `_flip_phase = _flip_current_phase or None` line."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9503", github="pr/engram-agents/engram-paper/9503",
+                turn="ariadne", participants="[clio, ariadne]",
+                colleague="ariadne", author="clio", phase="peer",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9503", to="clio", reason="one blocker, back to author", force=False,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-9503/flip"
+        assert body["phase"] == "peer"
+
+
+class TestInitPhaseWrite:
+    """Test obligation 7 (#3039 U2a): cmd_init computes the INTENDED
+    initial phase directly from the transition's own semantics (not
+    _resolve_phase -- there is nothing to fall back to for a fresh baton):
+    'pool' for a bunch-shaped project_id, 'fairy' for a PR-shaped one.
+
+    Contract-first: written against the pre-U2a `dev` code, where both
+    tests below go RED (cmd_init's POST body carries no `phase` key at
+    all).
+
+    Round 3 (#3039 U2a): this value is now sent under `transition_phase`
+    (an unconditional overwrite), not `phase` (stamp-if-absent) -- init is
+    ALWAYS a transition (the baton's very first phase), and routing it
+    through `transition_phase` is what fixes Borges's smaller finding
+    (the turn-log line used to read "(legacy conversion)" on a baton that
+    was never legacy)."""
+
+    def test_bunch_shaped_id_sends_phase_pool(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="pool-3039-u2a-test", title="bunch test",
+            participants="borges,ariadne", status="planning",
+            turn=None, github=None, colleague=None,
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["transition_phase"] == "pool"
+
+    def test_pr_shaped_id_sends_phase_fairy(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="UMWELT-PR-775", title="pr test",
+            participants="borges,ariadne", status="planning",
+            turn=None, github=None, colleague=None,
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["transition_phase"] == "fairy"
+
+    def test_project_anchored_bunch_sends_phase_pool_even_if_name_pr_shaped(self, monkeypatch):
+        """The anchor decides when there is one, same as _is_pr_baton: a
+        `project/`-anchored baton is a bunch regardless of a PR-shaped
+        name, so it inits with phase: pool, not fairy."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="ALPHA-PR-FOLLOWUPS", title="bunch, PR-shaped name",
+            participants="borges,ariadne", status="planning",
+            turn=None, github="project/12", colleague=None,
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["transition_phase"] == "pool"
+
+
+# ---------------------------------------------------------------------------
+# #3039 U2a round 3 — end-to-end double-claim regression (Borges's exact
+# contract-first spec, test obligation 3, PR #3254 round 3)
+# ---------------------------------------------------------------------------
+#
+# The double-claim race Borges's colleague review found on PR #3254
+# (independently reproduced by the dispatching agent): round 2 routed
+# claim's RESULT phase through the CONVERSION (stamp-if-absent) channel, so
+# a baton stamped `phase: pool` at init() NEVER actually advanced to
+# "claimed" on disk -- claim()'s own write-body no-op'd, since the baton
+# already had an EXPLICIT phase (stamp-if-absent never overwrites one). A
+# frozen `phase: pool` then reads as an explicit field (not the legacy
+# fallback), so cmd_claim's own client-side gate (`_phase != "pool"`
+# refusal) never refused a SECOND claim on an already-claimed baton.
+#
+# A MagicMock ForumClient (the pattern every other test in this file uses)
+# has a FIXED get_return -- it cannot see the effect of its own prior
+# POST, which is exactly what this regression needs to exercise. So this
+# test uses a REAL forum.server Flask app + a real FileStore +
+# SeqAllocator, wrapped in a thin ForumClient-shaped adapter, to drive TWO
+# real end-to-end `cmd_claim` calls against the SAME baton -- contract-
+# first: written to fail against unfixed `2398270` (round 2's
+# stamp-if-absent-everywhere mechanism); see the mutation-control check in
+# src/forum/tests/test_coordination_projects.py for the reverted-mechanism
+# confirmation.
+
+class _RealForumClientAdapter:
+    """Wraps a Flask test client so cmd_claim's ForumClient-shaped
+    ``.get(path, params=)`` / ``.post(path, payload)`` calls exercise the
+    REAL server.py endpoints + projects.py write-bodies end-to-end, raising
+    ForumHttpError exactly like the real ForumClient does on a non-2xx
+    response."""
+
+    def __init__(self, flask_test_client):
+        self._c = flask_test_client
+
+    def get(self, path, params=None):
+        resp = self._c.get(path, query_string=params)
+        if resp.status_code >= 400:
+            raise ForumHttpError(resp.status_code, resp.get_data(as_text=True))
+        return resp.get_json()
+
+    def post(self, path, payload=None):
+        resp = self._c.post(path, json=payload or {})
+        if resp.status_code >= 400:
+            raise ForumHttpError(resp.status_code, resp.get_data(as_text=True))
+        return resp.get_json()
+
+
+def _real_forum_client(tmp_path) -> _RealForumClientAdapter:
+    """Build a REAL forum.server Flask app, backed by a real FileStore +
+    SeqAllocator under `tmp_path`, wrapped in the ForumClient-shaped
+    adapter above.
+
+    Re-asserts `_SRC_DIR` at sys.path[0] immediately before importing
+    `forum` (measured necessary, not belt-and-braces): `import baton`
+    above runs baton.py's OWN top-of-file
+    `sys.path.insert(0, str(Path(__file__).resolve().parent))` --
+    `.resolve()` follows the `tools/baton.py` symlink back to its real
+    location, `src/engram/tools/`, which ALSO contains the flat,
+    non-package `forum.py` (the old thick CLI) baton.py imports
+    `forum_api` alongside. That insert lands AHEAD of this file's own
+    `_SRC_DIR` insert (which already ran, by module-import time), so a
+    bare `from forum.coordination import ...` here resolves `forum` to
+    the wrong (flat) module and fails with "'forum' is not a package" --
+    reproduced while writing this test.
+    """
+    import sqlite3
+
+    if sys.path[:1] != [_SRC_DIR]:
+        sys.path.insert(0, _SRC_DIR)
+
+    from forum.coordination import SeqAllocator
+    from forum.coordination.store_file import FileStore
+    from forum.db import init_db
+    from forum.server import create_app
+
+    db_path = str(tmp_path / "forum.db")
+    audit_path = str(tmp_path / "audit.jsonl")
+    conn = sqlite3.connect(db_path)
+    init_db(conn)
+    conn.close()
+
+    store = FileStore(tmp_path / "coord")
+    allocator = SeqAllocator(recover=store.recover_max_seq)
+    application = create_app(db_path, audit_path)
+    application.config["TESTING"] = True
+    application.config["COORD_STORE"] = store
+    application.config["COORD_ALLOCATOR"] = allocator
+    return _RealForumClientAdapter(application.test_client())
+
+
+class TestDoubleClaimRegressionEndToEnd:
+    """Test obligation 3 (#3039 U2a round 3): claim a bunch baton, then
+    attempt a SECOND `cmd_claim` call on it -- must be refused."""
+
+    def test_second_claim_on_already_claimed_bunch_is_refused(self, tmp_path, monkeypatch, capsys):
+        client = _real_forum_client(tmp_path)
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        # Seed the bunch baton via the REAL `cmd_init` call, exactly as
+        # `baton init pool-9910 --turn "lei shi" ...` would -- phase: pool,
+        # turn at the pool sentinel.
+        real_config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        init_args = argparse.Namespace(
+            project_id="pool-9910", title="a real bunch",
+            participants="borges,ariadne", status="planning",
+            turn="lei shi", github=None, colleague=None,
+        )
+        _baton.cmd_init(init_args, real_config, "borges", client)
+        raw = client.get("/api/projects/pool-9910")["raw"]
+        fields, _ = _baton._parse_frontmatter(raw)
+        assert fields["phase"] == "pool"
+
+        claim_args = argparse.Namespace(project_id="pool-9910")
+
+        # First claim: borges takes it from the pool -- must succeed.
+        _baton.cmd_claim(claim_args, real_config, "borges", client)
+        out = capsys.readouterr()
+        assert "pool-9910 → borges" in out.out
+
+        raw = client.get("/api/projects/pool-9910")["raw"]
+        fields, _ = _baton._parse_frontmatter(raw)
+        assert fields["phase"] == "claimed", (
+            "the first claim must actually advance the STORED phase to "
+            "'claimed' -- if it stays frozen at 'pool' (round 2's bug), "
+            "the second claim below is wrongly let through"
+        )
+
+        # Second claim: ariadne attempts to claim the SAME baton, which
+        # borges now holds -- must be REFUSED (EXIT_STATE), not silently
+        # let through onto an already-claimed baton.
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_claim(claim_args, real_config, "ariadne", client)
+        assert exc_info.value.code == EXIT_STATE
+
+        # And the baton must still show borges holding it -- the refused
+        # claim must not have mutated turn/phase at all.
+        raw = client.get("/api/projects/pool-9910")["raw"]
+        fields, _ = _baton._parse_frontmatter(raw)
+        assert fields["turn"] == "borges"
+        assert fields["phase"] == "claimed"
+
+
+# ===========================================================================
+# #3039 U2a round 4 -- transitions send BOTH conversion and transition
+# ===========================================================================
+#
+# Round 3 sent EXACTLY ONE of `phase` (conversion) / `transition_phase` per
+# call, so a transition on a LEGACY baton (no `phase:` yet) overwrote the
+# field and left no conversion record in the turn log (Borges, colleague
+# review, round 3: `conversion record in log: False` for a legacy claim).
+# Kepler's two-step ruling: every write to a legacy baton converts it first
+# (recorded, fleet-readable), then the transition overwrites.
+#
+# CONTRACT for claim / release / release --done / flip fairy->peer / flip
+# ->merge seat: the POST body carries BOTH `phase` (= what
+# `_conversion_phase` returns for the pre-POST fields) AND
+# `transition_phase`. `cmd_init` stays transition-only; conversion-only flips
+# (#2961 return-to-author, self-flip) stay `phase`-only.
+#
+# What `_conversion_phase` returns, which the assertions below follow:
+#   * explicit `phase:` present  -> that explicit value (server no-ops it)
+#   * legacy, turn at the sentinel -> the sentinel-derived phase
+#     (bunch -> "pool", PR -> "merge")
+#   * legacy, turn NOT at the sentinel -> None (`_resolve_phase` is
+#     indeterminate) from `_conversion_phase` ITSELF. Round 5: the transition
+#     verbs no longer forward that None -- release / flip fairy->peer / flip
+#     ->merge seat substitute their known pre-state ("claimed" / "fairy" /
+#     "peer"); see TestRound5LegacyConversionPreState below.
+#   * pool sentinel unresolvable -> None (claim still forwards it: nothing
+#     crashes; the round-5 fallbacks do not apply to claim).
+
+def _r4_keep_sentinel_resolvable(monkeypatch, name="casey"):
+    monkeypatch.setattr(_baton, "_pool_sentinel", lambda: name)
+    monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [name])
+
+
+class TestRound4TransitionsSendBothPhaseFields:
+
+    # -- claim -------------------------------------------------------------
+
+    def test_claim_legacy_bunch_sends_conversion_pool_and_transition_claimed(self, monkeypatch):
+        _r4_keep_sentinel_resolvable(monkeypatch)
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "pool-9800", turn="casey", participants="[borges, ariadne]",
+            )},
+        )
+        _baton.cmd_claim(argparse.Namespace(project_id="pool-9800"), MULTI_CONFIG, "borges", client)
+
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/pool-9800/claim"
+        assert body["phase"] == "pool"
+        assert body["transition_phase"] == "claimed"
+
+    def test_claim_explicit_phase_sends_the_explicit_value_as_conversion(self, monkeypatch):
+        """With an explicit `phase: pool`, `_conversion_phase` returns that
+        explicit value; the write-body's stamp-if-absent then no-ops it."""
+        _r4_keep_sentinel_resolvable(monkeypatch)
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "pool-9801", turn="casey", participants="[borges, ariadne]", phase="pool",
+            )},
+        )
+        _baton.cmd_claim(argparse.Namespace(project_id="pool-9801"), MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["phase"] == "pool"
+        assert body["transition_phase"] == "claimed"
+
+    def test_claim_with_unresolvable_sentinel_sends_none_conversion_and_still_transitions(
+        self, monkeypatch, tmp_path,
+    ):
+        """`_conversion_phase` returns None when the pool sentinel cannot be
+        resolved; claim must still send its transition. (`_pool_sentinel`
+        itself is stubbed so claim's own hard-exit doesn't fire -- this
+        isolates the `_conversion_phase` degradation.)"""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        monkeypatch.setenv("ENGRAM_HOME", str(tmp_path))  # no config.json here
+        monkeypatch.delenv("BATON_POOL_SENTINEL", raising=False)
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "pool-9802", turn="casey", participants="[borges, ariadne]",
+            )},
+        )
+        _baton.cmd_claim(argparse.Namespace(project_id="pool-9802"), MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert "phase" in body and body["phase"] is None
+        assert body["transition_phase"] == "claimed"
+
+    # -- release / release --done -------------------------------------------
+
+    @pytest.mark.parametrize("done,expected", [(False, "pool"), (True, "done")])
+    def test_release_legacy_sends_phase_key_equal_to_conversion_phase_and_transition(
+        self, monkeypatch, done, expected,
+    ):
+        """A legacy baton HELD by the releaser (turn = self, not the
+        sentinel) has no determinable legacy phase, so `_conversion_phase`
+        is None here -- round 5: release substitutes its known pre-state
+        "claimed", so the `phase` key carries that, alongside the
+        transition."""
+        _r4_keep_sentinel_resolvable(monkeypatch)
+        raw = _make_raw_baton(
+            "PR-9810", turn="borges", participants="[borges, ariadne]",
+        )
+        fields, _ = _baton._parse_frontmatter(raw)
+        client = _make_client(post_return={"seq": 1}, get_return={"raw": raw})
+        args = argparse.Namespace(project_id="PR-9810", done=done, reason="r")
+        _baton.cmd_release(args, MULTI_CONFIG, "borges", client)
+
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-9810/release"
+        assert _baton._conversion_phase("PR-9810", fields) is None  # premise
+        assert body["phase"] == "claimed"
+        assert body["transition_phase"] == expected
+
+    @pytest.mark.parametrize("done,expected", [(False, "pool"), (True, "done")])
+    def test_release_explicit_phase_sends_the_explicit_value_as_conversion(
+        self, monkeypatch, done, expected,
+    ):
+        _r4_keep_sentinel_resolvable(monkeypatch)
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9811", turn="borges", participants="[borges, ariadne]",
+                phase="claimed",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-9811", done=done, reason="r")
+        _baton.cmd_release(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["phase"] == "claimed"
+        assert body["transition_phase"] == expected
+
+    # -- flip ---------------------------------------------------------------
+
+    def test_flip_fairy_to_peer_legacy_sends_phase_key_and_transition(self, monkeypatch):
+        """Legacy in-flight PR baton (turn = author, not the sentinel):
+        `_resolve_phase` is indeterminate -> round 5: the conversion value
+        is the known pre-state "fairy", sent alongside `transition_phase`."""
+        _r4_keep_sentinel_resolvable(monkeypatch)
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9820", github="pr/engram-agents/engram-paper/9820",
+                turn="borges", participants="[borges, ariadne, sol]", colleague="sol",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-9820", to="sol", reason="review", force=False)
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["phase"] == "fairy"
+        assert body["transition_phase"] == "peer"
+
+    def test_flip_fairy_to_peer_explicit_phase_sends_explicit_conversion_and_transition(
+        self, monkeypatch,
+    ):
+        _r4_keep_sentinel_resolvable(monkeypatch)
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9821", github="pr/engram-agents/engram-paper/9821",
+                turn="borges", participants="[borges, ariadne, sol]", colleague="sol",
+                phase="fairy",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-9821", to="sol", reason="review", force=False)
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["phase"] == "fairy"
+        assert body["transition_phase"] == "peer"
+
+    def _flip_to_merge_body(self, monkeypatch, pid, **fm):
+        _r4_keep_sentinel_resolvable(monkeypatch)
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("green", "mergeStateStatus=CLEAN"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr, repo=None: ("fresh", "approved at current tip"))
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                pid, github=f"pr/engram-agents/engram-paper/{pid.split('-')[1]}",
+                turn="borges", participants="[borges, ariadne]", **fm,
+            )},
+        )
+        args = argparse.Namespace(project_id=pid, to="casey", reason="ready", force=False)
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        return body
+
+    def test_flip_to_merge_seat_legacy_sends_phase_key_and_transition(self, monkeypatch):
+        body = self._flip_to_merge_body(monkeypatch, "PR-9822")
+        assert body["phase"] == "peer"  # round 5: known pre-state, not None
+        assert body["transition_phase"] == "merge"
+
+    def test_flip_to_merge_seat_explicit_phase_sends_explicit_conversion_and_transition(
+        self, monkeypatch,
+    ):
+        body = self._flip_to_merge_body(monkeypatch, "PR-9823", phase="peer")
+        assert body["phase"] == "peer"
+        assert body["transition_phase"] == "merge"
+
+    # -- unchanged shapes -----------------------------------------------------
+
+    def test_conversion_only_flips_send_no_transition(self, monkeypatch):
+        """#2961 return-to-author stays conversion-only: `phase` alone,
+        `transition_phase` None, peer preserved."""
+        _r4_keep_sentinel_resolvable(monkeypatch)
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9830", github="pr/engram-agents/engram-paper/9830",
+                turn="ariadne", participants="[clio, ariadne]",
+                colleague="ariadne", author="clio", phase="peer",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-9830", to="clio", reason="blocker", force=False)
+        _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+        _, body = client.post.call_args[0]
+        assert body["phase"] == "peer"
+        assert body["transition_phase"] is None
+
+    def test_init_stays_transition_only(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="pool-9831", title="t", participants="borges,ariadne",
+            status="planning", turn=None, github=None, colleague=None,
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["transition_phase"] == "pool"
+        assert "phase" not in body
+
+
+class TestRound4ConversionThenTransitionEndToEnd:
+    """CLI -> REAL server -> REAL write-body -> turn LOG. Closes the gap
+    round 3 shipped through: request-body and stored-field assertions never
+    looked at the log sequence."""
+
+    @staticmethod
+    def _phase_lines(client, pid):
+        raw = client.get(f"/api/projects/{pid}")["raw"]
+        return [l for l in raw.splitlines() if l.startswith("- ") and "phase" in l], raw
+
+    @staticmethod
+    def _seed(client, pid, raw):
+        client._c.application.config["COORD_STORE"].write_project(pid, raw, seq=0)
+
+    def test_legacy_claim_logs_conversion_then_transition(self, tmp_path, monkeypatch):
+        client = _real_forum_client(tmp_path)
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
+        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        self._seed(client, "pool-9840", _make_raw_baton(
+            "pool-9840", turn="lei shi", participants="[borges, ariadne]",
+        ))
+
+        _baton.cmd_claim(argparse.Namespace(project_id="pool-9840"), config, "borges", client)
+
+        lines, raw = self._phase_lines(client, "pool-9840")
+        assert len(lines) == 2, lines
+        assert "phase stamped: 'pool' (legacy conversion" in lines[0]
+        assert "phase: 'claimed' (transition)" in lines[1]
+        fields, _ = _baton._parse_frontmatter(raw)
+        assert fields["phase"] == "claimed"
+
+    def test_explicit_phase_claim_logs_only_the_transition(self, tmp_path, monkeypatch):
+        client = _real_forum_client(tmp_path)
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
+        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        self._seed(client, "pool-9841", _make_raw_baton(
+            "pool-9841", turn="lei shi", participants="[borges, ariadne]", phase="pool",
+        ))
+
+        _baton.cmd_claim(argparse.Namespace(project_id="pool-9841"), config, "borges", client)
+
+        lines, _ = self._phase_lines(client, "pool-9841")
+        assert len(lines) == 1, lines
+        assert "phase: 'claimed' (transition)" in lines[0]
+
+
+# ===========================================================================
+# #3039 U2a round 5 -- a legacy baton's conversion phase is ALWAYS known
+# ===========================================================================
+#
+# Round 4 sent `phase` = `_conversion_phase(...)` / `_flip_current_phase or
+# None`, which is None for a LEGACY baton (no `phase:` yet) whose turn is not
+# the pool/merge sentinel -- i.e. for every realistic release / flip-to-peer /
+# flip-to-merge-seat, where the turn is held by the holder/author. The server's
+# stamp-if-absent step then had nothing to stamp and no `phase stamped: ...
+# (legacy conversion)` line was logged.
+#
+# CONTRACT: each of these verbs knows its pre-state from the verb itself, so
+# its POST carries a NON-None conversion `phase` equal to that pre-state:
+#   release / release --done  -> "claimed"   (you can only release what you hold)
+#   flip fairy -> peer        -> "fairy"
+#   flip -> merge seat        -> "peer"
+#   claim                     -> "pool"      (unchanged)
+# An existing non-empty value (explicit `phase:`, or a legacy pool/merge
+# sentinel resolution) wins over the fallback. Turn log, in order:
+#   phase stamped: '<pre-state>' (legacy conversion)
+#   phase: '<new>' (transition)
+# Conversion-only flips (#2961 return-to-author, self-flip) and cmd_init are
+# unchanged.
+
+class TestRound5LegacyConversionPreState:
+
+    @pytest.mark.parametrize("done,expected", [(False, "pool"), (True, "done")])
+    def test_release_legacy_held_baton_converts_from_claimed(self, monkeypatch, done, expected):
+        _r4_keep_sentinel_resolvable(monkeypatch)
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9900", turn="borges", participants="[borges, ariadne]",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-9900", done=done, reason="r")
+        _baton.cmd_release(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["phase"] == "claimed"
+        assert body["transition_phase"] == expected
+
+    @pytest.mark.parametrize("done,expected", [(False, "pool"), (True, "done")])
+    def test_release_explicit_phase_still_wins_over_the_fallback(self, monkeypatch, done, expected):
+        _r4_keep_sentinel_resolvable(monkeypatch)
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9901", turn="borges", participants="[borges, ariadne]", phase="fairy",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-9901", done=done, reason="r")
+        _baton.cmd_release(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["phase"] == "fairy"  # existing value wins; NOT "claimed"
+        assert body["transition_phase"] == expected
+
+    def test_flip_fairy_to_peer_legacy_converts_from_fairy(self, monkeypatch):
+        _r4_keep_sentinel_resolvable(monkeypatch)
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9910", github="pr/engram-agents/engram-paper/9910",
+                turn="borges", participants="[borges, ariadne, sol]", colleague="sol",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-9910", to="sol", reason="review", force=False)
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["phase"] == "fairy"
+        assert body["transition_phase"] == "peer"
+
+    def test_flip_fairy_to_peer_explicit_fairy_phase_is_sent_as_is(self, monkeypatch):
+        _r4_keep_sentinel_resolvable(monkeypatch)
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9911", github="pr/engram-agents/engram-paper/9911",
+                turn="borges", participants="[borges, ariadne, sol]", colleague="sol",
+                phase="fairy",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-9911", to="sol", reason="review", force=False)
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["phase"] == "fairy"
+        assert body["transition_phase"] == "peer"
+
+    def test_flip_to_merge_seat_legacy_converts_from_peer(self, monkeypatch):
+        body = TestRound4TransitionsSendBothPhaseFields()._flip_to_merge_body(
+            monkeypatch, "PR-9920",
+        )
+        assert body["phase"] == "peer"
+        assert body["transition_phase"] == "merge"
+
+    def test_flip_to_merge_seat_explicit_phase_still_wins_over_the_fallback(self, monkeypatch):
+        body = TestRound4TransitionsSendBothPhaseFields()._flip_to_merge_body(
+            monkeypatch, "PR-9921", phase="fairy",
+        )
+        assert body["phase"] == "fairy"  # existing value wins; NOT "peer"
+        assert body["transition_phase"] == "merge"
+
+    def test_claim_legacy_still_converts_from_pool(self, monkeypatch):
+        """Unchanged: claim's pre-state is the pool sentinel resolution."""
+        _r4_keep_sentinel_resolvable(monkeypatch)
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "pool-9930", turn="casey", participants="[borges, ariadne]",
+            )},
+        )
+        _baton.cmd_claim(argparse.Namespace(project_id="pool-9930"), MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["phase"] == "pool"
+        assert body["transition_phase"] == "claimed"
+
+    def test_conversion_only_flip_on_legacy_baton_is_unchanged(self, monkeypatch):
+        """Return-to-author on a legacy baton stays conversion-only with NO
+        invented pre-state: `phase` None, no transition."""
+        _r4_keep_sentinel_resolvable(monkeypatch)
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9940", github="pr/engram-agents/engram-paper/9940",
+                turn="ariadne", participants="[clio, ariadne]",
+                colleague="ariadne", author="clio",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-9940", to="clio", reason="blocker", force=False)
+        _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+        _, body = client.post.call_args[0]
+        assert body["phase"] is None
+        assert body["transition_phase"] is None
+
+
+class TestRound5LegacyConversionEndToEnd:
+    """CLI -> REAL server -> REAL write-body -> turn LOG, on LEGACY batons
+    whose turn is the realistic non-sentinel holder/author."""
+
+    _seed = staticmethod(TestRound4ConversionThenTransitionEndToEnd._seed)
+    _phase_lines = staticmethod(TestRound4ConversionThenTransitionEndToEnd._phase_lines)
+
+    @pytest.mark.parametrize("done,expected", [(False, "pool"), (True, "done")])
+    def test_legacy_release_logs_claimed_conversion_then_transition(
+        self, tmp_path, monkeypatch, done, expected,
+    ):
+        client = _real_forum_client(tmp_path)
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
+        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        pid = "pool-9950"
+        self._seed(client, pid, _make_raw_baton(
+            pid, turn="borges", participants="[borges, ariadne]",
+        ))
+
+        _baton.cmd_release(
+            argparse.Namespace(project_id=pid, done=done, reason="r"), config, "borges", client,
+        )
+
+        lines, raw = self._phase_lines(client, pid)
+        assert len(lines) == 2, lines
+        assert "phase stamped: 'claimed' (legacy conversion" in lines[0]
+        assert f"phase: '{expected}' (transition)" in lines[1]
+        fields, _ = _baton._parse_frontmatter(raw)
+        assert fields["phase"] == expected
+
+    def test_explicit_phase_release_logs_only_the_transition(self, tmp_path, monkeypatch):
+        client = _real_forum_client(tmp_path)
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
+        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        pid = "pool-9951"
+        self._seed(client, pid, _make_raw_baton(
+            pid, turn="borges", participants="[borges, ariadne]", phase="claimed",
+        ))
+
+        _baton.cmd_release(
+            argparse.Namespace(project_id=pid, done=False, reason="r"), config, "borges", client,
+        )
+
+        lines, _ = self._phase_lines(client, pid)
+        assert len(lines) == 1, lines
+        assert "phase: 'pool' (transition)" in lines[0]
+
+    def test_legacy_flip_fairy_to_peer_logs_fairy_conversion_then_transition(
+        self, tmp_path, monkeypatch,
+    ):
+        client = _real_forum_client(tmp_path)
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
+        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        monkeypatch.setenv("BATON_POOL_SENTINEL", "lei shi")
+        pid = "PR-9952"
+        self._seed(client, pid, _make_raw_baton(
+            pid, github="pr/engram-agents/engram-paper/9952",
+            turn="borges", participants="[borges, ariadne, sol]", colleague="sol",
+        ))
+
+        _baton.cmd_flip(
+            argparse.Namespace(project_id=pid, to="sol", reason="review", force=False),
+            config, "borges", client,
+        )
+
+        lines, raw = self._phase_lines(client, pid)
+        assert len(lines) == 2, lines
+        assert "phase stamped: 'fairy' (legacy conversion" in lines[0]
+        assert "phase: 'peer' (transition)" in lines[1]
+        fields, _ = _baton._parse_frontmatter(raw)
+        assert fields["phase"] == "peer"
+
+    def test_explicit_phase_flip_fairy_to_peer_logs_only_the_transition(
+        self, tmp_path, monkeypatch,
+    ):
+        client = _real_forum_client(tmp_path)
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
+        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        monkeypatch.setenv("BATON_POOL_SENTINEL", "lei shi")
+        pid = "PR-9953"
+        self._seed(client, pid, _make_raw_baton(
+            pid, github="pr/engram-agents/engram-paper/9953",
+            turn="borges", participants="[borges, ariadne, sol]", colleague="sol",
+            phase="fairy",
+        ))
+
+        _baton.cmd_flip(
+            argparse.Namespace(project_id=pid, to="sol", reason="review", force=False),
+            config, "borges", client,
+        )
+
+        lines, _ = self._phase_lines(client, pid)
+        assert len(lines) == 1, lines
+        assert "phase: 'peer' (transition)" in lines[0]
+
+    def test_legacy_flip_to_merge_seat_logs_peer_conversion_then_transition(
+        self, tmp_path, monkeypatch,
+    ):
+        client = _real_forum_client(tmp_path)
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("green", "mergeStateStatus=CLEAN"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr, repo=None: ("fresh", "approved at current tip"))
+        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        monkeypatch.setenv("BATON_POOL_SENTINEL", "lei shi")
+        # The SERVER mirrors cmd_flip's gate on a maintainer-role flip, through
+        # its own loaded copy of baton_gate -- green-light that copy too.
+        import forum.server as _forum_server
+        _gate = _forum_server._load_baton_gate()
+        monkeypatch.setattr(_gate, "_pr_ci_state", lambda pr, repo=None: ("green", "mergeStateStatus=CLEAN"))
+        monkeypatch.setattr(_gate, "_pr_approval_state", lambda pr, repo=None: ("fresh", "approved at current tip"))
+        pid = "PR-9954"
+        self._seed(client, pid, _make_raw_baton(
+            pid, github="pr/engram-agents/engram-paper/9954",
+            turn="borges", participants="[borges, ariadne]",
+        ))
+
+        _baton.cmd_flip(
+            argparse.Namespace(project_id=pid, to="lei shi", reason="ready", force=False),
+            config, "borges", client,
+        )
+
+        lines, raw = self._phase_lines(client, pid)
+        assert len(lines) == 2, lines
+        assert "phase stamped: 'peer' (legacy conversion" in lines[0]
+        assert "phase: 'merge' (transition)" in lines[1]
+        fields, _ = _baton._parse_frontmatter(raw)
+        assert fields["phase"] == "merge"
