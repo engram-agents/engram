@@ -202,13 +202,36 @@ class TestSentinelPredicateParity:
             baton_gate, "_resolve_pool_sentinel", lambda *a, **kw: sentinel_value
         )
 
-    def test_is_pool_sentinel_parity(self, monkeypatch):
+    # #3039 U1: _is_pool_sentinel() was renamed to the fallback-only
+    # _is_legacy_pool_sentinel() and is no longer the primary read path in
+    # either module -- _resolve_phase() is. This replaces the deleted
+    # test_is_pool_sentinel_parity with the equivalent pinning test for the
+    # new primary predicate, same (fields, is_bunch) shape adapted from the
+    # old (name) shape.
+    PHASE_FIELDS_CASES = (
+        {},
+        {"turn": ""},
+        {"turn": "ariadne"},
+        {"turn": "casey"},
+        {"turn": "lei"},
+        {"turn": "unknown-agent"},
+        {"phase": "pool"},
+        {"phase": "merge"},
+        {"phase": "merge", "turn": "casey"},
+        {"phase": "  Pool  ", "turn": "unknown-agent"},
+    )
+
+    def test_resolve_phase_parity(self, monkeypatch):
         for sentinel_value in self.SENTINEL_VALUES:
             self._pin_both(monkeypatch, sentinel_value)
-            for name in self.NAMES:
-                assert _baton._is_pool_sentinel(name) == baton_gate._is_pool_sentinel(name), (
-                    f"parity break: sentinel={sentinel_value!r} name={name!r}"
-                )
+            for fields in self.PHASE_FIELDS_CASES:
+                for is_bunch in (True, False):
+                    old = _baton._resolve_phase(dict(fields), is_bunch=is_bunch)
+                    new = baton_gate._resolve_phase(dict(fields), is_bunch=is_bunch)
+                    assert old == new, (
+                        f"parity break: sentinel={sentinel_value!r} fields={fields!r} "
+                        f"is_bunch={is_bunch!r} -- tools.baton={old!r} baton_gate={new!r}"
+                    )
 
     def test_is_maintainer_flip_parity(self, monkeypatch):
         for sentinel_value in self.SENTINEL_VALUES:
@@ -243,6 +266,10 @@ class TestSentinelPredicateParity:
             ),
         )
         with pytest.raises(baton_gate.PoolSentinelUnresolved):
-            baton_gate._is_pool_sentinel("anyone")
+            baton_gate._is_legacy_pool_sentinel("anyone")
         with pytest.raises(baton_gate.PoolSentinelUnresolved):
             baton_gate._is_maintainer_flip("anyone", "someone", "colleague")
+        # _resolve_phase reaches the same raise via its legacy-fallback
+        # branch, once no explicit `phase:` field short-circuits it.
+        with pytest.raises(baton_gate.PoolSentinelUnresolved):
+            baton_gate._resolve_phase({"turn": "anyone"}, is_bunch=True)

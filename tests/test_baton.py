@@ -1302,30 +1302,38 @@ class TestClaim:
     """baton claim: happy path, state-guard refusals, and audit-line tests."""
 
     def test_claim_happy_path(self, monkeypatch):
-        """Claim posts to the claim route with agent=borges and pool_sentinel=casey."""
+        """Claim posts to the claim route with agent=borges and pool_sentinel=casey.
+
+        Project ID is bunch-shaped ("pool-1001"), not PR-shaped, matching
+        cmd_claim's own contract (a Project-layer/bunch verb -- see its
+        docstring) and #3039 U1's cmd_claim gate, which now resolves phase
+        via is_bunch derived from project_id shape: a PR-shaped id at the
+        legacy sentinel resolves to phase "merge" (not "pool") and would be
+        refused here, same as any other baton this verb was never meant to
+        claim."""
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
-        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda n: n == "casey")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n == "casey")
 
         client = _make_client(
             post_return={"seq": 1},
             get_return={"raw": _make_raw_baton(
-                "PR-1001", title="pool project", turn="casey",
+                "pool-1001", title="pool project", turn="casey",
                 participants="[borges, ariadne]", turn_reason="released",
             )},
         )
-        args = argparse.Namespace(project_id="PR-1001")
+        args = argparse.Namespace(project_id="pool-1001")
         _baton.cmd_claim(args, MULTI_CONFIG, "borges", client)
 
         client.post.assert_called_once()
         url, body = client.post.call_args[0]
-        assert url == "/api/projects/PR-1001/claim"
+        assert url == "/api/projects/pool-1001/claim"
         assert body["agent"] == "borges"
         assert body["pool_sentinel"] == "casey"
 
     def test_claim_refuse_already_claimed_by_other(self, monkeypatch, capsys):
         """Claim when project held by another agent → EXIT_STATE with clear message."""
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
-        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda n: n == "casey")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n == "casey")
 
         client = _make_client(
             get_return={"raw": _make_raw_baton(
@@ -1355,7 +1363,7 @@ class TestClaim:
         behavior (still refuses, still EXIT_STATE) is unchanged and is
         covered by test_claim_refuse_already_claimed_by_other above."""
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
-        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda n: n == "casey")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n == "casey")
 
         client = _make_client(
             get_return={"raw": _make_raw_baton(
@@ -2244,15 +2252,20 @@ class TestClaim:
         )
 
     def test_claim_refuse_invoker_not_in_participants(self, monkeypatch, capsys):
-        """Claim when invoker not in participants → EXIT_VALIDATION."""
-        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda n: n == "casey")
+        """Claim when invoker not in participants → EXIT_VALIDATION.
+
+        Bunch-shaped project ID ("pool-1003") -- see test_claim_happy_path's
+        docstring above for why: a PR-shaped ID here would resolve phase
+        "merge" (not "pool") and refuse at the phase gate before ever
+        reaching the participant check this test exercises."""
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n == "casey")
 
         client = _make_client(
             get_return={"raw": _make_raw_baton(
-                "PR-1003", turn="casey", participants="[ariadne, mneme]",
+                "pool-1003", turn="casey", participants="[ariadne, mneme]",
             )},
         )
-        args = argparse.Namespace(project_id="PR-1003")
+        args = argparse.Namespace(project_id="pool-1003")
 
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_claim(args, MULTI_CONFIG, "borges", client)
@@ -2262,27 +2275,30 @@ class TestClaim:
 
     def test_claim_refusal_non_participant_names_remedy(self, monkeypatch, capsys):
         """C1 (#2901 fold): a non-participant claimant is told to ask a
-        participant, with a real, parseable add-participant command."""
+        participant, with a real, parseable add-participant command.
+
+        Bunch-shaped project ID ("pool-1003") -- see test_claim_happy_path's
+        docstring above for why."""
         import shlex
 
-        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda n: n == "casey")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n == "casey")
         client = _make_client(
             get_return={"raw": _make_raw_baton(
-                "PR-1003", turn="casey", participants="[ariadne, mneme]",
+                "pool-1003", turn="casey", participants="[ariadne, mneme]",
             )},
         )
-        args = argparse.Namespace(project_id="PR-1003")
+        args = argparse.Namespace(project_id="pool-1003")
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_claim(args, MULTI_CONFIG, "borges", client)
         assert exc_info.value.code == EXIT_VALIDATION
         err = capsys.readouterr().err
-        assert "ask a participant of PR-1003 to run:" in err
+        assert "ask a participant of pool-1003 to run:" in err
         cmd_lines = [ln.strip() for ln in err.splitlines()
                      if ln.strip().startswith("baton add-participant")]
         assert len(cmd_lines) == 1
         parsed = _baton.build_parser().parse_args(shlex.split(cmd_lines[0])[1:])
         assert parsed.subcommand == "add-participant"
-        assert parsed.project_id == "PR-1003"
+        assert parsed.project_id == "pool-1003"
         assert parsed.participant == "borges"
 
     def test_claim_refuse_missing_project(self, capsys):
@@ -2296,6 +2312,240 @@ class TestClaim:
         assert exc_info.value.code == EXIT_VALIDATION
         captured = capsys.readouterr()
         assert "not found" in captured.err.lower()
+
+    def test_claim_refuse_pr_shaped_id_at_legacy_sentinel(self, monkeypatch, capsys):
+        """#3039 U1 integration case, end-to-end through cmd_claim (not just
+        _resolve_phase in isolation): a PR-shaped project_id whose turn
+        matches the legacy sentinel resolves to phase "merge" (is_bunch is
+        derived False from the "PR-" prefix), not "pool" -- so cmd_claim
+        refuses it exactly as it would any other non-pool baton, even
+        though the OLD _is_pool_sentinel(turn) check alone would have
+        allowed it through. This is the behavioral consequence of moving
+        cmd_claim's gate from a bare sentinel string-match to
+        _resolve_phase(fields, is_bunch=...): the SAME turn value now reads
+        differently depending on what kind of baton it's parked on, per
+        the design note's "the sentinel is doing two jobs" (§1)."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n == "casey")
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-1005", turn="casey", participants="[borges, ariadne]",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-1005")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_claim(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_STATE
+        client.post.assert_not_called()
+
+    def test_claim_refuse_prefixed_pr_shaped_id_at_legacy_sentinel(self, monkeypatch, capsys):
+        """#3039 U1 round-2 (Borges colleague review, PR #3243, blocker 1):
+        a PREFIXED PR-shaped project_id (e.g. "UMWELT-PR-775") must resolve
+        is_bunch False -- same "merge", not "pool", refusal as a bare
+        "PR-N" id in test_claim_refuse_pr_shaped_id_at_legacy_sentinel above
+        -- via the id-shape branch of the wider _is_pr_baton() check that
+        replaces the narrow ^(?:PR-|pr-)(\\d+)$ regex, which only recognized
+        bare PR-N ids and misclassified 315 live prefixed PR batons
+        (Borges's live-store measurement) as bunches."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n == "casey")
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "UMWELT-PR-775", turn="casey", participants="[borges, ariadne]",
+            )},
+        )
+        args = argparse.Namespace(project_id="UMWELT-PR-775")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_claim(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_STATE
+        client.post.assert_not_called()
+
+    def test_claim_refuse_pr_anchor_odd_named_id_at_legacy_sentinel(self, monkeypatch, capsys):
+        """#3039 U1 round-2 (Borges colleague review, PR #3243, blocker 1):
+        an odd-named project_id that does NOT match either PR id-shape
+        (e.g. "PR-100-paper" -- not a bare "PR-N" and not "...-PR-N") but
+        carries a `github: pr/...` anchor must still resolve is_bunch
+        False -- via the github-anchor branch of _is_pr_baton() (the OTHER
+        of its two independent signals), not the id-shape branch exercised
+        by test_claim_refuse_prefixed_pr_shaped_id_at_legacy_sentinel
+        above."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n == "casey")
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-100-paper", turn="casey", participants="[borges, ariadne]",
+                github="pr/100",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-100-paper")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_claim(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_STATE
+        client.post.assert_not_called()
+
+    def test_claim_refuse_unanchored_pr_n_suffix_id_at_legacy_sentinel(self, monkeypatch, capsys):
+        """#3039 U1 round-2 (Borges re-review, PR #3243): an UNANCHORED
+        "PR-92-paper"-shaped project_id (no `github:` field at all) must
+        still resolve is_bunch False -- via the id-shape branch of
+        _is_pr_baton(), now reusing _PR_BATON_NAME_RE (the same prefix-only
+        pattern cmd_gc already uses) instead of the separately-written
+        `re.search(r"(?i)(?:^|-)pr-\\d+$", project_id)` it replaces. This is
+        the discriminating case: the withdrawn regex required digits at the
+        END of the id (bare "PR-N" or "...-PR-N$"), so it does NOT match
+        "PR-92-paper" (digits aren't at the end, and there's no anchor to
+        fall back on here) -- it would have resolved is_bunch True and let
+        cmd_claim treat this as a bunch. _PR_BATON_NAME_RE, by contrast, is
+        prefix-only ("^(?:[A-Z][A-Z0-9]*-)?PR-") and matches "PR-92-paper"
+        regardless of what follows "PR-"."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n == "casey")
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-92-paper", turn="casey", participants="[borges, ariadne]",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-92-paper")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_claim(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_STATE
+        client.post.assert_not_called()
+
+    def test_claim_allow_project_anchored_pool_pr_shaped_id_at_legacy_sentinel(self, monkeypatch):
+        """Kepler's #3243 merge-seat conformance check, defect 1: a
+        `project/`-anchored bunch baton whose id happens to be PR-shaped
+        ("pool-pr-discipline") must still resolve is_bunch True and be
+        claimable -- an anchor decides when there is one (`project/` is a
+        bunch, whatever the name contains); the name is consulted only for
+        an UNANCHORED baton. Measured on the live shared store (Kepler,
+        2026-09-30): the shipped `_is_pr_baton` (name-shape-first, via
+        `.upper()` against `_PR_BATON_NAME_RE`) misclassifies this exact
+        real baton (anchor `project/11`) as a PR baton, so `dev`'s
+        `cmd_claim` wrongly refuses a genuinely-claimable bunch."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n == "casey")
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "pool-pr-discipline", turn="casey",
+                participants="[borges, ariadne]", github="project/11",
+            )},
+        )
+        args = argparse.Namespace(project_id="pool-pr-discipline")
+        _baton.cmd_claim(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/pool-pr-discipline/claim"
+        assert body["agent"] == "borges"
+        assert body["pool_sentinel"] == "casey"
+
+    def test_claim_allow_unanchored_pool_pr_shaped_id_at_legacy_sentinel(self, monkeypatch):
+        """Kepler's #3243 merge-seat conformance check, defect 1 (sibling
+        case): an UNANCHORED bunch baton whose id is PR-shaped
+        ("pool-pr-followups", no `github:` field at all) must also resolve
+        is_bunch True -- for an unanchored baton, a bunch-naming-convention
+        id ("pool-...") is a bunch whatever else its name contains.
+        Measured on the live shared store (Kepler, 2026-09-30): the shipped
+        `_is_pr_baton` misclassifies this exact real baton
+        (`pool-pr-followups.md`, no anchor) as a PR baton, so `dev`'s
+        `cmd_claim` wrongly refuses it while the seat's own legacy sentinel
+        check alone would have allowed it."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n == "casey")
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "pool-pr-followups", turn="casey",
+                participants="[borges, ariadne]",
+            )},
+        )
+        args = argparse.Namespace(project_id="pool-pr-followups")
+        _baton.cmd_claim(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/pool-pr-followups/claim"
+        assert body["agent"] == "borges"
+        assert body["pool_sentinel"] == "casey"
+
+    def test_claim_allow_project_anchored_pr_shaped_name_at_legacy_sentinel(self, monkeypatch):
+        """Borges's re-review of PR #3243 (2026-09-30, `42dbfdb4`): the
+        distinguishing case that separates anchor-first from a plausible-
+        wrong name-first `_is_pr_baton`. "ALPHA-PR-FOLLOWUPS" is
+        `project/`-anchored (a genuine bunch) but its id, unlike
+        "pool-pr-discipline"/"pool-pr-followups" above, does NOT start with
+        "pool-" AND does match `_PR_BATON_NAME_RE` -- so the "pool-"
+        exclusion the two tests above rely on never fires here, and this
+        case alone separates the two orderings. Under the SHIPPED
+        anchor-first code, `_parse_github_anchor("project/12")` parses
+        immediately as `("project", None, "12")`, so the anchor decides
+        before the name is ever consulted -- a bunch, is_bunch True,
+        claimable. Under a decoy that decides by name FIRST (`_PR_BATON_
+        NAME_RE.match("ALPHA-PR-FOLLOWUPS")` matches "PR-" after the
+        "ALPHA-" type-prefix), the decoy says PR and refuses the claim --
+        the wrong answer per Kepler's contract ("an anchor decides when
+        there is one"). Borges ran this exact decoy and confirmed it
+        passed all 294 pre-existing tests, including the two `pool-pr-*`
+        allow-tests above -- neither of which distinguishes the two
+        orderings, because the "pool-" exclusion catches both of their
+        cases before the anchor is ever consulted under either ordering."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n == "casey")
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "ALPHA-PR-FOLLOWUPS", turn="casey",
+                participants="[borges, ariadne]", github="project/12",
+            )},
+        )
+        args = argparse.Namespace(project_id="ALPHA-PR-FOLLOWUPS")
+        _baton.cmd_claim(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/ALPHA-PR-FOLLOWUPS/claim"
+        assert body["agent"] == "borges"
+        assert body["pool_sentinel"] == "casey"
+
+    def test_claim_pr_shaped_refusal_names_phase_not_indeterminacy(self, monkeypatch, capsys):
+        """Kepler's #3243 merge-seat conformance check, defect 2: a refused
+        PR-shaped baton (phase resolves "merge" via the legacy fallback --
+        a REAL resolved phase, not genuine indeterminacy) must get a SHORT
+        refusal naming the phase and saying claim only takes 'pool' -- not
+        the long #3040 indeterminacy text, which is reserved for the
+        genuinely-indeterminate case (_resolve_phase returns an empty
+        phase). Nothing pinned this refusal-message TEXT before this test
+        (Kepler's review: "nothing pins this text")."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n == "casey")
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-1005", turn="casey", participants="[borges, ariadne]",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-1005")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_claim(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_STATE
+        captured = capsys.readouterr()
+        assert "is at phase 'merge', not 'pool'" in captured.err
+        assert "claim only takes a baton whose phase is 'pool'" in captured.err
+        assert "does not recognize as its pool marker" not in captured.err
+        assert "cannot tell from the turn log" not in captured.err
+        client.post.assert_not_called()
 
 
 # ===========================================================================
@@ -2871,7 +3121,7 @@ class TestPoolSentinel:
         # module-level constant.  Use setenv (not setattr) to redirect the config read.
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
-        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda n: n in ("alice",))
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n in ("alice",))
 
         client = _make_client(
             post_return={"seq": 1},
@@ -2917,7 +3167,7 @@ class TestPoolSentinel:
         _write_config(engram_home, agent_name="borges", primary_user="Alice")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
-        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda n: n in ("alice",))
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda n: n in ("alice",))
 
         client = _make_client(
             post_return={"seq": 1},
@@ -5573,3 +5823,138 @@ class TestApprovalStateParsing:
         with _mock.patch("subprocess.run", return_value=mock_result):
             state, detail = baton._pr_approval_state("123", repo=self.REPO)
         assert state == "no_approval"
+
+
+# ===========================================================================
+# CATEGORY 17: _resolve_phase -- phase resolution (engram-alpha#3039 U1)
+# ===========================================================================
+#
+# Kepler's ruling on #3039 states two obligations this category exists to
+# pin:
+#   1. A regression test that the pool/phase predicate's answer does NOT
+#      move when primary_user changes, once an explicit `phase:` field is
+#      present (the defect #3039 is about -- the OLD bare sentinel
+#      comparison's answer moved with the reading seat's own config.json).
+#   2. A legacy baton (no `phase:` field) reads as the right phase (`merge`
+#      on a PR baton, `pool` on a bunch baton), converts on its next
+#      transition (U2's job -- out of scope here, so untested), and the
+#      accept-both path logs that it took the legacy path.
+#
+# See docs/design/3039-baton-phase-turn.md for the full design (the two-tier
+# resolution: explicit `phase:` wins outright and is seat-independent; no
+# explicit field falls back to the pre-#3039 turn==pool-sentinel comparison,
+# seat-DEPENDENT, logged when it fires).
+
+class TestResolvePhase:
+    """_baton._resolve_phase(fields, *, is_bunch) -> (phase, used_legacy_fallback)."""
+
+    # Matches TestSentinelPredicateParity's style (tests/test_baton_gate.py)
+    # of varying the resolved sentinel across several seat configs.
+    SENTINEL_VALUES = ("casey", "lei shi", "lin")
+
+    def test_explicit_phase_does_not_move_with_primary_user(self, monkeypatch):
+        """Obligation 1: with an explicit `phase: "pool"` field already set,
+        the resolved phase stays "pool" regardless of what primary_user the
+        reading seat's config resolves to -- the explicit-phase branch
+        never even consults the sentinel. This is the property that did
+        NOT hold before #3039 U1 (the old bare _is_pool_sentinel(turn)
+        comparison's answer moved with the reading seat's own
+        primary_user) and must hold after."""
+        fields = {"phase": "pool", "turn": "borges"}
+        for sentinel_value in self.SENTINEL_VALUES:
+            monkeypatch.setattr(_baton, "_pool_sentinel", lambda sv=sentinel_value: sv)
+            phase, used_legacy = _baton._resolve_phase(fields, is_bunch=True)
+            assert phase == "pool", (
+                f"explicit phase moved under primary_user={sentinel_value!r} "
+                f"-- got {phase!r}"
+            )
+            assert used_legacy is False
+
+    def test_explicit_phase_wins_even_when_turn_would_match_legacy_sentinel(
+        self, monkeypatch,
+    ):
+        """The explicit-phase branch short-circuits before the legacy
+        comparison is even attempted: an explicit phase of "merge" wins
+        even when `turn` happens to equal this seat's own pool sentinel
+        (which would resolve to "pool" under the legacy fallback for a
+        bunch baton -- a different answer), proving the explicit field is
+        read first, unconditionally."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        fields = {"phase": "merge", "turn": "casey"}
+        phase, used_legacy = _baton._resolve_phase(fields, is_bunch=True)
+        assert phase == "merge"
+        assert used_legacy is False
+
+    def test_legacy_fallback_pr_shaped_resolves_merge_and_logs(
+        self, monkeypatch, capsys,
+    ):
+        """Obligation 2(a)+(b), PR-shaped (is_bunch=False): no explicit
+        `phase:` field, turn matches this seat's legacy pool sentinel ->
+        resolves to "merge" (presented for merge), and the accept-both
+        path logs that the legacy fallback fired."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        fields = {"turn": "casey"}
+        phase, used_legacy = _baton._resolve_phase(fields, is_bunch=False)
+        assert phase == "merge"
+        assert used_legacy is True
+        captured = capsys.readouterr()
+        assert "legacy" in captured.err.lower()
+
+    def test_legacy_fallback_bunch_shaped_resolves_pool_and_logs(
+        self, monkeypatch, capsys,
+    ):
+        """Obligation 2(a)+(b), bunch-shaped (is_bunch=True): the identical
+        legacy baton as the PR-shaped case above resolves to "pool" (free
+        to claim) instead of "merge" -- same sentinel value, two different
+        meanings depending on baton type (design note §1: "the sentinel is
+        doing two jobs") -- and logs the same way."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        fields = {"turn": "casey"}
+        phase, used_legacy = _baton._resolve_phase(fields, is_bunch=True)
+        assert phase == "pool"
+        assert used_legacy is True
+        captured = capsys.readouterr()
+        assert "legacy" in captured.err.lower()
+
+    def test_legacy_fallback_non_matching_turn_resolves_unresolved(
+        self, monkeypatch, capsys,
+    ):
+        """No explicit phase, and turn does not match this seat's legacy
+        sentinel -> unresolved ("", False), not an error and not a guess --
+        and nothing is logged, since the legacy path never fired."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        fields = {"turn": "ariadne"}
+        phase, used_legacy = _baton._resolve_phase(fields, is_bunch=True)
+        assert phase == ""
+        assert used_legacy is False
+        captured = capsys.readouterr()
+        assert captured.err == ""
+
+    def test_legacy_fallback_accepts_short_form_sentinel_token(
+        self, monkeypatch, capsys,
+    ):
+        """The legacy fallback still accepts the sentinel's first token
+        (issue #1309's short-form rule, preserved verbatim in
+        _is_legacy_pool_sentinel)."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "alex chen")
+        fields = {"turn": "alex"}
+        phase, used_legacy = _baton._resolve_phase(fields, is_bunch=False)
+        assert phase == "merge"
+        assert used_legacy is True
+
+    def test_missing_phase_field_and_missing_turn_field_resolves_unresolved(self, monkeypatch):
+        """Neither `phase:` nor `turn:` present at all (not just empty) --
+        .get() defaults apply cleanly, no KeyError, unresolved result."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        phase, used_legacy = _baton._resolve_phase({}, is_bunch=True)
+        assert phase == ""
+        assert used_legacy is False
+
+    def test_phase_field_is_case_and_whitespace_normalized(self, monkeypatch):
+        """An explicit phase field is read with the same
+        .strip().lower() normalization as every other frontmatter field
+        this file reads (turn, colleague, author, ...)."""
+        fields = {"phase": "  POOL  "}
+        phase, used_legacy = _baton._resolve_phase(fields, is_bunch=True)
+        assert phase == "pool"
+        assert used_legacy is False

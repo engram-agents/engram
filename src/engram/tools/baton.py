@@ -394,7 +394,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         initial_turn = participants[0]
 
     # Validate initial turn
-    if not _is_pool_sentinel(initial_turn) and initial_turn not in participants:
+    if not _is_legacy_pool_sentinel(initial_turn) and initial_turn not in participants:
         print(
             f"baton init: turn '{initial_turn}' must be in participants "
             f"{participants} or the pool sentinel ({_pool_sentinel()!r}).",
@@ -586,8 +586,8 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     # participants (participants ⊆ {initial turn holder, sentinel}), warn at
     # creation time
     # so the gap surfaces here rather than silently at flip.
-    _is_pr_baton = re.match(r"^(?:PR-|pr-)(\d+)$", project_id)
-    if _is_pr_baton:
+    _is_bare_pr_id = re.match(r"^(?:PR-|pr-)(\d+)$", project_id)
+    if _is_bare_pr_id:
         _sentinel = _pool_sentinel()
         # Colleague candidates: participants other than the initial turn
         # holder and the pool sentinel. (This is about the COLLEAGUE gate --
@@ -643,7 +643,7 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     participants_str = fields.get("participants", "").strip()
     participants = _parse_participants(participants_str) if participants_str else []
 
-    if not _is_pool_sentinel(to_agent) and to_agent not in participants:
+    if not _is_legacy_pool_sentinel(to_agent) and to_agent not in participants:
         # add-participant is server-gated to existing participants, so the
         # remedy line depends on whether THIS invoker is one.
         if (agent_name or "").strip().lower() in participants:
@@ -918,11 +918,25 @@ def _pool_sentinel() -> str:
     sys.exit(EXIT_VALIDATION)
 
 
-def _is_pool_sentinel(name: str) -> bool:
-    """Return True if name (already stripped/lowercased) matches the pool sentinel.
+def _is_legacy_pool_sentinel(name: str) -> bool:
+    """Legacy fallback only -- see _resolve_phase. Exactly today's (pre-#3039)
+    _is_pool_sentinel(): compares against THIS SEAT's own config.json
+    primary_user, seat-DEPENDENT by construction -- that dependency is
+    exactly the #3039 defect when used as a primary decision mechanism,
+    which is why _resolve_phase() only reaches this as a fallback once no
+    explicit `phase:` field is present.
 
     Accepts both the full sentinel ("lei shi") and its first token ("lei") so
     pools initialized with a short-form turn value work correctly (issue #1309).
+
+    Renamed from _is_pool_sentinel() by #3039 U1. A handful of pre-existing
+    call sites (cmd_init's initial-turn validation, cmd_flip's to_agent
+    validation, _is_maintainer_flip's sentinel check below) still call this
+    directly rather than through _resolve_phase() -- migrating those to a
+    phase-aware check is out of U1's scope (per Kepler's unit cut on #3039:
+    U2 is "one verb per phase advance", which is where cmd_flip and
+    _is_maintainer_flip's phase-edge rework belongs); they are mechanical
+    renames only, identical behavior to before this unit.
     """
     sentinel = _pool_sentinel()  # e.g. "lei shi"
     if name == sentinel:
@@ -930,6 +944,48 @@ def _is_pool_sentinel(name: str) -> bool:
     # Also accept the first whitespace-token of the sentinel ("lei" from "lei shi").
     first_token = sentinel.split()[0] if sentinel else ""
     return bool(first_token) and name == first_token
+
+
+def _resolve_phase(fields: dict, *, is_bunch: bool) -> tuple[str, bool]:
+    """Resolve a baton's current phase from its frontmatter fields.
+
+    Returns (phase, used_legacy_fallback).
+
+    Two-tier resolution (engram-alpha#3039, U1 -- read side only; nothing
+    writes an explicit `phase:` field yet, that is U2's job, so for U1
+    EVERY existing baton is "legacy" by definition):
+
+      1. An explicit `phase:` field, if present -- read verbatim. This is
+         seat-INDEPENDENT: no comparison against this install's own
+         config.json primary_user, so the answer cannot move when
+         primary_user changes. This is the property #3039 is about.
+      2. No explicit `phase:` field -- LEGACY FALLBACK: derive from the old
+         turn == pool-sentinel comparison (_is_legacy_pool_sentinel, exactly
+         today's pre-#3039 _is_pool_sentinel(), seat-DEPENDENT), and log
+         that the legacy path fired so the transition window (design note
+         docs/design/3039-baton-phase-turn.md §7) can be watched and
+         eventually retired. A bunch baton at the sentinel resolves to
+         "pool" (free to claim); a PR baton at the sentinel resolves to
+         "merge" (presented for merge) -- same sentinel value, two
+         different meanings, per the design note §1's "the sentinel is
+         doing two jobs."
+    """
+    explicit = fields.get("phase", "").strip().lower()
+    if explicit:
+        return explicit, False
+    turn = fields.get("turn", "").strip().lower()
+    if _is_legacy_pool_sentinel(turn):
+        phase = "pool" if is_bunch else "merge"
+        print(
+            f"baton: legacy phase fallback -- no explicit 'phase:' field; "
+            f"turn={turn!r} matches this seat's legacy pool sentinel, so "
+            f"phase resolves to {phase!r} via the pre-#3039 turn-vs-sentinel "
+            "comparison -- until #3039 U2 lands, no transition writes an "
+            "explicit phase.",
+            file=sys.stderr,
+        )
+        return phase, True
+    return "", False
 
 
 def _is_maintainer_flip(
@@ -948,7 +1004,7 @@ def _is_maintainer_flip(
 
     Fires on:
       - the literal pool sentinel (the single-human-owner convention
-        `_is_pool_sentinel` already recognizes), OR
+        `_is_legacy_pool_sentinel` already recognizes), OR
       - any OTHER agent — this repo's actual convention is to flip to a
         NAMED maintainer agent (e.g. "ariadne", "borges"), not the literal
         sentinel — PROVIDED it is not a self-flip, not the flip TO the
@@ -977,7 +1033,7 @@ def _is_maintainer_flip(
     genuine registered participant (validated earlier in cmd_flip) — this
     function does not re-validate participant membership.
     """
-    if _is_pool_sentinel(to_agent):
+    if _is_legacy_pool_sentinel(to_agent):
         return True
     if to_agent == current_holder:
         return False
@@ -986,6 +1042,68 @@ def _is_maintainer_flip(
     if author and to_agent == author:
         return False
     return True
+
+
+def _is_pr_baton(project_id: str, fields: dict) -> bool:
+    """True if this baton is a PR baton -- by github anchor, or (only when
+    unanchored) by id shape -- for _resolve_phase's is_bunch derivation
+    (engram-alpha#3039).
+
+    Anchor-first, name-only-when-unanchored (Kepler's #3243 merge-seat
+    conformance check, 2026-09-30, defect 1):
+      1. An anchor decides when there is one: parse fields["github"] via
+         _parse_github_anchor (shared with cmd_init/cmd_flip/etc. --
+         see its own docstring for the (kind, repo, number) return shape).
+         A "pr/..." anchor means this IS a PR baton; a "project/..." anchor
+         means it is NOT (a bunch), regardless of what the id looks like.
+      2. The name is consulted ONLY for an UNANCHORED baton (no github
+         field, or one that doesn't parse as a known anchor shape). For an
+         unanchored baton, a "pool-"-prefixed id is always a bunch -- the
+         bunch-naming convention this project's CLAUDE.md documents
+         ("Project-as-bunch coordination": bunch project IDs are named
+         `pool-<topic>`) -- whatever else its name contains. Otherwise fall
+         back to _PR_BATON_NAME_RE -- the same prefix-only id-shape gate
+         cmd_gc already uses -- case-insensitively via .upper(): bare
+         ("PR-3243"), prefixed ("UMWELT-PR-775", "PAPER-PR-121"), or
+         PR-N-suffixed ("PR-92-paper") -- anything starting with an
+         optional type-prefix followed by "PR-".
+
+    The PRIOR rule (name-shape-first via _PR_BATON_NAME_RE.match(id.upper()),
+    falling back to the "pr/" anchor prefix only as a second signal)
+    misclassified two real bunch batons as PR batons on the live shared
+    store: _PR_BATON_NAME_RE allows one upper-case type-prefix segment
+    before "PR-", and after .upper() "POOL-" is such a prefix, so
+    "POOL-PR-DISCIPLINE" and "POOL-PR-FOLLOWUPS" both matched. Kepler's
+    live-store re-measurement of the SHIPPED (pre-this-fix) function
+    (2026-09-30 merge-seat conformance check on PR #3243): of 12
+    project/-anchored batons, 1 misclassified as PR
+    ("pool-pr-discipline", anchor "project/11"); of 4 unanchored batons
+    that were PR-shaped only because of .upper(), 1 misclassified bunch
+    ("pool-pr-followups", no anchor) alongside 3 genuinely-PR batons
+    correctly classified ("umwelt-PR-10", "umwelt-PR-2", "umwelt-PR-33").
+    Borges has now re-run the SHIPPED function itself against the live
+    shared store -- not a pattern typed beside it, and not taken on trust
+    this time, unlike the prior round's docstring, which attributed his
+    count without independently re-running it (2026-09-30 re-review of
+    this PR at `42dbfdb4`; the store grew by one file since that prior
+    count -- 1,774, not 1,773):
+
+    |                                 | count | `_is_pr_baton` result |
+    |---------------------------------|-------|------------------------|
+    | `pr/`-anchored                  | 1,225 | all `True` |
+    | `project/`-anchored             | 12    | all `False` (includes "pool-pr-discipline") |
+    | anchor present but unparseable  | 0     | -- |
+    | unanchored                      | 537   | 482 `True`, 55 `False`; all 55 are "pool-*", "ISSUE-*", "SLICE-*", "DESIGN-*" and similar bunch/issue ids, and "pool-pr-followups" is among them |
+
+    Total 1,774. 0 anchored batons misclassified.
+    """
+    github = fields.get("github", "").strip().lower()
+    parsed = _parse_github_anchor(github) if github else None
+    if parsed is not None:
+        return parsed[0] == "pr"
+    if project_id.strip().lower().startswith("pool-"):
+        return False
+    return bool(_PR_BATON_NAME_RE.match(project_id.upper()))
 
 
 def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
@@ -1017,9 +1135,37 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str, client: F
         )
         sys.exit(EXIT_VALIDATION)
 
-    # Validate: current turn must be the pool sentinel
+    # Validate: current phase must be "pool" (#3039 U1 -- was a bare
+    # turn == pool-sentinel comparison; now routes through _resolve_phase(),
+    # which reads an explicit `phase:` field first and falls back to the
+    # legacy sentinel comparison only when none is present -- see
+    # _resolve_phase's own docstring). is_bunch is derived via _is_pr_baton
+    # (id shape OR github anchor -- see its docstring; #3039 U1 round-2,
+    # Borges colleague review PR #3243 blocker 1: the narrow bare-PR-N-only
+    # regex this replaced missed prefixed and oddly-named PR batons) to
+    # distinguish a PR baton from a bunch/Project-layer baton. cmd_claim is
+    # a Project-layer (bunch) verb by its own contract (see this function's
+    # docstring), so a PR baton resolves to phase "merge" (not "pool") here
+    # and is correctly refused below, same as before this unit for any
+    # baton that was never claimable via this verb.
     current_turn = fields.get("turn", "").strip().lower()
-    if not _is_pool_sentinel(current_turn):
+    _is_pr = _is_pr_baton(project_id, fields)
+    _phase, _ = _resolve_phase(fields, is_bunch=not _is_pr)
+    if _phase and _phase != "pool":
+        # A REAL resolved phase other than "pool" (the legacy fallback
+        # fired and turn DID match the sentinel -- see _resolve_phase's own
+        # docstring) is not indeterminate: there is nothing to hedge, so
+        # this refusal is short and names the phase directly. The long
+        # #3040 indeterminacy text below is reserved for the genuinely-
+        # indeterminate case (_resolve_phase returned an empty phase) --
+        # Kepler's #3243 merge-seat conformance check, 2026-09-30, defect 2.
+        print(
+            f"baton claim: '{project_id}' is at phase '{_phase}', not 'pool' -- "
+            f"claim only takes a baton whose phase is 'pool'.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_STATE)
+    if not _phase:
         # WHY THIS REFUSAL REPORTS INDETERMINACY RATHER THAN A VERDICT.
         # Rounds 2-4 of #3040 ended with "the baton may in fact be free"
         # whenever the scoped turn-log line was not a `claimed` one. That is
