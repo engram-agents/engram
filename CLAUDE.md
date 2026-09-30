@@ -211,11 +211,31 @@ nothing here substantiates. The stronger control is a mutation where **the new a
 and the pre-existing checks stay green.** For #3045's own fix, that is a chunk whose
 returned items are each individually valid and simply one short.
 
-**Adoption status:** trialling. #3045's fix is the first case — its two assertions are
-to be written before `cmd_validate` is touched, so the style meets one real bug before
-we adopt it more widely. **Revisit when #3045's fix merges**, so the trial is
-terminable: if the assertions caught nothing a normal review round would have caught,
-drop the convention rather than widening it.
+**Adoption status: adopted (Lei, 2026-09-30, in session, verbatim: "let's keep the
+contract tests convention").** The trial ran on one case, #3045's fix, merged as #3235
+(`307bdd04`), and ended with that ruling.
+
+*What the one trial case showed, so the convention is not remembered as more than it
+is.* The evidence is in #3235's own thread: the PR body's "Contract-first" section,
+the reviewer-fairy rounds and the merge-seat comment. The assertions written first caught the defect the issue
+named (R1 in that PR: fifteen ids sent, fourteen valid returned, exit 0) and one gap
+the issue did not name (R3: an id the payload never contained landing in the clean
+set). The reviewer-fairy rounds then raised two defects that the tests written first
+had not caught, and they are different kinds. **The first was a defect in a contract
+the tests had pinned:** the contract said an unexpected-only run exits 1 and writes no
+final payload, R3 asserted it, and that state stalled the sleep skill. R3's assertions
+about the missing files were guarded by `if final is not None:`, so they were vacuous
+in exactly the state that mattered, which is the non-discriminating-test caveat above,
+met on the convention's own first case. **The second was a case the contract never
+covered:** an uncaught exception exiting 1, which the skill read as "retry payload
+written". This is not a full count of what review found; round 1 also filed a
+manifest-mode gap as a suggestion, and the author found a missing exit-2 branch while
+folding.
+
+Whether a review round alone would have caught R3's gap was not tested: no round ran
+without the tests, and #3235's own body declines the counterfactual. **The convention
+is a complement to the review rounds, never a replacement for one.** That is n=1;
+nothing here measures how often either half will repeat.
 
 ## Plugin build restructures code paths — never rely on the `src/` layout
 
