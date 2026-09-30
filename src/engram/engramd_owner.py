@@ -159,7 +159,7 @@ Per Mira's ruling in revision 5 of docs/2652-security-slice-design.md SS3.1
 ("(b), two connections inside the one owner process"), this module holds
 TWO sqlite3 connections against the same `store_path`, never one:
 
-- `self._owner_conn` (was `self._owner_conn` in U3) -- owner-internal.
+- `self._owner_conn` (was `self._store_conn` in U3) -- owner-internal.
   Serves `snapshot()` and any future owner-internal operation. Client SQL
   never dispatches onto it. Its authorizer (`_owner_internal_authorizer`
   below) is deliberately PERMISSIVE, set explicitly rather than left
@@ -757,7 +757,7 @@ class EngramdOwner:
         self.contract_version = contract_version
 
         self._server: socket.socket | None = None
-        # Owner-internal connection (was `_owner_conn` in U3) -- serves
+        # Owner-internal connection (was `_store_conn` in U3) -- serves
         # snapshot() and any future owner-internal operation. Client SQL
         # never dispatches onto it.
         self._owner_conn: sqlite3.Connection | None = None
@@ -772,7 +772,7 @@ class EngramdOwner:
         # before start() / after stop(), mirroring the connection
         # attributes' own None-until-started lifecycle.
         self._client_read_gate: _ClientReadGate | None = None
-        # Guards BOTH connections' lifecycle -- was `_owner_lock` in U3,
+        # Guards BOTH connections' lifecycle -- was `_store_lock` in U3,
         # renamed because it now protects two connections, not one (see
         # _cleanup() and _handle_snapshot() below; folds #3152 item 1 for
         # both).
