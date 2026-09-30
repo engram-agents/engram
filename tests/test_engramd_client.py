@@ -710,3 +710,36 @@ def test_rejected_value_raises_attribute_error(fake_server):
     assert isinstance(result, ec.Rejected)
     with pytest.raises(AttributeError):
         result.value
+
+
+# ---------------------------------------------------------------------------
+# Round 6 (#3194): Rejected carries the owner's optional `commit` marker.
+# ---------------------------------------------------------------------------
+
+
+def test_rejected_commit_marker_is_populated_from_the_wire_and_defaults_to_none(fake_server):
+    def handler(request):
+        if request["method"] == "with_commit":
+            return {
+                "status": "rejected",
+                "reason": "deadline_exceeded",
+                "commit": "indeterminate",
+                "detail": "d",
+                "remedy": "r",
+            }
+        return {"status": "rejected", "reason": "deadline_exceeded", "detail": "d", "remedy": "r"}
+
+    server = fake_server(handler)
+    marked = ec.read("with_commit", {}, timeout=1.0, socket_path=server.socket_path)
+    plain = ec.read("without_commit", {}, timeout=1.0, socket_path=server.socket_path)
+
+    assert isinstance(marked, ec.Rejected) and marked.commit == "indeterminate"
+    assert isinstance(plain, ec.Rejected) and plain.commit is None
+
+
+def test_rejected_positional_construction_and_equality_unchanged_by_commit_field():
+    # existing positional shape still works; `commit` is last, defaulted
+    a = ec.Rejected("r", "d", "m", "rid")
+    assert (a.reason, a.detail, a.remedy, a.request_id, a.commit) == ("r", "d", "m", "rid", None)
+    assert a == ec.Rejected(reason="r", detail="d", remedy="m", request_id="rid")
+    assert a != ec.Rejected("r", "d", "m", "rid", commit="indeterminate")
