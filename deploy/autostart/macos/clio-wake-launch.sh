@@ -45,6 +45,16 @@
 
 set -euo pipefail
 
+# Captured BEFORE boot-env sourcing below (PR-3246 round-2 follow-up,
+# reviewer-fairy catch): boot-env is sourced with `set -a` further down and
+# could re-export this same-named var, letting an operator's leftover
+# debugging line in ~/.engram/boot-env silently turn a real launchd wake
+# into a silent no-op -- indistinguishable from the dark-seat failure class
+# #3002 exists to close. Freezing the value here means only a value already
+# present in the process's environment when this script STARTED (a test
+# harness's own env=, never launchd) can ever trigger the hook below.
+_TEST_HOOK_PRINT_PATH_AND_EXIT="${CLIO_WAKE_PRINT_PATH_AND_EXIT:-}"
+
 RUNNER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 RUNNER="$RUNNER_DIR/clio-wake-run.sh"
 CHARGE_DIR="$RUNNER_DIR"
@@ -52,6 +62,39 @@ CHARGE_DIR="$RUNNER_DIR"
 LOG_DIR="$HOME/.engram/logs"
 LOG="$LOG_DIR/clio-wake.log"
 mkdir -p "$LOG_DIR"
+
+# CREDENTIAL CHECK (engram-alpha#3002 follow-on, macOS Keychain question):
+# the FIRST executable action after the log scaffolding above -- before the
+# heartbeat touch, before boot-env sourcing, before the duplicate-launch
+# skip check -- and it runs UNCONDITIONALLY on every invocation, including
+# the common skip-path ticks. #3002's LaunchDaemon migration (see
+# ../README.md "Before installing") raised a real, UNRESOLVED question:
+# this account's login Keychain has never been proven to unlock without a
+# GUI session anywhere in the process's ancestry, and a LaunchDaemon
+# (system/ domain, UserName key) has none. If credential access silently
+# stopped working -- today, after a future reboot, or following any
+# Keychain-state change -- a `claude` session launched from here would fail
+# to authenticate. Without this check that failure would be
+# INDISTINGUISHABLE from a healthy skip-tick: the script would still exit 0
+# on the (correct) quiet-skip path below, or would attempt a cold launch
+# that then fails deep inside the platform CLI's own auth flow, invisible
+# to this log. That is precisely the dark-seat class of bug #3002 exists to
+# close -- recreated one layer INSIDE the wake mechanism itself. Never
+# attempt to fix a Keychain-unlock problem here (no `security
+# unlock-keychain`, no stored password, no workaround) -- that is a
+# security-design decision for a human plus a security reviewer, never a
+# fix baked silently into this launcher. Stdout from `security -w` is
+# always discarded; only the exit code and stderr text are ever logged.
+CRED_STDERR_FILE="$(mktemp)"
+if security find-generic-password -s "Claude Code-credentials" -w >/dev/null 2>"$CRED_STDERR_FILE"; then
+    rm -f "$CRED_STDERR_FILE"
+else
+    cred_ec=$?
+    cred_err="$(tr '\n' ' ' < "$CRED_STDERR_FILE" | sed 's/  */ /g; s/ *$//')"
+    rm -f "$CRED_STDERR_FILE"
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ERROR: Keychain credential check failed (exit $cred_ec): $cred_err -- refusing to proceed without confirmed credential access (see engram-alpha#3002)" >> "$LOG"
+    exit "$cred_ec"
+fi
 
 # S1 (fail loud): touch a heartbeat file on EVERY invocation, before any
 # branching — whether this run ends in a skip or a cold launch, this proves
@@ -102,7 +145,52 @@ fi
 # launchd starts jobs with a minimal environment — the platform CLI is
 # installed per-user at ~/.local/bin (and here, Homebrew's bin too, since
 # this seat's PATH fix lives in ~/.zshrc, which launchd does not source).
-export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+#
+# PREPEND ONLY WHEN ABSENT (PR-3246 round-1 follow-up, Kepler): a caller
+# that already put /opt/homebrew/bin on PATH -- a real interactive shell,
+# or a test harness's own PATH construction -- must keep whatever ordering
+# it chose ahead of anything this script adds. Unconditionally re-prepending
+# here silently moved a caller-supplied directory (e.g. a test's stub `bin/`
+# standing in for tmux/ps) BEHIND the real Homebrew tmux, so three tests in
+# tests/test_clio_wake_launchd.py were exercising the REAL tmux binary
+# instead of their stub without anyone noticing (engram-alpha#3247) -- a
+# safety hazard, not just a red test, since it could start a real tmux
+# session under the test's fake $HOME. Only launchd's own minimal PATH is
+# missing /opt/homebrew/bin at all, so the check below is exact: prepend
+# happens exactly in the one context (a bare launchd env) where it was ever
+# needed, and never reorders a caller's own PATH.
+if [[ ":$PATH:" != *":/opt/homebrew/bin:"* ]]; then
+    export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+fi
+
+# FAIL LOUD IF THE EXPORT DIDN'T FIX IT (PR-3246 round-1 follow-up, Kepler):
+# a wrongly-set PATH under launchd's bare environment must not leave this
+# seat silently unable to ever start -- indistinguishable, again, from the
+# dark-seat problem #3002 exists to close. Checked once, right after the
+# conditional export above, unconditionally on every invocation.
+if ! command -v tmux >/dev/null 2>&1; then
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ERROR: tmux not found on PATH ($PATH) even after the export -- refusing to proceed (see engram-alpha#3247)." >> "$LOG"
+    exit 1
+fi
+
+# TEST-ONLY INTROSPECTION HOOK (PR-3246 round-1 follow-up). Exists for
+# exactly one reason: testing the PATH-export conditional above end-to-end,
+# by letting the real `tmux new-session` line run, is UNSAFE on a seat with
+# a real Homebrew tmux -- when the prepend genuinely fires (PATH lacked
+# /opt/homebrew/bin), the real tmux then sits AHEAD of any test stub
+# directory, so a test that lets execution continue would invoke the REAL
+# tmux and could start a REAL detached session running the REAL runner
+# script, exactly the hazard engram-alpha#3247 was filed over. This hook
+# lets a test observe the exact resolved $PATH and stop BEFORE tmux is ever
+# invoked, real or stub. See
+# tests/test_clio_wake_launchd.py::TestPathExportPrependOnlyWhenAbsent.
+# Gated on the value CAPTURED before boot-env sourcing above, not the live
+# env var, specifically so boot-env content can never trigger it -- see
+# that capture's own comment for why.
+if [[ -n "${_TEST_HOOK_PRINT_PATH_AND_EXIT:-}" ]]; then
+    echo "$PATH"
+    exit 0
+fi
 
 TMUX_SESSION="clio-wake"
 

@@ -25,6 +25,58 @@ See engram-alpha#3002 for the full incident writeup.
 | Privilege | root/sudo to install system units | **No sudo** — a user-level LaunchAgent |
 | Already-live session | Treated as an **error** (fires once/day; unexpected) | Treated as a **quiet skip, exit 0** (fires every 2h; the expected common case) |
 
+## Before installing: verify Keychain access under a LaunchDaemon
+
+The install below is a **user-level LaunchAgent** (`gui/<uid>` domain), which
+requires a GUI/console login session for that uid to exist at all — and it
+does not on this seat: this macOS account has never had a GUI/console
+login, so this install as documented does not currently work here. The fix
+under discussion is to install as a **LaunchDaemon** instead (`system/`
+domain, root-installed via `sudo`, with a `UserName` key so it runs as this
+account) — LaunchDaemons don't require a GUI session to exist. But that
+raises an open, **not-yet-answered** question: can a LaunchDaemon-started
+process — with no GUI session anywhere in its ancestry — actually read this
+account's macOS login Keychain, where Claude Code stores its
+`"Claude Code-credentials"` secret via the `security` command? If the
+account's login keychain requires an unlock tied to a GUI login, a
+LaunchDaemon-started `claude` process would silently fail to authenticate —
+reproducing this directory's own dark-seat problem one layer deeper, inside
+the credential path instead of the process-liveness path.
+
+Verify this empirically, in the SAME `sudo` session where you would install
+the real LaunchDaemon, using the throwaway diagnostic in this directory
+(`credential-probe.sh` + `com.engram.clio-credential-probe.plist.template`
+— see that script's own header for the full context):
+
+```bash
+sed -e "s|__CREDENTIAL_PROBE_SH__|$HOME/GitHub/engram-alpha/deploy/autostart/macos/credential-probe.sh|" \
+    -e "s|__CLIO_ACCOUNT__|$(whoami)|" \
+    -e "s|__HOME__|$HOME|g" \
+    deploy/autostart/macos/com.engram.clio-credential-probe.plist.template \
+    | sudo tee /Library/LaunchDaemons/com.engram.clio-credential-probe.plist > /dev/null
+
+chmod +x deploy/autostart/macos/credential-probe.sh
+sudo chown root:wheel /Library/LaunchDaemons/com.engram.clio-credential-probe.plist
+sudo chmod 644 /Library/LaunchDaemons/com.engram.clio-credential-probe.plist
+
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.engram.clio-credential-probe.plist
+sleep 2
+cat ~/.engram/credential-probe-result.txt
+
+sudo launchctl bootout system/com.engram.clio-credential-probe
+sudo rm /Library/LaunchDaemons/com.engram.clio-credential-probe.plist
+```
+
+**If this fails, STOP — do not proceed with the LaunchDaemon install.** The
+fix for a locked Keychain is a security-design decision (credential storage,
+an unlock step, or a different mechanism entirely) that needs a security
+reviewer's read and the machine owner's explicit decision, not a workaround
+applied here.
+
+This diagnostic is throwaway by design. Never leave it loaded as a standing
+job — tear it down (the `bootout` above) regardless of outcome, whether the
+probe succeeded or failed.
+
 ## Install (no sudo — this agent can do this itself)
 
 1. Substitute both placeholder tokens and copy the plist — `launchd` does not
