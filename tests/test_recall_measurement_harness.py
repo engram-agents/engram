@@ -28,11 +28,14 @@ real ~/.engram install.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -932,6 +935,131 @@ class TestSplitAtCLIValidation(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             rmh.main(["--split-at", "not-a-date"])
         self.assertEqual(cm.exception.code, 2)
+
+
+class TestOffsetlessTimestampMeansUTC(unittest.TestCase):
+    """#1801: an offset-less ISO-8601 timestamp means UTC, not local wall
+    time. Every stored source this harness reads writes UTC explicitly
+    (see the #1801 handoff's caller/source-format table), so offset-less
+    := UTC is the consistent reading.
+
+    Every assertion below forces a NON-UTC local TZ (America/New_York)
+    via monkeypatched os.environ['TZ'] + time.tzset(), restored in
+    addCleanup -- on a UTC CI runner, naive-as-local and naive-as-UTC
+    coincide, so an un-forced test would be vacuous (green whether or not
+    the fix is present). Mirrors the TestUtcTimestamp convention in
+    tests/test_telemetry_store.py.
+    """
+
+    def setUp(self):
+        if not hasattr(time, "tzset"):
+            self.skipTest("time.tzset() unavailable on this platform")
+        self._old_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        self.addCleanup(self._restore_tz)
+
+    def _restore_tz(self):
+        if self._old_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = self._old_tz
+        time.tzset()
+
+    def test_parse_iso_ts_offsetless_equals_z_and_explicit_offset(self):
+        # C1
+        offsetless = rmh._parse_iso_ts("2026-09-30T12:00:00")
+        z_form = rmh._parse_iso_ts("2026-09-30T12:00:00Z")
+        offset_form = rmh._parse_iso_ts("2026-09-30T12:00:00+00:00")
+        self.assertIsNotNone(offsetless)
+        self.assertEqual(offsetless, z_form)
+        self.assertEqual(offsetless, offset_form)
+
+    def test_parse_iso_ts_malformed_returns_none(self):
+        # C4: malformed strings still return None -- unaffected by the fix.
+        self.assertIsNone(rmh._parse_iso_ts("garbage"))
+        self.assertIsNone(rmh._parse_iso_ts(""))
+
+    def test_to_epoch_offsetless_equals_z_and_explicit_offset(self):
+        # C2: same assertion through _to_epoch, which delegates to
+        # _parse_iso_ts -- confirms the fix propagates.
+        offsetless = rmh._to_epoch("2026-09-30T12:00:00")
+        z_form = rmh._to_epoch("2026-09-30T12:00:00Z")
+        offset_form = rmh._to_epoch("2026-09-30T12:00:00+00:00")
+        self.assertEqual(offsetless, z_form)
+        self.assertEqual(offsetless, offset_form)
+
+    def test_to_epoch_malformed_still_raises_valueerror(self):
+        # C4: unchanged -- _to_epoch still raises on malformed input.
+        with self.assertRaises(ValueError):
+            rmh._to_epoch("garbage")
+
+    def test_split_at_offsetless_selects_same_window_as_z_form(self):
+        # C3: an offset-less --split-at boundary must select the SAME
+        # before/after window as the Z form, through the full CLI path
+        # (main()) -- the mechanism TestSplitAtCLIValidation above already
+        # exercises for --split-at (its malformed-input case goes through
+        # the same main()/argparse entry point).
+        split_dt = datetime(2026, 9, 30, 12, 0, 0, tzinfo=timezone.utc)
+        split_epoch = split_dt.timestamp()
+        split_z = split_dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        split_offsetless = split_dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+        # A fire 2h AFTER the true UTC split. Under the pre-fix bug
+        # (offset-less read as LOCAL time under TZ=America/New_York, which
+        # shifts the split boundary ~4-5h LATER), this fire would be
+        # misclassified into "before" -- the discriminator.
+        fire_ts = split_epoch + 2 * 3600
+
+        tmpdir = tempfile.mkdtemp(prefix="rmh-c3-test-")
+        self.addCleanup(self._rmtree, tmpdir)
+
+        ledger_path = os.path.join(tmpdir, "in-turn-recall-ledger.jsonl")
+        _write_jsonl(ledger_path, [
+            {"ts": fire_ts, "session_id": "s1", "outcome": "rendered",
+             "rendered_ids": ["ob_9001"], "novel_terms": ["portfolio"]},
+        ])
+        surface_ledger_path = os.path.join(tmpdir, "surface-ledger.json")
+        with open(surface_ledger_path, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        index_db_path = os.path.join(tmpdir, "absent.db")
+
+        def _run(split_value):
+            argv = [
+                "--engram-home", tmpdir,
+                "--ledger-path", ledger_path,
+                "--surface-ledger-path", surface_ledger_path,
+                "--index-db-path", index_db_path,
+                "--format", "json",
+                "--split-at", split_value,
+            ]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = rmh.main(argv)
+            self.assertEqual(rc, 0)
+            return json.loads(buf.getvalue())
+
+        report_z = _run(split_z)
+        report_offsetless = _run(split_offsetless)
+
+        before_z = report_z["before"]["engagement_floor"]["n_fires_total"]
+        after_z = report_z["after"]["engagement_floor"]["n_fires_total"]
+        before_ol = report_offsetless["before"]["engagement_floor"]["n_fires_total"]
+        after_ol = report_offsetless["after"]["engagement_floor"]["n_fires_total"]
+
+        # Cross-form equality: offset-less must select the same window.
+        self.assertEqual(before_z, before_ol)
+        self.assertEqual(after_z, after_ol)
+        # Pin the actual (correct) classification too, not just cross-form
+        # equality: the fire belongs in "after" under the correct UTC
+        # reading of the offset-less boundary.
+        self.assertEqual(before_ol, 0)
+        self.assertEqual(after_ol, 1)
+
+    @staticmethod
+    def _rmtree(path):
+        import shutil
+        shutil.rmtree(path, ignore_errors=True)
 
 
 class TestNodeIdRegex(unittest.TestCase):
