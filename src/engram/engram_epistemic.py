@@ -868,6 +868,11 @@ def _goal_tension_impl(
                 ),
             })
 
+        try:
+            core._rebuild_principle_triggers()  # unified registry (#1698); tensions spec entry
+        except Exception:
+            pass  # best-effort
+
         return json.dumps({
             "status": "created",
             "tension_id": node_id,
