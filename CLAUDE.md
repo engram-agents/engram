@@ -312,15 +312,15 @@ model):**
   or a restart to reload the process. The path is the source; the process does not
   hot-reload.
 - **A changed `hooks.json` registration is re-read by `/reload-plugins` (measured
-  for a removal; an added hook's firing is not); a full Claude Code restart is the
-  fallback only if a registration demonstrably does not take effect — for an added
-  hook, confirm it actually fires after the reload.** Measured 2026-10-01 on the v0.5.2-rc4 upgrade (#3265): rc3's
+  for an addition, #1892, and for a removal, #3265); a full Claude Code restart is
+  the fallback only if a registration demonstrably does not take effect.** Measured 2026-10-01 on the v0.5.2-rc4 upgrade (#3265): rc3's
   deployed `hooks.json` had 22 entries, rc4's has 20, umwelt's has 8; after
   `/plugin marketplace update engram-local` → `/reload-plugins` → `/mcp`
   reconnect, with no restart, `/reload-plugins` reported 28 hooks (20 + 8, the
-  NEW set; the old set would read 30). One seat, one Claude Code version, one
-  removal-shaped change — not measured: whether a hook *added* by the new
-  registration fires without a restart, nor other harness versions. History: an
+  NEW set; the old set would read 30). The addition case was measured
+  in-session on another seat (#1892, Ariadne, 2026-08-03: three hooks added,
+  `/reload-plugins` reported 29 = 22 + 7, the new Stop hook fired, no restart).
+  One seat each, two dates (harness versions not recorded) — not a guarantee for every version. History: an
   earlier version of this bullet said a full restart was required; the v0.1.4
   four-day silent-hook outage that motivated it was a guard on
   marketplace-path-invoked hooks killing all live hooks, *because our live hooks

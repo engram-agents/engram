@@ -41,9 +41,10 @@ with an `-alpha` suffix during the alpha phase.
   > engram-local`) reported 28 hooks, which is the new set (20 engram + 8
   > umwelt; the old set would read 30), with no restart. Upgrade with the
   > `/plugin marketplace update` → `/reload-plugins` → `/mcp` sequence; restart
-  > fully only if a registration demonstrably does not take effect. One seat
-  > one harness version, one removal-shaped change; whether an *added* hook
-  > fires without a restart is not measured.
+  > fully only if a registration demonstrably does not take effect. Measured
+  > once for a removal (#3265, this release) and once for an addition (#1892,
+  > Ariadne, 2026-08-03: 29 = 22 + 7, the new Stop hook fired, no restart); one
+  > seat each, two dates (harness versions not recorded).
 - **The telemetry verdict line is real for the first time.** Until now
   nothing called `engram_telemetry_store.ingest()`, so no seat had a
   `records.db`, and the telemetry line in `engram_diagnose` and the dream
