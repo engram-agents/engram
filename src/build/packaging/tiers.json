@@ -1170,6 +1170,18 @@
       "reason": "test file for tools/tripwire.py — CI tooling only, never ships"
     },
     {
+      "path": "tools/test_forum_backup_alarm.py",
+      "reason": "test file for tools/forum_backup.py alarm (#3276) — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/test_forum_backup_stamp.py",
+      "reason": "test file for tools/forum_backup.py success stamp (#3276) — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/test_forum_status_backup.py",
+      "reason": "test file for the `forum status` backup-age line (#3276) — CI tooling only, never ships"
+    },
+    {
       "path": "tools/test_forum_backup.py",
       "reason": "test file for tools/forum_backup.py — CI tooling only, never ships"
     },
@@ -1244,6 +1256,10 @@
     {
       "path": "src/forum/deploy/engram-forum-backup.timer",
       "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; systemd timer unit for the forum host, not part of the plugin bundle (issue #868)"
+    },
+    {
+      "path": "src/forum/deploy/engram-forum-backup-alarm.service",
+      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; systemd oneshot alarm unit (OnFailure= of the backup unit) for the forum host, not part of the plugin bundle (issue #3276)"
     },
     {
       "path": "src/engram/tools/baton-migrate-to-coord-store.py",

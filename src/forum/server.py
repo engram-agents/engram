@@ -10,6 +10,7 @@ Bind: 0.0.0.0:5002 (5001 is viz_server). Same-LAN only for v0.1.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -17,6 +18,7 @@ import sqlite3
 import sys
 import tarfile
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -453,6 +455,42 @@ def _read_project_state(store, pid: str) -> tuple[str, str]:
     )
 
 
+# #3276: a daily backup on a host that is off ~10.5h nightly tolerates exactly
+# one missed run at 36h.
+BACKUP_MAX_AGE_HOURS = 36.0
+# Tolerated future-dating of the stamp (clock skew) before it counts as unreadable.
+BACKUP_CLOCK_SKEW_HOURS = 1.0
+
+
+def _read_backup_stamp(backup_dir: str) -> dict:
+    """Read <backup_dir>/.last-success.json -> {"last_success_at", "age_hours"}.
+
+    Any problem (missing dir/file, bad JSON, non-dict, missing/non-string/
+    unparseable ``at``) yields both fields None, which the caller reports as
+    degraded.
+    """
+    missing = {"last_success_at": None, "age_hours": None}
+    try:
+        with open(os.path.join(backup_dir, ".last-success.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+        at = data["at"]
+        if not isinstance(at, str):
+            return missing
+        dt = datetime.fromisoformat(at.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+    except (OSError, ValueError, KeyError, TypeError):
+        return missing
+    # A stamp dated in the future (broken clock / tampering) would give a negative
+    # age that always compares <= 36h. Beyond BACKUP_CLOCK_SKEW_HOURS of slack it
+    # is treated like an unreadable stamp (both fields None -> degraded); within
+    # the slack the age is clamped to 0.
+    if age < -BACKUP_CLOCK_SKEW_HOURS:
+        return missing
+    return {"last_success_at": at, "age_hours": max(age, 0.0)}
+
+
 def create_app(
     db_path: str,
     audit_path: str,
@@ -460,6 +498,7 @@ def create_app(
     packs_dir: str | None = None,
     dep_results: dict | None = None,
     coord_root: str | None = None,
+    backup_dir: str | None = None,
 ) -> Flask:
     """Create and configure the Flask application.
 
@@ -483,6 +522,12 @@ def create_app(
             unaffected. ``main()`` passes ``default_store_root()``; DM tests pass a
             ``tmp_path``.
 
+        backup_dir:        Optional forum-backup directory (``main()`` feeds it from
+            ``$FORUM_BACKUP_DIR``). **Opt-in:** when set, GET /health reads
+            ``<backup_dir>/.last-success.json`` (written by tools/forum_backup.py)
+            on every request and reports ``backup`` + ``deps.backup`` (#3276).
+            When None, /health is unchanged.
+
     Returns:
         A configured Flask application instance.
     """
@@ -501,6 +546,7 @@ def create_app(
     app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
     # Store dep probe results for /health (None when called from tests without probing).
     app.config["DEP_RESULTS"] = dep_results or {}
+    app.config["BACKUP_DIR"] = backup_dir
 
     # UCS coordination store (fork-1): wire the file-backed FileStore + the
     # process-level SeqAllocator so the /api/dm routes are live. The allocator is
@@ -558,6 +604,18 @@ def create_app(
         dr = app.config.get("DEP_RESULTS") or {}
         # Strip private diagnostic keys (prefixed with _).
         deps_public = {k: v for k, v in dr.items() if not k.startswith("_")}
+        # #3276: backup age, read fresh per request (no boot cache). Only when the
+        # app was configured with a backup dir; a missing/unreadable stamp is
+        # "degraded", never "ok". HTTP status stays 200 regardless.
+        backup_block = None
+        if app.config.get("BACKUP_DIR"):
+            backup_block = _read_backup_stamp(app.config["BACKUP_DIR"])
+            deps_public["backup"] = (
+                "ok"
+                if backup_block["age_hours"] is not None
+                and backup_block["age_hours"] <= BACKUP_MAX_AGE_HOURS
+                else "degraded"
+            )
         # Status is "degraded" if any dep is not "ok" (missing counts too, though
         # a server that passed boot-verify will only have "degraded" soft deps here).
         overall = "ok"
@@ -568,6 +626,8 @@ def create_app(
         payload: dict = {"status": overall}
         if deps_public:
             payload["deps"] = deps_public
+        if backup_block is not None:
+            payload["backup"] = backup_block
         return jsonify(payload)
 
     # ------------------------------------------------------------------
@@ -2745,6 +2805,7 @@ def main() -> None:
         packs_dir=args.packs_dir,
         dep_results=dep_results,
         coord_root=str(default_store_root()),
+        backup_dir=os.environ.get("FORUM_BACKUP_DIR", "").strip() or None,
     )
     app.run(host=args.host, port=args.port)
 

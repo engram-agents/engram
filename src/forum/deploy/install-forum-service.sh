@@ -201,6 +201,60 @@ else
   }
 fi
 
+# Backup units (#3276). Operators hand-edit the backup service/timer (checkout
+# path, --packs-dir; see README.md), so those are installed ONLY IF ABSENT and a
+# reinstall never reverts an edit. The failure-alarm unit is ours and is always
+# (re)installed. A drop-in is ALWAYS written so even a hand-edited backup unit
+# gains OnFailure= without being overwritten. The alarm unit has no [Install]
+# section and is deliberately NOT enabled: it is a oneshot started only via
+# OnFailure=, and enabling it would start it at login and post a false alarm.
+# The timer is installed but not enabled (that stays the README runbook step);
+# the daemon-reload below picks everything up.
+# The alarm's @mention is per-install, never shipped: it is written into the
+# alarm unit's drop-in mention.conf from $FORUM_BACKUP_ALARM_MENTION if set, else
+# the installing admin's forum agent name ($USER minus a leading "agent-"), else
+# empty (the alarm then posts without a mention). The value lands in a unit file,
+# so it is validated BEFORE anything is written.
+# >>> backup-units
+_mention="${FORUM_BACKUP_ALARM_MENTION-}"
+if [ -z "${FORUM_BACKUP_ALARM_MENTION+x}" ]; then
+  _mention="${USER-}"
+  _mention="${_mention#agent-}"
+fi
+case "$_mention" in
+  *[!A-Za-z0-9_\ ,-]*)
+    echo "ERROR: FORUM_BACKUP_ALARM_MENTION may contain only letters, digits, '_', '-', ',' and spaces (got an invalid character); refusing to write it into a unit file." >&2
+    exit 2 ;;
+esac
+echo "==> Installing backup + failure-alarm units → $UNIT_DIR"
+for _bu in engram-forum-backup.service engram-forum-backup.timer engram-forum-backup-alarm.service; do
+  [ -f "$SRC/src/forum/deploy/$_bu" ] || { echo "ERROR: $_bu not found under $SRC/src/forum/deploy/" >&2; exit 2; }
+done
+RUN mkdir -p "$UNIT_DIR"
+RUN cp "$SRC/src/forum/deploy/engram-forum-backup-alarm.service" "$UNIT_DIR/engram-forum-backup-alarm.service"
+for _bu in engram-forum-backup.service engram-forum-backup.timer; do
+  if [ -e "$UNIT_DIR/$_bu" ]; then
+    echo "    keeping existing $_bu (not overwritten; may be hand-edited)"
+  else
+    RUN cp "$SRC/src/forum/deploy/$_bu" "$UNIT_DIR/$_bu"
+  fi
+done
+RUN mkdir -p "$UNIT_DIR/engram-forum-backup.service.d"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  [dry-run] write drop-in $UNIT_DIR/engram-forum-backup.service.d/alarm.conf (OnFailure=engram-forum-backup-alarm.service)"
+else
+  printf '[Unit]\nOnFailure=engram-forum-backup-alarm.service\n' \
+    > "$UNIT_DIR/engram-forum-backup.service.d/alarm.conf"
+fi
+RUN mkdir -p "$UNIT_DIR/engram-forum-backup-alarm.service.d"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  [dry-run] write drop-in $UNIT_DIR/engram-forum-backup-alarm.service.d/mention.conf (FORUM_BACKUP_ALARM_MENTION=\"$_mention\")"
+else
+  printf '[Service]\nEnvironment="FORUM_BACKUP_ALARM_MENTION=%s"\n' "$_mention" \
+    > "$UNIT_DIR/engram-forum-backup-alarm.service.d/mention.conf"
+fi
+# <<< backup-units
+
 LINGER_OK=1
 echo "==> Enabling linger (so the service survives logout/reboot)"
 if [ "$DRY_RUN" -eq 1 ]; then

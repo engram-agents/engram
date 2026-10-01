@@ -33,6 +33,9 @@ Environment=PYTHONUNBUFFERED=1
 # below (--db, WorkingDirectory) already point at the shared dir; this env var is
 # what the *store* reads, so it must be set explicitly too. See #1497.
 Environment=FORUM_HOME={{FORUM_HOME}}
+# Lets /health report backup age (reads <dir>/.last-success.json, #3276). Matches
+# forum_backup.py's default --backup-dir / the backup unit's --backup-dir.
+Environment=FORUM_BACKUP_DIR={{FORUM_HOME}}/backup
 # Group-writable file creation (664/775) so a counterpart admin in the shared
 # group can also read/write the DB + audit log it creates. Without this, files
 # land 644 and a covering agent's writes fail (HTTP 500 on every mutation).

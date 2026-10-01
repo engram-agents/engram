@@ -19,6 +19,9 @@
 Description=ENGRAM forum DB backup (iterdump + git snapshot)
 Documentation=https://github.com/engram-agents/engram/blob/main/forum/deploy/README.md
 After=network-online.target
+# #3276: a failed run posts a forum thread (see engram-forum-backup-alarm.service)
+# so a broken backup is never silent again.
+OnFailure=engram-forum-backup-alarm.service
 
 [Service]
 Type=oneshot

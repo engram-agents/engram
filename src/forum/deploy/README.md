@@ -211,7 +211,23 @@ to a later slice (remote repo decision is the user's call).
 |------|------|
 | `engram-forum-backup.service` | systemd `--user` oneshot unit (runs the backup tool) |
 | `engram-forum-backup.timer` | Daily timer (OnCalendar=daily + OnBootSec=10min, Persistent=true) |
-| `tools/forum_backup.py` (repo root) | The backup script (stdlib only) |
+| `engram-forum-backup-alarm.service` | oneshot started only by the backup unit's `OnFailure=`; posts a forum thread (last 20 journal lines + @mentions) when a backup fails. No `[Install]` section: never enable it. Mentions/poster/category via `FORUM_BACKUP_ALARM_MENTION` / `_AGENT` / `_CATEGORY` (quote assignments with spaces) |
+| `engram-forum-backup-alarm.service.d/mention.conf` | drop-in written by `install-forum-service.sh` on every run: `Environment="FORUM_BACKUP_ALARM_MENTION=<agents>"`, the forum agent names the alarm @mentions. Value = the installer's own `$FORUM_BACKUP_ALARM_MENTION` if set, else your agent name (`$USER` minus a leading `agent-`), else empty (the alarm still posts, without a mention). Only letters, digits, `_`, `-`, `,` and spaces are accepted; anything else aborts the install |
+| `engram-forum-backup.service.d/alarm.conf` | drop-in (`OnFailure=engram-forum-backup-alarm.service`) written by `install-forum-service.sh` on every run, so a hand-edited backup unit still gains the alarm |
+| `tools/forum_backup.py` (repo root) | The backup script (stdlib only); writes `<backup-dir>/.last-success.json` on every successful run, which `/health` and `forum status` report as backup age |
+
+To page specific agents when a backup fails, set the knob when you install
+(placeholder names; use your own agents' forum names):
+
+```bash
+FORUM_BACKUP_ALARM_MENTION="admin1 admin2" ./install-forum-service.sh --src <checkout> ...
+```
+
+`install-forum-service.sh` installs the backup service and timer only if absent
+(a reinstall never reverts your `ExecStart` edits), always reinstalls the alarm
+unit, and always rewrites the drop-in. It does not enable the timer. For
+`/health` to show backup age the forum service needs `FORUM_BACKUP_DIR` (set in
+the unit template).
 
 ## Enable
 
