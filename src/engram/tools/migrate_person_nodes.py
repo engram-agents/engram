@@ -65,16 +65,80 @@ _TRUST_TIER_KEYWORDS = {
     "suspect": ["suspect", "adversarial"],
 }
 
+# Legacy person-metadata keys that survive engram_update_person (by design --
+# update_person does not delete unknown keys) and should be flagged in the
+# report for human cleanup after the typed-schema update is applied. One
+# module-level tuple so adding a key later is a one-line change (#1665 C4).
+_LEGACY_PERSON_KEYS = ("role",)
 
-def _infer_trust_tier(text: str, existing_tier: str) -> tuple[str, str, str]:
-    """Return (inferred_tier, confidence, note)."""
+
+def _infer_trust_tier(
+    text: str, existing_tier: str, is_self: Any = False
+) -> tuple[str, str, str]:
+    """Return (inferred_tier, confidence, note).
+
+    is_self is checked FIRST, before any keyword scan or column lookup: a
+    node with metadata.is_self=True is structurally 'self' (#1665 C1). If
+    the existing nodes.trust_tier column disagrees (non-empty, not
+    'unknown', not 'self'), that is a conflict flagged for human review
+    rather than silently resolved either way (#1665 C2).
+
+    Only a real boolean True counts as is_self (#1665 r2 C6) -- this tool's
+    whole job is to sanity-check possibly-inconsistent LEGACY data, which
+    may predate the write-path guards that make `is_self` always a real
+    bool on freshly-written nodes, and direct DB surgery can put anything
+    in metadata. A truthy-but-not-True value (e.g. the string "false", the
+    string "true", the int 1) is NOT treated as self; it falls through to
+    the non-self path (column, then keywords, exactly as for is_self
+    absent) but is downgraded to REVIEW with a note naming the value's
+    repr, rather than silently trusted either way.
+
+    Mirror conflict (#1665 r2 C7, PR #3259 reviewer-round-1 pre-existing
+    gap): when is_self is not True (absent, False, or non-boolean truthy)
+    but the nodes.trust_tier COLUMN already holds 'self', that state should
+    not be reachable through the normal write path
+    (engram_set_trust_tier's self-tier gate requires is_self=true on the
+    target) -- so it is never silently 'self' CONFIDENT from the column
+    either. Proposed as 'self' REVIEW with a note naming the conflict.
+    """
+    if is_self is True:
+        if existing_tier and existing_tier not in ("unknown", "", "self"):
+            return (
+                "self",
+                "REVIEW",
+                f"is_self=True in metadata but nodes.trust_tier column is "
+                f"{existing_tier!r} — verify",
+            )
+        return ("self", "CONFIDENT", "is_self=True in metadata")
+
+    # is_self is not True: absent, False (bool), or a non-boolean truthy
+    # value. A non-boolean truthy value gets its own note and forces
+    # confidence to REVIEW no matter which non-self branch below applies
+    # (#1665 r2 C6).
+    non_bool_note = None
+    if is_self:
+        non_bool_note = f"is_self has a non-boolean value: {is_self!r} — verify"
+
+    if existing_tier == "self":
+        # Mirror conflict (#1665 r2 C7).
+        conflict_note = (
+            "nodes.trust_tier column is 'self' but is_self is not True — verify"
+        )
+        note = f"{conflict_note}; {non_bool_note}" if non_bool_note else conflict_note
+        return ("self", "REVIEW", note)
+
     if existing_tier and existing_tier not in ("unknown", ""):
+        if non_bool_note:
+            return (existing_tier, "REVIEW", non_bool_note)
         return (existing_tier, "CONFIDENT", "taken from nodes.trust_tier column")
+
     text_lower = text.lower()
     for tier, keywords in _TRUST_TIER_KEYWORDS.items():
         if any(kw in text_lower for kw in keywords):
-            return (tier, "REVIEW", f"inferred from keyword match in prose — verify")
-    return ("unknown", "REVIEW", "no keyword match — defaulting to 'unknown', verify")
+            note = non_bool_note or "inferred from keyword match in prose — verify"
+            return (tier, "REVIEW", note)
+    note = non_bool_note or "no keyword match — defaulting to 'unknown', verify"
+    return ("unknown", "REVIEW", note)
 
 
 def _extract_name_from_claim(claim: str) -> tuple[str, str]:
@@ -203,15 +267,19 @@ def run_report(db_path: str) -> None:
                 extracted_relation = existing_role
                 rel_conf = "CONFIDENT"
 
+            # is_self must be known BEFORE tier inference runs (#1665 C1/C2) --
+            # a self-anchor's tier is structural, not inferred from prose.
+            is_self = meta.get("is_self", False)
+
             extracted_tier, tier_conf, tier_note = _infer_trust_tier(
-                claim + " " + logical_chain, row["trust_tier"] or ""
+                claim + " " + logical_chain, row["trust_tier"] or "", is_self
             )
 
             existing_aliases = meta.get("aliases", [])
             if isinstance(existing_aliases, str):
                 existing_aliases = [s.strip() for s in existing_aliases.split(",") if s.strip()]
 
-            is_self = meta.get("is_self", False)
+            legacy_keys_present = [k for k in _LEGACY_PERSON_KEYS if k in meta]
 
             print(f"  PROPOSED TYPED FIELDS:")
             print(f"    name:       {extracted_name!r} [{name_conf}]")
@@ -219,8 +287,17 @@ def run_report(db_path: str) -> None:
             print(f"    trust_tier: {extracted_tier!r} [{tier_conf}: {tier_note}]")
             if existing_aliases:
                 print(f"    aliases:    {existing_aliases} [CONFIDENT: taken from existing metadata]")
-            if is_self:
+            if is_self is True:
                 print(f"    is_self:    True [CONFIDENT]")
+            elif is_self:
+                print(
+                    f"    is_self:    {is_self!r} "
+                    f"[REVIEW: non-boolean value — verify]"
+                )
+
+            # Legacy keys that engram_update_person will NOT delete (#1665 C4).
+            if legacy_keys_present:
+                print(f"  LEGACY KEYS TO REMOVE: {', '.join(legacy_keys_present)}")
 
             # Prose remnants
             remnants = _identify_prose_remnants(claim, logical_chain, description)
@@ -243,6 +320,12 @@ def run_report(db_path: str) -> None:
             if tier_conf == "REVIEW":
                 decisions.append(
                     f"Confirm trust_tier: inferred '{extracted_tier}' ({tier_note})"
+                )
+            if legacy_keys_present:
+                decisions.append(
+                    f"Remove legacy key(s) {', '.join(legacy_keys_present)} from metadata "
+                    "after applying the update — engram_update_person does not delete "
+                    "unknown keys."
                 )
             if not decisions:
                 decisions.append("No decisions required — all fields extracted with confidence.")
