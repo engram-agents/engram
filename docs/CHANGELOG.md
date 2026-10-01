@@ -34,6 +34,16 @@ with an `-alpha` suffix during the alpha phase.
   it repaired can no longer occur. `tools/borges_session_eval.py` drops
   its `T2_antml_repair_rate` metric, whose only source logs this hook
   wrote (#3216, part of #3215).
+
+  > **Correction, 2026-10-01 (#3265; the tag's text above stays as cut).**
+  > The claim that `/reload-plugins` is not enough is measured false. On the
+  > rc4 upgrade, `/reload-plugins` (after `/plugin marketplace update
+  > engram-local`) reported 28 hooks, which is the new set (20 engram + 8
+  > umwelt; the old set would read 30), with no restart. Upgrade with the
+  > `/plugin marketplace update` → `/reload-plugins` → `/mcp` sequence; restart
+  > fully only if a registration demonstrably does not take effect. One seat
+  > one harness version, one removal-shaped change; whether an *added* hook
+  > fires without a restart is not measured.
 - **The telemetry verdict line is real for the first time.** Until now
   nothing called `engram_telemetry_store.ingest()`, so no seat had a
   `records.db`, and the telemetry line in `engram_diagnose` and the dream

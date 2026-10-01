@@ -311,10 +311,21 @@ model):**
   *process* is from session start — a changed `server.py` needs a `/mcp` reconnect
   or a restart to reload the process. The path is the source; the process does not
   hot-reload.
-- **A changed `hooks.json` registration needs a full Claude Code restart**
-  (registration is read at session start). This is what caused the v0.1.4 four-day
-  silent-hook outage: a guard on marketplace-path-invoked hooks killed all live
-  hooks, *because our live hooks ARE invoked from the marketplace path.*
+- **A changed `hooks.json` registration is re-read by `/reload-plugins` (measured
+  for a removal; an added hook's firing is not); a full Claude Code restart is the
+  fallback only if a registration demonstrably does not take effect — for an added
+  hook, confirm it actually fires after the reload.** Measured 2026-10-01 on the v0.5.2-rc4 upgrade (#3265): rc3's
+  deployed `hooks.json` had 22 entries, rc4's has 20, umwelt's has 8; after
+  `/plugin marketplace update engram-local` → `/reload-plugins` → `/mcp`
+  reconnect, with no restart, `/reload-plugins` reported 28 hooks (20 + 8, the
+  NEW set; the old set would read 30). One seat, one Claude Code version, one
+  removal-shaped change — not measured: whether a hook *added* by the new
+  registration fires without a restart, nor other harness versions. History: an
+  earlier version of this bullet said a full restart was required; the v0.1.4
+  four-day silent-hook outage that motivated it was a guard on
+  marketplace-path-invoked hooks killing all live hooks, *because our live hooks
+  ARE invoked from the marketplace path* — a different cause from registration
+  timing.
 
 **To know which code is actually running, instrument the live artifact — never
 infer from a proxy.** A version string, `installed_plugins.json`, or a bash-env

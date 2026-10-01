@@ -31,7 +31,7 @@ run, useful only for one-off testing.) Consequences (full table in §5):
 | hook / tool / skill code | **immediately** (re-read per invocation; no `/plugin update`) |
 | **agent spec (`agents/*.md`)** | after **`/plugin marketplace update` + `/reload-plugins`** (agents load from the cache snapshot, not source — #1639) |
 | `server.py` (MCP) | after a `/mcp` reconnect or restart (process is from session start) |
-| `hooks.json` *registration* (add/remove a hook) | after a **full Claude Code restart** |
+| `hooks.json` *registration* (add/remove a hook) | after **`/reload-plugins`** (measured on a removal, #3265); full restart only as fallback; added-hook firing not measured |
 
 And the meta-rule that produced all of this: **to know which code is live,
 instrument the live artifact — never infer from a version string, a JSON file, or
@@ -128,7 +128,7 @@ are out of scope for the source-loading mechanism above.)
 | Tool code (`tools/*.py`) | next call | next call | No |
 | `server.py` / MCP code | — | next `/mcp` reconnect or session | **Yes** — `/mcp` reconnect (lighter) or restart; the process is from session start, so its path is source but it doesn't hot-reload |
 | `.mcp.json` launcher | session start | next session | Yes — restart |
-| **`hooks.json` registration** (add/remove a hook) | **session start** | **next session** | **Yes — full Claude Code restart.** This is the v0.1.4 lever (§10) |
+| **`hooks.json` registration** (add/remove a hook) | **session start** | **Session start / `/reload-plugins`** (measured for a removal, #3265) | **`/reload-plugins`; full restart only if a registration demonstrably doesn't take effect.** Not measured: an *added* hook firing without restart |
 | Shared-bin CLIs (`/home/agents-shared/bin/{baton,ia,forum}`) | — | on refresh | **Separate copies** — not the plugin tree; refresh independently |
 
 **`/reload-plugins`** applies plugin changes without a full restart. For **agents**
@@ -136,8 +136,10 @@ it is **required** (paired with `/plugin marketplace update`, which refreshes th
 cache snapshot agents load from — §4/§6), not merely a forcing function. For
 skills/tools (source-live) it is only a forcing function if a hot-reload ever fails.
 It does **not** substitute for the MCP reconnect; for a `hooks.json` *registration*
-change it reloaded hooks in-session in the #1639 case, but a full restart remains
-the conservative fallback (that specific case is not independently re-verified).
+change it reloaded hooks in-session: 19 in the #1639 case, and on the rc4 upgrade
+(#3265) it reported 28 = 20 engram + 8 umwelt, the NEW set (the old would read 30),
+with no restart. One seat, one harness version, one removal-shaped change; a full
+restart remains the fallback if a registration demonstrably doesn't take effect.
 
 ## 6. The cache & `installed_plugins.json` — bookkeeping for MOST, live for AGENTS
 
@@ -202,7 +204,7 @@ forum thread #189.
   snapshot, NOT source (§4/§6), so a rebuild alone is inert. Verify by dispatching the
   agent and confirming its tools; a stale-cache agent fails *silently* (#1639).
 - **Shipped a `server.py` change?** → rebuild, then `/mcp` reconnect (or restart).
-- **Added/removed a hook (touched `hooks.json`)?** → rebuild, then **full restart**.
+- **Added/removed a hook (touched `hooks.json`)?** → rebuild, then `/reload-plugins` (measured for a removal, #3265; an added hook's firing is not — confirm it fires); full restart only if a registration demonstrably doesn't take effect. The installer's `HOOK REGISTRATION CHANGED` banner still says "MUST restart"; that wording predates #3265.
   `install-local-marketplace.sh` prints a `⚠️ HOOK REGISTRATION CHANGED` banner.
 - **Multi-agent shared CLIs changed?** → refresh `/home/agents-shared/bin/*`
   separately (they are copies, not the plugin tree).
