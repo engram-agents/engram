@@ -289,3 +289,59 @@ def test_filestore_append_dm_raises_on_invalid_name(store):
 def test_filestore_read_dm_thread_raises_on_invalid_name(store):
     with pytest.raises(InvalidAgentName):
         store.read_dm_thread("a+b", "sol")
+
+
+# ---------------------------------------------------------------------------
+# #1813 -- frontmatter field separator must not cross a newline
+# ---------------------------------------------------------------------------
+# _FRONTMATTER_FIELD_RE used `\s*` as the key/value separator, and `\s`
+# matches `\n`. An empty, UNQUOTED field therefore swallowed the entire next
+# field's line as its own value. Tests go through the real
+# `FileStore.read_projects` (which calls the module's `_parse_frontmatter`
+# internally), not the bare regex, so they pin behaviour rather than a
+# string.
+def test_1813_empty_unquoted_field_does_not_swallow_next_field(store):
+    raw = (
+        "---\n"
+        "project_id: PR-1813\n"
+        "title: t\n"
+        "status: in-progress\n"
+        "turn: borges\n"
+        "turn_since: 2026-06-26T00:00:00Z\n"
+        'turn_reason: "start"\n'
+        "turn_by: \n"
+        "participants: [borges]\n"
+        "---\n"
+        "body\n"
+    )
+    store.write_project("PR-1813", raw, seq=1)
+    records = store.read_projects()
+    rec = next(r for r in records if r.project_id == "PR-1813")
+    assert rec.turn_by == ""
+    assert rec.participants == ("borges",)
+
+
+def test_1813_unchanged_cases_still_parse_correctly(store):
+    # key: value (space) / key:value (no space) / a value containing ": " /
+    # quoted-empty / a trailing field at the end of the block -- all must
+    # parse exactly as before the fix.
+    raw = (
+        "---\n"
+        "project_id: PR-1813b\n"
+        "title:no-space-title\n"
+        "status: in-progress\n"
+        "turn: borges\n"
+        "turn_since: 2026-06-26T00:00:00Z\n"
+        'turn_reason: "a: value with a colon"\n'
+        'github: ""\n'
+        "participants: [borges, ariadne]\n"
+        "---\n"
+        "body\n"
+    )
+    store.write_project("PR-1813b", raw, seq=1)
+    records = store.read_projects()
+    rec = next(r for r in records if r.project_id == "PR-1813b")
+    assert rec.title == "no-space-title"
+    assert rec.turn_reason == "a: value with a colon"
+    assert rec.github == '""'
+    assert rec.participants == ("borges", "ariadne")

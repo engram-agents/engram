@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 # Frontmatter grammar — identical to the original tools/baton.py + the inline
 # copy FileStore carried, now unified here.
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
+FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):[ \t]*(.*)$", re.MULTILINE)
 
 # The turn-log section header + line shape the baton-flip monitor parses
 # (``- <iso> <from> → <to>: <reason>``).

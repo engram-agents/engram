@@ -1259,3 +1259,52 @@ def test_hooklib_resolution_in_flattened_deployed_topology(tmp_path):
         f"deployed-topology hook's emit_context envelope diverged "
         f"(stdout={r.stdout!r} stderr={r.stderr!r})"
     )
+
+
+# ===========================================================================
+# #1813 -- frontmatter field separator must not cross a newline
+# ===========================================================================
+#
+# The hook's own _FRONTMATTER_FIELD_RE used `\s*` as the key/value separator,
+# and `\s` matches `\n`. An empty, UNQUOTED field therefore swallowed the
+# entire next field's line as its own value. Tests go through the hook's
+# real `_parse_frontmatter`, not the bare regex, so they pin behaviour
+# rather than a string.
+def test_1813_empty_unquoted_field_does_not_swallow_next_field(engram_home):
+    mod = _load_hook_module(engram_home)
+    raw = (
+        "---\n"
+        "project: PR-1813\n"
+        "turn_by: \n"
+        "participants: [borges]\n"
+        "status: open\n"
+        "---\n"
+        "body\n"
+    )
+    fields, _ = mod._parse_frontmatter(raw)
+    assert fields["turn_by"] == ""
+    assert fields["participants"] == "[borges]"
+    assert fields["status"] == "open"
+
+
+def test_1813_unchanged_cases_still_parse_correctly(engram_home):
+    mod = _load_hook_module(engram_home)
+    # key: value (space) / key:value (no space) / a value containing ": " /
+    # quoted-empty / a trailing field at the end of the block -- all must
+    # parse exactly as before the fix.
+    raw = (
+        "---\n"
+        "project: PR-1813\n"
+        "title:no-space-value\n"
+        "colon_value: a value: with a colon\n"
+        'turn_reason: ""\n'
+        "participants: [borges, ariadne]\n"
+        "---\n"
+        "body\n"
+    )
+    fields, _ = mod._parse_frontmatter(raw)
+    assert fields["project"] == "PR-1813"
+    assert fields["title"] == "no-space-value"
+    assert fields["colon_value"] == "a value: with a colon"
+    assert fields["turn_reason"] == '""'
+    assert fields["participants"] == "[borges, ariadne]"

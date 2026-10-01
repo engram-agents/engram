@@ -7054,3 +7054,50 @@ class TestRound5LegacyConversionEndToEnd:
         assert "phase: 'merge' (transition)" in lines[1]
         fields, _ = _baton._parse_frontmatter(raw)
         assert fields["phase"] == "merge"
+
+
+# ===========================================================================
+# #1813 -- frontmatter field separator must not cross a newline
+# ===========================================================================
+#
+# _baton._FRONTMATTER_FIELD_RE used `\s*` as the key/value separator, and
+# `\s` matches `\n`. An empty, UNQUOTED field therefore swallowed the entire
+# next field's line as its own value. Tests go through the real
+# `_baton._parse_frontmatter` every baton read in this module calls, not the
+# bare regex, so they pin behaviour rather than a string.
+class TestFrontmatterFieldSeparatorNoNewlineCrossing:
+    def test_empty_unquoted_field_does_not_swallow_next_field(self):
+        raw = (
+            "---\n"
+            "project: PR-1813\n"
+            "turn_by: \n"
+            "participants: [borges]\n"
+            "status: open\n"
+            "---\n"
+            "body\n"
+        )
+        fields, _ = _baton._parse_frontmatter(raw)
+        assert fields["turn_by"] == ""
+        assert fields["participants"] == "[borges]"
+        assert fields["status"] == "open"
+
+    def test_unchanged_cases_still_parse_correctly(self):
+        # key: value (space) / key:value (no space) / a value containing
+        # ": " / quoted-empty / a trailing field at the end of the block --
+        # all must parse exactly as before the fix.
+        raw = (
+            "---\n"
+            "project: PR-1813\n"
+            "title:no-space-value\n"
+            "colon_value: a value: with a colon\n"
+            'turn_reason: ""\n'
+            "participants: [borges, ariadne]\n"
+            "---\n"
+            "body\n"
+        )
+        fields, _ = _baton._parse_frontmatter(raw)
+        assert fields["project"] == "PR-1813"
+        assert fields["title"] == "no-space-value"
+        assert fields["colon_value"] == "a value: with a colon"
+        assert fields["turn_reason"] == '""'
+        assert fields["participants"] == "[borges, ariadne]"

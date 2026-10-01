@@ -132,3 +132,49 @@ def test_flip_shaped_composition_byte_exact():
 
 def test_reattach_no_frontmatter_returns_unchanged():
     assert md.reattach_frontmatter("no fm\n", "ignored body") == "no fm\n"
+
+
+# ---------------------------------------------------------------------------
+# #1813 -- frontmatter field separator must not cross a newline
+# ---------------------------------------------------------------------------
+# FRONTMATTER_FIELD_RE used `\s*` as the key/value separator, and `\s`
+# matches `\n`. An empty, UNQUOTED field therefore swallowed the entire next
+# field's line as its own value. Tests go through the real
+# `md.parse_frontmatter`, not the bare regex, so they pin behaviour rather
+# than a string.
+def test_1813_empty_unquoted_field_does_not_swallow_next_field():
+    raw = (
+        "---\n"
+        "project_id: PR-1813\n"
+        "turn_by: \n"
+        "participants: [borges]\n"
+        "status: open\n"
+        "---\n"
+        "body\n"
+    )
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["turn_by"] == ""
+    assert fields["participants"] == "[borges]"
+    assert fields["status"] == "open"
+
+
+def test_1813_unchanged_cases_still_parse_correctly():
+    # key: value (space) / key:value (no space) / a value containing ": " /
+    # quoted-empty / a trailing field at the end of the block -- all must
+    # parse exactly as before the fix.
+    raw = (
+        "---\n"
+        "project_id: PR-1813\n"
+        "title:no-space-value\n"
+        "colon_value: a value: with a colon\n"
+        'turn_reason: ""\n'
+        "participants: [borges, ariadne]\n"
+        "---\n"
+        "body\n"
+    )
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["project_id"] == "PR-1813"
+    assert fields["title"] == "no-space-value"
+    assert fields["colon_value"] == "a value: with a colon"
+    assert fields["turn_reason"] == '""'
+    assert fields["participants"] == "[borges, ariadne]"

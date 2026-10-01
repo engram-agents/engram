@@ -220,7 +220,7 @@ def _is_forum_configured(config: Optional[dict] = None) -> bool:
 # ---------------------------------------------------------------------------
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
+_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):[ \t]*(.*)$", re.MULTILINE)
 
 # Participants list format: [alice, bob] or alice,bob
 _PARTICIPANTS_LIST_RE = re.compile(r"^\[?(.*?)\]?$")

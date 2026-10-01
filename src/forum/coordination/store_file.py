@@ -46,7 +46,7 @@ CLOSED_STATUSES = frozenset({"merged", "cancelled"})
 
 # Frontmatter grammar — identical to tools/baton.py so both read the same files.
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
+_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):[ \t]*(.*)$", re.MULTILINE)
 _PARTICIPANTS_LIST_RE = re.compile(r"^\[?(.*?)\]?$")
 
 # DM header line: --- seq=42 from=ariadne to=sol at=<iso> lines=2 ---

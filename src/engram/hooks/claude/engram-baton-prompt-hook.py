@@ -144,7 +144,7 @@ def _parse_pr_anchor(anchor: str) -> Optional[tuple]:
 
 # Frontmatter parsing (same regex as ia.py / inter-agent hook)
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
+_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):[ \t]*(.*)$", re.MULTILINE)
 
 # PR-ID fallback pattern: "PR-NNN"
 _PR_ID_RE = re.compile(r"^PR-(\d+)$")
