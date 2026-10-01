@@ -513,3 +513,81 @@ def test_prevention_type_update_rejects_invalid_value():
     u = json.loads(server.engram_update_lesson(payload_json=json.dumps(update_payload)))
     assert "error" in u, u
     assert "Invalid prevention_type" in u["error"], u
+
+
+# ---------------------------------------------------------------------------
+# alpha#3270/#3112 — tripwire_priority field
+# ---------------------------------------------------------------------------
+
+def test_tripwire_priority_defaults_to_normal():
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id)
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    assert r["tripwire_priority"] == "normal", r
+
+    meta = _lesson_metadata(server, r["lesson_id"])
+    assert meta["tripwire_priority"] == "normal", meta
+
+
+def test_tripwire_priority_high_accepted_at_creation():
+    """Unlike prevention_type's 'blocking', 'high' carries no earn-it gate —
+    it's the author's own interruption preference, mintable directly."""
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id, tripwire_priority="high")
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    assert r["tripwire_priority"] == "high", r
+
+    meta = _lesson_metadata(server, r["lesson_id"])
+    assert meta["tripwire_priority"] == "high", meta
+
+
+def test_tripwire_priority_invalid_value_rejected():
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id, tripwire_priority="destructive")
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "Invalid tripwire_priority" in r["error"], r
+    assert r["valid_types"] == ["high", "normal"], r
+
+
+def test_tripwire_priority_settable_via_update_lesson():
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id)
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    lesson_id = r["lesson_id"]
+
+    update_payload = {
+        "node_id": lesson_id,
+        "updates": {"tripwire_priority": "high"},
+        "reason": "fires rarely, guards a destructive cross-worktree action",
+    }
+    u = json.loads(server.engram_update_lesson(payload_json=json.dumps(update_payload)))
+    assert "error" not in u, u
+    assert u["updated_fields"]["tripwire_priority"] == "high", u
+
+    meta = _lesson_metadata(server, lesson_id)
+    assert meta["tripwire_priority"] == "high", meta
+
+
+def test_tripwire_priority_update_rejects_invalid_value():
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id)
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    lesson_id = r["lesson_id"]
+
+    update_payload = {
+        "node_id": lesson_id,
+        "updates": {"tripwire_priority": "destructive"},
+    }
+    u = json.loads(server.engram_update_lesson(payload_json=json.dumps(update_payload)))
+    assert "error" in u, u
+    assert "Invalid tripwire_priority" in u["error"], u

@@ -149,7 +149,8 @@ SELECT
         json_extract(metadata, '$.surfacing_nudge'),
         claim
     ) AS nudge,
-    json_extract(metadata, '$.situation_pattern')  AS pattern
+    json_extract(metadata, '$.situation_pattern')  AS pattern,
+    json_extract(metadata, '$.tripwire_priority')  AS priority
 FROM nodes
 WHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')
   AND is_current = 1
@@ -160,27 +161,38 @@ WHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')
 
 
 def load_tripwires(db_path: Path = DB_PATH):
-    """Return list of (pattern_str, nudge_str, node_id) from active lessons
-    with situation_pattern.
+    """Return list of (pattern_str, nudge_str, node_id, priority_str) from
+    active lessons with situation_pattern.
 
     #2753 epic WS2: node_id was added (3rd tuple element, minimal extension
     of the pre-existing (pattern, nudge) shape) so check_command's hits can
     carry the firing node's id for generalization_chain() lookups, without
-    touching what the existing nudge block renders."""
+    touching what the existing nudge block renders.
+
+    alpha#3270/#3112: priority was added (4th tuple element) carrying the
+    lesson's tripwire_priority metadata field -- "high" or "normal", NULL
+    on every lesson minted before this field existed. Coerced to "normal"
+    here (not left as None) so every downstream consumer can compare by
+    string equality without an extra None-check; a lesson with no opinion
+    sorts exactly like a lesson explicitly marked "normal"."""
     if not db_path.exists():
         return []
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
         rows = conn.execute(_QUERY).fetchall()
         conn.close()
-        return [(row[2], row[1], row[0]) for row in rows if row[1] and row[2]]
+        return [
+            (row[2], row[1], row[0], row[3] or "normal")
+            for row in rows if row[1] and row[2]
+        ]
     except Exception:
         return []
 
 
 def check_command(match_target: str, tripwires) -> list:
-    """Return list of {"nudge": str, "node_id": str, "pattern": str} dicts
-    for every situation_pattern that matches match_target.
+    """Return list of {"nudge": str, "node_id": str, "pattern": str,
+    "priority": str} dicts for every situation_pattern that matches
+    match_target.
 
     #2753 epic WS2: hits carry node_id (in addition to the pre-existing
     nudge text) so the caller can compute generalization_chain() per hit for
@@ -193,12 +205,25 @@ def check_command(match_target: str, tripwires) -> list:
     order hits by specificity (len(pattern), descending) before rendering
     and capping, per the preview-truncation fix above. This does NOT change
     the matching logic or the circumstances under which a hit fires -- still
-    exactly one hit per matching pattern."""
+    exactly one hit per matching pattern.
+
+    alpha#3270/#3112: `tripwires` entries are unpacked with a variadic tail
+    (`*rest`) rather than a strict 4-tuple, so every existing caller that
+    constructs bare (pattern, nudge, node_id) 3-tuples by hand (test
+    fixtures, mocked load_tripwires) keeps working unchanged -- priority
+    defaults to "normal" when the 4th element is absent, identical to what
+    load_tripwires() itself now coerces a NULL column to. Only
+    load_tripwires()'s own real DB-reading path needs the 4th element;
+    nothing about the matching logic changes."""
     hits = []
-    for pattern, nudge, node_id in tripwires:
+    for pattern, nudge, node_id, *rest in tripwires:
+        priority = rest[0] if rest else "normal"
         try:
             if re.search(pattern, match_target, re.IGNORECASE):
-                hits.append({"nudge": nudge, "node_id": node_id, "pattern": pattern})
+                hits.append({
+                    "nudge": nudge, "node_id": node_id, "pattern": pattern,
+                    "priority": priority,
+                })
         except re.error:
             pass  # malformed pattern — skip silently
     return hits
@@ -1475,6 +1500,19 @@ def main() -> None:
         # selection below (a longer, more specific pattern is judged more
         # likely to be the useful nudge when not everything can fit).
         #
+        # alpha#3270/#3112 — pattern length alone is a proxy for specificity
+        # that is UNCORRELATED with how much the lesson's author wants it to
+        # win a scarce slot: measured twice independently, a short pattern
+        # guarding a destructive/costly action (git stash; a comment-vs-
+        # review-state gh call) lost its slot to a longer, broad, low-cost
+        # reminder. Kepler's ruling: rank the author-set tripwire_priority
+        # field first ("high" before "normal"), THEN the existing
+        # -len(pattern) tiebreak within a tier. A hit set where every
+        # priority is "normal" (every lesson minted before this field
+        # existed, or one that never opted in) reduces to exactly today's
+        # pure-length order -- this is a strict refinement of the old key,
+        # not a replacement of it.
+        #
         # Reviewer-fairy round 1 (PR #2860): this resort also changes the
         # order `shown_hits` carries into render_triggered_principles below
         # (Piece 3) -- including in the ZERO-CUT case, where shown_hits ==
@@ -1487,7 +1525,13 @@ def main() -> None:
         # ordering nothing downstream depends on.
         shown_hits = []
         if hits:
-            hits = sorted(hits, key=lambda h: -len(h.get("pattern") or ""))
+            hits = sorted(
+                hits,
+                key=lambda h: (
+                    0 if h.get("priority") == "high" else 1,
+                    -len(h.get("pattern") or ""),
+                ),
+            )
             # #2863 WS2 — render via the shared _hooklib.emit_context()
             # helper instead of this hook's own former select_and_cap_hits/
             # _render_tripwire_block/_build_trailer (removed above).
@@ -1524,7 +1568,24 @@ def main() -> None:
                 cut_n = len(items)
                 cut = hits[-cut_n:] if 0 < cut_n <= len(hits) else []
                 cut_hits_holder["cut"] = cut
-                return write_tripwire_overflow(cut) if cut else ""
+                if not cut:
+                    return ""
+                path = write_tripwire_overflow(cut)
+                if not path:
+                    return ""
+                # alpha#3112's cheapest independent-of-ranking mitigation:
+                # name the cut node IDs right in the trailer, not just a
+                # count -- a reader deciding whether to open the overflow
+                # file at all needs to know WHICH lessons got cut, and the
+                # cases this bug actually bit on (git-stash; comment-vs-
+                # review-state) are exactly the ones worth that one glance.
+                # Appended space-separated after the path: _build_context_
+                # trailer's own overflow_path capture group is `(\S+)`, so
+                # this parenthetical never gets swallowed into the path
+                # itself and every existing caller/test that reads the
+                # trailer's path group is unaffected.
+                ids = ", ".join(h.get("node_id", "?") for h in cut)
+                return f"{path} ({ids})"
 
             budgets = get_harness_budgets(detect_harness())
             parts.append(emit_context(

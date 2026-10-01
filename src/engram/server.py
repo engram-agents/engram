@@ -5662,7 +5662,8 @@ def engram_goal_tension(payload_json: str) -> str:
 _ADD_LESSON_FIELDS = frozenset({
     "claim", "incident_ids", "scaffolding_nudge", "logical_chain",
     "reasoning_type", "context_ids", "situation_pattern", "bypass_prose_check",
-    "prevention_type", "recall_summary", "recall_keywords", "generalized_by",
+    "prevention_type", "tripwire_priority", "recall_summary", "recall_keywords",
+    "generalized_by",
 })
 
 
@@ -5760,6 +5761,15 @@ def engram_add_lesson(payload_json: str) -> str:
                 earns blocking only via engram_update_lesson, after a real shadow
                 window with measured zero false positives; nothing can mint straight
                 to blocking.
+            tripwire_priority (str, optional): One of "normal" (default) or "high"
+                (alpha#3270/#3112). The PreToolUse tripwire hook's display cap
+                ranks "high" lessons before "normal" ones, falling back to the
+                existing pattern-length tiebreak within a tier — a lesson with
+                no tripwire_priority set (every lesson minted before this field
+                existed) sorts exactly as before. "high" means the author would
+                rather be interrupted for this than for any broad reminder, not
+                a measured safety claim — mintable directly, no shadow-window
+                gate.
             recall_summary (str, optional, always provide when you can): Compress
                 the corrective pattern into a ≤140-char recall-scent string — don't
                 start from a blank line. Not content preservation (the full claim
@@ -5947,8 +5957,9 @@ _UPDATE_LESSON_FIELDS = frozenset({
 @mcp.tool(
     name="engram_update_lesson",
     capability=(
-        "In-place edit of ONLY situation_pattern + scaffolding_nudge — claim/confidence "
-        "stay supersede-only. Prose-shaped patterns rejected unless overridden."
+        "In-place edit of situation_pattern, scaffolding_nudge, prevention_type, "
+        "tripwire_priority — claim/confidence stay supersede-only. Prose-shaped "
+        "patterns rejected unless overridden."
     ),
     annotations={
         "title": "Update Mutable Fields on a Lesson Node",
@@ -5967,8 +5978,9 @@ def engram_update_lesson(payload_json: str) -> str:
     (action="lesson_field_updated") — an in-place update still shows up as
     a graph-mutation event, distinct from creating a new node.
 
-    Mutable fields (#1826, widened 2026-08-03; #1944 widened again for
-    prevention_type): situation_pattern, scaffolding_nudge, prevention_type
+    Mutable fields (#1826, widened 2026-08-03; #1944 widened for
+    prevention_type; #3270/#3112 widened for tripwire_priority):
+    situation_pattern, scaffolding_nudge, prevention_type, tripwire_priority
     — mechanical retrieval/actionability metadata you can refine from real
     firing experience, never the lesson's epistemic content (claim,
     logical_chain, confidence, reasoning_type stay supersede-only).
@@ -5989,13 +6001,19 @@ def engram_update_lesson(payload_json: str) -> str:
     what an update is for, earned after a real shadow window (measured
     zero false positives), never re-litigated by this validation.
 
+    tripwire_priority must be one of "normal", "high" (#3270/#3112) — an
+    explicit, author-set display-priority signal for the PreToolUse
+    tripwire hook's cap (see engram_add_lesson's docstring for the full
+    mechanism). No earn-it gate in either direction, unlike prevention_type.
+
     Args:
         payload_json: JSON object (as a string) with these fields:
             node_id (str, required): Lesson node ID (ls_NNNN). Must be
                 type='lesson' and is_current=1.
             updates (dict, required): Map of field → new_value. Mutable
-                fields: situation_pattern, scaffolding_nudge, prevention_type.
-                Attempting to update any other field returns an error.
+                fields: situation_pattern, scaffolding_nudge, prevention_type,
+                tripwire_priority. Attempting to update any other field
+                returns an error.
             reason (str, optional): Human-readable explanation for the change.
             bypass_prose_check (bool, optional): Default False. Same
                 override semantics as engram_add_lesson's field of the same

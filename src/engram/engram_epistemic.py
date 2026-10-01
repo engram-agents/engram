@@ -37,6 +37,27 @@ _VALID_EXEMPLAR_TARGET_TYPES = frozenset({"lesson", "cornerstone"})
 # declared at mint.
 PREVENTION_TYPES = frozenset({"advisory", "shadow", "blocking"})
 
+# alpha#3270/#3112 — the PreToolUse tripwire hook's display-cap sort key was
+# `-len(situation_pattern)` alone (longer regex = shown first), a proxy for
+# specificity that is uncorrelated with how much the lesson's AUTHOR wants
+# it to win a scarce display slot. Measured twice independently: a 15-char
+# pattern guarding `git stash` (a destructive, cross-worktree footgun) lost
+# its slot to a 119-char broad "you are reading the ambient working tree"
+# reminder; a narrow `gh pr comment`-vs-review-state pattern lost to a
+# broad node-ID-scrub reminder that didn't even apply to the call. Kepler's
+# ruling (2026-10-01): an explicit, author-set field named by what it
+# measures rather than by severity — "high" means "the author would rather
+# be interrupted for this than for any broad reminder" — covers both
+# incidents without having to classify either one as "destructive." Default
+# "normal" so every pre-existing lesson (no tripwire_priority key in its
+# metadata at all) sorts exactly as before: high first, `-len(pattern)`
+# tiebreak unchanged within a tier, so an all-normal hit set reduces to
+# today's pure length order byte-for-byte. Mintable directly (unlike
+# "blocking", there is no earn-it-via-shadow-window gate here — the author
+# is asserting their own interruption preference, not a measured safety
+# claim), and settable via engram_update_lesson same as prevention_type.
+TRIPWIRE_PRIORITIES = frozenset({"high", "normal"})
+
 
 def _looks_like_prose(pattern: str) -> bool:
     """Discriminate a command-shape regex from a dead-prose situation_pattern.
@@ -897,6 +918,7 @@ def _add_lesson_impl(
     situation_pattern: str = "",
     bypass_prose_check: bool = False,
     prevention_type: str = "advisory",
+    tripwire_priority: str = "normal",
     recall_summary: str = "",
     recall_keywords: list = None,
     generalized_by: str = "",
@@ -962,6 +984,15 @@ def _add_lesson_impl(
             No lesson may be minted directly as "blocking"; promotion is
             earned via engram_update_lesson after a measured
             zero-false-positive shadow window.
+        tripwire_priority: One of "normal" (default) or "high" (alpha#3270/
+            #3112). The PreToolUse tripwire hook's display cap ranks "high"
+            lessons before "normal" ones, then falls back to the existing
+            `-len(situation_pattern)` tiebreak within a tier — so a lesson
+            with no tripwire_priority set (every lesson minted before this
+            field existed) sorts exactly as before. "high" means the author
+            would rather be interrupted for this lesson than for any broad
+            reminder, not a measured safety claim — mintable directly, no
+            shadow-window gate (unlike prevention_type's "blocking").
         recall_summary: Always provide when you can — ≤140-char recall scent (#1952 PR1).
             Omission clean-accepts as 0 chars; soft-accepted up to 279 chars
             (flagged needs_tightening); rejected at 280+ chars.
@@ -1001,6 +1032,11 @@ def _add_lesson_impl(
         return json.dumps({
             "error": f"Invalid prevention_type '{prevention_type}'.",
             "valid_types": sorted(PREVENTION_TYPES),
+        })
+    if tripwire_priority not in TRIPWIRE_PRIORITIES:
+        return json.dumps({
+            "error": f"Invalid tripwire_priority '{tripwire_priority}'.",
+            "valid_types": sorted(TRIPWIRE_PRIORITIES),
         })
     # #1944 — eligibility to block is earned, never declared at mint. A
     # fresh lesson has zero fires and therefore zero measured precision;
@@ -1148,6 +1184,7 @@ def _add_lesson_impl(
             "reasoning_class": rclass,
             "scaffolding_nudge": scaffolding_nudge,
             "prevention_type": prevention_type,
+            "tripwire_priority": tripwire_priority,
         }
         if situation_pattern:
             meta["situation_pattern"] = situation_pattern
@@ -1282,6 +1319,7 @@ def _add_lesson_impl(
             "reasoning_class": rclass,
             "scaffolding_nudge": scaffolding_nudge,
             "prevention_type": prevention_type,
+            "tripwire_priority": tripwire_priority,
             "incident_nodes": ids,
             "context_nodes": ctx,
             "importance_anchored": True,
@@ -1323,7 +1361,16 @@ def _add_lesson_impl(
 # on a measured override-rate threshold) are both in-place transitions on
 # the SAME lesson, not a new epistemic claim — mechanical/actionability
 # metadata, same class as situation_pattern.
-_LESSON_MUTABLE_FIELDS = frozenset({"situation_pattern", "scaffolding_nudge", "prevention_type"})
+#
+# tripwire_priority joined the mutable set with alpha#3270/#3112: an
+# author's read of "how much I want this interrupting someone" can change
+# after real firing experience (a lesson that turns out to fire constantly
+# with low value, or one that turns out to guard something sharper than
+# first realized) — same mechanical-metadata class as prevention_type, no
+# epistemic content changes.
+_LESSON_MUTABLE_FIELDS = frozenset({
+    "situation_pattern", "scaffolding_nudge", "prevention_type", "tripwire_priority",
+})
 
 # #2000 — the subset of _LESSON_MUTABLE_FIELDS that error_incidents.json
 # actually carries a copy of (see core._rebuild_incidents_cache: it stores
@@ -1352,14 +1399,17 @@ def _update_lesson_impl(
     to an existing node still shows up as a graph-mutation event, distinct
     from node creation, without minting a new node.
 
-    Mutable fields (#1826, widened 2026-08-03; #1944 widened again to add
-    prevention_type): situation_pattern, scaffolding_nudge, prevention_type
+    Mutable fields (#1826, widened 2026-08-03; #1944 widened to add
+    prevention_type; #3270/#3112 widened to add tripwire_priority):
+    situation_pattern, scaffolding_nudge, prevention_type, tripwire_priority
     — all mechanical/actionability metadata tunable from real firing
     experience, not the lesson's epistemic content (claim, logical_chain,
     reasoning_type stay supersede-only). prevention_type is the sole field
     where an update MAY promote a lesson to "blocking" (minting cannot);
     engram_add_lesson refuses "blocking" at creation for exactly this
-    reason.
+    reason. tripwire_priority ("normal"/"high") has no such earn-it gate in
+    either direction — it is the author's own interruption preference, not
+    a measured safety claim.
 
     situation_pattern, when set to a non-empty value, runs the SAME #1864
     validation _add_lesson_impl runs at creation time — must compile as a
@@ -1372,8 +1422,8 @@ def _update_lesson_impl(
     Args:
         node_id: Lesson node ID (ls_NNNN). Must be type='lesson', is_current=1.
         updates: Dict of field → new_value. Mutable fields: situation_pattern,
-                 scaffolding_nudge, prevention_type. Unknown-field updates are
-                 rejected with a clear error.
+                 scaffolding_nudge, prevention_type, tripwire_priority.
+                 Unknown-field updates are rejected with a clear error.
         reason: Optional human-readable explanation for the change.
         bypass_prose_check: Default False. Overrides the prose-shape gate on
             a new situation_pattern value — see engram_add_lesson's docstring
@@ -1447,6 +1497,14 @@ def _update_lesson_impl(
             return json.dumps({
                 "error": f"Invalid prevention_type '{new_prevention_type}'.",
                 "valid_types": sorted(PREVENTION_TYPES),
+            })
+
+    if "tripwire_priority" in updates:
+        new_tripwire_priority = updates["tripwire_priority"]
+        if new_tripwire_priority not in TRIPWIRE_PRIORITIES:
+            return json.dumps({
+                "error": f"Invalid tripwire_priority '{new_tripwire_priority}'.",
+                "valid_types": sorted(TRIPWIRE_PRIORITIES),
             })
 
     conn = core._get_db()
