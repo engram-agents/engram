@@ -181,6 +181,54 @@ def test_codex_d_expands_to_bypass_approvals():
     assert "--dangerously-skip-permissions" not in out
 
 
+def test_codex_resume_with_bypass_is_rejected_by_shared_expansion():
+    rc, out, err = _run("session", "luria", "-dc", "--platform", "codex", "--dry-run")
+    assert rc != 0
+    assert not out
+    assert "remote resume forbids permission override" in err.lower()
+
+
+def test_codex_globally_prefixed_resume_with_bypass_is_rejected_by_shared_expansion():
+    rc, out, err = _run(
+        "session",
+        "luria",
+        "-d",
+        "--platform",
+        "codex",
+        "--dry-run",
+        "--config",
+        "foo=bar",
+        "resume",
+        "--last",
+    )
+    assert rc != 0
+    assert not out
+    assert "remote resume forbids permission override" in err.lower()
+    assert "requested bypass was not applied" in err.lower()
+    assert "no session was resumed" in err.lower()
+
+
+def test_codex_prompt_after_dashdash_does_not_trigger_remote_resume_guard():
+    """A literal -- is Codex's prompt boundary, not wrapper-only syntax."""
+    rc, out, err = _run(
+        "session",
+        "luria",
+        "--platform",
+        "codex",
+        "--dry-run",
+        "--",
+        "resume",
+        "--dangerously-bypass-approvals-and-sandbox",
+    )
+    assert rc == 0, err
+    assert out.split() == [
+        "codex",
+        "--",
+        "resume",
+        "--dangerously-bypass-approvals-and-sandbox",
+    ]
+
+
 def test_codex_r_is_silently_consumed_for_compatibility():
     rc, out, err = _run("session", "luria", "-r", "--platform", "codex", "--dry-run")
     assert rc == 0
@@ -298,13 +346,11 @@ def test_passthrough_args_after_dashdash_land_verbatim():
     assert "abc123" in words
 
 
-def test_dashdash_separator_itself_not_forwarded():
-    """The literal `--` token must be consumed as a separator, never appear
-    in the expanded output (matches tools/agentctl's own _parse_session_flags
-    behavior: a leading -- is shifted off, not passed through)."""
+def test_dashdash_separator_is_forwarded_as_platform_prompt_boundary():
+    """The literal `--` must reach Codex as its prompt boundary."""
     rc, out, _ = _run("session", "luria", "--dry-run", "--", "--resume", "abc123")
     assert rc == 0
-    assert "--" not in out.split()
+    assert "--" in out.split()
 
 
 def test_dry_run_after_dashdash_is_passthrough_not_intercepted():

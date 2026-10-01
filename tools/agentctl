@@ -50,6 +50,7 @@
 #                                        #   Bare - (stdin) passes as a non-flag arg.
 #                                        # Recognized aliases:
 #                                        #   -c  claude:--continue  codex:resume managed daemon's latest thread
+#                                        #       (Codex resume cannot combine with -d/bypass permissions)
 #                                        #   -d  claude:--dangerously-skip-permissions
 #                                        #       codex:--dangerously-bypass-approvals-and-sandbox
 #                                        #   -r  claude:--remote-control <agent>
@@ -568,7 +569,8 @@ _parse_session_flags() {
 #
 # Expansion rules (single-char aliases):
 #   -c  claude → append --continue                         (deduped)
-#       codex  → base command becomes "codex resume --last" (deduped)
+#       codex  → base command becomes "codex resume --last" (deduped; cannot
+#                be combined with the bypass-permissions flag)
 #   -d  claude → --dangerously-skip-permissions            (deduped)
 #       codex  → --dangerously-bypass-approvals-and-sandbox (deduped)
 #   -r  claude → --remote-control <agent_name>  (two words, deduped)
@@ -579,6 +581,86 @@ _parse_session_flags() {
 # NOTE: aliases MUST be expanded here and never passed through raw.
 # claude itself parses -d as --debug (silent behavior change); that is the
 # reason these aliases live in agentctl rather than the caller.
+_codex_remote_resume_bypass_error() {
+    printf '%s\n' "ERROR: Codex remote resume forbids permission override." >&2
+    printf '%s\n' "       Requested bypass was NOT applied; no session was resumed." >&2
+    printf '%s\n' "       Use -c, then inspect /permissions (or /status) for the actual policy." >&2
+    printf '%s\n' "       A new full-access thread uses -d without -c." >&2
+}
+
+# Return success only when a Codex argv contains both an explicit `resume`
+# subcommand and the exact bypass flag.  Codex permits global options before
+# its subcommand, so this walks its documented global-option grammar rather
+# than assuming argv[0] is the subcommand.  It deliberately stops on an
+# unknown option or positional argument: guessing there would risk treating a
+# prompt as a resume request.
+_codex_remote_resume_bypass_requested() {
+    local saw_bypass=0
+    local consume_value=0
+    local consuming_images=0
+    local arg
+
+    while [[ $# -gt 0 ]]; do
+        arg="$1"
+        shift
+
+        if [[ $consume_value -eq 1 ]]; then
+            consume_value=0
+            continue
+        fi
+
+        # --image accepts one or more values.  A bare `resume` immediately
+        # after it is an image value, not a subcommand; a following option
+        # ends that value list and resumes normal global-option parsing.
+        if [[ $consuming_images -eq 1 ]]; then
+            if [[ "$arg" != -* || "$arg" == "-" ]]; then
+                continue
+            fi
+            consuming_images=0
+        fi
+
+        case "$arg" in
+            --)
+                return 1
+                ;;
+            resume)
+                # After the subcommand, the bypass is a flag unless an
+                # explicit separator makes it prompt text.
+                if [[ $saw_bypass -eq 1 ]]; then
+                    return 0
+                fi
+                for arg in "$@"; do
+                    [[ "$arg" == "--" ]] && return 1
+                    [[ "$arg" == "--dangerously-bypass-approvals-and-sandbox" ]] && return 0
+                done
+                return 1
+                ;;
+            --dangerously-bypass-approvals-and-sandbox)
+                saw_bypass=1
+                ;;
+            --config|--enable|--disable|--remote|--remote-auth-token-env|--model|--local-provider|--profile|--sandbox|--cd|--add-dir|--ask-for-approval|-c|-m|-p|-s|-C|-a)
+                consume_value=1
+                ;;
+            --image|-i)
+                consuming_images=1
+                ;;
+            --config=*|--enable=*|--disable=*|--remote=*|--remote-auth-token-env=*|--model=*|--local-provider=*|--profile=*|--sandbox=*|--cd=*|--add-dir=*|--ask-for-approval=*|--image=*|-c?*|-i?*|-m?*|-p?*|-s?*|-C?*|-a?*)
+                : # Attached or equals-form global option value.
+                ;;
+            --strict-config|--oss|--approve-for-me|--dangerously-bypass-hook-trust|--worktree|--search|--no-alt-screen|--no-daemon)
+                : # Value-free global option.
+                ;;
+            -h|--help|-V|--version)
+                return 1
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    done
+    return 1
+}
+
 _expand_session_args() {
     local platform="$1"
     local agent_name="$2"
@@ -717,6 +799,24 @@ _expand_session_args() {
         return 6
     fi
 
+    # Codex remote resume rejects permission overrides before it reaches the
+    # managed thread. Refuse before emitting any command, rather than silently
+    # dropping -d or claiming to know the saved thread's policy.
+    if [[ "$platform" == "codex" ]]; then
+        local codex_resume_args=()
+        if [[ $use_resume -eq 1 ]]; then
+            codex_resume_args=("resume" "--last")
+        fi
+        local extra_arg
+        for extra_arg in "${extra_args[@]+"${extra_args[@]}"}"; do
+            codex_resume_args+=("$extra_arg")
+        done
+        if _codex_remote_resume_bypass_requested "${codex_resume_args[@]+"${codex_resume_args[@]}"}"; then
+            _codex_remote_resume_bypass_error
+            return 7
+        fi
+    fi
+
     # Emit base command words, then expanded args.
     # printf '%s\n' is used throughout (not echo) — see emission discipline above.
     if [[ "$platform" == "codex" && $use_resume -eq 1 ]]; then
@@ -802,6 +902,10 @@ _codex_managed_session() {
     [[ "${1:-}" == "--" ]] || { echo "ERROR: internal Codex session arguments require -- separator" >&2; return 2; }
     shift
     [[ -d "$cwd" ]] || { echo "ERROR: Codex session cwd '$cwd' is not a directory" >&2; return 1; }
+    if _codex_remote_resume_bypass_requested "$@"; then
+        _codex_remote_resume_bypass_error
+        return 2
+    fi
     local requested_arg
     for requested_arg in "$@"; do
         case "$requested_arg" in
@@ -901,9 +1005,9 @@ cmd_session() {
         echo >&2
         echo "  Recognized single-char aliases:" >&2
         echo "    -c   claude: --continue" >&2
-        echo "         codex:  resumes --last through the managed daemon" >&2
+        echo "         codex:  resumes --last through the managed daemon; cannot combine with -d" >&2
         echo "    -d   claude: --dangerously-skip-permissions" >&2
-        echo "         codex:  --dangerously-bypass-approvals-and-sandbox" >&2
+        echo "         codex:  --dangerously-bypass-approvals-and-sandbox (new thread only; do not combine with -c)" >&2
         echo "    -r   claude: --remote-control <agent>" >&2
         echo "         codex:  ignored (no remote-control equivalent; use agentctl attach <agent>)" >&2
         exit 2
