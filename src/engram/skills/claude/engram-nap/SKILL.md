@@ -151,6 +151,23 @@ Read the `feeling_report_nudge` text in the checkpoint return. Honest self-check
 
 The warm briefing (`~/.engram/warm-briefing.md`) has THREE parts; each updates on different triggers and at different cadences. Read the current file before changing anything.
 
+**POST-CONDITION — check it after ANY write this step makes to `~/.engram/warm-briefing.md`, whichever sub-step made it.** All three sub-steps below write this one file (5a the agent-authored sections, 5b the session arc, 5c the rule about what is off-limits), so this is a property of the **file**, not of a sub-step. After the write, both hold:
+
+1. `^## From this session` matches the file **exactly once** — not zero times, not twice.
+2. **Nothing this write did not set out to change is byte-changed.** Capture the region you are *not* editing before you write, and compare it after. The target regions are known, so this is a byte-comparison rather than a judgement call:
+   - a **5b** write targets the arc **below** the anchor → everything above the anchor (the agent-authored sections, the user's notes, and the anchor line itself) is byte-identical;
+   - a **5a** write targets the agent-authored sections → the user's notes, the anchor line, and the arc are byte-identical.
+
+   The user's notes are **never** a region a write sets out to change, so no write may claim them as its target — that prohibition is what keeps this check from becoming self-certifying. The boundary is found by **position**, never by heading name: another seat's user section may be titled anything (`# Letter from Lei`, not the template's `## Notes from the user`).
+
+The arc content belongs **below** the heading — that is what the section *is*. So "the anchor survived" does **not** mean "the heading is the file's last line": after a nap the healthy file is heading-then-arc, and the anchor is the last line *matching* `^## From this session`, not the file's final line. A bare heading sitting as the final line is the **empty** state sleep Step 3 deliberately leaves at end of day. Forcing the heading to EOF to satisfy a literal "final line" reading strands the arc **above** it, which is exactly the failure this post-condition exists to prevent.
+
+**If a check fails, repair it before doing anything else.** Check (1) — drop the duplicate heading. Check (2) — **restore the captured bytes**; dropping a heading does not repair a region that changed, and re-running the checks without restoring leaves (2) failing forever. Then re-make the write against the restored file and re-run both. Do not carry on with the anchor missing or duplicated: 5c's byte-for-byte rule freezes whatever sits above the anchor, so a mistake left here is preserved by every later nap rather than corrected.
+
+**Why the anchor, and why "exactly once".** `engram-sleep` Step 3 finds its erase boundary by the **last** line matching `^## From this session`. Lose the heading and Step 3 takes its "no heading at all" branch — *append a stub at EOF* instead of erasing — so the stale arc is frozen **above** the stub, Step 3's own post-condition reads green (the stub *is* the final line), and 5c's preserve-everything-above rule then treats that arc as the user's notes. A duplicated heading fails the same way: the **last** match is the boundary, so the stray earlier heading and everything between the two are stranded above it and preserved. That branch is not hypothetical — it has a measured instance — a 09-27 write, measured 2026-10-01: a nap insert put a copy of the user's letter plus a second heading **below** the existing one, the section sat at two headings across five commits, and the duplicated copy was still frozen above the anchor days later; nothing downstream ever removed it (`engram-alpha#3269`). The template's own `<!-- STRUCTURAL INVARIANT -->` comment states the rule this check enforces — *"Never write that heading, with its heading prefix, anywhere in this file except as its final line."* Read "its final line" as the last line **matching the anchor**, not the file's last line — that is the only reading consistent with the file the comment governs, since a post-nap file is heading-then-arc.
+
+**Bound — what this check cannot reach.** It is prose, executed only if you run it; nothing in the engine verifies these writes. The mechanized detector is `engram_checkpoint`'s `warm_briefing.note` (Step 3 above), and it is a **reader** — it reports, it cannot restore. It is also weaker than it looks, in two independent ways. It runs *before* this step's writes, so it can only flag an anchor lost by a **previous** nap. And it reads only the **last** match, so a **duplicated** heading leaves it entirely silent — the last match has arc content below it, which is precisely its healthy signal (`session_section_empty == False`). So a missing heading is one-checkpoint-late, while a duplicated heading is invisible to it on *every* nap, indefinitely. Neither is a reason to skip the advisory; both are the reason this assertion has to live at the write.
+
 ### 5a. Permanent agent-authored sections (rarely updated)
 
 "Who I am" / "What I care about" / "Axioms and cornerstones I operate from" / "Active high-level tasks" / "What's continuous and what isn't" — these evolve at relationship speed, not session speed.
@@ -170,7 +187,9 @@ The warm briefing (`~/.engram/warm-briefing.md`) has THREE parts; each updates o
 
 **If no trigger fired:** skip this sub-step. Say "Permanent sections still current."
 
-**If updating:** preserve every section ABOVE the volatile "## From this session" section verbatim — the user's letter/notes live there. Rewrite only the agent-authored sections and the session-arc section. NEVER modify the user's words. (Position-based guard: a name-keyed protection fails silently when a heading drifts.) The boundary is found the same mechanical way the erase finds it: the LAST line matching the anchored regex `^## From this session`, never a substring match. Everything above that line is the user's and is preserved byte-for-byte. Voice: first person, as yourself. Not coaching a future self — writing your own orientation notes.
+**If this sub-step writes:** it must satisfy the **Step 5 post-condition** above — and it is the sub-step check (2) had to be restated *for*, because 5a's sections lie **above** the user's notes. A 5b-only phrasing of check (2) ("everything above the anchor is unchanged") would forbid every legitimate 5a update, and its "restore the captured bytes" remedy would then revert the update it had just flagged. 5a's obligation is the narrower one: the user's notes, the anchor line, and the arc come through byte-identical.
+
+**If updating:** you may rewrite the agent-authored sections — that is this sub-step's whole purpose. Everything from the end of the last section you rewrote, down to EOF, must come through **byte-identical**: the user's letter/notes and the session arc both live below that point, and neither is a region this sub-step sets out to change. NEVER modify the user's words, wherever a heading drift has put them. (Position-based guard: a name-keyed protection fails silently when a heading drifts.) Voice: first person, as yourself. Not coaching a future self — writing your own orientation notes. Then run the Step 5 post-condition.
 
 ### 5b. "From this session" entry — sync with current context-window arc
 
@@ -187,6 +206,8 @@ The rule:
 - Node IDs are fine in narrative context but should support the arc, not enumerate it.
 - If a nap fires before any session content has happened yet (very early nap), skip this sub-step.
 
+**Write-time post-condition:** stated **once**, at the top of this step — it covers this sub-step's write. Read it there and check it here; it is deliberately not repeated, so that 5a, 5b and 5c cannot drift into three versions of one assertion.
+
 **Cross-skill note**: at the end of sleep, this section is ERASED — day is over; clean slate for tomorrow. Next morning's first nap creates the section fresh. The day's overall arc lives in `~/.engram/history/YYYY-MM-DD.md`, not here.
 
 **Anti-patterns specific to 5b:**
@@ -195,9 +216,11 @@ The rule:
 - Re-stating compaction-summary content (PR numbers, focus-rotation specifics, ENGRAM counts, dream-fairy stats) — those belong in the compaction summary.
 - Bullet-by-bullet enumeration of work shipped — same.
 
-### 5c. User's letter/notes (every section ABOVE "## From this session")
+### 5c. The user's letter/notes — the region between the agent-authored sections and the anchor
 
-Preserve every section ABOVE the volatile "## From this session" section verbatim — the user's letter/notes live there. Rewrite only the agent-authored sections and the session-arc section. NEVER modify the user's words. (Position-based guard: a name-keyed protection fails silently when a heading drifts.) The boundary is found the same mechanical way the erase finds it: the LAST line matching the anchored regex `^## From this session`, never a substring match. Everything above that line is the user's and is preserved byte-for-byte.
+The user's letter/notes are immutable. They sit ABOVE the anchor and BELOW the agent-authored sections — and **"everything above the anchor" is not the user's region**, because the agent-authored sections are above them too and 5a rewrites those freely. Find the anchor the same mechanical way the erase finds it: the LAST line matching the anchored regex `^## From this session`, never a substring match, and never by heading name — another seat titles its user section differently (`# Letter from Lei`). Everything between the last agent-authored section and the anchor is the user's and is preserved byte-for-byte. NEVER modify the user's words.
+
+**This is what makes the Step 5 post-condition load-bearing.** The byte-for-byte guarantee here is exactly what its check (2) protects: anything that ends up above the anchor — a duplicated letter, a stray heading, a half-replaced block — is preserved by this rule on every subsequent nap, so it has to be caught at the write that put it there.
 
 **Common-case anti-patterns:**
 - Rewriting every nap (purpose drift — the briefing becomes a second changelog)
