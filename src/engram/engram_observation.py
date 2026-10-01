@@ -2019,6 +2019,11 @@ def _add_observation_batch_impl(
         observations = json.loads(observations_json)
     except json.JSONDecodeError as e:
         return json.dumps({"error": f"Invalid JSON: {e}"})
+    except TypeError:
+        return json.dumps({
+            "error": f"observations_json must be a JSON string, got "
+                     f"{type(observations_json).__name__}"
+        })
 
     if not isinstance(observations, list):
         return json.dumps({"error": "observations_json must be a JSON array."})

@@ -3287,6 +3287,11 @@ def _list_impl(
             filters_obj = json.loads(filters_json)
         except json.JSONDecodeError as e:
             return json.dumps({"status": "error", "error": f"filters_json: invalid JSON — {e}"})
+        except TypeError:
+            return json.dumps({
+                "status": "error",
+                "error": f"filters_json must be a JSON string, got {type(filters_json).__name__}",
+            })
         try:
             filter_sql_frag, filter_params = parse_filters(filters_obj)
         except FilterError as e:
@@ -3314,6 +3319,11 @@ def _list_impl(
             fields_obj = json.loads(fields_json)
         except json.JSONDecodeError as e:
             return json.dumps({"status": "error", "error": f"fields_json: invalid JSON — {e}"})
+        except TypeError:
+            return json.dumps({
+                "status": "error",
+                "error": f"fields_json must be a JSON string, got {type(fields_json).__name__}",
+            })
         try:
             projected_fields = validate_fields(fields_obj)
         except FilterError as e:

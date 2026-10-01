@@ -162,6 +162,70 @@ def test_impl_callable_with_kwargs():
     assert r.get("created") == 2
 
 
+# ── nested JSON-string sub-field TypeError (issue #1753) ────────────────────
+#
+# observations_json is typed str, but a caller can send a real JSON array
+# (not a JSON-encoded string) at the untrusted MCP boundary. Before the fix,
+# json.loads(<list>) / json.loads(<dict>) raises an uncaught TypeError instead
+# of the structured error envelope the JSONDecodeError branch already returns
+# for malformed strings. Sibling defect class to #1683 (payload_json).
+
+
+def test_impl_observations_json_as_list_rejected_not_raised():
+    """A real list (not a JSON string) for observations_json must return the
+    structured error envelope, naming the field — never an uncaught TypeError."""
+    server = fresh_server()
+    r = json.loads(server._add_observation_batch_impl(
+        observations_json=_two_obs(),  # actual list, not json.dumps(...)
+        url=f"file://{TEST_FILE}",
+        title="Test source",
+    ))
+    assert "error" in r, r
+    assert "observations_json" in r["error"], r["error"]
+    assert "list" in r["error"], r["error"]
+
+
+def test_impl_observations_json_as_dict_rejected_not_raised():
+    """A real dict (not a JSON string) for observations_json must return the
+    structured error envelope, naming the field — never an uncaught TypeError."""
+    server = fresh_server()
+    r = json.loads(server._add_observation_batch_impl(
+        observations_json={"not": "a list"},  # actual dict, not a JSON string
+        url=f"file://{TEST_FILE}",
+        title="Test source",
+    ))
+    assert "error" in r, r
+    assert "observations_json" in r["error"], r["error"]
+    assert "dict" in r["error"], r["error"]
+
+
+def test_impl_observations_json_valid_string_still_works():
+    """C2 regression guard: a well-formed JSON-string observations_json is
+    unaffected by the TypeError fix."""
+    server = fresh_server()
+    r = json.loads(server._add_observation_batch_impl(
+        observations_json=json.dumps(_two_obs()),
+        url=f"file://{TEST_FILE}",
+        title="Test source",
+    ))
+    assert "error" not in r, r
+    assert r.get("total") == 2
+    assert r.get("created") == 2
+
+
+def test_impl_observations_json_malformed_string_still_reports_decode_error():
+    """C2 regression guard: a malformed JSON string still produces today's
+    JSONDecodeError message, unchanged by the TypeError fix."""
+    server = fresh_server()
+    r = json.loads(server._add_observation_batch_impl(
+        observations_json="{not-an-array}",
+        url=f"file://{TEST_FILE}",
+        title="Test source",
+    ))
+    assert "error" in r, r
+    assert "Invalid JSON" in r["error"], r["error"]
+
+
 # ── standpoint_author_id hard gate (#1827 layer 1) — batch per-item ────────
 
 
