@@ -7231,7 +7231,9 @@ def _commit_snapshot_async(
 
     # 1. #786 read-mark on conn — a real-page read forces a genuine WAL read mark so
     #    the capture sees a consistent committed view (identical discipline to the
-    #    sync dump; verified conn.backup() works while this txn is open). Guard: don't
+    #    sync dump). The capture itself backs up from a fresh read-only connection,
+    #    never from conn (#3232: conn.backup() hangs forever if conn holds an
+    #    uncommitted write), so conn's transaction state cannot block it. Guard: don't
     #    BEGIN if conn already has an open transaction.
     #    #3222: a failure here is NOT silent. The capture still runs (durability
     #    wins) but the result dict carries read_mark="failed" + read_mark_error and
