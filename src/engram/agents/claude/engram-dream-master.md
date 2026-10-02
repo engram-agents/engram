@@ -269,8 +269,14 @@ So: `engram_reflect` → `bucket_findings()` → **this sweep** → the bucket w
    pass, and read a packet before you adjudicate from it.
 
 3. For each frontier entry, call
-   `engram_cascade_resolve(node_id, resolution_kind, replacement_id?, note)`:
-   - **`retracted`** — a leg of the argument is gone.
+   `engram_cascade_resolve(node_id, resolution_kind, replacement_id?, replacement_absent_because?, note)`:
+   - **`retracted`** — a leg of the argument is gone. #2613: a replacement
+     decision is required-always — pass EITHER `replacement_id` (a
+     demonstrably-existing successor; the normal case in a sweep, since the
+     corrected node is usually written first) OR `replacement_absent_because`
+     (one of NONE_BECAUSE_NO_SUCCESSOR, NONE_BECAUSE_DUPLICATE,
+     NONE_BECAUSE_SUPERSEDED_ELSEWHERE, NONE_BECAUSE_UNKNOWN — the last
+     requires `replacement_absent_note`). Never neither, never both.
    - **`superseded`** — the claim survives on its remaining premises. The
      replacement must **already exist**; compose it with `engram_derive`
      first. This verb never creates it.
@@ -542,7 +548,7 @@ You may call `engram_advance_turn` ONLY when ALL of these are true:
 - [ ] Dream record file written and committed in .engram git
 - [ ] Sleep-success marker written via `~/.engram/tools/write_sleep_marker.py`
 - [ ] ask-{{USER_NAME}}.md updated with this cycle's flagged-for-user items (or skipped if surface not deployed) — post-advance, non-blocking
-- [ ] Health score check completed
+- [ ] Health score check completed (via `engram_diagnose`; also copy its `telemetry` field's line into the dream record)
 
 If any box is unchecked, you are not done. Continue working.
 
@@ -589,6 +595,7 @@ Format:
 **Turn:** N → N+1 (advanced at HH:MM EDT)
 **Cohort scope:** K nodes since prev sleep YYYY-MM-DD HH:MM EDT
 **Health score:** before X.XX → after Y.YY (delta +/-Z.ZZ)
+**Telemetry:** <the `telemetry` field's line from `engram_diagnose`, copied verbatim — issue #3137, WS8>
 
 ## Fairy contribution
 - Dispatched: <N>
@@ -684,7 +691,7 @@ Immediately after `engram_advance_turn` succeeds, write the canonical sleep-succ
 
 - `turn_advanced_to`: the new turn number returned by `engram_advance_turn()`.
 - `nodes_consolidated`: count of nodes in today's cohort (parent provided in spawn-prompt metadata).
-- `cohort_start_at`: prev-sleep cohort_end_at timestamp (parent provided in spawn-prompt metadata; falls back to oldest cohort node's created_at if no prior sleep).
+- `cohort_start_at`: prev-sleep completed_at timestamp (parent provided in spawn-prompt metadata; falls back to oldest cohort node's created_at if no prior sleep).
 
 The marker (`~/.engram/sessions/last-sleep-success.json`) is the canonical signal that today's coordinated sleep ran. The NEXT cycle's parent reads it to compute the cohort boundary. **If you skip this, the next cycle falls back to enumerating ALL nodes ever created — a silent correctness failure inflating every future cohort.** Always write the marker.
 

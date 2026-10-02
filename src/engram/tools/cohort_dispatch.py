@@ -7,9 +7,14 @@ orchestration:
   prepare         Sample/chunk a cohort into per-chunk payload files.
   verify-in       Pre-flight integrity checks on a cohort before dispatch.
   validate        Validate per-chunk agent output; split clean vs failures.
-                  On exit 0 (no failures): auto-writes final_payload.json.
-                  On exit 1 (failures): auto-writes retry_payload.json with
-                  previous_error fields for the retry fairy.
+                  Exit 0 = final_payload.json written (no failures; ids the
+                  fairy returned that were never sent are discarded and listed
+                  as `unexpected` in the summary + stderr, never retried).
+                  Exit 1 = retry_payload.json written with previous_error
+                  fields for the retry fairy (holds only the failures).
+                  Exit 2 = pipeline/validate error: neither file is written.
+                  A final/retry file present after validate was always written
+                  by THIS run (stale copies are deleted at the start).
   incorporate     Merge retry fairy output → final_payload.json.
                   When still_failing is non-empty: writes retry_payload.json
                   (same schema as validate's, for the next retry round).
@@ -46,11 +51,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import sqlite3
 import sys
 import textwrap
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -789,34 +796,219 @@ def _parse_agent_output(raw: str) -> list[dict]:
     raise ValueError(f"Unexpected agent output shape: {list(data.keys()) if isinstance(data, dict) else type(data)}")
 
 
+class ReconciliationInvariantError(RuntimeError):
+    """validate's own id bookkeeping is inconsistent (#3045) — a bug in
+    cmd_validate, never a fairy error."""
+
+
+def _assert_reconciled(
+    sent_ids: list[str], clean_ids: list[str], failure_ids: list[str]
+) -> None:
+    """Whole-run invariant (#3045): every sent id lands in exactly one of
+    clean / failures, and nothing that was not sent is clean.
+
+    Raises ReconciliationInvariantError naming the offending ids.
+    """
+    from collections import Counter
+
+    sent = Counter(sent_ids)
+    seen = Counter(clean_ids) + Counter(failure_ids)
+    problems: list[str] = []
+    missing = sorted(i for i in sent if seen[i] == 0)
+    if missing:
+        problems.append(f"sent but in neither clean nor failures: {missing}")
+    multiple = sorted(i for i in sent if seen[i] > sent[i])
+    if multiple:
+        problems.append(f"in more than one of clean/failures (or repeated): {multiple}")
+    stray_clean = sorted(set(clean_ids) - set(sent))
+    if stray_clean:
+        problems.append(f"clean but never sent: {stray_clean}")
+    if problems:
+        raise ReconciliationInvariantError("; ".join(problems))
+
+
+def _reconcile_chunk(
+    chunk_name: str,
+    sent_entries: list[dict],
+    items: list[dict],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Reconcile one chunk's returned items against its sent payload (#3045).
+
+    Returns (clean, failures, unexpected). Quality is judged per item by
+    validate_summary_entry; on top of that:
+      - dropped (sent, not returned) -> failure "dropped: ..."
+      - unexpected (returned, not sent) -> reported in `unexpected` only
+      - duplicate (returned K>1 times) -> ONE failure "returned K times ..."
+    """
+    from collections import Counter
+
+    entry_by_id = {e["id"]: e for e in sent_entries}
+    counts = Counter(
+        it.get("node_id") for it in items
+        if isinstance(it, dict) and isinstance(it.get("node_id"), str)
+    )
+    clean: list[dict] = []
+    failures: list[dict] = []
+    unexpected: list[dict] = []
+    dup_reported: set[str] = set()
+
+    for item in items:
+        nid = item.get("node_id") if isinstance(item, dict) else None
+        if not isinstance(nid, str) or nid not in entry_by_id:
+            unexpected.append({
+                "node_id": nid if isinstance(nid, str) and nid else "<unknown>",
+                "chunk": chunk_name,
+            })
+            continue
+        if counts[nid] > 1:
+            if nid not in dup_reported:
+                dup_reported.add(nid)
+                failures.append({
+                    "node_id": nid,
+                    "payload": entry_by_id[nid],
+                    "error": f"returned {counts[nid]} times in {chunk_name}",
+                })
+            continue
+        err = validate_summary_entry(item)
+        if err is None:
+            clean.append({
+                "node_id": nid,
+                "recall_summary": item["recall_summary"],
+                "recall_keywords": item["recall_keywords"],
+            })
+        else:
+            failures.append({
+                "node_id": nid,
+                "payload": entry_by_id[nid],
+                "error": err["error"],
+            })
+
+    for entry in sent_entries:
+        if entry["id"] not in counts:
+            failures.append({
+                "node_id": entry["id"],
+                "payload": entry,
+                "error": f"dropped: sent in {chunk_name} payload, not returned by the fairy",
+            })
+    return clean, failures, unexpected
+
+
+class _PayloadError(Exception):
+    """A chunk's sent payload is unusable (pipeline bug, not a fairy error)."""
+
+
+def _load_sent_entries(payload_path: Path) -> list[dict]:
+    """Read a chunk payload as a list of entries each with a string ``id``.
+
+    Raises _PayloadError naming the problem (missing, unreadable, not a list,
+    entry without a string id).
+    """
+    if not payload_path.exists():
+        raise _PayloadError(f"payload file not found: {payload_path}")
+    try:
+        entries = json.loads(payload_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise _PayloadError(f"payload file unreadable ({payload_path}): {exc}") from exc
+    if not isinstance(entries, list):
+        raise _PayloadError(f"payload file is not a JSON list: {payload_path}")
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+            raise _PayloadError(
+                f"payload entry {i} has no string 'id' ({payload_path})"
+            )
+    return entries
+
+
+def _exit_2_on_unexpected(fn):
+    """Map any UNEXPECTED exception in a subcommand to exit code 2.
+
+    An uncaught exception would exit 1 (Python's default), which the
+    engram-sleep skill reads as "failures present, retry_payload.json
+    written" -- so validate's exit 1 must mean exactly that. Deliberate exit
+    codes (returns) pass through untouched; SystemExit / KeyboardInterrupt are
+    not ``Exception`` and are not caught.
+    """
+    name = fn.__name__.removeprefix("cmd_").removesuffix("_retry")
+
+    @functools.wraps(fn)
+    def wrapper(args: argparse.Namespace) -> int:
+        try:
+            return fn(args)
+        except Exception as exc:
+            print(
+                f"error: {name} failed unexpectedly: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            traceback.print_exc(file=sys.stderr)
+            return 2
+
+    return wrapper
+
+
+@_exit_2_on_unexpected
 def cmd_validate(args: argparse.Namespace) -> int:
     """Validate per-chunk agent output; write clean_items.json + failures.json.
 
-    Reads chunk-N/agent_output.json files under --out.
-    Exit code: 0 if no failures, 1 if failures require retry.
+    Reads chunk-N/agent_output.json files under --out and reconciles each
+    chunk's returned node_ids against chunk-N/payload.json (#3045): dropped
+    ids become failures (retried), unexpected ids are reported and never
+    clean, duplicated ids are one failure.
+    In manifest mode the sent ids come from each chunk's manifest
+    payload_path (an unusable payload is a pipeline bug -> exit 2); without a
+    manifest (ad-hoc) they come from chunk-N/payload.json and an unusable one
+    only skips that chunk's reconciliation with a warning.
+
+    Exit code: 0 = final_payload.json written (no failures; unexpected ids, if
+    any, were discarded and are listed on stderr + in the summary);
+    1 = failures -> retry_payload.json written (holds only the failures;
+    unexpected ids are excluded and listed); 2 = usage / pipeline error or an
+    internal reconciliation-invariant violation or ANY unexpected exception
+    (no final/retry written; error + traceback on stderr). So exit 1 <=>
+    retry_payload.json was written by this run.
+    final_payload.json / retry_payload.json left by an earlier run are deleted
+    first, so a file present afterwards was written by this run.
     """
     out_dir = Path(args.out)
     if not out_dir.exists():
         print(f"error: output directory not found: {out_dir}", file=sys.stderr)
         return 2
+    for stale_name in ("final_payload.json", "retry_payload.json"):
+        (out_dir / stale_name).unlink(missing_ok=True)
 
     clean_items: list[dict] = []
     failures: list[dict] = []
+    unexpected: list[dict] = []
+    # Ids/results of chunks actually reconciled against a readable payload
+    # (#3045); the whole-run invariant is asserted over these only.
+    rec_sent: list[str] = []
+    rec_clean: list[str] = []
+    rec_failed: list[str] = []
 
     # Discover chunks by reading manifest if present, else scanning dirs
     manifest_path = out_dir / "manifest.json"
     chunk_dirs: list[Path]
+    # chunk_dir -> sent entries, manifest mode only (single source of truth)
+    manifest_sent: Optional[dict[Path, list[dict]]] = None
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
         chunk_dirs = [Path(c["chunk_dir"]) for c in manifest["chunks"]]
         # Build a lookup: node_id → original payload entry
         _payload_lookup: dict[str, dict] = {}
+        manifest_sent = {}
         for c in manifest["chunks"]:
-            payload_path = Path(c["payload_path"])
-            if payload_path.exists():
-                entries = json.loads(payload_path.read_text())
-                for entry in entries:
-                    _payload_lookup[entry["id"]] = entry
+            chunk_dir = Path(c["chunk_dir"])
+            try:
+                entries = _load_sent_entries(Path(c["payload_path"]))
+            except _PayloadError as exc:
+                print(
+                    f"error: {chunk_dir.name}: {exc} (pipeline bug, not a fairy "
+                    "error; no outputs written)",
+                    file=sys.stderr,
+                )
+                return 2
+            manifest_sent[chunk_dir] = entries
+            for entry in entries:
+                _payload_lookup[entry["id"]] = entry
     else:
         # No manifest.json: ad-hoc invocation only. _payload_lookup will be
         # empty, so retry-prompt failures carry only {"id": node_id} with no
@@ -845,24 +1037,26 @@ def cmd_validate(args: argparse.Namespace) -> int:
             )
             # Collect IDs from this chunk's payload and record as failures so
             # the dream master sees them in the dream record (not silently dropped).
-            payload_path = chunk_dir / "payload.json"
-            if payload_path.exists():
+            if manifest_sent is not None:
+                missing_entries = manifest_sent[chunk_dir]
+            else:
                 try:
-                    missing_entries = json.loads(payload_path.read_text())
-                    for entry in missing_entries:
-                        failures.append({
-                            "node_id": entry["id"],
-                            "payload": entry,
-                            "error": (
-                                f"missing output: agent_output.json absent for "
-                                f"{chunk_dir.name}"
-                            ),
-                        })
-                except (json.JSONDecodeError, KeyError) as exc:
+                    missing_entries = _load_sent_entries(chunk_dir / "payload.json")
+                except _PayloadError as exc:
                     print(
                         f"warning: could not read payload for {chunk_dir.name}: {exc}",
                         file=sys.stderr,
                     )
+                    missing_entries = []
+            for entry in missing_entries:
+                failures.append({
+                    "node_id": entry["id"],
+                    "payload": entry,
+                    "error": (
+                        f"missing output: agent_output.json absent for "
+                        f"{chunk_dir.name}"
+                    ),
+                })
             continue
 
         raw = output_file.read_text()
@@ -871,18 +1065,55 @@ def cmd_validate(args: argparse.Namespace) -> int:
         except (json.JSONDecodeError, ValueError) as exc:
             print(f"error: could not parse {output_file}: {exc}", file=sys.stderr)
             # All nodes in this chunk go to failures with a parse error
-            payload_path = chunk_dir / "payload.json"
-            if payload_path.exists():
-                payload_entries = json.loads(payload_path.read_text())
-                for entry in payload_entries:
-                    failures.append({
-                        "node_id": entry["id"],
-                        "payload": entry,
-                        "error": f"agent_output.json parse error: {exc}",
-                    })
+            if manifest_sent is not None:
+                payload_entries = manifest_sent[chunk_dir]
+            else:
+                try:
+                    payload_entries = _load_sent_entries(chunk_dir / "payload.json")
+                except _PayloadError as p_exc:
+                    print(
+                        f"warning: could not read payload for {chunk_dir.name}: {p_exc}",
+                        file=sys.stderr,
+                    )
+                    payload_entries = []
+            for entry in payload_entries:
+                failures.append({
+                    "node_id": entry["id"],
+                    "payload": entry,
+                    "error": f"agent_output.json parse error: {exc}",
+                })
             continue
 
-        # Validate each item
+        # Reconcile returned ids against the chunk's sent payload (#3045).
+        sent_entries: Optional[list[dict]]
+        if manifest_sent is not None:
+            sent_entries = manifest_sent[chunk_dir]
+        else:
+            sent_payload_path = chunk_dir / "payload.json"
+            try:
+                sent_entries = _load_sent_entries(sent_payload_path)
+            except _PayloadError as exc:
+                if sent_payload_path.exists():
+                    print(f"warning: could not read payload for {chunk_dir.name}: {exc}",
+                          file=sys.stderr)
+                sent_entries = None
+        if sent_entries is not None:
+            c_clean, c_fail, c_unexp = _reconcile_chunk(chunk_dir.name, sent_entries, items)
+            clean_items.extend(c_clean)
+            failures.extend(c_fail)
+            unexpected.extend(c_unexp)
+            rec_sent.extend(e["id"] for e in sent_entries)
+            rec_clean.extend(c["node_id"] for c in c_clean)
+            rec_failed.extend(f["node_id"] for f in c_fail)
+            continue
+
+        print(
+            f"warning: no readable payload.json for {chunk_dir.name} — cannot reconcile "
+            "returned ids against sent ids; reconciliation SKIPPED for this chunk "
+            "(dropped/unexpected/duplicate ids are NOT detected here)",
+            file=sys.stderr,
+        )
+        # Validate each item (quality only)
         for item in items:
             err = validate_summary_entry(item)
             if err is None:
@@ -899,6 +1130,16 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     "error": err["error"],
                 })
 
+    try:
+        _assert_reconciled(rec_sent, rec_clean, rec_failed)
+    except ReconciliationInvariantError as exc:
+        print(
+            "error: validate reconciliation invariant violated (a bug in validate, "
+            f"not a fairy error): {exc}",
+            file=sys.stderr,
+        )
+        return 2
+
     # Write artifacts
     (out_dir / "clean_items.json").write_text(
         json.dumps(clean_items, indent=2, ensure_ascii=False)
@@ -910,9 +1151,22 @@ def cmd_validate(args: argparse.Namespace) -> int:
     print(json.dumps({
         "clean": len(clean_items),
         "failures": len(failures),
+        "dropped": sum(1 for f in failures if f["error"].startswith("dropped:")),
+        "unexpected": unexpected,
         "clean_items_path": str(out_dir / "clean_items.json"),
         "failures_path": str(out_dir / "failures.json"),
     }, indent=2))
+
+    if unexpected:
+        # Loud, but not an exit-code event on its own: the invented items are
+        # discarded and nothing sent is missing, so there is nothing to retry.
+        print(
+            "\n!!! UNEXPECTED node_ids: the fairy returned ids that were never "
+            "sent; they were DISCARDED (excluded from clean/final/retry):",
+            file=sys.stderr,
+        )
+        for u in unexpected:
+            print(f"!!!   {u['node_id']}  (chunk: {u['chunk']})", file=sys.stderr)
 
     # Write retry_payload.json if there are failures (retryable items)
     # retry_payload.json is in the same schema as input payload.json so it can
@@ -955,6 +1209,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+@_exit_2_on_unexpected
 def cmd_incorporate_retry(args: argparse.Namespace) -> int:
     """Merge retry output + prior failures into final artifacts.
 
@@ -983,7 +1238,8 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
     — never the round-0 snapshot. Without this, round N re-read round-0's clean/failures
     and silently dropped every intermediate round's fixes (clean count could regress).
 
-    Exit code: 0.
+    Exit code: 0 = done; 2 = usage / input error or any unexpected exception
+    (error + traceback on stderr).
     """
     out_dir = Path(args.out)
     failures_path = out_dir / "failures.json"

@@ -154,3 +154,54 @@ CURRENT = format_version()
 today. Import this (not a hand-formatted string) at every call site that
 needs the current version literally, so a future MAJOR/MINOR bump here is
 the only edit required anywhere in the codebase."""
+
+
+# ---------------------------------------------------------------------------
+# Module-layout prefix canonicalization (engram-alpha#3122, round 2)
+# ---------------------------------------------------------------------------
+#
+# A `health.*` function's `__module__` (and, by extension, any dotted
+# `health.*` name derived from it -- a serialized signal_fn/scoring_fn path,
+# a declared-blob leaf string) depends on how the `health` package was
+# imported: `engram.health.metrics` from a `src/`-tree checkout (top-level
+# package `engram` on sys.path), `health.metrics` in the deployed plugin
+# (the build flattens `src/engram/` away -- see this repo's CLAUDE.md
+# "Plugin build restructures code paths"). This was previously two
+# independent copies of the same rule -- `health/engine.py`'s
+# `_dotted_name` (operating on a MODULE name) and `health/series.py`'s
+# `_normalize_layout_prefix` (operating on an arbitrary dotted STRING value
+# inside a recursively-walked JSON structure) -- each with its own copy of
+# the prefix constants. `canonical_health_dotted` below is the ONE shared
+# implementation both now route through.
+_SRC_TREE_HEALTH_PREFIX = "engram.health."
+_CANONICAL_HEALTH_PREFIX = "health."
+
+
+def canonical_health_dotted(name: str) -> str:
+    """Canonicalize a dotted ``health.*`` name to the deployed-layout form,
+    collapsing the two import-layout variants engram-alpha#3122 diagnosed.
+
+    Subsumes both call shapes this rule has: a full
+    ``f"{fn.__module__}.{fn.__qualname__}"`` dotted name (``health/
+    engine.py``'s ``_dotted_name`` -- a leading ``engram.health.`` prefix on
+    the module carries through into the joined string, so stripping it
+    there is equivalent to stripping it here), and an arbitrary leaf string
+    value from a recursively-walked JSON structure (``health/series.py``'s
+    ``_normalize_layout_prefix``, which may hand this a bare module name
+    with no qualname suffix at all).
+
+    - ``name`` starting with the literal ``"engram.health."`` prefix: strip
+      the leading ``"engram."``, so ``"engram.health.metrics.x"`` ->
+      ``"health.metrics.x"``.
+    - ``name`` exactly equal to the bare module name ``"engram.health"``
+      (no trailing dot, no qualname suffix) -> ``"health"`` -- the edge case
+      ``_dotted_name`` used to special-case separately (``module ==
+      "engram.health"``), kept here so this one function subsumes it too.
+    - Anything else (already canonical, or unrelated to ``health.*`` at
+      all) is returned unchanged.
+    """
+    if name.startswith(_SRC_TREE_HEALTH_PREFIX):
+        return _CANONICAL_HEALTH_PREFIX + name[len(_SRC_TREE_HEALTH_PREFIX):]
+    if name == "engram.health":
+        return "health"
+    return name

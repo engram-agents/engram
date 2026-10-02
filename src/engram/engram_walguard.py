@@ -29,16 +29,28 @@ predated the writes, so it did not rescue them either.  A caller filing during
 split-brain has no way to tell a durable write from a doomed one — the "6 hours"
 figure should be read as write exposure, not merely stale-read exposure.
 
+Fail-closed gate (#2635 unit 2): detection alone does not stop a doomed write.
+assert_not_displaced() is the single place that turns a CONFIRMED displacement
+into a hard refusal (SubstrateDisplaced) — called unthrottled on every DB-
+connection dispatch, additive alongside (never a replacement for) the
+existing throttled marker/dump path below.
+
 This module:
-  - detect_shm_displacement()  — inode-compare check via /proc/self/fd/
+  - detect_shm_displacement()  — inode-compare check via /proc/self/fd/,
+                                  covering both -shm and -wal
+  - assert_not_displaced()     — raises SubstrateDisplaced on a CONFIRMED
+                                  displacement; a quiet no-op on healthy or
+                                  detection_unavailable (#2635 unit 2)
+  - SubstrateDisplaced         — the exception assert_not_displaced() raises
   - write_degraded_marker()    — atomic marker write
   - read_degraded_marker()     — read the marker (returns None when absent)
   - clear_degraded_marker()    — remove the marker
   - recovery_block()           — structured recovery guidance (#1947), also
                                   embedded in write_degraded_marker()'s output
   - recovery_banner_text()     — compact prose form of the same guidance, used
-                                  by engram_core's CRITICAL log line and the
-                                  SUBSTRATE DEGRADED banner
+                                  by engram_core's CRITICAL log line, the
+                                  SUBSTRATE DEGRADED banner, and
+                                  SubstrateDisplaced.remedy
 """
 
 from __future__ import annotations
@@ -117,20 +129,33 @@ def recovery_banner_text() -> str:
 # ---------------------------------------------------------------------------
 
 def detect_shm_displacement(db_path: str) -> Optional[dict]:
-    """Check whether the live process's shm fd has been displaced.
+    """Check whether the live process's shm AND wal fds have been displaced.
 
-    Compares the inode of the -shm file the current process holds open
-    (via /proc/self/fd/) against the inode of the on-disk <db_path>-shm.
+    Compares the inode of the -shm and -wal files the current process holds
+    open (via /proc/self/fd/) against the inode of the corresponding on-disk
+    <db_path>-shm / <db_path>-wal files.
+
+    #2635 widening: v1 of this function checked -shm only. A real incident
+    (2026-09-06) showed a server's -wal fd marked "(deleted)" while -shm
+    looked perfectly healthy -- the shm-only check would have called that
+    case healthy. Both files are now checked with the same deleted-vs-
+    replaced logic; WAL is checked first (matching that incident's own
+    narrative), though either check order reaches the same verdict, since
+    ANY genuine displacement on either file is disqualifying.
 
     Returns:
-        None  — GENUINELY healthy: an shm fd is held and its inode matches
-                the on-disk file. The ONLY value a caller may read as
-                "confirmed not displaced".
+        None  — GENUINELY healthy: at least one of shm/wal has an fd held by
+                this process, and every HELD one's inode matches its on-disk
+                file. The ONLY value a caller may read as "confirmed not
+                displaced". (An fd not held for one of the two files is not
+                itself a failure — it just means that file can't be judged
+                yet; see "no shm or wal fd held" below for when NEITHER can
+                be judged.)
         {"reason": "detection_unavailable", "why": <str>}
             — #2651: detection could not be performed, for any of several
-              reasons (no /proc on this platform; no shm fd held by this
-              process yet, e.g. the connection hasn't opened WAL; the held
-              fd or the on-disk file couldn't be stat()'d; an unexpected
+              reasons (no /proc on this platform; neither shm nor wal fd held
+              by this process yet, e.g. the connection hasn't opened WAL; a
+              held fd or its on-disk file couldn't be stat()'d; an unexpected
               internal error). Mirrors capture_forensics()'s own
               "unavailable" vocabulary below. Callers MUST NOT treat this
               the same as None -- "could not check" is not "checked and
@@ -138,21 +163,23 @@ def detect_shm_displacement(db_path: str) -> Optional[dict]:
               None, indistinguishable from genuine health; on a seat with
               no /proc (every Darwin seat, v1), that made this function
               return the None shape on EVERY call, permanently.
-        {"reason": "shm_deleted", "fd": <int>}
+        {"reason": "shm_deleted", "fd": <int>} / {"reason": "wal_deleted", "fd": <int>}
             — the fd symlink ends with " (deleted)", meaning the on-disk shm
-              was removed while the process held it open.
+              (respectively wal) was removed while the process held it open.
         {"reason": "shm_replaced", "fd": <int>, "fd_inode": <int>, "disk_inode": <int>}
-            — the on-disk shm exists but has a different inode than the one
-              this process holds open (file was replaced, not deleted).  This
-              is the atomic-replacement case — e.g. another process called
-              os.replace() on the shm path — not the simple deletion case
-              (which produces "shm_deleted" via the "(deleted)" suffix).  On
-              Linux, unlinking always produces the "(deleted)" suffix, so
-              "shm_replaced" requires a live replacement file to exist at the
-              shm path with a mismatched inode.
+        {"reason": "wal_replaced", "fd": <int>, "fd_inode": <int>, "disk_inode": <int>}
+            — the on-disk shm (respectively wal) exists but has a different
+              inode than the one this process holds open (file was replaced,
+              not deleted).  This is the atomic-replacement case — e.g.
+              another process called os.replace() on the path — not the
+              simple deletion case (which produces the "_deleted" reason via
+              the "(deleted)" suffix).  On Linux, unlinking always produces
+              the "(deleted)" suffix, so a "_replaced" reason requires a live
+              replacement file to exist at the path with a mismatched inode.
     """
     try:
         shm_path = db_path + "-shm"
+        wal_path = db_path + "-wal"
         proc_fd = "/proc/self/fd"
         if not os.path.isdir(proc_fd):
             return {
@@ -161,8 +188,8 @@ def detect_shm_displacement(db_path: str) -> Optional[dict]:
                 "detection is Linux-only in v1)",
             }
 
-        shm_fd: Optional[int] = None
-        shm_target: Optional[str] = None
+        # (fd_num, raw readlink target) per file name, found by a single scan.
+        held: dict[str, tuple[int, str]] = {}
 
         # os.listdir intentional: closes dir fd before return, preventing a
         # transient self-referencing fd that os.scandir (which keeps the dir fd
@@ -176,67 +203,81 @@ def detect_shm_displacement(db_path: str) -> Optional[dict]:
                 target = os.readlink(os.path.join(proc_fd, entry))
             except OSError:
                 continue
-            # Match the exact shm path (ignoring any " (deleted)" suffix for
+            # Match the exact path (ignoring any " (deleted)" suffix for
             # comparison purposes — the suffix itself is a displacement signal)
             # rstrip() is cosmetic — the ' (deleted)' suffix is handled by
             # endswith() below, not stripped here.  We strip any trailing
             # whitespace so the equality/startswith comparisons don't miss a
             # path that happens to have a trailing space on an exotic fs.
             base_target = target.rstrip()
-            if base_target == shm_path or base_target.startswith(shm_path + " "):
-                shm_fd = fd_num
-                shm_target = target
-                break
+            for which, path in (("wal", wal_path), ("shm", shm_path)):
+                if which in held:
+                    continue
+                if base_target == path or base_target.startswith(path + " "):
+                    held[which] = (fd_num, target)
 
-        if shm_fd is None:
-            # No fd held for this shm — cannot judge; connection may not have
-            # opened WAL yet (e.g. the DB was opened in WAL mode but no
-            # read/write has forced shm creation yet). #2651: this is a
+        if not held:
+            # No fd held for either file — cannot judge; connection may not
+            # have opened WAL yet (e.g. the DB was opened in WAL mode but no
+            # read/write has forced shm/wal creation yet). #2651: this is a
             # "can't tell" state, not a health verdict -- distinct from
             # None, even though (unlike the /proc-absent case) it is
             # typically transient and resolves on the next check once the
             # connection has opened WAL.
             return {
                 "reason": "detection_unavailable",
-                "why": "no shm fd held by this process yet "
+                "why": "no shm or wal fd held by this process yet "
                 "(connection may not have opened WAL yet)",
             }
 
-        # fd target ends with " (deleted)" → on-disk shm is gone
-        if shm_target is not None and shm_target.endswith(" (deleted)"):
-            return {"reason": "shm_deleted", "fd": shm_fd}
+        # Check WAL before SHM (matches the 2026-09-06 incident narrative —
+        # -wal deleted while -shm looked fine); either order reaches the same
+        # verdict since any genuine displacement, on either file, disqualifies.
+        for which, path in (("wal", wal_path), ("shm", shm_path)):
+            entry = held.get(which)
+            if entry is None:
+                # This file's fd isn't held (yet) — not itself a failure;
+                # just nothing to judge for THIS file. Only "neither held"
+                # (handled above) is a detection_unavailable verdict.
+                continue
+            fd_num, target = entry
+            base_target = target.rstrip()
 
-        # Compare inodes
-        fd_link = os.path.join(proc_fd, str(shm_fd))
-        try:
-            fd_stat = os.stat(fd_link)
-        except OSError:
-            # can't stat the fd link -- #2651: unavailable, not healthy
-            return {
-                "reason": "detection_unavailable",
-                "why": f"could not stat the held fd link {fd_link!r}",
-            }
+            # fd target ends with " (deleted)" → on-disk file is gone
+            if base_target.endswith(" (deleted)"):
+                return {"reason": f"{which}_deleted", "fd": fd_num}
 
-        try:
-            disk_stat = os.stat(shm_path)
-        except FileNotFoundError:
-            return {"reason": "shm_deleted", "fd": shm_fd}
-        except OSError:
-            # unexpected; #2651: unavailable, not healthy -- don't raise
-            return {
-                "reason": "detection_unavailable",
-                "why": f"could not stat the on-disk shm path {shm_path!r}",
-            }
+            # Compare inodes
+            fd_link = os.path.join(proc_fd, str(fd_num))
+            try:
+                fd_stat = os.stat(fd_link)
+            except OSError:
+                # can't stat the fd link -- #2651: unavailable, not healthy
+                return {
+                    "reason": "detection_unavailable",
+                    "why": f"could not stat the held fd link {fd_link!r}",
+                }
 
-        if fd_stat.st_ino != disk_stat.st_ino:
-            return {
-                "reason": "shm_replaced",
-                "fd": shm_fd,
-                "fd_inode": fd_stat.st_ino,
-                "disk_inode": disk_stat.st_ino,
-            }
+            try:
+                disk_stat = os.stat(path)
+            except FileNotFoundError:
+                return {"reason": f"{which}_deleted", "fd": fd_num}
+            except OSError:
+                # unexpected; #2651: unavailable, not healthy -- don't raise
+                return {
+                    "reason": "detection_unavailable",
+                    "why": f"could not stat the on-disk {which} path {path!r}",
+                }
 
-        return None  # healthy
+            if fd_stat.st_ino != disk_stat.st_ino:
+                return {
+                    "reason": f"{which}_replaced",
+                    "fd": fd_num,
+                    "fd_inode": fd_stat.st_ino,
+                    "disk_inode": disk_stat.st_ino,
+                }
+
+        return None  # healthy — every held fd (wal and/or shm) matches disk
 
     except Exception as e:
         # Any unexpected error → the guard must never crash the caller, but
@@ -246,6 +287,78 @@ def detect_shm_displacement(db_path: str) -> Optional[dict]:
             "reason": "detection_unavailable",
             "why": f"unexpected error during detection: {e!r}",
         }
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed gate (#2635 unit 2) — assert_not_displaced()
+# ---------------------------------------------------------------------------
+#
+# Motivating incident: when the live server's -wal/-shm sidecar files get
+# displaced out from under a held connection, a write still runs on the
+# displaced connection and returns success — the tool call reports "created"
+# while the write is invisible to every other process. detect_shm_
+# displacement() above only DETECTS the condition; nothing before this unit
+# REFUSED the call once detected. This is the single place that rule lives —
+# nothing else re-implements it (call this function, don't hand-roll the
+# detect-then-decide logic at a new call site).
+
+
+class SubstrateDisplaced(Exception):
+    """Raised by assert_not_displaced() when a genuine WAL/-shm displacement
+    is confirmed for the checked db_path.
+
+    Attributes:
+        detection: the raw dict from detect_shm_displacement() (a genuine
+            displacement reason — never None, never "detection_unavailable";
+            assert_not_displaced() only raises past those two cases).
+        remedy: the SAME remedy text every other degraded-state surface uses
+            (recovery_banner_text(), below) — imported, never a second
+            hand-copied string, so this and the marker/banner text can never
+            drift out of sync.
+    """
+
+    def __init__(self, detection: dict, remedy: str):
+        self.detection = detection
+        self.remedy = remedy
+        super().__init__(
+            f"substrate displaced (reason={detection.get('reason')}); {remedy}"
+        )
+
+
+def assert_not_displaced(db_path: str) -> None:
+    """Raise SubstrateDisplaced iff db_path's -wal/-shm are CONFIRMED displaced.
+
+    Meant to be called UNTHROTTLED on every DB-connection dispatch (#2635
+    unit 2) — separate from the throttled, storm-gated marker-write +
+    forensic-capture + emergency-dump path in engram_core._run_walguard_check,
+    which keeps its own cadence unchanged. detect_shm_displacement() itself is
+    cheap (median ~29µs measured), so calling it unconditionally on every
+    dispatch is intentional, not a perf concern.
+
+    Verdict mapping (mirrors detect_shm_displacement()'s own three-way split):
+      - None (genuinely confirmed healthy)      → return quietly.
+      - {"reason": "detection_unavailable", ...} → NOT a confirmed
+        displacement (couldn't check, e.g. non-Linux or no fd held yet) —
+        treated identically to None, i.e. return quietly. Darwin seats get
+        no protection from this gate; that is an accepted bound, not a bug
+        here (detection is Linux-only in v1 — see detect_shm_displacement's
+        own docstring).
+      - any other dict (a genuine displacement reason)
+        → raise SubstrateDisplaced(detection, recovery_banner_text()).
+
+    Never attempts recovery/reopen itself — recovery stays operator-driven
+    (the same recovery_block()/recovery_banner_text() guidance every other
+    degraded-state surface points at). A fresh same-process connection has
+    been measured to get "disk I/O error" while a stale holder lives, and a
+    clean close of the stale holder checkpoints an orphan WAL over data other
+    connections have since written — both bad, so this function does neither.
+    """
+    detection = detect_shm_displacement(db_path)
+    if detection is None:
+        return
+    if detection.get("reason") == "detection_unavailable":
+        return
+    raise SubstrateDisplaced(detection, recovery_banner_text())
 
 
 # ---------------------------------------------------------------------------

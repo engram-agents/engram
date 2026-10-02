@@ -1078,3 +1078,289 @@ def _add_edge_impl(
         return json.dumps(result)
     finally:
         conn.close()
+
+
+def _retype_edge_impl(
+    source_id: str = "",
+    target_id: str = "",
+    relation: str = "",
+    new_relation: str = "",
+    reason: str = "",
+) -> str:
+    """Internal implementation — see engram_retype_edge MCP tool for the
+    public payload schema. Kept callable with named kwargs for in-server
+    callers.
+
+    Corrects a wrong edge by making it WEAKER, never stronger (issue #2265,
+    design doc docs/2265-2347-edge-correction-design.md sec.2). One
+    transaction: refuse on a pending cascade marker on either endpoint,
+    refuse if this would retype away a derivation's LAST cascade premise
+    (Ariadne's design ruling on #2265 — a premise-less derivation would keep
+    an uncomputed confidence; use engram_supersede or engram_retract
+    instead), refuse if new_relation fails its own add-time checks, refuse
+    if the retype target relation already exists between the same
+    endpoints, change the relation, log the edit with the required reason,
+    and — if the OLD relation fed a derivation's confidence formula
+    (core.CASCADE_RELATIONS
+    membership — supported_by and cites are NOT members post-#2252 Stage
+    1.3, so retyping either is a confidence no-op by construction) —
+    recompute the source's confidence AND its downstream cascade
+    (engram_revision._cascade_recompute_confidence_transitive, the same
+    fixpoint walk engram_cascade_resolve uses, per design doc sec.2's "then
+    run the normal downstream recompute" — colleague review round 1 caught
+    that the first cut stopped at the source node) and report old -> new
+    plus the full cascade. A failure anywhere in this sequence leaves the
+    edge exactly as it was; nothing commits until every step has succeeded.
+    """
+    if not source_id or not source_id.strip():
+        return json.dumps({"error": "source_id is required and cannot be empty."})
+    if not target_id or not target_id.strip():
+        return json.dumps({"error": "target_id is required and cannot be empty."})
+    if not relation or not relation.strip():
+        return json.dumps({"error": "relation is required and cannot be empty."})
+    if not new_relation or not new_relation.strip():
+        return json.dumps({"error": "new_relation is required and cannot be empty."})
+    if not reason or not reason.strip():
+        return json.dumps({
+            "error": (
+                "reason is required and cannot be empty — engram_retype_edge "
+                "keeps the old edge in the edit-history record, never silently, "
+                "so a future reader can see why the correction was made."
+            )
+        })
+
+    move = (relation, new_relation)
+    if move not in core.RETYPE_ALLOWED_MOVES:
+        return json.dumps({
+            "error": (
+                f"'{relation}' -> '{new_relation}' is not an allowed re-type move. "
+                f"Allowed: {sorted(f'{a} -> {b}' for a, b in core.RETYPE_ALLOWED_MOVES)}. "
+                f"A re-type may only move an edge to a relation that claims LESS "
+                f"(design doc sec.2) — engram_retype_edge never makes an edge "
+                f"stronger. Use engram-surgical if a move outside this table is "
+                f"truly required."
+            )
+        })
+
+    conn = core._get_db()
+    try:
+        source = conn.execute(
+            "SELECT id, type, confidence FROM nodes WHERE id = ?", (source_id,)
+        ).fetchone()
+        if not source:
+            return json.dumps({"error": f"Source node '{source_id}' not found."})
+        target = conn.execute(
+            "SELECT id, type FROM nodes WHERE id = ?", (target_id,)
+        ).fetchone()
+        if not target:
+            return json.dumps({"error": f"Target node '{target_id}' not found."})
+
+        required_target_types = core.RETYPE_ALLOWED_MOVES[move]
+        if required_target_types is not None and target["type"] not in required_target_types:
+            return json.dumps({
+                "error": (
+                    f"'{relation}' -> '{new_relation}' requires the target to be "
+                    f"one of {sorted(required_target_types)}; target '{target_id}' "
+                    f"is type '{target['type']}'."
+                )
+            })
+
+        existing = conn.execute(
+            "SELECT id FROM edges WHERE source_id = ? AND target_id = ? AND relation = ?",
+            (source_id, target_id, relation),
+        ).fetchone()
+        if not existing:
+            return json.dumps({
+                "error": (
+                    f"No '{relation}' edge from {source_id} to {target_id} — "
+                    f"nothing to retype."
+                )
+            })
+
+        # Step 1 (design doc sec.2): refuse on a pending cascade marker on
+        # EITHER endpoint — the endpoint's own premises (or its downstream
+        # dependents' view of it) are still under adjudication.
+        for node_id in (source_id, target_id):
+            if core._pending_markers_for_node(conn, node_id):
+                return json.dumps({
+                    "error": (
+                        f"'{node_id}' carries a pending cascade marker — settle "
+                        f"the cascade first (engram_cascade_resolve) before "
+                        f"retyping an edge touching it."
+                    )
+                })
+
+        # Ariadne's design ruling on #2265 (colleague-review round on
+        # 362f6d0's diff, test 10): retyping a derivation's LAST cascade
+        # premise (derives_from / acknowledged_derives_from) is refused, not
+        # silently left at a stale confidence -- a premise-less derivation
+        # breaks the claim-bearing partition #2252 enforces. Checked here,
+        # before any mutation, alongside the pending-marker check above:
+        # count the source's remaining CASCADE_RELATIONS edges EXCLUDING the
+        # one being retyped away. Only relevant when the OLD relation is
+        # itself cascade-bearing (supported_by/cites never are, so this is a
+        # no-op for those two moves).
+        if relation in core.CASCADE_RELATIONS:
+            cascade_rels = sorted(core.CASCADE_RELATIONS)
+            remaining = conn.execute(
+                f"SELECT COUNT(*) AS c FROM edges WHERE source_id = ? "
+                f"AND relation IN ({','.join('?' for _ in cascade_rels)}) "
+                f"AND NOT (target_id = ? AND relation = ?)",
+                (source_id, *cascade_rels, target_id, relation),
+            ).fetchone()["c"]
+            if remaining == 0:
+                return json.dumps({
+                    "error": (
+                        f"'{source_id}' has no other cascade premise besides "
+                        f"this '{relation}' edge to '{target_id}' -- retyping "
+                        f"it away would leave the derivation with no premises "
+                        f"to compute a confidence from. Use engram_supersede "
+                        f"(a new derivation with its real premises) or "
+                        f"engram_retract instead of engram_retype_edge for "
+                        f"this case."
+                    )
+                })
+
+        # Step 2: new_relation's own add-time checks. Currently a no-op for
+        # every move in RETYPE_ALLOWED_MOVES (both 'about' and 'exemplifies'
+        # are temporal_causal=False, dag=False) -- implemented generically,
+        # against core.EDGE_CLASSIFICATIONS, so a future table addition
+        # targeting a dag=True/temporal_causal=True relation is caught
+        # correctly rather than silently skipped.
+        new_class = core.EDGE_CLASSIFICATIONS.get(new_relation, {})
+        if new_class.get("temporal_causal"):
+            src_created = conn.execute(
+                "SELECT created_at FROM nodes WHERE id = ?", (source_id,)
+            ).fetchone()["created_at"]
+            tgt_created = conn.execute(
+                "SELECT created_at FROM nodes WHERE id = ?", (target_id,)
+            ).fetchone()["created_at"]
+            if src_created < tgt_created:
+                return json.dumps({
+                    "error": (
+                        f"'{new_relation}' requires the source to be created "
+                        f"at-or-after the target (temporal_causal); "
+                        f"'{source_id}' predates '{target_id}'."
+                    )
+                })
+        if new_class.get("dag"):
+            import engram_dag_conformance as dagc
+            edges = set(dagc._live_dag_edges(conn))
+            edges.discard((source_id, target_id))  # the edge being retyped away
+            edges.add((source_id, target_id))
+            if dagc._find_cycle(sorted(edges)) is not None:
+                return json.dumps({
+                    "error": (
+                        f"Retyping to '{new_relation}' would close a cycle "
+                        f"through {source_id} -> {target_id}."
+                    )
+                })
+
+        conflict = conn.execute(
+            "SELECT id FROM edges WHERE source_id = ? AND target_id = ? AND relation = ?",
+            (source_id, target_id, new_relation),
+        ).fetchone()
+        if conflict:
+            return json.dumps({
+                "error": (
+                    f"a '{new_relation}' edge from {source_id} to {target_id} "
+                    f"already exists -- nothing to retype into. "
+                    f"engram_retype_edge never deletes or merges edges, so "
+                    f"this move is refused rather than silently collapsing "
+                    f"two edges into one."
+                )
+            })
+
+        old_confidence = source["confidence"]
+
+        # Steps 3-5, one transaction: change the relation, log the edit
+        # (with the required reason), and — only if the OLD relation fed the
+        # confidence formula — recompute. Nothing commits until every step
+        # succeeds; an exception anywhere below leaves the edge untouched
+        # (atomicity control, Ariadne's test 7).
+        conn.execute(
+            "UPDATE edges SET relation = ? WHERE source_id = ? AND target_id = ? AND relation = ?",
+            (new_relation, source_id, target_id, relation),
+        )
+        core._log_edit(conn, "edge_retyped", source_id, source["type"], {
+            "target_id": target_id,
+            "target_type": target["type"],
+            "old_relation": relation,
+            "new_relation": new_relation,
+            "reason": reason,
+        })
+
+        confidence_recompute = None
+        if relation in core.CASCADE_RELATIONS:
+            # Design doc sec.2 step 5: "recompute the source node's
+            # confidence. Then run the normal downstream recompute." The
+            # transitive helper does both in one fixpoint walk and does NOT
+            # commit internally (it only issues UPDATEs through
+            # core._recompute_node_confidence, same as this file's own
+            # prior single-node call did) -- so this stays inside the same
+            # transaction as the relation change above, and atomicity (test
+            # 7) is unaffected.
+            import engram_revision as revision
+            rc = revision._cascade_recompute_confidence_transitive(conn, source_id)
+            source_change = next(
+                (c for c in rc["changed"] if c["node_id"] == source_id), None
+            )
+            source_skip = next(
+                (s for s in rc["skipped"] if s["node_id"] == source_id), None
+            )
+            if source_change is not None:
+                confidence_recompute = {
+                    "old": source_change["old"],
+                    "new": source_change["new"],
+                    "disposition": "recomputed",
+                }
+            elif source_skip is not None:
+                confidence_recompute = {
+                    "old": old_confidence,
+                    "new": old_confidence,
+                    "disposition": "skipped",
+                    "reason": source_skip.get("reason"),
+                }
+            else:
+                confidence_recompute = {
+                    "old": old_confidence,
+                    "new": old_confidence,
+                    "disposition": "unchanged",
+                }
+            confidence_recompute["cascade"] = rc["changed"]
+            if rc.get("convergence_warning"):
+                confidence_recompute["convergence_warning"] = rc["convergence_warning"]
+
+        conn.commit()
+
+        result = {
+            "status": "retyped",
+            "source_id": source_id,
+            "target_id": target_id,
+            "old_relation": relation,
+            "new_relation": new_relation,
+            "reason": reason,
+        }
+        if confidence_recompute is not None:
+            result["confidence_recompute"] = confidence_recompute
+        else:
+            result["confidence_recompute"] = {
+                "old": old_confidence,
+                "new": old_confidence,
+                "disposition": "no_op_not_cascade_bearing",
+            }
+        return json.dumps(result)
+    except Exception as exc:
+        # Atomicity (design doc sec.2, step 5's failure case; Ariadne's test
+        # 7): a failure anywhere after the UPDATE/log_edit calls above must
+        # leave the edge exactly as it was. sqlite3 connections default to
+        # an implicit transaction across the whole `try` block, so a
+        # rollback here reverts the UPDATE/INSERT already issued in this
+        # connection — nothing was committed until the conn.commit() call
+        # above, which this except branch never reaches on a raised error.
+        conn.rollback()
+        return json.dumps({
+            "error": f"engram_retype_edge failed and was rolled back: {exc!r}"
+        })
+    finally:
+        conn.close()

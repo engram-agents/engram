@@ -46,6 +46,7 @@ engram_remove_edge: Deletes ONLY a whitelisted non-cascade edge (about, tensions
 engram_report_feeling: Non-claim-bearing first-person self-report (only reports, never verifies own state) — dedup-exempt, always creates a new node.
 engram_resolve: Pure-wire: wires a resolves edge from an EXISTING claim-bearing node to a target and flips its status. Does NOT create the resolving derivation.
 engram_retract: Error correction (never-was-valid) — node preserved for audit, downstream TAINTED not deleted. Not for a valid-then claim — use engram_supersede.
+engram_retype_edge: Corrects a wrong edge relation by making it WEAKER (never stronger) in one audited transaction — e.g. a supported_by/derives_from/cites edge that was really only 'about' or an 'exemplifies' case. Refuses moves outside a fixed allowed-move table, a pending-marker endpoint, or a missing reason.
 engram_scan_emergence: [Sleep-cycle] Scans for clusters that could seed a new cornerstone — surfaces candidates only, creates nothing. Wasteful awake, not destructive.
 engram_set_person_lineage: Parses a model_id into provider/family/version onto a person node — a narrow patch, not a general field updater (use engram_update_person).
 engram_set_recall_summaries: Batch-writes recall_summary + recall_keywords onto EXISTING nodes — best-effort, partial failures don't roll back the batch. Accepts either inline 'summaries' or an absolute-path 'summaries_file' pointing at a JSON file of the same shape.

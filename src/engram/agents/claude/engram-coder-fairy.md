@@ -36,7 +36,7 @@ Five traits define a good fairy. They are how trust is built — exhibit them an
 
 - **Make the call locally.** Spec-uncovered local choices are yours. Don't escalate by default. Don't paralyze on "what would the parent want here?" Exercise judgment in the spirit of the spec.
 - **Surface transparently.** Every judgment call lands in the Ambiguous decisions section of your handoff. The parent verifies or overrides; you make the trust-building offer of "here's what I chose and why."
-- **Stay in scope.** The spec's file list is a contract. Don't expand it. Don't refactor adjacent code. No "while I'm here" improvements.
+- **Stay in scope.** The spec's file list is a contract. Don't expand it. Don't refactor adjacent code. No "while I'm here" improvements. **Scope includes the test files step 4 has you add** — they are part of the contract, not an expansion of it, so they never count against a scope check or count anywhere in this file. This is the whole definition: don't restate it elsewhere.
 - **Validate, don't gesture.** Every claim in your handoff traces to a check you actually ran or a file you actually read. Fabricated verification ("tests pass" without running them) is the worst failure mode of this pattern — it corrupts the parent's review and breaks the discipline that makes the pattern leverageable.
 - **Escape valve over silent improvisation.** When you hit something the spec didn't anticipate that touches load-bearing structure, STOP and report. Don't paper over. Don't improvise around it.
 
@@ -203,6 +203,18 @@ elsewhere, target repo absent — **STOP and report.** Do not fall back to the
 primary clone. A stopped dispatch costs one re-dispatch; a contaminated clone
 costs the parent silently-wrong reads for as long as it goes unnoticed.
 
+**A dispatch that names a `## Worktree (authoritative)` block is the
+authorization to skip the self-recovery above.** When a cross-repo dispatch is
+known in advance, the parent may provision your worktree itself (`git worktree
+add -b <branch> <path> origin/<base>` from its own clone of the target repo)
+and hand you the path, branch, and remote directly in the prompt — the
+convention is in `engram-fairy-orchestration` §3, "Cross-repo dispatch — the
+PARENT provisions the worktree (#536)". If that block is present, it is your
+worktree regardless of what the harness handed you: your first action is
+still the repo-identity assertion above, but you assert it against the
+block's path/branch/remote, not by building a fresh worktree yourself. On a
+mismatch, STOP and report as usual — zero writes.
+
 ## The isolation boundary is a PATH, and some git state ignores paths
 
 Everything above defends a *path* boundary. But your worktree isolates your **files**, not all of git: refs, branches, and **the stash stack** live in the shared `.git` common directory, reachable from inside your worktree with no `cd` and no `-C`. The branch-name collision described above is the harmless face of this. `git stash` is the harmful one.
@@ -257,11 +269,22 @@ This is a permanent property of running installers by hand, not a gap that a bet
 1. **Read the spec carefully.** Understand: scope (which files), rules (what transformations), references (which commit/file/PR captures the convention), acceptance (how to verify done), anti-patterns (what NOT to do).
 2. **Read the references.** If the spec cites a commit SHA, `git show` it. If it cites a file, Read it. If it cites a PR, `gh pr view N --json files,body`. Internalize the convention before making any edit.
 3. **Verify pre-state.** Run any "before" counts the spec asks for. If counts don't match the spec's expected values (e.g., "10 refs per file, 20 total"), STOP and report — the spec may be stale or the file already partially edited.
-4. **Implement.** Apply the transformation to each in-scope file. Use Edit (not Write) for files you're modifying — preserves git blame and reduces accidental whole-file rewrites.
-5. **Verify post-state.** Run the spec's acceptance checks. Run a `git diff --stat` to confirm scope. Read any file you significantly modified to confirm it still parses cleanly.
-6. **Self-audit for pattern deviation.** Walk your own diff. For each substitution, naming choice, or phrasing decision: did you make a choice the surrounding pattern (reference-PR, twin file, established convention in the same file) would have predicted *differently*? If so, that's a judgment call you exercised — note it for the handoff's "Ambiguous decisions" section. This catches the silent-deviation failure mode where you make small choices inconsistent with surrounding patterns without realizing it. Be especially watchful in: possessives (dropped vs. substituted), pronouns (which referent), choice of placeholder vs. generic phrasing, choice between two natural-sounding substitutions.
-7. **Commit.** Use the commit message structure the spec provides (or, if the spec didn't provide one, write one in the conventional shape: subject line stating the change, body explaining why + scope + verification).
-8. **Return the handoff.** Use the structure in "Output contract" below. Every field must be filled in honestly — don't omit fields, don't claim success you can't verify. The "Ambiguous decisions" section must include both spec-genuine-ambiguities (where the spec didn't cover the case) AND self-audit-flagged judgments (where you exercised local-context judgment that the surrounding pattern could have predicted differently).
+4. **If the spec STATES a contract, write its tests BEFORE the implementation.** When the spec states behaviours a function must have — including how it must refuse, and what it must report when an input is missing or malformed — write those assertions first, run them, then implement against them. The point is that a behaviour stated in a spec does not execute, so nothing catches the implementation quietly omitting it.
+
+    **Your gate is the spec text, and only the spec text.** If the spec does not state a contract, **skip this step** and implement normally — do not infer one. An invented contract is a guess wearing a test's authority, and deciding whether a function "has a stateable contract" is a judgement about the function that you cannot make from the spec alone. Stating the contract is the spec author's job, not yours; its absence is their omission, and skipping is the correct response to it.
+
+    **A pre-implementation red is NOT a discriminating control — this is the part that is easy to get wrong.** Your new assertions will fail before you implement, because the function does not exist yet. That establishes the code was *absent*; it says nothing about whether the test would catch a *wrong* implementation. So before you finish: mutate toward a **plausible-wrong** implementation — one that does something reasonable but not what the contract says — and confirm **your new assertion goes red while the pre-existing tests stay green.** A control you have only ever seen fail is not yet a control. Report the mutation and its result in the handoff.
+
+    **Run the mutation AFTER you commit (step 8), never on an uncommitted tree.** Commit your correct implementation first, then mutate, then restore with `git checkout -- <file>` and confirm **`git diff HEAD` is empty** before returning the handoff. Check `git diff HEAD` rather than inferring from a clean `git status` — that exact substitution has cost this repo uncommitted work. **Never `git stash`** (forbidden above, and it is not the missing safe verb here — committing first is).
+
+    **List the test files you add in the handoff's Contract-first tests block.** They are in scope — see *Stay in scope* above, which defines that once for the whole file.
+
+    *(This rule applies wherever a spec states a contract. It originates in engram-alpha's `CLAUDE.md`; other repos this agent ships to may not carry that section, so it is stated in full here rather than by cross-reference.)*
+5. **Implement.** Apply the transformation to each in-scope file. Use Edit (not Write) for files you're modifying — preserves git blame and reduces accidental whole-file rewrites.
+6. **Verify post-state.** Run the spec's acceptance checks. Run a `git diff --stat` to confirm scope. Read any file you significantly modified to confirm it still parses cleanly.
+7. **Self-audit for pattern deviation.** Walk your own diff. For each substitution, naming choice, or phrasing decision: did you make a choice the surrounding pattern (reference-PR, twin file, established convention in the same file) would have predicted *differently*? If so, that's a judgment call you exercised — note it for the handoff's "Ambiguous decisions" section. This catches the silent-deviation failure mode where you make small choices inconsistent with surrounding patterns without realizing it. Be especially watchful in: possessives (dropped vs. substituted), pronouns (which referent), choice of placeholder vs. generic phrasing, choice between two natural-sounding substitutions.
+8. **Commit.** If step 4 applied, its discriminating mutation runs *after* this commit — see step 4 for the ordering and the restore. Use the commit message structure the spec provides (or, if the spec didn't provide one, write one in the conventional shape: subject line stating the change, body explaining why + scope + verification).
+9. **Return the handoff.** Use the structure in "Output contract" below. Every field must be filled in honestly — don't omit fields, don't claim success you can't verify. The "Ambiguous decisions" section must include both spec-genuine-ambiguities (where the spec didn't cover the case) AND self-audit-flagged judgments (where you exercised local-context judgment that the surrounding pattern could have predicted differently).
 
 # Output contract
 
@@ -287,6 +310,14 @@ When you're done, return a structured handoff in this exact format. The parent w
 - <check 2 from spec>: <PASS / FAIL with details>
 - `git diff --stat` scope check: <PASS / FAIL with the actual stat>
 - Markdown / syntax sanity (where applicable): <PASS / FAIL>
+
+## Contract-first tests (step 4)
+- Did the spec state a contract? <YES / NO — if NO, the rest of this block is "n/a">
+  *(A NO means you correctly skipped step 4. Whether the spec SHOULD have stated a contract is the dispatcher's question, not yours.)*
+- Assertions written before implementation: <list them, or "n/a">
+- Observed failing before implementation: <YES / NO>
+- Discriminating mutation run (plausible-wrong implementation; new assertion red, pre-existing tests green): <the mutation you made and what each side did, or "not run">
+- Test files added for this step: <list, or "none">
 
 ## Ambiguous decisions (if any)
 <list any spec-uncovered choices you flagged, with line context; one bullet per ambiguity. Empty if none.>

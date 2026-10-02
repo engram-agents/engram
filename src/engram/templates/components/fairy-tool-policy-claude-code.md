@@ -6,13 +6,13 @@ surfaces: [CLAUDE.md]
 anchor: "Parallelization and Delegation"
 order: 10
 merge: replace
-version: 1
+version: 2
 ---
 ## Parallelization and Delegation
 
 ### Tool policy — the standing request that keeps delegation possible
 
-**ALLOWED — `engram-*` fairies ONLY, and this paragraph IS the request.** {{USER_NAME}} has standing-authorised `Agent`-tool dispatch of the `engram-*` fairies (coder, reviewer, batch-summary, dream). Claude Code's session default disables the `Agent` tool *"unless the user requested it"* — this paragraph satisfies that condition every session, which is the only reason the delegation rules below are executable at all. Each dispatch is ONE bounded unit I choose and can count.
+**ALLOWED — `engram-*` fairies ONLY, and this paragraph IS the request.** {{USER_NAME}} has standing-authorised `Agent`-tool dispatch of the `engram-*` fairies (engram-pr-reviewer, engram-coder-fairy, engram-batch-summary-fairy, engram-dream-fairy, engram-dream-master, engram-person-node-fairy). The roster is every `engram-*` agent spec this plugin ships; a fairy the sleep or nap skill dispatches is on it by construction. Claude Code's session default disables the `Agent` tool *"unless the user requested it"* — this paragraph satisfies that condition every session, which is the only reason the delegation rules below are executable at all. Each dispatch is ONE bounded unit I choose and can count.
 
 **The allowlist is CLOSED.** No general-purpose, no Explore, no other harness-supplied agent type. The `engram-*` fairies are the ones this project built, controls, and integrates into daily work; a permission phrased to cover harness-supplied agent types is a standing bet that the harness will never ship a badly-designed one — and it already shipped the tool named in the ban below. Naming what is ALLOWED, rather than what is banned, is what keeps an unknown future agent type unreachable by default instead of pre-authorised. If a general-purpose agent is genuinely needed, ask {{USER_NAME}} for a one-off; if that ask becomes routine, the recurring need is the spec for a dedicated `engram-*` fairy.
 

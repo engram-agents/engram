@@ -30,6 +30,33 @@ from .store import CoordinationStore
 _PARTICIPANTS_LIST_RE = re.compile(r"^\[?(.*?)\]?$")
 
 
+def _maybe_stamp_phase(fields: dict, phase: Optional[str], now: str) -> tuple[dict, str]:
+    """If `phase` is given and this baton has no explicit phase yet, return
+    ({"phase": phase}, log_suffix) to fold into this write's frontmatter
+    updates and turn-log line. Otherwise return ({}, "") — a no-op.
+
+    Calling this repeatedly/sequentially on the same baton is idempotent: a
+    second call sees the first call's already-committed stamp (via its own
+    fresh `store.read_project` read) and no-ops. This does NOT protect
+    against genuinely overlapping concurrent callers — `read_project`
+    happens before the allocator lock is acquired in every write-body, so
+    two truly concurrent writers can each decide to stamp from stale reads;
+    the second writer's full-document write then clobbers the first's, the
+    same pre-existing lost-update exposure every other field in this store
+    already has. See issue #3255 for tracking genuine concurrent-write
+    safety across `projects.py`.
+    """
+    if not phase:
+        return {}, ""
+    existing = (fields.get("phase") or "").strip()
+    if existing:
+        return {}, ""
+    return (
+        {"phase": phase},
+        f"\n- {now} phase stamped: {phase!r} (legacy conversion, #3039 U2a)",
+    )
+
+
 class ProjectNotFound(Exception):
     """Raised when a write targets a ``project_id`` with no existing baton file.
 
@@ -102,6 +129,8 @@ def flip(
     to_agent: str,
     reason: str,
     by_agent: str = "",
+    phase: Optional[str] = None,
+    transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
 ) -> int:
     """Flip a baton's turn to ``to_agent``; return the module-assigned seq.
@@ -122,6 +151,24 @@ def flip(
             baton onto someone else). Defaults to ``""`` (actor unknown) for
             back-compat with pre-existing callers; an empty ``turn_by`` is the
             safe default the updates feed never treats as a self-flip.
+        phase: the caller-computed CONVERSION phase for this flip -- the
+            legacy-conversion phase to stamp on a still-legacy baton via
+            stamp-if-absent (see :func:`_maybe_stamp_phase`, #3039 U2a);
+            ``None`` (default) leaves an existing/absent ``phase:`` field
+            untouched. A transition flip sends this TOGETHER with
+            ``transition_phase`` (round 4) -- see that parameter's docstring.
+        transition_phase: the caller-computed TRANSITION phase this flip
+            defines (#3039 U2a round 3) -- when given, unconditionally
+            overwrites ``phase:`` to this value, AFTER the conversion step
+            (``phase`` above) has run, regardless of what it did. Set by the
+            caller only for the two flip branches that actually define a
+            phase transition (fairy->peer, maintainer-flip-to-merge-seat),
+            which send BOTH fields (round 4): on a legacy baton the turn log
+            then carries the conversion line followed by the transition
+            line; on a baton with an explicit ``phase:`` only the transition
+            line. Every other flip leaves this ``None`` and sends ``phase``
+            (conversion-only) alone. ``None`` (default) means this flip is
+            not a transition.
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
     Returns:
@@ -143,6 +190,14 @@ def flip(
     from_agent = (fields.get("turn") or "unknown").strip().lower()
     to = to_agent.strip().lower()
     turn_by = (by_agent or "").strip().lower()
+    # Step 1 (conversion, unchanged _maybe_stamp_phase logic) then Step 2
+    # (transition, NEW #3039 U2a round 3): transition unconditionally
+    # overwrites whatever step 1 just did, regardless of its outcome -- see
+    # the design note's two-step architecture (Kepler's U2a-round-3 ruling).
+    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+    if transition_phase is not None:
+        phase_updates["phase"] = transition_phase
+        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
     updated = md.update_frontmatter(
         content,
@@ -155,10 +210,13 @@ def flip(
         # it). Quoting keeps a non-whitespace char right after the separator,
         # so the parser never crosses the line boundary. Unquoted on read by
         # store_file.read_projects, mirroring its existing turn_reason unquote.
-        {"turn": to, "turn_since": now, "turn_reason": f'"{reason}"', "turn_by": f'"{turn_by}"'},
+        {
+            "turn": to, "turn_since": now, "turn_reason": f'"{reason}"',
+            "turn_by": f'"{turn_by}"', **phase_updates,
+        },
     )
     _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f"- {now} {from_agent} → {to}: {reason}")
+    body = md.append_turn_log(body, f"- {now} {from_agent} → {to}: {reason}" + phase_log_suffix)
     final = md.reattach_frontmatter(updated, body)
 
     with allocator.allocate() as seq:
@@ -173,6 +231,8 @@ def claim(
     *,
     claimer: str,
     pool_sentinel: str,
+    phase: Optional[str] = None,
+    transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
 ) -> int:
     """Claim a project baton from the pool; return the assigned seq.
@@ -190,6 +250,14 @@ def claim(
         claimer: agent claiming the baton (normalised to lowercase).
         pool_sentinel: the install's pool-sentinel name (resolved by the caller
             from ``config.json``'s ``primary_user`` field).
+        phase: the caller-computed CONVERSION phase for this claim -- see
+            :func:`flip`'s docstring for the conversion/transition split
+            (#3039 U2a round 3). ``None`` (default) leaves an
+            existing/absent ``phase:`` field untouched.
+        transition_phase: the caller-computed TRANSITION phase this claim
+            defines. ``claim`` is ALWAYS a transition (result phase
+            ``"claimed"``) -- callers pass this ALONGSIDE ``phase`` (round
+            4): conversion runs first, the transition then overwrites.
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
     Returns:
@@ -205,6 +273,11 @@ def claim(
     now = ts or md.now_iso()
     self_name = claimer.strip().lower()
     sentinel = pool_sentinel.strip().lower()
+    fields, _ = md.parse_frontmatter(content)
+    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+    if transition_phase is not None:
+        phase_updates["phase"] = transition_phase
+        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
     updated = md.update_frontmatter(
         content,
@@ -212,10 +285,13 @@ def claim(
         # empty-value parser-corruption case doesn't arise here since
         # self_name is never empty, but quoting is applied uniformly across
         # every turn_by write site so the on-disk format is consistent).
-        {"turn": self_name, "turn_since": now, "turn_reason": '"claimed"', "turn_by": f'"{self_name}"'},
+        {
+            "turn": self_name, "turn_since": now, "turn_reason": '"claimed"',
+            "turn_by": f'"{self_name}"', **phase_updates,
+        },
     )
     _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f"- {now} {sentinel} → {self_name}: claimed")
+    body = md.append_turn_log(body, f"- {now} {sentinel} → {self_name}: claimed" + phase_log_suffix)
     final = md.reattach_frontmatter(updated, body)
 
     with allocator.allocate() as seq:
@@ -232,6 +308,8 @@ def release(
     pool_sentinel: str,
     reason: str,
     done: bool = False,
+    phase: Optional[str] = None,
+    transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
 ) -> int:
     """Release a project baton back to the pool; return the assigned seq.
@@ -252,6 +330,15 @@ def release(
         pool_sentinel: the install's pool-sentinel name (resolved by the caller).
         reason: the release reason / message.
         done: if True, mark the project title with ``" (done)"`` (idempotent).
+        phase: the caller-computed CONVERSION phase for this release -- see
+            :func:`flip`'s docstring for the conversion/transition split
+            (#3039 U2a round 3). ``None`` (default) leaves an
+            existing/absent ``phase:`` field untouched.
+        transition_phase: the caller-computed TRANSITION phase this release
+            defines. ``release`` is ALWAYS a transition (result phase
+            ``"pool"``, or ``"done"`` with ``done=True``) -- callers pass
+            this ALONGSIDE ``phase`` (round 4): conversion runs first, the
+            transition then overwrites.
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
     Returns:
@@ -267,6 +354,15 @@ def release(
     now = ts or md.now_iso()
     self_name = holder.strip().lower()
     sentinel = pool_sentinel.strip().lower()
+    # Parsed unconditionally (not just inside `if done:` as before #3039 U2a)
+    # so _maybe_stamp_phase always has this write's freshly-read fields to
+    # check the current `phase:` value against, regardless of whether --done
+    # was passed.
+    fields, _ = md.parse_frontmatter(content)
+    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+    if transition_phase is not None:
+        phase_updates["phase"] = transition_phase
+        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
     updates: dict = {
         "turn": sentinel,
@@ -274,11 +370,11 @@ def release(
         "turn_reason": f'"{reason}"',
         # quoted like turn_reason — see flip()'s comment for why.
         "turn_by": f'"{self_name}"',
+        **phase_updates,
     }
 
     title_renamed = False
     if done:
-        fields, _ = md.parse_frontmatter(content)
         current_title = fields.get("title", "").strip()
         if not current_title.endswith("(done)"):
             updates["title"] = current_title + " (done)"
@@ -290,6 +386,7 @@ def release(
     log_entry = f"- {now} {self_name} → {sentinel}: {reason}"
     if title_renamed:
         log_entry += f"\n- {now} title marked (done)"
+    log_entry += phase_log_suffix
     body = md.append_turn_log(body, log_entry)
     final = md.reattach_frontmatter(updated, body)
 
@@ -306,6 +403,8 @@ def set_status(
     new_status: str,
     reason: str,
     caller: str = "set_status",
+    phase: Optional[str] = None,
+    transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
 ) -> int:
     """Set a project baton's ``status`` field; return the assigned seq.
@@ -316,11 +415,23 @@ def set_status(
     (is ``new_status`` a valid value? is the transition permitted?) is the
     caller's job — only the write body lives here.
 
+    Per Kepler's #3039 U2a ruling, ``set_status`` writes NO transition phase
+    of its own (conversion only) -- it has no current caller anywhere in
+    server.py or baton.py (wired here for completeness / to prevent future
+    drift, per the ruling's "all twelve write bodies" scope).
+
     Args:
         new_status: the target status string (e.g. ``"merged"``, ``"in-review"``).
         reason: human-readable explanation logged in the turn-log entry.
         caller: operation label used in the log entry (e.g. ``"close"``,
             ``"reopen"``).  Defaults to ``"set_status"`` for bare calls.
+        phase: the caller-computed CONVERSION phase for this call -- see
+            :func:`flip`'s docstring for the conversion/transition split
+            (#3039 U2a round 3). ``None`` (default) leaves an
+            existing/absent ``phase:`` field untouched.
+        transition_phase: the caller-computed TRANSITION phase this call
+            defines, if any -- per Kepler's ruling, no caller should pass
+            this for ``set_status`` (it defines no transition).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
     Returns:
@@ -334,10 +445,15 @@ def set_status(
         raise ProjectNotFound(project_id)
 
     now = ts or md.now_iso()
+    fields, _ = md.parse_frontmatter(content)
+    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+    if transition_phase is not None:
+        phase_updates["phase"] = transition_phase
+        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(content, {"status": new_status})
+    updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
     _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f"- {now} {caller}: {new_status} — {reason}")
+    body = md.append_turn_log(body, f"- {now} {caller}: {new_status} — {reason}" + phase_log_suffix)
     final = md.reattach_frontmatter(updated, body)
 
     with allocator.allocate() as seq:
@@ -352,6 +468,8 @@ def close(
     *,
     new_status: str,
     reason: str,
+    phase: Optional[str] = None,
+    transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
 ) -> int:
     """Pure write body of baton cmd_close / gc. Validation (new_status ∈ CLOSED_STATUSES, not already closed) is the caller's job.
@@ -359,9 +477,23 @@ def close(
     Updates ``status`` in frontmatter (turn fields are NOT touched), appends a
     close turn-log entry, and writes atomically under the allocator lock (fork-4).
 
+    Per Kepler's #3039 U2a ruling, ``close`` writes NO transition phase of
+    its own (conversion only) -- terminal states live in ``status``
+    (``merged``, ``cancelled``), never in ``phase``. A closed baton stays at
+    whatever ``phase`` it was last at, with ``status: merged`` /
+    ``status: cancelled`` recording the terminal state.
+
     Args:
         new_status: the target closed-status string (e.g. ``"merged"``, ``"abandoned"``).
         reason: human-readable explanation logged in the turn-log entry.
+        phase: the caller-computed CONVERSION phase for this close -- see
+            :func:`flip`'s docstring for the conversion/transition split
+            (#3039 U2a round 3). ``None`` (default) leaves an
+            existing/absent ``phase:`` field untouched.
+        transition_phase: the caller-computed TRANSITION phase this close
+            defines, if any -- per Kepler's ruling, no caller should pass
+            this for ``close`` (it defines no transition; see class docstring
+            above).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
     Returns:
@@ -375,10 +507,15 @@ def close(
         raise ProjectNotFound(project_id)
 
     now = ts or md.now_iso()
+    fields, _ = md.parse_frontmatter(content)
+    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+    if transition_phase is not None:
+        phase_updates["phase"] = transition_phase
+        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(content, {"status": new_status})
+    updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
     _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f"- {now} close: {new_status} — {reason}")
+    body = md.append_turn_log(body, f"- {now} close: {new_status} — {reason}" + phase_log_suffix)
     final = md.reattach_frontmatter(updated, body)
 
     with allocator.allocate() as seq:
@@ -393,6 +530,8 @@ def merge(
     *,
     merged_by: str,
     forced: bool = False,
+    phase: Optional[str] = None,
+    transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
 ) -> int:
     """Mark a project baton as merged and archive it; return the assigned seq.
@@ -414,9 +553,23 @@ def merge(
     not archived; the next run will see a closed project in the active dir (benign;
     ``read_projects(active_only=True)`` already filters by CLOSED_STATUSES).
 
+    Per Kepler's #3039 U2a ruling, ``merge`` writes NO transition phase of
+    its own (conversion only) -- terminal states live in ``status``
+    (``merged``), never in ``phase``. A merged PR baton stays at whatever
+    ``phase`` it was last at (typically ``phase: merge``) with
+    ``status: merged`` recording the terminal state.
+
     Args:
         merged_by: agent performing the merge (normalised to lowercase).
         forced: if True, append ``(FORCED past gates 3-4)`` to the log entry.
+        phase: the caller-computed CONVERSION phase for this merge -- see
+            :func:`flip`'s docstring for the conversion/transition split
+            (#3039 U2a round 3). ``None`` (default) leaves an
+            existing/absent ``phase:`` field untouched.
+        transition_phase: the caller-computed TRANSITION phase this merge
+            defines, if any -- per Kepler's ruling, no caller should pass
+            this for ``merge`` (it defines no transition; see class
+            docstring above).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
     Returns:
@@ -431,6 +584,11 @@ def merge(
 
     now = ts or md.now_iso()
     merged_by_n = merged_by.strip().lower()
+    fields, _ = md.parse_frontmatter(content)
+    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+    if transition_phase is not None:
+        phase_updates["phase"] = transition_phase
+        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
     if forced:
         log_line = (
@@ -439,8 +597,9 @@ def merge(
         )
     else:
         log_line = f"- {now} merged via baton merge by {merged_by_n}"
+    log_line += phase_log_suffix
 
-    updated = md.update_frontmatter(content, {"status": "merged"})
+    updated = md.update_frontmatter(content, {"status": "merged", **phase_updates})
     _, body = md.parse_frontmatter(updated)
     body = md.append_turn_log(body, log_line)
     final = md.reattach_frontmatter(updated, body)
@@ -460,6 +619,8 @@ def reopen(
     *,
     invoker: str,
     new_status: str,
+    phase: Optional[str] = None,
+    transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
 ) -> int:
     """Pure write body of baton cmd_reopen. Validation (new_status ∈ ACTIVE_STATUSES, current_status ∈ CLOSED_STATUSES) is the caller's job. Reads current status internally for the log entry.
@@ -468,9 +629,21 @@ def reopen(
     reopened turn-log entry recording the prior status, and writes atomically
     under the allocator lock (fork-4).
 
+    Per Kepler's #3039 U2a ruling, ``reopen`` writes NO transition phase of
+    its own (conversion only) -- it restores ``status`` and leaves ``phase``
+    alone.
+
     Args:
         invoker: agent performing the reopen (normalised to lowercase).
         new_status: the target active-status string (e.g. ``"in-progress"``).
+        phase: the caller-computed CONVERSION phase for this reopen -- see
+            :func:`flip`'s docstring for the conversion/transition split
+            (#3039 U2a round 3). ``None`` (default) leaves an
+            existing/absent ``phase:`` field untouched.
+        transition_phase: the caller-computed TRANSITION phase this reopen
+            defines, if any -- per Kepler's ruling, no caller should pass
+            this for ``reopen`` (it defines no transition; see docstring
+            above).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
     Returns:
@@ -487,12 +660,16 @@ def reopen(
     invoker_name = invoker.strip().lower()
     fields, _ = md.parse_frontmatter(content)
     current_status = fields.get("status", "")
+    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+    if transition_phase is not None:
+        phase_updates["phase"] = transition_phase
+        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(content, {"status": new_status})
+    updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
     _, body = md.parse_frontmatter(updated)
     body = md.append_turn_log(
         body,
-        f"- {now} reopened → {invoker_name}: status was {current_status} → {new_status}",
+        f"- {now} reopened → {invoker_name}: status was {current_status} → {new_status}" + phase_log_suffix,
     )
     final = md.reattach_frontmatter(updated, body)
 
@@ -507,6 +684,8 @@ def rename(
     project_id: str,
     *,
     new_title: str,
+    phase: Optional[str] = None,
+    transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
 ) -> int:
     """Rename a project baton's title field; return the assigned seq.
@@ -516,10 +695,20 @@ def rename(
     atomically under the allocator lock (fork-4). Validation (non-empty title,
     length limit, no newlines) is the caller's job.
 
+    Per Kepler's #3039 U2a ruling, ``rename`` was never a phase-machine edge
+    -- it writes NO transition phase of its own (conversion only).
+
     Log format: ``- {ts} renamed: title from "{old}" to "{new}"``
 
     Args:
         new_title: the new title string (caller should strip whitespace).
+        phase: the caller-computed CONVERSION phase for this rename -- see
+            :func:`flip`'s docstring for the conversion/transition split
+            (#3039 U2a round 3). ``None`` (default) leaves an
+            existing/absent ``phase:`` field untouched.
+        transition_phase: the caller-computed TRANSITION phase this rename
+            defines, if any -- per Kepler's ruling, no caller should pass
+            this for ``rename`` (it defines no transition).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
     Returns:
@@ -535,10 +724,14 @@ def rename(
     now = ts or md.now_iso()
     fields, _ = md.parse_frontmatter(content)
     old_title = fields.get("title", "").strip()
+    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+    if transition_phase is not None:
+        phase_updates["phase"] = transition_phase
+        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(content, {"title": new_title})
+    updated = md.update_frontmatter(content, {"title": new_title, **phase_updates})
     _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f'- {now} renamed: title from "{old_title}" to "{new_title}"')
+    body = md.append_turn_log(body, f'- {now} renamed: title from "{old_title}" to "{new_title}"' + phase_log_suffix)
     final = md.reattach_frontmatter(updated, body)
 
     with allocator.allocate() as seq:
@@ -552,6 +745,8 @@ def anchor(
     project_id: str,
     *,
     github_anchor: str,
+    phase: Optional[str] = None,
+    transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
 ) -> int:
     """Set or update the ``github:`` anchor on a project baton; return the assigned seq.
@@ -562,12 +757,22 @@ def anchor(
     the allocator lock (fork-4). Anchor format validation (``pr/<N>`` or
     ``project/<N>``) is the caller's job.
 
+    Per Kepler's #3039 U2a ruling, ``anchor`` was never a phase-machine edge
+    -- it writes NO transition phase of its own (conversion only).
+
     Log formats:
       - First set: ``- {ts} anchor set: github → {anchor}``
       - Update:    ``- {ts} anchor updated: github from "{old}" to "{new}"``
 
     Args:
         github_anchor: the anchor string (e.g. ``"pr/490"``).
+        phase: the caller-computed CONVERSION phase for this anchor call --
+            see :func:`flip`'s docstring for the conversion/transition split
+            (#3039 U2a round 3). ``None`` (default) leaves an
+            existing/absent ``phase:`` field untouched.
+        transition_phase: the caller-computed TRANSITION phase this anchor
+            call defines, if any -- per Kepler's ruling, no caller should
+            pass this for ``anchor`` (it defines no transition).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
     Returns:
@@ -583,13 +788,18 @@ def anchor(
     now = ts or md.now_iso()
     fields, _ = md.parse_frontmatter(content)
     old_anchor = fields.get("github", "").strip()
+    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+    if transition_phase is not None:
+        phase_updates["phase"] = transition_phase
+        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(content, {"github": github_anchor})
+    updated = md.update_frontmatter(content, {"github": github_anchor, **phase_updates})
     _, body = md.parse_frontmatter(updated)
     if old_anchor:
         log_entry = f'- {now} anchor updated: github from "{old_anchor}" to "{github_anchor}"'
     else:
         log_entry = f"- {now} anchor set: github → {github_anchor}"
+    log_entry += phase_log_suffix
     body = md.append_turn_log(body, log_entry)
     final = md.reattach_frontmatter(updated, body)
 
@@ -605,6 +815,8 @@ def add_participant(
     *,
     agent: str,
     participant: str,
+    phase: Optional[str] = None,
+    transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
 ) -> tuple[int, bool]:
     """Add ``participant`` to a project baton's participants list; return ``(seq, added)``.
@@ -628,9 +840,26 @@ def add_participant(
 
     Log format: ``- {ts} {agent} added participant: {participant}``
 
+    Per Kepler's #3039 U2a ruling, ``add_participant`` was never a
+    phase-machine edge -- it writes NO transition phase of its own
+    (conversion only). The conversion step fires only on the real-write
+    path below, never on the idempotent no-op return (#3039 U2a round 3:
+    that path performs NO write at all -- no seq allocated, no file
+    touched -- so there is nothing for a conversion to attach to; the
+    baton's legacy-vs-explicit phase status is unchanged by a call that
+    changes nothing else either).
+
     Args:
         agent: the agent performing the add; must already be a participant.
         participant: the agent name to add (normalised to lowercase).
+        phase: the caller-computed CONVERSION phase for this add -- see
+            :func:`flip`'s docstring for the conversion/transition split
+            (#3039 U2a round 3). ``None`` (default) leaves an
+            existing/absent ``phase:`` field untouched. Ignored entirely on
+            the idempotent no-op path (see above).
+        transition_phase: the caller-computed TRANSITION phase this add
+            defines, if any -- per Kepler's ruling, no caller should pass
+            this for ``add_participant`` (it defines no transition).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
     Returns:
@@ -658,12 +887,16 @@ def add_participant(
         return _coerce_seq(fields.get("seq", "")), False
 
     now = ts or md.now_iso()
+    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+    if transition_phase is not None:
+        phase_updates["phase"] = transition_phase
+        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
     new_participants = list(current_participants) + [participant_n]
     participants_str = _format_participants(new_participants)
 
-    updated = md.update_frontmatter(content, {"participants": participants_str})
+    updated = md.update_frontmatter(content, {"participants": participants_str, **phase_updates})
     _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f"- {now} {agent_n} added participant: {participant_n}")
+    body = md.append_turn_log(body, f"- {now} {agent_n} added participant: {participant_n}" + phase_log_suffix)
     final = md.reattach_frontmatter(updated, body)
 
     with allocator.allocate() as seq:
@@ -678,6 +911,8 @@ def set_colleague(
     *,
     agent: str,
     colleague: str,
+    phase: Optional[str] = None,
+    transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
 ) -> tuple[int, bool]:
     """Set (or change) the ``colleague:`` field on a project baton; return ``(seq, participant_added)``.
@@ -735,11 +970,22 @@ def set_colleague(
     ``- {ts} {agent} changed colleague from "{old}" to "{new}"`` (update) —
     same two-case shape as ``anchor()``.
 
+    Per Kepler's #3039 U2a ruling, ``set_colleague`` was never a
+    phase-machine edge -- it writes NO transition phase of its own
+    (conversion only).
+
     Args:
         agent: the agent performing the set; must already be a participant
             or the current turn holder.
         colleague: the agent name to set as colleague (normalised to
             lowercase).
+        phase: the caller-computed CONVERSION phase for this set -- see
+            :func:`flip`'s docstring for the conversion/transition split
+            (#3039 U2a round 3). ``None`` (default) leaves an
+            existing/absent ``phase:`` field untouched.
+        transition_phase: the caller-computed TRANSITION phase this set
+            defines, if any -- per Kepler's ruling, no caller should pass
+            this for ``set_colleague`` (it defines no transition).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
     Returns:
@@ -774,6 +1020,12 @@ def set_colleague(
         updates["participants"] = _format_participants(new_participants)
 
     now = ts or md.now_iso()
+    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+    if transition_phase is not None:
+        phase_updates["phase"] = transition_phase
+        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+    updates.update(phase_updates)
+
     updated = md.update_frontmatter(content, updates)
     _, body = md.parse_frontmatter(updated)
     if old_colleague:
@@ -783,6 +1035,7 @@ def set_colleague(
         )
     else:
         log_entry = f"- {now} {agent_n} set colleague → {colleague_n}"
+    log_entry += phase_log_suffix
     body = md.append_turn_log(body, log_entry)
     final = md.reattach_frontmatter(updated, body)
 
@@ -805,6 +1058,8 @@ def init(
     github: Optional[str] = None,
     colleague: Optional[str] = None,
     author: Optional[str] = None,
+    phase: Optional[str] = None,
+    transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
 ) -> int:
     """Create a new project baton from scratch; return the assigned seq.
@@ -859,12 +1114,32 @@ def init(
             misclassified as presenting-for-merge and demanded an approval
             that cannot exist (the colleague is the one objecting). The
             caller (``cmd_init``) is responsible for supplying the right
-            value — the established convention is the initial ``turn``
-            holder, since a PR baton is normally initialized by its own
-            author with ``turn`` pointing at themselves. Omitted (``None`` /
+            value — as of #3042 that is the INVOKING agent, the seat that ran
+            ``baton init``, regardless of whose court ``turn`` puts it in.
+            (Before #3042 ``cmd_init`` supplied the initial ``turn`` holder as
+            a proxy, which is correct only when a baton is initialized by its
+            own author with ``turn`` pointing at themselves, and mis-attributed
+            authorship whenever it was not.) Omitted (``None`` /
             falsy) on an existing baton created before this field existed —
             ``_is_maintainer_flip`` treats a missing author as "no exemption
             available," identical to pre-#2961 behavior, not as an error.
+        phase: the caller-computed CONVERSION phase for this init -- see
+            :func:`flip`'s docstring for the conversion/transition split
+            (#3039 U2a round 3). ``init`` is ALWAYS a transition (the
+            baton's very first phase) -- callers pass ``transition_phase``,
+            not this. Kept for API uniformity with the other eleven write
+            bodies; ``None`` (default) is the expected value here.
+        transition_phase: the caller-computed INITIAL phase for this
+            brand-new baton (e.g. ``"pool"`` for a bunch, ``"fairy"`` for a
+            PR baton) -- a TRANSITION (#3039 U2a round 3), unconditionally
+            written. There is no pre-existing ``phase:`` to check against
+            (the baton doesn't exist yet) so, unlike every other write
+            body, sending this via the CONVERSION channel (``phase`` above)
+            would have produced the identical file content here -- but the
+            wrong turn-log text ("(legacy conversion)" on a baton that was
+            never legacy, Borges's finding on #3254). Routing init's
+            initial phase through THIS parameter instead is what fixes
+            that: the log line reads "(transition)".
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
     Returns:
@@ -880,6 +1155,18 @@ def init(
     now = ts or md.now_iso()
     turn_by = (by_agent or "").strip().lower()
     participants_str = "[" + ", ".join(participants) + "]"
+    # No pre-existing content to parse (this creates the baton) -- pass an
+    # empty fields dict, which trivially has no "phase" key, so
+    # _maybe_stamp_phase always stamps a truthy `phase` here (#3039 U2a).
+    # Step 1 (conversion) then Step 2 (transition, NEW #3039 U2a round 3) --
+    # see flip()'s comment for the two-step architecture. In practice a
+    # caller sends `transition_phase` here, not `phase` (see docstring
+    # above), so step 1 is normally a no-op and step 2 alone determines the
+    # stamped value + "(transition)" log text.
+    phase_updates, phase_log_suffix = _maybe_stamp_phase({}, phase, now)
+    if transition_phase is not None:
+        phase_updates["phase"] = transition_phase
+        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
     fm_lines = [
         "---",
@@ -901,6 +1188,8 @@ def init(
         fm_lines.append(f"colleague: {colleague.strip().lower()}")
     if author:
         fm_lines.append(f"author: {author.strip().lower()}")
+    if phase_updates:
+        fm_lines.append(f"phase: {phase_updates['phase']}")
     fm_lines.append("---")
     fm_lines.append("")
 
@@ -910,7 +1199,7 @@ def init(
         "",
         "## Turn log",
         "",
-        f"- {now} initialized → {turn}: {turn_reason}",
+        f"- {now} initialized → {turn}: {turn_reason}" + phase_log_suffix,
         "",
     ]
 

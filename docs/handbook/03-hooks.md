@@ -132,7 +132,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 - Recall injection: ENGRAM surface query via engram_client.EngramClient (lines 650+), formats results as bullet list (top-5 by default, per SURFACE_TOP_K). recall_keywords rendered as keyword chips per entry (lines 311–323 prefix form; 413–420 memory-block variant).
 - Nap warning: context_tracker.estimate_usage() + format_drowsiness() (812–830) or format_nap_warning() (828) fallback. Thresholds: NAP_WARN_THRESHOLD=20 prompts (start suggesting), NAP_URGENT_THRESHOLD=25 (escalate).
 - Warm-briefing pointer: check_warm_briefing() (line 807) injects one-liner on first prompt post-compact (prompts_since_compaction==0).
-- Repair-pending marker: checks REPAIR_MARKER_PATH (toolcall-repair-pending.json) from engram-toolcall-repair hook and alerts.
+- Repair-pending marker: checks REPAIR_MARKER_PATH (toolcall-repair-pending.json) and alerts (dead since #172 -- the producer hook is removed, so the marker is never written and this check is a permanent no-op).
 - Error-pattern alerts: reads ERROR_PATTERNS_PATH + ERROR_INCIDENTS_PATH, surfaces recent error summaries.
 - Feeling-nudge marker: surfaces engagement-tracking nudge from feeling-nudge-active.json.
 - Output: hookSpecificOutput/UserPromptSubmit/additionalContext with multi-part injection (836–841). Empty JSON `{}` on no content (832).
@@ -372,26 +372,28 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 ---
 
-## **6. PreToolUse Hook Suite (1 hook + 1 retired)**
+## **6. PreToolUse Hook Suite (0 hooks + 2 retired)**
 
-### **6.1 engram-toolcall-repair.py**
+### **6.1 engram-toolcall-repair.py — REMOVED (engram-alpha#172)**
 
-**what** — Repairs antml-prefix corruption in ENGRAM tool calls before execution. Scans tool_input for parameters with missing `antml:` prefix on closing tags, which causes the harness parser to swallow the next parameter's opening tag into the previous parameter. Detects and repairs the pattern, logs the repair, emits a model-visible warning (additionalContext) so the agent fixes the emit next time. **Failure mode addressed: silent swallowing** — the toolcall would succeed with corrupted input and the model wouldn't see the alert.
+Deprecated and deleted per its own tracking issue (#172, filed 2026-05-16): the
+antml-prefix swallow risk it repaired is now structurally eliminated — every
+current MCP tool takes either zero parameters or a single `payload_json`
+parameter (wave-3 migration, complete 2026-05-27), so the two-different-string-
+parameters swallow pattern this hook repaired has no remaining tool where it
+could occur. Independently, the hook's own `PROTECTED_TOOLS` dict keyed on the
+pre-plugin `mcp__engram__` prefix while every live call since at least
+2026-06-30 used `mcp__plugin_engram_engram__` — a prefix mismatch that made the
+repair path unconditionally unreachable regardless of the structural fix. Both
+findings verified against 6,981 real logged invocations spanning three months:
+zero repairs, zero calls that could have matched the stale dict. See #172 for
+the full evidence.
 
-**how** — Entry point: main() (372–411). Key operations:
-- Repair detection: attempt_repair() (95–350) scans each parameter value for closing tags without antml: prefix on the same line. For each found, extracts the next parameter's expected value and merges it in.
-- Logging: log_repair() (lines 220–240) appends structured JSON to toolcall-repair.log.
-- Repair marker: write_marker() (lines 250–270) writes toolcall-repair-pending.json so next-turn surface-hook alerts.
-- Output: hookSpecificOutput/PreToolUse/permissionDecision/updatedInput/additionalContext (402–409) when repairs found; silent exit on no repairs needed (line 393).
-- Format: format_additional_context() (352–369) surfaces repaired patterns + root-cause explanation.
-
-**status-candidate** — **PROD-VERIFIED** (test_hooks_json_stdout_audit.py parametrized; PROTECTED_TOOLS list maintained to know which tools are ENGRAM-write).
-
-**files** — engram-toolcall-repair.py (415 lines).
-
-**key constants** — HOOK_NAME (for log filenames), PROTECTED_TOOLS (hardcoded list from server.py).
-
-**tests** — test_hooks_json_stdout_audit.py (parametrized PreToolUse/engram-toolcall-repair.py).
+The file `hooks/claude/engram-toolcall-repair.py` still ships in v0.5.2 as an
+unregistered no-op tombstone (#3249), not a hook: sessions started before
+v0.5.2-rc4 still register the old PreToolUse entry, and a missing file would
+exit 2 (a block) on every ENGRAM tool call. It is deleted in the first release
+after v0.5.2; do not remove it earlier as dead code.
 
 ---
 
@@ -489,10 +491,10 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 |-------|-------|-------|
 | SessionStart | 2 | start-engram-daemon.sh, engram-session-start-hook.py |
 | UserPromptSubmit | 9 | time-bar, user-identity, surface, deference-prompt, end-of-day, inter-agent, baton, github-notifications, forum |
-| PreToolUse | 1 | engram-toolcall-repair |
+| PreToolUse | 0 | (engram-toolcall-repair removed, #172) |
 | Stop | 3 | engram-stop, engram-deference-detector-stop, engram-utility-credit-mention-stop |
 | PostCompact | 1 | engram-postcompact |
-| **Registered total** | **16** | + daemon (socket-serving, not a hook) + 2 unregistered root-library files |
+| **Registered total** | **15** (was 16; engram-toolcall-repair removed, #172) | + daemon (socket-serving, not a hook) + 2 unregistered root-library files |
 
 ### **Known Silent-Failure Patterns**
 
@@ -510,7 +512,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 ### **Test Coverage Gaps**
 
 - Daemon has no explicit unit tests (implicit via surface-hook integration only).
-- github-notifications + deference-prompt + toolcall-repair + utility-credit rely solely on the parametrized stdout audit (no behavior-specific test files).
+- github-notifications + deference-prompt + utility-credit rely solely on the parametrized stdout audit (no behavior-specific test files).
 - _log() calls not mocked in deference tests, so logs accumulate during test runs.
 
 ### **In-flight Changes (as of 2026-06-09)**

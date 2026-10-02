@@ -72,7 +72,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
-from _hooklib import atomic_write_json, resolve_runtime_dir
+from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context, _trim_to_line_boundary
+from _harness import detect_harness, get_harness_budgets
 
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
@@ -197,19 +198,22 @@ def _check_mcp_health(engram_home: str) -> tuple[bool | None, str | None]:
 
     Uses pgrep -f to search for the resolved server.py path in process
     command lines only when the current platform has a reliable hook/server
-    path relationship. Hard timeout of 1s. Any unexpected exception is treated
-    as ok=True (advisory probe — never block session start).
+    path relationship. Hard timeout of 1s. This is a pure function of the
+    pgrep outcome; the source-dependent downgrade of a miss and the
+    stale-marker note live in main() (#3202).
 
-    Tri-state result (see #1754):
-        True  — server process found (up), the platform defers startup
-                probing, or the probe itself errored (advisory fail-open).
-        False — pgrep completed and found NO process (confirmed absent).
-        None  — the probe was INDETERMINATE (pgrep timed out under
-                cold-start contention). A timeout is not evidence of
-                absence, so the caller must NOT render the hard "OFFLINE →
-                tell the user immediately" alarm for this case — that is a
-                cry-wolf false-negative. The per-prompt write-tool marker
-                check confirms real liveness on the first prompt.
+    Tri-state result (see #1754, #3202):
+        True  — server process found (pgrep rc 0), or the platform defers
+                startup probing.
+        False — pgrep completed with rc 1 (no match). The caller decides
+                whether that is evidence (compact/clear) or a launch race
+                (startup/resume).
+        None  — the probe was INDETERMINATE and is never evidence of
+                absence: pgrep timed out ("pgrep timed out"), exited with
+                an error rc >= 2 ("pgrep error (exit N)"), or the probe
+                itself raised ("probe error (<ExceptionTypeName>)"). The
+                per-prompt write-tool marker check confirms real liveness
+                on the first prompt.
 
     Returns:
         (status, reason): status per the tri-state above; reason is a
@@ -233,15 +237,43 @@ def _check_mcp_health(engram_home: str) -> tuple[bool | None, str | None]:
         )
         if result.returncode == 0:
             return True, None
-        return False, "no engram server process found"
+        if result.returncode == 1:
+            return False, "no engram server process found"
+        # rc >= 2 (or negative): pgrep itself failed -- not a "no match".
+        return None, f"pgrep error (exit {result.returncode})"
     except subprocess.TimeoutExpired:
         # Indeterminate, NOT absent: the probe never completed (busy box at
         # cold start). Signal the third state so the caller renders a soft
-        # "inconclusive" note instead of a false OFFLINE alarm (#1754).
+        # informational "unknown" line instead of a false OFFLINE alarm
+        # (#1754, #3202).
         return None, "pgrep timed out"
+    except Exception as exc:
+        # #3202: a probe that raised is unknown, not up -- fail-open to True
+        # hid real probe failures. Still never blocks session start.
+        return None, f"probe error ({type(exc).__name__})"
+
+
+def _dead_marker_pid(engram_home: str) -> int | None:
+    """Return the PID named by mcp-tools-ready.json iff that PID is dead.
+
+    Best-effort, no subprocess (the hook runs under a tight harness kill).
+    Any problem -- absent/unreadable/invalid marker, pid <= 0, a live PID,
+    EPERM (exists, not ours) -- returns None.
+    """
+    try:
+        with open(os.path.join(engram_home, "mcp-tools-ready.json")) as f:
+            pid = json.load(f).get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return pid
+        except PermissionError:
+            return None
+        return None
     except Exception:
-        # Advisory: probe errors are treated as ok to avoid blocking session start.
-        return True, None
+        return None
 
 
 def _is_any_server_py_running() -> bool:
@@ -384,6 +416,65 @@ def _check_backup_staleness(engram_home: str) -> tuple[bool, str | None]:
         return True, None
     except OSError:
         return True, None  # advisory — never block session start
+
+
+def _check_embedding_restore_flag(engram_home: str) -> tuple[bool, str | None]:
+    """Check the embedding restore-completeness flag (#3075 C5 round 2,
+    Borges's design ruling).
+
+    Reads the embedding_restore_state singleton row directly via a
+    read-only SQLite connection — this hook process never imports
+    engram_core; duplicated by value from engram-surface-hook.py's own
+    identically-named function (same cross-process-boundary precedent this
+    file's sibling hook already follows — see that function's docstring for
+    the full rationale) and from engram_core.py's server-side
+    _get_embedding_restore_flag.
+
+    Returns (True, None) when the flag is unset/clear, the DB is absent,
+    the table doesn't exist yet (a DB that predates this feature), or on
+    any other read failure — fail-open, same posture as
+    _check_backup_staleness above: an advisory probe must never block
+    session start.
+
+    Returns (False, message) when the flag IS SET — message names the
+    count, cause, and remedy.
+    """
+    db_path = os.path.join(engram_home, "knowledge.db")
+    if not os.path.exists(db_path):
+        return True, None
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        row = conn.execute(
+            "SELECT not_fully_restored, null_count, cause FROM "
+            "embedding_restore_state WHERE singleton_key = 1"
+        ).fetchone()
+        if not row or not row[0]:
+            return True, None
+        null_count, cause = row[1], row[2]
+        if cause and cause.startswith("detection-failed"):
+            # ROUND 4 (Borges's colleague pass, PR#3076 finding A):
+            # null_count=-1 here is a SENTINEL — detection itself raised,
+            # so the real count is unknown, not zero. A distinct message
+            # avoids a nonsensical "-1 node(s) lack embeddings" line.
+            return False, (
+                f"restore-completeness state UNKNOWN ({cause}) — recall "
+                f"may be degraded"
+            )
+        return False, (
+            f"{null_count} node(s) lack embeddings (cause: {cause}) — "
+            f"recall degraded/blocked for these nodes"
+        )
+    except sqlite3.OperationalError:
+        return True, None  # table doesn't exist yet — treat as clear
+    except Exception:
+        return True, None  # fail-open — advisory probe, never block
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # ── Viz-server health probe (#2783) ─────────────────────────────────────────
@@ -841,6 +932,47 @@ STARRED_CAP = 10
 STARRED_STALE_DAYS = 7  # soft TTL for staleness nudge (nudge only, never auto-drop)
 FOCUS_LIST_CAP = 15  # mirrors engram_focus.FOCUS_LIST_CAP (write-side enforced cap)
 
+# #127 r2 (tier names updated #127 r3): in-hook sub-cap for the focus block
+# (_P_FOCUS) -- see main()'s own "Real-seat overflow" handling right before
+# the final emit_context() call for the full rationale (a 39K-char focus
+# block, alone bigger than the whole 9,500-char budget, otherwise drives
+# emit_context()'s own Stage 2 candidate-shrink loop all the way down to
+# "show only the single most important item," dragging every _P_REST block
+# behind it off the visible render even though each of THEM is individually
+# tiny -- _P_MUST now sits ahead of _P_FOCUS per #127 r3, so it is no
+# longer at risk from this mechanism the way _P_REST still is).
+#
+# FOCUS_FLOOR: the minimum focus_cap this hook will ever compute, even when
+# the OTHER blocks (_P_HEALTH/_P_MUST/_P_REST minus tool-caps) alone already
+# consume more than the budget. 1,500 chars is roughly 15-20 short
+# focus-entry lines -- enough for the reader to see WHAT is pinned even in a
+# degraded seat, without being so large that it meaningfully starves the
+# small _P_MUST/_P_REST blocks the floor is designed to protect. Below
+# this, "as much as fits" (per
+# emit_context()'s own Stage 2 selection, which may still cut a
+# floor-sized focus item further if the OTHER blocks genuinely cannot be
+# trimmed) is the accepted degrade, not a crash.
+FOCUS_FLOOR = 1500
+
+# TRAILER_RESERVE: worst-case length of _hooklib._build_context_trailer()'s
+# own rendered line, sized so the in-hook focus_cap computation below never
+# has to invoke that private helper directly to know how much room it will
+# need. Trailer shape (see _hooklib.py's _build_context_trailer docstring):
+#   "▸ {shown} shown · {cut} cut · head trimmed — see {path}"
+# Fixed literal text ("▸ ", " shown · ", " cut", " · head trimmed",
+# " — see ") totals ~37 chars; {shown}/{cut} are each realistically 1-2
+# digits on this hook (single digits, at most a dozen or so priority-tagged
+# blocks ever exist) -- budget 10 chars for both, generously. {path} is
+# ENGRAM_HOME + "/session-start-overflow/" (24 literal chars) + a UTC
+# timestamp ("YYYYMMDDTHHMMSSZ", 16 chars) + "-" + a pid (up to 7 digits)
+# + ".md" (3 chars) -- ENGRAM_HOME itself budgeted generously at 150 chars
+# to cover unusually deep home directories on any platform. Total:
+# 37 + 10 + 150 + 24 + 16 + 1 + 7 + 3 = 248, rounded up with margin for the
+# extra "\n" joins this hook's own head/body assembly adds around the
+# trailer that _build_context_trailer()'s own worst-case sizing does not
+# itself need to reserve for (see emit_context()'s `sep` handling).
+TRAILER_RESERVE = 320
+
 # Agent registration directory (parallel to inter-agent/ and projects/)
 AGENTS_SHARED_ROOT = os.environ.get("AGENTS_SHARED_DIR", "/home/agents-shared")
 AGENT_REGISTRY_DIR = os.path.join(AGENTS_SHARED_ROOT, "agents")
@@ -1292,6 +1424,91 @@ def focus_block(engram_home: str) -> str:
     except Exception:
         # Hook discipline: never surface focus-block errors at session start.
         return ""
+
+
+# #127 r2: entry lines rendered by focus_block() above always start with
+# this exact 5-char prefix ("  - [") -- both the "  - [<id>] (<reason>)
+# <claim>" and "  - [<id>] <claim>" shapes share it. Used ONLY to COUNT
+# entry lines for the "+K more focused nodes cut" marker below; never used
+# to reconstruct or re-render a line's content.
+_FOCUS_ENTRY_LINE_PREFIX = "\n  - ["
+
+
+def _focus_cut_marker(k: int) -> str:
+    """The in-band marker appended when focus_block()'s own text is cut to
+    fit `focus_cap` (see _truncate_focus_block below). `k` is the count of
+    "  - [" entry lines dropped by the cut -- NOT a byte count, so the
+    reader knows how many pinned nodes are missing, not just that some text
+    is gone.
+
+    A fixed, one-line format (never multi-line, never carries a path -- the
+    overflow file is always named on the trailer, which is always line 1 of
+    the emitted additionalContext, so repeating the path here would be
+    redundant with a fact the reader already has by the time they reach
+    this marker).
+    """
+    return (
+        f"  …(+{k} more focused nodes cut — full focus list is in the "
+        "overflow file named on the first line)"
+    )
+
+
+def _truncate_focus_block(focus_text: str, focus_cap: int) -> str:
+    """Cut `focus_text` (focus_block()'s own rendered output) down to fit
+    `focus_cap` chars, appending the "+K more...cut" marker (see
+    _focus_cut_marker above) so the reader knows entries were dropped and
+    where the full list lives (the overflow file the trailer's own
+    "— see <path>" clause names -- written by main()'s emit_context() call,
+    not by this function).
+
+    Called ONLY when `len(focus_text) > focus_cap` -- callers must check
+    that themselves; this function does not re-check it, so calling it on
+    already-short text would just append a spurious "+0 more...cut" marker.
+
+    The cut point is the last COMPLETE LINE at or below
+    `focus_cap - len(marker)` (never mid-line, never mid-word), via
+    _hooklib._trim_to_line_boundary -- the SAME line-boundary primitive
+    emit_context() uses for its own head-trim, reused rather than
+    duplicated here. `marker`'s own length is sized against the
+    WORST-CASE `k` this cut could ever produce (FOCUS_LIST_CAP, the most
+    entry lines focus_block() can ever render) so the room reserved for
+    the marker's own text never depends on the real, not-yet-known `k` --
+    the exact placeholder-sizing pattern _hooklib.emit_context() itself
+    uses for its own not-yet-known overflow path (see
+    _hooklib._placeholder_overflow_path's docstring). Because the real `k`
+    is always <= FOCUS_LIST_CAP, the real marker is never longer than the
+    placeholder one, so this can only ever UNDER-use the reserved room,
+    never overrun it.
+
+    Returns the truncated text with the marker appended on its own line
+    (or, in the degenerate case where not even the header line fits within
+    `focus_cap`, the marker alone -- still a valid, non-empty, non-crashing
+    render; see FOCUS_FLOOR's own docstring for why this is an accepted
+    degrade, not a bug).
+
+    Caveat (#127 r3, reviewer-fairy finding on PR #3214, comment
+    5880917666): both the `k` count above (via _FOCUS_ENTRY_LINE_PREFIX
+    substring counting) and the line-boundary cut itself assume ONE
+    PHYSICAL LINE per focus entry, matching focus_block()'s current
+    renderer. If a claim or focus_reason string ever contained an embedded
+    newline, the substring count could be thrown off, and
+    _trim_to_line_boundary could cut inside that entry's own internal
+    newline, leaving a partially-rendered entry in the visible output with
+    no cut-indicator for that specific entry (it isn't fully dropped, so
+    it isn't counted in `k`, but it also isn't complete). Not fixed here --
+    no normalization is applied by this function -- flagged as a caveat
+    only.
+    """
+    placeholder_marker = _focus_cut_marker(FOCUS_LIST_CAP)
+    cut_limit = max(focus_cap - len(placeholder_marker), 0)
+    truncated = _trim_to_line_boundary(focus_text, cut_limit)
+
+    total_entries = focus_text.count(_FOCUS_ENTRY_LINE_PREFIX)
+    kept_entries = truncated.count(_FOCUS_ENTRY_LINE_PREFIX)
+    k = total_entries - kept_entries
+
+    marker = _focus_cut_marker(k)
+    return f"{truncated}\n{marker}" if truncated else marker
 
 
 def saved_focus_sets_block(engram_home: str) -> str:
@@ -1925,6 +2142,80 @@ def tool_capability_index_block() -> str:
         header = "ENGRAM tools — what each CAN do (fetch the schema for HOW):"
         block_lines = [header] + [f"  {entry}" for entry in entries]
         return "\n".join(block_lines)
+    except Exception:
+        # Hook discipline: never surface tool-capability-index errors at
+        # session start — this block is optional context, not load-bearing.
+        return ""
+
+
+# #3217: measured by the owner (issue comment 5881294279) against the real
+# checked-in tool_capability_index.txt (60 tools) — a names-only,
+# comma-separated form with the "engram_" prefix stripped is 803 chars;
+# every form that keeps even a truncated purpose (40-char cap: 3,684 chars;
+# 60-char cap: 4,884 chars) is far bigger than the ~1,213 chars of slack a
+# real seat has left in its 9,500-char budget after #3214's other blocks
+# (8,287 of 9,500 used). 1,200 is the cap this function's OWN rendered
+# output (header text + comma-joined names) must stay under — comfortably
+# above the measured 803/948-ish range, so ordinary artifact growth (a few
+# more tools) doesn't immediately trip it, while still catching the
+# structural regression (e.g. purposes creeping back in) that would blow
+# the budget the short form exists to fit inside.
+#
+# If the cap test fails because the tool count grew (at ~15 chars per name,
+# 1,200 holds roughly 78 tools): do not just raise the number. Re-measure
+# the real-seat slack first (the session-start budget is shared with the
+# focus list, which pays for every char here), then either raise the cap
+# within that slack or group the names by verb family.
+TOOL_SHORT_BLOCK_MAX = 1200
+
+
+def tool_capability_short_block() -> str:
+    """Render a SHORT, names-only index of every registered ENGRAM tool.
+
+    Companion to tool_capability_index_block() (#1958): that block carries
+    one-line purposes per tool and is, by itself, bigger than this hook's
+    entire emission budget (11,049 bytes checked in), so it always lands in
+    the overflow file and an agent sees no inline tool list at all (#3217).
+    This function reads the SAME checked-in artifact via
+    _resolve_tool_capability_index_path() — there is no second artifact, so
+    the short form cannot drift from the index the drift/coverage tests
+    already keep honest — and renders just the tool NAMES, comma-separated,
+    with the "engram_" prefix stripped (every registered tool carries that
+    prefix; stripping it saves ~7 chars per name for free).
+
+    Tool name = the text before the first ":" on each non-blank artifact
+    line, in file order (the artifact's own order, not re-sorted here).
+
+    Returns "" when the artifact is missing, unreadable, or empty — same
+    never-raise contract as tool_capability_index_block(): this is optional
+    context, never allowed to block session start.
+
+    Does NOT truncate to TOOL_SHORT_BLOCK_MAX — growth past the cap is
+    caught by a test (tests/test_session_start_hook_tool_capability_block.py),
+    so it fails loudly in CI, not silently at runtime.
+    """
+    try:
+        path = _resolve_tool_capability_index_path()
+        if not os.path.exists(path):
+            return ""
+        with open(path, encoding="utf-8") as f:
+            raw_lines = [ln.rstrip("\n") for ln in f]
+        entries = [ln for ln in raw_lines if ln.strip()]
+        if not entries:
+            return ""
+
+        names = []
+        for entry in entries:
+            name = entry.split(":", 1)[0]
+            if name.startswith("engram_"):
+                name = name[len("engram_"):]
+            names.append(name)
+
+        return (
+            f"ENGRAM tools ({len(names)}; fetch a tool's schema before first "
+            "use; one-line purposes for each are in the overflow file named "
+            "on the first line): " + ", ".join(names)
+        )
     except Exception:
         # Hook discipline: never surface tool-capability-index errors at
         # session start — this block is optional context, not load-bearing.
@@ -2869,6 +3160,47 @@ def _apply_pending_viz_acl(engram_home: str) -> None:
         return  # outer guard: NEVER block or break session start
 
 
+# ---------------------------------------------------------------------------
+# #127 -- TOTAL additionalContext cap via _hooklib.emit_context()
+# ---------------------------------------------------------------------------
+# Companion to write_tripwire_overflow() in engram-lesson-tripwire-hook.py
+# (that file's own reference implementation of the emit_context() overflow
+# contract): persists every session-start block emit_context() cuts (or, in
+# the rare single-item-exceeds-hard-budget case, marks truncated-in-band --
+# see main()'s own emit_context() call) so the trailer's "-- see <path>"
+# clause points somewhere real instead of leaving the reader with no way to
+# recover what was dropped. Nothing may be silently lost.
+def write_session_start_overflow(cut_blocks: list, now: float | None = None) -> str:
+    """Persist the full text of every cut/truncated session-start block,
+    verbatim and in order, to ENGRAM_HOME/session-start-overflow/<ts>-<pid>.md
+    (a NEW directory, created on demand).
+
+    Mirrors write_tripwire_overflow()'s own never-raises,
+    returns-""-on-failure contract exactly: a broken overflow-file write
+    must never suppress the blocks that DID make it into the visible
+    additionalContext, and must never crash the hook (this hook's whole
+    contract is "never blocks" -- see the module docstring).
+
+    `now` defaults to time.time() but accepts an injected value so tests can
+    assert on an exact resulting path (mirrors write_tripwire_overflow's own
+    signature). Returns "" on any failure, including an empty cut_blocks
+    list (nothing to write).
+    """
+    if not cut_blocks:
+        return ""
+    try:
+        if now is None:
+            now = time.time()
+        overflow_dir = Path(ENGRAM_HOME) / "session-start-overflow"
+        overflow_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        overflow_path = overflow_dir / f"{ts}-{os.getpid()}.md"
+        overflow_path.write_text("\n\n".join(cut_blocks) + "\n", encoding="utf-8")
+        return str(overflow_path)
+    except Exception:
+        return ""
+
+
 def main() -> None:
     # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
     # return in this function.
@@ -2911,22 +3243,51 @@ def main() -> None:
 
     source = (hook_input.get("source") or "").lower()
 
-    lines = []
+    # ── #127 r3: block collection ────────────────────────────────────────────
+    # Each block is tagged with its priority class (#127 r3's own scheme,
+    # highest first: _P_HEALTH < _P_MUST < _P_FOCUS < _P_REST) at the point
+    # it's computed. The tag only decides ORDER for the final
+    # emit_context() call below (main()'s tail) -- every block's own
+    # CONTENT/computation is unchanged from before this fix. `_blocks.sort()`
+    # (stable) at the end resolves cross-class order; within one class,
+    # original append order is preserved (Python's sort is stable), matching
+    # the hook's existing relative order.
+    #
+    # r3 (engram-alpha#127, reviewer-fairy finding on PR #3214, comment
+    # 5880917666): _P_MUST is a NEW class, carved out of what used to be P2
+    # (active-session / session-start-reading / compaction notice) and P3
+    # (the fairy-policy block) and placed AHEAD of _P_FOCUS. r1/r2 ranked
+    # focus (P1) ahead of these #2859 must-not-miss lines; on a real-seat-
+    # shaped fixture (≥40K focus block) that pushed "[Active session:",
+    # "[Session start reading —", and "[Coder fairy policy:" past the
+    # 1,800-char head-preview window (measured at char 8,929 / 9,071 / 9,266
+    # of a 9,322-char total) -- well past `_HEAD_PREVIEW_CHARS`, the
+    # invariant `tests/test_session_start_hook_piece_c_sidecar.py`'s
+    # `must_not_miss` list exists to protect (added by #2859 / PR #2925).
+    # That test still passes only because its own fixture has a trivial
+    # focus block, so it never caught this. Moving _P_MUST ahead of
+    # _P_FOCUS is the fix: these lines are cheap and must-survive by the
+    # same #2859 logic that already moved the substrate-health probe up
+    # from dead-last -- they should never be the content sacrificed to a
+    # large, otherwise-legitimate focus block.
+    _P_HEALTH, _P_MUST, _P_FOCUS, _P_REST = 0, 1, 2, 3
+    _blocks: list[tuple[int, str]] = []
+
     if marker:
-        lines.append(
+        _blocks.append((_P_MUST, (
             f"[Active session: {marker['session_id']} "
             f"(source={marker.get('source') or 'unknown'}) — "
             f"transcript at {marker['transcript_path']}]"
-        )
+        )))
     if source == "startup":
-        lines.append(
+        _blocks.append((_P_MUST, (
             "[Session start reading — before responding to the first task "
             "(even if a user task is already waiting), follow your Session "
             "Start Reading list in ~/.claude/CLAUDE.md. Read first, respond "
             "second.]"
-        )
+        )))
     else:
-        lines.append(
+        _blocks.append((_P_MUST, (
             f"[Session start reading — re-read {WARM_BRIEFING_PATH} before "
             "responding (relational context post-compact). The compaction "
             "summary is a table-of-contents index into what happened, not a "
@@ -2934,12 +3295,12 @@ def main() -> None:
             "your sole source of continuity. Today's arc below (if present) "
             "is the fuller picture; ENGRAM nodes below that are the raw "
             "claims.]"
-        )
-        lines.append(
+        )))
+        _blocks.append((_P_MUST, (
             "⚡ A compaction just completed — your context window is fresh and your "
             "energy is refreshed. Any drowsiness figure carried in the summary is "
             "stale-on-arrival; disregard it. You have a full window to work."
-        )
+        )))
 
     # ── Substrate health probe (#2859: moved up from dead-last) ────────────
     # Check MCP server only on platforms where the process-level probe is
@@ -3001,8 +3362,25 @@ def main() -> None:
     # (e.g. a single wall-clock deadline shared across all three checks)
     # is a real follow-up if this worst case is ever observed to bite.
     mcp_status, mcp_reason = _check_mcp_health(ENGRAM_HOME)
+    # #3202: at startup/resume the MCP server is launched concurrently with
+    # this hook, so a single pgrep miss can precede the process existing --
+    # a false OFFLINE on every boot. A compact/clear start keeps the running
+    # server, so a miss there IS evidence and stays the hard alarm. Anything
+    # else downgrades to the soft "unknown" state; the first-prompt marker
+    # check is the alarm of record. This is an allowlist of server-keeping
+    # sources, so an unrecognised or future source defaults to the soft line,
+    # and the first-prompt marker check backstops it.
+    if mcp_status is False and source not in ("compact", "clear"):
+        mcp_status = None
+        mcp_reason = "pgrep found no match; the server launches alongside this session"
+    # #3202: live process but the marker names a dead PID -> stale marker
+    # (informational only; never OFFLINE). Skipped where the probe is deferred.
+    _mcp_stale_pid = None
+    if mcp_status is True and _startup_mcp_health_probe_allowed():
+        _mcp_stale_pid = _dead_marker_pid(ENGRAM_HOME)
     stale_ok, stale_reason = _check_backup_staleness(ENGRAM_HOME)
     viz_status, viz_reason = _check_viz_server_health(ENGRAM_HOME)
+    embed_restore_ok, embed_restore_reason = _check_embedding_restore_flag(ENGRAM_HOME)
 
     # Tri-state (#1754): False = confirmed absent (hard alarm); None =
     # indeterminate probe (soft note, no "tell the user immediately" — a
@@ -3019,22 +3397,58 @@ def main() -> None:
     viz_down = viz_status == "down"
     viz_inconclusive = viz_status == "indeterminate"
 
-    if mcp_offline or mcp_inconclusive or not stale_ok or viz_down or viz_inconclusive:
-        lines.append("")
-        lines.append("⚠️  ENGRAM substrate health:")
+    # #127: substrate-health lines are collected into their own list rather
+    # than appended directly to a body block -- _P_HEALTH (must-survive,
+    # highest priority): folded into `head` near the end of main() if the
+    # combined tl;dr fits `head_budget`, else emitted as a _P_HEALTH body
+    # item so emit_context()'s own priority-ordered selection still
+    # guarantees it is considered ahead of every _P_MUST/_P_FOCUS/_P_REST
+    # block. Content/computation unchanged from before this fix -- only the
+    # assembly target changed
+    # (a local list instead of a direct `lines.append`).
+    _health_lines: list[str] = []
+    if (
+        mcp_offline or not stale_ok or viz_down
+        or viz_inconclusive or not embed_restore_ok
+    ):
+        _health_lines.append("⚠️  ENGRAM substrate health:")
         if mcp_offline:
-            lines.append(f"  MCP server: OFFLINE ({mcp_reason})")
-            lines.append("  → Tell the user immediately. ENGRAM tool calls will fail.")
-        elif mcp_inconclusive:
-            lines.append(f"  MCP liveness: inconclusive ({mcp_reason}) — will confirm on first prompt")
+            _health_lines.append(f"  MCP server: OFFLINE ({mcp_reason})")
+            _health_lines.append("  → Tell the user immediately. ENGRAM tool calls will fail.")
         if not stale_ok:
-            lines.append(f"  Git backup: {stale_reason}")
-            lines.append("  → Run engram-nap or engram-sleep to update the git backup.")
+            _health_lines.append(f"  Git backup: {stale_reason}")
+            _health_lines.append("  → Run engram-nap or engram-sleep to update the git backup.")
         if viz_down:
-            lines.append(f"  Viz server: DOWN ({viz_reason})")
-            lines.append("  → Tell the user; the health dashboard is unreachable.")
+            _health_lines.append(f"  Viz server: DOWN ({viz_reason})")
+            _health_lines.append("  → Tell the user; the health dashboard is unreachable.")
         elif viz_inconclusive:
-            lines.append(f"  Viz liveness: inconclusive ({viz_reason})")
+            _health_lines.append(f"  Viz liveness: inconclusive ({viz_reason})")
+        if not embed_restore_ok:
+            # #3075 C5 round 2 (Borges's design ruling): same flag the
+            # surface hook re-checks every prompt (engram-surface-hook.py's
+            # own _check_embedding_restore_flag) — surfaced here too so the
+            # very first turn of a session already carries it, not just the
+            # first UserPromptSubmit.
+            _health_lines.append(f"  Embeddings: DB NOT FULLY RESTORED ({embed_restore_reason})")
+            _health_lines.append(
+                "  → Run tools/engram-regenerate-embeddings.py once an "
+                "embedder is available (or wait — a regeneration may "
+                "already be running in the background)."
+            )
+    if mcp_inconclusive:
+        # #3202: unknown liveness is informational, NOT a ⚠️ alarm -- seats
+        # surface any ⚠️ substrate-health block to the user immediately, so
+        # the header itself would be the false alarm. First prompt confirms.
+        _health_lines.append(
+            f"ℹ️  ENGRAM substrate health: MCP liveness: unknown "
+            f"({mcp_reason}) — will confirm on first prompt"
+        )
+    if _mcp_stale_pid is not None:
+        _health_lines.append(
+            f"ℹ️  ENGRAM substrate health: MCP server up (marker stale "
+            f"(PID {_mcp_stale_pid} no longer running); live server found)."
+        )
+    _health_text = "\n".join(_health_lines)
 
     if source == "startup":
         # ── Small, single-purpose, cheap, purely-local-or-bounded-subprocess
@@ -3044,28 +3458,35 @@ def main() -> None:
         # only their position relative to Piece C moves.
         sleep_block = sleep_status_block()
         if sleep_block:
-            lines.append(sleep_block)
+            _blocks.append((_P_REST, sleep_block))
         cron_block = auto_sleep_cron_block()
         if cron_block:
-            lines.append(cron_block)
+            _blocks.append((_P_REST, cron_block))
+        # #127 r3: fairy_policy_block() carries the "[Coder fairy policy:"
+        # and "[Reviewer fairy policy:" lines -- part of the #2859
+        # must-not-miss group per the reviewer-fairy finding on PR #3214
+        # (comment 5880917666) -- so it is tagged _P_MUST, not _P_REST,
+        # even though it is computed here (still startup-only + the
+        # interactive-role gate inside fairy_policy_block() itself; neither
+        # gate is touched by this fix).
         fairy_block = fairy_policy_block()
         if fairy_block:
-            lines.append(fairy_block)
+            _blocks.append((_P_MUST, fairy_block))
         monitor_block = forum_monitor_block()
         if monitor_block:
-            lines.append(monitor_block)
+            _blocks.append((_P_REST, monitor_block))
         updates_monitor_block = forum_updates_monitor_block()
         if updates_monitor_block:
-            lines.append(updates_monitor_block)
+            _blocks.append((_P_REST, updates_monitor_block))
         peer_block = peer_topology_block(_agent_name)
         if peer_block:
-            lines.append(peer_block)
+            _blocks.append((_P_REST, peer_block))
 
         # ── Piece C (#2859: now a short pointer to a sidecar file rather
         # than the full inline commit listing) ─────────────────────────────
         git_log = piece_c_git_log(marker.get("session_id") if marker else None)
         if git_log:
-            lines.append(git_log)
+            _blocks.append((_P_REST, git_log))
 
     # ── Focus list surface (cheap: single local DB read) ───────────────────
     # Render the live focus list verbatim at EVERY session start (startup,
@@ -3076,10 +3497,25 @@ def main() -> None:
     # additionalContext at all (confirmed against CC docs, forum #241); moving
     # it here is the fix. Silent skip on any failure — hook must not block
     # session start.
+    # #127: the deterministic focus channel is _P_FOCUS -- per the issue's
+    # own priority scheme, explicitly guaranteed a spot ahead of every
+    # _P_REST block below. #127 r3 moved the #2859 must-not-miss group
+    # (_P_MUST: active-session / session-start-reading / compaction notice /
+    # fairy-policy) AHEAD of _P_FOCUS (see the ORDERING INVARIANT comment's
+    # rule (c), near main()'s tail, for why) -- so focus is no longer
+    # guaranteed ahead of _P_MUST, only ahead of _P_REST and, when absent or
+    # short enough to live in `head` instead, _P_HEALTH.
+    #
+    # #127 r2: NOT appended to `_blocks` here. `_focus_text` is held aside
+    # so the reserve/focus_cap computation near main()'s tail (right before
+    # the final sort) can see the full set of "every OTHER body block"
+    # first -- appending it immediately, as r1 did, would make it
+    # indistinguishable from every other _P_FOCUS candidate by the time that
+    # computation runs. See the "#127 r2: in-hook sub-cap" comment near the
+    # final emit_context() call for the full mechanism.
+    _focus_text = ""
     try:
-        _focus = focus_block(ENGRAM_HOME)
-        if _focus:
-            lines.append(_focus)
+        _focus_text = focus_block(ENGRAM_HOME)
     except Exception:
         pass
 
@@ -3090,7 +3526,7 @@ def main() -> None:
     try:
         _saved_sets = saved_focus_sets_block(ENGRAM_HOME)
         if _saved_sets:
-            lines.append(_saved_sets)
+            _blocks.append((_P_REST, _saved_sets))
     except Exception:
         pass
 
@@ -3103,7 +3539,7 @@ def main() -> None:
     try:
         _starred = starred_block(ENGRAM_HOME)
         if _starred:
-            lines.append(_starred)
+            _blocks.append((_P_REST, _starred))
     except Exception:
         pass
 
@@ -3126,7 +3562,7 @@ def main() -> None:
         except Exception:
             _history_text = ""
         if _history_text:
-            lines.append(_history_text)
+            _blocks.append((_P_REST, _history_text))
 
     # ── Session checkpoint / node-injection block (#2026 WS1) — placed
     # BEFORE the #1819 ordering-invariant comment below, not merely early
@@ -3147,7 +3583,7 @@ def main() -> None:
         except Exception:
             _checkpoint_text = ""
         if _checkpoint_text:
-            lines.append(_checkpoint_text)
+            _blocks.append((_P_REST, _checkpoint_text))
 
         # Advance-after-inject, strictly: persist a new injected_through ONLY
         # after the render above has completed — whether or not it produced
@@ -3181,19 +3617,26 @@ def main() -> None:
     #   1. TIMEOUT KILL (#1819, original) — cheap before expensive. A timeout
     #      costs only the optional tail instead of everything.
     #   2. HEAD-TRUNCATION / BUDGET (#127's axis, new here) — must-survive
-    #      before already-lived. Nothing caps this hook's TOTAL emission size,
-    #      so whatever a downstream reader truncates — a harness preview
-    #      today, a context budget tomorrow — takes it from the END. The
-    #      block explicitly labelled "must survive compaction" (focus_block())
-    #      must not sit behind a block explicitly labelled "already lived, not
-    #      a to-do list" (history_arc_block()) for exactly this reason.
-    #      Measured on a real post-compact injection (#2150, 2026-08-19):
-    #      62,859 bytes total, a ~2KB harness preview, focus block starting at
-    #      line 164 of 264 — well past the cut. The history arc's own
-    #      HISTORY_ARC_CHAR_CAP (32,000 chars) and focus_block()'s measured
-    #      30,139-char post-dedup size (below) together account for
-    #      essentially the whole injection, so which of the two goes first is
-    #      the decision that matters most on this axis.
+    #      before already-lived. Before #127's fix, nothing capped this
+    #      hook's TOTAL emission size, so whatever a downstream reader
+    #      truncated — a harness preview, a context budget — took it from
+    #      the END. The block explicitly labelled "must survive compaction"
+    #      (focus_block()) must not sit behind a block explicitly labelled
+    #      "already lived, not a to-do list" (history_arc_block()) for
+    #      exactly this reason. Measured on a real post-compact injection
+    #      (#2150, 2026-08-19): 62,859 bytes total, a ~2KB harness preview,
+    #      focus block starting at line 164 of 264 — well past the cut. The
+    #      history arc's own HISTORY_ARC_CHAR_CAP (32,000 chars) and
+    #      focus_block()'s measured 30,139-char post-dedup size (below)
+    #      together accounted for essentially the whole injection, so which
+    #      of the two went first was the decision that mattered most on this
+    #      axis. #127 (this fix) now routes the whole assembly through
+    #      _hooklib.emit_context() with a hard 9,500-char TOTAL budget,
+    #      priority-tagged per block (_P_HEALTH < _P_MUST < _P_FOCUS <
+    #      _P_REST, see the block-collection comment near the top of
+    #      main()) — the ordering below is now a DEFAULT (same-tier
+    #      tie-break + a documentation aid for readers), not the only
+    #      mechanism keeping must-survive content visible.
     #
     # Rule (axis 1, TIME): cheap, purely-local, load-bearing blocks are
     # appended FIRST; blocks that are expensive or depend on runtime state come
@@ -3203,9 +3646,55 @@ def main() -> None:
     # survive a truncating reader (focus, saved-sets, starred) is appended
     # BEFORE the one that is a convenience even when complete (the history arc
     # + session checkpoint) — see main()'s emission order, changed #2150.
-    # Ordering is a partial, free mitigation on this axis: it protects the
-    # must-survive blocks from a truncation of any size, but it does not cap
-    # the hook's TOTAL emission, which is still #127's open question.
+    # Ordering here is now a free, secondary mitigation on this axis (a
+    # same-priority-tier tie-break): the PRIMARY guarantee that must-survive
+    # blocks are never silently dropped is #127's emit_context() cap +
+    # priority tags, not append position alone.
+    #
+    # Rule (axis 3, PREFIX-ONLY SELECTION — #127 r2, extended #127 r3): THREE
+    # rules on top of the _P_HEALTH/_P_MUST/_P_FOCUS/_P_REST priority tags,
+    # all existing because emit_context()'s own Stage 2 keeps a PREFIX of
+    # `body` and cuts from the TAIL only (_hooklib.py ~line 662) — it never
+    # reorders, and it never reaches INTO the middle of `body` to drop one
+    # oversized item while keeping everything after it:
+    #   (a) The tool-capability index is always the LAST body item, after
+    #       every other _P_REST block including calibration — see its own
+    #       collection-site comment above for why. At 11,049 measured bytes
+    #       it is bigger than the hook's entire 9,500-char budget by
+    #       itself; wherever it sits, it hides every block appended AFTER
+    #       it (Stage 2 cuts from the tail) — so it must sit where it hides
+    #       NOTHING, which is the very end.
+    #   (b) The focus block (_P_FOCUS) is pre-cut, IN THE HOOK, to
+    #       `focus_cap` chars before ever reaching emit_context() — see the
+    #       "in-hook sub-cap for the focus block" comment right before the
+    #       final emit_context() call, near main()'s tail, for the full
+    #       mechanism and the reserve/focus_cap arithmetic. Without this,
+    #       a real-seat ~39K-char focus block sits near the FRONT of
+    #       `body`, so every Stage-2 candidate that includes it already
+    #       overflows `target`, and the greedy shrink-from-the-tail loop
+    #       degrades all the way to showing ONE truncated item — dragging
+    #       every _P_MUST/_P_REST block behind it (the ones this rule and
+    #       rule (a) both exist to protect) off the visible render, even
+    #       though each is individually tiny. Measured on a real seat
+    #       (#127 r2's own "Why"): `▸ 1 shown · 7/9 cut`.
+    #   (c) The #2859 must-not-miss group (_P_MUST: the active-session
+    #       line, the session-start-reading pointer, the compaction notice,
+    #       and the fairy-policy block) is now placed AHEAD of _P_FOCUS,
+    #       not behind it (#127 r3, reviewer-fairy finding on PR #3214,
+    #       comment 5880917666). r1/r2 ranked focus ahead of this group;
+    #       under a real-seat-shaped focus block that pushes ctx's total
+    #       length well past the harness's 1,800-char head-preview window
+    #       (`_HEAD_PREVIEW_CHARS`), stage 2's prefix-keeping selection
+    #       still shows every _P_MUST line SOMEWHERE in the 9,500-char
+    #       budget (rule (b) already guarantees that), but "somewhere in
+    #       9,500" is not the same guarantee as "inside the first 1,800" —
+    #       the #2859 invariant `tests/test_session_start_hook_piece_c_
+    #       sidecar.py`'s `must_not_miss` check is written against. Moving
+    #       _P_MUST ahead of _P_FOCUS is what keeps these specific lines
+    #       inside the head-preview window even when focus is large; the
+    #       existing #2859 test only kept passing through r1/r2 because its
+    #       own fixture's focus block is trivially small, so it never
+    #       exercised this path.
     #
     # Measured on a real install:
     #     focus_block() TIME         ~0.002s   (2026-07-25 — still free; this
@@ -3217,15 +3706,18 @@ def main() -> None:
     #                                carrying only 10 distinct reasons) —
     #                                SIZE is a token-budget concern that this
     #                                invariant did NOT originally guard against;
-    #                                ordering (axis 2, above, #2150) now partly
-    #                                addresses it by protecting must-survive
-    #                                blocks from truncation, but a total-
-    #                                emission CAP is still not in place and
-    #                                remains tracked separately at
-    #                                engram-alpha#127. Repeated-reason
-    #                                dedup (this function, see docstring)
-    #                                cuts the duplicated-reason bytes but
-    #                                does not cap SIZE outright.
+    #                                ordering (axis 2, above, #2150) partly
+    #                                addressed it by protecting must-survive
+    #                                blocks from truncation, and #127 (this
+    #                                fix) now additionally caps the hook's
+    #                                TOTAL emission at 9,500 chars via
+    #                                _hooklib.emit_context(), with anything
+    #                                cut persisted verbatim to
+    #                                ENGRAM_HOME/session-start-overflow/.
+    #                                Repeated-reason dedup (this function,
+    #                                see docstring) separately cuts the
+    #                                duplicated-reason bytes within this one
+    #                                block.
     #                                Note the 3-week 19,958 -> 44,222 drift:
     #                                nothing reports this block's growth, so
     #                                DATE every number you add here. The
@@ -3264,12 +3756,42 @@ def main() -> None:
     # subprocess, no server.py/fastmcp import — so it belongs with the cheap
     # local blocks per the #1819 ordering invariant. Silent skip on any
     # failure or missing artifact — hook must not block session start.
+    #
+    # #127 r2: NOT appended to `_blocks` here, even though it is still
+    # COMPUTED here (same cheap-before-expensive position as before, per
+    # the #1819 axis-1 TIME invariant -- this is a static local file read,
+    # unlike calibration's own network-shaped EngramClient call right
+    # below). The artifact is checked-in at 11,049 bytes -- bigger than the
+    # hook's ENTIRE 9,500-char budget by itself, so wherever it sits in the
+    # body list decides only which blocks it hides BEHIND it (rule 1 of
+    # #127 r2). Held in `_tool_caps_text` and appended as the LAST body
+    # item, after every other block including calibration, right before the
+    # final emit_context() call. #3217: since this full block almost never
+    # fits, a SHORT names-only companion (tool_capability_short_block(),
+    # immediately below) is queued as an ORDINARY _P_REST block instead --
+    # it is small enough to actually survive Stage-2 selection, so an agent
+    # gets an inline tool-name list even when the full per-tool-purpose
+    # index is cut to the overflow file.
+    _tool_caps_text = ""
     try:
-        _tool_caps = tool_capability_index_block()
-        if _tool_caps:
-            lines.append(_tool_caps)
+        _tool_caps_text = tool_capability_index_block()
     except Exception:
         pass
+
+    # ── Short tool-capability index (#3217) ────────────────────────────────
+    # Names-only companion to the full index above, small enough (measured
+    # 948 chars against the real artifact, capped at TOOL_SHORT_BLOCK_MAX)
+    # to actually survive inline. Unlike `_tool_caps_text`, this IS appended
+    # to `_blocks` here, as an ordinary _P_REST item -- so the focus
+    # sub-cap's `_reserve` computation below (which sums `_blocks`) counts
+    # it like every other small rest block, rather than being held aside
+    # the way the full index deliberately is.
+    try:
+        _tool_caps_short_text = tool_capability_short_block()
+    except Exception:
+        _tool_caps_short_text = ""
+    if _tool_caps_short_text:
+        _blocks.append((_P_REST, _tool_caps_short_text))
 
     # ── ENGRAM Calibration block (EXPENSIVE — must stay last, see #1819) ───
     # Inject per-type distribution anchors on every SessionStart so fresh-wake
@@ -3301,7 +3823,7 @@ def main() -> None:
             _current_turn,
         )
         if _cal_block:
-            lines.append(_cal_block)
+            _blocks.append((_P_REST, _cal_block))
     except Exception:
         # Hook discipline: never surface calibration errors to session start.
         pass
@@ -3317,10 +3839,143 @@ def main() -> None:
     except Exception:
         pass
 
+    # ── #127: bounded TOTAL emission via _hooklib.emit_context() ───────────
+    # `target` == `budget` (both the harness's own hard ceiling, 9,500 chars
+    # for claude-code) for this hook specifically -- unlike
+    # engram-lesson-tripwire-hook.py's own call (target=1800 < budget=9500),
+    # this hook has no single-block soft economy target of its own; every
+    # priority-tagged block competes for the same 9,500-char ceiling.
+    # `head_budget` (1,800 for claude-code) is used ONLY to size `head`
+    # below -- it is deliberately NOT passed to emit_context() itself (see
+    # _harness.py's own docstring on why head_budget and target are
+    # different concepts).
+    _harness_name = detect_harness()
+    _budgets = get_harness_budgets(_harness_name)
+
+    # `head` -- a short tl;dr naming the session id and every _P_HEALTH
+    # warning line (the "what was cut" half of the tl;dr is the trailer's
+    # own job, always rendered by emit_context() itself as line 1).
+    # Self-limited to `head_budget` HERE, before ever calling
+    # emit_context(): `target` above is 9,500, far larger than the
+    # harness's actual physical preview boundary (head_budget=1,800), so
+    # emit_context()'s own internal head sizing (which sizes against
+    # `target`, not `head_budget`) would not by itself keep _P_HEALTH
+    # content inside the preview window. If the combined session-id +
+    # health text does not fit head_budget, the health text is NOT
+    # truncated into head (silent loss) -- it is instead queued as the
+    # highest-priority (_P_HEALTH) body item, so emit_context()'s own
+    # priority-ordered selection still shows it first, with the same
+    # overflow-on-cut guarantee as every other body block.
+    _session_id_for_head = (marker.get("session_id") if marker else None) or "unknown"
+    _head_prefix = f"[SessionStart {_session_id_for_head}]"
+    if _health_text:
+        _head_candidate = f"{_head_prefix}\n{_health_text}"
+    else:
+        _head_candidate = _head_prefix
+    if len(_head_candidate) <= _budgets["head_budget"]:
+        _head_text = _head_candidate
+    else:
+        _head_text = _head_prefix
+        _blocks.append((_P_HEALTH, _health_text))
+
+    # ── #127 r2 (tier names updated #127 r3): in-hook sub-cap for the focus
+    # block (_P_FOCUS) ───────────────────────────────────────────────────────
+    # `_blocks` at this point holds every priority-tagged block EXCEPT the
+    # focus block and the tool-capability index -- both were deliberately
+    # held aside (see the comments at their own collection sites above)
+    # specifically so this computation can see the full, final set of
+    # "every OTHER body block" before deciding how much room is left for
+    # focus.
+    #
+    # WHY this is needed at all (not just emit_context()'s own per-item
+    # truncation): emit_context()'s Stage 2 keeps a PREFIX of `body` and
+    # cuts from the TAIL (see _hooklib.py ~line 662, "Stage 2: greedy
+    # body-item selection"). The focus block (_P_FOCUS) sits ahead of every
+    # _P_REST block in that ordering (and, per #127 r3, now BEHIND the
+    # _P_MUST group -- see the ORDERING INVARIANT comment's rule (c)). A
+    # real-seat focus block can be ~39K chars -- nearly 4x the whole
+    # 9,500-char budget -- so if it were queued whole, EVERY candidate the
+    # Stage-2 loop tries that includes it (which is every candidate except
+    # "show nothing") already overflows `target`, and the loop degrades all
+    # the way to `truncated_first`: ONE single, itself-truncated item shown,
+    # with every other block -- _P_HEALTH, _P_MUST (active-session /
+    # session-start-reading / compaction notice / fairy-policy), every
+    # small _P_REST block, calibration -- cut, even though each of THEM
+    # individually is tiny and would easily have fit. Measured on a real
+    # seat (#127 r2's own "Why" section, under r1/r2's pre-#127-r3
+    # ordering): `▸ 1 shown · 7/9 cut`. Pre-cutting focus HERE, in the hook,
+    # to a size that leaves room for everything else, is what lets
+    # emit_context()'s own prefix-keeping Stage 2 do what it is actually
+    # good at: keeping every small, must-survive block inline -- true
+    # regardless of whether _P_MUST sits ahead of or behind _P_FOCUS, since
+    # this sub-cap is computed from the total size of every OTHER block,
+    # not from their relative order.
+    #
+    # reserve: sum of every OTHER body block's own length, plus the
+    # newline characters that will join them to each other in the final
+    # render (one join between each adjacent pair -- `len(_blocks) - 1`
+    # when there is more than one). `head` is accounted for separately
+    # (`len(_head_text)`); the handful of additional joins this reserve
+    # does NOT count -- trailer-to-head, head-to-first-body-item, and the
+    # two joins on either side of wherever focus itself lands -- are
+    # covered by TRAILER_RESERVE's own margin (see that constant's
+    # docstring for the exact accounting), not recomputed here.
+    _reserve = sum(len(_text) for _, _text in _blocks)
+    if len(_blocks) > 1:
+        _reserve += len(_blocks) - 1
+
+    _focus_cap = _budgets["budget"] - len(_head_text) - _reserve - TRAILER_RESERVE
+    _focus_cap = max(_focus_cap, FOCUS_FLOOR)
+
+    # `_pending_full_focus`: the FULL, untruncated focus text, appended as
+    # its own extra body item (see below) placed just BEFORE the
+    # tool-capability index -- i.e. the second-to-last item overall -- only
+    # when truncation actually happened. This is what lets a truncated
+    # focus block's full text still be recovered verbatim from the
+    # overflow file (emit_context()'s own cut-item recording), the same
+    # never-silently-lost guarantee every other block gets. Both this item
+    # and the tool-caps item that follows it are, by construction, always
+    # far too large to fit the remaining budget once `reserve` + the
+    # (now-capped) visible focus block are already accounted for -- so
+    # emit_context()'s own Stage 2 will always cut both from the tail; they
+    # exist in `body` only so their full text reaches the overflow writer.
+    _pending_full_focus: str | None = None
+    if _focus_text and len(_focus_text) > _focus_cap:
+        _pending_full_focus = _focus_text
+        _blocks.append((_P_FOCUS, _truncate_focus_block(_focus_text, _focus_cap)))
+    elif _focus_text:
+        _blocks.append((_P_FOCUS, _focus_text))
+
+    # Stable sort: cross-class order becomes
+    # _P_HEALTH < _P_MUST < _P_FOCUS < _P_REST (#127 r3 -- _P_MUST moved
+    # ahead of _P_FOCUS, see the ORDERING INVARIANT comment's rule (c));
+    # within one class, original append order (this main()'s own existing
+    # block sequence) is preserved -- Python's sort() is a stable sort, and
+    # no two blocks appended above ever compare by anything but this single
+    # priority key. The full-focus-copy and tool-caps items are NOT part of
+    # this sort -- both are appended after it, unconditionally last (rule 1
+    # + rule 2 of #127 r2), so neither can ever compete with a
+    # _P_HEALTH/_P_MUST/_P_FOCUS/_P_REST block for placement ahead of
+    # anything.
+    _blocks.sort(key=lambda _b: _b[0])
+    _body = [_text for _, _text in _blocks if _text]
+    if _pending_full_focus:
+        _body.append(_pending_full_focus)
+    if _tool_caps_text:
+        _body.append(_tool_caps_text)
+
+    additional_context = emit_context(
+        _head_text,
+        _body,
+        budget=_budgets["budget"],
+        target=_budgets["budget"],
+        overflow_writer=write_session_start_overflow,
+    )
+
     output_obj = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": "\n".join(lines),
+            "additionalContext": additional_context,
         }
     }
     output_str = json.dumps(output_obj)

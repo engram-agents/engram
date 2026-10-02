@@ -102,6 +102,40 @@ def run_indexer_tick(last_run_ts: float, interval_s: int) -> float:
     except Exception as exc:
         print(f"[engram-daemon] indexer tick failed (suppressed): {exc}", file=sys.stderr)
 
+    # Step 2 (#3135, telemetry WS6): the daemon owns the records.db ingest.
+    # Independent of step 1 -- its own try, so neither step can skip the other.
+    # engram_telemetry_store ships at tier=convenience while this daemon is
+    # essential-tier, so the import is guarded (same shape as the #2574 WS5
+    # guard in server.py; tests/test_tiers_manifest.py::
+    # test_import_dep_tier_consistency enforces it). Unavailable == the
+    # designed Essential-only state: skip silently.
+    try:
+        try:
+            from engram_telemetry_store import ingest as _telemetry_ingest
+        except Exception:  # pragma: no cover -- Essential-only build
+            _telemetry_ingest = None
+        tdir = os.path.join(ENGRAM_HOME, "telemetry")
+        # No telemetry/ dir == this seat has written nothing yet (fresh
+        # install); ingest() would raise on it every tick, so skip quietly.
+        if _telemetry_ingest is not None and os.path.isdir(tdir):
+            summary = _telemetry_ingest(os.path.join(tdir, "records.db"), tdir)
+            errors = summary.get("errors") or []
+            if (
+                summary.get("records_ingested", 0) > 0
+                or summary.get("files_swept", 0) > 0
+                or errors
+            ):
+                line = (
+                    f"[engram-daemon] telemetry tick: {summary.get('files_processed', 0)} file(s), "
+                    f"{summary.get('records_ingested', 0)} record(s), "
+                    f"{summary.get('files_swept', 0)} swept"
+                )
+                if errors:
+                    line += f", {len(errors)} error(s)"
+                print(line, file=sys.stderr)
+    except Exception as exc:
+        print(f"[engram-daemon] telemetry ingest failed (suppressed): {exc}", file=sys.stderr)
+
     return now
 
 

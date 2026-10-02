@@ -32,8 +32,11 @@ tests/
 #     names, host boot schedule, per-instance systemd wiring). Generic ENGRAM
 #     users don't get a boot-autostart from the release; this stays private
 #     dev/ops infra. (Requested by Lei 2026-07-24 — added in the same PR that
-#     touched these files, alpha#1815.) ---
-deploy/
+#     touched these files, alpha#1815.) Leading slash anchors this to the
+#     repo root so it doesn't also swallow src/forum/deploy/ (the shipped
+#     forum systemd install path, tiered convenience) under the now-correct
+#     any-depth semantics for unanchored directory entries (#2516). ---
+/deploy/
 
 # --- Dev-process docs (the procedures for DEVELOPING and RELEASING ENGRAM, run
 #     from engram-alpha/dev; a public release USER never cuts a release or contributes

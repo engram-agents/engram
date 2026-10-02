@@ -384,7 +384,7 @@ Entry points:
 
 ## **19. Recall Summaries & Keywords (Sleep-Cycle Backfill)**
 
-**what** — Agent-curated short-form representations (recall_summary ≤120 chars, recall_keywords 3–5 strings) drive recall surfaces and tier-1/2 result formatting. Originally NULL on all nodes; backfilled via sleep-cycle summary-fairy (generates summaries for day's cohort), then applied via `engram_set_recall_summaries()` batch tool. Idempotent: re-writing same summary is a no-op.
+**what** — Agent-curated short-form representations (recall_summary ≤140 chars target, `RECALL_SUMMARY_TARGET`; recall_keywords 3–5 strings) drive recall surfaces and tier-1/2 result formatting. Originally NULL on all nodes; backfilled via sleep-cycle summary-fairy (generates summaries for day's cohort), then applied via `engram_set_recall_summaries()` batch tool. Idempotent: re-writing same summary is a no-op.
 
 **how** — Columns (added via migration in `engram_core.py` DB init): recall_summary (TEXT), recall_keywords (TEXT JSON array). Fetch in `_build_inspect_recall_view()` in `engram_query.py:704` and tiered result rendering in `_build_tiered_results()` in `engram_query.py:1601`.
 
@@ -394,7 +394,7 @@ Tool: `engram_set_recall_summaries()` (`engram_recall_summaries.py:63–219`) ba
 
 **files** — `engram_core.py` (column migrations in DB init). `engram_query.py` (`_build_inspect_recall_view()` :704; `_build_tiered_results()` :1601). `engram_recall_summaries.py` (batch-write impl). server.py (wrapper `engram_set_recall_summaries` :6933). `tools/recall_summary_validator.py` (validation constants).
 
-**key constants** — Max 120 chars (soft), 200 chars (hard cap: `RECALL_SUMMARY_HARD_CAP` in `tools/recall_summary_validator.py:19`).
+**key constants** — Max 140 chars (soft target: `RECALL_SUMMARY_TARGET`, now defined in `tools/recall_summary_validator.py`), 200 chars (hard cap: `RECALL_SUMMARY_HARD_CAP` in `tools/recall_summary_validator.py:19`).
 
 **tests** — test_set_recall_summaries_*.py (if exists).
 

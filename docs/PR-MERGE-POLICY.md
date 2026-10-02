@@ -49,8 +49,9 @@ elsewhere — one gate, one wording.
 criterion was given, and because without it a reader wonders whether the gate
 was weakened in some further, unwritten way. It was not. **The question "does a
 design-settled substrate PR still need to flip to Lei right now?" is answered in
-exactly one place — "When Lei is away" below — and this section does not answer
-it.**
+exactly two places — "Delegated by Lei, 2026-09-27" (he read the design) and
+"When Lei is away" (he is away) below — and this section answers it in
+neither case.**
 
 Lei, 2026-09-02, on the health-score lane (#1991), which the 08-25 criterion had
 already classified as stats. Quoted in full, no elision:
@@ -73,10 +74,11 @@ What it does and does not do:
   That raises the bar on us: "Lei is not reading PRs" is never a reason to skip
   a design conversation, only a reason it must happen somewhere he can see it.
 - **Does NOT:** create a general "design was settled with him at some point →
-  the team may merge any substrate PR" rule. He is present, the ⛔ list is
-  unchanged, and a substrate PR outside an explicitly-classified lane still
-  flips to him. If you are reaching for this section to justify a merge, you are
-  using it for the one thing it does not do.
+  the team may merge any substrate PR" rule. If you are reaching for this
+  section to justify a merge, you are using it for the one thing it does not
+  do. *(The 2026-09-27 delegation below later granted a narrower rule — "a
+  design **he** read", with a written conformance check — in its own words.
+  That grant lives there, not here.)*
 
 > **⚠ How this arrived, and the failure it should prevent.** The 08-25 ruling
 > was delivered in-session to **one seat** (Kepler's) and lived only in his
@@ -99,6 +101,59 @@ What it does and does not do:
 > written into this doc, by whoever heard it, the day they hear it** — a
 > verbatim quote in a graph is provenance, not governance.
 
+## Delegated by Lei, 2026-09-27 — substrate PRs that implement a design he already read
+
+Lei, 2026-09-27, in Kepler's session, answering Borges's question on where
+delegation stops. **Provenance: second-hand.** It reaches this doc through
+Kepler's forum post (thread #432, post 10928, 13:16Z), not through a surface
+the rest of us can read:
+
+> *"yes, go with your recommendation on delegation"*
+
+The recommendation he accepted, as Kepler posted it:
+
+> - The team may merge a technical or bug-fix substrate PR after peer review,
+>   without his read, **when it implements a design he already read**.
+> - The merge seat writes a short conformance check against that design before
+>   merging.
+> - Issues may be closed when code evidence is attached.
+> - A new substrate concept still goes to him first.
+
+**What changes.** A PR that hits the ⛔ list below no longer flips to Lei *just
+because* it touches substrate. It flips to him when it carries a substrate
+**concept he has not read** — a new node type, edge type or verb whose design
+he never saw, or a PR that departs from the design he did see. A build unit of
+a design he read is merged by the team.
+
+**How the merge seat applies it — two steps, both written on the PR before the
+merge** (operational reading of the grant; the two steps are not Lei's words):
+
+1. **Point to the read.** Link the artifact that shows Lei read the design: his
+   APPROVE or COMMENT on the design-note PR, his comment on the design issue,
+   or his in-session word quoted verbatim with who relayed it and where.
+   "The design was discussed with him" without an artifact does not count. If
+   you cannot link it, flip to Lei.
+2. **Conformance check.** A short PR comment: which design, which points the
+   PR implements, and any place it differs. A difference that changes what a
+   node, edge or verb **means** is a new concept → flip to Lei. A difference in
+   plumbing (names, file layout, error text) is not.
+
+**Scope limits.** This does not touch the live deploy (still Lei's — see "When
+Lei is away"), the security clause (Mira's approval is still the gate there),
+or any other repo. It adds nothing to the ⛔ list and removes nothing from it;
+it changes who merges an item on that list once Lei has read its design.
+
+### Closing issues (same ruling)
+
+**An issue may be closed when code evidence is attached.** The closing comment
+names the evidence: the merged PR or commit SHA, and the code or test that
+shows the issue's problem is gone. "I believe this is fixed" is not evidence.
+This covers **issues only**. Closing a PR someone else opened is not covered
+by this ruling.
+*(Only the first sentence is the ruling. The rest is the operational reading
+of "code evidence" and of its scope, the same status as the two merge-seat steps
+above.)*
+
 ## Scope — this policy governs **engram-alpha only**
 
 The substrate-feature gate below is **engram-alpha-specific**. Other repos in the org carry their own **delegated** merge authority, set by Lei per project:
@@ -119,7 +174,8 @@ unchanged readiness routine — reviewer-fairy convergence, non-author peer
 approval, CI green on the tip, the security read where the surface calls for it,
 **and every gate in this document where it applies**: the grant's own words are
 "when … requirements meet," and this policy's substrate gate (Lei reads
-substrate features first; when-away grant terms) is one of those requirements,
+substrate features first unless he has read their design, per the 2026-09-27
+delegation; when-away grant terms) is one of those requirements,
 not something the grant displaces.
 
 **What the second holder must not silently drop: serialization** (Borges's
@@ -151,11 +207,11 @@ mechanism, not luck:
   security PR that also carries substrate-concept changes outside Mira's
   review scope.
 
-So "flip to Lei for substrate" is an **engram-alpha** rule. Do not extend it to a delegated-authority repo; do not relax it inside engram-alpha. When you're unsure which repo's rule applies, the repo you're merging *into* decides.
+So "flip to Lei for substrate" is an **engram-alpha** rule. Do not extend it to a delegated-authority repo; do not relax it inside engram-alpha beyond what the 2026-09-27 delegation above grants. When you're unsure which repo's rule applies, the repo you're merging *into* decides.
 
 ## ⛔ Lei reads before merge — SUBSTRATE FEATURES
 
-Flip the baton to Lei (the maintainer) and **do not merge it yourself**, even after colleague convergence + CI-green, if the PR:
+Flip the baton to Lei (the maintainer) and **do not merge it yourself**, even after colleague convergence + CI-green, if the PR does one of the following **and Lei has not read its design** (if he has, see "Delegated by Lei, 2026-09-27" above — the team merges, after the two written steps there):
 
 - adds or changes a **node type or edge type**
 - changes **confidence computation** (quote_type / reasoning_type maps, propagation,
@@ -180,8 +236,23 @@ Merge once colleague-converged + CI-green, **no per-PR Lei permission needed**:
 
 - **bug fixes / regressions / test fixes**
 - **tooling, infra, CI** — backup, baton, forum, hooks, packaging, the affected-tests gate, install/upgrade
+  - **The baton system is on this side in full, its design included (Lei, 2026-09-30,
+    in session, verbatim: "baton system can be considered convention and convenience,
+    not substrate, feel free to improve it based on your real experience").** That
+    covers the CLI, the gates, the forum's project store, the file format and the
+    design notes for any of them. Before this ruling a baton *redesign* was held for
+    his read as if it were substrate (#3055, the phase-and-turn design note for #3039,
+    sat approved from 2026-09-27 to 2026-09-30 on that reading); it no longer is. A
+    baton PR merges at the seat after the normal pipeline. Two limits. **A baton PR
+    that also alters a concept on the ⛔ list is judged on that concept**, exactly as
+    the "Gray areas" line on a fix that changes a substrate behavior says; "in full"
+    describes the baton system, not whatever else a PR carries. **A change that makes
+    the forum or the baton authenticate its callers is a security PR** under "Security
+    PRs" above: Mira's approval is its merge gate, and it goes to Lei only if it also
+    changes a ⛔-listed concept outside her review scope.
 - **docs, brand, i18n**
 - **refactors** that don't change a substrate concept
+- **substrate PRs that implement a design Lei already read** — only after the merge seat has linked his read and written the conformance check ("Delegated by Lei, 2026-09-27" above)
 
 Surface notable ones in the **post-merge digest** so Lei can see what landed and why — but don't gate on them.
 
@@ -200,10 +271,11 @@ The boundary outside the grant is unchanged: substrate PRs with **unsettled desi
 ## At merge time — the natural checkpoint
 
 The baton's **flip-to-maintainer** step is where this rule lives in practice:
-- **Substrate feature:** the baton flips to Lei and *stays there until he merges* (or, under a live day-grant, to the grantee for a dev-merge per the section above).
+- **Substrate feature whose design Lei has not read:** the baton flips to Lei and *stays there until he merges* (or, under a live day-grant, to the grantee for a dev-merge per the section above).
+- **Substrate feature implementing a design Lei read:** the baton flips to the maintainer seat; the merge seat links his read, writes the conformance check, then merges.
 - **Fix / non-substrate:** a colleague-converged + CI-green PR can be merged by the team.
 
-So at every `baton flip … <maintainer>`, ask: *is this a substrate concept change, in this repo?* If yes (and no live grant applies), Lei reads first.
+So at every `baton flip … <maintainer>`, ask: *is this a substrate concept change, in this repo — and has Lei read its design?* If substrate and not read (and no live grant applies), Lei reads first.
 
 **Merging a `[part of #N]` PR:** tick the workstream line the PR's own body names (the author, not the merge seat, knows which line their PR corresponds to) in #N's body, in the same pass as the merge (checkbox, or a `— landed as #M (sha)` suffix) — see `CLAUDE.md`'s `## PR — issue closure` for the full convention (#2617). A `[part of #N]` PR never auto-closes #N, so this tick is the only thing that keeps the epic body from reading as open work nobody finished.
 
@@ -211,7 +283,7 @@ So at every `baton flip … <maintainer>`, ask: *is this a substrate concept cha
 
 ### Baton turn-target corollary
 
-The "flip to Lei" half applies **only to substrate PRs** (in engram-alpha). For a fix / non-substrate PR, the maintainer (pool sentinel) — **not Lei** — is the merge-ready turn-target; the agent team merges it directly after colleague-convergence + CI-green. Setting `turn: lei` on a non-substrate baton is the anti-pattern: it produces a stuck baton that no one can advance, because Lei isn't gating that class (origin: PR #1333, a forum brand rename, whose baton was parked at Lei and stuck after merge — #1442). Match the turn-target to the class: substrate → Lei; everything else → maintainer.
+The "flip to Lei" half applies **only to substrate PRs** (in engram-alpha). For a fix / non-substrate PR, the maintainer (pool sentinel) — **not Lei** — is the merge-ready turn-target; the agent team merges it directly after colleague-convergence + CI-green. Setting `turn: lei` on a non-substrate baton is the anti-pattern: it produces a stuck baton that no one can advance, because Lei isn't gating that class (origin: PR #1333, a forum brand rename, whose baton was parked at Lei and stuck after merge — #1442). Match the turn-target to the class: substrate whose design Lei has not read → Lei; everything else, including substrate implementing a design he read → maintainer.
 
 ## Gray areas
 
@@ -219,6 +291,7 @@ The "flip to Lei" half applies **only to substrate PRs** (in engram-alpha). For 
 - **A new tool that's pure plumbing** (backup, stats, a CLI) → not substrate, even though it's a "feature."
 - **A docs PR that documents a substrate concept** → not substrate (it's docs); but a docs PR that *defines new semantics* is.
 - **A substrate PR during a Lei-absence day-grant** → merge to `dev` is OK under the grant (design-settled, logged); the live deploy still waits for Lei. See "When Lei is away" above.
+- **A build unit of a design Lei read, where the PR had to depart from that design** → if the departure changes what a node, edge or verb means, it is a new concept: flip to Lei. If it is plumbing, the team merges and the conformance check names the departure.
 - Still unsure after this → flip to Lei. Defaulting to the gate is cheap.
 
 ## Origin

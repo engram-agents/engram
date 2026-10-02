@@ -138,7 +138,12 @@ def _derive_impl(
 
     Deductive (discount 0.98 — truth-preserving):
       deductive_modus_ponens, deductive_modus_tollens,
-      deductive_hypothetical_syllogism, deductive_disjunctive, deductive_reductio
+      deductive_hypothetical_syllogism, deductive_disjunctive, deductive_reductio,
+      deductive_conjunction (weakest-link over N≥2 premises for a claim that IS
+        the conjunction of its premises — e.g. a universal over an explicitly
+        enumerated, complete set. NOT for independent witnesses to the same
+        claim — that's corroboration: use inductive_generalization,
+        inductive_enumeration, or authority_consensus instead.)
 
     Inductive (discount 0.70–0.95 — evidence strengthens but never proves):
       inductive_generalization (0.95, corroborative, multi-source),

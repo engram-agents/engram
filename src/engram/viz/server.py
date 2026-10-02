@@ -70,10 +70,12 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import logging
 import os
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import agents as viz_agents
@@ -82,6 +84,7 @@ from . import routes
 from . import shell
 from . import static_serve
 from . import urls as viz_urls
+from . import version_info as viz_version_info
 from .data import calibration as viz_calibration_data
 from .data import config as viz_config_data
 from .data import graph as viz_graph_data
@@ -111,6 +114,67 @@ from .data import stats as viz_stats_data
 # in this module (viz_agents.AGENTS etc.) is monkeypatched, without going
 # through argparse/main().
 _ACCESS_LOG_PATH: "str | None" = None
+
+
+# ---------------------------------------------------------------------------
+# Startup-captured version report (engram-alpha#2531): which commit this
+# RUNNING PROCESS actually loaded, resolved ONCE at import time and cached --
+# never re-read per request (a checkout can move commits/branches under a
+# long-lived process; GET /api/version below always answers about what was
+# loaded at startup, not about the checkout's current state).
+#
+# `_VERSION_INFO_DIR` is kept as a separate module attribute (not folded
+# into the capture, discarded) specifically so tests can monkeypatch it
+# alongside `_VERSION_INFO` when exercising a scratch git repo, the same
+# pattern this module already uses for `_ACCESS_LOG_PATH` /
+# `viz_agents.AGENTS` (direct module-attribute monkeypatching rather than
+# routing every test through argparse/main()).
+# ---------------------------------------------------------------------------
+
+_VERSION_LOGGER = logging.getLogger("viz.server.version")
+
+
+def _capture_and_log_version_info(start_path: "str | Path | None" = None) -> dict:
+    """Capture version info (see viz.version_info.capture_version_info) and
+    log it: exactly one INFO line carrying all four fields, plus a WARNING
+    line iff the capture came back with a "warning" (non-dev/main branch,
+    or a dirty checkout). Startup always succeeds regardless -- this never
+    raises (capture_version_info itself never raises).
+
+    PR #3174: when the capture comes back with a null ``sha`` for a reason
+    meaning "genuinely no tracking checkout" (``is_plugin_fallback_reason``
+    -- not tracked / not a git checkout, as opposed to a checkout that
+    exists but git couldn't read), and ``.deployed-version`` names a real
+    ``alpha_sha``, the returned dict additionally carries a
+    ``"plugin": {"alpha_sha": ..., "alpha_dirty": ...}`` block -- the same
+    ``.deployed-version`` reader ``viz.footer``'s plugin-shape rendering
+    uses (``read_deployed_version``, moved to ``viz.version_info`` so both
+    callers share one reader). ``info["reason"]`` is left exactly as
+    ``capture_version_info`` returned it -- this only ADDS the ``"plugin"``
+    key, never replaces the reason string."""
+    info = viz_version_info.capture_version_info(start_path)
+    if info.get("sha") is None and viz_version_info.is_plugin_fallback_reason(
+        info.get("reason")
+    ):
+        dv = viz_version_info.read_deployed_version()
+        alpha_sha = dv.get("alpha_sha", "")
+        if alpha_sha and alpha_sha != "unknown":
+            info = dict(info)
+            info["plugin"] = {
+                "alpha_sha": alpha_sha,
+                "alpha_dirty": dv.get("alpha_dirty", ""),
+            }
+    _VERSION_LOGGER.info(
+        "viz server version: sha=%s branch=%s dirty=%s started_at=%s",
+        info.get("sha"), info.get("branch"), info.get("dirty"), info.get("started_at"),
+    )
+    if "warning" in info:
+        _VERSION_LOGGER.warning("viz server startup warning: %s", info["warning"])
+    return info
+
+
+_VERSION_INFO_DIR = Path(__file__).resolve().parent
+_VERSION_INFO: dict = _capture_and_log_version_info(_VERSION_INFO_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +270,14 @@ class Handler(BaseHTTPRequestHandler):
                         "default": viz_agents.DEFAULT_AGENT})
             return
 
+        if path == "/api/version":
+            # engram-alpha#2531: serves the value captured ONCE at startup
+            # (see _VERSION_INFO above) -- deliberately NEVER re-reads git
+            # per request. Not agent-scoped (no ?agent= handling), same as
+            # /api/agents and /api/schema.
+            self._json(dict(_VERSION_INFO))
+            return
+
         if path in routes.PAGE_ROUTES:
             # Nav rendering happens HERE, at request time, not at import
             # time in shell.py (engram-alpha#2555 PR B amendment-1,
@@ -270,9 +342,42 @@ class Handler(BaseHTTPRequestHandler):
                             "error": f"Unknown agent: {agent_name!r}",
                             "agent": agent_name})
             else:
-                resp = viz_graph_data.get_graph(db_path)
+                # engram-alpha#2866 fix 4: serve the INDEX payload here, not
+                # get_graph's full one -- ~7x smaller on the wire. A clicked
+                # node's full data is fetched on demand via /api/node below.
+                resp = viz_graph_data.get_graph_index(db_path)
                 resp["agent"] = agent_name
                 self._json(resp)
+        elif path == "/api/node":
+            # engram-alpha#2866 fix 4: GET /api/node?id=<id>&agent=<a> --
+            # the full node /api/graph's index no longer carries. Same
+            # tenant (db_path/?agent=) resolution as /api/graph above (both
+            # read agent_name/db_path off the single _resolve_agent() call
+            # made once for every agent-scoped endpoint, a few lines up).
+            qs = parse_qs(parsed.query or "")
+            node_id = (qs.get("id", [None])[0] or "").strip()
+            if not node_id:
+                self._json({"error": "id parameter is required",
+                            "agent": agent_name}, status=400)
+            elif not db_path:
+                # Mirrors /api/graph's own unknown-agent convention exactly
+                # (fail-honest 200 + error, not a 404) -- deliberately NOT
+                # the same as the unknown-NODE-id case below, which IS a 404.
+                self._json({"error": f"Unknown agent: {agent_name!r}",
+                            "agent": agent_name})
+            else:
+                node = viz_graph_data.get_node(db_path, node_id)
+                if node is None:
+                    # Same body-less 404 shape as the catch-all route below
+                    # (#2926's lesson): a keep-alive HTTP/1.1 client hangs on
+                    # a body-less response with no Content-Length.
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                else:
+                    resp = dict(node)
+                    resp["agent"] = agent_name
+                    self._json(resp)
         elif path == "/api/schema":
             # Schema is static (no DB required) — return the SSoT dict built
             # from engram_core / engram_query / engram_stats constants.
@@ -336,6 +441,20 @@ class Handler(BaseHTTPRequestHandler):
                 version = (qs.get("version", [None])[0]) or None
                 signal = (qs.get("signal", [None])[0]) or None
                 resp = viz_health_v2_data.get_health_v2_series(agent_name, version, signal)
+                resp["agent"] = agent_name
+                self._json(resp)
+        elif path == "/api/health/v2/live":
+            # health-v2 LIVE score panel (engram-alpha#2518, live-score
+            # slice) -- recomputes a fresh snapshot on EVERY call, straight
+            # off the requested agent's own knowledge.db; never reads or
+            # writes a stored snapshot file. Lei's direction: "always
+            # recompute on page refresh ... the health dashboard is
+            # basically showing the realtime health score all the time".
+            if not db_path:
+                self._json({"error": f"Unknown agent: {agent_name!r}",
+                            "agent": agent_name}, status=404)
+            else:
+                resp = viz_health_v2_data.get_health_v2_live_data(agent_name)
                 resp["agent"] = agent_name
                 self._json(resp)
         elif path == "/api/health/v2/model":
@@ -501,6 +620,34 @@ class Handler(BaseHTTPRequestHandler):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _version_banner_lines(info: dict) -> list[str]:
+    """Render the startup version report as stdout banner line(s).
+
+    Follow-up to engram-alpha#2531: viz.server never configures Python
+    logging (no basicConfig/handlers), so ``_VERSION_LOGGER.info(...)`` in
+    ``_capture_and_log_version_info`` above is silently dropped by Python's
+    last-resort handler (WARNING and above only) -- the server's real,
+    always-visible startup output is this print() banner in main(), not the
+    logger. Factored out of main() so the banner content is directly
+    testable without spinning up argparse/HTTPServer.
+
+    Always at least one line: "Loaded commit     ->  <sha or 'unknown
+    (<reason>)'> on <branch or 'detached'>", with ", dirty" appended when
+    dirty is truthy. A second "version warning: <warning>" line is added
+    iff `info` carries a "warning" key. Never raises -- `info` is always
+    one of capture_version_info()'s own shapes."""
+    sha = info.get("sha")
+    sha_display = sha if sha is not None else f"unknown ({info.get('reason', 'unknown reason')})"
+    branch = info.get("branch")
+    branch_display = branch if branch is not None else "detached"
+    dirty_suffix = ", dirty" if info.get("dirty") else ""
+
+    lines = [f"Loaded commit     →  {sha_display} on {branch_display}{dirty_suffix}"]
+    if "warning" in info:
+        lines.append(f"⚠ version warning: {info['warning']}")
+    return lines
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="ENGRAM visualization server — D3 force-directed graph for knowledge.db"
@@ -551,6 +698,8 @@ def main():
     ThreadingHTTPServer.allow_reuse_address = True
     bind = args.bind or "127.0.0.1"
     server = ThreadingHTTPServer((bind, args.port), Handler)
+    for line in _version_banner_lines(_VERSION_INFO):
+        print(line)
     print(f"ENGRAM Visualizer →  http://localhost:{args.port}")
     print(f"Health Dashboard  →  http://localhost:{args.port}/health")
     print(f"Config tab        →  http://localhost:{args.port}/config")

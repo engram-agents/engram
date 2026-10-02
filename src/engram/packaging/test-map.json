@@ -24,7 +24,6 @@
         "tests/test_stale_tree_pull_hook_injection_bounds.py",
         "tests/test_user_identity_hook_injection_bounds.py",
         "tests/test_lesson_tripwire_injection_bounds.py",
-        "tests/test_toolcall_repair_injection_bounds.py",
         "tests/test_deference_detector_injection_bounds.py",
         "tests/test_forum_hook_injection_bounds.py"
       ],
@@ -40,7 +39,6 @@
         "tests/test_stale_tree_pull_hook_injection_bounds.py",
         "tests/test_user_identity_hook_injection_bounds.py",
         "tests/test_lesson_tripwire_injection_bounds.py",
-        "tests/test_toolcall_repair_injection_bounds.py",
         "tests/test_deference_detector_injection_bounds.py",
         "tests/test_forum_hook_injection_bounds.py",
         "tests/test_forum_hook.py"
@@ -247,10 +245,9 @@
     {
       "path_prefix_or_glob": "hooks/claude/engram-toolcall-repair.py",
       "test_globs": [
-        "tests/test_add_observation_payload.py",
-        "tests/test_toolcall_repair_injection_bounds.py"
+        "tests/test_toolcall_repair_tombstone_3249.py"
       ],
-      "note": "toolcall-repair is exercised in test_add_observation_payload (antml repair path). engram-alpha#2863 WS2 batch C: test_toolcall_repair_injection_bounds.py added -- drives this hook's new emit_context() migration end-to-end (same dynamic-load invisibility as this file's existing entry)."
+      "note": "#3249 tombstone: no-op hook kept unregistered for one release; delete with the tombstone in the first release after v0.5.2 (only sessions started on v0.5.2-rc4 or later carry no registration)."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-user-identity-hook.py",
@@ -446,11 +443,25 @@
       "note": "engram-alpha#2544. test_reconcile_lesson_demotions.py loads the module via importlib.util.spec_from_file_location (not a static `import`), same reasoning as the hyphenated hook files above -- invisible to the layer-1 AST import graph despite having a valid module name, so it needs this layer-2 mapping."
     },
     {
+      "path_prefix_or_glob": "tools/enumerate_armed_monitors.py",
+      "test_globs": [
+        "tests/test_enumerate_armed_monitors.py"
+      ],
+      "note": "engram-alpha#3049/#3050. test_enumerate_armed_monitors.py DOES statically import via `from tools.enumerate_armed_monitors import find_armed_monitor_task_ids`, but this was invisible to the layer-1 AST import graph scan (test_all_shipped_tools_are_covered failed on this path) -- root cause of the miss not fully diagnosed at write time; this layer-2 mapping unblocks CI honestly rather than papering over an unexplained gap."
+    },
+    {
       "path_prefix_or_glob": "tools/grant_viz_operator_acl.py",
       "test_globs": [
         "tests/test_grant_viz_operator_acl.py"
       ],
       "note": "engram-alpha#2720. test_grant_viz_operator_acl.py loads the module via importlib.util.spec_from_file_location (not a static `import`), same reasoning as tools/reconcile_lesson_demotions.py's own mapping above -- invisible to the layer-1 AST import graph despite having a valid module name, so it needs this layer-2 mapping."
+    },
+    {
+      "path_prefix_or_glob": "tools/write_op_census.py",
+      "test_globs": [
+        "tests/test_write_op_census.py"
+      ],
+      "note": "engram-alpha#3095. test_write_op_census.py loads the module via importlib.util.spec_from_file_location (not a static `import`), same reasoning as tools/reconcile_lesson_demotions.py's own mapping -- invisible to the layer-1 AST import graph despite having a valid module name, so it needs this layer-2 mapping."
     },
     {
       "path_prefix_or_glob": "tools/worktree-gc.py",
@@ -494,12 +505,6 @@
       "note": "No test file found for engram-fix-git-backup.sh"
     },
     {
-      "path_prefix_or_glob": "tools/collab-baton-monitor.sh",
-      "test_globs": [
-        "tests/test_baton_monitor.py"
-      ]
-    },
-    {
       "path_prefix_or_glob": "tools/forum-mention-monitor.sh",
       "test_globs": [
         "tests/test_forum_mention_monitor_coalesce.py",
@@ -538,18 +543,20 @@
         "tests/test_loop_skill_harness_selection.py",
         "tests/test_skill_frontmatter_lint.py",
         "tests/test_skill_server_sync.py",
-        "tests/test_tiers_manifest.py"
+        "tests/test_tiers_manifest.py",
+        "tests/test_health_exam_skill.py"
       ],
-      "note": "The loop skill has a harness-routing order invariant in addition to the generic skill lint gates."
+      "note": "The loop skill has a harness-routing order invariant in addition to the generic skill lint gates. The health-exam gate is listed here as well as on the broader skills/claude/ entry because selection is FIRST-MATCH-WINS: this entry shadows that one for this path, so a gate omitted here simply never runs for this doc."
     },
     {
       "path_prefix_or_glob": "skills/claude/",
       "test_globs": [
         "tests/test_skill_frontmatter_lint.py",
         "tests/test_skill_server_sync.py",
-        "tests/test_tiers_manifest.py"
+        "tests/test_tiers_manifest.py",
+        "tests/test_health_exam_skill.py"
       ],
-      "note": "Any change to a skill directory triggers skill lint + tiers manifest"
+      "note": "Any change to a skill directory triggers skill lint + tiers manifest, plus the health-exam shell-pattern gate, whose population is EVERY shipped skill doc rather than the health-exam one. Adding a more specific skills/claude/<name>/ entry above this one shadows it (first-match-wins), so such an entry must repeat this gate."
     },
     {
       "path_prefix_or_glob": "templates/",

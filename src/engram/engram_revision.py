@@ -91,6 +91,29 @@ VALID_ERROR_TYPES = {
 
 VALID_INITIATION_TYPES = frozenset({"user_prompted", "gate_prompted", "unprompted"})
 
+# #2613: the retraction replacement contract. A closed set, deliberately with
+# no free-text sibling (docs/2613-retraction-replacement-contract.md §4) — the
+# set exists to be scanned ("which retractions had no replacement, and why?"),
+# and a closed-set-plus-note splits the answer across two fields. Members are
+# founded on distinct epistemic situations, not frequency data:
+#   NONE_BECAUSE_NO_SUCCESSOR        — the claim was simply wrong; nothing
+#                                       true stands in its place.
+#   NONE_BECAUSE_DUPLICATE           — the surviving node already existed.
+#   NONE_BECAUSE_SUPERSEDED_ELSEWHERE — a successor exists but is not this
+#                                       retraction's to name.
+#   NONE_BECAUSE_UNKNOWN             — no successor could be determined; the
+#                                       escape hatch, and the only member that
+#                                       requires replacement_absent_note (§4's
+#                                       "naming the escape hatch costs a
+#                                       sentence; naming a real category costs
+#                                       nothing").
+VALID_REPLACEMENT_ABSENT_REASONS = frozenset({
+    "NONE_BECAUSE_NO_SUCCESSOR",
+    "NONE_BECAUSE_DUPLICATE",
+    "NONE_BECAUSE_SUPERSEDED_ELSEWHERE",
+    "NONE_BECAUSE_UNKNOWN",
+})
+
 # Discipline hint returned when the threshold gate fires on engram_resolve.
 # Surfaces in the result JSON as "discipline_hint" alongside "note" to guide
 # callers away from chain-dilution and toward legitimate paths forward.
@@ -458,32 +481,91 @@ def _cascade_event_creation_time(conn, cascade_event: str) -> str:
     return row["t"] if row and row["t"] else ""
 
 
-def _cascade_dead_premise_detail(conn, node_id: str, cascade_event: str) -> list:
+def _root_replacement_decision(conn, root_node: str, root_op: str) -> dict | None:
+    """#2613 §5: the cascade ROOT carries no cascade_markers row — markers
+    are written for affected DOWNSTREAM nodes, never for the node whose
+    retraction/supersession created the cascade — so when the root is
+    itself one of node_id's direct premises, _dead_premises' marker-based
+    query structurally cannot find it (there is no 'resolved' marker row to
+    match). The root's decision lives on its own retraction/supersession
+    EVENT instead: §3 change 3 puts `replacement_id` /
+    `replacement_absent_because` on a retraction's own edit_history row;
+    supersede already records `replaced_by` there. Read it from there
+    rather than from a marker row that by construction does not exist —
+    "the design's answer falls straight out of event-not-edge" (§5).
+
+    Returns None only if no matching event is found (should not happen for
+    a genuine cascade root, but this is a read, not an assumed invariant).
+    """
+    action = "retracted" if root_op == "retract" else "superseded"
+    row = conn.execute(
+        "SELECT details, timestamp FROM edit_history "
+        "WHERE node_id = ? AND action = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (root_node, action),
+    ).fetchone()
+    if not row:
+        return None
+    details = json.loads(row["details"] or "{}")
+    replacement_id = (
+        details.get("replacement_id") if root_op == "retract"
+        else details.get("replaced_by")
+    )
+    return {
+        "premise_id": root_node,
+        "resolution_kind": action,
+        "resolution_replacement_id": replacement_id,
+        "resolved_at": row["timestamp"],
+        "replacement_absent_because": details.get("replacement_absent_because"),
+        "from_root_event": True,
+    }
+
+
+def _cascade_dead_premise_detail(conn, node_id: str, cascade_event: str,
+                                  root_node: str = "", root_op: str = "") -> list:
     """Detail companion to _dead_premises: which of node_id's direct
     premises genuinely moved (resolved superseded/retracted) under
     cascade_event, plus the resolution_kind / replacement id / resolved_at
     each carries. Reuses _dead_premises for the id set (never re-derives its
     filter) and pulls only the extra columns that function does not return.
+
+    #2613 §5: when root_node is itself one of node_id's direct premises, it
+    is genuinely dead but _dead_premises' marker-based query can never find
+    it (see _root_replacement_decision's docstring) — folded in here from
+    the root's own event, entries sorted together so the caller sees one
+    coherent list regardless of source.
     """
     dead_ids = _dead_premises(conn, node_id, cascade_event)
-    if not dead_ids:
+    direct_premises = set(core._direct_premise_ids(conn, node_id))
+    root_is_direct_dead = bool(
+        root_node and root_node in direct_premises and root_node not in dead_ids
+    )
+    if not dead_ids and not root_is_direct_dead:
         return []
-    placeholders = ",".join("?" for _ in dead_ids)
-    rows = conn.execute(
-        f"SELECT node_id, resolution_kind, resolution_replacement_id, resolved_at "
-        f"FROM cascade_markers WHERE cascade_event = ? AND node_id IN ({placeholders}) "
-        f"ORDER BY node_id",
-        (cascade_event, *dead_ids),
-    ).fetchall()
-    return [
-        {
-            "premise_id": r["node_id"],
-            "resolution_kind": r["resolution_kind"],
-            "resolution_replacement_id": r["resolution_replacement_id"],
-            "resolved_at": r["resolved_at"],
-        }
-        for r in rows
-    ]
+    detail = []
+    if dead_ids:
+        placeholders = ",".join("?" for _ in dead_ids)
+        rows = conn.execute(
+            f"SELECT node_id, resolution_kind, resolution_replacement_id, resolved_at "
+            f"FROM cascade_markers WHERE cascade_event = ? AND node_id IN ({placeholders}) "
+            f"ORDER BY node_id",
+            (cascade_event, *dead_ids),
+        ).fetchall()
+        detail.extend([
+            {
+                "premise_id": r["node_id"],
+                "resolution_kind": r["resolution_kind"],
+                "resolution_replacement_id": r["resolution_replacement_id"],
+                "resolved_at": r["resolved_at"],
+            }
+            for r in rows
+        ])
+    if root_is_direct_dead:
+        root_detail = _root_replacement_decision(conn, root_node, root_op)
+        if root_detail:
+            detail.append(root_detail)
+    detail.sort(key=lambda d: d["premise_id"])
+    return detail
 
 
 def _cascade_frontier_node_summary(conn, node_id: str) -> dict:
@@ -526,7 +608,9 @@ def _cascade_frontier_node_summary(conn, node_id: str) -> dict:
             "created_at": m["created_at"],
             "root_is_direct_premise": root_node in direct_premises,
             "immediate_cause": _immediate_cause(conn, node_id, cascade_event),
-            "dead_premises": _cascade_dead_premise_detail(conn, node_id, cascade_event),
+            "dead_premises": _cascade_dead_premise_detail(
+                conn, node_id, cascade_event, root_node=root_node, root_op=root_op
+            ),
         })
 
     events.sort(key=lambda e: (e["created_at"], e["cascade_event"]))
@@ -1259,7 +1343,9 @@ def _cascade_auto_resolve_trivial(conn, node_id: str, now: str) -> list:
 
 def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
                           replacement_id: str = "", note: str = "",
-                          error_type: str = "other") -> str:
+                          error_type: str = "other",
+                          replacement_absent_because: str = "",
+                          replacement_absent_note: str = "") -> str:
     """Impl for engram_cascade_resolve — see the @mcp.tool wrapper's
     docstring in server.py for the full contract.
 
@@ -1296,12 +1382,29 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
                      f"of: {', '.join(sorted(_CASCADE_RESOLUTION_KINDS))}.",
         })
 
-    # replacement_id is required IFF superseded, and refused otherwise.
-    # Refusing rather than ignoring it is deliberate: a caller who passes a
-    # replacement alongside 'acknowledged' has a different model of what they
-    # are doing than the machine does, and silently dropping the argument
-    # would leave that disagreement undetected.
+    # replacement_id is REQUIRED for 'superseded', PERMITTED for 'retracted',
+    # refused otherwise (#2613 §3 change 2 — this guard used to refuse
+    # replacement_id whenever resolution_kind != 'superseded', which made a
+    # retraction reached through the frontier unable to name a successor
+    # even when one demonstrably exists — the normal case in a sweep, since
+    # you write the corrected node first and resolve second). Refusing
+    # outright for 'acknowledged' is deliberate: a caller who passes a
+    # replacement alongside 'acknowledged' has a different model of what
+    # they are doing than the machine does, and silently dropping the
+    # argument would leave that disagreement undetected.
+    #
+    # The two new fields (replacement_absent_because / _note) are threaded
+    # through to _retract_impl with NO default that could satisfy the
+    # requirement — the anti-pattern named in §3 is `error_type: str =
+    # "other"` two lines up in this same signature, already satisfied on
+    # this path by a default the caller never sees; do not repeat that
+    # shape for the replacement decision. Validation of the decision itself
+    # (mutually-exclusive, required-one, enum membership, UNKNOWN-needs-
+    # note) is NOT duplicated here — it lives in _retract_impl alone, the
+    # one chokepoint §3 names, so there is exactly one place it can drift.
     replacement_id = (replacement_id or "").strip()
+    replacement_absent_because = (replacement_absent_because or "").strip()
+    replacement_absent_note = (replacement_absent_note or "").strip()
     if resolution_kind == "superseded" and not replacement_id:
         return json.dumps({
             "error": "replacement_id is required when resolution_kind is "
@@ -1310,10 +1413,31 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
                      "its own canonical tool (engram_derive, "
                      "engram_add_observation, ...), then name it here.",
         })
-    if resolution_kind != "superseded" and replacement_id:
+    if resolution_kind == "acknowledged" and (
+        replacement_id or replacement_absent_because or replacement_absent_note
+    ):
         return json.dumps({
-            "error": f"replacement_id is only meaningful when resolution_kind "
-                     f"is 'superseded' (got {resolution_kind!r}).",
+            "error": f"replacement_id / replacement_absent_because / "
+                     f"replacement_absent_note are only meaningful when "
+                     f"resolution_kind is 'superseded' or 'retracted' "
+                     f"(got {resolution_kind!r}).",
+        })
+    # #3125: replacement_absent_because / replacement_absent_note are
+    # retracted-only (per this function's own docstring in server.py:
+    # "only meaningful when resolution_kind is 'retracted'") — a SEPARATE
+    # rule from the replacement_id check above, which is meaningful for both
+    # 'superseded' and 'retracted'. Do NOT fold this into the acknowledged
+    # check above by widening it to `resolution_kind != "retracted"` across
+    # all three fields — replacement_id is REQUIRED for 'superseded' (the
+    # check a few lines above), so that widening would refuse every
+    # legitimate superseded resolve.
+    if resolution_kind != "retracted" and (
+        replacement_absent_because or replacement_absent_note
+    ):
+        return json.dumps({
+            "error": f"replacement_absent_because / replacement_absent_note "
+                     f"are only meaningful when resolution_kind is "
+                     f"'retracted' (got {resolution_kind!r}).",
         })
 
     conn = core._get_db()
@@ -1469,6 +1593,9 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
             node_id=node_id,
             error_type=error_type or "other",
             reason=note or f"cascade resolution of {resolved_events}",
+            replacement_id=replacement_id,
+            replacement_absent_because=replacement_absent_because,
+            replacement_absent_note=replacement_absent_note,
             cascade_triggering=False,
         ))
         if "error" in delegated:
@@ -1620,12 +1747,14 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
 
 
 def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
-    """Walk downstream from node_id following CASCADE_RELATIONS edges
-    (engram_core.EDGE_CLASSIFICATIONS' cascade flag — today just
-    derives_from; supported_by lost its cascade flag in #2252 Stage 1.3,
-    and the W6 pairing edge predicted_by was minted cascade:False from the
-    start, so neither ever reaches this walk). Visits each downstream node
-    at most once. For each live
+    """Walk downstream from node_id following engram_core.CASCADE_RELATIONS
+    edges (the relations whose EDGE_CLASSIFICATIONS entry sets cascade=True —
+    today derives_from and acknowledged_derives_from, the latter
+    cascade-bearing by design per #2013 §12.5; the constant is the source of
+    truth, not this list). supported_by lost its cascade flag in #2252
+    Stage 1.3, and the W6 pairing edge predicted_by was minted cascade:False
+    from the start, so neither ever reaches this walk. Visits each
+    downstream node at most once. For each live
     claim-bearing node visited, calls on_live_node(node) — the caller
     decides what to write. Stops cascade at retracted/superseded nodes
     (node not is_current) AND at any non-claim-bearing (NCB) node — an NCB
@@ -2102,7 +2231,8 @@ def _supersede_impl(
     Cascade behavior (parallel cascades for derivation and contradiction
     dependents; #2013/#2009 slice 1 — the cascade machine):
       - Derivation cascade: every node reachable via CASCADE_RELATIONS
-        edges (today just derives_from — supported_by lost its cascade
+        edges (engram_core.CASCADE_RELATIONS — today derives_from and
+        acknowledged_derives_from; supported_by lost its cascade
         flag in #2252 Stage 1.3) gets a pending cascade_markers row
         (root_node=old_node_id, root_op='supersede'). The walk stops at
         non-claim-bearing nodes, so an NCB dependent gets no marker at
@@ -2630,6 +2760,8 @@ def _retract_impl(
     error_type: str = "",
     reason: str = "",
     replacement_id: str = "",
+    replacement_absent_because: str = "",
+    replacement_absent_note: str = "",
     initiation: str = "",
     initiation_gate: str = "",
     initiation_ref: str = "",
@@ -2655,7 +2787,8 @@ def _retract_impl(
 
     Cascade behavior (#2013/#2009 slice 1 — the cascade machine):
       - Derivation cascade: every node reachable via CASCADE_RELATIONS
-        edges (today just derives_from — supported_by lost its cascade
+        edges (engram_core.CASCADE_RELATIONS — today derives_from and
+        acknowledged_derives_from; supported_by lost its cascade
         flag in #2252 Stage 1.3) gets a pending cascade_markers row
         (root_node=the retracted node, root_op='retract'). The walk stops
         at non-claim-bearing nodes, so an NCB dependent gets no marker at
@@ -2714,8 +2847,21 @@ def _retract_impl(
             _supersede_impl's new_node_id convention). Must name a node that
             exists, is_current=1, differs from node_id, and is not older than
             node_id (the retracts edge it lands on is temporal_causal=True).
-            Does not check that the replacement is claim-bearing — deferred,
-            see #2613.
+            Checked for claim-bearing parity against the retracted node
+            (#2613 §7): _is_claim_bearing(replacement) must equal
+            _is_claim_bearing(node_id) — a floor, not same-kind; permits
+            conjecture->derivation, refuses task->observation.
+        replacement_absent_because (str): REQUIRED when replacement_id is
+            not supplied (#2613) — the stated reason nothing replaces this
+            claim. One of VALID_REPLACEMENT_ABSENT_REASONS
+            (NONE_BECAUSE_NO_SUCCESSOR, NONE_BECAUSE_DUPLICATE,
+            NONE_BECAUSE_SUPERSEDED_ELSEWHERE, NONE_BECAUSE_UNKNOWN).
+            Mutually exclusive with replacement_id — supply exactly one.
+        replacement_absent_note (str): free-text note, REQUIRED iff
+            replacement_absent_because='NONE_BECAUSE_UNKNOWN' (the escape
+            hatch costs a sentence). Recorded on the retraction event in its
+            own field — deliberately NOT folded into `reason`, which is
+            truncated at [:200] (#2613 §4's "the hazard").
         initiation (str, optional): Who initiated this retraction. One of:
             user_prompted — triggered by explicit user request;
             gate_prompted — triggered by an internal gate (see initiation_gate);
@@ -2864,12 +3010,64 @@ def _retract_impl(
                             f"error_type={error_type!r})",
                 })
 
+        # #2613: the replacement decision is required-always — every
+        # author-initiated retraction must record either the node that
+        # replaces the claim, or a stated reason why nothing does. This is
+        # the ONE chokepoint (docs/2613-retraction-replacement-contract.md
+        # §3): both engram_retract and engram_cascade_resolve's retracted
+        # branch delegate here, so enforcing it in this one place gives both
+        # paths the obligation by construction. NOT gated on
+        # cascade_triggering — the resolution path must satisfy this
+        # exactly like the organic path; a default threaded in from the
+        # caller (the anti-pattern §3 names, error_type="other") would
+        # satisfy the letter while nobody decided anything.
+        #
+        # Deliberately checked HERE — after the non-current-node refusal and
+        # the pending-cascade-marker refusal above, not up front with
+        # node_id/error_type/reason — so a caller who names an unretractable
+        # node gets THAT specific, actionable refusal (with its successor/
+        # frontier guidance) rather than a generic "you forgot a field"
+        # message that would be true but useless: no decision they supplied
+        # would have made the retraction possible anyway.
+        replacement_id = (replacement_id or "").strip()
+        replacement_absent_because = (replacement_absent_because or "").strip()
+        replacement_absent_note = (replacement_absent_note or "").strip()
+
+        if replacement_id and replacement_absent_because:
+            return json.dumps({
+                "error": "replacement_id and replacement_absent_because are "
+                         "mutually exclusive — supply exactly one: either the "
+                         "node that replaces this claim, or the reason nothing "
+                         "does."
+            })
+        if not replacement_id and not replacement_absent_because:
+            return json.dumps({
+                "error": "A replacement decision is required (#2613): either "
+                         "replacement_id (naming the node that replaces this "
+                         "claim, already created via its own canonical creation "
+                         "tool) or replacement_absent_because (one of: "
+                         f"{', '.join(sorted(VALID_REPLACEMENT_ABSENT_REASONS))}) "
+                         "explaining why nothing does.",
+            })
+        if replacement_absent_because and replacement_absent_because not in VALID_REPLACEMENT_ABSENT_REASONS:
+            return json.dumps({
+                "error": f"Invalid replacement_absent_because '{replacement_absent_because}'. "
+                         f"Must be one of: {', '.join(sorted(VALID_REPLACEMENT_ABSENT_REASONS))}"
+            })
+        if replacement_absent_because == "NONE_BECAUSE_UNKNOWN" and not replacement_absent_note:
+            return json.dumps({
+                "error": "replacement_absent_because='NONE_BECAUSE_UNKNOWN' "
+                         "requires replacement_absent_note explaining what "
+                         "could not be determined — the escape hatch is the one "
+                         "member that must name itself; the other three do not.",
+            })
+
         # #2612: validate replacement_id up front, before any mutation — a
         # purely relational reference to a node the caller already created,
         # mirroring _supersede_impl's equivalent checks on new_node_id.
         if replacement_id:
             _repl_node = conn.execute(
-                "SELECT id, is_current, created_at FROM nodes WHERE id = ?",
+                "SELECT id, is_current, created_at, type FROM nodes WHERE id = ?",
                 (replacement_id,),
             ).fetchone()
             if not _repl_node:
@@ -2926,6 +3124,32 @@ def _retract_impl(
                         "WITHOUT a replacement_id and let the newer claim stand "
                         "on its own / be cited organically."
                     ),
+                })
+
+            # #2613 §7: claim-bearing PARITY, not an unconditional predicate
+            # and not same-kind — a floor. _supersede_impl already refuses
+            # any type mismatch (stricter than parity), so this check is
+            # retract-only. Rejects the task->observation case that motivated
+            # §7 (a non-claim-bearing node standing in for a claim-bearing
+            # one); permits conjecture->derivation, which is the honest shape
+            # for a cross-epistemic-category correction (_supersede_impl's
+            # own error text routes exactly that case here, to retract).
+            _target_cb = core._is_claim_bearing(node["type"])
+            _repl_cb = core._is_claim_bearing(_repl_node["type"])
+            if _target_cb != _repl_cb:
+                return json.dumps({
+                    "error": f"replacement_id '{replacement_id}' (type "
+                             f"'{_repl_node['type']}', claim-bearing={_repl_cb}) "
+                             f"does not match '{node_id}' (type "
+                             f"'{node['type']}', claim-bearing={_target_cb}) "
+                             f"on claim-bearing parity (#2613 §7). A "
+                             f"replacement must be claim-bearing iff the "
+                             f"node it replaces is — this is a floor, not a "
+                             f"same-kind requirement (a conjecture may be "
+                             f"replaced by a derivation).",
+                    "guard": "retract_replacement_claim_bearing_parity",
+                    "node_id": node_id,
+                    "replacement_id": replacement_id,
                 })
 
         now = core._now()
@@ -3145,15 +3369,29 @@ def _retract_impl(
                     "UPDATE nodes SET status = 'retracted', is_current = 0, metadata = ? WHERE id = ?",
                     (json.dumps(pred_meta), pred_id),
                 )
-                core._log_edit(conn, "retracted", pred_id, "prediction",
-                          {"error_type": error_type,
-                           "reason": f"basis retracted: {node_id}"[:200],
-                           "cascade_via": "prediction_basis_retraction"})
+                # #2613 §9: this is the MACHINE-WRITTEN retraction event the
+                # invariant carves out — no author named a decision for this
+                # specific node, so it is out of the "every author-initiated
+                # retraction records a decision" population (the
+                # `cascade_via` key is what a scan filters on to exclude it).
+                # It inherits the ROOT's decision for display only, never as
+                # its own recorded judgement.
+                _pred_event_details = {
+                    "error_type": error_type,
+                    "reason": f"basis retracted: {node_id}"[:200],
+                    "cascade_via": "prediction_basis_retraction",
+                }
+                if replacement_id:
+                    _pred_event_details["inherited_replacement_id"] = replacement_id
+                if replacement_absent_because:
+                    _pred_event_details["inherited_replacement_absent_because"] = replacement_absent_because
+                core._log_edit(conn, "retracted", pred_id, "prediction", _pred_event_details)
                 retracted_predictions.append({"id": pred_id, "type": "prediction"})
 
-        # 2. Find all downstream nodes via CASCADE_RELATIONS (today just
-        #    derives_from — supported_by lost its cascade flag in #2252
-        #    Stage 1.3, so it no longer reaches anything through this walk).
+        # 2. Find all downstream nodes via CASCADE_RELATIONS (the constant in
+        #    engram_core is the source of truth for the set — supported_by lost
+        #    its cascade flag in #2252 Stage 1.3, so it no longer reaches
+        #    anything through this walk).
         # Uses shared walker (_walk_cascade_downstream) — PR-AA SSoT refactor.
         # Cascade machine (#2013/#2009 slice 1): one cascade_event per this
         # call, shared by the derivation-cascade write below AND the
@@ -3250,9 +3488,25 @@ def _retract_impl(
         # discharge (that's engram_lifecycle._reflect_impl, Part 1).
         support_lost_cs_ls, support_restored_cs_ls = _detect_zero_support(conn, node_id)
 
-        # Log retraction and taint events
-        core._log_edit(conn, "retracted", node_id, node["type"],
-                  {"error_type": error_type, "reason": reason[:200]})
+        # Log retraction and taint events.
+        # #2613 §3 change 3 / §5: the replacement decision is recorded HERE,
+        # on the retraction event itself — not only as the (optional)
+        # `retracts` edge below. This is what makes §9's invariant
+        # ("checkable against the event log") true, and what lets §5's
+        # frontier-summary root-read work: a cascade ROOT carries no
+        # cascade_markers row (markers are written for affected DOWNSTREAM
+        # nodes, never for the node whose retraction created the cascade),
+        # so the decision has to live somewhere a node ALWAYS has — the
+        # event — for a later reader (or _cascade_dead_premise_detail) to
+        # find it when this node is itself a dead premise.
+        _retract_event_details = {"error_type": error_type, "reason": reason[:200]}
+        if replacement_id:
+            _retract_event_details["replacement_id"] = replacement_id
+        if replacement_absent_because:
+            _retract_event_details["replacement_absent_because"] = replacement_absent_because
+        if replacement_absent_note:
+            _retract_event_details["replacement_absent_note"] = replacement_absent_note
+        core._log_edit(conn, "retracted", node_id, node["type"], _retract_event_details)
         for t in tainted:
             core._log_edit(conn, "tainted", t["id"], t["type"],
                       {"tainted_by": node_id})
@@ -3272,8 +3526,28 @@ def _retract_impl(
                     "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'retracts', ?)",
                     (replacement_id, node_id, now),
                 )
-            except sqlite3.IntegrityError:
-                pass
+            except sqlite3.IntegrityError as _edge_exc:
+                # #2613 §11 / Lei's root-cause rule (2026-09-07): a bare
+                # `pass` here let a retraction COMMIT while its own event
+                # (just logged above) reports a replacement whose edge was
+                # never written — silent partial success, the exact shape
+                # this contract exists to eliminate. Fail loud: roll back
+                # the WHOLE retraction rather than accept a retraction whose
+                # replacement_id names an edge that does not exist. Nothing
+                # committed yet (conn.commit() is below this block), so the
+                # rollback discards the status update, the event just
+                # logged, and everything else in this call — an all-or-
+                # nothing retraction, not a partial one.
+                conn.rollback()
+                return json.dumps({
+                    "error": f"Failed to record the 'retracts' edge from "
+                             f"'{replacement_id}' to '{node_id}': {_edge_exc}. "
+                             f"The retraction was NOT applied — no state "
+                             f"changed. (#2613 §11: a retraction that commits "
+                             f"while its replacement edge silently fails to "
+                             f"write is exactly the defect this refusal "
+                             f"prevents.)",
+                })
 
         conn.commit()
 

@@ -318,6 +318,18 @@ class Handler(BaseHTTPRequestHandler):
                 resp = viz_health_v2_data.get_health_v2_series(agent_name, version, signal)
                 resp["agent"] = agent_name
                 self._json(resp)
+        elif path == "/api/health/v2/live":
+            # health-v2 LIVE score panel (engram-alpha#2518, live-score
+            # slice) -- same recompute-on-every-call contract as the
+            # sibling copy of this route in viz.server (see that file's
+            # comment for the full rationale).
+            if not db_path:
+                self._json({"error": f"Unknown agent: {agent_name!r}",
+                            "agent": agent_name}, status=404)
+            else:
+                resp = viz_health_v2_data.get_health_v2_live_data(agent_name)
+                resp["agent"] = agent_name
+                self._json(resp)
         elif path == "/api/health/v2/model":
             # NOT agent-scoped (every seat on this install runs the SAME
             # code, so there is exactly one shipped model to read) --

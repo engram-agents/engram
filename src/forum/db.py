@@ -159,15 +159,23 @@ CREATE INDEX IF NOT EXISTS idx_post_verifications_post
     ON post_verifications(post_id);
 
 CREATE TABLE IF NOT EXISTS packs (
-    id              TEXT PRIMARY KEY,
-    author          TEXT NOT NULL,
-    name            TEXT NOT NULL,
-    version         INTEGER NOT NULL,
-    uploaded_at     TEXT NOT NULL,
-    root_count      INTEGER NOT NULL DEFAULT 0,
-    node_count      INTEGER NOT NULL DEFAULT 0,
-    edge_count      INTEGER NOT NULL DEFAULT 0
+    id                  TEXT PRIMARY KEY,
+    author              TEXT NOT NULL,
+    name                TEXT NOT NULL,
+    version             INTEGER NOT NULL,
+    uploaded_at         TEXT NOT NULL,
+    root_count          INTEGER NOT NULL DEFAULT 0,
+    node_count          INTEGER NOT NULL DEFAULT 0,
+    edge_count          INTEGER NOT NULL DEFAULT 0,
+    share_clearance     TEXT NOT NULL DEFAULT 'private',
+    clearance_read_by   TEXT,
+    clearance_read_at   TEXT,
+    clearance_method    TEXT
 );
+-- share_clearance + clearance_* columns are in the base schema (fresh DBs get
+-- them directly); the ALTER TABLE guard in init_db() is retained as a no-op
+-- migration for existing installs (same idiom as the agents status_* columns
+-- above).
 
 CREATE INDEX IF NOT EXISTS idx_packs_author_name
     ON packs(author, name);
@@ -442,6 +450,25 @@ def init_db(conn: sqlite3.Connection, categories_config: str | None = None) -> N
     # NULL for agents that registered before this migration.
     if "hostname" not in agent_cols:
         conn.execute("ALTER TABLE agents ADD COLUMN hostname TEXT")
+
+    # ----------------------------------------------------------------
+    # Pack share-clearance columns (privacy-incident follow-up, #676 slice 1)
+    # Four columns added to packs; PRAGMA-guarded so the ALTER is a no-op on
+    # DBs that already have them. share_clearance defaults every existing row
+    # to 'private' -- nothing is deleted, packs just aren't marked cleared
+    # until their own author explicitly labels them.
+    # ----------------------------------------------------------------
+    pack_cols = {r[1] for r in conn.execute("PRAGMA table_info(packs)")}
+    if "share_clearance" not in pack_cols:
+        conn.execute(
+            "ALTER TABLE packs ADD COLUMN share_clearance TEXT NOT NULL DEFAULT 'private'"
+        )
+    if "clearance_read_by" not in pack_cols:
+        conn.execute("ALTER TABLE packs ADD COLUMN clearance_read_by TEXT")
+    if "clearance_read_at" not in pack_cols:
+        conn.execute("ALTER TABLE packs ADD COLUMN clearance_read_at TEXT")
+    if "clearance_method" not in pack_cols:
+        conn.execute("ALTER TABLE packs ADD COLUMN clearance_method TEXT")
 
     # ----------------------------------------------------------------
     # vec0 virtual tables (created only when sqlite-vec is available).
@@ -1493,6 +1520,25 @@ def mark_thread_read(
     conn.commit()
 
 
+def get_thread_read_watermark(
+    conn: sqlite3.Connection,
+    agent_id: int,
+    thread_id: int,
+) -> int | None:
+    """Return the agent's stored ``last_read_post_id`` watermark for this
+    thread, or ``None`` if the agent has never read it (no ``reads`` row).
+
+    Read-only counterpart to ``mark_thread_read`` — added for
+    engram-alpha#3138 so a client can see its own read state instead of only
+    ever writing it blind.
+    """
+    row = conn.execute(
+        "SELECT last_read_post_id FROM reads WHERE agent_id = ? AND thread_id = ?",
+        (agent_id, thread_id),
+    ).fetchone()
+    return row[0] if row else None
+
+
 def get_inbox(
     conn: sqlite3.Connection,
     agent_id: int,
@@ -2280,7 +2326,9 @@ def list_packs(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """Return all packs ordered by uploaded_at DESC."""
     rows = conn.execute(
         "SELECT id, author, name, version, uploaded_at, "
-        "       root_count, node_count, edge_count "
+        "       root_count, node_count, edge_count, "
+        "       share_clearance, clearance_read_by, clearance_read_at, "
+        "       clearance_method "
         "  FROM packs "
         " ORDER BY uploaded_at DESC"
     ).fetchall()
@@ -2294,6 +2342,10 @@ def list_packs(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             "root_count": r[5],
             "node_count": r[6],
             "edge_count": r[7],
+            "share_clearance": r[8],
+            "clearance_read_by": r[9],
+            "clearance_read_at": r[10],
+            "clearance_method": r[11],
         }
         for r in rows
     ]
@@ -2303,7 +2355,9 @@ def get_pack(conn: sqlite3.Connection, pack_id: str) -> dict[str, Any] | None:
     """Return the pack row dict for pack_id, or None if not found."""
     row = conn.execute(
         "SELECT id, author, name, version, uploaded_at, "
-        "       root_count, node_count, edge_count "
+        "       root_count, node_count, edge_count, "
+        "       share_clearance, clearance_read_by, clearance_read_at, "
+        "       clearance_method "
         "  FROM packs WHERE id = ?",
         (pack_id,),
     ).fetchone()
@@ -2318,7 +2372,63 @@ def get_pack(conn: sqlite3.Connection, pack_id: str) -> dict[str, Any] | None:
         "root_count": row[5],
         "node_count": row[6],
         "edge_count": row[7],
+        "share_clearance": row[8],
+        "clearance_read_by": row[9],
+        "clearance_read_at": row[10],
+        "clearance_method": row[11],
     }
+
+
+# Valid share-clearance states for packs (privacy-incident follow-up, #676
+# slice 1). 'private' is the default for every existing row and every newly
+# published pack; only the pack's own author may move it to
+# 'cleared-to-share' (enforced server-side in server.py's label route).
+PACK_SHARE_CLEARANCE_STATES = {"private", "cleared-to-share"}
+
+
+def set_pack_clearance(
+    conn: sqlite3.Connection,
+    pack_id: str,
+    clearance: str,
+    read_by: str,
+    read_at: str,
+    method: str | None,
+) -> bool:
+    """Update a pack's share-clearance label.
+
+    ``method`` is deliberately free text (not an enum) -- the design
+    principle is that the method string records WHAT was actually read
+    (e.g. "full read (pack files + database)"), not just a boolean
+    full-read flag. See PACK_SHARE_CLEARANCE_STATES for the two valid
+    ``clearance`` values.
+
+    Args:
+        pack_id: the pack to update.
+        clearance: 'private' or 'cleared-to-share'.
+        read_by: the agent name who performed the read.
+        read_at: ISO timestamp of the read.
+        method: free-text description of what was read, or None.
+
+    Returns:
+        True if a row was updated, False if pack_id does not exist.
+
+    Raises:
+        ValueError: if ``clearance`` is not a recognized state.
+    """
+    if clearance not in PACK_SHARE_CLEARANCE_STATES:
+        raise ValueError(
+            f"clearance {clearance!r} is not valid; "
+            f"allowed: {sorted(PACK_SHARE_CLEARANCE_STATES)!r}"
+        )
+    cur = conn.execute(
+        "UPDATE packs "
+        "SET share_clearance = ?, clearance_read_by = ?, "
+        "    clearance_read_at = ?, clearance_method = ? "
+        "WHERE id = ?",
+        (clearance, read_by, read_at, method, pack_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------

@@ -31,21 +31,34 @@ visible on the page instead of latent":
   section already reads, written at build/upgrade time by
   ``install-local-marketplace.sh``.
 - Working-tree run (what the live shared :5001 dashboard actually is, per
-  forum #389's parallel incident thread): ``git rev-parse HEAD`` of the
-  source root the ``viz`` package was ACTUALLY IMPORTED FROM (derived from
-  this module's own ``__file__``, never a configured/assumed directory --
-  a configured path and the code that actually ran can diverge, and the
-  configured-path label is then confidently wrong about the code that
-  just executed, per forum #389's discussion of that subtlety), with
-  a ``-dirty`` suffix if that tree has uncommitted changes.
+  forum #389's parallel incident thread): the sha of the git checkout the
+  ``viz`` package was ACTUALLY IMPORTED FROM (derived from this module's
+  own ``__file__``, never a configured/assumed directory -- a configured
+  path and the code that actually ran can diverge, and the configured-path
+  label is then confidently wrong about the code that just executed, per
+  forum #389's discussion of that subtlety), with a ``-dirty`` suffix if
+  that tree has uncommitted (tracked-file) changes.
 
-Which shape is in play is determined structurally, not by a flag: walk
-upward from this module's own file looking for a ``.git`` directory. The
-deployed plugin bundle (``build-plugin.sh``'s output) is a flat, non-git
-tree -- no ``.git`` exists anywhere above it -- so finding one means this
-is a working-tree/dev-checkout run; finding none means it's a plugin
-install, and the ``.deployed-version`` marker (written by the exact same
-installer that produces that flat, non-git tree) is the shape to read.
+Which shape is in play is determined structurally, not by a flag --
+**PR #3174**: this module no longer walks the tree itself to decide. It
+delegates entirely to ``version_info.capture_version_info()`` (this
+module's own ``__file__``-derived directory, passed explicitly as
+``start_path``), which additionally verifies the found git root actually
+TRACKS the running ``server.py`` before accepting it -- footer's OWN prior
+walk had no such check, which is exactly what let it silently misattribute
+an unrelated ANCESTOR repo's HEAD as this code's provenance on a real
+plugin install (measured against the installed plugin copy:
+``_code_provenance()`` returned ``~/.engram``'s HEAD labeled
+``(worktree)`` -- ``~/.engram`` encloses the plugin-flattened ``viz/``
+tree under a gitignored ``marketplace/`` and was never the code's own
+repo). A null ``sha`` whose reason means "genuinely no tracking checkout"
+(``version_info.is_plugin_fallback_reason``) falls back to the
+``.deployed-version`` marker (``version_info.read_deployed_version``,
+moved there since PR #3174 -- see that module's docstring for why no
+circular import results); any other null-``sha`` reason (a checkout
+exists but git couldn't read it -- dubious ownership, git-command
+failure) renders ``unversioned`` rather than risk reporting a stale
+plugin marker as if it were this run's live code provenance.
 
 **Fail-honest, both halves** (forum #389's ruling): a value that can't be
 resolved renders as the literal word ``unversioned`` -- never a fabricated
@@ -59,6 +72,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+
+from . import version_info
 
 _GIT_EXE = os.environ.get("ENGRAM_GIT_EXE") or "git"
 _GIT_TIMEOUT = 15  # seconds -- matches engram_core.GIT_TIMEOUT's value
@@ -119,64 +134,6 @@ def _data_provenance(data_dir: str | os.PathLike | None) -> str:
     return _short(sha) if sha else _UNVERSIONED
 
 
-# How many ancestor levels above viz/footer.py's own directory to search
-# for a .git before giving up (see _find_git_root's docstring for why this
-# walk, unlike its siblings, is deliberately BOUNDED). The real cases are
-# shallow: 2 in the deployed plugin tree (viz/ -> plugin root), 4 in this
-# repo's own source tree (viz/ -> src/engram -> src -> repo root). 12 is
-# generous headroom above both without reaching a user's $HOME or a
-# container's filesystem root in any layout this project ships.
-_GIT_ROOT_SEARCH_DEPTH = 12
-
-
-def _find_git_root(start: Path) -> Path | None:
-    """Walk upward from *start*, up to ``_GIT_ROOT_SEARCH_DEPTH`` ancestor
-    levels, looking for the nearest directory that itself contains a
-    ``.git`` entry (dir for a normal repo, file for a worktree/submodule --
-    ``.exists()`` covers both). Returns None if none is found within that
-    bound -- either the flat, non-git plugin-bundle case, or (deliberately,
-    see below) a ``.git`` that exists but is too far up to plausibly be
-    THIS code's own repo.
-
-    Deliberately BOUNDED, unlike ``data/config.py``'s ``_find_tools_parent``
-    / ``data/stats.py``'s ``_find_indexer_dir``, which walk unbounded to the
-    filesystem root -- reviewer-fairy finding on PR#2564: those two search
-    for a SPECIFIC sibling file, where a false-positive match requires an
-    unrelated file with that exact name existing at the exact right
-    relative shape somewhere above the real location -- vanishingly
-    unlikely. This one searches for "any .git", which is a much broader,
-    more plausible false-positive target: an unrelated ancestor directory
-    genuinely being a git repo for its OWN reasons (a dotfiles-tracked
-    $HOME, a git-tracked container filesystem root) is a real thing that
-    happens, and finding one would silently report an unrelated repo's
-    HEAD sha as this code's own provenance -- a real sha, confidently
-    wrong, which is exactly what this module's fail-honest design exists
-    to prevent. Bounding the walk trades "correct at an implausible
-    nesting depth no real deployment uses" for "never silently misattributes
-    provenance to an unrelated ancestor repo" -- the right side of that
-    trade for a module whose whole job is not fabricating a wrong answer.
-    """
-    for candidate in [start, *start.parents][:_GIT_ROOT_SEARCH_DEPTH]:
-        if (candidate / ".git").exists():
-            return candidate
-    return None
-
-
-def _read_deployed_version(engram_home: Path) -> dict[str, str]:
-    """Parse ``.deployed-version``'s ``key=value`` lines. Returns {} on any
-    read/parse failure or if the file doesn't exist -- never raises."""
-    path = engram_home / ".deployed-version"
-    out: dict[str, str] = {}
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            key, sep, value = line.partition("=")
-            if sep and key.strip():
-                out[key.strip()] = value.strip()
-    except OSError:
-        return {}
-    return out
-
-
 def _code_provenance() -> str:
     """The CODE sha actually serving this page, labeled by install shape.
 
@@ -184,44 +141,54 @@ def _code_provenance() -> str:
     change mid-process — a changed source file needs a process restart to
     take effect regardless, per server.py's own INVOCATION NOTE) rather
     than re-run on every request.
+
+    PR #3174: delegates entirely to ``version_info.capture_version_info()``
+    -- this module no longer walks the tree itself (see module docstring
+    for why: footer's own prior walk had no tracking check and could
+    silently misattribute an unrelated ancestor repo's HEAD as this code's
+    provenance on a real plugin install). ``start_path`` is this module's
+    own on-disk directory, passed explicitly rather than relying on
+    ``capture_version_info``'s internal default -- both resolve to the
+    same directory when this really is ``viz/footer.py`` running from the
+    ``viz`` package, but an explicit ``start_path`` is what makes this
+    function's behavior derivable from (and testable against) THIS
+    module's own ``__file__``, per ``capture_version_info``'s own
+    docstring note that a caller may pass an explicit start_path standing
+    in for "the viz package's own location."
     """
     global _CODE_PROVENANCE_CACHE
     if _CODE_PROVENANCE_CACHE is not None:
         return _CODE_PROVENANCE_CACHE
 
-    this_file = Path(__file__).resolve()
-    git_root = _find_git_root(this_file.parent)
+    this_dir = Path(__file__).resolve().parent
+    info = version_info.capture_version_info(this_dir)
 
-    if git_root is not None:
-        # Working-tree / dev-checkout shape: the code that just imported
-        # is running straight out of a git repo (no flat plugin bundle
-        # ever has a .git anywhere above it).
-        result = _run_git(["rev-parse", "HEAD"], cwd=git_root)
-        if result is not None and result.returncode == 0 and result.stdout.strip():
-            sha = _short(result.stdout.strip())
-            status = _run_git(["status", "--porcelain", "--untracked-files=no"],
-                              cwd=git_root)
-            dirty = bool(status is not None and status.returncode == 0
-                         and status.stdout.strip())
-            label = f"{sha}{'-dirty' if dirty else ''} (worktree)"
+    if info.get("sha") is not None:
+        # Working-tree / dev-checkout shape: a tracking git root was found.
+        sha = _short(info["sha"])
+        dirty_suffix = "-dirty" if info.get("dirty") else ""
+        label = f"{sha}{dirty_suffix} (worktree)"
+        _CODE_PROVENANCE_CACHE = label
+        return label
+
+    if version_info.is_plugin_fallback_reason(info.get("reason")):
+        # Plugin-install shape: no tracking checkout found, so read the
+        # marker the installer wrote at build/upgrade time. ENGRAM_HOME
+        # follows the same env-override convention as engram_core.DATA_DIR
+        # (read_deployed_version's own default).
+        dv = version_info.read_deployed_version()
+        alpha_sha = dv.get("alpha_sha", "")
+        if alpha_sha and alpha_sha != "unknown":
+            dirty_suffix = "-dirty" if dv.get("alpha_dirty") == "dirty" else ""
+            label = f"{alpha_sha}{dirty_suffix} (plugin)"
             _CODE_PROVENANCE_CACHE = label
             return label
-        _CODE_PROVENANCE_CACHE = _UNVERSIONED
-        return _UNVERSIONED
 
-    # Plugin-install shape: no .git above this file, so read the marker
-    # the installer wrote at build/upgrade time. ENGRAM_HOME follows the
-    # same env-override convention as engram_core.DATA_DIR.
-    engram_home = Path(os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram"))
-    dv = _read_deployed_version(engram_home)
-    alpha_sha = dv.get("alpha_sha", "")
-    if not alpha_sha or alpha_sha == "unknown":
-        _CODE_PROVENANCE_CACHE = _UNVERSIONED
-        return _UNVERSIONED
-    dirty_suffix = "-dirty" if dv.get("alpha_dirty") == "dirty" else ""
-    label = f"{alpha_sha}{dirty_suffix} (plugin)"
-    _CODE_PROVENANCE_CACHE = label
-    return label
+    # Either no plugin marker to fall back to, or the null sha meant a
+    # checkout genuinely exists but git couldn't read it (dubious
+    # ownership / git-command failure) -- fail-honest rather than guess.
+    _CODE_PROVENANCE_CACHE = _UNVERSIONED
+    return _UNVERSIONED
 
 
 _CODE_PROVENANCE_CACHE: str | None = None

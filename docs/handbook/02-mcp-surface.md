@@ -281,7 +281,7 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 - **tests**: *(unverified)*
 
 **29. engram_list** — Enumerate by single-field or structured filter.
-- **contract**: `{[node_type, status, sort_by, limit, filters_json, fields_json, unlimited, include_superseded]}`
+- **contract**: `{[node_type, status, sort_by, sort_order, limit, filters_json, fields_json, unlimited, include_superseded]}`
 - **guards**: dual-mode (legacy shorthand OR recursive condition tree); filters_json supports AND/OR/NOT + 15 atomic operators; virtual fields cites/cited_by; limit default 100, ceiling 500 (legacy); unlimited=True in structured mode; include_superseded=False default
 - **readOnlyHint**: True
 - **status-candidate**: PROD-VERIFIED (structured-filter mode per issue #81)
@@ -328,7 +328,7 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 ### Metadata & Cleanup
 
 **42. engram_set_recall_summaries** — Batch-write recall_summary + keywords.
-- **contract**: EXACTLY ONE of `{summaries: [{node_id, recall_summary, recall_keywords}, ...]}` (nested-encoding, inline) or `{summaries_file: "<absolute path>"}` (reads + parses a JSON file of the same shape — for large batches; relative path rejected); per-entry validation: summary ≤200 chars (target ≤120), keywords 3–5 items ≤30 chars each; file-path calls echo back `summaries_file` in the response
+- **contract**: EXACTLY ONE of `{summaries: [{node_id, recall_summary, recall_keywords}, ...]}` (nested-encoding, inline) or `{summaries_file: "<absolute path>"}` (reads + parses a JSON file of the same shape — for large batches; relative path rejected); per-entry validation: summary ≤200 chars (target ≤140, `RECALL_SUMMARY_TARGET`), keywords 3–5 items ≤30 chars each; file-path calls echo back `summaries_file` in the response
 - **guards**: best-effort batch (valid entries applied, per-item errors, no rollback); idempotent
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED (sleep-cycle cohort writes + backfill)

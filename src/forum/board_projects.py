@@ -11,16 +11,23 @@ local files it used to read froze at that instant and never got another
 write. The live source is the same store every other coordination surface
 (``/api/projects``, ``/api/updates``) already reads.
 
-Design constraints (forum thread #166, updated #1608):
+Design constraints (forum thread #166, updated #1608, #2007):
 - No stored copy: read fresh on every render, never persist to DB.
 - Read-only: this module never writes to the coordination store.
 - gh-reconcile on read: PR refs that are merged/closed render as 'done'
   regardless of file status. Degrade gracefully if gh is unavailable.
 - Batch gh lookups: one call per distinct PR ref per render, not per row.
+- #2007: gh lookups are skipped entirely for records whose file status is
+  already file-done (merged/cancelled) — resolving gh for those can never
+  change their effective_status (see _effective_status), so this is a lossless
+  reduction of the gh working set, not an approximation. Such records report
+  gh_state='skipped'. The remaining (active) lookups run concurrently via a
+  bounded thread pool (_batch_gh_reconcile).
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import re
@@ -198,6 +205,13 @@ _GH_CACHE_TTL_SECS = 90.0
 # the `gh` subprocess runs OUTSIDE the lock so I/O never serializes behind it.
 _GH_CACHE_LOCK = threading.Lock()
 
+# Bound on concurrent `gh pr view` subprocess fetches in _batch_gh_reconcile's
+# Phase 2 (#2007). These are independent I/O-bound subprocess calls, safe to
+# run in parallel -- bounded to avoid a subprocess-spawn storm under a
+# suddenly-large active set (e.g. a bulk status change touching many PRs at
+# once), not because concurrency itself is unsafe.
+_GH_FETCH_MAX_WORKERS = 10
+
 
 def _clear_gh_cache() -> None:
     """Test helper: drop the gh-state TTL cache."""
@@ -221,6 +235,14 @@ def _batch_gh_reconcile(pr_refs: list[tuple[str, str]]) -> dict[tuple[str, str],
     outside the lock so concurrent polls don't serialize on I/O. (Two threads
     that miss the same ref in the same instant may both fetch it — bounded and
     harmless: same answer, just one redundant call.)
+
+    #2007: Phase 2 misses are fetched concurrently via a bounded thread pool
+    (_GH_FETCH_MAX_WORKERS) rather than serially — each `gh pr view` call is
+    an independent I/O-bound subprocess, so running them in parallel is safe:
+    `_gh_pr_state` spawns its own `subprocess.run` per call with no shared
+    mutable state of its own, and the only shared state (`_GH_STATE_CACHE`) is
+    already lock-guarded. Return-dict shape and the non-unknown-only caching
+    behavior are unchanged — this is purely a fan-out of the same per-ref work.
     """
     result: dict[tuple[str, str], str] = {}
     now = time.monotonic()
@@ -235,14 +257,24 @@ def _batch_gh_reconcile(pr_refs: list[tuple[str, str]]) -> dict[tuple[str, str],
             else:
                 to_fetch.append(ref)
 
-    # Phase 2 (unlocked I/O): one gh call per distinct miss; store non-unknown.
-    for ref in to_fetch:
-        repo, pr_num = ref
-        state = _gh_pr_state(pr_num, repo)
-        result[ref] = state
-        if state != "unknown":
-            with _GH_CACHE_LOCK:
-                _GH_STATE_CACHE[ref] = (state, time.monotonic())
+    # Phase 2 (unlocked I/O): one gh call per distinct miss, run concurrently;
+    # store non-unknown results. Bounded worker count avoids a subprocess-spawn
+    # storm when the active (non-file-done) set is suddenly large.
+    if to_fetch:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=_GH_FETCH_MAX_WORKERS
+        ) as executor:
+            future_to_ref = {
+                executor.submit(_gh_pr_state, pr_num, repo): (repo, pr_num)
+                for (repo, pr_num) in to_fetch
+            }
+            for future in concurrent.futures.as_completed(future_to_ref):
+                ref = future_to_ref[future]
+                state = future.result()
+                result[ref] = state
+                if state != "unknown":
+                    with _GH_CACHE_LOCK:
+                        _GH_STATE_CACHE[ref] = (state, time.monotonic())
 
     return result
 
@@ -262,12 +294,22 @@ def _effective_status(
         file_status:  The status field from the baton file.
         github_ref:   The github field value (e.g. 'pr/1005' or
                       'pr/engram-agents/engram-paper/22') or ''.
-        gh_states:    Batch-resolved dict of (repo, pr_number) → state.
+        gh_states:    Batch-resolved dict of (repo, pr_number) → state. A ref
+                      absent from this dict means gh reconciliation was never
+                      attempted for it this call (see 'skipped' below) — this
+                      is distinct from a genuine gh lookup that came back
+                      'unknown'.
 
     Returns:
         (effective_status, gh_state)
         effective_status is 'done' when file says done OR gh says merged/closed.
-        gh_state is 'merged'/'closed'/'open'/'unknown'/'' (empty when no ref).
+        gh_state is 'merged'/'closed'/'open'/'unknown'/'skipped'/'' (empty
+        when no ref). 'skipped' (#2007) means the record's file status was
+        already file-done (_FILE_DONE_STATUSES), so gh reconciliation was
+        deliberately never attempted for it — distinct from 'unknown', which
+        means a lookup was attempted and failed. A ref shared with another,
+        still-active record (and therefore actually resolved this call) always
+        reports the real resolved state here, never 'skipped'.
     """
     # File-level done detection
     file_done = file_status in _FILE_DONE_STATUSES
@@ -283,7 +325,20 @@ def _effective_status(
 
     owner, repo_name, pr_num = m.group(1), m.group(2), m.group(3)
     repo = f"{owner}/{repo_name}" if owner and repo_name else DEFAULT_GITHUB_REPO
-    gh_state = gh_states.get((repo, pr_num), "unknown")
+    ref = (repo, pr_num)
+    if ref in gh_states:
+        # Resolved this call (whether because the record itself is active, or
+        # because another record sharing this ref is) — report the real state.
+        gh_state = gh_states[ref]
+    else:
+        # Never resolved this call. #2007: a file-done record's ref is
+        # deliberately never added to the resolve set (resolving it can never
+        # change effective_status — see the file_done branch below) — report
+        # that deliberate skip distinctly from a genuine gh miss. The
+        # not-file-done+absent combination should not occur in practice
+        # (every active record's ref is always added to the resolve set), but
+        # 'unknown' is the safe fallback if it ever does.
+        gh_state = "skipped" if file_done else "unknown"
 
     # gh-reconcile: merged or closed → treat as done regardless of file
     if gh_state in ("merged", "closed"):
@@ -373,13 +428,26 @@ def read_project_board(store) -> list[dict[str, Any]]:
         # Collect (repo, PR number) for batch gh resolution. #1715: an
         # unqualified pr/<N> anchor resolves against DEFAULT_GITHUB_REPO
         # explicitly, never gh's ambient cwd.
+        #
+        # #2007: skip adding the ref to the resolve set when this record's
+        # file status is already file-done (_FILE_DONE_STATUSES). This is not
+        # a heuristic — _effective_status's file_done branch returns 'done'
+        # unconditionally regardless of what gh_state comes back as, so
+        # resolving gh for an already-file-done record can never change its
+        # effective_status. pr_ref itself is still captured below (for
+        # _effective_status's lookup and for the 'skipped' discriminator);
+        # only the *resolve-set membership* is conditional. A ref shared with
+        # another, still-active record still gets resolved via that record's
+        # own (non-skipped) addition — _seen_pr dedupes the resolve set, not
+        # per-item pr_ref capture, so ordering between a done and an active
+        # record sharing a ref does not matter.
         pr_m = _PR_ANCHOR_RE.match(github_ref)
         pr_ref = None
         if pr_m:
             _owner, _repo_name, pr_num = pr_m.group(1), pr_m.group(2), pr_m.group(3)
             pr_repo = f"{_owner}/{_repo_name}" if _owner and _repo_name else DEFAULT_GITHUB_REPO
             pr_ref = (pr_repo, pr_num)
-            if pr_ref not in _seen_pr:
+            if file_status not in _FILE_DONE_STATUSES and pr_ref not in _seen_pr:
                 _seen_pr.add(pr_ref)
                 pr_refs_to_resolve.append(pr_ref)
 

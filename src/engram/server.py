@@ -231,6 +231,14 @@ from tools.recall_summary_validator import (
 
 # ---- #872 wave-1 compat layer: moved to engram_core -----------------
 import engram_core as core  # noqa: E402
+# #2635 unit 2: SubstrateDisplaced is caught once, in _timing_mcp_tool's
+# timed() wrapper below — the single dispatch-wide catch point for every
+# @mcp.tool()-decorated function (mcp.tool = _timing_mcp_tool re-binds the
+# decorator for the whole file). Imported at module level (not the lazy
+# per-function `import engram_walguard as _wg` pattern engram_core.py uses)
+# because this one is referenced from the hottest, most-common path in the
+# file — every single tool call — not from a rarely-hit branch.
+import engram_walguard as _walguard  # noqa: E402
 
 EmbeddingManager = core.EmbeddingManager
 _embedder = core._embedder
@@ -537,6 +545,9 @@ def _remove_edge_impl(*args, **kwargs):
 
 def _add_edge_impl(*args, **kwargs):
     return _cornerstone_mod._add_edge_impl(*args, **kwargs)
+
+def _retype_edge_impl(*args, **kwargs):
+    return _cornerstone_mod._retype_edge_impl(*args, **kwargs)
 # ---- end #872 wave-4 compat forwarders --------------------------------
 
 # ---- #872 wave-5 family imports --------------------------------------
@@ -1554,6 +1565,22 @@ def _timing_mcp_tool(*args, **kwargs):
             result_value = None
             try:
                 result_value = func(*a, **kw)
+                return result_value
+            except _walguard.SubstrateDisplaced as sd:
+                # #2635 unit 2: the ONE catch point for the whole tool-
+                # dispatch surface (every @mcp.tool() function is wrapped by
+                # this closure) — not a per-tool try/except. Raised from deep
+                # inside core._get_db() (via engram_walguard.
+                # assert_not_displaced), unthrottled, on every dispatch. Never
+                # a raw traceback to the caller: a structured refusal that
+                # names the remedy, and — same as any other refusal path —
+                # this call never ran and never returns "created".
+                timing_status = "error"
+                result_value = json.dumps({
+                    "error": "substrate_displaced",
+                    "reason": sd.detection.get("reason"),
+                    "remedy": sd.remedy,
+                })
                 return result_value
             except Exception:
                 timing_status = "error"
@@ -2628,6 +2655,7 @@ def engram_cascade_frontier(payload_json: str) -> str:
 # it could silently disarm the cascade on an ordinary revision.
 _CASCADE_RESOLVE_FIELDS = frozenset({
     "node_id", "resolution_kind", "replacement_id", "note", "error_type",
+    "replacement_absent_because", "replacement_absent_note",
 })
 
 
@@ -2709,8 +2737,21 @@ def engram_cascade_resolve(payload_json: str) -> str:
             resolution_kind (str, REQUIRED): one of "retracted",
                 "superseded", "acknowledged".
             replacement_id (str): REQUIRED iff resolution_kind is
-                "superseded"; refused otherwise. Must already exist — this
-                tool never creates it.
+                "superseded"; PERMITTED (not required by itself) when
+                resolution_kind is "retracted" — #2613: a retraction reached
+                through the frontier can name a successor when one
+                demonstrably exists, the normal case in a sweep. Refused for
+                "acknowledged". Must already exist — this tool never creates
+                it.
+            replacement_absent_because (str): only meaningful when
+                resolution_kind is "retracted". #2613: a replacement
+                decision is required-always on the retract path — supply
+                EITHER this OR replacement_id, never neither, never both.
+                One of: NONE_BECAUSE_NO_SUCCESSOR, NONE_BECAUSE_DUPLICATE,
+                NONE_BECAUSE_SUPERSEDED_ELSEWHERE, NONE_BECAUSE_UNKNOWN
+                (requires replacement_absent_note).
+            replacement_absent_note (str, optional): free-text note,
+                required iff replacement_absent_because='NONE_BECAUSE_UNKNOWN'.
             note (str, optional): your reasoning, recorded with the
                 resolution.
             error_type (str, optional): only read when resolution_kind is
@@ -3142,8 +3183,9 @@ def _compute_warm_briefing_advisory(warm_briefing_path: Path, last_checkpoint_at
 
     - SILENT (no `note` key at all): written_since_last_nap is True AND
       session_section_empty is False -- both confidently non-stale.
-    - CONFIRMED-stale (`note` = "Step 5b not performed this session", the
-      original text, unchanged): written_since_last_nap is False OR
+    - CONFIRMED-stale (`note` = "Step 5b not performed since the last
+      checkpoint" -- wording tracks the #3014 checkpoint anchor, see below):
+      written_since_last_nap is False OR
       session_section_empty is True -- at least one signal is a definite
       negative/positive-for-staleness. This takes PRECEDENCE over the
       unknown case below when both are simultaneously present (e.g.
@@ -3253,7 +3295,7 @@ def _compute_warm_briefing_advisory(warm_briefing_path: Path, last_checkpoint_at
             # unknown branch below even when the OTHER signal is also
             # None: a confirmed problem is real regardless of what a
             # separate, independent signal couldn't determine.
-            result["note"] = "Step 5b not performed this session"
+            result["note"] = "Step 5b not performed since the last checkpoint"
         else:
             # Neither confidently-clear nor confirmed-stale -- at least one
             # signal is None (undetermined) and neither is a confirmed
@@ -5340,6 +5382,113 @@ def engram_add_edge(payload_json: str) -> str:
     return _attach_walguard_banner(_add_edge_impl(**params))
 
 
+# Set of legitimate field names for the engram_retype_edge payload.
+_RETYPE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation", "new_relation", "reason"})
+
+
+# DESIGN INTENT — engram_retype_edge
+# -----------------------------------
+# Corrects a provably-wrong edge by making it WEAKER, never stronger (issue
+# #2265, design doc docs/2265-2347-edge-correction-design.md sec.2). Neither
+# engram_remove_edge nor engram_add_edge can do this: supported_by,
+# derives_from and cites are all removable=False/addable_after_creation=False,
+# so today the only routes are ad-hoc SQL (banned) or engram-surgical (dev
+# tier, requires Lei's explicit agreement, and remove-then-add doesn't
+# recompute confidence). This tool is Essential tier — it repairs the core
+# graph, so it ships with it — and does the whole correction as one audited
+# transaction rather than two unaudited steps.
+#
+# Allowed moves (core.RETYPE_ALLOWED_MOVES, a fixed table — never free-form):
+#   supported_by -> about
+#   derives_from -> about
+#   derives_from -> exemplifies   (target must be a lesson or cornerstone)
+#   cites        -> about
+# Any move outside this table is refused, INCLUDING the reverse (stronger)
+# direction of any of the four above — a re-type may only take a claim of
+# support AWAY, never add one after the fact (the same invariant
+# addable_after_creation=False already protects).
+#
+# Refusals (in order): missing/empty required field (including `reason` —
+# the correction is never silent); move not in RETYPE_ALLOWED_MOVES; target
+# type mismatch for a conditional move; source/target node not found; no
+# edge of the stated relation between them; a pending cascade marker on
+# EITHER endpoint (settle the cascade first via engram_cascade_resolve).
+#
+# Confidence: if the OLD relation is cascade-bearing (core.CASCADE_RELATIONS
+# — today only derives_from and acknowledged_derives_from), retyping it away
+# removes a real premise from the source's confidence formula, so the source
+# node's confidence is recomputed (core._recompute_node_confidence) and
+# old -> new is reported. supported_by and cites are NOT cascade-bearing
+# (#2252 Stage 1.3 flipped supported_by's cascade flag), so retyping either
+# is a confidence no-op by construction — reported as such, never silently
+# skipped.
+#
+# Atomicity: one sqlite transaction. A failure at any step (including the
+# confidence recompute) rolls back everything already issued in this call —
+# the edge is never left half-retyped.
+#
+# Single-payload signature.
+@mcp.tool(
+    name="engram_retype_edge",
+    capability=(
+        "Corrects a wrong edge relation by making it WEAKER (never stronger) "
+        "in one audited transaction — e.g. a supported_by/derives_from/cites "
+        "edge that was really only 'about' or an 'exemplifies' case. "
+        "Refuses moves outside a fixed allowed-move table, a pending-marker "
+        "endpoint, or a missing reason."
+    ),
+    annotations={
+        "title": "Correct a Wrong Edge's Relation (Weaker Only)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_retype_edge(payload_json: str) -> str:
+    """Correct a provably-wrong edge by re-typing it to a weaker relation.
+
+    Pass all fields as one JSON object string in payload_json.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            source_id (str, required): The source node of the edge.
+            target_id (str, required): The target node of the edge.
+            relation (str, required): The edge's CURRENT relation.
+            new_relation (str, required): The relation to retype it to. The
+                (relation, new_relation) pair must be one of the allowed
+                moves: supported_by->about, derives_from->about,
+                derives_from->exemplifies (target must be a lesson or
+                cornerstone), cites->about. Any other pair — including the
+                reverse of any of these — is refused.
+            reason (str, required): Why this edge was wrong. Required and
+                cannot be empty; recorded in the edit-history audit trail
+                alongside both the old and new relation.
+
+    Returns:
+        JSON with `status`:
+          - 'retyped': the edge's relation was changed; audit-logged; a
+            `confidence_recompute` block reports {old, new, disposition} for
+            the source node (disposition is 'no_op_not_cascade_bearing' when
+            the old relation never fed the confidence formula).
+          - 'error': payload invalid, move not allowed, nodes/edge missing,
+            a pending cascade marker on either endpoint, or a failure during
+            the transaction (rolled back — nothing is half-applied).
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+
+    unknown = set(params.keys()) - _RETYPE_EDGE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_RETYPE_EDGE_FIELDS)}"
+        })
+
+    return _attach_walguard_banner(_retype_edge_impl(**params))
+
+
 _SCAN_EMERGENCE_FIELDS = frozenset({
     "min_cluster_size", "similarity_threshold", "focus", "node_type_filter",
 })
@@ -6761,6 +6910,7 @@ def engram_supersede(payload_json: str) -> str:
 # Set of legitimate field names for the engram_retract payload.
 _RETRACT_FIELDS = frozenset({
     "node_id", "error_type", "reason", "replacement_id",
+    "replacement_absent_because", "replacement_absent_note",
     "initiation", "initiation_gate",
 })
 
@@ -6781,13 +6931,14 @@ _RETRACT_FIELDS = frozenset({
 # hallucinated_claim, duplicate, other. These name the failure modes — agents
 # can later scan-by-error-type to learn which kinds of errors they make.
 #
-# Optional replacement (replacement_id field): the retract can be paired with
-# a corrected node, named by id. #2612 retired the earlier mint-inside-
-# retraction path (a nested replacement_json field that minted the
-# replacement inline) — this is a purely relational operation, like
-# engram_supersede's new_node_id: the caller creates the replacement first,
-# via its own canonical creation tool (engram_add_observation for
-# observations), then names it here.
+# Replacement decision (#2613 — REQUIRED-ALWAYS, not optional): every
+# retraction records either replacement_id (the replacement node, already
+# created via its own canonical creation tool — #2612 retired the earlier
+# mint-inside-retraction path) or replacement_absent_because (a closed-set
+# reason nothing replaces the claim). Mutually exclusive; exactly one
+# required. The obligation attaches to the retraction EVENT (edit_history),
+# not just the optional `retracts` edge, so it is checkable even when no
+# replacement exists. See docs/2613-retraction-replacement-contract.md.
 #
 # Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
@@ -6829,14 +6980,31 @@ def engram_retract(payload_json: str) -> str:
             error_type (str, required): One of: fabricated_quote, wrong_citation,
                 wrong_evidence, hallucinated_claim, duplicate, other.
             reason (str, required): Human-readable explanation of the error.
-            replacement_id (str, optional): The replacement node's id, already
+            replacement_id (str): REQUIRED unless replacement_absent_because
+                is supplied instead (#2613 — a replacement decision is
+                always required). The replacement node's id, already
                 created via its type's canonical creation tool
                 (engram_add_observation, for observations) BEFORE calling
                 engram_retract — a purely relational operation, it does NOT
                 create a new node (matches engram_supersede's new_node_id
                 convention). Must name a node that exists, is_current=1,
-                differs from node_id, and is not older than node_id (the
-                retracts edge it lands on is temporal_causal=True).
+                differs from node_id, is not older than node_id (the
+                retracts edge it lands on is temporal_causal=True), and is
+                claim-bearing iff node_id is (a floor, not same-kind —
+                permits conjecture->derivation, refuses task->observation).
+                Mutually exclusive with replacement_absent_because.
+            replacement_absent_because (str): REQUIRED unless replacement_id
+                is supplied instead. The stated reason nothing replaces this
+                claim, one of: NONE_BECAUSE_NO_SUCCESSOR (the claim was
+                simply wrong), NONE_BECAUSE_DUPLICATE (a surviving node
+                already existed), NONE_BECAUSE_SUPERSEDED_ELSEWHERE (a
+                successor exists but is not this retraction's to name),
+                NONE_BECAUSE_UNKNOWN (no successor could be determined — the
+                escape hatch; requires replacement_absent_note).
+            replacement_absent_note (str, optional): free-text note,
+                REQUIRED iff replacement_absent_because='NONE_BECAUSE_UNKNOWN'.
+                Recorded on the retraction event in its own field — never
+                folded into reason, which is truncated at [:200].
             initiation (str, optional): Who initiated the retraction. One of:
                 user_prompted, gate_prompted, unprompted.
             initiation_gate (str, optional): Which gate triggered the
@@ -7333,8 +7501,9 @@ def engram_set_recall_summaries(payload_json: str) -> str:
         payload_json: JSON object string with EXACTLY ONE of:
             summaries (list): list of entry objects, each with:
                 node_id (str): target node. Must exist + is_current=1.
-                recall_summary (str): curated summary. Authoring target ≤120
-                    chars; hard cap 200 chars (defensive guard).
+                recall_summary (str): curated summary. Authoring target ≤140
+                    chars (RECALL_SUMMARY_TARGET); hard cap 200 chars
+                    (defensive guard).
                 recall_keywords (list[str]): 3–5 strings, each ≤30 chars,
                     no duplicates (case-sensitive).
             summaries_file (str): ABSOLUTE path to a JSON file on disk with
@@ -7395,7 +7564,7 @@ def engram_set_recall_summaries(payload_json: str) -> str:
 # Max-depth-8 nesting on filter trees: practical safety, prevents arbitrary-
 # depth queries from bloating the SQL. Top-level bare list = implicit AND.
 _LIST_FIELDS = frozenset({
-    "node_type", "status", "sort_by", "limit", "filters_json",
+    "node_type", "status", "sort_by", "sort_order", "limit", "filters_json",
     "fields_json", "unlimited", "include_superseded",
 })
 
@@ -7486,6 +7655,10 @@ def engram_list(payload_json: str = "{}") -> str:
                 (newest first), 'importance' (highest first), 'recalls'
                 (most recalled first). Unrecognized non-empty value errors
                 loudly rather than silently falling back to 'id' order.
+            sort_order (str, optional): Direction override — 'asc' or 'desc'
+                (case-insensitive). Empty = use sort_by's own default
+                direction (see above). Unrecognized non-empty value errors
+                loudly rather than silently falling back.
             limit (int, optional): Cap on rows returned. Default 100. Set to
                 0 for a metadata-only response (total_matched without rows).
                 Ignored if unlimited=True. Hard ceiling 500 in single-field
@@ -7501,8 +7674,11 @@ def engram_list(payload_json: str = "{}") -> str:
                 (superseded) nodes too. Default False.
 
     Returns JSON:
-        {status, total_matched, shown, truncated, sort_by, nodes,
+        {status, total_matched, shown, truncated, sort_by, sort_order, nodes,
          mode: "single_field" | "structured"}
+        sort_order echoes the RESOLVED direction actually used ('asc' or
+        'desc'), not a raw echo of the input — so a caller who omitted
+        sort_order can still see which direction they got.
         On payload-parsing failure, returns {"error": "..."}.
 
     See _list_impl for full semantics — kept callable with named kwargs for

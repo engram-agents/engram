@@ -59,12 +59,14 @@ Silent no-op conditions:
 Design doc: forum/spec.md
 """
 
+import http.client
 import json
 import os
 import socket
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -123,11 +125,63 @@ _DEFAULT_FORUM_URL = "http://localhost:5002"
 # open rather than shrinking these two constants further to compensate,
 # since that constant is shared with tools/forum.py's unconstrained
 # status-auto CLI path and squeezing these fetches much smaller trades away
-# real margin for legitimately-slow (not dead) hosts. See gh#1906 for the
-# candidate fixes (cache the held-batons call; a shared cross-call deadline;
-# or the connect-level reachability precheck already flagged in #1641).
+# real margin for legitimately-slow (not dead) hosts. This module's own
+# shared deadline below (HOOK_TOTAL_BUDGET_SECONDS) could subsume this gap
+# if extended to that fourth call -- not done here, kept as a documented,
+# disclosed follow-up rather than expanding this fix's diff into a second
+# module (see gh#1906 for the candidate fixes).
 FETCH_TIMEOUT_SECONDS = 1.5
 PUBLISH_TIMEOUT_SECONDS = 1.0
+
+# gh#3107: the worst-case arithmetic above (2*FETCH_TIMEOUT_SECONDS +
+# PUBLISH_TIMEOUT_SECONDS < 5.0) rests on a premise that is FALSE for a
+# server that trickles data: "a call made with timeout=T takes at most T".
+# urllib/http.client re-arm the socket's read timeout on every SUCCESSFUL
+# partial read, so a connection that is accepted and then dribbles bytes
+# resets its own clock indefinitely -- measured: a call budgeted at 2.0s took
+# 9.759s (4.84x) against a trickling peer, while the SAME timeout correctly
+# bounded a silent (non-responding) peer at 2.014s. The exception in both
+# cases is TimeoutError; only ELAPSED TIME distinguishes them, which is why a
+# test against an unresponsive server alone (the "control" case) cannot catch
+# this -- it passes on both a correct implementation and a broken one.
+#
+# The fix is a SHARED, wall-clock deadline for the whole hook fire, with
+# EVERY socket read (not just the initial connect) capped at
+# min(FETCH_TIMEOUT_SECONDS_or_PUBLISH_TIMEOUT_SECONDS, remaining-budget) --
+# re-checked between reads. Capping at the REMAINING budget is the
+# load-bearing element: re-checking the deadline between reads WITHOUT also
+# shrinking each read's own cap toward it still overshoots by up to one
+# read's full cap (measured: a between-ops-only check with a fixed 0.5s cap
+# returned at 0.503s for the WRONG reason -- the fixed cap firing on a
+# 0.5s-per-byte trickle, not the deadline; only a trickle FASTER than the cap
+# -- 0.1s -- with the cap ALSO shrunk toward the deadline correctly aborted
+# at the deadline itself, 3.003s against a 3.0s budget). Both layers are kept
+# (belt-and-braces), but the cap-at-remaining is what actually enforces the
+# bound; see _fetch_with_deadline's own docstring for the read loop.
+#
+# Scope note: this budget covers time AFTER a connection is established, not
+# DNS resolution. _ipv4_only_urlopen's own docstring documents why this
+# module pins IPv4 explicitly (an mDNS record advertising unreachable IPv6
+# candidates ahead of the working address); DNS itself was separately
+# measured at ~5ms on a reachable forum host, negligible against this
+# budget, but that measurement says nothing about a resolver hanging while
+# the host is asleep (a distinct, unmeasured case, cf. #3067's window) -- a
+# hung resolve is not bounded by anything below and is named here rather
+# than silently assumed away.
+HOOK_TOTAL_BUDGET_SECONDS = 4.2  # matches the old arithmetic guard's own
+                                 # ~0.8s-margin-under-5s ceiling: a host that
+                                 # is merely slow (each call taking close to
+                                 # its own FETCH/PUBLISH_TIMEOUT_SECONDS) is
+                                 # unaffected: 2*1.5+1.0 = 4.0 <= 4.2. Only a
+                                 # host that is anomalously slow beyond that
+                                 # intended sum -- a trickle, not a wait -- is
+                                 # newly bounded by this ceiling.
+_READ_BLOCK_SIZE = 4096
+
+
+def _remaining_budget(deadline: float) -> float:
+    """Seconds left before `deadline` (a time.monotonic() value), floored at 0."""
+    return max(0.0, deadline - time.monotonic())
 
 # ---------------------------------------------------------------------------
 # _status_derive import (spec §2, Q2)
@@ -230,6 +284,139 @@ def _ipv4_only_urlopen(req: urllib.request.Request, timeout: float):
         return urllib.request.urlopen(req, timeout=timeout)
     finally:
         socket.getaddrinfo = real_getaddrinfo
+
+
+def _ipv4_only_connect(conn) -> None:
+    """conn.connect(), forced to IPv4-only DNS resolution -- the http.client
+    analogue of _ipv4_only_urlopen (same rationale: see that function's
+    docstring), applied here because _fetch_with_deadline drives
+    http.client.HTTPConnection directly rather than urlopen.
+    """
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        return real_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+    socket.getaddrinfo = _ipv4_only_getaddrinfo
+    try:
+        conn.connect()
+    finally:
+        socket.getaddrinfo = real_getaddrinfo
+
+
+def _fetch_with_deadline(
+    url: str,
+    deadline: float,
+    per_op_cap: float,
+    method: str = "GET",
+    headers: Optional[dict] = None,
+    body: Optional[bytes] = None,
+) -> Optional[bytes]:
+    """GET/POST `url`, bounded by a SHARED end-to-end deadline (gh#3107), not
+    a flat per-call timeout. See HOOK_TOTAL_BUDGET_SECONDS's own comment
+    above for the measured reason a flat timeout= does not bound a request
+    against a server that keeps trickling data.
+
+    Every socket READ (the initial connect included, via the timeout= passed
+    to HTTPConnection's constructor) is capped at min(per_op_cap,
+    remaining-budget), re-checked before each read -- so no single read, nor
+    an unbounded SEQUENCE of individually-bounded reads, can outlive
+    `deadline`. Capping at the remaining budget is the load-bearing element
+    (see the module-level comment above HOOK_TOTAL_BUDGET_SECONDS); the
+    explicit remaining<=0 check below is belt-and-braces on top of it.
+
+    Drives http.client.HTTPConnection directly rather than urlopen: urlopen's
+    response object exposes no public way to re-arm its socket's timeout
+    between reads (only a private, three-levels-deep `.fp.raw._sock`), where
+    HTTPConnection.sock is a first-class public attribute -- the same choice
+    the fixture that validated this mechanism made, for the same reason.
+
+    Returns the raw response body on a 2xx status within budget; None on any
+    error, non-2xx status, or budget exhaustion mid-read -- matching the
+    existing bare-except-return-None contract every caller here already
+    relies on (a stalled/failed fetch is indistinguishable from any other
+    failure to fall back to cache).
+    """
+    remaining = _remaining_budget(deadline)
+    if remaining <= 0:
+        return None
+    parsed = urllib.parse.urlsplit(url)
+    conn_cls = (
+        http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    )
+    conn = conn_cls(parsed.hostname, parsed.port, timeout=min(per_op_cap, remaining))
+    try:
+        _ipv4_only_connect(conn)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        conn.request(method, path, body=body, headers=headers or {})
+        # gh#3143 (Mira's + Aleph's correction to this line's first draft):
+        # capture the socket BEFORE getresponse(), not after. On a
+        # `Connection: close` response, getresponse() sets conn.sock = None
+        # -- but per CPython's own http.client source, this "effectively
+        # passes the connection to the response": the response keeps
+        # reading from the SAME socket object, it has not consumed the
+        # body and there are real network reads still ahead of it. Re-arming
+        # a captured reference to that same object keeps every read1()
+        # bounded by min(per_op_cap, remaining) exactly as before; guarding
+        # the re-arm on conn.sock (this line's first, wrong draft) instead
+        # skips it entirely once conn.sock goes None, freezing every
+        # subsequent read at whatever timeout the connection started with --
+        # for a mid-body stall that is a full per_op_cap of unbounded
+        # overshoot, the exact class of failure #3107 exists to prevent.
+        sock = conn.sock
+        resp = conn.getresponse()
+        if resp.status < 200 or resp.status >= 300:
+            return None
+        out = bytearray()
+        while True:
+            remaining = _remaining_budget(deadline)
+            if remaining <= 0:
+                return None
+            # The captured `sock` re-arms the timeout for as long as the
+            # underlying fd is genuinely still open -- including mid-stall
+            # on a `Connection: close` response, where the server hasn't
+            # finished sending and the fd is very much alive despite
+            # `conn.sock` already reading None (this is the property the
+            # capture exists to preserve). But once the body has been FULLY
+            # drained (the common case: a short response read to completion
+            # in one prior read1() call), HTTPResponse's own EOF handling
+            # closes the underlying fd for real on ITS next internal step --
+            # and a `settimeout()` call against an already-closed fd raises
+            # OSError ("Bad file descriptor"), not the AttributeError this
+            # function used to guard against. Swallow it here rather than
+            # via the function's own bare except below: at that point there
+            # is nothing left to bound a timeout against, and resp.read1()
+            # immediately below correctly signals EOF (b"") without one.
+            try:
+                sock.settimeout(min(per_op_cap, remaining))
+            except OSError:
+                pass
+            # read1(), NOT read(): HTTPResponse.read(n) loops internally,
+            # making as many underlying raw socket reads as needed to
+            # accumulate n bytes (or EOF) BEFORE returning -- so the deadline
+            # recheck above never runs between those internal reads, and a
+            # server trickling slower than n bytes per per_op_cap window can
+            # trap this call for its ENTIRE remaining length regardless of
+            # settimeout() (measured: a 600-byte/0.05s-per-byte trickle ran
+            # ~30s past a 2s budget under read(), because 4096 > 600 meant
+            # ONE .read(4096) call never returned until EOF). read1(n) makes
+            # AT MOST ONE underlying raw read per call, returning whatever
+            # is currently available (possibly far fewer than n bytes) --
+            # exactly the "one settimeout() = one op" pairing this loop
+            # needs, and the reason the overshoot bound is one BLOCK's cap
+            # (a read1() call can still return up to n bytes if that much is
+            # already buffered) rather than one byte's, per #3107 review.
+            chunk = resp.read1(_READ_BLOCK_SIZE)
+            if not chunk:
+                break
+            out.extend(chunk)
+        return bytes(out)
+    except Exception:
+        return None
+    finally:
+        conn.close()
 
 
 def _load_config() -> dict:
@@ -476,11 +663,15 @@ def _apply_sleep_guard(
 # API fetch
 # ---------------------------------------------------------------------------
 
-def _fetch_threads(forum_url: str, since: Optional[str], agent_name: str) -> Optional[list]:
+def _fetch_threads(
+    forum_url: str, since: Optional[str], agent_name: str, deadline: float
+) -> Optional[list]:
     """GET /api/threads?since=<cursor>&agent=<name>.
 
     Returns thread list on success, None on any error (caller uses cache).
-    Timeout: FETCH_TIMEOUT_SECONDS (see module header for the budget math).
+    Timeout: min(FETCH_TIMEOUT_SECONDS, remaining budget under `deadline`) --
+    see HOOK_TOTAL_BUDGET_SECONDS's module-header comment for the budget math
+    (gh#3107).
     """
     params = {}
     if since:
@@ -489,26 +680,24 @@ def _fetch_threads(forum_url: str, since: Optional[str], agent_name: str) -> Opt
         params["agent"] = agent_name
 
     if params:
-        import urllib.parse
         qs = urllib.parse.urlencode(params)
         url = f"{forum_url}/api/threads?{qs}"
     else:
         url = f"{forum_url}/api/threads"
 
+    body = _fetch_with_deadline(
+        url, deadline, FETCH_TIMEOUT_SECONDS, headers={"Accept": "application/json"}
+    )
+    if body is None:
+        return None
     try:
-        req = urllib.request.Request(
-            url,
-            headers={"Accept": "application/json"},
-        )
-        with _ipv4_only_urlopen(req, timeout=FETCH_TIMEOUT_SECONDS) as resp:
-            body = resp.read().decode("utf-8")
-            data = json.loads(body)
-            return data.get("threads", [])
+        data = json.loads(body.decode("utf-8"))
+        return data.get("threads", [])
     except Exception:
         return None
 
 
-def _fetch_inbox(forum_url: str, agent_name: str) -> Optional[list]:
+def _fetch_inbox(forum_url: str, agent_name: str, deadline: float) -> Optional[list]:
     """GET /api/agent/<name>/inbox — returns at_mention items only.
 
     The inbox endpoint uses server-side per-thread read marks so "reading the
@@ -517,28 +706,27 @@ def _fetch_inbox(forum_url: str, agent_name: str) -> Optional[list]:
     Returns a list of inbox items filtered to kind=at_mention on success,
     None on any error (advisory; never breaks the hook chain). Swallows ALL
     errors including 404 (old server without the inbox endpoint) — same
-    bare-except discipline as _fetch_threads. Timeout: FETCH_TIMEOUT_SECONDS.
-    URL-quotes the agent name for safety.
+    bare-except discipline as _fetch_threads. Timeout: min(FETCH_TIMEOUT_SECONDS,
+    remaining budget under `deadline`) — see HOOK_TOTAL_BUDGET_SECONDS's
+    module-header comment (gh#3107). URL-quotes the agent name for safety.
 
     Response shape: {"inbox": [...], "unread_all": N}
     Item shape: {post_id, thread_id, thread_title, author, kind, created_at}
     """
-    import urllib.parse
     quoted_name = urllib.parse.quote(agent_name, safe="")
     url = f"{forum_url}/api/agent/{quoted_name}/inbox"
 
+    body = _fetch_with_deadline(
+        url, deadline, FETCH_TIMEOUT_SECONDS, headers={"Accept": "application/json"}
+    )
+    if body is None:
+        return None
     try:
-        req = urllib.request.Request(
-            url,
-            headers={"Accept": "application/json"},
-        )
-        with _ipv4_only_urlopen(req, timeout=FETCH_TIMEOUT_SECONDS) as resp:
-            body = resp.read().decode("utf-8")
-            data = json.loads(body)
-            inbox = data.get("inbox", [])
-            # Filter to at_mention only — reply_on_my_thread items are out of scope
-            # for the banner (they are a different notification class).
-            return [item for item in inbox if item.get("kind") == "at_mention"]
+        data = json.loads(body.decode("utf-8"))
+        inbox = data.get("inbox", [])
+        # Filter to at_mention only — reply_on_my_thread items are out of scope
+        # for the banner (they are a different notification class).
+        return [item for item in inbox if item.get("kind") == "at_mention"]
     except Exception:
         return None
 
@@ -758,6 +946,11 @@ def main() -> None:
     # cursor read needed here.
 
     # ── Fetch threads + inbox mentions (with cache + stale-cache fallback) ────
+    # gh#3107: ONE shared wall-clock deadline for every network call this hook
+    # fire makes (threads, inbox, and the publish POST below) -- see
+    # HOOK_TOTAL_BUDGET_SECONDS's module-header comment for why a flat
+    # per-call timeout alone does not bound a trickling connection.
+    _hook_deadline = time.monotonic() + HOOK_TOTAL_BUDGET_SECONDS
     threads: Optional[list] = None
     mentions: Optional[list] = None
 
@@ -774,12 +967,12 @@ def main() -> None:
         mentions = cached.get("mentions", [])
     else:
         # Live fetch with since=current surfaced cursor.
-        threads = _fetch_threads(forum_url, since_str, agent_name)
+        threads = _fetch_threads(forum_url, since_str, agent_name, _hook_deadline)
         if threads is not None:
             # Also fetch inbox mentions (advisory; failure → None, not a blocker).
             # Filtered to kind=at_mention inside _fetch_inbox.
             if agent_name:
-                mentions = _fetch_inbox(forum_url, agent_name)
+                mentions = _fetch_inbox(forum_url, agent_name, _hook_deadline)
             else:
                 mentions = None
             _save_cache(threads, mentions if mentions is not None else [])
@@ -840,24 +1033,26 @@ def main() -> None:
                     payload["expected_republish_seconds"] = cadence
 
                 post_data = json.dumps(payload).encode("utf-8")
-                req = urllib.request.Request(
+                # gh#3107: same shared _hook_deadline the fetches above used,
+                # not a fresh full-size PUBLISH_TIMEOUT_SECONDS -- a slow
+                # threads/inbox pair must correctly leave this call less
+                # budget, not a flat one regardless of what already elapsed.
+                publish_body = _fetch_with_deadline(
                     f"{forum_url}/api/agents/status",
-                    data=post_data,
+                    _hook_deadline,
+                    PUBLISH_TIMEOUT_SECONDS,
+                    method="POST",
                     headers={
                         "Content-Type": "application/json",
                         "Accept": "application/json",
                     },
-                    method="POST",
+                    body=post_data,
                 )
-                try:
-                    with _ipv4_only_urlopen(req, timeout=PUBLISH_TIMEOUT_SECONDS) as resp:
-                        resp.read()  # consume response body; discard result
+                if publish_body is not None:
                     # POST succeeded — advance the throttle timestamp.
                     _save_publish_state(state, activity, queue, cadence, _now)
-                except Exception:
-                    # POST failed — do NOT advance the timestamp so the next
-                    # prompt retries.
-                    pass
+                # else: POST failed (or the shared budget was already spent)
+                # — do NOT advance the timestamp so the next prompt retries.
     except Exception:
         # Whole publish block raised — swallow completely. The existing
         # thread/mention output is unaffected.

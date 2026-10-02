@@ -191,3 +191,85 @@ def get_graph(db_path: str) -> dict:
         return {"nodes": [], "edges": [], "error": str(e)}
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Index payload for /api/graph + on-demand full-node lookup for /api/node
+# (engram-alpha#2866 fix 4 -- see the 2026-09-26 issue comment "Re-profile
+# and the fix-4 contract" for the design of record).
+#
+# get_graph() ships every field of every node -- 18-33 MB raw / 4-7.5 MB
+# gzip on a real graph, though the page only needs a handful of fields per
+# node until one is clicked. Both functions below are derived FROM
+# get_graph()'s own output (never a separately-shaped query) so the index
+# can never disagree with the full graph on any field it carries forward --
+# get_graph() itself stays byte-for-byte unchanged (existing tests such as
+# tests/test_viz_server_cascade_markers.py call it directly).
+# ---------------------------------------------------------------------------
+
+# The plain (non-derived) index whitelist keys -- copied through verbatim
+# from get_graph's own node dict when present, and left OUT of the index
+# node entirely when get_graph's node lacks them (never an invented
+# default -- e.g. tainted_by/stale_by are only present on a node actually
+# marked by a pending cascade_markers row; see get_graph's own
+# warnings-omission convention above).
+_INDEX_PLAIN_KEYS = (
+    "id", "type", "status", "is_current", "confidence", "importance_score",
+    "created_at", "tainted_by", "stale_by", "source_domain", "source_title",
+)
+
+
+def _index_node(full_node: dict) -> dict:
+    """Reduce one full node (as returned by get_graph) to the index
+    whitelist: the plain keys above, plus the two derived fields --
+    `label` (first 80 chars of `claim`, "" if no claim, on every node
+    regardless of type) and, ONLY for type == 'definition', `term` (read
+    out of `metadata.term`)."""
+    idx = {k: full_node[k] for k in _INDEX_PLAIN_KEYS if k in full_node}
+
+    claim = full_node.get("claim") or ""
+    idx["label"] = claim[:80]
+
+    if full_node.get("type") == "definition":
+        term = None
+        meta = full_node.get("metadata")
+        if meta:
+            try:
+                meta_obj = meta if isinstance(meta, dict) else json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta_obj = None
+            if isinstance(meta_obj, dict):
+                term = meta_obj.get("term")
+        idx["term"] = term
+
+    return idx
+
+
+def get_graph_index(db_path: str) -> dict:
+    """/api/graph's payload (engram-alpha#2866 fix 4) -- same top-level
+    shape as get_graph (nodes/edges, plus an `error` key on failure), but
+    each node reduced to the index whitelist via _index_node(). Edges are
+    passed through unchanged."""
+    full = get_graph(db_path)
+    result = {
+        "nodes": [_index_node(n) for n in full.get("nodes", [])],
+        "edges": full.get("edges", []),
+    }
+    if "error" in full:
+        result["error"] = full["error"]
+    return result
+
+
+def get_node(db_path: str, node_id: str) -> dict | None:
+    """The FULL node exactly as get_graph(db_path) would return it for
+    `node_id` -- used by GET /api/node so the detail panel can fetch one
+    node's complete data on demand instead of shipping every field of
+    every node up front. None if the id is absent (or the graph itself
+    failed to load, e.g. missing db / uninitialised schema)."""
+    full = get_graph(db_path)
+    if full.get("error"):
+        return None
+    for n in full.get("nodes", []):
+        if n.get("id") == node_id:
+            return n
+    return None

@@ -258,6 +258,25 @@ stop with `TaskStop` when the loop ends). **Load-bearing discipline notes:**
   the script's name (#1935). (Origin: a compaction left two letter
   + two forum-mention monitors polling, double-delivering every event, 2026-06-13.)
 
+**Checking a monitor by hand** — for auditing orphans after a compaction, not as
+a pre-arm gate. Paste these rather than retyping them:
+
+```bash
+# What arms this mechanism?  (the :? guard is load-bearing -- with
+# CLAUDE_PLUGIN_ROOT unset the paths collapse to /skills /hooks /agents and
+# 2>/dev/null turns "no such file" into an empty result that reads as
+# "nothing arms it", which is the same silent-failure class this check exists
+# to avoid)
+: "${CLAUDE_PLUGIN_ROOT:?set CLAUDE_PLUGIN_ROOT before running this}"
+grep -rln '<script-basename>' "$CLAUDE_PLUGIN_ROOT"/{skills,hooks,agents} 2>/dev/null
+# Is it running? (anchored: an unanchored pattern self-matches via the parent shell on Linux)
+pgrep -u "$(id -u)" -f '^([^[:space:]]*/)?-?(bash|sh|dash|ksh|zsh|ash)[[:space:]]+[^[:space:]]*<script-basename>'
+```
+
+Never add `-a` to that `pgrep`: on Darwin `-a` *includes process ancestors* in the
+match set — so the check can never report a dead monitor as dead — while on
+procps-ng it only changes the output format (#2133).
+
 > **Why filename-poll, not mtime?** New letters are new *files*, so the
 > `comm`-of-`ls` diff catches them cleanly and emits each exactly once. (A baton
 > *flip* mutates an existing file's content without adding a file — watching

@@ -141,8 +141,44 @@ def _parse_minus_set(minus_set_path: str) -> list[str]:
     return entries
 
 
+def _glob_matches_path(path: str, pattern: str) -> bool:
+    """Match a POSIX relative path against a pattern, component by component.
+
+    Each component of `pattern` may use fnmatch-style globs (`*`, `?`,
+    `[...]`), but a `*` never crosses a `/` boundary — matching gitignore's
+    glob semantics within a single path segment. Requires equal component
+    counts (no `**` support — see _apply_minus_set's docstring).
+    """
+    path_parts = path.split("/")
+    pattern_parts = pattern.split("/")
+    if len(path_parts) != len(pattern_parts):
+        return False
+    return all(
+        fnmatch.fnmatchcase(p, pat) for p, pat in zip(path_parts, pattern_parts)
+    )
+
+
 def _apply_minus_set(tmp: Path, entries: list[str]) -> tuple[list[str], list[str]]:
-    """Remove paths matching minus-set entries from tmp. Return (removed, warned)."""
+    """Remove paths matching minus-set entries from tmp. Return (removed, warned).
+
+    Implements gitignore-style directory/anchoring rules (#2516), matching the
+    "gitignore-style globs ... matched against repo-root-relative POSIX paths"
+    promise in release-minus-set.txt's own header:
+
+      1. An entry ending in `/` matches a DIRECTORY (and its whole subtree),
+         never a file.
+      2. An entry is ANCHORED to the repo root if it starts with `/` OR
+         contains a `/` anywhere other than the trailing one. An anchored
+         entry matches only at that exact root-relative path (with glob
+         support within components).
+      3. An entry with no slash except an optional trailing one matches at
+         ANY depth (as a path component for directories; as a basename for
+         files).
+      4. Leading `/` is stripped before matching (it only signals anchoring).
+      5. `*` never crosses a `/` — matched component-wise (see
+         _glob_matches_path). `**` is NOT supported; none of today's entries
+         use it.
+    """
     removed = []
     warned = []
     # Collect all files+dirs relative to tmp root.
@@ -158,31 +194,46 @@ def _apply_minus_set(tmp: Path, entries: list[str]) -> tuple[list[str], list[str
 
     for entry in entries:
         is_dir_entry = entry.endswith("/")
+        anchored = entry.startswith("/")
+        core = entry[1:] if anchored else entry
+        if is_dir_entry:
+            core = core.rstrip("/")
+        if "/" in core:
+            anchored = True
+
         matched_any = False
 
         # Collect files to remove for this entry.
         to_remove: list[Path] = []
         for relpath in all_paths:
-            posix = relpath
-            if is_dir_entry:
-                # dir-entry: remove the whole subtree — any path whose first component
-                # matches the prefix (strip trailing slash from entry for comparison).
-                prefix = entry.rstrip("/")
-                if posix == prefix + "/" or posix.startswith(prefix + "/"):
-                    to_remove.append(tmp / relpath.rstrip("/"))
-                    matched_any = True
+            is_path_dir = relpath.endswith("/")
+            posix = relpath.rstrip("/") if is_path_dir else relpath
+
+            # A directory entry only ever matches a directory; a file entry
+            # only ever matches a file (rule 1).
+            if is_dir_entry != is_path_dir:
+                continue
+
+            if anchored:
+                hit = _glob_matches_path(posix, core)
             else:
-                # File pattern: match against the full relative POSIX path.
-                # fnmatch handles globs; also check basename-only if no slash.
-                if fnmatch.fnmatch(posix, entry) or fnmatch.fnmatch(posix, "**/" + entry):
-                    to_remove.append(tmp / posix)
-                    matched_any = True
-                elif "/" not in entry and fnmatch.fnmatch(posix.split("/")[-1], entry):
-                    to_remove.append(tmp / posix)
-                    matched_any = True
+                # Unanchored: match the final path component at any depth —
+                # the directory's own basename, or the file's basename.
+                hit = fnmatch.fnmatchcase(posix.split("/")[-1], core)
+
+            if hit:
+                to_remove.append(tmp / posix)
+                matched_any = True
 
         for p in to_remove:
-            if p.exists():
+            # Check is_symlink() BEFORE is_dir()/exists() -- both of the
+            # latter follow links, which would send a matched symlink (to a
+            # directory or a file, live or broken) into shutil.rmtree(p) and
+            # crash with OSError instead of removing the link itself.
+            if p.is_symlink():
+                p.unlink()
+                removed.append(str((p.relative_to(tmp)).as_posix()))
+            elif p.exists():
                 if p.is_dir():
                     shutil.rmtree(p)
                 else:

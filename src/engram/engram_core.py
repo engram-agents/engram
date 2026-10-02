@@ -28,13 +28,14 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import sys
 import textwrap
 import threading
 import time
 import uuid as _uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Union
+from typing import NamedTuple, Optional, Union
 from urllib.parse import urlparse
 
 from engram_confidence import (  # noqa: E402
@@ -927,9 +928,9 @@ _CASCADE_RELATION_PLACEHOLDERS = ",".join("?" * len(_CASCADE_RELATIONS_SORTED))
 # question that ONLY COINCIDENTALLY SHARED, pre-#2252-Stage-1.3, the same tuple
 # as CASCADE_RELATIONS. #2252 Stage 1.3 (now landed) removed `cascade` from
 # `supported_by`, so the two sets are no longer even numerically equal —
-# CASCADE_RELATIONS is now the strict subset {derives_from}, while this
-# constant deliberately still includes `supported_by` for citation-coverage
-# purposes. Had this constant been derived from CASCADE_RELATIONS instead of
+# CASCADE_RELATIONS no longer contains `supported_by` (see that constant for
+# its current members), while this constant deliberately still includes
+# `supported_by` for citation-coverage purposes. Had this constant been derived from CASCADE_RELATIONS instead of
 # hand-enumerated, the uncited-observation metric would have silently changed
 # meaning on the day Stage 1.3 landed, with no test to catch it — the
 # now-realized divergence is exactly why it stays hand-enumerated.
@@ -1128,6 +1129,23 @@ DAG_EXEMPT_RELATIONS = frozenset(
 # purely to bound the cycle-detection walk — see
 # engram_dag_conformance.check_dag_conformance.
 DAG_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c["dag"])
+
+
+# ---------------------------------------------------------------------------
+# engram_retype_edge's allowed-move table (issue #2265, epic #2252).
+# docs/2265-2347-edge-correction-design.md sec.2: "a re-type may only move an
+# edge to a relation that claims LESS" -- supported_by/derives_from/cites are
+# all provenance-bearing; about/exemplifies are not. Any move not in this
+# table is refused, including every move in the opposite (stronger)
+# direction. The value is None (no extra condition) or a tuple of node
+# `type` values the TARGET must already be one of.
+# ---------------------------------------------------------------------------
+RETYPE_ALLOWED_MOVES: "dict[tuple[str, str], tuple[str, ...] | None]" = {
+    ("supported_by", "about"): None,
+    ("derives_from", "about"): None,
+    ("derives_from", "exemplifies"): ("lesson", "cornerstone"),
+    ("cites", "about"): None,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -2868,7 +2886,7 @@ def _rung_ready(conn: sqlite3.Connection, target: int, backup_ok: bool) -> bool:
     return live == target - 1
 
 
-def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
+def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     """Run the one-shot backfill/migration/DAG-check block for `conn`.
 
     Extracted from _get_db() (#1669) so it can be gated by a once-per-
@@ -2885,6 +2903,16 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     returns without raising -- a failure here must leave the path
     unmarked so the next _get_db() call retries the whole block
     (guard-after-success, not guard-after-attempt).
+
+    Returns: True iff the caller must start the async embedding
+    restore-completeness regeneration thread (#3075 C5 round 2) AFTER
+    releasing _db_setup_lock -- see the "Restore-completeness check" block
+    below and _run_embedding_restore_regeneration's own docstring. False in
+    every other case (no NULL embeddings, embeddings disabled by config, or
+    the embedder is unavailable -- those last two are handled synchronously,
+    in-line, before this function returns). The caller (_get_db()) MUST NOT
+    start that thread while still holding _db_setup_lock -- doing so is
+    exactly the round-1 defect this round fixes.
     """
     # Local import (matches this file's established pattern of function-local
     # `import sys` — see e.g. lines 174/779/833). Unconditional at the top of
@@ -3135,8 +3163,9 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
         ("focused_at", "TEXT"),
         ("focus_reason", "TEXT"),
         # ── recall quality columns ──
-        # Curated ≤120-char summary string authored by Sonnet for fast agent
-        # recognition (PR A substrate; backfill via PR B sleep-fairy).
+        # Curated ≤140-char (RECALL_SUMMARY_TARGET) summary string authored by
+        # Sonnet for fast agent recognition (PR A substrate; backfill via PR
+        # B sleep-fairy).
         # NULL on existing rows and when not yet generated.
         ("recall_summary", "TEXT"),
         # JSON-encoded list of 3 short keyword strings for structural recognition
@@ -3371,6 +3400,164 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
             _backfill_vec_nodes(conn)
         except sqlite3.OperationalError:
             pass  # creation failed — fall back to Python cosine
+
+    # ── Restore-completeness check: NULL embeddings block recall (#3075) ────
+    # A restore from the git-tracked SQL dump (`sqlite3 knowledge.db <
+    # knowledge.sql`) strips ALL embeddings by design — see
+    # engram_backup.py's module docstring, "Restore contract" section — so
+    # every nodes.embedding is NULL immediately after a restore. Unlike
+    # _backfill_vec_nodes just above (which only mirrors EXISTING
+    # nodes.embedding into vec_nodes and can do nothing when
+    # nodes.embedding itself is NULL), this actually regenerates the
+    # missing embeddings on first connect after the restore — the same
+    # idempotent-on-first-connect precedent _backfill_vec_nodes itself
+    # follows ("Backfilled idempotently from existing nodes.embedding on
+    # first run after install").
+    #
+    # Lei's ruling (#3075 C5, verbatim): "embedding should be regenerated
+    # during restore, and it should fail loud instead of silently, so the
+    # user/agent know the DB is not in a fully restored state and the
+    # recall is totally blocked because of no embedding."
+    #
+    # ROUND 2 (#3075/#3076, Borges's design ruling — a reviewer-fairy found
+    # two real blockers in round 1's implementation): "fail loud" is now a
+    # DURABLE, PERSISTENT flag (embedding_restore_state — see
+    # _set_embedding_restore_flag et al above), not a one-shot stderr print
+    # nobody reads on an MCP stdio server. This block ONLY DETECTS and sets
+    # the flag (cheap — a COUNT(*) plus, in the disabled/unavailable cases,
+    # a single-row write); it never itself runs the actual re-embed pass.
+    # When an embedder IS available and enabled, the flag is set with a
+    # provisional "regeneration-pending" cause and this function returns
+    # True, signaling _get_db() (the caller, still holding _db_setup_lock
+    # right now) to start the ACTUAL regeneration on a daemon thread AFTER
+    # the lock is released — see _run_embedding_restore_regeneration's own
+    # docstring for why: round 1 ran the re-embed pass synchronously inside
+    # this same lock, freezing every other concurrent session's DB access
+    # for the full duration of a real restore's backlog.
+    #
+    # This block still never RAISES past its own try/except — a startup
+    # self-heal must not block server startup, matching this function's
+    # other loud-but-non-fatal paths (see the pre-migration-backup skip
+    # prints below).
+    #
+    # ROUND 4 (#3075/#3076, Borges's design ruling): this used to be a raw
+    # `embedding IS NULL` COUNT(*), with no awareness of C2's own skip
+    # rule — so a graph containing even one permanently-unembeddable node
+    # (e.g. an evidence node with no source_title) set this flag on EVERY
+    # process start, forever, and spawned a regeneration thread that
+    # embeds nothing. _count_missing_embeddings defines "missing an
+    # embedding" once (NULL AND embeddable text) and is shared with
+    # _finalize_embedding_restore_flag below, so detection and completion
+    # can never disagree about what counts as a real gap.
+    _needs_async_embedding_regen = False
+    try:
+        # #3077 round 2 (closing the PR#3078 round-1 reviewer-fairy's
+        # blocker), refined round 4 (closing Borges's colleague-pass
+        # required fix): this whole detection block never itself holds
+        # the regeneration lease. The `_fresh_regeneration_lease_held`
+        # pre-check below is now a CHEAP OPTIMIZATION ONLY — skip the
+        # (real, ~0.07s-at-9399-nodes per Borges's own PR#3076
+        # measurement) _count_missing_embeddings scan when a lease is
+        # already known-fresh — never the correctness mechanism. Round
+        # 2-3 made it the correctness mechanism via a separate
+        # check-then-act (`if not held(conn): <write>`), which is a
+        # genuine TOCTOU: a lease acquired in the window between this
+        # read and a later write would be silently clobbered by that
+        # write. Round 4 fixes this at the SOURCE — every write below
+        # now passes `respect_lease=True`, folding the "don't clobber a
+        # fresh lease" guard into the write's own atomic SQL (the same
+        # WHERE-clause pattern `_try_acquire_regeneration_lease` already
+        # uses) — so correctness no longer depends on this pre-check
+        # being fresh, only on the underlying writes being atomic, which
+        # they now are unconditionally. See _set_embedding_restore_flag's
+        # own `respect_lease` docstring for the full rationale.
+        if not _fresh_regeneration_lease_held(conn):
+            _null_emb_before = _count_missing_embeddings(conn)
+            if _null_emb_before > 0:
+                emb_config = _get_embedding_config()
+                if not emb_config.get("enabled", True):
+                    # Gate the REGENERATION on `enabled` (Borges's ruling,
+                    # point 3) -- but the FLAG still fires, naming the
+                    # cause, matching the server.py:8017 startup-gate
+                    # precedent's own wording for why a deliberate opt-out
+                    # stays non-fatal.
+                    _set_embedding_restore_flag(
+                        conn, null_count=_null_emb_before, cause="disabled-by-config",
+                        respect_lease=True,
+                    )
+                elif not _embedder.is_available():
+                    # Judgment call (documented in the PR handoff): Borges's
+                    # ruling named `enabled` as the synchronous gate explicitly;
+                    # extending the same synchronous treatment to a verifiably
+                    # UNAVAILABLE embedder (rather than scheduling a thread that
+                    # would provably no-op — every node outcome would be
+                    # "skipped", per C2's contract) is a superset-safe
+                    # extension, not a contradiction: it produces the identical
+                    # end state the async path would eventually reach anyway,
+                    # without the pointless thread hop.
+                    _set_embedding_restore_flag(
+                        conn, null_count=_null_emb_before, cause="embedder-unavailable",
+                        respect_lease=True,
+                    )
+                else:
+                    _set_embedding_restore_flag(
+                        conn, null_count=_null_emb_before, cause="regeneration-pending",
+                        respect_lease=True,
+                    )
+                    _needs_async_embedding_regen = True
+            else:
+                # No NULL embeddings at all -- clear any stale flag left by
+                # an earlier crashed/failed attempt (documented judgment
+                # call, see _clear_embedding_restore_flag's own docstring:
+                # not explicitly named in Borges's ruling, but required so
+                # a resolved problem doesn't read as permanently broken
+                # until the DB happens to pick up a fresh NULL row).
+                _clear_embedding_restore_flag(conn, respect_lease=True)
+    except Exception as _embed_restore_err:
+        print(
+            "[_run_db_one_time_setup] embedding restore-completeness check "
+            f"FAILED (continuing; DB may still have NULL embeddings — run "
+            f"tools/engram-regenerate-embeddings.py to check/repair): "
+            f"{_embed_restore_err!r}",
+            file=sys.stderr,
+        )
+        # ROUND 4 colleague finding (Borges's colleague pass on PR#3076,
+        # required 2 / finding A): a detection FAILURE here previously
+        # left no trace but the stderr line above, which nobody reads on
+        # an MCP stdio server — the hooks read only the durable flag, and
+        # their read is fail-open, so the agent was told NOTHING when
+        # detection itself broke. That is exactly what Lei's ruling says
+        # must be loud. Best-effort (itself try-wrapped — a broken
+        # detection path must not also break the flag write and crash
+        # setup) set of a distinct "detection-failed" cause, so the hooks
+        # surface "restore state unknown" instead of silence.
+        # null_count=-1 is a SENTINEL — the real count is genuinely
+        # unknown here, not zero — never read it as an actual count.
+        #
+        # #3077 round 3 (folding the round-2 reviewer-fairy's Suggestion
+        # plus a self-caught completeness gap): this was a FIFTH
+        # unconditional writer round 2 missed. Round 4 (Borges's
+        # colleague-pass required fix on PR#3078) simplifies this: the
+        # write itself is now atomically conditional
+        # (`respect_lease=True`, folded into the UPSERT's own WHERE
+        # clause — see _set_embedding_restore_flag's docstring), so this
+        # site no longer needs its own separate `_fresh_regeneration_
+        # lease_held` pre-check at all — a check-then-act pattern here
+        # would just reintroduce the same TOCTOU window round 4 closes
+        # everywhere else. If a fresh lease genuinely exists, the write
+        # below correctly no-ops (rowcount 0) and leaves it untouched. If
+        # the DB itself is unreachable (the contention scenario this
+        # whole path exists to survive), the outer try/except still
+        # fails safe by skipping the write entirely — same best-effort
+        # posture this function has always had.
+        try:
+            _set_embedding_restore_flag(
+                conn, null_count=-1,
+                cause=f"detection-failed: {type(_embed_restore_err).__name__}",
+                respect_lease=True,
+            )
+        except Exception:
+            pass  # best-effort -- must not also break setup itself
 
     # Rebuild FTS triggers — safe to run multiple times, and this always-run
     # (non-version-gated) block is why a NEW graph, or an existing graph on
@@ -4298,6 +4485,13 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     except Exception:
         pass  # Don't block startup on check failures
 
+    # #3075 C5 round 2: signal the caller (_get_db(), still holding
+    # _db_setup_lock at the call site) whether an async embedding
+    # regeneration thread must be started AFTER the lock is released. See
+    # this function's own docstring "Returns:" section and
+    # _run_embedding_restore_regeneration's docstring.
+    return _needs_async_embedding_regen
+
 
 def _get_db() -> sqlite3.Connection:
     """Get a database connection, creating tables if needed.
@@ -4334,7 +4528,55 @@ def _get_db() -> sqlite3.Connection:
     _ensure_data_dir()
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        # #2635 unit 2: measured empirically -- a BRAND-NEW connection's own
+        # PRAGMA journal_mode=WAL can itself raise a raw, uninformative
+        # sqlite3 "disk I/O error" the instant this process already holds a
+        # STALE fd on an already-deleted/replaced -wal/-shm pair (e.g. the
+        # server's long-lived _timing_conn survived the displacement) --
+        # every later statement on such a doomed connection fails
+        # identically, not just this one. Converting that into the same
+        # structured SubstrateDisplaced the rest of this gate raises below
+        # means a caller never sees a raw, unactionable traceback here
+        # instead of a clean refusal. A caught error that does NOT
+        # correlate with a CONFIRMED displacement is a genuine, unrelated
+        # disk problem -- re-raised untouched, unexamined further.
+        #
+        # Round-2 fix (reviewer-fairy finding on the round-1 PR): this is
+        # the path that actually fires for #2635's own primary/motivating
+        # scenario -- a stale long-lived connection (e.g. the server's real
+        # _timing_conn) already holding a displaced -wal/-shm pair, so even
+        # this brand-new connection's own PRAGMA fails before it ever
+        # reaches the main gate below. Mirror that main gate's ordering
+        # exactly: run the throttled marker+forensic-capture+dump path
+        # FIRST, then raise. _run_walguard_check() is documented "MUST NOT
+        # raise" and internally guards every sub-step in its own
+        # try/except (including a connection that's already broken), so it
+        # is safe to call here even though conn's own PRAGMA just failed --
+        # the dump portion may fail (logged, non-fatal) but the
+        # marker-write and forensic-capture, which don't need a working
+        # conn at all, still succeed. Without this call, the exact incident
+        # this whole feature exists to make diagnosable (#786, #2653)
+        # produced no degraded marker and no forensic capture -- only the
+        # raised exception.
+        if not bootstrap_mode:
+            _run_walguard_check(conn)
+        try:
+            # Note: closing this doomed connection can silently recreate an
+            # empty 0-byte -wal stub on disk that wasn't there before this
+            # close (SQLite's own connection-close behavior). Not dangerous,
+            # but it can change what a SECOND failed attempt later reports
+            # (wal_deleted -> wal_replaced) -- reviewer-fairy observation,
+            # round-1 review.
+            conn.close()
+        except Exception:
+            pass
+        if not bootstrap_mode:
+            import engram_walguard as _wg_early
+            _wg_early.assert_not_displaced(str(DB_PATH))  # raises if confirmed
+        raise
     # #1672 (blueprint H6): conservative SQLite defaults measured in effect
     # (synchronous=FULL, mmap_size=0, cache_size~2MB, temp_store=file). Each
     # change below is faster-never-looser: it does not weaken graph
@@ -4393,11 +4635,27 @@ def _get_db() -> sqlite3.Connection:
         except sqlite3.Error:
             return False
 
+    _needs_async_embedding_regen = False
     if resolved_db_path not in _db_setup_done_paths or not _schema_present():
         with _db_setup_lock:
             if resolved_db_path not in _db_setup_done_paths or not _schema_present():
-                _run_db_one_time_setup(conn)
+                _needs_async_embedding_regen = _run_db_one_time_setup(conn)
                 _db_setup_done_paths.add(resolved_db_path)
+
+    # #3075 C5 round 2 (Borges's design ruling): start the NULL-only
+    # embedding regeneration on a daemon thread ONLY AFTER _db_setup_lock
+    # has been released -- never inside the `with` block above. Round 1's
+    # defect was running this synchronously INSIDE that lock, freezing every
+    # other concurrent session's DB access for the pass's full duration on a
+    # real restore. Mirrors server.py's #276 _prewarm_embeddings shape (a
+    # daemon thread started at the end of startup, off the main thread).
+    if _needs_async_embedding_regen:
+        threading.Thread(
+            target=_run_embedding_restore_regeneration,
+            args=(resolved_db_path,),
+            daemon=True,
+            name="engram-embedding-restore-regen",
+        ).start()
 
     # Empty-graph sentinel — DB exists but bootstrap.py never seeded it.
     # Distinct from the DB-missing case at the top: this happens if bootstrap
@@ -4440,6 +4698,27 @@ def _get_db() -> sqlite3.Connection:
         # Throttled (≥30 s interval): detect shm displacement, emergency-dump
         # if detected, write degraded marker.  Must not raise.
         _run_walguard_check(conn)
+
+        # Unthrottled fail-closed gate (#2635 unit 2), on EVERY dispatch —
+        # separate cadence from the throttled marker/dump path just above,
+        # which always runs FIRST (unchanged) to secure the orphan state
+        # (forensics + emergency dump) before this gate can refuse the call.
+        # The two are additive: the throttled path keeps its own 30s/storm-
+        # gated cadence for the expensive dump/marker work regardless of how
+        # often this cheap check fires. Never caught here — SubstrateDisplaced
+        # is meant to propagate all the way to the MCP tool-dispatch wrapper
+        # (server.py's _timing_mcp_tool), the single place it is converted
+        # into a structured {"error": "substrate_displaced", ...} response.
+        import engram_walguard as _wg_gate
+        try:
+            _wg_gate.assert_not_displaced(str(DB_PATH))
+        except _wg_gate.SubstrateDisplaced:
+            # The connection this call just opened is itself compromised
+            # (this process holds a stale fd on the displaced pair) — close
+            # it before propagating, same discipline as the seed-missing
+            # fail-loud path just above (don't leak the connection).
+            conn.close()
+            raise
     else:
         # Emit one stderr line on the FIRST skipped check so that a production
         # server accidentally started with ENGRAM_NO_DB_GUARDS=1 is visible
@@ -5168,8 +5447,19 @@ def _embedding_text_for_node(conn: sqlite3.Connection, node_id: str) -> str:
     on embedding-based retrieval; this makes it load-bearing. recall_keywords
     is optional/weaker signal per #1817 but cheap to include, so it's folded
     in whenever present.
+
+    #3075 C1: independent of `conn`'s own row_factory. A connection with
+    row_factory=None (plain tuples — e.g. a caller that never opted into
+    sqlite3.Row) previously raised TypeError on the dict-style `row["type"]`
+    access below (and, transitively, inside _reflect_keywords' `row.keys()`
+    call). Fixed by binding sqlite3.Row on a fresh CURSOR rather than
+    trusting/mutating `conn.row_factory` — this leaves the connection's own
+    row_factory untouched for every other caller sharing it, while
+    guaranteeing dict-style access works here regardless of caller state.
     """
-    row = conn.execute(
+    _cur = conn.cursor()
+    _cur.row_factory = sqlite3.Row
+    row = _cur.execute(
         "SELECT type, claim, source_title, predicted_event, "
         "recall_summary, recall_keywords FROM nodes WHERE id = ?",
         (node_id,),
@@ -5199,8 +5489,90 @@ def _embedding_text_for_node(conn: sqlite3.Connection, node_id: str) -> str:
     return base
 
 
-def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str):
-    """Compute embedding for a node and store it. Silently skips if unavailable.
+def _count_missing_embeddings(conn: sqlite3.Connection) -> int:
+    """Count nodes GENUINELY missing an embedding (#3075 C5 round 4,
+    Borges's design ruling on PR#3076).
+
+    "Missing" = is_current=1 AND embedding IS NULL AND the node has
+    embeddable text, per the exact same rule _embedding_text_for_node /
+    _compute_and_store_embedding already apply (a non-empty result from
+    _embedding_text_for_node). A node with no embeddable text (e.g. an
+    evidence node with no source_title) is a PERMANENT, EXPECTED skip per
+    EmbeddingOutcome's own docstring — it is never going to embed, no
+    matter how many restore passes run, so counting it as "missing" is
+    what caused two separate, opposite-direction bugs before this round:
+
+    - Round 2's DETECTION site used a raw `embedding IS NULL` COUNT(*),
+      with no skip-awareness at all — so a permanently-unembeddable graph
+      set the restore flag (and spawned a wasted regeneration thread) on
+      every single process start, forever.
+    - Round 3's COMPLETION site (_finalize_embedding_restore_flag) went
+      the other way: it trusted the just-completed pass's own
+      `counts["failed"]` tally instead of re-checking state. Since
+      EmbeddingOutcome.status == "skipped" covers THREE distinct causes
+      uniformly (disabled-by-config, embedder-unavailable, empty-text —
+      see that type's own docstring), an embedder that dropped BETWEEN
+      the synchronous detection gate scheduling the pass and the pass
+      itself actually running made every node report "skipped" (not
+      "failed"), so counts["failed"] == 0 and round 3 silently CLEARED
+      the flag while real, embeddable content stayed un-embedded — the
+      round-3 reviewer-fairy's own reproduced blocker.
+
+    Deciding from the resulting STATE (this function), not from a pass's
+    own history, makes neither prior failure mode representable: a state
+    re-count can't be fooled by WHY a node stayed NULL. Used at BOTH the
+    detection site (_run_db_one_time_setup) and the completion site
+    (_finalize_embedding_restore_flag), so "missing an embedding" is
+    defined exactly once, not duplicated per call site.
+
+    Necessarily a Python-side scan, not pure SQL — embeddable-ness
+    depends on per-node content (claim / source_title / predicted_event /
+    recall_summary / recall_keywords, per _embedding_text_for_node's own
+    type-branch logic), so this function reuses that logic directly
+    rather than hand-duplicating a second copy of it in SQL.
+    """
+    node_ids = [
+        r[0] for r in conn.execute(
+            "SELECT id FROM nodes WHERE is_current=1 AND embedding IS NULL"
+        ).fetchall()
+    ]
+    return sum(1 for nid in node_ids if _embedding_text_for_node(conn, nid))
+
+
+class EmbeddingOutcome(NamedTuple):
+    """Return value of _compute_and_store_embedding (#3075 C2).
+
+    status: one of "embedded" / "skipped" / "failed" — never bare None any
+        more; every call site must interpret an explicit status.
+      - "skipped": an EXPECTED no-op — embeddings disabled via config, the
+        embedder unavailable, or empty text for this node type. No WARNING
+        logged; this is normal, silent operation.
+      - "embedded": the JSON nodes.embedding write succeeded (the canonical
+        store). vec_mirror_ok is False if the vec_nodes KNN mirror-write
+        degraded (a TOLERATED failure — JSON stays authoritative — but now
+        visible/countable here instead of silently swallowed).
+      - "failed": an UNEXPECTED error — a bad text-function result (e.g. the
+        original TypeError-on-tuple-row_factory bug class), an exception (or
+        an empty/None result despite the embedder reporting available) from
+        embed(), or a DB error on the UPDATE. Logged at WARNING level by this
+        function — never silent.
+    node_id: the node this outcome describes.
+    detail: exception type/message when status == "failed"; None otherwise.
+    """
+    status: str
+    node_id: str
+    detail: str | None = None
+    vec_mirror_ok: bool = True
+
+
+def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "EmbeddingOutcome":
+    """Compute embedding for a node and store it.
+
+    Returns an EmbeddingOutcome distinguishing EXPECTED no-ops ("skipped")
+    from UNEXPECTED failures ("failed") — see EmbeddingOutcome's own
+    docstring for the full contract (#3075 C2). Unexpected failures are
+    logged at WARNING level (never silently swallowed, unlike the old bare
+    `except Exception: pass`).
 
     Writes to BOTH nodes.embedding (JSON, human-readable, used for backfill
     and debugging) AND vec_nodes (the KNN index, if the sqlite-vec extension
@@ -5210,35 +5582,95 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str):
     try:
         emb_config = _get_embedding_config()
         if not emb_config.get("enabled", True) or not _embedder.is_available():
-            return
+            return EmbeddingOutcome(status="skipped", node_id=node_id)
 
         text = _embedding_text_for_node(conn, node_id)
         if not text:
-            return
+            return EmbeddingOutcome(status="skipped", node_id=node_id)
 
         model_name = emb_config.get("model", DEFAULT_EMBEDDING_MODEL)
         vector = _embedder.embed(text, model_name)
-        if vector:
-            conn.execute(
-                "UPDATE nodes SET embedding = ? WHERE id = ?",
-                (json.dumps(vector), node_id),
+        if not vector:
+            # The embedder reported itself available and the text was
+            # non-empty, yet no vector came back (no exception raised) —
+            # e.g. the model failed to load after is_available()'s cheaper
+            # import-only check passed. Genuinely unexpected, not a normal
+            # skip — must not be silent (#3075 C2).
+            logging.getLogger(__name__).warning(
+                "embedding computation for node %s produced no vector "
+                "(embedder reported available but embed() returned "
+                "empty/None) — node left without an embedding.",
+                node_id,
             )
-            # Mirror into the vec KNN index. vec0 doesn't support UPSERT on
-            # virtual tables, so delete-then-insert handles the rare re-embed.
-            if _VEC_BACKEND_AVAILABLE and _sqlite_vec is not None and len(vector) == 384:
-                try:
-                    conn.execute("DELETE FROM vec_nodes WHERE node_id = ?", (node_id,))
-                    conn.execute(
-                        "INSERT INTO vec_nodes(node_id, embedding) VALUES (?, ?)",
-                        (node_id, _sqlite_vec.serialize_float32(vector)),
-                    )
-                except sqlite3.OperationalError:
-                    pass  # vec_nodes missing or locked — JSON still canonical
-    except Exception:
-        pass  # Embedding computation failed — node works fine without it
+            return EmbeddingOutcome(
+                status="failed", node_id=node_id,
+                detail="embed() returned empty/None",
+            )
+
+        conn.execute(
+            "UPDATE nodes SET embedding = ? WHERE id = ?",
+            (json.dumps(vector), node_id),
+        )
+        vec_mirror_ok = True
+        # Mirror into the vec KNN index. vec0 doesn't support UPSERT on
+        # virtual tables, so delete-then-insert handles the rare re-embed.
+        if _VEC_BACKEND_AVAILABLE and _sqlite_vec is not None and len(vector) == 384:
+            try:
+                conn.execute("DELETE FROM vec_nodes WHERE node_id = ?", (node_id,))
+                conn.execute(
+                    "INSERT INTO vec_nodes(node_id, embedding) VALUES (?, ?)",
+                    (node_id, _sqlite_vec.serialize_float32(vector)),
+                )
+            except sqlite3.OperationalError:
+                # vec_nodes missing or locked — JSON still canonical. A
+                # TOLERATED degradation (#3075 C2 explicitly keeps this
+                # non-fatal), but now visible on the outcome instead of
+                # being silently swallowed.
+                vec_mirror_ok = False
+
+        return EmbeddingOutcome(
+            status="embedded", node_id=node_id, vec_mirror_ok=vec_mirror_ok,
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "embedding computation FAILED for node %s: %r — node left "
+            "without an embedding (recall degraded for this node until "
+            "re-embedded).",
+            node_id, exc,
+        )
+        return EmbeddingOutcome(status="failed", node_id=node_id, detail=repr(exc))
 
 
-def _reembed_all_nodes(conn: sqlite3.Connection) -> int:
+def _reembed_nodes(conn: sqlite3.Connection, node_ids: list[str], caller_name: str) -> dict:
+    """Shared (re-)embed loop for a given list of node ids (#3075 C3).
+
+    `caller_name` (e.g. "_reembed_all_nodes" / "_reembed_null_nodes") is
+    folded into the summary WARNING below so the log distinguishes a
+    migration-rung full re-embed from a restore-completeness NULL-only pass.
+
+    Best-effort per node (a failure does not abort the pass — every id in
+    `node_ids` is still attempted). Returns a dict with keys 'processed',
+    'embedded', 'skipped', 'failed' (counts from each node's
+    EmbeddingOutcome.status). Logs ONE WARNING-level summary line (not one
+    per node — _compute_and_store_embedding already logs the per-node
+    WARNING) if any node failed. Commits once at the end.
+    """
+    counts = {"processed": 0, "embedded": 0, "skipped": 0, "failed": 0}
+    for node_id in node_ids:
+        counts["processed"] += 1
+        outcome = _compute_and_store_embedding(conn, node_id)
+        counts[outcome.status] += 1
+    conn.commit()
+    if counts["failed"] > 0:
+        logging.getLogger(__name__).warning(
+            "%s: %d/%d node(s) failed to embed — see the individual "
+            "per-node WARNING log lines above for detail.",
+            caller_name, counts["failed"], counts["processed"],
+        )
+    return counts
+
+
+def _reembed_all_nodes(conn: sqlite3.Connection) -> dict:
     """One-time full re-embed pass: recompute the embedding for EVERY node.
 
     Used by migration rung 4 (#1952 PR2 / #1817): _embedding_text_for_node's
@@ -5248,7 +5680,8 @@ def _reembed_all_nodes(conn: sqlite3.Connection) -> int:
     design note: a graph where some nodes embed summaries and others don't is
     harder to reason about than either uniform state — so this touches EVERY
     row in `nodes`, not just embedding IS NULL ones (unlike
-    tools/engram-regenerate-embeddings.py's restore-path backfill, which is
+    tools/engram-regenerate-embeddings.py's restore-path backfill, and unlike
+    this file's own _reembed_null_nodes below, both of which are
     intentionally NULL-only and is_current=1-only).
 
     Reuses _compute_and_store_embedding per node on the SAME connection (no
@@ -5260,15 +5693,533 @@ def _reembed_all_nodes(conn: sqlite3.Connection) -> int:
     unavailable (ENGRAM_NO_EMBEDDINGS, missing sentence-transformers),
     matching every other embedding call site.
 
-    Returns the number of node IDs processed (not the number successfully
-    embedded — _compute_and_store_embedding never raises and never reports
-    success/failure back to the caller).
+    #3075 C3: returns a dict with keys 'processed', 'embedded', 'skipped',
+    'failed' — replacing the old bare int-processed-count return, which made
+    a 100%-failure pass indistinguishable from a 100%-success one. See
+    _reembed_nodes (the shared loop this delegates to) for the logging
+    contract.
     """
     node_ids = [r[0] for r in conn.execute("SELECT id FROM nodes").fetchall()]
-    for node_id in node_ids:
-        _compute_and_store_embedding(conn, node_id)
+    return _reembed_nodes(conn, node_ids, caller_name="_reembed_all_nodes")
+
+
+def _reembed_null_nodes(conn: sqlite3.Connection) -> dict:
+    """One-time restore-completeness pass: (re-)compute the embedding for
+    every CURRENT node whose embedding is NULL (#3075 C5).
+
+    Unlike _reembed_all_nodes (which touches EVERY row in `nodes`, current
+    or not, unconditionally — see that function's own docstring for why),
+    this is scoped to `is_current=1 AND embedding IS NULL` — the exact
+    post-restore state after `sqlite3 knowledge.db < knowledge.sql`
+    (engram_backup.py's restore contract strips ALL embeddings). Query shape
+    matches tools/engram-regenerate-embeddings.py's own NULL-only backfill.
+
+    Returns the same {'processed','embedded','skipped','failed'} dict shape
+    as _reembed_all_nodes (both delegate to the shared _reembed_nodes loop).
+    """
+    node_ids = [
+        r[0] for r in conn.execute(
+            "SELECT id FROM nodes WHERE is_current=1 AND embedding IS NULL"
+        ).fetchall()
+    ]
+    return _reembed_nodes(conn, node_ids, caller_name="_reembed_null_nodes")
+
+
+# ---------------------------------------------------------------------------
+# #3075 C5 round 2 — persistent restore-completeness flag + async
+# regeneration (Borges's design ruling, engram-alpha#3075/#3076).
+#
+# Round 1's C5 implementation printed to stderr (nobody reads stderr on an
+# MCP stdio server) and ran the NULL-only re-embed pass SYNCHRONOUSLY inside
+# _db_setup_lock (the process-wide lock _run_db_one_time_setup executes
+# entirely inside — freezing every other concurrent session's DB access for
+# the pass's full duration on a real restore with a nontrivial backlog).
+#
+# Round 2 fixes both: a DURABLE flag (survives process restart, unlike a
+# stderr print) that the hooks/engram_stats surface every prompt until
+# cleared, PLUS the regeneration itself moved OUTSIDE _db_setup_lock onto a
+# daemon thread (same shape as server.py's #276 _prewarm_embeddings) so a
+# large restore never blocks concurrent sessions.
+# ---------------------------------------------------------------------------
+
+_EMBEDDING_RESTORE_STATE_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS embedding_restore_state (
+        singleton_key       INTEGER PRIMARY KEY CHECK (singleton_key = 1),
+        not_fully_restored  INTEGER NOT NULL DEFAULT 0,
+        null_count          INTEGER NOT NULL DEFAULT 0,
+        cause               TEXT,
+        updated_at          TEXT
+    )
+"""
+
+
+def _ensure_embedding_restore_state_table(conn: sqlite3.Connection) -> None:
+    """Idempotent CREATE TABLE IF NOT EXISTS for the restore-completeness
+    flag (#3075 C5 round 2).
+
+    Self-contained rather than threaded through _run_db_one_time_setup's own
+    giant schema executescript (which runs LATER in that function than the
+    restore-completeness check itself needs the table) — called defensively
+    by every read/write helper below, matching this file's existing
+    per-table defensive-create idiom (e.g. ensure_vocab_table,
+    _backfill_vec_nodes's own "CREATE VIRTUAL TABLE IF NOT EXISTS" just
+    above the restore-completeness check site). A judgment call, documented
+    in the PR handoff: Borges's design ruling said "a DB meta table row" but
+    left the exact table/creation-site open; no existing key-value/meta
+    table was found to reuse (checked: focus_state is the nearest
+    precedent — a dedicated singleton-row table, not a generic KV store —
+    and this follows that same shape).
+    """
+    conn.execute(_EMBEDDING_RESTORE_STATE_SCHEMA)
+
+
+def _set_embedding_restore_flag(
+    conn: sqlite3.Connection, *, null_count: int, cause: str,
+    respect_lease: bool = False,
+) -> bool:
+    """Persist the "DB not fully restored" flag (#3075 C5 round 2).
+
+    Durable singleton row (survives process restart — the whole point,
+    unlike round 1's stderr print) — cheap to read (single-row PK lookup)
+    by the hooks (separate process, raw SQL — see
+    engram-surface-hook.py's own _check_embedding_restore_flag) and by
+    engram_stats/engram_diagnose.
+
+    `cause` is one of "disabled-by-config" / "embedder-unavailable" /
+    "per-node-failures" / "detection-failed: <ExceptionType>" (round 5) /
+    "regeneration-pending" (the provisional value written before the async
+    regeneration thread has run) / "regeneration-running" (#3077 — a
+    SINGLE-FLIGHT LEASE, written via _try_acquire_regeneration_lease, not
+    this function directly, once the thread actually starts working — see
+    that function and _run_embedding_restore_regeneration below, which
+    overwrites this row again with the real outcome on completion).
+
+    #3077 round 4 (Borges's colleague-pass required fix on PR#3078):
+    `respect_lease=True` makes this write ATOMICALLY conditional on no
+    fresh "regeneration-running" lease existing at write time — the same
+    WHERE-clause pattern `_try_acquire_regeneration_lease` already uses,
+    folded into this write's own SQL — rather than a separate
+    caller-side `if not _fresh_regeneration_lease_held(conn): ...`
+    pre-check. Rounds 2-3's pre-check pattern was CHECK-THEN-ACT: a
+    genuine TOCTOU race, since a lease acquired in the window between
+    the read and this write would be silently clobbered by it. Every
+    NON-HOLDER writer (the detection site, its detection-failed handler,
+    the manual regen script) must pass `respect_lease=True`. The
+    legitimate lease holder's own finalize write
+    (`_finalize_embedding_restore_flag`, called only after THIS
+    process's own `_try_acquire_regeneration_lease` already succeeded)
+    must NEVER pass this — it needs to unconditionally overwrite its own
+    lease with the real outcome, and this function has no way to
+    distinguish "my own lease" from "someone else's."
+
+    Returns True if the write actually happened. With
+    `respect_lease=True`, returns False if a fresh lease blocked it (the
+    row was left completely untouched); with the default `False`,
+    always returns True (unconditional, matching pre-round-4 behavior
+    exactly).
+
+    Commits immediately — this is a small, standalone bookkeeping write,
+    not part of the caller's own larger transaction.
+    """
+    _ensure_embedding_restore_state_table(conn)
+    if respect_lease:
+        _cutoff = _iso_seconds_ago(_REGENERATION_LEASE_STALENESS_SECONDS)
+        cur = conn.execute(
+            "INSERT INTO embedding_restore_state "
+            "(singleton_key, not_fully_restored, null_count, cause, updated_at) "
+            "VALUES (1, 1, ?, ?, ?) "
+            "ON CONFLICT(singleton_key) DO UPDATE SET "
+            "not_fully_restored=1, null_count=excluded.null_count, "
+            "cause=excluded.cause, updated_at=excluded.updated_at "
+            "WHERE embedding_restore_state.cause IS NOT 'regeneration-running' "
+            "   OR embedding_restore_state.updated_at < ?",
+            (null_count, cause, _now(), _cutoff),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    conn.execute(
+        "INSERT INTO embedding_restore_state "
+        "(singleton_key, not_fully_restored, null_count, cause, updated_at) "
+        "VALUES (1, 1, ?, ?, ?) "
+        "ON CONFLICT(singleton_key) DO UPDATE SET "
+        "not_fully_restored=1, null_count=excluded.null_count, "
+        "cause=excluded.cause, updated_at=excluded.updated_at",
+        (null_count, cause, _now()),
+    )
     conn.commit()
-    return len(node_ids)
+    return True
+
+
+def _clear_embedding_restore_flag(
+    conn: sqlite3.Connection, *, respect_lease: bool = False,
+) -> bool:
+    """Clear the restore-completeness flag (#3075 C5 round 2) — called after
+    a fully-successful regeneration (every NULL-embedding node now has an
+    embedding), by either the async regeneration thread or a manual
+    tools/engram-regenerate-embeddings.py run. Also called (as a
+    completeness fix, not explicitly named in Borges's ruling — a
+    documented judgment call) when _run_db_one_time_setup finds ZERO
+    NULL-embedding nodes at all: a flag left set by an earlier crashed/failed
+    attempt must not read as stale-but-permanent once the underlying problem
+    is actually gone.
+
+    #3077 round 4: `respect_lease=True` — same atomic-WHERE-clause
+    reasoning, same caller obligation, same return-value contract as
+    `_set_embedding_restore_flag`'s own `respect_lease` parameter; see
+    that function's docstring for the full rationale, not duplicated
+    here.
+    """
+    _ensure_embedding_restore_state_table(conn)
+    if respect_lease:
+        _cutoff = _iso_seconds_ago(_REGENERATION_LEASE_STALENESS_SECONDS)
+        cur = conn.execute(
+            "INSERT INTO embedding_restore_state "
+            "(singleton_key, not_fully_restored, null_count, cause, updated_at) "
+            "VALUES (1, 0, 0, NULL, ?) "
+            "ON CONFLICT(singleton_key) DO UPDATE SET "
+            "not_fully_restored=0, null_count=0, cause=NULL, updated_at=excluded.updated_at "
+            "WHERE embedding_restore_state.cause IS NOT 'regeneration-running' "
+            "   OR embedding_restore_state.updated_at < ?",
+            (_now(), _cutoff),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    conn.execute(
+        "INSERT INTO embedding_restore_state "
+        "(singleton_key, not_fully_restored, null_count, cause, updated_at) "
+        "VALUES (1, 0, 0, NULL, ?) "
+        "ON CONFLICT(singleton_key) DO UPDATE SET "
+        "not_fully_restored=0, null_count=0, cause=NULL, updated_at=excluded.updated_at",
+        (_now(),),
+    )
+    conn.commit()
+    return True
+
+
+def _get_embedding_restore_flag(conn: sqlite3.Connection) -> dict:
+    """Read the restore-completeness flag (#3075 C5 round 2).
+
+    Returns {"not_fully_restored": bool, "null_count": int,
+    "cause": str | None, "updated_at": str | None} — all-clear defaults
+    when the table/row doesn't exist yet (a DB that predates this feature,
+    or one that has never had a NULL embedding).
+    """
+    _ensure_embedding_restore_state_table(conn)
+    row = conn.execute(
+        "SELECT not_fully_restored, null_count, cause, updated_at "
+        "FROM embedding_restore_state WHERE singleton_key = 1"
+    ).fetchone()
+    if not row:
+        return {"not_fully_restored": False, "null_count": 0, "cause": None, "updated_at": None}
+    return {
+        "not_fully_restored": bool(row[0]),
+        "null_count": row[1],
+        "cause": row[2],
+        "updated_at": row[3],
+    }
+
+
+def _finalize_embedding_restore_flag(
+    conn: sqlite3.Connection, counts: dict, *, respect_lease: bool = False,
+) -> None:
+    """Clear/set the restore-completeness flag from a FRESH state re-count,
+    not from the just-completed pass's own tally (#3075 C5 round 4,
+    Borges's design ruling on PR#3076).
+
+    Round 2 and round 3 each got this wrong in OPPOSITE directions, both
+    because they decided clear-vs-set from something other than the
+    resulting state:
+
+    - Round 2 re-counted raw `embedding IS NULL` rows and set the flag
+      unconditionally with cause="per-node-failures" whenever any
+      remained — collapsing legitimate, PERMANENT "skipped" outcomes
+      (EmbeddingOutcome's own docstring: empty text for a node type,
+      e.g. an evidence node with no source_title) into the same bucket
+      as genuine failures. A graph with even one such node saw this flag
+      permanently stuck with a remedy ("re-run the tool") that could
+      never help.
+    - Round 3 fixed that by trusting `counts["failed"]` (the pass's own
+      per-node-outcome tally) instead — but EmbeddingOutcome.status ==
+      "skipped" covers THREE distinct causes uniformly (disabled-by-
+      config, embedder-unavailable, empty-text). An embedder that
+      dropped BETWEEN the synchronous detection gate scheduling this
+      pass and the pass itself actually running made every node report
+      "skipped" (not "failed"), so counts["failed"] == 0 and round 3
+      silently CLEARED the flag while real, embeddable content stayed
+      un-embedded — the round-3 reviewer-fairy's own reproduced blocker.
+
+    Fix: decide from `_count_missing_embeddings(conn)` — a FRESH,
+    skip-aware re-count of the resulting state (NULL embedding AND
+    embeddable text, the same predicate the detection site in
+    _run_db_one_time_setup now shares). A state re-count can't be fooled
+    by WHY a node stayed NULL, so neither round 2's nor round 3's
+    failure mode is representable through this function any more.
+
+    `counts` is still accepted (both call sites already have it in scope
+    from their own pass) and used only for a diagnostic WARNING when it
+    disagrees with the fresh re-count — never as the clear/set decision
+    itself; that decision is always the re-count.
+
+    Cause is derived from the CURRENT embedder state at decision time —
+    not from the pass's own history: "disabled-by-config" if embeddings
+    are now disabled via config, "embedder-unavailable" if the embedder
+    now reports unavailable, else "per-node-failures" (a genuinely
+    available, enabled embedder that still couldn't embed every
+    remaining node — the one case that IS a real, actionable failure).
+
+    Shared by both call sites that finalize this flag after a
+    regeneration pass — `_run_embedding_restore_regeneration` (the async
+    server-side path) and `tools/engram-regenerate-embeddings.py` (the
+    manual restore-path script) — same reasoning as round 3: the
+    decision lives in ONE place, not duplicated per call site.
+
+    #3077 round 4 (Borges's colleague-pass required fix): `respect_lease`
+    threads straight through to both internal `_clear_embedding_restore_flag`/
+    `_set_embedding_restore_flag` calls below — same atomic-WHERE-clause
+    reasoning as those functions' own `respect_lease` parameter.
+    `_run_embedding_restore_regeneration`'s own call (the legitimate
+    lease holder finishing its own work) must call this with the
+    default `respect_lease=False` — it needs to unconditionally
+    overwrite its own lease with the real outcome. The manual regen
+    script's call, which is NEVER the lease holder, must pass
+    `respect_lease=True` — and, critically, must do so on THIS call
+    directly rather than wrapping the whole call in its own separate
+    `if not _fresh_regeneration_lease_held(conn): ...` pre-check (the
+    exact check-then-act TOCTOU this round closes at every non-holder
+    site).
+    """
+    _missing = _count_missing_embeddings(conn)
+    if _missing == 0:
+        _clear_embedding_restore_flag(conn, respect_lease=respect_lease)
+        return
+    emb_config = _get_embedding_config()
+    if not emb_config.get("enabled", True):
+        _cause = "disabled-by-config"
+    elif not _embedder.is_available():
+        _cause = "embedder-unavailable"
+    else:
+        _cause = "per-node-failures"
+    if counts.get("failed", 0) != _missing:
+        # This can be a benign disagreement, not only a suspicious one:
+        # e.g. a node inserted with a NULL embedding concurrently with
+        # this pass raises the fresh recount without the pass's own
+        # tally ever having seen it. Either way the recount is
+        # authoritative (round 4) — this line is a diagnostic, not an
+        # error signal.
+        logging.getLogger(__name__).warning(
+            "_finalize_embedding_restore_flag: pass tally (failed=%d) "
+            "disagrees with the fresh missing-embedding recount (%d) -- "
+            "using the recount (state, not the pass's history) as "
+            "authoritative; cause=%s. (A mismatch can also mean new "
+            "NULL-embedding content arrived mid-pass, not just a "
+            "genuine disagreement.)",
+            counts.get("failed", 0), _missing, _cause,
+        )
+    _set_embedding_restore_flag(
+        conn, null_count=_missing, cause=_cause, respect_lease=respect_lease,
+    )
+
+
+# ---------------------------------------------------------------------------
+# #3077 — cross-process single-flight lease for the async regeneration pass.
+#
+# Every process that runs _run_db_one_time_setup with missing embeddings > 0
+# independently spawns its OWN _run_embedding_restore_regeneration thread —
+# safe (NULL-only, idempotent) but wasteful under concurrency: N concurrent
+# MCP sessions / short-lived CLIs each redundantly re-embed the same rows.
+# This section adds a lease so only one pass actually does the work at a
+# time; the rest exit immediately without touching anything.
+# ---------------------------------------------------------------------------
+
+_REGENERATION_LEASE_STALENESS_SECONDS = 600  # 10 minutes, per Borges's ruling
+# DOCUMENTED BOUND (Borges's colleague-pass Suggestion on PR#3078, accepted
+# as a bound rather than a fix): this lease is never RENEWED mid-pass. A
+# genuine regeneration pass that takes longer than this window loses its
+# lease, and a second process can then start a duplicate pass -- wasteful,
+# not unsafe (the underlying regeneration is idempotent/NULL-only either
+# way). Borges measured all-MiniLM-L6-v2 at ~320 short texts/s one-at-a-time
+# on his seat, making a 9,399-node restore roughly a minute -- 600s is ample
+# there. A CPU-only host an order of magnitude slower, with longer real
+# claim text, could approach this bound. If real-world pass durations ever
+# regularly approach it, add a heartbeat (refresh updated_at every N nodes
+# inside _reembed_nodes) rather than just raising the constant.
+
+
+def _try_acquire_regeneration_lease(conn: sqlite3.Connection, *, null_count: int) -> bool:
+    """Atomically acquire the "regeneration-running" lease (#3077).
+
+    Returns True (and durably sets cause="regeneration-running" with a
+    FRESH updated_at) when no fresh lease already exists: no row at all,
+    cause is NULL (the cleared/all-clear state), cause is any OTHER
+    terminal value, or cause IS "regeneration-running" but its updated_at
+    is older than _REGENERATION_LEASE_STALENESS_SECONDS (a crashed or
+    killed lease-holder self-heals — nobody has to detect the crash,
+    the staleness window just expires).
+
+    Returns False, making NO changes to the row whatsoever, when a FRESH
+    "regeneration-running" lease already exists — the caller must not do
+    any work in that case (see _run_embedding_restore_regeneration below).
+
+    The mutual exclusion is SQLite's own transactional serialization on a
+    single conditional UPSERT — verified empirically (not assumed) to
+    behave as a genuine cross-connection compare-and-swap, including
+    under real concurrent threads/connections against the same db file
+    (see this file's own test suite, TestTryAcquireRegenerationLease.
+    test_acquire_is_atomic_under_real_concurrency). No new lock, no new
+    table — this reuses the existing embedding_restore_state singleton
+    row. `_db_setup_lock` (a Python threading.Lock) does NOT help here —
+    it only serializes threads WITHIN one process, never across the
+    separate processes (concurrent MCP sessions, short-lived CLIs) this
+    lease actually needs to coordinate.
+
+    IMPORTANT SQL NOTE, verified empirically during design (a real bug
+    this exact check caught before it shipped): the WHERE clause MUST use
+    `IS NOT 'regeneration-running'`, never `!= 'regeneration-running'`.
+    In SQL, `NULL != 'x'` evaluates to NULL (not TRUE), so a naive `!=`
+    would leave the WHERE clause false whenever cause is NULL (the
+    ordinary cleared/all-clear state) — meaning the lease could NEVER be
+    acquired again once the flag had ever been cleared. `IS NOT` is
+    NULL-safe and was confirmed correct against exactly this case.
+
+    `null_count` is used only on the INSERT branch (no prior row) — on
+    the UPDATE (conflict) branch it is deliberately left untouched
+    (not part of the SET clause), preserving whatever count the last
+    detection pass recorded; it is purely informational either way and
+    never load-bearing to the mutual-exclusion decision itself.
+    """
+    _ensure_embedding_restore_state_table(conn)
+    _now_ts = _now()
+    _cutoff = _iso_seconds_ago(_REGENERATION_LEASE_STALENESS_SECONDS)
+    cur = conn.execute(
+        "INSERT INTO embedding_restore_state "
+        "(singleton_key, not_fully_restored, null_count, cause, updated_at) "
+        "VALUES (1, 1, ?, 'regeneration-running', ?) "
+        "ON CONFLICT(singleton_key) DO UPDATE SET "
+        "not_fully_restored=1, cause='regeneration-running', "
+        "updated_at=excluded.updated_at "
+        "WHERE embedding_restore_state.cause IS NOT 'regeneration-running' "
+        "   OR embedding_restore_state.updated_at < ?",
+        (null_count, _now_ts, _cutoff),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def _iso_seconds_ago(seconds: int) -> str:
+    """ISO-8601 UTC timestamp `seconds` in the past — same format as _now(),
+    so lexicographic string comparison against a stored updated_at value
+    correctly matches chronological comparison (#3077).
+    """
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+
+
+def _fresh_regeneration_lease_held(conn: sqlite3.Connection) -> bool:
+    """Read-only check: is a FRESH "regeneration-running" lease currently
+    held by some process (#3077 round 2, closing the PR#3078 round-1
+    reviewer-fairy's blocker)?
+
+    The round-1 lease mechanism (_try_acquire_regeneration_lease) was
+    individually correct but NOT actually cross-process exclusive under
+    its own stated primary scenario: `_run_db_one_time_setup`'s
+    detection-site write (`_set_embedding_restore_flag`/
+    `_clear_embedding_restore_flag`, both unconditional) would CLOBBER a
+    fresh lease held by another process the moment a second process's
+    ordinary startup ran detection — letting that second process
+    successfully re-acquire the lease and run a fully redundant
+    concurrent regeneration pass. Reproduced empirically (both by the
+    reviewer-fairy and independently by me, against the real shipped
+    functions) before this fix: no crash, no 10-minute wait required —
+    just ordinary concurrent session startup while a nontrivial backfill
+    is still running on the first session.
+
+    This function is the shared guard used by every writer that
+    STRUCTURALLY NEVER HOLDS THE LEASE ITSELF: the detection site (below)
+    and the manual regen script's own finalize call
+    (tools/engram-regenerate-embeddings.py). Both skip their own write
+    entirely when this returns True — their writes were only ever
+    informational snapshots, never load-bearing, so skipping costs
+    nothing; the in-flight pass's own `_finalize_embedding_restore_flag`
+    call determines the true final state when it completes.
+
+    NEVER call this from `_run_embedding_restore_regeneration`'s own
+    finalize call. That call IS the lease holder finishing its own
+    work — at that point the row legitimately still reads
+    "regeneration-running" (itself) with a fresh `updated_at`, and this
+    function has NO way to distinguish "my own lease" from "someone
+    else's." It is only safe to call from code paths that never hold the
+    lease themselves — using it anywhere else would incorrectly skip a
+    necessary write.
+    """
+    _ensure_embedding_restore_state_table(conn)
+    row = conn.execute(
+        "SELECT cause, updated_at FROM embedding_restore_state WHERE singleton_key = 1"
+    ).fetchone()
+    if not row or row[0] != "regeneration-running":
+        return False
+    _cutoff = _iso_seconds_ago(_REGENERATION_LEASE_STALENESS_SECONDS)
+    return row[1] is not None and row[1] >= _cutoff
+
+
+def _run_embedding_restore_regeneration(db_path: str) -> None:
+    """Background (daemon thread) NULL-only re-embed pass for the
+    restore-completeness flag (#3075 C5 round 2, Borges's design ruling).
+
+    Started by _get_db() AFTER _run_db_one_time_setup returns and
+    _db_setup_lock has been RELEASED — never while holding that lock (the
+    round-1 defect this round fixes: a synchronous re-embed pass inside the
+    lock freezes every other concurrent session's DB access for the pass's
+    full duration). Mirrors server.py's _prewarm_embeddings shape (#276): a
+    daemon thread, never raises past this function, never exits the process
+    (a thread cannot safely crash the process — only a synchronous startup
+    gate on the main thread may exit(1), and this is deliberately NOT that).
+
+    Opens its OWN connection — never the caller's _get_db() connection,
+    which may be closed or reused concurrently on the main thread by the
+    time this thread actually runs.
+
+    #3077: FIRST attempts to acquire the single-flight lease
+    (_try_acquire_regeneration_lease) before doing any work at all. If
+    another process's lease is fresh, this returns IMMEDIATELY — no
+    _reembed_null_nodes call, no embed() calls, the existing lease row is
+    left completely untouched. This is what actually eliminates the
+    redundant-compute cost (#3077's whole point) — a thread still gets
+    spawned per process (cheap), but only the lease-holder does the
+    expensive scan-and-embed work.
+
+    On completion: delegates to _finalize_embedding_restore_flag, which
+    (round 4) decides clear-vs-set from a FRESH, skip-aware state
+    re-count of missing embeddings — never from this pass's own returned
+    counts dict — with a cause determined by re-checking the CURRENT
+    embedder/config state at that point: "embedder-unavailable" if it
+    dropped mid-run, "disabled-by-config" if embeddings were disabled
+    mid-run, "per-node-failures" if it's still available/enabled and
+    individual embed() calls simply failed. See that function's own
+    docstring for the full round 2/3/4 history this line summarizes.
+    Because this always writes a DIFFERENT cause than
+    "regeneration-running" (or clears the flag outright), the lease is
+    inherently self-releasing on completion — no separate release call.
+    """
+    import sys
+    try:
+        conn = sqlite3.connect(db_path, timeout=30.0)
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            _load_vec_extension(conn)
+            if not _try_acquire_regeneration_lease(conn, null_count=-1):
+                return  # another process's pass is already in flight (#3077)
+            _reembed_counts = _reembed_null_nodes(conn)
+            _finalize_embedding_restore_flag(conn, _reembed_counts)
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(
+            f"[engram] async embedding restore-completeness regeneration "
+            f"FAILED: {exc!r} — DB may still have NULL embeddings; the "
+            f"restore-completeness flag stays set from the pre-attempt "
+            f"detection. Run tools/engram-regenerate-embeddings.py once the "
+            f"underlying issue is resolved.",
+            file=sys.stderr,
+        )
 
 
 DEDUP_TOP_K = 15                        # was 5; the dedup-top-k-floor derivation at sim 0.75 to the dedup-near-miss observation was cut by top_k floor, not similarity floor
@@ -6174,6 +7125,69 @@ def _commit_snapshot(
     return result
 
 
+def _acquire_read_mark(
+    conn: sqlite3.Connection, fn_name: str
+) -> "tuple[bool, str, Optional[str]]":
+    """#786 WAL read-mark acquire, shared by the async and sync snapshot paths (#3222).
+
+    Returns ``(held_txn, read_mark, read_mark_error)``:
+      - ``(False, "inherited", None)`` when conn is already in a transaction (no BEGIN
+        is issued; sqlite3's default isolation is non-autocommit, so any uncommitted
+        DML leaves ``in_transaction`` True).
+      - ``(True, "held", None)`` when BEGIN DEFERRED and the sqlite_master read both
+        succeed. A real-page read is what forces a genuine WAL read mark; ``SELECT 1``
+        touches no page and would not.
+      - ``(held, "failed", <error text>)`` when either statement raises, plus one
+        stderr line naming ``fn_name``. ``held`` is True if the BEGIN itself succeeded
+        (the read after it failed), so the caller's release still COMMITs.
+    Never raises. The capture still runs on failure (durability wins).
+    """
+    if conn.in_transaction:
+        return False, "inherited", None
+    held_txn = False
+    try:
+        conn.execute("BEGIN DEFERRED")
+        # Set immediately after BEGIN so the release always fires, even if the
+        # read statement below raises: BEGIN opened a transaction.
+        held_txn = True
+        conn.execute("SELECT count(*) FROM sqlite_master")
+        return held_txn, "held", None
+    except Exception as e:
+        print(
+            f"[engram snapshot] read-mark FAILED ({fn_name}): {e}"
+            " \u2014 capture will run without a consistent WAL view",
+            file=sys.stderr,
+        )
+        return held_txn, "failed", str(e)
+
+
+def _release_read_mark(
+    conn: sqlite3.Connection, held_txn: bool, fn_name: str
+) -> Optional[str]:
+    """Release the read-mark taken by ``_acquire_read_mark`` (#3222).
+
+    No-op (returns None) when ``held_txn`` is False. Otherwise COMMIT; if that raises,
+    print one stderr line naming ``fn_name``, attempt a ROLLBACK, and return the error
+    text (with the ROLLBACK failure appended if that also fails). Never raises.
+    """
+    if not held_txn:
+        return None
+    try:
+        conn.execute("COMMIT")
+        return None
+    except Exception as e:
+        release_error = str(e)
+        print(
+            f"[engram snapshot] read-mark release COMMIT FAILED ({fn_name}): {e}",
+            file=sys.stderr,
+        )
+        try:
+            conn.execute("ROLLBACK")
+        except Exception as e2:
+            release_error += f"; ROLLBACK also failed: {e2}"
+        return release_error
+
+
 def _commit_snapshot_async(
     conn: sqlite3.Connection,
     message: str,
@@ -6192,6 +7206,10 @@ def _commit_snapshot_async(
       5. Durably enqueue + fsync the async commit job; return only after the fsync.
     The worker then regenerates knowledge.sql + graph_snapshot.md from the captured
     immutable snapshot and commits/pushes them (R5: it never touches the live WAL).
+
+    #3222: when this returns None (fallback to sync), its own read-mark outcome
+    (read_mark_error / read_mark_release_error) appears only on stderr; the caller
+    sees the sync path's ``read_mark``.
     """
     global _git_available
 
@@ -6215,26 +7233,25 @@ def _commit_snapshot_async(
     #    the capture sees a consistent committed view (identical discipline to the
     #    sync dump; verified conn.backup() works while this txn is open). Guard: don't
     #    BEGIN if conn already has an open transaction.
-    _held_read_txn = False
-    if not conn.in_transaction:
-        try:
-            conn.execute("BEGIN DEFERRED")
-            _held_read_txn = True
-            conn.execute("SELECT count(*) FROM sqlite_master")
-        except Exception:
-            pass  # best-effort; capture still runs
+    #    #3222: a failure here is NOT silent. The capture still runs (durability
+    #    wins) but the result dict carries read_mark="failed" + read_mark_error and
+    #    stderr gets one line. "inherited" = conn was already in a transaction.
+    _held_read_txn, _read_mark, _read_mark_error = _acquire_read_mark(
+        conn, "_commit_snapshot_async"
+    )
 
     # 2. Per-turn durable binary snapshot (R1/R2) under the read-mark.
-    seq = _sw.next_seq()
-    capture = _sw.write_durable_snapshot(conn, turn, seq)
-
-    # 3a. Release the read-mark before the RESTART checkpoint (RESTART needs all
-    #     WAL readers gone).
-    if _held_read_txn:
-        try:
-            conn.execute("COMMIT")
-        except Exception:
-            pass
+    #    3a. Release the read-mark before the RESTART checkpoint (RESTART needs all
+    #    WAL readers gone). try/finally so an exception from next_seq() /
+    #    write_durable_snapshot() cannot strand the read transaction; it still
+    #    propagates unchanged.
+    try:
+        seq = _sw.next_seq()
+        capture = _sw.write_durable_snapshot(conn, turn, seq)
+    finally:
+        _read_mark_release_error = _release_read_mark(
+            conn, _held_read_txn, "_commit_snapshot_async"
+        )
 
     # If the sync capture failed, we have NOT secured this turn — fall back to sync
     # so durability is not silently dropped.
@@ -6282,7 +7299,12 @@ def _commit_snapshot_async(
         "db_backup": _db_backup_result,
         "git_gc": _git_gc_result,
         "snapshot_lag": _sw.compute_snapshot_lag(),
+        "read_mark": _read_mark,
     }
+    if _read_mark_error is not None:
+        result["read_mark_error"] = _read_mark_error
+    if _read_mark_release_error is not None:
+        result["read_mark_release_error"] = _read_mark_release_error
     if wal_warning:
         result["wal_warning"] = wal_warning
     return result
@@ -6418,17 +7440,13 @@ def _commit_snapshot_sync(
     # Guard: don't issue BEGIN if conn already has an open transaction
     # (sqlite3 default isolation_level is non-autocommit — implicit BEGIN fires
     # on first DML, so in_transaction is True after any uncommitted write).
-    _held_read_txn = False
-    if not conn.in_transaction:
-        try:
-            conn.execute("BEGIN DEFERRED")
-            # Set immediately after BEGIN so the finally-COMMIT always fires,
-            # even if the read statement below raises.  BEGIN opened a
-            # transaction; cleanup must be airtight regardless of what follows.
-            _held_read_txn = True
-            conn.execute("SELECT count(*) FROM sqlite_master")
-        except Exception:
-            pass  # best-effort; the dump still runs; #786 race window stays small
+    # #3222: a failure here is NOT silent. The dump still runs (durability wins)
+    # but every returned dict carries read_mark="failed" + read_mark_error and
+    # stderr gets one line.  "inherited" = conn was already in a transaction.
+    _read_mark_release_error = None
+    _held_read_txn, _read_mark, _read_mark_error = _acquire_read_mark(
+        conn, "_commit_snapshot_sync"
+    )
 
     try:
         import engram_backup  # local import: server.py's dir is on sys.path; dodges import-order
@@ -6444,11 +7462,9 @@ def _commit_snapshot_sync(
         # Release the WAL read mark before the RESTART checkpoint below.
         # RESTART needs all WAL readers gone; holding the mark past this point
         # would silently downgrade RESTART to a partial checkpoint.
-        if _held_read_txn:
-            try:
-                conn.execute("COMMIT")
-            except Exception:
-                pass
+        _read_mark_release_error = _release_read_mark(
+            conn, _held_read_txn, "_commit_snapshot_sync"
+        )
 
     # 2b. Binary backup: timestamped hot-copy of knowledge.db for fast point-in-time
     #     restore without re-running the full pipeline.  Best-effort (#1142): never
@@ -6496,6 +7512,12 @@ def _commit_snapshot_sync(
         _dump_fields["sql_dump_error"] = _dump_error
     _dump_fields["db_backup"] = _db_backup_result
     _dump_fields["git_gc"] = _git_gc_result
+    # #3222: read-mark outcome rides on every return path after this point.
+    _dump_fields["read_mark"] = _read_mark
+    if _read_mark_error is not None:
+        _dump_fields["read_mark_error"] = _read_mark_error
+    if _read_mark_release_error is not None:
+        _dump_fields["read_mark_release_error"] = _read_mark_release_error
 
     # 3. Stage explicit files only (never `git add .` — would pull in backups,
     #    daemon sockets, etc.)
@@ -7738,6 +8760,7 @@ REASONING_STRUCTURE = {
     "deductive_hypothetical_syllogism": {"min_premises": 2, "max_premises": None, "multi_source": False},
     "deductive_disjunctive": {"min_premises": 2, "max_premises": None, "multi_source": False},
     "deductive_reductio": {"min_premises": 1, "max_premises": None, "multi_source": False},
+    "deductive_conjunction": {"min_premises": 2, "max_premises": None, "multi_source": False},
     "inductive_generalization": {"min_premises": 2, "max_premises": None, "multi_source": True},
     "inductive_enumeration": {"min_premises": 2, "max_premises": None, "multi_source": False},
     "inductive_statistical": {"min_premises": 1, "max_premises": 2, "multi_source": False},
@@ -7898,7 +8921,23 @@ def _classify_pending_markers(conn: sqlite3.Connection, node_id: str) -> tuple:
 # for Borges that 200 vs 280 IS deliberate). Target: agents should aim for
 # ≤140 chars; soft-accept (needs_tightening=1) up to 279; hard-reject at
 # 280+.
-RECALL_SUMMARY_TARGET = 140
+#
+# RECALL_SUMMARY_TARGET now LIVES in tools/recall_summary_validator.py
+# (#2736 defect 2 — "140" had drifted into 8 sites as an unruled "≤120").
+# Imported here rather than redefined: the dependency direction is
+# core -> tools ON PURPOSE, because tools/ is DB-free and embeddings-free
+# and cannot import engram_core (would create a cycle), so the constant has
+# to live on the side both the heavy runtime and the lightweight tools can
+# reach. Do not move it back into core.
+# Inherited constraint (#2565 tools-package name clash): importing engram_core
+# now imports `tools`, binding it in sys.modules to whichever `tools` package is
+# first on sys.path. Standalone scripts that put src/engram first (e.g.
+# tools/anchoring_report.py, tools/surgical.py) therefore bind the runtime's
+# tools/, and a LATER `import tools.engine` (repo-root dev tooling) in the same
+# process fails. Nothing does that today; the pytest suite puts the repo root
+# first and is guarded by conftest.py's #2565 check, and the installed plugin
+# has only one `tools` package.
+from tools.recall_summary_validator import RECALL_SUMMARY_TARGET  # noqa: E402
 RECALL_SUMMARY_HARD_REJECT_AT = 280
 
 # Write-time recall_keywords bounds (#1952 PR1) — distinct from the older
@@ -8425,8 +9464,8 @@ def _trace_observation_leaves(
     SAME one by construction: a node's evidential lineage is exactly its
     cascade ancestry, so "premise" should derive from ``cascade``, not merely
     coincide with it. ``supported_by`` drops out of the walked set as a
-    consequence (``CASCADE_RELATIONS`` is now the strict subset
-    ``{derives_from}``) — behavior-preserving today, though the reason is
+    consequence (``CASCADE_RELATIONS`` no longer contains it — see that constant
+    for the current members) — behavior-preserving today, though the reason is
     about the edge's SOURCE, not its target (reviewer-fairy catch, PR #2329:
     an earlier draft of this note wrongly reasoned from the target side).
     Every ``supported_by`` edge is minted with a cornerstone or lesson as its

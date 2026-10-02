@@ -494,6 +494,148 @@ def _migrate_replay_runs(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# ---------------------------------------------------------------------------
+# Module-layout prefix normalization (engram-alpha#3122)
+# ---------------------------------------------------------------------------
+#
+# health/engine.py's _metric_def_to_dict/_aspect_def_to_dict serialize a
+# metric/aspect's signal_fn/scoring_fn as f"{fn.__module__}.
+# {fn.__qualname__}", and fn.__module__ depends on how the `health` package
+# was imported: `engram.health.metrics` from the `src/`-tree layout,
+# `health.metrics` in the deployed plugin (the build flattens
+# `src/engram/` away). Two `declarations` rows can therefore carry either
+# form for the SAME function -- a layout artifact, never a real declared
+# disagreement (borges-funes's diagnosis, issue #3122 comment,
+# 2026-09-26). Both the D4.1 ingest-time comparison (in `ingest()`, below)
+# and the one-time store-healing migration (`_migrate_declarations_
+# prefix_heal`, this store's SIXTH schema migration, wired into
+# `open_store()`) canonicalize through the same JSON round-trip: parse ->
+# recursively rewrite any string via `health.version.canonical_health_
+# dotted` (the ONE shared implementation of the prefix-strip rule,
+# engram-alpha#3122 round 2 should-fix 1 -- this module used to carry its
+# own copy of the prefix constants, as did `health/engine.py`'s
+# `_dotted_name`) -> re-serialize via `_canonical_json` (defined further
+# down this module -- a forward reference, resolved only when these
+# functions are actually CALLED, by which point the whole module has
+# finished importing).
+
+
+def _normalize_layout_prefix(value):
+    """Recursively rewrite any string value carrying the source-tree
+    module prefix ``"engram.health."`` (or the bare module name
+    ``"engram.health"``) to the deployed-layout form, via
+    ``health_version.canonical_health_dotted``. A pure structural walk
+    over dict/list/other -- the leaf-string transformation itself is
+    delegated to the shared function, so only a string matching the
+    prefix AT POSITION 0 (or the bare-module edge case) is rewritten; a
+    value that merely CONTAINS ``"engram.health."`` mid-string (never
+    actually produced by ``engine.py``'s dotted names, but not assumed
+    here) is left untouched."""
+    if isinstance(value, str):
+        return health_version.canonical_health_dotted(value)
+    if isinstance(value, list):
+        return [_normalize_layout_prefix(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _normalize_layout_prefix(v) for k, v in value.items()}
+    return value
+
+
+def _canonicalize_declared_blob(blob_json):
+    """Parse a stored/incoming declared blob's canonical-JSON string,
+    recursively normalize any ``engram.health.`` prefix via
+    ``_normalize_layout_prefix``, and re-serialize via ``_canonical_json``
+    -- the SAME canonical-JSON convention this module already uses for
+    these blobs. ``None``/the JSON string ``"null"`` pass through
+    unchanged -- the D4.1 gate's own absence handling (in ``ingest()``)
+    runs BEFORE this is ever called on a genuine two-sided comparison, so
+    by the time this function is invoked to settle a real disagreement
+    check, both sides are already known non-absent; the pass-through here
+    is only for callers (the healing migration, below) that may hand it a
+    raw column value without checking absence first."""
+    if blob_json is None or blob_json == "null":
+        return blob_json
+    parsed = json.loads(blob_json)
+    normalized = _normalize_layout_prefix(parsed)
+    return _canonical_json(normalized)
+
+
+def _declarations_needs_prefix_heal(conn: sqlite3.Connection) -> bool:
+    """``True`` iff any ``declarations`` row's four blob columns
+    (signal_defs/curve_defs/config/model_defs) still carry the literal
+    substring ``"engram.health."`` (this store's SIXTH schema migration).
+    A row seeded by a manual ``derive``/``ingest`` run from a `src/`-tree
+    checkout wrote this prefix into its declared signal_fn/scoring_fn
+    names; every snapshot file on disk uses the deployed-layout
+    ``"health."`` form instead (engram-alpha#3122). Only non-null columns
+    are scanned -- a genuine SQL NULL can never contain the substring, and
+    ``LIKE`` against a NULL column is NULL (falsy), never a match, so the
+    explicit ``IS NOT NULL`` guards are belt-and-suspenders, not strictly
+    required -- kept for readability."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM declarations WHERE "
+        "(signal_defs IS NOT NULL AND signal_defs LIKE '%engram.health.%') OR "
+        "(curve_defs IS NOT NULL AND curve_defs LIKE '%engram.health.%') OR "
+        "(config IS NOT NULL AND config LIKE '%engram.health.%') OR "
+        "(model_defs IS NOT NULL AND model_defs LIKE '%engram.health.%')"
+    ).fetchone()
+    return row["c"] > 0
+
+
+def _migrate_declarations_prefix_heal(conn: sqlite3.Connection) -> None:
+    """Rewrite every stored ``declarations`` row's four blob columns
+    through ``_canonicalize_declared_blob`` -- the same JSON-round-trip
+    layout-prefix normalization ``ingest``'s D4.1 comparison now applies at
+    comparison time -- and ``UPDATE`` any row whose healed content differs
+    from what is currently stored.
+
+    Safe under the never-mutate rule (module docstring) the same way
+    migrations (1)/(5) above are: ROW IDENTITY (``health_version``, the
+    primary key) is untouched, and no row is added or removed. Unlike
+    migrations (1)-(5), this one DOES rewrite existing BLOB CONTENT rather
+    than only schema (columns/constraints) -- but the content being
+    rewritten was never a genuine declaration to begin with: it is a
+    source-tree import-layout ARTIFACT of the producer bug this PR fixes
+    (borges-funes's diagnosis, engram-alpha#3122), not a real
+    signal_defs/curve_defs/config/model_defs value anyone declared on
+    purpose. Healing it in place retires that artifact; it does not mutate
+    a genuine declaration, because the healed and un-healed forms declare
+    the identical function under the identical health_version -- the D4.1
+    gate (immediately below, in ``ingest()``) already treats them as
+    agreeing for exactly this reason.
+
+    Prints one ``health.series:`` stderr line per healed
+    ``(health_version, blob_name)`` pair (engram-alpha#3122 round 2
+    should-fix 2) -- a check that used to reject this content now silently
+    accepts it, and a silent acceptance of something that used to be
+    rejected should leave a mark."""
+    rows = conn.execute(
+        "SELECT health_version, signal_defs, curve_defs, config, model_defs "
+        "FROM declarations"
+    ).fetchall()
+    for row in rows:
+        updates: dict[str, str] = {}
+        for blob_name in ("signal_defs", "curve_defs", "config", "model_defs"):
+            raw = row[blob_name]
+            if raw is None:
+                continue
+            healed = _canonicalize_declared_blob(raw)
+            if healed != raw:
+                updates[blob_name] = healed
+                print(
+                    f"health.series: healed layout-prefix artifact in "
+                    f"declarations health_version={row['health_version']!r} "
+                    f"blob={blob_name!r} (migration 6, engram-alpha#3122)",
+                    file=sys.stderr,
+                )
+        if updates:
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
+            conn.execute(
+                f"UPDATE declarations SET {set_clause} WHERE health_version = ?",
+                (*updates.values(), row["health_version"]),
+            )
+    conn.commit()
+
+
 def open_store(db_path: str | Path) -> sqlite3.Connection:
     """Open (creating if needed) the series store at ``db_path``, with all
     tables created idempotently. Plain rollback journal -- WAL is NOT
@@ -504,7 +646,7 @@ def open_store(db_path: str | Path) -> sqlite3.Connection:
     it was created with -- a schema-level change (widening ``unresolved_
     snapshots.reason`` to add ``commit_already_keyed``; adding ``equality_
     checks.replay_decl_hash``) does not reach an existing store on its own.
-    These are the store's five schema migrations, run in order after
+    These are the store's SIX schema migrations, run in order after
     creating tables: (1) detect the old ``unresolved_snapshots`` CHECK
     (``PRAGMA table_info`` doesn't expose CHECKs, so the literal is read off
     ``sqlite_master.sql``) and, if found, recreate the table preserving its
@@ -521,11 +663,21 @@ def open_store(db_path: str | Path) -> sqlite3.Connection:
     COLUMN`` it in place (nullable, D4.1); (5) (PR C1) detect the old
     ``replay_runs`` CHECK (missing the ``'derive'`` reason) and, if found,
     recreate the table preserving its rows (same rename-recreate-reinsert
-    shape as migration (1), since SQLite cannot alter a CHECK in place).
-    All five are safe specifically because every migrated table is DERIVED
-    state -- ``rebuild``/``derive``/``verify`` reconstruct or re-populate
-    each of them -- so migrating any of them in place never risks a source
-    of truth."""
+    shape as migration (1), since SQLite cannot alter a CHECK in place);
+    (6) (engram-alpha#3122) detect a ``declarations`` row whose blob
+    columns still carry the literal substring ``"engram.health."`` (a
+    source-tree import-layout artifact a manual ``derive``/``ingest`` run
+    wrote into a declared signal_fn/scoring_fn name) and, if found, rewrite
+    every stored row's blobs through the same JSON-round-trip
+    layout-prefix normalization the D4.1 gate itself now applies at
+    comparison time (see ``_canonicalize_declared_blob``/
+    ``_migrate_declarations_prefix_heal``, above). Migrations (1)-(5) are
+    safe because every migrated table is DERIVED state -- ``rebuild``/
+    ``derive``/``verify`` reconstruct or re-populate each of them -- so
+    migrating any of them in place never risks a source of truth;
+    migration (6) is additionally safe because the content it rewrites was
+    never a genuine declaration to begin with -- see that migration's own
+    docstring."""
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=DELETE")
@@ -541,6 +693,8 @@ def open_store(db_path: str | Path) -> sqlite3.Connection:
         _migrate_declarations_model_defs(conn)
     if _replay_runs_needs_migration(conn):
         _migrate_replay_runs(conn)
+    if _declarations_needs_prefix_heal(conn):
+        _migrate_declarations_prefix_heal(conn)
     return conn
 
 
@@ -1125,6 +1279,7 @@ def ingest(
             "unreadable": [],
             "collisions": [],
             "declaration_fills": [],
+            "layout_prefix_normalized": [],
         }
 
         # Track which files were actually parsed, so unreadable ones are
@@ -1216,9 +1371,41 @@ def ingest(
                         continue
                     if (not old_absent) and new_absent:
                         continue
-                    if old_val != new_val:
+                    # (engram-alpha#3122) canonicalize BOTH sides through
+                    # the same source-tree/deployed-layout module-prefix
+                    # normalization before the byte-for-byte comparison --
+                    # a stored declaration seeded from a `src/`-layout
+                    # checkout (`engram.health.metrics.x`-shaped
+                    # signal_fn/scoring_fn names) must not be flagged as
+                    # disagreeing with a snapshot using the deployed-layout
+                    # equivalent (`health.metrics.x`) for the SAME
+                    # function -- that is an import-layout artifact, never
+                    # a real declared disagreement. A genuine value
+                    # difference (e.g. a real weight/threshold change)
+                    # still differs after normalization and still raises.
+                    # By the time this line runs, `open_store()` has
+                    # already run migration 6, so the STORED side here is
+                    # already canonical -- what this comparison-time
+                    # normalization actually guards against is the
+                    # INCOMING side: a snapshot file freshly written by a
+                    # process running from a `src/`-layout checkout (round
+                    # 2 nit, engram-alpha#3122).
+                    canon_old = _canonicalize_declared_blob(old_val)
+                    canon_new = _canonicalize_declared_blob(new_val)
+                    if canon_old != canon_new:
                         first_diff = blob_name
                         break
+                    if old_val != new_val:
+                        # Raw values differ but canonicalized values agree
+                        # -- exactly the layout-prefix-only case #3122
+                        # describes, not a genuine agreement. Recorded
+                        # (round 2 should-fix 2) so a gate that now
+                        # silently accepts what it used to reject leaves a
+                        # visible trace, same shape as `declaration_fills`
+                        # above.
+                        detail["layout_prefix_normalized"].append(
+                            {"health_version": hv, "blob": blob_name, "file": f.name}
+                        )
                 if first_diff is not None:
                     raise SeriesIntegrityError(
                         f"declarations gate: health_version {hv!r} already has a "

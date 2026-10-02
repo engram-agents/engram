@@ -43,6 +43,34 @@
 #     engaged window (default 360s), skip the emit cycle entirely AND do not
 #     advance the cursor — events accumulate in (cursor, as_of] and emit once the
 #     window expires.
+#   - unreachable-vs-quiet is EDGE-TRIGGERED, not per-cycle (#3062): a forum
+#     outage and a quiet-but-reachable forum used to be byte-identical at this
+#     script's output (none) — the expiry notice reads "no events delivered"
+#     either way, and there is no way to tell a 7h blackout from a calm night.
+#     Fix mirrors umwelt-bell.py's post-umwelt#637 _ARMED_REACHABLE pattern:
+#     print exactly once on the transition INTO forum-unreachable and once on
+#     the transition back OUT, never once per failed poll. Level-triggered (a
+#     line every cycle) was considered and rejected in that precedent for the
+#     same reason it would be wrong here — at this script's 30s poll interval
+#     an 8h outage is ~960 lines, which destroys the very signal it exists to
+#     give. This does NOT touch cursor handling — see the never-advance-cursor
+#     bullet above; the two are orthogonal.
+#     The SEED loop announces on the same edge (#3067), because the poll-loop
+#     announce above sits BELOW a seed that blocks until the first poll that
+#     hands back a usable watermark — so a monitor armed while the forum is
+#     down never reached it and stayed completely mute, which is the case the
+#     announce is most needed in (seats arm at session start, and session start
+#     follows a reboot / redeploy / overnight shutdown). One line on the first
+#     failed seed attempt ("not yet seeded"), one when the seed finally
+#     succeeds, nothing at all when the first attempt succeeds, and nothing YET
+#     while the user is engaged — deferred, not swallowed: the latch stays clear
+#     so the next retry past the engaged window announces once. The seed says it
+#     cannot SEED rather than that the forum is "unreachable", because its
+#     failure predicate is broader than the poll loop's: it also covers a
+#     reachable 200 with no usable watermark. The seed's retry and
+#     usable-watermark predicate are unchanged: blocking until a usable
+#     watermark is CORRECT (#2225) — the defect was that the waiting was
+#     silent, not that it waited.
 
 set -u
 # NOT -e: a transient failure must not kill a session-length watch.
@@ -335,6 +363,46 @@ print(v)'
 # exercise the seed retry below without a 30s wall-clock wait.
 POLL_SECONDS="${FORUM_UPDATES_POLL_SECONDS:-30}"
 
+# Path to the last-user-activity stamp (written by the time-bar hook on each
+# genuine human-typed prompt) — same engaged-detection source as the
+# mention-monitor / _status_derive._recently_engaged(). Declared ABOVE the seed
+# (it used to sit between the seed and the poll loop) because the seed's
+# announce consults it too — see _engaged() below.
+LAST_USER_ACTIVITY="$HOME/.engram/last-user-activity"
+_ENGAGED_WINDOW=360  # matches _status_derive._DEFAULT_ENGAGED_WINDOW
+
+# True (exit 0) while the user is actively conversing. No stamp file means
+# never engaged; $_age is recomputed from the stamp on every call so a window
+# that expires mid-wait is seen; the `-ge 0` half rejects a FUTURE stamp (a
+# clock skew or a hand-edited file would otherwise make $_age negative, which
+# `-le $_ENGAGED_WINDOW` would read as engaged forever).
+#
+# A MALFORMED stamp must fail towards "not engaged" — i.e. announce — because
+# this predicate now gates the seed's arm-time warning, and the whole point of
+# that warning is that a monitor which cannot report is worse than a noisy one.
+# Getting there needs the validation below rather than the `|| _age=999999`
+# fallback the poll loop still carries, which cannot fire: under `set -u` a
+# non-numeric stamp makes the arithmetic expansion itself fail, so `_age` is
+# never assigned at all. Measured on #3111 — a stamp reading `garbage` gives
+# `unbound variable`, rc=1, and the monitor EXITS, silently and permanently;
+# a float or a `0999` aborts the enclosing `if` instead, so the announce is
+# skipped and the monitor goes on waiting in exactly the silence #3067 fixed.
+# Validating first makes the arithmetic total: the `case` rejects anything that
+# is not all-digits (empty, float, whitespace, `garbage`) and `10#` forces base
+# 10 so a zero-padded stamp cannot trip "value too great for base".
+#
+# The poll loop below keeps its own inline copy unchanged (#3062's code is
+# deliberately untouched here, and its reachability is not what changed) — if
+# either is ever changed, change both. Unifying the two is the follow-up.
+_engaged() {
+    [ -f "$LAST_USER_ACTIVITY" ] || return 1
+    local _stamp _age
+    _stamp="$(cat "$LAST_USER_ACTIVITY" 2>/dev/null || echo 0)"
+    case "$_stamp" in ''|*[!0-9]*) _stamp=0 ;; esac
+    _age=$(( $(date +%s) - 10#$_stamp ))
+    [ "$_age" -ge 0 ] && [ "$_age" -le "$_ENGAGED_WINDOW" ]
+}
+
 # ---------------------------------------------------------------------------
 # seed — retry until the first poll that SUCCEEDS and hands back a USABLE
 # WATERMARK; that watermark is the baseline, so arming does NOT replay history.
@@ -356,21 +424,76 @@ POLL_SECONDS="${FORUM_UPDATES_POLL_SECONDS:-30}"
 # caller. A watermark of 0 that the feed actually SERVED is still accepted —
 # see as_of() above; a fresh forum's as_of: 0 is a real baseline, not an
 # absence.
+#
+# The WAITING is announced, edge-triggered (#3067). #3062's announce lives in
+# the poll loop below, which an arm-time outage never reaches: the seed blocks
+# here until the first good poll, so a monitor armed while the forum was down
+# emitted nothing at all — byte-identical, on every surface an agent reads, to
+# a healthy monitor on a quiet channel. Arming during an outage is the routine
+# case, not the rare one (a seat arms its monitors at session start, and
+# session start is what follows a reboot / redeploy / overnight shutdown).
+# Same edge discipline as the poll loop, for the same reason: exactly one line
+# on the FIRST failed attempt, exactly one when the seed finally succeeds,
+# NEVER one per attempt — the retry sleeps on $POLL_SECONDS too, so a
+# level-triggered seed is the same ~960-lines-per-8h-outage flood umwelt#637
+# rejected. $_SEED_ANNOUNCED is what keeps the healthy path silent: when the
+# first attempt succeeds (the normal case) neither line is printed.
+# This changes only the OUTPUT — the retry and the usable-watermark predicate
+# are untouched.
+#
+# The WORDING deliberately diverges from the poll loop's "forum unreachable".
+# The two sites know different things. The poll loop's announce sits inside the
+# curl-failure branch, so "unreachable" is precisely what it observed. The
+# seed's failure predicate is BROADER: it fails on a curl failure AND on a
+# reachable HTTP 200 whose body does not parse or carries no usable watermark
+# (see the as_of() discussion above — that is not a hypothetical, it is exactly
+# what #2225 and the malformed-200 suite are about). Calling that "unreachable"
+# would be false. What the seed actually knows is that it cannot establish a
+# baseline, which is both true in every case and the thing an operator needs to
+# hear. The success line says "seeded" rather than "reachable AGAIN" for the
+# same reason: on this path the forum was never reachable in the first place.
+#
+# ENGAGED-WINDOW handling, mirroring the poll loop (#3067): while the user is
+# actively conversing, do not emit — and, critically, DO NOT SET THE LATCH.
+# The poll loop's documented semantics are defer-not-swallow (skip the emit
+# cycle, emit once the window expires); latching a suppressed announce here
+# would swallow it FOREVER, because nothing re-offers it: the seed would go on
+# retrying in silence and the operator would never learn the monitor is
+# unseeded — the exact defect #3067 exists to fix, reintroduced through the
+# suppression path. Leaving $_SEED_ANNOUNCED clear means the next retry past
+# the engaged window announces exactly once.
+# The SUCCESS line is deliberately NOT engaged-suppressed, and the asymmetry is
+# forced rather than chosen: the failure announce has a retry that re-offers it,
+# so deferral costs nothing, while the success line fires on the iteration that
+# breaks out of the loop. Deferring it would mean either delaying the seed (a
+# change to the retry semantics, which must not change) or latching a
+# suppressed line (swallowed forever, above). It also only ever CLOSES a
+# warning the operator has already received.
 # ---------------------------------------------------------------------------
+_SEED_ANNOUNCED=0
 while true; do
-    if RESP="$(curl -s --fail "$URL_BASE&since=0" 2>/dev/null)" \
+    if RESP="$(curl -s --fail --max-time 60 "$URL_BASE&since=0" 2>/dev/null)" \
        && _seed="$(printf '%s' "$RESP" | as_of)"; then
         printf '%s\n' "$_seed" > "$CURSOR"
+        if [ "$_SEED_ANNOUNCED" = 1 ]; then
+            echo "forum-updates-monitor.sh: seeded from the forum — now receiving"
+        fi
         break
+    fi
+    # Note the latch is set INSIDE the not-engaged branch, never beside it:
+    # see the defer-not-swallow paragraph above.
+    if [ "$_SEED_ANNOUNCED" = 0 ] && ! _engaged; then
+        echo "⚠️  forum-updates-monitor.sh: armed, but cannot seed from the forum — not yet seeded and not receiving; will report when it can"
+        _SEED_ANNOUNCED=1
     fi
     sleep "$POLL_SECONDS"
 done
 
-# Path to the last-user-activity stamp (written by the time-bar hook on each
-# genuine human-typed prompt) — same engaged-detection source as the
-# mention-monitor / _status_derive._recently_engaged().
-LAST_USER_ACTIVITY="$HOME/.engram/last-user-activity"
-_ENGAGED_WINDOW=360  # matches _status_derive._DEFAULT_ENGAGED_WINDOW
+# Edge-triggered reachability state for the unreachable-vs-quiet announce
+# (#3062 — see the discipline-notes bullet above). Seeded reachable: the seed
+# loop just above only exits once a poll has actually succeeded, so the poll
+# loop below always starts in the reachable state.
+_FORUM_REACHABLE=1
 
 # ---------------------------------------------------------------------------
 # poll loop
@@ -390,7 +513,28 @@ while true; do
     _cur="$(cat "$CURSOR" 2>/dev/null || echo 0)"
     # Forum unreachable -> curl --fail returns non-zero -> skip the cycle and
     # PRESERVE the cursor (never advance past an un-emitted window).
-    RESP="$(curl -s --fail "$URL_BASE&since=$_cur" 2>/dev/null)" || continue
+    # --max-time 60 (#2007): a hung request (e.g. a slow board-adjacent
+    # handler on the same server) must not block this loop indefinitely --
+    # 60s comfortably covers a healthy poll (including a transient slowdown)
+    # while still bounding a truly-hung request. A --fail --max-time timeout
+    # already returns non-zero exactly like any other curl failure, so the
+    # existing `|| continue` here (and the seed retry above) already handles
+    # it correctly -- no other logic change needed.
+    #
+    # #3062: the `continue` itself is unchanged (cursor still preserved,
+    # exactly as before) — only the EDGE is now announced, once on entry and
+    # once on recovery, via $_FORUM_REACHABLE (declared above the loop).
+    if ! RESP="$(curl -s --fail --max-time 60 "$URL_BASE&since=$_cur" 2>/dev/null)"; then
+        if [ "$_FORUM_REACHABLE" = 1 ]; then
+            echo "⚠️  forum-updates-monitor.sh: forum unreachable — still armed, not receiving; will report when it returns"
+            _FORUM_REACHABLE=0
+        fi
+        continue
+    fi
+    if [ "$_FORUM_REACHABLE" = 0 ]; then
+        echo "forum-updates-monitor.sh: forum reachable again — receiving resumed"
+        _FORUM_REACHABLE=1
+    fi
     printf '%s' "$RESP" | emit
     # Advance the cursor only when this poll actually handed back a watermark.
     # `$( )` swallows the command's status into the assignment, so the status

@@ -282,18 +282,101 @@ def _index_file(
     unprojected_counts: dict = {}
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for lineno, raw_line in enumerate(f, 1):
-            raw_line = raw_line.strip()
-            if not raw_line:
-                continue
-            try:
-                event = json.loads(raw_line)
-            except json.JSONDecodeError as exc:
-                _warn_once(
-                    str(jsonl_path),
-                    lineno,
-                    f"[engram-indexer] malformed JSON in {jsonl_path}:{lineno}: {exc}; skipping",
-                )
-                continue
+            if not raw_line.endswith("\n"):
+                # Incomplete tail (alpha #2801, review regression fix in
+                # PR #3161): iterating a text-mode file yields every
+                # completed line WITH its trailing "\n" -- only the file's
+                # current final line can lack one, and only when the file
+                # doesn't end in a newline. That is the signature of an
+                # append that hasn't finished landing -- a bare partial
+                # write, a run of NUL bytes an unclean shutdown left behind
+                # for a reserved-but-never-flushed append -- but it is ALSO
+                # exactly the signature of a writer that crashed after a
+                # complete record was already flushed and only the
+                # trailing "\n" was lost: the emitter's write is a single
+                # call, `f.write(line + "\n")` (engram_log_emitter.py
+                # ~line 226), so a missing "\n" here is one buffered write
+                # landing partially or being cut by a crash, never the
+                # JSON and the newline being two separate writes -- and a
+                # torn write of that single call can lose just its last
+                # byte (the "\n") as easily as it can lose everything after
+                # some earlier point.
+                #
+                # So before treating this as still in-flight and stopping
+                # silently, check whether it is ALREADY a complete,
+                # parseable record: strip whitespace and any NUL padding
+                # (the same unflushed-append signature as a terminated NUL
+                # run, below) and attempt json.loads. This is safe because
+                # a torn PARTIAL write cannot parse as a complete JSON
+                # object -- only a write that fully landed, minus its
+                # trailing newline, can -- and if the "\n" arrives later on
+                # a future tick, the ts high-water mark skips the re-read,
+                # with INSERT OR IGNORE on the uuid PRIMARY KEY as the
+                # second safety net.
+                candidate = raw_line.strip().strip("\x00")
+                try:
+                    event = json.loads(candidate)
+                except json.JSONDecodeError:
+                    # Genuinely incomplete (partial JSON, NUL-only padding,
+                    # or nothing at all) -- not a record yet. Stop here
+                    # silently: the next tick either sees a completed
+                    # record (parsed normally, below) or the same
+                    # still-incomplete tail (silently skipped again) --
+                    # never warn, since nothing has actually gone wrong yet.
+                    break
+                if not isinstance(event, dict) or event.get("ts") is None:
+                    # Parses, but not something the normal path below would
+                    # accept (a bare scalar/array, or a dict missing "ts").
+                    # Treat the same as genuinely incomplete rather than
+                    # warn -- an unterminated line is still ambiguous about
+                    # whether the writer is mid-append, and the ordinary
+                    # non-object/missing-ts warnings further down are keyed
+                    # to a TERMINATED line, whose shape is already final.
+                    break
+                # A recovered complete record: fall through to the exact
+                # same insert path a terminated line takes (the
+                # already-indexed high-water-mark check below), no NUL-run
+                # warning even if NULs were stripped -- unlike a terminated
+                # NUL run, a missing trailing "\n" alone is not itself
+                # evidence of the crash-induced unflushed-append pattern
+                # that warning names.
+            else:
+                # NUL bytes are NOT stripped by str.strip() (Ariadne + Borges,
+                # alpha #2785/#2801) -- a NUL run that reaches this point IS
+                # terminated (the branch above didn't fire), so it isn't an
+                # in-flight write; it's the unflushed-append signature an ext4
+                # unclean shutdown leaves behind, i.e. real data loss. Strip
+                # leading/trailing NULs (a NUL-PREFIXED record still deserves
+                # indexing) before the blank check and before parsing, and warn
+                # once per line whenever any were found -- named as a NUL run,
+                # never as "malformed JSON". A NUL byte in the MIDDLE of
+                # otherwise-JSON text is left alone here and falls through to
+                # the ordinary malformed-JSON path below; this is not a repair
+                # attempt, only a strip of the unflushed-append padding at the
+                # edges.
+                raw_line = raw_line.strip()
+                de_nulled = raw_line.strip("\x00")
+                if len(de_nulled) != len(raw_line):
+                    nul_count = len(raw_line) - len(de_nulled)
+                    _warn_once(
+                        str(jsonl_path),
+                        lineno,
+                        f"[engram-indexer] NUL run ({nul_count} bytes) in "
+                        f"{jsonl_path}:{lineno}: unflushed append -- possible "
+                        f"data loss; skipping NULs",
+                    )
+                raw_line = de_nulled
+                if not raw_line:
+                    continue
+                try:
+                    event = json.loads(raw_line)
+                except json.JSONDecodeError as exc:
+                    _warn_once(
+                        str(jsonl_path),
+                        lineno,
+                        f"[engram-indexer] malformed JSON in {jsonl_path}:{lineno}: {exc}; skipping",
+                    )
+                    continue
 
             # Valid JSON but not a JSON object (e.g. bare string, integer,
             # array) — the emitter only produces dict events, but externally-

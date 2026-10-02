@@ -1,0 +1,69 @@
+{
+  "degraded_threshold": 0.5,
+  "schema": 1,
+  "sites": {
+    "deference-detector-prompt.hook_fire": [
+      "hooks/claude/engram-deference-detector-prompt.py:main"
+    ],
+    "deference-detector-stop.hook_fire": [
+      "hooks/claude/engram-deference-detector-stop.py:main"
+    ],
+    "loop-arm-stop-hook.hook_fire": [
+      "hooks/claude/engram-loop-arm-stop-hook.py:main"
+    ],
+    "postcompact-hook.hook_fire": [
+      "hooks/claude/engram-postcompact-hook.py:main"
+    ],
+    "server.engram_add_observation": [
+      "server.py:engram_add_observation",
+      "server.py:engram_add_observation_batch"
+    ],
+    "server.engram_add_observation_batch": [
+      "server.py:engram_add_observation_batch"
+    ],
+    "server.engram_contradict": [
+      "server.py:engram_contradict"
+    ],
+    "server.engram_derive.blocked": [
+      "server.py:engram_derive"
+    ],
+    "server.engram_derive.created": [
+      "server.py:engram_derive"
+    ],
+    "server.engram_query": [
+      "server.py:engram_query"
+    ],
+    "server.engram_query_pattern": [
+      "server.py:engram_query_pattern"
+    ],
+    "server.engram_retract": [
+      "server.py:engram_cascade_resolve",
+      "server.py:engram_retract"
+    ],
+    "server.engram_supersede": [
+      "server.py:engram_cascade_resolve",
+      "server.py:engram_supersede"
+    ],
+    "session-start-hook.hook_fire": [
+      "hooks/claude/engram-session-start-hook.py:main"
+    ],
+    "stop-hook.hook_fire": [
+      "hooks/claude/engram-stop-hook.py:main"
+    ],
+    "surface-hook.render_size": [
+      "hooks/claude/engram-surface-hook.py:main"
+    ],
+    "surface-hook.surface_fire": [
+      "hooks/claude/engram-surface-hook.py:main"
+    ],
+    "surface-hook.trigger_fire": [
+      "hooks/claude/engram-surface-hook.py:main"
+    ],
+    "utility-credit-mention-stop.enactment": [
+      "hooks/claude/engram-utility-credit-mention-stop.py:main"
+    ],
+    "utility-credit-mention-stop.hook_fire": [
+      "hooks/claude/engram-utility-credit-mention-stop.py:main"
+    ]
+  }
+}

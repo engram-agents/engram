@@ -9,6 +9,655 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+## [v0.5.2] - 2026-09-25
+
+### rc4 round — 2026-09-30 (fixes, the telemetry ingest, and inert EngramManager units)
+
+**Read these three before upgrading.**
+
+- **`hooks.json` changed: the retired `engram-toolcall-repair.py` hook is
+  no longer registered, so restart Claude Code fully after upgrading.**
+  Both of its PreToolUse registrations are removed (#3213, closes #172). A
+  session reads hook registrations when it starts, so `/reload-plugins` is
+  not enough. The rebuild deletes and recreates the plugin tree, so a
+  session that is still running keeps the old registration after the
+  upgrade. The script is therefore still shipped, as an unregistered no-op
+  that reads its input, prints nothing and exits 0 (#3251, closes #3249).
+  Without it, that session would run python on a missing file (exit 2),
+  which Claude Code treats as a PreToolUse block on every ENGRAM tool
+  call. That hazard was reasoned, not observed on a seat. The no-op ships
+  for this release only and may be deleted in the first release after
+  v0.5.2, because sessions started on v0.5.2-rc4 or later no longer
+  register it. The hook had repaired nothing since at least 2026-06-30:
+  its own table of protected tools used the pre-plugin `mcp__engram__`
+  prefix, and every tool now takes one `payload_json` string, so the fault
+  it repaired can no longer occur. `tools/borges_session_eval.py` drops
+  its `T2_antml_repair_rate` metric, whose only source logs this hook
+  wrote (#3216, part of #3215).
+- **The telemetry verdict line is real for the first time.** Until now
+  nothing called `engram_telemetry_store.ingest()`, so no seat had a
+  `records.db`, and the telemetry line in `engram_diagnose` and the dream
+  record (rc3, #3170) could only read `telemetry: not aggregated`. The
+  surface daemon now runs the ingest on its indexer tick, in its own
+  `try`, so a failed ingest never skips the log indexer. A seat that has
+  never written telemetry is skipped quietly, and an Essential-only build
+  skips the step (#3226, closes #3135). The first pass also ingests and
+  sweeps the backlog of per-process files: on one seat, 9,020 files in
+  0.37 s. A surface daemon that is already running keeps the code it
+  started with, so restart it after upgrading (on a seat with the systemd
+  unit: `systemctl --user restart engram-surface-daemon`). The same PR
+  adds a nullable `swept_at` column to an existing `records.db` through an
+  idempotent `ALTER`, the round's one on-disk schema change. A
+  companion fix keeps a swept file's offset row and marks it swept, so a
+  file recreated under the same name is read from the start rather than
+  from the old offset, and the line's staleness signal survives the sweep
+  (#3228, closes #3227).
+- **The EngramManager units in this round are inert: nothing calls
+  them.** The owner process gains its socket permission layer: the socket
+  moves to `$ENGRAM_HOME/run/engramd.sock` in a 0700 directory with its
+  ACLs stripped, peer credentials are checked on every connection, a
+  symlink or non-socket at the path is refused, and the request deadline
+  covers execution as well as framing. `snapshot()` now stages into a
+  private temp file and replaces the destination atomically, so an
+  aborted snapshot never damages an existing file (#3201, closes #3194).
+  It also gains its two connections: an owner-internal one for
+  `snapshot()`, and a permanently restrictive client-read one behind an
+  authorizer floor with size and instruction limits (#3221, closes
+  #3195). No code outside `engramd_owner.py` and `engramd_client.py`
+  imports either module, and the owner still serves no domain
+  operations. Linux only for now: on another platform, or without
+  `setfacl`, the owner refuses to start.
+
+**Fixes and changes.**
+
+- **A snapshot read-mark failure is now visible instead of swallowed.**
+  `engram_core`'s per-turn snapshot capture still runs when its WAL
+  read-mark fails, but the result says so (`read_mark` is `held`,
+  `failed` or `inherited`, with the error), and a failed release is
+  reported and rolled back. The same PR adds a missing module-level
+  `import sys` that had turned two error handlers into `NameError`
+  crashes: the snapshot worker's unavailable-fallback, and the NLI
+  classifier's model-load failure (#3224, closes #3222).
+- **`cohort_dispatch validate` now checks that every node sent comes
+  back.** It checked the quality of each returned item but never compared
+  the returned ids with the payload, so a fairy that dropped one node of
+  fifteen passed with `failures: 0`. A dropped id is now a failure and
+  flows into the retry payload; an id returned but never sent is refused
+  and validate exits 1; a duplicate is retried (#3235, closes #3045).
+  This was the first fix built under the contract-first convention.
+- **The session-start hook's total injection is now capped.** It had no
+  total cap and injected 53,558 characters on one seat. Its output now
+  goes through `emit_context()` under the claude-code budget of 9,500
+  characters. Blocks that don't fit go to an overflow file named on the
+  first line, the must-not-miss lines stay within the first 1,800
+  characters, and the focus block is cut at whole entries with a marker
+  (#3214, closes #127). The full tool-capability index is now larger than
+  the whole budget, so it always goes to the overflow file; a names-only
+  tool list of about 950 characters, derived at runtime from the same
+  index, is shown inline instead (#3218, closes #3217).
+- **`forum reply` accepts the body as a positional argument.** Its
+  argument errors no longer echo the message text, which under `| tail`
+  read like a send confirmation, and stdin is read only when it is a real
+  redirect, so a socket on stdin can no longer hang the command (#3234,
+  closes #2906).
+- **`baton flip` to a non-participant now prints the fix:** the exact
+  `baton add-participant` command to run. The refusal itself is unchanged
+  (#3236, closes #2901).
+- **Batons now carry an explicit `phase:` that every transition writes,
+  so whether a baton is free to claim no longer depends on this seat's
+  `primary_user`.** `baton claim` asks `_resolve_phase()`: an explicit
+  `phase:` wins, and without one the old comparison (renamed
+  `_is_legacy_pool_sentinel()`) is the fallback and says so on stderr
+  (#3243). Every transition now writes its phase: `init` writes `fairy`
+  on a PR baton and `pool` on a bunch, the flip to the colleague writes
+  `peer`, the flip to the merge seat writes `merge`, `claim` writes
+  `claimed`, `release` writes `pool`, and `release --done` writes `done`.
+  When a transition meets a baton that has no `phase:` yet, it first logs
+  a `(legacy conversion)` line naming the phase the baton was in, then the
+  transition, so the change is readable in the baton's own turn log. Other
+  writes convert such a baton only when the old resolver can name its
+  phase. `close`, `merge` and
+  `reopen` write no phase; terminal states stay in `status` (#3254). Two
+  visible changes: `baton claim` refuses a PR baton sitting at the pool
+  marker, because that baton is in its merge phase (#3243); and a second
+  claim on a claimed bunch baton is refused because it reads `claimed`.
+  Both are part of #3039. The design note is
+  `docs/design/3039-baton-phase-turn.md` (#3055).
+- **The recall_summary authoring target is one number, 140, defined
+  once** as `RECALL_SUMMARY_TARGET` in
+  `tools/recall_summary_validator.py`. A second, never-ruled "≤120" limit
+  sat in eight places, including the fairy prompt and the validator's
+  message. The 200 and 280 gates are unchanged (#3191, closes #2736).
+- **The agent allowlist names all six shipped `engram-*` agents,
+  including `engram-dream-master`,** in the CLAUDE.md template, both boot
+  charges and the instruction-manifestation policy; a test binds the list
+  to the shipped agent specs. Deployed boot charges change only on
+  redeploy (#3220, closes #3219).
+- **Under `comms_surface: umwelt`, the Claude boot charges keep both
+  forum monitors armed as a safety net,** with the umwelt bell as
+  primary, until the forum-to-world bridge is live. Deployed copies change
+  only on redeploy (#3190).
+- **The CLAUDE.md template's write discipline now says to err on the side
+  of writing more,** and that the stop hook's Write Check reminder is
+  muted by design once the graph is mature. An existing seat's CLAUDE.md
+  is not changed (#3245, part of #3238).
+- **The session-start hook no longer raises a false `MCP server: OFFLINE`
+  on startup.** At a startup or resume, the MCP server is launched beside
+  the hook, and a single `pgrep` could run before the process was visible.
+  On one seat this fired on 12 of 12 automated boots after rc2. Now a miss
+  at startup or resume prints an informational `MCP liveness: unknown …
+  will confirm on first prompt`, with no `⚠️` header. A miss at a compact
+  or clear start still raises the hard alarm, and a probe that errors
+  names its cause (#3250, closes #3202). A follow-up test pins that any
+  unrecognised session source also gets the soft line (#3256, part of
+  #3252).
+- **viz: `GET /api/version` reports which commit the running `:5001`
+  server loaded,** captured once at startup (sha, branch, dirty,
+  started_at). It adds a warning off `dev`/`main` or on a dirty tree, and
+  with no git the server still starts and the endpoint returns nulls with
+  a reason (#3174, part of #2531).
+- **New `tools/monitor-supervisor.py` runs the two forum monitors and the
+  umwelt bell as children under one Monitor,** so a seat re-arms one
+  watch instead of three. It refuses to reap an earlier instance whose
+  identity it cannot confirm. Nothing arms it yet (#3177, part of #2982).
+- **macOS wake (repo-side only):** a throwaway credential probe for
+  checking, once, whether a LaunchDaemon can read the Claude Code Keychain
+  entry, and a fail-loud credential check as the first action of the
+  wake launch script, so a credential failure is logged instead of looking
+  like a quiet skip. The same PR fixes a `PATH` ordering bug in that
+  script found by its tests (#3246, part of #3002).
+- **WS4 adjudication kit (repo-only, in no install tier):**
+  `extract_spans.py` adjudicates at most 10 fires per seat per UTC day,
+  picked by a seeded hash that never sees the arm (#3181), and
+  `analyze.py` reports each seat's sampled fraction and per-lesson
+  composition (#3182); part of #2753.
+
+**Docs, CI and tests.**
+
+- `CLAUDE.md`: the contract-first tests convention is adopted, and
+  `docs/PR-MERGE-POLICY.md` puts the whole baton system, design included,
+  on the team-merge side (#3241). The macOS CI runner is removed and
+  macOS coverage comes from the Mac seats (#3192, #3193). Check 3 names
+  soma alongside umwelt as exposed to commit-message auto-close (#3189,
+  closes #2515 and #2514). The attribution section gains its
+  duplicated-by-hand footer (#3206, closes #2707).
+- Cross-repo fairy dispatch: the parent provisions the worktree and
+  passes it by path (#3212).
+- `docs/RELEASING.md`: reconciling `main` into `dev` is now a standing,
+  command-checked step before every cut, not only a fix for a `DIRTY`
+  release PR (#3258, closes #3116).
+- #2652 design docs: the owner is one process that may hold two
+  connections (#3198, closes #2840); the deadline covers execution
+  (#3200); the socket path and the inherited-ACL gap (#3211). Three
+  comments in `engramd_owner.py` name the right U3 identifiers (#3239).
+- Cascade docstrings name `CASCADE_RELATIONS` instead of "just
+  derives_from" (#3233, closes #3229).
+- Chinese: `docs/ZH-TERMINOLOGY.md` records the terminology ruling
+  (#3207), and the `README.zh.md` title renders "epistemic" as 认知
+  (#3203).
+- Tests: `fresh_module`'s `sys.modules` purge is restored at the end of
+  each test file, which turns dev's full suite green again after #3226
+  (#3230, closes #3225); a `tools` package cached from the wrong path is
+  purged after `sys.path` is restored (#3205, closes #3204);
+  `test_all_reasoning_types_accepted` covers `inductive_enumeration` and
+  now fails if its list drifts from `REASONING_TYPES` (#3231, closes
+  #3081); the tripwire ceiling test is tightened now that #2893 is fixed
+  (#3185).
+
+### rc3 round — 2026-09-27 (fixes plus new capabilities)
+
+- **A tool call can no longer report success on a live connection whose
+  `-wal`/`-shm` sidecar files have been silently displaced.** A new
+  predicate is checked, unthrottled, on every `_get_db()` dispatch; when
+  displacement is confirmed the call fails loudly and names the remedy
+  instead of returning `created` on a corrupted connection. The existing
+  marker/forensic-capture/dump path still runs first, unchanged; Darwin
+  (no `/proc`) is treated as healthy and gets no protection from this unit
+  (#3158, part of #2635).
+- **A `"superseded"` cascade resolution could silently carry a spurious
+  `replacement_absent_because`/`replacement_absent_note`, in violation of
+  the function's own documented contract.** The guard only ever checked
+  those two fields against `resolution_kind == "acknowledged"`; a
+  separate, `"superseded"`-scoped check now refuses them independently,
+  while the existing `replacement_id` requirement for `"superseded"` is
+  left untouched (#3130, closes #3125).
+- **The session-log indexer no longer reports every unflushed-append NUL
+  run as "malformed JSON", and the emitter now fsyncs each event so
+  fewer of those NUL runs happen at all.** The reader half adds a
+  NUL-aware guard plus an incomplete-tail rule: a terminated line with
+  leading/trailing NULs is stripped and recovered with a single
+  "unflushed append" warning, and an unterminated final line is indexed
+  if it already parses as a complete record (a writer that died after
+  the record landed but before its newline did — otherwise the size gate
+  would freeze that file and lose the record for good) and is otherwise
+  treated as the live tail of an in-progress write. The writer half closes the
+  other side of the same window — each event is flushed and `fsync`'d
+  before `emit()` returns (about 1.16ms per event on ext4), with a new
+  file's directory entry also made durable, and a failed fsync degrades
+  to a stderr warning rather than a dropped event (#3161, part of #2801;
+  #3168, closes #2801).
+- **The installer now shares the engine's single bounded offline
+  deploy-tag refresh, so a failed fetch still falls through to local
+  tracked ancestry instead of refusing outright.** It also owns and
+  terminates the fetch's private process group, validates timeout
+  inputs, and warns on every failed refresh while keeping the
+  distinction between cached ancestry and confirmed remote freshness
+  explicit; private/unmerged tagged heads are still refused (#3153,
+  closes #3133).
+- **New MCP tool `engram_retype_edge`: corrects a provably-wrong
+  `supported_by`/`derives_from`/`cites` edge by making it weaker, never
+  stronger, in one audited transaction.** Allowed moves come from a
+  fixed table; the call refuses on a pending cascade marker, an
+  already-existing target relation, or a `derives_from` retype that
+  would strip a derivation's last remaining cascade premise, and it
+  recomputes the source's confidence and its full downstream cascade
+  when the old relation was cascade-bearing. A fast-follow (#3167) fixed
+  a test fixture whose seeding order let an unrelated `temporal_causal`
+  guard mask what `test_stronger_move_refused` was meant to isolate
+  (#3160, closes #2265).
+- **The viz "Snapshot now" button is gone; every page load now computes
+  a live, uncached, never-persisted health score instead.** A new `GET
+  /api/health/v2/live?agent=<a>` route opens the requested agent's DB
+  read-only and never writes anything; concurrent requests for one
+  agent collapse into a single build; two new optional per-agent
+  overrides close a real multi-tenant bug where a shared viz process
+  would otherwise silently score using the server's own process-global
+  turn/embedder facts (#3155, part of #2518).
+- **A new runtime verdicts report classifies every tripwire site's
+  recent window into one of the design doc's eight VERDICTS lines, and
+  a new static check catches a typo'd `reached` literal at CI time
+  instead of it silently reading "NOT REACHED" forever.** The dispatch
+  map that drives it is now a committed, generated source file rather
+  than a runtime tree-walk, after a design-conformance read found the
+  original walk couldn't work against the flattened, `tiers.json`-less
+  layout of an installed plugin; a drift gate keeps the committed map
+  honest against the real tree (#3156, closes #3136).
+- **The WS7 verdicts now surface as one telemetry line where people
+  already look: `engram_diagnose`'s output and the nightly dream
+  record.** A single renderer produces it (the dream record copies the
+  diagnose field verbatim rather than rendering its own), and "we could
+  not check" never renders as healthy: a missing store or table, a
+  missing or unparseable ingest timestamp, an ingest more than two days
+  old, or zero rows for the window all read `telemetry: not aggregated
+  (...)`, never a line of zeros. Labels are the stored verdict values;
+  a test pins their set to WS7's own verdict table, and a verdict
+  outside it still renders rather than disappearing (#3170, closes
+  #3137).
+- **`forum read` gains `--new` (posts since your read watermark) and
+  `--last N`, and `GET /api/thread/<id>?agent=<a>` returns the caller's
+  own `last_read_post_id`.** Against a server without the field,
+  `--new` falls back to the last five posts and says so; the read
+  watermark advances the same way in every display mode. The server
+  half is live once the forum is redeployed; the CLI flags reach a seat
+  with its plugin rebuild (#3171, closes #3138).
+- **A per-fire ledger and a config-gated A/B of the tripwire `[triggered
+  principles]` chain render give the pre-registered experiment its
+  denominator.** Off by default; when active, each fire with a
+  `generalizes` head is assigned an arm from `sha256(seed:nonce)` and
+  logged with its shown/cut lesson ids and render sizes, so every
+  assignment is reconstructable before any real run begins (#3166, part
+  of #2753).
+- **A new tool mechanically BFS-walks a package's call graph from
+  declared root entry points and records every recognized database
+  write site reached, at the file:line level rather than the (verb,
+  table) level** — closing the gap where a union over pairs can hide
+  one specific site going unreached. Proven against small synthetic
+  fixtures only; it does not yet run against the real `src/engram` tree
+  (#3134, closes #3095).
+- **The EngramManager owner-process skeleton: the one process that will
+  hold `knowledge.db` open, speaking U1's existing AF_UNIX wire
+  contract.** Handles the handshake/version check, `ping`, and a
+  quiesced `snapshot()` over SQLite's backup API, with a
+  confirmably-dead-PID stale-socket recovery, an end-to-end
+  per-request deadline measured from accept, and thread-per-connection
+  concurrency so one slow client can't block another. No domain
+  operations yet, and nothing calls it (#3151, closes #3096).
+- **A macOS `launchd` LaunchAgent ports the existing Linux
+  systemd-timer autostart mechanism to single-user Mac seats**,
+  periodically checking for a live session and starting one via the
+  same charge-file invocation if none exists; the wake announces
+  itself to the forum before anything else but does not auto-resume
+  stale loop state. The live-fire install step and on-seat dry run are
+  still blocked on an unrelated seat issue (#3162, part of #3002).
+- **Design note settling the edge-correction contract for
+  `engram_retype_edge` (#2265) and the remainder of #2347, for Lei's
+  read.** Proposes the weaker-only retype move table, closes #2347 as
+  solved while keeping the per-node acknowledge guard, and narrows the
+  Stage-3 exit query to `temporal_causal: True` relations only. Docs
+  only; this is the design #3160 implements (#3093, part of #2252).
+- **`docs/PR-MERGE-POLICY.md` gains Lei's 2026-09-27 delegation: the
+  team may merge a substrate PR without his read when it implements a
+  design he already read, provided the merge seat links that read and
+  writes a short conformance check**, and an issue may be closed with
+  code evidence attached. A new substrate concept still goes to him
+  first (#3157).
+- **The three-pre-peer-fairy-round cap ruled on the forum on
+  2026-09-20 is now written into `CLAUDE.md`'s colleague-converged
+  gate**, including its stopping signal, the written-reason exception
+  for a fourth round, and the contributor-commit reset rule read off
+  `git log`. Closes the gap where the cap was load-bearing at the merge
+  seat but had no single-source-of-truth home in the repo (#3146).
+- **A cancelled or interrupted live-health build could leave every
+  waiting thread reading `None` instead of a payload, crashing one
+  level up.** The per-agent single-flight guard in
+  `get_health_v2_live_data()` only ever caught `Exception`; the
+  `finally` block now backfills a fail-honest placeholder result before
+  firing the event if a `BaseException` escaped the build (#3163, part
+  of #2518).
+- **A release build could ship files the minus-set's own header said it
+  excludes — including 45 files under `src/forum/tests/` present in
+  every public release since at least v0.3.1.** `_apply_minus_set` now
+  implements the documented gitignore-style rules: a directory entry
+  matches at any depth unless anchored with a leading `/`, `*` never
+  crosses `/`, and a matched symlink is removed as a link rather than
+  followed. The `deploy/` entry becomes `/deploy/` so the new any-depth
+  semantics don't also swallow the shipped `src/forum/deploy/` install
+  path (#3164, closes #2516).
+- **Loading the viz dashboard no longer ships every field of every node
+  over the wire.** `/api/graph` now serves index nodes only (the 13
+  fields the page reads outside the detail panel — about 7x less on the
+  wire on the author's own graph), and a new `GET
+  /api/node?id=&agent=` fetches one full node on click, 404ing with an
+  empty body on an unknown id and 400 on a missing one; `get_graph`
+  itself is unchanged (#3165, part of #2866).
+- **A failed WS4 arm computation or ledger-row build used to vanish
+  silently instead of showing up as a fire.** Each now gets its own
+  narrow guard: an arm-computation failure still renders the block the
+  way dev does today but logs the row with `arm: "error"` plus the
+  error text, and a row-construction failure still writes a minimal row
+  so the fire is counted; the nudge, exit code and deny path are all
+  untouched. Folds in the round-2 review suggestions from #3166, which
+  merged before they landed (#3173, part of #2753).
+- **A new offline adjudication kit lets a human score the
+  pre-registered chain-render A/B without seeing which arm a fire
+  belongs to.** `tools/ws4/extract_spans.py` cuts one blinded
+  heeding-window span per fire from the fire ledger and transcript,
+  redacting the `[triggered principles]` block and flagging any span
+  that still names a head after redaction; `tools/ws4/analyze.py`
+  computes O1-at-K via a `corrective_at` verdict field, O2 raw/transfer
+  counts, and per-arm privacy-drop counts. Read-only on the ledger,
+  transcripts and `knowledge.db`; ships in no install tier (#3175, part
+  of #2753).
+- **The WS4 adjudication report now counts every fire-ledger row,
+  including the `error` and `na` rows it used to skip without a trace.**
+  `compute_denominators()` in `tools/ws4/analyze.py` gains
+  `ledger_rows_by_arm` (per seat and pooled; `chain`, `control`, `na`
+  and `error` always present, 0 when absent) and an `error_rows` count
+  with a per-error breakdown, and the report always prints its
+  `error rows` line, including when the count is 0. The
+  `extract_spans.py` selection and every existing O1, O2 and
+  length-control number are unchanged (#3179, part of #2753).
+- **`engram_retype_edge` was missing from the two hand-kept registries
+  that must list every write-capable tool, which turned the rc3
+  release-gate full suite red.** The Stop hook's `_ENGRAM_WRITE_VERBS`
+  now includes `retype_edge`, so a turn whose only ENGRAM write is a
+  retype counts as a write for the write check. The checked-in
+  `tool_capability_index.txt` is regenerated with the new tool's entry.
+  Mechanical sync of #3160; no behaviour change beyond those two
+  lists (#3183, part of #2265).
+
+### rc2 fix round — 2026-09-26 (found on the rc1 soak)
+
+- **Forum prompt-hook `Connection: close` crash fixed — the reason for
+  this re-cut.** rc1's forum server answers with `Connection: close`,
+  which nulls `conn.sock` as soon as `getresponse()` returns — the
+  connection has merely dropped its own reference; the socket itself
+  stays open, owned by the response, with real reads still ahead of it;
+  the end-to-end deadline code added by #3110 called
+  `conn.sock.settimeout(...)` unconditionally on every read-loop
+  iteration, raised `AttributeError` on that path, and a bare `except`
+  swallowed it — so the hook silently fell back to stale cached
+  threads/mentions on every single prompt. The fix now captures the
+  socket reference before `getresponse()` and re-arms that captured
+  reference's timeout on every read iteration (catching `OSError` for
+  the case where the fd has since genuinely closed), so the
+  remaining-budget deadline still holds on a `Connection: close`
+  response (#3144, closes #3143).
+- **`engram-sleep`'s cohort-boundary snippet reads `completed_at`, not
+  the never-written `cohort_end_at` key.** The `KeyError` was swallowed
+  by a `2>/dev/null || echo ""` fallback, silently collapsing the cohort
+  boundary to empty and making the dream-master's cohort filter match
+  every node ever created; a marker missing the key now fails loudly
+  instead (#3132, closes #3123).
+- **The install-script untagged guard now decides on confirmed
+  ancestry, not raw tag presence.** A local tag on an unpushed/unmerged
+  commit passed the untagged guard even though the separate ancestry
+  check had already failed, disagreeing with the engine's own `cli run
+  upgrade` path on the identical case; both now refuse consistently
+  (#3131, closes #3103).
+- **Health-series declarations gate no longer false-positives on a
+  layout-dependent module prefix.** Two declarations rows seeded from a
+  `src/`-layout checkout carried `engram.health.` instead of the
+  deployed plugin's `health.` prefix, so the affected seat's very first
+  snapshot ingest raised `SeriesIntegrityError`; both serialization and
+  the ingest-time comparison now canonicalize the prefix, and a
+  migration heals stored rows (#3127, closes #3122).
+- **`_count_null_embeddings` no longer requires `row_factory =
+  sqlite3.Row`.** The health-engine helper indexed its query result by
+  column name, which only works when the caller sets `row_factory`; the
+  dream-master's own connection doesn't, so the only real caller hit a
+  `TypeError` in production the test suite's connection shape never
+  exercised (#3126, closes #3124).
+- **Forum monitors now announce during their seed loop, not just their
+  poll loop.** #3065's edge-triggered outage announce lived only in the
+  poll loop, reached only after a seed loop that blocks silently until
+  the first successful poll — so a monitor armed while the forum is down
+  (the routine case at session start) was completely mute. Both seed
+  loops now announce the first failed attempt and the eventual success
+  (#3111, closes #3067).
+- **EngramManager U1: the owner wire-contract client library.** A pure
+  client speaking the new AF_UNIX wire protocol for the future `engramd`
+  owner process, with three result states (`Ok`/`Unavailable`/
+  `Rejected`) distinct at the type level, and a `request_id` threaded
+  through every write so a caller that got `Unavailable` can retry
+  safely. Nothing calls it yet (#3102, closes #3094).
+- **Retraction replacement contract implemented.** Every
+  author-initiated retraction now records a replacement decision — the
+  node that replaces the claim, or one of four stated reasons why
+  nothing does — through the single chokepoint both the organic retract
+  path and cascade-resolve delegate to; also fixes a bare `except
+  IntegrityError: pass` that let a retraction commit while its
+  replacement edge was never written (#3090, implements #2613).
+- **`test-id-set-check` no longer re-demands markers already carried by
+  merged dev PRs.** The release-PR gate re-demanded a `Removed-test:`
+  marker for every test id that disappeared anywhere in the dev range,
+  even when the deleting dev PR already carried its own marker; the gate
+  now unions a third marker source, the already-merged PR's own body
+  (#3139, closes #3117).
+- **A CI gate now catches a stubbed test that a stale signature change
+  breaks silently.** #3110 changed two function signatures and moved a
+  call off `urlopen`; two test files that monkeypatch those names by
+  bare name were invisible to the existing affected-tests heuristic. A
+  new blocking CI step finds every signature that genuinely changed in
+  a PR's diff and greps `tests/` for bare-name references (#3129, closes
+  #3118).
+- **Lane prioritization rubric v0.** `docs/LANE-PRIORITIZATION.md`, the
+  commander's ranking policy for open engram-alpha/umwelt issues into
+  seat lanes: five 0-2 axes, four standing overrides, a day-end re-rank
+  rule, and a changelog section for revising the rubric with history.
+  Docs only (#3140).
+- **EngramManager security-slice design: read-template registry + socket
+  permission model.** Settles the #2652 security slice's four open
+  questions against measurement: `SO_PEERCRED` doesn't exist on Darwin,
+  a mismatched socket-option level silently returns uid 0, and a
+  read-only SQLite handle permits `ATTACH`/`PRAGMA`. Proposes a
+  two-layer floor — SQLite's own `set_authorizer` plus a build-time-
+  frozen template registry. Design only (#3100, part of #3097); a
+  follow-up (#3145) withdraws two overclaims flagged at approval — the
+  token-match fallback can under-deny, and `SQLITE_LIMIT_LENGTH` caps a
+  single string/blob/row, not aggregate memory.
+
+### Added
+
+- **`deductive_conjunction` reasoning type** (#3082, closes #3080) — a new
+  reasoning type for claims that are the logical conjunction of their
+  premises (e.g. "none of the N surveyed systems has feature X" over an
+  explicitly enumerated, complete set). Confidence is weakest-link
+  (`min(premise confidences) × 0.98`), matching the existing deductive
+  types but without their 2-premise cap.
+- **Per-pack share-clearance label on the forum pack registry** (#3036,
+  part of #676) — four new columns on `packs` distinguishing packs that
+  have been read in full and cleared for eventual external sharing from
+  packs that haven't (default `private` for every existing and new pack).
+  A deliberately narrow slice following a live pack-privacy incident;
+  the full node-level visibility system is tracked separately.
+- **`engram_list` gains a `sort_order` parameter** (#3025, closes #3016) —
+  `sort_by` previously baked column and direction into one fixed string,
+  so callers could never ask for oldest-first ordering. The optional
+  `sort_order` (`"asc"`/`"desc"`) now overrides direction independently of
+  column; omitted, behavior is unchanged. Fixes the engram-sleep Step 5
+  backfill, which needs oldest-first and had no way to request it.
+
+### Changed
+
+- **Board API reconciliation skips already-file-done records** (#3060,
+  closes #2007) — `/api/board/projects` and `/api/board/updates` were
+  taking 300-500s because every request re-resolved GitHub state for up
+  to 1038 PR refs serially, even for records whose file status already
+  reads `merged`/`cancelled` (where that resolution is provably
+  unused). Skipping those cuts the working set to ~30 refs, a ~34x
+  reduction, with no change to any served status.
+
+### Fixed
+
+- **Monitor timeout budgets are now end-to-end, not per-op**
+  (#3110, closes #3106, closes #3107) — `forum-mention-monitor.sh` had no
+  `--max-time` at all, and the forum prompt-hook's worst-case timeout
+  arithmetic assumed a call with `timeout=T` takes at most T, which is
+  false against a server that trickles data (the per-op timeout re-arms
+  on every partial read). Both now enforce a genuine wall-clock deadline.
+  Its `Connection: close` crash — the reason for the rc2 re-cut — is
+  fixed in the rc2 fix round above (#3144).
+- **Health-exam liveness checks could not report failure** (#3070) — the
+  agent-facing health-exam skill's `pgrep`-based checks counted other
+  seats' processes, could never detect a dead daemon on Darwin, silently
+  swallowed an absent-`pgrep` error as a false clean, and a zsh `$PATH`
+  clobber in Step 0 turned that false clean into a false alarm on a
+  healthy system. All three liveness sites fixed, plus a gate across all
+  29 shipped skill docs, with its known limits listed on the PR.
+- **One shared deploy-tag predicate, enforced by the engine too** (#3099,
+  closes #3092) — the install script already refused to build from an
+  untagged commit unless `--allow-untagged` was passed, but the engine's own
+  `upgrade`/`build` entry points never enforced this, so an untagged
+  `dev` tip could upgrade through the engine while the shell script would
+  have refused it. The engine paths now use the shared Python predicate;
+  the shell installer's own untagged check still reads raw tags at HEAD,
+  tracked in #3103.
+- **WS3 hook-injection gate is now live, not `xfail`** (#3098, closes
+  #2863) — the test asserting every hook's `additionalContext` routes
+  through the shared `emit_context()` helper was marked
+  `xfail(strict=True)` pending five known exceptions; four are confirmed
+  deliberate (atomic fixed-format emitters); the fifth, the session-start
+  hook, is excluded with its uncapped total emission disclosed and tracked
+  separately in #127; the gate is now enforced rather than merely tracked.
+- **`engram-sleep` stops live Monitors unconditionally in Step 3.5**
+  (#3050, closes #3049) — Step 3.5 only tore down live Monitors
+  (Umwelt bell, forum-mention, forum-updates) when a loop-mode marker
+  file was present, so a session that armed Monitors ad hoc (without the
+  marker) left them running through the sleep cycle and into the next
+  session.
+- **Racy wait predicate in the embedding-restore C5 tests fixed** (#3088,
+  closes #3087) — a test-only race in the async regeneration-daemon wait
+  helper, not a production defect; fixes the alpha nightly CI failure.
+- **Cross-process single-flight lease for embedding restore regeneration**
+  (#3078, closes #3077) — every process hitting missing embeddings on
+  startup independently spawned its own regeneration daemon thread;
+  harmless but wasteful under concurrency. A lease now coordinates
+  regeneration across concurrent MCP sessions / short-lived CLIs.
+- **Restore-completeness contract for the embedding pipeline, C1-C5**
+  (#3076, closes #3075) — fixes three real problems surfaced when a
+  user's agent restored from a backup snapshot: embedding-text generation
+  depending on caller row-factory state, an implicit regeneration
+  outcome, and other completeness gaps in the restore path, written to a
+  contract-first test suite before the fix.
+- **PR-baton auto-close gate now matches by suffix, not prefix** (#3061,
+  closes #2010) — both baton auto-close gates required a baton's
+  `project_id` to *start with* `PR-`, but the documented cross-repo
+  naming convention names cross-repo batons `<REPO>-PR-<N>`, so every
+  correctly-named cross-repo baton was invisible to both auto-close
+  mechanisms. Measured: 33 of 99 active batons followed the convention
+  and none matched either gate.
+- **Forum monitors announce the edge into and out of an outage** (#3065,
+  closes #3062) — previously an outage and a quiet-but-reachable forum
+  produced identical (silent) output, so a multi-hour blackout was
+  indistinguishable from a calm night. Both forum monitors now announce
+  the transition, once each way, instead of failing in total silence.
+- **Linux boot-charge stdout-target check counts lines, not the loop's
+  exit status** (#3059, closes #3057) — `readlink /proc/$pid/fd/1` on a
+  pid whose target is unreadable produces empty output with no error, so
+  a bare loop over monitor pids silently dropped that pid's line instead
+  of reporting it, and the "every line must start `socket:`" check then
+  passed against zero lines.
+- **`baton init` records the invoker as author, not the initial turn
+  holder** (#3054, closes #3042) — with `--turn` naming someone else,
+  authorship was durably misattributed to the turn holder, and the real
+  creator couldn't have the baton flipped back without `--force`.
+- **`baton claim`'s refusal no longer asserts a person holds a pool
+  baton** (#3040, part of #3039) — the refusal message resolves "is this
+  a pool sentinel" from the invoking seat's own `primary_user`, checked
+  against a `turn` written into a shared store; a pool baton parked by a
+  seat with a different `primary_user` produced a refusal claiming a
+  named colleague was holding it, when no one was.
+- **`pgrep` on BSD/Darwin no longer silently no-ops on GNU regex escapes**
+  (#3035, closes #3032) — BSD `pgrep -f` compiles its pattern as a POSIX
+  ERE, where `\s`/`\S` aren't special, so a Darwin boot-charge
+  monitor-verify check using GNU escapes matched nothing and exited 0 —
+  indistinguishable from "checked, both monitors fine." Fixed in the
+  charge text and the test harness that should have caught it.
+- **Nap advisory note wording now tracks the #3014 checkpoint anchor**
+  (#3031, closes #3030) — the warm-briefing staleness note still read
+  "Step 5b not performed this session" after #3014 moved the advisory's
+  anchor from session-start to last-checkpoint, which was false on
+  exactly the cases #3014 exists to catch.
+
+### Removed
+
+- **Deleted the unarmed `collab-baton-monitor.sh`** (#3072, part of
+  #2857) — no skill, hook, agent spec, or template invoked it; the live
+  baton wake path runs through `forum-updates-monitor.sh --kinds
+  dm,baton` instead. Removed alongside its dedicated test file and its
+  manifest entries.
+
+### Docs
+
+- **EngramManager design doc** (#2828, part of #2652) — design document
+  for the EngramManager substrate, the layer that will own `knowledge.db`
+  behind a socket contract. Design only; no code.
+- **EngramManager design §5.1 — 'bounded' means one end-to-end deadline**
+  (#3108, part of #2652) — states that a "bounded" retry window must mean
+  one deadline per request, end to end, on both sides of the socket, not
+  a timeout re-armed per socket operation.
+- **EngramManager design §5.5 — degraded-mode ruling recorded** (#3089,
+  part of #2652) — records the ruling that there is no degraded mode of
+  either kind: a hard stop for writes, no stale reads served, and a loud
+  unavailability signal with two-tier recovery guidance.
+- **Retraction replacement contract, design draft 4** (#2837, closes
+  #2613) — design contract requiring every author-initiated retraction to
+  record a replacement decision (the node that replaces the claim, or a
+  stated reason nothing does). Design only; implementation tracked
+  separately.
+- **Contract-first tests: write the assertions before the implementation**
+  (#3046, part of #3045) — for a function with a stateable contract,
+  write the tests asserting its designed behaviours (including error
+  handling) before implementing it, so drift from the design is caught
+  mechanically. Documents the discipline motivated by a silent-node-drop
+  bug.
+- **Falsifier-log figure re-measured; detective-channel caveat folded
+  into Confounds** (#3034, closes #3033) — re-measures a stale per-seat
+  cache figure and folds a caveat about detective-channel bias into the
+  log's Confounds section. Docs only.
+- **Boot-charge doc: the Darwin `/proc` form fails silently, not
+  outright** (#3056) — corrects a self-contradicting sentence claiming
+  the Linux `readlink /proc/$pid/fd/1` check "fails outright" on Darwin;
+  it actually fails silently, the same accepted-and-wrong shape the
+  paragraph already described one line later.
+- **`auto-reviewer-fairy-judgement` skill clarified: doesn't waive the
+  mandatory review round** (#3026) — the skill's "do the review
+  directly" branch was being misread as licensing a same-context
+  self-review in place of the mandatory pre-peer reviewer-fairy round;
+  it only ever governed whether spawning a fairy is worth the dispatch
+  overhead.
+
 ## [v0.5.1] - 2026-09-14
 
 ### rc5 fix round — 2026-09-19 (found on the rc4 soak; tracking #2941)
@@ -34,6 +683,14 @@ with an `-alpha` suffix during the alpha phase.
   the advisory now compares against the most recent one instead of the
   per-session marker, re-arming after every nap and naturally covering the
   compaction case (#3017, closes #3014).
+- **Nap advisory's CONFIRMED-stale note text updated to match the #3014
+  anchor.** #3014 moved the anchor from session-start to last-checkpoint
+  and renamed the field (`written_this_session` → `written_since_last_nap`),
+  but left the emitted note string reading "Step 5b not performed this
+  session" — false on exactly the cases #3014 newly catches (written since
+  session start, but before the last checkpoint). Now reads "Step 5b not
+  performed since the last checkpoint," true under both anchors (closes
+  #3030).
 - **Boot charge's monitor-liveness check reads the monitor's stdout target,
   not just process presence.** `pgrep` certifies a monitor process alive
   even when its stdout was armed to a dead end (a detached `nohup … > file`

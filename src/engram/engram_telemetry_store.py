@@ -371,6 +371,13 @@ CREATE TABLE IF NOT EXISTS ingest_offsets (
     source_file   TEXT PRIMARY KEY,
     byte_offset   INTEGER NOT NULL DEFAULT 0,
     last_ingested_at TEXT NOT NULL
+    -- swept_at (nullable) is added by open_store()'s idempotent migration,
+    -- not declared here, so a pre-#3227 records.db and a fresh one converge
+    -- on the same shape. NULL = the file this row measures may still exist;
+    -- set = the file was swept (or found absent), so a file that reappears
+    -- under this key is a NEW file and must be read from byte 0 (#3227).
+    -- The row is never deleted: WS8's summary_line reads
+    -- MAX(last_ingested_at) over this table.
 );
 """
 
@@ -385,6 +392,21 @@ def open_store(db_path: str | Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=DELETE")
     conn.executescript(_SCHEMA)
+    # Idempotent ADD COLUMN guard (same PRAGMA-then-ALTER idiom as
+    # src/forum/db.py): SQLite errors if the column already exists.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(ingest_offsets)")}
+    if "swept_at" not in cols:
+        try:
+            conn.execute("ALTER TABLE ingest_offsets ADD COLUMN swept_at TEXT")
+        except sqlite3.OperationalError as exc:
+            # Another process ran the same migration between our PRAGMA and
+            # our ALTER. That is success, not failure -- but only if the
+            # column really is there now; any other error propagates.
+            if "duplicate column" not in str(exc).lower():
+                raise
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(ingest_offsets)")}
+            if "swept_at" not in cols:
+                raise
     conn.commit()
     return conn
 
@@ -472,18 +494,34 @@ def _ingest_one_file(conn: sqlite3.Connection, path: Path, now: Optional[datetim
     per file; advancing past a bad line to ingest later good ones would mean
     never revisiting the bad line).
 
+    A row marked ``swept_at`` describes a file that no longer existed at some
+    point; a file present under that key now is a NEW file (a writer idle
+    past the stale-sweep threshold that reopened its cached path), so it is
+    read from byte 0 and the upsert clears the mark. Independently, a
+    ``byte_offset`` beyond the file's size means the file was replaced or
+    truncated (this writer is append-only, so a file never legitimately
+    shrinks) -- also read from 0. Both resets are counted in
+    ``offsets_reset`` (#3227).
+
     Returns a dict with keys: records_ingested, truncated_lines,
-    drop_count_rows.
+    drop_count_rows, offsets_reset.
     """
     source_file = path.name
     offset_key = _offset_key(path)
     ingested_at = _now_utc_iso(now)
 
     row = conn.execute(
-        "SELECT byte_offset FROM ingest_offsets WHERE source_file = ?",
+        "SELECT byte_offset, swept_at FROM ingest_offsets WHERE source_file = ?",
         (offset_key,),
     ).fetchone()
     start_offset = row["byte_offset"] if row is not None else 0
+    offsets_reset = 0
+    if row is not None and row["swept_at"] is not None:
+        start_offset = 0
+        offsets_reset = 1
+    elif start_offset > path.stat().st_size:
+        start_offset = 0
+        offsets_reset = 1
 
     with open(path, "rb") as f:
         f.seek(start_offset)
@@ -564,7 +602,8 @@ def _ingest_one_file(conn: sqlite3.Connection, path: Path, now: Optional[datetim
         "INSERT INTO ingest_offsets (source_file, byte_offset, last_ingested_at) "
         "VALUES (?, ?, ?) "
         "ON CONFLICT(source_file) DO UPDATE SET "
-        "byte_offset = excluded.byte_offset, last_ingested_at = excluded.last_ingested_at",
+        "byte_offset = excluded.byte_offset, last_ingested_at = excluded.last_ingested_at, "
+        "swept_at = NULL",
         (offset_key, complete_end, ingested_at),
     )
 
@@ -572,7 +611,15 @@ def _ingest_one_file(conn: sqlite3.Connection, path: Path, now: Optional[datetim
         "records_ingested": records_ingested,
         "truncated_lines": truncated_lines,
         "drop_count_rows": drop_count_rows,
+        "offsets_reset": offsets_reset,
     }
+
+
+def _mark_swept(conn: sqlite3.Connection, offset_key: str, now: Optional[datetime]) -> None:
+    conn.execute(
+        "UPDATE ingest_offsets SET swept_at = ? WHERE source_file = ?",
+        (_now_utc_iso(now), offset_key),
+    )
 
 
 def _maybe_sweep_file(conn: sqlite3.Connection, path: Path, now: Optional[datetime] = None) -> bool:
@@ -600,12 +647,16 @@ def _maybe_sweep_file(conn: sqlite3.Connection, path: Path, now: Optional[dateti
 
     if path.name.endswith(".done"):
         path.unlink()
+        _mark_swept(conn, offset_key, now)
+        conn.commit()  # the file is gone: never leave its row unmarked
         return True
 
     now_ts = now.timestamp() if now is not None else time.time()
     age_days = (now_ts - st.st_mtime) / _SECONDS_PER_DAY
     if age_days >= _STALE_FILE_AGE_DAYS:
         path.unlink()
+        _mark_swept(conn, offset_key, now)
+        conn.commit()  # the file is gone: never leave its row unmarked
         return True
     return False
 
@@ -622,7 +673,9 @@ def ingest(
 
     Returns a summary dict: ``records_ingested``, ``truncated_lines``,
     ``drop_count_rows`` (records carrying a self-healing ``dropped_total``
-    field), ``files_processed``, ``files_swept``, and ``errors`` (a list of
+    field), ``files_processed``, ``files_swept``, ``offsets_reset`` (files
+    read from byte 0 because their offset row was stale -- see
+    ``_ingest_one_file``), and ``errors`` (a list of
     ``{"file": ..., "error": ...}`` for any per-file OSError encountered --
     a single unreadable file never aborts the run for the rest).
 
@@ -634,13 +687,43 @@ def ingest(
     """
     conn = open_store(db_path)
     try:
-        files = _list_telemetry_files(Path(telemetry_dir))
+        tdir = Path(telemetry_dir)
+        files = _list_telemetry_files(tdir)
+        # An empty listing only means "every file is gone" if the directory
+        # exists: _list_telemetry_files also returns [] for a missing dir,
+        # and marking every row swept then would re-ingest each file from
+        # byte 0 (duplicates) once the dir returns. Checked AFTER the listing
+        # so a dir that vanished mid-run is not trusted either. (An iterdir()
+        # OSError is not swallowed -- it propagates out of ingest() before
+        # anything is marked.)
+        dir_listed = tdir.is_dir()
+
+        # Reconcile rows whose file is absent from this run's listing (rows
+        # written before #3227, or a crash between unlink and commit): mark
+        # them swept so a file that reappears under the key is read from 0.
+        # One pass over the rows against a set of keys, not a query per row.
+        present_keys = {_offset_key(f) for f in files}
+        absent = [
+            r["source_file"]
+            for r in conn.execute(
+                "SELECT source_file FROM ingest_offsets WHERE swept_at IS NULL"
+            ).fetchall()
+            if r["source_file"] not in present_keys
+        ] if dir_listed else []
+        if absent:
+            swept_at = _now_utc_iso(now)
+            conn.executemany(
+                "UPDATE ingest_offsets SET swept_at = ? WHERE source_file = ?",
+                [(swept_at, k) for k in absent],
+            )
+            conn.commit()
 
         records_ingested = 0
         truncated_lines = 0
         drop_count_rows = 0
         files_processed = 0
         files_swept = 0
+        offsets_reset = 0
         errors: list[dict[str, str]] = []
 
         for f in files:
@@ -652,6 +735,7 @@ def ingest(
             records_ingested += result["records_ingested"]
             truncated_lines += result["truncated_lines"]
             drop_count_rows += result["drop_count_rows"]
+            offsets_reset += result["offsets_reset"]
             files_processed += 1
 
         conn.commit()
@@ -672,6 +756,7 @@ def ingest(
             "drop_count_rows": drop_count_rows,
             "files_processed": files_processed,
             "files_swept": files_swept,
+            "offsets_reset": offsets_reset,
             "errors": errors,
         }
     finally:

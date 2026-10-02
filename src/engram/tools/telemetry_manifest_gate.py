@@ -81,6 +81,47 @@ backward walk not to reach any declared site, or recorded as a declared
 dynamic-dispatch exclusion in the manifest's `telemetry.dynamic_dispatch_exclusions`
 list, with a reason — default-deny with a declared exclusion set, the same
 discipline already used for `telemetry: []`.
+
+REACHED-LITERAL JOIN-KEY CHECK (issue #3136, WS7)
+===================================================
+A second, STATIC join-key check, added by WS7 (the §1 VERDICTS runtime
+report, `engram_telemetry_verdicts.py`): every `reached` literal hand-written
+in source (each hook's own `_MAIN_MANIFEST_ID`, server.py's inline
+`"server.py:engram_query"`, etc. — every
+`write_telemetry_record(manifest_id=..., event_type="engram.telemetry.reached")`
+call) must equal, as a set, the union over every DECLARED site of that
+site's own derived dispatch-target set (formatted via `dispatch_target_id`)
+— a set difference in both directions, exactly like NOT_WIRED/UNDECLARED
+above. See `find_reached_literals`, `derived_target_ids_over_declared_sites`,
+and `reached_literal_mismatches`. A typo on either side of this join makes
+the mistyped target's `reached` count silently 0 forever, which the VERDICTS
+report reads as `NOT REACHED` — "NOT a fault" — so this check is wired into
+`check_ok()`, not left advisory.
+
+DISPATCH MAP (issue #3136, WS7 REVISION 2026-09-27)
+=====================================================
+`engram_telemetry_verdicts.py` originally imported this module's own
+`build_call_graph`/`derive_dispatch_targets`/`enclosing_key_for_site`/
+`dispatch_target_id` to walk the backward call-graph AT RUNTIME. That
+cannot work on an installed plugin: no `tiers.json` ships, this module
+resolves paths from the `src/` layout (REPO_ROOT is computed 4 levels above
+this file, which overshoots the plugin root once the build flattens
+`hooks/claude/*` to `hooks/*`), and the `reached` literals in a deployed
+hook still carry the SOURCE path (`hooks/claude/....py:main`) that a walk
+over the DEPLOYED (flattened) tree would never derive. See issue #3136's
+own "REVISION 2026-09-27" block.
+
+The fix: walk once, HERE, and let the result ship as committed DATA instead
+of a runtime import. `build_dispatch_map()` performs that walk and returns
+the JSON-serializable capture; `emit_dispatch_map()` (and this module's own
+`--emit-map PATH` CLI flag) writes it to `src/engram/telemetry_targets.json`
+— a plain, convenience-tier, git-committed file (NOT build-generated,
+NOT baked at build time) that `engram_telemetry_verdicts.py` reads directly
+off its own directory at runtime, with zero import of this (dev-tier)
+module. `tests/test_tiers_manifest.py`'s own drift-gate test re-derives the
+map fresh on every `pr-checks` run and fails, naming the differing sites, if
+the committed file has gone stale — the same default-deny discipline as
+§4a's NOT_WIRED/UNDECLARED check.
 """
 
 from __future__ import annotations
@@ -509,6 +550,27 @@ def enclosing_key_for_site(site: EmitCallSite) -> tuple | None:
     return (site.file, site.enclosing)
 
 
+def dispatch_target_id(key) -> str:
+    """Format a (file, func) dispatch-target key as the manifest_id literal
+    that key's `reached` write carries in source -- e.g.
+    ``("hooks/claude/engram-surface-hook.py", "main")`` -> the literal
+    ``"hooks/claude/engram-surface-hook.py:main"`` that file's own
+    ``_MAIN_MANIFEST_ID`` constant holds. §1's join key ("The fix is to
+    DERIVE it") and its own R definition ("R := max, over the site's derived
+    dispatch-target set, of that target's reached count") both need this
+    SAME string shape -- one function, so the two callers (the reached
+    join-key check below, and WS7's `engram_telemetry_verdicts.compute_verdicts`,
+    issue #3136) cannot drift apart on the format.
+
+    Renamed from this module's own private `_format_key` (issue #3136 WS7,
+    which is this function's second caller) -- previously used only by
+    `main()`'s `--report` printing.
+    """
+    if key is None:
+        return "<unresolved>"
+    return f"{key[0]}:{key[1]}"
+
+
 # ---------------------------------------------------------------------------
 # Dynamic-dispatch static scan (§1 STATIC block)
 # ---------------------------------------------------------------------------
@@ -679,6 +741,133 @@ def unresolved_dynamic_dispatch_hits(
 
 
 # ---------------------------------------------------------------------------
+# Reached-literal <-> derived-dispatch-target join-key check (issue #3136,
+# WS7). §1: "The fix is to DERIVE it" gives R its join key (a site's own
+# derived dispatch-target set, formatted via `dispatch_target_id` above);
+# this section is the STATIC half of that join -- it checks that every
+# `reached` literal hand-written at a dispatch target's own first statement
+# (`write_telemetry_record(manifest_id=<literal>,
+# event_type="engram.telemetry.reached", ...)`, e.g. each hook's
+# `_MAIN_MANIFEST_ID` or server.py's inline `"server.py:engram_query"`)
+# actually names a target the gate's OWN backward walk derives for some
+# declared site -- and vice versa. Same shape as NOT_WIRED/UNDECLARED (a set
+# difference in both directions), one level down: NOT_WIRED/UNDECLARED
+# checks site declarations against site emit calls; this checks a site's
+# DERIVED reached-target set against the reached literals actually written
+# in source. A typo'd literal makes its target's reached count silently 0
+# forever, which §1's VERDICTS table reads as `NOT REACHED` -- "NOT a
+# fault" -- so an undetected typo here is the design's own dangerous
+# direction realized silently.
+# ---------------------------------------------------------------------------
+
+REACHED_EVENT_TYPE = "engram.telemetry.reached"
+
+
+def _module_level_string_consts(tree: ast.Module) -> dict:
+    """Map every module-TOP-LEVEL `NAME = "literal"` assignment to its string
+    value (single-target, single string-constant assignments only) -- e.g.
+    each hook's own `_MAIN_MANIFEST_ID = "hooks/claude/....py:main"`. Used by
+    `find_reached_literals` to resolve a
+    `write_telemetry_record(manifest_id=<NAME>, ...)` call whose manifest_id
+    argument is a bare Name rather than a literal directly at the call (the
+    hook-side convention; server.py's own reached calls pass the literal
+    directly). Deliberately does not recurse into function bodies -- a
+    same-named LOCAL variable shadowing a module constant is out of scope for
+    this repo's actual convention (verified against the real tree, same
+    reasoning `_module_import_aliases` above already uses for its own
+    narrower-than-general resolution)."""
+    consts: dict = {}
+    for top in tree.body:
+        if (
+            isinstance(top, ast.Assign)
+            and len(top.targets) == 1
+            and isinstance(top.targets[0], ast.Name)
+            and isinstance(top.value, ast.Constant)
+            and isinstance(top.value.value, str)
+        ):
+            consts[top.targets[0].id] = top.value.value
+    return consts
+
+
+def find_reached_literals(src_root_path: str) -> set:
+    """Scan src_root_path for every
+    ``write_telemetry_record(manifest_id=..., event_type="engram.telemetry.reached", ...)``
+    call and return the SET of resolved manifest_id literal strings (this is
+    RL in the join-key check below).
+
+    `manifest_id` is resolved two ways, matching the two conventions actually
+    present in this tree: a literal string constant directly at the call
+    (server.py's own reached writes), or a bare Name resolved against that
+    file's own module-top-level string constants (every hook's
+    `_MAIN_MANIFEST_ID`). A manifest_id expression that resolves to neither
+    shape is skipped -- silently under-counting RL, which is the SAME "safe
+    to under-report, dangerous to over-report" direction §1's own dynamic-
+    dispatch scan already accepts (an unresolved reached call would surface
+    instead as a DERIVED_NOT_REACHED mismatch below, once a human names the
+    convention it actually uses)."""
+    out: set = set()
+    for full in iter_py_files(src_root_path):
+        tree = _parse(full)
+        if tree is None:
+            continue
+        consts = _module_level_string_consts(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if _call_func_name(node.func) != "write_telemetry_record":
+                continue
+            event_type_val = None
+            manifest_id_val = None
+            for kw in node.keywords:
+                if kw.arg == "event_type" and isinstance(kw.value, ast.Constant):
+                    event_type_val = kw.value.value
+                elif kw.arg == "manifest_id":
+                    if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                        manifest_id_val = kw.value.value
+                    elif isinstance(kw.value, ast.Name):
+                        manifest_id_val = consts.get(kw.value.id)
+            if event_type_val == REACHED_EVENT_TYPE and manifest_id_val:
+                out.add(manifest_id_val)
+    return out
+
+
+def derived_target_ids_over_declared_sites(sites: list, dispatch_targets: dict, M: set) -> set:
+    """Union, over every DECLARED site (site_literal in M), of that site's
+    own derived dispatch-target set (already computed by `run_gate` into
+    `dispatch_targets`), each formatted via `dispatch_target_id`. This is DT
+    in the join-key check below -- the exact target-id population §1's `R`
+    is computed against, for every declared site at once."""
+    out: set = set()
+    for site in declarable_sites(sites):
+        if site.site_literal in M:
+            for target in dispatch_targets.get(site.key, ()):
+                out.add(dispatch_target_id(target))
+    return out
+
+
+def reached_literal_mismatches(reached_literals: set, derived_target_ids: set) -> tuple:
+    """§1's reached join-key check, both directions -- same shape as
+    NOT_WIRED (M - L) / UNDECLARED (L - M) above:
+
+      REACHED_NOT_DERIVED := RL - DT  -- a `reached` literal written in
+          source names a dispatch target that no declared site's backward
+          walk actually derives (a typo'd literal, or an orphaned reached
+          write). Naming the bad literal IS the point: a human reads it off
+          this set directly.
+      DERIVED_NOT_REACHED := DT - RL  -- a declared site's own derived
+          dispatch target has NO matching `reached` literal anywhere in
+          source (the target's own reached-write is missing, or misspelled
+          on the OTHER side of the same typo). THIS is the dangerous
+          direction: an under-counted RL makes that target's `reached` count
+          silently 0 forever, which §1's VERDICTS table reads as
+          `NOT REACHED` -- filed "NOT a fault".
+
+    Returns (reached_not_derived, derived_not_reached).
+    """
+    return (reached_literals - derived_target_ids, derived_target_ids - reached_literals)
+
+
+# ---------------------------------------------------------------------------
 # High-level report / check
 # ---------------------------------------------------------------------------
 
@@ -693,6 +882,10 @@ class GateReport:
     dynamic_hits: list
     unresolved_dynamic_hits: list
     zero_emit_violations: list
+    reached_literals: set  # RL -- issue #3136 WS7's join-key check
+    derived_target_ids: set  # DT -- issue #3136 WS7's join-key check
+    reached_not_derived: set  # RL - DT
+    derived_not_reached: set  # DT - RL
 
 
 def run_gate(src_root_path: str, manifest: dict) -> GateReport:
@@ -714,6 +907,10 @@ def run_gate(src_root_path: str, manifest: dict) -> GateReport:
     unresolved = unresolved_dynamic_dispatch_hits(dyn_hits, exclusions)
     zero_emit_violations = zero_emit_predicate_violations(manifest, sites)
 
+    reached_literals = find_reached_literals(src_root_path)
+    derived_target_ids = derived_target_ids_over_declared_sites(sites, dispatch_targets, M)
+    reached_not_derived, derived_not_reached = reached_literal_mismatches(reached_literals, derived_target_ids)
+
     return GateReport(
         L=L,
         M=M,
@@ -723,6 +920,10 @@ def run_gate(src_root_path: str, manifest: dict) -> GateReport:
         dynamic_hits=dyn_hits,
         unresolved_dynamic_hits=unresolved,
         zero_emit_violations=zero_emit_violations,
+        reached_literals=reached_literals,
+        derived_target_ids=derived_target_ids,
+        reached_not_derived=reached_not_derived,
+        derived_not_reached=derived_not_reached,
     )
 
 
@@ -730,15 +931,92 @@ def check_ok(report: GateReport) -> bool:
     """§4a's pass condition: NOT_WIRED and UNDECLARED empty, every
     dynamic-dispatch hit either declared-excluded or (in practice, since this
     gate does not attempt automatic unreachability proofs) at least reported
-    for review, and no declared exclusion's zero-emit-file predicate has been
-    falsified by the live census. Per round 11's ruling, an undeclared,
-    unresolved dynamic hit is a CI failure — never a silent pass."""
+    for review, no declared exclusion's zero-emit-file predicate has been
+    falsified by the live census, and (issue #3136 WS7) the reached-literal
+    join-key check clean in both directions. Per round 11's ruling, an
+    undeclared, unresolved dynamic hit is a CI failure — never a silent
+    pass; the join-key check is held to the same discipline, since a
+    mismatch there silently corrupts §1's `R` computation rather than
+    merely being reported wrong."""
     return (
         not report.not_wired
         and not report.undeclared
         and not report.unresolved_dynamic_hits
         and not report.zero_emit_violations
+        and not report.reached_not_derived
+        and not report.derived_not_reached
     )
+
+
+# ---------------------------------------------------------------------------
+# Dispatch map builder + emitter (issue #3136 D1 fix, REVISION 2026-09-27) —
+# see the module docstring's own "DISPATCH MAP" section for why this exists.
+# ---------------------------------------------------------------------------
+
+
+def build_dispatch_map(src_root_path: str, manifest: dict) -> dict:
+    """Walk the backward call-graph ONCE and return the JSON-serializable
+    capture of every declared site's own derived dispatch-target set —
+    reusing the SAME internals `run_gate` already uses
+    (`find_emit_call_sites`, `declarable_sites`, `compute_M`,
+    `build_call_graph`, `enclosing_key_for_site`, `derive_dispatch_targets`,
+    `dispatch_target_id`), never re-implementing the walk a third time.
+
+    Returns ``{"schema": 1, "degraded_threshold": <float>, "sites":
+    {<site_literal>: [<target_id string>, ...], ...}}`` — one key per
+    DECLARED site (every site literal in M, the manifest's own compute_M()
+    set), even when that site's own derived-target list is empty (the
+    NOT_WIRED / zero-target case) — a caller reading this map never needs
+    the manifest itself to know which sites are declared.
+
+    Raises KeyError if the manifest is missing `telemetry.degraded_threshold`
+    — a map-generation-time failure, deliberately loud rather than a silent
+    runtime default (issue #3136 D5: `engram_telemetry_verdicts.py` reads
+    `thr` from this map, not from the manifest, so a missing key must be
+    caught HERE, at generation time, not discovered as a silent fallback
+    three layers downstream at verdict-compute time).
+    """
+    telemetry_cfg = manifest.get("telemetry")
+    if not isinstance(telemetry_cfg, dict) or "degraded_threshold" not in telemetry_cfg:
+        raise KeyError(
+            "manifest is missing telemetry.degraded_threshold -- required to "
+            "build the telemetry dispatch map (issue #3136 D5: this must be a "
+            "loud failure at map-generation time, never a silent runtime "
+            "default in engram_telemetry_verdicts.py)."
+        )
+    thr = telemetry_cfg["degraded_threshold"]
+
+    sites = find_emit_call_sites(src_root_path)
+    declarable = declarable_sites(sites)
+    M = compute_M(manifest)
+    graph = build_call_graph(src_root_path)
+
+    site_map: dict = {}
+    for site_literal in sorted(M):
+        targets: set = set()
+        for site in declarable:
+            if site.site_literal != site_literal:
+                continue
+            start = enclosing_key_for_site(site)
+            if start is None:
+                continue
+            targets |= derive_dispatch_targets(graph, start)
+        site_map[site_literal] = sorted(dispatch_target_id(t) for t in targets)
+
+    return {"schema": 1, "degraded_threshold": thr, "sites": site_map}
+
+
+def emit_dispatch_map(path: str, src_root_path: str, manifest: dict) -> dict:
+    """Build the dispatch map (`build_dispatch_map`) and write it to `path`
+    as pretty-printed, sorted-keys JSON with a trailing newline. Returns the
+    built map (so a caller, e.g. a test, need not re-read it off disk).
+    Factored out of the `--emit-map` CLI flag so it is directly callable
+    without shelling out."""
+    dispatch_map = build_dispatch_map(src_root_path, manifest)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(dispatch_map, f, indent=2, sort_keys=True)
+        f.write("\n")
+    return dispatch_map
 
 
 # ---------------------------------------------------------------------------
@@ -981,6 +1259,120 @@ def _self_test_discriminating_control(tmp: str) -> list:
     return failures
 
 
+def _self_test_reached_join_key_typo(tmp: str) -> list:
+    """Issue #3136 WS7's join-key check, first control: a `reached` literal
+    written in source that does NOT match its own site's derived dispatch
+    target (a typo). `REACHED_NOT_DERIVED` (RL - DT) must name the bad
+    literal; `DERIVED_NOT_REACHED` (DT - RL) is non-empty too in this
+    single-target fixture (nothing else could match the correct id either) —
+    both directions failing on the SAME typo is the expected shape here, not
+    a discrimination failure (see the missing-literal fixture below for the
+    control that isolates the other direction alone)."""
+    failures = []
+    _write(
+        os.path.join(tmp, "join1_impl.py"),
+        (
+            "def emit_if_initialized(event_type, level, data, site=None):\n"
+            "    pass\n\n"
+            "def _join1_impl():\n"
+            '    emit_if_initialized("engram.join1.fired", 1, {}, site="join1.fired")\n'
+        ),
+    )
+    _write(
+        os.path.join(tmp, "join1_server.py"),
+        (
+            "import join1_impl as _impl_mod\n\n"
+            "def write_telemetry_record(manifest_id, event_type, fields=None):\n"
+            "    pass\n\n"
+            "class mcp:\n"
+            "    @staticmethod\n"
+            "    def tool():\n"
+            "        def deco(f):\n"
+            "            return f\n"
+            "        return deco\n\n"
+            "@mcp.tool()\n"
+            "def join1_tool():\n"
+            '    write_telemetry_record(manifest_id="join1_server.py:join1_toolTYPO", '
+            'event_type="engram.telemetry.reached", fields={})\n'
+            "    return _impl_mod._join1_impl()\n"
+        ),
+    )
+    sites = find_emit_call_sites(tmp)
+    graph = build_call_graph(tmp)
+    manifest = {"mechanisms": [{"path": "join1_impl.py", "telemetry": [{"site": "join1.fired", "trigger": "MCP tool body"}]}]}
+    M = compute_M(manifest)
+    dispatch_targets = {s.key: derive_dispatch_targets(graph, enclosing_key_for_site(s)) for s in declarable_sites(sites)}
+    RL = find_reached_literals(tmp)
+    DT = derived_target_ids_over_declared_sites(sites, dispatch_targets, M)
+    reached_not_derived, derived_not_reached = reached_literal_mismatches(RL, DT)
+    if "join1_server.py:join1_toolTYPO" not in reached_not_derived:
+        failures.append(
+            "reached-join-key typo self-test: expected the typo'd literal "
+            f"'join1_server.py:join1_toolTYPO' in REACHED_NOT_DERIVED, got {reached_not_derived}"
+        )
+    if not derived_not_reached:
+        failures.append(
+            "reached-join-key typo self-test: expected the correct target id "
+            "('join1_server.py:join1_tool') in DERIVED_NOT_REACHED (its own "
+            "reached literal is the typo'd string, not itself), got empty"
+        )
+    return failures
+
+
+def _self_test_reached_join_key_missing(tmp: str) -> list:
+    """Issue #3136 WS7's join-key check, second control: a declared site
+    whose derived dispatch target has NO `reached` literal at all anywhere
+    in source (the write was simply never added). This isolates
+    `DERIVED_NOT_REACHED` (DT - RL) as the ONLY non-empty direction —
+    `REACHED_NOT_DERIVED` must stay empty, which is what makes this the
+    control for "the other" direction rather than a duplicate of the typo
+    fixture above."""
+    failures = []
+    _write(
+        os.path.join(tmp, "join2_impl.py"),
+        (
+            "def emit_if_initialized(event_type, level, data, site=None):\n"
+            "    pass\n\n"
+            "def _join2_impl():\n"
+            '    emit_if_initialized("engram.join2.fired", 1, {}, site="join2.fired")\n'
+        ),
+    )
+    _write(
+        os.path.join(tmp, "join2_server.py"),
+        (
+            "import join2_impl as _impl_mod\n\n"
+            "class mcp:\n"
+            "    @staticmethod\n"
+            "    def tool():\n"
+            "        def deco(f):\n"
+            "            return f\n"
+            "        return deco\n\n"
+            "@mcp.tool()\n"
+            "def join2_tool():\n"
+            "    return _impl_mod._join2_impl()\n"
+        ),
+    )
+    sites = find_emit_call_sites(tmp)
+    graph = build_call_graph(tmp)
+    manifest = {"mechanisms": [{"path": "join2_impl.py", "telemetry": [{"site": "join2.fired", "trigger": "MCP tool body"}]}]}
+    M = compute_M(manifest)
+    dispatch_targets = {s.key: derive_dispatch_targets(graph, enclosing_key_for_site(s)) for s in declarable_sites(sites)}
+    RL = find_reached_literals(tmp)
+    DT = derived_target_ids_over_declared_sites(sites, dispatch_targets, M)
+    reached_not_derived, derived_not_reached = reached_literal_mismatches(RL, DT)
+    if reached_not_derived:
+        failures.append(
+            f"reached-join-key missing-literal self-test: expected REACHED_NOT_DERIVED "
+            f"empty (no reached literal exists at all in this fixture), got {reached_not_derived}"
+        )
+    if "join2_server.py:join2_tool" not in derived_not_reached:
+        failures.append(
+            "reached-join-key missing-literal self-test: expected "
+            f"'join2_server.py:join2_tool' in DERIVED_NOT_REACHED, got {derived_not_reached}"
+        )
+    return failures
+
+
 def self_test() -> list:
     """Run every synthetic positive/negative fixture. Returns a list of
     failure strings (empty = all passed)."""
@@ -996,18 +1388,16 @@ def self_test() -> list:
         failures += _self_test_dynamic_dispatch_shapes(tmp)
     with tempfile.TemporaryDirectory(prefix="telemetry-gate-selftest-") as tmp:
         failures += _self_test_discriminating_control(tmp)
+    with tempfile.TemporaryDirectory(prefix="telemetry-gate-selftest-") as tmp:
+        failures += _self_test_reached_join_key_typo(tmp)
+    with tempfile.TemporaryDirectory(prefix="telemetry-gate-selftest-") as tmp:
+        failures += _self_test_reached_join_key_missing(tmp)
     return failures
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
-
-def _format_key(key) -> str:
-    if key is None:
-        return "<unresolved>"
-    return f"{key[0]}:{key[1]}"
 
 
 def main() -> int:
@@ -1018,6 +1408,9 @@ def main() -> int:
                      help="print every site's derived dispatch-target set and the dynamic-dispatch scan result")
     ap.add_argument("--manifest", default=MANIFEST_PATH, help="path to packaging/tiers.json")
     ap.add_argument("--src-root", default=None, help="override source root (default: manifest's source_root)")
+    ap.add_argument("--emit-map", default=None, metavar="PATH",
+                     help="write the built telemetry dispatch map (issue #3136 D1) to PATH and exit "
+                          "(the committed src/engram/telemetry_targets.json is regenerated this way)")
     args = ap.parse_args()
 
     failures = self_test()
@@ -1028,7 +1421,8 @@ def main() -> int:
         return 2
     if args.self_test:
         print("telemetry-manifest-gate: self-test OK (emit extraction, NOT_WIRED/UNDECLARED, "
-              "call-graph walk, wrapper non-inflation, dynamic-dispatch shapes, discriminating control).")
+              "call-graph walk, wrapper non-inflation, dynamic-dispatch shapes, discriminating "
+              "control, reached-join-key typo/missing controls).")
         return 0
 
     manifest = load_manifest(args.manifest)
@@ -1037,6 +1431,15 @@ def main() -> int:
     # relationship MANIFEST_PATH has to REPO_ROOT above.
     manifest_repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(args.manifest)))))
     src_root_path = args.src_root or source_root(manifest, manifest_repo_root)
+
+    if args.emit_map:
+        dispatch_map = emit_dispatch_map(args.emit_map, src_root_path, manifest)
+        print(
+            f"telemetry-manifest-gate: wrote dispatch map "
+            f"({len(dispatch_map['sites'])} declared site(s)) -> {args.emit_map}"
+        )
+        return 0
+
     report = run_gate(src_root_path, manifest)
 
     if args.report:
@@ -1048,7 +1451,7 @@ def main() -> int:
         print(f"Emit call sites and their derived dispatch-target sets ({len(report.dispatch_targets)} sites):")
         for key in sorted(report.dispatch_targets):
             targets = report.dispatch_targets[key]
-            targets_str = ", ".join(sorted(_format_key(t) for t in targets)) or "<EMPTY — no dispatch target reached>"
+            targets_str = ", ".join(sorted(dispatch_target_id(t) for t in targets)) or "<EMPTY — no dispatch target reached>"
             print(f"  {key[0]}:{key[1]} -> {{{targets_str}}}")
         print()
         print(f"Dynamic-dispatch scan: {len(report.dynamic_hits)} hit(s), "
@@ -1056,12 +1459,17 @@ def main() -> int:
         for h in report.dynamic_hits:
             marker = "UNRESOLVED" if h in report.unresolved_dynamic_hits else "excluded"
             print(f"  [{marker}] {h.file}:{h.lineno} (shape {h.shape}) — {h.snippet}")
+        print()
+        print(f"Reached literals in source (RL): {sorted(report.reached_literals)}")
+        print(f"Derived target ids over declared sites (DT): {sorted(report.derived_target_ids)}")
+        print(f"REACHED_NOT_DERIVED (RL - DT): {sorted(report.reached_not_derived)}")
+        print(f"DERIVED_NOT_REACHED (DT - RL): {sorted(report.derived_not_reached)}")
 
     if args.check:
         ok = check_ok(report)
         if ok:
             print("telemetry-manifest-gate: CLEAN — NOT_WIRED/UNDECLARED empty, "
-                  "no unresolved dynamic-dispatch hits.")
+                  "no unresolved dynamic-dispatch hits, reached join-key check clean.")
             return 0
         print("telemetry-manifest-gate: FAILED", file=sys.stderr)
         if report.not_wired:
@@ -1077,10 +1485,17 @@ def main() -> int:
             print("  Exclusions whose zero-emit-file justification no longer holds:", file=sys.stderr)
             for v in report.zero_emit_violations:
                 print(f"    {v}", file=sys.stderr)
+        if report.reached_not_derived:
+            print(f"  REACHED_NOT_DERIVED (a `reached` literal in source names no derived "
+                  f"dispatch target -- typo'd or orphaned): {sorted(report.reached_not_derived)}", file=sys.stderr)
+        if report.derived_not_reached:
+            print(f"  DERIVED_NOT_REACHED (a declared site's derived dispatch target has no "
+                  f"matching `reached` literal in source -- its reached count is silently 0 "
+                  f"forever): {sorted(report.derived_not_reached)}", file=sys.stderr)
         return 1
 
     if not args.report:
-        print("telemetry-manifest-gate: nothing to do — pass --self-test, --check, or --report.")
+        print("telemetry-manifest-gate: nothing to do — pass --self-test, --check, --report, or --emit-map PATH.")
     return 0
 
 

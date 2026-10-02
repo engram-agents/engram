@@ -87,9 +87,6 @@
     .view-toggle-btn:hover { background: #16213e; color: #ccc; }
     .view-toggle-btn.active { background: #00d4ff; color: #0d1b36; font-weight: 600; }
     .view-toggle-btn + .view-toggle-btn { border-left: 1px solid #1a4a8a; }
-    .snapshot-now-btn { background: #0d1b36; color: #888; border: 1px solid #1a4a8a;
-                         border-radius: 4px; padding: 6px 12px; font-size: 0.85em;
-                         font-family: inherit; cursor: not-allowed; opacity: 0.6; }
     /* Detail-view empty state -- matches #loading's visual treatment
        (text-align/padding/color), per the existing dark theme. */
     .detail-empty-state { text-align: center; padding: 40px; color: #888; }
@@ -195,8 +192,6 @@
         <button type="button" class="view-toggle-btn" id="view-toggle-normal" data-view="normal">Normal</button>
         <button type="button" class="view-toggle-btn" id="view-toggle-detail" data-view="detail">Detail</button>
       </div>
-      <button type="button" class="snapshot-now-btn" id="snapshot-now-btn" disabled
-              title="Recompute endpoint not yet available">Snapshot now</button>
     </div>
   </div>
   <div id="normal-view">
@@ -234,7 +229,14 @@
     Promise.all([
       fetch(_withAgent('/api/health')).then(r => r.json()),
       fetch(_withAgent('/api/calibration')).then(r => r.json()).catch(() => null),
-      fetch(_withAgent('/api/health/v2')).then(r => r.json()).catch(() => null),
+      // Live score panel (engram-alpha#2518, live-score slice): recomputes
+      // on EVERY page load, straight off the requested agent's own
+      // knowledge.db -- never a stored snapshot file. The stored-snapshot
+      // endpoint (/api/health/v2) is still what the Detail view's history/
+      // series panels read (health-detail.js) -- deliberately unchanged,
+      // per this slice's own scope boundary; only THIS score-tile fetch
+      // switches to the live endpoint.
+      fetch(_withAgent('/api/health/v2/live')).then(r => r.json()).catch(() => null),
     ]).then(([data, calData, v2]) => {
         document.getElementById('loading').style.display = 'none';
         document.getElementById('dashboard').style.display = 'block';
@@ -340,7 +342,12 @@
 
     let scoreValueHtml, scoreFootHtml;
     if (v2Score !== null) {
-      const writtenAt = (v2.provenance && v2.provenance.written_at) || 'unknown';
+      // computed_at (NOT provenance.written_at) -- this is a LIVE
+      // recompute, never a stored checkpoint, so the label must say so
+      // explicitly rather than reading like "as of <time>", which would
+      // read as a stored snapshot's provenance (engram-alpha#2518,
+      // live-score slice).
+      const computedAt = v2.computed_at || 'unknown';
       // Round at render time only (#2867) -- the stored composed.value keeps
       // its full precision; scoreColor()'s threshold comparison below still
       // uses the raw v2Score, only the displayed text is rounded.
@@ -359,7 +366,7 @@
         const unscoredNote = unscoredAspects ? ` (${esc(unscoredAspects)} unavailable)` : '';
         coverageHtml = `<div class="detail-provenance">${esc(coveragePct)}% coverage${unscoredNote}</div>`;
       }
-      scoreFootHtml = `<div class="detail-provenance">as of ${esc(writtenAt)}</div>${coverageHtml}`;
+      scoreFootHtml = `<div class="detail-provenance">LIVE — computed ${esc(computedAt)}</div>${coverageHtml}`;
     } else {
       // FAIL-HONEST (#2757, mirrors #2524's own fix): never fabricate a 0
       // or fall back to the v1 score here, and never draw a gauge arc for

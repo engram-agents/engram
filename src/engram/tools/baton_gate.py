@@ -63,6 +63,19 @@ fails loudly rather than drifting unnoticed by anyone -- the
 carries and this PR was asked not to repeat, mitigated here (for this
 narrower, low-risk slice) with an automated parity check rather than left
 as bare hope.
+
+Addendum (engram-alpha#3039 U1): `_is_pool_sentinel()` in both this module
+and tools/baton.py was renamed `_is_legacy_pool_sentinel()` and demoted to a
+fallback-only helper behind a new `_resolve_phase()` (added to both modules,
+same deliberate-duplication treatment as the three predicates above --
+mirrored, not imported, per this scope note's own reasoning). tools/baton.py
+briefly kept a thin `_is_pool_sentinel = _is_legacy_pool_sentinel` back-compat
+alias for src/forum/tests/test_baton_thin_client.py's 7 monkeypatch call
+sites; that alias was retired in round-1 review (those call sites were
+migrated to the new name instead), so as of U1's merged form `_is_pool_sentinel`
+exists as a name in neither module. `_is_maintainer_flip` here is otherwise
+unchanged except for this one rename in its body (its own phase-edge
+rework is a later unit, per U1's spec).
 """
 
 from __future__ import annotations
@@ -223,8 +236,14 @@ def _resolve_pool_sentinel(engram_home: Optional[str] = None) -> str:
     )
 
 
-def _is_pool_sentinel(name: str) -> bool:
-    """Return True if name (already stripped/lowercased) matches the pool sentinel.
+def _is_legacy_pool_sentinel(name: str) -> bool:
+    """Legacy fallback only -- see _resolve_phase. Exactly today's (pre-#3039)
+    _is_pool_sentinel(): compares against THIS SEAT's own config.json
+    primary_user, seat-DEPENDENT by construction. Renamed by #3039 U1 --
+    mirrors tools/baton.py's own rename; see that module's copy of this
+    function for the full rationale. _is_maintainer_flip below still calls
+    this directly (mechanical rename only, not migrated to _resolve_phase in
+    this unit).
 
     Accepts both the full sentinel ("lei shi") and its first token ("lei") so
     pools initialized with a short-form turn value work correctly (issue #1309).
@@ -238,6 +257,35 @@ def _is_pool_sentinel(name: str) -> bool:
         return True
     first_token = sentinel.split()[0] if sentinel else ""
     return bool(first_token) and name == first_token
+
+
+def _resolve_phase(fields: dict, *, is_bunch: bool) -> tuple[str, bool]:
+    """Resolve a baton's current phase from its frontmatter fields.
+
+    Returns (phase, used_legacy_fallback).
+
+    Mirrors tools/baton.py's own _resolve_phase() -- see that module's copy
+    for the full two-tier-resolution rationale (engram-alpha#3039 U1) and
+    tests/test_baton_gate.py::TestSentinelPredicateParity for the pinning
+    test. DELIBERATELY DOES NOT PRINT -- this module's docstring ("Scope
+    note") requires every function here to be PURE (no argparse, no
+    sys.exit, no printing to stdout/stderr), since this module's functions
+    are called from a long-running Flask process via api_project_flip; a
+    caller that wants the legacy-fallback signal reads the returned
+    `used_legacy_fallback` bool and logs it itself.
+
+    May raise PoolSentinelUnresolved (via _is_legacy_pool_sentinel) when the
+    legacy branch is reached and the sentinel can't be determined --
+    callers must treat that as gate-unavailable and fail closed, same as
+    _is_legacy_pool_sentinel's own callers.
+    """
+    explicit = fields.get("phase", "").strip().lower()
+    if explicit:
+        return explicit, False
+    turn = fields.get("turn", "").strip().lower()
+    if _is_legacy_pool_sentinel(turn):
+        return ("pool" if is_bunch else "merge"), True
+    return "", False
 
 
 def _is_maintainer_flip(
@@ -256,7 +304,7 @@ def _is_maintainer_flip(
 
     Fires on:
       - the literal pool sentinel (the single-human-owner convention
-        `_is_pool_sentinel` already recognizes), OR
+        `_is_legacy_pool_sentinel` already recognizes), OR
       - any OTHER agent -- the actual convention is to flip to a NAMED
         maintainer agent (e.g. "ariadne", "borges"), not the literal
         sentinel -- PROVIDED it is not a self-flip, not the flip TO the
@@ -284,10 +332,10 @@ def _is_maintainer_flip(
     genuine registered participant -- this function does not re-validate
     participant membership.
 
-    May raise PoolSentinelUnresolved (via _is_pool_sentinel) -- callers
-    must treat that as gate-unavailable and fail closed.
+    May raise PoolSentinelUnresolved (via _is_legacy_pool_sentinel) --
+    callers must treat that as gate-unavailable and fail closed.
     """
-    if _is_pool_sentinel(to_agent):
+    if _is_legacy_pool_sentinel(to_agent):
         return True
     if to_agent == current_holder:
         return False

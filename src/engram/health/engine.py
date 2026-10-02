@@ -726,7 +726,10 @@ class HealthEngineSSoTError(Exception):
 
 
 def _verify_l1_against_live_signal_fns(
-    conn: sqlite3.Connection, l1_signals: dict[str, float | _Unavailable]
+    conn: sqlite3.Connection,
+    l1_signals: dict[str, float | _Unavailable],
+    *,
+    skip: "frozenset[str] | None" = None,
 ) -> None:
     """THE SSoT equality control (engram-alpha#2537 design charge: "keep the
     derived block in the snapshot as a cache ... recompute L1-L4 from L0 and
@@ -754,9 +757,25 @@ def _verify_l1_against_live_signal_fns(
     SQL changed without the L0/L1 layers being updated to match (a
     migration that missed a spot) — both are exactly the class of silent
     SSoT-identity failure this whole slice exists to make impossible.
+
+    ``skip`` (engram-alpha#2518, live-score slice): a set of signal names to
+    exclude from this control entirely — for the ONE case where the
+    premise above ("L0 and the live path read the SAME environment") is
+    deliberately not true: ``build_snapshot``'s ``embedding_enabled``
+    override lets a caller supply a DIFFERENT agent's embedder-gate facts
+    than this process's own ``core._embedder``/``core._get_embedding_
+    config()``, which is exactly what the live ``embedding_coverage``
+    signal_fn below still reads. Skipping is scoped to the named signal(s)
+    only — every other signal keeps the full cross-check even when an
+    override is in play elsewhere in the same build. ``None``/empty (the
+    default) runs the check over every registered signal, unchanged from
+    before this parameter existed.
     """
+    skip = skip or frozenset()
     mismatches: list[str] = []
     for name, live_fn in _LIVE_SIGNAL_FNS_FOR_VERIFICATION.items():
+        if name in skip:
+            continue
         live_value = live_fn(conn)
         l1_value = l1_signals[name]
         if l1_value != live_value:
@@ -889,6 +908,36 @@ def _to_jsonable(value: float | _Unavailable):
     return value
 
 
+# Module-layout prefix a `health.*` function's `__module__` can carry,
+# depending on how the `health` package was imported (engram-alpha#3122):
+# `engram.health.metrics` when imported from the source-tree `src/` layout
+# (top-level package `engram` on sys.path), `health.metrics` in the
+# deployed plugin (the build flattens `src/engram/` away -- see this
+# repo's CLAUDE.md "Plugin build restructures code paths"). `_dotted_name`
+# below canonicalizes to the LATTER form, because every snapshot file
+# already on disk uses it (borges-funes's diagnosis, issue #3122 comment,
+# 2026-09-26) -- via `health.version.canonical_health_dotted`, the ONE
+# shared implementation of this rule (engram-alpha#3122 round 2 should-fix
+# 1; `health/series.py`'s `_normalize_layout_prefix` routes through the
+# same function rather than carrying its own copy of the prefix constants).
+
+
+def _dotted_name(fn) -> str:
+    """Layout-independent dotted name for a metric/aspect def's
+    ``signal_fn``/``scoring_fn``. A pure function of ``fn.__module__`` +
+    ``fn.__qualname__`` -- given the SAME function, returns the
+    byte-identical string whether ``fn.__module__`` reads
+    ``engram.health.metrics`` (source-tree layout) or ``health.metrics``
+    (deployed-plugin layout): the raw dotted name is canonicalized through
+    ``health.version.canonical_health_dotted``, which strips a leading
+    ``engram.`` from an ``engram.health.`` prefix, so both layouts collapse
+    to the ``health.metrics.x`` form. This is the producer-side half of the
+    engram-alpha#3122 fix -- see ``health/series.py``'s
+    ``_canonicalize_declared_blob`` for the consumer-side half
+    (declarations already stored under the OLD, un-canonicalized prefix)."""
+    return health_version.canonical_health_dotted(f"{fn.__module__}.{fn.__qualname__}")
+
+
 def _metric_def_to_dict(metric: MetricDef) -> dict:
     return {
         "name": metric.name,
@@ -897,7 +946,7 @@ def _metric_def_to_dict(metric: MetricDef) -> dict:
         "scored": metric.scored,
         "state_valued": metric.state_valued,
         "dive_target": metric.dive_target,
-        "signal_fn": f"{metric.signal_fn.__module__}.{metric.signal_fn.__qualname__}",
+        "signal_fn": _dotted_name(metric.signal_fn),
     }
 
 
@@ -905,7 +954,7 @@ def _aspect_def_to_dict(aspect: AspectDef) -> dict:
     return {
         "name": aspect.name,
         "weight": aspect.weight,
-        "scoring_fn": f"{aspect.scoring_fn.__module__}.{aspect.scoring_fn.__qualname__}",
+        "scoring_fn": _dotted_name(aspect.scoring_fn),
         "metrics": [_metric_def_to_dict(m) for m in aspect.metrics],
     }
 
@@ -1374,13 +1423,44 @@ def build_snapshot(
     checkpoint_mode: str,
     config: EngineConfig = CONFIG,
     model: ScoringModel = MODEL,
+    *,
+    current_turn: "int | None" = None,
+    embedding_enabled: "bool | None" = None,
 ) -> dict:
     """Compute one health-score snapshot (design doc §4.1). Pure
     computation — persistence (writing it somewhere durable) is the
     caller's job; see ``write_snapshot`` below.
 
-    ``checkpoint_mode`` must be one of "nap" / "pre_sleep" / "post_dream"
-    (design doc §4.1).
+    ``checkpoint_mode`` must be one of "nap" / "pre_sleep" / "post_dream" /
+    "live" (design doc §4.1; "live" added by engram-alpha#2518's final
+    slice — see ``write_snapshot``'s own refusal for why "live" snapshots
+    are never persisted).
+
+    ``current_turn`` / ``embedding_enabled`` (engram-alpha#2518, live-score
+    slice): OPTIONAL per-agent overrides for the two process-global reads
+    this function otherwise makes (``core._get_current_turn()`` and the
+    ``core._embedder.is_available() and core._get_embedding_config().get(
+    "enabled", True)`` conjunction that gates ``embedding_coverage``). A
+    single viz-server process serves every agent's request, so the bare
+    ``core.*`` reads silently reflect the SERVER's own environment rather
+    than the REQUESTED agent's — exactly the bug this parameter pair exists
+    to close. ``None`` (the default) falls through to today's ``core``
+    reads unchanged, so every existing nap/pre_sleep/post_dream/MCP caller
+    (which passes neither) is byte-identical to before this parameter pair
+    existed. When ``embedding_enabled`` is given, it overrides BOTH
+    ``embedder_installed_available`` and ``embedder_config_enabled`` L0
+    measurements to the same value (the live route computes their
+    conjunction itself — see ``viz.data.health_v2.get_health_v2_live_data``
+    — so there is no need to carry the two conjuncts separately through this
+    parameter), and — necessarily — the ``embedding_coverage`` entry is
+    skipped in ``_verify_l1_against_live_signal_fns``'s cross-check: that
+    control's whole premise is "L0 and the live ``health.metrics`` SQL path
+    read the SAME environment on the SAME connection", which an explicit
+    per-agent override deliberately breaks for this one signal (the live
+    SQL path always reads THIS process's own ``core._embedder``/
+    ``core._get_embedding_config()``, which has no reason to agree with a
+    DIFFERENT agent's overridden value). See that function's own ``skip``
+    parameter.
 
     Per-metric ``scores.metrics[name]`` (PR5 change): now ``curve_fn(raw)``
     — range [0, 1] — via the metric's bound curve in ``model``, rather than
@@ -1425,15 +1505,17 @@ def build_snapshot(
     violation than the three small global fields the ruling already
     carved out an explicit exception for.
     """
-    if checkpoint_mode not in ("nap", "pre_sleep", "post_dream"):
+    if checkpoint_mode not in ("nap", "pre_sleep", "post_dream", "live"):
         raise ValueError(
-            "checkpoint_mode must be one of 'nap'/'pre_sleep'/'post_dream', "
+            "checkpoint_mode must be one of "
+            "'nap'/'pre_sleep'/'post_dream'/'live', "
             f"got {checkpoint_mode!r}"
         )
 
     import engram_core as core  # lazy — see module-top NOTE
 
-    current_turn = core._get_current_turn()
+    if current_turn is None:
+        current_turn = core._get_current_turn()
 
     # L0 -> L1 (engram-alpha#2537 slice 2): ONE L0 read, reused for BOTH the
     # stored "measurements" block below AND as L1's own input — never a
@@ -1445,14 +1527,32 @@ def build_snapshot(
     # and the L1 derived from it must come from the exact same instant, not
     # two reads that could straddle a concurrent write.
     l0_measurements = health_measurements.compute_all_measurements(conn)
+
+    # engram-alpha#2518 (live-score slice): per-agent embedder-gate override.
+    # Both L0 booleans are forced to the SAME value deliberately — the
+    # caller (viz.data.health_v2.get_health_v2_live_data) has already
+    # combined the agent's own config "enabled" fact with a cheap,
+    # no-model-load install check into ONE effective boolean before ever
+    # reaching here; there is no reason to carry the two conjuncts
+    # separately through this parameter. See this function's own docstring.
+    skip_ssot_signals: "frozenset[str]" = frozenset()
+    if embedding_enabled is not None:
+        l0_measurements = dict(l0_measurements)
+        l0_measurements["embedder_installed_available"] = bool(embedding_enabled)
+        l0_measurements["embedder_config_enabled"] = bool(embedding_enabled)
+        skip_ssot_signals = frozenset({"embedding_coverage"})
+
     l1_signals = health_signals.compute_all_signals(l0_measurements)
 
     # THE SSoT equality control (design charge, see
     # _verify_l1_against_live_signal_fns's own docstring for the full
     # reasoning) — run on every build, on the SAME connection L0 just read,
     # so L1-vs-live divergence is caught the moment it happens rather than
-    # only at some future re-score time.
-    _verify_l1_against_live_signal_fns(conn, l1_signals)
+    # only at some future re-score time. `embedding_coverage` is skipped
+    # exactly when `embedding_enabled` was overridden above — see this
+    # function's own docstring for why that ONE signal's cross-check is
+    # deliberately unable to hold under an explicit per-agent override.
+    _verify_l1_against_live_signal_fns(conn, l1_signals, skip=skip_ssot_signals)
 
     # engram-alpha#2575 PR C0: the per-metric/per-aspect scoring block
     # (curve scores, composition, coverage) is now ONE shared function —
@@ -2105,7 +2205,24 @@ def write_snapshot(
     step is ITSELF best-effort (wrapped in its own inner ``except OSError:
     pass``) — a failure to write or delete the sentinel must never raise
     here either, matching this whole function's best-effort posture.
+
+    REFUSES ``checkpoint_mode == "live"`` (engram-alpha#2518, live-score
+    slice): raises ``ValueError`` before computing or writing anything. A
+    "live" snapshot is a per-request, per-agent recompute (see
+    ``viz.data.health_v2.get_health_v2_live_data``) that must never be
+    persisted as if it were a real nap/pre_sleep/post_dream checkpoint —
+    Lei's direction that "snapshotting and history maintenance is totally
+    a different thing, independent of the scores panels shown on the
+    page" is exactly this: the live score panel recomputes on every page
+    load and never writes a file.
     """
+    if checkpoint_mode == "live":
+        raise ValueError(
+            "write_snapshot refuses checkpoint_mode='live' — a live "
+            "snapshot is a per-request recompute and must never be "
+            "persisted; call build_snapshot(..., 'live', ...) directly "
+            "if you only need the in-memory dict."
+        )
     snapshot = build_snapshot(conn, checkpoint_mode, config, model)
     turn = snapshot["turn"]
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -2511,4 +2628,4 @@ def _count_null_embeddings(conn: sqlite3.Connection, population: str) -> int:
         f"SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND type IN "
         f"({placeholders}) AND embedding IS NULL",
         claim_bearing_types,
-    ).fetchone()["c"]
+    ).fetchone()[0]

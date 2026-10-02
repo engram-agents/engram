@@ -408,6 +408,11 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
             result["memory"] = {
                 "current_turn": core._get_current_turn(),
                 "tier2_threshold": core._get_tier_threshold(conn, 2),
+                # #3075 C5 round 2 (Borges's design ruling): the numeric
+                # embedding_coverage percentage alone is NOT a substitute for
+                # this explicit count+cause (Lei's ruling) — read from the
+                # durable flag, cheap (single-row PK lookup).
+                "embedding_restore": core._get_embedding_restore_flag(conn),
             }
 
         # ── confidence ─────────────────────────────────────────────────────
@@ -813,6 +818,11 @@ def _diagnose_impl() -> str:
             "without_embedding": total_current - with_emb,
             "coverage_pct": round(with_emb / total_current * 100, 1) if total_current else 0,
         }
+
+        # #3075 C5 round 2 (Borges's design ruling): the coverage_pct number
+        # above is NOT a substitute for this explicit count+cause (Lei's
+        # ruling, #3075) — read from the durable restore-completeness flag.
+        memory["embedding_restore"] = core._get_embedding_restore_flag(conn)
 
         metrics["memory"] = memory
 
@@ -1392,6 +1402,24 @@ def _diagnose_impl() -> str:
         banner = core._walguard_degraded_banner()
         if banner:
             metrics["_walguard_warning"] = banner
+
+        # ── Telemetry (WS8, issue #3137, epic #2574) ─────────────────────
+        # Guarded import: engram_telemetry_verdicts.py ships at convenience
+        # tier; engram_stats.py is essential — this repo's established
+        # shape for an essential-tier module optionally consuming a
+        # convenience-tier one (see src/engram/tools/_status_derive.py's own
+        # lazy guarded import, same pattern). _diagnose_impl() must return
+        # normally no matter what happens in this block.
+        try:
+            import engram_telemetry_verdicts as _telemetry_mod
+        except ImportError:
+            metrics["telemetry"] = "telemetry: not installed (convenience tier)"
+        else:
+            try:
+                metrics["telemetry"] = _telemetry_mod.summary_line(_telemetry_mod._default_db_path())
+            except Exception as exc:
+                metrics["telemetry"] = f"telemetry: unavailable ({exc!r})"
+
         return json.dumps(metrics)
     finally:
         conn.close()

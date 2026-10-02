@@ -28,7 +28,9 @@ import argparse
 import json
 import os
 import pwd
+import re
 import socket
+import stat
 import sys
 import urllib.error
 import urllib.request
@@ -290,6 +292,34 @@ def _api_post(url: str, payload: dict) -> dict:
         data=data,
         headers={
             "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    return _do_request(req, url)
+
+
+def _api_post_form(url: str, fields: dict) -> dict:
+    """POST application/x-www-form-urlencoded fields to a forum API endpoint.
+
+    Companion to ``_api_post`` (JSON body) and ``_api_upload`` (multipart
+    with a file): this is for endpoints that read ``request.form`` but take
+    no file, e.g. ``POST /api/packs/<id>/label``.
+
+    Exits with EXIT_UNREACHABLE on connection failure.
+    Exits with EXIT_NOT_FOUND on 404.
+    Exits with EXIT_VALIDATION on 400.
+    """
+    import urllib.parse as _urllib_parse
+
+    data = _urllib_parse.urlencode(
+        {k: v for k, v in fields.items() if v is not None}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
         },
         method="POST",
@@ -570,6 +600,14 @@ def cmd_list(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_read(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    # Suggestion (Ariadne's fairy round, PR-3171): --last 0 or a negative N
+    # used to silently render zero posts, indistinguishable from a typo
+    # that happened to "work". Refuse loudly instead.
+    last_n = getattr(args, "last", None)
+    if last_n is not None and last_n <= 0:
+        print(f"forum read: --last must be a positive integer, got {last_n}", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
     forum_url = _resolve_forum_url(config)
 
     params: dict = {}
@@ -581,18 +619,84 @@ def cmd_read(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     thread = data.get("thread", {})
     posts = data.get("posts", [])
 
-    if args.format == "json":
-        print(json.dumps({"thread": thread, "posts": posts}, indent=2))
-    else:
-        _render_thread_human(thread, posts)
+    # engram-alpha#3138: --new / --last narrow what's DISPLAYED only. The
+    # full `posts` list from the server is always what watermark
+    # advancement below uses — item 7 ("watermark advancement is
+    # unchanged") holds regardless of which display path is taken.
+    display_posts = posts
+    pre_render_note: str | None = None
+    # Round-1 blocker fix (Ariadne's fairy round): a machine-readable
+    # counterpart to pre_render_note for --format json, so a JSON consumer
+    # sees the same "nothing new" / "degraded server" information a human
+    # reader gets from pre_render_note, instead of either an invalid
+    # non-JSON string (the original bug) or the notice silently vanishing.
+    json_notice: str | None = None
+    # True only for the "--new, nothing new" case, where pre_render_note IS
+    # the entire human-format output (no thread/posts to render below it) --
+    # every other path (old-server fallback, --new with real results, plain
+    # read, --last) renders normally.
+    skip_human_render = False
 
-    # v2 read-state: post the watermark server-side (max post id in this thread).
-    # forum-read-cursor.txt is deprecated/vestigial — read-state is pure-server now.
+    if getattr(args, "new", False):
+        # Item 6: distinguish "server doesn't report read state at all" (key
+        # absent — an un-redeployed server) from "reports null" (key
+        # present, agent has simply never read this thread — treated as
+        # everything being new, since there is no floor to filter against).
+        # Never silently show everything (that would be indistinguishable
+        # from the flag doing nothing) and never silently show nothing.
+        if "last_read_post_id" not in thread:
+            pre_render_note = "server does not report read state; showing last 5 — use --last N"
+            json_notice = pre_render_note
+            display_posts = posts[-5:]
+        else:
+            watermark = thread.get("last_read_post_id")
+            if watermark is None:
+                watermark = 0
+            new_posts = [p for p in posts if isinstance(p.get("id"), int) and p["id"] > watermark]
+            total = len(posts)
+            shown = len(new_posts)
+            if shown == 0:
+                # Round-1 blocker (Ariadne's fairy round): this used to
+                # print a plain-text line and return before the --format
+                # check ever ran, so `--new --format json` on the
+                # nothing-new case emitted invalid JSON. Route through the
+                # SAME format branch as every other case instead.
+                json_notice = f"no new posts since your last read ({total} total)"
+                pre_render_note = json_notice
+                display_posts = []
+                skip_human_render = True
+            else:
+                hidden = total - shown
+                pre_render_note = f"(showing {shown} new of {total}; {hidden} earlier hidden)"
+                display_posts = new_posts
+    elif last_n is not None:
+        # Item 5: pure client-side slice, no server dependency at all.
+        display_posts = posts[-last_n:]
+
+    if args.format == "json":
+        payload = {"thread": thread, "posts": display_posts}
+        if json_notice is not None:
+            payload["notice"] = json_notice
+        print(json.dumps(payload, indent=2))
+    else:
+        if pre_render_note:
+            print(pre_render_note)
+        if not skip_human_render:
+            _render_thread_human(thread, display_posts)
+
+    _advance_watermark(forum_url, args.thread_id, agent_name, posts)
+
+
+def _advance_watermark(forum_url: str, thread_id: int, agent_name: str, posts: list) -> None:
+    """v2 read-state: post the watermark server-side (max post id in this
+    thread). forum-read-cursor.txt is deprecated/vestigial — read-state is
+    pure-server now. Always computed from the FULL post list, never a
+    --new/--last-narrowed subset (engram-alpha#3138 item 7)."""
     if agent_name and posts:
         max_post_id = max(p.get("id", 0) for p in posts if isinstance(p.get("id"), int))
         if max_post_id > 0:
             _api_post(
-                f"{forum_url}/api/thread/{args.thread_id}/read",
+                f"{forum_url}/api/thread/{thread_id}/read",
                 {"agent": agent_name, "last_read_post_id": max_post_id},
             )
 
@@ -644,8 +748,8 @@ def _render_thread_human(thread: dict, posts: list) -> None:
 def cmd_post(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     forum_url = _resolve_forum_url(config)
 
-    # Read body from stdin
-    body_md = sys.stdin.read().strip()
+    # Read body from stdin (never blocks on a socket stdin — #2906)
+    body_md = _read_stdin_body("post")
     if not body_md:
         print(
             "forum post: body is required — pipe markdown body via stdin.\n"
@@ -673,14 +777,84 @@ def cmd_post(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # Subcommand: reply
 # ---------------------------------------------------------------------------
 
+def _stdin_kind() -> str:
+    """Classify fd 0: ``"file" | "fifo" | "chardev" | "tty" | "other"``.
+
+    ``file`` / ``fifo`` / non-tty ``chardev`` (``< /dev/null``) are the kinds a
+    ``read()`` on which normally reaches EOF (heredoc, pipe, ``< file``); a
+    ``fifo`` only if its writer closes, which the caller cannot know.  ``tty``
+    is an interactive terminal.  ``other`` (a socket — the Claude Code Bash
+    harness — or an unreadable fd 0) can block forever and is never read (#2906).
+    """
+    try:
+        mode = os.fstat(0).st_mode
+    except OSError:
+        return "other"
+    if os.isatty(0):
+        return "tty"
+    if stat.S_ISREG(mode):
+        return "file"
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    if stat.S_ISCHR(mode):
+        return "chardev"
+    return "other"
+
+
+def _stdin_is_readable_redirect() -> bool:
+    """True iff fd 0 is a regular file, FIFO or non-tty character device."""
+    return _stdin_kind() in ("file", "fifo", "chardev")
+
+
+def _read_stdin_body(subcommand: str) -> str:
+    """Read a body from stdin for ``reply`` (no BODY), ``post`` and ``verify``.
+
+    Redirects are read; a tty is read interactively; anything else (a socket)
+    is refused at once rather than blocking forever (#2906).  Returns the
+    stripped text (possibly empty — the caller owns the empty-body message).
+    """
+    if _stdin_is_readable_redirect() or _stdin_kind() == "tty":
+        return sys.stdin.read().strip()
+    if subcommand == "reply":
+        msg = (
+            "forum reply: no body — pass it as an argument "
+            '(forum reply ID "text") or pipe it on stdin'
+        )
+    else:
+        msg = f"forum {subcommand}: no body on stdin — pipe it in (e.g. heredoc)"
+    print(msg, file=sys.stderr)
+    sys.exit(EXIT_VALIDATION)
+
+
 def cmd_reply(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     forum_url = _resolve_forum_url(config)
 
-    # Read body from stdin
-    body_md = sys.stdin.read().strip()
+    # Body: a positional BODY is authoritative and nothing here may block
+    # (#2906).  With a BODY, stdin is only *looked at*: a regular file always
+    # reaches EOF, so a non-empty one is refused as a second source; a FIFO may
+    # never close, so it is not read and a note says it was ignored; anything
+    # else (socket, tty, char device) is neither read nor mentioned.  Without a
+    # BODY, stdin is the body (_read_stdin_body).
+    if args.body is not None:
+        kind = _stdin_kind()
+        if kind == "file" and sys.stdin.read().strip():
+            print(
+                "forum reply: body given both as argument and on stdin; use one",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        if kind == "fifo":
+            print(
+                "forum reply: note: stdin ignored because a body argument was given",
+                file=sys.stderr,
+            )
+        body_md = args.body.strip()
+    else:
+        body_md = _read_stdin_body("reply")
     if not body_md:
         print(
-            "forum reply: body is required — pipe markdown body via stdin.\n"
+            "forum reply: body is required — pass it as an argument or pipe it via stdin.\n"
+            "  example: forum reply 42 'Great point!'\n"
             "  example: echo 'Great point!' | forum reply 42",
             file=sys.stderr,
         )
@@ -735,7 +909,7 @@ def cmd_verify(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
     # Read verification note from stdin (the established body-from-stdin
     # workflow, same pattern as forum post / forum reply).
-    note = sys.stdin.read().strip()
+    note = _read_stdin_body("verify")
     if not note:
         print(
             "forum verify: a verification note is required — "
@@ -1111,7 +1285,7 @@ def _api_upload(url: str, fields: dict, file_path: str) -> dict:
 
 
 def cmd_pack(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    """Dispatch pack sub-subcommands: publish / list / get."""
+    """Dispatch pack sub-subcommands: publish / list / get / label."""
     forum_url = _resolve_forum_url(config)
 
     if args.pack_subcommand == "publish":
@@ -1120,6 +1294,8 @@ def cmd_pack(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         _pack_list(args, forum_url)
     elif args.pack_subcommand == "get":
         _pack_get(args, forum_url)
+    elif args.pack_subcommand == "label":
+        _pack_label(args, forum_url, agent_name)
     else:
         print("forum pack: unknown subcommand", file=sys.stderr)
         sys.exit(EXIT_VALIDATION)
@@ -1197,8 +1373,12 @@ def _pack_list(args: argparse.Namespace, forum_url: str) -> None:
         nodes = p.get("node_count", "?")
         edges = p.get("edge_count", "?")
         uploaded = p.get("uploaded_at", "?")
+        clearance = p.get("share_clearance", "?")
         print(f"  {pid}")
-        print(f"    by {author}  |  v{version}  |  {nodes} nodes, {edges} edges  |  {uploaded[:19]}")
+        print(
+            f"    by {author}  |  v{version}  |  {nodes} nodes, {edges} edges  |  "
+            f"{uploaded[:19]}  |  clearance: {clearance}"
+        )
 
 
 def _pack_get(args: argparse.Namespace, forum_url: str) -> None:
@@ -1243,6 +1423,36 @@ def _pack_get(args: argparse.Namespace, forum_url: str) -> None:
             _os.unlink(tmp_path)
         except OSError:
             pass
+
+
+def _pack_label(args: argparse.Namespace, forum_url: str, agent_name: str) -> None:
+    """forum pack label <pack-id> <clearance> [--method "..."].
+
+    Sets a pack's share-clearance label. Only the pack's own author may
+    label their pack (self-certification model, #676 slice 1) — the server
+    enforces this and returns a 403 for any other agent.
+    """
+    import urllib.parse as _up
+
+    fields = {"agent": agent_name, "clearance": args.clearance}
+    if args.method:
+        fields["method"] = args.method
+
+    result = _api_post_form(
+        f"{forum_url}/api/packs/{_up.quote(args.pack_id, safe='')}/label",
+        fields,
+    )
+
+    pack = result.get("pack", {})
+    clearance = pack.get("share_clearance", args.clearance)
+    method = pack.get("clearance_method")
+    if method:
+        print(
+            f"forum pack label: ok  pack_id={args.pack_id}  "
+            f"clearance={clearance}  method={method!r}"
+        )
+    else:
+        print(f"forum pack label: ok  pack_id={args.pack_id}  clearance={clearance}")
 
 
 # ---------------------------------------------------------------------------
@@ -1354,8 +1564,85 @@ def cmd_mark_read(args: argparse.Namespace, config: dict, agent_name: str) -> No
 # Argument parser
 # ---------------------------------------------------------------------------
 
+# argparse formats offending values with %r, so a value is a '...' span (or a
+# "..." span when it contains an apostrophe).  Values longer than this are
+# replaced by their length; short ones ("pakc") stay, they help the caller.
+_REDACT_OVER = 24
+_QUOTED_SPAN = re.compile(r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"")
+
+
+# The one argparse message that repeats user text WITHOUT %r: the ambiguous
+# option ("ambiguous option: --s=<value> could match --sort, --since").  The
+# value may contain spaces or quotes, so match up to the last " could match ".
+_AMBIGUOUS_OPTION = re.compile(
+    r"(ambiguous option: )(.*)( could match )", re.DOTALL
+)
+
+
+def _redact_ambiguous_option(m: "re.Match[str]") -> str:
+    opt, sep, value = m.group(2).partition("=")
+    if sep and len(value) > _REDACT_OVER:
+        opt = f"{opt}={'<%d chars, not shown>' % len(value)}"
+    else:
+        opt = m.group(2)
+    return f"{m.group(1)}{opt}{m.group(3)}"
+
+
+def _redact_long_values(message: str) -> str:
+    message = _AMBIGUOUS_OPTION.sub(_redact_ambiguous_option, message)
+
+    def repl(m: "re.Match[str]") -> str:
+        inner = m.group(1) if m.group(1) is not None else m.group(2)
+        if len(inner) > _REDACT_OVER:
+            return f"'<{len(inner)} chars, not shown>'"
+        return m.group(0)
+
+    return _QUOTED_SPAN.sub(repl, message)
+
+
+class _NoEchoArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that never echoes long user text in an error.
+
+    argparse's messages repeat the rejected value ("invalid int value: '<whole
+    body>'", "invalid choice: ...").  For a post body passed by mistake as an
+    argument that echoes the caller's whole message, which reads as a send
+    confirmation under ``| tail`` (#2906).  Two routes, both covered:
+    ``error()`` redacts every quoted value over ``_REDACT_OVER`` characters;
+    ``parse_args`` reports leftover ("unrecognized") arguments by count only.
+    Subparsers are created with this class too (``add_subparsers`` uses
+    ``type(parser)``), so their ``error()`` is this override.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: {_redact_long_values(message)}\n")
+
+    def parse_args(self, args=None, namespace=None):
+        ns, extras = self.parse_known_args(args, namespace)
+        if extras:
+            sub = getattr(ns, "subcommand", None) or "command"
+            sub_sub = getattr(ns, "pack_subcommand", None)
+            if sub_sub:
+                sub = f"{sub} {sub_sub}"
+            if sub == "reply":
+                hint = (
+                    "; the body may be a positional argument "
+                    "(forum reply THREAD-ID 'text') or piped on stdin"
+                )
+            elif sub in ("post", "verify"):
+                hint = f"; a {sub} body goes on stdin, not as an argument"
+            else:
+                hint = ""
+            self.exit(
+                2,
+                f"{self.prog}: {sub}: {len(extras)} unexpected argument(s) "
+                f"(text not shown){hint}.\n",
+            )
+        return ns
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _NoEchoArgumentParser(
         prog="forum",
         description=(
             "Agent-first LAN forum CLI — post, read, list, reply, and check "
@@ -1439,6 +1726,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", choices=["human", "json"], default="human",
         help="Output format: human (default) or json",
     )
+    p_read.add_argument(
+        "--new", action="store_true",
+        help="Show only posts since your server-side read watermark (engram-alpha#3138). "
+             "Takes precedence over --last if both are given.",
+    )
+    p_read.add_argument(
+        "--last", type=int, metavar="N", default=None,
+        help="Show only the last N posts (pure client-side, works on any server). "
+             "Ignored if --new is also given.",
+    )
 
     # -- post --
     p_post = subparsers.add_parser(
@@ -1461,15 +1758,23 @@ def build_parser() -> argparse.ArgumentParser:
     # -- reply --
     p_reply = subparsers.add_parser(
         "reply",
-        help="Reply to a thread; body from stdin",
+        help="Reply to a thread; body as argument or from stdin",
         description=(
-            "Post a reply to an existing thread. Reads the post body from stdin "
-            "(pipe markdown content). Prints the thread_id and new post_id."
+            "Post a reply to an existing thread. The body is the optional BODY "
+            "argument, or, if absent, stdin (pipe markdown content). Giving both "
+            "is refused. On success prints 'forum reply: created  thread_id=N  "
+            "post_id=M' — that line is the ONLY confirmation the reply was sent; "
+            "if you did not see it, the reply was not posted."
         ),
     )
     p_reply.add_argument(
         "thread_id", type=int, metavar="THREAD-ID",
         help="Numeric thread ID to reply to",
+    )
+    p_reply.add_argument(
+        "body", nargs="?", default=None, metavar="BODY",
+        help="Reply body (markdown). If omitted, read from stdin. A body "
+             "starting with '-' needs '--' first: forum reply 42 -- \"-1 from me\"",
     )
 
     # -- online --
@@ -1658,10 +1963,10 @@ def build_parser() -> argparse.ArgumentParser:
     # -- pack --
     p_pack = subparsers.add_parser(
         "pack",
-        help="Pack registry: publish / list / get",
+        help="Pack registry: publish / list / get / label",
         description=(
             "Manage knowledge packs in the forum pack registry. "
-            "Sub-subcommands: publish, list, get."
+            "Sub-subcommands: publish, list, get, label."
         ),
     )
     pack_subs = p_pack.add_subparsers(dest="pack_subcommand", metavar="pack-subcommand")
@@ -1710,6 +2015,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_pack_get.add_argument(
         "--out", metavar="DIR", default=None,
         help="Directory to extract into (default: current directory)",
+    )
+
+    # pack label
+    p_pack_label = pack_subs.add_parser(
+        "label",
+        help="Set a pack's share-clearance label (private / cleared-to-share)",
+        description=(
+            "Mark a pack as 'private' (default, keep internal-only) or "
+            "'cleared-to-share' externally, after reading it in full. "
+            "Only the pack's own author may label their pack — the server "
+            "rejects labeling attempts from any other agent."
+        ),
+    )
+    p_pack_label.add_argument(
+        "pack_id", metavar="PACK-ID",
+        help="Pack id (from `forum pack list`)",
+    )
+    p_pack_label.add_argument(
+        "clearance", metavar="CLEARANCE", choices=["private", "cleared-to-share"],
+        help="New share-clearance state",
+    )
+    p_pack_label.add_argument(
+        "--method", default=None,
+        help=(
+            "Free-text description of what was actually read (required when "
+            "clearance is 'cleared-to-share'), e.g. "
+            "'full read (pack files + database)'"
+        ),
     )
 
     # -- mark-read --
@@ -1769,10 +2102,11 @@ def main() -> None:
     # Agent name is required for most subcommands (search is agent-optional —
     # it's a read-only endpoint, no bump needed).
     # cursor is local-only; describe fetches a public endpoint — no agent bump;
-    # pack list and pack get don't require agent auth, but pack publish does.
+    # pack list and pack get don't require agent auth, but pack publish and
+    # pack label do (both mutate state).
     if args.subcommand not in ("cursor", "describe", "pack", "search"):
         _require_agent_name(agent_name)
-    elif args.subcommand == "pack" and getattr(args, "pack_subcommand", None) == "publish":
+    elif args.subcommand == "pack" and getattr(args, "pack_subcommand", None) in ("publish", "label"):
         _require_agent_name(agent_name)
 
     # Dispatch

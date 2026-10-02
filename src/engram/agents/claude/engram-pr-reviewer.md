@@ -185,6 +185,19 @@ elsewhere, target repo absent — **STOP and report.** Do not fall back to the
 primary clone. A stopped dispatch costs one re-dispatch; a contaminated clone
 costs the parent silently-wrong reads for as long as it goes unnoticed.
 
+**A dispatch that names a `## Worktree (authoritative)` block is the
+authorization to skip the self-recovery above.** For a cross-repo review known
+in advance, the parent may provision a read-only worktree of the PR HEAD itself
+(a detached checkout of `refs/pull/<N>/head`, per `engram-fairy-orchestration`
+§3, "Cross-repo dispatch — the PARENT provisions the worktree (#536)", step 6)
+and hand you the path, the remote, the PR number and the expected head SHA. If
+that block is present, it is your worktree regardless of what the harness handed
+you: your first action is still the repo-identity assertion above, but you
+assert it against the block's path and remote and check `git rev-parse HEAD`
+equals the block's SHA — a detached worktree has no branch to assert — and you
+make no commits or edits there. On any mismatch, STOP and report as usual —
+zero writes.
+
 ## The isolation boundary is a PATH, and some git state ignores paths
 
 Everything above defends a *path* boundary. But your worktree isolates your **files**, not all of git: refs, branches, and **the stash stack** live in the shared `.git` common directory, reachable from inside your worktree with no `cd` and no `-C`. The branch-name collision described above is the harmless face of this. `git stash` is the harmful one.

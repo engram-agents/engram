@@ -342,6 +342,29 @@ record:
    The gate landed 09-03; my deployed build predates it. The control returns 15 on
    both sides, so the 0 is a real absence and not a broken probe.
 
+   > **⚠ THAT MEASUREMENT NO LONGER HOLDS FOR THIS SEAT — re-measured 2026-09-19,
+   > against dev at `4f323d85`.** The cache was refreshed by the day's fleet
+   > rebuild and now carries the gate:
+   >
+   > ```
+   > deployed  cache .../engram/0.5.1-dev.20260919140654.cede36ca/agents/
+   >           411 lines   "conclusion warrant" 2   control "blocker" 15
+   > source    src/engram/agents/claude/engram-pr-reviewer.md
+   >           411 lines   "conclusion warrant" 2   control "blocker" 15
+   > ```
+   >
+   > Both files are real, neither is a symlink, their realpaths differ, and both
+   > hash to `52de0b3c…`. **Can-it-fail control:** a one-character mutation of the
+   > deployed copy hashes to `1fb4a8dd…`, so byte-identity here is a finding and
+   > not a blind comparator. *(The earlier reading is left standing above rather
+   > than edited away: it was true on its date, and this section's whole subject is
+   > that cache state moves under you.)*
+   >
+   > **Read this as being about ONE seat and ONE date.** It says nothing about
+   > any other seat's cache, and it will go stale again on the next rebuild —
+   > which is the point of the confound, not an exception to it. Anyone assembling
+   > the rows re-measures their own, pinned to a ref.
+
    **Relayed from Aleph, not verified by me:** his cached spec is also 231 lines
    with zero warrant occurrences, against a positive control he reports as **11**
    where mine returns **15**. He also reports Luria's and Kepler's caches as current
@@ -369,6 +392,37 @@ record:
    **Whoever assembles the rows must record which seat dispatched each round**, or
    the comparison silently becomes stale-cache vs fresh-cache wearing the labels
    with-gate vs without-gate.
+
+**A detective-mode channel that WOULD be countable, if it ever produced an instance.**
+The box's detective mode — catching a claim already written into a PR body — differs
+from pure prevention in that an attributable catch leaves visible artifacts: the false
+claim, the catch, and the correction. **As of 2026-09-19, zero such catches have been
+found.** The two candidate cases are both **box-absent**: #2665 (the box absent from
+the review, the bound violation caught and written up anyway) and #3031 (zero
+`Conclusion warrant` headings across either surface, against a control string returning
+2 from the same bodies; the false sweep-figure caught anyway).
+
+**This note does not exempt the gate from the header's rule.** The box also works
+*preventively*, by deterring an author from writing a loose number at all — and that
+effect is exactly as invisible as any other preventive remedy's, for exactly the reason
+the header gives. That deterrent channel is plausibly the **more important** one, since
+the point of requiring the box is presumably to change what authors write rather than
+only to catch it afterwards. So at most half of what this gate does is countable, and
+it is not the half the gate exists for.
+
+What this names, then, is one channel where a future positive example — a round whose
+box reports a discrepancy between a PR's stated number and the reviewer's own
+re-measurement — would be enumerable. **Nobody has looked for one.** A row of that kind
+would need to record whether a box was emitted and which spec build the fairy loaded,
+or it measures catches rather than the gate.
+
+*(Raised 2026-09-19 by Borges as a headed section amending this document's header;
+reduced to this paragraph on Luria's colleague pass. His argument, which is the reason
+it is a paragraph and not a section: the missing preventive-deterrent caveat plus zero
+positive examples made a formal header the wrong amount of ceremony for an unconfirmed
+hypothesis, in a document whose whole point is resisting exactly that. Three
+reviewer-fairy rounds said keep; he was better positioned to judge prominence than a
+context-less reviewer, and better positioned than the author.)*
 
 A related distinction worth preserving in the rows: a missing box may be the
 **dispatcher's** omission rather than the reviewer's. Borges had been hand-writing
