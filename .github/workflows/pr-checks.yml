@@ -134,6 +134,7 @@ jobs:
       # Uses body-text grep (same as trap-check): GitHub's closingIssuesReferences
       # GraphQL field is dormant on stacked/non-default-base PRs.
       - name: anti-dup — check target issues for already-closed or competing open PRs
+        if: success() || failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -210,6 +211,7 @@ jobs:
       # files. Existing references are grandfathered; the scrub of the existing
       # corpus happens incrementally in follow-up PRs to issue #51.
       - name: no-new-shipped-node-ids — fail on newly-added concrete ENGRAM node IDs in shipped files
+        if: success() || failure()
         run: |
           BASE_REF="origin/${{ github.base_ref }}"
           # The pattern follows engram_ids.py's documented broad shape:
@@ -341,6 +343,7 @@ jobs:
       # (verified on a stacked-PR review); the body regex works at creation time
       # regardless of base.
       - name: pr-body-close-keyword — fail on off-target close-keyword in the PR body
+        if: success() || failure()
         env:
           # Title + body passed via env, NOT inline ${{ }} in run:, to avoid
           # shell injection from author-controlled content.
@@ -416,6 +419,7 @@ jobs:
       #   \bagentname-nick\b
       - name: name-leak-warn — check for name-leak roster secret
         id: roster-check
+        if: success() || failure()
         run: |
           if [ -z "$NAME_LEAK_ROSTER" ]; then
             echo "NAME_LEAK_ROSTER not configured — name-leak warn-gate skipped" \
@@ -428,7 +432,7 @@ jobs:
           NAME_LEAK_ROSTER: ${{ secrets.NAME_LEAK_ROSTER }}
 
       - name: name-leak-warn — compute diff and scan for name mentions
-        if: steps.roster-check.outputs.skip == 'false'
+        if: (success() || failure()) && steps.roster-check.outputs.skip == 'false'
         id: scan
         continue-on-error: true
         run: |
@@ -453,7 +457,7 @@ jobs:
           NAME_LEAK_ROSTER: ${{ secrets.NAME_LEAK_ROSTER }}
 
       - name: name-leak-warn — post or update PR comment
-        if: steps.roster-check.outputs.skip == 'false'
+        if: (success() || failure()) && steps.roster-check.outputs.skip == 'false'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -518,6 +522,7 @@ jobs:
       # (which correctly narrates `master` as history) is out of scope by
       # design — see tools/stray_master_ref_check.py's module docstring.
       - name: stray-master-ref-check — scan workflows + ops shell for stray master refs
+        if: success() || failure()
         continue-on-error: true
         run: |
           python3 tools/stray_master_ref_check.py | tee -a "$GITHUB_STEP_SUMMARY"
@@ -534,6 +539,7 @@ jobs:
       # stray-master-ref-check's load-bearing-surfaces-only scope) — see
       # tools/stray_baton_path_check.py's module docstring for why.
       - name: stray-baton-path-check — scan for the stale pre-cutover baton path
+        if: success() || failure()
         continue-on-error: true
         run: |
           python3 tools/stray_baton_path_check.py | tee -a "$GITHUB_STEP_SUMMARY"
@@ -566,20 +572,26 @@ jobs:
       # Split rationale mirrors manifest-gate.yml: cheap stdlib+pytest gates run on
       # every dev PR independently of the selective unit-test path in affected-tests.yml.
       - name: Set up Python 3.12 (invariant-checks)
+        id: setup-python-invariant
+        if: success() || failure()
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: invariant-checks — install deps (pytest + pyyaml for frontmatter-lint)
+        id: install-deps-invariant
+        if: success() || failure()
         run: pip install pytest pyyaml
 
       - name: invariant-checks — scan-leaks (whole-repo structural invariant)
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
         # Runs the real-repo integration test: scans the checked-out tree for
         # structural leak patterns (private dev-repo URLs, main-repo paths) with
         # no local personal-name config (CI has none). Exit 1 = leak found.
         run: python3 -m pytest tests/test_scan_leaks.py -q
 
       - name: invariant-checks — frontmatter-lint (all skill SKILL.md frontmatters)
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
         # Checks every src/engram/skills/claude/*/SKILL.md: delimiters present,
         # yaml.safe_load parses, name + description fields non-empty, name
         # matches directory. Fails on the first YAML-breaking colon or malformed
@@ -587,6 +599,7 @@ jobs:
         run: python3 -m pytest tests/test_skill_frontmatter_lint.py -q
 
       - name: invariant-checks — health L0 set hash (MAJOR-bump gate)
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
         # Pins a SHA over the canonical L0 measurement set — every
         # MeasurementDef's (name, population, definition_inputs). An add,
         # remove, or silent redefinition through a remote constant (e.g.
@@ -598,6 +611,7 @@ jobs:
         run: python3 -m pytest tests/test_health_measurements.py -q
 
       - name: invariant-checks — health version tag-diff gate (engram-alpha#2563 Gap 3)
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
         # Checks health/version.py's (MAJOR, MINOR) against how HEAD's L0
         # measurement set differs from the last deployable tag (refs/tags/v*
         # union refs/tags/deploy/*). Two independent checks: well-formedness
@@ -629,17 +643,23 @@ jobs:
       # the full requirements-dev.txt stack — it stays in tests.yml (main-only
       # matrix).  See tests.yml for the full-suite rationale.
       - name: Set up Python 3.12 (manifest-gate)
+        id: setup-python-manifest
+        if: success() || failure()
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: manifest-gate — install pytest
+        id: install-pytest-manifest
+        if: success() || failure()
         run: pip install pytest
 
       - name: manifest-gate — run tag-once manifest gate
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         run: python3 -m pytest tests/test_tiers_manifest.py -q
 
       - name: manifest-gate — run tiers↔test-map completeness check
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         # Asserts every tool tagged in tiers.json has a test-map.json entry
         # (mapped or unmapped).  Pure stdlib + pytest — no heavy deps needed.
         # Moved here from the main-only full suite (tests.yml) so missing
@@ -664,6 +684,7 @@ jobs:
       # step that runs, does nothing, and can never fail would read as
       # coverage that isn't there.
       - name: stdlib-only guards — claude-md-drift, plugin-manifest-import-sync, tool-policy-sync, upgrade-drift-sources, build-plugin-hooks-consistency
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         run: |
           python3 -m pytest \
             tests/test_check_claude_md_drift.py \
@@ -687,6 +708,7 @@ jobs:
       # `server` lazily inside a function, never at module scope, so no
       # fastmcp is pulled in; nothing here needs a cost-model ruling.
       - name: cascade behaviour acceptance — playbox scenarios CD-01..09 + harness
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         run: |
           python3 -m pytest \
             tests/cascade_scenarios \
@@ -721,6 +743,7 @@ jobs:
       # tools/test_id_set_check.py's module docstring for the full marker
       # syntax and the accounting rules.
       - name: test-id-set-check — fail on a shrinking test-id set without a Removed-test marker
+        if: success() || failure()
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -763,6 +786,7 @@ jobs:
       # `fetch-depth: 0` / `fetch-tags: true`. Measured locally: 83 passed
       # in ~6s.
       - name: test-id-set-check-unit-tests — run tests/test_test_id_set_check.py (includes the #2950 TEST_SCAN_ROOTS <-> tests.yml sync gate)
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         run: python3 -m pytest tests/test_test_id_set_check.py -q
 
       # ── 9. hooks-stdout-audit ───────────────────────────────────────────
@@ -795,6 +819,7 @@ jobs:
       # free, same reasoning as test-id-set-check above.
       - name: hooks-stdout-audit — check whether the diff touches src/engram/hooks/ or hooks.json
         id: hooks-diff-check
+        if: success() || failure()
         run: |
           BASE_REF="origin/${{ github.base_ref }}"
           # --no-renames: --name-only collapses a detected rename to the
@@ -814,7 +839,7 @@ jobs:
           fi
 
       - name: hooks-stdout-audit — run test_hooks_json_stdout_audit.py
-        if: steps.hooks-diff-check.outputs.run == 'true'
+        if: (success() || failure()) && steps.hooks-diff-check.outputs.run == 'true' && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         run: python3 -m pytest tests/test_hooks_json_stdout_audit.py -q
 
       # ── 10. team-practice-drift-gate (umwelt#811) ───────────────────────
@@ -867,6 +892,7 @@ jobs:
       # analogous App-token case.
       - name: team-practice-drift-gate — checkout team-practice
         id: team-practice-checkout
+        if: success() || failure()
         continue-on-error: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
         uses: actions/checkout@v4
         with:
@@ -876,7 +902,7 @@ jobs:
           persist-credentials: false
 
       - name: team-practice-drift-gate — run sync_team_practice.py --check
-        if: steps.team-practice-checkout.outcome == 'success'
+        if: (success() || failure()) && steps.team-practice-checkout.outcome == 'success'
         run: |
           python3 team-practice/tools/sync_team_practice.py --check CLAUDE.md \
             --team-practice team-practice/TEAM-PRACTICE.md
@@ -900,7 +926,7 @@ jobs:
       # clear diagnosis. Cheap to get right now rather than rediscover
       # later.
       - name: team-practice-drift-gate — advisory notice (checkout unavailable)
-        if: steps.team-practice-checkout.outcome != 'success'
+        if: (success() || failure()) && steps.team-practice-checkout.outcome != 'success'
         run: |
           if [ "${{ github.event.pull_request.head.repo.full_name != github.repository }}" = "true" ]; then
             echo "::warning::team-practice-drift-gate could not check out engram-agents/team-practice from this fork PR (fork PRs cannot carry this repo's secrets by design). CLAUDE.md's generated-region drift is NOT being checked on this run — see umwelt#811."
@@ -929,6 +955,7 @@ jobs:
       # flag gates the heavier steps that follow).
       - name: check-stubbed-signatures — compute stub-affected test files
         id: stub-check
+        if: success() || failure()
         run: |
           set +e
           python3 tools/check_stubbed_signatures.py --base "origin/${{ github.base_ref }}" > /tmp/stub_affected_tests.txt
@@ -948,7 +975,8 @@ jobs:
           fi
 
       - name: Set up Python 3.12 (check-stubbed-signatures)
-        if: steps.stub-check.outputs.has_hits == 'true'
+        id: setup-python-stub
+        if: (success() || failure()) && steps.stub-check.outputs.has_hits == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -956,7 +984,8 @@ jobs:
           cache-dependency-path: requirements/requirements-dev.txt
 
       - name: check-stubbed-signatures — install dependencies for affected tests
-        if: steps.stub-check.outputs.has_hits == 'true'
+        id: install-deps-stub
+        if: (success() || failure()) && steps.stub-check.outputs.has_hits == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements/requirements-dev.txt
@@ -972,6 +1001,6 @@ jobs:
           fi
 
       - name: check-stubbed-signatures — run stub-affected tests
-        if: steps.stub-check.outputs.has_hits == 'true'
+        if: (success() || failure()) && steps.stub-check.outputs.has_hits == 'true' && steps.setup-python-stub.outcome == 'success' && steps.install-deps-stub.outcome == 'success'
         run: python3 -m pytest $(cat /tmp/stub_affected_tests.txt) -v --tb=short
 
