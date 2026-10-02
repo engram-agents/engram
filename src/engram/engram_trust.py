@@ -84,10 +84,12 @@ def _add_person_impl(
     person node via engram_link_about. The person node captures WHO + structured
     identity facts; observations capture WHAT IS KNOWN ABOUT THEM.
 
-    Mutable-with-trace fields (relation, pronouns, trust_tier, aliases,
-    location_contact) record prior values in metadata.field_traces when changed
-    via engram_update_person. Immutable fields (name, birthday, lineage,
+    Mutable-with-trace fields (relation, pronouns, aliases, location_contact)
+    record prior values in metadata.field_traces when changed via
+    engram_update_person. Immutable fields (name, birthday, lineage,
     architecture, first_session_date) may only be corrected via supersede.
+    trust_tier is neither — see its own Args entry below (alpha#1825: one
+    gate for every trust_tier change, at creation and after).
 
     Args:
         name: The person's name (required). Immutable — legal corrections
@@ -99,10 +101,17 @@ def _add_person_impl(
         pronouns: Free-form pronoun string (e.g. "she/her"). Mutable-with-trace.
         trust_tier: Trust tier string (same values as nodes.trust_tier column:
                     "self", "primary_user", "user_family", "our_side",
-                    "known_external", "unknown", "suspect"). Mutable-with-trace
-                    with elevated review flag on change via engram_update_person.
-                    If provided here, sets both metadata.trust_tier and the
-                    nodes.trust_tier column.
+                    "known_external", "unknown", "suspect"). NOT mutable via
+                    engram_update_person (alpha#1825 — that bypassed the
+                    approval gate). A tier at or above the internal-circle
+                    threshold (our_side, user_family, primary_user, self) is
+                    refused here too and no node is created — create the
+                    person first, then call engram_set_trust_tier, which
+                    enforces primary-user approval (and the is_self gate for
+                    'self'). Tiers below the threshold (known_external,
+                    unknown, suspect) and empty still work exactly as before
+                    and set both metadata.trust_tier and the nodes.trust_tier
+                    column directly.
         aliases: List of alternative names/identifiers for this person used by
                  the Stage 1 auto-suggest pipeline (e.g. ["Wei", "王伟"]).
                  Also accepted as a comma-separated string for backward compat.
@@ -169,6 +178,28 @@ def _add_person_impl(
                 return json.dumps({
                     "error": f"Invalid trust_tier '{trust_tier.strip()}'. "
                              f"Must be one of: {', '.join(sorted(TIER_RANK, key=lambda t: TIER_RANK[t], reverse=True))}"
+                })
+            # alpha#1825: one gate for trust_tier. A tier at/above the
+            # internal-circle threshold cannot be granted at creation time —
+            # that would bypass the primary-user approval gate enforced by
+            # engram_set_trust_tier. No node is created on this path.
+            if TIER_RANK[trust_tier.strip()] >= INTERNAL_THRESHOLD:
+                if trust_tier.strip() == "self":
+                    remedy = (
+                        "add_person(is_self=True), then "
+                        "engram_set_trust_tier(tier='self')"
+                    )
+                else:
+                    remedy = "create the person, then engram_set_trust_tier"
+                return json.dumps({
+                    "error": (
+                        f"trust_tier '{trust_tier.strip()}' is at or above the "
+                        f"internal-circle threshold (rank {INTERNAL_THRESHOLD}) "
+                        f"and cannot be granted at creation time — it would "
+                        f"bypass the primary-user approval gate enforced by "
+                        f"engram_set_trust_tier. No node was created. "
+                        f"Remedy: {remedy}."
+                    )
                 })
             meta_dict["trust_tier"] = trust_tier.strip()
         if location_contact and location_contact.strip():
@@ -276,8 +307,11 @@ def _add_person_impl(
 # ---------------------------------------------------------------------------
 
 # Fields that may be changed in-place via engram_update_person.
+# trust_tier is deliberately NOT here (alpha#1825) — see the explicit
+# trust_tier refusal at the top of _update_person_impl, which names
+# engram_set_trust_tier as the one gate for every trust_tier change.
 _PERSON_MUTABLE_FIELDS = frozenset({
-    "relation", "pronouns", "trust_tier", "aliases", "location_contact",
+    "relation", "pronouns", "aliases", "location_contact",
 })
 # Fields that are immutable — must be corrected via supersede.
 _PERSON_IMMUTABLE_FIELDS = frozenset({
@@ -317,11 +351,20 @@ def _update_person_impl(
     no new node). Records prior values in metadata.field_traces (append-only).
     Emits a field-value-changed cascade flag to nodes citing this person.
 
+    trust_tier is NOT a mutable field here (alpha#1825) — any `updates` dict
+    containing "trust_tier" (any value, valid or not, promotion or demotion)
+    is refused whole, with no field in the same call applied. Use
+    engram_set_trust_tier, which is the one gate for every trust_tier change
+    and enforces the primary-user approval gate (and the is_self gate for
+    tier='self').
+
     Args:
         node_id: Person node ID (pn_NNNN). Must be type='person', is_current=1.
         updates: Dict of field → new_value. Only mutable fields accepted:
-                 relation, pronouns, trust_tier, aliases, location_contact.
+                 relation, pronouns, aliases, location_contact.
                  Immutable-field updates are rejected with a clear error.
+                 trust_tier is rejected with a clear error naming
+                 engram_set_trust_tier as the remedy.
         reason: Optional human-readable explanation for the change.
 
     Returns:
@@ -333,6 +376,25 @@ def _update_person_impl(
         return json.dumps({"error": "node_id is required and cannot be empty."})
     if not updates:
         return json.dumps({"error": "updates must be a non-empty dict of field → new_value."})
+
+    # alpha#1825: one gate for trust_tier. The generic per-field writer below
+    # silently bypassed engram_set_trust_tier's primary-user approval gate
+    # (and the is_self singleton gate for tier='self') for every promotion
+    # AND every demotion. Refuse the whole call before any DB touch — no
+    # other field in the same `updates` dict is applied either. Unconditional
+    # on purpose: it does not depend on _PERSON_MUTABLE_FIELDS, so re-adding
+    # trust_tier there by mistake cannot reopen the bypass.
+    if "trust_tier" in updates:
+        return json.dumps({
+            "error": (
+                "trust_tier cannot be changed via engram_update_person — it "
+                "bypasses the primary-user approval gate that guards every "
+                "trust_tier change, up or down. Use engram_set_trust_tier("
+                "target_pn=..., tier=..., justification_obs_id=..., "
+                "primary_user_approval_obtained=...) instead. No field in "
+                "this call was applied."
+            )
+        })
 
     # Reject immutable fields early — give a clear error before any DB touch.
     immutable_attempted = set(updates.keys()) & _PERSON_IMMUTABLE_FIELDS
@@ -386,7 +448,6 @@ def _update_person_impl(
         now = core._now()
         updated_fields = {}
         field_traces_delta = {}
-        trust_tier_changed = False
 
         for field, new_value in updates.items():
             current_value = meta.get(field)
@@ -400,7 +461,8 @@ def _update_person_impl(
             })
             field_traces_delta[field] = {"prior_value": current_value, "changed_at": now}
 
-            # Apply the new value.
+            # Apply the new value. trust_tier can never reach here — refused
+            # above, before this loop, so no trust_tier branch exists (alpha#1825).
             if field == "aliases":
                 # Accept list or CSV string — normalize to list.
                 if isinstance(new_value, list):
@@ -408,29 +470,15 @@ def _update_person_impl(
                 elif isinstance(new_value, str):
                     new_value = [s.strip() for s in new_value.split(",") if s.strip()]
                 meta["aliases"] = new_value
-            elif field == "trust_tier":
-                if str(new_value) not in TIER_RANK:
-                    return json.dumps({
-                        "error": f"Invalid trust_tier '{new_value}'. "
-                                 f"Must be one of: {', '.join(sorted(TIER_RANK, key=lambda t: TIER_RANK[t], reverse=True))}"
-                    })
-                meta[field] = str(new_value)
             else:
                 meta[field] = new_value
 
             updated_fields[field] = new_value
 
-            if field == "trust_tier":
-                trust_tier_changed = True
-
-        # Persist metadata update (no new node, same node_id).
+        # Persist metadata update (no new node, same node_id). No column-sync
+        # branch for trust_tier — it can never appear in `updates` here.
         update_sql = "UPDATE nodes SET metadata = ?"
         update_params: list = [json.dumps(meta)]
-
-        # Keep nodes.trust_tier column in sync when trust_tier is updated.
-        if trust_tier_changed:
-            update_sql += ", trust_tier = ?"
-            update_params.append(str(updates["trust_tier"]))
 
         update_sql += " WHERE id = ?"
         update_params.append(node_id.strip())
@@ -444,9 +492,13 @@ def _update_person_impl(
         # Emit field-value-changed cascade flags to all nodes that cite this person.
         # Coarse-emit: node-scoped — any node with a cites, about, or
         # derives_from edge to this person gets flagged. Carries field +
-        # prior_value in each flag entry. trust_tier changes → elevated
-        # (review_required=True, non-dismissible). All other changes → cheap
-        # (dismissible on prior→new triage).
+        # prior_value in each flag entry. The review_required/dismissible
+        # keys below are a general per-field mechanism, not trust_tier-
+        # specific — `field == "trust_tier"` is retained verbatim rather than
+        # inlined to a literal because trust_tier can never reach this loop
+        # (refused earlier, alpha#1825), so it is provably always False here;
+        # left unchanged since other fields' review_required=False coverage
+        # (tests/test_person_node_typed_schema.py) reads this same key.
         # #2255 colleague-review fix: this three-relation set is deliberately
         # its own, distinct from core.CITATION_SUPPORT_RELATIONS
         # ({derives_from, supported_by}) — do not unify the two. This asks a
@@ -496,7 +548,11 @@ def _update_person_impl(
             "field_traces_delta": field_traces_delta,
             "cascade_flagged_nodes": flagged_nodes,
             "cascade_flag_type": "field-value-changed",
-            "trust_tier_elevated": trust_tier_changed,
+            # Always False: trust_tier can never reach this function (refused
+            # above, alpha#1825). Kept rather than removed — this key still
+            # has an external reader (tests/test_person_node_typed_schema.py,
+            # server.py's engram_update_person docstring).
+            "trust_tier_elevated": False,
         })
     finally:
         conn.close()

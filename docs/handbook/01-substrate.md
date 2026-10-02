@@ -346,8 +346,8 @@ Marker protocol: written at checkpoint (nap 7757–7767); read by engram_report_
 **how** — Columns added via migration (`engram_core.py:2091–2094`): trust_tier (TEXT), trust_signal_kind, trust_signal_polarity, trust_signal_weight. Backfill (`engram_core.py:2129–2131`): UPDATE nodes SET trust_tier='unknown' WHERE type='person' AND trust_tier IS NULL.
 
 Entry points:
-- `engram_add_person()` (server.py:3587–3642) creates pn_* with trust_tier param.
-- `engram_set_trust_tier()` (server.py:3855–3907) updates tier on existing node.
+- `engram_add_person()` (server.py:3587–3642) creates pn_* with an optional trust_tier, accepted only below the internal-circle threshold (known_external, unknown, suspect). our_side and above, and self, are refused at creation (#1825).
+- `engram_set_trust_tier()` (server.py:3855–3907) is the one path that changes a tier on an existing node, and the only way to reach our_side or above (primary-user approval + justification; the is_self gate for self). `engram_update_person` refuses trust_tier (#1825).
 - `engram_add_trust_signal()` (server.py:4010–4068) creates ts_* node linking to person.
 
 **status-candidate** — **prod-presumed** (infrastructure in place; trust-tier filtering in agent recalls not yet implemented as of current snapshot).

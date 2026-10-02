@@ -4,7 +4,9 @@ Coverage:
   1. engram_add_person with typed fields — no prose bin accepted
   2. Backward compat: role as deprecated alias for relation
   3. engram_update_person — field trace storage + cascade flag emission
-  4. trust_tier update → elevated flag (review_required=True)
+  4. trust_tier: refused via engram_update_person (alpha#1825 — one gate,
+     use engram_set_trust_tier); refused at engram_add_person creation
+     when at/above the internal-circle threshold
   5. Stage 1 auto-suggest: name-match fires suggestion, does NOT auto-wire about-edge
   6. Stage 2 auto-suggest: link_about response carries special_moment_suggestion
   7. special_moments cap (100, #1948): below-cap add succeeds normally; at
@@ -47,13 +49,19 @@ def fresh_server():
 # ---------------------------------------------------------------------------
 
 def test_add_person_typed_fields_accepted():
-    """Full typed-field payload creates a person with correct metadata."""
+    """Full typed-field payload creates a person with correct metadata.
+
+    trust_tier uses "known_external" (below the internal-circle threshold,
+    alpha#1825) rather than "user_family" — a tier at/above the threshold
+    is refused at add_person time; see test_add_person_internal_tiers_refused
+    and tests/test_trust_tier_one_gate.py for that coverage.
+    """
     server = fresh_server()
     payload = {
         "name": "Mira",
         "relation": "daughter",
         "pronouns": "she/her",
-        "trust_tier": "user_family",
+        "trust_tier": "known_external",
         "aliases": ["Leo", "Leonie"],
         "location_contact": "123 Elm St",
         "birthday": "2010-03-15",
@@ -77,7 +85,7 @@ def test_add_person_typed_fields_accepted():
         assert meta["name"] == "Mira"
         assert meta["relation"] == "daughter"
         assert meta["pronouns"] == "she/her"
-        assert meta["trust_tier"] == "user_family"
+        assert meta["trust_tier"] == "known_external"
         assert meta["aliases"] == ["Leo", "Leonie"]
         assert meta["location_contact"] == "123 Elm St"
         assert meta["birthday"] == "2010-03-15"
@@ -86,9 +94,25 @@ def test_add_person_typed_fields_accepted():
         # claim = "name — relation"
         assert row["claim"] == "Mira — daughter"
         # trust_tier column set
-        assert row["trust_tier"] == "user_family"
+        assert row["trust_tier"] == "known_external"
     finally:
         conn.close()
+
+
+def test_add_person_internal_tiers_refused():
+    """add_person with trust_tier at/above the internal-circle threshold is
+    refused and creates no node (alpha#1825). See
+    tests/test_trust_tier_one_gate.py for the full new-contract coverage
+    (impl-level, with DB-state assertions); this is the engram_add_person
+    (payload-level) sibling for the existing-suite regression net."""
+    server = fresh_server()
+    r = json.loads(server.engram_add_person(payload_json=json.dumps({
+        "name": "RefusedTierPerson",
+        "trust_tier": "user_family",
+    })))
+    assert "error" in r, r
+    assert "engram_set_trust_tier" in r["error"], r["error"]
+    assert "person_id" not in r, r
 
 
 def test_add_person_description_not_accepted():
@@ -341,11 +365,17 @@ def test_update_person_unknown_field_rejected():
 
 
 # ---------------------------------------------------------------------------
-# §2 — trust_tier elevated flag
+# §2 — trust_tier update via engram_update_person is REFUSED (alpha#1825)
 # ---------------------------------------------------------------------------
 
-def test_update_trust_tier_elevated_flag():
-    """trust_tier update produces trust_tier_elevated=True and review_required flag."""
+def test_update_trust_tier_refused_names_set_trust_tier_remedy():
+    """engram_update_person no longer accepts trust_tier (alpha#1825 — the
+    generic writer bypassed engram_set_trust_tier's primary-user approval
+    gate). The call is refused, no field_traces entry is written, no cascade
+    flag fires, and the trust_tier column is unchanged. This replaces the
+    old test_update_trust_tier_elevated_flag, which asserted exactly the
+    bypass behaviour this PR closes; see tests/test_trust_tier_one_gate.py
+    for the full new-contract coverage."""
     server = fresh_server()
     r = json.loads(server.engram_add_person(payload_json=json.dumps({
         "name": "TierTest",
@@ -353,7 +383,7 @@ def test_update_trust_tier_elevated_flag():
     })))
     pid = r["person_id"]
 
-    # Create and wire an observation so cascade fires
+    # Create and wire an observation to confirm the cascade does NOT fire.
     obs = json.loads(server.engram_add_observation(payload_json=json.dumps({
         "claim": "TierTest updated trust",
         "quoted_text": "updated trust",
@@ -369,10 +399,10 @@ def test_update_trust_tier_elevated_flag():
         "node_id": pid,
         "updates": {"trust_tier": "our_side"},
     })))
-    assert "error" not in upd, upd
-    assert upd["trust_tier_elevated"] is True
+    assert "error" in upd, upd
+    assert "engram_set_trust_tier" in upd["error"], upd["error"]
 
-    # Check cascade flag has review_required=True
+    # No cascade flag fired — the call never reached the cascade-emit step.
     import engram_core as core
     conn = core._get_db()
     try:
@@ -380,17 +410,19 @@ def test_update_trust_tier_elevated_flag():
         meta = json.loads(row["metadata"] or "{}")
         flags = meta.get("field_changed_flags", [])
         tier_flags = [f for f in flags if f["field"] == "trust_tier"]
-        assert tier_flags, f"No trust_tier flag found; flags: {flags}"
-        assert tier_flags[0]["review_required"] is True
-        assert tier_flags[0]["dismissible"] is False
+        assert tier_flags == [], f"No trust_tier cascade flag should fire: {flags}"
     finally:
         conn.close()
 
-    # Verify trust_tier column also updated
+    # trust_tier column is unchanged.
     conn = core._get_db()
     try:
-        row = conn.execute("SELECT trust_tier FROM nodes WHERE id = ?", (pid,)).fetchone()
-        assert row["trust_tier"] == "our_side"
+        row = conn.execute("SELECT trust_tier, metadata FROM nodes WHERE id = ?", (pid,)).fetchone()
+        assert row["trust_tier"] == "known_external"
+        pid_meta = json.loads(row["metadata"])
+        assert pid_meta["field_traces"] == {}, (
+            f"No field_traces entry should be written on a refused call: {pid_meta['field_traces']}"
+        )
     finally:
         conn.close()
 

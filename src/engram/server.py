@@ -4351,7 +4351,11 @@ _ADD_PERSON_FIELDS = frozenset({
     # Required
     "name",
     # Typed relational fields (shared human + agent; mutable-with-trace)
-    "relation", "pronouns", "trust_tier", "aliases", "location_contact",
+    "relation", "pronouns", "aliases", "location_contact",
+    # Accepted at creation, but NOT mutable-with-trace via engram_update_person
+    # (alpha#1825 — one gate for trust_tier). Internal-circle tiers are
+    # refused here too; see engram_add_person's capability text.
+    "trust_tier",
     # Agent-specific identity fields (immutable)
     "lineage", "architecture", "first_session_date",
     # Immutable identity
@@ -4390,7 +4394,8 @@ _ADD_PERSON_FIELDS = frozenset({
     capability=(
         "Records a person node with typed relational fields only — NOT free-form facts "
         "(those are observations via engram_link_about). At most one is_self=true node "
-        "per graph."
+        "per graph. trust_tier our_side and above (and self) is refused at creation — "
+        "create, then engram_set_trust_tier."
     ),
     annotations={
         "title": "Record a Person",
@@ -4417,8 +4422,14 @@ def engram_add_person(payload_json: str) -> str:
             pronouns (str, optional): Free-form pronoun string. Mutable-with-trace.
             trust_tier (str, optional): Trust tier string — same values as the
                 nodes.trust_tier column ("self", "primary_user", "user_family",
-                "our_side", "known_external", "unknown", "suspect").
-                Mutable-with-trace (elevated review flag on change).
+                "our_side", "known_external", "unknown", "suspect"). NOT
+                mutable via engram_update_person (alpha#1825 — use
+                engram_set_trust_tier for any later change). A tier at/above
+                the internal-circle threshold (our_side, user_family,
+                primary_user, self) is refused here too, with no node
+                created — create the person, then call engram_set_trust_tier.
+                Tiers below the threshold (known_external, unknown, suspect)
+                and empty still work as before.
             aliases (str or list, optional): Alternative names for Stage 1
                 auto-suggest matching. CSV string or JSON list. Mutable-with-trace.
             location_contact (str, optional): Address/contact info. Mutable-with-trace.
@@ -4465,23 +4476,29 @@ _UPDATE_PERSON_FIELDS = frozenset({
 
 # DESIGN INTENT — engram_update_person
 # ------------------------------------
-# In-place update of mutable person-node fields: relation, pronouns, trust_tier,
-# aliases, location_contact. Does NOT create a new node (not a supersede).
-# Immutable fields (name, birthday, lineage, architecture, first_session_date)
-# are rejected — corrections require supersede.
+# In-place update of mutable person-node fields: relation, pronouns, aliases,
+# location_contact. Does NOT create a new node (not a supersede). Immutable
+# fields (name, birthday, lineage, architecture, first_session_date) are
+# rejected — corrections require supersede. trust_tier is neither mutable
+# nor immutable here — alpha#1825 closed the generic-writer bypass of the
+# primary-user approval gate; any `updates` containing "trust_tier" is
+# refused whole, naming engram_set_trust_tier as the remedy.
 #
 # Field-trace audit: every mutable change appends {prior_value, changed_at} to
 # metadata.field_traces[field] — append-only, never mutates existing entries.
 #
 # Cascade flag: emits a 'field-value-changed' flag into metadata.field_changed_flags
-# of all current nodes that cite or are about this person. trust_tier changes
-# carry review_required=True (elevated, non-dismissible); all others are cheap
-# (dismissible). Coarse-emit: node-scoped, not field-scoped.
+# of all current nodes that cite or are about this person. review_required/
+# dismissible is a general per-field mechanism; it is always
+# review_required=False/dismissible=True now that trust_tier can never
+# appear in `updates`. Coarse-emit: node-scoped, not field-scoped.
 @mcp.tool(
     name="engram_update_person",
     capability=(
-        "In-place edit of MUTABLE person fields only (relation, pronouns, trust_tier, "
-        "aliases, location_contact). Immutable fields rejected — use engram_supersede."
+        "In-place edit of MUTABLE person fields only (relation, pronouns, "
+        "aliases, location_contact). Immutable fields rejected — use "
+        "engram_supersede. trust_tier is rejected too — use "
+        "engram_set_trust_tier."
     ),
     annotations={
         "title": "Update Mutable Fields on a Person Node",
@@ -4499,20 +4516,26 @@ def engram_update_person(payload_json: str) -> str:
     nodes that cite or are about this person.
 
     Immutable fields (name, birthday, lineage, architecture, first_session_date)
-    are rejected — use engram_supersede for corrections.
+    are rejected — use engram_supersede for corrections. trust_tier is
+    rejected too (alpha#1825) — use engram_set_trust_tier, which enforces
+    the primary-user approval gate for every trust_tier change, up or down.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
             node_id (str, required): Person node ID (pn_NNNN). Must be
                 type='person' and is_current=1.
             updates (dict, required): Map of field → new_value. Mutable fields:
-                relation, pronouns, trust_tier, aliases, location_contact.
+                relation, pronouns, aliases, location_contact.
                 Attempting to update an immutable field returns an error.
+                Attempting to update trust_tier returns an error naming
+                engram_set_trust_tier as the remedy.
             reason (str, optional): Human-readable explanation for the change.
 
     Returns:
         JSON with status, node_id, updated_fields, field_traces_delta,
-        cascade_flagged_nodes. trust_tier_elevated=True when trust_tier changed.
+        cascade_flagged_nodes. trust_tier_elevated is always False — kept
+        for response-shape compatibility; trust_tier can no longer be
+        changed via this tool (alpha#1825).
     """
     params, err = _parse_payload(payload_json)
     if err:

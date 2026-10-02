@@ -417,9 +417,12 @@ class QueryInspectPersonFieldsTest(unittest.TestCase):
         self.server = fresh_server()
 
     def test_query_tiered_default_includes_pronouns_relation_trust_tier(self):
+        # alpha#1825: trust_tier at/above the internal-circle threshold is
+        # refused at add_person time. "known_external" (below threshold)
+        # still exercises trust_tier rendering in query results.
         pid = _add_person(
             self.server, name="UniqueQueryPersonName",
-            pronouns="she/her", relation="daughter", trust_tier="user_family",
+            pronouns="she/her", relation="daughter", trust_tier="known_external",
         )
         r = json.loads(self.server.engram_query(payload_json=json.dumps({
             "query": "UniqueQueryPersonName",
@@ -428,7 +431,7 @@ class QueryInspectPersonFieldsTest(unittest.TestCase):
         entry = next(e for e in r["results"] if e["id"] == pid)
         self.assertEqual(entry.get("pronouns"), "she/her")
         self.assertEqual(entry.get("relation"), "daughter")
-        self.assertEqual(entry.get("trust_tier"), "user_family")
+        self.assertEqual(entry.get("trust_tier"), "known_external")
 
     def test_query_omits_pronouns_relation_when_absent(self):
         pid = _add_person(self.server, name="BarePersonNoFields")
