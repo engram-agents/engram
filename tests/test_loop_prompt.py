@@ -110,10 +110,33 @@ class TestFormatLoopPrompt:
 
     def test_idempotent_with_leading_whitespace(self):
         """A core that starts with whitespace then the marker is also idempotent."""
-        core = lp.format_loop_prompt("msg")
-        # Add leading whitespace to simulate an already-formatted prompt
+        core = "  \n" + lp.format_loop_prompt("msg")
         result = lp.format_loop_prompt(core)
-        assert result == core
+        assert result == core.lstrip()
+        assert result.count(lp.LOOP_WAKE_MARKER) == 1
+
+    def test_leading_whitespace_before_marker_is_stripped(self):
+        """An already-marked core with leading whitespace returns the marker
+        as the first character — leading whitespace does not stay in front
+        of the marker (#1847)."""
+        core = "  \n<loop-wake>\nbody"
+        result = lp.format_loop_prompt(core)
+        assert result[0] == "<"
+        assert result.count(lp.LOOP_WAKE_MARKER) == 1
+        assert result == "<loop-wake>\nbody"
+
+    def test_idempotent_on_the_stripped_result(self):
+        """format_loop_prompt is idempotent even when the input core had
+        leading whitespace before the marker (#1847)."""
+        once = lp.format_loop_prompt("  \n<loop-wake>\nbody")
+        twice = lp.format_loop_prompt(once)
+        assert once == twice == "<loop-wake>\nbody"
+
+    def test_already_marked_no_leading_whitespace_is_byte_identical(self):
+        """An already-marked core with NO leading whitespace returns
+        byte-identical (unchanged behavior; #1847)."""
+        core = lp.LOOP_WAKE_MARKER + "\nbody"
+        assert lp.format_loop_prompt(core) == core
 
 
 # ---------------------------------------------------------------------------

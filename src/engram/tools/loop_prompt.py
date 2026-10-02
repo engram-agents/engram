@@ -76,7 +76,7 @@ def format_loop_prompt(core: str, **meta) -> str:
 
     # Idempotency guard: already starts with the marker — don't double-add.
     if stripped_core.startswith(LOOP_WAKE_MARKER):
-        return core
+        return stripped_core
 
     parts = [LOOP_WAKE_MARKER]
     if meta:
