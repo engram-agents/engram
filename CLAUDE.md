@@ -1314,23 +1314,46 @@ Then flip it as the turn actually passes along the review pipeline:
 - counterpart **comments / requests changes** → it flips back to you (`flip PR-N <self>`);
   iterate and re-review. Only an explicit colleague **approval** advances the baton — a
   "COMMENTED with considerations" verdict does **not** (that misread is the whole origin).
-- counterpart **approved** → `baton flip PR-N <maintainer> "colleague-APPROVED; ready for merge"`
+- counterpart **approved** → `baton advance PR-N` (or the same hand-off as `baton flip PR-N <maintainer> "colleague-APPROVED; ready for merge"`; on a colleague-bearing PR baton the server runs one strict gate for both and refuses unless GitHub shows an APPROVED review on the current head by the colleague's mapped login)
 
 *(Single-agent mode — no counterpart: skip the colleague flip; after the reviewer-fairy
 converges and your own second-layer pass is clean, flip straight to the maintainer.)*
 
-**A PR is merge-ready ONLY when its baton turn = the maintainer (pool sentinel)** —
-reached only via an explicit colleague approval (or, single-agent, your own converged
-second-layer pass). The maintainer merges from that baton signal — never from a PR that
-merely *looks* parked. A PR with **no baton**, or a baton **not yet flipped to the maintainer**, is
-**not** ready, no matter how long it has sat. Symmetrically: never leave a
-colleague-converged PR without flipping its baton to the maintainer — otherwise its
-readiness is invisible, and a colleague verdict that is actually "COMMENTED with
-considerations" (not an approval) can be misread as ready.
+**A PR is merge-ready ONLY when its baton phase = `merge`** (the `phase:` line of the
+baton file, shown by `baton show`). That is **necessary, not sufficient**: the CI-green gate
+above still applies at merge time; `baton merge` itself requires the turn to be at a
+maintainer-role holder (the pool sentinel, or a named agent who is neither the colleague nor
+the author) and does **not** read `phase` at all, so checking the phase (`baton show`) before
+`baton merge` is a rule for whoever sits at the merge seat, not something the tool enforces;
+and a flip does not move the phase back out of `merge` — a PR the maintainer hands back to
+the author for rework keeps `phase: merge`, so a turn at the author means *not ready*
+whatever the phase says. `turn` stays the whose-move cursor: `baton advance`
+writes it to the merge seat it names (by default the one participant who is neither author
+nor colleague), so a turn at the maintainer is **not** the readiness signal either. On a PR
+baton whose `colleague` was set **before** it reached `merge` (the turn log shows when),
+`phase: merge` is reached through the server's strict peer→merge gate (`baton advance PR-N`,
+or a flip that resolves as the same transition): GitHub must show an `APPROVED` review on the
+PR's current head by a GitHub login mapped to the baton's `colleague`. **A colleague-bearing
+baton at `phase: merge` is not proof that gate ran**: a baton with no colleague can reach
+`merge` through the weak flip (the CLI sends `transition_phase=merge` on that path), and
+`POST /colleague` can still add a colleague to a baton already at `merge` — until the server
+refuses that, check when the colleague was set. That proves a mapped non-author approval on the current head, **not** that the
+*assigned* colleague approved (`colleague` is caller-declared and mutable); the limits are
+in `docs/baton-protocol.md`. The maintainer merges from that phase signal — never from a PR
+that merely *looks* parked. A PR with **no baton**, or a baton **not yet at `phase: merge`**,
+is **not** ready, no matter how long it has sat. Symmetrically: never leave a
+colleague-converged PR without running the advance — otherwise its readiness is
+invisible, and a colleague verdict that is actually "COMMENTED with considerations" (not an
+approval) can be misread as ready. **Fallback — read `turn` as before (turn = the
+maintainer, reached via an explicit colleague approval or, single-agent, your own converged
+second-layer pass) — in these known cases (a list of what has been found, not a proof that
+it is exhaustive):** the baton carries no `phase:` line (a legacy file); or it has no
+`colleague` (single-agent mode keeps the old weak gate); or the host's forum server predates
+the U2b gate (#3284), until it is redeployed.
 
 *Origin: a PR mis-merge — the colleague verdict lived only in a letter and no baton
 tracked the turn-state, so a parked-but-unconverged PR read as merge-ready. The
-baton's `turn:` field is the single load-bearing merge-gate; a letter is not.*
+baton, not a letter, is the merge-gate: its `turn:` field at the time, its `phase:` field since #3284.*
 
 **Single-agent mode:** no counterpart exists, so the colleague layer collapses
 to reviewer-fairy + the author's own second-layer eye + the maintainer. Don't
