@@ -380,11 +380,30 @@ this moved in the opposite direction before their sensitivity check corrected it
 
 ### The scope finding that shrinks this section
 
-**For U4 — the unit this whole design blocks — the read surface is 19 literal, 0 f-string, and 2
-unclassifiable, both of which are module-level literals. 21 of 21 byte-stable.** (Reviewer's
-measurement over the hooks; I have not re-run it.)
+⚠ **Corrected after Sol's U4c re-measure (engram-alpha#3196, dev `8c52a989`).** Revision 3 said:
+*"For U4 — the unit this whole design blocks — the read surface is 19 literal, 0 f-string, and 2
+unclassifiable, both of which are module-level literals. 21 of 21 byte-stable."* That figure counted statements written **inside the hook files**,
+and I had relayed it without re-running it. As a statement of U4's read surface it was wrong in three
+ways:
 
-**So tier 2 is not on U4's path.** It was revision 2's largest new surface and the unit that needs it
+- **The 21 are 19 SELECTs + 2 PRAGMAs.** One PRAGMA is `journal_mode=WAL`
+  (`engram-utility-credit-mention-stop.py:153`), a mode *write* on a read-write connection. One
+  SELECT (`engram-surface-hook.py:1573`) reads the package DB, which §3.5 rules out of scope.
+- **A read registry governs what the hooks REACH, not what the hook files contain.**
+  `engram-lesson-tripwire-hook.py` imports `engram_core.generalization_chain` (`:324`) and calls it
+  on the hook's own connection (`:460`). Walking U2's call graph from the hook entry points, the hooks reach **30 SELECTs, 2 of
+  them f-strings** (`engram_core.py:1530` and `:1541`, both `WHERE id IN ({_ph})`).
+- **That 30 is "found by this instrument", neither an upper nor a lower bound.** U2's edges match
+  calls by bare name (which over-reaches) and produce no edge for attribute calls (which
+  under-reaches). Which effect dominates is not measured.
+
+**What survives:** both f-strings are variable-arity `IN`, which this section already assigns to
+tier 1 through `json_each` (below). **What does not:** "0 f-string" and "21 of 21". The two sites
+must be rewritten before U4c's real-tree scan can pass. That rewrite is its own precursor unit
+(U4c-0), not folded into U4c, because `engram_core` is shared with the write path and the change
+needs its own equivalence test, the empty list included (#3196).
+
+**So tier 2 is still not on U4's path.** It was revision 2's largest new surface and the unit that needs it
 does not exist yet. It is specified below in outline because the shape matters for whether tier 1's
 boundary is drawn correctly — but it is **deferred to the unit that actually needs it**, and U4 should
 build tier 1 plus §3.5's constraint and nothing else. A design that specifies speculatively is worse
@@ -894,7 +913,7 @@ important thing the review produced.
 | **vec0 detection at registration** (§3.5) | The rule is decided. Detection is measured for FTS5 (author, Darwin) and for vec0 on one runtime (Mira: Linux, SQLite 3.45.1, sqlite-vec 0.1.9 — direct, alias and view all surface). Not established for every module or platform. The schema route is authoritative; the token-match backstop can miss quoting or view indirection, so it is not a never-under-deny guarantee, and incomplete classification fails closed. |
 | **How incomplete classification is DETECTED** (§3.5) | Owed by U4, and it must be **measured**, not asserted. "Fails closed" is only as good as the check that notices a classification is incomplete; the build must show a template whose reads the audit cannot fully account for, and show that registration denies it. (Mira, at approval.) |
 | **Two new budgets with no number** (§4) | `SQLITE_LIMIT_LENGTH` and the end-to-end request deadline — including its per-method variant for `snapshot` — both need values chosen against the owner contract (§8). |
-| **Tier 2 is DEFERRED, not designed** (§3.2) | U4's own surface is 21/21 byte-stable, so tier 2 is off its path. Outline only; it gets specified by the unit that needs it. Deferring it is deliberate — revision 2 specified it speculatively and that was the larger error of the two in §3.2. |
+| **Tier 2 is DEFERRED, not designed** (§3.2) | U4's reached reads that are not literals are the two variable-arity `IN` f-strings, which are tier-1 `json_each` cases (§3.2, corrected after #3196), so tier 2 is off its path. Outline only; it gets specified by the unit that needs it. Deferring it is deliberate — revision 2 specified it speculatively and that was the larger error of the two in §3.2. |
 | **The authorizer's action allowlist is an OBLIGATION, not a finished list** (§3.1) | Owed by U4: derive it from the census plus the owner's operations, and check every denied action for a caller that swallows the denial. `SQLITE_TRANSACTION` is the first known member, not the last. |
 | **The Linux peer-credential arm is UNMEASURED by me** (§2.2) | **Partly measured by the reviewer in revision 5** — a same-uid `SO_PEERCRED` read, 12 bytes, correct decode (§6). The foreign-uid rejection is measured by no one. Needs a first-hand run on a Linux seat before U4 builds. Documented is not measured — the whole of §1 exists because that distinction has cost this fleet real rounds. |
 | **Cross-uid rejection control** (§6) | Not run. Needs a second uid; the host-account route needs the user's OK. |
@@ -917,6 +936,12 @@ important thing the review produced.
 ## 9. What changed, revision by revision, and who found it
 
 Recorded because a reader should be able to see which parts survived attack.
+
+### Follow-up — U4c re-measure (Sol, #3196)
+
+| § | change | found by |
+|---|---|---|
+| §3.2 | **The U4 scope finding corrected.** "21 of 21 byte-stable, 0 f-string" counted statements inside the hook files only, and included a WAL-mode PRAGMA write and a package-DB read. By call path the hooks reach 30 SELECTs, 2 of them f-string variable-arity `IN` reads in `engram_core`; that count is an instrument's finding, not a bound. Tier 2 stays off U4's path because both f-strings are tier-1 `json_each` cases; their rewrite becomes precursor unit U4c-0. | Sol (re-measure); Aleph (design owner, correction) |
 
 ### Follow-up — U4a build findings (Borges, #3194)
 
