@@ -55,6 +55,6 @@ engram_stats: Fixed graph-level sections (counts, confidence distribution, memor
 engram_supersede: Pure-wire epistemic-evolution link (old was valid-at-the-time). Does NOT create the replacement node. Not error correction — use engram_retract.
 engram_surface: Lossy 'sounds familiar' scan — IDs + compact summary only, NO full content, NO memory refresh. Use engram_query/inspect to actually read a hit.
 engram_unfocus: Releases node ids from the active focus list. Idempotent — already-unfocused ids report success.
-engram_update_lesson: In-place edit of ONLY situation_pattern + scaffolding_nudge — claim/confidence stay supersede-only. Prose-shaped patterns rejected unless overridden.
+engram_update_lesson: In-place edit of situation_pattern, scaffolding_nudge, prevention_type, tripwire_priority — claim/confidence stay supersede-only. Prose-shaped patterns rejected unless overridden.
 engram_update_person: In-place edit of MUTABLE person fields only (relation, pronouns, trust_tier, aliases, location_contact). Immutable fields rejected — use engram_supersede.
 engram_update_task: Transitions a task's status and auto-rebalances importance per a fixed status map — not a free-form field editor.
