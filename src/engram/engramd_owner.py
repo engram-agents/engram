@@ -242,6 +242,8 @@ import threading
 import time
 from pathlib import Path
 
+import engram_pidfile
+import engram_walguard
 import engramd_client as ec
 
 # ---------------------------------------------------------------------------
@@ -249,6 +251,32 @@ import engramd_client as ec
 # ---------------------------------------------------------------------------
 
 DEFAULT_PID_NAME = "engramd.pid"
+# argv substring of a live owner (`python .../engramd_owner.py`, `python -m
+# engramd_owner`): the program-identity guard in engram_pidfile (#3240).
+_PIDFILE_PROGRAM_MARKER = "engramd_owner"
+
+# #3240 item 2: exit status of an owner that shut down on a DISPLACED
+# substrate (its -wal/-shm fds no longer match the files on disk). Distinct
+# from 0 (healthy) and 1 (OwnerAlreadyRunning) so a supervisor can tell a
+# displaced exit from a clean one. main() ends the process with os._exit(
+# EXIT_DISPLACED) on this path -- see main() for why finalization is skipped.
+EXIT_DISPLACED = 3
+
+# #3240 item 2: methods that never touch the store and so are exempt from the
+# displacement self-check. Every OTHER registered method is guarded by
+# default (a new store method that forgets the guard fails safe).
+NO_STORE_METHODS = frozenset({"ping"})
+
+# #3240 item 2: connections of a displaced owner are parked here for the life
+# of the process and never closed or cleared. Merely dropping the references
+# does NOT avoid a clean close in CPython: an unreferenced sqlite3.Connection
+# is closed by GC, and interpreter finalization closes the rest -- and the
+# last close of a stale holder checkpoints an orphan WAL over newer data
+# (see engram_walguard's docs for the harm). A displaced process is meant to
+# EXIT (main() -> os._exit(EXIT_DISPLACED)); calling start() again in the same
+# process after a displaced stop is unsupported -- the parked fds make a fresh
+# store at the same path read as displaced. Restart the process instead.
+_DISPLACED_CONNECTIONS_KEEPALIVE: list = []
 DEFAULT_STORE_NAME = "knowledge.db"
 
 # Response-size cap for INCOMING requests TO the owner (contract item 10).
@@ -786,6 +814,22 @@ class EngramdOwner:
         # is per-call). See SNAPSHOT_FINALIZE_SLOTS's own comment and
         # _handle_snapshot()'s docstring for the full protocol.
         self._finalize_slots = threading.BoundedSemaphore(SNAPSHOT_FINALIZE_SLOTS)
+        # #3240 item 2: set once engram_walguard.assert_not_displaced has
+        # confirmed this owner's -wal/-shm fds are displaced. From then on
+        # _cleanup() must NOT .close() either connection (a clean close of
+        # a stale holder checkpoints an orphan WAL over data other
+        # connections have since written -- see engram_walguard's docs).
+        self._displaced = False
+        # Method table: every KNOWN method. _dispatch() guards each one not
+        # in NO_STORE_METHODS, so registering a method here is all a new
+        # store-touching operation needs to be displacement-guarded.
+        # Entries late-bind through `self` (lambda) rather than capturing
+        # bound methods, so a replaced `self._handle_snapshot` (tests do
+        # this) is still what gets called.
+        self._methods = {
+            "ping": lambda params, deadline: self._handle_ping(params, deadline),
+            "snapshot": lambda params, deadline: self._handle_snapshot(params, deadline),
+        }
 
     # -- lifecycle ------------------------------------------------------
 
@@ -850,6 +894,9 @@ class EngramdOwner:
         # contract requires the store to pre-exist, and a real seat's
         # bootstrap already creates knowledge.db before any daemon
         # starts.
+        # Fresh connections, fresh verdict: a previous run's displacement
+        # says nothing about the connections opened here.
+        self._displaced = False
         self._owner_conn = sqlite3.connect(str(self.store_path), check_same_thread=False)
         # Permissive by DESIGN, not authorizer-less -- see the module
         # docstring's "Two connections" section and
@@ -1194,6 +1241,30 @@ class EngramdOwner:
         # under a running backup(); it waits for it, then closes. No
         # in-flight _handle_snapshot() call can race this close.
         with self._owner_lock:
+            if not self._displaced and self._owner_conn is not None:
+                # #3240 item 3: an owner displaced but never asked for a
+                # store operation must not take the clean-close path just
+                # because no request tripped the guard. Check once here.
+                try:
+                    engram_walguard.assert_not_displaced(str(self.store_path))
+                except engram_walguard.SubstrateDisplaced as exc:
+                    self._displaced = True
+                    print(
+                        f"[engramd] substrate displaced detected at shutdown: {exc}",
+                        file=sys.stderr,
+                    )
+            if self._displaced:
+                # #3240 item 2: displaced substrate -- NEVER close. Park the
+                # connections in the module-level keepalive list: dropping
+                # the references would let GC (or interpreter finalization)
+                # close them, and the last close checkpoints an orphan WAL
+                # over newer data. main() then ends the process with
+                # os._exit(EXIT_DISPLACED) so finalization cannot run.
+                for conn in (self._owner_conn, self._client_read_conn):
+                    if conn is not None:
+                        _DISPLACED_CONNECTIONS_KEEPALIVE.append(conn)
+                self._owner_conn = None
+                self._client_read_conn = None
             if self._owner_conn is not None:
                 try:
                     self._owner_conn.close()
@@ -1217,25 +1288,14 @@ class EngramdOwner:
             self._shutdown.wait(timeout=1.0)
 
     def _recorded_pid_is_alive(self) -> bool:
-        """Mirrors engram-surface-daemon.py's _recorded_pid_is_alive()
-        exactly (contract items 1+2's shared mechanism): False for a
-        missing/unreadable/garbage pidfile, or a PID that signal 0 confirms
-        is dead. Best-effort -- any error means "assume dead" so a corrupt
-        pidfile never blocks a fresh owner from starting."""
-        try:
-            with open(self.pid_path) as f:
-                pid = int(f.read().strip())
-        except (OSError, ValueError):
-            return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except OSError:
-            # Any other errno (e.g. EPERM on a reused PID owned by someone
-            # else) -- treat as "not confirmably ours", same as dead.
-            return False
-        return True
+        """Delegates to engram_pidfile.recorded_pid_is_alive() -- the single
+        source shared with engram-surface-daemon.py (#3240 item 1): a
+        recorded pid counts as alive only if that process could have
+        written the pidfile (not merely any live process that reused the
+        pid). False for a missing/unreadable/garbage pidfile."""
+        return engram_pidfile.recorded_pid_is_alive(
+            self.pid_path, program_marker=_PIDFILE_PROGRAM_MARKER
+        )
 
     # -- accept loop ------------------------------------------------------
 
@@ -1430,16 +1490,25 @@ class EngramdOwner:
         if not isinstance(params, dict):
             params = {}
 
-        if method == "ping":
-            return {
-                "status": "ok",
-                "result": {
-                    "contract_version": self.contract_version,
-                    "store_path": str(self.store_path),
-                },
-            }
-        if method == "snapshot":
-            return self._handle_snapshot(params, deadline)
+        handler = self._methods.get(method) if isinstance(method, str) else None
+        if handler is not None:
+            if method not in NO_STORE_METHODS:
+                # #3240 item 2: the owner's own displacement self-check,
+                # for EVERY known store-touching method (guarded by
+                # default; unknown methods never reach here, so they cost
+                # no /proc scan). detection_unavailable is NOT
+                # displacement -- assert_not_displaced returns quietly.
+                try:
+                    engram_walguard.assert_not_displaced(str(self.store_path))
+                except engram_walguard.SubstrateDisplaced as exc:
+                    self._displaced = True
+                    return {
+                        "status": "rejected",
+                        "reason": "substrate_displaced",
+                        "detail": str(exc),
+                        "remedy": exc.remedy,
+                    }
+            return handler(params, deadline)
 
         return {
             "status": "rejected",
@@ -1449,6 +1518,15 @@ class EngramdOwner:
                 "check the method name against the owner's supported "
                 "operations (this build: ping, snapshot)"
             ),
+        }
+
+    def _handle_ping(self, params: dict, deadline: float) -> dict:
+        return {
+            "status": "ok",
+            "result": {
+                "contract_version": self.contract_version,
+                "store_path": str(self.store_path),
+            },
         }
 
     def _handle_snapshot(self, params: dict, deadline: float) -> dict:
@@ -1636,6 +1714,13 @@ class EngramdOwner:
                     "whose parent directory already exists"
                 ),
             }
+        # PREMISE (#3240 item 3): os.access() here tests the OWNER's rights,
+        # which equals the CALLER's rights only because the peer-credential
+        # gate (_check_peer_credentials) admits solely callers whose uid is
+        # the owner's. Admitting any cross-uid caller requires replacing
+        # this with a check against the CALLER's rights. Pinned by
+        # tests/test_engramd_owner_displacement_3240.py::
+        # test_snapshot_dest_rights_premise_peer_uid_equals_owner.
         if not os.access(parent, os.W_OK):
             return {
                 "status": "rejected",
@@ -1973,6 +2058,26 @@ def main() -> int:
         return 1
     print(f"[engramd] listening on {owner.socket_path} (pid {os.getpid()})", file=sys.stderr)
     owner.wait_forever()
+    # Reading _displaced right after wait_forever() is safe because stop()
+    # (and so _cleanup(), which can set the flag) runs in the signal handler
+    # on THIS main thread before wait_forever() returns. If stop() is ever
+    # called from another thread, wait for its cleanup to finish before this
+    # read, or finalization could close displaced connections.
+    if owner._displaced:
+        # #3240 item 2: skip interpreter finalization. The displaced
+        # connections are parked in _DISPLACED_CONNECTIONS_KEEPALIVE, but
+        # finalization would still close them (and the last close
+        # checkpoints an orphan WAL over newer data). Socket and pidfile
+        # were already removed by _cleanup().
+        print(
+            f"[engramd] exiting WITHOUT closing the store connections: the "
+            f"substrate was displaced (exit {EXIT_DISPLACED}); restart the "
+            f"owner against the current store",
+            file=sys.stderr,
+        )
+        sys.stderr.flush()
+        sys.stdout.flush()
+        os._exit(EXIT_DISPLACED)
     return 0
 
 

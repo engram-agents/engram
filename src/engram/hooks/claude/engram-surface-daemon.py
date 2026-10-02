@@ -202,8 +202,12 @@ if _this_dir not in sys.path:
 from _hooklib import resolve_runtime_dir
 
 PROJECT_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
+_PIDFILE_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_pidfile.py")
 SOCKET_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.sock")
 PID_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.pid")
+# argv substring of a live daemon (its script name): the program-identity
+# guard in engram_pidfile (#3240).
+_PIDFILE_PROGRAM_MARKER = "engram-surface-daemon"
 
 # Bridge for downstream callers: ensure ENGRAM_HOME is set so any sibling process inherits it.
 os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
@@ -357,26 +361,23 @@ def cleanup(*args):
 
 
 def _recorded_pid_is_alive() -> bool:
-    """Return True if PID_PATH names a process that is still running.
-
-    False for: PID_PATH absent, unreadable, non-integer content, or a PID
-    that signal 0 confirms is dead. Best-effort -- any error means "assume
-    dead" so a corrupt pidfile never blocks a fresh daemon from starting.
+    """Return True if PID_PATH names a live process that could have written
+    it. Delegates to engram_pidfile.recorded_pid_is_alive() -- the single
+    source shared with engramd_owner.py (#3240 item 1): a pid reused by an
+    unrelated process after the instance crashed no longer reads as a live
+    daemon. False for PID_PATH absent, unreadable, or non-integer content.
     """
-    try:
-        with open(PID_PATH) as f:
-            pid = int(f.read().strip())
-    except (OSError, ValueError):
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        # Any other errno (e.g. EPERM on a reused PID owned by someone
-        # else) -- treat as "not confirmably ours", same as dead.
-        return False
-    return True
+    # Resolved via the runtime-dir mechanism (never a fixed parents[N]; the
+    # plugin build flattens hooks/claude/ -> hooks/). PROJECT_DIR is put on
+    # sys.path later in main() for engram_client; do it here too, since this
+    # check runs first.
+    if _PIDFILE_DIR not in sys.path:
+        sys.path.insert(0, _PIDFILE_DIR)
+    import engram_pidfile
+
+    return engram_pidfile.recorded_pid_is_alive(
+        PID_PATH, program_marker=_PIDFILE_PROGRAM_MARKER
+    )
 
 
 def main():
