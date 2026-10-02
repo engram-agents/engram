@@ -1068,3 +1068,69 @@ class TestTargetIsSubdirectory:
         assert before_sha == after_sha, (
             "Outer repo HEAD changed despite subdirectory-target abort — target was mutated."
         )
+
+
+# ---------------------------------------------------------------------------
+# Definition-of-released: the --push summary prints the two remaining public steps
+# ---------------------------------------------------------------------------
+
+class TestFinalSummaryRemainingSteps:
+    """Contract: --push summary prints a REMAINING block (before the CAVEAT lines);
+    a local-only run prints a one-line pointer instead; the existing 'target tag'
+    summary line stays in both. Driven end to end via subprocess, with a local
+    bare repo as the target's origin so --push really pushes."""
+
+    _AUTHOR = "Test Author <test@test.local>"
+
+    def _run(self, tmp_path, push: bool):
+        src = _make_source_repo(tmp_path)
+        tgt = _make_target_repo(tmp_path)
+        argv = ["--version", "v0.1.0", "--source", str(src), "--target", str(tgt),
+                "--yes", "--author", self._AUTHOR]
+        if push:
+            bare = tmp_path / "origin.git"
+            _git(["init", "--bare", str(bare)], cwd=str(tmp_path))
+            _git(["remote", "add", "origin", str(bare)], cwd=str(tgt))
+            argv.append("--push")
+        result = _run_tool(argv)
+        assert result.returncode == 0, (
+            f"Tool failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        return result.stdout
+
+    def test_push_summary_prints_remaining_block(self, tmp_path):
+        out = self._run(tmp_path, push=True)
+        assert ('REMAINING — the release is NOT done until these are live '
+                '(docs/RELEASING.md, "Announcing" + "Tell the public"):') in out
+        assert ("  [ ] Website Versions entry, en + zh, live at "
+                "https://engram-agents.org/versions  "
+                "(owner: Ariadne; Zephyr may do zh)") in out
+        assert ("  [ ] Newsletter sent to ENGRAM Communications (Buttondown), "
+                "linking the live Versions entry and the Releases page  "
+                "(owner: Ariadne)") in out
+        assert ("Report the version as released only after all three; "
+                "Releases entry first, then website, then newsletter.") in out
+        lines = out.splitlines()
+        rel = [i for i, l in enumerate(lines) if "[ ] Releases entry" in l]
+        web = [i for i, l in enumerate(lines) if "[ ] Website" in l]
+        assert rel and web and rel[0] < web[0]
+        assert "owner: Ariadne" in out
+        # Ordering: after the summary lines, before the CAVEAT.
+        assert out.index("target tag") < out.index("REMAINING") < out.index("CAVEAT:")
+        assert "After --push, three public steps remain" not in out
+
+    def test_local_summary_prints_one_line_note_not_block(self, tmp_path):
+        out = self._run(tmp_path, push=False)
+        assert ('  After --push, three public steps remain (Releases entry, '
+                'website entry, newsletter); see docs/RELEASING.md '
+                '"Announcing" + "Tell the public".') in out
+        assert "three public steps remain" in out
+        assert "REMAINING" not in out
+        assert "[ ] Website Versions entry" not in out
+
+    @pytest.mark.parametrize("push", [True, False])
+    def test_target_tag_summary_line_preserved(self, tmp_path, push):
+        out = self._run(tmp_path, push=push)
+        assert "  target tag   : v0.1.0 @ " in out
+        assert "=== Final summary ===" in out
+        assert "CAVEAT: scan-leaks is necessary-but-not-sufficient" in out

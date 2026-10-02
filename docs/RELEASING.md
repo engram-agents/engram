@@ -333,6 +333,21 @@ Once the rc has dogfooded clean, publish it to the public repo,
 repo carries **one squashed commit per version** — it is a clean, leak-scrubbed
 release snapshot, not a mirror of this repo's full history.
 
+> **Definition of released (Lei, 2026-10-02).** A version is reported as
+> *released* only when all three public surfaces are live, in this order:
+> (1) the public repo carries the tag and the Releases entry (the cutover
+> tool plus `gh release create`, below); (2) the website Versions entry is
+> live in both languages at engram-agents.org/versions; (3) the newsletter has
+> gone to the *ENGRAM Communications* subscribers. The tool does the tag half of (1); the Releases entry is a separate `gh release create` (a tag push never creates it, see *Announcing the public release*).
+> (2) and (3) are Ariadne's by standing assignment (Zephyr may do the Chinese
+> text); the two steps are specified under "Tell the public" below, and the
+> cutover tool's `--push` summary prints all three remaining steps as a block so
+> the success line cannot be mistaken for the finish line. Until (3) is done
+> the commander's reports say "repo released; website and newsletter
+> pending", never "released". Origin: v0.5.2 was reported released at
+> 2026-10-02 00:1xZ with (2) and (3) undone; the doc already carried both
+> steps, so the fix is the definition and the print, not a third copy.
+
 ### One-time setup
 
 Clone the public repo locally somewhere outside this checkout — this is the
@@ -460,6 +475,7 @@ mistake. Create it with `gh release create <tag> --repo engram-agents/engram
 anything that links to it.
 Notify users (see below) pointing at the **public** repo's release page, not
 the private rc.
+Creating the Releases entry completes surface (1) only; see *Definition of released* above.
 
 ## Notify users
 
