@@ -67,7 +67,7 @@ FAKE_NAME_B = "agentname-nick"
 
 _LEI = r"lei"
 _OTHER_HUMAN_NAMES = r"the child|lin(?!e|ux|k)"
-_AGENT_HANDLES = r"borges|ariadne|luria|aleph|mira|funes|calvino|hebb"
+_AGENT_HANDLES = r"borges|ariadne|luria|aleph|mira|funes|calvino|hebb|kepler|clio|sol|zephyr"
 
 # Strict: every roster name (Lei, other humans, agent handles) — the rule
 # used where NO roster name may appear at all (tools/name_leak_warn.py), and
@@ -287,6 +287,10 @@ def test_real_name_pattern_is_live():
         "mira-verala's note",
         "the child",
         "Lin said",
+        "Kepler merged it",
+        "per Clio's review",
+        "Sol re-measured",
+        "zephyr is idle",
     ]
     for text in must_match:
         assert REAL_NAME_PATTERN.search(text), f"pattern must match {text!r} but did not"
@@ -296,6 +300,9 @@ def test_real_name_pattern_is_live():
         "runs on linux",
         "click the link",
         "Malice in wonderland",
+        "solution",
+        "console",
+        "isolate",
     ]
     for text in must_not_match:
         assert not REAL_NAME_PATTERN.search(text), f"pattern incorrectly matched {text!r}"
@@ -374,6 +381,20 @@ def test_workflow_rule_case_b_marker_allowed_only_on_comment_lines():
         f"marker in a step name: line should be flagged; got {violations}"
     )
 
+    # New-roster-handle fixture (alpha#3307): Kepler marker on a comment line
+    # is clean; the same handle on a run: line is functional and flagged.
+    new_handle_marker_on_comment = "      # per Kepler's review, this is fine\n"
+    violations = _check_workflow_name_hygiene(new_handle_marker_on_comment)
+    assert not any(v[1] == "b" for v in violations), (
+        f"new-handle marker on a comment line should be clean; got {violations}"
+    )
+
+    new_handle_marker_in_run = '      run: echo "Kepler did this"\n'
+    violations = _check_workflow_name_hygiene(new_handle_marker_in_run)
+    assert any(v[1] == "b" for v in violations), (
+        f"new-handle marker on a non-comment (run:) line should be flagged; got {violations}"
+    )
+
 
 def test_workflow_rule_case_c_blocks_at_handle_mentions_anywhere():
     """(c) an @handle mention of any roster name is functional (renders as a
@@ -390,6 +411,15 @@ def test_workflow_rule_case_c_blocks_at_handle_mentions_anywhere():
     violations = _check_workflow_name_hygiene(bare_handle_in_comment)
     assert not any(v[1] == "c" for v in violations), (
         f"bare handle (no @) must not trip case (c); got {violations}"
+    )
+
+    # New-roster-handle fixture (alpha#3307): @clio mention is functional
+    # (a live GitHub notification once quoted) and forbidden even on a
+    # comment line.
+    new_handle_at_mention_in_comment = "      # cc @clio\n"
+    violations = _check_workflow_name_hygiene(new_handle_at_mention_in_comment)
+    assert any(v[1] == "c" for v in violations), (
+        f"@handle mention of a new roster name should still be flagged; got {violations}"
     )
 
 
