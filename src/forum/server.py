@@ -29,6 +29,7 @@ from . import audit, board_projects, board_theme, db, embeddings as emb_mod, pac
 from .avatar import avatar_svg
 from .board_projects import filter_updates, get_board_counts, read_project_board
 from .coordination import default_store_root
+from .coordination import markdown as _md
 from .coordination.names import InvalidProjectId as _InvalidProjectId
 from .coordination.names import is_valid_project_id as _is_valid_project_id
 from .render import render_post_body
@@ -225,15 +226,14 @@ def _load_baton_gate():
     Loaded by DIRECT FILE PATH (importlib.util.spec_from_file_location),
     not `import baton_gate` / `from tools.baton_gate import ...` -- this
     sidesteps two hazards a dotted import would carry:
-      1. Deployment: tools/install-forum-service.sh's rsync step snapshots
-         ONLY src/forum/ and tools/engram-pkg/ into the live service
-         directory -- tools/ itself (and therefore a `tools.baton_gate`
-         dotted import) is not currently part of that snapshot, so a
-         package-relative import would reliably fail there today. A
-         direct-file-path load still finds the module if a future deploy
-         places baton_gate.py as a sibling of this file's own directory
-         (mirroring how tools/engram-pkg/ is already sibling-deployed under
-         $APP/tools/) with ZERO further code changes here.
+      1. Deployment: the installer's rsync step snapshots src/forum/ and
+         tools/engram-pkg/ into the live service directory -- tools/ itself
+         (and therefore a `tools.baton_gate` dotted import) is not part of
+         that snapshot, so a package-relative import would reliably fail
+         there. A direct-file-path load finds the module where the installer
+         now places it, $APP/tools/baton_gate.py (a `cp -L` of the resolved
+         file, mirroring how tools/engram-pkg/ is sibling-deployed under
+         $APP/tools/).
       2. Test/dev sys.path collision: a bare `import tools.baton_gate`
          resolves through sys.modules['tools'], which other test files in
          this repo have been shown to silently poison with an unrelated
@@ -292,7 +292,252 @@ def _load_baton_gate():
     return module
 
 
-def _check_flip_gate(store, pid: str, to_agent: str) -> Optional[tuple[str, int]]:
+def _login_map_cfg(app) -> dict:
+    """The strict-gate map configuration, read from the app at REQUEST time.
+
+    ``path`` is None unless the server was started with --baton-login-map /
+    $ENGRAM_BATON_LOGIN_MAP (there is no default path); ``admin_uids`` are the
+    uids, besides root, allowed to own the map file (never defaulted to the
+    server's own uid); ``trust_anchor`` is "/" in production (tests root it at
+    a scratch dir).
+    """
+    return {
+        "path": app.config.get("BATON_LOGIN_MAP"),
+        "admin_uids": tuple(app.config.get("BATON_LOGIN_MAP_ADMIN_UIDS") or ()),
+        "trust_anchor": app.config.get("BATON_LOGIN_MAP_TRUST_ANCHOR") or "/",
+    }
+
+
+# Per-login verdicts that refuse an advance even when ANOTHER mapped login of the
+# same colleague is `approved_current` (R4).
+_APPROVAL_BLOCKERS = frozenset({"changes_requested", "ambiguous", "unknown", "incomplete"})
+
+
+def _duplicate_key_refusal(raw: Optional[str]) -> Optional[tuple]:
+    """``(message, 422)`` when ``raw``'s frontmatter repeats a key the gates trust.
+
+    ``parse_frontmatter`` lets the LAST duplicate win, so a repeated ``phase`` /
+    ``turn`` / ``github`` / ``colleague`` / ``author`` / ``status`` /
+    ``participants`` line changes what every gate reads without any gate having
+    approved it. A file in that state is corrupt (or was written before the
+    sanitiser existed): refuse to make an authority decision from it and say
+    which key. ``parse_frontmatter`` itself keeps its last-wins semantics.
+    """
+    if raw is None:
+        return None
+    dups = _md.guarded_duplicate_keys(raw)
+    if dups:
+        return (str(_md.DuplicateFrontmatterKeys(dups)), 422)
+    return None
+
+
+def _advance_gate(gate, pid: str, fields: dict, body: str, to_agent: str,
+                  login_map_cfg: Optional[dict], *, raw: Optional[str] = None):
+    """The ONE strict gate for the edge ``phase: peer -> phase: merge`` (#3039 U2b).
+
+    ``raw`` is the baton file text ``fields``/``body`` were parsed from: when
+    given, a duplicated guarded frontmatter key refuses first (round 4, R2).
+    Both callers pass it.
+
+    Called by BOTH spellings -- ``POST /api/projects/<pid>/advance`` and a
+    ``POST .../flip`` that resolves as this transition -- so a refusal is
+    identical (same text, same status) whichever door was used, and there is
+    no skip path.
+
+    Returns ``(refusal, ticket)``: ``refusal`` is ``(message, status)`` or
+    None; ``ticket`` (on pass) carries what the check-and-set write must
+    re-verify under the lock plus the two verdicts. ``ticket["noop"]`` is True
+    when the baton is already at ``merge`` (nothing to check, nothing to write).
+
+    Order: local checks first (anchor, phase, target, colleague, map), then CI
+    (red/pending refuse; ``unknown`` stays ADVISORY and is reported as a
+    warning), then the approval verdict (ONLY ``approved_current`` passes;
+    ``unknown``/``incomplete`` refuse). The two verdicts are kept separate in
+    the ticket and in the refusal text.
+    """
+    dup_refusal = _duplicate_key_refusal(raw)
+    if dup_refusal is not None:
+        return dup_refusal, None
+    github_anchor = (fields.get("github") or "").strip().lower()
+    parsed = gate._parse_github_anchor(github_anchor)
+    if not github_anchor:
+        # Round 6 (R-b): no anchor => no PR to verify. Refused here, before any
+        # status/phase/gh work, naming the missing anchor.
+        return (
+            (f"'{pid}' has no github anchor, so there is no PR whose CI/approval the "
+             "peer->merge advance can verify. The anchor can only be set while the baton is "
+             "in 'fairy' (it is write-once afterwards); it cannot be added at peer/merge.", 422),
+            None,
+        )
+    if parsed is None or parsed[0] != "pr":
+        return (
+            (f"'{pid}' is not a PR baton (its github anchor must be "
+             "pr/<owner>/<repo>/<N>); the peer->merge advance applies only to PR batons.", 422),
+            None,
+        )
+    pr_num, pr_repo = parsed[2], parsed[1]
+    anchor_shown = None
+    if pr_repo is None:
+        # Round 6 (D1): DERIVE, never write. An unqualified ``pr/<N>`` is read as
+        # ``pr/<repos[prefix]>/<N>`` -- the repo comes from the admin login map by
+        # the baton id's prefix, never from the request -- so a legacy unqualified
+        # peer baton can still advance without any anchor write. The number is
+        # still bound to the id below. No map / unmapped prefix => refused, as ever.
+        anchor_shown = github_anchor
+        pr_repo = _bound_repo(gate, pid, login_map_cfg)
+    if pr_repo is None:
+        # Same refusal as the weak flip gate has always given (#1918/#2511).
+        return (
+            (f"'{pid}' has no repo-qualified github anchor -- refusing to "
+             f"guess which repo's PR #{pr_num} to verify "
+             "CI/approval/colleague state against. Run "
+             f"'baton anchor {pid} --github pr/<owner>/<repo>/{pr_num}' "
+             "first.", 422),
+            None,
+        )
+    status = (fields.get("status") or "").strip().lower()
+    if status in ("merged", "cancelled"):
+        return ((f"'{pid}' is {status}; cannot advance a closed baton.", 422), None)
+
+    try:
+        cur_phase, _legacy = gate._resolve_phase(fields, is_bunch=False)
+    except gate.PoolSentinelUnresolved as e:
+        return ((f"cannot evaluate flip gate for {pid}: {e}", 422), None)
+    if cur_phase == "merge":
+        return (None, {"noop": True})
+    if cur_phase not in ("peer", ""):
+        return (
+            (f"'{pid}' is in phase {cur_phase!r}, not 'peer'; the peer->merge "
+             "advance applies only to a baton in the peer phase.", 409),
+            None,
+        )
+
+    to_agent = (to_agent or "").strip().lower()
+    current_holder = (fields.get("turn") or "").strip().lower()
+    colleague_name = (fields.get("colleague") or "").strip().lower()
+    author_name = (fields.get("author") or "").strip().lower() or gate._derive_legacy_author(body)
+    participants = [
+        p.strip().lower()
+        for p in re.split(r"[,\[\]]", fields.get("participants", ""))
+        if p.strip()
+    ]
+    try:
+        is_sentinel = gate._is_legacy_pool_sentinel(to_agent)
+        is_merge_target = gate._is_maintainer_flip(to_agent, current_holder, colleague_name, author_name)
+    except gate.PoolSentinelUnresolved as e:
+        return ((f"cannot evaluate flip gate for {pid}: {e}", 422), None)
+    if not is_sentinel and to_agent not in participants:
+        return (
+            (f"'{to_agent}' is not a participant in {pid} (participants: {participants}); "
+             "name the merge seat.", 422),
+            None,
+        )
+    if not is_merge_target:
+        return (
+            (f"'{to_agent}' is not a merge-seat target for {pid}: it is the current "
+             "holder, the colleague, or the author.", 422),
+            None,
+        )
+
+    if not colleague_name:
+        return (
+            (f"{pid} has no colleague assigned, so there is no reviewer whose approval "
+             "the peer->merge advance can check. Set one: "
+             f"'baton set-colleague {pid} <agent>'.", 422),
+            None,
+        )
+    cfg = login_map_cfg or {}
+    try:
+        login_map = gate._load_login_map(
+            cfg.get("path"),
+            extra_trusted_uids=cfg.get("admin_uids") or (),
+            trust_anchor=cfg.get("trust_anchor") or "/",
+        )
+    except gate.LoginMapError as e:
+        return ((str(e), 422), None)
+    # A2 (round 4): the baton id binds the anchor's number AND repo -- checked
+    # BEFORE any GitHub call, so a re-pointed or mis-anchored baton never even
+    # causes a query against the wrong PR.
+    binding_refusal = gate._anchor_id_binding_refusal(
+        pid, pr_repo, pr_num, getattr(login_map, "repos", None), anchor_shown=anchor_shown)
+    if binding_refusal is not None:
+        return ((binding_refusal, 422), None)
+    logins = login_map.get(colleague_name)
+    if not logins:
+        return (
+            (f"colleague '{colleague_name}' has no entry in the baton login map, so their "
+             "GitHub approval cannot be identified. The admin must add the mapping.", 422),
+            None,
+        )
+
+    ci_state, ci_detail = gate._pr_ci_state(pr_num, repo=pr_repo)
+    if ci_state in ("red", "pending"):
+        return (
+            (f"CI is {ci_state} on PR #{pr_num} ({ci_detail}) -- the current "
+             "tip is not merge-ready. Re-flip when checks are green.", 422),
+            None,
+        )
+    warnings = []
+    if ci_state == "unknown":
+        logger.warning(
+            "advance gate: could not verify CI state for PR #%s (%s) -- proceeding anyway",
+            pr_num, ci_detail,
+        )
+        warnings.append(f"could not verify CI state for PR #{pr_num} ({ci_detail}); CI is advisory here")
+
+    # R4 (round 4): EVERY mapped login is read (no stopping at the first
+    # approval). Pass = at least one `approved_current` AND no login's verdict is
+    # a blocker -- `changes_requested` / `ambiguous` (an objection or an
+    # unorderable pair of opinions) or `unknown` / `incomplete` (we could not
+    # tell whether that login objects: unknown must not render as permitted).
+    # `no_review` / `dismissed` / `stale_head` / `self_review` beside an
+    # approving login are fine -- they hold no standing objection.
+    verdicts = []
+    approval = None
+    for login in logins:
+        state, detail = gate._reviewer_approval_state(pr_num, pr_repo, login)
+        verdicts.append((login, state, detail))
+        if state == "approved_current" and approval is None:
+            approval = (state, detail)
+    blockers = [v for v in verdicts if v[1] in _APPROVAL_BLOCKERS]
+    if approval is None or blockers:
+        shown = "; ".join(f"{login}: {state} ({detail})" for login, state, detail in verdicts)
+        why = (
+            "a mapped login of the colleague objects or cannot be read"
+            if approval is not None else "no current approval"
+        )
+        return (
+            (f"approval check refused on PR #{pr_num}: {why} by "
+             f"{colleague_name}'s mapped GitHub account(s) ({shown}). Only an APPROVED review on the "
+             "current head, still that account's latest opinionated review, with no other mapped "
+             "login objecting, advances peer -> merge.", 422),
+            None,
+        )
+    return (
+        None,
+        {
+            "noop": False,
+            "anchor": github_anchor,
+            "colleague": colleague_name,
+            "pr": pr_num,
+            "repo": pr_repo,
+            "ci": {"state": ci_state, "detail": ci_detail},
+            "approval": {"state": approval[0], "detail": approval[1]},
+            "warnings": warnings,
+        },
+    )
+
+
+def _check_flip_gate(
+    store,
+    pid: str,
+    to_agent: str,
+    *,
+    phase: Optional[str] = None,
+    transition_phase: Optional[str] = None,
+    login_map_cfg: Optional[dict] = None,
+    ticket_out: Optional[dict] = None,
+) -> Optional[tuple[str, int]]:
     """Server-side mirror of cmd_flip's CI/approval/colleague gate.
 
     Returns None when the flip may proceed (not PR-anchored, not a
@@ -303,6 +548,20 @@ def _check_flip_gate(store, pid: str, to_agent: str) -> Optional[tuple[str, int]
     No --force equivalent: this is not an interactive CLI, and #2884's own
     framing ("unknown must not render as permitted") argues against adding
     a silent bypass knob to a REST caller.
+
+    #3039 U2b (D1, one gate / two spellings): a flip that resolves as the
+    ``peer -> merge`` transition is NOT judged by the weak gate below. It is
+    handed to :func:`_advance_gate` -- the same function the ``advance`` route
+    calls -- and, on pass, ``ticket_out`` is filled so the caller performs the
+    check-and-set write instead of a plain flip. A flip "resolves as the
+    transition" when it is a maintainer-role flip (or the client claims
+    ``merge`` in ``phase`` / ``transition_phase``) AND the baton's phase,
+    resolved server-side, is ``peer`` -- or is ``fairy``/legacy-unset on a
+    baton that HAS a colleague (a colleague means a peer phase exists; it
+    cannot be skipped by flipping straight to the merge seat). A baton with no
+    colleague (single-agent mode) has no peer phase and keeps the unchanged
+    weak gate; so does every flip within ``merge`` (author <-> merge seat
+    ping-pong).
     """
     from forum.coordination.markdown import parse_frontmatter
 
@@ -310,6 +569,12 @@ def _check_flip_gate(store, pid: str, to_agent: str) -> Optional[tuple[str, int]
     if raw is None:
         # Let the normal flip() call raise ProjectNotFound -> 404, unchanged.
         return None
+
+    # R2 (round 4): never make a gate decision from a file whose guarded keys
+    # are duplicated -- parse_frontmatter's last-wins would pick the value.
+    dup_refusal = _duplicate_key_refusal(raw)
+    if dup_refusal is not None:
+        return dup_refusal
 
     fields, body = parse_frontmatter(raw)
     github_anchor = (fields.get("github") or "").strip().lower()
@@ -323,6 +588,40 @@ def _check_flip_gate(store, pid: str, to_agent: str) -> Optional[tuple[str, int]
     # blocking flips that were never gated in the first place, while still
     # failing closed for the one case that actually matters (see below).
     if not github_anchor.startswith("pr/"):
+        if github_anchor:
+            return None  # project/<N> or anything else: never maintainer-gated
+        # Round 6 (R-b): NO anchor at all. A colleague-held PR baton moving to the
+        # merge seat has no PR behind it for the weak path to verify (nothing to
+        # parse, so it used to wave the flip through). Classify it exactly like the
+        # anchored case below and hand it to the strict gate, whose first check
+        # refuses a missing anchor. A baton with no colleague (single-agent mode,
+        # no peer phase) and anything that is not PR-shaped are unchanged.
+        gate = _load_baton_gate()
+        if gate is None:
+            return None
+        colleague_name = (fields.get("colleague") or "").strip().lower()
+        if not colleague_name or not gate._is_pr_baton(pid, fields):
+            return None
+        current_holder = (fields.get("turn") or "").strip().lower()
+        author_name = (fields.get("author") or "").strip().lower() or gate._derive_legacy_author(body)
+        claims_merge = "merge" in ((phase or "").lower(), (transition_phase or "").lower())
+        try:
+            if gate._is_maintainer_flip(to_agent, current_holder, colleague_name, author_name) or claims_merge:
+                resolved_phase, _legacy = gate._resolve_phase(fields, is_bunch=False)
+                if resolved_phase == "peer" or resolved_phase in ("", "fairy"):
+                    refusal, _ticket = _advance_gate(
+                        gate, pid, fields, body, to_agent, login_map_cfg, raw=raw)
+                    return refusal
+        except gate.PoolSentinelUnresolved as e:
+            # Round 7 (F1): an unanchored baton with an EXPLICIT phase never needed
+            # the sentinel -- unchanged, not a refusal for every flip. But a LEGACY
+            # baton (blank phase line) whose flip cannot be classified would be
+            # written phase-less with ``turn == sentinel``, which reads as the
+            # legacy ``merge`` once the sentinel resolves again (no approval
+            # anywhere). Fail closed: refuse, write nothing.
+            if not (fields.get("phase") or "").strip():
+                return (f"cannot evaluate flip gate for {pid}: {e}", 422)
+            return None
         return None
 
     gate = _load_baton_gate()
@@ -361,6 +660,29 @@ def _check_flip_gate(store, pid: str, to_agent: str) -> Optional[tuple[str, int]
         is_maintainer_flip = gate._is_maintainer_flip(to_agent, current_holder, colleague_name, author_name)
     except gate.PoolSentinelUnresolved as e:
         return (f"cannot evaluate flip gate for {pid}: {e}", 422)
+
+    # #3039 U2b (D1): does this flip resolve as the peer -> merge transition?
+    # Decided from the SERVER-resolved phase, never from the client's claim.
+    #
+    # PARITY (round 4, R6): this decision and `_flip_phase_inputs`'s "is this the
+    # merge transition?" decision MUST classify the flip identically -- when the
+    # weak path there would write a `merge` transition from fairy / legacy-unset
+    # on a baton that HAS a colleague, THIS function must already have sent the
+    # flip down the strict path. test_baton_gate_parity.py drives both over a grid;
+    # change one, change the other.
+    claims_merge = "merge" in ((phase or "").lower(), (transition_phase or "").lower())
+    if is_maintainer_flip or claims_merge:
+        try:
+            resolved_phase, _legacy = gate._resolve_phase(fields, is_bunch=False)
+        except gate.PoolSentinelUnresolved as e:
+            return (f"cannot evaluate flip gate for {pid}: {e}", 422)
+        if resolved_phase == "peer" or (resolved_phase in ("", "fairy") and colleague_name):
+            refusal, ticket = _advance_gate(gate, pid, fields, body, to_agent, login_map_cfg, raw=raw)
+            if refusal is not None:
+                return refusal
+            if ticket_out is not None and ticket:
+                ticket_out.update(ticket)
+            return None
 
     if not is_maintainer_flip:
         # Self-flip or flip-to-the-registered-colleague -- not a
@@ -441,6 +763,543 @@ def _check_flip_gate(store, pid: str, to_agent: str) -> Optional[tuple[str, int]
     return None
 
 
+def _perform_advance(gate, store, allocator, pid: str, *, to_agent: str, reason: str,
+                     agent: str, ticket: dict) -> tuple[dict, int]:
+    """Run the check-and-set write for a gate-passed (or already-merge) advance.
+
+    Shared by the ``advance`` route and the flip spelling. Returns
+    ``(json_body, status)``: 201 advanced, 200 idempotent no-op, 404 gone,
+    409 the baton moved between the GitHub check and the write.
+    """
+    from forum.coordination import AdvanceRefused, AdvanceResult, ProjectNotFound, advance as _advance
+
+    def resolve_phase(fields: dict) -> str:
+        try:
+            phase, _legacy = gate._resolve_phase(fields, is_bunch=False)
+        except gate.PoolSentinelUnresolved as e:
+            raise AdvanceRefused(f"cannot resolve the baton's phase: {e}")
+        return phase
+
+    if ticket.get("noop"):
+        # The gate saw the baton already at `merge`: an idempotent no-op. Nothing
+        # is written, so no seq is consumed and nothing wakes anyone.
+        from forum.coordination.markdown import parse_frontmatter
+        raw = store.read_project(pid)
+        if raw is None:
+            return {"error": f"project not found: {pid}"}, 404
+        fields, _ = parse_frontmatter(raw)
+        try:
+            seq = int((fields.get("seq") or "0").strip())
+        except ValueError:
+            seq = 0
+        result = AdvanceResult(False, seq, "already merge")
+    else:
+        try:
+            result = _advance(
+                store, allocator, pid,
+                to_agent=to_agent, reason=reason, by_agent=agent,
+                expected_anchor=ticket.get("anchor", ""),
+                expected_colleague=ticket.get("colleague", ""),
+                resolve_phase=resolve_phase,
+            )
+        except ProjectNotFound:
+            return {"error": f"project not found: {pid}"}, 404
+        except AdvanceRefused as e:
+            return {"error": str(e), "phase": e.phase}, 409
+
+    turn, status = _read_project_state(store, pid)
+    body = {
+        "advanced": result.advanced,
+        "seq": result.seq,
+        "turn": turn,
+        "status": status,
+        "phase": "merge",
+    }
+    if not result.advanced:
+        body["reason"] = result.reason
+        return body, 200
+    body["ci"] = ticket.get("ci")
+    body["approval"] = ticket.get("approval")
+    body["warnings"] = ticket.get("warnings", [])
+    return body, 201
+
+
+# ---------------------------------------------------------------------------
+# #3039 U2b round 2: the server never trusts a client-supplied phase.
+#
+# Every write route used to hand the request body's ``phase`` (the legacy
+# CONVERSION value) and ``transition_phase`` to its coordination write-body
+# verbatim, so any client could write ``phase: merge`` with no approval
+# anywhere -- a bypass of the strict peer -> merge gate (``_advance_gate``).
+# Now:
+#   * conversion: the server derives the value from the baton FILE
+#     (``gate._resolve_phase``, with its own PR-vs-bunch decision) and uses
+#     THAT. A differing client value is ignored (warning logged); a client
+#     ``merge`` the server does not itself resolve is a 422.
+#   * transition: an allow-list per route (what the CLI legitimately sends).
+#     ``merge`` is accepted from no request body; the only writers of
+#     ``phase: merge`` are the strict gate (``projects.advance``), a flip the
+#     SERVER itself classifies as the weak-gated maintainer flip (see
+#     ``_flip_phase_inputs``), and a legacy conversion whose value the server
+#     read off the file.
+# ---------------------------------------------------------------------------
+
+_INIT_PHASES_PR = frozenset({"fairy"})
+_INIT_PHASES_BUNCH = frozenset({"pool"})
+_CLAIM_PHASES = frozenset({"claimed"})
+_RELEASE_PHASES = frozenset({"pool", "done"})
+
+
+def _phase_refusal(route: str, pid: str, field: str, value: str, why: str) -> tuple[str, int]:
+    return (
+        f"{route} {pid}: {field} {value!r} is not accepted from a request body ({why}). "
+        "The server derives conversion phases itself and accepts no 'merge' "
+        "from a request body.",
+        422,
+    )
+
+
+# ---------------------------------------------------------------------------
+# #3039 U2b round 4: ONE shared reader for every baton write route's request body.
+#
+# Every client string a write-body puts into a baton file used to be only
+# ``.strip()``-ped, so an INTERIOR line break survived into the frontmatter and
+# (last duplicate key wins) could write ``phase: merge``. Now every route reads
+# its fields through ``_read_fields`` and nothing else, so the policy lives in one
+# place and a route that reads a field around it is caught by a test:
+#
+#   "text"  FREE-TEXT (reason, turn_reason, title, new_title): every run of
+#           line-break / control characters becomes ONE space (agents do send
+#           multi-line reasons); stored on one line. Quotes/backslashes untouched.
+#   "id"    IDENTIFIER (github, project id, status, ...): any line-break / control
+#           character => 422 naming the route and field. Case kept.
+#   "idl"   the same, lower-cased (agent / turn / phase names).
+#   "bool"  a real JSON boolean.
+#   "list"  a list of identifiers or a comma-separated string (participants).
+#
+# A non-string where a string is expected => 422 naming the route and field (no
+# more AttributeError -> 500). Absent / null stays "absent" ("" / False / []).
+# Nothing here touches the lock, the seq or the file: a refusal is free.
+# ---------------------------------------------------------------------------
+
+class _RequestRefusal(Exception):
+    def __init__(self, message: str, status: int = 422) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
+def _field_refusal(route: str, field: str, why: str) -> _RequestRefusal:
+    return _RequestRefusal(f"{route}: field '{field}' {why}")
+
+
+_NO_CONTROL = "must not contain line-break or control characters (it is an identifier, not free text)"
+
+
+def _read_ident(route: str, field: str, raw, *, lower: bool) -> str:
+    if not isinstance(raw, str):
+        raise _field_refusal(route, field, f"must be a string (got {type(raw).__name__})")
+    if _md.has_break_or_control(raw):
+        raise _field_refusal(route, field, _NO_CONTROL)
+    value = raw.strip()
+    return value.lower() if lower else value
+
+
+def _read_fields(route: str, data, spec: dict, *, pid: Optional[str] = None) -> dict:
+    """Read ``spec`` ({field: kind}) from the JSON body ``data`` -- see the block above."""
+    if pid is not None and _md.has_break_or_control(pid):
+        raise _field_refusal(route, "project_id", _NO_CONTROL)
+    if not isinstance(data, dict):
+        raise _RequestRefusal("JSON body required", 400)
+    out: dict = {}
+    for field, kind in spec.items():
+        raw = data.get(field)
+        if kind == "bool":
+            if raw is None:
+                out[field] = False
+            elif isinstance(raw, bool):
+                out[field] = raw
+            else:
+                raise _field_refusal(route, field, f"must be a boolean (got {type(raw).__name__})")
+        elif kind == "list":
+            if raw is None:
+                out[field] = []
+            elif isinstance(raw, str):
+                out[field] = [
+                    _read_ident(route, field, p, lower=True)
+                    for p in raw.split(",") if p.strip()
+                ]
+            elif isinstance(raw, list):
+                items = [_read_ident(route, field, p, lower=True) for p in raw if p != ""]
+                out[field] = [p for p in items if p]
+            else:
+                raise _field_refusal(
+                    route, field, f"must be a list of strings or a comma-separated string (got {type(raw).__name__})")
+        elif raw is None:
+            out[field] = ""
+        elif kind == "text":
+            if not isinstance(raw, str):
+                raise _field_refusal(route, field, f"must be a string (got {type(raw).__name__})")
+            out[field] = _md.normalize_free_text(raw)
+        elif kind in ("id", "idl"):
+            out[field] = _read_ident(route, field, raw, lower=(kind == "idl"))
+        else:  # a typo in a route's spec must be loud, not silently permissive
+            raise ValueError(f"unknown field kind {kind!r} for {field!r}")
+    return out
+
+
+def _baton_fields(store, pid: str):
+    """(fields, body) of an existing baton, or (None, None) when absent.
+
+    Raises :class:`~forum.coordination.markdown.DuplicateFrontmatterKeys` (mapped to
+    a 422 by the app's error handler) when the file repeats a guarded key -- every
+    caller here resolves phase / turn / github / colleague to make an authority
+    decision (R2, round 4).
+    """
+    from forum.coordination.markdown import parse_frontmatter
+    raw = store.read_project(pid)
+    if raw is None:
+        return None, None
+    dups = _md.guarded_duplicate_keys(raw)
+    if dups:
+        raise _md.DuplicateFrontmatterKeys(dups)
+    return parse_frontmatter(raw)
+
+
+def _resolved_phase(gate, pid: str, fields: dict) -> str:
+    """The baton's phase as the SERVER reads it (``""`` = indeterminate)."""
+    try:
+        phase, _legacy = gate._resolve_phase(fields, is_bunch=not gate._is_pr_baton(pid, fields))
+    except gate.PoolSentinelUnresolved:
+        return ""
+    return phase
+
+
+def _server_conversion(route: str, pid: str, client_phase: Optional[str], fields: Optional[dict],
+                       gate, *, fallback: Optional[str] = None):
+    """C1: the conversion phase to hand a write-body, plus a refusal or None.
+
+    ``fields`` is None when the baton does not exist (the write-body then
+    raises ProjectNotFound -> 404; nothing to derive). Returns
+    ``(server_phase, refusal)``. ``fallback`` is the route's known pre-state
+    when the file resolves nothing (release: ``claimed``), exactly as the CLI
+    applies it -- a server-side constant, never read from the request.
+    """
+    if fields is None:
+        return None, None
+    server_phase = None
+    if gate is not None:
+        server_phase = (_resolved_phase(gate, pid, fields) or fallback or None)
+    if client_phase and client_phase != (server_phase or ""):
+        if client_phase == "merge":
+            return None, _phase_refusal(
+                route, pid, "phase", client_phase,
+                f"the baton's server-resolved phase is {server_phase or 'unresolved'!r}")
+        logger.warning(
+            "%s %s: ignoring client conversion phase %r; using server-derived %r",
+            route, pid, client_phase, server_phase)
+    return server_phase, None
+
+
+def _bunch_verb_inputs(route: str, pid: str, store, client_phase: Optional[str],
+                       client_transition: Optional[str], allowed: frozenset, *,
+                       fallback: Optional[str] = None):
+    """claim / release: C3 (bunch verbs only) + C2 allow-list + C1 conversion.
+
+    Returns ``(phase, transition_phase, refusal)``.
+    """
+    fields, _body = _baton_fields(store, pid)
+    if fields is None:
+        return None, None, None  # the write-body raises ProjectNotFound -> 404
+    gate = _load_baton_gate()
+    if gate is None:
+        return None, None, (
+            f"{route} {pid}: phase gate unavailable (server could not load its gate module) "
+            "-- refusing to decide PR-vs-bunch. See server logs.", 422)
+    if gate._is_pr_baton(pid, fields):
+        return None, None, (
+            f"{route} {pid}: claim/release are bunch verbs and {pid} is a PR baton "
+            "(its phase machine is fairy -> peer -> merge).", 422)
+    if client_transition is not None and client_transition not in allowed:
+        return None, None, _phase_refusal(
+            route, pid, "transition_phase", client_transition,
+            "allowed here: " + ", ".join(sorted(allowed)))
+    phase, refusal = _server_conversion(route, pid, client_phase, fields, gate, fallback=fallback)
+    if refusal is not None:
+        return None, None, refusal
+    return phase, client_transition, None
+
+
+def _flip_phase_inputs(route: str, pid: str, store, to_agent: str,
+                       client_phase: Optional[str], client_transition: Optional[str]):
+    """flip: the phases to write, decided by the SERVER from the baton.
+
+    The server classifies the flip itself the way ``cmd_flip`` does:
+      * maintainer-role flip on a ``pr/`` baton whose gate has just passed
+        (the strict path already returned via ``_perform_advance``; what is
+        left is the unchanged weak gate -- phase ``merge``/``fairy``/legacy
+        on a baton WITHOUT a colleague, or a flip within ``merge``)
+        => expected transition ``merge``;
+      * author -> registered colleague while phase is fairy/legacy
+        => expected transition ``peer``;
+      * anything else => no transition.
+    A client ``transition_phase`` other than the expected one is a 422.
+    Returns ``(phase, transition_phase, refusal)``.
+
+    PARITY (round 4, R6): "is this the merge transition?" here and in
+    :func:`_check_flip_gate` ("does this flip go down the strict peer -> merge
+    path?") MUST classify a flip identically. This function is only reached when
+    the strict path did NOT take the flip; the ``merge`` it expects from
+    ``fairy`` / legacy-unset exists for a baton with NO colleague (single-agent
+    mode) and for a flip within ``merge`` -- with a colleague, ``_check_flip_gate``
+    must already have sent those flips down the strict path.
+    ``test_baton_gate_parity.py`` drives both over a grid and fails on drift.
+    """
+    fields, body = _baton_fields(store, pid)
+    if fields is None:
+        return None, None, None  # ProjectNotFound -> 404 in the write-body
+    gate = _load_baton_gate()
+    if gate is None:
+        # Cannot classify: a client transition cannot be verified, conversion is skipped.
+        if client_transition is not None or client_phase == "merge":
+            return None, None, (
+                f"{route} {pid}: phase gate unavailable (server could not load its "
+                "gate module) -- refusing a client-supplied phase. See server logs.", 422)
+        return None, None, None
+    resolved = _resolved_phase(gate, pid, fields)
+    is_pr = gate._is_pr_baton(pid, fields)
+    colleague = (fields.get("colleague") or "").strip().lower()
+    holder = (fields.get("turn") or "").strip().lower()
+    author = (fields.get("author") or "").strip().lower() or gate._derive_legacy_author(body)
+    parsed = gate._parse_github_anchor((fields.get("github") or "").strip().lower())
+    pr_anchor = parsed is not None and parsed[0] == "pr"
+    try:
+        is_maintainer = gate._is_maintainer_flip(to_agent, holder, colleague, author)
+    except gate.PoolSentinelUnresolved:
+        is_maintainer = None  # cannot classify => no transition is verifiable
+
+    expected: Optional[str] = None
+    fallback: Optional[str] = None
+    if is_maintainer is None:
+        pass
+    elif pr_anchor and is_maintainer:
+        if resolved in ("merge", "fairy", ""):
+            expected, fallback = "merge", "peer"
+    elif is_pr and colleague and to_agent == colleague and resolved in ("fairy", ""):
+        expected, fallback = "peer", "fairy"
+    elif is_pr and not pr_anchor and resolved == "":
+        # Round 5 (B1): a flip on a PR baton with no ``pr/`` anchor is not gated
+        # (``_check_flip_gate`` returns early: only a ``pr/`` anchor can be
+        # maintainer-gated) and writes no transition. If the baton is a legacy
+        # PHASE-LESS file, flipping it to the pool sentinel would leave
+        # ``phase-less + turn == sentinel`` -- which reads as the legacy
+        # ``merge``. So stamp an explicit ``fairy`` (conversion): an unanchored
+        # baton can never reach ``merge`` without ``fairy -> peer -> advance``,
+        # and ``advance`` needs a ``pr/`` anchor and an approval.
+        fallback = "fairy"
+
+    if client_transition is not None and client_transition != expected:
+        return None, None, _phase_refusal(
+            route, pid, "transition_phase", client_transition,
+            f"the server classifies this flip's transition as {expected or 'none'!r}")
+    server_phase = resolved or fallback or None
+    if client_phase and client_phase != (server_phase or ""):
+        if client_phase == "merge":
+            return None, None, _phase_refusal(
+                route, pid, "phase", client_phase,
+                f"the baton's server-resolved phase is {server_phase or 'unresolved'!r}")
+        logger.warning(
+            "%s %s: ignoring client conversion phase %r; using server-derived %r",
+            route, pid, client_phase, server_phase)
+    return server_phase, client_transition, None
+
+
+def _conversion_only_inputs(route: str, pid: str, store, client_phase: Optional[str]):
+    """Routes that write no transition (close/reopen/gc/merge/rename/anchor/
+    participants/colleague): the server-derived conversion, or a refusal."""
+    fields, _body = _baton_fields(store, pid)
+    phase, refusal = _server_conversion(route, pid, client_phase, fields, _load_baton_gate())
+    return phase, refusal
+
+
+def _anchor_refusal(route: str, pid: str, store, new_anchor: str,
+                    login_map_cfg: Optional[dict] = None) -> Optional[tuple]:
+    """``(message, status)`` when the anchor write must be refused, else None.
+
+    #3039 U2b round 4 + round 6. Two rules for ``POST .../anchor``:
+
+    A1 -- WRITE-ONCE after ``fairy``, with NO EXCEPTIONS (round 6, the merge
+    seat's ruling). On a baton whose SERVER-resolved phase is ``peer`` or
+    ``merge`` -- or whose phase cannot be resolved (an unresolvable pool sentinel
+    on a phase-less baton: it may be past ``fairy``, so it fails closed) -- a
+    request may not write the anchor in ANY case: not when none exists, not to
+    complete an unqualified ``pr/<N>``, not to re-send the identical value (that
+    is a write: a row and a seq), not to change it. The approval the strict gate
+    checks is the approval on THIS anchor's PR, so a past-``fairy`` request may
+    never choose which PR that is. The repo of an unqualified anchor is DERIVED
+    by the gate from the baton id's prefix via the admin ``repos`` table
+    (``_advance_gate``), never written by a request. The phase is read from the
+    file (``gate._resolve_phase``), never from the request. ``fairy`` /
+    legacy-unset batons and bunches may still be anchored and re-anchored.
+
+    A3 -- the value must parse the way ``baton anchor`` (the CLI) accepts it:
+    ``pr/<N>``, ``pr/<owner>/<repo>/<N>`` or ``project/<N>`` (reusing the gate's
+    own regex, so server and CLI cannot drift). Line-break/control characters were
+    already refused by the shared reader.
+    """
+    gate = _load_baton_gate()
+    fields, _body = _baton_fields(store, pid)  # a duplicated guarded key => 422
+    new_norm = new_anchor.strip().lower()
+    current = (fields.get("github") or "").strip().lower() if fields is not None else ""
+    named = (f"its current anchor is {current!r}" if current
+             else "it has no github anchor")
+
+    if gate is None:
+        return (
+            f"{route} {pid}: phase gate unavailable (server could not load its gate module) "
+            "-- refusing to write a github anchor without being able to verify its shape "
+            "and the baton's phase. See server logs.", 422)
+
+    if fields is not None:
+        is_pr = gate._is_pr_baton(pid, fields)
+        unresolved = None
+        resolved = ""
+        try:
+            resolved, _legacy = gate._resolve_phase(fields, is_bunch=not is_pr)
+        except gate.PoolSentinelUnresolved as e:
+            unresolved = e
+        if unresolved is not None:
+            return (f"{route} {pid}: cannot resolve the baton's phase to decide whether its "
+                    f"github anchor may be written ({unresolved}); {named}. Until the pool "
+                    "sentinel resolves, a baton that may be past 'fairy' is refused every anchor write.",
+                    422)
+        if resolved in ("peer", "merge"):
+            return (
+                f"{route} {pid}: the github anchor is write-once once a baton leaves 'fairy' "
+                f"(phase {resolved!r}) and takes NO writes at all -- not a first anchor, not a "
+                f"completion, not an identical re-send, not a change; {named}; refusing {new_norm!r}. "
+                "A re-pointed anchor would let another PR's approval stand in for this one's; "
+                "an unqualified pr/<N> is read by the gate as the repo the id's prefix maps to "
+                "in the admin login map, so it needs no completion.", 422)
+
+    if not gate._GITHUB_ANCHOR_RE.match(new_norm):
+        return (
+            f"{route} {pid}: invalid github anchor {new_anchor!r}. Expected pr/<N>, "
+            "pr/<owner>/<repo>/<N>, or project/<N> (e.g. pr/490, pr/example-org/example-repo/22, "
+            "project/4).", 422)
+
+    # Round 9 (B1): id-bind the anchor where it is WRITTEN (fairy / legacy / bunch
+    # re-anchored to a PR), not only at advance. A missing baton is the caller's 404.
+    if fields is not None:
+        is_pr = gate._is_pr_baton(pid, fields) or gate._is_pr_shaped(pid, new_norm)
+        bind_msg = _anchor_write_binding_refusal(gate, pid, is_pr, new_norm, login_map_cfg)
+        if bind_msg is not None:
+            return (f"{route} {pid}: {bind_msg}", 422)
+    return None
+
+
+def _bound_repo(gate, pid: str, login_map_cfg: Optional[dict]) -> Optional[str]:
+    """The ``owner/repo`` (lower-case) the baton id's prefix maps to in the admin
+    ``repos`` table, or None when that cannot be known: no map configured / map
+    unreadable or untrusted / the id carries no ``<PREFIX>-<N>`` / the prefix is
+    not in the table. None keeps the narrow pre-round-5 behaviour (state it: with
+    no table there is nothing to check a repo against)."""
+    m = gate._ID_BIND_RE.fullmatch(pid or "")
+    cfg = login_map_cfg or {}
+    if m is None or not cfg.get("path"):
+        return None
+    try:
+        login_map = gate._load_login_map(
+            cfg.get("path"),
+            extra_trusted_uids=cfg.get("admin_uids") or (),
+            trust_anchor=cfg.get("trust_anchor") or "/",
+        )
+    except gate.LoginMapError:
+        return None
+    return (getattr(login_map, "repos", None) or {}).get(m.group("prefix").upper())
+
+
+def _anchor_write_binding_refusal(gate, pid: str, is_pr: bool, anchor_norm: str,
+                                  login_map_cfg: Optional[dict]) -> Optional[str]:
+    """Refusal text when a ``pr/`` anchor being WRITTEN is not the one the baton id
+    names, else None (#3039 U2b round 9, B1).
+
+    The id binding used to be checked only at ``advance``; the anchor is
+    write-once past ``fairy``, so a wrong anchor written while still in ``fairy``
+    stranded the baton in ``peer``. This is the ONE check shared by the three
+    write sites: init (qualified and unqualified) and ``POST /anchor`` in
+    ``fairy`` / legacy. It reuses the gate's own binding (``_ID_BIND_RE``,
+    ``_same_number``, ``_anchor_id_binding_refusal``) and :func:`_bound_repo`.
+
+    Applies only to a PR-shaped baton (``is_pr``) and a ``pr/`` anchor whose id
+    carries a number; ``project/<N>`` anchors, bunches and number-less ids are
+    untouched. The NUMBER is always checked (it comes from the id). The REPO is
+    checked only when the id's prefix is in the admin ``repos`` table; with no
+    map / an unmapped prefix a qualified anchor with the right number is accepted
+    as before (``advance`` still refuses an unmapped prefix). An unqualified
+    ``pr/<N>`` is number-checked only (its repo is derived, never written)."""
+    if gate is None:
+        return None
+    parsed = gate._parse_github_anchor(anchor_norm)
+    if parsed is None:
+        return None
+    m = gate._ID_BIND_RE.fullmatch(pid or "")
+    if parsed[0] == "project":
+        # Round 10 (S-a): classification follows the ID SHAPE, not the anchor. A
+        # numbered id whose prefix is in the admin ``repos`` table is PR-shaped and
+        # takes only a binding ``pr/`` anchor, independent of ``is_pr`` (which is
+        # anchor-derived): this makes the PR -> bunch -> PR round trip through a
+        # ``project/<N>`` anchor unreachable. Unmapped prefix / no number / no map
+        # => unchanged. Legacy files on disk are never touched by a read path.
+        if m is not None and _bound_repo(gate, pid, login_map_cfg) is not None:
+            return (
+                f"the baton id {pid!r} is PR-shaped (its prefix is mapped to a repo in "
+                f"the admin login map), so it takes only a pr/ anchor that matches the "
+                f"id (pr/<owner>/<repo>/{m.group('num')} or pr/{m.group('num')}); "
+                f"refusing {anchor_norm!r}.")
+        return None
+    if not is_pr or parsed[0] != "pr" or m is None:
+        return None
+    _kind, anchor_repo, number = parsed
+    want = _bound_repo(gate, pid, login_map_cfg)
+    if want is None:
+        if gate._same_number(m.group("num"), number):
+            return None
+        return (
+            f"the github anchor {anchor_norm!r} does not match the baton id {pid!r}: "
+            f"the id names PR {m.group('num')}, so its anchor must be PR {m.group('num')}.")
+    return gate._anchor_id_binding_refusal(
+        pid, anchor_repo if anchor_repo is not None else want, number,
+        {m.group("prefix").upper(): want},
+        anchor_shown=anchor_norm if anchor_repo is None else None)
+
+
+def _anchor_completes(gate, current: str, new: str, want_repo: Optional[str] = None) -> bool:
+    """NO LONGER CALLED BY ANY ROUTE (round 6: the anchor is write-once past
+    ``fairy`` with no exceptions; see :func:`_anchor_refusal`). Kept only as a
+    pure helper because the S1 huge-number test imports it directly.
+
+    True when ``new`` does not re-point ``current``: there was no anchor, or
+    ``current`` is an unqualified ``pr/<N>`` and ``new`` is the repo-qualified
+    form of the same number. With ``want_repo`` (round 5, S3: the repo the id's
+    prefix maps to) a repo-qualified ``new`` must also name that repo, whether it
+    is being SET or COMPLETED. Numbers compare as ASCII-digit strings, never via
+    ``int()`` (S1)."""
+    pn = gate._parse_github_anchor(new)
+    if (want_repo and pn is not None and pn[0] == "pr" and pn[1] is not None
+            and pn[1].lower() != want_repo.lower()):
+        return False
+    if not current:
+        return True
+    pc = gate._parse_github_anchor(current)
+    return (
+        pc is not None and pn is not None
+        and pc[0] == "pr" and pn[0] == "pr"
+        and pc[1] is None and pn[1] is not None
+        and gate._same_number(pc[2], pn[2])
+    )
+
+
 def _read_project_state(store, pid: str) -> tuple[str, str]:
     """Return (turn, status) from a project baton immediately after a mutation.
 
@@ -502,6 +1361,8 @@ def create_app(
     dep_results: dict | None = None,
     coord_root: str | None = None,
     backup_dir: str | None = None,
+    baton_login_map: str | None = None,
+    baton_login_map_admin_uids: tuple = (),
 ) -> Flask:
     """Create and configure the Flask application.
 
@@ -530,6 +1391,14 @@ def create_app(
             ``<backup_dir>/.last-success.json`` (written by tools/forum_backup.py)
             on every request and reports ``backup`` + ``deps.backup`` (#3276).
             When None, /health is unchanged.
+        baton_login_map:   Path to the PROTECTED agent -> GitHub-login map the strict
+            ``peer -> merge`` gate reads (#3039 U2b; ``main()`` feeds it from
+            ``--baton-login-map`` / ``$ENGRAM_BATON_LOGIN_MAP``). **No default
+            path:** when None the gate fails closed ("no login map configured").
+            Read on every gate evaluation, never cached.
+        baton_login_map_admin_uids: uids, besides root, permitted to own that file
+            and its directories (``--baton-login-map-admin-uid``). Never defaulted
+            to the server's own uid: the server runs as an agent account.
 
     Returns:
         A configured Flask application instance.
@@ -550,6 +1419,8 @@ def create_app(
     # Store dep probe results for /health (None when called from tests without probing).
     app.config["DEP_RESULTS"] = dep_results or {}
     app.config["BACKUP_DIR"] = backup_dir
+    app.config["BATON_LOGIN_MAP"] = baton_login_map
+    app.config["BATON_LOGIN_MAP_ADMIN_UIDS"] = tuple(baton_login_map_admin_uids or ())
 
     # UCS coordination store (fork-1): wire the file-backed FileStore + the
     # process-level SeqAllocator so the /api/dm routes are live. The allocator is
@@ -1976,6 +2847,21 @@ def create_app(
 
         return jsonify(build_updates(store, allocator, agent, since=since, kinds=kinds))
 
+    # #3039 U2b round 4: refusals raised from the shared request reader, the
+    # write-layer backstop and the duplicate-key guard all become a JSON error with
+    # the status the exception carries -- never a 500, never a write.
+    @app.errorhandler(_RequestRefusal)
+    def _handle_request_refusal(exc):
+        return jsonify({"error": exc.message}), exc.status
+
+    @app.errorhandler(_md.UnsafeText)
+    def _handle_unsafe_text(exc):
+        return jsonify({"error": str(exc)}), 422
+
+    @app.errorhandler(_md.DuplicateFrontmatterKeys)
+    def _handle_duplicate_keys(exc):
+        return jsonify({"error": str(exc)}), 422
+
     # ------------------------------------------------------------------
     # Project / board coordination routes (UCS #1494 Phase 1c+2)
     #   GET  /api/projects                     — list all project records
@@ -2060,7 +2946,7 @@ def create_app(
         JSON body: {agent, project_id, title, status, turn, participants, turn_reason, github?, colleague?, author?, phase?, transition_phase?}
         ``participants`` may be a list of strings OR a comma-separated string.
         ``phase?`` / ``transition_phase?`` (#3039 U2a round 3): optional,
-        client-computed, trusted verbatim -- no validation/interpretation
+        client-computed, NOT trusted (U2b r2: the server re-derives it) -- no validation/interpretation
         here, same trust boundary as ``pool_sentinel`` on the claim/release
         endpoints below. ``init`` is always a transition (the baton's very
         first phase), so the client sends ``transition_phase`` here, not
@@ -2080,7 +2966,16 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        agent = (data.get("agent") or "").strip().lower()
+        # #3039 U2b round 4: every field through the shared reader (identifiers
+        # with a line-break/control char => 422, free text normalised, non-strings
+        # => 422) BEFORE anything else looks at the request.
+        f = _read_fields("POST /api/projects (init)", data, {
+            "agent": "idl", "project_id": "id", "title": "text", "status": "id",
+            "turn": "idl", "turn_reason": "text", "github": "id", "colleague": "id",
+            "author": "id", "phase": "idl", "transition_phase": "idl",
+            "participants": "list",
+        })
+        agent = f["agent"]
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
@@ -2096,30 +2991,106 @@ def create_app(
                 "start with a letter, use only letters, digits, '-' and '_', and contain a "
                 "hyphen separating type from id (e.g. PR-425)")}), 422
         project_id = raw_project_id or ""
-        title = (data.get("title") or "").strip()
-        status = (data.get("status") or "").strip()
-        turn = (data.get("turn") or "").strip().lower()
-        turn_reason = (data.get("turn_reason") or "").strip()
-        github = (data.get("github") or "").strip() or None
-        colleague = (data.get("colleague") or "").strip() or None
-        author = (data.get("author") or "").strip() or None
-        # #3039 U2a round 3: optional, trusted verbatim -- the client
+        title = f["title"]
+        status = f["status"]
+        turn = f["turn"]
+        turn_reason = f["turn_reason"]
+        github = f["github"] or None
+        colleague = f["colleague"] or None
+        author = f["author"] or None
+        # #3039 U2a round 3: optional, NOT trusted (U2b r2: the server re-derives it) -- the client
         # (baton.py) computes this baton's intended initial phase and sends
         # it under transition_phase (init is always a transition); this
         # endpoint does no validation/interpretation, same trust boundary as
         # pool_sentinel below. phase (conversion) is threaded through too,
         # for API uniformity, though a client should never need it here.
-        phase = (data.get("phase") or "").strip().lower() or None
-        transition_phase = (data.get("transition_phase") or "").strip().lower() or None
-
-        raw_parts = data.get("participants") or []
-        if isinstance(raw_parts, str):
-            participants = [p.strip().lower() for p in raw_parts.split(",") if p.strip()]
-        else:
-            participants = [p.strip().lower() for p in raw_parts if p]
+        phase = f["phase"] or None
+        transition_phase = f["transition_phase"] or None
+        participants = f["participants"]
 
         if not project_id or not title or not status or not turn or not turn_reason or not participants:
             return jsonify({"error": "project_id, title, status, turn, turn_reason, and participants are required"}), 400
+
+        # #3039 U2b round 2: no request body supplies a phase. A brand-new
+        # baton has no file to derive a conversion from, so a client
+        # ``phase`` is dropped (``merge`` is a 422); ``transition_phase`` is
+        # the baton's INITIAL phase, allow-listed by PR-vs-bunch shape.
+        route = "POST /api/projects (init)"
+        if phase == "merge":
+            msg, st = _phase_refusal(route, project_id, "phase", phase, "a new baton has no phase to convert")
+            return jsonify({"error": msg}), st
+        if phase:
+            logger.warning("%s %s: ignoring client conversion phase %r", route, project_id, phase)
+        phase = None
+        #
+        # Round 5 (B1): the SERVER stamps the initial phase itself on EVERY init.
+        # A phase-less PR baton whose turn is the pool sentinel reads as the
+        # LEGACY ``merge`` (``gate._resolve_phase``) -- a rule meant only for files
+        # that predate phase stamping -- so a client that simply omitted
+        # ``transition_phase`` got a baton the strict gate then saw as already
+        # merge-ready, with no approval anywhere. No new baton is ever phase-less.
+        gate = _load_baton_gate()
+        if gate is None:
+            if transition_phase is None:
+                return jsonify({"error": (
+                    f"{route} {project_id}: phase gate unavailable (server could not load its "
+                    "gate module) -- cannot decide PR-vs-bunch to stamp the baton's initial "
+                    "phase, and a phase-less baton is never created. See server logs.")}), 422
+            allowed = _INIT_PHASES_PR | _INIT_PHASES_BUNCH
+            default_phase = None
+        elif gate._is_pr_shaped(project_id, (github or "").strip().lower()):
+            allowed = _INIT_PHASES_PR
+            default_phase = "fairy"
+        else:
+            allowed = _INIT_PHASES_BUNCH
+            default_phase = "pool"
+        if transition_phase is None:
+            transition_phase = default_phase
+        elif transition_phase not in allowed:
+            msg, st = _phase_refusal(route, project_id, "transition_phase", transition_phase,
+                                     "allowed here: " + ", ".join(sorted(allowed)))
+            return jsonify({"error": msg}), st
+
+        # Round 6 (S5 + D2): the anchor is checked/qualified BEFORE anything is written.
+        g_norm = (github or "").strip().lower()
+        if g_norm:
+            tail = g_norm.rsplit("/", 1)[-1]
+            if (re.fullmatch(r"(?:pr/(?:[\w.-]+/[\w.-]+/)?|project/)[0-9]+", g_norm)
+                    and len(tail) > 15):
+                # S5: the shared anchor regex caps the number at 15 ASCII digits; init
+                # used to store a 5000-digit one that later 500ed or stuck the baton.
+                return jsonify({"error": (
+                    f"{route} {project_id}: github anchor number has {len(tail)} digits; "
+                    "at most 15 are accepted.")}), 422
+            if gate is None:
+                unqualified = re.fullmatch(r"pr/[0-9]{1,15}", g_norm) is not None
+                parsed_g = None
+            else:
+                parsed_g = gate._parse_github_anchor(g_norm)
+                unqualified = (parsed_g is not None and parsed_g[0] == "pr"
+                               and parsed_g[1] is None)
+            if unqualified:
+                # D2: an unqualified pr/<N> is qualified from the ADMIN map by the id's
+                # prefix (never from the request), or refused -- a baton is never
+                # created whose anchor the gate cannot bind to a repo.
+                want = None if gate is None else _bound_repo(gate, project_id, _login_map_cfg(app))
+                m_id = None if gate is None else gate._ID_BIND_RE.fullmatch(project_id)
+                if want is None or m_id is None:
+                    return jsonify({"error": (
+                        f"{route} {project_id}: the unqualified anchor {g_norm!r} cannot be "
+                        "qualified -- the baton id's prefix has no entry in the baton login "
+                        "map's 'repos' table (or no map / gate is available). Send "
+                        "pr/<owner>/<repo>/<N>, or ask the admin to map the prefix.")}), 422
+                github = f"pr/{want}/{parsed_g[2]}"
+            # Round 9 (B1): the id binding (number, and the mapped repo) is checked
+            # where the anchor is WRITTEN, for qualified AND unqualified anchors,
+            # so a baton is never created whose anchor advance would refuse.
+            bind_msg = _anchor_write_binding_refusal(
+                gate, project_id,
+                gate is not None and gate._is_pr_shaped(project_id, g_norm),
+                g_norm, _login_map_cfg(app))
+            if bind_msg is not None:
+                return jsonify({"error": f"{route} {project_id}: {bind_msg}"}), 422
 
         try:
             seq = _init(
@@ -2146,7 +3117,7 @@ def create_app(
 
         JSON body: {agent, to_agent, reason, phase?, transition_phase?}
         ``phase?`` / ``transition_phase?`` (#3039 U2a round 3): optional,
-        client-computed, trusted verbatim -- see api_project_init's
+        client-computed, NOT trusted (U2b r2: the server re-derives it) -- see api_project_init's
         docstring note. The two transition-defining flip branches send
         BOTH (round 4: ``phase`` = the legacy-conversion value, applied
         first, then ``transition_phase`` overwrites); conversion-only flips
@@ -2182,23 +3153,51 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        agent = (data.get("agent") or "").strip().lower()
+        f = _read_fields("POST /api/projects/<pid>/flip", data, {
+            "agent": "idl", "to_agent": "idl", "reason": "text",
+            "phase": "idl", "transition_phase": "idl",
+        }, pid=pid)
+        agent = f["agent"]
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
-        to_agent = (data.get("to_agent") or "").strip().lower()
-        reason = (data.get("reason") or "").strip()
+        to_agent = f["to_agent"]
+        reason = f["reason"]
         if not to_agent or not reason:
             return jsonify({"error": "to_agent and reason are required"}), 400
-        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # #3039 U2a round 3: optional, NOT trusted (U2b r2: the server re-derives it) -- see
         # api_project_init's note.
-        phase = (data.get("phase") or "").strip().lower() or None
-        transition_phase = (data.get("transition_phase") or "").strip().lower() or None
+        phase = f["phase"] or None
+        transition_phase = f["transition_phase"] or None
 
-        gate_refusal = _check_flip_gate(store, pid, to_agent)
+        advance_ticket: dict = {}
+        raw_phase, raw_transition = phase, transition_phase
+        gate_refusal = _check_flip_gate(
+            store, pid, to_agent,
+            phase=phase, transition_phase=transition_phase,
+            login_map_cfg=_login_map_cfg(app), ticket_out=advance_ticket,
+        )
         if gate_refusal is not None:
             message, gate_status = gate_refusal
             return jsonify({"error": message}), gate_status
+
+        if advance_ticket:
+            # D1: this flip IS the peer -> merge transition and passed the strict
+            # gate; write it through the same check-and-set body `advance` uses
+            # (the client's own phase fields are ignored -- the server decided).
+            body_out, status_out = _perform_advance(
+                _load_baton_gate(), store, allocator, pid,
+                to_agent=to_agent, reason=reason, agent=agent, ticket=advance_ticket,
+            )
+            return jsonify(body_out), status_out
+
+        # #3039 U2b round 2: the weak-gate path writes only phases the SERVER
+        # derived from the baton; a client transition it does not itself
+        # expect (notably ``merge``) is a 422, nothing written.
+        phase, transition_phase, phase_refusal = _flip_phase_inputs(
+            "POST /api/projects/<pid>/flip", pid, store, to_agent, raw_phase, raw_transition)
+        if phase_refusal is not None:
+            return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
 
         try:
             seq = _flip(
@@ -2211,13 +3210,84 @@ def create_app(
         turn, status = _read_project_state(store, pid)
         return jsonify({"seq": seq, "turn": turn, "status": status}), 201
 
+    @app.route("/api/projects/<pid>/advance", methods=["POST"])
+    def api_project_advance(pid: str):
+        """Advance a PR baton ``phase: peer -> phase: merge`` (#3039 U2b).
+
+        JSON body: {agent, to_agent, reason?}. ``to_agent`` is the merge seat
+        (a participant or the pool sentinel). There is no force / skip field:
+        the body is never consulted for anything that could bypass the gate.
+
+        The strict gate (:func:`_advance_gate`) is SERVER-authoritative: the
+        baton must be a repo-anchored PR baton in phase ``peer`` with a
+        ``colleague`` whose mapped GitHub login has a CURRENT ``APPROVED``
+        review on the PR head (still that login's latest opinionated review),
+        CI must not be red/pending, and the login map must load from its
+        protected path. The same function judges a raw ``POST .../flip`` that
+        resolves as this transition.
+
+        Response 201 ``{advanced: true, seq, turn, status, phase, ci, approval,
+        warnings}``; 200 ``{advanced: false, reason: "already merge", ...}`` on
+        the idempotent no-op (no seq, no turn-log line, no wake).
+        Errors: 400 (fields), 404, 409 (the baton moved between the GitHub
+        check and the write; names the actual phase), 422 (gate refusal),
+        503 (store not configured).
+
+        Honest limit: the GitHub verdict and the forum write are not one
+        cross-system transaction -- a CHANGES_REQUESTED landing between them
+        still advances (window: one HTTP round trip). And this gate proves an
+        authenticated non-author approval by a MAPPED account on the current
+        head; it does not prove the ASSIGNED colleague approved (the
+        ``colleague`` and ``agent`` fields are caller-declared), nor who ran
+        the verb.
+        """
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+        f = _read_fields("POST /api/projects/<pid>/advance", data, {
+            "agent": "idl", "to_agent": "idl", "reason": "text",
+        }, pid=pid)
+        agent = f["agent"]
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+        to_agent = f["to_agent"]
+        if not to_agent:
+            return jsonify({"error": "to_agent (the merge seat) is required"}), 400
+        reason = f["reason"] or "colleague-APPROVED; ready for merge"
+
+        raw = store.read_project(pid)
+        if raw is None:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+        gate = _load_baton_gate()
+        if gate is None:
+            return jsonify({"error": (
+                f"flip gate unavailable for {pid} (server could not load its "
+                "CI/approval gate module) -- refusing to advance without being able "
+                "to verify approval state. See server logs.")}), 422
+        from forum.coordination.markdown import parse_frontmatter
+        fields, body = parse_frontmatter(raw)
+        refusal, ticket = _advance_gate(gate, pid, fields, body, to_agent, _login_map_cfg(app), raw=raw)
+        if refusal is not None:
+            message, gate_status = refusal
+            return jsonify({"error": message}), gate_status
+        body_out, status_out = _perform_advance(
+            gate, store, allocator, pid,
+            to_agent=to_agent, reason=reason, agent=agent, ticket=ticket,
+        )
+        return jsonify(body_out), status_out
+
     @app.route("/api/projects/<pid>/claim", methods=["POST"])
     def api_project_claim(pid: str):
         """Claim a project baton from the pool.
 
         JSON body: {agent, pool_sentinel, phase?, transition_phase?}
         ``phase?`` / ``transition_phase?`` (#3039 U2a round 3): optional,
-        client-computed, trusted verbatim -- see api_project_init's
+        client-computed, NOT trusted (U2b r2: the server re-derives it) -- see api_project_init's
         docstring note. ``claim`` is always a transition, so the client
         sends ``transition_phase`` here -- together with ``phase`` (the
         legacy-conversion value, round 4), applied first.
@@ -2234,17 +3304,25 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        agent = (data.get("agent") or "").strip().lower()
+        f = _read_fields("POST /api/projects/<pid>/claim", data, {
+            "agent": "idl", "pool_sentinel": "idl", "phase": "idl", "transition_phase": "idl",
+        }, pid=pid)
+        agent = f["agent"]
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
-        pool_sentinel = (data.get("pool_sentinel") or "").strip().lower()
+        pool_sentinel = f["pool_sentinel"]
         if not pool_sentinel:
             return jsonify({"error": "pool_sentinel is required"}), 400
-        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # #3039 U2a round 3: optional, NOT trusted (U2b r2: the server re-derives it) -- see
         # api_project_init's note.
-        phase = (data.get("phase") or "").strip().lower() or None
-        transition_phase = (data.get("transition_phase") or "").strip().lower() or None
+        phase = f["phase"] or None
+        transition_phase = f["transition_phase"] or None
+
+        phase, transition_phase, phase_refusal = _bunch_verb_inputs(
+            "POST /api/projects/<pid>/claim", pid, store, phase, transition_phase, _CLAIM_PHASES)
+        if phase_refusal is not None:
+            return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
 
         try:
             seq = _claim(
@@ -2264,7 +3342,7 @@ def create_app(
         JSON body: {agent, pool_sentinel, reason, done?, phase?, transition_phase?}
         ``done`` (bool, default false) appends "(done)" to the project title.
         ``phase?`` / ``transition_phase?`` (#3039 U2a round 3): optional,
-        client-computed, trusted verbatim -- see api_project_init's
+        client-computed, NOT trusted (U2b r2: the server re-derives it) -- see api_project_init's
         docstring note. ``release`` is always a transition, so the client
         sends ``transition_phase`` here -- together with ``phase`` (the
         legacy-conversion value, round 4), applied first.
@@ -2281,20 +3359,30 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        agent = (data.get("agent") or "").strip().lower()
+        f = _read_fields("POST /api/projects/<pid>/release", data, {
+            "agent": "idl", "pool_sentinel": "idl", "reason": "text", "done": "bool",
+            "phase": "idl", "transition_phase": "idl",
+        }, pid=pid)
+        agent = f["agent"]
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
-        pool_sentinel = (data.get("pool_sentinel") or "").strip().lower()
-        reason = (data.get("reason") or "").strip()
+        pool_sentinel = f["pool_sentinel"]
+        reason = f["reason"]
         if not pool_sentinel or not reason:
             return jsonify({"error": "pool_sentinel and reason are required"}), 400
 
-        done = bool(data.get("done", False))
-        # #3039 U2a round 3: optional, trusted verbatim -- see
+        done = f["done"]
+        # #3039 U2a round 3: optional, NOT trusted (U2b r2: the server re-derives it) -- see
         # api_project_init's note.
-        phase = (data.get("phase") or "").strip().lower() or None
-        transition_phase = (data.get("transition_phase") or "").strip().lower() or None
+        phase = f["phase"] or None
+        transition_phase = f["transition_phase"] or None
+
+        phase, transition_phase, phase_refusal = _bunch_verb_inputs(
+            "POST /api/projects/<pid>/release", pid, store, phase, transition_phase,
+            _RELEASE_PHASES, fallback="claimed")
+        if phase_refusal is not None:
+            return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
 
         try:
             seq = _release(
@@ -2315,7 +3403,7 @@ def create_app(
         Dispatch: if new_status in (planning, in-progress, in-review) → reopen;
                   otherwise → close.
         ``phase?`` (#3039 U2a round 3): optional, client-computed CONVERSION
-        phase, trusted verbatim -- see api_project_init's docstring note.
+        phase, NOT trusted (U2b r2: the server re-derives it) -- see api_project_init's docstring note.
         Neither ``close`` nor ``reopen`` ever writes a transition phase
         (Kepler's ruling), so there is no ``transition_phase`` field here.
         Response: {seq, turn, status}, 201.
@@ -2331,19 +3419,27 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        agent = (data.get("agent") or "").strip().lower()
+        f = _read_fields("POST /api/projects/<pid>/status", data, {
+            "agent": "idl", "new_status": "idl", "reason": "text", "phase": "idl",
+        }, pid=pid)
+        agent = f["agent"]
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
-        new_status = (data.get("new_status") or "").strip().lower()
-        reason = (data.get("reason") or "").strip()
+        new_status = f["new_status"]
+        reason = f["reason"]
         if not new_status or not reason:
             return jsonify({"error": "new_status and reason are required"}), 400
-        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # #3039 U2a round 3: optional, NOT trusted (U2b r2: the server re-derives it) -- see
         # api_project_init's note.
-        phase = (data.get("phase") or "").strip().lower() or None
+        phase = f["phase"] or None
 
         _ACTIVE_STATUSES = frozenset({"planning", "in-progress", "in-review"})
+
+        phase, phase_refusal = _conversion_only_inputs(
+            "POST /api/projects/<pid>/status", pid, store, phase)
+        if phase_refusal is not None:
+            return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
 
         try:
             if new_status in _ACTIVE_STATUSES:
@@ -2362,7 +3458,7 @@ def create_app(
 
         JSON body: {agent, new_title, phase?}
         ``phase?`` (#3039 U2a round 3): optional, client-computed CONVERSION
-        phase, trusted verbatim -- see api_project_init's docstring note.
+        phase, NOT trusted (U2b r2: the server re-derives it) -- see api_project_init's docstring note.
         ``rename`` never writes a transition phase (never a phase-machine
         edge), so there is no ``transition_phase`` field here.
         Response: {seq, turn, status}, 201.
@@ -2378,16 +3474,24 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        agent = (data.get("agent") or "").strip().lower()
+        f = _read_fields("POST /api/projects/<pid>/rename", data, {
+            "agent": "idl", "new_title": "text", "phase": "idl",
+        }, pid=pid)
+        agent = f["agent"]
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
-        new_title = (data.get("new_title") or "").strip()
+        new_title = f["new_title"]
         if not new_title:
             return jsonify({"error": "new_title is required"}), 400
-        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # #3039 U2a round 3: optional, NOT trusted (U2b r2: the server re-derives it) -- see
         # api_project_init's note.
-        phase = (data.get("phase") or "").strip().lower() or None
+        phase = f["phase"] or None
+
+        phase, phase_refusal = _conversion_only_inputs(
+            "POST /api/projects/<pid>/rename", pid, store, phase)
+        if phase_refusal is not None:
+            return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
 
         try:
             seq = _rename(store, allocator, pid, new_title=new_title, phase=phase)
@@ -2403,7 +3507,7 @@ def create_app(
 
         JSON body: {agent, github, phase?}
         ``phase?`` (#3039 U2a round 3): optional, client-computed CONVERSION
-        phase, trusted verbatim -- see api_project_init's docstring note.
+        phase, NOT trusted (U2b r2: the server re-derives it) -- see api_project_init's docstring note.
         ``anchor`` never writes a transition phase (never a phase-machine
         edge), so there is no ``transition_phase`` field here.
         Response: {seq, turn, status}, 201.
@@ -2419,16 +3523,30 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        agent = (data.get("agent") or "").strip().lower()
+        f = _read_fields("POST /api/projects/<pid>/anchor", data, {
+            "agent": "idl", "github": "id", "phase": "idl",
+        }, pid=pid)
+        agent = f["agent"]
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
-        github_anchor = (data.get("github") or "").strip()
+        github_anchor = f["github"]
         if not github_anchor:
             return jsonify({"error": "github is required"}), 400
-        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # #3039 U2a round 3: optional, NOT trusted (U2b r2: the server re-derives it) -- see
         # api_project_init's note.
-        phase = (data.get("phase") or "").strip().lower() or None
+        phase = f["phase"] or None
+
+        # Round 4 (A1 + A3): write-once after `fairy`, and a CLI-sendable shape.
+        anchor_refusal = _anchor_refusal("POST /api/projects/<pid>/anchor", pid, store, github_anchor,
+                                         _login_map_cfg(app))
+        if anchor_refusal is not None:
+            return jsonify({"error": anchor_refusal[0]}), anchor_refusal[1]
+
+        phase, phase_refusal = _conversion_only_inputs(
+            "POST /api/projects/<pid>/anchor", pid, store, phase)
+        if phase_refusal is not None:
+            return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
 
         try:
             seq = _anchor(store, allocator, pid, github_anchor=github_anchor, phase=phase)
@@ -2448,7 +3566,7 @@ def create_app(
         (LOAD-BEARING: this check lives in the coordination write-fn, not
         here, so it can't be bypassed by a direct API call). ``participant``
         is the agent being added. ``phase?`` (#3039 U2a round 3): optional,
-        client-computed CONVERSION phase, trusted verbatim -- see
+        client-computed CONVERSION phase, NOT trusted (U2b r2: the server re-derives it) -- see
         api_project_init's docstring note. ``add_participant`` never writes
         a transition phase (never a phase-machine edge), so there is no
         ``transition_phase`` field here.
@@ -2472,16 +3590,24 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        agent = (data.get("agent") or "").strip().lower()
+        f = _read_fields("POST /api/projects/<pid>/participants", data, {
+            "agent": "idl", "participant": "idl", "phase": "idl",
+        }, pid=pid)
+        agent = f["agent"]
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
-        participant = (data.get("participant") or "").strip().lower()
+        participant = f["participant"]
         if not participant or not db.is_valid_agent_name(participant):
             return jsonify({"error": f"invalid participant name {participant!r}"}), 400
-        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # #3039 U2a round 3: optional, NOT trusted (U2b r2: the server re-derives it) -- see
         # api_project_init's note.
-        phase = (data.get("phase") or "").strip().lower() or None
+        phase = f["phase"] or None
+
+        phase, phase_refusal = _conversion_only_inputs(
+            "POST /api/projects/<pid>/participants", pid, store, phase)
+        if phase_refusal is not None:
+            return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
 
         try:
             seq, added = _add_participant(
@@ -2505,7 +3631,7 @@ def create_app(
         write-fn, not here, so it can't be bypassed by a direct API call).
         ``colleague`` is the agent being named; also added to ``participants``
         (dedup) in the same atomic write. ``phase?`` (#3039 U2a round 3):
-        optional, client-computed CONVERSION phase, trusted verbatim -- see
+        optional, client-computed CONVERSION phase, NOT trusted (U2b r2: the server re-derives it) -- see
         api_project_init's docstring note. ``set_colleague`` never writes a
         transition phase (never a phase-machine edge), so there is no
         ``transition_phase`` field here.
@@ -2528,16 +3654,24 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        agent = (data.get("agent") or "").strip().lower()
+        f = _read_fields("POST /api/projects/<pid>/colleague", data, {
+            "agent": "idl", "colleague": "idl", "phase": "idl",
+        }, pid=pid)
+        agent = f["agent"]
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
-        colleague = (data.get("colleague") or "").strip().lower()
+        colleague = f["colleague"]
         if not colleague or not db.is_valid_agent_name(colleague):
             return jsonify({"error": f"invalid colleague name {colleague!r}"}), 400
-        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # #3039 U2a round 3: optional, NOT trusted (U2b r2: the server re-derives it) -- see
         # api_project_init's note.
-        phase = (data.get("phase") or "").strip().lower() or None
+        phase = f["phase"] or None
+
+        phase, phase_refusal = _conversion_only_inputs(
+            "POST /api/projects/<pid>/colleague", pid, store, phase)
+        if phase_refusal is not None:
+            return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
 
         try:
             seq, participant_added = _set_colleague(
@@ -2560,7 +3694,7 @@ def create_app(
         JSON body: {agent, new_status, reason, phase?}
         ``new_status`` must be a closed status (merged or cancelled).
         ``phase?`` (#3039 U2a round 3): optional, client-computed CONVERSION
-        phase, trusted verbatim -- see api_project_init's docstring note.
+        phase, NOT trusted (U2b r2: the server re-derives it) -- see api_project_init's docstring note.
         This is the SAME write-body as ``/status``'s close branch (``gc`` is
         a second caller of ``close()``, not a separate write-body) --
         ``close`` never writes a transition phase, so there is no
@@ -2578,17 +3712,25 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        agent = (data.get("agent") or "").strip().lower()
+        f = _read_fields("POST /api/projects/<pid>/gc", data, {
+            "agent": "idl", "new_status": "idl", "reason": "text", "phase": "idl",
+        }, pid=pid)
+        agent = f["agent"]
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
-        new_status = (data.get("new_status") or "").strip().lower()
-        reason = (data.get("reason") or "").strip()
+        new_status = f["new_status"]
+        reason = f["reason"]
         if not new_status or not reason:
             return jsonify({"error": "new_status and reason are required"}), 400
-        # #3039 U2a round 3: optional, trusted verbatim -- see
+        # #3039 U2a round 3: optional, NOT trusted (U2b r2: the server re-derives it) -- see
         # api_project_init's note.
-        phase = (data.get("phase") or "").strip().lower() or None
+        phase = f["phase"] or None
+
+        phase, phase_refusal = _conversion_only_inputs(
+            "POST /api/projects/<pid>/gc", pid, store, phase)
+        if phase_refusal is not None:
+            return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
 
         try:
             seq = _close(store, allocator, pid, new_status=new_status, reason=reason, phase=phase)
@@ -2608,7 +3750,7 @@ def create_app(
         JSON body: {agent, forced?, phase?}
         ``forced`` (bool, default false) adds "(FORCED past gates 3-4)" to the log.
         ``phase?`` (#3039 U2a round 3): optional, client-computed CONVERSION
-        phase, trusted verbatim -- see api_project_init's docstring note.
+        phase, NOT trusted (U2b r2: the server re-derives it) -- see api_project_init's docstring note.
         ``merge`` never writes a transition phase (terminal states live in
         ``status``, never ``phase``), so there is no ``transition_phase``
         field here.
@@ -2625,14 +3767,22 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
-        agent = (data.get("agent") or "").strip().lower()
+        f = _read_fields("POST /api/projects/<pid>/merge", data, {
+            "agent": "idl", "forced": "bool", "phase": "idl",
+        }, pid=pid)
+        agent = f["agent"]
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
-        forced = bool(data.get("forced", False))
-        # #3039 U2a round 3: optional, trusted verbatim -- see
+        forced = f["forced"]
+        # #3039 U2a round 3: optional, NOT trusted (U2b r2: the server re-derives it) -- see
         # api_project_init's note.
-        phase = (data.get("phase") or "").strip().lower() or None
+        phase = f["phase"] or None
+
+        phase, phase_refusal = _conversion_only_inputs(
+            "POST /api/projects/<pid>/merge", pid, store, phase)
+        if phase_refusal is not None:
+            return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
 
         try:
             seq = _merge(store, allocator, pid, merged_by=agent, forced=forced, phase=phase)
@@ -2792,9 +3942,20 @@ def _run_boot_verify(db_path: str, audit_path: str, verify_only: bool = False) -
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
-def main() -> None:
+def _parse_args(argv=None, environ=None):
+    """Parse the server CLI. ``environ`` is injectable for tests.
+
+    #3039 U2b: ``--baton-login-map`` (env ``ENGRAM_BATON_LOGIN_MAP``) names the
+    protected agent -> GitHub-login map for the strict peer->merge gate. There
+    is NO default path: absent means the gate fails closed.
+    ``--baton-login-map-admin-uid`` (repeatable; env
+    ``ENGRAM_BATON_LOGIN_MAP_ADMIN_UIDS``, comma-separated) names the uids,
+    besides root, allowed to own the map -- never defaulted to the server's own
+    uid, because the server runs as an agent account.
+    """
     import argparse
 
+    env = os.environ if environ is None else environ
     p = argparse.ArgumentParser(description="LAN agent forum server")
     p.add_argument("--port", type=int, default=5002)
     p.add_argument("--host", default="0.0.0.0")
@@ -2808,7 +3969,31 @@ def main() -> None:
                         "Defaults to packs/ next to --db.")
     p.add_argument("--verify-only", action="store_true",
                    help="Run boot-verify probes, print report, exit 0/2 without binding the port.")
-    args = p.parse_args()
+    p.add_argument("--baton-login-map", default=(env.get("ENGRAM_BATON_LOGIN_MAP") or "").strip() or None,
+                   help="Path to the PROTECTED agent -> GitHub-login map the strict baton "
+                        "peer->merge gate reads (env: ENGRAM_BATON_LOGIN_MAP). No default path: "
+                        "when absent, `baton advance` fails closed ('no login map configured'). "
+                        "The file and every directory above it must be owned by root or by an "
+                        "--baton-login-map-admin-uid, and not group/world-writable.")
+    p.add_argument("--baton-login-map-admin-uid", type=int, action="append", default=None,
+                   help="Extra uid (besides root) allowed to own the login map and its directories. "
+                        "Repeatable (env: ENGRAM_BATON_LOGIN_MAP_ADMIN_UIDS, comma-separated). "
+                        "Never defaulted to the server's own uid.")
+    args = p.parse_args(argv)
+    uids = list(args.baton_login_map_admin_uid or [])
+    for tok in (env.get("ENGRAM_BATON_LOGIN_MAP_ADMIN_UIDS") or "").split(","):
+        tok = tok.strip()
+        if tok:
+            try:
+                uids.append(int(tok))
+            except ValueError:
+                p.error(f"ENGRAM_BATON_LOGIN_MAP_ADMIN_UIDS: {tok!r} is not an integer uid")
+    args.baton_login_map_admin_uid = uids
+    return args
+
+
+def main() -> None:
+    args = _parse_args()
 
     # ------------------------------------------------------------------
     # Boot-verify: run BEFORE binding the port.
@@ -2835,7 +4020,13 @@ def main() -> None:
         dep_results=dep_results,
         coord_root=str(default_store_root()),
         backup_dir=os.environ.get("FORUM_BACKUP_DIR", "").strip() or None,
+        baton_login_map=args.baton_login_map,
+        baton_login_map_admin_uids=tuple(args.baton_login_map_admin_uid),
     )
+    if args.baton_login_map is None:
+        print("[forum] baton login map: not configured -- `baton advance` (peer->merge) "
+              "will refuse until --baton-login-map / $ENGRAM_BATON_LOGIN_MAP is set.",
+              file=sys.stderr)
     app.run(host=args.host, port=args.port)
 
 

@@ -1456,6 +1456,10 @@
       "reason": "boot-time agent auto-start deploy files (systemd template unit/timer/target, tmux launch wrapper, boot-charge templates, install README) — operator-installed host administration per README (copied to /etc/systemd/system + /usr/local/lib/agentctl/autostart by the host owner), not shipped in any plugin install tier; same class as tools/agent-bootstrap"
     },
     {
+      "path": "deploy/baton-login-map.json",
+      "reason": "SYNTHETIC template of the agent -> GitHub-login map the forum server's strict baton peer->merge gate reads (#3039 U2b). The real map is admin-installed at a root-owned path named by --baton-login-map, never shipped; /deploy/ is in release-minus-set.txt, so this is repo-only, never in any install tier"
+    },
+    {
       "path": "deploy/tool_policy_facts.py",
       "reason": "canonical TOOL POLICY fact table consumed only by tests/test_tool_policy_sync.py (the three-surface drift guard) — CI-only, never shipped in any install tier"
     },

@@ -80,9 +80,11 @@ rework is a later unit, per U1's spec).
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
+import stat
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -96,9 +98,29 @@ from typing import Optional
 # file makes (#1918: there is no default repo) -- an unqualified pr/<N> is
 # refused-and-counted by cmd_gc/cmd_flip/cmd_merge (and now api_project_flip)
 # rather than resolved against a guess.
+#
+# Numbers are ASCII digits only and at most 15 long (#3039 U2b round 5,
+# S1/S2): ``\d`` / ``str.isdigit`` / ``int`` accept Arabic-Indic and other
+# Unicode digits, and ``int(<5000 digits>)`` raises ValueError on Python >= 3.11
+# (a 500 from the route and -- the anchor being write-once in ``peer`` -- a
+# stuck baton). No real PR number is anywhere near 15 digits.
 _GITHUB_ANCHOR_RE = re.compile(
-    r"^(?:pr/(?:[\w.-]+/[\w.-]+/)?\d+|project/\d+)$"
+    r"^(?:pr/(?:[\w.-]+/[\w.-]+/)?[0-9]{1,15}|project/[0-9]{1,15})$"
 )
+
+
+def _ascii_digits(value) -> bool:
+    """True for a non-empty string of ASCII digits 0-9 only. PURE."""
+    return isinstance(value, str) and bool(value) and value.isascii() and value.isdigit()
+
+
+def _same_number(a: str, b: str) -> bool:
+    """Numeric equality of two ASCII-digit strings WITHOUT ``int()`` (no
+    int-from-str digit limit, no Unicode digits): leading zeros are ignored.
+    PURE; False when either is not ASCII digits."""
+    if not (_ascii_digits(a) and _ascii_digits(b)):
+        return False
+    return (a.lstrip("0") or "0") == (b.lstrip("0") or "0")
 
 # #1918: there is NO default repo, deliberately -- do not revisit.
 #
@@ -130,12 +152,12 @@ def _parse_github_anchor(value: str) -> Optional[tuple]:
     """
     if not value:
         return None
-    m = re.match(r"^pr/(?:([\w.-]+)/([\w.-]+)/)?(\d+)$", value)
+    m = re.match(r"^pr/(?:([\w.-]+)/([\w.-]+)/)?([0-9]{1,15})$", value)
     if m:
         owner, repo, number = m.group(1), m.group(2), m.group(3)
         repo_qualified = f"{owner}/{repo}" if owner and repo else None
         return ("pr", repo_qualified, number)
-    m = re.match(r"^project/(\d+)$", value)
+    m = re.match(r"^project/([0-9]{1,15})$", value)
     if m:
         return ("project", None, m.group(1))
     return None
@@ -257,6 +279,38 @@ def _is_legacy_pool_sentinel(name: str) -> bool:
         return True
     first_token = sentinel.split()[0] if sentinel else ""
     return bool(first_token) and name == first_token
+
+
+# Matches a PR-baton's project_id by PREFIX ONLY (optional single-segment
+# repo-qualifier, then "PR-"). Mirror of tools/baton.py's _PR_BATON_NAME_RE;
+# pinned to it by src/forum/tests/test_baton_phase_injection.py (#3039 U2b r2).
+_PR_BATON_NAME_RE = re.compile(r"^(?:[A-Z][A-Z0-9]*-)?PR-")
+
+
+def _is_pr_baton(project_id: str, fields: dict) -> bool:
+    """True if this baton is a PR baton (not a bunch) -- the server's copy of
+    tools/baton.py's ``_is_pr_baton`` / ``_is_pr_shaped`` (#3039 U2b round 2:
+    the server must decide PR-vs-bunch itself instead of trusting a client).
+
+    Anchor-first, name-only-when-unanchored: a parseable ``github`` anchor
+    decides (``pr/...`` => PR, ``project/N`` => bunch) whatever the id looks
+    like; only an unanchored (or unparseable-anchor) baton falls back to the
+    id, where a ``pool-`` prefix is always a bunch and otherwise
+    ``_PR_BATON_NAME_RE`` (case-insensitive) decides. PURE.
+    """
+    return _is_pr_shaped(project_id, (fields or {}).get("github", ""))
+
+
+def _is_pr_shaped(project_id: str, github: str) -> bool:
+    """Shared body of :func:`_is_pr_baton` and the server's init check (there
+    is no baton file yet at init, only the id and the requested anchor)."""
+    github = (github or "").strip().lower()
+    parsed = _parse_github_anchor(github) if github else None
+    if parsed is not None:
+        return parsed[0] == "pr"
+    if project_id.strip().lower().startswith("pool-"):
+        return False
+    return bool(_PR_BATON_NAME_RE.match(project_id.upper()))
 
 
 def _resolve_phase(fields: dict, *, is_bunch: bool) -> tuple[str, bool]:
@@ -543,7 +597,7 @@ def _pr_approval_state(pr_number: str, repo: str) -> tuple:
     # the old argv-passed form, which the shell layer kept inert) — require a
     # bare integer so a malformed anchor can't inject query text.
     pr_str = str(pr_number).lstrip("#")
-    if not pr_str.isdigit():
+    if not _ascii_digits(pr_str):
         return ("unknown", f"PR number {pr_number!r} is not numeric")
     pr_number = pr_str
 
@@ -626,3 +680,482 @@ def _pr_approval_state(pr_number: str, repo: str) -> tuple:
         f"tip oid {tip_short} not covered by any approval "
         f"(latest approval oid {approval_short})",
     )
+
+
+# ---------------------------------------------------------------------------
+# #3039 U2b -- the strict `peer -> merge` gate primitives
+#
+# Two pieces live here, both PURE (no printing, no sys.exit -- this module is
+# imported into the long-running forum process):
+#
+#   1. `_load_login_map`  -- the agent -> GitHub-login map, read from a
+#      PROTECTED file the server is told about at start (never a default
+#      path, never shipped identities).
+#   2. `_reviewer_approval_state` -- one reviewer login's CURRENT verdict on a
+#      PR head.
+#
+# Deliberately NOT a retrofit of `_pr_approval_state` above: its other callers
+# ask a broader question ("does ANY approval cover the tip?") and treat
+# `unknown` as advisory.  This gate asks "did THIS mapped account approve THIS
+# head, and is that still its latest opinion?", and every answer other than
+# `approved_current` refuses -- `unknown` included.
+#
+# What this gate does NOT prove (stated, not hidden): it proves an
+# authenticated non-author GitHub approval by an account in the reviewed map,
+# on the current head.  It does not prove that the ASSIGNED colleague approved
+# (the forum's `colleague` / `agent` fields are caller-declared and mutable),
+# nor who ran the verb.
+# ---------------------------------------------------------------------------
+
+# Start option / env that names the protected map file.  There is NO default
+# path in code: an absent option means the gate fails closed.
+_BATON_LOGIN_MAP_ENV = "ENGRAM_BATON_LOGIN_MAP"
+
+_LOGIN_MAP_VERSION = 1
+_LOGIN_MAP_MAX_BYTES = 1024 * 1024
+
+
+class LoginMapError(Exception):
+    """The login map is absent, unreadable, malformed, or not trustworthy.
+
+    The message names the cause (and the failing path component / agent key),
+    so a caller can surface it verbatim as a refusal.
+    """
+
+
+def _login_map_fail(msg: str) -> "LoginMapError":
+    return LoginMapError(f"baton login map: {msg}")
+
+
+def _check_map_component(st, label: str, trusted: frozenset, *, want_dir: bool) -> None:
+    """Owner/mode/type check on an OPEN fd's stat result (never a path stat)."""
+    if want_dir:
+        if not stat.S_ISDIR(st.st_mode):
+            raise _login_map_fail(f"{label} is not a directory")
+    elif not stat.S_ISREG(st.st_mode):
+        raise _login_map_fail(f"{label} is not a regular file")
+    if st.st_uid not in trusted:
+        raise _login_map_fail(
+            f"{label} has owner uid {st.st_uid}, which is neither root nor an "
+            "admin uid named at server start"
+        )
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise _login_map_fail(
+            f"{label} is group- or world-writable (mode {oct(stat.S_IMODE(st.st_mode))})"
+        )
+
+
+class LoginMap(dict):
+    """``{agent(lower): [login(lower), ...]}`` plus ``.repos``.
+
+    ``repos`` is the admin-owned id-prefix table (#3039 U2b round 4, A2): an
+    UPPER-CASED baton-id prefix (``PR``, ``UMWELT-PR``) -> the lower-cased
+    ``owner/repo`` a baton with that prefix may be anchored to. It is a dict
+    subclass so existing callers that treat the result as the agent map keep
+    working unchanged.
+    """
+
+    repos: dict = {}
+
+
+def _validate_repos(raw_repos) -> dict:
+    """Schema validation of the ``repos`` table; returns {PREFIX: "owner/repo"}."""
+    if not isinstance(raw_repos, dict) or not raw_repos:
+        raise _login_map_fail(
+            "'repos' must be a non-empty object of baton-id prefix -> \"owner/repo\" "
+            "(the strict peer->merge gate binds a baton's id to its anchor's repo)"
+        )
+    out: dict = {}
+    for prefix, repo in raw_repos.items():
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise _login_map_fail(f"'repos' prefix {prefix!r} must be a non-empty string")
+        key = prefix.strip().upper()
+        if key in out:
+            raise _login_map_fail(
+                f"'repos' prefix {key!r} appears twice (prefixes are case-insensitive)"
+            )
+        if not isinstance(repo, str) or not _REPO_SLUG_RE.match(repo.strip()):
+            raise _login_map_fail(
+                f"'repos' entry for prefix {key!r} must be an \"owner/repo\" string, got {repo!r}"
+            )
+        out[key] = repo.strip().lower()
+    return out
+
+
+def _validate_login_map(data) -> dict:
+    """Schema validation; returns a :class:`LoginMap`
+    ({agent(lower): [login(lower), ...]} with ``.repos``)."""
+    if not isinstance(data, dict):
+        raise _login_map_fail("top level must be a JSON object")
+    version = data.get("version")
+    if isinstance(version, bool) or version != _LOGIN_MAP_VERSION:
+        raise _login_map_fail(
+            f"missing or unsupported 'version' (expected {_LOGIN_MAP_VERSION}, got {version!r})"
+        )
+    raw_map = data.get("map")
+    if not isinstance(raw_map, dict):
+        raise _login_map_fail("'map' must be an object of agent -> [github logins]")
+    out: dict = {}
+    owner_of: dict = {}
+    for agent, logins in raw_map.items():
+        if not isinstance(agent, str) or not agent.strip():
+            raise _login_map_fail(f"agent key {agent!r} must be a non-empty string")
+        key = agent.strip().lower()
+        if key in out:
+            raise _login_map_fail(f"agent {key!r} appears twice (keys are case-insensitive)")
+        if not isinstance(logins, list):
+            raise _login_map_fail(f"agent {key!r}: value must be a list of logins")
+        if not logins:
+            raise _login_map_fail(f"agent {key!r}: empty login list")
+        cleaned = []
+        for login in logins:
+            if not isinstance(login, str) or not login.strip():
+                raise _login_map_fail(f"agent {key!r}: each login must be a non-empty string")
+            low = login.strip().lower()
+            prior = owner_of.get(low)
+            if prior is not None and prior != key:
+                raise _login_map_fail(
+                    f"login {low!r} is mapped to more than one agent ({prior!r} and {key!r})"
+                )
+            owner_of[low] = key
+            if low not in cleaned:
+                cleaned.append(low)
+        out[key] = cleaned
+    result = LoginMap(out)
+    result.repos = _validate_repos(data.get("repos"))
+    return result
+
+
+# A baton id binds its anchor (#3039 U2b round 4, A2): ``<prefix>-<N>[-suffix]``.
+# Non-greedy prefix, so ``UMWELT-PR-925`` is prefix ``UMWELT-PR`` / number 925 and
+# ``PR-92-paper`` is prefix ``PR`` / number 92.
+_ID_BIND_RE = re.compile(r"(?P<prefix>.+?)-(?P<num>[0-9]+)(?:-.+)?", re.IGNORECASE | re.DOTALL)
+
+
+def _anchor_id_binding_refusal(project_id: str, anchor_repo: str, anchor_number: str,
+                               repos: dict, anchor_shown: Optional[str] = None) -> Optional[str]:
+    """None when the PR anchor is the one the baton id names, else the refusal text.
+
+    The id must carry a number; its prefix must have an entry in the admin-owned
+    ``repos`` table; the anchor's number must equal the id's number AND its
+    ``owner/repo`` must equal that table entry (case-insensitive). PURE.
+
+    ``anchor_shown`` (round 6, D1): when the caller DERIVED ``anchor_repo`` from
+    this same table for an unqualified ``pr/<N>`` anchor, the literal anchor to
+    name in the refusal text instead of the derived ``pr/<repo>/<N>``.
+    """
+    m = _ID_BIND_RE.fullmatch(project_id or "")
+    if m is None:
+        return (
+            f"baton id {project_id!r} carries no PR number (expected <PREFIX>-<N>[-suffix]), "
+            "so its anchor cannot be bound to it; the peer->merge advance applies only to "
+            "a PR baton whose id names its PR."
+        )
+    prefix, number = m.group("prefix").upper(), m.group("num")
+    want_repo = (repos or {}).get(prefix)
+    if want_repo is None:
+        return (
+            f"baton id prefix {prefix!r} (from {project_id!r}) has no entry in the baton login "
+            "map's 'repos' table, so the repository it may be anchored to is unknown. The "
+            "admin must add the prefix."
+        )
+    number_ok = _same_number(number, str(anchor_number))
+    repo_ok = (anchor_repo or "").lower() == want_repo
+    if not (number_ok and repo_ok):
+        shown = anchor_shown or "pr/%s/%s" % (anchor_repo, anchor_number)
+        return (
+            f"the github anchor of {project_id!r} does not match its id: expected "
+            f"'pr/{want_repo}/{number}' (PR {number} from the id, repo {want_repo} for prefix "
+            f"{prefix}) but the anchor is '{shown}'."
+        )
+    return None
+
+
+def _load_login_map(
+    path,
+    *,
+    extra_trusted_uids=(),
+    trust_anchor: str = "/",
+    _before_leaf_open=None,
+) -> dict:
+    """Load + validate the protected agent -> GitHub-login map.  Fails closed.
+
+    Integrity rules (the forum server runs as an AGENT unix account, so
+    "owned by the server's own uid" is NOT acceptable -- the file would be
+    agent-editable):
+
+      * every directory from the trust anchor down, and the file itself, must
+        be owned by root or by an admin uid named EXPLICITLY at server start
+        (`extra_trusted_uids`; never defaulted to the caller's own uid);
+      * none of them may be group- or world-writable;
+      * no component may be a symlink (each is opened with O_NOFOLLOW);
+      * owner/mode are checked with fstat on the OPEN fd of each component,
+        walked with dir_fd, so a swap or symlink replace between check and use
+        cannot change what was verified.
+
+    `trust_anchor` is "/" in production.  It is an injectable seam so tests
+    (which cannot chown to root) can root the walk at a scratch directory; it
+    must be an ancestor of `path`, and components at or above it are not
+    checked.  `_before_leaf_open` is a test seam run after the directory walk
+    and before the leaf is opened.
+    """
+    if path is None or not str(path).strip():
+        raise _login_map_fail(
+            "no login map configured (set --baton-login-map or "
+            f"${_BATON_LOGIN_MAP_ENV}); the strict peer->merge gate fails closed"
+        )
+    path = str(path)
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise _login_map_fail(
+            f"{path!r} must be an absolute, normalized path (no '..', '.', or doubled '/')"
+        )
+    anchor = os.path.normpath(str(trust_anchor))
+    if not os.path.isabs(anchor):
+        raise _login_map_fail("trust anchor must be absolute")
+    anchor_prefix = anchor if anchor == "/" else anchor + "/"
+    if not path.startswith(anchor_prefix):
+        raise _login_map_fail(f"{path!r} is not under the trust anchor {anchor!r}")
+    trusted = frozenset({0}) | frozenset(int(u) for u in (extra_trusted_uids or ()))
+
+    rel = path[len(anchor_prefix):]
+    comps = [c for c in rel.split("/") if c]
+    if not comps:
+        raise _login_map_fail(f"{path!r} names no file")
+
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW | cloexec
+    fds: list = []
+    try:
+        try:
+            cur = os.open(anchor, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | cloexec)
+        except OSError as exc:
+            raise _login_map_fail(f"cannot open trust anchor {anchor!r}: {exc.strerror}")
+        fds.append(cur)
+        walked = anchor
+        if anchor == "/":
+            _check_map_component(os.fstat(cur), "/", trusted, want_dir=True)
+        for comp in comps[:-1]:
+            walked = walked.rstrip("/") + "/" + comp
+            try:
+                nxt = os.open(comp, dir_flags, dir_fd=cur)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise _login_map_fail(
+                        f"{walked} is a symlink or not a directory (symlinks are refused)"
+                    )
+                raise _login_map_fail(f"cannot open {walked}: {exc.strerror}")
+            fds.append(nxt)
+            _check_map_component(os.fstat(nxt), walked, trusted, want_dir=True)
+            cur = nxt
+        leaf = walked.rstrip("/") + "/" + comps[-1]
+        if _before_leaf_open is not None:
+            _before_leaf_open()
+        try:
+            leaf_fd = os.open(comps[-1], os.O_RDONLY | os.O_NOFOLLOW | cloexec, dir_fd=cur)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise _login_map_fail(f"{leaf} is a symlink (symlinks are refused)")
+            raise _login_map_fail(f"cannot open {leaf}: {exc.strerror}")
+        fds.append(leaf_fd)
+        st = os.fstat(leaf_fd)
+        _check_map_component(st, leaf, trusted, want_dir=False)
+        if st.st_size > _LOGIN_MAP_MAX_BYTES:
+            raise _login_map_fail(f"{leaf} is larger than {_LOGIN_MAP_MAX_BYTES} bytes")
+        with os.fdopen(os.dup(leaf_fd), "rb") as fh:
+            raw = fh.read(_LOGIN_MAP_MAX_BYTES + 1)
+    finally:
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    if len(raw) > _LOGIN_MAP_MAX_BYTES:
+        raise _login_map_fail(f"{leaf} is larger than {_LOGIN_MAP_MAX_BYTES} bytes")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise _login_map_fail(f"{leaf} is not valid JSON")
+    return _validate_login_map(data)
+
+
+# Page size / hard page cap for the review walk.  Hitting the cap with
+# hasNextPage still true means the walk is INCOMPLETE and the gate refuses --
+# `reviews(last: 50)` (used by `_pr_approval_state`) silently loses older
+# reviews, which is the thing this replaces.
+_REVIEW_PAGE_SIZE = 50
+_REVIEW_PAGE_CAP = 10
+
+_REVIEWS_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!,$after:String){"
+    "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+    "headRefOid author{login} "
+    "reviews(first:%d,after:$after){pageInfo{hasNextPage endCursor} "
+    "nodes{id state submittedAt author{login} commit{oid}}}"
+    "}}}"
+) % _REVIEW_PAGE_SIZE
+
+_REPO_SLUG_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+
+
+def _reviewer_approval_state(pr_number, repo, reviewer_login) -> tuple:
+    """One reviewer's CURRENT verdict on a PR head, via `gh api graphql`.
+
+    Returns (state, detail) where state is one of:
+      "approved_current"  -- the reviewer's latest opinionated review is an
+                             APPROVED on exactly headRefOid.  The ONLY state
+                             that lets `peer -> merge` pass.
+      "changes_requested" -- latest opinionated review is CHANGES_REQUESTED
+                             (an earlier APPROVED on the same head does not
+                             survive it).
+      "dismissed"         -- latest opinionated review is DISMISSED.
+      "stale_head"        -- latest opinionated review is an APPROVED on an
+                             older commit.
+      "no_review"         -- this login has no opinionated review.
+      "self_review"       -- the reviewer login is the PR's author.
+      "incomplete"        -- the review walk hit the page cap with more pages
+                             still to read.
+      "ambiguous"         -- two or more of the reviewer's opinionated reviews
+                             share the MAXIMUM submittedAt and differ in state,
+                             so which one is latest cannot be known.
+      "unknown"           -- no verdict obtainable (gh missing / timeout /
+                             non-zero / empty / unparseable / missing fields,
+                             or an opinionated review of this reviewer whose
+                             submittedAt is null / missing / not a string).
+
+    Derivation (client-side, over ALL reviews, so it does not depend on what a
+    GraphQL convenience field's name implies): keep reviews by `reviewer_login`
+    (case-insensitive; a null author never matches), drop COMMENTED and PENDING
+    (they carry no opinion and must not revoke an approval), order by
+    submittedAt with the review node id as tie-break (NEVER pagination order),
+    and let the LAST remaining review decide.
+    """
+    pr_str = str(pr_number or "").lstrip("#")
+    if not _ascii_digits(pr_str):
+        return ("unknown", f"PR number {pr_number!r} is not numeric")
+    if not isinstance(repo, str) or not _REPO_SLUG_RE.match(repo):
+        return ("unknown", f"repo {repo!r} is not owner/repo shaped")
+    if not isinstance(reviewer_login, str) or not reviewer_login.strip():
+        return ("unknown", "reviewer login is empty")
+    wanted = reviewer_login.strip().lower()
+    owner, name = repo.split("/", 1)
+
+    head_oid = None
+    mine: list = []
+    cursor = None
+    complete = False
+    for _page in range(_REVIEW_PAGE_CAP):
+        cmd = ["gh", "api", "graphql",
+               "-f", f"query={_REVIEWS_QUERY}",
+               "-f", f"owner={owner}", "-f", f"name={name}",
+               "-F", f"number={pr_str}"]
+        if cursor:
+            cmd += ["-f", f"after={cursor}"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        except FileNotFoundError:
+            return ("unknown", "gh not found on PATH")
+        except subprocess.TimeoutExpired:
+            return ("unknown", "gh timed out after 15s")
+        except OSError as exc:
+            return ("unknown", f"gh exec error: {exc}")
+        if res.returncode != 0:
+            return ("unknown", (res.stderr or "").strip() or f"gh exit {res.returncode}")
+        raw = (res.stdout or "").strip()
+        if not raw:
+            return ("unknown", "gh returned empty output")
+        try:
+            pr = json.loads(raw)["data"]["repository"]["pullRequest"]
+            page_head = pr["headRefOid"]
+            pr_author = pr["author"]
+            reviews = pr["reviews"]
+            page_info = reviews["pageInfo"]
+            nodes = reviews["nodes"]
+            has_next = page_info["hasNextPage"]
+        except (ValueError, KeyError, TypeError):
+            return ("unknown", "gh response missing expected fields or unparseable")
+        if not isinstance(page_head, str) or not page_head:
+            return ("unknown", "headRefOid missing or empty")
+        if head_oid is None:
+            head_oid = page_head
+        elif page_head != head_oid:
+            return ("unknown", "PR head moved while reviews were being read")
+        if not isinstance(nodes, list) or not isinstance(has_next, bool):
+            return ("unknown", "reviews page malformed")
+
+        author_login = pr_author.get("login") if isinstance(pr_author, dict) else None
+        if isinstance(author_login, str) and author_login.strip().lower() == wanted:
+            return ("self_review", f"{reviewer_login} is the author of PR #{pr_str}")
+
+        for node in nodes:
+            if not isinstance(node, dict):
+                return ("unknown", "review node is not an object")
+            state = node.get("state")
+            rid = node.get("id")
+            if not isinstance(state, str) or not isinstance(rid, str):
+                return ("unknown", "review node missing state or id")
+            who = node.get("author")
+            login = who.get("login") if isinstance(who, dict) else None
+            if not isinstance(login, str) or login.strip().lower() != wanted:
+                continue
+            state = state.upper()
+            if state in ("COMMENTED", "PENDING"):
+                continue
+            commit = node.get("commit")
+            oid = commit.get("oid") if isinstance(commit, dict) else None
+            submitted = node.get("submittedAt")
+            if not isinstance(submitted, str) or not submitted.strip():
+                # An opinionated review we cannot place in time makes "which one
+                # is the latest" undecidable -- never guess an order (round 4, R3).
+                return (
+                    "unknown",
+                    f"review {rid} by {reviewer_login} has no usable submittedAt; "
+                    "cannot order the reviewer's opinions",
+                )
+            mine.append((submitted, rid, state, oid))
+
+        if not has_next:
+            complete = True
+            break
+        cursor = page_info.get("endCursor")
+        if not isinstance(cursor, str) or not cursor:
+            return ("incomplete", "reviews report more pages but no cursor")
+
+    if not complete:
+        return (
+            "incomplete",
+            f"more than {_REVIEW_PAGE_CAP * _REVIEW_PAGE_SIZE} reviews on PR #{pr_str}; "
+            "refusing to decide from a partial read",
+        )
+
+    if not mine:
+        return ("no_review", f"{reviewer_login} has no opinionated review on PR #{pr_str}")
+    mine.sort(key=lambda r: (r[0], r[1]))
+    # Round 5 (S4): look at EVERY review sharing the MAXIMUM timestamp, not just
+    # the last two -- (CHANGES_REQUESTED, APPROVED, APPROVED) at one second must
+    # not read as the node-id tie-break's "last" APPROVED.
+    top_ts = mine[-1][0]
+    tied_states = sorted({r[2] for r in mine if r[0] == top_ts})
+    if len(tied_states) > 1:
+        # Opinions with the SAME (latest) timestamp and different states: the
+        # order between them is not knowable (a node-id tie-break is arbitrary),
+        # so none may be treated as the latest (round 4, R3).
+        return (
+            "ambiguous",
+            f"{reviewer_login} has opinionated reviews ({', '.join(tied_states)}) that share "
+            f"the latest timestamp {top_ts}; their order is not knowable",
+        )
+    _ts, _rid, state, oid = mine[-1]
+    if state == "APPROVED":
+        if oid == head_oid:
+            return ("approved_current", f"{reviewer_login} approved tip oid {head_oid[:8]}")
+        return (
+            "stale_head",
+            f"{reviewer_login}'s latest approval is on {(oid or 'unknown')[:8]}, "
+            f"tip is {head_oid[:8]}",
+        )
+    if state == "CHANGES_REQUESTED":
+        return ("changes_requested", f"{reviewer_login}'s latest review requests changes")
+    if state == "DISMISSED":
+        return ("dismissed", f"{reviewer_login}'s latest review was dismissed")
+    return ("unknown", f"unrecognized review state {state!r}")

@@ -47,6 +47,12 @@ Frequent passes between agents. Don't use `claim`/`release` here — `flip` is t
 
 **The verb tells the reader the genre**: `flip` = transient cursor; `claim`/`release` = persistent ownership.
 
+### The `peer → merge` edge — `advance` (#3039 U2b)
+
+When the colleague has approved, hand the PR to the merge seat with `baton advance <PR-N> [--to <merge-seat>]` (or the old spelling `baton flip <PR-N> <merge-seat> "<reason>"` — it resolves as the same transition and is held to the same gate). The **server** decides: the baton needs a repo-qualified PR anchor, phase `peer`, a `colleague`, and a **current** GitHub `APPROVED` review on the head by that colleague's mapped login (their latest opinionated review — a later `CHANGES_REQUESTED`/`DISMISSED` revokes it, a later `COMMENTED` doesn't). CI red/pending refuses; CI `unknown` only warns; an `unknown`/`incomplete` approval verdict **refuses**. The output prints the CI verdict and the approval verdict on separate lines. Re-running it once the baton is at `merge` changes nothing. There is no force or skip option; if it refuses, fix the cause (re-request review, wait for CI, ask the admin to add the colleague to the login map), don't look for a way around it.
+
+**Know its limit.** It proves an authenticated non-author GitHub approval by a mapped account on the current head; it does not prove that the assigned colleague approved (`colleague` and `agent` are caller-declared and mutable), nor who ran the command. And the GitHub check and the forum write are not one cross-system transaction: a `CHANGES_REQUESTED` landing in that one-round-trip window still advances. Don't describe `advance` as "verified by the colleague" or "atomic." Full detail: `docs/baton-protocol.md`.
+
 ### Naming a colleague
 
 `--colleague <agent>` at `baton init` names the expected colleague reviewer — added to `participants` (dedup) and, as of #2764, persisted as a `colleague:` frontmatter field so it's visible on `baton show` from creation onward. To set or change it on an EXISTING baton (the colleague wasn't known at init, or the assignment changed):
@@ -115,6 +121,7 @@ Three genres of inter-agent communication, only one of which baton-grab replaces
 | Release a Project back to pool (done) | `baton release <pool-X> --done` |
 | Release a Project back to pool (abandoned) | `baton release <pool-X> --reason "<why>"` |
 | Pass a PR's turn forward | `baton flip <PR-N> <to-agent> "<reason>"` |
+| Colleague approved → hand to the merge seat (strict, server-gated) | `baton advance <PR-N> [--to <merge-seat>]` |
 | Open a new PR baton | `baton init <PR-N> --title "<short>" --participants <a,b> --turn <self> --status in-progress` |
 | Open a new PR baton with GitHub anchor | `baton init <id> ... --github pr/<N>` |
 | Set/update GitHub anchor on existing baton | `baton anchor <id> --github pr/<N>` |

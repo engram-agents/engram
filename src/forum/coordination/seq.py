@@ -160,3 +160,41 @@ class SeqAllocator:
             # Reached only if the caller's write (the with-body) returned without
             # raising — publish the watermark now that record `seq` is readable.
             self._committed = seq
+
+    @contextmanager
+    def locked(self) -> Iterator[Callable[[], int]]:
+        """Hold the allocator lock WITHOUT consuming a seq until asked to.
+
+        For a check-and-set write (#3039 U2b ``advance``): the body re-reads
+        state under the lock and may find there is nothing to write (an
+        idempotent no-op). :meth:`allocate` cannot express that — it bumps
+        ``_seq`` on entry, so a no-op would burn a seq (and, because the
+        store/feed key on seq, look like a mutation). Here the seq is claimed
+        only by calling the yielded ``claim()`` — at most once per context::
+
+            with allocator.locked() as claim:
+                content = store.read_project(pid)        # re-read under the lock
+                if nothing_to_do(content):
+                    return                                # no seq, no write
+                seq = claim()
+                store.write_project(pid, new_content, seq=seq)
+
+        Same publish-after-commit contract as :meth:`allocate`: ``_committed``
+        advances only after the body returns without raising, and only if a
+        seq was actually claimed. If the body raises after ``claim()``, the
+        seq is a harmless hole. Same warning too: keep the body to reads of the
+        local store plus the single atomic write — no network.
+        """
+        with self._lock:
+            claimed: list = []
+
+            def claim() -> int:
+                if claimed:
+                    raise RuntimeError("SeqAllocator.locked(): claim() may be called once")
+                self._seq += 1
+                claimed.append(self._seq)
+                return claimed[0]
+
+            yield claim
+            if claimed:
+                self._committed = claimed[0]

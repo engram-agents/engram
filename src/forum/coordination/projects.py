@@ -16,7 +16,7 @@ This slice lands ``flip`` (the most-used op) and the shared pattern; ``claim``,
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 from . import markdown as md
 from .seq import SeqAllocator
@@ -222,6 +222,124 @@ def flip(
     with allocator.allocate() as seq:
         store.write_project(project_id, final, seq=seq)
     return seq
+
+
+class AdvanceRefused(Exception):
+    """Raised by :func:`advance` when the baton, re-read under the lock, is no
+    longer in the state the (pre-lock) gate verified. Carries the actual
+    ``phase`` so the route layer can name it in the refusal."""
+
+    def __init__(self, message: str, phase: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.phase = phase
+
+
+class AdvanceResult:
+    """Outcome of :func:`advance`: ``advanced`` False is the idempotent no-op
+    (the baton was already at ``merge``): no seq consumed, no log line."""
+
+    __slots__ = ("advanced", "seq", "reason")
+
+    def __init__(self, advanced: bool, seq: int, reason: str = "") -> None:
+        self.advanced = advanced
+        self.seq = seq
+        self.reason = reason
+
+
+def advance(
+    store: CoordinationStore,
+    allocator: SeqAllocator,
+    project_id: str,
+    *,
+    to_agent: str,
+    reason: str,
+    by_agent: str = "",
+    expected_anchor: str,
+    expected_colleague: str,
+    resolve_phase: Callable[[dict], str],
+    ts: Optional[str] = None,
+) -> AdvanceResult:
+    """Check-and-set write for the single edge ``phase: peer -> phase: merge``
+    (#3039 U2b).
+
+    The GitHub verdict was obtained BEFORE this call (never a network call
+    under the allocator lock). Inside the lock this RE-READS the baton and
+    requires: the ``github`` anchor and ``colleague`` are the ones the verdict
+    was for, the baton is not closed, and the resolved phase is ``peer`` (a
+    legacy baton with no explicit ``phase:`` resolves to ``""`` and is treated
+    as ``peer``, exactly as ``cmd_flip`` does for the merge-seat flip). Else
+    :class:`AdvanceRefused` naming the actual phase.
+
+    If the phase is already ``merge`` this is an idempotent no-op:
+    ``AdvanceResult(advanced=False)`` with NO seq consumed, NO turn-log line and
+    NO write (so no wake). Otherwise it writes ``phase: merge`` and the turn
+    hand-off to ``to_agent`` -- one turn-log line, one seq -- in that single
+    critical section. Two simultaneous callers therefore produce exactly one
+    transition.
+
+    ``resolve_phase(fields)`` returns the baton's resolved phase (``""`` when
+    unresolvable); it is supplied by the caller (it needs the pool-sentinel
+    machinery that lives in the gate module) and may raise
+    :class:`AdvanceRefused` itself.
+
+    Known, stated limit: the GitHub verdict and this write are not one
+    cross-system transaction -- a ``CHANGES_REQUESTED`` landing between them
+    still advances. The window is one HTTP round trip.
+
+    Raises:
+        ProjectNotFound: no such baton.
+        AdvanceRefused: the re-read state no longer matches the gate's.
+    """
+    to = (to_agent or "").strip().lower()
+    turn_by = (by_agent or "").strip().lower()
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
+        fields, _ = md.parse_frontmatter(content)
+
+        status = (fields.get("status") or "").strip().lower()
+        if status in ("merged", "cancelled"):
+            raise AdvanceRefused(f"baton is {status}; cannot advance a closed baton", phase=None)
+        phase = (resolve_phase(fields) or "").strip().lower()
+        if phase == "merge":
+            return AdvanceResult(False, _coerce_seq(fields.get("seq", "")), "already merge")
+        if phase not in ("peer", ""):
+            raise AdvanceRefused(
+                f"baton is in phase {phase!r}, not 'peer'; nothing to advance", phase=phase
+            )
+        if (fields.get("github") or "").strip().lower() != (expected_anchor or "").strip().lower():
+            raise AdvanceRefused(
+                "github anchor changed while the approval was being checked; re-run advance",
+                phase=phase,
+            )
+        if (fields.get("colleague") or "").strip().lower() != (expected_colleague or "").strip().lower():
+            raise AdvanceRefused(
+                "colleague changed while the approval was being checked; re-run advance",
+                phase=phase,
+            )
+
+        now = ts or md.now_iso()
+        from_agent = (fields.get("turn") or "unknown").strip().lower()
+        # Same two-step phase write as flip(): conversion of a still-legacy baton
+        # first (stamp-if-absent, logged), then the unconditional transition.
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, "peer", now)
+        phase_updates["phase"] = "merge"
+        phase_log_suffix += f"\n- {now} phase: 'merge' (transition)"
+        updated = md.update_frontmatter(
+            content,
+            {
+                "turn": to, "turn_since": now, "turn_reason": f'"{reason}"',
+                "turn_by": f'"{turn_by}"', **phase_updates,
+            },
+        )
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, f"- {now} {from_agent} → {to}: {reason}" + phase_log_suffix)
+        final = md.reattach_frontmatter(updated, body)
+
+        seq = claim_seq()
+        store.write_project(project_id, final, seq=seq)
+    return AdvanceResult(True, seq, "advanced")
 
 
 def claim(
@@ -1193,13 +1311,24 @@ def init(
     fm_lines.append("---")
     fm_lines.append("")
 
+    heading = f"# {project_id} — {title}"
+    log_line = f"- {now} initialized → {turn}: {turn_reason}" + phase_log_suffix
+    # Last-resort backstop (#3039 U2b round 4): ``init`` builds the file from
+    # f-strings, not through ``update_frontmatter`` / ``append_turn_log``, so it
+    # carries its own copy of the "no line break / control character from client
+    # text" check -- before the allocator lock, so a refusal consumes no seq.
+    for ln in fm_lines:
+        md.assert_single_line(ln, "frontmatter line")
+    md.assert_single_line(heading, "heading")
+    md.check_log_entry(log_line)
+
     body_lines = [
         "",
-        f"# {project_id} — {title}",
+        heading,
         "",
         "## Turn log",
         "",
-        f"- {now} initialized → {turn}: {turn_reason}" + phase_log_suffix,
+        log_line,
         "",
     ]
 

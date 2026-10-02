@@ -2021,6 +2021,9 @@ class TestClaim:
             'subcommand:init:help': 'Create a new project baton file',
             'subcommand:flip:metavar': 'flip',
             'subcommand:flip:help': 'Pass the baton to another participant',
+            # #3039 U2b: a new user-facing surface, pinned here in the same breath.
+            'subcommand:advance:metavar': 'advance',
+            'subcommand:advance:help': "Strict peer → merge phase edge, gated server-side on the colleague's GitHub approval",
             'subcommand:claim:metavar': 'claim',
             'subcommand:claim:help': 'Claim a Project-layer baton from the pool (pool → self)',
             'subcommand:release:metavar': 'release',
@@ -6754,6 +6757,9 @@ class TestRound4ConversionThenTransitionEndToEnd:
         client = _real_forum_client(tmp_path)
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
+        # server-side gate needs a resolvable sentinel too (production servers have primary_user configured)
+        import forum.server as _forum_server
+        monkeypatch.setattr(_forum_server._load_baton_gate(), "_resolve_pool_sentinel", lambda *a, **kw: "lei shi")
         config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
         self._seed(client, "pool-9840", _make_raw_baton(
             "pool-9840", turn="lei shi", participants="[borges, ariadne]",

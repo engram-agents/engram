@@ -959,6 +959,107 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: advance  (#3039 U2b -- the strict peer -> merge edge)
+# ---------------------------------------------------------------------------
+
+# The two limits the strict gate carries. Kept as module constants so --help,
+# the protocol doc and the tests quote ONE wording.
+ADVANCE_D2_LIMIT = (
+    "This gate proves an authenticated non-author GitHub approval by a mapped "
+    "account on the current head; it does not prove that the assigned colleague "
+    "approved (the colleague and agent fields are caller-declared and mutable), "
+    "nor who ran this command."
+)
+ADVANCE_C4_LIMIT = (
+    "The GitHub verdict and the forum write are not one cross-system transaction: "
+    "a CHANGES_REQUESTED review landing between them still advances (the window is "
+    "one HTTP round trip)."
+)
+
+
+def _advance_error_text(body: str) -> str:
+    """Pull the server's `error` string out of a JSON error body, else the raw body."""
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict) and parsed.get("error"):
+            return str(parsed["error"])
+    except (ValueError, TypeError):
+        pass
+    return body
+
+
+def cmd_advance(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
+    """`baton advance <PR-ID> [--to MERGE-SEAT]` -- thin client of the SERVER-authoritative
+    peer -> merge gate. The server decides; this only builds the request and prints both
+    verdicts. There is no force / skip path."""
+    _require_forum(config)
+
+    project_id = args.project_id
+    err = _validate_project_id(project_id)
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    raw = _api_get_raw(client, project_id)
+    fields, body = _parse_frontmatter(raw)
+    if not fields:
+        print(
+            f"baton advance: cannot parse frontmatter for '{project_id}'. "
+            "The record may be malformed.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    to_agent = (args.to or "").strip().lower()
+    if not to_agent:
+        # Friendly default only: the merge seat is the one participant who is
+        # neither the author nor the colleague. Ambiguous => ask, never guess.
+        participants_str = fields.get("participants", "").strip()
+        participants = _parse_participants(participants_str) if participants_str else []
+        author = fields.get("author", "").strip().lower() or _derive_legacy_author(body)
+        colleague = fields.get("colleague", "").strip().lower()
+        candidates = [p for p in participants if p not in (author, colleague)]
+        if len(candidates) != 1:
+            print(
+                f"baton advance: cannot tell who the merge seat is for '{project_id}' "
+                f"(participants other than author and colleague: {candidates or 'none'}). "
+                "Name it: baton advance " + shlex.quote(project_id) + " --to <merge-seat>",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        to_agent = candidates[0]
+
+    from_agent = fields.get("turn", agent_name or "unknown").strip().lower()
+    try:
+        out = client.post(f"/api/projects/{project_id}/advance", {
+            "agent": agent_name or from_agent,
+            "to_agent": to_agent,
+            "reason": args.reason,
+        })
+    except ForumNetworkError as e:
+        print(f"baton advance: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton advance: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton advance: refused ({e.status}): {_advance_error_text(e.body)}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
+
+    if not out.get("advanced"):
+        print(f"baton advance: {project_id} is already at phase merge -- nothing to do "
+              "(no new turn, no wake).")
+        return
+    print(f"baton advance: {project_id} peer → merge, turn → {out.get('turn', to_agent)}")
+    ci = out.get("ci") or {}
+    approval = out.get("approval") or {}
+    print(f"  CI:       {ci.get('state', '?')} ({ci.get('detail', '')})")
+    print(f"  approval: {approval.get('state', '?')} ({approval.get('detail', '')})")
+    for w in out.get("warnings") or []:
+        print(f"warning: {w}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: claim  (Project layer — pool sentinel → self)
 # ---------------------------------------------------------------------------
 
@@ -2744,6 +2845,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the CI-green guard (override a flaky/known-red check)",
     )
 
+    # -- advance --
+    p_advance = subparsers.add_parser(
+        "advance",
+        help="Strict peer → merge phase edge, gated server-side on the colleague's GitHub approval",
+        description=(
+            "Move a PR baton from phase 'peer' to phase 'merge' and hand the turn to "
+            "the merge seat.\n\n"
+            "The SERVER decides. It requires: a repo-qualified PR anchor; a colleague on "
+            "the baton; that colleague's mapped GitHub account to have a CURRENT APPROVED "
+            "review on the PR head (its latest opinionated review -- a later "
+            "CHANGES_REQUESTED or DISMISSED revokes it; COMMENTED does not); CI not red "
+            "or pending. CI state 'unknown' only warns; an unknown or incomplete "
+            "approval verdict REFUSES. The two verdicts are printed separately.\n\n"
+            "Idempotent: running it again once the baton is at 'merge' changes nothing "
+            "(no new turn, no wake). There is no force option and no skip option. A "
+            "'baton flip' to the merge seat that resolves as this transition is held to "
+            "the same gate and refused identically.\n\n"
+            "Limits, stated so they are not assumed away.\n"
+            "  * " + ADVANCE_D2_LIMIT + "\n"
+            "  * " + ADVANCE_C4_LIMIT + "\n"
+            "  * The agent -> GitHub-login map lives in a protected file named by the "
+            "forum server's --baton-login-map / $ENGRAM_BATON_LOGIN_MAP; with none "
+            "configured the gate refuses."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_advance.add_argument(
+        "project_id",
+        metavar="PROJECT-ID",
+        help="PR baton identifier (e.g. PR-123)",
+    )
+    p_advance.add_argument(
+        "--to", metavar="MERGE-SEAT", default=None,
+        help=(
+            "The merge seat to hand the turn to (a participant, or the pool sentinel). "
+            "Defaults to the one participant who is neither author nor colleague; "
+            "required when that is ambiguous."
+        ),
+    )
+    p_advance.add_argument(
+        "--reason", metavar="REASON", default="colleague-APPROVED; ready for merge",
+        help="Turn-log reason (default: 'colleague-APPROVED; ready for merge')",
+    )
+
     # -- claim --
     p_claim = subparsers.add_parser(
         "claim",
@@ -3076,6 +3221,8 @@ def main() -> None:
         cmd_init(args, config, agent_name, client)
     elif args.subcommand == "flip":
         cmd_flip(args, config, agent_name, client)
+    elif args.subcommand == "advance":
+        cmd_advance(args, config, agent_name, client)
     elif args.subcommand == "claim":
         cmd_claim(args, config, agent_name, client)
     elif args.subcommand == "release":

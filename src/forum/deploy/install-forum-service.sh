@@ -80,6 +80,9 @@ fi
 [ -f "$SRC/tools/engram-pkg/engram-pkg" ] || {
   echo "ERROR: $SRC/tools/engram-pkg/engram-pkg not found — pack validator required" >&2; exit 2;
 }
+[ -f "$SRC/tools/baton_gate.py" ] || {
+  echo "ERROR: $SRC/tools/baton_gate.py not found — the server's baton gate module is required" >&2; exit 2;
+}
 if [ "$DRY_RUN" -eq 0 ]; then
   command -v systemctl >/dev/null || {
     echo "ERROR: systemctl not found (this installer targets systemd --user)" >&2; exit 2;
@@ -167,6 +170,19 @@ elif command -v rsync >/dev/null; then
       "$SRC/tools/engram-pkg/" "$APP/tools/engram-pkg/"
 else
   cp "$SRC/tools/engram-pkg/engram-pkg" "$APP/tools/engram-pkg/engram-pkg"
+fi
+
+# The baton gate module. server.py's _load_baton_gate() walk-parents-searches for
+# tools/baton_gate.py, which in this layout is $APP/tools/baton_gate.py. Without
+# it the loader returns None and every PR-anchored flip / claim / release fails
+# closed (#3039 U2b). tools/baton_gate.py is a symlink to
+# src/engram/tools/baton_gate.py, so copy the RESOLVED file (cp -L), never the link.
+echo "==> Snapshotting baton gate → $APP/tools/baton_gate.py"
+RUN mkdir -p "$APP/tools"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  [dry-run] cp -L $SRC/tools/baton_gate.py → $APP/tools/baton_gate.py (resolves the symlink)"
+else
+  cp -L "$SRC/tools/baton_gate.py" "$APP/tools/baton_gate.py"
 fi
 
 # Build the venv ONLY if it isn't already a working one.
