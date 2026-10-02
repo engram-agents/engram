@@ -60,8 +60,19 @@ def format_loop_prompt(core: str, **meta) -> str:
         <loop-meta {"kind": "working"}>   ← only when meta kwargs are given
         <core message here>
 
-    Idempotent: if ``core`` already starts with the marker (i.e. the result of
-    a previous ``format_loop_prompt`` call), the marker is not added again.
+    Contract when ``core.lstrip()`` already starts with the marker (i.e. the
+    result of a previous ``format_loop_prompt`` call) — the marker itself is
+    never added or duplicated again, but what happens to meta differs:
+
+    - No meta kwargs given: the result is the lstripped input, byte-for-byte
+      (today's / original behaviour, trailing whitespace included).
+    - Meta kwargs given: the result carries exactly one meta line, built the
+      same way as the fresh-input case above. If line 2 of the input is
+      already a ``<loop-meta ...>`` line, it is REPLACED by the new one (old
+      and new keys are never merged); otherwise the new meta line is
+      INSERTED right after the marker line. Everything else — the rest of
+      the input, including its trailing whitespace/newline — is preserved
+      byte-for-byte (gh#3309).
 
     Parameters
     ----------
@@ -70,13 +81,39 @@ def format_loop_prompt(core: str, **meta) -> str:
         or status.
     **meta:
         Optional machine-readable metadata (e.g. ``kind="working"``,
-        ``seq=3``).  Embedded as JSON on the second line when present.
+        ``seq=3``).  Embedded as JSON on the second line when present — even
+        when the input is already marked (see contract above).
     """
     stripped_core = core.lstrip()
 
     # Idempotency guard: already starts with the marker — don't double-add.
     if stripped_core.startswith(LOOP_WAKE_MARKER):
-        return stripped_core
+        if not meta:
+            return stripped_core
+
+        meta_line = f"{_META_PREFIX}{json.dumps(meta, separators=(',', ':'))}{_META_SUFFIX}"
+
+        if "\n" not in stripped_core:
+            # Bare marker, no newline at all — nothing else to preserve.
+            return stripped_core + "\n" + meta_line
+
+        marker_line, after_marker = stripped_core.split("\n", 1)
+
+        if "\n" in after_marker:
+            second_line, rest = after_marker.split("\n", 1)
+        else:
+            second_line, rest = after_marker, None
+
+        if second_line.startswith(_META_PREFIX):
+            # Replace the existing meta line in place — never merge old and
+            # new keys.
+            if rest is None:
+                return marker_line + "\n" + meta_line
+            return marker_line + "\n" + meta_line + "\n" + rest
+
+        # No existing meta line — insert the new one right after the marker
+        # line, preserving everything that followed the marker byte-for-byte.
+        return marker_line + "\n" + meta_line + "\n" + after_marker
 
     parts = [LOOP_WAKE_MARKER]
     if meta:
