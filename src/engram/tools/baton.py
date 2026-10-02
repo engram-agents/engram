@@ -3170,7 +3170,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Squash-merge a PR after passing the baton gate ladder:\n"
             "  1. Baton exists for PR-N          (never forceable)\n"
-            "  2. turn == pool sentinel            (never forceable)\n"
+            "  2. turn is a maintainer-role holder (never forceable): the pool\n"
+            "     sentinel, or a named agent who is neither the registered\n"
+            "     colleague nor the PR's author\n"
             "  3. CI green                         (--force skips)\n"
             "  4. Approval fresh (oid-compare)     (--force skips)\n"
             "  5. gh pr merge N --squash\n"
@@ -3178,7 +3180,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Prevents merging a PR that hasn't been presented to the maintainer\n"
             "via the baton flip pipeline, or merging with failing CI or a stale\n"
             "approval. --force overrides only the CI and approval gates (3-4);\n"
-            "a missing baton or unflipped turn is never forceable."
+            "a missing baton or a turn still with the colleague or the author is\n"
+            "never forceable."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -3191,7 +3194,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true", default=False,
         help=(
             "Skip CI-green and approval-fresh gates (3-4). "
-            "Does NOT skip baton-exists or turn-sentinel gates (1-2)."
+            "Does NOT skip baton-exists or turn-holder gates (1-2)."
         ),
     )
     p_merge.add_argument(

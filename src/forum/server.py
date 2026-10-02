@@ -1122,6 +1122,45 @@ def _conversion_only_inputs(route: str, pid: str, store, client_phase: Optional[
     return phase, refusal
 
 
+def _colleague_write_refusal(route: str, pid: str, store) -> Optional[tuple]:
+    """``(message, status)`` when a ``POST .../colleague`` must be refused, else None.
+
+    #3296 (part of #3039). The colleague can be neither SET nor CHANGED (an
+    identical re-send is a write too) once a PR baton is at ``merge``: a baton with
+    no colleague can reach ``merge`` through the weak flip (the CLI sends
+    ``transition_phase=merge`` on the maintainer-flip path), and a colleague added
+    afterwards would make a colleague-bearing baton at ``merge`` that never passed
+    the strict peer -> merge gate. The phase is the SERVER's reading of the file
+    (``gate._resolve_phase``, the same resolution ``_anchor_refusal`` uses), never
+    the request's. A PR baton whose phase cannot be resolved (phase-less file with an
+    unresolvable pool sentinel) fails CLOSED. Bunches are never refused here.
+    A missing baton returns None (the write-body's 404).
+    """
+    gate = _load_baton_gate()
+    fields, _body = _baton_fields(store, pid)
+    if fields is None:
+        return None
+    if gate is None:
+        return (
+            f"{route} {pid}: phase gate unavailable (server could not load its gate module) "
+            "-- refusing to write a colleague without being able to verify the baton's "
+            "phase. See server logs.", 422)
+    if not gate._is_pr_baton(pid, fields):
+        return None
+    try:
+        resolved, _legacy = gate._resolve_phase(fields, is_bunch=False)
+    except gate.PoolSentinelUnresolved as e:
+        return (f"{route} {pid}: cannot resolve the baton's phase to decide whether its "
+                f"colleague may be written ({e}); the pool sentinel is unresolvable, and a "
+                "baton that may be at 'merge' takes no colleague write until it resolves.", 422)
+    if resolved == "merge":
+        return (f"{route} {pid}: the baton is at phase {resolved!r}; the colleague cannot be "
+                "set or changed once the baton is at 'merge' (not a first set, not a change, "
+                "not an identical re-send). 'merge' is reached through the strict peer -> merge "
+                "gate with the colleague already on the baton.", 422)
+    return None
+
+
 def _anchor_refusal(route: str, pid: str, store, new_anchor: str,
                     login_map_cfg: Optional[dict] = None) -> Optional[tuple]:
     """``(message, status)`` when the anchor write must be refused, else None.
@@ -3637,7 +3676,9 @@ def create_app(
         ``transition_phase`` field here.
         Response: {seq, participant_added}, 201.
         Errors: 400 (missing/invalid fields), 403 (agent not authorized),
-                404 (project not found), 503 (store not configured).
+                404 (project not found), 422 (PR baton at phase ``merge``, or
+                its phase unresolvable -- see :func:`_colleague_write_refusal`),
+                503 (store not configured).
         """
         from forum.coordination import (
             set_colleague as _set_colleague,
@@ -3672,6 +3713,11 @@ def create_app(
             "POST /api/projects/<pid>/colleague", pid, store, phase)
         if phase_refusal is not None:
             return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
+
+        colleague_refusal = _colleague_write_refusal(
+            "POST /api/projects/<pid>/colleague", pid, store)
+        if colleague_refusal is not None:
+            return jsonify({"error": colleague_refusal[0]}), colleague_refusal[1]
 
         try:
             seq, participant_added = _set_colleague(

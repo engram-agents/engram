@@ -184,6 +184,13 @@ keeps its own check as a defensive re-check. Anchor numbers are 1-15 ASCII digit
 at init as everywhere. Limit: a legacy phase-less baton whose pool sentinel cannot be
 resolved is refused every anchor write until it resolves (or the baton is in `fairy`),
 so the CLI's `baton anchor` is blocked on such a baton meanwhile.
+The colleague cannot be set or changed once a PR baton is at `merge` (#3296): `POST /colleague`
+on a baton whose server-resolved phase is `merge` -- including a phase-less legacy file that
+resolves to `merge`, and an identical re-send -- is a 422 and writes nothing; a PR baton whose
+phase cannot be resolved (unresolvable pool sentinel) is refused the same way. It stays settable
+and changeable in `fairy` and `peer`, and bunches are untouched. This closes the weak-flip-then-set-colleague
+route (a no-colleague baton reaching `merge` through the weak flip, then gaining a colleague it never
+passed the strict gate with). A host whose forum predates this change still allows that route.
 The server stamps every new baton's initial phase itself (`fairy` for a PR baton, `pool` for a
 bunch), whether or not the client sent one: a baton with no `phase` whose turn is the pool
 sentinel reads as the legacy `merge`, a rule that exists only for files written before phases.

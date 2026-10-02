@@ -358,8 +358,11 @@ class TestLegitimateCliShapesStillWork:
         assert r.status_code == 201, r.get_json()
         assert world.log_lines("phase stamped: 'claimed'", BUNCH)
 
+    # #3296: `colleague` is no longer a row here -- a legacy PR baton at the sentinel
+    # resolves `merge`, where the colleague is refused (see
+    # test_baton_colleague_at_merge.py), exactly as `anchor` left these rows in R6.
     @pytest.mark.parametrize("route", ["close", "reopen", "gc", "merge", "rename",
-                                       "participants", "colleague"])
+                                       "participants"])
     def test_conversion_routes_stamp_the_server_value_for_a_legacy_pr_baton_at_the_sentinel(self, world, route):
         # server-resolved "merge" (legacy PR baton, turn == sentinel): allowed, and a
         # client value that differs is ignored in favour of the server's.
@@ -368,7 +371,7 @@ class TestLegitimateCliShapesStillWork:
         assert resp.status_code in (200, 201), (route, resp.get_json())
         assert phase_of(world, PR) == "merge"
 
-    @pytest.mark.parametrize("route", ["rename", "participants", "colleague", "close"])
+    @pytest.mark.parametrize("route", ["rename", "participants", "close"])
     def test_conversion_routes_accept_a_matching_client_merge_when_the_server_agrees(self, world, route):
         seed_pr(world, None, turn=SENTINEL)
         resp = post(world, PR, route, {"phase": "merge"})

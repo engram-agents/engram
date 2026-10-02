@@ -1333,11 +1333,12 @@ nor colleague), so a turn at the maintainer is **not** the readiness signal eith
 baton whose `colleague` was set **before** it reached `merge` (the turn log shows when),
 `phase: merge` is reached through the server's strict peer→merge gate (`baton advance PR-N`,
 or a flip that resolves as the same transition): GitHub must show an `APPROVED` review on the
-PR's current head by a GitHub login mapped to the baton's `colleague`. **A colleague-bearing
-baton at `phase: merge` is not proof that gate ran**: a baton with no colleague can reach
-`merge` through the weak flip (the CLI sends `transition_phase=merge` on that path), and
-`POST /colleague` can still add a colleague to a baton already at `merge` — until the server
-refuses that, check when the colleague was set. That proves a mapped non-author approval on the current head, **not** that the
+PR's current head by a GitHub login mapped to the baton's `colleague`. **On a forum that
+predates #3296, a colleague-bearing baton at `phase: merge` is not proof that gate ran**: a
+baton with no colleague can reach `merge` through the weak flip (the CLI sends
+`transition_phase=merge` on that path), and there `POST /colleague` could add a colleague to
+a baton already at `merge`. A forum running #3296 refuses that (422); on an older forum, check
+when the colleague was set. The gate proves a mapped non-author approval on the current head, **not** that the
 *assigned* colleague approved (`colleague` is caller-declared and mutable); the limits are
 in `docs/baton-protocol.md`. The maintainer merges from that phase signal — never from a PR
 that merely *looks* parked. A PR with **no baton**, or a baton **not yet at `phase: merge`**,

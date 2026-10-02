@@ -27,7 +27,8 @@ def app(tmp_path):
     # seed one baton for mutation tests
     _init(store, allocator, "PR-42",
           title="test pr", status="in-progress", turn="ariadne",
-          participants=["ariadne", "luria"], turn_reason="start")
+          participants=["ariadne", "luria"], turn_reason="start",
+          transition_phase="fairy")  # #3296: a phase-less baton resolves via the pool sentinel
 
     application = create_app(db_path, audit_path)
     application.config["TESTING"] = True
