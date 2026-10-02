@@ -70,6 +70,7 @@ Format: `TYPE-ID`
 - Descriptive when there isn't: `DESIGN-trust-tier-v2`, `DESIGN-baton-system`
 
 IDs must match the regex `[A-Za-z][A-Za-z0-9_-]*-[A-Za-z0-9][A-Za-z0-9_-]*`.
+The forum server applies the same rule (whole-string match) to the `project_id` of `POST /api/projects` and keeps every baton file inside its store (symlinks included) (#3286).
 
 ### Valid `turn:` values
 

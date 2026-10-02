@@ -10,6 +10,7 @@ Bind: 0.0.0.0:5002 (5001 is viz_server). Same-LAN only for v0.1.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -28,6 +29,8 @@ from . import audit, board_projects, board_theme, db, embeddings as emb_mod, pac
 from .avatar import avatar_svg
 from .board_projects import filter_updates, get_board_counts, read_project_board
 from .coordination import default_store_root
+from .coordination.names import InvalidProjectId as _InvalidProjectId
+from .coordination.names import is_valid_project_id as _is_valid_project_id
 from .render import render_post_body
 
 
@@ -564,6 +567,15 @@ def create_app(
     # Register avatar as a Jinja filter so templates can call:
     #   {{ author.avatar_seed | avatar(40) | safe }}
     app.jinja_env.filters["avatar"] = avatar_svg
+
+    # #3286: the file store refuses an id that cannot name a baton file under the
+    # store (separator, NUL, symlink out of the store, ...). A read of such an id
+    # is "not found"; anything else is a 422.
+    @app.errorhandler(_InvalidProjectId)
+    def _handle_invalid_project_id(exc):
+        if request.method == "GET":
+            return jsonify({"error": "project not found"}), 404
+        return jsonify({"error": str(exc)}), 422
 
     # Always-load the embedding model at app creation time (RAM fine per
     # design-settlement; embed-on-write keeps it warm). See issue #807.
@@ -2072,7 +2084,18 @@ def create_app(
         if not agent or not db.is_valid_agent_name(agent):
             return jsonify({"error": "agent is required and must be valid"}), 400
 
-        project_id = (data.get("project_id") or "").strip()
+        # #3286: the id becomes a file name under the store -- hold it to the CLI's
+        # rule (fullmatch, on the value EXACTLY as sent: no strip, no case-fold)
+        # before anything else (or the store) looks at it. Absent / null keeps the
+        # 400 "required" answer below; a present value (including "") that is not
+        # CLI-shaped, or not a string, is a 422.
+        raw_project_id = data.get("project_id")
+        if raw_project_id is not None and not _is_valid_project_id(raw_project_id):
+            return jsonify({"error": (
+                "POST /api/projects (init): field project_id must be a string like TYPE-ID: "
+                "start with a letter, use only letters, digits, '-' and '_', and contain a "
+                "hyphen separating type from id (e.g. PR-425)")}), 422
+        project_id = raw_project_id or ""
         title = (data.get("title") or "").strip()
         status = (data.get("status") or "").strip()
         turn = (data.get("turn") or "").strip().lower()
@@ -2108,6 +2131,12 @@ def create_app(
             )
         except ProjectAlreadyExists:
             return jsonify({"error": f"project already exists: {project_id}"}), 409
+        except OSError as exc:
+            # A CLI-shaped id has no length cap, so a very long one fails at the
+            # filesystem (ENAMETOOLONG): that is a bad id (422), not a server fault.
+            if exc.errno == errno.ENAMETOOLONG:
+                return jsonify({"error": "POST /api/projects (init): field project_id is too long to be a file name"}), 422
+            raise
 
         return jsonify({"seq": seq, "project_id": project_id}), 201
 
