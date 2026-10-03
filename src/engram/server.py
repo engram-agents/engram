@@ -3850,8 +3850,9 @@ def engram_history(payload_json: str) -> str:
             node_id (str, optional): Filter edits to a specific node
                 (edits mode only).
             action (str, optional): Filter by action type: created,
-                reopened, resolved, retracted, stale_flagged, superseded,
-                tainted, trust_tier_set (edits mode only).
+                prediction_decomposed, reopened, resolved, retracted,
+                stale_flagged, superseded, tainted, trust_tier_set (edits
+                mode only).
             since (str, optional): ISO timestamp — return only entries after
                 this time.
             limit (int, optional): Max entries to return (default 50,

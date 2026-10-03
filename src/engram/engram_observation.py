@@ -1650,6 +1650,7 @@ def _add_observation_impl(
 
         # Handle prediction decomposition
         prediction_id = None
+        _pred_emb_outcome = None
         if is_predictive and predicted_event:
             # Check if a prediction node for this event already exists
             existing_pred = conn.execute(
@@ -1671,8 +1672,23 @@ def _add_observation_impl(
                     (prediction_id, predicted_event, resolution_timeframe or None, now),
                 )
                 result["prediction_status"] = "created"
-                core._log_edit(conn, "created", prediction_id, "prediction",
-                          {"predicted_event": predicted_event[:200]})
+                # #3348: the prediction node now goes through _stamp_new_node
+                # (importance stamp + write-time embed + #3343 write-path
+                # contract), same as every other node-creating INSERT.
+                # _stamp_new_node writes its OWN "created" edit_history row
+                # (details: {"confidence": ...}, read fresh off the node
+                # after its importance UPDATE) -- the manual _log_edit call
+                # that used to be the ONLY "created" row here is removed so
+                # there is exactly one, not two. _stamp_new_node's own row
+                # does not carry predicted_event (it only ever logs
+                # confidence; not touched here per #3348's DO NOT), so that
+                # detail is preserved under a separate, non-"created" action
+                # instead of being silently dropped.
+                _pred_emb_outcome = core._stamp_new_node(
+                    conn, prediction_id, confidence=0.5, surprise=0.5,
+                )
+                core._log_edit(conn, "prediction_decomposed", prediction_id,
+                          "prediction", {"predicted_event": predicted_event[:200]})
 
             # Edge: prediction predicted_by observation (#2252 W6 — split
             # out of supported_by; prediction is still the SOURCE, the
@@ -1963,8 +1979,47 @@ def _add_observation_impl(
         # earlier strip-then-add ordering workaround is no longer needed.
         _stripped = core._strip_agent_facing(result)
         _emb_block = core._embedding_response_block(_emb_outcome)
+        # #3348 round 2 (Kepler's ruling on PR #3352, option B + rider):
+        # "embedding_failure" keeps EXACTLY its
+        # #3343 meaning -- the OBSERVATION node's outcome, always a dict,
+        # never a list. The prediction node's outcome (when the prediction
+        # was CREATED this call, not linked_to_existing, and its embed
+        # failed) goes in its OWN separate key, "prediction_embedding_
+        # failure", same shape. A key whose type depends on how many
+        # things failed is a reader hazard (Kepler's ruling); one key, one
+        # meaning, one shape, per node -- the round-1 dict-or-list shape
+        # this replaced is gone.
+        #
+        # Rider: both dicts carry "node_id" -- including "embedding_
+        # failure" ALWAYS, with or without a prediction node in play (an
+        # additive key, harmless to every existing dict reader that never
+        # expected it). Each dict's own "message" names its own node id in
+        # the text (no new top-level response line; #3343's reason for
+        # nesting "message" inside the block, rather than a new top-level
+        # key, still stands): message = f"{node_id}: " + <the message
+        # _embedding_response_block returned>, applied uniformly to both
+        # keys in every case (single-failure or both-fail).
+        #
+        # _pred_emb_outcome is None on the linked_to_existing path (no
+        # stamp call ran) and whenever is_predictive/predicted_event are
+        # absent -- _embedding_response_block requires a real
+        # EmbeddingOutcome, so it must not be called with None.
+        _pred_emb_block = (
+            core._embedding_response_block(_pred_emb_outcome)
+            if _pred_emb_outcome is not None else None
+        )
         if _emb_block:
+            _emb_block = dict(_emb_block)
+            _emb_block["node_id"] = node_id
+            _emb_block["message"] = f"{node_id}: " + _emb_block["message"]
             _stripped["embedding_failure"] = _emb_block
+        if _pred_emb_block:
+            _pred_emb_block = dict(_pred_emb_block)
+            _pred_emb_block["node_id"] = prediction_id
+            _pred_emb_block["message"] = (
+                f"{prediction_id}: " + _pred_emb_block["message"]
+            )
+            _stripped["prediction_embedding_failure"] = _pred_emb_block
         return json.dumps(_stripped)
     finally:
         conn.close()

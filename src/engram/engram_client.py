@@ -266,7 +266,7 @@ TOOL_SCHEMAS = {
     "engram_history": {
         "description": "Browse edit history and diagnostic snapshots. Side-effect-free.",
         "parameters": {
-            "payload_json": {"type": "string", "description": "JSON object (as a string) with history fields. All optional: mode (str — 'edits' (default) or 'diagnostics'; edits = chronological audit trail of mutations; diagnostics = metric snapshots at each checkpoint), node_id (str — filter edits to a specific node; edits mode only), action (str — filter by action type: created, reopened, resolved, retracted, stale_flagged, superseded, tainted, trust_tier_set; edits mode only), since (str — ISO timestamp — return only entries after this time), limit (int — max entries to return, default 50, max 200).", "required": True},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with history fields. All optional: mode (str — 'edits' (default) or 'diagnostics'; edits = chronological audit trail of mutations; diagnostics = metric snapshots at each checkpoint), node_id (str — filter edits to a specific node; edits mode only), action (str — filter by action type: created, prediction_decomposed, reopened, resolved, retracted, stale_flagged, superseded, tainted, trust_tier_set; edits mode only), since (str — ISO timestamp — return only entries after this time), limit (int — max entries to return, default 50, max 200).", "required": True},
         },
     },
     "engram_list_focused": {
