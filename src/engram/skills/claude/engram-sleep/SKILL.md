@@ -307,6 +307,49 @@ engram_update_lesson(payload_json=json.dumps({
 
 Empty `candidates` list is the common case (most cycles) — no lesson has ever crossed the lease threshold. Log the outcome (count reconciled, or "none this cycle") in today's history file alongside the other Phase A milestones. This step runs in Phase A, by the awake parent, not the dream master. Not because the dream master lacks the tool access — its own spec grants `tools: *` and it already calls `engram_update_lesson`-adjacent tools (supersede, retract, derive, resolve, contradict, update_task) — but because it needs no fairy investigation and no consolidation judgment, only a mechanical read-then-write, and inserting an unreviewed new step into that dense, heavily-negotiated spec is a cost this task doesn't need to pay.
 
+### Step 3.9 — Embedding backfill (engram-alpha#345 PR1 part (c))
+
+The in-process MCP-server embedder can leave a node with a NULL embedding — a disabled-by-config toggle, a cold-cache model load that failed in the background, or a transient per-node embed error. `tools/engram-regenerate-embeddings.py` backfills every such row idempotently, but nothing in the sleep routine ran it before this step: the store-and-flag design #345 settled on (store the node, flag the gap, report loudly) is only safe to leave as a long-lived default because this backfill exists AND runs routinely — Lei's rationale, verbatim, relayed 2026-10-03. This step is that routine run.
+
+Run the tool with `--json` via the engram venv python and the plugin path (same invocation shape as Steps 4.5–4.7). stderr is captured to a `mktemp` file rather than a fixed path (never reuse a predictable `/tmp` name across concurrent sleep runs) so a failure's reason survives without corrupting the stdout JSON parse below, and the file is removed in every branch:
+
+```bash
+embed_backfill_stderr=$(mktemp)
+embed_backfill_json=$("$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/engram-regenerate-embeddings.py" --json 2>"$embed_backfill_stderr")
+embed_backfill_rc=$?
+if [ $embed_backfill_rc -eq 0 ] && [ -n "$embed_backfill_json" ]; then
+    EMBED_BEFORE=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['before_null'])" "$embed_backfill_json")
+    EMBED_AFTER=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['after_null'])" "$embed_backfill_json")
+    EMBED_EMBEDDED=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['embedded'])" "$embed_backfill_json")
+    EMBED_FAILED=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['failed'])" "$embed_backfill_json")
+    if [ "$EMBED_AFTER" -gt 0 ]; then
+        embed_backfill_status="⚠ $EMBED_AFTER still unembedded (before=$EMBED_BEFORE, embedded=$EMBED_EMBEDDED, failed=$EMBED_FAILED)"
+    else
+        embed_backfill_status="✓ embedding backfill OK (before=$EMBED_BEFORE, embedded=$EMBED_EMBEDDED, failed=$EMBED_FAILED)"
+    fi
+else
+    embed_backfill_last_line=$(tail -n 1 "$embed_backfill_stderr")
+    embed_backfill_status="⚠ embedding backfill FAILED (exit $embed_backfill_rc): $embed_backfill_last_line"
+fi
+rm -f "$embed_backfill_stderr"
+```
+
+**Non-blocking, like 4.5–4.7**: a failure here (non-zero exit, unparseable output) is recorded, never aborts sleep — the day's nodes are already in the graph; this is maintenance on top of them, not a precondition for anything downstream in Phase A or B.
+
+The tool contends for the SQLite write lock like any other writer against a live MCP server (default busy timeout); a lock failure surfaces as a non-zero exit and is recorded by `embed_backfill_status` below as a loud `⚠`, not silently retried.
+
+**Record in today's history file (Step 4)**, in the exact shape `- embedding backfill: $embed_backfill_status`, e.g.:
+
+```
+- embedding backfill: $embed_backfill_status
+```
+
+`$embed_backfill_status` is a SINGLE variable computed above that already covers every branch — success with nothing remaining (`✓ ...`), success with a remainder (`⚠ N still unembedded ...`), and a fatal failure (`⚠ embedding backfill FAILED (exit N): <last stderr line>`) — so this one template, used unconditionally, is the only history line this step ever emits; there is no separate success-only template that could leave the failure branch's fields blank.
+
+**`after_null > 0` must be stated LOUDLY, never dropped silently** — this is already built into `embed_backfill_status` above (the `⚠ N still unembedded` prefix), so the history line is loud on that case by construction, not by a second template.
+
+**Pass the same line to the dream master** — carry `$embed_backfill_status` forward to Step 8, which adds one line to the COHORT METADATA block of the spawn prompt (`- Embedding backfill (Phase A): <embed_backfill_status>`) and one instruction sentence telling the dream master to copy it into the dream record — see Step 8 below.
+
 ### Step 4 — Reconcile today's history file (awake-state milestone log)
 
 `~/.engram/history/YYYY-MM-DD.md` is the **awake-state milestone log** — PRs shipped, decisions made, features delivered, key conversations. Distinct from the dream-record file that the dream master writes at `~/.engram/history/dream/YYYY-MM-DD.md` (filename = the NYC-local date the record was WRITTEN, per that spec's own Output contract), which captures consolidation output.
@@ -981,6 +1024,7 @@ Agent(
     - Batch-summary cohort dir: <COHORT_DIR>
     - Recall summaries already applied by parent in Step 7.5: X applied, Y failures deferred to next cycle
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)
+    - Embedding backfill (Phase A): <embed_backfill_status>
 
     Call engram_reflect first for your initial agenda. Read every dream-fairy report from disk (tonight's drawn set, listed above — NOT a fixed count; check the list, not a hardcoded number). Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items.
 
@@ -995,7 +1039,7 @@ Agent(
     FIRST because a plain supersede/retract is REFUSED on a node carrying a pending marker
     (#2343/#2392), and the supersedes/retractions buckets below WILL CONTAIN such nodes.
 
-    Then execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures → coverage_gaps; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Include tonight's lottery-draw provenance (drawn/weights-before/weights-after, given above) in the dream record's own text — this is the durable log the design calls for. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
+    Then execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures → coverage_gaps; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Include tonight's lottery-draw provenance (drawn/weights-before/weights-after, given above) in the dream record's own text — this is the durable log the design calls for. Also copy the Embedding backfill line from COHORT METADATA above verbatim into the dream record (engram-alpha#345 PR1 part (c)). Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
 
     FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + the cascade-sweep line (pending-at-start -> remaining, passes run, and any loud stop verbatim) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
     run_in_background=true

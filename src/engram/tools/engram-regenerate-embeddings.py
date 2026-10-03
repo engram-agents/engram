@@ -2,7 +2,16 @@
 """engram-regenerate-embeddings.py — backfill NULL embeddings after a git restore.
 
 Usage:
-    python tools/engram-regenerate-embeddings.py [--engram-home PATH]
+    python tools/engram-regenerate-embeddings.py [--engram-home PATH] [--json]
+
+    --json: after the normal backfill work, print exactly one JSON object to
+    stdout: {"before_null", "embedded", "failed", "after_null"} (#345 PR1
+    part (c)). before_null is the same is_current=1/embedding-IS-NULL count
+    this script always used; after_null is RE-QUERIED post-run, not computed
+    by subtraction. stderr progress is unchanged; without --json, stdout is
+    unchanged from today. Consumed by the engram-sleep Phase A embedding-
+    backfill step so the backfill this issue's store-and-flag design relies
+    on actually runs routinely.
 
 When to run:
     After restoring knowledge.db from the git-tracked SQL dump:
@@ -224,7 +233,7 @@ def _backfill_embeddings_core(conn, server, model_name: str, vec_available: bool
     return counts
 
 
-def backfill_embeddings(engram_home: Path) -> None:
+def backfill_embeddings(engram_home: Path, json_output: bool = False) -> None:
     db_path = engram_home / "knowledge.db"
     if not db_path.exists():
         print(
@@ -285,6 +294,12 @@ def backfill_embeddings(engram_home: Path) -> None:
         # function does setup, reports the outcome, and owns the fail-loud
         # exit-code contract.
         counts = _backfill_embeddings_core(conn, server, model_name, vec_available)
+        # C1 (#345 PR1 part (c)): before_null is the SAME predicate
+        # _backfill_embeddings_core already used to populate counts
+        # ["processed"], queried before any UPDATE in this pass touched a
+        # row -- reusing it avoids a redundant round trip rather than
+        # re-issuing the identical SELECT.
+        before_null = counts["processed"]
 
         if counts["processed"] == 0:
             print("[regen] No nodes with NULL embedding — nothing to do.", file=sys.stderr)
@@ -318,6 +333,20 @@ def backfill_embeddings(engram_home: Path) -> None:
                 server.core._clear_embedding_restore_flag(conn, respect_lease=True)
             except Exception:
                 pass  # best-effort — never fail the script over flag bookkeeping
+            if json_output:
+                # C1: after_null is RE-QUERIED (not before_null - embedded)
+                # even on the nothing-to-do path, for the same reason the
+                # normal-completion path below re-queries -- a uniform rule
+                # is simpler to verify than "subtract except when empty."
+                after_null = conn.execute(
+                    "SELECT COUNT(*) FROM nodes WHERE is_current=1 AND embedding IS NULL"
+                ).fetchone()[0]
+                print(json.dumps({
+                    "before_null": before_null,
+                    "embedded": counts["embedded"],
+                    "failed": counts["failed"],
+                    "after_null": after_null,
+                }))
             return
 
         if counts["skipped"] > 0:
@@ -380,6 +409,22 @@ def backfill_embeddings(engram_home: Path) -> None:
         except Exception:
             pass  # best-effort — never fail the script over flag bookkeeping
 
+        if json_output:
+            # C1 (#345 PR1 part (c)): after_null is RE-QUERIED from the DB
+            # here, deliberately NOT computed as before_null - embedded --
+            # this is the one line that keeps the summary honest if
+            # anything else ever touches nodes.embedding between the
+            # backfill loop finishing and this point.
+            after_null = conn.execute(
+                "SELECT COUNT(*) FROM nodes WHERE is_current=1 AND embedding IS NULL"
+            ).fetchone()[0]
+            print(json.dumps({
+                "before_null": before_null,
+                "embedded": counts["embedded"],
+                "failed": counts["failed"],
+                "after_null": after_null,
+            }))
+
         if counts["failed"] > 0:
             # #3075 C4 / Lei's C5 ruling: fail LOUD, not silently — a
             # non-zero exit is the one signal a caller (a human, or a
@@ -403,9 +448,20 @@ def main():
         default=os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram"),
         help="Path to the ENGRAM data directory (default: $ENGRAM_HOME or ~/.engram)",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "After the normal backfill work, print exactly one JSON object "
+            "to stdout: {\"before_null\", \"embedded\", \"failed\", "
+            "\"after_null\"} (#345 PR1 part (c), for the engram-sleep "
+            "Phase A embedding-backfill step). stderr progress is "
+            "unchanged; without this flag, stdout is unchanged from today."
+        ),
+    )
     args = parser.parse_args()
     engram_home = Path(args.engram_home).expanduser().resolve()
-    backfill_embeddings(engram_home)
+    backfill_embeddings(engram_home, json_output=args.json)
 
 
 if __name__ == "__main__":
