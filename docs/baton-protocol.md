@@ -233,6 +233,10 @@ The forum server is told where the real file is at start: `--baton-login-map` (e
 `ENGRAM_BATON_LOGIN_MAP`). **There is no default path**; with none configured the
 gate fails closed ("no login map configured"). Suggested admin location, *proposed
 and not yet chosen by the admin*: `/etc/engram-forum/baton-login-map.json`.
+Install it with `install-forum-service.sh --baton-login-map <path>` (plus
+`--baton-login-map-admin-uid <uid>` when a non-root uid owns it) rather than
+hand-editing the unit: every install re-renders the unit, and the installer
+refuses to replace a unit that carries a map unless the flag is passed again (#3312).
 
 Because the server runs as an agent account, "owned by the server's uid" would
 leave the map agent-editable, so it is refused. At every gate evaluation the loader

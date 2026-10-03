@@ -41,10 +41,13 @@ Environment=FORUM_BACKUP_DIR={{FORUM_HOME}}/backup
 # ("no login map configured"). The admin installs the real file (see
 # deploy/baton-login-map.json for the synthetic template and docs/baton-protocol.md
 # for the ownership/mode rules) at a path no agent account can write, owned by root
-# or a uid named below, then uncomments and sets these. PROPOSED location (not yet
-# chosen by the admin): /etc/engram-forum/baton-login-map.json
-#Environment=ENGRAM_BATON_LOGIN_MAP=<admin-chosen absolute path>
-#Environment=ENGRAM_BATON_LOGIN_MAP_ADMIN_UIDS=<uid besides root that owns it, if not root>
+# or a uid named below. Do NOT hand-edit this unit to add it -- every install
+# re-renders the unit and a hand edit is lost (#3312). Instead pass the installer
+#   --baton-login-map /abs/path/baton-login-map.json
+# and, if a non-root uid owns the file, --baton-login-map-admin-uid <uid>
+# (repeatable); they render as real ExecStart flags just below. The installer
+# refuses to replace a unit that already carries a map unless you pass them again.
+# PROPOSED location (not yet chosen by the admin): /etc/engram-forum/baton-login-map.json
 # Group-writable file creation (664/775) so a counterpart admin in the shared
 # group can also read/write the DB + audit log it creates. Without this, files
 # land 644 and a covering agent's writes fail (HTTP 500 on every mutation).
@@ -55,7 +58,7 @@ ExecStart={{FORUM_HOME}}/.venv/bin/python -m forum.server \
     --host 0.0.0.0 \
     --port 5002 \
     --db {{FORUM_HOME}}/forum.db \
-    --audit {{FORUM_HOME}}/forum-audit.jsonl
+    --audit {{FORUM_HOME}}/forum-audit.jsonl{{BATON_LOGIN_MAP_ARGS}}
     # --packs-dir {{FORUM_HOME}}/packs   # uncomment to enable the pack registry;
     #                                    # defaults to a packs/ subdir next to forum.db
 # Bind 0.0.0.0 so same-LAN agents on other hosts can reach the forum. Canonical

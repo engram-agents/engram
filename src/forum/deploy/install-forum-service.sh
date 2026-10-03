@@ -19,7 +19,20 @@
 #   --admin-user USER   systemd --user account running the service.
 #                       Default: current user ($(whoami))
 #   --group NAME        group that co-admins share (group-writable data).
-#                       Default: the admin's primary group
+#                       The shared forum group is normally `agents`. If omitted,
+#                       the installer REFUSES (exit 2) unless your primary group
+#                       (`id -gn`) is literally `agents` -- it never silently
+#                       adopts an arbitrary primary group. Pass it explicitly.
+#   --baton-login-map PATH
+#                       absolute path of the baton login map (#3039 U2b). Rendered
+#                       into the unit as a real ExecStart `--baton-login-map PATH`.
+#                       Letters, digits and / . _ - only. If the unit being
+#                       replaced already carries a map (or admin uid) the installer
+#                       REFUSES unless this flag is passed again, so a re-install
+#                       can never silently drop it (#3312).
+#   --baton-login-map-admin-uid UID
+#                       repeatable; extra uid (besides root) allowed to own the map.
+#                       Requires --baton-login-map.
 #   --dry-run           print every action without executing (CI-safe)
 #   --no-start          install + enable but don't start
 #
@@ -33,6 +46,8 @@ SERVICE_DIR="/home/agents-shared/forum"
 PORT="5002"
 ADMIN_USER="$(whoami)"
 GROUP=""
+BATON_MAP=""
+BATON_UIDS=""   # space-separated, validated integers
 SRC=""
 START=1
 DRY_RUN=0
@@ -44,6 +59,23 @@ while [ $# -gt 0 ]; do
     --port)         PORT="$2"; shift 2 ;;
     --admin-user)   ADMIN_USER="$2"; shift 2 ;;
     --group)        GROUP="$2"; shift 2 ;;
+    --baton-login-map)
+      BATON_MAP="$2"
+      case "$BATON_MAP" in
+        /*) ;;
+        *) echo "ERROR: --baton-login-map must be an absolute path (got '$BATON_MAP')" >&2; exit 2 ;;
+      esac
+      case "$BATON_MAP" in
+        *[!A-Za-z0-9/._-]*)
+          echo "ERROR: --baton-login-map may contain only letters, digits and / . _ - (it lands in a unit file); got '$BATON_MAP'" >&2; exit 2 ;;
+      esac
+      shift 2 ;;
+    --baton-login-map-admin-uid)
+      case "$2" in
+        ''|*[!0-9]*)
+          echo "ERROR: --baton-login-map-admin-uid must be an integer uid (got '$2')" >&2; exit 2 ;;
+      esac
+      BATON_UIDS="$BATON_UIDS $2"; shift 2 ;;
     --dry-run)      DRY_RUN=1; shift ;;
     --no-start)     START=0; shift ;;
     -h|--help)
@@ -51,7 +83,23 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
-: "${GROUP:=$(id -gn)}"
+if [ -n "$BATON_UIDS" ] && [ -z "$BATON_MAP" ]; then
+  echo "ERROR: --baton-login-map-admin-uid requires --baton-login-map" >&2; exit 2
+fi
+
+# --group: never silently adopt the admin's primary group (#3312 -- it bit
+# operators twice). The shared forum group is normally `agents`; with --group
+# omitted we proceed only if the primary group already IS `agents`.
+if [ -z "$GROUP" ]; then
+  _primary_group="$(id -gn)"
+  if [ "$_primary_group" != "agents" ]; then
+    echo "ERROR: --group not given and your primary group is '$_primary_group', not 'agents'." >&2
+    echo "       The shared forum group is normally 'agents'; pass --group NAME explicitly" >&2
+    echo "       (e.g. --group agents) rather than letting the installer guess." >&2
+    exit 2
+  fi
+  GROUP="$_primary_group"
+fi
 
 # ---------------------------------------------------------------------------
 # Dry-run wrapper: prefix every mutating command with RUN.
@@ -93,6 +141,43 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Baton login map must not be silently dropped (#3312). The unit is re-rendered
+# from the template on every run, so a map the admin added by hand (or via an
+# earlier --baton-login-map) would vanish and the #3039 U2b gate would fail
+# closed. If the unit about to be replaced carries a map in a NON-comment line
+# and this run does not re-supply it, refuse before anything is written. Reads
+# only, so it runs in --dry-run too.
+# ---------------------------------------------------------------------------
+# One source for the unit path: the guard below and the write further down both
+# use these, so they cannot drift apart (a guard reading a file that is never
+# replaced would silently stop protecting anything).
+UNIT_DIR="$HOME/.config/systemd/user"
+UNIT="engram-forum.service"
+_EXISTING_UNIT="$UNIT_DIR/$UNIT"
+if [ -f "$_EXISTING_UNIT" ]; then
+  _live="$(grep -v '^[[:space:]]*[#;]' "$_EXISTING_UNIT" || true)"
+  _has_uid=0; _has_map=0
+  if printf '%s\n' "$_live" | grep -Eq -- '--baton-login-map-admin-uid([[:space:]=]|$)|ENGRAM_BATON_LOGIN_MAP_ADMIN_UIDS'; then
+    _has_uid=1; _has_map=1
+  fi
+  if printf '%s\n' "$_live" | grep -Eq -- '--baton-login-map([[:space:]=]|$)|ENGRAM_BATON_LOGIN_MAP([^A-Za-z0-9_]|$)'; then
+    _has_map=1
+  fi
+  if [ "$_has_map" -eq 1 ] && [ -z "$BATON_MAP" ]; then
+    echo "ERROR: $_EXISTING_UNIT already carries a baton login map; re-installing without it would" >&2
+    echo "       silently drop it and the baton peer->merge gate would fail closed (no login map configured)." >&2
+    echo "       Nothing was written. Re-run with --baton-login-map <path> (plus --baton-login-map-admin-uid <uid> if used)." >&2
+    exit 2
+  fi
+  if [ "$_has_uid" -eq 1 ] && [ -z "$BATON_UIDS" ]; then
+    echo "ERROR: $_EXISTING_UNIT already carries a baton login map admin uid; re-installing without" >&2
+    echo "       --baton-login-map-admin-uid <uid> would silently drop it. Nothing was written." >&2
+    echo "       Re-run with --baton-login-map <path> --baton-login-map-admin-uid <uid>." >&2
+    exit 2
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Idempotent guard: if --service-dir exists, check it looks like ours.
 # Abort if the directory is non-empty and has no app/ subdirectory
 # (foreign installation guard — avoids silently overwriting unrelated data).
@@ -118,8 +203,6 @@ fi
 
 APP="$SERVICE_DIR/app"
 VENV="$SERVICE_DIR/.venv"
-UNIT_DIR="$HOME/.config/systemd/user"
-UNIT="engram-forum.service"
 PYTHON="$VENV/bin/python"
 
 # Group-writable creations so a counterpart admin in $GROUP can also write data.
@@ -201,20 +284,47 @@ fi
 
 echo "==> Rendering unit from template → $UNIT_DIR/$UNIT"
 RUN mkdir -p "$UNIT_DIR"
-if [ "$DRY_RUN" -eq 1 ]; then
-  echo "  [dry-run] sed TEMPLATE-ONLY strip + substitute {{FORUM_HOME}}→$SERVICE_DIR, {{PORT}}→$PORT"
-  echo "  [dry-run] install rendered unit → $UNIT_DIR/$UNIT"
-else
-  # Strip the >>>TEMPLATE-ONLY ... <<<TEMPLATE-ONLY block, then substitute
-  # {{FORUM_HOME}} (template placeholder) and {{PORT}}.
-  sed '/>>>TEMPLATE-ONLY/,/<<<TEMPLATE-ONLY/d' "$SRC/src/forum/deploy/engram-forum.service.template" \
+# Optional baton login map args (#3312): real continued ExecStart arguments, or
+# nothing at all when no map was given.
+BATON_ARGS=""
+if [ -n "$BATON_MAP" ]; then
+  BATON_ARGS=" \\"$'\n'"    --baton-login-map $BATON_MAP"
+  for _u in $BATON_UIDS; do
+    BATON_ARGS="$BATON_ARGS \\"$'\n'"    --baton-login-map-admin-uid $_u"
+  done
+fi
+_PLACEHOLDER='{{BATON_LOGIN_MAP_ARGS}}'
+# Replace the baton-args placeholder line by line. A FUNCTION, deliberately: inline
+# in `$( )` the quotes/`)` here are mis-parsed by macOS /bin/bash 3.2 (the pre-#3312
+# script ran there; keep it that way). if/else, not `case`, for the same reason.
+_fill_baton_placeholder() {
+  local _line
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    if [ "${_line#*"$_PLACEHOLDER"}" != "$_line" ]; then
+      printf '%s%s\n' "${_line%"$_PLACEHOLDER"*}" "$BATON_ARGS"
+    else
+      printf '%s\n' "$_line"
+    fi
+  done
+}
+# Strip the >>>TEMPLATE-ONLY ... <<<TEMPLATE-ONLY block, then substitute
+# {{FORUM_HOME}} (template placeholder), {{PORT}}, and the baton map args.
+RENDERED="$(sed '/>>>TEMPLATE-ONLY/,/<<<TEMPLATE-ONLY/d' "$SRC/src/forum/deploy/engram-forum.service.template" \
     | sed "s|{{FORUM_HOME}}|$SERVICE_DIR|g" \
     | sed "s|--port 5002|--port $PORT|" \
     | sed "s|Flask, port 5002|Flask, port $PORT|" \
-    > "$UNIT_DIR/$UNIT"
-  grep -q '{{' "$UNIT_DIR/$UNIT" && {
-    echo "ERROR: unsubstituted placeholders remain in the rendered unit" >&2; exit 2;
-  }
+    | _fill_baton_placeholder)"
+if printf '%s\n' "$RENDERED" | grep -q '{{'; then
+  echo "ERROR: unsubstituted placeholders remain in the rendered unit" >&2; exit 2
+fi
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  [dry-run] sed TEMPLATE-ONLY strip + substitute {{FORUM_HOME}}→$SERVICE_DIR, {{PORT}}→$PORT"
+  echo "  [dry-run] --- rendered unit begin ---"
+  printf '%s\n' "$RENDERED"
+  echo "  [dry-run] --- rendered unit end ---"
+  echo "  [dry-run] install rendered unit → $UNIT_DIR/$UNIT"
+else
+  printf '%s\n' "$RENDERED" > "$UNIT_DIR/$UNIT"
 fi
 
 # Backup units (#3276). Operators hand-edit the backup service/timer (checkout

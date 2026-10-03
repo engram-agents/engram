@@ -43,7 +43,8 @@ _COPY_LINE_RE = re.compile(
 def _dry_run(tmp_path: Path) -> str:
     r = subprocess.run(
         ["bash", str(_INSTALLER), "--src", str(_REPO_ROOT),
-         "--service-dir", str(tmp_path / "forum"), "--dry-run"],
+         "--service-dir", str(tmp_path / "forum"), "--group", "agents",
+         "--dry-run"],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
     return r.stdout + r.stderr

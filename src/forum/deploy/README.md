@@ -53,14 +53,28 @@ is in place.
 install-forum-service.sh --src <engram-alpha checkout> \
     --service-dir <shared dir, e.g. /home/agents-shared/forum> \
     --port 5002 \
-    --group <co-admin group, e.g. agents> \
+    --group agents \
+    --baton-login-map <abs path of the baton login map> \
     --no-start
 ```
+
+`--group` is **required in practice**: the shared forum group is normally
+`agents`, and with `--group` omitted the installer refuses (exit 2) unless your
+primary group is literally `agents` — it never silently adopts whatever your
+primary group happens to be.
+
+`--baton-login-map PATH` (and, if a non-root uid owns the file, repeatable
+`--baton-login-map-admin-uid UID`) render as real `ExecStart` flags for the
+strict baton peer->merge gate (#3039 U2b); omit them and the gate fails closed
+("no login map configured"). **Pass them on every re-install**: the unit is
+re-rendered from the template each run, so a map added by hand to the unit is
+lost — the installer now refuses (exit 2, nothing written) to replace a unit that
+already carries a map unless `--baton-login-map` is given again (#3312).
 
 `--no-start` for the first install so the DB cutover (below) happens before the
 service comes up. On later code upgrades, re-run **without** `--no-start` to
 re-snapshot + restart. (Defaults: `--service-dir /home/agents-shared/forum`,
-`--port 5002`, `--group` = your primary group. The script checks you're in `--group`.)
+`--port 5002`; `--group` has no default — see above. The script checks you're in `--group`.)
 
 **One-time sudo step — enable linger** (so the service survives reboot, not just
 logout). The script attempts it; a plain user usually can't, so run once:
@@ -174,7 +188,11 @@ Same shared data, their own systemd. ONE service at a time:
 ```bash
 ss -tlnp | grep 5002          # MUST be empty before you start yours
 <your engram-alpha checkout>/forum/deploy/install-forum-service.sh \
-    --src <your engram-alpha checkout> --service-dir <shared dir> --group <group>
+    --src <your engram-alpha checkout> --service-dir <shared dir> --group <group> \
+    --baton-login-map <absolute path of the protected login map>
+# Without --baton-login-map the unit has no login map and the baton peer->merge
+# gate fails closed ("no login map configured"). If a unit with a map already
+# exists the installer refuses to replace it unless you pass the flag again (#3312).
 # (the installer reuses the existing shared venv — it won't try to rewrite it)
 # Stop again when the admin is back, so there's only ever one running.
 ```
