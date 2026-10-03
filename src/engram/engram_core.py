@@ -1514,22 +1514,22 @@ def generalization_chain(
     #                    head's claim in full, middle rungs as one-liners"),
     #                    so it never touches a middle rung.
     #
-    # COUPLING, named rather than coded around: the IN-list's parameter count
-    # scales with the REACHED SET -- and ``max_depth`` bounds only that set's
-    # DEPTH. Its BREADTH is bounded by nothing here: a node may be generalized
-    # by several parents, so each rung can widen, and the only real ceiling is
-    # the graph's population of principle nodes (each is expanded at most
-    # once). At the default depth 4, on a graph whose lesson/cornerstone/
-    # axiom/goal count is in the hundreds, the list is trivially small. So the
-    # knob that would bite first is principle-node GROWTH or a raised
-    # max_depth -- not chain length -- against SQLite's build-dependent
-    # variable limit (999 on pre-3.32 builds, 32766 since). Chunk the IN-list
-    # if either ever approaches it.
+    # COUPLING, retired by #3324 (U4c-0): each read binds the reached set as
+    # ONE JSON-array parameter and filters with ``IN (SELECT value FROM
+    # json_each(?))``, so the bound-variable count is 1 regardless of set
+    # size and SQLite's variable limit no longer applies here. ``max_depth``
+    # bounds only the set's DEPTH and its breadth is bounded by nothing, so
+    # that matters: no chunking is needed at any size. json_each needs
+    # SQLite's JSON1 (built in from 3.38; measured on 3.45.1 and 3.53.0 on
+    # the Linux seats; macOS seats not measured). A missing json_each raises
+    # sqlite3.OperationalError -- deliberately uncaught, never empty. Still
+    # TWO queries total, independent of chain size. The SQL text is a fixed
+    # inline literal on purpose (no f-string, no concatenation): it is the
+    # single template U4c's byte-exact read registry (#3196) can admit.
     if nodes:
-        _ph = ",".join("?" * len(nodes))
         for _row in conn.execute(
-            f"SELECT id, recall_summary FROM nodes WHERE id IN ({_ph})",
-            tuple(nodes),
+            "SELECT id, recall_summary FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
+            (json.dumps(list(nodes)),),
         ):
             if _row[0] in nodes:
                 nodes[_row[0]]["recall_summary"] = _row[1]
@@ -1537,10 +1537,9 @@ def generalization_chain(
         nodes[_nid].setdefault("recall_summary", None)
 
     if heads:
-        _ph = ",".join("?" * len(heads))
         for _row in conn.execute(
-            f"SELECT id, claim FROM nodes WHERE id IN ({_ph})",
-            tuple(heads),
+            "SELECT id, claim FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
+            (json.dumps(list(heads)),),
         ):
             if _row[0] in nodes:
                 nodes[_row[0]]["claim"] = _row[1]
