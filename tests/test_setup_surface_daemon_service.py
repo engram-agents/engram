@@ -373,8 +373,15 @@ class TestOSDetection(unittest.TestCase):
 class TestMissingToolErrors(unittest.TestCase):
     """Script must fail loud with a clear message when systemctl/launchctl is absent."""
 
-    def _run_full_script(self, os_name: str, stubs: dict[str, str]) -> subprocess.CompletedProcess:
-        """Run the actual setup script with stubbed environment."""
+    def _run_full_script(
+        self, os_name: str, stubs: dict[str, str], *, hermetic_path: bool = False,
+    ) -> subprocess.CompletedProcess:
+        """Run the actual setup script with stubbed environment.
+
+        `hermetic_path=True` (#3333) replaces the inherited PATH with the
+        stub dir plus a dir of symlinks to only the tools the script runs
+        before its launchctl/systemctl check, so "launchctl absent" holds on
+        every host (a real Mac has launchctl on its PATH)."""
         with tempfile.TemporaryDirectory() as stub_dir, \
              tempfile.TemporaryDirectory() as fake_home:
 
@@ -399,9 +406,19 @@ class TestMissingToolErrors(unittest.TestCase):
             fake_engram_home = Path(fake_home) / ".engram"
             fake_engram_home.mkdir(parents=True, exist_ok=True)
 
+            path_value = f"{stub_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}"
+            if hermetic_path:
+                tools = stub_path / "tools"
+                tools.mkdir()
+                for tool in ("bash", "env", "readlink", "dirname"):
+                    found = shutil.which(tool)
+                    assert found, f"hermetic PATH needs {tool} on the host"
+                    (tools / tool).symlink_to(found)
+                path_value = f"{stub_dir}:{tools}"
+
             env = {
                 **os.environ,
-                "PATH": f"{stub_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                "PATH": path_value,
                 "HOME": fake_home,
                 "ENGRAM_HOME": str(fake_engram_home),
             }
@@ -430,7 +447,9 @@ class TestMissingToolErrors(unittest.TestCase):
     def test_darwin_no_launchctl_exits_nonzero(self):
         """On macOS, if launchctl is not found, script must exit non-zero."""
         # Don't provide a launchctl stub
-        result = self._run_full_script("Darwin", stubs={})
+        # hermetic_path: a real Mac has launchctl on PATH, so build a PATH
+        # that genuinely lacks it (#3333).
+        result = self._run_full_script("Darwin", stubs={}, hermetic_path=True)
         self.assertNotEqual(
             result.returncode,
             0,

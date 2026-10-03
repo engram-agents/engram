@@ -834,6 +834,36 @@ def _extract_bash_function(script_text: str, func_name: str) -> str:
     return m.group(0)
 
 
+# #3333: GNU `timeout` is absent on stock macOS. The script's supervisor
+# check runs `timeout 3 systemctl --user show ...` (behind `command -v
+# systemctl`, which only the fake systemctl satisfies here), so on such a
+# host every fixture that fakes systemctl also needs a `timeout`. The
+# condition is the missing primitive itself, never the platform name.
+def _real_timeout_missing() -> bool:
+    """True iff no `timeout` executable is on this process's PATH."""
+    return shutil.which("timeout") is None
+
+
+_NEEDS_REAL_TIMEOUT = unittest.skipIf(
+    _real_timeout_missing(),
+    "needs a real GNU `timeout` on PATH (absent here; a pass-through stub "
+    "cannot bound a wedged call)",
+)
+
+
+def _make_timeout_stub(bin_dir: Path) -> bool:
+    """Installs a hermetic pass-through `timeout` into `bin_dir` ONLY when
+    the host has none. The stub drops its first argument (the duration)
+    and execs the rest -- it never times anything out. Returns True iff it
+    installed the stub, so a host with a real `timeout` always uses it."""
+    if not _real_timeout_missing():
+        return False
+    path = bin_dir / "timeout"
+    path.write_text('#!/bin/bash\nshift\nexec "$@"\n')
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return True
+
+
 def _make_fake_systemctl(
     bin_dir: Path, *, mode: str,
     load_state: str = "", active_state: str = "", sub_state: str = "",
@@ -914,6 +944,10 @@ def _make_fake_systemctl(
     else:
         raise ValueError(mode)
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    if mode != "sleep":
+        # "sleep" is the wedged-bus fake: it needs a REAL timeout to bound
+        # it, so no stub is installed for it (#3333).
+        _make_timeout_stub(bin_dir)
 
 
 def _run_supervisor_function(
@@ -1638,6 +1672,43 @@ class TestBranch3ConnectionRefusedAgainstPreUnit4Script(_ProbeBranchFixture):
         )
 
 
+def _full_backlog_connect_raises_blocking_io() -> bool:
+    """Probes the primitive TestBranch3BlockingIO's fake depends on: that a
+    non-blocking AF_UNIX connect() to a listen(0) socket whose backlog is
+    full raises BlockingIOError (Linux). macOS never does: measured on one Mac,
+    20-40 non-blocking connects to a listen(0) socket all succeeded, and
+    with listen(1) the second onward got ECONNREFUSED, no BlockingIOError
+    either way. So the fake cannot produce the BlockingIOError branch
+    there (#3333)."""
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "p.sock")
+        srv = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+        clients = []
+        try:
+            srv.bind(path)
+            srv.listen(0)
+            for _ in range(20):
+                c = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+                clients.append(c)
+                c.setblocking(False)
+                try:
+                    c.connect(path)
+                except BlockingIOError:
+                    return True
+                except OSError:
+                    return False
+            return False
+        except OSError:
+            # bind()/listen() can fail (e.g. a TMPDIR path over the AF_UNIX
+            # length limit): the primitive is unusable here, so skip the cell
+            # rather than turn the whole file into a collection error.
+            return False
+        finally:
+            for c in clients:
+                c.close()
+            srv.close()
+
+
 class TestBranch3BlockingIO(_ProbeBranchFixture):
     """#2676 case 3: a real bound+listening socket with a zero backlog
     (`listen(0)`), its accept backlog deliberately exhausted by opening
@@ -1681,6 +1752,11 @@ class TestBranch3BlockingIO(_ProbeBranchFixture):
             self.live_proc.terminate()
             self.live_proc.wait(timeout=2)
 
+    @unittest.skipUnless(
+        _full_backlog_connect_raises_blocking_io(),
+        "needs a full AF_UNIX accept backlog to raise BlockingIOError on a "
+        "non-blocking connect (not observed on macOS: connects succeed or get ECONNREFUSED)",
+    )
     def test_logs_branch3_line_with_blocking_io_error(self):
         result = self._run()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -2237,6 +2313,7 @@ class TestSupervisorRegisteredStateTimeout(unittest.TestCase):
     `_run_supervisor_function`'s own `subprocess_timeout`, so a genuinely-
     hanging call cannot hang CI even if this fix is broken."""
 
+    @_NEEDS_REAL_TIMEOUT
     def test_wedged_systemctl_times_out_and_reads_unavailable(self):
         start = time.monotonic()
         result = _run_supervisor_function(
@@ -2792,7 +2869,9 @@ class TestEngramHomeNormalizationRelativeBecomesAbsolute(_EngramHomeNormalizatio
 
     def test_relative_engram_home_resolves_absolute_matching_daemon_side(self):
         with tempfile.TemporaryDirectory() as td:
-            cwd = Path(td)
+            # realpath: the script's `cd`+`pwd` reports the kernel's cwd, which
+            # on macOS is /private/var/... for a /var/... temp dir (#3333).
+            cwd = Path(os.path.realpath(td))
             relhome = "relhome"
             resolved = self._run_normalization(relhome, cwd)
 
@@ -2885,7 +2964,7 @@ class TestEngramHomeNormalizationSymlink(_EngramHomeNormalizationFixture):
         (a relative ENGRAM_HOME set from a given cwd) than the absolute-path
         symlink case above."""
         with tempfile.TemporaryDirectory() as td:
-            base = Path(td)
+            base = Path(os.path.realpath(td))  # macOS /var -> /private/var (#3333)
             real_target = base / "real_target"
             real_target.mkdir()
             link_name = "link_home"

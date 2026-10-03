@@ -85,6 +85,8 @@ import time
 import unittest
 from pathlib import Path
 
+import pytest
+
 # Cross-file reuse (mirrors the established
 # test_pgrep_liveness_reap_patterns._extract_reap_pattern import
 # convention used by tests/test_launch_line_reap_pattern_binding.py):
@@ -94,6 +96,48 @@ from pathlib import Path
 # state regardless of this host's own ambient systemctl behavior.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_start_daemon_probe_branch_logging import _make_fake_systemctl  # noqa: E402
+
+
+
+def _missing_guard_primitives() -> list[str]:
+    """Linux primitives the script's socket-ownership guard reads
+    (/proc/net/unix, /proc/<pid>/fd, GNU `stat -c`); names the ones this
+    host lacks. The condition is the primitive itself, never the platform
+    name (#3333)."""
+    missing = []
+    if not Path("/proc/net/unix").exists():
+        missing.append("/proc/net/unix")
+    if not os.path.isdir("/proc/self/fd"):
+        missing.append("/proc/<pid>/fd")
+    try:
+        gnu_stat = subprocess.run(
+            ["stat", "-c", "%d:%i:%W", "/"], capture_output=True, timeout=5,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        gnu_stat = False
+    if not gnu_stat:
+        missing.append("GNU `stat -c`")
+    return missing
+
+
+_MISSING_GUARD_PRIMITIVES = _missing_guard_primitives()
+_NEEDS_GUARD_PRIMITIVES = pytest.mark.skipif(
+    bool(_MISSING_GUARD_PRIMITIVES),
+    reason="needs " + ", ".join(_MISSING_GUARD_PRIMITIVES) + " (socket-ownership guard)",
+)
+
+def _missing_stat_primitive() -> list[str]:
+    """Only the GNU `stat -c` part of the guard primitives, for cells that
+    shell out to `stat` but touch neither /proc/net/unix nor /proc/<pid>/fd
+    (a host with GNU stat and no procfs must still run them) (#3333)."""
+    return [m for m in _missing_guard_primitives() if m == "GNU `stat -c`"]
+
+
+_MISSING_STAT_PRIMITIVE = _missing_stat_primitive()
+_NEEDS_GNU_STAT = pytest.mark.skipif(
+    bool(_MISSING_STAT_PRIMITIVE),
+    reason="needs GNU `stat -c` (absent on this host)",
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DAEMON_DIR = REPO_ROOT / "src" / "engram" / "hooks" / "claude"
@@ -1015,6 +1059,7 @@ class TestUnknownOwnerNotMatchedByReap(_ForceUnsupervisedMixin, _SocketGuardFixt
         self._seeded_dead_pid = self._dead_pid()
         self.pid_path.write_text(str(self._seeded_dead_pid))
 
+    @_NEEDS_GUARD_PRIMITIVES
     def test_socket_preserved_holder_alive_and_functional_reported(self):
         result = self._run()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1061,6 +1106,7 @@ class TestUnknownOwnerNotMatchedByReap(_ForceUnsupervisedMixin, _SocketGuardFixt
         self.assertIn(f"held by pid {self.holder.pid}", content)
         self.assertIn("not matched by the reap loop for this invocation", content)
 
+    @_NEEDS_GUARD_PRIMITIVES
     def test_next_launch_backs_off_instead_of_stealing(self):
         """The actual regression test for the reviewer-fairy's finding on
         PR #2687: after the shell guard refuses (PID_PATH and SOCKET_PATH
@@ -1205,6 +1251,7 @@ class TestRaceDetectionBlocksEvenWithoutALiveHolder(_ForceUnsupervisedMixin, _So
         hook_path.chmod(hook_path.stat().st_mode | stat.S_IXUSR)
         self.hook_path = hook_path
 
+    @_NEEDS_GUARD_PRIMITIVES
     def test_race_blocks_delete_and_reports_even_with_no_live_holder(self):
         result = self._run(extra_env={"_UNIT2_TEST_RACE_HOOK": str(self.hook_path)})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1291,6 +1338,7 @@ class TestRaceHookIdentityChangeIsGuaranteed(unittest.TestCase):
 
     N_TRIALS = 20
 
+    @_NEEDS_GNU_STAT
     def test_bind_then_rename_hook_always_changes_stat_identity(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "probe.sock"
@@ -1413,6 +1461,7 @@ class TestPidPathRemovalDefeatsOwnershipCheck(_SocketGuardFixture):
         self.holder = self._spawn_holder_process(match_reap_pattern=False)
         self.pid_path.write_text(str(self._dead_pid()))
 
+    @_NEEDS_GUARD_PRIMITIVES
     def test_pre_fold_script_removes_pid_path_despite_guard_refusal(self):
         result = self._run()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1441,6 +1490,7 @@ class TestPidPathRemovalDefeatsOwnershipCheck(_SocketGuardFixture):
             "REQUEST_CHANGES finding on PR #2687",
         )
 
+    @_NEEDS_GUARD_PRIMITIVES
     def test_pre_fold_script_causes_next_launch_to_steal_the_socket(self):
         """The actual regression: with PID_PATH gone (see previous test),
         engram-surface-daemon.py's own REAL _recorded_pid_is_alive() /
