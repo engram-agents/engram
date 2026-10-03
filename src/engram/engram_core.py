@@ -113,6 +113,18 @@ class EmbeddingManager:
         self._model = None
         self._model_name = None
         self._failed_models = set()  # cache download failures
+        # #345 PR3 B2 Rider 1: a SIBLING dict, not a repurposing of
+        # _failed_models itself. _failed_models stays a plain set with its
+        # existing semantics (server.py's pre-warm .add(), several tests'
+        # .discard()) completely unchanged — converting it to a dict would
+        # silently break every existing .discard() call (dict has no such
+        # method). This dict tracks ONLY the cooldown state the write path
+        # needs: model_name -> the UTC ISO timestamp of the last in-write
+        # revive() attempt that STILL failed. Absence of a key (or an
+        # expired entry) means the next failing write may revive
+        # immediately -- matching "a model put into the failed state with
+        # NO timestamp... may be revived on the first failing write."
+        self._revive_cooldown: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def _load_model(self, model_name: str):
@@ -216,6 +228,105 @@ class EmbeddingManager:
                 return None
             vectors = self._model.encode(texts, convert_to_numpy=True)
         return vectors.tolist()
+
+    def _load_model_local_only(self, model_name: str) -> None:
+        """Load the model from the LOCAL HuggingFace cache ONLY -- no
+        online fallback (#345 PR3 M4, Kepler's ruling seq 6544, on Mira's
+        finding seq 6539 during PR#3343's round-3 review).
+
+        Used ONLY by revive(), which runs INSIDE the caller's open write
+        transaction (_compute_and_store_embedding_with_revive -- the
+        caller does not commit until after _stamp_new_node returns). A
+        network download under that open transaction would hold the
+        writer's lock for an UNBOUNDED network round-trip; a local-cache
+        load is disk-bound and seconds-scale, not network-bound.
+        _load_model's own online-fallback branch stays exactly as it was
+        for SERVER START, which runs outside any write transaction. The
+        operator remedy for a genuine re-download (a cache that was never
+        populated, or a model name that changed) stays `/mcp` reconnect,
+        which goes through the ordinary, full-fallback _load_model path,
+        never this one.
+
+        Same double-checked-locking shape as _load_model (fast path
+        outside the lock, re-check inside) -- must be called OUTSIDE
+        self._lock by the caller, same reentrancy constraint revive()'s
+        own docstring explains.
+
+        On failure, re-adds model_name to `_failed_models` with NO
+        timestamp -- same as any other first-time load failure; the
+        write-path wrapper's own cooldown dict (`_revive_cooldown`) is
+        what actually prevents a retry storm against a genuinely-dead
+        local cache.
+        """
+        if self._model is not None and self._model_name == model_name:
+            return
+        if model_name in self._failed_models:
+            return
+        with self._lock:
+            if self._model is not None and self._model_name == model_name:
+                return
+            if model_name in self._failed_models:
+                return
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._model = SentenceTransformer(model_name, local_files_only=True)
+                self._model_name = model_name
+            except Exception as e:
+                import sys
+                print(
+                    f"[engram] revive(): local-cache-only reload of "
+                    f"'{model_name}' failed (no online fallback -- this "
+                    f"runs inside an open write transaction): {e}",
+                    file=sys.stderr,
+                )
+                self._model = None
+                self._model_name = None
+                self._failed_models.add(model_name)
+
+    def revive(self, model_name: str) -> bool:
+        """Drop a failed model and attempt to reload it, in-process only
+        (#345 PR3 B2).
+
+        Called by the write path at most once per failing write (and only
+        when no cooldown is active — see EMBED_REVIVE_COOLDOWN_S and
+        _compute_and_store_embedding_with_revive). NEVER touches the
+        surface daemon or any other process — Kepler's ruling (#345):
+        "it is a separate supervised process; the write path must not
+        reach across."
+
+        The cached model and model_name are cleared, and model_name is
+        removed from `_failed_models`, UNDER self._lock -- then
+        _load_model_local_only(model_name) is called OUTSIDE the lock.
+        This two-step shape (rather than holding self._lock across the
+        whole method) is deliberate and necessary: self._lock is a plain
+        threading.Lock (non-reentrant), and _load_model_local_only
+        acquires it again internally on the slow path -- calling it while
+        still holding the lock here would self-deadlock. Its own
+        double-checked-locking already gives the reload its correctness
+        guarantee.
+
+        Round 4 (M4, Kepler's ruling): reloads LOCAL-FILES-ONLY ONLY --
+        see _load_model_local_only's own docstring for why this must
+        never fall back to an online download. The in-write cost bound
+        is therefore ONE LOCAL model load (seconds, disk-bound -- NOT the
+        0.06-0.26s figure in _compute_and_store_embedding_with_revive's
+        docstring, which was a cached in-process reload measured on one
+        Mac seat and is not an upper bound for a genuine local-disk
+        load), at most once per EMBED_REVIVE_COOLDOWN_S, inside the
+        writer's open transaction.
+
+        Returns True if the model is now loaded and usable, False if the
+        reload failed (in which case _load_model_local_only's own except
+        block has already re-added model_name to `_failed_models`, with
+        no timestamp -- same as any other first-time load failure).
+        """
+        with self._lock:
+            if self._model_name == model_name:
+                self._model = None
+                self._model_name = None
+            self._failed_models.discard(model_name)
+        self._load_model_local_only(model_name)
+        return self._model is not None and self._model_name == model_name
 
     @staticmethod
     def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -5247,7 +5358,7 @@ def _compute_recall_set_continuity(conn: sqlite3.Connection, checkpoint_mode: st
 
 def _stamp_new_node(conn: sqlite3.Connection, node_id: str,
                      confidence: float = 0.5, surprise: float = 0.0,
-                     importance_base: float = None):
+                     importance_base: float = None) -> "EmbeddingOutcome":
     """Set importance and compute embedding on a freshly created node.
 
     By default, importance_base is derived from confidence/surprise via
@@ -5256,6 +5367,15 @@ def _stamp_new_node(conn: sqlite3.Connection, node_id: str,
     confidence/surprise are then ignored for the importance computation,
     which avoids computing a throwaway interim value the caller would
     otherwise immediately overwrite [alpha#2250].
+
+    #345 PR3 B1: RETURNS the EmbeddingOutcome (previously discarded) so
+    every node-creating tool impl can propagate a failed embed into its
+    own response (B4). Embedding is computed via
+    _compute_and_store_embedding_with_revive, not the bare
+    _compute_and_store_embedding -- the write path gets the B2/B3 in-write
+    revive + cooldown + flag behaviour; _reembed_nodes (the backfill/
+    restore path) still calls the bare function directly and is
+    unaffected by any of this.
     """
     base = (importance_base if importance_base is not None
             else _importance_base_for_node(confidence, surprise))
@@ -5265,8 +5385,8 @@ def _stamp_new_node(conn: sqlite3.Connection, node_id: str,
         "UPDATE nodes SET importance_base = ?, importance_score = ?, recall_turn = ? WHERE id = ?",
         (base, score, turn, node_id),
     )
-    # Compute and store embedding
-    _compute_and_store_embedding(conn, node_id)
+    # Compute and store embedding (#345 PR3: with in-write revive)
+    outcome = _compute_and_store_embedding_with_revive(conn, node_id)
     # Log creation event to edit_history
     row = conn.execute(
         "SELECT type, confidence FROM nodes WHERE id = ?", (node_id,)
@@ -5274,6 +5394,7 @@ def _stamp_new_node(conn: sqlite3.Connection, node_id: str,
     if row:
         _log_edit(conn, "created", node_id, row["type"],
                   {"confidence": row["confidence"]})
+    return outcome
 
 
 def _utility_reward(conn: sqlite3.Connection, node_ids: list[str], action: str) -> int:
@@ -5541,6 +5662,55 @@ def _count_missing_embeddings(conn: sqlite3.Connection) -> int:
     return sum(1 for nid in node_ids if _embedding_text_for_node(conn, nid))
 
 
+def _safe_count_missing_embeddings(conn: sqlite3.Connection) -> int:
+    """Non-throwing wrapper around _count_missing_embeddings, for the
+    WRITE PATH ONLY (#345 PR3 M1, Mira's BLOCKER on PR#3343's round-4
+    review + Kepler's clarification on the ruling).
+
+    _count_missing_embeddings re-runs _embedding_text_for_node over EVERY
+    node currently missing an embedding -- including the node THIS write
+    just failed on. When that node's own text-extraction bug is
+    PERSISTENT (not the one-shot fault TestK2StageContractCells'
+    parametrized "text" case exercises), _count_missing_embeddings
+    re-raises the very same exception while
+    _compute_and_store_embedding_with_revive is building the restore
+    flag's null_count -- so the flag/count path itself threw: no flag was
+    ever set, nothing was reported, and the exception escaped all the way
+    out of _stamp_new_node (Mira's reproduction: a single claim node with
+    _embedding_text_for_node patched to always raise).
+
+    Falls back to a plain SQL count of current nodes with a NULL
+    embedding when the precise scan raises -- that query touches no
+    per-node Python logic, so the same persistent fault cannot make it
+    raise too. Per Kepler's clarification, this still counts the
+    just-failed node as debt (it has a NULL embedding, so the raw SQL
+    COUNT includes it), the stage is already recorded on the
+    EmbeddingOutcome by _compute_and_store_embedding itself, and this
+    function never re-raises out of the write-path wrapper.
+
+    The fallback MAY OVER-count: it has no way to skip permanently-
+    unembeddable node types (e.g. an evidence node with no source_title),
+    which the precise scan's own _embedding_text_for_node call
+    deliberately excludes (see _count_missing_embeddings' own docstring).
+    An over-count is the safe direction here -- it can only make the
+    restore flag's null_count too HIGH, never silently hide real debt --
+    and the next sleep backfill's own fresh, precise
+    _count_missing_embeddings call (outside this write path) corrects it
+    either way.
+    """
+    try:
+        return _count_missing_embeddings(conn)
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "null-count scan raised while building the write-time restore "
+            "flag: %r -- falling back to a raw NULL-embedding SQL count "
+            "(may over-count permanently-unembeddable node types).", exc,
+        )
+        return conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE is_current=1 AND embedding IS NULL"
+        ).fetchone()[0]
+
+
 class EmbeddingOutcome(NamedTuple):
     """Return value of _compute_and_store_embedding (#3075 C2).
 
@@ -5562,11 +5732,63 @@ class EmbeddingOutcome(NamedTuple):
         function — never silent.
     node_id: the node this outcome describes.
     detail: exception type/message when status == "failed"; None otherwise.
+
+    #345 PR3 B1/B2: three further fields, all defaulted so every EXISTING
+    constructor call (this file, tests) is untouched. Populated ONLY by
+    _compute_and_store_embedding_with_revive (the write-path wrapper
+    _stamp_new_node calls) -- never by _compute_and_store_embedding itself,
+    which stays exactly as it was for every OTHER caller (_reembed_nodes /
+    the backfill tool / the sleep skill), per Kepler's "the write path
+    must not reach across" and this PR's own choice not to touch those
+    call sites:
+      - revive_attempted_at: UTC ISO timestamp of the in-write revive
+        attempt (None if the final status never needed one, i.e. the
+        first try already embedded).
+      - revive_result: "recovered" | "still-failing" | "cooldown" | None.
+      - next_revive_not_before: UTC ISO timestamp before which the next
+        revive attempt is refused, set whenever revive_result is
+        "still-failing" or "cooldown"; None otherwise.
+
+    Round 2 (R2): a `stage` field, set by _compute_and_store_embedding on
+    EVERY "failed" outcome (None for "skipped"/"embedded"), naming WHICH of
+    the three distinct failure points produced it:
+      - "embed": the embedder itself -- embed() raised, or returned an
+        empty/None vector despite is_available()/non-empty text. The ONLY
+        stage the write-path wrapper may revive, start a cooldown for, or
+        describe as "embedder down" -- the other two stages are not an
+        embedder-health signal at all.
+      - "text": _embedding_text_for_node raised (e.g. the original
+        TypeError-on-tuple-row_factory bug class) -- a bug in extracting
+        this node's embeddable text, unrelated to the embedder.
+      - "store": the nodes.embedding UPDATE itself raised (e.g. "database
+        is locked") -- the vector was computed fine; only persisting it
+        failed.
+    Any failure this function cannot attribute to one of the three stages
+    above (e.g. a config-read error ahead of all three) still gets a stage
+    -- defaulted to "embed", the closest-fit bucket, since the broad
+    except below was always the embedding pipeline's own catch-all and
+    this preserves its existing revive-and-flag behavior for genuinely
+    unanticipated exceptions rather than silently skipping it. Judgment
+    call -- flagged in the PR handoff.
     """
     status: str
     node_id: str
     detail: str | None = None
     vec_mirror_ok: bool = True
+    revive_attempted_at: str | None = None
+    revive_result: str | None = None
+    next_revive_not_before: str | None = None
+    stage: str | None = None
+
+
+# #345 PR3 B2 Rider 1 (Kepler's ruling): after an in-write revive still
+# fails, the model goes back into a cooldown so a burst of writes against a
+# genuinely-dead model pays one reload attempt, not one per node. 300s is a
+# judgment call within Kepler's stated range ("a few minutes is right —
+# long enough that a burst of writes pays once, short enough that a
+# transient recovers within a session"), matching this file's existing
+# constant-naming convention (_REGENERATION_LEASE_STALENESS_SECONDS).
+EMBED_REVIVE_COOLDOWN_S = 300
 
 
 def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "EmbeddingOutcome":
@@ -5588,12 +5810,41 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "Emb
         if not _embedder.is_available():
             return EmbeddingOutcome(status="skipped", node_id=node_id)
 
-        text = _embedding_text_for_node(conn, node_id)
+        # Stage "text" (#345 PR3 R2): a bug extracting this node's
+        # embeddable text (e.g. the original TypeError-on-tuple-
+        # row_factory bug class) is unrelated to the embedder's health --
+        # tagged separately so the write path never revives/cooldowns the
+        # embedder, or claims it is "down", for a text-extraction bug.
+        try:
+            text = _embedding_text_for_node(conn, node_id)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "embedding text extraction FAILED for node %s: %r — node "
+                "left without an embedding.",
+                node_id, exc,
+            )
+            return EmbeddingOutcome(
+                status="failed", node_id=node_id, detail=repr(exc), stage="text",
+            )
         if not text:
             return EmbeddingOutcome(status="skipped", node_id=node_id)
 
         model_name = emb_config.get("model", DEFAULT_EMBEDDING_MODEL)
-        vector = _embedder.embed(text, model_name)
+
+        # Stage "embed" (#345 PR3 R2): the only stage the write-path
+        # wrapper may revive, cooldown, or call "embedder down".
+        try:
+            vector = _embedder.embed(text, model_name)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "embedding computation FAILED for node %s: %r — node left "
+                "without an embedding (recall degraded for this node until "
+                "re-embedded).",
+                node_id, exc,
+            )
+            return EmbeddingOutcome(
+                status="failed", node_id=node_id, detail=repr(exc), stage="embed",
+            )
         if not vector:
             # The embedder reported itself available and the text was
             # non-empty, yet no vector came back (no exception raised) —
@@ -5608,13 +5859,26 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "Emb
             )
             return EmbeddingOutcome(
                 status="failed", node_id=node_id,
-                detail="embed() returned empty/None",
+                detail="embed() returned empty/None", stage="embed",
             )
 
-        conn.execute(
-            "UPDATE nodes SET embedding = ? WHERE id = ?",
-            (json.dumps(vector), node_id),
-        )
+        # Stage "store" (#345 PR3 R2): the vector computed fine; only
+        # persisting it failed (e.g. "database is locked") -- not an
+        # embedder-health signal, so no revive/cooldown either.
+        try:
+            conn.execute(
+                "UPDATE nodes SET embedding = ? WHERE id = ?",
+                (json.dumps(vector), node_id),
+            )
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "embedding STORE FAILED for node %s: %r — vector computed "
+                "but not persisted; node left without an embedding.",
+                node_id, exc,
+            )
+            return EmbeddingOutcome(
+                status="failed", node_id=node_id, detail=repr(exc), stage="store",
+            )
         vec_mirror_ok = True
         # Mirror into the vec KNN index. vec0 doesn't support UPSERT on
         # virtual tables, so delete-then-insert handles the rare re-embed.
@@ -5626,23 +5890,388 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "Emb
                     (node_id, _sqlite_vec.serialize_float32(vector)),
                 )
             except sqlite3.OperationalError:
-                # vec_nodes missing or locked — JSON still canonical. A
-                # TOLERATED degradation (#3075 C2 explicitly keeps this
-                # non-fatal), but now visible on the outcome instead of
-                # being silently swallowed.
+                # vec_nodes missing/locked -- the LONG-TOLERATED #3075
+                # contract (#3075 C2 explicitly keeps this non-fatal):
+                # SILENT degradation, no WARNING. Round 4 (M3, Mira's own
+                # regression on her round-3 R-S2 fix below): #3075's own
+                # minimal test fixtures have no vec_nodes table at all, so
+                # on any seat where sqlite-vec IS actually available this
+                # exact exception fires on EVERY write in those fixtures
+                # -- R-S2's single widened `except Exception` logged a
+                # WARNING here too, which turned two previously-green
+                # #3075 tests (test_enabled_false_is_ignored_still_embeds,
+                # test_all_succeed) red on such a seat. Kept separate from
+                # the branch below so this one specific, long-tolerated
+                # exception type stays exactly as quiet as it always was.
+                vec_mirror_ok = False
+            except Exception as exc:
+                # Any OTHER exception from this step (round 3, R-S2 --
+                # e.g. _sqlite_vec.serialize_float32 raising) — JSON still
+                # canonical either way. Still a TOLERATED degradation
+                # (#3075 C2), but now visible via a WARNING instead of
+                # being silently swallowed. Narrowed to only
+                # sqlite3.OperationalError before R-S2 — any OTHER
+                # exception type here fell through to the outer catch-all
+                # below, which defaults stage="embed" and wrongly implies
+                # the embedder (not the vec mirror) is unhealthy, even
+                # though both the embedder and the canonical
+                # nodes.embedding write already succeeded.
+                logging.getLogger(__name__).warning(
+                    "vec_nodes mirror write failed for node %s: %r -- the "
+                    "canonical nodes.embedding write succeeded; KNN index "
+                    "degraded for this node.", node_id, exc,
+                )
                 vec_mirror_ok = False
 
         return EmbeddingOutcome(
             status="embedded", node_id=node_id, vec_mirror_ok=vec_mirror_ok,
         )
     except Exception as exc:
+        # Anything NOT already attributed to "text"/"embed"/"store" above
+        # (e.g. a config-read error ahead of all three) -- defaulted to
+        # "embed", the closest-fit bucket; see EmbeddingOutcome's docstring.
         logging.getLogger(__name__).warning(
             "embedding computation FAILED for node %s: %r — node left "
             "without an embedding (recall degraded for this node until "
             "re-embedded).",
             node_id, exc,
         )
-        return EmbeddingOutcome(status="failed", node_id=node_id, detail=repr(exc))
+        return EmbeddingOutcome(
+            status="failed", node_id=node_id, detail=repr(exc), stage="embed",
+        )
+
+
+def _maybe_clear_write_embed_failed_flag(conn: sqlite3.Connection) -> None:
+    """Rider 3 (#345 PR3 B3, Kepler's ruling): react to a lingering
+    `write-embed-failed` restore flag the moment SOME write embeds
+    successfully (normally, or after a recovered in-write revive) --
+    not only at the next sleep backfill ("a flag that says 'embedder
+    down' for hours after it came back is the surface lying in the other
+    direction").
+
+    Called by _compute_and_store_embedding_with_revive on EVERY outcome
+    whose final status is "embedded" (never "skipped" — a skip is not a
+    recovery).
+
+    Round 4 (M2, Kepler's ruling, seq 6540): a recovered write RECOUNTS
+    rather than unconditionally clearing -- Mira's finding (round-4
+    review on #3343) was that the embedder recovering proves only that
+    the EMBEDDER is healthy again, not that every OTHER node is now
+    embedded; the old unconditional clear made both hooks report
+    all-clear (not_fully_restored=False, null_count=0) while a different,
+    still-NULL node's debt silently disappeared from both readers until
+    the next sleep scan happened to notice. The recount
+    (_safe_count_missing_embeddings -- M1's non-throwing wrapper, used
+    here too since this call sits on the same write path M1 was fixing)
+    runs inside the caller's still-open transaction, same respect_lease/
+    commit=False contract as before:
+      - n == 0: every node is genuinely embedded now -- clear the row
+        (unchanged from before this round).
+      - n > 0: real per-node debt remains elsewhere -- REWRITE the row
+        (not clear it) with null_count=n and cause
+        "per-node-failures (write-embed-failed recovered at <T>)", so
+        #3075's OWN backfill owns that debt from here on, and the write
+        path stops claiming "embedder down" for a condition the embedder
+        itself no longer has. Both hooks' readers (_check_embedding_
+        restore_flag in engram-surface-hook.py and engram-session-start-
+        hook.py) already report "NOT FULLY RESTORED" for any cause that
+        doesn't start with "detection-failed" -- no hook change needed.
+
+    NEVER acts on any OTHER cause (per-node-failures / embedder-unavailable
+    / detection-failed / regeneration-* / the legacy disabled-by-config
+    value) -- those belong to the restore pathway (#3075) and are cleared
+    only by its own backfill, never by this write-time path. The
+    startswith check (rather than equality) tolerates the cause string's
+    trailing "revive <T> -> <R>; next revive not before <N>" suffix, which
+    varies per write.
+
+    Round 3 (R-S1): this clear/rewrite assumes one LIVE MCP server
+    process per knowledge.db at a time -- a process restart (the flag
+    persisting across the restart, then a later process's write clearing
+    it) is the intended case this exists for. Two concurrent live
+    processes against the same knowledge.db, each with its own
+    EmbeddingManager singleton, are NOT covered: one process's lucky
+    successful write could react to a
+    flag that still accurately describes a DIFFERENT process's ongoing
+    failure.
+    """
+    flag = _get_embedding_restore_flag(conn)
+    cause = flag.get("cause") or ""
+    if not cause.startswith("write-embed-failed"):
+        return
+    n = _safe_count_missing_embeddings(conn)
+    if n == 0:
+        _clear_embedding_restore_flag(conn, respect_lease=True, commit=False)
+        return
+    _set_embedding_restore_flag(
+        conn,
+        null_count=n,
+        cause=f"per-node-failures (write-embed-failed recovered at {_now()})",
+        respect_lease=True,
+        commit=False,
+    )
+
+
+def _compute_and_store_embedding_with_revive(
+    conn: sqlite3.Connection, node_id: str,
+) -> "EmbeddingOutcome":
+    """Write-path wrapper around _compute_and_store_embedding (#345 PR3
+    B1-B3, per Kepler's binding ruling on issue #345).
+
+    ONLY called from _stamp_new_node -- i.e. only on the write path. Every
+    OTHER caller of _compute_and_store_embedding (_reembed_nodes, and
+    therefore _reembed_all_nodes / _reembed_null_nodes / the backfill tool
+    / the sleep skill's restore pass) is UNTOUCHED: this function wraps
+    _compute_and_store_embedding rather than modifying it in place, so the
+    revive/cooldown/flag-clear behaviour below applies only to node
+    creation, never to a bulk restore pass (explicitly out of scope per
+    the spec's DO NOT list: "change the backfill tool or the sleep
+    skill").
+
+    On a "failed" outcome whose stage is "embed" (R2), with no cooldown
+    active for this model: calls EmbeddingManager.revive() once (drop +
+    reload, in-process only, never touching the surface daemon), then
+    retries the embed for this node ONCE in the same write (B2). If the
+    retry embeds, the model's cooldown is cleared and any lingering
+    `write-embed-failed` flag is cleared too (Rider 3). If the retry still
+    fails, the model enters a cooldown (Rider 1: EMBED_REVIVE_COOLDOWN_S)
+    and the restore flag is set with `respect_lease=True` (B3).
+
+    On a "failed" outcome whose stage is "text" or "store" (R2): no
+    revive, no cooldown -- the embedder itself is not implicated (the
+    vector was computed correctly for "store"; text extraction is an
+    unrelated bug for "text"). The flag is still set (`respect_lease=
+    True`), with a cause naming the stage and detail directly, and
+    revive_attempted_at/revive_result/next_revive_not_before all stay at
+    their None defaults -- there was never a revive attempt to record.
+
+    On a "failed" outcome DURING an active cooldown: no revive is
+    attempted; revive_result is "cooldown" and next_revive_not_before
+    echoes the existing cooldown deadline (Rider 1).
+
+    On a first-try "embedded" outcome (the overwhelming common case, no
+    revive ever attempted): still checks-and-maybe-clears a lingering
+    `write-embed-failed` flag (Rider 3 applies to EVERY successful write,
+    not only revived ones).
+
+    "skipped" passes through unchanged -- no revive, no flag read/write
+    (B4: skipped adds nothing to a tool's response, and Rider 3 is scoped
+    to "embedded" outcomes only).
+
+    Round 2 (R4): the revive above runs INSIDE the caller's open SQLite
+    write transaction (_stamp_new_node has already executed its importance
+    UPDATE on `conn` before calling this function, and does not commit
+    until after it returns) -- an in-process model reload therefore holds
+    that transaction open for its own duration.
+
+    Round 4 (M4, Kepler's ruling seq 6544): the in-write cost bound is ONE
+    LOCAL model load (seconds, disk-bound -- a genuine cold read off the
+    local HuggingFace cache, NOT a cached in-process reload), at most
+    once per EMBED_REVIVE_COOLDOWN_S (300s) per model, inside the writer
+    lock. The earlier figure measured here (2026-10-03, one Mac seat,
+    cached all-MiniLM-L6-v2, sentence-transformers already imported as it
+    is in a running server: 0.06-0.26s per reload) was a cached
+    in-process reload, not a disk-bound cache load, and is NOT an upper
+    bound for this cost -- see EmbeddingManager.revive() and
+    _load_model_local_only's own docstrings for why the write path never
+    falls back to an online download (which WOULD be unbounded) for this
+    specific call.
+
+    Round 3 (R-B1, BLOCKER on reviewer comment 5972004666): every
+    `_set_embedding_restore_flag` call reached from this function (and
+    `_maybe_clear_write_embed_failed_flag`'s own `_clear_embedding_
+    restore_flag` call) passes `commit=False` -- those two helpers
+    predate this PR and always committed unconditionally, which is
+    correct for their ORIGINAL callers (each owns its own isolated
+    transaction) but was never safe once THIS function started calling
+    them from inside `_stamp_new_node`'s caller's own open write
+    transaction: an unconditional commit there would durably commit the
+    caller's ENTIRE pending transaction early, not just the flag row,
+    breaking the atomic-create contract several call sites document (e.g.
+    engram_trust.py's "Atomic create" comment). `commit=False` here, the
+    default `commit=True` everywhere else, so every pre-existing caller
+    of either helper is unchanged. CLASS SWEEP (every function reachable
+    from this wrapper, confirmed to neither commit nor roll back `conn`):
+    _compute_and_store_embedding (and its own _embedding_text_for_node /
+    `_embedder`.is_available/_load_model/embed calls -- none touch `conn`
+    at all), _maybe_clear_write_embed_failed_flag,
+    _get_embedding_restore_flag, _ensure_embedding_restore_state_table,
+    _count_missing_embeddings, _get_embedding_config,
+    `_embedder`.revive/._revive_cooldown (no `conn` access whatsoever).
+    _set_embedding_restore_flag / _clear_embedding_restore_flag
+    themselves no longer commit when called with `commit=False`, as
+    above. The ONLY two functions that ever called conn.commit() on this
+    path were those two helpers -- now gated by this kwarg.
+    """
+    outcome = _compute_and_store_embedding(conn, node_id)
+
+    if outcome.status == "skipped":
+        return outcome
+
+    if outcome.status == "embedded":
+        _maybe_clear_write_embed_failed_flag(conn)
+        return outcome
+
+    # outcome.status == "failed" from here on.
+
+    # #345 PR3 round 2 (R2): only an "embed"-stage failure is an
+    # embedder-health signal. A "text" or "store" stage failure means the
+    # embedder itself is fine -- the vector was computed correctly -- so
+    # no revive is attempted, no cooldown is started, and the flag/message
+    # built below must not claim the embedder is down.
+    if outcome.stage != "embed":
+        _set_embedding_restore_flag(
+            conn,
+            null_count=_safe_count_missing_embeddings(conn),
+            cause=f"write-embed-failed: {outcome.stage} error: {outcome.detail}",
+            respect_lease=True,
+            commit=False,
+        )
+        return outcome
+
+    model_name = _get_embedding_config().get("model", DEFAULT_EMBEDDING_MODEL)
+
+    # #345 PR3 round 2 (R3): production code does not branch on whether
+    # `_embedder` is the real EmbeddingManager or a test double -- any
+    # caller-substituted double (tests that replace the whole `_embedder`
+    # singleton) must carry a real `_revive_cooldown` dict and a `revive()`
+    # method, same as the production class. See test_strip_agent_facing_
+    # fields.py / test_action_hints.py / test_polarity_nli.py's doubles.
+    cooldown_started = _embedder._revive_cooldown.get(model_name)
+    now_dt = datetime.now(timezone.utc)
+
+    if cooldown_started:
+        not_before_dt = (
+            datetime.fromisoformat(cooldown_started)
+            + timedelta(seconds=EMBED_REVIVE_COOLDOWN_S)
+        )
+        if now_dt < not_before_dt:
+            final_outcome = outcome._replace(
+                revive_attempted_at=cooldown_started,
+                revive_result="cooldown",
+                next_revive_not_before=not_before_dt.isoformat(),
+            )
+            _set_embedding_restore_flag(
+                conn,
+                null_count=_safe_count_missing_embeddings(conn),
+                cause=(
+                    f"write-embed-failed: revive {final_outcome.revive_attempted_at} "
+                    f"-> {final_outcome.revive_result}; next revive not before "
+                    f"{final_outcome.next_revive_not_before}"
+                ),
+                respect_lease=True,
+                commit=False,
+            )
+            return final_outcome
+        # Cooldown expired on wall-clock time alone -- fall through to a
+        # fresh revive attempt below, same as a never-cooled-down model.
+
+    # No active cooldown: attempt one in-process revive, then retry the
+    # embed for this node ONCE in the same write (B2).
+    revive_attempted_at = _now()
+    _embedder.revive(model_name)
+    retry_outcome = _compute_and_store_embedding(conn, node_id)
+
+    if retry_outcome.status == "embedded":
+        _embedder._revive_cooldown.pop(model_name, None)
+        final_outcome = retry_outcome._replace(
+            revive_attempted_at=revive_attempted_at,
+            revive_result="recovered",
+        )
+        _maybe_clear_write_embed_failed_flag(conn)
+        return final_outcome
+
+    # Still failing (retry_outcome.status in {"failed", "skipped"} -- a
+    # skip here would mean the embedder became unavailable mid-revive,
+    # itself an unexpected state; treated the same as "failed" for the
+    # write-path contract, since the node still needs flagging either way).
+    _embedder._revive_cooldown[model_name] = revive_attempted_at
+    next_revive_not_before = (
+        datetime.now(timezone.utc) + timedelta(seconds=EMBED_REVIVE_COOLDOWN_S)
+    ).isoformat()
+    final_outcome = retry_outcome._replace(
+        status="failed",
+        revive_attempted_at=revive_attempted_at,
+        revive_result="still-failing",
+        next_revive_not_before=next_revive_not_before,
+    )
+    _set_embedding_restore_flag(
+        conn,
+        null_count=_safe_count_missing_embeddings(conn),
+        cause=(
+            f"write-embed-failed: revive {revive_attempted_at} -> "
+            f"still-failing; next revive not before {next_revive_not_before}"
+        ),
+        respect_lease=True,
+        commit=False,
+    )
+    return final_outcome
+
+
+def _embedding_response_block(outcome: "EmbeddingOutcome") -> dict | None:
+    """Build the B4 'embedding_failure' response block for a tool's return
+    value (#345 PR3 B4, per Kepler's binding ruling).
+
+    Round 3 (K1): the key is `embedding_failure`, not `embedding` --
+    `_strip_agent_facing` removes every key named `embedding` from every
+    tool response (`_AGENT_STRIP_KEYS`), so a block returned under that
+    name would never reach the agent.
+
+    Round 2 (R1): the outer key every caller assigns this block to is named
+    `embedding_failure`, not `embedding` -- `_AGENT_STRIP_KEYS` strips any
+    key literally named "embedding" from every @mcp.tool response (it
+    exists to drop a node's raw vector payload), which silently discarded
+    this block wherever a call site also ran `_strip_agent_facing` on its
+    result (found in round 1: `engram_add_observation_batch` lost the block
+    entirely via its own recursive strip over `results`). Renaming the key
+    sidesteps the collision outright; the strip-then-add workarounds at the
+    two affected call sites are no longer needed.
+
+    Returns None for "skipped" and "embedded" outcomes (B4: "skipped and
+    embedded add nothing to the response (no new keys, no message)") --
+    callers treat None as "add nothing."
+
+    For a "failed" outcome (status still failed after B1/B2's in-write
+    revive attempt), returns a dict with the 5 fields B4 specifies plus a
+    "message" key carrying the one-line loud report. The message key lives
+    INSIDE this block rather than as a new top-level "message" key on the
+    tool's response -- several tool impls (e.g. _ask_impl) already use a
+    top-level "message" key for their own unrelated success text, and B4
+    does not say where the message goes; nesting it here avoids clobbering
+    those existing keys. Documented as a judgment call in the PR handoff.
+
+    Rider 2 (Kepler's ruling): the message must name the operator's own
+    revive -- reconnect the MCP server (/mcp) so the model reloads, and
+    check the model cache if that still doesn't help. Round 2 (R2): this
+    only applies to a "embed"-stage failure -- the embedder is the thing
+    down. A "text"/"store"-stage failure never claims the embedder is
+    down (it isn't); the message instead names the actual stage and
+    detail, with no /mcp mention, since reconnecting the MCP server would
+    not fix a text-extraction bug or a locked database.
+    """
+    if outcome.status != "failed":
+        return None
+    if outcome.stage == "embed":
+        message = (
+            f"embedder down (revive attempted at {outcome.revive_attempted_at}, "
+            f"result: {outcome.revive_result}); node stored unembedded, "
+            f"backfill at next sleep. To revive: reconnect the MCP server "
+            f"(/mcp) so the model reloads; if that doesn't help, check the "
+            f"model cache."
+        )
+    else:
+        message = (
+            f"embedding not stored ({outcome.stage} error: {outcome.detail}); "
+            f"node stored unembedded, backfill at next sleep."
+        )
+    return {
+        "status": outcome.status,
+        "detail": outcome.detail,
+        "revive_attempted_at": outcome.revive_attempted_at,
+        "revive_result": outcome.revive_result,
+        "next_revive_not_before": outcome.next_revive_not_before,
+        "message": message,
+    }
 
 
 def _reembed_nodes(conn: sqlite3.Connection, node_ids: list[str], caller_name: str) -> dict:
@@ -5779,7 +6408,7 @@ def _ensure_embedding_restore_state_table(conn: sqlite3.Connection) -> None:
 
 def _set_embedding_restore_flag(
     conn: sqlite3.Connection, *, null_count: int, cause: str,
-    respect_lease: bool = False,
+    respect_lease: bool = False, commit: bool = True,
 ) -> bool:
     """Persist the "DB not fully restored" flag (#3075 C5 round 2).
 
@@ -5826,7 +6455,16 @@ def _set_embedding_restore_flag(
     exactly).
 
     Commits immediately — this is a small, standalone bookkeeping write,
-    not part of the caller's own larger transaction.
+    not part of the caller's own larger transaction. UNLESS `commit=False`
+    (round 3, R-B1): the write-path wrapper
+    (`_compute_and_store_embedding_with_revive`) calls this function from
+    INSIDE `_stamp_new_node`'s caller's own open write transaction, where
+    an unconditional commit would durably commit the caller's ENTIRE
+    pending transaction early, not just this flag row. `commit=False`
+    defers to the caller's own `conn.commit()`/`conn.rollback()`; the
+    default `commit=True` preserves every PRE-EXISTING caller (the
+    detection site, the lease finalize write, the manual regen script)
+    exactly as before.
     """
     _ensure_embedding_restore_state_table(conn)
     if respect_lease:
@@ -5842,7 +6480,8 @@ def _set_embedding_restore_flag(
             "   OR embedding_restore_state.updated_at < ?",
             (null_count, cause, _now(), _cutoff),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
         return cur.rowcount > 0
     conn.execute(
         "INSERT INTO embedding_restore_state "
@@ -5853,12 +6492,13 @@ def _set_embedding_restore_flag(
         "cause=excluded.cause, updated_at=excluded.updated_at",
         (null_count, cause, _now()),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return True
 
 
 def _clear_embedding_restore_flag(
-    conn: sqlite3.Connection, *, respect_lease: bool = False,
+    conn: sqlite3.Connection, *, respect_lease: bool = False, commit: bool = True,
 ) -> bool:
     """Clear the restore-completeness flag (#3075 C5 round 2) — called after
     a fully-successful regeneration (every NULL-embedding node now has an
@@ -5875,6 +6515,13 @@ def _clear_embedding_restore_flag(
     `_set_embedding_restore_flag`'s own `respect_lease` parameter; see
     that function's docstring for the full rationale, not duplicated
     here.
+
+    Round 3 (R-B1): `commit=False` — same reasoning, same caller
+    obligation (the write-path's `_maybe_clear_write_embed_failed_flag`
+    passes it), same default-True-preserves-every-existing-caller
+    contract as `_set_embedding_restore_flag`'s own `commit` parameter;
+    see that function's docstring for the full rationale, not duplicated
+    here.
     """
     _ensure_embedding_restore_state_table(conn)
     if respect_lease:
@@ -5889,7 +6536,8 @@ def _clear_embedding_restore_flag(
             "   OR embedding_restore_state.updated_at < ?",
             (_now(), _cutoff),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
         return cur.rowcount > 0
     conn.execute(
         "INSERT INTO embedding_restore_state "
@@ -5899,7 +6547,8 @@ def _clear_embedding_restore_flag(
         "not_fully_restored=0, null_count=0, cause=NULL, updated_at=excluded.updated_at",
         (_now(),),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return True
 
 
@@ -10289,7 +10938,7 @@ def _create_derivation(
                 except sqlite3.IntegrityError:
                     pass
 
-    _stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
+    _emb_outcome = _stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
 
     bumped_count = 0
     if supporting_ids:
@@ -10299,6 +10948,12 @@ def _create_derivation(
         "node_id": node_id,
         "confidence": confidence,
         "reasoning_type": reasoning_type,
+        # #345 PR3 B1/B4 (R1: key renamed "embedding" -> "embedding_failure"
+        # to avoid _AGENT_STRIP_KEYS collision -- see _embedding_response_
+        # block's docstring): the caller (_derive_impl) merges this into its
+        # own response's "embedding_failure" key only when non-None
+        # (_embedding_response_block returns None for "skipped"/"embedded").
+        "embedding_failure": _embedding_response_block(_emb_outcome),
         "reasoning_class": rclass,
         # "stale_ids" is DELIBERATELY ABSENT (#2324). It used to carry the
         # premises a use_stale=True override let through; with stale now a

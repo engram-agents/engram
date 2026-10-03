@@ -977,7 +977,7 @@ def _add_evidence_impl(
              source_type),
         )
 
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
         conn.commit()
 
         # Durability dual read-back (alpha#2193; supersedes the single
@@ -1001,6 +1001,9 @@ def _add_evidence_impl(
             "source_date": source_date or None,
             "in_trust_pool": in_trust_pool,
         }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            result["embedding_failure"] = _emb_block  # R1: renamed key
         if trust_pool and not in_trust_pool:
             result["warning"] = (
                 f"Domain '{domain}' is NOT in the trusted source pool. "
@@ -1602,7 +1605,7 @@ def _add_observation_impl(
         )
 
         # Stamp importance
-        core._stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
 
         result = {
             "status": "created",
@@ -1685,7 +1688,7 @@ def _add_observation_impl(
 
             result["prediction_id"] = prediction_id
 
-        core._stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
 
         # Attach similarity results with decision guidance.
         #
@@ -1954,7 +1957,15 @@ def _add_observation_impl(
                 )
             except Exception:
                 pass
-        return json.dumps(core._strip_agent_facing(result))
+        # #345 PR3 B4: R1 (round 2) renamed this block's key to
+        # "embedding_failure", which never collides with _AGENT_STRIP_KEYS'
+        # literal "embedding" entry (the raw vector payload strip) -- the
+        # earlier strip-then-add ordering workaround is no longer needed.
+        _stripped = core._strip_agent_facing(result)
+        _emb_block = core._embedding_response_block(_emb_outcome)
+        if _emb_block:
+            _stripped["embedding_failure"] = _emb_block
+        return json.dumps(_stripped)
     finally:
         conn.close()
 

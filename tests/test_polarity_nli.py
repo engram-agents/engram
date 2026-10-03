@@ -51,6 +51,13 @@ def fresh_server(*, polarity_enabled: bool, nli_score: float | None = None):
     # silently bypass the stub (review-caught on PR #894 round 1).
     class _StubEmb:
         def is_available(self_): return True
+        # #345 PR3 R3: a double substituting the whole _embedder singleton
+        # must carry the same _revive_cooldown dict + revive() method as
+        # the real EmbeddingManager -- production code no longer
+        # hasattr-guards around a double lacking them.
+        def __init__(self_):
+            self_._revive_cooldown = {}
+        def revive(self_, model_name): pass
     server._embedder = _StubEmb()
     engram_core._embedder = server._embedder
     engram_core._get_embedding_config = lambda: {"enabled": True}

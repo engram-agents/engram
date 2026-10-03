@@ -167,7 +167,7 @@ def _add_goal_impl(
         # _stamp_new_node writes the anchor in one pass instead of computing
         # an interim value from confidence/surprise and then overwriting it
         # [alpha#2266, alpha#2268].
-        core._stamp_new_node(conn, node_id, importance_base=2.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=2.0)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
@@ -208,13 +208,17 @@ def _add_goal_impl(
                 ),
             })
 
-        return json.dumps({
+        _result = {
             "status": "created",
             "goal_id": node_id,
             "claim": claim,
             "motivation": motivation,
             "context_nodes": context,
-        })
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        return json.dumps(_result)
     finally:
         conn.close()
 
@@ -340,7 +344,7 @@ def _add_task_impl(
         # Pass importance_base directly so _stamp_new_node writes the anchor
         # in one pass instead of computing an interim value from
         # confidence/surprise and then overwriting it [alpha#2266, alpha#2268].
-        core._stamp_new_node(conn, node_id, importance_base=TASK_IMPORTANCE["planned"])
+        _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=TASK_IMPORTANCE["planned"])
 
         # Citation USE-bumps (alpha #177 area 4, Lei 2026-05-19 tier-2):
         # implements_ids (cites edges) and goal_id (serves edge) are
@@ -420,6 +424,9 @@ def _add_task_impl(
         if non_current_parent_task_id:
             result["non_current_parent_task_id"] = non_current_parent_task_id
 
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            result["embedding_failure"] = _emb_block  # R1: renamed key
         return json.dumps(result)
     finally:
         conn.close()
@@ -757,7 +764,7 @@ def _report_feeling_impl(
         # importance_base directly so _stamp_new_node writes the anchor in
         # one pass instead of computing an interim value from
         # confidence/surprise and then overwriting it [alpha#2266, alpha#2268].
-        core._stamp_new_node(conn, node_id, importance_base=2.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=2.0)
 
         conn.commit()
 
@@ -797,7 +804,7 @@ def _report_feeling_impl(
                 ),
             })
 
-        return json.dumps({
+        _result = {
             "status": "created",
             "feeling_id": node_id,
             "claim": formatted_claim,
@@ -807,7 +814,11 @@ def _report_feeling_impl(
             "intensity_hint": intensity_value,
             "context_nodes": cited_ids,
             "context_fingerprint": fingerprint,
-        })
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        return json.dumps(_result)
     finally:
         conn.close()
 

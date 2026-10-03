@@ -416,6 +416,8 @@ def _derive_impl(
             result["built_on_contested"] = success["contested_ids"]
         if independence_advisory:
             result["independence_advisory"] = independence_advisory
+        if success.get("embedding_failure"):  # #345 PR3 B4 (R1: renamed key)
+            result["embedding_failure"] = success["embedding_failure"]
 
         # --- engram.tool.engram_call event — success path (DESIGN.md §4.2) ---
         # alpha #2574 WS5: see the blocked-path site above for the full
@@ -565,7 +567,7 @@ def _contradict_impl(
             (node_id, node_id_b, now),
         )
 
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=1.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, confidence=0.5, surprise=1.0)
         core._utility_reward(conn, [node_id_a, node_id_b], action="contradict")
         conn.commit()
 
@@ -648,18 +650,20 @@ def _contradict_impl(
             except Exception:
                 pass
 
-        return json.dumps(
-            {
-                "status": "created",
-                "contradiction_id": node_id,
-                "conflicts": {
-                    "node_a": {"id": node_id_a, "claim": node_a["claim"]},
-                    "node_b": {"id": node_id_b, "claim": node_b["claim"]},
-                },
-                "description": description,
-                "root_cause": root_cause or "Not analyzed yet",
-            }
-        )
+        _result = {
+            "status": "created",
+            "contradiction_id": node_id,
+            "conflicts": {
+                "node_a": {"id": node_id_a, "claim": node_a["claim"]},
+                "node_b": {"id": node_id_b, "claim": node_b["claim"]},
+            },
+            "description": description,
+            "root_cause": root_cause or "Not analyzed yet",
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        return json.dumps(_result)
     finally:
         conn.close()
 
@@ -739,7 +743,7 @@ def _ask_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.5)
+        _emb_outcome = core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.5)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
@@ -791,6 +795,12 @@ def _ask_impl(
             result["category"] = category
         if lacks:
             result["lacks"] = lacks
+        # #345 PR3 B4: the message key here lives INSIDE this block, not
+        # merged at top level -- this tool already uses a top-level
+        # "message" key for its own unrelated success text (see above).
+        _emb_block = core._embedding_response_block(_emb_outcome)
+        if _emb_block:
+            result["embedding_failure"] = _emb_block  # R1: renamed key
         return json.dumps(result)
     finally:
         conn.close()

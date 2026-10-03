@@ -221,7 +221,7 @@ def _add_cornerstone_impl(
         # _stamp_new_node writes the anchor in one pass instead of computing
         # an interim value from confidence=0.5 and then overwriting it
         # [alpha#2250].
-        core._stamp_new_node(conn, node_id, importance_base=2.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=2.0)
         if linked:
             core._utility_reward(conn, linked, action="citation")
         conn.commit()
@@ -274,6 +274,9 @@ def _add_cornerstone_impl(
             result["non_current_supporting_ids"] = non_current
         if generalizing_parents:
             result["generalized_by"] = generalizing_parents
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            result["embedding_failure"] = _emb_block  # R1: renamed key
         return json.dumps(result)
     finally:
         conn.close()
@@ -519,7 +522,7 @@ def _outgrow_cornerstone_impl(
         # _stamp_new_node writes the anchor in one pass instead of computing
         # an interim value from confidence=0.5 and then overwriting it
         # [alpha#2250].
-        core._stamp_new_node(conn, new_id, importance_base=2.0)
+        _emb_outcome = core._stamp_new_node(conn, new_id, importance_base=2.0)
 
         core._log_edit(conn, "superseded", old_cornerstone_id, "cornerstone",
                   {"replaced_by": new_id, "via": "engram_outgrow_cornerstone",
@@ -566,7 +569,7 @@ def _outgrow_cornerstone_impl(
                 ),
             })
 
-        return json.dumps({
+        _result = {
             "status": "outgrown",
             "old_cornerstone_id": old_cornerstone_id,
             "new_cornerstone_id": new_id,
@@ -584,7 +587,11 @@ def _outgrow_cornerstone_impl(
             **({"non_current_supporting_ids": non_current_supports} if non_current_supports else {}),
             **({"non_current_about_ids": non_current_about_ids} if non_current_about_ids else {}),
             **({"missing_about_ids": missing_about_ids} if missing_about_ids else {}),
-        })
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        return json.dumps(_result)
     finally:
         conn.close()
 

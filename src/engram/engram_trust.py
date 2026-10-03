@@ -243,7 +243,7 @@ def _add_person_impl(
         # inflation. Pass importance_base directly so _stamp_new_node writes
         # the anchor in one pass instead of computing an interim value from
         # confidence/surprise and then overwriting it [alpha#2266, alpha#2268].
-        core._stamp_new_node(conn, node_id, importance_base=2.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=2.0)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
@@ -297,6 +297,9 @@ def _add_person_impl(
                 "'role' is deprecated — use 'relation' instead. "
                 "Value accepted and stored as 'relation'."
             )
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            result["embedding_failure"] = _emb_block  # R1: renamed key
         return json.dumps(result)
     finally:
         conn.close()
@@ -1163,7 +1166,7 @@ def _add_trust_signal_impl(
             (ts_id, source_obs_id, now),
         )
 
-        core._stamp_new_node(conn, ts_id, confidence=0.0, surprise=0.0)
+        _emb_outcome = core._stamp_new_node(conn, ts_id, confidence=0.0, surprise=0.0)
         core._log_edit(conn, "created", ts_id, "trust_signal", {
             "subject_pn": subject_pn,
             "source_obs_id": source_obs_id,
@@ -1209,7 +1212,11 @@ def _add_trust_signal_impl(
                 ),
             })
 
-        return json.dumps({"status": "created", "trust_signal_id": ts_id})
+        _result = {"status": "created", "trust_signal_id": ts_id}
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        return json.dumps(_result)
     except Exception:
         conn.rollback()
         raise

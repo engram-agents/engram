@@ -223,7 +223,7 @@ def _add_axiom_impl(
         # _stamp_new_node writes the anchor in one pass instead of computing
         # an interim value from confidence/surprise and then overwriting it
         # [alpha#2266, alpha#2268].
-        core._stamp_new_node(conn, node_id, importance_base=2.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=2.0)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
@@ -264,13 +264,17 @@ def _add_axiom_impl(
                 ),
             })
 
-        return json.dumps({
+        _result = {
             "status": "created",
             "axiom_id": node_id,
             "claim": claim,
             "confidence": 1.0,
             "context_nodes": context,
-        })
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        return json.dumps(_result)
     finally:
         conn.close()
 
@@ -356,7 +360,7 @@ def _add_definition_impl(
         # _stamp_new_node writes the anchor in one pass instead of computing
         # an interim value from confidence/surprise and then overwriting it
         # [alpha#2266, alpha#2268].
-        core._stamp_new_node(conn, node_id, importance_base=2.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=2.0)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
@@ -397,13 +401,17 @@ def _add_definition_impl(
                 ),
             })
 
-        return json.dumps({
+        _result = {
             "status": "created",
             "definition_id": node_id,
             "term": term,
             "definition": definition,
             "context_nodes": context,
-        })
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        return json.dumps(_result)
     finally:
         conn.close()
 
@@ -507,7 +515,7 @@ def _add_conjecture_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        core._stamp_new_node(conn, node_id, confidence=conf, surprise=0.5)
+        _emb_outcome = core._stamp_new_node(conn, node_id, confidence=conf, surprise=0.5)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
@@ -520,13 +528,17 @@ def _add_conjecture_impl(
             return json.dumps(core.durability_failure_response(
                 _verdict, _durability, "conjecture_id", node_id, "#2097"))
 
-        return json.dumps({
+        _result = {
             "status": "created",
             "conjecture_id": node_id,
             "claim": claim,
             "confidence": conf,
             "context_nodes": context,
-        })
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        return json.dumps(_result)
     finally:
         conn.close()
 
@@ -850,7 +862,7 @@ def _goal_tension_impl(
             (node_id, goal_id_b, now),
         )
 
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=1.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, confidence=0.5, surprise=1.0)
         conn.commit()
 
         # Durability dual read-back (alpha#2193; supersedes the single
@@ -894,7 +906,7 @@ def _goal_tension_impl(
         except Exception:
             pass  # best-effort
 
-        return json.dumps({
+        _result = {
             "status": "created",
             "tension_id": node_id,
             "goals": {
@@ -903,7 +915,11 @@ def _goal_tension_impl(
             },
             "description": description,
             "analysis": analysis or "Not analyzed yet",
-        })
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        return json.dumps(_result)
     finally:
         conn.close()
 
@@ -1269,7 +1285,7 @@ def _add_lesson_impl(
         # so _stamp_new_node writes the anchor in one pass instead of
         # computing an interim value from confidence/surprise and then
         # overwriting it [alpha#2266, alpha#2268].
-        core._stamp_new_node(conn, node_id, importance_base=2.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=2.0)
         conn.commit()
 
         # Durability dual read-back (alpha#2193; supersedes the single
@@ -1335,7 +1351,17 @@ def _add_lesson_impl(
                 "More incidents = more matching surface area."
             )
 
-        return json.dumps(core._strip_agent_facing(result))
+        # #345 PR3 B4: _strip_agent_facing globally removes any key LITERALLY
+        # named "embedding" (it exists to drop a node's raw vector payload
+        # elsewhere in the codebase -- see _AGENT_STRIP_KEYS). R1 (round 2):
+        # the B4 block's key is now "embedding_failure", which never
+        # collides with that strip list, so the earlier strip-then-add
+        # ordering workaround is no longer needed -- order doesn't matter.
+        _stripped = core._strip_agent_facing(result)
+        _emb_block = core._embedding_response_block(_emb_outcome)
+        if _emb_block:
+            _stripped["embedding_failure"] = _emb_block
+        return json.dumps(_stripped)
     finally:
         conn.close()
 
