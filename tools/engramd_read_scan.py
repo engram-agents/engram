@@ -27,6 +27,8 @@ Outcome per reached site (R10)
   INSERT/UPDATE/DELETE/REPLACE/DDL/transaction verbs,
     and any PRAGMA with ``=`` or an argument list      -> write_sites
   a site named by an ``exclusions`` entry              -> declared_out_of_scope
+    (a function-form entry also pins the EXACT number of execute sites in
+    that function; a different number is ``exclusion_site_count_mismatch``)
   EVERYTHING ELSE -- an f-string, a variable, a concatenation, a call, a
   statement whose verb is not recognised, a PRAGMA in argument form -- and
   an exclusion that names no reached site             -> ``failures``
@@ -53,7 +55,28 @@ CLI
     python tools/engramd_read_scan.py --package DIR --config FILE --check FILE
 
 config: {"roots": ["<file>:<function>" | "<file>:<line>", ...],
-         "exclusions": [{"site": "<file>:<line>", "reason": "..."}]}
+         "exclusions": [{"site": "<file>:<function-qualname>", "sites": N >= 1,
+                         "reason": "..."} |
+                        {"site": "<file>:<line>", "reason": "..."}]}
+
+Site identity in the committed file (#3342)
+===========================================
+Every site written to the committed file (``templates[].sites``,
+``write_sites``, ``authorizer_governed``, ``declared_out_of_scope``) is keyed
+``<file>:<function-qualname>`` (``Class.method``, ``outer.inner``; ``<module>``
+for a module-level execute), NOT ``<file>:<line>``, so an edit that merely
+shifts line numbers cannot redden the drift gate. A function holding N sites of
+one template lists its ``file:function`` N times, so a site added or removed
+inside one function still changes the file. An exclusion in the function form
+covers every site of that function but MUST carry ``"sites": N`` (an int >= 1),
+the exact number of execute sites (any kind, classifiable or not) it covers. If
+the function holds a different number -- a read added, or one removed -- the scan
+fails with ``exclusion_site_count_mismatch``, so a new read in an excluded
+function turns the gate red instead of being silently suppressed (#3345). A
+function-form entry without a valid ``sites`` is a config error (exit 2). The
+line form is still accepted and needs no count. The count is a config-side pin;
+it is not serialised into the committed file.
+Failures (never committed) keep ``file:line`` for diagnostics.
 
 Exit 0 ok; 1 failures (or ``--check`` drift/missing file); 2 bad input
 (missing package dir, unreadable or malformed config, unresolvable root).
@@ -72,6 +95,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 SCHEMA_VERSION = 1
+MODULE_FUNC = "<module>"  # func part of the key for a module-level execute site
 
 
 def _load_u2():
@@ -97,10 +121,19 @@ class ReadSite:
     col_offset: int
     kind: str  # literal | module_literal | fstring | variable | concat | call | executescript
     sql: Optional[str]
+    func: str = MODULE_FUNC  # dotted qualname of the enclosing def/class chain
 
     @property
     def id(self) -> str:
+        """Line-keyed id: used for failure diagnostics and (still accepted)
+        line-form exclusions. NEVER written into the committed file."""
         return f"{self.file}:{self.line}"
+
+    @property
+    def key(self) -> str:
+        """``<file>:<function-qualname>`` -- the drift-stable identity written
+        into the committed file (#3342): a line shift cannot change it."""
+        return f"{self.file}:{self.func}"
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +223,9 @@ def _classify_arg(
     return "variable", None
 
 
-def _execute_sites(node: ast.AST, relfile: str, consts, u2, shadowed: Set[str] = frozenset()) -> List[ReadSite]:
+def _execute_sites(
+    node: ast.AST, relfile: str, consts, u2, shadowed: Set[str] = frozenset(), func: str = MODULE_FUNC
+) -> List[ReadSite]:
     """Every ``.execute*`` call in ``node``'s direct body (U2's own
     ``_direct_body_nodes``: nested defs are scanned as their own entries)."""
     sites: List[ReadSite] = []
@@ -202,11 +237,28 @@ def _execute_sites(node: ast.AST, relfile: str, consts, u2, shadowed: Set[str] =
         ):
             if child.func.attr == "executescript":
                 # Runs many statements: never classifiable by a first verb.
-                sites.append(ReadSite(relfile, child.lineno, child.col_offset, "executescript", None))
+                sites.append(ReadSite(relfile, child.lineno, child.col_offset, "executescript", None, func))
                 continue
             kind, sql = _classify_arg(child, consts, shadowed)
-            sites.append(ReadSite(relfile, child.lineno, child.col_offset, kind, sql))
+            sites.append(ReadSite(relfile, child.lineno, child.col_offset, kind, sql, func))
     return sites
+
+
+def _qualname(node: ast.AST, parent: Dict[ast.AST, ast.AST]) -> str:
+    """Dotted names of the enclosing def/class chain, outermost first
+    (``Class.method``, ``outer.inner``): a position-free identity that keeps
+    same-named methods of different classes apart.
+
+    Caveat: two defs with the SAME qualname in one file (e.g. one under ``if``
+    and one under ``else``, or a redefinition) share a key, so a read moved
+    from one to the other is not distinguished -- the scan is identical."""
+    parts: List[str] = []
+    cur: Optional[ast.AST] = node
+    while cur is not None:
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            parts.append(cur.name)
+        cur = parent.get(cur)
+    return ".".join(reversed(parts)) or MODULE_FUNC
 
 
 def _scan_read_sites(package_dir: Path, scan, u2):
@@ -224,13 +276,14 @@ def _scan_read_sites(package_dir: Path, scan, u2):
             if not isinstance(node, u2._STOP_TYPES):
                 continue
             fkey = (relfile, node.name, node.lineno)
+            func = _qualname(node, parent)
             shadowed: Set[str] = set()
             scope = node
             while scope is not None:
                 if isinstance(scope, u2._STOP_TYPES):
                     shadowed |= _bound_names(scope)
                 scope = parent.get(scope)
-            sites = _execute_sites(node, relfile, consts, u2, shadowed)
+            sites = _execute_sites(node, relfile, consts, u2, shadowed, func)
             sites_by_func[fkey] = sites
             for site in sites:
                 site_by_loc[(site.file, site.line, site.col_offset)] = site
@@ -284,12 +337,19 @@ def _classify_literal(sql: str) -> str:
 
 
 def _site_sort_key(site_id: str) -> Tuple[str, int]:
+    # A failure's site is a line id, except a stale exclusion, which echoes
+    # whatever the config declared (possibly the ``file:function`` form).
     file_part, _, line = site_id.rpartition(":")
-    return (file_part, int(line))
+    return (file_part, int(line)) if line.isdigit() else (file_part, -1)
 
 
 def _template_key(sql: str) -> str:
     return hashlib.sha256(sql.encode("utf-8")).hexdigest()
+
+
+def _is_line_form(site_id: str) -> bool:
+    """``<file>:<line>`` (digits after the last colon) vs ``<file>:<function>``."""
+    return site_id.rpartition(":")[2].isdigit()
 
 
 def scan(package_dir: Path, roots: List[str], exclusions: List[dict]) -> dict:
@@ -309,36 +369,58 @@ def scan(package_dir: Path, roots: List[str], exclusions: List[dict]) -> dict:
         for site in extra_sites:
             reached[(site.file, site.line, site.col_offset)] = site
 
+    # An exclusion names a site as ``<file>:<function-qualname>`` (drift-stable,
+    # covers every site in that function) or, still accepted, ``<file>:<line>``.
     excluded = {e["site"]: e for e in exclusions}
-    reached_ids = {s.id for s in reached.values()}
+    for e in exclusions:
+        if not _is_line_form(e["site"]):
+            n = e.get("sites")
+            if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+                raise u2.CensusInputError(
+                    f"function-form exclusion {e['site']!r} needs an integer \"sites\" >= 1 "
+                    f"(the exact number of execute sites it covers); got {n!r}")
+    reached_names = {s.id for s in reached.values()} | {s.key for s in reached.values()}
 
-    templates: Dict[str, Set[str]] = {}
+    # Committed site lists hold one ``file:function`` entry PER SITE (count is
+    # carried by repetition, sorted), so adding or removing a site in the same
+    # function changes the file while a line shift cannot.
+    templates: Dict[str, List[str]] = {}
     sql_by_key: Dict[str, str] = {}
-    governed: Set[str] = set()
-    writes: Set[str] = set()
+    governed: List[str] = []
+    writes: List[str] = []
+    out_of_scope: Set[Tuple[str, str]] = set()  # (site key, reason), one per excluded function
     failures: List[dict] = []
 
     for site in sorted(reached.values(), key=lambda s: (s.file, s.line, s.col_offset)):
-        if site.id in excluded:
+        hit = excluded.get(site.id) or excluded.get(site.key)
+        if hit is not None:
+            out_of_scope.add((site.key, hit["reason"]))
             continue
         if site.kind in ("literal", "module_literal"):
             verdict = _classify_literal(site.sql)
             if verdict == "read":
                 key = _template_key(site.sql)
-                templates.setdefault(key, set()).add(site.id)
+                templates.setdefault(key, []).append(site.key)
                 sql_by_key[key] = site.sql
             elif verdict == "pragma_governed":
-                governed.add(site.id)
+                governed.append(site.key)
             elif verdict == "write":
-                writes.add(site.id)
+                writes.append(site.key)
             else:
                 failures.append({"site": site.id, "kind": verdict})
         else:
             failures.append({"site": site.id, "kind": site.kind})
 
     for site_id, entry in excluded.items():
-        if site_id not in reached_ids:
+        if site_id not in reached_names:
             failures.append({"site": site_id, "kind": "stale_exclusion"})
+        elif not _is_line_form(site_id):
+            # Every reached execute site of the function counts, classifiable or
+            # not, so an added/removed read (or a new variable-SQL one) trips this.
+            actual = sum(1 for s in reached.values() if s.key == site_id)
+            if actual != entry["sites"]:
+                failures.append({"site": site_id, "kind": "exclusion_site_count_mismatch",
+                                 "expected": entry["sites"], "actual": actual})
 
     failures.sort(key=lambda f: (_site_sort_key(f["site"]), f["kind"]))
     return {
@@ -347,19 +429,13 @@ def scan(package_dir: Path, roots: List[str], exclusions: List[dict]) -> dict:
             {
                 "key": key,
                 "sql": sql_by_key[key],
-                "sites": sorted(templates[key], key=_site_sort_key),
+                "sites": sorted(templates[key]),
             }
             for key in sorted(templates)
         ],
-        "authorizer_governed": sorted(governed, key=_site_sort_key),
-        "write_sites": sorted(writes, key=_site_sort_key),
-        "declared_out_of_scope": [
-            {"site": e["site"], "reason": e["reason"]}
-            for e in sorted(
-                (e for sid, e in excluded.items() if sid in reached_ids),
-                key=lambda e: _site_sort_key(e["site"]),
-            )
-        ],
+        "authorizer_governed": sorted(governed),
+        "write_sites": sorted(writes),
+        "declared_out_of_scope": [{"site": k, "reason": r} for k, r in sorted(out_of_scope)],
         "failures": failures,
     }
 
@@ -404,7 +480,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         for e in exclusions
     ):
         print("engramd_read_scan: error -- config needs 'roots' (list) and 'exclusions' "
-              "(list of {site, reason})", file=sys.stderr)
+              "(list of {site, reason[, sites]})", file=sys.stderr)
         return 2
 
     try:
@@ -415,7 +491,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if result["failures"]:
         for f in result["failures"]:
-            print(f"engramd_read_scan: FAILURE {f['site']}  kind={f['kind']}", file=sys.stderr)
+            detail = f"  expected={f['expected']} actual={f['actual']}" if "expected" in f else ""
+            print(f"engramd_read_scan: FAILURE {f['site']}  kind={f['kind']}{detail}", file=sys.stderr)
         print(f"engramd_read_scan: {len(result['failures'])} failure(s); nothing written", file=sys.stderr)
         return 1
 

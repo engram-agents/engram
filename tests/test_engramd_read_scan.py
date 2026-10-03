@@ -80,7 +80,7 @@ def test_r10_literal_select_is_registered_with_its_site(tool, tmp_path):
     sql = "SELECT id FROM notes WHERE title = ?"
     assert r["failures"] == []
     assert _by_key(r)[_key(sql)]["sql"] == sql
-    assert _by_key(r)[_key(sql)]["sites"] == ["hook.py:2"]
+    assert _by_key(r)[_key(sql)]["sites"] == ["hook.py:run"]
 
 
 def test_r10_module_level_literal_select_is_registered(tool, tmp_path):
@@ -109,7 +109,7 @@ def test_r10_pragma_read_is_authorizer_governed_not_a_template(tool, tmp_path):
         "    return conn.execute('PRAGMA user_version').fetchone()\n"})
     r = tool.scan(pkg, ["hook.py:run"], [])
     assert r["failures"] == [] and r["templates"] == []
-    assert r["authorizer_governed"] == ["hook.py:2"]
+    assert r["authorizer_governed"] == ["hook.py:run"]
 
 
 def test_r10_pragma_journal_mode_write_is_a_write_site_not_governed(tool, tmp_path):
@@ -120,7 +120,7 @@ def test_r10_pragma_journal_mode_write_is_a_write_site_not_governed(tool, tmp_pa
         "    conn.execute('PRAGMA journal_mode=WAL')\n"})
     r = tool.scan(pkg, ["hook.py:run"], [])
     assert r["failures"] == []
-    assert r["write_sites"] == ["hook.py:2"]
+    assert r["write_sites"] == ["hook.py:run"]
     assert r["authorizer_governed"] == []
 
 
@@ -135,18 +135,19 @@ def test_r10_write_statements_are_reported_not_registered(tool, tmp_path, stmt):
         f"def run(conn):\n    conn.execute({stmt!r}, ())\n"})
     r = tool.scan(pkg, ["hook.py:run"], [])
     assert r["failures"] == [] and r["templates"] == []
-    assert r["write_sites"] == ["hook.py:2"]
+    assert r["write_sites"] == ["hook.py:run"]
 
 
 def test_r10_declared_exclusion_is_listed_with_its_reason(tool, tmp_path):
     pkg = _pkg(tmp_path, {"hook.py":
         "def run(conn):\n"
         "    return conn.execute('SELECT path FROM nodes_fts WHERE nodes_fts MATCH ?', ('x',))\n"})
-    ex = [{"site": "hook.py:2", "reason": "package-DB read, out of scope (design SS3.5)"}]
+    ex = [{"site": "hook.py:run", "reason": "package-DB read, out of scope (design SS3.5)", "sites": 1}]
     r = tool.scan(pkg, ["hook.py:run"], ex)
     assert r["failures"] == []
     assert r["templates"] == []
-    assert r["declared_out_of_scope"] == ex
+    # the count pin is a config-side check, not serialised (#3345)
+    assert r["declared_out_of_scope"] == [{"site": "hook.py:run", "reason": ex[0]["reason"]}]
 
 
 @pytest.mark.parametrize("body,kind", [
@@ -199,7 +200,7 @@ def test_r10_two_sites_with_identical_sql_share_one_template_with_both_sites(too
         "def b(conn):\n    return conn.execute('SELECT 1 FROM notes WHERE id = ?', (2,))\n"})
     r = tool.scan(pkg, ["hook.py:a", "hook.py:b"], [])
     ts = _by_key(r)[_key("SELECT 1 FROM notes WHERE id = ?")]
-    assert ts["sites"] == ["hook.py:2", "hook.py:4"]
+    assert ts["sites"] == ["hook.py:a", "hook.py:b"]
     assert len(r["templates"]) == 1
 
 
@@ -449,3 +450,379 @@ def test_r10_a_match_capture_that_shadows_a_module_constant_is_a_variable(tool, 
     r = tool.scan(pkg, ["hook.py:run"], [])
     assert r["templates"] == []
     assert [(f["site"], f["kind"]) for f in r["failures"]] == [("hook.py:5", "variable")]
+
+
+# === #3342: sites are keyed <file>:<function>, never <file>:<line> =========
+#
+# Contract (stated before the implementation):
+#  C1  every committed `sites` / `write_sites` / `authorizer_governed` /
+#      `declared_out_of_scope` entry is `<relfile>:<qualname>` (`<module>` for a
+#      module-level site); N sites of one template in one function = N entries.
+#  C2  inserting blank lines above registered sites in a COPY of the real tree
+#      leaves the scan byte-identical to the committed file.
+#  C3  a new template / changed SQL / removed read / read moved to another
+#      function each make a scan of a COPY differ from the committed file.
+#  C5  template keys + SQL are unchanged versus the pre-#3342 file.
+#  C6  the registry loader never parses `sites`.
+
+import ast as _ast
+import re as _re
+import shutil as _shutil
+
+_COMMITTED = REPO_ROOT / "src" / "engram" / "engramd_read_templates.json"
+_REAL_CFG = REPO_ROOT / "tools" / "engramd_read_scan.config.json"
+_LINE_KEY = _re.compile(r":\d+$")
+
+# Frozen at #3342 (== origin/dev's file before the change): the sha256 of every
+# registered SQL. A site re-key must not move any of them.
+_FROZEN_TEMPLATE_KEYS = frozenset({
+    "0280b9b584a3522d55be45f09ec258c28ec2d8b8e0e3cf80267097f593c71462",
+    "11d79fc4ecfafd263296a4ea553d76e8c995e961af23049158d6d89e80bf8088",
+    "2743db24b60c27d0ad4e70e440219d2904a12aa08d4fdca11760b8445b3fdc9c",
+    "276dce2997ab333e1583a542b4099dbb52e431db42c9d272ad0dbef63dfb3437",
+    "2ebd973676462df3efb4be4e82d0835e47ee84b6b9a6f7361806daa776dac09d",
+    "4795866d2d19b5085970ad79dd2705359930118747cd19d1ec6eb405627befb9",
+    "49ac1236d8081aa987ee1eafa9b3f4f10e48249f3f4c29446b8be5c73bd20412",
+    "5961b023ce8247394b6d859ca4d0959c3ae34d2e9be481a8fd726899c795ef8e",
+    "5ca245030193bc0e9811e8af365843b66ab4c4d999bbf2d13b79eabc0df37ee8",
+    "6b93753474b01e7fc71620df964ee442e9b3b6a7c9d679d00c1b24c29c65b76e",
+    "6fccf1c54a61e35899981e3f084277c3dbe091705d6609ab3abb46e73972551b",
+    "9f6da2c7f988f5d2d40b7cdf6afe3d1fef5abb993b47a72b16fe9070cc0c3c05",
+    "a3df78eb81c6fb751522f885a0748cd416c1e268e35b3669cf24f84da1591b65",
+    "a6822015a92b0414ca8b443bd623c4ce9be6f7637068d72f69e8711e2e6c1427",
+    "a81aff5ee1cfc444b6044abc808bcd8573b6e94d771e505c5119ca6678b91046",
+    "b1f125b644a0e5d0a8d1e81628d17e7b876b5dbce632cfbb7a4ba48732623765",
+    "c7ebb686c91c35f89f5bff3b5f1e3b9a746e2568d35a35899fc868a0d8d99223",
+    "cbfeed1901ba8473aa2edd65b9a0f92931b0ae1d537e2b0d6ed3ee7b6f5c70c6",
+    "cefc616a2876d56a7b84ead98f75fa894f5a3678510f4d5c5bbac0b78061feb8",
+    "d8ae87a01e31523ab8daab4fc634e227cfdb00339c30995e50a0fe82f6b67be8",
+    "d8df8312219022c740ab529591974426fb042368432378fde0c9fd47dcc07840",
+    "dc3d1b24f7b5d31cfb36abb9646c778d1dd42055b81cd0c99da5f206f23bc643",
+    "e3872e7780af9a2fb346d7019adb7f9bd36fd49794c534d74c2f96e364c9d129",
+    "f3fb3410d99851f0e833a131cbdc574e9e676b124dd85d9841250a21f8e05c0a",
+    "f80855b47d7d7e10bf3fc0b5d045906133299e4433da52de0ea75c0fa5a851fe",
+})
+
+
+def _real_scan(tool, package: Path) -> dict:
+    cfg = json.loads(_REAL_CFG.read_text())
+    r = tool.scan(package, cfg["roots"], cfg["exclusions"])
+    assert r["failures"] == [], r["failures"]
+    return {k: v for k, v in r.items() if k != "failures"}
+
+
+def _dump(payload: dict) -> str:
+    return json.dumps(payload, indent=2) + "\n"
+
+
+@pytest.fixture()
+def tree_copy(tmp_path):
+    dst = tmp_path / "engram_copy"
+    _shutil.copytree(REPO_ROOT / "src" / "engram", dst,
+                     ignore=_shutil.ignore_patterns("__pycache__", "*.pyc"))
+    return dst
+
+
+def _prepend_blank_lines(path: Path, n: int = 7) -> None:
+    path.write_text("\n" * n + path.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def test_3342_site_is_keyed_on_function_not_line(tool, tmp_path):
+    """Mutation: key on file:line again -> red."""
+    pkg = _pkg(tmp_path, {"hook.py":
+        "def run(conn):\n    return conn.execute('SELECT 1 FROM t')\n"})
+    r = tool.scan(pkg, ["hook.py:run"], [])
+    assert _by_key(r)[_key("SELECT 1 FROM t")]["sites"] == ["hook.py:run"]
+
+
+def test_3342_module_level_site_is_keyed_module(tool, tmp_path):
+    pkg = _pkg(tmp_path, {"hook.py":
+        "def run(conn):\n    return 1\n"
+        "ROOT_CONN.execute('SELECT 1 FROM t')\n"})
+    r = tool.scan(pkg, ["hook.py:3"], [])
+    assert _by_key(r)[_key("SELECT 1 FROM t")]["sites"] == ["hook.py:<module>"]
+
+
+def test_3342_two_sites_of_one_template_in_one_function_are_listed_twice(tool, tmp_path):
+    """Count is carried by repetition: adding/removing a same-function site must
+    change the output. Mutation: de-duplicate (set) -> red."""
+    one = _pkg(tmp_path / "one", {"hook.py":
+        "def run(conn):\n    conn.execute('SELECT 1 FROM t')\n"})
+    two = _pkg(tmp_path / "two", {"hook.py":
+        "def run(conn):\n    conn.execute('SELECT 1 FROM t')\n"
+        "    return conn.execute('SELECT 1 FROM t')\n"})
+    r1 = tool.scan(one, ["hook.py:run"], [])
+    r2 = tool.scan(two, ["hook.py:run"], [])
+    k = _key("SELECT 1 FROM t")
+    assert _by_key(r1)[k]["sites"] == ["hook.py:run"]
+    assert _by_key(r2)[k]["sites"] == ["hook.py:run", "hook.py:run"]
+    assert r1 != r2
+
+
+def test_3342_methods_and_nested_functions_get_a_qualname(tool, tmp_path):
+    """Two same-named methods in different classes must not collapse.
+    Mutation: use the bare function name -> red."""
+    pkg = _pkg(tmp_path, {"hook.py":
+        "class A:\n    def get(self, c):\n        return c.execute('SELECT 1 FROM a')\n"
+        "class B:\n    def get(self, c):\n        return c.execute('SELECT 1 FROM a')\n"
+        "def outer(c):\n    def inner():\n        return c.execute('SELECT 1 FROM a')\n    return inner\n"})
+    r = tool.scan(pkg, ["hook.py:get", "hook.py:outer", "hook.py:inner"], [])
+    assert _by_key(r)[_key("SELECT 1 FROM a")]["sites"] == [
+        "hook.py:A.get", "hook.py:B.get", "hook.py:outer.inner"]
+
+
+def test_3342_write_and_governed_sites_are_function_keyed(tool, tmp_path):
+    pkg = _pkg(tmp_path, {"hook.py":
+        "def run(conn):\n    conn.execute('PRAGMA user_version')\n"
+        "    conn.execute('DELETE FROM t')\n"})
+    r = tool.scan(pkg, ["hook.py:run"], [])
+    assert r["authorizer_governed"] == ["hook.py:run"]
+    assert r["write_sites"] == ["hook.py:run"]
+
+
+def test_3342_exclusion_may_name_the_function_and_is_reported_function_keyed(tool, tmp_path):
+    pkg = _pkg(tmp_path, {"hook.py":
+        "def run(conn):\n    return conn.execute('SELECT 1 FROM t')\n"})
+    ex = [{"site": "hook.py:run", "reason": "r", "sites": 1}]
+    r = tool.scan(pkg, ["hook.py:run"], ex)
+    assert r["failures"] == [] and r["templates"] == []
+    assert r["declared_out_of_scope"] == [{"site": "hook.py:run", "reason": "r"}]
+
+
+def test_3342_function_exclusion_naming_nothing_reached_is_stale(tool, tmp_path):
+    pkg = _pkg(tmp_path, {"hook.py":
+        "def run(conn):\n    return conn.execute('SELECT 1 FROM t')\n"})
+    r = tool.scan(pkg, ["hook.py:run"], [{"site": "hook.py:gone", "reason": "r", "sites": 1}])
+    assert [(f["site"], f["kind"]) for f in r["failures"]] == [("hook.py:gone", "stale_exclusion")]
+
+
+def test_3342_synthetic_line_shift_leaves_the_scan_unchanged(tool, tmp_path):
+    a = _pkg(tmp_path / "a", {"hook.py":
+        "def run(conn):\n    return conn.execute('SELECT 1 FROM t')\n"})
+    b = _pkg(tmp_path / "b", {"hook.py":
+        "\n\n\n# moved down\ndef run(conn):\n    return conn.execute('SELECT 1 FROM t')\n"})
+    assert tool.scan(a, ["hook.py:run"], []) == tool.scan(b, ["hook.py:run"], [])
+
+
+def test_3342_c1_committed_file_has_no_line_keyed_site():
+    """Mutation: regenerate with the old line-keyed scanner -> red."""
+    data = json.loads(_COMMITTED.read_text(encoding="utf-8"))
+    entries = [s for t in data["templates"] for s in t["sites"]]
+    entries += data["authorizer_governed"] + data["write_sites"]
+    entries += [e["site"] for e in data["declared_out_of_scope"]]
+    assert entries, "expected registered sites"
+    assert [e for e in entries if _LINE_KEY.search(e)] == []
+    for e in entries:
+        assert ":" in e and not e.endswith(":")
+
+
+def test_3342_c5_template_keys_and_sql_are_unchanged_by_the_site_rekey():
+    data = json.loads(_COMMITTED.read_text(encoding="utf-8"))
+    assert {t["key"] for t in data["templates"]} == _FROZEN_TEMPLATE_KEYS
+    for t in data["templates"]:
+        assert t["key"] == _key(t["sql"])
+
+
+def test_3342_c4_real_tree_scan_is_deterministic(tool):
+    pkg = REPO_ROOT / "src" / "engram"
+    assert _dump(_real_scan(tool, pkg)) == _dump(_real_scan(tool, pkg))
+
+
+def test_3342_c2_line_shift_in_the_real_tree_copy_is_invisible(tool, tree_copy):
+    """Blank lines above every registered site in engram_core.py and in two
+    hook files (one holding an exclusion, one a write/governed site).
+    Mutation: key sites on line -> red."""
+    committed = _COMMITTED.read_text(encoding="utf-8")
+    assert _dump(_real_scan(tool, tree_copy)) == committed  # control: copy == real
+    for rel in ("engram_core.py",
+                "hooks/claude/engram-session-start-hook.py",
+                "hooks/claude/engram-surface-hook.py"):
+        _prepend_blank_lines(tree_copy / rel)
+    assert _dump(_real_scan(tool, tree_copy)) == committed
+
+
+def _single_literal_read_site(tree_copy: Path):
+    """-> (path, Call node, sql) for a registered single-site literal template
+    whose call appears exactly once in its file, on one line."""
+    data = json.loads(_COMMITTED.read_text(encoding="utf-8"))
+    for t in data["templates"]:
+        if len(t["sites"]) != 1 or "\n" in t["sql"]:
+            continue
+        rel = t["sites"][0].rpartition(":")[0]
+        path = tree_copy / rel
+        src = path.read_text(encoding="utf-8")
+        hits = [n for n in _ast.walk(_ast.parse(src))
+                if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Attribute)
+                and n.func.attr.startswith("execute") and n.args
+                and isinstance(n.args[0], _ast.Constant) and n.args[0].value == t["sql"]]
+        if len(hits) == 1 and hits[0].lineno == hits[0].end_lineno:
+            return path, hits[0], t["sql"]
+    raise AssertionError("no suitable single-line literal read site found")
+
+
+def _splice(path: Path, call, replacement: str) -> None:
+    lines = path.read_text(encoding="utf-8").split("\n")
+    ln = call.lineno - 1
+    raw = lines[ln].encode("utf-8")
+    lines[ln] = (raw[:call.col_offset] + replacement.encode("utf-8")
+                 + raw[call.end_col_offset:]).decode("utf-8")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _line_seg(path: Path, call, a: int, b: int) -> str:
+    raw = path.read_text(encoding="utf-8").split("\n")[call.lineno - 1].encode("utf-8")
+    return raw[a:b].decode("utf-8")
+
+
+@pytest.mark.parametrize("mutation", ["new_template", "changed_sql", "removed_read", "moved_read"])
+def test_3342_c3_a_real_change_still_reddens_the_scan(tool, tree_copy, mutation):
+    """Each real change must differ from the committed file (control: the
+    unmutated copy equals it). Mutation: compare only template keys -> the
+    moved_read case goes green -> red."""
+    committed = _COMMITTED.read_text(encoding="utf-8")
+    assert _dump(_real_scan(tool, tree_copy)) == committed  # control
+    path, call, sql = _single_literal_read_site(tree_copy)
+    src_call = _line_seg(path, call, call.col_offset, call.end_col_offset)
+    recv = _line_seg(path, call, call.func.value.col_offset, call.func.value.end_col_offset)
+    if mutation == "new_template":
+        _splice(path, call, f"[{src_call}, {recv}.execute('SELECT brand_new_col FROM brand_new_tbl')]")
+    elif mutation == "changed_sql":
+        _splice(path, call, src_call.replace(sql, sql + " ", 1))
+    elif mutation == "removed_read":
+        _splice(path, call, "None")
+    else:
+        _splice(path, call, "_moved_read_3342()")
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n\ndef _moved_read_3342():\n    return {src_call}\n")
+    assert _dump(_real_scan(tool, tree_copy)) != committed
+
+
+def test_3342_c6_registry_loader_ignores_site_strings(tmp_path):
+    """No consumer parses `sites`: the loader reads only key + sql."""
+    import sqlite3
+    rr = _load("engramd_read_registry_3342", REPO_ROOT / "src" / "engram" / "engramd_read_registry.py")
+    sql = "SELECT id FROM nodes WHERE id = ?"
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE nodes (id TEXT)")
+    for sites in (["engram_core.py:somefunc"], ["engram_core.py:1530"], [], ["x:<module>"]):
+        p = tmp_path / "t.json"
+        p.write_text(json.dumps({"schema": 1, "templates": [
+            {"key": rr.template_key(sql), "sql": sql, "sites": sites}]}))
+        assert rr.load_registry(p, conn).templates
+
+
+# --- #3345: a function-form exclusion pins an exact site count -----------------
+
+_EXCL_BODY = "def run(conn):\n    return conn.execute('SELECT 1 FROM t')\n"
+
+
+def _fx(n=1):
+    return [{"site": "hook.py:run", "reason": "r", "sites": n}]
+
+
+def _mismatch(r):
+    return [f for f in r["failures"] if f["kind"] == "exclusion_site_count_mismatch"]
+
+
+def test_3345_exact_count_is_clean(tool, tmp_path):
+    """Mutation: reject a matching count -> red."""
+    pkg = _pkg(tmp_path, {"hook.py": _EXCL_BODY})
+    assert tool.scan(pkg, ["hook.py:run"], _fx(1))["failures"] == []
+
+
+def test_3345_a_new_read_in_an_excluded_function_is_a_failure(tool, tmp_path):
+    """Mutation: drop the count check -> red (the new read was silently covered)."""
+    pkg2 = _pkg(tmp_path / "b", {"hook.py":
+        "def run(conn):\n    conn.execute('SELECT 1 FROM t')\n    return conn.execute('SELECT 2 FROM t')\n"})
+    r = tool.scan(pkg2, ["hook.py:run"], _fx(1))
+    m = _mismatch(r)
+    assert len(m) == 1
+    assert m[0]["site"] == "hook.py:run" and m[0]["expected"] == 1 and m[0]["actual"] == 2
+
+
+def test_3345_a_removed_read_is_a_failure_not_just_a_shortfall_pass(tool, tmp_path):
+    """Mutation: compare actual >= expected instead of == -> red."""
+    pkg = _pkg(tmp_path, {"hook.py": _EXCL_BODY})
+    r = tool.scan(pkg, ["hook.py:run"], _fx(2))
+    m = _mismatch(r)
+    assert len(m) == 1 and m[0]["expected"] == 2 and m[0]["actual"] == 1
+
+
+@pytest.mark.parametrize("extra", [
+    "conn.execute(sql)",
+    "conn.execute('SELECT id FROM ' + t)",
+    "conn.execute(f'SELECT {c}')",
+    "conn.executescript('SELECT 1')",
+])
+def test_3345_an_unclassifiable_site_added_to_an_excluded_function_is_counted(tool, tmp_path, extra):
+    """Mutation: skip unclassifiable sites when counting -> red."""
+    pkg = _pkg(tmp_path, {"hook.py":
+        "def run(conn, sql, t, c):\n    conn.execute('SELECT 1 FROM t')\n    " + extra + "\n"})
+    r = tool.scan(pkg, ["hook.py:run"], _fx(1))
+    m = _mismatch(r)
+    assert len(m) == 1 and m[0]["actual"] == 2
+    # and with the right count the excluded function is clean (suppressed, not dropped from the count)
+    assert tool.scan(pkg, ["hook.py:run"], _fx(2))["failures"] == []
+
+
+@pytest.mark.parametrize("cmd_mode", ["--out", "--check"])
+def test_3345_cli_exits_nonzero_on_count_mismatch_in_both_modes(tool, tmp_path, cmd_mode):
+    """Mutation: CLI ignores the new failure kind -> red."""
+    pkg = _pkg(tmp_path, {"hook.py":
+        "def run(conn):\n    conn.execute('SELECT 1 FROM t')\n    return conn.execute('SELECT 2 FROM t')\n"})
+    cfg = _cfg(tmp_path, ["hook.py:run"], _fx(1))
+    out = tmp_path / "t.json"
+    if cmd_mode == "--check":
+        # a committed file that equals the scan output, so only the count pin can fail it
+        good = tmp_path / "good.json"
+        good.write_text(json.dumps({"roots": ["hook.py:run"], "exclusions": _fx(2)}))
+        assert tool.main(["--package", str(pkg), "--config", str(good), "--out", str(out)]) == 0
+    rc = tool.main(["--package", str(pkg), "--config", str(cfg), cmd_mode, str(out)])
+    assert rc == 1
+    if cmd_mode == "--out":
+        assert not out.exists()
+
+
+@pytest.mark.parametrize("bad", [None, 0, -1, "1", 1.0, True])
+def test_3345_function_form_without_a_valid_sites_count_is_a_config_error(tool, tmp_path, bad):
+    """Mutation: accept a missing/invalid count silently -> red."""
+    pkg = _pkg(tmp_path, {"hook.py": _EXCL_BODY})
+    entry = {"site": "hook.py:run", "reason": "r"}
+    if bad is not None:
+        entry["sites"] = bad
+    with pytest.raises(tool._load_u2().CensusInputError):
+        tool.scan(pkg, ["hook.py:run"], [entry])
+    out = tmp_path / "t.json"
+    rc = tool.main(["--package", str(pkg), "--config", str(_cfg(tmp_path, ["hook.py:run"], [entry])),
+                    "--out", str(out)])
+    assert rc == 2 and not out.exists()
+
+
+def test_3345_line_form_exclusion_needs_no_sites_field(tool, tmp_path):
+    """Mutation: demand `sites` on line-form too -> red."""
+    pkg = _pkg(tmp_path, {"hook.py": _EXCL_BODY})
+    r = tool.scan(pkg, ["hook.py:run"], [{"site": "hook.py:2", "reason": "r"}])
+    assert r["failures"] == []
+
+
+def test_3345_real_config_function_exclusions_pin_exactly_one_site():
+    cfg = json.loads(_REAL_CFG.read_text())
+    fn = [e for e in cfg["exclusions"] if not e["site"].rpartition(":")[2].isdigit()]
+    assert len(fn) == 2
+    for e in fn:
+        assert e["sites"] == 1 and "exactly 1 site" in e["reason"], e
+
+
+def test_3345_same_qualname_defs_share_a_key_so_moving_a_read_between_them_is_invisible(tool, tmp_path):
+    """Pins the documented caveat on _qualname: two defs with one qualname in a
+    file (e.g. under if/else) share a key. Mutation: disambiguate by line -> red."""
+    read = "        return c.execute('SELECT 1 FROM t')\n"
+    empty = "        return 0\n"
+    head = "import os\nif os.name:\n    def run(c):\n"
+    mid = "else:\n    def run(c):\n"
+    a = _pkg(tmp_path / "a", {"hook.py": head + read + mid + empty})
+    b = _pkg(tmp_path / "b", {"hook.py": head + empty + mid + read})  # the read moved to the other def
+    ra = tool.scan(a, ["hook.py:run"], [])
+    rb = tool.scan(b, ["hook.py:run"], [])
+    assert ra["templates"] and ra["templates"][0]["sites"] == ["hook.py:run"]
+    assert ra == rb

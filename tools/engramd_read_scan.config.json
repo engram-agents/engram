@@ -329,12 +329,14 @@
  ],
  "exclusions": [
   {
-   "site": "hooks/claude/engram-surface-hook.py:1573",
-   "reason": "package-DB read (nodes_fts on pack[\"path\"], an attached pack archive opened mode=ro&immutable=1, not the owner-held store); out of scope per docs/2652-security-slice-design.md SS3.5"
+   "site": "hooks/claude/engram-surface-hook.py:_query_attached_packs",
+   "sites": 1,
+   "reason": "package-DB read, exactly 1 site (nodes_fts on pack[\"path\"], an attached pack archive opened mode=ro&immutable=1, not the owner-held store); out of scope per docs/2652-security-slice-design.md SS3.5"
   },
   {
-   "site": "hooks/claude/engram-session-start-hook.py:521",
-   "reason": "JSON1 probe on a FRESH in-memory sqlite connection (#3327): never touches the owner-held knowledge.db, so it is not a client read of the store; out of scope per docs/2652-security-slice-design.md SS3.5 (reads of a store other than the owner's)"
+   "site": "hooks/claude/engram-session-start-hook.py:_check_json1",
+   "sites": 1,
+   "reason": "JSON1 probe, exactly 1 site, on a FRESH in-memory sqlite connection (#3327): never touches the owner-held knowledge.db, so it is not a client read of the store; out of scope per docs/2652-security-slice-design.md SS3.5 (reads of a store other than the owner's)"
   }
  ]
 }
