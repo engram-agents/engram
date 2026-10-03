@@ -62,7 +62,7 @@ Usage (production defaults -- reads ~/.umwelt/config.json for the bell's
 agent/world_url):
     monitor-supervisor.py --purpose collab-loop
 
-Health check (`--check`, #3311, Linux-only):
+Health check (`--check`, #3311 Linux /proc; #3330 ps/lsof backend for macOS):
     monitor-supervisor.py --check [--pidfile P] [--status-file S] [--max-status-age SECONDS]
 
 A read-only verification that the supervisor armed as ONE Monitor is actually
@@ -95,10 +95,22 @@ file; the default max age is 3x that value, `--max-status-age` overrides, and
 a status file without the field (older supervisor) falls back to 3x
 DEFAULT_STATUS_INTERVAL_SECONDS and says so on the supervisor line.
 
+Two backends, identical output shape and exit codes. With /proc present
+(Linux) the process table is read from /proc, as above. Without /proc
+(macOS) ONE uid-scoped `ps -U <uid> -o pid=,ppid=,stat=,args=` snapshot gives
+liveness (stat Z = dead), ppid and argv (the script NAME anywhere in args,
+never argv[0]); a child's stdout is a PIPE iff `lsof -n -P -a -p <pid> -d 0-2
+-F pftdn` shows fd 1 as type PIPE whose device/peer pair the supervisor's own
+`lsof -F pftdn` shows reversed (the supervisor holds a PIPE whose device is
+the child's peer AND whose peer is the child's device); the supervisor's own
+stdout is the harness's `unix` socket. If lsof is absent or errors, the
+pipe items FAIL naming lsof -- never PASS. All ps/lsof calls go through the
+module-level CHECK_RUNNER seam, which tests replace with captured output.
+
 Exit codes: 0 all four PASS; 1 any FAIL or extra child; 2 pidfile
 missing/unreadable/not an integer (ONE line, `CHECK FAIL supervisor not
-armed: ...`); 3 no /proc (ONE line, `CHECK FAIL unsupported platform`).
-Darwin is deliberately unsupported (use the three-Monitor check there).
+armed: ...`); 3 neither backend works -- no /proc AND ps unusable (ONE line,
+`CHECK FAIL unsupported platform`).
 
 See --help for every override (script paths, pidfile/status-file locations,
 backoff/status-interval tuning, and the --*-cmd-json escape hatches the test
@@ -224,7 +236,10 @@ def _is_supervisor_process(cmd: str) -> bool:
     argv = cmd.split()
     if not argv:
         return False
-    if not os.path.basename(argv[0]).startswith("python"):
+    # Case-insensitive: the python.org macOS framework interpreter is
+    # `.../Python.app/Contents/MacOS/Python` (capital P). This guard is the one
+    # place that is decided -- R6/R7 and --check (both backends) go through it.
+    if not os.path.basename(argv[0]).lower().startswith("python"):
         return False
     return any(
         a == "monitor-supervisor.py" or a.endswith("/monitor-supervisor.py")
@@ -542,7 +557,8 @@ def _install_signal_handler(supervisor: Supervisor) -> None:
 
 
 # ---------------------------------------------------------------------------
-# --check (#3311): read-only health verification. Linux-only (/proc).
+# --check (#3311): read-only health verification. /proc backend (Linux)
+# below; the ps/lsof backend (#3330) for seats without /proc follows it.
 # ---------------------------------------------------------------------------
 def _proc_stat(pid: int) -> tuple[str, int] | None:
     """(state, ppid) from /proc/<pid>/stat, or None if unreadable. comm may
@@ -653,19 +669,160 @@ def _check_child_item(name: str, sup_pid: int, entry, stale: str | None,
     return pid_txt, True, f"parent={sup_pid} stdout={target}"
 
 
-def run_check(pidfile: str, status_file: str, max_status_age: float | None) -> int:
-    if not os.path.isdir(PROC_ROOT):
-        print("CHECK FAIL unsupported platform: no /proc (use the three-Monitor check)")
-        return 3
-    try:
-        sup_pid = int(Path(pidfile).read_text().strip())
-        if sup_pid <= 0:
-            raise ValueError(f"non-positive pid {sup_pid}")
-    except (OSError, ValueError) as exc:
-        print(f"CHECK FAIL supervisor not armed: pidfile {pidfile} {exc.__class__.__name__}: {exc}")
-        return 2
+# -- ps/lsof backend (#3330): seats with no /proc (macOS). ---------------------
+def _default_runner(argv: list[str]) -> tuple[int, str]:
+    """Run argv, return (returncode, stdout). Raises OSError / SubprocessError
+    when the binary cannot run (absent, timed out) -- callers name that."""
+    out = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=10)
+    return out.returncode, out.stdout
 
-    # -- status file (upstream 1) --
+
+# The ONE seam for every ps / lsof invocation the ps backend makes (module
+# constant so tests substitute captured output, like PROC_ROOT).
+CHECK_RUNNER = _default_runner
+
+
+def _run_tool(argv: list[str], accept_nonzero=None) -> tuple[str | None, str]:
+    """(error-or-None, stdout) from CHECK_RUNNER. Never raises.
+
+    A non-zero exit is an error UNLESS `accept_nonzero(stdout)` is true: lsof
+    can exit 1 on harmless warnings while its -F output is complete. The
+    predicate must test for positive evidence in the output (never merely
+    "non-empty"); callers still require the full match for any PASS."""
+    try:
+        rc, out = CHECK_RUNNER(argv)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"{argv[0]} unavailable ({exc.__class__.__name__}: {exc})", ""
+    if rc != 0 and not (accept_nonzero is not None and accept_nonzero(out)):
+        return f"{argv[0]} exited {rc}", out
+    return None, out
+
+
+def _ps_scope() -> str:
+    """Value for `ps -U`: the login NAME (procps and BSD ps both accept one;
+    BSD acceptance of a bare number is unverified), else the numeric uid."""
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError, OSError):
+        return str(os.getuid())
+
+
+def _parse_ps(out: str) -> dict[int, tuple[int, str, str]]:
+    table: dict[int, tuple[int, str, str]] = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        table[int(parts[0])] = (int(parts[1]), parts[2], parts[3] if len(parts) > 3 else "")
+    return table
+
+
+def _ps_snapshot() -> dict[int, tuple[int, str, str]] | None:
+    """ONE uid-scoped process-table snapshot {pid: (ppid, stat, args)}, or None
+    if ps is unusable. Scoped to the caller's uid: on a shared Mac an unscoped
+    listing also shows another account's monitors (F2). `-ww`: unlimited args
+    width (see _pid_cmdline_status)."""
+    # Any non-zero exit = ps unusable: the extras line needs a COMPLETE table.
+    err, out = _run_tool(["ps", "-ww", "-U", _ps_scope(), "-o", "pid=,ppid=,stat=,args="])
+    if err is not None:
+        return None
+    return _parse_ps(out) or None
+
+
+def _ps_alive(table: dict, pid: int) -> bool:
+    row = table.get(pid)
+    return row is not None and not row[1].startswith("Z")
+
+
+def _lsof_records(pid: int, fds: str | None) -> tuple[str | None, list[dict]]:
+    """(error-or-None, records) from `lsof -F pftdn`; each record is
+    {"fd","t","d","n"} for one open file. `fds` narrows with -d (e.g. "0-2")."""
+    argv = ["lsof", "-n", "-P", "-a", "-p", str(pid)]
+    if fds:
+        argv += ["-d", fds]
+    # Non-zero exit accepted only with this pid's own `p<pid>` record present.
+    err, out = _run_tool(argv + ["-F", "pftdn"],
+                         accept_nonzero=lambda o: f"p{pid}" in o.splitlines())
+    if err is not None:
+        return err, []
+    recs: list[dict] = []
+    for line in out.splitlines():
+        if not line:
+            continue
+        tag, val = line[0], line[1:]
+        if tag == "f":
+            recs.append({"fd": val})
+        elif tag in "tdn" and recs:
+            recs[-1][tag] = val
+    return None, recs
+
+
+def _pipe_pair(rec: dict) -> tuple[str, str] | None:
+    """(device, peer) of a PIPE record, else None."""
+    if rec.get("t") != "PIPE":
+        return None
+    n = rec.get("n", "")
+    if not rec.get("d") or not n.startswith("->"):
+        return None
+    return rec["d"], n[2:]
+
+
+def _ps_supervisor_item(table: dict, sup_pid: int, note: str,
+                        sup_recs: tuple[str | None, list[dict]]) -> tuple[bool, str]:
+    if not _ps_alive(table, sup_pid):
+        return False, f"pid {sup_pid} not alive"
+    args = table[sup_pid][2]
+    if not _is_supervisor_process(args):
+        return False, f"not a monitor-supervisor ({args!r})"
+    err, recs = sup_recs
+    if err is not None:
+        return False, f"stdout (fd 1) UNVERIFIED: {err}"
+    fd1 = next((r for r in recs if r.get("fd") == "1"), None)
+    if fd1 is None:
+        return False, "stdout (fd 1) UNREADABLE"
+    if fd1.get("t") not in ("unix", "sock"):
+        return False, f"stdout (fd 1) is {fd1.get('t')}, not a socket"
+    return True, f"stdout is {fd1.get('t')} socket" + note
+
+
+def _ps_child_item(name: str, sup_pid: int, entry, stale: str | None, table: dict,
+                   sup_recs: tuple[str | None, list[dict]]) -> tuple[str, bool, str]:
+    """Same step order, text and result shape as _check_child_item."""
+    pid = entry.get("pid") if isinstance(entry, dict) else None
+    pid_txt = str(pid) if isinstance(pid, int) and not isinstance(pid, bool) else "?"
+    if stale is not None:
+        return pid_txt, False, stale
+    if pid_txt == "?":
+        return pid_txt, False, "no pid in status file"
+    if not _ps_alive(table, pid):
+        return pid_txt, False, f"pid {pid} not alive"
+    ppid, _stat, args = table[pid]
+    if ppid != sup_pid:
+        return pid_txt, False, f"not a child of supervisor (ppid={ppid}, supervisor={sup_pid})"
+    frag = _CHECK_ARGV_FRAGMENT[name]
+    if frag not in args:  # the script NAME anywhere in args, never argv[0] (F3)
+        return pid_txt, False, f"argv does not identify {frag} ({args!r})"
+    err, recs = _lsof_records(pid, "0-2")
+    if err is not None:
+        return pid_txt, False, f"stdout (fd 1) UNVERIFIED: {err}"
+    fd1 = next((r for r in recs if r.get("fd") == "1"), None)
+    pair = _pipe_pair(fd1) if fd1 is not None else None
+    if pair is None:
+        kind = fd1.get("t") if fd1 else None
+        return pid_txt, False, f"stdout (fd 1) is {kind or 'UNREADABLE'}, not a pipe"
+    sup_err, sup_list = sup_recs
+    if sup_err is not None:
+        return pid_txt, False, f"stdout pipe UNVERIFIED: supervisor {sup_err}"
+    dev, peer = pair
+    # F1: BOTH directions -- the supervisor holds the other end of this pipe.
+    if not any(_pipe_pair(r) == (peer, dev) for r in sup_list):
+        return pid_txt, False, f"stdout pipe {dev} is not held open by the supervisor"
+    return pid_txt, True, f"parent={sup_pid} stdout=pipe {dev}->{peer}"
+
+
+def _load_status(status_file: str, max_status_age: float | None):
+    """Status-file upstream shared by both backends: (data, stale, note, children)."""
     data = None
     stale: str | None = None
     note = ""
@@ -694,7 +851,23 @@ def run_check(pidfile: str, status_file: str, max_status_age: float | None) -> i
     children = data.get("children") if isinstance(data, dict) else None
     if not isinstance(children, dict):
         children = {}
+    return data, stale, note, children
 
+
+def _emit_verdict(results: list[tuple[str, str, bool, str]], extras: list[int]) -> int:
+    """The five stdout lines + exit code, shared by both backends."""
+    for label, pid_txt, ok, reason in results:
+        print(f"{label + ':':<12}{'PASS' if ok else 'FAIL'} pid={pid_txt} {reason}")
+    failed = sum(1 for r in results if not r[2])
+    verdict = "PASS" if failed == 0 and not extras else "FAIL"
+    tail = ""
+    if extras:
+        tail = "; extra child pid=" + ",".join(str(p) for p in extras)
+    print(f"CHECK {verdict} {failed}/4 failed{tail}")
+    return 0 if verdict == "PASS" else 1
+
+
+def _evaluate_proc(sup_pid: int, data, stale, note, children):
     results: list[tuple[str, str, bool, str]] = []  # label, pid, passed, reason
     try:
         ok, reason = _check_supervisor_item(sup_pid, note)
@@ -715,16 +888,60 @@ def run_check(pidfile: str, status_file: str, max_status_age: float | None) -> i
     if data is not None and _proc_alive(sup_pid):
         named = {e.get("pid") for e in children.values() if isinstance(e, dict)}
         extras = sorted(_process_table_children(sup_pid) - named)
+    return results, extras
 
-    for label, pid_txt, ok, reason in results:
-        print(f"{label + ':':<12}{'PASS' if ok else 'FAIL'} pid={pid_txt} {reason}")
-    failed = sum(1 for r in results if not r[2])
-    verdict = "PASS" if failed == 0 and not extras else "FAIL"
-    tail = ""
-    if extras:
-        tail = "; extra child pid=" + ",".join(str(p) for p in extras)
-    print(f"CHECK {verdict} {failed}/4 failed{tail}")
-    return 0 if verdict == "PASS" else 1
+
+def _evaluate_ps(sup_pid: int, table: dict, data, stale, note, children):
+    results: list[tuple[str, str, bool, str]] = []
+    # One lsof of the supervisor, shared by its own item and every child's
+    # pipe match. Only worth asking once the supervisor is alive.
+    sup_recs: tuple[str | None, list[dict]] = (
+        _lsof_records(sup_pid, None) if _ps_alive(table, sup_pid)
+        else ("not alive", []))
+    try:
+        ok, reason = _ps_supervisor_item(table, sup_pid, note, sup_recs)
+    except Exception as exc:
+        ok, reason = False, f"check error: {exc!r}"
+    results.append(("supervisor", str(sup_pid), ok, reason))
+    for name in _CHECK_ORDER:
+        try:
+            pid_txt, ok, reason = _ps_child_item(
+                name, sup_pid, children.get(name), stale, table, sup_recs)
+        except Exception as exc:
+            pid_txt, ok, reason = "?", False, f"check error: {exc!r}"
+        results.append((name, pid_txt, ok, reason))
+
+    extras: list[int] = []
+    if data is not None and _ps_alive(table, sup_pid):
+        named = {e.get("pid") for e in children.values() if isinstance(e, dict)}
+        extras = sorted(p for p, (pp, st, _a) in table.items()
+                        if pp == sup_pid and not st.startswith("Z") and p not in named)
+    return results, extras
+
+
+def run_check(pidfile: str, status_file: str, max_status_age: float | None) -> int:
+    # Backend: /proc if the seat has one (unchanged path), else ONE ps snapshot.
+    table = None
+    use_proc = os.path.isdir(PROC_ROOT)
+    if not use_proc:
+        table = _ps_snapshot()
+        if table is None:
+            print("CHECK FAIL unsupported platform: no /proc and ps is unusable")
+            return 3
+    try:
+        sup_pid = int(Path(pidfile).read_text().strip())
+        if sup_pid <= 0:
+            raise ValueError(f"non-positive pid {sup_pid}")
+    except (OSError, ValueError) as exc:
+        print(f"CHECK FAIL supervisor not armed: pidfile {pidfile} {exc.__class__.__name__}: {exc}")
+        return 2
+
+    data, stale, note, children = _load_status(status_file, max_status_age)
+    if use_proc:
+        results, extras = _evaluate_proc(sup_pid, data, stale, note, children)
+    else:
+        results, extras = _evaluate_ps(sup_pid, table, data, stale, note, children)
+    return _emit_verdict(results, extras)
 
 
 # ---------------------------------------------------------------------------
@@ -771,7 +988,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--status-interval", type=float, default=DEFAULT_STATUS_INTERVAL_SECONDS)
     p.add_argument("--check", action="store_true",
                     help="Read-only health check of a running supervisor "
-                         "(Linux-only; see module docstring). Prints five "
+                         "(Linux /proc or macOS ps/lsof; see module docstring). Prints five "
                          "lines; exit 0/1/2/3.")
     p.add_argument("--max-status-age", type=float, default=None,
                     help="--check only: max age of the status file in "

@@ -437,14 +437,23 @@ def _load_module():
 
 
 def test_no_proc_exit_3_one_line(tmp_path, monkeypatch, capsys):
-    """Mutation: no /proc gate (falls to pidfile logic / crashes) -> red."""
+    """#3330: exit 3 now means NEITHER backend works -- no /proc AND the
+    injected runner reports ps unusable (previously: no /proc alone). One line,
+    never advising a three-Monitor check.
+    Mutation: no platform gate (falls to pidfile logic / crashes) -> red."""
     mod = _load_module()
     monkeypatch.setattr(mod, "PROC_ROOT", str(tmp_path / "no-such-proc"))
+
+    def no_ps(argv):
+        raise FileNotFoundError("ps")
+
+    monkeypatch.setattr(mod, "CHECK_RUNNER", no_ps)
     with pytest.raises(SystemExit) as ei:
         mod.main(["--check", "--pidfile", str(tmp_path / "p"), "--status-file", str(tmp_path / "s")])
     assert ei.value.code == 3
     lines = capsys.readouterr().out.splitlines()
-    assert len(lines) == 1 and lines[0].startswith("CHECK FAIL unsupported platform: no /proc")
+    assert len(lines) == 1 and lines[0].startswith("CHECK FAIL unsupported platform")
+    assert "three-Monitor" not in lines[0]
 
 
 # ---------------------------------------------------------------------------

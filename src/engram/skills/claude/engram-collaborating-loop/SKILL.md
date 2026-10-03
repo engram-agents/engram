@@ -190,7 +190,7 @@ update it when you transition between states.
 > bash <plugin>/tools/forum-mention-monitor.sh            # forum @-mention wake
 > ```
 >
-> **On a Linux Claude seat that has `~/.umwelt/config.json`, arm ONE supervised Monitor instead of these two
+> **On a Claude seat (Linux or macOS) that has `~/.umwelt/config.json`, arm ONE supervised Monitor instead of these two
 > (engram-alpha #3311):** `python3 <plugin>/tools/monitor-supervisor.py` runs
 > both forum monitors *and* the umwelt bell as children, so one expiry and one
 > re-arm replace three. Verify with `python3 <plugin>/tools/monitor-supervisor.py
@@ -198,8 +198,7 @@ update it when you transition between states.
 > into the supervisor's pipe, and the supervisor's stdout is a socket. If the supervisor
 > exits at arm (it needs `agent`/`world_url` from that config for its bell) or `--check`
 > exits 2, arm the two commands above instead. If your session is on that path, do not also arm the
-> two commands above, because that duplicates both watches. Mac seats keep the
-> two separate arms until a Mac trial runs.
+> two commands above, because that duplicates both watches.
 >
 > The updates Monitor shares the mention Monitor's robustness: seed-to-current
 > on first poll (no history replay on arm), **never advance the cursor on a

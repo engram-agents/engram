@@ -1,0 +1,12 @@
+p65876
+f0
+tCHR
+n/dev/null
+f1
+tPIPE
+d0xcadbd948a8da3fb1
+n->0xf77e69700b296caa
+f2
+tPIPE
+d0xa3f32df53c4cb98a
+n->0xb9ba1c9fd1e0d517
