@@ -40,7 +40,8 @@ import pytest
 # ---------------------------------------------------------------------------
 _THIS_DIR = Path(__file__).parent
 _REPO_ROOT = _THIS_DIR.parent
-_WORKFLOW_PATH = _REPO_ROOT / ".github" / "workflows" / "check-pr-body-close-keyword.yml"
+_WORKFLOW_PATH = _REPO_ROOT / ".github" / "workflows" / "pr-checks.yml"
+_STEP_NAME_PREFIX = "pr-body-close-keyword"
 
 # ---------------------------------------------------------------------------
 # Attempt to import PyYAML; skip entire module if unavailable
@@ -62,10 +63,12 @@ SKIP_NO_YAML = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 def _extract_run_block() -> str:
-    """Extract the ``run: |`` block from the gate workflow via PyYAML.
+    """Extract the ``run: |`` block of the close-keyword step via PyYAML.
 
-    Navigates ``jobs.<first-job>.steps[0].run`` and returns the raw bash
-    string exactly as stored in the YAML.
+    The gate lives as one step inside the combined ``pr-checks.yml`` job (it
+    was a standalone workflow when this test was written; #3344 repointed it).
+    The step is located by name prefix, never by index, so reordering steps
+    does not break the test. Returns the raw bash string as stored in the YAML.
 
     Raises FileNotFoundError if the workflow file is missing.
     Raises KeyError / AssertionError with a descriptive message if the YAML
@@ -75,13 +78,16 @@ def _extract_run_block() -> str:
         wf = _yaml.safe_load(fh)
 
     job = next(iter(wf["jobs"].values()))
-    step = job["steps"][0]
-
-    expected_name = "Fail on off-target close-keyword in the PR body"
-    assert step.get("name") == expected_name, (
-        f"Expected step[0].name == {expected_name!r}; got {step.get('name')!r}. "
-        "The workflow structure may have changed — update this test accordingly."
+    matches = [
+        st for st in job["steps"]
+        if str(st.get("name", "")).startswith(_STEP_NAME_PREFIX)
+    ]
+    assert len(matches) == 1, (
+        f"Expected exactly one step named {_STEP_NAME_PREFIX!r}...; "
+        f"found {len(matches)}. The workflow structure may have changed — "
+        "update this test accordingly."
     )
+    step = matches[0]
     run_block = step["run"]
     # Guard against a vacuous suite: if the run-block is ever emptied by a
     # refactor, an empty bash script exits 0 and every FAIL/WARN-expected
@@ -116,7 +122,17 @@ class Verdict(NamedTuple):
         return "PASS"
 
 
+def _run_output(run_block: str, pr_title: str, pr_body: str) -> str:
+    """Return combined stdout+stderr of the gate for the given title/body."""
+    result = _run_raw(run_block, pr_title, pr_body)
+    return result.stdout + result.stderr
+
+
 def _run_gate(run_block: str, pr_title: str, pr_body: str) -> Verdict:
+    return Verdict.from_result(_run_raw(run_block, pr_title, pr_body))
+
+
+def _run_raw(run_block: str, pr_title: str, pr_body: str) -> subprocess.CompletedProcess:
     """Write *run_block* to a temp .sh and execute it with the given env vars."""
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".sh", delete=False, encoding="utf-8"
@@ -137,7 +153,7 @@ def _run_gate(run_block: str, pr_title: str, pr_body: str) -> Verdict:
             capture_output=True,
             text=True,
         )
-        return Verdict.from_result(result)
+        return result
     finally:
         os.unlink(tmp_path)
 
@@ -257,3 +273,230 @@ class TestCloseKeywordGate:
         """'CLOSES #11' (all-caps) — the gate grep is case-insensitive (-i flag)."""
         v = _run_gate(run_block, "feat: thing [closes #10]", "CLOSES #11.")
         assert v.label == "FAIL", f"expected FAIL; got {v}"
+
+    # ------------------------------------------------------------------
+    # #3344: [part of #N] title + body that would auto-close #N
+    # ------------------------------------------------------------------
+
+    def test_part_of_negated_close_fails(self, run_block: str) -> None:
+        """The real case (#3341): partial PR whose body says 'does not close #N'."""
+        v = _run_gate(
+            run_block, "fix: slice [part of #3197]", "This does not close #3197"
+        )
+        assert v.label == "FAIL", f"expected FAIL; got {v}"
+
+    def test_part_of_fail_message_names_safe_paraphrase(self, run_block: str) -> None:
+        """The failure must teach the fix: safe paraphrase + negation ignored."""
+        out = _run_output(
+            run_block, "fix: slice [part of #3197]", "This does not close #3197"
+        )
+        assert "stays open" in out and "part of #3197" in out
+        assert "negation" in out
+
+    def test_part_of_case_insensitive_title_fails(self, run_block: str) -> None:
+        v = _run_gate(run_block, "fix: slice [Part Of #3197]", "Fixes #3197")
+        assert v.label == "FAIL", f"expected FAIL; got {v}"
+
+    def test_part_of_backticked_keyword_passes(self, run_block: str) -> None:
+        """Inline code span: the real parser ignores it (#1191), so must we."""
+        v = _run_gate(run_block, "fix: slice [part of #3197]", "`closes #3197`")
+        assert v.label != "FAIL", f"expected non-FAIL; got {v}"
+
+    def test_part_of_backtick_fence_keyword_passes(self, run_block: str) -> None:
+        body = "Example:\n```\ncloses #3197\n```\nDone."
+        v = _run_gate(run_block, "fix: slice [part of #3197]", body)
+        assert v.label != "FAIL", f"expected non-FAIL; got {v}"
+
+    def test_part_of_tilde_fence_keyword_passes(self, run_block: str) -> None:
+        body = "Example:\n~~~\ncloses #3197\n~~~\nDone."
+        v = _run_gate(run_block, "fix: slice [part of #3197]", body)
+        assert v.label != "FAIL", f"expected non-FAIL; got {v}"
+
+    def test_part_of_keyword_after_fence_still_fails(self, run_block: str) -> None:
+        """Stripping is scoped to the fence: a keyword AFTER it still counts."""
+        body = "```\nx\n```\nThis does not close #3197"
+        v = _run_gate(run_block, "fix: slice [part of #3197]", body)
+        assert v.label == "FAIL", f"expected FAIL; got {v}"
+
+    def test_part_of_safe_paraphrase_passes(self, run_block: str) -> None:
+        v = _run_gate(run_block, "fix: slice [part of #3197]", "#3197 stays open")
+        assert v.label == "PASS", f"expected PASS; got {v}"
+
+    def test_part_of_off_target_keyword_is_existing_warn(self, run_block: str) -> None:
+        """Keyword for a DIFFERENT issue: not this rule — existing WARN, exit 0."""
+        v = _run_gate(run_block, "fix: slice [part of #3197]", "closes #9999")
+        assert v.label == "WARN", f"expected WARN; got {v}"
+        assert v.exit_code == 0
+
+    def test_closes_title_legit_close_unchanged(self, run_block: str) -> None:
+        v = _run_gate(run_block, "fix: thing [closes #3197]", "Closes #3197.")
+        assert v.label == "PASS", f"expected PASS; got {v}"
+
+    def test_part_of_multiple_numbers_keyword_on_second_fails(
+        self, run_block: str
+    ) -> None:
+        v = _run_gate(
+            run_block,
+            "fix: slice [part of #3197] [part of #2574]",
+            "does not close #2574",
+        )
+        assert v.label == "FAIL", f"expected FAIL; got {v}"
+
+    # ------------------------------------------------------------------
+    # #3344 round 1: stripper edge cases (CommonMark fence / span rules)
+    # ------------------------------------------------------------------
+
+    # "Passes" below means: this rule does not fire. The pre-existing
+    # no-title-target WARN may still show (raw grep), so assert != FAIL.
+    _PART_OF = "fix: slice [part of #5]"
+
+    def test_part_of_long_fence_with_inner_short_fence_passes(
+        self, run_block: str
+    ) -> None:
+        """4-backtick block holding a 3-backtick line: the inner line does NOT
+        close it, so the keyword after it is still inside the block."""
+        body = "````\n```\ncloses #5\n````\nDone."
+        v = _run_gate(run_block, self._PART_OF, body)
+        assert v.label != "FAIL", f"expected non-FAIL; got {v}"
+
+    def test_part_of_long_fence_keyword_after_close_fails(
+        self, run_block: str
+    ) -> None:
+        """The 4-backtick block still closes at a 4-backtick line."""
+        body = "````\n```\nx\n````\nThis does not close #5"
+        v = _run_gate(run_block, self._PART_OF, body)
+        assert v.label == "FAIL", f"expected FAIL; got {v}"
+
+    def test_part_of_open3_close4_fence_closes(self, run_block: str) -> None:
+        """A closing run LONGER than the opener closes it; keyword after FAILs."""
+        body = "```\nx\n````\nThis does not close #5"
+        v = _run_gate(run_block, self._PART_OF, body)
+        assert v.label == "FAIL", f"expected FAIL; got {v}"
+
+    def test_part_of_tilde_not_closed_by_backticks(self, run_block: str) -> None:
+        """Closing fence must be the same character as the opener."""
+        body = "~~~\n```\ncloses #5\n~~~\nDone."
+        v = _run_gate(run_block, self._PART_OF, body)
+        assert v.label != "FAIL", f"expected non-FAIL; got {v}"
+
+    def test_part_of_double_backtick_span_passes(self, run_block: str) -> None:
+        v = _run_gate(run_block, self._PART_OF, "use ``closes #5`` ok")
+        assert v.label != "FAIL", f"expected non-FAIL; got {v}"
+
+    def test_part_of_double_backtick_span_holding_single_tick_passes(
+        self, run_block: str
+    ) -> None:
+        """A k=2 span is not closed by a run of 1."""
+        v = _run_gate(run_block, self._PART_OF, "use ``a ` closes #5`` ok")
+        assert v.label != "FAIL", f"expected non-FAIL; got {v}"
+
+    def test_part_of_unmatched_backtick_run_keeps_keyword_scanned(
+        self, run_block: str
+    ) -> None:
+        """No closing run of the same length: the run is literal, not a span."""
+        v = _run_gate(run_block, self._PART_OF, "``closes #5`")
+        assert v.label == "FAIL", f"expected FAIL; got {v}"
+
+    def test_part_of_crlf_fenced_keyword_passes(self, run_block: str) -> None:
+        body = "Example:\r\n```\r\ncloses #5\r\n```\r\nDone."
+        v = _run_gate(run_block, self._PART_OF, body)
+        assert v.label != "FAIL", f"expected non-FAIL; got {v}"
+
+    def test_part_of_crlf_bare_keyword_fails(self, run_block: str) -> None:
+        body = "Intro\r\nThis does not close #5\r\n"
+        v = _run_gate(run_block, self._PART_OF, body)
+        assert v.label == "FAIL", f"expected FAIL; got {v}"
+
+    @pytest.mark.parametrize("indent", [1, 2, 3])
+    def test_part_of_fence_indented_up_to_3_is_a_fence(
+        self, run_block: str, indent: int
+    ) -> None:
+        """CommonMark: a fence may be indented AT MOST 3 spaces. Deliberately
+        changed from the earlier pin (any indent): 2 spaces is still a fence."""
+        pad = " " * indent
+        body = f"{pad}```\n{pad}closes #5\n{pad}```\nDone."
+        v = _run_gate(run_block, self._PART_OF, body)
+        assert v.label != "FAIL", f"expected non-FAIL; got {v}"
+
+    @pytest.mark.parametrize("indent", [4, 5])
+    def test_part_of_fence_indented_4plus_is_not_a_fence(
+        self, run_block: str, indent: int
+    ) -> None:
+        """CommonMark: 4+ spaces is an indented code block, not a fence.
+        Deliberately changed from the earlier pin (5 spaces was a fence): the
+        keyword is now scanned (fail-closed). Accepted cost: a fence nested in
+        a list item at 4+ spaces is scanned too."""
+        pad = " " * indent
+        body = f"{pad}```\n{pad}closes #5\n{pad}```\nDone."
+        v = _run_gate(run_block, self._PART_OF, body)
+        assert v.label == "FAIL", f"expected FAIL; got {v}"
+
+    def test_part_of_4plus_indented_fence_marker_does_not_swallow_rest(
+        self, run_block: str
+    ) -> None:
+        body = "    ```\nThis does not close #5"
+        v = _run_gate(run_block, self._PART_OF, body)
+        assert v.label == "FAIL", f"expected FAIL; got {v}"
+
+    def test_part_of_line_starting_with_inline_triple_span_is_not_a_fence(
+        self, run_block: str
+    ) -> None:
+        """A backtick fence's info string cannot contain a backtick, so a line
+        that BEGINS with an inline triple-backtick span is not a fence opener."""
+        body = "```x``` is the form.\nThis does not close #5."
+        v = _run_gate(run_block, self._PART_OF, body)
+        assert v.label == "FAIL", f"expected FAIL; got {v}"
+
+    def test_part_of_info_string_fence_keyword_passes(self, run_block: str) -> None:
+        body = "```python\ncloses #5\n```\nDone."
+        v = _run_gate(run_block, self._PART_OF, body)
+        assert v.label != "FAIL", f"expected non-FAIL; got {v}"
+
+    def test_part_of_info_string_fence_trap_after_close_fails(
+        self, run_block: str
+    ) -> None:
+        body = "```python\nx = 1\n```\nThis does not close #5."
+        v = _run_gate(run_block, self._PART_OF, body)
+        assert v.label == "FAIL", f"expected FAIL; got {v}"
+
+    @pytest.mark.parametrize("body", ["prefix #5", "disclosed #5", "unfixed #5"])
+    def test_part_of_keyword_inside_a_longer_word_is_not_flagged(
+        self, run_block: str, body: str
+    ) -> None:
+        v = _run_gate(run_block, self._PART_OF, body)
+        assert v.label != "FAIL", f"expected non-FAIL; got {v}"
+
+    @pytest.mark.parametrize(
+        "body", ["Fixes #5", "(closes #5)", "x\nResolved #5", "-fixed #5"]
+    )
+    def test_part_of_keyword_at_a_word_start_still_fails(
+        self, run_block: str, body: str
+    ) -> None:
+        v = _run_gate(run_block, self._PART_OF, body)
+        assert v.label == "FAIL", f"expected FAIL; got {v}"
+
+    def test_part_of_unterminated_fence_swallows_rest(self, run_block: str) -> None:
+        """CommonMark: an unclosed fence runs to the end of the document, so a
+        keyword after it is code, not text. Pinned."""
+        body = "```\nstill code\nThis does not close #5"
+        v = _run_gate(run_block, self._PART_OF, body)
+        assert v.label != "FAIL", f"expected non-FAIL; got {v}"
+
+    def test_part_of_fail_message_does_not_overclaim(self, run_block: str) -> None:
+        out = _run_output(run_block, self._PART_OF, "This does not close #5")
+        assert "multi-line spans and indented code blocks are not recognised" in out
+
+
+@SKIP_NO_YAML
+def test_pr_checks_invokes_this_test_file() -> None:
+    """Wiring guard (#3344): tools/test_*.py is outside tests.yml's pytest roots,
+    so pr-checks.yml must run this file itself or it silently runs nowhere."""
+    with open(_WORKFLOW_PATH, encoding="utf-8") as fh:
+        wf = _yaml.safe_load(fh)
+    job = next(iter(wf["jobs"].values()))
+    needle = "pytest tools/test_pr_body_close_keyword_gate.py"
+    wired = [st for st in job["steps"] if needle in str(st.get("run", ""))]
+    assert wired, (
+        f"No pr-checks.yml step runs {needle!r}; this test file would run "
+        "nowhere in CI and rot."
+    )

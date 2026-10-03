@@ -374,6 +374,88 @@ jobs:
             exit 0
           fi
 
+          # #3344 — a `[part of #N]` title means "#N stays open", so ANY body
+          # close-keyword for that same N is the negated-close trap ("this does
+          # not close #N" auto-closes #N: the parser ignores negation). Unlike
+          # the checks around it, this rule STRIPS fenced blocks (``` / ~~~) and
+          # inline code spans first (rules below), because the real parser ignores keywords
+          # inside them (#1191, #2630) — unstripped it false-fires on safe
+          # backticked examples (measured: #2759). The no-title-target WARN and
+          # the off-target check below are unchanged and still grep raw.
+          PART_OF_NS=$(printf '%s' "$PR_TITLE" \
+            | grep -ioE '\[part[[:space:]]+of[[:space:]]+#[0-9]+\]' \
+            | grep -oE '[0-9]+' | sort -u)
+          if [ -n "$PART_OF_NS" ]; then
+            # CommonMark rules, per line: a fence opened by a run of N >= 3
+            # backticks (or tildes) closes only at a line starting with a run of
+            # the SAME character at least N long; an unterminated fence swallows
+            # the rest of the body. A fence may be indented at most 3 spaces
+            # (a tab counts to the next multiple of 4); 4+ is an indented code
+            # block, not a fence, so its keyword is scanned (fail-closed; this
+            # also scans a fence nested in a list item at 4+ spaces). A
+            # backtick fence line whose info string holds a backtick (e.g. a
+            # line that begins with an inline triple-backtick span) is not a
+            # fence. An inline span opened by a run
+            # of k backticks closes at the next run of EXACTLY k on the same
+            # line; an unmatched run is literal. Multi-line spans and indented
+            # code blocks (4+ spaces, fence markers included) are NOT recognised,
+            # so they stay scanned (fail-closed).
+            STRIPPED_BODY=$(printf '%s\n' "$PR_BODY" | awk '
+              function runlen(s, i, c,   n) {
+                n = 0
+                while (substr(s, i + n, 1) == c) n++
+                return n
+              }
+              function strip_spans(s,   out, i, k, j, m, found) {
+                out = ""; i = 1
+                while (i <= length(s)) {
+                  if (substr(s, i, 1) != "`") { out = out substr(s, i, 1); i++; continue }
+                  k = runlen(s, i, "`"); j = i + k; found = 0
+                  while (j <= length(s)) {
+                    if (substr(s, j, 1) == "`") {
+                      m = runlen(s, j, "`")
+                      if (m == k) { found = 1; break }
+                      j += m
+                    } else j++
+                  }
+                  if (found) i = j + k
+                  else { out = out substr(s, i, k); i += k }
+                }
+                return out
+              }
+              {
+                line = $0; w = 0; p = 1
+                while ((ch = substr(line, p, 1)) == " " || ch == "\t") {
+                  w += (ch == "\t") ? 4 - (w % 4) : 1; p++
+                }
+                line = substr(line, p)
+                c = substr(line, 1, 1); n = 0
+                if (c == "`" || c == "~") n = runlen(line, 1, c)
+                if (w >= 4) n = 0
+                if (c == "`" && n >= 3 && index(substr(line, n + 1), "`") > 0) n = 0
+              }
+              infence != "" {
+                if (c == infence && n >= fencelen) infence = ""
+                next
+              }
+              n >= 3 { infence = c; fencelen = n; next }
+              { print strip_spans($0) }')
+            STRIPPED_MS=$(printf '%s' "$STRIPPED_BODY" \
+              | grep -ioE '\b(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]+#[0-9]+' \
+              | grep -oE '[0-9]+' | sort -u)
+            PART_OF_TRAPS=$(printf '%s\n' "$STRIPPED_MS" | grep -xF "$PART_OF_NS" || true)
+            if [ -n "$PART_OF_TRAPS" ]; then
+              for N in $PART_OF_TRAPS; do
+                echo "::error::The title says [part of #$N] but the PR body has a close-keyword for #$N, so merging this PR would auto-close #$N."
+              done
+              echo ""
+              echo "GitHub's auto-close parser ignores negation, so 'this does not close #N' closes #N exactly like 'closes #N'. Keywords inside inline code spans (any backtick-run length, same line) or fenced blocks (~~~ / \`\`\`, closed by a same-character run at least as long as the opener) are ignored by the parser and are not flagged; multi-line spans and indented code blocks are not recognised, so a keyword there is still flagged. A fence indented 4 or more spaces is not a fence (CommonMark allows at most 3)."
+              echo "Paraphrase so no close-keyword precedes the number:"
+              echo "  instead of: \"does not close #N\"   use: \"#N stays open\" or \"part of #N\""
+              exit 1
+            fi
+          fi
+
           # No title target → can't distinguish intended-close from trap.
           # Per Borges #756: WARN, don't hard-fail — may be a partial/EPIC slice
           # referencing an umbrella; the final PR in the series carries the title tag.
@@ -602,6 +684,16 @@ jobs:
         # matches directory. Fails on the first YAML-breaking colon or malformed
         # frontmatter block.
         run: python3 -m pytest tests/test_skill_frontmatter_lint.py -q
+
+      - name: invariant-checks — close-keyword gate tests (#3344)
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
+        # tools/test_*.py is outside tests.yml's `pytest tests/ src/forum/tests/`
+        # roots, so without this step the gate's own tests ran nowhere and rotted
+        # (13 errors against a deleted workflow file). The harness extracts the
+        # pr-body-close-keyword step from this file and runs it hermetically;
+        # needs only pytest + pyyaml (installed above). A harness test asserts
+        # this step stays wired.
+        run: python3 -m pytest tools/test_pr_body_close_keyword_gate.py -q
 
       - name: invariant-checks — health L0 set hash (MAJOR-bump gate)
         if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
