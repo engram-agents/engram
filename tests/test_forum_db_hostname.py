@@ -43,15 +43,29 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SRC_FORUM = _REPO_ROOT / "src" / "forum"
 sys.path.insert(0, str(_SRC_FORUM.parent))
-# Belt-and-braces, not a no-op: the paragraph above rules out today's only
-# known culprit (test_forum_backup.py never imports the name "forum"), not
-# every possible one. Any future alphabetically-earlier file that DOES
-# `import forum` before this one collects would leave a stale module object
-# cached under the shadowed `tools/forum.py` resolution; this pop keeps that
-# case from silently surviving the sys.path fix above. Cheap, so kept even
-# though it fires on no known case today (Ariadne, colleague review, #2064).
-for _stale in [k for k in sys.modules if k == "forum" or k.startswith("forum.")]:
-    del sys.modules[_stale]
+# Stale-module handling (#2064, narrowed by #3335): an alphabetically-earlier
+# file that DOES `import forum` could leave a module cached from somewhere
+# other than `src/forum/` (e.g. the shadowing `tools/forum.py`), so that
+# shadow and its `forum.*` entries are dropped before the import below. A
+# cached `forum` that IS the real package (its __file__ is under `src/forum/`)
+# is left alone: the old unconditional deletion replaced the module objects
+# src/forum/tests/test_packs.py had already imported, and its
+# TestMissingValidatorReturns503 then returned 201 instead of 503. A cached
+# module with no __file__ is treated as a shadow.
+_cached_forum = sys.modules.get("forum")
+if _cached_forum is not None:
+    _cached_file = getattr(_cached_forum, "__file__", None)
+    try:
+        _is_real_pkg = _cached_file is not None and Path(
+            _cached_file
+        ).resolve().is_relative_to(_SRC_FORUM.resolve())
+    except (OSError, ValueError):
+        _is_real_pkg = False
+    if not _is_real_pkg:
+        for _stale in [
+            k for k in sys.modules if k == "forum" or k.startswith("forum.")
+        ]:
+            del sys.modules[_stale]
 
 from forum import db
 
