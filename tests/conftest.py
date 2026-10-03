@@ -199,6 +199,31 @@ if "ENGRAM_HOME" not in os.environ:
     os.environ["ENGRAM_HOME"] = _FALLBACK_ENGRAM_HOME
 
 
+# #3328 -- keys that test helpers write straight into os.environ (not via
+# monkeypatch) and never restore. Twelve tests/test_session_start_hook_*.py
+# _load_hook_module helpers set ENGRAM_HOME to a long pytest tmp_path (and the
+# effective_role one also sets ENGRAM_SESSION_ROLE / pops ENGRAM_RUNTIME_DIR);
+# the leak overwrote this conftest's short throwaway ENGRAM_HOME for every later
+# test in the process, which grows _hooklib's load-time overflow placeholder and
+# flipped test_hook_injection_bounds depending on what ran before it.
+_LEAKY_ENV_KEYS = ("ENGRAM_HOME", "ENGRAM_SESSION_ROLE", "ENGRAM_RUNTIME_DIR")
+
+
+@pytest.fixture(autouse=True)
+def _restore_leaky_env_keys():
+    """Restore ENGRAM_HOME / ENGRAM_SESSION_ROLE / ENGRAM_RUNTIME_DIR after each test.
+
+    Snapshot at setup (present-or-absent), restore at teardown: re-set a key the
+    test changed or popped, re-delete a key that was absent before the test."""
+    before = {k: os.environ.get(k) for k in _LEAKY_ENV_KEYS}
+    yield
+    for k, v in before.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
 @pytest.fixture(autouse=True)
 def _stop_snapshot_worker():
     """Stop + reset the #1673 async snapshot worker after each test.
