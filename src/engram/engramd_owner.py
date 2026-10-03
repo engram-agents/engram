@@ -227,6 +227,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 import platform
 import shutil
@@ -245,6 +246,7 @@ from pathlib import Path
 import engram_pidfile
 import engram_walguard
 import engramd_client as ec
+import engramd_read_registry as rr
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -708,6 +710,50 @@ def _arm_read_deadline(
     conn.set_progress_handler(_check, n)
 
 
+# ---------------------------------------------------------------------------
+# Read-template registry wiring (U4c, #3196). Resolved and loaded in start(),
+# BEFORE the socket is bound; the owner gains NO socket operation from it.
+# ---------------------------------------------------------------------------
+
+READ_TEMPLATES_FILENAME = "engramd_read_templates.json"
+
+
+def _find_read_templates_path() -> "Path | None":
+    """Locate the committed template list WITHOUT assuming the source
+    layout (project CLAUDE.md, "Plugin build restructures code paths"):
+    the file BESIDE this module first, then `$CLAUDE_PLUGIN_ROOT`, then the
+    nearest ancestor of this module that actually contains the file -- never
+    a fixed `parents[N]`. The data file ships beside the module in both the
+    source and the flattened plugin layouts, so a stale CLAUDE_PLUGIN_ROOT
+    must not override it. None if it cannot be found (the registry is then
+    EMPTY: everything refused)."""
+    sibling = Path(__file__).resolve().with_name(READ_TEMPLATES_FILENAME)
+    if sibling.is_file():
+        return sibling
+    root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if root:
+        cand = Path(root) / READ_TEMPLATES_FILENAME
+        if cand.is_file():
+            return cand
+    here = Path(__file__).resolve()
+    for d in here.parents:
+        cand = d / READ_TEMPLATES_FILENAME
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _read_install_tier(engram_home: Path) -> "str | None":
+    """`install_tier` from `<ENGRAM_HOME>/config.json`; None if absent or
+    unreadable (which `resolve_dynamic_flag` treats as not-dev)."""
+    try:
+        cfg = json.loads((engram_home / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    tier = cfg.get("install_tier") if isinstance(cfg, dict) else None
+    return tier if isinstance(tier, str) else None
+
+
 class _ClientReadGate:
     """Holds ONLY the client-read connection. Any future client-facing
     read operation (U4c's read-template registry, U4d's real client
@@ -720,15 +766,48 @@ class _ClientReadGate:
     by this unit, is what checks the floor can't be bypassed by a
     registry bug)."""
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, registry: "rr.Registry | None" = None) -> None:
         self._conn = conn
+        # U4c (#3196): the read-template registry. None means the EMPTY
+        # registry -- a gate built without one refuses everything; it never
+        # defaults to permissive.
+        self._registry = registry if registry is not None else rr.EMPTY_REGISTRY
 
-    def execute(self, sql: str, params: tuple = (), *, deadline: float) -> list:
-        """Minimal execute-with-deadline path, exercised by this build's
-        own tests (12, 19, 22) standing in for the not-yet-built real
-        client dispatch. Not a public operation of this build -- no
-        `method` in `EngramdOwner._dispatch()` calls this; nothing wires
-        a real client to it yet."""
+    def execute(self, sql: str, params: tuple = (), *, deadline: float):
+        """Registry lookup FIRST (R1-R3, R8), then the existing deadline
+        path. A refused request is RETURNED as an `rr.Rejected` -- never
+        raised, and nothing is prepared on the connection (R2). An admitted
+        statement runs the deadline path unchanged; its authorizer and
+        resource bounds remain the second, independent layer (R9)."""
+        refusal = self._registry.check(sql, params)
+        if refusal is not None:
+            return refusal
+        try:
+            return self._execute_admitted(sql, params, deadline=deadline)
+        except sqlite3.OperationalError as exc:
+            # The split is by SQLite's own error code. SQLITE_ERROR (1) is a
+            # statement-level error from a bad parameter (e.g. malformed JSON
+            # into json_each(?)): the CLIENT's fault, so it is returned. The
+            # deadline abort (SQLITE_INTERRUPT, 9) and the resource-limit abort
+            # (sqlite3.DataError / SQLITE_TOOBIG, not an OperationalError) are
+            # the OWNER's controls and propagate to the dispatcher. No
+            # sqlite_errorcode (Python < 3.11): not convertible -- fail loud.
+            if getattr(exc, "sqlite_errorcode", None) != 1:
+                raise
+            logging.getLogger("engramd_owner").warning(
+                "admitted read failed at execution (template %s): %s: %s",
+                rr.template_key(sql), type(exc).__name__, exc)
+            return rr.Rejected(
+                reason="read_failed",
+                detail=f"{type(exc).__name__}: {exc}"[:200],
+                remedy="the statement was admitted but failed at execution; if the parameters "
+                "are valid this may be an owner-side fault (schema drift), see the owner log",
+            )
+
+    def _execute_admitted(self, sql: str, params: tuple, *, deadline: float) -> list:
+        """The deadline-armed execute path, reached only for a statement the
+        registry admitted. Stands in for the not-yet-built real client
+        dispatch (U4d); no `method` in `EngramdOwner._dispatch()` calls it."""
         _arm_read_deadline(self._conn, deadline)
         try:
             return self._conn.execute(sql, params).fetchall()
@@ -857,6 +936,14 @@ class EngramdOwner:
         """
         self._check_platform_support()
 
+        # R4 (#3196): the dynamic-template escape hatch is resolved FIRST,
+        # before any file, connection or socket is touched -- a flag set on
+        # a non-dev install raises DynamicTemplatesRefused with nothing
+        # to clean up.
+        dynamic_templates = rr.resolve_dynamic_flag(
+            os.environ, _read_install_tier(self.engram_home)
+        )
+
         self.engram_home.mkdir(parents=True, exist_ok=True)
 
         # `run/` (the socket's parent) MUST be hardened -- and, load-
@@ -915,7 +1002,13 @@ class EngramdOwner:
         # The structurally-isolated object a future client-facing read
         # would call through (test 22) -- holds ONLY the connection just
         # opened above, never `_owner_conn`.
-        self._client_read_gate = _ClientReadGate(self._client_read_conn)
+        # U4c (#3196): the read-template registry, loaded and RE-CLASSIFIED
+        # against the live store's schema (R12) BEFORE the socket binds.
+        # Any load problem yields an EMPTY registry (everything refused),
+        # never a permissive one.
+        self._client_read_gate = _ClientReadGate(
+            self._client_read_conn, self._load_read_registry(dynamic_templates)
+        )
 
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._bind_socket_or_raise()
@@ -942,6 +1035,30 @@ class EngramdOwner:
         self._shutdown.clear()
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._accept_thread.start()
+
+    def _load_read_registry(self, dynamic: bool) -> "rr.Registry":
+        """Load the committed template list, classifying each template
+        against a DEDICATED short-lived read-only connection to the live
+        store (the audit installs an authorizer, so it must never run on
+        `_owner_conn` or `_client_read_conn`)."""
+        # An unfindable file is handed to the loader as a nonexistent path:
+        # it logs once and returns the EMPTY registry (R12).
+        path = _find_read_templates_path() or (self.engram_home / (READ_TEMPLATES_FILENAME + ".not-found"))
+        schema_conn = None
+        loaded = False
+        try:
+            schema_conn = sqlite3.connect(self.store_path.resolve().as_uri() + "?mode=ro", uri=True)
+            registry = rr.load_registry(path, schema_conn, dynamic=dynamic)
+            loaded = True
+            return registry
+        except Exception as exc:  # fail closed: an unloadable registry is an empty one
+            logging.getLogger("engramd_owner").warning(
+                "read-template registry load failed (%s: %s); registry is EMPTY",
+                type(exc).__name__, exc)
+            return rr.EMPTY_REGISTRY
+        finally:
+            if schema_conn is not None and (not dynamic or not loaded):
+                schema_conn.close()
 
     def _check_platform_support(self) -> None:
         """Refuse to start rather than silently degrade the permission

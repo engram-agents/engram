@@ -128,6 +128,7 @@ if _SRC_ENGRAM not in sys.path:
 
 import engramd_client as ec  # noqa: E402
 import engramd_owner as eo  # noqa: E402
+import engramd_read_registry as rr  # noqa: E402
 
 # setfacl/getfacl availability -- tests 11 (ACL) rely on real POSIX-ACL
 # tooling; the whole class of test is Linux-ACL-specific and skips
@@ -2291,7 +2292,14 @@ def test_expensive_read_is_aborted_by_deadline_and_cheap_read_is_not(owner_runni
     not a fixed constant: shortening the deadline must shorten the abort
     point.
     """
-    gate = owner_running._client_read_gate
+    # U4c (#3196): the owner's own gate now refuses every statement not in
+    # the committed template list, so this test (whose subject is the
+    # deadline axis, not the registry) gets a gate over the SAME client-read
+    # connection with a fixture registry admitting the two statements it uses.
+    fixture_registry = rr.build_registry(
+        ["SELECT 1", _EXPENSIVE_CARTESIAN_SQL], sqlite3.connect(":memory:")
+    )
+    gate = eo._ClientReadGate(owner_running._client_read_conn, registry=fixture_registry)
 
     # Cheap read: comfortably under a generous deadline, completes.
     rows = gate.execute("SELECT 1", deadline=time.monotonic() + 5.0)
@@ -2507,14 +2515,21 @@ def test_single_value_size_is_bounded_independently_of_progress_handler(owner_ru
     zeroblob STILL returns in full -- proving the handler is not what
     bounds size.
     """
-    gate = owner_running._client_read_gate
     limit = eo.CLIENT_READ_LIMIT_LENGTH
+    # U4c (#3196): a `?` inside a function argument (`zeroblob(?)`) is an
+    # unsafe placeholder the registry refuses (R7), so the two statements are
+    # registered as LITERALS carrying the same sizes (limit-1 / limit+1), over
+    # a fixture registry on the owner's real client-read connection.
+    under_sql = f"SELECT length(zeroblob({limit - 1}))"
+    over_sql = f"SELECT zeroblob({limit + 1})"
+    fixture_registry = rr.build_registry([under_sql, over_sql], sqlite3.connect(":memory:"))
+    gate = eo._ClientReadGate(owner_running._client_read_conn, registry=fixture_registry)
 
-    under = gate.execute("SELECT length(zeroblob(?))", (limit - 1,), deadline=time.monotonic() + 5.0)
+    under = gate.execute(under_sql, deadline=time.monotonic() + 5.0)
     assert under == [(limit - 1,)]
 
     with pytest.raises(sqlite3.Error):
-        gate.execute("SELECT zeroblob(?)", (limit + 1,), deadline=time.monotonic() + 5.0)
+        gate.execute(over_sql, deadline=time.monotonic() + 5.0)
 
     # Control: progress handler armed but never firing (generous
     # deadline), and NO setlimit anywhere on this bare connection -- the

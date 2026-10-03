@@ -316,6 +316,13 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/engramd_read_scan.py",
+      "test_globs": [
+        "tests/test_engramd_read_scan.py"
+      ],
+      "note": "engram-alpha#3196 (U4c): loaded by tests/test_engramd_read_scan.py via importlib (file path), so it is invisible to the layer-1 import graph."
+    },
+    {
       "path_prefix_or_glob": "tools/dream_lottery.py",
       "test_globs": [
         "tests/test_dream_lottery.py"
