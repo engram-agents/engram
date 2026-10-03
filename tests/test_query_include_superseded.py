@@ -470,6 +470,73 @@ def test_query_include_superseded_semantic_path():
         core._embedder = original_embedder
 
 
+def test_semantic_search_ignores_enabled_false():
+    """(#345 PR2, A2) _semantic_search (engram_core.py ~7855) no longer
+    consults the retired `enabled` key: with `enabled: False` in the
+    mocked config, a current node must still surface via the real
+    cosine-similarity slow path (mirrors
+    test_query_include_superseded_semantic_path's mock-embedder pattern).
+
+    Mutation target: restoring the `emb_config.get("enabled", True)`
+    short-circuit here turns this RED (an empty list is returned instead
+    of the matching node).
+    """
+    core, obs, rev = _fresh_mods()
+
+    conn = core._get_db()
+    now = "2026-01-01T00:00:00"
+    fake_emb = json.dumps([1.0, 0.0, 0.0])
+
+    try:
+        conn.execute(
+            "INSERT INTO nodes (id, type, claim, created_at, is_current, status, embedding, "
+            "confidence, importance_score, quote_type, metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            ("sem_cur_345", "observation_factual",
+             "current node sem345enabledignore uniquemarkersem", now,
+             1, None, fake_emb, 0.85, 0.5, "hard_data", "{}"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    class _MockEmbedder:
+        def is_available(self):
+            return True
+
+        def embed(self, text, model_name):
+            return [1.0, 0.0, 0.0]
+
+        @staticmethod
+        def cosine_similarity(a, b):
+            dot = sum(x * y for x, y in zip(a, b))
+            norm_a = sum(x * x for x in a) ** 0.5
+            norm_b = sum(x * x for x in b) ** 0.5
+            if norm_a == 0 or norm_b == 0:
+                return 0.0
+            return dot / (norm_a * norm_b)
+
+    original_embedder = core._embedder
+    original_get_config = core._get_embedding_config
+    core._embedder = _MockEmbedder()
+    core._get_embedding_config = lambda: {"enabled": False, "model": "x"}
+    try:
+        conn2 = core._get_db()
+        try:
+            results = core._semantic_search(
+                conn2, "sem345enabledignore uniquemarkersem",
+                top_k=10, min_similarity=0.5,
+            )
+            ids = {r["id"] for r in results}
+            assert "sem_cur_345" in ids, (
+                f"expected the current node to surface despite enabled=False, got {ids}"
+            )
+        finally:
+            conn2.close()
+    finally:
+        core._embedder = original_embedder
+        core._get_embedding_config = original_get_config
+
+
 if __name__ == "__main__":
     import traceback
 

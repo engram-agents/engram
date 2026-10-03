@@ -2907,9 +2907,10 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     restore-completeness regeneration thread (#3075 C5 round 2) AFTER
     releasing _db_setup_lock -- see the "Restore-completeness check" block
     below and _run_embedding_restore_regeneration's own docstring. False in
-    every other case (no NULL embeddings, embeddings disabled by config, or
-    the embedder is unavailable -- those last two are handled synchronously,
-    in-line, before this function returns). The caller (_get_db()) MUST NOT
+    every other case (no NULL embeddings, or the embedder is unavailable --
+    that last case is handled synchronously, in-line, before this function
+    returns; #345 PR2 retired the separate "disabled by config" case, which
+    used to also return False here). The caller (_get_db()) MUST NOT
     start that thread while still holding _db_setup_lock -- doing so is
     exactly the round-1 defect this round fixes.
     """
@@ -3473,18 +3474,12 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
         if not _fresh_regeneration_lease_held(conn):
             _null_emb_before = _count_missing_embeddings(conn)
             if _null_emb_before > 0:
-                emb_config = _get_embedding_config()
-                if not emb_config.get("enabled", True):
-                    # Gate the REGENERATION on `enabled` (Borges's ruling,
-                    # point 3) -- but the FLAG still fires, naming the
-                    # cause, matching the server.py:8017 startup-gate
-                    # precedent's own wording for why a deliberate opt-out
-                    # stays non-fatal.
-                    _set_embedding_restore_flag(
-                        conn, null_count=_null_emb_before, cause="disabled-by-config",
-                        respect_lease=True,
-                    )
-                elif not _embedder.is_available():
+                # #345 PR2 (A2): the `enabled`-gated branch that used to
+                # live here (cause="disabled-by-config") is REMOVED -- the
+                # toggle is retired and the startup gate already refuses
+                # to start with `enabled: false`, so that cause is now
+                # unreachable code. See this function's own docstring.
+                if not _embedder.is_available():
                     # Judgment call (documented in the PR handoff): Borges's
                     # ruling named `enabled` as the synchronous gate explicitly;
                     # extending the same synchronous treatment to a verifiably
@@ -5409,11 +5404,18 @@ def _backfill_edit_history(conn: sqlite3.Connection):
 
 
 def _get_embedding_config() -> dict:
-    """Get embedding configuration."""
+    """Get embedding configuration.
+
+    No longer defaults (or reads) an `enabled` key (#345 PR2, A3) -- the
+    toggle is retired; embeddings are mandatory. A config file that still
+    carries a literal `enabled: false` is caught by the startup gate
+    (server._embedding_startup_gate), which refuses to start before any
+    caller of this function ever runs.
+    """
     if CONFIG_PATH.exists():
         config = json.loads(CONFIG_PATH.read_text())
-        return config.get("embedding", {"model": DEFAULT_EMBEDDING_MODEL, "enabled": True})
-    return {"model": DEFAULT_EMBEDDING_MODEL, "enabled": True}
+        return config.get("embedding", {"model": DEFAULT_EMBEDDING_MODEL})
+    return {"model": DEFAULT_EMBEDDING_MODEL}
 
 
 # Mechanical hedge prefix _report_feeling_impl (engram_tasks.py) writes onto
@@ -5508,9 +5510,10 @@ def _count_missing_embeddings(conn: sqlite3.Connection) -> int:
     - Round 3's COMPLETION site (_finalize_embedding_restore_flag) went
       the other way: it trusted the just-completed pass's own
       `counts["failed"]` tally instead of re-checking state. Since
-      EmbeddingOutcome.status == "skipped" covers THREE distinct causes
-      uniformly (disabled-by-config, embedder-unavailable, empty-text —
-      see that type's own docstring), an embedder that dropped BETWEEN
+      EmbeddingOutcome.status == "skipped" covered THREE distinct causes
+      uniformly at the time (disabled-by-config, embedder-unavailable,
+      empty-text — #345 PR2 later retired the first; see that type's own
+      docstring), an embedder that dropped BETWEEN
       the synchronous detection gate scheduling the pass and the pass
       itself actually running made every node report "skipped" (not
       "failed"), so counts["failed"] == 0 and round 3 silently CLEARED
@@ -5543,9 +5546,11 @@ class EmbeddingOutcome(NamedTuple):
 
     status: one of "embedded" / "skipped" / "failed" — never bare None any
         more; every call site must interpret an explicit status.
-      - "skipped": an EXPECTED no-op — embeddings disabled via config, the
-        embedder unavailable, or empty text for this node type. No WARNING
-        logged; this is normal, silent operation.
+      - "skipped": an EXPECTED no-op — the embedder unavailable, or empty
+        text for this node type (#345 PR2 retired the third cause,
+        "embeddings disabled via config": that key is now fatal at
+        startup, so a running server can never reach this status for that
+        reason). No WARNING logged; this is normal, silent operation.
       - "embedded": the JSON nodes.embedding write succeeded (the canonical
         store). vec_mirror_ok is False if the vec_nodes KNN mirror-write
         degraded (a TOLERATED failure — JSON stays authoritative — but now
@@ -5580,7 +5585,7 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "Emb
     """
     try:
         emb_config = _get_embedding_config()
-        if not emb_config.get("enabled", True) or not _embedder.is_available():
+        if not _embedder.is_available():
             return EmbeddingOutcome(status="skipped", node_id=node_id)
 
         text = _embedding_text_for_node(conn, node_id)
@@ -5784,14 +5789,17 @@ def _set_embedding_restore_flag(
     engram-surface-hook.py's own _check_embedding_restore_flag) and by
     engram_stats/engram_diagnose.
 
-    `cause` is one of "disabled-by-config" / "embedder-unavailable" /
+    `cause` is one of "embedder-unavailable" /
     "per-node-failures" / "detection-failed: <ExceptionType>" (round 5) /
     "regeneration-pending" (the provisional value written before the async
     regeneration thread has run) / "regeneration-running" (#3077 — a
     SINGLE-FLIGHT LEASE, written via _try_acquire_regeneration_lease, not
     this function directly, once the thread actually starts working — see
     that function and _run_embedding_restore_regeneration below, which
-    overwrites this row again with the real outcome on completion).
+    overwrites this row again with the real outcome on completion). A DB
+    predating #345 PR2 may still carry the legacy value
+    "disabled-by-config" in an OLD row -- never written fresh any more
+    (the toggle that produced it is retired and now fatal at startup).
 
     #3077 round 4 (Borges's colleague-pass required fix on PR#3078):
     `respect_lease=True` makes this write ATOMICALLY conditional on no
@@ -5960,11 +5968,13 @@ def _finalize_embedding_restore_flag(
     itself; that decision is always the re-count.
 
     Cause is derived from the CURRENT embedder state at decision time —
-    not from the pass's own history: "disabled-by-config" if embeddings
-    are now disabled via config, "embedder-unavailable" if the embedder
-    now reports unavailable, else "per-node-failures" (a genuinely
-    available, enabled embedder that still couldn't embed every
+    not from the pass's own history: "embedder-unavailable" if the
+    embedder now reports unavailable, else "per-node-failures" (a
+    genuinely available embedder that still couldn't embed every
     remaining node — the one case that IS a real, actionable failure).
+    (#345 PR2 retired the third, `enabled`-gated cause,
+    "disabled-by-config", that used to be checked first here — see this
+    function's own call site.)
 
     Shared by both call sites that finalize this flag after a
     regeneration pass — `_run_embedding_restore_regeneration` (the async
@@ -5991,10 +6001,12 @@ def _finalize_embedding_restore_flag(
     if _missing == 0:
         _clear_embedding_restore_flag(conn, respect_lease=respect_lease)
         return
-    emb_config = _get_embedding_config()
-    if not emb_config.get("enabled", True):
-        _cause = "disabled-by-config"
-    elif not _embedder.is_available():
+    # #345 PR2 (A2): the `enabled`-gated "disabled-by-config" cause that
+    # used to be checked first here is REMOVED, extending the spec's
+    # explicit ~3477 instruction to this structurally identical branch --
+    # same unreachable cause, same reasoning (the toggle is retired; the
+    # startup gate already refuses to start with `enabled: false`).
+    if not _embedder.is_available():
         _cause = "embedder-unavailable"
     else:
         _cause = "per-node-failures"
@@ -6189,10 +6201,10 @@ def _run_embedding_restore_regeneration(db_path: str) -> None:
     (round 4) decides clear-vs-set from a FRESH, skip-aware state
     re-count of missing embeddings — never from this pass's own returned
     counts dict — with a cause determined by re-checking the CURRENT
-    embedder/config state at that point: "embedder-unavailable" if it
-    dropped mid-run, "disabled-by-config" if embeddings were disabled
-    mid-run, "per-node-failures" if it's still available/enabled and
-    individual embed() calls simply failed. See that function's own
+    embedder state at that point: "embedder-unavailable" if it dropped
+    mid-run, "per-node-failures" if it's still available and individual
+    embed() calls simply failed (#345 PR2 retired the third,
+    `enabled`-gated cause, "disabled-by-config"). See that function's own
     docstring for the full round 2/3/4 history this line summarizes.
     Because this always writes a DIFFERENT cause than
     "regeneration-running" (or clears the flag outright), the lease is
@@ -7852,7 +7864,7 @@ def _semantic_search(
     """
     try:
         emb_config = _get_embedding_config()
-        if not emb_config.get("enabled", True) or not _embedder.is_available():
+        if not _embedder.is_available():
             return []
 
         model_name = emb_config.get("model", DEFAULT_EMBEDDING_MODEL)
@@ -8069,7 +8081,7 @@ def _similar_existing_matches(
         # Semantic complement. _semantic_search returns standardized
         # records (no per-caller column augmentation), so extras come
         # from a per-match SELECT against `nodes`.
-        if _embedder.is_available() and _get_embedding_config().get("enabled", True):
+        if _embedder.is_available():
             _th = _get_thresholds_config()
             sem_results = _semantic_search(
                 conn, claim,

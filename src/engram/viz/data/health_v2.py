@@ -615,7 +615,18 @@ def _resolve_effective_embedding_enabled(agent_config: dict) -> "tuple[bool, str
     (``engram_core._get_embedding_config``) reads ``config["embedding"]``
     (singular) -- this function reads the REAL key, matching every other
     reader of this same config file (``engram_core.py``,
-    ``viz/data/health.py``'s own ``current_turn`` read)."""
+    ``viz/data/health.py``'s own ``current_turn`` read).
+
+    `embedding.enabled` was retired by #345 (embeddings are mandatory),
+    and a RUNNING server/MCP process can never carry `enabled: false`
+    (the startup gate refuses to start first). This function's
+    `config_enabled` read is nonetheless kept deliberately: it feeds
+    `health.engine.build_snapshot`'s `embedding_enabled` override, a
+    health-SCORING path rather than an embed/search gate, and a stale
+    on-disk config (or the config of a different, non-running agent on a
+    shared host) can still carry the retired key -- this function reports
+    that ground truth rather than pretending the key no longer exists.
+    """
     import engram_core as core  # lazy -- see module docstring
 
     config_enabled = bool(

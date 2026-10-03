@@ -257,9 +257,10 @@ def backfill_embeddings(engram_home: Path, json_output: bool = False) -> None:
     emb_config = server._get_embedding_config()
     if not emb_config.get("enabled", True):
         print(
-            "WARNING: embeddings are disabled in config.json "
-            "(embedding.enabled=false). Proceeding anyway — "
-            "re-enable in config.json after restore if desired.",
+            "WARNING: config.json carries embedding.enabled=false. That "
+            "key was retired by #345 (embeddings are mandatory) and the "
+            "MCP server now refuses to start while it is set. Proceeding "
+            "with the backfill; delete the key from config.json.",
             file=sys.stderr,
         )
 

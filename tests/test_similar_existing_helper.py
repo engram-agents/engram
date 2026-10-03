@@ -193,3 +193,53 @@ def test_helper_exception_logs_warning_and_returns_empty(caplog):
         "_similar_existing_matches failed" in r.message
         for r in caplog.records
     ), f"Expected warning log, got records: {[r.message for r in caplog.records]}"
+
+
+def test_helper_semantic_complement_ignores_enabled_false():
+    """(#345 PR2, A2) The dedup semantic complement (engram_core.py ~8072,
+    inside _similar_existing_matches) no longer consults the retired
+    `enabled` key: with `enabled: False` mocked, the semantic complement
+    must still run (is_available()=True) and contribute a match that FTS
+    alone would never find (a synonym with zero shared FTS tokens).
+
+    Mutation target: restoring the
+    `_embedder.is_available() and _get_embedding_config().get("enabled", True)`
+    check here turns this RED (the semantic-only match disappears).
+    """
+    server = fresh_server()
+    os.environ.pop("ENGRAM_NO_EMBEDDINGS", None)  # this test wants the semantic branch live
+    conn = server._get_db()
+
+    class _StubEmbedder:
+        def is_available(self):
+            return True
+
+    original_embedder = server.core._embedder
+    original_get_config = server.core._get_embedding_config
+
+    def _stub_semantic_search(conn, claim, top_k=10, min_similarity=0.3,
+                               type_filter=None, importance_threshold=0.0,
+                               include_superseded=False):
+        return [{
+            "id": "sem_only_345", "claim": "semantic-only synonym match",
+            "confidence": 0.8, "similarity": 0.9,
+        }]
+
+    server.core._embedder = _StubEmbedder()
+    server.core._get_embedding_config = lambda: {"enabled": False, "model": "x"}
+    original_semantic_search = server.core._semantic_search
+    server.core._semantic_search = _stub_semantic_search
+    try:
+        matches = server._similar_existing_matches(
+            conn, "anything unrelated to the fts tokens",
+            type_filter={"observation_factual"},
+        )
+    finally:
+        server.core._embedder = original_embedder
+        server.core._get_embedding_config = original_get_config
+        server.core._semantic_search = original_semantic_search
+
+    ids = {m["id"] for m in matches}
+    assert "sem_only_345" in ids, (
+        f"expected the semantic-only match despite enabled=False, got: {matches}"
+    )

@@ -641,7 +641,17 @@ def m_embedder_installed_available(conn: sqlite3.Connection) -> bool:
 def m_embedder_config_enabled(conn: sqlite3.Connection) -> bool:
     """``core._get_embedding_config().get("enabled", True)`` — the operator-
     choice half of the embedder gate. ``conn`` unused, same reason as
-    ``m_embedder_installed_available``."""
+    ``m_embedder_installed_available``.
+
+    The `enabled` key was retired by #345: `_get_embedding_config()` no
+    longer defaults it, no embed/search call site consults it, and a
+    running server can never be in a False state (the startup gate
+    refuses to start first). This measurement deliberately stays a
+    literal read of the on-disk config (True when the key is absent): it
+    is health-REPORTING code, not an embed/search gate, so it keeps
+    reporting ground truth for a stale config file or a replayed
+    pre-#345 snapshot.
+    """
     import engram_core as core  # lazy — see module docstring
 
     return bool(core._get_embedding_config().get("enabled", True))

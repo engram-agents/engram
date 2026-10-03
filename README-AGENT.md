@@ -579,7 +579,7 @@ hand-edit; *(restart)* = takes effect after a Claude Code restart.
 
 | Field | Type | Description |
 |---|---|---|
-| `embedding.enabled` | bool | Semantic recall via sentence-transformer embeddings. |
+| `embedding.enabled` | bool | **Retired by #345** — embeddings are mandatory. If this key is present with any value other than true, the server refuses to start; delete the key to fix. |
 | `embedding.model` | str | Sentence-transformer model identifier. |
 
 **Drowsiness / cadence:**

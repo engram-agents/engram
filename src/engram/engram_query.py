@@ -1758,7 +1758,7 @@ def _search_nodes(
     # search results. Used to apply the floor + multiplicative bump (alpha
     # #207/#208) when merging FTS hits with semantic hits.
     sim_lookup: dict[str, float] = {}
-    semantic_available = use_semantic and core._embedder.is_available() and core._get_embedding_config().get("enabled", True)
+    semantic_available = use_semantic and core._embedder.is_available()
     if semantic_available:
         # Overfetch semantic so FTS-hit similarities (if above floor) are
         # available for the bump computation. min_similarity=FTS_SIM_FLOOR
@@ -2453,7 +2453,7 @@ def _surface_impl(
         # None (not computed / model unavailable) is a valid, expected value
         # — the hook falls back to today's count-only classification on it.
         query_embedding = None
-        if include_query_embedding and core._embedder.is_available() and core._get_embedding_config().get("enabled", True):
+        if include_query_embedding and core._embedder.is_available():
             try:
                 model_name = core._get_embedding_config().get("model", core.DEFAULT_EMBEDDING_MODEL)
                 effective_embed_query = embed_query if embed_query is not None else query

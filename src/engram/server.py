@@ -8213,34 +8213,56 @@ def _embedding_startup_gate() -> None:
 
     `ENGRAM_NO_EMBEDDINGS=1` bypasses this entire gate. It is documented test
     scaffolding (release_gates.py, dump_mcp_schema.py) and the escape hatch
-    for an operator who must start deliberately degraded.
+    for an operator who must start deliberately degraded. Checked FIRST,
+    before config is even read.
 
-    `embedding.enabled: false` also bypasses this gate — see the comment at
-    that check below for why this is deliberately NOT also-fatal.
+    `embedding.enabled: false` is now ALSO fatal (#345 PR2): the toggle is
+    retired -- embeddings are mandatory, full stop. A config that still
+    carries `enabled: false` (a stale file from before retirement, or a
+    deliberate opt-out that no longer exists) refuses to start with a
+    message naming the key and the fix, exactly like the missing/uncached
+    model cases below. This REPLACES the old deliberate-opt-out bypass: an
+    operator who previously relied on `enabled: false` to boot without the
+    ~500MB sentence_transformers dependency must delete the key and either
+    install the dependency or use ENGRAM_NO_EMBEDDINGS=1 for a genuinely
+    test/dev-only degraded start.
+
+    This gate covers the MCP server entry point only (`server.py` run as
+    `__main__`), by design -- see the `if __name__ == "__main__":` guard
+    around its call site. The surface daemon imports this module (`import
+    server as _server`) rather than executing it, so it never reaches this
+    gate and, like every other now-ungated call site, silently ignores the
+    retired `enabled` key. That is acceptable: the daemon only serves recall
+    (reads), and the refusing MCP server is the loud signal that reaches the
+    operator on any seat with a stale key.
     """
     import sys
 
     if os.environ.get("ENGRAM_NO_EMBEDDINGS"):
         return
 
-    # config["embedding"]["enabled"] (default True) is a real, still-active,
-    # documented toggle (README-AGENT.md, viz UI affordance) honored by 5
-    # call sites in engram_core.py / engram_query.py. Retiring it entirely is
-    # a *separate* slice of #345 (not landed here). Bypass rather than
-    # also-fatal is deliberate, not an oversight: an operator who has
-    # deliberately set `enabled: false` -- plausibly because they never
-    # installed the ~500MB sentence_transformers dependency -- previously
-    # got a clean boot with semantic search cleanly disabled at every query
-    # site. Making this fatal would change a documented, currently-honored
-    # configuration's behavior without the documentation, migration note, or
-    # release-note that the toggle's eventual retirement will carry. This
-    # gate closes the *unintentional* hole (a missing or uncached model);
-    # the *deliberate* opt-out keeps working as documented until it is
-    # retired on purpose. Checked before is_available() so an operator who
-    # disabled embeddings never sees a fatal about sentence_transformers.
     emb_config = _get_embedding_config()
-    if not emb_config.get("enabled", True):
-        return
+    if "enabled" in emb_config and emb_config["enabled"] is not True:
+        _enabled_value = emb_config["enabled"]
+        print(
+            f"[engram] FATAL: embedding.enabled is set to {_enabled_value!r} in "
+            "~/.engram/config.json. This key was RETIRED by #345 -- "
+            "embeddings are mandatory, and starting with it present and not "
+            "the boolean true would file nodes with NULL embeddings, "
+            "permanently excluded from semantic recall at any threshold, "
+            "for any query.",
+            file=sys.stderr,
+        )
+        print("", file=sys.stderr)
+        print("  To fix, delete the key from ~/.engram/config.json:", file=sys.stderr)
+        print('    {"embedding": {"model": "..."}}  # no "enabled" key', file=sys.stderr)
+        print("", file=sys.stderr)
+        print(
+            "  To start deliberately degraded (test/dev only): "
+            "ENGRAM_NO_EMBEDDINGS=1",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if not _embedder.is_available():
         print(

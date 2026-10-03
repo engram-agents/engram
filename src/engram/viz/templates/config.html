@@ -109,7 +109,8 @@
       white-space: pre-wrap; z-index: 100; pointer-events: none;
     }
 
-    /* Pulse animation for embedding.enabled == false */
+    /* Pulse animation for embedding.enabled == false (retired by #345 --
+       now a fatal startup misconfiguration, not a supported opt-out) */
     @keyframes alertPulse {
       0%   { border-color: #1a4a8a; }
       50%  { border-color: #c62828; }
