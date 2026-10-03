@@ -439,20 +439,31 @@ class TestCreatedPathEmbedFailsForPredictionOnly(_TestBase):
                 f"the restore flag must be set through the same path as "
                 f"every other node, got: {dict(flag_row) if flag_row else None}"
             )
-            # The existing (pre-#3348, unrelated) duplicate
-            # `_stamp_new_node(conn, node_id, ...)` call later in
-            # `_add_observation_impl` re-embeds the MAIN observation node a
-            # second time in the same transaction -- its success triggers
-            # Rider 3's recount-on-recovery (M2), rewriting the cause from
-            # "write-embed-failed: ..." to "per-node-failures (write-embed-
-            # failed recovered at <T>)" with null_count=1 (the prediction,
-            # still NULL) BEFORE this call even returns. Both strings are
-            # legitimate outcomes of the SAME flag-setting path every other
-            # node uses (_set_embedding_restore_flag /
-            # _maybe_clear_write_embed_failed_flag); the exact wording
-            # depends on that pre-existing duplicate call, which #3348 does
-            # not touch -- so this checks the substring, not an exact prefix.
-            assert "write-embed-failed" in flag_row["cause"], flag_row["cause"]
+            # #3353 removed the second (duplicate) `_stamp_new_node` call
+            # for the observation node that used to run later in
+            # `_add_observation_impl` -- it no longer re-embeds the MAIN
+            # observation a second time in this transaction, so Rider 3's
+            # recount-on-recovery (M2) no longer fires here and the cause
+            # is never rewritten to "per-node-failures (write-embed-failed
+            # recovered at <T>)". The cause is now the PREDICTION failure's
+            # own cause, set once by `_compute_and_store_embedding_with_
+            # revive` and never touched again -- exact value, built from
+            # the SAME `revive_attempted_at` / `next_revive_not_before`
+            # this test already read off `failure_block` above (both are
+            # wall-clock timestamps, so comparing against the response's
+            # own fields rather than a hardcoded string keeps this
+            # deterministic).
+            assert failure_block["revive_result"] == "still-failing", failure_block
+            expected_cause = (
+                f"write-embed-failed: revive "
+                f"{failure_block['revive_attempted_at']} -> still-failing; "
+                f"next revive not before {failure_block['next_revive_not_before']}"
+            )
+            assert flag_row["cause"] == expected_cause, (
+                f"expected the exact cause (no second stamp call left to "
+                f"rewrite it), got: {flag_row['cause']!r} != "
+                f"{expected_cause!r}"
+            )
             assert flag_row["null_count"] == 1, (
                 f"exactly one node (the prediction) should still be missing "
                 f"an embedding, got null_count={flag_row['null_count']}"

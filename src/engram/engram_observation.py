@@ -1704,7 +1704,17 @@ def _add_observation_impl(
 
             result["prediction_id"] = prediction_id
 
-        _emb_outcome = core._stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
+        # #3353: the observation node is stamped exactly ONCE -- the
+        # `_stamp_new_node` call right after the evidence `cites` edge
+        # above (the one that feeds `_emb_outcome` into the response
+        # below). A second, duplicate call used to run here, after the
+        # prediction-decomposition block: nothing between the two call
+        # sites reassigns `confidence` or runs `UPDATE nodes` on this
+        # observation's own row, so the second call re-stamped the exact
+        # same importance/embedding inputs -- one wasted embed, and a
+        # second "created" edit_history row for every observation ever
+        # written (issue #3353). Removed; `_emb_outcome` from the FIRST
+        # call above is the one that reaches the response unchanged.
 
         # Attach similarity results with decision guidance.
         #
