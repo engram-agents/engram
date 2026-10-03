@@ -302,10 +302,10 @@ def test_handshake_major_version_mismatch_is_rejected(owner_running):
 
 
 def test_handshake_minor_version_mismatch_is_accepted(owner_running):
-    # Owner's contract version is engramd_client.CONTRACT_VERSION ("1.0" --
+    # Owner's contract version is engramd_client.CONTRACT_VERSION ("1.1" --
     # MAJOR "1"). Sending "1.7" is a MINOR skew on the SAME major, which
     # check_contract_version() accepts (None -- proceed to serve the call).
-    assert owner_running.contract_version == "1.0"
+    assert owner_running.contract_version == "1.1"
     response = _raw_request(
         owner_running.socket_path,
         {"contract_version": "1.7", "method": "ping", "params": {}, "request_id": None},
@@ -2566,6 +2566,47 @@ def test_client_read_gate_holds_no_reference_to_owner_internal_connection(owner_
         assert value is not owner_running._owner_conn, (
             f"_ClientReadGate.{attr_name} holds the owner-internal connection"
         )
+
+    # U4d (#3197, cell O3): the client-facing `read` method now exists, so the
+    # property is asserted for it too -- the handler reaches the store ONLY
+    # through `_client_read_gate`, never through either connection directly.
+    # Mutation: have `_handle_read` execute on `self._owner_conn` (or on
+    # `self._client_read_conn` bypassing the gate) -> red.
+    import ast
+    import inspect
+    import textwrap
+
+    assert "read" in owner_running._methods
+    handler = ast.parse(textwrap.dedent(inspect.getsource(eo.EngramdOwner._handle_read)))
+    touched = {n.attr for n in ast.walk(handler) if isinstance(n, ast.Attribute)}
+    assert "_client_read_gate" in touched
+    assert not touched & {"_owner_conn", "_owner_lock", "_client_read_conn"}, touched
+
+    # And live, over the socket: `read` calls the gate (a spy stands in for it)
+    # while `_owner_conn` is a tripwire that fails on any use.
+    seen = []
+
+    class _SpyGate:
+        def execute(self, sql, params=(), *, deadline):
+            seen.append((sql, params))
+            return [(1, "x")]
+
+    class _Tripwire:
+        def __getattr__(self, name):
+            if name == "close":
+                return lambda: None
+            raise AssertionError(f"`read` touched the owner-internal connection: .{name}")
+
+    real_gate, real_conn = owner_running._client_read_gate, owner_running._owner_conn
+    owner_running._client_read_gate, owner_running._owner_conn = _SpyGate(), _Tripwire()
+    try:
+        result = ec.read("read", {"sql": "SELECT 1", "args": ["a"]}, timeout=2.0,
+                         socket_path=owner_running.socket_path)
+    finally:
+        owner_running._client_read_gate, owner_running._owner_conn = real_gate, real_conn
+    assert isinstance(result, ec.Ok), result
+    assert result.result == [[1, "x"]]
+    assert seen == [("SELECT 1", ("a",))]
 
 
 def test_start_wires_the_restrictive_authorizer_onto_the_real_client_read_conn(owner_running):

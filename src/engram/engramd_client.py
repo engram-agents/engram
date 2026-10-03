@@ -71,7 +71,11 @@ from typing import Any
 # Module-level constants
 # ---------------------------------------------------------------------------
 
-CONTRACT_VERSION = "1.0"  # MAJOR.MINOR -- this client's own wire-contract version.
+# MAJOR.MINOR -- this client's own wire-contract version (the owner reuses it:
+# engramd_owner takes ec.CONTRACT_VERSION, so there is exactly one copy).
+# "1.1" (U4d, #3197): the owner gained the client-facing `read` method -- an
+# added method is a MINOR change (docs/2652-engrammanager-design.md SS5.3).
+CONTRACT_VERSION = "1.1"
 DEFAULT_TIMEOUT = 2.0  # seconds -- matches _query_recall_daemon's sock.settimeout(2) precedent.
 DEFAULT_SOCKET_NAME = "engramd.sock"  # distinct from the existing recall-daemon.sock (a different service).
 # The socket's containing subdirectory, relative to $ENGRAM_HOME (#3194,

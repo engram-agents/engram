@@ -253,9 +253,10 @@
       "path_prefix_or_glob": "hooks/claude/engram-user-identity-hook.py",
       "test_globs": [
         "tests/test_codex_hook_envelopes.py",
-        "tests/test_user_identity_hook_injection_bounds.py"
+        "tests/test_user_identity_hook_injection_bounds.py",
+        "tests/test_user_identity_owner_read_3197.py"
       ],
-      "note": "engram-alpha#2863 WS2 batch A: migrated onto _hooklib.emit_context(); test_user_identity_hook_injection_bounds.py added as this hook's own injection-bounds gate (worst-case oversized Role/Profile metadata, common-case sanity, nothing-fires)."
+      "note": "engram-alpha#2863 WS2 batch A: migrated onto _hooklib.emit_context(); test_user_identity_hook_injection_bounds.py added as this hook's own injection-bounds gate (worst-case oversized Role/Profile metadata, common-case sanity, nothing-fires). engram-alpha#3197 (U4d): test_user_identity_owner_read_3197.py added -- the flagged owner-read path's differential harness (C1), flag-off (C2), owner-down (C3) and timeout-budget (C4) cells; the hook is loaded via importlib (hyphenated name), invisible to the import graph."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-utility-credit-mention-stop.py",
@@ -321,6 +322,13 @@
         "tests/test_engramd_read_scan.py"
       ],
       "note": "engram-alpha#3196 (U4c): loaded by tests/test_engramd_read_scan.py via importlib (file path), so it is invisible to the layer-1 import graph."
+    },
+    {
+      "path_prefix_or_glob": "tools/engramd_a6_latency.py",
+      "test_globs": [
+        "tests/test_engramd_a6_latency.py"
+      ],
+      "note": "engram-alpha#3197 (U4d): loaded by tests/test_engramd_a6_latency.py via importlib (file path), so it is invisible to the layer-1 import graph."
     },
     {
       "path_prefix_or_glob": "tools/dream_lottery.py",

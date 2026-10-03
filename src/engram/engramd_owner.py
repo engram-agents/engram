@@ -392,6 +392,32 @@ SNAPSHOT_FINALIZE_SLOTS = 2
 # iterations, idle and loaded, and report the MAX.
 SNAPSHOT_RESPONSE_RESERVE = 0.25  # seconds
 
+# The part of `read`'s request deadline held back for DELIVERING its response
+# (U4d, #3197) -- the same reason as SNAPSHOT_RESPONSE_RESERVE above: the send
+# gate in _handle_connection() drops a response composed after the REQUEST
+# deadline, so a read that overruns must stop SOONER or its own
+# `deadline_exceeded` rejection never reaches the client (it would read as
+# Unavailable). Same value, deliberately NOT re-measured for `read`: the
+# rejection it must deliver is a ~200-byte wire dict, smaller than the snapshot
+# timeout shapes the 0.25 s was measured against (80x margin there), and the
+# abort point is one progress-handler tick (PROGRESS_HANDLER_INSTRUCTION_COUNT
+# VM instructions, microseconds), not a backup step. Read at CALL time so a
+# test can monkeypatch it.
+READ_RESPONSE_RESERVE = 0.25  # seconds
+
+# Owner-side bound on a client `read` RESULT, as serialised on the wire (U4d
+# round 2, S3). The client refuses any response over ec.MAX_RESPONSE_BYTES
+# (10 MiB) and reads that as Unavailable -- which tells the agent to restart a
+# healthy owner for what is a deterministic, never-going-to-succeed oversize.
+# So the owner refuses first, as `Rejected(result_too_large)`: 8 MiB, a fixed
+# 2 MiB below the client's cap, far more than the envelope (`{"status": "ok",
+# "result": ...}` + request_id + framing newline, a few hundred bytes) can add.
+# It is measured row by row on the exact JSON the send path emits (json.dumps
+# defaults), so the check also stops the work: at most this bound plus one row
+# is ever serialised, which keeps serialisation inside the request deadline
+# for any result the owner will actually send.
+MAX_READ_RESPONSE_BYTES = 8 * 1024 * 1024
+
 # How often the LISTENING socket's accept() wakes up to check the shutdown
 # flag. Short enough that .stop() returns quickly in tests (this process's
 # accept loop has nothing else to do between wakeups, unlike
@@ -806,8 +832,8 @@ class _ClientReadGate:
 
     def _execute_admitted(self, sql: str, params: tuple, *, deadline: float) -> list:
         """The deadline-armed execute path, reached only for a statement the
-        registry admitted. Stands in for the not-yet-built real client
-        dispatch (U4d); no `method` in `EngramdOwner._dispatch()` calls it."""
+        registry admitted. Reached from `EngramdOwner._handle_read()` (the
+        client-facing `read` method, U4d #3197) via `execute()`."""
         _arm_read_deadline(self._conn, deadline)
         try:
             return self._conn.execute(sql, params).fetchall()
@@ -884,6 +910,13 @@ class EngramdOwner:
         # _cleanup() and _handle_snapshot() below; folds #3152 item 1 for
         # both).
         self._owner_lock = threading.Lock()
+        # Serialises `read` on the ONE shared `_client_read_conn` (U4d). The
+        # gate arms a per-call progress_handler on that connection and clears
+        # it in a `finally`; two request threads interleaving would clear each
+        # other's deadline mid-statement. Deliberately separate from
+        # `_owner_lock`: a long snapshot holds that one, and a read must not
+        # queue behind it (nor may a read ever take the owner-internal path).
+        self._client_read_lock = threading.Lock()
         self._shutdown = threading.Event()
         self._bound_socket = False
         self._accept_thread: threading.Thread | None = None
@@ -908,6 +941,7 @@ class EngramdOwner:
         self._methods = {
             "ping": lambda params, deadline: self._handle_ping(params, deadline),
             "snapshot": lambda params, deadline: self._handle_snapshot(params, deadline),
+            "read": lambda params, deadline: self._handle_read(params, deadline),
         }
 
     # -- lifecycle ------------------------------------------------------
@@ -1523,7 +1557,24 @@ class EngramdOwner:
             method = request.get("method")
             if method == "snapshot":
                 deadline = accept_time + self.snapshot_request_deadline
-            response = self._dispatch(request, deadline)
+            try:
+                response = self._dispatch(request, deadline)
+            except Exception as exc:
+                # Catch-all for an UNEXPECTED exception in any method (the
+                # deadline/limit aborts and every other deliberate refusal are
+                # mapped INSIDE the handlers and returned, so they never reach
+                # here). Without it the thread died silently, the client saw a
+                # closed socket, read it as Unavailable and told the agent to
+                # restart a healthy owner. `Exception`, not BaseException:
+                # SystemExit / KeyboardInterrupt still propagate.
+                logging.getLogger("engramd_owner").error(
+                    "unexpected exception in method %r", request.get("method"), exc_info=True)
+                response = {
+                    "status": "rejected",
+                    "reason": "internal_error",
+                    "detail": f"{type(exc).__name__}: {exc}"[:200],
+                    "remedy": "owner bug (an unexpected exception inside the owner, not an outage): see the owner log",
+                }
             # Bound the response send by the SAME (possibly method-
             # extended) remaining deadline -- a client that stops reading
             # after sending its request shouldn't be able to hold this
@@ -1633,7 +1684,7 @@ class EngramdOwner:
             "detail": f"no such operation: {method!r}",
             "remedy": (
                 "check the method name against the owner's supported "
-                "operations (this build: ping, snapshot)"
+                "operations (this build: ping, snapshot, read)"
             ),
         }
 
@@ -1644,6 +1695,105 @@ class EngramdOwner:
                 "contract_version": self.contract_version,
                 "store_path": str(self.store_path),
             },
+        }
+
+    def _read_deadline_rejection(self, detail: str) -> dict:
+        return {
+            "status": "rejected",
+            "reason": "deadline_exceeded",
+            "detail": detail,
+            "remedy": "retry the read; if it keeps overrunning the statement or the store is too slow for the request deadline",
+        }
+
+    def _handle_read(self, params: dict, deadline: float) -> dict:
+        """The client-facing `read` method (U4d, #3197; contract 1.1).
+
+        Wire: params = {"sql": <str>, "args": <list>} (D1: the client sends the
+        SQL literal itself, which the committed read-template list is matched
+        against byte-for-byte); reply `ok` carries `result` = the rows as JSON lists in
+        SQLite's own order (D2). Cell types None/int/float/str only: a bytes
+        cell is `rejected` / `unsupported_value_type`, never encoded or dropped.
+
+        Routing (test 22): the ONLY object this touches is
+        `self._client_read_gate`, which holds only `_client_read_conn`. Never
+        `_owner_conn`, never `_owner_lock`.
+
+        Deadline: execution stops READ_RESPONSE_RESERVE before the request
+        deadline so the `deadline_exceeded` rejection can still be delivered;
+        the wait for the shared read connection is bounded by the same instant.
+        """
+        gate = self._client_read_gate
+        if gate is None:
+            return {
+                "status": "rejected",
+                "reason": "owner_stopping",
+                "detail": "the owner is shutting down; its read path is closed",
+                "remedy": "retry once the owner has restarted",
+            }
+        sql = params.get("sql")
+        args = params.get("args", [])
+        if isinstance(args, list):
+            args = tuple(args)
+        # A non-list `args` is passed through as-is: the template list's own check
+        # refuses it as `invalid_parameter` (one source of refusal reasons).
+        execution_deadline = deadline - READ_RESPONSE_RESERVE
+        remaining = execution_deadline - time.monotonic()
+        if remaining <= 0 or not self._client_read_lock.acquire(timeout=remaining):
+            return self._read_deadline_rejection(
+                "no execution time was left inside the request deadline (after reserving time to deliver the response)"
+            )
+        try:
+            try:
+                outcome = gate.execute(sql, args, deadline=execution_deadline)
+            except sqlite3.OperationalError as exc:
+                # sqlite3.SQLITE_INTERRUPT and exc.sqlite_errorcode are Python
+                # 3.11 additions (3.10.7+ is supported): no bare access here.
+                # 9 is SQLITE_INTERRUPT; "interrupted" is the < 3.11 fallback.
+                if getattr(exc, "sqlite_errorcode", None) == getattr(sqlite3, "SQLITE_INTERRUPT", 9) \
+                        or str(exc) == "interrupted":
+                    return self._read_deadline_rejection("the read was aborted at the request deadline")
+                return self._read_failed(exc)
+            except sqlite3.Error as exc:  # incl. DataError: a cell over SQLITE_LIMIT_LENGTH
+                return self._read_failed(exc)
+        finally:
+            self._client_read_lock.release()
+        if isinstance(outcome, rr.Rejected):
+            return outcome.as_wire()
+        rows = []
+        wire_bytes = len('{"status": "ok", "result": []}')
+        for row in outcome:
+            cells = list(row)
+            for cell in cells:
+                if cell is not None and type(cell) not in (int, float, str):
+                    return {
+                        "status": "rejected",
+                        "reason": "unsupported_value_type",
+                        "detail": f"a result cell has type {type(cell).__name__}; only None/int/float/str are served",
+                        "remedy": "select a text/number projection of the column, or extend the read contract deliberately",
+                    }
+            # Size the row exactly as the send path will serialise it (+ the
+            # ", " row separator); refuse -- never truncate -- once the total
+            # passes the bound. Done here, on the only path that builds a read
+            # result, so no caller can skip it.
+            wire_bytes += len(json.dumps(cells)) + 2
+            if wire_bytes > MAX_READ_RESPONSE_BYTES:
+                return {
+                    "status": "rejected",
+                    "reason": "result_too_large",
+                    "detail": f"the result is over {MAX_READ_RESPONSE_BYTES} bytes serialised (stopped counting at {wire_bytes}); nothing was sent",
+                    "remedy": "this is a property of the statement and the data, not an outage -- do NOT restart the owner; narrow the statement (LIMIT / fewer columns) or ask for a paged read",
+                }
+            rows.append(cells)
+        return {"status": "ok", "result": rows}
+
+    def _read_failed(self, exc: Exception) -> dict:
+        logging.getLogger("engramd_owner").warning(
+            "client read failed: %s: %s", type(exc).__name__, exc)
+        return {
+            "status": "rejected",
+            "reason": "read_failed",
+            "detail": f"{type(exc).__name__}: {exc}"[:200],
+            "remedy": "the statement was admitted but could not complete (an over-limit value, a locked or damaged store); see the owner log",
         }
 
     def _handle_snapshot(self, params: dict, deadline: float) -> dict:

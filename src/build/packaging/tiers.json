@@ -677,6 +677,12 @@
       "note": "engram-alpha#3196 (U4c, part of #2652): build-time read-template scanner -- walks the hook call graph (reusing tools/write_op_census.py's _scan_package/_bfs_reach) and emits src/engram/engramd_read_templates.json; a site that is neither a readable literal nor declared fails the build. ENGRAM-development tooling; real file under repo-root tools/, so 'source' is set explicitly."
     },
     {
+      "path": "tools/engramd_a6_latency.py",
+      "tier": "dev",
+      "source": "tools/engramd_a6_latency.py",
+      "note": "engram-alpha#3197 (U4d, part of #2652): the A6 latency-delta measurement -- the user-identity hook's person-node read, old path vs through a REAL engramd_owner process, same run/store/N, with contended and cold-cache arms. A measurement owed in the PR body, not a CI gate; ENGRAM-development tooling, real file under repo-root tools/, so 'source' is set explicitly."
+    },
+    {
       "path": "tools/engramd_read_scan.config.json",
       "tier": "dev",
       "source": "tools/engramd_read_scan.config.json",

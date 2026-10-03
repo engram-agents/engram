@@ -16,6 +16,20 @@ the sticky context line is suppressed when the active user matches (since
 the primary speaker is the default — no need to re-announce them on every
 prompt). Set via the first-session skill or by hand editing config.json.
 
+Owner read (U4d, #3197, behind a flag, default OFF): with
+`{"engramd": {"user_identity_reads_via_owner": true}}` in
+$ENGRAM_HOME/config.json the person-node read goes through the engramd owner
+(`engramd_client.read("read", ...)`) instead of this hook opening knowledge.db
+itself. Flag ON never falls back to the store and never reads an outage as
+"zero people": an owner that is down or refusing yields a loud
+additionalContext block instead (docs/2652-engrammanager-design.md SS5.1, SS5.5).
+So does a client module that cannot be imported.
+
+Upgrade note: after an upgrade, RESTART the engramd owner BEFORE turning the flag
+on. This hook speaks contract 1.1 (the `read` method); a still-running 1.0 owner
+passes the MINOR-version check but answers `unknown_operation`, which this hook
+reports loudly as a refusal (never as "zero people") -- correct, but avoidable.
+
 Exit codes:
   0 - success (may output empty JSON if no identity detected)
   1 - non-blocking error
@@ -41,6 +55,24 @@ DB_PATH = os.path.join(ENGRAM_HOME, "knowledge.db")
 CURRENT_USER_PATH = os.path.join(ENGRAM_HOME, "current_user.json")
 CONFIG_PATH = os.path.join(ENGRAM_HOME, "config.json")
 
+# The ONE copy of this hook's person-node statement. Both paths use it: the old
+# path executes it, the owner path sends it verbatim as the `read` literal
+# (U4d D1) -- so the U4c scanner's registered template and what the client sends
+# cannot drift apart. A single adjacent-literal constant, which the scanner reads
+# as a `module_literal`.
+_PERSON_NODES_SQL = (
+    "SELECT id, claim, logical_chain, metadata FROM nodes "
+    "WHERE type = 'person' AND is_current = 1"
+)
+_PERSON_NODES_COLUMNS = ("id", "claim", "logical_chain", "metadata")
+
+# Bound for the owner call. This hook is registered with a 3 s timeout
+# (hooks/hooks.json); interpreter start, the _hooklib/_harness imports and the
+# render sit inside that too, so the owner call gets half of it: 1.5 s leaves
+# 1.5 s of margin. The call is end-to-end (the client re-arms the socket timeout
+# before every blocking op), so a trickling peer cannot stretch it.
+OWNER_READ_TIMEOUT_S = 1.5
+
 
 def get_primary_user() -> str:
     """Read primary_user from $ENGRAM_HOME/config.json (lowercased; empty if unset)."""
@@ -59,14 +91,148 @@ def get_person_nodes() -> list[dict]:
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT id, claim, logical_chain, metadata FROM nodes "
-            "WHERE type = 'person' AND is_current = 1"
-        ).fetchall()
+        rows = conn.execute(_PERSON_NODES_SQL).fetchall()
         conn.close()
         return [dict(r) for r in rows]
     except Exception:
         return []
+
+
+def _owner_reads_enabled() -> bool:
+    """The U4d flag: `engramd.user_identity_reads_via_owner` in
+    $ENGRAM_HOME/config.json. ONE source, no env override. Anything but the
+    boolean `true` (absent file, absent key, a string, malformed JSON) is OFF,
+    which is the old path. After an upgrade, restart the owner BEFORE turning
+    this on (a running 1.0 owner answers a 1.1 client `unknown_operation`)."""
+    try:
+        with open(CONFIG_PATH) as f:
+            config = json.load(f)
+        return config["engramd"]["user_identity_reads_via_owner"] is True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def _import_engramd_client():
+    """Lazy import (flag OFF must never import it), resolved layout-agnostically
+    via the shared resolver -- plugin root first, then a walk-parents search for
+    the file; never a fixed parents[N] (project CLAUDE.md, "Plugin build
+    restructures code paths")."""
+    from _hooklib import resolve_runtime_dir
+
+    runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engramd_client.py")
+    if runtime_dir not in sys.path:
+        sys.path.insert(0, runtime_dir)
+    try:
+        import engramd_client
+    except ImportError as exc:
+        # Carry the path searched to the loud block in read_people_via_owner.
+        raise ImportError(
+            f"engramd_client.py was not found or could not be imported "
+            f"(searched: {runtime_dir}; {type(exc).__name__}: {exc})"
+        ) from exc
+
+    return engramd_client
+
+
+def _lines(title: str, items) -> str:
+    return "  " + title + ":\n" + "\n".join(f"    - {i}" for i in items)
+
+
+def read_people_via_owner() -> tuple[list[dict] | None, dict | None]:
+    """The flag-ON read. Returns (people, None) on a real answer, or
+    (None, response) where `response` is the loud hook output for an owner that
+    is unavailable, refusing, or answering with something unusable. NEVER opens
+    knowledge.db and never returns an empty list for a failure."""
+    try:
+        ec = _import_engramd_client()
+    except ImportError as exc:
+        # Design 5.5: an unimportable client is as loud as an unreachable owner.
+        # Never open the store, never `{}`, never "zero people".
+        head = (
+            "[ENGRAM UNAVAILABLE: the engramd client module could not be loaded, so NO "
+            "identity context was loaded. This is not the same as no people being known.]"
+        )
+        body = [
+            f"  Cause: {exc}",
+            _lines("Agent steps", [
+                "Do NOT read knowledge.db directly to work around this; tell the human what is shown here.",
+                "Do not retry in a loop: the module is missing from the install, so a retry cannot succeed.",
+            ]),
+            _lines("Human steps", [
+                "Check that engramd_client.py exists at the plugin root (the directory above hooks/); "
+                "re-run the plugin install or upgrade if it is missing.",
+                "To go back to the direct-read path meanwhile, set "
+                "engramd.user_identity_reads_via_owner to false in $ENGRAM_HOME/config.json.",
+            ]),
+        ]
+        return None, _assemble_response(head, body)
+    try:
+        result = ec.read(
+            "read",
+            {"sql": _PERSON_NODES_SQL, "args": []},
+            timeout=OWNER_READ_TIMEOUT_S,
+        )
+    except Exception as exc:
+        # The client documents transport failures as Unavailable but does not
+        # guarantee it never raises (e.g. a ValueError out of json.loads). As
+        # loud as every other failure: never a traceback with empty stdout,
+        # never the store, never "zero people".
+        head = (
+            "[ENGRAM UNAVAILABLE: the engramd client failed while reading identity context, "
+            "so NO identity context was loaded. This is not the same as no people being known.]"
+        )
+        body = [
+            f"  Cause: {type(exc).__name__}: {exc}"[:300],
+            _lines("Agent steps", [
+                "Do NOT read knowledge.db directly to work around this; tell the human what is shown here.",
+                "Do not retry in a loop: the client raised rather than reporting the owner down.",
+            ]),
+            _lines("Human steps", [
+                "This is a client-side bug: report it with the Cause line above.",
+                "To go back to the direct-read path meanwhile, set "
+                "engramd.user_identity_reads_via_owner to false in $ENGRAM_HOME/config.json.",
+            ]),
+        ]
+        return None, _assemble_response(head, body)
+    if isinstance(result, ec.Unavailable):
+        head = (
+            "[ENGRAM UNAVAILABLE: the engramd owner did not answer the user-identity "
+            "read, so NO identity context was loaded. This is not the same as no people "
+            "being known.]"
+        )
+        body = [
+            f"  Socket: {result.socket_path} (bound {OWNER_READ_TIMEOUT_S}s)",
+            _lines("Agent steps", result.agent_steps),
+            _lines("Human steps", result.human_steps),
+        ]
+        if result.detail:
+            body.append(f"  Detail: {result.detail}")
+        return None, _assemble_response(head, body)
+    if isinstance(result, ec.Rejected):
+        head = (
+            f"[ENGRAM: the engramd owner REFUSED the user-identity read "
+            f"(reason: {result.reason}); NO identity context was loaded and the store "
+            f"was not read directly.]"
+        )
+        body = [
+            f"  Reason: {result.reason}",
+            f"  Remedy: {result.remedy}",
+        ]
+        if result.detail:
+            body.append(f"  Detail: {result.detail}")
+        return None, _assemble_response(head, body)
+    rows = result.result
+    usable = isinstance(rows, list) and all(
+        isinstance(r, list) and len(r) == len(_PERSON_NODES_COLUMNS) for r in rows
+    )
+    if not usable:
+        head = (
+            "[ENGRAM: the engramd owner returned an unusable answer to the user-identity "
+            "read; NO identity context was loaded.]"
+        )
+        body = [f"  Expected a list of {len(_PERSON_NODES_COLUMNS)}-cell rows, got: {str(rows)[:200]}"]
+        return None, _assemble_response(head, body)
+    return [dict(zip(_PERSON_NODES_COLUMNS, r)) for r in rows], None
 
 
 def detect_speaker(prompt: str, people: list[dict]) -> dict | None:
@@ -192,7 +358,13 @@ def main():
         print(json.dumps({}))
         sys.exit(0)
 
-    people = get_person_nodes()
+    if _owner_reads_enabled():
+        people, failure = read_people_via_owner()
+        if failure is not None:
+            print(json.dumps(failure))
+            sys.exit(0)
+    else:
+        people = get_person_nodes()
     if not people:
         print(json.dumps({}))
         sys.exit(0)
