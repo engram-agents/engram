@@ -62,6 +62,44 @@ Usage (production defaults -- reads ~/.umwelt/config.json for the bell's
 agent/world_url):
     monitor-supervisor.py --purpose collab-loop
 
+Health check (`--check`, #3311, Linux-only):
+    monitor-supervisor.py --check [--pidfile P] [--status-file S] [--max-status-age SECONDS]
+
+A read-only verification that the supervisor armed as ONE Monitor is actually
+healthy -- it never starts, signals, reaps or restarts anything and never
+writes the pidfile or status file. Under the supervisor the children's stdout
+is a PIPE to the supervisor and only the supervisor's own stdout is the
+Monitor's socket, so the old three-Monitor "fd 1 is a socket" check is wrong
+here. Four items are verified, always printed (never stopping at the first
+failure) as exactly five stdout lines:
+
+    supervisor: <PASS|FAIL> pid=<n> <reason>
+    updates:    <PASS|FAIL> pid=<n|?> <reason>
+    mention:    <PASS|FAIL> pid=<n|?> <reason>
+    bell:       <PASS|FAIL> pid=<n|?> <reason>
+    CHECK <PASS|FAIL> <k>/4 failed[; extra child pid=<n>[,<n>...]]
+
+supervisor PASSes iff the pidfile pid is alive, is a monitor-supervisor
+(`_is_supervisor_process`), and its fd 1 is a `socket:`. A child PASSes iff
+the status file (fresh) AND the process table agree: its status-file pid is
+alive, is a direct child of the supervisor, carries the right script name in
+argv (forum-updates-monitor / forum-mention-monitor / umwelt-bell -- the
+default names; a `--*-cmd-json` override that renames the script will fail
+this item), and its fd 1 is a `pipe:[N]` that the supervisor itself also holds
+open. The supervisor's children are enumerated from the process table by
+ppid (never `pgrep -f`); any child the status file does not name is an
+"extra child" and fails the check (exit 1) even if all four items PASS.
+
+Staleness: the supervisor records its own `status_interval` in the status
+file; the default max age is 3x that value, `--max-status-age` overrides, and
+a status file without the field (older supervisor) falls back to 3x
+DEFAULT_STATUS_INTERVAL_SECONDS and says so on the supervisor line.
+
+Exit codes: 0 all four PASS; 1 any FAIL or extra child; 2 pidfile
+missing/unreadable/not an integer (ONE line, `CHECK FAIL supervisor not
+armed: ...`); 3 no /proc (ONE line, `CHECK FAIL unsupported platform`).
+Darwin is deliberately unsupported (use the three-Monitor check there).
+
 See --help for every override (script paths, pidfile/status-file locations,
 backoff/status-interval tuning, and the --*-cmd-json escape hatches the test
 suite uses to substitute controllable fakes for one or more children without
@@ -108,6 +146,17 @@ DEFAULT_UMWELT_BELL_SCRIPT = str(
     Path.home() / ".umwelt" / "marketplace" / "plugins" / "umwelt" / "tools" / "umwelt-bell.py"
 )
 DEFAULT_UMWELT_INTERVAL_SECONDS = 5.0
+
+# --check reads the process table here (module constant so tests can point it
+# at a nonexistent root to exercise the "no /proc" exit).
+PROC_ROOT = "/proc"
+STATUS_STALE_MULTIPLIER = 3.0
+_CHECK_ARGV_FRAGMENT = {
+    "updates": "forum-updates-monitor",
+    "mention": "forum-mention-monitor",
+    "bell": "umwelt-bell",
+}
+_CHECK_ORDER = ("updates", "mention", "bell")
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +474,8 @@ class Supervisor:
 
     # -- R8: no heartbeat print; a periodic status FILE instead --------
     def write_status(self) -> None:
-        data = {"generated_at": time.time(), "children": {}}
+        data = {"generated_at": time.time(),
+                "status_interval": self.status_interval, "children": {}}
         for name, child in self.children.items():
             proc = child.proc
             data["children"][name] = {
@@ -492,6 +542,192 @@ def _install_signal_handler(supervisor: Supervisor) -> None:
 
 
 # ---------------------------------------------------------------------------
+# --check (#3311): read-only health verification. Linux-only (/proc).
+# ---------------------------------------------------------------------------
+def _proc_stat(pid: int) -> tuple[str, int] | None:
+    """(state, ppid) from /proc/<pid>/stat, or None if unreadable. comm may
+    contain spaces/parens, so split after the LAST ')'."""
+    try:
+        raw = Path(f"{PROC_ROOT}/{pid}/stat").read_text(errors="replace")
+        rest = raw.rsplit(")", 1)[1].split()
+        return rest[0], int(rest[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _proc_alive(pid: int) -> bool:
+    st = _proc_stat(pid)
+    return st is not None and st[0] != "Z"
+
+
+def _fd_target(pid: int, fd: int) -> str | None:
+    try:
+        return os.readlink(f"{PROC_ROOT}/{pid}/fd/{fd}")
+    except OSError:
+        return None
+
+
+def _held_fd_targets(pid: int) -> set[str]:
+    out: set[str] = set()
+    try:
+        names = os.listdir(f"{PROC_ROOT}/{pid}/fd")
+    except OSError:
+        return out
+    for n in names:
+        try:
+            out.add(os.readlink(f"{PROC_ROOT}/{pid}/fd/{n}"))
+        except OSError:
+            pass
+    return out
+
+
+def _proc_argv(pid: int) -> str:
+    try:
+        raw = Path(f"{PROC_ROOT}/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode(errors="replace").strip()
+
+
+def _process_table_children(sup_pid: int) -> set[int]:
+    """Live (non-zombie) direct children of sup_pid, by scanning
+    /proc/*/stat for ppid == sup_pid. Never pgrep -f: ppid enumeration cannot
+    self-match the calling shell."""
+    kids: set[int] = set()
+    try:
+        entries = os.listdir(PROC_ROOT)
+    except OSError:
+        return kids
+    for e in entries:
+        if not e.isdigit():
+            continue
+        st = _proc_stat(int(e))
+        if st is not None and st[1] == sup_pid and st[0] != "Z":
+            kids.add(int(e))
+    return kids
+
+
+def _check_supervisor_item(sup_pid: int, note: str) -> tuple[bool, str]:
+    if not _proc_alive(sup_pid):
+        return False, f"pid {sup_pid} not alive"
+    status, cmdline = _pid_cmdline_status(sup_pid)
+    if status == "unknown":
+        return False, "could not verify identity (ps unavailable/errored)"
+    if status == "gone":
+        return False, f"pid {sup_pid} not alive"
+    if not _is_supervisor_process(cmdline):
+        return False, f"not a monitor-supervisor ({cmdline!r})"
+    target = _fd_target(sup_pid, 1)
+    if target is None:
+        return False, "stdout (fd 1) UNREADABLE"
+    if not target.startswith("socket:"):
+        return False, f"stdout (fd 1) is {target}, not a socket"
+    return True, f"stdout is {target}" + note
+
+
+def _check_child_item(name: str, sup_pid: int, entry, stale: str | None,
+                      sup_fds: set[str]) -> tuple[str, bool, str]:
+    """Returns (pid-text, passed, reason). Steps run in the spec's order so
+    the reason names the FIRST failing step."""
+    pid = entry.get("pid") if isinstance(entry, dict) else None
+    pid_txt = str(pid) if isinstance(pid, int) and not isinstance(pid, bool) else "?"
+    if stale is not None:
+        return pid_txt, False, stale
+    if pid_txt == "?":
+        return pid_txt, False, "no pid in status file"
+    if not _proc_alive(pid):
+        return pid_txt, False, f"pid {pid} not alive"
+    st = _proc_stat(pid)
+    ppid = st[1] if st else None
+    if ppid != sup_pid:
+        return pid_txt, False, f"not a child of supervisor (ppid={ppid}, supervisor={sup_pid})"
+    frag = _CHECK_ARGV_FRAGMENT[name]
+    argv = _proc_argv(pid)
+    if frag not in argv:
+        return pid_txt, False, f"argv does not identify {frag} ({argv!r})"
+    target = _fd_target(pid, 1)
+    if target is None or not target.startswith("pipe:["):
+        return pid_txt, False, f"stdout (fd 1) is {target or 'UNREADABLE'}, not a pipe"
+    if target not in sup_fds:
+        return pid_txt, False, f"stdout {target} is not held open by the supervisor"
+    return pid_txt, True, f"parent={sup_pid} stdout={target}"
+
+
+def run_check(pidfile: str, status_file: str, max_status_age: float | None) -> int:
+    if not os.path.isdir(PROC_ROOT):
+        print("CHECK FAIL unsupported platform: no /proc (use the three-Monitor check)")
+        return 3
+    try:
+        sup_pid = int(Path(pidfile).read_text().strip())
+        if sup_pid <= 0:
+            raise ValueError(f"non-positive pid {sup_pid}")
+    except (OSError, ValueError) as exc:
+        print(f"CHECK FAIL supervisor not armed: pidfile {pidfile} {exc.__class__.__name__}: {exc}")
+        return 2
+
+    # -- status file (upstream 1) --
+    data = None
+    stale: str | None = None
+    note = ""
+    try:
+        data = json.loads(Path(status_file).read_text())
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+        generated = float(data["generated_at"])
+        age = time.time() - generated
+        if max_status_age is not None:
+            limit = max_status_age
+        else:
+            interval = data.get("status_interval")
+            if isinstance(interval, (int, float)) and not isinstance(interval, bool) and interval > 0:
+                limit = STATUS_STALE_MULTIPLIER * float(interval)
+            else:
+                limit = STATUS_STALE_MULTIPLIER * DEFAULT_STATUS_INTERVAL_SECONDS
+                note = (" (status_interval absent from status file; assumed default "
+                        f"{DEFAULT_STATUS_INTERVAL_SECONDS:g}s)")
+        if age > limit:
+            stale = f"status file missing/stale (age {age:.0f}s, max {limit:g}s)"
+    except Exception as exc:  # missing, unparseable, no generated_at
+        stale = f"status file missing/stale ({exc.__class__.__name__})"
+        if not isinstance(data, dict):
+            data = None
+    children = data.get("children") if isinstance(data, dict) else None
+    if not isinstance(children, dict):
+        children = {}
+
+    results: list[tuple[str, str, bool, str]] = []  # label, pid, passed, reason
+    try:
+        ok, reason = _check_supervisor_item(sup_pid, note)
+    except Exception as exc:
+        ok, reason = False, f"check error: {exc!r}"
+    results.append(("supervisor", str(sup_pid), ok, reason))
+
+    sup_fds = _held_fd_targets(sup_pid)
+    for name in _CHECK_ORDER:
+        try:
+            pid_txt, ok, reason = _check_child_item(
+                name, sup_pid, children.get(name), stale, sup_fds)
+        except Exception as exc:
+            pid_txt, ok, reason = "?", False, f"check error: {exc!r}"
+        results.append((name, pid_txt, ok, reason))
+
+    extras: list[int] = []
+    if data is not None and _proc_alive(sup_pid):
+        named = {e.get("pid") for e in children.values() if isinstance(e, dict)}
+        extras = sorted(_process_table_children(sup_pid) - named)
+
+    for label, pid_txt, ok, reason in results:
+        print(f"{label + ':':<12}{'PASS' if ok else 'FAIL'} pid={pid_txt} {reason}")
+    failed = sum(1 for r in results if not r[2])
+    verdict = "PASS" if failed == 0 and not extras else "FAIL"
+    tail = ""
+    if extras:
+        tail = "; extra child pid=" + ",".join(str(p) for p in extras)
+    print(f"CHECK {verdict} {failed}/4 failed{tail}")
+    return 0 if verdict == "PASS" else 1
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def build_argparser() -> argparse.ArgumentParser:
@@ -533,11 +769,22 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--pidfile", default=DEFAULT_PIDFILE)
     p.add_argument("--status-file", default=DEFAULT_STATUS_FILE)
     p.add_argument("--status-interval", type=float, default=DEFAULT_STATUS_INTERVAL_SECONDS)
+    p.add_argument("--check", action="store_true",
+                    help="Read-only health check of a running supervisor "
+                         "(Linux-only; see module docstring). Prints five "
+                         "lines; exit 0/1/2/3.")
+    p.add_argument("--max-status-age", type=float, default=None,
+                    help="--check only: max age of the status file in "
+                         "seconds (default: 3x the status_interval the "
+                         "supervisor recorded in the file).")
     return p
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_argparser().parse_args(argv)
+
+    if args.check:
+        sys.exit(run_check(args.pidfile, args.status_file, args.max_status_age))
 
     reap_stale_supervisor(args.pidfile)
     # R5: become our own process-group leader before spawning children -- but
