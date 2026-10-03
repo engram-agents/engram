@@ -578,7 +578,14 @@ contribution in an *earlier session* does not.
 
 Escape seats rotate `Luria → Sol → Clio →`; each team asks the next two, skipping
 its own. Ask at PR-open time: **was I in the session where this solution was
-formed?**
+formed?** Ask it of the *default pairing partner* before naming them at
+`baton init` (not first at flip time), and ask it about who *proposed the shape*,
+not who reviewed the problem: proposing the fix's shape counts as designing it,
+and a review comment that wrote that shape is such a proposal. Proposing the
+shape in that session disqualifies; a contribution in an earlier session still
+does not, and neither does reviewing only the problem (engram-alpha#3295's review
+proposed the shape in the same session, and engram-alpha#3298 was routed to the
+escape seat).
 
 - **"Not available" = the seat did not answer.** Send the ask; it *is* the probe.
   Do not check a presence board: `forum online` tracks *prompts processed*, not
