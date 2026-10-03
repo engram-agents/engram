@@ -477,6 +477,69 @@ def _check_embedding_restore_flag(engram_home: str) -> tuple[bool, str | None]:
                 pass
 
 
+def _check_json1(connect=None) -> tuple[str, str | None]:
+    """Probe SQLite JSON1 (`json_each`) on a FRESH in-memory connection (#3327).
+
+    After #3326, `engram_core.generalization_chain` hydrates through
+    `IN (SELECT value FROM json_each(?))`. On a SQLite built without JSON1 it
+    raises, and the lesson tripwire hook (never-blocks contract) turns that
+    into a silently absent "[triggered principles]" section -- and the
+    tripwire's own query (`load_tripwires`, json_extract) is JSON1 too, so on
+    such a build ALL lesson tripwires go silent, not only that section. This
+    probe makes that case a NAMED health line.
+
+    Three-state result (same shape as _check_viz_server_health):
+        ("ok", None)          -- `SELECT count(*) FROM json_each('[1,2]')`
+                                 returned exactly 2 (a positive control: the
+                                 probe saw rows, not merely "did not raise").
+                                 Silent.
+        ("missing", reason)   -- the query raised sqlite3.OperationalError
+                                 whose text says json_each / a JSON function
+                                 is unavailable ("no such table: json_each",
+                                 "no such function: json_..."). `reason`
+                                 names the Python and SQLite versions probed.
+        ("unknown", reason)   -- ANY other outcome: another exception, a
+                                 connect failure, an unexpected row. Never
+                                 reported as ok.
+
+    Coverage bound: this probes the SQLite of the interpreter running THIS
+    hook, not necessarily the MCP server's or the surface hook's.
+
+    Never touches knowledge.db or ENGRAM_HOME; never raises (advisory).
+    `connect` is an injectable connection factory for tests.
+    """
+    versions = (
+        f"Python {sys.version_info.major}.{sys.version_info.minor}"
+        f".{sys.version_info.micro}, SQLite {sqlite3.sqlite_version}"
+    )
+    conn = None
+    try:
+        if connect is None:
+            connect = sqlite3.connect
+        conn = connect(":memory:")
+        try:
+            row = conn.execute("SELECT count(*) FROM json_each('[1,2]')").fetchone()
+        except sqlite3.OperationalError as exc:
+            text = str(exc).lower()
+            if "json" in text and (
+                "no such table" in text or "no such function" in text
+            ):
+                return "missing", f"{versions}: {str(exc)[:80]}"
+            return "unknown", f"probe error: {str(exc)[:80]}"
+        count = row[0] if row else None
+        if count == 2:
+            return "ok", None
+        return "unknown", f"unexpected json_each row count: {str(count)[:40]}"
+    except Exception as exc:  # advisory -- must never break session start
+        return "unknown", f"{type(exc).__name__}: {str(exc)[:80]}"
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 # ── Viz-server health probe (#2783) ─────────────────────────────────────────
 # The MCP probe above is deliberately tri-state (#1754); the viz server needs
 # a REQUIRED fourth state -- see _check_viz_server_health's docstring for why
@@ -3381,6 +3444,9 @@ def main() -> None:
     stale_ok, stale_reason = _check_backup_staleness(ENGRAM_HOME)
     viz_status, viz_reason = _check_viz_server_health(ENGRAM_HOME)
     embed_restore_ok, embed_restore_reason = _check_embedding_restore_flag(ENGRAM_HOME)
+    json1_status, json1_reason = _check_json1()  # #3327
+    json1_missing = json1_status == "missing"
+    json1_unknown = json1_status not in ("ok", "missing")
 
     # Tri-state (#1754): False = confirmed absent (hard alarm); None =
     # indeterminate probe (soft note, no "tell the user immediately" — a
@@ -3409,7 +3475,7 @@ def main() -> None:
     _health_lines: list[str] = []
     if (
         mcp_offline or not stale_ok or viz_down
-        or viz_inconclusive or not embed_restore_ok
+        or viz_inconclusive or not embed_restore_ok or json1_missing
     ):
         _health_lines.append("⚠️  ENGRAM substrate health:")
         if mcp_offline:
@@ -3435,6 +3501,26 @@ def main() -> None:
                 "embedder is available (or wait — a regeneration may "
                 "already be running in the background)."
             )
+        if json1_missing:
+            # #3327: three lines, bounded. "Not checked" names the coverage
+            # of this probe (this hook's interpreter only).
+            _health_lines.append(f"  JSON1: MISSING ({json1_reason})")
+            _health_lines.append(
+                "  → lesson tripwires (incl. '[triggered principles]') "
+                "will be silently absent until SQLite has JSON1 (json_each); "
+                "use a Python built with SQLite >= 3.38."
+            )
+            _health_lines.append(
+                "  Not checked: only this hook's interpreter was probed, not "
+                "the MCP server's or the surface hook's."
+            )
+    if json1_unknown:
+        # #3202 convention: unknown is informational, NOT a warning -- and
+        # never silent-ok.
+        _health_lines.append(
+            f"ℹ️  ENGRAM substrate health: JSON1 probe: unknown "
+            f"({str(json1_reason)[:100]})"
+        )
     if mcp_inconclusive:
         # #3202: unknown liveness is informational, NOT a ⚠️ alarm -- seats
         # surface any ⚠️ substrate-health block to the user immediately, so
