@@ -634,6 +634,21 @@ jobs:
           python3 -m pytest tests/test_health_version_gate.py -q
           python3 -c "import importlib.util as u; s=u.spec_from_file_location('g','tests/test_health_version_gate.py'); g=u.module_from_spec(s); s.loader.exec_module(g); status, msg = g.run_live_gate(); print(f'health-version gate (live): {status} | {msg}')"
 
+      - name: invariant-checks — claude-md-budget (project CLAUDE.md <= 75,000 bytes now, 40,000 is the #3322 round-2 target)
+        if: success() || failure()
+        # CLAUDE.md loads into every session started from this repo, and had grown
+        # to ~115 KB of mostly dated measurement history. Rules stay in CLAUDE.md;
+        # evidence lives in docs/. One `wc` — stdlib, well inside the under-one-
+        # minute cost rule (Branching convention). The nothing-lost half of the
+        # contract is tests/test_claude_md_moves.py (docs/claude-md-moves.json).
+        run: |
+          size="$(wc -c < CLAUDE.md)"
+          if [ "$size" -gt 75000 ]; then
+            echo "::error::CLAUDE.md is $size bytes; the budget is 75000 (round 1 of #3322; round 2 lowers it to 40000). Move dated measurement history to docs/ (rules stay) and list the move in docs/claude-md-moves.json."
+            exit 1
+          fi
+          echo "CLAUDE.md is $size bytes (budget 75000)."
+
       # ── 7. manifest-gate ───────────────────────────────────────────────
       # (from manifest-gate.yml)
       # Cheap tag-once tiering gate — runs on EVERY dev PR (and main PRs).
@@ -792,7 +807,7 @@ jobs:
       # (SKILL.md retired, all 4 tests unconditionally skipped) — wiring a
       # step that runs, does nothing, and can never fail would read as
       # coverage that isn't there.
-      - name: stdlib-only guards — claude-md-drift, plugin-manifest-import-sync, tool-policy-sync, upgrade-drift-sources, build-plugin-hooks-consistency
+      - name: stdlib-only guards — claude-md-drift, plugin-manifest-import-sync, tool-policy-sync, upgrade-drift-sources, build-plugin-hooks-consistency, claude-md-moves
         if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         run: |
           python3 -m pytest \
@@ -801,6 +816,7 @@ jobs:
             tests/test_tool_policy_sync.py \
             tests/test_upgrade_drift_sources.py \
             tests/test_build_plugin_hooks_consistency.py \
+            tests/test_claude_md_moves.py \
             -q
 
       # ── 7d. cascade behaviour acceptance (playbox) ──────────────────────

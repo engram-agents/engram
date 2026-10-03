@@ -381,3 +381,11 @@ the same host) are completely unaffected:
 Manual deployment (above) is the current state — same as `ia` today. Issue
 #50 tracks automated multi-agent deployment via `agentctl`. When that lands,
 baton deployment will be absorbed into the operator setup flow.
+
+## Moved from CLAUDE.md § CLAUDE.md § Every PR carries a baton — origin paragraph (moved 2026-10-03, #3322)
+
+*Verbatim; moved, not edited. CLAUDE.md keeps the rule and a pointer here.*
+
+*Origin: a PR mis-merge — the colleague verdict lived only in a letter and no baton
+tracked the turn-state, so a parked-but-unconverged PR read as merge-ready. The
+baton, not a letter, is the merge-gate: its `turn:` field at the time, its `phase:` field since #3284.*
