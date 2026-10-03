@@ -224,7 +224,8 @@ class TestNoEmbeddingsBypassesGate:
                 # Must return normally -- no SystemExit.
                 server._embedding_startup_gate()
 
-            # The gate itself must print nothing when bypassed. Ignore the
+            # (#3350) The gate must print EXACTLY ONE WARNING line to
+            # stderr when bypassed -- loud, not silent. Ignore the
             # "sqlite-vec unavailable" notice: that is printed by
             # `_import_server()` above (at `import engram_core` time) on any
             # interpreter without sqlite-vec installed, and has nothing to
@@ -234,9 +235,18 @@ class TestNoEmbeddingsBypassesGate:
                 line for line in captured.err.splitlines()
                 if "sqlite-vec unavailable" not in line
             ]
-            assert gate_lines == [], (
-                f"expected the gate itself to print nothing when bypassed "
-                f"(ignoring the sqlite-vec import notice), got: {gate_lines!r}"
+            assert len(gate_lines) == 1, (
+                f"expected exactly one stderr line from the gate when "
+                f"bypassed (ignoring the sqlite-vec import notice), got: "
+                f"{gate_lines!r}"
+            )
+            assert gate_lines[0].startswith("[engram] WARNING:"), (
+                f"expected the one line to start with '[engram] WARNING:', "
+                f"got: {gate_lines[0]!r}"
+            )
+            assert "ENGRAM_NO_EMBEDDINGS" in gate_lines[0], (
+                f"expected the WARNING line to name ENGRAM_NO_EMBEDDINGS, "
+                f"got: {gate_lines[0]!r}"
             )
         finally:
             os.environ.pop("ENGRAM_NO_EMBEDDINGS", None)
@@ -263,22 +273,66 @@ class TestNoEmbeddingsBypassesGate:
                 # Must return normally -- no SystemExit.
                 server._embedding_startup_gate()
 
-            # The gate itself must print nothing when bypassed. Ignore the
-            # "sqlite-vec unavailable" notice: that is printed by
-            # `_import_server()` above (at `import engram_core` time) on any
-            # interpreter without sqlite-vec installed, and has nothing to
-            # do with the gate under test here.
+            # (#3350) Same contract as test 3: exactly one WARNING line,
+            # checked FIRST so this fires even with enabled: false also
+            # present. Ignore the "sqlite-vec unavailable" notice: that is
+            # printed by `_import_server()` above (at `import engram_core`
+            # time) on any interpreter without sqlite-vec installed, and has
+            # nothing to do with the gate under test here.
             captured = capsys.readouterr()
             gate_lines = [
                 line for line in captured.err.splitlines()
                 if "sqlite-vec unavailable" not in line
             ]
-            assert gate_lines == [], (
-                f"expected the gate itself to print nothing when bypassed "
-                f"(ignoring the sqlite-vec import notice), got: {gate_lines!r}"
+            assert len(gate_lines) == 1, (
+                f"expected exactly one stderr line from the gate when "
+                f"bypassed (ignoring the sqlite-vec import notice), got: "
+                f"{gate_lines!r}"
+            )
+            assert gate_lines[0].startswith("[engram] WARNING:"), (
+                f"expected the one line to start with '[engram] WARNING:', "
+                f"got: {gate_lines[0]!r}"
+            )
+            assert "ENGRAM_NO_EMBEDDINGS" in gate_lines[0], (
+                f"expected the WARNING line to name ENGRAM_NO_EMBEDDINGS, "
+                f"got: {gate_lines[0]!r}"
             )
         finally:
             os.environ.pop("ENGRAM_NO_EMBEDDINGS", None)
+
+
+# ---------------------------------------------------------------------------
+# Test 3b (#3350): no WARNING line when ENGRAM_NO_EMBEDDINGS is unset and
+# the embedder is healthy -- the new print must be scoped to the bypass
+# branch only, not leak onto the happy path.
+# ---------------------------------------------------------------------------
+
+class TestNoWarningWhenEnvUnsetAndHealthy:
+    def test_no_warning_line_when_unset_and_embedder_healthy(self, capsys):
+        os.environ.pop("ENGRAM_NO_EMBEDDINGS", None)
+        server = _import_server()
+
+        _FakeThread.instances = []
+        with mock.patch.object(server._embedder, "is_available", return_value=True), \
+             mock.patch.object(server, "_embedding_cache_status", return_value=True), \
+             mock.patch.object(server, "_get_embedding_config", return_value={"model": MODEL}), \
+             mock.patch.object(
+                 server._embedder, "_load_model",
+                 side_effect=AssertionError("_load_model must not be called synchronously"),
+             ), \
+             mock.patch("threading.Thread", side_effect=lambda **kw: _FakeThread(**kw)):
+            # Must not raise.
+            server._embedding_startup_gate()
+
+        captured = capsys.readouterr()
+        gate_lines = [
+            line for line in captured.err.splitlines()
+            if "sqlite-vec unavailable" not in line
+        ]
+        assert not any(line.startswith("[engram] WARNING:") for line in gate_lines), (
+            f"expected no WARNING line on the healthy, unset-env path, got: "
+            f"{gate_lines!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

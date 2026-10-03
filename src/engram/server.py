@@ -8211,10 +8211,11 @@ def _embedding_startup_gate() -> None:
         MCP connection timeout and leave every engram_* tool unavailable for
         the session. Do NOT collapse that split — it is load-bearing.
 
-    `ENGRAM_NO_EMBEDDINGS=1` bypasses this entire gate. It is documented test
-    scaffolding (release_gates.py, dump_mcp_schema.py) and the escape hatch
-    for an operator who must start deliberately degraded. Checked FIRST,
-    before config is even read.
+    `ENGRAM_NO_EMBEDDINGS=1` bypasses this entire gate. It is test/dev
+    scaffolding ONLY -- used by the test suite, release_gates.py,
+    dump_mcp_schema.py, run-all-tests.sh, and rc-upgrade-verify.py -- and is
+    NOT a supported production mode (#345, #3350). Checked FIRST, before
+    config is even read.
 
     `embedding.enabled: false` is now ALSO fatal (#345 PR2): the toggle is
     retired -- embeddings are mandatory, full stop. A config that still
@@ -8239,6 +8240,13 @@ def _embedding_startup_gate() -> None:
     import sys
 
     if os.environ.get("ENGRAM_NO_EMBEDDINGS"):
+        print(
+            "[engram] WARNING: embeddings disabled by ENGRAM_NO_EMBEDDINGS "
+            "-- this is test/dev scaffolding only, not a supported "
+            "production mode (#345, #3350). Every node written this "
+            "session will have no embedding.",
+            file=sys.stderr,
+        )
         return
 
     emb_config = _get_embedding_config()
