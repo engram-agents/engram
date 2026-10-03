@@ -894,11 +894,22 @@ def _field_refusal(route: str, field: str, why: str) -> _RequestRefusal:
 
 
 _NO_CONTROL = "must not contain line-break or control characters (it is an identifier, not free text)"
+# #3294: json.loads accepts the escape "\\ud800" and yields a lone surrogate, which the
+# store's UTF-8 encode then rejects at write time (a 500 and a burned seq).
+_NOT_UTF8 = "must be valid UTF-8 text (it contains a lone surrogate or another character that cannot be encoded)"
+
+
+def _require_utf8(route: str, field: str, raw: str) -> None:
+    try:
+        raw.encode("utf-8")
+    except UnicodeEncodeError:
+        raise _field_refusal(route, field, _NOT_UTF8) from None
 
 
 def _read_ident(route: str, field: str, raw, *, lower: bool) -> str:
     if not isinstance(raw, str):
         raise _field_refusal(route, field, f"must be a string (got {type(raw).__name__})")
+    _require_utf8(route, field, raw)
     if _md.has_break_or_control(raw):
         raise _field_refusal(route, field, _NO_CONTROL)
     value = raw.strip()
@@ -940,6 +951,7 @@ def _read_fields(route: str, data, spec: dict, *, pid: Optional[str] = None) -> 
         elif kind == "text":
             if not isinstance(raw, str):
                 raise _field_refusal(route, field, f"must be a string (got {type(raw).__name__})")
+            _require_utf8(route, field, raw)
             out[field] = _md.normalize_free_text(raw)
         elif kind in ("id", "idl"):
             out[field] = _read_ident(route, field, raw, lower=(kind == "idl"))
