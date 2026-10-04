@@ -89,6 +89,7 @@ No live ENGRAM install is touched; every test builds its own temp-dir tree.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import importlib.util
 import os
@@ -631,6 +632,13 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
         ),
     ]
 
+    @contextlib.contextmanager
+    def _tmpdir(self):
+        """The tmp root every test below builds its fake tree under. A hook
+        for the symlinked-tmp variant (TestResolveRuntimeDirWalkParentsSymlinkedTmp)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            yield tmp
+
     @staticmethod
     def _build_worktree_tree(tmp_path: Path, subject: _WalkParentsSubject):
         """<tmp>/main-repo/.claude/worktrees/fake-agent/src/engram/hooks/claude/<file>.py
@@ -709,7 +717,7 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
         past it and found the ancestor's instead"."""
         for subject in self._SUBJECTS:
             with self.subTest(subject=subject.label):
-                with tempfile.TemporaryDirectory() as tmp:
+                with self._tmpdir() as tmp:
                     tmp_path = Path(tmp)
                     main_repo, worktree, worktree_file = self._build_worktree_tree(
                         tmp_path, subject
@@ -728,9 +736,14 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
                         worktree_file, subject, data_home
                     )
 
+                    # Compare REAL paths: the resolver returns the
+                    # `Path(__file__).resolve()` spelling, so a symlinked tmp
+                    # root (macOS /var -> /private/var, gh#3292) names the same
+                    # directory differently. Full-path realpath equality still
+                    # proves WHICH directory was chosen.
                     self.assertEqual(
-                        result,
-                        str(own_engram_dir),
+                        os.path.realpath(result),
+                        os.path.realpath(own_engram_dir),
                         f"[{subject.label}] expected worktree's own "
                         f"{own_engram_dir!r}, got {result!r}",
                     )
@@ -742,7 +755,7 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
         from item 2's "worktree has its own copy" case)."""
         for subject in self._SUBJECTS:
             with self.subTest(subject=subject.label):
-                with tempfile.TemporaryDirectory() as tmp:
+                with self._tmpdir() as tmp:
                     tmp_path = Path(tmp)
                     main_repo, worktree, worktree_file = self._build_worktree_tree(
                         tmp_path, subject
@@ -759,9 +772,11 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
                         worktree_file, subject, data_home
                     )
 
+                    # Compare REAL paths (see the sibling test): same
+                    # directory, different spelling under a symlinked tmp root.
                     self.assertEqual(
-                        result,
-                        str(main_repo_engram_dir),
+                        os.path.realpath(result),
+                        os.path.realpath(main_repo_engram_dir),
                         f"[{subject.label}] expected ancestor's "
                         f"{main_repo_engram_dir!r}, got {result!r}",
                     )
@@ -772,7 +787,7 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
         preserved (additive hardening), not removed (spec Tests item 4)."""
         for subject in self._SUBJECTS:
             with self.subTest(subject=subject.label):
-                with tempfile.TemporaryDirectory() as tmp:
+                with self._tmpdir() as tmp:
                     tmp_path = Path(tmp)
                     main_repo, worktree, worktree_file = self._build_worktree_tree(
                         tmp_path, subject
@@ -803,7 +818,7 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
         unhandled exception here would crash the whole hook process."""
         for subject in self._SUBJECTS:
             with self.subTest(subject=subject.label):
-                with tempfile.TemporaryDirectory() as tmp:
+                with self._tmpdir() as tmp:
                     tmp_path = Path(tmp)
                     main_repo, worktree, worktree_file = self._build_worktree_tree(
                         tmp_path, subject
@@ -843,6 +858,28 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
                         f"{subject.expected_last_ditch!r} on a permission error "
                         f"mid-walk, got {result!r}",
                     )
+
+
+class TestResolveRuntimeDirWalkParentsSymlinkedTmp(TestResolveRuntimeDirWalkParents):
+    """engram-alpha#3292: the same WalkParents tests with the tmp root reached
+    through a SYMLINK, reproducing macOS's TMPDIR shape (/var -> /private/var)
+    on Linux. The resolver returns `Path(__file__).resolve()`-derived paths
+    (the real directory), so an expectation built from the unresolved tmp path
+    names the same directory spelled differently and must still pass.
+    """
+
+    @contextlib.contextmanager
+    def _tmpdir(self):
+        with tempfile.TemporaryDirectory() as base:
+            real_parent = Path(base) / "private" / "var"
+            real_dir = real_parent / "tmpX"
+            real_dir.mkdir(parents=True)
+            link = Path(base) / "var"
+            link.symlink_to(real_parent, target_is_directory=True)
+            reached = link / "tmpX"
+            # Guard against a vacuous variant: the spelling really differs.
+            self.assertNotEqual(str(reached), os.path.realpath(reached))
+            yield str(reached)
 
 
 if __name__ == "__main__":
