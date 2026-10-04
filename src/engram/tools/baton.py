@@ -72,6 +72,7 @@ from forum_api import (
 # ("Scope note") for why: they keep their own verbatim definitions further
 # down in this file, unchanged by this refactor.
 from baton_gate import (
+    GITHUB_ANCHOR_ACCEPTED_FORMS,
     PR_ANCHOR_TWO_ROUTE_HINT,
     _parse_github_anchor,
     _dedupe_checks_by_latest,
@@ -430,7 +431,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         if not _GITHUB_ANCHOR_RE.match(github_anchor):
             print(
                 f"baton init: invalid --github value '{github_anchor}'. "
-                "Expected pr/<N>, pr/<owner>/<repo>/<N>, or project/<N> "
+                f"Accepted forms: {GITHUB_ANCHOR_ACCEPTED_FORMS} "
                 "(e.g. pr/490, pr/engram-agents/engram-paper/22, project/4).",
                 file=sys.stderr,
             )

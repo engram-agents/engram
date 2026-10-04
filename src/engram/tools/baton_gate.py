@@ -154,6 +154,14 @@ PR_ANCHOR_TWO_ROUTE_HINT = (
 )
 
 
+# #3377 (Kepler): the ONE wording of the accepted ``github`` anchor forms, shared by
+# the forum server's 422 for a PRESENT github that does not parse (any baton id,
+# src/forum/server.py ``api_project_init``) and the CLI's ``baton init --github``
+# refusal (tools/baton.py ``cmd_init``). Surface-neutral: each surface supplies its
+# own lead-in. These are exactly the shapes ``_parse_github_anchor`` accepts.
+GITHUB_ANCHOR_ACCEPTED_FORMS = "pr/<owner>/<repo>/<N>, pr/<N>, or project/<N>"
+
+
 def _parse_github_anchor(value: str) -> Optional[tuple]:
     """Parse a github anchor value into (kind, repo, number).
 

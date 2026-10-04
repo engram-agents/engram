@@ -181,12 +181,13 @@ def test_unqualified_pr_n_is_not_this_rules_business(world):
         assert world.gate.PR_ANCHOR_TWO_ROUTE_HINT not in r.get_json()["error"]
 
 
-def test_junk_github_on_non_pr_shaped_id_keeps_current_behaviour(world):
-    """PINS pre-existing behaviour (to be filed separately, NOT changed here): a
-    non-PR-shaped id with an unparseable github is created as a bunch, junk stored."""
+def test_junk_github_on_non_pr_shaped_id_is_now_422(world):
+    """#3377 flips what this test pinned under #3374: a non-PR-shaped id with an
+    unparseable github is no longer created as a bunch with the junk stored; it is
+    refused (full contract: test_baton_init_refuses_unparseable_github.py)."""
     r = _post(world, "DESIGN-x", "garbage")
-    assert r.status_code == 201, r.get_json()
-    assert _phase(world, "DESIGN-x") == "pool"
+    assert r.status_code == 422, r.get_json()
+    _nothing_created(world, "DESIGN-x")
 
 
 # 4c whitespace / null ------------------------------------------------------------

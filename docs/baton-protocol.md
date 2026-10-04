@@ -96,6 +96,10 @@ Create a new project baton file. Fails if the file already exists.
   PR-shaped id with no `github`, or one that does not parse, is a 422 naming both routes, with no bypass and nothing
   stored, so a direct API call or `baton-migrate-to-coord-store` hits it too (the
   CLI refusal is the early, friendly copy). It applies at creation only.
+- For **every** id (#3377), the server refuses a `github` that is present but does not
+  parse: `POST /api/projects` answers 422 naming the accepted forms (`pr/<owner>/<repo>/<N>`,
+  `pr/<N>`, `project/<N>`), before anything is written and with no bypass; an absent, empty
+  or blank `github` on a non-PR-shaped id stays allowed (a bunch with no anchor).
 
 ```bash
 baton init PR-425 --title "viz_server global agent selector" \

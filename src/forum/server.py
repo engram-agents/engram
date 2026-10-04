@@ -1292,6 +1292,26 @@ def _anchorless_pr_refusal(route: str, project_id: str, given: str) -> str:
         "(Send the anchor in the github field.)")
 
 
+# Gate-unavailable fallback for ``baton_gate.GITHUB_ANCHOR_ACCEPTED_FORMS`` (the server
+# does not import the gate there); pinned equal to the gate's constant by a test.
+_ACCEPTED_FORMS_FALLBACK = "pr/<owner>/<repo>/<N>, pr/<N>, or project/<N>"
+
+
+def _unparseable_github_refusal(route: str, project_id: str, given: str) -> str:
+    """#3377: refusal text for a PRESENT ``github`` that does not parse, on an id that
+    is NOT PR-shaped (a PR-shaped id gets :func:`_anchorless_pr_refusal`'s two-route
+    text). The accepted forms are ``baton_gate.GITHUB_ANCHOR_ACCEPTED_FORMS``, shared
+    with the CLI's ``--github`` refusal. The echoed value is bounded (<= 60 chars)."""
+    gate = _load_baton_gate()
+    forms = gate.GITHUB_ANCHOR_ACCEPTED_FORMS if gate is not None else _ACCEPTED_FORMS_FALLBACK
+    shown = given if len(given) <= 60 else given[:60] + "..."
+    return (
+        f"{route} {project_id}: refusing to create '{project_id}': its github anchor "
+        f"{shown!r} is not an accepted anchor, and a stored anchor nothing can parse "
+        f"would be read as 'no anchor' by gc / flip / the board. Accepted forms: "
+        f"{forms}. (Omit github for a baton with no anchor.)")
+
+
 def _gate_hint() -> str:
     gate = _load_baton_gate()
     if gate is not None:
@@ -3125,6 +3145,10 @@ def create_app(
             if (_PR_ISH_ID_RE.match(project_id) and not project_id.lower().startswith("pool-")
                     and not _ANCHOR_SHAPE_RE.fullmatch(_g_chk.lower())):
                 return jsonify({"error": _anchorless_pr_refusal(route, project_id, _g_chk)}), 422
+            # #3377: ONE rule for every id -- a PRESENT github must parse (same local
+            # anchor-shape check, the gate is deliberately not imported here).
+            if _g_chk and not _ANCHOR_SHAPE_RE.fullmatch(_g_chk.lower()):
+                return jsonify({"error": _unparseable_github_refusal(route, project_id, _g_chk)}), 422
             allowed = _INIT_PHASES_PR | _INIT_PHASES_BUNCH
             default_phase = None
         elif gate._is_pr_shaped(project_id, (github or "").strip().lower()):
@@ -3143,6 +3167,14 @@ def create_app(
             allowed = _INIT_PHASES_PR
             default_phase = "fairy"
         else:
+            # #3377: ONE rule for every id (Kepler): a PRESENT github must parse, not
+            # only on a PR-shaped id. An absent / empty / blank github is a legitimate
+            # anchorless bunch (`github` is None here after the shared reader). Like the
+            # PR-shaped refusal this runs BEFORE the transition_phase allow-list and
+            # before anything is written; no request field bypasses it.
+            _g_chk = (github or "").strip()
+            if _g_chk and gate._parse_github_anchor(_g_chk.lower()) is None:
+                return jsonify({"error": _unparseable_github_refusal(route, project_id, _g_chk)}), 422
             allowed = _INIT_PHASES_BUNCH
             default_phase = "pool"
         if transition_phase is None:
@@ -3152,6 +3184,14 @@ def create_app(
                                      "allowed here: " + ", ".join(sorted(allowed)))
             return jsonify({"error": msg}), st
 
+        # #3377 fold (Ariadne, #3384): STORE what was validated. Every check above (and
+        # the PR-shaped / "present must parse" refusals) judged the stripped + lowercased
+        # value, but `_parse_github_anchor` is case-sensitive and the readers (gc, flip,
+        # board, CLI) parse the STORED value without lowercasing -- so a raw 'Project/7'
+        # passed validation and was stored as an anchor they read as "no anchor". All three
+        # branches (gate PR-shaped, gate non-PR, gate unavailable) reach this one line. An
+        # unqualified pr/<N> is still rewritten to pr/<owner>/<repo>/<N> below.
+        github = (github or "").strip().lower() or None
         # Round 6 (S5 + D2): the anchor is checked/qualified BEFORE anything is written.
         g_norm = (github or "").strip().lower()
         if g_norm:
