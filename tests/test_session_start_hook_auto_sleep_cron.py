@@ -377,6 +377,23 @@ def test_jitter_overflow_not_uses_wrapped_minute(tmp_path):
 # 9. Hook integration: cron block appears in startup additionalContext
 # ---------------------------------------------------------------------------
 
+def _parse_trailer(ctx: str):
+    """Parse emit_context's line-1 trailer -> (shown, cut, overflow_path).
+
+    The trailer always reads '▸ N shown · K cut', even when K == 0, so a bare
+    'cut' substring proves nothing; the count and the named file are the facts.
+    """
+    import re as _re
+    first_line = ctx.splitlines()[0]
+    m = _re.match(
+        r"▸ (\d+) shown · (\d+) cut(?: · head trimmed)?(?: — see (.+))?$", first_line
+    )
+    assert m, f"unparseable trailer: {first_line!r}"
+    path = m.group(3)
+    assert int(m.group(2)) == 0 or path, f"cut>0 but no overflow path: {first_line!r}"
+    return int(m.group(1)), int(m.group(2)), path
+
+
 def test_integration_cron_block_in_startup_context(tmp_path):
     """When enabled+interactive+startup, cron block appears in additionalContext."""
     engram_home = _make_engram_home(tmp_path)
@@ -397,7 +414,19 @@ def test_integration_cron_block_in_startup_context(tmp_path):
     assert "AUTO-SLEEP NIGHTLY" in ctx, (
         f"Expected 'AUTO-SLEEP NIGHTLY' in additionalContext: {ctx!r}"
     )
-    assert "[Auto-sleep enabled]" in ctx
+    # The full block is _P_REST: it is either visible, or (when the injection
+    # overflows -- e.g. a long pytest --basetemp inflates the overflow pointer,
+    # #3336) cut, in which case the must-not-miss line must still be visible
+    # and the overflow file named on line 1 must actually hold the full block.
+    assert mod.auto_sleep_must_line() in ctx
+    if "[Auto-sleep enabled]" not in ctx:
+        shown, cut, path = _parse_trailer(ctx)
+        assert cut >= 1, f"full block absent but trailer reports cut={cut}"
+        with open(path, encoding="utf-8") as fh:
+            overflow_text = fh.read()
+        assert "[Auto-sleep enabled]" in overflow_text, (
+            f"cut full block not recoverable from overflow file {path}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -629,3 +658,152 @@ def test_encode_with_errors_replace_does_not_raise(tmp_path):
         assert isinstance(result, str), f"Expected str result, got: {type(result)}"
     finally:
         mod.ENGRAM_HOME = original_home
+
+
+# ---------------------------------------------------------------------------
+# #3336 -- the cron instruction must survive injection overflow
+#
+# The full [Auto-sleep enabled] block is _P_REST, so when the 9,500-char
+# budget overflows (a long ENGRAM_HOME inflates the overflow pointer; a big
+# block does the same) it is cut, and the seat silently never registers
+# its nightly sleep cron. A one-line must-not-miss pointer at _P_MUST keeps
+# the instruction visible and names the overflow file holding the full text.
+# ---------------------------------------------------------------------------
+
+_MUST_TOKEN = "AUTO-SLEEP NIGHTLY"
+_FULL_BLOCK_MARK = "[Auto-sleep enabled]"  # must NOT appear in the short must line
+# A phrase that occurs once, inside the full cron prompt, and nowhere in the
+# short must line -- counting it counts copies of the full prompt.
+_FULL_PROMPT_ONLY = "recovered from stale lock"
+
+
+def _long_engram_home(tmp_path: Path, min_len: int = 300) -> Path:
+    """Nested engram home whose absolute path is >= min_len chars."""
+    base = tmp_path
+    i = 0
+    while len(str(base / "engram")) < min_len:
+        base = base / f"nested-dir-segment-{i:02d}-padding-padding"
+        i += 1
+    base.mkdir(parents=True)
+    return _make_engram_home(base)
+
+
+def _run_startup(mod, tmp_path: Path, name: str) -> str:
+    with _mock_no_engram_client():
+        with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
+            result = _run_hook_main(mod, {
+                "session_id": name,
+                "transcript_path": str(tmp_path / "transcript.jsonl"),
+                "source": "startup",
+            })
+    return result["hookSpecificOutput"]["additionalContext"]
+
+
+def test_must_line_survives_overflow_when_enabled(tmp_path):
+    """Cell 1: enabled + forced overflow -> must line (token + CronList) present."""
+    engram_home = _long_engram_home(tmp_path)
+    _write_config(engram_home, {"auto_sleep_enabled": True, "auto_sleep_time": "03:00"})
+    mod = _load_hook_module(engram_home, session_role="interactive")
+    # Force overflow: an earlier _P_REST block outranks the cron block regardless of the path length alone.
+    mod.sleep_status_block = lambda: "SLEEP-FILLER-" + ("a" * 9_000)
+
+    ctx = _run_startup(mod, tmp_path, "test-3336-overflow")
+
+    # Precondition: overflow really cut the full block (else test is vacuous).
+    assert _FULL_BLOCK_MARK not in ctx, "fixture did not overflow the full block"
+    assert _MUST_TOKEN in ctx, f"must line dropped under overflow: {ctx!r}"
+    assert "CronList" in ctx, f"CronList instruction dropped under overflow: {ctx!r}"
+    # Pin the pointer's promise: the file named on line 1 holds the full prompt.
+    _shown, cut, path = _parse_trailer(ctx)
+    assert cut >= 1 and path
+    with open(path, encoding="utf-8") as fh:
+        overflow_text = fh.read()
+    assert _FULL_BLOCK_MARK in overflow_text
+    assert "AUTO-SLEEP CRON-PROMPT to register" in overflow_text
+    assert _FULL_PROMPT_ONLY in overflow_text
+
+
+def test_must_line_absent_when_disabled(tmp_path):
+    """Cell 2: disabled -> no must line, no noise (also under overflow)."""
+    engram_home = _long_engram_home(tmp_path)
+    _write_config(engram_home, {"auto_sleep_enabled": False, "auto_sleep_time": "03:00"})
+    mod = _load_hook_module(engram_home, session_role="interactive")
+    mod.sleep_status_block = lambda: "SLEEP-FILLER-" + ("a" * 9_000)
+
+    ctx = _run_startup(mod, tmp_path, "test-3336-disabled")
+    assert _MUST_TOKEN not in ctx
+    assert "CronList" not in ctx
+
+
+def test_must_line_helper_empty_when_disabled_or_noninteractive(tmp_path):
+    engram_home = _make_engram_home(tmp_path)
+    _write_config(engram_home, {"auto_sleep_enabled": False})
+    mod = _load_hook_module(engram_home, session_role="interactive")
+    assert mod.auto_sleep_must_line() == ""
+
+    _write_config(engram_home, {"auto_sleep_enabled": True, "auto_sleep_time": "99:99"})
+    assert mod.auto_sleep_must_line() == "", "invalid time must disable like the block"
+
+    _write_config(engram_home, {"auto_sleep_enabled": True, "auto_sleep_time": "03:00"})
+    mod = _load_hook_module(engram_home, session_role="heartbeat")
+    assert mod.auto_sleep_must_line() == ""
+
+
+def test_must_line_is_short_and_references_not_duplicates(tmp_path):
+    engram_home = _make_engram_home(tmp_path)
+    _write_config(engram_home, {"auto_sleep_enabled": True, "auto_sleep_time": "03:00"})
+    mod = _load_hook_module(engram_home, session_role="interactive")
+    line = mod.auto_sleep_must_line()
+    assert _MUST_TOKEN in line and "CronList" in line
+    assert "\n" not in line
+    assert len(line) <= 300, f"must line too long ({len(line)})"
+    assert _FULL_PROMPT_ONLY not in line
+    # Existing integration tests key on the full block's header; the must line
+    # must not satisfy them by itself.
+    assert _FULL_BLOCK_MARK not in line
+
+
+def test_no_overflow_has_must_line_and_single_full_prompt():
+    """Cell 3: no overflow -> both present; full prompt appears exactly once.
+
+    The no-overflow premise must not depend on pytest's basetemp length (a long
+    tmp path inflates the marker line and overflow pointer and tips the
+    injection over budget), so this cell uses its own short mkdtemp home and
+    asserts the premise explicitly.
+    """
+    import shutil
+    short = Path(tempfile.mkdtemp(prefix="e"))
+    try:
+        engram_home = _make_engram_home(short)
+        _write_config(engram_home, {"auto_sleep_enabled": True, "auto_sleep_time": "03:00"})
+        mod = _load_hook_module(engram_home, session_role="interactive")
+        # A dev/source checkout has no baked harness, so detect_harness() is
+        # None and the hook runs at the 4,000-char unmeasured floor, where the
+        # ~2.6K cron block alone squeezes other blocks out. Pin the measured
+        # claude-code budget (same as test_session_start_hook_injection_bounds)
+        # so the premise holds on every host.
+        mod.detect_harness = lambda: "claude-code"
+        must = mod.auto_sleep_must_line()
+
+        ctx = _run_startup(mod, short, "test-3336-no-overflow")
+
+        # Premise, stated explicitly. The hook cuts the full tool-capability
+        # index to its overflow file by design (#3217), so raw `cut == 0` is
+        # unreachable; the premise is that auto-sleep content adds no cuts, i.e.
+        # the cut count equals the auto-sleep-disabled baseline on the same
+        # fixture.
+        _shown, cut, _path = _parse_trailer(ctx)
+        _write_config(engram_home, {"auto_sleep_enabled": False})
+        _s, baseline_cut, _p = _parse_trailer(
+            _run_startup(mod, short, "test-3336-no-overflow-baseline")
+        )
+    finally:
+        shutil.rmtree(short, ignore_errors=True)
+    assert cut == baseline_cut, (
+        f"premise broken: auto-sleep content was cut (cut={cut}, "
+        f"auto-sleep-off baseline={baseline_cut}); cell is not no-overflow"
+    )
+    assert must and must in ctx
+    assert _FULL_BLOCK_MARK in ctx
+    assert ctx.count(_FULL_PROMPT_ONLY) == 1, "full cron prompt must not be duplicated"
+    assert ctx.index(must) < ctx.index(_FULL_BLOCK_MARK), "must line precedes body"

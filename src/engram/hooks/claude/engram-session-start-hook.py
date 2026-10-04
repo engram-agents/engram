@@ -2783,22 +2783,22 @@ def sleep_status_block() -> str:
     )
 
 
-def auto_sleep_cron_block() -> str:
-    """Emit a cron-registration nudge when cadence.auto_sleep_enabled is true.
+def _auto_sleep_settings() -> "tuple[str, str] | None":
+    """Single source for the auto-sleep config read + validation (#3336).
 
-    Only fires for interactive role (cron is registered per-session by the
-    interactive agent; other roles don't carry it). Silent "" on any read/parse
-    error — hook must never block session start.
+    Returns (auto_sleep_time, cron_expr) when auto-sleep is enabled for an
+    interactive session with a valid HH:MM time, else None. Silent None on any
+    read/parse error — hook must never block session start. Shared by
+    auto_sleep_cron_block() (full body) and auto_sleep_must_line() (the
+    one-line must-not-miss pointer) so they can never disagree on whether
+    auto-sleep is on.
 
     Reads cadence.auto_sleep_enabled (default False) and cadence.auto_sleep_time
     (default "03:00") from ~/.engram/config.json. Computes a stable per-install
     jitter so not every install fires on the same exact minute.
-
-    Returns:
-        Multi-line nudge string when enabled + interactive, otherwise "".
     """
     if _EFFECTIVE_SESSION_ROLE != "interactive":
-        return ""
+        return None
 
     config_path = os.path.join(ENGRAM_HOME, "config.json")
     try:
@@ -2807,19 +2807,19 @@ def auto_sleep_cron_block() -> str:
         cadence = config.get("cadence", {})
         enabled = cadence.get("auto_sleep_enabled", False)
         if not enabled:
-            return ""
+            return None
         auto_sleep_time = cadence.get("auto_sleep_time", "03:00")
     except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
         # TypeError/AttributeError guard valid-JSON-but-non-dict shapes:
         # config.json containing `null` / `[]` / `"x"` makes config a
         # non-dict, and `{"cadence": null}` makes cadence None — either makes
         # the .get() calls above raise. The hook must never break session start.
-        return ""
+        return None
 
     # Guard: a present-but-null or non-string value would raise AttributeError
     # on .split(). Treat any non-string as a missing/invalid value.
     if not isinstance(auto_sleep_time, str):
-        return ""
+        return None
 
     # Parse HH:MM
     try:
@@ -2827,12 +2827,12 @@ def auto_sleep_cron_block() -> str:
         hour = int(parts[0])
         configured_minute = int(parts[1])
     except (ValueError, IndexError):
-        return ""
+        return None
 
     # Range-validate parsed time — e.g. "99:99" passes int() but produces an
     # invalid cron expression. Return "" rather than handing a bad expr to the agent.
     if not (0 <= hour <= 23 and 0 <= configured_minute <= 59):
-        return ""
+        return None
 
     # Stable per-install jitter: 0–9 minutes derived from ENGRAM_HOME path hash.
     # encode("utf-8", errors="replace") guards against surrogateescape paths from
@@ -2841,7 +2841,44 @@ def auto_sleep_cron_block() -> str:
     minute = configured_minute + jitter
     if minute >= 60:
         minute = configured_minute
-    cron_expr = f"{minute} {hour} * * *"
+    return auto_sleep_time, f"{minute} {hour} * * *"
+
+
+def auto_sleep_must_line() -> str:
+    """One-line must-not-miss pointer for the auto-sleep cron (#3336).
+
+    The full body from auto_sleep_cron_block() is _P_REST and is the first
+    thing cut when the injection overflows (a long ENGRAM_HOME inflates the
+    overflow pointer); the seat then silently never registers its nightly
+    sleep cron. This short line is appended at _P_MUST so the instruction
+    survives and points at the full prompt. Returns "" under exactly the
+    conditions auto_sleep_cron_block() does (shared _auto_sleep_settings()).
+    """
+    if _auto_sleep_settings() is None:
+        return ""
+    return (
+        "[Auto-sleep: call CronList on your FIRST prompt; if no job's prompt "
+        'contains "AUTO-SLEEP NIGHTLY", register it with the full cron prompt '
+        "in the full auto-sleep block below, or, if that block was cut, "
+        "in the overflow file named on the first line.]"
+    )
+
+
+def auto_sleep_cron_block() -> str:
+    """Emit a cron-registration nudge when cadence.auto_sleep_enabled is true.
+
+    Only fires for interactive role (cron is registered per-session by the
+    interactive agent; other roles don't carry it). Silent "" on any read/parse
+    error — hook must never block session start. Config read/validation lives
+    in _auto_sleep_settings().
+
+    Returns:
+        Multi-line nudge string when enabled + interactive, otherwise "".
+    """
+    settings = _auto_sleep_settings()
+    if settings is None:
+        return ""
+    auto_sleep_time, cron_expr = settings
 
     return (
         f"[Auto-sleep enabled] cadence.auto_sleep_enabled is true "
@@ -3545,6 +3582,15 @@ def main() -> None:
         sleep_block = sleep_status_block()
         if sleep_block:
             _blocks.append((_P_REST, sleep_block))
+        # #3336: the full cron body below is _P_REST and is cut first when the
+        # injection overflows (long ENGRAM_HOME path, big focus block), which
+        # silently loses the nightly-sleep registration. The instruction is
+        # must-not-miss; only its long body may overflow, so a one-line
+        # pointer rides in the _P_MUST group (kept to one short line on
+        # purpose -- that group must stay small).
+        auto_sleep_line = auto_sleep_must_line()
+        if auto_sleep_line:
+            _blocks.append((_P_MUST, auto_sleep_line))
         cron_block = auto_sleep_cron_block()
         if cron_block:
             _blocks.append((_P_REST, cron_block))
