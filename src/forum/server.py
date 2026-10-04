@@ -1270,6 +1270,37 @@ def _bound_repo(gate, pid: str, login_map_cfg: Optional[dict]) -> Optional[str]:
     return (getattr(login_map, "repos", None) or {}).get(m.group("prefix").upper())
 
 
+_PR_ISH_ID_RE = re.compile(r"(?i)^(?:[A-Z][A-Z0-9]*-)?PR-")
+_ANCHOR_SHAPE_RE = re.compile(r"(?:pr/(?:[\w.-]+/[\w.-]+/)?|project/)[0-9]{1,15}")
+
+
+def _anchorless_pr_refusal(route: str, project_id: str, given: str) -> str:
+    """#3366: refusal text for a PR-shaped id whose github anchor is absent or does
+    not parse. The two-route sentence is ``baton_gate.PR_ANCHOR_TWO_ROUTE_HINT``,
+    shared VERBATIM with the CLI's #3364 refusal (Kepler: one wording, two surfaces);
+    the lead-in is this surface's own (the API names a ``github`` field, the CLI a
+    ``--github`` flag). The echoed value is bounded (<= 60 chars)."""
+    if given:
+        shown = given if len(given) <= 60 else given[:60] + "..."
+        why = f"its github anchor {shown!r} is not a PR or project anchor"
+    else:
+        why = "no PR anchor was given (no github)"
+    return (
+        f"{route} {project_id}: refusing to create '{project_id}': its id is "
+        f"PR-shaped but {why}, so it would be a PR baton nothing can verify at the "
+        f"peer->merge gate. Pick the route that matches: {_gate_hint()}. "
+        "(Send the anchor in the github field.)")
+
+
+def _gate_hint() -> str:
+    gate = _load_baton_gate()
+    if gate is not None:
+        return gate.PR_ANCHOR_TWO_ROUTE_HINT
+    # Gate unavailable: the same sentence, only as the fail-closed fallback.
+    return ("if it IS a PR, give the anchor pr/<owner>/<repo>/<N>; "
+            "if it is NOT a PR, give project/<N> (a bunch) or use a non-PR-shaped id")
+
+
 def _anchor_write_binding_refusal(gate, pid: str, is_pr: bool, anchor_norm: str,
                                   login_map_cfg: Optional[dict]) -> Optional[str]:
     """Refusal text when a ``pr/`` anchor being WRITTEN is not the one the baton id
@@ -3087,9 +3118,28 @@ def create_app(
                     f"{route} {project_id}: phase gate unavailable (server could not load its "
                     "gate module) -- cannot decide PR-vs-bunch to stamp the baton's initial "
                     "phase, and a phase-less baton is never created. See server logs.")}), 422
+            # #3366: fail closed here too. Without the gate we cannot classify, but a
+            # PR-ish id (local copy of the name rule; the gate is deliberately not
+            # imported) with no usable anchor is exactly the baton this rule refuses.
+            _g_chk = (github or "").strip()
+            if (_PR_ISH_ID_RE.match(project_id) and not project_id.lower().startswith("pool-")
+                    and not _ANCHOR_SHAPE_RE.fullmatch(_g_chk.lower())):
+                return jsonify({"error": _anchorless_pr_refusal(route, project_id, _g_chk)}), 422
             allowed = _INIT_PHASES_PR | _INIT_PHASES_BUNCH
             default_phase = None
         elif gate._is_pr_shaped(project_id, (github or "").strip().lower()):
+            # #3366: a PR-shaped baton must name its PR. `_is_pr_shaped` is
+            # anchor-first, so when the github value does not PARSE (empty, or junk
+            # like 'garbage' / 'pr/') it falls back to the id -- PR-shaped by the id
+            # alone, "no anchor resolved". Such a baton would be stamped `fairy`
+            # with nothing the peer->merge gate can verify (the #2916 dead end). The
+            # server is the authority; it derives nothing from the id (the CLI's
+            # #3364 refusal is the early friendly copy of this rule). No bypass: no
+            # request field skips it. Runs BEFORE the transition_phase allow-list and
+            # before anything is written. Creation only.
+            _g_chk = (github or "").strip()
+            if gate._parse_github_anchor(_g_chk.lower()) is None:
+                return jsonify({"error": _anchorless_pr_refusal(route, project_id, _g_chk)}), 422
             allowed = _INIT_PHASES_PR
             default_phase = "fairy"
         else:

@@ -154,7 +154,8 @@ class TestInitRefusesBadProjectIds:
 class TestValidIdsStillWork:
     @pytest.mark.parametrize("pid", VALID_IDS, ids=lambda p: p[:30])
     def test_init_ok(self, sb, pid):
-        resp = sb.client.post("/api/projects", json=init_body(pid))
+        # #3366: a PR-shaped id must name its PR; a bunch anchor is the id-agnostic one.
+        resp = sb.client.post("/api/projects", json=init_body(pid, github="project/7"))
         assert resp.status_code == 201, resp.get_json()
         assert resp.get_json()["project_id"] == pid
         assert (sb.store.projects_dir / f"{pid}.md").is_file()
@@ -398,6 +399,8 @@ class TestOverlongButValidShapedId:
         # The CLI rule has no length cap, so this id is CLI-shaped; it fails at the
         # filesystem (ENAMETOOLONG). That must read as a bad id, not a server fault.
         pid = "PR-" + "a" * 300
-        resp = sb.client.post("/api/projects", json=init_body(pid))
+        # #3366: anchored (bunch) so the refusal under test is the filesystem one,
+        # not the anchorless-PR rule.
+        resp = sb.client.post("/api/projects", json=init_body(pid, github="project/7"))
         assert resp.status_code == 422, (resp.status_code, resp.get_data(as_text=True)[:200])
         assert "project_id" in resp.get_json()["error"]

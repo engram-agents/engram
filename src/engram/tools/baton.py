@@ -72,6 +72,7 @@ from forum_api import (
 # ("Scope note") for why: they keep their own verbatim definitions further
 # down in this file, unchanged by this refactor.
 from baton_gate import (
+    PR_ANCHOR_TWO_ROUTE_HINT,
     _parse_github_anchor,
     _dedupe_checks_by_latest,
     _pr_ci_state,
@@ -453,7 +454,8 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             f"baton init: refusing to create '{project_id}': its id is "
             "PR-shaped but no PR anchor can be resolved from it (no number to "
             "derive, no --github), so it would be a PR baton nothing can "
-            "verify at the peer->merge gate. Pick the route that matches:\n"
+            "verify at the peer->merge gate. Pick the route that matches: "
+            f"{PR_ANCHOR_TWO_ROUTE_HINT}.\n"
             f"    it IS a PR:     baton init {project_id} ... "
             f"--github pr/{_slot}\n"
             f"    it is NOT a PR: baton init {project_id} ... "

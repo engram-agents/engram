@@ -22,7 +22,7 @@ import pytest
 
 sys.path.insert(0, "src/forum/tests")
 from test_baton_advance_api import (  # noqa: E402
-    World, AUTHOR, COLLEAGUE, SEAT, SENTINEL,
+    World, AUTHOR, COLLEAGUE, SEAT, SENTINEL, REPO,
 )
 from test_baton_anchor_binding import disk, seq_state  # noqa: E402
 
@@ -76,12 +76,16 @@ def test_F2_route_created_baton_stays_fairy_and_flip_not_refused(world, monkeypa
     r = world.client.post("/api/projects", json={
         "project_id": "PR-9401", "title": "t", "agent": AUTHOR, "status": "in-progress",
         "turn": AUTHOR, "participants": [AUTHOR, COLLEAGUE, SEAT],
-        "colleague": COLLEAGUE, "turn_reason": "start"})
+        "colleague": COLLEAGUE, "turn_reason": "start",
+        "github": f"pr/{REPO}/9401"})  # #3366: a PR-shaped init must name its PR
     assert r.status_code == 201, r.get_json()
     assert world.fields("PR-9401")[0]["phase"] == "fairy"
+    # #3366: the original "unanchored flip to the sentinel with an unresolvable
+    # sentinel is not refused" half is no longer reachable through init (a PR-shaped
+    # init must carry an anchor, and an anchored flip legitimately needs the
+    # sentinel resolved). That behaviour stays pinned on a seeded unanchored fairy
+    # baton by test_F2_explicit_fairy_unanchored_flip_does_not_need_the_sentinel.
     make_unresolvable(world, monkeypatch)
-    resp = world.flip("PR-9401", agent=AUTHOR, to=SENTINEL, reason="x")
-    assert resp.status_code == 201, resp.get_json()
     make_resolvable(world, monkeypatch)
     world.client.post("/api/projects/PR-9401/rename", json={"agent": AUTHOR, "new_title": "t2"})
     assert world.fields("PR-9401")[0]["phase"] == "fairy"
@@ -92,6 +96,13 @@ def test_F2_explicit_fairy_unanchored_flip_does_not_need_the_sentinel(world, mon
     make_unresolvable(world, monkeypatch)
     resp = world.flip(LEGACY_PID, agent=AUTHOR, to=COLLEAGUE, reason="please review")
     assert resp.status_code == 201, resp.get_json()
+    # #3366: the flip-to-the-pool-SENTINEL half (formerly pinned on an init-created
+    # anchorless baton, unreachable through init now) lives here on the seeded one.
+    resp = world.flip(LEGACY_PID, agent=COLLEAGUE, to=SENTINEL, reason="x")
+    assert resp.status_code == 201, resp.get_json()
+    make_resolvable(world, monkeypatch)
+    world.client.post(f"/api/projects/{LEGACY_PID}/rename", json={"agent": AUTHOR, "new_title": "t2"})
+    assert world.fields(LEGACY_PID)[0]["phase"] == "fairy"
 
 
 def test_F3_fairy_colleague_held_unanchored_flip_to_merge_seat_refused(world):

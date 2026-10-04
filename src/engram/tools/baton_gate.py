@@ -141,6 +141,19 @@ def _same_number(a: str, b: str) -> bool:
 # comment for how it surfaces the refusal.
 
 
+# #3366 (Kepler): the ONE wording of the two-route hint shown when a PR-shaped
+# baton id resolves no PR anchor. Shared VERBATIM by the CLI refusal (tools/baton.py
+# ``_refuse_unanchored_pr_shaped``, #3364/#3365) and the forum server's 422
+# (src/forum/server.py ``api_project_init``). Deliberately SYNTAX-NEUTRAL: the CLI
+# says ``--github``, the API says the ``github`` field, so each surface supplies its
+# own lead-in and this sentence is what must stay byte-identical (pinned by
+# src/forum/tests/test_baton_init_refuses_anchorless_pr.py).
+PR_ANCHOR_TWO_ROUTE_HINT = (
+    "if it IS a PR, give the anchor pr/<owner>/<repo>/<N>; "
+    "if it is NOT a PR, give project/<N> (a bunch) or use a non-PR-shaped id"
+)
+
+
 def _parse_github_anchor(value: str) -> Optional[tuple]:
     """Parse a github anchor value into (kind, repo, number).
 

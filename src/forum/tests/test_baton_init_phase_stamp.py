@@ -128,7 +128,12 @@ def _route(world, pid, route):
 @pytest.mark.parametrize("turn", TURNS)
 def test_init_never_leaves_a_phase_less_file(world, turn, tp, anchor):
     r = world.client.post("/api/projects", json=_init_body("PR-9100", _turn(turn), anchor=anchor, tp=tp))
-    if tp in ("ABSENT", "fairy"):
+    if anchor is None:
+        # #3366: a PR-shaped id with no anchor is refused outright, whatever
+        # transition_phase the client sent -- nothing is created at all.
+        assert r.status_code == 422, r.get_json()
+        assert _raw(world, "PR-9100") is None
+    elif tp in ("ABSENT", "fairy"):
         assert r.status_code == 201, r.get_json()
         assert _has_phase_line(_raw(world, "PR-9100")), "phase-less baton created by init"
         assert world.fields("PR-9100")[0]["phase"] == "fairy"
@@ -138,12 +143,27 @@ def test_init_never_leaves_a_phase_less_file(world, turn, tp, anchor):
 
 
 @pytest.mark.parametrize("route", ROUTES)
-@pytest.mark.parametrize("anchor", ANCHORS)
+@pytest.mark.parametrize("anchor", [a for a in ANCHORS if a is not None])
 @pytest.mark.parametrize("tp", ["ABSENT", "fairy"])
 @pytest.mark.parametrize("turn", TURNS)
 def test_no_route_makes_an_initted_baton_read_merge(world, turn, tp, anchor, route):
     r = world.client.post("/api/projects", json=_init_body("PR-9100", _turn(turn), anchor=anchor, tp=tp))
     assert r.status_code == 201, r.get_json()
+    _route(world, "PR-9100", route)
+    assert not _reads_merge(world, "PR-9100"), f"{route} made the baton read merge"
+    raw = _raw(world, "PR-9100")
+    if raw is not None:  # gc may archive
+        assert _has_phase_line(raw)
+
+
+@pytest.mark.parametrize("route", ROUTES)
+@pytest.mark.parametrize("turn", TURNS)
+def test_no_route_makes_a_seeded_anchorless_fairy_baton_read_merge(world, turn, route):
+    """#3366: init now refuses an anchorless PR-shaped id, so the anchorless-fairy
+    state (42 such batons exist on disk) is SEEDED; the 3 turns x 8 routes matrix
+    that init used to feed is kept."""
+    world.seed("PR-9100", phase="fairy", github=None, turn=_turn(turn), colleague=COLLEAGUE,
+               participants=(AUTHOR, COLLEAGUE, SENTINEL, OTHER, SEAT))
     _route(world, "PR-9100", route)
     assert not _reads_merge(world, "PR-9100"), f"{route} made the baton read merge"
     raw = _raw(world, "PR-9100")

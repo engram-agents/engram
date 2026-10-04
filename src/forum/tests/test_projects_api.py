@@ -126,7 +126,7 @@ class TestProjectInit:
     def test_creates_new_project(self, client):
         resp = client.post("/api/projects", json={
             "agent": "luria",
-            "project_id": "PR-99",
+            "project_id": "PR-99", "github": "pr/example-org/example-repo/99",
             "title": "New Baton",
             "status": "in-progress",
             "turn": "luria",
@@ -142,7 +142,7 @@ class TestProjectInit:
         # PR-42 already seeded
         resp = client.post("/api/projects", json={
             "agent": "luria",
-            "project_id": "PR-42",
+            "project_id": "PR-42", "github": "pr/example-org/example-repo/42",
             "title": "Dup",
             "status": "in-progress",
             "turn": "luria",
@@ -181,7 +181,7 @@ class TestProjectInit:
         # responses don't (yet) surface turn_by.
         client.post("/api/projects", json={
             "agent": "luria",
-            "project_id": "PR-102",
+            "project_id": "PR-102", "github": "pr/example-org/example-repo/102",
             "title": "t",
             "status": "in-progress",
             "turn": "ariadne",  # by_agent (luria) != turn (ariadne)
@@ -200,7 +200,7 @@ class TestProjectInit:
         from forum.coordination.markdown import parse_frontmatter
 
         client.post("/api/projects", json={
-            "agent": "clio", "project_id": "PR-103", "title": "t",
+            "agent": "clio", "project_id": "PR-103", "github": "pr/example-org/example-repo/103", "title": "t",
             "status": "in-progress", "turn": "clio",
             "participants": ["clio", "ariadne"], "turn_reason": "start",
             "colleague": "ariadne", "author": "clio",
@@ -217,7 +217,7 @@ class TestProjectInit:
         from forum.coordination.markdown import parse_frontmatter
 
         client.post("/api/projects", json={
-            "agent": "luria", "project_id": "PR-104", "title": "t",
+            "agent": "luria", "project_id": "PR-104", "github": "pr/example-org/example-repo/104", "title": "t",
             "status": "in-progress", "turn": "luria",
             "participants": ["luria"], "turn_reason": "start",
         })
@@ -226,7 +226,10 @@ class TestProjectInit:
         fields, _ = parse_frontmatter(raw)
         assert "author" not in fields
 
-    def test_flip_never_touches_author_field(self, client, app):
+    def test_flip_never_touches_author_field(self, client, app, monkeypatch):
+        # #3366: the baton now carries a pr/ anchor, so its flips run through the gate,
+        # which needs the pool sentinel; set it here rather than rely on the host's config.
+        monkeypatch.setenv("BATON_POOL_SENTINEL", "casey")
         """#2961's whole premise depends on `author` staying fixed across
         turn-changes, unlike `turn_by` (which flip() deliberately
         overwrites every time). Flip the baton twice and confirm `author`
@@ -234,7 +237,7 @@ class TestProjectInit:
         from forum.coordination.markdown import parse_frontmatter
 
         client.post("/api/projects", json={
-            "agent": "clio", "project_id": "PR-105", "title": "t",
+            "agent": "clio", "project_id": "PR-105", "github": "pr/example-org/example-repo/105", "title": "t",
             "status": "in-progress", "turn": "clio",
             "participants": ["clio", "ariadne"], "turn_reason": "start",
             "colleague": "ariadne", "author": "clio",
@@ -258,7 +261,7 @@ class TestProjectInit:
     def test_participants_as_string(self, client):
         resp = client.post("/api/projects", json={
             "agent": "luria",
-            "project_id": "PR-101",
+            "project_id": "PR-101", "github": "pr/example-org/example-repo/101",
             "title": "t",
             "status": "in-progress",
             "turn": "luria",
@@ -283,7 +286,7 @@ class TestProjectInit:
         used to shape participants + a client-side print."""
         resp = client.post("/api/projects", json={
             "agent": "luria",
-            "project_id": "PR-103",
+            "project_id": "PR-103", "github": "pr/example-org/example-repo/103",
             "title": "t",
             "status": "in-progress",
             "turn": "luria",
@@ -298,7 +301,7 @@ class TestProjectInit:
     def test_colleague_omitted_when_not_passed(self, client):
         client.post("/api/projects", json={
             "agent": "luria",
-            "project_id": "PR-104",
+            "project_id": "PR-104", "github": "pr/example-org/example-repo/104",
             "title": "t",
             "status": "in-progress",
             "turn": "luria",

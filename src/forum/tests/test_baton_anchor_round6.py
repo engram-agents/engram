@@ -314,7 +314,10 @@ class TestInitQualifiesOrRefuses:
         r = init_post(world, "pool-d2", "project/7", transition_phase="pool")
         assert r.status_code == 201, r.get_json()
         assert world.fields("pool-d2")[0]["github"].strip() == "project/7"
-        assert init_post(world, "PR-9208", None).status_code == 201  # no anchor at all
+        # #3366: no anchor at all is refused for a PR-shaped id, allowed for a non-PR id.
+        assert init_post(world, "PR-9208", None).status_code == 422
+        assert world.store.read_project("PR-9208") is None
+        assert init_post(world, "DESIGN-9208", None).status_code == 201
 
     def test_without_the_gate_module_an_unqualified_anchor_fails_closed(self, world):
         saved = list(server_mod._BATON_GATE_MODULE_CACHE)

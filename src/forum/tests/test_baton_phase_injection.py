@@ -423,7 +423,8 @@ class TestLegitimateCliShapesStillWork:
         # (a phase-less PR baton at the pool sentinel reads as the legacy `merge`).
         resp = world.client.post("/api/projects", json={
             "agent": AUTHOR, "project_id": "PR-9102", "title": "t", "status": "in-progress",
-            "turn": AUTHOR, "turn_reason": "start", "participants": [AUTHOR]})
+            "turn": AUTHOR, "turn_reason": "start", "participants": [AUTHOR],
+            "github": f"pr/{REPO}/9102"})  # #3366: a PR-shaped init must name its PR
         assert resp.status_code == 201
         assert phase_of(world, "PR-9102") == "fairy"
 
