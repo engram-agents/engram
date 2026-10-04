@@ -197,7 +197,8 @@ update it when you transition between states.
 > --check`: it prints five lines and exits 0 only when every child is alive, writes
 > into the supervisor's pipe, and the supervisor's stdout is a socket. If the supervisor
 > exits at arm (it needs `agent`/`world_url` from that config for its bell) or `--check`
-> exits 2, arm the two commands above instead. If your session is on that path, do not also arm the
+> prints the literal line `CHECK FAIL supervisor not armed`, arm the two commands above instead. Exit 2 alone is not that
+> verdict: a deployed script older than the flag gives an argparse `unrecognized arguments` error, also exit 2 (alpha #3356) — then do not tear down; check with dev's read-only copy. If your session is on that path, do not also arm the
 > two commands above, because that duplicates both watches.
 >
 > The updates Monitor shares the mention Monitor's robustness: seed-to-current
