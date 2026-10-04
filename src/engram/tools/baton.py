@@ -448,6 +448,22 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         if _pr_from_id:
             github_anchor = f"pr/{_pr_from_id.group(1)}"
 
+    def _refuse_unanchored_pr_shaped(repo_hint: Optional[str]) -> None:
+        """#3364: two-route refusal for a PR-shaped id with no resolvable anchor."""
+        _slot = f"{repo_hint}/<N>" if repo_hint else "<owner>/<repo>/<N>"
+        print(
+            f"baton init: refusing to create '{project_id}': its id is "
+            "PR-shaped but no PR anchor can be resolved from it (no number to "
+            "derive, no --github), so it would be a PR baton nothing can "
+            "verify at the peer->merge gate. Pick the route that matches:\n"
+            f"    it IS a PR:     baton init {project_id} ... "
+            f"--github pr/{_slot}\n"
+            f"    it is NOT a PR: baton init {project_id} ... "
+            "--github project/<N>   (a bunch), or use a non-PR-shaped id",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
     # --repo qualifies a pr/<N> anchor to pr/<owner>/<repo>/<N> (#1715).
     # Effectively REQUIRED for every PR-baton now (#1918: there is no
     # default repo) -- an unqualified anchor is refused-and-counted by
@@ -463,6 +479,8 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             )
             sys.exit(EXIT_VALIDATION)
         parsed = _parse_github_anchor(github_anchor) if github_anchor else None
+        if not github_anchor and _is_pr_shaped(project_id, ""):
+            _refuse_unanchored_pr_shaped(repo_arg)
         if parsed is None or parsed[0] != "pr":
             print(
                 "baton init: --repo only applies to a PR anchor "
@@ -547,6 +565,21 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
+
+    # #3364: fail closed on a PR-SHAPED id that resolved NO anchor (no
+    # --github, no number derivable from the id: "PR-autopull", "PR-12abc").
+    # It would classify as a PR baton (fairy phase) yet carry nothing the
+    # peer->merge gate can verify, and the anchor is write-once after fairy
+    # phase -- the same dead end #2916 closed for derivable ids. Refuse here,
+    # before the POST, while the author can still fix it. Anchor-first, as
+    # everywhere: an explicit anchor (incl. project/<N>) decides. This is
+    # DISJOINT from the #1924/#2916 refusal above (that one needs a resolved
+    # unqualified anchor; this one needs github_anchor empty), so their
+    # relative order is not load-bearing. With --repo, the same refusal is
+    # raised earlier from the --repo guard (which would otherwise exit first
+    # with a less helpful message).
+    if not github_anchor and _is_pr_shaped(project_id, ""):
+        _refuse_unanchored_pr_shaped(repo_arg)
 
     title = args.title or project_id
     init_reason = f"project initialized by {agent_name or 'unknown'}"

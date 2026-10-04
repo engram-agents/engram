@@ -85,6 +85,7 @@ The auto-pull hook surfaces live GitHub status only when a baton has a resolvabl
 
 To set the anchor:
 - **At init time**: `baton init <id> --title "..." --participants <a,b> --github pr/<owner>/<repo>/<N>` (`baton init` refuses a bare `pr/<N>`: there is no default repo; the server later refuses a bare anchor at gc/flip/merge)
+- **PR-shaped id with no number** (e.g. `PR-autopull`): `baton init` refuses it unless `--github` is given. Pass `--github pr/<owner>/<repo>/<N>` if it is a PR, or `--github project/<N>` (a bunch) / a non-PR-shaped id if it is not.
 - **On an existing baton**: `baton anchor <id> --github pr/<owner>/<repo>/<N>` (or `--github project/<N>`)
 
 Valid anchor formats: `pr/<owner>/<repo>/<N>` for PRs (bare `pr/<N>` parses but is refused downstream), `project/<N>` for GitHub Projects. Malformed values (e.g. `xyz`, `pr/abc`) are rejected with `EXIT_VALIDATION`.

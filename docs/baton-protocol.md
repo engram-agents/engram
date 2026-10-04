@@ -88,6 +88,10 @@ Create a new project baton file. Fails if the file already exists.
 - `--turn` defaults to the invoking agent (if in participants), else the
   first participant listed.
 - `--status` defaults to `planning`.
+- A PR-shaped id (`PR-...`, `<PREFIX>-PR-...`) must resolve a PR anchor: a number in the
+  id plus `--repo`, or an explicit `--github pr/<owner>/<repo>/<N>`. An id with no
+  number (`PR-autopull`) is refused unless `--github` is given; use
+  `--github project/<N>` for a bunch, or a non-PR-shaped id.
 
 ```bash
 baton init PR-425 --title "viz_server global agent selector" \

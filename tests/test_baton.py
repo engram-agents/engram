@@ -2960,7 +2960,7 @@ class TestAnchor:
 
         client = _make_client({"seq": 1})
         args = argparse.Namespace(
-            project_id="PR-no-github", title="no anchor",
+            project_id="DESIGN-no-github", title="no anchor",
             participants="borges,ariadne", status="planning",
             turn=None, github=None, colleague=None,
         )
@@ -4368,15 +4368,78 @@ class TestInitPrefixedPrBatonAnchor:
         _, body = client.post.call_args[0]
         assert body["github"] == "pr/o/r/5"
 
-    def test_name_shaped_but_numberless_id_inits_without_anchor(self):
-        """Current, pre-existing behaviour -- documented, NOT endorsed:
-        'PR-12abc' is PR-shaped by name (fairy phase) but carries no number,
-        so no anchor is derived and nothing is refused."""
+    # --- #3364: fail closed on a PR-shaped id that resolves NO anchor ------
+    # (REPLACES #3363's test_name_shaped_but_numberless_id_inits_without_anchor,
+    # which recorded PR-12abc minting anchorless as current behaviour.)
+
+    @pytest.mark.parametrize("pid", ["PR-autopull", "PR-12abc"])
+    def test_pr_shaped_id_with_no_resolvable_anchor_is_refused(self, pid, capsys):
         client = _make_client({"seq": 1})
-        _baton.cmd_init(self._args("PR-12abc"), MULTI_CONFIG, "borges", client)
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(self._args(pid), MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()  # no baton created
+        err = capsys.readouterr().err
+        # both routes through (contract 7)
+        assert "--github pr/<owner>/<repo>/<N>" in err
+        assert "--github project/<N>" in err
+        assert "non-PR" in err
+
+    def test_pr_shaped_id_with_explicit_qualified_anchor_accepted(self):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(
+            self._args("PR-umwelt-466", github="pr/engram-agents/umwelt/466"),
+            MULTI_CONFIG, "borges", client)
         _, body = client.post.call_args[0]
+        assert body["github"] == "pr/engram-agents/umwelt/466"
         assert body["transition_phase"] == "fairy"
+
+    def test_pr_shaped_name_with_project_anchor_is_a_bunch(self):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(self._args("PR-autopull", github="project/12"),
+                        MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["github"] == "project/12"
+        assert _baton._is_pr_shaped("PR-autopull", body["github"]) is False
+        assert body["transition_phase"] == "pool"  # not the PR fairy gate
+
+    @pytest.mark.parametrize("pid", ["PR-umwelt-466", "PR-autopull"])
+    def test_numberless_pr_shaped_id_with_repo_shows_two_route_hint(self, pid, capsys):
+        """--repo is the natural invocation; it must reach the two-route
+        hint, not the generic '--repo only applies to a PR anchor' error."""
+        client = _make_client({"seq": 1})
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(self._args(pid, repo="a/b"), MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        err = capsys.readouterr().err
+        assert "--github pr/a/b/<N>" in err  # given --repo used in the example
+        assert "--github project/<N>" in err
+
+    def test_non_pr_id_with_repo_keeps_existing_repo_error(self, capsys):
+        client = _make_client({"seq": 1})
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(self._args("DESIGN-x", repo="a/b"),
+                            MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        err = capsys.readouterr().err
+        assert "--repo only applies to a PR anchor" in err
+        assert "project/<N>" not in err
+
+    def test_numbered_pr_id_with_repo_still_accepted(self):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(self._args("PR-5", repo="a/b"), MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["github"] == "pr/a/b/5"
+
+    @pytest.mark.parametrize("pid", ["DESIGN-x", "pool-x"])
+    def test_non_pr_ids_still_init_without_anchor(self, pid):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(self._args(pid), MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
         assert not body.get("github")
+        assert body["transition_phase"] == "pool"
 
     @pytest.mark.parametrize("pid", ["UMWELT-PR-1234", "PR-37-paper", "PR-9"])
     def test_colleague_warning_fires_without_colleague(self, pid, capsys):
