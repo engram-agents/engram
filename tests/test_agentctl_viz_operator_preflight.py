@@ -35,7 +35,10 @@ assumed-flaky.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 AGENTCTL = Path(__file__).resolve().parent.parent / "tools" / "agentctl"
 AGENTCTL_SOURCE = AGENTCTL.read_text()
@@ -430,6 +433,11 @@ class TestResolveVizOperatorFromConfigReal:
         assert proc.stdout.strip() == ""
         assert proc.stderr.strip() == ""
 
+    @pytest.mark.skipif(
+        not sys.platform.startswith("linux"),
+        reason="agentctl is Linux-only by design (see its header; macOS uses "
+        "agentctl-mac); this test exercises GNU `stat -c`, which BSD stat rejects",
+    )
     def test_real_test_owned_file_is_rejected_with_warning_not_silence(self, tmp_path):
         """GENUINE (not simulated) exercise of the real stat(1) call: a real
         file owned by whatever account runs this test suite is never
