@@ -489,6 +489,38 @@ class OwnerStalePathUnsafe(RuntimeError):
     owner is already here", it's "something unsafe to touch is here"."""
 
 
+class OwnerPythonTooOld(RuntimeError):
+    """Raised by EngramdOwner.start() when the running Python's sqlite3
+    lacks `Connection.setlimit` / `SQLITE_LIMIT_LENGTH` (#3349). The owner
+    bounds client-read result size with them; without them it must refuse
+    to start with this named reason, never run an unbounded read
+    connection."""
+
+
+def _require_sqlite_setlimit(conn_cls=None, module=None) -> None:
+    """Fail closed unless sqlite3 offers `Connection.setlimit` and
+    `SQLITE_LIMIT_LENGTH`.
+
+    #3349: both are "Added in version 3.11" (Python sqlite3 docs); on 3.10
+    the `setlimit` call in start() would raise AttributeError mid-start,
+    after files and connections were already opened. Checked by FEATURE,
+    not by sys.version_info. `conn_cls` / `module` are injection seams for
+    tests (a C type cannot be delattr'd); they default to the real
+    sqlite3 at call time.
+    """
+    if module is None:
+        module = sqlite3
+    if conn_cls is None:
+        conn_cls = module.Connection
+    if not hasattr(conn_cls, "setlimit") or not hasattr(module, "SQLITE_LIMIT_LENGTH"):
+        raise OwnerPythonTooOld(
+            "engramd owner requires Python 3.11+ (sqlite3.Connection.setlimit and "
+            "SQLITE_LIMIT_LENGTH, which bound client-read result size, were added "
+            f"in 3.11); running Python {sys.version.split()[0]}. Refusing to start "
+            "rather than serve reads without the size bound (#3349)."
+        )
+
+
 class _SnapshotDeadlineExceeded(Exception):
     """Internal-only control-flow signal (#3194 round 2) -- raised by
     `_handle_snapshot()`'s `progress` callback (passed to
@@ -958,6 +990,9 @@ class EngramdOwner:
         support the socket permission layer (#3194). Raises
         OwnerStalePathUnsafe if something other than a plain, ownerless
         socket sits at the socket path (#3194, design doc §2.4).
+        Raises OwnerPythonTooOld if the running Python's sqlite3 lacks
+        `Connection.setlimit` (Python < 3.11) -- before anything is created
+        (#3349).
 
         `install_signal_handlers=False` (tests only -- see
         tests/test_engramd_owner.py's owner_running fixture) skips
@@ -969,6 +1004,10 @@ class EngramdOwner:
         directly.
         """
         self._check_platform_support()
+
+        # #3349: refuse on a Python without sqlite3 setlimit (< 3.11)
+        # before ANY file, connection, socket or thread exists.
+        _require_sqlite_setlimit()
 
         # R4 (#3196): the dynamic-template escape hatch is resolved FIRST,
         # before any file, connection or socket is touched -- a flag set on
