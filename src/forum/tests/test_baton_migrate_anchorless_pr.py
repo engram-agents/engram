@@ -22,7 +22,7 @@ sys.path.insert(0, "src/forum/tests")
 from test_baton_advance_api import World, AUTHOR, COLLEAGUE, SENTINEL, REPO  # noqa: E402
 
 TOOLS = Path(__file__).resolve().parents[2] / "engram" / "tools"
-sys.path.insert(0, str(TOOLS))
+sys.path.append(str(TOOLS))  # append, never insert(0): tools/ must not outrank src/ packages (#2063 guard)
 from forum_api import ForumHttpError  # noqa: E402
 
 MIGRATE_PATH = TOOLS / "baton-migrate-to-coord-store.py"
