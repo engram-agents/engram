@@ -1892,13 +1892,19 @@ def test_fetch_timeout_falls_through_to_local_refs_without_shell_wrapper(tmp_pat
     _checkout(repo, "v1.0.0-ancestor-test")
 
     fake_ssh = tmp_path / "fake-ssh.sh"
+    ssh_pid_file = tmp_path / "fake-ssh.pid"
     child_pid_file = tmp_path / "fake-ssh-child.pid"
     fake_ssh.write_text(
+        # Record the ssh pid FIRST: under load the installer's 2s bound can
+        # fire before a later-written pid file exists (#3292); recorded first,
+        # it always does.  Then run the sleeper as a GRANDCHILD of git (a
+        # backgrounded child of this ssh) so the child pid proves the group
+        # kill reaches descendants two levels down.
         "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$$\" > \"$FAKE_SSH_PID_FILE\"\n"
         "sleep 30 &\n"
-        "child=$!\n"
-        "printf '%s\\n' \"$child\" > \"$FAKE_SSH_CHILD_PID_FILE\"\n"
-        "wait \"$child\"\n"
+        "printf '%s\\n' \"$!\" > \"$FAKE_SSH_CHILD_PID_FILE\"\n"
+        "wait\n"
     )
     fake_ssh.chmod(0o755)
     subprocess.run(
@@ -1917,6 +1923,7 @@ def test_fetch_timeout_falls_through_to_local_refs_without_shell_wrapper(tmp_pat
             extra_env={
                 "ENGRAM_INSTALL_FETCH_TIMEOUT_SECS": "2",
                 "GIT_SSH_COMMAND": str(fake_ssh),
+                "FAKE_SSH_PID_FILE": str(ssh_pid_file),
                 "FAKE_SSH_CHILD_PID_FILE": str(child_pid_file),
                 "PATH": masked_path,
             },
@@ -1929,16 +1936,28 @@ def test_fetch_timeout_falls_through_to_local_refs_without_shell_wrapper(tmp_pat
         # hosts vary) but far below the fixture's 30s sleeper.  This is a real
         # unreachable-origin hang, not a fast failure substituted for it.
         assert elapsed < 8, f"installer took {elapsed:.1f}s — the fetch was not bounded"
+        # Lower bound: the 2s bound was actually waited on against a hang, not
+        # a fast failure standing in for it (slack under 2 for timer/startup).
+        assert elapsed >= 1.5, f"installer took {elapsed:.1f}s — no hang was waited on"
         assert result.returncode == 0, result.stderr
         assert "UNBOUNDED" not in (result.stdout + result.stderr)
         marker = (engram_home / ".deployed-version").read_text()
         assert "alpha_tag=v1.0.0-ancestor-test" in marker
-        assert child_pid_file.exists()
-        assert not _fixture_pid_is_running(int(child_pid_file.read_text().strip()))
+        # The ssh pid is written first, so it must exist (flake-proof).
+        assert ssh_pid_file.exists()
+        assert not _fixture_pid_is_running(int(ssh_pid_file.read_text().strip()))
+        # The grandchild pid is written second; if the 2s bound fired before
+        # bash reached it (heavy load) there is nothing to check, so skip only
+        # this assertion -- never fail on its absence.
+        if child_pid_file.exists():
+            assert not _fixture_pid_is_running(
+                int(child_pid_file.read_text().strip())
+            )
     finally:
         # A direct-kill-only mutant can leave this known fake-SSH group alive.
-        if child_pid_file.exists():
-            _cleanup_fixture_process_group(int(child_pid_file.read_text().strip()))
+        for pid_file in (ssh_pid_file, child_pid_file):
+            if pid_file.exists():
+                _cleanup_fixture_process_group(int(pid_file.read_text().strip()))
 
 
 # ── #3133 — no timeout/gtimeout prerequisite ─────────────────────────────────
