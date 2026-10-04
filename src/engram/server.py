@@ -7808,8 +7808,10 @@ def engram_query_pattern(payload_json: str) -> str:
                   chain nearby (semantic) that may resolve them.
                 - stale_load_bearing: high-importance + low-recall non-
                   cornerstone nodes (re-engagement candidates).
-                - cornerstone_candidate: heavily-cited high-importance
-                  observations/derivations only (emergent-practice anchoring
+                - cornerstone_candidate: high-importance observations/
+                  derivations being cited recently (distinct current citers
+                  gained in the preset's recent window, not lifetime;
+                  observations/derivations only, emergent-practice anchoring
                   candidates; axioms/goals/definitions excluded as
                   fundamental-by-type — see the engram-* skills / MCP docstrings / #180).
                 - tainted_still_valid: tainted derivations whose substantive

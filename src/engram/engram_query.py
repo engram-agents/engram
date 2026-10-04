@@ -28,7 +28,7 @@ import os
 import sqlite3
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -137,9 +137,16 @@ PATTERN_QUERY_PRESETS: dict[str, dict[str, float | int]] = {
     # Whether to make this dict config-loadable (Tier 2 in issue #76's tier
     # model) vs leave hardcoded (Tier 3) is the open design question — for
     # now the dict stays here, values calibrated against v4 evidence.
-    "high_precision": {"cosine_threshold": 0.65, "top_k": 5,  "min_confidence": 0.70},
-    "balanced":       {"cosine_threshold": 0.55, "top_k": 15, "min_confidence": 0.50},
-    "high_recall":    {"cosine_threshold": 0.45, "top_k": 30, "min_confidence": 0.00},
+    #
+    # recent_window_days (#3154) is read ONLY by cornerstone_candidate: the window
+    # (in days) over which citations gained count toward its ranking. Same
+    # tighter/looser bracketing as the other knobs: 30 / 60 / 120.
+    "high_precision": {"cosine_threshold": 0.65, "top_k": 5,  "min_confidence": 0.70,
+                       "recent_window_days": 30},
+    "balanced":       {"cosine_threshold": 0.55, "top_k": 15, "min_confidence": 0.50,
+                       "recent_window_days": 60},
+    "high_recall":    {"cosine_threshold": 0.45, "top_k": 30, "min_confidence": 0.00,
+                       "recent_window_days": 120},
 }
 
 
@@ -560,7 +567,7 @@ def _pattern_stale_load_bearing(
 def _pattern_cornerstone_candidate(
     conn, preset_params: dict, **_filters
 ) -> list[dict]:
-    """Heavily-cited observations/derivations that may warrant cornerstone anchoring.
+    """Observations/derivations being cited NOW that may warrant cornerstone anchoring.
 
     Candidate pool is **observations and derivations only** — emergent-practice
     nodes whose load-bearing role has accumulated through use. Axioms, goals,
@@ -569,11 +576,29 @@ def _pattern_cornerstone_candidate(
     an emergence signal — nominating them was the #180 false-positive. See
     the engram-* skills / MCP docstrings for the axiom/goal/cornerstone semantic distinctions.
 
-    A cornerstone candidate is a node that has been load-bearing in the
-    graph (cited by many derivations / observations) but isn't yet anchored
-    as a cornerstone. Score: importance_base × (1 + citation_count / 10).
-    Gating uses importance_base (time-invariant) so the threshold is stable
-    across turns.
+    What is measured (#3154): **citations gained inside a recent window**
+    (`recent_window_days` from the preset: 30 / 60 / 120), not lifetime
+    citations. The earlier score, importance_base x (1 + lifetime_cites/10),
+    was age-biased twice over: importance_base saturates (hundreds of nodes tie
+    at the same value, so a `LIMIT` on it kept whatever came first in storage
+    order, i.e. the oldest nodes), and with importance_base flat the score
+    reduced to lifetime citations, i.e. node age. Measured on a real graph, all
+    of the top 15 came from the oldest month and the dream-fairy category-4
+    scan returned the same set on every draw. Ranking by recent gain keeps an
+    old node **only if it is still being cited**; age itself is not penalised.
+
+    Counts are of DISTINCT, CURRENT citing sources ("claims resting on this
+    node now"): one source citing the same target by several relations counts
+    once, and a retracted/superseded citer (`is_current=0`) no longer rests on
+    anything, so it is not counted (its successor, if any, counts via its own
+    edge). `recent` counts a source if any of its qualifying edges falls inside
+    the window.
+
+    Gate: `recent >= min_recent_citations` (3). Lifetime citations are no
+    longer a gate. There is no pre-cap: eligibility and counts are computed in
+    one SQL aggregate over all eligible nodes.
+    Order (deterministic): recent DESC, lifetime DESC, created_at DESC, id ASC.
+    `score` is the recent count (kept for consumers).
 
     A node already wired to an existing cornerstone (any incoming edge whose
     source is a current cornerstone — e.g. a cornerstone's own `supported_by`
@@ -583,98 +608,110 @@ def _pattern_cornerstone_candidate(
     count would double-count the very relationship that disqualifies it
     (#1913).
 
-    Returns: list of {id, type, claim, score, importance_base, citation_count,
-    recall_count, suggested_action}.
+    The recency comparison is done on SQLite `datetime()` of both sides, not on
+    raw strings: `edges.created_at` is written as `...ffffff+00:00` in
+    production but legacy/hand-written rows carry `Z` or a space separator, and
+    a raw text compare against an ISO `T` cutoff misorders those. An
+    unparseable timestamp yields NULL, which is never >= cutoff (not recent).
+
+    Returns: list of {id, type, claim, score, importance_base,
+    recent_citation_count, citation_count (lifetime), recall_count,
+    suggested_action}.
     """
     top_k = int(preset_params.get("top_k", 15))
-    min_citations = 3  # below this, not load-bearing enough to anchor
+    min_recent_citations = 3  # below this, not being cited enough NOW to anchor
+    window_days = float(preset_params.get("recent_window_days", 60))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
 
+    # One aggregate, no per-node queries. Counts are COUNT(DISTINCT source) over
+    # current citing sources (the `src` join), so multi-relation duplicates and
+    # retracted/superseded citers do not inflate them.
+    #
+    # Anchored exclusion (NOT EXISTS) is deliberately relation-agnostic: ANY
+    # incoming edge from a current cornerstone disqualifies the candidate, not
+    # just the supported_by/cites/derives_from relations the citation count
+    # tallies. "Wired to a cornerstone" is what matters, not by which
+    # relation — a future edge type sourced from a cornerstone should
+    # disqualify too without needing this list updated in lockstep.
+    #
+    # #2255 colleague-review fix: the relation set in the JOIN below is a THIRD,
+    # deliberately distinct relation set from core.CITATION_SUPPORT_RELATIONS
+    # ({derives_from, supported_by}) — do not unify the two. This is
+    # cornerstone-candidate SCORING, not the uncited-observation check: it
+    # includes 'cites', which CITATION_SUPPORT_RELATIONS excludes on purpose
+    # (see that constant's own comment in engram_core.py). Unifying onto
+    # CITATION_SUPPORT_RELATIONS would drop 'cites' from the count
+    # entirely. Measured on two independent ENGRAM graphs, that removes
+    # roughly two-thirds of it (63% and 67%) — so cornerstone-candidate
+    # scoring would silently lose most of its citation signal and
+    # min_recent_citations would filter a different population. Do not state
+    # absolute edge counts here: they are install-specific (every ENGRAM
+    # graph has a different edge population) and would be wrong for
+    # every other reader — the two-graph agreement in direction is the
+    # portable fact, not either graph's number.
+    #
+    # #2252 W6 design decision: `predicted_by` is DELIBERATELY EXCLUDED
+    # from this tuple — do not add it back. Cornerstone candidacy asks
+    # whether an observation is LOAD-BEARING: whether other CLAIMS rest
+    # on it. Predictions are non-claim-bearing (#2252 Q1 FINAL). A
+    # prediction attached to an observation is a tracker, not a
+    # dependent claim, so it should never have counted as a load-bearing
+    # citation. The pre-split behaviour — where the pairing edge's
+    # `supported_by` name made it count here by accident, because it
+    # shared a literal with the real citation relations — was the bug;
+    # excluding `predicted_by` is the correction, not a regression.
+    #
+    # Known transient inconsistency, owned by W3: because the W6
+    # migration is additive (old `supported_by` pairing edges are never
+    # deleted, only paralleled with a new `predicted_by` edge), a
+    # migrated pre-W6 prediction's stale `supported_by` edge STILL
+    # counts toward its observation's citation counts here, while a
+    # newly-minted post-W6 prediction (predicted_by only) does not.
+    # This is a known artifact of the additive migration, not an
+    # oversight — it resolves when W3 retires the stale `supported_by`
+    # pairing edges.
     rows = conn.execute(
-        "SELECT id, type, claim, importance_base, recall_count "
-        "FROM nodes "
-        "WHERE is_current=1 "
-        "AND (type LIKE 'observation%' OR type = 'derivation') "
-        "AND COALESCE(importance_base, 0) > 0.7 "
-        "ORDER BY importance_base DESC LIMIT 50"
+        "SELECT n.id, n.type, n.claim, n.importance_base, n.recall_count, "
+        "       COUNT(DISTINCT e.source_id) AS lifetime_cites, "
+        "       COUNT(DISTINCT CASE WHEN datetime(e.created_at) >= datetime(:cutoff) "
+        "                           THEN e.source_id END) AS recent_cites "
+        "FROM nodes n "
+        "JOIN edges e ON e.target_id = n.id "
+        "     AND e.relation IN ('supported_by', 'cites', 'derives_from') "
+        "JOIN nodes src ON src.id = e.source_id AND src.is_current = 1 "
+        "WHERE n.is_current=1 "
+        "AND (n.type LIKE 'observation%' OR n.type = 'derivation') "
+        "AND COALESCE(n.importance_base, 0) > 0.7 "
+        "AND NOT EXISTS ("
+        "    SELECT 1 FROM edges a JOIN nodes c ON a.source_id = c.id "
+        "    WHERE a.target_id = n.id AND c.type='cornerstone' AND c.is_current=1"
+        ") "
+        "GROUP BY n.id "
+        "HAVING recent_cites >= :min_recent "
+        "ORDER BY recent_cites DESC, lifetime_cites DESC, n.created_at DESC, n.id ASC "
+        "LIMIT :top_k",
+        {"cutoff": cutoff, "min_recent": min_recent_citations, "top_k": top_k},
     ).fetchall()
 
     candidates: list[dict] = []
-    for nid, ntype, claim, imp_base, recalls in rows:
-        # Deliberately relation-agnostic: ANY incoming edge from a current
-        # cornerstone disqualifies the candidate, not just the
-        # supported_by/cites/derives_from relations the citation count below
-        # tallies. "Wired to a cornerstone" is what matters, not by which
-        # relation — a future edge type sourced from a cornerstone should
-        # disqualify too without needing this list updated in lockstep.
-        already_anchored = conn.execute(
-            "SELECT COUNT(*) FROM edges e "
-            "JOIN nodes n ON e.source_id = n.id "
-            "WHERE e.target_id=? AND n.type='cornerstone' AND n.is_current=1",
-            (nid,),
-        ).fetchone()[0]
-        if already_anchored:
-            continue
-        # #2255 colleague-review fix: this is a THIRD, deliberately distinct
-        # relation set from core.CITATION_SUPPORT_RELATIONS ({derives_from,
-        # supported_by}) — do not unify the two. This is cornerstone-candidate
-        # SCORING, not the uncited-observation check: it includes 'cites',
-        # which CITATION_SUPPORT_RELATIONS excludes on purpose (see that
-        # constant's own comment in engram_core.py). Unifying onto
-        # CITATION_SUPPORT_RELATIONS would drop 'cites' from the count
-        # entirely. Measured on two independent ENGRAM graphs, that removes
-        # roughly two-thirds of it (63% and 67%) — so cornerstone-candidate
-        # scoring would silently lose most of its citation signal and
-        # min_citations would filter a different population. Do not state
-        # absolute edge counts here: they are install-specific (every ENGRAM
-        # graph has a different edge population) and would be wrong for
-        # every other reader — the two-graph agreement in direction is the
-        # portable fact, not either graph's number.
-        #
-        # #2252 W6 design decision: `predicted_by` is DELIBERATELY EXCLUDED
-        # from this tuple — do not add it back. Cornerstone candidacy asks
-        # whether an observation is LOAD-BEARING: whether other CLAIMS rest
-        # on it. Predictions are non-claim-bearing (#2252 Q1 FINAL). A
-        # prediction attached to an observation is a tracker, not a
-        # dependent claim, so it should never have counted as a load-bearing
-        # citation. The pre-split behaviour — where the pairing edge's
-        # `supported_by` name made it count here by accident, because it
-        # shared a literal with the real citation relations — was the bug;
-        # excluding `predicted_by` is the correction, not a regression.
-        #
-        # Known transient inconsistency, owned by W3: because the W6
-        # migration is additive (old `supported_by` pairing edges are never
-        # deleted, only paralleled with a new `predicted_by` edge), a
-        # migrated pre-W6 prediction's stale `supported_by` edge STILL
-        # counts toward its observation's cite_count here, while a
-        # newly-minted post-W6 prediction (predicted_by only) does not.
-        # This is a known artifact of the additive migration, not an
-        # oversight — it resolves when W3 retires the stale `supported_by`
-        # pairing edges.
-        cite_count = conn.execute(
-            "SELECT COUNT(*) FROM edges WHERE target_id=? "
-            "AND relation IN ('supported_by', 'cites', 'derives_from')",
-            (nid,),
-        ).fetchone()[0]
-        if cite_count < min_citations:
-            continue
+    for nid, ntype, claim, imp_base, recalls, lifetime_cites, recent_cites in rows:
         imp_base = imp_base or 0.0
-        score = imp_base * (1 + cite_count / 10.0)
         candidates.append({
             "id": nid,
             "type": ntype,
             "claim": (claim[:160] + "...") if claim and len(claim) > 160 else claim,
-            "score": round(score, 3),
+            "score": recent_cites,
             "importance_base": round(imp_base, 3),
-            "citation_count": cite_count,
+            "recent_citation_count": recent_cites,
+            "citation_count": lifetime_cites,
             "recall_count": recalls or 0,
             "suggested_action": (
                 f"Consider engram_focus or engram_add_cornerstone for {nid} — "
-                f"{cite_count} downstream citations suggest it's load-bearing."
+                f"{recent_cites} distinct current citers in the last {window_days:g} days "
+                f"({lifetime_cites} lifetime) suggest it's load-bearing now."
             ),
         })
-
-    candidates.sort(key=lambda c: c["score"], reverse=True)
-    return candidates[:top_k]
+    return candidates
 
 
 def _pattern_tainted_still_valid(

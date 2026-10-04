@@ -88,6 +88,22 @@ def _mods():
     return qry, obs, rev, drv, epi, tsk, cst, core
 
 
+def _days_ago_iso(days: float, fmt: str = "iso") -> str:
+    """Timestamp `days` ago in a given stored-format flavour (#3154 fixtures).
+
+    iso   -> production format `YYYY-MM-DDTHH:MM:SS.ffffff+00:00`
+    z     -> `YYYY-MM-DDTHH:MM:SSZ` (older fixtures / hand-written rows)
+    space -> `YYYY-MM-DD HH:MM:SS` (SQLite datetime() style, naive UTC)
+    """
+    from datetime import datetime, timedelta, timezone
+    t = datetime.now(timezone.utc) - timedelta(days=days)
+    if fmt == "z":
+        return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if fmt == "space":
+        return t.strftime("%Y-%m-%d %H:%M:%S")
+    return t.isoformat()
+
+
 def _add_observation(obs, claim: str, url: str = "https://example.com/test") -> str:
     """Create an observation, return its id."""
     r = json.loads(obs._add_observation_impl(
@@ -508,7 +524,7 @@ def test_cornerstone_candidate_excludes_axiom_goal_definition_includes_ob_dv():
     """
     core = _fresh_mods()
     qry, obs, rev, drv, epi, tsk, cst, core = _mods()
-    now = "2026-05-25T00:00:00Z"
+    now = _days_ago_iso(1)  # inside the cornerstone_candidate recent window (#3154)
 
     # Create three "citer" observations used only as edge sources
     citer_a = _add_observation(obs, "Citer A for citation fixture")
@@ -620,7 +636,7 @@ def test_cornerstone_candidate_excludes_nodes_already_anchored_to_a_cornerstone(
     """
     core = _fresh_mods()
     qry, obs, rev, drv, epi, tsk, cst, core = _mods()
-    now = "2026-05-25T00:00:00Z"
+    now = _days_ago_iso(1)  # inside the cornerstone_candidate recent window (#3154)
 
     citer_a = _add_observation(obs, "Citer A for anchored-node fixture")
     citer_b = _add_observation(obs, "Citer B for anchored-node fixture")
@@ -716,7 +732,7 @@ def test_cornerstone_candidate_exclusion_is_relation_agnostic():
     """
     core = _fresh_mods()
     qry, obs, rev, drv, epi, tsk, cst, core = _mods()
-    now = "2026-05-25T00:00:00Z"
+    now = _days_ago_iso(1)  # inside the cornerstone_candidate recent window (#3154)
 
     citer_a = _add_observation(obs, "Citer A for relation-agnostic fixture")
     citer_b = _add_observation(obs, "Citer B for relation-agnostic fixture")
@@ -801,7 +817,7 @@ def test_cornerstone_candidate_excludes_predicted_by_from_citation_count():
     """
     core = _fresh_mods()
     qry, obs, *_ = _mods()
-    now = "2026-08-27T00:00:00Z"
+    now = _days_ago_iso(1)  # inside the cornerstone_candidate recent window (#3154)
 
     citer_a = _add_observation(obs, "Citer A for predicted_by-exclusion fixture")
     citer_b = _add_observation(obs, "Citer B for predicted_by-exclusion fixture")
@@ -889,6 +905,288 @@ def test_cornerstone_candidate_excludes_predicted_by_from_citation_count():
         f"{node_id} now has 3 real citations and should cross min_citations=3 "
         f"on its own merit. Got candidates: {result_ids}"
     )
+
+
+# ── cornerstone_candidate: recent-window ranking (#3154) ──────────────────
+#
+# Contract: eligibility = current obs/dv, importance_base > 0.7, not anchored.
+# Rank = citations (supported_by/cites/derives_from) gained inside the preset's
+# `recent_window_days` (high_precision 30 / balanced 60 / high_recall 120),
+# gate recent >= 3, order recent DESC, lifetime DESC, created_at DESC, id ASC.
+# No importance_base pre-cap. Lifetime count is NOT a gate; node age is NOT a
+# penalty (an old node qualifies iff it is still being cited).
+
+
+def _cc_node(obs, core, claim, age_days, ib=2.0):
+    """Create an eligible obs aged `age_days`, return its id."""
+    nid = _add_observation(obs, claim)
+    conn = core._get_db()
+    try:
+        conn.execute(
+            "UPDATE nodes SET importance_base=?, importance_score=?, created_at=? WHERE id=?",
+            (ib, ib, _days_ago_iso(age_days), nid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return nid
+
+
+def _cc_cite(obs, core, target, ages_days, relation="cites", fmt="iso"):
+    """Add one citing edge per age (days), each from a fresh real citer node
+    (edges.source_id is a foreign key). Citers are parked at importance_base 0.1
+    so they are not themselves eligible candidates."""
+    for i, age in enumerate(ages_days):
+        src = _add_observation(obs, f"citer {target} {relation} {fmt} {i} {age}")
+        conn = core._get_db()
+        try:
+            conn.execute(
+                "UPDATE nodes SET importance_base=0.1, importance_score=0.1 WHERE id=?",
+                (src,),
+            )
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (src, target, relation, _days_ago_iso(age, fmt)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _cc_run(qry, core, preset="balanced", top_k=100):
+    conn = core._get_db()
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS[preset])
+        params["top_k"] = top_k
+        return qry._pattern_cornerstone_candidate(conn, params)
+    finally:
+        conn.close()
+
+
+def test_cornerstone_candidate_old_stale_node_loses_to_young_recently_cited():
+    """Cell 1: A (200d old, 10 cites all 150d+ ago) is NOT returned; B (20d old,
+    4 cites in the last 20d) IS. Dev returned A first (lifetime count)."""
+    core = _fresh_mods()
+    qry, obs, *_ = _mods()
+    a = _cc_node(obs, core, "Old node, cited long ago", 200)
+    _cc_cite(obs, core, a, [150 + i for i in range(10)])
+    b = _cc_node(obs, core, "Young node, cited lately", 20)
+    _cc_cite(obs, core, b, [1, 5, 10, 15])
+    rows = _cc_run(qry, core)
+    ids = [c["id"] for c in rows]
+    assert b in ids
+    assert a not in ids, "0 recent cites (< 3) must not qualify however many lifetime cites"
+    row = next(c for c in rows if c["id"] == b)
+    assert row["recent_citation_count"] == 4 and row["citation_count"] == 4
+    assert row["score"] == 4
+
+
+def test_cornerstone_candidate_old_node_still_being_cited_qualifies():
+    """Cell 2: C (200d old) with 5 cites in the last 30d IS returned: age is not penalised."""
+    core = _fresh_mods()
+    qry, obs, *_ = _mods()
+    c = _cc_node(obs, core, "Old node, cited now", 200)
+    _cc_cite(obs, core, c, [2, 6, 12, 20, 29])
+    # older lifetime cites: recent count must exclude them, lifetime must include them
+    _cc_cite(obs, core, c, [150, 160], relation="supported_by")
+    row = next((r for r in _cc_run(qry, core) if r["id"] == c), None)
+    assert row is not None
+    assert row["recent_citation_count"] == 5
+    assert row["citation_count"] == 7
+
+
+def test_cornerstone_candidate_window_comes_from_preset():
+    """Cell 3: 3 cites aged 45d -> in balanced (60d) and high_recall (120d), not high_precision (30d)."""
+    core = _fresh_mods()
+    qry, obs, *_ = _mods()
+    n = _cc_node(obs, core, "Cited 45 days ago", 100)
+    _cc_cite(obs, core, n, [45, 45, 45])
+    assert qry.PATTERN_QUERY_PRESETS["high_precision"]["recent_window_days"] == 30
+    assert qry.PATTERN_QUERY_PRESETS["balanced"]["recent_window_days"] == 60
+    assert qry.PATTERN_QUERY_PRESETS["high_recall"]["recent_window_days"] == 120
+    assert n in [c["id"] for c in _cc_run(qry, core, "balanced")]
+    assert n in [c["id"] for c in _cc_run(qry, core, "high_recall")]
+    assert n not in [c["id"] for c in _cc_run(qry, core, "high_precision")]
+
+
+def test_cornerstone_candidate_window_default_is_60_when_param_absent():
+    """recent_window_days defaults to 60 if a caller's params dict lacks it."""
+    core = _fresh_mods()
+    qry, obs, *_ = _mods()
+    inside = _cc_node(obs, core, "Cited 50 days ago", 100)
+    _cc_cite(obs, core, inside, [50, 50, 50])
+    outside = _cc_node(obs, core, "Cited 70 days ago", 100)
+    _cc_cite(obs, core, outside, [70, 70, 70])
+    conn = core._get_db()
+    try:
+        rows = qry._pattern_cornerstone_candidate(conn, {"top_k": 100})
+    finally:
+        conn.close()
+    ids = [r["id"] for r in rows]
+    assert inside in ids and outside not in ids
+
+
+def test_cornerstone_candidate_anchored_excluded_despite_recent_cites():
+    """Cell 4: 6 recent cites + an incoming edge from a current cornerstone -> excluded."""
+    core = _fresh_mods()
+    qry, obs, rev, drv, epi, tsk, cst, core = _mods()
+    anchored = _cc_node(obs, core, "Anchored, heavily and recently cited", 30)
+    _cc_cite(obs, core, anchored, [1, 2, 3, 4, 5, 6])
+    control = _cc_node(obs, core, "Unanchored control, same profile", 30)
+    _cc_cite(obs, core, control, [1, 2, 3, 4, 5, 6])
+    r = json.loads(cst._add_cornerstone_impl(
+        tag="test-anchor-3154", title="Anchor for 3154 fixture",
+        new_frame="A durable operating principle for this test",
+        prior_frame="No such principle yet",
+        triggering_experience="Fixture needs an anchoring cornerstone",
+        supporting_ids=anchored,
+    ))
+    assert "cornerstone_id" in r, r
+    ids = [c["id"] for c in _cc_run(qry, core)]
+    assert anchored not in ids
+    assert control in ids
+
+
+def test_cornerstone_candidate_order_is_deterministic_with_tiebreaks():
+    """Cell 5: order is recent DESC, lifetime DESC, created_at DESC, id ASC; stable across runs."""
+    core = _fresh_mods()
+    qry, obs, *_ = _mods()
+    older = _cc_node(obs, core, "tie older", 40)
+    newer = _cc_node(obs, core, "tie newer", 10)
+    same_a = _cc_node(obs, core, "tie same-time a", 25)
+    same_b = _cc_node(obs, core, "tie same-time b", 25)
+    stamp = _days_ago_iso(25)
+    conn = core._get_db()
+    try:
+        conn.execute("UPDATE nodes SET created_at=? WHERE id IN (?,?)", (stamp, same_a, same_b))
+        conn.commit()
+    finally:
+        conn.close()
+    for n in (older, newer, same_a, same_b):
+        _cc_cite(obs, core, n, [1, 2, 3])
+    # equal recent (3) but more lifetime: outranks the 3/3 ties
+    lt = _cc_node(obs, core, "more lifetime", 90)
+    _cc_cite(obs, core, lt, [1, 2, 3, 100, 110])
+    # more recent (4) but less lifetime than lt: outranks everything
+    top = _cc_node(obs, core, "most recent", 90)
+    _cc_cite(obs, core, top, [1, 2, 3, 4])
+    first = [c["id"] for c in _cc_run(qry, core)]
+    second = [c["id"] for c in _cc_run(qry, core)]
+    assert first == second
+    lo, hi = sorted((same_a, same_b))
+    assert first == [top, lt, newer, lo, hi, older]
+
+
+def test_cornerstone_candidate_no_importance_base_precap_hides_recent_node():
+    """Cell 6: >50 eligible nodes all at importance_base 0.95 (a saturated key); the only
+    node with >=3 recent cites must be returned wherever it sits in storage order.
+
+    The target is exercised both FIRST (low rowid) and LAST (high rowid). The low-rowid
+    case alone does not discriminate a kept `ORDER BY importance_base DESC LIMIT 50`,
+    because ties come back in storage order and a low rowid survives the cut; the LAST
+    case is the one a kept pre-cap must fail (target falls past row 50 of 56). Both
+    must pass under the correct implementation."""
+    for position in ("first", "last"):
+        core = _fresh_mods()
+        qry, obs, *_ = _mods()
+        target = None
+        if position == "first":
+            target = _cc_node(obs, core, "Target first", 30, ib=0.95)
+            _cc_cite(obs, core, target, [1, 2, 3])
+        for i in range(55):
+            _cc_node(obs, core, f"Filler {position} {i}", 30, ib=0.95)
+        if position == "last":
+            target = _cc_node(obs, core, "Target last", 30, ib=0.95)
+            _cc_cite(obs, core, target, [1, 2, 3])
+        ids = [c["id"] for c in _cc_run(qry, core)]
+        assert ids == [target], f"{position}: got {ids}"
+
+
+def test_cornerstone_candidate_recency_comparison_is_format_safe():
+    """Cell 7: edges.created_at in production is `...T..:..:...ffffff+00:00`, but rows also
+    exist as `...Z` and as naive `YYYY-MM-DD HH:MM:SS`. A raw string compare against an
+    ISO `T` cutoff misjudges the space form on the cutoff's own date (' ' < 'T').
+    Three edges, each in a different format, each just INSIDE the window (cutoff + 3h),
+    must all count; the same trio just outside (cutoff - 3h) must not."""
+    core = _fresh_mods()
+    qry, obs, *_ = _mods()
+    inside_age = 60 - 3 / 24.0
+    outside_age = 60 + 3 / 24.0
+    n = _cc_node(obs, core, "Mixed-format edges", 120)
+    for fmt in ("iso", "z", "space"):
+        _cc_cite(obs, core, n, [inside_age], fmt=fmt)
+    m = _cc_node(obs, core, "Mixed-format edges, outside window", 120)
+    for fmt in ("iso", "z", "space"):
+        _cc_cite(obs, core, m, [outside_age], fmt=fmt)
+    rows = _cc_run(qry, core)
+    row = next((r for r in rows if r["id"] == n), None)
+    assert row is not None, "all three format flavours just inside the window must count"
+    assert row["recent_citation_count"] == 3
+    assert m not in [r["id"] for r in rows]
+
+
+def test_cornerstone_candidate_counts_distinct_citing_sources():
+    """#3154 r1 (a): one source citing the same target by several relations is ONE
+    claim resting on it, not several. supported_by + cites + derives_from from the
+    same source = 1; with two other distinct sources the node has 3, and with only
+    one other it has 2 and is below the gate."""
+    core = _fresh_mods()
+    qry, obs, *_ = _mods()
+    dup = _cc_node(obs, core, "Cited thrice by one source, once by another", 20)
+    src = _add_observation(obs, "multi-relation citer")
+    other = _add_observation(obs, "other citer")
+    conn = core._get_db()
+    try:
+        for sid in (src, other):
+            conn.execute("UPDATE nodes SET importance_base=0.1 WHERE id=?", (sid,))
+        for rel in ("supported_by", "cites", "derives_from"):
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?,?,?,?)",
+                (src, dup, rel, _days_ago_iso(2)),
+            )
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?,?,?,?)",
+            (other, dup, "cites", _days_ago_iso(3)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # 4 edges but 2 distinct sources -> below the gate
+    assert dup not in [r["id"] for r in _cc_run(qry, core)]
+    # a third distinct source crosses it, and the counts are distinct-source counts
+    _cc_cite(obs, core, dup, [4])
+    row = next(r for r in _cc_run(qry, core) if r["id"] == dup)
+    assert row["recent_citation_count"] == 3
+    assert row["citation_count"] == 3
+
+
+def test_cornerstone_candidate_ignores_non_current_citers():
+    """#3154 r1 (b): a retracted/superseded citer no longer rests on the target. A node
+    with 3 recent cites, one from a non-current source, has recent=2 (below the gate);
+    lifetime also excludes it."""
+    core = _fresh_mods()
+    qry, obs, *_ = _mods()
+    n = _cc_node(obs, core, "Cited by three, one later retracted", 20)
+    _cc_cite(obs, core, n, [1, 2, 3])
+    ctrl = _cc_node(obs, core, "Control: three live citers", 20)
+    _cc_cite(obs, core, ctrl, [1, 2, 3])
+    conn = core._get_db()
+    try:
+        src = conn.execute(
+            "SELECT source_id FROM edges WHERE target_id=? ORDER BY source_id LIMIT 1", (n,)
+        ).fetchone()[0]
+        conn.execute("UPDATE nodes SET is_current=0, status='retracted' WHERE id=?", (src,))
+        conn.commit()
+    finally:
+        conn.close()
+    ids = [r["id"] for r in _cc_run(qry, core)]
+    assert n not in ids, "recent=2 after excluding the retracted citer: below the gate"
+    assert ctrl in ids
+    # a fourth live citer brings it back, with the retracted one excluded from both counts
+    _cc_cite(obs, core, n, [4, 5], relation="supported_by")
+    row = next(r for r in _cc_run(qry, core) if r["id"] == n)
+    assert row["recent_citation_count"] == 4 and row["citation_count"] == 4
 
 
 # ── open_question_answerable + recent_resolution_echo ─────────────────────
