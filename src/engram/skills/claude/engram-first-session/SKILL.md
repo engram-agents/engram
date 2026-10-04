@@ -415,6 +415,16 @@ fi
 
 Then follow the branch for the detected target:
 
+**The warm-briefing anchor assertion — required after ANY write to `~/.engram/warm-briefing.md`, both targets.** Step 6 rewrites that file whole, so it carries the same obligation as every other writer of it (`engram-sleep` Step 3, `engram-nap` Step 5). The invariant: exactly ONE line matching `^## From this session`, and it is the LAST line of the file (at first session the section is empty, so the bare heading is the final line), with the `<!-- STRUCTURAL INVARIANT: ... -->` comment above it. Verify after writing:
+
+```bash
+_a=$(grep -c '^## From this session$' "$HOME/.engram/warm-briefing.md")
+_last=$(tail -n 1 "$HOME/.engram/warm-briefing.md")
+[ "$_a" = 1 ] && [ "$_last" = '## From this session' ] || echo "FAIL: warm-briefing anchor lost, duplicated, or moved off the end — restore the file from the template and redo the substitution; never hand-patch the heading"
+```
+
+A lost or duplicated anchor is not cosmetic: `engram-sleep` Step 3's erase keys on the LAST matching heading through EOF, so a lost heading makes a later sleep APPEND a stub instead of erasing (freezing the stale arc above it), and a duplicate strands everything between the two headings as preserved user notes. Full reasoning: `engram-nap` Step 5 post-condition.
+
 ---
 
 ### Step 6 — Claude target (TARGET=claude)
@@ -431,7 +441,7 @@ Then follow the branch for the detected target:
    - Any other `{{...}}` markers present — consult the user if ambiguous, do not guess.
 4. Write the resolved files back. Enumerate each one explicitly: `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, `~/.claude/output-styles/proactive-with-carveouts.md` (if present — this file ships with the Proactive-with-Carveouts output style; older installs without it can skip), `~/.claude/skills/internal-external-decision/SKILL.md` (if present — same provenance), `~/.claude/skills/engram-upgrade/SKILL.md` (if present — references ask-{{USER_NAME}}.md in checkpoint + anti-pattern sections). Silent drop of any required file would leave it firing forever with raw `{{AGENT_NAME}}`/`{{USER_NAME}}`/`{{COUNTERPART_NAME}}` placeholders in the prose.
 5. **Bootstrap the ask-{{USER_NAME}}.md auto-load surface.** Run `touch "$HOME/.engram/ask-<USER_NAME>.md"` substituting the resolved user name — e.g. for USER_NAME=alice, run `touch ~/.engram/ask-alice.md`. This ensures session-start reads don't silently no-op on a fresh install before the agent has written anything. The filename matches whatever the user's name is (resolved during this dialogue, not hard-coded at install time).
-6. **Verify**: no literal `{{...}}` placeholders remain in any of the written files. Check with:
+6. **Verify**: no literal `{{...}}` placeholders remain in any of the written files, and the warm-briefing anchor assertion above. Check the placeholders with:
    ```bash
    grep -r '{{' ~/.claude/CLAUDE.md ~/.engram/warm-briefing.md 2>/dev/null && echo "WARN: unresolved placeholders"
    ```
@@ -461,7 +471,7 @@ The codex file set is different. Bootstrap wrote identity surfaces across four f
 
 3. Write all four resolved files back. For `config.toml`, the instructions= body contains the agent-specific prose; rewrite the full file with the resolved content (the bootstrap merge wrote the identity keys; this step resolves placeholders within them).
 
-4. **Verify**: no literal `{{...}}` placeholders remain in any of the four surfaces:
+4. **Verify**: no literal `{{...}}` placeholders remain in any of the four surfaces, and the warm-briefing anchor assertion above. Check the placeholders with:
    ```bash
    grep -rn '{{' ~/.codex/config.toml ~/.codex/AGENTS.md \
        ~/.engram/codex-compact-prompt.md ~/.engram/warm-briefing.md 2>/dev/null \
