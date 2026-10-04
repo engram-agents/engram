@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+from _owner_platform import requires_linux_owner
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ENGRAM = str(REPO_ROOT / "src" / "engram")
 if _SRC_ENGRAM not in sys.path:
@@ -91,6 +93,7 @@ def test_P1_helper_reused_pid_is_not_alive(home, sleeper):
 
 
 @linux_only
+@requires_linux_owner
 def test_P1_owner_start_succeeds_over_reused_pid(home, sleeper):
     import engramd_owner as eo
 
@@ -271,6 +274,7 @@ def test_P10_unreadable_cmdline_is_conservatively_alive(home, sleeper, monkeypat
 
 
 @linux_only
+@requires_linux_owner
 @pytest.mark.parametrize("marker_proc", [OWNER_MARKER], indirect=True)
 def test_P11_owner_does_not_steal_from_drifted_live_owner(home, marker_proc):
     import engramd_owner as eo

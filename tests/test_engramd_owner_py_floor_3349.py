@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+from _owner_platform import requires_linux_owner
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ENGRAM = str(REPO_ROOT / "src" / "engram")
 if _SRC_ENGRAM not in sys.path:
@@ -101,6 +103,7 @@ def test_helper_is_feature_check_not_version_check(monkeypatch):
         )
 
 
+@requires_linux_owner
 def test_start_refuses_before_any_side_effect(engram_home, monkeypatch):
     """Cell 1: start() on a no-setlimit sqlite3 raises the named error and
     creates nothing at all -- not even the (not-yet-existing) home dir, its
@@ -123,6 +126,7 @@ def test_start_refuses_before_any_side_effect(engram_home, monkeypatch):
     assert set(threading.enumerate()) == threads_before
 
 
+@requires_linux_owner
 def test_start_refusal_leaves_stale_socket_untouched(engram_home, monkeypatch):
     """Cell 2: a stale (dead-owner) socket at the socket path is what
     _check_stale_socket_or_raise would unlink; the refusal must come first,
@@ -143,6 +147,7 @@ def test_start_refusal_leaves_stale_socket_untouched(engram_home, monkeypatch):
     assert not owner.store_path.exists()
 
 
+@requires_linux_owner
 def test_start_proceeds_on_real_interpreter(engram_home):
     """Control: the real sqlite3 passes the check and start() works."""
     owner = eo.EngramdOwner(engram_home)

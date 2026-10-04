@@ -38,6 +38,8 @@ from pathlib import Path
 
 import pytest
 
+from _owner_platform import requires_linux_owner
+
 _SRC_ENGRAM = str(Path(__file__).resolve().parent.parent / "src" / "engram")
 if _SRC_ENGRAM not in sys.path:
     sys.path.insert(0, _SRC_ENGRAM)
@@ -209,6 +211,7 @@ def owner_running():
         shutil.rmtree(home, ignore_errors=True)
 
 
+@requires_linux_owner
 @pytest.mark.parametrize("method", ["register_template", "registerTemplate",
                                     "add_template", "register", "Register",
                                     "register_read_template"])
@@ -602,6 +605,7 @@ def _templates_file(root: Path, sqls) -> Path:
     return p
 
 
+@requires_linux_owner
 @pytest.mark.parametrize("tier", ["essential", "convenience", None])
 def test_start_with_dynamic_flag_on_a_non_dev_tier_refuses_before_the_socket(
         tmp_path, monkeypatch, tier):
@@ -620,6 +624,7 @@ def test_start_with_dynamic_flag_on_a_non_dev_tier_refuses_before_the_socket(
         shutil.rmtree(home, ignore_errors=True)
 
 
+@requires_linux_owner
 def test_start_with_dynamic_flag_on_a_dev_tier_builds_a_dynamic_registry(tmp_path, monkeypatch):
     home = _home_with_store(tmp_path, install_tier="dev")
     monkeypatch.setenv(FLAG, "1")
@@ -632,6 +637,7 @@ def test_start_with_dynamic_flag_on_a_dev_tier_builds_a_dynamic_registry(tmp_pat
         shutil.rmtree(home, ignore_errors=True)
 
 
+@requires_linux_owner
 def test_start_loads_the_committed_list_into_the_real_gate(tmp_path, monkeypatch):
     """R12 wiring. Mutation: pass rr.EMPTY_REGISTRY instead of the loaded
     registry in start() -> the gate refuses OK_SQL and this goes red."""
@@ -654,6 +660,7 @@ def test_start_loads_the_committed_list_into_the_real_gate(tmp_path, monkeypatch
         shutil.rmtree(home, ignore_errors=True)
 
 
+@requires_linux_owner
 def test_start_with_no_templates_file_leaves_the_gate_refusing_everything(tmp_path, monkeypatch):
     """Mutation: fall back to a permissive registry when the file is missing -> red."""
     home = _home_with_store(tmp_path)
@@ -668,6 +675,7 @@ def test_start_with_no_templates_file_leaves_the_gate_refusing_everything(tmp_pa
         shutil.rmtree(home, ignore_errors=True)
 
 
+@requires_linux_owner
 def test_start_with_a_corrupt_templates_file_leaves_the_gate_refusing_everything(tmp_path, monkeypatch):
     home = _home_with_store(tmp_path)
     plugin_root = tmp_path / "plugin"
@@ -857,6 +865,7 @@ def test_a_busy_database_error_propagates_through_the_gate(tmp_path, schema):
         holder.close()
 
 
+@requires_linux_owner
 def test_dynamic_registry_still_works_after_start(tmp_path, monkeypatch):
     """The dev-tier schema connection must stay open for register_dynamic.
     Mutation: always close the schema connection in start() -> red."""

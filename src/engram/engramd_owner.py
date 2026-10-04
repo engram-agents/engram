@@ -878,6 +878,38 @@ class _ClientReadGate:
             self._conn.set_progress_handler(None, 0)
 
 
+def platform_unsupported_reason() -> str | None:
+    """Why this seat cannot run the owner, or None when it can (#3194, #3292).
+
+    Three checks, in this order, first failure wins: (1) not Linux, (2) no
+    `setfacl` on PATH, (3) no `socket.SO_PEERCRED`.
+    `EngramdOwner._check_platform_support()` raises `OwnerPermissionUnsupported`
+    with the returned string, and the test suite's `requires_linux_owner`
+    marker skips on `is not None`, so the refusal and the skip share this one
+    definition."""
+    if platform.system() != "Linux":
+        return (
+            f"refusing to start: the socket permission layer (ACL "
+            f"strip on run/, SO_PEERCRED peer check) is only "
+            f"implemented for Linux in this build; this seat reports "
+            f"platform.system() == {platform.system()!r}"
+        )
+    if shutil.which("setfacl") is None:
+        return (
+            "refusing to start: `setfacl` is required to strip "
+            "inherited ACLs on the socket's run/ directory (design "
+            "doc §2.1) and was not found on PATH"
+        )
+    if not hasattr(socket, "SO_PEERCRED"):
+        return (
+            "refusing to start: this Python/OS build has no "
+            "socket.SO_PEERCRED -- the peer-credential check (design "
+            "doc §2.2) cannot run here, and starting without it would "
+            "be a silent permission-layer gap"
+        )
+    return None
+
+
 class EngramdOwner:
     """The owner process skeleton -- one per seat, sole PROCESS holding
     `knowledge.db` open within this build's scope (handshake + `ping` +
@@ -1143,27 +1175,15 @@ class EngramdOwner:
         LOCAL_PEERCRED / `chmod -N` equivalents are explicitly out of
         scope), so a non-Linux seat, a seat missing `setfacl`, or a
         Python/OS build with no socket.SO_PEERCRED all refuse here rather
-        than starting with a silently-unenforced permission layer."""
-        if platform.system() != "Linux":
-            raise OwnerPermissionUnsupported(
-                f"refusing to start: the socket permission layer (ACL "
-                f"strip on run/, SO_PEERCRED peer check) is only "
-                f"implemented for Linux in this build; this seat reports "
-                f"platform.system() == {platform.system()!r}"
-            )
-        if shutil.which("setfacl") is None:
-            raise OwnerPermissionUnsupported(
-                "refusing to start: `setfacl` is required to strip "
-                "inherited ACLs on the socket's run/ directory (design "
-                "doc §2.1) and was not found on PATH"
-            )
-        if not hasattr(socket, "SO_PEERCRED"):
-            raise OwnerPermissionUnsupported(
-                "refusing to start: this Python/OS build has no "
-                "socket.SO_PEERCRED -- the peer-credential check (design "
-                "doc §2.2) cannot run here, and starting without it would "
-                "be a silent permission-layer gap"
-            )
+        than starting with a silently-unenforced permission layer.
+
+        The three checks live in the module-level
+        `platform_unsupported_reason()` (#3292) -- the one definition the
+        test suite's `requires_linux_owner` marker also keys on, so the
+        refusal and the skip cannot disagree."""
+        reason = platform_unsupported_reason()
+        if reason is not None:
+            raise OwnerPermissionUnsupported(reason)
 
     def _check_stale_socket_or_raise(self) -> None:
         """Contract items 1+2 (liveness / staleness) plus #3194's §2.4

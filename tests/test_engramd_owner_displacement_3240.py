@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+from _owner_platform import requires_linux_owner
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ENGRAM = str(REPO_ROOT / "src" / "engram")
 if _SRC_ENGRAM not in sys.path:
@@ -38,9 +40,12 @@ import engram_walguard  # noqa: E402
 import engramd_client as ec  # noqa: E402
 import engramd_owner as eo  # noqa: E402
 
-pytestmark = pytest.mark.skipif(
-    not sys.platform.startswith("linux"), reason="displacement detection is Linux-only (/proc)"
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not sys.platform.startswith("linux"), reason="displacement detection is Linux-only (/proc)"
+    ),
+    requires_linux_owner,
+]
 
 
 @pytest.fixture

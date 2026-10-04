@@ -31,6 +31,8 @@ from pathlib import Path
 
 import pytest
 
+from _owner_platform import requires_linux_owner
+
 _SRC_ENGRAM = str(Path(__file__).resolve().parent.parent / "src" / "engram")
 if _SRC_ENGRAM not in sys.path:
     sys.path.insert(0, _SRC_ENGRAM)
@@ -126,6 +128,7 @@ def _read(owner, sql, args, timeout=2.0):
 
 # --- O1 ----------------------------------------------------------------------
 
+@requires_linux_owner
 def test_o1_registered_template_returns_rows_equal_to_a_direct_ro_execution(real_owner):
     """Mutation: reverse the row order, drop a row, or turn a None cell into ''
     in the owner's `read` handler -> red. Non-vacuous: the store holds three
@@ -145,6 +148,7 @@ def test_o1_registered_template_returns_rows_equal_to_a_direct_ro_execution(real
     IDENTITY_SQL.lower(),
     IDENTITY_SQL.replace("= 1", "=  1"),
 ])
+@requires_linux_owner
 def test_o2_one_byte_mutation_is_rejected_unregistered_and_nothing_prepared(real_owner, mutated):
     """Reuses the R2 technique: a recording authorizer wrapped around the REAL
     client-read connection's own authorizer sees every statement preparation.
@@ -170,6 +174,7 @@ def test_o2_one_byte_mutation_is_rejected_unregistered_and_nothing_prepared(real
     {"sql": IDENTITY_SQL, "args": "notalist"},
     {"args": []},
 ])
+@requires_linux_owner
 def test_o2b_malformed_read_params_are_rejected_not_dropped(real_owner, params):
     """Mutation: let a malformed `read` raise in the handler (connection dropped
     -> the client sees Unavailable) -> red."""
@@ -180,6 +185,7 @@ def test_o2b_malformed_read_params_are_rejected_not_dropped(real_owner, params):
 
 # --- O3 (test 22's `read` half lives in test_engramd_owner.py, extended) -------
 
+@requires_linux_owner
 def test_o3_read_executes_on_the_client_read_connection_only(real_owner):
     """Behavioural half of O3 on a REAL schema: the answer is correct while
     `_owner_conn` is a tripwire, and the gate's own connection IS
@@ -203,6 +209,7 @@ def test_o3_read_executes_on_the_client_read_connection_only(real_owner):
 
 # --- O4 ----------------------------------------------------------------------
 
+@requires_linux_owner
 def test_o4_method_table_has_read_and_no_registration_verb(real_owner):
     """Static + live: `read` IS a method, nothing in the table or `_dispatch`
     literals is registration-shaped. Mutation: add a `register_template`
@@ -219,6 +226,7 @@ def test_o4_method_table_has_read_and_no_registration_verb(real_owner):
 
 # --- O5 ----------------------------------------------------------------------
 
+@requires_linux_owner
 def test_o5_bytes_cell_is_rejected_unsupported_value_type(home):
     """D2. Mutation: encode bytes (hex/base64/latin-1), or drop the cell, or
     let json.dumps raise -> red. The first person's `claim` is a BLOB."""
@@ -242,6 +250,7 @@ _BIG = (
 )
 
 
+@requires_linux_owner
 def test_o6_overrunning_read_gets_the_deadline_rejection_not_a_hang(real_owner):
     """The request deadline (0.6 s here) applies end to end to `read`: an
     expensive admitted statement is aborted and the client gets
@@ -260,6 +269,7 @@ def test_o6_overrunning_read_gets_the_deadline_rejection_not_a_hang(real_owner):
     assert elapsed < real_owner.request_deadline + 0.5, elapsed
 
 
+@requires_linux_owner
 def test_o6b_a_read_waiting_for_the_client_read_lock_stops_at_the_deadline(real_owner):
     """Reads share ONE connection, so the owner serialises them; the wait for
     that serialisation is bounded by the same deadline. Mutation: a bare
@@ -277,6 +287,7 @@ def test_o6b_a_read_waiting_for_the_client_read_lock_stops_at_the_deadline(real_
     assert elapsed < real_owner.request_deadline + 0.5, elapsed
 
 
+@requires_linux_owner
 def test_o6c_concurrent_reads_do_not_clear_each_others_deadline(real_owner):
     """Two clients at once, many times: every answer is the full correct row
     set. Mutation: drop the `_client_read_lock` around the gate call -> one
@@ -298,6 +309,7 @@ def test_o6c_concurrent_reads_do_not_clear_each_others_deadline(real_owner):
     assert failures == []
 
 
+@requires_linux_owner
 def test_o7_oversized_cell_is_a_loud_rejection_not_a_dropped_connection(home):
     """The client-read connection's SQLITE_LIMIT_LENGTH makes an over-limit
     cell raise sqlite3.DataError inside the handler. Mutation: let it escape
@@ -313,6 +325,7 @@ def test_o7_oversized_cell_is_a_loud_rejection_not_a_dropped_connection(home):
     assert result.reason == "read_failed"
 
 
+@requires_linux_owner
 def test_contract_version_is_1_1_on_the_wire_and_on_ping(real_owner):
     """D3: adding a method is a MINOR bump, in the one shared constant.
     Mutation: leave the constant at "1.0" -> red."""
@@ -344,6 +357,7 @@ def test_s3_bound_is_strictly_below_the_clients_cap():
     assert ec.MAX_RESPONSE_BYTES - eo.MAX_READ_RESPONSE_BYTES >= 1024 * 1024  # envelope headroom
 
 
+@requires_linux_owner
 def test_s3_a_result_over_the_bound_is_rejected_result_too_large_not_unavailable(home):
     """6 rows x ~1.9 MB = ~11 MB, over the client's 10 MiB cap: before the fix
     the client saw Unavailable and the hook told the agent to restart a
@@ -364,6 +378,7 @@ def test_s3_a_result_over_the_bound_is_rejected_result_too_large_not_unavailable
         owner.stop()
 
 
+@requires_linux_owner
 def test_s3_a_result_under_the_bound_still_returns_ok(home):
     """3 rows x ~1.9 MB = ~5.7 MB: over any naive small bound, under ours.
     Mutation: a bound far too tight (e.g. 1 MiB) -> red, so the bound is not
@@ -377,6 +392,7 @@ def test_s3_a_result_under_the_bound_still_returns_ok(home):
         owner.stop()
 
 
+@requires_linux_owner
 def test_s3_non_ascii_cells_are_measured_at_wire_size_not_utf8_size(home):
     """The bound is on the bytes the send path emits: json.dumps with the default
     ensure_ascii=True, so a CJK char is a 6-byte \\uXXXX escape on the wire but
@@ -417,6 +433,7 @@ class _RaisingGate:
     ("interrupted", "deadline_exceeded"),
     ("database is locked", "read_failed"),
 ])
+@requires_linux_owner
 def test_read_error_path_survives_a_python_without_sqlite_interrupt(real_owner, monkeypatch, message, reason):
     """`sqlite3.SQLITE_INTERRUPT` and `OperationalError.sqlite_errorcode` are
     3.11 additions; README-AGENT.md supports 3.10.7+. Simulated on any Python
@@ -432,6 +449,7 @@ def test_read_error_path_survives_a_python_without_sqlite_interrupt(real_owner, 
 
 # --- Root cause: an unexpected exception in a method is never a dead connection -------
 
+@requires_linux_owner
 def test_unexpected_exception_in_a_method_is_internal_error_and_the_owner_keeps_serving(
         real_owner, caplog):
     """`_handle_connection` used to have no catch-all around `_dispatch`, so any
@@ -462,6 +480,7 @@ def test_unexpected_exception_in_a_method_is_internal_error_and_the_owner_keeps_
     assert isinstance(ok, ec.Ok) and len(ok.result) == 3
 
 
+@requires_linux_owner
 def test_catch_all_does_not_swallow_baseexception_or_the_mapped_aborts(real_owner):
     """The wrap is `except Exception`: a BaseException (SystemExit /
     KeyboardInterrupt) raised by a method is NOT converted to a Rejected

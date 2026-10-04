@@ -36,6 +36,8 @@ from unittest.mock import patch
 
 import pytest
 
+from _owner_platform import requires_linux_owner
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ENGRAM = str(REPO_ROOT / "src" / "engram")
 if _SRC_ENGRAM not in sys.path:
@@ -178,6 +180,7 @@ CASES = [
 ]
 
 
+@requires_linux_owner
 @pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
 def test_c1_hook_output_is_identical_flag_off_vs_on(case, home, monkeypatch):
     """Whole-stdout, exception and sticky-marker equality, off vs on, on the
@@ -213,6 +216,7 @@ def _mutating_read(mutate):
 _SEVERAL = [SAM1, SAM2, DEE]
 _NULL_FIRST = [NULLMETA, ALICE]
 
+@requires_linux_owner
 @pytest.mark.parametrize("name,mutate,people,prompt,baseline_crashes", [
     ("drop-one-row", lambda rows: rows[1:], _SEVERAL, "sammy: hi", False),
     ("reorder-rows", lambda rows: list(reversed(rows)), _SEVERAL, "sammy: hi", False),
@@ -244,6 +248,7 @@ def test_c1_control_the_harness_goes_red_on_a_corrupted_owner_side(
     assert on != off, f"harness failed to notice the {name} corruption"
 
 
+@requires_linux_owner
 def test_c1_flag_on_really_reads_through_the_owner_not_the_old_path(home, monkeypatch):
     """Without this, the differential above would pass vacuously while the flag
     is a no-op (both sides the old path). Flag ON must send exactly the hook's
@@ -367,6 +372,7 @@ def test_c3_owner_down_is_loud_two_kinds_of_steps_and_never_opens_the_store(prom
     assert "Alice" not in ctx, "no identity may be announced from a failed read"
 
 
+@requires_linux_owner
 def test_c3_rejected_by_a_real_owner_is_loud_names_reason_and_remedy(home, monkeypatch):
     """A registry drift bug for real: the store has no `nodes` table, so the
     owner's registry drops the statement and answers unregistered_template.
@@ -568,6 +574,7 @@ def test_s1_subprocess_exit_code_is_the_normal_success_path(home):
 
 # --- S2 (round 2): the DEPLOYED (flattened) layout ---------------------------------
 
+@requires_linux_owner
 def test_s2_flattened_deployed_layout_resolves_engramd_client_and_reads_through_the_owner(home, tmp_path):
     """The plugin build flattens hooks/claude/* -> hooks/* (tiers.json `dest`),
     and puts the runtime modules at the plugin root: <root>/engramd_client.py,

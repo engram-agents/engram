@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+from _owner_platform import requires_linux_owner
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOOL_PATH = REPO_ROOT / "tools" / "engramd_a6_latency.py"
 
@@ -47,6 +49,7 @@ def smoke(tool):
     return tool.measure(n=20, nodes=300, warmup=5)
 
 
+@requires_linux_owner
 def test_launcher_argv_carries_the_owner_marker_and_the_process_is_real(tool):
     """#3285 obligation: the launched owner's REAL command line (read from
     /proc, not from the argv we built) contains `engramd_owner`, and it is a
@@ -65,6 +68,7 @@ def test_launcher_argv_carries_the_owner_marker_and_the_process_is_real(tool):
     assert handle.proc.poll() is not None
 
 
+@requires_linux_owner
 def test_every_arm_has_a_same_run_baseline_and_both_percentiles(smoke):
     """Mutation: drop the baseline arm of any pair, or omit p99 -> red."""
     arms = {(r["arm"], r["path"]): r for r in smoke["rows"]}
@@ -75,6 +79,7 @@ def test_every_arm_has_a_same_run_baseline_and_both_percentiles(smoke):
             assert 0 < r["p50_ms"] <= r["p99_ms"]
 
 
+@requires_linux_owner
 def test_the_owner_arm_returns_the_same_people_as_the_baseline_arm(smoke):
     """Anti-vacuity: a fast wrong/empty answer must not count as fast. Mutation:
     make the owner arm return [] without reading -> red."""
@@ -83,6 +88,7 @@ def test_the_owner_arm_returns_the_same_people_as_the_baseline_arm(smoke):
     assert smoke["owner_pid"] != os.getpid()
 
 
+@requires_linux_owner
 def test_the_table_names_host_python_and_sqlite_build(tool, smoke):
     """Mutation: omit any of the three -> red."""
     table = tool.format_table(smoke)
