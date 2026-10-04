@@ -260,8 +260,8 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 - **tests**: *(unverified)*
 
 **26. engram_query** — Voluntary semantic recall (deliberate search).
-- **contract**: `{query, [types, min_confidence, include_superseded, top_k, summary_top_k, return_debug]}`
-- **guards**: refreshes recall on matched nodes (strengthens memory — distinct from surface); tiered return (Tier 1 summaries / Tier 2 keywords); return_debug=True for full legacy shape (eval/harness)
+- **contract**: `{query, [types, min_confidence, include_superseded, top_k, summary_top_k, return_debug, refresh_recall]}`
+- **guards**: refreshes recall on matched nodes (strengthens memory — distinct from surface; `refresh_recall=false` = measurement mode, results and ranking identical but no re-stamp; a person node's special_moment render is also skipped, since it writes, for probes and harnesses only); tiered return (Tier 1 summaries / Tier 2 keywords); return_debug=True for full legacy shape (eval/harness)
 - **readOnlyHint**: True
 - **status-candidate**: PROD-VERIFIED
 - **tests**: test_query_tiers.py

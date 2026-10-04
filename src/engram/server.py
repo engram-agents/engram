@@ -2263,7 +2263,7 @@ def engram_inspect(payload_json: str) -> str:
 # Set of legitimate field names for the engram_query payload.
 _QUERY_FIELDS = frozenset({
     "query", "types", "min_confidence", "include_superseded",
-    "top_k", "return_debug", "summary_top_k",
+    "top_k", "return_debug", "summary_top_k", "refresh_recall",
 })
 
 
@@ -2333,6 +2333,14 @@ def engram_query(payload_json: str) -> str:
                 recall_keywords only (Tier 2). Default 3. Clamped to [0, top_k].
                 Set to 0 for all-keywords; set >= top_k for all-summaries.
                 Ignored when return_debug=True (full shape returned instead).
+            refresh_recall (bool, optional): Default True. False = measurement
+                mode: results and ranking identical (a person node's
+                special_moment render is also skipped, since it writes), but
+                surfaced nodes are NOT re-stamped (no importance / recall_turn /
+                recall_count change). For probes and harnesses; never for
+                ordinary recall. The response gains a top-level
+                "refresh_recall": false key only when False. Truthiness, like
+                return_debug: the string "false" is truthy and refreshes.
 
     Returns:
         Default (return_debug=False): tiered shape

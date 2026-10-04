@@ -2916,6 +2916,7 @@ def _query_impl(
     top_k: int = 10,
     return_debug: bool = False,
     summary_top_k: int = 3,
+    refresh_recall: bool = True,
 ) -> str:
     """Impl for engram_query — callable with named kwargs for in-server callers."""
     conn = core._get_db()
@@ -2960,8 +2961,11 @@ def _query_impl(
                 node["warnings"] = w
             output.append(node)
 
-        # Refresh recall for all accessed nodes.
-        if output:
+        # Refresh recall for all accessed nodes. refresh_recall=False is the
+        # read-only measurement mode (#3362): ranking above is already done and
+        # is unaffected; only the re-stamp write is skipped (mirrors
+        # engram_inspect's dream_mode skip).
+        if output and refresh_recall:
             accessed_ids = [n["id"] for n in output]
             _refresh_recall(conn, accessed_ids)
 
@@ -2987,6 +2991,7 @@ def _query_impl(
                     "result_count": len(output),
                     "type_filter": types or None,
                     "source_class_filter": None,
+                    "refresh_recall": bool(refresh_recall),
                 },
                 site="server.engram_query",
             )
@@ -3030,18 +3035,32 @@ def _query_impl(
             }
             if "debug" in search:
                 response_body["debug"] = search["debug"]
+            if not refresh_recall:
+                response_body["refresh_recall"] = False
             return json.dumps(core._strip_agent_facing(response_body))
 
         # Default path: tiered summary/keywords shape (Wave C recall_summary rollout).
         # Clamp summary_top_k to [0, len(output)] so callers don't have to worry
         # about off-by-one edge cases.
         effective_top_k = max(0, min(summary_top_k, len(output)))
-        tiered = _build_tiered_results(output, effective_top_k, conn=conn)
-        return json.dumps(core._strip_agent_facing({
+        # The default conn=conn lets a person node in the Tier-1 top-k go
+        # through _select_and_render_person_moment, which rotates
+        # metadata.special_moment_cursor (UPDATE + commit) and burns the
+        # cross-surface cooldown ledger -- a write. refresh_recall=False is
+        # the read-only measurement mode, so pass conn=None: person nodes then
+        # simply never attempt a moment (same as engram_query_pattern).
+        tiered = _build_tiered_results(
+            output, effective_top_k,
+            conn=conn if refresh_recall else None,
+        )
+        tiered_body = {
             "results": tiered,
             "query": query,
             "total_matches": len(output),
-        }))
+        }
+        if not refresh_recall:
+            tiered_body["refresh_recall"] = False
+        return json.dumps(core._strip_agent_facing(tiered_body))
     finally:
         conn.close()
 
