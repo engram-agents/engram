@@ -6611,6 +6611,12 @@ def _real_forum_client(tmp_path) -> _RealForumClientAdapter:
     if sys.path[:1] != [_SRC_DIR]:
         sys.path.insert(0, _SRC_DIR)
 
+    # forum.server pulls forum.db, render and flask; skip when a third-party dep
+    # is absent (tests/_forum_deps.py), keep internal ImportErrors loud.
+    from _forum_deps import import_forum_or_skip
+
+    import_forum_or_skip("forum.server")
+
     from forum.coordination import SeqAllocator
     from forum.coordination.store_file import FileStore
     from forum.db import init_db

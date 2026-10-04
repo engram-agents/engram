@@ -67,7 +67,12 @@ if _cached_forum is not None:
         ]:
             del sys.modules[_stale]
 
-from forum import db
+# forum/db.py imports .render, which needs third-party deps from
+# src/forum/requirements.txt. Skip the module when any is absent (derived from
+# the failing import, see tests/_forum_deps.py) rather than aborting collection.
+from _forum_deps import import_forum_or_skip  # noqa: E402
+
+db = import_forum_or_skip("forum.db")
 
 
 # ---------------------------------------------------------------------------
