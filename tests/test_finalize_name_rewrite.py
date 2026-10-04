@@ -24,6 +24,7 @@ Synthetic identifiers used throughout:
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -757,6 +758,31 @@ class TestGenericity:
 # Step 7 viz-ACL counter regression tests
 # ---------------------------------------------------------------------------
 
+def _write_mock_setfacl(tmp_path: Path, exits: dict) -> Path:
+    """Write a mock setfacl (POSIX sh) whose exit code is keyed on the target's basename.
+
+    POSIX sh on purpose: macOS /bin/bash is 3.2, which has no `declare -A`
+    (#3292). The -R flag doesn't change the basename, so the mock keys on the
+    last arg, read portably with `for target; do :; done`. Keys are dir
+    basenames, emitted as case patterns quoted with shlex.quote so a key holding
+    a single quote or a glob character matches literally.
+    """
+    arms = "".join(f"    {shlex.quote(k)}) exit {int(v)};;\n" for k, v in exits.items())
+    mock_setfacl = tmp_path / "setfacl"
+    mock_setfacl.write_text(
+        "#!/bin/sh\n"
+        "# Last arg is the target path; look up exit code by basename.\n"
+        "for target; do :; done\n"
+        "base=$(basename \"$target\")\n"
+        "case \"$base\" in\n"
+        f"{arms}"
+        "esac\n"
+        "exit 0\n"
+    )
+    mock_setfacl.chmod(0o755)
+    return mock_setfacl
+
+
 def _step7_acl_loop(tmp_path: Path, dirs: list, setfacl_exits: dict | None = None) -> subprocess.CompletedProcess:
     """Run the Step 7 ACL-counter loop in a bash subshell.
 
@@ -771,18 +797,7 @@ def _step7_acl_loop(tmp_path: Path, dirs: list, setfacl_exits: dict | None = Non
     for d in dirs:
         (tmp_path / d).mkdir(exist_ok=True)
 
-    # Write a mock setfacl that reads its exit code from a per-dir file.
-    # The -R flag doesn't change the basename, so we key on the last path arg.
-    mock_setfacl = tmp_path / "setfacl"
-    mock_setfacl.write_text(
-        "#!/bin/bash\n"
-        "# Last arg is the target path; look up exit code by basename.\n"
-        "target=\"${@: -1}\"\n"
-        "base=$(basename \"$target\")\n"
-        f"declare -A exits=({' '.join(f'[{k}]={v}' for k, v in setfacl_exits.items())})\n"
-        "exit \"${exits[$base]:-0}\"\n"
-    )
-    mock_setfacl.chmod(0o755)
+    _write_mock_setfacl(tmp_path, setfacl_exits)
 
     script = f"""
 _step7_test() {{
@@ -803,6 +818,42 @@ export PATH="{tmp_path}:$PATH"
 _step7_test
 """
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+
+class TestMockSetfaclIsPosixSh:
+    """The mock setfacl must run under a POSIX sh (macOS bash 3.2 has no
+    `declare -A`; #3292). Run it directly with /bin/sh, not via bash.
+
+    The skip guard below fires only where /bin/sh resolves (as a symlink) to
+    bash or zsh. On macOS /bin/sh is a real binary that dispatches via
+    /private/var/select/sh to bash 3.2, so realpath is /bin/sh and the test
+    RUNS there, under bash-3.2-in-sh-mode: that catches bash-4 constructs
+    (e.g. `declare -A`) but not bash-isms bash 3.2 accepts. dash on Linux CI
+    is the strict check."""
+
+    @pytest.mark.parametrize(
+        "key,exits,want",
+        [
+            (".engram", {".engram": 1}, 1),
+            (".engram", {".engram": 0}, 0),
+            (".engram-x", {".engram": 1}, 0),
+            ("a'b", {"a'b": 1, ".e*": 1}, 1),
+            (".engram-x", {"a'b": 1, ".e*": 1}, 0),
+        ],
+        ids=["mapped-to-1", "mapped-to-0", "unmapped", "quote-key-matches", "glob-key-literal"],
+    )
+    def test_mock_exit_codes_under_bin_sh(self, tmp_path, key, exits, want):
+        if os.path.basename(os.path.realpath("/bin/sh")) in ("bash", "zsh"):
+            pytest.skip("/bin/sh is a symlink to bash/zsh here; this test would not discriminate")
+        mock = _write_mock_setfacl(tmp_path, exits)
+        target = tmp_path / key
+        target.mkdir()
+        r = subprocess.run(
+            ["/bin/sh", str(mock), "-R", "-m", "u:x:rX", str(target)],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == want, f"stderr: {r.stderr}"
+        assert r.stderr == "", f"mock must be silent: {r.stderr}"
 
 
 class TestStep7VizAclCounter:
