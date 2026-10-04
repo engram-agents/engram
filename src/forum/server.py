@@ -1235,8 +1235,8 @@ def _anchor_refusal(route: str, pid: str, store, new_anchor: str,
 
     if not gate._GITHUB_ANCHOR_RE.match(new_norm):
         return (
-            f"{route} {pid}: invalid github anchor {new_anchor!r}. Expected pr/<N>, "
-            "pr/<owner>/<repo>/<N>, or project/<N> (e.g. pr/490, pr/example-org/example-repo/22, "
+            f"{route} {pid}: invalid github anchor {new_anchor!r}. Accepted forms: "
+            f"{gate.GITHUB_ANCHOR_ACCEPTED_FORMS} (e.g. pr/490, pr/example-org/example-repo/22, "
             "project/4).", 422)
 
     # Round 9 (B1): id-bind the anchor where it is WRITTEN (fairy / legacy / bunch
