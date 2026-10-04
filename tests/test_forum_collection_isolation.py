@@ -15,6 +15,14 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
+# These cells run the forum test files in a subprocess; without the forum's
+# third-party deps every test in the subprocess skips (pytest exit 5), so the
+# cells cannot hold. Skip the whole module in that case (#3381 follow-up).
+sys.path.insert(0, str(REPO / "src"))
+from _forum_deps import import_forum_or_skip  # noqa: E402
+
+import_forum_or_skip("forum.db")
+
 
 def _run(args, *, code=None):
     cmd = [sys.executable] + (["-c", code] if code else ["-m", "pytest"] + args)
