@@ -76,11 +76,13 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import shutil
 import socket as socket_mod
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -137,6 +139,37 @@ _MISSING_STAT_PRIMITIVE = _missing_stat_primitive()
 _NEEDS_GNU_STAT = pytest.mark.skipif(
     bool(_MISSING_STAT_PRIMITIVE),
     reason="needs GNU `stat -c` (absent on this host)",
+)
+
+def _missing_live_guard_primitives() -> list[str]:
+    """What the LIVE script's guard needs on THIS host (#3333 follow-up):
+    an identity snapshot method (GNU `stat -c` or BSD `stat -f`) and a
+    live-holder method (/proc/net/unix + /proc/<pid>/fd, or `lsof`). Unlike
+    _missing_guard_primitives (which names the GNU-only primitives the
+    frozen pre-fold script copies still need), this is what the shipped
+    script itself needs, so cells exercising the live script run on Darwin
+    as well as Linux."""
+    missing = []
+    stat_ok = False
+    for argv in (["stat", "-c", "%d:%i:%W", "/"], ["stat", "-f", "%d:%i", "/"]):
+        try:
+            if subprocess.run(argv, capture_output=True, timeout=5).returncode == 0:
+                stat_ok = True
+                break
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if not stat_ok:
+        missing.append("a usable `stat` (GNU -c or BSD -f)")
+    has_proc = Path("/proc/net/unix").exists() and os.path.isdir("/proc/self/fd")
+    if not has_proc and shutil.which("lsof") is None:
+        missing.append("/proc/net/unix or `lsof`")
+    return missing
+
+
+_MISSING_LIVE_GUARD_PRIMITIVES = _missing_live_guard_primitives()
+_NEEDS_LIVE_GUARD_PRIMITIVES = pytest.mark.skipif(
+    bool(_MISSING_LIVE_GUARD_PRIMITIVES),
+    reason="needs " + ", ".join(_MISSING_LIVE_GUARD_PRIMITIVES) + " (live socket-ownership guard)",
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -693,6 +726,9 @@ exit 0
 """
 
 
+_HAS_PROC = Path("/proc/net/unix").exists()
+
+
 def _spawn_sleeper(seconds: float = 8.0):
     """A real, short-lived subprocess with a genuine, confirmable PID
     (mirrors tests/test_surface_daemon_pid_reap.py's and
@@ -854,7 +890,7 @@ class _SocketGuardFixture(unittest.TestCase):
         srv.listen(1)
         return srv
 
-    def _spawn_holder_process(self, *, match_reap_pattern: bool) -> subprocess.Popen:
+    def _spawn_holder_process(self, *, match_reap_pattern: bool, ignore_sigterm: bool = False, pad_argv: str = "") -> subprocess.Popen:
         """A real subprocess that binds+listens on self.socket_path itself
         (not this test process, so the socket's owning pid is genuinely a
         different, killable/unkillable process). If match_reap_pattern,
@@ -865,13 +901,16 @@ class _SocketGuardFixture(unittest.TestCase):
         daemon launched by a different surface, invisible to this hook's
         own reap pattern)."""
         holder_src = (
-            "import socket, sys, time\n"
-            "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+            "import signal, socket, sys, time\n"
+            + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_sigterm else "")
+            + "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
             f"s.bind({str(self.socket_path)!r})\n"
             "s.listen(1)\n"
             "time.sleep(20)\n"
         )
         argv = [sys.executable, "-c", holder_src]
+        if pad_argv:
+            argv.append(pad_argv)  # inert extra argv (sys.argv[1]) to lengthen the cmdline
         if match_reap_pattern:
             argv += ["engram-surface-daemon.py", str(self.engram_home)]
         proc = subprocess.Popen(argv)
@@ -973,6 +1012,11 @@ class TestOrphanedSocketAllowsDelete(_ForceUnsupervisedMixin, _SocketGuardFixtur
         self.assertEqual(result.returncode, 0, result.stderr)
         content = "\n".join(self._log_lines())
 
+        if not _HAS_PROC:
+            # No /proc: the guard is refuse-only (lsof rc 1 is UNKNOWN).
+            self.assertTrue(self.socket_path.exists())
+            self.assertIn("socket-guard: refusing", content)
+            return
         self.assertNotIn("socket-guard", content)
         self.assertTrue(self._wait_for_relaunch_marker())
         # The stub daemon never re-binds a socket, so the orphan's removal
@@ -1005,6 +1049,14 @@ class TestHeldByKilledPidAllowsDelete(_ForceUnsupervisedMixin, _SocketGuardFixtu
         content = "\n".join(self._log_lines())
 
         self.assertRegex(content, re.compile(r"reap matched 1 stale process\(es\):"))
+        if not _HAS_PROC:
+            # No /proc: real lsof reports rc 1 after the holder exits, which
+            # is UNKNOWN -> refuse-only (the exempt-and-removed path is
+            # covered with a shim in the C6 cells).
+            self.holder.wait(timeout=3)
+            self.assertTrue(self.socket_path.exists())
+            self.assertIn("socket-guard: refusing", content)
+            return
         self.assertNotIn("socket-guard", content)
         self.assertTrue(self._wait_for_relaunch_marker())
 
@@ -1059,7 +1111,7 @@ class TestUnknownOwnerNotMatchedByReap(_ForceUnsupervisedMixin, _SocketGuardFixt
         self._seeded_dead_pid = self._dead_pid()
         self.pid_path.write_text(str(self._seeded_dead_pid))
 
-    @_NEEDS_GUARD_PRIMITIVES
+    @_NEEDS_LIVE_GUARD_PRIMITIVES
     def test_socket_preserved_holder_alive_and_functional_reported(self):
         result = self._run()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1106,7 +1158,7 @@ class TestUnknownOwnerNotMatchedByReap(_ForceUnsupervisedMixin, _SocketGuardFixt
         self.assertIn(f"held by pid {self.holder.pid}", content)
         self.assertIn("not matched by the reap loop for this invocation", content)
 
-    @_NEEDS_GUARD_PRIMITIVES
+    @_NEEDS_LIVE_GUARD_PRIMITIVES
     def test_next_launch_backs_off_instead_of_stealing(self):
         """The actual regression test for the reviewer-fairy's finding on
         PR #2687: after the shell guard refuses (PID_PATH and SOCKET_PATH
@@ -1139,6 +1191,10 @@ class TestUnknownOwnerNotMatchedByReap(_ForceUnsupervisedMixin, _SocketGuardFixt
         falsification control, which proves the pre-fold answer was
         "stole" without needing this substitution (there, $PID_PATH is
         gone outright, not merely differently-seeded)."""
+        # C8 note: the hook now refuses to LAUNCH at all after a refusal
+        # (see TestSocketGuardPortableContract C8 cells), so this "next
+        # launch" is hypothetical for the hook; the cell still pins the
+        # daemon-side gate's behaviour on the preserved on-disk state.
         result = self._run()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.pid_path.exists(), "guard must have preserved PID_PATH first")
@@ -1251,7 +1307,7 @@ class TestRaceDetectionBlocksEvenWithoutALiveHolder(_ForceUnsupervisedMixin, _So
         hook_path.chmod(hook_path.stat().st_mode | stat.S_IXUSR)
         self.hook_path = hook_path
 
-    @_NEEDS_GUARD_PRIMITIVES
+    @_NEEDS_LIVE_GUARD_PRIMITIVES
     def test_race_blocks_delete_and_reports_even_with_no_live_holder(self):
         result = self._run(extra_env={"_UNIT2_TEST_RACE_HOOK": str(self.hook_path)})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1275,6 +1331,11 @@ class TestRaceDetectionBlocksEvenWithoutALiveHolder(_ForceUnsupervisedMixin, _So
         self.assertEqual(result.returncode, 0, result.stderr)
         content = "\n".join(self._log_lines())
 
+        if not _HAS_PROC:
+            # No /proc: refuse-only guard keeps the orphan.
+            self.assertTrue(self.socket_path.exists())
+            self.assertIn("socket-guard: refusing", content)
+            return
         self.assertNotIn("socket-guard", content)
         self.assertFalse(self.socket_path.exists())
 
@@ -1581,6 +1642,586 @@ class TestFrozenBaselineSanity(unittest.TestCase):
         self.assertIsNotNone(live_match)
         self.assertIsNotNone(frozen_match)
         self.assertEqual(live_match.group(1), frozen_match.group(1))
+
+
+# ===========================================================================
+# #3333 follow-up -- the guard must not FAIL OPEN where GNU `stat -c` and
+# /proc are absent (macOS). Contract (C1-C4), written before the fix:
+#   C1  socket on disk but identity snapshot unobtainable -> never "nothing
+#       on disk"; snapshot portably or refuse (keep both files, log it).
+#   C2  live holder not in the reap-killed set -> keep SOCKET_PATH and
+#       PID_PATH, log `socket-guard: refusing ...` -- Linux AND Darwin.
+#   C3  orphan socket -> still removed (socket + pidfile). No /proc: holder
+#       via `lsof`; neither /proc nor lsof -> refuse (fail closed).
+#   C4  path absent -> no-op.
+# These cells carry NO GNU/Linux skip: they run on whatever host has a
+# usable identity + holder method, i.e. on Darwin too.
+# ===========================================================================
+
+
+class TestSocketGuardPortableContract(_ForceUnsupervisedMixin, _SocketGuardFixture):
+    def setUp(self):
+        super().setUp()
+        self.pid_path.write_text(str(self._dead_pid()))
+        self._seeded_pid_text = self.pid_path.read_text()
+
+    def _install_unusable_stat(self):
+        """A `stat` earlier on PATH that fails for every flag, standing in
+        for a host whose stat speaks neither dialect the guard tries."""
+        shim = self._fake_systemctl_dir / "stat"
+        shim.write_text("#!/bin/sh\necho 'stat: unusable' >&2\nexit 1\n")
+        shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+
+    def _orphan(self):
+        srv = self._bind_listening_socket()
+        srv.close()
+        self.assertTrue(self.socket_path.exists())
+
+    def _assert_kept(self, content):
+        self.assertTrue(self.socket_path.exists(), "socket must be kept\n" + content)
+        self.assertTrue(self.pid_path.exists(), "pidfile must be kept\n" + content)
+        self.assertEqual(self.pid_path.read_text(), self._seeded_pid_text)
+
+    # -- C1 -----------------------------------------------------------------
+    def test_c1_unreadable_identity_orphan_is_kept_not_treated_as_absent(self):
+        self._orphan()
+        self._install_unusable_stat()
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self.assertIn("socket-guard: refusing", content)
+
+    def test_c1_unreadable_identity_live_holder_is_kept(self):
+        holder = self._spawn_holder_process(match_reap_pattern=False)
+        self._install_unusable_stat()
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self.assertIn("socket-guard: refusing", content)
+        self.assertIsNone(holder.poll())
+        self.assertTrue(self._socket_still_functional())
+
+    # -- C2 -----------------------------------------------------------------
+    @_NEEDS_LIVE_GUARD_PRIMITIVES
+    def test_c2_live_unmatched_holder_keeps_socket_and_pidfile(self):
+        holder = self._spawn_holder_process(match_reap_pattern=False)
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self.assertRegex(content, re.compile(r"reap matched none"))
+        self._assert_kept(content)
+        self.assertIn("socket-guard: refusing", content)
+        self.assertIn(f"held by pid {holder.pid}", content)
+        self.assertIsNone(holder.poll())
+        self.assertTrue(self._socket_still_functional())
+
+    # -- C3 -----------------------------------------------------------------
+    @_NEEDS_LIVE_GUARD_PRIMITIVES
+    @pytest.mark.skipif(
+        not Path("/proc/net/unix").exists(),
+        reason="no /proc: the guard is refuse-only (lsof rc 1 is UNKNOWN); see the C5 cells",
+    )
+    def test_c3_orphan_socket_and_pidfile_are_removed(self):
+        self._orphan()
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self.assertNotIn("socket-guard", content)
+        self.assertTrue(self._wait_for_relaunch_marker())
+        self.assertFalse(self.socket_path.exists(), "orphan socket must be removed")
+        self.assertFalse(self.pid_path.exists(), "pidfile must be removed with the orphan")
+
+    @pytest.mark.skipif(
+        Path("/proc/net/unix").exists(),
+        reason="host has /proc; this cell is the no-/proc-no-lsof case",
+    )
+    def test_c3_no_proc_and_no_lsof_refuses_fail_closed(self):
+        self._orphan()
+        # PATH without lsof (macOS keeps it in /usr/sbin, not /usr/bin).
+        if shutil.which("lsof", path=f"{self._fake_systemctl_dir}:/usr/bin:/bin"):
+            self.skipTest("lsof is on the minimal PATH of this host")
+        result = self._run(extra_env={"PATH": f"{self._fake_systemctl_dir}:/usr/bin:/bin"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self.assertIn("socket-guard: refusing", content)
+        self.assertIn("lsof", content)
+
+    # -- C3b: lsof rc 0 with NO pid is not "orphan" -----------------------
+    # CONTRACT: only rc 1 + empty stdout means orphan; rc 0 + no pid
+    # contradicts itself, so keep socket AND pidfile and log a refusal.
+    def _install_lsof_rc0_no_pid(self):
+        shim = self._fake_systemctl_dir / "lsof"
+        shim.write_text("#!/bin/sh\nexit 0\n")
+        shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+
+    @pytest.mark.skipif(
+        Path("/proc/net/unix").exists(),
+        reason="host has /proc; the lsof branch is only reached without it",
+    )
+    def test_c3b_lsof_rc0_no_pid_orphan_socket_is_kept(self):
+        self._orphan()
+        self._install_lsof_rc0_no_pid()
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self.assertIn("socket-guard: refusing", content)
+
+    @pytest.mark.skipif(
+        Path("/proc/net/unix").exists(),
+        reason="host has /proc; the lsof branch is only reached without it",
+    )
+    def test_c3b_lsof_rc0_no_pid_live_decoy_holder_is_kept(self):
+        holder = self._spawn_holder_process(match_reap_pattern=False)
+        self._install_lsof_rc0_no_pid()
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self.assertIn("socket-guard: refusing", content)
+        self.assertIsNone(holder.poll())
+        self.assertTrue(self._socket_still_functional())
+
+    # -- C5: lsof rc 1 + empty stdout is NOT by itself an orphan -----------
+    # CONTRACT (revised): on the no-/proc (lsof) branch lsof rc 1 is UNKNOWN,
+    # never "orphan" (incomplete searches also exit 1; a connect() probe
+    # cannot prove absence). Removal needs rc 0 with every pid a reap-killed
+    # pid that has exited. Orphan cleanup is unavailable there: refuse.
+    def _install_lsof(self, *, stderr_text="", rc=1, stdout_text=""):
+        shim = self._fake_systemctl_dir / "lsof"
+        lines = ["#!/bin/sh"]
+        if stdout_text:
+            lines.append(f"echo {stdout_text}")
+        if stderr_text:
+            lines.append(f"echo '{stderr_text}' >&2")
+        lines.append(f"exit {rc}")
+        shim.write_text("\n".join(lines) + "\n")
+        shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+
+    _NO_PROC = pytest.mark.skipif(
+        Path("/proc/net/unix").exists(),
+        reason="host has /proc; the lsof branch is only reached without it",
+    )
+
+    @_NO_PROC
+    def test_c5_i_lsof_rc1_empty_stdout_with_stderr_live_holder_is_kept(self):
+        holder = self._spawn_holder_process(match_reap_pattern=False)
+        self._install_lsof(stderr_text="lsof: WARNING: Permission denied")
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self.assertIn("socket-guard: refusing", content)
+        self.assertIsNone(holder.poll())
+        self.assertTrue(self._socket_still_functional())
+
+    @_NO_PROC
+    def test_c5_ii_lsof_blind_rc1_empty_both_live_holder_is_kept(self):
+        holder = self._spawn_holder_process(match_reap_pattern=False)
+        self._install_lsof()
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self.assertIn("socket-guard: refusing", content)
+        self.assertIsNone(holder.poll())
+        self.assertTrue(self._socket_still_functional())
+
+    @_NO_PROC
+    def test_c5_iii_lsof_rc1_empty_both_genuine_orphan_is_kept_with_reason(self):
+        # Deliberately retires "orphan removed on no-/proc hosts".
+        self._orphan()
+        self._install_lsof()
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self.assertIn("socket-guard: refusing", content)
+        self.assertIn("lsof exited 1", content)
+
+    # -- C6: a signaled pid is exempt only once it has actually exited -----
+    def _reap_in_background(self, proc):
+        # The holder is this test's child; the script kills it, and a
+        # zombie still answers kill(pid, 0). Reap it like a real parent.
+        t = threading.Thread(target=proc.wait, daemon=True)
+        t.start()
+
+    @_NO_PROC
+    def test_c6_iv_killed_pid_that_ignores_sigterm_is_still_a_live_holder(self):
+        holder = self._spawn_holder_process(match_reap_pattern=True, ignore_sigterm=True)
+        self._install_lsof(stdout_text=str(holder.pid), rc=0)
+        result = self._run(timeout=20.0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self.assertRegex(content, re.compile(r"reap matched 1 stale process\(es\):"))
+        self._assert_kept(content)
+        self.assertIn("socket-guard: refusing", content)
+        self.assertIn("still alive", content)
+        self.assertIsNone(holder.poll(), "the SIGTERM-ignoring holder must still be running")
+
+    @_NO_PROC
+    def test_c6_v_killed_pid_that_exits_is_exempt_and_socket_removed(self):
+        holder = self._spawn_holder_process(match_reap_pattern=True)
+        self._reap_in_background(holder)
+        self._install_lsof(stdout_text=str(holder.pid), rc=0)
+        result = self._run(timeout=20.0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self.assertNotIn("socket-guard", content)
+        self.assertTrue(self._wait_for_relaunch_marker())
+        self.assertFalse(self.socket_path.exists(), "socket held by an exited killed pid must be removed")
+        self.assertFalse(self.pid_path.exists())
+
+    # -- C6 on the /proc branch (#3360): same "signaled is not killed" rule --
+    # Linux only (needs /proc/net/unix); UNRUN on Darwin -- needs a Linux run.
+    _HAS_PROC = pytest.mark.skipif(
+        not Path("/proc/net/unix").exists(),
+        reason="the /proc holder branch is only reached on hosts with /proc/net/unix",
+    )
+
+    @_HAS_PROC
+    def test_c6_proc_iv_killed_pid_that_ignores_sigterm_is_still_a_live_holder(self):
+        holder = self._spawn_holder_process(match_reap_pattern=True, ignore_sigterm=True)
+        result = self._run(timeout=20.0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self.assertRegex(content, re.compile(r"reap matched 1 stale process\(es\):"))
+        self._assert_kept(content)
+        self.assertIn("still alive", content)
+        self._assert_no_launch(content)
+        self.assertIsNone(holder.poll(), "the SIGTERM-ignoring holder must still be running")
+
+    @_HAS_PROC
+    def test_c6_proc_v_killed_pid_that_exits_is_exempt_and_socket_removed(self):
+        holder = self._spawn_holder_process(match_reap_pattern=True)
+        self._reap_in_background(holder)
+        result = self._run(timeout=20.0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self.assertNotIn("socket-guard", content)
+        self.assertTrue(self._wait_for_relaunch_marker())
+        self.assertFalse(self.socket_path.exists(), "socket held by an exited killed pid must be removed")
+        self.assertFalse(self.pid_path.exists())
+
+    # -- C6 shared-FD (Mira): EVERY holder of the inode must be judged -----
+    # CONTRACT: on the /proc branch removal is authorized only if every
+    # process holding every matching inode is a reap-killed pid that has
+    # exited. A listening socket FD inherited by an exec'd child that the
+    # reap pattern does NOT match must keep socket + pidfile and block the
+    # launch, even though the reap-matched parent holding the same inode
+    # exits. UNRUN on Darwin (needs /proc/net/unix): a Linux run is required.
+    def _spawn_shared_fd_parent(self, *, child_matches_reap_pattern: bool, barrier: Path | None):
+        """A reap-matched parent that binds+listens on the guard's
+        SOCKET_PATH, then spawns a child inheriting the listening FD. Returns
+        (parent_popen, child_pid). With a barrier path the parent exits only
+        after (a) SIGTERM arrived and (b) that file exists, so the test
+        controls WHEN the parent dies relative to the guard's holder
+        enumeration. Without one it dies on SIGTERM at once (SIGCHLD ignored
+        so a dying child never lingers as a zombie)."""
+        src = (
+            "import os, signal, socket, subprocess, sys, time\n"
+            "home = sys.argv[-1]\n"
+            f"path = {str(self.socket_path)!r}\n"
+            f"barrier = {str(barrier) if barrier else ''!r}\n"
+            "signal.signal(signal.SIGCHLD, signal.SIG_IGN)\n"
+            "got = []\n"
+            "if barrier:\n"
+            "    signal.signal(signal.SIGTERM, lambda *a: got.append(1))\n"
+            "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+            "s.bind(path)\n"
+            "s.listen(1)\n"
+            "argv = [sys.executable, '-c', 'import time; time.sleep(30)']\n"
+            f"if {child_matches_reap_pattern!r}:\n"
+            "    argv += ['engram-surface-daemon.py', home]\n"
+            "child = subprocess.Popen(argv, pass_fds=[s.fileno()], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)\n"
+            "print(child.pid, flush=True)\n"
+            "while True:\n"
+            "    if barrier and got and os.path.exists(barrier):\n"
+            "        os._exit(0)\n"
+            "    time.sleep(0.02)\n"
+        )
+        parent = subprocess.Popen(
+            [sys.executable, "-c", src, "engram-surface-daemon.py", str(self.engram_home)],
+            stdout=subprocess.PIPE, text=True,
+        )
+        self._extra_cleanups.append(lambda: self._kill_proc(parent))
+        child_pid = int(parent.stdout.readline().strip())
+
+        def _kill_child():
+            try:
+                os.kill(child_pid, 9)
+            except OSError:
+                pass
+
+        self._extra_cleanups.append(_kill_child)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not self.socket_path.exists():
+            time.sleep(0.05)
+        self.assertTrue(self.socket_path.exists(), "test setup: parent did not bind in time")
+        self._reap_in_background(parent)
+        return parent, child_pid
+
+    @_HAS_PROC
+    def test_c6_proc_vi_shared_fd_unmatched_child_keeps_socket_when_parent_exits(self):
+        barrier = self.tmp / "holder-selected.barrier"
+        # Barrier WITHOUT a hook in the shipped script: patch the TEMP COPY
+        # the test runs, right after the guard's holder enumeration/selection
+        # (the fixed script's `holders = find_holders(inode)`, or the
+        # pre-fix `holder_pid, was_killed = find_holder(inode)`), so the
+        # parent exits only AFTER the guard has chosen what to judge. Exactly
+        # one match, so the patch cannot silently go stale.
+        text = self.script.read_text()
+        pattern = re.compile(
+            r"^    (?:holders = find_holders|holder_pid, was_killed = find_holder)\(inode\)\n",
+            re.MULTILINE,
+        )
+        self.assertEqual(len(pattern.findall(text)), 1)
+        patched, n = pattern.subn(
+            lambda m: m.group(0) + f"    open({str(barrier)!r}, 'w').close()\n", text,
+        )
+        self.assertEqual(n, 1)
+        self.script.write_text(patched)
+
+        parent, child_pid = self._spawn_shared_fd_parent(
+            child_matches_reap_pattern=False, barrier=barrier,
+        )
+        result = self._run(timeout=20.0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self.assertRegex(content, re.compile(r"reap matched 1 stale process\(es\):"))
+        self.assertTrue(barrier.exists(), "the guard never reached holder enumeration\n" + content)
+        self.assertTrue(self._wait_for(lambda: parent.poll() is not None), "the reap-matched parent must have exited")
+        # The parent (the reap-matched holder) is gone; the unmatched child
+        # still holds the inherited listener.
+        os.kill(child_pid, 0)  # raises if the child is not alive
+        self._assert_kept(content)
+        self._assert_no_launch(content)
+        self.assertIn(f"held by pid {child_pid}", content)
+        self.assertTrue(self._socket_still_functional())
+
+    @_HAS_PROC
+    def test_c6_proc_vii_control_two_killed_holders_both_exit_removes_and_launches(self):
+        parent, child_pid = self._spawn_shared_fd_parent(
+            child_matches_reap_pattern=True, barrier=None,
+        )
+        result = self._run(timeout=20.0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self.assertRegex(content, re.compile(r"reap matched 2 stale process\(es\):"))
+        self.assertNotIn("socket-guard", content)
+        self.assertTrue(self._wait_for_relaunch_marker())
+        self.assertFalse(self.socket_path.exists())
+        self.assertFalse(self.pid_path.exists())
+
+    @staticmethod
+    def _wait_for(pred, timeout: float = 5.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if pred():
+                return True
+            time.sleep(0.05)
+        return False
+
+    # -- C7: BSD `stat -f` fallback output must be dev:inode ---------------
+    def test_c7_stat_f_multiline_junk_is_not_an_identity(self):
+        self._orphan()
+        shim = self._fake_systemctl_dir / "stat"
+        shim.write_text(
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            "  -c) echo 'stat: illegal option' >&2; exit 1;;\n"
+            "  -f) printf '  File: x\\n    ID: 1 Namelen: 255\\n'; exit 0;;\n"
+            "esac\nexit 1\n"
+        )
+        shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self.assertIn("socket-guard: refusing", content)
+        # Discriminating: junk must be rejected at the identity step (C1
+        # reason). If the C7 pattern were removed the junk would be accepted
+        # as an identity, fall through to the holder check, and still log
+        # "refusing" -- but never this C1-only reason text.
+        self.assertIn("on-disk identity could not be read", content)
+
+    # -- C8: UNKNOWN OWNER -> no launch, no launch-attempt stamp, one line --
+    # CONTRACT: whenever the guard refuses (any branch), the hook must not
+    # start a daemon (its own startup gate would steal the socket from the
+    # live holder), must not stamp daemon-launch-attempt, must log exactly
+    # ONE `socket-guard:` line naming the holder (when known) and the
+    # restore path, and must exit 0.
+    def _assert_no_launch(self, content):
+        # The launch is backgrounded: give a (wrongly) started stub time to
+        # write its marker before asserting its absence.
+        time.sleep(1.5)
+        self.assertFalse(self._relaunch_happened(), "no daemon may be launched\n" + content)
+        self.assertFalse(
+            (self.engram_home / "daemon-launch-attempt").exists(),
+            "no launch attempt may be stamped",
+        )
+        lines = [ln for ln in self._log_lines() if "socket-guard:" in ln]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("NOT launching", lines[0])
+        self.assertIn("by hand", lines[0])
+
+    @_NEEDS_LIVE_GUARD_PRIMITIVES
+    def test_c8_live_unmatched_holder_dead_pid_no_launch_no_stamp(self):
+        holder = self._spawn_holder_process(match_reap_pattern=False)
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self._assert_no_launch(content)
+        self.assertIn(f"held by pid {holder.pid}", content)
+        self.assertIsNone(holder.poll())
+        self.assertTrue(self._socket_still_functional())
+
+    @_NEEDS_LIVE_GUARD_PRIMITIVES
+    def test_c8_live_unmatched_holder_missing_pidfile_no_launch_no_stamp(self):
+        holder = self._spawn_holder_process(match_reap_pattern=False)
+        self.pid_path.unlink()
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self.assertTrue(self.socket_path.exists())
+        self._assert_no_launch(content)
+        self.assertIn(f"held by pid {holder.pid}", content)
+
+    def test_c8_unreadable_identity_no_launch_no_stamp(self):
+        self._orphan()
+        self._install_unusable_stat()
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self._assert_no_launch(content)
+
+    def test_c8_holder_check_nonzero_with_no_output_names_the_rc(self):
+        # The holder check's interpreter cannot run (rc 127, no stdout): the
+        # refusal reason must not be empty -- it must name the exit code.
+        self._orphan()
+        text = self.script.read_text()
+        marker = '_holder_output="$(' + sys.executable + " -c"
+        self.assertEqual(text.count(marker), 1)
+        self.script.write_text(
+            text.replace(marker, '_holder_output="$(/nonexistent/python-for-holder-check -c')
+        )
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self._assert_no_launch(content)
+        self.assertIn("holder check exited rc=", content)
+
+    @pytest.mark.skipif(
+        not Path("/proc/net/unix").exists(),
+        reason="negative control needs the /proc orphan cleanup (Linux)",
+    )
+    def test_c8_control_genuine_orphan_is_removed_and_launches(self):
+        self._orphan()
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self._wait_for_relaunch_marker())
+        self.assertFalse(self.socket_path.exists())
+        self.assertTrue((self.engram_home / "daemon-launch-attempt").exists())
+
+
+    # -- C8b: the refusal is ONE line whatever the holder output contains ---
+    # CONTRACT: exactly one `socket-guard:` line (no embedded newline/CR/tab),
+    # always ending with the restore instruction from the template; the
+    # embedded holder text is whitespace-normalized and capped at ~300 chars.
+    def _install_ps_shim(self, body: str):
+        shim = self._fake_systemctl_dir / "ps"
+        shim.write_text("#!/bin/sh\n" + body)
+        shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+
+    def _assert_single_bounded_line(self):
+        raw = self.log_path.read_text()
+        guard = [ln for ln in raw.splitlines() if "socket-guard:" in ln]
+        self.assertEqual(len(guard), 1, raw)
+        # no continuation lines: every physical log line is a stamped entry
+        # (a split holder cmdline would leave bare, unstamped fragments)
+        for ln in raw.splitlines():
+            self.assertRegex(ln, r"^\[\d{4}-\d\d-\d\dT[\d:]+Z\] \[start-engram-daemon\] ", raw)
+        self.assertNotIn("\r", raw)
+        self.assertTrue(
+            guard[0].endswith("then re-run the hook"), "restore text must end the line: " + guard[0][-120:]
+        )
+        return guard[0]
+
+    # cmdline source covered: `ps -o command=` (lsof branch, shim ps + shim lsof)
+    @_NO_PROC
+    def test_c8b_ps_multiline_holder_command_is_one_log_line(self):
+        holder = self._spawn_holder_process(match_reap_pattern=False)
+        self._install_lsof(stdout_text=str(holder.pid), rc=0)
+        self._install_ps_shim("printf 'python3 -c import os\\n\\tx = 1\\r\\n  y = 2\\n'\n")
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self._assert_no_launch(content)
+        line = self._assert_single_bounded_line()
+        self.assertIn(f"held by pid {holder.pid} (python3 -c import os x = 1 y = 2)", line)
+
+    # cmdline source covered: `ps -o command=` (lsof branch, shim ps + shim lsof)
+    @_NO_PROC
+    def test_c8b_ps_huge_holder_command_is_capped_and_restore_text_survives(self):
+        holder = self._spawn_holder_process(match_reap_pattern=False)
+        self._install_lsof(stdout_text=str(holder.pid), rc=0)
+        self._install_ps_shim("printf 'python3 -c '; head -c 2000 /dev/zero | tr '\\0' 'A'; printf '\\n'\n")
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self._assert_no_launch(content)
+        line = self._assert_single_bounded_line()
+        self.assertIn("by hand", line)
+        self.assertIn("...", line)
+        self.assertNotIn("A" * 301, line)
+        self.assertLess(len(line), 1000, len(line))
+
+    # cmdline source covered: /proc/<pid>/cmdline on Linux, real `ps` on macOS
+    # (the holder's own `python -c "<multi-line script>"` is a real
+    # multi-line cmdline; no shim, no override).
+    @_NEEDS_LIVE_GUARD_PRIMITIVES
+    def test_c8b_real_multiline_holder_cmdline_is_one_log_line(self):
+        holder = self._spawn_holder_process(match_reap_pattern=False)
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self._assert_no_launch(content)
+        self._assert_single_bounded_line()
+        self.assertIsNone(holder.poll())
+
+    # cmdline source covered: /proc/<pid>/cmdline on Linux, real `ps` on macOS
+    # (a 3000-char extra argv on the real holder).
+    @_NEEDS_LIVE_GUARD_PRIMITIVES
+    def test_c8b_real_huge_holder_cmdline_is_capped(self):
+        holder = self._spawn_holder_process(match_reap_pattern=False, pad_argv="B" * 3000)
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self._assert_kept(content)
+        self._assert_no_launch(content)
+        line = self._assert_single_bounded_line()
+        self.assertNotIn("B" * 301, line)
+        self.assertLess(len(line), 1000, len(line))
+        self.assertIsNone(holder.poll())
+
+    # -- C4 -----------------------------------------------------------------
+    def test_c4_absent_path_is_a_noop_even_with_unusable_stat(self):
+        self.pid_path.unlink()
+        self._install_unusable_stat()
+        self.assertFalse(self.socket_path.exists())
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("socket-guard", "\n".join(self._log_lines()))
+        self.assertTrue(self._wait_for_relaunch_marker())
 
 
 if __name__ == "__main__":
