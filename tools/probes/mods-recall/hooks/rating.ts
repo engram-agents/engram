@@ -312,6 +312,15 @@ export function rateHook(probe: Probe) {
     if (!wrote) return deny('write', 'failed; nothing was recorded')
     let text = `rated ${parsed.steps.length} step(s) for turn ${parsed.turnId.slice(0, 8)}`
     if (unknownSteps.length > 0) text += ` (no step file for index ${unknownSteps.join(', ')}; recorded as unknownSteps)`
-    return { result: { content: [{ type: 'text', text }] } }
+    // Result contract for a plugin-registered tool. claude-code.d.ts types `result`
+    // as `ToolResultOf<Name>` = `unknown` for a non-builtin tool (ToolCallResult,
+    // ~line 12139; ToolResultOf, ~line 12456), so the declarations do not say what
+    // is accepted. The engine validates it at run time and, measured live on 2.1.289,
+    // rejected an MCP-shaped object with: "tool.call step resolved
+    // mcp__engram-probe__rate with a result that does not match its output shape:
+    // invalid_union -- expected string | array | undefined, received object".
+    // So `result` is a plain string (or an array of content blocks, or undefined).
+    // The ratings file was written above, before this return.
+    return { result: text }
   }
 }

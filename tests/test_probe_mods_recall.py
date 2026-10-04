@@ -845,3 +845,38 @@ def test_eval_rejects_trailing_newline_ids(evaluator, tmp_path):
     with pytest.raises(SystemExit) as exc:
         evaluator.evaluate(str(gdir), str(tdir), None)
     assert "nl_arm.json" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# querySource / envelope travel into RRU metadata; eval splits by querySource
+# ---------------------------------------------------------------------------
+
+
+def _source_session(tmp_path: Path) -> Path:
+    root = _session(tmp_path)
+    s3 = _step(3, {"thinking_tail": ["ob_0001"], "thinking_full": ["ob_0002"]}, querySource="thinking", visibleChars=50)
+    s4 = _step(4, {"thinking_tail": ["ob_0003"], "thinking_full": ["ob_0004"]}, querySource="visible", visibleChars=700)
+    s4["arms"]["thinking_full"]["envelope"] = "result-string"
+    _put_step(root, s3)
+    _put_step(root, s4)
+    _put_rating(root, [{"index": 3, "good": ["ob_0001"]}, {"index": 4, "good": ["ob_0003"]}])
+    return root
+
+
+def test_query_source_visible_chars_and_envelope_reach_rru_metadata(convert, tmp_path):
+    out = tmp_path / "out"
+    convert.convert(_source_session(tmp_path), out)
+    a = json.loads((out / "test" / f"{TURN}-3-thinking_tail.json").read_text())["metadata"]
+    b = json.loads((out / "test" / f"{TURN}-4-thinking_full.json").read_text())["metadata"]
+    assert (a["querySource"], a["visibleChars"], a["envelope"]) == ("thinking", 50, None)
+    assert (b["querySource"], b["visibleChars"], b["envelope"]) == ("visible", 700, "result-string")
+
+
+def test_eval_table_splits_steps_by_query_source(convert, evaluator, tmp_path):
+    out = tmp_path / "out"
+    convert.convert(_source_session(tmp_path), out)
+    result = evaluator.evaluate(str(out / "golden"), str(out / "test"), None)
+    assert result["arms"]["thinking_tail"]["by_query_source"] == {"thinking": 1, "visible": 1}
+    report = tmp_path / "r.md"
+    evaluator.main(["--golden", str(out / "golden"), "--test", str(out / "test"), "--out", str(report)])
+    assert "thinking: 1, visible: 1" in report.read_text()

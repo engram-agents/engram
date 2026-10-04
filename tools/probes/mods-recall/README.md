@@ -50,7 +50,7 @@ claude --plugin-dir <repo>/tools/probes/mods-recall
 ```
 
 or list it in `CLAUDE_CODE_PLUGIN_DIRS`. Options (`userConfig`, set in the config
-menu or settings `pluginConfigs`): `enabled`, `topK` (1..20), `minThinkingChars`,
+menu or settings `pluginConfigs`): `enabled`, `topK` (1..20), `minQueryChars` (old name `minThinkingChars` still accepted), `querySource`,
 `arms`, `extractModel`, `extractTimeoutMs`, `maxRatingChars`, `probeDir`
 (default `~/.engram/probe/mods-recall`; if `HOME` is unset the probe disables itself
 rather than guess a path). An invalid value logs a line and falls back to the default
@@ -88,10 +88,13 @@ golden loader, RRU dataclasses) unchanged and prints one row per arm.
   probe never retries without the flag, because a silent fallback would contaminate
   the measurement.
 - Step files hold ONLY the selected candidate fields (id, type, claim clipped to 160 chars, recall_summary, scores, match type, recall_turn, created_at, rank), never the raw node row.
-- Step files hold the thinking-derived query text (up to 6000 chars) on local disk.
-  Arm D (`tool_input`) also records up to 2000 chars of the step's TOOL-CALL ARGUMENTS
-  as its `query`: a Bash or MCP call can carry tokens or file contents. Step files are
-  per-user and local, under `probeDir`; do not share them unreviewed.
+- Step files hold each arm's query text on local disk (up to 6000 chars for arm A). In
+  thinking mode that text is thinking-derived; in `visible` mode (and `auto` steps that
+  fell back to it) the A/B queries are built from the answer text PLUS the step's
+  tool-call arguments, so they can carry the same tokens or file contents arm D does.
+  Arm D (`tool_input`) records up to 2000 chars of the TOOL-CALL ARGUMENTS as its
+  `query` in every mode. Step files are per-user and local, under `probeDir`; do not
+  share them unreviewed.
 - `inContext` counts ids found in the conversation text, EXCLUDING the probe's own
   rating requests (any row containing `[engram-probe · turn `), so an id it listed
   last turn does not read as "already in context" now.
@@ -119,6 +122,53 @@ golden loader, RRU dataclasses) unchanged and prints one row per arm.
   The tests read the attempts back from that log; they cannot see an append succeed.
 - Tests build node-id-shaped strings at run time (`kit.ts` `nid`) because the
   repo's `no-new-shipped-node-ids` gate scans `tools/`.
+
+## Model boundary
+
+Only arm C (`extract_model`) sends text to a side model. Its input is the thinking
+text (thinking mode) or the step's answer text (visible mode); raw tool-call arguments
+never reach arm C's side model. They DO still travel elsewhere: arms A, B and D send
+their queries (which in visible mode contain tool-call arguments) to the ENGRAM MCP
+server the probe discovered by tool-name prefix (the code does not verify that server
+is local), arm E's helper receives the material on stdin as a local python process, and
+A/B/D queries are written to the local step files (the disclosure above). Step rows
+record `extractChars`, the length of what arm C was given.
+
+## Lineages whose thinking is hidden
+
+Measured live on Claude Code 2.1.289 with claude-fable-5-1: over 5 steps the engine
+reported thinkingChars 0, 278, 0, 0, 0 (1-2 thinking blocks each) and the transcript's
+own thinking blocks were empty. A thinking-only probe measured nothing there. So the
+query material is a choice, `querySource`: `thinking`; `visible` (the step's answer
+text plus every tool call's arguments JSON); or `auto` (the default: thinking when it
+has at least `minQueryChars`, else visible). Arms A, B, C and E run over the chosen
+material (arm B is its last 3 sentences); arm D stays the tool-arguments control.
+Each step row records `querySource` and `visibleChars`, and `convert_ratings.py` copies
+them (and the arm's `envelope`) into every test RRU's metadata; `probe_eval.py` shows each
+arm's step counts by `querySource`, because arms A/B/C/E score over different material per
+step and pooling them hides that. In `visible` mode (and in `auto` steps that fell back
+to visible) arm D is NOT independent of A/B/C/E: the same tool arguments are inside the
+visible material.
+A step is skipped
+(`short-material`) only when the chosen material is under `minQueryChars`.
+
+## engram_query result envelope
+
+The engram server's MCP text is `{"result": "<server JSON as a string>"}`, for errors
+and successes alike. `recall.ts` unwraps exactly one level; each arm records
+`envelope: "result-string" | "direct"`, on error rows too once a body has been parsed
+(absent only when the call failed before any JSON, e.g. `isError`).
+
+## The rate tool's result contract
+
+The engine validates a plugin-registered tool's `result` at run time: it must be a
+string (or an array of content blocks, or undefined). An MCP-shaped
+`{content:[...]}` object is rejected (measured live, 2.1.289), so `rate` returns the
+plain string `rated N step(s) for turn <id8>`. The ratings file is written before it
+returns.
+
+Measured live: a 479-char request appended at turn end (`waitedMs` 18); the ratings
+file was written before the result was returned.
 
 ## Known minor limitation
 

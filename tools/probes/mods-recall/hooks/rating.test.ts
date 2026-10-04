@@ -70,7 +70,7 @@ test('T5 a turn whose steps were all skipped appends nothing', async ($, on) => 
   await $.session.start(START)
   await drain($.turn.step(STEP_INPUT))
   await flush(r.clock)
-  expect(stepFile(r.seen, TURN, 0)?.skipped).toBe('short-thinking')
+  expect(stepFile(r.seen, TURN, 0)?.skipped).toBe('short-material')
   await $.turn.complete(COMPLETE)
   expect(appended(r.seen).length).toBe(0)
 })
@@ -183,7 +183,9 @@ test('T6 rate: a valid call writes one ratings file and answers rated 1 step(s)'
   const { seen } = await oneStep($, on)
   const res = await callRate($, GOOD)
   expect(res.deny).toBeUndefined()
-  expect(JSON.stringify(res.result)).toContain(`rated 1 step(s) for turn ${TURN.slice(0, 8)}`)
+  expect(typeof res.result).toBe('string') // the engine's output shape: string | array | undefined
+  expect(String(res.result).startsWith('rated ')).toBe(true)
+  expect(res.result).toBe(`rated 1 step(s) for turn ${TURN.slice(0, 8)}`)
   const files = [...seen.writes.keys()].filter(k => k.startsWith(`${PROBE_ROOT}/ratings/`))
   expect(files.length).toBe(1)
   expect(files[0]!.startsWith(`${PROBE_ROOT}/ratings/${TURN}-`)).toBe(true)
@@ -198,7 +200,8 @@ test('T6 rate: a valid call writes one ratings file and answers rated 1 step(s)'
 test('T6 rate: an index with no step file is accepted and recorded as unknownSteps', async ($, on) => {
   const { seen } = await oneStep($, on)
   const res = await callRate($, { turnId: TURN, steps: [{ index: 0, good: [] }, { index: 9, good: [OB] }] })
-  expect(JSON.stringify(res.result)).toContain('index 9')
+  expect(typeof res.result).toBe('string')
+  expect(String(res.result)).toContain('index 9')
   const path = [...seen.writes.keys()].find(k => k.includes('/ratings/'))!
   expect(JSON.parse(seen.writes.get(path)!).unknownSteps).toEqual([9])
 })

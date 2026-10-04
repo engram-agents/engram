@@ -11,6 +11,8 @@ export type ArmResult = {
   /** not an error: the arm had nothing to ask (no tool call, no novel terms) */
   skipped?: string
   clipped?: boolean
+  /** how the engram_query text was framed: unwrapped result string, or direct */
+  envelope?: 'result-string' | 'direct'
   extract?: {
     ms: number
     usage?: unknown
@@ -30,7 +32,14 @@ export type ArmCtx = {
   probe: Probe
   cfg: Config
   server: string
-  thinking: string
+  /** the chosen query material (thinking, or the visible answer + tool args) */
+  material: string
+  /**
+   * What arm C may send to the SIDE MODEL: thinking (thinking mode) or the step's
+   * answer text (visible mode), NEVER tool-call arguments. Arms A/B/D/E query only
+   * the local ENGRAM server and may use `material`.
+   */
+  extractInput: string
   /** every tool block's arguments JSON text, one entry per tool call */
   toolArgs: string[]
   sessionId: string
@@ -42,11 +51,11 @@ export const EXTRACT_TAIL_CHARS = 3000
 export const TOOL_INPUT_CLIP = 2000
 
 export const EXTRACT_SYSTEM =
-  "You read an AI agent's private reasoning. Name, as 3 short noun phrases on one line separated by ' | ', the facts, decisions or prior experiences this reasoning assumes or would benefit from remembering. No prose."
+  "You read an AI agent's reasoning or working text. Name, as 3 short noun phrases on one line separated by ' | ', the facts, decisions or prior experiences this reasoning assumes or would benefit from remembering. No prose."
 
 /** Last 3 sentences (split on `[.!?]` + whitespace), else the last 400 chars. */
-export function tailQuery(thinking: string): string {
-  const text = thinking.trim()
+export function tailQuery(material: string): string {
+  const text = material.trim()
   const parts = text.split(/([.!?])\s/)
   const sentences: string[] = []
   for (let i = 0; i < parts.length; i += 2) {
@@ -86,25 +95,32 @@ async function retrieveArm(
 ): Promise<ArmResult> {
   const { value, err, ms } = await timed(ctx.io, () => recall(ctx.io, ctx.server, query, ctx.cfg.topK))
   if (err !== undefined) {
-    return { arm, query, ms, error: String((err as Error)?.message ?? err), ...extra }
+    return {
+      arm,
+      query,
+      ms,
+      error: String((err as Error)?.message ?? err),
+      envelope: (err as { envelope?: 'result-string' | 'direct' })?.envelope,
+      ...extra,
+    }
   }
-  return { arm, query, candidates: value ?? [], ms, ...extra }
+  return { arm, query, candidates: value?.candidates ?? [], envelope: value?.envelope, ms, ...extra }
 }
 
 async function armThinkingFull(ctx: ArmCtx): Promise<ArmResult> {
-  const clipped = ctx.thinking.length > FULL_CLIP
-  const query = clipped ? ctx.thinking.slice(-FULL_CLIP) : ctx.thinking
+  const clipped = ctx.material.length > FULL_CLIP
+  const query = clipped ? ctx.material.slice(-FULL_CLIP) : ctx.material
   return retrieveArm(ctx, 'thinking_full', query, { clipped })
 }
 
 async function armThinkingTail(ctx: ArmCtx): Promise<ArmResult> {
-  return retrieveArm(ctx, 'thinking_tail', tailQuery(ctx.thinking))
+  return retrieveArm(ctx, 'thinking_tail', tailQuery(ctx.material))
 }
 
 async function armExtractModel(ctx: ArmCtx): Promise<ArmResult> {
   const { io, probe, cfg } = ctx
   const t0 = await io.now()
-  const prompt = ctx.thinking.slice(-EXTRACT_TAIL_CHARS)
+  const prompt = ctx.extractInput.slice(-EXTRACT_TAIL_CHARS)
   const key = await hexSha256(prompt)
   let reply = probe.extractCache.get(key)
   const cached = reply !== undefined
@@ -167,7 +183,7 @@ async function armNovelTerms(ctx: ArmCtx): Promise<ArmResult> {
   try {
     const res = await io.run(
       ['python3', `${io.pluginRoot}/novel_terms.py`, '--state', statePath],
-      { stdin: ctx.thinking, timeoutMs: 8000 },
+      { stdin: ctx.material, timeoutMs: 8000 },
     )
     if (res.exitCode !== 0) {
       const t1 = await io.now()

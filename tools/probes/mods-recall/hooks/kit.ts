@@ -70,6 +70,7 @@ export function rig(on: On, options: RigOptions = {}) {
     recallCalls: [] as { server: string; tool: string; args: Record<string, unknown> }[],
     logs: [] as string[],
     completeCalls: 0,
+    completePrompts: [] as string[],
     processCalls: [] as { argv: readonly string[]; stdin?: string }[],
     registered: [] as unknown[],
   }
@@ -109,8 +110,9 @@ export function rig(on: On, options: RigOptions = {}) {
     const body = custom ?? { query, results: [candidateRow(OB), candidateRow(LX, { type: 'lesson' })] }
     return { value: mcpText(body) as never }
   })
-  on('model.complete', async () => {
+  on('model.complete', async (_$, e) => {
     seen.completeCalls += 1
+    seen.completePrompts.push(`${e.system ?? ''}\n${e.prompt}`)
     const custom = options.complete?.()
     return {
       value: (custom ?? {

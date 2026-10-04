@@ -29,7 +29,7 @@ import os
 import re
 import statistics
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 
@@ -178,6 +178,8 @@ def evaluate(golden_dir: str, test_dir: str, pairs_path: str | None = None,
             "ms_excluded": len(rrus) - len(mss),
             "median_ms_over_step": _median(rats),
             "ms_over_step_excluded": len(rrus) - len(rats),
+            "by_query_source": dict(sorted(Counter(
+                str(r.metadata.get("querySource")) for r in rrus).items())),
             "unshown_rate": (unshown / len(all_ids)) if all_ids else None,
             "in_context_rate": flag("inContext"),
             "principle_rate": flag("principle"),
@@ -219,14 +221,14 @@ def render_report(result: dict) -> str:
              f"unrated steps (not scored): {len(result['unrated'])}", "",
              "## Per arm", "",
              "| arm | n steps | p@5 | r@10 | nDCG@10 | MRR | median ms | p90 ms | "
-             "median msOverStep | unshown | inContext (top-5) | principle (top-5) |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+             "median msOverStep | unshown | steps by querySource | inContext (top-5) | principle (top-5) |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for arm, s in result["arms"].items():
         lines.append(
             f"| {arm} | {s['n_steps']} | {_fmt(s['precision_at_k_5'])} | {_fmt(s['recall_at_k_10'])} | "
             f"{_fmt(s['ndcg_at_k_10'])} | {_fmt(s['mean_reciprocal_rank'])} | "
             f"{_fmt(s['median_ms'], '.0f')} | {_fmt(s['p90_ms'], '.0f')} | "
-            f"{_fmt(s['median_ms_over_step'])} | {_fmt(s['unshown_rate'])} | {_fmt(s['in_context_rate'])} | "
+            f"{_fmt(s['median_ms_over_step'])} | {_fmt(s['unshown_rate'])} | {', '.join(f'{k}: {v}' for k, v in s['by_query_source'].items()) or '-'} | {_fmt(s['in_context_rate'])} | "
             f"{_fmt(s['principle_rate'])} |")
     lines += ["", "Latency excluded (value absent): " + (", ".join(
         f"{arm}: ms {s['ms_excluded']}, msOverStep {s['ms_over_step_excluded']}"
