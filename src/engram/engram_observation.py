@@ -66,6 +66,7 @@ Caller (server.py) uses the alias form::
 from __future__ import annotations
 
 import difflib
+import errno
 import hashlib
 import json
 import logging
@@ -543,6 +544,57 @@ def _content_addressed_archive_hash(abs_file: str) -> str:
         return ""
 
 
+_MAX_SYMLINK_EXPANSIONS = 40
+
+
+def _resolve_with_trace(path: str) -> "tuple[str, list[str]]":
+    """Resolve `path` exactly as the OS does, recording every symlink crossed.
+
+    Returns (physical_path, links). `path` is made absolute by joining the cwd
+    if relative, WITHOUT normpath/abspath: `..` is applied to the PHYSICAL path
+    built so far (so `repo/link/../f.md` is the parent of what `link` points at,
+    not `repo/f.md`). Each component that is a symlink is recorded as the
+    absolute physical path of the LINK itself, then replaced by its target and
+    the walk continues (a relative target resolves against the link's
+    directory). A missing FINAL component is kept as written (the caller's
+    existence check reports it); anything the OS would refuse earlier raises as
+    the OS does: OSError(ENOENT) when a component that must be a directory is
+    missing, OSError(ENOTDIR) when it exists but is not a directory (a trailing
+    slash, `/.` or `/..` after a regular file, or a path continuing past one).
+    More than _MAX_SYMLINK_EXPANSIONS links raises OSError(ELOOP), so a loop is
+    a clean rejection rather than a hang.
+    """
+    if not os.path.isabs(path):
+        path = os.path.join(os.getcwd(), path)
+    pending = path.split(os.sep)[::-1]  # a stack: next component is pending[-1]
+    resolved = os.sep
+    links: list = []
+    while pending:
+        comp = pending.pop()
+        # Consuming ANY further component (even "", "." or "..") means `resolved`
+        # is being used as a directory; the OS refuses when it is not one.
+        if not os.path.isdir(resolved):
+            code = errno.ENOTDIR if os.path.lexists(resolved) else errno.ENOENT
+            raise OSError(code, os.strerror(code), path)
+        if comp in ("", "."):
+            continue
+        if comp == "..":
+            resolved = os.path.dirname(resolved)
+            continue
+        candidate = os.path.join(resolved, comp)
+        if os.path.islink(candidate):
+            if len(links) >= _MAX_SYMLINK_EXPANSIONS:
+                raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), path)
+            links.append(candidate)
+            target = os.readlink(candidate)
+            if os.path.isabs(target):
+                resolved = os.sep
+            pending.extend(target.split(os.sep)[::-1])
+        else:
+            resolved = candidate
+    return resolved, links
+
+
 def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", source_repo: str = "", repo_path: str = "") -> dict:
     """Validate a file:// URL is citable and capture its version state.
 
@@ -589,7 +641,37 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
             "content_hash": "",
             "git_sha": "",
         }
-    if not os.path.exists(file_path):
+    try:
+        physical, links = _resolve_with_trace(file_path)
+    except OSError as e:
+        if e.errno in (errno.ENOENT, errno.ENOTDIR):
+            # The OS cannot open this path either: same rejection as a missing file.
+            return {
+                "ok": False,
+                "error": (
+                    f"File not found: '{file_path}'. Evidence URLs with file:// must "
+                    "point to existing files. If citing a conversation, use the "
+                    "JSONL transcript file path instead." + _HONESTY_REMINDER
+                ),
+                "content_hash": "",
+                "git_sha": "",
+            }
+        return {
+            "ok": False,
+            "error": (
+                f"Cannot resolve the symlinks in '{file_path}': {e.strerror or e} "
+                "(a symlink loop, or more than "
+                f"{_MAX_SYMLINK_EXPANSIONS} links on the path). Cite a path that resolves."
+                + _HONESTY_REMINDER
+            ),
+            "content_hash": "",
+            "git_sha": "",
+        }
+    # Both halves: the cited path as the OS opens it, and the physical path the
+    # walk reached. The walk fails where the OS fails; the cited-path check is
+    # defense in depth, because _verify_quote_in_source skips the quote check
+    # for a cited path that does not exist.
+    if not (os.path.exists(file_path) and os.path.exists(physical)):
         return {
             "ok": False,
             "error": (
@@ -601,7 +683,7 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
             "git_sha": "",
         }
 
-    file_dir = os.path.dirname(os.path.abspath(file_path))
+    cross_repo = bool(source_repo and repo_path)
     # When source_repo is provided, run git operations from that repo root
     # instead of the directory inferred from the file path. This lets the
     # caller verify a file against a secondary repo (e.g. the plugin source
@@ -617,10 +699,95 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
                 "git_sha": "",
             }
     else:
-        git_cwd = file_dir
-    _file_git = lambda *args: subprocess.run(
-        [core.GIT_EXE, *args], cwd=git_cwd, capture_output=True, text=True, timeout=core.GIT_TIMEOUT
+        # The PHYSICAL directory of the file: the one place the bytes live.
+        git_cwd = os.path.dirname(physical)
+    _git_at = lambda cwd, *args, env=None: subprocess.run(
+        [core.GIT_EXE, *args], cwd=cwd, capture_output=True, text=True, timeout=core.GIT_TIMEOUT,
+        env=env,
     )
+    # Link classification matches git's English "not a git repository", so it
+    # runs under the C locale; the rest of the environment is inherited.
+    _c_locale_env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    _file_git = lambda *args: _git_at(git_cwd, *args)
+
+    def _reject(message: str) -> dict:
+        return {"ok": False, "error": message + _HONESTY_REMINDER, "content_hash": "", "git_sha": ""}
+
+    def _outside_repo_rejection(real_file: str) -> dict:
+        # A committed in-repo symlink whose target lies outside the repo: git
+        # cannot vouch for the target, so name the cause rather than let
+        # `git status` (exit 128) and cat-file fail on a '../' path.
+        return _reject(
+            f"File '{file_path}' resolves outside the repository "
+            f"(to '{real_file}'). File-based evidence must live inside "
+            "the git repository so it is verifiable at the claimed revision. "
+            "Cite a file that is committed inside the repo."
+        )
+
+    # Link check (#3292). The cited path was resolved ONCE, physically, above;
+    # every symlink that resolution crossed is in `links`. A link outside every
+    # git work tree is environment (macOS /var -> /private/var, a ~/link) and
+    # is ignored. A link inside a work tree W is part of what the citation
+    # relies on, so it must be tracked in W and clean there: an untracked or
+    # retargeted link could otherwise vouch for committed bytes it merely
+    # points at.
+    in_tree_links = []  # (link path, work tree root, link path relative to it)
+    if not cross_repo:
+        for link in links:
+            link_dir = os.path.dirname(link)
+            try:
+                top = _git_at(link_dir, "rev-parse", "--show-toplevel", env=_c_locale_env)
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+                # Fail closed: an unanswered classification is not "environment".
+                return _reject(
+                    f"Cannot classify the symlink '{link}' on the cited path: git "
+                    f"could not be run ({type(e).__name__}). A link that cannot be "
+                    "classified cannot be trusted to vouch for the file it points "
+                    "at, so the citation cannot be accepted."
+                )
+            if top.returncode != 0:
+                # Only git's genuine "not a git repository" answer makes a link
+                # environment; any other failure must not read as one.
+                if "not a git repository" in (top.stderr or "").lower():
+                    continue
+                git_err = (top.stderr or "").strip()[:300] or "no stderr output"
+                return _reject(
+                    f"Cannot classify the symlink '{link}' on the cited path: "
+                    f"git rev-parse --show-toplevel failed (exit {top.returncode}): "
+                    f"{git_err}. A link that cannot be classified cannot be trusted "
+                    "to vouch for the file it points at, so the citation cannot be "
+                    "accepted."
+                )
+            work_tree = os.path.realpath(top.stdout.strip())
+            real_dir = os.path.realpath(link_dir)
+            if os.path.commonpath([work_tree, real_dir]) != work_tree:
+                continue
+            rel_link = os.path.relpath(os.path.join(real_dir, os.path.basename(link)), work_tree)
+            tracked = _git_at(work_tree, "ls-files", "--error-unmatch", "--", rel_link)
+            if tracked.returncode != 0:
+                return _reject(
+                    f"The cited path goes through the symlink '{link}', which is "
+                    f"untracked (not yet added to git) in '{work_tree}'. An uncommitted "
+                    "symlink cannot vouch for the file it points at. Commit the "
+                    "symlink first, or cite the file's real path."
+                )
+            link_status = _git_at(work_tree, "status", "--porcelain", "--", rel_link)
+            if link_status.returncode != 0:
+                git_err = (link_status.stderr or "").strip()[:300] or "no stderr output"
+                return _reject(
+                    f"git status failed (exit {link_status.returncode}) for symlink "
+                    f"'{rel_link}': {git_err}. Cannot confirm the symlink is committed, "
+                    "so the citation cannot be accepted."
+                )
+            if link_status.stdout.strip():
+                return _reject(
+                    f"The cited path goes through the symlink '{link}', which is "
+                    f"modified but not committed (status: {link_status.stdout[:2].strip()}). "
+                    "A changed symlink cannot vouch for the file it points at. "
+                    "Commit the symlink first, then retry."
+                )
+            in_tree_links.append((link, work_tree, rel_link))
+
     try:
         repo_check = _file_git("rev-parse", "--is-inside-work-tree")
         file_in_git_repo = repo_check.returncode == 0
@@ -628,6 +795,10 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
         file_in_git_repo = False
 
     if not file_in_git_repo:
+        if in_tree_links:
+            # Reached through a link that lives in a work tree, but the bytes
+            # are in none: no repository can vouch for them.
+            return _outside_repo_rejection(physical)
         return {"ok": True, "error": None, "content_hash": "", "git_sha": ""}
 
     # Deferred-commit relaxation (#1253): a content-addressed evidence-archive
@@ -644,42 +815,55 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
 
     repo_root_result = _file_git("rev-parse", "--show-toplevel")
     repo_root = repo_root_result.stdout.strip()
-    abs_file = os.path.abspath(file_path)
 
-    if source_repo and repo_path:
+    # Each entry is (label, repo-relative path); label "" = the only check.
+    # Every path must be clean in `git status` AND present at the revision.
+    if cross_repo:
         # Cross-repo citation: the cited file lives outside source_repo at abs_file,
         # but the canonical committed copy is at repo_path within source_repo.
         # Use repo_path for all git tree operations; abs_file only for content_hash.
-        rel_path = repo_path
-        git_status_path = repo_path
+        abs_file = os.path.abspath(file_path)
+        path_checks = [("", repo_path)]
+        check_git = _file_git
     else:
-        rel_path = os.path.relpath(abs_file, repo_root)
-        git_status_path = abs_file  # absolute path works in same-repo context
+        # Same-repo citation (#3292): the bytes are the PHYSICAL file, checked in
+        # the repository that contains it (link checks ran above).
+        abs_file = physical
+        real_root = os.path.realpath(repo_root)
+        rel_target = os.path.relpath(physical, real_root)
+        if rel_target == ".." or rel_target.startswith(".." + os.sep):
+            return _outside_repo_rejection(physical)
+        path_checks = [("resolved target " if links else "", rel_target)]
+        # Repo-relative paths need the repo root as cwd.
+        check_git = lambda *args: _git_at(real_root, *args)
 
-    status_result = _file_git("status", "--porcelain", "--", git_status_path)
-    file_status = status_result.stdout.strip()
-    if file_status:
-        status_code = file_status[:2]
-        if status_code == "??":
-            status_desc = "untracked (not yet added to git)"
-        elif "M" in status_code:
-            status_desc = "modified but not committed"
-        elif "A" in status_code:
-            status_desc = "staged but not committed"
-        else:
-            status_desc = f"uncommitted (status: {status_code.strip()})"
-        return {
-            "ok": False,
-            "error": (
-                f"File is {status_desc}: '{rel_path}'. "
+    for label, rel_path in path_checks:
+        status_result = check_git("status", "--porcelain", "--", rel_path)
+        if status_result.returncode != 0:
+            # Fail closed: an empty stdout from a failed `git status` is not "clean".
+            git_err = (status_result.stderr or "").strip()[:300] or "no stderr output"
+            return _reject(
+                f"git status failed (exit {status_result.returncode}) for "
+                f"{label}'{rel_path}': {git_err}. Cannot confirm the file is committed, "
+                "so it cannot be cited."
+            )
+        file_status = status_result.stdout.strip()
+        if file_status:
+            status_code = file_status[:2]
+            if status_code == "??":
+                status_desc = "untracked (not yet added to git)"
+            elif "M" in status_code:
+                status_desc = "modified but not committed"
+            elif "A" in status_code:
+                status_desc = "staged but not committed"
+            else:
+                status_desc = f"uncommitted (status: {status_code.strip()})"
+            return _reject(
+                f"File is {status_desc}: {label}'{rel_path}'. "
                 "File-based evidence must be committed to git before it can be cited. "
                 "This ensures the evidence is verifiable at the claimed revision. "
                 "Commit the file first, then retry with the new git SHA."
-                + _HONESTY_REMINDER
-            ),
-            "content_hash": "",
-            "git_sha": "",
-        }
+            )
 
     if not content_hash:
         with open(abs_file, "rb") as f:
@@ -691,19 +875,25 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
             git_sha = head_result.stdout.strip()
 
     if git_sha:
-        verify_result = _file_git("cat-file", "-e", f"{git_sha}:{rel_path}")
-        if verify_result.returncode != 0:
-            return {
-                "ok": False,
-                "error": (
-                    f"File '{rel_path}' does not exist at git revision {git_sha[:8]}. "
+        for label, rel_path in path_checks:
+            verify_result = check_git("cat-file", "-e", f"{git_sha}:{rel_path}")
+            if verify_result.returncode != 0:
+                return _reject(
+                    f"File {label}'{rel_path}' does not exist at git revision {git_sha[:8]}. "
                     "The git_sha must point to a commit that contains this file. "
                     "Check that you committed the file before this revision."
-                    + _HONESTY_REMINDER
-                ),
-                "content_hash": "",
-                "git_sha": "",
-            }
+                )
+        if not cross_repo:
+            for link, work_tree, rel_link in in_tree_links:
+                if work_tree != real_root:
+                    continue
+                verify_result = _git_at(real_root, "cat-file", "-e", f"{git_sha}:{rel_link}")
+                if verify_result.returncode != 0:
+                    return _reject(
+                        f"The symlink '{link}' ('{rel_link}') does not exist at git "
+                        f"revision {git_sha[:8]}. The git_sha must point to a commit "
+                        "that contains every symlink the cited path goes through."
+                    )
 
     return {"ok": True, "error": None, "content_hash": content_hash, "git_sha": git_sha}
 
