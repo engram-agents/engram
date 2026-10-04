@@ -192,6 +192,8 @@
   "hooks/claude/engram-session-start-hook.py:_persist_injected_through",
   "hooks/claude/engram-session-start-hook.py:piece_c_git_log",
   "hooks/claude/engram-session-start-hook.py:sleep_status_block",
+  "hooks/claude/engram-session-start-hook.py:_auto_sleep_settings",
+  "hooks/claude/engram-session-start-hook.py:auto_sleep_must_line",
   "hooks/claude/engram-session-start-hook.py:auto_sleep_cron_block",
   "hooks/claude/engram-session-start-hook.py:fairy_policy_block",
   "hooks/claude/engram-session-start-hook.py:forum_monitor_block",

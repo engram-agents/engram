@@ -695,6 +695,22 @@ jobs:
         # this step stays wired.
         run: python3 -m pytest tools/test_pr_body_close_keyword_gate.py -q
 
+      - name: invariant-checks — read-scan roots coverage + committed templates drift
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
+        # test_r10 fails when a hook function is missing from
+        # tools/engramd_read_scan.config.json `roots`; test_r12 fails when the
+        # committed src/engram/engramd_read_templates.json differs from a fresh
+        # scan. Both exist to fire the moment a new hook function arrives, but
+        # dev PRs run only this workflow (the full suite runs on dev->main), so
+        # #3371 added two session-start hook functions, merged green, and left
+        # r10 red on dev. Measured in a fresh venv with ONLY pytest installed:
+        # these two node ids = 2 passed in ~1.7 s wall; the whole file is 76
+        # tests in ~21 s, too slow for here, hence two node ids not the file.
+        run: >-
+          python3 -m pytest -q
+          "tests/test_engramd_read_scan.py::test_r10_roots_config_covers_every_hook_function_and_no_module_level_execute_site"
+          "tests/test_engramd_read_scan.py::test_r12_committed_file_equals_a_fresh_scan_of_the_real_tree"
+
       - name: invariant-checks — health L0 set hash (MAJOR-bump gate)
         if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
         # Pins a SHA over the canonical L0 measurement set — every
