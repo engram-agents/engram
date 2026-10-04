@@ -911,6 +911,46 @@ jobs:
             tests/test_claude_md_moves.py \
             -q
 
+      # ── 7c-2. test files outside tests.yml's roots (#3346) ────────────────
+      # tests.yml collects `tests/` and `src/forum/tests/` only. Nine healthy
+      # test files sat in tools/ and src/engram/tools/, named test_*.py, and
+      # ran in NO CI job at all: a test nothing runs cannot fail, so it
+      # cannot warn when it goes stale either (two sibling files, since
+      # retired, errored on every fixture for months unnoticed). This step
+      # runs them, plus tests/test_ci_wiring_guard.py, which fails if any
+      # tracked test_*.py outside tests.yml's roots is named by no workflow.
+      #
+      # Measured (not assumed) to fit the stdlib carve-out above: a fresh
+      # venv with ONLY `pip install pytest` runs all nine plus the guard
+      # clean. test_forum_backup.py and test_forum_cli.py skip their forum-
+      # server cells there ("forum package required" / "Flask/deps missing");
+      # tests.yml runs those cells with the full forum requirements. The
+      # per-file results and wall time are in the PR body.
+      #
+      # test_tripwire.py gets its OWN pytest invocation: it lives in
+      # src/engram/tools/, so pytest puts src/engram on sys.path and the
+      # tests/conftest.py #2565 collision guard aborts the whole run for
+      # every later `tools.*` import (measured: 8 collection errors when it
+      # shares a command with tools/test_pre_dispatch_check.py). `rc`
+      # keeps one failing command from hiding the other.
+      - name: stdlib-only guards — unrun tools/ tests + CI-wiring guard (#3346)
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
+        run: |
+          rc=0
+          python3 -m pytest \
+            tools/test_backup_claude_projects.py \
+            tools/test_backup_session_logs.py \
+            tools/test_forum_backup.py \
+            tools/test_forum_backup_alarm.py \
+            tools/test_forum_backup_stamp.py \
+            tools/test_forum_cli.py \
+            tools/test_forum_status_backup.py \
+            tools/test_pre_dispatch_check.py \
+            tests/test_ci_wiring_guard.py \
+            -q || rc=1
+          python3 -m pytest src/engram/tools/test_tripwire.py -q || rc=1
+          exit $rc
+
       # ── 7d. cascade behaviour acceptance (playbox) ──────────────────────
       # The #2013 cascade machine is accepted by BEHAVIOUR: tests/cascade_
       # scenarios/ drives supersede / retract / frontier / resolve through the

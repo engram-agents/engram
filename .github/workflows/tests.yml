@@ -52,3 +52,45 @@ jobs:
         # tools/ forum-CLI tests arrive with #616; add `tools/` to this path
         # once #616 merges (omitted now — empty tools/ test set would exit-5).
         run: pytest tests/ src/forum/tests/ -v --tb=short
+
+      - name: Run pytest — test files outside the roots above (#3346)
+        # Deliberately a SEPARATE step, not extra positionals on the line
+        # above: tools/test_id_set_check.py's TEST_SCAN_ROOTS must equal that
+        # line's roots (the #2950 sync gate), and it scans directories, not
+        # single files. These nine files are named test_*.py but live in
+        # tools/ and src/engram/tools/, so the directory roots never reached
+        # them and they ran in no job. Here they run with the full deps, so
+        # the forum-server cells that skip under pr-checks' stdlib-only
+        # venv (10 in test_forum_backup.py, 49 in test_forum_cli.py) run.
+        # tests/test_ci_wiring_guard.py (collected above, under tests/) fails
+        # if a tracked test_*.py outside the roots is named by no workflow.
+        # test_tripwire.py runs in its own pytest command: it lives in
+        # src/engram/tools/, which puts src/engram on sys.path and trips the
+        # tests/conftest.py #2565 collision guard for every later `tools.*`
+        # import in the same process. `rc` keeps one failure from hiding
+        # the other.
+        # The forum-server cells need the REAL `forum` package, and
+        # importing tools/forum.py (the thick CLI, imported by
+        # test_forum_cli.py) shadows it with a flat module -- so under a
+        # plain `pytest tools/...` all 59 cells skip even with Flask
+        # installed (measured: 123 passed, 59 skipped). The main step above
+        # avoids this only because collecting src/forum/tests/ imports the
+        # package first. Here the same is done explicitly: PYTHONPATH=src
+        # plus importing forum before pytest starts (measured: 182 passed,
+        # 0 skipped).
+        env:
+          PYTHONPATH: src
+        run: |
+          rc=0
+          python -c "import forum.db, forum.server, sys, pytest; sys.exit(pytest.main(sys.argv[1:]))" \
+            tools/test_backup_claude_projects.py \
+            tools/test_backup_session_logs.py \
+            tools/test_forum_backup.py \
+            tools/test_forum_backup_alarm.py \
+            tools/test_forum_backup_stamp.py \
+            tools/test_forum_cli.py \
+            tools/test_forum_status_backup.py \
+            tools/test_pre_dispatch_check.py \
+            -v --tb=short || rc=1
+          pytest src/engram/tools/test_tripwire.py -v --tb=short || rc=1
+          exit $rc

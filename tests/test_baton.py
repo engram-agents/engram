@@ -3364,6 +3364,7 @@ class TestPoolSentinel:
         assert exc_info.value.code == EXIT_VALIDATION
         captured = capsys.readouterr()
         assert "not presented for merge" in captured.err
+        assert "turn is with ariadne" in captured.err  # names the holder
 
     def test_merge_gate2_refuses_while_turn_back_with_author(self, engram_home, monkeypatch, capsys):
         """Companion control: turn == the PR's own author (explicit
@@ -3395,6 +3396,7 @@ class TestPoolSentinel:
         assert exc_info.value.code == EXIT_VALIDATION
         captured = capsys.readouterr()
         assert "not presented for merge" in captured.err
+        assert "turn is with clio" in captured.err  # names the holder
 
     def test_merge_gate2_refuses_empty_turn(self, engram_home, monkeypatch, capsys):
         """Edge case named in Gate 2's own comment: a baton with no `turn`
@@ -7289,3 +7291,401 @@ class TestFrontmatterFieldSeparatorNoNewlineCrossing:
         assert fields["colon_value"] == "a value: with a colon"
         assert fields["turn_reason"] == '""'
         assert fields["participants"] == "[borges, ariadne]"
+
+
+# ===========================================================================
+# CATEGORY 13: ported from the retired tools/test_baton_colleague_gate.py and
+# tools/test_baton_merge_gate.py (#3346)
+#
+# Those two files targeted the pre-#1536 file-backed baton (they patched
+# `BATON_PROJECTS_DIR`, a constant #1536 deleted) and, living under tools/,
+# were collected by no CI job -- so they errored on every fixture for months
+# and nobody was told. Behaviours the current CLI still has are re-asserted
+# here against the forum-API design (mock ForumClient, repo-qualified github
+# anchor, `_pool_sentinel` pinned). Behaviours that no longer exist were not
+# ported; the mapping is in the #3346 PR body.
+# ===========================================================================
+
+_FLIP_GATE_ANCHOR = "pr/engram-agents/engram-paper"
+
+
+def _pin_gate_states(monkeypatch, *, ci=("green", "ok"), approval=("fresh", "ok")):
+    """Pin the sentinel and both gh-backed gate probes; return the call log."""
+    monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+    calls = []
+
+    def _ci(pr_num, repo=None):
+        calls.append(("ci", pr_num, repo))
+        return ci
+
+    def _ap(pr_num, repo=None):
+        calls.append(("approval", pr_num, repo))
+        return approval
+
+    monkeypatch.setattr(_baton, "_pr_ci_state", _ci)
+    monkeypatch.setattr(_baton, "_pr_approval_state", _ap)
+    return calls
+
+
+def _flip_to_sentinel(project_id, num, *, participants, turn, force=False):
+    """A mock client holding a PR baton at `turn`, plus the flip-to-sentinel args."""
+    client = _make_client(
+        post_return={"seq": 1},
+        get_return={"raw": _make_raw_baton(
+            project_id, github=f"{_FLIP_GATE_ANCHOR}/{num}",
+            turn=turn, participants=participants,
+        )},
+    )
+    args = argparse.Namespace(
+        project_id=project_id, to="casey", reason="ready to merge", force=force,
+    )
+    return client, args
+
+
+class TestFlipColleagueApprovalGate:
+    """The #1267 colleague gate on `baton flip <PR> <maintainer/sentinel>`,
+    re-asserted for the forum-API CLI (ported from the retired
+    tools/test_baton_colleague_gate.py, tests 1-5, 7, 12)."""
+
+    def test_no_approval_with_colleague_refuses(self, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch, approval=("no_approval", "no APPROVED review"))
+        client, args = _flip_to_sentinel(
+            "PR-300", 300, participants="[borges, ariadne]", turn="borges",
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        err = capsys.readouterr().err
+        assert "no colleague approval" in err
+        assert "300" in err
+        assert "non-author colleague" in err
+        client.post.assert_not_called()  # nothing written on refusal
+
+    def test_no_approval_with_colleague_force_proceeds_with_warning(self, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch, approval=("no_approval", "no APPROVED review"))
+        client, args = _flip_to_sentinel(
+            "PR-301", 301, participants="[borges, ariadne]", turn="borges", force=True,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        err = capsys.readouterr().err
+        assert "warning" in err.lower()
+        assert "no colleague approval" in err
+
+    def test_no_approval_without_colleague_single_agent_warns_and_proceeds(
+        self, monkeypatch, capsys
+    ):
+        _pin_gate_states(monkeypatch, approval=("no_approval", "no APPROVED review"))
+        client, args = _flip_to_sentinel(
+            "PR-302", 302, participants="[borges]", turn="borges",
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        err = capsys.readouterr().err
+        assert "single-agent mode" in err
+        assert "warning" in err.lower()
+
+    def test_fresh_approval_with_colleague_proceeds_silently(self, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch, approval=("fresh", "approval covers tip"))
+        client, args = _flip_to_sentinel(
+            "PR-303", 303, participants="[borges, ariadne]", turn="borges",
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        assert capsys.readouterr().err == ""
+
+    def test_stale_approval_with_colleague_refuses_via_the_stale_branch(
+        self, monkeypatch, capsys
+    ):
+        """The stale branch must fire before the no_approval branch is reached."""
+        _pin_gate_states(monkeypatch, approval=("stale", "tip moved after approval"))
+        client, args = _flip_to_sentinel(
+            "PR-304", 304, participants="[borges, ariadne]", turn="borges",
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        assert "tip moved after approval" in capsys.readouterr().err
+        client.post.assert_not_called()
+
+    def test_unknown_approval_warns_and_proceeds(self, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch, approval=("unknown", "gh timed out after 15s"))
+        client, args = _flip_to_sentinel(
+            "PR-306", 306, participants="[borges, ariadne]", turn="borges",
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        assert "could not verify post-approval state" in capsys.readouterr().err
+
+    def test_inverted_holder_refusal_does_not_name_the_author_as_approver(
+        self, monkeypatch, capsys
+    ):
+        """The colleague (ariadne) holds the baton and flips to the sentinel
+        with no approval. The colleague set is derived from participants minus
+        the holder, so it resolves to the AUTHOR (borges); the refusal must
+        stay generic and must not tell the reader borges is the approver."""
+        _pin_gate_states(monkeypatch, approval=("no_approval", "no APPROVED review"))
+        client, args = _flip_to_sentinel(
+            "PR-500", 500, participants="[borges, ariadne]", turn="ariadne",
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        err = capsys.readouterr().err
+        assert "non-author colleague" in err
+        assert "borges" not in err
+        client.post.assert_not_called()
+
+
+class TestInitColleagueParticipants:
+    """`baton init --colleague` shapes the POSTed participants list (ported
+    from the retired colleague-gate tests 9 and 11; the file-write body note
+    those tests also asserted no longer exists, see the #3346 mapping)."""
+
+    @staticmethod
+    def _args(pid, participants, colleague):
+        return argparse.Namespace(
+            project_id=pid, title="t", participants=participants,
+            turn="borges", status="in-progress", github=None,
+            repo="engram-agents/engram-paper", colleague=colleague,
+        )
+
+    def test_colleague_is_added_to_participants_and_silences_the_warning(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        client = _make_client(post_return={"seq": 1})
+        _baton.cmd_init(self._args("PR-401", "borges", "ariadne"), MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["participants"] == ["borges", "ariadne"]
+        assert body["colleague"] == "ariadne"
+        captured = capsys.readouterr()
+        assert "no colleague participant" not in captured.err
+        assert "colleague:    ariadne" in captured.out
+
+    def test_colleague_already_in_participants_is_not_duplicated(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        client = _make_client(post_return={"seq": 1})
+        _baton.cmd_init(
+            self._args("PR-402", "borges,ariadne", "ariadne"), MULTI_CONFIG, "borges", client,
+        )
+
+        _, body = client.post.call_args[0]
+        assert body["participants"].count("ariadne") == 1
+
+
+_MERGE_REPO = "example-org/example-repo"
+
+
+class _MergeHarness:
+    """Shared plumbing for the merge-gate ladder tests below."""
+
+    @staticmethod
+    def client_for(num, *, turn="casey", status="in-progress", github=True):
+        fm = {"turn": turn, "status": status, "participants": "[borges, ariadne]"}
+        if github:
+            fm["github"] = f"pr/{_MERGE_REPO}/{num}"
+        return _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(f"PR-{num}", **fm)},
+        )
+
+    @staticmethod
+    def stub_gh(monkeypatch, *, returncode=0, stderr="", raises=None):
+        calls = []
+
+        def _run(cmd, **kwargs):
+            calls.append(cmd)
+            if raises is not None:
+                raise raises
+            r = MagicMock()
+            r.returncode = returncode
+            r.stdout = ""
+            r.stderr = stderr
+            return r
+
+        monkeypatch.setattr(_baton.subprocess, "run", _run)
+        return calls
+
+    @staticmethod
+    def merge(client, pr, *, force=False, dry_run=False):
+        args = argparse.Namespace(pr=pr, force=force, dry_run=dry_run)
+        _baton.cmd_merge(args, MULTI_CONFIG, "borges", client)
+
+
+class TestMergeGateLadder(_MergeHarness):
+    """`baton merge` gate ladder re-asserted for the forum-API CLI (ported
+    from the retired tools/test_baton_merge_gate.py). Gate 2 refusals, the
+    repo-qualified CI-red refusal, the PR-number mismatch, the `--repo` flag
+    and the bare-anchor refusals already live in TestPoolSentinel above."""
+
+    def test_missing_baton_refuses_even_with_force_and_never_calls_gh(
+        self, monkeypatch, capsys
+    ):
+        _pin_gate_states(monkeypatch)
+        gh = self.stub_gh(monkeypatch)
+        client = _make_client()
+        client.get.side_effect = ForumHttpError(404, '{"error": "not found"}')
+        for force in (False, True):
+            with pytest.raises(SystemExit) as exc_info:
+                self.merge(client, "PR-508", force=force)
+            assert exc_info.value.code == EXIT_VALIDATION
+        assert "not found" in capsys.readouterr().err.lower()
+        assert gh == []
+        client.post.assert_not_called()
+
+    def test_happy_path_squash_merges_then_closes_the_baton_via_the_api(
+        self, monkeypatch, capsys
+    ):
+        _pin_gate_states(monkeypatch)
+        gh = self.stub_gh(monkeypatch)
+        client = self.client_for(502)
+        self.merge(client, "PR-502")
+
+        assert gh == [["gh", "pr", "merge", "502", "--squash", "--repo", _MERGE_REPO]]
+        path, body = client.post.call_args[0]
+        assert path == "/api/projects/PR-502/merge"
+        assert body["agent"] == "borges"
+        assert body["forced"] is False
+        assert "merged (squash)" in capsys.readouterr().out
+
+    def test_pending_ci_refuses_and_writes_nothing(self, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch, ci=("pending", "check 'tests' status=IN_PROGRESS"))
+        gh = self.stub_gh(monkeypatch)
+        client = self.client_for(504)
+        with pytest.raises(SystemExit) as exc_info:
+            self.merge(client, "PR-504")
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        assert "pending" in capsys.readouterr().err.lower()
+        assert gh == []
+        client.post.assert_not_called()
+
+    def test_stale_approval_refuses_and_writes_nothing(self, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch, approval=("stale", "tip oid abc1234 not covered"))
+        gh = self.stub_gh(monkeypatch)
+        client = self.client_for(506)
+        with pytest.raises(SystemExit) as exc_info:
+            self.merge(client, "PR-506")
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        assert "tip moved after approval" in capsys.readouterr().err
+        assert gh == []
+        client.post.assert_not_called()
+
+    def test_force_skips_ci_and_approval_and_records_the_actual_states(
+        self, monkeypatch, capsys
+    ):
+        """--force bypasses gates 3-4 but still queries them, so the warning
+        records what was bypassed; the closure POST carries forced=True."""
+        _pin_gate_states(
+            monkeypatch, ci=("red", "lint FAILURE"), approval=("stale", "tip oid mismatch"),
+        )
+        gh = self.stub_gh(monkeypatch)
+        client = self.client_for(505)
+        self.merge(client, "PR-505", force=True)
+
+        err = capsys.readouterr().err
+        assert "--force" in err
+        assert "actual: red" in err
+        assert "actual: stale" in err
+        assert len(gh) == 1
+        _, body = client.post.call_args[0]
+        assert body["forced"] is True
+
+    def test_no_approval_passes_through_gate_4(self, monkeypatch):
+        """no_approval is the colleague layer's jurisdiction, not the merge gate's."""
+        _pin_gate_states(monkeypatch, approval=("no_approval", "no APPROVED review"))
+        gh = self.stub_gh(monkeypatch)
+        self.merge(self.client_for(507), "PR-507")
+        assert len(gh) == 1
+
+    @pytest.mark.parametrize("which", ["ci", "approval"])
+    def test_unknown_gate_state_warns_and_proceeds(self, which, monkeypatch, capsys):
+        kwargs = {which: ("unknown", "gh not found on PATH")}
+        _pin_gate_states(monkeypatch, **kwargs)
+        gh = self.stub_gh(monkeypatch)
+        self.merge(self.client_for(514), "PR-514")
+
+        assert len(gh) == 1
+        assert "could not verify" in capsys.readouterr().err
+
+    def test_dry_run_prints_the_verdict_and_changes_nothing(self, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch)
+        gh = self.stub_gh(monkeypatch)
+        client = self.client_for(510)
+        self.merge(client, "PR-510", dry_run=True)
+
+        out = capsys.readouterr().out
+        assert "DRY-RUN" in out
+        assert "gate 1 (baton exists): PASS" in out
+        assert "gate 3 (CI)" in out and "gate 4 (approval)" in out
+        assert gh == []
+        client.post.assert_not_called()
+
+    def test_gh_nonzero_exit_is_exit_io_and_leaves_the_baton_alone(
+        self, monkeypatch, capsys
+    ):
+        _pin_gate_states(monkeypatch)
+        self.stub_gh(monkeypatch, returncode=1, stderr="PR is already merged")
+        client = self.client_for(511)
+        with pytest.raises(SystemExit) as exc_info:
+            self.merge(client, "PR-511")
+
+        assert exc_info.value.code == EXIT_IO
+        assert "Baton state unchanged" in capsys.readouterr().err
+        client.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "raises,needle",
+        [
+            (FileNotFoundError("gh not found"), "gh not found"),
+            (subprocess.TimeoutExpired(cmd="gh", timeout=60), "timed out"),
+        ],
+        ids=["gh-missing", "gh-timeout"],
+    )
+    def test_gh_missing_or_timeout_is_exit_io_and_leaves_the_baton_alone(
+        self, raises, needle, monkeypatch, capsys
+    ):
+        _pin_gate_states(monkeypatch)
+        self.stub_gh(monkeypatch, raises=raises)
+        client = self.client_for(512)
+        with pytest.raises(SystemExit) as exc_info:
+            self.merge(client, "PR-512")
+
+        assert exc_info.value.code == EXIT_IO
+        assert needle in capsys.readouterr().err
+        client.post.assert_not_called()
+
+    @pytest.mark.parametrize("arg", ["PR-516", "516", "#516"])
+    def test_pr_argument_forms_resolve_to_the_same_baton_and_pr(
+        self, arg, monkeypatch
+    ):
+        _pin_gate_states(monkeypatch)
+        gh = self.stub_gh(monkeypatch)
+        client = self.client_for(516)
+        self.merge(client, arg)
+
+        client.get.assert_called_with("/api/projects/PR-516")
+        assert gh[0][3] == "516"
+
+    @pytest.mark.parametrize("status", ["merged", "cancelled"])
+    def test_already_closed_baton_refuses(self, status, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch)
+        gh = self.stub_gh(monkeypatch)
+        client = self.client_for(518, status=status)
+        with pytest.raises(SystemExit) as exc_info:
+            self.merge(client, "PR-518")
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        assert f"already {status}" in capsys.readouterr().err
+        assert gh == []
+        client.post.assert_not_called()

@@ -391,12 +391,10 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     # no APPROVED review will be rejected. Without it, the gate falls back to
     # single-agent (warn-only) mode.
     colleague_name = getattr(args, "colleague", None)
-    colleague_note = ""
     if colleague_name:
         colleague_name = colleague_name.strip().lower()
         if colleague_name and colleague_name not in participants:
             participants.append(colleague_name)
-        colleague_note = f"Colleague reviewer: {colleague_name}"
 
     # Default turn: the invoking agent (if in participants) else first participant
     if args.turn:
