@@ -20,9 +20,11 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
+from _short_socket import MAX_SOCKET_PATH_BYTES, short_socket_path
 
 AGENTCTL_MAC = Path(__file__).resolve().parent.parent / "tools" / "agentctl-mac"
 AGENTCTL_LINUX = Path(__file__).resolve().parent.parent / "tools" / "agentctl"
@@ -503,7 +505,27 @@ def _run_managed_mac_codex(
     version_output: str | None = None,
     socket_is_real: bool = True,
 ) -> tuple[subprocess.CompletedProcess[str], str, Path]:
-    socket_path = tmp_path / "app-server-control.sock"
+    with short_socket_path() as socket_path:
+        return _run_managed_mac_codex_at(
+            tmp_path,
+            socket_path,
+            *args,
+            session_exists=session_exists,
+            start_rc=start_rc,
+            version_output=version_output,
+            socket_is_real=socket_is_real,
+        )
+
+
+def _run_managed_mac_codex_at(
+    tmp_path: Path,
+    socket_path: Path,
+    *args: str,
+    session_exists: bool,
+    start_rc: int,
+    version_output: str | None,
+    socket_is_real: bool,
+) -> tuple[subprocess.CompletedProcess[str], str, Path]:
     sock = _make_unix_socket(socket_path) if socket_is_real else None
     if not socket_is_real:
         socket_path.write_text("not a socket", encoding="utf-8")
@@ -533,6 +555,21 @@ def _run_managed_mac_codex(
     finally:
         if sock is not None:
             sock.close()
+
+
+def test_short_socket_path_stays_under_the_af_unix_limit_even_with_a_long_tmpdir(tmp_path, monkeypatch):
+    """The helper's socket path must not depend on tmp_path/TMPDIR length (#3292)."""
+    long_tmp = tmp_path / ("x" * 120)
+    long_tmp.mkdir()
+    # tempfile caches its default dir, so setenv("TMPDIR") alone would be a no-op
+    # once gettempdir() has run; set the cache itself so a helper that falls back
+    # to the default tempdir (drops dir="/tmp") lands in the long dir and fails.
+    monkeypatch.setattr(tempfile, "tempdir", str(long_tmp))
+    with short_socket_path() as path:
+        assert len(os.fsencode(path)) < MAX_SOCKET_PATH_BYTES
+        sock = _make_unix_socket(path)  # a real bind, as macOS would do
+        sock.close()
+    assert not path.parent.exists()
 
 
 def test_mac_codex_ensures_verified_daemon_then_starts_remote_tui_in_cwd(tmp_path):

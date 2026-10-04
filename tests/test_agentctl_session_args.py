@@ -18,6 +18,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from _short_socket import short_socket_path
+
 AGENTCTL = Path(__file__).resolve().parent.parent / "tools" / "agentctl"
 
 
@@ -749,7 +751,31 @@ def _run_managed_codex(
     socket_is_real: bool = True,
     inside_managed_tmux: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], str]:
-    socket_path = tmp_path / "app-server-control.sock"
+    with short_socket_path() as socket_path:
+        return _run_managed_codex_at(
+            tmp_path,
+            socket_path,
+            *args,
+            session_exists=session_exists,
+            start_rc=start_rc,
+            version_rc=version_rc,
+            version_output=version_output,
+            socket_is_real=socket_is_real,
+            inside_managed_tmux=inside_managed_tmux,
+        )
+
+
+def _run_managed_codex_at(
+    tmp_path: Path,
+    socket_path: Path,
+    *args: str,
+    session_exists: bool,
+    start_rc: int,
+    version_rc: int,
+    version_output: str | None,
+    socket_is_real: bool,
+    inside_managed_tmux: bool,
+) -> tuple[subprocess.CompletedProcess[str], str]:
     sock = _make_unix_socket(socket_path) if socket_is_real else None
     if not socket_is_real:
         socket_path.write_text("not a socket", encoding="utf-8")
