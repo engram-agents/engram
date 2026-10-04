@@ -1,0 +1,16 @@
+{
+  "name": "engram-probe",
+  "version": "0.1.0",
+  "author": { "name": "ENGRAM project (dev probe)" },
+  "description": "Dev probe (part of #3362): measures what thinking-keyed ENGRAM recall would surface at each model step. Observe-only; changes nothing the model reads during the turn.",
+  "userConfig": {
+    "enabled": { "type": "boolean", "title": "Enabled", "description": "Master switch. false registers nothing.", "default": true },
+    "topK": { "type": "number", "title": "Candidates per arm", "description": "1..20", "default": 5 },
+    "minThinkingChars": { "type": "number", "title": "Min thinking chars", "description": "Steps with less thinking text get a skipped row and no arm runs.", "default": 200 },
+    "arms": { "type": "string", "title": "Arms", "description": "Comma list of arms to run.", "default": "thinking_full,thinking_tail,extract_model,tool_input,novel_terms" },
+    "extractModel": { "type": "string", "title": "Arm C model", "description": "Model for the extract_model arm.", "default": "haiku" },
+    "extractTimeoutMs": { "type": "number", "title": "Arm C timeout (ms)", "description": "Time limit for the extract_model completion.", "default": 6000 },
+    "maxRatingChars": { "type": "number", "title": "Rating request cap", "description": "Hard cap of the end-of-turn rating request row.", "default": 1200 },
+    "probeDir": { "type": "string", "title": "Probe directory", "description": "Where step/rating files go; ~ is the HOME directory.", "default": "~/.engram/probe/mods-recall" }
+  }
+}
