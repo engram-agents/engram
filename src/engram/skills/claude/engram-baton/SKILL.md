@@ -38,7 +38,7 @@ A **Project** (bunch) is a topic-coherent or defect-class-coherent unit of work 
 ### PR layer — `flip`
 
 A **PR-baton** (e.g., `PR-487`) tracks the per-PR turn cursor through the review pipeline:
-1. Coder-fairy opens PR → `baton init PR-N --title "<short>" --participants alice,bob --turn alice --status in-progress`
+1. Coder-fairy opens PR → `baton init PR-N --title "<short>" --participants alice,bob --turn alice --status in-progress --repo <owner>/<repo>`
 2. Reviewer-fairy converges → `baton flip PR-N bob "fairy-converged; colleague request"`
 3. Colleague review → `baton flip PR-N {{USER_NAME}} "colleague-APPROVED"`
 4. Maintainer merge → eventual `baton close PR-N --status merged`
@@ -84,10 +84,10 @@ The auto-pull hook surfaces live GitHub status only when a baton has a resolvabl
 2. **Explicit anchor required**: all other ids (e.g. `PR-env-home`, `pool-data-correctness`) — the hook resolves to None and skips the live-status clause unless you set a `github:` field.
 
 To set the anchor:
-- **At init time**: `baton init <id> --title "..." --participants <a,b> --github pr/<N>`
-- **On an existing baton**: `baton anchor <id> --github pr/<N>` (or `--github project/<N>`)
+- **At init time**: `baton init <id> --title "..." --participants <a,b> --github pr/<owner>/<repo>/<N>` (`baton init` refuses a bare `pr/<N>`: there is no default repo; the server later refuses a bare anchor at gc/flip/merge)
+- **On an existing baton**: `baton anchor <id> --github pr/<owner>/<repo>/<N>` (or `--github project/<N>`)
 
-Valid anchor formats: `pr/<N>` for PRs, `project/<N>` for GitHub Projects. Malformed values (e.g. `xyz`, `pr/abc`) are rejected with `EXIT_VALIDATION`.
+Valid anchor formats: `pr/<owner>/<repo>/<N>` for PRs (bare `pr/<N>` parses but is refused downstream), `project/<N>` for GitHub Projects. Malformed values (e.g. `xyz`, `pr/abc`) are rejected with `EXIT_VALIDATION`.
 
 ---
 
@@ -122,9 +122,9 @@ Three genres of inter-agent communication, only one of which baton-grab replaces
 | Release a Project back to pool (abandoned) | `baton release <pool-X> --reason "<why>"` |
 | Pass a PR's turn forward | `baton flip <PR-N> <to-agent> "<reason>"` |
 | Colleague approved → hand to the merge seat (strict, server-gated) | `baton advance <PR-N> [--to <merge-seat>]` |
-| Open a new PR baton | `baton init <PR-N> --title "<short>" --participants <a,b> --turn <self> --status in-progress` |
-| Open a new PR baton with GitHub anchor | `baton init <id> ... --github pr/<N>` |
-| Set/update GitHub anchor on existing baton | `baton anchor <id> --github pr/<N>` |
+| Open a new PR baton | `baton init <PR-N> --title "<short>" --participants <a,b> --turn <self> --status in-progress --repo <owner>/<repo>` |
+| Open a new PR baton with GitHub anchor | `baton init <id> ... --github pr/<owner>/<repo>/<N>` |
+| Set/update GitHub anchor on existing baton | `baton anchor <id> --github pr/<owner>/<repo>/<N>` |
 | Set/change the expected colleague reviewer | `baton set-colleague <id> <agent>` |
 | Add a participant to an existing baton | `baton add-participant <id> <agent>` |
 | Rename a Project's title | `baton rename <id> --title "<new>"` |

@@ -314,6 +314,19 @@ _PROJECT_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*-[A-Za-z0-9][A-Za-z0-9_-]*$
 # with the sibling copy in hooks/claude/engram-baton-prompt-hook.py.
 _PR_BATON_NAME_RE = re.compile(r"^(?:[A-Z][A-Z0-9]*-)?PR-")
 
+# The NUMBER-carrying subset of _PR_BATON_NAME_RE (#2916): the same optional
+# single prefix segment, then "PR-<N>", optionally followed by a "-<slug>"
+# tail (PR-37-paper). Group 1 is the PR number. MATCH IT ON project_id.upper(),
+# exactly like the effective classifier (_is_pr_shaped does
+# _PR_BATON_NAME_RE.match(id.upper())), so case variants such as "umwelt-pr-5"
+# -- which ARE PR batons -- also derive an anchor and get the refusal instead
+# of the silent anchorless dead end. `cmd_init` uses it for BOTH the bare
+# pr/<N> auto-derive and the colleague-warning check, so "is a PR baton" and
+# "derives an anchor" agree. The prefix is NEVER mapped to a repo (#1918:
+# there is no default repo) -- only the number is read from the id; the repo
+# must come from --repo / --github.
+_PR_BATON_NUMBER_RE = re.compile(r"^(?:[A-Z][A-Z0-9]*-)?PR-(\d+)(?:-.+)?$")
+
 # _GITHUB_ANCHOR_RE and _parse_github_anchor now live in baton_gate.py
 # (#2884, second half) -- imported above, shared with src/forum/server.py's
 # api_project_flip. See baton_gate.py for the full "#1918: no default repo"
@@ -431,7 +444,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     # different places pre-#1715, is exactly what let a repo-unqualified
     # match silently corrupt a cross-repo baton's stored status).
     if github_anchor is None:
-        _pr_from_id = re.match(r"^(?:PR-|pr-)(\d+)$", project_id)
+        _pr_from_id = _PR_BATON_NUMBER_RE.match(project_id.upper())
         if _pr_from_id:
             github_anchor = f"pr/{_pr_from_id.group(1)}"
 
@@ -511,11 +524,14 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     # deliberately.
     #
     # Scope note: fires only when an anchor RESOLVES TO A PR and is
-    # unqualified. A baton with no github anchor at all (a DESIGN-* project,
-    # or a PR-shaped id the auto-derive regex doesn't match, e.g.
-    # UMWELT-PR-<N>) is untouched -- cmd_gc already counts those as ungauged,
-    # and widening this to cover them needs a broader notion of "is this a PR
-    # baton" than project_id shape alone. Tracked in #1924, not guessed at.
+    # unqualified. The auto-derive covers every number-carrying PR-baton id
+    # (_PR_BATON_NUMBER_RE: PR-<N>, <PREFIX>-PR-<N>, PR-<N>-<slug>, #2916), so
+    # UMWELT-PR-<N> is refused without --repo/--github just like bare PR-<N>
+    # -- it used to mint with NO anchor, silently, and dead-end at the
+    # peer->merge flip. The prefix is deliberately NOT mapped to a repo.
+    # A baton with no github anchor at all (a DESIGN-* project, a bunch id,
+    # an id with two prefix segments) is untouched -- cmd_gc already
+    # counts those as ungauged.
     _final_anchor = _parse_github_anchor(github_anchor) if github_anchor else None
     if _final_anchor is not None and _final_anchor[0] == "pr" and _final_anchor[1] is None:
         _n = _final_anchor[2]
@@ -602,8 +618,8 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     # participants (participants ⊆ {initial turn holder, sentinel}), warn at
     # creation time
     # so the gap surfaces here rather than silently at flip.
-    _is_bare_pr_id = re.match(r"^(?:PR-|pr-)(\d+)$", project_id)
-    if _is_bare_pr_id:
+    _is_pr_baton_id = _PR_BATON_NUMBER_RE.match(project_id.upper())
+    if _is_pr_baton_id:
         _sentinel = _pool_sentinel()
         # Colleague candidates: participants other than the initial turn
         # holder and the pool sentinel. (This is about the COLLEAGUE gate --

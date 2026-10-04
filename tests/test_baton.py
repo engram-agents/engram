@@ -4275,6 +4275,124 @@ class TestInitRepoQualification:
         assert body.get("github") == "pr/engram-agents/engram-paper/22"
 
 
+class TestInitPrefixedPrBatonAnchor:
+    """#2916: the auto-derive (and the colleague warning) must cover every id
+    _PR_BATON_NAME_RE classifies as a PR baton AND that carries a number --
+    PR-<N>, <UPPERCASE-PREFIX>-PR-<N>, PR-<N>-<slug> -- not only bare PR-<N>.
+    Before, UMWELT-PR-959 minted with NO anchor, silently, and the dead end
+    surfaced at the peer->merge flip (anchor is write-once at fairy phase).
+    The refusal (#1924) is unchanged; only its reach is widened. The repo is
+    never inferred from the prefix (#1918: no default repo)."""
+
+    @staticmethod
+    def _args(project_id, github=None, repo=None, participants="borges,ariadne",
+              colleague=None):
+        return argparse.Namespace(
+            project_id=project_id, title="t", participants=participants,
+            status="planning", turn=None, github=github, repo=repo,
+            colleague=colleague,
+        )
+
+    @pytest.fixture(autouse=True)
+    def _sentinel(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+    @pytest.mark.parametrize("pid", ["UMWELT-PR-1234", "SOMA-PR-5", "PR-37-paper"])
+    def test_prefixed_id_without_repo_is_refused(self, pid, capsys):
+        client = _make_client({"seq": 1})
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(self._args(pid), MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()  # no baton created
+        err = capsys.readouterr().err
+        assert "--repo" in err
+        assert "auto-derived" in err
+
+    @pytest.mark.parametrize("pid,repo,expected", [
+        ("UMWELT-PR-1234", "engram-agents/umwelt", "pr/engram-agents/umwelt/1234"),
+        ("SOMA-PR-5", "engram-agents/soma", "pr/engram-agents/soma/5"),
+        ("PR-37-paper", "engram-agents/engram-paper",
+         "pr/engram-agents/engram-paper/37"),
+    ])
+    def test_prefixed_id_with_repo_derives_qualified_anchor(self, pid, repo, expected):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(self._args(pid, repo=repo), MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["github"] == expected
+
+    def test_prefixed_id_with_qualified_github_accepted_unchanged(self):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(
+            self._args("UMWELT-PR-1234", github="pr/engram-agents/umwelt/1234"),
+            MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["github"] == "pr/engram-agents/umwelt/1234"
+
+    def test_prefixed_id_conflicting_repo_still_refused(self):
+        client = _make_client({"seq": 1})
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(
+                self._args("UMWELT-PR-1234",
+                           github="pr/engram-agents/umwelt/1234",
+                           repo="engram-agents/soma"),
+                MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+
+    @pytest.mark.parametrize("pid", ["DESIGN-foo", "pool-x", "XPR-5", "MY-X-PR-5"])
+    def test_non_pr_ids_derive_no_anchor_and_no_refusal(self, pid):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(self._args(pid), MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert not body.get("github")
+
+    # The effective classifier (_is_pr_shaped) matches _PR_BATON_NAME_RE on
+    # project_id.upper(), so case variants ARE PR batons (fairy phase); the
+    # derive must agree or they hit the #2916 dead end.
+    CASE_VARIANTS = ["umwelt-pr-5", "umwelt-PR-5", "UMWELT-pr-5"]
+
+    @pytest.mark.parametrize("pid", CASE_VARIANTS)
+    def test_case_variant_without_repo_is_refused(self, pid, capsys):
+        client = _make_client({"seq": 1})
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(self._args(pid), MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        assert "--repo" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("pid", CASE_VARIANTS)
+    def test_case_variant_with_repo_derives_qualified_anchor(self, pid):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(self._args(pid, repo="o/r"), MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["github"] == "pr/o/r/5"
+
+    def test_name_shaped_but_numberless_id_inits_without_anchor(self):
+        """Current, pre-existing behaviour -- documented, NOT endorsed:
+        'PR-12abc' is PR-shaped by name (fairy phase) but carries no number,
+        so no anchor is derived and nothing is refused."""
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(self._args("PR-12abc"), MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["transition_phase"] == "fairy"
+        assert not body.get("github")
+
+    @pytest.mark.parametrize("pid", ["UMWELT-PR-1234", "PR-37-paper", "PR-9"])
+    def test_colleague_warning_fires_without_colleague(self, pid, capsys):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(
+            self._args(pid, repo="engram-agents/umwelt", participants="borges"),
+            MULTI_CONFIG, "borges", client)
+        assert "no colleague participant" in capsys.readouterr().err
+
+    def test_colleague_warning_silent_for_non_pr_id(self, capsys):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(self._args("DESIGN-foo", participants="borges"),
+                        MULTI_CONFIG, "borges", client)
+        assert "no colleague participant" not in capsys.readouterr().err
+
+
 class TestInitAuthorIsInvoker:
     """#3042: `baton init --turn <someone-else>` recorded THAT agent as the
     baton's `author:`, not the agent who ran the command.
@@ -6330,6 +6448,7 @@ class TestInitPhaseWrite:
             project_id="UMWELT-PR-775", title="pr test",
             participants="borges,ariadne", status="planning",
             turn=None, github=None, colleague=None,
+            repo="engram-agents/umwelt",  # #2916: prefixed PR ids now need it
         )
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
 

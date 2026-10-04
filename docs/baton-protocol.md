@@ -91,7 +91,7 @@ Create a new project baton file. Fails if the file already exists.
 
 ```bash
 baton init PR-425 --title "viz_server global agent selector" \
-    --participants borges,ariadne --status in-review
+    --participants borges,ariadne --status in-review --repo engram-agents/engram
 ```
 
 ### `baton flip <PROJECT-ID> <TO> "<reason>"`
@@ -342,7 +342,7 @@ The `BATON_PROJECTS_DIR` environment variable overrides the default path
 
 ```bash
 BATON_PROJECTS_DIR=/tmp/baton-smoke baton init PR-999 --title "smoke" \
-    --participants alice,bob
+    --participants alice,bob --repo test-owner/test-repo
 ```
 
 ---
