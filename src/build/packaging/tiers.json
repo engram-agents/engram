@@ -447,6 +447,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/erase_session_block.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/anchoring_report.py",
       "tier": "convenience"
     },

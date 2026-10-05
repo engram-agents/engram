@@ -289,9 +289,10 @@ def _erase_correct(text: str) -> str:
     lines = text.splitlines()
     anchored_indices = [i for i, line in enumerate(lines) if line == HEADING]
     assert anchored_indices, "fixture must contain at least one anchored heading"
-    target = anchored_indices[-1]
-    kept = lines[:target]
-    return "\n".join(kept) + "\n\n" + HEADING + "\n"
+    # #3141: erase by CHARACTER OFFSET so the region above the anchor stays
+    # byte-identical (a line-join rebuild is not byte-faithful).
+    start = list(re.finditer(r"(?m)^## From this session", text))[-1].start()
+    return text[:start] + HEADING + "\n"
 
 
 def _erase_wrong_first_match(text: str) -> str:
