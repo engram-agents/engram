@@ -51,6 +51,7 @@ sequential, no branching:
   Step 7 — Wait for the drawn fairies + collect reports
   Step 8 — Spawn the dream master with the full report bundle
   Step 9 — Receive the dream master's final return and relay to the user
+  Step 9.5 — Triage the dream's awake-seat findings (do / file / defer) and append the dispositions to the dream record
 
 The dream master owns the heavy consolidation (engram_reflect, agenda
 walk, supersedes/resolves/promotes, engram_advance_turn, dream record).
@@ -1059,8 +1060,36 @@ The dream master returns:
 - Recall summaries: applied / fixed-at-spot / unfixable counts
 - Health score delta
 - Flagged-for-user count
+- awake-seat items: N (count of numbered items in `## For the awake seat`; 0 when the block is `none`)
 
-Relay this to the user in 3-6 short bullets. Surface the dream-record path so the user can read the "Flagged for the user" section in the morning review. Then stop. The session is over.
+Relay this to the user in 3-6 short bullets. Surface the dream-record path so the user can read the "Flagged for the user" section in the morning review. Then go to Step 9.5.
+
+### Step 9.5 — Triage the dream's awake-seat findings (parent; do now / file / defer)
+
+For EVERY item under `## For the awake seat` and `## Open for tomorrow` in the dream record the master just returned, write exactly ONE disposition:
+
+- `do now` — one command or one write (a question resolvable by one measurement; a task node to close; a one-line fix). Do it, and cite the resulting node id / commit / command output in the disposition line.
+- `file` — larger than one step: a GitHub issue (preferred when code, tooling or a skill changes) or an `engram_add_task` node whose text cites the dream record path. Write `file (#N)` or `file (tk_XXXX)`. An item already covered by an open issue or task is `file (existing #N)`.
+- `defer` — only with a one-line reason: `defer — <reason>`. A reason is required; "noted", "carried" and "for the awake seat" are NOT dispositions.
+
+Append the dispositions to the dream record as a new final section `## Sleep-end triage (parent)` — one line per item. **Keys, by POSITION:** awake-seat items are keyed by the master's number (`1. do now — …`, `2. file (#N) — …`); open-for-tomorrow items are keyed by their position in order of appearance, `o1`, `o2`, … (`o1. defer — <reason>`), whatever each bullet starts with (a node id such as `qu_XXXX`, an `ob_XXXX`, or plain text) — masters do not reliably write `qu_` bullets, but the parent can always count position. The section lists `1. …`, `2. …` first, then `o1. …`, `o2. …`. **Heading suffix:** a record's `## Open for tomorrow` heading may carry a parenthetical suffix (e.g. `## Open for tomorrow (awake work)`); match on the heading's prefix. The morning check in `session-start-reading` compares item counts per section against triage lines per prefix.
+
+**Empty block.** If `## For the awake seat` is the literal line `none` and `## Open for tomorrow` is empty, still append `## Sleep-end triage (parent)` with the single line `none (0 items)` and log `sleep-end triage: 0 items`.
+
+**Partial return.** If the master returned partial and the `## For the awake seat` block is ABSENT, append the section with one line `master returned partial — block absent; triaged from the fairy reports instead:` followed by any dispositions. Step 9.5 triages only what the fairy reports already contain; it runs no master step. Anything unfinished still goes to the next cohort via the "Don't retry an interrupted dream" guardrail below.
+
+Then commit, mirroring the master's own record commit (a second commit on the same file):
+
+```bash
+git -C ~/.engram add history/dream/YYYY-MM-DD.md
+git -C ~/.engram commit -m "dream YYYY-MM-DD: sleep-end triage"
+```
+
+Log one line in today's history file: `sleep-end triage: N items — D do-now, F filed, X deferred`. Then stop. The session is over.
+
+**Bounded exception to "Why Phase A is pre-turn-advance" (below).** Step 9.5's do-now writes land after `engram_advance_turn`, the case that section calls "artificially placed in the next cohort". Accepted deliberately and bounded: a do-now write acts on a dream finding, not on the just-ended cohort, so it belongs to the next cohort by content, not by accident. A morning read would file them in the same turn.
+
+**Why here.** The parent that spawned the master is the only guaranteed reader of its return, in context and awake; the master cannot act on its own findings (it files no observations and dispatches nothing). A morning read of the same block is kept as a backstop check (`session-start-reading`), not the primary path (alpha #3403).
 
 ---
 
@@ -1072,7 +1101,7 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 
 ## Guardrails
 
-- **Parent does NOT call `engram_reflect`, `engram_advance_turn`, or write the dream record.** Those are dream-master responsibilities. The parent's job is orchestration + relay.
+- **Parent does NOT call `engram_reflect` or `engram_advance_turn`, and does NOT write the dream record.** Those are dream-master responsibilities. One bounded exception: the Step 9.5 `## Sleep-end triage (parent)` append to the dream record, and its commit. The parent's job is otherwise orchestration + relay.
 
 - **Parent's context is light by design.** Dispatch + routing messages costs little context. If your context fills up during the routing phase, **nap first to clear it, then return and dispatch the full lottery-drawn set** — do not reduce or drop fairies from `types_to_run`. The dream master's context is separate and unaffected by parent compaction. (See the Phase B mandatory invariant above: context pressure is never a reason to skip fairies.)
 

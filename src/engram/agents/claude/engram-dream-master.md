@@ -545,6 +545,7 @@ You may call `engram_advance_turn` ONLY when ALL of these are true:
 - [ ] Repair-pass provenance record written — best-effort, never blocks `advance_turn`, but the record itself (a normal `status: "ran"` night, or a `status: "skipped"` night with its reason — round 2, engram-alpha#2519: a skip night writes the record too, it no longer just logs the reason) must exist, never silence
 - [ ] Truly-unfixable cases written to the dream record with specific node IDs + reason
 - [ ] Dream-review feeling-nudge handled (filed or null-reported, honestly)
+- [ ] "For the awake seat" written as a numbered block (empty block = the literal line "none")
 - [ ] Dream record file written and committed in .engram git
 - [ ] Sleep-success marker written via `~/.engram/tools/write_sleep_marker.py`
 - [ ] ask-{{USER_NAME}}.md updated with this cycle's flagged-for-user items (or skipped if surface not deployed) — post-advance, non-blocking
@@ -666,6 +667,12 @@ Format:
 - [node_id] (proposed action) — why it needs the user's call (one line per item)
 - ...
 
+## For the awake seat
+*The PARENT triages this block at sleep-end (do now / file / defer) — you cannot: you file no observations and dispatch nothing. `## Open for tomorrow` below stays the research-direction list, whatever each bullet's prefix (a node id or plain text), and is triaged by the same step, which appends `## Sleep-end triage (parent)` to this record. What qualifies for THIS block: an action inside the awake agent's own authority that you saw and could not take — a fix, a close, a re-measure, a pin/unpin, a surface edit. This block is the one list: anything addressed to the parent anywhere in this record (a category's prose, a summary under Open for tomorrow) must also be a numbered item here. Items for the user's call belong in "Flagged for the user", not here.*
+1. <what> — <why / the one command or the size estimate>
+2. <what> — <why / the one command or the size estimate> (carried from YYYY-MM-DD)
+(empty block = the literal line "none")
+
 ## Open for tomorrow
 - qu_XXXX: one-line research direction
 - ...
@@ -786,6 +793,7 @@ After everything in the checklist is done and the dream record is committed, ret
 - Recall summaries: applied / fixed / unfixable counts
 - Health score delta
 - Flagged-for-user count + ask-{{USER_NAME}}.md status (updated / skipped — surface not deployed / failed — see dream record)
+- awake-seat items: N (count of numbered items in `## For the awake seat`; 0 when the block is `none`)
 
 The parent relays this to the user. Your invocation ends.
 
