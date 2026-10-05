@@ -925,14 +925,39 @@ def _require_int(route: str, field: str, raw) -> None:
     a string of ASCII digits with an optional leading minus (int("5") is accepted today and
     clients may rely on it).  absent / null keeps its meaning.  A float (even 1.0), any other
     string, a list and a dict are a 422, same shape as _require_str.  The caller keeps its own
-    int() parse after this guard."""
+    int() parse after this guard.
+
+    #3438: a value outside SQLite's signed 64-bit range (int or digit string) is a 422 too --
+    it used to overflow at the sqlite binding (a 500, on /read after upsert_agent)."""
     if raw is None:
         return
     if isinstance(raw, int) and not isinstance(raw, bool):
+        _require_int64(route, field, raw)
         return
     if isinstance(raw, str) and _INT_STR.fullmatch(raw):
+        # Leading zeros are stripped before int(): int() refuses a string of more than
+        # 4300 digits (a ValueError) and "0"*5000+"5" is the in-range value 5, which the
+        # caller's own parse still answers as before.
+        digits = raw.lstrip("-").lstrip("0")
+        if len(digits) > 25:  # far outside 64 bits; never parse or echo it
+            raise _field_refusal(route, field, f"{_INT64_MSG} (got a {len(digits)}-digit integer)")
+        _require_int64(route, field, int(digits or "0") * (-1 if raw.startswith("-") else 1))
         return
     raise _field_refusal(route, field, f"must be an integer (got {type(raw).__name__})")
+
+
+_INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
+_INT64_MSG = "must be an integer within the 64-bit range"
+
+
+def _require_int64(route: str, field: str, n: int) -> None:
+    """#3438: refuse an int outside SQLite's signed 64-bit range (a 422 before any read or
+    write; the binding would raise OverflowError).  The value is echoed only when short."""
+    if _INT64_MIN <= n <= _INT64_MAX:
+        return
+    text = str(n)
+    got = text if len(text) <= 25 else f"a {len(text.lstrip('-'))}-digit integer"
+    raise _field_refusal(route, field, f"{_INT64_MSG} (got {got})")
 
 
 def _require_utf8_deep(route: str, field: str, value) -> None:
@@ -2211,6 +2236,10 @@ def create_app(
         # expected_republish_seconds: absent key → None (global window).
         # Present-but-malformed is validated by set_agent_status → 400.
         expected_republish = data.get("expected_republish_seconds")
+        # #3438: a real int beyond 64 bits overflowed at the sqlite binding (a 500), before
+        # set_agent_status could answer.  A string / bool / float stays set_agent_status' 400.
+        if isinstance(expected_republish, int) and not isinstance(expected_republish, bool):
+            _require_int64("POST /api/agents/status", "expected_republish_seconds", expected_republish)
 
         try:
             db.set_agent_status(

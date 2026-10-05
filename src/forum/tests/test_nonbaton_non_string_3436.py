@@ -301,6 +301,15 @@ INT_VALUES = [
     ("abc", "abc", "str"),
     ("list", [1], "list"),
     ("dict", {}, "dict"),
+    # #3438: pin the full-string ASCII-digit rule (`_INT_STR.fullmatch`).  A `.match`
+    # mutant kept every earlier cell green: "5x" / "5 " would pass the guard.
+    ("trailing_junk", "5x", "str"),
+    ("leading_space", " 5", "str"),
+    ("plus_sign", "+5", "str"),
+    ("trailing_space", "5 ", "str"),
+    ("empty", "", "str"),
+    ("fullwidth_digit", "５", "str"),
+    ("trailing_newline", "5\n", "str"),
 ]
 
 # (route, variant, field)
@@ -391,3 +400,119 @@ def test_control_last_read_post_id_null_defaults_to_max_post(world):
     r = send(world, "POST", f"/api/thread/{tid}/read", {"agent": "bob", "last_read_post_id": None})
     assert r.status_code == 200, r.data
     assert r.get_json()["last_read_post_id"] == pid
+
+
+# ---------------------------------------------------------------------------
+# #3438: integers outside SQLite's signed 64-bit range
+# ---------------------------------------------------------------------------
+#
+# Measured at 20c1e81f: `_require_int` accepted any Python int, so thread_id (POST
+# /api/post reply), post_id (accept) and last_read_post_id (read) = 2**63, -(2**63)-1 or
+# 10**30 -- as an int AND as a digit string -- overflowed at the sqlite binding: a 500
+# (on /read AFTER upsert_agent, so an agent row was created).  expected_republish_seconds
+# (agents/status) did not use `_require_int`: an int >= 2**63 was a 500, a digit string
+# and a negative were a 400 from set_agent_status.  Now a value outside [-(2**63), 2**63-1]
+# is a 422 before the first read or write; the boundary values themselves still pass.
+
+INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
+OUT_OF_RANGE = [("2**63", 2**63), ("-(2**63)-1", -(2**63) - 1), ("10**30", 10**30)]
+OOR_FORMS = [(f"{n}_{kind}", conv(v)) for n, v in OUT_OF_RANGE for kind, conv in (("int", int), ("str", str))]
+RANGE_MSG = "must be an integer within the 64-bit range"
+
+
+@pytest.mark.parametrize("val_name,value", OOR_FORMS, ids=[v[0] for v in OOR_FORMS])
+@pytest.mark.parametrize("cell", INT_CELLS, ids=[int_cell_id(c) for c in INT_CELLS])
+def test_out_of_range_id_is_a_422_that_writes_nothing(world, cell, val_name, value):
+    route, variant, field = cell
+    prime(world, route)
+    method, url, body = agent_request(world, route, variant, value, field=field)
+    before = (snapshot(world), extra_state(world))
+
+    resp = send(world, method, url, body)
+
+    assert resp.status_code == 422, f"{resp.status_code}: {err_of(resp) or resp.data[:200]!r}"
+    assert err_of(resp).startswith(f"{route}: field '{field}' {RANGE_MSG} (got "), err_of(resp)
+    assert "\n" not in err_of(resp)
+    assert (snapshot(world), extra_state(world)) == before, "a refused request wrote something"
+
+
+@pytest.mark.parametrize("val_name,value", OOR_FORMS, ids=[v[0] for v in OOR_FORMS])
+def test_read_out_of_range_creates_no_agent_row(world, val_name, value):
+    # The old 500 came AFTER upsert_agent: the sender row survived the failed request.
+    tid, _ = seed_thread(world)
+    assert q(world, "SELECT name FROM agents WHERE name = 'bob'") == []
+    resp = send(world, "POST", f"/api/thread/{tid}/read", {"agent": "bob", "last_read_post_id": value})
+    assert resp.status_code == 422, resp.data
+    assert q(world, "SELECT name FROM agents WHERE name = 'bob'") == []
+    assert q(world, "SELECT * FROM reads") == []
+
+
+def test_out_of_range_message_does_not_echo_a_huge_value(world):
+    tid, _ = seed_thread(world)
+    resp = send(world, "POST", f"/api/thread/{tid}/read",
+                {"agent": "bob", "last_read_post_id": "9" * 5000})
+    assert resp.status_code == 422, resp.data
+    assert len(err_of(resp)) < 200, len(err_of(resp))
+    assert "9" * 40 not in err_of(resp)
+
+
+@pytest.mark.parametrize("value", [INT64_MAX, INT64_MIN, str(INT64_MAX), str(INT64_MIN)],
+                         ids=["max_int", "min_int", "max_str", "min_str"])
+@pytest.mark.parametrize("cell", INT_CELLS, ids=[int_cell_id(c) for c in INT_CELLS])
+def test_boundary_ids_pass_the_guard(world, cell, value):
+    route, variant, field = cell
+    method, url, body = agent_request(world, route, variant, value, field=field)
+    resp = send(world, method, url, body)
+    # Whatever the route then does with a nonexistent id (404; a read just stores the
+    # watermark -> 200) -- it is neither the guard's 422 nor a 500.
+    assert resp.status_code in (200, 404), f"{resp.status_code}: {err_of(resp) or resp.data[:200]!r}"
+
+
+@pytest.mark.parametrize("cell", INT_CELLS, ids=[int_cell_id(c) for c in INT_CELLS])
+def test_zero_padded_digit_string_beyond_the_int_str_limit_is_not_a_500(world, cell):
+    # 5000 leading zeros is the value 5 but int() refuses a >4300-digit string; the guard
+    # must neither crash on it nor change the route's own answer (400 "must be an integer").
+    route, variant, field = cell
+    method, url, body = agent_request(world, route, variant, "0" * 5000 + "5", field=field)
+    resp = send(world, method, url, body)
+    assert resp.status_code == 400, f"{resp.status_code}: {err_of(resp) or resp.data[:200]!r}"
+
+
+@pytest.mark.parametrize("cell", INT_CELLS, ids=[int_cell_id(c) for c in INT_CELLS])
+def test_huge_digit_string_is_a_422_not_a_crash(world, cell):
+    route, variant, field = cell
+    method, url, body = agent_request(world, route, variant, "7" * 5000, field=field)
+    resp = send(world, method, url, body)
+    assert resp.status_code == 422, f"{resp.status_code}: {err_of(resp) or resp.data[:200]!r}"
+
+
+# expected_republish_seconds (agents/status): not routed through `_require_int` (a digit
+# string stays the 400 set_agent_status gave it), but a real int beyond 64 bits is the same
+# class and the same 422.
+
+def status_body(value):
+    return {"agent": "bob", "state": "working", "expected_republish_seconds": value}
+
+
+@pytest.mark.parametrize("value", [2**63, 10**30, -(2**63) - 1], ids=["2**63", "10**30", "-(2**63)-1"])
+def test_expected_republish_seconds_out_of_range_int_is_a_422_that_writes_nothing(world, value):
+    prime(world, STATUS)
+    before = snapshot(world)
+    resp = send(world, "POST", "/api/agents/status", status_body(value))
+    assert resp.status_code == 422, f"{resp.status_code}: {err_of(resp) or resp.data[:200]!r}"
+    assert err_of(resp).startswith(f"{STATUS}: field 'expected_republish_seconds' {RANGE_MSG} (got "), err_of(resp)
+    assert snapshot(world) == before, "a refused request wrote something"
+
+
+def test_expected_republish_seconds_boundaries_and_strings_keep_their_answers(world):
+    prime(world, STATUS)
+    # max int64 is a valid non-negative int; the negative boundary is still set_agent_status' 400.
+    r = send(world, "POST", "/api/agents/status", status_body(INT64_MAX))
+    assert r.status_code == 200, r.data
+    assert q(world, "SELECT expected_republish_seconds FROM agents WHERE name='bob'") == [(INT64_MAX,)]
+    r = send(world, "POST", "/api/agents/status", status_body(INT64_MIN))
+    assert r.status_code == 400 and "non-negative int" in err_of(r), r.data
+    # digit strings were and stay a 400 from set_agent_status (any magnitude).
+    for s in ("5", str(2**63), str(10**30)):
+        r = send(world, "POST", "/api/agents/status", status_body(s))
+        assert r.status_code == 400 and "non-negative int" in err_of(r), (s, r.data)
