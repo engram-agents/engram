@@ -1854,6 +1854,18 @@ def cmd_show(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
 # Subcommand: close
 # ---------------------------------------------------------------------------
 
+def _server_refusal_text(e: "ForumHttpError") -> str:
+    """The server's own ``error`` string from a 403/409 refusal body (#3313),
+    falling back to the raw body when it is not the usual ``{"error": ...}`` JSON."""
+    try:
+        parsed = json.loads(e.body)
+        if isinstance(parsed, dict) and parsed.get("error"):
+            return str(parsed["error"])
+    except (ValueError, TypeError):
+        pass
+    return str(e.body)
+
+
 def cmd_close(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     _require_forum(config)
 
@@ -1908,6 +1920,11 @@ def cmd_close(args: argparse.Namespace, config: dict, agent_name: str, client: F
         if e.status == 404:
             print(f"baton close: project not found: {project_id}", file=sys.stderr)
             sys.exit(EXIT_STATE)
+        if e.status in (403, 409):
+            # #3313: server-side refusal (non-participant / already closed) --
+            # print the server's message verbatim; nothing was written.
+            print(f"baton close: refused (HTTP {e.status}): {_server_refusal_text(e)}", file=sys.stderr)
+            sys.exit(EXIT_VALIDATION)
         print(f"baton close: server error {e.status}: {e.body}", file=sys.stderr)
         sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
     print(f"baton close: {project_id} → {new_status}")
@@ -1982,6 +1999,10 @@ def cmd_reopen(args: argparse.Namespace, config: dict, agent_name: str, client: 
         if e.status == 404:
             print(f"baton reopen: project not found: {project_id}", file=sys.stderr)
             sys.exit(EXIT_STATE)
+        if e.status in (403, 409):
+            # #3313: server-side refusal -- print the server's message verbatim.
+            print(f"baton reopen: refused (HTTP {e.status}): {_server_refusal_text(e)}", file=sys.stderr)
+            sys.exit(EXIT_VALIDATION)
         print(f"baton reopen: server error {e.status}: {e.body}", file=sys.stderr)
         sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
     print(f"baton reopen: {project_id} → {new_status}")

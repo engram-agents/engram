@@ -3548,8 +3548,22 @@ def create_app(
         Neither ``close`` nor ``reopen`` ever writes a transition phase
         (Kepler's ruling), so there is no ``transition_phase`` field here.
         Response: {seq, turn, status}, 201.
+        Errors (#3313; the gates live in the coordination write-fns, so a direct
+        call into them cannot skip them; ``agent`` is caller-declared, so the
+        403 stops a mistaken or misdirected write, not a caller who names a
+        participant; checked in this order, and a
+        refusal writes nothing -- no frontmatter change, no turn-log line, no
+        seq consumed): 400 (missing/invalid fields), 404 (project not found),
+        403 (``agent`` is not a current participant of the baton; the
+        maintainer/sentinel counts only if listed in ``participants``),
+        409 (close-direction write on a baton ALREADY closed -- names the
+        current status; reopen of a closed baton is the legal path and is
+        never refused with 409), 503 (store not configured).
         """
-        from forum.coordination import close as _close, reopen as _reopen, ProjectNotFound
+        from forum.coordination import (
+            close as _close, reopen as _reopen, ProjectNotFound,
+            NotAParticipant, AlreadyClosed,
+        )
 
         store = app.config.get("COORD_STORE")
         allocator = app.config.get("COORD_ALLOCATOR")
@@ -3586,9 +3600,15 @@ def create_app(
             if new_status in _ACTIVE_STATUSES:
                 seq = _reopen(store, allocator, pid, invoker=agent, new_status=new_status, phase=phase)
             else:
-                seq = _close(store, allocator, pid, new_status=new_status, reason=reason, phase=phase)
+                seq = _close(store, allocator, pid, invoker=agent, new_status=new_status,
+                             reason=reason, phase=phase)
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
+        except NotAParticipant:
+            return jsonify({"error": f"agent {agent!r} is not a participant of {pid}"}), 403
+        except AlreadyClosed as e:
+            return jsonify({"error": f"project {pid} is already {e.status}; "
+                            "refusing to overwrite a closed status (reopen first)"}), 409
 
         turn, status = _read_project_state(store, pid)
         return jsonify({"seq": seq, "turn": turn, "status": status}), 201
@@ -3848,8 +3868,10 @@ def create_app(
         ``close`` never writes a transition phase, so there is no
         ``transition_phase`` field here either.
         Response: {seq, turn, status}, 201.
+        Errors: 400, 404, 409 (baton already closed, #3313; nothing written).
+        No participant gate (403) on this route -- see the in-body note.
         """
-        from forum.coordination import close as _close, ProjectNotFound
+        from forum.coordination import close as _close, ProjectNotFound, AlreadyClosed
 
         store = app.config.get("COORD_STORE")
         allocator = app.config.get("COORD_ALLOCATOR")
@@ -3881,9 +3903,20 @@ def create_app(
             return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
 
         try:
-            seq = _close(store, allocator, pid, new_status=new_status, reason=reason, phase=phase)
+            # #3313: the closed-state refusal (409) applies here too -- gc
+            # only ever closes ACTIVE batons, so a double close is an
+            # overwrite. The PARTICIPANT gate is deliberately NOT applied on
+            # this route yet (require_participant=False): `baton gc` is run by
+            # whoever sweeps and is a participant of only a minority of live
+            # PR batons, so gating it would break the sweep. That is an open
+            # design decision on #3313, not a settled exemption.
+            seq = _close(store, allocator, pid, invoker=agent, new_status=new_status,
+                         reason=reason, phase=phase, require_participant=False)
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
+        except AlreadyClosed as e:
+            return jsonify({"error": f"project {pid} is already {e.status}; "
+                            "refusing to overwrite a closed status (reopen first)"}), 409
 
         turn, status = _read_project_state(store, pid)
         return jsonify({"seq": seq, "turn": turn, "status": status}), 201

@@ -394,7 +394,7 @@ def test_set_status_missing_project_raises(store, allocator):
 
 def test_close_updates_status_and_appends_log(store, allocator):
     seq = close(
-        store, allocator, "PR-1",
+        store, allocator, "PR-1", invoker="ariadne",
         new_status="merged",
         reason="scope complete",
         ts="2026-06-26T12:00:00Z",
@@ -411,7 +411,7 @@ def test_close_updates_status_and_appends_log(store, allocator):
 def test_close_byte_exact_golden(store, allocator):
     """Byte-exact: log line format is '- {ts} close: {status} — {reason}'."""
     close(
-        store, allocator, "PR-1",
+        store, allocator, "PR-1", invoker="ariadne",
         new_status="merged",
         reason="scope complete",
         ts="2026-06-26T12:00:00Z",
@@ -423,7 +423,7 @@ def test_close_byte_exact_golden(store, allocator):
 def test_close_does_not_touch_turn_fields(store, allocator):
     """close() only mutates the status field; turn / turn_since / turn_reason are unchanged."""
     close(
-        store, allocator, "PR-1",
+        store, allocator, "PR-1", invoker="ariadne",
         new_status="merged",
         reason="done",
         ts="2026-06-26T12:00:00Z",
@@ -436,14 +436,14 @@ def test_close_does_not_touch_turn_fields(store, allocator):
 
 
 def test_close_returns_monotonic_seq(store, allocator):
-    seq1 = close(store, allocator, "PR-1", new_status="abandoned", reason="first")
-    seq2 = close(store, allocator, "PR-1", new_status="merged", reason="second")
+    seq1 = close(store, allocator, "PR-1", invoker="ariadne", new_status="abandoned", reason="first")
+    seq2 = close(store, allocator, "PR-1", invoker="ariadne", new_status="merged", reason="second")
     assert seq2 > seq1
 
 
 def test_close_missing_project_raises(store, allocator):
     with pytest.raises(ProjectNotFound):
-        close(store, allocator, "PR-nope", new_status="merged", reason="done")
+        close(store, allocator, "PR-nope", invoker="ariadne", new_status="merged", reason="done")
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +481,7 @@ def closed_allocator(closed_store):
 def test_reopen_updates_status_and_appends_log(closed_store, closed_allocator):
     seq = reopen(
         closed_store, closed_allocator, "PR-2",
-        invoker="luria",
+        invoker="ariadne",
         new_status="in-progress",
         ts="2026-06-26T12:00:00Z",
     )
@@ -498,19 +498,19 @@ def test_reopen_byte_exact_golden(closed_store, closed_allocator):
     """Byte-exact: log line format is '- {ts} reopened → {invoker}: status was {old} → {new}'."""
     reopen(
         closed_store, closed_allocator, "PR-2",
-        invoker="luria",
+        invoker="ariadne",
         new_status="in-progress",
         ts="2026-06-26T12:00:00Z",
     )
     raw = closed_store.read_project("PR-2")
-    assert "- 2026-06-26T12:00:00Z reopened → luria: status was merged → in-progress" in raw
+    assert "- 2026-06-26T12:00:00Z reopened → ariadne: status was merged → in-progress" in raw
 
 
 def test_reopen_reads_current_status_for_log(closed_store, closed_allocator):
     """The 'status was X' fragment must reflect the pre-reopen status read from the file, not a caller arg."""
     reopen(
         closed_store, closed_allocator, "PR-2",
-        invoker="luria",
+        invoker="ariadne",
         new_status="in-progress",
         ts="2026-06-26T12:00:00Z",
     )
@@ -522,7 +522,7 @@ def test_reopen_does_not_touch_turn_fields(closed_store, closed_allocator):
     """reopen() only mutates the status field; turn / turn_since / turn_reason are unchanged."""
     reopen(
         closed_store, closed_allocator, "PR-2",
-        invoker="luria",
+        invoker="ariadne",
         new_status="in-progress",
         ts="2026-06-26T12:00:00Z",
     )
@@ -535,7 +535,7 @@ def test_reopen_does_not_touch_turn_fields(closed_store, closed_allocator):
 
 def test_reopen_missing_project_raises(store, allocator):
     with pytest.raises(ProjectNotFound):
-        reopen(store, allocator, "PR-nope", invoker="luria", new_status="in-progress")
+        reopen(store, allocator, "PR-nope", invoker="ariadne", new_status="in-progress")
 
 
 # ---------------------------------------------------------------------------
@@ -1785,7 +1785,7 @@ class TestU2aRound3EightNewlyWiredConversions:
 
     def test_close_stamps_phase_on_legacy_baton(self, store, allocator):
         close(
-            store, allocator, "PR-1", new_status="merged", reason="closing",
+            store, allocator, "PR-1", invoker="ariadne", new_status="merged", reason="closing",
             phase="merge", ts="2026-09-30T00:00:00Z",
         )
         raw = store.read_project("PR-1")
@@ -1799,7 +1799,7 @@ class TestU2aRound3EightNewlyWiredConversions:
         s.write_project("PR-1", _baton_with_phase(turn="ariadne", phase="peer"), seq=0)
         a = SeqAllocator(recover=s.recover_max_seq)
         close(
-            s, a, "PR-1", new_status="merged", reason="closing",
+            s, a, "PR-1", invoker="ariadne", new_status="merged", reason="closing",
             phase="merge", ts="2026-09-30T00:00:00Z",
         )
         raw = s.read_project("PR-1")

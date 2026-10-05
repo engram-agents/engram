@@ -21,6 +21,7 @@ from typing import Callable, Optional
 from . import markdown as md
 from .seq import SeqAllocator
 from .store import CoordinationStore
+from .store_file import CLOSED_STATUSES
 
 # Participants list format: [alice, bob] or alice,bob — the same on-disk
 # grammar tools/baton.py and store_file.py already parse. A third private copy
@@ -38,13 +39,14 @@ def _maybe_stamp_phase(fields: dict, phase: Optional[str], now: str) -> tuple[di
     Calling this repeatedly/sequentially on the same baton is idempotent: a
     second call sees the first call's already-committed stamp (via its own
     fresh `store.read_project` read) and no-ops. This does NOT protect
-    against genuinely overlapping concurrent callers — `read_project`
-    happens before the allocator lock is acquired in every write-body, so
-    two truly concurrent writers can each decide to stamp from stale reads;
-    the second writer's full-document write then clobbers the first's, the
-    same pre-existing lost-update exposure every other field in this store
-    already has. See issue #3255 for tracking genuine concurrent-write
-    safety across `projects.py`.
+    against genuinely overlapping concurrent callers — in every write-body
+    EXCEPT `close`, `reopen` (#3313) and `advance` (#3039 U2b), which read
+    inside `allocator.locked()`, `read_project` happens before the allocator
+    lock is acquired, so two truly concurrent writers can each decide to
+    stamp from stale reads; the second writer's full-document write then
+    clobbers the first's, the same pre-existing lost-update exposure every
+    other field in this store already has. See issue #3255 for tracking
+    genuine concurrent-write safety across `projects.py`.
     """
     if not phase:
         return {}, ""
@@ -89,6 +91,21 @@ class NotAParticipant(Exception):
     not-authorized error + exit code (typically HTTP 403); the write-fn does
     not assume how the caller reports it.
     """
+
+
+class AlreadyClosed(Exception):
+    """Raised by ``close`` when the baton is ALREADY in a closed status (#3313).
+
+    A close-direction write on a closed baton is an overwrite (``merged ->
+    cancelled`` is not a transition). ``status`` carries the current closed
+    status so the route/CLI can name it. The legal way back to an active
+    status is ``reopen``, which never raises this.
+    """
+
+    def __init__(self, project_id: str, status: str):
+        super().__init__(f"project {project_id} is already {status}")
+        self.project_id = project_id
+        self.status = status
 
 
 def _parse_participants(participants_str: str) -> list:
@@ -584,13 +601,31 @@ def close(
     allocator: SeqAllocator,
     project_id: str,
     *,
+    invoker: str,
     new_status: str,
     reason: str,
     phase: Optional[str] = None,
     transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
+    require_participant: bool = True,
 ) -> int:
-    """Pure write body of baton cmd_close / gc. Validation (new_status ∈ CLOSED_STATUSES, not already closed) is the caller's job.
+    """Pure write body of baton cmd_close / gc.
+
+    Server-side gates (#3313, LOAD-BEARING -- they live HERE so a call into
+    the write-fn cannot skip them; ``invoker`` is caller-declared, so the 403
+    stops a mistaken or misdirected write, not a caller who names a
+    participant; checked in this order, BEFORE any write, so a refusal
+    consumes no seq and touches no byte):
+
+    1. ``ProjectNotFound`` -- no such baton.
+    2. ``NotAParticipant`` -- ``invoker`` (case-insensitive) is not in the
+       baton's ``participants`` list (same predicate as ``add_participant``).
+       Skipped only when ``require_participant=False``, an in-process kwarg
+       (never wire-exposed) used by the ``/gc`` route pending the #3313 gc
+       decision.
+    3. ``AlreadyClosed`` -- the baton's current status is already in
+       ``CLOSED_STATUSES``; a close on top of a closed baton is an overwrite.
+       Applies to every close-direction write regardless of ``new_status``.
 
     Updates ``status`` in frontmatter (turn fields are NOT touched), appends a
     close turn-log entry, and writes atomically under the allocator lock (fork-4).
@@ -602,6 +637,8 @@ def close(
     ``status: cancelled`` recording the terminal state.
 
     Args:
+        invoker: agent performing the close (normalised to lowercase); must
+            be a current participant (gate 2).
         new_status: the target closed-status string (e.g. ``"merged"``, ``"abandoned"``).
         reason: human-readable explanation logged in the turn-log entry.
         phase: the caller-computed CONVERSION phase for this close -- see
@@ -613,30 +650,43 @@ def close(
             this for ``close`` (it defines no transition; see class docstring
             above).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+        require_participant: in-process only; ``False`` skips gate 2.
 
     Returns:
         The seq assigned to this mutation.
 
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
+        NotAParticipant: if ``invoker`` is not a current participant.
+        AlreadyClosed: if the baton is already in a closed status.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
-
     now = ts or md.now_iso()
-    fields, _ = md.parse_frontmatter(content)
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+    invoker_n = invoker.strip().lower()
+    # Read, gates and write all inside ONE critical section (the check-and-set
+    # pattern `advance` uses), so two concurrent closes cannot both pass the
+    # closed-state check on a stale read. The seq is claimed only after the
+    # gates pass, so a refusal consumes none.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
+        fields, _ = md.parse_frontmatter(content)
+        if require_participant and invoker_n not in _parse_participants(fields.get("participants", "")):
+            raise NotAParticipant(invoker_n)
+        current_status = fields.get("status", "").strip().lower()
+        if current_status in CLOSED_STATUSES:
+            raise AlreadyClosed(project_id, current_status)
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f"- {now} close: {new_status} — {reason}" + phase_log_suffix)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, f"- {now} close: {new_status} — {reason}" + phase_log_suffix)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
 
@@ -743,6 +793,14 @@ def reopen(
 ) -> int:
     """Pure write body of baton cmd_reopen. Validation (new_status ∈ ACTIVE_STATUSES, current_status ∈ CLOSED_STATUSES) is the caller's job. Reads current status internally for the log entry.
 
+    Server-side gate (#3313, LOAD-BEARING): ``invoker`` must be a current
+    participant of the baton (case-insensitive, same predicate as
+    ``add_participant``), else ``NotAParticipant`` is raised BEFORE any write
+    (no byte changed, no seq consumed). ``ProjectNotFound`` is checked first.
+    Reopen has no already-closed refusal -- reopening a closed baton is the
+    legal path; a reopen of an already-ACTIVE baton keeps its pre-#3313
+    behaviour (it overwrites no terminal state).
+
     Updates ``status`` in frontmatter (turn fields are NOT touched), appends a
     reopened turn-log entry recording the prior status, and writes atomically
     under the allocator lock (fork-4).
@@ -769,29 +827,36 @@ def reopen(
 
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
+        NotAParticipant: if ``invoker`` is not a current participant.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
-
     now = ts or md.now_iso()
     invoker_name = invoker.strip().lower()
-    fields, _ = md.parse_frontmatter(content)
-    current_status = fields.get("status", "")
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+    # Read, gate and write all inside ONE critical section (the check-and-set
+    # pattern `advance` uses): a read taken before the lock could be stale by
+    # the time the lock is acquired. The seq is claimed only after the gates
+    # pass, so a refusal consumes none.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
+        fields, _ = md.parse_frontmatter(content)
+        if invoker_name not in _parse_participants(fields.get("participants", "")):
+            raise NotAParticipant(invoker_name)
+        current_status = fields.get("status", "")
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(
-        body,
-        f"- {now} reopened → {invoker_name}: status was {current_status} → {new_status}" + phase_log_suffix,
-    )
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(
+            body,
+            f"- {now} reopened → {invoker_name}: status was {current_status} → {new_status}" + phase_log_suffix,
+        )
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
 

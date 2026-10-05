@@ -33,6 +33,7 @@ from .store_file import FileStore, default_store_root
 from .dm import dm_send, dm_read, dm_list
 from .projects import (
     AdvanceRefused,
+    AlreadyClosed,
     AdvanceResult,
     NotAParticipant,
     advance,
@@ -66,6 +67,7 @@ __all__ = [
     "dm_list",
     "AdvanceRefused",
     "AdvanceResult",
+    "AlreadyClosed",
     "NotAParticipant",
     "ProjectAlreadyExists",
     "ProjectNotFound",

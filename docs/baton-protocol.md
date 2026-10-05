@@ -299,6 +299,26 @@ listings. Does not delete the file — the turn log and history remain.
 baton close PR-425 --status merged
 ```
 
+**Server-side status gates (#3313).** `baton close` and `baton reopen` both
+write through `POST /api/projects/<pid>/status`; the gates live in the
+coordination write-fns, so a direct call into them cannot skip them. `agent`
+is caller-declared, as for `add-participant`: the 403 stops a mistaken or
+misdirected write (wrong seat, stale script, the 10-03 incident shape), not a
+caller who names a participant. The 409 does not depend on who calls. Order of
+checks, all BEFORE any write:
+
+| Order | Refusal | HTTP | When |
+|---|---|---|---|
+| 1 | project not found | 404 | no such baton |
+| 2 | not a participant | 403 | the requesting `agent` (case-insensitive) is not in the baton's `participants` list (the same test `add-participant` applies). The pool sentinel / maintainer is admitted only when listed in `participants`; there is no separate sentinel exemption |
+| 3 | already closed | 409 | a close-direction write on a baton already `merged` / `cancelled`; the message names the current status. Reopen of a closed baton is the legal path and is never refused here |
+
+A refusal writes nothing: no frontmatter change, no turn-log line, no seq
+consumed. The CLI prints the server's message and exits non-zero.
+`POST /api/projects/<pid>/gc` (used by `baton gc`) shares the 409 check but
+does not yet apply the participant gate (open design question on #3313: a
+sweeper is a participant of only a minority of PR batons).
+
 ---
 
 ## Session-start hook
