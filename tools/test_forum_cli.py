@@ -175,8 +175,8 @@ def wired_cli(flask_client, engram_home):
             if resp.status_code == 404:
                 print(f"forum: not found (404): {err_msg}", file=sys.stderr)
                 sys.exit(forum_cli.EXIT_NOT_FOUND)
-            elif resp.status_code == 400:
-                print(f"forum: validation error (400): {err_msg}", file=sys.stderr)
+            elif 400 <= resp.status_code < 500:
+                print(f"forum: validation error ({resp.status_code}): {err_msg}", file=sys.stderr)
                 sys.exit(forum_cli.EXIT_VALIDATION)
             else:
                 print(f"forum: server error ({resp.status_code}): {err_msg}", file=sys.stderr)
@@ -1544,8 +1544,8 @@ def wired_cli_packs(flask_app_with_packs, engram_home):
             if resp.status_code == 404:
                 print(f"forum: not found (404): {err_msg}", file=sys.stderr)
                 sys.exit(forum_cli.EXIT_NOT_FOUND)
-            elif resp.status_code == 400:
-                print(f"forum: validation error (400): {err_msg}", file=sys.stderr)
+            elif 400 <= resp.status_code < 500:
+                print(f"forum: validation error ({resp.status_code}): {err_msg}", file=sys.stderr)
                 sys.exit(forum_cli.EXIT_VALIDATION)
             else:
                 print(f"forum: server error ({resp.status_code}): {err_msg}", file=sys.stderr)
@@ -1788,3 +1788,55 @@ class TestRenderThreadHumanPostCount:
         out = capsys.readouterr().out
         header = "\n".join(out.splitlines()[:5])
         assert "29 posts" in header, header
+
+
+# ---------------------------------------------------------------------------
+# #3436 round 3: the REAL _do_request labels every 4xx (but 404) a validation error
+# ---------------------------------------------------------------------------
+
+class TestDoRequestHttpErrorLabels:
+    """Runs the real ``forum_cli._do_request`` against a stubbed urlopen that raises
+    HTTPError (the wired_cli fixture above replaces _do_request wholesale, so it cannot
+    pin this).  A 422 typed-field refusal was labelled "server error"."""
+
+    def _run(self, code, payload, capsys):
+        import urllib.error
+        import urllib.request
+
+        err = urllib.error.HTTPError(
+            "http://localhost:5002/api/x", code, "x", {}, io.BytesIO(json.dumps(payload).encode()),
+        )
+
+        def boom(req, timeout=None):
+            raise err
+
+        req = urllib.request.Request("http://localhost:5002/api/x")
+        with mock.patch.object(forum_cli, "_ipv4_only_urlopen", side_effect=boom), \
+             mock.patch.object(forum_cli, "_resolve_forum_url", return_value="http://localhost:5002"):
+            with pytest.raises(SystemExit) as exc:
+                forum_cli._do_request(req, "http://localhost:5002/api/x")
+        return exc.value.code, capsys.readouterr().err
+
+    @pytest.mark.parametrize("code", [400, 401, 409, 422])
+    def test_4xx_is_a_validation_error(self, code, capsys):
+        rc, err = self._run(code, {"error": "bad field"}, capsys)
+        assert rc == forum_cli.EXIT_VALIDATION
+        assert f"forum: validation error ({code}): bad field" in err
+        assert "server error" not in err
+
+    def test_422_message_and_exit(self, capsys):
+        rc, err = self._run(422, {"error": "POST /api/post: field 'thread_id' must be an integer (got bool)"}, capsys)
+        assert rc == forum_cli.EXIT_VALIDATION
+        assert "forum: validation error (422): POST /api/post: field 'thread_id' must be an integer (got bool)" in err
+
+    def test_404_keeps_its_own_branch(self, capsys):
+        rc, err = self._run(404, {"error": "nope"}, capsys)
+        assert rc == forum_cli.EXIT_NOT_FOUND
+        assert "forum: not found (404): nope" in err
+
+    @pytest.mark.parametrize("code", [500, 503])
+    def test_5xx_is_still_a_server_error(self, code, capsys):
+        rc, err = self._run(code, {"error": "boom"}, capsys)
+        assert rc == forum_cli.EXIT_VALIDATION  # unchanged: today's exit code for non-404/400
+        assert f"forum: server error ({code}): boom" in err
+        assert "validation error" not in err

@@ -344,8 +344,10 @@ def _do_request(req: urllib.request.Request, url: str) -> dict:
         if e.code == 404:
             print(f"forum: not found (404): {err_msg}", file=sys.stderr)
             sys.exit(EXIT_NOT_FOUND)
-        elif e.code == 400:
-            print(f"forum: validation error (400): {err_msg}", file=sys.stderr)
+        elif 400 <= e.code < 500:
+            # #3436 r3: every 4xx but 404 is a refusal of the request, not a server
+            # fault -- a 422 typed-field refusal used to be labelled "server error".
+            print(f"forum: validation error ({e.code}): {err_msg}", file=sys.stderr)
             sys.exit(EXIT_VALIDATION)
         else:
             print(f"forum: server error ({e.code}): {err_msg}", file=sys.stderr)

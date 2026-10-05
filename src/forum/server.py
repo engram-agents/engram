@@ -906,6 +906,35 @@ def _require_utf8(route: str, field: str, raw: str) -> None:
         raise _field_refusal(route, field, _NOT_UTF8) from None
 
 
+def _require_str(route: str, field: str, raw) -> None:
+    """#3436: a free-text OR identifier field (body_md, note, ..., and `agent` / `state`)
+    must be a string (absent / null stays "absent").  Same
+    422 and message shape as _read_fields' typed-field error, so a number / list / object
+    is refused here instead of reaching .strip() or a store binding (500) -- or, for
+    pair_initials, str() (silently stored as the value's repr)."""
+    if raw is not None and not isinstance(raw, str):
+        raise _field_refusal(route, field, f"must be a string (got {type(raw).__name__})")
+
+
+_INT_STR = re.compile(r"-?[0-9]+")
+
+
+def _require_int(route: str, field: str, raw) -> None:
+    """#3436 round 3: an integer-id field (thread_id, post_id, last_read_post_id) must be a
+    real int (not a bool: True is an int subclass, and int(True) == 1 wrote to thread 1) or
+    a string of ASCII digits with an optional leading minus (int("5") is accepted today and
+    clients may rely on it).  absent / null keeps its meaning.  A float (even 1.0), any other
+    string, a list and a dict are a 422, same shape as _require_str.  The caller keeps its own
+    int() parse after this guard."""
+    if raw is None:
+        return
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return
+    if isinstance(raw, str) and _INT_STR.fullmatch(raw):
+        return
+    raise _field_refusal(route, field, f"must be an integer (got {type(raw).__name__})")
+
+
 def _require_utf8_deep(route: str, field: str, value) -> None:
     """_require_utf8 over an arbitrary JSON value: strings, and list items / dict keys /
     dict values at any depth.  (#3318 review: a queue item may be a list or dict, and
@@ -1905,6 +1934,7 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
+        _require_str("POST /api/thread/<tid>/accept", "agent", data.get("agent"))  # #3436: before any read / write
         agent_name = (data.get("agent") or "").strip()
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
@@ -1912,6 +1942,7 @@ def create_app(
         post_id = data.get("post_id")
         if post_id is None:
             return jsonify({"error": "post_id is required"}), 400
+        _require_int("POST /api/thread/<tid>/accept", "post_id", post_id)  # #3436 r3: before any read / write
         try:
             post_id = int(post_id)
         except (ValueError, TypeError):
@@ -1952,13 +1983,15 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
+        _require_str("POST /api/post/<pid>/verify", "agent", data.get("agent"))  # #3436: before any read / write
         agent_name = (data.get("agent") or "").strip()
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
 
-        note = data.get("note") or ""
-        if isinstance(note, str):
-            _require_utf8("POST /api/post/<pid>/verify", "note", note)
+        note = data.get("note")
+        _require_str("POST /api/post/<pid>/verify", "note", note)  # #3436
+        note = note or ""
+        _require_utf8("POST /api/post/<pid>/verify", "note", note)
 
         if not db.is_valid_agent_name(agent_name):
             return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
@@ -1994,15 +2027,25 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
+        _require_str("POST /api/post", "agent", data.get("agent"))  # #3436: before any read / write
         agent_name = (data.get("agent") or "").strip()
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
+
+        thread_id = data.get("thread_id")
+        _require_int("POST /api/post", "thread_id", thread_id)  # #3436 r3: before any read / write
+        # #3436: a non-string free-text field is a 422 BEFORE any read or write.
+        # title / category_slug are read only for a new thread (a reply ignores them).
+        _typed = ["body_md", "hostname"]
+        if thread_id is None:
+            _typed += ["category_slug", "title"]
+        for _field in _typed:
+            _require_str("POST /api/post", _field, data.get(_field))
 
         body_md = (data.get("body_md") or "").strip()
         if not body_md:
             return jsonify({"error": "body_md is required"}), 400
 
-        thread_id = data.get("thread_id")
         source_ip = request.remote_addr or "unknown"
         hostname = (data.get("hostname") or "").strip() or None
 
@@ -2134,6 +2177,7 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
+        _require_str("POST /api/agents/status", "agent", data.get("agent"))  # #3436: before any read / write
         agent_name = (data.get("agent") or "").strip()
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
@@ -2143,12 +2187,17 @@ def create_app(
         state = data.get("state")
         if state is None:
             return jsonify({"error": "state is required"}), 400
+        # #3436: a list / dict state was a 500 (unhashable); an int / bool a 400 with the
+        # "not publishable" message.  Non-string is a 422 before any write.
+        _require_str("POST /api/agents/status", "state", state)
 
         queue = data.get("queue")
         if queue is not None and not isinstance(queue, list):
             return jsonify({"error": "queue must be a list"}), 400
 
-        activity = data.get("activity") or None
+        activity = data.get("activity")
+        _require_str("POST /api/agents/status", "activity", activity)  # #3436
+        activity = activity or None
 
         # #3318: a lone surrogate is a 422 for BOTH free-text fields.  (queue is stored
         # as a JSON escape that decodes back to the surrogate on every read; activity
@@ -2277,9 +2326,13 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
+        _require_str("POST /api/thread/<tid>/read", "agent", data.get("agent"))  # #3436: before any read / write
         agent_name = (data.get("agent") or "").strip()
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
+
+        # #3436 r3: refuse a non-integer watermark BEFORE upsert_agent (a write).
+        _require_int("POST /api/thread/<tid>/read", "last_read_post_id", data.get("last_read_post_id"))
 
         if not db.is_valid_agent_name(agent_name):
             return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
@@ -2327,13 +2380,15 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
+        _require_str("PATCH /api/agent/me", "agent", data.get("agent"))  # #3436: before any read / write
         agent_name = (data.get("agent") or "").strip()
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
 
         pair_initials = data.get("pair_initials")  # None = clear; str = set
+        _require_str("PATCH /api/agent/me", "pair_initials", pair_initials)  # #3436
         if pair_initials is not None:
-            pair_initials = str(pair_initials).strip() or None
+            pair_initials = pair_initials.strip() or None
             if pair_initials is not None:  # .strip() or None can yield None
                 _require_utf8("PATCH /api/agent/me", "pair_initials", pair_initials)
 
@@ -2927,10 +2982,12 @@ def create_app(
         if not data:
             return jsonify({"error": "JSON body required"}), 400
 
+        _require_str("POST /api/dm/<counterpart>", "agent", data.get("agent"))  # #3436: before any read / write
         agent = (data.get("agent") or "").strip().lower()
         if not agent:
             return jsonify({"error": "agent is required"}), 400
 
+        _require_str("POST /api/dm/<counterpart>", "body", data.get("body"))  # #3436
         body = (data.get("body") or "").strip()
         if not body:
             return jsonify({"error": "body is required"}), 400
