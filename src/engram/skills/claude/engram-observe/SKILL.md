@@ -202,8 +202,9 @@ source file:
     moment and re-read the file rather than assuming the quote is wrong.
   - Otherwise, re-check for paraphrase drift: did you reconstruct the quote
     from memory instead of copying it? Re-read the source and copy exactly.
-- **Exit 2** — could not check at all (bad usage, file does not exist). Fix
-  the path before proceeding; this is not a verification result.
+- **Exit 2** — could not check at all (bad usage, file does not exist, or the
+  path is not a regular file — a directory, FIFO or device). Fix the path
+  before proceeding; this is not a verification result.
 
 Only after a confirmed match should you call the filing tool. If a filing
 call still fails the server's own verbatim check after this pre-verification
