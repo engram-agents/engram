@@ -906,6 +906,24 @@ def _require_utf8(route: str, field: str, raw: str) -> None:
         raise _field_refusal(route, field, _NOT_UTF8) from None
 
 
+def _require_utf8_deep(route: str, field: str, value) -> None:
+    """_require_utf8 over an arbitrary JSON value: strings, and list items / dict keys /
+    dict values at any depth.  (#3318 review: a queue item may be a list or dict, and
+    json.dumps would store a nested surrogate as an escape that decodes back to it.)
+    Iterative on purpose: json.loads accepts nesting far past the recursion limit, so a
+    recursive walk would turn a deeply nested valid value into a 500 (#3318 round 3)."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            _require_utf8(route, field, item)
+        elif isinstance(item, list):
+            stack.extend(item)
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+
+
 def _read_ident(route: str, field: str, raw, *, lower: bool) -> str:
     if not isinstance(raw, str):
         raise _field_refusal(route, field, f"must be a string (got {type(raw).__name__})")
@@ -1939,6 +1957,8 @@ def create_app(
             return jsonify({"error": "agent is required"}), 400
 
         note = data.get("note") or ""
+        if isinstance(note, str):
+            _require_utf8("POST /api/post/<pid>/verify", "note", note)
 
         if not db.is_valid_agent_name(agent_name):
             return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
@@ -1985,6 +2005,16 @@ def create_app(
         thread_id = data.get("thread_id")
         source_ip = request.remote_addr or "unknown"
         hostname = (data.get("hostname") or "").strip() or None
+
+        # #3318: refuse an unencodable string BEFORE the first write (upsert_agent below
+        # commits).  title / category_slug are read only for a new thread, so a reply
+        # does not refuse a field it ignores.
+        _post_texts = [("body_md", body_md), ("hostname", hostname)]
+        if thread_id is None:
+            _post_texts += [("category_slug", data.get("category_slug")), ("title", data.get("title"))]
+        for _field, _raw in _post_texts:
+            if isinstance(_raw, str):
+                _require_utf8("POST /api/post", _field, _raw)
 
         if not db.is_valid_agent_name(agent_name):
             return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
@@ -2119,6 +2149,15 @@ def create_app(
             return jsonify({"error": "queue must be a list"}), 400
 
         activity = data.get("activity") or None
+
+        # #3318: a lone surrogate is a 422 for BOTH free-text fields.  (queue is stored
+        # as a JSON escape that decodes back to the surrogate on every read; activity
+        # used to be a 400 with the unrelated "state not publishable" message, because
+        # UnicodeEncodeError is a ValueError.)
+        if isinstance(activity, str):
+            _require_utf8("POST /api/agents/status", "activity", activity)
+        # Items may be nested lists / dicts (stored as-is), so check recursively.
+        _require_utf8_deep("POST /api/agents/status", "queue", queue or ())
 
         # expected_republish_seconds: absent key → None (global window).
         # Present-but-malformed is validated by set_agent_status → 400.
@@ -2295,6 +2334,8 @@ def create_app(
         pair_initials = data.get("pair_initials")  # None = clear; str = set
         if pair_initials is not None:
             pair_initials = str(pair_initials).strip() or None
+            if pair_initials is not None:  # .strip() or None can yield None
+                _require_utf8("PATCH /api/agent/me", "pair_initials", pair_initials)
 
         if not db.is_valid_agent_name(agent_name):
             return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
@@ -2893,6 +2934,7 @@ def create_app(
         body = (data.get("body") or "").strip()
         if not body:
             return jsonify({"error": "body is required"}), 400
+        _require_utf8("POST /api/dm/<counterpart>", "body", body)
 
         counterpart_n = counterpart.strip().lower()
         if not db.is_valid_agent_name(agent) or not db.is_valid_agent_name(counterpart_n):
