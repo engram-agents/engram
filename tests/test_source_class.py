@@ -1503,3 +1503,405 @@ def test_git_enforcement_link_classify_runs_under_lc_all_c():
         assert r.get("status") == "created", f"translated not-a-repo read as a failure: {r}"
     finally:
         shutil.rmtree(base, ignore_errors=True)
+
+
+# --- #3393: a file:// citation must name a regular file -----------------------
+
+def _dir_repo():
+    """Repo with a committed directory `d` (holding note.md) and a committed
+    symlink `dlink` -> `d`. Returns (base, repo)."""
+    base = os.path.realpath(tempfile.mkdtemp(prefix="engram_test_3393_"))
+    repo = os.path.join(base, "repo")
+    _init_git_repo(repo)
+    os.makedirs(os.path.join(repo, "d"))
+    with open(os.path.join(repo, "d", "note.md"), "w") as f:
+        f.write("Quote inside the directory.\n")
+    os.symlink("d", os.path.join(repo, "dlink"))
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-m", "dir evidence")
+    return base, repo
+
+
+def _count_nodes():
+    import engram_core as _core
+    # _get_db() creates the schema on first use: a bare sqlite3.connect on a
+    # fresh client's DB file has no `nodes` table until a tool has run.
+    conn = _core._get_db()
+    return conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+
+
+def _cite_dir(client, url, text, **extra):
+    payload = {
+        "url": url,
+        "title": "Directory evidence",
+        "quoted_text": text,
+        "interpretation": "Testing that a directory is not evidence.",
+        "claim": f"Directory citation {url[-12:]} {text[:10]}",
+        "quote_type": "hard_data",
+    }
+    payload.update(extra)
+    return client.call("engram_add_observation", payload)
+
+
+def _assert_rejected_as_not_a_file(r, path, before):
+    assert "error" in r, f"directory citation was not rejected: {r}"
+    assert r.get("status") != "created" and "observation_id" not in r, r
+    assert _count_nodes() == before, "a node row was written for a directory citation"
+    err = r["error"].lower()
+    assert "must be a file" in err or "regular file" in err, r["error"]
+    assert path.rstrip("/") in r["error"], f"error does not name the path: {r['error']}"
+
+
+def _assert_rejected_no_node(r, before):
+    """The evidence_id path reaches _verify_quote_in_source before the file-version
+    check, so a directory is refused there (message not under this fix's control):
+    assert only the integrity property, rejected and nothing written."""
+    assert "error" in r, f"directory citation was not rejected: {r}"
+    assert r.get("status") != "created" and "observation_id" not in r, r
+    assert _count_nodes() == before, "a node row was written for a directory citation"
+
+
+def test_directory_citation_rejected_by_name_3393():
+    base, repo = _dir_repo()
+    try:
+        client = fresh_client()
+        before = _count_nodes()
+        d = os.path.join(repo, "d")
+        r = _cite_dir(client, f"file://{d}", "Quote inside the directory.")
+        _assert_rejected_as_not_a_file(r, d, before)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_directory_citation_trailing_slash_rejected_3393():
+    base, repo = _dir_repo()
+    try:
+        client = fresh_client()
+        before = _count_nodes()
+        d = os.path.join(repo, "d")
+        r = _cite_dir(client, f"file://{d}/", "Quote inside the directory.")
+        _assert_rejected_as_not_a_file(r, d, before)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_directory_citation_fabricated_quote_rejected_3393():
+    base, repo = _dir_repo()
+    try:
+        client = fresh_client()
+        before = _count_nodes()
+        d = os.path.join(repo, "d")
+        r = _cite_dir(client, f"file://{d}", "A sentence nobody ever wrote anywhere.")
+        _assert_rejected_as_not_a_file(r, d, before)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_symlink_to_directory_citation_rejected_3393():
+    base, repo = _dir_repo()
+    try:
+        client = fresh_client()
+        before = _count_nodes()
+        link = os.path.join(repo, "dlink")
+        r = _cite_dir(client, f"file://{link}", "Quote inside the directory.")
+        _assert_rejected_as_not_a_file(r, link, before)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_directory_citation_with_caller_content_hash_rejected_3393():
+    base, repo = _dir_repo()
+    try:
+        client = fresh_client()
+        before = _count_nodes()
+        d = os.path.join(repo, "d")
+        r = _cite_dir(client, f"file://{d}", "Quote inside the directory.",
+                      content_hash="0" * 64)
+        _assert_rejected_as_not_a_file(r, d, before)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def _evidence_for_then_swapped_to_dir(client, repo):
+    """Cite committed file `f` (creating its evidence node), then replace `f` by a
+    committed directory of the same name. Returns (evidence_id, path). A later
+    evidence_id citation reaches the observation-level _capture_file_version
+    with no evidence-creation guard in front of it."""
+    f = os.path.join(repo, "f")
+    with open(f, "w") as fh:
+        fh.write("Quote inside the directory.\n")
+    _git_run(repo, "add", "f")
+    _git_run(repo, "commit", "-m", "add f")
+    first = _cite_dir(client, f"file://{f}", "Quote inside the directory.")
+    assert first.get("status") == "created", first
+    os.remove(f)
+    os.makedirs(f)
+    with open(os.path.join(f, "note.md"), "w") as fh:
+        fh.write("Quote inside the directory.\n")
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-m", "f becomes a directory")
+    return first["evidence_id"], f
+
+
+def _cite_by_evidence_id(client, evidence_id, text, **extra):
+    payload = {
+        "evidence_id": evidence_id,
+        "quoted_text": text,
+        "interpretation": "Testing that a directory is not evidence.",
+        "claim": f"Evidence-id citation of a directory {text[:10]}",
+        "quote_type": "hard_data",
+    }
+    payload.update(extra)
+    return client.call("engram_add_observation", payload)
+
+
+def test_directory_by_evidence_id_with_content_hash_real_quote_rejected_3393():
+    base, repo = _dir_repo()
+    try:
+        client = fresh_client()
+        ev_id, f = _evidence_for_then_swapped_to_dir(client, repo)
+        before = _count_nodes()
+        r = _cite_by_evidence_id(client, ev_id, "Quote inside the directory.",
+                                 content_hash="0" * 64)
+        _assert_rejected_no_node(r, before)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_directory_by_evidence_id_with_content_hash_fabricated_quote_rejected_3393():
+    base, repo = _dir_repo()
+    try:
+        client = fresh_client()
+        ev_id, f = _evidence_for_then_swapped_to_dir(client, repo)
+        before = _count_nodes()
+        r = _cite_by_evidence_id(client, ev_id, "A sentence nobody ever wrote anywhere.",
+                                 content_hash="0" * 64)
+        _assert_rejected_no_node(r, before)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_regular_file_citation_still_accepted_3393():
+    base, repo = _dir_repo()
+    try:
+        client = fresh_client()
+        r = _cite_dir(client, f"file://{os.path.join(repo, 'd', 'note.md')}",
+                      "Quote inside the directory.")
+        assert r.get("status") == "created", r
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+# --- #3393 round 1: every entry rejects a non-file ----------------------------
+
+def _count_evidence():
+    import engram_core as _core
+    conn = _core._get_db()
+    return conn.execute("SELECT COUNT(*) FROM nodes WHERE type = 'evidence'").fetchone()[0]
+
+
+def _add_evidence(client, url):
+    return client.call("engram_add_evidence", {"url": url, "title": "Non-file evidence"})
+
+
+def _assert_evidence_rejected_no_row(r, path, before):
+    assert "error" in r, f"non-file evidence was not rejected: {r}"
+    assert r.get("status") != "created" and "evidence_id" not in r, r
+    assert _count_evidence() == before, "an evidence row was written for a non-file"
+    if path:
+        assert "must be a file" in r["error"] and path.rstrip("/") in r["error"], r["error"]
+
+
+def test_A_add_evidence_directory_outside_git_rejected_no_row_3393():
+    """Cell A: a directory outside any git repo. The isfile check must run BEFORE
+    the not-in-git early return, or this returns `created` and the observation
+    step later rejects, orphaning the evidence row."""
+    base = os.path.realpath(tempfile.mkdtemp(prefix="engram_test_3393A_"))
+    try:
+        client = fresh_client()
+        d = os.path.join(base, "plain_dir")
+        os.makedirs(d)
+        before = _count_evidence()
+        r = _add_evidence(client, f"file://{d}")
+        _assert_evidence_rejected_no_row(r, d, before)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_B_add_evidence_dev_null_rejected_no_row_3393():
+    """Cell B: file:///dev/null (a character device) is not a regular file."""
+    client = fresh_client()
+    before = _count_evidence()
+    r = _add_evidence(client, "file:///dev/null")
+    _assert_evidence_rejected_no_row(r, "/dev/null", before)
+
+
+def _cross_repo_setup():
+    """source_repo with a committed directory `d` (note.md inside) and a committed
+    regular file `f.md`; the cited file lives outside source_repo."""
+    base = os.path.realpath(tempfile.mkdtemp(prefix="engram_test_3393C_"))
+    src = os.path.join(base, "source_repo")
+    _init_git_repo(src)
+    os.makedirs(os.path.join(src, "d"))
+    with open(os.path.join(src, "d", "note.md"), "w") as fh:
+        fh.write("Committed copy.\n")
+    with open(os.path.join(src, "f.md"), "w") as fh:
+        fh.write("Committed copy.\n")
+    _git_run(src, "add", "-A")
+    _git_run(src, "commit", "-m", "source repo")
+    cited = os.path.join(base, "cited.md")
+    with open(cited, "w") as fh:
+        fh.write("Cited quote text.\n")
+    return base, src, cited
+
+
+def _cite_cross_repo(client, cited, src, repo_path):
+    return client.call("engram_add_observation", {
+        "url": f"file://{cited}",
+        "title": "Cross-repo evidence",
+        "quoted_text": "Cited quote text.",
+        "interpretation": "Testing the cross-repo repo_path object type.",
+        "claim": f"Cross-repo citation of {repo_path}",
+        "quote_type": "hard_data",
+        "source_repo": src,
+        "repo_path": repo_path,
+    })
+
+
+def test_C_cross_repo_repo_path_directory_rejected_3393():
+    """Cell C: the repo_path must name a blob; a committed directory is a tree."""
+    base, src, cited = _cross_repo_setup()
+    try:
+        client = fresh_client()
+        before = _count_nodes()
+        r = _cite_cross_repo(client, cited, src, "d")
+        assert "error" in r, f"a directory repo_path was accepted: {r}"
+        assert r.get("status") != "created" and "observation_id" not in r, r
+        assert _count_nodes() == before, "a node row was written for a directory repo_path"
+        assert "repo_path" in r["error"] and "file" in r["error"].lower(), r["error"]
+        assert "'d'" in r["error"], f"error does not name the repo_path: {r['error']}"
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_D_cross_repo_repo_path_file_still_accepted_3393():
+    """Cell D: a committed regular file as repo_path is unchanged behaviour."""
+    base, src, cited = _cross_repo_setup()
+    try:
+        client = fresh_client()
+        r = _cite_cross_repo(client, cited, src, "f.md")
+        assert r.get("status") == "created", r
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_E_fifo_citation_rejected_promptly_never_hangs_3393():
+    """Cell E: a FIFO inside a repo blocks open() forever. The call runs in a
+    daemon thread with a hard 10 s bound; exceeding it FAILS the cell (and the
+    FIFO is opened read-write at the end so the blocked thread is released)."""
+    import threading
+    base, repo = _dir_repo()
+    fifo = os.path.join(repo, "pipe")
+    try:
+        os.mkfifo(fifo)
+        client = fresh_client()
+        results = {}
+
+        def _run():
+            try:
+                results["evidence"] = _add_evidence(client, f"file://{fifo}")
+                results["observation"] = _cite_dir(client, f"file://{fifo}", "anything")
+            except BaseException as e:  # surfaced by the assertions below
+                results["exc"] = repr(e)
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(10)
+        hung = t.is_alive()
+        if hung:
+            # Release a thread blocked in open(fifo): a read-write open never blocks.
+            fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+            os.close(fd)
+            t.join(5)
+        assert not hung, "FIFO citation did not return within 10 s (blocked in open())"
+        assert "exc" not in results, results
+        for key in ("evidence", "observation"):
+            r = results[key]
+            assert "error" in r and r.get("status") != "created", (key, r)
+            assert "must be a file" in r["error"], (key, r["error"])
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+# --- #3393 round 2: quote verification requires a regular file; submodule pin --
+
+def test_F_evidence_row_whose_path_became_a_fifo_rejected_never_hangs_3393():
+    """Cell F: an evidence row is created for a committed regular file; the path is
+    then replaced by a FIFO. engram_add_observation(evidence_id=...) reaches
+    _verify_quote_in_source, which read the path after only an exists() test and
+    blocked forever in open(). Daemon thread, hard 10 s bound; on a hang the FIFO
+    is opened read-write so the blocked thread is released and the cell FAILS."""
+    import threading
+    base, repo = _dir_repo()
+    try:
+        client = fresh_client()
+        f = os.path.join(repo, "f")
+        with open(f, "w") as fh:
+            fh.write("Quote inside the directory.\n")
+        _git_run(repo, "add", "f")
+        _git_run(repo, "commit", "-m", "add f")
+        first = _cite_dir(client, f"file://{f}", "Quote inside the directory.")
+        assert first.get("status") == "created", first
+        os.remove(f)
+        os.mkfifo(f)
+        before = _count_nodes()
+        results = {}
+
+        def _run():
+            try:
+                results["r"] = _cite_by_evidence_id(
+                    client, first["evidence_id"], "Quote inside the directory.")
+            except BaseException as e:  # surfaced by the assertions below
+                results["exc"] = repr(e)
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(10)
+        hung = t.is_alive()
+        if hung:
+            fd = os.open(f, os.O_RDWR | os.O_NONBLOCK)
+            os.close(fd)
+            t.join(5)
+        assert not hung, "evidence_id citation of a FIFO did not return within 10 s"
+        assert "exc" not in results, results
+        r = results["r"]
+        assert "error" in r and r.get("status") != "created" and "observation_id" not in r, r
+        assert "must be a file" in r["error"].lower(), r["error"]
+        assert f in r["error"], f"error does not name the path: {r['error']}"
+        assert _count_nodes() == before, "a node row was written for a FIFO citation"
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_G_cross_repo_repo_path_submodule_entry_rejected_3393():
+    """Cell G: repo_path names a submodule (gitlink, mode 160000) entry whose commit
+    object exists in source_repo, so `cat-file -e` passes and the `cat-file -t`
+    non-blob branch (type `commit`) is the one that must reject it."""
+    import subprocess
+    base, src, cited = _cross_repo_setup()
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=src, capture_output=True,
+                              text=True, check=True).stdout.strip()
+        os.makedirs(os.path.join(src, "sub"))  # empty dir: a clean, un-initialised submodule
+        _git_run(src, "update-index", "--add", "--cacheinfo", f"160000,{head},sub")
+        _git_run(src, "commit", "-m", "gitlink entry")
+        client = fresh_client()
+        before = _count_nodes()
+        r = _cite_cross_repo(client, cited, src, "sub")
+        assert "error" in r, f"a submodule repo_path was accepted: {r}"
+        assert r.get("status") != "created" and "observation_id" not in r, r
+        assert _count_nodes() == before, "a node row was written for a submodule repo_path"
+        assert "repo_path 'sub' must name a file" in r["error"], r["error"]
+        assert "a commit" in r["error"], r["error"]
+    finally:
+        shutil.rmtree(base, ignore_errors=True)

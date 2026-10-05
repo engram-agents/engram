@@ -683,6 +683,22 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
             "git_sha": "",
         }
 
+    # Evidence is bytes: the physical path must be a regular file. A directory
+    # (or anything else that is not a file) has no content to hash or quote, and
+    # `git cat-file -e <sha>:<dir>` would succeed for it (a tree object) — so this
+    # fires before any content_hash / open() / git logic, for every caller (#3393).
+    if not os.path.isfile(physical):
+        return {
+            "ok": False,
+            "error": (
+                f"Evidence must be a file: '{file_path}' is not a regular file "
+                f"(it resolves to '{physical}'). Cite a file inside it instead."
+                + _HONESTY_REMINDER
+            ),
+            "content_hash": "",
+            "git_sha": "",
+        }
+
     cross_repo = bool(source_repo and repo_path)
     # When source_repo is provided, run git operations from that repo root
     # instead of the directory inferred from the file path. This lets the
@@ -883,6 +899,20 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
                     "The git_sha must point to a commit that contains this file. "
                     "Check that you committed the file before this revision."
                 )
+            if cross_repo:
+                # The isfile check above only inspects the cited abs_file. The
+                # object repo_path names in source_repo must be a blob too: for a
+                # directory `cat-file -e` succeeds on the tree (a symlink entry
+                # is also a blob, which is fine) (#3393).
+                type_result = check_git("cat-file", "-t", f"{git_sha}:{rel_path}")
+                obj_type = (type_result.stdout or "").strip()
+                if type_result.returncode != 0 or obj_type != "blob":
+                    return _reject(
+                        f"repo_path '{rel_path}' must name a file (a blob) at git "
+                        f"revision {git_sha[:8]} in source_repo, but it is "
+                        f"{('a ' + obj_type) if obj_type else 'not readable'}. "
+                        "Cite a committed file's path, not a directory."
+                    )
         if not cross_repo:
             for link, work_tree, rel_link in in_tree_links:
                 if work_tree != real_root:
@@ -930,6 +960,13 @@ def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
         )
     if not os.path.exists(file_path):
         return None  # File existence is checked separately
+    # A FIFO (or any non-regular file) blocks read_text() forever; an evidence row
+    # created for a regular file can have its path replaced later (#3393).
+    if not os.path.isfile(file_path):
+        return (
+            f"Evidence must be a file: '{file_path}' is not a regular file. "
+            "Cite a file inside it instead."
+        )
 
     try:
         content = Path(file_path).read_text(encoding="utf-8", errors="replace")
