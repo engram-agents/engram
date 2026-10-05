@@ -67,12 +67,13 @@ function observe(obs: Observed, chunk: TurnStepChunk): void {
   }
 }
 
-/** The step's visible material: its answer text and every tool call's arguments JSON. */
+/** The step's answer text only: its text blocks in block order, blanks dropped. */
 function answerTextOf(obs: Observed): string {
   const keys = [...obs.answerByBlock.keys()].sort((a, b) => a - b)
   return keys.map(k => obs.answerByBlock.get(k) ?? '').filter(s => s.length > 0).join('\n\n')
 }
 
+/** The step's visible material: its answer text and every tool call's arguments JSON. */
 function visibleMaterial(obs: Observed, toolArgs: string[]): string {
   const keys = [...obs.answerByBlock.keys()].sort((a, b) => a - b)
   return [...keys.map(k => obs.answerByBlock.get(k) ?? ''), ...toolArgs].filter(s => s.length > 0).join('\n\n')
@@ -162,17 +163,25 @@ async function stepJob(job: StepJob): Promise<void> {
   const { cfg } = probe
   const { text: thinking, blocks } = joinedThinking(obs)
   const visible = visibleMaterial(obs, job.toolArgs)
-  // Query material: thinking, or the step's visible text. `auto` (default) takes
+  // Query source: thinking, or the step's visible text. `auto` (default) takes
   // thinking when it is long enough, else visible: some lineages emit thinking
   // blocks with (almost) no text.
   const useThinking =
     cfg.querySource === 'thinking' ||
     (cfg.querySource === 'auto' && thinking.length >= cfg.minQueryChars)
-  const material = useThinking ? thinking : visible
-  // Arm C is the only arm that leaves the machine (a side model): its input never
-  // includes tool-call arguments, which can carry tokens or file contents.
+  // Proxy material: what the thinking-proxy arms (A, B, C, E) query: the thinking
+  // (thinking mode) or the step's answer text ONLY (visible mode). Tool-call
+  // arguments are arm D's material, never part of it. That also keeps arm C (the
+  // only arm that leaves the machine, a side model) free of tool arguments, which
+  // can carry tokens or file contents.
   const answerText = answerTextOf(obs)
-  const extractInput = useThinking ? thinking : answerText
+  const proxyMaterial = useThinking ? thinking : answerText
+  // equals proxyMaterial by construction (arm C's blank check is proxyTooShort); the model-boundary test pins that the tool-argument sentinel is absent
+  const extractInput = proxyMaterial
+  const hasToolArgs = job.toolArgs.some(a => a.trim().length > 0)
+  // Terminal: visible mode and no tool call. With thinking hidden, the only
+  // material of such a step is the final answer, emitted after recall could help.
+  const terminal = !useThinking && obs.tools.length === 0
   const row: Record<string, unknown> = {
     sessionId: probe.sessionId,
     turnId: input.turnId,
@@ -184,6 +193,7 @@ async function stepJob(job: StepJob): Promise<void> {
     thinkingBlocks: blocks,
     visibleChars: visible.length,
     extractChars: extractInput.length,
+    proxyChars: proxyMaterial.length,
     answerChars: obs.answerChars,
     toolCalls: obs.tools.map(t => ({ name: t.name })),
     stepMs: job.stepMs,
@@ -207,7 +217,11 @@ async function stepJob(job: StepJob): Promise<void> {
   }
 
   row.querySource = useThinking ? 'thinking' : 'visible'
-  if (material.length === 0 || material.length < cfg.minQueryChars) {
+  row.terminal = terminal
+  if (terminal) {
+    row.skipped = 'terminal'
+  } else if ((proxyMaterial.trim().length === 0 || proxyMaterial.length < cfg.minQueryChars) && !hasToolArgs) {
+    // no proxy material AND nothing for arm D either: nothing to measure
     row.skipped = 'short-material'
   } else if (server === null) {
     row.skipped = 'no-engram-server'
@@ -221,7 +235,7 @@ async function stepJob(job: StepJob): Promise<void> {
       probe,
       cfg,
       server,
-      material,
+      material: proxyMaterial,
       extractInput,
       toolArgs: job.toolArgs,
       sessionId: probe.sessionId,

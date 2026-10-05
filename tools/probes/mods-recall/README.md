@@ -18,11 +18,11 @@ Per model step (main loop only; subagent steps are skipped):
    retrieval **arms** run concurrently over the step, each through the same
    `engram_query` call (`return_debug: true`), so the comparison is about the
    QUERY, not the backend:
-   - `thinking_full` — the last 6000 chars of the step's thinking
+   - `thinking_full` — the last 6000 chars of the step's proxy material (see "Query material")
    - `thinking_tail` — its last 3 sentences (else the last 400 chars)
-   - `extract_model` — a small model names 3 noun phrases the thinking assumes
+   - `extract_model` — a small model names 3 noun phrases the proxy material assumes
    - `tool_input` — the step's tool-call arguments (the control: today's PreToolUse channel)
-   - `novel_terms` — `novel_terms.py`: high-IDF terms not yet seen this probe session
+   - `novel_terms` — `novel_terms.py`: high-IDF terms of the proxy material not yet seen this probe session
      (parity with the in-turn recall hook; it only builds the query)
 3. One JSON file per step: `<probeDir>/<sessionId>/steps/<turnId>-<NNN>.json`, with
    each arm's candidates (rank, scores, match type, latency) and cross-arm fields
@@ -90,10 +90,10 @@ golden loader, RRU dataclasses) unchanged and prints one row per arm.
 - Step files hold ONLY the selected candidate fields (id, type, claim clipped to 160 chars, recall_summary, scores, match type, recall_turn, created_at, rank), never the raw node row.
 - Step files hold each arm's query text on local disk (up to 6000 chars for arm A). In
   thinking mode that text is thinking-derived; in `visible` mode (and `auto` steps that
-  fell back to it) the A/B queries are built from the answer text PLUS the step's
-  tool-call arguments, so they can carry the same tokens or file contents arm D does.
-  Arm D (`tool_input`) records up to 2000 chars of the TOOL-CALL ARGUMENTS as its
-  `query` in every mode. Step files are per-user and local, under `probeDir`; do not
+  fell back to it) the A/B queries are built from the step's answer text ONLY, never the
+  tool-call arguments. Arm D (`tool_input`) records up to 2000 chars of the TOOL-CALL
+  ARGUMENTS as its `query` in every mode, so only arm D's query can carry the tokens or
+  file contents the arguments hold. Step files are per-user and local, under `probeDir`; do not
   share them unreviewed.
 - `inContext` counts ids found in the conversation text, EXCLUDING the probe's own
   rating requests (any row containing `[engram-probe · turn `), so an id it listed
@@ -111,6 +111,8 @@ golden loader, RRU dataclasses) unchanged and prints one row per arm.
 - Step, rating and request files are trusted input only after validation: turn ids,
   indexes, arm names and blind letters are checked before `convert_ratings.py` writes
   anything (they become file names), and a violation exits non-zero naming the file.
+  A completeness-identity failure is only detectable after writing, so it leaves the test
+  RRUs, goldens and pairs already written and no `summary.json` (a reused `--out`'s old one is removed first).
 - The probe pays for arm C (one small-model call per step). Arm C replies are cached
   per prompt for the module's lifetime only.
 - `claude plugin validate` follows `$` only into functions declared in the same file
@@ -125,32 +127,94 @@ golden loader, RRU dataclasses) unchanged and prints one row per arm.
 
 ## Model boundary
 
-Only arm C (`extract_model`) sends text to a side model. Its input is the thinking
-text (thinking mode) or the step's answer text (visible mode); raw tool-call arguments
-never reach arm C's side model. They DO still travel elsewhere: arms A, B and D send
-their queries (which in visible mode contain tool-call arguments) to the ENGRAM MCP
-server the probe discovered by tool-name prefix (the code does not verify that server
-is local), arm E's helper receives the material on stdin as a local python process, and
-A/B/D queries are written to the local step files (the disclosure above). Step rows
-record `extractChars`, the length of what arm C was given.
+Only arm C (`extract_model`) sends text to a side model. Its input is the proxy
+material: the thinking text (thinking mode) or the step's answer text (visible mode).
+Raw tool-call arguments never reach arm C's side model, and since the proxy material
+never contains tool arguments in either mode, that guarantee now holds by construction
+(it was already tested; the test was widened: A/B/E now assert the sentinel is absent, and exactly one recall call, D's, carries it). Arm D's query (the tool arguments) goes
+to the ENGRAM MCP server the probe discovered by tool-name prefix (the code does not
+verify that server is local) and is written to the local step files (the disclosure
+above); arms A, B and E now see only the proxy material, whose arm E helper runs as a
+local python process on stdin. Step rows record `extractChars`, the length of what arm C
+was given (equal to `proxyChars`). Arm C is not called for a blank or short input.
+
+When the side model gives no answer, the arm records `error: extract not answered:
+<reason>` and `extract.detail`: the JSON of every field of the reply object except
+`text`, cut to 400 chars with a trailing `…` (on a rejected call, `String(err)` cut the
+same way). In the 2.1.289 types (`ModelCompleteResult`) the not-answered arms carry
+`reason` (`api-error` | `empty-reply` | `aborted`), `usage`, and for `api-error` also
+`status` (HTTP status or null) and `error` (a kind such as `overloaded` or
+`rate_limit`; never the error's text or body, per the type's own docs). So `detail`
+tells a 529 from a refused request; it cannot carry a provider message the API does not
+hand over.
 
 ## Lineages whose thinking is hidden
 
 Measured live on Claude Code 2.1.289 with claude-fable-5-1: over 5 steps the engine
 reported thinkingChars 0, 278, 0, 0, 0 (1-2 thinking blocks each) and the transcript's
 own thinking blocks were empty. A thinking-only probe measured nothing there. So the
-query material is a choice, `querySource`: `thinking`; `visible` (the step's answer
-text plus every tool call's arguments JSON); or `auto` (the default: thinking when it
-has at least `minQueryChars`, else visible). Arms A, B, C and E run over the chosen
-material (arm B is its last 3 sentences); arm D stays the tool-arguments control.
-Each step row records `querySource` and `visibleChars`, and `convert_ratings.py` copies
-them (and the arm's `envelope`) into every test RRU's metadata; `probe_eval.py` shows each
-arm's step counts by `querySource`, because arms A/B/C/E score over different material per
-step and pooling them hides that. In `visible` mode (and in `auto` steps that fell back
-to visible) arm D is NOT independent of A/B/C/E: the same tool arguments are inside the
-visible material.
-A step is skipped
-(`short-material`) only when the chosen material is under `minQueryChars`.
+query source is a choice, `querySource`: `thinking`; `visible`; or `auto` (the default:
+thinking when it has at least `minQueryChars`, else visible).
+
+### Query material: proxy material vs tool arguments
+
+Two materials per step, never mixed:
+
+- **Proxy material** (`proxyChars` on the row): the thinking text when the source is
+  `thinking`, else the step's answer text ONLY (no tool-call arguments). The arms that
+  stand in for "what the agent was thinking" query it: A `thinking_full` (its last 6000
+  chars), B `thinking_tail` (its last 3 sentences), C `extract_model` (a side model's 3
+  noun phrases), E `novel_terms` (its high-IDF unseen terms). In thinking mode that is
+  the thinking; in visible mode it is the answer text.
+- **Tool arguments**: arm D `tool_input` queries the tool calls' arguments JSON (head
+  2000 chars) in every mode. It is the control, and it is the only arm that sees them.
+
+Why: with thinking hidden, 185 of 418 steps measured on one seat had no answer text at
+all, only tool calls. The old visible material (answer + arguments) then made A, B and D
+query the same tool-argument text (on 34 steps A's query was byte-identical to D's), so
+one arm was measured three times; and arm C was called with an empty prompt and answered
+`api-error` on every one of those steps.
+
+A and B differ in clip only, as before. Each step row records `querySource`,
+`visibleChars` (answer + arguments, kept), `proxyChars`, `extractChars` (= `proxyChars`),
+`terminal`. `convert_ratings.py` copies `querySource`, `visibleChars` and the arm's
+`envelope` into every test RRU's metadata; `probe_eval.py` shows each arm's step counts
+by `querySource`, because arms A/B/C/E score over different material per step and
+pooling them hides that. In `visible` mode arm D is now independent of A/B/C/E (it is
+the only arm over the arguments).
+
+### A step is skipped
+
+- `terminal` (visible source, zero tool calls): see "Terminal steps". No arm runs.
+- `short-material`: the proxy material is blank or under `minQueryChars` AND the step
+  has no non-blank tool-argument text (nothing for arm D either). No arm runs.
+- `no-engram-server`, `probe-inactive`: as before.
+
+A step whose proxy material is short but which has tool arguments is NOT skipped: arm D
+runs, and each of A, B, C, E records `skipped: short-proxy-material` (no recall call, no
+side-model call, no helper process). Those arm skips count under "Arm runs excluded" in
+the eval and are never scored. The rating request shows an arm with no candidates as
+`X: -`, as it does for any empty arm; a step with only arm D's candidates still gets
+one (an empty list is shown, not hidden).
+
+### Terminal steps
+
+A step is `terminal` iff its source is `visible` and it made zero tool calls. It writes
+its row with `terminal: true`, `skipped: terminal`, runs no arm, and adds nothing to the
+rating request. Rationale: with thinking hidden, the only material of an answer-only
+step is the final answer itself, which is emitted after the moment recall could have
+helped; with thinking visible, the thinking precedes the answer, so such a step (thinking
+source, zero tool calls) is NOT terminal and still measures something. `terminal` is an
+explicit `false` on every row that did not qualify, so the eval can count both.
+`convert_ratings.py` summarizes skipped steps as `steps_skipped_by_reason`
+(`{reason: count}`, a row with neither arms nor a reason counts as `no-arms`) and
+`steps_terminal`, and requires `steps_total == steps_with_arms + sum(steps_skipped_by_reason)`
+and `steps_terminal == steps_skipped_by_reason["terminal"]`. The first is a bookkeeping
+check that can only fail if the accounting code itself is edited; the terminal
+identity is the independent one (it fails on a row that says `terminal` but ran arms,
+or the reverse). `probe_eval.py` prints
+`steps skipped by reason: terminal N · short-material M · …` after the goldens line, read
+from the converter's `summary.json` beside `test/` and `golden/` (`unknown (summary.json absent or unreadable beside the test dir)` if it is missing, malformed, or lacks the key).
 
 ## engram_query result envelope
 

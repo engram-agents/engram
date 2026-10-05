@@ -3,6 +3,7 @@ import { DEFAULTS } from './config.ts'
 import { newProbe, writeUnderRoot, type Io } from './record.ts'
 import {
   COMPLETE,
+  LONG_THINKING,
   LX,
   OB,
   candidateRow,
@@ -10,6 +11,8 @@ import {
   START,
   STEP_RESULT,
   TURN,
+  appended,
+  blankStepChunks,
   chunksFor,
   drain,
   engineStep,
@@ -38,11 +41,12 @@ test('T1 passthrough: 7 chunks in order, payloads and result unchanged', async (
 
 test('T2 minQueryChars gate: short material -> skipped row and ZERO recall calls', async ($, on) => {
   const { clock, seen } = rig(on)
-  engineStep(on, chunksFor('too short', ''))
+  // a tool call with NO arguments text: blank proxy material AND blank tool arguments
+  engineStep(on, blankStepChunks('too short'))
   await $.session.start(START)
   const { chunks } = await drain($.turn.step(STEP_INPUT))
   await flush(clock)
-  expect(chunks.length).toBe(7)
+  expect(chunks.length).toBe(4)
   const row = stepFile(seen, TURN, 0)
   expect(row?.skipped).toBe('short-material')
   expect(row?.arms).toBeUndefined()
@@ -230,7 +234,7 @@ test('inContext marks candidates whose ids already appear in the conversation, a
 
 test('invalid options fall back to the default for that key only, and say so', { options: { topK: 99, minQueryChars: -5, arms: 'thinking_tail,bogus' } }, async ($, on) => {
   const { clock, seen } = rig(on)
-  engineStep(on, chunksFor('short but non-empty thinking text', ''))
+  engineStep(on, blankStepChunks('short but non-empty thinking text'))
   await $.session.start(START)
   await drain($.turn.step(STEP_INPUT))
   await flush(clock)
@@ -395,7 +399,7 @@ const visibleChunks = (thinking: string) => [
   { kind: 'stop' as const, stopReason: 'tool_use' as const, usage: null },
 ]
 
-test('zero-thinking step with 600+ chars of answer and tool args: arms run over visible material', async ($, on) => {
+test('zero-thinking step with 600+ chars of answer and tool args: A/B/C/E use the answer text only, D the tool arguments', async ($, on) => {
   const { clock, seen } = rig(on)
   engineStep(on, visibleChunks(''))
   await $.session.start(START)
@@ -406,8 +410,9 @@ test('zero-thinking step with 600+ chars of answer and tool args: arms run over 
   expect(row.querySource).toBe('visible')
   expect(row.thinkingChars).toBe(0)
   expect(row.visibleChars).toBeGreaterThan(600)
+  expect(row.proxyChars).toBe(VISIBLE_ANSWER.length)
   expect(row.arms.thinking_full.query).toContain('Visible working text.')
-  expect(row.arms.thinking_full.query).toContain('/aaaa')
+  expect(row.arms.thinking_full.query).not.toContain('/aaaa') // tool arguments are arm D's material only
   expect(row.arms.tool_input.query).toContain('/aaaa') // arm D unchanged
   expect(seen.recallCalls.length).toBeGreaterThan(0)
 })
@@ -423,7 +428,7 @@ test('thinking at or above the threshold: querySource thinking', async ($, on) =
   expect(row.arms.thinking_full.query).toContain('recall probe')
 })
 
-test('both thinking and visible material short: skipped short-material, zero recall calls', async ($, on) => {
+test('both thinking and answer short, zero tool calls (visible mode): terminal, zero recall calls', async ($, on) => {
   const { clock, seen } = rig(on)
   engineStep(on, [
     { kind: 'thinking', index: 0, text: 'hmm' },
@@ -434,7 +439,7 @@ test('both thinking and visible material short: skipped short-material, zero rec
   await drain($.turn.step(STEP_INPUT))
   await flush(clock)
   const row = stepFile(seen, TURN, 0)!
-  expect(row.skipped).toBe('short-material')
+  expect(row.skipped).toBe('terminal')
   expect(seen.recallCalls.length).toBe(0)
 })
 
@@ -502,13 +507,15 @@ test('model boundary: arm C never sends tool-call arguments to the side model; l
   expect(row.extractChars).toBeGreaterThan(0)
   // arm D reads tool arguments (the local control)
   expect(row.arms.tool_input.query).toContain(SENTINEL)
-  // arms A and B query the local ENGRAM server with the visible material, args included
-  expect(row.arms.thinking_full.query).toContain(SENTINEL)
-  expect(row.arms.thinking_tail.query).toContain(SENTINEL)
-  const payloads = seen.recallCalls.map(c => String(c.args.payload_json))
-  expect(payloads.some(p => p.includes(SENTINEL))).toBe(true)
-  // arm E's local helper (python, no side model) is fed the same material on stdin
-  expect(seen.processCalls[0]!.stdin).toContain(SENTINEL)
+  // arms A and B query the local ENGRAM server with the proxy material (answer text): no args
+  expect(row.arms.thinking_full.query).not.toContain(SENTINEL)
+  expect(row.arms.thinking_tail.query).not.toContain(SENTINEL)
+  // only arm D's query carries the arguments
+  const withSentinel = seen.recallCalls.filter(c => String(c.args.payload_json).includes(SENTINEL))
+  expect(withSentinel.length).toBe(1)
+  // arm E's local helper (python, no side model) is fed the proxy material on stdin
+  expect(seen.processCalls[0]!.stdin).not.toContain(SENTINEL)
+  expect(seen.processCalls[0]!.stdin).toContain('Plain answer text')
 })
 
 test('thinking mode: arm C input is the thinking text, unchanged', async ($, on) => {
@@ -519,4 +526,143 @@ test('thinking mode: arm C input is the thinking text, unchanged', async ($, on)
   await flush(clock)
   expect(seen.completePrompts[0]).toContain('recall probe')
   expect(stepFile(seen, TURN, 0)!.extractChars).toBeGreaterThan(0)
+})
+
+// ---- #3398: proxy material, terminal steps, arm C blank input and reply body
+const BIG_ARGS = '{"command":"' + 'b'.repeat(700) + '"}'
+const TOOL_ARGS_TEXT = 'ZZ_TOOL_ARG_ZZ'
+const LONG_ANSWER = 'The probe should measure recall against the visible answer text. '.repeat(12) // ~770 chars
+
+test('T-N1 visible mode, empty answer text, tool arguments only: D alone runs; A/B/C/E skip short-proxy-material; one recall, zero complete', async ($, on) => {
+  const { clock, seen } = rig(on)
+  engineStep(on, [
+    { kind: 'tool', index: 0, id: 'toolu_1', name: 'Bash' },
+    { kind: 'input', index: 0, json: BIG_ARGS },
+    { kind: 'stop', stopReason: 'tool_use', usage: null },
+  ])
+  await $.session.start(START)
+  await drain($.turn.step(STEP_INPUT))
+  await flush(clock)
+  const row = stepFile(seen, TURN, 0)!
+  expect(row.skipped).toBeUndefined()
+  expect(row.terminal).toBe(false)
+  expect(row.querySource).toBe('visible')
+  expect(row.proxyChars).toBe(0)
+  for (const name of ['thinking_full', 'thinking_tail', 'extract_model', 'novel_terms']) {
+    expect(row.arms[name].skipped).toBe('short-proxy-material')
+    expect(row.arms[name].candidates).toBeUndefined()
+  }
+  expect(row.arms.tool_input.candidates.length).toBeGreaterThan(0)
+  expect(seen.recallCalls.length).toBe(1)
+  expect(seen.completeCalls).toBe(0)
+  expect(seen.processCalls.length).toBe(0)
+})
+
+test('T-N2 visible mode, long answer, zero tool calls: terminal row, no arm, no call of any kind, no rating request', async ($, on) => {
+  const { clock, seen } = rig(on)
+  engineStep(on, [
+    { kind: 'text', index: 0, text: LONG_ANSWER },
+    { kind: 'stop', stopReason: 'end_turn', usage: null },
+  ])
+  await $.session.start(START)
+  await drain($.turn.step(STEP_INPUT))
+  await flush(clock)
+  const row = stepFile(seen, TURN, 0)!
+  expect(row.terminal).toBe(true)
+  expect(row.skipped).toBe('terminal')
+  expect(row.arms).toBeUndefined()
+  expect(seen.recallCalls.length).toBe(0)
+  expect(seen.completeCalls).toBe(0)
+  expect(seen.processCalls.length).toBe(0)
+  await $.turn.complete(COMPLETE)
+  expect(appended(seen).length).toBe(0)
+})
+
+test('T-N2b visible mode, no thinking, no answer text, no tool calls: still terminal (the rule never needs text), no call of any kind', async ($, on) => {
+  const { clock, seen } = rig(on)
+  engineStep(on, [{ kind: 'stop', stopReason: 'end_turn', usage: null }])
+  await $.session.start(START)
+  await drain($.turn.step(STEP_INPUT))
+  await flush(clock)
+  const row = stepFile(seen, TURN, 0)!
+  expect(row.terminal).toBe(true)
+  expect(row.skipped).toBe('terminal')
+  expect(row.arms).toBeUndefined()
+  expect(seen.recallCalls.length).toBe(0)
+  expect(seen.completeCalls).toBe(0)
+})
+
+test('T-N3 thinking mode, zero tool calls: not terminal; A/B/C/E run, D skips no-tool-call', async ($, on) => {
+  const { clock, seen } = rig(on)
+  engineStep(on, [
+    { kind: 'thinking', index: 0, text: LONG_THINKING },
+    { kind: 'stop', stopReason: 'end_turn', usage: null },
+  ])
+  await $.session.start(START)
+  await drain($.turn.step(STEP_INPUT))
+  await flush(clock)
+  const row = stepFile(seen, TURN, 0)!
+  expect(row.querySource).toBe('thinking')
+  expect(row.terminal).toBe(false)
+  expect(row.skipped).toBeUndefined()
+  for (const name of ['thinking_full', 'thinking_tail', 'extract_model', 'novel_terms']) {
+    expect(row.arms[name].skipped).toBeUndefined()
+    expect(Boolean(row.arms[name].candidates)).toBe(true)
+  }
+  expect(row.arms.tool_input.skipped).toBe('no-tool-call')
+  expect(row.proxyChars).toBe(LONG_THINKING.length)
+})
+
+test('T-N4 visible mode, answer + tool arguments: A queries the answer only, D the arguments only, C prompt has the answer only', async ($, on) => {
+  const { clock, seen } = rig(on)
+  const args = `{"command":"${TOOL_ARGS_TEXT}"}`
+  engineStep(on, [
+    { kind: 'text', index: 0, text: LONG_ANSWER },
+    { kind: 'tool', index: 1, id: 'toolu_1', name: 'Bash' },
+    { kind: 'input', index: 1, json: args },
+    { kind: 'stop', stopReason: 'tool_use', usage: null },
+  ])
+  await $.session.start(START)
+  await drain($.turn.step(STEP_INPUT))
+  await flush(clock)
+  const row = stepFile(seen, TURN, 0)!
+  expect(row.terminal).toBe(false)
+  expect(row.arms.thinking_full.query).toBe(LONG_ANSWER)
+  expect(row.arms.thinking_full.query).not.toContain(TOOL_ARGS_TEXT)
+  expect(row.arms.tool_input.query).toBe(args)
+  expect(seen.completePrompts.length).toBe(1)
+  expect(seen.completePrompts[0]).toContain(LONG_ANSWER.slice(0, 80))
+  expect(seen.completePrompts[0]).not.toContain(TOOL_ARGS_TEXT)
+  expect(row.proxyChars).toBe(LONG_ANSWER.length)
+  expect(row.extractChars).toBe(LONG_ANSWER.length)
+})
+
+test('T-N5 arm C not answered: the reply body (without text) is recorded in extract.detail, truncated to 400 + ellipsis', async ($, on) => {
+  const { clock, seen } = rig(on, {
+    complete: () => ({ isAnswered: false, reason: 'api-error', status: 529, message: 'overloaded' }),
+  })
+  engineStep(on, chunksFor())
+  await $.session.start(START)
+  await drain($.turn.step(STEP_INPUT))
+  await flush(clock)
+  const arm = stepFile(seen, TURN, 0)!.arms.extract_model
+  expect(arm.error.startsWith('extract not answered: api-error')).toBe(true)
+  expect(typeof arm.extract.detail).toBe('string')
+  expect(arm.extract.detail).toContain('529')
+  expect(arm.extract.detail).toContain('overloaded')
+  expect(arm.extract.detail).not.toContain('"text"')
+})
+
+test('T-N5b arm C detail: 1000-char field cut to 400 + ellipsis; a text field never rides along', async ($, on) => {
+  const long = rig(on, {
+    complete: () => ({ isAnswered: false, reason: 'api-error', status: 500, message: 'm'.repeat(1000), text: 'SHOULD_NOT_APPEAR' }),
+  })
+  engineStep(on, chunksFor())
+  await $.session.start(START)
+  await drain($.turn.step(STEP_INPUT))
+  await flush(long.clock)
+  const detail = stepFile(long.seen, TURN, 0)!.arms.extract_model.extract.detail as string
+  expect(detail.length).toBe(401)
+  expect(detail.endsWith('…')).toBe(true)
+  expect(detail).not.toContain('SHOULD_NOT_APPEAR')
 })

@@ -15,10 +15,18 @@ The units are the repo's own (`tools/recall_harness`, reused unchanged).
 
 Completeness contract: the returned / printed summary satisfies
     steps_with_arms == steps_rated + steps_unrated
+    steps_total == steps_with_arms + sum(steps_skipped_by_reason.values())
+    steps_terminal == steps_skipped_by_reason.get("terminal", 0)
     test_rrus_written == sum(arms per step-with-arms) == files on disk
-or the run exits non-zero naming the mismatch. A step is never silently dropped:
+or the run exits non-zero naming the mismatch. The first identity is a bookkeeping
+check: by construction every step lands in exactly one bucket, so it can only fail
+if the accounting code itself is edited. The terminal identity is the independent
+one: it compares a count of rows saying `terminal` against a count of rows skipped
+as `terminal`, two fields the mod writes separately. A step is never silently dropped:
 every input is validated BEFORE anything is written, so a malformed file stops
-the run with nothing partial left behind.
+the run with nothing partial left behind. A completeness-identity failure can only
+be detected after writing: it leaves the test RRUs, goldens and pairs already
+written and NO summary.json (never a stale one from an earlier run in the same --out).
 """
 from __future__ import annotations
 
@@ -236,6 +244,15 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
         rated_with_arms[(turn, index)] = {"good": good, "noise": noise}
 
     steps_with_arms = {k: s for k, s in steps.items() if has_arms(s)}
+    # every step row that has no arms is counted under the reason it gives (a row
+    # with neither arms nor a reason is "no-arms"), so steps_total is fully accounted for
+    skipped_by_reason: dict[str, int] = {}
+    for key, row in steps.items():
+        if key in steps_with_arms:
+            continue
+        reason = str(row["skipped"]) if row.get("skipped") else "no-arms"
+        skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + 1
+    steps_terminal = sum(1 for row in steps.values() if row.get("terminal") is True)
     expected_rrus = sum(len(s["arms"]) for s in steps_with_arms.values())
 
     _check_out_dir(out)
@@ -248,6 +265,13 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
     # ------------------------------------------------------------------- write
     for p in stale:
         p.unlink()
+    # Earliest point after _check_out_dir and the --overwrite refusal accepted the dir (a
+    # refused run must leave the old output untouched): the completeness check below can
+    # die after the files above are written, so an old summary.json must already be gone.
+    try:
+        (out / "summary.json").unlink()
+    except FileNotFoundError:
+        pass
     os.makedirs(out, mode=0o700, exist_ok=True)
     (out / "test").mkdir(mode=0o700, exist_ok=True)
     (out / "golden").mkdir(mode=0o700, exist_ok=True)
@@ -348,6 +372,8 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
         "steps_with_arms": len(steps_with_arms),
         "steps_rated": len(rated_with_arms),
         "steps_unrated": len(steps_with_arms) - len(rated_with_arms),
+        "steps_skipped_by_reason": skipped_by_reason,
+        "steps_terminal": steps_terminal,
         "ratings_without_step": ratings_without_step,
         "test_rrus_written": test_written,
         "goldens_written": goldens_written,
@@ -357,6 +383,11 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
     problems = []
     if summary["steps_with_arms"] != summary["steps_rated"] + summary["steps_unrated"]:
         problems.append("steps_with_arms != steps_rated + steps_unrated")
+    if summary["steps_total"] != summary["steps_with_arms"] + sum(skipped_by_reason.values()):
+        problems.append("steps_total != steps_with_arms + sum(steps_skipped_by_reason)")
+    if steps_terminal != skipped_by_reason.get("terminal", 0):
+        problems.append(f"steps_terminal {steps_terminal} != steps skipped as 'terminal' "
+                        f"{skipped_by_reason.get('terminal', 0)} (a row says terminal without skipped=terminal, or the reverse)")
     if test_written != expected_rrus:
         problems.append(f"test_rrus_written {test_written} != sum of arms per step-with-arms {expected_rrus}")
     on_disk = len(list((out / "test").glob("*.json")))

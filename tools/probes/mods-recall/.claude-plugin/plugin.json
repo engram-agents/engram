@@ -1,6 +1,6 @@
 {
   "name": "engram-probe",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "ENGRAM project (dev probe)"
   },
@@ -21,7 +21,7 @@
     "minQueryChars": {
       "type": "number",
       "title": "Min query chars",
-      "description": "Steps whose chosen query material is shorter get a skipped row and no arm runs.",
+      "description": "Thinking-proxy arms (A, B, C, E) run only when the proxy material (thinking, or the answer text in visible mode) has at least this many chars; a step with no proxy material and no tool arguments, or a terminal step, gets a skipped row and no arm runs.",
       "default": 200
     },
     "minThinkingChars": {
@@ -32,7 +32,7 @@
     "querySource": {
       "type": "string",
       "title": "Query material",
-      "description": "thinking | visible (answer text + tool arguments) | auto (thinking when long enough, else visible).",
+      "description": "thinking | visible (proxy arms use the answer text only; arm D keeps the tool arguments) | auto (thinking when long enough, else visible).",
       "default": "auto",
       "options": [
         "thinking",

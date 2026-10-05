@@ -157,6 +157,16 @@ export function chunksFor(thinkingA = LONG_THINKING, thinkingB = ' More thought.
   ]
 }
 
+/** A step with short thinking, a short answer, and a tool call whose arguments text is blank: nothing to measure. */
+export function blankStepChunks(thinking = 'short'): TurnStepChunk[] {
+  return [
+    { kind: 'thinking', index: 0, text: thinking },
+    { kind: 'text', index: 1, text: 'Looking now.' },
+    { kind: 'tool', index: 2, id: 'toolu_1', name: 'Read' },
+    { kind: 'stop', stopReason: 'tool_use', usage: null },
+  ]
+}
+
 export const STEP_RESULT: TurnStepResult = {
   turnId: TURN,
   index: 0,

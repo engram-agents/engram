@@ -119,6 +119,18 @@ def _load_goldens(golden_dir: str) -> dict[str, RankingResultUnit]:
     return goldens
 
 
+def _skipped_by_reason(test_dir: str):
+    """The converter's per-reason skipped-step counts, from the summary.json it
+    writes beside test/ and golden/; None when that file is absent or unreadable
+    (the report then says so rather than print a made-up "none")."""
+    path = Path(test_dir).resolve().parent / "summary.json"
+    try:
+        counts = json.loads(path.read_text()).get("steps_skipped_by_reason")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return counts if isinstance(counts, dict) else None
+
+
 def evaluate(golden_dir: str, test_dir: str, pairs_path: str | None = None,
              shown_only: bool = False) -> dict:
     goldens = _load_goldens(golden_dir)
@@ -206,11 +218,18 @@ def evaluate(golden_dir: str, test_dir: str, pairs_path: str | None = None,
             misses[qid] = missed
 
     return {"shown_only": shown_only, "arms": arms, "pairs": pairs, "misses": misses, "unrated": unrated,
-            "n_goldens": len(goldens), "n_test_rrus": len(test_rrus)}
+            "n_goldens": len(goldens), "n_test_rrus": len(test_rrus),
+            "steps_skipped_by_reason": _skipped_by_reason(test_dir)}
 
 
 def _fmt(value, spec=".3f"):
     return "-" if value is None else format(value, spec)
+
+
+def _skipped_line(counts) -> str:
+    if counts is None:
+        return "steps skipped by reason: unknown (summary.json absent or unreadable beside the test dir)"
+    return "steps skipped by reason: " + (" · ".join(f"{r} {n}" for r, n in counts.items()) or "none")
 
 
 def render_report(result: dict) -> str:
@@ -218,7 +237,8 @@ def render_report(result: dict) -> str:
             else "full (every surfaced id scored; unshown ids count as neutral)")
     lines = ["# Probe eval", "", f"mode: {mode}", "",
              f"goldens: {result['n_goldens']} · test RRUs: {result['n_test_rrus']} · "
-             f"unrated steps (not scored): {len(result['unrated'])}", "",
+             f"unrated steps (not scored): {len(result['unrated'])}",
+             _skipped_line(result.get("steps_skipped_by_reason")), "",
              "## Per arm", "",
              "| arm | n steps | p@5 | r@10 | nDCG@10 | MRR | median ms | p90 ms | "
              "median msOverStep | unshown | steps by querySource | inContext (top-5) | principle (top-5) |",

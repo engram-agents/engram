@@ -7,6 +7,7 @@ import {
   LX,
   OB,
   appended,
+  blankStepChunks,
   PROBE_ROOT,
   START,
   TURN,
@@ -66,7 +67,7 @@ test('T5 a turn that did not end in an answer appends nothing', async ($, on) =>
 
 test('T5 a turn whose steps were all skipped appends nothing', async ($, on) => {
   const r = rig(on)
-  engineStep(on, chunksFor('short', ''))
+  engineStep(on, blankStepChunks())
   await $.session.start(START)
   await drain($.turn.step(STEP_INPUT))
   await flush(r.clock)

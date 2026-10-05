@@ -199,6 +199,7 @@ def test_one_test_rru_per_step_arm_and_summary_counts(convert, tmp_path):
     assert set(summary) == {
         "steps_total", "steps_with_arms", "steps_rated", "steps_unrated",
         "ratings_without_step", "test_rrus_written", "goldens_written",
+        "steps_skipped_by_reason", "steps_terminal",
     }
 
     files = sorted(p.name for p in (out / "test").glob("*.json"))
@@ -880,3 +881,132 @@ def test_eval_table_splits_steps_by_query_source(convert, evaluator, tmp_path):
     report = tmp_path / "r.md"
     evaluator.main(["--golden", str(out / "golden"), "--test", str(out / "test"), "--out", str(report)])
     assert "thinking: 1, visible: 1" in report.read_text()
+
+
+# ---------------------------------------------------------------------------
+# #3398: terminal / short-material steps are counted by reason, never dropped
+# ---------------------------------------------------------------------------
+
+def _skip_reason_session(tmp_path: Path) -> Path:
+    root = _standard_session(tmp_path)
+    _put_step(root, {"turnId": TURN, "index": 5, "skipped": "terminal", "terminal": True,
+                     "querySource": "visible", "armBlind": BLIND, "ts": 1})
+    _put_step(root, {"turnId": TURN, "index": 6, "skipped": "short-material", "terminal": False,
+                     "querySource": "visible", "armBlind": BLIND, "ts": 1})
+    return root
+
+
+def test_summary_counts_skipped_steps_by_reason_and_identities_hold(convert, tmp_path):
+    summary = convert.convert(_skip_reason_session(tmp_path), tmp_path / "out")
+    assert summary["steps_skipped_by_reason"] == {"terminal": 1, "short-material": 1}
+    assert summary["steps_terminal"] == 1
+    assert summary["steps_total"] == summary["steps_with_arms"] + 2
+    assert summary["steps_total"] == summary["steps_with_arms"] + sum(summary["steps_skipped_by_reason"].values())
+    assert summary["steps_terminal"] == summary["steps_skipped_by_reason"].get("terminal", 0)
+    on_disk = json.loads((tmp_path / "out" / "summary.json").read_text())
+    assert on_disk["steps_skipped_by_reason"] == {"terminal": 1, "short-material": 1}
+
+
+def test_summary_with_no_skipped_steps_has_an_empty_reason_map(convert, tmp_path):
+    summary = convert.convert(_standard_session(tmp_path), tmp_path / "out")
+    assert summary["steps_skipped_by_reason"] == {}
+    assert summary["steps_terminal"] == 0
+
+
+def test_terminal_row_that_ran_arms_fails_the_terminal_identity_naming_the_mismatch(convert, tmp_path):
+    # terminal:true AND arms present, no skipped: counted terminal but not skipped-as-terminal
+    root = _standard_session(tmp_path)
+    _put_step(root, _step(7, {"thinking_tail": ["ob_0005"]}, terminal=True))
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit) as err:
+        convert.convert(root, out)
+    message = str(err.value)
+    assert "completeness check FAILED" in message
+    assert "steps_terminal 1 != steps skipped as 'terminal' 0" in message
+    # the check runs after the test/golden/pairs files are written and before summary.json,
+    # so a failed run leaves no summary.json for probe_eval to read as a clean answer
+    assert not (out / "summary.json").exists()
+
+
+def test_failed_completeness_on_a_reused_out_leaves_no_stale_summary(convert, tmp_path):
+    # a clean run leaves summary.json; a later FAILED run into the same --out (overwrite)
+    # must not leave that old file behind for probe_eval to read as current
+    root = _standard_session(tmp_path)
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    assert (out / "summary.json").exists()
+    _put_step(root, _step(7, {"thinking_tail": ["ob_0005"]}, terminal=True))
+    with pytest.raises(SystemExit) as err:
+        convert.convert(root, out, overwrite=True)
+    assert "steps_terminal 1 != steps skipped as 'terminal' 0" in str(err.value)
+    assert not (out / "summary.json").exists()
+
+
+def test_eval_report_prints_steps_skipped_by_reason(convert, evaluator, tmp_path):
+    out = tmp_path / "out"
+    convert.convert(_skip_reason_session(tmp_path), out)
+    report = tmp_path / "r.md"
+    evaluator.main(["--golden", str(out / "golden"), "--test", str(out / "test"), "--out", str(report)])
+    lines = report.read_text().splitlines()
+    goldens_at = next(i for i, l in enumerate(lines) if l.startswith("goldens:"))
+    assert lines[goldens_at + 1] == "steps skipped by reason: terminal 1 · short-material 1"
+
+
+def test_eval_report_says_none_for_no_skipped_steps(convert, evaluator, tmp_path):
+    out = tmp_path / "out"
+    convert.convert(_standard_session(tmp_path), out)
+    report = tmp_path / "r.md"
+    evaluator.main(["--golden", str(out / "golden"), "--test", str(out / "test"), "--out", str(report)])
+    assert "steps skipped by reason: none" in report.read_text().splitlines()
+
+
+UNKNOWN_LINE = ("steps skipped by reason: unknown "
+                "(summary.json absent or unreadable beside the test dir)")
+
+
+def _report_lines_with_summary(convert, evaluator, tmp_path: Path, summary_text) -> list[str]:
+    """Convert a session, replace summary.json with `summary_text` (None = delete it), report."""
+    out = tmp_path / "out"
+    convert.convert(_skip_reason_session(tmp_path), out)
+    if summary_text is None:
+        (out / "summary.json").unlink()
+    else:
+        (out / "summary.json").write_text(summary_text)
+    report = tmp_path / "r.md"
+    evaluator.main(["--golden", str(out / "golden"), "--test", str(out / "test"), "--out", str(report)])
+    return report.read_text().splitlines()
+
+
+@pytest.mark.parametrize("summary_text", [
+    None,                                   # summary.json missing
+    "{not json",                            # malformed
+    json.dumps([1, 2]),                     # list-valued
+    json.dumps({"steps_total": 3}),         # key absent
+    json.dumps({"steps_skipped_by_reason": [["terminal", 1]]}),  # key present, wrong type
+], ids=["missing", "malformed", "list", "key-absent", "key-wrong-type"])
+def test_eval_report_says_unknown_never_none_when_the_summary_cannot_answer(
+        convert, evaluator, tmp_path, summary_text):
+    lines = _report_lines_with_summary(convert, evaluator, tmp_path, summary_text)
+    assert UNKNOWN_LINE in lines
+    assert "steps skipped by reason: none" not in lines
+
+
+def test_eval_report_says_none_for_an_empty_reason_map_in_summary_json(convert, evaluator, tmp_path):
+    lines = _report_lines_with_summary(convert, evaluator, tmp_path, json.dumps({"steps_skipped_by_reason": {}}))
+    assert "steps skipped by reason: none" in lines
+    assert UNKNOWN_LINE not in lines
+
+
+def test_short_proxy_material_arm_skip_is_status_skipped_and_excluded_from_scoring(convert, evaluator, tmp_path):
+    root = _session(tmp_path)
+    step = _step(3, {"thinking_tail": ["ob_0001"], "thinking_full": ["ob_0002"]})
+    step["arms"]["thinking_full"] = {"arm": "thinking_full", "ms": 0, "skipped": "short-proxy-material"}
+    _put_step(root, step)
+    _put_rating(root, [{"index": 3, "good": ["ob_0001"], "noise": []}])
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    meta = json.loads((out / "test" / f"{TURN}-3-thinking_full.json").read_text())["metadata"]
+    assert (meta["status"], meta["skipped"]) == ("skipped", "short-proxy-material")
+    result = evaluator.evaluate(str(out / "golden"), str(out / "test"), None)
+    assert result["arms"]["thinking_full"]["excluded_arm_runs"] == 1
+    assert result["arms"]["thinking_full"]["n_steps"] == 0

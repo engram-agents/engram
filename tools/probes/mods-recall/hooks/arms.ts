@@ -19,6 +19,12 @@ export type ArmResult = {
     cached: boolean
     isAnswered: boolean
     reason?: string
+    /**
+     * Set when the side model gave no answer: JSON of every field of the reply
+     * object except `text` (or `String(err)` on a rejection), cut to 400 chars
+     * with a trailing ellipsis.
+     */
+    detail?: string
   }
   /** arm E: the terms the helper found and which of them were novel */
   terms?: string[]
@@ -32,12 +38,11 @@ export type ArmCtx = {
   probe: Probe
   cfg: Config
   server: string
-  /** the chosen query material (thinking, or the visible answer + tool args) */
+  /** the proxy material: the thinking (thinking mode) or the answer text only (visible mode); never tool arguments */
   material: string
   /**
-   * What arm C may send to the SIDE MODEL: thinking (thinking mode) or the step's
-   * answer text (visible mode), NEVER tool-call arguments. Arms A/B/D/E query only
-   * the local ENGRAM server and may use `material`.
+   * What arm C may send to the SIDE MODEL: the proxy material (thinking in thinking
+   * mode, the step's answer text in visible mode), NEVER tool-call arguments.
    */
   extractInput: string
   /** every tool block's arguments JSON text, one entry per tool call */
@@ -49,6 +54,18 @@ export const FULL_CLIP = 6000
 export const TAIL_FALLBACK_CHARS = 400
 export const EXTRACT_TAIL_CHARS = 3000
 export const TOOL_INPUT_CLIP = 2000
+export const DETAIL_CLIP = 400
+export const SHORT_PROXY = 'short-proxy-material'
+
+/** Cut to DETAIL_CLIP chars, with a trailing ellipsis when cut. */
+function clipDetail(text: string): string {
+  return text.length > DETAIL_CLIP ? text.slice(0, DETAIL_CLIP) + '…' : text
+}
+
+/** The proxy material is blank or under `minQueryChars`: the thinking-proxy arms have nothing to ask. */
+function proxyTooShort(ctx: ArmCtx): boolean {
+  return ctx.material.trim().length === 0 || ctx.material.length < ctx.cfg.minQueryChars
+}
 
 export const EXTRACT_SYSTEM =
   "You read an AI agent's reasoning or working text. Name, as 3 short noun phrases on one line separated by ' | ', the facts, decisions or prior experiences this reasoning assumes or would benefit from remembering. No prose."
@@ -108,17 +125,21 @@ async function retrieveArm(
 }
 
 async function armThinkingFull(ctx: ArmCtx): Promise<ArmResult> {
+  if (proxyTooShort(ctx)) return { arm: 'thinking_full', ms: 0, skipped: SHORT_PROXY }
   const clipped = ctx.material.length > FULL_CLIP
   const query = clipped ? ctx.material.slice(-FULL_CLIP) : ctx.material
   return retrieveArm(ctx, 'thinking_full', query, { clipped })
 }
 
 async function armThinkingTail(ctx: ArmCtx): Promise<ArmResult> {
+  if (proxyTooShort(ctx)) return { arm: 'thinking_tail', ms: 0, skipped: SHORT_PROXY }
   return retrieveArm(ctx, 'thinking_tail', tailQuery(ctx.material))
 }
 
 async function armExtractModel(ctx: ArmCtx): Promise<ArmResult> {
   const { io, probe, cfg } = ctx
+  // blank or short input (proxyTooShort covers blank): no side-model call (a blank prompt came back as api-error on every step)
+  if (proxyTooShort(ctx)) return { arm: 'extract_model', ms: 0, skipped: SHORT_PROXY }
   const t0 = await io.now()
   const prompt = ctx.extractInput.slice(-EXTRACT_TAIL_CHARS)
   const key = await hexSha256(prompt)
@@ -141,6 +162,7 @@ async function armExtractModel(ctx: ArmCtx): Promise<ArmResult> {
       const t1 = await io.now()
       extract.ms = Math.max(0, t1 - t0)
       extract.reason = 'rejected'
+      extract.detail = clipDetail(String(err))
       return { arm: 'extract_model', ms: extract.ms, error: `model.complete rejected: ${String(err).slice(0, 160)}`, extract }
     }
     const t1 = await io.now()
@@ -149,6 +171,8 @@ async function armExtractModel(ctx: ArmCtx): Promise<ArmResult> {
     extract.isAnswered = res.isAnswered
     if (!res.isAnswered) {
       extract.reason = res.reason
+      const { text: _text, ...body } = res as Record<string, unknown>
+      extract.detail = clipDetail(JSON.stringify(body))
       return { arm: 'extract_model', ms: extract.ms, error: `extract not answered: ${res.reason}`, extract }
     }
     reply = res.text
@@ -176,6 +200,7 @@ async function armToolInput(ctx: ArmCtx): Promise<ArmResult> {
 }
 
 async function armNovelTerms(ctx: ArmCtx): Promise<ArmResult> {
+  if (proxyTooShort(ctx)) return { arm: 'novel_terms', ms: 0, skipped: SHORT_PROXY }
   const { io, probe } = ctx
   const statePath = `${probe.root}/novel-terms-seen.json`
   const t0 = await io.now()
