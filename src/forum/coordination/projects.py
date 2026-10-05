@@ -38,15 +38,11 @@ def _maybe_stamp_phase(fields: dict, phase: Optional[str], now: str) -> tuple[di
 
     Calling this repeatedly/sequentially on the same baton is idempotent: a
     second call sees the first call's already-committed stamp (via its own
-    fresh `store.read_project` read) and no-ops. This does NOT protect
-    against genuinely overlapping concurrent callers — in every write-body
-    EXCEPT `close`, `reopen` (#3313) and `advance` (#3039 U2b), which read
-    inside `allocator.locked()`, `read_project` happens before the allocator
-    lock is acquired, so two truly concurrent writers can each decide to
-    stamp from stale reads; the second writer's full-document write then
-    clobbers the first's, the same pre-existing lost-update exposure every
-    other field in this store already has. See issue #3255 for tracking
-    genuine concurrent-write safety across `projects.py`.
+    fresh `store.read_project` read) and no-ops. Since #3255 every write-body
+    (including this helper's callers) reads the baton INSIDE ``allocator.locked()``, in the same critical section as the
+    write, so the stamp decision is made on the state actually being overwritten
+    -- safe against overlapping callers within ONE forum process (the allocator
+    lock is a ``threading.Lock``; no cross-process protection).
     """
     if not phase:
         return {}, ""
@@ -205,49 +201,59 @@ def flip(
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # #3255: read, decide and write in ONE allocator critical section. Before this,
+    # the read ran BEFORE the lock and the write was a blind whole-document
+    # overwrite, so two overlapping callers could both decide on the same pre-state
+    # and the second write clobbered the first (lost update). Every write-body in
+    # this module now follows this shape (advance/close/reopen/init already did).
+    # ASSUMES one forum process: the allocator lock is a threading.Lock, so this
+    # serializes writers within this process only -- it does NOT guard a second
+    # PROCESS or a hand edit (the file store has no cross-process lock). ``locked()``
+    # claims the seq only after the read/decisions, so a refusal burns no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    now = ts or md.now_iso()
-    fields, _ = md.parse_frontmatter(content)
-    # `from` is the baton's current holder; matches cmd_flip's
-    # fields.get("turn", ...).strip().lower(). Fallback fires on a malformed baton
-    # with no turn field OR an empty one (a valid baton always carries a real one);
-    # `or "unknown"` yields "unknown" for both, friendlier than cmd_flip's "".
-    from_agent = (fields.get("turn") or "unknown").strip().lower()
-    to = to_agent.strip().lower()
-    turn_by = (by_agent or "").strip().lower()
-    # Step 1 (conversion, unchanged _maybe_stamp_phase logic) then Step 2
-    # (transition, NEW #3039 U2a round 3): transition unconditionally
-    # overwrites whatever step 1 just did, regardless of its outcome -- see
-    # the design note's two-step architecture (Kepler's U2a-round-3 ruling).
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        now = ts or md.now_iso()
+        fields, _ = md.parse_frontmatter(content)
+        # `from` is the baton's current holder; matches cmd_flip's
+        # fields.get("turn", ...).strip().lower(). Fallback fires on a malformed baton
+        # with no turn field OR an empty one (a valid baton always carries a real one);
+        # `or "unknown"` yields "unknown" for both, friendlier than cmd_flip's "".
+        from_agent = (fields.get("turn") or "unknown").strip().lower()
+        to = to_agent.strip().lower()
+        turn_by = (by_agent or "").strip().lower()
+        # Step 1 (conversion, unchanged _maybe_stamp_phase logic) then Step 2
+        # (transition, NEW #3039 U2a round 3): transition unconditionally
+        # overwrites whatever step 1 just did, regardless of its outcome -- see
+        # the design note's two-step architecture (Kepler's U2a-round-3 ruling).
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(
-        content,
-        # turn_by is quoted like turn_reason (not bare like turn/turn_since):
-        # unlike turn, turn_by can legitimately be "" (actor unknown), and an
-        # UNQUOTED empty value written mid-block corrupts the frontmatter
-        # parser — its `\s*` separator is greedy across the newline and eats
-        # the NEXT field's entire line as this field's "value" (verified: an
-        # empty turn_by followed by, e.g., `participants:` silently absorbs
-        # it). Quoting keeps a non-whitespace char right after the separator,
-        # so the parser never crosses the line boundary. Unquoted on read by
-        # store_file.read_projects, mirroring its existing turn_reason unquote.
-        {
-            "turn": to, "turn_since": now, "turn_reason": f'"{reason}"',
-            "turn_by": f'"{turn_by}"', **phase_updates,
-        },
-    )
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f"- {now} {from_agent} → {to}: {reason}" + phase_log_suffix)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(
+            content,
+            # turn_by is quoted like turn_reason (not bare like turn/turn_since):
+            # unlike turn, turn_by can legitimately be "" (actor unknown), and an
+            # UNQUOTED empty value written mid-block corrupts the frontmatter
+            # parser — its `\s*` separator is greedy across the newline and eats
+            # the NEXT field's entire line as this field's "value" (verified: an
+            # empty turn_by followed by, e.g., `participants:` silently absorbs
+            # it). Quoting keeps a non-whitespace char right after the separator,
+            # so the parser never crosses the line boundary. Unquoted on read by
+            # store_file.read_projects, mirroring its existing turn_reason unquote.
+            {
+                "turn": to, "turn_since": now, "turn_reason": f'"{reason}"',
+                "turn_by": f'"{turn_by}"', **phase_updates,
+            },
+        )
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, f"- {now} {from_agent} → {to}: {reason}" + phase_log_suffix)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
 
@@ -412,35 +418,37 @@ def claim(
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    now = ts or md.now_iso()
-    self_name = claimer.strip().lower()
-    sentinel = pool_sentinel.strip().lower()
-    fields, _ = md.parse_frontmatter(content)
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        now = ts or md.now_iso()
+        self_name = claimer.strip().lower()
+        sentinel = pool_sentinel.strip().lower()
+        fields, _ = md.parse_frontmatter(content)
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(
-        content,
-        # turn_by quoted like turn_reason — see flip()'s comment for why (the
-        # empty-value parser-corruption case doesn't arise here since
-        # self_name is never empty, but quoting is applied uniformly across
-        # every turn_by write site so the on-disk format is consistent).
-        {
-            "turn": self_name, "turn_since": now, "turn_reason": '"claimed"',
-            "turn_by": f'"{self_name}"', **phase_updates,
-        },
-    )
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f"- {now} {sentinel} → {self_name}: claimed" + phase_log_suffix)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(
+            content,
+            # turn_by quoted like turn_reason — see flip()'s comment for why (the
+            # empty-value parser-corruption case doesn't arise here since
+            # self_name is never empty, but quoting is applied uniformly across
+            # every turn_by write site so the on-disk format is consistent).
+            {
+                "turn": self_name, "turn_since": now, "turn_reason": '"claimed"',
+                "turn_by": f'"{self_name}"', **phase_updates,
+            },
+        )
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, f"- {now} {sentinel} → {self_name}: claimed" + phase_log_suffix)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
 
@@ -493,50 +501,52 @@ def release(
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    now = ts or md.now_iso()
-    self_name = holder.strip().lower()
-    sentinel = pool_sentinel.strip().lower()
-    # Parsed unconditionally (not just inside `if done:` as before #3039 U2a)
-    # so _maybe_stamp_phase always has this write's freshly-read fields to
-    # check the current `phase:` value against, regardless of whether --done
-    # was passed.
-    fields, _ = md.parse_frontmatter(content)
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        now = ts or md.now_iso()
+        self_name = holder.strip().lower()
+        sentinel = pool_sentinel.strip().lower()
+        # Parsed unconditionally (not just inside `if done:` as before #3039 U2a)
+        # so _maybe_stamp_phase always has this write's freshly-read fields to
+        # check the current `phase:` value against, regardless of whether --done
+        # was passed.
+        fields, _ = md.parse_frontmatter(content)
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updates: dict = {
-        "turn": sentinel,
-        "turn_since": now,
-        "turn_reason": f'"{reason}"',
-        # quoted like turn_reason — see flip()'s comment for why.
-        "turn_by": f'"{self_name}"',
-        **phase_updates,
-    }
+        updates: dict = {
+            "turn": sentinel,
+            "turn_since": now,
+            "turn_reason": f'"{reason}"',
+            # quoted like turn_reason — see flip()'s comment for why.
+            "turn_by": f'"{self_name}"',
+            **phase_updates,
+        }
 
-    title_renamed = False
-    if done:
-        current_title = fields.get("title", "").strip()
-        if not current_title.endswith("(done)"):
-            updates["title"] = current_title + " (done)"
-            title_renamed = True
+        title_renamed = False
+        if done:
+            current_title = fields.get("title", "").strip()
+            if not current_title.endswith("(done)"):
+                updates["title"] = current_title + " (done)"
+                title_renamed = True
 
-    updated = md.update_frontmatter(content, updates)
-    _, body = md.parse_frontmatter(updated)
+        updated = md.update_frontmatter(content, updates)
+        _, body = md.parse_frontmatter(updated)
 
-    log_entry = f"- {now} {self_name} → {sentinel}: {reason}"
-    if title_renamed:
-        log_entry += f"\n- {now} title marked (done)"
-    log_entry += phase_log_suffix
-    body = md.append_turn_log(body, log_entry)
-    final = md.reattach_frontmatter(updated, body)
+        log_entry = f"- {now} {self_name} → {sentinel}: {reason}"
+        if title_renamed:
+            log_entry += f"\n- {now} title marked (done)"
+        log_entry += phase_log_suffix
+        body = md.append_turn_log(body, log_entry)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
 
@@ -586,23 +596,25 @@ def set_status(
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    now = ts or md.now_iso()
-    fields, _ = md.parse_frontmatter(content)
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        now = ts or md.now_iso()
+        fields, _ = md.parse_frontmatter(content)
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f"- {now} {caller}: {new_status} — {reason}" + phase_log_suffix)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, f"- {now} {caller}: {new_status} — {reason}" + phase_log_suffix)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
 
@@ -757,33 +769,35 @@ def merge(
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    now = ts or md.now_iso()
-    merged_by_n = merged_by.strip().lower()
-    fields, _ = md.parse_frontmatter(content)
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        now = ts or md.now_iso()
+        merged_by_n = merged_by.strip().lower()
+        fields, _ = md.parse_frontmatter(content)
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    if forced:
-        log_line = (
-            f"- {now} merged via baton merge by {merged_by_n} "
-            "(FORCED past gates 3-4)"
-        )
-    else:
-        log_line = f"- {now} merged via baton merge by {merged_by_n}"
-    log_line += phase_log_suffix
+        if forced:
+            log_line = (
+                f"- {now} merged via baton merge by {merged_by_n} "
+                "(FORCED past gates 3-4)"
+            )
+        else:
+            log_line = f"- {now} merged via baton merge by {merged_by_n}"
+        log_line += phase_log_suffix
 
-    updated = md.update_frontmatter(content, {"status": "merged", **phase_updates})
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, log_line)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, {"status": "merged", **phase_updates})
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, log_line)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
 
     # OQ-4 archive relocation (outside lock — seq-bearing write is complete)
@@ -911,24 +925,26 @@ def rename(
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    now = ts or md.now_iso()
-    fields, _ = md.parse_frontmatter(content)
-    old_title = fields.get("title", "").strip()
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        now = ts or md.now_iso()
+        fields, _ = md.parse_frontmatter(content)
+        old_title = fields.get("title", "").strip()
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(content, {"title": new_title, **phase_updates})
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f'- {now} renamed: title from "{old_title}" to "{new_title}"' + phase_log_suffix)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, {"title": new_title, **phase_updates})
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, f'- {now} renamed: title from "{old_title}" to "{new_title}"' + phase_log_suffix)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
 
@@ -975,29 +991,31 @@ def anchor(
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    now = ts or md.now_iso()
-    fields, _ = md.parse_frontmatter(content)
-    old_anchor = fields.get("github", "").strip()
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        now = ts or md.now_iso()
+        fields, _ = md.parse_frontmatter(content)
+        old_anchor = fields.get("github", "").strip()
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(content, {"github": github_anchor, **phase_updates})
-    _, body = md.parse_frontmatter(updated)
-    if old_anchor:
-        log_entry = f'- {now} anchor updated: github from "{old_anchor}" to "{github_anchor}"'
-    else:
-        log_entry = f"- {now} anchor set: github → {github_anchor}"
-    log_entry += phase_log_suffix
-    body = md.append_turn_log(body, log_entry)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, {"github": github_anchor, **phase_updates})
+        _, body = md.parse_frontmatter(updated)
+        if old_anchor:
+            log_entry = f'- {now} anchor updated: github from "{old_anchor}" to "{github_anchor}"'
+        else:
+            log_entry = f"- {now} anchor set: github → {github_anchor}"
+        log_entry += phase_log_suffix
+        body = md.append_turn_log(body, log_entry)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
 
@@ -1065,35 +1083,37 @@ def add_participant(
         ProjectNotFound: if ``project_id`` has no existing baton file.
         NotAParticipant: if ``agent`` is not a current participant of the baton.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    fields, _ = md.parse_frontmatter(content)
-    current_participants = _parse_participants(fields.get("participants", ""))
+        fields, _ = md.parse_frontmatter(content)
+        current_participants = _parse_participants(fields.get("participants", ""))
 
-    agent_n = agent.strip().lower()
-    if agent_n not in current_participants:
-        raise NotAParticipant(agent_n)
+        agent_n = agent.strip().lower()
+        if agent_n not in current_participants:
+            raise NotAParticipant(agent_n)
 
-    participant_n = participant.strip().lower()
-    if participant_n in current_participants:
-        return _coerce_seq(fields.get("seq", "")), False
+        participant_n = participant.strip().lower()
+        if participant_n in current_participants:
+            return _coerce_seq(fields.get("seq", "")), False
 
-    now = ts or md.now_iso()
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
-    new_participants = list(current_participants) + [participant_n]
-    participants_str = _format_participants(new_participants)
+        now = ts or md.now_iso()
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        new_participants = list(current_participants) + [participant_n]
+        participants_str = _format_participants(new_participants)
 
-    updated = md.update_frontmatter(content, {"participants": participants_str, **phase_updates})
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f"- {now} {agent_n} added participant: {participant_n}" + phase_log_suffix)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, {"participants": participants_str, **phase_updates})
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, f"- {now} {agent_n} added participant: {participant_n}" + phase_log_suffix)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq, True
 
@@ -1192,48 +1212,50 @@ def set_colleague(
         NotAParticipant: if ``agent`` is neither a current participant nor
             the current turn holder of the baton.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    fields, _ = md.parse_frontmatter(content)
-    current_turn = fields.get("turn", "").strip().lower()
-    current_participants = _parse_participants(fields.get("participants", ""))
+        fields, _ = md.parse_frontmatter(content)
+        current_turn = fields.get("turn", "").strip().lower()
+        current_participants = _parse_participants(fields.get("participants", ""))
 
-    agent_n = agent.strip().lower()
-    if agent_n != current_turn and agent_n not in current_participants:
-        raise NotAParticipant(agent_n)
+        agent_n = agent.strip().lower()
+        if agent_n != current_turn and agent_n not in current_participants:
+            raise NotAParticipant(agent_n)
 
-    colleague_n = colleague.strip().lower()
-    old_colleague = fields.get("colleague", "").strip()
+        colleague_n = colleague.strip().lower()
+        old_colleague = fields.get("colleague", "").strip()
 
-    updates = {"colleague": colleague_n}
-    participant_added = colleague_n not in current_participants
-    if participant_added:
-        new_participants = list(current_participants) + [colleague_n]
-        updates["participants"] = _format_participants(new_participants)
+        updates = {"colleague": colleague_n}
+        participant_added = colleague_n not in current_participants
+        if participant_added:
+            new_participants = list(current_participants) + [colleague_n]
+            updates["participants"] = _format_participants(new_participants)
 
-    now = ts or md.now_iso()
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
-    updates.update(phase_updates)
+        now = ts or md.now_iso()
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        updates.update(phase_updates)
 
-    updated = md.update_frontmatter(content, updates)
-    _, body = md.parse_frontmatter(updated)
-    if old_colleague:
-        log_entry = (
-            f'- {now} {agent_n} changed colleague from "{old_colleague}" '
-            f'to "{colleague_n}"'
-        )
-    else:
-        log_entry = f"- {now} {agent_n} set colleague → {colleague_n}"
-    log_entry += phase_log_suffix
-    body = md.append_turn_log(body, log_entry)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, updates)
+        _, body = md.parse_frontmatter(updated)
+        if old_colleague:
+            log_entry = (
+                f'- {now} {agent_n} changed colleague from "{old_colleague}" '
+                f'to "{colleague_n}"'
+            )
+        else:
+            log_entry = f"- {now} {agent_n} set colleague → {colleague_n}"
+        log_entry += phase_log_suffix
+        body = md.append_turn_log(body, log_entry)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq, participant_added
 
