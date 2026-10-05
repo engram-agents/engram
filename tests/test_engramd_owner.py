@@ -643,26 +643,112 @@ def test_socket_file_mode_is_not_bind_default(owner_running):
 
 # ---------------------------------------------------------------------------
 # Test 13 -- peer-uid mismatch -> Rejected(peer_identity) (design doc SS5
-# test 1). Needs a second uid; not runnable on this same-seat CI process.
+# test 1; issue #3194, made an automated control by #3197).
+#
+# What it controls: a client whose uid differs from the owner's gets
+# Rejected(reason="peer_identity") from EngramdOwner._check_peer_credentials
+# (SO_PEERCRED read on every accepted connection). The control ran by hand
+# once on 2026-09-29 (a sudo uid-0 client against a uid-1006 owner); this is
+# that run, repeatable.
+#
+# Why it needs sudo: the socket is 0o700 in a 0o700 directory, so the only
+# principal that can even connect from another uid is root. `sudo -n` (no
+# password prompt) is therefore the only way to produce a foreign peer.
+#
+# Where it runs: GitHub's ubuntu-latest runners have passwordless sudo, so it
+# runs in tests.yml (the full suite on the dev->main release PR) and in
+# affected-tests.yml when dispatched by hand. Agent seats have no passwordless
+# sudo, and there it SKIPS BY NAME (the reason says which precondition
+# failed); it never passes silently.
+#
+# Discrimination: the SAME helper script is first run as this process's own
+# uid and must get an accepted ping (so a helper that always errors cannot
+# satisfy the foreign-uid assertion), and every assertion is on the helper's
+# parsed typed result, never on stderr text. Mutant for a runner: make
+# _check_peer_credentials return None unconditionally -> this test goes red.
+#
+# What it does NOT discriminate: the foreign peer here is always uid 0, and
+# _check_peer_credentials rejects uid 0 through a SECOND branch (the
+# `peer_uid == 0 and own_uid != 0` defence-in-depth clause) as well as the
+# `peer_uid != own_uid` branch, with identical output. So this real-socket
+# test proves a non-owner uid-0 peer is rejected by the live owner, but it
+# cannot tell WHICH branch fired; removing only the mismatch branch would
+# leave it green. The non-root mismatch branch is covered by the fake-conn
+# cell in tests/test_engramd_owner_displacement_3240.py
+# (test_snapshot_dest_rights_premise_peer_uid_equals_owner, peer uid own+1).
 # ---------------------------------------------------------------------------
 
+# Prints the typed result of one `ping` as a single JSON object. Run as a
+# separate process (own uid under sudo), so it imports engramd_client the same
+# way any client would.
+_CROSSUID_HELPER = """\
+import dataclasses, json, sys
+from pathlib import Path
+import engramd_client as ec
+r = ec.read("ping", {}, timeout=5.0, socket_path=Path(sys.argv[1]))
+print(json.dumps({"type": type(r).__name__, **dataclasses.asdict(r)}))
+"""
 
-@pytest.mark.skip(
-    reason=(
-        "design doc SS5 test 1 / issue #3194: needs a genuinely different "
-        "uid connecting to the owner's socket, which a same-seat CI "
-        "process cannot produce. The peer-credential READ mechanism "
-        "itself (SO_PEERCRED decoding a REAL foreign uid correctly) was "
-        "already verified in a prior manual cross-uid measurement between "
-        "two live agent processes on this fleet (issue #3194 / PR #3100's "
-        "comment thread) -- not a repeatable pytest fixture, which is why "
-        "this lands as a skip rather than a same-uid workaround. Issue "
-        "#3194 calls this out explicitly: 'U4d (the first live migration) "
-        "should not ship until it has run' as an automated control."
+
+def _run_crossuid_helper(socket_path: Path, *, via_sudo: bool) -> dict:
+    # Explicit environment: sudo resets the caller's, and bytecode writes are
+    # off so a root run cannot leave root-owned __pycache__ in the checkout.
+    cmd = [
+        "env",
+        f"PYTHONPATH={_SRC_ENGRAM}",
+        "PYTHONDONTWRITEBYTECODE=1",
+        sys.executable,
+        "-c",
+        _CROSSUID_HELPER,
+        str(socket_path),
+    ]
+    if via_sudo:
+        cmd = ["sudo", "-n"] + cmd
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, (
+        f"helper (via_sudo={via_sudo}) exited {proc.returncode}; stderr={proc.stderr!r}"
     )
-)
-def test_peer_uid_mismatch_is_rejected():
-    pass
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError) as exc:
+        raise AssertionError(
+            f"helper (via_sudo={via_sudo}) printed no JSON result: "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        ) from exc
+
+
+@requires_linux_owner
+def test_peer_uid_mismatch_is_rejected(owner_running):
+    if os.getuid() == 0:
+        pytest.skip(
+            "cross-uid control needs a foreign uid: this process already runs as uid 0, "
+            "so sudo cannot produce a different uid (#3197)"
+        )
+    if shutil.which("sudo") is None:
+        pytest.skip("cross-uid control needs sudo: `sudo` is not on PATH (#3197)")
+    try:
+        probe = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        pytest.skip("cross-uid control needs passwordless sudo: `sudo -n true` timed out (#3197)")
+    if probe.returncode != 0:
+        pytest.skip(
+            "cross-uid control needs passwordless sudo: `sudo -n true` failed "
+            f"(exit {probe.returncode}) -- runs on GitHub runners, skips on agent seats (#3197)"
+        )
+
+    own_uid = os.getuid()
+
+    # Control (discrimination): the same helper as OUR uid gets an accepted ping.
+    own = _run_crossuid_helper(owner_running.socket_path, via_sudo=False)
+    assert own["type"] == "Ok", f"same-uid helper did not get an accepted ping: {own!r}"
+    assert own["result"]["store_path"] == str(owner_running.store_path), own
+
+    # Act: the same helper as uid 0 is refused by name.
+    foreign = _run_crossuid_helper(owner_running.socket_path, via_sudo=True)
+    assert foreign["type"] == "Rejected", f"foreign-uid client was not rejected: {foreign!r}"
+    assert foreign["reason"] == "peer_identity", foreign
+    assert "uid 0" in foreign["detail"], foreign
+    assert f"uid {own_uid}" in foreign["detail"], foreign
 
 
 # ---------------------------------------------------------------------------
