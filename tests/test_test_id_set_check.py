@@ -60,6 +60,7 @@ ParseError = _mod.ParseError
 Marker = _mod.Marker
 format_report_text = _mod.format_report_text
 main = _mod.main
+swallowed_marker_hint = _mod.swallowed_marker_hint
 warn_if_base_is_not_ancestor = _mod.warn_if_base_is_not_ancestor
 _is_ancestor = _mod._is_ancestor
 _merge_base = _mod._merge_base
@@ -2095,3 +2096,158 @@ def test_3117_main_end_to_end_fails_loud_on_a_fetch_failure(
     assert "::error::" in captured.err
     assert "#101" in captured.err
     assert "tests/test_mod.py::test_a" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# #3244 -- say so when a `Removed-test:` line exists but did not parse
+# because it was swallowed by the (deliberate) inline-code strip.
+#
+# Driven through main() with --pr-body-file: the hint lives in the failure
+# path, not in the parser, so the parser's return values stay unchanged.
+# ---------------------------------------------------------------------------
+
+_3244_HINT = "wrapped in backticks and were ignored"
+
+
+def _make_3244_fixture(tmp_path: Path) -> dict[str, str]:
+    """One commit that removes exactly one test id (tests/test_mod.py::test_a)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.com")
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_mod.py").write_text("def test_a():\n    assert True\n\n\ndef test_b():\n    assert True\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (tests_dir / "test_mod.py").write_text("def test_b():\n    assert True\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "remove test_a")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    return {"repo": str(repo), "base": base, "head": head}
+
+
+def _run_main_3244(tmp_path: Path, capsys: pytest.CaptureFixture, body: str) -> tuple[int, str]:
+    fx = _make_3244_fixture(tmp_path)
+    body_file = tmp_path / "pr_body.md"
+    body_file.write_text(body)
+    code = main(
+        ["--base", fx["base"], "--head", fx["head"], "--repo-root", fx["repo"], "--pr-body-file", str(body_file)]
+    )
+    captured = capsys.readouterr()
+    return code, captured.out + captured.err
+
+
+def test_3244_backtick_wrapped_marker_still_fails_but_says_why(tmp_path: Path, capsys: pytest.CaptureFixture):
+    body = "`Removed-test: tests/test_mod.py::test_a — obsolete`\n"
+    code, out = _run_main_3244(tmp_path, capsys, body)
+    assert code == 1, out
+    assert "not accounted for: tests/test_mod.py::test_a" in out
+    assert _3244_HINT in out
+    assert "backtick" in out.lower()
+
+
+def test_3244_correct_unwrapped_marker_passes_with_no_hint(tmp_path: Path, capsys: pytest.CaptureFixture):
+    body = "Removed-test: tests/test_mod.py::test_a — obsolete\n"
+    code, out = _run_main_3244(tmp_path, capsys, body)
+    assert code == 0, out
+    assert _3244_HINT not in out
+
+
+def test_3244_no_removed_test_text_fails_with_no_hint(tmp_path: Path, capsys: pytest.CaptureFixture):
+    code, out = _run_main_3244(tmp_path, capsys, "Just a PR description.\n")
+    assert code == 1, out
+    assert "not accounted for: tests/test_mod.py::test_a" in out
+    assert _3244_HINT not in out
+
+
+def test_3244_well_formed_marker_inside_fence_parses_so_no_hint(tmp_path: Path, capsys: pytest.CaptureFixture):
+    """Decision: a fence is NOT inline code (#2539/#2540) -- a well-formed
+    marker inside one parses and accounts, so the check passes and no hint
+    fires. The hint is only for lines the inline-code strip swallowed."""
+    body = "```\nRemoved-test: tests/test_mod.py::test_a — obsolete\n```\n"
+    code, out = _run_main_3244(tmp_path, capsys, body)
+    assert code == 0, out
+    assert _3244_HINT not in out
+
+
+def test_3244_malformed_marker_gets_existing_warning_not_the_backtick_hint(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+):
+    """A malformed (unwrapped) marker is already diagnosed by the #2393
+    warning; the backtick hint must not pile on a wrong cause."""
+    body = "Removed-test: tests/test_mod.py::test_a obsolete\n"
+    code, out = _run_main_3244(tmp_path, capsys, body)
+    assert code == 1, out
+    assert "did not parse and was ignored" in out
+    assert _3244_HINT not in out
+
+
+def test_3244_parser_return_values_unchanged_for_wrapped_marker():
+    assert parse_removed_test_markers("`Removed-test: a::b — r`\n") == []
+    assert find_unparsed_removed_test_lines("`Removed-test: a::b — r`\n") == []
+
+
+def test_3244_wrapped_marker_named_even_when_another_id_has_a_wellformed_marker(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+):
+    """Round 2: the hint DETECTS a wrapped line, so another id's well-formed
+    marker parsing does not silence it, and the wrapped id is named."""
+    body = (
+        "`Removed-test: tests/test_mod.py::test_a — obsolete`\n"
+        "Removed-test: tests/test_other.py::test_x — gone\n"
+    )
+    code, out = _run_main_3244(tmp_path, capsys, body)
+    assert code == 1, out
+    assert "not accounted for: tests/test_mod.py::test_a" in out
+    assert f"{_3244_HINT}: tests/test_mod.py::test_a" in out
+    hint_line = next(ln for ln in out.splitlines() if _3244_HINT in ln)
+    assert "test_x" not in hint_line  # the well-formed (parsed) id is not named
+
+
+def test_3244_wrapped_marker_plus_malformed_line_gets_both_warnings(tmp_path: Path, capsys: pytest.CaptureFixture):
+    body = (
+        "`Removed-test: tests/test_mod.py::test_a — obsolete`\n"
+        "Removed-test: tests/test_zzz.py::test_z no dash\n"
+    )
+    code, out = _run_main_3244(tmp_path, capsys, body)
+    assert code == 1, out
+    assert "did not parse and was ignored" in out  # #2393 still fires
+    assert f"{_3244_HINT}: tests/test_mod.py::test_a" in out
+
+
+def test_3244_bulleted_wrapped_marker_is_detected(tmp_path: Path, capsys: pytest.CaptureFixture):
+    body = "- `Removed-test: tests/test_mod.py::test_a — obsolete`\n"
+    code, out = _run_main_3244(tmp_path, capsys, body)
+    assert code == 1, out
+    assert f"{_3244_HINT}: tests/test_mod.py::test_a" in out
+
+
+def test_3244_keyword_only_in_inline_code_aside_gets_no_hint(tmp_path: Path, capsys: pytest.CaptureFixture):
+    body = "Write a `Removed-test:` line for each deleted test.\n"
+    code, out = _run_main_3244(tmp_path, capsys, body)
+    assert code == 1, out
+    assert "not accounted for: tests/test_mod.py::test_a" in out
+    assert _3244_HINT not in out
+
+
+def test_3244_passing_run_with_wrapped_marker_line_gets_no_hint(tmp_path: Path, capsys: pytest.CaptureFixture):
+    """The only-when-failing guard: the removal is accounted for, and the
+    body also carries an (illustrative) wrapped line -> exit 0, no hint."""
+    body = (
+        "Removed-test: tests/test_mod.py::test_a — obsolete\n"
+        "Example: `Removed-test: tests/x.py::test_y — why`\n"
+        "`Removed-test: tests/x.py::test_y — why`\n"
+    )
+    code, out = _run_main_3244(tmp_path, capsys, body)
+    assert code == 0, out
+    assert _3244_HINT not in out
+
+
+def test_3244_wrapped_marker_inside_fence_is_not_the_swallow_case():
+    """Decision: a fence is not run through the inline strip (#2539/#2540),
+    so a backtick-wrapped line inside one was not swallowed by it; the
+    #2393 warning owns that shape. The detector skips fenced lines."""
+    assert swallowed_marker_hint("```\n`Removed-test: a::b — r`\n```\n") is None
