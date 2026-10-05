@@ -15,11 +15,20 @@ Default file: $ENGRAM_HOME/warm-briefing.md, else ~/.engram/warm-briefing.md.
 
 Exit codes:
     0  erased, or already bare (no change)
-    2  usage / IO error (missing or unreadable file)
+    2  usage / IO error: missing or unreadable file, OR a failed write (the message
+       says whether the original bytes were restored, or the file was untouched)
     3  drift-STOP: an ATX level-1/2 heading sits below the anchor; file untouched
        (BEST-EFFORT structural proxy: ATX headings only; setext headings and
        plain prose are not detected)
-    4  post-condition failure; file untouched
+    4  post-condition failure: before any write (file untouched), or a read-back
+       mismatch after the write (the original bytes are restored in place)
+
+The write is IN PLACE (open the existing file r+, write, truncate, fsync, read
+back): the inode, ACLs, xattrs, mode and hard links survive by construction, and a
+`deny delete` ACL cannot block it (#3419).  If the write or the read-back fails
+the original bytes are restored in place.  There is no temp file / os.replace.
+The in-place write is NOT atomic: a concurrent reader can briefly see the old tail
+after the new heading (never an altered letter, never an empty file).
 
 Anchor: regex (?m)^## From this session  (line-anchored prefix match; the LAST
 match is the target).  No line-ending translation is ever performed.
@@ -28,7 +37,6 @@ import argparse
 import os
 import re
 import sys
-import tempfile
 from pathlib import Path
 
 HEADING = "## From this session"
@@ -116,20 +124,54 @@ def erase_session_block(text: str):
     return new, info
 
 
-def _atomic_write(path: Path, data: str) -> None:
-    mode = path.stat().st_mode & 0o7777
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+class WriteFailure(OSError):
+    """The in-place write failed; the message says whether the original was restored."""
+
+
+def _restore_in_place(path: Path, original: str) -> bool:
+    """Best-effort: put `original` back into the same inode. True if it was re-written."""
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+        with open(path, "r+", encoding="utf-8", newline="") as f:
+            f.seek(0)
+            f.write(original)
+            f.truncate()
+            f.flush()
+            os.fsync(f.fileno())
+        return True
+    except Exception:  # not BaseException: a second Ctrl-C must propagate
+        return False
+
+
+def _write_in_place(path: Path, data: str, original: str) -> None:
+    """Overwrite the EXISTING file (same inode), so ACLs, xattrs, mode and hard
+    links survive by construction (#3419).  No temp file, no os.replace, no chmod.
+    On any failure the original bytes are restored in place and WriteFailure is raised.
+    """
+    began = False  # becomes True just before the first write: until then the file is untouched
+    try:
+        with open(path, "r+", encoding="utf-8", newline="") as f:
+            began = True
+            f.seek(0)
             f.write(data)
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+            f.truncate()
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException as e:
+        restored = _restore_in_place(path, original) if began else None
+        if not isinstance(e, Exception):
+            raise
+        if restored is None:
+            outcome = "file untouched"
+        elif restored:
+            outcome = "original bytes restored"
+        else:
+            outcome = "original bytes NOT restored: file may be damaged"
+        raise WriteFailure(f"{e} ({outcome})") from e
+
+
+def _read_text(path: Path) -> str:
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        return f.read()
 
 
 def main(argv=None) -> int:
@@ -172,10 +214,23 @@ def main(argv=None) -> int:
         print(f"dry-run: would erase: {summary}")
         return 0
     try:
-        _atomic_write(path, new)
+        _write_in_place(path, new, old)
     except OSError as e:
         print(f"error: cannot write {path}: {e}", file=sys.stderr)
         return 2
+    # Read-back: the bytes on disk must be exactly the text we meant to write.
+    try:
+        written = _read_text(path)
+    except (OSError, UnicodeDecodeError) as e:
+        written = f"<unreadable: {e}>"
+    if written != new:
+        restored = _restore_in_place(path, old)
+        print(
+            f"post-condition failure: read-back of {path} differs from the intended text; "
+            f"original bytes {'restored' if restored else 'NOT restored: file may be damaged'}.",
+            file=sys.stderr,
+        )
+        return 4
     print(f"erased: {summary}")
     return 0
 

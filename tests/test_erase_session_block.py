@@ -13,6 +13,7 @@ in subprocess runs so the real ~/.engram is never touched.
 import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -336,3 +337,258 @@ def test_t12_p4_not_idempotent(tool, monkeypatch, tmp_path):
         return text[:i] + HEADING + "\n"
 
     _assert_wrong_core_refused(tool, monkeypatch, tmp_path, core, "P4")
+
+
+# T13 in-place write (#3419) ---------------------------------------------
+# The erase must write the EXISTING file in place: a temp file + os.replace gives
+# the briefing a new inode and silently drops its ACL / xattrs (measured on
+# macOS), and a `deny delete` ACL makes the replace fail.  Every cell uses a
+# scratch file under tmp_path; ENGRAM_HOME points at tmp_path (via _run).
+SECTION_TEXT = LETTER + HEADING + "\n- arc 1\n- arc 2\n"
+BARE_TEXT = LETTER + HEADING + "\n"
+
+
+def _set_xattr(path, name, value):
+    """Set a user xattr; return (getter, "") or (None, skip-reason) when unsupported."""
+    if hasattr(os, "setxattr") and hasattr(os, "getxattr"):
+        try:
+            os.setxattr(path, "user." + name, value)
+        except OSError:
+            return None, "filesystem under tmp_path has no user-xattr support"
+        return (lambda: os.getxattr(path, "user." + name)), ""
+    if shutil.which("xattr"):
+        r = subprocess.run(
+            ["xattr", "-w", "com." + name, value.decode(), str(path)],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            return None, f"xattr CLI refused: {r.stderr.strip()}"
+
+        def get():
+            return subprocess.run(
+                ["xattr", "-p", "com." + name, str(path)], capture_output=True, text=True
+            ).stdout.strip().encode()
+
+        return get, ""
+    return None, "neither os.setxattr nor the xattr CLI is available on this platform"
+
+
+def test_i1_inode_and_mode_unchanged_after_erase(tmp_path):
+    # Plausible-wrong: temp file + os.replace (new inode).
+    p = _write(tmp_path, SECTION_TEXT)
+    os.chmod(p, 0o640)
+    before = os.stat(p)
+    r = _run(["--file", str(p)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    after = os.stat(p)
+    assert after.st_ino == before.st_ino
+    assert after.st_mode == before.st_mode
+    assert p.read_bytes() == BARE_TEXT.encode()
+
+
+def test_i2_xattr_preserved(tmp_path):
+    # Plausible-wrong: temp file + os.replace drops xattrs.
+    p = _write(tmp_path, SECTION_TEXT)
+    get, why = _set_xattr(p, "test.marker", b"hello")
+    if get is None:
+        pytest.skip(why)
+    assert get() == b"hello"
+    r = _run(["--file", str(p)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert get() == b"hello"
+    assert p.read_bytes() == BARE_TEXT.encode()
+
+
+def test_i3_hard_link_sees_new_content(tmp_path):
+    # Plausible-wrong: os.replace re-points only one name; the link keeps old bytes.
+    p = _write(tmp_path, SECTION_TEXT)
+    link = tmp_path / "wb-link.md"
+    try:
+        os.link(p, link)
+    except OSError as e:
+        pytest.skip(f"hard links unsupported here: {e}")
+    r = _run(["--file", str(p)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert link.read_bytes() == BARE_TEXT.encode()
+    assert os.stat(link).st_ino == os.stat(p).st_ino
+
+
+def test_i4_write_failure_restores_original_exit2(tool, monkeypatch, tmp_path, capsys):
+    # The first fsync (after truncate, before the write is durable) raises; the tool
+    # must put the ORIGINAL bytes back in place and exit 2 naming the restore.
+    # Plausible-wrong: no restore -> a half-written / truncated briefing.
+    p = _write(tmp_path, SECTION_TEXT)
+    ino = os.stat(p).st_ino
+    real = os.fsync
+    calls = {"n": 0}
+
+    def flaky(fd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(5, "injected I/O error")
+        return real(fd)
+
+    monkeypatch.setattr(tool.os, "fsync", flaky)
+    assert tool.main(["--file", str(p)]) == 2
+    err = capsys.readouterr().err
+    assert "original bytes restored" in err and "NOT restored" not in err
+    assert "injected I/O error" in err
+    assert p.read_bytes() == SECTION_TEXT.encode()
+    assert os.stat(p).st_ino == ino
+
+
+def test_i4_partial_write_is_restored(tool, monkeypatch, tmp_path, capsys):
+    # The write itself dies halfway (file truncated, 3 chars of new text land, then an error):
+    # the original bytes must come back.
+    p = _write(tmp_path, SECTION_TEXT)
+    real_open = open
+
+    class Half:
+        def __init__(self, f):
+            self._f, self._n = f, 0
+
+        def __getattr__(self, k):
+            return getattr(self._f, k)
+
+        def __enter__(self):
+            self._f.__enter__()
+            return self
+
+        def __exit__(self, *a):
+            return self._f.__exit__(*a)
+
+        def write(self, s):
+            self._n += 1
+            if self._n == 1:
+                self._f.truncate(0)  # the file is already cut short when the error hits
+                self._f.write(s[:3])
+                self._f.flush()
+                raise OSError(28, "disk full")
+            return self._f.write(s)
+
+    opened = {"n": 0}
+
+    def fake_open(file, mode="r", *a, **k):
+        f = real_open(file, mode, *a, **k)
+        if "+" in mode:
+            opened["n"] += 1
+            if opened["n"] == 1:  # only the main write fails; the restore open is clean
+                return Half(f)
+        return f
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    rc = tool.main(["--file", str(p)])
+    monkeypatch.undo()
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "original bytes restored" in err and "NOT restored" not in err
+    assert p.read_bytes() == SECTION_TEXT.encode()
+
+
+def test_i5_readback_mismatch_restores_exit4(tool, monkeypatch, tmp_path, capsys):
+    # A writer that silently writes WRONG bytes (same length): only the read-back
+    # can notice.  Plausible-wrong: trust the write and report "erased".
+    p = _write(tmp_path, SECTION_TEXT)
+
+    def bad_writer(path, data, original):
+        with open(path, "r+", encoding="utf-8", newline="") as f:
+            f.seek(0)
+            f.write(data.replace("Dear", "DEAR"))
+            f.truncate()
+
+    monkeypatch.setattr(tool, "_write_in_place", bad_writer, raising=False)
+    assert tool.main(["--file", str(p)]) == 4
+    err = capsys.readouterr().err
+    assert "post-condition" in err
+    assert "original bytes restored" in err and "NOT restored" not in err
+    assert p.read_bytes() == SECTION_TEXT.encode()
+
+
+def test_i5_correct_write_passes_readback(tool, tmp_path, capsys):
+    p = _write(tmp_path, SECTION_TEXT)
+    assert tool.main(["--file", str(p)]) == 0
+    assert p.read_bytes() == BARE_TEXT.encode()
+    assert "erased:" in capsys.readouterr().out
+
+
+# ---- round-1 cells (#3419): longer-new-text failure, restore truncate, Ctrl-C, open failure
+
+NO_ANCHOR = "hello"  # case B: no anchor, so the new text ("hello\n## From this session\n") is LONGER
+
+
+def _first_fsync_raises(tool, monkeypatch, exc):
+    real = os.fsync
+    calls = {"n": 0}
+
+    def flaky(fd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise exc
+        return real(fd)
+
+    monkeypatch.setattr(tool.os, "fsync", flaky)
+
+
+def test_r1_case_b_failure_restores_exact_original_exit2(tool, monkeypatch, tmp_path, capsys):
+    # The new text is longer than the old; the failure hits after the full longer text
+    # is on disk.  Plausible-wrong: restore writes the short original but leaves the
+    # longer file's tail (no truncate) -> length/bytes differ.
+    p = _write(tmp_path, NO_ANCHOR)
+    _first_fsync_raises(tool, monkeypatch, OSError(5, "injected I/O error"))
+    assert tool.main(["--file", str(p)]) == 2
+    err = capsys.readouterr().err
+    assert "original bytes restored" in err and "NOT restored" not in err
+    assert p.read_bytes() == NO_ANCHOR.encode()
+    assert os.stat(p).st_size == len(NO_ANCHOR)
+
+
+def test_r1_restore_truncates_longer_leftover(tool, tmp_path):
+    # Direct pin on _restore_in_place: the file currently holds LONGER bytes than the
+    # original.  Plausible-wrong: restore without truncate() leaves the tail.
+    p = _write(tmp_path, NO_ANCHOR + "\n" + HEADING + "\n")
+    assert tool._restore_in_place(p, NO_ANCHOR) is True
+    assert p.read_bytes() == NO_ANCHOR.encode()
+
+
+def test_r1_keyboardinterrupt_restores_and_propagates(tool, monkeypatch, tmp_path):
+    # Ctrl-C during the write: the original is restored AND the interrupt is not
+    # swallowed.  Plausible-wrong: `except BaseException` that eats it (or a restore
+    # that swallows a second one).
+    p = _write(tmp_path, SECTION_TEXT)
+    _first_fsync_raises(tool, monkeypatch, KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        tool.main(["--file", str(p)])
+    monkeypatch.undo()
+    assert p.read_bytes() == SECTION_TEXT.encode()
+
+
+def test_r2_restore_does_not_swallow_a_second_interrupt(tool, monkeypatch, tmp_path):
+    # A second Ctrl-C landing inside the restore's OWN fsync must propagate.
+    # Plausible-wrong: the pre-r1 `except BaseException` in _restore_in_place eats it.
+    p = _write(tmp_path, SECTION_TEXT)
+
+    def boom(fd):
+        raise KeyboardInterrupt("second")
+
+    monkeypatch.setattr(tool.os, "fsync", boom)
+    with pytest.raises(KeyboardInterrupt):
+        tool._restore_in_place(p, "abc")
+
+
+@pytest.mark.skipif(
+    hasattr(os, "getuid") and os.getuid() == 0,
+    reason="root bypasses file mode bits, so a 0444 file is still writable",
+)
+def test_r1_open_failure_reports_untouched_not_damaged(tool, tmp_path, capsys):
+    # open(path, "r+") itself fails (read-only file): nothing was written, so the
+    # message must say untouched.  Plausible-wrong: "NOT restored: file may be damaged".
+    p = _write(tmp_path, SECTION_TEXT)
+    os.chmod(p, 0o444)
+    try:
+        assert tool.main(["--file", str(p)]) == 2
+        err = capsys.readouterr().err
+        assert "untouched" in err
+        assert "damaged" not in err and "NOT restored" not in err
+        assert p.read_bytes() == SECTION_TEXT.encode()
+    finally:
+        os.chmod(p, 0o644)
