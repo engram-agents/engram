@@ -256,3 +256,5 @@ claude plugin validate tools/probes/mods-recall
 claude plugin test tools/probes/mods-recall
 python3 -m pytest tests/test_probe_mods_recall.py
 ```
+
+Save the runner output to a file first, then read the counts and the `(fail)` lines from that file: a count-only pipe loses the failing test's name, which is the only thing a one-in-many failure carries (#3378).

@@ -66,7 +66,7 @@ export type Probe = {
   /** why the probe is inactive, if it is (also written to session notes) */
   disabled: string | null
   turns: Map<string, TurnState>
-  /** arm C replies by sha-256 of the prompt, for the module's lifetime */
+  /** arm C replies keyed by the prompt text (<= 3000 chars each), for the module's lifetime */
   extractCache: Map<string, string>
   logged: Set<string>
 }

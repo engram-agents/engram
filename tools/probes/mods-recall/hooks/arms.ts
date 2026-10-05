@@ -85,11 +85,6 @@ export function tailQuery(material: string): string {
   return text.slice(-TAIL_FALLBACK_CHARS)
 }
 
-async function hexSha256(text: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
-  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('')
-}
-
 async function timed<T>(io: Io, fn: () => Promise<T>): Promise<{ value?: T; err?: unknown; ms: number }> {
   const t0 = await io.now()
   let value: T | undefined
@@ -142,7 +137,9 @@ async function armExtractModel(ctx: ArmCtx): Promise<ArmResult> {
   if (proxyTooShort(ctx)) return { arm: 'extract_model', ms: 0, skipped: SHORT_PROXY }
   const t0 = await io.now()
   const prompt = ctx.extractInput.slice(-EXTRACT_TAIL_CHARS)
-  const key = await hexSha256(prompt)
+  // The prompt itself is the cache key (<= EXTRACT_TAIL_CHARS). Not a digest: crypto.subtle.digest
+  // completes on a real macrotask the test clock cannot settle (#3378).
+  const key = prompt
   let reply = probe.extractCache.get(key)
   const cached = reply !== undefined
   const extract: NonNullable<ArmResult['extract']> = { ms: 0, cached, isAnswered: cached }

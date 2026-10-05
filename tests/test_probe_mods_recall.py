@@ -1010,3 +1010,68 @@ def test_short_proxy_material_arm_skip_is_status_skipped_and_excluded_from_scori
     result = evaluator.evaluate(str(out / "golden"), str(out / "test"), None)
     assert result["arms"]["thinking_full"]["excluded_arm_runs"] == 1
     assert result["arms"]["thinking_full"]["n_steps"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Static guard (#3378): no real-async hop in the hook path
+# ---------------------------------------------------------------------------
+# The mods-recall hook step job once awaited crypto.subtle.digest, a real-async
+# hop the test kit's fake clock cannot settle -> a timing flake. This guard
+# keeps the cause class out: it scans hook SOURCE (not *.test.ts) with comments
+# stripped, so a comment that names the thing we avoid does not trip it.
+# kit.ts is included: it holds no timer/fetch/subtle token today, so there is
+# no reason to exempt it. Out of scope: `new Promise(` wrapping a timer.
+
+_REAL_ASYNC_TOKENS = ("crypto.subtle", "setTimeout(", "setInterval(", "fetch(")
+_HOOKS_DIR = PROBE_DIR / "hooks"
+
+
+def _strip_ts_comments(src: str) -> str:
+    """Blank out // and /* */ comments, keeping every newline (line numbers hold).
+
+    String-aware for '...', "..." and `...` so a '//' inside a literal is not a
+    comment. Does not model regex literals or template ${} nesting; hook source
+    has none that matter (a miss there fails loud on the green run, not silent).
+    """
+    out, i, n, quote = [], 0, len(src), None
+    while i < n:
+        c, two = src[i], src[i:i + 2]
+        if quote:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(src[i + 1])
+                i += 1
+            elif c == quote:
+                quote = None
+        elif two == "//":
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        elif two == "/*":
+            end = src.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            out.append("".join(ch for ch in src[i:end] if ch == "\n"))
+            i = end
+            continue
+        else:
+            if c in "'\"`":
+                quote = c
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _hook_sources() -> list[Path]:
+    return sorted(p for p in _HOOKS_DIR.glob("*.ts") if not p.name.endswith(".test.ts"))
+
+
+def test_hook_source_has_no_real_async_hop():
+    files = _hook_sources()
+    scanned = [p.name for p in files]
+    # zero files must be distinguishable from zero hits (a renamed dir must not pass vacuously)
+    assert files, f"no hook source found under {_HOOKS_DIR} (scanned: {scanned})"
+    hits = []
+    for p in files:
+        for lineno, line in enumerate(_strip_ts_comments(p.read_text()).splitlines(), 1):
+            hits.extend(f"{p.name}:{lineno}: {tok}" for tok in _REAL_ASYNC_TOKENS if tok in line)
+    assert not hits, f"real-async hop in the hook path: {hits} (scanned: {scanned})"
