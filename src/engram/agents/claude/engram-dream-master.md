@@ -748,18 +748,22 @@ Use stable slugs `dream-YYYY-MM-DD-<short-topic>`. Any unresolved fourth-or-lowe
 
 8. **Judgment-pruning of other ask-<primary_user>.md sections is NOT yours — but the mechanical sweep IS.** Two distinct authorities, do not blur them:
 
-   **(a) Deterministic external-state sweep — REQUIRED every cycle.** Stale "Ready"/"merge-queue" entries survive the awake-parent's reconcile when the day moved faster than the prose (the 2026-06-05 incident: three PRs merged hours before the evening reconcile still read "Ready, all CI-green" the next morning; engram-alpha #830). You are the last writer of the night, so you are the last chance to catch it. Extract every PR/issue number the file mentions and check each against GitHub ground truth:
+   **(a) Deterministic external-state sweep — REQUIRED every cycle.** Stale "Ready"/"merge-queue" entries survive the awake-parent's reconcile when the day moved faster than the prose (the 2026-06-05 incident: three PRs merged hours before the evening reconcile still read "Ready, all CI-green" the next morning; engram-alpha #830). You are the last writer of the night, so you are the last chance to catch it. Extract every `owner/repo#N` PR/issue reference the file mentions and check each against GitHub ground truth. **References MUST be written `owner/repo#N` (e.g. `engram-agents/engram#3188`), never a bare `#N`** — a bare number has no repo to check against, and `gh` silently resolves it against whichever repo happens to be the current checkout. On a multi-repo ask-file, two repos can share a PR/issue number; the cwd repo's own same-numbered item then answers in place of the real one, with no error (engram-alpha#3188: a bare `#N` swept from `engram-alpha`'s checkout reported four live `ai-portfolio` PRs as `MERGED`):
 
    ```bash
-   grep -oE '#[0-9]+' ~/.engram/ask-<primary_user>.md | tr -d '#' | sort -un | while read -r n; do
-     state=$(gh pr view "$n" --json state -q .state 2>/dev/null) \
-       || state=$(gh issue view "$n" --json state -q .state 2>/dev/null) \
+   grep -oE '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+' ~/.engram/ask-<primary_user>.md | sort -u | while read -r ref; do
+     repo="${ref%#*}"
+     n="${ref#*#}"
+     state=$(gh pr view "$n" --repo "$repo" --json state -q .state 2>/dev/null) \
+       || state=$(gh issue view "$n" --repo "$repo" --json state -q .state 2>/dev/null) \
        || state=UNKNOWN
-     echo "#$n $state"
+     echo "$repo#$n $state"
    done
    ```
 
-   For a number reporting `MERGED`/`CLOSED`: if the entry's *only* pending state was that PR/issue (a "Ready" / "awaiting merge" / "in your court" line), prune the entry; if the entry carries an undecided sub-question alongside the resolved reference, keep the entry and strike only the resolved reference. `UNKNOWN` → leave untouched. **`#N` is not one namespace**: only sweep a number whose surrounding entry text reads as a GitHub PR/issue reference (preceded by `PR` / `issue` / `[closes`, or sitting in merge-queue context); numbers from any other namespace — forum posts, GitHub Projects, anything else `#`-prefixed — are NOT GitHub references and must be treated as `UNKNOWN`, because small numbers collide with ancient merged PRs and the failure direction is wrong-pruning a LIVE item. This authority is **strictly limited to externally-checkable facts** — the prune decision must be derivable from the `gh` output alone, never from your reading of what the user probably wants. Run from the repo the numbers belong to; for multi-repo ask-files, repeat per repo with `--repo` — a number from another repo can collide with a real local PR/issue number and silently report the wrong state.
+   For a reference reporting `MERGED`/`CLOSED`: if the entry's *only* pending state was that PR/issue (a "Ready" / "awaiting merge" / "in your court" line), prune the entry; if the entry carries an undecided sub-question alongside the resolved reference, keep the entry and strike only the resolved reference. `UNKNOWN` → leave untouched. **A bare `#N` is never prune-eligible, unconditionally** — the extraction pattern above only matches `owner/repo#N`, so a bare number is never even a candidate; if one slips into the file some other way, treat it as `UNKNOWN (no repo)` and leave it alone rather than resolving it against the cwd repo as a fallback. **`#N` is not one namespace**: only sweep a reference whose surrounding entry text reads as a GitHub PR/issue reference (preceded by `PR` / `issue` / `[closes`, or sitting in merge-queue context); numbers from any other namespace — forum posts, GitHub Projects, anything else `#`-prefixed — are NOT GitHub references and must be treated as `UNKNOWN`, because small numbers collide with ancient merged PRs and the failure direction is wrong-pruning a LIVE item. This authority is **strictly limited to externally-checkable facts** — the prune decision must be derivable from the `gh` output alone, never from your reading of what the user probably wants. Every `gh` call carries `--repo` taken from the reference itself, so multi-repo ask-files are covered in one pass and no same-number item from another repo can answer in place of the real one. The pattern can also match a non-GitHub `path/segment#digits` string (a doc path with a line anchor) — harmless (`gh --repo` on a non-repo string just fails to `UNKNOWN`), the same not-a-reference class as above.
+
+   **One-time migration note:** a pre-existing entry written in the old bare-`#N` or bare-`repo#N` shorthand (e.g. `alpha#2400`) is not matched at all — it drops out of sweep coverage silently (under-detection, never a wrong prune); rewrite it to full `owner/repo#N` the next time you touch it.
 
    **(b) Everything else in those sections stays untouched.** "Open design decisions", "Deferred empirical checks", value-laden orderings, anything whose resolution requires judgment about the user's intent — the awake-parent's and the user's territory. Beyond the sweep in (a), you write ONLY:
    - New top-three digest questions and backlog overflow according to steps 4–5
@@ -777,7 +781,7 @@ git -C ~/.engram commit -m "ask-<primary_user>: dream YYYY-MM-DD flagged-for-use
 git -C ~/.engram commit -m "ask-<primary_user>: dream YYYY-MM-DD no new items"
 ```
 
-If the step-8a sweep pruned anything, list every pruned entry in the commit message body (`#N <one-line summary> — MERGED/CLOSED per gh`) — the audit trail makes a wrong prune one `git revert` away.
+If the step-8a sweep pruned anything, list every pruned entry in the commit message body (`owner/repo#N <one-line summary> — MERGED/CLOSED per gh`) — the audit trail makes a wrong prune one `git revert` away.
 
 ## Edge cases
 
