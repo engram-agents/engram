@@ -182,7 +182,7 @@ def _pattern_telemetry_log(pattern_name: str, preset: str,
 def _pattern_contradiction_obsolescence_ready(
     conn, preset_params: dict, **_filters
 ) -> list[dict]:
-    """Active contradictions where one side is retracted/superseded.
+    """Unsettled (active or partially_resolved) contradictions where one side is retracted/superseded.
 
     A contradiction with one side already obsolete is resolution-by-
     obsolescence ready: the agent can write a derivation citing the
@@ -191,7 +191,7 @@ def _pattern_contradiction_obsolescence_ready(
     signal is.
 
     Score: 1.0 if exactly one side is non-current AND the contradiction
-    is still status='active'; 0.5 if both sides are non-current (likely
+    is still unsettled (active/partially_resolved); 0.5 if both sides are non-current (likely
     already moot but the contradiction node wasn't resolved); 0.0 if
     neither side is obsolete (returned only at high_recall).
 
@@ -201,10 +201,14 @@ def _pattern_contradiction_obsolescence_ready(
     threshold = float(preset_params.get("cosine_threshold", 0.50))
     top_k = int(preset_params.get("top_k", 15))
 
+    # Unsettled set (active + partially_resolved), shared with reflect (#3355);
+    # NOT the narrower "open" set of core._open_contradiction_ids.
     contradictions = conn.execute(
         "SELECT id, claim, status FROM nodes "
-        "WHERE type='contradiction' AND is_current=1 AND status='active' "
-        "ORDER BY id DESC"
+        "WHERE type='contradiction' AND is_current=1 "
+        f"AND status IN ({core._unsettled_contradiction_status_sql()}) "
+        "ORDER BY id DESC",
+        core.UNSETTLED_CONTRADICTION_STATUSES,
     ).fetchall()
 
     candidates: list[dict] = []

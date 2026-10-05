@@ -580,6 +580,22 @@ def _as_csv(v) -> str:
     return v or ""
 
 
+# Contradiction status vocabulary (#3355). Two DIFFERENT questions, two different sets;
+# do not unify them.
+#   UNSETTLED (this constant): "does this contradiction still need adjudication
+#   work?" -> active OR partially_resolved. Used by the obsolescence scan, reflect,
+#   and (pinned by test) the health measurement. `open` is QUESTION vocabulary and
+#   never a contradiction status.
+#   OPEN (#1654, `_open_contradiction_ids`): "has no resolves closure landed?" ->
+#   status 'active' only; deliberately NOT this set.
+UNSETTLED_CONTRADICTION_STATUSES = ("active", "partially_resolved")
+
+
+def _unsettled_contradiction_status_sql() -> str:
+    """``IN (...)`` placeholder list for UNSETTLED_CONTRADICTION_STATUSES."""
+    return ",".join("?" * len(UNSETTLED_CONTRADICTION_STATUSES))
+
+
 VALID_NODE_TYPES = {
     "evidence",
     "observation_factual",
@@ -9442,8 +9458,11 @@ def _open_contradiction_ids(conn: sqlite3.Connection, node_id: str) -> list:
     yet. A contradiction's status only leaves 'active' (→ 'resolved' or
     'partially_resolved') once a resolves edge is wired against it
     (_resolve_impl), so status='active' IS the "no resolves closure" test
-    from the issue text — matches the existing obsolescence-scan convention
-    (engram_query._pattern_contradiction_obsolescence_ready).
+    from the issue text. This is the OPEN set (active only), deliberately
+    narrower than UNSETTLED_CONTRADICTION_STATUSES: the obsolescence scan
+    (engram_query._pattern_contradiction_obsolescence_ready) uses the unsettled
+    set, because a partially_resolved contradiction no longer blocks a derive
+    but is still unfinished, so an obsolete side on it is a resolution candidate.
     """
     rows = conn.execute(
         """SELECT DISTINCT ct.id FROM edges e

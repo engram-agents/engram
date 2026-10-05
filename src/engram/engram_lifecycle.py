@@ -627,10 +627,12 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         # Gate reflect sub-scans on tier-2 (queryable) threshold; tier-1 is retired.
         t2 = core._get_tier_threshold(conn, 2)
 
-        # 1. Unresolved contradictions (open and partially resolved)
+        # 1. Unresolved contradictions (unsettled: active and partially resolved)
         # LOW-VOLUME: source-swap description → recall_summary with claim fallback.
         contradictions = conn.execute(
-            "SELECT id, claim, recall_summary, status FROM nodes WHERE type = 'contradiction' AND status IN ('active', 'partially_resolved') AND is_current = 1"
+            "SELECT id, claim, recall_summary, status FROM nodes WHERE type = 'contradiction' "
+            f"AND status IN ({core._unsettled_contradiction_status_sql()}) AND is_current = 1",
+            core.UNSETTLED_CONTRADICTION_STATUSES,
         ).fetchall()
         report["unresolved_contradictions"] = [
             {"id": c["id"], "description": core._reflect_rs_or_claim(c, "claim"), "status": c["status"]} for c in contradictions

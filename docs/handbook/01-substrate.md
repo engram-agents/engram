@@ -436,7 +436,7 @@ Core search: `_search_nodes()` (6118–6570) implements FTS + semantic search, t
 
 **how** — Entry point: `engram_reflect()` (17143–17890) computes full briefing, optional slim via `_slim_reflect_briefing()` (17012–17088). Uses queries for:
 - Active goals/tasks (status='open' or 'in_progress')
-- Contradictions (status='active' or 'unresolved')
+- Contradictions (status IN ('active', 'partially_resolved'); `active` alone means no resolves closure yet, #1654)
 - Tainted nodes (has both current version AND superseding version in a contradiction)
 - Stale nodes (importance_score near decay floor)
 - Support-lost (had supporting edges, now none)
