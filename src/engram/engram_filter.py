@@ -25,6 +25,7 @@ See alpha issue #81 for the full design rationale.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -193,6 +194,43 @@ class FilterError(ValueError):
     """Raised when a filter dict is malformed. Message describes what's wrong."""
 
 
+# `metadata.<key>` — read-only access to ONE top-level key of the `nodes.metadata`
+# JSON blob (#3402). The key is validated against METADATA_KEY_PATTERN and then
+# passed to SQLite as a BOUND PARAMETER path (`$."<key>"`); it is never
+# interpolated into SQL. A malformed-JSON `metadata` row extracts as NULL rather
+# than failing the query (json_valid guard). JSON true/false extract as 1/0.
+METADATA_FIELD_PREFIX = "metadata."
+METADATA_KEY_PATTERN = r"^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+_METADATA_KEY_RE = re.compile(METADATA_KEY_PATTERN)
+_METADATA_EXPR = 'json_extract(CASE WHEN json_valid("metadata") THEN "metadata" END, ?)'
+
+
+def is_metadata_key_field(field: Any) -> bool:
+    return isinstance(field, str) and field.startswith(METADATA_FIELD_PREFIX)
+
+
+def parse_metadata_key(field: str, path: str) -> str:
+    """Return the validated key of a `metadata.<key>` field or raise FilterError."""
+    key = field[len(METADATA_FIELD_PREFIX):]
+    # fullmatch, so a trailing newline cannot slip past `$`.
+    if not _METADATA_KEY_RE.fullmatch(key):
+        raise FilterError(
+            f"{path}: invalid metadata key in '{field}': a metadata.<key> field "
+            f"takes one top-level key matching {METADATA_KEY_PATTERN}"
+        )
+    return key
+
+
+def metadata_json_path(key: str) -> str:
+    return f'$."{key}"'
+
+
+def metadata_select_expr(field: str, path: str = "fields") -> tuple[str, list]:
+    """(SQL expression, params) projecting `metadata.<key>`; key bound, not interpolated."""
+    key = parse_metadata_key(field, path)
+    return _METADATA_EXPR, [metadata_json_path(key)]
+
+
 def _is_atomic(cond: dict) -> bool:
     return "field" in cond
 
@@ -244,6 +282,18 @@ def _parse_atomic(cond: dict, path: str) -> tuple[str, list]:
             )
         return _build_virtual_clause(field, op, cond, path)
 
+    # Metadata-key path: json_extract over the metadata blob (#3402).
+    if is_metadata_key_field(field):
+        key = parse_metadata_key(field, path)
+        if op not in ALL_ATOMIC_OPS:
+            raise FilterError(
+                f"{path}: unknown op '{op}'. Valid ops: {sorted(ALL_ATOMIC_OPS)}"
+            )
+        return _build_scalar_clause(
+            field, op, cond, path,
+            expr=_METADATA_EXPR, expr_params=[metadata_json_path(key)],
+        )
+
     if field not in ALLOWED_NODE_COLUMNS:
         valid = sorted(ALLOWED_NODE_COLUMNS | set(VIRTUAL_FIELDS.keys()))
         raise FilterError(f"{path}: unknown field '{field}'. Valid fields: {valid}")
@@ -272,12 +322,32 @@ def _like_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _build_scalar_clause(field: str, op: str, cond: dict, path: str) -> tuple[str, list]:
+def _build_scalar_clause(
+    field: str, op: str, cond: dict, path: str,
+    expr: str | None = None, expr_params: list | None = None,
+) -> tuple[str, list]:
+    """Build the SQL for one atomic condition.
+
+    `expr` / `expr_params` override the column reference (used by
+    `metadata.<key>`: an expression with one bound `?` for the JSON path). The
+    expression's params go where the expression appears in the fragment.
+    """
+    if expr is None:
+        return _scalar_clause_sql(f'"{field}"', op, cond, path)
+    pre = list(expr_params or [])
+    sql, params = _scalar_clause_sql(expr, op, cond, path)
+    if op == "not_in":
+        # `(expr NOT IN (...) OR expr IS NULL)`: expr appears before AND after the list.
+        return sql, pre + params + pre
+    return sql, pre + params
+
+
+def _scalar_clause_sql(col: str, op: str, cond: dict, path: str) -> tuple[str, list]:
     has_value = "value" in cond
     if op in NULL_OPS:
         if has_value:
             raise FilterError(f"{path}: op '{op}' must not have a 'value'")
-        sql = f"\"{field}\" IS NULL" if op == "is_null" else f"\"{field}\" IS NOT NULL"
+        sql = f"{col} IS NULL" if op == "is_null" else f"{col} IS NOT NULL"
         return sql, []
     if not has_value:
         raise FilterError(f"{path}: op '{op}' requires a 'value'")
@@ -286,21 +356,21 @@ def _build_scalar_clause(field: str, op: str, cond: dict, path: str) -> tuple[st
 
     if op in SCALAR_OPS:
         if op == "eq":
-            return f"\"{field}\" = ?", [value]
+            return f"{col} = ?", [value]
         if op == "ne":
             # SQLite's `IS NOT` operator handles NULL natively: `NULL IS NOT 'x'`
             # evaluates TRUE because NULL is distinct from 'x'. So per design
             # Item 5, a NULL row matches `field ne X` without needing the
             # explicit `OR field IS NULL` we previously had.
-            return f"\"{field}\" IS NOT ?", [value]
+            return f"{col} IS NOT ?", [value]
         if op == "gt":
-            return f"\"{field}\" > ?", [value]
+            return f"{col} > ?", [value]
         if op == "gte":
-            return f"\"{field}\" >= ?", [value]
+            return f"{col} >= ?", [value]
         if op == "lt":
-            return f"\"{field}\" < ?", [value]
+            return f"{col} < ?", [value]
         if op == "lte":
-            return f"\"{field}\" <= ?", [value]
+            return f"{col} <= ?", [value]
         # contains / starts_with / ends_with: LIKE with wildcard escaping per
         # `_like_escape` to protect against the SQLite `%` and `_` wildcards.
         # ESCAPE '\\' tells SQLite that `\` is the escape character.
@@ -308,20 +378,20 @@ def _build_scalar_clause(field: str, op: str, cond: dict, path: str) -> tuple[st
             case_sensitive = bool(cond.get("case_sensitive", False))
             escaped = _like_escape(str(value))
             if case_sensitive:
-                return f"\"{field}\" LIKE ? ESCAPE '\\'", [f"%{escaped}%"]
-            return f"LOWER(\"{field}\") LIKE LOWER(?) ESCAPE '\\'", [f"%{escaped}%"]
+                return f"{col} LIKE ? ESCAPE '\\'", [f"%{escaped}%"]
+            return f"LOWER({col}) LIKE LOWER(?) ESCAPE '\\'", [f"%{escaped}%"]
         if op == "starts_with":
             case_sensitive = bool(cond.get("case_sensitive", False))
             escaped = _like_escape(str(value))
             if case_sensitive:
-                return f"\"{field}\" LIKE ? ESCAPE '\\'", [f"{escaped}%"]
-            return f"LOWER(\"{field}\") LIKE LOWER(?) ESCAPE '\\'", [f"{escaped}%"]
+                return f"{col} LIKE ? ESCAPE '\\'", [f"{escaped}%"]
+            return f"LOWER({col}) LIKE LOWER(?) ESCAPE '\\'", [f"{escaped}%"]
         if op == "ends_with":
             case_sensitive = bool(cond.get("case_sensitive", False))
             escaped = _like_escape(str(value))
             if case_sensitive:
-                return f"\"{field}\" LIKE ? ESCAPE '\\'", [f"%{escaped}"]
-            return f"LOWER(\"{field}\") LIKE LOWER(?) ESCAPE '\\'", [f"%{escaped}"]
+                return f"{col} LIKE ? ESCAPE '\\'", [f"%{escaped}"]
+            return f"LOWER({col}) LIKE LOWER(?) ESCAPE '\\'", [f"%{escaped}"]
 
     if op in LIST_OPS:
         if not isinstance(value, list):
@@ -330,16 +400,16 @@ def _build_scalar_clause(field: str, op: str, cond: dict, path: str) -> tuple[st
             raise FilterError(f"{path}: op '{op}' requires a non-empty list")
         placeholders = ",".join("?" * len(value))
         if op == "in":
-            return f"\"{field}\" IN ({placeholders})", list(value)
+            return f"{col} IN ({placeholders})", list(value)
         # not_in: include NULLs for the same reason as `ne`
-        return f"(\"{field}\" NOT IN ({placeholders}) OR \"{field}\" IS NULL)", list(value)
+        return f"({col} NOT IN ({placeholders}) OR {col} IS NULL)", list(value)
 
     if op in RANGE_OPS:  # between
         if not isinstance(value, list) or len(value) != 2:
             raise FilterError(
                 f"{path}: op 'between' requires a 2-element list [low, high], got {value!r}"
             )
-        return f"\"{field}\" BETWEEN ? AND ?", list(value)
+        return f"{col} BETWEEN ? AND ?", list(value)
 
     raise FilterError(f"{path}: unreachable — op '{op}' not handled")
 
@@ -500,6 +570,11 @@ def validate_fields(fields: Any) -> list[str]:
     for f in fields:
         if not isinstance(f, str):
             raise FilterError(f"fields: entries must be strings, got {f!r}")
+        if is_metadata_key_field(f):
+            parse_metadata_key(f, "fields")
+            continue
+        if f == "metadata":
+            continue  # raw JSON string; projection only (not filterable as a plain column)
         if f not in valid:
             raise FilterError(f"fields: unknown field '{f}'. Valid fields: {sorted(valid)}")
     return list(fields)

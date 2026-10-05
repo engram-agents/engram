@@ -1183,6 +1183,11 @@ def _build_inspect_recall_view(
             _meta = json.loads(_raw_meta) if isinstance(_raw_meta, str) else _raw_meta
             if "quote_verified" in _meta:
                 node_recall["quote_verified"] = _meta["quote_verified"]
+            # support_lost: set when a cited premise was retracted/superseded
+            # away (#3402). Promoted only when truthy, so a cleared flag
+            # (false) leaves no key.
+            if isinstance(_meta, dict) and _meta.get("support_lost"):
+                node_recall["support_lost"] = True
             if node.get("type") == "derivation" and "warrant" in _meta and _meta["warrant"]:
                 node_recall["warrant"] = _meta["warrant"]
             if node.get("type") == "person":
@@ -3332,6 +3337,8 @@ def _list_impl(
         parse_filters,
         validate_fields,
         contains_field,
+        is_metadata_key_field,
+        metadata_select_expr,
     )
 
     structured_mode = bool(filters_json) or bool(fields_json)
@@ -3341,6 +3348,7 @@ def _list_impl(
     filter_sql_frag: str = ""
     filter_params: list = []
     projected_fields: list[str] = []
+    select_params: list = []  # bound params for projected metadata.<key> expressions
 
     if filters_json:
         try:
@@ -3475,7 +3483,18 @@ def _list_impl(
         # Always include 'id' so callers can correlate even if they didn't
         # ask for it; preserves order otherwise.
         cols_to_fetch = ["id"] + [f for f in projected_fields if f != "id"]
-        select_cols = ", ".join(f'"{c}"' for c in cols_to_fetch)
+        _sel_parts: list[str] = []
+        for c in cols_to_fetch:
+            if is_metadata_key_field(c):
+                # metadata.<key>: json_extract with a BOUND path; row key stays
+                # the requested name because dict(zip(cols_to_fetch, row)) is
+                # positional. Absent key / malformed JSON -> NULL (#3402).
+                _expr, _p = metadata_select_expr(c)
+                _sel_parts.append(_expr)
+                select_params.extend(_p)
+            else:
+                _sel_parts.append(f'"{c}"')
+        select_cols = ", ".join(_sel_parts)
     else:
         # Default compact triage shape. recall_summary is fetched alongside
         # claim so the triage entry can surface the curated summary when one
@@ -3493,9 +3512,9 @@ def _list_impl(
         query = f"SELECT {select_cols} FROM nodes WHERE {where} ORDER BY {order}"
         if effective_limit is not None:
             query += " LIMIT ?"
-            rows = conn.execute(query, params + [effective_limit]).fetchall()
+            rows = conn.execute(query, select_params + params + [effective_limit]).fetchall()
         else:
-            rows = conn.execute(query, params).fetchall()
+            rows = conn.execute(query, select_params + params).fetchall()
 
     entries = []
     if projected_fields:

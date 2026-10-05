@@ -7679,6 +7679,19 @@ def engram_list(payload_json: str = "{}") -> str:
         categorical_tag, intensity_hint, and other node-table columns.
         Unknown field → error with the full valid-fields list.
 
+    Metadata keys (#3402): `metadata.<key>` reads ONE top-level key of a
+        node's metadata JSON, in filters AND in fields_json (read-only).
+        <key> must match ^[A-Za-z_][A-Za-z0-9_]{0,63}$ (no nesting, no dots);
+        anything else → error naming that pattern. The key is passed to SQLite
+        as a bound parameter, never interpolated. All atomic ops work as for
+        columns. A JSON true extracts as 1 and false as 0, so
+        {"field": "metadata.support_lost", "op": "eq", "value": 1} finds nodes
+        flagged support_lost. A key that is absent — or a row whose metadata
+        is not valid JSON — extracts as NULL (is_null matches it; in fields_json
+        the row carries the key with value null). Plain `metadata` is NOT a
+        filter field; in fields_json it returns the raw metadata JSON string
+        (the same value engram_inspect view="deep" shows).
+
     Example payload (yesterday's wiki-PR batch-verification use case):
         filters_json = json.dumps({
             "logic": "AND",
