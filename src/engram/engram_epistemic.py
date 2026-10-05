@@ -78,6 +78,49 @@ def _looks_like_prose(pattern: str) -> bool:
     return pattern.count(" ") > 8
 
 
+_CMD_TOOL_WORDS = (
+    "git", "gh", "ia", "forum", "baton", "python", "python3", "pytest", "bash",
+    "sh", "npm", "uv", "pip", "curl", "make", "docker", "rm", "cd", "ls",
+    "grep", "sed", "tar", "ssh",
+)
+_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+_CMD_SPAN_RE = re.compile(
+    r"^(?:(?:" + "|".join(_CMD_TOOL_WORDS) + r")\s+\S"  # CLI word + an arg
+    r"|tools/\S"                                          # repo tool path
+    r"|engram_\w+)"                                       # named MCP tool call
+)
+_CMD_FLAG_RE = re.compile(r"(?:^|[\s`(])--[a-z][a-z0-9-]+")
+_CMD_SCRIPT_RE = re.compile(r"\b[\w-]+\.(?:py|sh)\b")
+
+
+def _is_command_shaped(claim: str) -> bool:
+    """Heuristic: is this lesson claim about running a specific command/tool?
+
+    Matches (any one is enough):
+      1. a backtick code span that starts with a known CLI word (git, gh, ia,
+         forum, baton, python, pytest, bash, ...) followed by whitespace and
+         at least one more token, a `tools/...` path, or an `engram_*` MCP
+         tool name. A lone CLI word in backticks (`ia`, `make`, `forum`) does
+         NOT match, deliberately: short words like these are often nouns;
+      2. a long flag (`--body-file`) anywhere, in or out of backticks;
+      3. a script filename (`foo.py`, `foo.sh`) anywhere.
+    Does NOT match prose that merely discusses a concept, a bare CLI word
+    outside backticks, or a code span that is not a command (a regex, an ID
+    format). Known limits: it is a shape guess, not a parse. It misses
+    commands written without backticks or flags, and a semantic claim that
+    happens to cite a script or flag as an example will be flagged. It is
+    deliberately conservative (prefers a miss to nagging a semantic lesson);
+    it only feeds an advisory, never a refusal. Non-string or empty input
+    returns False.
+    """
+    if not isinstance(claim, str) or not claim.strip():
+        return False
+    for m in _CODE_SPAN_RE.finditer(claim):
+        if _CMD_SPAN_RE.match(m.group(1).strip()):
+            return True
+    return bool(_CMD_FLAG_RE.search(claim) or _CMD_SCRIPT_RE.search(claim))
+
+
 def _validate_situation_pattern(pattern: str, bypass_prose_check: bool) -> tuple:
     """Shared #1864 gate for a non-empty situation_pattern value.
 
@@ -1342,6 +1385,20 @@ def _add_lesson_impl(
         }
         if generalizing_parents:
             result["generalized_by"] = generalizing_parents
+
+        # #3209 — advisory only: a command-shaped lesson minted with no
+        # situation_pattern has no action-moment arming. Never refuses.
+        if not situation_pattern and _is_command_shaped(claim):
+            result["unarmed_warning"] = (
+                "This lesson has no action-moment pattern "
+                "(situation_pattern), so it will surface through recall or "
+                "the incident-match tripwire, not at the action moment when "
+                "a matching command is about to run. Its "
+                "claim reads as command-shaped; add one with "
+                "engram_update_lesson if you want it to fire at the "
+                "action moment. That is fine to skip if the lesson is "
+                "meant to be recall-only."
+            )
 
         if similar_lessons:
             result["similar_existing_lessons"] = core._strip_similar_block(similar_lessons)

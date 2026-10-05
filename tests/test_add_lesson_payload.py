@@ -591,3 +591,129 @@ def test_tripwire_priority_update_rejects_invalid_value():
     u = json.loads(server.engram_update_lesson(payload_json=json.dumps(update_payload)))
     assert "error" in u, u
     assert "Invalid tripwire_priority" in u["error"], u
+
+
+# ---------------------------------------------------------------------------
+# #3209 — advisory `unarmed_warning` for command-shaped lessons minted
+# without a situation_pattern. Flag only; never refuses.
+# ---------------------------------------------------------------------------
+
+_CMD_CLAIM = "Always pass `--body-file` to `tool-x send` instead of piping stdin."
+_SEMANTIC_CLAIM = "Under uncertainty, lower the threshold before acting on a hunch."
+_CORE_KEYS = {
+    "status", "lesson_id", "claim", "reasoning_type", "reasoning_class",
+    "scaffolding_nudge", "prevention_type", "tripwire_priority",
+    "incident_nodes", "context_nodes", "importance_anchored",
+}
+
+
+def _mint(server, claim, **extra):
+    inc_id = _seed_incident(server)
+    payload = {
+        "claim": claim,
+        "incident_ids": inc_id,
+        "scaffolding_nudge": "Check the flag before sending.",
+        "logical_chain": "Single incident to a command-shaped tripwire.",
+    }
+    payload.update(extra)
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    assert r["status"] == "created", r
+    assert r["lesson_id"].startswith("ls_"), r
+    return r, inc_id
+
+
+def test_unarmed_warning_present_for_command_claim_without_pattern():
+    server = fresh_server()
+    r, inc_id = _mint(server, _CMD_CLAIM)
+    w = r["unarmed_warning"]
+    assert isinstance(w, str) and w
+    assert "situation_pattern" in w and "engram_update_lesson" in w
+    assert "recall" in w
+    assert "never fires" not in w
+    assert "incident-match tripwire" in w and "action moment" in w
+    assert _CORE_KEYS <= set(r), r
+    assert r["claim"] == _CMD_CLAIM and r["incident_nodes"] == [inc_id]
+
+
+def test_unarmed_warning_absent_when_pattern_given():
+    server = fresh_server()
+    r, _ = _mint(server, _CMD_CLAIM, situation_pattern=r"tool-x\s+send")
+    assert "unarmed_warning" not in r, r
+    assert _CORE_KEYS <= set(r), r
+
+
+def test_unarmed_warning_absent_for_semantic_claim_without_pattern():
+    server = fresh_server()
+    r, _ = _mint(server, _SEMANTIC_CLAIM)
+    assert "unarmed_warning" not in r, r
+    assert _CORE_KEYS <= set(r), r
+
+
+def test_unarmed_warning_empty_string_pattern_treated_as_absent():
+    server = fresh_server()
+    r, _ = _mint(server, _CMD_CLAIM, situation_pattern="")
+    assert "unarmed_warning" in r, r
+
+
+def test_unarmed_warning_is_the_only_added_key():
+    server = fresh_server()
+    flagged, _ = _mint(server, _CMD_CLAIM)
+    armed, _ = _mint(server, _CMD_CLAIM, situation_pattern=r"tool-x\s+send")
+    # The second mint of a near-identical claim also gets the unrelated
+    # similar-lesson hint keys; ignore those, they are not under test.
+    noise = {"similar_existing_lessons", "consolidation_hint"}
+    fk, ak = set(flagged) - noise, set(armed) - noise
+    assert fk - ak == {"unarmed_warning"}, (flagged, armed)
+    assert ak - fk == set()
+    for k in _CORE_KEYS - {"lesson_id", "incident_nodes"}:
+        assert flagged[k] == armed[k], k
+
+
+def _cmd():
+    import engram_epistemic
+    return engram_epistemic._is_command_shaped
+
+
+def test_is_command_shaped_positive_synthetic():
+    f = _cmd()
+    assert f("Run `git rebase --onto` before pushing.")
+    assert f("Use --dry-run first when calling the deploy helper.")
+    assert f("deploy_it.sh swallows errors; check its exit code.")
+    assert f("Call `engram_foo` with the full payload.")
+    assert f("Prefer `tools/check-x.sh <N>` before starting.")
+    assert f("Run `pytest -x` on the touched file.")
+
+
+def test_is_command_shaped_negative_synthetic():
+    f = _cmd()
+    assert not f("Under uncertainty, lower the threshold.")
+    assert not f("Calibration needs domain diversity in the test batch.")
+    assert not f("Use `[a-z]{2}` as the shape of the identifier.")
+    assert not f("Remember to run git carefully")  # bare CLI word, no backticks
+    # flag-regex boundary prefix: `--` must start a token
+    assert not f("the a--b notation")
+    assert not f("a rule --- then more text")
+    assert not f("separator ----- line")
+    # long enough after `--` that only the boundary prefix keeps these False
+    assert not f("the a--bc notation")
+    assert not f("rule ---flag after a dash run")
+    # CLI-word boundary: a longer word is not a CLI word
+    assert not f("the `gitlab` service")
+    assert not f("the `shell` module")
+    assert not f("the `gitlab runner` service")
+    # lone CLI word in backticks is a noun, not a command
+    for w in ("ia", "make", "forum", "baton", "ls", "sh", "tar", "grep"):
+        assert not f(f"the `{w}` thing"), w
+
+
+def test_is_command_shaped_edge_cases():
+    f = _cmd()
+    assert f("") is False
+    assert f("   \n") is False
+    assert f("``") is False
+    assert f("```") is False
+    assert f("` `") is False
+    assert f(None) is False
+    assert f("word " * 50000) is False
+    assert f(("word " * 50000) + "`git status`") is True

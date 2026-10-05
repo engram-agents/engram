@@ -5822,7 +5822,10 @@ def engram_add_lesson(payload_json: str) -> str:
     Returns:
         JSON with lesson ID, confidence, linked incidents, and similar
         existing lessons for consolidation hints. On payload-parsing failure,
-        returns {"error": "..."}.
+        returns {"error": "..."}. When the claim is command-shaped and no
+        situation_pattern was given, also returns `unarmed_warning` (advisory
+        only, #3209): no action-moment pattern, recall-only; add one via
+        engram_update_lesson, or ignore if recall-only is intended.
 
     See _add_lesson_impl for full semantics.
     """
