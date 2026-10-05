@@ -72,7 +72,18 @@ class ProjectAlreadyExists(Exception):
 
     The CLI/route layer maps this to its own already-exists error + exit code;
     the write-fn does not assume how the caller reports it.
+
+    ``existing_ids`` lists every existing project id that collided with the
+    requested ``project_id`` (#3432): the exact id, or one or more CASE
+    VARIANTS of it (``.casefold()`` equal). ``[project_id]`` means an exact
+    duplicate. It lets the route name the colliding spelling(s) so a seat can
+    tell which one is live.
     """
+
+    def __init__(self, project_id, existing_ids=None):
+        super().__init__(project_id)
+        self.project_id = project_id
+        self.existing_ids = list(existing_ids) if existing_ids else [project_id]
 
 
 class NotAParticipant(Exception):
@@ -1227,6 +1238,30 @@ def set_colleague(
     return seq, participant_added
 
 
+def _refuse_existing_id(store: CoordinationStore, project_id: str) -> None:
+    """Raise ``ProjectAlreadyExists`` if ``project_id`` exists, exact OR case variant (#3432).
+
+    The case comparison is an explicit ``.casefold()`` over the enumerated ids,
+    NOT a filesystem path probe: the default macOS filesystem is case-insensitive
+    and the Linux prod host is not, so relying on path behaviour would make the
+    refusal platform-dependent. Closed/merged batons still in the store block
+    too (as an exact duplicate of a closed id already did). Ids already moved
+    to ``archive/`` (e.g. merged) do not block, same as the exact check
+    today. No migration:
+    existing ids -- including any case-variant pairs already present -- are
+    never touched, and every other verb keeps exact-id lookup.
+    """
+    folded = project_id.casefold()
+    matches = sorted(
+        r.project_id for r in store.read_projects(active_only=False)
+        if r.project_id.casefold() == folded
+    )
+    if not matches and store.read_project(project_id) is not None:
+        matches = [project_id]
+    if matches:
+        raise ProjectAlreadyExists(project_id, matches)
+
+
 def init(
     store: CoordinationStore,
     allocator: SeqAllocator,
@@ -1331,9 +1366,8 @@ def init(
     Raises:
         ProjectAlreadyExists: if ``project_id`` already has a baton file.
     """
-    existing = store.read_project(project_id)
-    if existing is not None:
-        raise ProjectAlreadyExists(project_id)
+    # Fast-path refusal (no lock); re-checked under the allocator lock below.
+    _refuse_existing_id(store, project_id)
 
     now = ts or md.now_iso()
     turn_by = (by_agent or "").strip().lower()
@@ -1399,6 +1433,19 @@ def init(
 
     content = "\n".join(fm_lines) + "\n".join(body_lines)
 
-    with allocator.allocate() as seq:
+    # Check-and-create under the allocator lock (#3432). Before this, the exact
+    # duplicate check ran OUTSIDE any lock (check-then-write): two concurrent
+    # inits of the same id could both pass and the second would overwrite the
+    # first. Re-checking exact + case-variant here, in the same critical section
+    # as the write, serializes concurrent inits of ``x`` / ``X`` within this
+    # process (ASSUMES one forum process; the allocator lock is a
+    # threading.Lock). Residual race: it does NOT guard against a second
+    # PROCESS (or a hand edit) creating a variant file between the check and
+    # the write; the file store has no cross-process lock or O_EXCL create.
+    # ``locked()`` claims a seq only after the check passes, so a refusal burns
+    # no seq.
+    with allocator.locked() as claim:
+        _refuse_existing_id(store, project_id)
+        seq = claim()
         store.write_project(project_id, content, seq=seq)
     return seq

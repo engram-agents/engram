@@ -521,6 +521,30 @@ class TestCmdInit:
         assert exc_info.value.code == EXIT_VALIDATION
         client.post.assert_called_once()  # verify API was reached, not client-side guard
 
+    def test_409_case_variant_shows_server_text_naming_both_ids(self, monkeypatch, capsys):
+        """#3432: the CLI surfaces the server's text so a seat sees the existing id."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei")
+        monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda name: name == "lei")
+
+        client = _make_client()
+        client.post.side_effect = ForumHttpError(409, json.dumps({"error": (
+            "project already exists (case-insensitive match): "
+            "requested 'UMWELT-PR-954', existing 'umwelt-PR-954'")}))
+        args = _ns(
+            project_id="UMWELT-PR-954",
+            title="dup",
+            participants="borges",
+            status="planning",
+            turn="borges",
+            repo="engram-agents/engram-paper",
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        err = capsys.readouterr().err
+        assert "requested 'UMWELT-PR-954'" in err and "existing 'umwelt-PR-954'" in err
+
     def test_network_error_maps_to_exit_io(self, monkeypatch):
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei")
         monkeypatch.setattr(_baton, "_is_legacy_pool_sentinel", lambda name: name == "lei")

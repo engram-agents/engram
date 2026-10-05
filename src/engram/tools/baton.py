@@ -632,7 +632,11 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         sys.exit(EXIT_IO)
     except ForumHttpError as e:
         if e.status == 409:
-            print(f"baton init: project already exists: {project_id}", file=sys.stderr)
+            # #3432: surface the server's own text -- for a case-variant refusal it
+            # names the requested AND the existing id(s), which a seat needs to pick
+            # the live one. An exact duplicate's server text is the same wording
+            # as before ("project already exists: <id>").
+            print(f"baton init: {_server_refusal_text(e)}", file=sys.stderr)
         else:
             print(f"baton init: server error {e.status}: {e.body}", file=sys.stderr)
         sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)

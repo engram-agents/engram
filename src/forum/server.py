@@ -3283,8 +3283,15 @@ def create_app(
                 by_agent=agent, github=github, colleague=colleague,
                 author=author, phase=phase, transition_phase=transition_phase,
             )
-        except ProjectAlreadyExists:
-            return jsonify({"error": f"project already exists: {project_id}"}), 409
+        except ProjectAlreadyExists as exc:
+            if exc.existing_ids == [project_id]:
+                return jsonify({"error": f"project already exists: {project_id}"}), 409
+            # #3432: a case variant. Name the requested id AND every colliding
+            # existing id (one line) so a seat can pick the live one.
+            named = ", ".join(f"'{e}'" for e in exc.existing_ids)
+            return jsonify({"error": (
+                f"project already exists (case-insensitive match): "
+                f"requested '{project_id}', existing {named}")}), 409
         except OSError as exc:
             # A CLI-shaped id has no length cap, so a very long one fails at the
             # filesystem (ENAMETOOLONG): that is a bad id (422), not a server fault.
