@@ -548,7 +548,7 @@ You may call `engram_advance_turn` ONLY when ALL of these are true:
 - [ ] "For the awake seat" written as a numbered block (empty block = the literal line "none")
 - [ ] Dream record file written and committed in .engram git
 - [ ] Sleep-success marker written via `~/.engram/tools/write_sleep_marker.py`
-- [ ] ask-{{USER_NAME}}.md updated with this cycle's flagged-for-user items (or skipped if surface not deployed) — post-advance, non-blocking
+- [ ] ask-<primary_user>.md updated with this cycle's flagged-for-user items (or skipped if surface not deployed) — post-advance, non-blocking
 - [ ] Health score check completed (via `engram_diagnose`; also copy its `telemetry` field's line into the dream record)
 
 If any box is unchecked, you are not done. Continue working.
@@ -704,16 +704,18 @@ The marker (`~/.engram/sessions/last-sleep-success.json`) is the canonical signa
 
 If the helper script invocation fails, log the error in the dream record but DO NOT retry `engram_advance_turn`. The turn already advanced; missing marker just means the next interactive session sees a stale-marker banner unnecessarily. Acceptable failure mode.
 
-# Output contract — ask-{{USER_NAME}} surface update
+# Output contract — ask-<primary_user> surface update
 
 After the sleep-success marker is written (post-`engram_advance_turn`), surface the dream's "Flagged for the user" items into the user's morning queue so they're visible at next session start.
 
+`<primary_user>` is the value of the `primary_user` key in `~/.engram/config.json` (for example `Alice` gives `~/.engram/ask-Alice.md`). Read it at run time at the start of this step. If the key is missing or empty, or `~/.engram/ask-<primary_user>.md` does not exist (for example a case mismatch between the key and the file name), fall back to the `~/.engram/ask-*.md` files that are not `-details`/`-backlog` files, and use the name after `ask-` from that file as `<primary_user>` only if exactly one remains; if zero or more than one remain, or neither works, skip this step as below.
+
 The user's morning queue lives in two files (the three-file pattern):
 
-- `~/.engram/ask-{{USER_NAME}}.md` — auto-loaded daily digest. ONLY the top 3 questions needing the user's action, decision, or input; one short line + detail-slug link each.
-- `~/.engram/ask-{{USER_NAME}}-details.md` — full descriptions, NOT auto-loaded. Section headings referenced by digest links.
+- `~/.engram/ask-<primary_user>.md` — auto-loaded daily digest. ONLY the top 3 questions needing the user's action, decision, or input; one short line + detail-slug link each.
+- `~/.engram/ask-<primary_user>-details.md` — full descriptions, NOT auto-loaded. Section headings referenced by digest links.
 
-- `~/.engram/ask-{{USER_NAME}}-backlog.md` — unresolved questions not selected for today's top 3. Dream overflow IS your concern: append there without deleting its detail section.
+- `~/.engram/ask-<primary_user>-backlog.md` — unresolved questions not selected for today's top 3. Dream overflow IS your concern: append there without deleting its detail section.
 
 ## Procedure
 
@@ -731,25 +733,25 @@ The user's morning queue lives in two files (the three-file pattern):
 
 5. **PREPEND selected questions to the digest; append overflow to backlog.** Every line uses the same durable form:
 ```
-- [node_id] (question/action needed) — one-line context. [ask-{{USER_NAME}}-details.md#slug-NNN]
+- [node_id] (question/action needed) — one-line context. [ask-<primary_user>-details.md#slug-NNN]
 ```
-Use stable slugs `dream-YYYY-MM-DD-<short-topic>`. Any unresolved fourth-or-lower question goes to `ask-{{USER_NAME}}-backlog.md` with the same detail-slug link. Never discard it and never exceed three digest questions.
+Use stable slugs `dream-YYYY-MM-DD-<short-topic>`. Any unresolved fourth-or-lower question goes to `ask-<primary_user>-backlog.md` with the same detail-slug link. Never discard it and never exceed three digest questions.
 
-6. **APPEND corresponding sections** to `~/.engram/ask-{{USER_NAME}}-details.md`:
+6. **APPEND corresponding sections** to `~/.engram/ask-<primary_user>-details.md`:
 ```
 ## dream-YYYY-MM-DD-<short-topic>
 
 [Full context the dream record captured — typically a paragraph or two; cite the supporting nodes; explain what decision the user needs to make.]
 ```
 
-7. **Update the "Last updated" timestamp** at the top of ask-{{USER_NAME}}.md (look for a line like `**Last updated:** ...`) to the dream's completion time + `End-of-dream.`
+7. **Update the "Last updated" timestamp** at the top of ask-<primary_user>.md (look for a line like `**Last updated:** ...`) to the dream's completion time + `End-of-dream.`
 
-8. **Judgment-pruning of other ask-{{USER_NAME}}.md sections is NOT yours — but the mechanical sweep IS.** Two distinct authorities, do not blur them:
+8. **Judgment-pruning of other ask-<primary_user>.md sections is NOT yours — but the mechanical sweep IS.** Two distinct authorities, do not blur them:
 
    **(a) Deterministic external-state sweep — REQUIRED every cycle.** Stale "Ready"/"merge-queue" entries survive the awake-parent's reconcile when the day moved faster than the prose (the 2026-06-05 incident: three PRs merged hours before the evening reconcile still read "Ready, all CI-green" the next morning; engram-alpha #830). You are the last writer of the night, so you are the last chance to catch it. Extract every PR/issue number the file mentions and check each against GitHub ground truth:
 
    ```bash
-   grep -oE '#[0-9]+' ~/.engram/ask-{{USER_NAME}}.md | tr -d '#' | sort -un | while read -r n; do
+   grep -oE '#[0-9]+' ~/.engram/ask-<primary_user>.md | tr -d '#' | sort -un | while read -r n; do
      state=$(gh pr view "$n" --json state -q .state 2>/dev/null) \
        || state=$(gh issue view "$n" --json state -q .state 2>/dev/null) \
        || state=UNKNOWN
@@ -765,14 +767,14 @@ Use stable slugs `dream-YYYY-MM-DD-<short-topic>`. Any unresolved fourth-or-lowe
 
 9. **Carryover discipline** — unresolved backlog questions remain untouched by judgment-pruning. The user/awake parent promotes them into a future day's top 3. The step-8a mechanical sweep may prune a resolved externally-checkable backlog item, but never drop unresolved carryover merely to control length.
 
-10. **Commit** the ask-{{USER_NAME}}.md + ask-{{USER_NAME}}-details.md changes in the .engram git repo, separately from the dream record commit:
+10. **Commit** the ask-<primary_user>.md + ask-<primary_user>-details.md changes in the .engram git repo, separately from the dream record commit:
 
 ```bash
-git -C ~/.engram add ask-{{USER_NAME}}.md ask-{{USER_NAME}}-details.md ask-{{USER_NAME}}-backlog.md
+git -C ~/.engram add ask-<primary_user>.md ask-<primary_user>-details.md ask-<primary_user>-backlog.md
 # If items were added this cycle:
-git -C ~/.engram commit -m "ask-{{USER_NAME}}: dream YYYY-MM-DD flagged-for-user items"
+git -C ~/.engram commit -m "ask-<primary_user>: dream YYYY-MM-DD flagged-for-user items"
 # If no items this cycle (only timestamp update):
-git -C ~/.engram commit -m "ask-{{USER_NAME}}: dream YYYY-MM-DD no new items"
+git -C ~/.engram commit -m "ask-<primary_user>: dream YYYY-MM-DD no new items"
 ```
 
 If the step-8a sweep pruned anything, list every pruned entry in the commit message body (`#N <one-line summary> — MERGED/CLOSED per gh`) — the audit trail makes a wrong prune one `git revert` away.
@@ -780,9 +782,9 @@ If the step-8a sweep pruned anything, list every pruned entry in the commit mess
 ## Edge cases
 
 - **No flagged-for-user items this cycle** — skip steps 4-6. Still update the timestamp (step 7) so the user sees you ran. Optional: write a sub-section `### From dream YYYY-MM-DD` with a single line `- No items flagged for user input this cycle.`
-- **ask-{{USER_NAME}}.md or ask-{{USER_NAME}}-details.md does not exist** — installs without these files (e.g. fresh users) — skip this step entirely. Note in dream record under "Flagged for the user" that the surface was bypassed. (The skill is forward-compat by design.)
+- **ask-<primary_user>.md or ask-<primary_user>-details.md does not exist** — installs without these files (e.g. fresh users) — skip this step entirely. Note in dream record under "Flagged for the user" that the surface was bypassed. (The skill is forward-compat by design.)
 - **`gh` unavailable or the install isn't GitHub-backed** — skip the step-8a sweep (it is GitHub-ground-truth-only by construction); the append-side steps proceed unchanged. Note the skipped sweep in the dream record.
-- **Failure to write** — log in dream record, do NOT retry. The turn already advanced before this step; ask-{{USER_NAME}} failures don't undo that. Next cycle's dream-master will see the dream-flagged items again from the prior dream record and can re-surface. Acceptable failure mode.
+- **Failure to write** — log in dream record, do NOT retry. The turn already advanced before this step; ask-<primary_user> failures don't undo that. Next cycle's dream-master will see the dream-flagged items again from the prior dream record and can re-surface. Acceptable failure mode.
 
 # Return to the parent
 
@@ -792,7 +794,7 @@ After everything in the checklist is done and the dream record is committed, ret
 - Top-line: nodes resolved / superseded / promoted / refuted (counts)
 - Recall summaries: applied / fixed / unfixable counts
 - Health score delta
-- Flagged-for-user count + ask-{{USER_NAME}}.md status (updated / skipped — surface not deployed / failed — see dream record)
+- Flagged-for-user count + ask-<primary_user>.md status (updated / skipped — surface not deployed / failed — see dream record)
 - awake-seat items: N (count of numbered items in `## For the awake seat`; 0 when the block is `none`)
 
 The parent relays this to the user. Your invocation ends.
