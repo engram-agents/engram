@@ -1040,6 +1040,117 @@ def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
 # A-family impls
 # ---------------------------------------------------------------------------
 
+def _evidence_fields_error(url: str, title: str) -> Optional[str]:
+    """Required-field check of an evidence write (item-independent, no writes).
+    Returns the bare error text, or None."""
+    if not url or not url.strip():
+        return "url is required and cannot be empty."
+    if not title or not title.strip():
+        return "title is required and cannot be empty."
+    return None
+
+
+def _evidence_row_id_for_url(url: str) -> Optional[str]:
+    """Id of the evidence row already registered for this raw url, else None.
+    The same lookup _add_evidence_impl's reuse short-circuit makes."""
+    conn = core._get_db()
+    try:
+        row = conn.execute(
+            "SELECT id FROM nodes WHERE source_url = ? AND type = 'evidence'"
+            " ORDER BY created_at DESC LIMIT 1", (url,)).fetchone()
+        return row["id"] if row else None
+    finally:
+        conn.close()
+
+
+def _evidence_url_error(url: str, source_repo: str = "", repo_path: str = "") -> Optional[str]:
+    """Every rejection an evidence write makes about the url alone (#3399): the
+    file:// committed-before-cite capture check, and for web urls the hostname /
+    TLD / localhost / DNS checks, and the unrecognized-scheme check.
+
+    ITEM-INDEPENDENT and write-free: no DB, no observation input. Returns the
+    bare error text (no "Failed to create evidence node:" prefix), or None when
+    the url may be cited. Called by _add_evidence_impl itself, after its
+    existing-row reuse short-circuit, and by the batch's up-front check, so a
+    url the evidence write would refuse is refused once at batch level instead
+    of once per item (and one DNS lookup instead of one per item).
+    """
+    RECOGNIZED_SCHEMES = ("http://", "https://", "file://")
+    _HONESTY_REMINDER = (
+        "\n\nRemember: cheating blinds you. A fabricated URL corrupts your own memory "
+        "and every future step built on it. If the real source is hard to find, "
+        "raise the problem transparently — never solve it with a shortcut. (the provenance axiom)"
+    )
+    if url.startswith("file://"):
+        # File:// URLs: enforce the committed-before-cite guard. Do NOT
+        # store the version state on the evidence — that lives on each
+        # citing observation now.
+        ver = _capture_file_version(url, source_repo=source_repo, repo_path=repo_path)
+        if not ver["ok"]:
+            return ver["error"]
+    elif url.startswith("http://") or url.startswith("https://"):
+        # --- Validation for web URLs ---
+        parsed_url = urlparse(url)
+        hostname = parsed_url.hostname or ""
+
+        # Check 1: Structural — must have a valid hostname
+        if not hostname:
+            return (
+                f"Malformed URL '{url}' — no hostname found. "
+                "Evidence URLs must point to real, resolvable web addresses."
+                + _HONESTY_REMINDER
+            )
+
+        # Check 2: TLD — hostname must contain a dot (rejects fabricated
+        # single-label hosts like 'session-transcript', 'conversation')
+        if "." not in hostname:
+            if hostname == "localhost":
+                return (
+                    f"Cannot cite a localhost URL directly — local/LAN addresses are not "
+                    "stable evidence sources. To cite a forum post or local file, archive it first: "
+                    "`engram-snapshot forum:<thread_id>` (forum thread) or "
+                    "`engram-snapshot file:<path>` (local file), then cite the resulting "
+                    "file:// evidence record returned by the snapshot tool."
+                    + _HONESTY_REMINDER
+                )
+            return (
+                f"Invalid hostname '{hostname}' in URL — no TLD found. "
+                "This looks like a fabricated domain. Real web URLs have a domain "
+                "with a TLD (e.g., 'arxiv.org', 'reuters.com')."
+                + _HONESTY_REMINDER
+            )
+
+        # Check 3: DNS resolution — verify the domain actually exists.
+        # If the agent is citing an online source, network should be available.
+        # A DNS failure almost certainly means a fabricated or hallucinated domain.
+        try:
+            socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        except socket.gaierror as e:
+            # Only block on definitive name-not-found errnos.
+            # EAI_NONAME / EAI_NODATA = the domain truly doesn't exist.
+            # EAI_AGAIN / EAI_FAIL = transient DNS infra; treat like timeout (pass).
+            if e.errno in NXDOMAIN_ERRNOS:
+                return (
+                    f"DNS resolution failed for '{hostname}' — this domain does not exist. "
+                    "The URL may be fabricated or hallucinated. Verify you have the correct URL "
+                    "from a real source before citing it as evidence."
+                    + _HONESTY_REMINDER
+                )
+            # Transient — fall through to silent pass (same as the OSError branch).
+        except (socket.timeout, OSError):
+            # Network issues — warn but don't block, since the domain might be real
+            pass
+
+    elif not any(url.startswith(s) for s in RECOGNIZED_SCHEMES):
+        return (
+            f"Unrecognized URL scheme in '{url}'. Evidence URLs must be resolvable — "
+            "use file:// for local files or https:// for web sources. "
+            "Do not invent synthetic schemes (e.g., conversation://, measurement://)."
+            + _HONESTY_REMINDER
+        )
+    return None
+
+
 def _add_evidence_impl(
     url: str = "",
     title: str = "",
@@ -1076,10 +1187,9 @@ def _add_evidence_impl(
     Returns:
         JSON with the evidence node ID and trust pool status.
     """
-    if not url or not url.strip():
-        return json.dumps({"error": "url is required and cannot be empty."})
-    if not title or not title.strip():
-        return json.dumps({"error": "title is required and cannot be empty."})
+    _fields_err = _evidence_fields_error(url, title)
+    if _fields_err:
+        return json.dumps({"error": _fields_err})
     conn = core._get_db()
     try:
         # Compute domain + yellow-card match early so every success return path
@@ -1106,80 +1216,11 @@ def _add_evidence_impl(
                 reuse["yellow_card_warning"] = _format_yellow_warning(_yellow_match)
             return json.dumps(reuse)
 
-        # Validate evidence URL resolvability
-        RECOGNIZED_SCHEMES = ("http://", "https://", "file://")
-        _HONESTY_REMINDER = (
-            "\n\nRemember: cheating blinds you. A fabricated URL corrupts your own memory "
-            "and every future step built on it. If the real source is hard to find, "
-            "raise the problem transparently — never solve it with a shortcut. (the provenance axiom)"
-        )
-        if url.startswith("file://"):
-            # File:// URLs: enforce the committed-before-cite guard. Do NOT
-            # store the version state on the evidence — that lives on each
-            # citing observation now.
-            ver = _capture_file_version(url, source_repo=source_repo, repo_path=repo_path)
-            if not ver["ok"]:
-                return json.dumps({"error": ver["error"]})
-        elif url.startswith("http://") or url.startswith("https://"):
-            # --- Validation for web URLs ---
-            parsed_url = urlparse(url)
-            hostname = parsed_url.hostname or ""
-
-            # Check 1: Structural — must have a valid hostname
-            if not hostname:
-                return json.dumps({
-                    "error": f"Malformed URL '{url}' — no hostname found. "
-                    "Evidence URLs must point to real, resolvable web addresses."
-                    + _HONESTY_REMINDER
-                })
-
-            # Check 2: TLD — hostname must contain a dot (rejects fabricated
-            # single-label hosts like 'session-transcript', 'conversation')
-            if "." not in hostname:
-                if hostname == "localhost":
-                    return json.dumps({
-                        "error": f"Cannot cite a localhost URL directly — local/LAN addresses are not "
-                        "stable evidence sources. To cite a forum post or local file, archive it first: "
-                        "`engram-snapshot forum:<thread_id>` (forum thread) or "
-                        "`engram-snapshot file:<path>` (local file), then cite the resulting "
-                        "file:// evidence record returned by the snapshot tool."
-                        + _HONESTY_REMINDER
-                    })
-                return json.dumps({
-                    "error": f"Invalid hostname '{hostname}' in URL — no TLD found. "
-                    "This looks like a fabricated domain. Real web URLs have a domain "
-                    "with a TLD (e.g., 'arxiv.org', 'reuters.com')."
-                    + _HONESTY_REMINDER
-                })
-
-            # Check 3: DNS resolution — verify the domain actually exists.
-            # If the agent is citing an online source, network should be available.
-            # A DNS failure almost certainly means a fabricated or hallucinated domain.
-            try:
-                socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-            except socket.gaierror as e:
-                # Only block on definitive name-not-found errnos.
-                # EAI_NONAME / EAI_NODATA = the domain truly doesn't exist.
-                # EAI_AGAIN / EAI_FAIL = transient DNS infra; treat like timeout (pass).
-                if e.errno in NXDOMAIN_ERRNOS:
-                    return json.dumps({
-                        "error": f"DNS resolution failed for '{hostname}' — this domain does not exist. "
-                        "The URL may be fabricated or hallucinated. Verify you have the correct URL "
-                        "from a real source before citing it as evidence."
-                        + _HONESTY_REMINDER
-                    })
-                # Transient — fall through to silent pass (same as the OSError branch).
-            except (socket.timeout, OSError):
-                # Network issues — warn but don't block, since the domain might be real
-                pass
-
-        elif not any(url.startswith(s) for s in RECOGNIZED_SCHEMES):
-            return json.dumps({
-                "error": f"Unrecognized URL scheme in '{url}'. Evidence URLs must be resolvable — "
-                "use file:// for local files or https:// for web sources. "
-                "Do not invent synthetic schemes (e.g., conversation://, measurement://)."
-                + _HONESTY_REMINDER
-            })
+        # Item-independent url validation (no writes): one helper, shared with
+        # the batch's up-front check.
+        _url_err = _evidence_url_error(url, source_repo=source_repo, repo_path=repo_path)
+        if _url_err:
+            return json.dumps({"error": _url_err})
 
         # Check trust pool (domain already computed above for yellow-card)
         config = json.loads(core.CONFIG_PATH.read_text()) if core.CONFIG_PATH.exists() else {}
@@ -1416,6 +1457,53 @@ def _build_anchoring_advisory(
         return {"status": "unavailable", "reason": str(exc)[:200]}
 
 
+def _evidence_capture_error(url: str, source_repo: str = "", repo_path: str = "") -> Optional[str]:
+    """The item-independent first check an evidence write makes (#3399), with
+    the "Failed to create evidence node:" prefix the single and batch paths
+    both report. Returns the prefixed error text, or None when the url may be
+    cited."""
+    err = _evidence_url_error(url, source_repo=source_repo, repo_path=repo_path)
+    return f"Failed to create evidence node: {err}" if err else None
+
+
+def _preflight_item_checks(url: str, quoted_text: str, *, content_hash: str = "",
+                           git_sha: str = "", source_repo: str = "",
+                           repo_path: str = ""):
+    """The per-observation rejections that depend only on the cited file (#3399).
+
+    Returns (error_json_or_None, ver_or_None); ver is the version capture to
+    reuse after the evidence write. Quote check first, then the caller
+    content_hash / git_sha version check -- the order the evidence_id path uses.
+    """
+    quote_error = _verify_quote_in_source(url, quoted_text)
+    if quote_error:
+        return json.dumps({"error": quote_error}), None
+    ver = _capture_file_version(
+        url, content_hash=content_hash, git_sha=git_sha,
+        source_repo=source_repo, repo_path=repo_path)
+    if not ver["ok"]:
+        return json.dumps({"error": ver["error"]}), None
+    return None, ver
+
+
+def _preflight_file_evidence(url: str, quoted_text: str, *, content_hash: str = "",
+                             git_sha: str = "", source_repo: str = "",
+                             repo_path: str = ""):
+    """Every rejection decided before a file:// evidence write (#3399): the
+    evidence-capture check, then the per-observation checks. The single source
+    of truth for the url path of the single-observation impl, which the batch
+    also goes through (it passes url+title per item).
+
+    Returns (error_json_or_None, ver_or_None).
+    """
+    cap_error = _evidence_capture_error(url, source_repo=source_repo, repo_path=repo_path)
+    if cap_error:
+        return json.dumps({"error": cap_error}), None
+    return _preflight_item_checks(
+        url, quoted_text, content_hash=content_hash, git_sha=git_sha,
+        source_repo=source_repo, repo_path=repo_path)
+
+
 def _add_observation_impl(
     quoted_text: str = "",
     interpretation: str = "",
@@ -1445,6 +1533,7 @@ def _add_observation_impl(
     recall_keywords: Optional[list] = None,
     evidence_type: str = "",
     original_url: str = "",
+    _evidence_created_out: Optional[dict] = None,
 ) -> str:
     """Internal implementation — see engram_add_observation MCP tool for the
     public payload schema. Kept callable with named kwargs for in-server
@@ -1460,6 +1549,10 @@ def _add_observation_impl(
     default is restored just below when session_id is not the source.
     Callers that always pass source_class explicitly (the batch impl) are
     unaffected either way.
+
+    ``_evidence_created_out`` is a private out-parameter for the batch impl: when
+    a dict is passed, ``["created"]`` is set True iff THIS call wrote a new
+    evidence row (False when it reused one). It is never part of the response.
     """
     # Per the bool-string-truthy lesson: bool-string truthy trap at wrapper boundary. JSON-string
     # "false" is truthy in Python, so an `is_predictive: "false"` payload
@@ -1681,6 +1774,28 @@ def _add_observation_impl(
             {"error": "'title' is required when providing 'url' for auto-creating an evidence node."}
         )
 
+    # Every rejection that depends only on the cited file is decided HERE,
+    # before the evidence write (#3399). _add_evidence_impl commits its row on
+    # its own connection (and reads it back on a second one), so the evidence
+    # write cannot share a transaction with the observation insert below: a
+    # rejection decided after it would leave an orphan evidence row. The same
+    # checks used to run after it; their results are reused further down.
+    #
+    # Invariant this relies on: on this path ev["source_url"] == url byte for
+    # byte. _add_evidence_impl's reuse lookup is `source_url = ?` on the raw
+    # url, with no normalisation, and it INSERTs that same raw url when it
+    # creates the row. So verifying the quote against `url` here, before the
+    # write, is identical to verifying it against the row's source_url after.
+    _pre_quote_checked = False
+    _pre_ver = None
+    if not evidence_id and url and url.startswith("file://"):
+        _pre_err, _pre_ver = _preflight_file_evidence(
+            url, quoted_text, content_hash=content_hash, git_sha=git_sha,
+            source_repo=source_repo, repo_path=repo_path)
+        if _pre_err:
+            return _pre_err
+        _pre_quote_checked = True
+
     _yellow_forward = None
     if not evidence_id and url:
         # Auto-create or reuse evidence node
@@ -1692,6 +1807,8 @@ def _add_observation_impl(
             return json.dumps({"error": f"Failed to create evidence node: {ev_result['error']}"})
         evidence_id = ev_result["evidence_id"]
         _yellow_forward = ev_result.get("yellow_card_warning")
+        if _evidence_created_out is not None:
+            _evidence_created_out["created"] = ev_result.get("status") == "created"
 
     conn = core._get_db()
     try:
@@ -1743,14 +1860,20 @@ def _add_observation_impl(
 
         # Verify quoted_text exists in the evidence source (file:// only)
         ev_url = ev["source_url"] or ""
-        quote_error = _verify_quote_in_source(ev_url, quoted_text)
-        if quote_error:
-            return json.dumps({"error": quote_error})
+        # (The url path already ran both this and the version capture below
+        # before the evidence write — #3399 — and reuses their results.)
+        if not _pre_quote_checked:
+            quote_error = _verify_quote_in_source(ev_url, quoted_text)
+            if quote_error:
+                return json.dumps({"error": quote_error})
 
         # Capture per-observation file version (the evidence-block refactor derivation). For file:// URLs
         # in a git repo: enforce committed-before-cite + record the specific
         # revision read on this observation. For other URLs: no-op.
-        ver = _capture_file_version(ev_url, content_hash=content_hash, git_sha=git_sha, source_repo=source_repo, repo_path=repo_path)
+        if _pre_quote_checked:
+            ver = _pre_ver
+        else:
+            ver = _capture_file_version(ev_url, content_hash=content_hash, git_sha=git_sha, source_repo=source_repo, repo_path=repo_path)
         if not ver["ok"]:
             return json.dumps({"error": ver["error"]})
         captured_content_hash = ver["content_hash"]
@@ -2331,22 +2454,41 @@ def _add_observation_batch_impl(
     if not isinstance(observations, list):
         return json.dumps({"error": "observations_json must be a JSON array."})
 
-    # Resolve evidence node once for the whole batch
+    # The shared evidence row is NOT written here (#3399). A url batch hands
+    # url+title to the single-observation path per item; that path decides every
+    # rejection before ITS evidence write and reuses the row by source_url, so
+    # the only writer of the row is an item that passed. No per-item rejection,
+    # present or future, can orphan it. A caller-supplied evidence_id is cited
+    # as-is and never written or deleted here.
     resolved_evidence_id = evidence_id
     evidence_created = False
     _batch_yellow = None
+    _use_url = False
     if not resolved_evidence_id and url:
         if not title:
             return json.dumps({"error": "'title' is required when providing 'url'."})
-        ev_result = json.loads(_add_evidence_impl(
-            url=url, title=title, domain=domain, source_date=source_date,
-            source_repo=source_repo, repo_path=repo_path,
-        ))
-        if ev_result.get("error"):
-            return json.dumps({"error": f"Failed to create evidence node: {ev_result['error']}"})
-        resolved_evidence_id = ev_result["evidence_id"]
-        evidence_created = ev_result["status"] == "created"
-        _batch_yellow = ev_result.get("yellow_card_warning")
+        # BATCH-LEVEL (item-independent, no write, decided once, one top-level
+        # error with dev's text): a blank title, and everything
+        # _evidence_url_error checks -- file:// capture, unrecognized scheme,
+        # localhost / no-TLD host, NXDOMAIN. They depend on url/title alone, so
+        # N items would only repeat them (and repeat the DNS lookup).
+        # PER-ITEM (decided by the single path for each item, before ITS
+        # evidence write): required fields, quote vs the file, version
+        # (content_hash / git_sha), recall_summary, standpoint_*, fs_class, ...
+        _fields_err = _evidence_fields_error(url, title)
+        if _fields_err:
+            return json.dumps({"error": f"Failed to create evidence node: {_fields_err}"})
+        # The evidence write reuses an existing row for the url BEFORE it
+        # validates the url, so a non-file url whose row exists is not
+        # re-validated here either (same as dev). file:// is always checked: the
+        # single path's preflight does the same, row or no row.
+        _row_exists = (not url.startswith("file://")) and _evidence_row_id_for_url(url)
+        if not _row_exists:
+            _cap_error = _evidence_capture_error(url, source_repo=source_repo, repo_path=repo_path)
+            if _cap_error:
+                return json.dumps({"error": _cap_error})
+        _use_url = True
+        resolved_evidence_id = None
     elif not resolved_evidence_id:
         return json.dumps({"error": "Provide either 'url' (+ 'title') or 'evidence_id'."})
 
@@ -2362,8 +2504,12 @@ def _add_observation_batch_impl(
             results.append({"index": i, "error": f"Missing required fields: {', '.join(missing)}"})
             continue
 
+        _ev_out = {}
         r = json.loads(_add_observation_impl(
-            evidence_id=resolved_evidence_id,
+            evidence_id=resolved_evidence_id or "",
+            **({"url": url, "title": title, "domain": domain,
+                "source_date": source_date, "_evidence_created_out": _ev_out}
+               if _use_url else {}),
             quoted_text=obs["quoted_text"],
             interpretation=obs["interpretation"],
             claim=obs["claim"],
@@ -2386,6 +2532,21 @@ def _add_observation_batch_impl(
             recall_keywords=obs.get("recall_keywords"),
         ))
         r["index"] = i
+        if _use_url and r.get("status") == "created":
+            # Every created item cites the same url-keyed row: the first one
+            # wrote it (or reused a pre-existing one), the rest reuse it.
+            if resolved_evidence_id and r.get("evidence_id") != resolved_evidence_id:
+                raise RuntimeError(
+                    f"batch items disagree on the shared evidence row: "
+                    f"{resolved_evidence_id!r} vs {r.get('evidence_id')!r} (#3399)")
+            resolved_evidence_id = r.get("evidence_id")
+            if _ev_out.get("created"):
+                evidence_created = True
+        # The batch reports the evidence warning once, at batch level; the
+        # per-item shape stays what the evidence_id path always returned.
+        _item_yellow = r.pop("yellow_card_warning", None) if _use_url else None
+        if _item_yellow and not _batch_yellow:
+            _batch_yellow = _item_yellow
         results.append(r)
 
     created = [r for r in results if r.get("status") == "created"]

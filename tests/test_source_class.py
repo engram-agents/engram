@@ -1905,3 +1905,634 @@ def test_G_cross_repo_repo_path_submodule_entry_rejected_3393():
         assert "a commit" in r["error"], r["error"]
     finally:
         shutil.rmtree(base, ignore_errors=True)
+
+
+# --- #3399: a rejected observation leaves no evidence row behind ---------------
+#
+# On the url path the evidence node is created (and committed on its own
+# connection) before the observation's own checks run. Every rejection that can
+# follow must therefore be decided BEFORE the evidence write.
+
+def _orphan_repo():
+    """Repo with one commit holding `f.md`, then a second commit adding `g.md`
+    and a symlink `lnk` -> `f.md`. Returns (base, repo, first_sha)."""
+    import subprocess
+    base = os.path.realpath(tempfile.mkdtemp(prefix="engram_test_3399_"))
+    repo = os.path.join(base, "repo")
+    _init_git_repo(repo)
+    with open(os.path.join(repo, "f.md"), "w") as fh:
+        fh.write("The real sentence lives here.\n")
+    _git_run(repo, "add", "f.md")
+    _git_run(repo, "commit", "-m", "f")
+    first = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,
+                           text=True, check=True).stdout.strip()
+    with open(os.path.join(repo, "g.md"), "w") as fh:
+        fh.write("A later file.\n")
+    os.symlink("f.md", os.path.join(repo, "lnk"))
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-m", "g and lnk")
+    return base, repo, first
+
+
+def _cite_orphan(client, path, text, **extra):
+    payload = {
+        "url": f"file://{path}",
+        "title": "Orphan-row evidence",
+        "quoted_text": text,
+        "interpretation": "Testing that a rejection leaves no evidence row.",
+        "claim": f"Orphan check {os.path.basename(path)} {text[:12]}",
+        "quote_type": "hard_data",
+    }
+    payload.update(extra)
+    return client.call("engram_add_observation", payload)
+
+
+def _assert_rejected_nothing_written(r, ev_before, nodes_before):
+    assert "error" in r and "observation_id" not in r, f"not rejected: {r}"
+    assert _count_evidence() == ev_before, "a rejected observation left an evidence row"
+    assert _count_nodes() == nodes_before, "a rejected observation left a node row"
+
+
+def test_1_quote_not_in_committed_file_leaves_no_evidence_row_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        ev, n = _count_evidence(), _count_nodes()
+        r = _cite_orphan(client, os.path.join(repo, "f.md"), "A sentence that is not in the file.")
+        assert "Quoted text not found" in r.get("error", ""), r
+        _assert_rejected_nothing_written(r, ev, n)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_2a_git_sha_predating_the_file_leaves_no_evidence_row_3399():
+    base, repo, first = _orphan_repo()
+    try:
+        client = fresh_client()
+        ev, n = _count_evidence(), _count_nodes()
+        # g.md is committed at HEAD but did not exist at `first`.
+        r = _cite_orphan(client, os.path.join(repo, "g.md"), "A later file.", git_sha=first)
+        assert "does not exist at git revision" in r.get("error", ""), r
+        _assert_rejected_nothing_written(r, ev, n)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_2b_git_sha_missing_an_in_tree_symlink_leaves_no_evidence_row_3399():
+    base, repo, first = _orphan_repo()
+    try:
+        client = fresh_client()
+        ev, n = _count_evidence(), _count_nodes()
+        # lnk -> f.md: f.md exists at `first`, the symlink `lnk` does not.
+        r = _cite_orphan(client, os.path.join(repo, "lnk"),
+                         "The real sentence lives here.", git_sha=first)
+        assert "error" in r, r
+        _assert_rejected_nothing_written(r, ev, n)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_2c_bad_quote_with_caller_content_hash_leaves_no_evidence_row_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        ev, n = _count_evidence(), _count_nodes()
+        r = _cite_orphan(client, os.path.join(repo, "f.md"), "Not in the file at all.",
+                         content_hash="0" * 64)
+        assert "error" in r, r
+        _assert_rejected_nothing_written(r, ev, n)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_3_accepted_observation_creates_exactly_one_linked_evidence_row_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        ev = _count_evidence()
+        r = _cite_orphan(client, os.path.join(repo, "f.md"), "The real sentence lives here.")
+        assert "error" not in r and r.get("observation_id"), r
+        assert _count_evidence() == ev + 1
+        import engram_core as _core
+        conn = _core._get_db()
+        row = conn.execute("SELECT evidence_id FROM nodes WHERE id = ?",
+                           (r["observation_id"],)).fetchone()
+        assert row["evidence_id"] == r["evidence_id"]
+        edge = conn.execute(
+            "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ? AND relation = 'cites'",
+            (r["observation_id"], r["evidence_id"])).fetchone()
+        assert edge is not None
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_4a_rejection_by_evidence_id_keeps_the_existing_evidence_row_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        good = _cite_orphan(client, os.path.join(repo, "f.md"), "The real sentence lives here.")
+        assert good.get("observation_id"), good
+        ev, n = _count_evidence(), _count_nodes()
+        r = _cite_by_evidence_id(client, good["evidence_id"], "Fabricated, not in the file.")
+        assert "Quoted text not found" in r.get("error", ""), r
+        _assert_rejected_nothing_written(r, ev, n)
+        assert ev == 1
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_4b_rejection_by_url_reuse_keeps_the_existing_evidence_row_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        path = os.path.join(repo, "f.md")
+        good = _cite_orphan(client, path, "The real sentence lives here.")
+        assert good.get("observation_id"), good
+        ev, n = _count_evidence(), _count_nodes()
+        r = _cite_orphan(client, path, "Fabricated, not in the file.")
+        assert "Quoted text not found" in r.get("error", ""), r
+        _assert_rejected_nothing_written(r, ev, n)
+        import engram_core as _core
+        still = _core._get_db().execute(
+            "SELECT 1 FROM nodes WHERE id = ? AND type = 'evidence'",
+            (good["evidence_id"],)).fetchone()
+        assert still is not None, "the pre-existing evidence row was deleted"
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+# --- #3399 (batch path): an all-rejected batch leaves no evidence row ----------
+#
+# _add_observation_batch_impl used to create the shared evidence row up front
+# and then call _add_observation_impl(evidence_id=...), the path that skips the
+# url preflight. A batch in which EVERY item is rejected therefore orphaned it.
+
+_BATCH_GOOD = "The real sentence lives here."
+
+
+def _batch_item(text, n):
+    return {
+        "quoted_text": text,
+        "interpretation": "Testing the batch no-orphan contract.",
+        "claim": f"Batch orphan check number {n} {text[:10]}",
+        "quote_type": "hard_data",
+    }
+
+
+def _batch_cite(client, items, **extra):
+    payload = {"observations_json": json.dumps(items)}
+    payload.update(extra)
+    return client.call("engram_add_observation_batch", payload)
+
+
+def _batch_url(repo, name="f.md"):
+    return {"url": f"file://{os.path.join(repo, name)}", "title": "Batch orphan evidence"}
+
+
+def test_b1_batch_all_quotes_bad_leaves_no_evidence_row_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        ev, n = _count_evidence(), _count_nodes()
+        r = _batch_cite(client, [_batch_item("Not in the file one.", 0),
+                                 _batch_item("Not in the file two.", 1)], **_batch_url(repo))
+        assert r.get("status") == "batch_complete", r
+        assert r["created"] == 0 and r["total"] == 2, r
+        assert all("Quoted text not found" in x.get("error", "") for x in r["results"]), r
+        assert not r.get("evidence_id"), f"a dangling evidence_id was returned: {r}"
+        assert r.get("evidence_created") is False, r
+        assert _count_evidence() == ev, "an all-rejected batch left an evidence row"
+        assert _count_nodes() == n, "an all-rejected batch left a node row"
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_b2_batch_one_good_one_bad_keeps_one_linked_evidence_row_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        ev = _count_evidence()
+        r = _batch_cite(client, [_batch_item(_BATCH_GOOD, 0),
+                                 _batch_item("Not in the file at all.", 1)], **_batch_url(repo))
+        assert r["created"] == 1 and r["total"] == 2, r
+        good, bad = r["results"]
+        assert good["status"] == "created" and good["index"] == 0, good
+        assert "Quoted text not found" in bad["error"] and bad["index"] == 1, bad
+        assert _count_evidence() == ev + 1
+        assert r["evidence_id"] and r["evidence_created"] is True, r
+        import engram_core as _core
+        row = _core._get_db().execute("SELECT evidence_id FROM nodes WHERE id = ?",
+                                      (good["observation_id"],)).fetchone()
+        assert row["evidence_id"] == r["evidence_id"]
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_b3_batch_all_rejected_by_git_sha_leaves_no_evidence_row_3399():
+    base, repo, first = _orphan_repo()
+    try:
+        client = fresh_client()
+        ev, n = _count_evidence(), _count_nodes()
+        # g.md did not exist at `first`: the (valid-quote) item is rejected.
+        r = _batch_cite(client, [_batch_item("A later file.", 0)],
+                        git_sha=first, **_batch_url(repo, "g.md"))
+        assert r["created"] == 0, r
+        assert "does not exist at git revision" in r["results"][0]["error"], r
+        assert not r.get("evidence_id"), r
+        assert _count_evidence() == ev and _count_nodes() == n
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_b4_batch_all_rejected_by_evidence_id_keeps_existing_row_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        good = _cite_orphan(client, os.path.join(repo, "f.md"), _BATCH_GOOD)
+        assert good.get("observation_id"), good
+        ev, n = _count_evidence(), _count_nodes()
+        r = _batch_cite(client, [_batch_item("Fabricated one.", 0)],
+                        evidence_id=good["evidence_id"])
+        assert r["created"] == 0, r
+        assert r["evidence_id"] == good["evidence_id"], r
+        assert _count_evidence() == ev == 1 and _count_nodes() == n
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_b5_batch_results_keep_input_index_order_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        items = [_batch_item("Not in the file zero.", 0),
+                 _batch_item(_BATCH_GOOD, 1),
+                 "not an object",
+                 {"quoted_text": "only this"},
+                 _batch_item("Not in the file four.", 4)]
+        r = _batch_cite(client, items, **_batch_url(repo))
+        assert r["total"] == 5 and r["created"] == 1, r
+        assert [x["index"] for x in r["results"]] == [0, 1, 2, 3, 4], r
+        assert [("error" in x) for x in r["results"]] == [True, False, True, True, True], r
+        assert "Quoted text not found" in r["results"][0]["error"]
+        assert "Each observation must be a JSON object" in r["results"][2]["error"]
+        assert "Missing required fields" in r["results"][3]["error"]
+        assert "Quoted text not found" in r["results"][4]["error"]
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_b5b_batch_no_valid_items_writes_nothing_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        ev = _count_evidence()
+        r = _batch_cite(client, ["x", {"quoted_text": "only"}], **_batch_url(repo))
+        assert r["created"] == 0 and [x["index"] for x in r["results"]] == [0, 1], r
+        assert _count_evidence() == ev, "a batch with no valid item wrote an evidence row"
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_b6_batch_first_item_bad_later_good_still_creates_3399():
+    """Pins that the skip is 'no item passes', not 'the first item failed'."""
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        r = _batch_cite(client, [_batch_item("Not in the file zero.", 0),
+                                 _batch_item(_BATCH_GOOD, 1)], **_batch_url(repo))
+        assert r["created"] == 1 and r["results"][1]["status"] == "created", r
+        assert _count_evidence() == 1
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_s1_uncommitted_file_bad_quote_carries_evidence_prefix_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        with open(os.path.join(repo, "wip.md"), "w") as fh:
+            fh.write("Uncommitted text.\n")
+        client = fresh_client()
+        ev = _count_evidence()
+        r = _cite_orphan(client, os.path.join(repo, "wip.md"), "Not in the file at all.")
+        assert "error" in r, r
+        assert r["error"].startswith("Failed to create evidence node:"), r
+        assert _count_evidence() == ev
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_b7_batch_uncommitted_file_is_a_batch_level_error_3399():
+    """The item-independent evidence-capture rejection stays batch-level (today's shape)."""
+    base, repo, _first = _orphan_repo()
+    try:
+        with open(os.path.join(repo, "wip.md"), "w") as fh:
+            fh.write("Uncommitted text.\n")
+        client = fresh_client()
+        ev = _count_evidence()
+        r = _batch_cite(client, [_batch_item("Uncommitted text.", 0)], **_batch_url(repo, "wip.md"))
+        assert r.get("error", "").startswith("Failed to create evidence node:"), r
+        assert "results" not in r, r
+        assert _count_evidence() == ev
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+# --- #3399 (batch path, root cause): only an item that passed writes the row ---
+#
+# The batch used to write the shared evidence row itself and then try to predict
+# which items would be rejected (file-dependent checks only). Any other per-item
+# rejection -- an over-long recall_summary, a dangling standpoint_author_id, a
+# non-file url -- still orphaned it. Contract: the row is written by the first
+# item that PASSES, through the single-observation path, and by nothing else.
+
+def _long_recall(item, ch="x"):
+    item = dict(item)
+    item["recall_summary"] = ch * 300
+    return item
+
+
+def _assert_batch_wrote_nothing(r, ev, n, total):
+    assert r.get("status") == "batch_complete", r
+    assert r["created"] == 0 and r["total"] == total, r
+    assert all(x.get("error") for x in r["results"]), r
+    assert not r.get("evidence_id"), f"a dangling evidence_id was returned: {r}"
+    assert r.get("evidence_created") is False, r
+    assert _count_evidence() == ev, "an all-rejected batch left an evidence row"
+    assert _count_nodes() == n, "an all-rejected batch left a node row"
+
+
+def test_c1_batch_all_rejected_for_long_recall_summary_leaves_no_evidence_row_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        ev, n = _count_evidence(), _count_nodes()
+        r = _batch_cite(client, [_long_recall(_batch_item(_BATCH_GOOD, 0), "x"),
+                                 _long_recall(_batch_item(_BATCH_GOOD, 1), "y")],
+                        **_batch_url(repo))
+        _assert_batch_wrote_nothing(r, ev, n, 2)
+        assert all("recall_summary" in x["error"] for x in r["results"]), r
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_c2_batch_all_rejected_for_dangling_author_leaves_no_evidence_row_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        ev, n = _count_evidence(), _count_nodes()
+        items = []
+        for k in range(2):
+            it = _batch_item(_BATCH_GOOD, k)
+            it["standpoint_author_id"] = "pn_999999"
+            items.append(it)
+        r = _batch_cite(client, items, **_batch_url(repo))
+        _assert_batch_wrote_nothing(r, ev, n, 2)
+        assert all("standpoint_author_id" in x["error"] for x in r["results"]), r
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_c3_batch_mixed_rejection_reasons_each_error_at_its_own_index_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        ev, n = _count_evidence(), _count_nodes()
+        dangling = _batch_item(_BATCH_GOOD, 2)
+        dangling["standpoint_author_id"] = "pn_999999"
+        r = _batch_cite(client, [_batch_item("Not in the file at all.", 0),
+                                 _long_recall(_batch_item(_BATCH_GOOD, 1)),
+                                 dangling], **_batch_url(repo))
+        _assert_batch_wrote_nothing(r, ev, n, 3)
+        assert [x["index"] for x in r["results"]] == [0, 1, 2], r
+        assert "Quoted text not found" in r["results"][0]["error"], r
+        assert "recall_summary" in r["results"][1]["error"], r
+        assert "standpoint_author_id" in r["results"][2]["error"], r
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_c4_batch_non_file_url_all_rejected_leaves_no_evidence_row_3399():
+    client = fresh_client()
+    ev, n = _count_evidence(), _count_nodes()
+    r = _batch_cite(client, [_long_recall(_batch_item(_BATCH_GOOD, 0)),
+                             _long_recall(_batch_item(_BATCH_GOOD, 1), "y")],
+                    url="https://example.com/article", title="Non-file batch evidence")
+    _assert_batch_wrote_nothing(r, ev, n, 2)
+
+
+def test_c5_batch_bad_then_good_writes_exactly_one_row_cited_by_the_good_item_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        ev = _count_evidence()
+        r = _batch_cite(client, [_long_recall(_batch_item(_BATCH_GOOD, 0)),
+                                 _batch_item(_BATCH_GOOD, 1)], **_batch_url(repo))
+        assert r["created"] == 1 and r["total"] == 2, r
+        bad, good = r["results"]
+        assert "recall_summary" in bad["error"] and bad["index"] == 0, bad
+        assert good["status"] == "created" and good["index"] == 1, good
+        assert _count_evidence() == ev + 1
+        assert r["evidence_id"] and r["evidence_created"] is True, r
+        import engram_core as _core
+        row = _core._get_db().execute("SELECT evidence_id FROM nodes WHERE id = ?",
+                                      (good["observation_id"],)).fetchone()
+        assert row["evidence_id"] == r["evidence_id"]
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_c6_batch_all_rejected_keeps_preexisting_row_and_reports_not_created_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        first = _cite_orphan(client, os.path.join(repo, "f.md"), _BATCH_GOOD)
+        assert first.get("evidence_id"), first
+        ev, n = _count_evidence(), _count_nodes()
+        r = _batch_cite(client, [_long_recall(_batch_item(_BATCH_GOOD, 0))], **_batch_url(repo))
+        assert r["created"] == 0 and r["evidence_created"] is False, r
+        # Documented behaviour: nothing was cited, so no id is reported even
+        # though the url's row already exists (dev returned that row's id).
+        assert r["evidence_id"] is None, r
+        assert _count_evidence() == ev == 1 and _count_nodes() == n
+        import engram_core as _core
+        assert _core._get_db().execute(
+            "SELECT 1 FROM nodes WHERE id = ?", (first["evidence_id"],)).fetchone()
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_c7_batch_good_item_reuses_preexisting_row_and_reports_not_created_3399():
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        first = _cite_orphan(client, os.path.join(repo, "f.md"), _BATCH_GOOD)
+        assert first.get("evidence_id"), first
+        ev = _count_evidence()
+        r = _batch_cite(client, [_batch_item(_BATCH_GOOD, 0)], **_batch_url(repo))
+        assert r["created"] == 1, r
+        assert _count_evidence() == ev
+        assert r["evidence_created"] is False, r
+        assert r["evidence_id"] == first["evidence_id"], r
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_r1_reuse_path_dirty_file_reports_prefixed_capture_error_3399():
+    """A url whose evidence row already exists, then the file is dirtied: the
+    capture error (prefixed) wins over the bad-quote error, and the existing
+    row is untouched."""
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        path = os.path.join(repo, "f.md")
+        first = _cite_orphan(client, path, _BATCH_GOOD)
+        assert first.get("evidence_id"), first
+        with open(path, "a") as fh:
+            fh.write("An uncommitted edit.\n")
+        ev, n = _count_evidence(), _count_nodes()
+        r = _cite_orphan(client, path, "Not in the file at all.")
+        assert "error" in r and "observation_id" not in r, r
+        assert r["error"].startswith("Failed to create evidence node:"), r
+        assert _count_evidence() == ev == 1 and _count_nodes() == n
+        import engram_core as _core
+        assert _core._get_db().execute(
+            "SELECT 1 FROM nodes WHERE id = ?", (first["evidence_id"],)).fetchone()
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+# --- #3399 (batch path, round 3): url-level rejections stay ONE batch error ----
+#
+# Every rejection _add_evidence_impl makes about the url or title alone (blank
+# title, unrecognized scheme, localhost / no-TLD host, NXDOMAIN) is
+# item-independent. On dev the batch returned it once, top-level, prefixed
+# "Failed to create evidence node:". It must not become N per-item errors (and N
+# DNS lookups) inside a batch_complete envelope.
+
+_URL_REJECTIONS = [
+    ("localhost", "http://localhost:5001/thread/1", "Cannot cite a localhost URL"),
+    ("no_tld", "https://session-transcript/x", "no TLD found"),
+    ("scheme", "conversation://abc", "Unrecognized URL scheme"),
+    ("nxdomain", "https://totally-fake-domain.example/x", "DNS resolution failed"),
+]
+
+
+def _single_cite_url(client, url, title="Url-level rejection"):
+    return client.call("engram_add_observation", {
+        "url": url, "title": title, "quoted_text": "q", "interpretation": "i",
+        "claim": "Url-level rejection single path", "quote_type": "hard_data",
+    })
+
+
+def test_u1_batch_url_level_rejection_is_one_top_level_error_3399():
+    client = fresh_client()
+    for label, url, needle in _URL_REJECTIONS:
+        ev, n = _count_evidence(), _count_nodes()
+        r = _batch_cite(client, [_batch_item(_BATCH_GOOD, 0), _batch_item(_BATCH_GOOD, 1)],
+                        url=url, title="Url-level rejection")
+        assert r.get("error", "").startswith("Failed to create evidence node:"), (label, r)
+        assert needle in r["error"], (label, r)
+        assert "results" not in r and r.get("status") != "batch_complete", (label, r)
+        assert _count_evidence() == ev and _count_nodes() == n, label
+
+
+def test_u2_batch_blank_title_is_one_top_level_error_3399():
+    client = fresh_client()
+    ev = _count_evidence()
+    r = _batch_cite(client, [_batch_item(_BATCH_GOOD, 0)],
+                    url="https://example.com/article", title="   ")
+    assert r.get("error") == ("Failed to create evidence node: "
+                              "title is required and cannot be empty."), r
+    assert "results" not in r and _count_evidence() == ev, r
+
+
+def test_u3_single_path_url_level_rejections_keep_their_text_3399():
+    client = fresh_client()
+    for label, url, needle in _URL_REJECTIONS:
+        ev = _count_evidence()
+        r = _single_cite_url(client, url)
+        assert r["error"].startswith("Failed to create evidence node:"), (label, r)
+        assert needle in r["error"], (label, r)
+        assert _count_evidence() == ev, label
+        # The batch reports the very same text the single path does.
+        b = _batch_cite(client, [_batch_item(_BATCH_GOOD, 0)], url=url, title="Url-level rejection")
+        assert b["error"] == r["error"], (label, b, r)
+
+
+def test_u4_batch_url_validated_once_not_per_item_3399():
+    import socket
+    client = fresh_client()
+    calls = []
+    real = socket.getaddrinfo
+
+    def counting(host, *a, **k):
+        calls.append(host)
+        return real(host, *a, **k)
+
+    socket.getaddrinfo = counting
+    try:
+        _batch_cite(client, [_batch_item(_BATCH_GOOD, k) for k in range(3)],
+                    url="https://totally-fake-domain.example/x", title="Once")
+    finally:
+        socket.getaddrinfo = real
+    assert calls.count("totally-fake-domain.example") == 1, calls
+
+
+def test_u5_batch_existing_row_still_reused_without_revalidating_url_3399():
+    """dev reused an existing row before validating; a non-file url whose row
+    exists must not be re-validated (a stale host would reject a citable row)."""
+    client = fresh_client()
+    good = _single_cite_url(client, "https://example.com/article")
+    assert good.get("evidence_id"), good
+    import socket
+    real = socket.getaddrinfo
+
+    def nxdomain(host, *a, **k):
+        raise socket.gaierror(socket.EAI_NONAME, "gone")
+
+    socket.getaddrinfo = nxdomain
+    try:
+        r = _batch_cite(client, [_long_recall(_batch_item(_BATCH_GOOD, 0))],
+                        url="https://example.com/article", title="Reuse")
+    finally:
+        socket.getaddrinfo = real
+    assert r.get("status") == "batch_complete" and r["created"] == 0, r
+
+
+def test_y1_batch_yellow_card_warning_lifted_once_to_batch_level_3399():
+    import engram_core as _core
+    client = fresh_client()
+    cfg = {}
+    if _core.CONFIG_PATH.exists():
+        cfg = json.loads(_core.CONFIG_PATH.read_text())
+    cfg["yellow_domains"] = [{"domain": "example.com", "reason": "test card"}]
+    _core.CONFIG_PATH.write_text(json.dumps(cfg))
+    r = _batch_cite(client, [_batch_item(_BATCH_GOOD, 0), _batch_item(_BATCH_GOOD, 1)],
+                    url="https://example.com/article", title="Yellow")
+    assert r["created"] == 2, r
+    assert "example.com" in r.get("yellow_card_warning", ""), r
+    assert all("yellow_card_warning" not in x for x in r["results"]), r
+
+
+def test_u6_batch_file_url_row_exists_dirty_file_is_one_batch_level_error_3399():
+    """The row for a file:// url exists and the file is then dirtied: the batch
+    reports the capture error ONCE, top-level, instead of per-item errors."""
+    base, repo, _first = _orphan_repo()
+    try:
+        client = fresh_client()
+        path = os.path.join(repo, "f.md")
+        first = _cite_orphan(client, path, _BATCH_GOOD)
+        assert first.get("evidence_id"), first
+        with open(path, "a") as fh:
+            fh.write("An uncommitted edit.\n")
+        ev, n = _count_evidence(), _count_nodes()
+        r = _batch_cite(client, [_batch_item(_BATCH_GOOD, 0), _batch_item(_BATCH_GOOD, 1)],
+                        **_batch_url(repo))
+        assert r.get("error", "").startswith("Failed to create evidence node:"), r
+        assert "results" not in r and r.get("status") != "batch_complete", r
+        assert _count_evidence() == ev == 1 and _count_nodes() == n
+        import engram_core as _core
+        assert _core._get_db().execute(
+            "SELECT 1 FROM nodes WHERE id = ?", (first["evidence_id"],)).fetchone()
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
