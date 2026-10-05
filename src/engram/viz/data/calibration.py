@@ -128,6 +128,8 @@ def _conf_dist_for_window(
     for row in deriv_rows:
         try:
             meta = json.loads(row["metadata"])
+            if not isinstance(meta, dict):  # valid JSON, not an object (#3413)
+                meta = {}
             rtype = meta.get("reasoning_type")
         except (json.JSONDecodeError, TypeError):
             rtype = None
@@ -153,6 +155,8 @@ def _conf_dist_for_window(
     for row in obs_rows:
         try:
             meta = json.loads(row["metadata"])
+            if not isinstance(meta, dict):  # valid JSON, not an object (#3413)
+                meta = {}
             sc = meta.get("source_class", "external")
         except (json.JSONDecodeError, TypeError):
             sc = "external"

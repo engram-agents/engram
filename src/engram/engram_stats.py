@@ -144,11 +144,7 @@ def _compute_confidence_distribution(
     ).fetchall()
     _rt_buckets: dict = {}  # reasoning_type → list of confidence values
     for row in deriv_rows:
-        try:
-            meta = json.loads(row["metadata"])
-            rtype = meta.get("reasoning_type")
-        except (json.JSONDecodeError, TypeError):
-            rtype = None
+        rtype = core._metadata_dict(row["metadata"]).get("reasoning_type")
         if not rtype:
             rtype = "legacy_untyped"
         _rt_buckets.setdefault(rtype, []).append(row["confidence"])
@@ -170,11 +166,7 @@ def _compute_confidence_distribution(
     ).fetchall()
     _sc_buckets: dict = {}
     for row in obs_rows:
-        try:
-            meta = json.loads(row["metadata"])
-            sc = meta.get("source_class", "external")
-        except (json.JSONDecodeError, TypeError):
-            sc = "external"
+        sc = core._metadata_dict(row["metadata"]).get("source_class", "external")
         _sc_buckets.setdefault(sc, []).append(row["confidence"])
     for sc, vals in _sc_buckets.items():
         by_source_class[sc] = {
@@ -376,11 +368,8 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
                 filter_args,
             ).fetchall()
             for d in derivations:
-                try:
-                    meta = json.loads(d["metadata"])
-                    rtype = meta.get("reasoning_type", "legacy_untyped")
-                except (json.JSONDecodeError, TypeError):
-                    rtype = "legacy_untyped"
+                rtype = core._metadata_dict(d["metadata"]).get(
+                    "reasoning_type", "legacy_untyped")
                 reasoning_breakdown[rtype] = reasoning_breakdown.get(rtype, 0) + 1
             result["reasoning_type_breakdown"] = reasoning_breakdown
 
@@ -752,11 +741,8 @@ def _diagnose_impl() -> str:
             "SELECT metadata FROM nodes WHERE type = 'derivation' AND is_current = 1 AND metadata IS NOT NULL"
         ).fetchall()
         for d in dvs:
-            try:
-                meta = json.loads(d["metadata"])
-                rtype = meta.get("reasoning_type", "legacy_untyped")
-            except (json.JSONDecodeError, TypeError):
-                rtype = "legacy_untyped"
+            rtype = core._metadata_dict(d["metadata"]).get(
+                "reasoning_type", "legacy_untyped")
             reasoning_breakdown[rtype] = reasoning_breakdown.get(rtype, 0) + 1
         epistemic["reasoning_types"] = reasoning_breakdown
 
@@ -1318,10 +1304,7 @@ def _diagnose_impl() -> str:
                 channels: list[str] = []
                 if nid in covered_ids:
                     channels.append("registry_trigger")
-                try:
-                    meta = json.loads(row["metadata"]) if row["metadata"] else {}
-                except (TypeError, json.JSONDecodeError):
-                    meta = {}
+                meta = core._metadata_dict(row["metadata"])
                 if meta.get("situation_pattern"):
                     channels.append("situation_pattern")
                 if nid in _pc_wb_text:

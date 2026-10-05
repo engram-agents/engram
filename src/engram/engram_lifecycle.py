@@ -725,7 +725,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         ).fetchall()
         active_tasks = []
         for t in tasks:
-            t_meta = json.loads(t["metadata"]) if t["metadata"] else {}
+            t_meta = core._metadata_dict(t["metadata"])
             serves = conn.execute(
                 "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'serves'",
                 (t["id"],),
@@ -750,8 +750,8 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
             report["known_people"] = [
                 {
                     "id": p["id"],
-                    "name": json.loads(p["metadata"]).get("name", "") if p["metadata"] else "",
-                    "role": json.loads(p["metadata"]).get("role", "") if p["metadata"] else "",
+                    "name": core._metadata_dict(p["metadata"]).get("name", ""),
+                    "role": core._metadata_dict(p["metadata"]).get("role", ""),
                     "since": p["created_at"],
                 }
                 for p in people
@@ -787,7 +787,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         ).fetchall()
         active_lessons = []
         for ls in lessons:
-            ls_meta = json.loads(ls["metadata"]) if ls["metadata"] else {}
+            ls_meta = core._metadata_dict(ls["metadata"])
             # Incidents point AT the lesson via `exemplifies` (incident → lesson).
             # Filter to is_current=1 sources so the list matches exemplar_count
             # semantics (live exemplars only; superseded source nodes excluded).
@@ -1076,7 +1076,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         ).fetchall()
         report["retracted_nodes"] = []
         for r in retracted:
-            meta = json.loads(r["metadata"] or "{}")
+            meta = core._metadata_dict(r["metadata"])
             report["retracted_nodes"].append({
                 "id": r["id"],
                 "type": r["type"],
@@ -1121,7 +1121,12 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         for r in support_lost_rows:
             live_count = core._count_live_exemplars(conn, r["id"], r["type"])
             if live_count > 0:
-                meta = json.loads(r["metadata"] or "{}")
+                # #3413: the LIKE pre-filter can match a non-object blob that
+                # merely CONTAINS the marker text (`[{"support_lost": true}]`);
+                # the re-dump then replaces it with a dict, so say so. The
+                # report has no `warnings` field; stderr is the signal.
+                meta, _ = core._metadata_dict_for_write(
+                    r["metadata"], r["id"], "engram_reflect")
                 meta.pop("support_lost", None)
                 conn.execute(
                     "UPDATE nodes SET metadata = ? WHERE id = ?",

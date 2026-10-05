@@ -350,7 +350,7 @@ def _outgrow_cornerstone_impl(
                          "Use engram_supersede for other node types."
             })
 
-        old_meta = json.loads(old["metadata"]) if old["metadata"] else {}
+        old_meta = core._metadata_dict(old["metadata"])
         tag = old_meta.get("tag", "")
         title = new_title if new_title else old_meta.get("title", old["claim"])
         # The growth-cycle roll: predecessor's new_frame becomes successor's prior_frame.
@@ -698,7 +698,7 @@ def _link_about_impl(
 
         # Stage 2 auto-suggest: only for newly-created edges (not redundant re-links).
         if created and person:
-            person_meta = json.loads(person["metadata"] or "{}")
+            person_meta = core._metadata_dict(person["metadata"])
             person_name = person_meta.get("name", person_id)
             result["special_moment_suggestion"] = {
                 "person_id": person_id,

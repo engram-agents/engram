@@ -463,10 +463,7 @@ def _visible_protection_channels(
         (node_id,),
     ).fetchall()
     for (lmeta_json,) in lesson_rows:
-        try:
-            lmeta = json.loads(lmeta_json) if lmeta_json else {}
-        except (TypeError, json.JSONDecodeError):
-            lmeta = {}
+        lmeta = core._metadata_dict(lmeta_json)
         if lmeta.get("situation_pattern"):
             return ["situation_pattern"]
 
@@ -535,10 +532,7 @@ def _pattern_stale_load_bearing(
 
     candidates: list[dict] = []
     for nid, ntype, claim, imp_base, imp_score, recalls, meta_json in rows:
-        try:
-            meta = json.loads(meta_json) if meta_json else {}
-        except (TypeError, json.JSONDecodeError):
-            meta = {}
+        meta = core._metadata_dict(meta_json)
         # Protection-channel floor: skip nodes kept live by any channel other
         # than deliberate recall — their inflation gap is benign, not erosion.
         if _visible_protection_channels(conn, nid, meta, doc_text, registry_ids):
@@ -1177,31 +1171,28 @@ def _build_inspect_recall_view(
     #   _RECALL_OMIT above, so it already passes through node_recall
     #   unconditionally (confirmed pre-existing; this was the "partly wired"
     #   case the issue itself names).
-    _raw_meta = node.get("metadata")
-    if _raw_meta:
-        try:
-            _meta = json.loads(_raw_meta) if isinstance(_raw_meta, str) else _raw_meta
-            if "quote_verified" in _meta:
-                node_recall["quote_verified"] = _meta["quote_verified"]
-            # support_lost: set when a cited premise was retracted/superseded
-            # away (#3402). Promoted only when truthy, so a cleared flag
-            # (false) leaves no key.
-            if isinstance(_meta, dict) and _meta.get("support_lost"):
-                node_recall["support_lost"] = True
-            if node.get("type") == "derivation" and "warrant" in _meta and _meta["warrant"]:
-                node_recall["warrant"] = _meta["warrant"]
-            if node.get("type") == "person":
-                if _meta.get("pronouns"):
-                    node_recall["pronouns"] = _meta["pronouns"]
-                if _meta.get("relation"):
-                    node_recall["relation"] = _meta["relation"]
-                _moments = _meta.get("special_moments")
-                if isinstance(_moments, list) and _moments:
-                    _moment_text = _select_and_render_person_moment(conn, node_id)
-                    if _moment_text:
-                        node_recall["special_moment"] = _moment_text
-        except (json.JSONDecodeError, TypeError):
-            pass
+    # `_metadata_dict` hands back {} for a non-object / invalid blob (#3413),
+    # so there is nothing to promote and no dict op can crash.
+    _meta = core._metadata_dict(node.get("metadata"))
+    if "quote_verified" in _meta:
+        node_recall["quote_verified"] = _meta["quote_verified"]
+    # support_lost: set when a cited premise was retracted/superseded
+    # away (#3402). Promoted only when truthy, so a cleared flag
+    # (false) leaves no key.
+    if _meta.get("support_lost"):
+        node_recall["support_lost"] = True
+    if node.get("type") == "derivation" and "warrant" in _meta and _meta["warrant"]:
+        node_recall["warrant"] = _meta["warrant"]
+    if node.get("type") == "person":
+        if _meta.get("pronouns"):
+            node_recall["pronouns"] = _meta["pronouns"]
+        if _meta.get("relation"):
+            node_recall["relation"] = _meta["relation"]
+        _moments = _meta.get("special_moments")
+        if isinstance(_moments, list) and _moments:
+            _moment_text = _select_and_render_person_moment(conn, node_id)
+            if _moment_text:
+                node_recall["special_moment"] = _moment_text
 
     response: dict = {
         "node": node_recall,
@@ -1382,12 +1373,7 @@ def _extract_warnings(
                     "retraction_reason_excerpt": None,
                 })
                 continue
-            rmeta: dict = {}
-            if row["metadata"]:
-                try:
-                    rmeta = json.loads(row["metadata"])
-                except (json.JSONDecodeError, TypeError):
-                    rmeta = {}
+            rmeta = core._metadata_dict(row["metadata"])
             claim = row["claim"] or ""
             reason = rmeta.get("retraction_reason") or ""
             t_entries.append({
@@ -2305,10 +2291,7 @@ def _select_and_render_person_moment(
     row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (node_id,)).fetchone()
     if not row:
         return None
-    try:
-        meta = json.loads(row["metadata"]) if row["metadata"] else {}
-    except (json.JSONDecodeError, TypeError):
-        return None
+    meta = core._metadata_dict(row["metadata"])
     moments = meta.get("special_moments")
     if not isinstance(moments, list) or not moments:
         return None
@@ -2555,11 +2538,7 @@ def _surface_impl(
                     # that reads this response over the daemon socket) can do
                     # its own suppression-gated selection + cursor-advance —
                     # see engram-surface-hook.py's _select_person_moment_candidate.
-                    _pmeta_raw = n.get("metadata")
-                    try:
-                        _pmeta = json.loads(_pmeta_raw) if _pmeta_raw else {}
-                    except (json.JSONDecodeError, TypeError):
-                        _pmeta = {}
+                    _pmeta = core._metadata_dict(n.get("metadata"))
                     if _pmeta.get("pronouns"):
                         entry["pronouns"] = _pmeta["pronouns"]
                     if _pmeta.get("relation"):
@@ -2955,11 +2934,7 @@ def _query_impl(
             # trust_tier needs no extraction here — it's already a raw
             # column carried through by _node_to_dict unconditionally.
             if not return_debug and node.get("type") == "person":
-                _pmeta_raw = node.get("metadata")
-                try:
-                    _pmeta = json.loads(_pmeta_raw) if _pmeta_raw else {}
-                except (json.JSONDecodeError, TypeError):
-                    _pmeta = {}
+                _pmeta = core._metadata_dict(node.get("metadata"))
                 if _pmeta.get("pronouns"):
                     node["pronouns"] = _pmeta["pronouns"]
                 if _pmeta.get("relation"):

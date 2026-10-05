@@ -250,6 +250,8 @@ def detect_speaker(prompt: str, people: list[dict]) -> dict | None:
 
     for person in people:
         meta = json.loads(person.get("metadata", "{}"))
+        if not isinstance(meta, dict):  # valid JSON, not an object (#3413)
+            meta = {}
         name = meta.get("name", "").lower()
         aliases = [a.lower() for a in meta.get("aliases", [])]
         role = meta.get("role", "")

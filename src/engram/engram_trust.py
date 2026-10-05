@@ -444,7 +444,11 @@ def _update_person_impl(
                 )
             })
 
-        meta = json.loads(row["metadata"] or "{}")
+        # #3413: this function ALWAYS re-dumps `meta`, so a non-object blob is
+        # replaced by a dict; the helper logs it (the engram_update_person
+        # response has no warnings field).
+        meta, _ = core._metadata_dict_for_write(
+            row["metadata"], node_id.strip(), "engram_update_person")
         if "field_traces" not in meta:
             meta["field_traces"] = {}
 
@@ -521,7 +525,10 @@ def _update_person_impl(
             ).fetchone()
             if not src_row:
                 continue
-            src_meta = json.loads(src_row["metadata"] or "{}")
+            # #3413: the CITING node's blob is re-dumped too; a non-object
+            # one is replaced by a dict and logged (no warnings field).
+            src_meta, _ = core._metadata_dict_for_write(
+                src_row["metadata"], src, "engram_update_person")
             if "field_changed_flags" not in src_meta:
                 src_meta["field_changed_flags"] = []
             for field, new_value in updates.items():
@@ -625,7 +632,11 @@ def _add_special_moment_impl(
                          f"Use engram_inspect('{node_id}') to find the current successor."
             })
 
-        meta = json.loads(pn_row["metadata"] or "{}")
+        # #3413: always re-dumped below (a non-object blob reads as {}, so the
+        # cap return cannot fire first); replaced by a dict and logged by the
+        # helper (no warnings field on the engram_add_special_moment response).
+        meta, _ = core._metadata_dict_for_write(
+            pn_row["metadata"], person_id.strip(), "engram_add_special_moment")
         moments = meta.get("special_moments", [])
 
         # Hard ceiling — fail loud, no silent eviction (#1948). The prior
@@ -737,10 +748,7 @@ def _backfill_special_moment_about_edges(conn: sqlite3.Connection) -> int:
     created = 0
     for prow in person_rows:
         person_id = prow["id"]
-        try:
-            meta = json.loads(prow["metadata"] or "{}")
-        except (json.JSONDecodeError, TypeError):
-            continue
+        meta = core._metadata_dict(prow["metadata"])
         moments = meta.get("special_moments") or []
         if not isinstance(moments, list):
             continue
@@ -865,7 +873,10 @@ def _set_person_lineage_impl(target_pn: str = "", model_id: str = "") -> str:
                     )
                 })
 
-        meta = json.loads(row["metadata"] or "{}")
+        # #3413: always re-dumped; a non-object blob is replaced by a dict and
+        # logged by the helper (no warnings field on the response).
+        meta, _ = core._metadata_dict_for_write(
+            row["metadata"], row["id"], "engram_set_person_lineage")
         meta["model_provider"] = parsed["provider"]
         meta["model_family"] = parsed["family"]
         meta["model_version"] = parsed["version"]
@@ -939,7 +950,7 @@ def _set_trust_tier_impl(
         # ── Self-tier gate (replaces the standard approval gate for tier='self') ──
         if tier == "self":
             # Gate 1: target node must have metadata.is_self=true
-            meta = json.loads(row["metadata"] or "{}")
+            meta = core._metadata_dict(row["metadata"])
             if not meta.get("is_self"):
                 return json.dumps({
                     "error": (

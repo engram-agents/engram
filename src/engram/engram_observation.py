@@ -226,10 +226,7 @@ def _find_person_repair_hint(conn: sqlite3.Connection, offending: str) -> Option
     candidates: dict[str, str] = {}  # name/alias (lowercase) -> person_id
     display: dict[str, str] = {}  # name/alias (lowercase) -> original-case name for display
     for prow in person_rows:
-        try:
-            pmeta = json.loads(prow["metadata"] or "{}")
-        except json.JSONDecodeError:
-            continue
+        pmeta = core._metadata_dict(prow["metadata"])
         pname = pmeta.get("name", "")
         paliases = pmeta.get("aliases", [])
         vocab = [pname] + (paliases if isinstance(paliases, list) else [])
@@ -1831,7 +1828,10 @@ def _add_observation_impl(
         # than silently resolving one way or the other. Absent/empty
         # arguments never touch the evidence node -- an evidence node created
         # without a snapshot must not grow a spurious key.
-        _ev_metadata = json.loads(ev["metadata"] or "{}")
+        # #3413: parse silently here (an early return below discards the
+        # write); the replacement of a non-object blob is logged and warned
+        # at the WRITE, where it actually happens.
+        _ev_metadata = core._metadata_dict(ev["metadata"])
         _ev_metadata_changed = False
         _evidence_type_conflict = None
         _original_url_conflict = None
@@ -2202,6 +2202,13 @@ def _add_observation_impl(
         # un-committed together, so the evidence node's metadata never
         # changes for an observation that itself was never created.
         if _ev_metadata_changed:
+            # A non-object blob read as {} above, so the dict being written
+            # REPLACES it: the write-side helper logs that and hands back the
+            # warning for this tool's `warnings` list (#3413).
+            _, _ev_replaced_warning = core._metadata_dict_for_write(
+                ev["metadata"], evidence_id, "engram_add_observation")
+            if _ev_replaced_warning:
+                result["warnings"] = result.get("warnings", []) + [_ev_replaced_warning]
             conn.execute(
                 "UPDATE nodes SET metadata = ? WHERE id = ?",
                 (json.dumps(_ev_metadata), evidence_id),
@@ -2237,7 +2244,7 @@ def _add_observation_impl(
             person_mentions = []
             claim_lower = claim.lower()
             for prow in person_rows:
-                pmeta = json.loads(prow["metadata"] or "{}")
+                pmeta = core._metadata_dict(prow["metadata"])
                 pname = pmeta.get("name", "")
                 paliases = pmeta.get("aliases", [])
                 vocab = [pname] + (paliases if isinstance(paliases, list) else [])

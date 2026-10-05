@@ -1613,7 +1613,10 @@ def _update_lesson_impl(
                 )
             })
 
-        meta = json.loads(row["metadata"] or "{}")
+        # #3413: a non-object blob is replaced by a dict on write; the helper
+        # logs it (this tool's response has no `warnings` field).
+        meta, _ = core._metadata_dict_for_write(
+            row["metadata"], node_id.strip(), "engram_update_lesson")
         if "field_traces" not in meta:
             meta["field_traces"] = {}
 
@@ -1802,7 +1805,10 @@ def _register_exemplar_impl(
         # 'instantiates'->lesson) — a third exemplar-creation surface
         # alongside this one and the initial-creation path in
         # _add_lesson_impl, neither of which routes through this hook.
-        target_meta = json.loads(target_row["metadata"] or "{}")
+        # #3413: read helper, deliberately not the write one: a non-object
+        # blob reads as {} (no support_lost), so nothing is written back and
+        # nothing on disk is replaced.
+        target_meta = core._metadata_dict(target_row["metadata"])
         if target_meta.get("support_lost") and exemplar_count > 0:
             target_meta.pop("support_lost", None)
             conn.execute(

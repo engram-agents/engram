@@ -332,8 +332,13 @@ def _add_task_impl(
                     (node_id, parent_task_id, now),
                 )
                 # Auto-promote parent to milestone scope
-                parent_meta = json.loads(parent["metadata"]) if parent["metadata"] else {}
+                parent_meta = core._metadata_dict(parent["metadata"])
                 if parent_meta.get("scope") != "milestone":
+                    # #3413: a non-object blob reads as {} and is REPLACED by
+                    # the dict written below; the helper logs it (the
+                    # engram_add_task response has no warnings field).
+                    parent_meta, _ = core._metadata_dict_for_write(
+                        parent["metadata"], parent_task_id, "engram_add_task")
                     parent_meta["scope"] = "milestone"
                     conn.execute(
                         "UPDATE nodes SET metadata = ? WHERE id = ?",
@@ -478,7 +483,11 @@ def _update_task_impl(
             return json.dumps({"error": f"'{task_id}' is not a task node (type: {task['type']})."})
 
         old_status = task["status"]
-        meta = json.loads(task["metadata"]) if task["metadata"] else {}
+        # #3413: this function ALWAYS re-dumps `meta`, so a non-object blob is
+        # replaced by a dict; the helper logs it (no warnings field on the
+        # engram_update_task response).
+        meta, _ = core._metadata_dict_for_write(
+            task["metadata"], task_id, "engram_update_task")
         scope = meta.get("scope", "routine")
 
         # Determine new importance base
@@ -869,7 +878,10 @@ def _deactivate_goal_impl(
         if not row["is_current"]:
             return json.dumps({"error": f"Node '{goal_id}' is not current (already retracted or superseded)."})
 
-        meta = json.loads(row["metadata"]) if row["metadata"] else {}
+        # #3413: deactivation always writes a dict back, so a non-object blob
+        # is replaced; logged by the helper (no warnings field on the response).
+        meta, _ = core._metadata_dict_for_write(
+            row["metadata"], goal_id, "engram_deactivate_goal")
         current_state = meta.get("lifecycle_state")
         if current_state == "paused":
             return json.dumps({"error": "goal already deactivated"})
@@ -930,7 +942,10 @@ def _activate_goal_impl(
         if not row["is_current"]:
             return json.dumps({"error": f"Node '{goal_id}' is not current (already retracted or superseded)."})
 
-        meta = json.loads(row["metadata"]) if row["metadata"] else {}
+        # #3413: read helper, not the write one: a non-object blob reads as {}
+        # (no "paused"), so the call refuses below and nothing is written or
+        # replaced.
+        meta = core._metadata_dict(row["metadata"])
         current_state = meta.get("lifecycle_state")
         if current_state != "paused":
             return json.dumps({"error": "goal is not deactivated"})

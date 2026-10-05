@@ -4856,6 +4856,78 @@ def _get_db() -> sqlite3.Connection:
     return conn
 
 
+def _metadata_dict(raw) -> dict:
+    """Return a `nodes.metadata` value as a dict, always (#3413).
+
+    Contract:
+      * str holding a JSON object -> that object, parsed.
+      * an already-parsed dict -> returned as-is (same object).
+      * None / "" / any other falsy value -> {}.
+      * invalid JSON -> {}.
+      * valid JSON that is NOT an object (`[1,2]`, `"str"`, `5`, `null`,
+        `true`, `1.5`, `""`, `[]`) -> {}   (non-object blob -> {}).
+      * any other non-str, non-dict value (a parsed list, bytes, ...) -> {}.
+        str only: bytes are not decoded, `nodes.metadata` is TEXT.
+
+    Pure: no logging. A non-object blob carries no keys a reader could use,
+    so it is not an error the read path should spam on. Every caller that
+    does `.get`, `[k]`, `in` or a write-back on parsed metadata goes through
+    this, so the bad state cannot reach a dict operation.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if not raw or not isinstance(raw, str):
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError, RecursionError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _metadata_dict_for_write(raw, node_id, tool) -> "tuple[dict, Optional[str]]":
+    """Write-side twin of `_metadata_dict` (#3413): returns (dict, warning).
+
+    A write site parses metadata, mutates it and re-dumps it. A blob that is
+    not a JSON object is treated as {} and the site then writes a DICT back;
+    replacing on-disk bytes without saying so would be a suppression, so this
+    variant says so, once, itself (no site can forget the log):
+
+      * dict / str holding a JSON object -> (that dict, None), silent.
+      * None / "" / any other falsy value -> ({}, None), silent: there was no
+        blob, so nothing carrying information is replaced.
+      * valid JSON that is not an object, invalid JSON, or a truthy non-str
+        non-dict value -> ({}, warning_text), ONE line to stderr naming the
+        node id, the blob's type and `tool`. (Invalid JSON counts as a
+        replaced non-object.)
+
+    The caller adds `warning_text` to its response's `warnings` field when the
+    tool has one. stderr, never stdout: stdout is the MCP channel.
+    """
+    if isinstance(raw, dict):
+        return raw, None
+    if not raw:
+        return {}, None
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError, RecursionError):
+            tname = "invalid JSON"
+        else:
+            if isinstance(parsed, dict):
+                return parsed, None
+            tname = "null" if parsed is None else type(parsed).__name__
+    else:
+        tname = type(raw).__name__
+    kind = tname if tname == "invalid JSON" else f"of type {tname}"
+    text = (
+        f"engram: node {node_id} metadata was {kind}, not an object; "
+        f"replaced with a dict on write (tool={tool})"
+    )
+    print(text, file=sys.stderr)
+    return {}, text
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -5516,7 +5588,11 @@ def _backfill_edit_history(conn: sqlite3.Connection):
         "SELECT id, type, metadata FROM nodes WHERE status = 'retracted'"
     ).fetchall()
     for r in retracted:
-        meta = json.loads(r["metadata"] or "{}")
+        # #3413: DB-init migration, must never crash. Reads only (edit_history
+        # rows are written, the node's metadata is NOT), so nothing on disk is
+        # replaced and the silent read helper is the right one: a write-side
+        # log here would claim a replacement that does not happen.
+        meta = _metadata_dict(r["metadata"])
         conn.execute(
             """INSERT INTO edit_history (timestamp, turn, action, node_id, node_type, details)
                VALUES (?, 0, 'retracted', ?, ?, ?)""",
@@ -7393,7 +7469,7 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                     lines.append(f"Basis: {n['logical_chain'][:200]}")
             elif ntype == "definition":
                 lines.append(f"### {n['id']} [{status_tag}]")
-                meta = json.loads(n["metadata"]) if n["metadata"] else {}
+                meta = _metadata_dict(n["metadata"])
                 term = meta.get("term", "")
                 defn = meta.get("definition", n["claim"] or "")
                 lines.append(f"Term: {term}")
@@ -7493,7 +7569,7 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 if n["logical_chain"]:
                     lines.append(f"Analysis: {n['logical_chain'][:200]}")
             elif ntype == "task":
-                meta = json.loads(n["metadata"]) if n["metadata"] else {}
+                meta = _metadata_dict(n["metadata"])
                 scope = meta.get("scope", "routine")
                 lines.append(f"### {n['id']} [{n['status'] or 'planned'}] [{scope}] [{status_tag}]")
                 lines.append(f"Task: {n['claim']}")
@@ -7510,7 +7586,7 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 for e in impl_edges:
                     lines.append(f"{e['relation'].replace('_', ' ').title()}: {e['target_id']}")
             elif ntype == "person":
-                meta = json.loads(n["metadata"]) if n["metadata"] else {}
+                meta = _metadata_dict(n["metadata"])
                 person_name = meta.get("name", "")
                 person_role = meta.get("role", "")
                 lines.append(f"### {n['id']} [{status_tag}]")
@@ -7520,7 +7596,7 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 if n["logical_chain"]:
                     lines.append(f"Background: {n['logical_chain'][:200]}")
             elif ntype == "lesson":
-                meta = json.loads(n["metadata"]) if n["metadata"] else {}
+                meta = _metadata_dict(n["metadata"])
                 lines.append(f"### {n['id']} [{conf_str}] [{status_tag}]")
                 lines.append(f"Claim: {n['claim']}")
                 nudge = meta.get("scaffolding_nudge", "")
@@ -8735,7 +8811,7 @@ def _similar_existing_matches(
                 for col in extra_columns:
                     rec[col] = r[col]
                 if extra_metadata_keys:
-                    meta = json.loads(r["metadata"]) if r["metadata"] else {}
+                    meta = _metadata_dict(r["metadata"])
                     for key in extra_metadata_keys:
                         rec[key] = meta.get(key, "")
                 matches.append(rec)
@@ -8778,7 +8854,7 @@ def _similar_existing_matches(
                         for col in extra_columns:
                             rec[col] = row[col]
                         if extra_metadata_keys:
-                            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+                            meta = _metadata_dict(row["metadata"])
                             for key in extra_metadata_keys:
                                 rec[key] = meta.get(key, "")
                 matches.append(rec)
@@ -8991,10 +9067,7 @@ def _recompute_node_confidence(conn: sqlite3.Connection, node_id: str,
             f"to recompute from (see CONFIDENCE_RECOMPUTABLE_TYPES)"
         )
 
-    try:
-        meta = json.loads(row["metadata"]) if row["metadata"] else {}
-    except (TypeError, json.JSONDecodeError):
-        meta = {}
+    meta = _metadata_dict(row["metadata"])
 
     if ntype == "axiom":
         new = 1.0
@@ -9096,10 +9169,7 @@ def _rebuild_incidents_cache() -> dict:
         index: dict[str, dict] = {}
         lesson_count: set[str] = set()
         for r in rows:
-            try:
-                meta = json.loads(r["lesson_meta"]) if r["lesson_meta"] else {}
-            except (TypeError, json.JSONDecodeError):
-                meta = {}
+            meta = _metadata_dict(r["lesson_meta"])
             index[r["incident_id"]] = {
                 "lesson_id": r["lesson_id"],
                 "lesson_claim": r["lesson_claim"],
@@ -9154,10 +9224,7 @@ def _rebuild_cornerstone_anchors_cache() -> dict:
         index: dict[str, dict] = {}
         cornerstone_count: set[str] = set()
         for r in rows:
-            try:
-                meta = json.loads(r["cs_meta"]) if r["cs_meta"] else {}
-            except (TypeError, json.JSONDecodeError):
-                meta = {}
+            meta = _metadata_dict(r["cs_meta"])
             index[r["exemplar_id"]] = {
                 "cornerstone_id": r["cornerstone_id"],
                 "cornerstone_claim": r["cs_claim"],
@@ -9261,10 +9328,7 @@ def _rebuild_principle_triggers() -> dict:
             for r in rows:
                 if r["trigger_id"] == r["principle_id"]:
                     continue
-                try:
-                    meta = json.loads(r["meta"]) if r["meta"] else {}
-                except (TypeError, json.JSONDecodeError):
-                    meta = {}
+                meta = _metadata_dict(r["meta"])
                 entry: dict = {
                     "principle_id": r["principle_id"],
                     "kind": kind,
@@ -9835,11 +9899,7 @@ def _validate_premises(
                 ).fetchone()
                 r_reason = None
                 if rrow and rrow["metadata"]:
-                    try:
-                        rmeta = json.loads(rrow["metadata"])
-                        r_reason = rmeta.get("retraction_reason")
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                    r_reason = _metadata_dict(rrow["metadata"]).get("retraction_reason")
                 retraction_info.append({
                     "retracted_by": rid,
                     "retraction_reason_excerpt": (r_reason or "")[:_WARNING_EXCERPT_LEN],

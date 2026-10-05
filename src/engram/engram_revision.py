@@ -1800,7 +1800,9 @@ def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
 
 
 def _detect_zero_support(
-    conn: sqlite3.Connection, affected_node_id: str
+    conn: sqlite3.Connection, affected_node_id: str,
+    tool: str = "engram_retract/engram_supersede",
+    warnings_out: "list | None" = None,
 ) -> "tuple[list[dict], list[dict]]":
     """Find cornerstones/lessons whose live-support state changed due to a
     cascade operation settling (retract or supersede).
@@ -1829,6 +1831,10 @@ def _detect_zero_support(
     Args:
         conn: Open DB connection with write access (caller commits).
         affected_node_id: The node that was retracted or superseded (already is_current=0).
+        tool: the calling tool's name, for the #3413 replaced-blob log line.
+        warnings_out: when given, the #3413 replaced-blob warning text is
+            appended to it (the caller adds it to its response if the tool
+            has a warning field).
 
     Returns:
         Tuple (newly_support_lost, newly_support_restored) — each a list of
@@ -1878,11 +1884,17 @@ def _detect_zero_support(
             continue  # Only count live cs/ls nodes
 
         total_live = core._count_live_exemplars(conn, cs_ls_id, cs_ls_node["type"])
-        meta = json.loads(cs_ls_node["metadata"] or "{}")
+        meta = core._metadata_dict(cs_ls_node["metadata"])
 
         if total_live == 0:
             # Mark support_lost in metadata.
             if not meta.get("support_lost"):
+                # #3413: a non-object blob reads as {} and is REPLACED by the
+                # dict written below; the write-side helper logs that.
+                meta, _replaced = core._metadata_dict_for_write(
+                    cs_ls_node["metadata"], cs_ls_id, tool)
+                if _replaced and warnings_out is not None:
+                    warnings_out.append(_replaced)
                 meta["support_lost"] = True
                 conn.execute(
                     "UPDATE nodes SET metadata = ? WHERE id = ?",
@@ -2533,12 +2545,16 @@ def _supersede_impl(
                 "SELECT metadata, trust_tier FROM nodes WHERE id = ?",
                 (old_node_id,),
             ).fetchone()
-            old_self_meta = json.loads(old_self["metadata"]) if old_self["metadata"] else {}
+            old_self_meta = core._metadata_dict(old_self["metadata"])
             if old_self_meta.get("is_self"):
                 new_row = conn.execute(
                     "SELECT metadata FROM nodes WHERE id = ?", (new_node_id,)
                 ).fetchone()
-                new_self_meta = json.loads(new_row["metadata"]) if new_row["metadata"] else {}
+                # #3413: a non-object blob on the NEW node is replaced by the
+                # dict written below; logged (the supersede response has no
+                # warnings field).
+                new_self_meta, _ = core._metadata_dict_for_write(
+                    new_row["metadata"], new_node_id, "engram_supersede")
                 new_self_meta["is_self"] = True
                 conn.execute(
                     "UPDATE nodes SET metadata = ?, trust_tier = ? WHERE id = ?",
@@ -2672,7 +2688,8 @@ def _supersede_impl(
         # the restore side; see _detect_zero_support's docstring for why
         # this write-time check is a convenience and not the load-bearing
         # discharge (that's engram_lifecycle._reflect_impl, Part 1).
-        support_lost_cs_ls, support_restored_cs_ls = _detect_zero_support(conn, old_node_id)
+        support_lost_cs_ls, support_restored_cs_ls = _detect_zero_support(
+            conn, old_node_id, tool="engram_supersede")
 
         core._log_edit(conn, "superseded", old_node_id, old["type"],
                   {"replaced_by": new_node_id, "reason": supersede_reason or None})
@@ -3158,14 +3175,20 @@ def _retract_impl(
         # self-anchors — silently breaking link_about default-targeting,
         # focus='self' emergence-scan, and trust_tier='self' assignment.
         # Detect now (before the retract flips is_current=0) so we can warn.
-        _retract_node_meta = json.loads(node["metadata"] or "{}")
+        _retract_node_meta = core._metadata_dict(node["metadata"])
         _self_anchor_retracted = (
             node["type"] == "person"
             and bool(_retract_node_meta.get("is_self"))
         )
 
         # 1. Mark the node as retracted
-        retract_meta = json.loads(node["metadata"] or "{}")
+        # #3413: a non-object blob is replaced by the dict written below;
+        # logged by the helper and added to the response's `warning` field.
+        _replaced_blob_warnings: list = []
+        retract_meta, _replaced = core._metadata_dict_for_write(
+            node["metadata"], node_id, "engram_retract")
+        if _replaced:
+            _replaced_blob_warnings.append(_replaced)
         retract_meta["retracted"] = True
         retract_meta["error_type"] = error_type
         retract_meta["retraction_reason"] = reason
@@ -3345,7 +3368,11 @@ def _retract_impl(
                 ).fetchone()
                 if not pred or not pred["is_current"]:
                     continue  # already retracted/superseded — nothing to do
-                pred_meta = json.loads(pred["metadata"] or "{}")
+                # #3413: same replacement rule for the prediction's blob.
+                pred_meta, _replaced = core._metadata_dict_for_write(
+                    pred["metadata"], pred_id, "engram_retract")
+                if _replaced:
+                    _replaced_blob_warnings.append(_replaced)
                 pred_meta["retracted"] = True
                 pred_meta["error_type"] = error_type
                 pred_meta["retraction_reason"] = (
@@ -3486,7 +3513,9 @@ def _retract_impl(
         # the restore side; see _detect_zero_support's docstring for why
         # this write-time check is a convenience and not the load-bearing
         # discharge (that's engram_lifecycle._reflect_impl, Part 1).
-        support_lost_cs_ls, support_restored_cs_ls = _detect_zero_support(conn, node_id)
+        support_lost_cs_ls, support_restored_cs_ls = _detect_zero_support(
+            conn, node_id, tool="engram_retract",
+            warnings_out=_replaced_blob_warnings)
 
         # Log retraction and taint events.
         # #2613 §3 change 3 / §5: the replacement decision is recorded HERE,
@@ -3593,6 +3622,14 @@ def _retract_impl(
                 "engram_link_about default-targeting, focus='self' emergence-scan, "
                 "and trust_tier='self' assignment are broken until a new person node "
                 "is created with is_self=True (or an existing one is promoted)."
+            )
+        if _replaced_blob_warnings:
+            # #3413: the retract response's one warning field is the singular
+            # `warning` string (set above only for a self-anchor); extend it
+            # rather than inventing a key.
+            result["warning"] = "\n".join(
+                ([result["warning"]] if result.get("warning") else [])
+                + _replaced_blob_warnings
             )
 
         # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
