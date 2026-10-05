@@ -1207,9 +1207,11 @@ class _ProbeBranchFixture(unittest.TestCase):
                 sub_state=self.FAKE_SUB_STATE,
             )
 
-    def _run(self, timeout: float = 10.0) -> subprocess.CompletedProcess:
+    def _run(self, timeout: float = 10.0, extra_env: dict | None = None) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         env["ENGRAM_HOME"] = str(self.engram_home)
+        if extra_env:
+            env.update(extra_env)
         if self.FAKE_SYSTEMCTL_MODE is not None:
             env["PATH"] = f"{self._fake_systemctl_dir}:{env.get('PATH', '')}"
         return subprocess.run(
@@ -1755,7 +1757,8 @@ class TestBranch3BlockingIO(_ProbeBranchFixture):
     @unittest.skipUnless(
         _full_backlog_connect_raises_blocking_io(),
         "needs a full AF_UNIX accept backlog to raise BlockingIOError on a "
-        "non-blocking connect (not observed on macOS: connects succeed or get ECONNREFUSED)",
+        "non-blocking connect (not observed on macOS: connects succeed or get ECONNREFUSED); "
+        "the injected cell (TestBranch3BlockingIOInjected) covers this branch here",
     )
     def test_logs_branch3_line_with_blocking_io_error(self):
         result = self._run()
@@ -1779,6 +1782,154 @@ class TestBranch3BlockingIO(_ProbeBranchFixture):
             "branch 3 (live process, full accept backlog) must NOT relaunch any more",
         )
         self.assertIsNone(self.live_proc.poll())
+
+
+# Injection shim for TestBranch3BlockingIOInjected (#3333). Python imports
+# `sitecustomize` at startup from PYTHONPATH. The shim is inert unless
+# ENGRAM_TEST_FORCE_PROBE_EXC names an exception AND this process is the
+# hook's liveness probe: started as `python -c <code>` (sys.orig_argv[1] ==
+# "-c") whose code contains the probe's own `s.settimeout(2)`. The other
+# `-c` call in the script (the socket-holder resolver) lacks that text, and
+# the relaunch is `python <script>`, so neither is affected.
+_PROBE_INJECTION_SITECUSTOMIZE = """\
+import os, sys
+
+_exc = os.environ.get("ENGRAM_TEST_FORCE_PROBE_EXC")
+_argv = getattr(sys, "orig_argv", [])
+if (
+    _exc == "BlockingIOError"
+    and len(_argv) >= 3
+    and _argv[1] == "-c"
+    and "s.settimeout(2)" in _argv[2]
+):
+    import errno
+    import socket
+
+    def _forced_connect(self, address):
+        raise BlockingIOError(errno.EAGAIN, "injected: resource temporarily unavailable")
+
+    socket.socket.connect = _forced_connect
+"""
+
+
+@unittest.skipIf(
+    sys.version_info < (3, 10),
+    "the injection shim needs sys.orig_argv (Python >= 3.10)",
+)
+class TestBranch3BlockingIOInjected(_ProbeBranchFixture):
+    """#3333: the BlockingIOError branch-3 log path, exercised on EVERY host.
+
+    CONTRACT. A live pid in PID_PATH + a live listening socket at SOCKET_PATH
+    + the probe's python process made to raise BlockingIOError from
+    socket.connect -> the script exits 0; the log holds the branch-3 line
+    naming BlockingIOError with the live pid and the real cgroup state; none of
+    `probe: no pidfile`, `but process not running`, `probe: healthy` appears;
+    the live process is NOT relaunched or killed. The injection reaches the
+    liveness probe ONLY (not the relaunch python nor any other `-c` call).
+
+    HONEST LABEL. This cell INJECTS the exception (a sitecustomize shim on
+    PYTHONPATH). It proves the script's capture-and-log path for that class
+    name and the no-relaunch outcome. It does NOT prove what any OS does:
+    macOS never raises BlockingIOError for a full AF_UNIX backlog, and
+    TestBranch3BlockingIO (a real listen(0) socket with an exhausted backlog)
+    remains the realistic Linux cell.
+
+    Skipped below Python 3.10: the shim keys on sys.orig_argv, so it is inert
+    there and the cells would fail as if the hook were broken."""
+
+    def setUp(self):
+        super().setUp()
+        self.live_proc = _spawn_sleeper(seconds=8.0)
+        self.pid_path.write_text(str(self.live_proc.pid))
+        self.addCleanup(self._kill_live_proc)
+
+        # A genuinely listening socket: without the injection the probe
+        # connects fine and the script logs `probe: healthy`.
+        self.srv = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+        self.srv.bind(str(self.socket_path))
+        self.srv.listen(1)
+        self.addCleanup(self.srv.close)
+
+        self.shim_dir = self.tmp / "inject"
+        self.shim_dir.mkdir()
+        (self.shim_dir / "sitecustomize.py").write_text(_PROBE_INJECTION_SITECUSTOMIZE)
+
+    def _kill_live_proc(self):
+        if self.live_proc.poll() is None:
+            self.live_proc.terminate()
+            self.live_proc.wait(timeout=2)
+
+    def _inject_env(self) -> dict:
+        existing = os.environ.get("PYTHONPATH")
+        return {
+            "PYTHONPATH": f"{self.shim_dir}{os.pathsep}{existing}" if existing else str(self.shim_dir),
+            "ENGRAM_TEST_FORCE_PROBE_EXC": "BlockingIOError",
+        }
+
+    def test_logs_branch3_line_with_injected_blocking_io_error(self):
+        result = self._run(extra_env=self._inject_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+
+        expected_cgroup = _expected_cgroup_state_for_pid(self.live_proc.pid)
+        self.assertRegex(
+            content,
+            _branch_regex(3, pid=self.live_proc.pid, exc_name="BlockingIOError", cgroup=expected_cgroup),
+        )
+        self.assertNotIn("probe: no pidfile", content)
+        self.assertNotIn("but process not running", content)
+        self.assertNotIn("probe: healthy", content)
+
+    def test_injected_branch3_does_not_relaunch_or_kill(self):
+        result = self._run(extra_env=self._inject_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+        self.assertRegex(
+            content,
+            _branch_regex(
+                3,
+                pid=self.live_proc.pid,
+                exc_name="BlockingIOError",
+                cgroup=_expected_cgroup_state_for_pid(self.live_proc.pid),
+            ),
+            "this cell ties 'no relaunch' to 'the probe actually failed': a healthy "
+            "probe also does not relaunch, so the branch-3 line must be present",
+        )
+        self.assertTrue(
+            self._wait_briefly_for_no_relaunch(),
+            "branch 3 (live process, probe raises BlockingIOError) must NOT relaunch",
+        )
+        self.assertIsNone(self.live_proc.poll())
+
+    def test_shim_is_scoped_to_the_probe_only(self):
+        """C2: with the env set, only the probe python is affected. The shim
+        must patch a `-c` run containing the probe's settimeout(2) text and
+        leave an unrelated `-c` run and a script-file run (the relaunch form)
+        untouched."""
+        # Never accept()ed, so widen the backlog: two un-injected connects
+        # must both succeed (listen(1) refuses the second on macOS).
+        self.srv.listen(8)
+        env = dict(os.environ)
+        env.update(self._inject_env())
+        probe_like = (
+            "import socket, sys\n"
+            "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+            "s.settimeout(2)\n"
+            f"try:\n    s.connect({str(self.socket_path)!r})\n    print('connected')\n"
+            "except Exception as e:\n    print(type(e).__name__)\n"
+        )
+        other_c = probe_like.replace("s.settimeout(2)", "s.settimeout(3)")
+        script_file = self.tmp / "relaunch_like.py"
+        script_file.write_text(probe_like)
+
+        def run(args):
+            return subprocess.run(
+                [sys.executable, *args], env=env, capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+
+        self.assertEqual(run(["-c", probe_like]), "BlockingIOError")
+        self.assertEqual(run(["-c", other_c]), "connected")
+        self.assertEqual(run([str(script_file)]), "connected")
 
 
 # ===========================================================================
