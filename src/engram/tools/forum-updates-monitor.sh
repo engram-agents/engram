@@ -470,9 +470,62 @@ _engaged() {
 # suppressed line (swallowed forever, above). It also only ever CLOSES a
 # warning the operator has already received.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# curl exit code + time_total on the failure lines (#3441)
+# 2026-10-05 ~22:05Z a "forum unreachable" announce fired while the forum's own
+# log showed every poll answered 200 on rhythm: the failure was client-side,
+# and the one datum that classifies it — curl's exit code — had been thrown
+# away by `if ! RESP="$(curl ...)"`. _curl_fetch keeps it, plus time_total, so
+# the edge line can say `curl 28: timed out, 10.00s` (28 = --max-time hit,
+# 7 = connect failed, 6 = resolve failed, 52 = empty reply, 56 = recv failure,
+# 35 = TLS handshake, 22 = HTTP >= 400 under --fail).
+#
+# Shell-semantics notes: the script runs under `set -u` only (no -e, no
+# pipefail at this level), so reading $? straight after the assignment is safe.
+# The status is captured from the ASSIGNMENT, never from inside an `if !`
+# (where $? is already negated). time_total rides on the same stdout via
+# `-w '\n%{time_total}'` and is split off the END so it can never reach the
+# parsed body: RESP is exactly what curl returned before the write-out.
+# Only the OUTPUT of the failure lines changes: cadence, --max-time, retry,
+# seed and cursor handling are untouched.
+# Sets RESP, _CURL_RC, _CURL_T; returns curl's own status.
+# ---------------------------------------------------------------------------
+_curl_fetch() {
+    local _out
+    _out="$(curl -s --fail --max-time "$1" -w '\n%{time_total}' "$2" 2>/dev/null)"
+    _CURL_RC=$?
+    case "$_out" in
+        *$'\n'*) RESP="${_out%$'\n'*}"; _CURL_T="${_out##*$'\n'}" ;;
+        *)       RESP="$_out"; _CURL_T="" ;;
+    esac
+    [ "$_CURL_RC" -eq 0 ] || RESP=""
+    return "$_CURL_RC"
+}
+
+# "curl 28: timed out, 10.00s" — unknown codes say `error`; a missing or
+# non-numeric time_total prints `?s` rather than a made-up number.
+_curl_detail() {
+    local _m _t
+    case "$_CURL_RC" in
+        6)  _m="could not resolve host" ;;
+        7)  _m="connect failed" ;;
+        22) _m="HTTP error" ;;
+        28) _m="timed out" ;;
+        35) _m="TLS handshake failed" ;;
+        52) _m="empty reply" ;;
+        56) _m="receive failure" ;;
+        *)  _m="error" ;;
+    esac
+    case "$_CURL_T" in
+        ''|*[!0-9.]*) _t="?s" ;;
+        *) _t="$(LC_ALL=C printf '%.2fs' "$_CURL_T" 2>/dev/null)" || _t="?s" ;;
+    esac
+    printf 'curl %s: %s, %s' "$_CURL_RC" "$_m" "$_t"
+}
+
 _SEED_ANNOUNCED=0
 while true; do
-    if RESP="$(curl -s --fail --max-time 60 "$URL_BASE&since=0" 2>/dev/null)" \
+    if _curl_fetch 60 "$URL_BASE&since=0" \
        && _seed="$(printf '%s' "$RESP" | as_of)"; then
         printf '%s\n' "$_seed" > "$CURSOR"
         if [ "$_SEED_ANNOUNCED" = 1 ]; then
@@ -483,7 +536,9 @@ while true; do
     # Note the latch is set INSIDE the not-engaged branch, never beside it:
     # see the defer-not-swallow paragraph above.
     if [ "$_SEED_ANNOUNCED" = 0 ] && ! _engaged; then
-        echo "⚠️  forum-updates-monitor.sh: armed, but cannot seed from the forum — not yet seeded and not receiving; will report when it can"
+        _seed_why=""
+        [ "$_CURL_RC" -ne 0 ] && _seed_why=" (last attempt: $(_curl_detail))"
+        echo "⚠️  forum-updates-monitor.sh: armed, but cannot seed from the forum — not yet seeded and not receiving; will report when it can${_seed_why}"
         _SEED_ANNOUNCED=1
     fi
     sleep "$POLL_SECONDS"
@@ -524,9 +579,9 @@ while true; do
     # #3062: the `continue` itself is unchanged (cursor still preserved,
     # exactly as before) — only the EDGE is now announced, once on entry and
     # once on recovery, via $_FORUM_REACHABLE (declared above the loop).
-    if ! RESP="$(curl -s --fail --max-time 60 "$URL_BASE&since=$_cur" 2>/dev/null)"; then
+    if ! _curl_fetch 60 "$URL_BASE&since=$_cur"; then
         if [ "$_FORUM_REACHABLE" = 1 ]; then
-            echo "⚠️  forum-updates-monitor.sh: forum unreachable — still armed, not receiving; will report when it returns"
+            echo "⚠️  forum-updates-monitor.sh: forum unreachable ($(_curl_detail)) — still armed, not receiving; will report when it returns"
             _FORUM_REACHABLE=0
         fi
         continue

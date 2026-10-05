@@ -1,0 +1,375 @@
+"""Tests for #3441 — the forum monitors' "forum unreachable" edge line must
+carry curl's exit code (with its meaning) and time_total.
+
+Background: on 2026-10-05 ~22:05Z forum-mention-monitor.sh announced "forum
+unreachable" and recovered a minute later, while the forum server's log showed
+every poll from that client arriving on rhythm and answered 200. The failure
+was client-side, and the monitor had thrown away the one datum that classifies
+it: curl's exit code (28 = --max-time exceeded, 7 = connect failed, ...).
+
+Contract (stated BEFORE the fix, see the issue):
+  1. On the transition INTO unreachable the single edge line contains
+     `curl <rc>: <meaning>` and time_total with units (`10.00s`). The existing
+     prefix ("forum unreachable") and the "— still armed, not receiving; will
+     report when it returns" tail stay byte-identical.
+  2. Edge discipline (#3062/#3067) is unchanged: exactly ONE such line per
+     transition, never per cycle; the recovery line prints once.
+  3. The write-out used to capture time_total must never leak into the parsed
+     body on success.
+  4. The seed path's "cannot seed" line carries the same datum when curl
+     itself failed.
+
+curl is replaced by a stub on PATH (a Python script) that returns a scripted
+(rc, body) per call and honours `-w '\\n%{time_total}'` the way real curl does
+(including on failure, where real curl still prints the write-out).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_UPDATES_SCRIPT = _REPO_ROOT / "src" / "engram" / "tools" / "forum-updates-monitor.sh"
+_MENTION_SCRIPT = _REPO_ROOT / "src" / "engram" / "tools" / "forum-mention-monitor.sh"
+
+_POLL = "0.2"
+_TAIL = " — still armed, not receiving; will report when it returns"
+
+_UPDATES_QUIET = json.dumps({"updates": [], "as_of": 7095})
+_MENTIONS_QUIET = json.dumps({"mentions": []})
+
+_STUB = """#!{python}
+import sys, json, os
+state = {state!r}
+script = json.load(open({script!r}))
+try:
+    n = int(open(state).read())
+except Exception:
+    n = 0
+open(state, "w").write(str(n + 1))
+rc, body = script[min(n, len(script) - 1)]
+fmt = None
+args = sys.argv[1:]
+for i, a in enumerate(args):
+    if a == "-w" and i + 1 < len(args):
+        fmt = args[i + 1]
+out = ""
+if rc == 0:
+    out += body
+if fmt is not None:
+    out += fmt.replace("%{{time_total}}", "10.001234").replace("\\\\n", "\\n")
+sys.stdout.write(out)
+sys.exit(rc)
+"""
+
+
+class _Run:
+    def __init__(self, argv, env, tmp_path, calls_file):
+        self.lines: list[str] = []
+        self._calls = calls_file
+        self._proc = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env
+        )
+        self._t = threading.Thread(target=self._drain, daemon=True)
+        self._t.start()
+
+    def _drain(self):
+        for line in self._proc.stdout:
+            self.lines.append(line.rstrip("\n"))
+
+    def calls(self) -> int:
+        try:
+            return int(self._calls.read_text())
+        except Exception:
+            return 0
+
+    def wait_calls(self, n: int, timeout: float = 10.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.calls() >= n:
+                return
+            time.sleep(0.02)
+        raise AssertionError(f"curl stub saw {self.calls()} calls, expected >= {n}")
+
+    def stop(self):
+        self._proc.terminate()
+        try:
+            self._proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            self._proc.wait(timeout=5)
+        self._t.join(timeout=2)
+        return self.lines
+
+
+@pytest.fixture
+def launch(tmp_path):
+    runs: list[_Run] = []
+
+    def _go(which: str, script: list[tuple[int, str]]):
+        home = tmp_path / "home"
+        (home / ".engram").mkdir(parents=True)
+        (home / ".engram" / "config.json").write_text(
+            json.dumps({"agent_name": "testagent",
+                        "forum": {"url": "http://127.0.0.1:9"}})
+        )
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        script_file = tmp_path / "script.json"
+        script_file.write_text(json.dumps(script))
+        calls = tmp_path / "calls"
+        stub = bindir / "curl"
+        stub.write_text(_STUB.format(python=sys.executable, state=str(calls),
+                                     script=str(script_file)))
+        stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+        if which == "updates":
+            env["FORUM_UPDATES_NO_REAP"] = "1"
+            env["FORUM_UPDATES_CURSOR_FILE"] = str(tmp_path / "cursor")
+            env["FORUM_UPDATES_POLL_SECONDS"] = _POLL
+            argv = ["bash", str(_UPDATES_SCRIPT)]
+        else:
+            env["FORUM_MENTION_NO_REAP"] = "1"
+            env["FORUM_MENTION_SEEN_FILE"] = str(tmp_path / "seen")
+            env["FORUM_MENTION_POLL_SECONDS"] = _POLL
+            env["FORUM_MENTION_COALESCE_SECONDS"] = "1"
+            argv = ["bash", str(_MENTION_SCRIPT)]
+        r = _Run(argv, env, tmp_path, calls)
+        runs.append(r)
+        return r
+
+    yield _go
+    for r in runs:
+        r.stop()
+
+
+_CASES = [
+    (28, "timed out"),
+    (7, "connect failed"),
+    (22, "HTTP error"),
+]
+
+_MONITORS = [
+    ("updates", "forum-updates-monitor.sh", _UPDATES_QUIET),
+    ("mention", "forum-mention-monitor.sh", _MENTIONS_QUIET),
+]
+
+
+@pytest.mark.parametrize("rc,meaning", _CASES)
+@pytest.mark.parametrize("which,name,quiet", _MONITORS)
+def test_edge_line_carries_rc_meaning_and_time(launch, which, name, quiet, rc, meaning):
+    """Poll-loop edge: one line, with `curl <rc>: <meaning>` and `10.00s`, the
+    byte-identical tail, once across 4 failing cycles; recovery prints once."""
+    script = [(0, quiet), (0, quiet)] + [(rc, "")] * 4 + [(0, quiet)] * 3
+    r = launch(which, script)
+    r.wait_calls(9)
+    lines = r.stop()
+    unreachable = [l for l in lines if "forum unreachable" in l]
+    assert len(unreachable) == 1, lines
+    line = unreachable[0]
+    assert f"curl {rc}: {meaning}" in line, line
+    assert "10.00s" in line, line
+    assert line.endswith(_TAIL), line
+    assert line.startswith(f"⚠️  {name}: forum unreachable"), line
+    assert "\n" not in line
+    assert len([l for l in lines if "forum reachable again" in l]) == 1, lines
+
+
+@pytest.mark.parametrize("which,name,quiet", _MONITORS)
+def test_unknown_code_prints_generic_meaning(launch, which, name, quiet):
+    script = [(0, quiet), (0, quiet)] + [(99, "")] * 3 + [(0, quiet)] * 2
+    r = launch(which, script)
+    r.wait_calls(6)
+    lines = r.stop()
+    unreachable = [l for l in lines if "forum unreachable" in l]
+    assert len(unreachable) == 1, lines
+    assert "curl 99: error" in unreachable[0], unreachable[0]
+
+
+@pytest.mark.parametrize("which,name,quiet", _MONITORS)
+def test_seed_failure_line_carries_rc_and_time(launch, which, name, quiet):
+    """Seed path: the 'cannot seed' line names curl's rc when curl failed, and
+    still fires exactly once across repeated failed seed attempts."""
+    script = [(28, "")] * 3 + [(0, quiet)] * 3
+    r = launch(which, script)
+    r.wait_calls(5)
+    lines = r.stop()
+    seed = [l for l in lines if "not yet seeded" in l]
+    assert len(seed) == 1, lines
+    assert "curl 28: timed out" in seed[0], seed[0]
+    assert "10.00s" in seed[0], seed[0]
+    assert "cannot seed from the forum — not yet seeded and not receiving" in seed[0]
+    assert len([l for l in lines if "seeded from the forum" in l]) == 1, lines
+
+
+def test_updates_success_path_body_not_polluted(launch, tmp_path):
+    """The time_total write-out must not leak into the parsed body: a real
+    update still parses, is emitted, and the cursor advances to its as_of."""
+    update = json.dumps(
+        {"as_of": 5, "updates": [{"seq": 1, "kind": "dm", "sender": "a", "body": "hi"}]}
+    )
+    script = [(0, json.dumps({"updates": [], "as_of": 0})), (0, update),
+              (0, '{"updates":[],"as_of":5}')]
+    r = launch("updates", script)
+    r.wait_calls(3)
+    deadline = time.monotonic() + 5
+    cursor = tmp_path / "cursor"
+    while time.monotonic() < deadline:
+        if cursor.is_file() and cursor.read_text().strip() == "5":
+            break
+        time.sleep(0.02)
+    lines = r.stop()
+    assert cursor.read_text().strip() == "5"
+    assert any("hi" in l for l in lines), lines
+    assert not [l for l in lines if "unreachable" in l], lines
+
+
+_MENTION_LINE = "📣 1 new @-mention across 1 thread: #3(×1)"
+_UPDATE_LINE = "✉️  new DM from a: hi"
+
+
+def _wait_until(pred, timeout: float = 8.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return pred()
+
+
+def test_mention_success_path_body_not_polluted(launch, tmp_path):
+    """Tightened in round 2. The round-1 version waited on `"PollutionCheckThread"
+    in l or "mention" in l.lower()`. The title clause can never match (the
+    emitted line carries only `#<thread_id>(xN)`), and the second clause matches
+    ANY line containing "mention", including a `forum-mention-monitor.sh:
+    forum unreachable` warning -- so the wait could end on the wrong line. Its
+    final check was `seen == ["11"] or "11" in seen_text`, whose substring arm
+    passes for "110", "111", "5\\n11", i.e. a polluted file. Now: wait for the
+    exact emitted line, require it to be the ONLY line, and require the seen
+    file to be exactly the one id."""
+    mention = json.dumps({"mentions": [
+        {"post_id": 11, "thread_id": 3, "thread_title": "PollutionCheckThread"}]})
+    script = [(0, _MENTIONS_QUIET), (0, mention)]
+    r = launch("mention", script)
+    assert _wait_until(lambda: any(l == _MENTION_LINE for l in r.lines)), r.lines
+    lines = r.stop()
+    assert len(lines) == 1, lines
+    assert lines == [_MENTION_LINE], lines
+    assert (tmp_path / "seen").read_text() == "11\tPollutionCheckThread\n"
+    assert not [l for l in lines if "unreachable" in l], lines
+
+
+# ---------------------------------------------------------------------------
+# Round 2 (#3442 review): the ONE behaviour shift _curl_fetch introduces.
+#
+# `RESP="$(curl ...)"` stripped the body's trailing newlines. _curl_fetch appends
+# `-w '\n%{time_total}'` and splits at the LAST newline, so on success RESP now
+# KEEPS the body's own trailing newline. These tests pin that every downstream
+# consumer (emit / as_of / ids, all JSON parsers fed via `printf '%s'`) treats a
+# newline-terminated body exactly like a bare one, and that an empty or
+# newline-only 200 body is still just a skipped cycle: no output line, no state
+# movement, no "unreachable" announce, loop still alive.
+# ---------------------------------------------------------------------------
+_UPDATE = json.dumps(
+    {"as_of": 5, "updates": [{"seq": 1, "kind": "dm", "sender": "a", "body": "hi"}]}
+)
+_MENTION = json.dumps({"mentions": [
+    {"post_id": 11, "thread_id": 3, "thread_title": "NewlineThread"}]})
+
+
+def _updates_run(launch, tmp_path, script):
+    """Run the updates monitor until the cursor reaches 5, return (lines, cursor)."""
+    r = launch("updates", script)
+    cursor = tmp_path / "cursor"
+    assert _wait_until(lambda: cursor.is_file() and cursor.read_text().strip() == "5"), (
+        r.lines, cursor.read_text() if cursor.is_file() else None)
+    return r.stop(), cursor.read_text().strip()
+
+
+def _mention_run(launch, tmp_path, script):
+    r = launch("mention", script)
+    assert _wait_until(lambda: any(l == _MENTION_LINE for l in r.lines)), r.lines
+    lines = r.stop()
+    return lines, (tmp_path / "seen").read_text()
+
+
+_UPDATES_SEED = (0, json.dumps({"updates": [], "as_of": 0}))
+_UPDATES_TAIL = (0, '{"updates":[],"as_of":5}')
+
+
+@pytest.mark.parametrize("trailing", ["", "\n"], ids=["bare", "trailing-newline"])
+def test_updates_trailing_newline_body_processed_like_bare(launch, tmp_path, trailing):
+    lines, cursor = _updates_run(
+        launch, tmp_path, [_UPDATES_SEED, (0, _UPDATE + trailing), _UPDATES_TAIL])
+    assert len(lines) == 1, lines
+    assert lines == [_UPDATE_LINE], lines
+    assert cursor == "5"
+
+
+@pytest.mark.parametrize("trailing", ["", "\n"], ids=["bare", "trailing-newline"])
+def test_mention_trailing_newline_body_processed_like_bare(launch, tmp_path, trailing):
+    lines, seen = _mention_run(
+        launch, tmp_path, [(0, _MENTIONS_QUIET), (0, _MENTION + trailing)])
+    assert len(lines) == 1, lines
+    assert lines == [_MENTION_LINE], lines
+    assert seen == "11\tNewlineThread\n"
+
+
+@pytest.mark.parametrize("bad", ["", "\n", "\n\n"], ids=["empty", "newline", "two-newlines"])
+def test_updates_empty_or_newline_only_200_is_a_skipped_cycle(launch, tmp_path, bad):
+    """Unchanged-by-the-PR behaviour (expected to pass at base too): an empty /
+    newline-only 200 is a window the monitor could not read -> no output, cursor
+    not moved by that cycle, no `unreachable`; the next good poll still lands."""
+    lines, cursor = _updates_run(
+        launch, tmp_path, [_UPDATES_SEED, (0, bad), (0, _UPDATE), _UPDATES_TAIL])
+    assert len(lines) == 1, lines
+    assert lines == [_UPDATE_LINE], lines
+    assert cursor == "5"
+
+
+@pytest.mark.parametrize("bad", ["", "\n", "\n\n"], ids=["empty", "newline", "two-newlines"])
+def test_mention_empty_or_newline_only_200_is_a_skipped_cycle(launch, tmp_path, bad):
+    """Same, for the mention monitor: `$SEEN` is preserved (not clobbered empty)
+    and the next good poll's mention is still reported exactly once."""
+    lines, seen = _mention_run(
+        launch, tmp_path, [(0, _MENTIONS_QUIET), (0, bad), (0, _MENTION)])
+    assert len(lines) == 1, lines
+    assert lines == [_MENTION_LINE], lines
+    assert seen == "11\tNewlineThread\n"
+
+
+@pytest.mark.parametrize("which,name,quiet", _MONITORS)
+def test_seed_200_with_unusable_body_gets_no_curl_suffix(launch, which, name, quiet):
+    """The ` (last attempt: curl ...)` suffix is for curl failures only. A 200
+    whose body cannot be parsed (curl rc 0) must print the bare 'cannot seed'
+    line -- blaming curl for a body problem would send the operator the wrong
+    way -- whereas a curl failure (rc 28) on the same path prints it."""
+    r = launch(which, [(0, "<html>maintenance</html>")] * 3 + [(0, quiet)] * 3)
+    r.wait_calls(5)
+    lines = r.stop()
+    seed = [l for l in lines if "cannot seed" in l]
+    assert len(seed) == 1, lines
+    assert seed[0].endswith("will report when it can"), seed[0]
+    assert "last attempt" not in seed[0] and "curl" not in seed[0], seed[0]
+
+
+@pytest.mark.parametrize("which,name,quiet", _MONITORS)
+def test_seed_curl_failure_gets_the_suffix(launch, which, name, quiet):
+    """Counterpart of the above: rc 28 on the seed path DOES carry the suffix."""
+    r = launch(which, [(28, "")] * 3 + [(0, quiet)] * 3)
+    r.wait_calls(5)
+    lines = r.stop()
+    seed = [l for l in lines if "cannot seed" in l]
+    assert len(seed) == 1, lines
+    assert seed[0].endswith(" (last attempt: curl 28: timed out, 10.00s)"), seed[0]
