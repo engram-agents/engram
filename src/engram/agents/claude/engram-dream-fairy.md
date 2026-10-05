@@ -116,21 +116,27 @@ Eleven well-supported categories you scan for (numbered 1–9, 11 and 12 — 10 
 
    **Inline methodology:**
    1. List open tasks: retrieve all `tk_*` nodes via `engram_list`. Inspect each for status; keep only `active`, `planned`, `blocked` statuses.
-   2. For each open task, extract GitHub references from the claim text using this pattern: `(?:(?:PR|pull request|issue|closes?)\s*#(\d+)|(?<!\w)#(\d+)(?!\w))`. Extract all candidate numbers.
-   3. For each reference number, run:
+   2. For each open task, extract GitHub references from the claim text. **Only repo-qualified `owner/repo#N` references are candidates** — a bare `#N` has no repo, and `gh` silently resolves it against whichever repo happens to be the current checkout, so a same-numbered PR/issue in the WRONG repo can read as MERGED/CLOSED with no error (alpha#3188, #3418, #3427). The extraction pattern below matches only the qualified shape, so a bare `#N` (including `PR #N`, `issue #N`, `closes #N`) is structurally unmatched, never a closure candidate. Each `gh` call takes `--repo` from the reference itself.
+   3. For each extracted reference, run (claim text on stdin). The first `grep` has a left boundary — the ref must start the line or follow a character that cannot be part of a path/ref — so a longer path like `a/b/c#5` is not mis-read as `b/c#5`; `sed` strips the boundary character. Each `gh` call takes `</dev/null` because it sits inside `while read` and would otherwise consume the loop's stdin. Each output line carries the **kind** (`pr` / `issue`) because an unmerged-closed PR also prints `CLOSED`:
       ```bash
-      # Run from your project-repo checkout (cwd's gh default), or add --repo OWNER/REPO:
-      gh pr view N --json state,mergedAt 2>/dev/null
-      gh issue view N --json state,closedAt 2>/dev/null
+      grep -oE '(^|[^A-Za-z0-9_./-])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+' | sed -E 's/^[^A-Za-z0-9_.-]//' | sort -u | while read -r ref; do
+        repo="${ref%#*}"
+        n="${ref#*#}"
+        if state=$(gh pr view "$n" --repo "$repo" --json state -q .state </dev/null 2>/dev/null); then kind=pr
+        elif state=$(gh issue view "$n" --repo "$repo" --json state -q .state </dev/null 2>/dev/null); then kind=issue
+        else kind=-; state=UNKNOWN
+        fi
+        echo "$repo#$n $kind $state"
+      done
       ```
-      A PR returning `"state":"MERGED"` or an issue returning `"state":"CLOSED"` is an externally-resolved reference. If `gh` returns an error (non-existent number), treat as `UNKNOWN` — do not flag.
-   4. Flag any task whose claim references ≥1 MERGED/CLOSED artifact AND whose task status is not `done`/`abandoned`.
+      Output lines: `owner/repo#N pr MERGED`, `owner/repo#N pr CLOSED`, `owner/repo#N pr OPEN`, `owner/repo#N issue CLOSED`, `owner/repo#N issue OPEN`, `owner/repo#N - UNKNOWN`. **Only `pr MERGED` or `issue CLOSED` makes a closure candidate. `pr CLOSED` (closed without merging) is reported, never a closure** — an abandoned PR is not an externally-resolved task. If `gh` errors (non-existent number, or a non-GitHub string such as a `docs/foo.md#12` path anchor), the line is `- UNKNOWN` — do not flag.
+   4. Flag any task whose claim references ≥1 closure-candidate artifact (`pr MERGED` or `issue CLOSED` only; never `pr CLOSED`) AND whose task status is not `done`/`abandoned`.
 
-   **Scope guard:** Only flag if the external artifact's close/merge date predates the current scan. Do not flag if the task claim uses safe-reference forms (e.g., `#N` in a context that's clearly not a closing reference — exercise judgment; if uncertain, flag conservatively and note the ambiguity). Limit to the top-10 most stale by task creation date (oldest first).
+   **Scope guard:** Only flag if the external artifact's close/merge date predates the current scan. Do not flag if the matched `owner/repo#N` sits in a context that's clearly not a closing reference — exercise judgment; if uncertain, flag conservatively and note the ambiguity. Limit to the top-10 most stale by task creation date (oldest first).
 
-   **Snapshot contract:** include `status`, `claim`, and the live `gh` output for each flagged reference in `key_neighbors` (use an extra field `external_check` on the snapshot if needed — the snapshot shape is extensible). Suggest action: `"close task and mark done — external reference #N <state>"` (this routes to `task_closures` bucket in the dream-master).
+   **Snapshot contract:** include `status`, `claim`, and the live `gh` output for each flagged reference in `key_neighbors` (use an extra field `external_check` on the snapshot if needed — the snapshot shape is extensible). Suggest action: `"close task and mark done — external reference owner/repo#N <state>"` (this routes to `task_closures` bucket in the dream-master).
 
-   **Important `gh` guard:** Only extract numbers that appear as GitHub PR/issue references in context (preceded by "PR", "issue", "closes", "#" in a merge/PR context). Do NOT blindly flag every `#N` in a claim — forum post IDs, GitHub Projects IDs, and arbitrary numbers collide with real PR/issue numbers. When in doubt, note ambiguity rather than silently skip or silently flag.
+   **Important `gh` guard:** Only repo-qualified `owner/repo#N` references are ever checked, and every `gh` call carries `--repo` from the reference. A bare `#N` is never a closure candidate and never produces a suggestion, not even a conservative one. You MAY mention a bare `#N` you noticed in a task claim as an ambiguous reference in your report prose (a note that the task cites an unqualified number), but never as a `task_closures` suggestion and never checked against `gh`. Forum post IDs, GitHub Projects IDs, and arbitrary numbers collide with real PR/issue numbers in whichever repo the cwd happens to be; the qualified-only pattern is what keeps them out.
 
 9. **Cornerstone auto-load surface coverage gaps.** No server-side pattern — compose inline using `Bash` + read-only MCP tools.
 
@@ -352,7 +358,7 @@ Use this format:
 ... or "None this scan."
 
 ## Category 8 — Open tasks with stale external references
-- [tk_XXXX] (verified) status=<active|planned|blocked> — claim references #N (<MERGED|CLOSED> as of <date>) — suggested action: close task and mark done — external reference #N <state>.
+- [tk_XXXX] (verified) status=<active|planned|blocked> — claim references owner/repo#N (<pr MERGED|issue CLOSED> as of <date>; always repo-qualified, never a bare `#N`; an unmerged `pr CLOSED` is never listed here) — suggested action: close task and mark done — external reference owner/repo#N <state>.
 ... or "None this scan."
 
 ## Category 11 — Cornerstones/lessons with support_lost
