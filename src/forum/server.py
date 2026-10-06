@@ -4531,6 +4531,10 @@ def _configure_gate_github_identity(data_dir: str, environ=None) -> str:
     gh login. A missing token never stops the server from starting. Called from
     ``main()`` only, never from ``create_app()``, so tests and the agent CLI keep
     the default (inherit-the-environment) behaviour.
+
+    CALL ONCE per process: with ``environ`` None / ``os.environ`` this removes
+    ``GH_TOKEN`` from the process environment after the gate captured it, so a second
+    call would see no token and leave the gate and the board with no identity.
     """
     config_dir = os.path.join(data_dir, "gh-config")
     gate = _load_baton_gate()
@@ -4545,17 +4549,51 @@ def _configure_gate_github_identity(data_dir: str, environ=None) -> str:
               file=sys.stderr)
         if gate is not None:
             gate.configure_service_github_identity(environ=environ, config_dir=None)
+            _adopt_gate_identity(gate, environ)
         return config_dir
     if gate is None:
-        print("[forum] baton gate module unavailable -- gate-checked flips will refuse.",
+        # Fail closed here too: the board's PR-state read must not fall back to
+        # the service user's ambient gh login when the gate cannot be loaded.
+        board_projects.configure_gh_identity(_gate_unavailable_provider)
+        print("[forum] baton gate module unavailable -- gate-checked flips will refuse "
+              "and the board's PR-state read will return unknown (#3509).",
               file=sys.stderr)
         return config_dir
     have_identity = gate.configure_service_github_identity(environ=environ, config_dir=config_dir)
+    _adopt_gate_identity(gate, environ)
     if not have_identity:
         print("[forum] baton gate GitHub identity: no GH_TOKEN -- gate-checked `baton advance` "
-              "will refuse (unknown) until the read-only token is installed (#3283).",
+              "and the board's PR-state read will refuse/return unknown until the read-only "
+              "token is installed (#3283, #3509).",
               file=sys.stderr)
     return config_dir
+
+
+def _gate_unavailable_provider():
+    """Board identity provider used when the gate module cannot be loaded: always refuses."""
+    return {}, ("unknown", "baton gate module unavailable (#3509): the board's gh read "
+                           "refuses rather than use an ambient login")
+
+
+def _adopt_gate_identity(gate, environ) -> None:
+    """After the gate captured its identity: give the board read the same one (#3509)
+    and keep the token out of every child process's environment.
+
+    The board's PR-state read (``board_projects._gh_pr_state``) takes its env from
+    the gate's public ``gh_call_identity``. ``GH_TOKEN`` is then removed from the
+    process environment, but ONLY when ``environ`` is ``os.environ`` itself (a caller
+    that passed its own mapping keeps it untouched), so nothing spawned later inherits it.
+
+    ONCE-ONLY per process: because the token is popped here, a second
+    ``configure_service_github_identity()`` with ``environ=None`` would find no token
+    and switch the gate and the board to no-identity (they would then refuse).
+    Only ``GH_TOKEN`` is removed. A ``GITHUB_TOKEN`` supplied in the unit stays in the
+    environment; that is inert today, since nothing in src/forum spawns a child other
+    than the gh calls, which get an explicit env.
+    """
+    board_projects.configure_gh_identity(gate.gh_call_identity)
+    if environ is None or environ is os.environ:
+        os.environ.pop("GH_TOKEN", None)
 
 
 def main() -> None:

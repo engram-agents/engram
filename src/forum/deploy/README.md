@@ -93,11 +93,32 @@ Like the login map, pass the flag on every re-install: the installer refuses (ex
 nothing written) to replace a unit that already carries a github-token
 `EnvironmentFile=` line unless the flag is given again.
 
-One limit: the board's PR-state read (`src/forum/board_projects.py`, a fourth `gh` call
-outside the gate) is not identity-scoped. With the `-` form and no token file it falls
-back to the service user's ambient `gh` login; with a token installed it incidentally
-runs under the read-only token, because `GH_TOKEN` stays in the process environment.
-Tracked as #3509.
+The board's PR-state read (`src/forum/board_projects.py`) runs under the same identity
+as the gate (#3509): the same explicit environment, the same empty `GH_CONFIG_DIR`.
+With no token it returns `unknown`: board rows keep their baton status, and nothing is
+cached. Once the server has captured `GH_TOKEN` it removes the variable from the process
+environment, so no child process inherits it. Only `GH_TOKEN` is removed: a
+`GITHUB_TOKEN` supplied in the unit stays, which is inert today because nothing in
+`src/forum` spawns a child other than the `gh` calls, and those get an explicit
+environment. If the baton gate module cannot be loaded, the board read also returns
+`unknown` instead of using an ambient `gh` login. The token's repository list must
+cover every repo a board PR anchor points at; for any repo it does not cover, those
+rows degrade to `unknown`.
+
+**This read also feeds the forum's `/gc` and `/merge` routes** (they derive an anchored
+baton's PR state through the same function, uncached), and there an `unknown` is a
+refusal, not a degrade: both routes answer 503 ("could not read the state of PR ...
+nothing written ... Retry later"). So, once this change is deployed, **without the token installed, or for an
+anchored baton whose repo is outside the token's list, closing and merging that baton
+through the forum is refused** where it used to work on the ambient login. Deploy order:
+(1) create the token and check its repository list against EVERY repo any anchored baton
+points at; (2) install the token file and re-run the installer with `--github-token-file`;
+(3) restart the service; only then rely on `/gc` and `/merge`. Host verification adds one
+real anchored-baton read through the forum, beside the gate checks above. Neither route
+has a dry-run option, and `/gc` or `/merge` on a baton whose PR is already merged or closed
+WRITES (it closes the baton), so the safe positive check is `POST /gc` on an anchored baton
+whose PR is still OPEN: a working identity answers 409 ("still OPEN ... refusing to close")
+before anything is written, and a 503 means the identity cannot read that PR.
 
 `--no-start` for the first install so the DB cutover (below) happens before the
 service comes up. On later code upgrades, re-run **without** `--no-start` to

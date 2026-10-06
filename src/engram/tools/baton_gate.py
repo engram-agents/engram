@@ -528,6 +528,10 @@ def configure_service_github_identity(environ=None, config_dir=None) -> bool:
     returns ``unknown`` without invoking gh. ``config_dir`` is an empty directory
     the service owns; nothing is ever written into it. Returns True iff a usable
     identity (token AND config_dir) is now configured.
+
+    ONCE-ONLY per process: the forum server removes ``GH_TOKEN`` from ``os.environ``
+    after this captured it, so a second call with ``environ=None`` would see no
+    token and switch the gate (and the board read that shares it) to no identity.
     """
     env = os.environ if environ is None else environ
     token = str(env.get("GH_TOKEN") or "").strip()
@@ -568,6 +572,17 @@ def _gh_identity():
         "GH_PROMPT_DISABLED": "1",
         "GH_NO_UPDATE_NOTIFIER": "1",
     }}, None
+
+
+def gh_call_identity():
+    """Public name of `_gh_identity` for callers outside this module (#3509).
+
+    The forum server injects it into ``board_projects.configure_gh_identity`` so
+    the board's PR-state read runs under the gate's identity. Same contract:
+    ``({}, None)`` default-off; ``({"env": ...}, None)`` with an identity;
+    ``({}, ("unknown", <fixed message>))`` in service mode without one.
+    """
+    return _gh_identity()
 
 
 def _scrub_gh_detail(text: str) -> str:

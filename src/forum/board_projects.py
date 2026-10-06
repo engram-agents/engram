@@ -137,6 +137,23 @@ def _infer_kind(project_id: str, github_ref: str) -> str:
 # gh PR state reconciliation
 # ---------------------------------------------------------------------------
 
+# Injection point for the GitHub identity of the board's `gh` read (#3509). The
+# forum server sets it from main() to the baton gate's public `gh_call_identity`
+# helper, so this read runs under the SAME explicit minimal env as the gate. A
+# provider is a zero-arg callable returning ``(extra_run_kwargs, refusal)`` where
+# ``refusal`` is None or a non-None "do not call gh" verdict. None (the default:
+# tests, anything not configured) keeps today's behaviour exactly: gh inherits
+# the process environment and no `env` kwarg is passed. Deliberately not an
+# import of the gate -- board_projects must not locate it by path.
+_GH_IDENTITY_PROVIDER = None
+
+
+def configure_gh_identity(provider) -> None:
+    """Set (or, with None, clear) the gh identity provider for `_gh_pr_state`."""
+    global _GH_IDENTITY_PROVIDER
+    _GH_IDENTITY_PROVIDER = provider
+
+
 def _gh_pr_state(pr_number: str, repo: str) -> str:
     """Query GitHub for a PR's state via `gh pr view --repo <repo>`.
 
@@ -152,12 +169,19 @@ def _gh_pr_state(pr_number: str, repo: str) -> str:
     cwd) -- that ambient-cwd fallback is exactly what let a PR-baton for one
     repo silently reconcile against a same-numbered PR in a different repo.
     """
+    gh_kw: dict = {}
+    provider = _GH_IDENTITY_PROVIDER
+    if provider is not None:
+        gh_kw, refusal = provider()
+        if refusal is not None:
+            return "unknown"  # no identity: never call gh under an ambient login
     try:
         result = subprocess.run(
             ["gh", "pr", "view", pr_number, "--repo", repo, "--json", "state"],
             capture_output=True,
             text=True,
             timeout=10,
+            **gh_kw,
         )
     except FileNotFoundError:
         return "unknown"
