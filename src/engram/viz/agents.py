@@ -26,6 +26,8 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs
 
+from .data.sqlite_ro import connect_ro
+
 # Renamed from the original "viz_server.discover" to match this module's
 # new home -- a diagnostic-only name (log filtering), not part of the
 # byte-identical served-output contract this PR's acceptance gates check.
@@ -458,7 +460,7 @@ def get_agents_meta() -> list:
             entry["current_node_count"] = 0
         else:
             try:
-                conn = sqlite3.connect(f"file:{info['db']}?mode=ro", uri=True)
+                conn = connect_ro(info['db'])
                 cnt = conn.execute(
                     "SELECT COUNT(*) FROM nodes WHERE is_current = 1"
                 ).fetchone()[0]

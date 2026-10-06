@@ -43,4 +43,5 @@ PAGE_ROUTES: dict[str, str] = {
     "/health": shell.HEALTH_HTML,
     "/stats": shell.STATS_HTML,
     "/config": shell.CONFIG_HTML,
+    "/moments": shell.MOMENTS_HTML,
 }

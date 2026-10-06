@@ -61,6 +61,7 @@ import threading
 from datetime import datetime, timezone
 
 from .. import agents as viz_agents
+from .sqlite_ro import connect_ro
 
 # Matches health.engine.write_snapshot's own filename shape exactly:
 #   filename = f"{turn}-{checkpoint_mode}-{ts}.json"
@@ -683,7 +684,7 @@ def _build_live_health_v2_payload(agent_name: str, db_path: str) -> dict:
         # viz/data/health.py's get_health_data already uses (comment there:
         # "multi-agent peer-DB safety is enforced by OS file permissions
         # ... not by this URI flag").
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = connect_ro(db_path)
         conn.row_factory = sqlite3.Row
     except sqlite3.OperationalError as exc:
         return {

@@ -11,7 +11,10 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+
 from datetime import datetime, timedelta, timezone
+
+from .sqlite_ro import connect_ro
 
 # ---------------------------------------------------------------------------
 # Queries replicated from server.py:_compute_confidence_distribution.
@@ -189,7 +192,7 @@ def get_calibration_data(db_path: str) -> dict:
     if not db_path or not os.path.exists(db_path):
         return {"error": f"Database not found: {db_path!r}"}
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = connect_ro(db_path)
         conn.row_factory = sqlite3.Row
     except sqlite3.Error as exc:
         return {"error": f"Could not open DB: {exc}"}

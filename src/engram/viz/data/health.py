@@ -15,8 +15,11 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from .sqlite_ro import connect_ro
 
 
 def get_health_data(db_path: str) -> dict:
@@ -28,7 +31,7 @@ def get_health_data(db_path: str) -> dict:
         # OS file permissions (owner UID writes; group=agents reads), not by
         # this URI flag. The previous `immutable=1` was dropped (#184) because
         # it caused the reader to ignore -wal entirely → silent staleness.
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = connect_ro(db_path)
         conn.row_factory = sqlite3.Row
 
         data: dict = {}

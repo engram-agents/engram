@@ -345,6 +345,26 @@
       "tier": "convenience"
     },
     {
+      "path": "viz/data/sqlite_ro.py",
+      "tier": "convenience",
+      "note": "engram-alpha#3513: the one read-only SQLite opener every viz data module and viz/agents.py imports (percent-encodes the path so ? and # cannot split the URI) -- same tier as its viz/ siblings, which all import it."
+    },
+    {
+      "path": "viz/data/moments.py",
+      "tier": "convenience",
+      "note": "engram-alpha#3511: read-only loader for the human-facing Moments page (/api/moments) -- same tier as its viz/ siblings."
+    },
+    {
+      "path": "viz/static/moments.js",
+      "tier": "convenience",
+      "note": "engram-alpha#3511: Moments page renderer, served via <script src>; all agent text goes through textContent."
+    },
+    {
+      "path": "viz/templates/moments.html",
+      "tier": "convenience",
+      "note": "engram-alpha#3511: Moments page shell."
+    },
+    {
       "path": "viz/static/base.css",
       "tier": "convenience",
       "note": "engram-alpha#2555 PR B amendment-1: moved from viz/templates/ -- served from a real /static/ route now, referenced via <link>, no longer baked into Python string constants."

@@ -11,6 +11,8 @@ import json
 import os
 import sqlite3
 
+from .sqlite_ro import connect_ro
+
 
 def search_nodes(db_path: str, query: str, limit: int = 20) -> dict:
     """FTS5-based node search for the /api/search endpoint.
@@ -26,7 +28,7 @@ def search_nodes(db_path: str, query: str, limit: int = 20) -> dict:
     if not query or not query.strip():
         return {"results": [], "error": "query is required"}
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = connect_ro(db_path)
         conn.row_factory = sqlite3.Row
 
         # Check whether nodes_fts exists
@@ -88,7 +90,7 @@ def get_graph(db_path: str) -> dict:
     if not os.path.exists(db_path):
         return {"nodes": [], "edges": [], "error": f"Database not found: {db_path}"}
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = connect_ro(db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
