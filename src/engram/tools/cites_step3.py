@@ -9,7 +9,8 @@ predicate (core._cites_pair_error) accepts (observation source -> `ev_`
 evidence target); that legitimate pair is never selected in any phase. Lei's ruling: `cites` carries observation -> evidence only, so
 each loose one is converted to `about` or another NON-provenance relation. The
 conversion is driven by the seat's own sampling report (--report) and per-edge
-labels (--labels), in five phases that always run in this order:
+labels (--labels), in six phases that always run in this order (default
+`--phases a,b,c,d,e,f`; a subset still runs in this order):
 
     a  duplicate pre-pass  a loose cites duplicating any other typed edge on the
                            same pair (either direction) -> about
@@ -19,6 +20,24 @@ labels (--labels), in five phases that always run in this order:
                            report's own `decision` field)
     d  per-edge            the labelled edges, by their effective label
     e  wrong-target        edges labelled wrong-target -> about, listed apart
+    f  frozen-history      every loose cites left whose SOURCE is non-current
+                           (superseded or retracted) -> about
+
+Phase f exists because no loose cites may remain, and a frozen node cannot carry
+a premise edge that any live cascade route or confidence will read again; a
+refile retracts and refiles the CURRENT node, so a loose cites with a superseded
+or retracted source can only ever become `about`. It takes only what no earlier
+phase touched: never the keeper pair, never an edge named in the labels file,
+never an edge with an earlier ledger entry (applied, refused, deferred or on the
+needs-seat-read / refile lists). Selection is by the SOURCE alone: a superseded
+TARGET changes nothing. The set is listed by stratum (source type -> target
+type, count) in the plan and the ledger header, and exported with its edge ids to
+`frozen-history-<ts>.json` ({edge_id, source_id, target_id, source_status,
+target_current}) so a seat can spot-read some before `--apply`.
+Re-running `--phases f` re-applies no edge: what applied is no longer a cites;
+an edge the engine refused (a duplicate of an `about`) or deferred (a pending
+cascade marker) is retried and recorded again as a fresh f entry, as in
+phases a-e.
 
 A mis-filed-premise edge whose source is a DERIVATION is never retyped (Lei's
 amendment): it stays `cites`, and is exported on the refile list GROUPED BY
@@ -105,7 +124,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 LABELS = ("correct-about", "mis-filed-premise", "other-relation", "unforeseen", "cannot-judge")
-PHASES = ("a", "b", "c", "d", "e")
+PHASES = ("a", "b", "c", "d", "e", "f")
 STRUCTURAL_SOURCES = ("feeling_report", "question")
 MARKER_TEXT = "pending cascade marker"
 # The premise-ancestry walk (fold: "already covered") follows these two
@@ -116,6 +135,14 @@ MAX_ANCESTRY_HOPS = 50
 # A cites that duplicates an `about` on the same pair can never be removed: the
 # engine refuses the retype and never deletes (header bucket name).
 DUP_ABOUT_BUCKET = "duplicate-of-about-unremovable"
+# Phase f's reason code (ledger `reason`, and the engine's reason after the prefix).
+FROZEN_CODE = "frozen-history"
+
+
+def _non_current(is_current, status):
+    """A node that is no longer live: superseded (is_current != 1) or retracted.
+    The one definition `loose_cites_remaining` and phase f share."""
+    return is_current != 1 or status == "retracted"
 
 
 class Refusal(Exception):
@@ -553,6 +580,7 @@ class Run:
         self._lost = None
         self.backup = None          # {path, bytes, edges}, set by --apply before the first write
         self._remaining = None
+        self.frozen_meta = {}       # edge_id -> export row, for what phase f selected
 
     # -- connections ------------------------------------------------------
     def open(self):
@@ -707,8 +735,8 @@ class Run:
                 total += 1
                 k = f"{r['st']}->{r['tt']}"
                 per[k] = per.get(k, 0) + 1
-                nc_s += 1 if (r["sc"] != 1 or r["ss"] == "retracted") else 0
-                nc_t += 1 if (r["tc"] != 1 or r["ts"] == "retracted") else 0
+                nc_s += 1 if _non_current(r["sc"], r["ss"]) else 0
+                nc_t += 1 if _non_current(r["tc"], r["ts"]) else 0
         finally:
             conn.close()
         self._remaining = {"total": total, "per_stratum": dict(sorted(per.items())),
@@ -839,6 +867,29 @@ class Run:
             self.wrong_target.append({"edge_id": row["id"], "source_id": row["s"],
                                       "target_id": row["t"]})
 
+    def phase_f(self, conn):
+        """frozen-history: every loose cites whose SOURCE is non-current and
+        that no earlier phase touched (still a cites, not in the labels file,
+        no ledger entry). The keeper pair is never selected."""
+        rows = conn.execute(
+            "SELECT e.id AS id, e.source_id AS s, e.target_id AS t, ns.type AS st, nt.type AS tt, "
+            "ns.is_current AS sc, ns.status AS ss, nt.is_current AS tc, nt.status AS ts "
+            "FROM edges e JOIN nodes ns ON ns.id = e.source_id JOIN nodes nt ON nt.id = e.target_id "
+            "WHERE e.relation = 'cites' ORDER BY e.id").fetchall()
+        for r in rows:
+            # The claimed filter matters in a dry run: an edge an earlier phase
+            # only PLANNED is still a cites in the DB, so without it act() would
+            # record a spurious (f, skipped-not-cites) entry.
+            if (r["id"] in self.claimed or (r["s"], r["t"]) in self.labelled
+                    or self.is_keeper(conn, r["s"], r["t"])
+                    or not _non_current(r["sc"], r["ss"])):
+                continue
+            self.frozen_meta[r["id"]] = {
+                "edge_id": r["id"], "source_id": r["s"], "target_id": r["t"],
+                "source_status": "retracted" if r["ss"] == "retracted" else "superseded",
+                "target_current": not _non_current(r["tc"], r["ts"])}
+            self.act(conn, "f", r, "about", FROZEN_CODE)
+
     # -- driver -----------------------------------------------------------
     def go(self):
         self._labelled_in_bulk = self.labelled_in_bulk()     # as the graph stands BEFORE any retype
@@ -858,8 +909,10 @@ class Run:
                         self.phase_c(conn)
                     elif ph == "d":
                         self.phase_d(conn)
-                    else:
+                    elif ph == "e":
                         self.phase_e(conn)
+                    else:
+                        self.phase_f(conn)
                 finally:
                     conn.close()
                 if not self.apply:
@@ -999,6 +1052,22 @@ class Run:
             conn.close()
         return out
 
+    def frozen_history(self):
+        """The edges phase f selected (every status but skipped), by edge id:
+        {edge_id, source_id, target_id, source_status, target_current}."""
+        ids = {e["edge_id"] for e in self.entries
+               if e["phase"] == "f" and e["reason"] == FROZEN_CODE
+               and e["status"] != "skipped-not-cites"}
+        return [self.frozen_meta[i] for i in sorted(ids)]
+
+    def frozen_history_counts(self):
+        per = {}
+        for e in self.entries:
+            if (e["phase"] == "f" and e["reason"] == FROZEN_CODE
+                    and e["status"] != "skipped-not-cites"):
+                per[e["stratum"]] = per.get(e["stratum"], 0) + 1
+        return {"total": sum(per.values()), "per_stratum": dict(sorted(per.items()))}
+
     def k7(self):
         retyped = {e["stratum"] for e in self.entries
                    if e["reason"] == "no-textual-trace" and e["status"] in ("applied", "planned")}
@@ -1041,6 +1110,7 @@ class Run:
             "promotion_candidate_count": len(self.promotion_candidates()),
             "labelled_in_bulk_strata": len(self._labelled_in_bulk),
             "lost_relation_counts": self.lost_relation()["header"],
+            "frozen_history_counts": self.frozen_history_counts(),
             DUP_ABOUT_BUCKET: self.dup_about_unremovable(),
             "loose_cites_remaining": self.loose_remaining(),
             **({"backup": self.backup} if self.backup else {}),
@@ -1129,6 +1199,12 @@ def print_plan(run, header, out=None):
             print(f"  [{stratum}] edge {x['edge_id']} {x['source_id']} -> {x['target_id']} names "
                   f"{x['relation_named']!r}: {x['reason']} "
                   f"(phase {x['phase_applied']}, action {x['action_taken']})", file=out)
+    fh = run.frozen_history_counts()
+    if "f" in run.phases:
+        print(f"frozen-history (phase f: a loose cites with a non-current source -> about; "
+              f"spot-read some before --apply): {fh['total']}", file=out)
+        for k, n in fh["per_stratum"].items():
+            print(f"  [{k}] {n}", file=out)
     dup = run.dup_about_unremovable()
     print(f"{DUP_ABOUT_BUCKET} (an about already exists, the engine never deletes; the seat decides "
           f"by hand): {dup['count']}", file=out)
@@ -1320,6 +1396,7 @@ def _main(argv):
         _write_private(out_dir / f"already-covered-{ts}.json", run.already_covered())
         _write_private(out_dir / f"lost-relation-{ts}.json", run.lost_relation())
         _write_private(out_dir / f"needs-seat-read-{ts}.json", needs_list(run.entries))
+        _write_private(out_dir / f"frozen-history-{ts}.json", run.frozen_history())
         print_plan(run, header)
         if failure is not None:
             print(f"ERROR: {run.error}. Retypes already committed are NOT rolled back (the engine "
@@ -1345,6 +1422,7 @@ def _main(argv):
                                              "promotion_candidates": run.promotion_candidates(),
                                              "already_covered": run.already_covered(),
                                              "lost_relation": run.lost_relation(),
+                                             "frozen_history": run.frozen_history(),
                                              "needs_seat_read": needs_list(run.entries)})
     return 0
 

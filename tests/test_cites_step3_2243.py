@@ -15,7 +15,7 @@ Contract (K0-K10 of the dispatch spec):
   K2  --apply preconditions (report + labels + handcheck valid, K0, reviewer
       lineage differs, edges_read >= min(20, correct-about in derivation-source
       strata) and >= 1, disagree <= 2), each refused with exit 2.
-  K3  phases a-e in order, each idempotent, every retype through the engine's
+  K3  phases a-f in order, each idempotent, every retype through the engine's
       _retype_edge_impl; bulk eligibility RECOMPUTED, never read from the
       report's own decision string.
   K4  DAG audit before and after each phase; a new cycle, or a larger
@@ -24,7 +24,7 @@ Contract (K0-K10 of the dispatch spec):
   K6  refusals reported, never worked around; never a provenance edge.
   K7  named-edge mis-filed rate beside every no-textual-trace retype.
   K8  pending cascade marker -> deferred-pending-marker, no fallback.
-  K9  a second apply changes nothing.
+  K9  a second apply re-applies no edge (a refused or deferred one is retried and recorded again).
   K10 exit codes 0 / 2 / 3 / 1; validation before the first write.
 
 Nodes and edges are inserted raw into a throwaway graph per cell (fixed types,
@@ -881,10 +881,10 @@ def test_k4_audit_runs_before_first_phase_and_after_each(world, tool, capsys, mo
     calls = _fake_audit(monkeypatch, [([], 0)])
     rc, out, err = apply_(world, tool, capsys, rep=plant_report())
     assert rc == 0
-    assert len(calls) == 1 + 5          # baseline + one per phase a..e
+    assert len(calls) == 1 + 6          # baseline + one per phase a..f
     led = ledger(world)
     assert led["header"]["audit"]["before"]["cycle_count"] == 0
-    assert len(led["header"]["audit"]["after_phase"]) == 5
+    assert len(led["header"]["audit"]["after_phase"]) == 6
 
 
 def test_k4_real_audit_clean_graph_passes(world, tool, capsys):
@@ -1320,7 +1320,7 @@ def test_keeper_selection_uses_the_shared_engine_predicate_in_every_phase(
                           extra=["--plan-out", str(dest)])
     assert rc == 0, out + err
     def only_keeper_refusals(es):
-        # a/b/c select from the graph and see nothing; d/e take the labelled
+        # a/b/c/f select from the graph and see nothing; d/e take the labelled
         # edges and record each as "keeper, refused" -- never planned/applied
         assert {e["phase"] for e in es} == {"d", "e"}
         assert {(e["reason"], e["status"]) for e in es} == {("keeper", "refused:not-loose-cites")}
@@ -2187,7 +2187,7 @@ def _set_status(w, node, status):
 def test_g3_unselected_loose_edges_are_counted_by_stratum_and_the_status_says_so(world, tool, capsys):
     w = world
     s1, t1 = w.cites("lesson", "goal")                      # selected (labelled)
-    s2, t2 = w.cites("lesson", "goal", src_current=0)       # unselected, superseded source
+    s2, t2 = w.cites("lesson", "goal", src_current=0)       # phase f (frozen-history) takes it
     s3, t3 = w.cites("lesson", "goal", tgt_current=0)       # unselected, superseded target
     s4, t4 = w.cites("task", "goal")                        # unselected, retracted target
     _set_status(w, t4, "retracted")
@@ -2197,8 +2197,8 @@ def test_g3_unselected_loose_edges_are_counted_by_stratum_and_the_status_says_so
     assert rc == 0, out + err
     h = ledger(w)["header"]
     assert h["loose_cites_remaining"] == {
-        "total": 3, "per_stratum": {"lesson->goal": 2, "task->goal": 1},
-        "non_current_source": 1, "non_current_target": 2}
+        "total": 2, "per_stratum": {"lesson->goal": 1, "task->goal": 1},
+        "non_current_source": 0, "non_current_target": 2}
     assert h["status"] == "complete-with-remaining"
     assert "loose_cites_remaining" in out and "complete-with-remaining" in out
 
@@ -2218,14 +2218,15 @@ def test_g3_everything_selected_is_complete_with_a_zero_count(world, tool, capsy
 def test_g3_the_dry_run_projects_the_figure_after_the_planned_retypes(world, tool, capsys):
     w = world
     s1, t1 = w.cites("lesson", "goal")
-    w.cites("lesson", "goal", src_current=0)
+    w.cites("lesson", "goal", src_current=0)                # phase f plans it
+    w.cites("lesson", "goal", tgt_current=0)                # current source: stays
     dest = w.inputs / "plan.json"
     rc, out, err = invoke(w, tool, capsys, labels={"edges": [lentry(w, s1, t1, [lab("correct-about")])]},
                           extra=["--plan-out", str(dest)])
     assert rc == 0, out + err
     h = json.loads(dest.read_text())["header"]
     assert h["loose_cites_remaining"] == {"total": 1, "per_stratum": {"lesson->goal": 1},
-                                          "non_current_source": 1, "non_current_target": 0}
+                                          "non_current_source": 0, "non_current_target": 1}
     assert "loose_cites_remaining" in out
     assert w.rels(s1, t1) == ["cites"]                      # still a dry run
 
@@ -2415,3 +2416,307 @@ def test_g5b_a_target_id_inside_a_longer_id_is_not_named(world, tool, capsys):
     assert by[("zz_src_b", "ob_01")]["status"] == "needs-seat-read"
     assert by[("zz_src_c", "ob_01")]["status"] == "needs-seat-read"
     assert by[("zz_src_d", "ob_01")]["reason"] == "no-textual-trace"
+
+
+# ---------------------------------------------------------------------------
+# Phase f (frozen-history): Kepler's ruling, relaying Lei's "no loose cites
+# remain". A loose cites whose SOURCE is non-current (superseded or retracted)
+# can only ever become `about`: a frozen node carries no premise edge any live
+# cascade route or confidence will read again, and a refile retracts and
+# refiles the CURRENT node. Phase f runs after phase e and takes every such
+# edge no earlier phase touched.
+# ---------------------------------------------------------------------------
+
+def _frozen_world(w):
+    """lesson->goal is in no report stratum, so it is never bulk-eligible."""
+    P = {}
+    P["sup"] = w.cites("lesson", "goal", src_current=0)
+    P["sup_tgt_sup"] = w.cites("lesson", "goal", src_current=0, tgt_current=0)
+    P["retracted"] = w.cites("task", "goal", src_current=0)
+    _set_status(w, P["retracted"][0], "retracted")
+    return P
+
+
+def _f_entry(led, pair):
+    return [e for e in led["entries"] if (e["source_id"], e["target_id"]) == pair]
+
+
+def test_phase_f_a_unlabelled_superseded_source_in_a_non_bulk_stratum_becomes_about(world, tool, capsys):
+    w = world
+    s, t = w.cites("lesson", "goal", src_current=0)
+    rc, out, err = apply_(w, tool, capsys)
+    assert rc == 0, out + err
+    assert w.rels(s, t) == ["about"]
+    led = ledger(w)
+    (e,) = _f_entry(led, (s, t))
+    assert (e["phase"], e["from"], e["to"], e["reason"], e["status"]) == (
+        "f", "cites", "about", "frozen-history", "applied")
+    assert any(d.get("reason") == "cites-step3 f: frozen-history"
+               for _n, d in w.retype_reasons())
+    h = led["header"]
+    assert h["loose_cites_remaining"] == {"total": 0, "per_stratum": {},
+                                          "non_current_source": 0, "non_current_target": 0}
+    assert h["status"] == "complete"
+    assert h["phases"] == ["a", "b", "c", "d", "e", "f"]
+
+
+def test_phase_f_b_a_retracted_source_is_taken_too(world, tool, capsys):
+    w = world
+    s, t = w.cites("lesson", "goal", src_current=0)
+    _set_status(w, s, "retracted")
+    s2, t2 = w.cites("task", "goal", src_current=1)       # retracted but still flagged current
+    _set_status(w, s2, "retracted")
+    rc, out, err = apply_(w, tool, capsys)
+    assert rc == 0, out + err
+    assert w.rels(s, t) == ["about"] and w.rels(s2, t2) == ["about"]
+    led = ledger(w)
+    for p in ((s, t), (s2, t2)):
+        (e,) = _f_entry(led, p)
+        assert (e["phase"], e["reason"], e["status"]) == ("f", "frozen-history", "applied")
+    assert led["header"]["status"] == "complete"
+    assert led["header"]["loose_cites_remaining"]["total"] == 0
+    exp = {x["source_id"]: x for x in _read(w, "frozen-history")}
+    assert exp[s]["source_status"] == "retracted" and exp[s2]["source_status"] == "retracted"
+
+
+def test_phase_f_c_current_source_and_superseded_target_alone_are_not_touched(world, tool, capsys):
+    w = world
+    cur = w.cites("lesson", "goal")                            # current source, current target
+    tgt_sup = w.cites("lesson", "goal", tgt_current=0)         # current source, SUPERSEDED target
+    sup = w.cites("lesson", "goal", src_current=0)
+    sup_id = w.eid(*sup)
+    rc, out, err = apply_(w, tool, capsys)
+    assert rc == 0, out + err
+    assert w.rels(*cur) == ["cites"] and w.rels(*tgt_sup) == ["cites"]
+    assert w.rels(*sup) == ["about"]
+    led = ledger(w)
+    assert not _f_entry(led, cur) and not _f_entry(led, tgt_sup)
+    h = led["header"]
+    assert h["loose_cites_remaining"]["total"] == 2
+    assert h["loose_cites_remaining"]["non_current_source"] == 0
+    assert h["loose_cites_remaining"]["non_current_target"] == 1
+    assert h["status"] == "complete-with-remaining"
+    assert {x["edge_id"] for x in _read(w, "frozen-history")} == {sup_id}
+
+
+def test_phase_f_d_a_labelled_superseded_source_edge_is_left_to_its_own_list(world, tool, capsys):
+    w = world
+    # (1) labelled `unforeseen`: phase d lists it for a seat read
+    un = w.cites("lesson", "goal", src_current=0)
+    # (2) a derivation source labelled mis-filed-premise stays cites on the refile list
+    t = w.node("derivation", created=OLD)
+    s = w.node("derivation", current=0, created=NEW)
+    w.edge("cites", s, t)
+    labels = {"edges": [lentry(w, *un, [lab("unforeseen")]),
+                        lentry(w, s, t, [lab("mis-filed-premise", "derives_from", premise="relies")])]}
+    rc, out, err = apply_(w, tool, capsys, labels=labels)
+    assert rc == 0, out + err
+    assert w.rels(*un) == ["cites"] and w.rels(s, t) == ["cites"]
+    led = ledger(w)
+    assert [(e["phase"], e["status"]) for e in _f_entry(led, un)] == [("d", "needs-seat-read")]
+    assert [(e["phase"], e["status"]) for e in _f_entry(led, (s, t))] == [("d", "needs-seat-read")]
+    assert [g["source_id"] for g in _read(w, "refile-by-source")] == [s]
+    assert _read(w, "frozen-history") == []
+    assert led["header"]["status"] == "complete-with-remaining"
+
+
+def test_phase_f_d2_the_labels_file_exclusion_holds_when_phase_d_did_not_run(world, tool, capsys):
+    w = world
+    un = w.cites("lesson", "goal", src_current=0)
+    free = w.cites("lesson", "goal", src_current=0)
+    labels = {"edges": [lentry(w, *un, [lab("correct-about")])]}
+    rc, out, err = apply_(w, tool, capsys, labels=labels, extra=["--phases", "f"])
+    assert rc == 0, out + err
+    assert w.rels(*un) == ["cites"] and w.rels(*free) == ["about"]
+    assert [e["phase"] for e in _f_entry(ledger(w), free)] == ["f"]
+    assert not _f_entry(ledger(w), un)
+
+
+def test_phase_f_e_the_keeper_pair_with_a_superseded_source_is_never_selected_or_exported(
+        world, tool, capsys):
+    w = world
+    keeper = w.cites("observation_factual", "evidence", src_current=0)
+    loose = w.cites("lesson", "goal", src_current=0)
+    dest = w.inputs / "plan.json"
+    rc, out, err = invoke(w, tool, capsys, extra=["--plan-out", str(dest)])
+    assert rc == 0, out + err
+    plan = json.loads(dest.read_text())
+    assert not _f_entry(plan, keeper)
+    assert {x["source_id"] for x in plan["frozen_history"]} == {loose[0]}
+    rc, out, err = apply_(w, tool, capsys)
+    assert rc == 0, out + err
+    assert w.rels(*keeper) == ["cites"] and w.rels(*loose) == ["about"]
+    assert not _f_entry(ledger(w), keeper)
+    assert {x["source_id"] for x in _read(w, "frozen-history")} == {loose[0]}
+    assert ledger(w)["header"]["loose_cites_remaining"]["total"] == 0
+
+
+def test_phase_f_f_an_edge_an_earlier_phase_handled_has_exactly_one_ledger_entry(world, tool, capsys):
+    w = world
+    struct = w.cites("feeling_report", "goal", src_current=0)         # phase b
+    bulk = w.cites("definition", "goal", src_current=0)                # phase c
+    dup = w.cites("task", "goal", src_current=0)                       # phase a: typed duplicate
+    w.edge("derives_from", *dup)
+    dup_about = w.cites("lesson", "goal", src_current=0)               # phase a REFUSES (about exists)
+    w.edge("about", *dup_about)
+    rep = report(strata=[stratum("definition", "goal", {"correct-about": 10})])
+    rc, out, err = apply_(w, tool, capsys, rep=rep)
+    assert rc == 0, out + err
+    led = ledger(w)
+    for pair, phase in ((struct, "b"), (bulk, "c"), (dup, "a"), (dup_about, "a")):
+        es = _f_entry(led, pair)
+        assert [e["phase"] for e in es] == [phase], (pair, es)
+    assert _f_entry(led, dup_about)[0]["status"].startswith("refused:")
+    assert w.rels(*dup_about) == ["about", "cites"]                    # still loose, never forced
+    assert _read(w, "frozen-history") == []
+    assert led["header"]["loose_cites_remaining"]["total"] == 1
+
+
+def test_phase_f_f2_dry_run_a_phase_a_planned_edge_has_one_entry_and_no_phase_f_count(world, tool, capsys):
+    """The claimed-by-an-earlier-phase filter matters in a dry run: a phase-a
+    PLANNED edge is still a `cites` in the DB, so without the filter act()'s
+    first branch would add a spurious (f, skipped-not-cites) entry that
+    pollutes the per-phase and per-status counts."""
+    w = world
+    dup = w.cites("task", "goal", src_current=0)
+    w.edge("derives_from", *dup)                                       # phase a PLANS it
+    dest = w.inputs / "plan.json"
+    rc, out, err = invoke(w, tool, capsys, extra=["--plan-out", str(dest)])
+    assert rc == 0, out + err
+    plan = json.loads(dest.read_text())
+    es = _f_entry(plan, dup)
+    assert [(e["phase"], e["status"]) for e in es] == [("a", "planned")], es
+    h = plan["header"]
+    assert h["counts_per_phase"] == {"a": {"planned": 1}}
+    assert h["counts_per_status"] == {"planned": 1}
+    assert plan["frozen_history"] == []
+
+
+def test_phase_f_g_the_set_is_listed_by_stratum_and_exported_with_ids_and_statuses(world, tool, capsys):
+    w = world
+    P = _frozen_world(w)
+    out_cur = w.cites("lesson", "goal")                                 # never in the set
+    ids = {k: w.eid(*p) for k, p in P.items()}
+    rc, out, err = apply_(w, tool, capsys)
+    assert rc == 0, out + err
+    h = ledger(w)["header"]
+    assert h["frozen_history_counts"] == {"total": 3, "per_stratum": {
+        "lesson->goal": 2, "task->goal": 1}}
+    assert "frozen-history" in out and "[lesson->goal] 2" in out and "[task->goal] 1" in out
+    d = w.home / "migrations" / "cites-step3"
+    (f,) = d.glob("frozen-history-*.json")
+    assert stat.S_IMODE(f.stat().st_mode) == 0o600
+    got = {x["edge_id"]: x for x in json.loads(f.read_text())}
+    want = {
+        ids["sup"]: {"edge_id": ids["sup"], "source_id": P["sup"][0],
+                     "target_id": P["sup"][1], "source_status": "superseded",
+                     "target_current": True},
+        ids["sup_tgt_sup"]: {"edge_id": ids["sup_tgt_sup"],
+                             "source_id": P["sup_tgt_sup"][0], "target_id": P["sup_tgt_sup"][1],
+                             "source_status": "superseded", "target_current": False},
+        ids["retracted"]: {"edge_id": ids["retracted"],
+                           "source_id": P["retracted"][0], "target_id": P["retracted"][1],
+                           "source_status": "retracted", "target_current": True},
+    }
+    assert got == want
+    assert out_cur[0] not in f.read_text()
+
+
+def test_phase_f_h_dry_run_plans_f_writes_nothing_and_lists_the_set_the_apply_retypes(world, tool, capsys):
+    w = world
+    P = _frozen_world(w)
+    before = w.dump()
+    dest = w.inputs / "plan.json"
+    rc, out, err = invoke(w, tool, capsys, extra=["--plan-out", str(dest)])
+    assert rc == 0, out + err
+    assert w.dump() == before
+    plan = json.loads(dest.read_text())
+    f_entries = [e for e in plan["entries"] if e["phase"] == "f"]
+    assert {(e["source_id"], e["target_id"]) for e in f_entries} == set(P.values())
+    assert {(e["to"], e["reason"], e["status"]) for e in f_entries} == {
+        ("about", "frozen-history", "planned")}
+    assert "phase f: 3 edge(s)" in out and "[lesson->goal] 2" in out
+    assert plan["header"]["frozen_history_counts"]["total"] == 3
+    assert plan["header"]["loose_cites_remaining"]["total"] == 0          # projected
+    assert stat.S_IMODE(dest.stat().st_mode) == 0o600
+    planned = sorted(plan["frozen_history"], key=lambda x: x["edge_id"])
+    rc, out, err = apply_(w, tool, capsys)
+    assert rc == 0, out + err
+    assert sorted(_read(w, "frozen-history"), key=lambda x: x["edge_id"]) == planned
+    applied = {e["edge_id"] for e in entries(ledger(w), phase="f", status="applied")}
+    assert applied == {x["edge_id"] for x in planned}
+
+
+def test_phase_f_i_without_f_the_edges_stay_cites_and_are_counted_as_remaining(world, tool, capsys):
+    w = world
+    P = _frozen_world(w)
+    rc, out, err = apply_(w, tool, capsys, extra=["--phases", "a,b,c,d,e"])
+    assert rc == 0, out + err
+    for p in P.values():
+        assert w.rels(*p) == ["cites"]
+    h = ledger(w)["header"]
+    assert h["loose_cites_remaining"]["total"] == 3
+    assert h["loose_cites_remaining"]["non_current_source"] == 3
+    assert h["status"] == "complete-with-remaining"
+    assert h["phases"] == ["a", "b", "c", "d", "e"]
+    assert _read(w, "frozen-history") == []
+
+
+def test_phase_f_j_a_second_apply_re_applies_no_edge(world, tool, capsys):
+    w = world
+    P = _frozen_world(w)
+    rc, out, err = apply_(w, tool, capsys)
+    assert rc == 0, out + err
+    eh = w.edges_hist()
+    rc, out, err = apply_(w, tool, capsys)
+    assert rc == 0, out + err
+    assert w.edges_hist() == eh
+    led = ledger(w)
+    assert not entries(led, status="applied")
+    assert not entries(led, phase="f") and led["header"]["status"] == "complete"
+    for p in P.values():
+        assert w.rels(*p) == ["about"]
+    # Bounded: "no edge is re-applied", not "no f entries". A second `--phases f`
+    # apply retries and records an edge that was refused or deferred, as
+    # phases a-e do; those reappear as refused / deferred, never as applied.
+    dup_about = w.cites("lesson", "goal", src_current=0)
+    w.edge("about", *dup_about)                                        # engine refuses: about exists
+    deferred = w.cites("lesson", "goal", src_current=0)
+    w.marker(deferred[1])                                              # engine defers: pending marker
+    for _ in range(2):
+        rc, out, err = apply_(w, tool, capsys, extra=["--phases", "f"])
+        assert rc == 0, out + err
+        led = ledger(w)
+        assert not entries(led, status="applied")
+        (r,) = _f_entry(led, dup_about)
+        assert r["phase"] == "f" and r["status"].startswith("refused:"), r
+        (d,) = _f_entry(led, deferred)
+        assert d["phase"] == "f" and d["status"] == "deferred-pending-marker", d
+        assert w.rels(*dup_about) == ["about", "cites"] and w.rels(*deferred) == ["cites"]
+        for p in P.values():
+            assert w.rels(*p) == ["about"]
+
+
+def test_phase_f_k_the_audit_gate_runs_after_f_and_aborts(world, tool, capsys, monkeypatch):
+    w = world
+    _frozen_world(w)
+    # calls: baseline, after a..e (five, clean), after f (<- a new cycle)
+    _fake_audit(monkeypatch, [([], 0)] * 6 + [([CYC2], 1)])
+    rc, out, err = apply_(w, tool, capsys)
+    assert rc == 3, out + err
+    assert "aborted-audit" in out + err and "zz_c" in out + err and "phase f" in out + err
+    led = ledger(w)
+    assert led["header"]["status"] == "aborted-audit"
+    assert len(entries(led, phase="f")) == 3                  # f ran; its retypes stand
+    assert set(led["header"]["audit"]["after_phase"]) == {"a", "b", "c", "d", "e", "f"}
+
+
+def test_phase_f_phases_flag_accepts_f_and_the_default_ends_with_it(world, tool, capsys):
+    w = world
+    s, t = w.cites("lesson", "goal", src_current=0)
+    rc, out, err = invoke(w, tool, capsys, extra=["--phases", "f"])
+    assert rc == 0, out + err
+    assert "phase f: 1 edge(s)" in out and "phase a" not in out
+    assert w.rels(s, t) == ["cites"]                          # dry run
+    assert tool.PHASES == ("a", "b", "c", "d", "e", "f")
+    assert "six phases" in tool.__doc__
