@@ -423,6 +423,101 @@ class TestCliSnapshotProvenance:
 
 
 # ---------------------------------------------------------------------------
+# run_one -- signals["composite"] must be the row's `composite_score`
+# ---------------------------------------------------------------------------
+
+
+class TestRunOneCompositeSignal:
+    def test_harness_composite_equals_row_composite_score_on_real_db(
+        self, monkeypatch, tmp_path
+    ):
+        """On a real database, signals["composite"] for each ranked node
+        equals that row's `composite_score` as returned by `_search_nodes`.
+
+        Contract: a row whose composite_score is None produces NO
+        "composite" key in its signals. (A bypass row is not easy to produce
+        in this FTS-only fixture, so only the equality side is asserted
+        here.)"""
+        monkeypatch.setenv("ENGRAM_NO_EMBEDDINGS", "1")
+        for key in list(sys.modules):
+            if key == "server" or key.startswith("engram_"):
+                del sys.modules[key]
+        import server
+
+        server._configure_paths(str(tmp_path / "engram_data"))
+        server._ensure_data_dir()
+        for claim in (
+            "xylophone rhythm instrument unique term",
+            "xylophone tuning bars resonate",
+            "xylophone mallets strike wooden bars",
+        ):
+            r = json.loads(server.engram_add_observation(payload_json=json.dumps({
+                "quoted_text": "test quote",
+                "interpretation": "test interpretation",
+                "claim": claim,
+                "quote_type": "personal_communication",
+                "url": "https://example.com/test",
+                "title": "Test",
+            })))
+            assert "error" not in r, r
+
+        conn = server._get_db()
+        monkeypatch.setattr(runner, "engram_server", server)
+
+        golden = RankingResultUnit(
+            query_id="q_composite", query_text="xylophone", ranked_nodes=[],
+        )
+        test = runner.run_one(conn, golden, top_k=5, use_semantic=False)
+        rows = server._search_nodes(
+            conn, query="xylophone", top_k=5, use_semantic=False,
+        )["results"]
+
+        assert len(rows) >= 2
+        by_id = {n.id: n for n in test.ranked_nodes}
+        assert set(by_id) == {row["id"] for row in rows}
+        for row in rows:
+            assert isinstance(row["composite_score"], float)
+            assert by_id[row["id"]].signals["composite"] == row["composite_score"]
+
+    def test_row_with_none_composite_score_yields_no_composite_key(
+        self, monkeypatch
+    ):
+        """Stub cell (no database) pinning the None side of the contract: a
+        row whose composite_score is None produces NO "composite" key, while a
+        sibling row with a real score still carries it, and a row scoring
+        exactly 0.0 keeps it (presence, not truthiness)."""
+
+        class _StubServer:
+            @staticmethod
+            def _search_nodes(conn, **kwargs):
+                return {
+                    "results": [
+                        {"id": "stub_a", "composite_score": 0.42},
+                        {"id": "stub_b", "composite_score": None},
+                        {"id": "stub_c", "composite_score": 0.0},
+                    ],
+                    "debug": {},
+                }
+
+        monkeypatch.setattr(runner, "engram_server", _StubServer)
+        golden = RankingResultUnit(
+            query_id="q_stub", query_text="anything", ranked_nodes=[],
+        )
+        test = runner.run_one(None, golden, top_k=5, use_semantic=False)
+
+        by_id = {n.id: n for n in test.ranked_nodes}
+        assert by_id["stub_a"].signals["composite"] == 0.42
+        # stub_b has no other signal either, so run_one stores signals=None;
+        # a regression that leaked the None would give {"composite": None}.
+        assert by_id["stub_b"].signals is None
+        # stub_c carries a legitimate composite of exactly 0.0: it must be
+        # kept (presence check), not dropped by a truthiness test.
+        assert "composite" in by_id["stub_c"].signals
+        assert by_id["stub_c"].signals["composite"] == 0.0
+        assert by_id["stub_c"].signals["composite"] is not None
+
+
+# ---------------------------------------------------------------------------
 # MUTATION CONTROLS (documentation only -- run by hand, not in CI, since they
 # mutate real source on disk). See the handoff's "Verification" section for
 # the actual captured run of both.

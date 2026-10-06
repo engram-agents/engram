@@ -218,8 +218,11 @@ def run_one(
             signals["similarity"] = n["similarity"]
         if "match_type" in n:
             signals["match_type"] = n["match_type"]
-        if "_composite" in n:
-            signals["composite"] = n["_composite"]
+        # `_search_nodes` pops its internal `_composite` before returning rows
+        # and exposes the ordering composite as `composite_score` (None for
+        # special-type bypass rows that are never composite-ranked).
+        if "composite_score" in n and n["composite_score"] is not None:
+            signals["composite"] = n["composite_score"]
         if "utility_score" in n and n["utility_score"] is not None:
             signals["utility_score"] = n["utility_score"]
         if "importance_score" in n and n["importance_score"] is not None:
