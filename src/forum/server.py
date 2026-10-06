@@ -4228,6 +4228,8 @@ def create_app(
         ``status``, never ``phase``), so there is no ``transition_phase``
         field here.
         Response: {seq, status: "merged"}, 201. (turn omitted — file is in archive/).
+        409 (#3488): the baton is already closed (``merged`` included), answered before
+        any gh call; nothing written. ``forced`` does not skip this.
         #3416: on a baton with a repo-qualified PR anchor the server reads GitHub
         itself and answers 409 unless the PR is MERGED, 503 (nothing written) if
         it cannot read the state. ``forced`` does not skip this check.
@@ -4235,7 +4237,10 @@ def create_app(
         gate and message as ``/status`` and ``/gc``; nothing written. On an ANCHORED
         baton there is no participant gate (GitHub decides).
         """
-        from forum.coordination import merge as _merge, ProjectNotFound, AnchorChanged, NotAParticipant
+        from forum.coordination import (
+            merge as _merge, ProjectNotFound, AnchorChanged, NotAParticipant, AlreadyClosed,
+        )
+        from forum.coordination.store_file import CLOSED_STATUSES as _CLOSED_STATUSES
 
         store = app.config.get("COORD_STORE")
         allocator = app.config.get("COORD_ALLOCATOR")
@@ -4262,6 +4267,15 @@ def create_app(
             "POST /api/projects/<pid>/merge", pid, store, phase)
         if phase_refusal is not None:
             return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
+
+        # #3488 (mirrors /gc): a baton that is already closed is answered 409 before
+        # any gh call (and _merge re-checks under the lock).
+        raw_now = store.read_project(pid)
+        if raw_now is not None:
+            _cur = _md.parse_frontmatter(raw_now)[0].get("status", "").strip().lower()
+            if _cur in _CLOSED_STATUSES:
+                return jsonify({"error": f"project {pid} is already {_cur}; "
+                                "refusing to overwrite a closed status (reopen first)"}), 409
 
         # #3416: on an anchored baton the server requires GitHub MERGED (it never
         # takes the client's word, and ``forced`` does not skip this). Unanchored
@@ -4295,6 +4309,9 @@ def create_app(
             return jsonify({"error": f"project not found: {pid}"}), 404
         except NotAParticipant:
             return jsonify({"error": f"agent {agent!r} is not a participant of {pid}"}), 403
+        except AlreadyClosed as e:
+            return jsonify({"error": f"project {pid} is already {e.status}; "
+                            "refusing to overwrite a closed status (reopen first)"}), 409
 
         return jsonify({"seq": seq, "status": "merged"}), 201
 

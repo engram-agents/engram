@@ -763,7 +763,7 @@ def merge(
     phase: Optional[str] = None,
     transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
-    require_participant: bool = False,
+    require_participant: bool = True,
     expected_anchor: Optional[str] = None,
 ) -> int:
     """Mark a project baton as merged and archive it; return the assigned seq.
@@ -771,6 +771,11 @@ def merge(
     Pure write body of baton cmd_merge (the post-gh-merge FS-write only). The
     gh-orchestration (PR-state queries, CI/approval gates, the gh pr merge call)
     stays client-side in baton.py — only this post-merge write lives here.
+
+    Gates (#3477, #3488; under the lock, BEFORE any write, so a refusal consumes
+    no seq): ``ProjectNotFound``, then ``NotAParticipant`` (``require_participant``,
+    default ``True``), then ``AlreadyClosed`` (the baton is already in
+    ``CLOSED_STATUSES``), then the ``expected_anchor`` binding.
 
     Log formats:
       - Normal: ``- {ts} merged via baton merge by {merged_by}``
@@ -804,13 +809,14 @@ def merge(
             docstring above).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
         require_participant: in-process only (#3477); never wire-exposed. ``True``
-            makes ``merged_by`` (case-insensitive) have to be in the baton's
-            ``participants`` -- the same predicate and position as :func:`close`'s
-            gate 2: under the lock, after not-found, before the anchor binding and
-            before a seq is claimed. Defaults to ``False`` (unlike ``close``) so
-            every caller that predates #3477 keeps its behaviour; the ``/merge``
-            route passes ``True`` on an UNANCHORED baton only (on an anchored one
-            GitHub decides).
+            (the default, like :func:`close`; #3488 -- secure by default, so a
+            caller that forgets the flag cannot reopen #3477) makes ``merged_by``
+            (case-insensitive) have to be in the baton's ``participants`` -- the
+            same predicate and position as :func:`close`'s gate 2: under the lock,
+            after not-found, before the closed-state check, the anchor binding and
+            before a seq is claimed. The ``/merge`` route passes ``True`` on an
+            UNANCHORED baton only (on an anchored one GitHub decides); pass
+            ``False`` explicitly to skip the gate.
         expected_anchor: in-process only (#3416 round 3). ``None`` (default) = no
             check. Otherwise the normalised ``github`` anchor the caller's
             authorising read was made against (``""`` = unanchored); compared under
@@ -824,6 +830,7 @@ def merge(
         ProjectNotFound: if ``project_id`` has no existing baton file.
         NotAParticipant: if ``require_participant`` and ``merged_by`` is not a
             current participant.
+        AlreadyClosed: if the baton is already in a closed status (#3488).
         AnchorChanged: if ``expected_anchor`` is given and the stored anchor differs.
     """
     # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
@@ -837,6 +844,13 @@ def merge(
         fields, _ = md.parse_frontmatter(content)
         if require_participant and merged_by_n not in _parse_participants(fields.get("participants", "")):
             raise NotAParticipant(merged_by_n)
+        # #3488 (mirrors close(), #3313): a merge on top of a closed baton is an
+        # overwrite of a terminal state. Every closed status refuses alike,
+        # ``merged`` included (a re-merge is not a no-op). Under the lock, before
+        # the anchor binding and before a seq is claimed.
+        current_status = fields.get("status", "").strip().lower()
+        if current_status in CLOSED_STATUSES:
+            raise AlreadyClosed(project_id, current_status)
         _check_expected_anchor(project_id, fields, expected_anchor)
         phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
         if transition_phase is not None:

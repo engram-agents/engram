@@ -1071,7 +1071,7 @@ def test_init_returns_seq_1_for_fresh_store(tmp_path):
 
 def test_merge_sets_status_and_log(store, allocator):
     seq = merge(store, allocator, "PR-1", merged_by="luria",
-                ts="2026-06-27T14:00:00Z")
+                ts="2026-06-27T14:00:00Z", require_participant=False)
     assert seq == 1
     raw = store.read_project("PR-1")
     # After merge, the file is archived — read_project returns None
@@ -1085,13 +1085,13 @@ def test_merge_sets_status_and_log(store, allocator):
 
 def test_merge_forced_log(store, allocator):
     seq = merge(store, allocator, "PR-1", merged_by="luria", forced=True,
-                ts="2026-06-27T14:00:00Z")
+                ts="2026-06-27T14:00:00Z", require_participant=False)
     archive_raw = (store.root / "archive" / "PR-1.md").read_text()
     assert "(FORCED past gates 3-4)" in archive_raw
 
 
 def test_merge_archives_to_archive_dir(store, allocator):
-    merge(store, allocator, "PR-1", merged_by="luria")
+    merge(store, allocator, "PR-1", merged_by="luria", require_participant=False)
     # file no longer in projects/
     assert not (store.projects_dir / "PR-1.md").exists()
     # file now in archive/
@@ -1149,7 +1149,7 @@ def test_archive_project_seq_suffix_increments(store):
 
 def test_recover_max_seq_counts_archived(store, allocator):
     # merge archives the file; seq must survive in recover_max_seq
-    seq = merge(store, allocator, "PR-1", merged_by="luria")
+    seq = merge(store, allocator, "PR-1", merged_by="luria", require_participant=False)
     hi = store.recover_max_seq()
     assert hi >= seq
 
@@ -1967,7 +1967,7 @@ class TestU2aRound3EightNewlyWiredConversions:
     def test_merge_stamps_phase_on_legacy_baton(self, store, allocator):
         merge(
             store, allocator, "PR-1", merged_by="luria",
-            phase="merge", ts="2026-09-30T00:00:00Z",
+            phase="merge", ts="2026-09-30T00:00:00Z", require_participant=False,
         )
         archive_raw = (store.root / "archive" / "PR-1.md").read_text()
         fields, _ = md.parse_frontmatter(archive_raw)
@@ -1981,7 +1981,7 @@ class TestU2aRound3EightNewlyWiredConversions:
         a = SeqAllocator(recover=s.recover_max_seq)
         merge(
             s, a, "PR-1", merged_by="luria",
-            phase="merge", ts="2026-09-30T00:00:00Z",
+            phase="merge", ts="2026-09-30T00:00:00Z", require_participant=False,
         )
         archive_raw = (s.root / "archive" / "PR-1.md").read_text()
         fields, _ = md.parse_frontmatter(archive_raw)

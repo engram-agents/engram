@@ -11,7 +11,7 @@ Contract:
   M3  /merge on an ANCHORED baton: no participant gate; GitHub decides.
   M4  coordination.merge(): the same ``require_participant`` / ``NotAParticipant``
       path as close(); checked under the lock, after not-found and before the
-      anchor binding and the seq; default keeps every existing caller unchanged.
+      anchor binding and the seq; default is True (#3488), False opts out.
   C1  client wording pins: ``baton gc``'s 403/409/503 refusal lines and
       ``baton merge``'s 409/503 "GitHub merge succeeded ... could not confirm" hint.
 """
@@ -165,9 +165,12 @@ class TestCoordinationMergeGate:
             _merge_fn(store, allocator, "PR-43", merged_by=OUTSIDER, require_participant=True)
         assert _snap(parts, "PR-43") == before
 
-    def test_default_keeps_existing_callers_unchanged(self, parts):
+    def test_explicit_false_skips_the_gate(self, parts):
+        # #3488: the default is now True (secure by default); the old
+        # default-keeps-callers-unchanged behaviour is an explicit opt-out.
         store, allocator = parts
-        seq = _merge_fn(store, allocator, "PR-43", merged_by=OUTSIDER)  # no kwarg
+        seq = _merge_fn(store, allocator, "PR-43", merged_by=OUTSIDER,
+                        require_participant=False)
         assert seq > 0
         assert store.read_project("PR-43") is None
 
