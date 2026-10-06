@@ -82,6 +82,14 @@ class _TmpMixin:
         self.mod.PID_PATH = self.pid
         self.procs: list[subprocess.Popen] = []
         self.addCleanup(self._reap)
+        # A refusal waits a backoff before exiting (default 60 s). These cells
+        # run refusals through the real main(); keep them fast. The backoff
+        # itself is pinned in test_surface_daemon_refusal_backoff_3361.py.
+        env = unittest.mock.patch.dict(
+            os.environ, {"ENGRAM_DAEMON_REFUSAL_BACKOFF_S": "0"}
+        )
+        env.start()
+        self.addCleanup(env.stop)
 
     def _reap(self):
         for p in self.procs:

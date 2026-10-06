@@ -246,6 +246,8 @@
   "hooks/claude/engram-surface-daemon.py:idle_watchdog",
   "hooks/claude/engram-surface-daemon.py:cleanup",
   "hooks/claude/engram-surface-daemon.py:_recorded_pid_is_alive",
+  "hooks/claude/engram-surface-daemon.py:_refusal_backoff_s",
+  "hooks/claude/engram-surface-daemon.py:_wait_refusal_backoff",
   "hooks/claude/engram-surface-daemon.py:_pids_holding_inode",
   "hooks/claude/engram-surface-daemon.py:_holder_cwds",
   "hooks/claude/engram-surface-daemon.py:_socket_holder_state",

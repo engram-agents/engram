@@ -387,6 +387,52 @@ def _recorded_pid_is_alive() -> bool:
 EXIT_SOCKET_HELD = 75       # another live process holds SOCKET_PATH
 EXIT_SOCKET_UNPROVEN = 76   # could not prove SOCKET_PATH is unheld (fail closed)
 
+# #3361: a refusal waits this long BEFORE exiting. Under systemd
+# (Restart=always) and launchd (KeepAlive true) an immediate exit would
+# relaunch at once and hot-loop; with the wait the refusal repeats about once a
+# minute and still self-heals the moment the holder goes away. Deliberately a
+# daemon-side wait, not RestartPreventExitStatus / ThrottleInterval: a
+# prevented restart leaves the unit `failed`, which start-engram-daemon.sh
+# reads as registered-failing and never relaunches, so the refusal would stick
+# even after the holder died.
+REFUSAL_BACKOFF_S = 60
+_REFUSAL_BACKOFF_MAX_S = 3600
+
+
+def _refusal_backoff_s() -> float:
+    """Seconds to wait before a refusal exit.
+
+    ENGRAM_DAEMON_REFUSAL_BACKOFF_S (float seconds) overrides REFUSAL_BACKOFF_S.
+    Missing, empty, non-numeric, negative or non-finite falls back to the
+    default silently (no extra log line). 0 means no wait. Capped at 3600.
+    """
+    raw = os.environ.get("ENGRAM_DAEMON_REFUSAL_BACKOFF_S", "")
+    try:
+        val = float(raw)
+    except (ValueError, TypeError):
+        return REFUSAL_BACKOFF_S
+    if not (val >= 0) or val == float("inf"):  # negative, nan, inf
+        return REFUSAL_BACKOFF_S
+    return min(val, _REFUSAL_BACKOFF_MAX_S)
+
+
+def _wait_refusal_backoff(seconds: float) -> None:
+    """Sleep `seconds` before a refusal exit.
+
+    No signal handler is installed at the refusal point (the daemon's
+    SIGTERM/SIGINT handlers come after the bind), so SIGTERM's default action
+    ends a plain sleep at once and `systemctl stop` / a launchd unload are not
+    delayed. SIGINT surfaces as KeyboardInterrupt; end the wait quietly so the
+    refusal exit code is still returned rather than a traceback.
+    """
+    if seconds <= 0:
+        return
+    try:
+        time.sleep(seconds)
+    except KeyboardInterrupt:
+        pass
+
+
 _LSOF_TIMEOUT_S = 5
 
 
@@ -584,7 +630,9 @@ def main():
                 f"process(es) pid={who} -- refusing to steal it (exit "
                 f"{EXIT_SOCKET_HELD})",
                 file=sys.stderr,
+                flush=True,
             )
+            _wait_refusal_backoff(_refusal_backoff_s())
             sys.exit(EXIT_SOCKET_HELD)
         if state == "UNKNOWN":
             print(
@@ -593,7 +641,9 @@ def main():
                 "answer) -- refusing to remove it; if you know it is stale, "
                 f"remove it by hand (exit {EXIT_SOCKET_UNPROVEN})",
                 file=sys.stderr,
+                flush=True,
             )
+            _wait_refusal_backoff(_refusal_backoff_s())
             sys.exit(EXIT_SOCKET_UNPROVEN)
         # Two race windows, which are NOT the same:
         # (a) FREE -> os.unlink (microseconds): a non-daemon process that
