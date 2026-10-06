@@ -51,6 +51,17 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.append(str(_TOOLS_DIR))
 
 
+@pytest.fixture(autouse=True)
+def _gh_says_merged(monkeypatch):
+    """#3416: /gc and /merge on an anchored baton read GitHub server-side. This
+    file tests phase handling, not PR state; pin the read so it never shells out."""
+    from forum import board_projects
+    # WARNING: pins "merged" for EVERY test here, whatever the client asks for. A
+    # future test that closes an anchored baton as ``cancelled`` would silently get
+    # ``merged``; give that test its own stub.
+    monkeypatch.setattr(board_projects, "_gh_pr_state", lambda n, r: "merged")
+
+
 @pytest.fixture
 def world(tmp_path, monkeypatch):
     w = World(tmp_path, monkeypatch)

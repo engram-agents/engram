@@ -19,6 +19,7 @@ import sqlite3
 import sys
 import tarfile
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -1489,6 +1490,107 @@ def _read_project_state(store, pid: str) -> tuple[str, str]:
         fields.get("turn", "").strip().lower(),
         fields.get("status", "").strip().lower(),
     )
+
+
+def _unparsed_anchor_503(pid: str, stored: str):
+    """#3416 round 2: the 503 for a baton whose ``github`` anchor is present but
+    unreadable. Nothing has been written; the way out is a participant's /status."""
+    return jsonify({"error": f"the github anchor {stored!r} on {pid} could not be parsed "
+                    "(or the anchor parser is unavailable), so the PR state cannot be "
+                    f"read; nothing written for {pid}. A participant can close the baton "
+                    "with /status."}), 503
+
+
+_GH_ADMISSION_LIMIT = 4
+_GH_ADMISSION = threading.BoundedSemaphore(_GH_ADMISSION_LIMIT)
+
+
+def _gh_busy_503(pid: str, repo: str, number):
+    """#3416 round 3: the 503 when the shared gh admission bound is full."""
+    return jsonify({"error": f"the server is busy reading PR state from GitHub (too many "
+                    f"reads in flight); no GitHub call was made for {repo}#{number} and "
+                    f"nothing was written for {pid}. Busy, retry shortly."}), 503
+
+
+def _anchor_changed_409(pid: str, e):
+    """#3416 round 3: the 409 for a baton re-anchored while the gh read was outstanding."""
+    old = e.expected or "(none)"
+    new = e.actual or "(none)"
+    return jsonify({"error": f"the github anchor changed during the GitHub check on {pid} "
+                    f"({old} -> {new}); the PR state read was for the old anchor, so "
+                    f"nothing was written for {pid}. Retry."}), 409
+
+
+def _server_pr_read(store, pid: str):
+    """#3416: the server's OWN read of a baton's anchored PR -- never the client's.
+
+    Returns ``None`` when there is nothing to verify: the baton does not exist
+    (the route's own 404 handles it) or it has no repo-qualified PR anchor
+    (no anchor, ``project/N``, or an unqualified ``pr/N`` -- there is no default
+    repo to ask, #1918). Otherwise ``(repo, number, state)`` with ``state`` one
+    of ``merged`` / ``closed`` / ``open`` / ``unknown``. ``unknown`` (gh missing,
+    non-zero exit, timeout, unparseable output, or the anchor parser itself
+    unavailable) is the caller's 503: it must write nothing and must NEVER fall
+    back to client-supplied state.
+
+    A NON-EMPTY anchor that does not parse (a full URL, ``pr/o/r/5/``,
+    ``owner/repo#5``, an overlong number, ...) is NOT "unanchored": the baton
+    names a PR we cannot read, so it fails closed as ``(<stored value>, None,
+    "unknown")`` -- ``number is None`` marks this case, and the ``repo`` slot
+    carries the stored anchor for the 503 message (see ``_unparsed_anchor_503``).
+    The same shape is returned when the parser module cannot be loaded.
+
+    Reuses ``board_projects._gh_pr_state`` (``gh pr view --repo``, 10s timeout,
+    never raises) and baton_gate's ``_parse_github_anchor`` -- no new credential,
+    client or parser. The call blocks up to 10s inside the request.
+
+    Returns ``(verdict, expected_anchor)`` (#3416 round 3, anchor TOCTOU): ``verdict``
+    is the value described above; ``expected_anchor`` is the normalised
+    (stripped, lowercased) ``github`` field of the SAME single read of the baton the
+    gh query was derived from -- ``""`` for an unanchored baton AND for a baton that
+    does not exist yet (so one created, anchored, before the write is refused as
+    drift; a baton still missing at write time keeps the route's 404). The routes
+    hand it to ``close`` / ``merge``, which compare it under the allocator lock, so
+    the read that authorises the write and the write always see the same anchor.
+    The gh call itself stays outside any lock.
+    """
+    raw = store.read_project(pid)
+    if raw is None:
+        return (None, "")
+    fields, _ = _md.parse_frontmatter(raw)
+    stored = (fields.get("github") or "").strip()
+    anchor = stored.lower()
+    return (_verdict_for_anchor(stored, anchor), anchor)
+
+
+def _verdict_for_anchor(stored: str, anchor: str):
+    """The verdict half of :func:`_server_pr_read` (see its docstring)."""
+    if not anchor:
+        return None
+    gate = _load_baton_gate()
+    if gate is None:
+        # A baton HAS an anchor but we cannot parse it: fail closed, not "unanchored".
+        return (stored, None, "unknown")
+    parsed = gate._parse_github_anchor(anchor)
+    if parsed is None:
+        # Present but unreadable: the baton names a PR we cannot ask about. Fail
+        # closed (503), never "unanchored" (which would trust the caller).
+        return (stored, None, "unknown")
+    if parsed[0] != "pr" or parsed[1] is None:
+        # The deliberately unanchored shapes the parser recognises: ``project/N``
+        # and the unqualified ``pr/N`` (no repo to ask, #1918).
+        return None
+    _, repo, number = parsed
+    # Admission bound (#3416 round 3): at most _GH_ADMISSION_LIMIT gh reads in
+    # flight across /gc and /merge. Non-blocking: when full, answer "busy" WITHOUT
+    # calling gh (the routes turn it into 503). Only this branch makes a gh call, so
+    # the unanchored / unparseable paths above never touch the semaphore. No cache.
+    if not _GH_ADMISSION.acquire(blocking=False):
+        return (repo, number, "busy")
+    try:
+        return (repo, number, board_projects._gh_pr_state(number, repo))
+    finally:
+        _GH_ADMISSION.release()
 
 
 # #3276: a daily backup on a host that is off ~10.5h nightly tolerates exactly
@@ -4003,10 +4105,21 @@ def create_app(
         ``close`` never writes a transition phase, so there is no
         ``transition_phase`` field here either.
         Response: {seq, turn, status}, 201.
-        Errors: 400, 404, 409 (baton already closed, #3313; nothing written).
-        No participant gate (403) on this route -- see the in-body note.
+        Errors: 400, 403, 404, 409 (baton already closed, #3313; or, #3416, the anchored
+        PR is still OPEN; nothing written), 503 (#3416: the server could not read
+        the anchored PR's state; nothing written).
+        403 (#3416 ruling (a)): on an UNANCHORED baton the caller must be a
+        participant, same gate and message as ``/status``; nothing written. On an
+        ANCHORED baton there is no participant gate (the server derives the state).
+        #3416: on a baton with a repo-qualified PR anchor the server derives the
+        PR state itself and IGNORES ``new_status`` (merged -> ``merged``, closed
+        unmerged -> ``cancelled``); the client's value only matters on an
+        unanchored baton.
         """
-        from forum.coordination import close as _close, ProjectNotFound, AlreadyClosed
+        from forum.coordination import (
+            close as _close, ProjectNotFound, AlreadyClosed, NotAParticipant, AnchorChanged,
+        )
+        from forum.coordination.store_file import CLOSED_STATUSES as _CLOSED_STATUSES
 
         store = app.config.get("COORD_STORE")
         allocator = app.config.get("COORD_ALLOCATOR")
@@ -4037,18 +4150,62 @@ def create_app(
         if phase_refusal is not None:
             return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
 
+        # #3416: on a baton with a repo-qualified PR anchor the SERVER reads the
+        # PR state and the client's ``new_status`` is ignored for the decision.
+        # Unanchored batons fall through to the pre-#3416 client-trusting path.
+        # A baton that is already closed is answered 409 before any gh call (and
+        # _close re-checks under the lock).
+        raw_now = store.read_project(pid)
+        if raw_now is not None:
+            _cur = _md.parse_frontmatter(raw_now)[0].get("status", "").strip().lower()
+            if _cur in _CLOSED_STATUSES:
+                return jsonify({"error": f"project {pid} is already {_cur}; "
+                                "refusing to overwrite a closed status (reopen first)"}), 409
+        verdict, expected_anchor = _server_pr_read(store, pid)
+        if verdict is not None:
+            repo, number, state = verdict
+            if number is None:
+                return _unparsed_anchor_503(pid, repo)
+            if state == "busy":
+                return _gh_busy_503(pid, repo, number)
+            if state == "merged":
+                derived = "merged"
+            elif state == "closed":
+                derived = "cancelled"
+            elif state == "open":
+                return jsonify({"error": f"PR {repo}#{number} is still OPEN on GitHub; "
+                                f"refusing to close {pid}. Close the PR first, or have a "
+                                "participant use /status with a reason."}), 409
+            else:
+                return jsonify({"error": f"could not read the state of PR {repo}#{number} "
+                                "from GitHub (gh unreachable, failed or unparseable); "
+                                f"nothing written for {pid}. Retry later."}), 503
+            if derived != new_status:
+                logger.warning(
+                    "#3416 gc %s: client new_status=%r disagrees with GitHub state %s "
+                    "for %s#%s; closing %r (server-derived)",
+                    pid, new_status, state, repo, number, derived)
+            new_status = derived
+
         try:
             # #3313: the closed-state refusal (409) applies here too -- gc
             # only ever closes ACTIVE batons, so a double close is an
-            # overwrite. The PARTICIPANT gate is deliberately NOT applied on
-            # this route yet (require_participant=False): `baton gc` is run by
-            # whoever sweeps and is a participant of only a minority of live
-            # PR batons, so gating it would break the sweep. That is an open
-            # design decision on #3313, not a settled exemption.
+            # overwrite. #3416 (Kepler ruling (a), 2026-10-06): the PARTICIPANT
+            # gate applies on an UNANCHORED baton (verdict is None), where the
+            # client's word is all there is -- same gate and 403 as /status.
+            # On an ANCHORED baton the server derived the state from GitHub,
+            # so the invoker's identity decides nothing and a sweeper who is
+            # not a participant can still close it.
             seq = _close(store, allocator, pid, invoker=agent, new_status=new_status,
-                         reason=reason, phase=phase, require_participant=False)
+                         reason=reason, phase=phase,
+                         require_participant=(verdict is None),
+                         expected_anchor=expected_anchor)
+        except AnchorChanged as e:
+            return _anchor_changed_409(pid, e)
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
+        except NotAParticipant:
+            return jsonify({"error": f"agent {agent!r} is not a participant of {pid}"}), 403
         except AlreadyClosed as e:
             return jsonify({"error": f"project {pid} is already {e.status}; "
                             "refusing to overwrite a closed status (reopen first)"}), 409
@@ -4071,8 +4228,11 @@ def create_app(
         ``status``, never ``phase``), so there is no ``transition_phase``
         field here.
         Response: {seq, status: "merged"}, 201. (turn omitted — file is in archive/).
+        #3416: on a baton with a repo-qualified PR anchor the server reads GitHub
+        itself and answers 409 unless the PR is MERGED, 503 (nothing written) if
+        it cannot read the state. ``forced`` does not skip this check.
         """
-        from forum.coordination import merge as _merge, ProjectNotFound
+        from forum.coordination import merge as _merge, ProjectNotFound, AnchorChanged
 
         store = app.config.get("COORD_STORE")
         allocator = app.config.get("COORD_ALLOCATOR")
@@ -4100,8 +4260,29 @@ def create_app(
         if phase_refusal is not None:
             return jsonify({"error": phase_refusal[0]}), phase_refusal[1]
 
+        # #3416: on an anchored baton the server requires GitHub MERGED (it never
+        # takes the client's word, and ``forced`` does not skip this). Unanchored
+        # batons keep the pre-#3416 behaviour.
+        verdict, expected_anchor = _server_pr_read(store, pid)
+        if verdict is not None:
+            repo, number, state = verdict
+            if number is None:
+                return _unparsed_anchor_503(pid, repo)
+            if state == "busy":
+                return _gh_busy_503(pid, repo, number)
+            if state in ("open", "closed"):
+                return jsonify({"error": f"PR {repo}#{number} is {state.upper()} on GitHub, "
+                                f"not MERGED; refusing to close {pid} as merged."}), 409
+            if state != "merged":
+                return jsonify({"error": f"could not read the state of PR {repo}#{number} "
+                                "from GitHub (gh unreachable, failed or unparseable); "
+                                f"nothing written for {pid}. Retry later."}), 503
+
         try:
-            seq = _merge(store, allocator, pid, merged_by=agent, forced=forced, phase=phase)
+            seq = _merge(store, allocator, pid, merged_by=agent, forced=forced, phase=phase,
+                         expected_anchor=expected_anchor)
+        except AnchorChanged as e:
+            return _anchor_changed_409(pid, e)
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 

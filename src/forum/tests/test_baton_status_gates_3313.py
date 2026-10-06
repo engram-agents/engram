@@ -360,12 +360,29 @@ class TestCliSurfacesRefusals:
 # Round 2: /gc exemption pin, read-outside-lock window, 'done' measurement
 # ---------------------------------------------------------------------------
 
-class TestGcRouteExemptionPinned:
-    def test_non_participant_can_gc_close_an_active_baton(self, client, parts):
-        """The /gc route deliberately has NO participant gate (open design
-        question on #3313): a sweeper who is not a participant still closes."""
-        resp = client.post("/api/projects/PR-42/gc", json={
-            "agent": "sweeper-not-listed", "new_status": "merged", "reason": "gc"})
+class TestGcRouteParticipantGateUnanchored:
+    """#3416, Kepler ruling (a): /gc gates an UNANCHORED baton (PR-42 here has no
+    ``github`` anchor) exactly like /status. The anchored path has no gate and is
+    pinned in test_baton_gc_merge_server_state_3416.py."""
+
+    def _gc(self, client, agent):
+        return client.post("/api/projects/PR-42/gc", json={
+            "agent": agent, "new_status": "merged", "reason": "gc"})
+
+    def test_non_participant_gc_on_unanchored_is_refused_like_status(self, client, parts):
+        before = _snapshot(*parts)
+        gc_resp = self._gc(client, "sweeper-not-listed")
+        assert gc_resp.status_code == 403
+        assert "sweeper-not-listed" in gc_resp.get_json()["error"]
+        assert "is not a participant of PR-42" in gc_resp.get_json()["error"]
+        assert _snapshot(*parts) == before
+        # same refusal (code + message shape) as /status
+        st_resp = _status(client, "sweeper-not-listed", "merged")
+        assert st_resp.status_code == gc_resp.status_code
+        assert st_resp.get_json() == gc_resp.get_json()
+
+    def test_participant_gc_on_unanchored_still_closes(self, client, parts):
+        resp = self._gc(client, "luria")
         assert resp.status_code == 201
         assert resp.get_json()["status"] == "merged"
         assert "status: merged" in parts[0].read_project("PR-42")

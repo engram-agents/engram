@@ -2191,7 +2191,20 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
             })
             print(f"baton gc: closed {project_id} → {new_status} ({repo}#{pr_num})")
             closed += 1
-        except (ForumNetworkError, ForumHttpError) as e:
+        except ForumHttpError as e:
+            if e.status in (403, 409, 503):
+                # #3416: the server derives the PR state itself (the client's
+                # new_status is advisory only). 409 = refused (PR still OPEN /
+                # already closed); 503 = server could not read GitHub; 403 =
+                # unanchored baton and the caller is not a participant (same
+                # refusal /status gives). Either way nothing was written; print
+                # the server's own message.
+                print(f"baton gc: server refused {project_id} (HTTP {e.status}): "
+                      f"{_server_refusal_text(e)}", file=sys.stderr)
+            else:
+                print(f"baton gc: write failed for {project_id}: {e!r}", file=sys.stderr)
+            failed += 1
+        except ForumNetworkError as e:
             print(f"baton gc: write failed for {project_id}: {e!r}", file=sys.stderr)
             failed += 1
         except Exception as e:
@@ -2802,6 +2815,16 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
         sys.exit(EXIT_IO)
     except ForumHttpError as e:
         print(f"baton merge: baton closure failed ({e.status}): {e.body}", file=sys.stderr)
+        if e.status in (409, 503):
+            # #3416: the server re-reads GitHub itself before closing. 409 = it
+            # does not (yet) see the PR as MERGED; 503 = it could not read
+            # GitHub. Nothing was written; the GitHub merge above did succeed.
+            print(
+                f"  (GitHub merge succeeded; the server could not confirm it. "
+                f"Retry later, or close the baton: baton close {project_id} "
+                f"--status merged)",
+                file=sys.stderr,
+            )
         sys.exit(EXIT_IO)
 
     print(f"baton merge: PR #{pr_number} merged (squash)")

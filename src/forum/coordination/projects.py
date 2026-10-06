@@ -100,6 +100,36 @@ class NotAParticipant(Exception):
     """
 
 
+class AnchorChanged(Exception):
+    """Raised by ``close`` / ``merge`` when the baton's ``github`` anchor is no longer
+    the one the caller's authorising read was made against (#3416 round 3).
+
+    The server's PR-state read happens OUTSIDE the allocator lock (it is gh I/O), so
+    the baton can be re-anchored while it is outstanding. The write binds itself to
+    the anchor that was actually queried and refuses, before claiming a seq or
+    touching a byte, if it moved. ``expected`` / ``actual`` are the normalised
+    (stripped, lowercased) anchors; ``""`` means unanchored.
+    """
+
+    def __init__(self, project_id: str, expected: str, actual: str):
+        super().__init__(
+            f"the github anchor of {project_id} changed from {expected!r} to {actual!r}")
+        self.project_id = project_id
+        self.expected = expected
+        self.actual = actual
+
+
+def _check_expected_anchor(project_id: str, fields: dict, expected_anchor: Optional[str]) -> None:
+    """Under-lock anchor binding. ``expected_anchor=None`` = don't check; ``""`` = the
+    caller read the baton as unanchored. Same normalisation the server read uses."""
+    if expected_anchor is None:
+        return
+    actual = (fields.get("github") or "").strip().lower()
+    expected = expected_anchor.strip().lower()
+    if actual != expected:
+        raise AnchorChanged(project_id, expected, actual)
+
+
 class AlreadyClosed(Exception):
     """Raised by ``close`` when the baton is ALREADY in a closed status (#3313).
 
@@ -631,6 +661,7 @@ def close(
     transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
     require_participant: bool = True,
+    expected_anchor: Optional[str] = None,
 ) -> int:
     """Pure write body of baton cmd_close / gc.
 
@@ -644,8 +675,9 @@ def close(
     2. ``NotAParticipant`` -- ``invoker`` (case-insensitive) is not in the
        baton's ``participants`` list (same predicate as ``add_participant``).
        Skipped only when ``require_participant=False``, an in-process kwarg
-       (never wire-exposed) used by the ``/gc`` route pending the #3313 gc
-       decision.
+       (never wire-exposed) used by the ``/gc`` route on an ANCHORED baton only
+       (#3416: the server derives the PR state there); on an unanchored baton
+       ``/gc`` keeps the gate.
     3. ``AlreadyClosed`` -- the baton's current status is already in
        ``CLOSED_STATUSES``; a close on top of a closed baton is an overwrite.
        Applies to every close-direction write regardless of ``new_status``.
@@ -674,6 +706,11 @@ def close(
             above).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
         require_participant: in-process only; ``False`` skips gate 2.
+        expected_anchor: in-process only (#3416 round 3). ``None`` (default) = no
+            check. Otherwise the normalised ``github`` anchor the caller's
+            authorising read was made against (``""`` = unanchored); compared under
+            the lock, before a seq is claimed, and a mismatch raises
+            :class:`AnchorChanged` (nothing written).
 
     Returns:
         The seq assigned to this mutation.
@@ -682,6 +719,7 @@ def close(
         ProjectNotFound: if ``project_id`` has no existing baton file.
         NotAParticipant: if ``invoker`` is not a current participant.
         AlreadyClosed: if the baton is already in a closed status.
+        AnchorChanged: if ``expected_anchor`` is given and the stored anchor differs.
     """
     now = ts or md.now_iso()
     invoker_n = invoker.strip().lower()
@@ -699,6 +737,7 @@ def close(
         current_status = fields.get("status", "").strip().lower()
         if current_status in CLOSED_STATUSES:
             raise AlreadyClosed(project_id, current_status)
+        _check_expected_anchor(project_id, fields, expected_anchor)
         phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
         if transition_phase is not None:
             phase_updates["phase"] = transition_phase
@@ -724,6 +763,7 @@ def merge(
     phase: Optional[str] = None,
     transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
+    expected_anchor: Optional[str] = None,
 ) -> int:
     """Mark a project baton as merged and archive it; return the assigned seq.
 
@@ -762,12 +802,18 @@ def merge(
             this for ``merge`` (it defines no transition; see class
             docstring above).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+        expected_anchor: in-process only (#3416 round 3). ``None`` (default) = no
+            check. Otherwise the normalised ``github`` anchor the caller's
+            authorising read was made against (``""`` = unanchored); compared under
+            the lock, before a seq is claimed, and a mismatch raises
+            :class:`AnchorChanged` (nothing written).
 
     Returns:
         The seq assigned to this mutation.
 
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
+        AnchorChanged: if ``expected_anchor`` is given and the stored anchor differs.
     """
     # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
     with allocator.locked() as claim_seq:
@@ -778,6 +824,7 @@ def merge(
         now = ts or md.now_iso()
         merged_by_n = merged_by.strip().lower()
         fields, _ = md.parse_frontmatter(content)
+        _check_expected_anchor(project_id, fields, expected_anchor)
         phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
         if transition_phase is not None:
             phase_updates["phase"] = transition_phase

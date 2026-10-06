@@ -34,6 +34,7 @@ from .dm import dm_send, dm_read, dm_list
 from .projects import (
     AdvanceRefused,
     AlreadyClosed,
+    AnchorChanged,
     AdvanceResult,
     NotAParticipant,
     advance,
@@ -68,6 +69,7 @@ __all__ = [
     "AdvanceRefused",
     "AdvanceResult",
     "AlreadyClosed",
+    "AnchorChanged",
     "NotAParticipant",
     "ProjectAlreadyExists",
     "ProjectNotFound",

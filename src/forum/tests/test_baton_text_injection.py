@@ -54,6 +54,17 @@ from forum.tests.test_baton_advance_api import (
 
 NEWBIE = "example-agent-new"
 
+
+@pytest.fixture(autouse=True)
+def _gh_says_merged(monkeypatch):
+    """#3416: /gc and /merge on an anchored baton read GitHub server-side. This
+    file tests text sanitisation, not PR state; pin the read so it never shells out."""
+    from forum import board_projects
+    # WARNING: pins "merged" for EVERY test here, whatever the client asks for. A
+    # future test that closes an anchored baton as ``cancelled`` would silently get
+    # ``merged``; give that test its own stub.
+    monkeypatch.setattr(board_projects, "_gh_pr_state", lambda n, r: "merged")
+
 # Every separator the sanitiser must neutralise. Measured: only LF and CR (and
 # CRLF) actually split frontmatter lines through the store's text-mode read; the
 # rest are inert today but are rejected / normalised anyway so a parser change
