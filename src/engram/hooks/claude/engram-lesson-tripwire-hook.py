@@ -140,23 +140,29 @@ TRIPWIRE_BLOCK_CHAR_CEILING = 1800
 # tests share exactly one copy of the literal text.
 TRIPWIRE_HEADER = "[lesson-tripwire] Action-moment pattern matched — remember:"
 
+# #3485: every json_extract reads through CASE WHEN json_valid(metadata) THEN
+# metadata END. A non-JSON blob in nodes.metadata otherwise makes SQLite abort
+# the WHOLE query ("malformed JSON"), and load_tripwires' `except Exception:
+# return []` then silences the tripwire layer for EVERY lesson, not just the
+# bad row. The guarded read yields NULL for a bad blob, so only that row drops
+# out. (Plain SQL text, no helper: the hook cannot import server code.)
 _QUERY = """
 SELECT
     id,
     COALESCE(
-        json_extract(metadata, '$.scaffolding_nudge'),
-        json_extract(metadata, '$.anchor_line'),
-        json_extract(metadata, '$.surfacing_nudge'),
+        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.scaffolding_nudge'),
+        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.anchor_line'),
+        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.surfacing_nudge'),
         claim
     ) AS nudge,
-    json_extract(metadata, '$.situation_pattern')  AS pattern,
-    json_extract(metadata, '$.tripwire_priority')  AS priority
+    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,
+    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.tripwire_priority')  AS priority
 FROM nodes
 WHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')
   AND is_current = 1
   AND memory_status = 'active'
-  AND json_extract(metadata, '$.situation_pattern') IS NOT NULL
-  AND json_extract(metadata, '$.situation_pattern') != ''
+  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') IS NOT NULL
+  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') != ''
 """
 
 
@@ -687,19 +693,21 @@ def _append_ws4_fire_ledger(entry: dict) -> None:
 
 PREVENTION_LEDGER_PATH = Path(ENGRAM_HOME) / "lesson-prevention-ledger.jsonl"
 
+# #3485: same json_valid guard as _QUERY above (one bad blob must not abort the
+# whole read and silence every shadow/blocking lesson).
 _PREVENTION_QUERY = """
 SELECT
     id,
-    json_extract(metadata, '$.situation_pattern')  AS pattern,
-    json_extract(metadata, '$.prevention_type')    AS prevention_type,
-    COALESCE(json_extract(metadata, '$.scaffolding_nudge'), claim) AS nudge
+    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,
+    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.prevention_type')    AS prevention_type,
+    COALESCE(json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.scaffolding_nudge'), claim) AS nudge
 FROM nodes
 WHERE type = 'lesson'
   AND is_current = 1
   AND memory_status = 'active'
-  AND json_extract(metadata, '$.situation_pattern') IS NOT NULL
-  AND json_extract(metadata, '$.situation_pattern') != ''
-  AND json_extract(metadata, '$.prevention_type') IN ('shadow', 'blocking')
+  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') IS NOT NULL
+  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') != ''
+  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.prevention_type') IN ('shadow', 'blocking')
 """
 
 

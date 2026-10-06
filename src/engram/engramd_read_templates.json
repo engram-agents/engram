@@ -30,13 +30,6 @@
       ]
     },
     {
-      "key": "2ebd973676462df3efb4be4e82d0835e47ee84b6b9a6f7361806daa776dac09d",
-      "sql": "\nSELECT\n    id,\n    json_extract(metadata, '$.situation_pattern')  AS pattern,\n    json_extract(metadata, '$.prevention_type')    AS prevention_type,\n    COALESCE(json_extract(metadata, '$.scaffolding_nudge'), claim) AS nudge\nFROM nodes\nWHERE type = 'lesson'\n  AND is_current = 1\n  AND memory_status = 'active'\n  AND json_extract(metadata, '$.situation_pattern') IS NOT NULL\n  AND json_extract(metadata, '$.situation_pattern') != ''\n  AND json_extract(metadata, '$.prevention_type') IN ('shadow', 'blocking')\n",
-      "sites": [
-        "hooks/claude/engram-lesson-tripwire-hook.py:load_prevention_lessons"
-      ]
-    },
-    {
       "key": "4795866d2d19b5085970ad79dd2705359930118747cd19d1ec6eb405627befb9",
       "sql": "SELECT id, type FROM nodes WHERE id = ?",
       "sites": [
@@ -81,6 +74,13 @@
       ]
     },
     {
+      "key": "755fd8686d5feac4204716df355f3c6656f9505332e06102735d02ab15135c23",
+      "sql": "\nSELECT\n    id,\n    COALESCE(\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.scaffolding_nudge'),\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.anchor_line'),\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.surfacing_nudge'),\n        claim\n    ) AS nudge,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.tripwire_priority')  AS priority\nFROM nodes\nWHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')\n  AND is_current = 1\n  AND memory_status = 'active'\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') IS NOT NULL\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') != ''\n",
+      "sites": [
+        "hooks/claude/engram-lesson-tripwire-hook.py:load_tripwires"
+      ]
+    },
+    {
       "key": "9f6da2c7f988f5d2d40b7cdf6afe3d1fef5abb993b47a72b16fe9070cc0c3c05",
       "sql": "SELECT count(*) FROM nodes",
       "sites": [
@@ -116,6 +116,13 @@
       ]
     },
     {
+      "key": "bca59f0784091d50dfa65e9ee9d35288defe5503524b0e43437bb701e1dc7e80",
+      "sql": "\nSELECT\n    id,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.prevention_type')    AS prevention_type,\n    COALESCE(json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.scaffolding_nudge'), claim) AS nudge\nFROM nodes\nWHERE type = 'lesson'\n  AND is_current = 1\n  AND memory_status = 'active'\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') IS NOT NULL\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') != ''\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.prevention_type') IN ('shadow', 'blocking')\n",
+      "sites": [
+        "hooks/claude/engram-lesson-tripwire-hook.py:load_prevention_lessons"
+      ]
+    },
+    {
       "key": "c7ebb686c91c35f89f5bff3b5f1e3b9a746e2568d35a35899fc868a0d8d99223",
       "sql": "SELECT id, claim, logical_chain, metadata FROM nodes WHERE type = 'person' AND is_current = 1",
       "sites": [
@@ -141,13 +148,6 @@
       "sql": "SELECT utility_score FROM nodes WHERE id = ?",
       "sites": [
         "hooks/claude/engram-utility-credit-mention-stop.py:bump_utility"
-      ]
-    },
-    {
-      "key": "d8df8312219022c740ab529591974426fb042368432378fde0c9fd47dcc07840",
-      "sql": "\nSELECT\n    id,\n    COALESCE(\n        json_extract(metadata, '$.scaffolding_nudge'),\n        json_extract(metadata, '$.anchor_line'),\n        json_extract(metadata, '$.surfacing_nudge'),\n        claim\n    ) AS nudge,\n    json_extract(metadata, '$.situation_pattern')  AS pattern,\n    json_extract(metadata, '$.tripwire_priority')  AS priority\nFROM nodes\nWHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')\n  AND is_current = 1\n  AND memory_status = 'active'\n  AND json_extract(metadata, '$.situation_pattern') IS NOT NULL\n  AND json_extract(metadata, '$.situation_pattern') != ''\n",
-      "sites": [
-        "hooks/claude/engram-lesson-tripwire-hook.py:load_tripwires"
       ]
     },
     {

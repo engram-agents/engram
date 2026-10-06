@@ -474,13 +474,15 @@ _REAL_CFG = REPO_ROOT / "tools" / "engramd_read_scan.config.json"
 _LINE_KEY = _re.compile(r":\d+$")
 
 # Frozen at #3342 (== origin/dev's file before the change): the sha256 of every
-# registered SQL. A site re-key must not move any of them.
+# registered SQL. A site re-key must not move any of them. (#3485 re-froze the
+# two lesson-tripwire-hook keys when their SQL gained the json_valid guard: a
+# SQL change legitimately moves its own key; a re-key must still move none.)
 _FROZEN_TEMPLATE_KEYS = frozenset({
     "0280b9b584a3522d55be45f09ec258c28ec2d8b8e0e3cf80267097f593c71462",
     "11d79fc4ecfafd263296a4ea553d76e8c995e961af23049158d6d89e80bf8088",
     "2743db24b60c27d0ad4e70e440219d2904a12aa08d4fdca11760b8445b3fdc9c",
     "276dce2997ab333e1583a542b4099dbb52e431db42c9d272ad0dbef63dfb3437",
-    "2ebd973676462df3efb4be4e82d0835e47ee84b6b9a6f7361806daa776dac09d",
+    "bca59f0784091d50dfa65e9ee9d35288defe5503524b0e43437bb701e1dc7e80",
     "4795866d2d19b5085970ad79dd2705359930118747cd19d1ec6eb405627befb9",
     "49ac1236d8081aa987ee1eafa9b3f4f10e48249f3f4c29446b8be5c73bd20412",
     "5961b023ce8247394b6d859ca4d0959c3ae34d2e9be481a8fd726899c795ef8e",
@@ -496,7 +498,7 @@ _FROZEN_TEMPLATE_KEYS = frozenset({
     "cbfeed1901ba8473aa2edd65b9a0f92931b0ae1d537e2b0d6ed3ee7b6f5c70c6",
     "cefc616a2876d56a7b84ead98f75fa894f5a3678510f4d5c5bbac0b78061feb8",
     "d8ae87a01e31523ab8daab4fc634e227cfdb00339c30995e50a0fe82f6b67be8",
-    "d8df8312219022c740ab529591974426fb042368432378fde0c9fd47dcc07840",
+    "755fd8686d5feac4204716df355f3c6656f9505332e06102735d02ab15135c23",
     "dc3d1b24f7b5d31cfb36abb9646c778d1dd42055b81cd0c99da5f206f23bc643",
     "e3872e7780af9a2fb346d7019adb7f9bd36fd49794c534d74c2f96e364c9d129",
     "f3fb3410d99851f0e833a131cbdc574e9e676b124dd85d9841250a21f8e05c0a",

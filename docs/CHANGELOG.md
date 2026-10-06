@@ -9,6 +9,22 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+- **The remaining `json_extract(metadata, ...)` read sites now guard with
+  `json_valid` too (#3485, follow-up to #3425).** Measured: one non-JSON blob
+  in `nodes.metadata` made BOTH lesson-tripwire loaders (`load_tripwires`,
+  `load_prevention_lessons`) return `[]`, because the query aborted with
+  `malformed JSON` and the loaders' `except Exception: return []` swallowed it
+  — so one bad row silenced the tripwire layer for every lesson on every
+  prompt. Both hook queries and the `reconcile_lesson_demotions` lookup now
+  read through `json_extract(CASE WHEN json_valid(metadata) THEN metadata END,
+  ...)`: a bad blob reads as NULL and only that row drops out (the reconcile
+  tool skips it like a missing row). `engramd_read_templates.json` was
+  regenerated with `tools/engramd_read_scan.py` (the two hook entries; it is
+  generated from the hook source, not a separate site). A new drift guard,
+  `tests/test_json_extract_metadata_guard_3485.py`, fails on any SQL JSON
+  function or `->` / `->>` applied to an unguarded `metadata` column anywhere
+  under `src/engram/`, repo-root `tools/`, or the templates file.
+
 - **`nodes.metadata` must now be valid JSON or NULL (#3425).** Migration rung
   7 first quarantines every existing non-JSON blob (raw copy into the new
   `metadata_quarantine` table, the node's `metadata` set to NULL, nothing else

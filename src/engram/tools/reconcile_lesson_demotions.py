@@ -223,8 +223,12 @@ def find_candidates(
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
     try:
         for lesson_id in sorted(lesson_ids):
+            # #3485: json_valid-guarded, so a non-JSON metadata blob on one
+            # ledgered lesson reads as NULL (skipped below, like a missing
+            # row) instead of raising "malformed JSON" out of the whole run.
             row = conn.execute(
-                "SELECT json_extract(metadata, '$.prevention_type') FROM nodes "
+                "SELECT json_extract(CASE WHEN json_valid(metadata) THEN metadata END, "
+                "'$.prevention_type') FROM nodes "
                 "WHERE id = ? AND type = 'lesson' AND is_current = 1 "
                 "AND memory_status = 'active'",
                 (lesson_id,),
