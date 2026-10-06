@@ -345,3 +345,40 @@ def test_rekeyed_carry_over_refreshes_variants_and_count_and_says_so():
     assert ("The carried-over entry's `variants` and `count_at_ruling` are "
             "refreshed to the current finding's values") in bullet
     assert "and you say so in the dream record" in bullet
+
+
+# ---- #3473: the master must not prune a re-keyed entry ----------------------
+
+
+def _rekeyed_sentence() -> str:
+    """The master's sentence about entries marked `possibly re-keyed`."""
+    flat = _master_flat()
+    opening = "An entry the fairy marks `possibly re-keyed to <new key>`"
+    i = flat.find(opening)
+    assert i != -1, (
+        "dream-master spec no longer contains the re-keyed sentence "
+        f"opening: {opening}")
+    return flat[i: flat.index(". ", i) + 1]
+
+
+def test_master_does_not_prune_rekeyed_entry_and_carries_ruling_over():
+    """Meaning, not wording: a re-keyed entry is NOT an unmatched entry to
+    prune (i), and the ruling moves by writing the new key and removing the
+    old one, in that order (ii). Losing this only re-asks the human, but it
+    is behaviour the master acts on."""
+    s = _rekeyed_sentence()
+    # (i) not treated as gone / unmatched / prunable
+    assert "is not gone" in s
+    low = s.lower()
+    for bad in ("unmatched", "like any other", "prune"):
+        assert bad not in low, f"re-keyed entry must not be framed as: {bad}"
+    # close synonyms of "prune": whole-word start (so "dropped"/"deletes"
+    # also hit, but an unrelated longer word like "dropdown" is the only
+    # false-positive risk we accept; none occurs in the current sentence)
+    m = re.search(r"\b(drop|delete|discard)\w*", low)
+    assert m is None, (
+        f"re-keyed entry must not be framed as removable: {m.group(0)}")
+    # (ii) write under the new key, THEN remove the old one
+    assert re.search(
+        r"writing the entry under the new key.*removing the old one", s)
+    assert "so the ruling is not lost" in s
