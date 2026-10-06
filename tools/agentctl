@@ -968,6 +968,25 @@ _codex_managed_session() {
     exec tmux attach -t "$tmux_session"
 }
 
+# Shared launch prologue (#3451): run in the TARGET user's shell by every
+# Claude launch branch of cmd_session, before `cd`/`exec`. Same semantics as
+# deploy/autostart/agent-session-launch.sh (source ~/.engram/boot-env with
+# set -a/+a), so a manual `agentctl session` restart gives the seat the same
+# environment as a booted one. umask 022 matches the autostart status quo (the
+# `sudo -i` login shell inherits 0002). boot-env ABSENT is the normal state for
+# most seats: a true optional, silent. Present-but-unreadable is loud (one
+# stderr line) and not fatal. Printed by `agentctl __session-prologue` so the
+# tests eval the exact text the launch branches use.
+# ONE line on purpose: `sudo -i <cmd>` backslash-escapes a newline in the command
+# string, which the login shell reads as a line continuation (joining lines).
+session_prologue_text() {
+    cat <<'PROLOGUE'
+umask 022; if [ -e "$HOME/.engram/boot-env" ]; then if [ -r "$HOME/.engram/boot-env" ]; then set -a; . "$HOME/.engram/boot-env"; set +a; else echo "agentctl: WARNING: $HOME/.engram/boot-env exists but is not readable; launching without it" >&2; fi; fi
+PROLOGUE
+}
+
+cmd__session_prologue() { session_prologue_text; }
+
 cmd_session() {
     local name="${1:-}"; shift || true
     [[ -z "$name" ]] && {
@@ -1189,17 +1208,43 @@ cmd_session() {
     # no sudo/user-switch, just `exec` the platform binary in place. Same
     # argv construction (binary + tail_args) as the sudo path; only the
     # exec mechanism differs.
+    local prologue
+    prologue="$(session_prologue_text)"
     if [[ "$as_self" -eq 1 ]]; then
+        # This shell already IS the target user, so no sudo -- but the launch
+        # goes through the SAME form as the sudo branches below (bash -c,
+        # prologue first): a fresh bash child, without agentctl's
+        # `set -euo pipefail` and without its variable namespace (binary,
+        # user, tail_args, cwd_arg). A boot-env line that references an unset
+        # variable or returns non-zero therefore cannot abort the launch, and
+        # the sourced file cannot clobber agentctl's locals. The execution
+        # context (not only the text) is identical to the sudo branches.
+        # Behaviour change worth knowing: binary/adapter SELECTION below
+        # (`command -v "$binary"`, `-x "$HOME/.runtime/start.sh"`) uses the
+        # pre-prologue PATH and HOME of the invoking shell, while the child
+        # re-resolves `exec "$binary"` after boot-env ran. That matches the
+        # sudo branches, where the check runs in `sudo -i bash -c` and the
+        # exec comes after the prologue.
         if command -v "$binary" >/dev/null 2>&1; then
             if [[ ${#cwd_arg[@]} -gt 0 ]]; then
-                cd "${cwd_arg[0]}"
+                exec bash -c \
+                    "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec \"$binary\" \"\$@\"" \
+                    -- "${tail_args[@]}"
+            else
+                exec bash -c \
+                    "$prologue; exec \"$binary\" \"\$@\"" \
+                    -- "${tail_args[@]}"
             fi
-            exec "$binary" "${tail_args[@]}"
         elif [[ -x "$HOME/.runtime/start.sh" ]]; then
             if [[ ${#cwd_arg[@]} -gt 0 ]]; then
-                cd "${cwd_arg[0]}"
+                exec bash -c \
+                    "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec ~/.runtime/start.sh \"\$@\"" \
+                    -- "${tail_args[@]}"
+            else
+                exec bash -c \
+                    "$prologue; "'exec ~/.runtime/start.sh "$@"' \
+                    -- "${tail_args[@]}"
             fi
-            exec "$HOME/.runtime/start.sh" "${tail_args[@]}"
         else
             echo "ERROR: no $binary on PATH for $user (as-self) and no ~/.runtime/start.sh adapter" >&2
             exit 1
@@ -1207,20 +1252,24 @@ cmd_session() {
     elif sudo -u "$user" -i bash -c "command -v \"$binary\"" >/dev/null 2>&1; then
         if [[ ${#cwd_arg[@]} -gt 0 ]]; then
             sudo -u "$user" -i bash -c \
-                "cd $(printf '%q' "${cwd_arg[0]}") && exec \"$binary\" \"\$@\"" \
+                "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec \"$binary\" \"\$@\"" \
                 -- "${tail_args[@]}"
         else
-            sudo -u "$user" -i "$binary" "${tail_args[@]}"
+            sudo -u "$user" -i bash -c \
+                "$prologue; exec \"$binary\" \"\$@\"" \
+                -- "${tail_args[@]}"
         fi
     elif sudo -u "$user" -i bash -c 'test -x "$HOME/.runtime/start.sh"' 2>/dev/null; then
         # Fallback: ~/.runtime/start.sh adapter. Pass tail args only (not the
         # base binary word — the adapter knows what to launch).
         if [[ ${#cwd_arg[@]} -gt 0 ]]; then
             sudo -u "$user" -i bash -c \
-                "cd $(printf '%q' "${cwd_arg[0]}") && exec ~/.runtime/start.sh \"\$@\"" \
+                "$prologue; cd $(printf '%q' "${cwd_arg[0]}") && exec ~/.runtime/start.sh \"\$@\"" \
                 -- "${tail_args[@]}"
         else
-            sudo -u "$user" -i bash -c '~/.runtime/start.sh "$@"' -- "${tail_args[@]}"
+            sudo -u "$user" -i bash -c \
+                "$prologue; "'exec ~/.runtime/start.sh "$@"' \
+                -- "${tail_args[@]}"
         fi
     else
         echo "ERROR: no $binary on PATH for $user and no ~/.runtime/start.sh adapter" >&2
@@ -2441,6 +2490,7 @@ case "$SUBCMD" in
     help|--help|-h) cmd_help ;;
     __codex-managed-session) cmd__codex_managed_session "$@" ;;
     __expand-session-args) cmd__expand_session_args "$@" ;;
+    __session-prologue) cmd__session_prologue "$@" ;;
     __require-viz-operator) cmd__require_viz_operator "$@" ;;
     __read-viz-operator-config) cmd__read_viz_operator_config "$@" ;;
     __viz-operator-conf-provenance-ok) cmd__viz_operator_conf_provenance_ok "$@" ;;
