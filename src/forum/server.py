@@ -4274,8 +4274,11 @@ def create_app(
         if raw_now is not None:
             _cur = _md.parse_frontmatter(raw_now)[0].get("status", "").strip().lower()
             if _cur in _CLOSED_STATUSES:
+                # #3494: machine-readable reason/status so the client can tell this
+                # from the other 409s (error text unchanged).
                 return jsonify({"error": f"project {pid} is already {_cur}; "
-                                "refusing to overwrite a closed status (reopen first)"}), 409
+                                "refusing to overwrite a closed status (reopen first)",
+                                "reason": "already_closed", "status": _cur}), 409
 
         # #3416: on an anchored baton the server requires GitHub MERGED (it never
         # takes the client's word, and ``forced`` does not skip this). Unanchored
@@ -4310,8 +4313,10 @@ def create_app(
         except NotAParticipant:
             return jsonify({"error": f"agent {agent!r} is not a participant of {pid}"}), 403
         except AlreadyClosed as e:
+            # #3494: same reason/status fields as the pre-check site above.
             return jsonify({"error": f"project {pid} is already {e.status}; "
-                            "refusing to overwrite a closed status (reopen first)"}), 409
+                            "refusing to overwrite a closed status (reopen first)",
+                            "reason": "already_closed", "status": e.status}), 409
 
         return jsonify({"seq": seq, "status": "merged"}), 201
 

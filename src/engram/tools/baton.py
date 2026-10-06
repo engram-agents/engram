@@ -2519,6 +2519,31 @@ def cmd_set_colleague(args: argparse.Namespace, config: dict, agent_name: str, c
 # Subcommand: merge  (gate-checked merge verb — #999 + #1000)
 # ---------------------------------------------------------------------------
 
+_ALREADY_CLOSED_TEXT = "refusing to overwrite a closed status"
+
+
+def _merge_already_closed_status(e: "ForumHttpError"):
+    """#3494: the closed status named by an already-closed 409 from POST /merge,
+    else None. Reads the machine field (``reason == "already_closed"``); an older
+    server has none, so fall back to the stable fragment of its error text.
+    Returns ``""`` if recognised but the status cannot be read (callers must test
+    ``is not None``, not truthiness)."""
+    try:
+        parsed = json.loads(e.body)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if parsed.get("reason") == "already_closed":
+        status = parsed.get("status")
+        return str(status).strip() if status else ""
+    err = parsed.get("error")
+    if isinstance(err, str) and _ALREADY_CLOSED_TEXT in err:
+        m = re.search(r"is already (\S+?);", err)
+        return m.group(1) if m else ""
+    return None
+
+
 def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Squash-merge a PR through the baton gate ladder.
 
@@ -2815,7 +2840,26 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
         sys.exit(EXIT_IO)
     except ForumHttpError as e:
         print(f"baton merge: baton closure failed ({e.status}): {e.body}", file=sys.stderr)
-        if e.status in (409, 503):
+        _closed_as = _merge_already_closed_status(e) if e.status == 409 else None
+        if _closed_as is not None:
+            # #3494: someone closed the baton between Gate 1's read and this
+            # write (the window spans `gh pr merge`). The GitHub merge DID
+            # succeed; "retry later" would 409 again, so say what happened.
+            _as = f" as {_closed_as}" if _closed_as else ""
+            _check = (
+                "If that status is merged, nothing more is needed."
+                if _closed_as
+                else "Check the baton's status: if it is merged, nothing more is needed."
+            )
+            print(
+                f"  (GitHub merge succeeded, but the baton was already closed{_as} "
+                f"when the closure was written -- someone closed it "
+                f"after this command read it. {_check} "
+                f"Otherwise: baton reopen {project_id}, then "
+                f"baton close {project_id} --status merged)",
+                file=sys.stderr,
+            )
+        elif e.status in (409, 503):
             # #3416: the server re-reads GitHub itself before closing. 409 = it
             # does not (yet) see the PR as MERGED; 503 = it could not read
             # GitHub. Nothing was written; the GitHub merge above did succeed.
