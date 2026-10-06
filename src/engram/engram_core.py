@@ -4246,33 +4246,11 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                 engram_backup.rebuild_fts_index(_fts4_db_path)
 
             _fts4_cols = list(engram_backup.NODES_FTS_COLUMNS)
-            _fts4_cols_sql = ", ".join(_fts4_cols)
 
-            # rebuild_fts_index's 'rebuild' step repopulates FTS from every
-            # row in `nodes` (including is_current=0 ones) and its own
-            # cleanup only excludes status='retracted' rows — it has no
-            # is_current awareness. Migration 3 above additionally excludes
-            # superseded (is_current=0, non-retracted) rows from FTS, and
-            # that exclusion does not survive a rebuild_fts_index call
-            # untouched. Reassert it here with the same delete-insert
-            # migration 3 uses (now over the new column set) so this rung
-            # doesn't regress migration 3's guarantee. Safe to run every
-            # time this rung executes, including on a retry after an
-            # earlier failed attempt, because rebuild_fts_index's own
-            # 'rebuild' step, immediately above, unconditionally repopulates
-            # every row first — so the rows targeted below are always
-            # present in the index at this point, never already-absent (the
-            # specific condition that makes FTS5's 'delete' magic-insert
-            # raise "database disk image is malformed").
-            _fts4_select_sql = ", ".join(f"COALESCE({c}, '')" for c in _fts4_cols)
-            conn.execute(
-                f"""
-                INSERT INTO nodes_fts(nodes_fts, rowid, {_fts4_cols_sql})
-                SELECT 'delete', rowid, {_fts4_select_sql}
-                FROM nodes
-                WHERE is_current = 0 AND status != 'retracted'
-                """
-            )
+            # rebuild_fts_index itself excludes retracted AND superseded
+            # (is_current=0) rows from the index (#2746), so there is nothing
+            # to re-assert here: a second 'delete' on an already-excluded
+            # rowid corrupts ranked queries (#2742).
 
             # Triggers — rebuild_fts_index doesn't touch these, and they
             # were already dropped above (BEFORE the rebuild, to close the
@@ -4302,10 +4280,8 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
             # rungs 1-3's own retry-safety convention. Every step above is
             # independently safe to re-run: rebuild_fts_index is idempotent;
             # DROP+CREATE TRIGGER is idempotent; the claim backfill UPDATE
-            # recomputes the same value; the supersede-cleanup delete-insert
-            # is safe to re-run because rebuild_fts_index's own rebuild step
-            # always runs immediately before it (see above); re-embedding is
-            # idempotent by construction (it overwrites, never appends).
+            # recomputes the same value; re-embedding is idempotent by
+            # construction (it overwrites, never appends).
             conn.execute("PRAGMA user_version = 4")
             conn.commit()
         except sqlite3.DatabaseError as _migration4_err:
@@ -4629,9 +4605,8 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     # server start after the plugin upgrade carrying this migration. A
     # SECOND per-seat rebuild is then needed — to clear whatever accumulated
     # in the gap between the emergency rebuild and the trigger's arrival,
-    # and (once #2746's rebuild_fts_index contract fix lands) to move the
-    # seat onto the trigger's own contract, which currently disagrees with
-    # rebuild_fts_index about whether a superseded row belongs in the index.
+    # and to move the seat onto the trigger's own contract, which
+    # rebuild_fts_index now agrees with (#2746: superseded rows excluded).
     # A graph landing on this rung may still carry orphaned postings from
     # edits made before the trigger reached it; this rung only guarantees no
     # NEW orphan is created going forward.
