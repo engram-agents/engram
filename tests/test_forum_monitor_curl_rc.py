@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -68,9 +69,9 @@ out = ""
 if rc == 0:
     out += body
 if fmt is not None:
-    fmt = fmt.replace("%{{time_total}}", "10.001234")
     for k, v in phases.items():
         fmt = fmt.replace("%{{time_" + k + "}}", v)
+    fmt = fmt.replace("%{{time_total}}", "10.001234")
     out += fmt.replace("\\\\n", "\\n")
 sys.stdout.write(out)
 sys.exit(rc)
@@ -120,7 +121,8 @@ class _Run:
 def launch(tmp_path):
     runs: list[_Run] = []
 
-    def _go(which: str, script: list[tuple], url: str = "http://127.0.0.1:9"):
+    def _go(which: str, script: list[tuple], url: str = "http://127.0.0.1:9",
+            env_extra: dict | None = None, stubs: dict | None = None):
         home = tmp_path / "home"
         (home / ".engram").mkdir(parents=True)
         (home / ".engram" / "config.json").write_text(
@@ -139,6 +141,16 @@ def launch(tmp_path):
         env = os.environ.copy()
         env["HOME"] = str(home)
         env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+        if stubs:
+            # Extra executables PREPENDED ahead of curl's dir (PATH is not replaced).
+            stubdir = tmp_path / "stubbin"
+            stubdir.mkdir()
+            for name, body in stubs.items():
+                f = stubdir / name
+                f.write_text("#!/bin/sh\n" + body)
+                f.chmod(f.stat().st_mode | stat.S_IXUSR)
+            env["PATH"] = f"{stubdir}{os.pathsep}{env['PATH']}"
+        env.update(env_extra or {})
         if which == "updates":
             env["FORUM_UPDATES_NO_REAP"] = "1"
             env["FORUM_UPDATES_CURSOR_FILE"] = str(tmp_path / "cursor")
@@ -504,3 +516,72 @@ def test_success_with_phase_fields_leaves_body_clean(launch, which, name, quiet)
     lines = r.stop()
     assert len([l for l in lines if "forum unreachable" in l]) == 1, lines
     assert len([l for l in lines if "forum reachable again" in l]) == 1, lines
+
+
+# ---------------------------------------------------------------------------
+# #3469: the time must format identically under a comma-decimal locale.
+#
+# macOS /bin/bash 3.2's printf BUILTIN ignores a per-command `LC_ALL=C` prefix
+# and parses curl's dot decimal with the ambient locale: under de_DE / fr_FR it
+# prints "invalid number" and exits non-zero, so the line read `?s`. The fix
+# runs the EXTERNAL printf (`env LC_ALL=C printf`), which does honour LC_ALL.
+# ---------------------------------------------------------------------------
+def _locale_installed(name: str) -> bool:
+    try:
+        out = subprocess.run(["locale", "-a"], capture_output=True, text=True,
+                             timeout=10).stdout
+    except Exception:
+        return False
+    wanted = {name.lower(), name.lower().replace("utf-8", "utf8")}
+    return any(l.strip().lower() in wanted for l in out.splitlines())
+
+
+def _edge_line(r, calls: int = 5) -> str:
+    r.wait_calls(calls)
+    lines = r.stop()
+    unreachable = [l for l in lines if "forum unreachable" in l]
+    assert len(unreachable) == 1, lines
+    return unreachable[0]
+
+
+@pytest.mark.parametrize("which,name,quiet", _MONITORS)
+def test_time_formats_under_comma_decimal_locale(launch, which, name, quiet):
+    if not _locale_installed("de_DE.UTF-8"):
+        pytest.skip("de_DE.UTF-8 not installed on this host; "
+                    "test_time_comes_from_external_printf_with_locale_pinned "
+                    "still covers it without a comma locale")
+    script = [(0, quiet), (0, quiet), (7, ""), (7, ""), (0, quiet)]
+    r = launch(which, script, env_extra={"LC_ALL": "de_DE.UTF-8"})
+    line = _edge_line(r)
+    assert re.search(r"curl 7: connect failed, \d+\.\d\ds\)", line), line
+    assert "?s" not in line, line
+
+
+@pytest.mark.parametrize("which,name,quiet", _MONITORS)
+def test_time_comes_from_external_printf_with_locale_pinned(launch, which, name, quiet):
+    """Locale-independent discriminator: a stub `printf` first on PATH is only
+    reached by an EXTERNAL printf; the builtin never calls it. It echoes the
+    LC_ALL it was run with and the value it was given."""
+    stub = "printf 'STUB[%s|%s]' \"$LC_ALL\" \"$2\"\n"
+    script = [(0, quiet), (0, quiet), (7, ""), (7, ""), (0, quiet)]
+    r = launch(which, script, env_extra={"LC_ALL": "de_DE.UTF-8"}, stubs={"printf": stub})
+    line = _edge_line(r)
+    assert "curl 7: connect failed, STUB[C|10.001234])" in line, line
+
+
+@pytest.mark.parametrize("which,name,quiet", _MONITORS)
+def test_non_numeric_time_total_prints_question_mark(launch, which, name, quiet):
+    script = [(0, quiet), (0, quiet), (7, "", {"total": "n/a"}),
+              (7, "", {"total": "n/a"}), (0, quiet)]
+    line = _edge_line(launch(which, script))
+    assert line.endswith("(curl 7: connect failed, ?s)" + _TAIL), line
+
+
+@pytest.mark.parametrize("which,name,quiet", _MONITORS)
+def test_failing_external_printf_falls_back_to_question_mark(launch, which, name, quiet):
+    """A numeric time whose external printf fails (or is broken) must still
+    print `?s`, not an empty field and not a crash."""
+    script = [(0, quiet), (0, quiet), (7, ""), (7, ""), (0, quiet)]
+    r = launch(which, script, stubs={"printf": "exit 1\n"})
+    line = _edge_line(r)
+    assert line.endswith("(curl 7: connect failed, ?s)" + _TAIL), line

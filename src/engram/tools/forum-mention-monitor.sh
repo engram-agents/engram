@@ -530,9 +530,11 @@ _curl_detail() {
         56) _m="receive failure" ;;
         *)  _m="error" ;;
     esac
+    # `env` forces the EXTERNAL printf: bash 3.2's builtin ignores a per-command LC_ALL=C
+    # and rejects curl's dot decimal under a comma locale (de_DE, fr_FR) -> "?s" (#3469).
     case "$_CURL_T" in
         ''|*[!0-9.]*) _t="?s" ;;
-        *) _t="$(LC_ALL=C printf '%.2fs' "$_CURL_T" 2>/dev/null)" || _t="?s" ;;
+        *) _t="$(env LC_ALL=C printf '%.2fs' "$_CURL_T" 2>/dev/null)" || _t="?s" ;;
     esac
     # Phase only for rc 28: every other rc already names where it failed.
     if [ "$_CURL_RC" = 28 ]; then
