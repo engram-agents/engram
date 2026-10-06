@@ -274,6 +274,13 @@
       "note": "2026-07-31-loop-arm-nudge-SPEC.md PR-B: new Stop hook, tested via direct subprocess invocation (same _run_hook pattern as test_stop_hook_prose_gate.py), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping."
     },
     {
+      "path_prefix_or_glob": "hooks/claude/clear-stale-engram-daemon.sh",
+      "test_globs": [
+        "tests/test_clear_stale_daemon_3493.py"
+      ],
+      "note": "Operator-invoked clear verb (#3493); the test runs the real script as a subprocess in a temp ENGRAM_HOME."
+    },
+    {
       "path_prefix_or_glob": "hooks/claude/start-engram-daemon.sh",
       "full_suite_fallback": true,
       "note": "No dedicated test file for start-engram-daemon.sh"

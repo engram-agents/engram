@@ -784,6 +784,11 @@
       "dest": "hooks/start-engram-daemon.sh"
     },
     {
+      "path": "hooks/claude/clear-stale-engram-daemon.sh",
+      "tier": "essential",
+      "dest": "hooks/clear-stale-engram-daemon.sh"
+    },
+    {
       "path": "hooks/claude/engram-surface-daemon.py",
       "tier": "essential",
       "dest": "hooks/engram-surface-daemon.py"
