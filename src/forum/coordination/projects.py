@@ -763,6 +763,7 @@ def merge(
     phase: Optional[str] = None,
     transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
+    require_participant: bool = False,
     expected_anchor: Optional[str] = None,
 ) -> int:
     """Mark a project baton as merged and archive it; return the assigned seq.
@@ -802,6 +803,14 @@ def merge(
             this for ``merge`` (it defines no transition; see class
             docstring above).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+        require_participant: in-process only (#3477); never wire-exposed. ``True``
+            makes ``merged_by`` (case-insensitive) have to be in the baton's
+            ``participants`` -- the same predicate and position as :func:`close`'s
+            gate 2: under the lock, after not-found, before the anchor binding and
+            before a seq is claimed. Defaults to ``False`` (unlike ``close``) so
+            every caller that predates #3477 keeps its behaviour; the ``/merge``
+            route passes ``True`` on an UNANCHORED baton only (on an anchored one
+            GitHub decides).
         expected_anchor: in-process only (#3416 round 3). ``None`` (default) = no
             check. Otherwise the normalised ``github`` anchor the caller's
             authorising read was made against (``""`` = unanchored); compared under
@@ -813,6 +822,8 @@ def merge(
 
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
+        NotAParticipant: if ``require_participant`` and ``merged_by`` is not a
+            current participant.
         AnchorChanged: if ``expected_anchor`` is given and the stored anchor differs.
     """
     # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
@@ -824,6 +835,8 @@ def merge(
         now = ts or md.now_iso()
         merged_by_n = merged_by.strip().lower()
         fields, _ = md.parse_frontmatter(content)
+        if require_participant and merged_by_n not in _parse_participants(fields.get("participants", "")):
+            raise NotAParticipant(merged_by_n)
         _check_expected_anchor(project_id, fields, expected_anchor)
         phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
         if transition_phase is not None:

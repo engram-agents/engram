@@ -4231,8 +4231,11 @@ def create_app(
         #3416: on a baton with a repo-qualified PR anchor the server reads GitHub
         itself and answers 409 unless the PR is MERGED, 503 (nothing written) if
         it cannot read the state. ``forced`` does not skip this check.
+        403 (#3477): on an UNANCHORED baton the caller must be a participant, same
+        gate and message as ``/status`` and ``/gc``; nothing written. On an ANCHORED
+        baton there is no participant gate (GitHub decides).
         """
-        from forum.coordination import merge as _merge, ProjectNotFound, AnchorChanged
+        from forum.coordination import merge as _merge, ProjectNotFound, AnchorChanged, NotAParticipant
 
         store = app.config.get("COORD_STORE")
         allocator = app.config.get("COORD_ALLOCATOR")
@@ -4279,12 +4282,19 @@ def create_app(
                                 f"nothing written for {pid}. Retry later."}), 503
 
         try:
+            # #3477 (mirrors /gc): the PARTICIPANT gate applies on an UNANCHORED
+            # baton (verdict is None), where the client's word is all there is --
+            # same gate and 403 as /status and /gc. On an ANCHORED baton GitHub
+            # MERGED was just required above, so the caller's identity decides nothing.
             seq = _merge(store, allocator, pid, merged_by=agent, forced=forced, phase=phase,
+                         require_participant=(verdict is None),
                          expected_anchor=expected_anchor)
         except AnchorChanged as e:
             return _anchor_changed_409(pid, e)
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
+        except NotAParticipant:
+            return jsonify({"error": f"agent {agent!r} is not a participant of {pid}"}), 403
 
         return jsonify({"seq": seq, "status": "merged"}), 201
 
