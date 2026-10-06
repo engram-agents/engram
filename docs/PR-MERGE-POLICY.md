@@ -428,7 +428,7 @@ and the colleague review the head.
 git fetch origin <base> '+refs/pull/N/head:refs/pr/N'
 git worktree add --detach <scratch> origin/<base>
 git -C <scratch> merge --no-edit refs/pr/N
-git -C <scratch> log -1 --format=%p      # one parent = fast-forwarded: take the fast path below only if --is-ancestor holds; no parents or an error = the merge did not happen
+{ git -C <scratch> merge-base --is-ancestor origin/<base> HEAD && git -C <scratch> merge-base --is-ancestor refs/pr/N HEAD; } && echo MERGE-OK || { echo "MERGE-FAILED: stop"; false; }
 # run the PR's tests + the repo guard set here
 ```
 
@@ -440,9 +440,9 @@ against #1002; #1016 was caught on a scratch merge, and #1017 is the head-only-r
 escape (the seat ran the PR's five test files on the head alone, 380 passed, and
 merged; main was red on three cells minutes later).
 
-**2. A failure seen on the scratch merge belongs to the PR only if the same test cell
-is GREEN on the base alone.** Otherwise it is the base's and goes to the seat that
-broke it, and must not be held against the PR. To tell the two apart, run the failing cell on the base tip.
+**2. A failure seen on the scratch merge belongs to the PR only if that test cell is
+GREEN on the base alone (or the PR adds it).** Otherwise it is the base's and goes to
+the seat that broke it, and must not be held against the PR. To tell the two apart, run the failing cell on the base tip.
 
 *Evidence:* Borges's run on umwelt #1021 (2026-10-06) kept main's own red off the PR.
 

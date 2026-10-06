@@ -314,7 +314,7 @@ CI-green must hold on the tip the maintainer would actually merge.
 
 **The merge seat's own test run** is on a scratch merge of the base tip plus the PR
 head, never the head alone; a scratch-merge failure counts against the PR only if
-that cell is green on the base alone; and a `CANCELLED` newest same-SHA run can
+that cell is green on the base alone (or the PR adds it); and a `CANCELLED` newest same-SHA run can
 block the merge even when another run passed — rerun it. Commands and evidence:
 `docs/PR-MERGE-POLICY.md` § "Merge-seat test rules".
 
