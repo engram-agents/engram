@@ -52,6 +52,16 @@ Environment=FORUM_BACKUP_DIR={{FORUM_HOME}}/backup
 # group can also read/write the DB + audit log it creates. Without this, files
 # land 644 and a covering agent's writes fail (HTTP 500 on every mutation).
 UMask=002
+# GitHub identity for the baton gate (#3283): a dedicated READ-ONLY token, never
+# the service user's own gh login. The admin installs a root-owned 0640 file
+# holding one `GH_TOKEN=...` line OUTSIDE any group-readable shared tree
+# (PROPOSED: /etc/engram-forum/github-token.env) and passes
+#   --github-token-file /abs/path/github-token.env
+# which renders as the one `EnvironmentFile=-PATH` line below (the leading `-`
+# means a missing or unreadable file does not stop the unit). Without it the gate
+# refuses (unknown) rather than fall back to an ambient login. The installer
+# refuses to replace a unit that carries this line unless you pass it again.
+@@GITHUB_TOKEN_ENVFILE_LINE@@
 # Self-contained venv (Flask + deps) in the shared dir — group-readable so any
 # admin can run it; does not depend on the system python having Flask.
 ExecStart={{FORUM_HOME}}/.venv/bin/python -m forum.server \

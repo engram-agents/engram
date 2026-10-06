@@ -33,6 +33,18 @@
 #   --baton-login-map-admin-uid UID
 #                       repeatable; extra uid (besides root) allowed to own the map.
 #                       Requires --baton-login-map.
+#   --github-token-file PATH
+#                       absolute path of the root/admin-installed file holding the
+#                       gate's dedicated read-only `GH_TOKEN=...` line (#3283).
+#                       Rendered into [Service] as ONE `EnvironmentFile=-PATH` line
+#                       (the `-` is the installer's: a missing or unreadable file
+#                       lets the unit start and the gate refuses instead).
+#                       Letters, digits and / . _ - only. The path is NEVER read or
+#                       dereferenced here (it may not exist on this host yet; keep it
+#                       out of any group-readable shared tree, mode 0640). If the unit
+#                       being replaced already carries a github-token EnvironmentFile
+#                       line the installer REFUSES unless this flag is passed again,
+#                       so a re-install can never silently drop it.
 #   --dry-run           print every action without executing (CI-safe)
 #   --no-start          install + enable but don't start
 #
@@ -48,6 +60,7 @@ ADMIN_USER="$(whoami)"
 GROUP=""
 BATON_MAP=""
 BATON_UIDS=""   # space-separated, validated integers
+GITHUB_TOKEN_FILE=""
 SRC=""
 START=1
 DRY_RUN=0
@@ -76,6 +89,23 @@ while [ $# -gt 0 ]; do
           echo "ERROR: --baton-login-map-admin-uid must be an integer uid (got '$2')" >&2; exit 2 ;;
       esac
       BATON_UIDS="$BATON_UIDS $2"; shift 2 ;;
+    --github-token-file)
+      GITHUB_TOKEN_FILE="$2"
+      case "$GITHUB_TOKEN_FILE" in
+        /*) ;;
+        *) echo "ERROR: --github-token-file must be an absolute path (got '$GITHUB_TOKEN_FILE')" >&2; exit 2 ;;
+      esac
+      case "$GITHUB_TOKEN_FILE" in
+        *[!A-Za-z0-9/._-]*)
+          echo "ERROR: --github-token-file may contain only letters, digits and / . _ - (it lands in a unit file); got '$GITHUB_TOKEN_FILE'" >&2; exit 2 ;;
+      esac
+      # The re-install guard below finds an existing line by the name
+      # `github-token`, so the FILE NAME (not just a directory) must carry it.
+      case "${GITHUB_TOKEN_FILE##*/}" in
+        *github-token*) ;;
+        *) echo "ERROR: --github-token-file's file name must contain 'github-token' (got '$GITHUB_TOKEN_FILE'); the re-install guard keys on that name, so any other name could be dropped silently" >&2; exit 2 ;;
+      esac
+      shift 2 ;;
     --dry-run)      DRY_RUN=1; shift ;;
     --no-start)     START=0; shift ;;
     -h|--help)
@@ -173,6 +203,16 @@ if [ -f "$_EXISTING_UNIT" ]; then
     echo "ERROR: $_EXISTING_UNIT already carries a baton login map admin uid; re-installing without" >&2
     echo "       --baton-login-map-admin-uid <uid> would silently drop it. Nothing was written." >&2
     echo "       Re-run with --baton-login-map <path> --baton-login-map-admin-uid <uid>." >&2
+    exit 2
+  fi
+  # GitHub token file (#3283): same no-silent-drop rule. A NON-comment
+  # EnvironmentFile= line naming a github-token file must be re-supplied, or the
+  # re-rendered unit would lose the gate's dedicated identity (the gate then
+  # refuses every advance). Reads only, so it runs in --dry-run too.
+  if printf '%s\n' "$_live" | grep -Eq -- '^[[:space:]]*EnvironmentFile[[:space:]]*=.*github-token' && [ -z "$GITHUB_TOKEN_FILE" ]; then
+    echo "ERROR: $_EXISTING_UNIT already carries a github-token EnvironmentFile line; re-installing without" >&2
+    echo "       --github-token-file <path> would silently drop the gate's dedicated GitHub identity." >&2
+    echo "       Nothing was written. Re-run with --github-token-file <path>." >&2
     exit 2
   fi
 fi
@@ -293,6 +333,7 @@ if [ -n "$BATON_MAP" ]; then
     BATON_ARGS="$BATON_ARGS \\"$'\n'"    --baton-login-map-admin-uid $_u"
   done
 fi
+_TOKEN_PLACEHOLDER='@@GITHUB_TOKEN_ENVFILE_LINE@@'
 _PLACEHOLDER='{{BATON_LOGIN_MAP_ARGS}}'
 # Replace the baton-args placeholder line by line. A FUNCTION, deliberately: inline
 # in `$( )` the quotes/`)` here are mis-parsed by macOS /bin/bash 3.2 (the pre-#3312
@@ -307,14 +348,30 @@ _fill_baton_placeholder() {
     fi
   done
 }
+# The github-token EnvironmentFile line (#3283): the placeholder sits on a line of
+# its own; it becomes the one `EnvironmentFile=-PATH` line, or the whole line is
+# dropped when no --github-token-file was given. Same function shape, same reason.
+_fill_token_placeholder() {
+  local _line
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    if [ "$_line" = "$_TOKEN_PLACEHOLDER" ]; then
+      if [ -n "$GITHUB_TOKEN_FILE" ]; then
+        printf 'EnvironmentFile=-%s\n' "$GITHUB_TOKEN_FILE"
+      fi
+    else
+      printf '%s\n' "$_line"
+    fi
+  done
+}
 # Strip the >>>TEMPLATE-ONLY ... <<<TEMPLATE-ONLY block, then substitute
 # {{FORUM_HOME}} (template placeholder), {{PORT}}, and the baton map args.
 RENDERED="$(sed '/>>>TEMPLATE-ONLY/,/<<<TEMPLATE-ONLY/d' "$SRC/src/forum/deploy/engram-forum.service.template" \
     | sed "s|{{FORUM_HOME}}|$SERVICE_DIR|g" \
     | sed "s|--port 5002|--port $PORT|" \
     | sed "s|Flask, port 5002|Flask, port $PORT|" \
-    | _fill_baton_placeholder)"
-if printf '%s\n' "$RENDERED" | grep -q '{{'; then
+    | _fill_baton_placeholder \
+    | _fill_token_placeholder)"
+if printf '%s\n' "$RENDERED" | grep -Eq '[{][{]|@@GITHUB_TOKEN'; then
   echo "ERROR: unsubstituted placeholders remain in the rendered unit" >&2; exit 2
 fi
 if [ "$DRY_RUN" -eq 1 ]; then

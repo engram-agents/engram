@@ -71,6 +71,34 @@ re-rendered from the template each run, so a map added by hand to the unit is
 lost — the installer now refuses (exit 2, nothing written) to replace a unit that
 already carries a map unless `--baton-login-map` is given again (#3312).
 
+`--github-token-file PATH` (#3283) renders one `EnvironmentFile=-PATH` line into the
+unit's `[Service]` section. The leading `-` is added by the installer, not by PATH
+(PATH must be absolute, so it can never start with `-`), and the file name must
+contain `github-token`. The file is the gate's dedicated **read-only** GitHub
+identity: a single `GH_TOKEN=...` line, installed by root/the host admin, never under
+the group-readable shared tree (PROPOSED: `/etc/engram-forum/github-token.env`).
+Permissions are either `0640 root:<a group the service user is in>` or
+`0600 <service-user>`. **`root:root 0640` cannot work**: the service user could not
+read it. The installer never reads or dereferences the path.
+
+The server reads `GH_TOKEN` once at startup, so **rotating the token needs a service
+restart**. It runs every `gh` call of the baton gate under that token plus an empty
+`GH_CONFIG_DIR` (`$FORUM_HOME/gh-config`, 0700). With **no token the gate refuses
+(`unknown`) instead of falling back to the service user's own `gh` login**. Because of
+the leading `-`, a missing or unreadable token file lets the unit start, and then every
+gate-checked `baton advance` refuses until the file is installed; server startup prints
+a token-free warning line saying so.
+
+Like the login map, pass the flag on every re-install: the installer refuses (exit 2,
+nothing written) to replace a unit that already carries a github-token
+`EnvironmentFile=` line unless the flag is given again.
+
+One limit: the board's PR-state read (`src/forum/board_projects.py`, a fourth `gh` call
+outside the gate) is not identity-scoped. With the `-` form and no token file it falls
+back to the service user's ambient `gh` login; with a token installed it incidentally
+runs under the read-only token, because `GH_TOKEN` stays in the process environment.
+Tracked as #3509.
+
 `--no-start` for the first install so the DB cutover (below) happens before the
 service comes up. On later code upgrades, re-run **without** `--no-start` to
 re-snapshot + restart. (Defaults: `--service-dir /home/agents-shared/forum`,

@@ -4521,6 +4521,43 @@ def _parse_args(argv=None, environ=None):
     return args
 
 
+def _configure_gate_github_identity(data_dir: str, environ=None) -> str:
+    """Put the baton gate in service-identity mode (#3283); return the config dir.
+
+    The gate then calls `gh` only under the dedicated read-only ``GH_TOKEN`` from
+    ``environ`` (default ``os.environ``) and an EMPTY ``GH_CONFIG_DIR`` this
+    function creates (0700) at ``<data_dir>/gh-config``; with no token it refuses
+    (``unknown``) at call time instead of falling back to the service user's own
+    gh login. A missing token never stops the server from starting. Called from
+    ``main()`` only, never from ``create_app()``, so tests and the agent CLI keep
+    the default (inherit-the-environment) behaviour.
+    """
+    config_dir = os.path.join(data_dir, "gh-config")
+    gate = _load_baton_gate()
+    try:
+        os.makedirs(config_dir, mode=0o700, exist_ok=True)
+        os.chmod(config_dir, 0o700)
+    except OSError as exc:
+        # Unwritable / foreign-owned dir: never crash startup. Service mode with
+        # NO identity (config_dir=None) -- the gate refuses at call time.
+        print(f"[forum] baton gate: cannot prepare {config_dir}: {exc.strerror or exc.__class__.__name__}"
+              " -- gate-checked `baton advance` will refuse (unknown) (#3283).",
+              file=sys.stderr)
+        if gate is not None:
+            gate.configure_service_github_identity(environ=environ, config_dir=None)
+        return config_dir
+    if gate is None:
+        print("[forum] baton gate module unavailable -- gate-checked flips will refuse.",
+              file=sys.stderr)
+        return config_dir
+    have_identity = gate.configure_service_github_identity(environ=environ, config_dir=config_dir)
+    if not have_identity:
+        print("[forum] baton gate GitHub identity: no GH_TOKEN -- gate-checked `baton advance` "
+              "will refuse (unknown) until the read-only token is installed (#3283).",
+              file=sys.stderr)
+    return config_dir
+
+
 def main() -> None:
     args = _parse_args()
 
@@ -4552,6 +4589,10 @@ def main() -> None:
         baton_login_map=args.baton_login_map,
         baton_login_map_admin_uids=tuple(args.baton_login_map_admin_uid),
     )
+    # #3283: the gate's own, dedicated read-only GitHub identity, kept beside the
+    # service data (the unit sets FORUM_HOME; else the dir holding the DB).
+    _configure_gate_github_identity(
+        os.environ.get("FORUM_HOME", "").strip() or db_dir)
     if args.baton_login_map is None:
         print("[forum] baton login map: not configured -- `baton advance` (peer->merge) "
               "will refuse until --baton-login-map / $ENGRAM_BATON_LOGIN_MAP is set.",

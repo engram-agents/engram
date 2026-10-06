@@ -474,6 +474,110 @@ def _dedupe_checks_by_latest(checks: list) -> list:
     return list(latest.values())
 
 
+# ---------------------------------------------------------------------------
+# Service GitHub identity (#3283).
+#
+# The three `gh` call sites below (`_pr_ci_state`, `_pr_approval_state`,
+# `_reviewer_approval_state`) used to inherit the caller's environment. For the
+# agent CLI that is intended (the agent's own gh login). For the FORUM SERVICE it
+# meant the gate authenticated as whatever agent account the service runs under
+# (broad `repo` scope, via that account's ~/.config/gh/hosts.yml).
+#
+# So the forum server -- and only the forum server -- calls
+# `configure_service_github_identity()` once at startup. From then on every gh
+# call runs under an EXPLICIT minimal env carrying a dedicated read-only token
+# (GH_TOKEN) and an empty service-owned GH_CONFIG_DIR, and a missing token
+# yields ("unknown", ...) BEFORE any subprocess call (`advance` already refuses
+# on approval-side unknown). Until it is called -- the CLI, and every test that
+# does not opt in -- behaviour is unchanged: gh inherits the environment and
+# nothing is refused.
+# ---------------------------------------------------------------------------
+
+_SERVICE_IDENTITY_MISSING_MSG = (
+    "GitHub gate identity not configured: the forum service has no dedicated "
+    "read-only GH_TOKEN (#3283), so the gate refuses to call gh under an ambient login"
+)
+_DEFAULT_GH_PATH = "/usr/local/bin:/usr/bin:/bin"
+
+
+class _ServiceIdentity:
+    """Module-private holder. repr/str never include the token."""
+
+    __slots__ = ("on", "token", "config_dir")
+
+    def __init__(self) -> None:
+        self.on = False
+        self.token = ""
+        self.config_dir = ""
+
+    def __repr__(self) -> str:
+        return f"<_ServiceIdentity on={self.on} token={'set' if self.token else 'absent'}>"
+
+    __str__ = __repr__
+
+
+_SERVICE_IDENTITY = _ServiceIdentity()
+
+
+def configure_service_github_identity(environ=None, config_dir=None) -> bool:
+    """Switch the gate into service-identity mode (forum server, once, at startup).
+
+    Reads ``GH_TOKEN`` from ``environ`` (default ``os.environ``) ONCE, here, and
+    keeps it module-privately. Absent / empty / whitespace-only token, or no
+    ``config_dir``, leaves the mode ON with no identity: every gh call site then
+    returns ``unknown`` without invoking gh. ``config_dir`` is an empty directory
+    the service owns; nothing is ever written into it. Returns True iff a usable
+    identity (token AND config_dir) is now configured.
+    """
+    env = os.environ if environ is None else environ
+    token = str(env.get("GH_TOKEN") or "").strip()
+    _SERVICE_IDENTITY.on = True
+    _SERVICE_IDENTITY.token = token
+    _SERVICE_IDENTITY.config_dir = str(config_dir) if config_dir else ""
+    return bool(token and _SERVICE_IDENTITY.config_dir)
+
+
+def _service_identity_is_on() -> bool:
+    return _SERVICE_IDENTITY.on
+
+
+def _service_identity_reset() -> None:
+    """Back to default-off (tests only; the server never calls this)."""
+    _SERVICE_IDENTITY.on = False
+    _SERVICE_IDENTITY.token = ""
+    _SERVICE_IDENTITY.config_dir = ""
+
+
+def _gh_identity():
+    """Return (env_kwargs, refusal) for one gh call.
+
+    Default-off: ({}, None) -- no `env=` kwarg at all, today's behaviour.
+    Service mode with an identity: ({"env": <explicit minimal env>}, None).
+    Service mode without one: ({}, ("unknown", <fixed message>)) -- the caller
+    returns the refusal before any subprocess call.
+    """
+    ident = _SERVICE_IDENTITY
+    if not ident.on:
+        return {}, None
+    if not ident.token or not ident.config_dir:
+        return {}, ("unknown", _SERVICE_IDENTITY_MISSING_MSG)
+    return {"env": {
+        "PATH": os.environ.get("PATH") or _DEFAULT_GH_PATH,
+        "GH_TOKEN": ident.token,
+        "GH_CONFIG_DIR": ident.config_dir,
+        "GH_PROMPT_DISABLED": "1",
+        "GH_NO_UPDATE_NOTIFIER": "1",
+    }}, None
+
+
+def _scrub_gh_detail(text: str) -> str:
+    """Replace every occurrence of the service token with ``***`` (no-op otherwise)."""
+    tok = _SERVICE_IDENTITY.token
+    if not (_SERVICE_IDENTITY.on and tok):
+        return text
+    return text.replace(tok, "***")
+
+
 def _pr_ci_state(pr_number: str, repo: str) -> tuple:
     """Query GitHub CI state for a pull request via `gh`.
 
@@ -498,6 +602,9 @@ def _pr_ci_state(pr_number: str, repo: str) -> tuple:
     """
     if not repo:
         return ("unknown", "repo argument is required and was empty")
+    gh_kw, refusal = _gh_identity()
+    if refusal is not None:
+        return refusal
     cmd = ["gh", "pr", "view", pr_number,
            "--json", "statusCheckRollup,mergeStateStatus", "--repo", repo]
     try:
@@ -506,17 +613,18 @@ def _pr_ci_state(pr_number: str, repo: str) -> tuple:
             capture_output=True,
             text=True,
             timeout=15,
+            **gh_kw,
         )
     except FileNotFoundError:
         return ("unknown", "gh not found on PATH")
     except subprocess.TimeoutExpired:
         return ("unknown", "gh timed out after 15s")
     except OSError as exc:
-        return ("unknown", f"gh exec error: {exc}")
+        return ("unknown", _scrub_gh_detail(f"gh exec error: {exc}"))
 
     if result.returncode != 0:
         detail = (result.stderr or "").strip() or f"gh exit {result.returncode}"
-        return ("unknown", detail)
+        return ("unknown", _scrub_gh_detail(detail))
 
     raw = (result.stdout or "").strip()
     if not raw:
@@ -637,23 +745,27 @@ def _pr_approval_state(pr_number: str, repo: str) -> tuple:
         " } } }"
     ) % (owner, repo_name, pr_number)
 
+    gh_kw, refusal = _gh_identity()
+    if refusal is not None:
+        return refusal
     try:
         gql_result = subprocess.run(
             ["gh", "api", "graphql", "-f", f"query={query}"],
             capture_output=True,
             text=True,
             timeout=15,
+            **gh_kw,
         )
     except FileNotFoundError:
         return ("unknown", "gh not found on PATH")
     except subprocess.TimeoutExpired:
         return ("unknown", "gh timed out after 15s")
     except OSError as exc:
-        return ("unknown", f"gh exec error: {exc}")
+        return ("unknown", _scrub_gh_detail(f"gh exec error: {exc}"))
 
     if gql_result.returncode != 0:
         detail = (gql_result.stderr or "").strip() or f"gh exit {gql_result.returncode}"
-        return ("unknown", detail)
+        return ("unknown", _scrub_gh_detail(detail))
 
     raw_gql = (gql_result.stdout or "").strip()
     if not raw_gql:
@@ -1061,6 +1173,10 @@ def _reviewer_approval_state(pr_number, repo, reviewer_login) -> tuple:
     wanted = reviewer_login.strip().lower()
     owner, name = repo.split("/", 1)
 
+    gh_kw, refusal = _gh_identity()
+    if refusal is not None:
+        return refusal
+
     head_oid = None
     mine: list = []
     cursor = None
@@ -1073,15 +1189,16 @@ def _reviewer_approval_state(pr_number, repo, reviewer_login) -> tuple:
         if cursor:
             cmd += ["-f", f"after={cursor}"]
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=15, **gh_kw)
         except FileNotFoundError:
             return ("unknown", "gh not found on PATH")
         except subprocess.TimeoutExpired:
             return ("unknown", "gh timed out after 15s")
         except OSError as exc:
-            return ("unknown", f"gh exec error: {exc}")
+            return ("unknown", _scrub_gh_detail(f"gh exec error: {exc}"))
         if res.returncode != 0:
-            return ("unknown", (res.stderr or "").strip() or f"gh exit {res.returncode}")
+            return ("unknown", _scrub_gh_detail(
+                (res.stderr or "").strip() or f"gh exit {res.returncode}"))
         raw = (res.stdout or "").strip()
         if not raw:
             return ("unknown", "gh returned empty output")
