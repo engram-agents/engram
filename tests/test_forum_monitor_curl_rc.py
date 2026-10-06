@@ -122,7 +122,8 @@ def launch(tmp_path):
     runs: list[_Run] = []
 
     def _go(which: str, script: list[tuple], url: str = "http://127.0.0.1:9",
-            env_extra: dict | None = None, stubs: dict | None = None):
+            env_extra: dict | None = None, stubs: dict | None = None,
+            interpreter: str = "bash"):
         home = tmp_path / "home"
         (home / ".engram").mkdir(parents=True)
         (home / ".engram" / "config.json").write_text(
@@ -155,13 +156,13 @@ def launch(tmp_path):
             env["FORUM_UPDATES_NO_REAP"] = "1"
             env["FORUM_UPDATES_CURSOR_FILE"] = str(tmp_path / "cursor")
             env["FORUM_UPDATES_POLL_SECONDS"] = _POLL
-            argv = ["bash", str(_UPDATES_SCRIPT)]
+            argv = [interpreter, str(_UPDATES_SCRIPT)]
         else:
             env["FORUM_MENTION_NO_REAP"] = "1"
             env["FORUM_MENTION_SEEN_FILE"] = str(tmp_path / "seen")
             env["FORUM_MENTION_POLL_SECONDS"] = _POLL
             env["FORUM_MENTION_COALESCE_SECONDS"] = "1"
-            argv = ["bash", str(_MENTION_SCRIPT)]
+            argv = [interpreter, str(_MENTION_SCRIPT)]
         r = _Run(argv, env, tmp_path, calls)
         runs.append(r)
         return r
@@ -547,9 +548,7 @@ def _edge_line(r, calls: int = 5) -> str:
 @pytest.mark.parametrize("which,name,quiet", _MONITORS)
 def test_time_formats_under_comma_decimal_locale(launch, which, name, quiet):
     if not _locale_installed("de_DE.UTF-8"):
-        pytest.skip("de_DE.UTF-8 not installed on this host; "
-                    "test_time_comes_from_external_printf_with_locale_pinned "
-                    "still covers it without a comma locale")
+        pytest.skip("de_DE.UTF-8 not installed on this host")
     script = [(0, quiet), (0, quiet), (7, ""), (7, ""), (0, quiet)]
     r = launch(which, script, env_extra={"LC_ALL": "de_DE.UTF-8"})
     line = _edge_line(r)
@@ -557,16 +556,60 @@ def test_time_formats_under_comma_decimal_locale(launch, which, name, quiet):
     assert "?s" not in line, line
 
 
+_BUGGY_BASH = "/bin/bash"
+_BUG_LOCALE = "de_DE.UTF-8"
+_bug_probe_cache: list = []
+
+
+def _bug_probe_skip_reason() -> str:
+    """Why the printf-builtin locale bug cannot be exhibited on this host, or
+    "" if it can. Probed once per process.
+
+    The bug: the builtin printf of macOS /bin/bash 3.2 ignores a per-command
+    `LC_ALL=C` prefix, so under a comma-decimal locale `LC_ALL=C printf '%.2f'
+    2.5` fails instead of printing 2.50."""
+    if _bug_probe_cache:
+        return _bug_probe_cache[0]
+    reason = ""
+    if not os.path.exists(_BUGGY_BASH):
+        reason = f"no {_BUGGY_BASH} on this host"
+    elif not _locale_installed(_BUG_LOCALE):
+        reason = f"{_BUG_LOCALE} not installed on this host"
+    else:
+        try:
+            env = {**os.environ, "LC_ALL": _BUG_LOCALE}
+            out = subprocess.run(
+                [_BUGGY_BASH, "-c", "LC_ALL=C printf '%.2f' 2.5"],
+                capture_output=True, text=True, timeout=10, env=env).stdout
+        except Exception as e:
+            out = None
+            reason = f"probe of {_BUGGY_BASH} failed to run: {e}"
+        if out == "2.50":
+            reason = (f"{_BUGGY_BASH} is not affected (its builtin printf honours "
+                      "a per-command LC_ALL): the bug cannot occur here")
+    _bug_probe_cache.append(reason)
+    return reason
+
+
 @pytest.mark.parametrize("which,name,quiet", _MONITORS)
-def test_time_comes_from_external_printf_with_locale_pinned(launch, which, name, quiet):
-    """Locale-independent discriminator: a stub `printf` first on PATH is only
-    reached by an EXTERNAL printf; the builtin never calls it. It echoes the
-    LC_ALL it was run with and the value it was given."""
-    stub = "printf 'STUB[%s|%s]' \"$LC_ALL\" \"$2\"\n"
+def test_time_formats_as_dot_decimal_under_buggy_bash(launch, which, name, quiet):
+    """BEHAVIOUR pin, independent of how the fix is written: run the real
+    script under /bin/bash (3.2 on macOS, the bash that HAS the bug) with a
+    comma-decimal locale and require the time to print as a dot-decimal number.
+
+    Contract: this cell fails on the pre-fix code on any host that can exhibit
+    the bug, and is skipped, with the reason stated, on hosts that cannot
+    (no /bin/bash, no de_DE.UTF-8, or a /bin/bash whose builtin printf is not
+    affected). The plain `bash` of the neighbouring cell may resolve to a
+    newer bash on PATH where the bug does not exist; this one never does."""
+    reason = _bug_probe_skip_reason()
+    if reason:
+        pytest.skip(reason)
     script = [(0, quiet), (0, quiet), (7, ""), (7, ""), (0, quiet)]
-    r = launch(which, script, env_extra={"LC_ALL": "de_DE.UTF-8"}, stubs={"printf": stub})
+    r = launch(which, script, env_extra={"LC_ALL": _BUG_LOCALE}, interpreter=_BUGGY_BASH)
     line = _edge_line(r)
-    assert "curl 7: connect failed, STUB[C|10.001234])" in line, line
+    assert re.search(r"curl 7: connect failed, \d+\.\d\ds\)", line), line
+    assert "?s" not in line, line
 
 
 @pytest.mark.parametrize("which,name,quiet", _MONITORS)
