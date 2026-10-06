@@ -56,7 +56,9 @@ try:
 except Exception:
     n = 0
 open(state, "w").write(str(n + 1))
-rc, body = script[min(n, len(script) - 1)]
+entry = script[min(n, len(script) - 1)]
+rc, body = entry[0], entry[1]
+phases = entry[2] if len(entry) > 2 else {{}}
 fmt = None
 args = sys.argv[1:]
 for i, a in enumerate(args):
@@ -66,7 +68,10 @@ out = ""
 if rc == 0:
     out += body
 if fmt is not None:
-    out += fmt.replace("%{{time_total}}", "10.001234").replace("\\\\n", "\\n")
+    fmt = fmt.replace("%{{time_total}}", "10.001234")
+    for k, v in phases.items():
+        fmt = fmt.replace("%{{time_" + k + "}}", v)
+    out += fmt.replace("\\\\n", "\\n")
 sys.stdout.write(out)
 sys.exit(rc)
 """
@@ -115,12 +120,12 @@ class _Run:
 def launch(tmp_path):
     runs: list[_Run] = []
 
-    def _go(which: str, script: list[tuple[int, str]]):
+    def _go(which: str, script: list[tuple], url: str = "http://127.0.0.1:9"):
         home = tmp_path / "home"
         (home / ".engram").mkdir(parents=True)
         (home / ".engram" / "config.json").write_text(
             json.dumps({"agent_name": "testagent",
-                        "forum": {"url": "http://127.0.0.1:9"}})
+                        "forum": {"url": url}})
         )
         bindir = tmp_path / "bin"
         bindir.mkdir()
@@ -373,3 +378,129 @@ def test_seed_curl_failure_gets_the_suffix(launch, which, name, quiet):
     seed = [l for l in lines if "cannot seed" in l]
     assert len(seed) == 1, lines
     assert seed[0].endswith(" (last attempt: curl 28: timed out, 10.00s)"), seed[0]
+
+
+# ---------------------------------------------------------------------------
+# #3443: on rc 28 the detail names the PHASE curl ran out of time in.
+#
+# Contract (stated before the fix):
+#   1. rc 28 -> `curl 28: timed out in <phase>, 10.00s`; other rcs get NO phase.
+#      Prefix and tail stay byte-identical, one line.
+#   2. http URL: time_appconnect is always 0 (no TLS), so a stall after connect
+#      says `first byte` / `body`, NEVER `tls`.
+#   3. Missing / unparseable phase fields -> phase omitted, rest unchanged.
+#   5. Edge discipline unchanged (once per transition).
+# curl reports 0 for a phase it never reached; the phase that ate the time is the
+# first one still at 0. The stub emits the extra write-out fields per entry.
+# ---------------------------------------------------------------------------
+def _ph(dns="0.0001", tcp="0.0003", tls="0", pre="0.0004", ttfb="0.0012"):
+    return {"namelookup": dns, "connect": tcp, "appconnect": tls,
+            "pretransfer": pre, "starttransfer": ttfb}
+
+
+_PHASE_CASES = [
+    # id, url, fields, expected phase
+    ("http-first-byte", "http://127.0.0.1:9", _ph(ttfb="0"), "first byte"),
+    ("http-body", "http://127.0.0.1:9", _ph(ttfb="0.0009"), "body"),
+    ("http-connect", "http://127.0.0.1:9", _ph(tcp="0", pre="0", ttfb="0"), "connect"),
+    ("http-resolve", "http://127.0.0.1:9", _ph(dns="0", tcp="0", pre="0", ttfb="0"), "resolve"),
+    # namelookup=0 but connect>0: `resolve` needs BOTH at 0. A mutant that fires
+    # `resolve` on namelookup==0 alone must go red here (every other case has dns>0).
+    ("http-dns-zero-connected", "http://127.0.0.1:9",
+     _ph(dns="0", tcp="0.02", pre="0", ttfb="0"), "first byte"),
+    # connect>0, appconnect=0: builds that record connect at TCP completion.
+    ("https-tls", "https://127.0.0.1:9", _ph(tls="0", pre="0", ttfb="0"), "tls"),
+    # connect=0, appconnect=0, namelookup>0: mirrors MEASURED macOS curl 8.7.1
+    # (SecureTransport / LibreSSL 3.3.6), where time_connect stays 0 until the TLS
+    # handshake finishes -- a silent TCP-accepting server gave tcp=0 tls=0 there.
+    # A TCP stall and a TLS stall are indistinguishable, so the label says both.
+    ("https-connect-or-tls", "https://127.0.0.1:9",
+     _ph(tcp="0", tls="0", pre="0", ttfb="0"), "connect or tls"),
+    ("https-first-byte", "https://127.0.0.1:9", _ph(tls="0.02", ttfb="0"), "first byte"),
+    ("https-body", "https://127.0.0.1:9", _ph(tls="0.02", ttfb="0.03"), "body"),
+]
+
+
+@pytest.mark.parametrize("cid,url,fields,phase", _PHASE_CASES,
+                         ids=[c[0] for c in _PHASE_CASES])
+@pytest.mark.parametrize("which,name,quiet", _MONITORS)
+def test_rc28_edge_line_names_phase(launch, which, name, quiet, cid, url, fields, phase):
+    script = [(0, quiet), (0, quiet)] + [(28, "", fields)] * 3 + [(0, quiet)] * 2
+    r = launch(which, script, url=url)
+    r.wait_calls(7)
+    lines = r.stop()
+    unreachable = [l for l in lines if "forum unreachable" in l]
+    assert len(unreachable) == 1, lines
+    # ORDER-sensitive: the whole line, so a moved/duplicated phase cannot pass.
+    assert unreachable[0] == (
+        f"⚠️  {name}: forum unreachable (curl 28: timed out in {phase}, 10.00s)" + _TAIL
+    ), unreachable[0]
+
+
+@pytest.mark.parametrize("which,name,quiet", _MONITORS)
+def test_http_stall_after_connect_is_never_tls(launch, which, name, quiet):
+    """The trap: http => appconnect 0 even on success. Must not read `tls`."""
+    script = [(0, quiet), (0, quiet), (28, "", _ph(ttfb="0")), (0, quiet)]
+    r = launch(which, script)
+    r.wait_calls(4)
+    lines = r.stop()
+    unreachable = [l for l in lines if "forum unreachable" in l]
+    assert len(unreachable) == 1, lines
+    assert "tls" not in unreachable[0], unreachable[0]
+    assert "in first byte" in unreachable[0], unreachable[0]
+
+
+@pytest.mark.parametrize("rc", [7, 6, 22, 56])
+@pytest.mark.parametrize("which,name,quiet", _MONITORS)
+def test_non_28_rc_gets_no_phase(launch, which, name, quiet, rc):
+    script = [(0, quiet), (0, quiet)] + [(rc, "", _ph(ttfb="0"))] * 2 + [(0, quiet)] * 2
+    r = launch(which, script)
+    r.wait_calls(5)
+    lines = r.stop()
+    unreachable = [l for l in lines if "forum unreachable" in l]
+    assert len(unreachable) == 1, lines
+    assert " in " not in unreachable[0].split("(", 1)[1].split(")", 1)[0], unreachable[0]
+    assert unreachable[0].endswith(_TAIL), unreachable[0]
+
+
+@pytest.mark.parametrize("fields", [{}, _ph(ttfb="n/a"), _ph(dns="")],
+                         ids=["absent", "garbage", "empty"])
+@pytest.mark.parametrize("which,name,quiet", _MONITORS)
+def test_missing_or_unparseable_phase_fields_are_omitted(launch, which, name, quiet, fields):
+    """No phase fields (older/odd curl) or garbage ones: the phase is omitted,
+    the rest of the line is the pre-#3443 text."""
+    script = [(0, quiet), (0, quiet), (28, "", fields), (0, quiet)]
+    r = launch(which, script)
+    r.wait_calls(4)
+    lines = r.stop()
+    unreachable = [l for l in lines if "forum unreachable" in l]
+    assert unreachable == [
+        f"⚠️  {name}: forum unreachable (curl 28: timed out, 10.00s)" + _TAIL
+    ], unreachable
+
+
+@pytest.mark.parametrize("which,name,quiet", _MONITORS)
+def test_seed_suffix_names_phase_on_rc28(launch, which, name, quiet):
+    script = [(28, "", _ph(ttfb="0"))] * 3 + [(0, quiet)] * 3
+    r = launch(which, script)
+    r.wait_calls(5)
+    lines = r.stop()
+    seed = [l for l in lines if "cannot seed" in l]
+    assert len(seed) == 1, lines
+    assert seed[0].endswith(" (last attempt: curl 28: timed out in first byte, 10.00s)"), seed[0]
+
+
+@pytest.mark.parametrize("which,name,quiet", _MONITORS)
+def test_success_with_phase_fields_leaves_body_clean(launch, which, name, quiet):
+    """Extra write-out fields on a success must not reach the parsed body."""
+    script = [(0, quiet, _ph()), (0, quiet, _ph()), (28, "", _ph(ttfb="0")),
+              (0, quiet, _ph())]
+    r = launch(which, script)
+    # Wait for the OUTPUT the assertions need, not for the 4th curl call: the
+    # stub counts a call when it STARTS, but "forum reachable again" is printed
+    # only after the monitor has processed that call's response, so
+    # wait_calls(4) + stop() can win the race under load.
+    assert _wait_until(lambda: any("forum reachable again" in l for l in r.lines)), r.lines
+    lines = r.stop()
+    assert len([l for l in lines if "forum unreachable" in l]) == 1, lines
+    assert len([l for l in lines if "forum reachable again" in l]) == 1, lines

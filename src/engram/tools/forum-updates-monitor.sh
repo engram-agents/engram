@@ -488,24 +488,68 @@ _engaged() {
 # parsed body: RESP is exactly what curl returned before the write-out.
 # Only the OUTPUT of the failure lines changes: cadence, --max-time, retry,
 # seed and cursor handling are untouched.
-# Sets RESP, _CURL_RC, _CURL_T; returns curl's own status.
+# #3443: the write-out also carries namelookup/connect/appconnect/starttransfer
+# (space-separated after time_total) for the phase named on rc 28.
+# Sets RESP, _CURL_RC, _CURL_T and the phase fields; returns curl's own status.
 # ---------------------------------------------------------------------------
 _curl_fetch() {
-    local _out
-    _out="$(curl -s --fail --max-time "$1" -w '\n%{time_total}' "$2" 2>/dev/null)"
+    local _out _w
+    _out="$(curl -s --fail --max-time "$1" -w '\n%{time_total} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' "$2" 2>/dev/null)"
     _CURL_RC=$?
     case "$_out" in
-        *$'\n'*) RESP="${_out%$'\n'*}"; _CURL_T="${_out##*$'\n'}" ;;
-        *)       RESP="$_out"; _CURL_T="" ;;
+        *$'\n'*) RESP="${_out%$'\n'*}"; _w="${_out##*$'\n'}" ;;
+        *)       RESP="$_out"; _w="" ;;
     esac
+    _CURL_T=""; _CURL_DNS=""; _CURL_TCP=""; _CURL_TLS=""; _CURL_TTFB=""
+    read -r _CURL_T _CURL_DNS _CURL_TCP _CURL_TLS _CURL_TTFB <<< "$_w"
+    case "$2" in https://*) _CURL_HTTPS=1 ;; *) _CURL_HTTPS=0 ;; esac
     [ "$_CURL_RC" -eq 0 ] || RESP=""
     return "$_CURL_RC"
 }
 
-# "curl 28: timed out, 10.00s" — unknown codes say `error`; a missing or
+# Phase curl was in when --max-time hit (#3443, mirrors umwelt#1007). curl
+# reports 0 for a phase it never reached, so the phase that ate the time is
+# the first one still at 0. TRAP: on a plain-http URL time_appconnect is ALWAYS
+# 0 (no TLS), so it is consulted for https:// only -- otherwise every http stall
+# would read `tls`. A zero namelookup with a non-zero connect is just a fast
+# lookup (IP literal), so `resolve` needs connect == 0 too. On https, connect == 0
+# (namelookup > 0) is labelled `connect or tls`: measured on macOS curl 8.7.1
+# (SecureTransport) time_connect stays 0 until the TLS handshake completes, so a
+# TCP stall and a TLS stall cannot be told apart there; builds that record connect
+# at TCP completion reach the `tls` branch instead. Any field missing
+# or non-numeric -> prints nothing (no guessing).
+_curl_zero() {  # 0 = numeric, all zeros; 1 = numeric, non-zero; 2 = invalid
+    case "$1" in
+        ''|*[!0-9.]*) return 2 ;;
+        *[!0.]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+_curl_phase() {
+    local _f
+    for _f in "$_CURL_DNS" "$_CURL_TCP" "$_CURL_TTFB"; do
+        _curl_zero "$_f"; [ $? -eq 2 ] && return 0
+    done
+    if [ "$_CURL_HTTPS" = 1 ]; then
+        _curl_zero "$_CURL_TLS"; [ $? -eq 2 ] && return 0
+    fi
+    if _curl_zero "$_CURL_TCP"; then
+        if _curl_zero "$_CURL_DNS"; then printf 'resolve'
+        elif [ "$_CURL_HTTPS" = 1 ]; then printf 'connect or tls'
+        else printf 'connect'; fi
+    elif [ "$_CURL_HTTPS" = 1 ] && _curl_zero "$_CURL_TLS"; then
+        printf 'tls'
+    elif _curl_zero "$_CURL_TTFB"; then
+        printf 'first byte'
+    else
+        printf 'body'
+    fi
+}
+
+# "curl 28: timed out in first byte, 10.00s" — unknown codes say `error`; a missing or
 # non-numeric time_total prints `?s` rather than a made-up number.
 _curl_detail() {
-    local _m _t
+    local _m _t _p=""
     case "$_CURL_RC" in
         6)  _m="could not resolve host" ;;
         7)  _m="connect failed" ;;
@@ -520,7 +564,12 @@ _curl_detail() {
         ''|*[!0-9.]*) _t="?s" ;;
         *) _t="$(LC_ALL=C printf '%.2fs' "$_CURL_T" 2>/dev/null)" || _t="?s" ;;
     esac
-    printf 'curl %s: %s, %s' "$_CURL_RC" "$_m" "$_t"
+    # Phase only for rc 28: every other rc already names where it failed.
+    if [ "$_CURL_RC" = 28 ]; then
+        _p="$(_curl_phase)"
+        [ -n "$_p" ] && _p=" in $_p"
+    fi
+    printf 'curl %s: %s%s, %s' "$_CURL_RC" "$_m" "$_p" "$_t"
 }
 
 _SEED_ANNOUNCED=0
