@@ -174,8 +174,8 @@ CASES = [
     ("prefix-matching-nobody", [ALICE, BOB], "Nobody: hello", None, False),
     ("zero-person-rows", [], "Alice: hello", None, False),
     ("several-rows-duplicate-alias-first-wins", [SAM1, SAM2, DEE], "sammy: hi", None, True),
-    ("malformed-metadata-crash", [BROKEN, ALICE], "Alice: hello", None, None),
-    ("null-metadata-crash", [NULLMETA, ALICE], "Alice: hello", None, None),
+    ("malformed-metadata-survived", [BROKEN, ALICE], "Alice: hello", None, True),
+    ("null-metadata-survived", [NULLMETA, ALICE], "Alice: hello", None, True),
     ("non-ascii-name", [ZOE, ALICE], "雷: bonjour", None, True),
 ]
 
@@ -185,19 +185,27 @@ CASES = [
 def test_c1_hook_output_is_identical_flag_off_vs_on(case, home, monkeypatch):
     """Whole-stdout, exception and sticky-marker equality, off vs on, on the
     SAME store. Mutation: in the owner path drop a row / reorder rows / swap two
-    columns / turn None into "" (see the controls below and the handoff's
-    source-level mutations) -> red. The crash cases pin that the new path
-    crashes exactly where the old one does."""
+    columns / turn a NULL metadata into a valid, matching alias (see the controls
+    below and the handoff's source-level mutations) -> red. The bad-metadata cases (malformed JSON, NULL)
+    pin that BOTH paths survive them and agree (#3449): neither raises, both
+    still produce Alice's identity card past the bad row. A path that crashes
+    again on either side goes red."""
     _name, people, prompt, sticky, must_be_nonempty = case
     make_real_store(home, people)
     mod = load_hook(home, monkeypatch)
     with started_owner(home):
         off, on = run_off_and_on(mod, home, prompt, sticky)
+    if "survived" in _name:
+        # Anti-vacuity for the bad-metadata cases: neither path may raise (the
+        # card assert below then shows the good row after the bad one was
+        # still served).
+        assert off[1] is None and on[1] is None, (off[1], on[1])
     if must_be_nonempty is True:
         # Anti-vacuity: both sides produced a real identity card.
         assert additional_context(off[0]) and additional_context(on[0])
-    if must_be_nonempty is None:
-        assert off[1] is not None, "this case must crash the old path, or it pins nothing"
+    if "survived" in _name:
+        # The card names Alice (pn_0001) past the bad row, not the bad row itself.
+        assert "pn_0001" in additional_context(off[0]) and "pn_0001" in additional_context(on[0])
     assert on == off
 
 
@@ -217,18 +225,22 @@ _SEVERAL = [SAM1, SAM2, DEE]
 _NULL_FIRST = [NULLMETA, ALICE]
 
 @requires_linux_owner
-@pytest.mark.parametrize("name,mutate,people,prompt,baseline_crashes", [
-    ("drop-one-row", lambda rows: rows[1:], _SEVERAL, "sammy: hi", False),
-    ("reorder-rows", lambda rows: list(reversed(rows)), _SEVERAL, "sammy: hi", False),
-    ("swap-two-columns", lambda rows: [[r[0], r[2], r[1], r[3]] for r in rows], _SEVERAL, "sammy: hi", False),
-    # A NULL logical_chain is invisible in the hook's output (`or ""`), but a
-    # NULL metadata is not: None crashes json.loads with a TypeError, "" with a
-    # JSONDecodeError -- the exception text is part of what the harness compares.
-    ("none-becomes-empty-string", lambda rows: [["" if c is None else c for c in r] for r in rows],
-     _NULL_FIRST, "Alice: hi", True),
-], ids=["drop-one-row", "reorder-rows", "swap-two-columns", "none-becomes-empty-string"])
+@pytest.mark.parametrize("name,mutate,people,prompt", [
+    ("drop-one-row", lambda rows: rows[1:], _SEVERAL, "sammy: hi"),
+    ("reorder-rows", lambda rows: list(reversed(rows)), _SEVERAL, "sammy: hi"),
+    ("swap-two-columns", lambda rows: [[r[0], r[2], r[1], r[3]] for r in rows], _SEVERAL, "sammy: hi"),
+    # A NULL metadata is survived by the hook (#3449: treated as `{}`), and so is
+    # "" -- so None -> "" is invisible in the output and cannot be a control.
+    # What IS visible: the NEW side turning the NULL metadata into a VALID
+    # metadata whose alias matches the prompt. The NULL row comes first, so it
+    # now wins the match: the card names "Nully" (pn_0031) instead of Alice
+    # (pn_0001), whereas the untouched baseline skips the NULL row.
+    ("none-metadata-becomes-matching-alias",
+     lambda rows: [[*r[:3], meta("Nully", ["alice"])] if r[3] is None else r for r in rows],
+     _NULL_FIRST, "Alice: hi"),
+], ids=["drop-one-row", "reorder-rows", "swap-two-columns", "none-metadata-becomes-matching-alias"])
 def test_c1_control_the_harness_goes_red_on_a_corrupted_owner_side(
-        name, mutate, people, prompt, baseline_crashes, home, monkeypatch):
+        name, mutate, people, prompt, home, monkeypatch):
     """The harness can fail: the NEW side's rows are corrupted in flight (the
     OLD side is untouched) and the comparison must report a difference.
     Mutation of the harness itself (compare only `len`, or only stdout) -> this
@@ -238,13 +250,14 @@ def test_c1_control_the_harness_goes_red_on_a_corrupted_owner_side(
     with started_owner(home):
         off_clean, on_clean = run_off_and_on(mod, home, prompt)
         assert on_clean == off_clean
-        if baseline_crashes:
-            assert off_clean[1] is not None
-        else:
-            assert additional_context(off_clean[0]), "baseline must agree and be non-empty"
+        assert additional_context(off_clean[0]), "baseline must agree and be non-empty"
         with patch.object(ec, "read", _mutating_read(mutate)):
             off, on = run_off_and_on(mod, home, prompt)
     assert off == off_clean, "the OLD side must be untouched by a NEW-side mutation"
+    if name == "none-metadata-becomes-matching-alias":
+        # The comment's claim, checked: the mutated side names the NULL row.
+        assert "pn_0031" in additional_context(on[0])
+        assert "pn_0001" in additional_context(off[0])
     assert on != off, f"harness failed to notice the {name} corruption"
 
 
