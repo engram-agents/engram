@@ -65,7 +65,10 @@ Allowed-move table under test (design doc sec.2):
   supported_by -> about
   derives_from -> about
   derives_from -> exemplifies   (target is a lesson or cornerstone)
-  cites        -> about
+  cites        -> about   (loose cites only; observation -> evidence is refused)
+  cites        -> every addable_after_creation relation (widened by #2243
+                  step 3 part A; those cells live in
+                  tests/test_retype_cites_widening_2243.py)
 
 Only `supported_by -> about` and `cites -> about` are confidence-recompute
 no-ops by construction (neither relation is in CASCADE_RELATIONS, so neither

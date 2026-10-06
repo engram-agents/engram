@@ -370,8 +370,8 @@ replacement into the premise set (measured: without it, `0.833 → 0.833`,
    `X → P`, so under resolution the ack adds nothing and a resolved check
    could only re-report a cycle that already exists (and would refuse every
    ack inside it). **Repair routes:** if the closing path contains a
-   retypable edge (`cites` / `supported_by` / `derives_from` that is not the
-   node's last cascade premise), retype it to `about` with
+   retypable edge (a loose `cites` (not an observation's link to its evidence) /
+   `supported_by` / `derives_from` that is not the node's last cascade premise), retype it to `about` with
    `engram_retype_edge`, then acknowledge again; otherwise (the path runs
    through `supersedes`, `retracts`, `subtask_of`, `predicted_by` or
    `acknowledged_derives_from`, or the `derives_from → about` retype is

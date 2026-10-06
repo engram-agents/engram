@@ -1293,13 +1293,35 @@ def dag_family_relations(family: str) -> "frozenset[str]":
 # all provenance-bearing; about/exemplifies are not. Any move not in this
 # table is refused, including every move in the opposite (stronger)
 # direction. The value is None (no extra condition) or a tuple of node
-# `type` values the TARGET must already be one of.
+# `type` values the TARGET must already be one of. (#2243 step 3 part A
+# widens a loose `cites` (one that is not observation -> evidence) to every
+# addable relation; see the block below.) A `cites` between an observation
+# and its evidence (the pair core._cites_pair_error accepts) is provenance and
+# is never retypable: engram_retype_edge refuses it before this table's moves
+# are applied.
 # ---------------------------------------------------------------------------
+#
+# #2243 step 3 part A: a LOOSE `cites` may be re-typed to EVERY relation that
+# is addable after creation (Lei's ruling: loose cites -> `about` or another
+# non-provenance edge type). That half of the table is DERIVED from
+# EDGE_CLASSIFICATIONS, never a hand-typed list, so a relation that gains or
+# loses addable_after_creation moves with it. The relation-specific endpoint
+# rules for the new relation are enforced by the same helper engram_add_edge
+# uses (engram_cornerstone._relation_endpoint_error).
+
+# Required TARGET node types for any re-type into `exemplifies` (one
+# definition, shared by derives_from->exemplifies and cites->exemplifies).
+EXEMPLIFIES_TARGET_TYPES = ("lesson", "cornerstone")
+
 RETYPE_ALLOWED_MOVES: "dict[tuple[str, str], tuple[str, ...] | None]" = {
     ("supported_by", "about"): None,
     ("derives_from", "about"): None,
-    ("derives_from", "exemplifies"): ("lesson", "cornerstone"),
-    ("cites", "about"): None,
+    ("derives_from", "exemplifies"): EXEMPLIFIES_TARGET_TYPES,
+    **{
+        ("cites", _r): (EXEMPLIFIES_TARGET_TYPES if _r == "exemplifies" else None)
+        for _r, _c in EDGE_CLASSIFICATIONS.items()
+        if _c["addable_after_creation"]
+    },
 }
 
 
@@ -5600,6 +5622,27 @@ def _is_observation_node(conn: sqlite3.Connection, node_id: str) -> bool:
     return bool(row) and str(row[0]).startswith("observation_")
 
 
+def _cites_pair_error(conn: sqlite3.Connection, source_id: str,
+                      target_id: str) -> "str | None":
+    """The ONE definition of which (source, target) pairs may carry `cites`:
+    an observation source and an `ev_` evidence target. Returns None when the
+    pair is accepted, else the refusal text (target checked first). Used by
+    `_insert_cites_edge` (the writer) and by `engram_retype_edge`'s guard,
+    which refuses to retype an edge of an accepted pair: that edge is
+    provenance."""
+    if not str(target_id).startswith("ev_"):
+        return (
+            "cites targets evidence nodes only; use 'about' for a context "
+            f"reference: {target_id}"
+        )
+    if not _is_observation_node(conn, source_id):
+        return (
+            "cites carries observation->evidence only; source is not an "
+            f"observation node: {source_id}"
+        )
+    return None
+
+
 def _insert_cites_edge(conn: sqlite3.Connection, source_id: str, target_id: str,
                        now: str) -> None:
     """The ONLY writer of relation 'cites' (#2243, Lei's ruling 2026-10-06).
@@ -5611,16 +5654,9 @@ def _insert_cites_edge(conn: sqlite3.Connection, source_id: str, target_id: str,
     its node before its edges). Writes nothing on refusal. A duplicate edge
     raises sqlite3.IntegrityError as before; callers keep their wrapper.
     """
-    if not str(target_id).startswith("ev_"):
-        raise ValueError(
-            "cites targets evidence nodes only; use 'about' for a context "
-            f"reference: {target_id}"
-        )
-    if not _is_observation_node(conn, source_id):
-        raise ValueError(
-            "cites carries observation->evidence only; source is not an "
-            f"observation node: {source_id}"
-        )
+    err = _cites_pair_error(conn, source_id, target_id)
+    if err is not None:
+        raise ValueError(err)
     conn.execute(
         "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
         (source_id, target_id, now),

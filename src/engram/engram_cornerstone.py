@@ -840,6 +840,69 @@ def _remove_edge_impl(
         conn.close()
 
 
+def _relation_endpoint_error(relation: str, source_row, target_row) -> "str | None":
+    """The relation-specific ENDPOINT-TYPE gates for writing ``relation``
+    between two nodes, or None when the pair is acceptable.
+
+    ONE guarded writer for these rules (#2243 step 3 part A): both
+    ``_add_edge_impl`` (a new edge) and ``_retype_edge_impl`` (an existing
+    edge's new relation) call this, so a re-type to X is refused with X's own
+    text exactly when add_edge to X would be refused for the same node types.
+    That equivalence is bounded to THESE node-type endpoint rules: a re-type
+    to ``subtask_of`` also runs the grounding-family cycle check, which
+    add_edge does not, so a re-type can be refused where add_edge would not be.
+    Rows need ``id`` and ``type``.
+
+    Covers: the ``instantiates`` boundary gates (#530: not a lesson target,
+    target in INSTANTIATES_TARGET_TYPES, claim-bearing source) and the
+    ``generalizes`` endpoint-pair rule (#2753 epic, WS1, D1).
+
+    Deliberately NOT here: is-current checks and the already-exists no-op
+    (add-only), the ``generalizes`` cycle walk and the ``temporal_causal``
+    order check (applied generically by each caller).
+    """
+    source_id, target_id = source_row["id"], target_row["id"]
+    if relation == "instantiates":
+        if target_row["type"] == "lesson":
+            return (
+                f"'instantiates' does not accept lesson targets — an "
+                f"incident that is an instance of a lesson's pattern is "
+                f"wired via `exemplifies` (engram_register_exemplar / "
+                f"engram_lesson_register_incident), which feeds the "
+                f"tripwire engine. Target '{target_id}' is a lesson."
+            )
+        if target_row["type"] not in core.INSTANTIATES_TARGET_TYPES:
+            return (
+                f"'instantiates' targets must be one of "
+                f"{sorted(core.INSTANTIATES_TARGET_TYPES)} — the "
+                f"principle-family node the source realizes. Target "
+                f"'{target_id}' is type '{target_row['type']}'. For "
+                f"intent-shaped task→goal contribution use `serves`; "
+                f"for incident→lesson membership use `exemplifies`."
+            )
+        if not core._is_claim_bearing(source_row["type"]):
+            return (
+                f"'instantiates' sources must be claim-bearing "
+                f"({sorted(core.CLAIM_BEARING_TYPES)}); source "
+                f"'{source_id}' is type '{source_row['type']}'."
+            )
+    if relation == "generalizes":
+        pair = (source_row["type"], target_row["type"])
+        if pair not in core.GENERALIZES_ALLOWED_PAIRS:
+            return (
+                f"'generalizes' does not accept a "
+                f"{source_row['type']} -> {target_row['type']} pair. "
+                f"Allowed: {sorted(core.GENERALIZES_ALLOWED_PAIRS)}. "
+                f"Concrete nodes keep `exemplifies` (incident -> "
+                f"lesson) / `instantiates` (claim -> principle) — "
+                f"`generalizes` is reserved for principle -> "
+                f"principle abstraction (source '{source_id}' is "
+                f"type '{source_row['type']}', target '{target_id}' is "
+                f"type '{target_row['type']}')."
+            )
+    return None
+
+
 def _add_edge_impl(
     source_id: str = "",
     target_id: str = "",
@@ -914,60 +977,19 @@ def _add_edge_impl(
                 )
             })
 
-        # `instantiates` boundary gates (#530): the exemplifies/serves/instantiates
-        # three-way boundary is enforced mechanically here, not just documented
-        # (mechanical gate > vigilance — the redundant-near-synonym failure mode).
-        if relation == "instantiates":
-            if target["type"] == "lesson":
-                return json.dumps({
-                    "error": (
-                        f"'instantiates' does not accept lesson targets — an "
-                        f"incident that is an instance of a lesson's pattern is "
-                        f"wired via `exemplifies` (engram_register_exemplar / "
-                        f"engram_lesson_register_incident), which feeds the "
-                        f"tripwire engine. Target '{target_id}' is a lesson."
-                    )
-                })
-            if target["type"] not in core.INSTANTIATES_TARGET_TYPES:
-                return json.dumps({
-                    "error": (
-                        f"'instantiates' targets must be one of "
-                        f"{sorted(core.INSTANTIATES_TARGET_TYPES)} — the "
-                        f"principle-family node the source realizes. Target "
-                        f"'{target_id}' is type '{target['type']}'. For "
-                        f"intent-shaped task→goal contribution use `serves`; "
-                        f"for incident→lesson membership use `exemplifies`."
-                    )
-                })
-            if not core._is_claim_bearing(source["type"]):
-                return json.dumps({
-                    "error": (
-                        f"'instantiates' sources must be claim-bearing "
-                        f"({sorted(core.CLAIM_BEARING_TYPES)}); source "
-                        f"'{source_id}' is type '{source['type']}'."
-                    )
-                })
+        # Relation-specific endpoint gates (`instantiates` #530, `generalizes`
+        # #2753 WS1 D1) live in ONE helper shared with engram_retype_edge
+        # (#2243 step 3 part A): the three-way exemplifies/serves/instantiates
+        # boundary and the generalizes pair rule are enforced mechanically,
+        # not just documented, and a re-type is held to the same rules.
+        endpoint_err = _relation_endpoint_error(relation, source, target)
+        if endpoint_err is not None:
+            return json.dumps({"error": endpoint_err})
 
-        # `generalizes` boundary gates (#2753 epic, WS1, D1): endpoint-pair
-        # gate + write-time cycle guard, mechanically enforced here — not
-        # just documented — same discipline as the `instantiates` gate
-        # above (#530).
+        # `generalizes` write-time cycle guard (#2753 epic, WS1, D1). The
+        # endpoint-pair rule is in _relation_endpoint_error above; the cycle
+        # walk stays here (retype applies its own family-aware cycle check).
         if relation == "generalizes":
-            pair = (source["type"], target["type"])
-            if pair not in core.GENERALIZES_ALLOWED_PAIRS:
-                return json.dumps({
-                    "error": (
-                        f"'generalizes' does not accept a "
-                        f"{source['type']} -> {target['type']} pair. "
-                        f"Allowed: {sorted(core.GENERALIZES_ALLOWED_PAIRS)}. "
-                        f"Concrete nodes keep `exemplifies` (incident -> "
-                        f"lesson) / `instantiates` (claim -> principle) — "
-                        f"`generalizes` is reserved for principle -> "
-                        f"principle abstraction (source '{source_id}' is "
-                        f"type '{source['type']}', target '{target_id}' is "
-                        f"type '{target['type']}')."
-                    )
-                })
             cycle_path = core._generalizes_cycle_path(conn, source_id, target_id)
             if cycle_path is not None:
                 return json.dumps({
@@ -1099,6 +1121,10 @@ def _retype_edge_impl(
     public payload schema. Kept callable with named kwargs for in-server
     callers.
 
+    A `cites` edge between an observation and its evidence (the pair
+    core._cites_pair_error accepts) is provenance and is refused for every
+    new relation; only a loose cites is retypable.
+
     Corrects a wrong edge by making it WEAKER, never stronger (issue #2265,
     design doc docs/2265-2347-edge-correction-design.md sec.2). One
     transaction: refuse on a pending cascade marker on either endpoint,
@@ -1162,6 +1188,29 @@ def _retype_edge_impl(
         ).fetchone()
         if not target:
             return json.dumps({"error": f"Target node '{target_id}' not found."})
+
+        # Provenance guard: a `cites` between an observation and its evidence
+        # (the pair core._cites_pair_error accepts) is the observation's
+        # evidence link and is never retypable, whatever the new relation.
+        # It runs before every check below that could name a different
+        # error, so this pair always gets this text. It fires only when the
+        # edge exists (a missing edge keeps its "nothing to retype" error,
+        # which the order below would otherwise have produced).
+        if relation == "cites" and core._cites_pair_error(
+                conn, source_id, target_id) is None:
+            cites_row = conn.execute(
+                "SELECT id FROM edges WHERE source_id = ? AND target_id = ? "
+                "AND relation = 'cites'", (source_id, target_id),
+            ).fetchone()
+            if cites_row:
+                return json.dumps({
+                    "error": (
+                        f"'cites' edge {source_id} -> {target_id} is an "
+                        f"observation's link to its evidence: it is provenance "
+                        f"and is not retypable. Only a loose cites (one that "
+                        f"is not observation -> evidence) can be retyped."
+                    )
+                })
 
         required_target_types = core.RETYPE_ALLOWED_MOVES[move]
         if required_target_types is not None and target["type"] not in required_target_types:
@@ -1229,12 +1278,21 @@ def _retype_edge_impl(
                     )
                 })
 
-        # Step 2: new_relation's own add-time checks. Currently a no-op for
-        # every move in RETYPE_ALLOWED_MOVES (both 'about' and 'exemplifies'
-        # are temporal_causal=False, dag_family None) -- implemented generically,
-        # against core.EDGE_CLASSIFICATIONS, so a future table addition
-        # targeting a temporal_causal=True or acyclicity-family relation is caught
-        # correctly rather than silently skipped.
+        # Step 2: new_relation's own add-time checks. #2243 step 3 part A:
+        # the relation-specific endpoint rules come from the SAME helper
+        # engram_add_edge uses (never copied), so a re-type to X is refused
+        # exactly when add_edge to X would be for these node types. (That
+        # holds for the node-type endpoint rules only: a retype to subtask_of
+        # ALSO runs the grounding-family cycle check, which add_edge does
+        # not, so a retype can be refused where add_edge would not be.) Current-
+        # ness is deliberately NOT required (a loose cites on superseded or
+        # retracted history is retyped with its stratum). The generic
+        # temporal_causal and acyclicity-family checks follow, against
+        # core.EDGE_CLASSIFICATIONS, so any relation is covered by its own
+        # classification rather than silently skipped.
+        endpoint_err = _relation_endpoint_error(new_relation, source, target)
+        if endpoint_err is not None:
+            return json.dumps({"error": endpoint_err})
         new_class = core.EDGE_CLASSIFICATIONS.get(new_relation, {})
         if new_class.get("temporal_causal"):
             src_created = conn.execute(
@@ -1345,6 +1403,30 @@ def _retype_edge_impl(
 
         conn.commit()
 
+        # Post-commit side effects, same surface as _add_edge_impl (#2243
+        # step 3 part A) and equally best-effort: outside the transaction, so
+        # a cache/registry failure can never fail or roll back the retype.
+        # Applies to EVERY move into these relations, including the older
+        # derives_from -> exemplifies. Deliberately NO
+        # _reset_principle_enactments: that is add_edge's "new trigger edge
+        # = new evidence" reset, and a relabel of an EXISTING edge is not new
+        # evidence (same reasoning as _remove_edge_impl's note on its own case).
+        cache_rebuild = None
+        if new_relation == "exemplifies":
+            try:
+                cache_rebuild = core._rebuild_incidents_cache()
+            except Exception as exc:
+                cache_rebuild = {"status": "error", "detail": str(exc)}
+            try:
+                core._rebuild_cornerstone_anchors_cache()
+            except Exception:
+                pass  # best-effort; anchor staleness is non-fatal
+        if new_relation in ("exemplifies", "instantiates", "serves", "tensions"):
+            try:
+                core._rebuild_principle_triggers()
+            except Exception:
+                pass  # best-effort
+
         result = {
             "status": "retyped",
             "source_id": source_id,
@@ -1361,6 +1443,8 @@ def _retype_edge_impl(
                 "new": old_confidence,
                 "disposition": "no_op_not_cascade_bearing",
             }
+        if cache_rebuild is not None:
+            result["cache_rebuild"] = cache_rebuild
         return json.dumps(result)
     except Exception as exc:
         # Atomicity (design doc sec.2, step 5's failure case; Ariadne's test

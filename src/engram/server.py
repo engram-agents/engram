@@ -5491,17 +5491,42 @@ _RETYPE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation", "new_rela
 #   supported_by -> about
 #   derives_from -> about
 #   derives_from -> exemplifies   (target must be a lesson or cornerstone)
-#   cites        -> about
+#   cites        -> every relation with addable_after_creation (today: about,
+#                   exemplifies, generalizes, instantiates, serves, subtask_of,
+#                   tensions) -- derived from EDGE_CLASSIFICATIONS, not typed;
+#                   #2243 step 3 part A. The new relation's own endpoint rules
+#                   are the ones engram_add_edge enforces (one shared helper,
+#                   engram_cornerstone._relation_endpoint_error), so a retype
+#                   to X is refused exactly when add_edge to X would be for
+#                   the same node types (a bound on the node-type endpoint
+#                   rules only: a retype to subtask_of ALSO runs the
+#                   grounding-family cycle check, which add_edge does not, so
+#                   a retype can be refused where add_edge would not be);
+#                   exemplifies still needs a lesson or
+#                   cornerstone target. A loose cites on a superseded or
+#                   retracted source IS retypable (current-ness is not required).
+#                   A cites from an observation to its evidence (an ev_ node;
+#                   the pair core._cites_pair_error accepts) is provenance and
+#                   is NEVER retypable, to any relation, about included.
 # Any move outside this table is refused, INCLUDING the reverse (stronger)
-# direction of any of the four above — a re-type may only take a claim of
+# direction of any of the above — a re-type may only take a claim of
 # support AWAY, never add one after the fact (the same invariant
 # addable_after_creation=False already protects).
 #
 # Refusals (in order): missing/empty required field (including `reason` —
-# the correction is never silent); move not in RETYPE_ALLOWED_MOVES; target
-# type mismatch for a conditional move; source/target node not found; no
-# edge of the stated relation between them; a pending cascade marker on
-# EITHER endpoint (settle the cascade first via engram_cascade_resolve).
+# the correction is never silent); move not in RETYPE_ALLOWED_MOVES;
+# source/target node not found; an observation -> evidence cites (provenance,
+# never retypable, checked once that edge exists); target type mismatch for a
+# conditional move; no edge of the stated relation between them; a pending cascade marker on
+# EITHER endpoint (settle the cascade first via engram_cascade_resolve); the
+# new relation's own endpoint rules (instantiates / generalizes pair), its
+# temporal order (subtask_of) and its acyclicity family.
+#
+# Side effects after commit, best-effort (same as engram_add_edge): a retype
+# INTO exemplifies rebuilds the incidents + cornerstone-anchors caches
+# (result carries `cache_rebuild`); a retype into exemplifies / instantiates /
+# serves / tensions rebuilds the principle-trigger registry. It does NOT reset
+# principle enactments: a relabel of an existing edge is not new evidence.
 #
 # Confidence: if the OLD relation is cascade-bearing (core.CASCADE_RELATIONS
 # — today only derives_from and acknowledged_derives_from), retyping it away
@@ -5521,8 +5546,8 @@ _RETYPE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation", "new_rela
     name="engram_retype_edge",
     capability=(
         "Corrects a wrong edge relation by making it WEAKER (never stronger) "
-        "in one audited transaction — e.g. a supported_by/derives_from/cites "
-        "edge that was really only 'about' or an 'exemplifies' case. "
+        "in one audited transaction — e.g. a supported_by/derives_from/loose-cites "
+        "edge (never an observation's cites to its evidence) that was really only an 'about', 'exemplifies', 'generalizes', 'instantiates', 'serves', 'subtask_of' or 'tensions' case. "
         "Refuses moves outside a fixed allowed-move table, a pending-marker "
         "endpoint, or a missing reason."
     ),
@@ -5548,8 +5573,14 @@ def engram_retype_edge(payload_json: str) -> str:
                 (relation, new_relation) pair must be one of the allowed
                 moves: supported_by->about, derives_from->about,
                 derives_from->exemplifies (target must be a lesson or
-                cornerstone), cites->about. Any other pair — including the
-                reverse of any of these — is refused.
+                cornerstone), and loose cites->X for every relation X addable after
+                creation (about, exemplifies [lesson/cornerstone target],
+                generalizes, instantiates, serves, subtask_of, tensions);
+                a cites from an observation to its evidence is provenance
+                and is never retypable;
+                the new relation must also pass the endpoint rules
+                engram_add_edge applies to it. Any other pair — including
+                the reverse of any of these — is refused.
             reason (str, required): Why this edge was wrong. Required and
                 cannot be empty; recorded in the edit-history audit trail
                 alongside both the old and new relation.

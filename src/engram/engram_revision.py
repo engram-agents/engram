@@ -1592,7 +1592,8 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
                                  f"contains an edge that should not be a "
                                  f"premise — typically a mistyped context "
                                  f"edge. Repair: if the path contains a "
-                                 f"retypable edge (cites / supported_by / "
+                                 f"retypable edge (a loose cites -- not an observation's "
+                                 f"link to its evidence -- / supported_by / "
                                  f"derives_from that is not the node's last "
                                  f"cascade premise), retype it with "
                                  f"engram_retype_edge to about, then "
@@ -1610,7 +1611,8 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
                         "relation": "acknowledged_derives_from",
                         "cycle": exc.cycle,
                         "remedy": "if the closing path contains a retypable "
-                                  "edge (cites / supported_by / derives_from "
+                                  "edge (a loose cites -- not an observation's link "
+                                  "to its evidence -- / supported_by / derives_from "
                                   "that is not the node's last cascade "
                                   "premise), retype it with "
                                   "engram_retype_edge to about, then retry "
