@@ -380,6 +380,169 @@ def _recorded_pid_is_alive() -> bool:
     )
 
 
+# #3361: startup gate exit codes (sysexits 75 = "temporary failure"), so a
+# supervisor log reads "refused, did not start" rather than a crash. Distinct
+# so a reader can tell "a live holder was positively identified" from "could
+# not prove the path unheld". Never 0: exit 0 tells a supervisor all is well.
+EXIT_SOCKET_HELD = 75       # another live process holds SOCKET_PATH
+EXIT_SOCKET_UNPROVEN = 76   # could not prove SOCKET_PATH is unheld (fail closed)
+
+_LSOF_TIMEOUT_S = 5
+
+
+def _pids_holding_inode(inode, proc_root):
+    """Pids (ints) with an fd link `socket:[inode]` under proc_root/<pid>/fd.
+    Unreadable pid dirs are skipped (permissions), so [] means "none we
+    could see", never "none exist"."""
+    target = "socket:[" + inode + "]"
+    pids = set()
+    try:
+        names = os.listdir(proc_root)
+    except OSError:
+        return []
+    for name in names:
+        if not name.isdigit():
+            continue
+        fd_dir = os.path.join(proc_root, name, "fd")
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                link = os.readlink(os.path.join(fd_dir, fd))
+            except OSError:
+                continue
+            if link == target:
+                pids.add(int(name))
+                break
+    return sorted(pids)
+
+
+def _holder_cwds(inode, proc_root):
+    """cwd paths of every pid holding `inode`, or None when that cannot be
+    established (no visible pid, or any holder's cwd unreadable): the caller
+    must then treat a relative-path row as UNKNOWN, not as another file."""
+    pids = _pids_holding_inode(inode, proc_root)
+    if not pids:
+        return None
+    cwds = []
+    for pid in pids:
+        try:
+            cwds.append(os.readlink(os.path.join(proc_root, str(pid), "cwd")))
+        except OSError:
+            return None
+    return cwds
+
+
+def _socket_holder_state(socket_path, proc_net_unix="/proc/net/unix", proc_root="/proc"):
+    """Who holds `socket_path`? Returns (state, pids), state in HELD / FREE /
+    UNKNOWN, pids a sorted list of ints (may be empty even when HELD).
+
+    Positive identification only, fail CLOSED (#3361). Mirrors the shell
+    guard in start-engram-daemon.sh (#3359):
+
+    * Where `proc_net_unix` exists: each named row's PATH-TEXT column is
+      classified against `socket_path` (see the comment above the loop:
+      aliased and relative spellings are resolved, never compared as bare
+      text; never by inode against stat(), never by substring). HELD even if
+      no pid can be resolved (permissions); UNKNOWN when a row cannot be
+      shown to be another file; FREE only when every row is provably not ours.
+    * Else (macOS/BSD): `lsof -t -- <path>`. rc 0 with pid lines is HELD;
+      every other outcome (rc 1, other rc, timeout, no lsof, no parsable pid)
+      is UNKNOWN. `-U` is deliberately NOT passed: with a path argument lsof
+      ORs the selections and would list every unix-socket holder on the host.
+
+    A connect() attempt is never proof of absence: a socket that is bound but
+    not listening answers ECONNREFUSED and is still a live holder.
+    """
+    if os.path.exists(proc_net_unix):
+        try:
+            with open(proc_net_unix, errors="replace") as f:
+                lines = f.readlines()
+        except OSError:
+            return ("UNKNOWN", [])
+        # The kernel lists the BIND-TIME path text, which can be a different
+        # spelling of our file (a symlinked parent directory, or a relative
+        # bind). So each named row is CLASSIFIED against our file, never
+        # just compared as text (#3361, #3490 security review):
+        #   absolute P: P == socket_path or realpath(P) == realpath(ours)
+        #     -> HELD. Else if P's directory resolves to a real directory
+        #     and the realpaths differ, the row cannot be our file -> ignore
+        #     (a same-basename decoy elsewhere). Else (directory missing,
+        #     dangling symlink, unresolvable) and the basename matches ->
+        #     UNKNOWN: we cannot show the row is not our file.
+        #   relative P: a different basename -> ignore. Same basename: the
+        #     meaning depends on the binder's cwd, so read
+        #     /proc/<pid>/cwd of the pid(s) holding the row's inode;
+        #     realpath(cwd/P) == realpath(ours) -> HELD, different ->
+        #     ignore, no pid or an unreadable cwd -> UNKNOWN.
+        #   Aggregate: any HELD -> HELD; else any UNKNOWN -> UNKNOWN; else
+        #     FREE. Unnamed and abstract ('@') rows are skipped. Matching is
+        #     exact path equality, never substring, and never a comparison of
+        #     filesystem inodes against sockfs inodes.
+        # Remaining limits, stated precisely (not claimed solved): the
+        # kernel text is whatever the binder passed, so (1) a holder that
+        # bound through a symlink that was RETARGETED after the bind, or a
+        # relative-bind holder that chdir()ed afterwards, is classified by
+        # where the text points NOW; (2) a hard link (link() on a socket
+        # file) or a bind mount can make our path reach a socket whose row
+        # text has a different directory AND basename. All three need a
+        # local process that deliberately re-plumbs paths after binding.
+        ours_real = os.path.realpath(socket_path)
+        ours_base = os.path.basename(socket_path)
+        held_inodes = set()
+        unknown = False
+        for line in lines:
+            # 7 fixed columns then the path text (which may contain spaces).
+            parts = line.rstrip("\n").split(None, 7)
+            if len(parts) != 8:
+                continue
+            inode, text = parts[6], parts[7]
+            if text.startswith("@"):
+                continue
+            if os.path.isabs(text):
+                if text == socket_path or os.path.realpath(text) == ours_real:
+                    held_inodes.add(inode)
+                elif os.path.isdir(os.path.realpath(os.path.dirname(text))):
+                    continue  # provably another file (a decoy)
+                elif os.path.basename(text) == ours_base:
+                    unknown = True
+            elif os.path.basename(text) == ours_base:
+                cwds = _holder_cwds(inode, proc_root)
+                if not cwds:
+                    unknown = True
+                    continue
+                for cwd in cwds:
+                    if os.path.realpath(os.path.join(cwd, text)) == ours_real:
+                        held_inodes.add(inode)
+                        break
+        if not held_inodes:
+            return ("UNKNOWN" if unknown else "FREE", [])
+        pids = set()
+        for inode in held_inodes:
+            pids.update(_pids_holding_inode(inode, proc_root))
+        return ("HELD", sorted(pids))
+
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            ["lsof", "-t", "--", socket_path],
+            capture_output=True,
+            text=True,
+            timeout=_LSOF_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ("UNKNOWN", [])
+    if r.returncode != 0:
+        return ("UNKNOWN", [])
+    pids = sorted({int(t) for t in (r.stdout or "").split() if t.isdigit()})
+    if not pids:
+        return ("UNKNOWN", [])
+    return ("HELD", pids)
+
+
 def main():
     global _client, _bound_socket
 
@@ -406,6 +569,43 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(0)
+        # #3361: the recorded pid is dead, but that does not mean nobody
+        # holds the path (pidfile stale / missing / names another process).
+        # Unlink only when the path is positively known to be unheld; a live
+        # holder or an unprovable answer refuses loudly rather than steal.
+        state, holders = _socket_holder_state(SOCKET_PATH)
+        # Defensive: HELD with only our own pid is effectively unreachable
+        # here, since we have not bound yet at gate time.
+        others = [p for p in holders if p != os.getpid()]
+        if state == "HELD" and (others or not holders):
+            who = ",".join(str(p) for p in others) if others else "unknown"
+            print(
+                f"[engram-daemon] socket {SOCKET_PATH} is held by live "
+                f"process(es) pid={who} -- refusing to steal it (exit "
+                f"{EXIT_SOCKET_HELD})",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_SOCKET_HELD)
+        if state == "UNKNOWN":
+            print(
+                f"[engram-daemon] could not prove socket {SOCKET_PATH} is "
+                "unheld (no /proc/net/unix answer and no usable lsof "
+                "answer) -- refusing to remove it; if you know it is stale, "
+                f"remove it by hand (exit {EXIT_SOCKET_UNPROVEN})",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_SOCKET_UNPROVEN)
+        # Two race windows, which are NOT the same:
+        # (a) FREE -> os.unlink (microseconds): a non-daemon process that
+        #     binds a path just proven stale can have its live socket
+        #     unlinked here, after which our own bind() succeeds -- a steal.
+        #     This gate narrows that window; it does not close it, and
+        #     nothing short of an atomic bind-or-fail can.
+        # (b) os.unlink -> our bind() (the model load, seconds): a process
+        #     that binds in this window wins, and our bind() fails loudly
+        #     with EADDRINUSE. bind() never unlinks: the only server.bind
+        #     is the one in main(), and SOCKET_PATH is unlinked only in
+        #     cleanup() and in this gate.
         try:
             os.unlink(SOCKET_PATH)
         except OSError:
