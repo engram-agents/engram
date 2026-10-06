@@ -95,7 +95,7 @@ from pathlib import Path
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context
+from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context, write_route_ledger, tool_fire_key
 from _harness import detect_harness, get_harness_budgets
 
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
@@ -1376,9 +1376,31 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
                 "outcome": outcome,
             }
 
+        # Route ledger (#3458 A): one line per gate-passing fire when the
+        # probe is live for this session (opt-in by presence, fail-open --
+        # see _hooklib.write_route_ledger). Observation only. This route has
+        # no FTS fallback (daemon-only), so source is always "daemon"; a
+        # daemon that returned nothing records zero candidates.
+        recall_query = " ".join(novel)
+
+        def _route_ledger(result_, shown_: list, cut_: dict) -> None:
+            if not hook_input:
+                return
+            try:
+                write_route_ledger(
+                    "tool_recall", hook_input.get("session_id"),
+                    tool_fire_key(hook_input.get("tool_name"), hook_input.get("tool_input")),
+                    recall_query, result_, shown_, cut_,
+                    source="daemon", default_cut="not_in_pool",
+                    extra={"novel_terms": list(novel)},
+                )
+            except Exception as exc:  # e.g. an unserialisable tool_input: fail-open
+                print(f"route-ledger: {type(exc).__name__}: {exc}"[:300], file=sys.stderr)
+
         # Gate passed — query the daemon with the novel terms.
-        result = _query_recall_daemon(" ".join(novel))
+        result = _query_recall_daemon(recall_query)
         if not result or not result.get("match_count"):
+            _route_ledger(result, [], {})
             _record_fire()
             _write_state()
             _append_ledger(lambda: _ledger_entry("no_matches", 0, [], 0))
@@ -1389,12 +1411,22 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
         rendered_ids = []
         skipped_recent = 0
         pool = (result.get("special_nodes") or []) + (result.get("top_claims") or [])
+        _cut_names: dict = {}  # route ledger: id -> this route's own cut name
         for n in pool:
-            if len(lines) >= cfg["max_lines"]:
-                break
             nid = n.get("id", "?")
+            if len(lines) >= cfg["max_lines"]:
+                # cfg["max_lines"] reached: every remaining pool entry is cut
+                # by that cap (named "max_lines" for the ledger). The cap
+                # branch continues past the cap to record those cut names;
+                # the rendered lines and counts are unchanged.
+                if nid in recent_ids:
+                    _cut_names[nid] = "dedup"
+                else:
+                    _cut_names[nid] = "max_lines"
+                continue
             if nid in recent_ids:
                 skipped_recent += 1
+                _cut_names[nid] = "dedup"
                 continue
             kw = n.get("recall_keywords")
             kw_str = (" · ".join(f"`{k}`" for k in kw) + " — ") if isinstance(kw, list) and kw else ""
@@ -1402,6 +1434,7 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
             lines.append(f"  - [{nid}] {kw_str}{body}")
             rendered_ids.append(nid)
 
+        _route_ledger(result, rendered_ids, _cut_names)
         _record_fire()
         if not lines:
             _write_state()

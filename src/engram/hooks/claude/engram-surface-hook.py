@@ -39,7 +39,7 @@ os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 
 if HOOK_DIR not in sys.path:
     sys.path.insert(0, HOOK_DIR)
-from _hooklib import resolve_runtime_dir, emit_context
+from _hooklib import resolve_runtime_dir, emit_context, write_route_ledger, prompt_fire_key
 from _harness import detect_harness, get_harness_budgets
 try:
     from _hooklib import (
@@ -1959,6 +1959,7 @@ def format_nudge(
     pack_results: list[dict] | None = None,
     session_id: str | None = None,
     stats: dict | None = None,
+    route_out: dict | None = None,
 ) -> str:
     """Format engram_surface result into a compact nudge string.
 
@@ -2041,7 +2042,22 @@ def format_nudge(
     the dict shape unconditionally. None (the default) skips telemetry
     entirely — no behavior change, matches the pack_results / session_id
     optional-param precedent above.
+
+    route_out: optional caller-owned dict, mutated in place (out-parameter),
+    for the route ledger (#3458 section A, `_hooklib.write_route_ledger`):
+    {shown: own-graph ids in render order, cut_reasons: {id: this function's
+    own cut name}}. Cut names are the ones already in this function:
+    "budget" (the recall_budget gate), "suppress" (the #1689 suppress tier),
+    "echo" (the #257 same-session-echo drop), plus "no_keywords" (an Others
+    candidate with no recall_keywords, dropped by the keyword filter). Ids
+    absent from cut_reasons that were neither shown are cut by a count cap
+    (the [:3] specials/top_claims slices or the [:15] Others slice) -- the
+    ledger writer defaults those to "cap". Observation only: nothing here
+    changes what renders. None (the default) records nothing.
     """
+    if route_out is not None:
+        route_out.clear()
+        route_out.update({"shown": [], "cut_reasons": {}})
     budget_cfg = _get_budget_config()
     if stats is not None:
         stats.clear()
@@ -2147,6 +2163,10 @@ def format_nudge(
     lines.append(f"[ENGRAM Recall: {total} nodes match your query]")
 
     rendered_ids_this_prompt: set = set()
+    # route ledger (#3458 A): render-order record of own-graph ids, and the
+    # ids the Others pass cut that no existing set records. Observation only.
+    _shown_order: list = []
+    _others_budget_cut: set = set()
     suppressed_ids: set = set()
     demoted_candidates: list[dict] = []
     # Nodes that were eligible (full-tier or Others-tier) in one section but
@@ -2215,6 +2235,7 @@ def format_nudge(
                 if _budget_try_spend(rendered_line, budget_state):
                     special_lines.append(rendered_line)
                     rendered_ids_this_prompt.add(nid)
+                    _shown_order.append(nid)
                     special_rendered_count += 1
                     if moment_candidate is not None:
                         # Cursor + cooldown only commit once the line
@@ -2262,6 +2283,7 @@ def format_nudge(
                 if _budget_try_spend(rendered_line, budget_state):
                     top_claim_lines.append(rendered_line)
                     rendered_ids_this_prompt.add(nid)
+                    _shown_order.append(nid)
                     top_claims_rendered_count += 1
                 else:
                     # eligible (full-tier) but budget-cut — dropped, not
@@ -2384,6 +2406,7 @@ def format_nudge(
                         continue
                     reserved_lines.append(reserved_line)
                     rendered_ids_this_prompt.add(nid)
+                    _shown_order.append(nid)
                     already_placed.add(nid)
         if reserved_lines:
             lines.append("  Worth revisiting (not recalled recently):")
@@ -2478,9 +2501,11 @@ def format_nudge(
         others_marker = f"⚠ {'/'.join(tags)} " if tags else ""
         others_line = f"    - {others_marker}[{mid}] {kw_str}"
         if not _budget_try_spend(others_line, budget_state):
+            _others_budget_cut.add(mid)
             continue
         others_rendered_lines.append(others_line)
         others_rendered_ids.add(mid)
+        _shown_order.append(mid)
     if others_rendered_lines:
         lines.append("  Others:")
         lines.extend(others_rendered_lines)
@@ -2605,6 +2630,25 @@ def format_nudge(
             suppressed_echo_ids=suppressed_echo_ids,
             decay_events=decay_events,
         )
+
+    # --- Route ledger out-parameter (#3458 A): what rendered, in order, and
+    # the cut names this function already uses. Read-only over local state.
+    # Known bound (not fixed): `shown` is the render BEFORE `emit_context`
+    # applies its final whole-block budget cut, so an id reported as shown
+    # could in principle be dropped by that later cut.
+    if route_out is not None:
+        _reasons: dict = {}
+        for _m in others_candidates:
+            if not (isinstance(_m.get("recall_keywords"), list) and _m.get("recall_keywords")):
+                _reasons[_m.get("id")] = "no_keywords"
+        for _i in suppressed_ids:
+            _reasons[_i] = "suppress"
+        for _i in suppressed_echo_ids:
+            _reasons[_i] = "echo"
+        for _i in budget_cut_ids | _others_budget_cut:
+            _reasons[_i] = "budget"
+        route_out["shown"] = [i for i in _shown_order if i]
+        route_out["cut_reasons"] = {k: v for k, v in _reasons.items() if k}
 
     # --- Stats out-parameter: final telemetry for engram.surface.render_size
     # (issue #1692). chars_rendered/nodes_shown/nodes_cut_budget come from
@@ -3590,12 +3634,14 @@ def main():
     # not None) — see the engram.surface.render_size emission below, which
     # gates on this dict being non-empty.
     _render_stats: dict = {}
+    _route_out: dict = {}
     if result is not None:
         nudge = format_nudge(
             result,
             pack_results=pack_results,
             session_id=hook_input.get("session_id", "unknown"),
             stats=_render_stats,
+            route_out=_route_out,
         )
         if nudge:
             body_blocks.append(nudge)
@@ -3712,6 +3758,17 @@ def main():
         nap_warning = format_nap_warning(counter["prompts_since_compaction"])
         if nap_warning:
             body_blocks.append(nap_warning)
+
+    # Route ledger (#3458 A): one line per fire when the probe is live for
+    # this session (opt-in by presence, fail-open -- see _hooklib). `query` is
+    # the text sent to the daemon/FTS (the raw prompt; embed_query, when set,
+    # only widens the semantic side and is recorded separately).
+    write_route_ledger(
+        "prompt_surface", hook_input.get("session_id"), prompt_fire_key(prompt),
+        prompt, result, _route_out.get("shown", []), _route_out.get("cut_reasons", {}),
+        source="daemon" if used_daemon else "fallback",
+        extra={"embed_query": embed_query} if embed_query is not None else None,
+    )
 
     response = _assemble_response(head_blocks, body_blocks)
     if not response:

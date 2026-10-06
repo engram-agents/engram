@@ -781,3 +781,183 @@ def emit_context(
         rendered = safe if safe else rendered[:budget]
 
     return rendered
+
+
+# ---------------------------------------------------------------------------
+# Route ledger (#3458 section A)
+#
+# The probe mod (tools/probes/mods-recall) rates what the recall ARMS surface.
+# #3458 widens its ratings to the two LIVE recall routes, so each route records
+# -- at fire time, because signals such as utility change on use and cannot be
+# recovered from the live graph later -- one JSON line per fire:
+#
+#   <probeDir>/<session_id>/routes/<route>.jsonl
+#
+# probeDir rule (matches the mod exactly: config.ts DEFAULTS.probeDir =
+# '~/.engram/probe/mods-recall', record.ts resolveProbeDir = HOME-relative):
+# `$HOME/.engram/probe/mods-recall`, via Path.home(). NOT $ENGRAM_HOME -- the
+# mod derives its root from the user's home directory, so ENGRAM_HOME (which
+# may point at another data dir) must not move the ledger away from the
+# directory the probe is actually reading.
+#
+# Opt-in by presence: nothing is written unless `<probeDir>/<session_id>/`
+# already exists. Absence of that directory means "the probe is not live for
+# this session", which is a true optional (not an error): the hook changes
+# nothing -- no file, no directory, no log line. Fail-open: any other ledger
+# error costs one stderr line `route-ledger: <reason>`; the hook's own stdout
+# is never touched. The ledger OBSERVES: it records what the route's own
+# response carried and never recomputes or approximates a signal.
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib
+import time as _time
+
+ROUTE_PROBE_SUBPATH = (".engram", "probe", "mods-recall")
+
+# Per-candidate signal fields read from the route's own response. A field the
+# response does not carry for a candidate is null, and its name is listed once
+# in the line's `missing_signals`.
+ROUTE_SIGNALS = (
+    "type", "similarity", "importance_score", "utility", "composite_score",
+    "match_type", "recall_turn", "created_at", "in_context",
+)
+# Response-key aliases: the debug shape of engram_query names utility
+# `utility_score`. Same value under another key, not an approximation.
+_ROUTE_SIGNAL_ALIASES = {"utility": ("utility", "utility_score")}
+
+
+def route_probe_dir() -> Path:
+    """`$HOME/.engram/probe/mods-recall` (see the block comment above)."""
+    return Path.home().joinpath(*ROUTE_PROBE_SUBPATH)
+
+
+def prompt_fire_key(prompt_text: str) -> str:
+    """prompt_surface fire_key: sha256(prompt_text)[:16]."""
+    return _hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+
+
+def tool_fire_key(tool_name, tool_input) -> str:
+    """tool_recall fire_key: `<tool_name>:` + sha256 of the canonical
+    (sort_keys) JSON of tool_input, first 16 hex."""
+    canon = json.dumps(tool_input, sort_keys=True)
+    return f"{tool_name}:{_hashlib.sha256(canon.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _signal_from(entry: dict, name: str):
+    """Nested `entry["signals"]` first (the surface response shape, #3462),
+    then the flat key (legacy / debug shapes). No default: absent -> None."""
+    nested = entry.get("signals")
+    sources = (nested, entry) if isinstance(nested, dict) else (entry,)
+    for src in sources:
+        for key in _ROUTE_SIGNAL_ALIASES.get(name, (name,)):
+            if key in src and src[key] is not None:
+                return src[key]
+    return None
+
+
+def build_route_candidates(result: Optional[dict]) -> tuple:
+    """(candidates, missing_signals) from a daemon/query response, BEFORE any
+    route-side cut. Ranking = the response's own `matched_ids` order (falling
+    back to matched_meta / top_claims / special_nodes order when the response
+    carries no matched_ids). Each signal is read from whichever of
+    matched_meta / top_claims / special_nodes carries it for that id; absent
+    -> None, and the name is added once to missing_signals."""
+    result = result if isinstance(result, dict) else {}
+    sources: dict = {}
+    pool = (
+        list(result.get("matched_meta") or [])
+        + list(result.get("top_claims") or [])
+        + list(result.get("special_nodes") or [])
+    )
+    order = [i for i in (result.get("matched_ids") or []) if i]
+    for e in pool:
+        if not isinstance(e, dict) or not e.get("id"):
+            continue
+        sources.setdefault(e["id"], []).append(e)
+        if not result.get("matched_ids") and e["id"] not in order:
+            order.append(e["id"])
+    candidates, missing = [], []
+    for rank, nid in enumerate(order, start=1):
+        cand = {"id": nid, "rank": rank}
+        for name in ROUTE_SIGNALS:
+            val = None
+            for e in sources.get(nid, ()):
+                val = _signal_from(e, name)
+                if val is not None:
+                    break
+            cand[name] = val
+            if val is None and name not in missing:
+                missing.append(name)
+        candidates.append(cand)
+    return candidates, missing
+
+
+def write_route_ledger(
+    route: str,
+    session_id,
+    fire_key: str,
+    query,
+    result: Optional[dict],
+    shown: list,
+    cut_reasons: dict,
+    *,
+    source: str,
+    default_cut: str = "cap",
+    extra: Optional[dict] = None,
+) -> None:
+    """Append one ledger line (see block comment). Never raises; at most one
+    stderr line. `cut_reasons` maps id -> the route's own cut name; any
+    candidate neither shown nor named gets `default_cut`."""
+    try:
+        sid = session_id if isinstance(session_id, str) else ""
+        # "unknown" is the hooks' own missing-session placeholder, and a
+        # separator / dot-dot would escape the probe dir: never a ledger key.
+        # "." would resolve to the probe root itself (`probeDir/.`), so a line
+        # would land in `<probeDir>/routes/`: it must be a plain single name.
+        if (
+            not sid or sid == "unknown" or "/" in sid or "\\" in sid or ".." in sid
+            or sid in {".", ".."} or sid != Path(sid).name
+        ):
+            return
+        session_dir = route_probe_dir() / sid
+        if not session_dir.is_dir():
+            return  # probe not live for this session: true optional, silent
+        candidates, missing = build_route_candidates(result)
+        shown_set = set(shown)
+        cut = {
+            c["id"]: cut_reasons.get(c["id"], default_cut)
+            for c in candidates if c["id"] not in shown_set
+        }
+        line = {
+            "ts": int(_time.time() * 1000),
+            "route": route,
+            "session_id": sid,
+            "fire_key": fire_key,
+            "source": source,
+            "query": query,
+        }
+        if extra:
+            line.update(extra)
+        line.update({
+            "candidates": candidates,
+            "missing_signals": missing,
+            "shown": list(shown),
+            "cut": cut,
+        })
+        text = json.dumps(line) + "\n"
+        routes_dir = session_dir / "routes"
+        if not routes_dir.is_dir():
+            os.mkdir(routes_dir, 0o700)
+            os.chmod(routes_dir, 0o700)  # mkdir's mode is masked by umask
+        fd = os.open(routes_dir / f"{route}.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, text.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception as exc:  # fail-open: the route's own output is never affected
+        try:
+            msg = f"route-ledger: {type(exc).__name__}: {exc}".replace("\r", " ").replace("\n", " ")
+            print(msg[:300], file=sys.stderr)
+        except Exception:
+            pass
