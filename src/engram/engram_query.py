@@ -2004,12 +2004,17 @@ def _search_nodes(
     output = _mmr_rerank(output, top_k=top_k, mmr_lambda=core.MMR_LAMBDA)
 
     # Strip internal-only fields before returning to callers.
+    # #3458: keep the pre-MMR composite on the row as `composite_score` (the
+    # exact value used for ordering) so the surface signals can report it.
     for node in output:
-        node.pop("_composite", None)
+        node["composite_score"] = node.pop("_composite", None)
         node.pop("_embedding", None)
-    # Strip _embedding from special_pool too (set during Tier 1).
+    # Strip _embedding from special_pool too (set during Tier 1). Special-type
+    # bypass rows are never composite-ranked -> composite_score is null, never
+    # a computed substitute.
     for node in special_pool:
         node.pop("_embedding", None)
+        node["composite_score"] = None
 
     # ══ FINAL MERGE: generic (top_k) + special-type bypass results ══════
     # top_k is the generic-result budget. Special-type results append after,
@@ -2426,6 +2431,24 @@ def _conn_total_count(where_clause: str, params: list) -> int:
 # Impl functions (moved from server.py)
 # ---------------------------------------------------------------------------
 
+# #3458 half C — per-candidate ranking signals exposed on the surface response.
+# name -> key on the ranked row it is read from. Read-only: a key the row lacks
+# is None (never computed here), so the ledger can tell "absent" from a value.
+_SURFACE_SIGNAL_ROW_KEYS = {
+    "similarity": "similarity",
+    "importance_score": "importance_score",
+    "utility": "utility_score",
+    "composite_score": "composite_score",
+    "match_type": "match_type",
+    "recall_turn": "recall_turn",
+}
+
+
+def _surface_signals(row: dict) -> dict:
+    """The six #3458 ranking signals for one ranked row (None when absent)."""
+    return {name: row.get(key) for name, key in _SURFACE_SIGNAL_ROW_KEYS.items()}
+
+
 def _surface_impl(
     query: str,
     top_k: int = 10,
@@ -2444,6 +2467,9 @@ def _surface_impl(
     engram_surface call (from an agent, not the daemon) has no use for a
     384-float array in its own context, so it's opt-in rather than always
     computed+stripped (mirrors the `return_debug` idiom on _search_nodes).
+
+    The no-results early return carries no `signals_present` key; consumers
+    treat an absent key as empty (#3458).
     """
     conn = core._get_db()
     try:
@@ -2521,6 +2547,7 @@ def _surface_impl(
                     "created_minutes_ago": core._created_minutes_ago(n.get("created_at"), now=now_utc),
                     "recall_summary": n.get("recall_summary"),
                     "recall_keywords": json.loads(n.get("recall_keywords") or "null"),
+                    "signals": _surface_signals(n),
                 }
                 if ntype == "question":
                     entry["status"] = n.get("status", "open")
@@ -2578,6 +2605,7 @@ def _surface_impl(
                 "created_minutes_ago": core._created_minutes_ago(n.get("created_at"), now=now_utc),
                 "recall_summary": n.get("recall_summary"),
                 "recall_keywords": json.loads(n.get("recall_keywords") or "null"),
+                "signals": _surface_signals(n),
             }
             for n in claim_nodes[:3]
         ]
@@ -2667,6 +2695,7 @@ def _surface_impl(
                 # #1779 round 1).
                 "created_at": n.get("created_at"),
                 "created_minutes_ago": core._created_minutes_ago(n.get("created_at"), now=now_utc),
+                "signals": _surface_signals(n),
             }
             # Lightweight boolean taint/staleness signal (MECH-5 follow-up) —
             # reuse the warned_nodes map already built above rather than
@@ -2697,6 +2726,12 @@ def _surface_impl(
             "issues": {},
             "matched_ids": matched_ids,
             "matched_meta": matched_meta,
+            # Signal names non-null on >=1 candidate (#3458): lets a reader
+            # tell "absent on this build" from "null for this node".
+            "signals_present": [
+                name for name in _SURFACE_SIGNAL_ROW_KEYS
+                if any(m["signals"][name] is not None for m in matched_meta)
+            ],
             "search_methods": {
                 "keyword_matches": search["keyword_matches"],
                 "semantic_matches": search["semantic_matches"],
@@ -2928,9 +2963,11 @@ def _query_impl(
             # above. Gated on `not return_debug`: return_debug=True's
             # contract is "preserve full legacy shape verbatim" (eval/harness
             # contract per the docstring below), so no new fields are added
-            # to node dicts on that path — metadata is popped unconditionally
-            # either way (see node.pop("metadata", ...) below), so
-            # return_debug output is genuinely unchanged by this fix.
+            # to node dicts on that path by THIS extraction — metadata is
+            # popped unconditionally either way (see node.pop("metadata", ...)
+            # below). Note return_debug=True result rows DO gain one additive
+            # field, `composite_score` (#3458, set in _search_nodes);
+            # `debug.per_result` is unchanged.
             # trust_tier needs no extraction here — it's already a raw
             # column carried through by _node_to_dict unconditionally.
             if not return_debug and node.get("type") == "person":
