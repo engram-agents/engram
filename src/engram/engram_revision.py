@@ -1100,6 +1100,27 @@ class _CascadeCycleError(Exception):
         )
 
 
+class _GroundingCycleError(_CascadeCycleError):
+    """#3210: the acknowledgement edge would close a cycle through the wider
+    GROUNDING family (e.g. via a `cites` or `supported_by` edge) even though
+    no path over CASCADE_RELATIONS alone closes it. A subclass of
+    `_CascadeCycleError`, so every existing `except _CascadeCycleError` still
+    catches it; `_cascade_resolve_impl` branches on the subclass to name the
+    repair route, which differs: the closing path contains an edge that
+    should not be a premise, and the fix is `engram_retype_edge`, not a
+    different resolution kind.
+    """
+
+    def __init__(self, node_id: str, replacement_id: str, cycle: "list[str]"):
+        self.cycle = list(cycle)
+        super().__init__(node_id, replacement_id)
+        self.args = (
+            f"acknowledging {node_id!r} would close a grounding cycle "
+            f"{' -> '.join(self.cycle)} (the closing path runs through a "
+            f"non-cascade grounding edge such as cites/supported_by).",
+        )
+
+
 def _cascade_record_acknowledgement_edges(conn, node_id: str,
                                           affected: list, now: str) -> list:
     """§4: an acknowledgement records that the node now ALSO rests on each
@@ -1112,10 +1133,11 @@ def _cascade_record_acknowledgement_edges(conn, node_id: str,
     order. Filed as `derives_from` it produced one DAG-time violation per
     acknowledgement, measured, because `derives_from` carries
     `temporal_causal: True` (#2357 renamed that flag from dag_check; the
-    creation-order semantics are the renamed flag's, NOT the new `dag`
-    edge-walk flag's). `acknowledged_derives_from` carries
-    `temporal_causal: False` for exactly that structural reason — and
-    `dag: True`, because it is still not permitted to close a cycle — which
+    creation-order semantics are the renamed flag's, NOT the acyclicity
+    edge-walk's). `acknowledged_derives_from` carries
+    `temporal_causal: False` for exactly that structural reason — and sits in
+    the grounding acyclicity family, because it is still not permitted to
+    close a cycle — which
     keeps `derives_from`'s creation-order check honest everywhere else.
 
     WHY IT MUST EXIST AT ALL: an acknowledgement OUTLIVES the repair window.
@@ -1193,6 +1215,34 @@ def _cascade_record_acknowledgement_edges(conn, node_id: str,
             # `_cascade_reaches` — do not write a second walker.
             if _cascade_reaches(conn, node_id, replacement):
                 raise _CascadeCycleError(node_id, replacement)
+            # #3210: the cascade walk above is deliberately cascade-scoped
+            # (§12.4's proof; it also serves the supersede/retract guards)
+            # and cannot see a loop that closes through a non-cascade
+            # grounding edge (`cites`, `supported_by`, ...) -- admitted here,
+            # then reported by conformance. So ALSO check the whole grounding
+            # family. RAW edges, not resolved through supersedes (resolve=
+            # False): that keeps this check's semantics identical to the
+            # cascade guard it sits beside, so everything the cascade guard
+            # admitted or refused before is unchanged except for paths that
+            # use a non-cascade grounding edge.
+            # WHY resolve=False (measured in review): an ack edge X -> R,
+            # where R replaced X's premise P, resolves to the SAME edge as
+            # the existing X -> P. So under resolution the ack adds no edge
+            # to the resolved graph, and a resolved check here could only
+            # re-report a cycle that ALREADY exists -- and would then refuse
+            # every ack inside an existing cycle. The audit sees that cycle
+            # from the second supersede on, before any ack. The remaining
+            # guard/audit gap is at the supersede and retract writers, which
+            # are guarded only by the cascade-scoped `_cascade_reaches`, by
+            # §12.4 design; it is not this writer's to close.
+            # The grounding family contains CASCADE_RELATIONS, so everything
+            # the check above refuses is still refused (it runs first).
+            g_cycle = core._dag_cycle_path(
+                conn, "acknowledged_derives_from", node_id, replacement,
+                resolve=False,
+            )
+            if g_cycle is not None:
+                raise _GroundingCycleError(node_id, replacement, g_cycle)
             conn.execute(
                 "INSERT INTO edges (source_id, target_id, relation, created_at) "
                 "VALUES (?, ?, 'acknowledged_derives_from', ?)",
@@ -1532,6 +1582,47 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
                 # this call is committed (no ack edges, no marker
                 # resolution, no audit entry).
                 conn.rollback()
+                if isinstance(exc, _GroundingCycleError):
+                    return json.dumps({
+                        "error": f"Cycle guard: acknowledging {exc.node_id!r} "
+                                 f"would write an acknowledged_derives_from "
+                                 f"edge to {exc.replacement_id!r}, closing a "
+                                 f"cycle through the grounding relations: "
+                                 f"{' -> '.join(exc.cycle)}. The closing path "
+                                 f"contains an edge that should not be a "
+                                 f"premise — typically a mistyped context "
+                                 f"edge. Repair: if the path contains a "
+                                 f"retypable edge (cites / supported_by / "
+                                 f"derives_from that is not the node's last "
+                                 f"cascade premise), retype it with "
+                                 f"engram_retype_edge to about, then "
+                                 f"acknowledge again. Otherwise (the path "
+                                 f"runs only through supersedes, retracts, "
+                                 f"subtask_of, predicted_by or "
+                                 f"acknowledged_derives_from edges, or "
+                                 f"derives_from -> about is refused because "
+                                 f"it is the last cascade premise) the path "
+                                 f"cannot be repaired through the MCP tools "
+                                 f"and needs engram_surgical.",
+                        "guard": "acknowledgement_would_close_grounding_cycle",
+                        "node_id": exc.node_id,
+                        "replacement_id": exc.replacement_id,
+                        "relation": "acknowledged_derives_from",
+                        "cycle": exc.cycle,
+                        "remedy": "if the closing path contains a retypable "
+                                  "edge (cites / supported_by / derives_from "
+                                  "that is not the node's last cascade "
+                                  "premise), retype it with "
+                                  "engram_retype_edge to about, then retry "
+                                  "the acknowledgement; otherwise the path "
+                                  "cannot be repaired through the MCP tools "
+                                  "and needs engram_surgical.",
+                        "next_call": "engram_retype_edge(source_id=..., "
+                                     "target_id=..., relation=..., "
+                                     "new_relation='about', reason=...)",
+                        "phase": "apply",
+                        "markers_unchanged": True,
+                    })
                 return json.dumps({
                     "error": f"Cycle guard: acknowledging {exc.node_id!r} "
                              f"would write an acknowledged_derives_from edge "

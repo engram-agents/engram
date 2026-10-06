@@ -796,8 +796,8 @@ VALID_RELATIONS = {
                      # (addable_after_creation/removable both True). Also
                      # writable at mint time via `generalized_by` on
                      # engram_add_lesson/engram_add_cornerstone.
-                     # dag=True (real structural acyclicity — see its
-                     # EDGE_CLASSIFICATIONS entry) and CYCLE-GUARDED AT
+                     # in the abstraction acyclicity family (real structural
+                     # acyclicity — see its EDGE_CLASSIFICATIONS entry) and CYCLE-GUARDED AT
                      # WRITE TIME (see _generalizes_cycle_path below), not
                      # merely audited after the fact.
 }
@@ -812,12 +812,26 @@ VALID_RELATIONS = {
 #     order: source created at-or-after target). This is what every existing
 #     call site (the supersede/add_edge timestamp guards, the startup scan)
 #     actually measures, honestly named.
-#   dag — the real, structural property: is this relation safe from cycles?
+#   dag_family (#3210; replaced the bool `dag`) — the real, structural
+#     property: which acyclicity FAMILY, if any, is this relation in?
+#     "grounding" (cites, derives_from, acknowledged_derives_from,
+#     predicted_by, retracts, subtask_of, supersedes, supported_by: all point
+#     dependent -> premise), "abstraction" (generalizes), or None (not
+#     acyclicity-checked). A cycle is only meaningful WITHIN a family: grounding
+#     runs both ways relative to generality, so `generalizes` (general ->
+#     specific) cannot share one acyclicity check with it -- a deduction-shaped
+#     pair (specific supported_by general, general generalizes specific) is a
+#     legal 2-cycle in the union. Every walk -- the batch audit, the write-time
+#     guards, the retype guard -- derives its relation set from this field via
+#     dag_family_relations(), never a literal. `dag` is no longer a key;
+#     "is this relation acyclicity-checked" is `dag_family is not None`
+#     (== DAG_RELATIONS membership).
+#     Historical note, from when the key was the bool `dag`:
 #     For every relation that existed before this split, dag == temporal_causal
 #     (the two never diverged until now, so no relation needed re-judging).
 #     `acknowledged_derives_from` is the first and so far only relation where
-#     they differ: dag=True (a cycle through it would be genuinely bad — see
-#     its entry), temporal_causal=False (it is deliberately backwards in time,
+#     they differ: in the grounding family (a cycle through it would be
+#     genuinely bad — see its entry), temporal_causal=False (it is deliberately backwards in time,
 #     by construction).
 # dag is per-relation, not scoped to CASCADE_RELATIONS — structural relations
 # like supersedes/retracts/subtask_of need cycle protection too and are not
@@ -827,7 +841,7 @@ EDGE_CLASSIFICATIONS = {
     "about": {
         "cascade": False,
         "temporal_causal": False,
-        "dag": False,
+        "dag_family": None,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -835,7 +849,7 @@ EDGE_CLASSIFICATIONS = {
     "cites": {
         "cascade": False,
         "temporal_causal": True,
-        "dag": True,
+        "dag_family": "grounding",
         "removable": False,    # provenance load-bearing; removal would orphan claims
         "addable_after_creation": False,  # legacy dual-use; PR 3 introduces new relation for relevance-marking
         "provenance": True,
@@ -843,7 +857,7 @@ EDGE_CLASSIFICATIONS = {
     "contradicts": {
         "cascade": False,
         "temporal_causal": False,    # advisory check exempts contradicts (the contradicts-dag-exempt observation)
-        "dag": False,
+        "dag_family": None,
         "removable": False,    # structural commitment; alters epistemic stance
         "addable_after_creation": False,
         "provenance": False,
@@ -851,7 +865,7 @@ EDGE_CLASSIFICATIONS = {
     "derives_from": {
         "cascade": True,       # taint/stale propagation
         "temporal_causal": True,
-        "dag": True,
+        "dag_family": "grounding",
         "removable": False,    # cascade-bearing
         "addable_after_creation": False,
         "provenance": True,    # traced by _trace_evidence_roots in engram_core.py
@@ -868,16 +882,16 @@ EDGE_CLASSIFICATIONS = {
         # But it is NOT exempt from acyclicity. Constructed through public
         # verbs only: base → P, X derives_from P, P′ derives_from X (legal —
         # X is unmarked at that moment), supersede P → P′, then acknowledge X.
-        # The ack edge closes X → P′ → X. A real per-relation dag flag is what
-        # catches that a plain "cascade relations are acyclic because they're
-        # temporal_causal" argument cannot: dag=True, checked by a real edge
+        # The ack edge closes X → P′ → X. A real per-relation acyclicity family
+        # is what catches that a plain "cascade relations are acyclic because
+        # they're temporal_causal" argument cannot: grounding family, checked by a real edge
         # walk (see engram_dag_conformance.check_dag_conformance and the
         # write-time guard that #2349 lands at §12.7), independent of the
         # temporal direction.
         "cascade": True,        # must participate in cascade walks — that is
                                  # the entire reason this relation exists.
         "temporal_causal": False,
-        "dag": True,
+        "dag_family": "grounding",
         "removable": False,     # cascade-bearing, mirrors derives_from.
         "addable_after_creation": False,
         "provenance": True,
@@ -885,7 +899,7 @@ EDGE_CLASSIFICATIONS = {
     "exemplifies": {
         "cascade": False,
         "temporal_causal": False,    # advisory check exempts exemplifies (lesson edges, the exemplifies-dag-exempt observation)
-        "dag": False,
+        "dag_family": None,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -899,22 +913,22 @@ EDGE_CLASSIFICATIONS = {
         # to an older principle — the edge is allowed to point backwards in
         # time, same shape as `instantiates`/`serves`.
         #
-        # dag=True is the flag that matters here (wording fix on #2753,
-        # 2026-09-08 16:3xZ): real structural acyclicity — a cycle in
+        # The acyclicity family (abstraction) is what matters here (wording
+        # fix on #2753, 2026-09-08 16:3xZ): real structural acyclicity — a cycle in
         # generalization/exemplification makes no sense, so `generalizes`
         # joins the relation set `engram_dag_conformance` walks (see
         # DAG_RELATIONS below) AND is cycle-guarded at WRITE time (see
         # _generalizes_cycle_path) — conformance is the after-the-fact
         # audit, the write guard is what stops a cycle landing.
         #
-        # classification-tier + dag=True is a combination present nowhere
-        # else in this table (every classification-tier relation today —
-        # instantiates/serves/exemplifies — is dag=False); this is an
+        # classification-tier + an acyclicity family is a combination present
+        # nowhere else in this table (every classification-tier relation
+        # today — instantiates/serves/exemplifies — has dag_family None); this is an
         # INTENTIONAL divergence from the tier's usual dag pattern,
         # acknowledged in EDGE_TIER_DIVERGENCE_ACK below.
         "cascade": False,
         "temporal_causal": False,
-        "dag": True,
+        "dag_family": "abstraction",
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -922,7 +936,7 @@ EDGE_CLASSIFICATIONS = {
     "instantiates": {
         "cascade": False,      # pure relevance marker — no confidence propagation
         "temporal_causal": False,    # realization is not a temporal dependency (see VALID_RELATIONS note)
-        "dag": False,
+        "dag_family": None,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -935,7 +949,7 @@ EDGE_CLASSIFICATIONS = {
                                 # own author; do not restore it.
         "temporal_causal": True,      # same provenance-chain shape as supported_by, which
                                 # this edge is split out of.
-        "dag": True,
+        "dag_family": "grounding",
         "removable": False,    # provenance load-bearing, mirrors supported_by.
         "addable_after_creation": False,  # minted once at node-add time
                                            # (engram_observation.py); never hand-addable.
@@ -947,7 +961,7 @@ EDGE_CLASSIFICATIONS = {
                                # (a question filed and immediately resolved by a pre-existing node
                                # has resolver.created_at < question.created_at — correct, not a
                                # violation). Exemption added 2026-06-10, issue #1076.
-        "dag": False,
+        "dag_family": None,
         "removable": False,    # structural commitment
         "addable_after_creation": False,
         "provenance": False,
@@ -963,7 +977,7 @@ EDGE_CLASSIFICATIONS = {
                                 # walking this relation would make a retract cascade's first
                                 # taint target the very node that is correcting it.
         "temporal_causal": True,
-        "dag": True,
+        "dag_family": "grounding",
         "removable": False,
         "addable_after_creation": False,
         "provenance": False,
@@ -973,7 +987,7 @@ EDGE_CLASSIFICATIONS = {
         "temporal_causal": False,    # same shape as instantiates: a goal can be articulated after the node
                                # that serves it — serves.source legitimately pre-dates serves.target.
                                # Exemption added 2026-06-10, issue #1076 (three-tier edge taxonomy).
-        "dag": False,
+        "dag_family": None,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -981,7 +995,7 @@ EDGE_CLASSIFICATIONS = {
     "subtask_of": {
         "cascade": False,
         "temporal_causal": True,
-        "dag": True,
+        "dag_family": "grounding",
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -994,7 +1008,7 @@ EDGE_CLASSIFICATIONS = {
                                 # at non-current nodes, so a stale cascade:True here would only
                                 # ever fire on invariant-violating data.
         "temporal_causal": True,
-        "dag": True,
+        "dag_family": "grounding",
         "removable": False,    # structural mutation; use engram-surgical for emergencies
         "addable_after_creation": False,
         "provenance": False,
@@ -1007,7 +1021,7 @@ EDGE_CLASSIFICATIONS = {
                                 # accomplishes nothing. provenance/temporal_causal/dag/removable
                                 # deliberately UNCHANGED — this is a cascade-only flip.
         "temporal_causal": True,
-        "dag": True,
+        "dag_family": "grounding",
         "removable": False,
         "addable_after_creation": False,
         "provenance": True,    # traced by _trace_evidence_roots in engram_core.py
@@ -1017,7 +1031,7 @@ EDGE_CLASSIFICATIONS = {
         "temporal_causal": False,    # relational tier (dependency/relational/classification): symmetric/cross-temporal
                                # like contradicts (already exempt). A tension between nodes has no causal
                                # direction; either can pre-date the other legitimately.
-        "dag": False,
+        "dag_family": None,
                                # Exemption added 2026-06-10, issue #1076 (three-tier edge taxonomy).
         "removable": True,
         "addable_after_creation": True,
@@ -1150,11 +1164,11 @@ def prediction_pairing_exemption_sql(target_col: str = "n.id") -> "tuple[str, tu
 # (the three-tier edge taxonomy: dependency / relational / classification).
 # Maintained as a SEPARATE dict from
 # EDGE_CLASSIFICATIONS so that existing consumers of that dict (which iterate
-# its schema of {cascade, temporal_causal, dag, removable,
+# its schema of {cascade, temporal_causal, dag_family, removable,
 # addable_after_creation, provenance}) are not affected.
 #
 # Tier→temporal_causal expectation (#2357 renamed dag_check→temporal_causal;
-# this tier map is about creation-order, not the newer `dag` acyclicity flag
+# this tier map is about creation-order, not the newer `dag_family` acyclicity field
 # — see EDGE_CLASSIFICATIONS's own header comment for why the two split):
 #   dependency     ⇒ temporal_causal=True   (causal / provenance chain; temporal order matters)
 #   relational     ⇒ temporal_causal=False  (symmetric or cross-temporal; no causal direction)
@@ -1202,7 +1216,7 @@ EDGE_TIERS: dict[str, str] = {
                                     # abstraction edge, temporal_causal=False
                                     # (matches this tier's expectation — the
                                     # INTENTIONAL divergence here is on the
-                                    # `dag` flag, not `temporal_causal`; see
+                                    # `dag_family` field, not `temporal_causal`; see
                                     # EDGE_TIER_DIVERGENCE_ACK below and the
                                     # hard-failing test in
                                     # test_edge_tier_audit.py that checks it).
@@ -1214,26 +1228,27 @@ EDGE_TIERS: dict[str, str] = {
 # (test_edge_tier_audit.py) skips emitting a warning for acknowledged entries,
 # preserving the ability to intentionally diverge without noisy CI output.
 #
-# #2753 WS1 widening: also the home for an intentional `dag`/tier divergence
-# (distinct from the temporal_causal divergence above — see `generalizes`
-# below, the first relation where the two kinds differ). The soft warn in
-# test_edge_tier_audit.py checks temporal_causal only and would NOT catch a
-# `dag`-only divergence's absence here; test_edge_tier_audit.py also carries
+# #2753 WS1 widening: also the home for an intentional `dag_family`/tier
+# divergence (distinct from the temporal_causal divergence above — see
+# `generalizes` below, the first relation where the two kinds differ). The
+# soft warn in test_edge_tier_audit.py checks temporal_causal only and would
+# NOT catch a `dag_family`-only divergence's absence here; test_edge_tier_audit.py also carries
 # a HARD-FAILING test for exactly that gap (added alongside this entry).
 EDGE_TIER_DIVERGENCE_ACK: dict[str, str] = {
     "acknowledged_derives_from": (
         "#2357: deliberately backwards in creation time — the acknowledging "
         "node necessarily predates the replacement it acknowledges. Real "
-        "acyclicity is still enforced via dag=True, checked by an edge walk "
+        "acyclicity is still enforced via the grounding family, checked by an edge walk "
         "rather than the temporal_causal timestamp comparison."
     ),
     "generalizes": (
         "#2753 epic WS1, R1 (Lei's ruling, 2026-09-08 16:28Z): classification "
-        "tier, but dag=True — every other classification-tier relation today "
-        "(instantiates/serves/exemplifies) is dag=False. Real structural "
+        "tier, but in the abstraction acyclicity family — every other "
+        "classification-tier relation today "
+        "(instantiates/serves/exemplifies) has dag_family None. Real structural "
         "acyclicity genuinely matters here (a cycle in generalization/"
         "exemplification makes no sense), so this is an intentional "
-        "divergence on the `dag` flag, not `temporal_causal` (which matches "
+        "divergence on the `dag_family` field, not `temporal_causal` (which matches "
         "its tier's expectation at False, unremarkable on its own). Cycle "
         "prevention is enforced at WRITE time (see _generalizes_cycle_path) "
         "as well as by the batch conformance walk (DAG_RELATIONS)."
@@ -1244,9 +1259,10 @@ EDGE_TIER_DIVERGENCE_ACK: dict[str, str] = {
 # check — the name predates #2357's dag/temporal_causal split and is kept for
 # call-site stability, but every current reader (the startup consistency scan,
 # the generic add_edge_impl timestamp guard) wants the temporal_causal set, not
-# the newer real-acyclicity `dag` set. Do not repoint this at `dag` without
-# updating every reader — the two sets differ (acknowledged_derives_from is
-# temporal_causal=False but dag=True).
+# the newer real-acyclicity set (DAG_RELATIONS, `dag_family is not None`). Do
+# not repoint this at that set without updating every reader — the two sets
+# differ (acknowledged_derives_from is temporal_causal=False but in the
+# grounding family).
 DAG_EXEMPT_RELATIONS = frozenset(
     r for r, c in EDGE_CLASSIFICATIONS.items() if not c["temporal_causal"]
 )
@@ -1255,7 +1271,19 @@ DAG_EXEMPT_RELATIONS = frozenset(
 # CASCADE_RELATIONS (walked for taint/stale propagation), this set exists
 # purely to bound the cycle-detection walk — see
 # engram_dag_conformance.check_dag_conformance.
-DAG_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c["dag"])
+DAG_RELATIONS = frozenset(
+    r for r, c in EDGE_CLASSIFICATIONS.items() if c["dag_family"] is not None
+)
+
+DAG_FAMILIES = ("grounding", "abstraction")
+
+
+def dag_family_relations(family: str) -> "frozenset[str]":
+    """The relations in one acyclicity family (#3210), derived from
+    EDGE_CLASSIFICATIONS at call time -- never a hand-picked literal."""
+    return frozenset(
+        r for r, c in EDGE_CLASSIFICATIONS.items() if c["dag_family"] == family
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1279,43 +1307,50 @@ RETYPE_ALLOWED_MOVES: "dict[tuple[str, str], tuple[str, ...] | None]" = {
 # `generalizes` substrate (#2753 epic, WS1).
 # ---------------------------------------------------------------------------
 
-def _generalizes_cycle_path(
-    conn: sqlite3.Connection, source_id: str, target_id: str
+def _dag_cycle_path(
+    conn: sqlite3.Connection, relation: str, source_id: str, target_id: str,
+    *, resolve: bool = True,
 ) -> "list[str] | None":
-    """Would inserting ``source_id --generalizes--> target_id`` close a
-    cycle among LIVE ``generalizes`` edges? Returns the cycle (list of node
-    ids, first == last) if so, else None.
+    """Would inserting ``source_id --relation--> target_id`` close a cycle
+    among LIVE edges of ``relation``'s acyclicity FAMILY? Returns the cycle
+    (list of node ids, first == last) if so, else None. A relation with no
+    family (``dag_family is None``) has no walk: always None.
 
-    #2753 epic WS1 (D1): the write-time cycle guard — refuse the edge and
-    return the cycle path in the error. Conformance
+    #3210: the one write-time cycle helper. The walked relation set is the
+    family of the edge being written, read from ``EDGE_CLASSIFICATIONS`` via
+    ``dag_family_relations`` -- no relation literal here. ``grounding`` and
+    ``abstraction`` are separate families because grounding runs both ways
+    relative to generality, so a deduction-shaped ``generalizes`` edge
+    (specific supported_by general, then general generalizes specific) is
+    legal and must not be refused by a union walk.
+
+    #2753 epic WS1 (D1) origin: the write-time guard for ``generalizes`` --
+    refuse the edge and return the cycle path in the error. Conformance
     (``engram_dag_conformance.check_dag_conformance``) is the after-the-fact
-    BATCH audit; this is the TARGETED check that stops a cycle landing in
-    the first place, called from every ``generalizes``-writing path (the
-    generic ``engram_add_edge``, and the ``generalized_by`` mint-time wiring
-    on ``engram_add_lesson``/``engram_add_cornerstone``).
+    BATCH audit over the same families; this is the TARGETED check that stops
+    a cycle landing in the first place.
 
-    Scoped to the ``generalizes`` relation ONLY, not the full
-    ``DAG_RELATIONS`` set — ``generalizes`` is a distinct specialization/
-    abstraction hierarchy from e.g. ``cites``/``derives_from``/
-    ``subtask_of``, and folding unrelated dag-bearing relations into one
-    targeted write-time check would conflate independent hierarchies that
-    happen to share the ``dag: True`` flag for unrelated reasons. (The
-    full-graph, all-``DAG_RELATIONS`` batch walk is what
-    ``engram_dag_conformance`` already does, separately.)
+    BFS from ``target_id`` over existing edges of the family (source->target):
+    if ``source_id`` is reachable FROM ``target_id``, the candidate edge would
+    close ``target_id -> ... -> source_id -> target_id``.
 
-    BFS from ``target_id`` over existing LIVE ``generalizes`` edges
-    (source->target, i.e. general->specific): if ``source_id`` is reachable
-    FROM ``target_id``, the candidate edge would close
-    ``target_id -> ... -> source_id -> target_id``. CURRENT-only
-    (``is_current = 1`` nodes/edges), same convention as
-    ``check_dag_conformance``.
+    ``resolve`` (default True) puts every endpoint through the supersedes
+    chain, as the ``generalizes`` guard and the conformance audit do. The
+    acknowledgement writer passes ``resolve=False`` -- it keeps the raw-edge
+    semantics of the cascade guard it sits beside (``_cascade_reaches``); see
+    its call site for why.
     """
+    family = EDGE_CLASSIFICATIONS.get(relation, {}).get("dag_family")
+    if family is None:
+        return None
     if source_id == target_id:
         return [source_id, target_id]
+    relations = sorted(dag_family_relations(family))
+    placeholders = ",".join("?" * len(relations))
 
-    # Walk the RESOLVED generalizes graph -- every edge's endpoints put
-    # through _resolve_to_current, exactly as generalization_chain resolves
-    # them on the read side.
+    # Walk the RESOLVED graph -- every edge's endpoints put through
+    # _resolve_to_current, exactly as generalization_chain resolves them on
+    # the read side (and as engram_dag_conformance resolves them).
     #
     # The earlier shape filtered on `s.is_current = 1 AND t.is_current = 1`
     # instead, and that was a real hole (found in #2812 review). An edge
@@ -1331,13 +1366,17 @@ def _generalizes_cycle_path(
     _resolved: "dict[str, str | None]" = {}
 
     def _res(nid: str) -> "str | None":
+        if not resolve:
+            return nid
         if nid not in _resolved:
             _resolved[nid] = _resolve_to_current(conn, nid)
         return _resolved[nid]
 
     adjacency: "dict[str, set]" = {}
     for row in conn.execute(
-        "SELECT source_id, target_id FROM edges WHERE relation = 'generalizes'"
+        f"SELECT source_id, target_id FROM edges "
+        f"WHERE relation IN ({placeholders})",
+        tuple(relations),
     ):
         r_src = _res(row["source_id"])
         r_tgt = _res(row["target_id"])
@@ -1368,6 +1407,26 @@ def _generalizes_cycle_path(
                 parent[nxt] = current
                 queue.append(nxt)
     return None
+
+
+def _generalizes_cycle_path(
+    conn: sqlite3.Connection, source_id: str, target_id: str
+) -> "list[str] | None":
+    """Would inserting ``source_id --generalizes--> target_id`` close a
+    cycle among LIVE ``generalizes`` edges? Returns the cycle (list of node
+    ids, first == last) if so, else None.
+
+    #2753 epic WS1 (D1): the write-time cycle guard, called from every
+    ``generalizes``-writing path (the generic ``engram_add_edge``, and the
+    ``generalized_by`` mint-time wiring on ``engram_add_lesson``/
+    ``engram_add_cornerstone``). #3210: now a thin caller of
+    ``_dag_cycle_path`` -- ``generalizes`` is the sole member of the
+    ``abstraction`` family, so the walk is the same ``generalizes``-only,
+    resolve-through-supersedes walk as before (#2812/#2813), but the walked
+    set is read from ``EDGE_CLASSIFICATIONS`` rather than hard-coded.
+    Deliberately NOT walked over the grounding family: see ``_dag_cycle_path``.
+    """
+    return _dag_cycle_path(conn, "generalizes", source_id, target_id)
 
 
 def _resolve_to_current(conn: sqlite3.Connection, node_id: str) -> "str | None":

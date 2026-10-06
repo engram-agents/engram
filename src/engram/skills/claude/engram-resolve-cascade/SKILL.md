@@ -217,8 +217,14 @@ step but NOT the wiring: when an affected premise was **superseded**, the
 resolution itself records an `acknowledged_derives_from` edge from your node
 to the superseding premise `P'` — deliberately exempt from the creation-order
 check (`temporal_causal: False`; this edge always points older→newer, that is
-what an acknowledgement *is*) but still cycle-guarded (`dag: True`; a
-resolution whose edge would close a logical loop is refused, §12.7). The edge
+what an acknowledgement *is*) but still cycle-guarded (`dag_family: grounding`; a
+resolution whose edge would close a logical loop is refused, §12.7). If the
+refusal says `acknowledgement_would_close_grounding_cycle`, the loop runs
+through a wider grounding edge: when the closing path contains a retypable
+edge (`cites` / `supported_by` / `derives_from` that is not the node's last
+cascade premise), retype it to `about` with `engram_retype_edge` and
+acknowledge again; otherwise the path cannot be repaired through the MCP
+tools and needs `engram_surgical`. The edge
 is what lets a *later* supersede of `P'` reach your node again once its marker
 is gone. Only when nothing actually moved — every affected premise itself
 resolved `acknowledged`, the auto-ack case — is truly nothing new cited.)

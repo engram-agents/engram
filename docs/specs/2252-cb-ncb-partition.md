@@ -174,16 +174,17 @@ flag values.
 **Column note (#2357, 2026-08-29):** `dag_check` was renamed `temporal_causal`
 (pure rename, same values below — every relation's creation-order check is
 unchanged) and split from a new, independent `dag` (real edge-walk
-acyclicity) flag, not shown in this table (this doc covers the CB/NCB
+acyclicity; #3210 turned the bool into `dag_family`, `grounding` /
+`abstraction` / none) flag, not shown in this table (this doc covers the CB/NCB
 partition, not DAG/acyclicity design — see `engram_dag_conformance.py` and
 issue #2357 for that property). For every relation below except
 `acknowledged_derives_from` and `generalizes` (#2753 epic WS1, 2026-09-10),
-`dag` equals `temporal_causal`.
+`dag` (now: `dag_family is not None`) equals `temporal_causal`.
 
 | relation | cascade | provenance | temporal_causal | removable | notes |
 |---|---|---|---|---|---|
 | `derives_from` | **True** | **True** | True | False | CB cascade relation — taint/stale propagation |
-| `acknowledged_derives_from` | **True** | **True** | **False** | False | #2357/#2013 cascade-frontier acknowledgement edge — deliberately backwards in creation time; `dag=True` protects it instead |
+| `acknowledged_derives_from` | **True** | **True** | **False** | False | #2357/#2013 cascade-frontier acknowledgement edge — deliberately backwards in creation time; `dag_family=grounding` protects it instead |
 | `supported_by` | **False** | **True** | True | False | NCB accumulation (cornerstone-sourced vote edges) — see history below |
 | `predicted_by` | **False** | **True** | True | False | prediction-pairing edge, split out of `supported_by` (#2252 W6) — see "the pairing invariant" below |
 | `cites` | False | True | True | False | provenance-only; overloaded with ~5 meanings (#2243/#4, separate workstream) |
@@ -193,7 +194,7 @@ issue #2357 for that property). For every relation below except
 | `contradicts` | False | False | False | False | structural commitment, DAG-exempt |
 | `exemplifies` | False | False | False | True | incident→lesson membership, DAG-exempt |
 | `instantiates` | False | False | False | True | achievement-shaped relevance marker, DAG-exempt |
-| `generalizes` | False | False | False | True | #2753 epic WS1: general→specific abstraction/membership edge — NOT DAG-exempt (`dag=True`, real acyclicity, cycle-guarded at write time; diverges from `temporal_causal` like `acknowledged_derives_from` above) |
+| `generalizes` | False | False | False | True | #2753 epic WS1: general→specific abstraction/membership edge — NOT DAG-exempt (`dag_family=abstraction`, real acyclicity within its own family, cycle-guarded at write time; diverges from `temporal_causal` like `acknowledged_derives_from` above) |
 | `resolves` | False | False | False | False | back-reference, DAG-exempt |
 | `serves` | False | False | False | True | intent-shaped relevance marker, DAG-exempt |
 | `subtask_of` | False | False | True | True | |

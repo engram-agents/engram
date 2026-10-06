@@ -69,7 +69,7 @@ def test_removable_matches_pre_refactor_set():
 
 def test_all_relations_have_full_field_set():
     """Every entry has all 6 fields set (catches typos / partial edits)."""
-    expected_fields = {"cascade", "temporal_causal", "dag", "removable",
+    expected_fields = {"cascade", "temporal_causal", "dag_family", "removable",
                        "addable_after_creation", "provenance"}
     for relation, classification in EDGE_CLASSIFICATIONS.items():
         missing = expected_fields - set(classification.keys())

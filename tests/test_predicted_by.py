@@ -136,7 +136,7 @@ def test_predicted_by_declared_with_cascade_false_and_dag_check_true():
         f"predicted_by temporal_causal must be True (same provenance-chain "
         f"shape as supported_by, which it is split out of), got: {classification}"
     )
-    assert classification["dag"] is True, (
+    assert classification["dag_family"] == "grounding", (
         f"predicted_by dag must be True (real acyclicity matters for a "
         f"dependency-tier provenance edge), got: {classification}"
     )

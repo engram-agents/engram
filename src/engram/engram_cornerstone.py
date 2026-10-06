@@ -991,15 +991,16 @@ def _add_edge_impl(
         #
         # UPDATE (#2753 epic, WS1): the gap this TODO named is now live.
         # `generalizes` is the first addable-after-creation relation with
-        # dag=True and temporal_causal=False (acknowledged_derives_from has
+        # a dag_family and temporal_causal=False (acknowledged_derives_from has
         # the same profile but is never addable via this generic tool — see
         # its EDGE_CLASSIFICATIONS entry). Its real reachability check is
         # the `generalizes`-specific cycle guard ABOVE
-        # (`core._generalizes_cycle_path`) — deliberately scoped to the
-        # `generalizes` relation only, not a general `dag: True`
-        # reachability check for every relation reaching this generic tool
-        # (see that helper's docstring for why). A future second
-        # dag=True/temporal_causal=False addable relation would need its
+        # (`core._generalizes_cycle_path`, a thin caller of the family-keyed
+        # `core._dag_cycle_path`, #3210) — deliberately scoped to the
+        # `generalizes` relation's own family, not a general reachability
+        # check for every relation reaching this generic tool (see that
+        # helper's docstring for why). A future second
+        # dag_family/temporal_causal=False addable relation would need its
         # own equivalent guard here, following this one's shape.
         classification = core.EDGE_CLASSIFICATIONS.get(relation, {})
         if classification.get("temporal_causal", False):
@@ -1230,9 +1231,9 @@ def _retype_edge_impl(
 
         # Step 2: new_relation's own add-time checks. Currently a no-op for
         # every move in RETYPE_ALLOWED_MOVES (both 'about' and 'exemplifies'
-        # are temporal_causal=False, dag=False) -- implemented generically,
+        # are temporal_causal=False, dag_family None) -- implemented generically,
         # against core.EDGE_CLASSIFICATIONS, so a future table addition
-        # targeting a dag=True/temporal_causal=True relation is caught
+        # targeting a temporal_causal=True or acyclicity-family relation is caught
         # correctly rather than silently skipped.
         new_class = core.EDGE_CLASSIFICATIONS.get(new_relation, {})
         if new_class.get("temporal_causal"):
@@ -1250,16 +1251,20 @@ def _retype_edge_impl(
                         f"'{source_id}' predates '{target_id}'."
                     )
                 })
-        if new_class.get("dag"):
-            import engram_dag_conformance as dagc
-            edges = set(dagc._live_dag_edges(conn))
-            edges.discard((source_id, target_id))  # the edge being retyped away
-            edges.add((source_id, target_id))
-            if dagc._find_cycle(sorted(edges)) is not None:
+        if new_class.get("dag_family") is not None:
+            # #3210: family-aware -- retyping to relation R is checked against
+            # R's OWN acyclicity family (core._dag_cycle_path), not the union
+            # of every family: a deduction-shaped pair retyped to `generalizes`
+            # is legal, while a grounding relation closing a grounding cycle
+            # is refused. The edge being retyped away cannot create a path
+            # target -> ... -> source by itself, so no discard step is needed.
+            cyc = core._dag_cycle_path(conn, new_relation, source_id, target_id)
+            if cyc is not None:
                 return json.dumps({
                     "error": (
                         f"Retyping to '{new_relation}' would close a cycle "
-                        f"through {source_id} -> {target_id}."
+                        f"through {source_id} -> {target_id}: "
+                        f"{' -> '.join(cyc)}."
                     )
                 })
 

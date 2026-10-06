@@ -336,7 +336,8 @@ replacement into the premise set (measured: without it, `0.833 → 0.833`,
    confidence-participating (it is a premise edge), **`temporal_causal:
    False`** (its source predates its target by construction, always — the
    creation-order exemption is definitional, not an oversight), and
-   **`dag: True`** (it is still not permitted to close a logical cycle).
+   **`dag_family: grounding`** (it is still not permitted to close a logical
+   cycle; #3210 replaced the bool `dag` with the family).
    A distinct relation rather than an exemption on `derives_from` keeps the
    creation-order check honest everywhere else and makes
    adjudication-established dependencies separately queryable. (#2357 split
@@ -360,6 +361,24 @@ replacement into the premise set (measured: without it, `0.833 → 0.833`,
    `acknowledged_derives_from` joined that set the moment it was born —
    which is why every reachability query involved must be derived, not
    literal.
+   **A second, wider refusal (#3210):** the writer ALSO refuses when the new
+   edge would close a loop through the whole *grounding family* (`cites`,
+   `supported_by`, `derives_from`, ... — not only the cascade relations),
+   guard `acknowledgement_would_close_grounding_cycle`, nothing written. It
+   walks RAW edges (no supersede-resolution): an ack edge `X → R`, where `R`
+   replaced `X`'s premise `P`, resolves to the same edge as the existing
+   `X → P`, so under resolution the ack adds nothing and a resolved check
+   could only re-report a cycle that already exists (and would refuse every
+   ack inside it). **Repair routes:** if the closing path contains a
+   retypable edge (`cites` / `supported_by` / `derives_from` that is not the
+   node's last cascade premise), retype it to `about` with
+   `engram_retype_edge`, then acknowledge again; otherwise (the path runs
+   through `supersedes`, `retracts`, `subtask_of`, `predicted_by` or
+   `acknowledged_derives_from`, or the `derives_from → about` retype is
+   itself refused as the last cascade premise) it cannot be repaired through
+   the MCP tools and needs `engram_surgical`. The supersede and retract
+   writers remain guarded only by the cascade-scoped reachability check, by
+   §12.4 design.
 
 ## 9. The derived-set SSoT rule — stated as a rule, with the failure it prevents
 
@@ -484,7 +503,7 @@ test):
 - The resolution kinds are exactly: `acknowledged`, `retracted`,
   `superseded` (`_CASCADE_RESOLUTION_KINDS`).
 - `acknowledged_derives_from` carries `cascade: True`,
-  `temporal_causal: False`, `dag: True` in `EDGE_CLASSIFICATIONS`.
+  `temporal_causal: False`, `dag_family: grounding` in `EDGE_CLASSIFICATIONS`.
 - The marker status domain is exactly `pending`, `resolved`, and the
   `cascade_markers` schema carries no severity column.
 

@@ -1,12 +1,14 @@
 """cascade ⇒ dag consistency invariant over EDGE_CLASSIFICATIONS.
 
 #2357 renamed the old `dag_check` flag to `temporal_causal` (pure rename,
-same creation-order semantics) and added a new, independent `dag` flag (real
-edge-walk acyclicity). This file's invariant now follows `dag`, not
+same creation-order semantics) and added a new, independent flag (real
+edge-walk acyclicity; since #3210 it is the `dag_family` field, and "has a
+dag_family" is the old `dag` truth). This file's invariant follows
+acyclicity-family membership, not
 `temporal_causal` — see EDGE_CLASSIFICATIONS's header comment in
 engram_core.py for why: `acknowledged_derives_from` is a cascade relation
 that is deliberately `temporal_causal: False` (it points backwards in
-creation time by construction) while still needing `dag: True` (a real
+creation time by construction) while still needing an acyclicity family (a real
 cycle through it would be genuinely bad). Coupling this invariant to
 `temporal_causal` instead would make that relation's very existence a
 declared violation of a design goal it's actually satisfying.
@@ -52,7 +54,7 @@ Nor does a cascade walk's termination depend on acyclicity. Each walker
 (e.g. `_walk_cascade_downstream` in engram_revision.py) carries its own
 `visited` set, checked BEFORE recursing, so a cycle in the underlying
 graph is visited once and then skipped — no hang, no RecursionError,
-regardless of dag. And `temporal_causal`'s own init-time check
+regardless of acyclicity. And `temporal_causal`'s own init-time check
 (engram_core.py) is warn-only: it runs once at startup, compares
 `created_at` ordering (not actual cycle detection — a genuine cycle among
 equal-timestamp nodes evades it), `LIMIT 5`s the result, calls
@@ -60,13 +62,13 @@ equal-timestamp nodes evades it), `LIMIT 5`s the result, calls
 ``try: ... except Exception: pass  # Don't block startup on check
 failures``. It rejects nothing, at startup or at edge-creation time. The
 REAL cycle-detection walk lives in engram_dag_conformance.py (#2357),
-walking `dag: True` relations specifically.
+walking the relations that carry a `dag_family` specifically.
 
 So why assert this hard? Because it is a live correctness dependency
-today, not a someday one: `cascade` and `dag` are meant to co-vary — a
+today, not a someday one: `cascade` and acyclicity are meant to co-vary — a
 relation that propagates taint/stale state should also be guaranteed
 acyclic. All four cascade-taint walkers listed above already depend on
-`CASCADE_RELATIONS` being right; cascade:True with dag:False is a flag
+`CASCADE_RELATIONS` being right; cascade:True with dag_family None is a flag
 combination that would hand every one of them an unprotected relation to
 traverse, with no acyclicity guarantee behind it. There is no "the rest
 still hardcodes it, so this is only groundwork" hedge left to make — that
@@ -82,12 +84,12 @@ completeness tests (every relation has a tier and vice versa, every tier
 value is valid) alongside one soft-warning test,
 `test_dag_check_tier_drift_warn` (`warnings.warn` on divergence, always
 passes, and checks `temporal_causal` against tier expectation — a
-DIFFERENT invariant from this file's `dag` check). It's specifically that
+DIFFERENT invariant from this file's acyclicity-family check). It's specifically that
 soft-warning test this file's check is unlike: a tier's temporal_causal
 *expectation* is a design convention with a documented escape hatch
 (EDGE_TIER_DIVERGENCE_ACK) for relations that intentionally diverge from
 it. cascade⇒dag has no such escape hatch — there is no legitimate use for
-cascade:True with dag:False, so this is asserted HARD rather than warned.
+cascade:True with dag_family None, so this is asserted HARD rather than warned.
 
 Import-pattern contract (#948 wave C): imports engram_core directly;
 contains no ``import server``.
@@ -123,7 +125,7 @@ _EXPECTED_CASCADE_RELATIONS = frozenset(
 
 
 def test_cascade_implies_dag_check():
-    """Every cascade:True relation must also be dag:True.
+    """Every cascade:True relation must also be in an acyclicity family.
 
     This IS a live correctness dependency, not merely declarative
     consistency (module docstring above has the full, source-verified
@@ -137,7 +139,7 @@ def test_cascade_implies_dag_check():
     skipped, not hang or recurse forever. `cascade` ALSO has one purely
     cosmetic runtime consumer, viz_server.py's edge-rendering choice.
 
-    What this guards: a relation carrying cascade=True/dag=False would
+    What this guards: a relation carrying cascade=True and no dag_family would
     hand every one of those walkers an unprotected relation to traverse
     RIGHT NOW, not on some future day — the failure mode (hang /
     RecursionError, or in the new engram_dag_conformance.py checker's own
@@ -145,28 +147,28 @@ def test_cascade_implies_dag_check():
     whichever walk or check hit the cycle first. Catching the mismatch
     here is the point.
 
-    This does NOT require the converse. A relation may be dag=True
+    This does NOT require the converse. A relation may be in an acyclicity family
     without being cascade=True (e.g. 'cites', 'subtask_of') — those are
     acyclic for other reasons and never propagate anything. Only the
     cascade ⇒ dag direction is a correctness requirement.
 
-    #2357: this checks `dag`, not `temporal_causal` (the renamed old
-    `dag_check`) — a cascade relation MAY legitimately be
+    #2357: this checks acyclicity-family membership, not `temporal_causal`
+    (the renamed old `dag_check`) — a cascade relation MAY legitimately be
     temporal_causal=False (acknowledged_derives_from is), as long as it's
-    still dag=True. Coupling this test to temporal_causal instead would make
+    still in a family. Coupling this test to temporal_causal instead would make
     that relation's existence a declared bug.
     """
     violations = sorted(
         relation
         for relation, flags in EDGE_CLASSIFICATIONS.items()
-        if flags.get("cascade") and not flags.get("dag")
+        if flags.get("cascade") and flags.get("dag_family") is None
     )
     assert not violations, (
-        f"Relation(s) with cascade=True but dag=False: {violations}. "
-        f"cascade and dag are declared to co-vary; nothing enforces "
+        f"Relation(s) with cascade=True but no dag_family: {violations}. "
+        f"cascade and acyclicity are declared to co-vary; nothing enforces "
         f"that today, but engram-alpha#2013's cascade machine will make "
         f"cascade drive the walked-relation set, turning this into a live "
-        f"acyclicity gap. Fix by setting dag=True for each relation "
+        f"acyclicity gap. Fix by giving each relation a dag_family "
         f"listed in EDGE_CLASSIFICATIONS (src/engram/engram_core.py) — this "
         f"has no legitimate use and is not an exception to justify, it is a "
         f"bug to fix."

@@ -860,7 +860,7 @@ def _diagnose_impl() -> str:
         metrics["partition_conformance"] = _conformance_mod.check_partition_conformance(conn)
 
         # ── DAG Conformance (#2357) ────────────────────────────────────────
-        # Real edge-walk acyclicity over the `dag: True` relation set —
+        # Real edge-walk acyclicity over the per-family dag_family relation sets (#3210) —
         # deliberately a separate module/check from partition_conformance
         # above (engram_dag_conformance.py's own docstring explains why: a
         # DAG cycle is a different property from the CB/NCB partition, with
