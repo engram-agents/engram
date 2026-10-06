@@ -36,9 +36,14 @@ an exact site COUNT, an issue ref and a one-line reason:
   * a `LOCAL`-tagged entry is a site routed WITHOUT `engram_core`: standalone
     scripts, hooks and the viz layer duplicate the 2-line primitive by
     convention rather than import across the process boundary. It is valid
-    only if the enclosing function holds an `isinstance(<parsed name>, dict)`
-    check for every flagged parse (AST check, `local_guard_problems`); LOCAL
-    sites are not counted in the `#3425` ceiling.
+    only if, for every flagged parse `N = json.loads(...)`, the enclosing
+    function's own scope (not a nested def / lambda / class) has an `if` AFTER
+    the parse and before any later re-assignment of N, reachable (not
+    `if False:`), whose test holds `isinstance(N, dict)` (directly or under
+    `not`) and which re-assigns N in its body or orelse (AST check,
+    `local_guard_problems`); an `except` handler of the try holding the parse is
+    an alternative path, not a re-assignment. LOCAL sites are not counted in
+    the `#3425` ceiling.
 
 What the guard CANNOT catch (so a green guard is not "the class is closed"):
   * aliased parse: `from json import loads` / `import json as j` /
@@ -75,9 +80,10 @@ HELPER = {
 # parse-mutate-re-dump, so what to STORE BACK for a non-object blob is a
 # decision of its own); "S" = already guarded / caught, deliberately left;
 # "RAW" = the raw parsed value is the product, never dict-accessed;
-# "LOCAL" = routed locally with an `isinstance(<parsed>, dict)` guard in the
-# same function (verified by the AST check), for code that does not import
-# engram_core by convention.
+# "LOCAL" = routed locally with an `if ...isinstance(<parsed>, dict)...:` guard
+# that re-assigns the parsed name, after the parse in the same function scope
+# (verified by the AST check), for code that does not import engram_core by
+# convention.
 ALLOW_LIST = {
     # (The runtime write paths are all routed through
     # `_metadata_dict_for_write` / `_metadata_dict`: no entry left for them.)
@@ -223,22 +229,163 @@ def entry_mismatches(sites, allow_list=ALLOW_LIST):
             for key, spec in allow_list.items() if found.get(key, 0) != spec[0]]
 
 
-def _isinstance_dict_names(fn_node):
-    """Names `n` for which `isinstance(n, dict)` appears inside fn_node."""
-    names = set()
-    for n in ast.walk(fn_node):
-        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                and n.func.id == "isinstance" and len(n.args) == 2
-                and isinstance(n.args[0], ast.Name)
-                and isinstance(n.args[1], ast.Name) and n.args[1].id == "dict"):
-            names.add(n.args[0].id)
-    return names
+_SCOPE_BREAKS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
+def _scope_stmts(body):
+    """Statements of ONE function scope, in source order, descending into
+    compound statements but never into a nested def / lambda / class, and never
+    into the body of an `if` whose test is the constant False / 0 / None."""
+    for st in body:
+        if isinstance(st, _SCOPE_BREAKS):
+            continue
+        yield st
+        if isinstance(st, ast.If):
+            dead = isinstance(st.test, ast.Constant) and not st.test.value
+            if not dead:
+                yield from _scope_stmts(st.body)
+            yield from _scope_stmts(st.orelse)
+            continue
+        for field in ("body", "orelse", "finalbody"):
+            yield from _scope_stmts(getattr(st, field, None) or [])
+        for h in getattr(st, "handlers", None) or []:
+            yield from _scope_stmts(h.body)
+        for c in getattr(st, "cases", None) or []:
+            yield from _scope_stmts(c.body)
+
+
+def _tests_isinstance_dict(test, name):
+    """`isinstance(name, dict)` appears in an `if` test (directly or under `not`)."""
+    return any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        and n.func.id == "isinstance" and len(n.args) == 2
+        and isinstance(n.args[0], ast.Name) and n.args[0].id == name
+        and isinstance(n.args[1], ast.Name) and n.args[1].id == "dict"
+        for n in ast.walk(test))
+
+
+def _assigns_name(stmts, name):
+    return any(isinstance(s, ast.Assign) and len(s.targets) == 1
+               and isinstance(s.targets[0], ast.Name) and s.targets[0].id == name
+               for s in _scope_stmts(stmts))
+
+
+def _isinstance_dict_sense(test, name):
+    """`"neg"` for exactly `not isinstance(name, dict)`, `"pos"` for exactly
+    `isinstance(name, dict)`, else None."""
+    neg = isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
+    inner = test.operand if neg else test
+    if (isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
+            and inner.func.id == "isinstance" and len(inner.args) == 2
+            and not inner.keywords
+            and isinstance(inner.args[0], ast.Name) and inner.args[0].id == name
+            and isinstance(inner.args[1], ast.Name) and inner.args[1].id == "dict"):
+        return "neg" if neg else "pos"
+    return None
+
+
+def _assigns_dict_literal(stmts, name):
+    """`name = <dict literal>` (e.g. `{}`) somewhere in `stmts` (same scope)."""
+    return any(isinstance(s, ast.Assign) and len(s.targets) == 1
+               and isinstance(s.targets[0], ast.Name) and s.targets[0].id == name
+               and isinstance(s.value, ast.Dict)
+               for s in _scope_stmts(stmts))
+
+
+def _header_exprs(st):
+    """The expressions a compound statement evaluates BEFORE its body runs."""
+    if isinstance(st, ast.If) or isinstance(st, ast.While):
+        return [st.test]
+    if isinstance(st, (ast.For, ast.AsyncFor)):
+        return [st.target, st.iter]
+    if isinstance(st, (ast.With, ast.AsyncWith)):
+        return list(st.items)
+    if isinstance(st, ast.Match):
+        return [st.subject]
+    return []
+
+
+def _stores_name(st, name):
+    """`st` (not descending into nested scopes) stores to `name`."""
+    stack = [st]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Store):
+            return True
+        stack.extend(c for c in ast.iter_child_nodes(n)
+                     if not isinstance(c, _SCOPE_BREAKS))
+    return False
+
+
+def _guard_problem(fn_node, assign, name):
+    """None if the parse `assign` (to plain `name`) is followed, in the same
+    function scope and before any re-assignment of `name`, by an `if` whose test
+    holds `isinstance(name, dict)` and which re-assigns `name` in its body or
+    orelse; else a `why` string."""
+    after = assign.end_lineno
+    # The `except` handlers of a `try` that holds the parse are ALTERNATIVE
+    # paths (`try: meta = json.loads(..) / except ValueError: meta = {}`), not
+    # re-assignments that follow the parse: they do not end the guard window.
+    alt = set()
+    for t in _scope_stmts(fn_node.body):
+        if isinstance(t, ast.Try) and any(
+                n is assign for b in t.body for n in ast.walk(b)):
+            for h in t.handlers:
+                alt.update(id(x) for x in _scope_stmts(h.body))
+    stmts = sorted((s for s in _scope_stmts(fn_node.body)
+                    if s.lineno > after and id(s) not in alt),
+                   key=lambda s: s.lineno)
+    saw_check = False
+    wrong = None
+    for st in stmts:
+        if (isinstance(st, ast.If) and _tests_isinstance_dict(st.test, name)):
+            saw_check = True
+            sense = _isinstance_dict_sense(st.test, name)
+            if sense is None:
+                wrong = wrong or ("the guard test must be exactly `isinstance(%s, dict)` "
+                                  "or `not isinstance(%s, dict)`" % (name, name))
+            else:
+                arm, arm_name = ((st.body, "body") if sense == "neg"
+                                 else (st.orelse, "else"))
+                if _assigns_dict_literal(arm, name):
+                    return None
+                wrong = wrong or (
+                    "`%s` must be assigned a dict literal (`%s = {}`) in the %s of "
+                    "`%sisinstance(%s, dict)` (line %d)"
+                    % (name, name, arm_name, "not " if sense == "neg" else "", name, st.lineno))
+        # a re-assignment of `name` that is not the guard ends the window
+        # (statement-level only: stores nested in a compound stmt are visited
+        # as their own statements, so check simple statements here; a compound
+        # statement's own HEADER, e.g. a walrus in an `if` test, is checked too)
+        if isinstance(st, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With,
+                           ast.AsyncWith, ast.Try, ast.Match)):
+            stored = any(_stores_name(h, name) for h in _header_exprs(st))
+        else:
+            stored = _stores_name(st, name)
+        if stored:
+            return ("`%s` is re-assigned (line %d) before any guard" % (name, st.lineno)
+                    if not saw_check else
+                    wrong or "the `isinstance(%s, dict)` test does not re-assign `%s`" % (name, name))
+    if saw_check:
+        return wrong or "the `isinstance(%s, dict)` test never re-assigns `%s` (needs `%s = {}`)" % (name, name, name)
+    return ("no reachable `if` after this parse, in the same function scope, tests "
+            "`isinstance(%s, dict)` and re-assigns `%s`" % (name, name))
 
 
 def local_guard_problems(sites, root=SRC_ROOT, allow_list=ALLOW_LIST):
     """For every LOCAL entry: each flagged parse must be assigned to a plain
-    name AND that name must be `isinstance(<name>, dict)`-checked somewhere in
-    the enclosing function. Returns [(rel, function, line, why)]."""
+    name N AND be followed, in the SAME function scope (not a nested def /
+    lambda / class) and before any later re-assignment of N (a walrus in an
+    `if` header counts), by a reachable `if` (test not the constant False / 0 /
+    None) that matches its arm: `if not isinstance(N, dict): N = {}` (dict
+    literal in the BODY) or `if isinstance(N, dict): ... else: N = {}` (dict
+    literal in the ORELSE). Returns [(rel, function, line, why)].
+
+    NOT modelled: reachability beyond a constant-falsy `if` body (`while False`,
+    `for _ in []`, the else-arm of `if True`, code after `return`, a guard under
+    a conditional that only runs on one branch), and the ternary shape
+    `N = N if isinstance(N, dict) else {}` (rejected: it has no `if`
+    statement; pinned by a test)."""
     root = pathlib.Path(root)
     problems = []
     for (rel, fn), spec in allow_list.items():
@@ -256,19 +403,24 @@ def local_guard_problems(sites, root=SRC_ROOT, allow_list=ALLOW_LIST):
             problems.append((rel, fn, 0, "function missing"))
             continue
         for line in sorted(lines):
+            whys = []
             ok = False
             for f in fns:
-                checked = _isinstance_dict_names(f)
-                for a in ast.walk(f):
-                    if (isinstance(a, ast.Assign) and len(a.targets) == 1
+                for a in _scope_stmts(f.body):
+                    if not (isinstance(a, ast.Assign) and len(a.targets) == 1
                             and isinstance(a.targets[0], ast.Name)
                             and any(isinstance(c, ast.Call) and _is_json_load(c)
-                                    and c.lineno == line for c in ast.walk(a.value))
-                            and a.targets[0].id in checked):
+                                    and c.lineno == line for c in ast.walk(a.value))):
+                        continue
+                    why = _guard_problem(f, a, a.targets[0].id)
+                    if why is None:
                         ok = True
+                    else:
+                        whys.append(why)
             if not ok:
-                problems.append((rel, fn, line,
-                                 "no `isinstance(<parsed name>, dict)` check for this parse"))
+                problems.append((rel, fn, line, whys[0] if whys else
+                                 "this parse is not assigned to a plain name in the "
+                                 "function's own scope, so no guard can be tied to it"))
     return problems
 
 
@@ -323,8 +475,8 @@ def test_helper_exemption_targets_exist():
 def test_local_entries_carry_an_isinstance_dict_guard(real_sites):
     bad = local_guard_problems(real_sites)
     assert not bad, (
-        "LOCAL allow-list entries need an `isinstance(<parsed>, dict)` check in "
-        "the enclosing function:\n"
+        "LOCAL allow-list entries need an `if` testing `isinstance(<parsed>, dict)` "
+        "that re-assigns the name, after the parse in the same function scope:\n"
         + "\n".join(f"  {r}:{line} in {f}(): {why}" for r, f, line, why in bad)
     )
 
@@ -475,3 +627,190 @@ def test_renaming_the_write_helpers_raw_variable_does_not_false_positive(tmp_pat
     flagged = [s for s in unaccounted_sites(find_metadata_parse_sites(tmp_path))
                if s[2] == "_metadata_dict_for_write_x"]
     assert flagged
+
+
+# --------------------------------------------------------------------------
+# the LOCAL guard check, tightened (#3425 follow-up 1): the guard must be an
+# `if` AFTER the parse, before any re-assignment, whose test holds
+# `isinstance(N, dict)` and which RE-ASSIGNS N, in the same function scope.
+# --------------------------------------------------------------------------
+
+_LOCAL_ALLOW = {("mod.py", "f"): (1, "LOCAL", "r")}
+
+
+def _local_problems(tmp_path, src):
+    sites = _scratch(tmp_path, src)
+    return sites, local_guard_problems(sites, root=tmp_path, allow_list=_LOCAL_ALLOW)
+
+
+def test_local_guard_rejects_isinstance_only_in_a_nested_function(tmp_path):
+    _sites, got = _local_problems(tmp_path, (
+        "import json\n"
+        "def f(row):\n"
+        "    meta = json.loads(row['metadata'])\n"
+        "    def g():\n"
+        "        if not isinstance(meta, dict):\n"
+        "            meta = {}\n"
+        "        return meta\n"
+        "    return meta.get('x')\n"
+    ))
+    assert [p[2] for p in got] == [3], got
+    assert got[0][3]  # carries a human-readable `why`
+
+
+def test_local_guard_rejects_a_guard_inside_if_false(tmp_path):
+    _sites, got = _local_problems(tmp_path, (
+        "import json\n"
+        "def f(row):\n"
+        "    meta = json.loads(row['metadata'])\n"
+        "    if False:\n"
+        "        if not isinstance(meta, dict):\n"
+        "            meta = {}\n"
+        "    return meta.get('x')\n"
+    ))
+    assert [p[2] for p in got] == [3], got
+
+
+def test_local_guard_rejects_a_bare_isinstance_without_reassignment(tmp_path):
+    for body in (
+        "    isinstance(meta, dict)\n",                          # bare expression
+        "    assert isinstance(meta, dict)\n",                   # assert
+        "    ok = isinstance(meta, dict)\n",                     # used as a value
+        "    if not isinstance(meta, dict):\n        return {}\n",  # test but no re-assign of N
+    ):
+        _sites, got = _local_problems(tmp_path, (
+            "import json\n"
+            "def f(row):\n"
+            "    meta = json.loads(row['metadata'])\n"
+            + body +
+            "    return meta.get('x')\n"
+        ))
+        assert [p[2] for p in got] == [3], (body, got)
+
+
+def test_local_guard_second_parse_of_the_same_name_is_reported_alone(tmp_path):
+    _sites, got = _local_problems(tmp_path, (
+        "import json\n"                                   # 1
+        "def f(row):\n"                                   # 2
+        "    meta = json.loads(row['metadata'])\n"        # 3  guarded below
+        "    if not isinstance(meta, dict):\n"            # 4
+        "        meta = {}\n"                             # 5
+        "    meta = json.loads(row['metadata'])\n"        # 6  never guarded
+        "    return meta.get('x')\n"                      # 7
+    ))
+    assert [p[2] for p in got] == [6], got
+    assert got[0][3]  # carries a human-readable `why`
+
+
+def test_local_guard_must_precede_the_next_reassignment(tmp_path):
+    _sites, got = _local_problems(tmp_path, (
+        "import json\n"
+        "def f(row):\n"
+        "    meta = json.loads(row['metadata'])\n"
+        "    meta = dict(meta)\n"                         # re-assigned unguarded
+        "    if not isinstance(meta, dict):\n"
+        "        meta = {}\n"
+        "    return meta.get('x')\n"
+    ))
+    assert [p[2] for p in got] == [3], got
+
+
+def test_local_guard_accepts_not_isinstance_then_reassign(tmp_path):
+    _sites, got = _local_problems(tmp_path, (
+        "import json\n"
+        "def f(row):\n"
+        "    meta = json.loads(row['metadata'])\n"
+        "    if not isinstance(meta, dict):\n"
+        "        meta = {}\n"
+        "    return meta.get('x')\n"
+    ))
+    assert got == []
+
+
+def test_local_guard_accepts_isinstance_else_reassign(tmp_path):
+    _sites, got = _local_problems(tmp_path, (
+        "import json\n"
+        "def f(row):\n"
+        "    meta = json.loads(row['metadata'])\n"
+        "    if isinstance(meta, dict):\n"
+        "        x = meta.get('x')\n"
+        "    else:\n"
+        "        meta = {}\n"
+        "        x = None\n"
+        "    return x\n"
+    ))
+    assert got == []
+
+
+def test_local_guard_try_except_alternative_is_not_a_reassignment_window(tmp_path):
+    head = (
+        "import json\n"
+        "def f(row):\n"
+        "    try:\n"
+        "        meta = json.loads(row['metadata'])\n"
+        "    except ValueError:\n"
+        "        meta = {}\n"
+    )
+    guard = "    if not isinstance(meta, dict):\n        meta = {}\n"
+    tail = "    return meta.get('x')\n"
+    _s, got = _local_problems(tmp_path, head + guard + tail)
+    assert got == []
+    _s, got = _local_problems(tmp_path, head + tail)  # handler alone is no guard
+    assert [p[2] for p in got] == [4], got
+
+
+# --------------------------------------------------------------------------
+# #3425 round 2: the guard must MATCH ITS ARM and assign a dict LITERAL.
+#   `not isinstance(N, dict)` -> `N = {}` in the BODY;
+#   `isinstance(N, dict)`     -> `N = {}` in the ORELSE.
+# --------------------------------------------------------------------------
+
+def _guard_src(guard):
+    return ("import json\n"                                 # 1
+            "def f(row):\n"                                 # 2
+            "    meta = json.loads(row['metadata'])\n"      # 3
+            + guard +
+            "    return meta.get('x')\n")
+
+
+@pytest.mark.parametrize("guard", [
+    # wrong sense: assigns in the body of the POSITIVE test
+    "    if isinstance(meta, dict):\n        meta = {}\n",
+    # wrong sense, with an else that does not assign
+    "    if isinstance(meta, dict):\n        meta = {}\n    else:\n        pass\n",
+    # wrong sense the other way: assigns in the ORELSE of the NEGATED test
+    "    if not isinstance(meta, dict):\n        pass\n    else:\n        meta = {}\n",
+    # non-dict value
+    "    if not isinstance(meta, dict):\n        meta = None\n",
+    "    if isinstance(meta, dict):\n        pass\n    else:\n        meta = []\n",
+    "    if not isinstance(meta, dict):\n        meta = dict(meta)\n",
+])
+def test_local_guard_rejects_wrong_arm_or_non_dict_value(tmp_path, guard):
+    _sites, got = _local_problems(tmp_path, _guard_src(guard))
+    assert [p[2] for p in got] == [3], (guard, got)
+    assert got[0][3]  # carries a human-readable `why`
+
+
+def test_local_guard_walrus_store_between_parse_and_guard_ends_the_window(tmp_path):
+    _sites, got = _local_problems(tmp_path, (
+        "import json\n"
+        "def f(row):\n"
+        "    meta = json.loads(row['metadata'])\n"
+        "    if (meta := {}):\n"
+        "        pass\n"
+        "    if not isinstance(meta, dict):\n"
+        "        meta = {}\n"
+        "    return meta.get('x')\n"
+    ))
+    assert [p[2] for p in got] == [3], got
+    assert got[0][3]
+
+
+def test_local_guard_ternary_shape_is_rejected_by_decision(tmp_path):
+    """PINNED DECISION, not an accident: `meta = meta if isinstance(meta, dict)
+    else {}` is not modelled (it has no `if` statement) and is reported. A site
+    that wants it must be rewritten as the statement form."""
+    _sites, got = _local_problems(tmp_path, _guard_src(
+        "    meta = meta if isinstance(meta, dict) else {}\n"))
+    assert [p[2] for p in got] == [3], got
+    assert got[0][3]

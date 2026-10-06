@@ -249,7 +249,10 @@ def detect_speaker(prompt: str, people: list[dict]) -> dict | None:
     prefix_name = match.group(1).strip().lower()
 
     for person in people:
-        meta = json.loads(person.get("metadata", "{}"))
+        try:
+            meta = json.loads(person.get("metadata") or "{}")
+        except (ValueError, TypeError):  # None / invalid JSON: same as `{}` (#3425)
+            meta = {}
         if not isinstance(meta, dict):  # valid JSON, not an object (#3413)
             meta = {}
         name = meta.get("name", "").lower()

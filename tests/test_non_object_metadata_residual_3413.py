@@ -115,6 +115,44 @@ def test_detect_speaker_dict_blobs_unchanged(tmp_path, monkeypatch):
     assert hook.detect_speaker("no prefix", people) is None
 
 
+# #3425 follow-up 2. Contract (written before the fix): a person row whose
+# `metadata` is an ABSENT key, None, or a string that is not valid JSON is
+# treated as metadata `{}` exactly like a valid non-object blob: detect_speaker
+# does not raise, that row can never match a prefix, and a LATER person with a
+# valid object is still matched (one bad row cannot hide another).
+_BAD_ROWS = {
+    "absent": {"id": "pn_1", "logical_chain": "desc"},
+    "none": {"id": "pn_1", "metadata": None, "logical_chain": "desc"},
+    "invalid_json": {"id": "pn_1", "metadata": "{not json", "logical_chain": "desc"},
+    "empty_string": {"id": "pn_1", "metadata": "", "logical_chain": "desc"},
+    # non-str, non-None values. The FALSY ones (0, [], {}) take the `or "{}"`
+    # path; the TRUTHY ones make json.loads raise TypeError, which only the
+    # `except (ValueError, TypeError)` clause catches. A dict object is NOT
+    # treated as already-parsed metadata: it is `{}` like every other bad row.
+    "int_zero": {"id": "pn_1", "metadata": 0, "logical_chain": "desc"},
+    "empty_list": {"id": "pn_1", "metadata": [], "logical_chain": "desc"},
+    "empty_dict_object": {"id": "pn_1", "metadata": {}, "logical_chain": "desc"},
+    "int_truthy": {"id": "pn_1", "metadata": 5, "logical_chain": "desc"},
+    "list_truthy": {"id": "pn_1", "metadata": [1], "logical_chain": "desc"},
+    "dict_object_truthy": {"id": "pn_1", "metadata": {"name": "Lei", "aliases": ["L"]},
+                           "logical_chain": "desc"},
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_BAD_ROWS))
+def test_detect_speaker_bad_metadata_row_does_not_raise(kind, tmp_path, monkeypatch):
+    hook = _load_identity_hook(tmp_path, monkeypatch)
+    assert hook.detect_speaker("Lei: hi", [_BAD_ROWS[kind]]) is None
+
+
+@pytest.mark.parametrize("kind", sorted(_BAD_ROWS))
+def test_detect_speaker_later_person_still_matches_after_a_bad_row(kind, tmp_path, monkeypatch):
+    hook = _load_identity_hook(tmp_path, monkeypatch)
+    good = _person("pn_2", json.dumps({"name": "Lei", "aliases": ["L"], "role": "owner"}))
+    got = hook.detect_speaker("Lei: hi", [_BAD_ROWS[kind], good])
+    assert got is not None and got["person_id"] == "pn_2" and got["role"] == "owner"
+
+
 def _calib(tmp_path, blobs):
     from viz.data import calibration
     db = str(tmp_path / "k.db")
