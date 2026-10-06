@@ -23,6 +23,7 @@ checkout — see the inline `git grep` commands in each assertion's comment.
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -356,6 +357,438 @@ def test_collect_wide_hits_only_scans_removed_lines():
     assert hits["urlopen"] == {"src/widget.py"}
     # "http.client" appears only on an ADDED line -- must not be collected.
     assert "http.client" not in hits
+
+
+# ---------------------------------------------------------------------------
+# NARROW-lane noise fallback (#3334) — contract-first tests
+#
+# Contract (stated in the #3334 spec):
+#   collect_narrow_hits(diff) -> {name: {destination files of the hunks where
+#     the same-hunk added+removed def pair occurs}}; collect_narrow_names is
+#     exactly set(collect_narrow_hits(diff)).
+#   resolve_narrow_hits(repo, hits, head): per name, raw word-bounded fixed
+#     grep; if len(raw) > NARROW_RESOLVE_THRESHOLD (strictly), discard raw and
+#     use the module-scoped pattern built from the hit files (None -> the name
+#     contributes nothing); otherwise keep raw unchanged.
+# Measured origin: PR #3321's `__init__` / `execute` -> ~255 test files.
+# ---------------------------------------------------------------------------
+
+
+def _hits(diff_text: str):
+    return _mod.collect_narrow_hits(diff_text)
+
+
+def _def_pair_hunk(path: str, name: str) -> str:
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        f"--- a/{path}\n"
+        f"+++ b/{path}\n"
+        "@@ -1,2 +1,2 @@\n"
+        f"-def {name}(x):\n"
+        f"+def {name}(x, y):\n"
+    )
+
+
+def test_n1_collect_narrow_hits_maps_name_to_destination_file():
+    assert _hits(_def_pair_hunk("src/widget.py", "fetch_widget")) == {
+        "fetch_widget": {"src/widget.py"}
+    }
+
+
+def test_n1_two_files_with_same_name_pair_map_to_both_files():
+    diff_text = _def_pair_hunk("src/a_mod.py", "execute") + _def_pair_hunk(
+        "src/b_mod.py", "execute"
+    )
+    assert _hits(diff_text) == {"execute": {"src/a_mod.py", "src/b_mod.py"}}
+
+
+def test_n1_exclusions_unchanged_added_only_removed_only_split_hunks():
+    diff_text = (
+        "diff --git a/src/widget.py b/src/widget.py\n"
+        "--- a/src/widget.py\n"
+        "+++ b/src/widget.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "+def brand_new_helper(x):\n"
+        "-def only_removed(x):\n"
+        "-def split_name(x):\n"
+        "@@ -40,2 +40,2 @@\n"
+        "+def split_name(x, y):\n"
+    )
+    assert _hits(diff_text) == {}
+
+
+_EXISTING_FIXTURES = [
+    "diff --git a/src/widget.py b/src/widget.py\n"
+    "--- a/src/widget.py\n+++ b/src/widget.py\n"
+    "-def fetch_widget(url):\n+def fetch_widget(url, deadline):\n",
+    "diff --git a/src/widget.py b/src/widget.py\n"
+    "--- a/src/widget.py\n+++ b/src/widget.py\n"
+    "+def brand_new_helper(x):\n-def only_removed(x):\n"
+    "-def fetch_widget(url):\n+def fetch_widget(url, deadline):\n",
+    "diff --git a/src/widget.py b/src/widget.py\n"
+    "--- a/src/widget.py\n+++ b/src/widget.py\n"
+    "@@ -1,2 +1,2 @@\n-def unrelated_before(x):\n+def read(self, n=-1):\n"
+    "@@ -40,2 +40,2 @@\n-def read(self):\n+def unrelated_after(x):\n",
+]
+
+
+@pytest.mark.parametrize("diff_text", _EXISTING_FIXTURES)
+def test_n2_collect_narrow_names_is_set_of_narrow_hits(diff_text):
+    assert collect_narrow_names(diff_text) == set(_hits(diff_text))
+
+
+def _write_tests_tree(repo: Path, files: dict[str, str]) -> None:
+    tests_dir = repo / "tests"
+    tests_dir.mkdir(exist_ok=True)
+    for name, content in files.items():
+        (tests_dir / name).write_text(content)
+
+
+def _boundary_repo(tmp_path: Path, n_raw: int) -> tuple[Path, str]:
+    """A repo whose tests/ has exactly n_raw files containing the word
+    `thing`; exactly one of them (test_ref.py) also references the module
+    `mod_alpha`. Returns (repo, head_sha)."""
+    repo = _init_repo(tmp_path)
+    files = {"test_ref.py": "# mod_alpha\nthing()\n"}
+    for i in range(n_raw - 1):
+        files[f"test_noise_{i:02d}.py"] = "thing()\n"
+    _write_tests_tree(repo, files)
+    head = _commit_all(repo, "tests")
+    return repo, head
+
+
+def test_n3_exactly_threshold_raw_files_keeps_raw_result(tmp_path):
+    n = _mod.NARROW_RESOLVE_THRESHOLD
+    repo, head = _boundary_repo(tmp_path, n)
+    got = _mod.resolve_narrow_hits(repo, {"thing": {"src/mod_alpha.py"}}, head)
+    assert len(got) == n
+    assert "tests/test_noise_00.py" in got and "tests/test_ref.py" in got
+
+
+def test_n3_threshold_plus_one_raw_files_switches_to_module_fallback(tmp_path):
+    n = _mod.NARROW_RESOLVE_THRESHOLD
+    repo, head = _boundary_repo(tmp_path, n + 1)
+    got = _mod.resolve_narrow_hits(repo, {"thing": {"src/mod_alpha.py"}}, head)
+    assert got == {"tests/test_ref.py"}
+
+
+def test_n3_threshold_constant_is_ten():
+    assert _mod.NARROW_RESOLVE_THRESHOLD == 10
+
+
+def test_n4_3321_shape_generic_names_fall_back_to_module_files(
+    tmp_path, monkeypatch, capsys
+):
+    """PR #3321's shape: a rewritten class whose `__init__`/`execute` change
+    (added + removed def in one hunk). The fixture rewrites an EXISTING
+    module, src/engram/engramd_read_registry.py (a brand-new file cannot
+    produce a same-hunk def pair; the real #3321 hits were `__init__` /
+    `execute` in src/engram/engramd_owner.py, an existing file that was
+    modified). 12+ test files mention those generic names; only the two that
+    reference the module by name may be returned. A small-name control
+    (`_fetch_threads`, 3 raw files) must still return all 3."""
+    repo = _init_repo(tmp_path)
+    (repo / "src" / "engram").mkdir(parents=True)
+    reg = repo / "src" / "engram" / "engramd_read_registry.py"
+    other = repo / "src" / "engram" / "forum_hook.py"
+    reg.write_text(
+        "class Registry:\n"
+        "    def __init__(self):\n        pass\n"
+        "    def execute(self, q):\n        return q\n"
+    )
+    other.write_text("def _fetch_threads(url):\n    return url\n")
+    files = {
+        "test_engramd_read_registry.py": (
+            "from engram import engramd_read_registry\n"
+            "def test_a():\n    r = engramd_read_registry.Registry()\n    r.execute(1)\n"
+        ),
+        "test_scan_registry_path.py": (
+            'P = "src/engram/engramd-read-registry.py"\n'
+            "class T:\n    def __init__(self):\n        pass\n"
+        ),
+        "test_fetch_a.py": "stub('_fetch_threads')\n",
+        "test_fetch_b.py": "stub('_fetch_threads')\n",
+        "test_fetch_c.py": "stub('_fetch_threads')\n",
+    }
+    for i in range(12):
+        files[f"test_generic_{i:02d}.py"] = (
+            "class T:\n    def __init__(self):\n        pass\n"
+            "    def run(self):\n        self.execute()\n"
+        )
+    _write_tests_tree(repo, files)
+    base = _commit_all(repo, "base")
+
+    reg.write_text(
+        "class Registry:\n"
+        "    def __init__(self, path):\n        self.path = path\n"
+        "    def execute(self, q, limit):\n        return q\n"
+    )
+    other.write_text("def _fetch_threads(url, deadline):\n    return url\n")
+    head = _commit_all(repo, "rewrite")
+
+    rc, out, err = _run_main(monkeypatch, repo, ["--base", base, "--head", head], capsys)
+    assert rc == 0, f"stderr={err!r}"
+    assert set(out.splitlines()) == {
+        "tests/test_engramd_read_registry.py",
+        "tests/test_scan_registry_path.py",
+        "tests/test_fetch_a.py",
+        "tests/test_fetch_b.py",
+        "tests/test_fetch_c.py",
+    }
+
+
+def test_n5_unusable_hit_file_basename_keeps_raw_result(tmp_path):
+    """No usable fallback pattern (a basename with no tokens) must NOT
+    silently drop the name (F4): over-select by keeping the raw result.
+    (WIDE's own behaviour for a None pattern is unchanged: it contributes
+    nothing.)"""
+    n = _mod.NARROW_RESOLVE_THRESHOLD
+    repo, head = _boundary_repo(tmp_path, n + 1)
+    got = _mod.resolve_narrow_hits(repo, {"thing": {"src/__.py"}}, head)
+    assert len(got) == n + 1
+    assert "tests/test_noise_00.py" in got and "tests/test_ref.py" in got
+
+
+def test_f4_empty_hit_file_set_keeps_raw_result(tmp_path):
+    n = _mod.NARROW_RESOLVE_THRESHOLD
+    repo, head = _boundary_repo(tmp_path, n + 1)
+    got = _mod.resolve_narrow_hits(repo, {"thing": set()}, head)
+    assert len(got) == n + 1
+
+
+def _size_repo(tmp_path: Path, n_raw: int, n_frag: int) -> tuple[Path, str]:
+    """tests/ with n_raw files containing the word `thing` (and not
+    `mod_alpha`) and n_frag DISJOINT files containing `mod_alpha` (and not
+    `thing`), so raw and fallback results are told apart by content."""
+    repo = _init_repo(tmp_path)
+    files = {f"test_raw_{i:02d}.py": "thing()\n" for i in range(n_raw)}
+    files.update({f"test_frag_{i:02d}.py": "# mod_alpha\n" for i in range(n_frag)})
+    _write_tests_tree(repo, files)
+    return repo, _commit_all(repo, "tests")
+
+
+def test_f3_fallback_smaller_than_raw_is_used(tmp_path):
+    n = _mod.NARROW_RESOLVE_THRESHOLD
+    repo, head = _size_repo(tmp_path, n + 1, 1)
+    got = _mod.resolve_narrow_hits(repo, {"thing": {"src/mod_alpha.py"}}, head)
+    assert got == {"tests/test_frag_00.py"}
+
+
+def test_f3_fallback_larger_than_raw_keeps_raw(tmp_path):
+    n = _mod.NARROW_RESOLVE_THRESHOLD
+    repo, head = _size_repo(tmp_path, n + 1, n + 5)
+    got = _mod.resolve_narrow_hits(repo, {"thing": {"src/mod_alpha.py"}}, head)
+    assert got == {f"tests/test_raw_{i:02d}.py" for i in range(n + 1)}
+
+
+def test_f3_fallback_equal_size_keeps_raw_strictly_fewer_required(tmp_path):
+    n = _mod.NARROW_RESOLVE_THRESHOLD
+    repo, head = _size_repo(tmp_path, n + 1, n + 1)
+    got = _mod.resolve_narrow_hits(repo, {"thing": {"src/mod_alpha.py"}}, head)
+    assert got == {f"tests/test_raw_{i:02d}.py" for i in range(n + 1)}
+
+
+def test_f1_each_name_uses_only_its_own_hit_files_for_the_fallback(
+    tmp_path, monkeypatch
+):
+    """Name A (changed in mod_a.py) and name B (changed in mod_b.py) are both
+    over the threshold. A's fallback pattern must be built from mod_a only,
+    B's from mod_b only -- never the union of all names' hit files."""
+    n = _mod.NARROW_RESOLVE_THRESHOLD
+    repo = _init_repo(tmp_path)
+    files = {
+        "test_ref_a.py": "# mod_a\n",
+        "test_ref_b.py": "# mod_b\n",
+    }
+    for i in range(n + 1):
+        files[f"test_aa_{i:02d}.py"] = "aa_fn()\n"
+        files[f"test_bb_{i:02d}.py"] = "bb_fn()\n"
+    _write_tests_tree(repo, files)
+    head = _commit_all(repo, "tests")
+
+    patterns: list[str] = []
+    real = _mod._git_grep_files
+
+    def spy(repo_root, pattern, rev, *, fixed, word):
+        if not fixed:
+            patterns.append(pattern)
+        return real(repo_root, pattern, rev, fixed=fixed, word=word)
+
+    monkeypatch.setattr(_mod, "_git_grep_files", spy)
+    got = _mod.resolve_narrow_hits(
+        repo, {"aa_fn": {"src/mod_a.py"}, "bb_fn": {"src/mod_b.py"}}, head
+    )
+    assert got == {"tests/test_ref_a.py", "tests/test_ref_b.py"}
+    # Per-name, not a union: one pattern per name, each naming exactly one of
+    # the two modules and containing no alternation.
+    assert len(patterns) == 2
+    for pattern in patterns:
+        assert "|" not in pattern
+        assert ("mod[-_]a" in pattern) != ("mod[-_]b" in pattern)
+
+
+def test_f2_headerless_hunk_keeps_name_with_empty_file_set():
+    diff_text = (
+        "@@ -1,2 +1,2 @@\n"
+        "-def foo(x):\n"
+        "+def foo(x, y):\n"
+    )
+    assert collect_narrow_names(diff_text) == {"foo"}
+    assert _hits(diff_text) == {"foo": set()}
+
+
+def test_f5_quoted_non_ascii_header_does_not_attribute_to_neighbour():
+    quoted = '"a/src/m\\303\\263dulo_\\303\\251.py" "b/src/m\\303\\263dulo_\\303\\251.py"'
+    diff_text = (
+        _def_pair_hunk("src/first.py", "first_fn")
+        + f"diff --git {quoted}\n"
+        + "--- a/x\n+++ b/x\n"
+        + "@@ -1,2 +1,2 @@\n-def mid_fn(x):\n+def mid_fn(x, y):\n"
+        + _def_pair_hunk("src/last.py", "last_fn")
+    )
+    hits = _hits(diff_text)
+    assert hits["mid_fn"] == set()
+    assert hits["first_fn"] == {"src/first.py"}
+    assert hits["last_fn"] == {"src/last.py"}
+
+
+def test_n6_union_is_sorted_and_deduplicated(tmp_path, monkeypatch, capsys):
+    """Narrow fallback + raw narrow + wide fallback results merge into one
+    sorted, de-duplicated list (test_both.py is reached by all three)."""
+    repo = _init_repo(tmp_path)
+    (repo / "src").mkdir()
+    hookmod = repo / "src" / "hookmod.py"
+    wideuser = repo / "src" / "wideuser.py"
+    hookmod.write_text(
+        "def generic(a):\n    return a\n"
+        "def small_name(a):\n    return a\n"
+    )
+    wideuser.write_text("def f(req):\n    return urlopen(req)\n")
+    files = {
+        "test_both.py": "# hookmod wideuser\ngeneric()\nurlopen()\nsmall_name()\n",
+        "test_small_two.py": "small_name()\n",
+    }
+    for i in range(11):
+        files[f"test_noise_{i:02d}.py"] = "generic()\nurlopen()\n"
+    _write_tests_tree(repo, files)
+    base = _commit_all(repo, "base")
+
+    hookmod.write_text(
+        "def generic(a, b):\n    return a\n"
+        "def small_name(a, b):\n    return a\n"
+    )
+    wideuser.write_text("def f(req):\n    return http_call(req)\n")
+    head = _commit_all(repo, "change")
+
+    rc, out, err = _run_main(monkeypatch, repo, ["--base", base, "--head", head], capsys)
+    assert rc == 0, f"stderr={err!r}"
+    lines = out.splitlines()
+    assert lines == ["tests/test_both.py", "tests/test_small_two.py"]
+    assert lines == sorted(set(lines))
+
+
+_NARROW_LINE = r"check_stubbed_signatures: narrow '{name}': "
+
+
+def test_diag_fallback_taken_writes_one_stderr_line(tmp_path, capsys):
+    n = _mod.NARROW_RESOLVE_THRESHOLD
+    repo, head = _size_repo(tmp_path, n + 1, 1)
+    _mod.resolve_narrow_hits(repo, {"thing": {"src/mod_alpha.py"}}, head)
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert re.fullmatch(
+        _NARROW_LINE.format(name="thing")
+        + rf"{n + 1} raw > {n}, module fallback -> 1 files\n",
+        cap.err,
+    ), cap.err
+
+
+def test_diag_fallback_rejected_writes_not_fewer_line(tmp_path, capsys):
+    n = _mod.NARROW_RESOLVE_THRESHOLD
+    repo, head = _size_repo(tmp_path, n + 1, n + 5)
+    _mod.resolve_narrow_hits(repo, {"thing": {"src/mod_alpha.py"}}, head)
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert re.fullmatch(
+        _NARROW_LINE.format(name="thing")
+        + rf"{n + 1} raw > {n}, module fallback would select {n + 5} "
+        r"\(not fewer\), kept raw\n",
+        cap.err,
+    ), cap.err
+
+
+@pytest.mark.parametrize("hit_files", [{"src/__.py"}, set()])
+def test_diag_no_usable_pattern_writes_line(tmp_path, capsys, hit_files):
+    n = _mod.NARROW_RESOLVE_THRESHOLD
+    repo, head = _boundary_repo(tmp_path, n + 1)
+    _mod.resolve_narrow_hits(repo, {"thing": hit_files}, head)
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert re.fullmatch(
+        _NARROW_LINE.format(name="thing")
+        + rf"{n + 1} raw > {n}, no usable fallback pattern, kept raw\n",
+        cap.err,
+    ), cap.err
+
+
+def test_diag_at_or_below_threshold_writes_nothing(tmp_path, capsys):
+    n = _mod.NARROW_RESOLVE_THRESHOLD
+    repo, head = _boundary_repo(tmp_path, n)
+    _mod.resolve_narrow_hits(repo, {"thing": {"src/mod_alpha.py"}}, head)
+    cap = capsys.readouterr()
+    assert cap.out == "" and cap.err == ""
+
+
+def test_diag_two_over_threshold_names_write_one_line_each(tmp_path, capsys):
+    n = _mod.NARROW_RESOLVE_THRESHOLD
+    repo = _init_repo(tmp_path)
+    files = {"test_ref_a.py": "# mod_a\n", "test_ref_b.py": "# mod_b\n"}
+    for i in range(n + 1):
+        files[f"test_aa_{i:02d}.py"] = "aa_fn()\n"
+        files[f"test_bb_{i:02d}.py"] = "bb_fn()\n"
+    _write_tests_tree(repo, files)
+    head = _commit_all(repo, "tests")
+    _mod.resolve_narrow_hits(
+        repo, {"aa_fn": {"src/mod_a.py"}, "bb_fn": {"src/mod_b.py"}}, head
+    )
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 2
+    assert lines[0].startswith(_NARROW_LINE.format(name="aa_fn"))
+    assert lines[1].startswith(_NARROW_LINE.format(name="bb_fn"))
+
+
+def test_diag_main_stdout_is_only_paths_diagnostics_on_stderr(
+    tmp_path, monkeypatch, capsys
+):
+    n = _mod.NARROW_RESOLVE_THRESHOLD
+    repo = _init_repo(tmp_path)
+    (repo / "src").mkdir()
+    mod = repo / "src" / "hookmod.py"
+    mod.write_text("def generic(a):\n    return a\n")
+    files = {"test_ref.py": "# hookmod\ngeneric()\n"}
+    for i in range(n + 1):
+        files[f"test_noise_{i:02d}.py"] = "generic()\n"
+    _write_tests_tree(repo, files)
+    base = _commit_all(repo, "base")
+    mod.write_text("def generic(a, b):\n    return a\n")
+    head = _commit_all(repo, "change")
+
+    rc, out, err = _run_main(monkeypatch, repo, ["--base", base, "--head", head], capsys)
+    assert rc == 0
+    assert out == "tests/test_ref.py\n"
+    assert err.startswith(_NARROW_LINE.format(name="generic"))
+    assert err.count("\n") == 1
+
+
+def test_n7_module_docstring_no_longer_claims_narrow_has_no_threshold():
+    """The old sentence ("a large raw hit count is itself meaningful signal")
+    was the wrong claim, falsified by PR #3321. The phrase lived in the
+    comment above WIDE_RESOLVE_THRESHOLD, not the docstring, so check the
+    whole source file too; and the docstring must now name the new rule."""
+    phrase = "Narrow names have no such threshold"
+    assert phrase not in _mod.__doc__
+    assert phrase not in TOOL_PATH.read_text()
+    assert "NARROW_RESOLVE_THRESHOLD" in _mod.__doc__
 
 
 if __name__ == "__main__":
