@@ -116,13 +116,16 @@ _GH_TIMEOUT = 4
 # GitHub Project owner (used for project-anchor queries)
 _GH_OWNER = os.environ.get("BATON_GH_OWNER", "engram-agents")
 
-# #1715: default repo a BARE pr/<N> anchor resolves against. Same variable
-# name as tools/baton.py's own DEFAULT_GITHUB_REPO / board_projects.py's own
-# copy -- read here too (self-contained; this hook is a standalone deployed
-# script and must not assume it can import a sibling module post-plugin-
-# restructure, per this repo's CLAUDE.md). Public-safe fallback, not the
-# private dev-repo literal (tools/scan-leaks.py flags that shape of leak).
-_DEFAULT_GITHUB_REPO = os.environ.get("ENGRAM_DEFAULT_GITHUB_REPO", "engram-agents/engram")
+# #1918 / #1650 / #1919: there is NO default repo for a bare pr/<N> anchor,
+# deliberately -- do not revisit (same rule as tools/baton.py and
+# tools/baton_gate.py). This hook used to resolve a bare anchor against
+# $ENGRAM_DEFAULT_GITHUB_REPO (falling back to the public repo) and then
+# AUTO-ARCHIVE the baton from the cached result, so on a seat that set the
+# variable, a legacy bare PR-<N> baton belonging to another repo was closed
+# from the wrong repo's #N (#1650's 07-03 incident). A bare anchor is now
+# never fetched, never cached and never auto-archived, whatever the
+# environment says; the render says it needs a qualified anchor and the
+# auto-archive pass counts what it skipped.
 
 # #1715: pr/<N> (bare) or pr/<owner>/<repo>/<N> (repo-qualified) -- mirrors
 # tools/baton.py's _GITHUB_ANCHOR_RE / _parse_github_anchor.
@@ -130,17 +133,33 @@ _PR_ANCHOR_RE = re.compile(r"^pr/(?:([\w.-]+)/([\w.-]+)/)?(\d+)$", re.IGNORECASE
 
 
 def _parse_pr_anchor(anchor: str) -> Optional[tuple]:
-    """Parse a pr/<N> or pr/<owner>/<repo>/<N> anchor into (repo, pr_number).
+    """Parse a pr/<owner>/<repo>/<N> anchor into (repo, pr_number).
 
-    repo defaults to _DEFAULT_GITHUB_REPO for a bare anchor. Returns None if
-    the anchor isn't PR-shaped at all.
+    Returns None if the anchor isn't PR-shaped at all, AND for a bare pr/<N>
+    anchor (#1918: no default repo -- a bare anchor has no repo to return).
     """
     m = _PR_ANCHOR_RE.match(anchor.strip().lower())
     if not m:
         return None
     owner, repo_name, pr_num = m.groups()
-    repo = f"{owner}/{repo_name}" if owner and repo_name else _DEFAULT_GITHUB_REPO
-    return (repo, pr_num)
+    if not (owner and repo_name):
+        return None
+    return (f"{owner}/{repo_name}", pr_num)
+
+
+def _is_bare_pr_anchor(anchor: Optional[str]) -> bool:
+    """True for an unqualified pr/<N> anchor (PR-shaped, but no repo).
+
+    Derived from _parse_pr_anchor so there is ONE place that decides whether
+    an anchor carries a repo: PR-shaped yet unparseable == bare.
+    """
+    if not anchor:
+        return False
+    return bool(_PR_ANCHOR_RE.match(anchor.strip().lower())) and _parse_pr_anchor(anchor) is None
+
+
+# Render text for an in-court baton whose anchor is a bare pr/<N>.
+_NEEDS_QUALIFIED_ANCHOR = "needs a qualified anchor: pr/<owner>/<repo>/<N>"
 
 # Frontmatter parsing (same regex as ia.py / inter-agent hook)
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
@@ -431,6 +450,12 @@ def _get_live_status(anchor: str, cache: dict) -> str:
     This function NEVER raises — all exceptions are swallowed.
     """
     try:
+        # #1918: a bare pr/<N> anchor has no repo -- never consult the cache
+        # (a stale/poisoned entry under that key must not render), never
+        # fetch, never cache. Say what it needs instead of a status.
+        if _is_bare_pr_anchor(anchor):
+            return _NEEDS_QUALIFIED_ANCHOR
+
         # Check cache first
         cached = _cache_get(cache, anchor)
         if cached is not None:
@@ -445,6 +470,8 @@ def _get_live_status(anchor: str, cache: dict) -> str:
                 # slice -- the slice produced "owner/repo/N" verbatim for a
                 # repo-qualified anchor, which gh would reject as a garbage
                 # PR-number argument.
+                # #1918: a bare anchor parses to None (no default repo) and
+                # was already handled above; only a qualified one fetches.
                 parsed = _parse_pr_anchor(anchor)
                 if parsed is not None:
                     pr_repo, pr_num = parsed
@@ -572,26 +599,27 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
     Detection order is ANCHOR-FIRST (#2010 rider 1, Kepler DM 2026-09-21),
     mirroring tools/baton.py's cmd_gc: a project whose ``github:`` field
     resolves to a repo-qualified PR anchor is a PR-baton unconditionally,
-    whatever its ``project_id`` looks like -- the name shape
-    (_PR_BATON_NAME_RE) is never consulted for such a baton, at any point.
-    The name gate is consulted only as a FALLBACK, for batons with no
-    qualified anchor (an unqualified bare ``pr/<N>``, a non-PR anchor, or
-    no anchor at all).
+    whatever its ``project_id`` looks like.
+
+    #1918 (closes #1650/#1919): there is NO default repo. A baton whose
+    anchor is a bare ``pr/<N>`` -- explicit, or the ``PR-<N>`` id-fallback --
+    is NEVER closed here, whatever the cache holds or the environment says;
+    the skips are counted and reported in one stderr line per run. A
+    non-PR anchor or no anchor at all is ignored silently, as before. The
+    old name-shape fallback (_PR_BATON_NAME_RE) only ever applied to
+    unqualified anchors, so it can no longer make anything closable and is
+    not consulted.
 
     Two DISTINCT skip reasons exist past this point, and rider 2 requires
     they stay distinguishable rather than conflated into one "skipped"
     bucket:
-      1. NO-QUALIFIED-ANCHOR-AND-NAME-MISMATCH -- the baton has no
-         qualified PR anchor, and its project_id also doesn't match the
-         name-gate fallback (or matched but produced no anchor at all).
-         This is an ID/anchor-shape decision, made before the cache is
-         ever consulted.
-      2. UNCACHED-ANCHOR -- the baton IS an anchored, qualified (or
-         name-fallback-resolved) PR-baton, but its anchor's live status
-         hasn't been fetched into the 30s-TTL cache yet. This is a
-         cache-BUDGET decision, made only after the baton has already
-         cleared reason 1 -- an anchored PR-baton is never skipped on name
-         shape merely because it happens to be uncached.
+      1. NO-QUALIFIED-ANCHOR -- the baton has no repo-qualified PR anchor
+         (bare, non-PR, or absent). An anchor-shape decision, made before
+         the cache is ever consulted; the bare case is counted.
+      2. UNCACHED-ANCHOR -- the baton IS a repo-qualified PR-baton, but its
+         anchor's live status hasn't been fetched into the 30s-TTL cache
+         yet. This is a cache-BUDGET decision, made only after the baton
+         has already cleared reason 1.
     """
     # Resolve the baton binary; skip if not in PATH.
     _baton_which = shutil.which("baton")
@@ -601,6 +629,8 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
             file=sys.stderr,
         )
         return
+
+    skipped_bare = 0  # #1918: batons with an unqualified pr/<N> anchor
 
     for p in projects:
         # Skip already-closed batons (idempotency gate). The fetched list is
@@ -617,22 +647,20 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
         # "UMWELT-PR-572") or any id shape at all, an explicit github:
         # field produces the anchor directly, independent of project_id.
         anchor = _resolve_anchor(project_id, p.get("github", ""))
-        _anchor_m = _PR_ANCHOR_RE.match(anchor) if anchor else None
-        qualified = bool(_anchor_m and _anchor_m.group(1) and _anchor_m.group(2))
 
-        if not qualified:
-            # No qualified PR anchor -- fall back to the name-shape gate
-            # (skip reason 1, above), exactly as this pass behaved before
-            # the anchor-first redesign. #2010: matched by SUFFIX
-            # (_PR_BATON_NAME_RE), not prefix, so both bare "PR-<N>" and
-            # repo-qualified "<REPO>-PR-<N>" batons reach this pass.
-            # (_PR_ID_RE is a narrower, separate pattern used only inside
-            # _resolve_anchor's id-based anchor fallback -- do not conflate
-            # the two.)
-            if not _PR_BATON_NAME_RE.match(project_id.upper()):
-                continue
-            if not anchor:
-                continue
+        # #1918: a bare pr/<N> anchor (explicit, or the "PR-<N>" id-fallback)
+        # has no repo and there is NO default repo -- it is never closed
+        # from a cached status, whatever any cache or environment says.
+        # Counted, and reported once per run after the loop.
+        if _is_bare_pr_anchor(anchor):
+            skipped_bare += 1
+            continue
+
+        # Only a repo-qualified PR anchor can reach the cache lookup below.
+        # Everything else (a non-PR anchor such as project/<N>, or no anchor
+        # at all) is not a PR-baton this pass can close.
+        if not (anchor and _parse_pr_anchor(anchor)):
+            continue
 
         # Cache-only (skip reason 2, above): skip uncached anchors to stay
         # within the hook's 5s timeout. With 430+ baton files, uncached gh
@@ -682,6 +710,15 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
                 f"baton auto-archive: close {pid} raised: {e!r}",
                 file=sys.stderr,
             )
+
+    # #1918: ONE counted line per run for the batons refused above.
+    if skipped_bare:
+        print(
+            f"baton auto-archive: skipped {skipped_bare} baton(s) with an "
+            f"unqualified pr/<N> anchor (run baton anchor <id> --github "
+            f"pr/<owner>/<repo>/<N>)",
+            file=sys.stderr,
+        )
 
 
 # ---------------------------------------------------------------------------

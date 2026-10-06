@@ -26,7 +26,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from forum.board_projects import (
-    DEFAULT_GITHUB_REPO,
     _batch_gh_reconcile,
     _effective_status,
     _gh_pr_state,
@@ -37,6 +36,10 @@ from forum.board_projects import (
 from forum.coordination import FileStore, SeqAllocator, init as _init
 from forum.db import init_db
 from forum.server import create_app
+
+# #1918/#1919: there is no default repo any more, so fixtures carry a
+# repo-qualified anchor (pr/<owner>/<repo>/<N>) and name its repo explicitly.
+_REPO = "example-org/example-repo"
 
 
 # ---------------------------------------------------------------------------
@@ -49,20 +52,20 @@ def _seed_store(store: FileStore, allocator: SeqAllocator) -> None:
           title="Add project board feature", status="in-review", turn="ariadne",
           participants=["borges", "ariadne", "lei"],
           turn_reason="reviewer-fairy converged; colleague fresh-eye requested",
-          github="pr/100", ts="2026-06-20T10:00:00Z")
+          github="pr/example-org/example-repo/100", ts="2026-06-20T10:00:00Z")
     _init(store, allocator, "PR-101",
           title="Fix baton flip guard", status="in-progress", turn="borges",
           participants=["borges", "ariadne"], turn_reason="claimed from pool",
-          github="pr/101", ts="2026-06-18T14:30:00Z")
+          github="pr/example-org/example-repo/101", ts="2026-06-18T14:30:00Z")
     _init(store, allocator, "PR-102",
           title="Already merged PR that baton file still says in-progress",
           status="in-progress", turn="lei",
           participants=["kepler", "borges", "lei"], turn_reason="presented for merge",
-          github="pr/102", ts="2026-06-15T08:00:00Z")
+          github="pr/example-org/example-repo/102", ts="2026-06-15T08:00:00Z")
     _init(store, allocator, "PR-103",
           title="Merged PR with file status already merged", status="merged",
           turn="lei", participants=["ariadne", "lei"], turn_reason="merged",
-          github="pr/103", ts="2026-06-10T08:00:00Z")
+          github="pr/example-org/example-repo/103", ts="2026-06-10T08:00:00Z")
     _init(store, allocator, "ISSUE-200",
           title="Forum search indexing latency", status="planning", turn="lei",
           participants=["borges", "ariadne", "lei"],
@@ -126,10 +129,10 @@ def _board_with_gh_mock(store, gh_mock: dict) -> list:
     Args:
         gh_mock: dict mapping pr_number string → state string (bare number,
             not repo-qualified -- #1715 threaded (repo, pr_number) tuples
-            through the real reconciliation, but every fixture in this file
-            uses an unqualified pr/<N> anchor, which always resolves to
-            DEFAULT_GITHUB_REPO, so this helper still takes bare pr_number
-            keys for readability and translates to the real tuple keys).
+            through the real reconciliation, and every seeded fixture in
+            this file uses a pr/<_REPO>/<N> anchor, so this helper still
+            takes bare pr_number keys for readability and translates to the
+            real tuple keys).
             Any PR number not in the dict returns 'unknown'.
     """
     def _fake_batch(pr_refs):
@@ -162,7 +165,7 @@ class TestReadModel:
         assert pr100["status"] == "in-review"
         assert pr100["turn"] == "ariadne"
         assert pr100["kind"] == "pr"
-        assert pr100["github"] == "pr/100"
+        assert pr100["github"] == "pr/example-org/example-repo/100"
         assert "ariadne" in pr100["participants"]
         assert "lei" in pr100["participants"]
         assert isinstance(pr100["seq"], int) and pr100["seq"] > 0
@@ -345,12 +348,12 @@ class TestSkipReconcileForFileDone:
         _init(
             store, alloc, "PR-500", title="Active PR sharing a ref",
             status="in-review", turn="ariadne", participants=["ariadne"],
-            turn_reason="x", github="pr/999", ts="2026-06-20T10:00:00Z",
+            turn_reason="x", github="pr/example-org/example-repo/999", ts="2026-06-20T10:00:00Z",
         )
         _init(
             store, alloc, "PR-501", title="Done PR, same ref",
             status="merged", turn="lei", participants=["lei"],
-            turn_reason="merged", github="pr/999", ts="2026-06-10T08:00:00Z",
+            turn_reason="merged", github="pr/example-org/example-repo/999", ts="2026-06-10T08:00:00Z",
         )
 
         def _fake_batch(pr_refs):
@@ -364,7 +367,7 @@ class TestSkipReconcileForFileDone:
         # The shared ref was passed to _batch_gh_reconcile exactly once
         # (deduped), driven by PR-500's active status.
         called_refs = mock_batch.call_args[0][0]
-        assert (DEFAULT_GITHUB_REPO, "999") in called_refs
+        assert (_REPO, "999") in called_refs
         assert len(called_refs) == 1
 
         pr500 = next(i for i in items if i["project"] == "PR-500")
@@ -391,13 +394,13 @@ class TestSkipReconcileForFileDone:
             _init(
                 store, alloc, f"PR-DONE-{i}", title=f"done {i}", status="merged",
                 turn="lei", participants=["lei"], turn_reason="merged",
-                github=f"pr/{9000 + i}", ts="2026-06-01T00:00:00Z",
+                github=f"pr/example-org/example-repo/{9000 + i}", ts="2026-06-01T00:00:00Z",
             )
         for i in range(n_active):
             _init(
                 store, alloc, f"PR-ACTIVE-{i}", title=f"active {i}",
                 status="in-review", turn="ariadne", participants=["ariadne"],
-                turn_reason="x", github=f"pr/{8000 + i}", ts="2026-06-01T00:00:00Z",
+                turn_reason="x", github=f"pr/example-org/example-repo/{8000 + i}", ts="2026-06-01T00:00:00Z",
             )
 
         call_log = []
@@ -766,13 +769,13 @@ class TestNoWrites:
 class TestHelpers:
     def test_effective_status_gh_merged_overrides_inprogress(self):
         """_effective_status: gh merged overrides in-progress file status."""
-        eff, gh = _effective_status("in-progress", "pr/42", {(DEFAULT_GITHUB_REPO, "42"): "merged"})
+        eff, gh = _effective_status("in-progress", "pr/example-org/example-repo/42", {(_REPO, "42"): "merged"})
         assert eff == "done"
         assert gh == "merged"
 
     def test_effective_status_gh_closed_overrides_inreview(self):
         """_effective_status: gh closed overrides in-review file status."""
-        eff, gh = _effective_status("in-review", "pr/42", {(DEFAULT_GITHUB_REPO, "42"): "closed"})
+        eff, gh = _effective_status("in-review", "pr/example-org/example-repo/42", {(_REPO, "42"): "closed"})
         assert eff == "done"
         assert gh == "closed"
 
@@ -784,19 +787,19 @@ class TestHelpers:
 
     def test_effective_status_open_pr_passthrough(self):
         """_effective_status: open PR → file status passes through."""
-        eff, gh = _effective_status("in-review", "pr/42", {(DEFAULT_GITHUB_REPO, "42"): "open"})
+        eff, gh = _effective_status("in-review", "pr/example-org/example-repo/42", {(_REPO, "42"): "open"})
         assert eff == "in-review"
         assert gh == "open"
 
     def test_effective_status_unknown_gh_passthrough(self):
         """_effective_status: unknown gh state → file status passes through."""
-        eff, gh = _effective_status("in-progress", "pr/42", {(DEFAULT_GITHUB_REPO, "42"): "unknown"})
+        eff, gh = _effective_status("in-progress", "pr/example-org/example-repo/42", {(_REPO, "42"): "unknown"})
         assert eff == "in-progress"
         assert gh == "unknown"
 
     def test_effective_status_repo_qualified_anchor(self):
         """_effective_status: a repo-qualified anchor (#1715) resolves against
-        that repo's key in gh_states, not DEFAULT_GITHUB_REPO."""
+        that repo's key in gh_states, not some other repo's."""
         eff, gh = _effective_status(
             "in-progress", "pr/engram-agents/engram-paper/22",
             {("engram-agents/engram-paper", "22"): "merged"},
@@ -805,12 +808,12 @@ class TestHelpers:
         assert gh == "merged"
 
     def test_effective_status_repo_qualified_does_not_collide_with_default(self):
-        """A repo-qualified anchor must NOT be satisfied by a DEFAULT_GITHUB_REPO
+        """A repo-qualified anchor must NOT be satisfied by another repo's
         entry for the same bare number -- this is the exact #1715 collision
         shape (engram-paper PR-22 must never read engram-alpha's PR #22)."""
         eff, gh = _effective_status(
             "in-progress", "pr/engram-agents/engram-paper/22",
-            {(DEFAULT_GITHUB_REPO, "22"): "merged"},  # wrong repo's entry
+            {(_REPO, "22"): "merged"},  # wrong repo's entry
         )
         assert eff == "in-progress"  # not reconciled -- falls to 'unknown'
         assert gh == "unknown"
@@ -831,7 +834,7 @@ class TestHelpers:
     def test_gh_pr_state_returns_unknown_on_gh_unavailable(self):
         """_gh_pr_state returns 'unknown' when gh is not on PATH."""
         with patch("forum.board_projects.subprocess.run", side_effect=FileNotFoundError):
-            result = _gh_pr_state("999", DEFAULT_GITHUB_REPO)
+            result = _gh_pr_state("999", _REPO)
         assert result == "unknown"
 
     def test_gh_pr_state_returns_unknown_on_nonzero_exit(self):
@@ -841,7 +844,7 @@ class TestHelpers:
         mock_result.stdout = ""
         mock_result.stderr = "not found"
         with patch("forum.board_projects.subprocess.run", return_value=mock_result):
-            result = _gh_pr_state("999", DEFAULT_GITHUB_REPO)
+            result = _gh_pr_state("999", _REPO)
         assert result == "unknown"
 
     def test_gh_pr_state_parses_merged(self):
@@ -850,7 +853,7 @@ class TestHelpers:
         mock_result.returncode = 0
         mock_result.stdout = json.dumps({"state": "MERGED"})
         with patch("forum.board_projects.subprocess.run", return_value=mock_result):
-            result = _gh_pr_state("42", DEFAULT_GITHUB_REPO)
+            result = _gh_pr_state("42", _REPO)
         assert result == "merged"
 
     def test_gh_pr_state_parses_closed(self):
@@ -859,7 +862,7 @@ class TestHelpers:
         mock_result.returncode = 0
         mock_result.stdout = json.dumps({"state": "CLOSED"})
         with patch("forum.board_projects.subprocess.run", return_value=mock_result):
-            result = _gh_pr_state("42", DEFAULT_GITHUB_REPO)
+            result = _gh_pr_state("42", _REPO)
         assert result == "closed"
 
     def test_gh_pr_state_parses_open(self):
@@ -868,7 +871,7 @@ class TestHelpers:
         mock_result.returncode = 0
         mock_result.stdout = json.dumps({"state": "OPEN"})
         with patch("forum.board_projects.subprocess.run", return_value=mock_result):
-            result = _gh_pr_state("42", DEFAULT_GITHUB_REPO)
+            result = _gh_pr_state("42", _REPO)
         assert result == "open"
 
     def test_batch_gh_reconcile_deduplicates(self):
@@ -888,9 +891,9 @@ class TestHelpers:
 
         try:
             with patch("forum.board_projects._gh_pr_state", side_effect=_fake_gh_pr_state):
-                result = _batch_gh_reconcile([(DEFAULT_GITHUB_REPO, "42"), (DEFAULT_GITHUB_REPO, "43")])
-            assert result == {(DEFAULT_GITHUB_REPO, "42"): "open", (DEFAULT_GITHUB_REPO, "43"): "open"}
-            assert sorted(call_log) == [(DEFAULT_GITHUB_REPO, "42"), (DEFAULT_GITHUB_REPO, "43")]
+                result = _batch_gh_reconcile([(_REPO, "42"), (_REPO, "43")])
+            assert result == {(_REPO, "42"): "open", (_REPO, "43"): "open"}
+            assert sorted(call_log) == [(_REPO, "42"), (_REPO, "43")]
         finally:
             bp._clear_gh_cache()
 
@@ -902,15 +905,15 @@ class TestHelpers:
         bp._clear_gh_cache()
 
         def _fake_gh_pr_state(pr_num, repo):
-            return "merged" if repo == DEFAULT_GITHUB_REPO else "open"
+            return "merged" if repo == _REPO else "open"
 
         try:
             with patch("forum.board_projects._gh_pr_state", side_effect=_fake_gh_pr_state):
                 result = _batch_gh_reconcile([
-                    (DEFAULT_GITHUB_REPO, "22"),
+                    (_REPO, "22"),
                     ("engram-agents/engram-paper", "22"),
                 ])
-            assert result[(DEFAULT_GITHUB_REPO, "22")] == "merged"
+            assert result[(_REPO, "22")] == "merged"
             assert result[("engram-agents/engram-paper", "22")] == "open"
         finally:
             bp._clear_gh_cache()
@@ -928,7 +931,7 @@ def test_gh_cache_suppresses_repeat_calls():
     """
     from forum import board_projects as bp
     bp._clear_gh_cache()
-    ref = (DEFAULT_GITHUB_REPO, "1005")
+    ref = (_REPO, "1005")
     try:
         with patch("forum.board_projects._gh_pr_state", return_value="merged") as m:
             assert bp._batch_gh_reconcile([ref]) == {ref: "merged"}
@@ -942,7 +945,7 @@ def test_gh_cache_does_not_cache_unknown():
     """'unknown' is not cached, so a transient gh outage self-heals next call."""
     from forum import board_projects as bp
     bp._clear_gh_cache()
-    ref = (DEFAULT_GITHUB_REPO, "1005")
+    ref = (_REPO, "1005")
     try:
         with patch("forum.board_projects._gh_pr_state", return_value="unknown") as m:
             bp._batch_gh_reconcile([ref])
@@ -1006,3 +1009,76 @@ def test_board_group_by_param_accepted(client):
     """?group_by= is the extensibility seam; known + unknown axes both 200."""
     assert client.get("/board?group_by=status").status_code == 200
     assert client.get("/board?group_by=nonsense").status_code == 200  # falls back
+
+
+# ---------------------------------------------------------------------------
+# #1918 class (#1919): NO default repo for a bare pr/<N> anchor on the board.
+# ---------------------------------------------------------------------------
+
+class TestNoDefaultRepoBareAnchor:
+    """A bare pr/<N> anchor gets no gh lookup (whatever
+    $ENGRAM_DEFAULT_GITHUB_REPO says) and keeps its stored status, flagged
+    gh_state='unqualified' / gh_unknown=True. A qualified anchor still
+    reconciles exactly as before."""
+
+    QUALIFIED = "example-org/example-repo"
+
+    def _store(self, tmp_path):
+        s = FileStore(tmp_path / "coord")
+        alloc = SeqAllocator(recover=s.recover_max_seq)
+        _init(s, alloc, "PR-7001", title="bare", status="in-progress", turn="borges",
+              participants=["borges"], turn_reason="x", github="pr/7001",
+              ts="2026-06-20T10:00:00Z")
+        _init(s, alloc, "PR-7002", title="qualified", status="in-progress", turn="borges",
+              participants=["borges"], turn_reason="x",
+              github=f"pr/{self.QUALIFIED}/7002", ts="2026-06-20T10:00:00Z")
+        return s
+
+    def test_c4_bare_anchor_no_gh_lookup_keeps_stored_status(self, tmp_path):
+        from forum import board_projects as bp
+        bp._clear_gh_cache()
+        try:
+            with patch("forum.board_projects._gh_pr_state", return_value="merged") as m:
+                items = read_project_board(self._store(tmp_path))
+        finally:
+            bp._clear_gh_cache()
+        looked_up = [(c.args[1], c.args[0]) for c in m.call_args_list]
+        assert looked_up == [(self.QUALIFIED, "7002")], looked_up
+        bare = next(i for i in items if i["project"] == "PR-7001")
+        assert bare["effective_status"] == "in-progress"  # stored status, NOT 'done'
+        assert bare["gh_state"] == "unqualified"
+        assert bare["gh_unknown"] is True
+
+    def test_c4_qualified_anchor_still_reconciles(self, tmp_path):
+        from forum import board_projects as bp
+        bp._clear_gh_cache()
+        try:
+            with patch("forum.board_projects._gh_pr_state", return_value="merged"):
+                items = read_project_board(self._store(tmp_path))
+        finally:
+            bp._clear_gh_cache()
+        q = next(i for i in items if i["project"] == "PR-7002")
+        assert q["effective_status"] == "done"
+        assert q["gh_state"] == "merged"
+        assert q["gh_unknown"] is False
+
+    def test_c4_effective_status_bare_ignores_any_gh_states_entry(self):
+        # Even if some entry exists for the bare number under ANY repo key,
+        # a bare anchor must not be reconciled from it.
+        eff, gh = _effective_status(
+            "in-progress", "pr/42", {(self.QUALIFIED, "42"): "merged"},
+        )
+        assert (eff, gh) == ("in-progress", "unqualified")
+        eff, gh = _effective_status("merged", "pr/42", {})
+        assert eff == "done"
+
+    def test_c4_bare_anchor_already_terminal_stored_status_is_done_unqualified(self):
+        # A bare anchor whose STORED status is already terminal (merged /
+        # cancelled) is done regardless of gh; it is still flagged
+        # 'unqualified' (pins the measured behaviour, #1919 round 2).
+        for stored in ("merged", "cancelled"):
+            assert _effective_status(stored, "pr/42", {}) == ("done", "unqualified"), stored
+        # A gh_states entry under any repo key changes nothing.
+        assert _effective_status(
+            "cancelled", "pr/42", {(self.QUALIFIED, "42"): "open"},
+        ) == ("done", "unqualified")

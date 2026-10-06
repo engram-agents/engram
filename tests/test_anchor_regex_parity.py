@@ -21,19 +21,17 @@ without a lowering step first). The contract that matters is behavioral
 agreement on shape (accept/reject) and, for a REPO-QUALIFIED anchor, the
 resolved (repo, pr_number).
 
-#1918 update: for an UNQUALIFIED pr/<N> anchor, the two modules now
-DELIBERATELY diverge on repo resolution rather than agree -- baton.py
-removed its DEFAULT_GITHUB_REPO fallback entirely (an unqualified anchor
-resolves to no repo, and every baton.py caller refuses/skips rather than
-guessing); board_projects.py's own DEFAULT_GITHUB_REPO is unchanged
-(out of scope for #1918 -- board_projects.py is read-only/display-only,
-already being superseded by umwelt's gh_reconcile.py per that module's own
-docstring, and Borges's #1918 comment explicitly deferred it to a sibling
-issue rather than folding it into this fix). This file's job narrows
-accordingly: still catch #1715-shaped drift on anchor SHAPE and PR NUMBER
-extraction for every case, and still catch repo-resolution drift for
-repo-qualified anchors specifically; no longer assert repo agreement for
-the unqualified case, where disagreement is now the intended contract.
+#1918 update: for an UNQUALIFIED pr/<N> anchor, baton.py removed its
+DEFAULT_GITHUB_REPO fallback entirely (an unqualified anchor resolves to no
+repo, and every baton.py caller refuses/skips rather than guessing).
+#1919 update: board_projects.py now follows the same rule -- its own
+DEFAULT_GITHUB_REPO is gone, and an unqualified anchor gets no gh lookup
+(effective status = stored status, gh_state='unqualified'). So the two
+modules agree again for the unqualified case, but on "NO repo" rather than
+on a shared default: this file asserts that NEITHER resolves a repo for a
+bare anchor (a regression back to a default in either module goes red), and
+still catches #1715-shaped drift on anchor SHAPE, PR NUMBER extraction, and
+the resolved repo of repo-qualified anchors.
 """
 
 from __future__ import annotations
@@ -86,21 +84,24 @@ def _baton_parse(anchor: str):
 
 
 def _board_projects_parse(anchor: str):
-    """Return (repo, pr_number) via board_projects.py's regex, or None.
-    Mirrors board_projects.py's own calling convention: callers pass
-    .strip() only (the regex itself carries IGNORECASE)."""
+    """Return (repo, pr_number) via board_projects.py's own anchor handling,
+    or None. Mirrors board_projects.py's calling convention: callers pass
+    .strip() only (the regex itself carries IGNORECASE).
+
+    #1919: repo is None (not a guessed default) when the anchor is
+    unqualified -- board_projects.py itself never looks such an anchor up
+    (_effective_status reports gh_state='unqualified')."""
     m = _board_projects._PR_ANCHOR_RE.match(anchor.strip())
     if not m:
         return None
     owner, repo_name, number = m.groups()
-    repo = f"{owner}/{repo_name}" if owner and repo_name else _board_projects.DEFAULT_GITHUB_REPO
+    repo = f"{owner}/{repo_name}" if owner and repo_name else None
     return (repo, number)
 
 
-# Golden list: (anchor, expected_repo_or_None_for_default, expected_pr_number_or_None)
-# expected_repo=None means "whichever default each parser resolves to" --
-# checked for AGREEMENT, not a literal string (the two parsers' defaults
-# come from the same env var but are independently read constants).
+# Golden list of anchors both parsers must treat identically: same
+# accept/reject decision, same PR number, same repo for a qualified anchor,
+# and NO repo for an unqualified one.
 _ACCEPT_CASES = [
     "pr/1005",
     "pr/22",
@@ -136,13 +137,17 @@ def test_both_parsers_accept_the_same_pr_anchor_forms_and_agree_on_repo():
             f"board_projects={board_result[1]!r}"
         )
         if baton_result[0] is None:
-            # #1918: unqualified anchor -- baton.py deliberately resolves no
-            # repo (refuse/skip contract); board_projects.py still applies
-            # its own DEFAULT_GITHUB_REPO (out of scope here, see module
-            # docstring). Divergence is the intended, current contract.
-            assert board_result[0].lower() == _board_projects.DEFAULT_GITHUB_REPO.lower(), (
-                f"{anchor!r}: board_projects.py resolved {board_result[0]!r}, "
-                f"expected its own DEFAULT_GITHUB_REPO {_board_projects.DEFAULT_GITHUB_REPO!r}"
+            # #1918/#1919: unqualified anchor -- NEITHER module resolves a
+            # repo (no default; refuse/skip in baton.py, no gh lookup in
+            # board_projects.py). Both must say "no repo".
+            assert board_result[0] is None, (
+                f"{anchor!r}: board_projects.py resolved {board_result[0]!r} "
+                f"for an unqualified anchor; expected no repo (#1919)"
+            )
+            # ...and board_projects.py's real entry point agrees: no lookup.
+            _eff, gh_state = _board_projects._effective_status("in-progress", anchor, {})
+            assert gh_state == "unqualified", (
+                f"{anchor!r}: _effective_status gh_state={gh_state!r}, expected 'unqualified'"
             )
         else:
             assert baton_result[0].lower() == board_result[0].lower(), (

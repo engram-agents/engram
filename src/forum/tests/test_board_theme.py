@@ -58,20 +58,24 @@ def test_group_board_empty():
 # --- github_url -----------------------------------------------------------
 
 def test_github_url_variants():
-    base = f"https://github.com/{t.GITHUB_REPO}"
-    assert t.github_url("pr/1005") == f"{base}/pull/1005"
-    assert t.github_url("PR/1005") == f"{base}/pull/1005"   # case-insensitive
-    assert t.github_url("issue/42") == f"{base}/issues/42"
-    assert t.github_url("#42") == f"{base}/issues/42"
+    # #1918/#1919: no default repo -- only a repo-qualified PR anchor links;
+    # bare pr/<N>, issue/<N> and #<N> have no repo and so no link.
+    base = "https://github.com/example-org/example-repo"
+    assert t.github_url("pr/example-org/example-repo/1005") == f"{base}/pull/1005"
+    assert t.github_url("PR/example-org/example-repo/1005") == f"{base}/pull/1005"  # case-insensitive
+    assert t.github_url("pr/1005") is None
+    assert t.github_url("PR/1005") is None
+    assert t.github_url("issue/42") is None
+    assert t.github_url("#42") is None
     assert t.github_url("") is None
     assert t.github_url("nonsense") is None
 
 
 def test_github_url_repo_qualified_pr_anchor():
     """#1715 reviewer-fairy-caught: a repo-qualified anchor
-    (pr/<owner>/<repo>/<N>) must link to ITS OWN repo, not GITHUB_REPO --
-    the pre-fix `ref[3:]` slice glued 'owner/repo/N' onto GITHUB_REPO's URL,
-    producing a broken link."""
+    (pr/<owner>/<repo>/<N>) must link to ITS OWN repo, not a default repo --
+    the pre-fix `ref[3:]` slice glued 'owner/repo/N' onto a default repo's
+    URL, producing a broken link."""
     assert (
         t.github_url("pr/engram-agents/engram-paper/22")
         == "https://github.com/engram-agents/engram-paper/pull/22"
@@ -83,6 +87,24 @@ def test_github_url_repo_qualified_pr_anchor():
     # Malformed qualified form (only one path segment) -- rejected, not
     # silently mis-parsed into a broken link.
     assert t.github_url("pr/only-one-segment/22") is None
+
+
+def test_c5_github_url_bare_pr_is_none_qualified_unchanged(monkeypatch):
+    """#1918 class (#1919): a bare pr/<N> never links to a guessed repo,
+    whatever $ENGRAM_DEFAULT_GITHUB_REPO says; the qualified form is unchanged."""
+    monkeypatch.setenv("ENGRAM_DEFAULT_GITHUB_REPO", "example-org/example-repo")
+    assert t.github_url("pr/42") is None
+    assert t.github_url("PR/42") is None
+    assert (
+        t.github_url("pr/owner/repo/42") == "https://github.com/owner/repo/pull/42"
+    )
+
+
+def test_c5_github_url_bare_issue_refs_are_none():
+    """Same rule for the unqualified issue/<N> and #<N> shapes (no repo ->
+    no link, never a guessed one)."""
+    assert t.github_url("issue/42") is None
+    assert t.github_url("#42") is None
 
 
 # --- helpers --------------------------------------------------------------
