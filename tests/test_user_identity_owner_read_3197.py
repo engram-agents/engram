@@ -52,8 +52,13 @@ FLAG_KEY = "user_identity_reads_via_owner"
 
 # --- fixtures / helpers --------------------------------------------------------
 
-def make_real_store(home: Path, people) -> Path:
-    """knowledge.db with the REAL schema plus the given current person rows."""
+def make_real_store(home: Path, people, pre_metadata_guard: bool = False) -> Path:
+    """knowledge.db with the REAL schema plus the given current person rows.
+
+    `pre_metadata_guard=True` builds a store that lacks the rung-7
+    guards, as a pre-rung-7 database does (#3484 / #3525): the two metadata JSON guard
+    triggers (migration rung 7) are dropped BEFORE the rows go in, so a
+    non-JSON `metadata` can be inserted. Same schema path, one extra step."""
     import engram_core
 
     old = os.environ.get("ENGRAM_HOME")
@@ -64,6 +69,9 @@ def make_real_store(home: Path, people) -> Path:
         conn.row_factory = sqlite3.Row
         engram_core._run_db_one_time_setup(conn)
         conn.row_factory = None
+        if pre_metadata_guard:
+            for trig in engram_core._METADATA_GUARD_TRIGGER_NAMES:
+                conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
         for pid, claim, chain, meta in people:
             conn.execute(
                 "INSERT INTO nodes (id, type, claim, created_at, logical_chain, metadata, is_current) "
@@ -174,6 +182,10 @@ CASES = [
     ("prefix-matching-nobody", [ALICE, BOB], "Nobody: hello", None, False),
     ("zero-person-rows", [], "Alice: hello", None, False),
     ("several-rows-duplicate-alias-first-wins", [SAM1, SAM2, DEE], "sammy: hi", None, True),
+    # A non-JSON metadata can no longer be INSERTed since rung 7 (#3484); a
+    # database still at schema 6 can hold one, so this case is built with the
+    # guard triggers dropped (see `pre_metadata_guard`; #3525). The refusal on
+    # the current schema is pinned by test_current_schema_refuses_malformed_metadata.
     ("malformed-metadata-survived", [BROKEN, ALICE], "Alice: hello", None, True),
     ("null-metadata-survived", [NULLMETA, ALICE], "Alice: hello", None, True),
     ("non-ascii-name", [ZOE, ALICE], "雷: bonjour", None, True),
@@ -191,7 +203,7 @@ def test_c1_hook_output_is_identical_flag_off_vs_on(case, home, monkeypatch):
     still produce Alice's identity card past the bad row. A path that crashes
     again on either side goes red."""
     _name, people, prompt, sticky, must_be_nonempty = case
-    make_real_store(home, people)
+    make_real_store(home, people, pre_metadata_guard=(BROKEN in people))
     mod = load_hook(home, monkeypatch)
     with started_owner(home):
         off, on = run_off_and_on(mod, home, prompt, sticky)
@@ -207,6 +219,24 @@ def test_c1_hook_output_is_identical_flag_off_vs_on(case, home, monkeypatch):
         # The card names Alice (pn_0001) past the bad row, not the bad row itself.
         assert "pn_0001" in additional_context(off[0]) and "pn_0001" in additional_context(on[0])
     assert on == off
+
+
+def test_current_schema_refuses_malformed_metadata(home):
+    """#3525: on the CURRENT schema (rung-7 guard triggers present) the same
+    malformed metadata the survived case uses is refused at INSERT, and a
+    valid-JSON control goes in. Pins the constraint that makes the survived
+    case need a pre-rung-7 database. Mutation: insert VALID json in the
+    refusal cell, or drop the guard triggers -> red."""
+    with pytest.raises(sqlite3.IntegrityError, match="valid JSON or NULL"):
+        make_real_store(home, [BROKEN])
+    ok_home = home / "ok"
+    ok_home.mkdir()
+    db = make_real_store(ok_home, [ALICE])
+    conn = sqlite3.connect(str(db))
+    try:
+        assert conn.execute("SELECT count(*) FROM nodes WHERE id='pn_0001'").fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 def _mutating_read(mutate):
