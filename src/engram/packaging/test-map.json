@@ -154,6 +154,7 @@
         "tests/test_in_turn_recall.py",
         "tests/test_principle_triggers_registry.py",
         "tests/test_lesson_tripwire_injection_bounds.py",
+        "tests/test_loader_failure_visible_3503.py",
         "tests/test_resolve_runtime_dir_plugin.py"
       ],
       "note": "PreToolUse hook that surfaces lesson tripwires on Bash and MCP tool calls (issues #1203 + #1297). test_principle_triggers_registry.py added #1731 -- its own docstring (Coverage §6) already documented covering this hook's PreToolUse _QUERY broadening, but it was missing from this glob (found while fixing #1731, same completeness-gap class as this morning's tools/perf/*.py <-> test_in_turn_recall.py gap). engram-alpha#2863 WS2 (lesson-tripwire fold onto _hooklib.emit_context()): test_lesson_tripwire_injection_bounds.py added (bound/head/ordering coverage for the new emit_context() call site). test_resolve_runtime_dir_plugin.py added too -- it dynamically loads this hook file's own no-argument _resolve_runtime_dir (a different helper from the shared _hooklib one) via importlib against a synthetic worktree-nested copy, and this migration added a second module-scope dependency (`_harness`) that fixture now has to satisfy alongside the pre-existing `_hooklib` one."

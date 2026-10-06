@@ -90,6 +90,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -166,6 +167,108 @@ WHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')
 """
 
 
+# ---------------------------------------------------------------------------
+# #3503 -- make the loaders' fail-soft `except` VISIBLE
+# ---------------------------------------------------------------------------
+# Both loaders below end in `except Exception: return []`, so a caller could not
+# tell "no lessons" from "the loader failed" (a locked file past the timeout, a
+# missing table after a partial migration, a file that is not a database all
+# looked identical to an empty lesson set). The loaders still return [] and
+# never raise (fail-soft is the hook's whole contract); the failure is now also
+#   1. recorded in LOADER_FAILURES (reset at the top of every main() run),
+#   2. written as ONE sanitized stderr line (the `route-ledger:` convention), and
+#   3. surfaced to the agent as ONE bounded line inside the tripwire block
+#      (rendered by emit_context, see main()), at most once per
+#      LOADER_NOTICE_WINDOW_SECONDS, tracked by a small stamp file.
+LOADER_FAILURES: list = []
+LOADER_NOTICE_WINDOW_SECONDS = 1800
+# State file beside the hook's other state (ENGRAM_HOME, like the overflow dir
+# and the ledgers). Module constant so a test can point it elsewhere.
+LOADER_NOTICE_STAMP_PATH = Path(ENGRAM_HOME) / "lesson-tripwire-loader-notice.json"
+_LOADER_NAMES = ("load_tripwires", "load_prevention_lessons")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _sanitize_exc_text(text: str, limit: int) -> str:
+    """Each control character (newline included) -> one space, then cut to
+    `limit` characters, so an exception message is always one bounded line."""
+    return _CONTROL_CHARS_RE.sub(" ", text)[:limit]
+
+
+def _record_loader_failure(loader: str, exc: BaseException) -> None:
+    """Record one loader failure and write exactly one stderr line:
+    `lesson-tripwire: <loader> failed: <ExcType>: <message>` (message
+    sanitized, <= 200 chars; whole line <= 300). Never raises."""
+    try:
+        etype = _sanitize_exc_text(type(exc).__name__, 80)
+        try:
+            msg = _sanitize_exc_text(str(exc), 200)
+        except Exception:
+            msg = "<unprintable exception message>"
+        LOADER_FAILURES.append({"loader": loader, "exc_type": etype, "message": msg})
+        sys.stderr.write(f"lesson-tripwire: {loader} failed: {etype}: {msg}"[:300] + "\n")
+    except Exception:
+        pass
+
+
+def _loader_notice_now() -> float:
+    return time.time()
+
+
+def _loader_notice_due(now: float) -> bool:
+    """True unless a notice was shown within the last window. An absent,
+    unreadable, corrupt, wrongly-shaped or future-dated stamp is "due": the
+    rate limit must fail VISIBLE, never silent. Never raises."""
+    try:
+        shown_at = json.loads(LOADER_NOTICE_STAMP_PATH.read_text(encoding="utf-8"))["shown_at"]
+        if isinstance(shown_at, bool) or not isinstance(shown_at, (int, float)):
+            return True
+        return not (0 <= now - shown_at < LOADER_NOTICE_WINDOW_SECONDS)
+    except Exception:
+        return True
+
+
+def _mark_loader_notice_shown(now: float) -> None:
+    """Start a new rate-limit window. Never raises (an unwritable stamp just
+    means the next failure shows the line again)."""
+    try:
+        LOADER_NOTICE_STAMP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(LOADER_NOTICE_STAMP_PATH, {"shown_at": now})
+    except Exception:
+        pass
+
+
+def _pending_loader_notice():
+    """Return (line, now): the one visible line to inject this run, or ("", None).
+
+    A recorded failure of EITHER loader is shown (rate-limited), including a
+    prevention-only failure with no tripwire hits: the hook never blocks on an
+    infrastructure failure, so a failed prevention load leaves the blocking
+    gate off for the run and this line is the only visible signal. With no
+    hits the line is the whole block (main renders it through emit_context).
+    The caller writes the rate-limit stamp only after the response carrying
+    the line has been printed.
+    Shape: `[lesson-tripwire] <loaders> failed (<ExcType>); tripwires or
+    blocking lessons may be missing this prompt`, <= 200 chars, no exception
+    message text."""
+    try:
+        if not LOADER_FAILURES:
+            return "", None
+        names = [n for n in _LOADER_NAMES if any(f["loader"] == n for f in LOADER_FAILURES)]
+        now = _loader_notice_now()
+        if not _loader_notice_due(now):
+            return "", None
+        types: list = []
+        for f in LOADER_FAILURES:
+            if f["exc_type"] not in types:
+                types.append(f["exc_type"])
+        types_s = "/".join(t[:40] for t in types)[:80]
+        line = f"[lesson-tripwire] {', '.join(names)} failed ({types_s}); tripwires or blocking lessons may be missing this prompt"
+        return line[:200], now
+    except Exception:
+        return "", None
+
+
 def load_tripwires(db_path: Path = DB_PATH):
     """Return list of (pattern_str, nudge_str, node_id, priority_str) from
     active lessons with situation_pattern.
@@ -191,7 +294,8 @@ def load_tripwires(db_path: Path = DB_PATH):
             (row[2], row[1], row[0], row[3] or "normal")
             for row in rows if row[1] and row[2]
         ]
-    except Exception:
+    except Exception as exc:
+        _record_loader_failure("load_tripwires", exc)
         return []
 
 
@@ -725,7 +829,8 @@ def load_prevention_lessons(db_path: Path = DB_PATH):
             {"id": row[0], "pattern": row[1], "prevention_type": row[2], "nudge": row[3] or ""}
             for row in rows if row[1] and row[2]
         ]
-    except Exception:
+    except Exception as exc:
+        _record_loader_failure("load_prevention_lessons", exc)
         return []
 
 
@@ -1476,6 +1581,7 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
 
 
 def main() -> None:
+    LOADER_FAILURES.clear()  # #3503: the record is per run
     try:
         hook_input = json.load(sys.stdin)
     except (json.JSONDecodeError, EOFError, ValueError):
@@ -1533,6 +1639,9 @@ def main() -> None:
 
         tripwires = load_tripwires()
         hits = check_command(match_target, tripwires) if tripwires else []
+        # #3503: at most one visible loader-failure line per window; "" when
+        # nothing failed (clean path: head/body below stay byte-identical).
+        loader_notice, loader_notice_now = _pending_loader_notice()
         # #2858 Piece 1 — order by specificity (pattern length, descending)
         # before rendering/capping. Ties preserve check_command's original
         # (DB-query) order — sorted() is stable, so this is just the sort
@@ -1630,7 +1739,10 @@ def main() -> None:
 
             budgets = get_harness_budgets(detect_harness())
             parts.append(emit_context(
-                TRIPWIRE_HEADER,
+                # #3503: the failure line, when due, is part of the head (so it
+                # shares emit_context's target/budget accounting and sits above
+                # the bullets); unchanged TRIPWIRE_HEADER otherwise.
+                f"{loader_notice}\n{TRIPWIRE_HEADER}" if loader_notice else TRIPWIRE_HEADER,
                 bullets,
                 budget=budgets["budget"],
                 target=TRIPWIRE_BLOCK_CHAR_CEILING,
@@ -1652,6 +1764,17 @@ def main() -> None:
             shown_hits = hits[: len(hits) - len(cut_hits)] if cut_hits else hits
             if not shown_hits and hits:
                 shown_hits = hits[:1]
+        elif loader_notice:
+            # #3503: a loader failed and there are no hits, so the block would
+            # otherwise be silent -- the line IS the block, still rendered by
+            # emit_context (trailer first, same budget rules).
+            budgets = get_harness_budgets(detect_harness())
+            parts.append(emit_context(
+                loader_notice,
+                [],
+                budget=budgets["budget"],
+                target=TRIPWIRE_BLOCK_CHAR_CEILING,
+            ))
 
         # #2753 epic WS2 (D3 point 1) — generalization-chain render, ADDITIVE
         # after the nudge block above and independently guarded: a failure
@@ -1844,6 +1967,15 @@ def main() -> None:
             }
         }
         print(json.dumps(response))
+        if loader_notice:
+            # #3503: the window is consumed only once the line has actually
+            # been written out; an exit before this point (or a failed
+            # print/flush) leaves no stamp, so the next failure shows it again.
+            try:
+                sys.stdout.flush()
+            except Exception:
+                sys.exit(0)
+            _mark_loader_notice_shown(loader_notice_now)
         sys.exit(0)
 
     except Exception:
