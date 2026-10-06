@@ -363,6 +363,8 @@ carried it until 2026-08-30:
    name,headSha,conclusion,updatedAt` in time order is the direct way to see which run
    is the current one — that command exposes no `completedAt`, but on a finished run
    its `updatedAt` is ≈ the completion time (measured ~1s later, on five runs).
+   This dedupe is the test verdict, but see rule 3 of "Merge-seat test rules" below: a
+   cancelled newest same-SHA run still blocks the merge; rerun it.
 5. **`UNKNOWN` is not red — measured, not reasoned.** `mergeStateStatus` is computed
    asynchronously and only for open PRs. It has been observed reading `UNKNOWN` twice a
    minute apart on a PR that was genuinely fine, then `CLEAN` minutes later, then
@@ -408,3 +410,63 @@ beside a genuinely green tip, both on the tip's own SHA — #2410 (one stale `CA
 and #2419, the v0.5.0-rc1 release cut (two stale `FAILURE`s). The pre-amendment rule reads both as not-green, and
 would have held the release cut. Both are merged and both still carry those entries, so
 merging does not clean the rollup and the evidence stays checkable.*
+
+### Merge-seat test rules (added 2026-10-06, #3479)
+
+Three rules for the seat that runs tests before merging. They sit with the CI-green
+gate above because they answer the same question from the other side: CI-green says
+the PR's checks passed; these say what the seat's own run must be and how to read it.
+
+**1. The seat's own test run is on a SCRATCH MERGE of the base tip plus the PR head,
+never on the head alone.** The run answers *does the base work after this lands*. A
+head-only green is necessary (the PR works) and not sufficient (the base works after
+it): another PR can land on the base between the peer approval and the merge, and the
+two compose badly. No review layer sees that tree except the merge seat — the fairy
+and the colleague review the head.
+
+```
+git fetch origin <base> '+refs/pull/N/head:refs/pr/N'
+git worktree add --detach <scratch> origin/<base>
+git -C <scratch> merge --no-edit refs/pr/N
+git -C <scratch> log -1 --format=%p      # one parent = fast-forwarded: take the fast path below only if --is-ancestor holds; no parents or an error = the merge did not happen
+# run the PR's tests + the repo guard set here
+```
+
+The one fast path is "head is already rebased on the base tip", where head == merged
+tree; assert `git merge-base --is-ancestor origin/<base> refs/pr/N` before taking it.
+
+*Evidence:* umwelt #878/#872 on 2026-09-29. On 2026-10-06, umwelt #1016 and #1017
+against #1002; #1016 was caught on a scratch merge, and #1017 is the head-only-run
+escape (the seat ran the PR's five test files on the head alone, 380 passed, and
+merged; main was red on three cells minutes later).
+
+**2. A failure seen on the scratch merge belongs to the PR only if the same test cell
+is GREEN on the base alone.** Otherwise it is the base's and goes to the seat that
+broke it, and must not be held against the PR. To tell the two apart, run the failing cell on the base tip.
+
+*Evidence:* Borges's run on umwelt #1021 (2026-10-06) kept main's own red off the PR.
+
+**3. A cancelled same-SHA run can block the merge even when another run passed.**
+Observed: a required status check can read as not-satisfied — the PR stays `BLOCKED`
+and the merge is refused — when the newest run of that check on the head SHA was
+`CANCELLED`, even though another run on the same SHA passed. `gh run rerun <the
+cancelled run id>` cleared it. Never argue from the deduplication above ("another run
+passed, so the gate is satisfied"); rerun the cancelled run.
+
+The cause seen, on alpha #3489 only: two `pull_request` runs on the same SHA were
+created in the same second, after a push and a PR-body edit seconds apart, and
+concurrency cancelled one. On #3476 we know only that the newest same-SHA run was
+cancelled by concurrency; what triggered the second run is not known. The
+explanation that fits is that GitHub keys the required check on the newest same-SHA
+run, not the most recently completed one. That is the merge seat's reading from two
+measurements, no documentation; the fact and the remedy above are as measured.
+Untested advice: edit the PR body before pushing, or wait for the push's run to start.
+
+*Evidence:* two measurements, 2026-10-06.
+(1) alpha #3476, ~16:43Z: the newest same-SHA run was cancelled by concurrency, the PR
+was `BLOCKED` and the merge refused ("base branch policy prohibits"), even though an
+older run was green and a valid approval existed; `gh run rerun` of the cancelled run
+gave `CLEAN` as soon as it completed.
+(2) alpha #3489, ~17:13–17:20Z: read `BLOCKED | pr-checks:CANCELLED, pr-checks:SUCCESS`
+(two runs on the same SHA, started in the same second by a push and a body edit);
+`gh run rerun` of the cancelled run gave `CLEAN | SUCCESS, SUCCESS`.

@@ -297,7 +297,7 @@ rollup. (`DIRTY` is a merge conflict and must be resolved whatever CI says.)
 1. **`CLEAN` is the verdict — stop there.** GitHub computes it from the latest run per check.
 2. **The rollup does NOT dedupe.** A stale `FAILURE`/`CANCELLED` from a superseded same-SHA run sits beside the current `SUCCESS`; requiring every entry to be `SUCCESS` false-blocks a green PR.
 3. **Two runs of one check can land on the SAME SHA** (the workflow fires on `edited` as well as `synchronize`). The dedupe is load-bearing within one SHA only.
-4. **Use the rollup only to find WHICH check to read**, deduped to the latest run per check name, where *latest* = most recently **completed** (`completedAt`, not `startedAt`). `gh run list --branch <branch> --json name,headSha,conclusion,updatedAt` shows the current run.
+4. **Use the rollup only to find WHICH check to read**, deduped to the latest run per check name, where *latest* = most recently **completed** (`completedAt`, not `startedAt`). `gh run list --branch <branch> --json name,headSha,conclusion,updatedAt` shows the current run. But see rule 3 of "Merge-seat test rules" below: a cancelled newest same-SHA run still blocks the merge; rerun it.
 5. **`UNKNOWN` is not red** — it is computed asynchronously. Treat it as *pending* (hold, re-check next tick), never as a failure.
 
 Reference implementation: `_pr_ci_state()` and `_dedupe_checks_by_latest()` in
@@ -311,6 +311,12 @@ drift, the doc is the side that moves.
 **Re-check after ANY post-approval commit.** A moved tip (e.g. folding a late
 reviewer nit after the approve) re-triggers CI and can fail on the new commit —
 CI-green must hold on the tip the maintainer would actually merge.
+
+**The merge seat's own test run** is on a scratch merge of the base tip plus the PR
+head, never the head alone; a scratch-merge failure counts against the PR only if
+that cell is green on the base alone; and a `CANCELLED` newest same-SHA run can
+block the merge even when another run passed — rerun it. Commands and evidence:
+`docs/PR-MERGE-POLICY.md` § "Merge-seat test rules".
 
 *Origin: converged-but-red PRs reached "ready" framing twice (CI was not
 checked); amended 2026-08-30 after superseded same-SHA runs (#2410, #2419) read
