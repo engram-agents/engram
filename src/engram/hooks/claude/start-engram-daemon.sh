@@ -43,6 +43,20 @@
 # entirely absent; a systemd host whose call fails or answers
 # ambiguously still reads "unavailable" (report loudly, no launch),
 # unchanged.
+#
+# RECOVERY -- the hook banner says the daemon is offline but a daemon process
+# is alive:
+#   1. `pgrep -fl engram-surface-daemon.py`, then `lsof -p <pid> | grep unix`:
+#      does the live process hold a socket whose path no longer exists?
+#   2. `launchctl list | grep engram` and
+#      `launchctl print gui/$(id -u)/com.engram.surface-daemon`; compare
+#      ProgramArguments with the real daemon path. A job pointing at a deleted
+#      worktree or a temp ENGRAM_HOME is a zombie:
+#      `launchctl bootout gui/$(id -u)/com.engram.surface-daemon`. (This script
+#      never reads launchd: its supervisor check is Linux-only.)
+#   3. SIGTERM the orphaned holder: `kill <pid>`.
+#   4. Run this script.
+#   5. Confirm $ENGRAM_HOME/recall-daemon.sock and recall-daemon.pid exist.
 
 : "${ENGRAM_HOME:=$HOME/.engram}"
 
