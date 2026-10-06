@@ -126,6 +126,88 @@ def test_every_claude_launch_site_carries_the_prologue():
     assert "__session-prologue" not in body[:claude_start]
 
 
+# Each Claude launch site is one line of the cmd_session body carrying one of
+# these exec forms (the quoting differs per site, so match the unquoted tail).
+_CLAUDE_EXEC_MARKERS = ('exec \\"$binary\\"', "exec ~/.runtime/start.sh")
+
+
+def _check_launch_site_order(line: str) -> None:
+    """Assert `$prologue;` precedes `cd` and `exec` within ONE launch-site line.
+
+    Failure messages quote the offending line, so the broken site is named.
+    """
+    where = f"launch site: {line.strip()!r}"
+    p = line.find("$prologue;")
+    assert p != -1, f"no `$prologue;` on the same line as the exec -- {where}"
+    exec_at = min(i for i in (line.find(m) for m in _CLAUDE_EXEC_MARKERS) if i != -1)
+    assert p < exec_at, f"`$prologue;` is not before `exec` -- {where}"
+    # Any `cd` command, whatever its argument form: a `cd` token not glued to a
+    # word, `$`, `.`, `/` or `-` on its left (so not `abcd`, `$cd`, `./cd`) and
+    # followed by whitespace.
+    cd_m = re.search(r"(?<![\w$./-])cd\s", line)
+    cd_at = cd_m.start() if cd_m else -1
+    if cd_at != -1:
+        assert p < cd_at, f"`$prologue;` is not before `cd` -- {where}"
+        assert cd_at < exec_at, f"`cd` is not before `exec` -- {where}"
+
+
+def test_every_claude_launch_site_runs_the_prologue_before_cd_and_exec():
+    """Order, per site: the prologue comes before `cd` and `exec` on that line.
+
+    The count cell above passes if `$prologue;` moves AFTER the `exec` (still 8).
+    The end-to-end cells drive only the `--as-self` sites; no cell can run the
+    four sudo sites (no sudo in the sandboxes), so this static, per-line check
+    is the only protection for those. Also: exactly 8 lines carry a Claude
+    `exec`, and each of them carries `$prologue;` itself (a stray `$prologue;`
+    on some other line, such as a comment, cannot stand in for a dropped one).
+    """
+    body = _cmd_session_body()
+    launch_lines = [
+        l for l in body.splitlines() if any(m in l for m in _CLAUDE_EXEC_MARKERS)
+    ]
+    assert len(launch_lines) == 8, launch_lines
+    for line in launch_lines:
+        _check_launch_site_order(line)
+
+
+# Synthetic launch-site lines for `_check_launch_site_order` (no file reads).
+# The four real shapes below are each used twice in cmd_session (as-self and
+# sudo carry identical text), so four distinct strings cover the eight sites.
+_ORDER_PASS_LINES = [
+    '"$prologue; cd $(printf \'%q\' "${cwd_arg[0]}") && exec \\"$binary\\" \\"\\$@\\""',
+    '"$prologue; exec \\"$binary\\" \\"\\$@\\""',
+    '"$prologue; cd $(printf \'%q\' "${cwd_arg[0]}") && exec ~/.runtime/start.sh \\"\\$@\\""',
+    '"$prologue; "\'exec ~/.runtime/start.sh "$@"\'',
+    # Any cd form is fine as long as the prologue and exec order holds.
+    '"$prologue; cd . && exec \\"$binary\\" \\"\\$@\\""',
+    # `cd` inside another word, as a variable, or as a path component is not a
+    # cd command (guards the regex's left boundary).
+    '"$prologue; exec \\"$binary\\" \\"\\$@\\"; echo abcd $cd ./cd x"',
+]
+_ORDER_RAISE_LINES = [
+    # cd before the prologue (a cd form other than `cd $(printf`).
+    '"cd . && $prologue; exec \\"$binary\\" \\"\\$@\\""',
+    '"cd \\"$d\\" && $prologue; exec ~/.runtime/start.sh \\"\\$@\\""',
+    # prologue after exec.
+    '"exec \\"$binary\\" \\"\\$@\\"; $prologue;"',
+    # exec with no prologue at all.
+    '"exec \\"$binary\\" \\"\\$@\\""',
+    # cd after exec (prologue first).
+    '"$prologue; exec \\"$binary\\" \\"\\$@\\"; cd . "',
+]
+
+
+@pytest.mark.parametrize("line", _ORDER_PASS_LINES)
+def test_launch_site_order_check_accepts_correct_lines(line):
+    _check_launch_site_order(line)
+
+
+@pytest.mark.parametrize("line", _ORDER_RAISE_LINES)
+def test_launch_site_order_check_rejects_misordered_lines(line):
+    with pytest.raises(AssertionError):
+        _check_launch_site_order(line)
+
+
 # --- End-to-end: the REAL cmd_session under --as-self, no sudo, no real agent.
 # A fake `id` on PATH satisfies resolve_user and _as_self_check on any host;
 # a fake `claude` (or ~/.runtime/start.sh) prints argv, pwd and the SURV env.
