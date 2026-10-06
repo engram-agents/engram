@@ -1075,3 +1075,251 @@ def test_hook_source_has_no_real_async_hop():
         for lineno, line in enumerate(_strip_ts_comments(p.read_text()).splitlines(), 1):
             hits.extend(f"{p.name}:{lineno}: {tok}" for tok in _REAL_ASYNC_TOKENS if tok in line)
     assert not hits, f"real-async hop in the hook path: {hits} (scanned: {scanned})"
+
+
+# ---------------------------------------------------------------------------
+# #3458 section B: the live routes (R = prompt_surface, T = tool_recall)
+#
+# Contract-first: these cells were written BEFORE the converter / eval changes.
+# The join file `route-joins/<turnId>.json` is what hooks/rating.ts writes at
+# turn.complete; the ledger line shape is #3458 section A's contract.
+# ---------------------------------------------------------------------------
+
+ROUTE_FIRE_KEY = "Read:b2b3bcf85e6c8ba9"
+
+
+def _ledger_line(route: str, fire_key: str, cands: list[tuple], shown: list[str], **extra) -> dict:
+    """cands: (id, similarity, utility) in the route's own ranked order."""
+    line = {
+        "ts": 1000, "route": route, "session_id": "s", "fire_key": fire_key,
+        "query": f"live query of {route}",
+        "candidates": [
+            {"id": i, "type": "observation", "rank": r + 1, "similarity": sim,
+             "importance_score": 0.2, "utility": util, "composite_score": 0.5,
+             "match_type": "semantic", "recall_turn": 7, "created_at": "2026-10-01T00:00:00Z",
+             "in_context": False}
+            for r, (i, sim, util) in enumerate(cands)
+        ],
+        "missing_signals": [], "shown": shown, "cut": {}, "source": "test",
+    }
+    line.update(extra)
+    return line
+
+
+def _put_route_join(root: Path, step_index: int, attaches: list[dict], *, turn: str = TURN,
+                    also_by_arm: dict | None = None) -> Path:
+    entry = {"routeOnlyIds": [], "alsoByArm": also_by_arm or {},
+             "routes": [{"route": a["line"]["route"], "letter": a["letter"],
+                         "fire_key": a["line"]["fire_key"], "line": a["line"],
+                         **({"unmatched": True} if a.get("unmatched") else {})} for a in attaches]}
+    path = root / "route-joins" / f"{turn}.json"
+    existing = json.loads(path.read_text()) if path.exists() else {"turnId": turn, "ts": 1, "steps": {}}
+    existing["steps"][str(step_index)] = entry
+    return _write(path, existing)
+
+
+def _route_session(tmp_path: Path):
+    root = _session(tmp_path)
+    _put_step(root, _step(1, {"thinking_tail": ["ob_0001", "ob_0002"], "tool_input": ["ob_0003"]},
+                          blind={"A": "thinking_tail", "D": "tool_input"}))
+    line = _ledger_line("tool_recall", ROUTE_FIRE_KEY,
+                        [("ob_0003", 0.6, 0.1), ("ob_0701", 0.55, 0.2), ("ob_0702", 0.4, None)],
+                        ["ob_0003", "ob_0701"], missing_signals=["utility"])
+    _put_route_join(root, 1, [{"line": line, "letter": "T"}], also_by_arm={"ob_0003": ["D"]})
+    # the request showed ob_0003 once (route cell, "also D"), so arm D's cell no longer lists it
+    _put_request(root, shown={"1": {"A": ["ob_0001", "ob_0002"], "D": [], "T": ["ob_0003", "ob_0701"]}})
+    _put_rating(root, [{"index": 1, "good": ["ob_0701"], "noise": ["ob_0002"]}])
+    return root, line
+
+
+def test_rating_a_route_id_round_trips_into_a_golden_and_a_route_rru(convert, tmp_path):
+    root, line = _route_session(tmp_path)
+    out = tmp_path / "out"
+    summary = convert.convert(root, out)
+    golden = _golden_by_id(out, f"q_{Q8}-s1.json")
+    assert golden["ob_0701"]["grading"]["relevance"] == 2  # the route-only id the agent rated good
+    assert "notes" not in golden["ob_0701"]  # surfaced by the route, not "unsurfaced"
+    assert golden["ob_0702"]["notes"] == "unshown"  # in the ledger candidates, never shown, never rated
+    assert summary["goldens_written"] == 1 and summary["steps_rated"] == 1
+
+    rru = json.loads((out / "test" / f"{TURN}-1-route-tool_recall-0.json").read_text())
+    md = rru["metadata"]
+    assert md["arm"] == "route:tool_recall" and md["armLetter"] == "T"
+    assert md["shownIds"] == ["ob_0003", "ob_0701"]  # the ledger's shown
+    assert md["missing_signals"] == ["utility"]
+    assert md["fire_key"] == ROUTE_FIRE_KEY
+    assert rru["query_text"] == "live query of tool_recall"
+    # ranking = the ledger's FULL candidate order, recorded signals carried per item
+    assert [n["id"] for n in rru["ranked_nodes"]] == ["ob_0003", "ob_0701", "ob_0702"]
+    assert [n["rank"] for n in rru["ranked_nodes"]] == [1, 2, 3]
+    assert rru["ranked_nodes"][1]["signals"]["similarity"] == 0.55
+    assert rru["ranked_nodes"][2]["signals"]["utility"] is None
+    assert "id" not in rru["ranked_nodes"][0]["signals"]
+    assert summary["test_rrus_written"] == 3  # 2 arm RRUs + 1 route RRU
+
+
+def test_arm_shown_ids_include_ids_a_route_cell_listed_once_with_also(convert, tmp_path):
+    root, _ = _route_session(tmp_path)
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    d = json.loads((out / "test" / f"{TURN}-1-tool_input.json").read_text())
+    # ob_0003 was removed from D's request cell and shown under T "·also D": D still showed it
+    assert d["metadata"]["shownIds"] == ["ob_0003"]
+    a = json.loads((out / "test" / f"{TURN}-1-thinking_tail.json").read_text())
+    assert a["metadata"]["shownIds"] == ["ob_0001", "ob_0002"]
+
+
+def test_unmatched_route_flag_is_carried_into_the_route_rru(convert, tmp_path):
+    root = _session(tmp_path)
+    _put_step(root, _step(0, {"thinking_tail": ["ob_0001"]}, blind={"A": "thinking_tail"}))
+    line = _ledger_line("tool_recall", "Read:0000000000000000", [("ob_0801", 0.5, 0.1)], ["ob_0801"])
+    _put_route_join(root, 0, [{"line": line, "letter": "T", "unmatched": True}])
+    convert.convert(root, tmp_path / "out")
+    rru = json.loads((tmp_path / "out" / "test" / f"{TURN}-0-route-tool_recall-0.json").read_text())
+    assert rru["metadata"]["unmatched"] is True
+
+
+def test_prompt_surface_route_rru_is_named_for_its_route(convert, tmp_path):
+    root = _session(tmp_path)
+    _put_step(root, _step(0, {"thinking_tail": ["ob_0001"]}, blind={"A": "thinking_tail"}))
+    line = _ledger_line("prompt_surface", "abc123", [("ob_0801", 0.5, 0.1)], ["ob_0801"])
+    _put_route_join(root, 0, [{"line": line, "letter": "R"}])
+    convert.convert(root, tmp_path / "out")
+    rru = json.loads((tmp_path / "out" / "test" / f"{TURN}-0-route-prompt_surface-0.json").read_text())
+    assert rru["metadata"]["arm"] == "route:prompt_surface" and rru["metadata"]["armLetter"] == "R"
+
+
+def test_known_arms_accept_both_route_names_and_an_unsafe_name_is_still_refused(evaluator, tmp_path):
+    assert "route:prompt_surface" in evaluator._KNOWN_ARMS
+    assert "route:tool_recall" in evaluator._KNOWN_ARMS
+    gdir, tdir, _, rru = _eval_fixture(tmp_path)
+    _write(tdir / "r.json", rru("route:tool_recall", ["ob_0001"]))
+    evaluator.evaluate(str(gdir), str(tdir), None)  # accepted, scored as an arm
+    (tdir / "r.json").unlink()
+    _write(tdir / "bad.json", rru("route:../../evil", ["ob_0001"]))
+    with pytest.raises(SystemExit) as exc:
+        evaluator.evaluate(str(gdir), str(tdir), None)
+    assert "bad.json" in str(exc.value) and "arm" in str(exc.value)
+
+
+def test_route_arms_are_reported_in_the_existing_arm_table(evaluator, tmp_path):
+    gdir, tdir, _, rru = _eval_fixture(tmp_path)
+    _write(tdir / "r.json", rru("route:prompt_surface", ["ob_0001", "ob_0002"]))
+    result = evaluator.evaluate(str(gdir), str(tdir), None)
+    assert result["arms"]["route:prompt_surface"]["n_steps"] == 1
+    assert "| route:prompt_surface |" in evaluator.render_report(result)
+
+
+# ---- the signal sweep ------------------------------------------------------
+
+SWEEP_QID = "tsweep001-s1"
+
+
+def _sweep_fixture(tmp_path: Path, cands: list[tuple], rel: dict[str, int], route="route:tool_recall"):
+    """One golden + one route test RRU. cands: (id, similarity, utility) in ledger order;
+    rel: id -> golden relevance (absent = surfaced-unmarked = 1)."""
+    gdir, tdir = tmp_path / "golden", tmp_path / "test"
+    gdir.mkdir()
+    tdir.mkdir()
+    _write(gdir / f"q_{SWEEP_QID}.json", {
+        "query_id": SWEEP_QID, "query_text": "q",
+        "ranked_candidates": [{"id": i, "grading": {"relevance": rel.get(i, 1)}} for i, _, _ in cands],
+    })
+    _write(tdir / "route.json", {
+        "query_id": SWEEP_QID, "query_text": "q",
+        "ranked_nodes": [{"id": i, "rank": r + 1, "grading": None, "notes": "",
+                          "signals": {"similarity": sim, "utility": util, "rank": r + 1}}
+                         for r, (i, sim, util) in enumerate(cands)],
+        "metadata": {"arm": route, "armLetter": "T", "status": "ok", "model": "m", "sessionId": "s"},
+    })
+    return gdir, tdir
+
+
+def _rows(result, route="route:tool_recall"):
+    return {r["setting"]: r for r in result[route]}
+
+
+def test_sweep_floor_0_5_drops_the_one_noise_item_and_p_at_5_rises(evaluator, tmp_path):
+    # ob_0901 (noise) is the ONLY candidate below similarity 0.5; at floor 0.30 it sits in the top 5
+    cands = [("ob_0901", 0.45, 0.1), ("ob_0902", 0.80, 0.1), ("ob_0903", 0.70, 0.1),
+             ("ob_0904", 0.60, 0.1), ("ob_0905", 0.55, 0.1), ("ob_0906", 0.52, 0.1)]
+    rel = {"ob_0901": 0, "ob_0902": 2, "ob_0903": 2, "ob_0904": 2, "ob_0905": 2, "ob_0906": 2}
+    gdir, tdir = _sweep_fixture(tmp_path, cands, rel)
+    result = evaluator.signal_sweep(str(gdir), str(tdir))
+    rows = _rows(result)
+    assert rows["floor 0.30"]["precision_at_k_5"] == pytest.approx(0.8)
+    assert rows["floor 0.50"]["precision_at_k_5"] == pytest.approx(1.0)
+    assert rows["floor 0.50"]["precision_at_k_5"] > rows["floor 0.30"]["precision_at_k_5"]
+    # the sweep covers 0.30 .. 0.70 in steps of 0.05
+    assert [r["setting"] for r in result["route:tool_recall"] if r["setting"].startswith("floor")] == [
+        f"floor {0.30 + 0.05 * i:.2f}" for i in range(9)]
+    assert rows["floor 0.30"]["n_steps"] == 1
+
+
+def test_sweep_formula_reorders_as_computed_by_hand(evaluator, tmp_path):
+    # 0.6*similarity + 0.4*utility, by hand:
+    #   a 0.6*0.9+0.4*0.0=0.54   b 0.6*0.5+0.4*1.0=0.70   c 0.6*0.6+0.4*0.5=0.56
+    #   d 0.6*0.8+0.4*0.0=0.48   e 0.6*0.7+0.4*0.0=0.42   g 0.6*0.4+0.4*1.0=0.64   (g starts LAST)
+    # order by formula: b 0.70, g 0.64, c 0.56, a 0.54, d 0.48, e 0.42
+    cands = [("ob_0911", 0.9, 0.0), ("ob_0912", 0.5, 1.0), ("ob_0913", 0.6, 0.5),
+             ("ob_0914", 0.8, 0.0), ("ob_0915", 0.7, 0.0), ("ob_0916", 0.4, 1.0)]
+    ordered, nulls = evaluator.rerank_by_formula(
+        [{"id": i, "similarity": s, "utility": u} for i, s, u in cands], "0.6*similarity+0.4*utility")
+    assert [c["id"] for c in ordered] == ["ob_0912", "ob_0916", "ob_0913", "ob_0911", "ob_0914", "ob_0915"]
+    assert nulls == 0
+    rel = {"ob_0916": 2}  # the one good item: last in the ledger, 2nd by the formula
+    gdir, tdir = _sweep_fixture(tmp_path, cands, rel)
+    result = evaluator.signal_sweep(str(gdir), str(tdir), formula="0.6*similarity+0.4*utility")
+    rows = _rows(result)
+    assert rows["floor 0.30"]["precision_at_k_5"] == pytest.approx(0.0)  # ledger order: good item is 6th
+    assert rows["formula 0.6*similarity+0.4*utility"]["precision_at_k_5"] == pytest.approx(0.2)
+
+
+def test_sweep_formula_naming_an_absent_signal_is_refused_naming_it(evaluator, tmp_path):
+    gdir, tdir = _sweep_fixture(tmp_path, [("ob_0921", 0.5, 0.1)], {})
+    with pytest.raises(SystemExit) as exc:
+        evaluator.signal_sweep(str(gdir), str(tdir), formula="similarity + stickiness")
+    assert "stickiness" in str(exc.value)
+
+
+def test_sweep_formula_syntax_and_calls_outside_the_allowlist_are_refused(evaluator, tmp_path):
+    gdir, tdir = _sweep_fixture(tmp_path, [("ob_0921", 0.5, 0.1)], {})
+    for bad in ("similarity +", "__import__('os').system('true')", "similarity.__class__"):
+        with pytest.raises(SystemExit):
+            evaluator.signal_sweep(str(gdir), str(tdir), formula=bad)
+
+
+def test_sweep_formula_deep_power_nesting_is_refused_and_shallow_is_allowed(evaluator, tmp_path):
+    gdir, tdir = _sweep_fixture(tmp_path, [("ob_0922", 0.5, 0.1)], {})
+    # left-nested: every exponent is a small constant, yet the value explodes with depth
+    with pytest.raises(SystemExit, match="nests"):
+        evaluator.signal_sweep(str(gdir), str(tdir), formula="((((9**10)**10)**10)**10)**10")
+    with pytest.raises(SystemExit):
+        evaluator.signal_sweep(str(gdir), str(tdir), formula="9**10**10")  # right operand not a constant
+    # three levels and the ordinary small powers still parse
+    evaluator.signal_sweep(str(gdir), str(tdir), formula="((similarity**2)**2)**2")
+    evaluator.signal_sweep(str(gdir), str(tdir), formula="similarity**2 + utility**3")
+
+
+def test_sweep_null_signal_is_zero_and_counted_in_null_signal_rows(evaluator, tmp_path):
+    cands = [("ob_0931", 0.9, None), ("ob_0932", 0.5, 0.9), ("ob_0933", 0.6, None)]
+    ordered, nulls = evaluator.rerank_by_formula(
+        [{"id": i, "similarity": s, "utility": u} for i, s, u in cands], "utility")
+    assert [c["id"] for c in ordered] == ["ob_0932", "ob_0931", "ob_0933"]  # nulls score 0, ledger order kept among ties
+    assert nulls == 2
+    gdir, tdir = _sweep_fixture(tmp_path, cands, {"ob_0932": 2})
+    rows = _rows(evaluator.signal_sweep(str(gdir), str(tdir), formula="utility"))
+    assert rows["formula utility"]["null_signal_rows"] == 2
+    assert rows["floor 0.30"]["null_signal_rows"] == 0  # similarity is recorded on every candidate
+
+
+def test_sweep_cli_prints_one_table_per_route_and_formula_needs_signal_sweep(evaluator, tmp_path):
+    gdir, tdir = _sweep_fixture(tmp_path, [("ob_0941", 0.9, 0.1), ("ob_0942", 0.4, 0.1)], {"ob_0941": 2})
+    out = tmp_path / "sweep.md"
+    assert evaluator.main(["--golden", str(gdir), "--test", str(tdir), "--out", str(out),
+                           "--signal-sweep", "--formula", "similarity"]) == 0
+    text = out.read_text()
+    assert "## route:tool_recall" in text and "null_signal_rows" in text and "floor 0.70" in text
+    with pytest.raises(SystemExit):
+        evaluator.main(["--golden", str(gdir), "--test", str(tdir), "--out", str(tmp_path / "x.md"),
+                        "--formula", "similarity"])

@@ -8,6 +8,14 @@ import {
   type Probe,
   type StepDigest,
 } from './record.ts'
+import {
+  ROUTES,
+  attachRoutes,
+  mergeRoutes,
+  parseLedger,
+  type RouteAttach,
+  type RouteLine,
+} from './route.ts'
 
 /** Leads every rating request; step.ts skips rows containing it (inContext). */
 export const REQUEST_MARKER = '[engram-probe · turn '
@@ -33,7 +41,8 @@ function stepLine(d: StepDigest, letters: string[], level: Level): string {
     if (cands.length === 0) return `${letter}: -`
     const shown = cands.map(c => {
       const s = level.summaries ? words(c.summary, 8) : ''
-      return s.length > 0 ? `${c.id} "${s}"` : c.id
+      const also = c.also !== undefined && c.also.length > 0 ? ` ·also ${c.also.join('/')}` : ''
+      return (s.length > 0 ? `${c.id} "${s}"` : c.id) + also
     })
     return `${letter}: ${shown.join(' · ')}`
   })
@@ -103,6 +112,110 @@ export function buildRequest(args: {
   return { ...last, text: last.text.slice(0, Math.max(0, maxChars)) }
 }
 
+/** A ledger whose newest line is further than this from the turn's end is probably a different clock domain. */
+const CLOCK_SKEW_MS = 6 * 3_600_000
+
+/**
+ * Seed the lower bound of the route-ledger window, once per loaded copy of the module.
+ * `newProbe` starts at 0, so without this a mod reload or a resumed session would hand
+ * the next turn every historical ledger line. Source of truth: `bound.json`
+ * (`{"ts": <turn end ms>}`), written at EVERY main-loop turn.complete, attach-less turns
+ * included. Only when it is absent (a session recorded before bound.json existed) fall back
+ * to the max `ts` among `route-joins/*.json`; neither -> stays 0.
+ */
+async function loadBound(io: Io, probe: Probe): Promise<void> {
+  if (probe.boundLoaded || probe.root === null) return
+  probe.boundLoaded = true
+  const tsOf = async (path: string): Promise<number | null> => {
+    const raw = await io.read(path)
+    const text = typeof raw === 'string' ? raw : typeof (raw as { text?: unknown } | null)?.text === 'string' ? (raw as { text: string }).text : ''
+    const ts = (JSON.parse(text) as { ts?: unknown }).ts
+    return typeof ts === 'number' && Number.isFinite(ts) ? ts : null
+  }
+  try {
+    const ts = await tsOf(`${probe.root}/bound.json`)
+    if (ts !== null) {
+      if (ts > probe.lastCompleteMs) probe.lastCompleteMs = ts
+      return
+    }
+  } catch {
+    // absent or unreadable bound.json: fall back to the join files
+  }
+  let entries: { name: string; kind: string }[]
+  try {
+    entries = await io.list(`${probe.root}/route-joins`)
+  } catch {
+    return // no route-joins directory yet: a fresh session
+  }
+  for (const entry of entries) {
+    if (!entry.name.endsWith('.json')) continue
+    try {
+      const ts = await tsOf(`${probe.root}/route-joins/${entry.name}`)
+      if (ts !== null && ts > probe.lastCompleteMs) probe.lastCompleteMs = ts
+    } catch {
+      // an unreadable join file contributes no bound
+    }
+  }
+}
+
+/**
+ * The route ledger lines (#3458) stamped inside this turn: after the last turn.complete and
+ * not after now. Read through Io.read (`$.fs.read`); a missing file is an empty ledger.
+ *
+ * Clock domain: the ledger `ts` is Python `int(time.time()*1000)` (epoch ms) and `toMs` is
+ * `$.clock.now()`. MEASURED 2026-10-06 13:47Z on the live seat: a live step file's `ts` =
+ * 1791294457121 while epoch now = 1791294503984 (47 s later), so `$.clock.now()` IS epoch
+ * ms and the two compare directly. The guard below still logs once if a ledger has lines
+ * and none are in the window while its newest `ts` is > 6 h from now.
+ */
+async function readRouteLines(io: Io, probe: Probe, fromMs: number, toMs: number): Promise<RouteLine[]> {
+  const out: RouteLine[] = []
+  for (const route of ROUTES) {
+    let raw: unknown
+    try {
+      raw = await io.read(`${probe.root}/routes/${route}.jsonl`)
+    } catch {
+      continue // no ledger for this route: the section-A hook never fired (or the probe was not live)
+    }
+    const text = typeof raw === 'string' ? raw : typeof (raw as { text?: unknown } | null)?.text === 'string' ? (raw as { text: string }).text : ''
+    const parsed = parseLedger(text, route)
+    let inWindow = 0
+    for (const line of parsed) {
+      if (line.ts > fromMs && line.ts <= toMs) {
+        out.push(line)
+        inWindow += 1
+      }
+    }
+    if (parsed.length > 0 && inWindow === 0) {
+      const newest = Math.max(...parsed.map(l => l.ts))
+      if (Math.abs(toMs - newest) > CLOCK_SKEW_MS) {
+        logOnce(io, probe, `route-clock:${route}`, `route ledger clock domain mismatch? newest ts ${newest} vs now ${toMs} (${route})`)
+      }
+    }
+  }
+  return out
+}
+
+function joinFileText(turnId: string, attaches: RouteAttach[], merged: ReturnType<typeof mergeRoutes>, ts: number): string {
+  const steps: Record<string, unknown> = {}
+  for (const a of attaches) {
+    const key = String(a.index)
+    const entry = (steps[key] ??= {
+      routeOnlyIds: merged.routeOnlyIds[key] ?? [],
+      alsoByArm: merged.alsoByArm[key] ?? {},
+      routes: [] as unknown[],
+    }) as { routes: unknown[] }
+    entry.routes.push({
+      route: a.route,
+      letter: a.letter,
+      fire_key: a.fire_key,
+      ...(a.unmatched ? { unmatched: true } : {}),
+      line: a.line,
+    })
+  }
+  return JSON.stringify({ turnId, ts, steps })
+}
+
 /** turn.complete: append ONE rating request when the main loop answered and arms ran. */
 export type CompleteNext = (e: TurnCompleteInput) => Promise<TurnCompleteResult>
 
@@ -110,6 +223,15 @@ export function turnCompleteHook(probe: Probe) {
   return async (io: Io, e: Readonly<TurnCompleteInput>, next: CompleteNext): Promise<TurnCompleteResult> => {
     const result = await next(e as TurnCompleteInput)
     if (e.agentId !== undefined || probe.root === null || probe.disabled !== null) return result
+    // the route ledger window: (previous turn's end, this turn's end]. Every main-loop
+    // turn.complete advances the bound, including a turn the probe saw no step of (it errored
+    // before its first step): its ledger lines must not attach to the NEXT turn.
+    await loadBound(io, probe)
+    const turnFromMs = probe.lastCompleteMs
+    const turnToMs = await io.now()
+    probe.lastCompleteMs = turnToMs
+    // persisted so a reload or resume keeps the bound even when no join file is ever written
+    await writeUnderRoot(io, probe, 'bound.json', JSON.stringify({ ts: turnToMs }))
     const turn = probe.turns.get(e.turnId)
     if (turn === undefined) return result
     probe.turns.delete(e.turnId)
@@ -127,11 +249,22 @@ export function turnCompleteHook(probe: Probe) {
     const waitedMs = Math.max(0, (await io.now()) - waitStart)
     const pendingTimedOut = turn.pending.length - turn.jobsDone > 0
 
-    if (turn.digests.length === 0) return result
-    const letters = Object.keys(turn.blind).sort()
+    const armLetters = Object.keys(turn.blind).sort()
+    let attaches: RouteAttach[] = []
+    try {
+      const lines = await readRouteLines(io, probe, turnFromMs, turnToMs)
+      const indexes = [...turn.digests.map(d => d.index), ...(turn.digests.length === 0 ? turn.toolKeys.map(t => t.index) : [])]
+      attaches = attachRoutes(lines, turn.toolKeys, indexes.length > 0 ? Math.min(...indexes) : 0)
+    } catch (err) {
+      logOnce(io, probe, 'route-read', `route ledger unreadable: ${String(err).slice(0, 160)}`)
+    }
+    const merged = mergeRoutes(turn.digests, attaches, armLetters)
+    if (merged.digests.length === 0) return result
+    const routeLetters = [...new Set(attaches.map(a => a.letter))].sort()
+    const letters = [...armLetters, ...routeLetters]
     const built = buildRequest({
       turnId: e.turnId,
-      digests: turn.digests,
+      digests: merged.digests,
       letters,
       topK: probe.cfg.topK,
       maxChars: probe.cfg.maxRatingChars,
@@ -171,6 +304,11 @@ export function turnCompleteHook(probe: Probe) {
         ...(pendingTimedOut ? { pendingTimedOut: true } : {}),
       }),
     )
+    // The join the converter reads (a sibling of requests/, not a rewrite of step files
+    // that are already on disk and that the rate tool checks for existence).
+    if (attaches.length > 0) {
+      await writeUnderRoot(io, probe, `route-joins/${e.turnId}.json`, joinFileText(e.turnId, attaches, merged, turnToMs))
+    }
     return result
   }
 }

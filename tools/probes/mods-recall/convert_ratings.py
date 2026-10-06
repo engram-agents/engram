@@ -3,10 +3,14 @@
 
     python3 convert_ratings.py <probeDir>/<sessionId> --out <dir> [--overwrite]
 
-Reads  <session>/steps/*.json, ratings/*.json, requests/*.json  (written by the
-engram-probe mod) and writes, under --out:
+Reads  <session>/steps/*.json, ratings/*.json, requests/*.json and (when the live
+routes were ledgered, #3458) route-joins/*.json  (written by the engram-probe mod)
+and writes, under --out:
 
     test/<turnId>-<index>-<arm>.json   one TEST RankingResultUnit per (step, arm)
+    test/<turnId>-<index>-route-<route>-<k>.json
+                                       one per live-route ledger line joined to a step
+                                       (metadata.arm "route:prompt_surface" / "route:tool_recall")
     golden/q_t<turnId8>-s<index>.json  one GOLDEN per RATED step (loader shape)
     pairs.jsonl                        unblinded A-vs-B verdicts
     summary.json                       the completeness summary (also printed)
@@ -17,8 +21,12 @@ Completeness contract: the returned / printed summary satisfies
     steps_with_arms == steps_rated + steps_unrated
     steps_total == steps_with_arms + sum(steps_skipped_by_reason.values())
     steps_terminal == steps_skipped_by_reason.get("terminal", 0)
-    test_rrus_written == sum(arms per step-with-arms) == files on disk
-or the run exits non-zero naming the mismatch. The first identity is a bookkeeping
+    test_rrus_written == sum(arms per step-with-arms) + route RRUs == files on disk
+or the run exits non-zero naming the mismatch. A step with route lines but no arms
+is "route only": counted in steps_route_only, not under steps_skipped_by_reason, and
+the first two identities then read steps_with_arms + steps_route_only. The three
+route keys (route_rrus_written, steps_route_only, route_joins_without_step) appear
+in the summary only when a route-joins file exists. The first identity is a bookkeeping
 check: by construction every step lands in exactly one bucket, so it can only fail
 if the accounting code itself is edited. The terminal identity is the independent
 one: it compares a count of rows saying `terminal` against a count of rows skipped
@@ -48,6 +56,8 @@ VERDICTS = ("better", "same", "worse")
 # truth (the mod only ever writes ids that match it); keep the two in step.
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 KNOWN_ARMS = ("thinking_full", "thinking_tail", "extract_model", "tool_input", "novel_terms")
+# The live routes the mod joins from its ledger (hooks/route.ts ROUTES): metadata.arm is "route:<name>".
+ROUTE_NAMES = ("prompt_surface", "tool_recall")
 BLIND_LETTER = re.compile(r"^[A-Z]$")
 
 
@@ -149,12 +159,80 @@ def _read_dir(session: Path, sub: str) -> list[tuple[Path, dict]]:
     return out
 
 
+def _check_route_join(path: Path, data: dict) -> dict[int, dict]:
+    """One route-joins/<turnId>.json -> {step index: entry}; refuses what could not be joined."""
+    steps = data.get("steps")
+    if not isinstance(steps, dict):
+        _die(f"convert_ratings: {path.name} field 'steps' is not an object")
+    out: dict[int, dict] = {}
+    for key, entry in steps.items():
+        try:
+            index = int(key)
+        except (TypeError, ValueError):
+            _die(f"convert_ratings: {path.name} step key {key!r} is not an integer")
+        _check_index(path, index)
+        if not isinstance(entry, dict) or not isinstance(entry.get("routes"), list):
+            _die(f"convert_ratings: {path.name} step {key} lacks a routes list")
+        for r in entry["routes"]:
+            if not isinstance(r, dict) or r.get("route") not in ROUTE_NAMES:
+                _die(f"convert_ratings: {path.name} step {key} has a route entry that does not name "
+                     f"one of {ROUTE_NAMES}")
+            line = r.get("line")
+            if not isinstance(line, dict) or not isinstance(line.get("candidates"), list) \
+                    or not all(isinstance(c, dict) and isinstance(c.get("id"), str) for c in line["candidates"]):
+                _die(f"convert_ratings: {path.name} step {key} route {r['route']} has no ledger line "
+                     "with a candidates list of {id, ...} objects")
+        out[index] = entry
+    return out
+
+
 def _arm_status(arm: dict) -> str:
     if "error" in arm:
         return "error"
     if "skipped" in arm:
         return "skipped"
     return "ok"
+
+
+def _arm_shown(shown_by_letter: dict, letter, also_by_arm: dict) -> list:
+    """The ids the request showed for an arm. An id the request listed ONCE, in a route
+    cell marked "also <letters>", was shown by every arm named there too."""
+    shown = list(shown_by_letter.get(letter, []))
+    for node_id, letters in also_by_arm.items():
+        if letter in letters and node_id not in shown:
+            shown.append(node_id)
+    return shown
+
+
+def _route_rru(entry: dict, qid: str, step: dict, session: Path) -> dict:
+    """A TEST RRU for one live-route ledger line: the ranking is the ledger's FULL candidate
+    list in the route's own order, each item carrying every recorded signal so the eval can
+    re-rank offline; shownIds is the ledger's `shown`."""
+    line = entry["line"]
+    ranked = []
+    for position, cand in enumerate(line["candidates"], start=1):
+        ranked.append({"id": cand["id"], "rank": position, "grading": None,
+                       "signals": {k: v for k, v in cand.items() if k != "id"}, "notes": ""})
+    return {
+        "query_id": qid,
+        "query_text": line.get("query") or "",
+        "ranked_nodes": ranked,
+        "metadata": {
+            "arm": f"route:{entry['route']}",
+            "armLetter": entry.get("letter"),
+            "status": "ok",
+            "ms": None, "msOverStep": None, "stepMs": _num(step.get("stepMs")),
+            "model": step.get("model"),
+            "querySource": None, "visibleChars": None, "envelope": None,
+            "sessionId": line.get("session_id") or step.get("sessionId", session.name),
+            "shownIds": list(line.get("shown") or []),
+            "missing_signals": list(line.get("missing_signals") or []),
+            "fire_key": entry.get("fire_key"),
+            "unmatched": bool(entry.get("unmatched")),
+            "cut": line.get("cut"),
+            "source": line.get("source"),
+        },
+    }
 
 
 def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
@@ -179,6 +257,15 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
     for path, data in _read_dir(session, "requests"):
         requests[_check_turn_id(path, data)] = data
 
+    # route-joins (#3458): the live routes' ledger lines the mod attached to steps at turn end
+    route_entries: dict[tuple[str, int], dict] = {}
+    for path, data in _read_dir(session, "route-joins"):
+        turn = _check_turn_id(path, data)
+        for index, entry in _check_route_join(path, data).items():
+            route_entries[(turn, index)] = entry
+    route_steps = {k for k in route_entries if k in steps}
+    route_joins_without_step = len(route_entries) - len(route_steps)
+
     turn8_owner: dict[str, str] = {}
     for turn, _ in steps:
         owner = turn8_owner.setdefault(_turn8(turn), turn)
@@ -188,6 +275,11 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
 
     def has_arms(step: dict) -> bool:
         return isinstance(step.get("arms"), dict) and bool(step["arms"]) and not step.get("skipped")
+
+    route_only = {k for k in route_steps if not has_arms(steps[k])}
+
+    def arms_of(step: dict) -> dict:
+        return step["arms"] if has_arms(step) else {}
 
     # Latest rating wins per (turnId, index): order by (ts, file name).
     def _order(item):
@@ -210,8 +302,8 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
     rated_with_arms: dict[tuple[str, int], dict] = {}
     for (turn, index), entry in rated.items():
         step = steps.get((turn, index))
-        if step is None or not has_arms(step):
-            ratings_without_step += 1  # no step-with-arms to score it against
+        if step is None or not (has_arms(step) or (turn, index) in route_steps):
+            ratings_without_step += 1  # no step-with-arms (or route lines) to score it against
             continue
         if turn not in requests:
             # The rater only ever saw what the request showed: without it the
@@ -244,16 +336,18 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
         rated_with_arms[(turn, index)] = {"good": good, "noise": noise}
 
     steps_with_arms = {k: s for k, s in steps.items() if has_arms(s)}
+    scored = {k: s for k, s in steps.items() if has_arms(s) or k in route_steps}
     # every step row that has no arms is counted under the reason it gives (a row
     # with neither arms nor a reason is "no-arms"), so steps_total is fully accounted for
     skipped_by_reason: dict[str, int] = {}
     for key, row in steps.items():
-        if key in steps_with_arms:
+        if key in scored:
             continue
         reason = str(row["skipped"]) if row.get("skipped") else "no-arms"
         skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + 1
-    steps_terminal = sum(1 for row in steps.values() if row.get("terminal") is True)
-    expected_rrus = sum(len(s["arms"]) for s in steps_with_arms.values())
+    steps_terminal = sum(1 for k, row in steps.items() if row.get("terminal") is True and k not in route_only)
+    route_rru_count = sum(len(route_entries[k]["routes"]) for k in route_steps)
+    expected_rrus = sum(len(s["arms"]) for s in steps_with_arms.values()) + route_rru_count
 
     _check_out_dir(out)
     stale = [p for p in [out / "pairs.jsonl", *(out / "test").glob("*.json"),
@@ -277,12 +371,13 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
     (out / "golden").mkdir(mode=0o700, exist_ok=True)
 
     test_written = 0
-    for (turn, index), step in sorted(steps_with_arms.items()):
+    for (turn, index), step in sorted(scored.items()):
         blind = step.get("armBlind") or {}
         letter_of = {arm: letter for letter, arm in blind.items()}
         qid = _query_id(turn, index)
         shown_by_letter = ((requests.get(turn) or {}).get("shown") or {}).get(str(index))
-        for arm_name, arm in step["arms"].items():
+        also_by_arm = (route_entries.get((turn, index)) or {}).get("alsoByArm") or {}
+        for arm_name, arm in arms_of(step).items():
             ms = _num(arm.get("ms"))
             ranked = []
             for position, cand in enumerate(arm.get("candidates") or [], start=1):
@@ -309,7 +404,7 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
                     "sessionId": step.get("sessionId", session.name),
                     # ids the request showed for this step/arm; None = no request
                     # shown-list for the step (unrated, or rated from the files)
-                    "shownIds": (shown_by_letter.get(letter_of.get(arm_name), [])
+                    "shownIds": (_arm_shown(shown_by_letter, letter_of.get(arm_name), also_by_arm)
                                  if isinstance(shown_by_letter, dict) else None),
                 },
             }
@@ -318,13 +413,25 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
                     rru["metadata"][key] = arm[key]
             _write_private(out / "test" / f"{turn}-{index}-{arm_name}.json", json.dumps(rru))
             test_written += 1
+        per_route: dict[str, int] = {}
+        routes_here = route_entries[(turn, index)]["routes"] if (turn, index) in route_steps else []
+        for entry in routes_here:
+            k = per_route.get(entry["route"], 0)
+            per_route[entry["route"]] = k + 1
+            rru = _route_rru(entry, qid, step, session)
+            _write_private(out / "test" / f"{turn}-{index}-route-{entry['route']}-{k}.json", json.dumps(rru))
+            test_written += 1
 
     goldens_written = 0
     for (turn, index), marks in sorted(rated_with_arms.items()):
-        step = steps_with_arms[(turn, index)]
+        step = scored[(turn, index)]
         surfaced: list[str] = []
-        for arm in step["arms"].values():
+        for arm in arms_of(step).values():
             for cand in arm.get("candidates") or []:
+                if cand["id"] not in surfaced:
+                    surfaced.append(cand["id"])
+        for entry in (route_entries[(turn, index)]["routes"] if (turn, index) in route_steps else []):
+            for cand in entry["line"]["candidates"]:
                 if cand["id"] not in surfaced:
                     surfaced.append(cand["id"])
         shown_by_letter = ((requests.get(turn) or {}).get("shown") or {}).get(str(index))
@@ -371,7 +478,7 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
         "steps_total": len(steps),
         "steps_with_arms": len(steps_with_arms),
         "steps_rated": len(rated_with_arms),
-        "steps_unrated": len(steps_with_arms) - len(rated_with_arms),
+        "steps_unrated": len(scored) - len(rated_with_arms),
         "steps_skipped_by_reason": skipped_by_reason,
         "steps_terminal": steps_terminal,
         "ratings_without_step": ratings_without_step,
@@ -381,15 +488,15 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
 
     # ------------------------------------------------- completeness (never silent)
     problems = []
-    if summary["steps_with_arms"] != summary["steps_rated"] + summary["steps_unrated"]:
+    if summary["steps_with_arms"] + len(route_only) != summary["steps_rated"] + summary["steps_unrated"]:
         problems.append("steps_with_arms != steps_rated + steps_unrated")
-    if summary["steps_total"] != summary["steps_with_arms"] + sum(skipped_by_reason.values()):
+    if summary["steps_total"] != summary["steps_with_arms"] + len(route_only) + sum(skipped_by_reason.values()):
         problems.append("steps_total != steps_with_arms + sum(steps_skipped_by_reason)")
     if steps_terminal != skipped_by_reason.get("terminal", 0):
         problems.append(f"steps_terminal {steps_terminal} != steps skipped as 'terminal' "
                         f"{skipped_by_reason.get('terminal', 0)} (a row says terminal without skipped=terminal, or the reverse)")
     if test_written != expected_rrus:
-        problems.append(f"test_rrus_written {test_written} != sum of arms per step-with-arms {expected_rrus}")
+        problems.append(f"test_rrus_written {test_written} != sum of arms per step-with-arms (+ route RRUs) {expected_rrus}")
     on_disk = len(list((out / "test").glob("*.json")))
     if on_disk != test_written:
         problems.append(f"{on_disk} test RRU files on disk != test_rrus_written {test_written}")
@@ -400,6 +507,10 @@ def convert(session_dir, out_dir, overwrite: bool = False) -> dict:
     if problems:
         _die("convert_ratings: completeness check FAILED: " + "; ".join(problems))
 
+    if route_entries:  # keys appear only when the live routes were ledgered (#3458)
+        summary["route_rrus_written"] = route_rru_count
+        summary["steps_route_only"] = len(route_only)
+        summary["route_joins_without_step"] = route_joins_without_step
     _write_private(out / "summary.json", json.dumps(summary, indent=2))
     return summary
 

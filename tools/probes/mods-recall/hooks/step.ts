@@ -3,6 +3,7 @@ import type { HookStream, TurnStepChunk, TurnStepInput, TurnStepResult } from 'c
 import { runArms, type ArmResult } from './arms.ts'
 import type { ArmName } from './config.ts'
 import { discoverServer, type Candidate } from './recall.ts'
+import { fireKeyVariants } from './route.ts'
 import {
   SAFE_ID,
   logOnce,
@@ -292,6 +293,8 @@ export function stepHook(probe: Probe) {
       const turn = turnState(probe, e.turnId, probe.cfg.arms)
       turn.stepsSeen += 1
       const toolArgs = obs.tools.map(t => obs.inputByBlock.get(t.index) ?? '')
+      // fire_key variants per tool call (#3458): the join key of the tool_recall route ledger
+      turn.toolKeys.push({ index: e.index, keys: obs.tools.flatMap((t, k) => fireKeyVariants(t.name, toolArgs[k] ?? '')) })
       let release: () => void = () => {}
       turn.pending.push(new Promise<void>(resolve => (release = resolve)))
       const job: StepJob = { io, probe, turn, input: e, obs, stepMs, toolArgs }

@@ -37,6 +37,8 @@ export type RigOptions = {
   modelThrows?: boolean
   /** HOME the env answers (undefined = unset) */
   home?: string | undefined
+  /** files `$.fs.read` answers, by absolute path (a path in neither this nor the writes throws, like a missing file) */
+  files?: Record<string, string>
 }
 
 export function candidateRow(id: string, extra: Record<string, unknown> = {}) {
@@ -102,6 +104,20 @@ export function rig(on: On, options: RigOptions = {}) {
     return { value: undefined }
   })
   on('fs.exists', async (_$, e) => ({ value: seen.writes.has(e.path) }))
+  on('fs.list', async (_$, e) => {
+    const dir = e.path.replace(/\/+$/, '') + '/'
+    const names = new Set<string>()
+    for (const k of [...Object.keys(options.files ?? {}), ...seen.writes.keys()]) {
+      if (k.startsWith(dir) && !k.slice(dir.length).includes('/')) names.add(k.slice(dir.length))
+    }
+    if (names.size === 0) throw new Error(`ENOENT: ${e.path}`)
+    return { value: [...names].map(name => ({ name, kind: 'file' as const })) as never }
+  })
+  on('fs.read', async (_$, e) => {
+    const text = options.files?.[e.path] ?? seen.writes.get(e.path)
+    if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
+    return { value: text as never }
+  })
   on('mcp.call', async (_$, e) => {
     seen.recallCalls.push({ server: e.server, tool: e.tool, args: e.args })
     const query = String(JSON.parse(String(e.args.payload_json)).query)
@@ -219,3 +235,55 @@ export function appended(seen: { logs: string[] }): AppendedRow[] {
       return { type: 'user', content: [{ type: 'text', text }] }
     })
 }
+
+/** The route ledger line shape of #3458 section A (only the fields the probe reads are required). */
+export function ledgerCandidate(id: string, similarity: number | null, extra: Record<string, unknown> = {}) {
+  return {
+    id,
+    type: 'observation',
+    rank: 1,
+    similarity,
+    importance_score: 0.2,
+    utility: 0.1,
+    composite_score: 0.5,
+    match_type: 'semantic',
+    recall_turn: 7,
+    created_at: '2026-10-01T00:00:00Z',
+    in_context: false,
+    ...extra,
+  }
+}
+
+export function routeLine(
+  route: 'prompt_surface' | 'tool_recall',
+  fireKey: string,
+  shown: string[],
+  extra: Record<string, unknown> = {},
+) {
+  return {
+    ts: 1_000,
+    route,
+    session_id: SESSION,
+    fire_key: fireKey,
+    query: `query of ${route}`,
+    candidates: shown.map((id, i) => ledgerCandidate(id, 0.6 - i * 0.1, { rank: i + 1 })),
+    missing_signals: [],
+    shown,
+    cut: {},
+    source: 'test',
+    ...extra,
+  }
+}
+
+/** `files` entries for a ledger: one JSON line per route line, under `<session>/routes/<route>.jsonl`. */
+export function ledgerFiles(lines: ReturnType<typeof routeLine>[]): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const l of lines) {
+    const path = `${PROBE_ROOT}/routes/${l.route}.jsonl`
+    out[path] = (out[path] ?? '') + JSON.stringify(l) + '\n'
+  }
+  return out
+}
+
+/** sha256 of {"file_path":"/a.md"} (first 16 hex), measured with python's hashlib, for the Read call chunksFor() streams. */
+export const READ_FIRE_KEY = 'Read:b2b3bcf85e6c8ba9'

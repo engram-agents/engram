@@ -15,7 +15,11 @@ export type Io = {
   now: () => Promise<number>
   after: Eng['clock']['after']
   write: (path: string, text: string) => Promise<void>
+  /** a file's text; rejects when it does not exist */
+  read: (path: string) => Promise<unknown>
   exists: (path: string) => Promise<boolean>
+  /** the entries of a directory; rejects when it does not exist */
+  list: (path: string) => Promise<{ name: string; kind: string }[]>
   /** the debug channel only; never the transcript */
   log: (text: string) => void
   /** the transcript line shown to the person (config problems) */
@@ -39,7 +43,7 @@ export type Io = {
 export type StepDigest = {
   index: number
   /** letter -> candidates in rank order (empty for a skipped/errored arm) */
-  byLetter: Record<string, { id: string; summary: string }[]>
+  byLetter: Record<string, { id: string; summary: string; also?: string[] }[]>
 }
 
 export type TurnState = {
@@ -47,6 +51,8 @@ export type TurnState = {
   /** letter -> arm name; drawn once per turn */
   blind: Record<string, ArmName>
   digests: StepDigest[]
+  /** every step's tool calls' fire_key variants (all steps, whether or not arms ran), for the route join */
+  toolKeys: { index: number; keys: string[] }[]
   /** one promise per scheduled step job; settled when its file is written */
   pending: Promise<void>[]
   /** steps whose job has been handed to the clock (arms run or skipped row) */
@@ -69,6 +75,10 @@ export type Probe = {
   /** arm C replies keyed by the prompt text (<= 3000 chars each), for the module's lifetime */
   extractCache: Map<string, string>
   logged: Set<string>
+  /** ms epoch of the last main-loop turn.complete: route ledger lines newer than this belong to the next turn */
+  lastCompleteMs: number
+  /** true once lastCompleteMs has been seeded from the route-joins already on disk (a reload or a resumed session) */
+  boundLoaded: boolean
 }
 
 export function newProbe(cfg: Config): Probe {
@@ -81,6 +91,8 @@ export function newProbe(cfg: Config): Probe {
     turns: new Map(),
     extractCache: new Map(),
     logged: new Set(),
+    lastCompleteMs: 0,
+    boundLoaded: false,
   }
 }
 
@@ -145,7 +157,7 @@ export function stepAbsPath(probe: Probe, turnId: string, index: number): string
 export function turnState(probe: Probe, turnId: string, arms: readonly ArmName[]): TurnState {
   let turn = probe.turns.get(turnId)
   if (turn === undefined) {
-    turn = { turnId, blind: drawBlind(arms), digests: [], pending: [], stepsSeen: 0, jobsDone: 0 }
+    turn = { turnId, blind: drawBlind(arms), digests: [], toolKeys: [], pending: [], stepsSeen: 0, jobsDone: 0 }
     probe.turns.set(turnId, turn)
   }
   return turn

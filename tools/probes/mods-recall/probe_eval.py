@@ -14,6 +14,11 @@ each test RRU to the ids the rating request actually SHOWED for that step/arm (t
 rater never saw the rest, so those ids are unrated, not neutral). `unshown_rate` in
 the table says how much of an arm's output sat in that unrated region.
 
+The live routes (#3458) are arms like the others: `route:prompt_surface` and
+`route:tool_recall` rows appear in the same table. --signal-sweep re-ranks each route's
+recorded candidates offline (a similarity floor sweep and an optional --formula over the
+recorded signal names) and scores p@5 per setting against the same goldens.
+
 A test RRU whose step has no golden is reported as UNRATED and never scored.
 Arms that were skipped or errored on a step (metadata.status) are excluded from
 the scores and counted in the report, so a failed arm cannot masquerade as a
@@ -22,6 +27,7 @@ zero-recall arm.
 from __future__ import annotations
 
 import argparse
+import ast
 import glob
 import json
 import math
@@ -53,7 +59,8 @@ from tools.recall_harness.rru import RankedNode, RankingResultUnit  # noqa: E402
 
 _QUERY_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
-_KNOWN_ARMS = ("thinking_full", "thinking_tail", "extract_model", "tool_input", "novel_terms")
+_KNOWN_ARMS = ("thinking_full", "thinking_tail", "extract_model", "tool_input", "novel_terms",
+               "route:prompt_surface", "route:tool_recall")
 
 TOP_K = 5  # the "top-k" the inContext / principle rates are read over (= p@5's k)
 
@@ -222,6 +229,176 @@ def evaluate(golden_dir: str, test_dir: str, pairs_path: str | None = None,
             "steps_skipped_by_reason": _skipped_by_reason(test_dir)}
 
 
+# ---------------------------------------------------------------------------
+# --signal-sweep (#3458): re-rank each live route's recorded candidates offline
+# ---------------------------------------------------------------------------
+
+FLOOR_SWEEP = [round(0.30 + 0.05 * i, 2) for i in range(9)]  # 0.30 .. 0.70
+_FORMULA_FUNCS = {"abs": abs, "min": min, "max": max, "log": math.log, "exp": math.exp, "sqrt": math.sqrt}
+_FORMULA_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow)
+
+
+_FORMULA_MAX_POW_NESTING = 3
+
+
+def _pow_depth(node) -> int:
+    """The deepest chain of `**` operators in the tree (a `**` inside either operand of another counts)."""
+    here = 1 if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow) else 0
+    return here + max((_pow_depth(c) for c in ast.iter_child_nodes(node)), default=0)
+
+
+def _parse_formula(formula: str):
+    """Validate `formula` (an arithmetic expression over signal names) and return
+    (compiled code, the signal names it uses). Refuses anything else, naming it."""
+    try:
+        tree = ast.parse(formula, mode="eval")
+    except SyntaxError as err:
+        raise SystemExit(f"probe_eval: --formula {formula!r} is not a valid expression: {err.msg}")
+    names: list[str] = []
+    if _pow_depth(tree.body) > _FORMULA_MAX_POW_NESTING:
+        raise SystemExit(f"probe_eval: --formula nests ** more than {_FORMULA_MAX_POW_NESTING} deep")
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Expression, ast.Load, ast.Add, ast.Sub, ast.Mult, ast.Div,
+                             ast.Mod, ast.Pow, ast.UAdd, ast.USub)):
+            continue
+        if isinstance(node, ast.BinOp) and isinstance(node.op, _FORMULA_BINOPS):
+            if isinstance(node.op, ast.Pow) and not (
+                    isinstance(node.right, ast.Constant) and abs(node.right.value) <= 10):
+                raise SystemExit("probe_eval: --formula may only raise to a constant power of at most 10")
+            continue
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            continue
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
+                and not isinstance(node.value, bool):
+            continue
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id in _FORMULA_FUNCS and not node.keywords:
+            continue
+        if isinstance(node, ast.Name):
+            if node.id not in _FORMULA_FUNCS and node.id not in names:
+                names.append(node.id)
+            continue
+        raise SystemExit(f"probe_eval: --formula {formula!r} uses {type(node).__name__}, which is not "
+                         f"allowed (numbers, signal names, + - * / % **, and {sorted(_FORMULA_FUNCS)})")
+    # a function name used as a bare value is not a signal either
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in _FORMULA_FUNCS:
+            parents_call = [c for c in ast.walk(tree) if isinstance(c, ast.Call) and c.func is node]
+            if not parents_call:
+                raise SystemExit(f"probe_eval: --formula {formula!r} uses the function {node.id!r} without calling it")
+    return compile(tree, "<formula>", "eval"), names
+
+
+def _num_or_none(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def rerank_by_formula(candidates: list[dict], formula: str, known: set[str] | None = None):
+    """Re-rank recorded candidates (dicts: id + signals) by `formula`, highest first, ties
+    keeping the recorded order. A signal that is null/missing/non-numeric on a candidate is
+    0 for that candidate, and the candidate is counted once in the returned null-row count.
+    `known` = the signal names that exist on at least one candidate (default: derived from
+    `candidates`); a name outside it is refused naming it."""
+    code, names = _parse_formula(formula)
+    present = known if known is not None else {k for c in candidates for k in c if k != "id"}
+    for name in names:
+        if name not in present:
+            raise SystemExit(f"probe_eval: --formula names signal {name!r}, which no recorded candidate "
+                             f"carries (recorded signals: {sorted(present)})")
+    scored = []
+    null_rows = 0
+    for position, cand in enumerate(candidates):
+        values, has_null = {}, False
+        for name in names:
+            v = _num_or_none(cand.get(name))
+            if v is None:
+                has_null = True
+            values[name] = 0 if v is None else v
+        null_rows += 1 if has_null else 0
+        try:
+            score = eval(code, {"__builtins__": {}}, {**_FORMULA_FUNCS, **values})  # noqa: S307 (validated AST)
+        except (ArithmeticError, ValueError, TypeError) as err:
+            raise SystemExit(f"probe_eval: --formula {formula!r} failed on candidate {cand.get('id')!r}: {err!r}")
+        scored.append((-score, position, cand))
+    scored.sort(key=lambda t: (t[0], t[1]))
+    return [c for _, _, c in scored], null_rows
+
+
+def _p_at_5(rru: RankingResultUnit, nodes: list[RankedNode], golden: RankingResultUnit):
+    renumbered = RankingResultUnit(
+        query_id=rru.query_id, query_text=rru.query_text, metadata=rru.metadata,
+        ranked_nodes=[RankedNode(id=n.id, rank=i, grading=n.grading, signals=n.signals, notes=n.notes)
+                      for i, n in enumerate(nodes, start=1)])
+    for name, kwargs in METRICS_TO_APPLY:
+        if metric_key(name, kwargs) == "precision_at_k_5":
+            return apply_metric(name, renumbered, golden, **_kwargs_for(name, kwargs)).get("value")
+    raise SystemExit("probe_eval: the harness no longer computes precision_at_k_5")
+
+
+def signal_sweep(golden_dir: str, test_dir: str, formula: str | None = None) -> dict:
+    """For each route arm: p@5 against the goldens with the route's recorded candidates
+    (a) as recorded, (b) cut at each similarity floor 0.30..0.70 (kept order), (c) re-ranked by
+    `formula`. Returns {route arm: [row, ...]}; a row is {setting, n_steps, precision_at_k_5,
+    null_signal_rows}. Steps without a golden are not scored."""
+    goldens = _load_goldens(golden_dir)
+    rrus = [_load_test_rru(p) for p in sorted(glob.glob(os.path.join(test_dir, "*.json")))]
+    by_route: dict[str, list[RankingResultUnit]] = defaultdict(list)
+    for rru in rrus:
+        arm = str(rru.metadata.get("arm", ""))
+        if arm.startswith("route:") and rru.query_id in goldens and rru.metadata.get("status", "ok") == "ok":
+            by_route[arm].append(rru)
+    if formula is not None:
+        _parse_formula(formula)  # a bad formula is refused even when no route has data
+    out: dict[str, list[dict]] = {}
+    for route, items in sorted(by_route.items()):
+        known = {k for r in items for n in r.ranked_nodes for k in (n.signals or {})}
+        rows: list[dict] = []
+
+        def score(settings_nodes) -> float | None:
+            vals = [_p_at_5(r, nodes, goldens[r.query_id]) for r, nodes in settings_nodes]
+            return _mean(vals)
+
+        rows.append({"setting": "as recorded", "n_steps": len(items),
+                     "precision_at_k_5": score([(r, r.ranked_nodes) for r in items]), "null_signal_rows": 0})
+        sim_nulls = sum(1 for r in items for n in r.ranked_nodes
+                        if _num_or_none((n.signals or {}).get("similarity")) is None)
+        for floor in FLOOR_SWEEP:
+            kept = [(r, [n for n in r.ranked_nodes
+                         if (_num_or_none((n.signals or {}).get("similarity")) or 0) >= floor])
+                    for r in items]
+            rows.append({"setting": f"floor {floor:.2f}", "n_steps": len(items),
+                         "precision_at_k_5": score(kept), "null_signal_rows": sim_nulls})
+        if formula is not None:
+            ranked, nulls = [], 0
+            for r in items:
+                cands = [{"id": n.id, **(n.signals or {})} for n in r.ranked_nodes]
+                ordered, n_null = rerank_by_formula(cands, formula, known)
+                nulls += n_null
+                lookup = {n.id: n for n in r.ranked_nodes}
+                ranked.append((r, [lookup[c["id"]] for c in ordered]))
+            rows.append({"setting": f"formula {formula}", "n_steps": len(items),
+                         "precision_at_k_5": score(ranked), "null_signal_rows": nulls})
+        out[route] = rows
+    return out
+
+
+def render_sweep(result: dict, formula: str | None = None) -> str:
+    lines = ["# Probe signal sweep", "",
+             "Each route's recorded candidates re-ranked offline; p@5 against the same goldens "
+             "(unrated candidates count as not relevant). A signal null on a candidate is 0 for it "
+             "and counted in null_signal_rows.", ""]
+    if formula is not None:
+        lines += [f"formula: `{formula}`", ""]
+    if not result:
+        lines += ["no route arms with goldens (nothing to sweep)", ""]
+    for route, rows in result.items():
+        lines += [f"## {route}", "", "| setting | n steps | p@5 | null_signal_rows |", "|---|---|---|---|"]
+        lines += [f"| {r['setting']} | {r['n_steps']} | {_fmt(r['precision_at_k_5'])} | {r['null_signal_rows']} |"
+                  for r in rows]
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 def _fmt(value, spec=".3f"):
     return "-" if value is None else format(value, spec)
 
@@ -292,9 +469,20 @@ def main(argv=None) -> int:
     parser.add_argument("--pairs", help="pairs.jsonl from convert_ratings.py")
     parser.add_argument("--shown-only", action="store_true",
                         help="truncate each test RRU to the ids the request showed before scoring")
+    parser.add_argument("--signal-sweep", action="store_true",
+                        help="re-rank each live route's recorded candidates (similarity floor sweep "
+                             "0.30..0.70, plus --formula) and report p@5 per setting instead of the arm table")
+    parser.add_argument("--formula",
+                        help="with --signal-sweep: a python expression over the recorded signal names, "
+                             "e.g. '0.6*similarity+0.4*utility'")
     parser.add_argument("--out", required=True, help="markdown report path")
     args = parser.parse_args(argv)
-    text = render_report(evaluate(args.golden, args.test, args.pairs, shown_only=args.shown_only))
+    if args.formula is not None and not args.signal_sweep:
+        parser.error("--formula needs --signal-sweep")
+    if args.signal_sweep:
+        text = render_sweep(signal_sweep(args.golden, args.test, args.formula), args.formula)
+    else:
+        text = render_report(evaluate(args.golden, args.test, args.pairs, shown_only=args.shown_only))
     _write_private(Path(args.out), text)
     print(text)
     return 0

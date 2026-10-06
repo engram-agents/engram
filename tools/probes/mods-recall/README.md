@@ -249,6 +249,45 @@ is first truncated to the ids the request showed for that step/arm. The table's
 (golden rows carry `notes: "unshown"`; relevance stays 1). `convert_ratings.py`
 requires `requests/<turnId>.json` for every rated turn.
 
+## Rating the live routes
+
+The two recall routes the agent already has are rated beside the arms (#3458):
+**R** = the per-prompt surface hook's `[ENGRAM Recall: ...]` block (`prompt_surface`),
+**T** = the PreToolUse hook's `[ENGRAM in-turn recall ...]` block (`tool_recall`).
+Those hooks append one JSON line per fire to the route ledger,
+`<probeDir>/<sessionId>/routes/<route>.jsonl` (written only while the probe is live
+for the session; the ledger contract is in #3458 section A). Every ranking signal is
+recorded beside each candidate at fire time, because signals such as `utility` change
+on use and cannot be recovered from the graph later.
+
+At `turn.complete` the mod reads the ledger through `$.fs.read` and keeps the lines
+stamped since the previous turn ended. A `prompt_surface` line goes to the turn's first
+rated step as letter R. A `tool_recall` line goes to the step whose tool call has the
+same `fire_key` (`tool_name:` + first 16 hex of sha256 over the tool_input JSON); a line
+matching no step goes to step 0 marked `unmatched`. An id an arm also showed on that
+step is listed once, in the route cell, marked `·also A/D`. The `rate` tool is unchanged;
+route ids rate into the same ratings file. The join is saved as
+`route-joins/<turnId>.json` (per step: the ledger lines, `routeOnlyIds`, `alsoByArm`).
+
+`convert_ratings.py` emits one test RRU per joined line (`metadata.arm` is
+`route:prompt_surface` / `route:tool_recall`, `shownIds` = the ledger's `shown`, the
+ranking = the ledger's full candidate list with each recorded signal on the item), and
+`probe_eval.py` reports both as arms in the usual table. To try ranking changes offline:
+
+```
+python3 probe_eval.py --golden <out>/golden --test <out>/test --out sweep.md --signal-sweep
+python3 probe_eval.py --golden <out>/golden --test <out>/test --out sweep.md --signal-sweep \
+    --formula "0.6*similarity+0.4*utility"
+```
+
+One table per route: p@5 for the recorded order, for a similarity floor from 0.30 to 0.70
+in steps of 0.05 (candidates below the floor dropped, order kept), and for the formula.
+A formula may use numbers, the recorded signal names, `+ - * / % **` (constant power),
+and `abs min max log exp sqrt`; a signal no candidate carries is refused by name. A
+signal that is null on a candidate counts as 0 for it and the candidate is counted in
+`null_signal_rows`. Unrated candidates count as not relevant. The sweep never touches
+the ledger or the graph.
+
 ## Tests
 
 ```
