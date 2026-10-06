@@ -711,6 +711,19 @@ jobs:
           "tests/test_engramd_read_scan.py::test_r10_roots_config_covers_every_hook_function_and_no_module_level_execute_site"
           "tests/test_engramd_read_scan.py::test_r12_committed_file_equals_a_fresh_scan_of_the_real_tree"
 
+      - name: invariant-checks — forum-service process-spawn ratchet (#3518)
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
+        # Enumerates every process spawn on the forum service's executable surface
+        # (non-test src/forum/*.py + the gate module server._load_baton_gate loads)
+        # and fails on one that is not on the allow-list, or whose allow-listed
+        # call lacks the identity kwargs. It ratchets the #3283 class (a fourth
+        # ambient gh call missed by a spec) and, like read-scan r10/r12 above, is
+        # a repo-level property a dev PR would otherwise never run (dev PRs run
+        # only this workflow). Stdlib + pytest only. Measured in a fresh venv with
+        # ONLY pytest installed: the whole file, 92 tests, ~0.5 s wall, so the
+        # file path is listed rather than node ids.
+        run: python3 -m pytest -q tests/test_forum_process_spawn_ratchet_3518.py
+
       - name: invariant-checks — health L0 set hash (MAJOR-bump gate)
         if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
         # Pins a SHA over the canonical L0 measurement set — every
