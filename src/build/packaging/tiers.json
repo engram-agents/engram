@@ -84,6 +84,10 @@
       "tier": "essential"
     },
     {
+      "path": "engram_signature.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_lifecycle.py",
       "tier": "essential"
     },
@@ -581,6 +585,10 @@
     {
       "path": "tools/dump_mcp_schema.py",
       "tier": "dev"
+    },
+    {
+      "path": "tools/engram-sign.py",
+      "tier": "essential"
     },
     {
       "path": "tools/baton.py",

@@ -3720,6 +3720,63 @@ def engram_stats(payload_json: str = "{}") -> str:
     return _stats_mod._stats_impl(mode=mode, sections=sections_param)
 
 
+# DESIGN INTENT — engram_sign (engram-alpha#3450)
+# ------------------------------------------------
+# The lineage-transparent signature: one predictable line every agent appends
+# to every EXTERNAL communication. All fields are read mechanically by
+# engram_signature.build_signature (shared with tools/engram-sign.py); any
+# unreadable field is a refusal naming the field, never a placeholder line.
+# Read-only: no graph access, no writes, no network.
+@mcp.tool(
+    name="engram_sign",
+    capability=(
+        "Return the signature line (emoji, name, model lineage, ENGRAM version, accountable "
+        "human) to append to external communications; refuses naming the field if any is unreadable."
+    ),
+    annotations={
+        "title": "Lineage-Transparent Signature Line",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_sign(payload_json: str = "{}") -> str:
+    """Build the signature line to end every external communication with.
+
+    Never hand-type the line. On a refusal, fix the named field; never
+    improvise a line.
+
+    Args:
+        payload_json: JSON object (as a string) with these optional fields:
+            session_id (str, optional): session whose transcript names the
+                running model. Default: the harness's CLAUDE_CODE_SESSION_ID in the
+                server's environment (then CLAUDE_SESSION_ID / ANTHROPIC_SESSION_ID);
+                with no id the tool refuses (session_marker) rather than guessing a marker.
+
+    Returns:
+        JSON: {"status": "ok", "line": <str>, "parts": {...}} or
+        {"status": "refused", "field": <str>, "reason": <str>}.
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+    unknown = set(params.keys()) - {"session_id"}
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     "Allowed: ['session_id']"
+        })
+    sid = params.get("session_id")
+    if sid is not None and not isinstance(sid, str):
+        return json.dumps({"error": "session_id must be a string"})
+    import engram_signature
+    res = engram_signature.build_signature(core.DATA_DIR, session_id=sid)
+    if res.ok:
+        return json.dumps({"status": "ok", "line": res.line, "parts": res.parts})
+    return json.dumps({"status": "refused", "field": res.field, "reason": res.reason})
+
+
 # DESIGN INTENT — engram_diagnose
 # -------------------------------
 # Quantitative health audit for both user + agent consumption. Side-effect-free

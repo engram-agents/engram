@@ -10274,6 +10274,35 @@ def _self_lineage() -> str:
         return ""
 
 
+def model_id_to_lineage(model_id: str) -> str:
+    """Map a harness model id to ``provider:family`` (e.g. ``anthropic:fable``);
+    ``""`` when the id does not map.
+
+    This is the code form of the model-identity gate's prose mapping in
+    ``templates/components/model-identity-gate.md`` ("map the model tag to its
+    family, compare against ``self_lineage``"): the gate stays a discipline,
+    this helper only reads. Built on ``engram_trust._parse_model_id`` (not a
+    second parser): a ``[...]`` suffix such as ``claude-opus-4-7[1m]`` is
+    stripped first, the parser must report a provider and a ``claude-`` family,
+    and the result must satisfy ``_LINEAGE_RE``. Fail-closed like
+    ``_self_lineage()``: anything else is ``""``, never a guess.
+    """
+    if not isinstance(model_id, str):
+        return ""
+    # Lazy import: engram_trust imports engram_core at module level.
+    from engram_trust import _parse_model_id
+
+    mid = re.sub(r"\[[^\]]*\]\s*$", "", model_id.strip()).strip()
+    if not mid:
+        return ""
+    parsed = _parse_model_id(mid)
+    family = parsed.get("family", "")
+    if not parsed.get("provider") or not family.startswith("claude-"):
+        return ""
+    value = f"{parsed['provider']}:{family[len('claude-'):]}"
+    return value if _LINEAGE_RE.fullmatch(value) else ""
+
+
 def _standpoint_cluster_key(
     conn: sqlite3.Connection, node_id: str
 ) -> dict | None:

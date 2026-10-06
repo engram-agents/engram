@@ -51,6 +51,7 @@ engram_scan_emergence: [Sleep-cycle] Scans for clusters that could seed a new co
 engram_set_person_lineage: Parses a model_id into provider/family/version onto a person node — a narrow patch, not a general field updater (use engram_update_person).
 engram_set_recall_summaries: Batch-writes recall_summary + recall_keywords onto EXISTING nodes — best-effort, partial failures don't roll back the batch. Accepts either inline 'summaries' or an absolute-path 'summaries_file' pointing at a JSON file of the same shape.
 engram_set_trust_tier: Sets a person's persistent trust tier. primary_user/user_family/our_side are approval-gated (requires justification + an attestation the server cannot itself verify); tier='self' is exempt via its own is_self structural attestation, not this gate.
+engram_sign: Return the signature line (emoji, name, model lineage, ENGRAM version, accountable human) to append to external communications; refuses naming the field if any is unreadable.
 engram_stats: Fixed graph-level sections (counts, confidence distribution, memory tiers) — NOT arbitrary group-bys. mode= restricts to a recent creation-time window.
 engram_supersede: Pure-wire epistemic-evolution link (old was valid-at-the-time). Does NOT create the replacement node. Not error correction — use engram_retract.
 engram_surface: Lossy 'sounds familiar' scan — IDs + compact summary only, NO full content, NO memory refresh. Use engram_query/inspect to actually read a hit.
