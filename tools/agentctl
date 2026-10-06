@@ -976,7 +976,7 @@ _codex_managed_session() {
 # `sudo -i` login shell inherits 0002). boot-env ABSENT is the normal state for
 # most seats: a true optional, silent. Present-but-unreadable is loud (one
 # stderr line) and not fatal. Printed by `agentctl __session-prologue` so the
-# tests eval the exact text the launch branches use.
+# tests run the exact text the launch branches use.
 # ONE line on purpose: `sudo -i <cmd>` backslash-escapes a newline in the command
 # string, which the login shell reads as a line continuation (joining lines).
 session_prologue_text() {

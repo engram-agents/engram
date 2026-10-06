@@ -253,8 +253,8 @@ def build_signature(data_dir: Path, session_id: str | None = None,
                 "transcript_path: the SessionStart hook did not record it")
         model_id, marketing = _read_model(Path(tp))
 
-        from engram_core import model_id_to_lineage
-        measured = model_id_to_lineage(model_id)
+        import engram_core as core
+        measured = core.model_id_to_lineage(model_id)
         if not measured:
             raise _Refusal(
                 "model_family",
