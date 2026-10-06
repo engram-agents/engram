@@ -2589,8 +2589,10 @@ def _supersede_impl(
         # linked about→old_node becomes stranded after old is marked non-current.
         # Option A: old edge stays (audit trail); a live edge is inserted on the
         # current node for each source that doesn't already point at new_node.
-        # Scope: `about` is the recall-routing person-edge. (A `cites`→person
-        # edge via context_ids is annotation-only and intentionally NOT migrated.)
+        # Scope: `about` is the recall-routing person-edge. (A context_ids
+        # reference to a person is written as `about` since #2243 — it used to
+        # be a `cites`→person edge, annotation-only and NOT migrated — so it
+        # joins this pool and migrates on person supersede.)
         # Gate on old type only — new is guaranteed the same type by the
         # type-equality validation above.
         if old["type"] == "person":

@@ -124,7 +124,7 @@ def _add_goal_impl(
     Args:
         claim: The goal statement — a desired state or direction.
         motivation: Why this goal matters — what drives it.
-        context_ids: Optional comma-separated node IDs for context. Creates cites edges.
+        context_ids: Optional comma-separated node IDs for context. Creates about edges.
 
     Returns:
         JSON with the new goal node ID.
@@ -154,10 +154,7 @@ def _add_goal_impl(
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, cid, now)
                 except sqlite3.IntegrityError:
                     pass
 
@@ -254,7 +251,7 @@ def _add_task_impl(
         description: What needs to be done — concrete and actionable.
         goal_id: The goal this task serves. Creates a 'serves' edge.
         implements_ids: Comma-separated conjecture or question IDs this task
-            addresses. Creates 'cites' edges.
+            addresses. Creates 'about' edges (cites is observation->evidence only).
         parent_task_id: If this is a subtask, the parent task ID. Creates
             a 'subtask_of' edge. Parent is auto-promoted to milestone scope.
         scope: "milestone" or "routine" (default). Milestones retain higher
@@ -308,10 +305,7 @@ def _add_task_impl(
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (iid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, iid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, iid, now)
                 except sqlite3.IntegrityError:
                     pass
 
@@ -352,7 +346,7 @@ def _add_task_impl(
         _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=TASK_IMPORTANCE["planned"])
 
         # Citation USE-bumps (alpha #177 area 4, Lei 2026-05-19 tier-2):
-        # implements_ids (cites edges) and goal_id (serves edge) are
+        # implements_ids (about edges) and goal_id (serves edge) are
         # deliberate references to existing nodes — bump as tier-2 citations.
         # Only bump goal_id if the serves edge was actually created (is_current).
         cite_targets: list[str] = []
@@ -640,7 +634,7 @@ def _report_feeling_impl(
             dimension and should leave this unset.
         context_ids: Optional comma-separated node IDs the report cites
             (e.g. an observation or exchange that precipitated it).
-            Creates 'cites' edges.
+            Creates 'about' edges (cites is observation->evidence only).
 
     Returns:
         JSON with the new feeling node ID, formatted claim, captured
@@ -753,18 +747,15 @@ def _report_feeling_impl(
             ),
         )
 
-        # Optional context_ids → 'cites' edges (new → old convention).
+        # Optional context_ids → 'about' edges (new → old convention; an ev_ id
+        # from an observation source would stay 'cites', see _insert_context_edge).
         context = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
         cited_ids: list = []
         for cid in context:
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) "
-                        "VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, cid, now)
                     cited_ids.append(cid)
                 except sqlite3.IntegrityError:
                     pass

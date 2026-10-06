@@ -120,7 +120,7 @@ def _add_person_impl(
         lineage: Agent lineage string (e.g. "anthropic:claude-sonnet"). Immutable.
         architecture: Agent architecture descriptor. Immutable.
         first_session_date: ISO date of first interaction. Immutable.
-        context_ids: Optional comma-separated node IDs. Creates cites edges
+        context_ids: Optional comma-separated node IDs. Creates about edges
                      (e.g. link to goals they serve).
         is_self: Mark this person node as the agent's own self-anchor.
                  Only one self-node should exist; subsequent attempts are rejected.
@@ -232,10 +232,7 @@ def _add_person_impl(
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, cid, now)
                 except sqlite3.IntegrityError:
                     pass
 

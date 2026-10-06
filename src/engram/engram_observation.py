@@ -1949,10 +1949,7 @@ def _add_observation_impl(
         )
 
         # Edge: observation cites evidence
-        conn.execute(
-            "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-            (node_id, evidence_id, now),
-        )
+        core._insert_cites_edge(conn, node_id, evidence_id, now)
 
         # Stamp importance
         _emb_outcome = core._stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)

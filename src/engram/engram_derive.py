@@ -170,7 +170,8 @@ def _derive_impl(
         derivation_mode: LEGACY — use reasoning_type instead. If reasoning_type is provided, this is ignored.
             Kept for backward compatibility: "chain" or "corroboration".
         context_ids: Optional comma-separated node IDs for context references (e.g. definitions).
-            Creates 'cites' edges (not 'derives_from') — these don't affect confidence computation.
+            Creates 'about' edges (not 'derives_from'; an evidence id is also 'about' here, since 'cites'
+            is observation->evidence only) — these don't affect confidence computation.
         use_stale: RETIRED (#2324) — accepted for compatibility, but it has NO EFFECT.
             A stale premise is now a hard block, and passing this flag returns a loud
             `use_stale_retired` notice on both the refusal and the success payload
@@ -736,10 +737,7 @@ def _ask_impl(
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, cid, now)
                 except sqlite3.IntegrityError:
                     pass
 

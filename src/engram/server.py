@@ -6571,7 +6571,8 @@ def engram_derive(payload_json: str) -> str:
             derivation_mode (str, optional): LEGACY — use reasoning_type instead.
                 Kept for backward compatibility: "chain" or "corroboration".
             context_ids (str, optional): Comma-separated node IDs for context
-                references (e.g. definitions). Creates 'cites' edges.
+                references (e.g. definitions). Creates 'about' edges (cites is
+                observation->evidence only).
             use_stale (bool, optional): RETIRED (#2324) — accepted for
                 compatibility, NO EFFECT. Stale is a hard block now; passing
                 this returns a loud use_stale_retired notice rather than

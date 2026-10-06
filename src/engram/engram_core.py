@@ -5591,6 +5591,60 @@ def _utility_reward(conn: sqlite3.Connection, node_ids: list[str], action: str) 
     return updated
 
 
+def _is_observation_node(conn: sqlite3.Connection, node_id: str) -> bool:
+    """True iff `node_id` exists and its `nodes.type` is in the observation
+    family (`observation_factual`, `observation_predictive`: the prefix
+    predicate, so a new `observation_*` type joins by default). A missing row
+    is not an observation."""
+    row = conn.execute("SELECT type FROM nodes WHERE id = ?", (node_id,)).fetchone()
+    return bool(row) and str(row[0]).startswith("observation_")
+
+
+def _insert_cites_edge(conn: sqlite3.Connection, source_id: str, target_id: str,
+                       now: str) -> None:
+    """The ONLY writer of relation 'cites' (#2243, Lei's ruling 2026-10-06).
+
+    `cites` carries observation -> evidence ONLY. Refuses with ValueError when
+    the target is not an `ev_` node (use 'about' for a context reference) or
+    the source row is not an observation node (read from `nodes.type`; the
+    source row must already exist, which every writer guarantees by inserting
+    its node before its edges). Writes nothing on refusal. A duplicate edge
+    raises sqlite3.IntegrityError as before; callers keep their wrapper.
+    """
+    if not str(target_id).startswith("ev_"):
+        raise ValueError(
+            "cites targets evidence nodes only; use 'about' for a context "
+            f"reference: {target_id}"
+        )
+    if not _is_observation_node(conn, source_id):
+        raise ValueError(
+            "cites carries observation->evidence only; source is not an "
+            f"observation node: {source_id}"
+        )
+    conn.execute(
+        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
+        (source_id, target_id, now),
+    )
+
+
+def _insert_context_edge(conn: sqlite3.Connection, source_id: str, target_id: str,
+                         now: str) -> None:
+    """Write a context-reference edge (`context_ids` / `implements_ids`).
+
+    `cites` only when the source is an observation AND the target is an `ev_`
+    node (delegating to `_insert_cites_edge`); everything else is `about`, a
+    non-provenance, non-DAG relation (#2243). Duplicate edges raise
+    sqlite3.IntegrityError exactly as the raw INSERTs did.
+    """
+    if str(target_id).startswith("ev_") and _is_observation_node(conn, source_id):
+        _insert_cites_edge(conn, source_id, target_id, now)
+        return
+    conn.execute(
+        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'about', ?)",
+        (source_id, target_id, now),
+    )
+
+
 def _log_edit(conn: sqlite3.Connection, action: str, node_id: str,
               node_type: str, details: dict | None = None):
     """Append an entry to the edit_history audit trail. Best-effort, never raises."""
@@ -7638,6 +7692,7 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 ).fetchall()
                 for e in serves_edges:
                     lines.append(f"Serves: {e['target_id']}")
+                # tasks are not snapshot-rendered (see test_c2_task_nodes_are_not_rendered_in_the_snapshot_at_all); a new task's implements_ids edge is `about`: add it here when tasks are rendered.
                 impl_edges = conn.execute(
                     "SELECT target_id, relation FROM edges WHERE source_id = ? AND relation IN ('cites', 'subtask_of')",
                     (n["id"],),
@@ -7669,9 +7724,10 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 incidents = [r["source_id"] for r in incident_rows]
                 if incidents:
                     lines.append(f"Incidents: {', '.join(incidents)}")
-                # Cites edges for context still flow lesson → context_node.
+                # Context edges flow lesson → context_node: `about` since #2243,
+                # `cites` for legacy rows written before it.
                 ctx_rows = conn.execute(
-                    "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'cites'",
+                    "SELECT target_id FROM edges WHERE source_id = ? AND relation IN ('cites', 'about')",
                     (n["id"],),
                 ).fetchall()
                 ctx_ids = [r["target_id"] for r in ctx_rows]
@@ -10959,7 +11015,7 @@ def _create_derivation(
     """Shared derivation-creation core for engram_derive and engram_resolve.
 
     Runs the MECH-5 premise guard, computes confidence, INSERTs the
-    derivation row, wires derives_from + cites edges, stamps the node,
+    derivation row, wires derives_from + about (context) edges, stamps the node,
     and issues utility rewards. Does NOT commit — caller owns the
     transaction boundary so resolve can append a resolves edge and
     update the target atomically.
@@ -10974,7 +11030,8 @@ def _create_derivation(
         supporting_ids: pre-validated claim-bearing premise IDs
         reasoning_type: required — caller resolves legacy derivation_mode
             → reasoning_type default before calling
-        context_ids: optional 'cites' targets; missing IDs are silently
+        context_ids: optional context targets ('about' edges; an observation
+            source naming an ev_ id keeps 'cites'); missing IDs are silently
             filtered (legacy engram_derive behavior)
         use_stale: RETIRED (#2324) — accepted, inert, and loud about it.
             NOT an opt-in: stale premises block unconditionally. Passing
@@ -11097,10 +11154,7 @@ def _create_derivation(
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    _insert_context_edge(conn, node_id, cid, now)
                     ctx_used.append(cid)
                 except sqlite3.IntegrityError:
                     pass

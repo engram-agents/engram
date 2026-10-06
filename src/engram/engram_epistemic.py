@@ -224,7 +224,7 @@ def _add_axiom_impl(
     Args:
         claim: The axiom statement (e.g. "Honesty is non-negotiable in graph construction").
         basis: Why this axiom is adopted — not a proof, but a justification.
-        context_ids: Optional comma-separated node IDs for context. Creates cites edges.
+        context_ids: Optional comma-separated node IDs for context. Creates about edges.
 
     Returns:
         JSON with the new axiom node ID and confidence (always 1.0).
@@ -253,10 +253,7 @@ def _add_axiom_impl(
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, cid, now)
                 except sqlite3.IntegrityError:
                     pass
 
@@ -342,7 +339,7 @@ def _add_definition_impl(
     Args:
         term: The term being defined (e.g. "recession").
         definition: What the term means (e.g. "Two consecutive quarters of negative GDP growth").
-        context_ids: Optional comma-separated node IDs for context. Creates cites edges.
+        context_ids: Optional comma-separated node IDs for context. Creates about edges.
         recall_summary: Always provide when you can — ≤140-char recall scent (#1952 PR1).
             Omission clean-accepts as 0 chars; soft-accepted up to 279 chars
             (flagged needs_tightening); rejected at 280+ chars.
@@ -390,10 +387,7 @@ def _add_definition_impl(
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, cid, now)
                 except sqlite3.IntegrityError:
                     pass
 
@@ -492,7 +486,7 @@ def _add_conjecture_impl(
         claim: The hypothesis (e.g. "Structured memory substitutes for model scale").
         basis: Why this conjecture is worth investigating.
         initial_confidence: Starting confidence, default 0.40, range [0.10, 0.60].
-        context_ids: Optional comma-separated node IDs for context. Creates cites edges.
+        context_ids: Optional comma-separated node IDs for context. Creates about edges.
         recall_summary: Always provide when you can — ≤140-char recall scent (#1952 PR1).
             Omission clean-accepts as 0 chars; soft-accepted up to 279 chars
             (flagged needs_tightening); rejected at 280+ chars.
@@ -551,10 +545,7 @@ def _add_conjecture_impl(
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, cid, now)
                 except sqlite3.IntegrityError:
                     pass
 
@@ -1027,7 +1018,7 @@ def _add_lesson_impl(
         reasoning_type: The type of reasoning (default: inductive_generalization).
             Most lessons are inductive: multiple incidents → general pattern.
         context_ids: Optional comma-separated node IDs for context references
-            (e.g., definitions, related derivations). Creates cites edges.
+            (e.g., definitions, related derivations). Creates about edges.
         situation_pattern: Optional regex matched against the pending Bash
             command / MCP call at action-moment by the PreToolUse tripwire
             hook (see engram_add_lesson's docstring for the exact matched
@@ -1285,16 +1276,13 @@ def _add_lesson_impl(
                 (sid, node_id, now),
             )
 
-        # Create cites edges for context
+        # Create about edges for context (#2243: cites is observation->evidence only)
         ctx = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
         for cid in ctx:
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, cid, now)
                 except sqlite3.IntegrityError:
                     pass
 
