@@ -636,7 +636,7 @@ def _scan_emergence_impl(
         self_id = None
         scope_person_id = None
         self_row = conn.execute(
-            "SELECT id FROM nodes WHERE type = 'person' AND json_extract(metadata, '$.is_self') = 1 AND is_current = 1"
+            "SELECT id FROM nodes WHERE type = 'person' AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.is_self') = 1 AND is_current = 1"
         ).fetchone()
         if self_row:
             self_id = self_row["id"]

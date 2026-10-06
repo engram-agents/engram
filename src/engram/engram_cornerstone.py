@@ -648,7 +648,7 @@ def _link_about_impl(
 
         if not person_id:
             self_row = conn.execute(
-                "SELECT id FROM nodes WHERE type = 'person' AND json_extract(metadata, '$.is_self') = 1 AND is_current = 1"
+                "SELECT id FROM nodes WHERE type = 'person' AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.is_self') = 1 AND is_current = 1"
             ).fetchone()
             if not self_row:
                 return json.dumps({

@@ -9,6 +9,33 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+- **`nodes.metadata` must now be valid JSON or NULL (#3425).** Migration rung
+  7 first quarantines every existing non-JSON blob (raw copy into the new
+  `metadata_quarantine` table, the node's `metadata` set to NULL, nothing else
+  on the node changed), then installs two triggers that refuse a non-JSON
+  `INSERT` / `UPDATE OF metadata` with `nodes.metadata must be valid JSON or
+  NULL`. Valid JSON of any shape (including non-objects) is still allowed.
+  `engram_diagnose` reports a `metadata_quarantine` finding (count, 0 when
+  none) plus `live_invalid_count` (rows invalid right now); either being
+  non-zero flares, and is the signal to read the raw blobs. The six SQL
+  `json_extract(metadata, ...)` read sites also guard with `json_valid`, so a
+  blob that slips past the triggers (restore of an old dump, a hand edit) reads
+  as NULL instead of aborting the query. The whole rung is one transaction
+  (the quarantine INSERT/UPDATE open it, so the `CREATE TRIGGER`s join it); a
+  fault rolls back to user_version 6. Only the empty `metadata_quarantine`
+  table can survive a failed rung (`CREATE TABLE IF NOT EXISTS` autocommits;
+  harmless, diagnose reports 0).
+  Known limits:
+  - `engram-pkg scope-export` on a PRE-rung-7 source DB that still holds an
+    invalid row aborts with an uncaught `IntegrityError` (the `INSERT OR
+    REPLACE` hits the guard), after `cmd_init` already created the package
+    directory.
+  - Metadata containing NaN/Infinity floats (`json.dumps` emits them,
+    `json_valid` rejects them) is now refused at write; no current writer was
+    found to produce one.
+  - `json_valid` accepts invalid UTF-8 text, which the guard and the read
+    belt cannot see (pre-existing; unreachable through Python writers).
+
 ## [v0.5.2] - 2026-09-25
 
 ### rc4 round — 2026-09-30 (fixes, the telemetry ingest, and inert EngramManager units)

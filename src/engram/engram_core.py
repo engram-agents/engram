@@ -2901,6 +2901,78 @@ def _recreate_fts_sync_triggers(
             pass
 
 
+# ── #3425: nodes.metadata must be valid JSON or NULL ───────────────────────
+# A non-JSON blob in nodes.metadata makes SQL json_extract(metadata, ...)
+# abort the WHOLE query ("malformed JSON"). It is a WRITE-path defect that
+# surfaces at read sites, so the fix is write-side: two BEFORE triggers that
+# refuse an invalid write (SQLite has no ADD CONSTRAINT; the trigger is this
+# file's existing pattern, cf. the nodes_fts_* set above). Valid JSON of ANY
+# shape stays allowed -- non-object JSON is the separate #3423 class.
+# Created at migration rung 7 and re-ensured on every startup at
+# user_version >= 7 (CREATE TRIGGER IF NOT EXISTS), so a trigger lost to a
+# hand edit or a restore is healed on the next start. Neither trigger's SQL
+# mentions nodes_fts, so engram_backup's FTS-trigger drop plan leaves them in
+# a dump and a restore keeps the guard.
+_METADATA_GUARD_MSG = "nodes.metadata must be valid JSON or NULL"
+_METADATA_GUARD_TRIGGER_NAMES = (
+    "nodes_metadata_json_guard_insert",
+    "nodes_metadata_json_guard_update",
+)
+
+
+def _ensure_metadata_json_guard_triggers(conn: sqlite3.Connection) -> None:
+    """Create the two metadata write-guard triggers (idempotent)."""
+    conn.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS nodes_metadata_json_guard_insert
+        BEFORE INSERT ON nodes
+        WHEN NEW.metadata IS NOT NULL AND NOT json_valid(NEW.metadata)
+        BEGIN
+            SELECT RAISE(ABORT, '{_METADATA_GUARD_MSG}');
+        END
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS nodes_metadata_json_guard_update
+        BEFORE UPDATE OF metadata ON nodes
+        WHEN NEW.metadata IS NOT NULL AND NOT json_valid(NEW.metadata)
+        BEGIN
+            SELECT RAISE(ABORT, '{_METADATA_GUARD_MSG}');
+        END
+        """
+    )
+
+
+def _quarantine_invalid_metadata(conn: sqlite3.Connection) -> int:
+    """Copy every invalid-JSON nodes.metadata blob to metadata_quarantine,
+    then NULL it on the node. Returns the number of rows quarantined. Does
+    NOT commit: the caller's rung owns the transaction, so a failure between
+    the copy and the NULLing rolls both back. (The `CREATE TABLE IF NOT
+    EXISTS` below autocommits; the INSERT then opens the transaction that the
+    caller's CREATE TRIGGERs must join, so this must run before them.)
+
+    Idempotent: a quarantined row has metadata NULL, so a second run finds
+    nothing to copy. Side effects of the UPDATE: it names only `metadata`,
+    and no trigger in this schema is declared on that column (the FTS
+    triggers fire on text columns / status / is_current), so nothing else
+    is rewritten. Edit history is written by Python call sites, not by a
+    trigger.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS metadata_quarantine ("
+        "node_id TEXT NOT NULL, raw TEXT, quarantined_at TEXT NOT NULL)"
+    )
+    invalid_where = "metadata IS NOT NULL AND NOT json_valid(metadata)"
+    conn.execute(
+        "INSERT INTO metadata_quarantine (node_id, raw, quarantined_at) "
+        f"SELECT id, metadata, ? FROM nodes WHERE {invalid_where}",
+        (_now(),),
+    )
+    cur = conn.execute(f"UPDATE nodes SET metadata = NULL WHERE {invalid_where}")
+    return cur.rowcount
+
+
 # ── #2181: pre-migration backup ─────────────────────────────────────────────
 # A migration-keyed binary copy taken because a migration is ABOUT TO RUN —
 # not merely whenever the agent last napped. Migration rung 4 (#2170)
@@ -3846,17 +3918,17 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     current_user_version = conn.execute("PRAGMA user_version").fetchone()[0]
 
     # _PRE_MIGRATION_LATEST_VERSION tracks the highest rung's target version
-    # below (currently rung 6 -> PRAGMA user_version = 6). No single named
+    # below (currently rung 7 -> PRAGMA user_version = 7). No single named
     # constant exists elsewhere in this function for "the latest schema
     # version" — each rung below hardcodes its own target inline — so this
     # local mirrors that existing convention rather than inventing a new
     # module-level constant this PR would be the only user of. Bump this
-    # alongside adding any future rung 7. (Mechanically checked against the
+    # alongside adding any future rung 8. (Mechanically checked against the
     # rungs' own PRAGMA user_version = N literals by
     # test_2181_pre_migration_latest_version_constant_matches_max_rung_target
     # — forgetting the bump fails loudly at test time instead of silently
     # skipping the new rung's backup.)
-    _PRE_MIGRATION_LATEST_VERSION = 6
+    _PRE_MIGRATION_LATEST_VERSION = 7
 
     # See _take_pre_migration_backup_if_pending's docstring for the full
     # contract (what True/False mean, why the failure posture is inverted
@@ -4572,6 +4644,57 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                 "[_run_db_one_time_setup] migration 6 (#2742 rewrite-resync "
                 "trigger version bump) FAILED, will retry on next startup: "
                 f"{_migration6_err!r}",
+                file=sys.stderr,
+            )
+
+    # Migration version 7 (#3425): nodes.metadata must be valid JSON or NULL.
+    # Quarantine the existing invalid rows (raw blob copied to
+    # metadata_quarantine, then metadata set to NULL), then install the write
+    # guard. WHY THIS ORDER (it is NOT that invalid rows would block the
+    # triggers: the NULLing UPDATE has NEW.metadata IS NULL, so the trigger
+    # WHEN is false either way): Python sqlite3 opens its implicit transaction
+    # only before DML. The INSERT..SELECT / UPDATE must therefore run BEFORE
+    # the CREATE TRIGGERs so the DDL joins that transaction; with the triggers
+    # first, CREATE TRIGGER autocommits and a later fault would leave both
+    # guards installed at user_version 6. Done in this order, a failure
+    # anywhere rolls back the copy, the NULLing and the triggers, leaves
+    # user_version at 6, and the rung retries on the next start. One residue:
+    # `CREATE TABLE IF NOT EXISTS metadata_quarantine` itself autocommits, so
+    # an EMPTY quarantine table can survive a failed rung (harmless: IF NOT
+    # EXISTS, and engram_diagnose reports 0). engram_diagnose reports the
+    # quarantine row count and the live invalid count.
+    if _rung_ready(conn, 7, _pre_migration_backup_ok):
+        try:
+            _mq_count = _quarantine_invalid_metadata(conn)
+            _ensure_metadata_json_guard_triggers(conn)
+            conn.execute("PRAGMA user_version = 7")
+            conn.commit()
+            if _mq_count:
+                print(
+                    "[_run_db_one_time_setup] migration 7 (#3425): quarantined "
+                    f"{_mq_count} node(s) with non-JSON metadata into "
+                    "metadata_quarantine (raw blob kept, metadata set to NULL).",
+                    file=sys.stderr,
+                )
+        except sqlite3.DatabaseError as _migration7_err:
+            conn.rollback()
+            print(
+                "[_run_db_one_time_setup] migration 7 (#3425 metadata JSON "
+                "write guard + quarantine) FAILED, will retry on next "
+                f"startup: {_migration7_err!r}",
+                file=sys.stderr,
+            )
+
+    # Self-heal: at user_version >= 7 the guard must exist. Re-created every
+    # startup (IF NOT EXISTS) so a trigger lost to a hand edit is restored.
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 7:
+        try:
+            _ensure_metadata_json_guard_triggers(conn)
+            conn.commit()
+        except sqlite3.DatabaseError as _mdg_err:
+            print(
+                "[_run_db_one_time_setup] metadata JSON guard self-heal "
+                f"FAILED: {_mdg_err!r}",
                 file=sys.stderr,
             )
 

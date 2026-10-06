@@ -141,7 +141,7 @@ def _add_person_impl(
     try:
         if is_self:
             existing = conn.execute(
-                "SELECT id FROM nodes WHERE type = 'person' AND json_extract(metadata, '$.is_self') = 1 AND is_current = 1"
+                "SELECT id FROM nodes WHERE type = 'person' AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.is_self') = 1 AND is_current = 1"
             ).fetchone()
             if existing:
                 return json.dumps({
@@ -848,7 +848,7 @@ def _set_person_lineage_impl(target_pn: str = "", model_id: str = "") -> str:
         if not target_pn or not target_pn.strip():
             row = conn.execute(
                 "SELECT id, metadata FROM nodes "
-                "WHERE type='person' AND json_extract(metadata,'$.is_self')=1 AND is_current=1"
+                "WHERE type='person' AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.is_self')=1 AND is_current=1"
             ).fetchone()
             if not row:
                 return json.dumps({

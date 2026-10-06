@@ -3856,6 +3856,18 @@ def engram_diagnose() -> str:
           pairs that exceeded thresholds in the 7-day window — may be >
           worst_hours_shown if more than 10 buckets are flagged. See
           the cornerstone-evolution derivation/the cornerstone-evolution derivation/the cornerstone-frame-evolution open question for context.
+
+        - metadata_quarantine (#3425): ALWAYS present, 0 included.
+          {entity_kind, count, live_invalid_count, sample_ids, flare}.
+          count = ROWS in the metadata_quarantine table (migration rung 7
+          copied the raw blob of every node whose nodes.metadata was not valid
+          JSON there and set the node's metadata to NULL; a node re-quarantined
+          after a restore counts twice). sample_ids = DISTINCT node ids
+          (<= 10). live_invalid_count = nodes whose metadata is invalid RIGHT
+          NOW (slipped past the write guard). flare is true when EITHER count
+          is > 0 -- zero-or-investigate. To close the finding: review the raw
+          blobs in metadata_quarantine, then DELETE the reviewed rows and fix
+          or null any live invalid blob; flare clears when both counts are 0.
     """
     return _stats_mod._diagnose_impl()
 

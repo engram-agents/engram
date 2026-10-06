@@ -868,6 +868,42 @@ def _diagnose_impl() -> str:
         # conformance — no severity, no scoring, no acknowledged state.
         metrics["dag_conformance"] = _dag_conformance_mod.check_dag_conformance(conn)
 
+        # ── Metadata quarantine (#3425) ────────────────────────────────────
+        # Rows whose nodes.metadata was NOT valid JSON, quarantined by
+        # migration rung 7 (raw blob kept in metadata_quarantine, the node's
+        # metadata set to NULL). Always present, 0 included -- silence must be
+        # distinguishable from health, so a missing table reports count 0
+        # rather than omitting the key. Same zero-or-investigate shape as the
+        # conformance blocks above: non-zero count => flare True.
+        try:
+            _mq_count = conn.execute(
+                "SELECT COUNT(*) FROM metadata_quarantine"
+            ).fetchone()[0]
+            _mq_ids = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT DISTINCT node_id FROM metadata_quarantine "
+                    "ORDER BY node_id LIMIT 10"
+                ).fetchall()
+            ]
+        except sqlite3.OperationalError:  # table absent: nothing quarantined
+            _mq_count, _mq_ids = 0, []
+        # live_invalid_count: rows that are invalid RIGHT NOW (slipped past
+        # the guard: restore of an old dump, hand edit, guard dropped). The
+        # read belt turns them into NULL fields silently, so this count is
+        # what keeps that from being a default that hides a failed read.
+        _mq_live = conn.execute(
+            "SELECT COUNT(*) FROM nodes "
+            "WHERE metadata IS NOT NULL AND NOT json_valid(metadata)"
+        ).fetchone()[0]
+        metrics["metadata_quarantine"] = {
+            "entity_kind": "node",
+            "count": _mq_count,
+            "live_invalid_count": _mq_live,
+            "sample_ids": _mq_ids,
+            "flare": _mq_count > 0 or _mq_live > 0,
+        }
+
         # ── Agent Experience ─────────────────────────────────────────────
         experience: dict = {}
 
@@ -1198,7 +1234,7 @@ def _diagnose_impl() -> str:
         # that file describes concepts by label without cs_ identifiers.
         try:
             cs_rows = conn.execute(
-                "SELECT id, claim, json_extract(metadata, '$.tag') AS tag"
+                "SELECT id, claim, json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.tag') AS tag"
                 " FROM nodes WHERE type='cornerstone' AND is_current=1"
                 " ORDER BY id"
             ).fetchall()

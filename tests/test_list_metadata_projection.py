@@ -53,8 +53,14 @@ def env():
         })))
         assert "observation_id" in r, r
         ids[name] = r["observation_id"]
-    from engram_core import _get_db
+    from engram_core import _get_db, _METADATA_GUARD_TRIGGER_NAMES
     conn = _get_db()
+    # #3425: the write guard now refuses a non-JSON blob. These cells test the
+    # READ path against a legacy blob that slipped past the guard (a restore of
+    # an old dump, a hand edit), so the fixture drops the guard to plant one.
+    for _guard in _METADATA_GUARD_TRIGGER_NAMES:
+        conn.execute(f"DROP TRIGGER IF EXISTS {_guard}")
+    conn.commit()
 
     def setmeta(nid, text):
         conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (text, nid))
