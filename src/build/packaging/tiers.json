@@ -725,6 +725,10 @@
       "tier": "dev"
     },
     {
+      "path": "tools/cites_step3.py",
+      "tier": "dev"
+    },
+    {
       "path": "tools/run_touched_tests.py",
       "tier": "dev"
     },

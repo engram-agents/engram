@@ -497,6 +497,12 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/cites_step3.py",
+      "test_globs": [
+        "tests/test_cites_step3_2243.py"
+      ]
+    },
+    {
       "path_prefix_or_glob": "tools/build-plugin.sh",
       "test_globs": [
         "tests/test_build_plugin_hooks_consistency.py",
