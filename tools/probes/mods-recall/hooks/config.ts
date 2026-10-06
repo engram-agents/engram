@@ -27,7 +27,7 @@ export type Config = {
 export const DEFAULTS: Config = {
   enabled: true,
   topK: 5,
-  minQueryChars: 200,
+  minQueryChars: 0,
   querySource: 'auto',
   arms: [...ALL_ARMS],
   extractModel: 'haiku',

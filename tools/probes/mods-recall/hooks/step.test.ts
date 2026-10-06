@@ -39,7 +39,7 @@ test('T1 passthrough: 7 chunks in order, payloads and result unchanged', async (
   expect(stepFiles(seen).length).toBe(1)
 })
 
-test('T2 minQueryChars gate: short material -> skipped row and ZERO recall calls', async ($, on) => {
+test('T2 minQueryChars gate: short material -> skipped row and ZERO recall calls', { options: { minQueryChars: 200 } }, async ($, on) => {
   const { clock, seen } = rig(on)
   // a tool call with NO arguments text: blank proxy material AND blank tool arguments
   engineStep(on, blankStepChunks('too short'))
@@ -239,11 +239,11 @@ test('invalid options fall back to the default for that key only, and say so', {
   await drain($.turn.step(STEP_INPUT))
   await flush(clock)
   expect(seen.logs.some(l => l.includes('topK=99') && l.includes('using default 5'))).toBe(true)
-  expect(seen.logs.some(l => l.includes('minQueryChars=-5') && l.includes('using default 200'))).toBe(true)
+  expect(seen.logs.some(l => l.includes('minQueryChars=-5') && l.includes('using default 0'))).toBe(true)
   expect(seen.logs.some(l => l.includes('unknown arm'))).toBe(true)
-  // minQueryChars fell back to 200, so this short thinking is skipped; arms = only the valid one
+  // minQueryChars fell back to the default 0, so this short thinking is NOT skipped; arms = only the valid one
   const row = stepFile(seen, TURN, 0)!
-  expect(row.skipped).toBe('short-material')
+  expect(row.skipped).toBeUndefined()
   expect(Object.values(row.armBlind)).toEqual(['thinking_tail'])
 })
 
@@ -428,7 +428,7 @@ test('thinking at or above the threshold: querySource thinking', async ($, on) =
   expect(row.arms.thinking_full.query).toContain('recall probe')
 })
 
-test('both thinking and answer short, zero tool calls (visible mode): terminal, zero recall calls', async ($, on) => {
+test('both thinking and answer short, zero tool calls (visible mode): terminal, zero recall calls', { options: { minQueryChars: 200 } }, async ($, on) => {
   const { clock, seen } = rig(on)
   engineStep(on, [
     { kind: 'thinking', index: 0, text: 'hmm' },
@@ -665,4 +665,68 @@ test('T-N5b arm C detail: 1000-char field cut to 400 + ellipsis; a text field ne
   expect(detail.length).toBe(401)
   expect(detail.endsWith('…')).toBe(true)
   expect(detail).not.toContain('SHOULD_NOT_APPEAR')
+})
+
+// Floor 0 / auto fallback (#3362 part; Sol, 2026-10-05): with minQueryChars 0 an empty
+// thinking must still fall back to the visible narration.
+const NARRATION = 'Checking the narration channel. '.repeat(10).slice(0, 300) // 300 chars
+const autoChunks = (thinking: string, narration: string) => [
+  ...(thinking === '' ? [] : [{ kind: 'thinking' as const, index: 0, text: thinking }]),
+  { kind: 'text' as const, index: 1, text: narration },
+  { kind: 'tool' as const, index: 2, id: 'toolu_1', name: 'Read' },
+  { kind: 'input' as const, index: 2, json: '{"file_path":"/' + 'a'.repeat(200) + '"}' },
+  { kind: 'stop' as const, stopReason: 'tool_use' as const, usage: null },
+]
+
+test('C1 auto, floor 0, EMPTY thinking: falls back to the visible narration as proxy material', { options: { querySource: 'auto', minQueryChars: 0 } }, async ($, on) => {
+  const { clock, seen } = rig(on)
+  engineStep(on, autoChunks('', NARRATION))
+  await $.session.start(START)
+  await drain($.turn.step(STEP_INPUT))
+  await flush(clock)
+  const row = stepFile(seen, TURN, 0)!
+  expect(NARRATION.length).toBe(300)
+  expect(row.querySource).toBe('visible')
+  expect(row.proxyChars).toBe(NARRATION.length)
+  expect(row.arms.thinking_full.query).toContain('Checking the narration channel.')
+})
+
+test('C2 auto, floor 0, whitespace-only thinking: still visible (the trim is load-bearing)', { options: { querySource: 'auto', minQueryChars: 0 } }, async ($, on) => {
+  const { clock, seen } = rig(on)
+  engineStep(on, autoChunks('   \n', NARRATION))
+  await $.session.start(START)
+  await drain($.turn.step(STEP_INPUT))
+  await flush(clock)
+  const row = stepFile(seen, TURN, 0)!
+  expect(row.querySource).toBe('visible')
+  expect(row.proxyChars).toBe(NARRATION.length)
+})
+
+test('C3 auto, floor 0, 2-char thinking: non-empty thinking wins even when tiny', { options: { querySource: 'auto', minQueryChars: 0 } }, async ($, on) => {
+  const { clock, seen } = rig(on)
+  engineStep(on, autoChunks('ok', NARRATION))
+  await $.session.start(START)
+  await drain($.turn.step(STEP_INPUT))
+  await flush(clock)
+  const row = stepFile(seen, TURN, 0)!
+  expect(row.querySource).toBe('thinking')
+  expect(row.proxyChars).toBe(2)
+})
+
+test('C4 auto, floor 200, 150-char thinking, 500-char narration: the floor still governs when > 1', { options: { querySource: 'auto', minQueryChars: 200 } }, async ($, on) => {
+  const { clock, seen } = rig(on)
+  engineStep(on, autoChunks('t'.repeat(150), 'N'.repeat(500)))
+  await $.session.start(START)
+  await drain($.turn.step(STEP_INPUT))
+  await flush(clock)
+  const row = stepFile(seen, TURN, 0)!
+  expect(row.querySource).toBe('visible')
+  expect(row.proxyChars).toBe(500)
+})
+
+// The manifest half of "DEFAULTS and plugin.json agree" cannot run here: the hooks sandbox
+// imports only .ts/.js files, so plugin.json is unreadable from a test cell (measured
+// 2026-10-06: JSON import and node:fs import are both refused). Keep the two in step by hand.
+test('C5 DEFAULTS.minQueryChars is 0 (plugin.json userConfig default is 0 too: not checkable from here)', async () => {
+  expect(DEFAULTS.minQueryChars).toBe(0)
 })

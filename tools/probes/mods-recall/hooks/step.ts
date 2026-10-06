@@ -168,7 +168,10 @@ async function stepJob(job: StepJob): Promise<void> {
   // blocks with (almost) no text.
   const useThinking =
     cfg.querySource === 'thinking' ||
-    (cfg.querySource === 'auto' && thinking.length >= cfg.minQueryChars)
+    // trimmed, and never below 1: with minQueryChars 0 an EMPTY thinking must still
+    // fall back to the visible narration (Sol, 2026-10-05: floor 0 had turned the
+    // fallback off and made every step read querySource 'thinking' with a blank proxy).
+    (cfg.querySource === 'auto' && thinking.trim().length >= Math.max(1, cfg.minQueryChars))
   // Proxy material: what the thinking-proxy arms (A, B, C, E) query: the thinking
   // (thinking mode) or the step's answer text ONLY (visible mode). Tool-call
   // arguments are arm D's material, never part of it. That also keeps arm C (the

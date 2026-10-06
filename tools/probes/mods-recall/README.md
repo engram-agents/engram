@@ -154,7 +154,7 @@ Measured live on Claude Code 2.1.289 with claude-fable-5-1: over 5 steps the eng
 reported thinkingChars 0, 278, 0, 0, 0 (1-2 thinking blocks each) and the transcript's
 own thinking blocks were empty. A thinking-only probe measured nothing there. So the
 query source is a choice, `querySource`: `thinking`; `visible`; or `auto` (the default:
-thinking when it has at least `minQueryChars`, else visible).
+thinking when its trimmed length is at least `max(1, minQueryChars)`, else visible).
 
 ### Query material: proxy material vs tool arguments
 

@@ -65,7 +65,7 @@ test('T5 a turn that did not end in an answer appends nothing', async ($, on) =>
   expect(appended(seen).length).toBe(0)
 })
 
-test('T5 a turn whose steps were all skipped appends nothing', async ($, on) => {
+test('T5 a turn whose steps were all skipped appends nothing', { options: { minQueryChars: 200 } }, async ($, on) => {
   const r = rig(on)
   engineStep(on, blankStepChunks())
   await $.session.start(START)

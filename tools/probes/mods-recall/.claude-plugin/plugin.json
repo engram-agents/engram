@@ -22,12 +22,12 @@
       "type": "number",
       "title": "Min query chars",
       "description": "Thinking-proxy arms (A, B, C, E) run only when the proxy material (thinking, or the answer text in visible mode) has at least this many chars; a step with no proxy material and no tool arguments, or a terminal step, gets a skipped row and no arm runs.",
-      "default": 200
+      "default": 0
     },
     "minThinkingChars": {
       "type": "number",
       "title": "Min thinking chars (deprecated alias)",
-      "description": "Old name of minQueryChars; used when minThinkingChars is set and minQueryChars is at its default (200)."
+      "description": "Old name of minQueryChars; used when minThinkingChars is set and minQueryChars is at its default (0)."
     },
     "querySource": {
       "type": "string",
