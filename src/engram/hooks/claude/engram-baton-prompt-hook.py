@@ -14,11 +14,11 @@ explicit current-state field in the file, read fresh each prompt. No
 surfaced/read cursor mechanism needed; the baton file IS the state.
 
 Anti-patterns guarded:
-  - Forum-configured guard (#2857 step 1): if no forum.url/agent_name is set
-    in config.json, exits silently. Installs with no forum configured see
-    zero behavior change. (Previously gated on config.json mode == 'multi' —
-    baton is symmetric for any agent once a forum is configured, regardless
-    of host topology.)
+  - Forum-configured guard (#2857 step 1): if no forum.url is set in
+    config.json (agent_name alone does not count), exits silently. Installs
+    with no forum configured see zero behavior change. (Previously gated on
+    config.json mode == 'multi' — baton is symmetric for any agent once a
+    forum is configured, regardless of host topology.)
   - No LLM calls, no DB — one forum API call (+ optional gh calls) only.
     Per-gh-call timeout 4s; worst case one gh call per in-court baton on a
     full cache miss (N_batons calls). The 30s-TTL status cache makes the
@@ -511,15 +511,21 @@ def _get_live_status(anchor: str, cache: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _is_forum_configured(config: dict) -> bool:
-    """Return True if forum is explicitly configured (url or agent_name set).
+    """Return True if a forum is configured: ``forum.url`` is a non-empty string.
 
-    Silent no-op gate: if neither forum.url nor agent_name is in config, skip
-    the hook to avoid noise on non-forum installs.
+    Silent no-op gate: no ``forum.url`` -> skip the hook, so an install with no
+    forum server never reports one as unreachable. ``agent_name`` alone is this
+    agent's identity, not forum configuration, and does not pass the gate;
+    neither does the ``FORUM_URL`` env var by itself. Total: any other shape
+    (non-dict ``forum``, non-string or blank ``url``) is "not configured".
     """
-    forum_cfg = config.get("forum", {})
-    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
-    has_agent = bool(config.get("agent_name", "").strip())
-    return has_url or has_agent
+    if not isinstance(config, dict):
+        return False
+    forum_cfg = config.get("forum")
+    if not isinstance(forum_cfg, dict):
+        return False
+    url = forum_cfg.get("url")
+    return isinstance(url, str) and bool(url.strip())
 
 
 def _fetch_active_projects(config: dict) -> list:
@@ -761,7 +767,7 @@ def main() -> None:
     # Even if agent_name is empty, filtering returns nothing (no turn match).
 
     # ── Forum-configured gate ────────────────────────────────────────────────
-    # Pure-API: no forum configured (no forum.url, no agent_name), or a missing
+    # Pure-API: no forum configured (no forum.url), or a missing
     # forum_api import, exit silently — zero behavior change, and no local-FS
     # fallback.
     if not _FORUM_API_OK or not _is_forum_configured(config):

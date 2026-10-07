@@ -141,10 +141,14 @@ def _write_config(
 
     agent_name=None omits the agent_name field entirely (for the
     no-forum-configured gate tests); forum_url, if given, sets forum.url.
+    #3546: agent_name alone no longer configures a forum, so a config that
+    names an agent also gets a (never-contacted: the fetch is stubbed) forum.url.
     """
     cfg = {"mode": mode}
     if agent_name is not None:
         cfg["agent_name"] = agent_name
+        if forum_url is None:
+            forum_url = "http://127.0.0.1:5002"
     if forum_url is not None:
         cfg["forum"] = {"url": forum_url}
     (engram_home / "config.json").write_text(json.dumps(cfg))

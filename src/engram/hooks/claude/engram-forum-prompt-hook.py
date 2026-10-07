@@ -64,7 +64,7 @@ once per 1800 s via the shared stamp (_hooklib.probe_notice_due /
 mark_probe_notice); it reappears after the window while the condition lasts.
 
 Silent no-op conditions:
-  - forum.url and agent_name not configured.
+  - forum.url not configured (agent_name alone does not count).
   - No new threads since last prompt and no pending @mentions (and no unknown
     state to report inside its rate-limit window).
   - Inbox endpoint absent (HTTP 404) -> known-empty, no line.
@@ -521,15 +521,21 @@ def _get_forum_url(config: dict) -> str:
 
 
 def _is_forum_configured(config: dict) -> bool:
-    """Return True if forum is explicitly configured (url or agent_name set).
+    """Return True if a forum is configured: ``forum.url`` is a non-empty string.
 
-    Silent no-op gate: if neither forum.url nor agent_name is in config, skip
-    the hook to avoid noise on non-forum installs.
+    Silent no-op gate: no ``forum.url`` -> skip the hook, so an install with no
+    forum server never reports one as unreachable. ``agent_name`` alone is this
+    agent's identity, not forum configuration, and does not pass the gate;
+    neither does the ``FORUM_URL`` env var by itself. Total: any other shape
+    (non-dict ``forum``, non-string or blank ``url``) is "not configured".
     """
-    forum_cfg = config.get("forum", {})
-    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
-    has_agent = bool(config.get("agent_name", "").strip())
-    return has_url or has_agent
+    if not isinstance(config, dict):
+        return False
+    forum_cfg = config.get("forum")
+    if not isinstance(forum_cfg, dict):
+        return False
+    url = forum_cfg.get("url")
+    return isinstance(url, str) and bool(url.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -1131,7 +1137,8 @@ def main() -> None:
         sys.exit(0)
 
     # ── Silent no-op gate ────────────────────────────────────────────────────
-    # If forum isn't configured (neither url nor agent_name in config), skip.
+    # If forum isn't configured (no forum.url in config), skip: no output, no
+    # file, no connection.
     if not _is_forum_configured(config):
         sys.exit(0)
 

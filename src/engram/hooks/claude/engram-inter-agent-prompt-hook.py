@@ -25,7 +25,8 @@ group-summarize with a "+ N older from <senders>" line.
 
 Anti-patterns guarded:
   - Forum-configured gate is the first check (#2857 step 1) — installs with
-    no forum.url/agent_name set see exactly zero behavior change.
+    forum.url set (agent_name alone does not count) see exactly zero
+    behavior change.
     (Previously gated on config.json mode == 'multi' — the DM feed is
     symmetric for any agent once a forum is configured, regardless of host
     topology.)
@@ -151,17 +152,23 @@ def _get_agent_name(config: Optional[dict] = None) -> str:
 
 
 def _is_forum_configured(config: Optional[dict] = None) -> bool:
-    """Return True if forum is explicitly configured (url or agent_name set).
+    """Return True if a forum is configured: ``forum.url`` is a non-empty string.
 
-    Silent no-op gate: if neither forum.url nor agent_name is in config, skip
-    the hook to avoid noise on non-forum installs.
+    Silent no-op gate: no ``forum.url`` -> skip the hook, so an install with no
+    forum server never reports one as unreachable. ``agent_name`` alone is this
+    agent's identity, not forum configuration, and does not pass the gate;
+    neither does the ``FORUM_URL`` env var by itself. Total: any other shape
+    (non-dict ``forum``, non-string or blank ``url``) is "not configured".
     """
     if config is None:
         config = _load_config()
-    forum_cfg = config.get("forum", {})
-    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
-    has_agent = bool(config.get("agent_name", "").strip())
-    return has_url or has_agent
+    if not isinstance(config, dict):
+        return False
+    forum_cfg = config.get("forum")
+    if not isinstance(forum_cfg, dict):
+        return False
+    url = forum_cfg.get("url")
+    return isinstance(url, str) and bool(url.strip())
 
 
 # ---------------------------------------------------------------------------

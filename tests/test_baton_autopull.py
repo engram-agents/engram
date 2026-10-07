@@ -103,7 +103,9 @@ def _ts(offset_minutes: int) -> datetime:
 
 def _write_config(engram_home: Path, agent_name: str = "ariadne") -> None:
     """Write a minimal multi-agent config.json into engram_home."""
-    cfg = {"mode": "multi", "agent_name": agent_name}
+    # #3546: a forum is configured by forum.url, not by agent_name alone.
+    cfg = {"mode": "multi", "agent_name": agent_name,
+           "forum": {"url": "http://127.0.0.1:5002"}}
     (engram_home / "config.json").write_text(json.dumps(cfg))
 
 
@@ -666,7 +668,8 @@ def test_tools_resolution_in_flattened_deployed_topology(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     (home / "config.json").write_text(
-        json.dumps({"mode": "multi", "agent_name": "ariadne"})
+        json.dumps({"mode": "multi", "agent_name": "ariadne",
+                    "forum": {"url": "http://127.0.0.1:5002"}})
     )
     env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
     env["ENGRAM_HOME"] = str(home)
