@@ -86,6 +86,7 @@ import os
 import re
 import stat
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -593,54 +594,112 @@ def _scrub_gh_detail(text: str) -> str:
     return text.replace(tok, "***")
 
 
-def _pr_ci_state(pr_number: str, repo: str) -> tuple:
-    """Query GitHub CI state for a pull request via `gh`.
+# ---------------------------------------------------------------------------
+# CI state from workflow runs (#3533)
+#
+# GitHub's fine-grained PAT UI has no "Checks" permission, so under the forum
+# service's token `gh pr view --json statusCheckRollup` is refused with
+# "Resource not accessible by personal access token".  The same token (Pull
+# requests, Commit statuses, Actions, Metadata: Read) CAN read the workflow runs
+# of a head commit, which carry the same conclusions, superseded runs included.
+# Every mapping below fails closed: only a completed run whose conclusion is
+# exactly "success" is green, and anything unestablished is unknown or pending.
+# ---------------------------------------------------------------------------
 
-    Returns (state, detail) where state is one of:
-      "green"   — all checks passed (or no checks registered)
-      "red"     — at least one check failed
-      "pending" — no failure, but at least one check still running
-      "unknown" — could not obtain a verdict (degraded; advisory only)
+_RUNS_FALLTHROUGH_MARKER = "resource not accessible by personal access token"
+_HEAD_OID_RE = re.compile(r"[0-9a-f]{40}")
+_REPO_SLUG_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_RUN_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_RUN_RANK_GREEN, _RUN_RANK_PENDING, _RUN_RANK_RED = 0, 1, 2
 
-    #1715 / #1918: `repo` (owner/repo) is REQUIRED, not optional. Every
-    caller resolves it from a repo-qualified anchor before calling this --
-    that guarantee used to be enforced only by caller discipline (`repo:
-    Optional[str] = None`, falling back to gh's cwd-based inference when
-    omitted). #1918 removed baton.py's DEFAULT_GITHUB_REPO precisely
-    because a silently-guessed repo is how a cross-repo PR-baton ends up
-    checking the WRONG repo's PR entirely -- cwd inference is that same
-    failure mode one function down, just unnamed. Making `repo` required
-    at the signature enforces the guarantee structurally rather than by
-    every caller remembering to pass it (all six production call sites
-    already did; this closes the latent re-entry point for a future one
-    that doesn't).
+
+def _gh_identity_is_service(gh_kw) -> bool:
+    """True iff `gh_kw` (from `_gh_identity`) carries the service token env.
+
+    Default-off identity is ``{}`` (the ambient login); a configured service
+    identity is ``{"env": {..., "GH_TOKEN": <token>, ...}}``.
     """
-    if not repo:
-        return ("unknown", "repo argument is required and was empty")
-    gh_kw, refusal = _gh_identity()
-    if refusal is not None:
-        return refusal
-    cmd = ["gh", "pr", "view", pr_number,
-           "--json", "statusCheckRollup,mergeStateStatus", "--repo", repo]
+    env = gh_kw.get("env") if isinstance(gh_kw, dict) else None
+    return isinstance(env, dict) and bool(env.get("GH_TOKEN"))
+
+
+def _repo_slug_is_valid(repo) -> bool:
+    """A plain ``owner/name`` slug, safe to place in an API path."""
+    if not (isinstance(repo, str) and _REPO_SLUG_RE.fullmatch(repo)):
+        return False
+    return all(part.strip(".") for part in repo.split("/"))
+
+
+def _ci_state_from_workflow_runs(raw: str) -> tuple:
+    """Map the JSON of `actions/runs?head_sha=<oid>` to (state, detail).
+
+    Newest run per workflow ``name`` by ``updated_at`` (an exact tie takes the
+    worst); a newest run that is not completed, or has no conclusion, is pending;
+    ``success`` is green; every other conclusion is red.  Red beats pending
+    beats green across names.  No runs is pending.  A body that is unparseable,
+    truncated (``total_count`` above the runs returned) or has a run this
+    function cannot read is unknown.
+    """
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            **gh_kw,
-        )
-    except FileNotFoundError:
-        return ("unknown", "gh not found on PATH")
-    except subprocess.TimeoutExpired:
-        return ("unknown", "gh timed out after 15s")
-    except OSError as exc:
-        return ("unknown", _scrub_gh_detail(f"gh exec error: {exc}"))
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        return ("unknown", "gh returned unparseable JSON")
+    if not isinstance(data, dict):
+        return ("unknown", "workflow runs body is not a JSON object")
+    runs = data.get("workflow_runs")
+    if not isinstance(runs, list):
+        return ("unknown", "workflow_runs missing or not a list")
+    total = data.get("total_count")
+    if not isinstance(total, int) or isinstance(total, bool):
+        return ("unknown", "total_count missing or not an integer")
+    if total > len(runs):
+        return ("unknown", f"workflow runs truncated ({len(runs)} of {total} returned)")
 
-    if result.returncode != 0:
-        detail = (result.stderr or "").strip() or f"gh exit {result.returncode}"
-        return ("unknown", _scrub_gh_detail(detail))
+    newest: dict = {}
+    for item in runs:
+        if not isinstance(item, dict):
+            return ("unknown", "a workflow run is not an object")
+        name = item.get("name")
+        if not (isinstance(name, str) and name):
+            return ("unknown", "a workflow run has no name")
+        stamp = item.get("updated_at")
+        if not isinstance(stamp, str):
+            return ("unknown", f"workflow run '{name}' has no updated_at")
+        try:
+            when = datetime.strptime(stamp, _RUN_TIMESTAMP_FORMAT)
+        except ValueError:
+            return ("unknown", f"workflow run '{name}' has an unparseable updated_at")
+        status = item.get("status")
+        conclusion = item.get("conclusion")
+        if not isinstance(status, str):
+            return ("unknown", f"workflow run '{name}' has no status")
+        if conclusion is not None and not isinstance(conclusion, str):
+            return ("unknown", f"workflow run '{name}' has a malformed conclusion")
+        if status != "completed" or conclusion is None:
+            rank, why = _RUN_RANK_PENDING, f"workflow '{name}' status={status}"
+        elif conclusion == "success":
+            rank, why = _RUN_RANK_GREEN, f"workflow '{name}' conclusion=success"
+        else:
+            rank, why = _RUN_RANK_RED, f"workflow '{name}' conclusion={conclusion}"
+        kept = newest.get(name)
+        if kept is None or when > kept[0] or (when == kept[0] and rank > kept[1]):
+            newest[name] = (when, rank, why)
 
+    if not newest:
+        return ("pending", "no workflow runs on the head")
+    for wanted, label in ((_RUN_RANK_RED, "red"), (_RUN_RANK_PENDING, "pending")):
+        for _when, rank, why in newest.values():
+            if rank == wanted:
+                return (label, why)
+    return ("green", "all workflow runs succeeded")
+
+
+def _ci_state_from_rollup_output(result) -> tuple:
+    """Map the output of `gh pr view --json statusCheckRollup,mergeStateStatus`.
+
+    Moved verbatim out of `_pr_ci_state` (#3533) so the rollup path and the
+    workflow-runs path can sit side by side there; behaviour is unchanged.
+    """
     raw = (result.stdout or "").strip()
     if not raw:
         return ("unknown", "gh returned empty output")
@@ -694,6 +753,132 @@ def _pr_ci_state(pr_number: str, repo: str) -> tuple:
             return ("pending", f"check '{name}' not yet started")
 
     return ("green", "all checks passed")
+
+
+
+def _pr_ci_state(pr_number: str, repo: str) -> tuple:
+    """Query GitHub CI state for a pull request via `gh`.
+
+    Returns (state, detail) where state is one of:
+      "green"   — all checks passed (or no checks registered)
+      "red"     — at least one check failed
+      "pending" — no failure, but at least one check still running
+      "unknown" — could not obtain a verdict (degraded; advisory only)
+
+    #1715 / #1918: `repo` (owner/repo) is REQUIRED, not optional. Every
+    caller resolves it from a repo-qualified anchor before calling this --
+    that guarantee used to be enforced only by caller discipline (`repo:
+    Optional[str] = None`, falling back to gh's cwd-based inference when
+    omitted). #1918 removed baton.py's DEFAULT_GITHUB_REPO precisely
+    because a silently-guessed repo is how a cross-repo PR-baton ends up
+    checking the WRONG repo's PR entirely -- cwd inference is that same
+    failure mode one function down, just unnamed. Making `repo` required
+    at the signature enforces the guarantee structurally rather than by
+    every caller remembering to pass it (all six production call sites
+    already did; this closes the latent re-entry point for a future one
+    that doesn't).
+    """
+    if not repo:
+        return ("unknown", "repo argument is required and was empty")
+    gh_kw, refusal = _gh_identity()
+    if refusal is not None:
+        return refusal
+    if not _gh_identity_is_service(gh_kw):
+        cmd = ["gh", "pr", "view", pr_number,
+               "--json", "statusCheckRollup,mergeStateStatus", "--repo", repo]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                **gh_kw,
+            )
+        except FileNotFoundError:
+            return ("unknown", "gh not found on PATH")
+        except subprocess.TimeoutExpired:
+            return ("unknown", "gh timed out after 15s")
+        except OSError as exc:
+            return ("unknown", _scrub_gh_detail(f"gh exec error: {exc}"))
+
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip() or f"gh exit {result.returncode}"
+            if _RUNS_FALLTHROUGH_MARKER not in detail.lower():
+                return ("unknown", _scrub_gh_detail(detail))
+            # The fine-grained-PAT refusal of the check-run rollup (#3533): read
+            # the workflow runs below instead.  Every OTHER failure stays unknown.
+        else:
+            return _ci_state_from_rollup_output(result)
+
+    # Workflow-runs path (#3533): the service token cannot read the check-run
+    # rollup, so ask for mergeStateStatus + headRefOid, then the runs on that
+    # head.  Anything this path cannot establish is unknown or pending, never green.
+    cmd_b = ["gh", "pr", "view", pr_number,
+             "--json", "mergeStateStatus,headRefOid", "--repo", repo]
+    try:
+        res_b = subprocess.run(
+            cmd_b,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            **gh_kw,
+        )
+    except FileNotFoundError:
+        return ("unknown", "gh not found on PATH")
+    except subprocess.TimeoutExpired:
+        return ("unknown", "gh timed out after 15s")
+    except OSError as exc:
+        return ("unknown", _scrub_gh_detail(f"gh exec error: {exc}"))
+
+    if res_b.returncode != 0:
+        detail = (res_b.stderr or "").strip() or f"gh exit {res_b.returncode}"
+        return ("unknown", _scrub_gh_detail(detail))
+
+    raw_b = (res_b.stdout or "").strip()
+    if not raw_b:
+        return ("unknown", "gh returned empty output")
+    try:
+        data_b = json.loads(raw_b)
+    except (json.JSONDecodeError, ValueError):
+        return ("unknown", "gh returned unparseable JSON")
+    if not isinstance(data_b, dict):
+        return ("unknown", "gh returned JSON that is not an object")
+
+    merge_state = data_b.get("mergeStateStatus")
+    if isinstance(merge_state, str) and merge_state.upper() == "CLEAN":
+        return ("green", "mergeStateStatus=CLEAN")
+
+    head_oid = data_b.get("headRefOid")
+    if not (isinstance(head_oid, str) and _HEAD_OID_RE.fullmatch(head_oid)):
+        return ("unknown", "headRefOid missing or not a 40-hex commit id")
+    if not _repo_slug_is_valid(repo):
+        return ("unknown", "repo is not a plain owner/name slug")
+
+    cmd_c = ["gh", "api", f"repos/{repo}/actions/runs?head_sha={head_oid}&per_page=100"]
+    try:
+        res_c = subprocess.run(
+            cmd_c,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            **gh_kw,
+        )
+    except FileNotFoundError:
+        return ("unknown", "gh not found on PATH")
+    except subprocess.TimeoutExpired:
+        return ("unknown", "gh timed out after 15s")
+    except OSError as exc:
+        return ("unknown", _scrub_gh_detail(f"gh exec error: {exc}"))
+
+    if res_c.returncode != 0:
+        detail = (res_c.stderr or "").strip() or f"gh exit {res_c.returncode}"
+        return ("unknown", _scrub_gh_detail(detail))
+
+    raw_c = (res_c.stdout or "").strip()
+    if not raw_c:
+        return ("unknown", "gh returned empty output")
+    state, detail = _ci_state_from_workflow_runs(raw_c)
+    return (state, _scrub_gh_detail(detail))
 
 
 # ---------------------------------------------------------------------------

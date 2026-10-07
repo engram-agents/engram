@@ -257,7 +257,7 @@ def test_B5_each_allowed_site_reaches_the_identity_helper():
     body = board.split("def _gh_pr_state", 1)[1].split("\ndef ", 1)[0]
     assert "_GH_IDENTITY_PROVIDER" in body and "**gh_kw" in body
     gate = (_SRC_FORUM.parent / "engram" / "tools" / "baton_gate.py").read_text(encoding="utf-8")
-    assert len(re.findall(r"subprocess\.run\(", gate)) == len(re.findall(r"\*\*gh_kw", gate)) == 3
+    assert len(re.findall(r"subprocess\.run\(", gate)) == len(re.findall(r"\*\*gh_kw", gate)) == 5
 
 
 # ---------------------------------------------------------------------------
