@@ -288,6 +288,34 @@ signal that is null on a candidate counts as 0 for it and the candidate is count
 `null_signal_rows`. Unrated candidates count as not relevant. The sweep never touches
 the ledger or the graph.
 
+## Fleet report across seats and days
+
+```
+~/.engram/venv/bin/python probe_fleet_report.py <dirA> <dirB> --label kepler:2026-10-06 --label borges:2026-10-07 \
+    [--shown-only] --out fleet.md
+```
+
+Use the venv python: the tool imports `probe_eval`, which imports the recall harness, which needs
+`fastmcp`. The `--out` directory must already exist (a missing one is an error naming it).
+
+Takes several converter `--out` dirs, one `--label <seat>:<yyyy-mm-dd>` per dir in the same
+order (a dir whose `summary.json` carries `seat` and `date` needs none; the converter does
+not write them today, so labels are required in practice, and a missing one is an error
+naming the dir). It imports `probe_eval`'s scoring and writes one report: arm x seat:date
+tables for p@5, nDCG@10 and median ms (cell = value (n); n < 10 shows the value in
+parentheses and is never named best), the querySource split, the route signal sweep (per
+route two tables: 3a pooled over every input with null similarity counted as 0 as `probe_eval`
+does, 3b pooled over the inputs with no null similarity, same inputs in every row, excluded
+inputs and null rows counted; the sweep never runs `--shown-only`), pooled pair
+verdicts, and a caveats block rendered from each input's data. When a dir's `summary.json`
+carries a `seat`/`date` that differs from its `--label`, the label wins and that input's
+caveats line says so. Columns sort by date then
+seat, so the input order does not change the bytes. The converter's `summary.json` does
+not record who rated, so the report says `rater provenance not recorded in this input`
+rather than asserting the ratings are the agent's own. Tests:
+`tests/test_probe_fleet_report_3549.py`; the byte pin for `probe_eval`'s own report is
+`tests/test_probe_eval_report_pin_3549.py`.
+
 ## Tests
 
 ```
