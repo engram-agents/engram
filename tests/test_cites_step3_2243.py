@@ -53,6 +53,13 @@ OLD = "2026-01-01T00:00:00+00:00"
 NEW = "2026-02-01T00:00:00+00:00"
 
 _ctr = itertools.count(1)
+_DEFAULT_META = object()
+DEFAULT_RTYPE = "deductive_modus_ponens"
+
+
+def rt(rtype):
+    """The metadata blob of a derivation of the given reasoning type."""
+    return json.dumps({"reasoning_type": rtype})
 
 
 # ---------------------------------------------------------------------------
@@ -78,16 +85,21 @@ class World:
     def conn(self):
         return self.core._get_db()
 
-    def node(self, typ, current=1, claim=None, created=OLD):
+    def node(self, typ, current=1, claim=None, created=OLD, metadata=_DEFAULT_META):
         # evidence nodes carry the `ev_` id prefix the engine's only cites
         # writer requires of a cites target
         nid = f"{'ev' if typ == 'evidence' else 'zz'}_{next(_ctr):06d}"
+        # a real derivation always carries a reasoning_type (#2243 hand-only
+        # rule); the shared default is the ordinary refile-able one. `metadata`
+        # is the raw column value: None -> SQL NULL, a str -> stored verbatim.
+        if metadata is _DEFAULT_META:
+            metadata = rt(DEFAULT_RTYPE) if typ == "derivation" else None
         c = self.conn()
         try:
             c.execute(
-                "INSERT INTO nodes (id, type, claim, created_at, is_current, confidence) "
-                "VALUES (?, ?, ?, ?, ?, 0.5)",
-                (nid, typ, claim if claim is not None else f"claim {nid}", created, current))
+                "INSERT INTO nodes (id, type, claim, created_at, is_current, confidence, metadata) "
+                "VALUES (?, ?, ?, ?, ?, 0.5, ?)",
+                (nid, typ, claim if claim is not None else f"claim {nid}", created, current, metadata))
             c.commit()
         finally:
             c.close()
@@ -102,11 +114,13 @@ class World:
         finally:
             c.close()
 
-    def cites(self, stype, ttype, src_current=1, src_claim=None, tgt_current=1):
+    def cites(self, stype, ttype, src_current=1, src_claim=None, tgt_current=1,
+              src_meta=_DEFAULT_META):
         """A loose (or keeper) cites edge between two fresh nodes. Returns
         (source_id, target_id)."""
         t = self.node(ttype, current=tgt_current, created=OLD)
-        s = self.node(stype, current=src_current, created=NEW, claim=src_claim)
+        s = self.node(stype, current=src_current, created=NEW, claim=src_claim,
+                      metadata=src_meta)
         self.edge("cites", s, t)
         return s, t
 
@@ -2720,3 +2734,551 @@ def test_phase_f_phases_flag_accepts_f_and_the_default_ends_with_it(world, tool,
     assert w.rels(s, t) == ["cites"]                          # dry run
     assert tool.PHASES == ("a", "b", "c", "d", "e", "f")
     assert "six phases" in tool.__doc__
+
+
+# ---------------------------------------------------------------------------
+# Kepler's ruling: a derivation whose reasoning CLASS is inductive_corroboration
+# (the engine's REASONING_CLASS: inductive_generalization, inductive_enumeration,
+# authority_consensus) is HAND-ONLY. `inductive_corroboration` is that class
+# name, not a reasoning type. A premise wired into a generalization
+# must be one of its cases; a precision sentence, a recommendation or a
+# restatement goes to `about`, so the tool must never list such a source as a
+# plain retract+refile (measured on one seat: wiring such a node as a premise
+# inflated a derivation's confidence 0.777 -> 0.941). The tool never refiles:
+# it lists. The contract is on the LIST, and on `--apply` writing nothing but
+# retypes. (contract-first: these cells were written before the implementation)
+#
+#   H1  the reasoning type is read from nodes.metadata with the guarded SQL form
+#   H2  generalization / corroboration -> action "hand-only" (+ reasoning_type,
+#       + why); every other READABLE type keeps "retract+refile" unchanged
+#   H3  fail closed: missing / empty / unreadable / malformed -> hand-only with
+#       why "reasoning-type-unreadable", and a malformed blob never aborts a run
+#   H4  every emission site agrees (per-edge needs entry, refile export, printed
+#       summary, needs-seat-read file, ledger header, docstring)
+#   H5  --apply invokes no engine verb but the retype, and never on the planted edge
+# ---------------------------------------------------------------------------
+
+REFILE_TYPES = ("deductive_modus_ponens", "abductive_best_explanation", "inductive_analogy",
+                "inductive_causal", "abductive_elimination", "deductive_hypothetical_syllogism")
+PRECISION = ("Precision: the figure above holds only for the sampled seats; "
+             "recommendation: read it as a bound, not a case.")
+UNREADABLE = "reasoning-type-unreadable"
+UNRECOGNIZED = "reasoning-type-unrecognized"
+
+
+def _force_metadata(w, node_id, raw):
+    """Store `raw` verbatim in nodes.metadata, bypassing the write-guard
+    triggers (a real graph can still hold a bad blob written before them)."""
+    c = w.conn()
+    try:
+        for (name,) in c.execute("SELECT name FROM sqlite_master WHERE type='trigger' "
+                                 "AND name LIKE 'nodes_metadata_json_guard%'").fetchall():
+            c.execute(f'DROP TRIGGER "{name}"')
+        c.execute("UPDATE nodes SET metadata=? WHERE id=?", (raw, node_id))
+        c.commit()
+    finally:
+        c.close()
+
+
+def _mf_label_for(reason="quoted: 'because of X'"):
+    return [lab("mis-filed-premise", "derives_from", premise="relies", reason=reason)]
+
+
+def _planted(w, meta=_DEFAULT_META, ttype="observation_factual", tclaim=PRECISION):
+    """A derivation source (metadata as given) with a labelled mis-filed-premise
+    cites edge to a precision-sentence node. Returns (source, target, labels)."""
+    src = w.node("derivation", created=NEW, metadata=meta)
+    t = w.node(ttype, created=OLD, claim=tclaim)
+    w.edge("cites", src, t)
+    return src, t, {"edges": [lentry(w, src, t, _mf_label_for())]}
+
+
+def _plan(w, tool, capsys, labels, apply=False):
+    if apply:
+        rc, out, err = apply_(w, tool, capsys, labels=labels)
+        d = w.home / "migrations" / "cites-step3"
+        return rc, out, err, {
+            "refile_by_source": json.loads(next(d.glob("refile-by-source-*.json")).read_text()),
+            "needs_seat_read": json.loads(next(d.glob("needs-seat-read-*.json")).read_text()),
+            "entries": ledger(w)["entries"], "header": ledger(w)["header"]}
+    dest = w.inputs / "plan.json"
+    rc, out, err = invoke(w, tool, capsys, rep=report(), labels=labels, extra=["--plan-out", str(dest)])
+    return rc, out, err, json.loads(dest.read_text())
+
+
+def _only(doc, src):
+    (g,) = [g for g in doc["refile_by_source"] if g["source_id"] == src]
+    return g
+
+
+@pytest.mark.parametrize("apply", [False, True], ids=["dry-run", "apply"])
+def test_hand_only_a_precision_sentence_on_a_generalization_is_listed_hand_only_not_refiled(
+        world, tool, capsys, apply):
+    w = world
+    src, t, labels = _planted(w, meta=rt("inductive_generalization"))
+    snap = w.dump() if not apply else None
+    rc, out, err, doc = _plan(w, tool, capsys, labels, apply=apply)
+    assert rc == 0, out + err
+    if snap is not None:
+        assert w.dump() == snap
+    g = _only(doc, src)
+    assert g["action"] == "hand-only" and g["reasoning_type"] == "inductive_generalization"
+    assert g["why"] and UNREADABLE not in g["why"]
+    assert [x["target_id"] for x in g["targets"]] == [t]
+    # nothing was refiled or retyped: the edge is still the very same cites edge
+    assert w.rels(src, t) == ["cites"] and w.retype_reasons() == []
+    # the per-edge needs entry and the needs-seat-read export agree with the list
+    (e,) = [e for e in doc["entries"] if (e["source_id"], e["target_id"]) == (src, t)]
+    assert e["status"] == "needs-seat-read" and e["to"] is None and e["action"] == "hand-only"
+    (n,) = [n for n in doc["needs_seat_read"] if (n["source_id"], n["target_id"]) == (src, t)]
+    assert n["action"] == "hand-only"
+    assert "retract+refile" not in json.dumps(doc["refile_by_source"] + doc["needs_seat_read"])
+
+
+@pytest.mark.parametrize("apply", [False, True], ids=["dry-run", "apply"])
+def test_hand_only_control_same_fixture_on_modus_ponens_stays_retract_refile(world, tool, capsys, apply):
+    w = world
+    src, t, labels = _planted(w, meta=rt("deductive_modus_ponens"))
+    rc, out, err, doc = _plan(w, tool, capsys, labels, apply=apply)
+    assert rc == 0, out + err
+    g = _only(doc, src)
+    assert g["action"] == "retract+refile"          # unchanged by the hand-only rule
+    (e,) = [e for e in doc["entries"] if (e["source_id"], e["target_id"]) == (src, t)]
+    assert e["action"] == "retract+refile"
+    assert w.rels(src, t) == ["cites"]
+
+
+def test_hand_only_a_refile_entry_carries_its_reasoning_type_and_no_why(world, tool, capsys):
+    w = world
+    src, t, labels = _planted(w, meta=rt("deductive_modus_ponens"))
+    rc, out, err, doc = _plan(w, tool, capsys, labels)
+    g = _only(doc, src)
+    assert g["reasoning_type"] == "deductive_modus_ponens" and "why" not in g
+
+
+def test_hand_only_inductive_corroboration_is_hand_only(world, tool, capsys):
+    """The corroboration CLASS is hand-only through its real member types
+    (inductive_enumeration here); the class name is not a type."""
+    w = world
+    src, t, labels = _planted(w, meta=rt("inductive_enumeration"))
+    rc, out, err, doc = _plan(w, tool, capsys, labels)
+    assert rc == 0, out + err
+    g = _only(doc, src)
+    assert g["action"] == "hand-only" and g["reasoning_type"] == "inductive_enumeration"
+    assert g["why"] and g["why"] not in (UNREADABLE, UNRECOGNIZED)
+
+
+@pytest.mark.parametrize("rtype", REFILE_TYPES)
+def test_hand_only_every_other_readable_type_stays_retract_refile(world, tool, capsys, rtype):
+    w = world
+    src, t, labels = _planted(w, meta=rt(rtype))
+    rc, out, err, doc = _plan(w, tool, capsys, labels)
+    assert rc == 0, out + err
+    g = _only(doc, src)
+    assert g["action"] == "retract+refile"
+
+
+@pytest.mark.parametrize("case", ["no_key", "null", "not_json", "empty_string", "json_array",
+                                  "json_scalar", "empty_type", "null_type", "number_type",
+                                  "whitespace_type"])
+def test_hand_only_fail_closed_when_the_reasoning_type_is_unreadable(world, tool, capsys, case):
+    w = world
+    src, t, labels = _planted(w, meta=None)
+    raw = {"no_key": json.dumps({"confidence_note": "x"}), "null": None, "not_json": "{not json",
+           "empty_string": "", "json_array": "[1, 2]", "json_scalar": "5",
+           "empty_type": json.dumps({"reasoning_type": ""}),
+           "null_type": json.dumps({"reasoning_type": None}),
+           "number_type": json.dumps({"reasoning_type": 7}),
+           "whitespace_type": json.dumps({"reasoning_type": "  "})}[case]
+    _force_metadata(w, src, raw)
+    snap = w.dump()
+    rc, out, err, doc = _plan(w, tool, capsys, labels)
+    assert rc == 0, out + err                      # a bad blob never aborts the run
+    assert w.dump() == snap
+    g = _only(doc, src)
+    assert g["action"] == "hand-only" and g["why"] == UNREADABLE and g["reasoning_type"] is None
+    (e,) = [e for e in doc["entries"] if (e["source_id"], e["target_id"]) == (src, t)]
+    assert e["action"] == "hand-only"
+    assert w.rels(src, t) == ["cites"]
+
+
+def test_hand_only_a_malformed_blob_on_one_source_does_not_abort_the_other_sources(world, tool, capsys):
+    w = world
+    bad, t1, l1 = _planted(w, meta=None)
+    _force_metadata(w, bad, "{not json")
+    good, t2, l2 = _planted(w, meta=rt("deductive_modus_ponens"))
+    rc, out, err, doc = _plan(w, tool, capsys, {"edges": l1["edges"] + l2["edges"]}, apply=True)
+    assert rc == 0, out + err
+    assert _only(doc, bad)["action"] == "hand-only"
+    assert _only(doc, good)["action"] == "retract+refile"
+
+
+def test_hand_only_the_reader_treats_a_missing_source_row_as_unreadable(world, tool):
+    """The reader itself: no row, no type -> unreadable (never the safe case)."""
+    w = world
+    conn = w.conn()
+    try:
+        assert tool.read_reasoning_type(conn, "zz_does_not_exist") is None
+        src = w.node("derivation", metadata=rt("inductive_generalization"))
+        assert tool.read_reasoning_type(conn, src) == "inductive_generalization"
+    finally:
+        conn.close()
+
+
+def test_hand_only_a_superseded_source_is_still_read_by_id(world, tool, capsys):
+    """Currentness and status do not hide the type: a closed derivation's
+    metadata is read like any other."""
+    w = world
+    src = w.node("derivation", current=0, created=NEW, metadata=rt("inductive_generalization"))
+    t = w.node("observation_factual", created=OLD, claim=PRECISION)
+    w.edge("cites", src, t)
+    rc, out, err, doc = _plan(w, tool, capsys, {"edges": [lentry(w, src, t, _mf_label_for())]})
+    assert rc == 0, out + err
+    g = _only(doc, src)
+    assert g["action"] == "hand-only" and g["reasoning_type"] == "inductive_generalization"
+
+
+def test_hand_only_two_targets_of_one_generalization_make_one_entry(world, tool, capsys):
+    w = world
+    src = w.node("derivation", created=NEW, metadata=rt("inductive_generalization"))
+    t1, t2 = _mf(w, src), _mf(w, src)
+    labels = {"edges": [lentry(w, src, t, _mf_label_for(f"q{i}")) for i, t in enumerate((t1, t2))]}
+    rc, out, err, doc = _plan(w, tool, capsys, labels, apply=True)
+    assert rc == 0, out + err
+    assert len(doc["refile_by_source"]) == 1
+    g = _only(doc, src)
+    assert g["action"] == "hand-only" and sorted(x["target_id"] for x in g["targets"]) == sorted([t1, t2])
+    assert doc["header"]["refile_counts"] == {"edges": 2, "sources": 1}
+    assert doc["header"]["hand_only_counts"] == {"edges": 2, "sources": 1}
+
+
+def test_hand_only_mixed_sources_interleaved_each_gets_its_own_verdict(world, tool, capsys):
+    """Edge ids interleave (B, A, B, C, A, D, B): A a generalization, B modus
+    ponens, C an authority_consensus (corroboration class), D unreadable. The verdict is per SOURCE, never
+    taken from whichever candidate came first."""
+    w = world
+    a = w.node("derivation", created=NEW, metadata=rt("inductive_generalization"))
+    b = w.node("derivation", created=NEW, metadata=rt("deductive_modus_ponens"))
+    c = w.node("derivation", created=NEW, metadata=rt("authority_consensus"))
+    d = w.node("derivation", created=NEW, metadata=None)
+    _force_metadata(w, d, "{not json")
+    pairs = [(b, _mf(w, b)), (a, _mf(w, a)), (b, _mf(w, b)), (c, _mf(w, c)),
+             (a, _mf(w, a)), (d, _mf(w, d)), (b, _mf(w, b))]
+    labels = {"edges": [lentry(w, s, t, _mf_label_for(f"q{i}")) for i, (s, t) in enumerate(pairs)]}
+    rc, out, err, doc = _plan(w, tool, capsys, labels, apply=True)
+    assert rc == 0, out + err
+    got = {g["source_id"]: (g["action"], len(g["targets"])) for g in doc["refile_by_source"]}
+    assert got == {a: ("hand-only", 2), b: ("retract+refile", 3), c: ("hand-only", 1),
+                   d: ("hand-only", 1)}
+    assert _only(doc, d)["why"] == UNREADABLE
+    acts = {e["source_id"]: e["action"] for e in doc["entries"] if e["status"] == "needs-seat-read"}
+    assert acts == {a: "hand-only", b: "retract+refile", c: "hand-only", d: "hand-only"}
+    assert doc["header"]["refile_counts"] == {"edges": 7, "sources": 4}
+    assert doc["header"]["hand_only_counts"] == {"edges": 4, "sources": 3}
+
+
+def test_hand_only_printed_summary_counts_hand_only_separately(world, tool, capsys):
+    w = world
+    a, ta, la = _planted(w, meta=rt("inductive_generalization"))
+    b, tb, lb = _planted(w, meta=rt("deductive_modus_ponens"))
+    rc, out, err, doc = _plan(w, tool, capsys, {"edges": la["edges"] + lb["edges"]})
+    assert rc == 0, out + err
+    assert ("refile list: 2 source(s) (retract+refile: 1, hand-only: 1); 2 edge(s); "
+            "hand-only sources are never refiled, the premise role is read from the chain") in out
+    assert "retract+refile list:" not in out
+    line_a = next(l for l in out.splitlines() if l.strip().startswith(f"source {a} "))
+    line_b = next(l for l in out.splitlines() if l.strip().startswith(f"source {b} "))
+    assert "HAND-ONLY" in line_a and "inductive_generalization" in line_a
+    assert "HAND-ONLY" not in line_b
+    assert "needs-seat-read [mis-filed-premise] action=hand-only" in out
+    assert "needs-seat-read [mis-filed-premise] action=retract+refile" in out
+
+
+def test_hand_only_ledger_header_carries_the_counts_and_the_entry_the_type(world, tool, capsys):
+    w = world
+    src, t, labels = _planted(w, meta=rt("inductive_generalization"))
+    rc, out, err, doc = _plan(w, tool, capsys, labels, apply=True)
+    assert rc == 0, out + err
+    assert doc["header"]["hand_only_counts"] == {"edges": 1, "sources": 1}
+    assert doc["header"]["refile_counts"] == {"edges": 1, "sources": 1}
+    (e,) = [e for e in doc["entries"] if (e["source_id"], e["target_id"]) == (src, t)]
+    assert e["reasoning_type"] == "inductive_generalization"
+
+
+def test_hand_only_module_docstring_states_the_rule_and_the_reason(tool):
+    doc = " ".join(tool.__doc__.split())
+    assert "hand-only" in doc and "inductive_generalization" in doc and "inductive_corroboration" in doc
+    assert "reasoning-type-unreadable" in doc
+    assert "one of its cases" in doc
+
+
+def test_hand_only_reads_the_type_with_the_guarded_json_extract_only():
+    src = TOOL_PATH.read_text()
+    # the value through the guarded json_extract; duplicate keys counted through
+    # a guarded json_each (json_extract alone would return the first duplicate)
+    assert "json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.reasoning_type')" in src
+    assert "FROM json_each(CASE WHEN json_valid(metadata) THEN metadata END)" in src
+    assert not re.search(r"json_extract\(\s*(?:n\.)?metadata\s*,", src)
+
+
+import engram_confidence as _ec
+
+CORROBORATION_CLASS = "inductive_corroboration"
+CORROBORATION_TYPES = tuple(sorted(t for t in _ec.REASONING_TYPES
+                                   if _ec.REASONING_CLASS[t] == CORROBORATION_CLASS))
+OTHER_ENGINE_TYPES = tuple(sorted(t for t in _ec.REASONING_TYPES
+                                  if _ec.REASONING_CLASS[t] != CORROBORATION_CLASS))
+ENGINE_SRC = REPO / "src" / "engram"
+
+
+def _plan_type(w, tool, capsys, meta):
+    (w.inputs / "plan.json").unlink(missing_ok=True)      # a cell may plan twice
+    src, t, labels = _planted(w, meta=meta)
+    rc, out, err, doc = _plan(w, tool, capsys, labels)
+    assert rc == 0, out + err
+    return src, t, _only(doc, src), doc
+
+
+# F1 / F7: the rule is keyed on the engine's reasoning CLASS, from its own constants
+
+def test_hand_only_the_engine_class_holds_the_three_types_the_ruling_names():
+    """Pins the premise of the fold: the class has these members today (the
+    cells below are parametrized over the engine, so they track a change)."""
+    assert CORROBORATION_TYPES == ("authority_consensus", "inductive_enumeration",
+                                   "inductive_generalization")
+    assert CORROBORATION_CLASS not in _ec.REASONING_TYPES      # a class name, not a type
+
+
+@pytest.mark.parametrize("rtype", CORROBORATION_TYPES)
+def test_hand_only_every_corroboration_class_type_is_hand_only(world, tool, capsys, rtype):
+    src, t, g, doc = _plan_type(world, tool, capsys, rt(rtype))
+    assert g["action"] == "hand-only" and g["reasoning_type"] == rtype
+    assert g["why"] == tool.HAND_ONLY_WHY
+    assert world.rels(src, t) == ["cites"]
+
+
+@pytest.mark.parametrize("rtype", OTHER_ENGINE_TYPES)
+def test_hand_only_every_other_engine_type_stays_retract_refile(world, tool, capsys, rtype):
+    """Control: same fixture, every real type of another class (incl.
+    inductive_statistical, inductive_analogy, authority_expert) stays refile."""
+    src, t, g, doc = _plan_type(world, tool, capsys, rt(rtype))
+    assert g["action"] == "retract+refile" and g["reasoning_type"] == rtype and "why" not in g
+
+
+def test_hand_only_class_level_rule_covers_exactly_the_engine_class_members(world, tool):
+    w = world
+    conn = w.conn()
+    try:
+        for rtype in sorted(_ec.REASONING_TYPES):
+            n = w.node("derivation", metadata=rt(rtype))
+            got = tool.classify_derivation(conn, n)
+            want_hand = _ec.REASONING_CLASS[rtype] == CORROBORATION_CLASS
+            assert got[1] is want_hand, (rtype, got)
+            assert got[0] == rtype and (got[2] is not None) == want_hand
+    finally:
+        conn.close()
+
+
+def test_hand_only_a_type_added_to_the_class_is_covered_without_editing_the_tool(
+        world, tool, capsys, monkeypatch):
+    """A hand-copied type list would stay green on the real types and miss this."""
+    monkeypatch.setattr(_ec, "REASONING_TYPES", _ec.REASONING_TYPES | {"inductive_future_kind"})
+    monkeypatch.setitem(_ec.REASONING_CLASS, "inductive_future_kind", CORROBORATION_CLASS)
+    src, t, g, doc = _plan_type(world, tool, capsys, rt("inductive_future_kind"))
+    assert g["action"] == "hand-only" and g["why"] == tool.HAND_ONLY_WHY
+    # control: the same new type filed under a different class is a plain refile
+    monkeypatch.setitem(_ec.REASONING_CLASS, "inductive_future_kind", "deductive")
+    src2, t2, g2, doc2 = _plan_type(world, tool, capsys, rt("inductive_future_kind"))
+    assert g2["action"] == "retract+refile"
+
+
+# F2: an unrecognized (well-formed) type name fails closed
+
+@pytest.mark.parametrize("name", ["inductive_generalisation", "inductive_corroboration",
+                                  "inductve_generalization", "some_future_type"])
+def test_hand_only_an_unrecognized_type_name_fails_closed(world, tool, capsys, name):
+    assert name not in _ec.REASONING_TYPES
+    src, t, g, doc = _plan_type(world, tool, capsys, rt(name))
+    assert g["action"] == "hand-only" and g["why"] == UNRECOGNIZED
+    assert g["reasoning_type"] == name
+    (e,) = [e for e in doc["entries"] if (e["source_id"], e["target_id"]) == (src, t)]
+    assert e["action"] == "hand-only" and e["reasoning_type"] == name
+    assert world.rels(src, t) == ["cites"]
+
+
+def test_hand_only_inductive_statistical_is_a_real_type_and_stays_retract_refile(world, tool, capsys):
+    assert "inductive_statistical" in _ec.REASONING_TYPES
+    src, t, g, doc = _plan_type(world, tool, capsys, rt("inductive_statistical"))
+    assert g["action"] == "retract+refile"
+
+
+# F3: a duplicate reasoning_type key is unreadable (json_extract = first, json.loads = last)
+
+DUP_HAND_FIRST = '{"reasoning_type": "inductive_generalization", "reasoning_type": "deductive_modus_ponens"}'
+DUP_SAFE_FIRST = '{"reasoning_type": "deductive_modus_ponens", "reasoning_type": "inductive_generalization"}'
+DUP_BOTH_SAFE = '{"reasoning_type": "deductive_modus_ponens", "reasoning_type": "abductive_elimination"}'
+
+
+@pytest.mark.parametrize("raw", [DUP_HAND_FIRST, DUP_SAFE_FIRST, DUP_BOTH_SAFE],
+                         ids=["hand-only-first", "safe-first", "both-safe"])
+def test_hand_only_a_duplicate_reasoning_type_key_is_unreadable(world, tool, capsys, raw):
+    w = world
+    src, t, labels = _planted(w, meta=None)
+    _force_metadata(w, src, raw)
+    rc, out, err, doc = _plan(w, tool, capsys, labels)
+    assert rc == 0, out + err
+    g = _only(doc, src)
+    assert g["action"] == "hand-only" and g["why"] == UNREADABLE and g["reasoning_type"] is None
+
+
+def test_hand_only_a_single_key_control_beside_the_duplicate_cells_is_read(world, tool):
+    """Control: the same object with ONE reasoning_type key reads normally, and a
+    duplicate of an unrelated key does not make the type unreadable."""
+    w = world
+    a = w.node("derivation", metadata='{"reasoning_type": "deductive_modus_ponens"}')
+    b = w.node("derivation",
+               metadata='{"reasoning_type": "deductive_modus_ponens", "note": 1, "note": 2}')
+    conn = w.conn()
+    try:
+        assert tool.read_reasoning_type(conn, a) == "deductive_modus_ponens"
+        assert tool.read_reasoning_type(conn, b) == "deductive_modus_ponens"
+    finally:
+        conn.close()
+
+
+# F6: the normalisation is pinned
+
+def test_hand_only_the_type_is_stripped_and_lower_cased_before_the_class_lookup(world, tool, capsys):
+    src, t, g, doc = _plan_type(world, tool, capsys, rt("  Inductive_Enumeration \t"))
+    assert g["action"] == "hand-only" and g["reasoning_type"] == "inductive_enumeration"
+    assert g["why"] == tool.HAND_ONLY_WHY
+    # control: a padded, mixed-case SAFE type is normalised too and stays refile
+    src2, t2, g2, doc2 = _plan_type(world, tool, capsys, rt(" Deductive_Modus_Ponens "))
+    assert g2["action"] == "retract+refile" and g2["reasoning_type"] == "deductive_modus_ponens"
+
+
+# F5: the printed label is honest
+
+def test_hand_only_summary_label_counts_sources_and_splits_them(world, tool, capsys):
+    w = world
+    a, ta, la = _planted(w, meta=rt("inductive_enumeration"))
+    b, tb, lb = _planted(w, meta=rt("authority_consensus"))
+    c, tc, lc = _planted(w, meta=rt("deductive_modus_ponens"))
+    rc, out, err, doc = _plan(w, tool, capsys, {"edges": la["edges"] + lb["edges"] + lc["edges"]})
+    assert rc == 0, out + err
+    assert "refile list: 3 source(s) (retract+refile: 1, hand-only: 2); 3 edge(s)" in out
+    assert "retract+refile list:" not in out
+
+
+def test_hand_only_summary_label_with_no_hand_only_source_reads_zero(world, tool, capsys):
+    w = world
+    a, ta, la = _planted(w, meta=rt("deductive_modus_ponens"))
+    rc, out, err, doc = _plan(w, tool, capsys, la)
+    assert rc == 0, out + err
+    assert "refile list: 1 source(s) (retract+refile: 1, hand-only: 0); 1 edge(s)" in out
+
+
+# F4: the spy enumerates every `*_impl`, and the planted rows are compared before/after
+
+def _engine_modules():
+    """Every module under src/engram (tools/ excluded) that the engine load and
+    the server the world builds left in sys.modules."""
+    import importlib
+    for name in ("engram_core", "engram_cornerstone", "engram_dag_conformance",
+                 "engram_revision", "engram_derive", "server"):
+        importlib.import_module(name)
+    mods = []
+    for name, mod in sorted(sys.modules.items()):
+        f = getattr(mod, "__file__", None)
+        if not f:
+            continue
+        p = Path(f).resolve()
+        if ENGINE_SRC in p.parents and p.relative_to(ENGINE_SRC).parts[0] != "tools":
+            mods.append(mod)
+    return mods
+
+
+def _spy_every_engine_impl(monkeypatch):
+    """Wrap EVERY `*_impl` function bound on every engine module. A call made
+    while another spied call is running (the retype's own internals) is not
+    recorded, so the one verb the tool may use does not trip its own spy; every
+    top-level call is. Returns (calls, names)."""
+    calls, names, depth = [], set(), [0]
+    for mod in _engine_modules():
+        for attr in sorted(vars(mod)):
+            real = vars(mod)[attr]
+            if not (attr.endswith("_impl") and callable(real)):
+                continue
+            names.add(attr)
+
+            def spy(*a, _n=attr, _real=real, **kw):
+                if depth[0] == 0:
+                    calls.append((_n, a, kw))
+                depth[0] += 1
+                try:
+                    return _real(*a, **kw)
+                finally:
+                    depth[0] -= 1
+
+            monkeypatch.setattr(mod, attr, spy)
+    return calls, names
+
+
+def _rows(w, src, t):
+    c = w.conn()
+    try:
+        return {
+            "source": [tuple(r) for r in c.execute("SELECT * FROM nodes WHERE id=?", (src,))],
+            "target": [tuple(r) for r in c.execute("SELECT * FROM nodes WHERE id=?", (t,))],
+            "edges": [tuple(r) for r in c.execute(
+                "SELECT * FROM edges WHERE source_id=? OR target_id=? ORDER BY id", (src, src))],
+            "history": [tuple(r) for r in c.execute(
+                "SELECT * FROM edit_history WHERE node_id IN (?, ?) ORDER BY rowid", (src, t))],
+        }
+    finally:
+        c.close()
+
+
+def test_hand_only_the_spy_wraps_every_impl_on_every_loaded_engine_module(world, tool, monkeypatch):
+    calls, names = _spy_every_engine_impl(monkeypatch)
+    # not a hand-written list: it holds the old ten, the cornerstone verbs, and more
+    assert {"_retype_edge_impl", "_derive_impl", "_supersede_impl", "_retract_impl",
+            "_outgrow_cornerstone_impl"} <= names
+    assert len(names) > 10
+    import engram_cornerstone
+    assert engram_cornerstone._outgrow_cornerstone_impl.__name__ == "spy"
+    # a verb outside the old ten is recorded when called at top level
+    engram_cornerstone._outgrow_cornerstone_impl(old_cornerstone_id="zz_does_not_exist")
+    assert [c[0] for c in calls] == ["_outgrow_cornerstone_impl"]
+
+
+def test_hand_only_apply_calls_no_engine_verb_but_retype_and_never_on_the_planted_edge(
+        world, tool, capsys, monkeypatch):
+    w = world
+    plant_phases(w)                                       # ordinary retypable edges, phases a-c
+    src, t, mf = _planted(w, meta=rt("inductive_generalization"))
+    s2, t2 = w.cites("lesson", "goal")                    # an ordinary labelled retype (phase d)
+    labels = {"edges": mf["edges"] + [lentry(w, s2, t2, [lab("correct-about")])]}
+    rep = plant_report()
+    rep["strata"].append(stratum("derivation", "observation_factual", {"correct-about": 10}))
+    planted_eid = w.eid(src, t)
+    before = _rows(w, src, t)
+    assert before["source"] and before["edges"]            # the rows exist to be compared
+    calls, names = _spy_every_engine_impl(monkeypatch)
+    rc, out, err = apply_(w, tool, capsys, rep=rep, labels=labels,
+                          hand=handcheck(edges_read=list(range(1, 11)), agree=10))
+    assert rc == 0, out + err
+    assert calls, "the spy saw no call at all: the cell would prove nothing"
+    assert {c[0] for c in calls} == {"_retype_edge_impl"}, sorted({c[0] for c in calls})
+    retyped = {(c[2]["source_id"], c[2]["target_id"]) for c in calls}
+    assert (src, t) not in retyped and (s2, t2) in retyped
+    assert all(c[2]["source_id"] != src and c[2]["target_id"] != t for c in calls)
+    # the planted edge is exactly as it was: same id, still cites, no history on its pair
+    assert w.edge_map()[planted_eid] == (src, t, "cites")
+    assert w.rels(src, t) == ["cites"]
+    assert all(n not in (src, t) for n, _ in w.retype_reasons())
+    # every stored row about the planted source, target and edge is identical, so a
+    # direct UPDATE that bypasses every engine verb is caught too
+    assert _rows(w, src, t) == before
+    by = by_edge(ledger(w))
+    assert by[(src, t)]["status"] == "needs-seat-read" and by[(src, t)]["action"] == "hand-only"

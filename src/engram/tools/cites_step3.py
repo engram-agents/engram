@@ -46,6 +46,32 @@ mis-filed-premise (or `relies`) edge whose source is any other type is retyped
 to `about` (reason `non-derivation-premise`) and exported on the promotion
 candidate list. The tool never creates a provenance edge.
 
+HAND-ONLY derivation sources (Kepler's ruling on #2243). A premise wired into an
+`inductive_generalization` must be part of that generalization's basis, one of
+its cases; a precision sentence, a methodological recommendation or a
+restatement is not a case and belongs on `about` (wiring one as a premise was
+measured to inflate a derivation's confidence 0.777 -> 0.941). So a refile-list
+source whose `reasoning_type` belongs to the engine's reasoning CLASS
+`inductive_corroboration` (the engine's own REASONING_CLASS: today
+`inductive_generalization`, `inductive_enumeration` and `authority_consensus`;
+`inductive_corroboration` is that class name, not a type, and a type added to
+the class later is covered automatically) is listed with action `hand-only`,
+never `retract+refile`: the seat reads the premise role from the chain by hand (a
+premise of a generalization is a case, anything else goes to `about`). The
+`reasoning_type` is read with the guarded json_extract form (a malformed blob
+yields NULL, never aborts the run); a `reasoning_type` key present twice, counted
+with a guarded json_each, is unreadable (json_extract alone would return the
+first, the engine's json.loads the last). A source
+whose type is missing, empty, not a plain type name, duplicated, or in an
+unreadable metadata blob is ALSO hand-only, with `why` `reasoning-type-unreadable`
+(unknown is not reported as the safe case); a well-formed name that is not one of
+the engine's reasoning types (a typo, a spelling variant, a future name) is
+hand-only with `why` `reasoning-type-unrecognized`. Every other recognized type
+keeps `retract+refile`. The per-edge needs-seat-read entry, the refile export, the
+needs-seat-read file, the printed summary and the ledger header
+(`hand_only_counts`) all say the same thing. The tool itself never refiles or
+retracts either way: its only graph write is the cites -> about retype.
+
 Per-stratum `lost-relation` export: every SAMPLED edge (from the report and
 from the labels file's effective labels) whose effective label names a relation
 that cannot be added after creation (resolves, supersedes, contradicts, ...,
@@ -127,6 +153,15 @@ LABELS = ("correct-about", "mis-filed-premise", "other-relation", "unforeseen", 
 PHASES = ("a", "b", "c", "d", "e", "f")
 STRUCTURAL_SOURCES = ("feeling_report", "question")
 MARKER_TEXT = "pending cascade marker"
+# #2243 (Kepler): a premise of a derivation in this reasoning CLASS must be one of
+# the cases, so a derivation source of any type in the class is never listed as a
+# plain refile. The members come from the engine's REASONING_CLASS at call time.
+HAND_ONLY_CLASS = "inductive_corroboration"
+HAND_ONLY_WHY = ("a premise of a generalization is one of its cases; a precision sentence, "
+                 "recommendation or restatement goes to about -- read the premise role from the chain")
+UNREADABLE_WHY = "reasoning-type-unreadable"
+UNRECOGNIZED_WHY = "reasoning-type-unrecognized"
+_RTYPE_NAME = re.compile(r"[a-z][a-z_]*")
 # The premise-ancestry walk (fold: "already covered") follows these two
 # relations from a derivation source, over current nodes only, at most this
 # many hops; past the cap the candidate counts as NOT covered.
@@ -185,7 +220,20 @@ def _load_engine():
     import engram_core as core
     import engram_cornerstone as cornerstone
     import engram_dag_conformance as dagc
+    _reasoning_constants()          # a missing constants module refuses here, before any write
     return core, cornerstone, dagc
+
+
+def _reasoning_constants():
+    """(REASONING_TYPES, REASONING_CLASS) from the engine's own module, read at
+    call time (never copied into this tool). If the module cannot be imported
+    the ImportError propagates: this tool does not guess the engine's types."""
+    try:
+        import engram_confidence as ec
+    except ImportError:
+        sys.path.append(str(_find_engine_dir()))
+        import engram_confidence as ec
+    return ec.REASONING_TYPES, ec.REASONING_CLASS
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +430,44 @@ def effective_label(le):
     if a["label"] == b["label"] and _norm(a.get("relation_if_any")) == _norm(b.get("relation_if_any")):
         return a
     return None
+
+
+def read_reasoning_type(conn, node_id):
+    """The node's `reasoning_type` (lower-cased), or None when it cannot be
+    read: no such row, NULL / non-JSON / non-object metadata, a missing,
+    empty or non-string value, a `reasoning_type` key present twice, or
+    anything that is not a plain type name. The node is read by id whatever its
+    currentness or status. Every JSON function takes the guarded form (an
+    unguarded one over the column aborts the whole statement on one malformed
+    blob). json_extract alone returns the FIRST duplicate key while the engine's
+    json.loads returns the LAST, so the top-level members named reasoning_type
+    are COUNTED with json_each and anything but exactly one is unreadable."""
+    row = conn.execute(
+        "SELECT json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.reasoning_type'), "
+        "(SELECT COUNT(*) FROM json_each(CASE WHEN json_valid(metadata) THEN metadata END) "
+        "WHERE key = 'reasoning_type') FROM nodes WHERE id = ?", (node_id,)).fetchone()
+    # json_each walks every member of the top-level object, duplicates included
+    if row is None or row[1] != 1 or not isinstance(row[0], str):
+        return None
+    value = row[0]
+    name = value.strip().lower()
+    return name if _RTYPE_NAME.fullmatch(name) else None
+
+
+def classify_derivation(conn, source_id):
+    """-> (reasoning_type or None, hand_only, why or None) for a derivation
+    source. Hand-only when the type's engine reasoning CLASS is
+    `inductive_corroboration`, and (fail closed) whenever the type cannot be
+    read or is not a type the engine knows."""
+    rtype = read_reasoning_type(conn, source_id)
+    if rtype is None:
+        return None, True, UNREADABLE_WHY
+    types, classes = _reasoning_constants()
+    if rtype not in types:
+        return rtype, True, UNRECOGNIZED_WHY
+    if classes.get(rtype) == HAND_ONLY_CLASS:
+        return rtype, True, HAND_ONLY_WHY
+    return rtype, False, None
 
 
 def decide(le, named, addable, source_type):
@@ -747,7 +833,8 @@ class Run:
     def protected_pairs(self, conn):
         """Labelled edges whose effective label is mis-filed-premise and whose
         source is a derivation: never retyped by an earlier phase (the per-edge
-        pass routes them to retract+refile, or to already-covered)."""
+        pass routes them to the refile list (retract+refile, or hand-only for
+        a generalization / corroboration), or to already-covered)."""
         out = set()
         for le in self.labels["edges"]:
             eff = effective_label(le)
@@ -830,6 +917,11 @@ class Run:
 
     def phase_d(self, conn):
         for le, row, d, cand in self.label_decisions(conn):
+            if cand is not None and cand["source_type"] == "derivation":
+                (cand["reasoning_type"], cand["hand_only"],
+                 cand["why"]) = classify_derivation(conn, cand["source_id"])
+                if d["kind"] == "needs" and d.get("action") == "retract+refile" and cand["hand_only"]:
+                    d = dict(d, action="hand-only")
             if cand is not None and not any(c["edge_id"] == cand["edge_id"] for c in self.candidates):
                 if cand["source_type"] == "derivation":
                     cand["covered_path"] = premise_path(conn, cand["source_id"], cand["target_id"])
@@ -849,8 +941,11 @@ class Run:
                 if not self.still_cites(conn, row):
                     self.add("d", row, None, d["bucket"], "skipped-not-cites")
                     continue
+                extra = ({"reasoning_type": cand["reasoning_type"]}
+                         if cand is not None and "reasoning_type" in cand
+                         and d["action"] in ("retract+refile", "hand-only") else {})
                 self.add("d", row, None, d["bucket"], "needs-seat-read",
-                         bucket=d["bucket"], action=d["action"])
+                         bucket=d["bucket"], action=d["action"], **extra)
                 continue
             self.act(conn, "d", row, d["to"], d["code"], d.get("fallback"))
 
@@ -943,9 +1038,15 @@ class Run:
         for c in sorted(self.candidates, key=lambda c: c["edge_id"]):
             if c["source_type"] != "derivation" or c.get("covered_path") or not self.stays_cites(c):
                 continue
-            g = groups.setdefault(c["source_id"], {
-                "source_id": c["source_id"], "source_type": c["source_type"],
-                "action": "retract+refile", "targets": []})
+            if c["source_id"] not in groups:
+                g = {"source_id": c["source_id"], "source_type": c["source_type"],
+                     "action": "hand-only" if c["hand_only"] else "retract+refile",
+                     "reasoning_type": c["reasoning_type"]}
+                if c["hand_only"]:
+                    g["why"] = c["why"]
+                g["targets"] = []
+                groups[c["source_id"]] = g
+            g = groups[c["source_id"]]
             g["targets"].append({"edge_id": c["edge_id"], "target_id": c["target_id"],
                                  "reason": c["reason"], "relies": c["relies"]})
         return list(groups.values())
@@ -1104,6 +1205,10 @@ class Run:
             "fallbacks": self.fallbacks,
             "refile_counts": {"edges": sum(len(g["targets"]) for g in self.refile_by_source()),
                               "sources": len(self.refile_by_source())},
+            "hand_only_counts": {
+                "edges": sum(len(g["targets"]) for g in self.refile_by_source()
+                             if g["action"] == "hand-only"),
+                "sources": sum(1 for g in self.refile_by_source() if g["action"] == "hand-only")},
             "already_covered_counts": {
                 "edges": len(self.already_covered()),
                 "sources": len({c["source_id"] for c in self.already_covered()})},
@@ -1176,11 +1281,17 @@ def print_plan(run, header, out=None):
                 print(f"  edge {e['edge_id']} {e['source_id']} -> {e['target_id']} "
                       f"{verb} cites -> {e['to']} ({e['reason']}) [{e['status']}]", file=out)
     refile = run.refile_by_source()
-    print(f"retract+refile list: {len(refile)} source node(s), "
-          f"{sum(len(g['targets']) for g in refile)} edge(s)", file=out)
+    hand = [g for g in refile if g["action"] == "hand-only"]
+    print(f"refile list: {len(refile)} source(s) "
+          f"(retract+refile: {len(refile) - len(hand)}, hand-only: {len(hand)}); "
+          f"{sum(len(g['targets']) for g in refile)} edge(s); "
+          f"hand-only sources are never refiled, the premise role is read from the chain",
+          file=out)
     for g in refile:
+        tag = (f" [HAND-ONLY {g['reasoning_type'] or 'reasoning type unreadable'}: {g['why']}]"
+               if g["action"] == "hand-only" else "")
         print(f"  source {g['source_id']} ({g['source_type']}): "
-              f"{', '.join(t['target_id'] for t in g['targets'])}", file=out)
+              f"{', '.join(t['target_id'] for t in g['targets'])}{tag}", file=out)
     cov = run.already_covered()
     print(f"already covered (premise already wired): {len(cov)}", file=out)
     for c in cov:
