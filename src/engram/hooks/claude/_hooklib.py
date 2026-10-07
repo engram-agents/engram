@@ -45,6 +45,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -874,6 +875,25 @@ def _parse_iso_utc(text):
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
+def _open_regular_fd(path):
+    """An O_RDONLY fd for `path`, or None when it cannot be opened or is not a
+    regular file. O_NONBLOCK makes open() on a FIFO return at once instead of
+    waiting for a writer; the fstat then rejects it before any read. The ledger
+    reads run in a hook before its response is printed, and a try/except is
+    fail-open for an exception, not for a hang."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            return fd
+    except OSError:
+        pass
+    os.close(fd)
+    return None
+
+
 def session_started_at(session_id):
     """This session's `started_at` from `$ENGRAM_HOME/sessions/<sid>.json`
     (aware datetime), or None when the marker is missing/malformed. Shared
@@ -890,11 +910,138 @@ def session_started_at(session_id):
         return None
 
 
-def _earlier_shown_ids(routes_dir: Path) -> tuple:
-    """(ids, readable): every id in the `shown` list of every line already in
-    `routes_dir/*.jsonl` (both routes). A malformed line is skipped; a file
-    that cannot be read makes `readable` False. A routes dir that does not
-    exist yet is readable-and-empty (nothing has been shown)."""
+def _read_session_marker(session_id):
+    """The session marker dict from `$ENGRAM_HOME/sessions/<sid>.json`, or None
+    when it is missing, malformed or not an object."""
+    if not session_id:
+        return None
+    try:
+        home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+        fd = _open_regular_fd(Path(home) / "sessions" / f"{session_id}.json")
+        if fd is None:
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            marker = json.load(f)
+        return marker if isinstance(marker, dict) else None
+    except Exception:
+        return None
+
+
+def _marker_compaction_count(marker):
+    """The marker's `compaction_count` as an int, or None when the marker is
+    absent or lacks a usable value (a bool is not a count)."""
+    if not isinstance(marker, dict):
+        return None
+    n = marker.get("compaction_count")
+    if isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+        return n
+    return None
+
+
+_SUMMARY_MARK = b'"isCompactSummary":true'
+_BOUNDARY_MARK = b'"subtype":"compact_boundary"'
+# A real summary line is tens of KB (12 KB measured); json.loads of a matched
+# line costs about 3.5x the line in peak memory, so a line above this is skipped.
+_SUMMARY_LINE_CAP = 1_000_000
+_NODE_ID_RE = None  # compiled lazily: `_re` is imported further down the module
+
+
+def _summary_text(record):
+    """The text of a parsed compaction-summary record, or None when `record` is
+    not one: it must carry a top-level `isCompactSummary` that `is True` and a
+    `message.content` that is a string or a list of text blocks."""
+    if not isinstance(record, dict) or record.get("isCompactSummary") is not True:
+        return None
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            b["text"] for b in content
+            if isinstance(b, dict) and isinstance(b.get("text"), str))
+    return None
+
+
+def _last_summary_ids(transcript_path) -> tuple:
+    """(ids, readable): node ids that appear as text in the LAST compaction
+    summary of the session transcript. Found from the END of the file by a
+    backwards bytes search (mmap `rfind`); a hit that does not parse, or whose
+    record is not a real summary (`_summary_text`), is skipped and the search
+    continues backwards, so a record that merely quotes the phrase inside an
+    escaped string never matches (its quotes are escaped, so the bytes differ).
+    No transcript path, an unreadable file, or no summary record at all ->
+    readable False (unknown, never an empty set)."""
+    global _NODE_ID_RE
+    import mmap
+    try:
+        if not isinstance(transcript_path, str) or not transcript_path:
+            return set(), False
+        if _NODE_ID_RE is None:
+            _NODE_ID_RE = _re.compile(r"\b[a-z]{2}_\d{4,}(?:_[A-Za-z0-9]+)?\b")
+        # O_NONBLOCK: open() on a FIFO would block until a writer appears, and
+        # this runs in a hook that fires on every prompt and tool call. Only a
+        # regular file is ever mapped.
+        fd = _open_regular_fd(transcript_path)
+        if fd is None:
+            return set(), False
+        try:
+            with mmap.mmap(fd, 0, access=mmap.ACCESS_READ) as m:
+                end = len(m)
+                while end > 0:
+                    hit = m.rfind(_SUMMARY_MARK, 0, end)
+                    if hit < 0:
+                        return set(), False
+                    start = m.rfind(b"\n", 0, hit) + 1
+                    stop = m.find(b"\n", hit)
+                    if stop < 0:
+                        stop = len(m)
+                    if stop - start > _SUMMARY_LINE_CAP:
+                        # Treated like an unparseable hit. The cap is on the
+                        # LINE, not the file: a backward-scan window or a file
+                        # size cap would make a far-back summary read unknown,
+                        # a behaviour change this code deliberately does not take.
+                        end = start
+                        continue
+                    try:
+                        text = _summary_text(json.loads(m[start:stop]))
+                    except ValueError:
+                        text = None
+                    if text is not None:
+                        # A compact_boundary record AFTER this summary means a
+                        # newer compaction has begun and its own summary is not
+                        # written yet: this one is stale, so unreadable. File
+                        # order, not timestamps: on a real session the summary's
+                        # `timestamp` is about 2 minutes BEFORE the marker's
+                        # `started_at`, so a "newer than started_at" test would
+                        # reject the right summary. Measured on one real
+                        # transcript, in 5 of 5 compactions the boundary record
+                        # precedes its summary, and the summary precedes the
+                        # next boundary.
+                        if m.find(_BOUNDARY_MARK, hit) >= 0:
+                            return set(), False
+                        return set(_NODE_ID_RE.findall(text)), True
+                    end = start
+        finally:
+            os.close(fd)
+        return set(), False
+    except Exception:  # empty file (mmap ValueError), permissions, anything
+        return set(), False
+
+
+def _earlier_shown_ids(routes_dir: Path, compaction_count=None) -> tuple:
+    """(ids, readable): every id in the `shown` list of the lines already in
+    `routes_dir/*.jsonl` (both routes) that were written in the CURRENT context
+    window (#3556). `compaction_count` unknown (None) or 0: every earlier line
+    counts, as before. N > 0: a line counts only when its `compaction_count`
+    equals N; a lower count, or no `compaction_count` key (written by older
+    code), does not. Dropping old-format lines is the conservative direction:
+    it under-reports in_context and never over-reports it. A malformed line is
+    skipped; a file that cannot be read makes `readable` False. A routes dir
+    that does not exist yet is readable-and-empty (nothing has been shown).
+    A missing, corrupt or count-less marker makes the count None, so every
+    earlier line counts again and `shown` can over-report in that case."""
+    windowed = isinstance(compaction_count, int) and compaction_count > 0
     ids: set = set()
     readable = True
     try:
@@ -903,13 +1050,21 @@ def _earlier_shown_ids(routes_dir: Path) -> tuple:
         return ids, False
     for path in files:
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            fd = _open_regular_fd(path)
+            if fd is None:
+                readable = False
+                continue
+            with os.fdopen(fd, "r", encoding="utf-8") as f:
                 for raw in f:
                     try:
                         row = json.loads(raw)
                     except ValueError:
                         continue
-                    shown = row.get("shown") if isinstance(row, dict) else None
+                    if not isinstance(row, dict):
+                        continue
+                    if windowed and row.get("compaction_count") != compaction_count:
+                        continue
+                    shown = row.get("shown")
                     if isinstance(shown, list):
                         ids.update(i for i in shown if isinstance(i, str))
         except Exception:
@@ -928,8 +1083,12 @@ def _focused_ids() -> tuple:
         # Short lock wait: this source is optional and an unreadable result is
         # already handled (readable False -> in_context None), so a locked DB
         # must not cost the surface hook a full second.
+        db_path = Path(home) / "knowledge.db"
+        # stat does not block; sqlite3.connect on a FIFO could.
+        if not stat.S_ISREG(os.stat(db_path).st_mode):
+            return set(), False
         conn = sqlite3.connect(
-            f"file:{Path(home) / 'knowledge.db'}?mode=ro", uri=True, timeout=0.2)
+            f"file:{db_path}?mode=ro", uri=True, timeout=0.2)
         rows = conn.execute(
             "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
         ).fetchall()
@@ -945,11 +1104,16 @@ def _focused_ids() -> tuple:
 
 
 def _in_context_for(node_id, created_at, *, shown_ids, shown_ok, started,
-                    focused, focused_ok):
-    """`(in_context, why)` for one candidate against the three pre-read sources
+                    focused, focused_ok, summary_ids=frozenset(), summary_ok=True):
+    """`(in_context, why)` for one candidate against the pre-read sources
     (see `make_in_context_resolver`). First source that fired wins, in the order
-    shown, created, focused. None of the three -> (False, None); a source that
-    cannot be read and no readable source fired -> (None, None)."""
+    summary, shown, created, focused. That order is a decision to align with
+    the offline recompute tool so live and offline rows compare; it is not a
+    measured fact. None fired -> (False, None); a source that cannot be read and
+    no readable source fired -> (None, None). `summary_ok` is True with an empty
+    `summary_ids` when the summary source is off (no compaction yet)."""
+    if node_id in summary_ids:
+        return True, "summary"
     if node_id in shown_ids:
         return True, "shown"
     created_dt = _parse_iso_utc(created_at)
@@ -958,24 +1122,43 @@ def _in_context_for(node_id, created_at, *, shown_ids, shown_ok, started,
         return True, "created"
     if node_id in focused:
         return True, "focused"
-    if not (shown_ok and created_known and focused_ok):
+    if not (shown_ok and created_known and focused_ok and summary_ok):
         return None, None
     return False, None
 
 
-def make_in_context_resolver(session_id, routes_dir: Path):
+def make_in_context_resolver(session_id, routes_dir: Path, marker=None):
     """Build `resolve(node_id, created_at) -> (in_context, why)` for ONE ledger
-    write. Reads the three sources once, so call it BEFORE appending the line
+    write. Reads the sources once, so call it BEFORE appending the line
     being written (a node is never "already shown" by the very fire being
-    written). `why` is the FIRST source that fired, in the order shown,
-    created, focused. None of the three -> (False, None). A source that cannot
-    be read and no readable source fired -> (None, None): unknown, not false."""
-    shown_ids, shown_ok = _earlier_shown_ids(routes_dir)
-    started = session_started_at(session_id)
+    written). `why` is the FIRST source that fired, in the order summary,
+    shown, created, focused. None fired -> (False, None). A source that cannot
+    be read and no readable source fired -> (None, None): unknown, not false.
+
+    Compaction (#3556): `shown` counts only ledger lines of the current context
+    window, and once the session has compacted (marker `compaction_count` > 0)
+    the ids in the LAST compaction summary are a fourth source, read lazily here
+    from the marker's transcript. The summary is read now rather than at
+    SessionStart because on the one session measured (n=1) SessionStart ran
+    about 1.2 s BEFORE the transcript's compact_boundary record, with the
+    summary a few lines after it, so it is probably not in the file yet when the
+    marker is written. A session that has not compacted (count 0 or unknown)
+    never opens the transcript. `marker` is the already-read marker dict (read
+    here when omitted)."""
+    if marker is None:
+        marker = _read_session_marker(session_id)
+    count = _marker_compaction_count(marker)
+    shown_ids, shown_ok = _earlier_shown_ids(routes_dir, count)
+    started = _parse_iso_utc(marker.get("started_at")) if marker else None
     focused, focused_ok = _focused_ids()
+    if count:
+        summary_ids, summary_ok = _last_summary_ids(marker.get("transcript_path"))
+    else:
+        summary_ids, summary_ok = set(), True
     return functools.partial(
         _in_context_for, shown_ids=shown_ids, shown_ok=shown_ok,
-        started=started, focused=focused, focused_ok=focused_ok)
+        started=started, focused=focused, focused_ok=focused_ok,
+        summary_ids=summary_ids, summary_ok=summary_ok)
 
 
 def build_route_candidates(result: Optional[dict], in_context=None) -> tuple:
@@ -1058,7 +1241,8 @@ def write_route_ledger(
         if not session_dir.is_dir():
             return  # probe not live for this session: true optional, silent
         # Read the in_context sources BEFORE this line is appended (C4).
-        resolver = make_in_context_resolver(sid, session_dir / "routes")
+        marker = _read_session_marker(sid)
+        resolver = make_in_context_resolver(sid, session_dir / "routes", marker=marker)
         candidates, missing = build_route_candidates(result, in_context=resolver)
         shown_set = set(shown)
         cut = {
@@ -1069,6 +1253,7 @@ def write_route_ledger(
             "ts": int(_time.time() * 1000),
             "route": route,
             "session_id": sid,
+            "compaction_count": _marker_compaction_count(marker),
             "fire_key": fire_key,
             "source": source,
             "query": query,
@@ -1086,8 +1271,13 @@ def write_route_ledger(
         if not routes_dir.is_dir():
             os.mkdir(routes_dir, 0o700)
             os.chmod(routes_dir, 0o700)  # mkdir's mode is masked by umask
-        fd = os.open(routes_dir / f"{route}.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        # O_NONBLOCK: a write-open of a FIFO blocks until a reader appears, and
+        # nothing in this hook's response is printed until this function returns.
+        fd = os.open(routes_dir / f"{route}.jsonl",
+                     os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK, 0o600)
         try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return  # a FIFO with a reader would otherwise accept the write
             os.fchmod(fd, 0o600)
             os.write(fd, text.encode("utf-8"))
         finally:

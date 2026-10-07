@@ -2515,10 +2515,14 @@ def write_marker(hook_input: dict) -> dict | None:
     _existing_session_started_at = None
     _existing_injected_through = None
     _existing_started_at = None
+    _existing_compaction_count = 0
     try:
         with open(session_marker_path) as _existing_f:
             _existing_marker = json.load(_existing_f)
         if isinstance(_existing_marker, dict):
+            _cc = _existing_marker.get("compaction_count")
+            if isinstance(_cc, int) and not isinstance(_cc, bool) and _cc >= 0:
+                _existing_compaction_count = _cc
             _existing_session_started_at = _existing_marker.get("session_started_at")
             _existing_injected_through = _existing_marker.get("injected_through")
             _existing_started_at = _existing_marker.get("started_at")
@@ -2544,6 +2548,13 @@ def write_marker(hook_input: dict) -> dict | None:
             _existing_session_started_at or _existing_started_at or _started_at
         ),
         "injected_through": _existing_injected_through,
+        # Number of compactions this session has seen (#3556): +1 only on a
+        # source=="compact" SessionStart, carried unchanged otherwise, 0 for a
+        # brand-new marker. A legacy marker with no count that then compacts
+        # reads 1: an UNDERCOUNT of the true number, but the pre/post split the
+        # route ledger needs is still right.
+        "compaction_count": _existing_compaction_count
+        + (1 if str(hook_input.get("source") or "").lower() == "compact" else 0),
     }
     try:
         # Per-session marker keyed by session_id. Concurrent sessions own
