@@ -16,8 +16,10 @@ real disk writer can be identified. The contract pinned here:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -221,3 +223,84 @@ def test_suite_step_keeps_its_id(steps):
 def test_ci_nightly_if_expressions_unchanged(steps):
     assert steps[_index(steps, ON_FAILURE_NAME)]["if"] == ON_FAILURE_IF
     assert steps[_index(steps, ON_SUCCESS_NAME)]["if"] == ON_SUCCESS_IF
+
+
+# --- no pip wheel cache + no retained passing tmp dirs (#3539) --------------
+
+
+def _code_lines(run):
+    return [ln for ln in run.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+
+
+def _joined_command(run):
+    """Code lines with backslash continuations joined into single lines."""
+    return " ".join(
+        ln.strip().rstrip("\\").strip() if ln.rstrip().endswith("\\") else ln.strip()
+        for ln in _code_lines(run)
+    )
+
+
+def test_every_pip_install_line_has_no_cache_dir(steps):
+    run = steps[_install_index(steps)]["run"]
+    pip_lines = [ln for ln in _code_lines(run) if "pip install" in ln]
+    # >= 3 so an empty/short match cannot pass vacuously (upgrade + two -r installs).
+    assert len(pip_lines) >= 3, pip_lines
+    for ln in pip_lines:
+        # Strip a trailing ` #...` comment: the flag must be a real argument,
+        # not text in a comment on the line.
+        argv_part = re.split(r"\s#", ln, maxsplit=1)[0]
+        assert "--no-cache-dir" in argv_part, f"pip install without --no-cache-dir: {ln!r}"
+
+
+def test_suite_step_drops_passing_tests_tmp_dirs(steps):
+    # Code lines only: the step's explanatory comment quotes the flag too, so a
+    # raw substring check would stay green with the flag itself deleted. And the
+    # flag must sit in pytest's argv: the part of the command before the first
+    # `|` / `2>&1`, so moving it after `| tee` (passed to tee) goes red.
+    cmd = _joined_command(steps[_suite_index(steps)]["run"])
+    pytest_part = re.split(r"\||2>&1", cmd, maxsplit=1)[0]
+    assert "pytest " in pytest_part, pytest_part
+    assert "-o tmp_path_retention_policy=failed" in pytest_part, pytest_part
+
+
+def test_suite_step_rest_of_contract_unchanged(steps):
+    step = steps[_suite_index(steps)]
+    assert step.get("shell") == "bash"
+    run = "\n".join(_code_lines(step["run"]))
+    for needle in ("set -o pipefail", "tests/ src/forum/tests/", "--cov=src --cov-branch",
+                   "tee /tmp/nightly-output.log"):
+        assert needle in run, f"{needle!r} missing from the suite step"
+
+
+RETENTION_ARG = "tmp_path_retention_policy=failed"
+
+_GENERATED_TESTS = '''\
+def test_passes(tmp_path):
+    (tmp_path / "marker.txt").write_text("x")
+
+
+def test_fails(tmp_path):
+    (tmp_path / "marker.txt").write_text("x")
+    assert False
+'''
+
+
+def test_retention_policy_failed_keeps_only_failing_tests_dirs(tmp_path):
+    # Executable check of the suite step's flag on the pytest actually installed:
+    # run pytest on a tiny generated file with default basetemp (steered into an
+    # isolated TMPDIR) and see which tmp_path dirs survive.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "test_gen.py").write_text(_GENERATED_TESTS, encoding="utf-8")
+    tmpdir = tmp_path / "tmpdir"
+    tmpdir.mkdir()
+    env = {k: v for k, v in os.environ.items() if k != "PYTEST_ADDOPTS"}
+    env.update({"TMPDIR": str(tmpdir), "TMP": str(tmpdir), "TEMP": str(tmpdir)})
+    r = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
+         "-o", RETENTION_ARG, str(proj / "test_gen.py")],
+        cwd=proj, env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert "1 failed, 1 passed" in r.stdout, r.stdout + r.stderr
+    markers = sorted(p.parent.name for p in tmpdir.rglob("marker.txt"))
+    assert markers == ["test_fails0"], (markers, r.stdout)

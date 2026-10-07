@@ -225,6 +225,38 @@ def _restore_leaky_env_keys():
 
 
 @pytest.fixture(autouse=True)
+def _reset_telemetry_process_file_path(monkeypatch):
+    """Start every test with no cached telemetry file path / emitter instance (#3539).
+
+    engram_telemetry_store caches ONE per-process file path in
+    ``_PROCESS_FILE_PATH`` on first use, resolved under ``$ENGRAM_HOME/telemetry``.
+    In production ENGRAM_HOME never changes within a process, so that is right.
+    Under pytest the first test to emit telemetry pinned the path inside ITS OWN
+    tmp ENGRAM_HOME and every later test wrote there: a silent cross-test leak
+    under the default ``tmp_path_retention_policy=all``, and FileNotFoundError on
+    stderr under ``=failed`` (that dir is deleted at teardown).
+
+    Reset to None before each test (monkeypatch restores the prior value after,
+    so the store's atexit finalize still sees whatever was cached before).
+    No-op when the module has not been imported yet: the first use then resolves
+    against the ENGRAM_HOME in force. The store is imported under one name only
+    (``engram_telemetry_store``, via src/engram on sys.path), so one lookup covers it."""
+    mod = sys.modules.get("engram_telemetry_store")
+    if mod is not None:
+        monkeypatch.setattr(mod, "_PROCESS_FILE_PATH", None)
+    # engram_log_emitter has the SAME shape: its ``_EMITTER_INSTANCE`` singleton
+    # caches ``logs_dir`` (``$ENGRAM_HOME/logs``) at first init(). Under
+    # ``=failed`` retention the second leak surfaced as
+    # ``[engram-emitter] emit(...) FAILED: FileNotFoundError`` once the telemetry
+    # path was fixed. The emitter opens-appends-closes per event (no held handle,
+    # no atexit), so dropping the instance leaves nothing open.
+    emitter = sys.modules.get("engram_log_emitter")
+    if emitter is not None:
+        monkeypatch.setattr(emitter, "_EMITTER_INSTANCE", None)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _stop_snapshot_worker():
     """Stop + reset the #1673 async snapshot worker after each test.
 

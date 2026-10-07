@@ -82,12 +82,15 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements/requirements-dev.txt
+          # --no-cache-dir on every pip call (#3539): the pip wheel cache was ~3G
+          # on the runner (torch + CUDA stack) and is never reused on an
+          # ephemeral runner, so it only eats disk.
+          python -m pip install --no-cache-dir --upgrade pip
+          pip install --no-cache-dir -r requirements/requirements-dev.txt
           # src/forum/tests/ import forum.server (Flask + bleach + markdown-it-py +
           # beautifulsoup4 + html5lib) — deps live in src/forum/requirements.txt,
           # not the main requirements. (Same as tests.yml.)
-          pip install -r src/forum/requirements.txt
+          pip install --no-cache-dir -r src/forum/requirements.txt
 
       - name: disk usage — before suite
         # #3539 — MEASUREMENT ONLY. Contract: a disk-read step can NEVER change
@@ -178,7 +181,11 @@ jobs:
           # success()` closes any open ci-nightly issue on a red suite
           # (umwelt#738 round 1 / CLAUDE.md's umwelt#558 pipe-exit note).
           set -o pipefail
+          # -o tmp_path_retention_policy=failed (#3539): pytest's default keeps
+          # every test's tmp_path (measured 1.8G retained on a green night);
+          # with "failed", passing tests' dirs are removed, failing tests keep theirs.
           pytest tests/ src/forum/tests/ -v --tb=short \
+            -o tmp_path_retention_policy=failed \
             --cov=src --cov-branch \
             --cov-report=xml:coverage.xml --cov-report=html:htmlcov --cov-report=term \
             2>&1 | tee /tmp/nightly-output.log
