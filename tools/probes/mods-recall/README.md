@@ -316,6 +316,72 @@ rather than asserting the ratings are the agent's own. Tests:
 `tests/test_probe_fleet_report_3549.py`; the byte pin for `probe_eval`'s own report is
 `tests/test_probe_eval_report_pin_3549.py`.
 
+## Offline `in_context` across compaction (#3556 Half A)
+
+The route ledger's `in_context` is written live and never resets at a compaction, so after a
+compaction it can say "in context" for an id the model no longer holds. `recompute_in_context.py`
+recomputes it offline from the session transcript and writes a sidecar. It never rewrites the
+ledger or the transcript.
+
+```
+~/.engram/venv/bin/python recompute_in_context.py ~/.claude/projects/<proj>/<session>.jsonl \
+    ~/.engram/probe/mods-recall/<session>/routes --out <new or empty dir> [--persisted-root DIR]
+```
+
+Run it with the venv python (3.12), not the system `python3`. Before Python 3.11, `datetime.fromisoformat`
+rejects a trailing `Z`, which Claude Code transcripts use; the tool now rewrites `Z` to `+00:00` before
+every parse, so a 3.9 run gives the same output on the two real transcripts tried, but the venv python is
+the interpreter the tests and the checks ran on.
+
+For a ledger line at time t and candidate x: the boundary B is the last transcript line with
+`isCompactSummary: true` stamped before t, and the window is the lines stamped after B and before t
+(both strict). First match wins: `summary` (x is in B's own message), `shown` (x is in text of a
+window line), `persisted` (x is in a persisted-output file a window line points at), `created`
+(`created_at` in [B, t); a naive `created_at` is read as UTC), `focused` (the hook's own value),
+`none`. `in_context_offline` is true for every why except `none`; it is `null` (unknown, never false)
+only when `created_at` is missing or unparsable, nothing else matched, and the hook did not say
+`focused`.
+
+With no boundary before t (the steps before the first compaction, or a session with none) the flag is
+still computed from the transcript text, never copied from the hook: the window is [the first
+transcript line's timestamp, t), start inclusive, end strict, and the same order applies minus
+`summary`. The hook's own `in_context` / `in_context_why` always sit beside the result as
+`in_context_hook` / `in_context_hook_why`. `summary.json` counts `hook_flag_present` and
+`hook_flag_absent` (candidates with and without a hook `in_context`), so a `disagree_with_hook` of 0
+can be read: on a seat whose hook predates #3554 every candidate is absent and 0 means nothing.
+
+Text of a line is every string in it, except sidechain lines, metadata line types, and any line that
+carries the probe's own rating-request marker. `hook_success` `stdout` is JSON-decoded first, so an
+id behind a `\uXXXX` escape is found. A `<persisted-output>` stub ("Output too large ... Full output
+saved to: <path>") has its file read only when the path resolves to a regular file of at most 5 MiB
+inside `~/.claude/projects/`, the transcript's directory, or a `--persisted-root`; any other path
+(including a NUL byte in it) is refused, named on stderr, and counted in
+`persisted_output_stubs_missing`.
+
+A ledger `ts` is milliseconds. If a row's `ts` lies outside [the transcript's earliest timestamp minus
+1 day, its latest plus 1 day] the unit is almost certainly wrong (seconds put t in 1970, microseconds
+put it in the far future): the tool prints one stderr warning per ledger file, counts the rows in
+`ledger_ts_implausible_rows`, and still processes them.
+
+Output: `<out>/<route>.in_context_offline.jsonl` (one row per ledger line, same order: `ts`, `route`,
+`fire_key`, `boundary_index`, `boundary_ts`, and per candidate `in_context_offline`,
+`in_context_offline_why`, `in_context_hook`, `in_context_hook_why`) and `<out>/summary.json`. Files are
+0600, the directory 0700, and a non-empty `--out` is refused. A truncated last ledger line is skipped
+and counted; any other unparsable ledger line is an error naming the line.
+
+Bounds to read the numbers by:
+
+- `focused` is the hook's own value. The live focus set is a database state, and the transcript does not
+  carry it: measured on one real transcript, the SessionStart `compact` injection holds the saved
+  focus-set names and, in the briefing text, a human-written "Currently focused" section, not the
+  focus-list node ids as such. An id that is focused but never named in any window text is therefore
+  reported only through the hook's value.
+- A persisted-output file that is gone, over the cap, or outside the allowed roots is the remaining
+  under-report; the count is in `summary.json`.
+- `shown` means the id's text sits in the window, not that the model attended to it.
+
+`probe_eval.py` and `probe_fleet_report.py` do not read the sidecar yet.
+
 ## Tests
 
 ```
