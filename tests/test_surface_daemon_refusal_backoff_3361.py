@@ -31,7 +31,8 @@ import contextlib
 import importlib.util
 import io
 import os
-import select
+import resource
+import selectors
 import shutil
 import signal
 import subprocess
@@ -293,20 +294,27 @@ class TestRealSubprocess(_Base, unittest.TestCase):
         return p
 
     def _read_line(self, p, timeout=20.0) -> tuple[str, float]:
-        """Block (select) until a full stderr line arrives; (line, t_seen)."""
+        """Block (selectors) until a full stderr line arrives; (line, t_seen)."""
         buf = b""
         end = time.monotonic() + timeout
         fd = p.stderr.fileno()
-        while b"\n" not in buf:
-            left = end - time.monotonic()
-            if left <= 0:
-                self.fail(f"no stderr line within {timeout}s; got {buf!r}")
-            r, _, _ = select.select([fd], [], [], left)
-            if r:
-                chunk = os.read(fd, 4096)
-                if not chunk:
-                    break
-                buf += chunk
+        # DefaultSelector (kqueue/epoll), not select.select: select() is
+        # capped at fd 1023 and fails under a full-suite run (#3361).
+        sel = selectors.DefaultSelector()
+        try:
+            sel.register(fd, selectors.EVENT_READ)
+            while b"\n" not in buf:
+                left = end - time.monotonic()
+                if left <= 0:
+                    self.fail(f"no stderr line within {timeout}s; got {buf!r}")
+                r = sel.select(timeout=left)
+                if r:
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+        finally:
+            sel.close()
         return buf.decode(errors="replace"), time.monotonic()
 
     def _setup(self):
@@ -371,6 +379,61 @@ class TestRealSubprocess(_Base, unittest.TestCase):
 
     def test_k6_sigint_during_long_wait_exits_promptly(self):
         self._term_during_long_wait(signal.SIGINT, quiet_exit_75=True)
+
+
+# ----------------------------------------- _read_line above the select() cap
+class TestReadLineFdLimit(unittest.TestCase):
+    """Needs neither /proc/net/unix nor lsof, so it is NOT behind
+    TestRealSubprocess's skip: the fd-limit regression stays guarded on every
+    seat. Borrows the helper under test from TestRealSubprocess."""
+
+    _read_line = TestRealSubprocess._read_line
+
+    def test_wait_works_with_fd_above_select_limit(self):
+        """_read_line must work when the pipe fd is >= 1024 (select() limit)."""
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = 1200
+        if soft != resource.RLIM_INFINITY and soft < want:
+            target = want if hard == resource.RLIM_INFINITY else min(want, hard)
+            if target < want:
+                self.skipTest(f"cannot raise RLIMIT_NOFILE to {want} (hard={hard})")
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            except (ValueError, OSError) as e:
+                self.skipTest(f"cannot raise RLIMIT_NOFILE: {e}")
+            self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        r, w = os.pipe()
+        fillers = [r, w]  # closed on any failure path
+
+        def _cleanup():
+            for f in fillers:
+                with contextlib.suppress(OSError):
+                    os.close(f)
+
+        self.addCleanup(_cleanup)
+        # First dup BEFORE the loop: if the pipe's own fd is already above
+        # 1100 (process holding many fds) `high` must still not be `r`, or
+        # os.close(r) below closes the fd we are about to wrap.
+        high = os.dup(r)
+        fillers.append(high)
+        while high <= 1100:
+            high = os.dup(r)
+            fillers.append(high)
+        os.close(r)
+        fillers.remove(r)
+        fillers.remove(w)
+        wf = os.fdopen(w, "wb")
+        self.addCleanup(lambda: wf.closed or wf.close())
+        rf = os.fdopen(high, "rb", buffering=0)
+        fillers.remove(high)
+        self.addCleanup(rf.close)
+        self.assertGreater(rf.fileno(), 1023)
+        wf.write(b"hello refusal line\n")
+        wf.flush()
+        fake = unittest.mock.Mock(stderr=rf)
+        line, t_seen = self._read_line(fake, timeout=5.0)
+        self.assertEqual(line, "hello refusal line\n")
+        self.assertIsInstance(t_seen, float)
 
 
 if __name__ == "__main__":
