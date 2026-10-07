@@ -70,10 +70,15 @@
 #   agentctl share-status [<agent>]      # list active shares
 #   sudo agentctl spawn [--runtime claude]  (v0.1: claude only)
 #                       [--alpha-source PATH] [--bootstrap-path PATH]
+#                       [--forum-url URL]
 #                                        # birth a newborn-tagged agent
 #                                        # (agent-newborn-YYYYMMDDhhmmss)
 #                                        # via /usr/local/sbin/agent-bootstrap.
 #                                        # Prints next-step instructions.
+#                                        # --forum-url leaves a one-line hint
+#                                        # (~/.engram/forum-url.hint) that the
+#                                        # first-session offers as the default
+#                                        # answer to its forum question.
 #                                        # Multi-runtime (gemini-cli, codex) is
 #                                        # forthcoming as a separate epic.
 #   sudo agentctl finalize-name <newborn-id> <chosen>
@@ -1317,6 +1322,101 @@ cmd_attach() {
 # finalize-name then does the substrate rename in one shot — no general-purpose
 # rename is provided (names are immutable post-finalize).
 
+# ---- spawn --forum-url hint (#3563) ----
+# agentctl runs as ROOT. Nothing derived from the URL is ever sourced, eval'd
+# or executed here; it is only compared, measured and written as one line of
+# data. The full URL validation happens later, in the seat, by set_forum_url.py.
+
+# _forum_hint_url_problem <url>: prints the reason and returns 1 when the value
+# is not an acceptable hint; returns 0 silently when it is. Deliberately only a
+# minimal shape check: 1..2048 bytes, http:// or https://, no whitespace or
+# control characters, no '@' (credentials never go in a hint), and none of the
+# shell metacharacters  ` $ \ " ' ; & | < > ( ) { }
+_forum_hint_url_problem() {
+    local LC_ALL=C
+    local url="$1"
+    if [[ ${#url} -lt 1 || ${#url} -gt 2048 ]]; then
+        echo "must be 1..2048 bytes long"; return 1
+    fi
+    case "$url" in
+        http://?*|https://?*) ;;
+        *) echo "must start with http:// or https://"; return 1 ;;
+    esac
+    case "$url" in
+        *[[:space:][:cntrl:]]*) echo "must not contain whitespace or control characters"; return 1 ;;
+    esac
+    if [[ "$url" == *"@"* ]]; then
+        echo "must not contain '@' (credentials never go in a hint)"; return 1
+    fi
+    local meta='`$\"'"'"';&|<>(){}'
+    local i
+    for ((i = 0; i < ${#meta}; i++)); do
+        if [[ "$url" == *"${meta:i:1}"* ]]; then
+            echo "must not contain the shell metacharacter '${meta:i:1}'"; return 1
+        fi
+    done
+    return 0
+}
+
+# _write_forum_hint <home> <user> <group> <url>
+# Writes <home>/.engram/forum-url.hint as ROOT: exactly one line (the URL), mode
+# 0600, owned by <user>:<group>. Never overwrites and never follows a symlink:
+# it refuses when .engram is not a real directory owned by <user>, or when the
+# target path already exists in any form; the file is written under a temp name
+# in the same directory, owned and moded there, then PUBLISHED with a link(2)-
+# style `ln temp final`, which fails when `final` exists (mv -n is not atomic
+# against a racing create). Returns 0 on success; on any refusal or failure it
+# prints a WARN naming the manual step and returns 1. The caller treats that as
+# non-fatal: the newborn exists and is usable without a hint.
+_write_forum_hint() {
+    local home="$1" user="$2" group="$3" url="$4"
+    local dir="$home/.engram"
+    local target="$dir/forum-url.hint"
+    local tmp="" why=""
+    local manual="to leave a hint by hand, write the URL as one line to $target as $user"
+
+    if ! why="$(_forum_hint_url_problem "$url")"; then
+        echo "WARN: forum-url.hint not written: URL $why; $manual" >&2
+        return 1
+    fi
+    # Assumption that makes this check-then-write window acceptable: at spawn
+    # time the newborn account has just been created and has no running process,
+    # so nothing can swap .engram between these checks and the write below. If
+    # that ever stops being true, do the write AS the newborn (runuser) instead
+    # of as root.
+    if [[ -L "$home" || -L "$dir" || ! -d "$dir" ]]; then
+        echo "WARN: forum-url.hint not written: $dir is not a real directory (symlink or missing); $manual" >&2
+        return 1
+    fi
+    if [[ "$(stat -c %U "$dir" 2>/dev/null)" != "$user" ]]; then
+        echo "WARN: forum-url.hint not written: $dir is not owned by $user; $manual" >&2
+        return 1
+    fi
+    if [[ -e "$target" || -L "$target" ]]; then
+        echo "WARN: forum-url.hint not written: $target already exists (a hint is never overwritten); $manual" >&2
+        return 1
+    fi
+
+    tmp="$(umask 077; mktemp "$dir/.forum-url.hint.XXXXXX" 2>/dev/null)" || {
+        echo "WARN: forum-url.hint not written: cannot create a temp file in $dir; $manual" >&2
+        return 1
+    }
+    if ! { (umask 077; printf '%s\n' "$url" > "$tmp") \
+           && chown -h "$user:$group" "$tmp" \
+           && chmod 0600 "$tmp"; } 2>/dev/null; then
+        rm -f -- "$tmp"
+        echo "WARN: forum-url.hint not written: could not write or own the temp file in $dir; $manual" >&2
+        return 1
+    fi
+    if ! ln -- "$tmp" "$target" 2>/dev/null; then
+        rm -f -- "$tmp"
+        echo "WARN: forum-url.hint not written: $target appeared first or cannot be linked (never overwritten); $manual" >&2
+        return 1
+    fi
+    rm -f -- "$tmp"
+    return 0
+}
+
 cmd_spawn() {
     require_root "spawn"
     _require_viz_operator "spawn"
@@ -1324,8 +1424,23 @@ cmd_spawn() {
     local runtime="claude"
     local alpha_source=""
     local bootstrap_path="/usr/local/sbin/agent-bootstrap"
+    local forum_url="" forum_url_given=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --forum-url|--forum-url=*)
+                if [[ $forum_url_given -eq 1 ]]; then
+                    echo "ERROR: --forum-url given more than once" >&2; exit 2
+                fi
+                forum_url_given=1
+                if [[ "$1" == --forum-url=* ]]; then
+                    forum_url="${1#--forum-url=}"; shift
+                else
+                    if [[ $# -lt 2 ]]; then
+                        echo "ERROR: --forum-url requires a value" >&2; exit 2
+                    fi
+                    forum_url="$2"; shift 2
+                fi
+                ;;
             --runtime)          runtime="$2"; shift 2 ;;
             --runtime=*)        runtime="${1#--runtime=}"; shift ;;
             --alpha-source)     alpha_source="$2"; shift 2 ;;
@@ -1335,6 +1450,17 @@ cmd_spawn() {
             *) echo "ERROR: unknown flag '$1'" >&2; exit 2 ;;
         esac
     done
+
+    # Early, minimal shape check of the hint URL, BEFORE any side effect (the
+    # user is created further down). Not the full validation: set_forum_url.py
+    # does that when the seat writes the key.
+    if [[ $forum_url_given -eq 1 ]]; then
+        local forum_url_why
+        if ! forum_url_why="$(_forum_hint_url_problem "$forum_url")"; then
+            echo "ERROR: --forum-url $forum_url_why" >&2
+            exit 2
+        fi
+    fi
 
     if [[ ! -x "$bootstrap_path" ]]; then
         echo "ERROR: agent-bootstrap not found at $bootstrap_path" >&2
@@ -1403,7 +1529,22 @@ cmd_spawn() {
     chgrp agents "/home/agent-$newborn_tag" 2>/dev/null || \
         echo "WARN: chgrp agents /home/agent-$newborn_tag failed; the operator may not be able to traverse the new home." >&2
 
-    audit "spawn" "$newborn_tag" "newborn" "runtime=$runtime"
+    # Leave the forum-url hint (only when --forum-url was passed). Non-fatal:
+    # a failure is a WARN with the manual step, never a failed spawn.
+    local forum_hint="no"
+    if [[ $forum_url_given -eq 1 ]]; then
+        local newborn_group
+        newborn_group="$(id -gn "$user_name" 2>/dev/null)" || newborn_group="$user_name"
+        if _write_forum_hint "/home/agent-$newborn_tag" "$user_name" "$newborn_group" "$forum_url"; then
+            forum_hint="yes"
+        fi
+    fi
+
+    # Without --forum-url the audit line is exactly what it always was. With it,
+    # the line records THAT a hint was left (yes|no), never the URL.
+    local audit_extras="runtime=$runtime"
+    [[ $forum_url_given -eq 1 ]] && audit_extras+=" forum_hint=$forum_hint"
+    audit "spawn" "$newborn_tag" "newborn" "$audit_extras"
 
     cat <<NEXT
 
@@ -1430,6 +1571,9 @@ The newborn is at $user_name. To complete the birth:
 To abandon a newborn before finalize-name (simple cleanup):
   sudo userdel -r $user_name
 NEXT
+    if [[ "$forum_hint" == "yes" ]]; then
+        echo "A forum URL hint was left at /home/agent-$newborn_tag/.engram/forum-url.hint; the first-session will offer it as the default answer (the user still confirms)."
+    fi
 }
 
 cmd_finalize_name() {
@@ -2477,6 +2621,18 @@ cmd__detect_platform_as_self() {
     _session_platform "$override" "" 1
 }
 
+# Not listed in user-facing help (internal verb, invoked programmatically).
+# Usage: agentctl __forum-hint-url-ok <url>
+# Exercises the --forum-url shape check directly: exit 0 = acceptable; exit 1
+# plus the reason on stdout = refused. No sudo, no users, no side effects.
+cmd__forum_hint_url_ok() {
+    local url="${1-}" why
+    if ! why="$(_forum_hint_url_problem "$url")"; then
+        echo "forum-url: $why"
+        exit 1
+    fi
+}
+
 case "$SUBCMD" in
     health)        cmd_health        "$@" ;;
     session)       cmd_session       "$@" ;;
@@ -2498,6 +2654,7 @@ case "$SUBCMD" in
     __resolve-viz-operator-from-config) cmd__resolve_viz_operator_from_config "$@" ;;
     __viz-operator-charset-ok) cmd__viz_operator_charset_ok "$@" ;;
     __validate-chosen-name) cmd__validate_chosen_name "$@" ;;
+    __forum-hint-url-ok) cmd__forum_hint_url_ok "$@" ;;
     __as-self-check) cmd__as_self_check "$@" ;;
     __parse-session-flags) cmd__parse_session_flags "$@" ;;
     __detect-platform-as-self) cmd__detect_platform_as_self "$@" ;;

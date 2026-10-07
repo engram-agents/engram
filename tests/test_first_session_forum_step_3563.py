@@ -458,7 +458,8 @@ class TestC8PinnedWording:
     def test_fence_is_the_one_c7_runs(self):
         sec = _step57_section(_skill_text())
         fences = _fences(sec)
-        assert len(fences) == 3, "Step 5.7 carries the answer template, the force fence and the block"
+        assert len(fences) == 4, ("Step 5.7 carries the answer template, the force fence, "
+                                  "the block and the hint-consume fence (slice 2b)")
         block = _block()
         assert block in fences
         assert block.lstrip().startswith(MARKER)

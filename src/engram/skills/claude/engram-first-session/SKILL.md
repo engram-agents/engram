@@ -397,7 +397,13 @@ On decline: tell the user: "No problem. You can start the viz server manually an
 
 Hooks and CLIs treat a non-empty string `forum.url` in `~/.engram/config.json` as "forum configured", and nothing infers it. This is the only step that can ask the user for it. It is optional, and it is asked on every install, single-agent too (a single-host agent can have a forum).
 
-**Asked once.** Run the block below FIRST with no `FORUM_ANSWER`. If it prints `set_forum_url.py is not installed here (no forum components on this install): skip this step`, this install has no forum components: SKIP the question, do not ask it, and move on (you may mention that a forum can be connected later by installing the convenience tier). Otherwise, if `forum.url` is already set (identity-resolve mode, a re-run, an operator that set it), it prints the value it found, says it is already set, and you SKIP the question: tell the user what is set and move on. If it prints that the key is not set, ask the question.
+**Asked once.** Run the block below FIRST with no `FORUM_ANSWER`. If it prints `set_forum_url.py is not installed here (no forum components on this install): skip this step`, this install has no forum components: SKIP the question, do not ask it, and move on (you may mention that a forum can be connected later by installing the convenience tier). In that case the operator's hint (below) is NOT offered, because the tool that would apply it is not there; the hint is left where it is. Otherwise, if `forum.url` is already set (identity-resolve mode, a re-run, an operator that set it), it prints the value it found, says it is already set, and you SKIP the question: tell the user what is set and move on. (If an operator's hint was still lying around, the block also removes it and prints `stale forum-url.hint removed`; nothing for you to do.) If it prints that the key is not set, ask the question.
+
+**The operator's hint.** An operator who created this account with `agentctl spawn --forum-url URL` leaves one line in `~/.engram/forum-url.hint`. The block reads only that file's first line, and only through a short Python read (it is never sourced, and nothing else reads it). If the line is an `http://` or `https://` URL and `forum.url` is not set, the block's one line names it: `forum.url is not set (ask the question; the operator who created this account suggested <URL>: offer it as the default)`. If the file is there but its first line is not a usable `http(s)` URL, the block says it is ignoring it and prints the plain not-set line; do not offer anything. When a URL is suggested, ask the same question below with one change: put the suggestion first, as the proposed default.
+
+> **Optional — is there an ENGRAM forum I should connect to?** The operator who created this account suggested `<URL>`. Use it / give a different URL / no forum?
+
+"Use it" is answer (a) or (b) with that URL; "give a different URL" is answer (b) with the user's URL; "no forum" is answer (c). The user's confirmation, not the hint, decides: never put the hinted URL into `FORUM_ANSWER` unless the user chose it, and never write it any other way. Without a suggestion, ask the three-answer question as written below.
 
 Ask the user ONE question with three answers:
 
@@ -407,7 +413,7 @@ Ask the user ONE question with three answers:
 > - **(b) On another host.** Type the LAN URL of the forum (for example `http://192.168.1.50:5002`).
 > - **(c) No forum.** I'll leave it unset; nothing changes, and the forum, baton and letter hooks stay correctly silent. *(Pick this if you are unsure — you can add a forum any time.)*
 
-The URL is never guessed and never taken from the `FORUM_URL` environment variable, a file, or `hostname`; only the user's answer counts. For (a) with a different port, use the port the user gave. For (c), do nothing more: the key stays absent, and you do not run the block again. If the user is unsure, (c) is the default.
+The URL is never guessed and never taken from the `FORUM_URL` environment variable, a file, or `hostname`; only the user's answer counts. For (a) with a different port, use the port the user gave. For (c), write nothing: the key stays absent, and you do not run the block again. Run the consume fence (`forum-url-hint-consume`, see "Consuming the hint" below) so an operator's hint does not come back on a rerun. If the user is unsure, (c) is the default.
 
 For (a) or (b), write the key ONLY by running `set_forum_url.py` through the block below, with the user's URL in `FORUM_ANSWER`. Never edit `config.json` inline for this key; the tool validates the URL and writes atomically. The block finds the tool the way the other steps find plugin tools (plugin root first, then the runtime's marketplace path), and a missing tool is an `ERROR` line, not a first-session abort.
 
@@ -441,6 +447,29 @@ print(u.strip() if isinstance(u, str) and u.strip() else "")
 PYEOF
 )"
 FORUM_ANSWER="${FORUM_ANSWER:-}"
+HINT_FILE="${ENGRAM_HOME:-$HOME/.engram}/forum-url.hint"
+# The operator's hint: the first line only, read through Python, never sourced.
+# Prints "absent", "invalid" or "valid <url>".
+HINT_STATE="$("$PY" - "$HINT_FILE" <<'PYEOF'
+import os, re, stat, sys
+try:
+    # Not a regular file (a FIFO would block the open): invalid, before opening.
+    if not stat.S_ISREG(os.stat(sys.argv[1]).st_mode):
+        print("invalid")
+        raise SystemExit
+    with open(sys.argv[1], encoding="utf-8") as f:
+        line = f.readline(4097).strip()
+except FileNotFoundError:
+    print("absent")
+    raise SystemExit
+except Exception:
+    print("invalid")
+    raise SystemExit
+ok = (len(line) <= 4096 and re.match(r"https?://.+", line)
+      and not re.search(r"[\s\x00-\x1f\x7f]", line))
+print("valid " + line if ok else "invalid")
+PYEOF
+)"
 TOOL="${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/tools/set_forum_url.py}"
 [ -f "$TOOL" ] || TOOL="$HOME/.engram/marketplace/plugins/engram/tools/set_forum_url.py"
 FORCE=""
@@ -450,8 +479,14 @@ if [ -z "$FORUM_ANSWER" ]; then
     echo "set_forum_url.py is not installed here (no forum components on this install): skip this step"
   elif [ -n "$EXISTING" ]; then
     echo "forum.url is already set: $EXISTING (skip the question)"
+    if [ -e "$HINT_FILE" ] || [ -L "$HINT_FILE" ]; then
+      rm -f -- "$HINT_FILE" && echo "stale forum-url.hint removed (forum.url is already set)"
+    fi
+  elif [ "${HINT_STATE%% *}" = "valid" ]; then
+    echo "forum.url is not set (ask the question; the operator who created this account suggested ${HINT_STATE#valid }: offer it as the default)"
   else
     echo "forum.url is not set (ask the question; answer (c) leaves it unset)"
+    [ "$HINT_STATE" = "invalid" ] && echo "forum-url.hint is present but its first line is not a usable http(s) URL: ignoring it"
   fi
 else
   if [ ! -f "$TOOL" ]; then
@@ -478,6 +513,17 @@ export FORUM_FORCE=1
 ```
 
 If the block prints the `ERROR` line, tell the user the forum can be connected later by running `set_forum_url.py` from the plugin's `tools/` directory, and continue.
+
+**Consuming the hint.** After the question has been answered, run this fence, in its own Bash call, after ANY answer, including "no forum" (answer (c)), "give a different URL" and "use it", and also when the tool refused the URL. It deletes the operator's hint and nothing else, so a "no forum" answer does not come back as an offer on a later first-session run. It prints one line when it removed something and nothing when there was no hint. Skip it only when the step was skipped (tool not installed). If the session ends before the question is answered, the hint stays for the next run, which is intended.
+
+```bash
+# forum-url-hint-consume
+HINT_FILE="${ENGRAM_HOME:-$HOME/.engram}/forum-url.hint"
+if [ -e "$HINT_FILE" ] || [ -L "$HINT_FILE" ]; then
+  rm -f -- "$HINT_FILE" && echo "forum-url.hint consumed"
+fi
+:
+```
 
 ## Step 6 — Finalize (the substitution step)
 
