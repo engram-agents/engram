@@ -40,12 +40,15 @@ os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 if HOOK_DIR not in sys.path:
     sys.path.insert(0, HOOK_DIR)
 from _hooklib import resolve_runtime_dir, emit_context, write_route_ledger, prompt_fire_key
+# #3521: shared advisory-probe `unknown` rendering (sanitize + stderr line + the
+# one injected line + the stamp-file rate limit) and the tri-state pgrep probe.
+from _hooklib import (
+    probe_unknown_line, write_probe_unknown_stderr,
+    probe_notice_due, mark_probe_notice, probe_own_server_py,
+)
 from _harness import detect_harness, get_harness_budgets
 try:
-    from _hooklib import (
-        is_own_server_py_running as _is_own_server_py_running_impl,
-        atomic_write_json,
-    )
+    from _hooklib import atomic_write_json
     _HOOKLIB_OK = True
 except Exception:
     _HOOKLIB_OK = False
@@ -121,9 +124,12 @@ def _check_db_liveness(db_path: str) -> tuple[bool, str]:
                 pass
 
 
-def _is_any_server_py_running() -> bool:
-    """Return True if THIS agent's own server.py process is running (pgrep
-    secondary check) -- scoped, not a bare "server.py" substring match.
+def _is_any_server_py_running() -> "bool | None":
+    """Tri-state (#3521): True if THIS agent's own server.py process is running
+    (pgrep secondary check), False if pgrep ran and found no match, and None if
+    pgrep could not answer (not installed, timed out, errored rc >= 2, or the
+    shared helper failed to import) -- unknown, never evidence of absence.
+    Scoped, not a bare "server.py" substring match.
 
     Used by _check_mcp_write_tool_marker to distinguish a truly dead server
     from a post-restart race where the marker PID is stale but the server is
@@ -131,16 +137,17 @@ def _is_any_server_py_running() -> bool:
     (see its docstring for the unscoped-pgrep regression this replaced --
     PR #1839's colleague review) -- an unscoped `pgrep -f server.py`
     matches every agent's own server process on a shared multi-agent host,
-    permanently reporting healthy. Best-effort: returns False on any error,
-    including a failed _hooklib import, so the caller degrades to the
-    conservative (unhealthy) path rather than a false positive.
+    permanently reporting healthy. Before #3521 this returned False on ANY
+    error (pgrep missing / timed out / errored), conflating "could not look"
+    with "no server running"; it now returns None for those, via the
+    tri-state _hooklib.probe_own_server_py.
     """
     if not _HOOKLIB_OK:
-        return False
-    return _is_own_server_py_running_impl(ENGRAM_HOME)
+        return None
+    return probe_own_server_py(ENGRAM_HOME)[0]
 
 
-def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
+def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool | None, str | None]:
     """Check whether the MCP server wrote its initialization-complete marker.
 
     Deferred from SessionStart to here (UserPromptSubmit) to avoid a timing
@@ -168,8 +175,14 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
     Known ceiling: the marker attests "init complete + about to serve," not
     "serving." A hang inside mcp.run()'s serve-setup would still false-confirm.
 
-    Returns (True, None) if marker exists and its PID is still running, or on
-    any unexpected error (advisory probe — never block).
+    Returns (True, None) if marker exists and its PID is still running (or the
+    PID exists but EPERM forbids signalling it).
+    Returns (None, "<class>: <message>") -- UNKNOWN (#3521) -- when the probe
+    could not measure: a corrupt / torn / wrongly-shaped marker, an unreadable
+    marker file, a non-integer pid, the pgrep secondary check being unable to
+    answer, or any other exception. Never evidence of a dead server and never
+    reported as healthy; the caller renders one bounded, rate-limited line and
+    the hook still never blocks.
     Returns (True, note) if a dead marker PID is offset by a live server.py
     found via the secondary check -- healthy, but NOT silent: per
     PR #1839's colleague review, a suppressed condition must still surface
@@ -185,7 +198,15 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
             return False, "mcp-tools-ready.json absent (server may not have completed initialization)"
         with open(marker_path) as f:
             data = json.load(f)
-        pid = int(data.get("pid", 0))
+        raw_pid = data.get("pid", 0)
+        if isinstance(raw_pid, bool) or (isinstance(raw_pid, float) and raw_pid != 0.0):
+            # A bool or a non-integer JSON number is not a pid: int() would
+            # coerce it (True -> 1, 1.5 -> 1) and os.kill(1, 0) then reads healthy.
+            return None, f"invalid-pid: marker pid is {type(raw_pid).__name__}, not an integer"
+        pid = int(raw_pid)
+        if pid < 0:
+            # os.kill(-1, 0) succeeds for any caller; a negative pid is never a server.
+            return None, f"invalid-pid: marker pid {pid} is negative"
         if not pid:
             return False, "mcp-tools-ready.json has no valid pid field"
         try:
@@ -197,7 +218,11 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
             # Marker PID is dead — server may have restarted and not yet refreshed
             # the marker (race between restart and this hook). Secondary check: is
             # any server.py actually running right now?
-            if _is_any_server_py_running():
+            server_running = _is_any_server_py_running()
+            if server_running is None:
+                # #3521: pgrep could not answer -- unknown, NOT "no server".
+                return None, "pgrep-unknown: could not run pgrep (missing, timed out or errored)"
+            if server_running:
                 # A live server.py found — stale marker, not a dead server.
                 # Return healthy WITH a note; server will refresh the marker
                 # on its next startup write (or already has — hook just
@@ -206,11 +231,13 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
                 # surfaces instead of being permanently absorbed.
                 return True, f"marker stale (PID {pid} no longer running); live server found"
             return False, f"mcp-tools-ready.json stale (server PID {pid} no longer running)"
-    except Exception:
-        return True, None  # advisory — never block
+    except Exception as exc:
+        # #3521: still never raises and never blocks, but a probe that could
+        # not read the marker is UNKNOWN -- it must not report "writes alive".
+        return None, f"{type(exc).__name__}: {exc}"
 
 
-def _check_embedding_restore_flag(db_path: str) -> tuple[bool, str | None]:
+def _check_embedding_restore_flag(db_path: str) -> tuple[bool | None, str | None]:
     """Check the embedding restore-completeness flag (#3075 C5 round 2,
     Borges's design ruling).
 
@@ -221,10 +248,16 @@ def _check_embedding_restore_flag(db_path: str) -> tuple[bool, str | None]:
     hook/server process boundary" precedent; engram_core.py's own
     _get_embedding_restore_flag is the server-side twin of this read).
 
-    Returns (True, None) when the flag is unset/clear, the DB is absent, the
-    table doesn't exist yet (a DB that predates this feature), or on any
-    other read failure — fail-open, same posture as _check_db_liveness
-    above: an advisory probe must never block the hook.
+    Returns (True, None) when the flag is unset/clear, the DB is absent, or
+    the table doesn't exist yet (a DB that predates this feature) -- the
+    latter two healthy BY DESIGN (nothing to restore).
+
+    Returns (None, "<ExcType>: <message>") -- UNKNOWN (#3521) -- on any other
+    read failure: a file that is not a database, a locked database, a table
+    missing a queried column, any other exception. The probe still never
+    raises and never blocks the hook, but it no longer REPORTS HEALTHY for a
+    state it could not read (the caller renders one bounded, rate-limited
+    line).
 
     Returns (False, message) when the flag IS SET — message names the
     count, cause, and remedy, ready for direct injection into
@@ -260,18 +293,39 @@ def _check_embedding_restore_flag(db_path: str) -> tuple[bool, str | None]:
             f"embedder is available (or wait — a regeneration may already "
             f"be running in the background)."
         )
-    except sqlite3.OperationalError:
-        # embedding_restore_state doesn't exist yet (DB predates this
-        # feature) — treat as clear, same as "no flag ever set."
-        return True, None
-    except Exception:
-        return True, None  # fail-open — advisory probe, never block
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            # embedding_restore_state doesn't exist yet (DB predates this
+            # feature) — healthy BY DESIGN, same as "no flag ever set."
+            return True, None
+        # #3521: a locked database, a missing queried column, an I/O error:
+        # also OperationalError, but NOT "nothing to restore" -- UNKNOWN.
+        return None, f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        # #3521: never raises and never blocks, but cannot report healthy for
+        # a state it could not read (garbage file, any other failure).
+        return None, f"{type(exc).__name__}: {exc}"
     finally:
         if conn is not None:
             try:
                 conn.close()
             except Exception:
                 pass
+
+
+def _probe_unknown_notice(pending: list, probe: str, label: str, suffix: str, reason) -> str:
+    """Render an UNKNOWN probe (#3521): always ONE sanitized stderr line; the
+    one bounded injected line only when the per-probe rate-limit window is due
+    (else ""). A due line registers `probe` in `pending` so main() stamps the
+    window only AFTER the response carrying it was printed. Never raises."""
+    try:
+        write_probe_unknown_stderr("engram-surface-hook", probe, reason)
+        if not probe_notice_due(ENGRAM_HOME, probe):
+            return ""
+        pending.append(probe)
+        return probe_unknown_line(label, reason, suffix)
+    except Exception:
+        return ""
 
 
 SOCKET_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.sock")
@@ -3578,8 +3632,19 @@ def main():
     # server.py detectable yet. That case is indistinguishable from a real outage
     # by this check alone, so the warning below is worded to surface both
     # possibilities and point at a reality-test rather than alarming unconditionally.
+    # #3521: probes that could not measure return None (UNKNOWN). Each renders
+    # one bounded, rate-limited line; the stamp that starts the window is
+    # written only after the response carrying the line has been printed.
+    probe_stamps_pending: list = []
     write_ok, write_reason = _check_mcp_write_tool_marker(ENGRAM_HOME)
-    if not write_ok:
+    if write_ok is None:
+        _line = _probe_unknown_notice(
+            probe_stamps_pending, "mcp-write-marker", "MCP write-tool marker",
+            "write-tool liveness not confirmed", write_reason,
+        )
+        if _line:
+            head_blocks.append(_line)
+    elif write_ok is False:
         head_blocks.append(
             f"⚠️  ENGRAM substrate health:\n"
             f"  MCP write-tool liveness: UNCONFIRMED ({write_reason})\n"
@@ -3618,7 +3683,14 @@ def main():
     # channel for "fail loud": a stderr print nobody reads (round 1) is
     # replaced by a durable flag the hooks re-check on every prompt.
     embed_restore_ok, embed_restore_msg = _check_embedding_restore_flag(KNOWLEDGE_DB_PATH)
-    if not embed_restore_ok:
+    if embed_restore_ok is None:
+        _line = _probe_unknown_notice(
+            probe_stamps_pending, "embedding-restore", "embedding-restore",
+            "recall may be degraded", embed_restore_msg,
+        )
+        if _line:
+            head_blocks.append(_line)
+    elif embed_restore_ok is False:
         head_blocks.append(f"⚠️  {embed_restore_msg}")
 
     # Attached-pack surfacing — queried AFTER own-graph result, guarded
@@ -3776,6 +3848,15 @@ def main():
         sys.exit(0)
 
     print(json.dumps(response))
+    if probe_stamps_pending:
+        # #3521: the rate-limit window is consumed only once the response
+        # carrying the line has been written out (mirrors #3504).
+        try:
+            sys.stdout.flush()
+            for _probe in probe_stamps_pending:
+                mark_probe_notice(ENGRAM_HOME, _probe)
+        except Exception:
+            pass
     sys.exit(0)
 
 

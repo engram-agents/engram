@@ -69,6 +69,22 @@ try:
 except Exception:
     _STALE_TREE_HOOKLIB_OK = False
 
+# #3521: shared advisory-probe `unknown` rendering (sanitize + stderr line + the
+# one injected line + the stamp-file rate limit). Same sys.path bootstrap as
+# above; an import failure degrades to a plain, unlimited line (never silent).
+try:
+    from _hooklib import (
+        probe_unknown_line, write_probe_unknown_stderr,
+        probe_notice_due, mark_probe_notice,
+    )
+    _PROBE_LIB_OK = True
+except Exception:
+    _PROBE_LIB_OK = False
+
+# Path shown in the unknown line is cut to this many characters (tail kept):
+# the whole injected line stays <= 200 chars, well inside the 300 budget.
+_UNKNOWN_PATH_CHARS = 60
+
 
 def _load_watch_list() -> list[dict]:
     """Read stale_tree_watch from config.json. Malformed/missing -> [].
@@ -140,9 +156,14 @@ def _find_watched_root_in_command(command: str, watch_list: list[dict]) -> dict 
     return best
 
 
-def _behind_count(root: str, branch: str) -> int | None:
-    """Return how many commits `root` is behind origin/<branch>, or None on
-    any failure (git absent, timeout, root not a repo, no such ref, etc.)."""
+def _behind_count(root: str, branch: str) -> "tuple[int | None, str | None]":
+    """Return `(count, None)` -- how many commits `root` is behind
+    origin/<branch>, 0 meaning current -- or `(None, "<class>: <message>")`
+    when the probe could not tell (#3521): UNKNOWN, never the same value as
+    0 behind. Reason classes: `git-missing` (git not installed),
+    `timeout`, `nonzero` (git exited non-zero: not a repo, no such ref,
+    typo'd branch), `unparsable` (stdout was not an integer), `os-error`
+    (any other OSError launching git). Never raises for those."""
     try:
         result = subprocess.run(
             ["git", "-C", root, "rev-list", "--count", f"HEAD..origin/{branch}"],
@@ -150,14 +171,55 @@ def _behind_count(root: str, branch: str) -> int | None:
             text=True,
             timeout=REV_LIST_TIMEOUT,
         )
-    except (subprocess.TimeoutExpired, OSError):
-        return None
+    except subprocess.TimeoutExpired:
+        return None, f"timeout: git rev-list exceeded {REV_LIST_TIMEOUT}s"
+    except FileNotFoundError as exc:
+        return None, f"git-missing: {exc}"
+    except OSError as exc:
+        return None, f"os-error: {type(exc).__name__}: {exc}"
     if result.returncode != 0:
-        return None
+        detail = (result.stderr or "").strip().splitlines()
+        return None, f"nonzero: git exited {result.returncode}: {detail[0] if detail else ''}"
     try:
-        return int(result.stdout.strip())
+        return int(result.stdout.strip()), None
     except ValueError:
-        return None
+        return None, f"unparsable: {result.stdout.strip()[:80]!r}"
+
+
+def _report_unknown(entry: dict, reason: str) -> None:
+    """Render an UNKNOWN behind-count (#3521): always one sanitized stderr line;
+    ONE bounded injected line at most once per window per checkout path
+    (stamp under ENGRAM_HOME, written only after the line was printed). The
+    hook still exits 0 and never blocks. Never raises.
+
+    Rendering choice: this hook prints its own JSON (as its not-ok warning
+    does) rather than going through emit_context -- the line is a single
+    <= 200-char string, far under any harness budget, and emit_context would
+    add a trailer to a block that has none today."""
+    try:
+        path = str(entry.get("path", ""))
+        probe = "stale-tree-behind-count"
+        if not _PROBE_LIB_OK:
+            clean = "".join(" " if (ord(c) < 32 or 127 <= ord(c) <= 159) else c for c in str(reason))
+            sys.stderr.write(f"engram-stale-tree-warn-hook: {probe} unknown: {clean}"[:300] + "\n")
+            line = "[probe] stale-tree behind-count state UNKNOWN; checkout may be behind origin"
+            key = None
+        else:
+            write_probe_unknown_stderr("engram-stale-tree-warn-hook", probe, reason)
+            key = f"stale-tree:{path}"
+            if not probe_notice_due(ENGRAM_HOME, key):
+                return
+            shown = path if len(path) <= _UNKNOWN_PATH_CHARS else "…" + path[-(_UNKNOWN_PATH_CHARS - 1):]
+            line = probe_unknown_line(
+                f"stale-tree behind-count ({shown})", reason, "checkout may be behind origin")
+        print(json.dumps({
+            "hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": line}
+        }))
+        if key is not None:
+            sys.stdout.flush()
+            mark_probe_notice(ENGRAM_HOME, key)
+    except Exception:
+        pass
 
 
 def _extract_read_glob_grep_target(tool_input: dict) -> str | None:
@@ -201,8 +263,11 @@ def main() -> None:
         if entry is None:
             sys.exit(0)
 
-        count = _behind_count(entry["path"], entry["branch"])
-        if not count:  # None (probe failed) or 0 (current) — stay silent
+        count, reason = _behind_count(entry["path"], entry["branch"])
+        if count is None:  # #3521: probe could not tell — NOT the same as current
+            _report_unknown(entry, reason)
+            sys.exit(0)
+        if not count:  # 0 (current) — stay silent
             sys.exit(0)
 
         response = {

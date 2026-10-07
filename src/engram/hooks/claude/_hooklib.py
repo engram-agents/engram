@@ -961,3 +961,155 @@ def write_route_ledger(
             print(msg[:300], file=sys.stderr)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Advisory-probe `unknown` state (part of #3521, rows 1-4)
+# ---------------------------------------------------------------------------
+# A probe that cannot measure must say so. "Never block" means the probe never
+# blocks the tool call; it never meant a probe may REPORT HEALTHY on a failure.
+# Each probe's result is tri-state -- True healthy / False confirmed not-ok /
+# None UNKNOWN -- and UNKNOWN renders ONE bounded line (the #3504 loader notice
+# in engram-lesson-tripwire-hook.py is the template), rate-limited for the
+# per-prompt / per-tool-call hooks. This is the ONE shared implementation of
+# sanitize + line-building + the stamp-file rate limit; the tripwire hook's own
+# copies are deliberately not refactored onto it here (a follow-up).
+#
+# Reason convention: an unknown probe returns `(None, "<class>: <message>")`
+# where <class> is an exception type name or a short reason class
+# (`git-missing`, `timeout`, `nonzero`, `unparsable`, `pgrep-unknown`, ...).
+# The raw <message> goes ONLY to the sanitized stderr line; the injected line
+# carries the <class> alone.
+
+import re as _re
+
+PROBE_NOTICE_WINDOW_SECONDS = 1800
+PROBE_NOTICE_STAMP_NAME = "probe-unknown-notice.json"
+_PROBE_CONTROL_CHARS_RE = _re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def sanitize_probe_text(text, limit: int) -> str:
+    """Each control character (newline included) -> one space, then cut to
+    `limit` characters, so a message is always one bounded line. Never raises."""
+    try:
+        return _PROBE_CONTROL_CHARS_RE.sub(" ", str(text))[:limit]
+    except Exception:
+        return "<unprintable>"[:limit]
+
+
+def split_probe_reason(reason) -> tuple:
+    """`"<class>: <message>"` -> (class, message). A reason with no colon is
+    all class. Never raises."""
+    try:
+        cls, _sep, msg = str(reason).partition(":")
+        return cls.strip(), msg.strip()
+    except Exception:
+        return "unknown", ""
+
+
+def write_probe_unknown_stderr(hook_name: str, probe: str, reason) -> None:
+    """Write exactly one stderr line:
+    `<hook_name>: <probe> unknown: <class>: <message>` (message sanitized,
+    <= 200 chars; whole line <= 300). Never raises."""
+    try:
+        cls, msg = split_probe_reason(reason)
+        line = (
+            f"{sanitize_probe_text(hook_name, 60)}: {sanitize_probe_text(probe, 60)} unknown: "
+            f"{sanitize_probe_text(cls, 80)}: {sanitize_probe_text(msg, 200)}"
+        )
+        sys.stderr.write(line[:300] + "\n")
+    except Exception:
+        pass
+
+
+def probe_unknown_line(label: str, reason, suffix: str, prefix: str = "[probe] ") -> str:
+    """The ONE injected line for an unknown probe, <= 200 chars:
+    `[probe] <label> state UNKNOWN (<class>); <suffix>`. Carries the exception
+    type / reason class only, never the raw message. Never raises."""
+    try:
+        cls, _ = split_probe_reason(reason)
+        line = (
+            f"{prefix}{sanitize_probe_text(label, 90)} state UNKNOWN "
+            f"({sanitize_probe_text(cls, 40)}); {sanitize_probe_text(suffix, 60)}"
+        )
+        return line[:200]
+    except Exception:
+        return f"{prefix}probe state UNKNOWN"[:200]
+
+
+def _probe_stamp_path(engram_home) -> Path:
+    return Path(engram_home) / PROBE_NOTICE_STAMP_NAME
+
+
+def _probe_stamp_read(engram_home) -> dict:
+    """The `shown_at` map from the stamp file, or {} when the file is absent,
+    unreadable, corrupt or wrongly shaped. Never raises."""
+    try:
+        data = json.loads(_probe_stamp_path(engram_home).read_text(encoding="utf-8"))
+        shown = data["shown_at"]
+        return shown if isinstance(shown, dict) else {}
+    except Exception:
+        return {}
+
+
+def probe_notice_due(engram_home, key: str, now=None) -> bool:
+    """True unless a notice for `key` was shown within the last window. An
+    absent, unreadable, corrupt, wrongly-shaped or future-dated stamp is "due":
+    the rate limit fails VISIBLE, never silent. Never raises."""
+    try:
+        now = _time.time() if now is None else now
+        ts = _probe_stamp_read(engram_home).get(str(key)[:300])
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            return True
+        return not (0 <= now - ts < PROBE_NOTICE_WINDOW_SECONDS)
+    except Exception:
+        return True
+
+
+def mark_probe_notice(engram_home, key: str, now=None) -> None:
+    """Start a new rate-limit window for `key` (call only AFTER the response
+    carrying the line was produced). Expired and malformed entries are dropped
+    so the file stays small. Never raises: an unwritable stamp just means the
+    next unknown shows the line again."""
+    try:
+        now = _time.time() if now is None else now
+        kept = {
+            k: v for k, v in _probe_stamp_read(engram_home).items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+            and 0 <= now - v < PROBE_NOTICE_WINDOW_SECONDS
+        }
+        kept[str(key)[:300]] = now
+        path = _probe_stamp_path(engram_home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, {"shown_at": kept})
+    except Exception:
+        pass
+
+
+def probe_own_server_py(engram_home: str) -> tuple:
+    """Tri-state twin of is_own_server_py_running (which is unchanged and still
+    folds every failure into False). Returns (state, reason):
+
+        (True, None)      pgrep matched (rc 0)
+        (False, None)     pgrep ran and found no match (rc 1)
+        (None, reason)    pgrep could not answer: not installed, timed out,
+                          exited with an error rc >= 2, or the path could not
+                          be resolved. Never evidence of absence.
+
+    Never raises."""
+    import subprocess
+
+    try:
+        server_path = resolve_own_server_py_path(engram_home)
+        result = subprocess.run(
+            ["pgrep", "-f", server_path], capture_output=True, timeout=2
+        )
+        if result.returncode == 0:
+            return True, None
+        if result.returncode == 1:
+            return False, None
+        return None, f"pgrep-unknown: pgrep exited {result.returncode}"
+    except subprocess.TimeoutExpired:
+        return None, "pgrep-unknown: pgrep timed out"
+    except Exception as exc:
+        return None, f"pgrep-unknown: {type(exc).__name__}: {exc}"

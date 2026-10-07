@@ -73,6 +73,9 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
 from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context, _trim_to_line_boundary
+# #3521: shared advisory-probe `unknown` rendering (once per session here, so
+# only the stderr line + the one injected line are used; no rate-limit stamp).
+from _hooklib import probe_unknown_line, write_probe_unknown_stderr
 from _harness import detect_harness, get_harness_budgets
 
 ENGRAM_HOME = (
@@ -418,7 +421,7 @@ def _check_backup_staleness(engram_home: str) -> tuple[bool, str | None]:
         return True, None  # advisory — never block session start
 
 
-def _check_embedding_restore_flag(engram_home: str) -> tuple[bool, str | None]:
+def _check_embedding_restore_flag(engram_home: str) -> tuple[bool | None, str | None]:
     """Check the embedding restore-completeness flag (#3075 C5 round 2,
     Borges's design ruling).
 
@@ -430,11 +433,15 @@ def _check_embedding_restore_flag(engram_home: str) -> tuple[bool, str | None]:
     the full rationale) and from engram_core.py's server-side
     _get_embedding_restore_flag.
 
-    Returns (True, None) when the flag is unset/clear, the DB is absent,
-    the table doesn't exist yet (a DB that predates this feature), or on
-    any other read failure — fail-open, same posture as
-    _check_backup_staleness above: an advisory probe must never block
-    session start.
+    Returns (True, None) when the flag is unset/clear, the DB is absent, or
+    the table doesn't exist yet (a DB that predates this feature) — the
+    latter two healthy BY DESIGN (nothing to restore).
+
+    Returns (None, "<ExcType>: <message>") — UNKNOWN (#3521) — on any other
+    read failure (not a database, locked, a queried column missing, any other
+    exception). Still never raises and never blocks session start, but no
+    longer reports healthy for a state it could not read; the caller renders
+    one bounded line (once per session, so no rate limit is needed).
 
     Returns (False, message) when the flag IS SET — message names the
     count, cause, and remedy.
@@ -465,10 +472,16 @@ def _check_embedding_restore_flag(engram_home: str) -> tuple[bool, str | None]:
             f"{null_count} node(s) lack embeddings (cause: {cause}) — "
             f"recall degraded/blocked for these nodes"
         )
-    except sqlite3.OperationalError:
-        return True, None  # table doesn't exist yet — treat as clear
-    except Exception:
-        return True, None  # fail-open — advisory probe, never block
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return True, None  # table doesn't exist yet (pre-feature DB) — healthy by design
+        # #3521: locked database / missing queried column / I/O error are also
+        # OperationalError but are NOT "nothing to restore" — UNKNOWN.
+        return None, f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        # #3521: never raises, never blocks session start, but cannot report
+        # healthy for a state it could not read.
+        return None, f"{type(exc).__name__}: {exc}"
     finally:
         if conn is not None:
             try:
@@ -3481,6 +3494,10 @@ def main() -> None:
     stale_ok, stale_reason = _check_backup_staleness(ENGRAM_HOME)
     viz_status, viz_reason = _check_viz_server_health(ENGRAM_HOME)
     embed_restore_ok, embed_restore_reason = _check_embedding_restore_flag(ENGRAM_HOME)
+    if embed_restore_ok is None:
+        # #3521: UNKNOWN — one sanitized stderr line per run (once per session).
+        write_probe_unknown_stderr(
+            "engram-session-start-hook", "embedding-restore", embed_restore_reason)
     json1_status, json1_reason = _check_json1()  # #3327
     json1_missing = json1_status == "missing"
     json1_unknown = json1_status not in ("ok", "missing")
@@ -3512,7 +3529,7 @@ def main() -> None:
     _health_lines: list[str] = []
     if (
         mcp_offline or not stale_ok or viz_down
-        or viz_inconclusive or not embed_restore_ok or json1_missing
+        or viz_inconclusive or embed_restore_ok is False or json1_missing
     ):
         _health_lines.append("⚠️  ENGRAM substrate health:")
         if mcp_offline:
@@ -3526,7 +3543,7 @@ def main() -> None:
             _health_lines.append("  → Tell the user; the health dashboard is unreachable.")
         elif viz_inconclusive:
             _health_lines.append(f"  Viz liveness: inconclusive ({viz_reason})")
-        if not embed_restore_ok:
+        if embed_restore_ok is False:
             # #3075 C5 round 2 (Borges's design ruling): same flag the
             # surface hook re-checks every prompt (engram-surface-hook.py's
             # own _check_embedding_restore_flag) — surfaced here too so the
@@ -3551,6 +3568,14 @@ def main() -> None:
                 "  Not checked: only this hook's interpreter was probed, not "
                 "the MCP server's or the surface hook's."
             )
+    if embed_restore_ok is None:
+        # #3521: unknown is informational, NOT a ⚠️ warning (the #3202
+        # convention) — and never silent-ok. Type/reason class only, never the
+        # raw exception message.
+        _health_lines.append(probe_unknown_line(
+            "embedding-restore", embed_restore_reason, "recall may be degraded",
+            prefix="ℹ️  ENGRAM substrate health: ",
+        ))
     if json1_unknown:
         # #3202 convention: unknown is informational, NOT a warning -- and
         # never silent-ok.
