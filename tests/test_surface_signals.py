@@ -3,7 +3,7 @@
 Contract (stated by the dispatching spec):
   S1  every matched_meta / top_claims / special_nodes entry carries `signals`
       = {similarity, importance_score, utility, composite_score, match_type,
-      recall_turn}, each EQUAL to the ranked row's value (`utility` is read from
+      recall_turn, ranked (#3551)}, each EQUAL to the ranked row's value (`utility` is read from
       the row's `utility_score`); top-level `signals_present` lists the names
       that were non-null on at least one candidate.
   S2  a row lacking a key -> that signal is null on that entry; the name is
@@ -34,7 +34,7 @@ TEST_DIR = tempfile.mkdtemp(prefix="engram_test_surface_signals_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 SIGNAL_NAMES = ["similarity", "importance_score", "utility",
-                "composite_score", "match_type", "recall_turn"]
+                "composite_score", "match_type", "recall_turn", "ranked"]
 # signal name -> row key it is read from
 _ROW_KEY = {"utility": "utility_score"}
 
@@ -64,23 +64,26 @@ def _fresh_server():
 
 
 def _rows(drop=()):
-    """Ranked rows carrying all six signals (distinct values per row/signal)."""
+    """Rows carrying all seven signals (distinct values per row/signal)."""
     base = [
         {"id": "ob_0001", "type": "observation_factual", "claim": "claim one",
          "confidence": 0.85, "created_at": "2026-10-01T00:00:00+00:00",
          "recall_summary": "s1", "recall_keywords": json.dumps(["k1"]),
          "similarity": 0.81, "importance_score": 2.5, "utility_score": 0.33,
-         "composite_score": 1.7, "match_type": "semantic", "recall_turn": 7},
+         "composite_score": 1.7, "match_type": "semantic", "recall_turn": 7,
+         "ranked": True},
         {"id": "ob_0002", "type": "observation_factual", "claim": "claim two",
          "confidence": 0.7, "created_at": "2026-10-02T00:00:00+00:00",
          "recall_summary": "s2", "recall_keywords": json.dumps(["k2"]),
          "similarity": 0.42, "importance_score": 1.25, "utility_score": 0.11,
-         "composite_score": 0.9, "match_type": "keyword", "recall_turn": 3},
+         "composite_score": 0.9, "match_type": "keyword", "recall_turn": 3,
+         "ranked": True},
         {"id": "ls_0001", "type": "lesson", "claim": "a lesson",
          "created_at": "2026-10-03T00:00:00+00:00",
          "recall_summary": "s3", "recall_keywords": json.dumps(["k3"]),
          "similarity": 0.66, "importance_score": 3.75, "utility_score": 0.55,
-         "composite_score": 2.2, "match_type": "semantic", "recall_turn": 9},
+         "composite_score": 2.2, "match_type": "semantic", "recall_turn": 9,
+         "ranked": False},
     ]
     for r in base:
         for k in drop:

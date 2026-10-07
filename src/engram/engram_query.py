@@ -2008,6 +2008,7 @@ def _search_nodes(
     # exact value used for ordering) so the surface signals can report it.
     for node in output:
         node["composite_score"] = node.pop("_composite", None)
+        node["ranked"] = True  # #3551: went through composite ranking
         node.pop("_embedding", None)
     # Strip _embedding from special_pool too (set during Tier 1). Special-type
     # bypass rows are never composite-ranked -> composite_score is null, never
@@ -2015,6 +2016,7 @@ def _search_nodes(
     for node in special_pool:
         node.pop("_embedding", None)
         node["composite_score"] = None
+        node["ranked"] = False  # #3551: bypass row, null composite is by design
 
     # ══ FINAL MERGE: generic (top_k) + special-type bypass results ══════
     # top_k is the generic-result budget. Special-type results append after,
@@ -2434,6 +2436,9 @@ def _conn_total_count(where_clause: str, params: list) -> int:
 # #3458 half C — per-candidate ranking signals exposed on the surface response.
 # name -> key on the ranked row it is read from. Read-only: a key the row lacks
 # is None (never computed here), so the ledger can tell "absent" from a value.
+# #3551 adds `ranked` (set in _search_nodes: True = composite-ranked, False =
+# special-type bypass row, whose null composite_score is by design); a seventh
+# entry in the same dict, so signals_present and the ledger reader pick it up.
 _SURFACE_SIGNAL_ROW_KEYS = {
     "similarity": "similarity",
     "importance_score": "importance_score",
@@ -2441,11 +2446,12 @@ _SURFACE_SIGNAL_ROW_KEYS = {
     "composite_score": "composite_score",
     "match_type": "match_type",
     "recall_turn": "recall_turn",
+    "ranked": "ranked",
 }
 
 
 def _surface_signals(row: dict) -> dict:
-    """The six #3458 ranking signals for one ranked row (None when absent)."""
+    """The #3458 ranking signals (+ #3551 `ranked`) for one row (None when absent)."""
     return {name: row.get(key) for name, key in _SURFACE_SIGNAL_ROW_KEYS.items()}
 
 
@@ -2965,8 +2971,9 @@ def _query_impl(
             # contract per the docstring below), so no new fields are added
             # to node dicts on that path by THIS extraction — metadata is
             # popped unconditionally either way (see node.pop("metadata", ...)
-            # below). Note return_debug=True result rows DO gain one additive
-            # field, `composite_score` (#3458, set in _search_nodes);
+            # below). Note return_debug=True result rows DO gain two additive
+            # fields, `composite_score` (#3458) and `ranked` (#3551), both set in
+            # _search_nodes;
             # `debug.per_result` is unchanged.
             # trust_tier needs no extraction here — it's already a raw
             # column carried through by _node_to_dict unconditionally.

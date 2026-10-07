@@ -190,7 +190,8 @@ def test_surface_probe_live_one_parseable_line_shown_matches_output(tmp_path, mo
     assert [c["id"] for c in row["candidates"]] == _ids(1, 2, 3)
     assert [c["rank"] for c in row["candidates"]] == [1, 2, 3]
     c0 = row["candidates"][0]
-    assert set(c0) == {"id", "type", "rank", *SIGNALS}
+    # #3551: + `ranked` (producer flag) and `in_context_why` (hook-derived)
+    assert set(c0) == {"id", "type", "rank", *SIGNALS, "ranked", "in_context_why"}
     assert c0["similarity"] == 0.81 and c0["utility"] == 0.2
     # every candidate is either shown or has a cut reason, never both
     for c in row["candidates"]:

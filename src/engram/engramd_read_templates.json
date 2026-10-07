@@ -9,6 +9,13 @@
       ]
     },
     {
+      "key": "087e3f5506c5f2ef7d6de772c9085141f77fd026db29b1f55e39bcc16323eeeb",
+      "sql": "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1",
+      "sites": [
+        "hooks/claude/_hooklib.py:_focused_ids"
+      ]
+    },
+    {
       "key": "11d79fc4ecfafd263296a4ea553d76e8c995e961af23049158d6d89e80bf8088",
       "sql": "SELECT id, type, claim, recall_summary, created_at, is_current, status FROM nodes WHERE created_at >= ? ORDER BY created_at ASC",
       "sites": [

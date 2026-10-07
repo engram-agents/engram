@@ -477,7 +477,9 @@ _LINE_KEY = _re.compile(r":\d+$")
 # registered SQL. A site re-key must not move any of them. (#3485 re-froze the
 # two lesson-tripwire-hook keys when their SQL gained the json_valid guard: a
 # SQL change legitimately moves its own key; a re-key must still move none.)
+# #3551 added a new template (the focused-ids read in _hooklib._focused_ids): its own key.
 _FROZEN_TEMPLATE_KEYS = frozenset({
+    "087e3f5506c5f2ef7d6de772c9085141f77fd026db29b1f55e39bcc16323eeeb",
     "0280b9b584a3522d55be45f09ec258c28ec2d8b8e0e3cf80267097f593c71462",
     "11d79fc4ecfafd263296a4ea553d76e8c995e961af23049158d6d89e80bf8088",
     "2743db24b60c27d0ad4e70e440219d2904a12aa08d4fdca11760b8445b3fdc9c",

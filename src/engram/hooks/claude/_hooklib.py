@@ -42,6 +42,7 @@ don't have -- exactly the "big bang" gh#1657 explicitly asks to avoid.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import sys
@@ -806,7 +807,13 @@ def emit_context(
 # nothing -- no file, no directory, no log line. Fail-open: any other ledger
 # error costs one stderr line `route-ledger: <reason>`; the hook's own stdout
 # is never touched. The ledger OBSERVES: it records what the route's own
-# response carried and never recomputes or approximates a signal.
+# response carried and never recomputes or approximates a ranking signal.
+# Two fields are not read from the response (#3551): `ranked` is PRODUCER-
+# computed (engram_query sets it per row: True = composite-ranked, False =
+# special-type bypass row, whose null composite_score is by design and is not
+# listed in missing_signals) and `in_context` / `in_context_why` are HOOK-
+# computed at write time from three sources (shown earlier this session,
+# created since session start, currently focused). The rest are read as-is.
 # ---------------------------------------------------------------------------
 
 import hashlib as _hashlib
@@ -818,7 +825,7 @@ ROUTE_PROBE_SUBPATH = (".engram", "probe", "mods-recall")
 # response does not carry for a candidate is null, and its name is listed once
 # in the line's `missing_signals`.
 ROUTE_SIGNALS = (
-    "type", "similarity", "importance_score", "utility", "composite_score",
+    "type", "similarity", "importance_score", "utility", "ranked", "composite_score",
     "match_type", "recall_turn", "created_at", "in_context",
 )
 # Response-key aliases: the debug shape of engram_query names utility
@@ -855,11 +862,134 @@ def _signal_from(entry: dict, name: str):
     return None
 
 
-def build_route_candidates(result: Optional[dict]) -> tuple:
+def _parse_iso_utc(text):
+    """ISO timestamp (naive = UTC, trailing Z ok) -> aware datetime, or None."""
+    from datetime import datetime, timezone
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def session_started_at(session_id):
+    """This session's `started_at` from `$ENGRAM_HOME/sessions/<sid>.json`
+    (aware datetime), or None when the marker is missing/malformed. Shared
+    helper for the route ledger's `created` source; mirrors the surface hook's
+    `_get_session_started_at` (left untouched: that script is not importable)."""
+    if not session_id:
+        return None
+    try:
+        home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+        with open(Path(home) / "sessions" / f"{session_id}.json", "r", encoding="utf-8") as f:
+            marker = json.load(f)
+        return _parse_iso_utc(marker.get("started_at"))
+    except Exception:
+        return None
+
+
+def _earlier_shown_ids(routes_dir: Path) -> tuple:
+    """(ids, readable): every id in the `shown` list of every line already in
+    `routes_dir/*.jsonl` (both routes). A malformed line is skipped; a file
+    that cannot be read makes `readable` False. A routes dir that does not
+    exist yet is readable-and-empty (nothing has been shown)."""
+    ids: set = set()
+    readable = True
+    try:
+        files = sorted(routes_dir.glob("*.jsonl")) if routes_dir.is_dir() else []
+    except Exception:
+        return ids, False
+    for path in files:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for raw in f:
+                    try:
+                        row = json.loads(raw)
+                    except ValueError:
+                        continue
+                    shown = row.get("shown") if isinstance(row, dict) else None
+                    if isinstance(shown, list):
+                        ids.update(i for i in shown if isinstance(i, str))
+        except Exception:
+            readable = False
+    return ids, readable
+
+
+def _focused_ids() -> tuple:
+    """(ids, readable): ids currently focused, read-only, one query, closed in
+    a `finally`. Any DB problem (missing file, locked, no column) -> readable
+    False."""
+    import sqlite3
+    conn = None
+    try:
+        home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+        # Short lock wait: this source is optional and an unreadable result is
+        # already handled (readable False -> in_context None), so a locked DB
+        # must not cost the surface hook a full second.
+        conn = sqlite3.connect(
+            f"file:{Path(home) / 'knowledge.db'}?mode=ro", uri=True, timeout=0.2)
+        rows = conn.execute(
+            "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
+        ).fetchall()
+        return {r[0] for r in rows}, True
+    except Exception:
+        return set(), False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _in_context_for(node_id, created_at, *, shown_ids, shown_ok, started,
+                    focused, focused_ok):
+    """`(in_context, why)` for one candidate against the three pre-read sources
+    (see `make_in_context_resolver`). First source that fired wins, in the order
+    shown, created, focused. None of the three -> (False, None); a source that
+    cannot be read and no readable source fired -> (None, None)."""
+    if node_id in shown_ids:
+        return True, "shown"
+    created_dt = _parse_iso_utc(created_at)
+    created_known = started is not None and created_dt is not None
+    if created_known and created_dt >= started:
+        return True, "created"
+    if node_id in focused:
+        return True, "focused"
+    if not (shown_ok and created_known and focused_ok):
+        return None, None
+    return False, None
+
+
+def make_in_context_resolver(session_id, routes_dir: Path):
+    """Build `resolve(node_id, created_at) -> (in_context, why)` for ONE ledger
+    write. Reads the three sources once, so call it BEFORE appending the line
+    being written (a node is never "already shown" by the very fire being
+    written). `why` is the FIRST source that fired, in the order shown,
+    created, focused. None of the three -> (False, None). A source that cannot
+    be read and no readable source fired -> (None, None): unknown, not false."""
+    shown_ids, shown_ok = _earlier_shown_ids(routes_dir)
+    started = session_started_at(session_id)
+    focused, focused_ok = _focused_ids()
+    return functools.partial(
+        _in_context_for, shown_ids=shown_ids, shown_ok=shown_ok,
+        started=started, focused=focused, focused_ok=focused_ok)
+
+
+def build_route_candidates(result: Optional[dict], in_context=None) -> tuple:
     """(candidates, missing_signals) from a daemon/query response, BEFORE any
-    route-side cut. Ranking = the response's own `matched_ids` order (falling
-    back to matched_meta / top_claims / special_nodes order when the response
-    carries no matched_ids). Each signal is read from whichever of
+    route-side cut. `in_context`, when given, is the resolver from
+    `make_in_context_resolver`: it sets `in_context` / `in_context_why` per
+    candidate (the response never carries them); without it `in_context` is
+    null and named missing, as before. Every candidate carries
+    `in_context_why` (None unless a resolver sets it). A candidate with
+    `ranked is False` does not list its null composite_score as missing
+    (bypass rows are never composite-ranked, by design). Ranking = the
+    response's own `matched_ids` order (falling back to matched_meta /
+    top_claims / special_nodes order when the response carries no
+    matched_ids). Each signal is read from whichever of
     matched_meta / top_claims / special_nodes carries it for that id; absent
     -> None, and the name is added once to missing_signals."""
     result = result if isinstance(result, dict) else {}
@@ -878,15 +1008,20 @@ def build_route_candidates(result: Optional[dict]) -> tuple:
             order.append(e["id"])
     candidates, missing = [], []
     for rank, nid in enumerate(order, start=1):
-        cand = {"id": nid, "rank": rank}
+        cand = {"id": nid, "rank": rank, "in_context_why": None}
         for name in ROUTE_SIGNALS:
             val = None
             for e in sources.get(nid, ()):
                 val = _signal_from(e, name)
                 if val is not None:
                     break
+            if name == "in_context" and in_context is not None:
+                val, why = in_context(nid, cand.get("created_at"))
+                cand["in_context_why"] = why
             cand[name] = val
             if val is None and name not in missing:
+                if name == "composite_score" and cand.get("ranked") is False:
+                    continue  # bypass row: null composite is by design (#3551)
                 missing.append(name)
         candidates.append(cand)
     return candidates, missing
@@ -922,7 +1057,9 @@ def write_route_ledger(
         session_dir = route_probe_dir() / sid
         if not session_dir.is_dir():
             return  # probe not live for this session: true optional, silent
-        candidates, missing = build_route_candidates(result)
+        # Read the in_context sources BEFORE this line is appended (C4).
+        resolver = make_in_context_resolver(sid, session_dir / "routes")
+        candidates, missing = build_route_candidates(result, in_context=resolver)
         shown_set = set(shown)
         cut = {
             c["id"]: cut_reasons.get(c["id"], default_cut)
