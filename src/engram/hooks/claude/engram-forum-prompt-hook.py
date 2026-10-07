@@ -262,7 +262,8 @@ except Exception:
     _PROBE_LIB_OK = False
 try:
     from _prompthooklib import (
-        load_config as _load_config_impl,
+        load_config_checked as _load_config_checked_impl,
+        report_config_unknown as _report_config_unknown,
         get_agent_name as _get_agent_name_impl,
         get_comms_surface as _get_comms_surface_impl,
         bootstrap_tools_dir as _bootstrap_tools_dir,
@@ -475,9 +476,21 @@ def _fetch_with_deadline(
     return _fetch_classified(url, deadline, per_op_cap, method, headers, body)[0]
 
 
+# #3521 row 6: why the last _load_config() could not read config.json, or None
+# when it could (or the file is simply absent). main() reads this right after
+# _load_config() so an unreadable file is reported as UNKNOWN instead of being
+# treated as "not configured". Kept as module state, not a changed return
+# type, so _load_config() keeps its zero-arg dict contract for every existing
+# caller and test monkeypatch.
+_config_unknown_reason: Optional[str] = None
+
+
 def _load_config() -> dict:
-    """Load $ENGRAM_HOME/config.json. Returns {} on any failure."""
-    return _load_config_impl(ENGRAM_HOME)
+    """Load $ENGRAM_HOME/config.json. Returns {} on any failure (and records
+    the reason in _config_unknown_reason when the file is present but unusable)."""
+    global _config_unknown_reason
+    cfg, _config_unknown_reason = _load_config_checked_impl(ENGRAM_HOME)
+    return cfg or {}
 
 
 def _get_agent_name(config: dict) -> str:
@@ -1105,6 +1118,17 @@ def main() -> None:
 
     # ── Config ────────────────────────────────────────────────────────────────
     config = _load_config()
+    if _config_unknown_reason is not None:
+        # #3521 row 6: a config.json that is there but unusable is UNKNOWN,
+        # never "forum not configured". One stderr line + one rate-limited
+        # injected line, then exit: nothing below can run without a config.
+        _report_config_unknown(
+            _HOOK_NAME, "config:forum-prompt-hook", ENGRAM_HOME,
+            _config_unknown_reason,
+            lambda text: print(json.dumps(_assemble_response([text], []))),
+            "forum check skipped",
+        )
+        sys.exit(0)
 
     # ── Silent no-op gate ────────────────────────────────────────────────────
     # If forum isn't configured (neither url nor agent_name in config), skip.

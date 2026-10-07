@@ -97,7 +97,8 @@ if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 try:
     from _prompthooklib import (
-        load_config as _load_config_impl,
+        load_config_checked as _load_config_checked_impl,
+        report_config_unknown as _report_config_unknown,
         get_agent_name as _get_agent_name_impl,
         emit_context as _emit_context,
         bootstrap_tools_dir as _bootstrap_tools_dir,
@@ -127,9 +128,21 @@ except Exception:
 # import time" ENGRAM_HOME timing the pre-extraction inline code had.
 # ---------------------------------------------------------------------------
 
+# #3521 row 6: why the last _load_config() could not read config.json, or None
+# when it could (or the file is simply absent). main() reads this right after
+# _load_config() so an unreadable file is reported as UNKNOWN instead of being
+# treated as "not configured". Kept as module state, not a changed return
+# type, so _load_config() keeps its zero-arg dict contract for every existing
+# caller and test monkeypatch.
+_config_unknown_reason: Optional[str] = None
+
+
 def _load_config() -> dict:
-    """Load $ENGRAM_HOME/config.json. Returns {} on any failure."""
-    return _load_config_impl(ENGRAM_HOME)
+    """Load $ENGRAM_HOME/config.json. Returns {} on any failure (and records
+    the reason in _config_unknown_reason when the file is present but unusable)."""
+    global _config_unknown_reason
+    cfg, _config_unknown_reason = _load_config_checked_impl(ENGRAM_HOME)
+    return cfg or {}
 
 
 def _get_agent_name(config: Optional[dict] = None) -> str:
@@ -293,6 +306,13 @@ def main() -> None:
 
     # ── Config (single load) ──────────────────────────────────────────────────
     config = _load_config()
+    if _config_unknown_reason is not None:
+        # #3521 row 6: unreadable config.json is UNKNOWN, never "not configured".
+        _report_config_unknown(
+            "engram-inter-agent-prompt-hook", "config:inter-agent-prompt-hook",
+            ENGRAM_HOME, _config_unknown_reason, _emit_context, "DM check skipped",
+        )
+        sys.exit(0)
 
     # ── Forum-configured gate (FIRST check) ───────────────────────────────────
     # No forum configured (or forum_api import failure) see zero output and

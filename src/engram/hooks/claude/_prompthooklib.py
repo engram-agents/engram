@@ -87,23 +87,116 @@ from pathlib import Path
 from typing import Optional
 
 
+_JSON_TYPE_NAMES = (
+    (bool, "boolean"), (int, "number"), (float, "number"),
+    (str, "string"), (list, "array"), (type(None), "null"),
+)
+
+
+def _json_type_name(value) -> str:
+    for py_type, name in _JSON_TYPE_NAMES:
+        if isinstance(value, py_type):
+            return name
+    return type(value).__name__
+
+
+def load_config_checked(
+    engram_home: Optional[str] = None,
+) -> "tuple[Optional[dict], Optional[str]]":
+    """Load <engram_home>/config.json, able to say "unknown". Never raises.
+
+    Returns ``(config, reason)``:
+      - file ABSENT                         -> ``({}, None)``  (not configured)
+      - valid JSON, top level an object     -> ``(dict, None)``
+      - present but unreadable (OSError)    -> ``(None, "unreadable: <Class>")``
+      - present, not valid JSON             -> ``(None, "unparsable: <Class>")``
+      - valid JSON, top level not an object -> ``(None, "not-an-object: <type>")``
+        where <type> is a JSON type name (array, string, number, boolean, null)
+
+    ``config is None`` means UNKNOWN: a file is there but could not be used,
+    which is not the same as "no config". The reason follows the probe
+    convention in _hooklib (``<class>: <message>``, see split_probe_reason).
+    engram_home defaults to $ENGRAM_HOME or ~/.engram, the same formula as
+    load_config.
+    """
+    try:
+        if engram_home is None:
+            engram_home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+        config_path = Path(engram_home) / "config.json"
+        try:
+            raw = config_path.read_bytes()
+        except (FileNotFoundError, NotADirectoryError):
+            return {}, None
+        except (OSError, ValueError) as e:
+            # ValueError: an embedded NUL in the path.
+            return None, f"unreadable: {type(e).__name__}"
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception as e:  # JSONDecodeError, UnicodeDecodeError, RecursionError
+            return None, f"unparsable: {type(e).__name__}"
+        if not isinstance(data, dict):
+            return None, f"not-an-object: {_json_type_name(data)}"
+        return data, None
+    except Exception as e:
+        return None, f"unreadable: {type(e).__name__}"
+
+
 def load_config(engram_home: Optional[str] = None) -> dict:
     """Load <engram_home>/config.json. Returns {} on any failure.
+
+    A thin wrapper over load_config_checked that deliberately cannot tell
+    "absent" from "unreadable"; a caller that must tell them apart (the
+    prompt hooks' main()) uses load_config_checked.
 
     engram_home defaults to $ENGRAM_HOME or ~/.engram -- the identical
     formula every hook already computes at module scope for its own
     ENGRAM_HOME constant -- so existing call sites that call this with no
     arguments (``_load_config()``) see no behavior change.
     """
-    if engram_home is None:
-        engram_home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
-    config_path = Path(engram_home) / "config.json"
-    if config_path.exists():
+    cfg, _reason = load_config_checked(engram_home)
+    return cfg or {}
+
+
+def report_config_unknown(
+    hook_name: str,
+    key: str,
+    engram_home: str,
+    reason: str,
+    inject,
+    skipped: str,
+) -> None:
+    """The unreadable-config handler shared by the three prompt hooks.
+
+    ALWAYS writes one stderr line. If the shared rate limit says a notice is
+    due, calls ``inject(line)`` with ONE bounded injected line and only then
+    stamps the window (a stamp is written after the response is out, never
+    for a line nobody saw). If _hooklib cannot be imported, the stderr line is
+    all there is -- still not silent. Never raises; the caller exits 0.
+    """
+    try:
+        from _hooklib import (
+            write_probe_unknown_stderr, probe_unknown_line,
+            probe_notice_due, mark_probe_notice,
+        )
+    except Exception:
         try:
-            return json.loads(config_path.read_text())
-        except (json.JSONDecodeError, OSError):
+            msg = "".join(" " if ord(c) < 32 or 127 <= ord(c) <= 159 else c
+                          for c in str(reason))[:200]
+            sys.stderr.write(f"{hook_name}: config unknown: {msg}"[:300] + "\n")
+        except Exception:
             pass
-    return {}
+        return
+    write_probe_unknown_stderr(hook_name, "config", reason)
+    try:
+        if not probe_notice_due(engram_home, key):
+            return
+        inject(probe_unknown_line("config.json unreadable", reason, skipped))
+        # Stamp strictly AFTER a successful flush: if flush raises, the line
+        # was never delivered, so no window starts (the outer except skips it).
+        sys.stdout.flush()
+        mark_probe_notice(engram_home, key)
+    except Exception:
+        pass
 
 
 def get_agent_name(
