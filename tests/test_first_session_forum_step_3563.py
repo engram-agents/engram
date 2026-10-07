@@ -20,8 +20,11 @@ different things:
       answers, the no-inline-write rule, the --force and never-guess
       instructions). They cannot prove an agent follows it.
 
-Block contract: the answer arrives in the ``FORUM_ANSWER`` environment variable
-(empty or unset = no answer yet). With no answer and a non-empty string
+Block contract (#3571): the answer arrives as DATA in the file
+``$ENGRAM_HOME/forum-url.answer`` (one line, written with a file-writing tool;
+absent = no answer yet). There is no template fence and no ``FORUM_ANSWER``
+environment variable. The cells here write that file with a plain
+``open().write()`` (what the file tool does: data, no shell). With no answer and a non-empty string
 ``forum.url`` present, the block prints the value and says to skip the
 question (nothing is written). With no answer and none set, it says the key is
 not set (ask the question). With an answer, it runs the tool, shows its output
@@ -124,8 +127,9 @@ def _run(tmp_path, config=None, answer=None, plugin_root="fake", extra_env=None,
         empty = tmp_path / "empty-root"
         empty.mkdir()
         env["CLAUDE_PLUGIN_ROOT"] = str(empty)
-    if answer is not None:
-        env["FORUM_ANSWER"] = answer
+    if answer:
+        # #3571: the answer is a file the agent writes (data), not an environment variable.
+        (home / "forum-url.answer").write_text(answer + "\n")
     env.update(extra_env or {})
     proc = subprocess.run(
         ["bash", "-c", _block()], env=_hermetic_env(**env),
@@ -134,16 +138,6 @@ def _run(tmp_path, config=None, answer=None, plugin_root="fake", extra_env=None,
         text=True, timeout=60,
     )
     return proc, cfg, before
-
-
-ANSWER_MARKER = "# forum-url-answer"
-
-
-def _template():
-    """The invocation template fence (first line ``# forum-url-answer``)."""
-    fences = [f for f in _fences(_step57_section(_skill_text())) if ANSWER_MARKER in f]
-    assert len(fences) == 1, f"expected exactly one answer-template fence, found {len(fences)}"
-    return fences[0]
 
 
 FORCE_MARKER = "# forum-url-force"
@@ -157,13 +151,13 @@ def _force_fence():
 
 
 def _run_as_instructed(tmp_path, url, config, force=None):
-    """Run EXACTLY what the skill tells an agent to run: the template with <URL>
-    substituted, then (only if ``force`` is set) the force fence, then the block,
-    all as ONE ``bash -c`` script. ``force="fence"`` pastes the skill's own force
-    fence; any other string is pasted as ``export FORUM_FORCE=<string>``."""
-    template = _template()
-    assert "<URL>" in template
-    script = template.replace("<URL>", url) + "\n"
+    """Run EXACTLY what the skill tells an agent to do (#3571): write the user's URL
+    to ``$ENGRAM_HOME/forum-url.answer`` the way a file tool does (a plain
+    ``open().write()``, no shell), then run (only if ``force`` is set) the force
+    fence, then the block, as ONE ``bash -c`` script. ``force="fence"`` pastes the
+    skill's own force fence; any other string is pasted as
+    ``export FORUM_FORCE=<string>``. The URL never enters the script text."""
+    script = ""
     if force == "fence":
         script += _force_fence() + "\n"
     elif force is not None:
@@ -174,6 +168,8 @@ def _run_as_instructed(tmp_path, url, config, force=None):
     cfg = home / "config.json"
     cfg.write_text(json.dumps(config, indent=2) + "\n")
     before = cfg.read_bytes()
+    with open(home / "forum-url.answer", "wb") as f:
+        f.write(url.encode("utf-8") + b"\n")
     env = _hermetic_env(ENGRAM_HOME=str(home), CLAUDE_PLUGIN_ROOT=str(_plugin_root(tmp_path)))
     proc = subprocess.run(["bash", "-c", script], env=env, cwd=str(tmp_path),
                           capture_output=True, text=True, timeout=60)
@@ -256,7 +252,7 @@ class TestC7BlockRuns:
         assert "pass --force" in (proc.stdout + proc.stderr)  # the tool's own words, verbatim
 
     def test_bad_url_reports_exit_2_untouched_and_block_exits_0(self, tmp_path):
-        proc, cfg, before = _run(tmp_path, BASE, answer="ftp://nope")
+        proc, cfg, before = _run(tmp_path, BASE, answer="http://h:0")
         assert proc.returncode == 0, proc.stderr
         assert cfg.read_bytes() == before
         assert "exit status: 2" in proc.stdout
@@ -374,10 +370,10 @@ class TestC7BlockRuns:
     # -- F4: the refusal reason must be in the stream the agent reads (stdout)
 
     def test_bad_url_reason_is_in_stdout_even_with_stderr_discarded(self, tmp_path):
-        proc, cfg, before = _run(tmp_path, BASE, answer="ftp://nope", stderr_to_devnull=True)
+        proc, cfg, before = _run(tmp_path, BASE, answer="http://h:0", stderr_to_devnull=True)
         assert proc.returncode == 0
         assert "exit status: 2" in proc.stdout
-        assert "refused: URL scheme must be http or https" in proc.stdout
+        assert "refused: URL port must be 1..65535" in proc.stdout
         assert cfg.read_bytes() == before
 
     def test_hermetic_env_pins_home_and_drops_engram_home(self, monkeypatch):
@@ -458,8 +454,8 @@ class TestC8PinnedWording:
     def test_fence_is_the_one_c7_runs(self):
         sec = _step57_section(_skill_text())
         fences = _fences(sec)
-        assert len(fences) == 4, ("Step 5.7 carries the answer template, the force fence, "
-                                  "the block and the hint-consume fence (slice 2b)")
+        assert len(fences) == 3, ("Step 5.7 carries the force fence, the block and the "
+                                  "hint-consume fence (#3571 removed the answer template)")
         block = _block()
         assert block in fences
         assert block.lstrip().startswith(MARKER)
@@ -476,14 +472,14 @@ class TestC8PinnedWording:
         bullet = next(l for l in sec.splitlines() if l.startswith("> - **(a)"))
         assert "5002 is the installer's default port" in bullet
         assert "if yours differs, tell me the port" in bullet
-        assert "use the port the user gave" in sec
+        assert "write the URL the user gave" in sec
 
     def test_force_fence_is_exactly_the_export_and_prose_gates_it(self):
         f = _force_fence()
         assert [l for l in f.splitlines() if l.strip()] == [FORCE_MARKER, "export FORUM_FORCE=1"]
         sec = _step57_section(_skill_text())
         prose = re.sub(r"^```.*?^```", "", sec, flags=re.MULTILINE | re.DOTALL)
-        assert re.search(r"between the (answer )?template and the block", prose)
+        assert re.search(r"(insert|paste) this fence (right )?before the block", prose)
         assert re.search(r"ONLY after the user has explicitly asked to overwrite", prose)
 
     def test_skip_line_is_pinned_in_prose_and_block(self):
@@ -494,14 +490,18 @@ class TestC8PinnedWording:
         assert re.search(r"SKIP the question", prose)
 
     def test_tool_call_merges_stderr(self):
-        assert '"$FORUM_ANSWER" ${FORCE:+--force} 2>&1' in _block()
+        assert '"$PY" "$TOOL" "$ANSWER" ${FORCE:+--force} 2>&1' in _block()
 
     def test_template_shape(self):
-        t = _template()
-        assert t.lstrip().startswith(ANSWER_MARKER)
-        assert "<<'URL_EOF'" in t          # quoted delimiter: nothing in the URL is expanded
-        assert "export FORUM_ANSWER" in t
-        assert "<URL>" in t
+        # #3571: the answer template fence is gone. No fence in Step 5.7 carries a
+        # placeholder, a URL_EOF delimiter or an answer variable; the only heredocs
+        # are the block's own constant, quoted Python reads.
+        for f in _fences(_step57_section(_skill_text())):
+            assert not f.lstrip().startswith("# forum-url-answer")
+            assert "<URL>" not in f and "URL_EOF" not in f
+            assert "export FORUM_ANSWER" not in f
+            for m in re.finditer(r"<<(-?)\s*(['\"]?)(\w+)\2", f):
+                assert m.group(3) == "PYEOF" and m.group(2) == "'", m.group(0)
 
     def test_tool_resolution_uses_plugin_root_pattern(self):
         assert "${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/tools/set_forum_url.py}" in _block()

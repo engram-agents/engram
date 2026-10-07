@@ -8,9 +8,9 @@ sourced, never read by a gate or hook, and never makes "configured" true.
 Every runnable instruction in the skill is a marked fence, and every cell here
 builds its command FROM THE SKILL TEXT exactly as the prose says, then runs it:
 
-  # forum-url-answer         the template (the user's URL as data)
-  # forum-url-step           the block (pasted right after the template)
-  # forum-url-force          only when the user asks to overwrite
+  # forum-url-step           the block (reads the answer FILE; #3571 removed the
+                             answer template, the URL is never shell text)
+  # forum-url-force          only when the user asks to overwrite (before the block)
   # forum-url-hint-consume   run in its OWN Bash call after ANY answer,
                              including "no forum" and "give a different URL"
 
@@ -39,9 +39,8 @@ REPO = Path(__file__).resolve().parents[1]
 SKILL = REPO / "src" / "engram" / "skills" / "claude" / "engram-first-session" / "SKILL.md"
 TOOL = REPO / "src" / "engram" / "tools" / "set_forum_url.py"
 
-STEP, ANSWER, FORCE, CONSUME = (
-    "# forum-url-step", "# forum-url-answer", "# forum-url-force",
-    "# forum-url-hint-consume")
+STEP, FORCE, CONSUME = (
+    "# forum-url-step", "# forum-url-force", "# forum-url-hint-consume")
 
 LOCAL = "http://localhost:5002"
 LAN = "http://192.168.1.50:5002"
@@ -132,10 +131,11 @@ class Seat:
         return self._run(_fence(STEP))
 
     def answer(self, url, force=False):
-        """The template with <URL> replaced, [force fence,] then the block: one call."""
-        template = _fence(ANSWER)
-        assert "<URL>" in template
-        script = template.replace("<URL>", url) + "\n"
+        """Write the answer file the way a file tool does (data, no shell), then run
+        [force fence,] the block: one call. The URL never enters the script text."""
+        with open(self.home / "forum-url.answer", "wb") as f:
+            f.write(url.encode("utf-8") + b"\n")
+        script = ""
         if force:
             script += _fence(FORCE) + "\n"
         return self._run(script + _fence(STEP))
@@ -333,7 +333,7 @@ class TestConsume:
 
     def test_a_refused_answer_still_consumes_when_the_fence_runs(self, tmp_path):
         s = Seat(tmp_path, hint=HINTED + "\n")
-        r = s.answer("ftp://nope")
+        r = s.answer("http://h:0")
         assert "exit status: 2" in r.stdout
         assert s.consume().returncode == 0
         assert not s.hint_exists()
@@ -474,7 +474,7 @@ class TestH10NeverConfigured:
 class TestPinnedWording:
     def test_four_marked_fences_and_the_consume_fence_is_unique(self):
         fences = _fences(_step57())
-        assert len(fences) == 4
+        assert len(fences) == 3  # #3571: the answer template fence is gone
         assert _fence(CONSUME) in fences
         assert _fence(CONSUME).lstrip().startswith(CONSUME)
 
@@ -487,7 +487,7 @@ class TestPinnedWording:
     def test_confirmation_not_the_hint_decides_and_no_auto_write(self):
         p = re.sub(r"\s+", " ", _prose())
         assert "the user's confirmation, not the hint, decides" in p.lower()
-        assert re.search(r"never put the hinted URL into `FORUM_ANSWER` unless the user", p)
+        assert re.search(r"never write the hinted URL to `forum-url\.answer` unless the user", p)
 
     def test_consume_instruction_runs_after_any_answer_in_its_own_call(self):
         p = re.sub(r"\s+", " ", _prose())
