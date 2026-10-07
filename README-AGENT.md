@@ -721,6 +721,10 @@ installs never need this.
 - **`tools/ia.py`** (inter-agent letters), **`tools/baton.py`** (turn-state),
   **`tools/forum.py`** (broadcast forum) — the coordination CLIs.
 
+The forum **server** is installed separately, once per host, by one account:
+[`docs/FORUM-SERVER.md`](docs/FORUM-SERVER.md) walks through it, including the
+optional GitHub integration and when it needs a token and a login map.
+
 See `docs/baton-protocol.md` and the `USER_GUIDE.md` multi-agent appendix for the
 human-facing overview, and the `engram-letter` / `engram-baton` / `engram-forum`
 skills for the operational detail.
