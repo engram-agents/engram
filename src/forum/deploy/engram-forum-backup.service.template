@@ -1,14 +1,21 @@
-# ENGRAM forum DB backup — systemd --user oneshot unit
+# ENGRAM forum DB backup — systemd --user oneshot unit TEMPLATE
 #
-# Runs tools/forum_backup.py with defaults (snaps the live forum DB into a
+# >>>TEMPLATE-ONLY (install-forum-service.sh strips this block when rendering)
+#     {{FORUM_HOME}} is a placeholder. install-forum-service.sh renders it to the
+#     forum's service dir (--service-dir) and installs the result as
+#     engram-forum-backup.service; the script runs from the snapshot the installer
+#     keeps at {{FORUM_HOME}}/app/tools/forum_backup.py, never from a checkout.
+# <<<TEMPLATE-ONLY
+#
+# Runs forum_backup.py with defaults (snaps the live forum DB into a
 # text SQL dump + copies the audit JSONL, then commits to a local git repo).
 # Triggered by the companion timer: engram-forum-backup.timer
 #
-# Install: see "Backup" section of forum/deploy/README.md.
+# Install: see the "Backup timer" section of src/forum/deploy/README.md.
 # Enable:  systemctl --user enable --now engram-forum-backup.timer
 # Restore: stop the forum service, then:
-#          sqlite3 /home/agents-shared/forum/forum.db \
-#              < /home/agents-shared/forum/backup/forum.sql
+#          sqlite3 {{FORUM_HOME}}/forum.db \
+#              < {{FORUM_HOME}}/backup/forum.sql
 #
 # This unit is a oneshot — it runs the backup script once per timer fire and
 # exits. Failures surface via:  systemctl --user status engram-forum-backup.service
@@ -17,7 +24,7 @@
 
 [Unit]
 Description=ENGRAM forum DB backup (iterdump + git snapshot)
-Documentation=https://github.com/engram-agents/engram/blob/main/forum/deploy/README.md
+Documentation=https://github.com/engram-agents/engram/blob/main/src/forum/deploy/README.md
 After=network-online.target
 # #3276: a failed run posts a forum thread (see engram-forum-backup-alarm.service)
 # so a broken backup is never silent again.
@@ -34,13 +41,14 @@ UMask=002
 # (system python3 lacks sqlite_vec, so a vec-bearing forum.db backup died with
 # "no such module: vec0"). Belt-and-suspenders with the extension-free strip
 # (#1057/#1089): the tool works under any interpreter AND the unit runs under the
-# right one, matching the server. The script path below is the admin's
-# engram-alpha checkout (%h); adjust if your checkout lives elsewhere.
-ExecStart=/home/agents-shared/forum/.venv/bin/python \
-    %h/engram-alpha/tools/forum_backup.py \
-    --db /home/agents-shared/forum/forum.db \
-    --backup-dir /home/agents-shared/forum/backup \
-    --audit /home/agents-shared/forum/forum-audit.jsonl
+# right one, matching the server. The script is the installer's snapshot under
+# the service dir, so it moves with each deploy rather than with whatever branch a
+# checkout happens to be on.
+ExecStart={{FORUM_HOME}}/.venv/bin/python \
+    {{FORUM_HOME}}/app/tools/forum_backup.py \
+    --db {{FORUM_HOME}}/forum.db \
+    --backup-dir {{FORUM_HOME}}/backup \
+    --audit {{FORUM_HOME}}/forum-audit.jsonl
 # stdout+stderr go to the journal; surface with:
 #   journalctl --user -u engram-forum-backup.service
 StandardOutput=journal

@@ -37,8 +37,9 @@ _REPO = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_REPO / "src"))
 from forum.coordination.names import is_valid_agent_name  # noqa: E402
 DEPLOY = _REPO / "src" / "forum" / "deploy"
-BACKUP_UNIT = DEPLOY / "engram-forum-backup.service"
-ALARM_UNIT = DEPLOY / "engram-forum-backup-alarm.service"
+# The two units are TEMPLATES ({{FORUM_HOME}}, #3568); the installer renders them.
+BACKUP_UNIT = DEPLOY / "engram-forum-backup.service.template"
+ALARM_UNIT = DEPLOY / "engram-forum-backup-alarm.service.template"
 INSTALLER = DEPLOY / "install-forum-service.sh"
 
 
@@ -60,6 +61,15 @@ def _effective_env(path: Path) -> dict:
                 k, v = tok.split("=", 1)
                 env[k] = v
     return env
+
+
+def _rendered_copy(template: Path, dest_dir: Path) -> Path:
+    """The template rendered for a scratch service dir, under its real unit name
+    (systemd-analyze wants a .service file with absolute ExecStart paths)."""
+    out = dest_dir / template.name.removesuffix(".template")
+    out.write_text(template.read_text(encoding="utf-8").replace("{{FORUM_HOME}}", str(dest_dir / "forum")),
+                   encoding="utf-8")
+    return out
 
 
 def _parse_unit(path: Path) -> dict[str, dict[str, list[str]]]:
@@ -146,8 +156,7 @@ class TestUnitFiles:
         exe = shutil.which("systemd-analyze")
         if exe is None:
             pytest.skip("systemd-analyze not installed")
-        work = tmp_path / ALARM_UNIT.name
-        shutil.copy(ALARM_UNIT, work)
+        work = _rendered_copy(ALARM_UNIT, tmp_path)
         # system-mode verify: needs no user bus
         r = subprocess.run([exe, "verify", str(work)], capture_output=True, text=True)
         text = r.stdout + r.stderr
@@ -169,10 +178,9 @@ class TestUnitFiles:
         # ExecStart paths (venv python, %h/engram-alpha) do not exist on every
         # host and verify reports that; only SYNTAX problems matter here. Copy to
         # tmp so unit-name resolution of the OnFailure target is also local.
-        work = tmp_path / unit.name
-        shutil.copy(unit, work)
+        work = _rendered_copy(unit, tmp_path)
         if unit == BACKUP_UNIT and ALARM_UNIT.is_file():
-            shutil.copy(ALARM_UNIT, tmp_path / ALARM_UNIT.name)
+            _rendered_copy(ALARM_UNIT, tmp_path)
         r = subprocess.run(
             [exe, "--user", "verify", str(work)], capture_output=True, text=True,
             env={**os.environ, "SYSTEMD_LOG_LEVEL": "info"},
@@ -293,6 +301,7 @@ def run_block(tmp_path):
     script = (
         "set -euo pipefail\n"
         f"SRC={shlex.quote(str(_REPO))}\nUNIT_DIR={shlex.quote(str(unit_dir))}\nDRY_RUN=0\n"
+        f"SERVICE_DIR={shlex.quote(str(tmp_path / 'forum'))}\n"
         'RUN() { "$@"; }\n' + m.group(1)
     )
 
@@ -332,10 +341,9 @@ class TestInstallerBackupUnitBlockRealExecution:
         unit_dir, run = run_block
         run()
         svc = unit_dir / "engram-forum-backup.service"
-        edited = svc.read_text().replace(
-            "--audit /home/agents-shared/forum/forum-audit.jsonl",
-            "--audit /home/agents-shared/forum/forum-audit.jsonl --packs-dir /srv/packs",
-        )
+        audit = f"--audit {unit_dir.parent / 'forum'}/forum-audit.jsonl"  # the fixture's SERVICE_DIR
+        assert audit in svc.read_text()
+        edited = svc.read_text().replace(audit, audit + " --packs-dir /srv/packs")
         assert "--packs-dir /srv/packs" in edited
         svc.write_text(edited)
         (unit_dir / "engram-forum-backup.timer").write_text("[Timer]\nOnCalendar=hourly\n")

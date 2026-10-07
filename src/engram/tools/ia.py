@@ -674,7 +674,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_read.add_argument(
         "counterpart",
         metavar="COUNTERPART",
-        help="The other agent in the thread (e.g. 'borges')",
+        help="The other agent in the thread (e.g. 'alice')",
     )
     p_read.add_argument(
         "--since-seq", dest="since_seq", type=int, default=0, metavar="N",
@@ -704,7 +704,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_write.add_argument(
         "--to", required=True, metavar="AGENT[,AGENT,...]",
         help=(
-            "Recipient(s) — one name or a comma-separated list (e.g. 'ariadne,borges'). "
+            "Recipient(s) — one name or a comma-separated list (e.g. 'alice,bob'). "
             "Each recipient gets their own 1:1 DM thread with the same body."
         ),
     )

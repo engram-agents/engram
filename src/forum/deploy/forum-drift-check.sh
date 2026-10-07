@@ -15,7 +15,11 @@
 #
 # Options:
 #   --service-dir PATH  shared dir for the deployed forum (DB + code + venv).
-#                       Default: /home/agents-shared/forum
+#                       Without it, the FORUM_HOME of the existing
+#                       engram-forum.service (user unit dir) is used, exactly as
+#                       install-forum-service.sh does. No such unit: refused
+#                       (exit 2) naming this flag. A unit with no parsable
+#                       FORUM_HOME: refused (exit 2) naming the unit file.
 #   --src PATH          engram-alpha checkout containing src/forum/.
 #                       Default: auto-detect via `git rev-parse --show-toplevel`
 #                       from this script's own location (i.e. the checkout
@@ -43,7 +47,7 @@
 # Part of #2824.
 set -euo pipefail
 
-SERVICE_DIR="/home/agents-shared/forum"
+SERVICE_DIR=""   # no default (#3568): a flag, else the existing unit's FORUM_HOME
 SRC=""
 REF="HEAD"
 VERBOSE=0
@@ -59,6 +63,44 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+# ---------------------------------------------------------------------------
+# Resolve --service-dir (#3568): a flag wins; otherwise the FORUM_HOME of the
+# existing engram-forum.service, the same rule and the same unit path as
+# install-forum-service.sh (a hand-kept copy of its _unit_forum_home: this script
+# must run without sourcing the installer). Reads only.
+# ---------------------------------------------------------------------------
+_unit_forum_home() {
+  local _l _v="" _w
+  while IFS= read -r _l || [ -n "$_l" ]; do
+    _l="${_l#"${_l%%[![:space:]]*}"}"
+    case "$_l" in
+      '#'*|';'*) continue ;;
+      'Environment=FORUM_HOME='*) _w="${_l#Environment=FORUM_HOME=}" ;;
+      'Environment="FORUM_HOME='*) _w="${_l#Environment=\"FORUM_HOME=}"; _w="${_w%\"*}" ;;
+      *) continue ;;
+    esac
+    _w="${_w%"${_w##*[![:space:]]}"}"
+    _v="$_w"
+  done < "$1"
+  case "$_v" in
+    *[[:space:]\"\']*) ;;
+    /*) printf '%s\n' "$_v" ;;
+  esac
+}
+if [ -z "$SERVICE_DIR" ]; then
+  _EXISTING_UNIT="$HOME/.config/systemd/user/engram-forum.service"
+  if [ ! -f "$_EXISTING_UNIT" ]; then
+    echo "ERROR: --service-dir is required (no existing engram-forum.service at $_EXISTING_UNIT to read FORUM_HOME from)" >&2
+    exit 2
+  fi
+  SERVICE_DIR="$(_unit_forum_home "$_EXISTING_UNIT")"
+  if [ -z "$SERVICE_DIR" ]; then
+    echo "ERROR: $_EXISTING_UNIT has no parsable absolute Environment=FORUM_HOME=<dir> line; pass --service-dir <dir> explicitly" >&2
+    exit 2
+  fi
+  echo "==> --service-dir not given; using FORUM_HOME=$SERVICE_DIR from $_EXISTING_UNIT" >&2
+fi
 
 # ---------------------------------------------------------------------------
 # Resolve --src: explicit flag wins; otherwise auto-detect from this script's

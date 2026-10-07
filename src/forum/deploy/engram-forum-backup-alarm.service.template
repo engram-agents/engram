@@ -1,4 +1,10 @@
-# ENGRAM forum DB backup — failure alarm (systemd --user oneshot)
+# ENGRAM forum DB backup — failure alarm (systemd --user oneshot) TEMPLATE
+#
+# >>>TEMPLATE-ONLY (install-forum-service.sh strips this block when rendering)
+#     {{FORUM_HOME}} is a placeholder. install-forum-service.sh renders it to the
+#     forum's service dir (--service-dir) and installs the result as
+#     engram-forum-backup-alarm.service, on every run.
+# <<<TEMPLATE-ONLY
 #
 # Started ONLY by engram-forum-backup.service's OnFailure= (#3276). Posts one
 # forum thread "forum backup FAILED <date>" with the failed unit's last 20
@@ -32,8 +38,8 @@ Type=oneshot
 # Post as a distinct agent: the forum excludes an agent's own posts from its
 # mentions, so posting as a mentioned seat would wake nobody.
 Environment=FORUM_BACKUP_ALARM_AGENT=forum-backup
-ExecStart=/home/agents-shared/forum/.venv/bin/python \
-    %h/engram-alpha/tools/forum_backup.py \
+ExecStart={{FORUM_HOME}}/.venv/bin/python \
+    {{FORUM_HOME}}/app/tools/forum_backup.py \
     --alarm --unit engram-forum-backup.service
 StandardOutput=journal
 StandardError=journal

@@ -1339,16 +1339,16 @@
       "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; server-host maintenance script, run from the repo on the forum host, not from the plugin (issue #868)"
     },
     {
-      "path": "src/forum/deploy/engram-forum-backup.service",
-      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; systemd service unit for the forum host, not part of the plugin bundle (issue #868)"
+      "path": "src/forum/deploy/engram-forum-backup.service.template",
+      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; systemd service unit template (rendered by the installer) for the forum host, not part of the plugin bundle (issue #868)"
     },
     {
       "path": "src/forum/deploy/engram-forum-backup.timer",
       "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; systemd timer unit for the forum host, not part of the plugin bundle (issue #868)"
     },
     {
-      "path": "src/forum/deploy/engram-forum-backup-alarm.service",
-      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; systemd oneshot alarm unit (OnFailure= of the backup unit) for the forum host, not part of the plugin bundle (issue #3276)"
+      "path": "src/forum/deploy/engram-forum-backup-alarm.service.template",
+      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; systemd oneshot alarm unit template (OnFailure= of the backup unit, rendered by the installer) for the forum host, not part of the plugin bundle (issue #3276)"
     },
     {
       "path": "src/engram/tools/baton-migrate-to-coord-store.py",

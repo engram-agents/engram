@@ -388,7 +388,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     if len(participants) < 1:
         print(
             "baton init: --participants requires at least one agent name "
-            "(e.g. --participants borges,ariadne).",
+            "(e.g. --participants alice,bob).",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -438,7 +438,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             print(
                 f"baton init: invalid --github value '{github_anchor}'. "
                 f"Accepted forms: {GITHUB_ANCHOR_ACCEPTED_FORMS} "
-                "(e.g. pr/490, pr/engram-agents/engram-paper/22, project/4).",
+                "(e.g. pr/490, pr/owner/repo/22, project/4).",
                 file=sys.stderr,
             )
             sys.exit(EXIT_VALIDATION)
@@ -481,7 +481,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         if not re.match(r"^[\w.-]+/[\w.-]+$", repo_arg):
             print(
                 f"baton init: invalid --repo value '{repo_arg}'. "
-                "Expected owner/repo (e.g. engram-agents/engram-paper).",
+                "Expected owner/repo (e.g. owner/repo).",
                 file=sys.stderr,
             )
             sys.exit(EXIT_VALIDATION)
@@ -2333,7 +2333,7 @@ def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str, client: 
         print(
             f"baton anchor: invalid --github value '{github_anchor}'. "
             f"Accepted forms: {GITHUB_ANCHOR_ACCEPTED_FORMS} "
-            "(e.g. pr/490, pr/engram-agents/engram-paper/22, project/4).",
+            "(e.g. pr/490, pr/owner/repo/22, project/4).",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -2895,7 +2895,6 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Protocol docs: docs/baton-protocol.md\n"
-            "Projects dir:  /home/agents-shared/forum/projects/ (manual deploy)\n"
         ),
     )
     subparsers = parser.add_subparsers(dest="subcommand", metavar="subcommand")
@@ -2922,7 +2921,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_init.add_argument(
         "--participants", metavar="AGENTS", required=True,
-        help="Comma-separated list of participant agent names (e.g. borges,ariadne)",
+        help="Comma-separated list of participant agent names (e.g. alice,bob)",
     )
     p_init.add_argument(
         "--status",
@@ -2939,14 +2938,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "GitHub anchor for live status in the auto-pull hook. "
             f"Format: {GITHUB_ANCHOR_ACCEPTED_FORMS} "
-            "(e.g. pr/490, pr/engram-agents/engram-paper/22, project/4). "
+            "(e.g. pr/490, pr/owner/repo/22, project/4). "
             "A PR-<N> project_id auto-derives pr/<N> if this is omitted."
         ),
     )
     p_init.add_argument(
         "--repo", metavar="OWNER/REPO",
         help=(
-            "Repo-qualify a PR anchor (e.g. engram-agents/engram-paper). "
+            "Repo-qualify a PR anchor (e.g. owner/repo). "
             "Effectively REQUIRED for every PR-baton (#1918: there is no "
             "default repo) -- an unqualified pr/<N> anchor is refused and "
             "counted (never guessed against) by gc/flip/merge."
@@ -3249,7 +3248,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--github", metavar="ANCHOR", required=True,
         help=(
             f"GitHub anchor value: {GITHUB_ANCHOR_ACCEPTED_FORMS} "
-            "(e.g. pr/490, pr/engram-agents/engram-paper/22, project/4). "
+            "(e.g. pr/490, pr/owner/repo/22, project/4). "
             "Repo-qualify (#1715, #1918) every PR anchor -- there is no "
             "default repo, and gc/flip/merge refuse an unqualified one."
         ),

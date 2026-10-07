@@ -581,8 +581,7 @@ class TestExplicitGroup:
     def test_omitted_group_refused_when_primary_not_agents(self, tmp_path):
         r, unit, log = _install(tmp_path, [], group=None, primary_group="wheel")
         assert r.returncode == 2, r.stdout + r.stderr
-        assert "--group" in r.stderr and "agents" in r.stderr
-        assert "wheel" in r.stderr
+        assert "--group" in r.stderr and "wheel" in r.stderr
         assert not (tmp_path / "forum").exists()
 
     def test_omitted_group_ok_when_primary_is_agents(self, tmp_path):

@@ -5,7 +5,7 @@
 # Run AS THE FORUM ADMIN (the account that runs the forum day to day) — NOT via
 # sudo. The admin owns + runs the service so upgrades/restarts + the direct-DB
 # admin CLI (admin.py) need no operator round-trip. The forum is hosted in a
-# SHARED dir (default below) so the data outlives the admin baton and a
+# SHARED dir (--service-dir) so the data outlives the admin baton and a
 # counterpart agent in the shared group can cover. The one sudo exception is
 # enabling linger for reboot-survival (printed at the end if it's not set).
 #
@@ -13,15 +13,19 @@
 #
 # Options:
 #   --src PATH          engram-alpha checkout containing src/forum/ (required)
-#   --service-dir PATH  shared dir for the forum (DB + code + venv).
-#                       Default: /home/agents-shared/forum
+#   --service-dir PATH  shared dir for the forum (DB + code + venv). Required on a
+#                       first install (e.g. /home/<shared>/forum). On a re-install
+#                       it may be omitted: the FORUM_HOME of the existing
+#                       engram-forum.service is reused, so a re-run can never start a
+#                       second, empty forum somewhere new. An existing unit with no
+#                       parsable FORUM_HOME is refused (exit 2), never guessed at.
 #   --port PORT         port the service listens on. Default: 5002
 #   --admin-user USER   systemd --user account running the service.
 #                       Default: current user ($(whoami))
 #   --group NAME        group that co-admins share (group-writable data).
-#                       The shared forum group is normally `agents`. If omitted,
-#                       the installer REFUSES (exit 2) unless your primary group
-#                       (`id -gn`) is literally `agents` -- it never silently
+#                       Pass the shared group your forum seats belong to. If
+#                       omitted, the installer REFUSES (exit 2) unless your primary
+#                       group (`id -gn`) is literally `agents` -- it never silently
 #                       adopts an arbitrary primary group. Pass it explicitly.
 #   --baton-login-map PATH
 #                       absolute path of the baton login map (#3039 U2b). Rendered
@@ -54,7 +58,7 @@
 # Part of #868 (forum as second deploy target).
 set -euo pipefail
 
-SERVICE_DIR="/home/agents-shared/forum"
+SERVICE_DIR=""   # no default (#3568): a flag, else the existing unit's FORUM_HOME
 PORT="5002"
 ADMIN_USER="$(whoami)"
 GROUP=""
@@ -118,14 +122,14 @@ if [ -n "$BATON_UIDS" ] && [ -z "$BATON_MAP" ]; then
 fi
 
 # --group: never silently adopt the admin's primary group (#3312 -- it bit
-# operators twice). The shared forum group is normally `agents`; with --group
-# omitted we proceed only if the primary group already IS `agents`.
+# operators twice). With --group omitted we proceed only if the primary group
+# already IS the literal `agents` (the group our own deployment uses); anyone
+# else must say which shared group their forum seats belong to.
 if [ -z "$GROUP" ]; then
   _primary_group="$(id -gn)"
   if [ "$_primary_group" != "agents" ]; then
-    echo "ERROR: --group not given and your primary group is '$_primary_group', not 'agents'." >&2
-    echo "       The shared forum group is normally 'agents'; pass --group NAME explicitly" >&2
-    echo "       (e.g. --group agents) rather than letting the installer guess." >&2
+    echo "ERROR: --group not given: pass --group <the shared group your forum seats belong to>" >&2
+    echo "       (your primary group is '$_primary_group'; the installer never guesses the shared group)." >&2
     exit 2
   fi
   GROUP="$_primary_group"
@@ -160,6 +164,9 @@ fi
 }
 [ -f "$SRC/tools/baton_gate.py" ] || {
   echo "ERROR: $SRC/tools/baton_gate.py not found — the server's baton gate module is required" >&2; exit 2;
+}
+[ -f "$SRC/tools/forum_backup.py" ] || {
+  echo "ERROR: $SRC/tools/forum_backup.py not found — the backup units run the snapshot of this script" >&2; exit 2;
 }
 if [ "$DRY_RUN" -eq 0 ]; then
   command -v systemctl >/dev/null || {
@@ -215,6 +222,50 @@ if [ -f "$_EXISTING_UNIT" ]; then
     echo "       Nothing was written. Re-run with --github-token-file <path>." >&2
     exit 2
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# --service-dir (#3568): no baked-in location. A flag wins. Without one, reuse the
+# FORUM_HOME of the unit being replaced (so the redeploy command, which passes no
+# --service-dir, keeps working and can never start a second, empty forum
+# somewhere new). No unit at all = a first install: refuse. A unit whose FORUM_HOME
+# cannot be read: refuse naming it, never guess. Reads only (runs in --dry-run too),
+# and runs before anything is written. forum-drift-check.sh carries the same rule.
+# ---------------------------------------------------------------------------
+# Print FORUM_HOME from a unit's live (non-comment) Environment= line, plain or
+# quoted form, the last assignment winning; print nothing when there is none or it
+# is not an absolute path. A FUNCTION defined here, called inside $( ) below: the
+# case patterns must not sit inside a command substitution (macOS bash 3.2).
+_unit_forum_home() {
+  local _l _v="" _w
+  while IFS= read -r _l || [ -n "$_l" ]; do
+    _l="${_l#"${_l%%[![:space:]]*}"}"
+    case "$_l" in
+      '#'*|';'*) continue ;;
+      'Environment=FORUM_HOME='*) _w="${_l#Environment=FORUM_HOME=}" ;;
+      'Environment="FORUM_HOME='*) _w="${_l#Environment=\"FORUM_HOME=}"; _w="${_w%\"*}" ;;
+      *) continue ;;
+    esac
+    _w="${_w%"${_w##*[![:space:]]}"}"
+    _v="$_w"
+  done < "$1"
+  case "$_v" in
+    *[[:space:]\"\']*) ;;
+    /*) printf '%s\n' "$_v" ;;
+  esac
+}
+if [ -z "$SERVICE_DIR" ]; then
+  if [ ! -f "$_EXISTING_UNIT" ]; then
+    echo "ERROR: --service-dir is required on a first install (e.g. /home/<shared>/forum)" >&2
+    exit 2
+  fi
+  SERVICE_DIR="$(_unit_forum_home "$_EXISTING_UNIT")"
+  if [ -z "$SERVICE_DIR" ]; then
+    echo "ERROR: $_EXISTING_UNIT has no parsable absolute Environment=FORUM_HOME=<dir> line, so the" >&2
+    echo "       service dir cannot be reused. Nothing was written. Pass --service-dir <dir> explicitly." >&2
+    exit 2
+  fi
+  echo "==> --service-dir not given; reusing FORUM_HOME=$SERVICE_DIR from $_EXISTING_UNIT"
 fi
 
 # ---------------------------------------------------------------------------
@@ -308,6 +359,17 @@ else
   cp -L "$SRC/tools/baton_gate.py" "$APP/tools/baton_gate.py"
 fi
 
+# The backup tool (#3568). The backup and alarm units run THIS snapshot, never a
+# checkout, so the deployed backup code moves with deploys and not with whatever
+# branch a checkout happens to be on. cp -L: copy the resolved file, never a link.
+echo "==> Snapshotting backup tool → $APP/tools/forum_backup.py"
+RUN mkdir -p "$APP/tools"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  [dry-run] cp -L $SRC/tools/forum_backup.py → $APP/tools/forum_backup.py (resolves any symlink)"
+else
+  cp -L "$SRC/tools/forum_backup.py" "$APP/tools/forum_backup.py"
+fi
+
 # Build the venv ONLY if it isn't already a working one.
 if [ "$DRY_RUN" -eq 0 ] && [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import flask" 2>/dev/null; then
   echo "==> Reusing existing venv → $VENV ($("$VENV/bin/python" -c 'import flask;print("flask",flask.__version__)'))"
@@ -384,13 +446,16 @@ else
   printf '%s\n' "$RENDERED" > "$UNIT_DIR/$UNIT"
 fi
 
-# Backup units (#3276). Operators hand-edit the backup service/timer (checkout
-# path, --packs-dir; see README.md), so those are installed ONLY IF ABSENT and a
-# reinstall never reverts an edit. The failure-alarm unit is ours and is always
-# (re)installed. A drop-in is ALWAYS written so even a hand-edited backup unit
-# gains OnFailure= without being overwritten. The alarm unit has no [Install]
-# section and is deliberately NOT enabled: it is a oneshot started only via
-# OnFailure=, and enabling it would start it at login and post a false alarm.
+# Backup units (#3276, #3568). The backup service and the failure-alarm unit are
+# RENDERED from templates ({{FORUM_HOME}} -> the service dir), never copied, so
+# they name this install's own paths and no checkout. Operators hand-edit the
+# backup service/timer (--packs-dir; see README.md), so those are installed ONLY IF
+# ABSENT and a reinstall never reverts an edit; a kept unit that differs from what
+# would be installed gets exactly one notice line. The failure-alarm unit is ours
+# and is always (re)installed. A drop-in is ALWAYS written so even a hand-edited
+# backup unit gains OnFailure= without being overwritten. The alarm unit has no
+# [Install] section and is deliberately NOT enabled: it is a oneshot started only
+# via OnFailure=, and enabling it would start it at login and post a false alarm.
 # The timer is installed but not enabled (that stays the README runbook step);
 # the daemon-reload below picks everything up.
 # The alarm's @mention is per-install, never shipped: it is written into the
@@ -410,16 +475,53 @@ case "$_mention" in
     exit 2 ;;
 esac
 echo "==> Installing backup + failure-alarm units → $UNIT_DIR"
-for _bu in engram-forum-backup.service engram-forum-backup.timer engram-forum-backup-alarm.service; do
-  [ -f "$SRC/src/forum/deploy/$_bu" ] || { echo "ERROR: $_bu not found under $SRC/src/forum/deploy/" >&2; exit 2; }
+_BU_DEPLOY="$SRC/src/forum/deploy"
+for _bu in engram-forum-backup.service.template engram-forum-backup.timer engram-forum-backup-alarm.service.template; do
+  [ -f "$_BU_DEPLOY/$_bu" ] || { echo "ERROR: $_bu not found under $_BU_DEPLOY/" >&2; exit 2; }
 done
+# Render one unit template to stdout: drop the >>>TEMPLATE-ONLY block, substitute
+# {{FORUM_HOME}}. A leftover placeholder is a refusal, never an installed unit.
+_render_unit() {
+  local _out
+  _out="$(sed '/>>>TEMPLATE-ONLY/,/<<<TEMPLATE-ONLY/d' "$1" | sed "s|{{FORUM_HOME}}|$SERVICE_DIR|g")"
+  if printf '%s\n' "$_out" | grep -q '[{][{]'; then
+    echo "ERROR: unsubstituted placeholders remain in the rendered $(basename "$1")" >&2; exit 2
+  fi
+  printf '%s\n' "$_out"
+}
+# Install a rendered unit (always overwrites): $1 template file, $2 unit name.
+_install_rendered_unit() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  [dry-run] --- rendered $2 begin ---"
+    _render_unit "$1"
+    echo "  [dry-run] --- rendered $2 end ---"
+    echo "  [dry-run] install rendered unit → $UNIT_DIR/$2"
+  else
+    _render_unit "$1" > "$UNIT_DIR/$2"
+  fi
+}
+# One notice line when a KEPT unit is not what this installer would put there.
+_note_if_kept_unit_differs() {
+  local _name="$1" _same=0
+  if [ "$_name" = "engram-forum-backup.timer" ]; then
+    cmp -s "$_BU_DEPLOY/$_name" "$UNIT_DIR/$_name" && _same=1
+  else
+    _render_unit "$_BU_DEPLOY/$_name.template" | cmp -s - "$UNIT_DIR/$_name" && _same=1
+  fi
+  if [ "$_same" -eq 0 ]; then
+    echo "    NOTE: kept $UNIT_DIR/$_name differs from what this installer would install (left as is)"
+  fi
+}
 RUN mkdir -p "$UNIT_DIR"
-RUN cp "$SRC/src/forum/deploy/engram-forum-backup-alarm.service" "$UNIT_DIR/engram-forum-backup-alarm.service"
+_install_rendered_unit "$_BU_DEPLOY/engram-forum-backup-alarm.service.template" engram-forum-backup-alarm.service
 for _bu in engram-forum-backup.service engram-forum-backup.timer; do
   if [ -e "$UNIT_DIR/$_bu" ]; then
     echo "    keeping existing $_bu (not overwritten; may be hand-edited)"
+    _note_if_kept_unit_differs "$_bu"
+  elif [ "$_bu" = "engram-forum-backup.timer" ]; then
+    RUN cp "$_BU_DEPLOY/$_bu" "$UNIT_DIR/$_bu"
   else
-    RUN cp "$SRC/src/forum/deploy/$_bu" "$UNIT_DIR/$_bu"
+    _install_rendered_unit "$_BU_DEPLOY/$_bu.template" "$_bu"
   fi
 done
 RUN mkdir -p "$UNIT_DIR/engram-forum-backup.service.d"
@@ -436,7 +538,121 @@ else
   printf '[Service]\nEnvironment="FORUM_BACKUP_ALARM_MENTION=%s"\n' "$_mention" \
     > "$UNIT_DIR/engram-forum-backup-alarm.service.d/mention.conf"
 fi
+
+# Loud on a dead target (#3568). A backup timer that points at nothing fails
+# silently every day, so before anything is restarted read the backup service that
+# will actually be LIVE (rendered or kept) and refuse unless every absolute path in
+# its ExecStart exists: the interpreter and the script as files, and the parent
+# directory of each --db / --backup-dir / --audit value. Reads only. An ExecStart
+# that is absent or cannot be read this way is a refusal naming the unit, never a
+# silent pass. %h is expanded; continuation lines are joined; tokens split on
+# whitespace (no quote handling). Under --dry-run the venv and the snapshot do not
+# exist, so it only says what it would do. ALL the branching lives in this one
+# function (called right after this region, i.e. after the venv and the snapshot
+# exist and before any systemctl action) so a test can extract and drive it.
+_check_backup_exec_paths() {
+  local _unit="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  [dry-run] would check every ExecStart path of $_unit"
+    return 0
+  fi
+  _bce_fail() {
+    echo "ERROR: $_unit: $1" >&2
+    echo "       Nothing was restarted. Fix the unit (or delete it so it is re-rendered) and re-run." >&2
+    exit 2
+  }
+  [ -f "$_unit" ] || _bce_fail "unit file not found, so its ExecStart cannot be checked"
+  local _line _t _acc="" _in=0 _cmds="" _cmd _n=0
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    _t="${_line#"${_line%%[![:space:]]*}"}"
+    if [ "$_in" -eq 0 ]; then
+      case "$_t" in
+        ExecStart=*) _acc="${_t#ExecStart=}" ;;
+        *) continue ;;
+      esac
+    else
+      case "$_t" in
+        '#'*|';'*) continue ;;
+      esac
+      _acc="$_acc $_t"
+    fi
+    case "$_acc" in
+      *\\) _acc="${_acc%\\}"; _in=1 ;;
+      *)
+        _in=0
+        if [ -z "${_acc//[[:space:]]/}" ]; then
+          _cmds=""   # an empty ExecStart= resets the list, as systemd does
+        else
+          _cmds="$_cmds$_acc"$'\n'
+        fi
+        _acc="" ;;
+    esac
+  done < "$_unit"
+  [ -n "$_cmds" ] || _bce_fail "no ExecStart= command found (absent or empty)"
+  local _toks _tok _first _x _script _i _flag _val _parent
+  set -f
+  while IFS= read -r _cmd; do
+    [ -n "$_cmd" ] || continue
+    _toks=($_cmd)
+    _first="${_toks[0]}"
+    while :; do
+      case "$_first" in
+        [-@+!:]*) _first="${_first#?}" ;;
+        *) break ;;
+      esac
+    done
+    _first="${_first//\%h/$HOME}"
+    case "$_first" in
+      /*) ;;
+      *) set +f; _bce_fail "ExecStart interpreter '$_first' is not an absolute path" ;;
+    esac
+    [ -f "$_first" ] || { set +f; _bce_fail "ExecStart interpreter $_first does not exist (or is not a file)"; }
+    _script=""
+    _i=1
+    while [ "$_i" -lt "${#_toks[@]}" ]; do
+      _tok="${_toks[$_i]}"
+      case "$_tok" in
+        -*) ;;
+        *) _script="${_tok//\%h/$HOME}"; break ;;
+      esac
+      _i=$((_i + 1))
+    done
+    [ -n "$_script" ] || { set +f; _bce_fail "ExecStart names no script after the interpreter"; }
+    case "$_script" in
+      /*) ;;
+      *) set +f; _bce_fail "ExecStart script '$_script' is not an absolute path" ;;
+    esac
+    [ -f "$_script" ] || { set +f; _bce_fail "ExecStart script $_script does not exist (or is not a file)"; }
+    _i=1
+    while [ "$_i" -lt "${#_toks[@]}" ]; do
+      _tok="${_toks[$_i]}"
+      _flag=""; _val=""
+      case "$_tok" in
+        --db|--backup-dir|--audit)
+          _flag="$_tok"; _i=$((_i + 1))
+          [ "$_i" -lt "${#_toks[@]}" ] && _val="${_toks[$_i]}" ;;
+        --db=*|--backup-dir=*|--audit=*)
+          _flag="${_tok%%=*}"; _val="${_tok#*=}" ;;
+      esac
+      if [ -n "$_flag" ]; then
+        _val="${_val//\%h/$HOME}"
+        case "$_val" in
+          /*)
+            _parent="${_val%/*}"
+            [ -n "$_parent" ] || _parent="/"
+            [ -d "$_parent" ] || { set +f; _bce_fail "ExecStart $_flag parent directory $_parent does not exist (for $_val)"; } ;;
+        esac
+      fi
+      _i=$((_i + 1))
+    done
+  done <<EOF_BCE
+$_cmds
+EOF_BCE
+  set +f
+  echo "    backup unit ExecStart paths all exist: $_unit"
+}
 # <<< backup-units
+_check_backup_exec_paths "$UNIT_DIR/engram-forum-backup.service"
 
 LINGER_OK=1
 echo "==> Enabling linger (so the service survives logout/reboot)"

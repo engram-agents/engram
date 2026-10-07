@@ -2018,7 +2018,7 @@ class TestClaim:
             'prog': 'baton',
             'usage': None,
             'description': 'Multi-agent turn-state CLI — declare whose move it is on a shared project via explicit baton files.',
-            'epilog': 'Protocol docs: docs/baton-protocol.md\nProjects dir:  /home/agents-shared/forum/projects/ (manual deploy)\n',
+            'epilog': 'Protocol docs: docs/baton-protocol.md\n',
             'subparsers:metavar': 'subcommand',
             'subparsers:help': None,
             'subcommand:init:metavar': 'init',
