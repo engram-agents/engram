@@ -306,15 +306,44 @@ def rv(rid, login, state, oid=HEAD, ts="2026-10-01T10:00:00Z"):
     }
 
 
+def _rest_id(rid):
+    """The REST review id is an integer; the fixtures name reviews with strings."""
+    if isinstance(rid, str):
+        return int.from_bytes(rid.encode("utf-8"), "big")
+    return rid
+
+
+def to_rest(node):
+    """Translate a fixture review node (the old GraphQL field names) to the REST
+    row the gate reads (#3541). A non-dict node is passed through unchanged and a
+    deleted key stays deleted, so each test's malformed-input intent survives."""
+    if not isinstance(node, dict):
+        return node
+    out = {}
+    if "id" in node:
+        out["id"] = _rest_id(node["id"])
+    if "state" in node:
+        out["state"] = node["state"]
+    if "submittedAt" in node:
+        out["submitted_at"] = node["submittedAt"]
+    if "author" in node:
+        out["user"] = node["author"]
+    if "commit" in node:
+        c = node["commit"]
+        out["commit_id"] = c.get("oid") if isinstance(c, dict) else None
+    return out
+
+
 class FakeGh:
     """Stands in for subprocess.run at the baton_gate boundary.
 
-    Contract with the implementation: one `gh api graphql` call per page; the
-    page cursor travels as `-f after=<cursor>` (absent on the first page).
-    `reviews` is in PAGINATION order; the fake serves `page_size` per page.
+    Contract with the implementation (#3541): `gh pr view <N> --json
+    headRefOid,author` serves the head + PR author, `gh api
+    repos/<repo>/pulls/<N>/reviews?per_page=100&page=K` serves the rows.
+    `reviews` is in REST order (oldest first); the fake serves `page_size` per page.
     """
 
-    def __init__(self, reviews, *, head=HEAD, author="example-gh-author", page_size=50):
+    def __init__(self, reviews, *, head=HEAD, author="example-gh-author", page_size=100):
         self.reviews = list(reviews)
         self.head = head
         self.author = author
@@ -334,36 +363,27 @@ class FakeGh:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if self.mode == "garbage":
             return subprocess.CompletedProcess(cmd, 0, stdout="<<not json>>", stderr="")
-        kv = {}
-        for i, tok in enumerate(cmd):
-            if tok in ("-f", "-F") and i + 1 < len(cmd) and "=" in cmd[i + 1]:
-                k, v = cmd[i + 1].split("=", 1)
-                kv[k] = v
-        after = kv.get("after")
-        start = 0 if not after else int(after.lstrip("c"))
-        page = self.reviews[start:start + self.page_size]
-        end = start + len(page)
+        path = cmd[2]
+        if cmd[:2] == ["gh", "api"] and "/reviews?" in path:
+            page_no = int(path.rsplit("page=", 1)[1])
+            start = (page_no - 1) * self.page_size
+            page = [to_rest(n) for n in self.reviews[start:start + self.page_size]]
+            body = page
+            if self.mode == "nodes_not_list":
+                body = "oops"
+            if self.mode == "no_pageinfo":
+                body = {"message": "a page that is not a list"}
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(body), stderr="")
         pr = {
             "headRefOid": self.head,
             "author": ({"login": self.author} if self.author is not None else None),
-            "reviews": {
-                "pageInfo": {"hasNextPage": end < len(self.reviews),
-                             "endCursor": f"c{end}"},
-                "nodes": page,
-            },
         }
         if self.mode == "no_head":
             del pr["headRefOid"]
-        if self.mode == "no_pr":
-            pr = None
-        if self.mode == "nodes_not_list":
-            pr["reviews"]["nodes"] = "oops"
-        if self.mode == "no_pageinfo":
-            del pr["reviews"]["pageInfo"]
         if self.mode == "no_author":
             del pr["author"]
-        payload = {"data": {"repository": {"pullRequest": pr}}}
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+        body = None if self.mode == "no_pr" else pr
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(body), stderr="")
 
 
 @pytest.fixture
@@ -444,29 +464,32 @@ class TestReviewerVerdict:
 
     def test_T13b_page_boundary_exactly_at_cap_is_complete(self, gh):
         cap = baton_gate._REVIEW_PAGE_CAP
-        n = 50 * cap - 1
+        n = baton_gate._REVIEW_PAGE_SIZE * cap - 2  # + the approval = 999 rows: a short tenth page
         others = [rv(f"X{i}", "example-gh-two", "COMMENTED") for i in range(n)]
         fake = gh(others + [rv("R9", "example-gh-one", "APPROVED", ts="2026-10-01T12:00:00Z")])
         assert state() == "approved_current"
-        assert len(fake.calls) == cap
+        assert len([c for c in fake.calls if c[:2] == ["gh", "api"]]) == cap
 
     def test_T14_page_cap_exceeded_with_more_pages_is_incomplete(self, gh):
         cap = baton_gate._REVIEW_PAGE_CAP
-        others = [rv(f"X{i}", "example-gh-two", "COMMENTED") for i in range(50 * cap + 5)]
+        others = [rv(f"X{i}", "example-gh-two", "COMMENTED")
+                  for i in range(baton_gate._REVIEW_PAGE_SIZE * cap + 5)]
         fake = gh(others + [rv("R9", "example-gh-one", "APPROVED", ts="2026-10-01T12:00:00Z")])
         assert state() == "incomplete"
-        assert len(fake.calls) == cap  # hard cap: no further pages fetched
+        # hard cap: no further pages fetched
+        assert len([c for c in fake.calls if c[:2] == ["gh", "api"]]) == cap
 
     def test_has_next_page_without_cursor_is_not_complete(self, gh, monkeypatch):
+        # REST has no cursor: the same hazard is a page that never stops being
+        # full. It must never read as a complete walk (#3541).
         fake = gh([rv("R1", "example-gh-one", "APPROVED")])
         real = fake.__call__
+        full = [to_rest(rv(f"X{i}", "example-gh-two", "COMMENTED")) for i in range(100)]
 
         def broken(cmd, *a, **kw):
-            r = real(cmd, *a, **kw)
-            d = json.loads(r.stdout)
-            d["data"]["repository"]["pullRequest"]["reviews"]["pageInfo"] = {
-                "hasNextPage": True, "endCursor": None}
-            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(d), stderr="")
+            if cmd[:2] == ["gh", "api"] and "/reviews?" in cmd[2]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(full), stderr="")
+            return real(cmd, *a, **kw)
 
         monkeypatch.setattr(subprocess, "run", broken)
         assert state() in ("incomplete", "unknown")

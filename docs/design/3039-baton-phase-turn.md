@@ -405,7 +405,7 @@ and the file is identical on `dev` as of 2026-09-27:
   name. No request hook authenticates the caller. Anyone who can reach the server can
   flip as anyone.
 - The merge-stage gate's approval check (`_pr_approval_state` in `baton_gate.py`)
-  asks GitHub only for each review's `state` and `commit.oid`. It confirms that
+  asks GitHub only for each review's `state` and `commit_id` (read over REST since #3541). It confirms that
   **some** `APPROVED` review sits on the head commit. It does not ask **who** gave it.
   GitHub itself refuses self-approval, so the author cannot satisfy it alone, but any
   other account's approval does.

@@ -61,9 +61,26 @@ def rv(rid, login, state, oid=HEAD, ts="2026-10-01T10:00:00Z"):
     }
 
 
+def _rest_id(rid):
+    """The REST review id is an integer; the fixtures name reviews with strings."""
+    if isinstance(rid, str):
+        return int.from_bytes(rid.encode("utf-8"), "big")
+    return rid
+
+
+def to_rest(node):
+    """Translate a fixture review node (the old GraphQL field names) to the REST
+    row the gate reads (#3541)."""
+    c = node.get("commit")
+    return {"id": _rest_id(node["id"]), "state": node["state"],
+            "submitted_at": node["submittedAt"], "user": node["author"],
+            "commit_id": c.get("oid") if isinstance(c, dict) else None}
+
+
 class FakeGh:
-    """Routes the two gh calls the gate makes: CI (`gh pr view`) and reviews
-    (`gh api graphql`, cursor via `-f after=`)."""
+    """Routes the gh calls the gate makes: CI (`gh pr view --json
+    mergeStateStatus,...`), the head (`gh pr view --json headRefOid,author`) and
+    the review rows (`gh api .../reviews?per_page=100&page=K`)."""
 
     def __init__(self):
         self.ci = "green"          # green | red | pending | unknown
@@ -79,6 +96,9 @@ class FakeGh:
     def __call__(self, cmd, *a, **kw):
         with self._lock:
             self.calls.append(list(cmd))
+        if cmd[:3] == ["gh", "pr", "view"] and "headRefOid,author" in cmd:
+            payload = {"headRefOid": self.head, "author": {"login": self.pr_author}}
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
         if cmd[:3] == ["gh", "pr", "view"]:
             if self.ci == "unknown":
                 return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="ci boom")
@@ -91,7 +111,7 @@ class FakeGh:
                 out = {"mergeStateStatus": "BLOCKED", "statusCheckRollup": [
                     {"name": "pr-checks", "status": "IN_PROGRESS", "conclusion": ""}]}
             return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
-        if cmd[:3] == ["gh", "api", "graphql"]:
+        if cmd[:2] == ["gh", "api"] and "/reviews?" in cmd[2]:
             if self.barrier is not None:
                 try:
                     self.barrier.wait(timeout=10)
@@ -101,23 +121,10 @@ class FakeGh:
                 self.on_review_query()
             if self.review_mode == "nonzero":
                 return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="gh boom")
-            kv = {}
-            for i, tok in enumerate(cmd):
-                if tok in ("-f", "-F") and i + 1 < len(cmd) and "=" in cmd[i + 1]:
-                    k, v = cmd[i + 1].split("=", 1)
-                    kv[k] = v
-            after = kv.get("after")
-            start = 0 if not after else int(after.lstrip("c"))
-            page = self.reviews[start:start + 50]
-            end = start + len(page)
-            payload = {"data": {"repository": {"pullRequest": {
-                "headRefOid": self.head,
-                "author": {"login": self.pr_author},
-                "reviews": {"pageInfo": {"hasNextPage": end < len(self.reviews),
-                                         "endCursor": f"c{end}"},
-                            "nodes": page},
-            }}}}
-            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+            page_no = int(cmd[2].rsplit("page=", 1)[1])
+            page = self.reviews[(page_no - 1) * 100:page_no * 100]
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=json.dumps([to_rest(n) for n in page]), stderr="")
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="unexpected gh call")
 
 

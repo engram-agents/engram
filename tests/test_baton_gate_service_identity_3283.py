@@ -63,18 +63,18 @@ class FakeRun:
             raise self.raises
         if self.returncode != 0:
             return subprocess.CompletedProcess(cmd, self.returncode, stdout="", stderr=self.stderr)
-        if cmd[:3] == ["gh", "pr", "view"]:
+        if cmd[:3] == ["gh", "pr", "view"] and "headRefOid,author" in cmd:
+            out = {"headRefOid": HEAD, "author": {"login": "someone-else"}}
+        elif cmd[:3] == ["gh", "pr", "view"]:
             out = {"mergeStateStatus": "CLEAN", "statusCheckRollup": []}
-        elif any("query=query(" in t for t in cmd):
-            # reviewer site: two pages
-            after = any(t.startswith("after=") for t in cmd)
-            out = {"data": {"repository": {"pullRequest": {
-                "headRefOid": HEAD, "author": {"login": "someone-else"},
-                "reviews": {"pageInfo": {"hasNextPage": not after, "endCursor": "c1"},
-                            "nodes": []}}}}}
+        elif cmd[:2] == ["gh", "api"] and "/reviews?" in cmd[2]:
+            # reviewer / approval sites: a full first page, then an empty one
+            out = [] if cmd[2].endswith("page=2") else [
+                {"id": i, "state": "COMMENTED", "user": {"login": "someone-else"},
+                 "submitted_at": "2026-10-01T10:00:00Z", "commit_id": HEAD}
+                for i in range(100)]
         else:
-            out = {"data": {"repository": {"pullRequest": {
-                "headRefOid": HEAD, "reviews": {"nodes": []}}}}}
+            out = {}
         return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
 
 

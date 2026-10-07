@@ -425,10 +425,8 @@ ALLOW_LIST = {
         (1, "#3509", "the board's PR-state read; env comes from the injected identity provider, no identity -> no call"),
     (_GATE, "_pr_ci_state"):
         (3, "#3533", "CI-state read for the flip gate, under the service identity: the check-run rollup (ambient login only) plus, for the fine-grained service token, the merge-state read and the workflow-runs read"),
-    (_GATE, "_pr_approval_state"):
-        (1, "#3283", "approval-state read for the flip gate, under the service identity"),
-    (_GATE, "_reviewer_approval_state"):
-        (1, "#3283", "reviewer-approval paging read for the flip gate, under the service identity"),
+    (_GATE, "_gh_read_json"):
+        (1, "#3541", "the one private reader the two approval reads share (gh pr view --json headRefOid,author, and gh api pulls/<N>/reviews); it takes the identity itself, so every approval-state call runs under the service identity"),
 }
 
 # File-path module loaders on the surface (item 5), by (path, function). The
@@ -446,9 +444,11 @@ KNOWN_PATH_LOADERS = {
 # The ratchet. LOWER this (never raise it) when a PR routes a spawn away and
 # deletes/lowers its entry. Adoption value: 4; raised to 6 once, deliberately, by
 # #3533 (the fine-grained service token cannot read the check-run rollup, so
-# `_pr_ci_state` gained two gh calls, both under the identity kwargs).
-_MAX_ALLOWED_SPAWN_SITES = 6
-_ADOPTION_CEILING = 6
+# `_pr_ci_state` gained two gh calls, both under the identity kwargs); lowered
+# to 5 by #3541 (the two approval reads each lost their own spawn site and now
+# share ONE private REST reader: 6 - 2 + 1).
+_MAX_ALLOWED_SPAWN_SITES = 5
+_ADOPTION_CEILING = 5
 
 
 # --------------------------------------------------------------------------
@@ -502,8 +502,7 @@ def test_real_tree_sees_exactly_the_four_known_sites(real_sites):
     assert found == collections.Counter({
         (_BOARD, "_gh_pr_state"): 1,
         (_GATE, "_pr_ci_state"): 3,
-        (_GATE, "_pr_approval_state"): 1,
-        (_GATE, "_reviewer_approval_state"): 1,
+        (_GATE, "_gh_read_json"): 1,
     })
 
 
@@ -785,13 +784,13 @@ def test_removing_kwargs_from_a_copy_of_each_real_allow_listed_call_fails(repo_r
     board = (repo_root / _BOARD).read_text(encoding="utf-8")
     gate = (repo_root / _GATE).read_text(encoding="utf-8")
     assert board.count("            **gh_kw,\n") == 1
-    assert gate.count("**gh_kw") == 5
+    assert gate.count("**gh_kw") == 4
     mutated_board = board.replace("            **gh_kw,\n", "")
     mutated_gate = gate.replace("timeout=15, **gh_kw)", "timeout=15)")
     assert mutated_board != board and mutated_gate != gate, "mutation did not apply (vacuous control)"
     root = _tree(tmp_path, {_BOARD: mutated_board, _GATE: mutated_gate})
     bad = {(p[0], p[1]) for p in identity_problems(scan_surface(root), ALLOW_LIST)}
-    assert bad == {(_BOARD, "_gh_pr_state"), (_GATE, "_reviewer_approval_state")}
+    assert bad == {(_BOARD, "_gh_pr_state"), (_GATE, "_gh_read_json")}
 
 
 # --------------------------------------------------------------------------

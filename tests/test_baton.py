@@ -5858,9 +5858,9 @@ class TestApprovalStateParsing:
     Adapted for the current signature, `_pr_approval_state(pr_number, repo)`:
     `repo` is now REQUIRED (#1715/#1918 removed the `gh repo view`
     cwd-inference fallback -- a caller with no repo-qualified anchor now gets
-    "unknown" rather than a silent guess), and the function makes a SINGLE
-    `subprocess.run` call (the GraphQL query only) instead of the old
-    repo-view-then-graphql two-call shape.
+    "unknown" rather than a silent guess), and the function reads the PR head
+    and the review rows over REST (`gh api repos/<repo>/pulls/<N>` and
+    `.../reviews`, #3541) instead of one GraphQL query.
     """
 
     @pytest.fixture
@@ -5870,38 +5870,40 @@ class TestApprovalStateParsing:
     REPO = "engram-agents/engram-paper"
 
     @staticmethod
-    def _gql_payload(head_oid, review_nodes):
-        """Build the GraphQL response envelope expected by _pr_approval_state."""
-        return {
-            "data": {
-                "repository": {
-                    "pullRequest": {
-                        "headRefOid": head_oid,
-                        "reviews": {"nodes": review_nodes},
-                    }
-                }
-            }
-        }
+    def _rest_payload(head_oid, review_nodes):
+        """The REST rows `_pr_approval_state` reads (#3541): `pulls/<N>` gives
+        head.sha, `pulls/<N>/reviews` gives rows with `state` + `commit_id`.
+        Test inputs keep the old `{"state", "commit": {"oid"}}` node shape and
+        are translated here, so the assertions in each test are unchanged."""
+        rows = []
+        for n in review_nodes:
+            commit = n.get("commit")
+            rows.append({"state": n["state"],
+                         "commit_id": commit.get("oid") if isinstance(commit, dict) else None})
+        return {"head": head_oid, "rows": rows}
 
     @classmethod
-    def _mock_gql_result(cls, payload, returncode=0, stderr=""):
-        """Build a mock subprocess.CompletedProcess-like object for the single
-        `gh api graphql` call _pr_approval_state now makes."""
-        return _mock.MagicMock(
-            returncode=returncode,
-            stdout=json.dumps(payload) if payload is not None else "",
-            stderr=stderr,
-        )
+    def _mock_rest_run(cls, payload, returncode=0, stderr=""):
+        """A `subprocess.run` stand-in routing on the `gh api <path>` argument."""
+        def _run(argv, *a, **kw):
+            if returncode != 0:
+                return _mock.MagicMock(returncode=returncode, stdout="", stderr=stderr)
+            if "/reviews?" in argv[2]:
+                body = payload["rows"]
+            else:
+                body = {"headRefOid": payload["head"], "author": {"login": "someone"}}
+            return _mock.MagicMock(returncode=0, stdout=json.dumps(body), stderr="")
+        return _run
 
     # --- core verdict tests ---
 
     def test_state_fresh_when_approval_oid_matches_tip(self, baton):
         """APPROVED review with commit.oid == headRefOid -> fresh."""
-        tip = "aabbccdd1122334455667788"
-        mock_result = self._mock_gql_result(self._gql_payload(tip, [
+        tip = "aabbccdd1122334455667788" + "0" * 16
+        mock_result = self._mock_rest_run(self._rest_payload(tip, [
             {"state": "APPROVED", "commit": {"oid": tip}},
         ]))
-        with _mock.patch("subprocess.run", return_value=mock_result):
+        with _mock.patch("subprocess.run", mock_result):
             state, detail = baton._pr_approval_state("1", repo=self.REPO)
         assert state == "fresh"
         assert tip[:8] in detail
@@ -5910,12 +5912,12 @@ class TestApprovalStateParsing:
         """APPROVED review exists but commit.oid != headRefOid (rebase case)
         -- stale even if the approval's committedDate would be OLDER than the
         tip."""
-        tip = "aaaa0000111122223333"
-        old_oid = "bbbb9999888877776666"
-        mock_result = self._mock_gql_result(self._gql_payload(tip, [
+        tip = "aaaa0000111122223333" + "0" * 20
+        old_oid = "bbbb9999888877776666" + "0" * 20
+        mock_result = self._mock_rest_run(self._rest_payload(tip, [
             {"state": "APPROVED", "commit": {"oid": old_oid}},
         ]))
-        with _mock.patch("subprocess.run", return_value=mock_result):
+        with _mock.patch("subprocess.run", mock_result):
             state, detail = baton._pr_approval_state("1", repo=self.REPO)
         assert state == "stale"
         assert tip[:8] in detail
@@ -5923,34 +5925,34 @@ class TestApprovalStateParsing:
 
     def test_state_no_approval_without_approved_reviews(self, baton):
         """Only COMMENTED / CHANGES_REQUESTED reviews -> no_approval."""
-        tip = "deadbeef00001111"
-        mock_result = self._mock_gql_result(self._gql_payload(tip, [
+        tip = "deadbeef00001111" + "0" * 24
+        mock_result = self._mock_rest_run(self._rest_payload(tip, [
             {"state": "COMMENTED", "commit": {"oid": "old111"}},
             {"state": "CHANGES_REQUESTED", "commit": {"oid": "old222"}},
         ]))
-        with _mock.patch("subprocess.run", return_value=mock_result):
+        with _mock.patch("subprocess.run", mock_result):
             state, _ = baton._pr_approval_state("1", repo=self.REPO)
         assert state == "no_approval"
 
     def test_state_dismissed_only_is_no_approval(self, baton):
         """DISMISSED reviews only -> no_approval (not stale)."""
-        tip = "cafebabe12345678"
-        mock_result = self._mock_gql_result(self._gql_payload(tip, [
+        tip = "cafebabe12345678" + "0" * 24
+        mock_result = self._mock_rest_run(self._rest_payload(tip, [
             {"state": "DISMISSED", "commit": {"oid": "old333"}},
         ]))
-        with _mock.patch("subprocess.run", return_value=mock_result):
+        with _mock.patch("subprocess.run", mock_result):
             state, _ = baton._pr_approval_state("1", repo=self.REPO)
         assert state == "no_approval"
 
     def test_state_fresh_with_commit_null_and_matching_approval(self, baton):
         """A review node with commit: null is non-matching but not an error;
         a second node that matches the tip still produces fresh."""
-        tip = "1234567890abcdef"
-        mock_result = self._mock_gql_result(self._gql_payload(tip, [
+        tip = "1234567890abcdef" + "0" * 24
+        mock_result = self._mock_rest_run(self._rest_payload(tip, [
             {"state": "APPROVED", "commit": None},
             {"state": "APPROVED", "commit": {"oid": tip}},
         ]))
-        with _mock.patch("subprocess.run", return_value=mock_result):
+        with _mock.patch("subprocess.run", mock_result):
             state, detail = baton._pr_approval_state("1", repo=self.REPO)
         assert state == "fresh"
         assert tip[:8] in detail
@@ -5959,10 +5961,10 @@ class TestApprovalStateParsing:
 
     def test_state_unknown_on_gql_failure(self, baton):
         """GraphQL call failure -> unknown (with gh's stderr text)."""
-        mock_result = self._mock_gql_result(
+        mock_result = self._mock_rest_run(
             None, returncode=1, stderr="gh: not logged in",
         )
-        with _mock.patch("subprocess.run", return_value=mock_result):
+        with _mock.patch("subprocess.run", mock_result):
             state, detail = baton._pr_approval_state("1", repo=self.REPO)
         assert state == "unknown"
         assert "not logged in" in detail
@@ -6011,16 +6013,14 @@ class TestApprovalStateParsing:
         ergonomics."""
         calls = []
 
+        tip = "abc123ff" + "0" * 32
+        routed = self._mock_rest_run(self._rest_payload(tip, [
+            {"state": "APPROVED", "commit": {"oid": tip}},
+        ]))
+
         def _fake_run(argv, **kwargs):
             calls.append(argv)
-            return _mock.MagicMock(
-                returncode=0,
-                stderr="",
-                stdout=(
-                    '{"data": {"repository": {"pullRequest": {"headRefOid": "abc123ff",'
-                    ' "reviews": {"nodes": [{"state": "APPROVED", "commit": {"oid": "abc123ff"}}]}}}}}'
-                ),
-            )
+            return routed(argv, **kwargs)
 
         with _mock.patch("subprocess.run", _fake_run):
             state, detail = baton._pr_approval_state("#123", repo=self.REPO)
@@ -6031,8 +6031,8 @@ class TestApprovalStateParsing:
         """A PR with zero reviews of any kind is no_approval (reviewer-fairy
         suggestion on the original PR: pin the empty-list path so a future
         edit can't silently turn it into unknown)."""
-        mock_result = self._mock_gql_result(self._gql_payload("abc123ff", []))
-        with _mock.patch("subprocess.run", return_value=mock_result):
+        mock_result = self._mock_rest_run(self._rest_payload("abc123ff" + "0" * 32, []))
+        with _mock.patch("subprocess.run", mock_result):
             state, detail = baton._pr_approval_state("123", repo=self.REPO)
         assert state == "no_approval"
 

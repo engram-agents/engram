@@ -608,7 +608,7 @@ def _scrub_gh_detail(text: str) -> str:
 
 _RUNS_FALLTHROUGH_MARKER = "resource not accessible by personal access token"
 _HEAD_OID_RE = re.compile(r"[0-9a-f]{40}")
-_REPO_SLUG_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_CI_REPO_SLUG_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _RUN_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _RUN_RANK_GREEN, _RUN_RANK_PENDING, _RUN_RANK_RED = 0, 1, 2
 
@@ -625,7 +625,7 @@ def _gh_identity_is_service(gh_kw) -> bool:
 
 def _repo_slug_is_valid(repo) -> bool:
     """A plain ``owner/name`` slug, safe to place in an API path."""
-    if not (isinstance(repo, str) and _REPO_SLUG_RE.fullmatch(repo)):
+    if not (isinstance(repo, str) and _CI_REPO_SLUG_RE.fullmatch(repo)):
         return False
     return all(part.strip(".") for part in repo.split("/"))
 
@@ -882,6 +882,134 @@ def _pr_ci_state(pr_number: str, repo: str) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Reads for the two approval states (#3541)
+#
+# The forum service's fine-grained token cannot read GraphQL
+# `reviews{commit{oid}}` (it needs Contents:Read), but REST
+# `GET repos/<repo>/pulls/<N>/reviews` serves `commit_id`, and `gh pr view
+# --json headRefOid,author` serves the head and the PR author, under the same
+# token (both measured live; REST `pulls/<N>` was NOT measured, so it is not
+# used).  Both approval states read through the ONE private reader below.
+# Every mapping fails closed: anything unestablished is unknown / incomplete /
+# stale, never fresh / approved_current.
+# ---------------------------------------------------------------------------
+
+# Page size / hard page cap for the review walk.  A page with fewer rows than
+# the page size is the last one; a full page needs the next page fetched.
+# Hitting the cap with the last page still full means the walk is INCOMPLETE
+# and the gate refuses -- a truncated read must never read as complete.
+_REVIEW_PAGE_SIZE = 100
+_REVIEW_PAGE_CAP = 10
+
+
+def _gh_read_json(args: list) -> tuple:
+    """Run ``gh <args>`` and parse its stdout as JSON.
+
+    The only process spawn of the approval reads.  It takes the identity itself
+    (`_gh_identity`), so no call can run without it: a refusal comes back as the
+    reason before any spawn.  Returns ``(parsed_json, None)`` or
+    ``(None, scrubbed_reason)``; never raises.  The argv is exactly
+    ``["gh", *args]`` (no token, no ``--jq``, no ``--paginate``).
+    """
+    gh_kw, refusal = _gh_identity()
+    if refusal is not None:
+        return None, refusal[1]
+    try:
+        res = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=15, **gh_kw)
+    except FileNotFoundError:
+        return None, "gh not found on PATH"
+    except subprocess.TimeoutExpired:
+        return None, "gh timed out after 15s"
+    except Exception as exc:  # noqa: BLE001 -- fail closed on anything else
+        return None, _scrub_gh_detail(f"gh exec error: {exc}")
+    if res.returncode != 0:
+        stderr = res.stderr if isinstance(res.stderr, str) else ""
+        return None, _scrub_gh_detail(stderr.strip() or f"gh exit {res.returncode}")
+    if res.stdout is not None and not isinstance(res.stdout, str):
+        return None, "gh returned non-text output"
+    raw = (res.stdout or "").strip()
+    if not raw:
+        return None, "gh returned empty output"
+    try:
+        return json.loads(raw), None
+    except (ValueError, RecursionError):
+        return None, "gh returned unparseable JSON"
+
+
+def _rest_pull_head(repo: str, pr_str: str) -> tuple:
+    """Read the head and author with `gh pr view <N> --json headRefOid,author
+    --repo <repo>`: ``(view_object, None)`` or ``(None, reason)``.
+
+    `headRefOid` must be a 40-char lowercase hex commit id; anything else is a
+    refusal (the value is only ever compared for equality).
+    """
+    body, why = _gh_read_json(
+        ["pr", "view", pr_str, "--json", "headRefOid,author", "--repo", repo])
+    if why is not None:
+        return None, why
+    if not isinstance(body, dict):
+        return None, "pr view body is not a JSON object"
+    sha = body.get("headRefOid")
+    if not (isinstance(sha, str) and _HEAD_OID_RE.fullmatch(sha)):
+        return None, "headRefOid missing or not a 40-hex commit id"
+    return body, None
+
+
+def _rest_review_rows(repo: str, pr_str: str) -> tuple:
+    """Walk `pulls/<N>/reviews` by explicit page: ``(rows, None)`` or
+    ``(None, (state, reason))`` with state ``unknown`` or ``incomplete``."""
+    rows: list = []
+    for page in range(1, _REVIEW_PAGE_CAP + 1):
+        body, why = _gh_read_json(
+            ["api", f"repos/{repo}/pulls/{pr_str}/reviews?per_page={_REVIEW_PAGE_SIZE}&page={page}"])
+        if why is not None:
+            return None, ("unknown", why)
+        if not isinstance(body, list):
+            return None, ("unknown", "reviews page is not a JSON list")
+        for item in body:
+            if not isinstance(item, dict):
+                return None, ("unknown", "a review row is not an object")
+            if not isinstance(item.get("state"), str):
+                return None, ("unknown", "a review row has no string state")
+        rows.extend(body)
+        if len(body) < _REVIEW_PAGE_SIZE:
+            return rows, None
+    return None, (
+        "incomplete",
+        f"reviews reached the {_REVIEW_PAGE_CAP}-page cap "
+        f"({_REVIEW_PAGE_CAP * _REVIEW_PAGE_SIZE} rows) with the last page still full; "
+        "refusing to decide from a partial read",
+    )
+
+
+def _rest_read_reviews(repo: str, pr_str: str, early=None) -> tuple:
+    """Head, then every review page, then the head again.
+
+    REST is not one atomic query, so the head is read once before the reviews
+    and once after the last page: if it moved in between the read is refused.
+    `early(pull)` may return a final ``(state, detail)`` verdict from the first
+    head read alone (no review needs reading).  Returns ``(pull, rows, None)``
+    or ``(None, None, (state, detail))``.
+    """
+    pull, why = _rest_pull_head(repo, pr_str)
+    if why is not None:
+        return None, None, ("unknown", why)
+    if early is not None:
+        verdict = early(pull)
+        if verdict is not None:
+            return None, None, verdict
+    rows, failure = _rest_review_rows(repo, pr_str)
+    if failure is not None:
+        return None, None, failure
+    after, why = _rest_pull_head(repo, pr_str)
+    if why is not None:
+        return None, None, ("unknown", why)
+    if after["headRefOid"] != pull["headRefOid"]:
+        return None, None, ("unknown", "PR head moved while reviews were being read")
+    return pull, rows, None
+
+
+# ---------------------------------------------------------------------------
 # Approval-staleness helper for the flip guard (#1002 / #2884)
 # ---------------------------------------------------------------------------
 
@@ -893,7 +1021,7 @@ def _pr_approval_state(pr_number: str, repo: str) -> tuple:
     after the latest approval re-triggers CI and invalidates the reviewed
     state ("re-check after ANY post-approval commit", CLAUDE.md).
 
-    Uses commit-identity comparison (headRefOid vs approval commit oid)
+    Uses commit-identity comparison (headRefOid vs approval commit_id)
     rather than timestamp comparison. Timestamp comparison is evadable: a
     rebased or backdated commit can carry a committedDate older than the
     approval and falsely read as fresh. Oid comparison is exact — a rebased
@@ -909,11 +1037,16 @@ def _pr_approval_state(pr_number: str, repo: str) -> tuple:
     up. That fallback path is gone; a caller with no repo-qualified anchor
     gets "unknown" (advisory, non-blocking) rather than a guess.
 
-    One gh call: gh api graphql querying headRefOid and
-    reviews(last:50){state,commit{oid}}.
+    #3541: REST, not GraphQL. `GraphQL reviews{commit{oid}}` needs Contents:Read,
+    which the forum service's fine-grained token lacks; REST `GET
+    repos/<repo>/pulls/<N>/reviews` serves `commit_id` and `gh pr view
+    --json headRefOid,author` serves the head, with no extra token scope. The
+    head is read before and after the review pages (moved -> unknown) and the
+    review walk is paged by explicit `page=`; a truncated walk is "unknown",
+    never "no_approval".
 
     Returns (state, detail) where state is one of:
-      "fresh"       — at least one APPROVED review has commit.oid == headRefOid
+      "fresh"       — at least one APPROVED review has commit_id == headRefOid
                       (an approval that reviewed exactly the current tip)
       "stale"       — APPROVED review(s) exist but none match the tip oid
                       (tip moved after approval, or tip was rebased)
@@ -922,9 +1055,8 @@ def _pr_approval_state(pr_number: str, repo: str) -> tuple:
                       jurisdiction, not an oid question)
       "unknown"     — could not obtain a verdict (degraded; advisory only)
     """
-    # pr_number is interpolated into the GraphQL query string below (unlike
-    # the old argv-passed form, which the shell layer kept inert) — require a
-    # bare integer so a malformed anchor can't inject query text.
+    # pr_number goes into a REST path below -- require a bare ASCII integer so
+    # a malformed anchor can't smuggle path or query text.
     pr_str = str(pr_number).lstrip("#")
     if not _ascii_digits(pr_str):
         return ("unknown", f"PR number {pr_number!r} is not numeric")
@@ -932,73 +1064,28 @@ def _pr_approval_state(pr_number: str, repo: str) -> tuple:
 
     if not repo:
         return ("unknown", "repo argument is required and was empty")
-    if "/" not in repo:
+    if not _repo_slug_is_valid(repo):
         return ("unknown", f"repo {repo!r} is not owner/repo shaped")
-    owner, repo_name = repo.split("/", 1)
 
-    # GraphQL — fetch headRefOid and last 50 reviews with commit oid.
-    query = (
-        "{ repository(owner: \"%s\", name: \"%s\") {"
-        " pullRequest(number: %s) {"
-        "  headRefOid"
-        "  reviews(last: 50) { nodes { state commit { oid } } }"
-        " } } }"
-    ) % (owner, repo_name, pr_number)
+    pull, rows, verdict = _rest_read_reviews(repo, pr_number)
+    if verdict is not None:
+        # an "incomplete" walk is "unknown" here: it must never read as no_approval
+        return ("unknown", verdict[1])
+    head_oid = pull["headRefOid"]
 
-    gh_kw, refusal = _gh_identity()
-    if refusal is not None:
-        return refusal
-    try:
-        gql_result = subprocess.run(
-            ["gh", "api", "graphql", "-f", f"query={query}"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            **gh_kw,
-        )
-    except FileNotFoundError:
-        return ("unknown", "gh not found on PATH")
-    except subprocess.TimeoutExpired:
-        return ("unknown", "gh timed out after 15s")
-    except OSError as exc:
-        return ("unknown", _scrub_gh_detail(f"gh exec error: {exc}"))
-
-    if gql_result.returncode != 0:
-        detail = (gql_result.stderr or "").strip() or f"gh exit {gql_result.returncode}"
-        return ("unknown", _scrub_gh_detail(detail))
-
-    raw_gql = (gql_result.stdout or "").strip()
-    if not raw_gql:
-        return ("unknown", "gh returned empty output")
-
-    try:
-        gql_data = json.loads(raw_gql)
-        pr_data = gql_data["data"]["repository"]["pullRequest"]
-        head_oid = pr_data["headRefOid"]
-        review_nodes = pr_data["reviews"]["nodes"]
-    except (json.JSONDecodeError, ValueError):
-        return ("unknown", "gh returned unparseable JSON")
-    except (KeyError, TypeError):
-        return ("unknown", "gh response missing expected fields")
-
-    if not head_oid:
-        return ("unknown", "headRefOid missing or empty")
-    if not isinstance(review_nodes, list):
-        return ("unknown", "reviews.nodes missing or not a list")
-
-    # Walk review nodes: collect APPROVED reviews and check oid match.
-    # A review node with commit: null is simply non-matching, never an error.
+    # Walk review rows (REST order is oldest-first): collect APPROVED reviews
+    # and check the oid match. A row with a null/missing commit_id is simply
+    # non-matching, never an error. A row that is not APPROVED never counts.
     has_approval = False
     latest_approval_oid = None
-    for node in review_nodes:
-        if not isinstance(node, dict):
-            continue
-        if (node.get("state") or "").upper() != "APPROVED":
+    for item in rows:
+        if item["state"].upper() != "APPROVED":
             continue
         has_approval = True
-        commit = node.get("commit")
-        node_oid = commit.get("oid") if isinstance(commit, dict) else None
-        latest_approval_oid = node_oid  # last APPROVED node in list = most recent
+        node_oid = item.get("commit_id")
+        if not isinstance(node_oid, str):
+            node_oid = None
+        latest_approval_oid = node_oid  # last APPROVED row in list = most recent
         if node_oid and node_oid == head_oid:
             short = head_oid[:8]
             return ("fresh", f"approval covers tip oid {short}")
@@ -1312,27 +1399,15 @@ def _load_login_map(
     return _validate_login_map(data)
 
 
-# Page size / hard page cap for the review walk.  Hitting the cap with
-# hasNextPage still true means the walk is INCOMPLETE and the gate refuses --
-# `reviews(last: 50)` (used by `_pr_approval_state`) silently loses older
-# reviews, which is the thing this replaces.
-_REVIEW_PAGE_SIZE = 50
-_REVIEW_PAGE_CAP = 10
-
-_REVIEWS_QUERY = (
-    "query($owner:String!,$name:String!,$number:Int!,$after:String){"
-    "repository(owner:$owner,name:$name){pullRequest(number:$number){"
-    "headRefOid author{login} "
-    "reviews(first:%d,after:$after){pageInfo{hasNextPage endCursor} "
-    "nodes{id state submittedAt author{login} commit{oid}}}"
-    "}}}"
-) % _REVIEW_PAGE_SIZE
-
 _REPO_SLUG_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
 
 def _reviewer_approval_state(pr_number, repo, reviewer_login) -> tuple:
-    """One reviewer's CURRENT verdict on a PR head, via `gh api graphql`.
+    """One reviewer's CURRENT verdict on a PR head, via REST `gh api` (#3541).
+
+    Reads `gh pr view <N> --json headRefOid,author` before and after
+    `GET repos/<repo>/pulls/<N>/reviews` (paged by `page=`), all through
+    `_gh_read_json`; no GraphQL `commit{oid}`, so no Contents:Read scope.
 
     Returns (state, detail) where state is one of:
       "approved_current"  -- the reviewer's latest opinionated review is an
@@ -1346,137 +1421,85 @@ def _reviewer_approval_state(pr_number, repo, reviewer_login) -> tuple:
                              older commit.
       "no_review"         -- this login has no opinionated review.
       "self_review"       -- the reviewer login is the PR's author.
-      "incomplete"        -- the review walk hit the page cap with more pages
-                             still to read.
+      "incomplete"        -- the review walk hit the page cap with the last
+                             page still full.
       "ambiguous"         -- two or more of the reviewer's opinionated reviews
-                             share the MAXIMUM submittedAt and differ in state,
+                             share the MAXIMUM submitted_at and differ in state,
                              so which one is latest cannot be known.
       "unknown"           -- no verdict obtainable (gh missing / timeout /
-                             non-zero / empty / unparseable / missing fields,
-                             or an opinionated review of this reviewer whose
-                             submittedAt is null / missing / not a string).
+                             non-zero / empty / unparseable / missing fields /
+                             head moved while reading, or an opinionated review
+                             of this reviewer whose submitted_at is null /
+                             missing / not a string).
 
     Derivation (client-side, over ALL reviews, so it does not depend on what a
-    GraphQL convenience field's name implies): keep reviews by `reviewer_login`
-    (case-insensitive; a null author never matches), drop COMMENTED and PENDING
+    convenience field's name implies): keep reviews by `reviewer_login`
+    (case-insensitive; a null user never matches), drop COMMENTED and PENDING
     (they carry no opinion and must not revoke an approval), order by
-    submittedAt with the review node id as tie-break (NEVER pagination order),
-    and let the LAST remaining review decide.
+    submitted_at with the numeric review id as tie-break (NEVER REST order, and
+    ids compare as integers, not strings), and let the LAST remaining review
+    decide.
     """
     pr_str = str(pr_number or "").lstrip("#")
     if not _ascii_digits(pr_str):
         return ("unknown", f"PR number {pr_number!r} is not numeric")
-    if not isinstance(repo, str) or not _REPO_SLUG_RE.match(repo):
+    if not _repo_slug_is_valid(repo):
         return ("unknown", f"repo {repo!r} is not owner/repo shaped")
     if not isinstance(reviewer_login, str) or not reviewer_login.strip():
         return ("unknown", "reviewer login is empty")
     wanted = reviewer_login.strip().lower()
-    owner, name = repo.split("/", 1)
 
-    gh_kw, refusal = _gh_identity()
-    if refusal is not None:
-        return refusal
-
-    head_oid = None
-    mine: list = []
-    cursor = None
-    complete = False
-    for _page in range(_REVIEW_PAGE_CAP):
-        cmd = ["gh", "api", "graphql",
-               "-f", f"query={_REVIEWS_QUERY}",
-               "-f", f"owner={owner}", "-f", f"name={name}",
-               "-F", f"number={pr_str}"]
-        if cursor:
-            cmd += ["-f", f"after={cursor}"]
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=15, **gh_kw)
-        except FileNotFoundError:
-            return ("unknown", "gh not found on PATH")
-        except subprocess.TimeoutExpired:
-            return ("unknown", "gh timed out after 15s")
-        except OSError as exc:
-            return ("unknown", _scrub_gh_detail(f"gh exec error: {exc}"))
-        if res.returncode != 0:
-            return ("unknown", _scrub_gh_detail(
-                (res.stderr or "").strip() or f"gh exit {res.returncode}"))
-        raw = (res.stdout or "").strip()
-        if not raw:
-            return ("unknown", "gh returned empty output")
-        try:
-            pr = json.loads(raw)["data"]["repository"]["pullRequest"]
-            page_head = pr["headRefOid"]
-            pr_author = pr["author"]
-            reviews = pr["reviews"]
-            page_info = reviews["pageInfo"]
-            nodes = reviews["nodes"]
-            has_next = page_info["hasNextPage"]
-        except (ValueError, KeyError, TypeError):
-            return ("unknown", "gh response missing expected fields or unparseable")
-        if not isinstance(page_head, str) or not page_head:
-            return ("unknown", "headRefOid missing or empty")
-        if head_oid is None:
-            head_oid = page_head
-        elif page_head != head_oid:
-            return ("unknown", "PR head moved while reviews were being read")
-        if not isinstance(nodes, list) or not isinstance(has_next, bool):
-            return ("unknown", "reviews page malformed")
-
-        author_login = pr_author.get("login") if isinstance(pr_author, dict) else None
+    def _self_review(pull):
+        if "author" not in pull:
+            return ("unknown", "pr view body has no author field")
+        owner = pull["author"]
+        author_login = owner.get("login") if isinstance(owner, dict) else None
         if isinstance(author_login, str) and author_login.strip().lower() == wanted:
             return ("self_review", f"{reviewer_login} is the author of PR #{pr_str}")
+        return None
 
-        for node in nodes:
-            if not isinstance(node, dict):
-                return ("unknown", "review node is not an object")
-            state = node.get("state")
-            rid = node.get("id")
-            if not isinstance(state, str) or not isinstance(rid, str):
-                return ("unknown", "review node missing state or id")
-            who = node.get("author")
-            login = who.get("login") if isinstance(who, dict) else None
-            if not isinstance(login, str) or login.strip().lower() != wanted:
-                continue
-            state = state.upper()
-            if state in ("COMMENTED", "PENDING"):
-                continue
-            commit = node.get("commit")
-            oid = commit.get("oid") if isinstance(commit, dict) else None
-            submitted = node.get("submittedAt")
-            if not isinstance(submitted, str) or not submitted.strip():
-                # An opinionated review we cannot place in time makes "which one
-                # is the latest" undecidable -- never guess an order (round 4, R3).
-                return (
-                    "unknown",
-                    f"review {rid} by {reviewer_login} has no usable submittedAt; "
-                    "cannot order the reviewer's opinions",
-                )
-            mine.append((submitted, rid, state, oid))
+    pull, rows, verdict = _rest_read_reviews(repo, pr_str, early=_self_review)
+    if verdict is not None:
+        return verdict
+    head_oid = pull["headRefOid"]
 
-        if not has_next:
-            complete = True
-            break
-        cursor = page_info.get("endCursor")
-        if not isinstance(cursor, str) or not cursor:
-            return ("incomplete", "reviews report more pages but no cursor")
-
-    if not complete:
-        return (
-            "incomplete",
-            f"more than {_REVIEW_PAGE_CAP * _REVIEW_PAGE_SIZE} reviews on PR #{pr_str}; "
-            "refusing to decide from a partial read",
-        )
+    mine: list = []
+    for node in rows:
+        rid = node.get("id")
+        if not isinstance(rid, int) or isinstance(rid, bool):
+            return ("unknown", "review row missing an integer id")
+        who = node.get("user")
+        login = who.get("login") if isinstance(who, dict) else None
+        if not isinstance(login, str) or login.strip().lower() != wanted:
+            continue
+        state = node["state"].upper()
+        if state in ("COMMENTED", "PENDING"):
+            continue
+        oid = node.get("commit_id")
+        if not isinstance(oid, str):
+            oid = None
+        submitted = node.get("submitted_at")
+        if not isinstance(submitted, str) or not submitted.strip():
+            # An opinionated review we cannot place in time makes "which one
+            # is the latest" undecidable -- never guess an order (round 4, R3).
+            return (
+                "unknown",
+                f"review {rid} by {reviewer_login} has no usable submitted_at; "
+                "cannot order the reviewer's opinions",
+            )
+        mine.append((submitted, rid, state, oid))
 
     if not mine:
         return ("no_review", f"{reviewer_login} has no opinionated review on PR #{pr_str}")
     mine.sort(key=lambda r: (r[0], r[1]))
     # Round 5 (S4): look at EVERY review sharing the MAXIMUM timestamp, not just
     # the last two -- (CHANGES_REQUESTED, APPROVED, APPROVED) at one second must
-    # not read as the node-id tie-break's "last" APPROVED.
+    # not read as the id tie-break's "last" APPROVED.
     top_ts = mine[-1][0]
     tied_states = sorted({r[2] for r in mine if r[0] == top_ts})
     if len(tied_states) > 1:
         # Opinions with the SAME (latest) timestamp and different states: the
-        # order between them is not knowable (a node-id tie-break is arbitrary),
+        # order between them is not knowable (an id tie-break is arbitrary),
         # so none may be treated as the latest (round 4, R3).
         return (
             "ambiguous",

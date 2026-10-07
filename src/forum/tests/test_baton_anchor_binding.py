@@ -26,6 +26,7 @@ Identities are SYNTHETIC; no real fleet name appears here.
 """
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -203,16 +204,17 @@ class TestRepoTableInTheMap:
 # ---------------------------------------------------------------------------
 
 class PerPrGh(FakeGh):
-    """Reviews depend on which PR number the graphql query names."""
+    """Reviews depend on which PR number the REST reviews path names (#3541)."""
 
     def __init__(self):
         super().__init__()
         self.by_pr = {}
 
     def __call__(self, cmd, *a, **kw):
-        if cmd[:3] == ["gh", "api", "graphql"]:
-            n = next((c.split("=", 1)[1] for c in cmd if c.startswith("number=")), None)
-            self.reviews = self.by_pr.get(int(n), []) if n and n.isdigit() else []
+        if cmd[:2] == ["gh", "api"] and "/pulls/" in cmd[2]:
+            m = re.search(r"/pulls/([0-9]+)", cmd[2])
+            n = m.group(1) if m else None
+            self.reviews = self.by_pr.get(int(n), []) if n else []
         return super().__call__(cmd, *a, **kw)
 
 
