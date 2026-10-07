@@ -29,7 +29,9 @@ It is written to FAIL against the pre-fix purge tuple (server, engram_core
 only) and PASS once the family modules are included in the purge.
 
 FAMILY_MODULES below is derived DYNAMICALLY by scanning src/engram/engram_*.py
-for the `import engram_core as core` line, rather than hand-enumerated — an
+for the `import engram_core as core` line (MODULE-LEVEL only: a function-local
+import re-resolves on every call and cannot hold a stale `core`, so it is
+deliberately outside the family set, #3527), rather than hand-enumerated — an
 enumerated list here would be exactly the kind of silently-stale duplicate
 that caused #1679 in the first place (the production purge used to be a
 hardcoded list too; it's now prefix-based in engram_client.py, but a
@@ -54,16 +56,16 @@ if str(REPO_ROOT) not in sys.path:
 from engram_client import EngramClient  # noqa: E402
 
 
-def _discover_family_modules() -> list[str]:
+def _discover_family_modules(src_dir: pathlib.Path = SRC_ENGRAM) -> list[str]:
     """Scan src/engram/engram_*.py for modules that bind `import engram_core
     as core` at module level — the project's canonical shared-state-access
     convention (see module docstring above). Derived at collection time so
     this list can't silently go stale as family modules are added/removed,
     unlike a hand-maintained enumeration.
     """
-    pattern = re.compile(r"^\s*import\s+engram_core\s+as\s+core\s*$", re.MULTILINE)
+    pattern = re.compile(r"^import\s+engram_core\s+as\s+core\s*$", re.MULTILINE)
     found = []
-    for path in sorted(SRC_ENGRAM.glob("engram_*.py")):
+    for path in sorted(src_dir.glob("engram_*.py")):
         if path.stem in ("engram_client", "engram_core"):
             continue
         if pattern.search(path.read_text()):
@@ -72,6 +74,20 @@ def _discover_family_modules() -> list[str]:
 
 
 FAMILY_MODULES = _discover_family_modules()
+
+
+def test_discovery_excludes_function_local_core_imports(tmp_path):
+    """#3527: only a MODULE-LEVEL `import engram_core as core` makes a family
+    module. A function-local one re-resolves on every call and cannot hold a
+    stale `core`, so a module whose only such import is indented is excluded.
+    """
+    (tmp_path / "engram_toplevel.py").write_text(
+        "import engram_core as core\n\n\ndef f():\n    return core\n"
+    )
+    (tmp_path / "engram_lazy.py").write_text(
+        "def f():\n    import engram_core as core\n    return core\n"
+    )
+    assert _discover_family_modules(tmp_path) == ["engram_toplevel"]
 
 
 def test_family_module_core_reference_tracks_latest_client(tmp_path):
