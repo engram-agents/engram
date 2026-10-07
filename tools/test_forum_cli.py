@@ -1377,7 +1377,10 @@ class TestHookCursorNotAdvancedOnUnreachableNoCache:
         monkeypatch.setattr(hook, "HOOK_CACHE_PATH", hook_cache_path)
 
         # No cache file exists; _fetch_threads returns None (server unreachable)
-        monkeypatch.setattr(hook, "_fetch_threads", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            hook, "_fetch_threads",
+            lambda *a, **kw: (None, "connect: ConnectionRefusedError: refused"),
+        )
         # _load_cache returns None (no fresh cache)
         monkeypatch.setattr(hook, "_load_cache", lambda: None)
 
@@ -1410,7 +1413,7 @@ class TestHookCursorNotAdvancedOnUnreachableNoCache:
         monkeypatch.setattr(hook, "HOOK_CACHE_PATH", hook_cache_path)
 
         # Successful fetch returns empty list (no new threads — hook exits silently)
-        monkeypatch.setattr(hook, "_fetch_threads", lambda *a, **kw: [])
+        monkeypatch.setattr(hook, "_fetch_threads", lambda *a, **kw: ([], None))
         monkeypatch.setattr(hook, "_load_cache", lambda: None)
         # _save_cache is a no-op for this test
         monkeypatch.setattr(hook, "_save_cache", lambda threads, mentions: None)

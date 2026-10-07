@@ -26,7 +26,8 @@
         "tests/test_lesson_tripwire_injection_bounds.py",
         "tests/test_deference_detector_injection_bounds.py",
         "tests/test_forum_hook_injection_bounds.py",
-        "tests/test_probe_unknown_state_3521.py"
+        "tests/test_probe_unknown_state_3521.py",
+        "tests/test_forum_hook_unknown_state_3521.py"
       ],
       "note": "gh#1657 SSoT for tools/-resolution shared by the baton/inter-agent/forum prompt hooks. Each hook dynamically imports it via a runtime sys.path insert (not a static `import` statement), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping. Consumed by all three hooks as of slice 3 (baton, inter-agent, forum) -- gh#1657 complete. engram-alpha#2863 WS2 review round 1: test_surface_hook_injection_bounds.py added -- it drives engram-surface-hook.py's emit_context() call end-to-end (same dynamic-load invisibility as the other consumers here). engram-alpha#2863 WS2 batch B: test_stale_tree_pull_hook_injection_bounds.py added -- it drives engram-stale-tree-pull-hook.py's emit_context() call end-to-end, same dynamic-load invisibility. engram-alpha#2863 WS2 batch A: test_user_identity_hook_injection_bounds.py added -- it drives engram-user-identity-hook.py's own emit_context() call end-to-end, same dynamic-load invisibility. engram-alpha#2863 WS2 (lesson-tripwire fold): test_lesson_tripwire_injection_bounds.py added -- same reasoning, for engram-lesson-tripwire-hook.py's own emit_context() call site. engram-alpha#2863 WS2 batch C: test_toolcall_repair_injection_bounds.py and test_deference_detector_injection_bounds.py added -- they drive engram-toolcall-repair.py's and engram-deference-detector-prompt.py's own emit_context() calls end-to-end (same dynamic-load invisibility as the other consumers here). WS2 forum-hook migration: test_forum_hook_injection_bounds.py added -- same dynamic-load invisibility, driving engram-forum-prompt-hook.py's own emit_context() call end-to-end."
     },
@@ -133,6 +134,7 @@
       "test_globs": [
         "tests/test_forum_hook.py",
         "tests/test_forum_hook_injection_bounds.py",
+        "tests/test_forum_hook_unknown_state_3521.py",
         "tests/test_engine_phase3.py",
         "tests/test_tiers_manifest.py"
       ]

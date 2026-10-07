@@ -142,8 +142,8 @@ class TestWorstCaseCombinedOutage:
             _make_inbox_item(tid=str(i), title=huge_title, author="a" * 50)
             for i in range(3)
         ]
-        monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [{"id": "9", "title": "x"}] * 50)
-        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: mentions)
+        monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: ([{"id": "9", "title": "x"}] * 50, None))
+        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: (mentions, None))
 
         # Spy on emit_context so we can assert on the actual `head` string
         # main() constructed BEFORE it was passed in -- the load-bearing
@@ -209,9 +209,9 @@ class TestCommonCaseSanity:
 
         monkeypatch.setattr(
             hook, "_fetch_threads",
-            lambda url, since, agent, deadline: [{"id": "1", "title": "new thread"}],
+            lambda url, since, agent, deadline: ([{"id": "1", "title": "new thread"}], None),
         )
-        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: [])
+        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: ([], None))
 
         output = _run_main(hook)
         assert output.strip(), "expected a non-empty response -- the threads line should have fired"
@@ -236,8 +236,8 @@ class TestUmweltModeSanity:
         _patch_paths(hook, monkeypatch, tmp_path)
 
         mention = _make_inbox_item(tid="5", title="Needs review", author="luria")
-        monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
-        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: [mention])
+        monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: ([], None))
+        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: ([mention], None))
 
         output = _run_main(hook)
         assert output.strip(), "expected the umwelt advisory line to fire"
@@ -265,8 +265,8 @@ class TestNothingFires:
         _stub_config(hook, monkeypatch, comms_surface="forum")
         _patch_paths(hook, monkeypatch, tmp_path)
 
-        monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
-        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: [])
+        monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: ([], None))
+        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: ([], None))
 
         called = {"emit_context": False}
         real_emit_context = hook.emit_context
