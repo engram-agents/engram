@@ -393,6 +393,92 @@ On decline: tell the user: "No problem. You can start the viz server manually an
 
 **Defer the `enable-linger` hint if your name isn't finalized yet** (Linux accept path only) — same reason as Step 5.5: the script prints a `sudo loginctl enable-linger <user>` suggestion; if you're still on `agent-newborn-*`, defer until after finalize-name (Step 7). (If the username is already final — no rename pending — the hint is fine as-is.)
 
+## Step 5.7 — Forum connection (optional)
+
+Hooks and CLIs treat a non-empty string `forum.url` in `~/.engram/config.json` as "forum configured", and nothing infers it. This is the only step that can ask the user for it. It is optional, and it is asked on every install, single-agent too (a single-host agent can have a forum).
+
+**Asked once.** Run the block below FIRST with no `FORUM_ANSWER`. If it prints `set_forum_url.py is not installed here (no forum components on this install): skip this step`, this install has no forum components: SKIP the question, do not ask it, and move on (you may mention that a forum can be connected later by installing the convenience tier). Otherwise, if `forum.url` is already set (identity-resolve mode, a re-run, an operator that set it), it prints the value it found, says it is already set, and you SKIP the question: tell the user what is set and move on. If it prints that the key is not set, ask the question.
+
+Ask the user ONE question with three answers:
+
+> **Optional — is there an ENGRAM forum I should connect to?**
+>
+> - **(a) On this host.** I'll use `http://localhost:5002`. 5002 is the installer's default port; if yours differs, tell me the port.
+> - **(b) On another host.** Type the LAN URL of the forum (for example `http://192.168.1.50:5002`).
+> - **(c) No forum.** I'll leave it unset; nothing changes, and the forum, baton and letter hooks stay correctly silent. *(Pick this if you are unsure — you can add a forum any time.)*
+
+The URL is never guessed and never taken from the `FORUM_URL` environment variable, a file, or `hostname`; only the user's answer counts. For (a) with a different port, use the port the user gave. For (c), do nothing more: the key stays absent, and you do not run the block again. If the user is unsure, (c) is the default.
+
+For (a) or (b), write the key ONLY by running `set_forum_url.py` through the block below, with the user's URL in `FORUM_ANSWER`. Never edit `config.json` inline for this key; the tool validates the URL and writes atomically. The block finds the tool the way the other steps find plugin tools (plugin root first, then the runtime's marketplace path), and a missing tool is an `ERROR` line, not a first-session abort.
+
+Pass the URL as data, in ONE Bash call: paste the lines below with `<URL>` replaced by the user's URL, then paste the block right after them, unchanged. (The first run, with no answer yet, is the block alone.) The heredoc delimiter is quoted, so nothing in the URL is ever expanded or executed by the shell.
+
+```bash
+# forum-url-answer
+FORUM_ANSWER="$(cat <<'URL_EOF'
+<URL>
+URL_EOF
+)"
+export FORUM_ANSWER
+```
+
+The block:
+
+```bash
+# forum-url-step
+# FORUM_ANSWER: the user's URL for answer (a) or (b); empty or unset = no answer yet.
+CFG="${ENGRAM_HOME:-$HOME/.engram}/config.json"
+PY="$HOME/.engram/venv/bin/python3"
+[ -x "$PY" ] || PY=python3
+EXISTING="$("$PY" - "$CFG" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        u = (json.load(f).get("forum") or {}).get("url")
+except Exception:
+    u = None
+print(u.strip() if isinstance(u, str) and u.strip() else "")
+PYEOF
+)"
+FORUM_ANSWER="${FORUM_ANSWER:-}"
+TOOL="${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/tools/set_forum_url.py}"
+[ -f "$TOOL" ] || TOOL="$HOME/.engram/marketplace/plugins/engram/tools/set_forum_url.py"
+FORCE=""
+[ "${FORUM_FORCE:-}" = "1" ] && FORCE=1
+if [ -z "$FORUM_ANSWER" ]; then
+  if [ ! -f "$TOOL" ]; then
+    echo "set_forum_url.py is not installed here (no forum components on this install): skip this step"
+  elif [ -n "$EXISTING" ]; then
+    echo "forum.url is already set: $EXISTING (skip the question)"
+  else
+    echo "forum.url is not set (ask the question; answer (c) leaves it unset)"
+  fi
+else
+  if [ ! -f "$TOOL" ]; then
+    echo "ERROR: cannot locate set_forum_url.py (continuing without a forum; forum.url stays as it was)"
+  else
+    "$PY" "$TOOL" "$FORUM_ANSWER" ${FORCE:+--force} 2>&1
+    echo "set_forum_url.py exit status: $?"
+  fi
+fi
+:
+```
+
+Show the tool's own output to the user verbatim. Then by exit status:
+
+- **0** — written, or already that value. Done.
+- **3** — a DIFFERENT `forum.url` is already set. Tell the user what is set. Do not pass `--force` unless the user says so explicitly (they have to ask to overwrite it); without that, leave it as it is and continue. (To overwrite when they do ask, see the force fence below.)
+- **2** — refused (a bad URL, or a missing or unreadable config). Show the reason; the config is untouched. Continue first-session: a refused forum URL never blocks identity formation. If the user wants to retry with a corrected URL, run the block again.
+
+**Overwriting (exit 3 only).** ONLY after the user has explicitly asked to overwrite the different `forum.url`, insert this fence between the template and the block, then run all three together in one Bash call. The block adds `--force` to the tool call only when `FORUM_FORCE` is exactly `1`. Never insert it on your own initiative.
+
+```bash
+# forum-url-force
+export FORUM_FORCE=1
+```
+
+If the block prints the `ERROR` line, tell the user the forum can be connected later by running `set_forum_url.py` from the plugin's `tools/` directory, and continue.
+
 ## Step 6 — Finalize (the substitution step)
 
 Do this step LAST, only after the dialogue is genuinely complete. If the session aborts mid-dialogue, the marker file should still be present so the next session re-enters this skill.
