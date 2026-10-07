@@ -86,6 +86,12 @@ jobs:
           # on the runner (torch + CUDA stack) and is never reused on an
           # ephemeral runner, so it only eats disk.
           python -m pip install --no-cache-dir --upgrade pip
+          # CPU torch first (#3539 follow-up): the runner has no GPU, so the CUDA
+          # stack that sentence-transformers pulls in through torch (~3G of
+          # downloads) is pure install size. Only the torch index changes;
+          # sentence-transformers and the requirements files are untouched, and
+          # the -r install below then finds torch already satisfied.
+          pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
           pip install --no-cache-dir -r requirements/requirements-dev.txt
           # src/forum/tests/ import forum.server (Flask + bleach + markdown-it-py +
           # beautifulsoup4 + html5lib) — deps live in src/forum/requirements.txt,

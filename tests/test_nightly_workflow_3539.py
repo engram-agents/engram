@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -304,3 +305,76 @@ def test_retention_policy_failed_keeps_only_failing_tests_dirs(tmp_path):
     assert "1 failed, 1 passed" in r.stdout, r.stdout + r.stderr
     markers = sorted(p.parent.name for p in tmpdir.rglob("marker.txt"))
     assert markers == ["test_fails0"], (markers, r.stdout)
+
+
+# --- torch from the CPU index (follow-up to #3539) --------------------------
+#
+# The runner has no GPU, so the CUDA stack that `sentence-transformers` drags in
+# through torch (~3G of downloads) is pure install size. Only the torch INDEX
+# changes: the sentence-transformers pin and the requirements files stay as
+# they are. Installing CPU torch first means the later `-r` install finds torch
+# already satisfied and does not pull the CUDA build.
+
+CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+REQUIREMENTS_DIR = WORKFLOW.parent.parent.parent / "requirements"
+
+
+def _install_code_lines(steps):
+    return _code_lines(steps[_install_index(steps)]["run"])
+
+
+def _argv(line):
+    return shlex.split(re.split(r"\s#", line, maxsplit=1)[0])
+
+
+def _torch_lines(steps):
+    return [
+        ln for ln in _install_code_lines(steps)
+        if "pip install" in ln and "torch" in _argv(ln)
+    ]
+
+
+def _requirements_dev_line_index(steps):
+    hits = [
+        i for i, ln in enumerate(_install_code_lines(steps))
+        if "pip install" in ln and "-r requirements/requirements-dev.txt" in ln
+    ]
+    assert len(hits) == 1, hits
+    return hits[0]
+
+
+def test_install_has_exactly_one_torch_line_from_the_cpu_index(steps):
+    lines = _torch_lines(steps)
+    assert len(lines) == 1, lines
+    argv = _argv(lines[0])
+    assert "--index-url" in argv, argv
+    assert argv[argv.index("--index-url") + 1] == CPU_INDEX, argv
+
+
+def test_cpu_torch_installs_before_the_requirements(steps):
+    lines = _torch_lines(steps)
+    assert len(lines) == 1, lines
+    assert _install_code_lines(steps).index(lines[0]) < _requirements_dev_line_index(steps)
+
+
+def test_cpu_torch_line_is_counted_by_the_no_cache_dir_pin(steps):
+    # test_every_pip_install_line_has_no_cache_dir matches on "pip install";
+    # prove it sees this line, and that the flag is a real argument.
+    lines = _torch_lines(steps)
+    assert len(lines) == 1, lines
+    assert "pip install" in lines[0]
+    assert "--no-cache-dir" in _argv(lines[0])
+
+
+@pytest.mark.parametrize("name", ["requirements.txt", "requirements-dev.txt"])
+def test_requirements_files_untouched_by_the_torch_index_change(name):
+    lines = [
+        ln.strip()
+        for ln in (REQUIREMENTS_DIR / name).read_text(encoding="utf-8").splitlines()
+    ]
+    if name == "requirements.txt":
+        assert "sentence-transformers==5.3.0" in lines
+    else:
+        # dev pulls the main pins in via -r and must not pin torch itself.
+        assert "-r requirements.txt" in lines
+    assert not any(ln.lower().startswith("torch") for ln in lines), lines
