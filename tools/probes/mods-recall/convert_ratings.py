@@ -204,6 +204,14 @@ def _arm_shown(shown_by_letter: dict, letter, also_by_arm: dict) -> list:
     return shown
 
 
+def _ledger_ts(value):
+    """The ledger line's `ts` (int ms) for the offline in-context sidecar join (#3570), else None.
+    A whole-number float is read as that int; anything else (absent, bool, text) is None."""
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def _route_rru(entry: dict, qid: str, step: dict, session: Path) -> dict:
     """A TEST RRU for one live-route ledger line: the ranking is the ledger's FULL candidate
     list in the route's own order, each item carrying every recorded signal so the eval can
@@ -231,6 +239,7 @@ def _route_rru(entry: dict, qid: str, step: dict, session: Path) -> dict:
             "unmatched": bool(entry.get("unmatched")),
             "cut": line.get("cut"),
             "source": line.get("source"),
+            "ledgerTs": _ledger_ts(line.get("ts")),
         },
     }
 

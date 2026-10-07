@@ -2,7 +2,8 @@
 """Score the probe's arms against the agent's ratings: a per-arm metrics table.
 
     python3 probe_eval.py --golden <out>/golden --test <out>/test \
-        [--pairs <out>/pairs.jsonl] [--shown-only] --out report.md
+        [--pairs <out>/pairs.jsonl] [--shown-only] [--in-context-sidecar <recompute_in_context out>] \
+        --out report.md
 
 Inputs are what convert_ratings.py wrote. The metrics, the golden loader and the
 RankingResultUnit dataclasses are the repo's own (`tools/recall_harness`) and are
@@ -138,8 +139,81 @@ def _skipped_by_reason(test_dir: str):
     return counts if isinstance(counts, dict) else None
 
 
+SIDECAR_SUFFIX = ".in_context_offline.jsonl"  # recompute_in_context.py's output, one file per route
+_ROUTE_PREFIX = "route:"
+
+
+def _hook_flag(signals):
+    """A candidate's in-context flag as the ledger/arms recorded it: `inContext` (arm candidates,
+    hooks/step.ts) wins over `in_context` (route ledger candidates, copied through by the converter).
+    None = unknown (key absent or null); otherwise a bool."""
+    sig = signals or {}
+    value = sig["inContext"] if "inContext" in sig else sig.get("in_context")
+    return None if value is None else bool(value)
+
+
+def _load_sidecar(sidecar_dir: str, routes) -> dict:
+    """{(route, ts): {candidate id: bool|None}} for the given route names, read from
+    `<dir>/<route>.in_context_offline.jsonl`. A (route, ts) that occurs twice maps to None
+    (ambiguous, never guessed). A route with no file is warned about on stderr and has no rows."""
+    root = Path(sidecar_dir)
+    if not root.is_dir():
+        raise SystemExit(f"probe_eval: --in-context-sidecar {sidecar_dir}: not a directory")
+    index: dict = {}
+    for route in sorted(routes):
+        path = root / f"{route}{SIDECAR_SUFFIX}"
+        if not path.is_file():
+            print(f"probe_eval: warning: no {path.name} in {sidecar_dir}; every route:{route} step is "
+                  "unmatched (its in-context flag is unknown)", file=sys.stderr)
+            continue
+        try:
+            text = path.read_text()
+        except (OSError, UnicodeDecodeError) as err:
+            raise SystemExit(f"probe_eval: cannot read sidecar {path}: {err!r}")
+        for lineno, raw in enumerate(text.splitlines(), start=1):
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw)
+            except ValueError as err:
+                raise SystemExit(f"probe_eval: {path} line {lineno}: not JSON: {err}")
+            ts = row.get("ts") if isinstance(row, dict) else None
+            cands = row.get("candidates") if isinstance(row, dict) else None
+            if isinstance(ts, float) and ts.is_integer():
+                ts = int(ts)  # the converter reads a whole-number float ts the same way
+            if (not isinstance(ts, int) or isinstance(ts, bool) or not isinstance(row.get("route"), str)
+                    or not isinstance(cands, list)
+                    or not all(isinstance(c, dict) and isinstance(c.get("id"), str) for c in cands)):
+                raise SystemExit(f"probe_eval: {path} line {lineno}: expected an object with an int ts, a "
+                                 "string route and a candidates list of {id, ...} objects")
+            key = (row["route"], ts)
+            flags = {c["id"]: (c["in_context_offline"] if isinstance(c.get("in_context_offline"), bool)
+                               else None) for c in cands}
+            index[key] = None if key in index else flags
+    return index
+
+
+def _top_flags(rru: RankingResultUnit, sidecar_index) -> tuple[list, bool | None]:
+    """(flags of the top-k candidates, matched). matched is None for a row not read through the
+    sidecar (an arm, or no sidecar given), else whether a sidecar row was found for this step. An
+    unmatched route step has every flag unknown: it never falls back to the hook value."""
+    top = rru.ranked_nodes[:TOP_K]
+    arm = str(rru.metadata.get("arm", ""))
+    if sidecar_index is None or not arm.startswith(_ROUTE_PREFIX):
+        return [_hook_flag(n.signals) for n in top], None
+    ts = rru.metadata.get("ledgerTs")
+    if isinstance(ts, float) and ts.is_integer():
+        ts = int(ts)  # same normalisation as the loader: a whole-number float ts is that int
+    row = None
+    if isinstance(ts, int) and not isinstance(ts, bool):
+        row = sidecar_index.get((arm[len(_ROUTE_PREFIX):], ts))
+    if row is None:
+        return [None] * len(top), False
+    return [row.get(n.id) for n in top], True
+
+
 def evaluate(golden_dir: str, test_dir: str, pairs_path: str | None = None,
-             shown_only: bool = False) -> dict:
+             shown_only: bool = False, in_context_sidecar: str | None = None) -> dict:
     goldens = _load_goldens(golden_dir)
     test_rrus = [_load_test_rru(p) for p in sorted(glob.glob(os.path.join(test_dir, "*.json")))]
 
@@ -170,6 +244,11 @@ def evaluate(golden_dir: str, test_dir: str, pairs_path: str | None = None,
     # golden rows the converter marked "unshown": surfaced, never shown, unrated
     unshown_ids = {qid: {n.id for n in g.ranked_nodes if n.notes == "unshown"}
                    for qid, g in goldens.items()}
+    sidecar_index = None
+    if in_context_sidecar is not None:
+        sidecar_index = _load_sidecar(in_context_sidecar, {a[len(_ROUTE_PREFIX):] for a in by_arm
+                                                           if a.startswith(_ROUTE_PREFIX)})
+    matched = unmatched = 0
     arms: dict[str, dict] = {}
     for arm in sorted(set(by_arm) | set(excluded_status)):
         rrus = by_arm.get(arm, [])
@@ -185,6 +264,10 @@ def evaluate(golden_dir: str, test_dir: str, pairs_path: str | None = None,
         all_ids = [(r.query_id, n.id) for r in rrus for n in r.ranked_nodes]
         unshown = sum(1 for qid, i in all_ids if unshown_ids.get(qid) and i in unshown_ids[qid])
         flag = lambda key: (sum(1 for n in topk if (n.signals or {}).get(key)) / len(topk)) if topk else None  # noqa: E731
+        per_step = [_top_flags(r, sidecar_index) for r in rrus]
+        known = [f for flags, _ in per_step for f in flags if f is not None]
+        matched += sum(1 for _, m in per_step if m is True)
+        unmatched += sum(1 for _, m in per_step if m is False)
         arms[arm] = {
             "n_steps": len(rrus),
             "excluded_arm_runs": excluded_status.get(arm, 0),
@@ -200,7 +283,8 @@ def evaluate(golden_dir: str, test_dir: str, pairs_path: str | None = None,
             "by_query_source": dict(sorted(Counter(
                 str(r.metadata.get("querySource")) for r in rrus).items())),
             "unshown_rate": (unshown / len(all_ids)) if all_ids else None,
-            "in_context_rate": flag("inContext"),
+            "in_context_rate": (sum(known) / len(known)) if known else None,
+            "in_context_n": sum(1 for flags, _ in per_step if any(f is not None for f in flags)),
             "principle_rate": flag("principle"),
         }
 
@@ -226,7 +310,9 @@ def evaluate(golden_dir: str, test_dir: str, pairs_path: str | None = None,
 
     return {"shown_only": shown_only, "arms": arms, "pairs": pairs, "misses": misses, "unrated": unrated,
             "n_goldens": len(goldens), "n_test_rrus": len(test_rrus),
-            "steps_skipped_by_reason": _skipped_by_reason(test_dir)}
+            "steps_skipped_by_reason": _skipped_by_reason(test_dir),
+            "in_context_source": "hook" if sidecar_index is None else "offline sidecar",
+            "sidecar_matched": matched, "sidecar_unmatched": unmatched}
 
 
 # ---------------------------------------------------------------------------
@@ -416,8 +502,13 @@ def render_report(result: dict) -> str:
              f"goldens: {result['n_goldens']} · test RRUs: {result['n_test_rrus']} · "
              f"unrated steps (not scored): {len(result['unrated'])}",
              _skipped_line(result.get("steps_skipped_by_reason")), "",
-             "## Per arm", "",
-             "| arm | n steps | p@5 | r@10 | nDCG@10 | MRR | median ms | p90 ms | "
+             "## Per arm", ""]
+    if any(arm.startswith(_ROUTE_PREFIX) for arm in result["arms"]):
+        matched, unmatched = result.get("sidecar_matched", 0), result.get("sidecar_unmatched", 0)
+        lines += ["in-context flag: " + ("ledger/hook value" if result.get("in_context_source", "hook") == "hook"
+                                         else f"offline sidecar (matched {matched} of {matched + unmatched} "
+                                              "route steps)"), ""]
+    lines += ["| arm | n steps | p@5 | r@10 | nDCG@10 | MRR | median ms | p90 ms | "
              "median msOverStep | unshown | steps by querySource | inContext (top-5) | principle (top-5) |",
              "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for arm, s in result["arms"].items():
@@ -475,14 +566,20 @@ def main(argv=None) -> int:
     parser.add_argument("--formula",
                         help="with --signal-sweep: a python expression over the recorded signal names, "
                              "e.g. '0.6*similarity+0.4*utility'")
+    parser.add_argument("--in-context-sidecar", metavar="DIR",
+                        help="dir written by recompute_in_context.py: the route arms' inContext (top-5) is then "
+                             "read from its in_context_offline flag instead of the ledger's")
     parser.add_argument("--out", required=True, help="markdown report path")
     args = parser.parse_args(argv)
     if args.formula is not None and not args.signal_sweep:
         parser.error("--formula needs --signal-sweep")
+    if args.in_context_sidecar is not None and args.signal_sweep:
+        parser.error("--in-context-sidecar does not apply to --signal-sweep")
     if args.signal_sweep:
         text = render_sweep(signal_sweep(args.golden, args.test, args.formula), args.formula)
     else:
-        text = render_report(evaluate(args.golden, args.test, args.pairs, shown_only=args.shown_only))
+        text = render_report(evaluate(args.golden, args.test, args.pairs, shown_only=args.shown_only,
+                                          in_context_sidecar=args.in_context_sidecar))
     _write_private(Path(args.out), text)
     print(text)
     return 0

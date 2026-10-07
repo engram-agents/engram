@@ -94,9 +94,25 @@ def _resolve_label(root: Path, label, summary: dict) -> tuple[str, str]:
     _die(f"{root}: no --label for this dir and its summary.json does not carry a valid seat and date")
 
 
-def load_inputs(dirs: list[str], labels: list[str], shown_only: bool) -> list[dict]:
+def parse_sidecar_specs(specs: list[str]) -> dict[str, str]:
+    """['SEAT:DATE=DIR', ...] -> {'SEAT:DATE': 'DIR'}; a malformed or repeated spec is an error naming it."""
+    out: dict[str, str] = {}
+    for spec in specs:
+        col, sep, path = spec.partition("=")
+        m = _LABEL.fullmatch(col)
+        if not sep or not path or not m or not _valid_date(m.group(2)):
+            _die(f"--in-context-sidecar {spec!r} is not <seat>:<yyyy-mm-dd>=<dir>")
+        if col in out:
+            _die(f"--in-context-sidecar given twice for {col}")
+        out[col] = path
+    return out
+
+
+def load_inputs(dirs: list[str], labels: list[str], shown_only: bool,
+                sidecars: dict[str, str] | None = None) -> list[dict]:
     if len(labels) > len(dirs):
         _die(f"{len(labels)} --label values for {len(dirs)} input dirs")
+    sidecars = dict(sidecars or {})
     inputs, seen = [], {}
     for i, d in enumerate(dirs):
         root = Path(d)
@@ -115,13 +131,17 @@ def load_inputs(dirs: list[str], labels: list[str], shown_only: bool) -> list[di
         seen[key] = root
         pairs_path = root / "pairs.jsonl"
         try:
-            result = _PE.evaluate(str(gdir), str(tdir), str(pairs_path), shown_only=shown_only)
+            result = _PE.evaluate(str(gdir), str(tdir), str(pairs_path), shown_only=shown_only,
+                                  in_context_sidecar=sidecars.pop(f"{seat}:{date}", None))
             sweep = _PE.signal_sweep(str(gdir), str(tdir))
         except SystemExit as err:
             _die(f"{root}: {err.code}")
         inputs.append({"root": root, "seat": seat, "date": date, "summary": summary,
                        "result": result, "sweep": sweep, "has_pairs": pairs_path.exists(), "labelled": i < len(labels),
                        "col": f"{seat}:{date}"})
+    if sidecars:
+        _die(f"--in-context-sidecar {sorted(sidecars)[0]} is not the seat:date of any input "
+             f"(inputs: {', '.join(f'{s}:{d}' for s, d in seen)})")
     inputs.sort(key=lambda x: (x["date"], x["seat"]))
     return inputs
 
@@ -308,7 +328,38 @@ def render(inputs: list[dict], shown_only: bool) -> str:
                      f"{rated if isinstance(rated, int) and not isinstance(rated, bool) else 'unknown'} · "
                      f"goldens {res['n_goldens']} · arms: {', '.join(res['arms']) or 'none'} · "
                      f"arm runs excluded by status: {excluded} · {rater_text}{override}")
+        m, u = res["sidecar_matched"], res["sidecar_unmatched"]
+        lines.append(f"  - in-context flag, {x['col']}: " + (
+            f"offline sidecar (matched {m} of {m + u} route steps) for route rows · inContext for arm rows"
+            if res["in_context_source"] == "offline sidecar"
+            else "ledger/hook value for route rows · inContext for arm rows"))
+    if has_known_in_context(inputs):
+        lines += _render_in_context(inputs, arms)
     return "\n".join(lines) + "\n"
+
+
+def has_known_in_context(inputs) -> bool:
+    """True when at least one arm in at least one input has a step with a known in-context flag."""
+    return any(s["in_context_n"] for x in inputs for s in x["result"]["arms"].values())
+
+
+def _render_in_context(inputs, arms) -> list[str]:
+    lines = ["", "## 6. In-context rate (top-5 of each step)", "",
+             f"Cell = share of the top-5 candidates whose in-context flag is known and true, over the known ones "
+             f"(n steps contributing at least one known flag). A cell with n < {MIN_N} shows its value in "
+             "parentheses too. `-` = no known flag.", ""]
+    lines += _table(inputs, arms, lambda s: "-" if s is None or s["in_context_rate"] is None else
+                    _cell_fmt(s["in_context_rate"], s["in_context_n"], ".3f"))
+    lines.append("")
+    for x in inputs:
+        res = x["result"]
+        if res["in_context_source"] == "offline sidecar":
+            src = (f"offline sidecar (route rows: matched {res['sidecar_matched']}, "
+                   f"unmatched {res['sidecar_unmatched']}; arm rows: inContext)")
+        else:
+            src = "ledger/hook value (route rows) · inContext (arm rows)"
+        lines.append(f"- {x['col']}: flag source: {src}")
+    return lines
 
 
 def main(argv=None) -> int:
@@ -318,12 +369,17 @@ def main(argv=None) -> int:
                         help="seat:yyyy-mm-dd for the dir at the same position; repeat once per dir")
     parser.add_argument("--shown-only", action="store_true",
                         help="score each ranking truncated to the ids the rating request showed")
+    parser.add_argument("--in-context-sidecar", action="append", default=[], metavar="SEAT:DATE=DIR",
+                        help="recompute_in_context.py output dir for the input labelled SEAT:DATE; repeatable. "
+                             "That input's route rows read in_context_offline instead of the ledger value")
     parser.add_argument("--out", required=True, help="markdown report path")
     args = parser.parse_args(argv)
     out_dir = Path(args.out).resolve().parent
     if not out_dir.is_dir():
         _die(f"--out {args.out}: directory {out_dir} does not exist (create it first)")
-    inputs = load_inputs(args.dirs, args.label, args.shown_only)
+    inputs = load_inputs(args.dirs, args.label, args.shown_only, parse_sidecar_specs(args.in_context_sidecar))
+    if not has_known_in_context(inputs):
+        print("probe_fleet_report: Section 6 omitted: no known in-context flag in any input", file=sys.stderr)
     try:
         _PE._write_private(Path(args.out), render(inputs, args.shown_only))
     except OSError as err:

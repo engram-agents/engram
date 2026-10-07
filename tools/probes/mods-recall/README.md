@@ -380,7 +380,34 @@ Bounds to read the numbers by:
   under-report; the count is in `summary.json`.
 - `shown` means the id's text sits in the window, not that the model attended to it.
 
-`probe_eval.py` and `probe_fleet_report.py` do not read the sidecar yet.
+### Reading the sidecar in the reports (#3570)
+
+The route arms' `inContext (top-5)` cell is the share of the top-5 candidates whose flag is **known and true**, over the
+known ones; `-` when none is known. Arm candidates carry `inContext` (always a bool). Route candidates carry the ledger's
+snake_case `in_context` (`true`, `false` or `null`); `probe_eval` reads `inContext` first and `in_context` otherwise.
+A route RRU from `convert_ratings.py` also carries `metadata.ledgerTs`, the ledger line's `ts` (ms), which is the join key.
+
+```
+~/.engram/venv/bin/python probe_eval.py --golden G --test T --in-context-sidecar <recompute out dir> --out report.md
+~/.engram/venv/bin/python probe_fleet_report.py A B --label kepler:2026-10-06 --label borges:2026-10-07 \
+    --in-context-sidecar kepler:2026-10-06=<recompute out dir> --out fleet.md
+```
+
+With a sidecar, each route step is joined to its sidecar row by (route, `ledgerTs`) (not by `fire_key`, which repeats
+when the same text is sent twice) and each candidate by id; the flag is `in_context_offline`. A route step with no
+matching row (no `ledgerTs`, no row at that ts, or a ts that occurs twice in the file) is **unmatched**: its flag is
+unknown, never the hook value, so one rate never mixes the two sources. A candidate id absent from the row, or `null`
+there, is unknown. Arm rows are unaffected. The report says which it used: `in-context flag: ledger/hook value` or
+`in-context flag: offline sidecar (matched N of M route steps)`, on the line right under `## Per arm` (only when the
+report has a route row). A sidecar dir with no file for a route is a stderr warning and that route's steps are all
+unmatched; an unreadable file or a line without `ts` / `route` / `candidates` exits non-zero naming the file. The
+hook-only report changes in two places: that one line, and any row (route or arm) whose top-5 has no known flag now
+reads `-` where it read `0.000` (unknown, not false); an arm row with no `inContext` key at all is included, and real arm
+candidates always carry a bool, so real arm numbers are unchanged.
+
+The fleet report adds Section 6, `In-context rate (top-5 of each step)` (same shape as Section 1; cell = value (n steps
+with at least one known flag)), a flag-source line per column, and one flag-source line per input in Section 5. Section 6
+is left out, with the reason on stderr, when no input has a known flag anywhere.
 
 ## Tests
 
