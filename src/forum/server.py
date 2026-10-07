@@ -306,7 +306,117 @@ def _login_map_cfg(app) -> dict:
         "path": app.config.get("BATON_LOGIN_MAP"),
         "admin_uids": tuple(app.config.get("BATON_LOGIN_MAP_ADMIN_UIDS") or ()),
         "trust_anchor": app.config.get("BATON_LOGIN_MAP_TRUST_ANCHOR") or "/",
+        # #3568: "on" / "off" / None (no service mode: today's behaviour).
+        "github_integration": app.config.get("GITHUB_INTEGRATION"),
     }
+
+
+# ---------------------------------------------------------------------------
+# #3568: GitHub integration is an explicit server-side switch.
+#
+# Principle (Lei): a released feature never hard-depends on a team credential.
+# The strict gate reads GitHub (CI, reviews) under the service's read-only token;
+# a user who has no such token must still get a working forum. The switch
+# ``FORUM_GITHUB_INTEGRATION=on|off`` is read ONCE, at startup in ``main()``
+# (``_resolve_github_integration``), and handed to ``create_app`` as
+# ``github_integration``; every route reads ``app.config["GITHUB_INTEGRATION"]``
+# (via ``_login_map_cfg``), never the environment.
+#
+# C1 resolution (env value / GH_TOKEN present at startup -> result):
+#     on     / yes -> ON  (today's gate, byte for byte)
+#     on     / no  -> startup REFUSES: one stderr line naming the token source,
+#                     non-zero exit, before anything is served
+#     off    / any -> OFF
+#     unset  / yes -> ON  (a legacy install keeps the gate it already had)
+#     unset  / no  -> LEGACY-CLOSED: the server starts and behaves exactly as it did
+#                     before the switch existed. It is NOT a third mode: it resolves
+#                     to "on", the service identity is on with no token, so every
+#                     GitHub-gated transition REFUSES (the gate's own no-identity
+#                     refusal, which now also names the opt-out). NOT advisory.
+#     other value  -> startup REFUSES, naming the value
+#   OFF is reached ONLY by an explicit ``off``. An unset switch must never loosen a
+#   write-path gate: the installer always renders an explicit value, so "unset" only
+#   exists on a unit rendered by the OLD installer, where it must mean the old
+#   (fail-closed) behaviour, with or without a token (a missing token file must not
+#   quietly turn the merge gate advisory).
+#
+# ``create_app(github_integration=None)`` (the default; tests, anything not
+# started through ``main()``) is "no service mode": the routes behave exactly as
+# they did before the switch existed, so every existing test stays meaningful.
+#
+# C2 OFF: no ``gh`` process is ever started on any route. ``advance`` skips the
+# login-map lookup and the approval read, proceeds with ci/approval ``unknown``
+# and the one plain warning, and the turn log records the unknown verdicts. The
+# flip gates are advisory, the board PR-state read returns ``unknown``. ``/gc`` and
+# ``/merge`` on a parseable PR-anchored baton take the UNANCHORED path (client's
+# word + participant gate, 403 otherwise), never a 503; the turn log and response
+# say the PR state was not verified. A non-empty UNPARSEABLE anchor and a gate
+# module that cannot load still 503 (malformed data, not a GitHub read). Every
+# NON-GitHub refusal (anchor format/qualification, id binding, pool sentinel,
+# phase rules, participants, colleague assigned) is unchanged.
+# ---------------------------------------------------------------------------
+
+GITHUB_INTEGRATION_ENV = "FORUM_GITHUB_INTEGRATION"
+# The unset + no-token row's why-string; ``main()`` keys the startup label on it.
+LEGACY_CLOSED_WHY = (
+    "switch unset and no GH_TOKEN \u2014 GitHub-gated transitions will REFUSE; set "
+    f"{GITHUB_INTEGRATION_ENV}=off for advisory mode, or install a read-only token")
+GITHUB_OFF_DETAIL = "GitHub integration is off"
+GITHUB_OFF_WARNING = "GitHub integration is off; enable it to gate on CI and approvals"
+GITHUB_OFF_FLIP_NOTE = "(GitHub integration is off; CI and approval not verified)"
+# main()'s refusal exit code for a switch/token contradiction (EX_CONFIG). Deliberately
+# not 2: the unit sets RestartPreventExitStatus=78 so systemd does not crash-loop on a
+# config error, while boot-verify failures (exit 2, possibly transient) still restart.
+EXIT_CONFIG_REFUSED = 78
+GITHUB_OFF_LOG_NOTE = (
+    "gate: ci 'unknown', approval 'unknown' (GitHub integration is off; nothing was read from GitHub)"
+)
+
+
+# OFF, /gc and /merge on a PR-anchored baton: the server cannot read the PR, so the
+# baton takes the SAME path as an unanchored one (#3416 ruling (a): the client's word,
+# but the caller must be a participant). The write says the PR state was not verified.
+GITHUB_OFF_UNVERIFIED_NOTE = "(GitHub integration is off; PR state not verified)"
+GITHUB_OFF_UNVERIFIED_WARNING = "GitHub integration is off; PR state not verified"
+
+
+class GithubIntegrationError(Exception):
+    """Startup refusal: the switch and the token disagree, or the value is invalid."""
+
+
+def _resolve_github_integration(environ) -> tuple:
+    """Resolve the C1 table to ``(mode, why)``; ``mode`` is ``"on"`` or ``"off"``.
+
+    ``"off"`` only for an explicit ``off``. Unset with no token is LEGACY-CLOSED:
+    mode ``"on"`` (the gate refuses for want of an identity, as before the switch).
+
+    Raises :class:`GithubIntegrationError` (a single-line message) for ``on``
+    without a ``GH_TOKEN`` and for any value other than ``on`` / ``off``. The
+    value is compared case-insensitively after stripping; an empty value counts
+    as unset. ``why`` never contains the token.
+    """
+    raw = str(environ.get(GITHUB_INTEGRATION_ENV) or "").strip()
+    value = raw.lower()
+    have_token = bool(str(environ.get("GH_TOKEN") or "").strip())
+    if value == "":
+        if have_token:
+            return "on", "switch unset and a GH_TOKEN is present (legacy install keeps its gate)"
+        return "on", LEGACY_CLOSED_WHY
+    if value == "off":
+        return "off", f"{GITHUB_INTEGRATION_ENV}=off"
+    if value == "on":
+        if not have_token:
+            raise GithubIntegrationError(
+                f"{GITHUB_INTEGRATION_ENV}=on but GH_TOKEN is empty or absent: the unit's "
+                "EnvironmentFile (install-forum-service.sh --github-token-file) must supply "
+                "a read-only GH_TOKEN, or set the switch to off")
+        return "on", f"{GITHUB_INTEGRATION_ENV}=on and GH_TOKEN present"
+    raise GithubIntegrationError(
+        f"{GITHUB_INTEGRATION_ENV}={raw!r} is not valid: use 'on' or 'off' (or leave it unset)")
+
+
+def _github_off(login_map_cfg: Optional[dict]) -> bool:
+    return (login_map_cfg or {}).get("github_integration") == "off"
 
 
 # Per-login verdicts that refuse an advance even when ANOTHER mapped login of the
@@ -448,6 +558,39 @@ def _advance_gate(gate, pid: str, fields: dict, body: str, to_agent: str,
             None,
         )
     cfg = login_map_cfg or {}
+    if _github_off(cfg):
+        # #3568 OFF: nothing is read from GitHub, so no login map is REQUIRED and no
+        # approval can be checked. The id<->anchor binding is not a GitHub read: it
+        # still applies whenever a map (the only home of the ``repos`` table) loads.
+        try:
+            off_map = gate._load_login_map(
+                cfg.get("path"),
+                extra_trusted_uids=cfg.get("admin_uids") or (),
+                trust_anchor=cfg.get("trust_anchor") or "/",
+            )
+        except gate.LoginMapError:
+            off_map = None
+        if off_map is not None:
+            off_binding = gate._anchor_id_binding_refusal(
+                pid, pr_repo, pr_num, getattr(off_map, "repos", None), anchor_shown=anchor_shown)
+            if off_binding is not None:
+                return ((off_binding, 422), None)
+        logger.warning(
+            "advance gate: GitHub integration is off -- advancing %s without reading CI or approval", pid)
+        return (
+            None,
+            {
+                "noop": False,
+                "anchor": github_anchor,
+                "colleague": colleague_name,
+                "pr": pr_num,
+                "repo": pr_repo,
+                "ci": {"state": "unknown", "detail": GITHUB_OFF_DETAIL},
+                "approval": {"state": "unknown", "detail": GITHUB_OFF_DETAIL},
+                "warnings": [GITHUB_OFF_WARNING],
+                "log_note": GITHUB_OFF_LOG_NOTE,
+            },
+        )
     try:
         login_map = gate._load_login_map(
             cfg.get("path"),
@@ -538,6 +681,7 @@ def _check_flip_gate(
     transition_phase: Optional[str] = None,
     login_map_cfg: Optional[dict] = None,
     ticket_out: Optional[dict] = None,
+    off_out: Optional[dict] = None,
 ) -> Optional[tuple[str, int]]:
     """Server-side mirror of cmd_flip's CI/approval/colleague gate.
 
@@ -705,6 +849,19 @@ def _check_flip_gate(
     pr_num = parsed_anchor[2]
     pr_repo = parsed_anchor[1]
 
+    if _github_off(login_map_cfg):
+        # #3568 OFF: the CI / approval / colleague-approval reads are all GitHub
+        # reads. Advisory: log it, never refuse for a GitHub reason, no gh call.
+        logger.warning(
+            "flip gate: GitHub integration is off -- not checking CI or approval for PR #%s "
+            "(proceeding)", pr_num,
+        )
+        if off_out is not None:
+            # The route writes the audit note and returns the warning (same shape
+            # as advance, /gc and /merge in OFF). Filled only here, so ON is untouched.
+            off_out.update({"log_note": GITHUB_OFF_FLIP_NOTE, "warnings": [GITHUB_OFF_WARNING]})
+        return None
+
     ci_state, ci_detail = gate._pr_ci_state(pr_num, repo=pr_repo)
     if ci_state in ("red", "pending"):
         return (
@@ -802,6 +959,7 @@ def _perform_advance(gate, store, allocator, pid: str, *, to_agent: str, reason:
                 expected_anchor=ticket.get("anchor", ""),
                 expected_colleague=ticket.get("colleague", ""),
                 resolve_phase=resolve_phase,
+                log_note=ticket.get("log_note", ""),
             )
         except ProjectNotFound:
             return {"error": f"project not found: {pid}"}, 404
@@ -1521,7 +1679,7 @@ def _anchor_changed_409(pid: str, e):
                     f"nothing was written for {pid}. Retry."}), 409
 
 
-def _server_pr_read(store, pid: str):
+def _server_pr_read(store, pid: str, *, github_off: bool = False):
     """#3416: the server's OWN read of a baton's anchored PR -- never the client's.
 
     Returns ``None`` when there is nothing to verify: the baton does not exist
@@ -1553,6 +1711,13 @@ def _server_pr_read(store, pid: str):
     hand it to ``close`` / ``merge``, which compare it under the allocator lock, so
     the read that authorises the write and the write always see the same anchor.
     The gh call itself stays outside any lock.
+
+    ``github_off`` (#3568, keyword-only; the routes pass it only when GitHub
+    integration is OFF, so the ON call shape is unchanged): a parseable repo-qualified
+    PR anchor returns ``None`` -- the unanchored path -- with no gh call and no
+    admission-semaphore use. ``expected_anchor`` is returned as always, so the
+    under-lock anchor binding is untouched. An unparseable non-empty anchor and a
+    gate module that cannot load still fail closed (see ``_verdict_for_anchor``).
     """
     raw = store.read_project(pid)
     if raw is None:
@@ -1560,25 +1725,44 @@ def _server_pr_read(store, pid: str):
     fields, _ = _md.parse_frontmatter(raw)
     stored = (fields.get("github") or "").strip()
     anchor = stored.lower()
-    return (_verdict_for_anchor(stored, anchor), anchor)
+    return (_verdict_for_anchor(stored, anchor, github_off=github_off), anchor)
 
 
-def _verdict_for_anchor(stored: str, anchor: str):
+def _off_unverified_pr(anchor: str) -> bool:
+    """True when ``anchor`` is a parseable repo-qualified PR anchor, i.e. a baton whose
+    PR state OFF mode could not verify (#3568). False for no anchor, ``project/N``,
+    unqualified ``pr/N``, an unparseable anchor, or an unavailable gate module."""
+    if not anchor:
+        return False
+    gate = _load_baton_gate()
+    parsed = None if gate is None else gate._parse_github_anchor(anchor)
+    return parsed is not None and parsed[0] == "pr" and parsed[1] is not None
+
+
+def _verdict_for_anchor(stored: str, anchor: str, github_off: bool = False):
     """The verdict half of :func:`_server_pr_read` (see its docstring)."""
     if not anchor:
         return None
     gate = _load_baton_gate()
     if gate is None:
         # A baton HAS an anchor but we cannot parse it: fail closed, not "unanchored".
+        # Also in OFF (#3568): malformed data / a broken gate is not a GitHub read, and
+        # trusting a baton whose anchor we cannot interpret is what the 503 prevents.
         return (stored, None, "unknown")
     parsed = gate._parse_github_anchor(anchor)
     if parsed is None:
         # Present but unreadable: the baton names a PR we cannot ask about. Fail
-        # closed (503), never "unanchored" (which would trust the caller).
+        # closed (503), never "unanchored" (which would trust the caller). Also in
+        # OFF (#3568), for the same reason as above.
         return (stored, None, "unknown")
     if parsed[0] != "pr" or parsed[1] is None:
         # The deliberately unanchored shapes the parser recognises: ``project/N``
         # and the unqualified ``pr/N`` (no repo to ask, #1918).
+        return None
+    if github_off:
+        # #3568: OFF is advisory, never a refusal. The PR cannot be read, so this
+        # baton takes the unanchored path (client's word + the participant gate).
+        # No gh call, no admission slot.
         return None
     _, repo, number = parsed
     # Admission bound (#3416 round 3): at most _GH_ADMISSION_LIMIT gh reads in
@@ -1639,6 +1823,7 @@ def create_app(
     backup_dir: str | None = None,
     baton_login_map: str | None = None,
     baton_login_map_admin_uids: tuple = (),
+    github_integration: str | None = None,
 ) -> Flask:
     """Create and configure the Flask application.
 
@@ -1676,9 +1861,18 @@ def create_app(
             and its directories (``--baton-login-map-admin-uid``). Never defaulted
             to the server's own uid: the server runs as an agent account.
 
+        github_integration: ``"on"`` / ``"off"`` / None (#3568; ``main()`` feeds it from
+            ``FORUM_GITHUB_INTEGRATION`` via ``_resolve_github_integration``). **None
+            (the default) is "no service mode"**: the routes behave as they did before
+            the switch existed, which keeps every test that calls create_app()
+            directly meaningful. ``"off"`` makes every GitHub read advisory with no
+            ``gh`` call; see the #3568 block above ``_advance_gate``.
+
     Returns:
         A configured Flask application instance.
     """
+    if github_integration not in (None, "on", "off"):
+        raise ValueError(f"github_integration must be 'on', 'off' or None, got {github_integration!r}")
     if packs_dir is None:
         packs_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "packs")
 
@@ -1697,6 +1891,7 @@ def create_app(
     app.config["BACKUP_DIR"] = backup_dir
     app.config["BATON_LOGIN_MAP"] = baton_login_map
     app.config["BATON_LOGIN_MAP_ADMIN_UIDS"] = tuple(baton_login_map_admin_uids or ())
+    app.config["GITHUB_INTEGRATION"] = github_integration
 
     # UCS coordination store (fork-1): wire the file-backed FileStore + the
     # process-level SeqAllocator so the /api/dm routes are live. The allocator is
@@ -3549,11 +3744,13 @@ def create_app(
         transition_phase = f["transition_phase"] or None
 
         advance_ticket: dict = {}
+        off_flip: dict = {}
         raw_phase, raw_transition = phase, transition_phase
         gate_refusal = _check_flip_gate(
             store, pid, to_agent,
             phase=phase, transition_phase=transition_phase,
             login_map_cfg=_login_map_cfg(app), ticket_out=advance_ticket,
+            off_out=off_flip,
         )
         if gate_refusal is not None:
             message, gate_status = gate_refusal
@@ -3581,12 +3778,16 @@ def create_app(
             seq = _flip(
                 store, allocator, pid, to_agent=to_agent, reason=reason,
                 by_agent=agent, phase=phase, transition_phase=transition_phase,
+                **({"log_note": off_flip["log_note"]} if off_flip else {}),
             )
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
         turn, status = _read_project_state(store, pid)
-        return jsonify({"seq": seq, "turn": turn, "status": status}), 201
+        out = {"seq": seq, "turn": turn, "status": status}
+        if off_flip:
+            out["warnings"] = off_flip["warnings"]
+        return jsonify(out), 201
 
     @app.route("/api/projects/<pid>/advance", methods=["POST"])
     def api_project_advance(pid: str):
@@ -4161,7 +4362,15 @@ def create_app(
             if _cur in _CLOSED_STATUSES:
                 return jsonify({"error": f"project {pid} is already {_cur}; "
                                 "refusing to overwrite a closed status (reopen first)"}), 409
-        verdict, expected_anchor = _server_pr_read(store, pid)
+        # #3568: with GitHub integration OFF a PR-anchored baton takes the unanchored
+        # path (verdict None: client's word + participant gate) and the write records
+        # that the PR state was not verified. ON / no service mode: unchanged call.
+        github_off = _github_off(_login_map_cfg(app))
+        if github_off:
+            verdict, expected_anchor = _server_pr_read(store, pid, github_off=True)
+        else:
+            verdict, expected_anchor = _server_pr_read(store, pid)
+        unverified = github_off and verdict is None and _off_unverified_pr(expected_anchor)
         if verdict is not None:
             repo, number, state = verdict
             if number is None:
@@ -4199,7 +4408,8 @@ def create_app(
             seq = _close(store, allocator, pid, invoker=agent, new_status=new_status,
                          reason=reason, phase=phase,
                          require_participant=(verdict is None),
-                         expected_anchor=expected_anchor)
+                         expected_anchor=expected_anchor,
+                         log_note=(GITHUB_OFF_UNVERIFIED_NOTE if unverified else ""))
         except AnchorChanged as e:
             return _anchor_changed_409(pid, e)
         except ProjectNotFound:
@@ -4211,7 +4421,10 @@ def create_app(
                             "refusing to overwrite a closed status (reopen first)"}), 409
 
         turn, status = _read_project_state(store, pid)
-        return jsonify({"seq": seq, "turn": turn, "status": status}), 201
+        out = {"seq": seq, "turn": turn, "status": status}
+        if unverified:
+            out["warnings"] = [GITHUB_OFF_UNVERIFIED_WARNING]
+        return jsonify(out), 201
 
     @app.route("/api/projects/<pid>/merge", methods=["POST"])
     def api_project_merge(pid: str):
@@ -4283,7 +4496,13 @@ def create_app(
         # #3416: on an anchored baton the server requires GitHub MERGED (it never
         # takes the client's word, and ``forced`` does not skip this). Unanchored
         # batons keep the pre-#3416 behaviour.
-        verdict, expected_anchor = _server_pr_read(store, pid)
+        # #3568: OFF -> a PR-anchored baton takes the unanchored path (see /gc).
+        github_off = _github_off(_login_map_cfg(app))
+        if github_off:
+            verdict, expected_anchor = _server_pr_read(store, pid, github_off=True)
+        else:
+            verdict, expected_anchor = _server_pr_read(store, pid)
+        unverified = github_off and verdict is None and _off_unverified_pr(expected_anchor)
         if verdict is not None:
             repo, number, state = verdict
             if number is None:
@@ -4305,7 +4524,8 @@ def create_app(
             # MERGED was just required above, so the caller's identity decides nothing.
             seq = _merge(store, allocator, pid, merged_by=agent, forced=forced, phase=phase,
                          require_participant=(verdict is None),
-                         expected_anchor=expected_anchor)
+                         expected_anchor=expected_anchor,
+                         log_note=(GITHUB_OFF_UNVERIFIED_NOTE if unverified else ""))
         except AnchorChanged as e:
             return _anchor_changed_409(pid, e)
         except ProjectNotFound:
@@ -4318,7 +4538,10 @@ def create_app(
                             "refusing to overwrite a closed status (reopen first)",
                             "reason": "already_closed", "status": e.status}), 409
 
-        return jsonify({"seq": seq, "status": "merged"}), 201
+        out = {"seq": seq, "status": "merged"}
+        if unverified:
+            out["warnings"] = [GITHUB_OFF_UNVERIFIED_WARNING]
+        return jsonify(out), 201
 
     return app
 
@@ -4521,7 +4744,7 @@ def _parse_args(argv=None, environ=None):
     return args
 
 
-def _configure_gate_github_identity(data_dir: str, environ=None) -> str:
+def _configure_gate_github_identity(data_dir: str, environ=None, github_integration=None) -> str:
     """Put the baton gate in service-identity mode (#3283); return the config dir.
 
     The gate then calls `gh` only under the dedicated read-only ``GH_TOKEN`` from
@@ -4535,7 +4758,17 @@ def _configure_gate_github_identity(data_dir: str, environ=None) -> str:
     CALL ONCE per process: with ``environ`` None / ``os.environ`` this removes
     ``GH_TOKEN`` from the process environment after the gate captured it, so a second
     call would see no token and leave the gate and the board with no identity.
+
+    ``github_integration="off"`` (#3568): the gate is configured with NO token
+    whatever ``environ`` holds (``GH_TOKEN`` is also removed from ``os.environ``),
+    so any ``gh`` call site that is ever reached refuses (``unknown``) without
+    starting a process, and the board's PR-state read is given a provider that
+    answers ``unknown`` with the off detail. None / ``"on"``: unchanged.
     """
+    github_off = github_integration == "off"
+    if github_off:
+        os.environ.pop("GH_TOKEN", None)
+        environ = {}
     config_dir = os.path.join(data_dir, "gh-config")
     gate = _load_baton_gate()
     try:
@@ -4550,23 +4783,35 @@ def _configure_gate_github_identity(data_dir: str, environ=None) -> str:
         if gate is not None:
             gate.configure_service_github_identity(environ=environ, config_dir=None)
             _adopt_gate_identity(gate, environ)
+        if github_off:
+            board_projects.configure_gh_identity(_github_off_provider)
         return config_dir
     if gate is None:
         # Fail closed here too: the board's PR-state read must not fall back to
         # the service user's ambient gh login when the gate cannot be loaded.
-        board_projects.configure_gh_identity(_gate_unavailable_provider)
+        board_projects.configure_gh_identity(
+            _github_off_provider if github_off else _gate_unavailable_provider)
         print("[forum] baton gate module unavailable -- gate-checked flips will refuse "
               "and the board's PR-state read will return unknown (#3509).",
               file=sys.stderr)
         return config_dir
     have_identity = gate.configure_service_github_identity(environ=environ, config_dir=config_dir)
     _adopt_gate_identity(gate, environ)
+    if github_off:
+        board_projects.configure_gh_identity(_github_off_provider)
+        return config_dir
     if not have_identity:
         print("[forum] baton gate GitHub identity: no GH_TOKEN -- gate-checked `baton advance` "
               "and the board's PR-state read will refuse/return unknown until the read-only "
               "token is installed (#3283, #3509).",
               file=sys.stderr)
     return config_dir
+
+
+def _github_off_provider():
+    """Board identity provider when GitHub integration is off (#3568): always the
+    ``unknown`` verdict, so ``_gh_pr_state`` returns before starting any process."""
+    return {}, ("unknown", GITHUB_OFF_DETAIL)
 
 
 def _gate_unavailable_provider():
@@ -4599,6 +4844,21 @@ def _adopt_gate_identity(gate, environ) -> None:
 def main() -> None:
     args = _parse_args()
 
+    # #3568: resolve the GitHub-integration switch FIRST, from the environment,
+    # once. A contradiction (on without a token, an invalid value) refuses here --
+    # before boot-verify, any data-dir write, or serving.
+    try:
+        github_mode, github_why = _resolve_github_integration(os.environ)
+    except GithubIntegrationError as exc:
+        print(f"[forum] refusing to start: {exc}", file=sys.stderr)
+        # Exit 78 (EX_CONFIG), not 2: a switch/token contradiction is a config error
+        # that no restart can fix, so the unit's RestartPreventExitStatus=78 stops
+        # systemd crash-looping on it. Boot-verify's hard-dep failures still exit 2
+        # (possibly transient: mount, permissions) and so are still restarted.
+        sys.exit(EXIT_CONFIG_REFUSED)
+    label = github_mode.upper() + (", no token" if github_why == LEGACY_CLOSED_WHY else "")
+    print(f"[forum] GitHub integration: {label} ({github_why})", file=sys.stderr)
+
     # ------------------------------------------------------------------
     # Boot-verify: run BEFORE binding the port.
     # Exits 2 on hard-dep failure; DEGRADED banner for soft deps.
@@ -4626,12 +4886,16 @@ def main() -> None:
         backup_dir=os.environ.get("FORUM_BACKUP_DIR", "").strip() or None,
         baton_login_map=args.baton_login_map,
         baton_login_map_admin_uids=tuple(args.baton_login_map_admin_uid),
+        github_integration=github_mode,
     )
     # #3283: the gate's own, dedicated read-only GitHub identity, kept beside the
     # service data (the unit sets FORUM_HOME; else the dir holding the DB).
     _configure_gate_github_identity(
-        os.environ.get("FORUM_HOME", "").strip() or db_dir)
-    if args.baton_login_map is None:
+        os.environ.get("FORUM_HOME", "").strip() or db_dir,
+        github_integration=github_mode)
+    if github_mode == "off":
+        pass  # advance is advisory; the login map is not required (#3568)
+    elif args.baton_login_map is None:
         print("[forum] baton login map: not configured -- `baton advance` (peer->merge) "
               "will refuse until --baton-login-map / $ENGRAM_BATON_LOGIN_MAP is set.",
               file=sys.stderr)

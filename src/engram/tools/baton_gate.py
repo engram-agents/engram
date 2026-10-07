@@ -496,7 +496,9 @@ def _dedupe_checks_by_latest(checks: list) -> list:
 
 _SERVICE_IDENTITY_MISSING_MSG = (
     "GitHub gate identity not configured: the forum service has no dedicated "
-    "read-only GH_TOKEN (#3283), so the gate refuses to call gh under an ambient login"
+    "read-only GH_TOKEN (#3283), so the gate refuses to call gh under an ambient login; "
+    "set FORUM_GITHUB_INTEGRATION=off on the forum server for advisory mode, "
+    "or install a read-only token"
 )
 _DEFAULT_GH_PATH = "/usr/local/bin:/usr/bin:/bin"
 

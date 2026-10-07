@@ -119,6 +119,17 @@ class AnchorChanged(Exception):
         self.actual = actual
 
 
+def _log_note_suffix(now: str, log_note: str) -> str:
+    """The optional one-line turn-log note (#3568) as a suffix for a log entry.
+
+    Empty when there is no note (so the log is byte-for-byte what it was). The note
+    is collapsed to one line, whatever the caller passed, and sits on its own
+    ``- {ts} `` line, the same shape ``advance`` uses.
+    """
+    note = " ".join((log_note or "").split())
+    return f"\n- {now} {note}" if note else ""
+
+
 def _check_expected_anchor(project_id: str, fields: dict, expected_anchor: Optional[str]) -> None:
     """Under-lock anchor binding. ``expected_anchor=None`` = don't check; ``""`` = the
     caller read the baton as unanchored. Same normalisation the server read uses."""
@@ -186,6 +197,7 @@ def flip(
     phase: Optional[str] = None,
     transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
+    log_note: str = "",
 ) -> int:
     """Flip a baton's turn to ``to_agent``; return the module-assigned seq.
 
@@ -224,6 +236,9 @@ def flip(
             (conversion-only) alone. ``None`` (default) means this flip is
             not a transition.
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+        log_note: (#3568, default empty = the log is byte-for-byte unchanged) a
+            one-line note appended to this flip's turn-log entries; the server
+            passes it only when GitHub integration is off.
 
     Returns:
         The seq assigned to this mutation.
@@ -262,6 +277,7 @@ def flip(
         if transition_phase is not None:
             phase_updates["phase"] = transition_phase
             phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        phase_log_suffix += _log_note_suffix(now, log_note)
 
         updated = md.update_frontmatter(
             content,
@@ -322,6 +338,7 @@ def advance(
     expected_colleague: str,
     resolve_phase: Callable[[dict], str],
     ts: Optional[str] = None,
+    log_note: str = "",
 ) -> AdvanceResult:
     """Check-and-set write for the single edge ``phase: peer -> phase: merge``
     (#3039 U2b).
@@ -345,6 +362,11 @@ def advance(
     unresolvable); it is supplied by the caller (it needs the pool-sentinel
     machinery that lives in the gate module) and may raise
     :class:`AdvanceRefused` itself.
+
+    ``log_note`` (#3568, default empty = no change to the log): a one-line note
+    appended to this advance's turn-log entries; the server passes it only when
+    GitHub integration is off, so the log records that the gate's verdicts were
+    ``unknown`` rather than leaving the advance looking verified.
 
     Known, stated limit: the GitHub verdict and this write are not one
     cross-system transaction -- a ``CHANGES_REQUESTED`` landing between them
@@ -390,6 +412,11 @@ def advance(
         phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, "peer", now)
         phase_updates["phase"] = "merge"
         phase_log_suffix += f"\n- {now} phase: 'merge' (transition)"
+        note = " ".join((log_note or "").split())  # one line, whatever the caller passed
+        if note:
+            # #3568: when the gate could not read GitHub (integration off), the log
+            # says so on its own line. Absent for an ordinary (verdict-bearing) advance.
+            phase_log_suffix += f"\n- {now} {note}"
         updated = md.update_frontmatter(
             content,
             {
@@ -662,6 +689,7 @@ def close(
     ts: Optional[str] = None,
     require_participant: bool = True,
     expected_anchor: Optional[str] = None,
+    log_note: str = "",
 ) -> int:
     """Pure write body of baton cmd_close / gc.
 
@@ -742,6 +770,7 @@ def close(
         if transition_phase is not None:
             phase_updates["phase"] = transition_phase
             phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        phase_log_suffix += _log_note_suffix(now, log_note)
 
         updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
         _, body = md.parse_frontmatter(updated)
@@ -765,6 +794,7 @@ def merge(
     ts: Optional[str] = None,
     require_participant: bool = True,
     expected_anchor: Optional[str] = None,
+    log_note: str = "",
 ) -> int:
     """Mark a project baton as merged and archive it; return the assigned seq.
 
@@ -865,6 +895,7 @@ def merge(
         else:
             log_line = f"- {now} merged via baton merge by {merged_by_n}"
         log_line += phase_log_suffix
+        log_line += _log_note_suffix(now, log_note)
 
         updated = md.update_frontmatter(content, {"status": "merged", **phase_updates})
         _, body = md.parse_frontmatter(updated)

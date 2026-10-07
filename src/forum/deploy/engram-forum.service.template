@@ -74,6 +74,7 @@ ExecStart={{FORUM_HOME}}/.venv/bin/python -m forum.server \
 # Bind 0.0.0.0 so same-LAN agents on other hosts can reach the forum. Canonical
 # DB pinned via --db; a refuse-start-on-other-DB guard is a tracked #738 follow-up.
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=3
 # Crash → restarts in 3s. Reboot → started by the [Install] target below
 # (requires linger for the admin user: `sudo loginctl enable-linger <admin>`).

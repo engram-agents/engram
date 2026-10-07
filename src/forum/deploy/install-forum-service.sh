@@ -49,6 +49,9 @@
 #                       being replaced already carries a github-token EnvironmentFile
 #                       line the installer REFUSES unless this flag is passed again,
 #                       so a re-install can never silently drop it.
+#                       Also renders `Environment=FORUM_GITHUB_INTEGRATION=on`; without
+#                       this flag the unit carries `=off` (GitHub integration is an
+#                       explicit server-side switch, #3568).
 #   --dry-run           print every action without executing (CI-safe)
 #   --no-start          install + enable but don't start
 #
@@ -411,14 +414,20 @@ _fill_baton_placeholder() {
   done
 }
 # The github-token EnvironmentFile line (#3283): the placeholder sits on a line of
-# its own; it becomes the one `EnvironmentFile=-PATH` line, or the whole line is
-# dropped when no --github-token-file was given. Same function shape, same reason.
+# its own; it becomes the one `EnvironmentFile=-PATH` line, or no EnvironmentFile line
+# when no --github-token-file was given. Same function shape, same reason.
+# #3568: it ALWAYS also yields an explicit `Environment=FORUM_GITHUB_INTEGRATION=`
+# line -- `on` with a token file, `off` without -- so a unit never leaves the
+# server's GitHub-integration switch to inference.
 _fill_token_placeholder() {
   local _line
   while IFS= read -r _line || [ -n "$_line" ]; do
     if [ "$_line" = "$_TOKEN_PLACEHOLDER" ]; then
       if [ -n "$GITHUB_TOKEN_FILE" ]; then
+        printf 'Environment=FORUM_GITHUB_INTEGRATION=on\n'
         printf 'EnvironmentFile=-%s\n' "$GITHUB_TOKEN_FILE"
+      else
+        printf 'Environment=FORUM_GITHUB_INTEGRATION=off\n'
       fi
     else
       printf '%s\n' "$_line"
@@ -435,6 +444,12 @@ RENDERED="$(sed '/>>>TEMPLATE-ONLY/,/<<<TEMPLATE-ONLY/d' "$SRC/src/forum/deploy/
     | _fill_token_placeholder)"
 if printf '%s\n' "$RENDERED" | grep -Eq '[{][{]|@@GITHUB_TOKEN'; then
   echo "ERROR: unsubstituted placeholders remain in the rendered unit" >&2; exit 2
+fi
+# #3568: the reverse guard. The check above catches a placeholder that SURVIVES; it
+# cannot catch a template that never carried the token placeholder at all (the render
+# then has no switch line and no error). A unit must state the switch explicitly.
+if [ "$(printf '%s\n' "$RENDERED" | grep -Ec '^Environment=FORUM_GITHUB_INTEGRATION=(on|off)$')" -ne 1 ]; then
+  echo "ERROR: the rendered unit must contain exactly one Environment=FORUM_GITHUB_INTEGRATION=(on|off) line (#3568); is @@GITHUB_TOKEN_ENVFILE_LINE@@ missing from the template?" >&2; exit 2
 fi
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "  [dry-run] sed TEMPLATE-ONLY strip + substitute {{FORUM_HOME}}→$SERVICE_DIR, {{PORT}}→$PORT"
