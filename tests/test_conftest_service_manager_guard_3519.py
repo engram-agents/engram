@@ -430,7 +430,10 @@ def test_c7_old_darwin_no_launchctl_cell_is_stopped_by_the_guard(
     assert ambient[0] == str(service_manager_shim_dir)
     path = ":".join([str(stub_dir), ambient[0], str(spy_dir), *ambient[1:]])
 
-    env = {**os.environ, "PATH": path, "HOME": str(fake_home), "ENGRAM_HOME": str(engram_home)}
+    env = {**os.environ, "PATH": path, "HOME": str(fake_home), "ENGRAM_HOME": str(engram_home),
+           # #3519 item 1: the script's own ephemeral-path refusal would fire first
+           # (temp/worktree daemon path); this cell tests the SHIM, so allow it.
+           "ENGRAM_SETUP_ALLOW_PATH": "1"}
     r = subprocess.run(["bash", str(SETUP_SCRIPT)], capture_output=True, text=True, env=env, timeout=10)
 
     out = r.stdout + r.stderr

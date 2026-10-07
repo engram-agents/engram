@@ -29,8 +29,33 @@
 #   ENGRAM_HOOKS_DIR — if set, skips auto-resolution and uses this directory
 #                      directly as HOOKS_DIR (also used by layer-b testing against
 #                      the real deployed bundle).
+#
+# Ephemeral-path refusal (#3519 item 1):
+#   The script REFUSES (exit 2, before writing any plist/unit and before calling
+#   launchctl/systemctl) when the physical, symlink-resolved path of
+#   engram-surface-daemon.py lies under a temp root (/tmp, /private/tmp,
+#   /var/tmp, /private/var/tmp, /var/folders, /private/var/folders, or $TMPDIR
+#   when set and non-empty) or contains a /.claude/worktrees/ component pair
+#   (agent/fairy worktrees). A service pointing at such a path outlives its
+#   directory and respawns forever (2026-10-03: 27,605 launchd respawns).
+#   Override, when you really mean it: pass --allow-path, or set
+#   ENGRAM_SETUP_ALLOW_PATH=1 (exactly 1). The script then prints one WARN line.
 
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Arguments — the only option is --allow-path; anything else is ignored, as it
+# always was.
+# ---------------------------------------------------------------------------
+ALLOW_PATH=0
+for _arg in "$@"; do
+    if [[ "$_arg" == "--allow-path" ]]; then
+        ALLOW_PATH=1
+    fi
+done
+if [[ "${ENGRAM_SETUP_ALLOW_PATH:-}" == "1" ]]; then
+    ALLOW_PATH=1
+fi
 
 # ---------------------------------------------------------------------------
 # Resolve script location and repo root (template source)
@@ -98,6 +123,78 @@ if [[ ! -f "$DAEMON_PY" ]]; then
     echo "       Run this script from within an engram-alpha repo clone or a" >&2
     echo "       plugin bundle where hooks/engram-surface-daemon.py exists." >&2
     exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Refuse an ephemeral daemon path (#3519 item 1) — BEFORE any OS branching,
+# plist/unit write, or launchctl/systemctl call.
+#
+# Physical resolution in plain bash (macOS bash 3.2: no readlink -f, no
+# realpath): follow a file symlink chain with plain `readlink`, then resolve the
+# directory with `cd ... && pwd -P`.
+# ---------------------------------------------------------------------------
+_physical_path() {
+    local p="$1" target n=0
+    while [[ -L "$p" && $n -lt 40 ]]; do
+        target="$(readlink "$p")"
+        if [[ "$target" == /* ]]; then
+            p="$target"
+        else
+            p="$(dirname "$p")/$target"
+        fi
+        n=$((n + 1))
+    done
+    local d b
+    d="$(dirname "$p")"
+    b="${p##*/}"
+    if d="$(cd "$d" 2>/dev/null && pwd -P)"; then
+        if [[ "$d" == "/" ]]; then
+            echo "/$b"
+        else
+            echo "$d/$b"
+        fi
+    else
+        echo "$p"
+    fi
+}
+
+_under_root() {
+    # $1 = path, $2 = root. Component-bounded prefix match. An empty root (or
+    # "/" once trailing slashes are stripped) matches nothing.
+    local path="$1" root="$2"
+    while [[ "$root" == */ ]]; do root="${root%/}"; done
+    [[ -n "$root" ]] || return 1
+    [[ "$path" == "$root" || "$path" == "$root"/* ]]
+}
+
+_ephemeral_reason() {
+    local path="$1" root
+    local roots=(/tmp /private/tmp /var/tmp /private/var/tmp /var/folders /private/var/folders)
+    if [[ -n "${TMPDIR:-}" ]]; then
+        roots+=("$TMPDIR")
+        roots+=("$(cd "$TMPDIR" 2>/dev/null && pwd -P || true)")
+    fi
+    for root in "${roots[@]}"; do
+        if _under_root "$path" "$root"; then
+            echo "it is under the temp directory $root"
+            return 0
+        fi
+    done
+    if [[ "$path/" == */.claude/worktrees/* ]]; then
+        echo "it is inside an agent/fairy worktree (.claude/worktrees)"
+        return 0
+    fi
+    return 1
+}
+
+DAEMON_REAL="$(_physical_path "$DAEMON_PY")"
+if _why="$(_ephemeral_reason "$DAEMON_REAL")"; then
+    if [[ "$ALLOW_PATH" == "1" ]]; then
+        echo "WARN: registering a service for an ephemeral daemon path $DAEMON_REAL ($_why); proceeding because --allow-path / ENGRAM_SETUP_ALLOW_PATH=1 was given." >&2
+    else
+        echo "ERROR: refusing to register a service for $DAEMON_REAL: ephemeral location ($_why); the service would respawn forever once that directory is deleted. Override with --allow-path or ENGRAM_SETUP_ALLOW_PATH=1." >&2
+        exit 2
+    fi
 fi
 
 # ---------------------------------------------------------------------------

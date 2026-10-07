@@ -421,6 +421,8 @@ class TestMissingToolErrors(unittest.TestCase):
                 "PATH": path_value,
                 "HOME": fake_home,
                 "ENGRAM_HOME": str(fake_engram_home),
+                # #3519 item 1: these cells run from temp dirs / worktrees.
+                "ENGRAM_SETUP_ALLOW_PATH": "1",
             }
             return subprocess.run(
                 ["bash", str(SETUP_SCRIPT)],
@@ -511,6 +513,8 @@ class TestHooksDirResolution(unittest.TestCase):
             "PATH": f"{stub_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
             "HOME": fake_home,
             "ENGRAM_HOME": fake_engram_home,
+            # #3519 item 1: these cells run from temp dirs / worktrees.
+            "ENGRAM_SETUP_ALLOW_PATH": "1",
         }
         # Always clear ENGRAM_HOOKS_DIR from inherited env unless caller sets it
         env.pop("ENGRAM_HOOKS_DIR", None)
