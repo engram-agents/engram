@@ -144,8 +144,8 @@ def _require_forum(config=None) -> None:
     """
     if not _is_forum_configured(config):
         print(
-            "baton: no forum configured (set forum.url or agent_name in "
-            "config.json); baton requires a configured forum.",
+            "baton: no forum configured (set forum.url in config.json); "
+            "baton requires a configured forum.",
             file=sys.stderr,
         )
         sys.exit(EXIT_STATE)
@@ -203,18 +203,24 @@ def _get_agent_name(config: Optional[dict] = None) -> str:
 
 
 def _is_forum_configured(config: Optional[dict] = None) -> bool:
-    """Return True if forum is explicitly configured (url or agent_name set).
+    """Return True if a forum is configured: ``forum.url`` is a non-empty string.
 
-    Gates write commands: if neither forum.url nor agent_name is in config,
-    baton refuses with an actionable message. Mirrors ia.py / the engram hook
-    helper.
+    Gates write commands: no ``forum.url`` -> baton refuses with an actionable
+    message (``status`` / ``show`` exit 0 silently). ``agent_name`` alone is
+    this agent's identity, not forum configuration, and does not pass the
+    gate. Total: any other shape (non-dict config or ``forum``, non-string or
+    blank ``url``) is "not configured" and never raises. Same rule as the
+    forum/baton/inter-agent prompt hooks, ``ia.py`` and ``engram_client.py``.
     """
     if config is None:
         config = _load_config()
-    forum_cfg = config.get("forum", {})
-    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
-    has_agent = bool(config.get("agent_name", "").strip())
-    return has_url or has_agent
+    if not isinstance(config, dict):
+        return False
+    forum_cfg = config.get("forum")
+    if not isinstance(forum_cfg, dict):
+        return False
+    url = forum_cfg.get("url")
+    return isinstance(url, str) and bool(url.strip())
 
 
 # ---------------------------------------------------------------------------

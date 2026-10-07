@@ -780,15 +780,20 @@ class TestForumConfiguredGate:
         raw = _make_raw_baton("PR-99")
         client = _make_client(post_return={"seq": 7}, get_return={"raw": raw})
         args = _ns(project_id="PR-99", to="ariadne", reason="done")
-        config_single_mode_with_forum = {"mode": "single", "agent_name": "borges"}
+        config_single_mode_with_forum = {
+            "mode": "single", "agent_name": "borges",
+            "forum": {"url": "http://test-forum:5002"},
+        }
 
         _baton.cmd_flip(args, config_single_mode_with_forum, "borges", client)
         client.post.assert_called_once()
 
     def test_is_forum_configured_reads_config(self):
-        """_is_forum_configured reads forum.url/agent_name, not the mode field."""
+        """_is_forum_configured reads forum.url (agent_name is identity, #3552), not the mode field."""
         assert _baton._is_forum_configured({"forum": {"url": "http://x:5002"}}) is True
-        assert _baton._is_forum_configured({"agent_name": "borges"}) is True
+        assert _baton._is_forum_configured(
+            {"agent_name": "borges", "forum": {"url": "http://x:5002"}}) is True
+        assert _baton._is_forum_configured({"agent_name": "borges"}) is False
         assert _baton._is_forum_configured({"mode": "multi"}) is False  # mode alone is not enough
         assert _baton._is_forum_configured({"mode": "single"}) is False
         assert _baton._is_forum_configured({}) is False  # default = not configured

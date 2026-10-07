@@ -324,7 +324,8 @@ def test_constant_is_shared_by_server_and_cli(world, capsys, monkeypatch):
                               turn=None, github="garbage", repo=None, colleague=None)
     client = MagicMock()
     with pytest.raises(SystemExit) as ei:
-        _baton.cmd_init(args, {"mode": "multi", "agent_name": "borges", "primary_user": "casey"},
+        _baton.cmd_init(args, {"mode": "multi", "agent_name": "borges", "primary_user": "casey",
+                                 "forum": {"url": "http://test-forum:5002"}},
                         "borges", client)
     assert ei.value.code == _baton.EXIT_VALIDATION
     client.post.assert_not_called()
@@ -345,7 +346,8 @@ def test_cli_refuses_empty_or_junk_github_on_non_pr_id_before_any_post(world, ca
                               turn=None, github=val, repo=None, colleague=None)
     client = MagicMock()
     with pytest.raises(SystemExit) as ei:
-        _baton.cmd_init(args, {"mode": "multi", "agent_name": "borges", "primary_user": "casey"},
+        _baton.cmd_init(args, {"mode": "multi", "agent_name": "borges", "primary_user": "casey",
+                                 "forum": {"url": "http://test-forum:5002"}},
                         "borges", client)
     assert ei.value.code == _baton.EXIT_VALIDATION
     client.post.assert_not_called()

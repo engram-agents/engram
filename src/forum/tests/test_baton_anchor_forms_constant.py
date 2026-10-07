@@ -37,7 +37,8 @@ if _TOOLS not in sys.path:
 from test_baton_advance_api import World, SENTINEL, AUTHOR, COLLEAGUE, REPO  # noqa: E402
 
 OLD_PHRASE = "Expected pr/"
-CFG = {"mode": "multi", "agent_name": "borges", "primary_user": "casey"}
+CFG = {"mode": "multi", "agent_name": "borges", "primary_user": "casey",
+       "forum": {"url": "http://test-forum:5002"}}
 RAW = "---\nproject_id: pool-x\ntitle: t\nturn: borges\nstatus: planning\n---\n\nbody\n"
 
 

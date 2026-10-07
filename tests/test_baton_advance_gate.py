@@ -753,7 +753,8 @@ def _args(**kw):
     return argparse.Namespace(**ns)
 
 
-_CFG = {"agent_name": "example-agent-colleague"}
+_CFG = {"agent_name": "example-agent-colleague",
+        "forum": {"url": "http://test-forum:5002"}}
 
 
 class TestCmdAdvance:

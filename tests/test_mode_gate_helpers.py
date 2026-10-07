@@ -179,7 +179,8 @@ class TestIsForumConfigured(unittest.TestCase):
     """Tests for engram_client.is_forum_configured() (#2857 step 1).
 
     Parallel to TestIsMultiAgentMode above, but the predicate is entirely
-    different: forum.url or agent_name set, independent of the mode field.
+    different: forum.url set (agent_name alone does not count, #3552),
+    independent of the mode field.
     """
 
     def _write_config(self, tmp_dir: Path, data: dict) -> Path:
@@ -196,14 +197,18 @@ class TestIsForumConfigured(unittest.TestCase):
                 self.assertTrue(engram_client.is_forum_configured())
 
     def test_agent_name_set_returns_true(self):
-        """agent_name set, mode='single' → True (mode is irrelevant)."""
+        """agent_name AND forum.url set, mode='single' → True (mode is irrelevant)."""
         with tempfile.TemporaryDirectory() as tmp:
-            self._write_config(Path(tmp), {"mode": "single", "agent_name": "ariadne"})
+            self._write_config(
+                Path(tmp),
+                {"mode": "single", "agent_name": "ariadne",
+                 "forum": {"url": "http://x:5002"}},
+            )
             with patch.dict(os.environ, {"ENGRAM_HOME": tmp}):
                 self.assertTrue(engram_client.is_forum_configured())
 
     def test_multi_mode_without_forum_or_agent_name_returns_false(self):
-        """mode='multi' alone, no forum.url/agent_name → False."""
+        """mode='multi' alone, no forum.url → False."""
         with tempfile.TemporaryDirectory() as tmp:
             self._write_config(Path(tmp), {"mode": "multi"})
             with patch.dict(os.environ, {"ENGRAM_HOME": tmp}):

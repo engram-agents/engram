@@ -80,8 +80,11 @@ EXIT_VALIDATION = 1
 EXIT_IO = 2
 EXIT_STATE = 3
 
+# A forum is configured by forum.url alone (#3552); agent_name is identity only.
+FORUM_CFG = {"url": "http://test-forum:5002"}
+
 # Config used for all multi-agent direct-call tests
-MULTI_CONFIG = {"mode": "multi", "agent_name": "borges", "primary_user": "casey"}
+MULTI_CONFIG = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG, "primary_user": "casey"}
 
 # Repo root, for tests that assert on shipped documentation surfaces.
 REPO_ROOT = Path(__file__).parent.parent
@@ -222,7 +225,8 @@ def _write_config(
     primary_user: str = "casey",
 ) -> None:
     """Write a minimal config.json into engram_home with mode=multi."""
-    cfg = {"mode": "multi", "agent_name": agent_name, "primary_user": primary_user}
+    cfg = {"mode": "multi", "agent_name": agent_name, "forum": FORUM_CFG,
+           "primary_user": primary_user}
     (engram_home / "config.json").write_text(json.dumps(cfg))
 
 
@@ -897,7 +901,7 @@ class TestSingleAgentGuard:
         assert "no forum configured" in captured.err
 
     def test_init_single_mode_with_agent_name_succeeds(self, capsys, monkeypatch):
-        """cmd_init with mode=single but agent_name set proceeds past the gate."""
+        """cmd_init with mode=single but forum.url set proceeds past the gate."""
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
 
@@ -908,7 +912,7 @@ class TestSingleAgentGuard:
             repo="engram-agents/engram-paper",
         )
         _baton.cmd_init(
-            args, {"mode": "single", "agent_name": "borges"}, "borges", client,
+            args, {"mode": "single", "agent_name": "borges", "forum": FORUM_CFG}, "borges", client,
         )
         client.post.assert_called()
 
@@ -3144,7 +3148,8 @@ class TestPoolSentinel:
         This is the core fresh-install correctness test from issue #606:
         a non-casey primary_user install must work end-to-end.
         """
-        alice_config = {"mode": "multi", "agent_name": "borges", "primary_user": "alice"}
+        alice_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "alice"}
         _write_config(engram_home, agent_name="borges", primary_user="alice")
         # _pool_sentinel() reads os.environ.get("ENGRAM_HOME") directly, not the
         # module-level constant.  Use setenv (not setattr) to redirect the config read.
@@ -3192,7 +3197,8 @@ class TestPoolSentinel:
         the raw config string, so a capitalized primary_user would silently
         fail all sentinel comparisons.  The fix applies .lower() in _pool_sentinel().
         """
-        alice_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alice"}
+        alice_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alice"}
         _write_config(engram_home, agent_name="borges", primary_user="Alice")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3237,7 +3243,8 @@ class TestPoolSentinel:
         but pools are often initialized with just the first token ('alex').
         _is_pool_sentinel must accept both forms.
         """
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alex Chen"}
         _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3283,7 +3290,8 @@ class TestPoolSentinel:
         with turn='alex' (short form, written by baton flip) would block merge
         with "turn is with lei — not presented for merge."
         """
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alex Chen"}
         _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3318,7 +3326,8 @@ class TestPoolSentinel:
         a PR's review at a NAMED maintainer agent (e.g. "kepler"), never
         the literal pool sentinel string. Pre-#2913, `_is_pool_sentinel`
         alone would refuse this exact, correct, real-world state."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Lei Shi"}
         _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3345,7 +3354,8 @@ class TestPoolSentinel:
         is still in review, not presented for merge -- must stay refused,
         same as it always has (the fix adds an exemption for NAMED
         maintainers, it does not turn Gate 2 into a rubber stamp)."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Lei Shi"}
         _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3372,7 +3382,8 @@ class TestPoolSentinel:
         colleague sent it back with a blocker -- must stay refused, not be
         read as merge-ready just because it isn't the literal colleague
         field either."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Lei Shi"}
         _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3412,7 +3423,8 @@ class TestPoolSentinel:
         the realistic shape (production writers never emit an empty
         `turn:` line) and the one that actually reaches Gate 2's
         `if not current_turn` branch cleanly."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Lei Shi"}
         _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3446,7 +3458,8 @@ class TestPoolSentinel:
         `gh pr merge --squash`, that's the most dangerous instance of the
         whole #1715 bug class. Prove the gate actually fires against the
         ANCHOR's repo, not just that some CI check happened."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alex Chen"}
         _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3478,7 +3491,8 @@ class TestPoolSentinel:
         number is a red flag worth refusing on, not silently picking one --
         this would otherwise be a way for a mismatched/stale anchor to merge
         the wrong PR entirely."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alex Chen"}
         _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3503,7 +3517,8 @@ class TestPoolSentinel:
         """The actual gate-5 `gh pr merge` invocation must carry --repo --
         this is the single most consequential call in the whole #1715 bug
         class (an irreversible squash-merge)."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alex Chen"}
         _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3543,7 +3558,8 @@ class TestPoolSentinel:
         irreversible `gh pr merge --squash`. Supersedes the old
         test_merge_bare_anchor_resolves_default_repo, which asserted the
         exact behavior this issue fixes."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alex Chen"}
         _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3574,7 +3590,8 @@ class TestPoolSentinel:
         """#1918: --force skips CI/approval quality gates (3-4), never the
         repo-identity gate -- it has never meant 'merge without knowing
         which repo'."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alex Chen"}
         _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3618,17 +3635,18 @@ class TestPoolSentinel:
         assert "no forum configured" in captured.err
 
     def test_missing_mode_with_forum_configured_succeeds_past_gate(self, capsys):
-        """cmd_claim with mode absent but agent_name set proceeds past the gate.
+        """cmd_claim with mode absent but forum.url set proceeds past the gate.
 
         Control case for the above: an otherwise-empty config with just
-        agent_name set is NOT held at the forum-configured gate — it reaches
+        forum.url (and agent_name) set is NOT held at the forum-configured gate — it reaches
         the project-ID validation instead (EXIT_VALIDATION, not EXIT_STATE).
         """
         client = _make_client()
         args = argparse.Namespace(project_id="badid")
 
         with pytest.raises(SystemExit) as exc_info:
-            _baton.cmd_claim(args, {"agent_name": "borges"}, "borges", client)
+            _baton.cmd_claim(args, {"agent_name": "borges", "forum": FORUM_CFG},
+                             "borges", client)
         assert exc_info.value.code == EXIT_VALIDATION
         captured = capsys.readouterr()
         assert "invalid project ID" in captured.err
@@ -4002,14 +4020,14 @@ class TestSetColleague:
         assert exc_info.value.code == EXIT_STATE
 
     def test_set_colleague_single_mode_with_agent_name_succeeds(self, capsys):
-        """set-colleague with mode=single but agent_name set proceeds past the gate."""
+        """set-colleague with mode=single but forum.url set proceeds past the gate."""
         client = _make_client(
             post_return={"seq": 6, "participant_added": True},
             get_return={"raw": _make_raw_baton("PR-707")},
         )
         args = argparse.Namespace(project_id="PR-707", colleague="alex")
         _baton.cmd_set_colleague(
-            args, {"mode": "single", "agent_name": "borges"}, "borges", client,
+            args, {"mode": "single", "agent_name": "borges", "forum": FORUM_CFG}, "borges", client,
         )
         client.post.assert_called()
 
@@ -6649,7 +6667,8 @@ class TestDoubleClaimRegressionEndToEnd:
         # Seed the bunch baton via the REAL `cmd_init` call, exactly as
         # `baton init pool-9910 --turn "lei shi" ...` would -- phase: pool,
         # turn at the pool sentinel.
-        real_config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        real_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         init_args = argparse.Namespace(
             project_id="pool-9910", title="a real bunch",
             participants="borges,ariadne", status="planning",
@@ -6950,7 +6969,8 @@ class TestRound4ConversionThenTransitionEndToEnd:
         # server-side gate needs a resolvable sentinel too (production servers have primary_user configured)
         import forum.server as _forum_server
         monkeypatch.setattr(_forum_server._load_baton_gate(), "_resolve_pool_sentinel", lambda *a, **kw: "lei shi")
-        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         self._seed(client, "pool-9840", _make_raw_baton(
             "pool-9840", turn="lei shi", participants="[borges, ariadne]",
         ))
@@ -6968,7 +6988,8 @@ class TestRound4ConversionThenTransitionEndToEnd:
         client = _real_forum_client(tmp_path)
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
-        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         self._seed(client, "pool-9841", _make_raw_baton(
             "pool-9841", turn="lei shi", participants="[borges, ariadne]", phase="pool",
         ))
@@ -7132,7 +7153,8 @@ class TestRound5LegacyConversionEndToEnd:
         client = _real_forum_client(tmp_path)
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
-        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         pid = "pool-9950"
         self._seed(client, pid, _make_raw_baton(
             pid, turn="borges", participants="[borges, ariadne]",
@@ -7153,7 +7175,8 @@ class TestRound5LegacyConversionEndToEnd:
         client = _real_forum_client(tmp_path)
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
-        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         pid = "pool-9951"
         self._seed(client, pid, _make_raw_baton(
             pid, turn="borges", participants="[borges, ariadne]", phase="claimed",
@@ -7173,7 +7196,8 @@ class TestRound5LegacyConversionEndToEnd:
         client = _real_forum_client(tmp_path)
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
-        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         monkeypatch.setenv("BATON_POOL_SENTINEL", "lei shi")
         pid = "PR-9952"
         self._seed(client, pid, _make_raw_baton(
@@ -7199,7 +7223,8 @@ class TestRound5LegacyConversionEndToEnd:
         client = _real_forum_client(tmp_path)
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
-        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         monkeypatch.setenv("BATON_POOL_SENTINEL", "lei shi")
         pid = "PR-9953"
         self._seed(client, pid, _make_raw_baton(
@@ -7225,7 +7250,8 @@ class TestRound5LegacyConversionEndToEnd:
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
         monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("green", "mergeStateStatus=CLEAN"))
         monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr, repo=None: ("fresh", "approved at current tip"))
-        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         monkeypatch.setenv("BATON_POOL_SENTINEL", "lei shi")
         # The SERVER mirrors cmd_flip's gate on a maintainer-role flip, through
         # its own loaded copy of baton_gate -- green-light that copy too.

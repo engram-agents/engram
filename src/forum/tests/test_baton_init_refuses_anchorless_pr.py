@@ -281,7 +281,8 @@ def test_two_route_hint_is_one_constant_in_both_surfaces(world, capsys, monkeypa
                               turn=None, github=None, repo=None, colleague=None)
     client = MagicMock()
     with pytest.raises(SystemExit) as ei:
-        _baton.cmd_init(args, {"mode": "multi", "agent_name": "borges", "primary_user": "casey"},
+        _baton.cmd_init(args, {"mode": "multi", "agent_name": "borges", "primary_user": "casey",
+                                 "forum": {"url": "http://test-forum:5002"}},
                         "borges", client)
     assert ei.value.code == _baton.EXIT_VALIDATION
     client.post.assert_not_called()

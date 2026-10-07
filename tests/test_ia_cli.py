@@ -187,14 +187,14 @@ class TestSmoke:
 
     def test_cursor_show_exits_0(self, engram_home):
         """ia cursor with no file → shows 0 and exits 0."""
-        _write_config(engram_home, "multi")
+        _write_config(engram_home, "multi", forum_url="http://localhost:1")
         rc, stdout, stderr = _run_ia(engram_home, "cursor", "--show")
         assert rc == 0
         assert "0" in stdout
 
     def test_cursor_set_exits_0(self, engram_home):
         """ia cursor --set 42 → exits 0, writes 42 to cursor file."""
-        _write_config(engram_home, "multi")
+        _write_config(engram_home, "multi", forum_url="http://localhost:1")
         rc, stdout, stderr = _run_ia(engram_home, "cursor", "--set", "42")
         assert rc == 0
         assert "42" in stdout
@@ -231,7 +231,7 @@ class TestSmoke:
 class TestModeGate:
     """No forum configured returns a clean error (exit 3) for all DM commands.
 
-    mode=single WITH forum.url/agent_name set now succeeds identically to
+    mode=single WITH forum.url set now succeeds identically to
     mode=multi (#2857 step 1) — the gate that actually matters is "is a
     forum configured", not the mode field.
     """
@@ -244,8 +244,8 @@ class TestModeGate:
         assert "inter-agent/README.md" in stderr
 
     def test_list_single_mode_with_forum_configured_proceeds_past_gate(self, engram_home):
-        """mode=single but agent_name set → list proceeds past the gate."""
-        _write_config(engram_home, "single", agent_name="ariadne")
+        """mode=single but forum.url set → list proceeds past the gate."""
+        _write_config(engram_home, "single", agent_name="ariadne", forum_url="http://localhost:1")
         rc, stdout, stderr = _run_ia(
             engram_home, "list",
             env_overrides={"FORUM_URL": "http://localhost:1"},
@@ -454,7 +454,7 @@ class TestWrite:
 
     def test_write_missing_to_fails(self, engram_home):
         """--to not provided → exit non-zero."""
-        _write_config(engram_home, "multi")
+        _write_config(engram_home, "multi", forum_url="http://localhost:1")
         rc, stdout, stderr = _run_ia(
             engram_home, "write", "--from-stdin",
             stdin_text="hello",
@@ -621,21 +621,21 @@ class TestCursor:
 
     def test_cursor_show_zero_when_no_file(self, engram_home):
         """ia cursor --show with no cursor file → shows 0."""
-        _write_config(engram_home, "multi")
+        _write_config(engram_home, "multi", forum_url="http://localhost:1")
         rc, stdout, stderr = _run_ia(engram_home, "cursor", "--show")
         assert rc == EXIT_OK
         assert "0" in stdout
 
     def test_cursor_set_integer(self, engram_home):
         """ia cursor --set 100 → writes 100 to file."""
-        _write_config(engram_home, "multi")
+        _write_config(engram_home, "multi", forum_url="http://localhost:1")
         rc, stdout, stderr = _run_ia(engram_home, "cursor", "--set", "100")
         assert rc == EXIT_OK
         assert _read_cursor(engram_home) == "100"
 
     def test_cursor_show_after_set(self, engram_home):
         """ia cursor shows the value written by --set."""
-        _write_config(engram_home, "multi")
+        _write_config(engram_home, "multi", forum_url="http://localhost:1")
         _run_ia(engram_home, "cursor", "--set", "42")
         rc, stdout, stderr = _run_ia(engram_home, "cursor", "--show")
         assert rc == EXIT_OK
@@ -643,7 +643,7 @@ class TestCursor:
 
     def test_cursor_show_existing_file(self, engram_home):
         """ia cursor reads existing cursor file."""
-        _write_config(engram_home, "multi")
+        _write_config(engram_home, "multi", forum_url="http://localhost:1")
         _write_cursor(engram_home, 999)
         rc, stdout, stderr = _run_ia(engram_home, "cursor", "--show")
         assert rc == EXIT_OK
@@ -651,14 +651,14 @@ class TestCursor:
 
     def test_cursor_set_invalid_value_fails(self, engram_home):
         """ia cursor --set 'not-an-int' → exit EXIT_VALIDATION."""
-        _write_config(engram_home, "multi")
+        _write_config(engram_home, "multi", forum_url="http://localhost:1")
         rc, stdout, stderr = _run_ia(engram_home, "cursor", "--set", "not-an-int")
         assert rc == EXIT_VALIDATION
         assert "integer" in stderr
 
     def test_cursor_write_no_tmp_remains(self, engram_home):
         """After cursor --set, no .tmp file remains in engram_home."""
-        _write_config(engram_home, "multi")
+        _write_config(engram_home, "multi", forum_url="http://localhost:1")
         _run_ia(engram_home, "cursor", "--set", "77")
         tmp_files = list(engram_home.glob("*.tmp"))
         assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
@@ -704,7 +704,7 @@ class TestMarkRead:
         forum reachable the command legitimately fails loud, and that is fine —
         what must not happen is the top-level-help-plus-mode-epilog output.
         """
-        _write_config(engram_home, "multi")
+        _write_config(engram_home, "multi", forum_url="http://localhost:1")
         rc, stdout, stderr = _run_ia(engram_home, "mr")
 
         combined = stdout + stderr
@@ -834,7 +834,7 @@ class TestLoudFail:
 
     def test_loud_fail_subprocess_unreachable(self, engram_home):
         """ia list against a refused port → non-zero exit + stderr."""
-        _write_config(engram_home, "multi")
+        _write_config(engram_home, "multi", forum_url="http://localhost:1")
         rc, stdout, stderr = _run_ia(
             engram_home, "list",
             env_overrides={"FORUM_URL": "http://localhost:1"},
