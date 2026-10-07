@@ -1485,6 +1485,10 @@
       "reason": "pytest configuration — dev test config, never shipped"
     },
     {
+      "path": "conftest.py",
+      "reason": "repo-root pytest conftest holding the one definition of the #3519 launchctl/systemctl guard shims, loaded for all three test roots (tests/, src/forum/tests/, tools/test_*.py) — dev test config, never shipped"
+    },
+    {
       "path": ".coveragerc",
       "reason": "coverage.py configuration for the #2774 coverage instrumentation (nightly.yml's --cov flags + tools/coverage-diff.sh) — dev/CI test config, never shipped"
     },

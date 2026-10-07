@@ -22,6 +22,9 @@ tools/borges_session_eval.py
 #     fixtures that intentionally embed scanner patterns, which would otherwise
 #     false-positive the scan-leaks gate. ---
 tests/
+# The repo-root pytest conftest (#3519 service-manager guard) only serves the excluded
+# test suites; a root conftest.py in the public snapshot would be an orphan.
+/conftest.py
 
 # --- CI / dev-policy workflows (private dev infra). Their gates reference tests/
 #     (excluded above) + the private repo's structure, so shipping them would show
