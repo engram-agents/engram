@@ -60,9 +60,14 @@ class TestRendering:
         assert "{{" not in body
 
     def test_path_is_not_dereferenced(self, tmp_path):
-        assert not __import__("os").path.exists(_TOKEN_FILE), "fixture assumption"
-        r, _, _ = _install(tmp_path, ["--github-token-file", _TOKEN_FILE])
+        # The fixture owns the path: absent by construction under tmp_path, never a
+        # host path (the forum host really has /etc/engram-forum/github-token.env, #3580).
+        absent = tmp_path / "nope" / "github-token.env"
+        assert not absent.exists(), "fixture assumption"
+        r, _, _ = _install(tmp_path, ["--github-token-file", str(absent)])
         assert r.returncode == 0, r.stdout + r.stderr
+        assert f"EnvironmentFile=-{absent}" in _noncomment(_rendered(r.stdout))
+        assert not absent.exists() and not absent.parent.exists(), "installer touched the path"
 
     def test_composes_with_the_login_map_flag(self, tmp_path):
         r, _, _ = _install(tmp_path, ["--baton-login-map", "/etc/engram-forum/baton-login-map.json",
