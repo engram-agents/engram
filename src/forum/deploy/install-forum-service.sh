@@ -503,6 +503,37 @@ else
   echo "==> --no-start: unit installed + enabled, NOT started (do the DB cutover, then: systemctl --user start $UNIT)"
 fi
 
+# forum.url for the ADMIN seat's own config (#3557). "Forum configured" means
+# config.json forum.url is a non-empty string, and this is the one place that
+# knows this host now has a forum on $PORT. All branching lives in the tool
+# (src/engram/tools/set_forum_url.py); a refusal or failure only WARNs with the
+# exact manual command and never changes this installer's exit status. Other
+# seats are told what to run; the LAN address is never guessed.
+# >>> forum-url-step
+_FU_TOOL="$SRC/src/engram/tools/set_forum_url.py"
+_FU_CFG="${ENGRAM_HOME:-$HOME/.engram}/config.json"
+_FU_LOCAL="http://localhost:$PORT"
+# Printed commands are shell-quoted (printf %q, fine in bash 3.2) so a path with
+# a space still pastes into a shell and runs; the real call below is quoted too.
+_FU_TOOL_Q="$(printf '%q' "$_FU_TOOL")"
+_FU_CFG_Q="$(printf '%q' "$_FU_CFG")"
+echo "==> Setting forum.url for the admin seat → $_FU_CFG"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  [dry-run] python3 $_FU_TOOL_Q $_FU_LOCAL --config $_FU_CFG_Q"
+else
+  _fu_rc=0
+  _fu_out="$(python3 "$_FU_TOOL" "$_FU_LOCAL" --config "$_FU_CFG" 2>&1)" || _fu_rc=$?
+  echo "    forum.url: ${_fu_out:-no output from the tool} (exit $_fu_rc)"
+  if [ "$_fu_rc" -ne 0 ]; then
+    echo "    WARN: forum.url was NOT set; the install itself succeeded. To set it by hand:" >&2
+    echo "      python3 $_FU_TOOL_Q $_FU_LOCAL --config $_FU_CFG_Q" >&2
+    echo "    (add --force to overwrite a different existing url)" >&2
+  fi
+fi
+echo "    Other seats on THIS host:       python3 $_FU_TOOL_Q http://localhost:$PORT"
+echo "    Seats on ANOTHER host (LAN):    python3 $_FU_TOOL_Q http://<this-host-address>:$PORT"
+# <<< forum-url-step
+
 echo "==> Done."
 echo "    Manage: systemctl --user {status,restart,stop} $UNIT  ·  Logs: journalctl --user -u $UNIT -f"
 echo "    Shared data: $SERVICE_DIR/forum.db (group $GROUP, group-writable)"

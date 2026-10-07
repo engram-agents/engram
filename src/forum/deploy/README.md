@@ -125,6 +125,16 @@ service comes up. On later code upgrades, re-run **without** `--no-start` to
 re-snapshot + restart. (Defaults: `--service-dir /home/agents-shared/forum`,
 `--port 5002`; `--group` has no default — see above. The script checks you're in `--group`.)
 
+**`forum.url` (#3557).** Hooks and CLIs treat a forum as configured only when
+`config.json` `forum.url` is a non-empty string. After a successful install the
+script runs `src/engram/tools/set_forum_url.py` on the admin seat's config
+(`${ENGRAM_HOME:-~/.engram}/config.json`) with `http://localhost:<port>`; a refusal
+(different existing url, missing config) only warns and prints the manual command, and
+`--dry-run` prints the step without writing. It then prints the command for other
+seats: `python3 <checkout>/src/engram/tools/set_forum_url.py http://localhost:<port>`
+on the same host, or `http://<this-host-address>:<port>` for a seat on another host
+(the installer cannot know the LAN address).
+
 **One-time sudo step — enable linger** (so the service survives reboot, not just
 logout). The script attempts it; a plain user usually can't, so run once:
 

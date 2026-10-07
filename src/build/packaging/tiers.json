@@ -631,6 +631,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/set_forum_url.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/_status_derive.py",
       "tier": "convenience"
     },
