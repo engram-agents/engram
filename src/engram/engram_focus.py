@@ -826,10 +826,16 @@ def _focus_swap_impl(save_as: str, load: str = "", description: str = "") -> str
             (now, load),
         )
         _set_active_set_name(load, conn)
-        # Bump both the outgoing and incoming node sets — swap is focus on both
-        swap_bump_ids = list(dict.fromkeys(active_ids + loaded))
-        if swap_bump_ids:
-            core._utility_reward(conn, swap_bump_ids, action="focus")
+        # Utility credit for both sets, but only the INCOMING (loaded / kept in
+        # focus) set restamps: "focus" restamps, "unfocus" does not -- removing
+        # a node from mind is not use.  An id in both sets is incoming.
+        incoming_ids = list(dict.fromkeys(loaded))
+        incoming_set = set(incoming_ids)
+        outgoing_ids = [n for n in dict.fromkeys(active_ids) if n not in incoming_set]
+        if outgoing_ids:
+            core._utility_reward(conn, outgoing_ids, action="unfocus")
+        if incoming_ids:
+            core._utility_reward(conn, incoming_ids, action="focus")
         conn.commit()
 
         return json.dumps({

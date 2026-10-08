@@ -154,7 +154,7 @@
       "key": "d8ae87a01e31523ab8daab4fc634e227cfdb00339c30995e50a0fe82f6b67be8",
       "sql": "SELECT utility_score FROM nodes WHERE id = ?",
       "sites": [
-        "hooks/claude/engram-utility-credit-mention-stop.py:bump_utility"
+        "engram_restamp.py:bump_utility"
       ]
     },
     {
@@ -192,8 +192,8 @@
     "hooks/claude/engram-surface-hook.py:_check_db_liveness"
   ],
   "write_sites": [
+    "engram_restamp.py:bump_utility",
     "hooks/claude/engram-surface-hook.py:_advance_person_moment_cursor",
-    "hooks/claude/engram-utility-credit-mention-stop.py:bump_utility",
     "hooks/claude/engram-utility-credit-mention-stop.py:bump_utility"
   ],
   "declared_out_of_scope": [

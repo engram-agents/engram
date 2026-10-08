@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import NamedTuple, Optional, Union
 from urllib.parse import urlparse
 
+import engram_restamp as _restamp  # noqa: E402
 from engram_confidence import (  # noqa: E402
     CONFIDENCE_MAP,
     PREDICTIVE_CONFIDENCE_CAP,
@@ -433,28 +434,11 @@ def _configure_paths(data_dir: str | Path) -> None:
     _walguard_disabled_logged = False
 
 
-USE_ALPHA = {
-    # Tier 1 — deep cognitive load
-    "derive":          0.15,
-    "supersede":       0.15,
-    "contradict":      0.15,
-    "resolve":         0.15,
-    "lesson_incident":   0.15,  # legacy key; preserved for backward-compat
-    "register_exemplar": 0.15,  # unified key (used by engram_register_exemplar)
-    # Tier 2 — moderate engagement
-    "inspect":         0.10,
-    "subgraph":        0.10,
-    "mention":         0.10,
-    "focus":           0.10,  # focus_swap also uses this key — both outgoing+incoming sets
-    "history":         0.10,
-    "citation":        0.10,
-    # Tier 3 — loose touch
-    "focus_load":      0.05,
-    "unfocus":         0.05,
-}
-
-
-USE_ALPHA_DEFAULT = 0.10  # Fallback for unknown actions
+# The use-action table, its default alpha and the Q-update live in the
+# lightweight engram_restamp module (shared with the mention Stop hook); these
+# are re-exports so no caller or server.py re-export changes.
+USE_ALPHA = _restamp.USE_ALPHA
+USE_ALPHA_DEFAULT = _restamp.USE_ALPHA_DEFAULT
 
 
 UTIL_BETA = 0.10
@@ -5243,14 +5227,7 @@ def _sanitize_fts_query_legacy(text: str) -> Optional[str]:
 
 def _get_memory_config() -> dict:
     """Get memory management config."""
-    if CONFIG_PATH.exists():
-        config = json.loads(CONFIG_PATH.read_text())
-        return config.get("memory", {
-            "decay_base": 1.014, "current_turn": 0,
-            "tier2_max_nodes": 1000,
-        })
-    return {"decay_base": 1.014, "current_turn": 0,
-            "tier2_max_nodes": 1000}
+    return _restamp.read_memory_config(CONFIG_PATH)
 
 
 def _get_current_turn() -> int:
@@ -5398,7 +5375,7 @@ def _compute_importance(base: float, turn: int, decay_base: float = None) -> flo
     """Compute importance score: base × a^turn."""
     if decay_base is None:
         decay_base = _get_memory_config().get("decay_base", 1.014)
-    return round(base * (decay_base ** turn), 6)
+    return _restamp.compute_importance(base, turn, decay_base)
 
 
 def _importance_base_for_node(
@@ -5677,38 +5654,29 @@ def _utility_reward(conn: sqlite3.Connection, node_ids: list[str], action: str) 
     (e.g. comma-split supporting_ids with the same node listed twice).
     Returns the count of nodes updated.
 
+    The sequence (bump, then restamp when the action is in
+    `engram_restamp.RESTAMP_ACTIONS`) is owned by `engram_restamp.use_reward`.
+    The restamp is decoration on a write: it must never abort or roll back the
+    write, nor lose the utility bump, so use_reward reads the memory config
+    inside a guard (lazily -- `_get_memory_config` is passed uncalled) and runs
+    the restamp in a SAVEPOINT; a failure of either comes back as
+    `restamp_error` and is logged here as a WARNING -- visible, never silent.
+
     Caller is responsible for committing the connection after this call
     returns — `_utility_reward` issues UPDATEs but does not commit. Direct
     callers (engram_inspect, engram_get_subgraph) commit explicitly;
     `_create_derivation` relies on `_derive_impl` / `_resolve_impl` to
     commit the surrounding transaction.
     """
-    if not node_ids:
-        return 0
-    # Dedup while preserving first-occurrence order so the bump is idempotent
-    # on duplicates within one call. Old recall_window-based model was
-    # immune via dict-key semantics; the action-keyed model has to enforce
-    # this explicitly at the bump boundary so every caller (existing or
-    # future) inherits the invariant.
-    deduped: list[str] = list(dict.fromkeys(node_ids))
-    alpha = USE_ALPHA.get(action, USE_ALPHA_DEFAULT)
-    updated = 0
-    for nid in deduped:
-        row = conn.execute(
-            "SELECT utility_score FROM nodes WHERE id = ?", (nid,)
-        ).fetchone()
-        if row is None:
-            continue
-        q_old = row["utility_score"] if isinstance(row, sqlite3.Row) else (row[0] or 0.0)
-        if q_old is None:
-            q_old = 0.0
-        q_new = round(q_old + alpha * (1.0 - q_old), 6)
-        conn.execute(
-            "UPDATE nodes SET utility_score = ? WHERE id = ?",
-            (q_new, nid),
+    result = _restamp.use_reward(
+        conn, node_ids, action, memory_config=_get_memory_config
+    )
+    if result.restamp_error:
+        logging.getLogger(__name__).warning(
+            "recall_turn restamp not applied for action=%s (%d node(s)): %s",
+            action, result.bumped, result.restamp_error,
         )
-        updated += 1
-    return updated
+    return result.bumped
 
 
 def _is_observation_node(conn: sqlite3.Connection, node_id: str) -> bool:

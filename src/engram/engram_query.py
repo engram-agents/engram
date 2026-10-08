@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Optional
 
 import engram_core as core
+import engram_restamp
 from engram_log_emitter import Emitter, emit_if_initialized
 
 # alpha #2574 WS5: engram_telemetry_store.py ships at tier=convenience (WS1's
@@ -895,24 +896,15 @@ def _get_min_queryable_importance(
 
 
 def _refresh_recall(conn: sqlite3.Connection, node_ids: list[str]):
-    """Re-stamp recalled nodes with current turn's importance."""
-    mem = core._get_memory_config()
-    turn = mem.get("current_turn", 0)
-    decay_base = mem.get("decay_base", 1.014)
-    for nid in node_ids:
-        row = conn.execute(
-            "SELECT importance_base, recall_count FROM nodes WHERE id = ?",
-            (nid,),
-        ).fetchone()
-        if row:
-            new_score = core._compute_importance(
-                row["importance_base"] or 0.5, turn, decay_base
-            )
-            conn.execute(
-                """UPDATE nodes SET importance_score = ?, recall_turn = ?,
-                   recall_count = ? WHERE id = ?""",
-                (new_score, turn, (row["recall_count"] or 0) + 1, nid),
-            )
+    """Re-stamp recalled nodes with current turn's importance.
+
+    The restamp formula lives in engram_restamp.restamp (shared with the
+    prose-mention Stop hook, which passes count_recall=False); deliberate
+    recall is the caller that also increments recall_count.
+    """
+    engram_restamp.restamp(
+        conn, node_ids, count_recall=True, memory_config=core._get_memory_config()
+    )
     conn.commit()
 
 

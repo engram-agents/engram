@@ -373,6 +373,8 @@
   "hooks/claude/engram-user-identity-hook.py:_truncate_name_for_head",
   "hooks/claude/engram-user-identity-hook.py:_assemble_response",
   "hooks/claude/engram-user-identity-hook.py:main",
+  "hooks/claude/engram-utility-credit-mention-stop.py:_mention_alpha",
+  "hooks/claude/engram-utility-credit-mention-stop.py:_mention_alpha_or_none",
   "hooks/claude/engram-utility-credit-mention-stop.py:bump_utility",
   "hooks/claude/engram-utility-credit-mention-stop.py:_log",
   "hooks/claude/engram-utility-credit-mention-stop.py:_is_real_user_message",
