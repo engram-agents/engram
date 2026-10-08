@@ -253,6 +253,24 @@ python "$SOURCE_DIR/tools/check-claude-md-drift.py" \
 diff "$SOURCE_DIR"/src/engram/templates/template.AGENTS.md /path/to/live/AGENTS.md
 ```
 
+**Does my LIVE file carry everything the template carries?** The base-to-head diff above cannot answer that: it cannot see a hunk an earlier rebuild skipped without merging, because every later range starts after that hunk and the seat looks clean (engram-alpha#3604). The live mode checks the live file directly against the rendered template, in one direction: every rendered template unit (heading, paragraph, list item, table row) must be present in the live file; only the missing ones are printed (first line plus its line in the rendered template); extras are ignored. It finds absence only: text inside a comment, fence or quote still counts as present. It never edits the file.
+
+```bash
+# Each Bash call is a fresh shell: re-derive everything here.
+SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
+HEAD_REF=$(grep '^alpha_sha=' ~/.engram/.deployed-version | cut -d= -f2-)
+# Needs a deploy whose tool has --live (engram-alpha#3604). An older tool does not say so: it fails with "the following arguments are required: --base".
+python3 "$SOURCE_DIR/tools/check-claude-md-drift.py" --help 2>&1 | grep -q -- '--live' || echo "STOP: the deployed check-claude-md-drift.py predates --live; rebuild from a tag that carries #3604 first"
+python3 "$SOURCE_DIR/tools/check-claude-md-drift.py" --repo "$SOURCE_DIR" --head "$HEAD_REF" \
+    --live ~/.claude/CLAUDE.md --user-name "<your user>" --agent-name "<your name>" \
+    --self-node-id "<your pn_ id>" --engram-home ~/.engram --seed-manifest ~/.engram/seed-manifest.json
+# Exit 0 = nothing missing; exit 1 = MISSING lines (merge or consciously decline each); exit 2 = input/render error (never read as "0 missing").
+```
+
+`--head` is the seat's DEPLOYED commit (`alpha_sha`), not the origin tip: the check asks what the template the seat actually deployed carries, and an origin tip may carry template changes the seat has not deployed yet, which would be reported as missing.
+
+Add `--multi-agent` to also check `template.CLAUDE.multi-agent.md` as its own paragraph set; hand-merged seats often reword or re-head those paragraphs, so expect false "missing" there.
+
 - Inverse-merge template-side additions that are identity- or discipline-forming into the live file; **preserve agent-local customizations** (the template is the floor, not the ceiling).
 - Mechanical change → just copy. Judgment-laden (new discipline, conflicts with local content) → surface the diff to the user and decide together.
 - Verify with grep-presence + a re-diff whose remaining hunks are each either (i) a local customization you're keeping or (ii) a template addition you deliberately declined.
