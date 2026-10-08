@@ -48,7 +48,13 @@
 #                       out of any group-readable shared tree, mode 0640). If the unit
 #                       being replaced already carries a github-token EnvironmentFile
 #                       line the installer REFUSES unless this flag is passed again,
-#                       so a re-install can never silently drop it.
+#                       so a re-install can never silently drop it. The line is looked
+#                       for in the main unit AND in the drop-ins of the user unit dir
+#                       (engram-forum.service.d/*.conf, #3593; never /etc or runtime
+#                       overrides), and a refusal names each file. A drop-in that sets
+#                       FORUM_GITHUB_INTEGRATION itself is warned about, not refused:
+#                       systemd applies drop-ins after the main unit, so it overrides
+#                       the value rendered here.
 #                       Also renders `Environment=FORUM_GITHUB_INTEGRATION=on`; without
 #                       this flag the unit carries `=off` (GitHub integration is an
 #                       explicit server-side switch, #3568).
@@ -56,7 +62,9 @@
 #                       the deliberate way to turn GitHub integration off on an
 #                       existing install (#3583). Renders `=off` and drops the
 #                       github-token EnvironmentFile line from the unit; the one line
-#                       it drops is named on stdout. It keeps the baton login map: a
+#                       it drops is named on stdout. It never edits drop-ins: a token line
+#                       in one stays loaded, and the notice names it as not removed.
+#                       It keeps the baton login map: a
 #                       unit that carries one still needs --baton-login-map again
 #                       (the map also backs a check that is not a GitHub read).
 #                       Cannot be combined with --github-token-file. `on` is not
@@ -217,6 +225,85 @@ fi
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT="engram-forum.service"
 _EXISTING_UNIT="$UNIT_DIR/$UNIT"
+# Drop-ins (#3593). The installer never edits <unit>.d/*.conf, but systemd loads them
+# on top of the main unit, so a github-token EnvironmentFile or a
+# FORUM_GITHUB_INTEGRATION value set there changes what the server sees. Same read
+# rules as _forum_home_dropin below: the user unit dir only (no /etc, no runtime
+# overrides, no systemctl), *.conf in name order, live (non-comment) lines, plain file
+# reads. Both are FUNCTIONS (macOS bash 3.2: case patterns stay out of $( ) bodies).
+# Print each drop-in file holding a live `EnvironmentFile=...github-token...` line.
+# An unreadable drop-in directory or *.conf is refused here (rc 2, ERROR on stderr,
+# before any write): a scan that silently saw nothing would let `=off` render over a
+# live token. Callers run this WITHOUT $( ) -- `_dropin_token_files "$u" || exit 2` --
+# so the refusal can end the script; the result is left in _DROPIN_TOKEN_LIST
+# (comma-separated, empty when none).
+_DROPIN_TOKEN_LIST=""
+_dropin_token_files() {
+  local _f _t _rc _d="$1.d"
+  _DROPIN_TOKEN_LIST=""
+  if [ -d "$_d" ] && { [ ! -r "$_d" ] || [ ! -x "$_d" ]; }; then
+    echo "ERROR: cannot read drop-in directory $_d; nothing was written. Fix its permissions and re-run." >&2
+    return 2
+  fi
+  for _f in "$_d"/*.conf; do
+    [ -f "$_f" ] || continue
+    if [ ! -r "$_f" ]; then
+      echo "ERROR: cannot read drop-in $_f; nothing was written. Fix its permissions and re-run." >&2
+      return 2
+    fi
+    # grep -v exits 1 when every line is a comment (fine); 2+ is a real read error.
+    _rc=0
+    _t="$(grep -v '^[[:space:]]*[#;]' "$_f")" || _rc=$?
+    if [ "$_rc" -gt 1 ]; then
+      echo "ERROR: cannot read drop-in $_f; nothing was written. Fix its permissions and re-run." >&2
+      return 2
+    fi
+    if printf '%s\n' "$_t" | grep -Eq -- '^[[:space:]]*EnvironmentFile[[:space:]]*=.*github-token'; then
+      if [ -n "$_DROPIN_TOKEN_LIST" ]; then _DROPIN_TOKEN_LIST="$_DROPIN_TOKEN_LIST, "; fi
+      _DROPIN_TOKEN_LIST="$_DROPIN_TOKEN_LIST$_f"
+    fi
+  done
+  return 0
+}
+# Print `<file> <value>` for each drop-in with a live Environment= line that assigns
+# FORUM_GITHUB_INTEGRATION, the last assignment winning (within a line and across the
+# lines of one file). Covers: spaces around `=`, several assignments on one line, and
+# plain or double-quoted words (`Environment="A=1" "FORUM_GITHUB_INTEGRATION=off"`).
+# NOT a systemd parser; out of scope: a word with spaces inside quotes, `\` line
+# continuations, single-quote and escape rules, and `%`-specifiers. Words are split on
+# whitespace only. Readability was already checked by _dropin_token_files.
+_dropin_switch_overrides() {
+  local _f _l _v _w _rest
+  local -a _words
+  local _re='^Environment[[:space:]]*=(.*)$'
+  for _f in "$1".d/*.conf; do
+    [ -f "$_f" ] || continue
+    _v=""
+    while IFS= read -r _l || [ -n "$_l" ]; do
+      _l="${_l%$'\r'}"
+      _l="${_l#"${_l%%[![:space:]]*}"}"
+      case "$_l" in
+        '#'*|';'*) continue ;;
+      esac
+      [[ "$_l" =~ $_re ]] || continue
+      _rest="${BASH_REMATCH[1]}"
+      _words=()
+      read -r -a _words <<< "$_rest" || true
+      for _w in ${_words[@]+"${_words[@]}"}; do
+        _w="${_w#[\"\']}"
+        case "$_w" in
+          FORUM_GITHUB_INTEGRATION=*)
+            _w="${_w#FORUM_GITHUB_INTEGRATION=}"
+            _w="${_w%[\"\']}"
+            _v="$_w"
+            ;;
+        esac
+      done
+    done < "$_f"
+    if [ -n "$_v" ]; then printf '%s %s\n' "$_f" "$_v"; fi
+  done
+  return 0
+}
 if [ -f "$_EXISTING_UNIT" ]; then
   _live="$(grep -v '^[[:space:]]*[#;]' "$_EXISTING_UNIT" || true)"
   _has_uid=0; _has_map=0
@@ -244,23 +331,52 @@ if [ -f "$_EXISTING_UNIT" ]; then
   # refuses every advance). Reads only, so it runs in --dry-run too.
   # #3583: `--github-integration off` is the deliberate way to drop it. It overrides
   # only THIS guard; the login-map guards above still fire. The dropped path is named.
-  if printf '%s\n' "$_live" | grep -Eq -- '^[[:space:]]*EnvironmentFile[[:space:]]*=.*github-token' && [ -z "$GITHUB_TOKEN_FILE" ]; then
+  # #3593: the token may also come from a drop-in in the user unit dir
+  # (<unit>.d/*.conf). The installer never edits drop-ins, so such a token stays
+  # loaded, but the switch value it renders must not be decided from the main unit
+  # alone: a drop-in token counts as "present" for this refusal, and the refusal
+  # names the file. Under `off` the drop-in is named as NOT removed.
+  _main_token=0
+  if printf '%s\n' "$_live" | grep -Eq -- '^[[:space:]]*EnvironmentFile[[:space:]]*=.*github-token'; then
+    _main_token=1
+  fi
+  _dropin_token_files "$_EXISTING_UNIT" || exit 2
+  _dropin_tokens="$_DROPIN_TOKEN_LIST"
+  if { [ "$_main_token" -eq 1 ] || [ -n "$_dropin_tokens" ]; } && [ -z "$GITHUB_TOKEN_FILE" ]; then
     if [ "$GITHUB_OFF" -eq 1 ]; then
-      # Name EVERY such line (comma-separated, one stdout line). Printed at guard
-      # time, so the wording says what the re-rendered unit WILL lack, not that a
-      # write already happened (a later refusal can still end the run unwritten).
-      _dropped="$(printf '%s\n' "$_live" | grep -E -- '^[[:space:]]*EnvironmentFile[[:space:]]*=.*github-token' \
-        | sed -E 's/^[[:space:]]*EnvironmentFile[[:space:]]*=[[:space:]]*//; s/["'"'"']//g; s/^-//; s/[[:space:]]+$//' \
-        | awk 'NR>1{printf ", "} {printf "%s", $0} END{print ""}')"
-      echo "==> --github-integration off: the re-rendered unit will not carry the github-token EnvironmentFile line(s): $_dropped (from $_EXISTING_UNIT)"
+      if [ "$_main_token" -eq 1 ]; then
+        # Name EVERY such line (comma-separated, one stdout line). Printed at guard
+        # time, so the wording says what the re-rendered unit WILL lack, not that a
+        # write already happened (a later refusal can still end the run unwritten).
+        _dropped="$(printf '%s\n' "$_live" | grep -E -- '^[[:space:]]*EnvironmentFile[[:space:]]*=.*github-token' \
+          | sed -E 's/^[[:space:]]*EnvironmentFile[[:space:]]*=[[:space:]]*//; s/["'"'"']//g; s/^-//; s/[[:space:]]+$//' \
+          | awk 'NR>1{printf ", "} {printf "%s", $0} END{print ""}')"
+        echo "==> --github-integration off: the re-rendered unit will not carry the github-token EnvironmentFile line(s): $_dropped (from $_EXISTING_UNIT)"
+      fi
+      if [ -n "$_dropin_tokens" ]; then
+        echo "==> --github-integration off: the installer did not remove the github-token EnvironmentFile line(s) in drop-in(s): $_dropin_tokens (it never edits drop-ins; they stay loaded, harmless while GitHub integration is off)"
+      fi
     else
-      echo "ERROR: $_EXISTING_UNIT already carries a github-token EnvironmentFile line; re-installing without" >&2
+      if [ "$_main_token" -eq 1 ] && [ -z "$_dropin_tokens" ]; then
+        echo "ERROR: $_EXISTING_UNIT already carries a github-token EnvironmentFile line; re-installing without" >&2
+      else
+        _where="$_dropin_tokens"
+        if [ "$_main_token" -eq 1 ]; then _where="$_EXISTING_UNIT, $_where"; fi
+        echo "ERROR: a github-token EnvironmentFile line is already present in: $_where; re-installing without" >&2
+      fi
       echo "       --github-token-file <path> would silently drop the gate's dedicated GitHub identity." >&2
       echo "       Nothing was written. Re-run with --github-token-file <path>," >&2
       echo "       or with --github-integration off to turn GitHub integration off on purpose." >&2
       exit 2
     fi
   fi
+  # #3593: a drop-in that sets FORUM_GITHUB_INTEGRATION itself overrides the value the
+  # installer renders (systemd applies drop-ins after the main unit). It is an explicit
+  # operator value, so it is warned about, never refused.
+  if [ -n "$GITHUB_TOKEN_FILE" ]; then _rendered_switch=on; else _rendered_switch=off; fi
+  _dropin_switch_overrides "$_EXISTING_UNIT" | while IFS=' ' read -r _of _ov; do
+    echo "WARNING: drop-in $_of sets FORUM_GITHUB_INTEGRATION=$_ov, which overrides the value this installer renders ($_rendered_switch): systemd applies drop-ins after the main unit."
+  done
 fi
 
 # ---------------------------------------------------------------------------

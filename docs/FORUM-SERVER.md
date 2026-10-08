@@ -319,10 +319,23 @@ The new unit carries `FORUM_GITHUB_INTEGRATION=off` and no token line. The
 installer prints the one line it dropped, with the token file's path. The token
 file itself is not touched. Without this flag, a re-run that leaves out
 `--github-token-file` still stops with an error and writes nothing, when the
-token line is in the main unit file under a file name that contains
-`github-token`. The guard reads only that file: a token set by a systemd
-drop-in, or by a hand-edited line with another file name, is not seen. The flag
-cannot be combined with `--github-token-file`.
+token line is in the main unit file or in a drop-in, under a file name that
+contains `github-token`. The guard reads the main unit and the drop-ins in the
+user unit directory (`~/.config/systemd/user/engram-forum.service.d/*.conf`).
+It does not read `/etc` or runtime overrides, and a hand-edited line with
+another file name is not seen. The error names each file that carries the line.
+With `--github-integration off`, a token line in a drop-in is not removed (the
+installer never edits drop-ins); the notice names the file. A drop-in that sets
+`FORUM_GITHUB_INTEGRATION` itself is warned about, not refused: systemd applies
+drop-ins after the main unit, so that value wins over the one the installer
+renders. The warning covers an `Environment=` line with spaces around `=`, with
+several assignments on one line, and with double-quoted words. It does not read
+a quoted word that contains spaces, a line continued with `\`, or `%`
+specifiers. If a drop-in file or the drop-in directory cannot be read, the
+installer stops with an error and writes nothing, rather than guess. An empty `EnvironmentFile=` line in a drop-in clears the main unit's
+token at load time. The installer still renders `on`, and the server then runs
+ON with the service user's own `gh` login, or fails its GitHub reads if there
+is none. The flag cannot be combined with `--github-token-file`.
 
 If the unit has a baton login map, pass `--baton-login-map` again as usual: `off`
 keeps the map, because the map also backs a check that is not a GitHub read.
