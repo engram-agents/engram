@@ -131,7 +131,9 @@ def _execstart(svc: Path, script: str | None = None, extra: str = "") -> str:
 def _install(tmp_path: Path, *, service_dir_arg: bool = True, dry_run: bool = False,
              no_start: bool = True, prep: bool = True, existing: dict | None = None,
              primary_group: str | None = None, group: str | None = "auto",
-             extra_args: tuple = (), svc_name: str = "forum") -> SimpleNamespace:
+             extra_args: tuple = (), svc_name: str = "forum",
+             service_dir_value: str | None = None, env_extra: dict | None = None,
+             cwd: Path | None = None) -> SimpleNamespace:
     home = tmp_path / "home"
     unit_dir = home / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
@@ -144,7 +146,7 @@ def _install(tmp_path: Path, *, service_dir_arg: bool = True, dry_run: bool = Fa
     stub, log = _stubs(tmp_path, primary_group)
     args = ["bash", str(INSTALLER), "--src", str(_REPO)]
     if service_dir_arg:
-        args += ["--service-dir", str(svc)]
+        args += ["--service-dir", service_dir_value if service_dir_value is not None else str(svc)]
     if group == "auto":
         group = _my_group()
     if group is not None:
@@ -155,7 +157,8 @@ def _install(tmp_path: Path, *, service_dir_arg: bool = True, dry_run: bool = Fa
         args.append("--no-start")
     args += list(extra_args)
     r = subprocess.run(args, capture_output=True, text=True,
-                       env=_hermetic_env(home, stub))
+                       env=_hermetic_env(home, stub, **(env_extra or {})), cwd=cwd,
+                       timeout=60)  # a hang is a red cell, not a stuck suite (#3600)
     return SimpleNamespace(r=r, home=home, unit_dir=unit_dir, svc=svc, log=log,
                            out=r.stdout, err=r.stderr, both=r.stdout + r.stderr)
 
@@ -848,8 +851,245 @@ class TestServiceDirCharacters3590:
         assert ctx.r.returncode == 0, ctx.both
         assert "backup unit ExecStart paths all exist" in ctx.out, ctx.out
 
-    @pytest.mark.parametrize("name", ["for-um", "for_um", "for.um", "for+um"])
+    @pytest.mark.parametrize("name", ["for-um", "for_um", "for.um", "for+um",
+                                      "for=um", "for,um", "for@um", "for:um"])
     def test_other_special_but_allowed_characters_still_install(self, tmp_path, name):
         ctx = _install(tmp_path, svc_name=name)
         assert ctx.r.returncode == 0, ctx.both
         assert "backup unit ExecStart paths all exist" in ctx.out, ctx.out
+
+
+# ---------------------------------------------------------------------------
+# #3600 -- --service-dir is an ALLOWLIST [A-Za-z0-9/._+=,@:-], absolute, no leading
+# dash; the same check on a FORUM_HOME reused from the existing unit. Written BEFORE
+# the implementation (contract-first). Design owner's ruling: issue #3600.
+# ---------------------------------------------------------------------------
+
+_ALLOWLIST_BAD = [
+    ("&", "amp"), ("|", "pipe"), ("\\", "backslash"), ("'", "squote"), ('"', "dquote"),
+    ("(", "lparen"), (")", "rparen"), ("#", "hash"), ("!", "bang"), ("~", "tilde"),
+    ("*", "star"), ("?", "qmark"), (" ", "space"), ("é", "e-acute"),
+]
+
+
+def _utf8_locale() -> str | None:
+    out = subprocess.run(["locale", "-a"], capture_output=True, text=True).stdout.split()
+    for n in out:
+        if re.search(r"utf-?8", n, re.I):
+            return n
+    return None
+
+
+class TestServiceDirAllowlist3600:
+
+    @pytest.mark.parametrize("ch", [c for c, _ in _ALLOWLIST_BAD],
+                             ids=[i for _, i in _ALLOWLIST_BAD])
+    @pytest.mark.parametrize("dry", [False, True], ids=["real", "dry-run"])
+    def test_character_outside_the_allowlist_is_refused_before_anything_is_written(
+            self, tmp_path, ch, dry):
+        ctx = _install(tmp_path, prep=False, dry_run=dry, no_start=False,
+                       svc_name=f"for{ch}um")
+        assert ctx.r.returncode == 2, ctx.both
+        # The echoed value already contains ch, so pin the message's own naming of it.
+        named = "contains a non-ASCII character" if ch == "é" else f"contains '{ch}'"
+        assert named in ctx.err and "--service-dir" in ctx.err, ctx.err
+        assert "Forum service dir" not in ctx.out
+        _assert_nothing_written(ctx)
+
+    @pytest.mark.parametrize("value", ["relforum", "./x", "-x", "-"],
+                             ids=["bare-relative", "dot-relative", "leading-dash", "lone-dash"])
+    @pytest.mark.parametrize("dry", [False, True], ids=["real", "dry-run"])
+    def test_relative_or_leading_dash_value_is_refused_at_the_flag(
+            self, tmp_path, value, dry):
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        ctx = _install(tmp_path, prep=False, dry_run=dry, no_start=False,
+                       service_dir_value=value, cwd=cwd)
+        assert ctx.r.returncode == 2, ctx.both
+        if value.startswith("-"):
+            assert "starts with '-'" in ctx.err, ctx.err
+        else:
+            assert "relative" in ctx.err, ctx.err
+        assert "Forum service dir" not in ctx.out
+        assert list(cwd.iterdir()) == [], "a relative dir was created"
+        _assert_nothing_written(ctx)
+
+    @pytest.mark.parametrize("ch", ["&", "|"], ids=["amp", "pipe"])
+    @pytest.mark.parametrize("dry", [False, True], ids=["real", "dry-run"])
+    def test_reused_forum_home_outside_the_allowlist_is_refused_naming_the_character(
+            self, tmp_path, ch, dry):
+        target = tmp_path / f"for{ch}um"
+        ctx = _install(tmp_path, service_dir_arg=False, prep=False, dry_run=dry,
+                       no_start=False,
+                       existing={MAIN: _MAIN_BASE.format(env=f"Environment=FORUM_HOME={target}")})
+        assert ctx.r.returncode == 2, ctx.both
+        assert f"'{ch}'" in ctx.err and "FORUM_HOME" in ctx.err, ctx.err
+        assert "Forum service dir" not in ctx.out
+        assert not target.exists()
+        files = {rel for rel, kind, _ in _digest(ctx.home) if kind != "dir"}
+        assert files == {f".config/systemd/user/{MAIN}"}, files
+        assert _log(ctx) == ""
+
+    @pytest.mark.parametrize("env_line", [
+        "Environment=FORUM_HOME=/srv/for um",
+        "Environment=FORUM_HOME=/srv/for'um",
+        'Environment=FORUM_HOME=/srv/for"um',
+    ], ids=["space", "squote", "dquote"])
+    @pytest.mark.parametrize("dry", [False, True], ids=["real", "dry-run"])
+    def test_reused_forum_home_with_whitespace_or_quote_gets_the_unparsable_refusal(
+            self, tmp_path, env_line, dry):
+        # _unit_forum_home prints nothing for these, so the reuse site never sees
+        # them: they take the existing 'no parsable FORUM_HOME' refusal (exit 2).
+        ctx = _install(tmp_path, service_dir_arg=False, prep=False, dry_run=dry,
+                       no_start=False, existing={MAIN: _MAIN_BASE.format(env=env_line)})
+        assert ctx.r.returncode == 2, ctx.both
+        assert "no parsable absolute Environment=FORUM_HOME" in ctx.err, ctx.err
+        assert "Forum service dir" not in ctx.out
+        files = {rel for rel, kind, _ in _digest(ctx.home) if kind != "dir"}
+        assert files == {f".config/systemd/user/{MAIN}"}, files
+        assert _log(ctx) == ""
+
+    def test_positive_control_the_live_shape_agents_shared_forum_passes(self, tmp_path):
+        root = tmp_path / "agents-shared" / "forum"
+        _prep_service_dir(root)
+        ctx = _install(tmp_path, prep=False, service_dir_value=str(root))
+        assert ctx.r.returncode == 0, ctx.both
+        assert "backup unit ExecStart paths all exist" in ctx.out, ctx.out
+
+    @pytest.mark.parametrize("loc", [
+        "C",
+        pytest.param(_utf8_locale(), marks=pytest.mark.skipif(
+            _utf8_locale() is None, reason="no UTF-8 locale in `locale -a` on this host")),
+    ], ids=["C", "utf8"])
+    def test_non_ascii_letter_is_refused_in_both_locales(self, tmp_path, loc):
+        ctx = _install(tmp_path, prep=False, no_start=False, svc_name="foréum",
+                       env_extra={"LC_ALL": loc})
+        assert ctx.r.returncode == 2, (loc, ctx.both)
+        assert "--service-dir" in ctx.err, ctx.err
+        assert "Forum service dir" not in ctx.out
+        _assert_nothing_written(ctx)
+
+
+# ---------------------------------------------------------------------------
+# #3600 follow-up -- a path component that is exactly '.' or '..' passes the
+# allowlist but renders a unit systemd refuses ("path is not normalized"). Only a
+# component EQUAL to '.' or '..' is refused. Written BEFORE the implementation.
+# ---------------------------------------------------------------------------
+
+_DOT_SHAPES = [("{t}/x/../y", "dotdot-mid", ".."), ("{t}/x/./y", "dot-mid", "."),
+               ("{t}/x/..", "dotdot-end", ".."), ("{t}/x/.", "dot-end", ".")]
+
+
+class TestDotComponents3600:
+
+    @pytest.mark.parametrize("shape,comp", [(s, c) for s, _, c in _DOT_SHAPES],
+                             ids=[i for _, i, _ in _DOT_SHAPES])
+    @pytest.mark.parametrize("dry", [False, True], ids=["real", "dry-run"])
+    def test_flag_with_a_dot_or_dotdot_component_is_refused_naming_it(
+            self, tmp_path, shape, comp, dry):
+        ctx = _install(tmp_path, prep=False, dry_run=dry, no_start=False,
+                       service_dir_value=shape.format(t=tmp_path))
+        assert ctx.r.returncode == 2, ctx.both
+        assert f"has a '.' or '..' path component ('{comp}')" in ctx.err, ctx.err
+        assert "--service-dir" in ctx.err
+        assert "Forum service dir" not in ctx.out
+        _assert_nothing_written(ctx)
+
+    @pytest.mark.parametrize("shape,comp", [(s, c) for s, _, c in _DOT_SHAPES],
+                             ids=[i for _, i, _ in _DOT_SHAPES])
+    @pytest.mark.parametrize("dry", [False, True], ids=["real", "dry-run"])
+    def test_reused_forum_home_with_a_dot_or_dotdot_component_is_refused(
+            self, tmp_path, shape, comp, dry):
+        target = shape.format(t=tmp_path)
+        ctx = _install(tmp_path, service_dir_arg=False, prep=False, dry_run=dry,
+                       no_start=False,
+                       existing={MAIN: _MAIN_BASE.format(env=f"Environment=FORUM_HOME={target}")})
+        assert ctx.r.returncode == 2, ctx.both
+        assert f"has a '.' or '..' path component ('{comp}')" in ctx.err, ctx.err
+        assert "FORUM_HOME" in ctx.err
+        assert "Forum service dir" not in ctx.out
+        files = {rel for rel, kind, _ in _digest(ctx.home) if kind != "dir"}
+        assert files == {f".config/systemd/user/{MAIN}"}, files
+        assert _log(ctx) == ""
+
+    @pytest.mark.parametrize("name", [".hidden", "..dots", "a.b", "x.."])
+    def test_positive_control_dotted_names_that_are_not_dot_components_install(
+            self, tmp_path, name):
+        ctx = _install(tmp_path, svc_name=name)
+        assert ctx.r.returncode == 0, ctx.both
+        assert "backup unit ExecStart paths all exist" in ctx.out, ctx.out
+
+    @pytest.mark.parametrize("kind", ["trailing-slash", "double-slash"])
+    def test_positive_control_trailing_or_double_slash_installs(self, tmp_path, kind):
+        val = f"{tmp_path}/forum/" if kind == "trailing-slash" else f"{tmp_path}//forum"
+        _prep_service_dir(tmp_path / "forum")
+        ctx = _install(tmp_path, prep=False, service_dir_value=val)
+        assert ctx.r.returncode == 0, ctx.both
+
+
+# ---------------------------------------------------------------------------
+# #3600 / bash 3.2: on stock macOS bash 3.2.57 `printf '%d' "'é"` returns a NEGATIVE
+# number (the first byte as a signed char; measured there by a colleague, not on this
+# host), where bash 5 returns 233. This host has no bash 3.2, so the cells shadow
+# `printf` with a FUNCTION that reports a chosen value for a non-ASCII argument and
+# delegates everything else to `builtin printf`. The non-ASCII argument is detected
+# under LC_ALL=C with `case "${2#\'}" in [!\ -~]*)` (a byte outside space..~), which
+# is plain pattern matching and bash 3.2-safe. Written BEFORE the fix.
+# ---------------------------------------------------------------------------
+
+_PRINTF_SHIM = r'''
+printf() {
+  if [ "$#" -eq 2 ] && [ "$1" = '%d' ]; then
+    case "${2#\'}" in
+      [!\ -~]*) builtin printf '%s\n' "$SHIM_NONASCII_CODE"; return 0 ;;
+      *) if [ -n "${SHIM_ASCII_CODE:-}" ]; then
+           builtin printf '%s\n' "$SHIM_ASCII_CODE"; return 0
+         fi ;;
+    esac
+  fi
+  builtin printf "$@"
+}
+'''
+
+
+def _refuse_under_shim(value: str, code: str, ascii_code: str = "") -> SimpleNamespace:
+    script = _extract_fn(INSTALLER, "_refuse_unrenderable_dir") + _PRINTF_SHIM + \
+        '\n_refuse_unrenderable_dir "$1" "--service-dir"\n'
+    env = dict(os.environ, LC_ALL="C", SHIM_NONASCII_CODE=code, SHIM_ASCII_CODE=ascii_code)
+    r = subprocess.run(["bash", "-c", script, "x", value], capture_output=True, env=env)
+    return SimpleNamespace(rc=r.returncode, err=r.stderr)
+
+
+# A real bash 3.2 returns the first byte as a signed char: ANY of -128..-1 for a
+# non-ASCII character. Pin the decision boundary on both sides, not at one value.
+_NEG_CODES = ["-1", "-26", "-61", "-128"]
+_POS_CODES = ["128", "233", "26085"]
+
+
+class TestNonAsciiMessageBash32_3600:
+
+    @pytest.mark.parametrize("value", ["/foréum", "/for日um"], ids=["e-acute", "ri"])
+    @pytest.mark.parametrize("code", _NEG_CODES + _POS_CODES,
+                             ids=[f"neg{c}" for c in _NEG_CODES] + [f"pos{c}" for c in _POS_CODES])
+    def test_non_ascii_is_named_as_such_whatever_value_printf_returns(self, value, code):
+        r = _refuse_under_shim(value, code)
+        assert r.rc == 2, r.err
+        assert b"contains a non-ASCII character" in r.err, r.err
+        assert b"contains '" not in r.err, ("raw byte/character named: " + repr(r.err))
+
+    @pytest.mark.parametrize("code", ["-61", "233"], ids=["negative-3.2", "positive-5"])
+    def test_an_ascii_character_still_prints_its_quoted_form_under_the_shim(self, code):
+        # '&' is ASCII, so the shim leaves its printf alone (real code 38).
+        r = _refuse_under_shim("/for&um", code)
+        assert r.rc == 2, r.err
+        assert b"contains '&'" in r.err, r.err
+        assert b"non-ASCII" not in r.err, r.err
+
+    @pytest.mark.parametrize("ascii_code", ["0", "38", "127"])
+    def test_an_ascii_character_with_a_code_up_to_127_stays_on_the_quoted_branch(
+            self, ascii_code):
+        # The upper edge of the ASCII side: code 127 is NOT > 127, 0 is NOT < 0.
+        r = _refuse_under_shim("/for&um", "-61", ascii_code)
+        assert r.rc == 2, r.err
+        assert b"contains '&'" in r.err, r.err
+        assert b"non-ASCII" not in r.err, r.err

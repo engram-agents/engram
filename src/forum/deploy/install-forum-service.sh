@@ -93,19 +93,50 @@ SRC=""
 START=1
 DRY_RUN=0
 
-# The installer must never render a unit shape its own kept-unit check would refuse
-# (#3590): a service dir holding ; $ or % lands in the rendered backup unit as a
-# token that check rejects. Refuse it before anything is written. `case` globs only
-# (macOS bash 3.2). $1 = the value, $2 = where it came from.
+# The installer must never render a shape it then refuses or breaks on (#3590, #3600):
+# the service dir is spliced into unit files by an unescaped sed, so only the class
+# [A-Za-z0-9/._+=,@:-] is accepted, and it must be absolute (systemd needs an absolute
+# WorkingDirectory=/ExecStart=) and must not lead with '-' (it reads as an option).
+# Refuse before anything is written. LOCALE: the class is spelled out letter by letter,
+# never as a range or [:alpha:], because ranges collate by locale; a non-ASCII letter
+# is refused in the C locale and in a UTF-8 one. `case` globs only (macOS bash 3.2).
+# $1 = the value, $2 = where it came from.
 _refuse_unrenderable_dir() {
-  local _c
-  for _c in ';' '$' '%'; do
-    case "$1" in
-      *"$_c"*)
-        echo "ERROR: $2 '$1' contains '$_c'; the service dir is rendered into unit files, where ';', '\$' and '%' are not supported. Nothing was written. Use a path without ';', '\$' or '%'." >&2
+  local _v="$1" _i=0 _c _o
+  case "$_v" in
+    -*) echo "ERROR: $2 '$_v' starts with '-', which reads as an option. Nothing was written. Use an absolute path." >&2
+        exit 2 ;;
+    /*) ;;
+    *)  echo "ERROR: $2 '$_v' is a relative path (or empty); a unit needs an absolute one. Nothing was written. Use an absolute path." >&2
+        exit 2 ;;
+  esac
+  while [ "$_i" -lt "${#_v}" ]; do
+    _c="${_v:$_i:1}"
+    case "$_c" in
+      [abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._+=,@:-]) ;;
+      *)
+        # A lone byte of a multibyte character (C locale) is not printable: name it
+        # as non-ASCII instead of emitting a broken fragment. bash 5 returns the code
+        # point (> 127); bash 3.2 returns the first byte as a NEGATIVE signed char
+        # (-61 for e-acute; measured on macOS 3.2.57 by a colleague, not on this host),
+        # so test both arms.
+        _o="$(printf '%d' "'$_c")"
+        if [ "$_o" -gt 127 ] || [ "$_o" -lt 0 ]; then _c="a non-ASCII character"; else _c="'$_c'"; fi
+        echo "ERROR: $2 '$_v' contains $_c; the service dir is rendered into unit files, so only letters, digits and / . _ + = , @ : - are accepted. Nothing was written. Use a path made of those." >&2
         exit 2 ;;
     esac
+    _i=$((_i + 1))
   done
+  # A component EXACTLY '.' or '..' renders a unit systemd refuses ("path is not
+  # normalized"); names merely containing dots (.hidden, ..dots, x..) are fine. The
+  # value is absolute here, so every component follows a '/'.
+  case "$_v" in
+    */./*|*/.)   _c="." ;;
+    */../*|*/..) _c=".." ;;
+    *) return 0 ;;
+  esac
+  echo "ERROR: $2 '$_v' has a '.' or '..' path component ('$_c'); systemd refuses a path that is not normalized. Nothing was written. Use a normalized absolute path." >&2
+  exit 2
 }
 
 while [ $# -gt 0 ]; do
