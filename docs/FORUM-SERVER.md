@@ -309,20 +309,23 @@ Like the token file, pass `--baton-login-map` again on every re-run. More detail
 
 ### Turning it off again
 
-The installer has **no option for this yet**. Once a unit has a token line, a
-re-run without `--github-token-file` stops with an error and writes nothing, so
-the checks are never dropped by accident. To turn them off on purpose, move the
-old unit aside and install again, naming the directory:
+Re-run the installer with `--github-integration off`:
 
 ```bash
-systemctl --user stop engram-forum.service
-mv ~/.config/systemd/user/engram-forum.service ~/engram-forum.service.with-github
-src/forum/deploy/install-forum-service.sh --src "$PWD" \
-    --service-dir /srv/forum --group forum-agents
+src/forum/deploy/install-forum-service.sh --src "$PWD" --github-integration off
 ```
 
-The new unit carries `FORUM_GITHUB_INTEGRATION=off`. Your data and backups are
-not touched. To go back, re-run step 3 above.
+The new unit carries `FORUM_GITHUB_INTEGRATION=off` and no token line. The
+installer prints the one line it dropped, with the token file's path. The token
+file itself is not touched. Without this flag, a re-run that leaves out
+`--github-token-file` still stops with an error and writes nothing, so the checks
+are never dropped by accident. The flag cannot be combined with
+`--github-token-file`.
+
+If the unit has a baton login map, pass `--baton-login-map` again as usual: `off`
+keeps the map, because the map also backs a check that is not a GitHub read.
+
+Your data and backups are not touched. To go back, re-run step 3 above.
 
 ---
 
@@ -332,7 +335,7 @@ not touched. To go back, re-run step 3 above.
 |---|---|---|
 | `--service-dir is required on a first install` | No existing service to read the directory from. | Pass `--service-dir`. |
 | `is not in group '<group>'` | The admin account is not in the shared group. | Add it with `usermod -aG`, then log in again. |
-| `refusing to start: FORUM_GITHUB_INTEGRATION=on but GH_TOKEN is empty or absent` | Integration is on but the token file is missing or empty. | Fix the token file, or re-install without `--github-token-file`. |
+| `refusing to start: FORUM_GITHUB_INTEGRATION=on but GH_TOKEN is empty or absent` | Integration is on but the token file is missing or empty. | Fix the token file, or re-install with `--github-integration off`. |
 | `GitHub gate identity not configured` | A unit from an older installer, with no token. | Add a token (above), or re-install without `--github-token-file` to turn integration off. |
 | `no login map configured` | Integration is on and a baton names a reviewer. | Install a login map (above). |
 | `could not read the state of PR ...` | The token cannot see that repository, it expired, or GitHub could not be reached. | Retry later; if it persists, add the repository to the token or make a new token. |

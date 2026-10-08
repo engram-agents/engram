@@ -52,6 +52,15 @@
 #                       Also renders `Environment=FORUM_GITHUB_INTEGRATION=on`; without
 #                       this flag the unit carries `=off` (GitHub integration is an
 #                       explicit server-side switch, #3568).
+#   --github-integration off
+#                       the deliberate way to turn GitHub integration off on an
+#                       existing install (#3583). Renders `=off` and drops the
+#                       github-token EnvironmentFile line from the unit; the one line
+#                       it drops is named on stdout. It keeps the baton login map: a
+#                       unit that carries one still needs --baton-login-map again
+#                       (the map also backs a check that is not a GitHub read).
+#                       Cannot be combined with --github-token-file. `on` is not
+#                       accepted: --github-token-file already means on.
 #   --dry-run           print every action without executing (CI-safe)
 #   --no-start          install + enable but don't start
 #
@@ -68,6 +77,7 @@ GROUP=""
 BATON_MAP=""
 BATON_UIDS=""   # space-separated, validated integers
 GITHUB_TOKEN_FILE=""
+GITHUB_OFF=0     # --github-integration off (#3583)
 SRC=""
 START=1
 DRY_RUN=0
@@ -113,6 +123,16 @@ while [ $# -gt 0 ]; do
         *) echo "ERROR: --github-token-file's file name must contain 'github-token' (got '$GITHUB_TOKEN_FILE'); the re-install guard keys on that name, so any other name could be dropped silently" >&2; exit 2 ;;
       esac
       shift 2 ;;
+    --github-integration)
+      if [ $# -lt 2 ]; then
+        echo "ERROR: --github-integration needs a value; the only one accepted is 'off'" >&2; exit 2
+      fi
+      case "$2" in
+        off) GITHUB_OFF=1 ;;
+        on) echo "ERROR: --github-integration on is not accepted: --github-token-file <path> already means on" >&2; exit 2 ;;
+        *) echo "ERROR: --github-integration must be 'off' (got '$2')" >&2; exit 2 ;;
+      esac
+      shift 2 ;;
     --dry-run)      DRY_RUN=1; shift ;;
     --no-start)     START=0; shift ;;
     -h|--help)
@@ -120,6 +140,9 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+if [ "$GITHUB_OFF" -eq 1 ] && [ -n "$GITHUB_TOKEN_FILE" ]; then
+  echo "ERROR: --github-integration off contradicts --github-token-file (a token file means integration on); pass one of them" >&2; exit 2
+fi
 if [ -n "$BATON_UIDS" ] && [ -z "$BATON_MAP" ]; then
   echo "ERROR: --baton-login-map-admin-uid requires --baton-login-map" >&2; exit 2
 fi
@@ -219,11 +242,24 @@ if [ -f "$_EXISTING_UNIT" ]; then
   # EnvironmentFile= line naming a github-token file must be re-supplied, or the
   # re-rendered unit would lose the gate's dedicated identity (the gate then
   # refuses every advance). Reads only, so it runs in --dry-run too.
+  # #3583: `--github-integration off` is the deliberate way to drop it. It overrides
+  # only THIS guard; the login-map guards above still fire. The dropped path is named.
   if printf '%s\n' "$_live" | grep -Eq -- '^[[:space:]]*EnvironmentFile[[:space:]]*=.*github-token' && [ -z "$GITHUB_TOKEN_FILE" ]; then
-    echo "ERROR: $_EXISTING_UNIT already carries a github-token EnvironmentFile line; re-installing without" >&2
-    echo "       --github-token-file <path> would silently drop the gate's dedicated GitHub identity." >&2
-    echo "       Nothing was written. Re-run with --github-token-file <path>." >&2
-    exit 2
+    if [ "$GITHUB_OFF" -eq 1 ]; then
+      # Name EVERY such line (comma-separated, one stdout line). Printed at guard
+      # time, so the wording says what the re-rendered unit WILL lack, not that a
+      # write already happened (a later refusal can still end the run unwritten).
+      _dropped="$(printf '%s\n' "$_live" | grep -E -- '^[[:space:]]*EnvironmentFile[[:space:]]*=.*github-token' \
+        | sed -E 's/^[[:space:]]*EnvironmentFile[[:space:]]*=[[:space:]]*//; s/["'"'"']//g; s/^-//; s/[[:space:]]+$//' \
+        | awk 'NR>1{printf ", "} {printf "%s", $0} END{print ""}')"
+      echo "==> --github-integration off: the re-rendered unit will not carry the github-token EnvironmentFile line(s): $_dropped (from $_EXISTING_UNIT)"
+    else
+      echo "ERROR: $_EXISTING_UNIT already carries a github-token EnvironmentFile line; re-installing without" >&2
+      echo "       --github-token-file <path> would silently drop the gate's dedicated GitHub identity." >&2
+      echo "       Nothing was written. Re-run with --github-token-file <path>," >&2
+      echo "       or with --github-integration off to turn GitHub integration off on purpose." >&2
+      exit 2
+    fi
   fi
 fi
 
