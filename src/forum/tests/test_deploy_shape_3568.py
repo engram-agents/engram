@@ -131,11 +131,11 @@ def _execstart(svc: Path, script: str | None = None, extra: str = "") -> str:
 def _install(tmp_path: Path, *, service_dir_arg: bool = True, dry_run: bool = False,
              no_start: bool = True, prep: bool = True, existing: dict | None = None,
              primary_group: str | None = None, group: str | None = "auto",
-             extra_args: tuple = ()) -> SimpleNamespace:
+             extra_args: tuple = (), svc_name: str = "forum") -> SimpleNamespace:
     home = tmp_path / "home"
     unit_dir = home / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
-    svc = tmp_path / "forum"
+    svc = tmp_path / svc_name
     if prep:
         _prep_service_dir(svc)
     for name, text in (existing or {}).items():
@@ -756,3 +756,100 @@ class TestForumHomeInDropin3579:
     def test_the_dropin_detector_is_byte_identical_in_both_scripts(self):
         assert (_extract_fn(INSTALLER, "_forum_home_dropin")
                 == _extract_fn(DRIFT, "_forum_home_dropin"))
+
+
+# ---------------------------------------------------------------------------
+# #3590 -- (A) a flag value that is another flag is refused; (B) a --service-dir
+# holding ; $ or % is refused at argument parsing, before anything is written.
+# Written BEFORE the implementation (contract-first).
+# ---------------------------------------------------------------------------
+
+class TestFlagFollowedByFlag3590:
+
+    @pytest.mark.parametrize("exec_line,flag", [
+        ("/bin/sh /bin/sh --db --audit /x", "--db"),
+        ("/bin/sh /bin/sh --backup-dir --db /x", "--backup-dir"),
+        ("/bin/sh /bin/sh --audit --db /x", "--audit"),
+        ("/bin/sh /bin/sh --db --backup-dir", "--db"),
+    ], ids=["db-audit", "backup-db", "audit-db", "db-then-flag-last"])
+    def test_space_form_with_a_flag_as_value_is_refused_naming_the_flag(
+            self, tmp_path, exec_line, flag):
+        c = _check(tmp_path, _unit_with_exec(exec_line))
+        assert not c.passed and c.r.returncode == 2, c.both
+        assert flag in c.r.stderr, c.both
+
+    @pytest.mark.parametrize("exec_line,flag", [
+        ("/bin/sh /bin/sh --db=-x", "--db"),
+        ("/bin/sh /bin/sh --backup-dir=--audit", "--backup-dir"),
+        ("/bin/sh /bin/sh --audit=-", "--audit"),
+    ], ids=["db", "backup-dir", "audit"])
+    def test_equals_form_with_a_value_starting_with_dash_is_refused(
+            self, tmp_path, exec_line, flag):
+        c = _check(tmp_path, _unit_with_exec(exec_line))
+        assert not c.passed and c.r.returncode == 2, c.both
+        assert flag in c.r.stderr, c.both
+
+    def test_positive_control_live_unit_shape_passes(self, tmp_path):
+        assert _check(tmp_path, _live_unit(tmp_path / "forum", joiner=" \\\n    ")).passed
+
+    def test_positive_control_equals_form_with_absolute_paths_passes(self, tmp_path):
+        assert _check(tmp_path, _live_unit(tmp_path / "forum", eq=True)).passed
+
+    def test_positive_control_percent_h_value_passes(self, tmp_path):
+        u = _unit_with_exec(f"%h/bin/py %h/tools/s.py --db {tmp_path}/forum/forum.db "
+                            "--audit %h/audit.jsonl")
+        assert _check(tmp_path, u, home_files=("bin/py", "tools/s.py")).passed
+
+
+_BAD_CHARS = [";", "$", "%"]
+_BAD_IDS = ["semicolon", "dollar", "percent"]
+
+
+def _assert_nothing_written(ctx, allowed_files=()):
+    """The helper pre-creates empty home dirs and any `existing` units; a refusal
+    must add no file anywhere, create no service dir, and run no command."""
+    assert not ctx.svc.exists(), f"service dir was created: {ctx.svc}"
+    files = {rel for rel, kind, _ in _digest(ctx.home) if kind != "dir"}
+    assert files == set(allowed_files), files
+    assert _log(ctx) == ""
+
+
+class TestServiceDirCharacters3590:
+
+    @pytest.mark.parametrize("ch", _BAD_CHARS, ids=_BAD_IDS)
+    @pytest.mark.parametrize("dry", [False, True], ids=["real", "dry-run"])
+    def test_flag_value_with_the_character_is_refused_before_anything_is_written(
+            self, tmp_path, ch, dry):
+        ctx = _install(tmp_path, prep=False, dry_run=dry, no_start=False,
+                       svc_name=f"for{ch}um")
+        assert ctx.r.returncode == 2, ctx.both
+        assert ch in ctx.err and "--service-dir" in ctx.err, ctx.err
+        assert "Forum service dir" not in ctx.out
+        _assert_nothing_written(ctx)
+
+    @pytest.mark.parametrize("ch", _BAD_CHARS, ids=_BAD_IDS)
+    @pytest.mark.parametrize("dry", [False, True], ids=["real", "dry-run"])
+    def test_reused_forum_home_with_the_character_is_refused_naming_the_unit(
+            self, tmp_path, ch, dry):
+        target = tmp_path / f"for{ch}um"
+        ctx = _install(tmp_path, service_dir_arg=False, prep=False, dry_run=dry,
+                       no_start=False,
+                       existing={MAIN: _MAIN_BASE.format(env=f"Environment=FORUM_HOME={target}")})
+        assert ctx.r.returncode == 2, ctx.both
+        assert ch in ctx.err and "FORUM_HOME" in ctx.err, ctx.err
+        assert "Forum service dir" not in ctx.out
+        assert not target.exists()
+        files = {rel for rel, kind, _ in _digest(ctx.home) if kind != "dir"}
+        assert files == {f".config/systemd/user/{MAIN}"}, files
+        assert _log(ctx) == ""
+
+    def test_positive_control_plain_path_renders_and_passes_its_own_check(self, tmp_path):
+        ctx = _install(tmp_path)
+        assert ctx.r.returncode == 0, ctx.both
+        assert "backup unit ExecStart paths all exist" in ctx.out, ctx.out
+
+    @pytest.mark.parametrize("name", ["for-um", "for_um", "for.um", "for+um"])
+    def test_other_special_but_allowed_characters_still_install(self, tmp_path, name):
+        ctx = _install(tmp_path, svc_name=name)
+        assert ctx.r.returncode == 0, ctx.both
+        assert "backup unit ExecStart paths all exist" in ctx.out, ctx.out

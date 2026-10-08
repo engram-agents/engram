@@ -90,10 +90,28 @@ SRC=""
 START=1
 DRY_RUN=0
 
+# The installer must never render a unit shape its own kept-unit check would refuse
+# (#3590): a service dir holding ; $ or % lands in the rendered backup unit as a
+# token that check rejects. Refuse it before anything is written. `case` globs only
+# (macOS bash 3.2). $1 = the value, $2 = where it came from.
+_refuse_unrenderable_dir() {
+  local _c
+  for _c in ';' '$' '%'; do
+    case "$1" in
+      *"$_c"*)
+        echo "ERROR: $2 '$1' contains '$_c'; the service dir is rendered into unit files, where ';', '\$' and '%' are not supported. Nothing was written. Use a path without ';', '\$' or '%'." >&2
+        exit 2 ;;
+    esac
+  done
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --src)          SRC="$2"; shift 2 ;;
-    --service-dir)  SERVICE_DIR="$2"; shift 2 ;;
+    --service-dir)
+      SERVICE_DIR="$2"
+      _refuse_unrenderable_dir "$SERVICE_DIR" "--service-dir"
+      shift 2 ;;
     --port)         PORT="$2"; shift 2 ;;
     --admin-user)   ADMIN_USER="$2"; shift 2 ;;
     --group)        GROUP="$2"; shift 2 ;;
@@ -442,6 +460,7 @@ if [ -z "$SERVICE_DIR" ]; then
     echo "       service dir cannot be reused. Nothing was written. Pass --service-dir <dir> explicitly." >&2
     exit 2
   fi
+  _refuse_unrenderable_dir "$SERVICE_DIR" "FORUM_HOME of the existing unit $_EXISTING_UNIT:"
   echo "==> --service-dir not given; reusing FORUM_HOME=$SERVICE_DIR from $_EXISTING_UNIT"
 fi
 
@@ -850,6 +869,9 @@ _check_backup_exec_paths() {
       esac
       if [ -n "$_flag" ]; then
         [ -n "$_val" ] || _bce_fail "ExecStart $_flag has no value (nothing follows it), so its target cannot be checked: $_cmd"
+        case "$_val" in
+          -*) _bce_fail "ExecStart $_flag value '$_val' starts with '-', so it is another flag and not a path, and its target cannot be checked: $_cmd" ;;
+        esac
         _val="${_val//\%h/$HOME}"
         case "$_val" in
           /*)
