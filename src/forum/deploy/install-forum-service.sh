@@ -963,11 +963,15 @@ RUN systemctl --user enable "$UNIT"
 
 if [ "$START" -eq 1 ]; then
   echo "==> Starting service"
+  # Captured BEFORE the restart, in the form `journalctl --since` accepts: the post-gate
+  # journal read below must show THIS run's startup line, never a previous run's (#3597).
+  _restart_ts="$(date '+%Y-%m-%d %H:%M:%S')" || _restart_ts=""
   RUN systemctl --user restart "$UNIT"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "  [dry-run] health check: curl http://127.0.0.1:${PORT}/health"
     echo "  [dry-run] verify-only:  $VENV/bin/python -m forum.server --db $SERVICE_DIR/forum.db --audit $SERVICE_DIR/forum-audit.jsonl --verify-only"
+    echo "  [dry-run] GitHub integration: journalctl --user -u $UNIT --since \"<restart time>\" -o cat | grep '^\\[forum\\] GitHub integration:' | tail -1"
   else
     sleep 2
     systemctl --user --no-pager status "$UNIT" | head -6 || true
@@ -1006,6 +1010,23 @@ if [ "$START" -eq 1 ]; then
     else
       echo "ERROR: verify-only probe returned non-zero — dep check failed; service may be degraded." >&2
       exit 2
+    fi
+
+    # The probe above cannot say whether GitHub integration is on: it runs in THIS
+    # shell, not with the unit's environment (#3597). The running service logs its own
+    # line at startup (before it listens, so gate 1 passing means it is already in the
+    # journal); show that one, from this run's restart on. Best effort: it NEVER fails
+    # the install -- journalctl missing, failing, or no line yet all fall back to a
+    # pointer. `|| true` keeps the pipeline clear of set -e / pipefail.
+    _gh_line=""
+    if command -v journalctl >/dev/null 2>&1; then
+      _gh_line="$(journalctl --user -u "$UNIT" --since "$_restart_ts" -o cat 2>/dev/null \
+        | grep '^\[forum\] GitHub integration:' | tail -1 || true)"
+    fi
+    if [ -n "$_gh_line" ]; then
+      echo "==> GitHub integration (from the running service's journal): $_gh_line"
+    else
+      echo "==> GitHub integration: see the service's own startup line: journalctl --user -u $UNIT -o cat | grep '^\[forum\] GitHub integration:' | tail -1"
     fi
   fi
 else

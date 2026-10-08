@@ -192,7 +192,10 @@ The installer always writes it: `on` when you pass `--github-token-file`, `off`
 otherwise. **So a default install is off.**
 
 When the server starts, its log says which mode it chose, in a line that begins
-`[forum] GitHub integration:`.
+`[forum] GitHub integration:`. The installer's own `--verify-only` check does not
+run with the service's settings, so it does not report the mode: it prints
+`not checked by --verify-only`. After a restart, the installer instead copies the
+service's own line from its journal, labelled as coming from the running service.
 
 | Setting | What happens |
 |---|---|

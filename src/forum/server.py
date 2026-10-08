@@ -4852,17 +4852,30 @@ def main() -> None:
     # #3568: resolve the GitHub-integration switch FIRST, from the environment,
     # once. A contradiction (on without a token, an invalid value) refuses here --
     # before boot-verify, any data-dir write, or serving.
-    try:
-        github_mode, github_why = _resolve_github_integration(os.environ)
-    except GithubIntegrationError as exc:
-        print(f"[forum] refusing to start: {exc}", file=sys.stderr)
-        # Exit 78 (EX_CONFIG), not 2: a switch/token contradiction is a config error
-        # that no restart can fix, so the unit's RestartPreventExitStatus=78 stops
-        # systemd crash-looping on it. Boot-verify's hard-dep failures still exit 2
-        # (possibly transient: mount, permissions) and so are still restarted.
-        sys.exit(EXIT_CONFIG_REFUSED)
-    label = github_mode.upper() + (", no token" if github_why == LEGACY_CLOSED_WHY else "")
-    print(f"[forum] GitHub integration: {label} ({github_why})", file=sys.stderr)
+    #
+    # #3597: NOT under --verify-only. The probe runs in the installer's (admin) shell,
+    # not with the unit's environment (Environment= / EnvironmentFile=), so resolving
+    # here would report -- or refuse on -- the wrong environment. --verify-only checks
+    # dependencies and exits inside _run_boot_verify (before anything below uses the
+    # mode); the running service logs its own line at startup.
+    if args.verify_only:
+        print("[forum] GitHub integration: not checked by --verify-only (this probe does "
+              "not run with the unit's environment; the running service logs its own line "
+              "at startup: journalctl --user -u engram-forum.service -o cat | "
+              "grep '^\\[forum\\] GitHub integration:' | tail -1)", file=sys.stderr)
+        github_mode = None
+    else:
+        try:
+            github_mode, github_why = _resolve_github_integration(os.environ)
+        except GithubIntegrationError as exc:
+            print(f"[forum] refusing to start: {exc}", file=sys.stderr)
+            # Exit 78 (EX_CONFIG), not 2: a switch/token contradiction is a config error
+            # that no restart can fix, so the unit's RestartPreventExitStatus=78 stops
+            # systemd crash-looping on it. Boot-verify's hard-dep failures still exit 2
+            # (possibly transient: mount, permissions) and so are still restarted.
+            sys.exit(EXIT_CONFIG_REFUSED)
+        label = github_mode.upper() + (", no token" if github_why == LEGACY_CLOSED_WHY else "")
+        print(f"[forum] GitHub integration: {label} ({github_why})", file=sys.stderr)
 
     # ------------------------------------------------------------------
     # Boot-verify: run BEFORE binding the port.
