@@ -27,7 +27,7 @@ Mode 2 — live-file presence check (engram-alpha#3604):
 
     python tools/check-claude-md-drift.py --repo <SRC_DIR> --head <REF> --live <FILE> \\
         --user-name N --agent-name N --self-node-id pn_NNNN --engram-home DIR \\
-        [--seed-manifest ~/.engram/seed-manifest.json] [--multi-agent]
+        [--seed-manifest ~/.engram/seed-manifest.json] [--seed-id KEY=VALUE ...] [--multi-agent]
 
 Arguments
 ---------
@@ -42,6 +42,15 @@ Arguments
 --seed-manifest PATH
           Mode 2: the seed-manifest.json bootstrap wrote (reads only its
           ``seed_ids`` map, e.g. {"{{AX_HONESTY}}": "<the install's ax_ id>", ...}).
+--seed-id KEY=VALUE
+          Mode 2, repeatable: supply or override one seed id (KEY is the placeholder
+          name without braces, e.g. AX_HONESTY_DISCRETION).  An override beats the
+          manifest value; a key the template does not use is harmless; for a
+          repeated key the last one wins; the value is everything after the first
+          ``=``.  An explicit flag (--user-name etc.) beats a --seed-id of the same
+          placeholder, so ``--seed-id ENGRAM_HOME=DIR`` also works as a stand-in
+          for --engram-home.  Needed when an early seat's manifest lacks an id the
+          current template uses.
 --multi-agent
           Mode 2, OPT-IN: also check template.CLAUDE.multi-agent.md (see below).
 
@@ -64,6 +73,16 @@ every later base-to-head range starts after that hunk.  Mode 2 checks the live
 file against the rendered template at ``--head`` in ONE direction: every
 rendered paragraph must be present in the live file; only MISSING ones are
 reported; extras and ordering are ignored (the template is the floor).
+
+Home path.  {{ENGRAM_HOME}} comes from --engram-home, but a live file may write
+the home as the literal ``~/.engram...`` or as the absolute path (an unquoted
+``~`` on the command line is expanded by the shell).  A unit that contains the
+home is present if the live file has it with the home written EITHER way,
+whichever form --engram-home was given in.  Any other home (a different
+directory) is still reported missing.  Trailing slashes on --engram-home are
+ignored.  Known limit: a single unit that contains the home TWICE, written in
+the live file with one ``~`` and one absolute form, reads MISSING (one form is
+substituted everywhere in the unit).
 
 Render path.  Bootstrap renders a Claude seat's file by reading
 ``template.CLAUDE.md`` and running a plain literal ``str.replace`` loop over its
@@ -89,7 +108,8 @@ even if it contains blank lines.  A local edit inside a list or table is thus
 not a false "missing", and a real miss names its own line.  Presence = the
 unit, whitespace-normalised (runs of whitespace collapse to one space), occurs
 in the whitespace-normalised live text bounded by whitespace or text edge, so
-an item with text appended still matches.  Case, punctuation and words are
+an item with text appended at its END still matches (text inserted in the
+MIDDLE of a unit does not).  Case, punctuation and words are
 significant.  Identical duplicate units (e.g. two "- none" bullets) collapse
 into ONE check, reported once at the first occurrence.
 
@@ -100,12 +120,18 @@ summary line ``N units checked, M missing``.
 Limits (what this check does NOT tell you).  It finds ABSENCE, not whether
 text is live-effective: a unit is matched ANYWHERE in the live file, including
 inside fenced blocks, HTML comments, blockquotes and code spans, so a seat that
-commented out or quoted a hunk is NOT reported.  A unit that is a prefix of a
-longer line, or a heading with extra words appended, counts present.
+commented out or quoted a hunk is NOT reported.  A unit that is a prefix OR the tail of a
+longer line (an item extended at its end; ``Do the thing.`` inside
+``Please never. Do the thing.``), or a heading with extra words appended,
+counts present; a unit extended in the middle does not.
 Trailing punctuation appended to an unpunctuated unit counts MISSING
 ("write it." does not contain the unit "write it" bounded by whitespace).
 Blockquotes and HTML comments are ordinary paragraph units.  Locally reworded
-units are reported missing; a human judges.
+units are reported missing; a human judges.  That noise is by design: on a real
+seat about 14 of 169 units were reported (some real lag, some deliberate local
+rewrites) and the output does not say which kind a line is.  If a seat that
+rewords more finds it too noisy, the options are a per-seat accepted-deviations
+list or a fuzzy match for lightly reworded units; neither is built.
 
 Multi-agent.  There is no code path that renders template.CLAUDE.multi-agent.md
 into a seat's file; operators hand-merge it.  So ``--multi-agent`` (off by
@@ -136,6 +162,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -393,33 +420,86 @@ def _load_seed_ids(path: str) -> dict[str, str]:
     return out
 
 
+def _home_forms(home: str | None) -> list[str]:
+    """The forms a home path may be written in: as given, plus the other of
+    ``~/...`` / absolute (via $HOME).  The given form comes first."""
+    if home is None:
+        return []
+    # A trailing slash would double up against the template's "/..." (a bare
+    # "/" is kept as "/": it must not become an empty home).
+    home = home.rstrip("/") or "/"
+    forms = [home]
+    if home == "~" or home.startswith("~/"):
+        alt = os.path.expanduser(home)
+    else:
+        h = os.path.expanduser("~").rstrip("/")
+        alt = home
+        if h and h != "~" and (home == h or home.startswith(h + "/")):
+            alt = "~" + home[len(h):]
+    if alt != home:
+        forms.append(alt)
+    return forms
+
+
+def _parse_seed_id(raw: str) -> tuple[str, str]:
+    key, sep, value = raw.partition("=")
+    key = key.strip()
+    if key.startswith("{{") and key.endswith("}}"):
+        key = key[2:-2].strip()
+    if not sep or not key or not value.strip():
+        raise _LiveError(
+            f"--seed-id {raw!r} is malformed: expected KEY=VALUE with a non-empty key and value"
+        )
+    return "{{" + key + "}}", value
+
+
 def _substitute(text: str, subs: dict[str, str]) -> str:
     for placeholder, value in subs.items():
         text = text.replace(placeholder, value)      # literal, like bootstrap
     return text
 
 
-def _check_set(label: str, rendered: str, live_norm: str, skip_headings: bool):
-    """Return (checked, [(line, first_line)]) for one rendered file."""
-    left = sorted(set(_PLACEHOLDER_RE.findall(rendered)))
+def _check_set(label: str, rendered: str, live_norm: str, skip_headings: bool,
+               homes: list[str] | None = None):
+    """Return (checked, [(line, first_line)]) for one rendered file.
+
+    ``rendered`` still carries {{ENGRAM_HOME}} when ``homes`` is given; each
+    unit is judged present if it is found with the home written in ANY of the
+    ``homes`` forms (the first is the primary form, used for the unresolved
+    check and duplicate collapsing)."""
+    homes = homes or []
+    primary = _substitute(rendered, {"{{ENGRAM_HOME}}": homes[0]}) if homes else rendered
+    left = sorted(set(_PLACEHOLDER_RE.findall(primary)))
     if left:
-        raise _LiveError(
-            f"unresolved placeholder(s) in {label} after substitution: "
-            + ", ".join(p.strip("{}") for p in left)
-            + " (supply the matching flag / --seed-manifest, or teach the tool the new placeholder)"
-        )
+        seeds = [p.strip("{}") for p in left if p in SEED_PLACEHOLDERS]
+        others = [p.strip("{}") for p in left if p not in SEED_PLACEHOLDERS]
+        parts = []
+        if seeds:
+            parts.append(
+                "seed id(s) missing from the seed manifest: " + ", ".join(seeds)
+                + " (pass each with --seed-id KEY=VALUE, e.g. --seed-id "
+                + seeds[0] + "=<the install's id>)"
+            )
+        if others:
+            parts.append(
+                "unresolved placeholder(s): " + ", ".join(others)
+                + " (supply the matching flag, or teach the tool the new placeholder)"
+            )
+        raise _LiveError(f"in {label} after substitution: " + "; ".join(parts))
     checked, missing = 0, []
     seen: set[str] = set()
     for start, ulines, is_heading in split_units(rendered):
         if is_heading and skip_headings:
             continue
-        key = _norm("\n".join(ulines))
+        raw = "\n".join(ulines)
+        variants = [_norm(_substitute(raw, {"{{ENGRAM_HOME}}": h})) for h in homes] or [_norm(raw)]
+        key = variants[0]
         if key in seen:                  # identical duplicate units: one check
             continue
         seen.add(key)
         checked += 1
-        if not _present(key, live_norm):
-            first = ulines[0].strip()
+        if not any(_present(v, live_norm) for v in variants):
+            first = _substitute(ulines[0], {"{{ENGRAM_HOME}}": homes[0]} if homes else {}).strip()
             if len(first) > _TRUNC:
                 first = first[: _TRUNC - 3] + "..."
             missing.append((start, first))
@@ -436,10 +516,15 @@ def run_live(args: argparse.Namespace, repo: Path) -> int:
         subs: dict[str, str] = {}
         if args.seed_manifest:
             subs.update(_load_seed_ids(args.seed_manifest))
+        for raw in getattr(args, "seed_id", None) or []:
+            key, value = _parse_seed_id(raw)     # an override beats the manifest
+            subs[key] = value
         for placeholder, flag in FLAG_PLACEHOLDERS.items():
             value = getattr(args, flag[2:].replace("-", "_"))
             if value is not None:
                 subs[placeholder] = value
+        # {{ENGRAM_HOME}} stays in the text; _check_set tries every home form.
+        homes = _home_forms(subs.pop("{{ENGRAM_HOME}}", None))
         live_norm = _norm(live_text)
 
         rendered = _substitute(_render_ref(repo, args.head), subs)
@@ -452,7 +537,7 @@ def run_live(args: argparse.Namespace, repo: Path) -> int:
                 raise _LiveError(f"--multi-agent: {_MULTI_FILE} absent or empty at {args.head}")
             sets.append((_MULTI_FILE, _substitute(raw, subs), True))
 
-        results = [(label, *_check_set(label, text, live_norm, skip))
+        results = [(label, *_check_set(label, text, live_norm, skip, homes))
                    for label, text, skip in sets]
     except _LiveError as exc:
         print(f"check-claude-md-drift: error: {exc}", file=sys.stderr)
@@ -501,16 +586,28 @@ def main() -> int:
     parser.add_argument("--live", metavar="FILE",
                         help="Mode 2: live CLAUDE.md to check against the rendered template at --head. "
                              "Every rendered paragraph must be present in FILE; only missing ones are "
-                             "reported, extras ignored. Exclusive with --base. Exit 0/1, 2 on any error. "
+                             "reported, extras ignored. An item or row the seat extended is still found "
+                             "when the text was appended at the END (or the unit is the tail of a longer "
+                             "line); text inserted in the MIDDLE is reported missing, and so is a reworded "
+                             "unit (some noise on a real seat is by design; a human judges each line). Exclusive with --base. Exit 0/1, 2 on any error. "
                              "Finds absence only: text is matched anywhere in FILE, even inside a "
                              "comment, fence or quote, so a commented-out hunk is not reported.")
     parser.add_argument("--user-name", metavar="NAME", help="Mode 2: value for {{USER_NAME}}.")
     parser.add_argument("--agent-name", metavar="NAME", help="Mode 2: value for {{AGENT_NAME}}.")
     parser.add_argument("--self-node-id", metavar="ID", help="Mode 2: value for {{SELF_NODE_ID}} (this install's pn_ self node id).")
-    parser.add_argument("--engram-home", metavar="DIR", help="Mode 2: value for {{ENGRAM_HOME}}.")
+    parser.add_argument("--engram-home", metavar="DIR",
+                        help="Mode 2: value for {{ENGRAM_HOME}}; a live file that writes the home as ~/... "
+                             "or as the absolute path matches either way, whichever form is given here.")
     parser.add_argument("--seed-manifest", metavar="PATH",
                         help="Mode 2: seed-manifest.json written by bootstrap; its 'seed_ids' map fills "
                              "the seed-ID placeholders.")
+    parser.add_argument("--seed-id", metavar="KEY=VALUE", action="append", default=[],
+                        help="Mode 2, repeatable: supply or override one seed id (KEY = placeholder name "
+                             "without braces, e.g. AX_HONESTY_DISCRETION). Beats the manifest value; a key "
+                             "the template does not use is ignored; the last repeat of a key wins; "
+                             "the value is everything after the first '='; an explicit flag such as "
+                             "--user-name beats a --seed-id of the same placeholder. Use it when an early seat's manifest "
+                             "lacks an id the current template needs.")
     parser.add_argument("--multi-agent", action="store_true",
                         help="Mode 2, opt-in: also check template.CLAUDE.multi-agent.md as its OWN "
                              "paragraph set (line numbers relative to that file, headings skipped, no "

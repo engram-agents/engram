@@ -885,3 +885,217 @@ class TestLiveLimitsPinned:
         proc = subprocess.run([sys.executable, str(CLI_PATH), "--help"],
                               capture_output=True, text=True, timeout=15)
         assert "absence" in " ".join(proc.stdout.split())
+
+
+# ===========================================================================
+# Contract A (home written as ~ or absolute) and B (--seed-id) -- follow-ups
+# to the live mode.  Written before the implementation.
+# ===========================================================================
+
+class TestLiveHomeTildeOrAbsolute:
+    """{{ENGRAM_HOME}} may be given as ~/.engram or the absolute path (an unquoted
+    ~ is expanded by the shell); a live file may write either form."""
+
+    TPL = "# T\n\nData lives in {{ENGRAM_HOME}}/x for this seat.\n\nUnrelated plain paragraph.\n"
+
+    def _go(self, tmp_path, monkeypatch, live_text, home_arg):
+        fake_home = tmp_path / "fakehome"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+        abs_home = str(fake_home / ".engram")
+        repo = _live_repo(tmp_path, self.TPL)
+        live = tmp_path / "hl.md"
+        live.write_text(live_text.replace("ABS", abs_home), encoding="utf-8")
+        arg = abs_home if home_arg == "ABS" else home_arg
+        return _run_live(repo, live, flags=["--engram-home", arg])
+
+    def test_live_tilde_arg_absolute(self, tmp_path, monkeypatch):
+        rc, out, err = self._go(tmp_path, monkeypatch,
+                                "# T\n\nData lives in ~/.engram/x for this seat.\n\nUnrelated plain paragraph.\n", "ABS")
+        assert rc == 0 and _summary(out) == (3, 0), (out, err)
+
+    def test_live_absolute_arg_tilde(self, tmp_path, monkeypatch):
+        rc, out, err = self._go(tmp_path, monkeypatch,
+                                "# T\n\nData lives in ABS/x for this seat.\n\nUnrelated plain paragraph.\n", "~/.engram")
+        assert rc == 0 and _summary(out) == (3, 0), (out, err)
+
+    @pytest.mark.parametrize("form", ["ABS", "~/.engram"])
+    def test_same_form_as_argument_still_present(self, tmp_path, monkeypatch, form):
+        live = "# T\n\nData lives in %s/x for this seat.\n\nUnrelated plain paragraph.\n" % form
+        rc, out, err = self._go(tmp_path, monkeypatch, live, form)
+        assert rc == 0 and _summary(out) == (3, 0), (out, err)
+
+    @pytest.mark.parametrize("arg", ["ABS", "~/.engram"])
+    def test_control_different_home_stays_missing(self, tmp_path, monkeypatch, arg):
+        live = "# T\n\nData lives in /other/.engram/x for this seat.\n\nUnrelated plain paragraph.\n"
+        rc, out, err = self._go(tmp_path, monkeypatch, live, arg)
+        assert rc == 1 and _summary(out) == (3, 1), (out, err)
+        assert "line 3:" in out
+
+    def test_unit_without_home_is_unaffected(self, tmp_path, monkeypatch):
+        live = "# T\n\nData lives in ~/.engram/x for this seat.\n"
+        rc, out, err = self._go(tmp_path, monkeypatch, live, "ABS")
+        assert rc == 1 and _summary(out) == (3, 1), (out, err)
+        assert "Unrelated plain paragraph." in out
+
+
+class TestLiveSeedIdOverride:
+    TPL = "# T\n\nSee {{AX_HONESTY}} and {{AX_HONESTY_DISCRETION}}.\n"
+
+    def _setup(self, tmp_path, ids, live_text="# T\n\nSee idone and idtwo.\n"):
+        repo = _live_repo(tmp_path, self.TPL)
+        live = tmp_path / "sl.md"
+        live.write_text(live_text, encoding="utf-8")
+        m = tmp_path / "seed-manifest.json"
+        m.write_text(json.dumps({"seed_ids": ids}))
+        return repo, live, m
+
+    def test_missing_id_message_names_it_and_the_flag(self, tmp_path):
+        repo, live, m = self._setup(tmp_path, {"{{AX_HONESTY}}": "idone"})
+        rc, out, err = _run_live(repo, live, "--seed-manifest", str(m), flags=[])
+        assert rc == 2 and out == "", (rc, out, err)
+        assert "AX_HONESTY_DISCRETION" in err
+        assert "--seed-id KEY=VALUE" in err
+
+    def test_override_completes_the_run(self, tmp_path):
+        repo, live, m = self._setup(tmp_path, {"{{AX_HONESTY}}": "idone"})
+        rc, out, err = _run_live(repo, live, "--seed-manifest", str(m),
+                                 "--seed-id", "AX_HONESTY_DISCRETION=idtwo", flags=[])
+        assert rc == 0 and _summary(out) == (2, 0), (out, err)
+
+    def test_override_by_content_exits_1(self, tmp_path):
+        repo, live, m = self._setup(tmp_path, {"{{AX_HONESTY}}": "idone"})
+        rc, out, err = _run_live(repo, live, "--seed-manifest", str(m),
+                                 "--seed-id", "AX_HONESTY_DISCRETION=idother", flags=[])
+        assert rc == 1 and _summary(out) == (2, 1), (out, err)
+
+    def test_override_beats_manifest_value(self, tmp_path):
+        repo, live, m = self._setup(
+            tmp_path, {"{{AX_HONESTY}}": "idwrong", "{{AX_HONESTY_DISCRETION}}": "idtwo"})
+        rc, out, _ = _run_live(repo, live, "--seed-manifest", str(m), flags=[])
+        assert rc == 1                                    # manifest value is wrong for this live file
+        rc, out, err = _run_live(repo, live, "--seed-manifest", str(m),
+                                 "--seed-id", "AX_HONESTY=idone", flags=[])
+        assert rc == 0, (out, err)
+
+    def test_override_without_a_manifest(self, tmp_path):
+        repo, live, _ = self._setup(tmp_path, {})
+        rc, out, err = _run_live(repo, live, "--seed-id", "AX_HONESTY=idone",
+                                 "--seed-id", "AX_HONESTY_DISCRETION=idtwo", flags=[])
+        assert rc == 0, (out, err)
+
+    def test_braced_key_form_accepted(self, tmp_path):
+        repo, live, _ = self._setup(tmp_path, {})
+        rc, out, err = _run_live(repo, live, "--seed-id", "{{AX_HONESTY}}=idone",
+                                 "--seed-id", "AX_HONESTY_DISCRETION=idtwo", flags=[])
+        assert rc == 0, (out, err)
+
+    @pytest.mark.parametrize("bad", ["NOEQUALS", "=idone", "AX_HONESTY=", "AX_HONESTY=  ", "  =x"])
+    def test_malformed_seed_id_exit_2(self, tmp_path, bad):
+        repo, live, m = self._setup(tmp_path, {"{{AX_HONESTY}}": "idone",
+                                               "{{AX_HONESTY_DISCRETION}}": "idtwo"})
+        rc, out, err = _run_live(repo, live, "--seed-manifest", str(m), "--seed-id", bad, flags=[])
+        assert rc == 2, (rc, out, err)
+        assert "--seed-id" in err
+        assert "0 missing" not in out
+
+    def test_unused_key_is_harmless(self, tmp_path):
+        repo, live, m = self._setup(tmp_path, {"{{AX_HONESTY}}": "idone",
+                                               "{{AX_HONESTY_DISCRETION}}": "idtwo"})
+        rc, out, err = _run_live(repo, live, "--seed-manifest", str(m),
+                                 "--seed-id", "NOT_USED_ANYWHERE=whatever", flags=[])
+        assert rc == 0, (out, err)
+
+
+class TestLiveHelpWording:
+    def test_help_mentions_end_append(self):
+        proc = subprocess.run([sys.executable, str(CLI_PATH), "--help"],
+                              capture_output=True, text=True, timeout=15)
+        text = " ".join(proc.stdout.split())
+        assert "appended at the END" in text
+        assert "--seed-id" in text
+
+
+# ===========================================================================
+# Round 2: different-home controls in both directions, trailing slash,
+# `=` in a seed-id value, repeated key.
+# ===========================================================================
+
+class TestLiveDifferentHomeBothDirections:
+    _go = TestLiveHomeTildeOrAbsolute._go
+    TPL = TestLiveHomeTildeOrAbsolute.TPL
+
+    @pytest.mark.parametrize("arg,live_home", [
+        ("/other/.engram", "~/.engram"),            # different absolute arg vs ~ live file
+        ("/other/.engram", "ABS"),                  # different absolute arg vs own absolute live
+        ("~/.engram", "/home/zzz/.engram"),         # ~ arg vs live file under a different absolute home
+        ("~/.elsewhere", "~/.engram"),              # different ~ arg vs ~ live file
+        ("~/.elsewhere", "ABS"),
+    ])
+    def test_different_home_is_missing(self, tmp_path, monkeypatch, arg, live_home):
+        live = "# T\n\nData lives in %s/x for this seat.\n\nUnrelated plain paragraph.\n" % live_home
+        rc, out, err = self._go(tmp_path, monkeypatch, live, arg)
+        assert rc == 1 and _summary(out) == (3, 1), (arg, live_home, out, err)
+        assert "line 3:" in out
+
+
+class TestLiveHomeTrailingSlash:
+    TPL = TestLiveHomeTildeOrAbsolute.TPL
+
+    def _go(self, tmp_path, monkeypatch, live_home, arg):
+        fake_home = tmp_path / "fakehome"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+        abs_home = str(fake_home / ".engram")
+        repo = _live_repo(tmp_path, self.TPL)
+        live = tmp_path / "ts.md"
+        live.write_text("# T\n\nData lives in %s/x for this seat.\n\nUnrelated plain paragraph.\n"
+                        % live_home.replace("ABS", abs_home), encoding="utf-8")
+        return _run_live(repo, live, flags=["--engram-home", arg.replace("ABS", abs_home)])
+
+    @pytest.mark.parametrize("arg", ["ABS/", "~/.engram/", "ABS//", "~/.engram//"])
+    @pytest.mark.parametrize("live_home", ["ABS", "~/.engram"])
+    def test_trailing_slash_gives_zero_missing(self, tmp_path, monkeypatch, arg, live_home):
+        rc, out, err = self._go(tmp_path, monkeypatch, live_home, arg)
+        assert rc == 0 and _summary(out) == (3, 0), (arg, live_home, out, err)
+
+    @pytest.mark.parametrize("arg", ["/other/.engram/", "~/.elsewhere/"])
+    @pytest.mark.parametrize("live_home", ["ABS", "~/.engram"])
+    def test_control_different_home_with_slash_is_missing(self, tmp_path, monkeypatch, arg, live_home):
+        rc, out, err = self._go(tmp_path, monkeypatch, live_home, arg)
+        assert rc == 1 and _summary(out) == (3, 1), (arg, live_home, out, err)
+
+    def test_bare_slash_home_stays_nonempty(self, tmp_path, monkeypatch):
+        # "/" must not collapse to an empty home (that would turn /x into plain x)
+        rc, out, err = self._go(tmp_path, monkeypatch, "ABS", "/")
+        assert rc == 1 and _summary(out) == (3, 1), (out, err)
+
+
+class TestLiveSeedIdValueAndRepeat:
+    TPL = "# T\n\nSee {{AX_HONESTY}} here.\n"
+
+    def _run(self, tmp_path, live_value, *seed_args):
+        repo = _live_repo(tmp_path, self.TPL)
+        live = tmp_path / "eq.md"
+        live.write_text("# T\n\nSee %s here.\n" % live_value, encoding="utf-8")
+        extra = []
+        for a in seed_args:
+            extra += ["--seed-id", a]
+        return _run_live(repo, live, *extra, flags=[])
+
+    def test_value_is_everything_after_the_first_equals(self, tmp_path):
+        rc, out, err = self._run(tmp_path, "x=y=z", "AX_HONESTY=x=y=z")
+        assert rc == 0, (out, err)
+
+    def test_value_after_first_equals_is_not_the_tail_only(self, tmp_path):
+        # a live file carrying only the last segment must NOT satisfy KEY=x=y=z
+        rc, out, err = self._run(tmp_path, "z", "AX_HONESTY=x=y=z")
+        assert rc == 1, (out, err)
+
+    def test_repeated_key_last_wins(self, tmp_path):
+        rc, out, err = self._run(tmp_path, "second", "AX_HONESTY=first", "AX_HONESTY=second")
+        assert rc == 0, (out, err)
+
+    def test_repeated_key_first_does_not_win(self, tmp_path):
+        rc, out, err = self._run(tmp_path, "first", "AX_HONESTY=first", "AX_HONESTY=second")
+        assert rc == 1, (out, err)
