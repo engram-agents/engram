@@ -19,7 +19,8 @@
 #                       engram-forum.service is reused, so a re-run can never start a
 #                       second, empty forum somewhere new. An existing unit with no
 #                       parsable FORUM_HOME is refused (exit 2), never guessed at.
-#   --port PORT         port the service listens on. Default: 5002
+#   --port PORT         port the service listens on, a plain integer 1-65535
+#                       (no sign, no leading zero). Default: 5002
 #   --admin-user USER   systemd --user account running the service.
 #                       Default: current user ($(whoami))
 #   --group NAME        group that co-admins share (group-writable data).
@@ -139,16 +140,60 @@ _refuse_unrenderable_dir() {
   exit 2
 }
 
+# --port is spliced into the main unit by an unescaped sed (and into a curl URL), so it
+# must be a canonical decimal integer 1..65535 (#3603): digits only, no sign, no leading
+# zero, no whitespace, at most 5 digits. Privileged ports (<1024) are NOT refused: whether
+# a port can be bound is a host property, not a unit shape. LOCALE: the digits are spelled
+# out, never [0-9] or [:digit:], so a non-ASCII digit is refused in the C locale and in a
+# UTF-8 one. The length is checked BEFORE the numeric compare so a 30-digit value cannot
+# overflow `[ -gt ]`. `case` globs and `[ ]` only (macOS bash 3.2). $1 = the value.
+_refuse_bad_port() {
+  local _v="$1"
+  case "$_v" in
+    '') echo "ERROR: --port '' is empty; give a port number 1-65535. Nothing was written." >&2; exit 2 ;;
+    *[!0123456789]*)
+        echo "ERROR: --port '$_v' is not a plain decimal integer (digits 0-9 only: no sign, space, dot or other character); it is rendered into the unit file. Nothing was written. Use a port number 1-65535." >&2
+        exit 2 ;;
+    0*) echo "ERROR: --port '$_v' is zero or has a leading zero; use a canonical port number 1-65535. Nothing was written." >&2
+        exit 2 ;;
+  esac
+  if [ "${#_v}" -gt 5 ] || [ "$_v" -gt 65535 ]; then
+    echo "ERROR: --port '$_v' is out of range; use a port number 1-65535. Nothing was written." >&2
+    exit 2
+  fi
+}
+
+# --group and --admin-user reach shell arguments (chgrp, loginctl, grep), so each is an
+# ALLOWLIST [A-Za-z0-9_.-], not empty, and not leading with '-' (it would read as an
+# option: `chgrp -R dir` is the worst shape). Refused at the flag, before anything is
+# written (#3603). The class is spelled out, no ranges or [:alpha:] (locale). $1 = value,
+# $2 = the flag.
+_refuse_bad_name() {
+  local _v="$1"
+  case "$_v" in
+    '') echo "ERROR: $2 '' is empty; give a name. Nothing was written." >&2; exit 2 ;;
+    -*) echo "ERROR: $2 '$_v' starts with '-', which reads as an option. Nothing was written. Use a name made of letters, digits and _ . -" >&2
+        exit 2 ;;
+    *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-]*)
+        echo "ERROR: $2 '$_v' contains a character outside letters, digits and _ . - (it reaches shell arguments). Nothing was written. Use a name made of those." >&2
+        exit 2 ;;
+  esac
+}
+
 while [ $# -gt 0 ]; do
+  case "$1" in
+    --port|--admin-user|--group)
+      [ $# -ge 2 ] || { echo "ERROR: $1 requires a value. Nothing was written." >&2; exit 2; } ;;
+  esac
   case "$1" in
     --src)          SRC="$2"; shift 2 ;;
     --service-dir)
       SERVICE_DIR="$2"
       _refuse_unrenderable_dir "$SERVICE_DIR" "--service-dir"
       shift 2 ;;
-    --port)         PORT="$2"; shift 2 ;;
-    --admin-user)   ADMIN_USER="$2"; shift 2 ;;
-    --group)        GROUP="$2"; shift 2 ;;
+    --port)         _refuse_bad_port "$2"; PORT="$2"; shift 2 ;;
+    --admin-user)   _refuse_bad_name "$2" "--admin-user"; ADMIN_USER="$2"; shift 2 ;;
+    --group)        _refuse_bad_name "$2" "--group"; GROUP="$2"; shift 2 ;;
     --baton-login-map)
       BATON_MAP="$2"
       case "$BATON_MAP" in
@@ -258,7 +303,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
   command -v systemctl >/dev/null || {
     echo "ERROR: systemctl not found (this installer targets systemd --user)" >&2; exit 2;
   }
-  id -nG | tr ' ' '\n' | grep -qx "$GROUP" || {
+  id -nG | tr ' ' '\n' | grep -qxF -- "$GROUP" || {
     echo "ERROR: $(whoami) is not in group '$GROUP' — needed to own the shared forum data" >&2; exit 2;
   }
 fi

@@ -1093,3 +1093,175 @@ class TestNonAsciiMessageBash32_3600:
         assert r.rc == 2, r.err
         assert b"contains '&'" in r.err, r.err
         assert b"non-ASCII" not in r.err, r.err
+
+
+# ---------------------------------------------------------------------------
+# #3603 -- --port is spliced into the main unit by an unescaped sed, so it must be a
+# canonical decimal integer 1..65535, refused at argument parsing (exit 2, under
+# --dry-run too, naming the flag and the value) before anything is written. A missing
+# value is refused too. Privileged ports (<1024) are NOT refused: whether a port can be
+# bound is a host property, not a unit shape. Written BEFORE the implementation.
+# ---------------------------------------------------------------------------
+
+_BAD_PORTS = [
+    ("5002|x", "pipe"), ("5002&x", "amp"), ("50\\02", "backslash"), ("", "empty"),
+    ("0", "zero"), ("65536", "65536"), ("99999", "99999"), ("100000", "100000"),
+    ("1" * 30, "30-digits"), ("abc", "abc"), ("-1", "minus1"), ("+80", "plus80"),
+    ("0080", "leading-zero"), ("5002.0", "decimal"),
+    ("5002 --db /x", "injection"), ("５００２", "fullwidth"),
+    ("٥٠٠٢", "arabic-indic"), (" 5002", "leading-space"), ("5002\n", "newline"),
+]
+
+
+def _unit_text(ctx) -> str:
+    return (ctx.unit_dir / MAIN).read_text()
+
+
+class TestPortValidation3603:
+
+    @pytest.mark.parametrize("value", [v for v, _ in _BAD_PORTS],
+                             ids=[i for _, i in _BAD_PORTS])
+    @pytest.mark.parametrize("dry", [False, True], ids=["real", "dry-run"])
+    def test_bad_port_is_refused_before_anything_is_written(self, tmp_path, value, dry):
+        ctx = _install(tmp_path, prep=False, dry_run=dry, no_start=False,
+                       extra_args=("--port", value))
+        assert ctx.r.returncode == 2, ctx.both
+        assert "--port" in ctx.err and value in ctx.err, ctx.err
+        assert "Forum service dir" not in ctx.out
+        _assert_nothing_written(ctx)
+
+    @pytest.mark.parametrize("dry", [False, True], ids=["real", "dry-run"])
+    def test_missing_value_is_refused_naming_the_flag(self, tmp_path, dry):
+        ctx = _install(tmp_path, prep=False, dry_run=dry, no_start=False,
+                       extra_args=("--port",))
+        assert ctx.r.returncode == 2, ctx.both
+        assert "--port" in ctx.err and "requires a value" in ctx.err, ctx.err
+        assert "unbound variable" not in ctx.err
+        assert "Forum service dir" not in ctx.out
+        _assert_nothing_written(ctx)
+
+    def test_positive_control_default_renders_5002(self, tmp_path):
+        ctx = _install(tmp_path)
+        assert ctx.r.returncode == 0, ctx.both
+        unit = _unit_text(ctx)
+        assert "--port 5002" in unit and "Flask, port 5002" in unit, unit
+
+    @pytest.mark.parametrize("port", ["1", "80", "8080", "65535"])
+    def test_positive_control_port_installs_and_is_rendered_in_both_places(
+            self, tmp_path, port):
+        # 80 is privileged: still accepted (binding it is a host property).
+        ctx = _install(tmp_path, extra_args=("--port", port))
+        assert ctx.r.returncode == 0, ctx.both
+        unit = _unit_text(ctx)
+        assert f"--port {port}" in unit and f"Flask, port {port}" in unit, unit
+        assert "port 5002" not in unit, unit
+
+    @pytest.mark.parametrize("loc", [
+        "C",
+        pytest.param(_utf8_locale(), marks=pytest.mark.skipif(
+            _utf8_locale() is None, reason="no UTF-8 locale in `locale -a` on this host")),
+    ], ids=["C", "utf8"])
+    def test_fullwidth_digits_are_refused_in_both_locales(self, tmp_path, loc):
+        ctx = _install(tmp_path, prep=False, no_start=False,
+                       extra_args=("--port", "５００２"), env_extra={"LC_ALL": loc})
+        assert ctx.r.returncode == 2, (loc, ctx.both)
+        assert "--port" in ctx.err and "５００２" in ctx.err, ctx.err
+        _assert_nothing_written(ctx)
+
+
+# ---------------------------------------------------------------------------
+# #3603 (owner's ruling) -- --group and --admin-user reach shell arguments (chgrp,
+# loginctl, grep), so each is refused AT THE FLAG, before anything is written, exit 2,
+# real and --dry-run, when it is empty, starts with '-', or holds a character outside
+# [A-Za-z0-9_.-]; a missing value is refused naming the flag. The group-membership test
+# is a FIXED-STRING match (grep -qxF), so a name is never read as a regex. --src is
+# deliberately not validated. Written BEFORE the implementation.
+# ---------------------------------------------------------------------------
+
+_BAD_NAMES = [
+    ("-x", "dash-x"), ("-R", "dash-R"), ("", "empty"), ("a b", "space"),
+    ("a;b", "semicolon"), ("a$b", "dollar"), ("a|b", "pipe"), ("a&b", "amp"),
+    ("a/b", "slash"), ("é", "e-acute"), ("a*", "star"), ("-", "lone-dash"),
+    ("a\tb", "tab"),
+]
+_NAME_FLAGS = ["--group", "--admin-user"]
+
+
+def _name_args(flag: str, value: str | None) -> dict:
+    """--group is passed through extra_args too (group=None stops the helper adding one)."""
+    args = (flag,) if value is None else (flag, value)
+    return dict(group=None if flag == "--group" else "auto", extra_args=args)
+
+
+class TestNameFlags3603:
+
+    @pytest.mark.parametrize("flag", _NAME_FLAGS)
+    @pytest.mark.parametrize("value", [v for v, _ in _BAD_NAMES],
+                             ids=[i for _, i in _BAD_NAMES])
+    @pytest.mark.parametrize("dry", [False, True], ids=["real", "dry-run"])
+    def test_bad_name_is_refused_before_anything_is_written(
+            self, tmp_path, flag, value, dry):
+        ctx = _install(tmp_path, prep=False, dry_run=dry, no_start=False,
+                       **_name_args(flag, value))
+        assert ctx.r.returncode == 2, ctx.both
+        assert flag in ctx.err and value in ctx.err, ctx.err
+        if value == "":
+            # Old code refuses an empty --group too (via "--group not given"), so pin
+            # the flag-level message or this cell cannot tell the two apart.
+            assert "is empty" in ctx.err, ctx.err
+        assert "Forum service dir" not in ctx.out
+        _assert_nothing_written(ctx)
+
+    @pytest.mark.parametrize("flag", _NAME_FLAGS)
+    @pytest.mark.parametrize("dry", [False, True], ids=["real", "dry-run"])
+    def test_missing_value_is_refused_naming_the_flag(self, tmp_path, flag, dry):
+        ctx = _install(tmp_path, prep=False, dry_run=dry, no_start=False,
+                       **_name_args(flag, None))
+        assert ctx.r.returncode == 2, ctx.both
+        assert flag in ctx.err and "requires a value" in ctx.err, ctx.err
+        assert "unbound variable" not in ctx.err
+        _assert_nothing_written(ctx)
+
+    @pytest.mark.parametrize("flag", _NAME_FLAGS)
+    @pytest.mark.parametrize("loc", [
+        "C",
+        pytest.param(_utf8_locale(), marks=pytest.mark.skipif(
+            _utf8_locale() is None, reason="no UTF-8 locale in `locale -a` on this host")),
+    ], ids=["C", "utf8"])
+    def test_non_ascii_name_is_refused_in_both_locales(self, tmp_path, flag, loc):
+        ctx = _install(tmp_path, prep=False, no_start=False, env_extra={"LC_ALL": loc},
+                       **_name_args(flag, "é"))
+        assert ctx.r.returncode == 2, (loc, ctx.both)
+        assert flag in ctx.err, ctx.err
+        _assert_nothing_written(ctx)
+
+    @pytest.mark.parametrize("name", ["agents", "agent-ariadne", "a_b", "a.b", "a-b",
+                                      "a1b2"])
+    def test_positive_control_group_names_inside_the_class_install(self, tmp_path, name):
+        ctx = _install(tmp_path, primary_group=name, group=name)
+        assert ctx.r.returncode == 0, ctx.both
+        assert f"group {name}" in ctx.out, ctx.out
+
+    @pytest.mark.parametrize("name", ["agents", "agent-ariadne", "a_b", "a.b", "a-b",
+                                      "a1b2"])
+    def test_positive_control_admin_user_names_inside_the_class_install(
+            self, tmp_path, name):
+        ctx = _install(tmp_path, extra_args=("--admin-user", name))
+        assert ctx.r.returncode == 0, ctx.both
+        assert f"admin: {name}" in ctx.out, ctx.out
+
+    @pytest.mark.parametrize("name", ["agent.", "a.ents"])
+    def test_membership_is_a_fixed_string_match_a_dot_is_literal(self, tmp_path, name):
+        # The stubbed `id -nG` prints `agents`. `agent.` and `a.ents` are inside the
+        # class, so they pass the flag check, but they are NOT members: as a regex
+        # (grep -qx) both would match `agents` and be wrongly accepted.
+        ctx = _install(tmp_path, prep=False, no_start=False,
+                       primary_group="agents", group=name)
+        assert ctx.r.returncode == 2, ctx.both
+        assert "is not in group" in ctx.err and name in ctx.err, ctx.err
+        _assert_nothing_written(ctx)
+
+    def test_membership_test_has_the_fixed_string_flag(self):
+        # Structural pin on the extracted line: -F and the `--` end-of-options guard.
+        line = [l for l in INSTALLER.read_text().splitlines() if "grep -qx" in l]
+        assert len(line) == 1 and "grep -qxF -- " in line[0], line
