@@ -86,6 +86,35 @@ except Exception:
     def write_telemetry_record(manifest_id, event_type, fields=None):  # pragma: no cover -- import-failure fallback
         return False
 
+# Evidence-out-of-search (Lei 2026-10-08): the attached-pack FTS below is a
+# search path, so it applies the ONE definition of "not searchable" from the
+# stdlib-only engram_search_rules module (never a hand-copied literal). Its own
+# sentinel, per the one-call-per-module rule above. If the module cannot be
+# imported the pack query FAILS CLOSED (returns no pack results) rather than
+# risk returning evidence nodes.
+_SEARCH_RULES_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_search_rules.py")
+if _SEARCH_RULES_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _SEARCH_RULES_RUNTIME_DIR)
+try:
+    from engram_search_rules import not_search_excluded_sql as _not_search_excluded_sql
+except Exception:
+    # An explicit ENGRAM_RUNTIME_DIR override is returned by resolve_runtime_dir
+    # without checking the sentinel, so it can point at a dir that lacks this
+    # module. Fall back to walking this file's parents for the nearest dir (or
+    # its src/engram) that actually holds it -- never a fixed parents[N].
+    _not_search_excluded_sql = None
+    try:
+        for _parent in Path(__file__).resolve().parents:
+            for _cand in (_parent, _parent / "src" / "engram"):
+                if (_cand / "engram_search_rules.py").exists():
+                    sys.path.insert(0, str(_cand))
+                    from engram_search_rules import not_search_excluded_sql as _not_search_excluded_sql
+                    break
+            if _not_search_excluded_sql is not None:
+                break
+    except Exception:  # pragma: no cover -- fail closed (pack query returns [])
+        _not_search_excluded_sql = None
+
 # alpha #2574 WS3: this hook's TRIGGER-ENTRY site literal (participation
 # manifest_id) for engram.telemetry.reached -- see main()'s first line. All
 # three of this file's emit sites share this one `main` dispatch target
@@ -1597,6 +1626,19 @@ def _query_attached_packs(prompt: str, quota: int = _PACK_SURFACE_QUOTA) -> list
         packs = _get_attached_packs()
         if not packs:
             return []
+        if _not_search_excluded_sql is None:
+            # Fail closed (cannot apply the evidence exclusion) but VISIBLE:
+            # without this line a broken install makes attached-pack results
+            # vanish with no trace. One stderr line per call (hook stderr goes
+            # to logs, not the model), same channel as the other degrade tells.
+            try:
+                sys.stderr.write(
+                    "engram-surface-hook: engram_search_rules unavailable; attached-pack "
+                    "search disabled (fail closed) -- check the plugin install\n"
+                )
+            except Exception:
+                pass
+            return []
 
         # Build FTS MATCH expression: tokenize to alphanumeric words ≥3 chars,
         # take up to 8, quote-wrap each to prevent FTS5 syntax errors.
@@ -1625,12 +1667,13 @@ def _query_attached_packs(prompt: str, quota: int = _PACK_SURFACE_QUOTA) -> list
                 conn.row_factory = sqlite3.Row
                 try:
                     rows = conn.execute(
-                        """
+                        f"""
                         SELECT n.id, n.type, n.claim, n.confidence,
                                n.recall_summary, n.recall_keywords
                         FROM nodes_fts f
                         JOIN nodes n ON n.rowid = f.rowid
                         WHERE f.nodes_fts MATCH ? AND n.is_current = 1
+                          AND {_not_search_excluded_sql("n")}
                         ORDER BY rank
                         LIMIT ?
                         """,

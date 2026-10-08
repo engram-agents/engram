@@ -886,7 +886,7 @@ def _get_min_queryable_importance(
         tier2_threshold = core._get_tier_threshold(conn, 2)
     row = conn.execute(
         "SELECT MIN(importance_score) FROM nodes "
-        "WHERE is_current = 1 AND importance_score > 0 "
+        f"WHERE {core._searchable_where_sql()} AND importance_score > 0 "
         "  AND importance_score >= ?",
         (max(0.0, tier2_threshold),),
     ).fetchone()
@@ -1672,9 +1672,7 @@ def _search_nodes(
     """
     # Default embed_query to query if not explicitly provided (backward compat).
     effective_embed_query = embed_query if embed_query is not None else query
-    type_filter = set(t.strip() for t in core._as_csv(types).split(",") if t.strip()) or None
-    if type_filter:
-        type_filter = {_TYPE_ALIASES.get(t, t) for t in type_filter}
+    type_filter = _parse_type_filter(types)
     tier2_threshold = core._get_tier_threshold(conn, 2)
 
     # --- Debug signal capture (pre-search) ---
@@ -1720,10 +1718,11 @@ def _search_nodes(
         # value. Previously hardcoded as top_k * 3 — became the binding
         # constraint at the old MMR_POOL_MULTIPLIER ≥ 3.
         fts_rows = conn.execute(
-            """SELECT n.*, fts.rank
+            f"""SELECT n.*, fts.rank
                FROM nodes_fts fts
                JOIN nodes n ON n.rowid = fts.rowid
                WHERE nodes_fts MATCH ?
+                 AND {core._not_search_excluded_sql('n')}
                ORDER BY fts.rank
                LIMIT ?""",
             (fts_query, pool_size * 3),
@@ -2748,21 +2747,14 @@ def _surface_impl(
         test_config = mem.get("test")
         if test_config and test_config.get("enabled"):
             test_max = test_config.get("tier2_max_nodes", 1000)
-            # Compute test threshold using same logic as _get_tier_threshold
+            # Test threshold comes from the SAME function as the real one (with
+            # the test cap as a parameter), so the two can never disagree about
+            # which population is counted. total_current is the searchable
+            # population (evidence excluded) -- the "total_searchable" below.
             total_current = conn.execute(
-                "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1"
+                f"SELECT COUNT(*) as c FROM nodes WHERE {core._searchable_where_sql()}"
             ).fetchone()["c"]
-            if total_current <= test_max:
-                test_threshold = 0.0
-            else:
-                row_t = conn.execute(
-                    """SELECT importance_score FROM nodes
-                       WHERE is_current = 1
-                       ORDER BY importance_score DESC
-                       LIMIT 1 OFFSET ?""",
-                    (test_max - 1,),
-                ).fetchone()
-                test_threshold = row_t["importance_score"] if row_t else 0.0
+            test_threshold = core._get_tier_threshold(conn, 2, max_nodes=test_max)
 
             # Check which base results would be excluded by test config
             tier2_threshold_base = core._get_tier_threshold(conn, 2)
@@ -2929,6 +2921,38 @@ def _inspect_impl(
         conn.close()
 
 
+def _parse_type_filter(types: str) -> Optional[set]:
+    """The ``types`` CSV as a set of canonical node types (aliases resolved), or
+    None when empty. The one parse shared by _search_nodes and the engram_query
+    note."""
+    type_filter = set(t.strip() for t in core._as_csv(types).split(",") if t.strip()) or None
+    if type_filter:
+        type_filter = {_TYPE_ALIASES.get(t, t) for t in type_filter}
+    return type_filter
+
+
+def _search_excluded_types_note(types: str) -> Optional[str]:
+    """A short note when ``types`` names a SEARCH_EXCLUDED_TYPES type, else None.
+
+    All requested types excluded -> the empty result is explained (it is not
+    "no matches"); mixed -> the excluded ones are named as ignored. The type
+    names come from core.SEARCH_EXCLUDED_TYPES, never a literal.
+    """
+    type_filter = _parse_type_filter(types)
+    if not type_filter:
+        return None
+    ignored = sorted(type_filter & set(core.SEARCH_EXCLUDED_TYPES))
+    if not ignored:
+        return None
+    names = ", ".join(ignored)
+    list_hints = " or ".join(f"engram_list with node_type={t}" for t in ignored)
+    if type_filter <= set(core.SEARCH_EXCLUDED_TYPES):
+        return (f"{names} is never a search result, so this query matches nothing "
+                f"by design; to list it use {list_hints}.")
+    return (f"{names} ignored: never a search result; the other requested types "
+            f"were searched normally. To list it use {list_hints}.")
+
+
 def _query_impl(
     query: str,
     types: str = "",
@@ -2942,6 +2966,7 @@ def _query_impl(
     """Impl for engram_query — callable with named kwargs for in-server callers."""
     conn = core._get_db()
     try:
+        excluded_note = _search_excluded_types_note(types)
         search = _search_nodes(
             conn, query, types=types, min_confidence=min_confidence,
             include_superseded=include_superseded, top_k=top_k,
@@ -3055,6 +3080,8 @@ def _query_impl(
             }
             if "debug" in search:
                 response_body["debug"] = search["debug"]
+            if excluded_note:
+                response_body["note"] = excluded_note
             if not refresh_recall:
                 response_body["refresh_recall"] = False
             return json.dumps(core._strip_agent_facing(response_body))
@@ -3078,6 +3105,8 @@ def _query_impl(
             "query": query,
             "total_matches": len(output),
         }
+        if excluded_note:
+            tiered_body["note"] = excluded_note
         if not refresh_recall:
             tiered_body["refresh_recall"] = False
         return json.dumps(core._strip_agent_facing(tiered_body))

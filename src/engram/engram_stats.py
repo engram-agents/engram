@@ -754,10 +754,14 @@ def _diagnose_impl() -> str:
         memory["current_turn"] = current_turn
 
         t2 = core._get_tier_threshold(conn, 2)
+        # tier2_queryable counts the SEARCHABLE population only (evidence is
+        # out of search and out of the tier budget -- core.SEARCH_EXCLUDED_TYPES);
+        # tier3_total below still counts every current node, evidence included.
         tier2_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
+            f"SELECT COUNT(*) as c FROM nodes WHERE {core._searchable_where_sql()} "
+            "AND COALESCE(importance_score, 0) >= ?",
             (t2,),
-        ).fetchone()["c"] if t2 > 0 else total_current
+        ).fetchone()["c"]
         memory["tiers"] = {
             "tier2_queryable": tier2_count,
             "tier2_threshold": round(t2, 4),

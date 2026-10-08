@@ -281,10 +281,13 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
 
         # Memory tier stats (two-tier: queryable vs faded; tier-1 retired)
         t2 = core._get_tier_threshold(conn, 2)
+        # queryable = the SEARCHABLE population only (evidence excluded,
+        # core.SEARCH_EXCLUDED_TYPES); "total" in the log line counts every current node.
         tier2_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
+            f"SELECT COUNT(*) as c FROM nodes WHERE {core._searchable_where_sql()} "
+            "AND COALESCE(importance_score, 0) >= ?",
             (t2,),
-        ).fetchone()["c"] if t2 > 0 else current_count
+        ).fetchone()["c"]
 
         # Append to session log
         now = core._now()
@@ -1149,10 +1152,13 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         total_current = conn.execute(
             "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1"
         ).fetchone()["c"]
+        # tier2_queryable = the SEARCHABLE population only (evidence excluded,
+        # core.SEARCH_EXCLUDED_TYPES); total_current above counts every current node.
         tier2_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
+            f"SELECT COUNT(*) as c FROM nodes WHERE {core._searchable_where_sql()} "
+            "AND COALESCE(importance_score, 0) >= ?",
             (t2,),
-        ).fetchone()["c"] if t2 > 0 else total_current
+        ).fetchone()["c"]
 
         report["summary"] = {
             "contradictions": len(report["unresolved_contradictions"]),

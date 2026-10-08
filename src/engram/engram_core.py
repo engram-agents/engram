@@ -51,6 +51,14 @@ from engram_confidence import (  # noqa: E402
     REASONING_DISCOUNT,
     ABDUCTIVE_CONFIDENCE_CAP,
 )
+# The one definition of "not searchable" lives in a stdlib-only module so the
+# surface hook (which cannot import this file) builds the rule from the same
+# source. Re-exported here under the original names.
+from engram_search_rules import (  # noqa: E402,F401
+    SEARCH_EXCLUDED_TYPES,
+    not_search_excluded_sql as _not_search_excluded_sql,
+    searchable_where_sql as _searchable_where_sql,
+)
 
 
 # #1682: belt-and-suspenders against HuggingFace Hub's online etag-check
@@ -5390,7 +5398,18 @@ def _importance_base_for_node(
     return round(confidence * (1.0 + surprise), 4)
 
 
-def _get_tier_threshold(conn: sqlite3.Connection, tier: int) -> float:
+# SEARCH_EXCLUDED_TYPES, _not_search_excluded_sql and _searchable_where_sql are
+# defined ONCE in engram_search_rules.py (imported at the top of this file):
+# the ONE definition of "not searchable" (Lei 2026-10-08, tracker #2005 §4).
+# Node types in that set are reached by TRAVERSAL (cites edges, engram_inspect,
+# engram_get_subgraph, engram_list), never by SEARCH (FTS or semantic), and they
+# do not consume tier-2 slots -- the tier budget exists purely for search
+# efficiency. Do NOT hand-write ``type != 'evidence'`` elsewhere.
+
+
+def _get_tier_threshold(
+    conn: sqlite3.Connection, tier: int, max_nodes: Optional[int] = None
+) -> float:
     """Compute the importance_score threshold for a visibility tier.
 
     Instead of a fixed threshold, we compute dynamically based on target
@@ -5401,17 +5420,26 @@ def _get_tier_threshold(conn: sqlite3.Connection, tier: int) -> float:
                              Callers use tier=2 instead.
     Tier 2 (queryable): used by reflect, checkpoint, stats, query, add_* similarity-hints
     Tier 3 (total): no threshold, everything visible
+
+    Only the SEARCHABLE population (_searchable_where_sql: current and not a
+    SEARCH_EXCLUDED_TYPES type, i.e. evidence today) is counted and ranked --
+    excluded types neither consume tier-2 slots nor shift the cutoff.
+
+    max_nodes: optional cap override (default: config ``tier2_max_nodes``).
+    The engram_surface tier A/B comparison passes its test cap here instead
+    of re-implementing this logic.
     """
     if tier >= 3:
         return 0.0  # no filter
 
-    mem = _get_memory_config()
-    # Tier 1 is retired; fall through to tier-2 handling for any legacy callers.
-    max_nodes = mem.get("tier2_max_nodes", 1000)
+    if max_nodes is None:
+        mem = _get_memory_config()
+        # Tier 1 is retired; fall through to tier-2 handling for any legacy callers.
+        max_nodes = mem.get("tier2_max_nodes", 1000)
 
-    # Count active current nodes
+    # Count active current searchable nodes
     total = conn.execute(
-        "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1"
+        f"SELECT COUNT(*) as c FROM nodes WHERE {_searchable_where_sql()}"
     ).fetchone()["c"]
 
     if total <= max_nodes:
@@ -5419,8 +5447,8 @@ def _get_tier_threshold(conn: sqlite3.Connection, tier: int) -> float:
 
     # Find the importance_score cutoff that keeps only the top N nodes
     row = conn.execute(
-        """SELECT importance_score FROM nodes
-           WHERE is_current = 1
+        f"""SELECT importance_score FROM nodes
+           WHERE {_searchable_where_sql()}
            ORDER BY importance_score DESC
            LIMIT 1 OFFSET ?""",
         (max_nodes - 1,),
@@ -5529,7 +5557,8 @@ def _compute_recall_set_continuity(conn: sqlite3.Connection, checkpoint_mode: st
     tier2_threshold = _get_tier_threshold(conn, 2)
     current_ids = {
         row["id"] for row in conn.execute(
-            "SELECT id FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
+            f"SELECT id FROM nodes WHERE {_searchable_where_sql()} "
+            "AND COALESCE(importance_score, 0) >= ?",
             (tier2_threshold,),
         ).fetchall()
     }
@@ -8793,6 +8822,12 @@ def _reflect_keywords(row) -> list | None:
 # ---------------------------------------------------------------------------
 
 
+# Bounds for the KNN widening in _semantic_search: at most 4 rounds (k = 40,
+# 160, 640, 2560 for the default top_k), and k never above sqlite-vec's 4096 cap.
+_KNN_MAX_ROUNDS = 4
+_KNN_MAX_K = 4096
+
+
 def _semantic_search(
     conn: sqlite3.Connection,
     query_text: str,
@@ -8808,7 +8843,8 @@ def _semantic_search(
     (SIMD cosine distance). Joined back to nodes for metadata + filtered
     by is_current, importance_threshold, type_filter, min_similarity.
     KNN is applied before filtering, so overfetch (top_k * OVERFETCH) to
-    allow post-filtering without starving the result set.
+    allow post-filtering without starving the result set, and widen the
+    overfetch (bounded) when the filters still leave fewer than top_k.
 
     Slow path (fallback): O(N) pure-Python cosine — only used when the
     sqlite-vec extension failed to load.
@@ -8833,66 +8869,89 @@ def _semantic_search(
         # ── Fast path: sqlite-vec KNN ──────────────────────────────────────
         if _VEC_BACKEND_AVAILABLE and _sqlite_vec is not None and len(query_vector) == 384:
             try:
-                # Overfetch so post-filter by is_current / importance / type
-                # can still yield top_k. Cap at a reasonable ceiling — KNN
-                # cost grows with k, and we rarely need more than ~40 rows
-                # surviving the filter.
-                overfetch = max(top_k * 4, 40)
-                vec_rows = conn.execute(
-                    "SELECT node_id, distance FROM vec_nodes "
-                    "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-                    (_sqlite_vec.serialize_float32(query_vector), overfetch),
-                ).fetchall()
-                if not vec_rows:
-                    return []
+                # vec0 has no metadata column to pre-filter on (a type/current
+                # column would need a vec_nodes schema migration), so the KNN
+                # runs BEFORE the is_current / importance / type filters.
+                # Fetch k = max(top_k*4, 40) first, then WIDEN (x4 per round, at
+                # most _KNN_MAX_ROUNDS rounds, k capped at _KNN_MAX_K) while the
+                # filters left fewer than top_k results AND the KNN still has
+                # candidates at or above min_similarity. Without this, a block of
+                # nearer-but-filtered rows (evidence today) takes the KNN slots
+                # and the semantic leg returns fewer than top_k even though
+                # enough searchable nodes exist. vec0 scans every row regardless
+                # of k, so a larger k only adds heap and result-row cost.
+                query_blob = _sqlite_vec.serialize_float32(query_vector)
+                k = max(top_k * 4, 40)
+                scored: list = []
+                for _round in range(_KNN_MAX_ROUNDS):
+                    vec_rows = conn.execute(
+                        "SELECT node_id, distance FROM vec_nodes "
+                        "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                        (query_blob, k),
+                    ).fetchall()
+                    if not vec_rows:
+                        return []
 
-                # Distance → similarity: distance_metric=cosine returns
-                # (1 - cos_sim). Pre-filter by min_similarity before the JOIN
-                # to avoid fetching nodes we'll discard.
-                keep = []
-                for row in vec_rows:
-                    sim = 1.0 - float(row[1])
-                    if sim >= min_similarity:
-                        keep.append((row[0], sim))
-                if not keep:
-                    return []
+                    # Distance → similarity: distance_metric=cosine returns
+                    # (1 - cos_sim). Pre-filter by min_similarity before the JOIN
+                    # to avoid fetching nodes we'll discard.
+                    keep = []
+                    for row in vec_rows:
+                        sim = 1.0 - float(row[1])
+                        if sim >= min_similarity:
+                            keep.append((row[0], sim))
 
-                ids = [k[0] for k in keep]
-                placeholders = ",".join("?" * len(ids))
-                # When include_superseded=False: require is_current=1 (excludes
-                # both superseded and retracted). When include_superseded=True:
-                # allow superseded (is_current=0) but always exclude retracted —
-                # retracted nodes were never valid (defense-in-depth).
-                where_parts = [f"id IN ({placeholders})"]
-                if not include_superseded:
-                    where_parts.append("is_current = 1")
-                where_parts.append("(status IS NULL OR status != 'retracted')")
-                where_parts.append("COALESCE(importance_score, 0) >= ?")
-                where_clause = " AND ".join(where_parts)
-                meta_rows = conn.execute(
-                    f"SELECT id, type, claim, confidence, quote_type, importance_score "
-                    f"FROM nodes WHERE {where_clause}",
-                    ids + [importance_threshold],
-                ).fetchall()
-                meta = {r["id"]: r for r in meta_rows}
+                    scored = []
+                    if keep:
+                        ids = [k_[0] for k_ in keep]
+                        placeholders = ",".join("?" * len(ids))
+                        # When include_superseded=False: require is_current=1
+                        # (excludes both superseded and retracted). When
+                        # include_superseded=True: allow superseded (is_current=0)
+                        # but always exclude retracted — retracted nodes were
+                        # never valid (defense-in-depth).
+                        where_parts = [f"id IN ({placeholders})"]
+                        if not include_superseded:
+                            where_parts.append("is_current = 1")
+                        where_parts.append("(status IS NULL OR status != 'retracted')")
+                        where_parts.append(_not_search_excluded_sql())
+                        where_parts.append("COALESCE(importance_score, 0) >= ?")
+                        where_clause = " AND ".join(where_parts)
+                        meta_rows = conn.execute(
+                            f"SELECT id, type, claim, confidence, quote_type, importance_score "
+                            f"FROM nodes WHERE {where_clause}",
+                            ids + [importance_threshold],
+                        ).fetchall()
+                        meta = {r["id"]: r for r in meta_rows}
 
-                scored = []
-                for node_id, sim in keep:
-                    r = meta.get(node_id)
-                    if r is None:
-                        continue  # filtered out (non-current / retracted / below threshold)
-                    if type_filter and r["type"] not in type_filter:
-                        continue
-                    scored.append({
-                        "id": r["id"],
-                        "type": r["type"],
-                        "claim": r["claim"],
-                        "confidence": r["confidence"],
-                        "quote_type": r["quote_type"],
-                        "similarity": round(sim, 4),
-                    })
+                        for node_id, sim in keep:
+                            r = meta.get(node_id)
+                            if r is None:
+                                continue  # filtered out (non-current / retracted / excluded type / below threshold)
+                            if type_filter and r["type"] not in type_filter:
+                                continue
+                            scored.append({
+                                "id": r["id"],
+                                "type": r["type"],
+                                "claim": r["claim"],
+                                "confidence": r["confidence"],
+                                "quote_type": r["quote_type"],
+                                "similarity": round(sim, 4),
+                            })
+                            if len(scored) >= top_k:
+                                break
+
                     if len(scored) >= top_k:
                         break
+                    # Widen only if it can add candidates: the KNN returned a
+                    # full page (more rows may exist), the page's farthest row
+                    # is still at or above min_similarity (rows beyond it are
+                    # below the floor), and k has headroom.
+                    exhausted = len(vec_rows) < k
+                    past_floor = (1.0 - float(vec_rows[-1][1])) < min_similarity
+                    if exhausted or past_floor or k >= _KNN_MAX_K:
+                        break
+                    k = min(k * 4, _KNN_MAX_K)
                 return scored
             except sqlite3.OperationalError:
                 pass  # fall through to Python cosine
@@ -8907,6 +8966,7 @@ def _semantic_search(
                      FROM nodes
                      WHERE (status IS NULL OR status != 'retracted')
                      AND embedding IS NOT NULL
+                     AND {excluded}
                      AND COALESCE(importance_score, 0) >= ?"""
         else:
             sql = """SELECT id, type, claim, confidence, is_current, embedding,
@@ -8915,8 +8975,11 @@ def _semantic_search(
                      WHERE is_current = 1
                      AND (status IS NULL OR status != 'retracted')
                      AND embedding IS NOT NULL
+                     AND {excluded}
                      AND COALESCE(importance_score, 0) >= ?"""
-        rows = conn.execute(sql, (importance_threshold,)).fetchall()
+        rows = conn.execute(
+            sql.format(excluded=_not_search_excluded_sql()), (importance_threshold,)
+        ).fetchall()
 
         scored = []
         for r in rows:
@@ -9012,6 +9075,7 @@ def _similar_existing_matches(
                 "FROM nodes_fts fts "
                 "JOIN nodes n ON n.rowid = fts.rowid "
                 f"WHERE nodes_fts MATCH ? AND n.is_current = 1 "
+                f"AND {_not_search_excluded_sql('n')} "
                 f"AND n.type IN ({type_placeholders}) "
                 "AND COALESCE(n.importance_score, 0) >= ? "
                 "ORDER BY rank "

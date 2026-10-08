@@ -2319,6 +2319,8 @@ def engram_query(payload_json: str) -> str:
             query (str, required): Natural language search query.
             types (str, optional): Comma-separated node types to filter
                 (e.g. 'derivation,observation_factual'). Empty = all types.
+                Evidence nodes are never search results; use engram_list
+                with node_type=evidence to list them.
             min_confidence (float, optional): Only return nodes at or above this
                 confidence threshold (0.0–1.0). Default 0.0.
             include_superseded (bool, optional): If True, include non-current
