@@ -320,16 +320,29 @@ installer prints the one line it dropped, with the token file's path. The token
 file itself is not touched. Without this flag, a re-run that leaves out
 `--github-token-file` still stops with an error and writes nothing, when the
 token line is in the main unit file or in a drop-in, under a file name that
-contains `github-token`. The guard reads the main unit and the drop-ins in the
+contains `github-token`, or in a drop-in as a live `Environment=GH_TOKEN=...`
+setting. The guard reads the main unit and the drop-ins in the
 user unit directory (`~/.config/systemd/user/engram-forum.service.d/*.conf`).
 It does not read `/etc` or runtime overrides, and a hand-edited line with
-another file name is not seen. The error names each file that carries the line.
+another file name is not seen. The scan is line by line and looks for
+token-shaped lines. It does not see an `EnvironmentFile=` or `Environment=` line
+continued with a backslash, or a token file whose name lacks `github-token`; this
+holds for the main unit too. A scan that finds nothing is not proof that no token
+is loaded. An empty `GH_TOKEN=` word in a drop-in is not counted: per systemd's
+documented rule (systemd.exec, `Environment=` / `EnvironmentFile=`), variables read
+from `EnvironmentFile=` override those set with `Environment=`, so an empty
+`Environment=GH_TOKEN=` in a drop-in does not clear a token supplied by the main
+unit's `EnvironmentFile=`. This is the documented behaviour; it was not measured on
+a host.
+The error names each file that carries the line.
 With `--github-integration off`, a token line in a drop-in is not removed (the
 installer never edits drop-ins); the notice names the file. A drop-in that sets
 `FORUM_GITHUB_INTEGRATION` itself is warned about, not refused: systemd applies
 drop-ins after the main unit, so that value wins over the one the installer
-renders. The warning covers an `Environment=` line with spaces around `=`, with
-several assignments on one line, and with double-quoted words. It does not read
+renders. An empty `FORUM_GITHUB_INTEGRATION=` gets its own warning: the server
+treats an empty value as unset, which is ON, so it turns an installer-rendered
+`off` back to ON. The warning covers an `Environment=` line with spaces around `=`, with
+several assignments on one line, and with quoted words or values. It does not read
 a quoted word that contains spaces, a line continued with `\`, or `%`
 specifiers. If a drop-in file or the drop-in directory cannot be read, the
 installer stops with an error and writes nothing, rather than guess. An empty `EnvironmentFile=` line in a drop-in clears the main unit's

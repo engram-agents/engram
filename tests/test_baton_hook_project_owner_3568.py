@@ -88,6 +88,24 @@ def test_c2_empty_env_counts_as_unset(engram_home, monkeypatch):
     assert "project anchor has no owner" in ctx, ctx
 
 
+@pytest.mark.parametrize("blank", ["   ", "\t", " \t \n"], ids=["spaces", "tab", "mixed"])
+def test_c2b_whitespace_only_env_counts_as_unset(engram_home, monkeypatch, blank):
+    """A whitespace-only $BATON_GH_OWNER is unset too: no gh call (an `--owner "   "`
+    would be a bogus query), and the same notice line."""
+    mod = _mod(engram_home, monkeypatch, env_owner=blank)
+    ctx, calls = _run(mod, "project/4")
+    assert calls == [], calls
+    assert "project anchor has no owner" in ctx, ctx
+
+
+def test_c2c_env_owner_is_stripped_before_use(engram_home, monkeypatch):
+    mod = _mod(engram_home, monkeypatch, env_owner="  org2 \n")
+    ctx, calls = _run(mod, "project/4")
+    assert len(calls) == 1, calls
+    argv = calls[0]
+    assert argv[argv.index("--owner") + 1] == "org2", argv
+
+
 def test_c3_no_owner_notice_is_not_cached_as_a_status(engram_home, monkeypatch):
     mod = _mod(engram_home, monkeypatch, env_owner=None)
     cache = {}

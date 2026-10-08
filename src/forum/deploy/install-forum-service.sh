@@ -51,8 +51,11 @@
 #                       so a re-install can never silently drop it. The line is looked
 #                       for in the main unit AND in the drop-ins of the user unit dir
 #                       (engram-forum.service.d/*.conf, #3593; never /etc or runtime
-#                       overrides), and a refusal names each file. A drop-in that sets
-#                       FORUM_GITHUB_INTEGRATION itself is warned about, not refused:
+#                       overrides), and a refusal names each file. A drop-in that supplies
+#                       the token directly (a live Environment=GH_TOKEN=... word) counts too.
+#                       A drop-in that sets
+#                       FORUM_GITHUB_INTEGRATION itself (an empty value too: the server
+#                       reads it as unset, i.e. ON) is warned about, not refused:
 #                       systemd applies drop-ins after the main unit, so it overrides
 #                       the value rendered here.
 #                       Also renders `Environment=FORUM_GITHUB_INTEGRATION=on`; without
@@ -249,7 +252,50 @@ _EXISTING_UNIT="$UNIT_DIR/$UNIT"
 # rules as _forum_home_dropin below: the user unit dir only (no /etc, no runtime
 # overrides, no systemctl), *.conf in name order, live (non-comment) lines, plain file
 # reads. Both are FUNCTIONS (macOS bash 3.2: case patterns stay out of $( ) bodies).
-# Print each drop-in file holding a live `EnvironmentFile=...github-token...` line.
+# Succeeds when the file has a live `Environment=` line with a `GH_TOKEN=<non-empty>`
+# word (X_GH_TOKEN= and GH_TOKEN_FILE= are other names and do not match). Words split
+# on whitespace; a leading quote on the word and quotes around the value are dropped,
+# as in _dropin_switch_overrides. The value is never printed.
+_dropin_has_gh_token_word() {
+  local _l _w _rest
+  local -a _words
+  local _re='^Environment[[:space:]]*=(.*)$'
+  while IFS= read -r _l || [ -n "$_l" ]; do
+    _l="${_l%$'\r'}"
+    _l="${_l#"${_l%%[![:space:]]*}"}"
+    case "$_l" in
+      '#'*|';'*) continue ;;
+    esac
+    [[ "$_l" =~ $_re ]] || continue
+    _rest="${BASH_REMATCH[1]}"
+    _words=()
+    read -r -a _words <<< "$_rest" || true
+    for _w in ${_words[@]+"${_words[@]}"}; do
+      _w="${_w#[\"\']}"
+      case "$_w" in
+        GH_TOKEN=*)
+          _w="${_w#GH_TOKEN=}"
+          _w="${_w#[\"\']}"
+          _w="${_w%[\"\']}"
+          if [ -n "$_w" ]; then return 0; fi
+          ;;
+      esac
+    done
+  done < "$1"
+  return 1
+}
+# Print each drop-in file holding a live token: an `EnvironmentFile=...github-token...`
+# line, or a live `Environment=` word `GH_TOKEN=<non-empty>` (plain or quoted, alone or
+# one of several words on the line; #3593 follow-up -- the token supplied directly).
+# SCOPE OF THIS SCAN: it is line-oriented and looks for token-shaped lines. It does
+# not see a backslash-continued EnvironmentFile= or Environment= line, nor a token file
+# whose name lacks `github-token`; the same limits hold for the main unit. A scan hit is a
+# real token line; a miss is not proof that no token is loaded.
+# An empty `GH_TOKEN=` word is not counted. Per systemd's documented rule (systemd.exec,
+# Environment= / EnvironmentFile=), variables read from EnvironmentFile= override those set
+# with Environment=, so an empty `Environment=GH_TOKEN=` in a drop-in does not clear a
+# token supplied by the main unit's EnvironmentFile. (Documented behaviour, not measured
+# on a host.)
 # An unreadable drop-in directory or *.conf is refused here (rc 2, ERROR on stderr,
 # before any write): a scan that silently saw nothing would let `=off` render over a
 # live token. Callers run this WITHOUT $( ) -- `_dropin_token_files "$u" || exit 2` --
@@ -276,7 +322,8 @@ _dropin_token_files() {
       echo "ERROR: cannot read drop-in $_f; nothing was written. Fix its permissions and re-run." >&2
       return 2
     fi
-    if printf '%s\n' "$_t" | grep -Eq -- '^[[:space:]]*EnvironmentFile[[:space:]]*=.*github-token'; then
+    if printf '%s\n' "$_t" | grep -Eq -- '^[[:space:]]*EnvironmentFile[[:space:]]*=.*github-token' \
+        || _dropin_has_gh_token_word "$_f"; then
       if [ -n "$_DROPIN_TOKEN_LIST" ]; then _DROPIN_TOKEN_LIST="$_DROPIN_TOKEN_LIST, "; fi
       _DROPIN_TOKEN_LIST="$_DROPIN_TOKEN_LIST$_f"
     fi
@@ -291,12 +338,13 @@ _dropin_token_files() {
 # continuations, single-quote and escape rules, and `%`-specifiers. Words are split on
 # whitespace only. Readability was already checked by _dropin_token_files.
 _dropin_switch_overrides() {
-  local _f _l _v _w _rest
+  local _f _l _v _w _rest _set
   local -a _words
   local _re='^Environment[[:space:]]*=(.*)$'
   for _f in "$1".d/*.conf; do
     [ -f "$_f" ] || continue
     _v=""
+    _set=0
     while IFS= read -r _l || [ -n "$_l" ]; do
       _l="${_l%$'\r'}"
       _l="${_l#"${_l%%[![:space:]]*}"}"
@@ -312,13 +360,17 @@ _dropin_switch_overrides() {
         case "$_w" in
           FORUM_GITHUB_INTEGRATION=*)
             _w="${_w#FORUM_GITHUB_INTEGRATION=}"
+            _w="${_w#[\"\']}"
             _w="${_w%[\"\']}"
             _v="$_w"
+            _set=1
             ;;
         esac
       done
     done < "$_f"
-    if [ -n "$_v" ]; then printf '%s %s\n' "$_f" "$_v"; fi
+    # An empty value is reported too (`<file> ` with nothing after the space): the
+    # server reads an empty FORUM_GITHUB_INTEGRATION as unset (ON).
+    if [ "$_set" -eq 1 ]; then printf '%s %s\n' "$_f" "$_v"; fi
   done
   return 0
 }
@@ -372,7 +424,7 @@ if [ -f "$_EXISTING_UNIT" ]; then
         echo "==> --github-integration off: the re-rendered unit will not carry the github-token EnvironmentFile line(s): $_dropped (from $_EXISTING_UNIT)"
       fi
       if [ -n "$_dropin_tokens" ]; then
-        echo "==> --github-integration off: the installer did not remove the github-token EnvironmentFile line(s) in drop-in(s): $_dropin_tokens (it never edits drop-ins; they stay loaded, harmless while GitHub integration is off)"
+        echo "==> --github-integration off: the installer did not remove the GitHub token line(s) (a github-token EnvironmentFile or a GH_TOKEN setting) in drop-in(s): $_dropin_tokens (it never edits drop-ins; they stay loaded, harmless while GitHub integration is off)"
       fi
     else
       if [ "$_main_token" -eq 1 ] && [ -z "$_dropin_tokens" ]; then
@@ -380,7 +432,7 @@ if [ -f "$_EXISTING_UNIT" ]; then
       else
         _where="$_dropin_tokens"
         if [ "$_main_token" -eq 1 ]; then _where="$_EXISTING_UNIT, $_where"; fi
-        echo "ERROR: a github-token EnvironmentFile line is already present in: $_where; re-installing without" >&2
+        echo "ERROR: a GitHub token (a github-token EnvironmentFile line or a GH_TOKEN setting) is already present in: $_where; re-installing without" >&2
       fi
       echo "       --github-token-file <path> would silently drop the gate's dedicated GitHub identity." >&2
       echo "       Nothing was written. Re-run with --github-token-file <path>," >&2
@@ -393,7 +445,11 @@ if [ -f "$_EXISTING_UNIT" ]; then
   # operator value, so it is warned about, never refused.
   if [ -n "$GITHUB_TOKEN_FILE" ]; then _rendered_switch=on; else _rendered_switch=off; fi
   _dropin_switch_overrides "$_EXISTING_UNIT" | while IFS=' ' read -r _of _ov; do
-    echo "WARNING: drop-in $_of sets FORUM_GITHUB_INTEGRATION=$_ov, which overrides the value this installer renders ($_rendered_switch): systemd applies drop-ins after the main unit."
+    if [ -z "$_ov" ]; then
+      echo "WARNING: drop-in $_of sets FORUM_GITHUB_INTEGRATION to an empty value, which the server treats as unset (ON); it overrides the value this installer renders ($_rendered_switch): systemd applies drop-ins after the main unit."
+    else
+      echo "WARNING: drop-in $_of sets FORUM_GITHUB_INTEGRATION=$_ov, which overrides the value this installer renders ($_rendered_switch): systemd applies drop-ins after the main unit."
+    fi
   done
 fi
 

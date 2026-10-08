@@ -292,6 +292,35 @@ def test_server_init_route_accepts_owner_form_and_refuses_malformed(world):
     assert world.store.read_project("pool-w") is None
 
 
+def test_server_init_s5_digit_cap_covers_the_owner_form(world, monkeypatch):
+    """The init route's own S5 digit-cap check (defense in depth behind the shared
+    anchor regex, which caps the number at 15 digits) must recognise ``project/<owner>/
+    <N>``. With the real gate an over-cap number is refused EARLIER (as unparseable), so
+    the S5 branch is unreachable; this cell loosens the gate's parse to reach it and
+    asserts the S5-specific text, and that nothing was written."""
+    import re
+    from test_baton_anchor_binding import seq_state
+    lenient = re.compile(r"project/(?:[A-Za-z0-9][A-Za-z0-9-]{0,38}/)?([0-9]+)")
+    real = world.gate._parse_github_anchor
+
+    def parse(value):
+        m = lenient.fullmatch(value or "")
+        return real(value) if m is None or len(m.group(1)) <= 15 else ("project", None, m.group(1))
+
+    monkeypatch.setattr(world.gate, "_parse_github_anchor", parse)
+    from test_baton_advance_api import SENTINEL
+    seq0 = seq_state(world)
+    for anchor in (f"project/{OWNER}/{'1' * 16}", f"project/{'1' * 16}"):
+        r = world.client.post("/api/projects", json={
+            "agent": AUTHOR, "project_id": "pool-s5", "title": "t", "status": "in-progress",
+            "turn": AUTHOR, "turn_reason": "r", "participants": [AUTHOR, COLLEAGUE, SENTINEL],
+            "colleague": COLLEAGUE, "author": AUTHOR, "github": anchor})
+        assert r.status_code == 422, (anchor, r.get_json())
+        assert "github anchor number has 16 digits; at most 15 are accepted." in r.get_json()["error"], (
+            anchor, r.get_json())
+    assert world.store.read_project("pool-s5") is None and seq_state(world) == seq0
+
+
 def test_server_local_shape_regex_accepts_owner_form_like_the_gate():
     from forum import server as S
     g = _gate()
