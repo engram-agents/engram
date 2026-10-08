@@ -91,6 +91,7 @@
       "path_prefix_or_glob": "hooks/claude/engram-baton-prompt-hook.py",
       "test_globs": [
         "tests/test_baton_hook.py",
+        "tests/test_baton_hook_project_owner_3568.py",
         "tests/test_baton_autopull.py",
         "tests/test_build_plugin_hooks_consistency.py",
         "tests/test_engine_phase3.py",

@@ -438,7 +438,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             print(
                 f"baton init: invalid --github value '{github_anchor}'. "
                 f"Accepted forms: {GITHUB_ANCHOR_ACCEPTED_FORMS} "
-                "(e.g. pr/490, pr/owner/repo/22, project/4).",
+                "(e.g. pr/490, pr/owner/repo/22, project/4, project/owner/4).",
                 file=sys.stderr,
             )
             sys.exit(EXIT_VALIDATION)
@@ -2333,7 +2333,7 @@ def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str, client: 
         print(
             f"baton anchor: invalid --github value '{github_anchor}'. "
             f"Accepted forms: {GITHUB_ANCHOR_ACCEPTED_FORMS} "
-            "(e.g. pr/490, pr/owner/repo/22, project/4).",
+            "(e.g. pr/490, pr/owner/repo/22, project/4, project/owner/4).",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -2938,7 +2938,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "GitHub anchor for live status in the auto-pull hook. "
             f"Format: {GITHUB_ANCHOR_ACCEPTED_FORMS} "
-            "(e.g. pr/490, pr/owner/repo/22, project/4). "
+            "(e.g. pr/490, pr/owner/repo/22, project/4, project/owner/4). "
             "A PR-<N> project_id auto-derives pr/<N> if this is omitted."
         ),
     )
@@ -3248,7 +3248,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--github", metavar="ANCHOR", required=True,
         help=(
             f"GitHub anchor value: {GITHUB_ANCHOR_ACCEPTED_FORMS} "
-            "(e.g. pr/490, pr/owner/repo/22, project/4). "
+            "(e.g. pr/490, pr/owner/repo/22, project/4, project/owner/4). "
             "Repo-qualify (#1715, #1918) every PR anchor -- there is no "
             "default repo, and gc/flip/merge refuse an unqualified one."
         ),

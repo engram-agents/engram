@@ -1425,7 +1425,7 @@ def _anchor_refusal(route: str, pid: str, store, new_anchor: str,
     legacy-unset batons and bunches may still be anchored and re-anchored.
 
     A3 -- the value must parse the way ``baton anchor`` (the CLI) accepts it:
-    ``pr/<N>``, ``pr/<owner>/<repo>/<N>`` or ``project/<N>`` (reusing the gate's
+    ``pr/<N>``, ``pr/<owner>/<repo>/<N>``, ``project/<owner>/<N>`` or ``project/<N>`` (reusing the gate's
     own regex, so server and CLI cannot drift). Line-break/control characters were
     already refused by the shared reader.
     """
@@ -1468,7 +1468,7 @@ def _anchor_refusal(route: str, pid: str, store, new_anchor: str,
         return (
             f"{route} {pid}: invalid github anchor {new_anchor!r}. Accepted forms: "
             f"{gate.GITHUB_ANCHOR_ACCEPTED_FORMS} (e.g. pr/490, pr/example-org/example-repo/22, "
-            "project/4).", 422)
+            "project/4, project/example-org/4).", 422)
 
     # Round 9 (B1): id-bind the anchor where it is WRITTEN (fairy / legacy / bunch
     # re-anchored to a PR), not only at advance. A missing baton is the caller's 404.
@@ -1502,7 +1502,10 @@ def _bound_repo(gate, pid: str, login_map_cfg: Optional[dict]) -> Optional[str]:
 
 
 _PR_ISH_ID_RE = re.compile(r"(?i)^(?:[A-Z][A-Z0-9]*-)?PR-")
-_ANCHOR_SHAPE_RE = re.compile(r"(?:pr/(?:[\w.-]+/[\w.-]+/)?|project/)[0-9]{1,15}")
+# #3568: mirrors baton_gate._GITHUB_ANCHOR_RE (incl. the project/<owner>/<N> form); pinned
+# equal to the gate's parser by a parity test.
+_ANCHOR_SHAPE_RE = re.compile(
+    r"(?:pr/(?:[\w.-]+/[\w.-]+/)?|project/(?:[A-Za-z0-9][A-Za-z0-9-]{0,38}/)?)[0-9]{1,15}")
 
 
 def _anchorless_pr_refusal(route: str, project_id: str, given: str) -> str:
@@ -1525,7 +1528,9 @@ def _anchorless_pr_refusal(route: str, project_id: str, given: str) -> str:
 
 # Gate-unavailable fallback for ``baton_gate.GITHUB_ANCHOR_ACCEPTED_FORMS`` (the server
 # does not import the gate there); pinned equal to the gate's constant by a test.
-_ACCEPTED_FORMS_FALLBACK = "pr/<owner>/<repo>/<N>, pr/<N>, or project/<N>"
+_ACCEPTED_FORMS_FALLBACK = (
+    "pr/<owner>/<repo>/<N>, pr/<N>, project/<owner>/<N>, or project/<N>"
+)
 
 
 def _unparseable_github_refusal(route: str, project_id: str, given: str) -> str:
@@ -3621,7 +3626,7 @@ def create_app(
         g_norm = (github or "").strip().lower()
         if g_norm:
             tail = g_norm.rsplit("/", 1)[-1]
-            if (re.fullmatch(r"(?:pr/(?:[\w.-]+/[\w.-]+/)?|project/)[0-9]+", g_norm)
+            if (re.fullmatch(r"(?:pr/(?:[\w.-]+/[\w.-]+/)?|project/(?:[A-Za-z0-9][A-Za-z0-9-]{0,38}/)?)[0-9]+", g_norm)
                     and len(tail) > 15):
                 # S5: the shared anchor regex caps the number at 15 ASCII digits; init
                 # used to store a 5000-digit one that later 500ed or stuck the baton.

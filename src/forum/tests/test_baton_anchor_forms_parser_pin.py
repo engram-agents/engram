@@ -33,6 +33,12 @@ _PLACEHOLDERS = {"<owner>": "o", "<repo>": "r", "<N>": "1"}
 # (word chars, '.', '-'; dots are real, e.g. foo.github.io). Minimal values alone leave a
 # narrowed digit limit or character class invisible.
 _BOUNDARY_PLACEHOLDERS = {"<owner>": "a-b_c.d", "<repo>": "x.y-z_1", "<N>": "9" * 15}
+# #3568: the owner of ``project/<owner>/<N>`` follows the GitHub LOGIN rule (1-39 chars,
+# alnum or hyphen, no leading hyphen) -- narrower than a PR's owner/repo class (no '.'
+# or '_'). Its boundary instance is the 39-char maximum with an inner hyphen.
+_PROJECT_BOUNDARY_PLACEHOLDERS = {
+    "<owner>": "a-" + "b" * 37, "<repo>": "x.y-z_1", "<N>": "9" * 15,
+}
 
 
 def _named_forms():
@@ -56,7 +62,11 @@ def _accepted_instances():
 
 
 def _boundary_instances():
-    return [_instantiate(t, _BOUNDARY_PLACEHOLDERS) for t in _named_forms()]
+    return [
+        _instantiate(t, _PROJECT_BOUNDARY_PLACEHOLDERS if t.startswith("project/")
+                     else _BOUNDARY_PLACEHOLDERS)
+        for t in _named_forms()
+    ]
 
 
 REJECTED = [
@@ -70,6 +80,13 @@ REJECTED = [
     "project/",
     "project/abc",
     "project/o/r/1",
+    "project/o/",
+    "project//1",
+    "project/-o/1",
+    "project/o.x/1",
+    "project/o_x/1",
+    "project/" + "a" * 40 + "/1",
+    "project/o/" + "1" * 16,
     "issue/1",
     "/pr/1",
     "pr/1/",
@@ -96,7 +113,7 @@ def test_constant_is_machine_readable_and_names_the_known_shapes():
     # rather than silently pinning nothing.
     forms = _accepted_instances()
     assert forms, "derived zero forms from the constant"
-    assert {"pr/1", "pr/o/r/1", "project/1"} <= set(forms), forms
+    assert {"pr/1", "pr/o/r/1", "project/1", "project/o/1"} <= set(forms), forms
 
 
 def test_every_named_form_is_accepted_by_regex_and_parser():

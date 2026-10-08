@@ -114,8 +114,12 @@ _CACHE_TTL = 30
 # Per-gh-call timeout in seconds — quick-fail so the hook stays fast
 _GH_TIMEOUT = 4
 
-# GitHub Project owner (used for project-anchor queries)
-_GH_OWNER = os.environ.get("BATON_GH_OWNER", "engram-agents")
+# #3568 F1: the GitHub owner of a project anchor comes from the anchor itself
+# (project/<owner>/<N>), else from $BATON_GH_OWNER if set and non-empty, else there is
+# NO owner: no gh call, and the render says so. There is deliberately NO hardcoded
+# default org -- a released feature must not name a team (same rule as the bare pr/<N>
+# anchor below). Resolved at call time, not import time.
+_NO_OWNER_NOTICE = "project anchor has no owner: re-anchor as project/<owner>/<N>"
 
 # #1918 / #1650 / #1919: there is NO default repo for a bare pr/<N> anchor,
 # deliberately -- do not revisit (same rule as tools/baton.py and
@@ -131,6 +135,36 @@ _GH_OWNER = os.environ.get("BATON_GH_OWNER", "engram-agents")
 # #1715: pr/<N> (bare) or pr/<owner>/<repo>/<N> (repo-qualified) -- mirrors
 # tools/baton.py's _GITHUB_ANCHOR_RE / _parse_github_anchor.
 _PR_ANCHOR_RE = re.compile(r"^pr/(?:([\w.-]+)/([\w.-]+)/)?(\d+)$", re.IGNORECASE)
+
+
+# #3568: project/<N> (bare) or project/<owner>/<N>. MIRRORS baton_gate.py's
+# _PROJECT_OWNER_PATTERN / _PROJECT_OWNER_ANCHOR_RE (the source of truth; kept in sync
+# by hand like _PR_ANCHOR_RE above). Owner = GitHub login rule: 1-39 chars, alnum or
+# hyphen, not starting with a hyphen. Anchors are lowercased before parsing, and
+# GitHub logins are case-insensitive, so re.IGNORECASE changes nothing real.
+_PROJECT_OWNER_PATTERN = r"[A-Za-z0-9][A-Za-z0-9-]{0,38}"
+_PROJECT_ANCHOR_RE = re.compile(
+    r"^project/(?:(" + _PROJECT_OWNER_PATTERN + r")/)?([0-9]{1,15})$", re.IGNORECASE
+)
+
+
+def _parse_project_anchor(anchor: str) -> Optional[tuple]:
+    """Parse project/<N> or project/<owner>/<N> into (owner_or_None, number).
+
+    Returns None if the anchor is not a well-formed project anchor.
+    """
+    m = _PROJECT_ANCHOR_RE.match(anchor.strip().lower())
+    if not m:
+        return None
+    return (m.group(1), m.group(2))
+
+
+def _project_anchor_owner(anchor: Optional[str]) -> Optional[str]:
+    """The owner carried by a project/<owner>/<N> anchor, else None (bare or malformed)."""
+    if not anchor:
+        return None
+    parsed = _parse_project_anchor(anchor)
+    return parsed[0] if parsed else None
 
 
 def _parse_pr_anchor(anchor: str) -> Optional[tuple]:
@@ -406,8 +440,11 @@ def _fetch_pr_status(pr_num: str, repo: Optional[str] = None) -> Optional[str]:
         return None
 
 
-def _fetch_project_status(project_num: str) -> Optional[str]:
+def _fetch_project_status(project_num: str, owner: str) -> Optional[str]:
     """Call ``gh project item-list`` and return a tally render string, or None.
+
+    ``owner`` is required (#3568): the caller resolves it from the anchor or the
+    environment and never calls this without one.
 
     Returns strings like ``"2 Done · 1 In Progress · 2 Blocked"``.
     """
@@ -415,7 +452,7 @@ def _fetch_project_status(project_num: str) -> Optional[str]:
         result = subprocess.run(
             [
                 "gh", "project", "item-list", project_num,
-                "--owner", _GH_OWNER,
+                "--owner", owner,
                 "--format", "json",
             ],
             capture_output=True,
@@ -490,8 +527,17 @@ def _get_live_status(anchor: str, cache: dict) -> str:
                     pr_repo, pr_num = parsed
                     render = _fetch_pr_status(pr_num, repo=pr_repo)
             elif anchor.startswith("project/"):
-                project_num = anchor[8:]
-                render = _fetch_project_status(project_num)
+                parsed_proj = _parse_project_anchor(anchor)
+                if parsed_proj is not None:
+                    anchor_owner, project_num = parsed_proj
+                    # #3568: anchor owner -> $BATON_GH_OWNER (non-empty) -> none.
+                    owner = anchor_owner or os.environ.get("BATON_GH_OWNER", "").strip()
+                    if not owner:
+                        # No owner anywhere: make no gh call, cache nothing (the
+                        # stale-cache fallback below is keyed on the same anchor),
+                        # and say so.
+                        return _NO_OWNER_NOTICE
+                    render = _fetch_project_status(project_num, owner)
         except Exception:
             render = None  # fall through to stale-cache check
 

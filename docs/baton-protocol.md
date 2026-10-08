@@ -91,14 +91,14 @@ Create a new project baton file. Fails if the file already exists.
 - A PR-shaped id (`PR-...`, `<PREFIX>-PR-...`) must resolve a PR anchor: a number in the
   id plus `--repo`, or an explicit `--github pr/<owner>/<repo>/<N>`. An id with no
   number (`PR-autopull`) is refused unless `--github` is given; use
-  `--github project/<N>` for a bunch, or a non-PR-shaped id.
+  `--github project/<N>` (or `project/<owner>/<N>`) for a bunch, or a non-PR-shaped id.
   The forum server enforces the same rule itself (#3366): `POST /api/projects` for a
   PR-shaped id with no `github`, or one that does not parse, is a 422 naming both routes, with no bypass and nothing
   stored, so a direct API call or `baton-migrate-to-coord-store` hits it too (the
   CLI refusal is the early, friendly copy). It applies at creation only.
 - For **every** id (#3377), the server refuses a `github` that is present but does not
   parse: `POST /api/projects` answers 422 naming the accepted forms (`pr/<owner>/<repo>/<N>`,
-  `pr/<N>`, `project/<N>`), before anything is written and with no bypass; an absent, empty
+  `pr/<N>`, `project/<owner>/<N>`, `project/<N>`), before anything is written and with no bypass; an absent, empty
   or blank `github` on a non-PR-shaped id stays allowed (a bunch with no anchor).
 
 ```bash

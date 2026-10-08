@@ -95,7 +95,8 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 # GitHub anchor value validation: pr/<N>, pr/<owner>/<repo>/<N> (repo-qualified,
-# #1715), or project/<N>. Repo-qualification is REQUIRED for any gh call this
+# #1715), project/<N>, or project/<owner>/<N> (#3568: the anchor carries the GitHub
+# owner of the project, so no seat needs config for it). Repo-qualification is REQUIRED for any gh call this
 # file makes (#1918: there is no default repo) -- an unqualified pr/<N> is
 # refused-and-counted by cmd_gc/cmd_flip/cmd_merge (and now api_project_flip)
 # rather than resolved against a guess.
@@ -105,8 +106,17 @@ from typing import Optional
 # Unicode digits, and ``int(<5000 digits>)`` raises ValueError on Python >= 3.11
 # (a 500 from the route and -- the anchor being write-once in ``peer`` -- a
 # stuck baton). No real PR number is anywhere near 15 digits.
+#
+# #3568: the owner of ``project/<owner>/<N>`` follows the GitHub login rule: 1-39
+# chars, alphanumeric or hyphen, not starting with a hyphen. Readers lowercase an
+# anchor before parsing it; GitHub logins are case-insensitive, so that is fine.
+_PROJECT_OWNER_PATTERN = r"[A-Za-z0-9][A-Za-z0-9-]{0,38}"
 _GITHUB_ANCHOR_RE = re.compile(
-    r"^(?:pr/(?:[\w.-]+/[\w.-]+/)?[0-9]{1,15}|project/[0-9]{1,15})$"
+    r"^(?:pr/(?:[\w.-]+/[\w.-]+/)?[0-9]{1,15}"
+    r"|project/(?:" + _PROJECT_OWNER_PATTERN + r"/)?[0-9]{1,15})$"
+)
+_PROJECT_OWNER_ANCHOR_RE = re.compile(
+    r"^project/(" + _PROJECT_OWNER_PATTERN + r")/[0-9]{1,15}$"
 )
 
 
@@ -160,7 +170,9 @@ PR_ANCHOR_TWO_ROUTE_HINT = (
 # src/forum/server.py ``api_project_init``) and the CLI's ``baton init --github``
 # refusal (tools/baton.py ``cmd_init``). Surface-neutral: each surface supplies its
 # own lead-in. These are exactly the shapes ``_parse_github_anchor`` accepts.
-GITHUB_ANCHOR_ACCEPTED_FORMS = "pr/<owner>/<repo>/<N>, pr/<N>, or project/<N>"
+GITHUB_ANCHOR_ACCEPTED_FORMS = (
+    "pr/<owner>/<repo>/<N>, pr/<N>, project/<owner>/<N>, or project/<N>"
+)
 
 
 def _parse_github_anchor(value: str) -> Optional[tuple]:
@@ -171,6 +183,11 @@ def _parse_github_anchor(value: str) -> Optional[tuple]:
     must refuse-and-count an unqualified PR anchor rather than guess one).
     number is the PR/project number as a string. Returns None if `value`
     doesn't match a known anchor shape (caller should treat as "no anchor").
+
+    #3568: ``project/<owner>/<N>`` parses to ``("project", None, <N>)`` -- the SAME
+    tuple as the bare ``project/<N>``. The owner is NEVER put in the repo slot: many
+    callers read a non-None slot 1 as "repo-qualified PR". Use
+    :func:`_project_anchor_owner` for the owner.
     """
     if not value:
         return None
@@ -179,10 +196,23 @@ def _parse_github_anchor(value: str) -> Optional[tuple]:
         owner, repo, number = m.group(1), m.group(2), m.group(3)
         repo_qualified = f"{owner}/{repo}" if owner and repo else None
         return ("pr", repo_qualified, number)
-    m = re.match(r"^project/([0-9]{1,15})$", value)
+    m = re.match(r"^project/(?:" + _PROJECT_OWNER_PATTERN + r"/)?([0-9]{1,15})$", value)
     if m:
         return ("project", None, m.group(1))
     return None
+
+
+def _project_anchor_owner(value) -> Optional[str]:
+    """The GitHub owner carried by a ``project/<owner>/<N>`` anchor (#3568), else None.
+
+    None for a bare ``project/<N>``, for any ``pr/...`` anchor, and for anything
+    malformed (or not a string). PURE. The owner is returned as written (callers
+    lowercase anchors before parsing; GitHub logins are case-insensitive).
+    """
+    if not isinstance(value, str):
+        return None
+    m = _PROJECT_OWNER_ANCHOR_RE.match(value)
+    return m.group(1) if m else None
 
 
 _INIT_LOG_LINE_RE = re.compile(r"^- \S+ initialized → ([a-z0-9_-]+):", re.MULTILINE)

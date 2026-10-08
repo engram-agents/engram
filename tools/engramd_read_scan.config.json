@@ -73,6 +73,8 @@
   "hooks/claude/engram-bash-pipe-exit-warn.py:main",
   "hooks/claude/engram-baton-prompt-hook.py:_parse_pr_anchor",
   "hooks/claude/engram-baton-prompt-hook.py:_is_bare_pr_anchor",
+  "hooks/claude/engram-baton-prompt-hook.py:_parse_project_anchor",
+  "hooks/claude/engram-baton-prompt-hook.py:_project_anchor_owner",
   "hooks/claude/engram-baton-prompt-hook.py:_load_config",
   "hooks/claude/engram-baton-prompt-hook.py:_get_agent_name",
   "hooks/claude/engram-baton-prompt-hook.py:_parse_frontmatter",
