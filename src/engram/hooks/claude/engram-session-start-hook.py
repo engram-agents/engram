@@ -73,6 +73,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
 from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context, _trim_to_line_boundary
+from _hooklib import _open_regular_fd
 # #3521: shared advisory-probe `unknown` rendering (once per session here, so
 # only the stderr line + the one injected line are used; no rate-limit stamp).
 from _hooklib import probe_unknown_line, write_probe_unknown_stderr
@@ -2517,8 +2518,14 @@ def write_marker(hook_input: dict) -> dict | None:
     _existing_started_at = None
     _existing_compaction_count = 0
     try:
-        with open(session_marker_path) as _existing_f:
-            _existing_marker = json.load(_existing_f)
+        # #3576: a plain open() of a FIFO here blocks until a writer appears and
+        # hangs SessionStart. _open_regular_fd opens O_NONBLOCK and rejects
+        # anything that is not a regular file (None => treated as no prior marker).
+        _existing_fd = _open_regular_fd(session_marker_path)
+        _existing_marker = None
+        if _existing_fd is not None:
+            with os.fdopen(_existing_fd) as _existing_f:
+                _existing_marker = json.load(_existing_f)
         if isinstance(_existing_marker, dict):
             _cc = _existing_marker.get("compaction_count")
             if isinstance(_cc, int) and not isinstance(_cc, bool) and _cc >= 0:
