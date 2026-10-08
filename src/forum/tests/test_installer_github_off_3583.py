@@ -133,3 +133,56 @@ def test_fresh_install_off_is_the_same_as_no_flag(tmp_path):
     assert _OFF in _noncomment(body)
     assert _env_lines(body) == []
     assert not [ln for ln in r.stdout.splitlines() if "will not carry" in ln]
+
+
+# ---------------------------------------------------------------------------
+# Non-dry-run refusal cells (review F1 on PR #3592).
+#
+# Under --dry-run the installer never writes, so "nothing was written" cannot
+# fail. Every refusal below runs WITHOUT --dry-run against the stubbed PATH
+# (the #3312 pattern in test_installer.py): a refusal that fires too late leaves
+# the service dir behind, rewrites the unit, or calls a write stub.
+# ---------------------------------------------------------------------------
+
+
+def _assert_refused_before_any_write(tmp_path, r, unit, log, unit_text):
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert not (tmp_path / "forum").exists(), "service dir was created before the refusal"
+    assert not log.exists(), "a write stub was called:\n" + (log.read_text() if log.exists() else "")
+    if unit_text is None:
+        assert not unit.exists()
+    else:
+        assert unit.read_bytes() == unit_text.encode()
+
+
+@pytest.mark.parametrize("unit_text", [None, _WITH_TOKEN], ids=["fresh", "with-token"])
+def test_nondry_off_with_token_file_refused_before_any_write(tmp_path, unit_text):
+    r, unit, log = _install(tmp_path, ["--github-integration", "off", "--github-token-file", _TOKEN_FILE],
+                            unit=unit_text, dry_run=False)
+    _assert_refused_before_any_write(tmp_path, r, unit, log, unit_text)
+    assert "--github-integration" in r.stderr and "--github-token-file" in r.stderr
+
+
+def test_nondry_off_with_login_map_in_old_unit_refused_before_any_write(tmp_path):
+    r, unit, log = _install(tmp_path, ["--github-integration", "off"],
+                            unit=_WITH_TOKEN_AND_MAP, dry_run=False)
+    _assert_refused_before_any_write(tmp_path, r, unit, log, _WITH_TOKEN_AND_MAP)
+    assert "--baton-login-map" in r.stderr
+
+
+def test_nondry_no_flag_on_token_unit_refused_before_any_write(tmp_path):
+    r, unit, log = _install(tmp_path, [], unit=_WITH_TOKEN, dry_run=False)
+    _assert_refused_before_any_write(tmp_path, r, unit, log, _WITH_TOKEN)
+    assert "--github-token-file" in r.stderr and "--github-integration off" in r.stderr
+
+
+@pytest.mark.parametrize("flags", [
+    ["--github-integration", "on"],
+    ["--github-integration", "maybe"],
+    ["--github-integration", ""],
+    ["--github-integration"],
+], ids=["on", "other", "empty", "no-value"])
+def test_nondry_other_values_refused_before_any_write(tmp_path, flags):
+    r, unit, log = _install(tmp_path, flags, unit=_WITH_TOKEN, dry_run=False)
+    _assert_refused_before_any_write(tmp_path, r, unit, log, _WITH_TOKEN)
+    assert "--github-integration" in r.stderr and "unknown arg" not in r.stderr

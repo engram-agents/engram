@@ -318,9 +318,11 @@ src/forum/deploy/install-forum-service.sh --src "$PWD" --github-integration off
 The new unit carries `FORUM_GITHUB_INTEGRATION=off` and no token line. The
 installer prints the one line it dropped, with the token file's path. The token
 file itself is not touched. Without this flag, a re-run that leaves out
-`--github-token-file` still stops with an error and writes nothing, so the checks
-are never dropped by accident. The flag cannot be combined with
-`--github-token-file`.
+`--github-token-file` still stops with an error and writes nothing, when the
+token line is in the main unit file under a file name that contains
+`github-token`. The guard reads only that file: a token set by a systemd
+drop-in, or by a hand-edited line with another file name, is not seen. The flag
+cannot be combined with `--github-token-file`.
 
 If the unit has a baton login map, pass `--baton-login-map` again as usual: `off`
 keeps the map, because the map also backs a check that is not a GitHub read.
