@@ -88,6 +88,21 @@ _unit_forum_home() {
     /*) printf '%s\n' "$_v" ;;
   esac
 }
+# Print the first drop-in file (<unit>.d/*.conf, name order) that sets FORUM_HOME,
+# plain or quoted form, on a live (non-comment) line; print nothing when there is
+# none. Used only to explain a refusal: FORUM_HOME is read from the MAIN unit alone,
+# and a seat that keeps it in a drop-in is told to move it, never guessed at.
+_forum_home_dropin() {
+  local _f
+  for _f in "$1".d/*.conf; do
+    [ -f "$_f" ] || continue
+    if grep -Eq '^[[:space:]]*Environment=("?)FORUM_HOME=' "$_f"; then
+      printf '%s\n' "$_f"
+      return 0
+    fi
+  done
+  return 0
+}
 if [ -z "$SERVICE_DIR" ]; then
   _EXISTING_UNIT="$HOME/.config/systemd/user/engram-forum.service"
   if [ ! -f "$_EXISTING_UNIT" ]; then
@@ -96,6 +111,11 @@ if [ -z "$SERVICE_DIR" ]; then
   fi
   SERVICE_DIR="$(_unit_forum_home "$_EXISTING_UNIT")"
   if [ -z "$SERVICE_DIR" ]; then
+    _dropin="$(_forum_home_dropin "$_EXISTING_UNIT")"
+    if [ -n "$_dropin" ]; then
+      echo "ERROR: FORUM_HOME is set in a drop-in ($_dropin), not in the main unit $_EXISTING_UNIT; move that Environment= line into the main unit, or pass --service-dir <dir>" >&2
+      exit 2
+    fi
     echo "ERROR: $_EXISTING_UNIT has no parsable absolute Environment=FORUM_HOME=<dir> line; pass --service-dir <dir> explicitly" >&2
     exit 2
   fi

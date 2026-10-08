@@ -257,6 +257,21 @@ _unit_forum_home() {
     /*) printf '%s\n' "$_v" ;;
   esac
 }
+# Print the first drop-in file (<unit>.d/*.conf, name order) that sets FORUM_HOME,
+# plain or quoted form, on a live (non-comment) line; print nothing when there is
+# none. Used only to explain a refusal: FORUM_HOME is read from the MAIN unit alone,
+# and a seat that keeps it in a drop-in is told to move it, never guessed at.
+_forum_home_dropin() {
+  local _f
+  for _f in "$1".d/*.conf; do
+    [ -f "$_f" ] || continue
+    if grep -Eq '^[[:space:]]*Environment=("?)FORUM_HOME=' "$_f"; then
+      printf '%s\n' "$_f"
+      return 0
+    fi
+  done
+  return 0
+}
 if [ -z "$SERVICE_DIR" ]; then
   if [ ! -f "$_EXISTING_UNIT" ]; then
     echo "ERROR: --service-dir is required on a first install (e.g. /home/<shared>/forum)" >&2
@@ -264,6 +279,13 @@ if [ -z "$SERVICE_DIR" ]; then
   fi
   SERVICE_DIR="$(_unit_forum_home "$_EXISTING_UNIT")"
   if [ -z "$SERVICE_DIR" ]; then
+    _dropin="$(_forum_home_dropin "$_EXISTING_UNIT")"
+    if [ -n "$_dropin" ]; then
+      echo "ERROR: FORUM_HOME is set in a drop-in ($_dropin), not in the main unit $_EXISTING_UNIT." >&2
+      echo "       The installer reads FORUM_HOME from the main unit only. Move that Environment= line" >&2
+      echo "       into the main unit, or pass --service-dir <dir>. Nothing was written." >&2
+      exit 2
+    fi
     echo "ERROR: $_EXISTING_UNIT has no parsable absolute Environment=FORUM_HOME=<dir> line, so the" >&2
     echo "       service dir cannot be reused. Nothing was written. Pass --service-dir <dir> explicitly." >&2
     exit 2
@@ -604,11 +626,33 @@ _check_backup_exec_paths() {
     esac
   done < "$_unit"
   [ -n "$_cmds" ] || _bce_fail "no ExecStart= command found (absent or empty)"
+  # A kept unit may contain only the shapes the installer itself renders (#3579):
+  # an absolute interpreter, an absolute script, flags with values. Anything else is
+  # a refusal that names the line and the one remedy, never a wider parser.
+  _bce_shape() {
+    echo "ERROR: $_unit: $1" >&2
+    echo "       The installer supports only the ExecStart shape it renders itself (absolute interpreter," >&2
+    echo "       absolute script, --db/--backup-dir/--audit <absolute path>; %h is the only specifier)." >&2
+    echo "       In: $_cmd" >&2
+    echo "       Nothing was restarted. Move the unit aside (mv $_unit $_unit.old) and re-run so the installer renders it." >&2
+    exit 2
+  }
   local _toks _tok _first _x _script _i _flag _val _parent
   set -f
   while IFS= read -r _cmd; do
     [ -n "$_cmd" ] || continue
     _toks=($_cmd)
+    for _tok in "${_toks[@]}"; do
+      case "$_tok" in
+        *\;*) _bce_fail "ExecStart holds a ';' ($_tok), so a second command may follow and cannot be checked: $_cmd" ;;
+        -m) _bce_shape "ExecStart uses the '-m <module>' form" ;;
+      esac
+      _x="${_tok//\%h/}"
+      case "$_x" in
+        *\$*) _bce_shape "ExecStart token '$_tok' uses a \$ variable" ;;
+        *%*) _bce_shape "ExecStart token '$_tok' uses a systemd specifier other than %h" ;;
+      esac
+    done
     _first="${_toks[0]}"
     while :; do
       case "$_first" in
@@ -619,7 +663,10 @@ _check_backup_exec_paths() {
     _first="${_first//\%h/$HOME}"
     case "$_first" in
       /*) ;;
-      *) set +f; _bce_fail "ExecStart interpreter '$_first' is not an absolute path" ;;
+      *) _bce_shape "ExecStart interpreter '$_first' is not an absolute path" ;;
+    esac
+    case "${_first##*/}" in
+      env) _bce_shape "ExecStart uses env as the interpreter" ;;
     esac
     [ -f "$_first" ] || { set +f; _bce_fail "ExecStart interpreter $_first does not exist (or is not a file)"; }
     _script=""
@@ -635,7 +682,7 @@ _check_backup_exec_paths() {
     [ -n "$_script" ] || { set +f; _bce_fail "ExecStart names no script after the interpreter"; }
     case "$_script" in
       /*) ;;
-      *) set +f; _bce_fail "ExecStart script '$_script' is not an absolute path" ;;
+      *) _bce_shape "ExecStart script '$_script' is not an absolute path" ;;
     esac
     [ -f "$_script" ] || { set +f; _bce_fail "ExecStart script $_script does not exist (or is not a file)"; }
     _i=1
@@ -650,6 +697,7 @@ _check_backup_exec_paths() {
           _flag="${_tok%%=*}"; _val="${_tok#*=}" ;;
       esac
       if [ -n "$_flag" ]; then
+        [ -n "$_val" ] || _bce_fail "ExecStart $_flag has no value (nothing follows it), so its target cannot be checked: $_cmd"
         _val="${_val//\%h/$HOME}"
         case "$_val" in
           /*)

@@ -139,6 +139,7 @@ def _install(tmp_path: Path, *, service_dir_arg: bool = True, dry_run: bool = Fa
     if prep:
         _prep_service_dir(svc)
     for name, text in (existing or {}).items():
+        (unit_dir / name).parent.mkdir(parents=True, exist_ok=True)
         (unit_dir / name).write_text(text)
     stub, log = _stubs(tmp_path, primary_group)
     args = ["bash", str(INSTALLER), "--src", str(_REPO)]
@@ -564,12 +565,16 @@ _HOME_CASES = [
 ]
 
 
-def _extract_unit_forum_home(script: Path) -> str:
+def _extract_fn(script: Path, name: str) -> str:
     out = subprocess.run(
-        ["awk", "/^_unit_forum_home\\(\\) \\{/{p=1} p{print} p&&/^\\}/{exit}", str(script)],
+        ["awk", "/^" + name + "\\(\\) \\{/{p=1} p{print} p&&/^\\}/{exit}", str(script)],
         capture_output=True, text=True, check=True).stdout
-    assert out.startswith("_unit_forum_home() {") and out.rstrip().endswith("}"), out
+    assert out.startswith(name + "() {") and out.rstrip().endswith("}"), out
     return out
+
+
+def _extract_unit_forum_home(script: Path) -> str:
+    return _extract_fn(script, "_unit_forum_home")
 
 
 def _run_unit_forum_home(script: Path, tmp_path: Path, unit_text: str) -> str:
@@ -608,3 +613,146 @@ class TestUnitForumHomeParser:
         assert str(ctx.unit_dir / MAIN) in ctx.err, ctx.err
         assert "Forum service dir" not in ctx.out
         assert list(base.iterdir()) == [], list(base.iterdir())
+
+
+# ---------------------------------------------------------------------------
+# #3579 -- a kept forum unit may contain only the shapes the installer itself
+# renders; anything else is a LOUD refusal (exit 2) naming the line and the remedy.
+# Written BEFORE the implementation (contract-first).
+# ---------------------------------------------------------------------------
+
+def _unit_with_exec(execstart: str) -> str:
+    return f"[Service]\nExecStart={execstart}\n"
+
+
+class TestKeptUnitShapes3579:
+
+    def test_positive_control_the_live_unit_shape_still_passes(self, tmp_path):
+        svc = tmp_path / "forum"
+        c = _check(tmp_path, _live_unit(svc, joiner=" \\\n    "))
+        assert c.passed and c.r.returncode == 0, c.both
+
+    @pytest.mark.parametrize("flag", ["--db", "--backup-dir", "--audit"])
+    def test_flag_as_last_token_with_no_value_is_refused_naming_the_flag(self, tmp_path, flag):
+        c = _check(tmp_path, _unit_with_exec(f"/bin/sh /bin/sh {flag}"))
+        assert not c.passed and c.r.returncode == 2, c.both
+        assert flag in c.r.stderr, c.both
+
+    def test_equals_form_with_empty_value_is_refused(self, tmp_path):
+        c = _check(tmp_path, _unit_with_exec("/bin/sh /bin/sh --db="))
+        assert not c.passed and c.r.returncode == 2, c.both
+        assert "--db" in c.r.stderr, c.both
+
+    @pytest.mark.parametrize("exec_line", [
+        "/usr/bin/env python3 /bin/sh --db /x",
+        "/bin/sh -m forum.server --db /x",
+        "/bin/sh -m /bin/sh --db /x",
+        "%S/bin/py /bin/sh --db /x",
+        "/bin/sh %S/s.py --db /x",
+        "/bin/sh /bin/sh --db %S/forum.db",
+        "/bin/sh /bin/sh --db $FORUM_HOME/forum.db",
+        "$FORUM_HOME/bin/py /bin/sh",
+        "/bin/sh $FORUM_HOME/s.py",
+    ], ids=["env", "dash-m-module", "dash-m-abs", "specifier-interp", "specifier-script",
+            "specifier-flag-value", "var-flag-value", "var-interp", "var-script"])
+    def test_foreign_shapes_are_refused_with_the_remedy(self, tmp_path, exec_line):
+        c = _check(tmp_path, _unit_with_exec(exec_line))
+        assert not c.passed and c.r.returncode == 2, c.both
+        err = c.r.stderr
+        assert "only" in err and "renders" in err, err
+        assert "mv " in err and "re-run" in err, err
+        assert PROBE in err, err
+
+    def test_percent_h_keeps_working(self, tmp_path):
+        u = _unit_with_exec(f"%h/bin/py %h/tools/s.py --db {tmp_path}/forum/forum.db")
+        assert _check(tmp_path, u, home_files=("bin/py", "tools/s.py")).passed
+
+    def test_standalone_semicolon_second_command_is_refused(self, tmp_path):
+        c = _check(tmp_path, _unit_with_exec("/bin/sh /bin/sh --db /x ; /bin/true"))
+        assert not c.passed and c.r.returncode == 2, c.both
+        assert ";" in c.r.stderr and "second command" in c.r.stderr, c.both
+
+    @pytest.mark.parametrize("exec_line", [
+        "/bin/sh /bin/sh --db /x; /bin/true",
+        "/bin/sh /bin/sh --db /x;",
+        "/bin/sh /bin/sh --db /x ;/bin/true",
+    ], ids=["glued-trailing", "glued-last", "glued-leading"])
+    def test_semicolon_glued_to_a_token_is_refused_too(self, tmp_path, exec_line):
+        c = _check(tmp_path, _unit_with_exec(exec_line))
+        assert not c.passed and c.r.returncode == 2, c.both
+
+    def test_semicolon_comment_line_inside_a_continuation_still_ignored(self, tmp_path):
+        svc = tmp_path / "forum"
+        u = (f"[Service]\nExecStart=/bin/sh /bin/sh \\\n; a comment line\n"
+             f"# another\n    --db {svc}/forum.db\n")
+        c = _check(tmp_path, u)
+        assert c.passed, c.both
+
+
+def _dropin_unit_home(tmp_path: Path, dropin_text: str | None) -> tuple:
+    """Main unit with NO FORUM_HOME, plus (optionally) a drop-in."""
+    home = tmp_path / "home"
+    unit_dir = home / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True)
+    (unit_dir / MAIN).write_text("[Service]\nExecStart=/x\n")
+    if dropin_text is not None:
+        d = unit_dir / (MAIN + ".d")
+        d.mkdir()
+        (d / "00-other.conf").write_text("[Service]\nEnvironment=PACK_LIMIT=3\n")
+        (d / "home.conf").write_text(dropin_text)
+    return home, unit_dir
+
+
+class TestForumHomeInDropin3579:
+
+    @pytest.mark.parametrize("line", [
+        "Environment=FORUM_HOME=/srv/forum",
+        'Environment="FORUM_HOME=/srv/forum"',
+    ], ids=["plain", "quoted"])
+    def test_installer_refuses_and_names_the_dropin(self, tmp_path, line):
+        ctx = _install(tmp_path, service_dir_arg=False, dry_run=True, prep=False,
+                       existing={MAIN: "[Service]\nExecStart=/x\n",
+                                 MAIN + ".d/home.conf": f"[Service]\n{line}\n"})
+        assert ctx.r.returncode == 2, ctx.both
+        assert str(ctx.unit_dir / (MAIN + ".d") / "home.conf") in ctx.err, ctx.err
+        assert "drop-in" in ctx.err and "main unit" in ctx.err, ctx.err
+        assert "Forum service dir" not in ctx.out
+
+    @pytest.mark.parametrize("line", [
+        "Environment=FORUM_HOME=/srv/forum",
+        'Environment="FORUM_HOME=/srv/forum"',
+    ], ids=["plain", "quoted"])
+    def test_drift_check_refuses_and_names_the_dropin(self, tmp_path, line):
+        home, unit_dir = _dropin_unit_home(tmp_path, f"[Service]\n{line}\n")
+        r = subprocess.run(["bash", str(DRIFT)], capture_output=True, text=True,
+                           env=_hermetic_env(home))
+        assert r.returncode == 2, r.stdout + r.stderr
+        assert str(unit_dir / (MAIN + ".d") / "home.conf") in r.stderr, r.stderr
+        assert "drop-in" in r.stderr and "main unit" in r.stderr, r.stderr
+
+    def test_dropin_with_other_settings_only_keeps_the_plain_unparsable_message(self, tmp_path):
+        ctx = _install(tmp_path, service_dir_arg=False, dry_run=True, prep=False,
+                       existing={MAIN: "[Service]\nExecStart=/x\n",
+                                 MAIN + ".d/o.conf": "[Service]\nEnvironment=PACK=1\n"})
+        assert ctx.r.returncode == 2, ctx.both
+        assert "drop-in" not in ctx.err, ctx.err
+        assert str(ctx.unit_dir / MAIN) in ctx.err
+
+    def test_positive_control_forum_home_in_main_unit_with_other_dropins(self, tmp_path):
+        ctx = _install(tmp_path, service_dir_arg=False, dry_run=True, prep=False,
+                       existing={MAIN: _MAIN_BASE.format(env="Environment=FORUM_HOME=/srv/f"),
+                                 MAIN + ".d/o.conf": "[Service]\nEnvironment=PACK=1\n"})
+        assert ctx.r.returncode == 0, ctx.both
+        assert "Forum service dir: /srv/f " in ctx.out, ctx.out
+
+    def test_main_unit_wins_over_a_dropin_that_also_sets_it(self, tmp_path):
+        # the refusal is only for "no FORUM_HOME in the main unit"
+        ctx = _install(tmp_path, service_dir_arg=False, dry_run=True, prep=False,
+                       existing={MAIN: _MAIN_BASE.format(env="Environment=FORUM_HOME=/srv/f"),
+                                 MAIN + ".d/h.conf": "[Service]\nEnvironment=FORUM_HOME=/srv/g\n"})
+        assert ctx.r.returncode == 0, ctx.both
+        assert "Forum service dir: /srv/f " in ctx.out, ctx.out
+
+    def test_the_dropin_detector_is_byte_identical_in_both_scripts(self):
+        assert (_extract_fn(INSTALLER, "_forum_home_dropin")
+                == _extract_fn(DRIFT, "_forum_home_dropin"))
