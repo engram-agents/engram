@@ -60,7 +60,7 @@ NOMATCH_CMD = "ls -la"
 PLANT_TOP = f'    raise RuntimeError("{RAW_MSG}")\n'
 
 
-def _dev_hook_text():
+def _dev_hook_text(required=True):
     for ref in ("origin/dev", "dev"):
         r = subprocess.run(
             ["git", "-C", str(REPO_ROOT), "show", f"{ref}:{HOOK_REL}"],
@@ -68,6 +68,8 @@ def _dev_hook_text():
         )
         if r.returncode == 0 and r.stdout:
             return r.stdout
+    if not required:
+        return None
     pytest.skip("no origin/dev or dev ref available to compare against")
 
 
@@ -173,9 +175,16 @@ def _assert_visible_crash(r):
 # --- C1/C2/C5: planted exception, first run -----------------------------------
 
 def test_c2_planted_exception_is_visible(sandbox):
-    hook = _install(sandbox, _plant_top(_dev_hook_text()), "planted_dev.py")
-    ctl = _run(sandbox, hook, NOMATCH_CMD)  # CONTROL: unfixed dev text stays silent
-    assert (ctl.returncode, ctl.stdout, ctl.stderr) == (0, "", "")
+    dev_text = _dev_hook_text(required=False)
+    if dev_text is not None:
+        hook = _install(sandbox, _plant_top(dev_text), "planted_dev.py")
+        ctl = _run(sandbox, hook, NOMATCH_CMD)  # CONTROL: unfixed dev text stays silent
+        # Documents the pre-fix state: once dev carries the fix the control is
+        # moot and is not asserted (it must not go red on the fix it motivated).
+        if ctl.stdout or ctl.stderr:
+            _stamp(sandbox).unlink(missing_ok=True)  # dev's visible crash may have stamped the window
+        else:
+            assert ctl.returncode == 0
     hook = _install(sandbox, _plant_top((HOOKS_SRC / HOOK_NAME).read_text(encoding="utf-8")), "planted.py")
     r = _run(sandbox, hook, NOMATCH_CMD)
     _assert_visible_crash(r)
