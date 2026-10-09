@@ -26,6 +26,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import test_agentctl_forum_hint_3563 as hint_mod  # noqa: E402
 import test_resolve_engram_home_abspath as resolve_mod  # noqa: E402
 import test_socket_ownership_guard as guard_mod  # noqa: E402
 import test_start_daemon_probe_branch_logging as probe_mod  # noqa: E402
@@ -180,6 +181,60 @@ def test_stat_only_gate_names_a_missing_stat(monkeypatch, platform):
     monkeypatch.setattr(sys, "platform", platform)
     _fake_guard_host(monkeypatch, net_unix=True, proc_fd=True, gnu_stat=False)
     assert guard_mod._missing_stat_primitive() == ["GNU `stat -c`"]
+
+
+# ---------------------------------------------------------------------------
+# GNU `stat -c` for tools/agentctl (#3614): hint writer + viz-operator config read
+# ---------------------------------------------------------------------------
+
+
+def _fake_stat(monkeypatch, *, returncode=0, stdout="1000 755 user\n", exc=None):
+    seen = []
+
+    def fake_run(cmd, *a, **k):
+        seen.append(cmd)
+        if exc is not None:
+            raise exc
+        return types.SimpleNamespace(returncode=returncode, stdout=stdout)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return seen
+
+
+@pytest.mark.parametrize("platform", PLATFORMS)
+def test_agentctl_gnu_stat_present_means_not_missing(monkeypatch, platform):
+    monkeypatch.setattr(sys, "platform", platform)
+    seen = _fake_stat(monkeypatch)
+    assert hint_mod._gnu_stat_missing() is False
+    assert seen[0][:2] == ["stat", "-c"] and "%U" in seen[0][2] and "%a" in seen[0][2]
+
+
+@pytest.mark.parametrize("platform", PLATFORMS)
+def test_agentctl_gnu_stat_rejecting_dash_c_means_missing(monkeypatch, platform):
+    monkeypatch.setattr(sys, "platform", platform)
+    _fake_stat(monkeypatch, returncode=1, stdout="")
+    assert hint_mod._gnu_stat_missing() is True
+
+
+@pytest.mark.parametrize("platform", PLATFORMS)
+def test_agentctl_gnu_stat_empty_output_means_missing(monkeypatch, platform):
+    monkeypatch.setattr(sys, "platform", platform)
+    _fake_stat(monkeypatch, returncode=0, stdout="\n")
+    assert hint_mod._gnu_stat_missing() is True
+
+
+@pytest.mark.parametrize("platform", PLATFORMS)
+@pytest.mark.parametrize("exc", [FileNotFoundError("stat"), PermissionError("stat"),
+                                 subprocess.TimeoutExpired("stat", 5)])
+def test_agentctl_gnu_stat_that_cannot_run_counts_as_missing(monkeypatch, platform, exc):
+    monkeypatch.setattr(sys, "platform", platform)
+    _fake_stat(monkeypatch, exc=exc)
+    assert hint_mod._gnu_stat_missing() is True
+
+
+def test_agentctl_gnu_stat_skip_reason_names_the_primitive():
+    assert "GNU `stat -c`" in hint_mod._NEEDS_GNU_STAT_REASON
+    assert "Linux-only by design" in hint_mod._NEEDS_GNU_STAT_REASON
 
 
 def test_blocking_io_probe_returns_false_when_the_socket_cannot_bind(monkeypatch):

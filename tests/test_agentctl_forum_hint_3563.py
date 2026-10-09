@@ -59,6 +59,31 @@ ME = subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip(
 MYGROUP = subprocess.run(["id", "-gn"], capture_output=True, text=True).stdout.strip()
 
 
+def _gnu_stat_missing() -> bool:
+    """True when this host lacks the GNU ``stat -c`` that tools/agentctl runs.
+
+    tools/agentctl is Linux-only by design (its header; macOS uses
+    tools/agentctl-mac) and calls ``stat -c %U`` (the hint writer's owner
+    check) and ``stat -c '%u %a'`` (the viz-operator config provenance read).
+    BSD stat has no ``-c``. The condition is the missing PRIMITIVE, never the
+    platform name (#3333): a host with GNU stat, whatever its OS, never skips.
+    The probe runs the union of both call sites' formats against an existing
+    directory and needs rc 0 with non-empty stdout; a stat that cannot run at
+    all counts as missing rather than crashing collection.
+    """
+    try:
+        r = subprocess.run(["stat", "-c", "%u %a %U", "/"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return r.returncode != 0 or not r.stdout.strip()
+
+
+_NEEDS_GNU_STAT_REASON = ("needs GNU `stat -c` (absent on this host); "
+                          "tools/agentctl is Linux-only by design")
+needs_gnu_stat = pytest.mark.skipif(_gnu_stat_missing(), reason=_NEEDS_GNU_STAT_REASON)
+
+
 def _hermetic_env(**extra):
     env = dict(os.environ)
     for k in ("ENGRAM_HOME", "FORUM_URL", "FORUM_ANSWER", "FORUM_FORCE",
@@ -183,6 +208,11 @@ def _entries(d):
 
 
 class TestDWriter:
+    # Cells marked @needs_gnu_stat sit at or after the writer's owner check
+    # (`stat -c %U`). Without GNU stat that check refuses EVERY call, so such a
+    # cell would "pass" on a refusal that is not the one it is about. Cells
+    # before the owner check (URL, symlink/missing dir) run everywhere.
+    @needs_gnu_stat
     def test_happy_path_exact_content_mode_owner_and_no_temp_left(self, tmp_path):
         home, hint = _tree(tmp_path)
         r = _write_hint(home)
@@ -195,6 +225,7 @@ class TestDWriter:
         assert st.st_nlink == 1
         assert _entries(hint.parent) == ["forum-url.hint"]
 
+    @needs_gnu_stat
     def test_mode_is_0600_even_under_a_permissive_umask(self, tmp_path):
         home, hint = _tree(tmp_path)
         r = _write_hint(home, umask="000")
@@ -208,6 +239,7 @@ class TestDWriter:
         assert "forum-url" in r.stderr
         assert _entries(hint.parent) == []
 
+    @needs_gnu_stat
     def test_existing_hint_is_never_overwritten(self, tmp_path):
         home, hint = _tree(tmp_path)
         hint.write_text("OLD\n")
@@ -217,6 +249,7 @@ class TestDWriter:
         assert hint.read_text() == "OLD\n"
         assert _entries(hint.parent) == ["forum-url.hint"]
 
+    @needs_gnu_stat
     def test_symlinked_target_is_not_followed(self, tmp_path):
         home, hint = _tree(tmp_path)
         victim = tmp_path / "victim"
@@ -228,6 +261,7 @@ class TestDWriter:
         assert os.readlink(hint) == str(victim)
         assert _entries(hint.parent) == ["forum-url.hint"]
 
+    @needs_gnu_stat
     def test_dangling_symlink_target_is_not_followed_or_created_through(self, tmp_path):
         home, hint = _tree(tmp_path)
         ghost = tmp_path / "ghost"
@@ -268,6 +302,7 @@ class TestDWriter:
         assert r.returncode != 0 and "WARN" in r.stderr
         assert not (home / ".engram").exists()
 
+    @needs_gnu_stat
     def test_engram_dir_not_owned_by_the_newborn_user_is_refused(self, tmp_path):
         home, hint = _tree(tmp_path)
         # chown is shadowed to succeed, so ONLY the owner check can refuse: a
@@ -277,6 +312,7 @@ class TestDWriter:
         assert "WARN" in r.stderr and "not owned by nobody" in r.stderr
         assert _entries(hint.parent) == [], "no file and no temp name may be left"
 
+    @needs_gnu_stat
     def test_unresolvable_group_publishes_nothing(self, tmp_path):
         home, hint = _tree(tmp_path)
         r = _write_hint(home, group="no-such-group-xyz")
@@ -284,6 +320,7 @@ class TestDWriter:
         assert "WARN" in r.stderr
         assert _entries(hint.parent) == [], "a half-owned file must never be published"
 
+    @needs_gnu_stat
     def test_target_created_between_check_and_publish_survives(self, tmp_path):
         home, hint = _tree(tmp_path)
         # a function named ln shadows the command: the target appears with
