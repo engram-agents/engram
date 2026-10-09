@@ -105,6 +105,10 @@ from _hooklib import (
     open_regular_text, open_regular_text_append, open_regular_text_write,
     read_regular_text,
 )
+from _hooklib import (
+    append_shown_record, build_exclusion_resolver, in_context_drop_ids,
+    in_context_exclusion_enabled,
+)
 from _harness import detect_harness, get_harness_budgets
 
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
@@ -1523,6 +1527,12 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
                 )
             except Exception as exc:  # e.g. an unserialisable tool_input: fail-open
                 print(f"route-ledger: {type(exc).__name__}: {exc}"[:300], file=sys.stderr)
+            # #3613 S1: the shown record, AFTER the ledger's resolver read its
+            # sources. Written whatever the exclusion kill switch says.
+            try:
+                append_shown_record("tool_recall", hook_input.get("session_id"), shown_)
+            except Exception:  # a non-dict hook_input: fail-open, as above
+                pass
 
         # Gate passed — query the daemon with the novel terms.
         result = _query_recall_daemon(recall_query)
@@ -1539,6 +1549,24 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
         skipped_recent = 0
         pool = (result.get("special_nodes") or []) + (result.get("top_claims") or [])
         _cut_names: dict = {}  # route ledger: id -> this route's own cut name
+        # #3613 live in-context exclusion: drop candidates already in the
+        # model's context BEFORE the max_lines cap, so the next ones backfill.
+        # Default OFF (`recall_in_context_exclusion.enabled`); fail-open (a
+        # resolver that cannot be built or called drops nothing). lesson /
+        # cornerstone are exempt on THIS route: a tripwire's job is
+        # action-time salience, so it re-shows even what is in context.
+        try:
+            if in_context_exclusion_enabled(ENGRAM_HOME):
+                _resolver = build_exclusion_resolver(
+                    hook_input.get("session_id") if hook_input else None)
+                _drop = in_context_drop_ids(
+                    [n for n in pool if isinstance(n, dict)], _resolver,
+                    exempt_types=("lesson", "cornerstone"))
+                if _drop:
+                    pool = [n for n in pool if not (isinstance(n, dict) and n.get("id") in _drop)]
+                    _cut_names.update({i: "in_context" for i in _drop})
+        except Exception:
+            pass
         for n in pool:
             nid = n.get("id", "?")
             if len(lines) >= cfg["max_lines"]:

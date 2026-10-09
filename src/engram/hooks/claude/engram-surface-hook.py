@@ -40,6 +40,10 @@ os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 if HOOK_DIR not in sys.path:
     sys.path.insert(0, HOOK_DIR)
 from _hooklib import resolve_runtime_dir, emit_context, write_route_ledger, prompt_fire_key
+from _hooklib import (
+    append_shown_record, build_exclusion_resolver, in_context_drop_ids,
+    in_context_exclusion_enabled,
+)
 # #3521: shared advisory-probe `unknown` rendering (sanitize + stderr line + the
 # one injected line + the stamp-file rate limit) and the tri-state pgrep probe.
 from _hooklib import (
@@ -2054,12 +2058,50 @@ def render_one_node_line(
     return f"- {warn_marker}[{nid}] {prefix}{age_tag}{kw_prefix}{body}{person_suffix}{moment_suffix}"
 
 
+def _apply_in_context_exclusion(result: dict, resolver) -> tuple:
+    """(result', dropped_ids) for the live in-context exclusion (#3613 C1-C5).
+
+    Removes every candidate the resolver says is already in the model's context
+    (`in_context is True`, any `why`) from `special_nodes`, `top_claims`,
+    `matched_meta` and `matched_ids` -- on a COPY, `result` itself is untouched
+    (the route ledger still reads the full candidate list). Runs before any of
+    format_nudge's caps, so an excluded id never takes a slot. `match_count` is
+    left as the daemon sent it. Fail-open: no resolver, or any exception ->
+    (result, empty set), i.e. the switch-off render."""
+    try:
+        if resolver is None:
+            return result, set()
+        pool = (
+            list(result.get("special_nodes") or [])
+            + list(result.get("top_claims") or [])
+            + list(result.get("matched_meta") or [])
+            + [{"id": i} for i in (result.get("matched_ids") or [])]
+        )
+        drop = in_context_drop_ids(pool, resolver)
+        if not drop:
+            return result, set()
+
+        def _keep(entries):
+            return [e for e in entries if not (isinstance(e, dict) and e.get("id") in drop)]
+
+        out = dict(result)
+        for key in ("special_nodes", "top_claims", "matched_meta"):
+            if key in out:
+                out[key] = _keep(out[key] or [])
+        if "matched_ids" in out:
+            out["matched_ids"] = [i for i in (out["matched_ids"] or []) if i not in drop]
+        return out, drop
+    except Exception:
+        return result, set()
+
+
 def format_nudge(
     result: dict,
     pack_results: list[dict] | None = None,
     session_id: str | None = None,
     stats: dict | None = None,
     route_out: dict | None = None,
+    in_context_resolver=None,
 ) -> str:
     """Format engram_surface result into a compact nudge string.
 
@@ -2177,6 +2219,23 @@ def format_nudge(
     total = result.get("match_count", 0)
     if total == 0:
         return ""
+
+    # --- Live in-context exclusion (#3613): drop candidates already in the
+    # model's context BEFORE any cap below, so the next candidates backfill.
+    # `in_context_resolver` is None when the kill switch is off (the default),
+    # so nothing in this block runs and the render is byte-identical.
+    _in_context_dropped: set = set()
+    if in_context_resolver is not None:
+        result, _in_context_dropped = _apply_in_context_exclusion(result, in_context_resolver)
+        if _in_context_dropped:
+            if route_out is not None:
+                route_out["cut_reasons"].update({i: "in_context" for i in _in_context_dropped})
+            _left = (
+                (result.get("special_nodes") or []) + (result.get("top_claims") or [])
+                + (result.get("matched_meta") or []) + (result.get("matched_ids") or [])
+            )
+            if not _left:
+                return ""  # everything was in context: no recall block (C8)
 
     # --- Suppression setup ---------------------------------------------
     suppression_active = session_id is not None
@@ -2747,6 +2806,8 @@ def format_nudge(
             _reasons[_i] = "echo"
         for _i in budget_cut_ids | _others_budget_cut:
             _reasons[_i] = "budget"
+        for _i in _in_context_dropped:
+            _reasons[_i] = "in_context"  # #3613: dropped before the caps
         route_out["shown"] = [i for i in _shown_order if i]
         route_out["cut_reasons"] = {k: v for k, v in _reasons.items() if k}
 
@@ -3826,12 +3887,23 @@ def main():
     _render_stats: dict = {}
     _route_out: dict = {}
     if result is not None:
+        # #3613 live in-context exclusion: the resolver is built BEFORE this
+        # fire's shown-record line is appended (below), and only when the
+        # kill switch (`recall_in_context_exclusion.enabled`, default off) is
+        # on. None => format_nudge renders exactly as before.
+        _in_context_resolver = None
+        try:
+            if in_context_exclusion_enabled(ENGRAM_HOME):
+                _in_context_resolver = build_exclusion_resolver(hook_input.get("session_id"))
+        except Exception:
+            _in_context_resolver = None
         nudge = format_nudge(
             result,
             pack_results=pack_results,
             session_id=hook_input.get("session_id", "unknown"),
             stats=_render_stats,
             route_out=_route_out,
+            in_context_resolver=_in_context_resolver,
         )
         if nudge:
             body_blocks.append(nudge)
@@ -3959,6 +4031,10 @@ def main():
         source="daemon" if used_daemon else "fallback",
         extra={"embed_query": embed_query} if embed_query is not None else None,
     )
+    # #3613 S1: the shown record, AFTER the ledger's resolver read its sources
+    # (a node is never "already shown" by the fire being written). Written
+    # whatever the kill switch says; fail-open inside the helper.
+    append_shown_record("prompt_surface", hook_input.get("session_id"), _route_out.get("shown", []))
 
     response = _assemble_response(head_blocks, body_blocks)
     if not response:

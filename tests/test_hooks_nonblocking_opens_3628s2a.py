@@ -793,8 +793,14 @@ _HELPER_DEFS = {
     # write_route_ledger: origin/dev's own already-hardened open (O_NONBLOCK +
     # fstat S_ISREG, silent return on a non-regular target); deliberately NOT
     # routed through the append helper, which would change its behaviour.
+    # append_shown_record (#3613): the shown record's own hardened opens -- the append
+    # open is O_NONBLOCK + fstat S_ISREG (a non-regular target is never written), the trim
+    # tmp is created O_EXCL|O_NOFOLLOW after an unlink (it cannot be a FIFO), and the file
+    # is 0o600. Like write_route_ledger it is deliberately NOT routed through the append /
+    # write helpers, which would change the mode and drop the no-follow create.
     "_hooklib.py": {"_open_regular_fd", "open_regular_text", "open_regular_text_write",
-                    "open_regular_text_append", "write_route_ledger"},
+                    "open_regular_text_append", "write_route_ledger",
+                    "append_shown_record"},
     "engram-loop-arm-stop-hook.py": {"open_regular_text"},
 }
 _RAW = {"read_text", "write_text", "read_bytes", "write_bytes"}

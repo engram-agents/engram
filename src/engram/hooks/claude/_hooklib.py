@@ -1169,6 +1169,165 @@ def _earlier_shown_ids(routes_dir: Path, compaction_count=None) -> tuple:
     return ids, readable
 
 
+# ---------------------------------------------------------------------------
+# Shown record (#3613 S1): what the two LIVE recall routes actually rendered
+# ---------------------------------------------------------------------------
+# Both hooks append ONE JSON line per fire to `<ENGRAM_HOME>/sessions/
+# <session_id>.shown.jsonl` -- OUTSIDE the probe dir, so it exists on every seat
+# (the probe ledger's `shown` is only written when the probe dir is live).
+# Line: {ts, route, compaction_count, prompt_index, ids}. `ids` are the own-graph
+# ids actually rendered (never the cap-cut ones). `prompt_index` is a per-session
+# monotonically increasing integer, shared by both routes (last line's + 1).
+# The in-context resolver reads this record as part of its `shown` source,
+# windowed by compaction_count exactly like `_earlier_shown_ids`.
+#
+# Bounds: at most SHOWN_RECORD_MAX_IDS ids per line (head kept) and at most
+# SHOWN_RECORD_MAX_BYTES per file. Past the byte bound the OLDEST lines are
+# dropped (the file is rewritten to about half the bound), which loses only
+# older context windows' lines. The write is fail-open: any error is silent
+# apart from at most one stderr line, and never changes a hook's output. It is
+# written whatever the exclusion kill switch says.
+
+SHOWN_RECORD_MAX_IDS = 64
+SHOWN_RECORD_MAX_BYTES = 262144
+
+
+def _safe_session_name(session_id):
+    """`session_id` when it is usable as ONE file-name component, else None
+    (the same guard `write_route_ledger` applies to its probe-dir key)."""
+    sid = session_id if isinstance(session_id, str) else ""
+    if (
+        not sid or sid == "unknown" or "/" in sid or "\\" in sid or ".." in sid
+        or sid in {".", ".."} or sid != Path(sid).name
+    ):
+        return None
+    return sid
+
+
+def shown_record_path(session_id):
+    """`<ENGRAM_HOME>/sessions/<session_id>.shown.jsonl`, or None for an unsafe id."""
+    sid = _safe_session_name(session_id)
+    if sid is None:
+        return None
+    home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+    return Path(home) / "sessions" / f"{sid}.shown.jsonl"
+
+
+def _shown_record_ids(session_id, compaction_count=None) -> tuple:
+    """(ids, readable) from the shown record, windowed exactly as
+    `_earlier_shown_ids` windows the probe ledger: count unknown/0 -> every line;
+    N > 0 -> only lines whose `compaction_count` == N. A missing record is
+    readable-and-empty; a record that cannot be read as a regular file makes
+    `readable` False."""
+    path = shown_record_path(session_id)
+    ids: set = set()
+    if path is None:
+        return ids, True
+    try:
+        if not os.path.lexists(path):
+            return ids, True
+        fd = _open_regular_fd(path)
+        if fd is None:
+            return ids, False
+        windowed = isinstance(compaction_count, int) and compaction_count > 0
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            for raw in f:
+                try:
+                    row = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                if windowed and row.get("compaction_count") != compaction_count:
+                    continue
+                rec = row.get("ids")
+                if isinstance(rec, list):
+                    ids.update(i for i in rec if isinstance(i, str))
+        return ids, True
+    except Exception:
+        return set(), False
+
+
+def append_shown_record(route: str, session_id, ids) -> None:
+    """Append this fire's line to the shown record (see the block comment).
+    Never raises; at most one stderr line. Call it AFTER the resolver for this
+    fire was built, so a node is never "already shown" by the fire being
+    written.
+
+    `prompt_index` is best-effort: it is read from the last parseable line + 1
+    with no lock, so it may duplicate under concurrent fires, or reset to 0 on
+    an unparseable file. Consumers must not treat it as a strict sequence."""
+    try:
+        path = shown_record_path(session_id)
+        if path is None or not path.parent.is_dir():
+            return  # no session dir: nothing to record into
+        marker = _read_session_marker(session_id)
+        kept: list = []
+        for i in ids or ():
+            if isinstance(i, str) and i not in kept:
+                kept.append(i)
+        kept = kept[:SHOWN_RECORD_MAX_IDS]
+        lines: list = []
+        fd = _open_regular_fd(path)
+        if fd is not None:
+            with os.fdopen(fd, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        elif os.path.lexists(path):
+            raise OSError(f"{path.name} is not a regular file")
+        last = -1
+        for raw in reversed(lines):
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                continue
+            n = row.get("prompt_index") if isinstance(row, dict) else None
+            if isinstance(n, int) and not isinstance(n, bool):
+                last = n
+                break
+        line = {
+            "ts": int(_time.time() * 1000), "route": route,
+            "compaction_count": _marker_compaction_count(marker),
+            "prompt_index": last + 1, "ids": kept,
+        }
+        text = json.dumps(line) + "\n"
+        text_bytes = len(text.encode("utf-8"))
+        if sum(len(x.encode("utf-8")) for x in lines) + text_bytes > SHOWN_RECORD_MAX_BYTES:
+            keep: list = []
+            size = text_bytes
+            for raw in reversed(lines):
+                size += len(raw.encode("utf-8"))
+                if size > SHOWN_RECORD_MAX_BYTES // 2:
+                    break
+                keep.append(raw)
+            keep.reverse()
+            tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+            try:
+                os.unlink(tmp)  # a stale tmp (or a symlink planted there): remove, never follow
+            except FileNotFoundError:
+                pass
+            tfd = os.open(
+                tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                os.write(tfd, "".join(keep).encode("utf-8"))
+            finally:
+                os.close(tfd)
+            os.replace(tmp, path)
+        # O_NONBLOCK: a write-open of a FIFO blocks until a reader appears.
+        wfd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(wfd).st_mode):
+                return
+            os.write(wfd, text.encode("utf-8"))
+        finally:
+            os.close(wfd)
+    except Exception as exc:  # fail-open
+        try:
+            msg = f"shown-record: {type(exc).__name__}: {exc}".replace("\r", " ").replace("\n", " ")
+            print(msg[:300], file=sys.stderr)
+        except Exception:
+            pass
+
+
 def _focused_ids() -> tuple:
     """(ids, readable): ids currently focused, read-only, one query, closed in
     a `finally`. Any DB problem (missing file, locked, no column) -> readable
@@ -1246,6 +1405,11 @@ def make_in_context_resolver(session_id, routes_dir: Path, marker=None):
         marker = _read_session_marker(session_id)
     count = _marker_compaction_count(marker)
     shown_ids, shown_ok = _earlier_shown_ids(routes_dir, count)
+    # #3613 S1: the live routes' own shown record, present on every seat (the
+    # probe ledger above exists only while the probe is live). Union of both.
+    rec_ids, rec_ok = _shown_record_ids(session_id, count)
+    shown_ids = set(shown_ids) | rec_ids
+    shown_ok = shown_ok and rec_ok
     started = _parse_iso_utc(marker.get("started_at")) if marker else None
     focused, focused_ok = _focused_ids()
     if count:
@@ -1256,6 +1420,71 @@ def make_in_context_resolver(session_id, routes_dir: Path, marker=None):
         _in_context_for, shown_ids=shown_ids, shown_ok=shown_ok,
         started=started, focused=focused, focused_ok=focused_ok,
         summary_ids=summary_ids, summary_ok=summary_ok)
+
+
+# ---------------------------------------------------------------------------
+# Live in-context exclusion (#3613 Part 2)
+# ---------------------------------------------------------------------------
+# Config `recall_in_context_exclusion.enabled` in $ENGRAM_HOME/config.json,
+# default OFF: only a JSON `true` turns it on (anything else, or an unreadable
+# config, is off). Everything below is fail-open: a resolver that cannot be
+# built or called drops NOTHING.
+
+def in_context_exclusion_enabled(engram_home=None) -> bool:
+    """True only when config.json has `recall_in_context_exclusion.enabled: true`."""
+    try:
+        home = engram_home or os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+        # open_regular_text: a FIFO at config.json fails fast (OSError -> off)
+        # instead of blocking the hook (#3628).
+        with open_regular_text(Path(home) / "config.json", encoding="utf-8") as f:
+            config = json.load(f)
+        section = config.get("recall_in_context_exclusion")
+        return isinstance(section, dict) and section.get("enabled") is True
+    except Exception:
+        return False
+
+
+def build_exclusion_resolver(session_id):
+    """`resolve(node_id, created_at) -> (in_context, why)` for the live
+    exclusion, or None when it cannot be built (fail-open: None = drop nothing).
+    Same resolver the probe ledger uses; the probe routes dir is read only when
+    the probe is live for this session."""
+    try:
+        sid = _safe_session_name(session_id)
+        if sid is None:
+            return None
+        marker = _read_session_marker(sid)
+        return make_in_context_resolver(
+            sid, route_probe_dir() / sid / "routes", marker=marker)
+    except Exception:
+        return None
+
+
+def in_context_drop_ids(candidates, resolver, exempt_types=()) -> set:
+    """The ids among `candidates` (dicts with `id`, optionally `created_at` /
+    `type`) to drop as already in the model's context: those the resolver
+    answers `in_context is True` for, whatever the `why`. `None` (unknown) and
+    `False` keep the candidate. A candidate whose `type` is in `exempt_types`
+    is never dropped. Any exception -> an empty set (all-or-nothing: a
+    half-applied exclusion would make the output depend on where it failed)."""
+    try:
+        if resolver is None:
+            return set()
+        drop: set = set()
+        for c in candidates:
+            if not isinstance(c, dict):
+                continue
+            nid = c.get("id")
+            if not nid or nid in drop:
+                continue
+            if exempt_types and c.get("type") in exempt_types:
+                continue
+            in_context, _why = resolver(nid, c.get("created_at"))
+            if in_context is True:
+                drop.add(nid)
+        return drop
+    except Exception:
+        return set()
 
 
 def build_route_candidates(result: Optional[dict], in_context=None) -> tuple:
