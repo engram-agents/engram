@@ -110,6 +110,13 @@ from _hooklib import (
     in_context_exclusion_enabled,
 )
 from _harness import detect_harness, get_harness_budgets
+# #3613: meaningful-span marker. Fail-open: an older/absent helper degrades to
+# "no marker" (the pre-change behaviour), never an import crash.
+try:
+    from _hooklib import marker_recall_query
+except Exception:
+    def marker_recall_query(text):
+        return ("none", text)
 
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
 DB_PATH = Path(ENGRAM_HOME) / "knowledge.db"
@@ -1992,8 +1999,18 @@ def main() -> None:
 
         # In-turn ambient recall (#1690) — independently guarded; a recall
         # failure must never suppress a tripwire hit (and vice versa).
+        # #3613: lesson matching above/below stays on the RAW match_target (a
+        # tripwire must fire on the raw action). Only the in-turn recall's
+        # term source is narrowed to the marked span; an empty marker skips it.
         try:
-            recall = check_in_turn_recall(match_target, hook_input)
+            _recall_state, _recall_text = marker_recall_query(match_target)
+        except Exception:
+            _recall_state, _recall_text = "none", match_target
+        try:
+            if _recall_state == "empty":
+                recall = ""
+            else:
+                recall = check_in_turn_recall(_recall_text, hook_input)
         except Exception:
             recall = ""
         if recall:

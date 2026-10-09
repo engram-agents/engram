@@ -1766,3 +1766,64 @@ def probe_own_server_py(engram_home: str) -> tuple:
         return None, "pgrep-unknown: pgrep timed out"
     except Exception as exc:
         return None, f"pgrep-unknown: {type(exc).__name__}: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Meaningful-span marker (#3613 Part 1A, consumer side)
+# ---------------------------------------------------------------------------
+# Producers (loop stub, probe rating request, monitors, bell) wrap the
+# meaningful text of a notification in OPEN..CLOSE so recall consumers can
+# search only that text instead of the fixed wrapper that dominates the match.
+
+ENGRAM_MARKER_OPEN = "⟦ENGRAM⟧"
+ENGRAM_MARKER_CLOSE = "⟦/ENGRAM⟧"
+
+
+def marker_recall_query(text):
+    """Return ``(state, query)`` for a recall consumer; ``state`` is one of
+    ``"none"`` (no marker: ``query is text``), ``"marked"`` (``query`` is the
+    marked span text, several top-level spans joined by ``"\\n"``) or
+    ``"empty"`` (markers present but nothing meaningful inside; ``query`` is
+    ``""``).
+
+    Balanced markers yield their top-level spans (nesting by depth count).
+    Unbalanced markers (an unclosed opener, or a closer at depth 0 after the
+    first opener) fall back to ONE span from the first opener to the LAST
+    closer after it (or to the end of the text when none follows). Marker
+    tokens inside a span are removed, spans are stripped, empties dropped.
+    Never raises: any unexpected input is ``("none", text)``."""
+    try:
+        if not isinstance(text, str) or ENGRAM_MARKER_OPEN not in text:
+            return ("none", text)
+        opener, closer = ENGRAM_MARKER_OPEN, ENGRAM_MARKER_CLOSE
+        spans: list = []
+        depth = 0
+        start = 0
+        stray = False
+        seen_open = False
+        for m in _re.finditer(_re.escape(opener) + "|" + _re.escape(closer), text):
+            if m.group(0) == opener:
+                if depth == 0:
+                    start = m.end()
+                depth += 1
+                seen_open = True
+            elif depth > 0:
+                depth -= 1
+                if depth == 0:
+                    spans.append(text[start:m.start()])
+            elif seen_open:
+                stray = True  # closer at depth 0 after the first opener
+        if depth > 0 or stray:
+            begin = text.index(opener) + len(opener)
+            last_close = text.rfind(closer)
+            spans = [text[begin:last_close] if last_close >= begin else text[begin:]]
+        cleaned = []
+        for span in spans:
+            span = span.replace(opener, "").replace(closer, "").strip()
+            if span:
+                cleaned.append(span)
+        if not cleaned:
+            return ("empty", "")
+        return ("marked", "\n".join(cleaned))
+    except Exception:
+        return ("none", text)

@@ -59,6 +59,13 @@ try:
     _HOOKLIB_OK = True
 except Exception:
     _HOOKLIB_OK = False
+# #3613: meaningful-span marker. Fail-open: an older/absent helper degrades to
+# "no marker" (the pre-change behaviour), never an import crash.
+try:
+    from _hooklib import marker_recall_query
+except Exception:
+    def marker_recall_query(text):
+        return ("none", text)
 
 # Locate where engram_client.py lives for import (gh#2570: local
 # _resolve_runtime_dir hoisted to _hooklib.resolve_runtime_dir; this hook's
@@ -3548,6 +3555,19 @@ def main():
         print(json.dumps({}))
         sys.exit(0)
 
+    # #3613: producers wrap the meaningful text of a notification in an
+    # ENGRAM marker; the recall QUERY is built from that text only. `prompt`
+    # stays the raw text for everything that is not the recall query
+    # (telemetry, counters, loop-wake detection, keyword-pattern fallback).
+    #   none   -> recall_query is prompt (identical object): unchanged behaviour
+    #   marked -> recall_query is the extracted span text
+    #   empty  -> the recall stage is skipped; every other output still runs
+    try:
+        _recall_state, recall_query = marker_recall_query(prompt)
+    except Exception:
+        _recall_state, recall_query = "none", prompt
+    _recall_skipped = _recall_state == "empty"
+
     # Increment prompt counter
     counter = read_prompt_counter()
     counter["prompts_since_compaction"] = counter.get("prompts_since_compaction", 0) + 1
@@ -3563,14 +3583,17 @@ def main():
     embed_query: str | None = None
     conn = None
     try:
-        if _as_cfg["idf_gate_enabled"]:
+        if _recall_skipped:
+            # No recall query this prompt: nothing to prepend context to.
+            should_prepend = False
+        elif _as_cfg["idf_gate_enabled"]:
             # IDF-based gate: open a read-only DB connection for keyword lookup.
             # extract_keywords doesn't use sqlite-vec, so skip the extension load.
             conn = sqlite3.connect(f"file:{KNOWLEDGE_DB_PATH}?mode=ro", uri=True)
-            should_prepend = _should_prepend(prompt, conn, _as_cfg)
+            should_prepend = _should_prepend(recall_query, conn, _as_cfg)
         else:
             # Feature flag off — legacy char-length heuristic.
-            should_prepend = len(prompt) < _as_cfg["short_prompt_threshold_chars"]
+            should_prepend = len(recall_query) < _as_cfg["short_prompt_threshold_chars"]
 
         if should_prepend:
             prev_tail = _read_prev_assistant_tail(
@@ -3578,7 +3601,7 @@ def main():
                 _as_cfg["prev_response_tail_chars"],
             )
             if prev_tail:
-                embed_query = f"{prev_tail}\n\n{prompt}"
+                embed_query = f"{prev_tail}\n\n{recall_query}"
     except Exception:
         # Any unexpected failure in gate logic must not break the hook.
         # Degrade to no-prepend (embed_query stays None).
@@ -3590,8 +3613,13 @@ def main():
     # Try daemon first (fast, semantic), fall back to FTS-only
     used_daemon = False
     _daemon_t0 = time.perf_counter()
-    result = query_daemon(prompt, embed_query=embed_query)
-    if result is not None:
+    # Empty marker (#3613): no recall query at all. `result` stays None and
+    # `used_daemon` False, but the daemon-down warning below is gated on
+    # `_recall_skipped` so this is not misreported as an outage.
+    result = None if _recall_skipped else query_daemon(recall_query, embed_query=embed_query)
+    if _recall_skipped:
+        pass
+    elif result is not None:
         used_daemon = True
     else:
         # FTS-only fallback path. We intentionally do NOT forward embed_query
@@ -3600,7 +3628,7 @@ def main():
         # the raw prompt. Prepending prev-response-tail to a keyword search
         # would pollute results with arbitrary prior-context tokens — exactly
         # what the design intentionally avoided in the daemon path.
-        result = query_fts_fallback(prompt)
+        result = query_fts_fallback(recall_query)
     _daemon_latency_ms = int((time.perf_counter() - _daemon_t0) * 1000)
 
     # Emit engram.surface.fire event for the structured event log.
@@ -3627,7 +3655,7 @@ def main():
             fields={"outcome": "init_failed"},
         )
 
-    if _emitter is not None:
+    if _emitter is not None and not _recall_skipped:
         _surface_matched = result.get("matched_ids", []) if result else []
         _uid = _emitter.emit(
             event_type="engram.surface.fire",
@@ -3739,7 +3767,7 @@ def main():
     # genuinely-down daemon. The daemon writes its PID + binds its socket
     # only AFTER the ~7s model load, so during warmup neither exists; the
     # start script stamps daemon-launch-attempt at launch, before warmup.
-    if not used_daemon:
+    if not used_daemon and not _recall_skipped:
         user_name = get_user_name()
         # Resolve the daemon script path relative to this hook's own location.
         # Works for both install paths:
@@ -3876,7 +3904,8 @@ def main():
     # fail-open so any pack error never breaks the hook.
     pack_results: list[dict] = []
     try:
-        pack_results = _query_attached_packs(prompt)
+        if not _recall_skipped:
+            pack_results = _query_attached_packs(recall_query)
     except Exception:
         pack_results = []
 
@@ -4023,18 +4052,19 @@ def main():
 
     # Route ledger (#3458 A): one line per fire when the probe is live for
     # this session (opt-in by presence, fail-open -- see _hooklib). `query` is
-    # the text sent to the daemon/FTS (the raw prompt; embed_query, when set,
+    # the text sent to the daemon/FTS (the recall query; embed_query, when set,
     # only widens the semantic side and is recorded separately).
-    write_route_ledger(
-        "prompt_surface", hook_input.get("session_id"), prompt_fire_key(prompt),
-        prompt, result, _route_out.get("shown", []), _route_out.get("cut_reasons", {}),
-        source="daemon" if used_daemon else "fallback",
-        extra={"embed_query": embed_query} if embed_query is not None else None,
-    )
-    # #3613 S1: the shown record, AFTER the ledger's resolver read its sources
-    # (a node is never "already shown" by the fire being written). Written
-    # whatever the kill switch says; fail-open inside the helper.
-    append_shown_record("prompt_surface", hook_input.get("session_id"), _route_out.get("shown", []))
+    if not _recall_skipped:  # empty marker: no recall ran, nothing to record
+        write_route_ledger(
+            "prompt_surface", hook_input.get("session_id"), prompt_fire_key(prompt),
+            recall_query, result, _route_out.get("shown", []), _route_out.get("cut_reasons", {}),
+            source="daemon" if used_daemon else "fallback",
+            extra={"embed_query": embed_query} if embed_query is not None else None,
+        )
+        # #3613 S1: the shown record, AFTER the ledger's resolver read its sources
+        # (a node is never "already shown" by the fire being written). Written
+        # whatever the kill switch says; fail-open inside the helper.
+        append_shown_record("prompt_surface", hook_input.get("session_id"), _route_out.get("shown", []))
 
     response = _assemble_response(head_blocks, body_blocks)
     if not response:
