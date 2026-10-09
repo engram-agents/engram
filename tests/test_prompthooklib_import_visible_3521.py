@@ -298,6 +298,81 @@ def test_forum_broken_lib_class_name_control_chars_are_sanitized(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Baton and inter-agent hooks (in scope because the healthy control PRINTS:
+# with a working lib, the scratch tree's `tools/` reachable and the forum
+# unreachable, each emits its UCS-unreachable banner; with the lib broken,
+# dev's hook is silent -- that is the reproduction).
+# ---------------------------------------------------------------------------
+
+OTHER_HOOKS = [
+    ("engram-baton-prompt-hook.py", "UCS unreachable"),
+    ("engram-inter-agent-prompt-hook.py", "DM unread check unavailable"),
+]
+
+
+@pytest.mark.parametrize("hook_name,marker", OTHER_HOOKS)
+def test_other_healthy_control_prints_and_is_byte_identical_to_dev(
+        tmp_path, hook_name, marker):
+    dev_text = _dev_hook_text(hook_name)
+    if dev_text is None:
+        pytest.skip("origin/dev not available")
+    home_a = _home(tmp_path, "home_a")
+    home_b = tmp_path / "home_b"
+    shutil.copytree(home_a, home_b)
+    head = _scratch(tmp_path, "head", "real", hook_name)
+    dev = _scratch(tmp_path, "dev", "real", hook_name, hook_text=dev_text)
+    h = _run(head, home_a)
+    d = _run(dev, home_b)
+    assert marker in _ctx(h[1]), "control must PRINT its banner"
+    assert h == d
+
+
+@pytest.mark.parametrize("hook_name,marker", OTHER_HOOKS)
+@pytest.mark.parametrize("lib_mode,exc_class", [
+    ("raise", "RuntimeError"),
+    ("absent", "ModuleNotFoundError"),
+])
+def test_other_broken_lib_is_visible_not_silent(
+        tmp_path, hook_name, marker, lib_mode, exc_class):
+    hook = _scratch(tmp_path, "h", lib_mode, hook_name)
+    rc, out, err = _run(hook, _home(tmp_path))
+    _assert_visible(hook, rc, out, err, exc_class)
+    assert marker not in out  # the lib-gone line, not the healthy banner
+
+
+@pytest.mark.parametrize("hook_name,marker", OTHER_HOOKS)
+def test_other_broken_lib_two_runs_in_a_row_both_show_the_line(
+        tmp_path, hook_name, marker):
+    hook = _scratch(tmp_path, "h", "raise", hook_name)
+    home = _home(tmp_path)
+    for _ in range(2):
+        rc, out, err = _run(hook, home)
+        _assert_visible(hook, rc, out, err, "RuntimeError")
+
+
+@pytest.mark.parametrize("close_out,close_err", CLOSED_PIPE_CASES)
+@pytest.mark.parametrize("hook_name,marker", OTHER_HOOKS)
+def test_other_broken_lib_closed_pipe_still_exits_0(
+        tmp_path, hook_name, marker, close_out, close_err):
+    hook = _scratch(tmp_path, "h", "raise", hook_name)
+    rc = _run_closed_pipe(hook, _home(tmp_path), close_out, close_err)
+    assert rc == 0, rc
+
+
+@pytest.mark.parametrize("hook_name,marker", OTHER_HOOKS)
+def test_other_broken_lib_is_silent_at_dev(tmp_path, hook_name, marker):
+    """The reproduction: dev's hook with a raising lib prints nothing."""
+    dev_text = _dev_hook_text(hook_name)
+    if dev_text is None:
+        pytest.skip("origin/dev not available")
+    hook = _scratch(tmp_path, "dev", "raise", hook_name, hook_text=dev_text)
+    rc, out, err = _run(hook, _home(tmp_path))
+    if out or err:
+        pytest.skip("dev already carries the visible import failure")
+    assert rc == 0
+
+
+# ---------------------------------------------------------------------------
 # In-process caller survives the failure path (round 3)
 # ---------------------------------------------------------------------------
 # os._exit(0) on the failure path kills a pytest process that calls main()
@@ -349,3 +424,26 @@ def _assert_inproc_survives(tmp_path: Path, hook_name: str):
 
 def test_forum_in_process_failure_path_does_not_kill_the_test_process(tmp_path):
     _assert_inproc_survives(tmp_path, FORUM_HOOK)
+
+
+@pytest.mark.parametrize("hook_name,marker", OTHER_HOOKS)
+def test_other_in_process_failure_path_does_not_kill_the_test_process(
+        tmp_path, hook_name, marker):
+    _assert_inproc_survives(tmp_path, hook_name)
+
+
+@pytest.mark.parametrize("hook_name,marker", OTHER_HOOKS)
+def test_other_broken_lib_class_name_control_chars_are_sanitized(
+        tmp_path, hook_name, marker):
+    """Same shape as the forum cell: an exception class whose __name__ holds a
+    newline and an ESC yields ONE stderr line and ONE context line, control
+    characters replaced by '?', no ESC in either stream."""
+    hook = _scratch(tmp_path, "h", "real", hook_name)
+    (hook.parent / "_prompthooklib.py").write_text(
+        "raise type('Bad\\nName\\x1b[31m', (Exception,), {})('x')\n")
+    rc, out, err = _run(hook, _home(tmp_path))
+    expected = f"{hook.stem}: _prompthooklib import failed: Bad?Name?[31m"
+    assert rc == 0, (rc, out, err)
+    assert _ctx(out) == expected
+    assert err.splitlines() == [expected], err
+    assert "\x1b" not in out and "\x1b" not in err
