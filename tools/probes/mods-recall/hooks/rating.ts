@@ -19,6 +19,12 @@ import {
 
 /** Leads every rating request; step.ts skips rows containing it (inContext). */
 export const REQUEST_MARKER = '[engram-probe · turn '
+/**
+ * The empty ENGRAM marker (#3613): U+27E6 / U+27E7, the real characters. The row has no
+ * meaningful text for recall to search, so its LAST line is an empty marker and the recall
+ * hooks skip it. Counted inside `maxChars`.
+ */
+export const EMPTY_ENGRAM_MARKER = '\u27e6ENGRAM\u27e7\u27e6/ENGRAM\u27e7'
 export const RATE_TOOL = 'mcp__engram-probe__rate'
 export const NODE_ID = /^[a-z]{2}_\d{4,}$/
 const VERDICTS = ['better', 'same', 'worse'] as const
@@ -92,7 +98,7 @@ export function buildRequest(args: {
         letters.map(l => [l, (d.byLetter[l] ?? []).slice(0, lvl.limit).map(c => c.id)]),
       )
     }
-    return { text: lines.join('\n'), shown, omittedSteps: omitted }
+    return { text: [...lines, EMPTY_ENGRAM_MARKER].join('\n'), shown, omittedSteps: omitted }
   }
 
   // Richest first: as many steps as fit, with summaries.
@@ -109,7 +115,14 @@ export function buildRequest(args: {
   }
   // The header alone can exceed an absurdly small cap: truncate, never exceed.
   const last = render(1, () => ({ limit: 1, summaries: false }))
-  return { ...last, text: last.text.slice(0, Math.max(0, maxChars)) }
+  // Reserve the marker (plus its newline) so the cut row still ends with it. But the row's
+  // head REQUEST_MARKER must always survive (step.ts skips the rating row by it), so the
+  // trailing marker is only kept when maxChars - reserve >= REQUEST_MARKER.length (maxChars >= 39);
+  // below that, fall back to the plain hard cut with no trailing marker: the cap still wins.
+  const reserve = EMPTY_ENGRAM_MARKER.length + 1
+  if (maxChars - reserve < REQUEST_MARKER.length) return { ...last, text: last.text.slice(0, Math.max(0, maxChars)) }
+  const body = last.text.slice(0, last.text.length - reserve)
+  return { ...last, text: `${body.slice(0, maxChars - reserve)}\n${EMPTY_ENGRAM_MARKER}` }
 }
 
 /** A ledger whose newest line is further than this from the turn's end is probably a different clock domain. */

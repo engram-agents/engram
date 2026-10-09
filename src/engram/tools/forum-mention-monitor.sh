@@ -601,7 +601,11 @@ flush_buffer() {
     if [ -s "$BUF" ]; then
         python3 -c '
 import collections, sys
-lines = [l.strip() for l in sys.stdin if l.strip()]
+# #3613: thread ids come from the forum; delete EVERY U+27E6/U+27E7 before
+# wrapping so no payload can forge or rebuild (split-token) a marker.
+def clean(x):
+    return str(x).replace("\u27e6", "").replace("\u27e7", "")
+lines = [clean(l.strip()) for l in sys.stdin if l.strip()]
 n = len(lines)
 counts = collections.OrderedDict()
 for tid in lines:
@@ -609,7 +613,10 @@ for tid in lines:
 parts = ", ".join("#" + str(t) + "(×" + str(c) + ")" for t, c in counts.items())
 mention_word = "mention" if n == 1 else "mentions"
 thread_word = "thread" if len(counts) == 1 else "threads"
-print("\U0001f4e3 " + str(n) + " new @-" + mention_word + " across " + str(len(counts)) + " " + thread_word + ": " + parts)
+# #3613: the summary is fixed wrapper words plus thread ids -- nothing
+# meaningful to recall on -- so it ends with the EMPTY ENGRAM marker (skip
+# recall), not a span. \u escapes keep this source ASCII (bash 3.2 / LC_ALL=C safe).
+print("\U0001f4e3 " + str(n) + " new @-" + mention_word + " across " + str(len(counts)) + " " + thread_word + ": " + parts + " \u27e6ENGRAM\u27e7\u27e6/ENGRAM\u27e7")
 ' < "$BUF"
         : > "$BUF"
     fi

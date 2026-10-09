@@ -332,3 +332,23 @@ test('requests file records pendingTimedOut when the 5000 ms cap fires with a jo
   expect(req.waitedMs >= 5000).toBe(true)
   expect(Object.keys(req.shown)).toEqual(['0']) // only the finished step is shown
 })
+
+// ------------------------------------------------------------------ R1 (#3613 producer marker)
+
+const EMPTY_ENGRAM_MARKER = '\u27e6ENGRAM\u27e7\u27e6/ENGRAM\u27e7'
+
+test('R1 the request row ends with the empty ENGRAM marker, also when cut to a tiny cap', async () => {
+  const letters = ['A', 'B', 'C', 'D', 'E']
+  const whole = buildRequest({ turnId: TURN, digests: [digest(3, 1)], letters, topK: 5, maxChars: 4300, dir: PROBE_ROOT })
+  expect(whole.text.startsWith(REQUEST_MARKER)).toBe(true)
+  expect(whole.text.endsWith(`\n${EMPTY_ENGRAM_MARKER}`)).toBe(true)
+  // Sweep every cap: (a) never exceeded, (b) head REQUEST_MARKER kept for every cap >= its length,
+  // (c) trailing empty marker kept once maxChars - (marker + newline) >= REQUEST_MARKER.length.
+  const threshold = REQUEST_MARKER.length + EMPTY_ENGRAM_MARKER.length + 1
+  for (let maxChars = 0; maxChars <= 4300; maxChars++) {
+    const cut = buildRequest({ turnId: TURN, digests: [digest(3, 5), digest(4, 5)], letters, topK: 5, maxChars, dir: PROBE_ROOT })
+    expect(cut.text.length <= maxChars).toBe(true)
+    if (maxChars >= REQUEST_MARKER.length) expect(cut.text.startsWith(REQUEST_MARKER)).toBe(true)
+    if (maxChars >= threshold) expect(cut.text.endsWith(EMPTY_ENGRAM_MARKER)).toBe(true)
+  }
+})

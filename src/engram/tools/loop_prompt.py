@@ -39,6 +39,14 @@ import sys
 
 LOOP_WAKE_MARKER: str = "<loop-wake>"
 
+# The ENGRAM meaningful-span marker (#3613). A loop-wake has no meaningful text
+# to recall on, so a FRESH prompt ends with the EMPTY marker (open immediately
+# followed by close), which tells the recall hooks to skip recall for the
+# message.  U+27E6 / U+27E7 white square brackets, the real characters.
+ENGRAM_MARKER_OPEN: str = "\u27e6ENGRAM\u27e7"
+ENGRAM_MARKER_CLOSE: str = "\u27e6/ENGRAM\u27e7"
+ENGRAM_EMPTY_MARKER: str = ENGRAM_MARKER_OPEN + ENGRAM_MARKER_CLOSE
+
 # The machine-readable meta-line prefix (prefix only; the JSON payload follows).
 _META_PREFIX: str = "<loop-meta "
 _META_SUFFIX: str = ">"
@@ -59,10 +67,17 @@ def format_loop_prompt(core: str, **meta) -> str:
         <loop-wake>
         <loop-meta {"kind": "working"}>   ← only when meta kwargs are given
         <core message here>
+        ⟦ENGRAM⟧⟦/ENGRAM⟧                 ← empty marker, ALWAYS the last line
+
+    The empty ENGRAM marker (#3613) tells the recall hooks a loop-wake has no
+    meaningful text to recall on.  It is added only for FRESH input, and only
+    when the core does not already contain the open token anywhere (so a core
+    that carries its own marker is never given a second one).
 
     Contract when ``core.lstrip()`` already starts with the marker (i.e. the
     result of a previous ``format_loop_prompt`` call) — the marker itself is
-    never added or duplicated again, but what happens to meta differs:
+    never added or duplicated again (and no ENGRAM marker is added either — the
+    input is taken as already formatted), but what happens to meta differs:
 
     - No meta kwargs given: the result is the lstripped input, byte-for-byte
       (today's / original behaviour, trailing whitespace included).
@@ -119,6 +134,8 @@ def format_loop_prompt(core: str, **meta) -> str:
     if meta:
         parts.append(f"{_META_PREFIX}{json.dumps(meta, separators=(',', ':'))}{_META_SUFFIX}")
     parts.append(core)
+    if ENGRAM_MARKER_OPEN not in core:
+        parts.append(ENGRAM_EMPTY_MARKER)
     return "\n".join(parts)
 
 

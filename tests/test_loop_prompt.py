@@ -257,7 +257,12 @@ class TestFormatLoopPrompt:
             f"{json.dumps({'kind': 'sleeping'}, separators=(',', ':'))}"
             f"{lp._META_SUFFIX}"
         )
-        expected = lp.LOOP_WAKE_MARKER + "\n" + meta_line + "\nbody\n"
+        # #3613: ``once`` came from FRESH input, so it ends with the empty
+        # ENGRAM marker (on its own line after the body's own "\n"); the
+        # re-wrap preserves everything after the meta line byte-for-byte.
+        expected = (
+            lp.LOOP_WAKE_MARKER + "\n" + meta_line + "\nbody\n\n" + lp.ENGRAM_EMPTY_MARKER
+        )
         assert twice == expected
 
     def test_bare_marker_no_newline_with_meta_full_equality(self):

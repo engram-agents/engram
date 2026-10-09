@@ -276,20 +276,29 @@ try:
     d = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
+# #3613: wrap the meaningful payload (DM body, baton title) in the ENGRAM
+# marker; a line with no meaningful text carries the EMPTY marker. \u escapes
+# keep this source ASCII (bash 3.2 / LC_ALL=C safe).
+def clean(x):
+    # Delete EVERY U+27E6/U+27E7 from forum-supplied text before it is wrapped:
+    # a single-pass token strip can be rebuilt by split tokens.
+    return str(x).replace("\u27e6", "").replace("\u27e7", "")
+OPEN = "\u27e6ENGRAM\u27e7"
+CLOSE = "\u27e6/ENGRAM\u27e7"
 for u in d.get("updates", []):
     k = u.get("kind")
     if k == "dm":
-        body = (u.get("body") or "").replace("\n", " ").strip()
+        body = clean(u.get("body") or "").replace("\n", " ").strip()
         if len(body) > 90:
             body = body[:90] + "…"
-        print("✉️  new DM from " + str(u.get("sender", "?")) + ": " + body)
+        print("✉️  new DM from " + clean(u.get("sender", "?")) + ": " + OPEN + body + CLOSE)
     elif k == "baton":
-        title = (u.get("title") or "").strip()
+        title = clean(u.get("title") or "").strip()
         if len(title) > 50:
             title = title[:50] + "…"
-        print("\U0001f3be baton " + str(u.get("project_id", "?")) + " → turn: " + str(u.get("turn", "?")) + " (" + title + ")")
+        print("\U0001f3be baton " + clean(u.get("project_id", "?")) + " → turn: " + clean(u.get("turn", "?")) + " (" + OPEN + title + CLOSE + ")")
     else:
-        print("\U0001f514 new " + str(k) + " update (seq " + str(u.get("seq", "?")) + ")")
+        print("\U0001f514 new " + clean(k) + " update (seq " + clean(u.get("seq", "?")) + ") " + OPEN + CLOSE)
 '
 }
 

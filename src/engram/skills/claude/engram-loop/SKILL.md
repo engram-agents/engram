@@ -492,6 +492,14 @@ cannot be stale.)*
    > parallel block, then put the reply after it as the turn's FINAL text —
    > a solo arm ends the turn and a trailing arm swallows the reply (Step 2
    > item 3's reply-carrying split, #2098).***
+   >
+   > ⟦ENGRAM⟧⟦/ENGRAM⟧
+
+   The stub's LAST line is the **empty ENGRAM marker** — keep it, verbatim,
+   as the final line of the armed prompt. A loop-wake has no meaningful text to
+   recall on, and the empty marker tells the recall hooks to skip recall for
+   that message (#3613). `format_loop_prompt` adds it for you when the core you
+   pass has none, and never adds a second one when it is already there.
 
    **The re-arm line lives in the PROMPT, and that is the primary channel —
    not the marker.** Two reasons, and the first is the load-bearing one:

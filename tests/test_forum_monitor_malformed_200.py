@@ -85,7 +85,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _UPDATES_SCRIPT = _REPO_ROOT / "src" / "engram" / "tools" / "forum-updates-monitor.sh"
 _MENTION_SCRIPT = _REPO_ROOT / "src" / "engram" / "tools" / "forum-mention-monitor.sh"
 
-_FLUSH_RE = re.compile(r"^\U0001f4e3 (\d+) new @-mentions? across ")
+# #3613: the summary ends with the EMPTY ENGRAM marker (no span).
+_FLUSH_RE = re.compile(r"^\U0001f4e3 (\d+) new @-mentions? across .* \u27e6ENGRAM\u27e7\u27e6/ENGRAM\u27e7$")
 
 # Bodies that pass `curl --fail` with a 200 and do NOT parse as JSON.
 _UNPARSEABLE = [

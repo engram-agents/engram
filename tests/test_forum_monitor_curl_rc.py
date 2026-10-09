@@ -253,8 +253,9 @@ def test_updates_success_path_body_not_polluted(launch, tmp_path):
     assert not [l for l in lines if "unreachable" in l], lines
 
 
-_MENTION_LINE = "📣 1 new @-mention across 1 thread: #3(×1)"
-_UPDATE_LINE = "✉️  new DM from a: hi"
+# #3613: event payloads carry the ENGRAM meaningful-span marker.
+_MENTION_LINE = "📣 1 new @-mention across 1 thread: #3(×1) \u27e6ENGRAM\u27e7\u27e6/ENGRAM\u27e7"
+_UPDATE_LINE = "✉️  new DM from a: \u27e6ENGRAM\u27e7hi\u27e6/ENGRAM\u27e7"
 
 
 def _wait_until(pred, timeout: float = 8.0) -> bool:
