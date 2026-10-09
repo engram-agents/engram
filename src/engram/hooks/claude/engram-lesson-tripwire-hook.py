@@ -97,6 +97,14 @@ _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context, write_route_ledger, tool_fire_key
+# #3628: this hook runs on EVERY tool call. Every file open goes through these
+# non-blocking, regular-file-only helpers (a FIFO makes a plain open() wait for
+# a peer and the harness kills the hook silently); a non-regular target raises
+# OSError, which every handler below already swallows (`except Exception`).
+from _hooklib import (
+    open_regular_text, open_regular_text_append, open_regular_text_write,
+    read_regular_text,
+)
 from _harness import detect_harness, get_harness_budgets
 
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
@@ -220,7 +228,7 @@ def _loader_notice_due(now: float) -> bool:
     unreadable, corrupt, wrongly-shaped or future-dated stamp is "due": the
     rate limit must fail VISIBLE, never silent. Never raises."""
     try:
-        shown_at = json.loads(LOADER_NOTICE_STAMP_PATH.read_text(encoding="utf-8"))["shown_at"]
+        shown_at = json.loads(read_regular_text(LOADER_NOTICE_STAMP_PATH, encoding="utf-8"))["shown_at"]
         if isinstance(shown_at, bool) or not isinstance(shown_at, (int, float)):
             return True
         return not (0 <= now - shown_at < LOADER_NOTICE_WINDOW_SECONDS)
@@ -393,7 +401,8 @@ def write_tripwire_overflow(cut_hits: list, now: float | None = None) -> str:
             f"[{hit.get('node_id', '?')}] {hit.get('nudge', '')}"
             for hit in cut_hits
         ]
-        overflow_path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+        with open_regular_text_write(overflow_path, encoding="utf-8") as f:
+            f.write("\n\n".join(blocks) + "\n")
         return str(overflow_path)
     except Exception:
         return ""
@@ -698,7 +707,7 @@ def _ws4_config() -> dict:
     """
     inactive = {"active": False, "seed": None}
     try:
-        with open(Path(ENGRAM_HOME) / "config.json", "r", encoding="utf-8") as f:
+        with open_regular_text(Path(ENGRAM_HOME) / "config.json", encoding="utf-8") as f:
             config = json.load(f)
         section = (config.get("experiments", {}) or {}).get("ws4_chain_ab", {}) or {}
         if section.get("enabled") is not True:
@@ -776,7 +785,7 @@ def _append_ws4_fire_ledger(entry: dict) -> None:
     the chain block main() already decided to render or withhold -- this
     call always happens strictly AFTER that decision, purely to log it."""
     try:
-        with open(WS4_LEDGER_PATH, "a", encoding="utf-8") as f:
+        with open_regular_text_append(WS4_LEDGER_PATH, encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
     except Exception:
         pass
@@ -921,7 +930,7 @@ def _demotion_config() -> dict:
     pattern matches legitimate calls and should stop blocking.
     """
     try:
-        with open(Path(ENGRAM_HOME) / "config.json", "r", encoding="utf-8") as f:
+        with open_regular_text(Path(ENGRAM_HOME) / "config.json", encoding="utf-8") as f:
             config = json.load(f)
         section = (config.get("lessons", {}) or {}).get("blocking_demotion", {}) or {}
         return {
@@ -943,7 +952,7 @@ def _count_recent_overrides(lesson_id: str, window_days: float, now: float) -> i
     cutoff = now - (window_days * 86400)
     count = 0
     try:
-        with open(PREVENTION_LEDGER_PATH) as f:
+        with open_regular_text(PREVENTION_LEDGER_PATH) as f:
             for line in f:
                 try:
                     entry = json.loads(line)
@@ -1049,7 +1058,7 @@ def _log_threshold_crossed(now: float, deny: dict) -> None:
     except Exception:
         pass
     try:
-        with open(PREVENTION_LEDGER_PATH, "a") as f:
+        with open_regular_text_append(PREVENTION_LEDGER_PATH) as f:
             f.write(json.dumps({
                 "ts": now,
                 "lesson_id": lesson_id,
@@ -1071,7 +1080,7 @@ def _append_prevention_ledger(now: float, hits: list) -> None:
     if not hits:
         return
     try:
-        with open(PREVENTION_LEDGER_PATH, "a") as f:
+        with open_regular_text_append(PREVENTION_LEDGER_PATH) as f:
             for hit in hits:
                 f.write(json.dumps({
                     "ts": now,
@@ -1151,7 +1160,7 @@ def _append_ledger(build_entry) -> None:
     added."""
     try:
         entry = build_entry()
-        with open(LEDGER_PATH, "a") as f:
+        with open_regular_text_append(LEDGER_PATH) as f:
             f.write(json.dumps(entry) + "\n")
     except Exception:
         pass
@@ -1208,7 +1217,7 @@ def _in_turn_config() -> dict:
         "junk_stoplist": None,
     }
     try:
-        with open(Path(ENGRAM_HOME) / "config.json", "r", encoding="utf-8") as f:
+        with open_regular_text(Path(ENGRAM_HOME) / "config.json", encoding="utf-8") as f:
             config = json.load(f)
         section = (config.get("auto_surface", {}) or {}).get("in_turn_recall", {}) or {}
         raw_min_idf = section.get("min_idf")
@@ -1316,7 +1325,12 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
     lock_degrade_reason = ""
     try:
         import fcntl
-        lock_fd = os.open(str(STATE_PATH) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        # O_NONBLOCK (#3628): defence in depth. Measured on macOS, O_CREAT|O_RDWR
+        # on a FIFO already returns at once and the flock below then fails
+        # ENOTSUP (-> suppress, "" -- unchanged); O_NONBLOCK keeps a platform
+        # where that open could wait from hanging. No effect on a regular file.
+        lock_fd = os.open(str(STATE_PATH) + ".lock",
+                          os.O_CREAT | os.O_RDWR | os.O_NONBLOCK, 0o600)
     except Exception as exc:
         # fcntl unavailable (non-POSIX) or the lockfile couldn't be opened
         # (e.g. permissions) — degrade to the unlocked path exactly as
@@ -1362,7 +1376,7 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
         # except: any state-read failure (incl. PermissionError) must
         # degrade to empty state, never block the tripwire path.
         try:
-            with open(STATE_PATH, "r") as f:
+            with open_regular_text(STATE_PATH) as f:
                 state = json.load(f)
             if not isinstance(state, dict):
                 state = {}

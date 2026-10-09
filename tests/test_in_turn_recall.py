@@ -677,14 +677,16 @@ def test_ledger_write_failure_does_not_break_recall(tmp_path, monkeypatch):
     _stub_idf([["replay", "harness"]])
     monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
 
-    real_open = open
+    # the hook appends through _hooklib.open_regular_text_append (#3628), so that
+    # is the seam where the append is made to fail
+    real_append = hook.open_regular_text_append
 
-    def broken_open(path, *a, **kw):
+    def broken_append(path, *a, **kw):
         if str(path) == str(hook.LEDGER_PATH):
             raise OSError("simulated: ledger append unavailable")
-        return real_open(path, *a, **kw)
+        return real_append(path, *a, **kw)
 
-    monkeypatch.setattr(hook, "open", broken_open, raising=False)
+    monkeypatch.setattr(hook, "open_regular_text_append", broken_append)
 
     out = hook.check_in_turn_recall("Bash python replay-bench harness run")
     assert "ENGRAM in-turn recall" in out
