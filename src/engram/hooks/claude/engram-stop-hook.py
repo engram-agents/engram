@@ -162,6 +162,8 @@ _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import atomic_write_json, resolve_runtime_dir
+# #3628: the config reads are non-blocking and regular-file-only.
+from _hooklib import open_regular_text
 
 # Module-scope emitter resolve+insert (gh#2570 §1/§3): this hook previously
 # had no resolver at all -- its emit site did a bare
@@ -309,7 +311,7 @@ def _read_node_threshold() -> int:
     """
     config_path = os.path.join(ENGRAM_HOME, "config.json")
     try:
-        with open(config_path, encoding="utf-8") as f:
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
         cadence = config.get("cadence", {})
         val = cadence.get("write_nudge_node_threshold")
@@ -330,7 +332,7 @@ def _read_prose_threshold() -> int:
     """
     config_path = os.path.join(ENGRAM_HOME, "config.json")
     try:
-        with open(config_path, encoding="utf-8") as f:
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
         cadence = config.get("cadence", {})
         val = cadence.get("write_nudge_prose_threshold")

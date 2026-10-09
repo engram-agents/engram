@@ -84,6 +84,8 @@ try:
         get_agent_name as _get_agent_name_impl,
         emit_context as _emit_context,
         bootstrap_tools_dir as _bootstrap_tools_dir,
+        # #3628: the cache read/write are non-blocking and regular-file-only.
+        hooklib_io as _hooklib_io,
     )
     _PROMPTHOOKLIB_OK = True
 except Exception:
@@ -353,7 +355,7 @@ def _load_cache() -> dict:
     path = _cache_path()
     try:
         if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(_hooklib_io().read_regular_text(path, encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         pass
     return {}
@@ -363,7 +365,8 @@ def _save_cache(cache: dict) -> None:
     """Write cache to disk. Silently ignores write failures."""
     path = _cache_path()
     try:
-        path.write_text(json.dumps(cache), encoding="utf-8")
+        with _hooklib_io().open_regular_text_write(path, encoding="utf-8") as f:
+            f.write(json.dumps(cache))
     except OSError:
         pass
 

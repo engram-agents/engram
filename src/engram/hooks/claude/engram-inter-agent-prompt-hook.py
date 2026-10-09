@@ -103,6 +103,8 @@ try:
         get_agent_name as _get_agent_name_impl,
         emit_context as _emit_context,
         bootstrap_tools_dir as _bootstrap_tools_dir,
+        # #3628: the cursor read/write are non-blocking and regular-file-only.
+        hooklib_io as _hooklib_io,
     )
     _PROMPTHOOKLIB_OK = True
 except Exception:
@@ -178,7 +180,7 @@ def _is_forum_configured(config: Optional[dict] = None) -> bool:
 def _read_cursor_int(path: str) -> int:
     """Read the cursor file; return int or 0 if absent/invalid."""
     try:
-        raw = Path(path).read_text().strip()
+        raw = _hooklib_io().read_regular_text(path).strip()
         return int(raw)
     except (OSError, ValueError):
         return 0
@@ -194,7 +196,8 @@ def _write_cursor_int(path: str, value: int) -> None:
     dest = Path(path)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     try:
-        tmp.write_text(str(value) + "\n")
+        with _hooklib_io().open_regular_text_write(tmp) as f:
+            f.write(str(value) + "\n")
         os.replace(tmp, dest)
     except OSError as e:
         try:

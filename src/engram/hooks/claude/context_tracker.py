@@ -23,6 +23,18 @@ Every call reads the JSONL and config.json fresh.
 import glob
 import json
 import os
+import sys
+
+# _hooklib.py sits beside this file in both build topologies, so -- as
+# _stophooklib does -- make that directory importable before importing it: a
+# loader such as spec_from_file_location (every test that loads this module by
+# path) does not add it, and no hook bootstrap has run in that process.
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+# #3628: every open() here is non-blocking and regular-file-only (a FIFO at a
+# marker / config / transcript path must raise OSError, not hang the hook).
+from _hooklib import open_regular_text
 
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
@@ -112,7 +124,7 @@ def find_active_jsonl(session_id: str | None = None) -> str | None:
         return None
     marker_path = os.path.join(ENGRAM_HOME, "sessions", f"{session_id}.json")
     try:
-        with open(marker_path) as f:
+        with open_regular_text(marker_path) as f:
             marker = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
         return None
@@ -180,7 +192,7 @@ def _read_drowsiness_ceiling_tokens() -> int:
 
     config_path = os.path.join(ENGRAM_HOME, "config.json")
     try:
-        with open(config_path) as f:
+        with open_regular_text(config_path) as f:
             config = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
         config = {}
@@ -247,7 +259,7 @@ def _last_compact_offset(jsonl_path: str) -> int | None:
     and rely on the legacy fallback path in read_current_tokens.
     """
     try:
-        with open(LAST_COMPACT_PATH) as f:
+        with open_regular_text(LAST_COMPACT_PATH) as f:
             marker = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
         return None
@@ -285,7 +297,11 @@ def read_current_tokens(transcript_path: str | None = None) -> int | None:
     if not jsonl_path:
         return None
     try:
-        with open(jsonl_path, "rb") as f:
+        # open_regular_text is a text-mode wrapper; the transcript is read as
+        # raw bytes through its .buffer (the same BufferedReader open(.., "rb")
+        # returns), so seek/tell/read are unchanged.
+        with open_regular_text(jsonl_path) as _tf:
+            f = _tf.buffer
             f.seek(0, 2)
             size = f.tell()
             # Path 1: if a post-compact marker exists for this JSONL, start
@@ -412,7 +428,7 @@ def _load_drowsiness_thresholds(mode: str) -> dict:
     )
     config_path = os.path.join(ENGRAM_HOME, "config.json")
     try:
-        with open(config_path) as f:
+        with open_regular_text(config_path) as f:
             config = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
         return defaults

@@ -78,6 +78,8 @@ _HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
 if _HOOK_DIR not in sys.path:
     sys.path.insert(0, _HOOK_DIR)
 from _hooklib import atomic_write_json, resolve_runtime_dir
+# #3628: every read and the log append are non-blocking and regular-file-only.
+from _hooklib import open_regular_text, open_regular_text_append
 
 # Resolves the directory containing engram_ids.py -- hoisted to
 # _hooklib.resolve_runtime_dir (gh#2570); this hook's own sentinel
@@ -225,7 +227,7 @@ def bump_utility(
 
 def _log(line: str, log_path: str = LOG_PATH) -> None:
     try:
-        with open(log_path, "a") as f:
+        with open_regular_text_append(log_path) as f:
             f.write(f"[{datetime.now(timezone.utc).isoformat()}] {line}\n")
     except Exception:
         pass
@@ -276,7 +278,7 @@ def collect_turn_text(transcript_path: str, last_assistant_message: str) -> str:
     collected: list[str] = []
     if transcript_path and os.path.exists(transcript_path):
         try:
-            with open(transcript_path) as f:
+            with open_regular_text(transcript_path) as f:
                 lines = f.readlines()
             for line in reversed(lines):
                 try:
@@ -330,7 +332,7 @@ def _read_prompt_count(path: str = PROMPT_COUNTER_PATH) -> int:
     never a crash).
     """
     try:
-        with open(path, "r") as f:
+        with open_regular_text(path) as f:
             data = json.load(f)
         return int(data.get("prompts_since_compaction", 0))
     except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
@@ -404,10 +406,17 @@ def _check_enactments(
     unprompted enactment: the practice happened without the nudge firing.
     """
     try:
-        with open(PRINCIPLE_TRIGGERS_PATH, "r") as f:
+        with open_regular_text(PRINCIPLE_TRIGGERS_PATH) as f:
             registry = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return
+    except OSError:
+        # Only a non-regular target (FIFO / directory: the helper refuses it) is
+        # treated as absent; any other OSError on a regular file propagates, as
+        # it did before the non-blocking opens (#3628).
+        if os.path.exists(PRINCIPLE_TRIGGERS_PATH) and not os.path.isfile(PRINCIPLE_TRIGGERS_PATH):
+            return
+        raise
     # #1731: registry values are LISTS of entries (a dual-role trigger node
     # now gets one entry per principle it triggers). Tolerate an old-shape
     # single dict too (lazy-read shim, same as the surface hook's consumer).
@@ -423,10 +432,16 @@ def _check_enactments(
 
     prompt_count = _read_prompt_count(prompt_count_path)
     try:
-        with open(state_path, "r") as f:
+        with open_regular_text(state_path) as f:
             state = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         state = {}
+    except OSError:
+        # As above: swallow only a non-regular state path; else propagate.
+        if os.path.exists(state_path) and not os.path.isfile(state_path):
+            state = {}
+        else:
+            raise
 
     changed = False
     for pid in hits:

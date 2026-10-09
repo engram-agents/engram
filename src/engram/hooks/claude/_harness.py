@@ -50,6 +50,17 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+
+# _hooklib.py sits beside this file in both build topologies, so -- as
+# _stophooklib does -- make that directory importable before importing it: a
+# loader such as spec_from_file_location (every test that loads this module by
+# path) does not add it, and no hook bootstrap has run in that process.
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+# #3628: the platform.json read is non-blocking and regular-file-only.
+from _hooklib import open_regular_text
 
 # claude-code: budget = 9,500 sits 134 chars under the lowest measured
 # persist threshold (band 9,634 < t <= 10,184 chars, four seats -- Borges
@@ -123,7 +134,7 @@ def detect_harness() -> "str | None":
         hook_dir = os.path.dirname(os.path.abspath(__file__))
         runtime_dir = os.path.dirname(hook_dir)
         platform_path = os.path.join(runtime_dir, "platform.json")
-        with open(platform_path, encoding="utf-8") as f:
+        with open_regular_text(platform_path, encoding="utf-8") as f:
             data = json.load(f)
         platform = data.get("platform")
         return platform.strip().lower() if isinstance(platform, str) else None

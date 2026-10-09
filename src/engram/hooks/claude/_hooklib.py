@@ -970,6 +970,27 @@ def open_regular_text_write(path, encoding=None):
         raise
 
 
+def open_regular_text_append(path, encoding=None):
+    """`open(path, "a", encoding=encoding)` that must never block (#3628).
+
+    Same shape as open_regular_text_write, with O_APPEND|O_CREAT (no O_TRUNC)
+    and mode 0o666 (umask applies), matching open(path, "a"). A reader-less
+    FIFO fails at os.open with ENXIO; a FIFO that has a reader is rejected by
+    the fstat before any byte is written. Raises OSError for a non-regular
+    target."""
+    fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_APPEND | os.O_CREAT, 0o666)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise _not_regular_error(fd, path)
+        return os.fdopen(fd, "a", encoding=encoding)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
 def session_started_at(session_id):
     """This session's `started_at` from `$ENGRAM_HOME/sessions/<sid>.json`
     (aware datetime), or None when the marker is missing/malformed. Shared
@@ -1448,7 +1469,7 @@ def _probe_stamp_read(engram_home) -> dict:
     """The `shown_at` map from the stamp file, or {} when the file is absent,
     unreadable, corrupt or wrongly shaped. Never raises."""
     try:
-        data = json.loads(_probe_stamp_path(engram_home).read_text(encoding="utf-8"))
+        data = json.loads(read_regular_text(_probe_stamp_path(engram_home), encoding="utf-8"))
         shown = data["shown_at"]
         return shown if isinstance(shown, dict) else {}
     except Exception:

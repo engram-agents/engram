@@ -100,6 +100,38 @@ def _json_type_name(value) -> str:
     return type(value).__name__
 
 
+def hooklib_io():
+    """The sibling ``_hooklib`` module, for its non-blocking regular-file
+    helpers (``open_regular_text``, ``read_regular_text``,
+    ``open_regular_text_write``; #3628).
+
+    The prompt hooks must keep running when ``_hooklib`` cannot be imported
+    (they report the config as unknown and exit 0; see the module docstring and
+    ``report_config_unknown``), so they cannot import its helpers at module
+    scope. A call site reaches them as ``hooklib_io().read_regular_text(p)``:
+    when the import fails this raises ``OSError`` -- the exception every one of
+    those sites already treats as "unreadable / unwritable" -- instead of an
+    ImportError no handler there catches. The same OSError is raised for a
+    ``_hooklib`` that imports but predates the helpers (a stale copy). No
+    helper is copied here.
+    """
+    # _hooklib.py sits beside this file in both build topologies, so make sure
+    # that directory is importable (as _stophooklib does): a loader such as
+    # spec_from_file_location does not add it, and the hooks' own bootstrap
+    # only runs for the hooks, not for a test that loads this module alone.
+    _this_dir = os.path.dirname(os.path.abspath(__file__))
+    if _this_dir not in sys.path:
+        sys.path.insert(0, _this_dir)
+    try:
+        import _hooklib
+    except ImportError as e:
+        raise OSError(f"_hooklib unavailable: {e}") from e
+    for name in ("open_regular_text", "read_regular_text", "open_regular_text_write"):
+        if not hasattr(_hooklib, name):
+            raise OSError(f"_hooklib lacks {name}")
+    return _hooklib
+
+
 def load_config_checked(
     engram_home: Optional[str] = None,
 ) -> "tuple[Optional[dict], Optional[str]]":
@@ -124,7 +156,10 @@ def load_config_checked(
             engram_home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
         config_path = Path(engram_home) / "config.json"
         try:
-            raw = config_path.read_bytes()
+            # #3628: non-blocking, regular-file-only (see hooklib_io). Raw
+            # bytes through .buffer, exactly what read_bytes() returned.
+            with hooklib_io().open_regular_text(config_path) as f:
+                raw = f.buffer.read()
         except (FileNotFoundError, NotADirectoryError):
             return {}, None
         except (OSError, ValueError) as e:

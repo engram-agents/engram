@@ -267,6 +267,11 @@ try:
         get_agent_name as _get_agent_name_impl,
         get_comms_surface as _get_comms_surface_impl,
         bootstrap_tools_dir as _bootstrap_tools_dir,
+        # #3628: every cursor / cache / publish-state read and temp write is
+        # non-blocking and regular-file-only (the temp names are predictable:
+        # <dest>.tmp). Reached through _prompthooklib so a missing _hooklib
+        # helper degrades to OSError at the site, not to an import crash.
+        hooklib_io as _hooklib_io,
     )
     _PROMPTHOOKLIB_OK = True
 except Exception:
@@ -545,7 +550,7 @@ def _is_forum_configured(config: dict) -> bool:
 def _read_cursor(path: str) -> Optional[datetime]:
     """Read a cursor file; return UTC datetime or None if absent/invalid."""
     try:
-        raw = Path(path).read_text().strip()
+        raw = _hooklib_io().read_regular_text(path).strip()
     except (OSError, ValueError):
         return None
     if not raw:
@@ -563,7 +568,8 @@ def _write_cursor(path: str, ts: datetime) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     try:
-        tmp.write_text(ts_str + "\n")
+        with _hooklib_io().open_regular_text_write(tmp) as f:
+            f.write(ts_str + "\n")
         os.replace(tmp, dest)
     except OSError:
         try:
@@ -579,7 +585,7 @@ def _write_cursor(path: str, ts: datetime) -> None:
 def _load_cache() -> Optional[dict]:
     """Load the hook cache. Returns None if absent, expired, or invalid."""
     try:
-        raw = Path(HOOK_CACHE_PATH).read_text()
+        raw = _hooklib_io().read_regular_text(HOOK_CACHE_PATH)
         data = json.loads(raw)
         age = time.time() - data.get("fetched_at", 0)
         if age > CACHE_TTL_SECONDS:
@@ -609,7 +615,8 @@ def _save_cache(threads: list, mentions: Optional[list],
             "threads": threads,
             "mentions": mentions,
         }
-        tmp.write_text(json.dumps(payload))
+        with _hooklib_io().open_regular_text_write(tmp) as f:
+            f.write(json.dumps(payload))
         os.replace(tmp, dest)
     except OSError:
         try:
@@ -625,7 +632,7 @@ def _save_cache(threads: list, mentions: Optional[list],
 def _load_publish_state() -> Optional[dict]:
     """Load the last-published status state. Returns None if absent/invalid."""
     try:
-        return json.loads(Path(STATUS_PUBLISH_PATH).read_text())
+        return json.loads(_hooklib_io().read_regular_text(STATUS_PUBLISH_PATH))
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -645,7 +652,8 @@ def _save_publish_state(state: str, activity: Optional[str],
             "cadence": cadence,
             "published_at": published_at,
         }
-        tmp.write_text(json.dumps(payload))
+        with _hooklib_io().open_regular_text_write(tmp) as f:
+            f.write(json.dumps(payload))
         os.replace(tmp, dest)
     except OSError:
         try:
@@ -1218,7 +1226,7 @@ def main() -> None:
             # The fallback is no longer silent: see unknown_blocks below.
             threads_unknown = threads_reason
             try:
-                raw = Path(HOOK_CACHE_PATH).read_text()
+                raw = _hooklib_io().read_regular_text(HOOK_CACHE_PATH)
                 stale = json.loads(raw)
                 threads = stale.get("threads", [])
                 mentions = _cached_mentions(stale)

@@ -45,6 +45,8 @@ _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import atomic_write_json, emit_context
+# #3628: the config / sticky-marker reads are non-blocking and regular-file-only.
+from _hooklib import open_regular_text
 from _harness import detect_harness, get_harness_budgets
 
 ENGRAM_HOME = (
@@ -77,7 +79,7 @@ OWNER_READ_TIMEOUT_S = 1.5
 def get_primary_user() -> str:
     """Read primary_user from $ENGRAM_HOME/config.json (lowercased; empty if unset)."""
     try:
-        with open(CONFIG_PATH) as f:
+        with open_regular_text(CONFIG_PATH) as f:
             config = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return ""
@@ -105,7 +107,7 @@ def _owner_reads_enabled() -> bool:
     which is the old path. After an upgrade, restart the owner BEFORE turning
     this on (a running 1.0 owner answers a 1.1 client `unknown_operation`)."""
     try:
-        with open(CONFIG_PATH) as f:
+        with open_regular_text(CONFIG_PATH) as f:
             config = json.load(f)
         return config["engramd"]["user_identity_reads_via_owner"] is True
     except (OSError, ValueError, KeyError, TypeError):
@@ -395,7 +397,7 @@ def main():
         # No prefix — use sticky session context if available
         if os.path.exists(CURRENT_USER_PATH):
             try:
-                with open(CURRENT_USER_PATH) as f:
+                with open_regular_text(CURRENT_USER_PATH) as f:
                     sticky = json.load(f)
                 # Suppress context for the configured primary user (default
                 # speaker — no need to re-announce on every prompt). If no

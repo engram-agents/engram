@@ -303,6 +303,7 @@ crash the session.
 import html
 import json
 import os
+import stat
 import sys
 import time
 from pathlib import Path
@@ -378,6 +379,55 @@ try:
     _STOPHOOKLIB_OK = True
 except Exception:
     _STOPHOOKLIB_OK = False
+
+# #3628: the two marker reads below (platform.json, loop-mode.json) must be
+# non-blocking and regular-file-only. They use _hooklib's helper when it can be
+# imported. This hook's contract (see the emitter resolver note above, and
+# test_emits_via_fallback_when_stophooklib_import_fails) is that it must still
+# work, and still emit its nudge, when it runs with NO sibling lib at all, so it
+# cannot hard-import _hooklib: on ImportError it defines the same two helpers
+# itself. The fallback bodies are pinned identical to _hooklib's by
+# tests/test_regular_io_parity_3628.py (AST + behavioural) -- never edit one
+# without the other.
+try:
+    from _hooklib import open_regular_text
+except Exception:
+    def _not_regular_error(fd, path):
+        """The OSError for a path that opened but is not a regular file. A
+        directory keeps the IsADirectoryError a plain open() raises for it; any
+        other kind (FIFO, socket, device) is an EINVAL OSError. Does not close fd:
+        the caller's except clause does, once."""
+        import errno
+        try:
+            is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+        except OSError:
+            is_dir = False
+        code = errno.EISDIR if is_dir else errno.EINVAL
+        return OSError(code, os.strerror(code) + " (not a regular file)", str(path))
+
+    def open_regular_text(path, encoding=None):
+        """`open(path, encoding=encoding)` for a read that must never block (#3591).
+
+        A plain open() of a FIFO waits for a writer; a hook under a 5 s timeout
+        hangs and is killed. This opens O_NONBLOCK (returns at once on a FIFO),
+        fstat-checks that the target is a regular file, and returns a text file
+        object over the fd. Anything else raises OSError (IsADirectoryError for a
+        directory, EINVAL otherwise), so a call site that already treats an
+        unreadable file as absent -- `except OSError` or broader -- needs only
+        `open(p)` -> `open_regular_text(p)`. FileNotFoundError / PermissionError
+        come from os.open exactly as from open(). For a regular file the result is
+        the same text wrapper open() returns."""
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise _not_regular_error(fd, path)
+            return os.fdopen(fd, "r", encoding=encoding)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
 
 # ---------------------------------------------------------------------------
 # loop_prompt import — SSoT for the loop-wake marker (same pattern as
@@ -465,7 +515,7 @@ def _runtime_platform() -> str | None:
             candidates.append(Path(value))
     for runtime_dir in candidates:
         try:
-            with open(runtime_dir / "platform.json", encoding="utf-8") as f:
+            with open_regular_text(runtime_dir / "platform.json", encoding="utf-8") as f:
                 data = json.load(f)
             platform = data.get("platform")
             if isinstance(platform, str):
@@ -524,7 +574,7 @@ def _pacer_is_schedule_wakeup(loop_marker_path: str) -> bool:
     fail-toward-emitting policy.
     """
     try:
-        with open(loop_marker_path, encoding="utf-8") as f:
+        with open_regular_text(loop_marker_path, encoding="utf-8") as f:
             marker = json.load(f)
     except Exception:
         return False
