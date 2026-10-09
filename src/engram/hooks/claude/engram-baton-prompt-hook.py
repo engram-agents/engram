@@ -834,10 +834,12 @@ def main() -> None:
     # If _prompthooklib somehow failed to import, _load_config/_get_agent_name/
     # _emit_context are unavailable. Report the failure (class-only stderr
     # line + injected context line, #3521) and exit 0 without doing any other
-    # work. The exit is os._exit(0), not sys.exit(0): the reporter swallows a
-    # failed write on a closed pipe, which leaves data buffered, and the
-    # interpreter's shutdown flush would then fail and turn the exit code
-    # into 120.
+    # work. When run as a script the exit is os._exit(0), not sys.exit(0):
+    # the reporter swallows a failed write on a closed pipe, which leaves
+    # data buffered, and the interpreter's shutdown flush would then fail and
+    # turn the exit code into 120. When the module is loaded in-process (as
+    # the tests do), it raises SystemExit(0) instead, because os._exit would
+    # end the host process.
     if not _PROMPTHOOKLIB_OK:
         _report_prompthooklib_import_failed()
         try:
