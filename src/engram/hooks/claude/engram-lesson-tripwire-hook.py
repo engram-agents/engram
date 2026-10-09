@@ -112,6 +112,12 @@ from _hooklib import (
 # #3628: every mode=ro sqlite connect goes through this (refuses a FIFO or
 # directory instead of hanging; raises a sqlite3.OperationalError + OSError).
 from _hooklib import connect_regular_ro
+# #3521 row 9: a crash reaching main()'s outer handler must not look like
+# "no lesson matched" (see the handler at the bottom of main()).
+from _hooklib import (
+    mark_probe_notice, probe_notice_due, probe_unknown_line,
+    write_probe_unknown_stderr,
+)
 from _harness import detect_harness, get_harness_budgets
 # #3613: meaningful-span marker. Fail-open: an older/absent helper degrades to
 # "no marker" (the pre-change behaviour), never an import crash.
@@ -1637,8 +1643,13 @@ def main() -> None:
     try:
         hook_input = json.load(sys.stdin)
     except (json.JSONDecodeError, EOFError, ValueError):
+        # #3521 row 9: out of scope -- malformed harness input keeps its
+        # silent exit (the outer-handler crash notice below does not cover it).
         sys.exit(0)
 
+    # #3521 row 9: set right after a response JSON was printed, so the outer
+    # handler never prints a second object.
+    response_printed = False
     try:
         match_target = build_match_target(hook_input)
         if not match_target or not match_target.strip():
@@ -1685,6 +1696,9 @@ def main() -> None:
                 }
             }
             print(json.dumps(response))
+            # Defensive only: sys.exit(0) below raises SystemExit, which the
+            # `except Exception` handler cannot see, so this is not load-bearing.
+            response_printed = True
             sys.exit(0)
 
         parts = []
@@ -2029,6 +2043,7 @@ def main() -> None:
             }
         }
         print(json.dumps(response))
+        response_printed = True
         if loader_notice:
             # #3503: the window is consumed only once the line has actually
             # been written out; an exit before this point (or a failed
@@ -2040,7 +2055,42 @@ def main() -> None:
             _mark_loader_notice_shown(loader_notice_now)
         sys.exit(0)
 
-    except Exception:
+    except Exception as exc:
+        # #3521 row 9: a crash here used to be byte-identical to a healthy
+        # "nothing matched" run (exit 0, empty stdout, empty stderr). Now: one
+        # stderr line always, and -- only if no response was printed yet and the
+        # rate-limit window is open -- one UNKNOWN context line. Never denies,
+        # always exits 0, and the handler itself must never raise.
+        try:
+            reason = f"{type(exc).__name__}: {exc}"
+            write_probe_unknown_stderr("engram-lesson-tripwire-hook", "tripwire-run", reason)
+            if not response_printed and probe_notice_due(ENGRAM_HOME, "tripwire-run"):
+                line = probe_unknown_line(
+                    "lesson-tripwire", reason,
+                    "tripwire checks were skipped for this call",
+                    prefix="[lesson-tripwire] ",
+                )
+                print(json.dumps({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "additionalContext": line,
+                    }
+                }))
+                sys.stdout.flush()
+                mark_probe_notice(ENGRAM_HOME, "tripwire-run")
+        except BaseException:
+            # The print/flush above may have failed because the stdout reader is
+            # gone; a normal sys.exit(0) would then fail again in interpreter
+            # shutdown's stdout flush and replace the exit code (120). os._exit
+            # skips that flush; stderr is flushed first so the line is not lost.
+            try:
+                sys.stderr.flush()
+            except BaseException:
+                pass
+            # Only a hook run as a script may skip shutdown: an in-process caller
+            # (such as a test) must get a catchable SystemExit, never a killed process.
+            if __name__ == "__main__":
+                os._exit(0)
         sys.exit(0)  # hook failures must never block a tool call
 
 
