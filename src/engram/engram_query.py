@@ -2140,7 +2140,7 @@ def _get_person_moment_cooldown_seconds() -> float:
     """
     try:
         if core.CONFIG_PATH.exists():
-            config = json.loads(core.CONFIG_PATH.read_text())
+            config = core._config_io.read_config_json(core.CONFIG_PATH)
             section = config.get("person_moment_cooldown", {})
             if isinstance(section, dict):
                 return float(section.get("seconds", _PERSON_MOMENT_COOLDOWN_SECONDS))

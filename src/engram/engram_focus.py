@@ -52,7 +52,7 @@ def _get_focus_sets_cap() -> int:
     """
     if core.CONFIG_PATH.exists():
         try:
-            config = json.loads(core.CONFIG_PATH.read_text())
+            config = core._config_io.read_config_json(core.CONFIG_PATH)
             section = config.get("focus", {})
             if isinstance(section, dict) and "focus_sets_cap" in section:
                 return int(section["focus_sets_cap"])

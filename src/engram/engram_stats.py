@@ -464,7 +464,7 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
             # config.json identity fields (agent_name, multi_agent) — fill gaps
             if core.CONFIG_PATH.exists():
                 try:
-                    _cfg = json.loads(core.CONFIG_PATH.read_text(encoding="utf-8"))
+                    _cfg = core._config_io.read_config_json(core.CONFIG_PATH)
                     for _field in ("agent_name", "multi_agent"):
                         if _field in _cfg and _field not in ver:
                             ver[_field] = _cfg[_field]
@@ -836,7 +836,7 @@ def _diagnose_impl() -> str:
         provenance["evidence_by_source_type"] = {r["st"]: r["c"] for r in stype_rows}
 
         # Trust status check
-        _diag_config = json.loads(core.CONFIG_PATH.read_text()) if core.CONFIG_PATH.exists() else {}
+        _diag_config = core._config_io.read_config_json(core.CONFIG_PATH)
         trusted_domains = set(_diag_config.get("trust_pool", []))
         untrusted = conn.execute(
             """SELECT source_domain, COUNT(*) as c FROM nodes

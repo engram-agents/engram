@@ -2206,7 +2206,7 @@ def _resolve_impl(
             })
 
         confidence = resolver["confidence"] if resolver["confidence"] is not None else 1.0
-        config = json.loads(core.CONFIG_PATH.read_text()) if core.CONFIG_PATH.exists() else {}
+        config = core._config_io.read_config_json(core.CONFIG_PATH)
         threshold = config.get("resolution_confidence_threshold", core.DEFAULT_RESOLUTION_THRESHOLD)
 
         now = core._now()
@@ -3306,7 +3306,7 @@ def _retract_impl(
         # Retracting the resolution should revert the target to 'open' so it
         # can be re-resolved with proper provenance.
         reopened_targets = []
-        retract_config = json.loads(core.CONFIG_PATH.read_text()) if core.CONFIG_PATH.exists() else {}
+        retract_config = core._config_io.read_config_json(core.CONFIG_PATH)
         retract_threshold = retract_config.get("resolution_confidence_threshold", core.DEFAULT_RESOLUTION_THRESHOLD)
         resolution_edges = conn.execute(
             "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'resolves'",

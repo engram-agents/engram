@@ -394,9 +394,13 @@ def write_config_key(agent_name: str, key: str, raw_value) -> dict:
         # below cover a torn write. Second tradeoff vs os.rename (which is
         # atomic at the VFS layer): a concurrent reader can transiently
         # observe a partially-written config.json and get a JSONDecodeError.
-        # The copy window is sub-millisecond for typical config sizes and
-        # config is read at startup, not continuously, so this is not a
-        # real-world concern.
+        # The copy window is sub-millisecond for typical config sizes, but
+        # config.json is NOT read only at startup: every node creation reads
+        # it (the current turn is stamped from it). The readers therefore
+        # retry a parse failure briefly (engram_config_io.read_config_json,
+        # #3607) before failing loud; same-UID writers go through the atomic
+        # engram_config_io.write_config_json, so this cross-UID copy is the
+        # only non-atomic writer left.
         config_dir = os.path.dirname(config_path)
         try:
             fd, tmp_path = _tempfile_in_dir(config_dir)

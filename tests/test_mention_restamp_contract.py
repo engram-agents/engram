@@ -280,7 +280,7 @@ def test_hook_restamps_in_flattened_deployed_layout_without_plugin_root(tmp_path
     for name in ("_hooklib.py",):
         shutil.copy(SRC_ENGRAM / "hooks" / "claude" / name, root / "hooks" / name)
     shutil.copy(HOOK_PATH, root / "hooks" / HOOK_PATH.name)
-    for name in ("engram_ids.py", "engram_restamp.py"):
+    for name in ("engram_ids.py", "engram_restamp.py", "engram_config_io.py"):
         shutil.copy(SRC_ENGRAM / name, root / name)
 
     home = tmp_path / "engram_home"

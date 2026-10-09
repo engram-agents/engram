@@ -39,6 +39,7 @@ from typing import NamedTuple, Optional, Union
 from urllib.parse import urlparse
 
 import engram_restamp as _restamp  # noqa: E402
+import engram_config_io as _config_io  # noqa: E402
 from engram_confidence import (  # noqa: E402
     CONFIDENCE_MAP,
     PREDICTIVE_CONFIDENCE_CAP,
@@ -540,7 +541,7 @@ def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
 
             # Write default config
             if not CONFIG_PATH.exists():
-                CONFIG_PATH.write_text(json.dumps({
+                _config_io.write_config_json(CONFIG_PATH, {
                     "trust_pool": [],
                     "confidence_map": CONFIDENCE_MAP,
                     "memory": {
@@ -550,7 +551,7 @@ def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
                     },
                     "mode": "single",
                     "counterparts": [],
-                }))
+                })
 
             _ensure_data_dir()
             yield sandbox_path
@@ -2229,7 +2230,7 @@ def _ensure_data_dir():
             "mode": "single",
             "counterparts": [],
         }
-        CONFIG_PATH.write_text(json.dumps(default_config, indent=2))
+        _config_io.write_config_json(CONFIG_PATH, default_config)
 
 
 VALID_SOURCE_TYPES = {"document", "conversation", "file", "web_page"}
@@ -4962,17 +4963,18 @@ def _get_db() -> sqlite3.Connection:
     # init writes it before the first _get_db() call), so this guard fires
     # only on personal-install DBs where the empty state means bootstrap crash.
     if not bootstrap_mode:
-        is_knowledge_pack = False
-        try:
-            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            is_knowledge_pack = bool(cfg.get("is_knowledge_pack", False))
-        except Exception:
-            pass
-        if not is_knowledge_pack:
-            seed_count = conn.execute(
-                "SELECT COUNT(*) FROM nodes WHERE type='axiom'"
-            ).fetchone()[0]
-            if seed_count == 0:
+        seed_count = conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE type='axiom'"
+        ).fetchone()[0]
+        if seed_count == 0:
+            # Config is read only here, so a healthy graph does no config parse.
+            is_knowledge_pack = False
+            try:
+                cfg = _config_io.read_config_json(CONFIG_PATH)
+                is_knowledge_pack = bool(cfg.get("is_knowledge_pack", False))
+            except Exception:
+                pass
+            if not is_knowledge_pack:
                 conn.close()
                 raise RuntimeError(_seed_missing_message())
 
@@ -5244,14 +5246,11 @@ def _get_current_turn() -> int:
 
 def _set_current_turn(turn: int):
     """Update the turn counter in config."""
-    if CONFIG_PATH.exists():
-        config = json.loads(CONFIG_PATH.read_text())
-    else:
-        config = {}
+    config = _config_io.read_config_json(CONFIG_PATH)
     if "memory" not in config:
         config["memory"] = {}
     config["memory"]["current_turn"] = turn
-    CONFIG_PATH.write_text(json.dumps(config, indent=2))
+    _config_io.write_config_json(CONFIG_PATH, config)
 
 
 def _write_feeling_nudge(source: str) -> bool:
@@ -5869,10 +5868,8 @@ def _get_embedding_config() -> dict:
     (server._embedding_startup_gate), which refuses to start before any
     caller of this function ever runs.
     """
-    if CONFIG_PATH.exists():
-        config = json.loads(CONFIG_PATH.read_text())
-        return config.get("embedding", {"model": DEFAULT_EMBEDDING_MODEL})
-    return {"model": DEFAULT_EMBEDDING_MODEL}
+    config = _config_io.read_config_json(CONFIG_PATH)
+    return config.get("embedding", {"model": DEFAULT_EMBEDDING_MODEL})
 
 
 # Mechanical hedge prefix _report_feeling_impl (engram_tasks.py) writes onto
@@ -7259,13 +7256,13 @@ def _get_thresholds_config() -> dict:
     }
     if CONFIG_PATH.exists():
         try:
-            config = json.loads(CONFIG_PATH.read_text())
+            config = _config_io.read_config_json(CONFIG_PATH)
             user = config.get("thresholds", {})
             if isinstance(user, dict):
                 merged = dict(defaults)
                 merged.update(user)
                 return merged
-        except (json.JSONDecodeError, OSError):
+        except (_config_io.ConfigUnreadableError, OSError):
             pass
     return defaults
 
@@ -9239,7 +9236,7 @@ def _compute_confidence(
                 return round(conf, 3)
 
             # Legacy fallback: use derivation_mode
-            config = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+            config = _config_io.read_config_json(CONFIG_PATH)
             chain_decay = config.get("chain_decay", 0.95)
             corrob_decay = config.get("corroboration_decay", 0.98)
 
@@ -10538,7 +10535,7 @@ def _self_lineage() -> str:
     premises, producing false diversity and suppressing ⚠⚠ (Mira #750)."""
     global _self_lineage_warned
     try:
-        cfg = json.loads(CONFIG_PATH.read_text())
+        cfg = _config_io.read_config_json(CONFIG_PATH)
         val = (cfg.get("self_lineage") or "").strip()
         if val and not _LINEAGE_RE.fullmatch(val):
             if not _self_lineage_warned:

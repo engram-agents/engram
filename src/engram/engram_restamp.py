@@ -25,10 +25,10 @@ server.  engram_core imports *this* module (for `compute_importance` and
 
 from __future__ import annotations
 
-import json
 import sqlite3
-from pathlib import Path
 from typing import NamedTuple
+
+from engram_config_io import read_config_json
 
 # Use-action table: alpha of Q_new = Q_old + alpha*(1-Q_old) per USE action.
 USE_ALPHA = {
@@ -76,14 +76,14 @@ def default_memory_config() -> dict:
 def read_memory_config(config_path) -> dict:
     """The `memory` block of config.json, or the defaults when the file is absent.
 
-    A malformed file raises (json.JSONDecodeError), exactly as the original
-    engram_core._get_memory_config did -- callers decide how to surface it.
+    A file that still will not parse after the brief retry raises
+    ``engram_config_io.ConfigUnreadableError`` (a ValueError naming the file
+    and the parse position) -- never a defaults sentinel: stamping turn 0 from
+    a torn file would sink the node being created (#3607).  Callers decide how
+    to surface it.
     """
-    path = Path(config_path)
-    if path.exists():
-        config = json.loads(path.read_text())
-        return config.get("memory", default_memory_config())
-    return default_memory_config()
+    config = read_config_json(config_path)
+    return config.get("memory", default_memory_config())
 
 
 def compute_importance(base: float, turn: int, decay_base: float) -> float:

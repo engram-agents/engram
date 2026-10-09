@@ -160,13 +160,13 @@ def _get_polarity_config() -> dict:
         return defaults
     if core.CONFIG_PATH.exists():
         try:
-            config = json.loads(core.CONFIG_PATH.read_text())
+            config = core._config_io.read_config_json(core.CONFIG_PATH)
             user = config.get("polarity", {})
             if isinstance(user, dict):
                 merged = dict(defaults)
                 merged.update(user)
                 return merged
-        except (json.JSONDecodeError, OSError):
+        except (core._config_io.ConfigUnreadableError, OSError):
             pass
     return defaults
 
@@ -190,13 +190,13 @@ def _get_standpoint_config() -> dict:
     defaults = {"author_id_hard_gate": True}
     if core.CONFIG_PATH.exists():
         try:
-            config = json.loads(core.CONFIG_PATH.read_text())
+            config = core._config_io.read_config_json(core.CONFIG_PATH)
             user = config.get("standpoint", {})
             if isinstance(user, dict):
                 merged = dict(defaults)
                 merged.update(user)
                 return merged
-        except (json.JSONDecodeError, OSError):
+        except (core._config_io.ConfigUnreadableError, OSError):
             pass
     return defaults
 
@@ -347,7 +347,7 @@ def _check_yellow_card(domain: str):
     if not domain:
         return None
     try:
-        config = json.loads(core.CONFIG_PATH.read_text()) if core.CONFIG_PATH.exists() else {}
+        config = core._config_io.read_config_json(core.CONFIG_PATH)
     except Exception:
         return None
     for entry in config.get("yellow_domains", []):
@@ -1220,7 +1220,7 @@ def _add_evidence_impl(
             return json.dumps({"error": _url_err})
 
         # Check trust pool (domain already computed above for yellow-card)
-        config = json.loads(core.CONFIG_PATH.read_text()) if core.CONFIG_PATH.exists() else {}
+        config = core._config_io.read_config_json(core.CONFIG_PATH)
         trust_pool = config.get("trust_pool", [])
         in_trust_pool = any(domain.endswith(tp) for tp in trust_pool)
 

@@ -128,7 +128,7 @@ def test_malformed_config_does_not_abort_focus(caplog):
         assert st["recall_turn"] == SENTINEL_TURN, st            # no invented turn
         assert st["importance_score"] == pytest.approx(SENTINEL_SCORE, abs=1e-9)
     msgs = _warnings(caplog)
-    assert any("focus" in m and "JSONDecodeError" in m and "2 node" in m for m in msgs), msgs
+    assert any("focus" in m and "ConfigUnreadableError" in m and "2 node" in m for m in msgs), msgs
 
 
 def test_restamp_failure_rolls_back_only_the_restamp(caplog, monkeypatch):

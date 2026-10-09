@@ -83,7 +83,7 @@ def test_malformed_config_names_config_stage_and_keeps_bump(conn, tmp_path):
     cfg.write_text("{not json")
     r = rs.use_reward(conn, ["ob_0001"], "mention", config_path=cfg)
     assert r.bumped == 1 and r.restamped == 0
-    assert r.restamp_error.startswith("config: JSONDecodeError")
+    assert r.restamp_error.startswith("config: ConfigUnreadableError")
     assert _turns(conn)["ob_0001"] == SENT
     assert _util(conn)["ob_0001"] == pytest.approx(0.10)
 

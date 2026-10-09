@@ -245,6 +245,11 @@
       "tier": "essential"
     },
     {
+      "path": "engram_config_io.py",
+      "tier": "essential",
+      "note": "Atomic write + retrying read of config.json (#3607). Stdlib-only. Essential because engram_core and engram_restamp import it (hard dependencies)."
+    },
+    {
       "path": "engram_search_rules.py",
       "tier": "essential",
       "note": "The one definition of 'not searchable' (SEARCH_EXCLUDED_TYPES + the SQL fragment builders; evidence is out of search, Lei 2026-10-08). Stdlib-only. Essential because engram_core imports it (a hard dependency) and the surface hook imports it to filter attached-pack FTS."
