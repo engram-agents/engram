@@ -43,6 +43,8 @@ import stat
 import time
 from pathlib import Path
 
+from engram_regular_io import read_regular_text
+
 
 class ConfigUnreadableError(ValueError):
     """``config.json`` exists but does not parse after the retry window."""
@@ -111,7 +113,9 @@ def read_config_json(path, *, attempts: int = 3, delay: float = 0.05) -> dict:
         if i:
             time.sleep(delay)
         try:
-            text = path.read_text(encoding="utf-8")
+            # Non-blocking and regular-file-only (#3628): a FIFO at config.json
+            # raises OSError (as a directory does) instead of hanging the caller.
+            text = read_regular_text(path, encoding="utf-8")
         except FileNotFoundError:
             return {}
         try:

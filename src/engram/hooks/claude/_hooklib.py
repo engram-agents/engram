@@ -38,6 +38,13 @@ loop-wake-marker logic already has its own SSoT module (`tools/loop_prompt.py`,
 extracted for the deference-detector/time-bar hook pair, unrelated to these
 three). Bundling them here would be solving problems these three hooks
 don't have -- exactly the "big bang" gh#1657 explicitly asks to avoid.
+
+_hooklib is self-contained (stdlib-only, importable alone): tests copy it by
+itself into synthetic hooks/ layouts, and every hook imports it, so a missed
+import here would fail every hook at once. Do not import ENGRAM core modules
+from it. The non-blocking regular-file helpers are deliberately duplicated in
+engram_regular_io.py (core) and pinned identical by
+tests/test_regular_io_parity_3628.py.
 """
 
 from __future__ import annotations
@@ -972,7 +979,7 @@ def session_started_at(session_id):
         return None
     try:
         home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
-        with open(Path(home) / "sessions" / f"{session_id}.json", "r", encoding="utf-8") as f:
+        with open_regular_text(Path(home) / "sessions" / f"{session_id}.json", encoding="utf-8") as f:
             marker = json.load(f)
         return _parse_iso_utc(marker.get("started_at"))
     except Exception:

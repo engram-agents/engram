@@ -182,14 +182,16 @@ def test_r1_unreadable_raises_named_error_after_attempts(tmp_path, cio, monkeypa
     p = tmp_path / "config.json"
     p.write_text(content)
     reads = []
-    real = Path.read_text
+    # read seam since #3628: engram_regular_io.read_regular_text (non-blocking
+    # regular-file read), imported by name into engram_config_io
+    real = cio.read_regular_text
 
-    def counting(self, *a, **k):
-        if self == p:
+    def counting(path, *a, **k):
+        if Path(path) == p:
             reads.append(1)
-        return real(self, *a, **k)
+        return real(path, *a, **k)
 
-    monkeypatch.setattr(Path, "read_text", counting)
+    monkeypatch.setattr(cio, "read_regular_text", counting)
     with pytest.raises(cio.ConfigUnreadableError) as ei:
         cio.read_config_json(p, attempts=3, delay=0.05)
     assert len(reads) == 3
@@ -204,11 +206,11 @@ def test_r2_torn_then_valid_returns_valid(tmp_path, cio, monkeypatch, no_sleep):
     p.write_text('{"a": ')
     calls = []
 
-    def flaky(self, *a, **k):
+    def flaky(path, *a, **k):  # read seam since #3628, see the R1 test above
         calls.append(1)
         return '{"a": ' if len(calls) == 1 else '{"a": 7}'
 
-    monkeypatch.setattr(Path, "read_text", flaky)
+    monkeypatch.setattr(cio, "read_regular_text", flaky)
     assert cio.read_config_json(p) == {"a": 7}
     assert len(calls) == 2
 

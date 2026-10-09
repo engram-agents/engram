@@ -40,6 +40,7 @@ from urllib.parse import urlparse
 
 import engram_restamp as _restamp  # noqa: E402
 import engram_config_io as _config_io  # noqa: E402
+import engram_regular_io as _regular_io  # noqa: E402
 from engram_confidence import (  # noqa: E402
     CONFIDENCE_MAP,
     PREDICTIVE_CONFIDENCE_CAP,
@@ -9631,7 +9632,10 @@ def _rebuild_principle_triggers() -> dict:
                 by_kind[k] = by_kind.get(k, 0) + 1
 
         os.makedirs(os.path.dirname(PRINCIPLE_TRIGGERS_PATH), exist_ok=True)
-        with open(PRINCIPLE_TRIGGERS_PATH, "w") as f:
+        # Non-blocking, regular-file-only write (#3628): reached from
+        # server._ensure_schema_bootstrap, so a FIFO here must raise OSError
+        # (callers catch Exception), never hang startup.
+        with _regular_io.open_regular_text_write(PRINCIPLE_TRIGGERS_PATH) as f:
             json.dump(index, f, indent=2)
 
         return {

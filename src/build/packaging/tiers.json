@@ -250,6 +250,11 @@
       "note": "Atomic write + retrying read of config.json (#3607). Stdlib-only. Essential because engram_core and engram_restamp import it (hard dependencies)."
     },
     {
+      "path": "engram_regular_io.py",
+      "tier": "essential",
+      "note": "Non-blocking, regular-file-only text opens (open_regular_text / read_regular_text / open_regular_text_write / open_regular_text_append; #3591, #3628): a FIFO at a config/marker/log path raises OSError instead of hanging a hook under its 5 s timeout. Stdlib-only. Essential because engram_config_io and engram_log_emitter import it (hard dependencies) (hooks/_hooklib.py keeps its own identical copy, pinned by tests/test_regular_io_parity_3628.py). Layering: hooks import core, never the reverse."
+    },
+    {
       "path": "engram_search_rules.py",
       "tier": "essential",
       "note": "The one definition of 'not searchable' (SEARCH_EXCLUDED_TYPES + the SQL fragment builders; evidence is out of search, Lei 2026-10-08). Stdlib-only. Essential because engram_core imports it (a hard dependency) and the surface hook imports it to filter attached-pack FTS."

@@ -55,6 +55,9 @@ import pytest
 REPO_ROOT = Path(__file__).parent.parent
 HOOKS_SRC = REPO_ROOT / "src" / "engram" / "hooks" / "claude"
 EMITTER_SRC = REPO_ROOT / "src" / "engram" / "engram_log_emitter.py"
+# engram_log_emitter imports this core sibling (#3628), so a deployed layout
+# without it cannot load the emitter at all.
+REGULAR_IO_SRC = REPO_ROOT / "src" / "engram" / "engram_regular_io.py"
 PYTHON = sys.executable
 
 # Shared library modules every hook (or its imports) may need as a sibling
@@ -137,6 +140,7 @@ def plugin_root(tmp_path) -> Path:
         shutil.copy(HOOKS_SRC / name, hooks_dir / name)
 
     shutil.copy(EMITTER_SRC, root / "engram_log_emitter.py")
+    shutil.copy(REGULAR_IO_SRC, root / "engram_regular_io.py")
     for name, content in _STUB_MODULES.items():
         (root / name).write_text(content)
 
