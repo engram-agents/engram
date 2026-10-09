@@ -3091,21 +3091,31 @@ def check_principle_triggers(matched_ids: list, prompt_count: int) -> str:
     return text
 
 
-def check_principle_triggers_full(matched_ids: list, prompt_count: int) -> tuple[str, list]:
+def check_principle_triggers_full(
+    matched_ids: list, prompt_count: int, unknown: "list | None" = None
+) -> tuple[str, list]:
     """Same check as `check_principle_triggers`, but also returns the
     `rendered` list (`[(kind, principle_id, entry, matched_trigger_id), ...]`)
     of everything that actually fired this call -- the #1698 slice-3 caller
     (`main()`) uses this to emit one `engram.trigger.fire` telemetry event
     per rendered firing without re-deriving the cap/cooldown decision.
+
+    #3521 row 7: `unknown` is an optional list. A registry that could not be
+    read or used (anything but an ABSENT file) still returns `("", [])`, but
+    appends one `"<ExceptionClass>: <message>"` reason to `unknown` so the
+    caller can tell "the registry is broken" from "nothing fired". With
+    `unknown=None` (the default) behaviour is exactly as before.
     """
     if not matched_ids:
         return "", []
     try:
-        return _check_principle_triggers_inner(matched_ids, prompt_count)
-    except Exception:
+        return _check_principle_triggers_inner(matched_ids, prompt_count, unknown)
+    except Exception as exc:
         # Runs on every prompt — a malformed cache must degrade to
         # silence, never break the hook (same contract as the function
-        # this replaces).
+        # this replaces). #3521: but the degrade is reported, not hidden.
+        if isinstance(unknown, list):
+            unknown.append(f"{type(exc).__name__}: {exc}")
         return "", []
 
 
@@ -3224,11 +3234,18 @@ def _with_state_lock(lock_path, fn):
             pass
 
 
-def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tuple[str, list]:
+def _check_principle_triggers_inner(
+    matched_ids: list, prompt_count: int, unknown: "list | None" = None
+) -> tuple[str, list]:
     try:
         with open_regular_text(PRINCIPLE_TRIGGERS_PATH) as f:
             registry = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except json.JSONDecodeError as exc:
+        # #3521 row 7: a corrupt registry is UNKNOWN, not "nothing fired".
+        if isinstance(unknown, list):
+            unknown.append(f"{type(exc).__name__}: {exc}")
+        return "", []
+    except FileNotFoundError:
         # Deviation from design doc §2's literal "fallback to legacy":
         # slice 1's rebuild is additive and runs at the same 3 sites the
         # legacy caches already rebuild from, so this file is realistically
@@ -3240,13 +3257,21 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tup
         # explicitly for reviewer/Kepler to confirm or override, since the
         # design doc's literal words say "fallback to legacy."
         return "", []
-    except OSError:
+    except OSError as exc:
         # #3628: swallowed only for a non-regular target (a FIFO); on a
-        # regular file it propagates as on dev.
+        # regular file it propagates as on dev (and the outer wrapper in
+        # check_principle_triggers_full records it, #3521 row 7).
         if _is_non_regular(PRINCIPLE_TRIGGERS_PATH):
+            if isinstance(unknown, list):
+                unknown.append(f"{type(exc).__name__}: {exc}")
             return "", []
         raise
-    if not registry or not isinstance(registry, dict):
+    if not isinstance(registry, dict):
+        # #3521 row 7: a registry that is not an object cannot be used.
+        if isinstance(unknown, list):
+            unknown.append("ValueError: registry is not an object")
+        return "", []
+    if not registry:
         return "", []
 
     # Reverse view: a matched ID that IS a principle's own node ID (not a
@@ -3701,8 +3726,9 @@ def main():
     # kinds (lesson/cornerstone/axiom/goal), replacing the separate
     # check_incident_tripwire + check_cornerstone_anchor calls.
     matched_ids = result.get("matched_ids", []) if result else []
+    _principle_unknown: list = []  # #3521 row 7: rendered below with the other probes
     principle_triggers, _principle_rendered = check_principle_triggers_full(
-        matched_ids, counter["prompts_since_compaction"]
+        matched_ids, counter["prompts_since_compaction"], _principle_unknown
     )
     if not principle_triggers:
         # Preserve the semantic-keyword fallback for lessons specifically --
@@ -3907,6 +3933,16 @@ def main():
             head_blocks.append(_line)
     elif embed_restore_ok is False:
         head_blocks.append(f"⚠️  {embed_restore_msg}")
+
+    # #3521 row 7: a registry that could not be read or used is UNKNOWN, not
+    # "no principle fired". Same render + stamp path as the probes above.
+    if _principle_unknown:
+        _line = _probe_unknown_notice(
+            probe_stamps_pending, "principle-triggers", "principle triggers",
+            "trigger nudges skipped this prompt", _principle_unknown[0],
+        )
+        if _line:
+            head_blocks.append(_line)
 
     # Attached-pack surfacing — queried AFTER own-graph result, guarded
     # fail-open so any pack error never breaks the hook.
