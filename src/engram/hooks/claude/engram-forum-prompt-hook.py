@@ -220,8 +220,8 @@ def _remaining_budget(deadline: float) -> float:
 # previously inlined here now lives in the shared _prompthooklib module
 # (same directory, same sys.path bootstrap used below). _PROMPTHOOKLIB_OK
 # gates main() -- if the shared module somehow fails to import, the hook
-# degrades to a silent no-op rather than crashing, same discipline as every
-# other best-effort import in this prologue.
+# reports the exception class (one stderr line, one injected context line;
+# #3521) and exits 0 rather than crashing.
 #
 # engram-alpha#2863 WS2: this hook's own response-dict construction at the
 # end of main() now routes through _assemble_response() below, which calls
@@ -274,8 +274,10 @@ try:
         hooklib_io as _hooklib_io,
     )
     _PROMPTHOOKLIB_OK = True
-except Exception:
+except Exception as _lib_exc:
+    # #3521: remember the CLASS only (never the message); main() reports it.
     _PROMPTHOOKLIB_OK = False
+    _PROMPTHOOKLIB_IMPORT_ERROR = type(_lib_exc).__name__
 _tools_dir = _bootstrap_tools_dir("_status_derive.py") if _PROMPTHOOKLIB_OK else None
 try:
     from _status_derive import derive_own_status, _read_loop_mode
@@ -1122,12 +1124,56 @@ def _assemble_response(head_blocks: list, body_blocks: list) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
+def _report_prompthooklib_import_failed() -> None:
+    """#3521: a failed `_prompthooklib` import is VISIBLE, not a silent no-op.
+
+    One class-only stderr line plus one class-only injected context line, on
+    every run (deliberately no rate limit: a broken install is rare and
+    severe). The lib -- and its `emit_context` -- is the thing that failed, so
+    the envelope is built here with `json` alone. Each emission is separately
+    guarded: this function never raises, and if a write fails the hook falls
+    back to the silent exit 0 it had before.
+    """
+    try:
+        cls = "".join(
+            ch if ch.isprintable() else "?" for ch in _PROMPTHOOKLIB_IMPORT_ERROR
+        )[:80]
+        line = f"{_HOOK_NAME}: _prompthooklib import failed: {cls}"
+    except Exception:
+        return
+    try:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": line,
+        }}))
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def main() -> None:
     # ── Prologue-lib gate (gh#1680 slice 1) ───────────────────────────────────
     # If _prompthooklib somehow failed to import, _load_config/_get_agent_name
-    # are unavailable -- degrade to a silent no-op, matching every other
-    # best-effort import in this hook's prologue.
+    # are unavailable. Report the failure (class-only stderr line + injected
+    # context line, #3521) and exit 0 without doing any other work. The exit
+    # is os._exit(0), not sys.exit(0): the reporter swallows a failed write on
+    # a closed pipe, which leaves data buffered, and the interpreter's
+    # shutdown flush would then fail and turn the exit code into 120.
     if not _PROMPTHOOKLIB_OK:
+        _report_prompthooklib_import_failed()
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        # Only a hook run as a script may skip shutdown: an in-process caller
+        # (such as a test) must get a catchable SystemExit, never a killed process.
+        if __name__ == "__main__":
+            os._exit(0)
         sys.exit(0)
 
     # ── Config ────────────────────────────────────────────────────────────────

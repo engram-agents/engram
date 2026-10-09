@@ -157,6 +157,7 @@
   "hooks/claude/engram-forum-prompt-hook.py:_assemble_response",
   "hooks/claude/engram-forum-prompt-hook.py:main",
   "hooks/claude/engram-forum-prompt-hook.py:_ipv4_only_getaddrinfo",
+  "hooks/claude/engram-forum-prompt-hook.py:_report_prompthooklib_import_failed",
   "hooks/claude/engram-inter-agent-prompt-hook.py:_load_config",
   "hooks/claude/engram-inter-agent-prompt-hook.py:_get_agent_name",
   "hooks/claude/engram-inter-agent-prompt-hook.py:_is_forum_configured",
