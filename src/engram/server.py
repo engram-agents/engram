@@ -6947,14 +6947,23 @@ def engram_resolve(payload_json: str) -> str:
         When partial_resolution is due to threshold gate, includes
         discipline_hint advising against chain dilution.
         When the target is a question with `bears_on` edges (#3615; also on
-        the idempotent no_op path), the return adds `bears_on` (the live
-        targets, each {target_id, target_type}; a SUPERSEDED target is
-        followed to its live successor, listed with `superseded_from`: the
-        old id), `bears_on_prompt` (asks, for each, whether the answer
-        supports or weakens it; it says "partially resolved" when the
-        resolve left the question partially_resolved) and
-        `bears_on_omitted_noncurrent` (count of targets with no live
-        successor: retracted, or a supersede chain that ends non-current; absent at 0).
+        the idempotent no_op path), the return adds `bears_on` (the LIVE
+        DIRECT targets, each {target_id, target_type}; a superseded target
+        is never listed), `bears_on_prompt` (asks, for each, whether the
+        answer supports or weakens it; it says "partially resolved" when the
+        resolve left the question partially_resolved),
+        `bears_on_hints` + `bears_on_hint_prompt` (#3625: a target
+        superseded, or retracted with a replacement, whose live replacement
+        is a legal target the question is not yet wired to, found by
+        following supersede or retract chains; ONE hint per replacement;
+        each entry carries the exact engram_add_edge call, and the old edge
+        stays as provenance), `bears_on_hint_error` ("<ExceptionType>:
+        <message>", present only if computing the surfacing failed after the
+        resolve committed; the resolve itself still succeeded) and
+        `bears_on_omitted_noncurrent` (count of non-current targets that
+        produced no hint: retracted without a replacement, no live
+        replacement, replacement already wired, or not a legal target;
+        absent at 0).
         engram_resolve changes none of those targets'
         confidence — acting on the prompt is a separate, deliberate step.
         Absent for any other target.
@@ -7064,6 +7073,12 @@ def engram_supersede(payload_json: str) -> str:
     Returns:
         JSON with old_node_id, new_node_id, the stale downstream list,
         and stale_count. On payload-parsing failure, returns {"error": "..."}.
+        When a current question has a `bears_on` edge to old_node_id, also
+        `bears_on_hints` + `bears_on_hint_prompt` (#3625; read-only; each
+        entry carries the exact engram_add_edge call, the old edge stays as
+        provenance); absent otherwise. If computing the hint fails after the
+        supersede committed, the supersede still succeeds and the return
+        carries `bears_on_hint_error` ("<ExceptionType>: <message>") instead.
 
     See _supersede_impl for full semantics + workflow + validation rules.
     """
@@ -7209,6 +7224,11 @@ def engram_retract(payload_json: str) -> str:
     Returns:
         JSON with retraction details, tainted downstream nodes, and optional
         replacement. On payload-parsing failure, returns {"error": "..."}.
+        With a replacement_id, also `bears_on_hints` +
+        `bears_on_hint_prompt` (#3625; read-only) for current questions that
+        bore on the retracted node; absent otherwise. If computing the hint
+        fails after the retraction committed, the retraction still succeeds
+        and the return carries `bears_on_hint_error` instead.
 
     See _retract_impl for full semantics + error-type catalog.
     """

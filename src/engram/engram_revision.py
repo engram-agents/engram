@@ -2026,20 +2026,193 @@ def _detect_zero_support(
 # E impls
 # ---------------------------------------------------------------------------
 
+def _bears_on_hint_entry(question_id, old_id, repl_row) -> dict:
+    """One ``bears_on_hints`` entry (#3625). The ``add_edge_call`` is exactly a
+    valid ``engram_add_edge`` payload."""
+    return {
+        "question_id": question_id,
+        "from_target": old_id,
+        "replacement_id": repl_row["id"],
+        "replacement_type": repl_row["type"],
+        "add_edge_call": {
+            "source_id": question_id,
+            "target_id": repl_row["id"],
+            "relation": "bears_on",
+        },
+    }
+
+
+def _bears_on_replacement_ok(conn, question_id, repl_row) -> bool:
+    """True when a hint pointing ``question_id`` at ``repl_row`` is legal: the
+    question is not already wired to the replacement and the shared endpoint
+    rule would accept the pair. Currency of the question and of the
+    replacement is the caller's job."""
+    if conn.execute(
+        "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ? "
+        "AND relation = 'bears_on' LIMIT 1",
+        (question_id, repl_row["id"]),
+    ).fetchone():
+        return False
+    # Call-time import, as engram_derive._ask_impl does (accepted bend; the
+    # helper moves into core under #3631).
+    import engram_cornerstone as _cornerstone
+    return _cornerstone._relation_endpoint_error(
+        "bears_on", {"id": question_id, "type": "question"}, repl_row
+    ) is None
+
+
+def _bears_on_replacement_hints(conn, old_id, replacement_id) -> list:
+    """The ``bears_on_hints`` for ``old_id`` replaced by ``replacement_id``
+    (#3625): one entry per CURRENT question with a ``bears_on`` edge to
+    ``old_id`` (ordered by question id) that is not already wired to the
+    replacement and for which the replacement is a legal ``bears_on`` target.
+    ``[]`` when the replacement is not current. Read-only. Costs ONE indexed
+    query when ``old_id`` has no incoming ``bears_on`` edge (supersede and
+    retract are hot paths)."""
+    qrows = conn.execute(
+        "SELECT DISTINCT e.source_id AS id FROM edges e "
+        "JOIN nodes q ON q.id = e.source_id "
+        "WHERE e.target_id = ? AND e.relation = 'bears_on' "
+        "AND q.type = 'question' AND q.is_current = 1 "
+        "ORDER BY e.source_id",
+        (old_id,),
+    ).fetchall()
+    if not qrows:
+        return []
+    repl = conn.execute(
+        "SELECT id, type, is_current FROM nodes WHERE id = ?", (replacement_id,)
+    ).fetchone()
+    if not repl or repl["is_current"] != 1:
+        return []
+    return [
+        _bears_on_hint_entry(q["id"], old_id, repl)
+        for q in qrows
+        if _bears_on_replacement_ok(conn, q["id"], repl)
+    ]
+
+
+def _bears_on_hint_prompt(hints) -> str:
+    """ONE string for a non-empty ``bears_on_hints`` list: names each
+    question, the old and the new target, gives the exact
+    ``engram_add_edge`` call, and says the old edge stays as provenance."""
+    lines = []
+    for h in hints:
+        lines.append(
+            f"- question {h['question_id']} bore on {h['from_target']}, which "
+            f"was replaced by {h['replacement_id']} ({h['replacement_type']}). "
+            f"If it still bears on the replacement, call engram_add_edge with "
+            f"{json.dumps(h['add_edge_call'])}."
+        )
+    return (
+        "A question that bears_on a replaced claim may still bear on its "
+        "replacement; you decide, nothing was added for you:\n"
+        + "\n".join(lines)
+        + "\nThe old edge stays as provenance: it is hidden and does not "
+        "count toward the question's importance, and adding the new edge "
+        "removes nothing."
+    )
+
+
+def _bears_on_hint_fields(conn, old_id, replacement_id) -> dict:
+    """The return keys for a supersede / retract-with-replacement: the
+    ``bears_on_hints`` + ``bears_on_hint_prompt`` pair, or ``{}`` when there
+    is nothing to hint. Looks ``_bears_on_replacement_hints`` up at call time."""
+    hints = _bears_on_replacement_hints(conn, old_id, replacement_id)
+    if not hints:
+        return {}
+    return {
+        "bears_on_hints": hints,
+        "bears_on_hint_prompt": _bears_on_hint_prompt(hints),
+    }
+
+
+def _bears_on_best_effort(fn, *args) -> dict:
+    """Run an ADVISORY bears_on surfacing step that executes after its
+    mutation has committed (#3625). On any Exception the step is dropped and
+    ``{"bears_on_hint_error": "<ExceptionType>: <message, ~200 chars>"}`` is
+    returned instead, so the caller still gets the committed mutation's
+    normal success payload (a retry of a committed supersede would fail with
+    "not current") and can see that the hint is missing. Never silent: the
+    error key is the signal."""
+    try:
+        return fn(*args)
+    except Exception as e:  # noqa: BLE001 - advisory, must never fail the call
+        return {"bears_on_hint_error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+_BEARS_ON_CHAIN_HOP_CAP = 50
+
+
+def _bears_on_replacement_of(conn, node_id):
+    """The live replacement of a non-current ``node_id`` for the resolve hint
+    (#3625), or None. Follows the full mixed chain to its live end: at each
+    hop a node was either SUPERSEDED (its ``superseded_by``) or RETRACTED WITH
+    a replacement (the source of a ``retracts`` edge into it:
+    ``_retract_impl`` writes ``replacement --retracts--> node``). Among
+    several ``retracts`` sources a current one wins, then the lowest id, for
+    determinism; a dead-end branch falls back to the next. A visited set
+    guards cycles and ``_BEARS_ON_CHAIN_HOP_CAP`` bounds the depth. None when
+    the chain ends without a live node (retracted without a replacement, or
+    no edge at all)."""
+    seen = {node_id}
+
+    def walk(cur, depth):
+        if depth > _BEARS_ON_CHAIN_HOP_CAP:
+            return None
+        row = conn.execute(
+            "SELECT is_current, superseded_by FROM nodes WHERE id = ?", (cur,)
+        ).fetchone()
+        if row is None:
+            return None
+        if cur != node_id and row["is_current"] == 1:
+            return cur
+        nexts = []
+        if row["superseded_by"]:
+            nexts.append(row["superseded_by"])
+        nexts += [
+            r["id"] for r in conn.execute(
+                "SELECT e.source_id AS id FROM edges e "
+                "JOIN nodes n ON n.id = e.source_id "
+                "WHERE e.target_id = ? AND e.relation = 'retracts' "
+                "ORDER BY n.is_current DESC, e.source_id",
+                (cur,),
+            ).fetchall()
+        ]
+        for nxt in nexts:
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            end = walk(nxt, depth + 1)
+            if end is not None:
+                return end
+        return None
+
+    return walk(node_id, 0)
+
+
 def _bears_on_resolve_fields(conn, question_row, resolution_status=None) -> dict:
-    """The `bears_on` surfacing for an engram_resolve return (#3615).
+    """The `bears_on` surfacing for an engram_resolve return (#3615, #3625).
 
     When ``question_row`` is a question with >=1 ``bears_on`` edge, returns
-    ``bears_on`` (the live targets as ``{"target_id","target_type"}``; a target
-    that was SUPERSEDED is followed to its live successor via
-    ``core._current_successor`` and listed as the successor, carrying
-    ``"superseded_from": <old id>``, deduped when two edges map to one
-    successor), ``bears_on_prompt`` (one string naming each live target and
-    asking whether the answer supports or weakens it) and, when any target has
-    NO live successor (retracted, or a supersede chain that ends non-current),
-    ``bears_on_omitted_noncurrent`` (that count; omitted at 0). Returns ``{}``
-    otherwise, so the response shape of every other resolve is unchanged.
-    Read-only: it touches no status or confidence.
+    ``bears_on`` (the LIVE DIRECT targets only, as
+    ``{"target_id","target_type"}``; a superseded target is never listed, not
+    even as its successor), ``bears_on_prompt`` (one string naming each live
+    target and asking whether the answer supports or weakens it) and
+    ``bears_on_omitted_noncurrent`` (the count of non-current targets that
+    produced NO hint: retracted without a replacement, no live successor or
+    replacement, replacement already wired to the question, or not a legal
+    target; omitted at 0). A non-current target (superseded, or retracted
+    WITH a replacement) whose end-of-chain replacement
+    (``_bears_on_replacement_of``, following supersede or retract chains)
+    passes the hint conditions goes under ``bears_on_hints`` (same entry
+    shape as supersede/retract) with a ``bears_on_hint_prompt``; ONE hint per
+    (question, replacement): the first target by edge order supplies
+    ``from_target`` and later targets sharing that replacement are covered by
+    it, not counted as omitted. The agent decides whether to add the edge.
+    Callers wrap this in ``_bears_on_best_effort`` (a failure becomes
+    ``bears_on_hint_error``, never an exception). Returns ``{}`` when the question has no
+    ``bears_on`` edge, so the response shape of every other resolve is
+    unchanged. Read-only: it touches no status, edge or confidence.
 
     ``resolution_status`` is the outcome of THIS resolve (``resolved`` or
     ``partially_resolved``); the prompt wording depends on it. ``None`` (the
@@ -2061,34 +2234,40 @@ def _bears_on_resolve_fields(conn, question_row, resolution_status=None) -> dict
 
     live: list = []
     seen: set = set()
+    hints: list = []
+    hinted: set = set()
     skipped = 0
     for r in rows:
         if r["is_current"] == 1:
-            tid, ttype, old = r["id"], r["type"], None
-        else:
-            tid = core._current_successor(conn, r["id"])
-            if tid is None:
-                skipped += 1
-                continue
-            trow = conn.execute(
-                "SELECT type FROM nodes WHERE id = ?", (tid,)
-            ).fetchone()
-            ttype, old = trow["type"], r["id"]
-        if tid in seen:
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                live.append({"target_id": r["id"], "target_type": r["type"]})
             continue
-        seen.add(tid)
-        entry = {"target_id": tid, "target_type": ttype}
-        if old is not None:
-            entry["superseded_from"] = old
-        live.append(entry)
+        # Non-current target (#3625): hint toward the END of its supersede
+        # chain when the hint conditions hold; otherwise count it as omitted.
+        succ = _bears_on_replacement_of(conn, r["id"])
+        trow = (
+            conn.execute(
+                "SELECT id, type FROM nodes WHERE id = ?", (succ,)
+            ).fetchone()
+            if succ is not None else None
+        )
+        if trow is not None and _bears_on_replacement_ok(
+            conn, question_row["id"], trow
+        ):
+            # One hint per (question, replacement): the first target by edge
+            # order supplies from_target; a later target sharing the same
+            # replacement is covered by that hint (not "omitted").
+            if trow["id"] not in hinted:
+                hinted.add(trow["id"])
+                hints.append(
+                    _bears_on_hint_entry(question_row["id"], r["id"], trow))
+        else:
+            skipped += 1
 
     out: dict = {"bears_on": live}
     if live:
-        ids = ", ".join(
-            f"{t['target_id']} (superseded from {t['superseded_from']})"
-            if "superseded_from" in t else t["target_id"]
-            for t in live
-        )
+        ids = ", ".join(t["target_id"] for t in live)
         if partial:
             out["bears_on_prompt"] = (
                 f"This question was wired to bear on: {ids}. It is only "
@@ -2108,12 +2287,21 @@ def _bears_on_resolve_fields(conn, question_row, resolution_status=None) -> dict
                 f"warranted; engram_resolve itself changed none of their "
                 f"confidence."
             )
+    elif hints:
+        out["bears_on_prompt"] = (
+            "This question was wired to bear on claims, but none of them is "
+            "current any more; see bears_on_hints for the replacement(s) it "
+            "may still bear on."
+        )
     else:
         out["bears_on_prompt"] = (
             "This question was wired to bear on claims, but none of them is "
-            "current any more (each was retracted or has no live successor); "
-            "nothing to re-assess."
+            "current any more (each was retracted, or superseded with no "
+            "replacement it could be pointed at); nothing to re-assess."
         )
+    if hints:
+        out["bears_on_hints"] = hints
+        out["bears_on_hint_prompt"] = _bears_on_hint_prompt(hints)
     if skipped:
         out["bears_on_omitted_noncurrent"] = skipped
     return out
@@ -2169,14 +2357,22 @@ def _resolve_impl(
     Returns:
         JSON with the wired edge, target's new status, and the resolving
         node's confidence. When the target is a question with ``bears_on``
-        edges (#3615), also ``bears_on`` (the live targets, ``target_id`` +
-        ``target_type``; a SUPERSEDED target is followed to its live
-        successor and listed as that successor with ``superseded_from``),
-        ``bears_on_prompt`` (asks whether the answer supports or weakens
-        each; worded as "partially resolved" when this resolve left the
-        question partially_resolved) and ``bears_on_omitted_noncurrent``
-        (count of targets with no live successor: retracted, or a supersede
-        chain that ends non-current; absent at 0) — on the idempotent
+        edges (#3615, #3625), also ``bears_on`` (the LIVE DIRECT targets,
+        ``target_id`` + ``target_type``; a superseded target is never
+        listed), ``bears_on_prompt`` (asks whether the answer supports or
+        weakens each; worded as "partially resolved" when this resolve left
+        the question partially_resolved), ``bears_on_hints`` +
+        ``bears_on_hint_prompt`` (a target superseded, or retracted with a
+        replacement, whose live replacement (found by following supersede
+        or retract chains) the question may still bear on, one hint per
+        replacement, with the exact ``engram_add_edge`` call; the old edge
+        stays as provenance), ``bears_on_hint_error`` (present only if
+        computing the surfacing failed after the resolve committed; the
+        resolve still succeeded) and
+        ``bears_on_omitted_noncurrent`` (count of non-current targets that
+        produced no hint: retracted without a replacement, no live
+        replacement, replacement already wired, or not a legal target;
+        absent at 0) — on the idempotent
         ``no_op`` path too. Absent for every other resolve.
     """
     RESOLVABLE_TYPES = {"question", "contradiction", "prediction", "conjecture", "goal_tension"}
@@ -2306,7 +2502,7 @@ def _resolve_impl(
                 "resolving_node_id": resolving_node_id,
                 "target_status": target["status"],
                 # #3615: a retry keeps the bears_on prompt (empty dict when n/a).
-                **_bears_on_resolve_fields(conn, target),
+                **_bears_on_best_effort(_bears_on_resolve_fields, conn, target),
             })
 
         confidence = resolver["confidence"] if resolver["confidence"] is not None else 1.0
@@ -2390,7 +2586,10 @@ def _resolve_impl(
 
         # #3615: name the question's bears_on targets (read-only; absent keys
         # when the target is not a question or has no bears_on edges).
-        result.update(_bears_on_resolve_fields(conn, target, resolution_status))
+        # Advisory and computed after the commit: a failure here is reported
+        # as `bears_on_hint_error`, never raised (a retry would fail).
+        result.update(_bears_on_best_effort(
+            _bears_on_resolve_fields, conn, target, resolution_status))
 
         return json.dumps(result)
     finally:
@@ -2970,6 +3169,10 @@ def _supersede_impl(
         if support_restored_cs_ls:
             result["support_restored"] = support_restored_cs_ls
             result["support_restored_count"] = len(support_restored_cs_ls)
+        # #3625: read-only hint that a question's bears_on may still hold
+        # toward the replacement. Keys absent when there is nothing to hint.
+        result.update(_bears_on_best_effort(
+            _bears_on_hint_fields, conn, old_node_id, new_node_id))
         return json.dumps(result)
     finally:
         conn.close()
@@ -3818,6 +4021,9 @@ def _retract_impl(
             result["retracted_predictions_count"] = len(retracted_predictions)
         if replacement_id:
             result["replacement_id"] = replacement_id
+            # #3625: only WITH a replacement; read-only, keys absent at none.
+            result.update(_bears_on_best_effort(
+                _bears_on_hint_fields, conn, node_id, replacement_id))
         if _self_anchor_retracted:
             result["warning"] = (
                 "Retracted node was the agent's self-anchor (is_self=True). "

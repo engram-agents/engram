@@ -30,18 +30,18 @@ reviewer may overturn, and each is pinned by a test so the change is loud):
      (The issue text said "visible but marked"; that would be a second,
      different convention for the same situation.) The edge ROW is never
      deleted by a retract. The priority signal counts CURRENT targets only.
-  3. engram_resolve lists LIVE targets under `bears_on`. A SUPERSEDED target
-     is followed to its live successor (listed as the successor, marked
-     `superseded_from`); `bears_on_omitted_noncurrent` counts only targets
-     with no live successor (retracted, or a chain that ends non-current).
-     The prompt says "partially resolved" when the resolve left the question
-     partially_resolved. The keys are absent when the target is not a question
-     or has no bears_on edges. They are also present on the idempotent no_op
-     path, so a retry does not lose the prompt. (Round 1 of the PR listed
-     CURRENT targets only; round 2 added the successor and wording rules.) `engram_cascade_resolve` is OUT OF SCOPE: it works
-     on tainted/stale claim-bearing nodes, and a question is not
-     claim-bearing, so no question reaches it (read from engram_resolve's
-     RESOLVABLE_TYPES; cascade_resolve's own code was not read -- inferred).
+  3. engram_resolve lists LIVE DIRECT targets under `bears_on` and nothing else.
+     A SUPERSEDED target is no longer followed and listed (Lei's ruling,
+     2026-10-09, #3625): if it has a live successor the question may still bear
+     on, that appears as a HINT (`bears_on_hints`, see
+     tests/test_bears_on_hints_3625.py) for the agent to act on by adding a new
+     edge. `bears_on_omitted_noncurrent` counts non-current targets that
+     produced no hint. The prompt says "partially resolved" when the resolve
+     left the question partially_resolved. The keys are absent when the target
+     is not a question or has no bears_on edges. They are also present on the
+     idempotent no_op path, so a retry does not lose the prompt. (Round 1 of
+     #3618 listed CURRENT targets only; round 2 followed a successor and listed
+     it; Lei's ruling replaced that with the hint.)
   4. `bears_on_weight` = sum of the CURRENT targets' importance_score, rounded
      to 3 places. It is only a tie-break behind `bears_on_count`. This is the
      least-grounded choice: the issue says "importance/confidence stake" and
@@ -539,25 +539,6 @@ def test_resolve_prompt_does_not_claim_answered_on_a_partial_resolution():
     full = _resolve(server2, qu2, _strong_observation(server2))
     assert full.get("resolution_status") == "resolved", full
     assert "answered" in full["bears_on_prompt"]
-
-
-def test_resolve_follows_a_superseded_target_to_its_live_successor():
-    """A superseded target has a live successor: the stake must not read as
-    'nothing to re-assess'. The successor is listed, marked as coming from the
-    superseded id, and the prompt names it."""
-    server = fresh_server()
-    qu = _seed_question(server)
-    old, new = _seed_conjecture(server, "old form"), _seed_conjecture(server, "new form")
-    _wire(server, qu, old)
-    _supersede(server, old, new)
-    r = _resolve(server, qu, _seed_observation(server, "answer"))
-    assert "error" not in r, r
-    assert r["bears_on"] == [
-        {"target_id": new, "target_type": "conjecture", "superseded_from": old}
-    ], r
-    assert new in r["bears_on_prompt"], r["bears_on_prompt"]
-    assert "nothing to re-assess" not in r["bears_on_prompt"]
-    assert r.get("bears_on_omitted_noncurrent", 0) == 0, r
 
 
 def test_resolve_with_only_a_retracted_target_lists_nothing_and_says_so():
