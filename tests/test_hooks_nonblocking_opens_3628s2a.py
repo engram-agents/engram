@@ -540,9 +540,9 @@ def _c_tb_stamp(ctx):
 
 @cell("user_identity_primary_user_config", "engram-user-identity-hook.py")
 def _c_ui_primary(ctx):
-    ctx.special(ctx.eh / "config.json", json.dumps({"primary_user": "Lin"}))
+    ctx.special(ctx.eh / "config.json", json.dumps({"primary_user": "Kfixture"}))
     return ("result = mod.get_primary_user()",
-            {"fifo": lambda r: r == "", "regular": lambda r: r == "lin"})
+            {"fifo": lambda r: r == "", "regular": lambda r: r == "kfixture"})
 
 
 @cell("user_identity_owner_reads_flag", "engram-user-identity-hook.py")

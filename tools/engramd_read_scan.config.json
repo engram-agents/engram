@@ -343,6 +343,7 @@
   "hooks/claude/engram-surface-hook.py:_compact_age",
   "hooks/claude/engram-surface-hook.py:render_one_node_line",
   "hooks/claude/engram-surface-hook.py:format_nudge",
+  "hooks/claude/engram-surface-hook.py:_is_non_regular",
   "hooks/claude/engram-surface-hook.py:read_prompt_counter",
   "hooks/claude/engram-surface-hook.py:write_prompt_counter",
   "hooks/claude/engram-surface-hook.py:check_write_reminder",

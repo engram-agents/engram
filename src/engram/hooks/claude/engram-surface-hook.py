@@ -46,6 +46,9 @@ from _hooklib import (
     probe_unknown_line, write_probe_unknown_stderr,
     probe_notice_due, mark_probe_notice, probe_own_server_py,
 )
+# #3628: every file open here is non-blocking and regular-file-only (a FIFO at
+# a state path must not hang the hook); the helpers live in _hooklib.
+from _hooklib import open_regular_text, open_regular_text_write
 from _harness import detect_harness, get_harness_budgets
 try:
     from _hooklib import atomic_write_json
@@ -225,7 +228,7 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool | None, str | N
         marker_path = os.path.join(engram_home, "mcp-tools-ready.json")
         if not os.path.exists(marker_path):
             return False, "mcp-tools-ready.json absent (server may not have completed initialization)"
-        with open(marker_path) as f:
+        with open_regular_text(marker_path) as f:
             data = json.load(f)
         raw_pid = data.get("pid", 0)
         if isinstance(raw_pid, bool) or (isinstance(raw_pid, float) and raw_pid != 0.0):
@@ -395,7 +398,7 @@ RETIREMENT_CEILING_PROMPTS = 160  # design doc §4: "effectively retired"
 def get_user_name() -> str:
     """Read primary_user from $ENGRAM_HOME/config.json; fall back to 'the human'."""
     try:
-        with open(os.path.join(ENGRAM_HOME, "config.json"), "r", encoding="utf-8") as f:
+        with open_regular_text(os.path.join(ENGRAM_HOME, "config.json"), encoding="utf-8") as f:
             config = json.load(f)
         return str(config.get("primary_user") or "the human")
     except (OSError, json.JSONDecodeError, AttributeError, TypeError):
@@ -461,7 +464,7 @@ def _get_auto_surface_config() -> dict:
         "idf_gate_short_prompt_floor_chars": DEFAULT_IDF_GATE_SHORT_PROMPT_FLOOR_CHARS,
     }
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
         section = config.get("auto_surface", {})
         return {
@@ -533,7 +536,7 @@ def _get_suppression_config() -> dict:
         "prompt_similarity_threshold": DEFAULT_PROMPT_SIMILARITY_THRESHOLD,
     }
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
         section = config.get("recall_suppression", {})
         return {
@@ -565,7 +568,7 @@ def _get_echo_guard_config() -> dict:
     config_path = os.path.join(ENGRAM_HOME, "config.json")
     defaults = {"minutes": DEFAULT_ECHO_GUARD_MINUTES}
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
         section = config.get("same_session_echo", {})
         return {"minutes": float(section.get("minutes", defaults["minutes"]))}
@@ -586,7 +589,7 @@ def _get_session_started_at(session_id: str | None) -> "datetime | None":
         return None
     try:
         path = os.path.join(ENGRAM_HOME, "sessions", f"{session_id}.json")
-        with open(path, "r", encoding="utf-8") as f:
+        with open_regular_text(path, encoding="utf-8") as f:
             marker = json.load(f)
         started_at = marker.get("started_at")
         if not started_at:
@@ -642,7 +645,7 @@ def _read_surface_ledger() -> dict:
     an advisory cache for render-layer suppression, never a source of truth).
     """
     try:
-        with open(_surface_ledger_path(), "r", encoding="utf-8") as f:
+        with open_regular_text(_surface_ledger_path(), encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
@@ -657,7 +660,7 @@ def _write_surface_ledger(ledger: dict) -> None:
         if _HOOKLIB_OK:
             atomic_write_json(path, ledger, encoding="utf-8")
         else:
-            with open(path, "w", encoding="utf-8") as f:
+            with open_regular_text_write(path, encoding="utf-8") as f:
                 json.dump(ledger, f)
     except Exception:
         pass
@@ -958,7 +961,7 @@ def _get_person_moment_cooldown_config() -> dict:
     config_path = os.path.join(ENGRAM_HOME, "config.json")
     defaults = {"seconds": float(_PERSON_MOMENT_COOLDOWN_SECONDS)}
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
         section = config.get("person_moment_cooldown", {})
         return {"seconds": float(section.get("seconds", defaults["seconds"]))}
@@ -1256,7 +1259,7 @@ def _get_budget_config() -> dict:
         "enabled": DEFAULT_RECALL_BUDGET_ENABLED,
     }
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
         section = config.get("recall_budget", {})
         return {
@@ -1587,7 +1590,7 @@ def _get_attached_packs() -> list[dict]:
     """
     try:
         config_path = os.path.join(ENGRAM_HOME, "config.json")
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
         packs = config.get("attached_packs", [])
         if not isinstance(packs, list):
@@ -1728,7 +1731,7 @@ def _read_prev_assistant_tail(transcript_path: str | None, tail_chars: int) -> s
     if not transcript_path or not os.path.exists(transcript_path):
         return ""
     try:
-        with open(transcript_path, "r", encoding="utf-8") as f:
+        with open_regular_text(transcript_path, encoding="utf-8") as f:
             lines = f.readlines()
     except OSError:
         return ""
@@ -2764,13 +2767,24 @@ def format_nudge(
     return "\n".join(lines)
 
 
+def _is_non_regular(path) -> bool:
+    """True only when `path` exists and is not a regular file (a FIFO, a
+    directory...). #3628: the read handlers below swallow an OSError ONLY for
+    such a target; an OSError on a regular file propagates exactly as on dev."""
+    return os.path.exists(path) and not os.path.isfile(path)
+
+
 def read_prompt_counter() -> dict:
     """Read the prompt counter state."""
     try:
-        with open(COUNTER_PATH, "r") as f:
+        with open_regular_text(COUNTER_PATH) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {"prompts_since_compaction": 0, "last_reset": ""}
+    except OSError:
+        if _is_non_regular(COUNTER_PATH):
+            return {"prompts_since_compaction": 0, "last_reset": ""}
+        raise
 
 
 def write_prompt_counter(state: dict):
@@ -2779,23 +2793,49 @@ def write_prompt_counter(state: dict):
     if _HOOKLIB_OK:
         atomic_write_json(COUNTER_PATH, state)
     else:
-        with open(COUNTER_PATH, "w") as f:
+        # #3628: main() calls this unguarded, so a non-regular target (the
+        # helper raises OSError) is skipped here rather than crashing the hook;
+        # a failure on a regular file still raises exactly as before.
+        try:
+            f = open_regular_text_write(COUNTER_PATH)
+        except OSError:
+            if os.path.exists(COUNTER_PATH) and not os.path.isfile(COUNTER_PATH):
+                return
+            raise
+        with f:
             json.dump(state, f)
 
 
 def check_write_reminder() -> str:
     """Check if the Stop hook flagged a pending write reminder."""
+    # An OSError on the read is swallowed ONLY for a non-regular target (a
+    # FIFO); on a regular file it propagates as on dev. The clear-write below
+    # likewise keeps its pre-#3628 exception behaviour for regular files.
     try:
-        with open(WRITE_REMINDER_PATH, "r") as f:
+        with open_regular_text(WRITE_REMINDER_PATH) as f:
             marker = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return ""
+    except OSError:
+        if _is_non_regular(WRITE_REMINDER_PATH):
+            return ""
+        raise
+    try:
         if marker.get("pending"):
             # Clear the marker so it doesn't repeat
             marker["pending"] = False
-            if _HOOKLIB_OK:
-                atomic_write_json(WRITE_REMINDER_PATH, marker)
-            else:
-                with open(WRITE_REMINDER_PATH, "w") as f:
-                    json.dump(marker, f)
+            try:
+                if _HOOKLIB_OK:
+                    atomic_write_json(WRITE_REMINDER_PATH, marker)
+                else:
+                    with open_regular_text_write(WRITE_REMINDER_PATH) as f:
+                        json.dump(marker, f)
+            except OSError:
+                # Only a non-regular target (swapped in after the read) is
+                # tolerated; any other OSError propagates as before.
+                if os.path.exists(WRITE_REMINDER_PATH) and not os.path.isfile(WRITE_REMINDER_PATH):
+                    return ""
+                raise
             return (
                 "[ENGRAM Write Check: Did your last response contain a decision, insight, "
                 "or design choice worth recording? If so, write to ENGRAM now (observation, "
@@ -2820,10 +2860,14 @@ def check_feeling_nudge_marker() -> str:
     engram_reflect, not via UserPromptSubmit).
     """
     try:
-        with open(FEELING_NUDGE_MARKER, "r") as f:
+        with open_regular_text(FEELING_NUDGE_MARKER) as f:
             marker = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return ""
+    except OSError:
+        if _is_non_regular(FEELING_NUDGE_MARKER):
+            return ""
+        raise
 
     source = marker.get("source")
     if source != "post_compact":
@@ -2847,18 +2891,31 @@ def check_feeling_nudge_marker() -> str:
 
 def check_repair_marker() -> str:
     """Check if the PreToolUse repair hook fixed a malformed tool call."""
+    # OSError handling on the read: see check_write_reminder.
     try:
-        with open(REPAIR_MARKER_PATH, "r") as f:
+        with open_regular_text(REPAIR_MARKER_PATH) as f:
             marker = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return ""
+    except OSError:
+        if _is_non_regular(REPAIR_MARKER_PATH):
+            return ""
+        raise
+    try:
         if not marker.get("pending"):
             return ""
         # Clear the marker so it doesn't repeat
         marker["pending"] = False
-        if _HOOKLIB_OK:
-            atomic_write_json(REPAIR_MARKER_PATH, marker)
-        else:
-            with open(REPAIR_MARKER_PATH, "w") as f:
-                json.dump(marker, f)
+        try:
+            if _HOOKLIB_OK:
+                atomic_write_json(REPAIR_MARKER_PATH, marker)
+            else:
+                with open_regular_text_write(REPAIR_MARKER_PATH) as f:
+                    json.dump(marker, f)
+        except OSError:
+            if os.path.exists(REPAIR_MARKER_PATH) and not os.path.isfile(REPAIR_MARKER_PATH):
+                return ""
+            raise
         tool_name = marker.get("tool_name", "?")
         repairs = marker.get("repairs", [])
         lines = [
@@ -2905,10 +2962,14 @@ def check_error_patterns(prompt: str) -> str:
     then [action]' creates strategic automaticity. See dv_NNNN, dv_NNNN.
     """
     try:
-        with open(ERROR_PATTERNS_PATH, "r") as f:
+        with open_regular_text(ERROR_PATTERNS_PATH) as f:
             patterns = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return ""
+    except OSError:
+        if _is_non_regular(ERROR_PATTERNS_PATH):
+            return ""
+        raise
 
     if not patterns:
         return ""
@@ -3089,7 +3150,7 @@ def _with_state_lock(lock_path, fn):
 
 def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tuple[str, list]:
     try:
-        with open(PRINCIPLE_TRIGGERS_PATH, "r") as f:
+        with open_regular_text(PRINCIPLE_TRIGGERS_PATH) as f:
             registry = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         # Deviation from design doc §2's literal "fallback to legacy":
@@ -3103,6 +3164,12 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tup
         # explicitly for reviewer/Kepler to confirm or override, since the
         # design doc's literal words say "fallback to legacy."
         return "", []
+    except OSError:
+        # #3628: swallowed only for a non-regular target (a FIFO); on a
+        # regular file it propagates as on dev.
+        if _is_non_regular(PRINCIPLE_TRIGGERS_PATH):
+            return "", []
+        raise
     if not registry or not isinstance(registry, dict):
         return "", []
 
@@ -3137,11 +3204,15 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tup
                 by_principle.setdefault(pid, entry)
 
     try:
-        with open(PRINCIPLE_TRIGGER_STATE_PATH, "r") as f:
+        with open_regular_text(PRINCIPLE_TRIGGER_STATE_PATH) as f:
             state = json.load(f)
         if not isinstance(state, dict):
             state = {}
     except (FileNotFoundError, json.JSONDecodeError):
+        state = {}
+    except OSError:
+        if not _is_non_regular(PRINCIPLE_TRIGGER_STATE_PATH):
+            raise
         state = {}
 
     # #1698 slice 3 §1.1 — migration on read: a bare int entry is the
@@ -3274,11 +3345,15 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tup
     # non-blocking-suppress pattern").
     def _write_back():
         try:
-            with open(PRINCIPLE_TRIGGER_STATE_PATH, "r") as f:
+            with open_regular_text(PRINCIPLE_TRIGGER_STATE_PATH) as f:
                 fresh_state = json.load(f)
             if not isinstance(fresh_state, dict):
                 fresh_state = {}
         except (FileNotFoundError, json.JSONDecodeError):
+            fresh_state = {}
+        except OSError:
+            if not _is_non_regular(PRINCIPLE_TRIGGER_STATE_PATH):
+                raise
             fresh_state = {}
 
         # Re-apply the same bare-int-entry upconversion (§1.1) done on the
@@ -3315,7 +3390,7 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tup
                 atomic_write_json(str(PRINCIPLE_TRIGGER_STATE_PATH), fresh_state)
             else:
                 tmp = str(PRINCIPLE_TRIGGER_STATE_PATH) + ".tmp"
-                with open(tmp, "w") as f:
+                with open_regular_text_write(tmp) as f:
                     json.dump(fresh_state, f)
                 os.replace(tmp, str(PRINCIPLE_TRIGGER_STATE_PATH))
         except OSError:
@@ -3620,7 +3695,7 @@ def main():
         warming_up = False
         try:
             marker = os.path.join(ENGRAM_HOME, "daemon-launch-attempt")
-            with open(marker) as _f:
+            with open_regular_text(marker) as _f:
                 launched_at = int(_f.read().strip())
             if 0 <= (int(time.time()) - launched_at) < _DAEMON_WARMUP_WINDOW_SECONDS:
                 warming_up = True
@@ -3639,7 +3714,7 @@ def main():
             _idle_tombstone = os.path.join(ENGRAM_HOME, "daemon-idle-shutdown")
             _is_idle_shutdown = False
             try:
-                with open(_idle_tombstone) as _tf:
+                with open_regular_text(_idle_tombstone) as _tf:
                     _shutdown_at = int(_tf.read().strip())
                 # Valid for up to 48h (2 idle-timeout cycles); stale after that.
                 if 0 <= (int(time.time()) - _shutdown_at) <= 172800:
