@@ -74,6 +74,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
 from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context, _trim_to_line_boundary
 from _hooklib import _open_regular_fd
+# #3591: every other open() in this hook is non-blocking and regular-file-only.
+from _hooklib import open_regular_text, open_regular_text_write, read_regular_text
 # #3521: shared advisory-probe `unknown` rendering (once per session here, so
 # only the stderr line + the one injected line are used; no rate-limit stamp).
 from _hooklib import probe_unknown_line, write_probe_unknown_stderr
@@ -132,7 +134,7 @@ def _runtime_platform() -> str | None:
         hook_dir = os.path.dirname(os.path.abspath(__file__))
         runtime_dir = os.path.dirname(hook_dir)
         platform_path = os.path.join(runtime_dir, "platform.json")
-        with open(platform_path, encoding="utf-8") as f:
+        with open_regular_text(platform_path, encoding="utf-8") as f:
             data = json.load(f)
         platform = data.get("platform")
         return platform if isinstance(platform, str) else None
@@ -265,7 +267,7 @@ def _dead_marker_pid(engram_home: str) -> int | None:
     EPERM (exists, not ours) -- returns None.
     """
     try:
-        with open(os.path.join(engram_home, "mcp-tools-ready.json")) as f:
+        with open_regular_text(os.path.join(engram_home, "mcp-tools-ready.json")) as f:
             pid = json.load(f).get("pid")
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
             return None
@@ -332,7 +334,7 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
         marker_path = os.path.join(engram_home, "mcp-tools-ready.json")
         if not os.path.exists(marker_path):
             return False, "mcp-tools-ready.json absent (server may not have completed initialization)"
-        with open(marker_path) as f:
+        with open_regular_text(marker_path) as f:
             data = json.load(f)
         pid = int(data.get("pid", 0))
         if not pid:
@@ -401,7 +403,7 @@ def _check_backup_staleness(engram_home: str) -> tuple[bool, str | None]:
         threshold_hours = 2.0
         try:
             config_path = os.path.join(engram_home, "config.json")
-            with open(config_path) as _f:
+            with open_regular_text(config_path) as _f:
                 _cfg = json.load(_f)
             threshold_hours = float(
                 _cfg.get("backup", {}).get("stale_threshold_hours", 2.0)
@@ -448,7 +450,7 @@ def _check_embedding_restore_flag(engram_home: str) -> tuple[bool | None, str | 
     count, cause, and remedy.
     """
     db_path = os.path.join(engram_home, "knowledge.db")
-    if not os.path.exists(db_path):
+    if not os.path.isfile(db_path):
         return True, None
     conn = None
     try:
@@ -1166,7 +1168,7 @@ def update_counterparts_from_registry(
         co_host_names: list[str] = []
         for json_file in sorted(registry_path.glob("*.json")):
             try:
-                text = json_file.read_text(encoding="utf-8")
+                text = read_regular_text(json_file, encoding="utf-8")
                 record = json.loads(text)
             except (OSError, json.JSONDecodeError, ValueError):
                 continue  # skip malformed/unreadable files
@@ -1216,7 +1218,7 @@ def update_counterparts_from_registry(
             return
 
         # Read current config.json
-        with open(config_path, encoding="utf-8") as f:
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
 
         config["counterparts"] = co_host_names
@@ -1265,7 +1267,7 @@ def peer_topology_block(agent_name: str) -> str:
 
         for json_file in sorted(registry_path.glob("*.json")):
             try:
-                record = json.loads(json_file.read_text(encoding="utf-8"))
+                record = json.loads(read_regular_text(json_file, encoding="utf-8"))
             except (OSError, json.JSONDecodeError, ValueError):
                 continue
 
@@ -1318,7 +1320,7 @@ def _get_focus_staleness_days(engram_home: str) -> int:
     """
     try:
         config_path = os.path.join(engram_home, "config.json")
-        with open(config_path) as _f:
+        with open_regular_text(config_path) as _f:
             _cfg = json.load(_f)
         return int(_cfg.get("focus", {}).get("focus_staleness_days", FOCUS_STALENESS_DAYS_DEFAULT))
     except Exception:
@@ -1406,7 +1408,7 @@ def focus_block(engram_home: str) -> str:
     """
     try:
         db_path = os.path.join(engram_home, "knowledge.db")
-        if not os.path.exists(db_path):
+        if not os.path.isfile(db_path):
             return ""
 
         conn = None
@@ -1609,7 +1611,7 @@ def saved_focus_sets_block(engram_home: str) -> str:
     """
     try:
         db_path = os.path.join(engram_home, "knowledge.db")
-        if not os.path.exists(db_path):
+        if not os.path.isfile(db_path):
             return ""
 
         conn = None
@@ -1681,7 +1683,7 @@ def starred_block(engram_home: str) -> str:
     try:
         starred_path = os.path.join(engram_home, "inter-agent-starred.json")
         try:
-            raw = Path(starred_path).read_text(encoding="utf-8")
+            raw = read_regular_text(starred_path, encoding="utf-8")
             entries = json.loads(raw)
             if not isinstance(entries, list):
                 return ""
@@ -1857,7 +1859,7 @@ def session_checkpoint_block(engram_home: str, injected_through: str | None) -> 
         return ""
     try:
         db_path = os.path.join(engram_home, "knowledge.db")
-        if not os.path.exists(db_path):
+        if not os.path.isfile(db_path):
             return ""
 
         conn = None
@@ -2061,7 +2063,7 @@ def history_arc_block(engram_home: str) -> str:
             return ""
 
         try:
-            with open(resolved, encoding="utf-8") as f:
+            with open_regular_text(resolved, encoding="utf-8") as f:
                 content = f.read()
         except OSError:
             return ""
@@ -2210,7 +2212,7 @@ def tool_capability_index_block() -> str:
         path = _resolve_tool_capability_index_path()
         if not os.path.exists(path):
             return ""
-        with open(path, encoding="utf-8") as f:
+        with open_regular_text(path, encoding="utf-8") as f:
             raw_lines = [ln.rstrip("\n") for ln in f]
         entries = [ln for ln in raw_lines if ln.strip()]
         if not entries:
@@ -2275,7 +2277,7 @@ def tool_capability_short_block() -> str:
         path = _resolve_tool_capability_index_path()
         if not os.path.exists(path):
             return ""
-        with open(path, encoding="utf-8") as f:
+        with open_regular_text(path, encoding="utf-8") as f:
             raw_lines = [ln.rstrip("\n") for ln in f]
         entries = [ln for ln in raw_lines if ln.strip()]
         if not entries:
@@ -2393,7 +2395,7 @@ def prune_stale_session_markers(current_session_id: str | None) -> None:
                 # disposable workers; interactive transcripts are kept indefinitely.
                 transcript_to_delete = None
                 try:
-                    with open(path) as _mf:
+                    with open_regular_text(path) as _mf:
                         _md = json.load(_mf)
                     if _md.get("role") == "fairy":
                         _tp = _md.get("transcript_path") or ""
@@ -2620,7 +2622,7 @@ def _persist_injected_through(engram_home: str, session_id: str, new_injected_th
     """
     try:
         marker_path = os.path.join(engram_home, "sessions", f"{session_id}.json")
-        with open(marker_path) as f:
+        with open_regular_text(marker_path) as f:
             data = json.load(f)
         if not isinstance(data, dict):
             return
@@ -2701,7 +2703,7 @@ def piece_c_git_log(session_id: str | None) -> str:
     )
     try:
         os.makedirs(SESSIONS_DIR, exist_ok=True)
-        with open(sidecar_path, "w", encoding="utf-8") as f:
+        with open_regular_text_write(sidecar_path, encoding="utf-8") as f:
             f.write(sidecar_body)
     except OSError:
         # Escape valve (spec #2859): never let a sidecar-write failure
@@ -2750,7 +2752,7 @@ def sleep_status_block() -> str:
     completed_at_str = None
     if os.path.exists(LAST_SLEEP_MARKER_PATH):
         try:
-            with open(LAST_SLEEP_MARKER_PATH) as f:
+            with open_regular_text(LAST_SLEEP_MARKER_PATH) as f:
                 marker = json.load(f)
             completed_at_str = marker.get("completed_at")
             if completed_at_str:
@@ -2833,7 +2835,7 @@ def _auto_sleep_settings() -> "tuple[str, str] | None":
 
     config_path = os.path.join(ENGRAM_HOME, "config.json")
     try:
-        with open(config_path) as f:
+        with open_regular_text(config_path) as f:
             config = json.load(f)
         cadence = config.get("cadence", {})
         enabled = cadence.get("auto_sleep_enabled", False)
@@ -2976,7 +2978,7 @@ def fairy_policy_block() -> str:
 
     config_path = os.path.join(ENGRAM_HOME, "config.json")
     try:
-        with open(config_path) as f:
+        with open_regular_text(config_path) as f:
             config = json.load(f)
         coder_policy = config.get("coder_fairy_policy", "auto")
         reviewer_policy = config.get("reviewer_fairy_policy", "auto")
@@ -3061,7 +3063,7 @@ def forum_monitor_block() -> str:
 
     config_path = os.path.join(ENGRAM_HOME, "config.json")
     try:
-        with open(config_path) as f:
+        with open_regular_text(config_path) as f:
             config = json.load(f)
         forum_cfg = config.get("forum", {})
         if not forum_cfg or not forum_cfg.get("url"):
@@ -3113,7 +3115,7 @@ def forum_updates_monitor_block() -> str:
 
     config_path = os.path.join(ENGRAM_HOME, "config.json")
     try:
-        with open(config_path) as f:
+        with open_regular_text(config_path) as f:
             config = json.load(f)
         forum_cfg = config.get("forum", {})
         if not forum_cfg or not forum_cfg.get("url"):
@@ -3181,7 +3183,7 @@ def _apply_pending_viz_acl(engram_home: str) -> None:
         # the environment changes), a malformed file never would; leaving it
         # would zombie every future session. Re-run finalize-name to regenerate.
         try:
-            with open(marker_path) as _f:
+            with open_regular_text(marker_path) as _f:
                 _data = json.load(_f)
         except Exception:
             try:
@@ -3357,7 +3359,7 @@ def main() -> None:
     _agent_name = ""
     try:
         _config_path = os.path.join(ENGRAM_HOME, "config.json")
-        with open(_config_path) as _cf:
+        with open_regular_text(_config_path) as _cf:
             _cfg = json.load(_cf)
         _agent_name = _cfg.get("agent_name", "").strip()
         if _agent_name:

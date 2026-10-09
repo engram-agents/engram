@@ -395,11 +395,13 @@ def test_piece_c_sidecar_write_failure_degrades_to_empty_string(tmp_path, engram
     # Mock the file write itself (spec's own phrasing) to raise, e.g. a
     # permission error — os.makedirs succeeds (sessions/ already exists),
     # but the open(..., "w") call that writes the sidecar body fails.
-    mod.open = MagicMock(side_effect=PermissionError("disk full"))
+    # (#3591: the sidecar write now goes through open_regular_text_write.)
+    _orig_write = mod.open_regular_text_write
+    mod.open_regular_text_write = MagicMock(side_effect=PermissionError("disk full"))
     try:
         result = mod.piece_c_git_log("write-fail-session")
     finally:
-        del mod.open  # don't leak the module-level override past this test
+        mod.open_regular_text_write = _orig_write  # don't leak the override
 
     assert result == "", (
         f"a sidecar-write failure must degrade piece_c_git_log() to '' "
@@ -418,11 +420,12 @@ def test_piece_c_sidecar_write_failure_never_raises(tmp_path, engram_home):
     _make_fixture_repo(fixture_repo, 3)
     mod = _load_hook_module(engram_home, piece_c_repos=str(fixture_repo))
 
-    mod.open = MagicMock(side_effect=OSError("simulated disk full"))
+    _orig_write = mod.open_regular_text_write
+    mod.open_regular_text_write = MagicMock(side_effect=OSError("simulated disk full"))
     try:
         # Must not raise.
         result = mod.piece_c_git_log("write-fail-session-2")
     finally:
-        del mod.open
+        mod.open_regular_text_write = _orig_write
 
     assert result == ""
