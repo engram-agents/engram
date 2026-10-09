@@ -991,6 +991,66 @@ def open_regular_text_append(path, encoding=None):
         raise
 
 
+_NOT_REGULAR_DB_ERROR_CLS = None
+
+
+def _not_regular_db_error_cls():
+    """The refusal class for connect_regular_ro, built once per process.
+
+    It subclasses sqlite3.OperationalError (so a handler that classifies a
+    sqlite failure -- e.g. surface-hook._check_db_liveness's
+    `except sqlite3.DatabaseError -> unhealthy` -- keeps the branch a
+    directory already took on dev) AND OSError (so a handler written for
+    "could not open the file" also matches). A plain OSError would be caught
+    by the later broad `except Exception` there and report a FIFO DB healthy.
+    sqlite3 is imported here, not at module level: every hook imports this
+    module, and the class cannot be declared without sqlite3 in hand, so it is
+    built on first use and cached in a module global (one class object)."""
+    global _NOT_REGULAR_DB_ERROR_CLS
+    if _NOT_REGULAR_DB_ERROR_CLS is None:
+        import sqlite3
+
+        class NotRegularDatabaseError(sqlite3.OperationalError, OSError):
+            """The database path exists but is not a regular file."""
+
+        _NOT_REGULAR_DB_ERROR_CLS = NotRegularDatabaseError
+    return _NOT_REGULAR_DB_ERROR_CLS
+
+
+def connect_regular_ro(db_path, uri_params="mode=ro", **connect_kwargs):
+    """`sqlite3.connect(f"file:{db_path}?{uri_params}", uri=True, **kwargs)`
+    that refuses a non-regular file instead of blocking on it (#3628).
+
+    A `mode=ro` connect to a FIFO hangs (measured: > 5 s), so a hook under a
+    5 s timeout is killed. This stats first (os.stat follows symlinks and does
+    not block on a FIFO) and, when the path exists and is not a regular file,
+    raises NotRegularDatabaseError -- a sqlite3.OperationalError AND an
+    OSError, message "not a regular file: <path>". A path that cannot be
+    statted (missing, dangling symlink, unreadable parent) falls through to
+    the raw connect, so sqlite raises exactly what it raised before. Extra
+    keyword arguments (timeout=...) pass through untouched; a timeout bounds
+    lock waits, not a FIFO open, so it is not part of this defence.
+    `uri_params` is the URI query, e.g. "mode=ro&immutable=1".
+
+    Residual, NOT closed here. #3577 states it: "The pair is check-then-act:
+    measured by two people independently, with the file regular at the `stat`
+    and swapped for a FIFO before the connect, `sqlite3.connect` hung until
+    killed at 6 s." SQLite takes a path, not a descriptor, so the fd+fstat
+    route the other helpers in this module use is not available here; the
+    race-free /proc/self/fd/N route is unverified and not portable (see
+    #3577). This helper narrows the window to stat-then-connect; it does not
+    close it."""
+    import sqlite3
+    try:
+        st = os.stat(db_path)
+    except OSError:
+        st = None
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        raise _not_regular_db_error_cls()(f"not a regular file: {db_path}")
+    return sqlite3.connect(
+        f"file:{db_path}?{uri_params}", uri=True, **connect_kwargs)
+
+
 def session_started_at(session_id):
     """This session's `started_at` from `$ENGRAM_HOME/sessions/<sid>.json`
     (aware datetime), or None when the marker is missing/malformed. Shared
@@ -1332,7 +1392,6 @@ def _focused_ids() -> tuple:
     """(ids, readable): ids currently focused, read-only, one query, closed in
     a `finally`. Any DB problem (missing file, locked, no column) -> readable
     False."""
-    import sqlite3
     conn = None
     try:
         home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
@@ -1340,11 +1399,9 @@ def _focused_ids() -> tuple:
         # already handled (readable False -> in_context None), so a locked DB
         # must not cost the surface hook a full second.
         db_path = Path(home) / "knowledge.db"
-        # stat does not block; sqlite3.connect on a FIFO could.
-        if not stat.S_ISREG(os.stat(db_path).st_mode):
-            return set(), False
-        conn = sqlite3.connect(
-            f"file:{db_path}?mode=ro", uri=True, timeout=0.2)
+        # timeout bounds lock waits, not a FIFO open, so it is not part of the
+        # FIFO defence; connect_regular_ro refuses a non-regular file.
+        conn = connect_regular_ro(db_path, timeout=0.2)
         rows = conn.execute(
             "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
         ).fetchall()

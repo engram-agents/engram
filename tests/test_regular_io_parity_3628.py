@@ -450,3 +450,58 @@ def test_loop_arm_fallback_helper_has_identical_ast_to_hooklib(name):
     assert _dump_fn(found[0]) == _helper_dump(HOOKLIB, name), (
         f"{name} in {LOOP_ARM.name} differs from _hooklib.py: the import-failure "
         "fallback copy must stay identical to the shared helper (#3628)")
+
+
+# ------------------------------------------- (c) connect_regular_ro: ONE copy (#3628 2d)
+#
+# The sqlite helper exists only in `_hooklib.py` (no core caller needs it), so
+# there is no AST-equality cell; these behavioural cells pin the one copy. The
+# full contract, per-site cells and the guards live in
+# tests/test_hooks_sqlite_regular_3628s2d.py. Residual, not closed: a regular
+# file swapped for a FIFO between the helper's stat and its connect still hangs
+# (#3577); no cell here claims otherwise.
+
+@_NEEDS_FIFO
+def test_connect_regular_ro_refuses_a_fifo_promptly_with_the_dual_class(tmp_path):
+    os.mkfifo(tmp_path / "db")
+    r = _child("_hooklib", tmp_path, r"""
+import sqlite3
+try:
+    impl.connect_regular_ro(os.path.join(ROOT, "db")); result = "no-error"
+except Exception as e:
+    result = [isinstance(e, sqlite3.OperationalError), isinstance(e, OSError),
+              "not a regular file" in str(e)]
+""")
+    assert r == [True, True, True], r
+
+
+@pytest.mark.parametrize("kind", ["missing", "dangling"])
+def test_connect_regular_ro_missing_and_dangling_raise_what_a_raw_connect_raises(tmp_path, kind):
+    if kind == "dangling":
+        os.symlink(str(tmp_path / "nowhere"), tmp_path / "db")
+    r = _child("_hooklib", tmp_path, r"""
+import sqlite3
+p = os.path.join(ROOT, "db")
+def err(f):
+    try:
+        f(); return None
+    except Exception as e:
+        return [type(e).__name__, str(e)]
+result = [err(lambda: sqlite3.connect("file:" + p + "?mode=ro", uri=True)),
+          err(lambda: impl.connect_regular_ro(p))]
+""")
+    assert r[0] is not None and r[0] == r[1], r
+
+
+def test_connect_regular_ro_regular_file_reads(tmp_path):
+    import sqlite3
+    conn = sqlite3.connect(str(tmp_path / "db"))
+    conn.execute("CREATE TABLE t (x)")
+    conn.execute("INSERT INTO t VALUES (7)")
+    conn.commit()
+    conn.close()
+    r = _child("_hooklib", tmp_path, r"""
+c = impl.connect_regular_ro(os.path.join(ROOT, "db"), timeout=0.2)
+result = c.execute("SELECT x FROM t").fetchone()[0]
+""")
+    assert r == 7

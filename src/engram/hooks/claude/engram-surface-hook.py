@@ -53,6 +53,9 @@ from _hooklib import (
 # #3628: every file open here is non-blocking and regular-file-only (a FIFO at
 # a state path must not hang the hook); the helpers live in _hooklib.
 from _hooklib import open_regular_text, open_regular_text_write
+# #3628: every mode=ro sqlite connect refuses a FIFO / directory (raising a
+# sqlite3.OperationalError + OSError) instead of hanging.
+from _hooklib import connect_regular_ro
 from _harness import detect_harness, get_harness_budgets
 try:
     from _hooklib import atomic_write_json
@@ -152,7 +155,7 @@ def _check_db_liveness(db_path: str) -> tuple[bool, str]:
         return False, "knowledge.db not found"
     conn = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn = connect_regular_ro(db_path, timeout=1.0)
         conn.execute("PRAGMA user_version")
         return True, "ok"
     except sqlite3.DatabaseError as e:
@@ -311,7 +314,7 @@ def _check_embedding_restore_flag(db_path: str) -> tuple[bool | None, str | None
         return True, None
     conn = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn = connect_regular_ro(db_path, timeout=1.0)
         row = conn.execute(
             "SELECT not_fully_restored, null_count, cause FROM "
             "embedding_restore_state WHERE singleton_key = 1"
@@ -1381,7 +1384,7 @@ def _dormant_focus_set_candidates(rendered_ids: set) -> tuple[list[dict], int]:
     """
     conn = None
     try:
-        conn = sqlite3.connect(f"file:{KNOWLEDGE_DB_PATH}?mode=ro", uri=True, timeout=1.0)
+        conn = connect_regular_ro(KNOWLEDGE_DB_PATH, timeout=1.0)
         conn.row_factory = sqlite3.Row
         active_row = conn.execute(
             "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
@@ -1521,7 +1524,7 @@ def _render_triggered_principles_section(ordered_ids: list, db_path: "str | None
 
     conn = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn = connect_regular_ro(db_path, timeout=1.0)
         conn.row_factory = sqlite3.Row
         head_order: list = []
         head_summaries: dict = {}  # head_id -> recall_summary (from its own chain entry)
@@ -1677,7 +1680,8 @@ def _query_attached_packs(prompt: str, quota: int = _PACK_SURFACE_QUOTA) -> list
                 # re-authored in place, immutable reads may be stale; attached packs
                 # are static downloads, and re-authoring an attached pack in place is
                 # out of contract.
-                conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+                conn = connect_regular_ro(
+                    db_path, uri_params="mode=ro&immutable=1")
                 conn.row_factory = sqlite3.Row
                 try:
                     rows = conn.execute(
@@ -2838,7 +2842,11 @@ def format_nudge(
 def _is_non_regular(path) -> bool:
     """True only when `path` exists and is not a regular file (a FIFO, a
     directory...). #3628: the read handlers below swallow an OSError ONLY for
-    such a target; an OSError on a regular file propagates exactly as on dev."""
+    such a target; an OSError on a regular file propagates exactly as on dev.
+    engram-surface-daemon.py carries a private copy; the two are pinned by
+    tests/test_hooks_sqlite_regular_3628s2d.py
+    (test_is_non_regular_copies_have_identical_ast and
+    test_is_non_regular_behaviour_is_the_same_in_both_copies)."""
     return os.path.exists(path) and not os.path.isfile(path)
 
 
@@ -3589,7 +3597,7 @@ def main():
         elif _as_cfg["idf_gate_enabled"]:
             # IDF-based gate: open a read-only DB connection for keyword lookup.
             # extract_keywords doesn't use sqlite-vec, so skip the extension load.
-            conn = sqlite3.connect(f"file:{KNOWLEDGE_DB_PATH}?mode=ro", uri=True)
+            conn = connect_regular_ro(KNOWLEDGE_DB_PATH)
             should_prepend = _should_prepend(recall_query, conn, _as_cfg)
         else:
             # Feature flag off — legacy char-length heuristic.

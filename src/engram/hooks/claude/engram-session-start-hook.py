@@ -76,6 +76,9 @@ from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context, _trim
 from _hooklib import _open_regular_fd
 # #3591: every other open() in this hook is non-blocking and regular-file-only.
 from _hooklib import open_regular_text, open_regular_text_write, read_regular_text
+# #3628: every mode=ro sqlite connect refuses a FIFO / directory (raising a
+# sqlite3.OperationalError + OSError) instead of hanging.
+from _hooklib import connect_regular_ro
 # #3521: shared advisory-probe `unknown` rendering (once per session here, so
 # only the stderr line + the one injected line are used; no rate-limit stamp).
 from _hooklib import probe_unknown_line, write_probe_unknown_stderr
@@ -450,11 +453,11 @@ def _check_embedding_restore_flag(engram_home: str) -> tuple[bool | None, str | 
     count, cause, and remedy.
     """
     db_path = os.path.join(engram_home, "knowledge.db")
-    if not os.path.isfile(db_path):
+    if not os.path.exists(db_path):
         return True, None
     conn = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn = connect_regular_ro(db_path, timeout=1.0)
         row = conn.execute(
             "SELECT not_fully_restored, null_count, cause FROM "
             "embedding_restore_state WHERE singleton_key = 1"
@@ -1408,12 +1411,12 @@ def focus_block(engram_home: str) -> str:
     """
     try:
         db_path = os.path.join(engram_home, "knowledge.db")
-        if not os.path.isfile(db_path):
+        if not os.path.exists(db_path):
             return ""
 
         conn = None
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+            conn = connect_regular_ro(db_path, timeout=1.0)
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT id, claim, focus_reason, focused_at FROM nodes "
@@ -1611,12 +1614,12 @@ def saved_focus_sets_block(engram_home: str) -> str:
     """
     try:
         db_path = os.path.join(engram_home, "knowledge.db")
-        if not os.path.isfile(db_path):
+        if not os.path.exists(db_path):
             return ""
 
         conn = None
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+            conn = connect_regular_ro(db_path, timeout=1.0)
             conn.row_factory = sqlite3.Row
             active_row = conn.execute(
                 "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
@@ -1859,12 +1862,12 @@ def session_checkpoint_block(engram_home: str, injected_through: str | None) -> 
         return ""
     try:
         db_path = os.path.join(engram_home, "knowledge.db")
-        if not os.path.isfile(db_path):
+        if not os.path.exists(db_path):
             return ""
 
         conn = None
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+            conn = connect_regular_ro(db_path, timeout=1.0)
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT id, type, claim, recall_summary, created_at, "

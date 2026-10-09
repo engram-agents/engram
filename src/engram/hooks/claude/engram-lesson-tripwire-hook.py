@@ -109,6 +109,9 @@ from _hooklib import (
     append_shown_record, build_exclusion_resolver, in_context_drop_ids,
     in_context_exclusion_enabled,
 )
+# #3628: every mode=ro sqlite connect goes through this (refuses a FIFO or
+# directory instead of hanging; raises a sqlite3.OperationalError + OSError).
+from _hooklib import connect_regular_ro
 from _harness import detect_harness, get_harness_budgets
 # #3613: meaningful-span marker. Fail-open: an older/absent helper degrades to
 # "no marker" (the pre-change behaviour), never an import crash.
@@ -306,7 +309,7 @@ def load_tripwires(db_path: Path = DB_PATH):
     if not db_path.exists():
         return []
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        conn = connect_regular_ro(db_path, timeout=2.0)
         rows = conn.execute(_QUERY).fetchall()
         conn.close()
         return [
@@ -558,7 +561,7 @@ def render_triggered_principles(
 
     conn = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn = connect_regular_ro(db_path, timeout=1.0)
         conn.row_factory = sqlite3.Row
         # head_id -> {"nodes": {resolved_id: entry, ...}, "hit_ids": [node_id, ...]}
         heads_seen: dict = {}
@@ -842,7 +845,7 @@ def load_prevention_lessons(db_path: Path = DB_PATH):
     if not db_path.exists():
         return []
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        conn = connect_regular_ro(db_path, timeout=2.0)
         rows = conn.execute(_PREVENTION_QUERY).fetchall()
         conn.close()
         return [
@@ -1440,7 +1443,7 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
             # config-supplied frozenset — including an empty one (filtering
             # disabled) — passes through unchanged.
             junk = cfg["junk_stoplist"] if cfg["junk_stoplist"] is not None else JUNK_STOPLIST
-            conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=1.0)
+            conn = connect_regular_ro(DB_PATH, timeout=1.0)
             try:
                 if cfg["min_idf"] is not None:
                     effective_min_idf = cfg["min_idf"]

@@ -200,6 +200,9 @@ _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import resolve_runtime_dir
+# #3628: the daemon's file opens are non-blocking and regular-file-only (a FIFO
+# planted at a daemon-owned path must not hang it); the helpers live in _hooklib.
+from _hooklib import open_regular_text, open_regular_text_write
 
 PROJECT_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
 _PIDFILE_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_pidfile.py")
@@ -281,6 +284,17 @@ def handle_client(conn, client):
         conn.close()
 
 
+def _is_non_regular(path) -> bool:
+    """True only when `path` exists and is not a regular file (a FIFO, a
+    directory...). #3628: the daemon's file opens log-and-skip ONLY for such a
+    target; an OSError on a regular or missing file keeps its previous
+    handling. Same predicate as engram-surface-hook.py's _is_non_regular; the
+    two private copies are pinned by tests/test_hooks_sqlite_regular_3628s2d.py
+    (test_is_non_regular_copies_have_identical_ast and
+    test_is_non_regular_behaviour_is_the_same_in_both_copies)."""
+    return os.path.exists(path) and not os.path.isfile(path)
+
+
 def idle_watchdog(idle_timeout: int):
     """Exit if no queries received within idle_timeout seconds.
 
@@ -300,10 +314,18 @@ def idle_watchdog(idle_timeout: int):
             # alarm on next startup rather than a generic CRITICAL (#1260).
             tombstone_path = os.path.join(ENGRAM_HOME, "daemon-idle-shutdown")
             try:
-                with open(tombstone_path, "w") as f:
+                with open_regular_text_write(tombstone_path) as f:
                     f.write(str(int(time.time())))
             except OSError:
-                pass
+                # A regular-file error (read-only dir, ENOSPC...) is still
+                # swallowed silently. A FIFO/directory at the path is logged
+                # once and skipped: the tombstone is advisory, shutdown goes on.
+                if _is_non_regular(tombstone_path):
+                    print(
+                        f"[engram-daemon] {tombstone_path} is not a regular "
+                        f"file; skipping the idle-shutdown tombstone.",
+                        file=sys.stderr,
+                    )
             _shutdown.set()
             break
         _shutdown.wait(timeout=60)  # check every minute
@@ -339,7 +361,7 @@ def cleanup(*args):
     _shutdown.set()
     still_ours = False
     try:
-        with open(PID_PATH) as f:
+        with open_regular_text(PID_PATH) as f:
             still_ours = int(f.read().strip()) == os.getpid()
     except (OSError, ValueError):
         # No pidfile, or unreadable/garbage content -- nothing to protect
@@ -347,6 +369,15 @@ def cleanup(*args):
         # unconditional behavior for this case). Says nothing about the
         # socket -- see _bound_socket above.
         still_ours = True
+        # #3628: a FIFO/directory at PID_PATH is NOT a file this process wrote,
+        # so it is never unlinked: log once, leave it, keep going.
+        if _is_non_regular(PID_PATH):
+            still_ours = False
+            print(
+                f"[engram-daemon] {PID_PATH} is not a regular file; "
+                f"leaving it in place.",
+                file=sys.stderr,
+            )
     if still_ours:
         try:
             os.unlink(PID_PATH)
@@ -589,6 +620,25 @@ def _socket_holder_state(socket_path, proc_net_unix="/proc/net/unix", proc_root=
     return ("HELD", pids)
 
 
+def _write_pidfile():
+    """Write this process's pid to PID_PATH. #3628: a FIFO/directory already at
+    PID_PATH is logged once and the daemon runs without a pidfile (no crash, no
+    hang); any other OSError -- e.g. a PermissionError on a regular file --
+    propagates exactly as it did before."""
+    os.makedirs(os.path.dirname(PID_PATH), exist_ok=True)
+    try:
+        with open_regular_text_write(PID_PATH) as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        if not _is_non_regular(PID_PATH):
+            raise
+        print(
+            f"[engram-daemon] {PID_PATH} is not a regular file; "
+            f"running without a pidfile.",
+            file=sys.stderr,
+        )
+
+
 def main():
     global _client, _bound_socket
 
@@ -671,10 +721,7 @@ def main():
     # Force-load the embedding model now so first query is fast
     _client.call("engram_surface", {"query": "warmup", "top_k": 1, "semantic": True})
 
-    # Write PID file
-    os.makedirs(os.path.dirname(PID_PATH), exist_ok=True)
-    with open(PID_PATH, "w") as f:
-        f.write(str(os.getpid()))
+    _write_pidfile()
 
     # Set up signal handlers
     signal.signal(signal.SIGTERM, cleanup)

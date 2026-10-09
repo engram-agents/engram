@@ -163,7 +163,7 @@ if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import atomic_write_json, resolve_runtime_dir
 # #3628: the config reads are non-blocking and regular-file-only.
-from _hooklib import open_regular_text
+from _hooklib import open_regular_text, connect_regular_ro
 
 # Module-scope emitter resolve+insert (gh#2570 §1/§3): this hook previously
 # had no resolver at all -- its emit site did a bare
@@ -374,7 +374,7 @@ def _maturity_muted() -> bool:
         # SQLITE_BUSY during concurrent writes. Any exception that does occur
         # (missing file, missing table, I/O error) lands on the except branch
         # below and fails toward nudging.
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = connect_regular_ro(db_path)
         try:
             row = conn.execute(
                 "SELECT count(*) FROM nodes WHERE is_current = 1"

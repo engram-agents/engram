@@ -402,9 +402,12 @@ def _c_sq_embed(ctx):
     else:
         (ctx.eh / "knowledge.db").write_bytes(b"")
     return ("result = list(mod._check_embedding_restore_flag(P['eh']))",
-            # FIFO is "not a database file": same as absent -> healthy.
+            # #3628 slice 2d: the precheck is now os.path.exists, so a FIFO
+            # reaches connect_regular_ro and is refused into the existing
+            # sqlite3.OperationalError handler -> UNKNOWN (None, ...), no longer
+            # "absent -> healthy". Deliberate, non-regular targets only.
             # An empty regular file has no table -> unknown (None, ...) as today.
-            {"fifo": lambda r: r == [True, None],
+            {"fifo": lambda r: r[0] is None and "not a regular file" in r[1],
              "regular": lambda r: r[0] in (True, None)})
 
 
