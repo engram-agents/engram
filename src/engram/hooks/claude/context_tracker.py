@@ -34,7 +34,12 @@ if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 # #3628: every open() here is non-blocking and regular-file-only (a FIFO at a
 # marker / config / transcript path must raise OSError, not hang the hook).
-from _hooklib import open_regular_text
+from _hooklib import (
+    open_regular_text,
+    sanitize_probe_text,
+    split_probe_reason,
+    write_probe_unknown_stderr,
+)
 
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
@@ -271,7 +276,9 @@ def _last_compact_offset(jsonl_path: str) -> int | None:
     return offset
 
 
-def read_current_tokens(transcript_path: str | None = None) -> int | None:
+def read_current_tokens(
+    transcript_path: str | None = None, *, _unknown_sink: list | None = None
+) -> int | None:
     """Input-token count of the most recent post-compact assistant usage record.
 
     Two boundary-detection paths, in priority order:
@@ -292,6 +299,15 @@ def read_current_tokens(transcript_path: str | None = None) -> int | None:
     the correct behavior in the turn between /compact and the first
     post-compact assistant message (which prevents the bogus drowsiness
     spike documented in ob_NNNN and ob_NNNN).
+
+    Also returns None -- publicly unchanged -- when the RESOLVED transcript
+    cannot be opened (OSError: mode 000, a FIFO, EIO). That one case is UNKNOWN,
+    not "no data" (#3521 row 8): the private keyword-only `_unknown_sink`, when
+    a list is passed, receives one "<Type>: <msg>" string for it, which is how
+    estimate_usage tells it apart from the three legitimate None paths. A
+    transcript that _resolve_jsonl resolved but that is deleted before the open
+    (FileNotFoundError) is UNKNOWN by design too: resolved, then unreadable --
+    unlike the unresolved path, which is decided earlier and stays None.
     """
     jsonl_path = _resolve_jsonl(transcript_path)
     if not jsonl_path:
@@ -318,7 +334,9 @@ def read_current_tokens(transcript_path: str | None = None) -> int | None:
                 start = max(0, size - TAIL_SCAN_BYTES)
             f.seek(start)
             tail = f.read()
-    except OSError:
+    except OSError as exc:
+        if _unknown_sink is not None:
+            _unknown_sink.append(f"{type(exc).__name__}: {exc}")
         return None
 
     for line in reversed(tail.split(b"\n")):
@@ -361,8 +379,16 @@ def estimate_usage(transcript_path: str | None = None, session_id: str | None = 
     format_drowsiness picks per-mode display thresholds correctly rather
     than always defaulting to the "1m" band (which silently ignores
     drowsiness_display.200k config for low-ceiling users).
+
+    Returns {"unknown": "<Type>: <msg>"} -- and only that key -- when the
+    resolved transcript could not be read (#3521 row 8); format_drowsiness
+    renders it. The legitimate no-data cases (no resolvable path, empty
+    post-compact window, no usage record yet) still return None.
     """
-    current = read_current_tokens(transcript_path)
+    unknown: list = []
+    current = read_current_tokens(transcript_path, _unknown_sink=unknown)
+    if unknown:
+        return {"unknown": unknown[0]}
     if current is None:
         return None
     ceiling = compute_ceiling()
@@ -487,7 +513,24 @@ def format_drowsiness(usage: dict) -> str:
     Stop path carried a loop-risk defect (no stop_hook_active guard, plus a
     lowered prose threshold that made re-fire more likely exactly when turns
     are most expensive).
+
+    UNKNOWN (#3521 row 8): a usage of {"unknown": "<Type>: <msg>"} -- the
+    transcript could not be read -- is handled FIRST, before any key the
+    percentage arithmetic indexes, and renders one bounded line
+    `[Drowsiness: unknown (<Type>)]` (class only, never the raw message). One
+    sanitized stderr line and the injected line are both emitted on EVERY
+    call: there is deliberately NO rate limit. The healthy banner already
+    renders on every prompt, so an unknown banner every prompt adds no noise;
+    and with no stamp written at render time, the race "stamped, then the line
+    is dropped under the injection budget, silent for a whole window" cannot
+    happen.
     """
+    if "unknown" in usage:
+        reason = usage["unknown"]
+        write_probe_unknown_stderr("context_tracker", "drowsiness", reason)
+        cls, _ = split_probe_reason(reason)
+        return f"[Drowsiness: unknown ({sanitize_probe_text(cls, 40)})]"
+
     pct = usage["usage_pct"]
     est_tokens = usage["estimated_tokens"]
     limit = usage["context_limit"]
