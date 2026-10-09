@@ -27,6 +27,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -144,11 +145,24 @@ def test_w3_atomic_writer_never_exposes_partial_file(tmp_path, cio):
     assert _hammer(p, lambda i: cio.write_config_json(p, _payload(i)), 500) == 0
 
 
+def _nonatomic_writer_with_window(path, i):
+    """Explicitly non-atomic writer: truncate, hold the empty-file
+    window open, then write the full payload.  The window is a sleep, not a
+    race, so the control does not depend on filesystem speed (#3634)."""
+    with open(path, "w") as f:  # open() truncates to zero bytes (O_TRUNC); the sleep holds that empty-file window open
+        time.sleep(0.03)
+        f.write(json.dumps(_payload(i), indent=2))
+
+
 def test_w3_harness_detects_a_nonatomic_writer(tmp_path):
-    """Control for the harness itself: the OLD write_text writer is caught."""
+    """Control for the harness itself: a non-atomic writer is caught.
+
+    Deterministic: the writer holds the truncated state open for 30 ms, so the
+    reader observes it on every platform (the old Path.write_text race closed
+    too fast on macOS APFS, #3634)."""
     p = tmp_path / "config.json"
     p.write_text(json.dumps(_payload(0)))
-    errs = _hammer(p, lambda i: p.write_text(json.dumps(_payload(i), indent=2)), 500)
+    errs = _hammer(p, lambda i: _nonatomic_writer_with_window(p, i), 3)
     assert errs > 0, "harness failed to observe the truncate-then-write window"
 
 
