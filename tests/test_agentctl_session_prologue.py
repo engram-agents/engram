@@ -10,9 +10,14 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+# One shared probe for the GNU `stat -c` primitive (defined with the hint tests).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_agentctl_forum_hint_3563 import needs_gnu_stat  # noqa: E402
 
 AGENTCTL = Path(__file__).resolve().parent.parent / "tools" / "agentctl"
 
@@ -76,6 +81,7 @@ def test_boot_env_unreadable_warns_once_and_launch_proceeds(tmp_path):
     assert "FOO_FROM_BOOT_ENV" not in proc.stdout
 
 
+@needs_gnu_stat
 def test_umask_forced_to_022_from_0002(tmp_path):
     proc = _launch(tmp_path, "sh -c umask", start_umask="0002")
     assert proc.stdout.strip() == "0022"
