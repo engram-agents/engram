@@ -131,6 +131,9 @@ VALID_PAIR = {
     "serves": ("task", "goal"),
     "subtask_of": ("task", "task"),
     "tensions": ("goal", "goal"),
+    # #3615: question -> claim-bearing. Extends the three parametrized families
+    # below (accepted retype, add_edge-equivalence, parity) to the new relation.
+    "bears_on": ("question", "conjecture"),
 }
 
 
@@ -471,7 +474,12 @@ def _corpus(srv, monkeypatch):
     return out
 
 
-_CORPUS_SHA256 = "754687062c63057ae86f87377441863915f6ce67d56e8ebbb0cbf0d57b0ff99b"
+# Re-pinned for #3615 (`bears_on` joins the addable set). The corpus grew by 49
+# `bears_on|<src>|<tgt>` rows; the node-id counter shifts every later relation's
+# ids by 49; and the `x|bad_rel` "Allowed: [...]" list now names `bears_on`.
+# Checked against the previous pin: every other row is byte-identical once the
+# id shift is normalised, so no pre-existing relation's response changed.
+_CORPUS_SHA256 = "73ed3a90bd5d69849a0a247304d4515ac49ec107b7fc16be835e5b2208f88bee"
 
 
 def test_t8_add_edge_responses_byte_identical(srv, monkeypatch):

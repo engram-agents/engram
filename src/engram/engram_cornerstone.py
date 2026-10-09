@@ -855,7 +855,9 @@ def _relation_endpoint_error(relation: str, source_row, target_row) -> "str | No
 
     Covers: the ``instantiates`` boundary gates (#530: not a lesson target,
     target in INSTANTIATES_TARGET_TYPES, claim-bearing source) and the
-    ``generalizes`` endpoint-pair rule (#2753 epic, WS1, D1).
+    ``generalizes`` endpoint-pair rule (#2753 epic, WS1, D1), and the
+    ``bears_on`` rule (#3615: question source; claim-bearing or contradiction
+    target).
 
     Deliberately NOT here: is-current checks and the already-exists no-op
     (add-only), the ``generalizes`` cycle walk and the ``temporal_causal``
@@ -899,6 +901,27 @@ def _relation_endpoint_error(relation: str, source_row, target_row) -> "str | No
                 f"principle abstraction (source '{source_id}' is "
                 f"type '{source_row['type']}', target '{target_id}' is "
                 f"type '{target_row['type']}')."
+            )
+    if relation == "bears_on":
+        # #3615: question -> claim-bearing node (or contradiction). The target
+        # set is DERIVED from core.CLAIM_BEARING_TYPES (never re-listed, the
+        # #2252 rule) plus `contradiction`. Shared with engram_ask's strict
+        # `bears_on` field and with engram_retype_edge.
+        if source_row["type"] != "question":
+            return (
+                f"'bears_on' sources must be type 'question' — the edge says "
+                f"\"once this question is answered, the answer will count "
+                f"for or against the target\". Source '{source_id}' is type "
+                f"'{source_row['type']}'."
+            )
+        if (
+            target_row["type"] not in core.CLAIM_BEARING_TYPES
+            and target_row["type"] != "contradiction"
+        ):
+            return (
+                f"'bears_on' targets must be claim-bearing "
+                f"({sorted(core.CLAIM_BEARING_TYPES)}) or a 'contradiction'; "
+                f"target '{target_id}' is type '{target_row['type']}'."
             )
     return None
 

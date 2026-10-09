@@ -794,6 +794,18 @@ VALID_RELATIONS = {
                      # acyclicity — see its EDGE_CLASSIFICATIONS entry) and CYCLE-GUARDED AT
                      # WRITE TIME (see _generalizes_cycle_path below), not
                      # merely audited after the fact.
+    "bears_on",  # #3615: question -> claim-bearing node (or contradiction):
+                 # "once this question is answered, the answer will count for
+                 # or against that claim". Direction-neutral, relevance only:
+                 # no cascade, no confidence propagation, DAG-exempt (the
+                 # answer may pre-date the question's filing), not grounding
+                 # (a promise about future evidence is not evidence).
+                 # Endpoints are enforced in
+                 # engram_cornerstone._relation_endpoint_error. Surfaced by
+                 # engram_resolve; its out-degree is engram_list's
+                 # sort_by="bears_on" priority signal. Addable/removable
+                 # after creation; also writable at ask time via
+                 # engram_ask's `bears_on` field.
 }
 
 
@@ -923,6 +935,20 @@ EDGE_CLASSIFICATIONS = {
         "cascade": False,
         "temporal_causal": False,
         "dag_family": "abstraction",
+        "removable": True,
+        "addable_after_creation": True,
+        "provenance": False,
+    },
+    "bears_on": {
+        # #3615: question -> claim relevance marker. Non-cascade: the answer's
+        # direction (support or weaken) is unknown when the edge is written, so
+        # nothing propagates. temporal_causal=False: the answer may pre-date
+        # the question's filing. dag_family None: a promise about future
+        # evidence is not grounding. removable: over-applied wiring must be
+        # correctable. The edge ROW survives a retract of either end.
+        "cascade": False,
+        "temporal_causal": False,
+        "dag_family": None,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -1202,6 +1228,7 @@ EDGE_TIERS: dict[str, str] = {
     "tensions":     "relational",
     "about":        "relational",
     "resolves":     "relational",   # epistemic-stance edge: a resolution closes a question/contradiction (pairs with contradicts), not a realization/membership
+    "bears_on":     "relational",   # #3615: question -> claim; cross-temporal (the answer may pre-date the question), temporal_causal=False matches the tier
     # classification tier: realization / membership; temporal_causal=False expected
     "instantiates": "classification",
     "serves":       "classification",

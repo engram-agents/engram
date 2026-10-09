@@ -674,6 +674,7 @@ def _ask_impl(
     context_ids: str = "",
     category: str = "",
     lacks: str = "",
+    bears_on: str = "",
 ) -> str:
     """Internal implementation — see engram_ask MCP tool for the public
     payload schema. Kept callable with named kwargs for in-server callers.
@@ -700,6 +701,13 @@ def _ask_impl(
         lacks: Optional blocker — what's missing to resolve. One of:
             external_evidence, empirical_data, human_decision, implementation,
             synthesis, prerequisite. Can be updated later during sweeps.
+        bears_on: Optional comma-separated node IDs of claim-bearing nodes (or
+            contradictions) the eventual answer will count for or against
+            (#3615). Writes `bears_on` edges in the same transaction as the
+            question. STRICT, unlike context_ids: every id must exist, be
+            current, and pass the shared endpoint rule
+            (engram_cornerstone._relation_endpoint_error); otherwise the whole
+            call is refused naming the offending id and NO question is created.
 
     Returns:
         JSON with the new question node ID.
@@ -718,6 +726,41 @@ def _ask_impl(
 
     conn = core._get_db()
     try:
+        # #3615: strict, all-or-nothing `bears_on` validation, BEFORE any id is
+        # allocated or row written, so a refused call leaves no question and no
+        # edges. Held to the same endpoint rule as engram_add_edge /
+        # engram_retype_edge (one shared helper). Call-time import: the family
+        # modules otherwise import only engram_core (see module docstring);
+        # engram_cornerstone is the same (essential) tier.
+        bears_targets: list[str] = []
+        for tid in (s.strip() for s in core._as_csv(bears_on).split(",")):
+            if tid and tid not in bears_targets:
+                bears_targets.append(tid)
+        if bears_targets:
+            import engram_cornerstone as _cornerstone
+            for tid in bears_targets:
+                trow = conn.execute(
+                    "SELECT id, type, is_current FROM nodes WHERE id = ?", (tid,)
+                ).fetchone()
+                if not trow:
+                    return json.dumps({"error": (
+                        f"bears_on target '{tid}' not found. No question was "
+                        f"created (bears_on is strict, unlike context_ids)."
+                    )})
+                if not trow["is_current"]:
+                    return json.dumps({"error": (
+                        f"bears_on target '{tid}' is not current (retracted or "
+                        f"superseded). No question was created. Use "
+                        f"engram_inspect('{tid}') to find the current successor."
+                    )})
+                ep_err = _cornerstone._relation_endpoint_error(
+                    "bears_on", {"id": "(new question)", "type": "question"}, trow
+                )
+                if ep_err is not None:
+                    return json.dumps({"error": (
+                        f"{ep_err} No question was created."
+                    )})
+
         node_id = core._next_id(conn, "question")
         now = core._now()
 
@@ -740,6 +783,14 @@ def _ask_impl(
                     core._insert_context_edge(conn, node_id, cid, now)
                 except sqlite3.IntegrityError:
                     pass
+
+        # `bears_on` edges (#3615): same transaction as the question node.
+        for tid in bears_targets:
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, created_at) "
+                "VALUES (?, ?, 'bears_on', ?)",
+                (node_id, tid, now),
+            )
 
         _emb_outcome = core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.5)
         if context:
@@ -793,6 +844,8 @@ def _ask_impl(
             result["category"] = category
         if lacks:
             result["lacks"] = lacks
+        if bears_targets:
+            result["bears_on"] = bears_targets
         # #345 PR3 B4: the message key here lives INSIDE this block, not
         # merged at top level -- this tool already uses a top-level
         # "message" key for its own unrelated success text (see above).

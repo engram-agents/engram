@@ -119,11 +119,11 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 - **tests**: test_derive_payload.py, test_cascade_semantics.py
 
 **7. engram_ask** — Open research question.
-- **contract**: `{question, [context_ids, category, lacks]}`
-- **guards**: dedup is caller responsibility; questions are non-claim-bearing (cannot be derivation premises)
+- **contract**: `{question, [context_ids, category, lacks, bears_on]}`
+- **guards**: dedup is caller responsibility; questions are non-claim-bearing (cannot be derivation premises); `bears_on` (#3615) is strict and all-or-nothing, unlike lenient `context_ids`: every id must exist, be current, and pass the add_edge endpoint rule (question -> claim-bearing node or contradiction), else the call is refused and no question is created
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED
-- **tests**: test_open_questions.py
+- **tests**: test_open_questions.py, test_bears_on_3615.py
 
 ### Node Mutations (Supersede, Retract, Resolve)
 
@@ -143,7 +143,7 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 
 **10. engram_resolve** — Wire resolves edge (question/contradiction/prediction/conjecture/goal_tension).
 - **contract**: `{target_id, resolving_node_id, [prediction_outcome]}`
-- **guards**: pure-wire (does NOT create derivation); threshold 0.7 on resolving node's confidence to flip status; max-of-resolves (weak later resolver cannot downgrade); idempotent on duplicate edges; bool-string type check on bool params
+- **guards**: pure-wire (does NOT create derivation); threshold 0.7 on resolving node's confidence to flip status; max-of-resolves (weak later resolver cannot downgrade); idempotent on duplicate edges; bool-string type check on bool params; a question with `bears_on` edges (#3615) returns `bears_on` (live targets; a superseded target is followed to its live successor, marked `superseded_from`), `bears_on_prompt` (worded as partial when the question is only partially resolved) and `bears_on_omitted_noncurrent` (targets with no live successor), also on the idempotent no_op path, and changes no target confidence
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED (pure-wire redesign per issue #229)
 - **tests**: test_resolve_goal_tension.py, test_open_questions.py
@@ -281,8 +281,8 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 - **tests**: *(unverified)*
 
 **29. engram_list** — Enumerate by single-field or structured filter.
-- **contract**: `{[node_type, status, sort_by, sort_order, limit, filters_json, fields_json, unlimited, include_superseded]}`
-- **guards**: dual-mode (legacy shorthand OR recursive condition tree); filters_json supports AND/OR/NOT + 15 atomic operators; virtual fields cites/cited_by; limit default 100, ceiling 500 (legacy); unlimited=True in structured mode; include_superseded=False default
+- **contract**: `{[node_type, status, sort_by, sort_order, limit, filters_json, fields_json, unlimited, include_superseded]}`; sort_by: id, created, importance, recalls, bears_on
+- **guards**: question rows carry `bears_on_count` / `bears_on_weight` (live targets only, #3615); dual-mode (legacy shorthand OR recursive condition tree); filters_json supports AND/OR/NOT + 15 atomic operators; virtual fields cites/cited_by; limit default 100, ceiling 500 (legacy); unlimited=True in structured mode; include_superseded=False default
 - **readOnlyHint**: True
 - **status-candidate**: PROD-VERIFIED (structured-filter mode per issue #81)
 - **tests**: test_list_structured_filter.py, test_list_single_field.py
@@ -305,14 +305,14 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 ### Edge Management
 
 **39. engram_add_edge** — Add non-cascade edge post-creation.
-- **contract**: `{source_id, target_id, relation}`; safe whitelist: about, exemplifies, serves, subtask_of, tensions
+- **contract**: `{source_id, target_id, relation}`; safe whitelist: about, exemplifies, serves, subtask_of, tensions, instantiates, generalizes, bears_on (question -> claim-bearing node or contradiction, #3615)
 - **guards**: whitelist blocks cascade/structural-commitment/provenance edges; idempotent (no_op_already_exists); DAG guard for dag-checked relations
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED
 - **tests**: test_engram_add_edge.py
 
 **40. engram_remove_edge** — Remove non-cascade edge (correction tool).
-- **contract**: `{source_id, target_id, relation}`; same whitelist
+- **contract**: `{source_id, target_id, relation}`; same whitelist (about, tensions, subtask_of, serves, exemplifies, instantiates, generalizes, bears_on)
 - **guards**: whitelist; idempotent; audit-logged
 - **readOnlyHint**: False · **destructiveHint**: True
 - **status-candidate**: PROD-VERIFIED

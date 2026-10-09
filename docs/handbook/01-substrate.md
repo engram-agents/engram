@@ -211,7 +211,7 @@ Validation: `engram_add_edge()` (server.py wrapper :4454 → `_add_edge_impl()` 
 
 **files** — `engram_core.py` (`EDGE_CLASSIFICATIONS` :551; derived constants `DAG_EXEMPT_RELATIONS` :709, `_ADDABLE_AFTER_CREATION_RELATIONS` :714, `_REMOVABLE_EDGE_RELATIONS` :4858). `engram_cornerstone.py` (`_add_edge_impl()` :571; `_remove_edge_impl()` :465). `engram_query.py` (`_get_neighbors()` :782). server.py (wrappers: `engram_add_edge` :4454; `engram_remove_edge` :4367).
 
-**key constants** — All 13 relation types defined in EDGE_CLASSIFICATIONS (and mirrored in VALID_RELATIONS): `about`, `cites`, `contradicts`, `derives_from`, `exemplifies`, `instantiates`, `resolves`, `retracts`, `serves`, `subtask_of`, `supersedes`, `supported_by`, `tensions`.
+**key constants** — All 17 relation types defined in EDGE_CLASSIFICATIONS (and mirrored in VALID_RELATIONS): `about`, `acknowledged_derives_from`, `bears_on`, `cites`, `contradicts`, `derives_from`, `exemplifies`, `generalizes`, `instantiates`, `predicted_by`, `resolves`, `retracts`, `serves`, `subtask_of`, `supersedes`, `supported_by`, `tensions`.
 
 **tests** — test_link_about_payload.py, test_add_edge_*.py (in test directory), test_remove_edge_payload.py.
 

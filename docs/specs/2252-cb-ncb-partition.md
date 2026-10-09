@@ -195,6 +195,7 @@ issue #2357 for that property). For every relation below except
 | `exemplifies` | False | False | False | True | incident→lesson membership, DAG-exempt |
 | `instantiates` | False | False | False | True | achievement-shaped relevance marker, DAG-exempt |
 | `generalizes` | False | False | False | True | #2753 epic WS1: general→specific abstraction/membership edge — NOT DAG-exempt (`dag_family=abstraction`, real acyclicity within its own family, cycle-guarded at write time; diverges from `temporal_causal` like `acknowledged_derives_from` above) |
+| `bears_on` | False | False | False | True | #3615: question→claim relevance marker (the eventual answer will count for or against the target); no cascade, DAG-exempt |
 | `resolves` | False | False | False | False | back-reference, DAG-exempt |
 | `serves` | False | False | False | True | intent-shaped relevance marker, DAG-exempt |
 | `subtask_of` | False | False | True | True | |

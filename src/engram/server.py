@@ -867,10 +867,9 @@ NXDOMAIN_ERRNOS = _observation_mod.NXDOMAIN_ERRNOS
 
 # Relations permitted for after-creation edge addition via engram_add_edge.
 # Derived from the addable_after_creation flag in EDGE_CLASSIFICATIONS.
-# Currently equals _REMOVABLE_EDGE_RELATIONS (about, exemplifies, instantiates,
-# serves, subtask_of, tensions) — coincidental; PR 3 will diverge them by
-# adding the new relevance-marker relation. Do NOT collapse into a single
-# constant.
+# Currently equals _REMOVABLE_EDGE_RELATIONS (about, bears_on, exemplifies,
+# generalizes, instantiates, serves, subtask_of, tensions) — coincidental; a
+# future relation may diverge them. Do NOT collapse into a single constant.
 
 # VALID_ERROR_TYPES and _THRESHOLD_GATE_DISCIPLINE_HINT moved to engram_revision.py
 # (family E) in #872 wave 6; aliased above in wave-6 compat forwarders block.
@@ -5275,7 +5274,10 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # SQL surgery. Whitelist is the safety mechanism: only non-cascade, non-
 # structural-commitment edges can be removed via this tool.
 #
-# Whitelist (safe to remove): about, tensions, subtask_of, serves, exemplifies.
+# Whitelist (safe to remove): every relation with `removable: True` in
+# EDGE_CLASSIFICATIONS (core._REMOVABLE_EDGE_RELATIONS; today: about,
+# tensions, subtask_of, serves, exemplifies, instantiates, generalizes,
+# bears_on #3615).
 #
 # BLOCKED (require engram-surgical or substrate-level correction):
 #   - provenance-bearing: every relation with `provenance: True` in
@@ -5309,7 +5311,7 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
     name="engram_remove_edge",
     capability=(
         "Deletes ONLY a whitelisted non-cascade edge (about, tensions, subtask_of, "
-        "serves, exemplifies, instantiates, generalizes). Cascade/provenance edges "
+        "serves, exemplifies, instantiates, generalizes, bears_on). Cascade/provenance edges "
         "blocked — use engram-surgical."
     ),
     annotations={
@@ -5323,7 +5325,8 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 def engram_remove_edge(payload_json: str) -> str:
     """Remove a non-cascade edge between two nodes.
 
-    Whitelist-scoped (about, tensions, subtask_of, serves, exemplifies).
+    Whitelist-scoped (about, tensions, subtask_of, serves, exemplifies,
+    instantiates, generalizes, bears_on).
     Cascade / structural / provenance edges blocked — use engram-surgical for
     those. Idempotent: no_op_not_found is a successful return.
 
@@ -5368,7 +5371,8 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # groupings) previously required engram-surgical or an engram_supersede call.
 #
 # Whitelist (safe to add): about, exemplifies, serves, subtask_of, tensions,
-# generalizes. All are non-cascade, non-structural-commitment, non-provenance
+# instantiates, generalizes, bears_on (#3615; question -> claim, endpoints in
+# engram_cornerstone._relation_endpoint_error). All are non-cascade, non-structural-commitment, non-provenance
 # relations.
 #
 # BLOCKED (require node-add-time payload or dedicated mutation tool):
@@ -5413,7 +5417,7 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
     name="engram_add_edge",
     capability=(
         "Adds ONLY a whitelisted non-cascade edge between EXISTING nodes (about, "
-        "exemplifies, serves, subtask_of, tensions, instantiates, generalizes). "
+        "exemplifies, serves, subtask_of, tensions, instantiates, generalizes, bears_on). "
         "Idempotent."
     ),
     annotations={
@@ -5428,12 +5432,12 @@ def engram_add_edge(payload_json: str) -> str:
     """Add a non-cascade edge between two existing nodes.
 
     Whitelist-scoped (about, exemplifies, instantiates, serves, subtask_of,
-    tensions, generalizes). Cascade / structural / provenance edges blocked
+    tensions, generalizes, bears_on). Cascade / structural / provenance edges blocked
     — those must be created at node-add time (via the source node's
     payload) or via the dedicated mutation tool (supersede / retract).
     Generic add-edge is only for non-claim-bearing topological edges.
 
-    Relation boundaries (the four-way split):
+    Relation boundaries (the five-way split):
       exemplifies  — this incident is an instance of this lesson's
                      error/success pattern (incident → lesson ONLY; feeds
                      the tripwire engine).
@@ -5453,6 +5457,14 @@ def engram_add_edge(payload_json: str) -> str:
                      exemplifies/instantiates). Cycle-guarded at write
                      time. Coexists with `supported_by` — never a
                      replacement for it.
+      bears_on     — this QUESTION, once answered, will count for or
+                     against that claim (#3615; question → claim-bearing
+                     node or contradiction ONLY; direction-neutral, no
+                     cascade, no confidence change). engram_resolve names
+                     the question's live targets when it is answered, and
+                     engram_list(sort_by="bears_on") ranks open questions
+                     by how many live claims ride on them. Also writable at
+                     ask time via engram_ask's `bears_on` field.
 
     Idempotent: no_op_already_exists is a successful return.
 
@@ -5507,7 +5519,7 @@ _RETYPE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation", "new_rela
 #   derives_from -> exemplifies   (target must be a lesson or cornerstone)
 #   cites        -> every relation with addable_after_creation (today: about,
 #                   exemplifies, generalizes, instantiates, serves, subtask_of,
-#                   tensions) -- derived from EDGE_CLASSIFICATIONS, not typed;
+#                   tensions, bears_on) -- derived from EDGE_CLASSIFICATIONS, not typed;
 #                   #2243 step 3 part A. The new relation's own endpoint rules
 #                   are the ones engram_add_edge enforces (one shared helper,
 #                   engram_cornerstone._relation_endpoint_error), so a retype
@@ -5533,7 +5545,7 @@ _RETYPE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation", "new_rela
 # never retypable, checked once that edge exists); target type mismatch for a
 # conditional move; no edge of the stated relation between them; a pending cascade marker on
 # EITHER endpoint (settle the cascade first via engram_cascade_resolve); the
-# new relation's own endpoint rules (instantiates / generalizes pair), its
+# new relation's own endpoint rules (instantiates / generalizes pair / bears_on), its
 # temporal order (subtask_of) and its acyclicity family.
 #
 # Side effects after commit, best-effort (same as engram_add_edge): a retype
@@ -5561,7 +5573,7 @@ _RETYPE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation", "new_rela
     capability=(
         "Corrects a wrong edge relation by making it WEAKER (never stronger) "
         "in one audited transaction — e.g. a supported_by/derives_from/loose-cites "
-        "edge (never an observation's cites to its evidence) that was really only an 'about', 'exemplifies', 'generalizes', 'instantiates', 'serves', 'subtask_of' or 'tensions' case. "
+        "edge (never an observation's cites to its evidence) that was really only an 'about', 'bears_on', 'exemplifies', 'generalizes', 'instantiates', 'serves', 'subtask_of' or 'tensions' case. "
         "Refuses moves outside a fixed allowed-move table, a pending-marker "
         "endpoint, or a missing reason."
     ),
@@ -5588,7 +5600,8 @@ def engram_retype_edge(payload_json: str) -> str:
                 moves: supported_by->about, derives_from->about,
                 derives_from->exemplifies (target must be a lesson or
                 cornerstone), and loose cites->X for every relation X addable after
-                creation (about, exemplifies [lesson/cornerstone target],
+                creation (about, bears_on [question source, claim-bearing or
+                contradiction target], exemplifies [lesson/cornerstone target],
                 generalizes, instantiates, serves, subtask_of, tensions);
                 a cites from an observation to its evidence is provenance
                 and is never retypable;
@@ -6763,7 +6776,7 @@ def engram_contradict(payload_json: str) -> str:
 
 
 _ASK_FIELDS = frozenset({
-    "question", "context_ids", "category", "lacks",
+    "question", "context_ids", "category", "lacks", "bears_on",
 })
 
 
@@ -6784,12 +6797,19 @@ _ASK_FIELDS = frozenset({
 # lacks: external_evidence routes to research). Sharpens what KIND of help
 # the question needs.
 #
+# bears_on (#3615, optional): ids of the claim-bearing nodes (or contradictions)
+# the eventual answer will count for or against. Strict and all-or-nothing,
+# unlike context_ids: a bad id refuses the call and no question is created.
+# engram_resolve later names the live targets; engram_list(sort_by="bears_on")
+# ranks open questions by how many live claims ride on them.
+#
 # Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99).
 @mcp.tool(
     name="engram_ask",
     capability=(
         "Registers a persistent open question that survives across sessions via "
-        "recall/dream scans. Pair with engram_resolve for the answer."
+        "recall/dream scans. Pair with engram_resolve for the answer. Optional "
+        "bears_on names the claims the answer will count for or against."
     ),
     annotations={
         "title": "Register Open Research Question",
@@ -6816,6 +6836,13 @@ def engram_ask(payload_json: str) -> str:
             lacks (str, optional): What's missing — one of
                 external_evidence / empirical_data / human_decision /
                 implementation / synthesis / prerequisite.
+            bears_on (str, optional): Comma-separated IDs of claim-bearing
+                nodes (or contradictions) the eventual answer will count for
+                or against (#3615). Writes `bears_on` edges with the
+                question, in one transaction. STRICT, unlike context_ids:
+                every id must exist, be current and pass the engram_add_edge
+                endpoint rule, or the whole call is refused naming the
+                offending id and NO question is created.
 
     Returns:
         JSON with the new question node ID. On payload-parsing failure,
@@ -6919,6 +6946,18 @@ def engram_resolve(payload_json: str) -> str:
         confidence. On payload-parsing failure, returns {"error": "..."}.
         When partial_resolution is due to threshold gate, includes
         discipline_hint advising against chain dilution.
+        When the target is a question with `bears_on` edges (#3615; also on
+        the idempotent no_op path), the return adds `bears_on` (the live
+        targets, each {target_id, target_type}; a SUPERSEDED target is
+        followed to its live successor, listed with `superseded_from`: the
+        old id), `bears_on_prompt` (asks, for each, whether the answer
+        supports or weakens it; it says "partially resolved" when the
+        resolve left the question partially_resolved) and
+        `bears_on_omitted_noncurrent` (count of targets with no live
+        successor: retracted, or a supersede chain that ends non-current; absent at 0).
+        engram_resolve changes none of those targets'
+        confidence — acting on the prompt is a separate, deliberate step.
+        Absent for any other target.
 
     Side effect (#1777, #1952 PR3): if target already carries a
     recall_summary, a real status change (not the idempotent no_op path)
@@ -7748,7 +7787,9 @@ def engram_list(payload_json: str = "{}") -> str:
     status as plain strings. Returns the compact triage shape; the `claim`
     key carries `recall_summary` when populated — truncated to 200 chars
     with an ellipsis if longer — falling back to the claim truncated to
-    130 chars.
+    130 chars. Question rows also carry `bears_on_count` (live `bears_on`
+    targets) and `bears_on_weight` (their summed importance_score, 3 places) —
+    the open-question priority signal (#3615); other types get neither key.
 
     Structured-filter mode (issue #81): pass filters_json with a recursive
     condition tree. Supports multi-field AND/OR/NOT composition, text
@@ -7822,7 +7863,11 @@ def engram_list(payload_json: str = "{}") -> str:
                 filters_json (errors loudly).
             sort_by (str, optional): Sort order — 'id' (default), 'created'
                 (newest first), 'importance' (highest first), 'recalls'
-                (most recalled first). Unrecognized non-empty value errors
+                (most recalled first), 'bears_on' (#3615: most live
+                bears_on targets first, then highest summed target
+                importance, then id ASC; sort_order flips count/weight
+                direction, id stays ASC; non-question rows count 0).
+                Unrecognized non-empty value errors
                 loudly rather than silently falling back to 'id' order.
             sort_order (str, optional): Direction override — 'asc' or 'desc'
                 (case-insensitive). Empty = use sort_by's own default

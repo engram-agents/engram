@@ -3476,6 +3476,10 @@ def _list_impl(
         "created": ("created_at", "DESC"),
         "importance": ("importance_score", "DESC"),
         "recalls": ("recall_count", "DESC"),
+        # #3615: the open-question priority signal. The ORDER BY is built
+        # specially below (count, then weight, then id ASC), so the column
+        # here is only the primary key, `bears_on_count`.
+        "bears_on": ("bo_cnt", "DESC"),
     }
     if sort_by and sort_by not in sort_columns:
         return json.dumps({
@@ -3493,6 +3497,12 @@ def _list_impl(
         })
     resolved_direction = sort_order.upper() if sort_order else default_direction
     order = f"{column} {resolved_direction}"
+    if sort_by == "bears_on":
+        # #3615: count, then weight (same direction), then id ASC for a stable
+        # order. COALESCE: a question with no live bears_on edge has no
+        # aggregate row (LEFT JOIN NULL) and counts as 0 / 0.0.
+        order = (f"COALESCE(bo_cnt, 0) {resolved_direction}, "
+                 f"COALESCE(bo_wt, 0.0) {resolved_direction}, id ASC")
 
     # Limit semantics (per issue #81 + Lei's state-table refinement):
     #   unlimited=True OR limit=None  → no cap
@@ -3545,11 +3555,33 @@ def _list_impl(
         ]
         select_cols = ", ".join(f'"{c}"' for c in cols_to_fetch)
 
+    # #3615: per-question bears_on aggregate (count + summed importance of the
+    # CURRENT targets). The grouped-subquery JOIN is used ONLY for
+    # sort_by="bears_on" (the ORDER BY needs it, and `limit` must apply after
+    # the sort). Every other compact list fetches its page first and then runs
+    # one extra query for just the question rows on that page (below), so the
+    # default path pays nothing when the page holds no question.
+    # Aliased bo_* so no unqualified column in `where`/filters can collide.
+    # A retracted/superseded target is excluded: the signal counts live stakes.
+    need_bears_on = sort_by == "bears_on"
+    from_clause = "nodes"
+    if need_bears_on:
+        if not projected_fields:
+            select_cols += ", COALESCE(bo_cnt, 0), COALESCE(bo_wt, 0.0)"
+        from_clause = (
+            "nodes LEFT JOIN ("
+            "SELECT e.source_id AS bo_src, COUNT(*) AS bo_cnt, "
+            "SUM(COALESCE(t.importance_score, 0.0)) AS bo_wt "
+            "FROM edges e JOIN nodes t ON t.id = e.target_id "
+            "WHERE e.relation = 'bears_on' AND t.is_current = 1 "
+            "GROUP BY e.source_id) AS bo ON bo.bo_src = nodes.id"
+        )
+
     if effective_limit == 0:
         rows: list = []
     else:
         conn = core._get_db()
-        query = f"SELECT {select_cols} FROM nodes WHERE {where} ORDER BY {order}"
+        query = f"SELECT {select_cols} FROM {from_clause} WHERE {where} ORDER BY {order}"
         if effective_limit is not None:
             query += " LIMIT ?"
             rows = conn.execute(query, select_params + params + [effective_limit]).fetchall()
@@ -3570,8 +3602,34 @@ def _list_impl(
         # ellipsis) or falls back to the original claim truncated to
         # LIST_CLAIM_FALLBACK_DISPLAY_CAP chars for legacy nodes that haven't
         # been backfilled yet. Key name unchanged for downstream compat.
+        # #3615: when the aggregate was not joined (every sort but
+        # "bears_on"), fetch count + live-target weight for just the question
+        # rows on this page in ONE query; no question on the page -> no query.
+        bo_by_q: dict = {}
+        if not need_bears_on:
+            q_ids = [r[0] for r in rows if r[1] == "question"]
+            if q_ids:
+                marks = ",".join("?" * len(q_ids))
+                # `+t.is_current` is deliberate: unary plus keeps SQLite from
+                # driving this lookup off idx_nodes_current (a scan of every
+                # current node, ~230 ms at 20k nodes) instead of the page's
+                # own bears_on edges. Pinned by a query-plan test.
+                for src, cnt, wt in conn.execute(
+                    "SELECT e.source_id, COUNT(*), "
+                    "SUM(COALESCE(t.importance_score, 0.0)) "
+                    "FROM edges e JOIN nodes t ON t.id = e.target_id "
+                    "WHERE e.relation = 'bears_on' AND +t.is_current = 1 "
+                    f"AND e.source_id IN ({marks}) GROUP BY e.source_id",
+                    q_ids,
+                ).fetchall():
+                    bo_by_q[src] = (cnt, wt)
         for row in rows:
-            nid, ntype, claim, st, conf, recalls, imp, created, mem_st, rs = row
+            (nid, ntype, claim, st, conf, recalls, imp, created, mem_st, rs,
+             *bo_cols) = row
+            if bo_cols:
+                bo_count, bo_weight = bo_cols
+            else:
+                bo_count, bo_weight = bo_by_q.get(nid, (0, 0.0))
             if rs and len(rs) <= LIST_CLAIM_SUMMARY_DISPLAY_CAP:
                 # Display-only bound, independent of the write-path validators
                 # (see LIST_CLAIM_SUMMARY_DISPLAY_CAP) — use as-is.
@@ -3598,6 +3656,10 @@ def _list_impl(
             }
             if conf is not None:
                 entry["confidence"] = round(conf, 3)
+            if ntype == "question":
+                # #3615: open-question priority signal (live targets only).
+                entry["bears_on_count"] = int(bo_count)
+                entry["bears_on_weight"] = round(float(bo_weight), 3)
             entries.append(entry)
 
     truncated_count = (total - len(entries)) if total > len(entries) else 0

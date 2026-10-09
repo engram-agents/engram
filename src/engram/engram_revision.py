@@ -2026,6 +2026,99 @@ def _detect_zero_support(
 # E impls
 # ---------------------------------------------------------------------------
 
+def _bears_on_resolve_fields(conn, question_row, resolution_status=None) -> dict:
+    """The `bears_on` surfacing for an engram_resolve return (#3615).
+
+    When ``question_row`` is a question with >=1 ``bears_on`` edge, returns
+    ``bears_on`` (the live targets as ``{"target_id","target_type"}``; a target
+    that was SUPERSEDED is followed to its live successor via
+    ``core._current_successor`` and listed as the successor, carrying
+    ``"superseded_from": <old id>``, deduped when two edges map to one
+    successor), ``bears_on_prompt`` (one string naming each live target and
+    asking whether the answer supports or weakens it) and, when any target has
+    NO live successor (retracted, or a supersede chain that ends non-current),
+    ``bears_on_omitted_noncurrent`` (that count; omitted at 0). Returns ``{}``
+    otherwise, so the response shape of every other resolve is unchanged.
+    Read-only: it touches no status or confidence.
+
+    ``resolution_status`` is the outcome of THIS resolve (``resolved`` or
+    ``partially_resolved``); the prompt wording depends on it. ``None`` (the
+    idempotent no_op path) uses the question's stored status.
+    """
+    if question_row["type"] != "question":
+        return {}
+    rows = conn.execute(
+        "SELECT n.id AS id, n.type AS type, n.is_current AS is_current "
+        "FROM edges e JOIN nodes n ON n.id = e.target_id "
+        "WHERE e.source_id = ? AND e.relation = 'bears_on' ORDER BY e.id",
+        (question_row["id"],),
+    ).fetchall()
+    if not rows:
+        return {}
+    if resolution_status is None:
+        resolution_status = question_row["status"]
+    partial = resolution_status == "partially_resolved"
+
+    live: list = []
+    seen: set = set()
+    skipped = 0
+    for r in rows:
+        if r["is_current"] == 1:
+            tid, ttype, old = r["id"], r["type"], None
+        else:
+            tid = core._current_successor(conn, r["id"])
+            if tid is None:
+                skipped += 1
+                continue
+            trow = conn.execute(
+                "SELECT type FROM nodes WHERE id = ?", (tid,)
+            ).fetchone()
+            ttype, old = trow["type"], r["id"]
+        if tid in seen:
+            continue
+        seen.add(tid)
+        entry = {"target_id": tid, "target_type": ttype}
+        if old is not None:
+            entry["superseded_from"] = old
+        live.append(entry)
+
+    out: dict = {"bears_on": live}
+    if live:
+        ids = ", ".join(
+            f"{t['target_id']} (superseded from {t['superseded_from']})"
+            if "superseded_from" in t else t["target_id"]
+            for t in live
+        )
+        if partial:
+            out["bears_on_prompt"] = (
+                f"This question was wired to bear on: {ids}. It is only "
+                f"partially resolved so far; does the answer so far support "
+                f"or weaken each of them? The picture may change when it is "
+                f"fully resolved. Update each with the usual tools "
+                f"(engram_derive, engram_contradict, engram_supersede, "
+                f"engram_retract) as warranted; engram_resolve itself "
+                f"changed none of their confidence."
+            )
+        else:
+            out["bears_on_prompt"] = (
+                f"This question was wired to bear on: {ids}. Now that it is "
+                f"answered, does the answer support or weaken each of them? "
+                f"Update each with the usual tools (engram_derive, "
+                f"engram_contradict, engram_supersede, engram_retract) as "
+                f"warranted; engram_resolve itself changed none of their "
+                f"confidence."
+            )
+    else:
+        out["bears_on_prompt"] = (
+            "This question was wired to bear on claims, but none of them is "
+            "current any more (each was retracted or has no live successor); "
+            "nothing to re-assess."
+        )
+    if skipped:
+        out["bears_on_omitted_noncurrent"] = skipped
+    return out
+
+
 def _resolve_impl(
     target_id: str = "",
     resolving_node_id: str = "",
@@ -2075,7 +2168,16 @@ def _resolve_impl(
 
     Returns:
         JSON with the wired edge, target's new status, and the resolving
-        node's confidence.
+        node's confidence. When the target is a question with ``bears_on``
+        edges (#3615), also ``bears_on`` (the live targets, ``target_id`` +
+        ``target_type``; a SUPERSEDED target is followed to its live
+        successor and listed as that successor with ``superseded_from``),
+        ``bears_on_prompt`` (asks whether the answer supports or weakens
+        each; worded as "partially resolved" when this resolve left the
+        question partially_resolved) and ``bears_on_omitted_noncurrent``
+        (count of targets with no live successor: retracted, or a supersede
+        chain that ends non-current; absent at 0) — on the idempotent
+        ``no_op`` path too. Absent for every other resolve.
     """
     RESOLVABLE_TYPES = {"question", "contradiction", "prediction", "conjecture", "goal_tension"}
     VALID_PREDICTION_OUTCOMES = {"confirmed", "partially_confirmed", "refuted", "partially_refuted"}
@@ -2203,6 +2305,8 @@ def _resolve_impl(
                 "target_id": target_id,
                 "resolving_node_id": resolving_node_id,
                 "target_status": target["status"],
+                # #3615: a retry keeps the bears_on prompt (empty dict when n/a).
+                **_bears_on_resolve_fields(conn, target),
             })
 
         confidence = resolver["confidence"] if resolver["confidence"] is not None else 1.0
@@ -2283,6 +2387,10 @@ def _resolve_impl(
                 f"then call engram_resolve again to wire it."
             )
             result["discipline_hint"] = _THRESHOLD_GATE_DISCIPLINE_HINT
+
+        # #3615: name the question's bears_on targets (read-only; absent keys
+        # when the target is not a question or has no bears_on edges).
+        result.update(_bears_on_resolve_fields(conn, target, resolution_status))
 
         return json.dumps(result)
     finally:
