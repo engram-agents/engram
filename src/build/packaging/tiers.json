@@ -1204,6 +1204,10 @@
     {
       "path": "health/signals.py",
       "tier": "essential"
+    },
+    {
+      "path": "health/rows.py",
+      "tier": "essential"
     }
   ],
   "excluded": [

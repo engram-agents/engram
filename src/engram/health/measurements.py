@@ -174,6 +174,7 @@ from dataclasses import dataclass
 from typing import Callable, Union
 
 from . import model as _health_model
+from .rows import named_rows
 from .signals import SIGNAL_DEFS
 from .version import MAJOR as RAW_SCHEMA_VERSION
 
@@ -327,7 +328,7 @@ _CLAIM_BEARING_TYPES_RESOLVED = _resolve_claim_bearing_types()
 def m_derivations_current(conn: sqlite3.Connection) -> int:
     """Count of current derivation nodes. Denominator for
     ``stale_derivation_rate``."""
-    return conn.execute(
+    return named_rows(conn,
         "SELECT COUNT(*) as c FROM nodes WHERE type = 'derivation' AND is_current = 1"
     ).fetchone()["c"]
 
@@ -341,7 +342,7 @@ def m_claim_bearing_current(conn: sqlite3.Connection) -> int:
 
     claim_bearing_types = tuple(sorted(core.CLAIM_BEARING_TYPES))
     placeholders = ",".join("?" * len(claim_bearing_types))
-    return conn.execute(
+    return named_rows(conn,
         f"SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND type IN ({placeholders})",
         claim_bearing_types,
     ).fetchone()["c"]
@@ -350,7 +351,7 @@ def m_claim_bearing_current(conn: sqlite3.Connection) -> int:
 def m_contradictions_current(conn: sqlite3.Connection) -> int:
     """Count of current contradiction nodes. Denominator for
     ``open_contradiction_rate``."""
-    return conn.execute(
+    return named_rows(conn,
         "SELECT COUNT(*) as c FROM nodes WHERE type = 'contradiction' AND is_current = 1"
     ).fetchone()["c"]
 
@@ -359,7 +360,7 @@ def m_observations_current(conn: sqlite3.Connection) -> int:
     """Count of current observation nodes (``observation_factual`` +
     ``observation_predictive``). Denominator for
     ``uncited_observation_rate``."""
-    return conn.execute(
+    return named_rows(conn,
         "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1"
         " AND type IN ('observation_factual', 'observation_predictive')"
     ).fetchone()["c"]
@@ -368,7 +369,7 @@ def m_observations_current(conn: sqlite3.Connection) -> int:
 def m_evidence_current(conn: sqlite3.Connection) -> int:
     """Count of current evidence nodes. Denominator for
     ``dangling_evidence_rate``."""
-    return conn.execute(
+    return named_rows(conn,
         "SELECT COUNT(*) as c FROM nodes WHERE type = 'evidence' AND is_current = 1"
     ).fetchone()["c"]
 
@@ -390,7 +391,7 @@ def m_claim_bearing_pending_marker(conn: sqlite3.Connection) -> int:
 
     claim_bearing_types = tuple(sorted(core.CLAIM_BEARING_TYPES))
     placeholders = ",".join("?" * len(claim_bearing_types))
-    return conn.execute(
+    return named_rows(conn,
         f"""SELECT COUNT(DISTINCT n.id) as c
             FROM nodes n
             JOIN cascade_markers m ON m.node_id = n.id
@@ -404,7 +405,7 @@ def m_contradictions_open(conn: sqlite3.Connection) -> int:
     """Count of current contradiction nodes with
     ``status IN ('active', 'partially_resolved')``. Numerator for
     ``open_contradiction_rate``."""
-    return conn.execute(
+    return named_rows(conn,
         """SELECT COUNT(*) as c FROM nodes
            WHERE type = 'contradiction' AND is_current = 1
              AND status IN ('active', 'partially_resolved')"""
@@ -414,7 +415,7 @@ def m_contradictions_open(conn: sqlite3.Connection) -> int:
 def m_observations_without_evidence_id(conn: sqlite3.Connection) -> int:
     """Count of current observations with ``evidence_id IS NULL``.
     Numerator for ``uncited_observation_rate``."""
-    return conn.execute(
+    return named_rows(conn,
         """SELECT COUNT(*) as c FROM nodes
            WHERE is_current = 1
              AND type IN ('observation_factual', 'observation_predictive')
@@ -477,7 +478,7 @@ def m_evidence_uncited(conn: sqlite3.Connection) -> int:
     What #2559 changes is only how expensive "always-on" turns out to
     actually be: the price is gone by construction once it lands — ~1.3s/
     build before, ~30ms after, on the seats measured."""
-    return conn.execute(
+    return named_rows(conn,
         """SELECT COUNT(*) as c FROM nodes n
            WHERE n.type = 'evidence' AND n.is_current = 1
              AND NOT EXISTS (
@@ -500,7 +501,7 @@ def m_claim_bearing_without_recall_summary(conn: sqlite3.Connection) -> int:
 
     claim_bearing_types = tuple(sorted(core.CLAIM_BEARING_TYPES))
     placeholders = ",".join("?" * len(claim_bearing_types))
-    rows = conn.execute(
+    rows = named_rows(conn,
         f"SELECT recall_summary FROM nodes WHERE is_current = 1 AND type IN ({placeholders})",
         claim_bearing_types,
     ).fetchall()
@@ -524,7 +525,7 @@ def m_claim_bearing_without_recall_keywords(conn: sqlite3.Connection) -> int:
 
     claim_bearing_types = tuple(sorted(core.CLAIM_BEARING_TYPES))
     placeholders = ",".join("?" * len(claim_bearing_types))
-    rows = conn.execute(
+    rows = named_rows(conn,
         f"SELECT recall_keywords FROM nodes WHERE is_current = 1 AND type IN ({placeholders})",
         claim_bearing_types,
     ).fetchall()
@@ -560,7 +561,7 @@ def m_claim_bearing_null_embedding(conn: sqlite3.Connection) -> int:
 
     claim_bearing_types = tuple(sorted(core.CLAIM_BEARING_TYPES))
     placeholders = ",".join("?" * len(claim_bearing_types))
-    return conn.execute(
+    return named_rows(conn,
         f"SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND type IN ({placeholders})"
         " AND embedding IS NULL",
         claim_bearing_types,
@@ -586,7 +587,7 @@ def m_claim_bearing_giant_component_size(conn: sqlite3.Connection) -> int:
 
     claim_bearing_types = tuple(sorted(core.CLAIM_BEARING_TYPES))
     placeholders = ",".join("?" * len(claim_bearing_types))
-    node_rows = conn.execute(
+    node_rows = named_rows(conn,
         f"SELECT id FROM nodes WHERE is_current = 1 AND type IN ({placeholders})",
         claim_bearing_types,
     ).fetchall()
@@ -594,7 +595,7 @@ def m_claim_bearing_giant_component_size(conn: sqlite3.Connection) -> int:
     if not claim_bearing_ids:
         return 0
 
-    edge_rows = conn.execute("SELECT source_id, target_id FROM edges").fetchall()
+    edge_rows = named_rows(conn, "SELECT source_id, target_id FROM edges").fetchall()
     adj: dict = {}
     for e in edge_rows:
         s, t = e["source_id"], e["target_id"]

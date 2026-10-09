@@ -133,12 +133,14 @@ from pathlib import Path
 try:  # pragma: no cover -- exercised by both execution modes in practice
     from . import measurements as health_measurements
     from . import version as health_version
+    from .rows import named_rows
 except ImportError:
     _src_engram = str(Path(__file__).resolve().parent.parent)
     if _src_engram not in sys.path:
         sys.path.insert(0, _src_engram)
     from health import measurements as health_measurements  # type: ignore[no-redef]
     from health import version as health_version  # type: ignore[no-redef]
+    from health.rows import named_rows  # type: ignore[no-redef]
 
 # Second alias to the SAME `health.version` module object as `health_version`
 # above -- used ONLY inside PR C1's `derive`/`export`, whose own PARAMETER is
@@ -304,7 +306,7 @@ def _unresolved_snapshots_needs_migration(conn: sqlite3.Connection) -> bool:
     migration -- see ``open_store``'s docstring). ``PRAGMA table_info``
     cannot see CHECK constraints, so the literal text of the constraint is
     read off ``sqlite_master.sql`` instead."""
-    row = conn.execute(
+    row = named_rows(conn,
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'unresolved_snapshots'"
     ).fetchone()
     if row is None or row["sql"] is None:
@@ -347,7 +349,7 @@ def _equality_checks_needs_migration(conn: sqlite3.Connection) -> bool:
     columns) is sufficient here -- no need to read ``sqlite_master.sql``."""
     cols = {
         r["name"]
-        for r in conn.execute("PRAGMA table_info(equality_checks)").fetchall()
+        for r in named_rows(conn, "PRAGMA table_info(equality_checks)").fetchall()
     }
     return "replay_decl_hash" not in cols
 
@@ -375,7 +377,7 @@ def _derived_points_needs_migration(conn: sqlite3.Connection) -> bool:
     column (this store's THIRD schema migration, PR C1) -- a plain column,
     so ``PRAGMA table_info`` suffices."""
     cols = {
-        r["name"] for r in conn.execute("PRAGMA table_info(derived_points)").fetchall()
+        r["name"] for r in named_rows(conn, "PRAGMA table_info(derived_points)").fetchall()
     }
     return "l0_source" not in cols
 
@@ -391,7 +393,7 @@ def _migrate_derived_points(conn: sqlite3.Connection) -> None:
     NON-empty (meaning something, somehow, wrote to it under the old
     schema -- should never happen), raise ``SeriesIntegrityError`` naming
     the table rather than silently dropping rows."""
-    count = conn.execute("SELECT COUNT(*) AS c FROM derived_points").fetchone()["c"]
+    count = named_rows(conn, "SELECT COUNT(*) AS c FROM derived_points").fetchone()["c"]
     if count != 0:
         raise SeriesIntegrityError(
             "derived_points migration (PR C1): the table is on the pre-C1 "
@@ -425,7 +427,7 @@ def _declarations_needs_model_defs_migration(conn: sqlite3.Connection) -> bool:
     column (this store's FOURTH schema migration, PR C1 / D4.1) -- a plain
     column, so ``PRAGMA table_info`` suffices."""
     cols = {
-        r["name"] for r in conn.execute("PRAGMA table_info(declarations)").fetchall()
+        r["name"] for r in named_rows(conn, "PRAGMA table_info(declarations)").fetchall()
     }
     return "model_defs" not in cols
 
@@ -448,7 +450,7 @@ def _replay_runs_needs_migration(conn: sqlite3.Connection) -> bool:
     PR C1) -- same ``sqlite_master.sql`` literal-text check as
     ``_unresolved_snapshots_needs_migration`` above, since ``PRAGMA
     table_info`` cannot see CHECK constraints."""
-    row = conn.execute(
+    row = named_rows(conn,
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'replay_runs'"
     ).fetchone()
     if row is None or row["sql"] is None:
@@ -571,7 +573,7 @@ def _declarations_needs_prefix_heal(conn: sqlite3.Connection) -> bool:
     ``LIKE`` against a NULL column is NULL (falsy), never a match, so the
     explicit ``IS NOT NULL`` guards are belt-and-suspenders, not strictly
     required -- kept for readability."""
-    row = conn.execute(
+    row = named_rows(conn,
         "SELECT COUNT(*) AS c FROM declarations WHERE "
         "(signal_defs IS NOT NULL AND signal_defs LIKE '%engram.health.%') OR "
         "(curve_defs IS NOT NULL AND curve_defs LIKE '%engram.health.%') OR "
@@ -608,7 +610,7 @@ def _migrate_declarations_prefix_heal(conn: sqlite3.Connection) -> None:
     should-fix 2) -- a check that used to reject this content now silently
     accepts it, and a silent acceptance of something that used to be
     rejected should leave a mark."""
-    rows = conn.execute(
+    rows = named_rows(conn,
         "SELECT health_version, signal_defs, curve_defs, config, model_defs "
         "FROM declarations"
     ).fetchall()
@@ -1562,7 +1564,7 @@ def ingest(
 def _dump_table_rows(conn: sqlite3.Connection, table: str) -> list[dict]:
     pk_cols = _PRIMARY_KEYS[table]
     order_by = ", ".join(pk_cols)
-    rows = conn.execute(f"SELECT * FROM {table} ORDER BY {order_by}").fetchall()
+    rows = named_rows(conn, f"SELECT * FROM {table} ORDER BY {order_by}").fetchall()
     return [dict(row) for row in rows]
 
 
