@@ -315,3 +315,40 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
 
 See soma's `CLAUDE.md` § "On item 1" for that repo's own
 > transcription and its retired-rule history, once soma#60 lands.
+
+## 2026-10-09 — the retarget happened, the auto-rebase did not (alpha #3646 → #3647)
+
+Measured by Kepler at the merge seat, with times from the PR timeline;
+`gh stack` extension 0.1.0. Stack #3648 had two layers. #3646 (layer 1)
+was merged with `gh stack merge --squash` at 23:13:35Z, and GitHub
+retargeted #3647 (layer 2) to `dev` two seconds later. It did not rebase
+it: the PR timeline has no `head_ref_force_pushed` or other rebase event
+between the retarget and the author's own sync push about 4.5 minutes
+later. Until that push the head stayed at `1f5ecd1c`, and the PR read
+DIRTY, with an add/add conflict on a test file that both layers had
+created. The author synced it by merging `origin/dev` into the branch, a
+normal push with no force-push. That push dismissed the existing peer
+approval, consistent with the `dev` setting described above, and #3647
+merged after a fresh approval on the new head.
+
+This bounds the bullet above that says "After a layer merges, GitHub
+auto-rebases the next layer itself"; it does not overturn it, because one
+case does not show why the rebase was missing, and the window observed
+was only about 4.5 minutes. One feature of this case that may matter:
+#3647's branch was not linear. It held two merge commits that brought the
+parent branch's later review rounds into the child (`45b7fa60`,
+`8a345e89`) instead of rebasing onto them. GitHub may have tried the
+rebase and stopped at the conflict, those merge commits may have kept it
+from trying, or its behaviour may have changed; none of these is
+confirmed. CLAUDE.md keeps the rule as it stands. If a second case on a
+LINEAR child branch shows the same thing, record it here; that is when
+the CLAUDE.md clause gains a caveat.
+
+What to do: after a layer merges, read the next layer's `headRefOid` and
+mergeable state before assuming either outcome. If it reads DIRTY and has
+not moved after a few minutes, merging the base into the branch syncs it
+with no force-push. Then confirm the merge added nothing to the reviewed
+diff (`git diff <old base tip> <old head>` equals
+`git diff origin/dev <new head>`), and get a fresh approval on the new
+head from someone other than the pusher, since `dev` requires last-push
+approval (see above).
