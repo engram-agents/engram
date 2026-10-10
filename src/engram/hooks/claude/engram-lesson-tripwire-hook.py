@@ -1317,13 +1317,29 @@ def _query_recall_daemon(query: str, top_k: int = 5) -> dict | None:
         return None
 
 
-def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> str:
+def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
+                         record_out: dict | None = None) -> str:
     """Budgeted general recall at action-moment, behind the novelty gate.
 
     hook_input (#1749): the raw PreToolUse payload, passed through from
     main() so the fire ledger can stamp session_id/transcript_path/tool_name
     per entry. Optional -- existing callers/tests that don't pass it keep
-    working, with those fields recorded as null."""
+    working, with those fields recorded as null.
+
+    record_out (#3670): optional out-parameter for the shown record. When a
+    dict is passed, a gate-passing fire stores the ids it rendered in
+    ``record_out["ids"]`` (possibly ``[]``) and does NOT append the record
+    itself: the caller appends it only after the response was written out,
+    so a record never claims more than was shown. When None (every other
+    caller: tests, tools/perf/bench_in_turn_recall.py) no shown record is
+    appended at all -- appending here, before anything was printed, was the
+    bug. The return type and the route ledger write are unchanged.
+
+    There is no emit_context cut on the recall text, but main() appends it LAST
+    to the joined additionalContext, and the harness silently cuts the TAIL of
+    an oversized injection. So main() records ``record_out["ids"]`` only when
+    the WHOLE joined string fits the harness budget; otherwise it records an
+    empty-ids line (under-record, never over-record)."""
     import time
 
     cfg = _in_turn_config()
@@ -1543,12 +1559,13 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
                 )
             except Exception as exc:  # e.g. an unserialisable tool_input: fail-open
                 print(f"route-ledger: {type(exc).__name__}: {exc}"[:300], file=sys.stderr)
-            # #3613 S1: the shown record, AFTER the ledger's resolver read its
-            # sources. Written whatever the exclusion kill switch says.
-            try:
-                append_shown_record("tool_recall", hook_input.get("session_id"), shown_)
-            except Exception:  # a non-dict hook_input: fail-open, as above
-                pass
+            # #3613 S1 / #3670: the shown record is NOT appended here (this runs
+            # before anything is printed). The pending ids are handed to main(),
+            # which appends once the response was written out, still after the
+            # ledger's resolver read its sources. Written whatever the
+            # exclusion kill switch says.
+            if record_out is not None:
+                record_out["ids"] = list(shown_)
 
         # Gate passed — query the daemon with the novel terms.
         result = _query_recall_daemon(recall_query)
@@ -2023,23 +2040,38 @@ def main() -> None:
             _recall_state, _recall_text = marker_recall_query(match_target)
         except Exception:
             _recall_state, _recall_text = "none", match_target
+        # #3670: the shown record is appended only AFTER the response was
+        # written out. check_in_turn_recall leaves the pending ids in
+        # _pending_shown; a call that raised discards them (the model saw no
+        # recall text), and a fire that passed the gate but rendered nothing
+        # leaves ids == [] so the per-fire line (prompt_index) stays continuous.
+        _pending_shown: dict = {}
         try:
             if _recall_state == "empty":
                 recall = ""
             else:
-                recall = check_in_turn_recall(_recall_text, hook_input)
+                recall = check_in_turn_recall(_recall_text, hook_input, _pending_shown)
         except Exception:
             recall = ""
+            _pending_shown.clear()
         if recall:
             parts.append(recall)
 
         if not parts:
+            # Nothing is printed, nothing was shown: the empty-ids line is true.
+            if "ids" in _pending_shown:
+                try:
+                    append_shown_record("tool_recall", hook_input.get("session_id"),
+                                        _pending_shown["ids"])
+                except Exception:  # fail-open: a non-dict hook_input etc.
+                    pass
             sys.exit(0)
 
+        additionalContext = "\n".join(parts)
         response = {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
-                "additionalContext": "\n".join(parts),
+                "additionalContext": additionalContext,
             }
         }
         print(json.dumps(response))
@@ -2053,6 +2085,36 @@ def main() -> None:
             except Exception:
                 sys.exit(0)
             _mark_loader_notice_shown(loader_notice_now)
+        # #3670: the shown record is appended only once the response has been
+        # written out AND flushed; a failed print/flush records nothing, so no
+        # unseen id is ever recorded. A printed-but-oversized string (the
+        # harness may cut its tail, where the recall sits) records empty ids.
+        try:
+            sys.stdout.flush()
+        except Exception:
+            sys.exit(0)
+        if "ids" in _pending_shown:
+            # The recall block is appended LAST and has no emit_context cut of
+            # its own, but the joined string is subject to the HARNESS tail cut:
+            # when it exceeds the harness budget the recall may not have reached
+            # the model, so record EMPTY ids (the line still lands, keeping
+            # prompt_index continuous). Fail-open toward under-recording: a
+            # budget lookup that raises is treated as over budget.
+            # NOTE (Borges, #3674 review): get_harness_budgets()["budget"]
+            # (9,500 on claude-code) sits a little UNDER the measured harness
+            # ceiling, so this check also under-records in that narrow band.
+            # That is the intended direction: do NOT "fix" it to the measured
+            # number.
+            try:
+                _fits = len(additionalContext) <= get_harness_budgets(
+                    detect_harness())["budget"]
+            except Exception:
+                _fits = False
+            try:
+                append_shown_record("tool_recall", hook_input.get("session_id"),
+                                    _pending_shown["ids"] if _fits else [])
+            except Exception:  # fail-open: a non-dict hook_input etc.
+                pass
         sys.exit(0)
 
     except Exception as exc:

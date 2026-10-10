@@ -274,7 +274,10 @@ def _fire(mod, monkeypatch, response, tool_input=None, session=SESSION):
     Path(os.environ["ENGRAM_HOME"], "in-turn-recall-state.json").unlink(missing_ok=True)
     err = io.StringIO()
     with patch("sys.stderr", err):
-        out = mod.check_in_turn_recall("Bash alphaterm betaterm", hook_input)
+        pending = {}
+        out = mod.check_in_turn_recall("Bash alphaterm betaterm", hook_input, pending)
+        if "ids" in pending:
+            mod.append_shown_record("tool_recall", session, pending["ids"])
     return out, err.getvalue()
 
 
