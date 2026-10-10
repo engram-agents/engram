@@ -1,0 +1,38 @@
+[Unit]
+Description=ENGRAM owner (engramd_owner), one per ENGRAM_HOME
+# Exit 1 = OwnerAlreadyRunning: another owner holds this seat. Restart=on-failure restarts
+# it, BOUNDED: RestartSec below plus at most StartLimitBurst starts per StartLimitIntervalSec
+# (5 starts in 300 s with RestartSec=10s, so a repeatedly failing owner is down for good
+# about 40-50 s after the first failure). After that the unit stays failed until
+# `systemctl --user reset-failed` or a manual start, and start-engramd-owner.sh then
+# reports `registered but failed` on each session start and launches nothing (it never
+# competes with a registered supervisor). StartLimit* belongs in [Unit] (systemd >= 230);
+# in [Service] it is ignored.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Every launch path's argv MUST contain `engramd_owner` (engram_pidfile's
+# _PIDFILE_PROGRAM_MARKER): the script path below carries it. ENGRAM_HOME is read
+# from the Environment= line, as for the surface daemon.
+ExecStart={{PYTHON}} {{ENGRAM_OWNER_PY}}
+Environment=ENGRAM_HOME={{ENGRAM_HOME}}
+# Exit codes are supervised by meaning:
+#   0  clean stop            -> not restarted (on-failure does not restart a clean exit)
+#   1  OwnerAlreadyRunning   -> restarted, bounded (RestartSec + StartLimit* above)
+#   3  EXIT_DISPLACED        -> restarted by Restart=on-failure (until the start limit
+#                               trips, as for exit 1): the owner shut down on a displaced
+#                               substrate without closing the store, so it must never read
+#                               as a success. Hence deliberately NO SuccessExitStatus= and
+#                               no RestartPreventExitStatus= here.
+Restart=on-failure
+RestartSec=10s
+# `append:` log routing requires systemd >= 240 (same floor as the surface daemon unit).
+StandardOutput=append:{{ENGRAM_HOME}}/engramd-owner.log
+StandardError=append:{{ENGRAM_HOME}}/engramd-owner.log
+
+# No User=/Group=: this is a `systemctl --user` unit and runs as the seat's own user.
+# U4a's peer-credential check compares the connecting uid with the owner's uid.
+[Install]
+WantedBy=default.target

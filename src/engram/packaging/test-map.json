@@ -288,6 +288,13 @@
       "note": "Operator-invoked clear verb (#3493); the test runs the real script as a subprocess in a temp ENGRAM_HOME."
     },
     {
+      "path_prefix_or_glob": "hooks/claude/_engramd_owner_hook_io.py",
+      "test_globs": [
+        "tests/test_owner_launcher_3663.py"
+      ],
+      "note": "engram-alpha#3663 round 8: the I/O helper of start-engramd-owner.sh. The bash hook runs it as a script (python <path> live|report|launch), not an import, so the layer-1 AST import graph cannot see it; convention mapping to the launcher suite."
+    },
+    {
       "path_prefix_or_glob": "hooks/claude/start-engram-daemon.sh",
       "full_suite_fallback": true,
       "note": "No dedicated test file for start-engram-daemon.sh"

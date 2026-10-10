@@ -98,6 +98,8 @@ class Ctx:
         """Copy the hooks dir to <rt>/hooks so runtime_dir (= <rt>) is a tmp dir."""
         shutil.copytree(HOOK_DIR, self.rt / "hooks",
                         ignore=shutil.ignore_patterns("__pycache__"))
+        # #3663: the runtime module U4d's flag read now imports lazily, at the plugin root.
+        shutil.copy(HOOK_DIR.parent.parent / "engramd_owner_flags.py", self.rt / "engramd_owner_flags.py")
         self.hook = str(self.rt / "hooks" / self.hook_file)
 
     def paths(self):

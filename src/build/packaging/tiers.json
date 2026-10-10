@@ -205,6 +205,11 @@
       "tier": "essential"
     },
     {
+      "path": "engramd_owner_flags.py",
+      "tier": "essential",
+      "note": "engram-alpha#3663 (U5, part of #2652): the one definition of 'an engramd.*_via_owner flag is on' (flag_on per key, any_owner_flag_on by pattern). Read by U4d's hook and by start-engramd-owner.sh; stdlib only."
+    },
+    {
       "path": "engramd_read_registry.py",
       "tier": "essential",
       "note": "engram-alpha#3196 (U4c, part of #2652): the tier-1 read-template registry -- the owner admits a client read iff its exact SQL bytes equal a registered template (default-deny), classifies templates from the schema, and validates bound parameters. Imported by engramd_owner.py (essential), so same tier."
@@ -817,6 +822,18 @@
       "dest": "hooks/start-engram-daemon.sh"
     },
     {
+      "path": "hooks/claude/_engramd_owner_hook_io.py",
+      "tier": "essential",
+      "dest": "hooks/_engramd_owner_hook_io.py",
+      "note": "engram-alpha#3663 (round 8): the I/O helper of start-engramd-owner.sh -- the pidfile read, the log append and the detached owner launch go through _hooklib's non-blocking regular-file helpers (#3628) because bash cannot open a state file non-blockingly; reports go through emit_context. Tiered like the hook it serves; a sibling of _hooklib.py in the bundle."
+    },
+    {
+      "path": "hooks/claude/start-engramd-owner.sh",
+      "tier": "essential",
+      "dest": "hooks/start-engramd-owner.sh",
+      "note": "engram-alpha#3663 (U5, part of #2652): SessionStart fallback that starts the engramd owner when nothing supervises it, gated on the engramd.*_via_owner flags (all off = does nothing). Tiered like start-engram-daemon.sh; it reads engramd_owner_flags.py and launches engramd_owner.py, both essential."
+    },
+    {
       "path": "hooks/claude/clear-stale-engram-daemon.sh",
       "tier": "essential",
       "dest": "hooks/clear-stale-engram-daemon.sh"
@@ -1198,6 +1215,11 @@
     {
       "path": "templates/engram-surface-daemon.plist.template",
       "tier": "convenience"
+    },
+    {
+      "path": "templates/engramd-owner.service.template",
+      "tier": "convenience",
+      "note": "engram-alpha#3663 (U5, part of #2652): systemd --user unit for the engramd owner, rendered by tools/setup-surface-daemon-service.sh --owner (Linux only; the launchd plist is a later unit)."
     },
     {
       "path": "templates/engram-viz-user.service.template",

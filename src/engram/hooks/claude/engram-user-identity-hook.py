@@ -100,17 +100,95 @@ def get_person_nodes() -> list[dict]:
         return []
 
 
+def _import_owner_flags():
+    """Lazy import of the plugin-root module engramd_owner_flags (#3663), resolved
+    like _import_engramd_client: the shared resolver, never a fixed parents[N]. An
+    explicit ENGRAM_RUNTIME_DIR that does not hold the module (it exists to redirect
+    the CLIENT import) is retried once without the override, so redirecting the
+    client can never make a flag that is ON read as OFF. Raises ImportError."""
+    from _hooklib import resolve_runtime_dir
+
+    explicit = os.environ.pop("ENGRAM_RUNTIME_DIR", None)
+    try:
+        resolved = resolve_runtime_dir(ENGRAM_HOME, "engramd_owner_flags.py")
+    finally:
+        if explicit is not None:
+            os.environ["ENGRAM_RUNTIME_DIR"] = explicit
+    last = None
+    for runtime_dir in ([explicit] if explicit else []) + [resolved]:
+        if runtime_dir not in sys.path:
+            sys.path.insert(0, runtime_dir)
+        try:
+            import engramd_owner_flags
+            return engramd_owner_flags
+        except Exception as exc:  # a bad copy in one candidate must not hide a good one in the next
+            last = exc
+    if last is None or (isinstance(last, ModuleNotFoundError) and last.name == "engramd_owner_flags"):
+        raise ImportError("engramd_owner_flags.py not found under the runtime dir")
+    raise last  # the class of the LAST failure, so the visible report names it
+
+
+# Room reserved in the bounded render for the failure report line (136 chars at most: the
+# 55-char prefix + the 80-char class cap + the newline): see _assemble_response.
+_IMPORT_REPORT_RESERVE = 160
+
+# Set by _owner_reads_enabled() when engramd_owner_flags cannot be imported (class name only).
+_OWNER_FLAGS_IMPORT_ERROR = None
+
+
+def _owner_flags_import_report(obj):
+    """#3663 (in #3521's shape): a failed engramd_owner_flags import is VISIBLE.
+
+    One class-only stderr line plus the same line injected into the hook's single
+    additionalContext payload, on every run (no rate limit). The healthy path returns `obj`
+    untouched. Never raises: if anything here fails the hook falls back to today's silent
+    behaviour (flag OFF, `obj` as it was)."""
+    if _OWNER_FLAGS_IMPORT_ERROR is None:
+        return obj
+    try:
+        cls = "".join(ch if ch.isprintable() else "?" for ch in _OWNER_FLAGS_IMPORT_ERROR)[:80]
+        line = f"engram-user-identity-hook: engramd_owner_flags failed: {cls}"
+        try:
+            sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        inner = dict((obj or {}).get("hookSpecificOutput") or {})
+        existing = inner.get("additionalContext") or ""
+        return {"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": line + ("\n" + existing if existing else ""),
+        }}
+    except Exception:
+        return obj
+
+
+def _emit(obj) -> None:
+    print(json.dumps(_owner_flags_import_report(obj)))
+
+
 def _owner_reads_enabled() -> bool:
     """The U4d flag: `engramd.user_identity_reads_via_owner` in
-    $ENGRAM_HOME/config.json. ONE source, no env override. Anything but the
-    boolean `true` (absent file, absent key, a string, malformed JSON) is OFF,
-    which is the old path. After an upgrade, restart the owner BEFORE turning
-    this on (a running 1.0 owner answers a 1.1 client `unknown_operation`)."""
+    $ENGRAM_HOME/config.json (CONFIG_PATH). ONE source, no env override. Anything
+    but the boolean `true` (absent file, absent key, a string, malformed JSON) is
+    OFF, which is the old path. The rule lives in engramd_owner_flags.flag_on
+    (#3663: one definition shared with the owner launcher); the import is lazy and
+    a bundle whose module fails to import or whose `flag_on` fails (Exception AND
+    SystemExit, e.g. a helper that calls sys.exit) reads OFF, never raises -- the old
+    path -- and the failure is reported visibly (class name only). KeyboardInterrupt is
+    deliberately NOT caught: it keeps escaping the hook. After
+    an upgrade, restart the owner BEFORE turning this on (a running 1.0 owner
+    answers a 1.1 client `unknown_operation`)."""
+    global _OWNER_FLAGS_IMPORT_ERROR
     try:
-        with open_regular_text(CONFIG_PATH) as f:
-            config = json.load(f)
-        return config["engramd"]["user_identity_reads_via_owner"] is True
-    except (OSError, ValueError, KeyError, TypeError):
+        engramd_owner_flags = _import_owner_flags()
+        return engramd_owner_flags.flag_on("user_identity_reads_via_owner", CONFIG_PATH)
+    except (Exception, SystemExit) as exc:
+        # Flag state is unknown: read OFF (the direct path), and remember the CLASS only so
+        # main() reports it visibly (#3663, in #3521's shape). Never the message. SystemExit
+        # (a BaseException) is a failed helper too -- a helper that calls sys.exit must not
+        # silence the hook. KeyboardInterrupt is deliberately NOT caught.
+        _OWNER_FLAGS_IMPORT_ERROR = type(exc).__name__
         return False
 
 
@@ -321,10 +399,15 @@ def _assemble_response(head: str, body_blocks: list) -> dict:
 
     harness = detect_harness()
     budgets = get_harness_budgets(harness)
+    # When engramd_owner_flags failed (import or call), _emit() PREPENDS one report line (at most
+    # 136 chars: the class name is capped at 80) AFTER this render. Reserve room for it up
+    # front so the final payload never exceeds the hard per-harness budget, even through
+    # allow_single_overflow (which is bounded by `budget`, not `target`).
+    reserve = _IMPORT_REPORT_RESERVE if _OWNER_FLAGS_IMPORT_ERROR is not None else 0
     rendered = emit_context(
         head,
         body_blocks,
-        budget=budgets["budget"],
+        budget=budgets["budget"] - reserve,
         # Deliberate DEVIATION from engram-surface-hook.py's target=budget
         # choice (#2876): that hook's content is already what the agent
         # receives in full every prompt today, so its soft ceiling is the
@@ -338,7 +421,7 @@ def _assemble_response(head: str, body_blocks: list) -> dict:
         # helper"). Only a pathologically long Role/Profile value (no
         # length cap enforced at write time, see this function's own
         # docstring) would ever make this bind.
-        target=budgets["head_budget"],
+        target=min(budgets["head_budget"], budgets["budget"] - reserve),
         # The Role line is the more informative of the two body items;
         # letting it run past the soft head_budget (never past the hard
         # budget) beats hard-truncating a legitimately long free-text
@@ -368,12 +451,12 @@ def main():
     if _owner_reads_enabled():
         people, failure = read_people_via_owner()
         if failure is not None:
-            print(json.dumps(failure))
+            _emit(failure)
             sys.exit(0)
     else:
         people = get_person_nodes()
     if not people:
-        print(json.dumps({}))
+        _emit({})
         sys.exit(0)
 
     speaker = detect_speaker(prompt, people)
@@ -392,7 +475,7 @@ def main():
             f"  Role: {speaker['role']}",
             f"  Profile: {speaker['description']}",
         ]
-        print(json.dumps(_assemble_response(head, body)))
+        _emit(_assemble_response(head, body))
     else:
         # No prefix — use sticky session context if available
         if os.path.exists(CURRENT_USER_PATH):
@@ -414,13 +497,13 @@ def main():
                         f"  Role: {sticky.get('role', '')}",
                         f"  Profile: {sticky.get('description', '')}",
                     ]
-                    print(json.dumps(_assemble_response(head, body)))
+                    _emit(_assemble_response(head, body))
                 else:
-                    print(json.dumps({}))
+                    _emit({})
             except (json.JSONDecodeError, OSError):
-                print(json.dumps({}))
+                _emit({})
         else:
-            print(json.dumps({}))
+            _emit({})
 
 
 if __name__ == "__main__":

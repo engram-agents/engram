@@ -640,6 +640,8 @@ def test_s2_flattened_deployed_layout_resolves_engramd_client_and_reads_through_
     shutil.copy(src_hooks / "_hooklib.py", root / "hooks" / "_hooklib.py")
     shutil.copy(src_hooks / "_harness.py", root / "hooks" / "_harness.py")
     shutil.copy(Path(_SRC_ENGRAM) / "engramd_client.py", root / "engramd_client.py")
+    # #3663: the runtime module the hook's flag read now imports lazily, at the plugin root.
+    shutil.copy(Path(_SRC_ENGRAM) / "engramd_owner_flags.py", root / "engramd_owner_flags.py")
     env = {k: v for k, v in os.environ.items()
            if k not in ("CLAUDE_PLUGIN_ROOT", "ENGRAM_RUNTIME_DIR", "PYTHONPATH")}
     env["ENGRAM_HOME"] = str(home)

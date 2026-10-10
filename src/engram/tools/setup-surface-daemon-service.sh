@@ -8,6 +8,16 @@
 #
 # Usage:
 #   tools/setup-surface-daemon-service.sh
+#   tools/setup-surface-daemon-service.sh --owner     # the engramd OWNER, Linux only (#3663)
+#
+# --owner installs the engramd owner (engramd_owner.py) instead, as the systemd USER
+# unit engramd-owner-<id>.service rendered from engramd-owner.service.template, where
+# <id> is the first 8 hex chars of sha256 over the NORMALIZED (absolute, physical,
+# no trailing slash) ENGRAM_HOME -- one unit per ENGRAM_HOME, not per user. Linux only:
+# on macOS it exits non-zero and writes/calls nothing (the owner refuses to start
+# there until the Darwin permission arm lands, #3194). The ephemeral-path refusal below
+# applies to engramd_owner.py's physical path in this mode. Without --owner the
+# behaviour is exactly what it always was.
 #
 # The script detects the OS via `uname -s`:
 #   Linux  → renders engram-surface-daemon.service.template and installs it as a
@@ -48,13 +58,28 @@ set -euo pipefail
 # always was.
 # ---------------------------------------------------------------------------
 ALLOW_PATH=0
+OWNER_MODE=0
 for _arg in "$@"; do
     if [[ "$_arg" == "--allow-path" ]]; then
         ALLOW_PATH=1
+    elif [[ "$_arg" == "--owner" ]]; then
+        OWNER_MODE=1
     fi
 done
 if [[ "${ENGRAM_SETUP_ALLOW_PATH:-}" == "1" ]]; then
     ALLOW_PATH=1
+fi
+
+# --owner is Linux only (#3663): refuse on anything else BEFORE touching anything.
+if [[ "$OWNER_MODE" == "1" ]]; then
+    _owner_os="$(uname -s)"
+    if [[ "$_owner_os" == "Darwin" ]]; then
+        echo "ERROR: --owner is not supported on macOS yet: the engramd owner refuses to start there (permission layer, #3194); the launchd unit is a later unit. Nothing was written or loaded." >&2
+        exit 1
+    elif [[ "$_owner_os" != "Linux" ]]; then
+        echo "ERROR: --owner supports Linux (systemd --user) only; this is $_owner_os. Nothing was written." >&2
+        exit 1
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -83,7 +108,9 @@ TEMPLATE_DIR="$PLUGIN_ROOT/templates"
 #   3. $PLUGIN_ROOT/hooks/claude/engram-surface-daemon.py exists → source-tree layout
 #   4. Neither found → fail loud (surface at setup-time, not as a silent broken service)
 # ---------------------------------------------------------------------------
-if [[ -n "${ENGRAM_HOOKS_DIR:-}" ]]; then
+if [[ "$OWNER_MODE" == "1" ]]; then
+    HOOKS_DIR=""   # --owner needs no hooks dir; engramd_owner.py sits at $PLUGIN_ROOT
+elif [[ -n "${ENGRAM_HOOKS_DIR:-}" ]]; then
     HOOKS_DIR="$ENGRAM_HOOKS_DIR"
 elif [[ -f "$PLUGIN_ROOT/hooks/engram-surface-daemon.py" ]]; then
     HOOKS_DIR="$PLUGIN_ROOT/hooks"
@@ -118,6 +145,11 @@ fi
 # Validate the daemon script exists
 # ---------------------------------------------------------------------------
 DAEMON_PY="$HOOKS_DIR/engram-surface-daemon.py"
+if [[ "$OWNER_MODE" == "1" ]]; then
+    # In --owner mode the "daemon script" every check below guards IS the owner.
+    # engramd_owner.py sits flat at the plugin root in the bundle AND in src/engram/.
+    DAEMON_PY="$PLUGIN_ROOT/engramd_owner.py"
+fi
 if [[ ! -f "$DAEMON_PY" ]]; then
     echo "ERROR: daemon script not found: $DAEMON_PY" >&2
     echo "       Run this script from within an engram-alpha repo clone or a" >&2
@@ -202,10 +234,83 @@ fi
 # ---------------------------------------------------------------------------
 OS="$(uname -s)"
 
-echo "=== ENGRAM surface daemon service setup ==="
+# --owner: refuse values the unit render cannot carry (I1). The unit is rendered with sed
+# (`&` expands to the match, `\` is eaten, `|` aborts the s||| and leaves a truncated
+# file) and then read by systemd (whitespace splits Environment=/ExecStart, `%` and `$`
+# expand, quotes are interpreted). A wrong-home unit named for home X is silent wrong
+# supervision, so refuse BEFORE the destination is opened or any directory is created.
+_owner_bad_char() {
+    case "$1" in
+        *' '*) printf 'space' ;;
+        *$'\t'*) printf 'tab' ;;
+        *$'\n'*) printf 'newline' ;;
+        *$'\r'*) printf 'carriage-return' ;;
+        *'&'*) printf 'ampersand' ;;
+        *'\'*) printf 'backslash' ;;
+        *'|'*) printf 'pipe' ;;
+        *'%'*) printf 'percent' ;;
+        *'"'*) printf 'double-quote' ;;
+        *"'"*) printf 'single-quote' ;;
+        *'$'*) printf 'dollar' ;;
+        # sed substitutes the python and owner paths BEFORE ENGRAM_HOME, so a literal
+        # {{ENGRAM_HOME}}/{{PYTHON}} inside them would be re-substituted: refuse {{ and }}
+        # in every value (one uniform rule).
+        *'{{'*) printf 'open-brace-pair' ;;
+        *'}}'*) printf 'close-brace-pair' ;;
+        *) return 1 ;;
+    esac
+}
+_owner_refuse_if_bad() {
+    # $1 = what the value is, $2 = the value
+    local _name _art="a"
+    if _name="$(_owner_bad_char "$2")"; then
+        case "$_name" in a*|e*|i*|o*|u*) _art="an" ;; esac
+        echo "ERROR: unsupported in --owner mode: $1 contains $_art $_name character ($(printf '%q' "$2")); the unit would be rendered or read wrongly. No unit was written or loaded." >&2
+        exit 2
+    fi
+}
+if [[ "$OWNER_MODE" == "1" ]]; then
+    case "$ENGRAM_HOME" in
+        "~") _owner_home_raw="$HOME" ;;
+        "~/"*) _owner_home_raw="$HOME/${ENGRAM_HOME#"~/"}" ;;
+        *) _owner_home_raw="$ENGRAM_HOME" ;;
+    esac
+    _owner_refuse_if_bad "ENGRAM_HOME" "$_owner_home_raw"
+    _owner_refuse_if_bad "the python path" "$PYTHON_BIN"
+    _owner_refuse_if_bad "the owner script path" "$DAEMON_PY"
+fi
+
+if [[ "$OWNER_MODE" == "1" ]]; then
+    # Normalize ENGRAM_HOME (after the refusals above, so a refusal creates nothing):
+    # ~ expanded, created, made absolute and physical, no trailing slash. The unit name
+    # is keyed on this string, so every spelling of one home must give the same one.
+    case "$ENGRAM_HOME" in
+        "~") ENGRAM_HOME="$HOME" ;;
+        "~/"*) ENGRAM_HOME="$HOME/${ENGRAM_HOME#"~/"}" ;;
+    esac
+    mkdir -p "$ENGRAM_HOME"
+    ENGRAM_HOME="$(cd "$ENGRAM_HOME" && pwd -P)"
+    _owner_refuse_if_bad "ENGRAM_HOME (physical path)" "$ENGRAM_HOME"
+    while [[ "$ENGRAM_HOME" != "/" && "$ENGRAM_HOME" == */ ]]; do ENGRAM_HOME="${ENGRAM_HOME%/}"; done
+    if command -v sha256sum &>/dev/null; then
+        _home_id="$(printf '%s' "$ENGRAM_HOME" | sha256sum | cut -c1-8)"
+    elif command -v shasum &>/dev/null; then
+        _home_id="$(printf '%s' "$ENGRAM_HOME" | shasum -a 256 | cut -c1-8)"
+    else
+        echo "ERROR: neither sha256sum nor shasum found; cannot key the unit name on ENGRAM_HOME." >&2
+        exit 1
+    fi
+    echo "=== ENGRAM owner service setup ==="
+else
+    echo "=== ENGRAM surface daemon service setup ==="
+fi
 echo "  OS:            $OS"
 echo "  python:        $PYTHON_BIN"
-echo "  hooks dir:     $HOOKS_DIR"
+if [[ "$OWNER_MODE" == "1" ]]; then
+    echo "  owner script:  $DAEMON_PY"
+else
+    echo "  hooks dir:     $HOOKS_DIR"
+fi
 echo "  ENGRAM_HOME:   $ENGRAM_HOME"
 echo
 
@@ -222,20 +327,33 @@ if [[ "$OS" == "Linux" ]]; then
     fi
 
     SERVICE_TEMPLATE="$TEMPLATE_DIR/engram-surface-daemon.service.template"
+    SERVICE_NAME="engram-surface-daemon.service"
+    SERVICE_LOG_NAME="surface-daemon.log"
+    if [[ "$OWNER_MODE" == "1" ]]; then
+        SERVICE_TEMPLATE="$TEMPLATE_DIR/engramd-owner.service.template"
+        SERVICE_NAME="engramd-owner-$_home_id.service"
+        SERVICE_LOG_NAME="engramd-owner.log"
+    fi
     if [[ ! -f "$SERVICE_TEMPLATE" ]]; then
         echo "ERROR: service template not found: $SERVICE_TEMPLATE" >&2
         exit 1
     fi
 
-    SERVICE_NAME="engram-surface-daemon.service"
     SERVICE_DEST="$HOME/.config/systemd/user/$SERVICE_NAME"
     mkdir -p "$(dirname "$SERVICE_DEST")"
 
     echo "Step 1: Rendering systemd unit → $SERVICE_DEST"
-    sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
-        -e "s|{{ENGRAM_HOOKS_DIR}}|$HOOKS_DIR|g" \
-        -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
-        "$SERVICE_TEMPLATE" > "$SERVICE_DEST"
+    if [[ "$OWNER_MODE" == "1" ]]; then
+        sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
+            -e "s|{{ENGRAM_OWNER_PY}}|$DAEMON_PY|g" \
+            -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
+            "$SERVICE_TEMPLATE" > "$SERVICE_DEST"
+    else
+        sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
+            -e "s|{{ENGRAM_HOOKS_DIR}}|$HOOKS_DIR|g" \
+            -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
+            "$SERVICE_TEMPLATE" > "$SERVICE_DEST"
+    fi
     echo "  done."
 
     echo
@@ -248,7 +366,7 @@ if [[ "$OS" == "Linux" ]]; then
     echo "=== Setup complete ==="
     echo "  Check status:  systemctl --user status $SERVICE_NAME"
     echo "  Follow logs:   journalctl --user -u $SERVICE_NAME -f"
-    echo "  Logs file:     $ENGRAM_HOME/surface-daemon.log"
+    echo "  Logs file:     $ENGRAM_HOME/$SERVICE_LOG_NAME"
     echo
     echo "  Note: For service persistence across user logout, run:"
     echo "        sudo loginctl enable-linger $USER"
