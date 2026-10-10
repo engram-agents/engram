@@ -1197,8 +1197,12 @@ same-build BY CONSTRUCTION**: it compares a hook's owner round-trip against *tha
 same hook's* direct-connect path, on one host, so the build cancels in the delta
 and does not cancel in a level. That is the strongest argument yet for a delta
 rather than a pinned number, and it was produced by the measurement failing rather
-than by the design being defended. **Operationally the 3.53.0 arm is the one A6
-ranges over**, because hooks run under the venv python — a scoping fact, not luck.
+than by the design being defended. **Operationally A6 ranges over the build of each
+seat's plugin venv**, because hooks run under the venv python — a scoping fact, not
+luck. *(Corrected 2026-10-10: this sentence used to name 3.53.0 as "the" operative
+arm. That was true of the author's seat only. Each seat's plugin venv carries its own
+build, and the fleet runs at least two in production: 3.53.0 and 3.45.1, measured on
+#3675. See "A6 instrument axes" below.)*
 
 **Why that is an argument for this design and not merely a number.** The
 per-connection cost the owner amortises is the one paid at **SCHEMA LOAD** — not
@@ -1212,6 +1216,27 @@ schema the thing to watch. So the epic's stated worry (*"today's per-tool-call
 connection is ~ms; the socket must not be slower"*) points, on this evidence, the
 other way. **What none of it bounds:** the owner's own dispatch, which is the
 whole content of the acceptance condition above.
+
+#### A6 instrument axes (added 2026-10-10; the criterion above is unchanged)
+
+**This is an instrument note, not a criterion change.** The gate stays the one sentence
+stated once above. What this adds is the list of coordinates an A6 *measurement* must name,
+because on one hook (U6a's stop hook, #3675 and #3678) they moved the result while the
+criterion's text held still. **Two of them, build and store, flipped the gate's outcome.
+The third, layout, moved the ratio without flipping it.** An A6 number reported without
+all three, plus the hook and the host and run it came from, is incomplete.
+
+| axis | what it moved, on the stop hook | where measured |
+|---|---|---|
+| **build** (the venv the hooks run under: its SQLite library AND its Python; the two measured cells differ in both, 3.53.0 + Python 3.14.4 vs 3.45.1 + Python 3.12.3) | **Flipped the gate.** Same store (an 11k-node real-graph copy), same host, source layout: owner/direct p50 **0.80×** under the 3.53.0 plugin venv, **1.26×** under a 3.45.1 venv (the repo's `.venv`, not a plugin venv; the same build the 3.45.1 seats' plugin venvs carry). | #3675 (Borges) |
+| **store** (synthetic vs a copy of a real graph; never the live file) | **Flipped the gate under 3.53.0 only.** Owner/direct p50, 5k synthetic → the 11k real copy: **1.46× → 0.80×** under 3.53.0; **1.46× → 1.26×** under 3.45.1, which stays above 1. Direct p50 behind those ratios: 3.53.0, 0.31 → 0.66 ms; 3.45.1, 0.32 → 0.42 ms. A 4.6k-node copy on another seat under 3.45.1: direct 0.31 → 0.33 ms, owner/direct 1.30×. **Bound:** two hosts and three stores cannot separate store size from host (Kepler's statement of the bound on #3675). The real copies differ from the synthetic store in data volume, and their schema-object counts (58 and 57) are recorded while the synthetic store's is not, so these cells cannot separate schema from data. They do not reopen this section's "schema, not data" conclusion, which rests on `SELECT 1`. | #3675 (Borges, Kepler) |
+| **layout** (installed plugin vs source checkout) | **Moved the ratio, did not flip it.** On the source checkout the owner path re-resolves its runtime dir through a parent walk on every call (~0.06 ms), which the installed flat layout never pays (~0.003 ms). Same run: owner/direct **1.43× source → 1.17× installed** (gap 0.130 → 0.049 ms). **Bound:** one host, 3.45.1, the 5k synthetic store. **The installed layout is the gate cell; source-layout numbers are dev-time only.** This is the "build restructures code paths" hazard from the project CLAUDE.md, landing in a measurement instead of a correctness path. | #3678 (Ariadne) |
+
+**Two notes on the existing text above, so it is not read against these rows.**
+- *"Same-build BY CONSTRUCTION"* still holds: each cell compares owner and direct under one build. It means **each build gets its own verdict**, not that the verdicts agree. Measured here, they do not.
+- **Host and hook are named, not shown to move the stop-hook result.** On the source layout, the stop-hook owner p50 sat at ~0.43–0.53 ms on every host and build measured (installed layout, one run: 0.346 ms, the layout row's cell). The ~0.67 ms figure on #3678 is a *different hook* (user-identity). So compare within one host, one run and one hook. That is a precaution on unmeasured axes, not a finding.
+
+**Consequence for any A6 table on #2652 measured on the source layout,** which is all of them until #3678's installed-layout mode lands: it overstates the owner's per-call cost by the parent walk. The relative findings it supports (build flips the gate; the owner's floor is the cost to cut) stand. Its ratios are not production's.
 
 ### 6.2 The phase-2 recall gate, as settled on #406
 
