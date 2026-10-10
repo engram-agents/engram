@@ -1650,12 +1650,26 @@ def test_k14_a_missing_io_helper_is_quiet_on_stdout_loud_on_stderr_and_launches_
 
 # ---- K15: every report is bounded and trailer-first, whatever the home's length -----------------------------------
 
-def _long_home(tmp_path: Path) -> Path:
+def _long_home_path(tmp_path: Path) -> Path:
+    """The 2,400+ char home as a PATH only -- nothing is created on disk."""
     home = tmp_path
     for i in range(12):
         home = home / (chr(ord("a") + i) * 200)
-    home.mkdir(parents=True)
     assert len(str(home)) >= 2400
+    return home
+
+
+def _long_home(tmp_path: Path) -> Path:
+    """Create the long home; where the platform's PATH_MAX forbids it (macOS: 1,024), skip -- and only for
+    that errno: any other OSError still fails the cell."""
+    import errno
+    home = _long_home_path(tmp_path)
+    try:
+        home.mkdir(parents=True)
+    except OSError as e:
+        if e.errno != errno.ENAMETOOLONG:
+            raise
+        pytest.skip("a 2,400+ char home cannot exist here (PATH_MAX); the helper-level cell covers the bound")
     return home
 
 
@@ -1680,6 +1694,82 @@ def test_k15_a_report_for_a_very_long_home_is_bounded_trailer_first_json_and_kee
     assert lead in ctx, ctx[:300]
     logged = (home / "engramd-owner.log").read_text()
     assert _physical(home) in logged, "the full home must remain in the log line"
+
+
+def _path_exists(p) -> bool:
+    """Existence check that is safe on an over-long path: os.path.exists maps ENAMETOOLONG to False, whereas
+    pathlib's Path.exists raises it on Python <= 3.12 (3.13+ no longer does)."""
+    return os.path.exists(str(p))
+
+
+def test_k15_path_exists_is_safe_on_a_path_longer_than_any_platform_limit():
+    """The trap behind the helper cell's check: a path > Linux's PATH_MAX (4,096) gives ENAMETOOLONG on every
+    platform, as a 2,400-char one does on macOS (PATH_MAX 1,024)."""
+    import errno
+    p = Path("/" + "a" * 5000)
+    assert _path_exists(p) is False
+    try:
+        p.exists()
+    except OSError as e:  # Python <= 3.12 only; recorded, never required (3.13+ returns False)
+        assert e.errno == errno.ENAMETOOLONG
+
+
+_HELPER_LEADS = [
+    ("UNSUPERVISED", "UNSUPERVISED: engramd_owner launched (pid 1); no supervisor reachable (systemd: x). "),
+    ("could not be started", "ENGRAM owner could not be started: the launch failed. "),
+    ("not launched", "ENGRAM owner not launched (systemd state is ambiguous: x). "),
+]
+
+
+@pytest.mark.parametrize("platform", [None, "claude-code"], ids=["floor-4000", "claude-code-9500"])
+@pytest.mark.parametrize("lead,prefix", _HELPER_LEADS, ids=["launch", "fail", "ambiguous"])
+def test_k15_helper_report_for_a_nonexistent_very_long_home_is_bounded_and_creates_nothing(
+        tmp_path, lead, prefix, platform):
+    """K2: the same bound as the K15 hook cells, with no real long path -- so a Mac still checks it."""
+    seat = Seat(tmp_path)
+    if platform:
+        (seat.plugin / "platform.json").write_text(json.dumps({"platform": platform}))
+    home = _long_home_path(tmp_path)
+    message = f"{prefix}ENGRAM_HOME={home}"
+    helper = seat.plugin / "hooks" / "_engramd_owner_hook_io.py"
+    r = subprocess.run([sys.executable, str(helper), "report", str(home), message], capture_output=True,
+                       text=True, timeout=20, cwd=str(tmp_path),
+                       env={"HOME": str(seat.home), "ENGRAM_HOME": str(seat.eh), "PATH": os.environ.get("PATH", "")})
+    assert r.returncode == 0, r.stderr[-300:]
+    ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert len(ctx) <= 1000, len(ctx)
+    assert ctx.splitlines()[0].startswith("\u25b8 "), ctx[:80]
+    assert lead in ctx, ctx[:300]
+    assert not _path_exists(home) and not (tmp_path / ("a" * 200)).exists(), "the report created the home on disk"
+
+
+def test_k15_long_home_skips_when_the_platform_path_limit_is_hit(tmp_path, monkeypatch):
+    """K3a: ENAMETOOLONG from creating the home turns the K15 cells into a skip, not a failure."""
+    import errno
+
+    def boom(self, *a, **k):
+        raise OSError(errno.ENAMETOOLONG, "File name too long")
+    monkeypatch.setattr(Path, "mkdir", boom)
+    with pytest.raises(pytest.skip.Exception) as ei:
+        _long_home(tmp_path)
+    assert "PATH_MAX" in str(ei.value)
+
+
+def test_k15_long_home_does_not_swallow_any_other_oserror(tmp_path, monkeypatch):
+    """K3b: only ENAMETOOLONG skips; EACCES still fails the cell."""
+    import errno
+
+    def boom(self, *a, **k):
+        raise OSError(errno.EACCES, "Permission denied")
+    monkeypatch.setattr(Path, "mkdir", boom)
+    try:
+        _long_home(tmp_path)
+    except pytest.skip.Exception:  # a Skipped is not an OSError: it would pass through pytest.raises as a skip
+        pytest.fail("EACCES must fail the cell, not skip it")
+    except OSError as e:
+        assert e.errno == errno.EACCES
+    else:
+        pytest.fail("EACCES was swallowed")
 
 
 # ---- bookkeeping: the new helper is tiered like start-engramd-owner.sh -------------------------------------------------
