@@ -52,6 +52,8 @@
   "hooks/claude/_hooklib.py:shown_record_path",
   "hooks/claude/_hooklib.py:_shown_record_ids",
   "hooks/claude/_hooklib.py:append_shown_record",
+  "hooks/claude/_hooklib.py:_shown_record_candidate_session",
+  "hooks/claude/_hooklib.py:prune_shown_records",
   "hooks/claude/_hooklib.py:in_context_exclusion_enabled",
   "hooks/claude/_hooklib.py:build_exclusion_resolver",
   "hooks/claude/_hooklib.py:in_context_drop_ids",

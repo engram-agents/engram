@@ -1306,9 +1306,17 @@ def _earlier_shown_ids(routes_dir: Path, compaction_count=None) -> tuple:
 # older context windows' lines. The write is fail-open: any error is silent
 # apart from at most one stderr line, and never changes a hook's output. It is
 # written whatever the exclusion kill switch says.
+#
+# Retention (#3622): `prune_shown_records` (called once per SessionStart) deletes
+# records whose mtime is older than SHOWN_RECORD_RETENTION_DAYS; an append
+# refreshes mtime, so a session written to within that window is never pruned.
+# No-follow: the append opens with O_NOFOLLOW, and the prune lstat()s -- a symlink
+# at a record path is neither written through nor unlinked-as-a-file.
 
 SHOWN_RECORD_MAX_IDS = 64
 SHOWN_RECORD_MAX_BYTES = 262144
+SHOWN_RECORD_RETENTION_DAYS = 14
+SHOWN_RECORD_PRUNE_MAX_ENTRIES = 5000
 
 
 def _safe_session_name(session_id):
@@ -1432,7 +1440,9 @@ def append_shown_record(route: str, session_id, ids) -> None:
                 os.close(tfd)
             os.replace(tmp, path)
         # O_NONBLOCK: a write-open of a FIFO blocks until a reader appears.
-        wfd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK, 0o600)
+        # O_NOFOLLOW: a symlink planted at the record path is refused (ELOOP), never written through.
+        wfd = os.open(
+            path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600)
         try:
             if not stat.S_ISREG(os.fstat(wfd).st_mode):
                 return
@@ -1445,6 +1455,71 @@ def append_shown_record(route: str, session_id, ids) -> None:
             print(msg[:300], file=sys.stderr)
         except Exception:
             pass
+
+
+def _shown_record_candidate_session(name):
+    """The session name when `name` is a shown-record candidate (`<sid>.shown.jsonl`
+    or a stale trim leftover `<sid>.shown.jsonl.<digits>.tmp`), else None."""
+    suffix = ".shown.jsonl"
+    sid = None
+    if name.endswith(suffix):
+        sid = name[: -len(suffix)]
+    elif name.endswith(".tmp"):
+        head, sep, pid = name[: -len(".tmp")].rpartition(suffix + ".")
+        if sep and pid.isascii() and pid.isdigit():
+            sid = head
+    # An empty session name is never ours: append cannot create one.
+    return sid or None
+
+
+def prune_shown_records(
+    keep_session_id=None, max_age_days=SHOWN_RECORD_RETENTION_DAYS, now=None
+) -> int:
+    """Delete shown records (and stale trim tmp leftovers) older than
+    `max_age_days` from `<ENGRAM_HOME>/sessions/`; return how many were deleted.
+
+    Only direct entries named `<sid>.shown.jsonl` / `<sid>.shown.jsonl.<digits>.tmp`
+    are candidates. A candidate goes only if it is a regular file by `lstat` (a
+    symlink, directory, FIFO or socket is never followed or unlinked), its mtime is
+    strictly older than the cutoff (a future mtime stays), and its session is not
+    `keep_session_id`. A `max_age_days <= 0` deletes every non-keep record, fresh
+    ones included (the only caller uses the default). Scans at most SHOWN_RECORD_PRUNE_MAX_ENTRIES entries. Never
+    raises; at most one stderr line."""
+    deleted = 0
+    first_err = None
+    try:
+        home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+        sessions = Path(home) / "sessions"
+        cutoff = (_time.time() if now is None else now) - max_age_days * 86400
+        with os.scandir(sessions) as it:
+            for scanned, entry in enumerate(it):
+                if scanned >= SHOWN_RECORD_PRUNE_MAX_ENTRIES:
+                    break
+                try:
+                    sid = _shown_record_candidate_session(entry.name)
+                    if sid is None or (keep_session_id is not None and sid == keep_session_id):
+                        continue
+                    st = os.lstat(entry.path)
+                    if not stat.S_ISREG(st.st_mode) or not st.st_mtime < cutoff:
+                        continue
+                    os.unlink(entry.path)
+                    deleted += 1
+                except FileNotFoundError:
+                    continue  # raced with a concurrent unlink: not ours to count
+                except Exception as exc:
+                    if first_err is None:
+                        first_err = exc
+    except Exception as exc:
+        if first_err is None:
+            first_err = exc
+    if first_err is not None:
+        try:
+            msg = f"shown-record prune: {type(first_err).__name__}: {first_err}"
+            msg = "".join(c if c.isprintable() else " " for c in msg)
+            print(msg[:300], file=sys.stderr)
+        except Exception:
+            pass
+    return deleted
 
 
 def _focused_ids() -> tuple:

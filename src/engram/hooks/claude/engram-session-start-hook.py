@@ -74,6 +74,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
 from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context, _trim_to_line_boundary
 from _hooklib import _open_regular_fd
+from _hooklib import prune_shown_records
 # #3591: every other open() in this hook is non-blocking and regular-file-only.
 from _hooklib import open_regular_text, open_regular_text_write, read_regular_text
 # #3628: every mode=ro sqlite connect refuses a FIFO / directory (raising a
@@ -2584,6 +2585,11 @@ def write_marker(hook_input: dict) -> dict | None:
             prune_stale_session_markers(session_id)
         except Exception as exc:
             print(f"[engram-session-start] prune: unexpected error, skipped: {exc}", file=sys.stderr)
+        # Shown-record retention (#3622): same best-effort posture as above.
+        try:
+            prune_shown_records(keep_session_id=session_id)
+        except Exception as exc:
+            print(f"[engram-session-start] shown-record prune: unexpected error, skipped: {exc}", file=sys.stderr)
         atomic_write_json(session_marker_path, marker)
     except OSError:
         return None
