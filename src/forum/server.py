@@ -1501,6 +1501,79 @@ def _bound_repo(gate, pid: str, login_map_cfg: Optional[dict]) -> Optional[str]:
     return (getattr(login_map, "repos", None) or {}).get(m.group("prefix").upper())
 
 
+def _pr_exists_refusal(gate, route: str, project_id: str, github: str, participants,
+                       colleague: Optional[str], login_map_cfg: Optional[dict]) -> Optional[str]:
+    """#3638: refusal text when a new PR baton's PR does not exist on GitHub, is
+    unreadable, or was written by someone who is not on the baton; else None.
+
+    ``github`` is the STORED, repo-qualified ``pr/<owner>/<repo>/<N>`` anchor (the
+    unqualifiable cases were refused before this runs). FAIL CLOSED: a refused
+    init costs a retry; an accepted wrong one squats its id permanently, because
+    the anchor-must-match-N rule leaves nothing that can repair it (#3638).
+    The author check is best-effort: a login the map does not know, or no map
+    configured, leaves existence as the only check. A configured map that fails
+    to load is a refusal.
+    """
+    parsed = gate._parse_github_anchor(github)
+    if parsed is None or parsed[0] != "pr" or parsed[1] is None:
+        return None  # not a repo-qualified PR anchor: nothing to look up
+    _kind, repo, number = parsed
+    cfg = login_map_cfg or {}
+    if _github_off(cfg):
+        logger.warning(
+            "init gate: GitHub integration is off -- not checking that %s#%s exists "
+            "or belongs to the participants of %s", repo, number, project_id)
+        return None
+    # A map that is CONFIGURED must load: an unreadable / untrusted one refuses
+    # (as _advance_gate does on the same error) rather than silently turning the
+    # author check off. Loaded once, BEFORE the GitHub read, so a broken map costs
+    # no spawn. No map configured: existence is the only check.
+    login_map = None
+    if cfg.get("path"):
+        try:
+            login_map = gate._load_login_map(
+                cfg.get("path"),
+                extra_trusted_uids=cfg.get("admin_uids") or (),
+                trust_anchor=cfg.get("trust_anchor") or "/",
+            )
+        except gate.LoginMapError as e:
+            return f"{route} {project_id}: {e}"
+    state, detail = gate._pr_identity(number, repo)
+    if state == "absent":
+        return (f"{route} {project_id}: PR {repo}#{number} does not exist on GitHub, so no "
+                f"baton can be anchored to it. Check the number (a typo here would squat "
+                f"the id of a PR that may be opened later) and re-run init.")
+    if state != "exists":
+        return (f"{route} {project_id}: could not read PR {repo}#{number} from GitHub "
+                f"({detail}); nothing was created. Retry in a moment.")
+    # The reader already lower-cases; the reverse lookup is case-insensitive here too.
+    login = detail.strip().lower() if isinstance(detail, str) else ""
+    if not login or login_map is None:
+        return None
+    owners = sorted(a for a, logins in login_map.items() if login in logins)
+    if not owners:
+        return None
+    present = {(p or "").strip().lower() for p in participants}
+    if colleague:
+        present.add(colleague.strip().lower())
+    if present.intersection(owners):
+        return None
+    return (f"{route} {project_id}: PR {repo}#{number} was opened by GitHub user {login!r} "
+            f"({', '.join(owners)}), who is not on this baton's participants. The PR belongs "
+            f"to someone not on the baton -- check the number.")
+
+
+def _id_exists(store, project_id: str) -> bool:
+    """True when ``project_id`` is already taken (exact or case variant, #3432) --
+    the SAME test ``_init`` refuses on, reused rather than re-implemented."""
+    from forum.coordination.projects import ProjectAlreadyExists, _refuse_existing_id
+    try:
+        _refuse_existing_id(store, project_id)
+    except ProjectAlreadyExists:
+        return True
+    return False
+
+
 _PR_ISH_ID_RE = re.compile(r"(?i)^(?:[A-Z][A-Z0-9]*-)?PR-")
 # #3568: mirrors baton_gate._GITHUB_ANCHOR_RE (incl. the project/<owner>/<N> form); pinned
 # equal to the gate's parser by a parity test.
@@ -3662,6 +3735,16 @@ def create_app(
                 g_norm, _login_map_cfg(app))
             if bind_msg is not None:
                 return jsonify({"error": f"{route} {project_id}: {bind_msg}"}), 422
+
+        # #3638: a PR baton must name a PR that exists and is the participants'. Runs
+        # AFTER every local refusal above and BEFORE anything is written.
+        # An id that already exists gets _init's own refusal below with no GitHub read
+        # (a refused re-init must not cost a spawn, nor turn into a "retry" 422).
+        if gate is not None and gate._is_pr_shaped(project_id, g_norm) and not _id_exists(store, project_id):
+            pr_msg = _pr_exists_refusal(
+                gate, route, project_id, github, participants, colleague, _login_map_cfg(app))
+            if pr_msg is not None:
+                return jsonify({"error": pr_msg}), 422
 
         try:
             seq = _init(

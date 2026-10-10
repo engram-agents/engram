@@ -987,6 +987,38 @@ def _rest_pull_head(repo: str, pr_str: str) -> tuple:
     return body, None
 
 
+_PR_NOT_FOUND_TEXT = "could not resolve to a pullrequest"
+
+
+def _pr_identity(pr_number: str, repo: str) -> tuple:
+    """Does PR ``<repo>#<pr_number>`` exist, and who wrote it?  Never raises.
+
+    ``("exists", author_login_lower)`` | ``("absent", reason)`` |
+    ``("unknown", reason)``.  Reads `gh pr view <N> --json number,author --repo
+    <repo>` through `_gh_read_json` (the one spawn point: service identity,
+    scrubbed stderr).  ``absent`` is ONLY GitHub's not-found answer; every other
+    failure (timeout, gh missing, auth, identity refusal, unparseable JSON, a
+    missing or ill-typed author) is ``unknown`` -- a caller that must not guess
+    (baton init, #3638) treats it as unreadable, never as absent or present.
+    The repo slug and the number are validated before any spawn.
+    """
+    if not _repo_slug_is_valid(repo):
+        return ("unknown", "repo is not a plain owner/name slug")
+    if not (isinstance(pr_number, str) and _ascii_digits(pr_number)):
+        return ("unknown", "PR number is not ASCII digits")
+    body, why = _gh_read_json(
+        ["pr", "view", pr_number, "--json", "number,author", "--repo", repo])
+    if why is not None:
+        if _PR_NOT_FOUND_TEXT in why.lower():
+            return ("absent", why)
+        return ("unknown", why)
+    author = body.get("author") if isinstance(body, dict) else None
+    login = author.get("login") if isinstance(author, dict) else None
+    if not (isinstance(login, str) and login.strip()):
+        return ("unknown", "pr view has no author login")
+    return ("exists", login.strip().lower())
+
+
 def _rest_review_rows(repo: str, pr_str: str) -> tuple:
     """Walk `pulls/<N>/reviews` by explicit page: ``(rows, None)`` or
     ``(None, (state, reason))`` with state ``unknown`` or ``incomplete``."""
