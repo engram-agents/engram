@@ -948,6 +948,44 @@ def read_regular_text(path, encoding=None):
         return f.read()
 
 
+def read_state_json_classified(path):
+    """Read a JSON-object state file and CLASSIFY the outcome (#3521 row 40).
+
+    Returns `(state, unknown_reason, movable)`; never raises:
+
+      * ABSENT (FileNotFoundError)              -> `({}, None, False)`
+      * a JSON object (dict)                    -> `(state, None, False)`
+      * bad JSON / undecodable bytes / absurd
+        nesting (the bytes WERE read)           -> `({}, "<Class>: <msg>", True)`
+      * valid JSON that is not an object        -> `({}, "NotADict: <type> ...", True)`
+      * ANY OSError (PermissionError, EMFILE,
+        EIO, a FIFO / directory ...)            -> `({}, "<Class>: <msg>", False)`
+
+    `movable` is True ONLY when the file was actually READ and found unusable:
+    the maintainer's ruling moves aside the UNPARSEABLE file, and an unreadable
+    file has not been shown unparseable. A transient OSError (an fd limit, an
+    I/O hiccup) on a perfectly valid file must never cost its history, so every
+    OSError is UNKNOWN and never movable: the caller neither moves nor writes
+    it, and the bytes stay where they are. The reason string is
+    `"<ExceptionClass>: <message>"`, the shape `split_probe_reason` /
+    `probe_unknown_line` already consume. The read never blocks (see
+    open_regular_text)."""
+    try:
+        try:
+            data = json.loads(read_regular_text(path))
+        except FileNotFoundError:
+            return {}, None, False
+        except (ValueError, RecursionError) as exc:  # bad JSON, bad bytes, absurd nesting
+            return {}, f"{type(exc).__name__}: {exc}", True
+        except OSError as exc:
+            return {}, f"{type(exc).__name__}: {exc}", False
+        if not isinstance(data, dict):
+            return {}, f"NotADict: state is a {type(data).__name__}, not an object", True
+        return data, None, False
+    except Exception as exc:  # defensive: the contract is "never raises"
+        return {}, f"{type(exc).__name__}: {exc}", False
+
+
 def open_regular_text_write(path, encoding=None):
     """`open(path, "w", encoding=encoding)` that must never block (#3591).
 

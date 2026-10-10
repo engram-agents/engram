@@ -49,6 +49,7 @@ from _hooklib import (
 from _hooklib import (
     probe_unknown_line, write_probe_unknown_stderr,
     probe_notice_due, mark_probe_notice, probe_own_server_py,
+    read_state_json_classified,
 )
 # #3628: every file open here is non-blocking and regular-file-only (a FIFO at
 # a state path must not hang the hook); the helpers live in _hooklib.
@@ -3092,7 +3093,8 @@ def check_principle_triggers(matched_ids: list, prompt_count: int) -> str:
 
 
 def check_principle_triggers_full(
-    matched_ids: list, prompt_count: int, unknown: "list | None" = None
+    matched_ids: list, prompt_count: int, unknown: "list | None" = None,
+    state_unknown: "list | None" = None,
 ) -> tuple[str, list]:
     """Same check as `check_principle_triggers`, but also returns the
     `rendered` list (`[(kind, principle_id, entry, matched_trigger_id), ...]`)
@@ -3105,11 +3107,28 @@ def check_principle_triggers_full(
     appends one `"<ExceptionClass>: <message>"` reason to `unknown` so the
     caller can tell "the registry is broken" from "nothing fired". With
     `unknown=None` (the default) behaviour is exactly as before.
+
+    #3521 row 40: `state_unknown` is a SEPARATE optional list (own probe key,
+    `principle-trigger-state`) for the cooldown STATE file. When the state
+    read is UNKNOWN (bad JSON, a non-dict, an unreadable file, a non-regular
+    target -- anything but ABSENT), one `{"reason": "<Class>: <msg>",
+    "moved_to": None}` is appended; `moved_to` is set to the `.corrupt` path
+    if the write-back then moved the unparseable file aside. The firing
+    decision is unchanged (state is treated as empty). `None` (default) ->
+    nothing is reported, behaviour otherwise identical.
+
+    Move-aside bound: an unparseable regular state file is renamed to
+    `principle-trigger-state.json.corrupt` (ONE fixed name) under the same
+    lock the write-back holds, before fresh state is written. Evidence is kept
+    for the latest corruption only: a newer corruption replaces an older copy.
+    A non-regular target is neither moved nor written.
     """
     if not matched_ids:
         return "", []
     try:
-        return _check_principle_triggers_inner(matched_ids, prompt_count, unknown)
+        return _check_principle_triggers_inner(
+            matched_ids, prompt_count, unknown, state_unknown
+        )
     except Exception as exc:
         # Runs on every prompt — a malformed cache must degrade to
         # silence, never break the hook (same contract as the function
@@ -3235,7 +3254,8 @@ def _with_state_lock(lock_path, fn):
 
 
 def _check_principle_triggers_inner(
-    matched_ids: list, prompt_count: int, unknown: "list | None" = None
+    matched_ids: list, prompt_count: int, unknown: "list | None" = None,
+    state_unknown: "list | None" = None,
 ) -> tuple[str, list]:
     try:
         with open_regular_text(PRINCIPLE_TRIGGERS_PATH) as f:
@@ -3304,17 +3324,17 @@ def _check_principle_triggers_inner(
             if pid:
                 by_principle.setdefault(pid, entry)
 
-    try:
-        with open_regular_text(PRINCIPLE_TRIGGER_STATE_PATH) as f:
-            state = json.load(f)
-        if not isinstance(state, dict):
-            state = {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        state = {}
-    except OSError:
-        if not _is_non_regular(PRINCIPLE_TRIGGER_STATE_PATH):
-            raise
-        state = {}
+    # #3521 row 40: one read rule (_hooklib.read_state_json_classified). ABSENT
+    # and a JSON object behave exactly as before; anything else (bad JSON, a
+    # non-dict, an unreadable regular file, a non-regular target) is UNKNOWN:
+    # the cooldown decision still treats state as empty (an extra nudge, never
+    # a missing one), but the UNKNOWN is reported and the write-back below
+    # moves an unparseable regular file aside instead of overwriting it.
+    state, _state_reason, _ = read_state_json_classified(PRINCIPLE_TRIGGER_STATE_PATH)
+    _state_report = None
+    if _state_reason is not None and isinstance(state_unknown, list):
+        _state_report = {"reason": _state_reason, "moved_to": None}
+        state_unknown.append(_state_report)
 
     # #1698 slice 3 §1.1 — migration on read: a bare int entry is the
     # slice-2 shape (last_fired_prompt only). Upconvert in memory here;
@@ -3445,17 +3465,46 @@ def _check_principle_triggers_inner(
     # exclusivity with the other writer (see spec's "Why NOT #1709's
     # non-blocking-suppress pattern").
     def _write_back():
-        try:
-            with open_regular_text(PRINCIPLE_TRIGGER_STATE_PATH) as f:
-                fresh_state = json.load(f)
-            if not isinstance(fresh_state, dict):
-                fresh_state = {}
-        except (FileNotFoundError, json.JSONDecodeError):
-            fresh_state = {}
-        except OSError:
-            if not _is_non_regular(PRINCIPLE_TRIGGER_STATE_PATH):
-                raise
-            fresh_state = {}
+        # #3521 row 40: the FRESH in-lock read decides the move (the snapshot
+        # above may be stale: a file repaired since is merged into, not moved).
+        # A file that was READ and found unparseable (bad JSON, a non-dict) is
+        # renamed to ONE fixed sidecar name BEFORE fresh state is written --
+        # evidence is kept for the latest corruption only (a newer corruption
+        # replaces an older copy). Any OSError (unreadable file, fd limit, a
+        # FIFO / directory) is UNKNOWN but never movable: an unreadable file has
+        # not been shown unparseable, and a transient error must never cost
+        # valid history, so it is neither moved nor written (#3628: the hook
+        # never opens, and does not rename, a non-regular target). If the move
+        # itself fails, the file is NOT overwritten.
+        # Known bound: the utility-credit stop hook rewrites this state file
+        # WITHOUT this lock (until the core-side follow-up). If its write lands
+        # between the fresh read below and the rename, a just-written valid file
+        # could be moved aside. The window is tiny, the bytes are preserved in
+        # the sidecar, and that cross-writer clobbering predates this change.
+        fresh_state, fresh_reason, fresh_movable = read_state_json_classified(
+            PRINCIPLE_TRIGGER_STATE_PATH
+        )
+        if fresh_reason is not None:
+            if not fresh_movable:
+                return
+            sidecar = str(PRINCIPLE_TRIGGER_STATE_PATH) + ".corrupt"
+            try:
+                os.replace(str(PRINCIPLE_TRIGGER_STATE_PATH), sidecar)
+            except OSError:
+                return  # cannot preserve the evidence -> do not overwrite it
+            if _state_report is not None:
+                _state_report["moved_to"] = sidecar
+            elif isinstance(state_unknown, list):
+                state_unknown.append({"reason": fresh_reason, "moved_to": sidecar})
+            try:
+                print(
+                    f"[engram principle-trigger-state] unparseable state file "
+                    f"moved aside to {sidecar} ({fresh_reason[:200]}) -- cooldown "
+                    f"history reset; only the latest corrupt copy is kept",
+                    file=sys.stderr,
+                )
+            except Exception:
+                pass
 
         # Re-apply the same bare-int-entry upconversion (§1.1) done on the
         # snapshot read above -- that migrated copy isn't reused here (it may
@@ -3727,8 +3776,10 @@ def main():
     # check_incident_tripwire + check_cornerstone_anchor calls.
     matched_ids = result.get("matched_ids", []) if result else []
     _principle_unknown: list = []  # #3521 row 7: rendered below with the other probes
+    _principle_state_unknown: list = []  # #3521 row 40: own probe key
     principle_triggers, _principle_rendered = check_principle_triggers_full(
-        matched_ids, counter["prompts_since_compaction"], _principle_unknown
+        matched_ids, counter["prompts_since_compaction"], _principle_unknown,
+        _principle_state_unknown,
     )
     if not principle_triggers:
         # Preserve the semantic-keyword fallback for lessons specifically --
@@ -3940,6 +3991,20 @@ def main():
         _line = _probe_unknown_notice(
             probe_stamps_pending, "principle-triggers", "principle triggers",
             "trigger nudges skipped this prompt", _principle_unknown[0],
+        )
+        if _line:
+            head_blocks.append(_line)
+
+    # #3521 row 40: a corrupt / unreadable cooldown STATE file is UNKNOWN too
+    # (own probe key). The suffix is cut to 60 chars by probe_unknown_line, so
+    # both wordings fit whole.
+    if _principle_state_unknown:
+        _rec = _principle_state_unknown[0]
+        _line = _probe_unknown_notice(
+            probe_stamps_pending, "principle-trigger-state", "principle cooldown",
+            "cooldown reset; kept as principle-trigger-state.json.corrupt"
+            if _rec.get("moved_to") else "cooldowns ignored this prompt",
+            _rec.get("reason"),
         )
         if _line:
             head_blocks.append(_line)

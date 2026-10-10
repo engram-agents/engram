@@ -34,6 +34,7 @@
   "hooks/claude/_hooklib.py:_not_regular_error",
   "hooks/claude/_hooklib.py:open_regular_text",
   "hooks/claude/_hooklib.py:read_regular_text",
+  "hooks/claude/_hooklib.py:read_state_json_classified",
   "hooks/claude/_hooklib.py:open_regular_text_write",
   "hooks/claude/_hooklib.py:open_regular_text_append",
   "hooks/claude/_hooklib.py:_not_regular_db_error_cls",

@@ -112,6 +112,27 @@ def deny_open(path, write=False, nth=1):
                 gate(p)
             return orig_open(p, mode, *a, **k)
         builtins.open = wrapped_open
+
+def deny_state_read(path, nth=1, errno_=13):
+    # #3521 row 40: the principle-trigger STATE reads (the snapshot and the
+    # write-back re-read) now happen inside _hooklib.read_state_json_classified,
+    # which calls _hooklib.read_regular_text -- NOT the hook module's own
+    # open_regular_text, so deny_open cannot reach them. Same fault (a
+    # PermissionError at the nth open of `path`, on a REGULAR file), injected
+    # at the seam where the read now lives.
+    import sys
+    hl = sys.modules.get('_hooklib') or __import__('_hooklib')
+    seen = []
+    orig = hl.read_regular_text
+    def wrapped(p, *a, **k):
+        if str(p) == str(path):
+            seen.append(1)
+            if len(seen) == nth:
+                if errno_ == 13:
+                    raise PermissionError(13, 'denied', str(p))
+                raise OSError(errno_, 'injected', str(p))
+        return orig(p, *a, **k)
+    hl.read_regular_text = wrapped
 """
 
 
@@ -486,13 +507,12 @@ _PROPAGATE = {
         None, "mod.check_error_patterns('a foo b')", 1),
     "principle_triggers_registry": ("principle_triggers.json", json.dumps(_REG), None,
                                     "mod._check_principle_triggers_inner(['t1'], 100)", 1),
-    "principle_trigger_state": ("principle-trigger-state.json", _STALE_STATE,
-                                ("principle_triggers.json", json.dumps(_REG)),
-                                "mod._check_principle_triggers_inner(['t1'], 100)", 1),
-    # the write-back re-read is the SECOND open of the state file in one call
-    "principle_write_back_reread": ("principle-trigger-state.json", _STALE_STATE,
-                                    ("principle_triggers.json", json.dumps(_REG)),
-                                    "mod._check_principle_triggers_inner(['t1'], 100)", 2),
+    # The two principle-trigger STATE entries that were here (the snapshot read
+    # and the write-back re-read) are retired: #3628 pinned "OSError on a regular
+    # file propagates" only to keep dev behaviour unchanged, and the #3521 row 40
+    # ruling makes an unreadable regular STATE file UNKNOWN (never raised). The
+    # state reads moved into _hooklib.read_state_json_classified; the re-pinned
+    # cells are test_state_read_denied_* below. The registry entry stays.
 }
 
 
@@ -505,6 +525,129 @@ def test_regular_file_oserror_propagates(tmp_path, name):
         (ctx.eh / extra[0]).write_text(extra[1])
     code = (f"deny_open(P['eh'] + '/{rel}', nth={nth})\n" + _RAISES.format(call=call))
     assert _run(ctx, code) == "raised:PermissionError", name
+
+
+_STATE_REL = "principle-trigger-state.json"
+
+_STATE_CALL = (
+    "su = []\n"
+    "deny_state_read(P['eh'] + '/{rel}', nth={nth}, errno_={errno_})\n"
+    "try:\n"
+    "    ret = mod._check_principle_triggers_inner(['t1'], 100, None, su)\n"
+    "    raised = None\n"
+    "except Exception as e:\n"
+    "    ret = None\n"
+    "    raised = type(e).__name__\n"
+    "side = P['eh'] + '/{rel}.corrupt'\n"
+    "live = P['eh'] + '/{rel}'\n"
+    "result = {{\n"
+    "    'raised': raised,\n"
+    "    'fired': bool(ret and ret[0]),\n"
+    "    'su': su,\n"
+    "    'side': open(side).read() if os.path.exists(side) else None,\n"
+    "    'live': json.load(open(live)) if os.path.exists(live) else None,\n"
+    "    'live_raw': open(live).read() if os.path.exists(live) else None,\n"
+    "}}\n"
+)
+
+
+def _state_ctx(tmp_path):
+    ctx = Ctx(tmp_path, "regular")
+    (ctx.eh / _STATE_REL).write_text(_STALE_STATE)
+    (ctx.eh / "principle_triggers.json").write_text(json.dumps(_REG))
+    return ctx
+
+
+def test_state_read_denied_wrapper_fires_positive_control(tmp_path):
+    # A deny_state_read that never fires would let the two cells below pass
+    # vacuously; prove it raises exactly on the nth read of the path.
+    ctx = _state_ctx(tmp_path)
+    code = (
+        "import sys\n"
+        "hl = sys.modules['_hooklib']\n"
+        "p = P['eh'] + '/principle-trigger-state.json'\n"
+        "deny_state_read(p, nth=1)\n"
+        "first = hl.read_state_json_classified(p)\n"
+        "result = {'first_reason': first[1], 'first_movable': first[2], 'first_state': first[0]}\n"
+    )
+    out = _run(ctx, code)
+    assert out["first_reason"].startswith("PermissionError: "), out
+    assert out["first_movable"] is False and out["first_state"] == {}
+
+
+def test_state_read_denied_nth_is_exact(tmp_path):
+    ctx = _state_ctx(tmp_path)
+    code = (
+        "import sys\n"
+        "hl = sys.modules['_hooklib']\n"
+        "p = P['eh'] + '/principle-trigger-state.json'\n"
+        "deny_state_read(p, nth=2)\n"
+        "a = hl.read_state_json_classified(p)\n"
+        "b = hl.read_state_json_classified(p)\n"
+        "c = hl.read_state_json_classified(p)\n"
+        "result = {'a': a[1], 'b': b[1], 'c': c[1], 'a_has': bool(a[0])}\n"
+    )
+    out = _run(ctx, code)
+    assert out["a"] is None and out["a_has"] is True
+    assert out["b"].startswith("PermissionError: ")
+    assert out["c"] is None
+
+
+def test_state_snapshot_read_denied_is_unknown_not_raised(tmp_path):
+    # nth=1: the snapshot read is denied; the in-lock fresh read succeeds, so
+    # the file is merged into -- NOT moved aside.
+    ctx = _state_ctx(tmp_path)
+    out = _run(ctx, _STATE_CALL.format(rel=_STATE_REL, nth=1, errno_=13))
+    assert out["raised"] is None, out
+    assert out["fired"] is True
+    assert len(out["su"]) == 1 and out["su"][0]["reason"].startswith("PermissionError: ")
+    assert out["su"][0]["moved_to"] is None
+    assert out["side"] is None
+    assert out["live"][_PID]["last_fired_prompt"] == 100
+    assert out["live"][_PID]["fires"] == 2  # merged onto the stale entry (fires 1)
+
+
+def test_state_writeback_reread_denied_is_unknown_not_moved_not_written(tmp_path):
+    # nth=2: the snapshot read works, the write-back re-read is denied
+    # (PermissionError). An unreadable file has not been shown unparseable, so
+    # it is UNKNOWN but never movable: no sidecar, no write, bytes unchanged.
+    ctx = _state_ctx(tmp_path)
+    out = _run(ctx, _STATE_CALL.format(rel=_STATE_REL, nth=2, errno_=13))
+    assert out["raised"] is None, out
+    assert out["fired"] is True  # firing decision unchanged
+    assert out["side"] is None
+    assert out["live_raw"] == _STALE_STATE
+    # The snapshot was fine, so nothing was reported for this call.
+    assert out["su"] == []
+
+
+def test_state_valid_file_with_injected_emfile_is_not_moved(tmp_path):
+    # Reviewer's case (#3654 round 1): an injected EMFILE on a VALID dict file
+    # must not rename it to .corrupt and reset every principle's history.
+    import errno
+    ctx = _state_ctx(tmp_path)
+    # nth=1: the snapshot read fails; the in-lock re-read is fine, so the file
+    # is merged into (history kept: fires 1 -> 2), never moved.
+    out = _run(ctx, _STATE_CALL.format(rel=_STATE_REL, nth=1, errno_=errno.EMFILE))
+    assert out["raised"] is None and out["side"] is None, out
+    assert out["live"][_PID]["fires"] == 2, out
+    # nth=2: the write-back re-read fails; neither moved nor written.
+    ctx = _state_ctx(tmp_path / "second")
+    out = _run(ctx, _STATE_CALL.format(rel=_STATE_REL, nth=2, errno_=errno.EMFILE))
+    assert out["raised"] is None and out["side"] is None, out
+    assert out["live_raw"] == _STALE_STATE, out
+    # And the classifier itself: movable only for a READ-and-unparseable file.
+    code = (
+        "import sys, errno\n"
+        "hl = sys.modules['_hooklib']\n"
+        "p = P['eh'] + '/principle-trigger-state.json'\n"
+        f"deny_state_read(p, nth=1, errno_={errno.EMFILE})\n"
+        "r = hl.read_state_json_classified(p)\n"
+        "result = {'reason': r[1], 'movable': r[2], 'state': r[0]}\n"
+    )
+    out = _run(ctx, code)
+    assert out["reason"].startswith("OSError: ") and out["movable"] is False
+    assert out["state"] == {}
 
 
 def test_write_prompt_counter_regular_oserror_propagates(tmp_path):
