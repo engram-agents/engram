@@ -2804,9 +2804,9 @@ def format_nudge(
 
     # --- Route ledger out-parameter (#3458 A): what rendered, in order, and
     # the cut names this function already uses. Read-only over local state.
-    # Known bound (not fixed): `shown` is the render BEFORE `emit_context`
-    # applies its final whole-block budget cut, so an id reported as shown
-    # could in principle be dropped by that later cut.
+    # `shown` is the render BEFORE `emit_context` applies its final whole-block
+    # budget cut -- the ROUTE's render. The shown RECORD is gated on that cut
+    # separately (#3621, see main()).
     if route_out is not None:
         _reasons: dict = {}
         for _m in others_candidates:
@@ -3584,7 +3584,7 @@ def format_nap_warning(count: int) -> str:
     return ""
 
 
-def _assemble_response(head_blocks: list, body_blocks: list) -> dict:
+def _assemble_response(head_blocks: list, body_blocks: list, kept_out=None) -> dict:
     """Build the UserPromptSubmit response dict from this prompt's fired
     head/body blocks, routed through the shared bounded renderer
     `_hooklib.emit_context()` (engram-alpha#2863 WS2).
@@ -3600,6 +3600,10 @@ def _assemble_response(head_blocks: list, body_blocks: list) -> dict:
     `if not parts:` early exit) -- `emit_context()` is never called with
     two empty inputs. Otherwise returns the full
     `{"hookSpecificOutput": {...}}` response dict, ready for `json.dumps()`.
+
+    `kept_out` (#3621): optional list, passed straight through to
+    `emit_context(kept_out=)` -- extended with the indices (into
+    `body_blocks`) of the blocks rendered in full. The return is unchanged.
     """
     head = "\n\n".join(head_blocks)
     body = list(body_blocks)
@@ -3627,6 +3631,7 @@ def _assemble_response(head_blocks: list, body_blocks: list) -> dict:
         # <path>" pointer. A shared overflow-writer helper is a clean
         # fast-follow, not built here.
         overflow_writer=None,
+        kept_out=kept_out,
     )
     return {
         "hookSpecificOutput": {
@@ -3784,6 +3789,7 @@ def main():
     # this prompt; only WHERE the resulting string goes has changed.
     head_blocks: list = []
     body_blocks: list = []
+    _nudge_index = None  # #3621: index of the recall block in body_blocks, if any
 
     # Unified principle-trigger check (#1698 slice 2) — one registry, four
     # kinds (lesson/cornerstone/axiom/goal), replacing the separate
@@ -4058,6 +4064,7 @@ def main():
             in_context_resolver=_in_context_resolver,
         )
         if nudge:
+            _nudge_index = len(body_blocks)  # #3621: where the recall block sits
             body_blocks.append(nudge)
         elif pack_results:
             # Own-graph returned 0 matches (match_count=0) but we have pack hits
@@ -4173,6 +4180,7 @@ def main():
         if nap_warning:
             body_blocks.append(nap_warning)
 
+    _record_shown = False  # #3621: set True where the old append used to run
     # Route ledger (#3458 A): one line per fire when the probe is live for
     # this session (opt-in by presence, fail-open -- see _hooklib). `query` is
     # the text sent to the daemon/FTS (the recall query; embed_query, when set,
@@ -4184,17 +4192,38 @@ def main():
             source="daemon" if used_daemon else "fallback",
             extra={"embed_query": embed_query} if embed_query is not None else None,
         )
-        # #3613 S1: the shown record, AFTER the ledger's resolver read its sources
-        # (a node is never "already shown" by the fire being written). Written
-        # whatever the kill switch says; fail-open inside the helper.
-        append_shown_record("prompt_surface", hook_input.get("session_id"), _route_out.get("shown", []))
+        # #3613 S1 / #3621: the shown record is written below, after the response
+        # was printed, once we know whether the recall block survived emit_context's
+        # final cut. (Still after the in-context resolver was built above.)
+        _record_shown = True
 
-    response = _assemble_response(head_blocks, body_blocks)
+    _kept_blocks: list = []
+    response = _assemble_response(head_blocks, body_blocks, _kept_blocks)
+    print(json.dumps(response if response else {}))
+    # #3621: the ALL-OR-NOTHING shown record, written only now that the response
+    # was printed (a print that raised never reaches this). The fire's shown ids
+    # are recorded only if the recall block (body index `_nudge_index`) was
+    # rendered IN FULL (`_kept_blocks`, from emit_context); otherwise an EMPTY-ids
+    # line still lands, so prompt_index and the compaction window stay continuous.
+    # Fail-open, same style as the probe-stamp handling below. (Inline, not a
+    # helper: the read-scan root config lists every hook function.)
+    if _record_shown:
+        try:
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
+            _shown_ids = (
+                _route_out.get("shown", [])
+                if isinstance(_nudge_index, int) and _nudge_index in _kept_blocks
+                else []
+            )
+            append_shown_record("prompt_surface", hook_input.get("session_id"), _shown_ids)
+        except Exception:
+            pass
     if not response:
-        print(json.dumps({}))
         sys.exit(0)
 
-    print(json.dumps(response))
     if probe_stamps_pending:
         # #3521: the rate-limit window is consumed only once the response
         # carrying the line has been written out (mirrors #3504).

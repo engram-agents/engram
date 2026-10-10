@@ -475,6 +475,7 @@ def emit_context(
     target: int,
     allow_single_overflow: bool = False,
     overflow_writer: "Callable[[list], str] | None" = None,
+    kept_out: "list | None" = None,
 ) -> str:
     """Render a bounded additionalContext block: trailer FIRST (survives the
     harness's tail truncation), then `head`, then as many `body` items as
@@ -520,6 +521,15 @@ def emit_context(
         valid, distinct choice from a writer that itself fails at runtime;
         both end up with an empty path, and the trailer reads identically
         either way (see `_build_context_trailer`'s docstring).
+    kept_out:
+        Optional OUT-parameter (#3621). When a `list` is passed it is
+        EXTENDED with the 0-based indices (into `body` as the caller passed
+        it) of the body items rendered IN FULL in the returned string. A body
+        item that was cut, or truncated in-band (the `truncated_first`
+        shape), is NOT listed; neither is any item if the final `budget`
+        backstop had to shorten the render. The returned string is
+        byte-identical with and without it. Anything that is not a `list`
+        (including the default `None`) is ignored.
 
     Contract
     --------
@@ -572,6 +582,12 @@ def emit_context(
        if even a single item's render doesn't fit `target` against the real
        path (subject to the same `allow_single_overflow`/`budget` exception
        as the placeholder-sized determination below).
+
+    6. `kept_out` (#3621) reports what the model can actually see: the indices
+       of the items present whole in the returned string. It errs toward
+       UNDER-reporting (a caller that records "shown" ids from it would rather
+       repeat a display than record an id the model never saw). It never
+       changes the returned string and never makes this function raise.
 
     Never raises on well-typed inputs. A caller-supplied `overflow_writer`
     that raises is caught and treated as a failed write (empty path),
@@ -785,9 +801,21 @@ def emit_context(
     # (Kepler's Amendment 1). Every path above is already designed to stay
     # within `budget`; this is a defensive backstop, not the primary
     # mechanism -- it should not trigger in normal operation.
+    backstop_hit = False
     if len(rendered) > budget:
+        backstop_hit = True
         safe = _trim_to_line_boundary(rendered, budget)
         rendered = safe if safe else rendered[:budget]
+
+    # #3621: report which body items are present IN FULL. A truncated_first
+    # item is not; if the backstop above shortened the render we cannot say
+    # what survived, so under-report (nothing kept).
+    if isinstance(kept_out, list):
+        try:
+            if not truncated_first and not backstop_hit:
+                kept_out.extend(range(shown_n if n > 0 else 0))
+        except Exception:
+            pass
 
     return rendered
 
@@ -1312,6 +1340,11 @@ def _earlier_shown_ids(routes_dir: Path, compaction_count=None) -> tuple:
 # refreshes mtime, so a session written to within that window is never pruned.
 # No-follow: the append opens with O_NOFOLLOW, and the prune lstat()s -- a symlink
 # at a record path is neither written through nor unlinked-as-a-file.
+#
+# Final cut (#3621): the recall block is ONE atomic body item that emit_context
+# may still cut or truncate, so the surface hook records the fire's ids all-or-
+# nothing -- only if the block was rendered IN FULL (`emit_context(kept_out=)`),
+# else an EMPTY-ids line, after the response was printed. Under-record, never over.
 
 SHOWN_RECORD_MAX_IDS = 64
 SHOWN_RECORD_MAX_BYTES = 262144
