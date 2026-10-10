@@ -768,6 +768,10 @@
       "tier": "dev"
     },
     {
+      "path": "tools/ack_recompute_sweep.py",
+      "tier": "dev"
+    },
+    {
       "path": "tools/cites_step3.py",
       "tier": "dev"
     },

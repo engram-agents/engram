@@ -210,7 +210,11 @@ def test_compute_confidence_sources_from_cascade_relations(surgical, conn, monke
     _insert_edge(conn, "dv_node", "ob_premise", "derives_from")
     conn.commit()
 
-    monkeypatch.setattr(surgical, "CASCADE_RELATIONS", frozenset({"acknowledged_derives_from"}))
+    # #3531: surgical no longer owns the premise query; it calls
+    # engram_core._recompute_premise_ids, the single definition, which reads
+    # engram_core.CASCADE_RELATIONS. Patch the constant where it is read.
+    import engram_core
+    monkeypatch.setattr(engram_core, "CASCADE_RELATIONS", frozenset({"acknowledged_derives_from"}))
     dv_row = dict(
         conn.execute("SELECT * FROM nodes WHERE id = ?", ("dv_node",)).fetchone()
     )

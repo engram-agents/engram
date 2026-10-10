@@ -54,8 +54,8 @@ from engram_confidence import (
     ABDUCTIVE_CONFIDENCE_CAP,
 )
 from engram_core import (
-    CASCADE_RELATIONS, CITATION_SUPPORT_RELATIONS, EDGE_CLASSIFICATIONS,
-    _pending_markers_for_node,
+    CITATION_SUPPORT_RELATIONS, EDGE_CLASSIFICATIONS,
+    _pending_markers_for_node, _recompute_premise_ids,
 )
 
 DATA_DIR = Path(os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram"))
@@ -404,12 +404,11 @@ def _compute_confidence_for_node(conn: sqlite3.Connection, node: dict) -> float 
         # recompute (#2349 blocker 2) — deliberately NOT CITATION_SUPPORT_RELATIONS,
         # which also carries supported_by and answers a different question
         # ("which premises were affected"), not "what does the formula read".
-        _rels = sorted(CASCADE_RELATIONS)
-        premises = conn.execute(
-            "SELECT target_id FROM edges WHERE source_id = ? AND relation IN "
-            f"({','.join('?' for _ in _rels)})",
-            (node["id"], *_rels),
-        ).fetchall()
+        # #3531: the premise set is engram_core's single definition
+        # (_recompute_premise_ids), so an acknowledged-superseded premise is
+        # not counted alongside its replacement here either.
+        premises = [{"target_id": t} for t in
+                    _recompute_premise_ids(conn, node["id"])]
         if not premises:
             return 0.5  # no premises found
 

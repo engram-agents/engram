@@ -9408,6 +9408,85 @@ CONFIDENCE_RECOMPUTABLE_TYPES = frozenset({
 })
 
 
+def _acknowledged_superseded_premises(conn: sqlite3.Connection,
+                                      node_id: str) -> set:
+    """#3531: the CASCADE_RELATIONS targets of ``node_id`` that its confidence
+    recompute must NOT count, because the node has acknowledged a replacement.
+
+    A target X (of EITHER relation) is returned iff ``node_id`` has an
+    `acknowledged_derives_from` edge to some A that supersedes X, directly or
+    through a chain of `supersedes` edges (edge direction: successor -> old).
+    So a re-acknowledgement (T <- S <- S2, acks to both S and S2) keeps only
+    the latest, S2. A target the node has not yet acknowledged a replacement
+    for (a still-pending one) stays. A node with no acknowledgement edge gets
+    the empty set, so the cascade frontier's behaviour is untouched.
+
+    Malformed supersede cycle: X is dropped only if A does NOT also supersede X
+    back, so mutually-superseding ack targets never drop each other and the
+    premise set is never emptied by a cycle.
+    """
+    acked = [r["target_id"] for r in conn.execute(
+        "SELECT target_id FROM edges WHERE source_id = ? "
+        "AND relation = 'acknowledged_derives_from'", (node_id,)).fetchall()]
+    if not acked:
+        return set()
+    memo: dict = {}
+
+    def _ancestors(start: str) -> set:
+        # Supersede-ancestors of ``start`` (contains ``start`` itself only
+        # through a malformed cycle).
+        if start in memo:
+            return memo[start]
+        found: set = set()
+        frontier = [start]
+        while frontier:
+            cur = frontier.pop()
+            for r in conn.execute(
+                    "SELECT target_id FROM edges WHERE source_id = ? "
+                    "AND relation = 'supersedes'", (cur,)).fetchall():
+                if r["target_id"] not in found:
+                    found.add(r["target_id"])
+                    frontier.append(r["target_id"])
+        memo[start] = found
+        return found
+
+    _rels = sorted(CASCADE_RELATIONS)
+    targets = {r["target_id"] for r in conn.execute(
+        f"SELECT target_id FROM edges WHERE source_id = ? AND relation IN "
+        f"({','.join('?' for _ in _rels)})", (node_id, *_rels)).fetchall()}
+    dropped: set = set()
+    for a in acked:
+        for x in _ancestors(a) & targets:
+            if x != a and a not in _ancestors(x):
+                dropped.add(x)
+    return dropped
+
+
+def _recompute_premise_ids(conn: sqlite3.Connection, node_id: str) -> list:
+    """The ONE definition of the premise set a confidence recompute of
+    ``node_id`` reads (#3531): every CASCADE_RELATIONS target (`derives_from`
+    + `acknowledged_derives_from`), ordered by target id, each at most once
+    (a node holding BOTH edges to one premise lists it once -- a doubled
+    premise would be noisy-ORed twice), EXCEPT a premise
+    (either relation) whose replacement the node has acknowledged (see
+    `_acknowledged_superseded_premises`). Shared by `_recompute_node_confidence`
+    and tools/surgical.py::_compute_confidence_for_node so the two copies of
+    the confidence arithmetic cannot disagree about which premises count.
+    """
+    _rels = sorted(CASCADE_RELATIONS)
+    _superseded = _acknowledged_superseded_premises(conn, node_id)
+    return [
+        r["target_id"] for r in conn.execute(
+            f"SELECT DISTINCT target_id FROM edges "
+            f"WHERE source_id = ? AND relation IN "
+            f"({','.join('?' for _ in _rels)}) "
+            f"ORDER BY target_id",
+            (node_id, *_rels),
+        ).fetchall()
+        if r["target_id"] not in _superseded
+    ]
+
+
 def _recompute_node_confidence(conn: sqlite3.Connection, node_id: str,
                                *, write: bool = True) -> dict:
     """Recompute one existing node's confidence from its own stored formula
@@ -9494,16 +9573,7 @@ def _recompute_node_confidence(conn: sqlite3.Connection, node_id: str,
         # never consulted — the recompute would run on the acknowledge path and
         # find nothing to change, which is exactly the inert behaviour measured
         # while the edge was deferred (0.833 -> 0.833, changed: []).
-        _rels = sorted(CASCADE_RELATIONS)
-        premise_ids = [
-            r["target_id"] for r in conn.execute(
-                f"SELECT target_id FROM edges "
-                f"WHERE source_id = ? AND relation IN "
-                f"({','.join('?' for _ in _rels)}) "
-                f"ORDER BY target_id",
-                (node_id, *_rels),
-            ).fetchall()
-        ]
+        premise_ids = _recompute_premise_ids(conn, node_id)
         if not premise_ids:
             return _skip("derivation has no derives_from premises")
         have_conf = conn.execute(
