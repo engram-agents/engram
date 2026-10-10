@@ -840,90 +840,9 @@ def _remove_edge_impl(
         conn.close()
 
 
-def _relation_endpoint_error(relation: str, source_row, target_row) -> "str | None":
-    """The relation-specific ENDPOINT-TYPE gates for writing ``relation``
-    between two nodes, or None when the pair is acceptable.
-
-    ONE guarded writer for these rules (#2243 step 3 part A): both
-    ``_add_edge_impl`` (a new edge) and ``_retype_edge_impl`` (an existing
-    edge's new relation) call this, so a re-type to X is refused with X's own
-    text exactly when add_edge to X would be refused for the same node types.
-    That equivalence is bounded to THESE node-type endpoint rules: a re-type
-    to ``subtask_of`` also runs the grounding-family cycle check, which
-    add_edge does not, so a re-type can be refused where add_edge would not be.
-    Rows need ``id`` and ``type``.
-
-    Covers: the ``instantiates`` boundary gates (#530: not a lesson target,
-    target in INSTANTIATES_TARGET_TYPES, claim-bearing source) and the
-    ``generalizes`` endpoint-pair rule (#2753 epic, WS1, D1), and the
-    ``bears_on`` rule (#3615: question source; claim-bearing or contradiction
-    target).
-
-    Deliberately NOT here: is-current checks and the already-exists no-op
-    (add-only), the ``generalizes`` cycle walk and the ``temporal_causal``
-    order check (applied generically by each caller).
-    """
-    source_id, target_id = source_row["id"], target_row["id"]
-    if relation == "instantiates":
-        if target_row["type"] == "lesson":
-            return (
-                f"'instantiates' does not accept lesson targets — an "
-                f"incident that is an instance of a lesson's pattern is "
-                f"wired via `exemplifies` (engram_register_exemplar / "
-                f"engram_lesson_register_incident), which feeds the "
-                f"tripwire engine. Target '{target_id}' is a lesson."
-            )
-        if target_row["type"] not in core.INSTANTIATES_TARGET_TYPES:
-            return (
-                f"'instantiates' targets must be one of "
-                f"{sorted(core.INSTANTIATES_TARGET_TYPES)} — the "
-                f"principle-family node the source realizes. Target "
-                f"'{target_id}' is type '{target_row['type']}'. For "
-                f"intent-shaped task→goal contribution use `serves`; "
-                f"for incident→lesson membership use `exemplifies`."
-            )
-        if not core._is_claim_bearing(source_row["type"]):
-            return (
-                f"'instantiates' sources must be claim-bearing "
-                f"({sorted(core.CLAIM_BEARING_TYPES)}); source "
-                f"'{source_id}' is type '{source_row['type']}'."
-            )
-    if relation == "generalizes":
-        pair = (source_row["type"], target_row["type"])
-        if pair not in core.GENERALIZES_ALLOWED_PAIRS:
-            return (
-                f"'generalizes' does not accept a "
-                f"{source_row['type']} -> {target_row['type']} pair. "
-                f"Allowed: {sorted(core.GENERALIZES_ALLOWED_PAIRS)}. "
-                f"Concrete nodes keep `exemplifies` (incident -> "
-                f"lesson) / `instantiates` (claim -> principle) — "
-                f"`generalizes` is reserved for principle -> "
-                f"principle abstraction (source '{source_id}' is "
-                f"type '{source_row['type']}', target '{target_id}' is "
-                f"type '{target_row['type']}')."
-            )
-    if relation == "bears_on":
-        # #3615: question -> claim-bearing node (or contradiction). The target
-        # set is DERIVED from core.CLAIM_BEARING_TYPES (never re-listed, the
-        # #2252 rule) plus `contradiction`. Shared with engram_ask's strict
-        # `bears_on` field and with engram_retype_edge.
-        if source_row["type"] != "question":
-            return (
-                f"'bears_on' sources must be type 'question' — the edge says "
-                f"\"once this question is answered, the answer will count "
-                f"for or against the target\". Source '{source_id}' is type "
-                f"'{source_row['type']}'."
-            )
-        if (
-            target_row["type"] not in core.CLAIM_BEARING_TYPES
-            and target_row["type"] != "contradiction"
-        ):
-            return (
-                f"'bears_on' targets must be claim-bearing "
-                f"({sorted(core.CLAIM_BEARING_TYPES)}) or a 'contradiction'; "
-                f"target '{target_id}' is type '{target_row['type']}'."
-            )
-    return None
+# #3631: the helper lives in engram_core (so engram_derive / engram_revision need
+# not import this module); same object, never a copy.
+_relation_endpoint_error = core._relation_endpoint_error
 
 
 def _add_edge_impl(

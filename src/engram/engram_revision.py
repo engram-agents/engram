@@ -2053,10 +2053,7 @@ def _bears_on_replacement_ok(conn, question_id, repl_row) -> bool:
         (question_id, repl_row["id"]),
     ).fetchone():
         return False
-    # Call-time import, as engram_derive._ask_impl does (accepted bend; the
-    # helper moves into core under #3631).
-    import engram_cornerstone as _cornerstone
-    return _cornerstone._relation_endpoint_error(
+    return core._relation_endpoint_error(
         "bears_on", {"id": question_id, "type": "question"}, repl_row
     ) is None
 
@@ -2150,7 +2147,11 @@ def _bears_on_replacement_of(conn, node_id):
     a replacement (the source of a ``retracts`` edge into it:
     ``_retract_impl`` writes ``replacement --retracts--> node``). Among
     several ``retracts`` sources a current one wins, then the lowest id, for
-    determinism; a dead-end branch falls back to the next. A visited set
+    determinism; a dead-end branch falls back to the next. The "a current
+    ``retracts`` source wins over a non-current one" preference is UNPINNED by
+    tests and structural: it cannot be reached through public verbs
+    (retracting an already-superseded node is refused), so only a hand-built
+    fixture could fail it. A visited set
     guards cycles and ``_BEARS_ON_CHAIN_HOP_CAP`` bounds the depth. None when
     the chain ends without a live node (retracted without a replacement, or
     no edge at all)."""

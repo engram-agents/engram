@@ -706,7 +706,7 @@ def _ask_impl(
             (#3615). Writes `bears_on` edges in the same transaction as the
             question. STRICT, unlike context_ids: every id must exist, be
             current, and pass the shared endpoint rule
-            (engram_cornerstone._relation_endpoint_error); otherwise the whole
+            (engram_core._relation_endpoint_error); otherwise the whole
             call is refused naming the offending id and NO question is created.
 
     Returns:
@@ -729,15 +729,12 @@ def _ask_impl(
         # #3615: strict, all-or-nothing `bears_on` validation, BEFORE any id is
         # allocated or row written, so a refused call leaves no question and no
         # edges. Held to the same endpoint rule as engram_add_edge /
-        # engram_retype_edge (one shared helper). Call-time import: the family
-        # modules otherwise import only engram_core (see module docstring);
-        # engram_cornerstone is the same (essential) tier.
+        # engram_retype_edge (one shared helper, in engram_core).
         bears_targets: list[str] = []
         for tid in (s.strip() for s in core._as_csv(bears_on).split(",")):
             if tid and tid not in bears_targets:
                 bears_targets.append(tid)
         if bears_targets:
-            import engram_cornerstone as _cornerstone
             for tid in bears_targets:
                 trow = conn.execute(
                     "SELECT id, type, is_current FROM nodes WHERE id = ?", (tid,)
@@ -753,7 +750,7 @@ def _ask_impl(
                         f"superseded). No question was created. Use "
                         f"engram_inspect('{tid}') to find the current successor."
                     )})
-                ep_err = _cornerstone._relation_endpoint_error(
+                ep_err = core._relation_endpoint_error(
                     "bears_on", {"id": "(new question)", "type": "question"}, trow
                 )
                 if ep_err is not None:

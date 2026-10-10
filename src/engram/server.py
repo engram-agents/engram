@@ -2786,7 +2786,10 @@ def engram_cascade_resolve(payload_json: str) -> str:
         no contradictions), re_cascade (an explanation of what did and
         did not propagate), and — only when resolution_kind is `superseded`
         or `retracted` — delegated_to + delegated_result, naming the verb
-        this resolution handed off to and what it returned.
+        this resolution handed off to and what it returned. The #3625
+        bears_on hint keys (`bears_on_hints`, `bears_on_hint_prompt`,
+        `bears_on_hint_error`) arrive NESTED under `delegated_result`, never
+        at the top level of this response.
         On refusal, {"error": "..."} — with blocking_ancestors + next_call
         when the node is not on the frontier, or eligible +
         acknowledge_blocked_by when the shape is not available.
@@ -5372,7 +5375,7 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 #
 # Whitelist (safe to add): about, exemplifies, serves, subtask_of, tensions,
 # instantiates, generalizes, bears_on (#3615; question -> claim, endpoints in
-# engram_cornerstone._relation_endpoint_error). All are non-cascade, non-structural-commitment, non-provenance
+# engram_core._relation_endpoint_error). All are non-cascade, non-structural-commitment, non-provenance
 # relations.
 #
 # BLOCKED (require node-add-time payload or dedicated mutation tool):
@@ -5522,7 +5525,7 @@ _RETYPE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation", "new_rela
 #                   tensions, bears_on) -- derived from EDGE_CLASSIFICATIONS, not typed;
 #                   #2243 step 3 part A. The new relation's own endpoint rules
 #                   are the ones engram_add_edge enforces (one shared helper,
-#                   engram_cornerstone._relation_endpoint_error), so a retype
+#                   engram_core._relation_endpoint_error), so a retype
 #                   to X is refused exactly when add_edge to X would be for
 #                   the same node types (a bound on the node-type endpoint
 #                   rules only: a retype to subtask_of ALSO runs the
@@ -6957,7 +6960,9 @@ def engram_resolve(payload_json: str) -> str:
         is a legal target the question is not yet wired to, found by
         following supersede or retract chains; ONE hint per replacement;
         each entry carries the exact engram_add_edge call, and the old edge
-        stays as provenance), `bears_on_hint_error` ("<ExceptionType>:
+        stays as provenance; declining a hint leaves no trace, so resolving
+        the question again re-hints the same replacement),
+        `bears_on_hint_error` ("<ExceptionType>:
         <message>", present only if computing the surfacing failed after the
         resolve committed; the resolve itself still succeeded) and
         `bears_on_omitted_noncurrent` (count of non-current targets that
@@ -7076,7 +7081,8 @@ def engram_supersede(payload_json: str) -> str:
         When a current question has a `bears_on` edge to old_node_id, also
         `bears_on_hints` + `bears_on_hint_prompt` (#3625; read-only; each
         entry carries the exact engram_add_edge call, the old edge stays as
-        provenance); absent otherwise. If computing the hint fails after the
+        provenance; declining leaves no trace, so engram_resolve re-hints that
+        replacement each time the question is resolved); absent otherwise. If computing the hint fails after the
         supersede committed, the supersede still succeeds and the return
         carries `bears_on_hint_error` ("<ExceptionType>: <message>") instead.
 
@@ -7226,7 +7232,9 @@ def engram_retract(payload_json: str) -> str:
         replacement. On payload-parsing failure, returns {"error": "..."}.
         With a replacement_id, also `bears_on_hints` +
         `bears_on_hint_prompt` (#3625; read-only) for current questions that
-        bore on the retracted node; absent otherwise. If computing the hint
+        bore on the retracted node; declining leaves no trace, so engram_resolve
+        re-hints that replacement each time the question is resolved; absent
+        otherwise. If computing the hint
         fails after the retraction committed, the retraction still succeeds
         and the return carries `bears_on_hint_error` instead.
 

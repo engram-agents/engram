@@ -129,21 +129,21 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 
 **8. engram_supersede** — Link replacement node to old node.
 - **contract**: `{old_node_id, new_node_id, [supersede_reason]}`
-- **guards**: DAG invariant (new.created_at ≥ old.created_at); same-type only; new node must not already supersede another; no-drop discipline on load-bearing claims; stale-cascade to derivation dependents; the return may carry read-only `bears_on_hints` (#3625) for current questions that `bears_on` the old node, or `bears_on_hint_error` if computing them failed after the supersede committed (the supersede still succeeded)
+- **guards**: DAG invariant (new.created_at ≥ old.created_at); same-type only; new node must not already supersede another; no-drop discipline on load-bearing claims; stale-cascade to derivation dependents; the return may carry read-only `bears_on_hints` (#3625) for current questions that `bears_on` the old node, or `bears_on_hint_error` if computing them failed after the supersede committed (the supersede still succeeded); declining a hint leaves no trace, so `engram_resolve` re-hints that replacement each time the question is resolved
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED
 - **tests**: test_cascade_semantics.py, test_cascade_derived_sets.py
 
 **9. engram_retract** — Mark claim as erroneous.
 - **contract**: `{node_id, error_type, reason, [replacement_id]}`
-- **guards**: taint-cascade to derivation dependents; contradiction nodes touching retracted node also flagged tainted; retraction is permanent (no undo); with a `replacement_id` the return may carry read-only `bears_on_hints` (#3625), or `bears_on_hint_error` if computing them failed after the retraction committed
+- **guards**: taint-cascade to derivation dependents; contradiction nodes touching retracted node also flagged tainted; retraction is permanent (no undo); with a `replacement_id` the return may carry read-only `bears_on_hints` (#3625), or `bears_on_hint_error` if computing them failed after the retraction committed; declining a hint leaves no trace, so `engram_resolve` re-hints that replacement each time the question is resolved
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED
 - **tests**: test_retract_and_quotes.py, test_cascade_semantics.py
 
 **10. engram_resolve** — Wire resolves edge (question/contradiction/prediction/conjecture/goal_tension).
 - **contract**: `{target_id, resolving_node_id, [prediction_outcome]}`
-- **guards**: pure-wire (does NOT create derivation); threshold 0.7 on resolving node's confidence to flip status; max-of-resolves (weak later resolver cannot downgrade); idempotent on duplicate edges; bool-string type check on bool params; a question with `bears_on` edges (#3615) returns `bears_on` (live direct targets only), `bears_on_prompt` (worded as partial when the question is only partially resolved), `bears_on_hints` + `bears_on_hint_prompt` (#3625: a target superseded, or retracted with a replacement, whose live replacement, found by following supersede or retract chains, the question may still bear on; one hint per replacement; the agent adds the edge, the old edge stays as provenance), `bears_on_hint_error` (present only if computing the hint failed after the resolve committed; the resolve itself still succeeded) and `bears_on_omitted_noncurrent` (non-current targets that produced no hint), also on the idempotent no_op path, and changes no target confidence
+- **guards**: pure-wire (does NOT create derivation); threshold 0.7 on resolving node's confidence to flip status; max-of-resolves (weak later resolver cannot downgrade); idempotent on duplicate edges; bool-string type check on bool params; a question with `bears_on` edges (#3615) returns `bears_on` (live direct targets only), `bears_on_prompt` (worded as partial when the question is only partially resolved), `bears_on_hints` + `bears_on_hint_prompt` (#3625: a target superseded, or retracted with a replacement, whose live replacement, found by following supersede or retract chains, the question may still bear on; one hint per replacement; the agent adds the edge, the old edge stays as provenance; declining a hint leaves no trace, so resolving the question again re-hints the same replacement), `bears_on_hint_error` (present only if computing the hint failed after the resolve committed; the resolve itself still succeeded) and `bears_on_omitted_noncurrent` (non-current targets that produced no hint), also on the idempotent no_op path, and changes no target confidence
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED (pure-wire redesign per issue #229)
 - **tests**: test_resolve_goal_tension.py, test_open_questions.py
