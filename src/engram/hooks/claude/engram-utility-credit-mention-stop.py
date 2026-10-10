@@ -351,6 +351,80 @@ def _write_state_atomic(path: str, state: dict) -> None:
     atomic_write_json(path, state)
 
 
+def _with_state_lock(lock_path, fn):
+    """Run fn() (a read-modify-write closure) while holding an exclusive,
+    BLOCKING flock on lock_path. Unlike #1709's non-blocking pattern, this
+    one blocks -- the critical section is a fast local file read+write (no
+    daemon round-trip), so a brief wait is cheap and correctness (no lost
+    update) matters more than never-block here. Degrades to running fn()
+    unlocked if fcntl, the lockfile open, or the flock call itself fails
+    (non-POSIX, permissions, a file type or filesystem without flock
+    support) -- same
+    never-crash contract as #1709's degrade path, just without the
+    non-blocking contention branch (there's nothing to suppress; fn() still
+    runs, just unprotected).
+
+    #1720: this exact ~15-line helper is duplicated rather than shared, in
+    THREE files (#3658): engram-surface-hook.py, engram_core.py (the MCP server
+    process), and this one (engram-utility-credit-mention-stop.py, the Stop hook). Hook scripts
+    are separate subprocesses invoked by Claude Code, hooks do not import each
+    other, and engram_core.py may not be imported by a hook, so there is no
+    shared import surface today, and a new shared module for ~15 lines isn't
+    worth the engineering (see spec docs/specs/1720-principle-state-write-race.md).
+    If any copy changes, change the other two; tests/test_utility_state_lock_3658.py
+    pins all three AST-identical (docstring dropped).
+    """
+    fd = None
+    try:
+        import fcntl
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)  # blocking -- no LOCK_NB
+    except Exception as exc:
+        # #3658 review: BOTH setup steps (the open and the flock) degrade here;
+        # flock can raise on a file the open accepted (EOPNOTSUPP on a FIFO on
+        # macOS). The lock was never taken, so it is never unlocked: just close
+        # the fd and run fn() unlocked.
+        # #1743: this degrade was silent -- nothing distinguished "locked and
+        # protected" from "running unlocked," the same diagnosis-costing gap
+        # #1737/#1742 fixed for the non-blocking cooldown lock. Emit one
+        # never-block/never-raise stderr tell (hook/server stderr goes to logs,
+        # not the model, so it is safe on every call) so a fallback-to-unlocked
+        # -- which leaves fn()'s read-modify-write unprotected against a lost
+        # update -- leaves a trace instead of being invisible. (#1742's
+        # state-file-flag half does not map onto this generic helper, which has
+        # no access to fn()'s state dict; the stderr line is the proportionate
+        # tell here.) Kept byte-identical with the sibling copy (surface-hook /
+        # engram_core) per the #1720 sync note above -- if one changes, change
+        # the other.
+        try:
+            import sys
+            print(
+                f"[engram _with_state_lock] flock degraded to UNLOCKED "
+                f"({lock_path}): {type(exc).__name__}: {exc} -- read-modify-write "
+                f"is unprotected; a concurrent write may be lost",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        return fn()  # degrade: run unlocked rather than crash or skip
+    try:
+        return fn()
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
 def _emit_enactment(
     principle_id: str,
     prompt_count: int,
@@ -433,41 +507,56 @@ def _check_enactments(
         return
 
     prompt_count = _read_prompt_count(prompt_count_path)
-    # #3521 row 40: one read rule shared with the other two readers of this
-    # file (_hooklib.read_state_json_classified). ABSENT -> {}, a JSON object
-    # -> as-is, anything else (bad JSON, a non-dict, an unreadable file, a
-    # non-regular target, a symlink) is UNKNOWN: skip the write so the file
-    # keeps its bytes (never moved here: only the per-prompt surface hook does
-    # that). The one stderr line is printed HERE, before credit_mentions'
-    # `except Exception` could swallow anything; nothing is raised.
-    state, state_reason, _movable = read_state_json_classified(state_path)
-    if state_reason is not None:
-        try:
-            msg = re.sub(r"[\x00-\x1f\x7f]", " ", state_reason)[:200]
-            print(
-                f"[engram principle-trigger-state] unusable state file "
-                f"({msg}) -- enactment count skipped; file left untouched",
-                file=sys.stderr,
-            )
-        except Exception:
-            pass
-        return
+    # #3658: the read-modify-write below runs under the SAME blocking flock the
+    # surface hook's write-back takes (`<state>.lock`, `_with_state_lock`), with
+    # the READ inside the lock (#1720 rationale: a snapshot read before the lock
+    # is stale by the time we write it, and would overwrite a concurrent
+    # surface update). The lock has no timeout, same as the surface hook; if one
+    # is ever added it must be added to every caller in one PR. Lock setup
+    # failure degrades to running unlocked with the helper's own stderr line.
+    # Telemetry is emitted after the lock is released: it does I/O.
+    emitted = []
 
-    changed = False
-    for pid in hits:
-        entry = state.get(pid)
-        if isinstance(entry, int):
-            entry = {"last_fired_prompt": entry, "strength": 1.0, "enactments": 0, "fires": 0}
-        if not isinstance(entry, dict):
-            entry = {"last_fired_prompt": 0, "strength": 1.0, "enactments": 0, "fires": 0}
-        last_fired = entry.get("last_fired_prompt", 0)
-        if (prompt_count - last_fired) >= _ENACTMENT_WINDOW_PROMPTS:
-            entry["enactments"] = entry.get("enactments", 0) + 1
-            state[pid] = entry
-            changed = True
-            _emit_enactment(pid, prompt_count, session_id=session_id, transcript_path=transcript_path)
-    if changed:
-        _write_state_atomic(state_path, state)
+    def _rmw() -> None:
+        # #3521 row 40: one read rule shared with the other two readers of this
+        # file (_hooklib.read_state_json_classified). ABSENT -> {}, a JSON object
+        # -> as-is, anything else (bad JSON, a non-dict, an unreadable file, a
+        # non-regular target, a symlink) is UNKNOWN: skip the write so the file
+        # keeps its bytes (never moved here: only the per-prompt surface hook does
+        # that). The one stderr line is printed HERE, before credit_mentions'
+        # `except Exception` could swallow anything; nothing is raised.
+        state, state_reason, _movable = read_state_json_classified(state_path)
+        if state_reason is not None:
+            try:
+                msg = re.sub(r"[\x00-\x1f\x7f]", " ", state_reason)[:200]
+                print(
+                    f"[engram principle-trigger-state] unusable state file "
+                    f"({msg}) -- enactment count skipped; file left untouched",
+                    file=sys.stderr,
+                )
+            except Exception:
+                pass
+            return
+
+        changed = False
+        for pid in hits:
+            entry = state.get(pid)
+            if isinstance(entry, int):
+                entry = {"last_fired_prompt": entry, "strength": 1.0, "enactments": 0, "fires": 0}
+            if not isinstance(entry, dict):
+                entry = {"last_fired_prompt": 0, "strength": 1.0, "enactments": 0, "fires": 0}
+            last_fired = entry.get("last_fired_prompt", 0)
+            if (prompt_count - last_fired) >= _ENACTMENT_WINDOW_PROMPTS:
+                entry["enactments"] = entry.get("enactments", 0) + 1
+                state[pid] = entry
+                changed = True
+                emitted.append(pid)
+        if changed:
+            _write_state_atomic(state_path, state)
+
+    _with_state_lock(str(state_path) + ".lock", _rmw)
+    for pid in emitted:
+        _emit_enactment(pid, prompt_count, session_id=session_id, transcript_path=transcript_path)
 
 
 def credit_mentions(

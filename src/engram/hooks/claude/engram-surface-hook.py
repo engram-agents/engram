@@ -3199,23 +3199,33 @@ def _with_state_lock(lock_path, fn):
     one blocks -- the critical section is a fast local file read+write (no
     daemon round-trip), so a brief wait is cheap and correctness (no lost
     update) matters more than never-block here. Degrades to running fn()
-    unlocked if fcntl/lockfile-open fails (non-POSIX, permissions) -- same
+    unlocked if fcntl, the lockfile open, or the flock call itself fails
+    (non-POSIX, permissions, a file type or filesystem without flock
+    support) -- same
     never-crash contract as #1709's degrade path, just without the
     non-blocking contention branch (there's nothing to suppress; fn() still
     runs, just unprotected).
 
-    #1720: this exact ~15-line helper is duplicated in engram_core.py
-    (the MCP server process) rather than shared -- this hook script (a
-    separate subprocess invoked by Claude Code) and engram_core.py have no
+    #1720: this exact ~15-line helper is duplicated rather than shared, in
+    THREE files (#3658): this one, engram_core.py (the MCP server process),
+    and engram-utility-credit-mention-stop.py (the Stop hook). Hook scripts
+    are separate subprocesses invoked by Claude Code, hooks do not import each
+    other, and engram_core.py may not be imported by a hook, so there is no
     shared import surface today, and a new shared module for ~15 lines isn't
-    worth the engineering (see spec
-    docs/specs/1720-principle-state-write-race.md). If either copy changes,
-    check the other.
+    worth the engineering (see spec docs/specs/1720-principle-state-write-race.md).
+    If any copy changes, change the other two; tests/test_utility_state_lock_3658.py
+    pins all three AST-identical (docstring dropped).
     """
+    fd = None
     try:
         import fcntl
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)  # blocking -- no LOCK_NB
     except Exception as exc:
+        # #3658 review: BOTH setup steps (the open and the flock) degrade here;
+        # flock can raise on a file the open accepted (EOPNOTSUPP on a FIFO on
+        # macOS). The lock was never taken, so it is never unlocked: just close
+        # the fd and run fn() unlocked.
         # #1743: this degrade was silent -- nothing distinguished "locked and
         # protected" from "running unlocked," the same diagnosis-costing gap
         # #1737/#1742 fixed for the non-blocking cooldown lock. Emit one
@@ -3238,9 +3248,13 @@ def _with_state_lock(lock_path, fn):
             )
         except Exception:
             pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
         return fn()  # degrade: run unlocked rather than crash or skip
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)  # blocking -- no LOCK_NB
         return fn()
     finally:
         try:

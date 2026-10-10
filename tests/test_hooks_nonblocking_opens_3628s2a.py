@@ -810,6 +810,10 @@ _HELPER_DEFS = {
                     "open_regular_text_append", "write_route_ledger",
                     "append_shown_record"},
     "engram-loop-arm-stop-hook.py": {"open_regular_text"},
+    # #3658: the utility hook's byte-identical copy of the state-lock helper (its one
+    # os.open is the O_CREAT lock-file open; the surface hook is allowed the same one
+    # by test_surface_hook_nonblocking_opens_3628s2c.py, "the state lock").
+    "engram-utility-credit-mention-stop.py": {"_with_state_lock"},
 }
 _RAW = {"read_text", "write_text", "read_bytes", "write_bytes"}
 
