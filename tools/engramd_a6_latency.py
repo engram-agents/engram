@@ -53,6 +53,8 @@ from typing import Callable, Dict, List, Optional
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_ENGRAM = REPO_ROOT / "src" / "engram"
 HOOK_PATH = SRC_ENGRAM / "hooks" / "claude" / "engram-user-identity-hook.py"
+STOP_HOOK_PATH = SRC_ENGRAM / "hooks" / "claude" / "engram-stop-hook.py"
+HOOKS = ("user-identity", "stop")  # --hook; the default stays user-identity
 N_FLOOR = 300
 
 
@@ -164,13 +166,64 @@ def launch_owner(home: Path) -> OwnerHandle:
 
 # --- the hook under test ---------------------------------------------------------
 
-def load_hook(home: Path):
+def load_hook(home: Path, path: Optional[Path] = None, name: str = "engram_user_identity_hook_a6"):
     os.environ["ENGRAM_HOME"] = str(home)
     os.environ.pop("ENGRAM_RUNTIME_DIR", None)
-    spec = importlib.util.spec_from_file_location("engram_user_identity_hook_a6", str(HOOK_PATH))
+    spec = importlib.util.spec_from_file_location(name, str(path or HOOK_PATH))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _bind_user_identity(home: Path):
+    """-> (baseline_fn, owner_fn, answers_match, answer_size, extra_result_keys)."""
+    hook = load_hook(home)
+
+    def baseline():
+        return hook.get_person_nodes()
+
+    def owner():
+        rows, failure = hook.read_people_via_owner()
+        if failure is not None:
+            raise RuntimeError(f"owner read failed: {failure}")
+        return rows
+
+    base_rows, owner_rows = baseline(), owner()
+    people_match = base_rows == owner_rows
+    return baseline, owner, people_match, len(base_rows), {
+        "people_match": people_match, "people_count": len(base_rows)}
+
+
+def _bind_stop(home: Path):
+    """The stop hook (U6a, #3664). Two module instances of the SAME hook file, one
+    with the flag reader pinned OFF (its old direct-connect path) and one pinned ON
+    (the owner path); both are timed through the hook's own `_maturity_muted()`, so
+    the threshold read is common to both and the difference is the read itself.
+    The answers compared are the RAW count (old path via a plain SELECT on the store
+    copy with the hook's registered statement, owner path via
+    `_read_count_via_owner()`) and the decision both modules return."""
+    base = load_hook(home, STOP_HOOK_PATH, "engram_stop_hook_a6_base")
+    owner_mod = load_hook(home, STOP_HOOK_PATH, "engram_stop_hook_a6_owner")
+    base._owner_reads_enabled = lambda: False
+    owner_mod._owner_reads_enabled = lambda: True
+
+    def baseline():
+        return base._maturity_muted()
+
+    def owner():
+        try:
+            return owner_mod._maturity_muted()
+        except owner_mod._OwnerReadFailure as exc:
+            raise RuntimeError(f"owner read failed: {exc.args[0]}")
+
+    conn = sqlite3.connect(str(home / "knowledge.db"))
+    try:
+        direct_count = conn.execute(base._CURRENT_COUNT_SQL).fetchone()[0]
+    finally:
+        conn.close()
+    owner_count = owner_mod._read_count_via_owner()
+    answers_match = direct_count == owner_count and baseline() == owner()
+    return baseline, owner, answers_match, direct_count, {"answer_count": direct_count}
 
 
 # --- timing ----------------------------------------------------------------------
@@ -205,7 +258,9 @@ def _timed(fn: Callable[[], object], before: Optional[Callable[[], None]] = None
 
 
 def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 30,
-            store: Optional[Path] = None) -> Dict:
+            store: Optional[Path] = None, hook: str = "user-identity") -> Dict:
+    if hook not in HOOKS:
+        raise ValueError(f"unknown hook {hook!r}; one of {HOOKS}")
     home = make_test_store(nodes=nodes, people=people, source=store)
     handle = None
     saved_env = {k: os.environ.get(k) for k in ("ENGRAM_HOME", "ENGRAM_RUNTIME_DIR")}
@@ -213,20 +268,9 @@ def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 
         handle = launch_owner(home)
         owner_cmdline = Path(f"/proc/{handle.proc.pid}/cmdline").read_bytes().replace(b"\0", b" ").decode() \
             if Path("/proc").is_dir() else ""
-        hook = load_hook(home)
         db = home / "knowledge.db"
-
-        def baseline():
-            return hook.get_person_nodes()
-
-        def owner():
-            rows, failure = hook.read_people_via_owner()
-            if failure is not None:
-                raise RuntimeError(f"owner read failed: {failure}")
-            return rows
-
-        base_rows, owner_rows = baseline(), owner()
-        people_match = base_rows == owner_rows
+        bind = _bind_stop if hook == "stop" else _bind_user_identity
+        baseline, owner, answers_match, answer_size, extra = bind(home)
         for _ in range(warmup):
             baseline()
             owner()
@@ -268,8 +312,9 @@ def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 
 
         node_count = sqlite3.connect(str(db)).execute("SELECT count(*) FROM nodes").fetchone()[0]
         return {
-            "rows": rows, "n": n, "warmup": warmup, "people_match": people_match,
-            "people_count": len(base_rows), "owner_pid": handle.proc.pid,
+            "rows": rows, "n": n, "warmup": warmup, "hook": hook,
+            "answers_match": answers_match, "answer_size": answer_size, **extra,
+            "owner_pid": handle.proc.pid,
             "owner_cmdline": owner_cmdline, "node_count": node_count,
             "db_bytes": db.stat().st_size,
             "env": {"platform": platform.platform(), "cpus": os.cpu_count(),
@@ -288,13 +333,16 @@ def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 
 
 def format_table(result: Dict) -> str:
     env = result["env"]
+    stop = result.get("hook") == "stop"
     lines = [
         f"Host: {env['platform']} ({env['cpus']} CPUs) | Python {env['python']} | SQLite {env['sqlite']}",
         f"Store copy: {result['node_count']} nodes, {result['db_bytes']} bytes, "
-        f"{result['people_count']} person rows | N={result['n']} per path per arm "
+        + (f"{result['answer_count']} current nodes" if stop else f"{result['people_count']} person rows")
+        + f" | N={result['n']} per path per arm "
         f"(contended: 2 threads x N) after {result['warmup']} warm-up calls",
         f"Real owner: pid {result['owner_pid']}, cmdline `{result['owner_cmdline'].strip()}`; "
-        f"owner rows == baseline rows: {result['people_match']}",
+        + ("owner count and muted decision == baseline: " if stop else "owner rows == baseline rows: ")
+        + f"{result['answers_match']}",
         "",
         "| arm | path | p50 ms | p99 ms | mean ms | p50 owner/baseline | p99 owner/baseline |",
         "|---|---|---|---|---|---|---|",
@@ -315,6 +363,13 @@ def format_table(result: Dict) -> str:
         "page cache only; the owner's in-process SQLite cache stays warm. Ratios do not survive across "
         "SQLite builds. Owner path includes the per-call runtime-dir resolution and client round trip.",
     ]
+    if stop:
+        lines.append(
+            "Stop hook (U6a, #3664): both paths are timed through the hook's own `_maturity_muted()` "
+            "(baseline = flag OFF, direct connect_regular_ro + SELECT; owner = flag ON, "
+            "engramd_client.read); the threshold read is common to both. The gate is the "
+            "sequential arm only; the contended and cold-cache arms are reported, not gates, and "
+            "their Linux-seat numbers are owed in the PR body.")
     return "\n".join(lines)
 
 
@@ -328,7 +383,10 @@ def _is_live_store(path: Path) -> bool:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="A6 latency delta for the user-identity owner read (U4d, #3197).")
+    p = argparse.ArgumentParser(
+        description="A6 latency delta for a hook's owner read (user-identity: U4d, #3197; stop: U6a, #3664).")
+    p.add_argument("--hook", choices=HOOKS, default="user-identity",
+                   help="which hook's owner read to measure (default: user-identity)")
     p.add_argument("--n", type=int, default=N_FLOOR)
     p.add_argument("--nodes", type=int, default=5000)
     p.add_argument("--people", type=int, default=5)
@@ -343,9 +401,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"engramd_a6_latency: error -- {args.store} is this seat's live store; "
               "refusing. Pass a COPY of a test store.", file=sys.stderr)
         return 2
-    result = measure(n=args.n, nodes=args.nodes, people=args.people, warmup=args.warmup, store=args.store)
+    result = measure(n=args.n, nodes=args.nodes, people=args.people, warmup=args.warmup,
+                     store=args.store, hook=args.hook)
     print(format_table(result))
-    return 0 if result["people_match"] else 1
+    return 0 if result["answers_match"] else 1
 
 
 if __name__ == "__main__":

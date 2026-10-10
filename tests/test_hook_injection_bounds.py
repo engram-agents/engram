@@ -261,6 +261,12 @@ class TestNoBareJoinOutsideHelper:
         "engram-end-of-day-hook.py",
         "engram-stale-tree-warn-hook.py",
         "engram-time-bar-hook.py",
+        # engram-stop-hook.py (#3664): its only additionalContext is the one-line
+        # failed-flag-helper report, fixed format and bounded by construction (a
+        # class name capped at 80 chars: <= ~124 chars, orders of magnitude under any
+        # per-harness budget), with no head/body split. Same atomic-emitter reasoning
+        # as the four above; the nudge itself is a `reason`, not additionalContext.
+        "engram-stop-hook.py",
         # engram-session-start-hook.py: NO LONGER excluded (engram-alpha#127
         # closed this gap) -- its main() now routes the whole
         # priority-tagged block assembly through _hooklib.emit_context(),

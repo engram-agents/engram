@@ -214,8 +214,10 @@
         "tests/test_stop_hook_idle_suppression.py",
         "tests/test_stop_hook_maturity_gate.py",
         "tests/test_stop_hook_prose_gate.py",
+        "tests/test_stop_hook_owner_read_3664.py",
         "tests/test_codex_hook_envelopes.py"
-      ]
+      ],
+      "note": "engram-alpha#3664 (U6a): test_stop_hook_owner_read_3664.py added -- the flagged owner-read path's differential harness (C1), flag-off (C0/C2), owner-down (C3), timeout-budget (C4), flattened-layout (C5) and launcher-gate (C6) cells; the hook is loaded via importlib (hyphenated name), invisible to the import graph."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-surface-daemon.py",
