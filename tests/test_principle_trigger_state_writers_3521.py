@@ -409,16 +409,38 @@ class TestCoreUnknown:
             self, state_kind, tmp_path, monkeypatch, capsys):
         import ast
         import fcntl
+        import re
         text = _merge_base_text(_CORE_REL)
         tree = ast.parse(text)
         want = {"_with_state_lock", "_reset_principle_enactments"}
         picked = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in want]
         assert {n.name for n in picked} == want
+
+        def _code_dump(fn):
+            # Same comparison as test_regular_io_parity_3628._dump_fn: docstring
+            # dropped, so wording may differ but code may not.
+            body = list(fn.body)
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                body = body[1:]
+            return ast.dump(ast.FunctionDef(
+                name=fn.name, args=fn.args, body=body,
+                decorator_list=fn.decorator_list, returns=fn.returns,
+                type_comment=None,
+                **({"type_params": []} if hasattr(fn, "type_params") else {})))
+
+        head_tree = ast.parse((PROJECT_ROOT / _CORE_REL).read_text(encoding="utf-8"))
+        head_dumps = {n.name: _code_dump(n) for n in head_tree.body
+                      if isinstance(n, ast.FunctionDef) and n.name in want}
+        if {n.name: _code_dump(n) for n in picked} == head_dumps:
+            pytest.skip("merge-base core already carries this code; nothing to compare")
         dev_home = tmp_path / "dev"
         new_home = tmp_path / "new"
         dev_home.mkdir()
         new_home.mkdir()
-        ns = {"os": os, "json": json, "sys": sys, "fcntl": fcntl, "DATA_DIR": str(dev_home)}
+        ns = {"os": os, "json": json, "sys": sys, "fcntl": fcntl, "re": re,
+              "_regular_io": _core_io(), "DATA_DIR": str(dev_home)}
         exec(compile(ast.Module(body=picked, type_ignores=[]), "mb_core", "exec"), ns)
         core = _fresh_core(new_home, monkeypatch)
         capsys.readouterr()  # engram_core's import-time stderr is not this contract
