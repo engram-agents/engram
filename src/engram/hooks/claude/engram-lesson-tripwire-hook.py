@@ -758,7 +758,7 @@ def _ws4_config() -> dict:
 def _build_ws4_ledger_entry(
     *, ts, ts_iso, hook_input, raw_tool_use_id, nonce, draw_basis, seed,
     arm, shown_lesson_ids, cut_lesson_ids, heads_by_lesson, nudge_chars,
-    principles_block, chain_rendered, error,
+    principles_block, chain_rendered, error, chain_cut=False,
 ) -> dict:
     """Assemble one full WS4 fire-ledger row (schema per the WS4 spec).
 
@@ -792,6 +792,10 @@ def _build_ws4_ledger_entry(
         "nudge_chars": nudge_chars,
         "chain_chars": len(principles_block),
         "chain_rendered": chain_rendered,
+        # #3677: True iff the final total-budget pass dropped the chain block.
+        # chain_chars above stays the WOULD-RENDER length; chain_rendered is
+        # whether the chain was delivered (False when cut).
+        "chain_cut": bool(chain_cut),
     }
     if error is not None:
         entry["error"] = error
@@ -809,6 +813,63 @@ def _append_ws4_fire_ledger(entry: dict) -> None:
             f.write(json.dumps(entry) + "\n")
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# #3677 -- the final total-budget pass. main() joins [tripwire block, chain,
+# in-turn recall]; the block alone is bounded by emit_context, but the joined
+# string was not, and the harness cuts the TAIL of an oversized injection (where
+# the chain and recall sit). The pass cuts in whole units, recall (whole id
+# lines from the end) first, then the chain (one whole block), never the block,
+# and says so on the FIRST line, counted inside the budget via the reserve.
+# Priority order: block, then chain, then recall; the chain also goes when the
+# marker would not fit after the recall is gone (better than truncating a lesson
+# hit in-band to save a chain).
+# ---------------------------------------------------------------------------
+
+# Room taken off the budget whenever the pass must cut, so the first-line clause
+# (" · tail cut: R recall lines, C chain lines", <= 52 chars for 6-digit counts)
+# can never push the total over the budget. Nothing is reserved when nothing is cut.
+_TAIL_CUT_RESERVE = 64
+_TRAILER_PREFIX_RE = re.compile(r"^▸ \d+ shown · \d+ cut")
+
+
+def _tail_cut_clause(recall_cut: int, chain_cut_lines: int, own_line: bool = False) -> str:
+    """The first-line marker. Inside a tripwire trailer it is a clause that sits
+    right after "N cut"; with no tripwire block it is its own first line."""
+    text = f"tail cut: {recall_cut} recall lines, {chain_cut_lines} chain lines"
+    return f"▸ {text}" if own_line else f" · {text}"
+
+
+def _apply_tail_cut(parts: list, recall_cut: int, chain_cut_lines: int, has_block: bool) -> list:
+    """Return `parts` with the marker on the FIRST line (a new list; never mutates).
+    With a tripwire block, the clause goes after `▸ N shown · M cut` and before any
+    ` · head trimmed` / ` — see <path>` text, so the trailer's path stays last."""
+    out = list(parts)
+    if has_block and out:
+        m = _TRAILER_PREFIX_RE.match(out[0])
+        if m:
+            out[0] = out[0][: m.end()] + _tail_cut_clause(recall_cut, chain_cut_lines) + out[0][m.end():]
+            return out
+    return [_tail_cut_clause(recall_cut, chain_cut_lines, own_line=True)] + out
+
+
+def _place_chain(parts: list, block: str, budget) -> tuple:
+    """(delivered, cut_lines): whether the chain block is kept whole by C3's rule,
+    and, when it is dropped, how many lines the dropped block had (else 0)."""
+    if _chain_fits(parts, block, budget):
+        return True, 0
+    return False, block.count("\n") + 1
+
+
+def _chain_fits(parts: list, block: str, budget) -> bool:
+    """C3's chain rule: keep the chain iff the pieces so far plus the whole chain
+    block fit the budget. Fail-open toward delivering (any error, or no known
+    budget, keeps the chain exactly as before #3677)."""
+    try:
+        return budget is None or len("\n".join(parts + [block])) <= budget
+    except Exception:
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -1317,8 +1378,12 @@ def _query_recall_daemon(query: str, top_k: int = 5) -> dict | None:
         return None
 
 
+_RECALL_FOOTER = "\n  (ambient action-moment recall; engram_inspect(id) for detail)"
+
+
 def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
-                         record_out: dict | None = None) -> str:
+                         record_out: dict | None = None,
+                         max_chars: int | None = None, cut_reserve: int = 0) -> str:
     """Budgeted general recall at action-moment, behind the novelty gate.
 
     hook_input (#1749): the raw PreToolUse payload, passed through from
@@ -1339,7 +1404,17 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
     to the joined additionalContext, and the harness silently cuts the TAIL of
     an oversized injection. So main() records ``record_out["ids"]`` only when
     the WHOLE joined string fits the harness budget; otherwise it records an
-    empty-ids line (under-record, never over-record)."""
+    empty-ids line (under-record, never over-record).
+
+    max_chars / cut_reserve (#3677): the final total-budget pass. ``max_chars``
+    is the room the rendered recall may take (None = no cap, today's behaviour).
+    When the full rendering is longer than it, id lines are cut WHOLE from the
+    END until the REAL rendered string (header + footer included) fits
+    ``max_chars - cut_reserve`` -- BEFORE the route ledger, ``recent_ids`` and
+    the fire-ledger row are written, so all of them list only the survivors (a
+    cut id is shown again on a later fire). Cut ids carry the route-ledger cut
+    name "tail_budget"; ``record_out["tail_cut_lines"]`` is how many id lines
+    were cut. If no id line survives the result is "" with outcome "budget_cut"."""
     import time
 
     cfg = _in_turn_config()
@@ -1622,11 +1697,30 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
             lines.append(f"  - [{nid}] {kw_str}{body}")
             rendered_ids.append(nid)
 
+        # #3677: the total-budget cut, BEFORE anything below records what was
+        # shown. Whole id lines from the END; measured on the real rendering.
+        tail_cut = 0
+        if max_chars is not None and lines:
+            _header = f"[ENGRAM in-turn recall — novel terms: {', '.join(novel)}]\n"
+            if len(_header + "\n".join(lines) + _RECALL_FOOTER) > max_chars:
+                _limit = max_chars - cut_reserve
+                keep = len(lines)
+                while keep > 0 and len(_header + "\n".join(lines[:keep]) + _RECALL_FOOTER) > _limit:
+                    keep -= 1
+                for _nid in rendered_ids[keep:]:
+                    _cut_names[_nid] = "tail_budget"
+                tail_cut = len(lines) - keep
+                lines = lines[:keep]
+                rendered_ids = rendered_ids[:keep]
+        if record_out is not None:
+            record_out["tail_cut_lines"] = tail_cut
+
         _route_ledger(result, rendered_ids, _cut_names)
         _record_fire()
         if not lines:
             _write_state()
-            _append_ledger(lambda: _ledger_entry("all_suppressed", result.get("match_count", 0), [], skipped_recent))
+            _outcome = "budget_cut" if tail_cut else "all_suppressed"
+            _append_ledger(lambda: _ledger_entry(_outcome, result.get("match_count", 0), [], skipped_recent))
             return ""
 
         ids = state.get("recent_ids", [])
@@ -1640,7 +1734,7 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
         return (
             f"[ENGRAM in-turn recall — novel terms: {', '.join(novel)}]\n"
             + "\n".join(lines)
-            + "\n  (ambient action-moment recall; engram_inspect(id) for detail)"
+            + _RECALL_FOOTER
         )
     finally:
         if lock_fd is not None and lock_acquired:
@@ -1667,6 +1761,9 @@ def main() -> None:
     # #3521 row 9: set right after a response JSON was printed, so the outer
     # handler never prints a second object.
     response_printed = False
+    # #3677: WS4 rows are written after the total-budget pass (a late chain drop
+    # patches them); the crash handler below flushes any still pending.
+    _ws4_rows: list = []
     try:
         match_target = build_match_target(hook_input)
         if not match_target or not match_target.strip():
@@ -1719,6 +1816,17 @@ def main() -> None:
             sys.exit(0)
 
         parts = []
+
+        # #3677 -- final total-budget pass state. _tb_budget None (an unreadable
+        # budget) disables the pass: fail-open toward delivering, as before.
+        try:
+            _tb_budget = get_harness_budgets(detect_harness())["budget"]
+        except Exception:
+            _tb_budget = None
+        _block_call = None        # (head, body, kwargs) of the tripwire block's emit_context call
+        _chain_cut = False        # the chain block was dropped by the pass
+        _chain_cut_lines = 0      # lines in the dropped chain block
+        _chain_in_parts = False   # the chain block is currently in `parts`
 
         tripwires = load_tripwires()
         hits = check_command(match_target, tripwires) if tripwires else []
@@ -1820,18 +1928,32 @@ def main() -> None:
                 ids = ", ".join(h.get("node_id", "?") for h in cut)
                 return f"{path} ({ids})"
 
+            # #3677: remembers the first call's overflow path, so the (rare)
+            # corner re-render of this block under a smaller budget does not write
+            # a second overflow file for the same cut items.
+            _ow_memo: dict = {}
+
+            def _cached_overflow_writer(items: list) -> str:
+                key = tuple(items)
+                if key not in _ow_memo:
+                    _ow_memo[key] = _tripwire_overflow_writer(items)
+                return _ow_memo[key]
+
             budgets = get_harness_budgets(detect_harness())
-            parts.append(emit_context(
+            _block_call = (
                 # #3503: the failure line, when due, is part of the head (so it
                 # shares emit_context's target/budget accounting and sits above
                 # the bullets); unchanged TRIPWIRE_HEADER otherwise.
                 f"{loader_notice}\n{TRIPWIRE_HEADER}" if loader_notice else TRIPWIRE_HEADER,
                 bullets,
-                budget=budgets["budget"],
-                target=TRIPWIRE_BLOCK_CHAR_CEILING,
-                allow_single_overflow=True,
-                overflow_writer=_tripwire_overflow_writer,
-            ))
+                dict(
+                    budget=budgets["budget"],
+                    target=TRIPWIRE_BLOCK_CHAR_CEILING,
+                    allow_single_overflow=True,
+                    overflow_writer=_cached_overflow_writer,
+                ),
+            )
+            parts.append(emit_context(_block_call[0], _block_call[1], **_block_call[2]))
 
             # shown_hits feeds render_triggered_principles below (Piece 3)
             # — never the full, uncapped `hits`, so a "[triggered
@@ -1852,12 +1974,12 @@ def main() -> None:
             # otherwise be silent -- the line IS the block, still rendered by
             # emit_context (trailer first, same budget rules).
             budgets = get_harness_budgets(detect_harness())
-            parts.append(emit_context(
+            _block_call = (
                 loader_notice,
                 [],
-                budget=budgets["budget"],
-                target=TRIPWIRE_BLOCK_CHAR_CEILING,
-            ))
+                dict(budget=budgets["budget"], target=TRIPWIRE_BLOCK_CHAR_CEILING),
+            )
+            parts.append(emit_context(_block_call[0], _block_call[1], **_block_call[2]))
 
         # #2753 epic WS2 (D3 point 1) — generalization-chain render, ADDITIVE
         # after the nudge block above and independently guarded: a failure
@@ -1893,7 +2015,13 @@ def main() -> None:
             ws4_cfg = _ws4_config()
             if not ws4_cfg["active"]:
                 if principles_block:
-                    parts.append(principles_block)
+                    # #3677: whole-block rule, decided where the chain is appended.
+                    _delivered, _cl = _place_chain(parts, principles_block, _tb_budget)
+                    if _delivered:
+                        parts.append(principles_block)
+                        _chain_in_parts = True
+                    else:
+                        _chain_cut, _chain_cut_lines = True, _cl
             else:
                 # Round 2 (reviewer-fairy suggestion #1 on PR #3166): arm
                 # computation and ledger-row construction now get their OWN
@@ -1938,9 +2066,15 @@ def main() -> None:
                         ) & 1
                         arm = "chain" if draw == 1 else "control"
                         if arm == "chain":
-                            parts.append(principles_block)
-                            appended_chain = True
-                            chain_rendered = True
+                            # #3677: the arm draw above is untouched by the cut.
+                            _delivered, _cl = _place_chain(parts, principles_block, _tb_budget)
+                            if _delivered:
+                                parts.append(principles_block)
+                                appended_chain = True
+                                chain_rendered = True
+                                _chain_in_parts = True
+                            else:
+                                _chain_cut, _chain_cut_lines = True, _cl
                         # control arm: principles_block computed but withheld.
                 except Exception as exc:
                     # Dev-parity fallback -- render exactly as the INACTIVE
@@ -1949,9 +2083,14 @@ def main() -> None:
                     # of silently dropped. Guard against double-appending if
                     # the exception struck AFTER a successful chain-arm
                     # append above.
-                    if principles_block and not appended_chain:
-                        parts.append(principles_block)
-                        chain_rendered = True
+                    if principles_block and not appended_chain and not _chain_cut:
+                        _delivered, _cl = _place_chain(parts, principles_block, _tb_budget)
+                        if _delivered:
+                            parts.append(principles_block)
+                            chain_rendered = True
+                            _chain_in_parts = True
+                        else:
+                            _chain_cut, _chain_cut_lines = True, _cl
                     arm = "error"
                     arm_error = f"{type(exc).__name__}: {str(exc)[:200]}"
 
@@ -1969,6 +2108,16 @@ def main() -> None:
                 # dropping the fire.
                 now = None
                 ts_iso = None
+                # #3677: the row is written AT CREATION, as on dev (a hook killed
+                # during the recall keeps it), except in the sliver where a late
+                # chain drop (the marker not fitting once the recall is gone) could
+                # still change it: only then is it held until the pass has settled.
+                _defer_row = False
+                try:
+                    _defer_row = (_tb_budget is not None and
+                                  len("\n".join(parts)) > _tb_budget - _TAIL_CUT_RESERVE)
+                except Exception:
+                    _defer_row = False
                 try:
                     import time as _time
                     from datetime import datetime as _ws4_dt, timezone as _ws4_tz
@@ -1984,8 +2133,12 @@ def main() -> None:
                         nudge_chars=nudge_chars,
                         principles_block=principles_block,
                         chain_rendered=chain_rendered, error=arm_error,
+                        chain_cut=_chain_cut,
                     )
-                    _append_ws4_fire_ledger(entry)
+                    if _defer_row:
+                        _ws4_rows.append(entry)
+                    else:
+                        _append_ws4_fire_ledger(entry)
                 except Exception as row_exc:
                     # Row construction itself failed -- still count the
                     # fire with a MINIMAL row (fixed 8-field shape) rather
@@ -1994,7 +2147,7 @@ def main() -> None:
                     # is what raised -- the minimal row is written with
                     # whatever timestamp is available. The write below
                     # keeps its own internal fail-open behaviour.
-                    _append_ws4_fire_ledger({
+                    _fallback_row = {
                         "schema_version": 1,
                         "experiment": "ws4_chain_ab",
                         "ts": now,
@@ -2012,7 +2165,11 @@ def main() -> None:
                         # decision itself was corrupted, not just its
                         # downstream bookkeeping.
                         "error": arm_error or f"{type(row_exc).__name__}: {str(row_exc)[:200]}",
-                    })
+                    }
+                    if _defer_row:
+                        _ws4_rows.append(_fallback_row)
+                    else:
+                        _append_ws4_fire_ledger(_fallback_row)
 
         # alpha#1944 step 2 — shadow-block logging. Independently guarded,
         # same posture as in-turn recall below: a logging failure must never
@@ -2046,16 +2203,67 @@ def main() -> None:
         # recall text), and a fire that passed the gate but rendered nothing
         # leaves ids == [] so the per-fire line (prompt_index) stays continuous.
         _pending_shown: dict = {}
+        # #3677: the room the recall may take, decided from what is already in
+        # `parts`, so the recall is trimmed (and its state written) ONCE, for the
+        # survivors. After a chain cut the reserve is already owed (a cut happened);
+        # otherwise it is taken only if the recall itself has to be cut.
+        _recall_kw: dict = {}
+        try:
+            if _tb_budget is not None:
+                _room = _tb_budget - (len("\n".join(parts)) + 1 if parts else 0)
+                if _chain_cut:
+                    _recall_kw = {"max_chars": _room - _TAIL_CUT_RESERVE}
+                else:
+                    _recall_kw = {"max_chars": _room, "cut_reserve": _TAIL_CUT_RESERVE}
+        except Exception:
+            _recall_kw = {}
         try:
             if _recall_state == "empty":
                 recall = ""
             else:
-                recall = check_in_turn_recall(_recall_text, hook_input, _pending_shown)
+                recall = check_in_turn_recall(_recall_text, hook_input, _pending_shown, **_recall_kw)
         except Exception:
             recall = ""
             _pending_shown.clear()
         if recall:
             parts.append(recall)
+
+        # #3677: the first-line marker, counted inside the budget. Fail-open: an
+        # exception here leaves `parts` exactly as it was (dev-shaped output).
+        try:
+            _recall_cut_n = int(_pending_shown.get("tail_cut_lines", 0) or 0)
+            if _tb_budget is not None and (_recall_cut_n or _chain_cut):
+                _final = _apply_tail_cut(parts, _recall_cut_n, _chain_cut_lines, _block_call is not None)
+                if len("\n".join(_final)) > _tb_budget and _chain_in_parts:
+                    # The chain fit by the whole-block rule but the clause does not,
+                    # and the recall is already gone (its room was below the
+                    # reserve). Priority is block > chain > recall, so the chain
+                    # goes too, whole: truncating a lesson hit in-band to keep a
+                    # chain would be the worse trade.
+                    _chain_part = parts[1] if (_block_call is not None and len(parts) > 1) else parts[0]
+                    parts = [p for p in parts if p is not _chain_part]
+                    _chain_cut, _chain_in_parts = True, False
+                    _chain_cut_lines = _chain_part.count("\n") + 1
+                    for _row in _ws4_rows:
+                        if "chain_rendered" in _row:
+                            _row["chain_cut"], _row["chain_rendered"] = True, False
+                    _final = _apply_tail_cut(parts, _recall_cut_n, _chain_cut_lines, _block_call is not None)
+                if len("\n".join(_final)) > _tb_budget and _block_call is not None:
+                    # Corner: the block alone is within the reserve of the budget.
+                    # Re-render it (deterministic) under budget - reserve; the
+                    # overflow path is reused, not rewritten (see _cached_overflow_writer).
+                    _new_block = emit_context(
+                        _block_call[0], _block_call[1],
+                        **{**_block_call[2], "budget": _tb_budget - _TAIL_CUT_RESERVE})
+                    parts = [_new_block] + parts[1:]
+                    _final = _apply_tail_cut(parts, _recall_cut_n, _chain_cut_lines, True)
+                if len("\n".join(_final)) <= _tb_budget:
+                    parts = _final
+        except Exception:
+            pass
+        # WS4 rows are written once the pass has settled (a late chain drop patches them).
+        while _ws4_rows:
+            _append_ws4_fire_ledger(_ws4_rows.pop(0))
 
         if not parts:
             # Nothing is printed, nothing was shown: the empty-ids line is true.
@@ -2105,6 +2313,8 @@ def main() -> None:
             # ceiling, so this check also under-records in that narrow band.
             # That is the intended direction: do NOT "fix" it to the measured
             # number.
+            # #3677: since the total-budget pass above this can no longer fire
+            # (the joined string is <= budget by construction); kept as a guard.
             try:
                 _fits = len(additionalContext) <= get_harness_budgets(
                     detect_harness())["budget"]
@@ -2123,6 +2333,11 @@ def main() -> None:
         # stderr line always, and -- only if no response was printed yet and the
         # rate-limit window is open -- one UNKNOWN context line. Never denies,
         # always exits 0, and the handler itself must never raise.
+        try:
+            while _ws4_rows:  # #3677: a pending WS4 row is still a fire
+                _append_ws4_fire_ledger(_ws4_rows.pop(0))
+        except Exception:
+            pass
         try:
             reason = f"{type(exc).__name__}: {exc}"
             write_probe_unknown_stderr("engram-lesson-tripwire-hook", "tripwire-run", reason)

@@ -423,14 +423,25 @@ def _budget(monkeypatch, mod, n):
                         lambda h: {"budget": n, "head_budget": n, "measured": True})
 
 
+def _bypass_total_budget_pass(mod, monkeypatch):
+    """#3677: the recall is not trimmed (max_chars/cut_reserve ignored) and the
+    chain is never dropped, so an over-budget joined string can still be built."""
+    real = mod.check_in_turn_recall
+    monkeypatch.setattr(mod, "check_in_turn_recall",
+                        lambda mt, hi=None, ro=None, **kw: real(mt, hi, ro))
+    monkeypatch.setattr(mod, "_chain_fits", lambda parts, block, budget: True)
+
+
 def test_b1_near_budget_lesson_plus_recall_records_empty_ids(monkeypatch):
     """[RED-ON-BASE] the harness budget as detected here (the unmeasured floor,
     4000, when no harness env is set; 9500 on claude-code), one ~9,000-char lesson
     nudge through the real emit_context path (the lesson block alone already
     fills the budget, the recall appended after it pushes the joined string past
     it). Printed, and an EMPTY line lands.
-    Mutant: record the pending ids regardless of size -> red."""
+    Mutant: record the pending ids regardless of size -> red.
+    the total-budget pass (#3677) normally prevents this state; the pass is bypassed here to keep the #3674 guard pinned."""
     mod = _load("b1")
+    _bypass_total_budget_pass(mod, monkeypatch)
     _with_lesson(mod, monkeypatch, 9000)
     budget = mod.get_harness_budgets(mod.detect_harness())["budget"]
     out, _ = _main(mod, monkeypatch, _response(_ids(1, 2)))
@@ -453,8 +464,10 @@ def test_b2_small_lesson_plus_recall_within_budget_records_full_ids(monkeypatch)
 
 def test_b3_boundary_exactly_budget_records_budget_plus_one_does_not(monkeypatch):
     """Exactly the budget -> ids recorded [GUARD]; budget + 1 -> empty ids
-    [RED-ON-BASE].  Mutant: `>=` instead of `>` -> the exactly-budget half red."""
+    [RED-ON-BASE].  Mutant: `>=` instead of `>` -> the exactly-budget half red.
+    the total-budget pass (#3677) normally prevents this state; the pass is bypassed here to keep the #3674 guard pinned."""
     mod = _load("b3")
+    _bypass_total_budget_pass(mod, monkeypatch)
     _budget(monkeypatch, mod, 10**6)
     out, _ = _main(mod, monkeypatch, _response(_ids(1, 2)))
     length = len(_ctx(out))
@@ -477,8 +490,10 @@ def test_b3_boundary_exactly_budget_records_budget_plus_one_does_not(monkeypatch
 def test_b4_small_recall_after_a_huge_block_still_records_empty(monkeypatch):
     """[RED-ON-BASE] the recall block alone is far under the budget, the TOTAL is
     over: compare the total.  Mutant: compare only the recall block's length to
-    the budget -> red."""
+    the budget -> red.
+    the total-budget pass (#3677) normally prevents this state; the pass is bypassed here to keep the #3674 guard pinned."""
     mod = _load("b4")
+    _bypass_total_budget_pass(mod, monkeypatch)
     _budget(monkeypatch, mod, 1500)
     _with_lesson(mod, monkeypatch, 1400)
     recall_len = len(mod.check_in_turn_recall("Bash alphaterm betaterm"))
