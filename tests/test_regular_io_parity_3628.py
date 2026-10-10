@@ -2,8 +2,9 @@
 
 `hooks/claude/_hooklib.py` must stay self-contained (tests copy it alone into
 synthetic hooks/ layouts; every hook imports it), so it cannot import the core
-module `engram_regular_io.py`. The five shared helpers (the four of #3591 plus
-`open_regular_text_append`, #3628) are therefore duplicated, and this file pins
+module `engram_regular_io.py`. The shared helpers (the four of #3591 plus
+`open_regular_text_append`, #3628, plus `read_state_json_classified`, #3521 row
+40) are therefore duplicated, and this file pins
 the two copies together two ways:
 
   (a) BEHAVIOURAL: one cell set, parametrised over BOTH implementations.
@@ -47,7 +48,13 @@ LOOP_ARM = HOOK_DIR / "engram-loop-arm-stop-hook.py"
 GUARD_S = int(os.environ.get("REGULAR_IO_PARITY_GUARD_S", "8"))
 IMPLS = ["_hooklib", "engram_regular_io"]
 SHARED = ["_not_regular_error", "open_regular_text", "read_regular_text",
-          "open_regular_text_write", "open_regular_text_append"]
+          "open_regular_text_write", "open_regular_text_append",
+          # #3521 row 40: the principle-trigger-state UNKNOWN read rule. Core may
+          # not import a hook module, so it keeps its own copy beside
+          # read_regular_text; the two are pinned by the same AST cell. Its
+          # behaviour table (incl. the ruling-5 symlink rows) is P1 in
+          # tests/test_principle_trigger_state_writers_3521.py.
+          "read_state_json_classified"]
 # The loop-arm hook's import-failure fallback copies (see module docstring).
 LOOP_ARM_FALLBACK = ["_not_regular_error", "open_regular_text"]
 # A generated module holding ONLY the fallback defs, importable like an impl.

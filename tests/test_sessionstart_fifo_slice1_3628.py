@@ -200,7 +200,8 @@ def test_core_module_does_not_import_from_hooks():
         elif isinstance(n, ast.ImportFrom):
             mods.add((n.module or "").split(".")[0])
     assert not ({"_hooklib", "hooks", "context_tracker"} & mods)
-    assert mods <= {"__future__", "errno", "os", "stat"}
+    # json: read_state_json_classified (#3521 row 40) parses the state file.
+    assert mods <= {"__future__", "errno", "json", "os", "stat"}
 
 
 def test_append_regular_file_creates_appends_and_honours_umask(tmp_path):

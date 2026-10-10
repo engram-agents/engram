@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -78,6 +79,7 @@ _HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
 if _HOOK_DIR not in sys.path:
     sys.path.insert(0, _HOOK_DIR)
 from _hooklib import atomic_write_json, resolve_runtime_dir
+from _hooklib import read_state_json_classified  # #3521 row 40
 # #3628: every read and the log append are non-blocking and regular-file-only.
 from _hooklib import open_regular_text, open_regular_text_append
 
@@ -431,17 +433,25 @@ def _check_enactments(
         return
 
     prompt_count = _read_prompt_count(prompt_count_path)
-    try:
-        with open_regular_text(state_path) as f:
-            state = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        state = {}
-    except OSError:
-        # As above: swallow only a non-regular state path; else propagate.
-        if os.path.exists(state_path) and not os.path.isfile(state_path):
-            state = {}
-        else:
-            raise
+    # #3521 row 40: one read rule shared with the other two readers of this
+    # file (_hooklib.read_state_json_classified). ABSENT -> {}, a JSON object
+    # -> as-is, anything else (bad JSON, a non-dict, an unreadable file, a
+    # non-regular target, a symlink) is UNKNOWN: skip the write so the file
+    # keeps its bytes (never moved here: only the per-prompt surface hook does
+    # that). The one stderr line is printed HERE, before credit_mentions'
+    # `except Exception` could swallow anything; nothing is raised.
+    state, state_reason, _movable = read_state_json_classified(state_path)
+    if state_reason is not None:
+        try:
+            msg = re.sub(r"[\x00-\x1f\x7f]", " ", state_reason)[:200]
+            print(
+                f"[engram principle-trigger-state] unusable state file "
+                f"({msg}) -- enactment count skipped; file left untouched",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+        return
 
     changed = False
     for pid in hits:

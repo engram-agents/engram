@@ -9855,11 +9855,24 @@ def _reset_principle_enactments(principle_id: str) -> None:
     lock_path = path + ".lock"
 
     def _do_reset():
-        try:
-            with open(path, "r") as f:
-                state = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            state = {}
+        # #3521 row 40: one read rule shared with the hooks (ABSENT -> {}, a
+        # JSON object -> as-is, anything else -> UNKNOWN). On UNKNOWN the file
+        # is neither moved (only the per-prompt surface hook does that) nor
+        # written: a corrupt / non-dict / unreadable / symlinked state file
+        # keeps its bytes. The one stderr line is printed HERE, before any
+        # caller's `except Exception: pass` could eat it; nothing is raised.
+        state, reason, _movable = _regular_io.read_state_json_classified(path)
+        if reason is not None:
+            try:
+                msg = re.sub(r"[\x00-\x1f\x7f]", " ", reason)[:200]
+                print(
+                    f"[engram principle-trigger-state] unusable state file "
+                    f"({msg}) -- enactment reset skipped; file left untouched",
+                    file=sys.stderr,
+                )
+            except Exception:
+                pass
+            return
         entry = state.get(principle_id)
         if isinstance(entry, int):
             entry = {"last_fired_prompt": entry, "strength": 1.0, "enactments": 0, "fires": 0}

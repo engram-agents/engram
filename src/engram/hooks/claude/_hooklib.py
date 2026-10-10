@@ -954,6 +954,8 @@ def read_state_json_classified(path):
     Returns `(state, unknown_reason, movable)`; never raises:
 
       * ABSENT (FileNotFoundError)              -> `({}, None, False)`
+      * a SYMLINK (even to a valid file, even
+        dangling)                               -> `({}, "SymlinkStatePath: ...", False)`
       * a JSON object (dict)                    -> `(state, None, False)`
       * bad JSON / undecodable bytes / absurd
         nesting (the bytes WERE read)           -> `({}, "<Class>: <msg>", True)`
@@ -969,8 +971,27 @@ def read_state_json_classified(path):
     it, and the bytes stay where they are. The reason string is
     `"<ExceptionClass>: <message>"`, the shape `split_probe_reason` /
     `probe_unknown_line` already consume. The read never blocks (see
-    open_regular_text)."""
+    open_regular_text).
+
+    A symlinked path is UNKNOWN and never movable (maintainer ruling 5): the
+    read follows a link and fstat-checks its TARGET, so a link to a regular
+    file would read as regular, and the move-aside `os.replace` would rename
+    the LINK and leave the corrupt target in place behind a `.corrupt` link.
+    `os.lstat` runs first; a dangling link is still a link (UNKNOWN, not
+    absent). Kept AST-identical with `engram_regular_io.read_state_json_classified`
+    (pinned by tests/test_regular_io_parity_3628.py)."""
     try:
+        try:
+            lst = os.lstat(path)
+        except FileNotFoundError:
+            return {}, None, False
+        except OSError as exc:
+            return {}, f"{type(exc).__name__}: {exc}", False
+        if stat.S_ISLNK(lst.st_mode):
+            return {}, (
+                "SymlinkStatePath: state path is a symlink; replace the link "
+                "with a regular file to restore cooldowns"
+            ), False
         try:
             data = json.loads(read_regular_text(path))
         except FileNotFoundError:

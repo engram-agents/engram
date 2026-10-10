@@ -597,19 +597,27 @@ def _c_ut_state(ctx):
     (ctx.eh / "reg.json").write_text(json.dumps({"k": [{"principle_id": "pid-a"}]}))
     (ctx.eh / "pc.json").write_text(json.dumps({"prompts_since_compaction": 50}))
     ctx.special(ctx.eh / "st.json", "{}")
-    return ("mod.PRINCIPLE_TRIGGERS_PATH = P['eh'] + '/reg.json'\n"
+    return (_STAT + "mod.PRINCIPLE_TRIGGERS_PATH = P['eh'] + '/reg.json'\n"
             "mod._check_enactments(['pid-a'], state_path=P['eh'] + '/st.json',\n"
             "                      prompt_count_path=P['eh'] + '/pc.json')\n"
-            "result = json.load(open(P['eh'] + '/st.json'))['pid-a']['enactments']",
-            # unreadable state -> treated as empty; the atomic write then replaces the FIFO
-            {"fifo": lambda r: r == 1, "regular": lambda r: r == 1})
+            "p = P['eh'] + '/st.json'\n"
+            "result = 'fifo' if stat.S_ISFIFO(os.stat(p).st_mode) else json.load(open(p))['pid-a']['enactments']",
+            # #3521 row 40: a non-regular state path is UNKNOWN, so the hook
+            # skips the write and the FIFO is left in place (it used to be
+            # treated as empty and replaced by the atomic write). The cell
+            # reads the result without open()ing the FIFO, which would block.
+            {"fifo": lambda r: r == "fifo", "regular": lambda r: r == 1})
 
 
-# A REGULAR file whose open fails with PermissionError must PROPAGATE out of
-# _check_enactments exactly as on origin/dev (whose handler caught only
+# A REGULAR registry file whose open fails with PermissionError must PROPAGATE
+# out of _check_enactments exactly as on origin/dev (whose handler caught only
 # FileNotFoundError / JSONDecodeError). Only a non-regular target (the FIFO /
-# directory refusal) is swallowed. The failure is forced two ways at once so the
-# very same assertion runs against both trees: the helper this branch calls
+# directory refusal) is swallowed. (The STATE file is no longer in this cell:
+# since #3521 row 40 it is read through _hooklib.read_state_json_classified and
+# an unreadable state file is UNKNOWN -- skipped with one stderr line, never
+# raised; see tests/test_principle_trigger_state_writers_3521.py U1.) The
+# failure is forced two ways at once so the very same assertion runs against
+# both trees: the helper this branch calls
 # (`open_regular_text`) and the builtin `open` dev calls, each raising only for
 # the one target path.
 _FORCE_PERM = (
@@ -636,7 +644,7 @@ _FORCE_PERM = (
 )
 
 
-@pytest.mark.parametrize("target", ["reg.json", "st.json"])
+@pytest.mark.parametrize("target", ["reg.json"])
 def test_utility_check_enactments_regular_file_oserror_propagates(tmp_path, target):
     ctx = Ctx(tmp_path, "regular", "engram-utility-credit-mention-stop.py")
     (ctx.eh / "reg.json").write_text(json.dumps({"k": [{"principle_id": "pid-a"}]}))
