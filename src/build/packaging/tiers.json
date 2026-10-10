@@ -720,6 +720,12 @@
       "note": "nothing-lost check for the CLAUDE.md prune (#3322): reads docs/claude-md-moves.json and asserts each moved block's first and last sentence appears exactly once in its target doc and zero times in CLAUDE.md. Developer tier (T3): a repo-maintenance gate for ENGRAM development, run by tests/test_claude_md_moves.py in pr-checks; no install ever needs it. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly, same as tools/recall_repetition_analysis.py."
     },
     {
+      "path": "tools/check_2652_ledger.py",
+      "tier": "dev",
+      "source": "tools/check_2652_ledger.py",
+      "note": "completeness guard for docs/2652-migration-ledger.md (#2652): per-file count of Section-2 rows vs sqlite3.connect( lines in tracked src/engram. Developer tier (T3): a repo-maintenance gate run by pr-checks; no install ever needs it. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly, same as tools/claude_md_moves_check.py."
+    },
+    {
       "path": "tools/recall_repetition_analysis.py",
       "tier": "dev",
       "source": "tools/recall_repetition_analysis.py",

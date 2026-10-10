@@ -940,6 +940,16 @@ jobs:
             tests/test_claude_md_moves.py \
             -q
 
+      # ── 7c-1. 2652 migration-ledger completeness (#2652) ──────────────────
+      # docs/2652-migration-ledger.md lists every `sqlite3.connect(` line in
+      # tracked src/engram, one Section-2 row each. Dev PRs do not run the
+      # pytest suite, so a test alone would not gate them: this runs the
+      # stdlib-only check directly (git + python, ~0.1s). Keyed on per-file
+      # counts, so line drift from unrelated edits stays green.
+      - name: stdlib-only guards — 2652 migration-ledger completeness
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success'
+        run: python3 tools/check_2652_ledger.py
+
       # ── 7c-2. test files outside tests.yml's roots (#3346) ────────────────
       # tests.yml collects `tests/` and `src/forum/tests/` only. Nine healthy
       # test files sat in tools/ and src/engram/tools/, named test_*.py, and

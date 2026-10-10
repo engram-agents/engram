@@ -186,6 +186,6 @@ print(d['write_sites']); print(d['authorizer_governed']); print([x['site'] for x
 EOF
 ```
 
-- This first version adds no script and no test. A mechanical check that Section 2 equals the grep is a possible follow-up; it is not part of this document.
+- `tools/check_2652_ledger.py` (run in `pr-checks`, tested by `tests/test_2652_ledger_completeness.py`) checks per-file count completeness: for each tracked file under `src/engram`, the number of Section-2 rows naming it must equal the number of `sqlite3.connect(` lines in it. It does not check row contents (target, state, function), line numbers, or Section 1's tallies, and a swap inside one file (one connect removed, another added) passes. When it fails, add or remove a Section-2 row for each connect line you added or removed.
 
 *Sources read for this version: `docs/2652-engrammanager-design.md` §3, §4.1-4.2, §5.5, §6, §6.1; `src/engram/engramd_read_templates.json`; #3663, #3664, #3665, #3666; the #3341 PR body and comments.*
