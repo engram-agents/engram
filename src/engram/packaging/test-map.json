@@ -361,6 +361,13 @@
       "note": "engram-alpha#3197 (U4d): loaded by tests/test_engramd_a6_latency.py via importlib (file path), so it is invisible to the layer-1 import graph."
     },
     {
+      "path_prefix_or_glob": "tools/engramd_stage_profile.py",
+      "test_globs": [
+        "tests/test_engramd_stage_profile_3678.py"
+      ],
+      "note": "engram-alpha#3678 (U7): loaded by tests/test_engramd_stage_profile_3678.py via importlib (file path), so it is invisible to the layer-1 import graph."
+    },
+    {
       "path_prefix_or_glob": "tools/dream_lottery.py",
       "test_globs": [
         "tests/test_dream_lottery.py"

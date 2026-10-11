@@ -226,10 +226,12 @@ timer or module constant in its place.
 from __future__ import annotations
 
 import errno
+import itertools
 import json
 import logging
 import os
 import platform
+import queue
 import shutil
 import signal
 import socket
@@ -424,6 +426,19 @@ MAX_READ_RESPONSE_BYTES = 8 * 1024 * 1024
 # engram-surface-daemon.py's heavier 5.0s, which also runs an idle watchdog
 # and an indexer tick this module has neither of).
 ACCEPT_POLL_INTERVAL = 0.2  # seconds
+
+# Connection handler threads (#3678, U7). Starting a fresh thread for every accepted
+# connection cost ~0.066 ms of each owner round trip (the U7 stage profile). A finished
+# handler now waits for the next connection instead of exiting; the accept loop hands a
+# connection to an IDLE handler when one exists and starts a new one only when none is
+# idle. Capacity is never below spawn-per-connection: a connection is never queued
+# behind a busy handler, so clients that hold their connections (until the request
+# deadline drops them) cannot starve a fresh client of a handler. Idle handlers beyond
+# IDLE_WORKER_CAP exit after IDLE_WORKER_TIMEOUT seconds idle, so a burst leaves at most
+# the cap behind; stop() releases every idle handler.
+WORKER_THREAD_PREFIX = "engramd-worker"
+IDLE_WORKER_CAP = 4
+IDLE_WORKER_TIMEOUT = 60.0  # seconds
 
 # Mode applied to both the socket's `run/` parent directory and the socket
 # file itself (#3194, design doc §2.1 + Borges's issue-#3194 ruling). The
@@ -812,6 +827,65 @@ def _read_install_tier(engram_home: Path) -> "str | None":
     return tier if isinstance(tier, str) else None
 
 
+# ---------------------------------------------------------------------------
+# Serialize-once read replies (#3678, U7 cut 2). Each row is JSON-encoded ONCE;
+# the response-size bound is counted on those fragments and the reply is
+# assembled from the SAME fragments, so the bytes checked are the bytes sent.
+# `_assemble_read_ok` reproduces json.dumps's default separators (", " and
+# ": ") and ensure_ascii exactly: the wire output is byte-identical to
+# json.dumps({"status": "ok", "result": rows}).
+# ---------------------------------------------------------------------------
+
+_READ_OK_PREFIX = '{"status": "ok", "result": ['
+_READ_OK_SUFFIX = ']}'
+_READ_OK_EMPTY_LEN = len('{"status": "ok", "result": []}')
+
+
+def _assemble_read_ok(fragments: list) -> str:
+    return _READ_OK_PREFIX + ", ".join(fragments) + _READ_OK_SUFFIX
+
+
+class _RenderedReadOk(dict):
+    """The `ok` reply of `read`, as the dict callers have always seen, carrying
+    the exact wire text built from the size-checked fragments. `_handle_connection`
+    sends `wire_text` instead of serializing the dict again. Do not mutate the
+    dict after construction: `wire_text` is a copy and would not follow."""
+
+    def __init__(self, rows: list, wire_text: str) -> None:
+        super().__init__(status="ok", result=rows)
+        self.wire_text = wire_text
+
+
+def _render_read_rows(outcome) -> "tuple[dict, int]":
+    """-> (reply, counted bytes). `reply` is a `_RenderedReadOk`, or the same
+    rejection dict as before (unsupported cell type; over MAX_READ_RESPONSE_BYTES).
+    The count keeps the old per-row allowance (+2 per row for the separator)."""
+    rows, fragments = [], []
+    wire_bytes = _READ_OK_EMPTY_LEN
+    for row in outcome:
+        cells = list(row)
+        for cell in cells:
+            if cell is not None and type(cell) not in (int, float, str):
+                return {
+                    "status": "rejected",
+                    "reason": "unsupported_value_type",
+                    "detail": f"a result cell has type {type(cell).__name__}; only None/int/float/str are served",
+                    "remedy": "select a text/number projection of the column, or extend the read contract deliberately",
+                }, wire_bytes
+        fragment = json.dumps(cells)
+        wire_bytes += len(fragment) + 2
+        if wire_bytes > MAX_READ_RESPONSE_BYTES:
+            return {
+                "status": "rejected",
+                "reason": "result_too_large",
+                "detail": f"the result is over {MAX_READ_RESPONSE_BYTES} bytes serialised (stopped counting at {wire_bytes}); nothing was sent",
+                "remedy": "this is a property of the statement and the data, not an outage -- do NOT restart the owner; narrow the statement (LIMIT / fewer columns) or ask for a paged read",
+            }, wire_bytes
+        rows.append(cells)
+        fragments.append(fragment)
+    return _RenderedReadOk(rows, _assemble_read_ok(fragments)), wire_bytes
+
+
 class _ClientReadGate:
     """Holds ONLY the client-read connection. Any future client-facing
     read operation (U4c's read-template registry, U4d's real client
@@ -932,6 +1006,8 @@ class EngramdOwner:
         max_request_bytes: int = MAX_REQUEST_BYTES,
         accept_poll_interval: float = ACCEPT_POLL_INTERVAL,
         contract_version: str = ec.CONTRACT_VERSION,
+        idle_worker_cap: int = IDLE_WORKER_CAP,
+        idle_worker_timeout: float = IDLE_WORKER_TIMEOUT,
     ) -> None:
         self.engram_home = _resolve_engram_home(engram_home)
         # The socket's parent directory (self.socket_path.parent) is the
@@ -952,6 +1028,15 @@ class EngramdOwner:
         self.max_request_bytes = max_request_bytes
         self.accept_poll_interval = accept_poll_interval
         self.contract_version = contract_version
+        self.idle_worker_cap = idle_worker_cap
+        self.idle_worker_timeout = idle_worker_timeout
+        # Handler hand-off (#3678): `_idle` counts handlers waiting on `_jobs`. Both are
+        # changed only under `_handoff_lock`, so a handler retiring on its idle timeout and
+        # the accept loop handing it a connection cannot strand that connection.
+        self._handoff_lock = threading.Lock()
+        self._idle = 0
+        self._jobs: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._worker_seq = itertools.count(1)
 
         self._server: socket.socket | None = None
         # Owner-internal connection (was `_store_conn` in U3) -- serves
@@ -1406,6 +1491,15 @@ class EngramdOwner:
         self._shutdown.set()
         if self._accept_thread is not None:
             self._accept_thread.join(timeout=self.accept_poll_interval + 2.0)
+        # Release every idle handler (#3678); a busy one exits after its request, when it
+        # sees _shutdown in _next_connection(). The tokens go in under the same lock that
+        # zeroes `_idle`: a handler whose idle timeout fires in between then finds a token
+        # waiting and takes it, rather than decrementing `_idle` below zero and leaving a
+        # stray token behind.
+        with self._handoff_lock:
+            idle, self._idle = self._idle, 0
+            for _ in range(idle):
+                self._jobs.put(None)
         self._cleanup()
 
     def _cleanup(self) -> None:
@@ -1518,7 +1612,50 @@ class EngramdOwner:
                 continue
             except OSError:
                 break
-            threading.Thread(target=self._handle_connection, args=(conn,), daemon=True).start()
+            self._dispatch_connection(conn)
+
+    def _dispatch_connection(self, conn: socket.socket) -> None:
+        """Give `conn` to an idle handler if there is one, else start a new handler.
+        Never queues a connection behind a busy handler (#3678)."""
+        with self._handoff_lock:
+            if self._idle > 0:
+                self._idle -= 1
+                self._jobs.put(conn)
+                return
+        threading.Thread(
+            target=self._worker, args=(conn,),
+            name=f"{WORKER_THREAD_PREFIX}-{next(self._worker_seq)}", daemon=True,
+        ).start()
+
+    def _worker(self, conn: "socket.socket | None") -> None:
+        """Serve `conn`, then wait for the next connection; exit on stop() or when idle
+        past `idle_worker_timeout` while more than `idle_worker_cap` handlers are idle."""
+        while conn is not None:
+            try:
+                self._handle_connection(conn)
+            except Exception:  # _handle_connection maps its own failures; keep the handler alive
+                logging.getLogger("engramd_owner").error(
+                    "unexpected exception in a connection handler", exc_info=True)
+            conn = self._next_connection()
+
+    def _next_connection(self) -> "socket.socket | None":
+        with self._handoff_lock:
+            if self._shutdown.is_set():
+                return None
+            self._idle += 1
+        while True:
+            try:
+                return self._jobs.get(timeout=self.idle_worker_timeout)  # None = stop()
+            except queue.Empty:
+                pass
+            with self._handoff_lock:
+                if not self._jobs.empty():
+                    # Handed a connection between the timeout and taking the lock: the
+                    # accept loop already counted this handler as busy.
+                    return self._jobs.get_nowait()
+                if self._shutdown.is_set() or self._idle > self.idle_worker_cap:
+                    self._idle -= 1
+                    return None
 
     def _check_peer_credentials(self, conn: socket.socket) -> dict | None:
         """Peer-credential check (#3194, design doc §2.2): defence in
@@ -1657,8 +1794,13 @@ class EngramdOwner:
             if remaining <= 0:
                 return
             conn.settimeout(remaining)
+            # A `read` reply arrives pre-rendered from its size-checked fragments
+            # (#3678 cut 2); everything else is serialized here as before.
+            text = getattr(response, "wire_text", None)
+            if text is None:
+                text = json.dumps(response)
             try:
-                conn.sendall((json.dumps(response) + "\n").encode("utf-8"))
+                conn.sendall((text + "\n").encode("utf-8"))
             except OSError:
                 pass
         finally:
@@ -1818,32 +1960,9 @@ class EngramdOwner:
             self._client_read_lock.release()
         if isinstance(outcome, rr.Rejected):
             return outcome.as_wire()
-        rows = []
-        wire_bytes = len('{"status": "ok", "result": []}')
-        for row in outcome:
-            cells = list(row)
-            for cell in cells:
-                if cell is not None and type(cell) not in (int, float, str):
-                    return {
-                        "status": "rejected",
-                        "reason": "unsupported_value_type",
-                        "detail": f"a result cell has type {type(cell).__name__}; only None/int/float/str are served",
-                        "remedy": "select a text/number projection of the column, or extend the read contract deliberately",
-                    }
-            # Size the row exactly as the send path will serialise it (+ the
-            # ", " row separator); refuse -- never truncate -- once the total
-            # passes the bound. Done here, on the only path that builds a read
-            # result, so no caller can skip it.
-            wire_bytes += len(json.dumps(cells)) + 2
-            if wire_bytes > MAX_READ_RESPONSE_BYTES:
-                return {
-                    "status": "rejected",
-                    "reason": "result_too_large",
-                    "detail": f"the result is over {MAX_READ_RESPONSE_BYTES} bytes serialised (stopped counting at {wire_bytes}); nothing was sent",
-                    "remedy": "this is a property of the statement and the data, not an outage -- do NOT restart the owner; narrow the statement (LIMIT / fewer columns) or ask for a paged read",
-                }
-            rows.append(cells)
-        return {"status": "ok", "result": rows}
+        # Serialize once (#3678 cut 2): sized and sent from the same fragments.
+        reply, _counted = _render_read_rows(outcome)
+        return reply
 
     def _read_failed(self, exc: Exception) -> dict:
         logging.getLogger("engramd_owner").warning(

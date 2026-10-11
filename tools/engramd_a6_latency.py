@@ -73,6 +73,197 @@ def owner_argv() -> List[str]:
     return [sys.executable, str(SRC_ENGRAM / "engramd_owner.py")]
 
 
+# --- the measurement layout (#3678) -------------------------------------------------
+#
+# A hook's owner path re-resolves its runtime directory on EVERY call
+# (`_import_engramd_client` -> `_hooklib.resolve_runtime_dir`). In the source
+# checkout that falls through to a walk over parent directories; in an installed
+# plugin (flat hooks/, runtime modules at the plugin root) it resolves on its
+# first check. The direct path resolves once at import. So measuring the source
+# checkout charges the OWNER for a lookup production never does. The INSTALLED
+# layout -- a plugin built from the tree under test into a scratch directory,
+# never installed -- is the gate cell; the source layout is a development-time
+# number and is labelled so.
+
+BUILD_SCRIPT = REPO_ROOT / "tools" / "build-plugin.sh"
+LAYOUTS = ("source", "installed")
+# build-relative path -> source-relative path: the runtime files a measurement
+# loads. Byte-identical between the build and the tree is what makes the
+# installed cell a measurement of THIS tree.
+RUNTIME_FILES = {
+    "engramd_owner.py": "src/engram/engramd_owner.py",
+    "engramd_client.py": "src/engram/engramd_client.py",
+    "engramd_read_registry.py": "src/engram/engramd_read_registry.py",
+    "engramd_read_templates.json": "src/engram/engramd_read_templates.json",
+    "engram_walguard.py": "src/engram/engram_walguard.py",
+    "hooks/engram-stop-hook.py": "src/engram/hooks/claude/engram-stop-hook.py",
+    "hooks/engram-user-identity-hook.py": "src/engram/hooks/claude/engram-user-identity-hook.py",
+    "hooks/_hooklib.py": "src/engram/hooks/claude/_hooklib.py",
+}
+
+
+class LayoutViolation(RuntimeError):
+    """An installed-layout run did not measure the installed layout."""
+
+
+class Layout:
+    """A code layout to measure. A plain class, not a dataclass: this tool is
+    loaded by file path (spec_from_file_location) by its own tests and by the
+    stage profiler, and a dataclass needs its module registered in sys.modules."""
+
+    def __init__(self, name: str, root: Path, stop_hook: Path, user_hook: Path) -> None:
+        self.name = name
+        self.root = Path(root)            # the directory holding engramd_owner.py / engramd_client.py
+        self.stop_hook = Path(stop_hook)
+        self.user_hook = Path(user_hook)
+
+    def to_json(self) -> str:
+        return json.dumps({"name": self.name, "root": str(self.root),
+                           "stop_hook": str(self.stop_hook), "user_hook": str(self.user_hook)})
+
+    @staticmethod
+    def from_json(text: str) -> "Layout":
+        d = json.loads(text)
+        return Layout(name=d["name"], root=Path(d["root"]),
+                      stop_hook=Path(d["stop_hook"]), user_hook=Path(d["user_hook"]))
+
+
+def source_layout() -> Layout:
+    return Layout(name="source", root=SRC_ENGRAM, stop_hook=STOP_HOOK_PATH, user_hook=HOOK_PATH)
+
+
+def build_installed_layout(out_dir: Path) -> Layout:
+    """Build the plugin from the tree under test into `out_dir` (a scratch
+    directory; this build is never installed). The two override flags are the
+    build script's own measurement escape hatches: a feature branch and an
+    untagged commit are exactly what a PR measurement builds."""
+    out_dir = Path(out_dir)
+    proc = subprocess.run(
+        ["bash", str(BUILD_SCRIPT), "--tier", "dev", "--multi-agent",
+         "--allow-branch", "--allow-untagged", "--output", str(out_dir)],
+        cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=600)
+    if proc.returncode != 0:
+        raise RuntimeError(f"plugin build failed (rc {proc.returncode}): {proc.stderr[-800:]}")
+    layout = Layout(name="installed", root=out_dir,
+                    stop_hook=out_dir / "hooks" / "engram-stop-hook.py",
+                    user_hook=out_dir / "hooks" / "engram-user-identity-hook.py")
+    drift = layout_matches_tree(layout)
+    if drift:
+        raise LayoutViolation(f"the build differs from the tree under test: {drift}")
+    return layout
+
+
+def layout_matches_tree(layout: Layout) -> List[str]:
+    """Build-relative names of runtime files that are missing from the build or
+    differ byte-for-byte from the tree under test. [] = the build IS this tree."""
+    bad = []
+    for built_rel, src_rel in RUNTIME_FILES.items():
+        built, src = layout.root / built_rel, REPO_ROOT / src_rel
+        if not built.is_file() or built.read_bytes() != src.read_bytes():
+            bad.append(built_rel)
+    return bad
+
+
+def check_installed_run(result: Dict, layout: Layout) -> None:
+    """The two runtime asserts (Borges, #3678). Raises LayoutViolation."""
+    argv = result.get("owner_argv") or []
+    owner_file = Path(argv[1]).resolve() if len(argv) > 1 else None
+    if owner_file is None or layout.root.resolve() not in owner_file.parents:
+        raise LayoutViolation(f"the owner did not run from the build {layout.root}: argv {argv}")
+    if result.get("parent_walk_calls") != 0:
+        raise LayoutViolation(
+            f"the client import walked parent directories {result.get('parent_walk_calls')} time(s); "
+            "an installed plugin resolves at the plugin root and never walks")
+
+
+def _apply_layout(layout: Layout) -> None:
+    """Point this module at `layout`. Only ever called in a FRESH process (the
+    `--_layout-child` mode), before any runtime module is imported, so nothing
+    from the other layout can already sit in sys.modules."""
+    global SRC_ENGRAM, STOP_HOOK_PATH, HOOK_PATH
+    SRC_ENGRAM, STOP_HOOK_PATH, HOOK_PATH = layout.root, layout.stop_hook, layout.user_hook
+
+
+def _count_parent_walks(layout: Layout) -> Dict[str, int]:
+    """Import the layout's own _hooklib and count the resolver's parent walk:
+    its only `Path(__file__).resolve()`. Returns a live counter dict."""
+    hooks_dir = str(layout.stop_hook.parent)
+    if hooks_dir not in sys.path:
+        sys.path.insert(0, hooks_dir)
+    import _hooklib
+    if Path(_hooklib.__file__).resolve().parent != layout.stop_hook.parent.resolve():
+        raise LayoutViolation(f"_hooklib loaded from {_hooklib.__file__}, not {hooks_dir}")
+    counter = {"walks": 0}
+    real_path = _hooklib.Path
+    me = str(Path(_hooklib.__file__))
+
+    class _Probe:
+        def __init__(self, p):
+            self._p = p
+
+        def resolve(self, *a, **k):
+            counter["walks"] += 1
+            return self._p.resolve(*a, **k)
+
+        def __getattr__(self, attr):
+            return getattr(self._p, attr)
+
+    def counting_path(*args, **kwargs):
+        p = real_path(*args, **kwargs)
+        return _Probe(p) if str(p) == me else p
+
+    _hooklib.Path = counting_path
+    return counter
+
+
+def measure_in_layout(layout: Layout, **kwargs) -> Dict:
+    """Run measure() for `layout` in a FRESH process (no runtime module from
+    another layout can be cached), return its result. An installed-layout
+    result is checked by check_installed_run() before it is returned."""
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--_layout-child", layout.to_json(),
+         "--_kwargs", json.dumps({k: (str(v) if isinstance(v, Path) else v) for k, v in kwargs.items()})],
+        capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0:
+        raise RuntimeError(f"{layout.name}-layout run failed (rc {proc.returncode}): {proc.stderr[-1500:]}")
+    result = json.loads(proc.stdout.strip().splitlines()[-1])
+    result["layout"] = layout.name
+    result["layout_root"] = str(layout.root)
+    if layout.name == "installed":
+        check_installed_run(result, layout)
+    return result
+
+
+def _layout_child(layout_json: str, kwargs_json: str) -> int:
+    layout = Layout.from_json(layout_json)
+    _apply_layout(layout)
+    counter = _count_parent_walks(layout)
+    kwargs = json.loads(kwargs_json)
+    if kwargs.get("store"):
+        kwargs["store"] = Path(kwargs["store"])
+    result = measure(**kwargs)
+    result["parent_walk_calls"] = counter["walks"]
+    print(json.dumps(result))
+    return 0
+
+
+LAYOUT_LABELS = {
+    "installed": "INSTALLED layout -- the gate cell (plugin built from the tree under test; never installed)",
+    "source": "SOURCE checkout -- a development-time number, NOT production "
+              "(the owner path pays a per-call parent-directory walk an installed plugin never does)",
+}
+
+
+def format_layouts(results: List[Dict]) -> str:
+    order = {"installed": 0, "source": 1}
+    parts = []
+    for r in sorted(results, key=lambda r: order.get(r.get("layout"), 9)):
+        parts.append(f"### {LAYOUT_LABELS[r['layout']]}\n"
+                     f"Runtime root: {r['layout_root']} | parent-walk calls during the run: {r['parent_walk_calls']}\n\n"
+                     + format_table(r))
+    return "\n\n".join(parts)
+
+
 # --- the test store --------------------------------------------------------------
 
 def make_test_store(nodes: int = 5000, people: int = 5, source: Optional[Path] = None) -> Path:
@@ -98,6 +289,10 @@ def make_test_store(nodes: int = 5000, people: int = 5, source: Optional[Path] =
     os.environ["ENGRAM_HOME"] = str(home)
     try:
         conn = sqlite3.connect(str(db))
+        # Real ENGRAM stores are WAL, so the owner's per-request displacement check
+        # inspects real -wal/-shm fds there; a delete-mode store would skip that work
+        # and price a path production never runs (#3678, Kepler's ruling).
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
         engram_core._run_db_one_time_setup(conn)
         conn.row_factory = None
@@ -266,8 +461,9 @@ def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 
     saved_env = {k: os.environ.get(k) for k in ("ENGRAM_HOME", "ENGRAM_RUNTIME_DIR")}
     try:
         handle = launch_owner(home)
-        owner_cmdline = Path(f"/proc/{handle.proc.pid}/cmdline").read_bytes().replace(b"\0", b" ").decode() \
-            if Path("/proc").is_dir() else ""
+        raw_cmdline = Path(f"/proc/{handle.proc.pid}/cmdline").read_bytes() if Path("/proc").is_dir() else b""
+        owner_argv = [a.decode() for a in raw_cmdline.split(b"\0") if a]
+        owner_cmdline = raw_cmdline.replace(b"\0", b" ").decode()
         db = home / "knowledge.db"
         bind = _bind_stop if hook == "stop" else _bind_user_identity
         baseline, owner, answers_match, answer_size, extra = bind(home)
@@ -310,12 +506,16 @@ def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 
             o.append(_timed(owner, before=lambda: _fadvise_cold(db)))
         rows += [_summarise("cold-cache", "baseline", b), _summarise("cold-cache", "owner", o)]
 
-        node_count = sqlite3.connect(str(db)).execute("SELECT count(*) FROM nodes").fetchone()[0]
+        _c = sqlite3.connect(str(db))
+        node_count = _c.execute("SELECT count(*) FROM nodes").fetchone()[0]
+        journal_mode = _c.execute("PRAGMA journal_mode").fetchone()[0]
+        _c.close()
         return {
             "rows": rows, "n": n, "warmup": warmup, "hook": hook,
             "answers_match": answers_match, "answer_size": answer_size, **extra,
             "owner_pid": handle.proc.pid,
             "owner_cmdline": owner_cmdline, "node_count": node_count,
+            "owner_argv": owner_argv, "journal_mode": journal_mode,
             "db_bytes": db.stat().st_size,
             "env": {"platform": platform.platform(), "cpus": os.cpu_count(),
                     "python": sys.version.split()[0], "sqlite": sqlite3.sqlite_version},
@@ -337,6 +537,7 @@ def format_table(result: Dict) -> str:
     lines = [
         f"Host: {env['platform']} ({env['cpus']} CPUs) | Python {env['python']} | SQLite {env['sqlite']}",
         f"Store copy: {result['node_count']} nodes, {result['db_bytes']} bytes, "
+        f"journal_mode={result.get('journal_mode', '?')}, "
         + (f"{result['answer_count']} current nodes" if stop else f"{result['people_count']} person rows")
         + f" | N={result['n']} per path per arm "
         f"(contended: 2 threads x N) after {result['warmup']} warm-up calls",
@@ -393,7 +594,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--warmup", type=int, default=30)
     p.add_argument("--store", type=Path, default=None,
                    help="a test store to COPY (never the live store); default: a synthetic one")
+    p.add_argument("--layout", choices=("both",) + LAYOUTS, default="both",
+                   help="which code layout to measure (#3678): 'installed' builds the plugin from this "
+                        "tree into a scratch dir and is the gate cell; 'source' is the checkout; "
+                        "default both")
+    p.add_argument("--_layout-child", dest="layout_child", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--_kwargs", dest="child_kwargs", default="{}", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
+    if args.layout_child:
+        return _layout_child(args.layout_child, args.child_kwargs)
     if args.n < N_FLOOR:
         print(f"engramd_a6_latency: error -- N must be >= {N_FLOOR} (got {args.n})", file=sys.stderr)
         return 2
@@ -401,10 +610,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"engramd_a6_latency: error -- {args.store} is this seat's live store; "
               "refusing. Pass a COPY of a test store.", file=sys.stderr)
         return 2
-    result = measure(n=args.n, nodes=args.nodes, people=args.people, warmup=args.warmup,
-                     store=args.store, hook=args.hook)
-    print(format_table(result))
-    return 0 if result["answers_match"] else 1
+    kwargs = dict(n=args.n, nodes=args.nodes, people=args.people, warmup=args.warmup,
+                  store=args.store, hook=args.hook)
+    wanted = LAYOUTS if args.layout == "both" else (args.layout,)
+    results = []
+    with tempfile.TemporaryDirectory(prefix="a6-build-") as build_dir:
+        for name in ("installed", "source"):
+            if name not in wanted:
+                continue
+            layout = build_installed_layout(Path(build_dir) / "plugin") if name == "installed" else source_layout()
+            results.append(measure_in_layout(layout, **kwargs))
+    print(format_layouts(results))
+    return 0 if all(r["answers_match"] for r in results) else 1
 
 
 if __name__ == "__main__":

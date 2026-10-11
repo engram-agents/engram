@@ -755,6 +755,12 @@
       "note": "engram-alpha#3197 (U4d, part of #2652): the A6 latency-delta measurement -- the user-identity hook's person-node read, old path vs through a REAL engramd_owner process, same run/store/N, with contended and cold-cache arms. A measurement owed in the PR body, not a CI gate; ENGRAM-development tooling, real file under repo-root tools/, so 'source' is set explicitly."
     },
     {
+      "path": "tools/engramd_stage_profile.py",
+      "tier": "dev",
+      "source": "tools/engramd_stage_profile.py",
+      "note": "engram-alpha#3678 (U7, part of #2652): the owner round-trip stage profiler -- wraps a REAL engramd_owner process's callables from a launcher (no profile mode in the owner) and attributes one call's time across named stages. Attribution only; cuts are judged by the unwrapped A6 tool. ENGRAM-development tooling, real file under repo-root tools/, so 'source' is set explicitly."
+    },
+    {
       "path": "tools/engramd_read_scan.config.json",
       "tier": "dev",
       "source": "tools/engramd_read_scan.config.json",

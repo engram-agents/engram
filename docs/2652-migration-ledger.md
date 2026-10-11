@@ -41,9 +41,9 @@ The two are different populations measured by different instruments at different
 
 ## 2. The ledger — one row per matching line (row 55 holds two connects; rows count lines, not connects)
 
-Columns. **kind:** `call` or `prose`. **target:** `live store` (the seat's `$ENGRAM_HOME/knowledge.db`), `parameter` (path passed in; live callers named), `other DB` (named). **access:** the open mode — `ro` is `mode=ro`; `rw` means opened without `mode=ro` (a read-only use is said in the note). **state** (live-store rows only): `owner` · `direct` · `behind-flag` · `flag-on` · `retired`. **A6 delta:** only the user-identity row has one. **macOS:** per row, for every live-store row; `unreachable via owner (Darwin arm #3666)` = a planned owner path exists and Mac blocks it, `n/a — no owner path planned yet` = no owner path is planned for this channel (see the Mac seats paragraph).
+Columns. **kind:** `call` or `prose`. **target:** `live store` (the seat's `$ENGRAM_HOME/knowledge.db`), `parameter` (path passed in; live callers named), `other DB` (named). **access:** the open mode — `ro` is `mode=ro`; `rw` means opened without `mode=ro` (a read-only use is said in the note). **state** (live-store rows only): `owner` · `direct` · `behind-flag` · `flag-on` · `retired`. **A6 delta:** the user-identity and stop rows have one. **macOS:** per row, for every live-store row; `unreachable via owner (Darwin arm #3666)` = a planned owner path exists and Mac blocks it, `n/a — no owner path planned yet` = no owner path is planned for this channel (see the Mac seats paragraph).
 
-**Mac seats, applies to every `macOS` cell below.** The owner refuses to start on macOS: `EngramdOwner._check_platform_support` (`src/engram/engramd_owner.py:1168`, called from `start()` at `:1038`) raises `OwnerPermissionUnsupported` with the reason from `platform_unsupported_reason()` (`:881`; the Linux test is at `:890`), because U4a's permission layer (`SO_PEERCRED`, the `run/` ACL strip) is Linux-only. So the one `*_via_owner` flag in tree today, `engramd.user_identity_reads_via_owner`, has no effect on a Mac seat except to make the hook report `Unavailable`; the U6a and U6b flags, once they exist, would behave the same. This holds until the Darwin permission arm lands: **#3666** (Aleph designs, Mira reviews). Per #3666 the affected seats are Aleph, Clio and Luria.
+**Mac seats, applies to every `macOS` cell below.** The owner refuses to start on macOS: `EngramdOwner._check_platform_support` (`src/engram/engramd_owner.py:1253`, called from `start()` at `:1123`) raises `OwnerPermissionUnsupported` with the reason from `platform_unsupported_reason()` (`:955`; the Linux test is at `:964`), because U4a's permission layer (`SO_PEERCRED`, the `run/` ACL strip) is Linux-only. So the one `*_via_owner` flag in tree today, `engramd.user_identity_reads_via_owner`, has no effect on a Mac seat except to make the hook report `Unavailable`; the U6a and U6b flags, once they exist, would behave the same. This holds until the Darwin permission arm lands: **#3666** (Aleph designs, Mira reviews). Per #3666 the affected seats are Aleph, Clio and Luria.
 
 | # | site (function) | kind | target | access | component | state | A6 delta | macOS |
 |---|---|---|---|---|---|---|---|---|
@@ -66,12 +66,12 @@ Columns. **kind:** `call` or `prose`. **target:** `live store` (the seat's `$ENG
 | 17 | `engram_snapshot_worker.py:390` (_regenerate_derived_files) | call | other DB: captured snapshot (`mode=ro&immutable=1`) | ro | backup/snapshot | out of scope | — | — |
 | 18 | `engram_telemetry_store.py:391` (open_store) | call | other DB: telemetry `records.db` (WAL off, `journal_mode=DELETE`) | rw | other (telemetry) | out of scope | — | — |
 | 19 | `engram_telemetry_verdicts.py:616` (summary_line) | call | other DB: telemetry `records.db` | ro | other (telemetry) | out of scope | — | — |
-| 20 | `engramd_owner.py:1084` (start) | prose | n/a — comment: "sqlite3.connect() creates an empty file" | n/a | owner | out of scope | — | — |
-| 21 | `engramd_owner.py:1092` (start) | call | live store — `_owner_conn`, permissive owner-internal authorizer | rw | owner | owner | — | n/a — owner refuses to start |
-| 22 | `engramd_owner.py:1103` (start) | call | live store — `_client_read_conn`: opened without mode=ro but permanently restrictive authorizer + `SQLITE_LIMIT_LENGTH`; serves client `read` | rw | owner | owner | — | n/a — owner refuses to start |
-| 23 | `engramd_owner.py:1155` (_load_read_registry) | call | live store — short-lived dedicated connection that classifies the read templates | ro | owner | owner | — | n/a — owner refuses to start |
-| 24 | `engramd_owner.py:2116` (_handle_snapshot) | prose | n/a — trailing comment on `os.close(temp_fd)` | n/a | owner | out of scope | — | — |
-| 25 | `engramd_owner.py:2126` (_handle_snapshot) | call | other DB: snapshot staging file (O_EXCL temp beside `dest`) | rw | owner | out of scope | — | — |
+| 20 | `engramd_owner.py:1169` (start) | prose | n/a — comment: "sqlite3.connect() creates an empty file" | n/a | owner | out of scope | — | — |
+| 21 | `engramd_owner.py:1177` (start) | call | live store — `_owner_conn`, permissive owner-internal authorizer | rw | owner | owner | — | n/a — owner refuses to start |
+| 22 | `engramd_owner.py:1188` (start) | call | live store — `_client_read_conn`: opened without mode=ro but permanently restrictive authorizer + `SQLITE_LIMIT_LENGTH`; serves client `read` | rw | owner | owner | — | n/a — owner refuses to start |
+| 23 | `engramd_owner.py:1240` (_load_read_registry) | call | live store — short-lived dedicated connection that classifies the read templates | ro | owner | owner | — | n/a — owner refuses to start |
+| 24 | `engramd_owner.py:2235` (_handle_snapshot) | prose | n/a — trailing comment on `os.close(temp_fd)` | n/a | owner | out of scope | — | — |
+| 25 | `engramd_owner.py:2245` (_handle_snapshot) | call | other DB: snapshot staging file (O_EXCL temp beside `dest`) | rw | owner | out of scope | — | — |
 | 26 | `health/rows.py:6` ((module docstring)) | prose | n/a | n/a | health | out of scope | — | — |
 | 27 | `health/series.py:683` (open_store) | call | other DB: health `series.db` (`db_path` parameter; own file, design §4.3) | rw | health | out of scope | — | — |
 | 28 | `health/series.py:2474` (replay_commit) | prose | n/a — docstring | n/a | health | out of scope | — | — |
@@ -84,7 +84,7 @@ Columns. **kind:** `call` or `prose`. **target:** `live store` (the seat's `$ENG
 | 35 | `hooks/claude/engram-session-start-hook.py:2773` (sleep_status_block) | call | live store — `COUNT(*)`, `ENGRAM_DB_PATH`, `timeout=2.0`; registry site | rw | hook | direct | — | unreachable via owner (Darwin arm #3666) |
 | 36 | `hooks/claude/engram-session-start-hook.py:2796` (sleep_status_block) | call | live store — `COUNT(*) WHERE created_at > ?`, `timeout=2.0`; registry site | rw | hook | direct | — | unreachable via owner (Darwin arm #3666) |
 | 37 | `hooks/claude/engram-surface-hook.py:1137` (_advance_person_moment_cursor) | call | live store — READ-MODIFY-WRITE: `SELECT metadata` then `UPDATE nodes SET metadata`; a registered write site | rw | hook | direct | — | unreachable via owner (Darwin arm #3666) |
-| 38 | `hooks/claude/engram-user-identity-hook.py:94` (get_person_nodes) | call | live store — the OLD path, kept live for flag OFF; flag `engramd.user_identity_reads_via_owner` (default OFF) routes the read through the owner instead (U4d, #3341) | rw | hook | behind-flag | 3.45.1: seq 0.90x / cont 0.24x / cold 0.20x; 3.53.0: seq 0.90x p50, 0.95x p99 (gate holds) / cont 0.26x / cold 0.19x — see A6 | unreachable via owner (Darwin arm #3666) |
+| 38 | `hooks/claude/engram-user-identity-hook.py:94` (get_person_nodes) | call | live store — the OLD path, kept live for flag OFF; flag `engramd.user_identity_reads_via_owner` (default OFF) routes the read through the owner instead (U4d, #3341) | rw | hook | behind-flag | installed layout (gate cell), sequential p50, synthetic 5k / real copy, with U7 cuts 1–2 (#3678): 3.53.0 0.74× / 0.71× (gate holds); 3.45.1 0.67× / **1.04×** (real copy over, reported, not a gate cell — see A6). Earlier 0.90x figures (U4d) are source-layout, dev-time only — see A6 | unreachable via owner (Darwin arm #3666) |
 | 39 | `hooks/claude/engram-utility-credit-mention-stop.py:209` (bump_utility) | call | parameter — WRITES (`bump_utility`, WAL pragma, commit); `db_path` defaults to `KNOWLEDGE_DB` = `ENGRAM_HOME/knowledge.db`; a registered write site | rw | hook | direct | — | unreachable via owner (Darwin arm #3666) |
 | 40 | `server.py:1225` (_get_timing_conn) | call | live store — long-lived tool-timing connection on `core.DB_PATH.resolve()`; one INSERT per tool call | rw | MCP server/core | direct | — | n/a — no owner path planned yet |
 | 41 | `server.py:1394` (_log_engram_tool_event) | call | other DB: `logs/index.db` (log index) | rw | MCP server/core | out of scope | — | — |
@@ -132,8 +132,8 @@ Source: `src/engram/engramd_read_templates.json` at `21ec2944` (schema 1, 26 tem
 
 | order | caller (file) | distinct templates | functions (template count) | state | unit | A6 delta | macOS |
 |---|---|---|---|---|---|---|---|
-| done | `hooks/claude/engram-user-identity-hook.py` | 1 | `get_person_nodes` (1) | behind-flag (`engramd.user_identity_reads_via_owner`, default OFF) | U4d, #3341 (merged 17f69f5a0) | 3.45.1: seq 0.90x / cont 0.24x / cold 0.20x; 3.53.0: seq 0.90x p50, 0.95x p99 (gate holds) / cont 0.26x / cold 0.19x — see A6 | unreachable via owner (Darwin arm #3666) |
-| 1 | `hooks/claude/engram-stop-hook.py` | 1 | `_maturity_muted` (1: `SELECT count(*) FROM nodes WHERE is_current = 1`) | behind-flag (`engramd.stop_reads_via_owner`, default OFF) | U6a, #3664 | owed: Linux seat run (`tools/engramd_a6_latency.py --hook stop`) | unreachable via owner (Darwin arm #3666) |
+| done | `hooks/claude/engram-user-identity-hook.py` | 1 | `get_person_nodes` (1) | behind-flag (`engramd.user_identity_reads_via_owner`, default OFF) | U4d, #3341 (merged 17f69f5a0) | installed layout (gate cell), sequential p50, synthetic 5k / real copy, with U7 cuts 1–2 (#3678): 3.53.0 0.74× / 0.71× (gate holds); 3.45.1 0.67× / **1.04×** (real copy over, reported, not a gate cell — see A6). Earlier 0.90x figures (U4d) are source-layout, dev-time only — see A6 | unreachable via owner (Darwin arm #3666) |
+| 1 | `hooks/claude/engram-stop-hook.py` | 1 | `_maturity_muted` (1: `SELECT count(*) FROM nodes WHERE is_current = 1`) | behind-flag (`engramd.stop_reads_via_owner`, default OFF) | U6a, #3664 | measured, installed layout (gate cell), N=1000, sequential p50 owner/direct, synthetic 5k / real copy — with U7 cuts 1–2 (#3678): SQLite 3.45.1 0.89× / 0.85×; SQLite 3.53.0 0.87× / 0.55×. Before U7: 1.18× / 1.02× and 1.22× / 0.70×. Source-layout runs (1.30–1.44×) are dev-time only. — see A6 | unreachable via owner (Darwin arm #3666) |
 | 2 | `hooks/claude/_hooklib.py` | 1 | `_focused_ids` (1) | direct | shared library; sequenced after the single-hook units | — | unreachable via owner (Darwin arm #3666) |
 | 3 | `hooks/claude/engram-lesson-tripwire-hook.py` | 3 | `load_tripwires` (1), `load_prevention_lessons` (1), `check_in_turn_recall` (1; template shared with `engram_idf`) | direct | U6b, #3665 (flag `engramd.lesson_tripwire_reads_via_owner`) | — | unreachable via owner (Darwin arm #3666) |
 | 4 | `hooks/claude/engram-surface-hook.py` | 4 | `_check_embedding_restore_flag` (1), `_dormant_focus_set_candidates` (2), `_advance_person_moment_cursor` (1, also a registered write site) | direct | no unit filed that I found | — | unreachable via owner (Darwin arm #3666) |
@@ -153,7 +153,29 @@ Source: `src/engram/engramd_read_templates.json` at `21ec2944` (schema 1, 26 tem
 
 Both reasons cite `docs/2652-security-slice-design.md` §3.5.
 
-## 4. A6 — the one measured delta
+## 4. A6 — measured deltas
+
+### After U7 (#3678), installed layout — the gate cell
+
+Layout, build and store are named instrument axes in design §6.1. The gate is judged on the **installed layout** (the plugin build, owner launched from the build, parent-walk calls 0) under the **production build**, the plugin venv's SQLite 3.53.0 (Python 3.14.4). SQLite 3.45.1 (Python 3.12.3) is the reported build axis, not a gate cell. Linux WSL2, 32 CPUs, N=1000 per path per arm, real owner process, owner rows == direct rows on every run. Synthetic store = 5k nodes, WAL (as production). Real copy = a `backup()` copy of one seat's graph (Ariadne's for 3.45.1, Borges's 11,149-node graph for 3.53.0), so real-copy cells do not compare across builds as a size effect.
+
+Sequential p50, owner/direct:
+
+| hook | store | 3.53.0 before U7 | **3.53.0 after cuts 1–2 (gate)** | 3.45.1 before U7 | 3.45.1 after cuts 1–2 |
+|---|---|---|---|---|---|
+| stop | synthetic 5k | 1.22× | **0.87×** | 1.18× | 0.89× |
+| stop | real copy | 0.70× | **0.55×** | 1.02× | 0.85× |
+| user-identity | synthetic 5k | 0.80× | **0.74×** | 0.85× | 0.67× |
+| user-identity | real copy | 0.93× | **0.71×** | 1.33× | **1.04×** |
+
+- **The gate holds in all four cells on 3.53.0.** The one cell over 1.0× on either build is user-identity, real copy, 3.45.1, at 1.04×. It is reported, not cut: U7's scope is to profile the owner floor and cut what the profile names, and 3.45.1 is no seat's deploy build (Kepler's ruling on #3678, 2026-10-11). A later unit that needs that cell opens its own issue.
+- The "before U7" synthetic cells were taken on a **delete-mode** synthetic store, before the A6 store became WAL in this unit; the after-U7 cells are WAL. So the synthetic before/after pairs differ in store mode as well as code.
+- 3.53.0 cells: Borges, #3678 comments of 2026-10-10 (before: tip `017a7bcb`; after: tip `149f65a3`). 3.45.1 cells: Ariadne, #3678 comments of 2026-10-10. A second 3.45.1 host (Kepler's seat, his 4,635-node graph, installed layout, WAL, N=1000, review of #3686 at `579c6465`) measured user-identity real copy at 1.04× p50 / 1.08× p99 and stop real copy at 0.83×, so the 1.04× cell is reproduced on two hosts and two graphs, one build.
+- Contended and cold arms (3.53.0, after): all under 1.0× (stop 0.96× / 0.16× synthetic, 0.64× / 0.08× real; user-identity 0.16× / 0.13× synthetic, 0.62× / 0.15× real). Reported, not gates.
+- **U7 cut 1 does not bound concurrency.** `IDLE_WORKER_CAP` limits only the idle handler pool. Busy handlers are unbounded by design: one per concurrent connection, each bounded by the request deadline, and reachable only by peers the `run/` ACLs admit. A bounded pool could deadlock with the deadline guard. A larger accept backlog (#3680) does not change this.
+- **Every A6 figure below this subsection is a source-layout figure** (the owner pays a per-call parent walk that the installed build does not), so it overstates the owner's per-call cost. Dev-time only.
+
+### U4d (#3341), source layout — dev-time only
 
 Criterion (design §6.1, stated there once): the hook's owner round trip must not exceed the same hook's direct-connect path. Applies to the user-identity hook (U4d, #3341, merged 17f69f5a0). Both runs: Linux WSL2, 32 CPUs, synthetic 5,005-node store copy (2.7 MB, 5 person rows), N=1000 per path per arm, a real owner process. Ratio = owner p50 / baseline p50.
 

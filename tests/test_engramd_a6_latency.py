@@ -149,17 +149,23 @@ def test_hook_selector_defaults_to_user_identity_and_passes_stop_through(tool, m
     """The default stays `user-identity` (its measurement, table text and exit code
     unchanged) and `--hook stop` selects the new path. Mutation: default to `stop`,
     ignore `--hook`, or accept an unknown hook name -> red."""
+    # #3678: main() now measures BOTH layouts (installed = the gate cell) through
+    # measure_in_layout(); the hook routing pinned here is unchanged. Each run of
+    # main() hands its hook to every layout it measures.
     seen = []
 
-    def fake_measure(**kw):
-        seen.append(kw["hook"])
-        return {"answers_match": True}
+    def fake_measure_in_layout(layout, **kw):
+        seen.append((layout.name, kw["hook"]))
+        return {"answers_match": True, "layout": layout.name}
 
-    monkeypatch.setattr(tool, "measure", fake_measure)
-    monkeypatch.setattr(tool, "format_table", lambda r: "table")
+    monkeypatch.setattr(tool, "measure_in_layout", fake_measure_in_layout)
+    monkeypatch.setattr(tool, "build_installed_layout", lambda out: tool.Layout(
+        name="installed", root=out, stop_hook=out / "hooks" / "s.py", user_hook=out / "hooks" / "u.py"))
+    monkeypatch.setattr(tool, "format_layouts", lambda rs: "table")
     assert tool.main([]) == 0
     assert tool.main(["--hook", "stop"]) == 0
-    assert seen == ["user-identity", "stop"]
+    assert seen == [("installed", "user-identity"), ("source", "user-identity"),
+                    ("installed", "stop"), ("source", "stop")]
     with pytest.raises(SystemExit) as exc:
         tool.main(["--hook", "surface"])
     assert exc.value.code == 2
