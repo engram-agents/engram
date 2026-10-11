@@ -88,6 +88,13 @@ DEFAULT_SOCKET_NAME = "engramd.sock"  # distinct from the existing recall-daemon
 # §2.1 of docs/2652-security-slice-design.md asks for is the directory,
 # not the name.
 SOCKET_DIR_NAME = "run"
+# Longest AF_UNIX socket path, in BYTES, that bind()/connect() accept (#3696).
+# Linux: sun_path is 108 bytes including the NUL, so 107 usable. MEASURED on a
+# Linux 6.6 seat (a 107-byte path binds; a 108-byte path raises "AF_UNIX path
+# too long"). The Darwin value (sun_path is 104 per the platform header) lands
+# with the #3666 build unit against this same contract; it was NOT measured
+# here, so this one constant is the Linux value only.
+SOCKET_PATH_MAX_BYTES = 107
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MiB -- generous for a JSON control-plane response,
 # small enough to bound a misbehaving owner that never completes a line (round-5 should-fix 1).
 
@@ -243,6 +250,23 @@ def _resolve_socket_path(socket_path: Path | None) -> Path:
     return Path(engram_home) / SOCKET_DIR_NAME / DEFAULT_SOCKET_NAME
 
 
+def socket_path_too_long_reason(socket_path: Path | str) -> str | None:
+    """None when `socket_path` fits an AF_UNIX address; otherwise the reason
+    text (byte length, limit, remedy). The ONE source of that text: the owner
+    raises it as OwnerSocketPathTooLong and the client returns it as the
+    Unavailable detail, so the two cannot disagree (#3696). Length is in
+    BYTES (os.fsencode), as the kernel counts, never characters."""
+    n = len(os.fsencode(socket_path))
+    if n <= SOCKET_PATH_MAX_BYTES:
+        return None
+    return (
+        f"engramd socket path is {n} bytes, over the {SOCKET_PATH_MAX_BYTES}-byte "
+        f"AF_UNIX limit: {socket_path}. Shorten ENGRAM_HOME (the socket lives at "
+        f"<ENGRAM_HOME>/{SOCKET_DIR_NAME}/{DEFAULT_SOCKET_NAME}, which adds "
+        f"{len('/' + SOCKET_DIR_NAME + '/' + DEFAULT_SOCKET_NAME)} bytes)."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unavailable-result construction (shared by every _call() failure branch)
 # ---------------------------------------------------------------------------
@@ -353,6 +377,14 @@ def _call(
         "request_id": request_id,
     }
     payload = (json.dumps(request) + "\n").encode("utf-8")
+
+    # #3696: an over-long path can never connect; say why (same text as the
+    # owner's refusal) before any socket exists.
+    too_long = socket_path_too_long_reason(socket_path)
+    if too_long is not None:
+        return _unavailable(
+            socket_path=sp, bound=timeout, detail=too_long, request_id=request_id
+        )
 
     deadline = time.monotonic() + timeout
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

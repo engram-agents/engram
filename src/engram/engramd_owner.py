@@ -504,6 +504,15 @@ class OwnerStalePathUnsafe(RuntimeError):
     owner is already here", it's "something unsafe to touch is here"."""
 
 
+class OwnerSocketPathTooLong(RuntimeError):
+    """Raised by EngramdOwner.start() when the socket path
+    (<ENGRAM_HOME>/run/engramd.sock) is longer in BYTES than an AF_UNIX
+    address allows (#3696). Raised before any filesystem mutation, so
+    neither engram_home nor run/ is created. The message is
+    `engramd_client.socket_path_too_long_reason()`'s text, shared with the
+    client's Unavailable detail."""
+
+
 class OwnerPythonTooOld(RuntimeError):
     """Raised by EngramdOwner.start() when the running Python's sqlite3
     lacks `Connection.setlimit` / `SQLITE_LIMIT_LENGTH` (#3349). The owner
@@ -1109,7 +1118,9 @@ class EngramdOwner:
         socket sits at the socket path (#3194, design doc §2.4).
         Raises OwnerPythonTooOld if the running Python's sqlite3 lacks
         `Connection.setlimit` (Python < 3.11) -- before anything is created
-        (#3349).
+        (#3349). Raises OwnerSocketPathTooLong if the socket path exceeds
+        the AF_UNIX byte limit -- before engram_home or run/ is created
+        (#3696).
 
         `install_signal_handlers=False` (tests only -- see
         tests/test_engramd_owner.py's owner_running fixture) skips
@@ -1121,6 +1132,13 @@ class EngramdOwner:
         directly.
         """
         self._check_platform_support()
+
+        # #3696: an over-long socket path is refused by name BEFORE the first
+        # filesystem mutation (engram_home.mkdir below), so a refusal leaves
+        # nothing behind. Byte length, shared reason text with the client.
+        too_long = ec.socket_path_too_long_reason(self.socket_path)
+        if too_long is not None:
+            raise OwnerSocketPathTooLong(too_long)
 
         # #3349: refuse on a Python without sqlite3 setlimit (< 3.11)
         # before ANY file, connection, socket or thread exists.
@@ -2499,6 +2517,9 @@ def main() -> int:
     try:
         owner.start(install_signal_handlers=True)
     except OwnerAlreadyRunning as exc:
+        print(f"[engramd] {exc}", file=sys.stderr)
+        return 1
+    except OwnerSocketPathTooLong as exc:
         print(f"[engramd] {exc}", file=sys.stderr)
         return 1
     print(f"[engramd] listening on {owner.socket_path} (pid {os.getpid()})", file=sys.stderr)
