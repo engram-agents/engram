@@ -10,9 +10,24 @@ Identity rule (Linux): a pid counts as alive only if the process could have
 WRITTEN the pidfile -- i.e. it did not start after the pidfile was last
 written (mtime). A process that did not exist yet cannot be the writer.
 
+Identity rule (Darwin, #3714): same rule, different primitives. The start
+time comes from libproc `proc_pidinfo(PROC_PIDTBSDINFO)` (pbi_start_tvsec /
+pbi_start_tvusec) and argv from `sysctl(CTL_KERN, KERN_PROCARGS2)`. libproc
+and libc are loaded lazily via ctypes, only on Darwin and only when a start
+time is needed, so importing this module stays cheap and side-effect free.
+The `struct proc_bsdinfo` size (136 bytes) and its pbi_pid are checked on
+every read; a mismatch is "cannot read" (conservative True), never parsed.
+An empty argv[0] is also "cannot read": it is indistinguishable from a
+future, wider padding layout, so it is never parsed.
+ESRCH after a successful `os.kill(pid, 0)` means the process died in
+between: that is dead (False), unlike "cannot read".
+
 Bounds, stated rather than hidden:
-  * /proc unreadable for a pid `os.kill` says is alive (non-Linux, permission,
-    race) -> conservative True. We never guess "dead" from missing data.
+  * Start time or argv unreadable for a pid `os.kill` says is alive
+    (permission, a cross-uid KERN_PROCARGS2 EINVAL, a libproc size mismatch,
+    libproc missing, a platform with neither /proc nor the Darwin arm, race)
+    -> conservative True. We never guess "dead" from missing data. The one
+    exception is Darwin ESRCH (above): the process is gone.
   * The pidfile format is unchanged (the bare pid), so an old-version
     instance that is genuinely alive (it started before writing its pidfile)
     still reads alive: upgrade/downgrade safe.
@@ -40,7 +55,11 @@ Bounds, stated rather than hidden:
 
 from __future__ import annotations
 
+import errno
+import logging
 import os
+import platform
+import struct
 from pathlib import Path
 
 # Clock skew / tick-rounding slack between the pidfile's mtime and the
@@ -61,9 +80,19 @@ def _parse_starttime_ticks(stat_text: str) -> int:
     return int(after_comm[19])
 
 
+def _is_darwin() -> bool:
+    """The same predicate as `engramd_client.platform_arm() == "darwin"` (#3712:
+    one platform discriminator, keyed on platform.system()). Not imported from
+    the client because the client imports this module (#3707), so importing
+    back would be a cycle."""
+    return platform.system() == "Darwin"
+
+
 def _read_process_start_time(pid: int) -> float | None:
     """Wall-clock start time of `pid`, or None if it cannot be determined
     (non-Linux, /proc unreadable, malformed, process vanished)."""
+    if _is_darwin():  # #3714: Darwin arm, defined below
+        return _read_process_start_time_darwin(pid)
     try:
         with open(f"/proc/{pid}/stat") as f:
             ticks = _parse_starttime_ticks(f.read())
@@ -89,6 +118,8 @@ def _started_after_pidfile(start_time: float, pidfile_mtime: float) -> bool:
 def _read_process_cmdline(pid: int) -> str | None:
     """/proc/<pid>/cmdline (NUL-separated argv) joined with spaces, or None
     if it cannot be read (non-Linux, permission, process vanished)."""
+    if _is_darwin():  # #3714: Darwin arm, defined below
+        return _read_process_cmdline_darwin(pid)
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
             raw = f.read()
@@ -97,14 +128,168 @@ def _read_process_cmdline(pid: int) -> str | None:
     return raw.replace(b"\0", b" ").decode("utf-8", "replace")
 
 
+# --- Darwin arm (#3714) ---------------------------------------------------
+# Everything here is additive: the Linux readers above are untouched and stay
+# the only readers on Linux; _read_process_start_time / _read_process_cmdline
+# dispatch to the Darwin readers below with an early platform check.
+
+_log = logging.getLogger(__name__)
+
+_PROC_PIDTBSDINFO = 3
+_PROC_BSDINFO_SIZE = 136  # sizeof(struct proc_bsdinfo), measured macOS 26.6.2
+_PBI_PID_OFFSET = 12  # uint32 pbi_pid
+_PBI_START_OFFSET = 120  # uint64 pbi_start_tvsec, then uint64 pbi_start_tvusec
+_CTL_KERN, _KERN_ARGMAX, _KERN_PROCARGS2 = 1, 8, 49
+
+# Unlocked module globals on purpose: the races are benign (worst case is a
+# duplicate library load or a second warning).
+_darwin_libs_cache = None
+_size_warned = False
+
+
+def _darwin_libs():
+    """(libproc, libc) via ctypes, loaded on first use. Darwin only."""
+    global _darwin_libs_cache
+    if _darwin_libs_cache is None:
+        import ctypes
+
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        libc = ctypes.CDLL(None, use_errno=True)
+        # int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize)
+        libproc.proc_pidinfo.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int,
+        ]
+        libproc.proc_pidinfo.restype = ctypes.c_int
+        # int sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
+        #            void *newp, size_t newlen)
+        libc.sysctl.argtypes = [
+            ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t,
+        ]
+        libc.sysctl.restype = ctypes.c_int
+        _darwin_libs_cache = (libproc, libc)
+    return _darwin_libs_cache
+
+
+def _darwin_proc_pidinfo(pid: int):
+    """Raw proc_pidinfo(PROC_PIDTBSDINFO) -> (nbytes, errno, buf bytes).
+    Raises OSError if libproc cannot be loaded."""
+    import ctypes
+
+    libproc, _ = _darwin_libs()
+    buf = ctypes.create_string_buffer(_PROC_BSDINFO_SIZE)
+    ctypes.set_errno(0)
+    n = libproc.proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, buf, _PROC_BSDINFO_SIZE)
+    return n, ctypes.get_errno(), buf.raw
+
+
+def _darwin_procargs2(pid: int):
+    """Raw sysctl(CTL_KERN, KERN_PROCARGS2, pid) -> (bytes | None, errno).
+    Raises OSError if libc cannot be loaded."""
+    import ctypes
+
+    _, libc = _darwin_libs()
+    ctypes.set_errno(0)
+    argmax = ctypes.c_int(0)
+    sz = ctypes.c_size_t(ctypes.sizeof(argmax))
+    mib2 = (ctypes.c_int * 2)(_CTL_KERN, _KERN_ARGMAX)
+    if libc.sysctl(mib2, 2, ctypes.byref(argmax), ctypes.byref(sz), None, 0) != 0:
+        return None, ctypes.get_errno()
+    buf = ctypes.create_string_buffer(argmax.value)
+    size = ctypes.c_size_t(argmax.value)
+    mib = (ctypes.c_int * 3)(_CTL_KERN, _KERN_PROCARGS2, pid)
+    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+        return None, ctypes.get_errno()
+    return buf.raw[: size.value], 0
+
+
+def _read_process_start_time_darwin(pid: int) -> float | None:
+    """Wall-clock start time of `pid` via libproc, or None if it cannot be
+    determined (libproc missing, size/pid mismatch, EPERM, ...). Raises
+    ProcessLookupError on ESRCH: the process is gone (dead, not unreadable)."""
+    global _size_warned
+    try:
+        n, err, raw = _darwin_proc_pidinfo(pid)
+    except (OSError, AttributeError):
+        return None
+    if n == 0 and err == errno.ESRCH:
+        raise ProcessLookupError(errno.ESRCH, "process gone", pid)
+    if n > 0 and n != _PROC_BSDINFO_SIZE:
+        # A positive, wrong size is a real layout signal. n == 0 with an errno
+        # other than ESRCH (plain EPERM, ...) is just "unreadable": no warning.
+        if not _size_warned:
+            _size_warned = True
+            _log.warning(
+                "proc_pidinfo(PROC_PIDTBSDINFO) returned %s bytes (errno %s), expected %s; "
+                "not parsing, treating the start time as unreadable",
+                n, err, _PROC_BSDINFO_SIZE,
+            )
+        return None
+    if n != _PROC_BSDINFO_SIZE or len(raw) < _PROC_BSDINFO_SIZE:
+        return None
+    if struct.unpack_from("I", raw, _PBI_PID_OFFSET)[0] != pid:
+        return None
+    sec, usec = struct.unpack_from("QQ", raw, _PBI_START_OFFSET)
+    return sec + usec / 1e6
+
+
+def _read_process_cmdline_darwin(pid: int) -> str | None:
+    """argv of `pid` joined with spaces (the shape _read_process_cmdline
+    returns on Linux), or None if unreadable (cross-uid EINVAL, vanished,
+    libc missing, malformed).
+
+    KERN_PROCARGS2 layout: int32 argc, the exec path, NUL padding, then argc
+    argv strings, then the environment. The padding is not a blind run of
+    NULs: measured on macOS 26.6.2 across exec-path lengths of every residue
+    mod 8, argv[0] starts at the next multiple of 8 after the exec path's
+    terminating NUL, counted from raw[4:] (granularity 8, not 16). We compute
+    that offset instead of stripping NULs. If the padding bytes are not all
+    NUL, fewer than argc terminated strings follow, or argv[0] itself is
+    EMPTY, the layout is not what we measured: return None (unreadable ->
+    conservative True), never guess. An empty argv[0] is therefore
+    "unreadable", not parsed (see the comment at the check)."""
+    try:
+        raw, _err = _darwin_procargs2(pid)
+    except (OSError, AttributeError):
+        return None
+    if raw is None or len(raw) < 4:
+        return None
+    try:
+        argc = struct.unpack_from("i", raw, 0)[0]
+        rest = raw[4:]
+        path_end = rest.index(b"\0")
+    except (struct.error, ValueError):
+        return None
+    if argc < 0:
+        return None
+    start = -(-(path_end + 1) // 8) * 8  # next multiple of 8 after path + its NUL
+    if start > len(rest) or rest[path_end:start].strip(b"\0"):
+        return None
+    parts = rest[start:].split(b"\0")
+    if len(parts) <= argc:  # the argc-th string must itself be NUL-terminated
+        return None
+    # Layout-drift guard. Padding WIDER than the next-multiple-of-8 rule puts a
+    # NUL at the computed start, so it always surfaces as an empty argv[0]
+    # (and would shift the parse, dropping the last argument from parts[:argc]);
+    # NARROWER padding puts non-NUL bytes inside the computed padding region,
+    # which the check above already rejects. So every drift lands on None. The
+    # cost: a real process with an empty argv[0] reads as unreadable, the same
+    # conservative outcome as a cross-uid EINVAL.
+    if not parts[0]:
+        return None
+    return b" ".join(parts[:argc]).decode("utf-8", "replace")
+
+
 def recorded_pid_is_alive(pid_path, program_marker: str | None = None) -> bool:
     """True iff `pid_path` names a live process that could have written it.
 
     False for: missing/unreadable/garbage pidfile; a non-positive pid (0, -N:
     not a process, and `os.kill` would "succeed" on a group); a pid `os.kill(pid, 0)`
     says is not signalable (dead, or any other OSError); or (Linux) a process
-    that started after the pidfile was last written. See the module
-    docstring for the conservative-True bound when /proc is unreadable.
+    that started after the pidfile was last written (Linux via /proc,
+    Darwin via libproc; a Darwin ESRCH after a successful kill is dead too).
+    See the module docstring for the conservative-True bound when the start
+    time is unreadable.
 
     `program_marker` (a substring of the owning program's argv): a process
     that started after the pidfile counts as a REUSED pid only if its
@@ -131,7 +316,12 @@ def recorded_pid_is_alive(pid_path, program_marker: str | None = None) -> bool:
         # An out-of-range pid (OverflowError from os.kill) is a garbage
         # pidfile, not ours.
         return False
-    start_time = _read_process_start_time(pid)
+    try:
+        start_time = _read_process_start_time(pid)
+    except ProcessLookupError:
+        # Darwin only: kill(pid, 0) succeeded, then libproc says ESRCH -- the
+        # process exited in between. Gone, not unreadable.
+        return False
     if start_time is None:
         return True
     if not _started_after_pidfile(start_time, mtime):
