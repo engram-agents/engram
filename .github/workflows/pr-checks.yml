@@ -928,7 +928,7 @@ jobs:
       # (SKILL.md retired, all 4 tests unconditionally skipped) — wiring a
       # step that runs, does nothing, and can never fail would read as
       # coverage that isn't there.
-      - name: stdlib-only guards — claude-md-drift, plugin-manifest-import-sync, tool-policy-sync, upgrade-drift-sources, build-plugin-hooks-consistency, claude-md-moves
+      - name: stdlib-only guards — claude-md-drift, plugin-manifest-import-sync, tool-policy-sync, upgrade-drift-sources, build-plugin-hooks-consistency, claude-md-moves, prev-release-hooks-gate
         if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         run: |
           python3 -m pytest \
@@ -938,6 +938,7 @@ jobs:
             tests/test_upgrade_drift_sources.py \
             tests/test_build_plugin_hooks_consistency.py \
             tests/test_claude_md_moves.py \
+            tests/test_prev_release_hooks_gate.py \
             -q
 
       # ── 7c-1. 2652 migration-ledger completeness (#2652) ──────────────────
