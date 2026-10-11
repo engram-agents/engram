@@ -1,5 +1,5 @@
 """Contract tests for the AF_UNIX socket-path length limit (#3696, part of
-#2652) -- the Linux half.
+#2652) -- Linux, and Darwin since #3666 (same cells, per-platform limit).
 
 The contract (written before the implementation):
 
@@ -47,10 +47,18 @@ import engramd_owner as eo  # noqa: E402
 # MEASURED on Linux 6.6 (WSL2), Python AF_UNIX bind on an absolute path in an
 # existing directory, 2026-10-11 (#3696): a 107-byte path binds; a 108-byte
 # path raises "OSError: AF_UNIX path too long". sun_path is 108 bytes
-# including the NUL. test_kernel_boundary_matches_constants re-measures both
-# on the running seat so these cannot drift from reality.
-LONGEST_BINDABLE_BYTES = 107
-SHORTEST_FAILING_BYTES = 108
+# including the NUL.
+# MEASURED on macOS 26.6.2 / Python 3.12.10, same probe (#3666): a 103-byte
+# path binds; a 104-byte path raises "AF_UNIX path too long" (sun_path is 104
+# per the header). Literals, not ec's constants, so the constants are checked
+# against a measurement; test_kernel_boundary_matches_constants re-measures
+# both on the running seat so these cannot drift from reality.
+if sys.platform == "darwin":
+    LONGEST_BINDABLE_BYTES = 103
+    SHORTEST_FAILING_BYTES = 104
+else:
+    LONGEST_BINDABLE_BYTES = 107
+    SHORTEST_FAILING_BYTES = 108
 
 REQUEST_DEADLINE = 0.6
 _TAIL = "/run/engramd.sock"  # appended to ENGRAM_HOME: 17 bytes
@@ -189,7 +197,10 @@ def test_multibyte_path_at_the_limit_in_bytes_starts(tmp_base):
 # -- T5: the constants match the kernel on this seat ----------------------------
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux sun_path limit")
+@pytest.mark.skipif(
+    not (sys.platform.startswith("linux") or sys.platform == "darwin"),
+    reason="sun_path limit measured only for Linux and Darwin",
+)
 def test_kernel_boundary_matches_constants(tmp_base):
     def try_bind(total: int):
         name = "k" * (total - _blen(tmp_base) - 1)

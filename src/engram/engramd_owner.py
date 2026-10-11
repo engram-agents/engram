@@ -462,6 +462,44 @@ SOCKET_FILE_MODE = 0o700
 PEERCRED_STRUCT_FORMAT = "@3i"
 PEERCRED_STRUCT_SIZE = struct.calcsize(PEERCRED_STRUCT_FORMAT)  # 12 on this fleet's Linux seats
 
+# ---------------------------------------------------------------------------
+# Darwin arm (#3666, design doc §2.1, §2.2, §2.5). Everything below is used
+# only when `platform.system() == "Darwin"` (or, for the peer check, only when
+# `socket.SO_PEERCRED` is absent); the Linux arm above is unchanged.
+# ---------------------------------------------------------------------------
+
+# Darwin xucred{cr_version, cr_uid, cr_ngroups, cr_groups[16]} -- LOCAL_PEERCRED's
+# wire shape. NATIVE alignment ("@") and a literal 76 are both load-bearing:
+# calcsize("@IIh16I") is 76, calcsize("=IIh16I") is 74, and a length pinned to
+# calcsize() would agree with the wrong ("=") format (design doc §2.2).
+DARWIN_PEERCRED_STRUCT_FORMAT = "@IIh16I"
+DARWIN_PEERCRED_STRUCT_SIZE = 76
+# cr_version of the xucred layout this parser understands (XUCRED_VERSION).
+DARWIN_XUCRED_VERSION = 0
+# getsockopt() level for AF_LOCAL options. Python exports neither SOL_LOCAL nor
+# LOCAL_PEERPID, so this is a literal (measured: design doc P2). It is NOT
+# SOL_SOCKET: LOCAL_PEERCRED at SOL_SOCKET succeeds and returns 4 zero bytes.
+SOL_LOCAL = 0
+
+# The Darwin socket-path limit (103 usable bytes, measured) lives with the
+# shared #3696 contract: engramd_client.DARWIN_SOCKET_PATH_MAX_BYTES.
+
+# Prerequisites of the Darwin permission layer, as named module constants so a
+# test can point one at a missing path and exercise the real existence check.
+# `chmod` is called by ABSOLUTE path, never found through PATH: a gnubin-first
+# PATH would resolve to GNU chmod (which may lack -N). `/dev/fd/<n>` is how the
+# strip and the read-back address the already-open run/ fd.
+DARWIN_CHMOD = "/bin/chmod"
+DARWIN_DEV_FD = "/dev/fd"
+
+# Folders macOS TCC guards by default for an unprivileged process, relative to
+# the user's home. THIS IS A DOCUMENTED HEURISTIC PREFIX LIST, NOT A TCC QUERY:
+# asking TCC (or probing the folder) would itself raise a consent dialog nobody
+# can answer on a launchd-run owner. The list is the three folders; it does not
+# follow symlinks (resolving one would touch the protected folder) and is not
+# claimed complete.
+DARWIN_TCC_PROTECTED_HOME_FOLDERS = ("Documents", "Desktop", "Downloads")
+
 
 class OwnerAlreadyRunning(RuntimeError):
     """Raised by EngramdOwner.start() when a confirmably-live owner already
@@ -483,13 +521,15 @@ class OwnerPermissionUnsupported(RuntimeError):
     START -- never to skip the check", extended here to the ACL-strip
     requirement of §2.1 and to a missing socket.SO_PEERCRED). A permission
     check that silently no-ops where it cannot run is worse than none --
-    the deployment would believe it has one. This build only implements
-    the Linux arm (issue #3194 scope bounds; Darwin's LOCAL_PEERCRED /
-    `chmod -N` equivalents are out of scope), so a non-Linux seat, a
-    seat missing the `setfacl` or `getfacl` binary (#3698: the strip is
-    read back), or a Python/OS build with no
-    SO_PEERCRED all refuse to start via this exception rather than
-    starting with a silently-unenforced permission layer."""
+    the deployment would believe it has one. This build implements the
+    Linux arm (#3194) and the Darwin arm (#3666: LOCAL_PEERCRED, `/bin/chmod
+    -N` on the run/ fd). A seat on any other platform, or one missing an
+    arm's prerequisite (Linux: `setfacl` or `getfacl` -- #3698: the strip is
+    read back -- or SO_PEERCRED; Darwin: LOCAL_PEERCRED, `/bin/chmod`,
+    `/dev/fd`), refuses to start via this exception rather than starting
+    with a silently-unenforced permission layer. So does a strip command
+    that exits non-zero (both arms) or, on Darwin, does not finish within
+    its timeout; what the READ-BACK finds is OwnerAclNotStripped."""
 
 
 class OwnerStalePathUnsafe(RuntimeError):
@@ -509,10 +549,27 @@ class OwnerStalePathUnsafe(RuntimeError):
 class OwnerSocketPathTooLong(RuntimeError):
     """Raised by EngramdOwner.start() when the socket path
     (<ENGRAM_HOME>/run/engramd.sock) is longer in BYTES than an AF_UNIX
-    address allows (#3696). Raised before any filesystem mutation, so
-    neither engram_home nor run/ is created. The message is
+    address allows (#3696; the Darwin limit since #3666 -- both are
+    `engramd_client.SOCKET_PATH_MAX_BYTES`). Raised before any filesystem
+    mutation, so neither engram_home nor run/ is created. The message is
     `engramd_client.socket_path_too_long_reason()`'s text, shared with the
     client's Unavailable detail."""
+
+
+class OwnerHomeTccProtected(RuntimeError):
+    """Raised by EngramdOwner.start() on Darwin when $ENGRAM_HOME sits under a
+    folder macOS TCC guards by default (#3666, design doc §2.5). A launchd-run
+    owner there would block on a consent dialog nobody can answer, so it
+    refuses instead. A heuristic prefix list, not a TCC query -- see
+    DARWIN_TCC_PROTECTED_HOME_FOLDERS."""
+
+
+class OwnerPeerCredentialsMalformed(RuntimeError):
+    """Raised by the Darwin peer check when the kernel's LOCAL_PEERCRED answer is
+    not the xucred this parser understands (length other than exactly 76, or
+    cr_version other than 0). Fail closed: the worker drops the connection and
+    the client reads it as Unavailable. A SHORT buffer does not reach this
+    class: `struct.unpack_from` raises `struct.error` first, as on Linux."""
 
 
 class OwnerAclNotStripped(RuntimeError):
@@ -522,9 +579,13 @@ class OwnerAclNotStripped(RuntimeError):
     mask::, any default: line) -- or when that read-back itself cannot be
     completed (getfacl failed, timed out or printed nothing parseable), because
     an unverifiable strip is the silent-gap shape (#3698, design doc §2.2).
+    Darwin (#3666) raises it for the same three outcomes of its own read-back
+    (`acl_get_fd_np` through the strip's fd): any entry left after `chmod -N`,
+    a read-back that cannot complete, and a mode other than 0700.
     Raised before the stale-socket check and the bind, so no socket exists.
-    `home/` and `run/` are left behind, hardened (mode 0700, owned by this
-    uid) and carrying whatever ACL the strip failed to remove; the next
+    `home/` and `run/` are left behind, owned by this uid, set to mode 0700
+    (unless the Darwin mode check is what refused) and carrying whatever
+    ACL the strip failed to remove; the next
     start() re-hardens `run/` on every start, so nothing needs cleaning up."""
 
 
@@ -976,22 +1037,120 @@ class _ClientReadGate:
             self._conn.set_progress_handler(None, 0)
 
 
+def _darwin_unsupported_reason() -> str | None:
+    """The Darwin branch of `platform_unsupported_reason()` (#3666, design doc
+    §2.5): None only when all three prerequisites hold; otherwise a refusal
+    naming the FIRST missing one. Each is read from its own primitive (the
+    `socket` attribute, the two module path constants) so a test can remove
+    exactly one -- never by patching `platform.system` alone (#3375)."""
+    if not hasattr(socket, "LOCAL_PEERCRED"):
+        return (
+            "refusing to start: this Python/OS build has no "
+            "socket.LOCAL_PEERCRED -- the Darwin peer-credential check "
+            "(design doc §2.2) cannot run here, and starting without it "
+            "would be a silent permission-layer gap"
+        )
+    if not os.path.exists(DARWIN_CHMOD):
+        return (
+            f"refusing to start: {DARWIN_CHMOD} is required to strip "
+            f"inherited ACLs on the socket's run/ directory (`chmod -N`, "
+            f"design doc §2.1) and was not found; it is called by absolute "
+            f"path, never through PATH"
+        )
+    if not os.path.isdir(DARWIN_DEV_FD):
+        return (
+            f"refusing to start: {DARWIN_DEV_FD} is not a directory -- the "
+            f"run/ strip and its ACL read-back address the open directory fd "
+            f"as {DARWIN_DEV_FD}/<fd> (design doc §2.5)"
+        )
+    return None
+
+
+def _darwin_acl_entries_via_fd(fd: int) -> list[str]:
+    """The ACL entries on the object behind `fd`, read THROUGH that fd with
+    libc's `acl_get_fd_np` (#3666, design doc §2.5's open read-back item).
+    Returns one text line per entry; `[]` means no ACL.
+
+    Measured on macOS 26.6.2: with no ACL, `acl_get_fd_np` returns NULL with
+    errno ENOENT (that is the documented "no ACL", not a failure); with an
+    entry it returns the acl_t, whose `acl_to_text` lists it. (`ls -led
+    /dev/fd/<fd>` was tried first and shows NO entry for a directory that
+    carries one, so it cannot serve as the read-back.) Any other failure, or a
+    libc without these symbols, raises OwnerAclNotStripped: an ACL we
+    could not read is not an ACL we may call absent."""
+    import ctypes  # lazy: Darwin-only, keeps the Linux import path untouched
+
+    try:
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        get_fd = libc.acl_get_fd_np
+        get_fd.restype = ctypes.c_void_p
+        get_fd.argtypes = [ctypes.c_int, ctypes.c_int]
+        to_text = libc.acl_to_text
+        to_text.restype = ctypes.c_void_p
+        to_text.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ssize_t)]
+        free = libc.acl_free
+        free.argtypes = [ctypes.c_void_p]
+        free.restype = ctypes.c_int
+    except (OSError, AttributeError) as exc:
+        raise OwnerAclNotStripped(
+            f"refusing to start: cannot read back the ACL on run/ (libc "
+            f"acl_get_fd_np unavailable: {exc}); an unverified strip is not "
+            f"accepted"
+        ) from exc
+
+    ACL_TYPE_EXTENDED = 0x00000100  # <sys/acl.h>
+    ctypes.set_errno(0)
+    acl = get_fd(fd, ACL_TYPE_EXTENDED)
+    if not acl:
+        err = ctypes.get_errno()
+        if err == errno.ENOENT:
+            return []
+        raise OwnerAclNotStripped(
+            f"refusing to start: ACL read-back on run/ failed "
+            f"(acl_get_fd_np errno {err}: {os.strerror(err)}); an unverified "
+            f"strip is not accepted"
+        )
+    try:
+        length = ctypes.c_ssize_t()
+        text_ptr = to_text(acl, ctypes.byref(length))
+        if not text_ptr:
+            err = ctypes.get_errno()
+            raise OwnerAclNotStripped(
+                f"refusing to start: ACL read-back on run/ found an ACL it "
+                f"could not render (acl_to_text errno {err}: "
+                f"{os.strerror(err)}); an unverified strip is not accepted"
+            )
+        try:
+            text = ctypes.string_at(text_ptr).decode("utf-8", "replace")
+        finally:
+            free(text_ptr)
+    finally:
+        free(acl)
+    # "!#acl 1" header, then one "kind:guid:name:id:allow|deny:perms" per entry.
+    return [ln for ln in text.splitlines() if ln and not ln.startswith("!#acl")]
+
+
 def platform_unsupported_reason() -> str | None:
     """Why this seat cannot run the owner, or None when it can (#3194, #3292).
 
-    Four checks, in this order, first failure wins: (1) not Linux, (2) no
-    `setfacl` on PATH, (3) no `getfacl` on PATH (the strip's read-back, #3698),
-    (4) no `socket.SO_PEERCRED`.
+    Linux: four checks, in this order, first failure wins: (1) not Linux,
+    (2) no `setfacl` on PATH, (3) no `getfacl` on PATH (the strip's
+    read-back, #3698), (4) no `socket.SO_PEERCRED`.
+    Darwin (#3666): `_darwin_unsupported_reason()` -- `socket.LOCAL_PEERCRED`,
+    `/bin/chmod` and `/dev/fd`, each named when missing. Any other platform
+    refuses.
     `EngramdOwner._check_platform_support()` raises `OwnerPermissionUnsupported`
     with the returned string, and the test suite's `requires_linux_owner`
     marker skips on `is not None`, so the refusal and the skip share this one
     definition."""
+    if platform.system() == "Darwin":
+        return _darwin_unsupported_reason()
     if platform.system() != "Linux":
         return (
             f"refusing to start: the socket permission layer (ACL "
             f"strip on run/, SO_PEERCRED peer check) is only "
-            f"implemented for Linux in this build; this seat reports "
-            f"platform.system() == {platform.system()!r}"
+            f"implemented for Linux and Darwin in this build; this seat "
+            f"reports platform.system() == {platform.system()!r}"
         )
     if shutil.which("setfacl") is None:
         return (
@@ -1214,10 +1373,14 @@ class EngramdOwner:
         `Connection.setlimit` (Python < 3.11) -- before anything is created
         (#3349). Raises OwnerSocketPathTooLong if the socket path exceeds
         the AF_UNIX byte limit -- before engram_home or run/ is created
-        (#3696). Raises OwnerAclNotStripped if the run/ ACL read back
-        through the strip's fd still carries any entry beyond the base
-        triple, or cannot be read back (#3698) -- before the stale-socket
-        check and the bind.
+        (#3696; per-platform limit since #3666). Raises OwnerAclNotStripped
+        if the run/ ACL read back through the strip's fd still carries any
+        entry beyond the base triple, or cannot be read back (#3698; on
+        Darwin also if run/ is not mode 0700 after the strip, #3666) --
+        before the stale-socket check and the bind. On Darwin, raises
+        OwnerHomeTccProtected if engram_home is under ~/Documents,
+        ~/Desktop or ~/Downloads -- before anything under it is read or
+        created (#3666).
 
         `install_signal_handlers=False` (tests only -- see
         tests/test_engramd_owner.py's owner_running fixture) skips
@@ -1232,10 +1395,16 @@ class EngramdOwner:
 
         # #3696: an over-long socket path is refused by name BEFORE the first
         # filesystem mutation (engram_home.mkdir below), so a refusal leaves
-        # nothing behind. Byte length, shared reason text with the client.
+        # nothing behind. Byte length, shared reason text with the client;
+        # the limit is per-platform (Darwin's 103 since #3666).
         too_long = ec.socket_path_too_long_reason(self.socket_path)
         if too_long is not None:
             raise OwnerSocketPathTooLong(too_long)
+
+        # #3666 (Darwin only, no-op elsewhere): pure -- no filesystem access --
+        # and so also before the first read under engram_home
+        # (_read_install_tier below) and the first mutation (mkdir).
+        self._check_darwin_home_not_tcc_protected()
 
         # #3349: refuse on a Python without sqlite3 setlimit (< 3.11)
         # before ANY file, connection, socket or thread exists.
@@ -1384,6 +1553,32 @@ class EngramdOwner:
         reason = platform_unsupported_reason()
         if reason is not None:
             raise OwnerPermissionUnsupported(reason)
+
+    def _check_darwin_home_not_tcc_protected(self) -> None:
+        """Darwin only (#3666, design doc §2.5): refuse an ENGRAM_HOME under
+        ~/Documents, ~/Desktop or ~/Downloads. A heuristic prefix list, NOT a
+        TCC query (see DARWIN_TCC_PROTECTED_HOME_FOLDERS): probing those
+        folders would itself raise a consent dialog. Compared lexically and
+        case-insensitively (the default volume is case-insensitive), with no
+        filesystem access and no symlink resolution -- resolving a path inside
+        a protected folder is exactly the access this check exists to avoid."""
+        if platform.system() != "Darwin":
+            return
+        home_parts = [p.casefold() for p in Path.home().parts]
+        parts = [p.casefold() for p in self.engram_home.parts]
+        for folder in DARWIN_TCC_PROTECTED_HOME_FOLDERS:
+            prefix = home_parts + [folder.casefold()]
+            if parts[: len(prefix)] == prefix:
+                raise OwnerHomeTccProtected(
+                    f"refusing to start: ENGRAM_HOME {self.engram_home} is "
+                    f"under ~/{folder}, a folder macOS TCC protects by "
+                    f"default; an owner started without a user at the screen "
+                    f"would block forever on a consent dialog nobody can "
+                    f"answer. Grant the owner's python Full Disk Access, or "
+                    f"move ENGRAM_HOME out of ~/Documents, ~/Desktop and "
+                    f"~/Downloads. (This is a heuristic folder list, not a "
+                    f"TCC query -- probing would raise the dialog.)"
+                )
 
     def _check_stale_socket_or_raise(self) -> None:
         """Contract items 1+2 (liveness / staleness) plus #3194's §2.4
@@ -1552,6 +1747,11 @@ class EngramdOwner:
                         f"directory this process doesn't own"
                     )
             os.fchmod(fd, RUN_DIR_MODE)
+            if platform.system() == "Darwin":
+                # #3666: the Darwin strip + fd-based read-back; the finally
+                # below still closes fd. The Linux setfacl arm is untouched.
+                self._strip_run_dir_acl_darwin(fd, run_dir)
+                return
             proc = subprocess.run(
                 ["setfacl", "-b", f"/proc/self/fd/{fd}"],
                 capture_output=True,
@@ -1579,6 +1779,57 @@ class EngramdOwner:
                 )
         finally:
             os.close(fd)
+
+    def _strip_run_dir_acl_darwin(self, fd: int, run_dir: Path) -> None:
+        """Darwin arm of the `run/` ACL strip (#3666, design doc §2.1 + §2.5).
+
+        `/bin/chmod -N /dev/fd/<fd>` with the fd passed via `pass_fds`: the
+        strip acts on the fd's TARGET, not on whatever the path names now
+        (swap control measured in §2.5). Then the ACL is READ BACK through the
+        same fd -- never the path, so a swap between strip and read-back
+        cannot show a clean read for a different directory -- and any entry
+        left over refuses the start. `chmod -N` exiting 0 is not evidence the
+        strip worked; nothing on the Linux arm re-reads the ACL either (#3698)."""
+        try:
+            proc = subprocess.run(
+                [DARWIN_CHMOD, "-N", f"{DARWIN_DEV_FD}/{fd}"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=30,
+                pass_fds=[fd],
+            )
+        except subprocess.TimeoutExpired as exc:
+            # A hung strip is a refusal with a named reason, not a bare
+            # traceback out of _harden_run_dir (still fail-closed either way).
+            raise OwnerPermissionUnsupported(
+                f"refusing to start: `chmod -N` on {run_dir} did not finish "
+                f"within {exc.timeout}s"
+            ) from exc
+        if proc.returncode != 0:
+            raise OwnerPermissionUnsupported(
+                f"refusing to start: `chmod -N` on {run_dir} (via its open "
+                f"fd, never by re-resolving the path) failed (exit "
+                f"{proc.returncode}): {proc.stderr.strip()}"
+            )
+        leftover = _darwin_acl_entries_via_fd(fd)
+        if leftover:
+            raise OwnerAclNotStripped(
+                f"refusing to start: ACL read-back on {run_dir} (through the "
+                f"same open fd) still shows {len(leftover)} entr"
+                f"{'y' if len(leftover) == 1 else 'ies'} after `chmod -N` "
+                f"reported success: {'; '.join(leftover)}"
+            )
+        # The security argument rests on the MODE as well as the ACL: read it
+        # back through the same fd too. Measured on macOS 26.6.2: `chmod -N`
+        # leaves mode bits alone (0700 stays 0700, 0755 stays 0755), so this
+        # holds today; it refuses if a strip ever widens the mode.
+        mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        if mode != RUN_DIR_MODE:
+            raise OwnerAclNotStripped(
+                f"refusing to start: {run_dir} reads mode {oct(mode)} after "
+                f"the ACL strip, expected {oct(RUN_DIR_MODE)}"
+            )
 
     def _bind_socket_or_raise(self) -> None:
         """bind() the listening socket, translating the double-launch
@@ -1796,7 +2047,14 @@ class EngramdOwner:
         too-short buffer to 0 (read as uid 0) with no error, whereas
         `unpack_from` RAISES on a short buffer (contract test 2's
         discrimination mutation targets exactly this parse form, per
-        design doc §2.2/§5 test 2)."""
+        design doc §2.2/§5 test 2).
+
+        The platform discriminator is the PRESENCE of `socket.SO_PEERCRED`
+        (design doc §2.2): absent, the Darwin LOCAL_PEERCRED check runs
+        instead (#3666), and with neither the check REFUSES -- it never
+        no-ops."""
+        if not hasattr(socket, "SO_PEERCRED"):
+            return self._check_peer_credentials_darwin(conn)
         raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, PEERCRED_STRUCT_SIZE)
         _peer_pid, peer_uid, _peer_gid = struct.unpack_from(PEERCRED_STRUCT_FORMAT, raw)
         own_uid = os.getuid()
@@ -1819,6 +2077,49 @@ class EngramdOwner:
         # property check, not a discriminating test", and no mutation is
         # invented for it here.
         if peer_uid == 0 and own_uid != 0:
+            return {
+                "status": "rejected",
+                "reason": "peer_identity",
+                "detail": f"connecting uid {peer_uid} is not this owner's uid {own_uid}",
+                "remedy": "connect to the socket under your own $ENGRAM_HOME",
+            }
+        return None
+
+    def _check_peer_credentials_darwin(self, conn: socket.socket) -> dict | None:
+        """Darwin arm of the peer check (#3666, design doc §2.2 + §2.5): same
+        return contract as `_check_peer_credentials()` -- a §2.3 rejection wire
+        dict for an unauthorised uid, None to proceed.
+
+        `getsockopt(SOL_LOCAL=0, LOCAL_PEERCRED, 76)`, parsed with
+        `struct.unpack_from("@IIh16I")` -- NEVER a slice, so a short buffer
+        (measured: an 8-byte request returns 8 bytes with no error; the wrong
+        LEVEL returns 4 zero bytes with no error) raises `struct.error`
+        instead of decoding to uid 0. Then the buffer must be EXACTLY 76 bytes
+        and `cr_version` must be 0, else `OwnerPeerCredentialsMalformed`
+        (fail closed; `cr_version == 0` is §2.5's added requirement)."""
+        if not hasattr(socket, "LOCAL_PEERCRED"):
+            raise OwnerPermissionUnsupported(
+                "refusing to check peer credentials: this platform has "
+                "neither socket.SO_PEERCRED nor socket.LOCAL_PEERCRED"
+            )
+        raw = conn.getsockopt(SOL_LOCAL, socket.LOCAL_PEERCRED, DARWIN_PEERCRED_STRUCT_SIZE)
+        cr_version, peer_uid, _ngroups, *_groups = struct.unpack_from(
+            DARWIN_PEERCRED_STRUCT_FORMAT, raw
+        )
+        if len(raw) != DARWIN_PEERCRED_STRUCT_SIZE:
+            raise OwnerPeerCredentialsMalformed(
+                f"LOCAL_PEERCRED returned {len(raw)} bytes, expected exactly "
+                f"{DARWIN_PEERCRED_STRUCT_SIZE}"
+            )
+        if cr_version != DARWIN_XUCRED_VERSION:
+            raise OwnerPeerCredentialsMalformed(
+                f"LOCAL_PEERCRED returned xucred cr_version {cr_version}, "
+                f"this parser understands only {DARWIN_XUCRED_VERSION}"
+            )
+        own_uid = os.getuid()
+        # uid mismatch, then §2.2's uid-0 clause (defence in depth: it changes
+        # no outcome given the mismatch rule, see _check_peer_credentials()).
+        if peer_uid != own_uid or (peer_uid == 0 and own_uid != 0):
             return {
                 "status": "rejected",
                 "reason": "peer_identity",
@@ -2628,7 +2929,7 @@ def main() -> int:
     except OwnerAlreadyRunning as exc:
         print(f"[engramd] {exc}", file=sys.stderr)
         return 1
-    except OwnerSocketPathTooLong as exc:
+    except (OwnerSocketPathTooLong, OwnerHomeTccProtected) as exc:
         print(f"[engramd] {exc}", file=sys.stderr)
         return 1
     except OwnerAclNotStripped as exc:

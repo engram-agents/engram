@@ -61,6 +61,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -91,10 +92,17 @@ SOCKET_DIR_NAME = "run"
 # Longest AF_UNIX socket path, in BYTES, that bind()/connect() accept (#3696).
 # Linux: sun_path is 108 bytes including the NUL, so 107 usable. MEASURED on a
 # Linux 6.6 seat (a 107-byte path binds; a 108-byte path raises "AF_UNIX path
-# too long"). The Darwin value (sun_path is 104 per the platform header) lands
-# with the #3666 build unit against this same contract; it was NOT measured
-# here, so this one constant is the Linux value only.
-SOCKET_PATH_MAX_BYTES = 107
+# too long").
+LINUX_SOCKET_PATH_MAX_BYTES = 107
+# Darwin (#3666): sun_path is 104 per the platform header, but the usable
+# length is 103. MEASURED on macOS 26.6.2 / Python 3.12.10 (a 103-byte path
+# binds; a 104-byte path raises "AF_UNIX path too long").
+DARWIN_SOCKET_PATH_MAX_BYTES = 103
+# The limit on THIS seat -- the one value socket_path_too_long_reason() and
+# so both the owner's refusal and the client's Unavailable detail use.
+SOCKET_PATH_MAX_BYTES = (
+    DARWIN_SOCKET_PATH_MAX_BYTES if sys.platform == "darwin" else LINUX_SOCKET_PATH_MAX_BYTES
+)
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MiB -- generous for a JSON control-plane response,
 # small enough to bound a misbehaving owner that never completes a line (round-5 should-fix 1).
 

@@ -37,7 +37,7 @@ from pathlib import Path
 
 import pytest
 
-from _owner_platform import requires_linux_owner
+from _owner_platform import requires_linux_kernel, requires_linux_owner
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOOL_PATH = REPO_ROOT / "tools" / "engramd_a6_latency.py"
@@ -105,6 +105,7 @@ def test_a_build_that_differs_from_the_tree_is_reported(tool, installed, tmp_pat
 # --- the two runtime asserts ---------------------------------------------------------
 
 @requires_linux_owner
+@requires_linux_kernel  # (a) Linux-only: the A6 tool reads /proc and calls os.posix_fadvise; porting the tool is out of scope (#3666)
 def test_the_installed_runs_owner_command_line_is_under_the_build(installed, installed_run):
     """Read from /proc by the tool, not from the argv it built. Mutation:
     launch the owner from the source tree in installed mode -> red (and the
@@ -116,6 +117,7 @@ def test_the_installed_runs_owner_command_line_is_under_the_build(installed, ins
 
 
 @requires_linux_owner
+@requires_linux_kernel  # (a) Linux-only: the A6 tool reads /proc and calls os.posix_fadvise; porting the tool is out of scope (#3666)
 def test_the_installed_run_never_walks_parent_directories(installed_run):
     """Borges's assert: counted, not timed. Mutation: load the hook (or its
     _hooklib) from the source tree in installed mode -> the walk runs -> red."""
@@ -123,6 +125,7 @@ def test_the_installed_run_never_walks_parent_directories(installed_run):
 
 
 @requires_linux_owner
+@requires_linux_kernel  # (a) Linux-only: the A6 tool reads /proc and calls os.posix_fadvise; porting the tool is out of scope (#3666)
 def test_the_source_run_does_walk_so_the_counter_can_see_a_walk(source_run):
     """Positive control for the counter: in the source layout the resolver
     falls through to the parent walk on every call. Mutation: a counter that
@@ -147,6 +150,7 @@ def test_the_installed_check_refuses_a_run_that_escaped_the_build(tool, installe
 # --- reporting -------------------------------------------------------------------------
 
 @requires_linux_owner
+@requires_linux_kernel  # (a) Linux-only: the A6 tool reads /proc and calls os.posix_fadvise; porting the tool is out of scope (#3666)
 def test_both_layouts_are_reported_and_labelled(tool, installed_run, source_run):
     """Mutation: drop either table, or label the source table as the gate ->
     red."""
@@ -162,6 +166,7 @@ def test_both_layouts_are_reported_and_labelled(tool, installed_run, source_run)
 
 
 @requires_linux_owner
+@requires_linux_kernel  # (a) Linux-only: the A6 tool reads /proc and calls os.posix_fadvise; porting the tool is out of scope (#3666)
 def test_both_runs_answer_like_the_direct_read(installed_run, source_run):
     """Mutation: an installed run that measures a stub or a different store ->
     red."""
@@ -194,6 +199,7 @@ def test_the_synthetic_store_is_wal_like_production(tool):
 
 
 @requires_linux_owner
+@requires_linux_kernel  # (a) Linux-only: the A6 tool reads /proc and calls os.posix_fadvise; porting the tool is out of scope (#3666)
 def test_the_report_names_the_store_journal_mode(tool, installed_run):
     """The header names the journal mode the run measured. Mutation: drop it
     from the result or the table -> red."""

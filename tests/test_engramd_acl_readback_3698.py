@@ -44,7 +44,7 @@ from pathlib import Path
 
 import pytest
 
-from _owner_platform import requires_linux_owner
+from _owner_platform import requires_linux_kernel, requires_linux_owner
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ENGRAM = str(REPO_ROOT / "src" / "engram")
@@ -282,6 +282,7 @@ def _open_fd_count() -> int:
 
 
 @requires_linux_owner
+@requires_linux_kernel  # counts fds via /proc/self/fd and drives the setfacl strip (#3666 marker audit)
 @pytest.mark.parametrize(
     "stub",
     [

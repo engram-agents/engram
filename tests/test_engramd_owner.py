@@ -2816,21 +2816,23 @@ def test_cleanup_blocks_on_owner_lock_held_by_an_in_flight_operation(owner_runni
 
 
 # ---------------------------------------------------------------------------
-# #3292 -- the owner refuses on non-Linux BY DESIGN (#3194). This test carries
-# no requires_linux_owner marker: it runs on every platform, and is the one
-# that proves the refusal the other tests' skip marker relies on.
+# #3292 -- the owner refuses on an UNSUPPORTED platform BY DESIGN (#3194). This
+# test carries no requires_linux_owner marker: it runs on every platform, and is
+# the one that proves the refusal the other tests' skip marker relies on.
+# #3666: Darwin is now a SUPPORTED platform (its own prerequisites, below), so
+# the "unsupported" case here is FreeBSD -- a platform that is neither.
 # ---------------------------------------------------------------------------
 
 
-def test_start_refuses_on_non_linux_before_any_side_effect(engram_home, monkeypatch):
-    monkeypatch.setattr(eo.platform, "system", lambda: "Darwin")
+def test_start_refuses_on_an_unsupported_platform_before_any_side_effect(engram_home, monkeypatch):
+    monkeypatch.setattr(eo.platform, "system", lambda: "FreeBSD")
     fresh_home = engram_home / "not-yet-created"
     assert not fresh_home.exists()
     threads_before = set(threading.enumerate())
     owner = eo.EngramdOwner(fresh_home)
     with pytest.raises(eo.OwnerPermissionUnsupported) as ei:
         owner.start(install_signal_handlers=False)
-    assert "Darwin" in str(ei.value)
+    assert "FreeBSD" in str(ei.value)
     assert not fresh_home.exists()
     assert not owner.socket_path.exists()
     assert not owner.pid_path.exists()
@@ -2858,7 +2860,7 @@ def _patch_platform(monkeypatch, *, system="Linux", setfacl=True, peercred=True)
 
 
 _PLATFORM_CASES = [
-    pytest.param({"system": "Darwin"}, "platform.system()", id="not-linux"),
+    pytest.param({"system": "FreeBSD"}, "platform.system()", id="unsupported-platform"),
     pytest.param({"setfacl": False}, "setfacl", id="no-setfacl"),
     pytest.param({"peercred": False}, "SO_PEERCRED", id="no-so-peercred"),
 ]
@@ -2878,7 +2880,7 @@ def test_platform_unsupported_reason_names_each_failing_condition(monkeypatch, k
 
 
 def test_platform_unsupported_reason_order_platform_first(monkeypatch):
-    _patch_platform(monkeypatch, system="Darwin", peercred=False)
+    _patch_platform(monkeypatch, system="FreeBSD", peercred=False)
     assert "platform.system()" in eo.platform_unsupported_reason()
     _patch_platform(monkeypatch, setfacl=False, peercred=False)
     assert "setfacl" in eo.platform_unsupported_reason()
@@ -2901,6 +2903,59 @@ def test_start_refusal_message_equals_shared_predicate(engram_home, monkeypatch,
     assert not owner.store_path.exists()
     assert owner._accept_thread is None
     assert set(threading.enumerate()) == threads_before
+
+
+# ---------------------------------------------------------------------------
+# #3666 -- the Darwin branch of the same predicate. SIMULATED here so the logic
+# is checked on every platform (patching each primitive the branch reads, never
+# `platform.system` alone -- #3375); the REAL-Mac evidence for the same
+# prerequisites is tests/test_engramd_owner_darwin_3666.py.
+# ---------------------------------------------------------------------------
+
+
+def _patch_darwin(monkeypatch, *, peercred=True, chmod=True, devfd=True):
+    monkeypatch.setattr(eo.platform, "system", lambda: "Darwin")
+    if peercred:
+        monkeypatch.setattr(eo.socket, "LOCAL_PEERCRED", 1, raising=False)
+    else:
+        monkeypatch.delattr(eo.socket, "LOCAL_PEERCRED", raising=False)
+    monkeypatch.setattr(eo, "DARWIN_CHMOD", __file__ if chmod else "/nonexistent-3666/chmod")
+    monkeypatch.setattr(
+        eo, "DARWIN_DEV_FD", str(Path(__file__).parent) if devfd else "/nonexistent-3666/fd"
+    )
+
+
+_DARWIN_CASES = [
+    pytest.param({"peercred": False}, "LOCAL_PEERCRED", id="darwin-no-local-peercred"),
+    pytest.param({"chmod": False}, "/nonexistent-3666/chmod", id="darwin-no-chmod"),
+    pytest.param({"devfd": False}, "/nonexistent-3666/fd", id="darwin-no-dev-fd"),
+]
+
+
+def test_platform_unsupported_reason_none_for_a_darwin_with_every_prerequisite(monkeypatch):
+    _patch_darwin(monkeypatch)
+    assert eo.platform_unsupported_reason() is None
+
+
+@pytest.mark.parametrize("kw,needle", _DARWIN_CASES)
+def test_darwin_reason_names_the_one_missing_prerequisite(monkeypatch, kw, needle):
+    _patch_darwin(monkeypatch, **kw)
+    reason = eo.platform_unsupported_reason()
+    assert reason is not None and needle in reason
+    # a Darwin seat is never asked for Linux's tools
+    assert "setfacl" not in reason and "SO_PEERCRED" not in reason
+
+
+@pytest.mark.parametrize("kw,needle", _DARWIN_CASES)
+def test_darwin_start_refusal_message_equals_shared_predicate(engram_home, monkeypatch, kw, needle):
+    _patch_darwin(monkeypatch, **kw)
+    expected = eo.platform_unsupported_reason()
+    fresh_home = engram_home / "not-yet-created"
+    owner = eo.EngramdOwner(fresh_home)
+    with pytest.raises(eo.OwnerPermissionUnsupported) as ei:
+        owner.start(install_signal_handlers=False)
+    assert str(ei.value) == expected
+    assert not fresh_home.exists()
 
 
 def test_marker_and_predicate_agree_at_import_time():

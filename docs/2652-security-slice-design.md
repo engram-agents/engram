@@ -173,10 +173,10 @@ entries on Linux, and `chmod -N` on Darwin. It does this through a directory fd 
 `O_DIRECTORY|O_NOFOLLOW` and `fstat`-checked, never by path. It then **sets the socket's own mode
 explicitly** rather than inheriting it from the umask.
 
-**Build scope.** The U4a build (#3194, #3201) implements the **Linux arm only**. On any other platform,
-or on a Linux seat without `setfacl`, `getfacl` or `SO_PEERCRED`, the owner **refuses to start** (§2.2's posture)
-rather than running without the strip. The Darwin `chmod -N` step above specifies what a later Darwin
-build must do; no Darwin build does it today. §2.5 adds the Darwin build notes measured for #3666.
+**Build scope.** The U4a build (#3194, #3201) implemented the **Linux arm**, and the Darwin arm followed
+in #3666 (PR #3703), with build notes in §2.5. On any other platform, on a Linux seat without `setfacl`,
+`getfacl` or `SO_PEERCRED`, or on a Darwin seat without `socket.LOCAL_PEERCRED`, `/bin/chmod` or
+`/dev/fd`, the owner **refuses to start** (§2.2's posture) rather than running without the strip.
 
 ### 2.2 Peer credentials — defence in depth, and the assertion that makes it real
 
@@ -276,6 +276,10 @@ Darwin has no `/proc`, but `/dev/fd/<fd>` serves the same purpose. With the fd p
   without verification is the silent-gap shape §2.2 refuses elsewhere. `acl_get_fd_np` and `acl_free`
   are present in libc via ctypes (an fd-native read-back), but that call was NOT exercised. The build
   must measure it, or use `ls -led /dev/fd/<fd>`, and refuse if any entry remains.
+  *Resolved in the build (#3666, PR #3703):* `acl_get_fd_np` works as the read-back, and NULL with ENOENT
+  means no ACL. `ls -led /dev/fd/<fd>` does NOT show a directory's ACL entry, so it cannot serve. The
+  build reads the ACL and the mode back through the strip's fd and refuses with `OwnerAclNotStripped`.
+  Measured: `chmod -N` leaves mode bits alone. The Linux arm reads back too since #3698.
 
 **Peer check: two facts §2.2's assertions already cover, stated so the build tests them.**
 - With a buffer length of 8, `getsockopt(0, LOCAL_PEERCRED, 8)` returned 8 bytes with no error, so the
@@ -296,6 +300,8 @@ Darwin has no `/proc`, but `/dev/fd/<fd>` serves the same purpose. With the fd p
 - On macOS `bind()` on a 129-byte path fails with `OSError: AF_UNIX path too long`. That failure is
   the only measurement. The Darwin `sun_path` is 104 bytes **per the platform header, not measured
   here**, and the usable boundary (103 vs 104) was not measured. Linux's 108 was not measured either.
+  *Measured since:* Darwin's usable limit is 103 bytes (103 binds, 104 fails; macOS 26.6.2, #3666),
+  and Linux's is 107 (107 binds, 108 fails; Linux 6.6, #3696).
 - The owner has no length check. `_bind_socket_or_raise` translates only `EADDRINUSE`; any other
   `OSError` is re-raised raw. And `start()` runs `_harden_run_dir()` before the bind, so an over-long
   path leaves `run/` created and hardened, then a bare traceback.
@@ -306,12 +312,16 @@ Darwin has no `/proc`, but `/dev/fd/<fd>` serves the same purpose. With the fd p
   right after `_check_platform_support()` and computed from `self.socket_path`. It must precede the
   FIRST filesystem mutation in `start()`, which is `self.engram_home.mkdir(...)`, not
   `_harden_run_dir()`. The Darwin build includes it; the Linux half is #3696, against the same
-  contract.
+  contract. *As built:* #3696 landed first and holds the one check for both platforms
+  (`engramd_client.SOCKET_PATH_MAX_BYTES` plus one reason text, shared by owner and client); #3666
+  adds Darwin's measured 103 to that constant rather than a second check.
 
 **The refusal gains a Darwin branch, and the test marker must move with it.** Today
 `platform_unsupported_reason()` refuses anything that is not Linux, then checks for `setfacl`, then for
 `socket.SO_PEERCRED`. The Darwin branch checks the Darwin prerequisites instead:
-`socket.LOCAL_PEERCRED` present, `chmod` on `PATH`, and `/dev/fd` present. It refuses, naming the
+`socket.LOCAL_PEERCRED` present, `/bin/chmod` present (called by absolute path, never found through
+`PATH`: a GNU-coreutils-first `PATH` resolves a `chmod` that may lack `-N`), and `/dev/fd` present.
+It refuses, naming the
 missing one, if any is absent. An unrecognised platform still refuses. The `requires_linux_owner` marker
 keys on the same function (#3375), and that shared function is what keeps the refusal and the skip in
 agreement. The marker should still be renamed (to something like "owner-supported platform"), so the

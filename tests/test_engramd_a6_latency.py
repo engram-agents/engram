@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from _owner_platform import requires_linux_owner
+from _owner_platform import requires_linux_kernel, requires_linux_owner
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOOL_PATH = REPO_ROOT / "tools" / "engramd_a6_latency.py"
@@ -55,13 +55,16 @@ def test_launcher_argv_carries_the_owner_marker_and_the_process_is_real(tool):
     /proc, not from the argv we built) contains `engramd_owner`, and it is a
     different process from the test. Mutation: launch via `python -c` / a
     wrapper without the module path in argv -> red."""
-    if not Path("/proc").is_dir():
-        pytest.skip("needs /proc")
     assert any("engramd_owner" in a for a in tool.owner_argv())
     handle = tool.launch_owner(tool.make_test_store(nodes=50))
     try:
         assert handle.proc.pid != os.getpid()
-        cmdline = Path(f"/proc/{handle.proc.pid}/cmdline").read_bytes()
+        if Path("/proc").is_dir():
+            cmdline = Path(f"/proc/{handle.proc.pid}/cmdline").read_bytes()
+        else:  # no /proc (macOS): the process table's own command line, same fact (#3666)
+            import subprocess as _sp
+            cmdline = _sp.run(["ps", "-o", "command=", "-p", str(handle.proc.pid)],
+                              capture_output=True, check=True).stdout
         assert b"engramd_owner" in cmdline
     finally:
         handle.stop()
@@ -69,6 +72,7 @@ def test_launcher_argv_carries_the_owner_marker_and_the_process_is_real(tool):
 
 
 @requires_linux_owner
+@requires_linux_kernel  # (a) Linux-only: the A6 tool reads /proc and calls os.posix_fadvise; porting the tool is out of scope (#3666)
 def test_every_arm_has_a_same_run_baseline_and_both_percentiles(smoke):
     """Mutation: drop the baseline arm of any pair, or omit p99 -> red."""
     arms = {(r["arm"], r["path"]): r for r in smoke["rows"]}
@@ -80,6 +84,7 @@ def test_every_arm_has_a_same_run_baseline_and_both_percentiles(smoke):
 
 
 @requires_linux_owner
+@requires_linux_kernel  # (a) Linux-only: the A6 tool reads /proc and calls os.posix_fadvise; porting the tool is out of scope (#3666)
 def test_the_owner_arm_returns_the_same_people_as_the_baseline_arm(smoke):
     """Anti-vacuity: a fast wrong/empty answer must not count as fast. Mutation:
     make the owner arm return [] without reading -> red."""
@@ -89,6 +94,7 @@ def test_the_owner_arm_returns_the_same_people_as_the_baseline_arm(smoke):
 
 
 @requires_linux_owner
+@requires_linux_kernel  # (a) Linux-only: the A6 tool reads /proc and calls os.posix_fadvise; porting the tool is out of scope (#3666)
 def test_the_table_names_host_python_and_sqlite_build(tool, smoke):
     """Mutation: omit any of the three -> red."""
     table = tool.format_table(smoke)
@@ -237,6 +243,7 @@ def test_default_measurement_output_shape_is_unchanged_for_user_identity(tool, m
 
 
 @requires_linux_owner
+@requires_linux_kernel  # (a) Linux-only: the A6 tool reads /proc and calls os.posix_fadvise; porting the tool is out of scope (#3666)
 def test_stop_measurement_against_a_real_owner(tool):
     """Live cell (Linux seat): the stop selector against a REAL owner process, with
     the real page-cache eviction. Mutation: a launcher that does not start a real

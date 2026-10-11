@@ -34,7 +34,7 @@ from pathlib import Path
 
 import pytest
 
-from _owner_platform import requires_linux_owner
+from _owner_platform import requires_linux_kernel, requires_linux_owner
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOOL_PATH = REPO_ROOT / "tools" / "engramd_stage_profile.py"
@@ -87,12 +87,15 @@ def test_the_profiled_owner_is_a_separate_process_carrying_the_owner_marker(tool
     """#3285 obligation, read from /proc rather than from the argv we built.
     Mutation: serve the owner in-process, or launch the launcher without the
     owner module's path on its command line -> red."""
-    if not Path("/proc").is_dir():
-        pytest.skip("needs /proc")
     handle = tool.launch_profiled_owner(store)
     try:
         assert handle.proc.pid != os.getpid()
-        cmdline = Path(f"/proc/{handle.proc.pid}/cmdline").read_bytes()
+        if Path("/proc").is_dir():
+            cmdline = Path(f"/proc/{handle.proc.pid}/cmdline").read_bytes()
+        else:  # no /proc (macOS): the process table's own command line, same fact (#3666)
+            import subprocess as _sp
+            cmdline = _sp.run(["ps", "-o", "command=", "-p", str(handle.proc.pid)],
+                              capture_output=True, check=True).stdout
         assert b"engramd_owner" in cmdline
     finally:
         handle.stop()
@@ -284,6 +287,7 @@ def test_cli_enforces_the_n_floor(tool, monkeypatch):
 # --- layout (#3678): the profiler gets A6's switch --------------------------------------
 
 @requires_linux_owner
+@requires_linux_kernel  # (a) Linux-only: the A6 tool reads /proc and calls os.posix_fadvise; porting the tool is out of scope (#3666)
 def test_the_installed_layout_profile_runs_the_build_and_never_walks(tool, tmp_path_factory):
     """Borges's ruling: the profiler measures the installed layout too, under
     the same two runtime asserts as A6. Its client_import row then shows what
