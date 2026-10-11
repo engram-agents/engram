@@ -582,6 +582,14 @@ def emit_context(
        if even a single item's render doesn't fit `target` against the real
        path (subject to the same `allow_single_overflow`/`budget` exception
        as the placeholder-sized determination below).
+       Within that `truncated_first` shape the in-band marker is part of the
+       render too (engram-alpha#2899): Stage 1 sizes the head without it, so
+       when trailer + head + marker would exceed the ceiling,
+       `_render_truncated_first()` re-trims a local copy of the head on a
+       line boundary (trailer says `head trimmed`) until it fits. If trailer
+       + marker alone exceed the ceiling the head is dropped entirely and the
+       overshoot of `target` is unavoidable -- it is never an overshoot of
+       `budget`.
 
     6. `kept_out` (#3621) reports what the model can actually see: the indices
        of the items present whole in the returned string. It errs toward
@@ -674,13 +682,39 @@ def emit_context(
             if overflow_path_
             else "…[truncated]"
         )
-        trailer = _build_context_trailer(1, cut_n_for_marker, overflow_path_, head_cut)
-        overhead = len(trailer) + (len(head_text) + 1 if head_text else 0) + 1 + len(marker)
+        local_head = head_text
+        local_head_cut = head_cut
+        trailer = _build_context_trailer(1, cut_n_for_marker, overflow_path_, local_head_cut)
+        overhead = len(trailer) + (len(local_head) + 1 if local_head else 0) + 1 + len(marker)
+        if overhead > ceiling and local_head:
+            # engram-alpha#2899: Stage 1 sized the head against the trailer
+            # only and never reserved this marker, so trailer + head +
+            # marker alone can exceed the ceiling -- and the item_room
+            # clamp below would then hide the shortfall. Re-trim a LOCAL
+            # copy of the head (head_text/head_cut stay untouched: the
+            # Stage-3 degrade call site calls this function again) on a
+            # line boundary so trailer + head + marker fits. The trailer is
+            # rebuilt with head_cut=True so the cut is never silent; that
+            # clause is already reserved by Stage 1's worst_trailer.
+            # Layout: trailer \n head \n item+marker, hence the two joins.
+            local_head_cut = True
+            trailer = _build_context_trailer(
+                1, cut_n_for_marker, overflow_path_, local_head_cut
+            )
+            head_room_local = ceiling - len(trailer) - len(marker) - 2
+            local_head = _trim_to_line_boundary(local_head, head_room_local)
+            overhead = (
+                len(trailer) + (len(local_head) + 1 if local_head else 0) + 1 + len(marker)
+            )
+        # Unavoidable overshoot (documented in emit_context()'s contract
+        # item 5): if trailer + marker alone exceed the ceiling, the head is
+        # already empty here and the render stays over `target` (never over
+        # `budget` -- the final backstop clamps).
         item_room = max(ceiling - overhead, 0)
         item_text = body_list[0][:item_room]
         parts = [trailer]
-        if head_text:
-            parts.append(head_text)
+        if local_head:
+            parts.append(local_head)
         parts.append((item_text + marker) if item_text else marker)
         return "\n".join(parts)
 
