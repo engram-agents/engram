@@ -839,7 +839,8 @@ def test_c5_flattened_deployed_layout_resolves_both_runtime_modules_and_reads_th
     (root / "hooks").mkdir(parents=True)
     for name in ("engram-stop-hook.py", "_hooklib.py", "_stophooklib.py"):
         shutil.copy(_HOOKS_SRC / name, root / "hooks" / name)
-    for name in ("engramd_client.py", "engramd_owner_flags.py"):
+    # #3707: engramd_client imports engram_pidfile; the build ships both at the plugin root (tiers.json, essential).
+    for name in ("engramd_client.py", "engramd_owner_flags.py", "engram_pidfile.py"):
         shutil.copy(Path(_SRC_ENGRAM) / name, root / name)
     transcript = home / "t.jsonl"
     transcript.write_text("{}\n")

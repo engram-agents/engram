@@ -80,12 +80,24 @@ def _parse_starttime_ticks(stat_text: str) -> int:
     return int(after_comm[19])
 
 
+def platform_arm() -> str | None:
+    """Which platform arm this seat is on (#3712, moved here by #3707): "linux",
+    "darwin", or None for any other platform. Keyed on `platform.system()`
+    ALONE -- the single source of the platform decision. engramd_client
+    delegates to it (the client imports this module, never the reverse), and
+    the owner's `_owner_arm()` delegates to the client."""
+    system = platform.system()
+    if system == "Linux":
+        return "linux"
+    if system == "Darwin":
+        return "darwin"
+    return None
+
+
 def _is_darwin() -> bool:
-    """The same predicate as `engramd_client.platform_arm() == "darwin"` (#3712:
-    one platform discriminator, keyed on platform.system()). Not imported from
-    the client because the client imports this module (#3707), so importing
-    back would be a cycle."""
-    return platform.system() == "Darwin"
+    """`platform_arm() == "darwin"`: this module is the source of the platform
+    discriminator, so there is no import cycle to avoid any more."""
+    return platform_arm() == "darwin"
 
 
 def _read_process_start_time(pid: int) -> float | None:
@@ -93,6 +105,9 @@ def _read_process_start_time(pid: int) -> float | None:
     (non-Linux, /proc unreadable, malformed, process vanished)."""
     if _is_darwin():  # #3714: Darwin arm, defined below
         return _read_process_start_time_darwin(pid)
+    # The broad except below is also why the ProcessLookupError clause in
+    # recorded_live_pid() is inert on Linux: a vanished process lands here
+    # as None, never as an exception (see the comment at that clause).
     try:
         with open(f"/proc/{pid}/stat") as f:
             ticks = _parse_starttime_ticks(f.read())
@@ -178,6 +193,9 @@ def _darwin_proc_pidinfo(pid: int):
 
     libproc, _ = _darwin_libs()
     buf = ctypes.create_string_buffer(_PROC_BSDINFO_SIZE)
+    # Must run BEFORE proc_pidinfo: a stale errno left by an earlier call, read
+    # afterwards as ESRCH, would turn a live owner into a dead one -- the one
+    # fail-open direction this module guards.
     ctypes.set_errno(0)
     n = libproc.proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, buf, _PROC_BSDINFO_SIZE)
     return n, ctypes.get_errno(), buf.raw
@@ -282,8 +300,17 @@ def _read_process_cmdline_darwin(pid: int) -> str | None:
 
 def recorded_pid_is_alive(pid_path, program_marker: str | None = None) -> bool:
     """True iff `pid_path` names a live process that could have written it.
+    The bool form of `recorded_live_pid` (same logic, run once there)."""
+    return recorded_live_pid(pid_path, program_marker) is not None
 
-    False for: missing/unreadable/garbage pidfile; a non-positive pid (0, -N:
+
+def recorded_live_pid(pid_path, program_marker: str | None = None) -> int | None:
+    """The pid `pid_path` names when it is a live process that could have
+    written it, else None (#3707). One read of the pidfile: a caller that needs
+    the pid must not read it separately from the liveness check, or the two
+    could disagree. `recorded_pid_is_alive` is `... is not None`.
+
+    None (False in the bool form) for: missing/unreadable/garbage pidfile; a non-positive pid (0, -N:
     not a process, and `os.kill` would "succeed" on a group); a pid `os.kill(pid, 0)`
     says is not signalable (dead, or any other OSError); or (Linux) a process
     that started after the pidfile was last written (Linux via /proc,
@@ -301,13 +328,13 @@ def recorded_pid_is_alive(pid_path, program_marker: str | None = None) -> bool:
             pid = int(f.read().strip())
         mtime = os.stat(pid_path).st_mtime
     except (OSError, ValueError):
-        return False
+        return None
     if pid <= 0:
         # os.kill(0, 0) / os.kill(-1, 0) signal a process group / every
         # signalable process and succeed, and /proc/0|-1 is unreadable, so
         # they would read alive forever. Not a pid. (pid 1 is NOT special-
         # cased: in a container the owner can legitimately be pid 1.)
-        return False
+        return None
     try:
         os.kill(pid, 0)
     except (OSError, OverflowError):
@@ -315,20 +342,25 @@ def recorded_pid_is_alive(pid_path, program_marker: str | None = None) -> bool:
         # someone else -- not confirmably ours, same as dead (today's rule).
         # An out-of-range pid (OverflowError from os.kill) is a garbage
         # pidfile, not ours.
-        return False
+        return None
     try:
         start_time = _read_process_start_time(pid)
     except ProcessLookupError:
-        # Darwin only: kill(pid, 0) succeeded, then libproc says ESRCH -- the
-        # process exited in between. Gone, not unreadable.
-        return False
+        # Not platform-gated, but only the Darwin reader raises it: kill(pid, 0)
+        # succeeded, then libproc says ESRCH -- the process exited in between.
+        # Gone, not unreadable. On Linux this clause is inert, because the
+        # Linux reader's broader `except (OSError, ...)` already returns None
+        # for a vanished process. If that clause is ever narrowed, a
+        # ProcessLookupError escaping it is still ESRCH (no such process), so
+        # reading it as dead here stays correct. The two clauses go together.
+        return None
     if start_time is None:
-        return True
+        return pid
     if not _started_after_pidfile(start_time, mtime):
-        return True
+        return pid
     if program_marker is None:
-        return False
+        return None
     cmdline = _read_process_cmdline(pid)
     if cmdline is None:
-        return True  # cannot tell reuse from drift -- never guess dead
-    return program_marker in cmdline
+        return pid  # cannot tell reuse from drift -- never guess dead
+    return pid if program_marker in cmdline else None

@@ -255,10 +255,11 @@ import engramd_read_registry as rr
 # Module-level constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_PID_NAME = "engramd.pid"
-# argv substring of a live owner (`python .../engramd_owner.py`, `python -m
-# engramd_owner`): the program-identity guard in engram_pidfile (#3240).
-_PIDFILE_PROGRAM_MARKER = "engramd_owner"
+# The pidfile name and the argv marker live in the client (#3707: the client
+# reads the pidfile on a Darwin refused connect() and never imports the owner);
+# aliased here so existing owner code and tests keep their names.
+DEFAULT_PID_NAME = ec.DEFAULT_PID_NAME
+_PIDFILE_PROGRAM_MARKER = ec.PIDFILE_PROGRAM_MARKER
 
 # #3240 item 2: exit status of an owner that shut down on a DISPLACED
 # substrate (its -wal/-shm fds no longer match the files on disk). Distinct
@@ -293,7 +294,10 @@ DEFAULT_STORE_NAME = "knowledge.db"
 # peer. See the fairy handoff's design-choices section for this reasoning
 # stated plainly, since the fairy spec left the exact number to the
 # builder's judgment.
-MAX_REQUEST_BYTES = 1 * 1024 * 1024  # 1 MiB
+#
+# #3707 round 3: the value now lives in engramd_client (the client checks it
+# before connecting, so it is the single source); this is an alias.
+MAX_REQUEST_BYTES = ec.MAX_REQUEST_BYTES
 
 # Production default for the per-request end-to-end deadline (contract item
 # 8), measured from ACCEPT. Generous enough for a legitimately slow
@@ -1298,8 +1302,8 @@ class EngramdOwner:
         # The socket's parent directory (self.socket_path.parent) is the
         # `run/` directory this unit hardens -- see start()'s directory
         # setup below (#3194).
-        self.socket_path = self.engram_home / ec.SOCKET_DIR_NAME / ec.DEFAULT_SOCKET_NAME
-        self.pid_path = self.engram_home / DEFAULT_PID_NAME
+        self.socket_path = ec.socket_path_for_home(self.engram_home)
+        self.pid_path = ec.pid_path_for_home(self.engram_home)
         self.store_path = self.engram_home / DEFAULT_STORE_NAME
         self.request_deadline = request_deadline
         # snapshot()'s own, larger, named budget (#3194 round 2) -- a plain

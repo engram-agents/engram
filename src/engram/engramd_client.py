@@ -69,6 +69,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import engram_pidfile
+
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
@@ -90,6 +92,19 @@ DEFAULT_SOCKET_NAME = "engramd.sock"  # distinct from the existing recall-daemon
 # §2.1 of docs/2652-security-slice-design.md asks for is the directory,
 # not the name.
 SOCKET_DIR_NAME = "run"
+# The owner's pidfile name (relative to $ENGRAM_HOME) and the argv substring of
+# a live owner (`python .../engramd_owner.py`, `python -m engramd_owner`), the
+# program-identity guard in engram_pidfile (#3240). They live here, not in the
+# owner, because the client reads the pidfile on a Darwin refused connect()
+# (#3707) and the client must never import the owner; the owner aliases them.
+DEFAULT_PID_NAME = "engramd.pid"
+PIDFILE_PROGRAM_MARKER = "engramd_owner"
+# How long a caller should retry a refused / busy owner before treating it as
+# stuck (#3707). A JUDGEMENT, not a measurement: 5x the 2 s per-call
+# DEFAULT_TIMEOUT. There is no data on how long a full accept backlog takes to
+# drain. One constant so the Linux busy remedy and the Darwin busy_or_stuck
+# remedy say the same number.
+OWNER_BUSY_RETRY_SECONDS = 10
 # Longest AF_UNIX socket path, in BYTES, that bind()/connect() accept (#3696).
 # Linux: sun_path is 108 bytes including the NUL, so 107 usable. MEASURED on a
 # Linux 6.6 seat (a 107-byte path binds; a 108-byte path raises "AF_UNIX path
@@ -104,15 +119,11 @@ DARWIN_SOCKET_PATH_MAX_BYTES = 103
 def platform_arm() -> str | None:
     """Which platform arm this seat is on (#3712): "linux", "darwin", or None
     for any other platform. Keyed on `platform.system()` ALONE -- the single
-    source of the platform decision. The client owns it because the owner
-    imports the client and the client must never import the owner; the owner's
-    `_owner_arm()` delegates here."""
-    system = platform.system()
-    if system == "Linux":
-        return "linux"
-    if system == "Darwin":
-        return "darwin"
-    return None
+    source of the platform decision, which lives in engram_pidfile.platform_arm()
+    (#3707: the client imports that module, so the source moved there). This
+    delegates, so the owner's `_owner_arm()` -> here -> engram_pidfile chain has
+    exactly one body."""
+    return engram_pidfile.platform_arm()
 
 
 # The limit on THIS seat -- the one value socket_path_too_long_reason() and
@@ -122,6 +133,16 @@ def platform_arm() -> str | None:
 SOCKET_PATH_MAX_BYTES = (
     DARWIN_SOCKET_PATH_MAX_BYTES if platform_arm() == "darwin" else LINUX_SOCKET_PATH_MAX_BYTES
 )
+# Cap on one INCOMING request line, in bytes, newline included (#3707 round 3).
+# The single source: the owner takes it from here (engramd_owner aliases it) and
+# the client checks the encoded request against it BEFORE connecting, so an
+# oversize request is a Rejected the caller can act on, never a broken pipe
+# discovered at sendall(). The owner counts every byte it has received on the
+# connection and drops (without replying) once that total is > this cap; the
+# client sends exactly `payload` (the JSON line + "\n"), so `len(payload) > cap`
+# is the same comparison. Requests are small control-plane JSON, so 1 MiB is
+# generous headroom that still bounds a runaway or hostile peer.
+MAX_REQUEST_BYTES = 1 * 1024 * 1024  # 1 MiB
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MiB -- generous for a JSON control-plane response,
 # small enough to bound a misbehaving owner that never completes a line (round-5 should-fix 1).
 
@@ -168,6 +189,23 @@ class Unavailable:
     human_steps: list[str]  # non-empty: what only the user can do
     detail: str = ""
     request_id: str | None = None
+    # Why the owner was unavailable, as a code a caller can act on without
+    # parsing prose (#3707), by MEANING:
+    #   "down"          no owner listening (ENOENT/ENOTSOCK/refused, no live owner;
+    #                   socket path over the AF_UNIX limit); restart it.
+    #   "timeout"       no valid reply within the bound; the owner may be alive.
+    #   "protocol"      the owner was reached, but the exchange failed without a valid
+    #                   answer (response over the cap, empty, unparseable, an
+    #                   unrecognized status, or an OSError after connect()).
+    #   "busy"          Linux full accept backlog; owner healthy, retry.
+    #   "busy_or_stuck" Darwin refused connect() with a live owner pid; retry,
+    #                   then stop it and restart.
+    # Added LAST, defaulted, so positional construction and equality
+    # of existing callers are unchanged (the Rejected.commit pattern).
+    reason: str | None = None
+    # The live owner's pid when reason == "busy_or_stuck" and the pidfile was
+    # found; None on every other path.
+    owner_pid: int | None = None
 
     @property
     def value(self) -> Any:
@@ -274,7 +312,31 @@ def _resolve_socket_path(socket_path: Path | None) -> Path:
     if socket_path is not None:
         return socket_path
     engram_home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
-    return Path(engram_home) / SOCKET_DIR_NAME / DEFAULT_SOCKET_NAME
+    return socket_path_for_home(Path(engram_home))
+
+
+def socket_path_for_home(home: Path) -> Path:
+    """<home>/run/engramd.sock -- the one place the owner socket path is
+    composed (the owner uses this too)."""
+    return Path(home) / SOCKET_DIR_NAME / DEFAULT_SOCKET_NAME
+
+
+def pid_path_for_home(home: Path) -> Path:
+    """<home>/engramd.pid -- the one place the owner pidfile path is composed
+    (the owner uses this too)."""
+    return Path(home) / DEFAULT_PID_NAME
+
+
+def _pid_path_for_socket(socket_path: Path) -> Path | None:
+    """The pidfile for an owner socket at the standard layout
+    (<home>/run/engramd.sock), else None (location unknown). An explicit
+    `socket_path` that is not BOTH inside a directory named SOCKET_DIR_NAME AND
+    named DEFAULT_SOCKET_NAME (e.g. /var/run/foo.sock) has no knowable home, so
+    no pidfile is guessed."""
+    socket_path = Path(socket_path)
+    if socket_path.parent.name != SOCKET_DIR_NAME or socket_path.name != DEFAULT_SOCKET_NAME:
+        return None
+    return socket_path.parent.parent / DEFAULT_PID_NAME
 
 
 def socket_path_too_long_reason(socket_path: Path | str) -> str | None:
@@ -299,31 +361,83 @@ def socket_path_too_long_reason(socket_path: Path | str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+# The remedy by reason (#3707 round 3, design-seat ruling: the remedy text
+# follows the code). ONE table, (agent_steps, human_steps) templates per reason,
+# filled with {socket_path} and {n} (OWNER_BUSY_RETRY_SECONDS) at build time.
+#   down      no owner listening: the restart step is right here and ONLY here.
+#   timeout   no valid reply within the bound; a timeout was measured on a live,
+#             SIGSTOPped owner, so the escalation is stop-then-restart, never a
+#             bare restart.
+#   protocol  the owner was reached and the exchange failed. No claim about the
+#             owner's state and no restart step: a post-connect EPIPE/ECONNRESET
+#             is also what a crashed owner looks like, so the retry discriminates
+#             (a crashed owner turns the retry into `down`, which restarts).
+# `busy` and `busy_or_stuck` keep their own builders (the latter has pid
+# variants); `_BUILDER_REASONS` names them so the reason set stays complete.
+_REMEDY_STEPS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "down": (
+        (
+            "Retry the call after a short backoff -- engramd may recover on its own.",
+            "Check whether the engramd process is running and (re)start it if not "
+            "(the owner should be listening on {socket_path}).",
+        ),
+        (
+            "If retries keep failing, restart your Claude Code session.",
+            "Run /mcp to reconnect the MCP server, or check the engramd logs for "
+            "the underlying failure.",
+        ),
+    ),
+    "timeout": (
+        (
+            "Retry the call after a short backoff.",
+            "If calls keep timing out for more than {n} seconds, the owner may be "
+            "stuck. Check whether the engramd process is running; if it is running "
+            "but not answering, stop it, then restart it.",
+        ),
+        (
+            "If calls keep timing out for more than {n} seconds, the owner may be "
+            "stuck: if the engramd process is running but not answering, stop it, "
+            "then restart it. Check the engramd logs for what is holding it.",
+        ),
+    ),
+    "protocol": (
+        (
+            "The owner was reached, but the exchange failed without a valid answer. "
+            "Retry once. If the retry returns `down`, follow its steps. If it fails "
+            "as `protocol` again, check the engramd logs for why the owner dropped "
+            "this request.",
+        ),
+        ("Check the engramd logs for why the owner dropped this request.",),
+    ),
+}
+_BUILDER_REASONS = ("busy", "busy_or_stuck")
+# Every value Unavailable.reason can take (the table rows plus the builders').
+UNAVAILABLE_REASONS = tuple(_REMEDY_STEPS) + _BUILDER_REASONS
+
+
 def _unavailable(
-    *, socket_path: str, bound: float, detail: str, request_id: str | None
+    *, socket_path: str, bound: float, detail: str, request_id: str | None, reason: str
 ) -> Unavailable:
     """Build an Unavailable result carrying concrete, actionable recovery
     guidance in the response payload itself (docs/2652-engrammanager-design.md
     SS5.5: guidance travels in the payload, not a log line, and the two kinds
     -- agent-actionable vs. human-only -- are distinguishable without parsing
-    prose)."""
-    agent_steps = [
-        "Retry the call after a short backoff -- engramd may recover on its own.",
-        f"Check whether the engramd process is running and (re)start it if not "
-        f"(the owner should be listening on {socket_path}).",
-    ]
-    human_steps = [
-        "If retries keep failing, restart your Claude Code session.",
-        "Run /mcp to reconnect the MCP server, or check the engramd logs for "
-        "the underlying failure.",
-    ]
+    prose). `reason` is REQUIRED (no default): it is set by what the site
+    MEANS -- "down", "timeout" or "protocol" (see Unavailable.reason) -- so a
+    new call site cannot silently inherit the wrong code (#3707).
+
+    The steps come from `_REMEDY_STEPS`, keyed by `reason` (the remedy follows
+    the code); a reason with no row raises KeyError here, at construction."""
+    agent_templates, human_templates = _REMEDY_STEPS[reason]
+    fields = {"socket_path": socket_path, "n": OWNER_BUSY_RETRY_SECONDS}
     return Unavailable(
         socket_path=socket_path,
         bound=bound,
-        agent_steps=agent_steps,
-        human_steps=human_steps,
+        agent_steps=[t.format(**fields) for t in agent_templates],
+        human_steps=[t.format(**fields) for t in human_templates],
         detail=detail,
         request_id=request_id,
+        reason=reason,
     )
 
 
@@ -349,11 +463,81 @@ def _busy_unavailable(
             "retry once the burst drains.",
         ],
         human_steps=[
-            "If retries keep failing for more than a few seconds, check the engramd "
-            "logs for what is holding the owner.",
+            f"If retries keep failing for more than {OWNER_BUSY_RETRY_SECONDS} seconds, "
+            "check the engramd logs for what is holding the owner.",
         ],
         detail=f"owner busy (accept backlog full): {detail}",
         request_id=request_id,
+        reason="busy",
+    )
+
+
+def _busy_or_stuck_unavailable(
+    *,
+    socket_path: str,
+    bound: float,
+    detail: str,
+    request_id: str | None,
+    owner_pid: int | None,
+) -> Unavailable:
+    """Darwin: connect() was REFUSED and the pidfile names a live owner (#3707).
+    On Darwin a full accept backlog, a stale socket file and a bound-but-never-
+    listening socket all give ECONNREFUSED, so a busy owner and a live owner
+    that is not accepting look identical to the client; the pid check only
+    separates "an owner exists" from "no owner". So the remedy leads with retry
+    (a wrong restart drops every other client; a wrong retry costs one caller a
+    few seconds) and carries the escalation: after OWNER_BUSY_RETRY_SECONDS, stop
+    the named pid, then restart. Never "restart" alone, and never "do not
+    restart" (the owner is not known to be healthy).
+
+    `owner_pid` None means the pidfile location is unknown (an explicit socket
+    path outside the standard layout); the remedy then says so."""
+    n = OWNER_BUSY_RETRY_SECONDS
+    if owner_pid is not None:
+        who = f"pid {owner_pid}"
+        agent_steps = [
+            f"The owner process ({who}) exists but refused the connection: it is "
+            f"busy (accept backlog full) or not accepting connections. Retry the call "
+            f"after a short backoff, for up to {n} seconds.",
+            f"If it is still refused after {n} seconds, owner {who} is not accepting "
+            f"connections. First confirm {who} is still the engramd owner (its command "
+            f"line contains {PIDFILE_PROGRAM_MARKER}, e.g. `ps -p {owner_pid} -o command=`): "
+            f"the pid was checked when the call failed, and it may have been reused since. "
+            f"If it is, stop {who}, then restart the owner. If it is not, the owner has "
+            f"exited: do not stop that pid; restart the owner.",
+        ]
+        human_steps = [
+            f"Retry for up to {n} seconds. If the connection is still refused, owner "
+            f"{who} is not accepting connections. Confirm {who} is still the engramd "
+            f"owner (`ps -p {owner_pid} -o command=` shows {PIDFILE_PROGRAM_MARKER}) "
+            f"before stopping it, then restart the owner; if it is not, do not stop it. "
+            "Check the engramd logs for what is holding it.",
+        ]
+        detail_text = f"owner busy or stuck (connection refused, owner alive) pid {owner_pid}: {detail}"
+    else:
+        agent_steps = [
+            "An owner process may exist but refused the connection (the pidfile location "
+            "is unknown for this socket path, so its pid is unknown): it is busy "
+            "or not accepting connections. Retry the call after a short backoff, for up "
+            f"to {n} seconds.",
+            f"If it is still refused after {n} seconds, the owner's pid is unknown: find "
+            "and stop the running owner process before any restart.",
+        ]
+        human_steps = [
+            f"Retry for up to {n} seconds. If the connection is still refused, the owner's "
+            "pid is unknown: find and stop the running owner process, then restart it. "
+            "Check the engramd logs for what is holding it.",
+        ]
+        detail_text = f"owner busy or stuck (connection refused, owner pid unknown): {detail}"
+    return Unavailable(
+        socket_path=socket_path,
+        bound=bound,
+        agent_steps=agent_steps,
+        human_steps=human_steps,
+        detail=detail_text,
+        request_id=request_id,
+        reason="busy_or_stuck",
+        owner_pid=owner_pid,
     )
 
 
@@ -386,6 +570,7 @@ def _arm_timeout_or_unavailable(
             bound=bound,
             detail="owner did not respond within the bound",
             request_id=request_id,
+            reason="timeout",
         )
     sock.settimeout(remaining)
     return None
@@ -423,8 +608,10 @@ def _call(
 
     An unparseable owner response, or a response carrying an unrecognized
     `status` value, is classified as Unavailable (not Rejected) -- a
-    deliberate choice: it is a protocol failure, and the remedy is to
-    restart the owner, not to fix the call's params.
+    deliberate choice: it is a protocol failure (reason="protocol"), not a
+    problem with the call's params. Its steps make no claim about the owner's
+    state and carry no restart: retry once, and a crashed owner turns the retry
+    into `down` (#3707).
     """
     sp = str(socket_path)
     request = {
@@ -435,16 +622,32 @@ def _call(
     }
     payload = (json.dumps(request) + "\n").encode("utf-8")
 
+    # #3707 round 3: an oversize request is the CALLER's error and the client can
+    # know it before sending. Refuse it here as Rejected (the owner's availability
+    # is not in question), never discover it as a broken pipe after connect().
+    # Same comparison the owner makes (bytes received, newline included, > cap),
+    # exact for an owner on the default cap; an owner built with a smaller
+    # max_request_bytes (tests do this) can still drop a request this lets through.
+    if len(payload) > MAX_REQUEST_BYTES:
+        return Rejected(
+            reason="request_too_large",
+            detail=f"request is {len(payload)} bytes, over the {MAX_REQUEST_BYTES}-byte cap",
+            remedy="shrink the request or split it into smaller requests",
+            request_id=request_id,
+        )
+
     # #3696: an over-long path can never connect; say why (same text as the
     # owner's refusal) before any socket exists.
     too_long = socket_path_too_long_reason(socket_path)
     if too_long is not None:
         return _unavailable(
-            socket_path=sp, bound=timeout, detail=too_long, request_id=request_id
+            socket_path=sp, bound=timeout, detail=too_long, request_id=request_id,
+            reason="down",
         )
 
     deadline = time.monotonic() + timeout
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connected = False  # set once connect() returns: later OSErrors are `protocol`
     try:
         exhausted = _arm_timeout_or_unavailable(
             sock, deadline=deadline, socket_path=sp, bound=timeout, request_id=request_id
@@ -463,7 +666,30 @@ def _call(
                 return _busy_unavailable(
                     socket_path=sp, bound=timeout, detail=str(exc), request_id=request_id
                 )
+            # Darwin only (#3707): a full backlog fails with ECONNREFUSED there, the
+            # same errno as "owner gone". A pidfile naming a LIVE owner means an owner
+            # exists and refused: busy_or_stuck. Pidfile missing / dead / reused ->
+            # re-raise, so the down Unavailable below results. Pidfile location
+            # unknown (explicit non-standard socket path) leans to busy_or_stuck
+            # without a pid, never to "restart". Never on ENOENT, ENOTSOCK, a
+            # timeout or any later step, or on Linux.
+            if exc.errno == errno.ECONNREFUSED and platform_arm() == "darwin":
+                pid_path = _pid_path_for_socket(socket_path)
+                if pid_path is None:
+                    return _busy_or_stuck_unavailable(
+                        socket_path=sp, bound=timeout, detail=str(exc),
+                        request_id=request_id, owner_pid=None,
+                    )
+                live_pid = engram_pidfile.recorded_live_pid(
+                    pid_path, program_marker=PIDFILE_PROGRAM_MARKER
+                )
+                if live_pid is not None:
+                    return _busy_or_stuck_unavailable(
+                        socket_path=sp, bound=timeout, detail=str(exc),
+                        request_id=request_id, owner_pid=live_pid,
+                    )
             raise
+        connected = True
 
         exhausted = _arm_timeout_or_unavailable(
             sock, deadline=deadline, socket_path=sp, bound=timeout, request_id=request_id
@@ -489,6 +715,7 @@ def _call(
                     bound=timeout,
                     detail=f"owner response exceeded the {MAX_RESPONSE_BYTES}-byte cap without completing a line",
                     request_id=request_id,
+                    reason="protocol",
                 )
             if b"\n" in data:
                 break
@@ -502,17 +729,25 @@ def _call(
             bound=timeout,
             detail="owner did not respond within the bound",
             request_id=request_id,
+            reason="timeout",
         )
     except (ConnectionRefusedError, FileNotFoundError, OSError) as exc:
         # socket.timeout (== TimeoutError as of Python 3.10) is itself an
         # OSError subclass, so this clause MUST come after the timeout
         # clause above, never merged with it -- a merged `except Exception`
         # (or an OSError-first ordering) would swallow the timeout branch.
+        #
+        # Split by step (#3707 round 3): before connect() returned, no owner was
+        # reached -> `down`. After it, the owner WAS reached and the exchange
+        # failed (EPIPE / ECONNRESET from sendall() or recv(), e.g. a dropped
+        # request) -> `protocol`; `down` would be asserted about an owner that
+        # answered the connect.
         return _unavailable(
             socket_path=sp,
             bound=timeout,
             detail=str(exc),
             request_id=request_id,
+            reason="protocol" if connected else "down",
         )
     finally:
         sock.close()
@@ -523,6 +758,7 @@ def _call(
             bound=timeout,
             detail="owner closed the connection without responding",
             request_id=request_id,
+            reason="protocol",
         )
 
     try:
@@ -533,6 +769,7 @@ def _call(
             bound=timeout,
             detail=f"owner sent an unparseable response: {exc}",
             request_id=request_id,
+            reason="protocol",
         )
 
     status = response.get("status") if isinstance(response, dict) else None
@@ -551,6 +788,7 @@ def _call(
         bound=timeout,
         detail=f"owner sent an unrecognized status: {status!r}",
         request_id=request_id,
+        reason="protocol",
     )
 
 

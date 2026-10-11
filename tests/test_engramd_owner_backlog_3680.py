@@ -165,9 +165,11 @@ def test_a_burst_of_32_simultaneous_pings_is_all_ok(engram_home):
 @requires_linux_owner
 @pytest.mark.xfail(
     platform.system() == "Darwin",
-    reason="#3707: on Darwin a full AF_UNIX backlog fails with ECONNREFUSED, the "
-    "owner-down errno, so the EAGAIN-keyed busy path never fires. strict: once "
-    "#3707 lands this XPASSes and fails, so remove the marker there.",
+    reason="Darwin cannot tell busy from stuck: a full AF_UNIX backlog fails with "
+    "ECONNREFUSED, as does a live owner that is not listening. The Darwin "
+    "counterpart is #3707 cell (a), busy_or_stuck (tests/"
+    "test_engramd_client_darwin_refused_3707.py); this cell stays the Linux-busy "
+    "contract, so strict: it must keep failing on Darwin.",
     strict=True,
 )
 def test_a_full_backlog_is_busy_loud_and_never_restart(engram_home, monkeypatch):
@@ -227,8 +229,15 @@ def test_owner_down_no_socket_file_is_unchanged(engram_home):
 
 def test_owner_down_nobody_listening_is_unchanged(engram_home):
     """ConnectionRefusedError: a socket file left behind with nothing
-    listening. Mutation: route every OSError to the busy path -> red."""
-    sp = str(engram_home / "stale.sock")
+    listening. Mutation: route every OSError to the busy path -> red.
+
+    #3707: the stale socket sits at the standard <home>/run/ layout with no
+    pidfile, so "no owner" is known on every platform. At a non-standard path
+    the pidfile location is unknown and Darwin answers busy_or_stuck by
+    contract (#3707 cell (h))."""
+    run_dir = engram_home / ec.SOCKET_DIR_NAME
+    run_dir.mkdir(exist_ok=True)
+    sp = str(run_dir / ec.DEFAULT_SOCKET_NAME)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.bind(sp)
     s.close()  # the file stays, nobody listens
@@ -238,8 +247,9 @@ def test_owner_down_nobody_listening_is_unchanged(engram_home):
 
 def test_eagain_from_sendall_keeps_the_generic_path(engram_home, monkeypatch):
     """The busy mapping covers the CONNECT step only. A socket whose connect()
-    succeeds but whose sendall() raises EAGAIN must get today's owner-down
-    Unavailable, restart remedy included, never the busy one. Mutation: map
+    succeeds but whose sendall() raises EAGAIN must get the generic
+    post-connect Unavailable (now `protocol`, per #3707 ruling 6112946218),
+    never the busy one. Mutation: map
     EAGAIN from sendall() to the busy path too -> detail says busy -> red
     (Sol's surviving mutant H on #3690)."""
     real_socket = ec.socket.socket
@@ -254,6 +264,17 @@ def test_eagain_from_sendall_keeps_the_generic_path(engram_home, monkeypatch):
     monkeypatch.setattr(ec.socket, "socket", _SendallEagain)
     sp = str(engram_home / "x.sock")
     res = ec.read("ping", {}, timeout=PING_TIMEOUT, socket_path=sp)
-    _assert_todays_owner_down(
-        res, sp, lambda d: "temporarily unavailable" in d.lower()
-    )
+    assert isinstance(res, ec.Unavailable), res
+    assert res.reason == "protocol", res
+    assert "temporarily unavailable" in res.detail.lower(), res.detail
+    assert "busy" not in res.detail.lower()
+    assert not any("restart" in s.lower() for s in res.agent_steps + res.human_steps)
+    assert res.agent_steps == [
+        "The owner was reached, but the exchange failed without a valid answer. "
+        "Retry once. If the retry returns `down`, follow its steps. If it fails "
+        "as `protocol` again, check the engramd logs for why the owner dropped "
+        "this request.",
+    ]
+    assert res.human_steps == [
+        "Check the engramd logs for why the owner dropped this request.",
+    ]
