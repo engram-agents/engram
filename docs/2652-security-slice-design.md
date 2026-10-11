@@ -176,7 +176,7 @@ explicitly** rather than inheriting it from the umask.
 **Build scope.** The U4a build (#3194, #3201) implements the **Linux arm only**. On any other platform,
 or on a Linux seat without `setfacl` or `SO_PEERCRED`, the owner **refuses to start** (§2.2's posture)
 rather than running without the strip. The Darwin `chmod -N` step above specifies what a later Darwin
-build must do; no Darwin build does it today.
+build must do; no Darwin build does it today. §2.5 adds the Darwin build notes measured for #3666.
 
 ### 2.2 Peer credentials — defence in depth, and the assertion that makes it real
 
@@ -252,6 +252,107 @@ costs the one thing §5.5 requires.
 Before unlinking, the owner confirms the path is a socket (`stat.S_ISSOCK`) and **not a symlink**,
 then unlinks and binds. Replacing whatever sits at the path, sight unseen, turns crash recovery into
 "write a file anywhere the owner can reach".
+
+### 2.5 Darwin arm — build notes measured for #3666 (2026-10-10/11)
+
+§2.1 and §2.2 already decide the Darwin mechanisms: `chmod -N` for the `run/` strip and `LOCAL_PEERCRED`
+for the peer check. This section adds only what the Darwin build needs and those sections do not say.
+Every new row was measured on one seat: macOS 26.6.2, Apple M4, the plugin venv's Python 3.12.10, on
+2026-10-10/11. Rows that restate §2.1/§2.2 come from that section's own 09-26/09-28 measurements on the
+same Mac. Nothing here was measured on another Mac.
+
+**The fd-relative strip on Darwin is `chmod -N /dev/fd/<fd>`.** §2.1 requires the strip to go through the
+`O_DIRECTORY|O_NOFOLLOW` fd, never the path. Linux does that with `setfacl -b /proc/self/fd/<fd>`.
+Darwin has no `/proc`, but `/dev/fd/<fd>` serves the same purpose. With the fd passed via
+`pass_fds`, `chmod -N /dev/fd/<fd>` returned 0 and removed both explicit and inherited entries.
+- **Swap control (the property the Linux code relies on):** open `run/` (A), rename it away, create a new
+  `run/` (B) with its own entry, then strip through the fd. A was stripped and B was untouched, so the
+  strip acts on the fd's target, not on what the path names now. The test could have shown the
+  opposite, and was built to tell the two apart.
+- `O_DIRECTORY|O_NOFOLLOW` on a symlink to a directory refuses with `ENOTDIR` (errno 20), the same errno
+  the Linux docstring records.
+- **Open for the build: verify the strip by reading the ACL back.** `chmod -N` returned 0 in every case
+  above, and nothing in the Linux arm re-reads the ACL after `setfacl -b`. A strip that reports success
+  without verification is the silent-gap shape §2.2 refuses elsewhere. `acl_get_fd_np` and `acl_free`
+  are present in libc via ctypes (an fd-native read-back), but that call was NOT exercised. The build
+  must measure it, or use `ls -led /dev/fd/<fd>`, and refuse if any entry remains.
+
+**Peer check: two facts §2.2's assertions already cover, stated so the build tests them.**
+- With a buffer length of 8, `getsockopt(0, LOCAL_PEERCRED, 8)` returned 8 bytes with no error, so the
+  kernel truncates silently rather than refusing. §2.2's "exactly 76 bytes" assertion and the
+  `unpack_from` parse form are what catch this; the build's test should pass a short buffer and
+  require a refusal.
+- **`cr_version == 0` is an added requirement, not in §2.2.** `XUCRED_VERSION` is 0 and the measured
+  buffers carried 0. A parser that ignores the field would read a future layout as this one, so the
+  Darwin parser must assert `cr_version == 0` alongside the length, and refuse otherwise.
+- `cr_ngroups` is capped at 16: this account has 20 groups and `xucred` carried the first 16. The owner
+  uses only the uid, so nothing is lost today. **Bound:** no future rule may rely on the group list
+  being complete on Darwin.
+- `getsockopt(0, LOCAL_PEERPID=2, 4)` returns the peer pid if a later unit wants it for logging. Python
+  exports neither `SOL_LOCAL` nor `LOCAL_PEERPID`, so they are literals with a comment.
+- Control: the same call on an unconnected socket fails with `ENOTCONN` (errno 57).
+
+**Socket path length: a gap on BOTH arms, found while measuring Darwin.**
+- On macOS `bind()` on a 129-byte path fails with `OSError: AF_UNIX path too long`. That failure is
+  the only measurement. The Darwin `sun_path` is 104 bytes **per the platform header, not measured
+  here**, and the usable boundary (103 vs 104) was not measured. Linux's 108 was not measured either.
+- The owner has no length check. `_bind_socket_or_raise` translates only `EADDRINUSE`; any other
+  `OSError` is re-raised raw. And `start()` runs `_harden_run_dir()` before the bind, so an over-long
+  path leaves `run/` created and hardened, then a bare traceback.
+- Reach: the owner builds the path only from `engram_home` (`self.socket_path = self.engram_home /
+  SOCKET_DIR_NAME / DEFAULT_SOCKET_NAME`, set in `__init__`). The default
+  `$HOME/.engram/run/engramd.sock` is 37 bytes on my seat, so only a long `ENGRAM_HOME` hits it.
+- **Requirement:** a length pre-check against the platform's limit, with a named refusal, placed
+  right after `_check_platform_support()` and computed from `self.socket_path`. It must precede the
+  FIRST filesystem mutation in `start()`, which is `self.engram_home.mkdir(...)`, not
+  `_harden_run_dir()`. The Darwin build includes it; the Linux half is #3696, against the same
+  contract.
+
+**The refusal gains a Darwin branch, and the test marker must move with it.** Today
+`platform_unsupported_reason()` refuses anything that is not Linux, then checks for `setfacl`, then for
+`socket.SO_PEERCRED`. The Darwin branch checks the Darwin prerequisites instead:
+`socket.LOCAL_PEERCRED` present, `chmod` on `PATH`, and `/dev/fd` present. It refuses, naming the
+missing one, if any is absent. An unrecognised platform still refuses. The `requires_linux_owner` marker
+keys on the same function (#3375), and that shared function is what keeps the refusal and the skip in
+agreement. The marker should still be renamed (to something like "owner-supported platform"), so the
+label says what it now means. It must never be re-keyed on `platform.system()`: #3375 showed a
+simulated-Darwin run that patched only `platform.system` missing the `SO_PEERCRED` absence a real
+Mac run found.
+
+**Consequence the build must handle: every marked test starts running on a Mac.** Once Darwin passes
+the refusal check, the marker no longer skips there. Some marked tests name Linux APIs directly, for
+example `tests/test_engramd_owner.py` reads `socket.SO_PEERCRED`. So the build needs a per-test audit
+of the marked tests, and a second marker for tests that are genuinely Linux-only (Linux API, `/proc`,
+`setfacl`). Tests with their own module-level Linux skip are already safe.
+
+**What Darwin adds nothing to, stated so a reader does not re-derive it.**
+- **File flags and xattrs.** `~/.engram` and `knowledge.db` carry no BSD flags, no ACL entries and no
+  xattrs on my seat (control: `ls -ldO /` shows `restricted`, so the column can report a flag).
+  Darwin's flags (`uchg`, `uappnd`, ...) only restrict, and a different uid cannot set them on this
+  directory. That is reasoning, not a measurement of every flag, but no flag grants access.
+- **launchd and TCC.** A temporary user LaunchAgent (parent pid 1, the plugin venv's python) listed
+  `~/.engram` and read `knowledge.db`'s header with no TCC prompt and no denial. It was unloaded and
+  removed after the run. **Bound, not measured:** an `ENGRAM_HOME` under a TCC-protected folder
+  (`~/Documents`, `~/Desktop`). Probing it would raise a consent dialog on the person's screen. The
+  launcher unit should refuse such a home, or document the Full Disk Access requirement, rather than
+  hang on an unanswerable prompt.
+
+**What the Darwin build must be tested against, on a real Mac** (beside §5's cells, which apply as
+written):
+1. Strip through the fd, with the swap control above: the fd's target is stripped, a replacement at
+   the path is not.
+2. A strip that leaves an entry behind is refused (read-back), not reported as success. A real
+   `chmod -N` never leaves one, so the fixture replaces the strip command with a no-op on a `run/`
+   that carries an entry. This cell is mutation-shaped by necessity; say so in the test.
+3. Short `LOCAL_PEERCRED` buffer → refusal. Wrong `cr_version` → refusal. Wrong level (`SOL_SOCKET`)
+   → refusal, never uid 0 accepted.
+4. An over-long socket path → named refusal, with NEITHER `engram_home` NOR `run/` created by this
+   start. A test that checks only `run/` would pass with the check wrongly placed between the two
+   mkdirs.
+5. The refusal and the test marker agree on a host missing each Darwin prerequisite in turn. On one
+   Mac this can only be simulated, and per #3375 the simulation must patch EACH primitive the
+   function reads (`socket.LOCAL_PEERCRED`, `shutil.which("chmod")`, the `/dev/fd` check), never
+   `platform.system` alone.
 
 ---
 
@@ -936,6 +1037,12 @@ important thing the review produced.
 ## 9. What changed, revision by revision, and who found it
 
 Recorded because a reader should be able to see which parts survived attack.
+
+### Follow-up — Darwin arm build notes (Aleph, #3666)
+
+| § | change | found by |
+|---|---|---|
+| §2.5 (new), §2.1 | **Darwin build notes, measured on one Mac.** The fd-relative strip is `chmod -N /dev/fd/<fd>` (swap control passed); the strip must be read back, not trusted from its exit code; short `LOCAL_PEERCRED` buffers truncate silently and groups cap at 16; the refusal gains a Darwin branch and the test marker moves with it; a launchd agent reads the store with no TCC barrier. Also found a **socket-path length gap on both arms**: no check, and `run/` is hardened before the failing bind. §2.1 and §2.2 were NOT changed: they already specified the Darwin mechanisms on 2026-09-28, which #3666 at first failed to notice. | Aleph (measurements; the #3666 scope miss is also mine). Round 1 review (reviewer fairy) corrected two over-claims (`ENGRAM_RUNTIME_DIR` never feeds the socket path; 104 is the header value, not measured), placed the length check before `engram_home.mkdir`, added `cr_version`, and made cells 2/4/5 testable as written. |
 
 ### Follow-up — U4c re-measure (Sol, #3196)
 
