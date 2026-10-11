@@ -1048,7 +1048,9 @@ def test_l_protocol_does_not_get_the_down_steps():
 
 
 def test_l_every_reason_has_a_row_and_the_set_agrees_with_the_builders():
-    assert set(ec.UNAVAILABLE_REASONS) == {"down", "timeout", "protocol", "busy", "busy_or_stuck"}
+    assert set(ec.UNAVAILABLE_REASONS) == {
+        "down", "timeout", "protocol", "local", "internal", "busy", "busy_or_stuck"
+    }
     for reason in ec.UNAVAILABLE_REASONS:
         if reason not in ec._BUILDER_REASONS:
             assert reason in ec._REMEDY_STEPS, reason

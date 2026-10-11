@@ -105,6 +105,12 @@ PIDFILE_PROGRAM_MARKER = "engramd_owner"
 # drain. One constant so the Linux busy remedy and the Darwin busy_or_stuck
 # remedy say the same number.
 OWNER_BUSY_RETRY_SECONDS = 10
+# The largest `timeout` a call accepts (#3717). A judgement with headroom, not a
+# measurement: callers pass 2-2.5 s today (DEFAULT_TIMEOUT; the stop hook's
+# OWNER_READ_TIMEOUT_S), and the platform's settimeout overflows near 9.2e9 s, so
+# one hour is far above any real use and far below the overflow. A larger finite
+# value is refused as Rejected(invalid_timeout) before any I/O.
+MAX_CALL_TIMEOUT_SECONDS = 3600
 # Longest AF_UNIX socket path, in BYTES, that bind()/connect() accept (#3696).
 # Linux: sun_path is 108 bytes including the NUL, so 107 usable. MEASURED on a
 # Linux 6.6 seat (a 107-byte path binds; a 108-byte path raises "AF_UNIX path
@@ -197,6 +203,11 @@ class Unavailable:
     #   "protocol"      the owner was reached, but the exchange failed without a valid
     #                   answer (response over the cap, empty, unparseable, an
     #                   unrecognized status, or an OSError after connect()).
+    #   "local"         this client process could not create a socket (EMFILE /
+    #                   ENFILE / ENOBUFS); nothing is known about the owner.
+    #   "internal"      the last-resort guard (#3717): an unexpected exception inside
+    #                   the client. A client defect to report; nothing is known about
+    #                   the owner. Tests assert no generated input reaches it.
     #   "busy"          Linux full accept backlog; owner healthy, retry.
     #   "busy_or_stuck" Darwin refused connect() with a live owner pid; retry,
     #                   then stop it and restart.
@@ -372,6 +383,9 @@ def socket_path_too_long_reason(socket_path: Path | str) -> str | None:
 #             owner's state and no restart step: a post-connect EPIPE/ECONNRESET
 #             is also what a crashed owner looks like, so the retry discriminates
 #             (a crashed owner turns the retry into `down`, which restarts).
+#   local     the CLIENT process could not create a socket (EMFILE / ENFILE /
+#             ENOBUFS, #3717). Nothing is known about the owner: no claim that it
+#             is up or down, and no restart-the-owner step.
 # `busy` and `busy_or_stuck` keep their own builders (the latter has pid
 # variants); `_BUILDER_REASONS` names them so the reason set stays complete.
 _REMEDY_STEPS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
@@ -409,6 +423,36 @@ _REMEDY_STEPS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ),
         ("Check the engramd logs for why the owner dropped this request.",),
     ),
+    "local": (
+        (
+            "This client's process could not open a socket (the detail gives the "
+            "errno: out of file descriptors or kernel buffers). Nothing is known "
+            "about the owner. Free resources in this process (close leaked sockets "
+            "or files) or restart this client process, then retry. Do not restart "
+            "the owner for this.",
+        ),
+        (
+            "Restart the Claude Code session (this client process ran out of file "
+            "descriptors or kernel buffers); the owner's state is unknown and "
+            "restarting it will not help.",
+        ),
+    ),
+    # #3717: the last-resort guard in _call(). A CLIENT defect: an exception no
+    # mapped clause expected. It says nothing about the owner and carries no
+    # restart step; it is a signal to report, not a state to recover from.
+    "internal": (
+        (
+            "This client hit an unexpected internal error (the detail names the "
+            "exception). It is a defect in the client, not a statement about the "
+            "owner: nothing is known about the owner's state. Report it with the "
+            "detail text; retrying the same call may not help.",
+        ),
+        (
+            "Report this to the engram maintainers with the detail text (an "
+            "unexpected exception inside the engramd client). It says nothing "
+            "about the owner, and retrying may not help.",
+        ),
+    ),
 }
 _BUILDER_REASONS = ("busy", "busy_or_stuck")
 # Every value Unavailable.reason can take (the table rows plus the builders').
@@ -423,8 +467,9 @@ def _unavailable(
     SS5.5: guidance travels in the payload, not a log line, and the two kinds
     -- agent-actionable vs. human-only -- are distinguishable without parsing
     prose). `reason` is REQUIRED (no default): it is set by what the site
-    MEANS -- "down", "timeout" or "protocol" (see Unavailable.reason) -- so a
-    new call site cannot silently inherit the wrong code (#3707).
+    MEANS -- "down", "timeout", "protocol", "local" or "internal" (see
+    Unavailable.reason) -- so a new call site cannot silently inherit the wrong
+    code (#3707).
 
     The steps come from `_REMEDY_STEPS`, keyed by `reason` (the remedy follows
     the code); a reason with no row raises KeyError here, at construction."""
@@ -589,10 +634,53 @@ def _call(
     timeout: float,
     socket_path: Path,
 ) -> EngramdResult:
-    """The one place that touches the socket. Every transport failure path
-    maps to Unavailable; every owner-sent {"status":"rejected",...} maps to
-    Rejected; every {"status":"ok",...} maps to Ok. This is the ONLY
-    function with `except` clauses around socket I/O in this module.
+    """The one place that touches the socket. NEVER RAISES (#3717): it returns Ok,
+    Unavailable or Rejected on every path, by construction. Every transport
+    failure maps to Unavailable (seven reason codes: down, timeout, protocol,
+    busy, busy_or_stuck, local, internal); a request that cannot be serialized,
+    or a `timeout` that is not a finite number, maps to Rejected
+    (request_not_serializable / invalid_timeout) before any socket exists; every
+    owner-sent {"status":"rejected",...} maps to Rejected; every
+    {"status":"ok",...} maps to Ok. This is the ONLY function with `except`
+    clauses around socket I/O in this module.
+
+    The bound, enumerated by EXCEPTION per statement (Python docs for each call),
+    not by input. Each exception lands on a mapped result below; any exception
+    NOT listed lands on the last-resort guard, `Unavailable(reason="internal")`,
+    which is a SIGNAL (a client defect to report), not a mapping, and which the
+    generative cell in tests/test_engramd_client_never_raises_3717.py asserts no
+    generated input ever reaches.
+      timeout check (None, str, bool, NaN, +-inf,
+        finite > MAX_CALL_TIMEOUT_SECONDS)              -> Rejected(invalid_timeout)
+      json.dumps(request): TypeError, ValueError (also
+        NaN/inf via allow_nan=False, circular reference,
+        int over the digit limit), RecursionError       -> Rejected(request_not_serializable)
+      .encode("utf-8")                                  -> cannot raise (ensure_ascii)
+      len(payload) > MAX_REQUEST_BYTES                  -> Rejected(request_too_large)
+      socket_path_too_long_reason                       -> Unavailable(down) when too long;
+        a str path with a lone surrogate raises UnicodeEncodeError in os.fsencode
+        -> `internal` (a caller defect; paths from the environment use
+        surrogateescape and never reach it)
+      time.monotonic() + timeout                        -> finite numeric timeouts only (checked
+        above); zero/negative clamped to 0 for the arithmetic -> Unavailable(timeout)
+      socket.socket(): OSError (EMFILE/ENFILE/ENOBUFS)  -> Unavailable(local)
+      sock.settimeout / connect: socket.timeout         -> Unavailable(timeout)
+        EAGAIN/EWOULDBLOCK on connect                   -> Unavailable(busy)
+        ECONNREFUSED on Darwin + live pidfile           -> Unavailable(busy_or_stuck)
+        any other OSError before connect returned       -> Unavailable(down)
+      sendall / recv: socket.timeout                    -> Unavailable(timeout)
+        any other OSError after connect returned        -> Unavailable(protocol)
+      response over MAX_RESPONSE_BYTES, no newline,
+        or closed with no data                          -> Unavailable(protocol)
+      json.loads: ValueError (JSONDecodeError, and an
+        int over the digit limit), UnicodeDecodeError
+        (non-UTF-8), RecursionError                     -> Unavailable(protocol)
+      unknown / non-dict status                         -> Unavailable(protocol)
+    Out of bounds, deliberately: KeyboardInterrupt and SystemExit (BaseException;
+    the guard catches `Exception` only, so they propagate). Also outside this
+    function, and so outside the guard: `Path.home()` RuntimeError in
+    `_resolve_socket_path` (read()/write() call it before `_call`) when no home
+    directory can be determined.
 
     `timeout` is an END-TO-END deadline for the whole call, not a
     per-socket-op budget: socket.settimeout() applies its configured value
@@ -613,6 +701,60 @@ def _call(
     state and carry no restart: retry once, and a crashed owner turns the retry
     into `down` (#3707).
     """
+    # #3717 last-resort guard. `Exception`, never BaseException. The socket is
+    # closed by _call_mapped's own `finally`, so this path cannot leak it.
+    try:
+        return _call_mapped(
+            method, params, request_id=request_id, timeout=timeout, socket_path=socket_path
+        )
+    except Exception as exc:  # noqa: BLE001 -- the guard is the point
+        try:
+            detail = f"{type(exc).__name__}: {exc}"
+        except Exception:  # noqa: BLE001 -- an exception whose __str__ itself raises
+            detail = type(exc).__name__
+        bound = 0.0
+        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+            try:
+                bound = float(timeout)
+            except OverflowError:
+                bound = 0.0
+        return _unavailable(
+            socket_path=str(socket_path), bound=bound,
+            detail=f"unexpected internal error: {detail}", request_id=request_id,
+            reason="internal",
+        )
+
+
+def _call_mapped(
+    method: str,
+    params: dict,
+    *,
+    request_id: str | None,
+    timeout: float,
+    socket_path: Path,
+) -> EngramdResult:
+    """`_call`'s body: every known exception is mapped here (see `_call`'s table).
+    Call `_call`, never this, so the last-resort guard applies."""
+    # #3717: a timeout that is not a finite real number would raise further down
+    # (None: TypeError; NaN: ValueError; inf: OverflowError), and so would a finite
+    # one too large for the platform (settimeout overflows near 9.2e9 s). Refuse
+    # both before any I/O; the cap is MAX_CALL_TIMEOUT_SECONDS. bool is excluded
+    # (True would silently mean 1 second). Written with comparisons only:
+    # math.isfinite(10**400) itself raises OverflowError, while 10**400 > 3600 does not.
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or timeout != timeout
+        or timeout in (float("inf"), float("-inf"))
+        or timeout > MAX_CALL_TIMEOUT_SECONDS
+    ):
+        return Rejected(
+            reason="invalid_timeout",
+            detail=f"{timeout!r} ({type(timeout).__name__})",
+            remedy=f"pass a finite number of seconds, at most {MAX_CALL_TIMEOUT_SECONDS}",
+            request_id=request_id,
+        )
+
     sp = str(socket_path)
     request = {
         "contract_version": CONTRACT_VERSION,
@@ -620,7 +762,23 @@ def _call(
         "params": params,
         "request_id": request_id,
     }
-    payload = (json.dumps(request) + "\n").encode("utf-8")
+    # #3717: a request that cannot be serialized (a set, bytes, datetime or object
+    # in params; a circular structure; NaN / Infinity, which json would otherwise
+    # encode to non-JSON tokens) is the CALLER's error, decidable before any I/O.
+    # Refuse it as Rejected here so _call never raises; this runs BEFORE the size
+    # check because the size cannot be measured until serialization succeeds.
+    try:
+        payload = (json.dumps(request, allow_nan=False) + "\n").encode("utf-8")
+    except (TypeError, ValueError, RecursionError) as exc:
+        return Rejected(
+            reason="request_not_serializable",
+            detail=f"{type(exc).__name__}: {exc}",
+            remedy=(
+                "make the params JSON-serializable: no sets, bytes, datetimes, "
+                "objects, NaN/Infinity or circular references"
+            ),
+            request_id=request_id,
+        )
 
     # #3707 round 3: an oversize request is the CALLER's error and the client can
     # know it before sending. Refuse it here as Rejected (the owner's availability
@@ -645,8 +803,20 @@ def _call(
             reason="down",
         )
 
-    deadline = time.monotonic() + timeout
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    # #3717: a zero or negative timeout means "already out of budget" (immediate
+    # Unavailable(timeout), as ruled). Clamp it to 0 for the deadline arithmetic
+    # only, so a huge negative int (-10**400) cannot overflow `monotonic() + x`;
+    # `bound` still reports the caller's value.
+    deadline = time.monotonic() + (timeout if timeout > 0 else 0)
+    # #3717: creating the socket can fail in THIS process (EMFILE / ENFILE /
+    # ENOBUFS). That says nothing about the owner, so it is `local`, never `down`.
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    except OSError as exc:
+        return _unavailable(
+            socket_path=sp, bound=timeout, detail=str(exc), request_id=request_id,
+            reason="local",
+        )
     connected = False  # set once connect() returns: later OSErrors are `protocol`
     try:
         exhausted = _arm_timeout_or_unavailable(
@@ -763,7 +933,9 @@ def _call(
 
     try:
         response = json.loads(data.decode("utf-8").strip())
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    # ValueError, not just JSONDecodeError (its subclass): an integer over Python's
+    # int-from-str digit limit raises a plain ValueError (#3717 round-2 review).
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
         return _unavailable(
             socket_path=sp,
             bound=timeout,
