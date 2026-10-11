@@ -58,6 +58,7 @@ level will retry a permanent rejection forever.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
@@ -308,6 +309,36 @@ def _unavailable(
     )
 
 
+def _busy_unavailable(
+    *, socket_path: str, bound: float, detail: str, request_id: str | None
+) -> Unavailable:
+    """The owner IS up but its accept backlog is full (#3680). Still an Unavailable
+    (§5.5's two-kind shape), but the remedy is "retry", never "restart the owner":
+    the owner is healthy, so restarting it would drop every other client's connection.
+
+    The claim this message makes is bounded: it holds because the call site maps
+    only EAGAIN/EWOULDBLOCK raised by connect() on this client's AF_UNIX socket,
+    which on Linux means a full accept backlog. Do not route any other errno or
+    any other step here; a reassuring "do NOT restart" on a real outage is the
+    costly failure direction."""
+    return Unavailable(
+        socket_path=socket_path,
+        bound=bound,
+        agent_steps=[
+            "The owner is up but busy (its accept backlog is full). Retry the call "
+            "after a short backoff.",
+            "Do NOT restart the owner for this: it is healthy and will serve the "
+            "retry once the burst drains.",
+        ],
+        human_steps=[
+            "If retries keep failing for more than a few seconds, check the engramd "
+            "logs for what is holding the owner.",
+        ],
+        detail=f"owner busy (accept backlog full): {detail}",
+        request_id=request_id,
+    )
+
+
 def _arm_timeout_or_unavailable(
     sock: socket.socket,
     *,
@@ -402,7 +433,19 @@ def _call(
         )
         if exhausted is not None:
             return exhausted
-        sock.connect(sp)
+        try:
+            sock.connect(sp)
+        except OSError as exc:
+            # Only the CONNECT step: an AF_UNIX connect() against a full accept
+            # backlog fails at once with EAGAIN (#3680) -- the owner is up and busy,
+            # not down. EAGAIN from sendall()/recv() is not that, so it keeps the
+            # generic path below. Anything else (ENOENT, ECONNREFUSED, the timeout)
+            # is re-raised to the clauses below, unchanged.
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return _busy_unavailable(
+                    socket_path=sp, bound=timeout, detail=str(exc), request_id=request_id
+                )
+            raise
 
         exhausted = _arm_timeout_or_unavailable(
             sock, deadline=deadline, socket_path=sp, bound=timeout, request_id=request_id

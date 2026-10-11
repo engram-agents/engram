@@ -47,10 +47,10 @@ import engramd_client as ec  # noqa: E402
 import engramd_owner as eo  # noqa: E402
 
 REQUEST_DEADLINE = 0.6
-# Bursts stay within the owner's listen(5) backlog. Above it, simultaneous connects
-# fail with EAGAIN -> Unavailable on the owner BEFORE this change too (measured:
-# 16 clients -> 8 Unavailable, 12 -> 5, 5 -> 0), a capacity limit tracked
-# separately in #3680. These tests check handler reuse, not the backlog.
+# Bursts stay small. Before #3680 the owner's listen(5) backlog overflowed above ~5
+# simultaneous connects (EAGAIN -> Unavailable; measured: 16 clients -> 8 Unavailable,
+# 12 -> 5, 5 -> 0); the backlog is now SOMAXCONN and the burst/backlog contracts live in
+# test_engramd_owner_backlog_3680.py. These tests check handler reuse, not the backlog.
 BURST = 5
 
 

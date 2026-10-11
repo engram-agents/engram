@@ -441,6 +441,14 @@ WORKER_THREAD_PREFIX = "engramd-worker"
 IDLE_WORKER_CAP = 4
 IDLE_WORKER_TIMEOUT = 60.0  # seconds
 
+# Accept backlog (#3680). listen(5) let a burst of ~6+ simultaneous hook processes
+# overflow the kernel's accept queue: the client's connect() failed at once with EAGAIN
+# although the owner was healthy. The kernel caps this at net.core.somaxconn (Linux) /
+# the platform limit, so SOMAXCONN is "as large as the platform allows", not a number
+# picked by hand. It is NOT the concurrency control (there is none, by design: see
+# above); it only absorbs a burst of clients starting together.
+OWNER_LISTEN_BACKLOG = socket.SOMAXCONN
+
 # Mode applied to both the socket's `run/` parent directory and the socket
 # file itself (#3194, design doc §2.1 + Borges's issue-#3194 ruling). The
 # directory is the PRIMARY gate (created 0700 before bind, ACLs stripped);
@@ -1270,6 +1278,7 @@ class EngramdOwner:
         contract_version: str = ec.CONTRACT_VERSION,
         idle_worker_cap: int = IDLE_WORKER_CAP,
         idle_worker_timeout: float = IDLE_WORKER_TIMEOUT,
+        listen_backlog: int = OWNER_LISTEN_BACKLOG,
     ) -> None:
         self.engram_home = _resolve_engram_home(engram_home)
         # The socket's parent directory (self.socket_path.parent) is the
@@ -1292,6 +1301,8 @@ class EngramdOwner:
         self.contract_version = contract_version
         self.idle_worker_cap = idle_worker_cap
         self.idle_worker_timeout = idle_worker_timeout
+        # A plain attribute so a test can use a tiny backlog to hit "backlog full" (#3680).
+        self.listen_backlog = listen_backlog
         # Handler hand-off (#3678): `_idle` counts handlers waiting on `_jobs`. Both are
         # changed only under `_handoff_lock`, so a handler retiring on its idle timeout and
         # the accept loop handing it a connection cannot strand that connection.
@@ -1497,7 +1508,7 @@ class EngramdOwner:
         # a plain bind() leaves the socket at 0755). Defense-in-depth --
         # the `run/` directory above is the primary gate.
         os.chmod(str(self.socket_path), SOCKET_FILE_MODE)
-        self._server.listen(5)
+        self._server.listen(self.listen_backlog)  # OWNER_LISTEN_BACKLOG (#3680)
         self._server.settimeout(self.accept_poll_interval)
 
         self.pid_path.write_text(str(os.getpid()))
