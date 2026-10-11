@@ -1381,13 +1381,20 @@ def test_k10_a_broken_helper_never_pushes_the_payload_past_the_budget(tmp_path, 
     assert "ENGRAM User Identity: Alice" in ctx
 
 
+# The "before" hook is a FROZEN copy, not a `git show`: the pin commit lived only on the U5 branch (the squash merge
+# did not carry it to dev) and the nightly checks out at depth 1, so any SHA-based read went dead (#3684). The
+# fixture is the byte-exact content of src/engram/hooks/claude/engram-user-identity-hook.py at cf86878b2fe5a17ea914aeb073744cfa4cf5ce85
+# (the commit before the import report, U5 #3663); the `.txt` suffix keeps it out of collection and compile scrubs.
+K10_PRE_IMPORT_REPORT_HOOK = (REPO / "tests" / "fixtures" / "owner_launcher_3663"
+                              / "engram-user-identity-hook.pre-import-report.py.txt")
+
+
 @pytest.mark.parametrize("platform", ["claude-code", None])
 def test_k10_the_healthy_path_is_byte_identical_to_the_commit_before_the_import_report(tmp_path, platform):
-    old = subprocess.run(["git", "show", "cf86878b:src/engram/hooks/claude/engram-user-identity-hook.py"],
-                         cwd=REPO, capture_output=True, text=True)
-    assert old.returncode == 0 and old.stdout, "cf86878b is not available in this checkout"
+    old_text = K10_PRE_IMPORT_REPORT_HOOK.read_text()
+    assert old_text, "frozen pre-import-report hook fixture is empty"
     outs = []
-    for name, text in (("old", old.stdout), ("new", None)):
+    for name, text in (("old", old_text), ("new", None)):
         d = tmp_path / name
         d.mkdir()
         hook = _k7_bundle(d, "real", platform=platform)
