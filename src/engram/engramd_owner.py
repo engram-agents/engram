@@ -472,8 +472,8 @@ PEERCRED_STRUCT_SIZE = struct.calcsize(PEERCRED_STRUCT_FORMAT)  # 12 on this fle
 
 # ---------------------------------------------------------------------------
 # Darwin arm (#3666, design doc §2.1, §2.2, §2.5). Everything below is used
-# only when `platform.system() == "Darwin"` (or, for the peer check, only when
-# `socket.SO_PEERCRED` is absent); the Linux arm above is unchanged.
+# only when `_owner_arm() == "darwin"` (#3708: `platform.system()` is the one
+# discriminator at every site); the Linux arm above is unchanged.
 # ---------------------------------------------------------------------------
 
 # Darwin xucred{cr_version, cr_uid, cr_ngroups, cr_groups[16]} -- LOCAL_PEERCRED's
@@ -1138,6 +1138,20 @@ def _darwin_acl_entries_via_fd(fd: int) -> list[str]:
     return [ln for ln in text.splitlines() if ln and not ln.startswith("!#acl")]
 
 
+def _owner_arm() -> str | None:
+    """Which permission arm this seat runs (#3708): "linux", "darwin", or None
+    for any other platform. Keyed on `platform.system()` ALONE -- the one place
+    the arm is decided; the platform gate, the TCC check, `_harden_run_dir` and
+    the peer check all ask this. The `hasattr(socket, ...)` prerequisite checks
+    do not choose an arm; they ask whether the chosen arm's tool exists."""
+    system = platform.system()
+    if system == "Linux":
+        return "linux"
+    if system == "Darwin":
+        return "darwin"
+    return None
+
+
 def platform_unsupported_reason() -> str | None:
     """Why this seat cannot run the owner, or None when it can (#3194, #3292).
 
@@ -1151,9 +1165,10 @@ def platform_unsupported_reason() -> str | None:
     with the returned string, and the test suite's `requires_linux_owner`
     marker skips on `is not None`, so the refusal and the skip share this one
     definition."""
-    if platform.system() == "Darwin":
+    arm = _owner_arm()
+    if arm == "darwin":
         return _darwin_unsupported_reason()
-    if platform.system() != "Linux":
+    if arm != "linux":
         return (
             f"refusing to start: the socket permission layer (ACL "
             f"strip on run/, SO_PEERCRED peer check) is only "
@@ -1551,13 +1566,13 @@ class EngramdOwner:
         design doc §2.2's posture -- "the fallback on an unrecognised
         platform is to REFUSE TO START, never to skip the check" --
         extended here to the ACL-strip requirement of §2.1). This build
-        only implements the Linux arm (issue #3194 scope bounds; Darwin's
-        LOCAL_PEERCRED / `chmod -N` equivalents are explicitly out of
-        scope), so a non-Linux seat, a seat missing `setfacl` or `getfacl`, or a
-        Python/OS build with no socket.SO_PEERCRED all refuse here rather
+        implements the Linux arm (#3194) and the Darwin arm (#3666), chosen
+        by `_owner_arm()` (#3708). Any other platform, a Linux seat missing
+        `setfacl`, `getfacl` or socket.SO_PEERCRED, or a Darwin seat missing
+        socket.LOCAL_PEERCRED, `/bin/chmod` or `/dev/fd` refuses here rather
         than starting with a silently-unenforced permission layer.
 
-        The four checks live in the module-level
+        The checks live in the module-level
         `platform_unsupported_reason()` (#3292) -- the one definition the
         test suite's `requires_linux_owner` marker also keys on, so the
         refusal and the skip cannot disagree."""
@@ -1573,7 +1588,7 @@ class EngramdOwner:
         case-insensitively (the default volume is case-insensitive), with no
         filesystem access and no symlink resolution -- resolving a path inside
         a protected folder is exactly the access this check exists to avoid."""
-        if platform.system() != "Darwin":
+        if _owner_arm() != "darwin":
             return
         home_parts = [p.casefold() for p in Path.home().parts]
         parts = [p.casefold() for p in self.engram_home.parts]
@@ -1758,18 +1773,27 @@ class EngramdOwner:
                         f"directory this process doesn't own"
                     )
             os.fchmod(fd, RUN_DIR_MODE)
-            if platform.system() == "Darwin":
+            if _owner_arm() == "darwin":
                 # #3666: the Darwin strip + fd-based read-back; the finally
                 # below still closes fd. The Linux setfacl arm is untouched.
                 self._strip_run_dir_acl_darwin(fd, run_dir)
                 return
-            proc = subprocess.run(
-                ["setfacl", "-b", f"/proc/self/fd/{fd}"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                pass_fds=[fd],
-            )
+            try:
+                proc = subprocess.run(
+                    ["setfacl", "-b", f"/proc/self/fd/{fd}"],
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=30,
+                    pass_fds=[fd],
+                )
+            except subprocess.TimeoutExpired as exc:
+                # Parity with the Darwin `chmod -N` refusal (#3708): a hung
+                # strip is a named refusal, not a bare traceback.
+                raise OwnerPermissionUnsupported(
+                    f"refusing to start: `setfacl -b` on {run_dir} did not "
+                    f"finish within {exc.timeout}s"
+                ) from exc
             if proc.returncode != 0:
                 raise OwnerPermissionUnsupported(
                     f"refusing to start: `setfacl -b` on {run_dir} (via "
@@ -2060,12 +2084,24 @@ class EngramdOwner:
         discrimination mutation targets exactly this parse form, per
         design doc §2.2/§5 test 2).
 
-        The platform discriminator is the PRESENCE of `socket.SO_PEERCRED`
-        (design doc §2.2): absent, the Darwin LOCAL_PEERCRED check runs
-        instead (#3666), and with neither the check REFUSES -- it never
-        no-ops."""
-        if not hasattr(socket, "SO_PEERCRED"):
+        The arm is `_owner_arm()` (#3708), not the presence of an attribute:
+        darwin runs the LOCAL_PEERCRED check (#3666); linux runs this
+        SO_PEERCRED check and REFUSES if `socket.SO_PEERCRED` is absent --
+        never falling through to the Darwin check; any other platform
+        REFUSES. The check never no-ops."""
+        arm = _owner_arm()
+        if arm == "darwin":
             return self._check_peer_credentials_darwin(conn)
+        if arm != "linux":
+            raise OwnerPermissionUnsupported(
+                f"refusing to check peer credentials: no peer-credential "
+                f"check exists for platform.system() == {platform.system()!r}"
+            )
+        if not hasattr(socket, "SO_PEERCRED"):
+            raise OwnerPermissionUnsupported(
+                "refusing to check peer credentials: this Linux Python/OS "
+                "build has no socket.SO_PEERCRED"
+            )
         raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, PEERCRED_STRUCT_SIZE)
         _peer_pid, peer_uid, _peer_gid = struct.unpack_from(PEERCRED_STRUCT_FORMAT, raw)
         own_uid = os.getuid()
@@ -2944,6 +2980,9 @@ def main() -> int:
         print(f"[engramd] {exc}", file=sys.stderr)
         return 1
     except OwnerAclNotStripped as exc:
+        print(f"[engramd] {exc}", file=sys.stderr)
+        return 1
+    except OwnerPermissionUnsupported as exc:
         print(f"[engramd] {exc}", file=sys.stderr)
         return 1
     print(f"[engramd] listening on {owner.socket_path} (pid {os.getpid()})", file=sys.stderr)
