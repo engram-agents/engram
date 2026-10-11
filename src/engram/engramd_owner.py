@@ -1140,16 +1140,15 @@ def _darwin_acl_entries_via_fd(fd: int) -> list[str]:
 
 def _owner_arm() -> str | None:
     """Which permission arm this seat runs (#3708): "linux", "darwin", or None
-    for any other platform. Keyed on `platform.system()` ALONE -- the one place
-    the arm is decided; the platform gate, the TCC check, `_harden_run_dir` and
-    the peer check all ask this. The `hasattr(socket, ...)` prerequisite checks
-    do not choose an arm; they ask whether the chosen arm's tool exists."""
-    system = platform.system()
-    if system == "Linux":
-        return "linux"
-    if system == "Darwin":
-        return "darwin"
-    return None
+    for any other platform. The decision now lives in the client, as
+    `ec.platform_arm()` (#3712), keyed on `platform.system()` ALONE: the client
+    also needs the platform (its socket-path limit) and must never import the
+    owner, so the one source sits on the side of the import direction both can
+    reach. This stays a name here because the platform gate, the TCC check,
+    `_harden_run_dir` and the peer check all ask it, and tests patch it. The
+    `hasattr(socket, ...)` prerequisite checks do not choose an arm; they ask
+    whether the chosen arm's tool exists."""
+    return ec.platform_arm()
 
 
 def platform_unsupported_reason() -> str | None:

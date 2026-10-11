@@ -61,8 +61,8 @@ from __future__ import annotations
 import errno
 import json
 import os
+import platform
 import socket
-import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -99,10 +99,28 @@ LINUX_SOCKET_PATH_MAX_BYTES = 107
 # length is 103. MEASURED on macOS 26.6.2 / Python 3.12.10 (a 103-byte path
 # binds; a 104-byte path raises "AF_UNIX path too long").
 DARWIN_SOCKET_PATH_MAX_BYTES = 103
+
+
+def platform_arm() -> str | None:
+    """Which platform arm this seat is on (#3712): "linux", "darwin", or None
+    for any other platform. Keyed on `platform.system()` ALONE -- the single
+    source of the platform decision. The client owns it because the owner
+    imports the client and the client must never import the owner; the owner's
+    `_owner_arm()` delegates here."""
+    system = platform.system()
+    if system == "Linux":
+        return "linux"
+    if system == "Darwin":
+        return "darwin"
+    return None
+
+
 # The limit on THIS seat -- the one value socket_path_too_long_reason() and
 # so both the owner's refusal and the client's Unavailable detail use.
+# Computed once at import from platform_arm(); any non-darwin arm (including
+# None) keeps the Linux limit, as before.
 SOCKET_PATH_MAX_BYTES = (
-    DARWIN_SOCKET_PATH_MAX_BYTES if sys.platform == "darwin" else LINUX_SOCKET_PATH_MAX_BYTES
+    DARWIN_SOCKET_PATH_MAX_BYTES if platform_arm() == "darwin" else LINUX_SOCKET_PATH_MAX_BYTES
 )
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MiB -- generous for a JSON control-plane response,
 # small enough to bound a misbehaving owner that never completes a line (round-5 should-fix 1).
