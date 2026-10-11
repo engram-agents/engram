@@ -2,7 +2,7 @@
 
 `EngramdOwner.start()` refuses on any seat that `engramd_owner.
 platform_unsupported_reason()` reports as unsupported (#3194): not Linux, no
-`setfacl` on PATH, or no `socket.SO_PEERCRED` -- by design. A test that calls
+`setfacl` or `getfacl` on PATH, or no `socket.SO_PEERCRED` -- by design. A test that calls
 `start()` (directly, or through a fixture that does), or that reads a
 Linux-only API the predicate covers (e.g. `socket.SO_PEERCRED`), therefore
 cannot pass on a Mac; it carries `requires_linux_owner` and SKIPS there with

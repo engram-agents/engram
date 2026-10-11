@@ -174,7 +174,7 @@ entries on Linux, and `chmod -N` on Darwin. It does this through a directory fd 
 explicitly** rather than inheriting it from the umask.
 
 **Build scope.** The U4a build (#3194, #3201) implements the **Linux arm only**. On any other platform,
-or on a Linux seat without `setfacl` or `SO_PEERCRED`, the owner **refuses to start** (§2.2's posture)
+or on a Linux seat without `setfacl`, `getfacl` or `SO_PEERCRED`, the owner **refuses to start** (§2.2's posture)
 rather than running without the strip. The Darwin `chmod -N` step above specifies what a later Darwin
 build must do; no Darwin build does it today. §2.5 adds the Darwin build notes measured for #3666.
 

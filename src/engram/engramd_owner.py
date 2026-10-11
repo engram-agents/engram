@@ -232,6 +232,7 @@ import logging
 import os
 import platform
 import queue
+import re
 import shutil
 import signal
 import socket
@@ -485,7 +486,8 @@ class OwnerPermissionUnsupported(RuntimeError):
     the deployment would believe it has one. This build only implements
     the Linux arm (issue #3194 scope bounds; Darwin's LOCAL_PEERCRED /
     `chmod -N` equivalents are out of scope), so a non-Linux seat, a
-    seat missing the `setfacl` binary, or a Python/OS build with no
+    seat missing the `setfacl` or `getfacl` binary (#3698: the strip is
+    read back), or a Python/OS build with no
     SO_PEERCRED all refuse to start via this exception rather than
     starting with a silently-unenforced permission layer."""
 
@@ -511,6 +513,19 @@ class OwnerSocketPathTooLong(RuntimeError):
     neither engram_home nor run/ is created. The message is
     `engramd_client.socket_path_too_long_reason()`'s text, shared with the
     client's Unavailable detail."""
+
+
+class OwnerAclNotStripped(RuntimeError):
+    """Raised by EngramdOwner.start() when the run/ directory's ACL, read back
+    through the same fd the `setfacl -b` strip used, still carries an entry
+    beyond the base user::/group::/other:: triple (a named user or group, a
+    mask::, any default: line) -- or when that read-back itself cannot be
+    completed (getfacl failed, timed out or printed nothing parseable), because
+    an unverifiable strip is the silent-gap shape (#3698, design doc §2.2).
+    Raised before the stale-socket check and the bind, so no socket exists.
+    `home/` and `run/` are left behind, hardened (mode 0700, owned by this
+    uid) and carrying whatever ACL the strip failed to remove; the next
+    start() re-hardens `run/` on every start, so nothing needs cleaning up."""
 
 
 class OwnerPythonTooOld(RuntimeError):
@@ -964,8 +979,9 @@ class _ClientReadGate:
 def platform_unsupported_reason() -> str | None:
     """Why this seat cannot run the owner, or None when it can (#3194, #3292).
 
-    Three checks, in this order, first failure wins: (1) not Linux, (2) no
-    `setfacl` on PATH, (3) no `socket.SO_PEERCRED`.
+    Four checks, in this order, first failure wins: (1) not Linux, (2) no
+    `setfacl` on PATH, (3) no `getfacl` on PATH (the strip's read-back, #3698),
+    (4) no `socket.SO_PEERCRED`.
     `EngramdOwner._check_platform_support()` raises `OwnerPermissionUnsupported`
     with the returned string, and the test suite's `requires_linux_owner`
     marker skips on `is not None`, so the refusal and the skip share this one
@@ -983,6 +999,12 @@ def platform_unsupported_reason() -> str | None:
             "inherited ACLs on the socket's run/ directory (design "
             "doc §2.1) and was not found on PATH"
         )
+    if shutil.which("getfacl") is None:
+        return (
+            "refusing to start: `getfacl` is required to read back the "
+            "ACL strip on the socket's run/ directory (design doc §2.2: "
+            "an unverified strip is a silent gap) and was not found on PATH"
+        )
     if not hasattr(socket, "SO_PEERCRED"):
         return (
             "refusing to start: this Python/OS build has no "
@@ -991,6 +1013,78 @@ def platform_unsupported_reason() -> str | None:
             "be a silent permission-layer gap"
         )
     return None
+
+
+_ACL_LEFTOVER_LIST_MAX = 10
+_ACL_BASE_RE = re.compile(r"^(user|group|other)::\S*(\s+#.*)?$")
+
+
+def _read_acl_entries(fd: int, run_dir=None) -> list[str]:
+    """The ACL entries of the directory open as `fd`, one string per line,
+    blank and `#` comment lines dropped (#3698). Reads through
+    /proc/self/fd/<fd> -- the SAME fd the strip used -- never a path, so a
+    swap of run/ between strip and read-back cannot report a clean ACL for a
+    different directory. A getfacl failure (non-zero exit, timeout, missing
+    binary) or output with no entry at all raises OwnerAclNotStripped with its
+    own reason: an unverifiable strip refuses. stderr is NOT a failure signal
+    (getfacl always warns about the leading '/')."""
+    where = str(run_dir) if run_dir is not None else f"/proc/self/fd/{fd}"
+    try:
+        proc = subprocess.run(
+            ["getfacl", "-c", "-n", f"/proc/self/fd/{fd}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            pass_fds=[fd],
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise OwnerAclNotStripped(
+            f"refusing to start: `getfacl` on {where} timed out after "
+            f"{exc.timeout}s -- the ACL strip could not be verified"
+        ) from exc
+    except OSError as exc:
+        raise OwnerAclNotStripped(
+            f"refusing to start: `getfacl` could not be run on {where} "
+            f"({exc}) -- the ACL strip could not be verified"
+        ) from exc
+    if proc.returncode != 0:
+        raise OwnerAclNotStripped(
+            f"refusing to start: `getfacl` on {where} failed (exit "
+            f"{proc.returncode}): {proc.stderr.strip()} -- the ACL strip "
+            f"could not be verified"
+        )
+    entries = [
+        ln.strip()
+        for ln in proc.stdout.splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+    if not entries:
+        raise OwnerAclNotStripped(
+            f"refusing to start: `getfacl` on {where} printed no ACL entries "
+            f"(unparseable output) -- the ACL strip could not be verified"
+        )
+    return entries
+
+
+def _acl_leftovers(entries: list[str]) -> list[str]:
+    """The entries that make a stripped ACL NOT clean (#3698): everything but
+    exactly one each of user::, group::, other:: (any permission bits). A
+    named entry, mask::, any default: line or an unrecognised line is listed
+    verbatim; a missing or duplicated base entry is listed as a note."""
+    leftovers: list[str] = []
+    seen: dict[str, int] = {"user": 0, "group": 0, "other": 0}
+    for ln in entries:
+        m = _ACL_BASE_RE.match(ln)
+        if m is None:
+            leftovers.append(ln)
+        else:
+            seen[m.group(1)] += 1
+            if seen[m.group(1)] > 1:
+                leftovers.append(ln)
+    for kind, n in seen.items():
+        if n == 0:
+            leftovers.append(f"<missing base entry {kind}::>")
+    return leftovers
 
 
 class EngramdOwner:
@@ -1120,7 +1214,10 @@ class EngramdOwner:
         `Connection.setlimit` (Python < 3.11) -- before anything is created
         (#3349). Raises OwnerSocketPathTooLong if the socket path exceeds
         the AF_UNIX byte limit -- before engram_home or run/ is created
-        (#3696).
+        (#3696). Raises OwnerAclNotStripped if the run/ ACL read back
+        through the strip's fd still carries any entry beyond the base
+        triple, or cannot be read back (#3698) -- before the stale-socket
+        check and the bind.
 
         `install_signal_handlers=False` (tests only -- see
         tests/test_engramd_owner.py's owner_running fixture) skips
@@ -1276,11 +1373,11 @@ class EngramdOwner:
         extended here to the ACL-strip requirement of §2.1). This build
         only implements the Linux arm (issue #3194 scope bounds; Darwin's
         LOCAL_PEERCRED / `chmod -N` equivalents are explicitly out of
-        scope), so a non-Linux seat, a seat missing `setfacl`, or a
+        scope), so a non-Linux seat, a seat missing `setfacl` or `getfacl`, or a
         Python/OS build with no socket.SO_PEERCRED all refuse here rather
         than starting with a silently-unenforced permission layer.
 
-        The three checks live in the module-level
+        The four checks live in the module-level
         `platform_unsupported_reason()` (#3292) -- the one definition the
         test suite's `requires_linux_owner` marker also keys on, so the
         refusal and the skip cannot disagree."""
@@ -1467,6 +1564,18 @@ class EngramdOwner:
                     f"refusing to start: `setfacl -b` on {run_dir} (via "
                     f"its open fd, never by re-resolving the path) "
                     f"failed (exit {proc.returncode}): {proc.stderr.strip()}"
+                )
+            # #3698: trust the strip only after reading it back, through the
+            # SAME fd (never the path), before the fd is closed.
+            leftovers = _acl_leftovers(_read_acl_entries(fd, run_dir))
+            if leftovers:
+                shown = leftovers[:_ACL_LEFTOVER_LIST_MAX]
+                rest = len(leftovers) - len(shown)
+                more = f" (and {rest} more)" if rest else ""
+                raise OwnerAclNotStripped(
+                    f"refusing to start: {run_dir} still carries leftover ACL "
+                    f"entries after `setfacl -b` (read back via its open fd): "
+                    f"{'; '.join(shown)}{more}"
                 )
         finally:
             os.close(fd)
@@ -2520,6 +2629,9 @@ def main() -> int:
         print(f"[engramd] {exc}", file=sys.stderr)
         return 1
     except OwnerSocketPathTooLong as exc:
+        print(f"[engramd] {exc}", file=sys.stderr)
+        return 1
+    except OwnerAclNotStripped as exc:
         print(f"[engramd] {exc}", file=sys.stderr)
         return 1
     print(f"[engramd] listening on {owner.socket_path} (pid {os.getpid()})", file=sys.stderr)
