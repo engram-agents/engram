@@ -1291,7 +1291,10 @@ with the file actually opened.
   generator produces, which is the not-done item above it.
 - **A6 is now a criterion in §6.1 and a day-zero datum, and what remains is the
   measurement that criterion actually requires.** The delta is stated and the
-  direct-connect baseline is measured; the owner-side arm is not, because the
-  owner does not exist — today's socket figure is an empty echo server and
-  measures transport only. Phase 1 owes three arms nobody has run: the real
-  owner's dispatch, a contended arm, and a cold-cache arm.
+  direct-connect baseline is measured. The owner exists (U3, #3151), and
+  owner-side arms were measured for the user-identity hook (U4d, #3341); the
+  ledger's A6 section (`docs/2652-migration-ledger.md` §4) records which arms
+  and under which SQLite build, and is the one place for the numbers. The
+  stop hook's cells were measured after the ledger's anchor (#3675, #3686) and
+  are due to enter the ledger with #3686 (as of 2026-10-11). The ledger records contended and
+  cold-cache arms for the user-identity hook only.

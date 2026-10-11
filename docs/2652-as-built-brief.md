@@ -25,7 +25,7 @@ Hardening along the way: pid identity across reuse and clock drift (#3285), fail
 
 ## What is ON
 
-Nothing known. The ledger counts 43 channels that reach the live store (at `21ec2944`). Of those: 3 are the owner's own, 39 are direct, 1 is behind a flag, **0 are flag-on, 0 retired**. U6a has since moved the Stop hook's channel to behind-flag as well. The ledger counts tracked source; it cannot see a seat's own config.
+Nothing known. The ledger counts 43 channels that reach the live store (at `21ec2944`). Of those: 3 are the owner's own, 39 are direct, 1 is behind a flag, **0 are flag-on, 0 retired**. U6a has since put the stop hook's read behind its own flag (ledger Section 3); it shares `_hooklib`'s connection opener, so the 43-channel count above is unchanged. The ledger counts tracked source; it cannot see a seat's own config.
 
 Glossary for the next section. **Owner**: the one process that holds the database open. **A6**: the design's name for the hook-latency test. **Gate cell**: one measured pair of hook and store. **p50**: the median of 1000 calls. **Synthetic store**: a generated 5,000-node graph. **Real copy**: a copy of a seat's actual graph.
 
