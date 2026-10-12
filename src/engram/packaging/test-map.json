@@ -392,6 +392,14 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/loop_prompt.py",
+      "test_globs": [
+        "tests/test_loop_prompt.py",
+        "tests/test_loop_rearm_3005.py"
+      ],
+      "note": "engram-alpha#3005: the loop wake-prompt builder and, from round 1, the --rearm-delay helper (the single writer of next_due_at). It had no entry before round 2 (pre-existing gap). It is a tools/ file with no repo-root symlink yet, so _shipped_path_candidates de-prefixes a change to src/engram/tools/loop_prompt.py to this bare path."
+    },
+    {
       "path_prefix_or_glob": "tools/_status_derive.py",
       "test_globs": [
         "tests/test_loop_gate.py",
@@ -603,9 +611,10 @@
         "tests/test_agent_session_run.py",
         "tests/test_boot_charge_template_glob.py",
         "tests/test_pgrep_liveness_reap_patterns.py",
-        "tests/test_tool_policy_sync.py"
+        "tests/test_tool_policy_sync.py",
+        "tests/test_loop_rearm_3005.py"
       ],
-      "note": "Autostart charge composition is selected at runtime after platform detection; these subprocess and source-template tests pin its harness separation and Claude monitor safety text."
+      "note": "Autostart charge composition is selected at runtime after platform detection; these subprocess and source-template tests pin its harness separation and Claude monitor safety text. engram-alpha#3005 round 3 adds test_loop_rearm_3005.py: it widened its arm-instruction sweep to walk deploy/autostart/ (the boot charges name a cadence and arm the heartbeat at session start), so a boot-charge edit must select it."
     },
     {
       "path_prefix_or_glob": "skills/claude/engram-loop/SKILL.md",
@@ -614,9 +623,10 @@
         "tests/test_skill_frontmatter_lint.py",
         "tests/test_skill_server_sync.py",
         "tests/test_tiers_manifest.py",
-        "tests/test_health_exam_skill.py"
+        "tests/test_health_exam_skill.py",
+        "tests/test_loop_rearm_3005.py"
       ],
-      "note": "The loop skill has a harness-routing order invariant in addition to the generic skill lint gates. The health-exam gate is listed here as well as on the broader skills/claude/ entry because selection is FIRST-MATCH-WINS: this entry shadows that one for this path, so a gate omitted here simply never runs for this doc."
+      "note": "The loop skill has a harness-routing order invariant in addition to the generic skill lint gates. The health-exam gate is listed here as well as on the broader skills/claude/ entry because selection is FIRST-MATCH-WINS: this entry shadows that one for this path, so a gate omitted here simply never runs for this doc. engram-alpha#3005 round 2 adds test_loop_rearm_3005.py: its sweep cell walks EVERY skill doc for the retired full-cadence arm phrase, and this doc is the primary carrier of that instruction."
     },
     {
       "path_prefix_or_glob": "skills/claude/",
@@ -624,9 +634,10 @@
         "tests/test_skill_frontmatter_lint.py",
         "tests/test_skill_server_sync.py",
         "tests/test_tiers_manifest.py",
-        "tests/test_health_exam_skill.py"
+        "tests/test_health_exam_skill.py",
+        "tests/test_loop_rearm_3005.py"
       ],
-      "note": "Any change to a skill directory triggers skill lint + tiers manifest, plus the health-exam shell-pattern gate, whose population is EVERY shipped skill doc rather than the health-exam one. Adding a more specific skills/claude/<name>/ entry above this one shadows it (first-match-wins), so such an entry must repeat this gate."
+      "note": "Any change to a skill directory triggers skill lint + tiers manifest, plus the health-exam shell-pattern gate, whose population is EVERY shipped skill doc rather than the health-exam one. Adding a more specific skills/claude/<name>/ entry above this one shadows it (first-match-wins), so such an entry must repeat this gate. engram-alpha#3005 round 3 adds test_loop_rearm_3005.py: its sweep cell walks EVERY swept root for the retired full-cadence arm phrase, and any skill doc (not only engram-loop's) is a carrier of that instruction."
     },
     {
       "path_prefix_or_glob": "templates/",

@@ -23,6 +23,16 @@ CLI (compose with shell tools):
 
     echo "Loop tick — checking new work." | python -m engram.tools.loop_prompt
 
+CLI — preserve-deadline re-arm (#3005):
+
+    delay=$(python3 loop_prompt.py --rearm-delay --wake-kind other)
+
+Prints the integer seconds to pass to ``ScheduleWakeup`` and (when the marker
+needs it) stamps ``next_due_at`` into the marker.  A wake that is NOT the
+heartbeat re-arms for the REMAINING time to the original due moment instead of
+a fresh full cadence — see ``compute_rearm``.  This helper is the single writer
+of ``next_due_at``.
+
 Stdlib-only — no third-party deps.  Mirrors the style of tools/presence.py and
 tools/_status_derive.py.
 """
@@ -30,7 +40,12 @@ tools/_status_derive.py.
 import argparse
 import html
 import json
+import os
 import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Mapping, Optional
 
 # ---------------------------------------------------------------------------
 # SSoT — the single source of truth for the marker string.  The hook imports
@@ -162,8 +177,289 @@ def is_loop_wake(body: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Preserve-deadline re-arm (#3005)
+#
+# The defect: `engram-loop` re-armed `ScheduleWakeup` at the FULL cadence on
+# every wake.  Because `ScheduleWakeup` REPLACES the pending wake, a Monitor
+# expiry notice (which arrives faster than the declared cadence) pushed the due
+# moment out before it could ever come due — the heartbeat never fired.
+#
+# The fix: a wake that is NOT the heartbeat re-arms for the REMAINING time to
+# the original due moment (`next_due_at`, stamped into the marker once and
+# preserved thereafter).  The helper below is the SINGLE WRITER of that field,
+# so no caller hand-types a timestamp.
+# ---------------------------------------------------------------------------
+
+# The marker's canonical UTC timestamp shape — the same convention the
+# `activated` field already uses (`date -u +%Y-%m-%dT%H:%M:%SZ`).  Do not
+# invent a second shape.
+_TS_FORMAT: str = "%Y-%m-%dT%H:%M:%SZ"
+
+# The floor on any re-arm delay: a due moment already past (or less than a
+# minute away) still gets a real, positive wake rather than a busy loop.
+_MIN_DELAY_SECONDS: int = 60
+
+# Default cadence when the marker carries none.  Canonical loop default.
+DEFAULT_CADENCE_SECONDS: int = 1800
+
+# Default marker path (Step 0 of the engram-loop skill owns the absent case).
+DEFAULT_MARKER_PATH: str = "~/.engram/loop-mode.json"
+
+
+@dataclass(frozen=True)
+class RearmDecision:
+    """The outcome of one re-arm decision.
+
+    ``delay_seconds`` is what to pass to ``ScheduleWakeup``.
+    ``next_due_at`` is the ISO-8601 UTC due moment ("YYYY-MM-DDTHH:MM:SSZ") —
+    preserved byte-identically when the deadline is kept.
+    ``write_next_due_at`` is True iff the helper must stamp the marker.
+    ``reason`` is one of ``heartbeat`` / ``preserved`` / ``migrated_absent`` /
+    ``migrated_invalid``.
+    """
+
+    delay_seconds: int
+    next_due_at: str
+    write_next_due_at: bool
+    reason: str
+
+
+def _format_ts(moment: datetime) -> str:
+    """Render a tz-aware datetime in the marker's canonical UTC shape."""
+    return moment.astimezone(timezone.utc).strftime(_TS_FORMAT)
+
+
+def _is_valid_cadence(cadence: object) -> bool:
+    """True iff *cadence* is a positive ``int`` that is not a ``bool``.
+
+    ``bool`` is excluded explicitly: ``True``/``False`` are ``int`` subclasses
+    in Python, so an ``isinstance(cadence, int)`` test alone would read
+    ``True`` as the cadence ``1``.
+    """
+    return (
+        isinstance(cadence, int)
+        and not isinstance(cadence, bool)
+        and cadence > 0
+    )
+
+
+def _cadence_notice(marker: object) -> Optional[str]:
+    """Loud-line detail for a PRESENT-but-invalid ``cadence_seconds``, else None.
+
+    Returns a short human-readable descriptor (the offending value and its
+    type) when the marker CARRIES ``cadence_seconds`` and it is not a positive
+    int; ``None`` when the field is absent (the legitimate pre-upgrade state),
+    when the marker is not a mapping, or when the value is valid.  The CLI
+    prints this loudly — a present-but-invalid cadence must never be a SILENT
+    fallback to the default (the #3005 silent-fallback shape, on the INPUT
+    side).
+    """
+    if isinstance(marker, Mapping) and "cadence_seconds" in marker:
+        cadence = marker.get("cadence_seconds")
+        if not _is_valid_cadence(cadence):
+            return f"cadence_seconds is {cadence!r} (type {type(cadence).__name__})"
+    return None
+
+
+def _resolve_cadence(marker: object, default_cadence: int) -> int:
+    """The marker's ``cadence_seconds`` if it is a positive int, else default.
+
+    Anything missing, non-int (including bool and float), or ``<= 0`` falls
+    back to ``default_cadence`` (R6).  See ``_cadence_notice`` for the LOUD
+    stderr line the CLI emits for a present-but-invalid value.
+    """
+    if isinstance(marker, Mapping):
+        cadence = marker.get("cadence_seconds")
+        if _is_valid_cadence(cadence):
+            return cadence
+    return default_cadence
+
+
+def _parse_due(raw: object) -> Optional[datetime]:
+    """Parse ``next_due_at``; return a tz-aware datetime, or None if invalid.
+
+    Invalid means: not a non-empty ``str``, unparseable as ISO-8601, or naive
+    (no UTC offset — a zone-less value must never be guessed).
+    """
+    if not isinstance(raw, str) or raw == "":
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
+def compute_rearm(
+    marker: Optional[Mapping],
+    *,
+    now: datetime,
+    is_heartbeat: bool,
+    default_cadence: int = DEFAULT_CADENCE_SECONDS,
+) -> RearmDecision:
+    """Decide the re-arm delay for one loop wake (the #3005 contract table).
+
+    ``now`` MUST be timezone-aware (a naive one raises ``ValueError`` — fail
+    loud, never guess).  This function MUST NOT read the clock itself: ``now``
+    is passed in, which is what makes every cell of the table testable.
+
+    - heartbeat            → full cadence, stamp ``next_due_at``
+    - non-heartbeat, due in the future → remaining seconds (min 60), PRESERVE
+    - non-heartbeat, due already past  → 60 (the clamp), PRESERVE
+    - non-heartbeat, key absent        → cadence, stamp (``migrated_absent``)
+    - non-heartbeat, key corrupt       → cadence, stamp (``migrated_invalid``)
+
+    ``migrated_absent`` and ``migrated_invalid`` stay distinct on purpose: a
+    corrupt value must not be indistinguishable from a pre-upgrade marker.
+    A preserved ``next_due_at`` is returned byte-identical — never re-formatted.
+    """
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("compute_rearm: `now` must be timezone-aware")
+
+    cadence = _resolve_cadence(marker, default_cadence)
+
+    if is_heartbeat:
+        return RearmDecision(
+            delay_seconds=cadence,
+            next_due_at=_format_ts(now + timedelta(seconds=cadence)),
+            write_next_due_at=True,
+            reason="heartbeat",
+        )
+
+    if not (isinstance(marker, Mapping) and "next_due_at" in marker):
+        # R4 — a pre-upgrade marker (or no marker at all): write the field once.
+        return RearmDecision(
+            delay_seconds=cadence,
+            next_due_at=_format_ts(now + timedelta(seconds=cadence)),
+            write_next_due_at=True,
+            reason="migrated_absent",
+        )
+
+    raw = marker["next_due_at"]
+    due = _parse_due(raw)
+    if due is None:
+        # R5 — a corrupt value is a real error, not a pre-upgrade marker.
+        return RearmDecision(
+            delay_seconds=cadence,
+            next_due_at=_format_ts(now + timedelta(seconds=cadence)),
+            write_next_due_at=True,
+            reason="migrated_invalid",
+        )
+
+    # R2/R3 — preserve the deadline; re-arm for what remains, clamped at 60.
+    remaining = int((due - now).total_seconds())
+    return RearmDecision(
+        delay_seconds=max(_MIN_DELAY_SECONDS, remaining),
+        next_due_at=raw,
+        write_next_due_at=False,
+        reason="preserved",
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI entrypoint — compose as: echo "core msg" | python -m engram.tools.loop_prompt
 # ---------------------------------------------------------------------------
+
+def _load_marker_file(path: str) -> dict:
+    """Read and parse the marker file, or exit 2 with a named message.
+
+    An ABSENT file is owned by Step 0 of the loop skill, so it is an error
+    here; a PRESENT but unparseable file is a real error too.  Neither case
+    guesses a cadence.
+    """
+    if not os.path.exists(path):
+        sys.stderr.write(f"loop_prompt: marker file not found: {path}\n")
+        sys.exit(2)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        sys.stderr.write(
+            f"loop_prompt: marker file is not valid JSON: {path} ({exc})\n"
+        )
+        sys.exit(2)
+    if not isinstance(data, dict):
+        sys.stderr.write(f"loop_prompt: marker file is not a JSON object: {path}\n")
+        sys.exit(2)
+    return data
+
+
+def _write_next_due_at(path: str, marker: dict, next_due_at: str) -> None:
+    """Patch ONLY ``next_due_at`` into the marker, atomically.
+
+    A temp file in the SAME directory + ``os.replace``, so a crash mid-write
+    never leaves a truncated marker.  Every other key (and its order) is
+    preserved — a wholesale rewrite would silently drop ``next_due_at`` and
+    reintroduce the #3005 defect.
+    """
+    payload = dict(marker)
+    payload["next_due_at"] = next_due_at
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    # `mkstemp` creates the temp 0600 and `os.replace` carries that mode onto
+    # the marker (so a first write moves it 644 -> 600); acceptable — 0600 is
+    # tighter, and the marker is single-user (#3005 review nit).
+    fd, tmp_path = tempfile.mkstemp(
+        dir=directory, prefix=".loop-mode.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, ensure_ascii=False))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _rearm_main(args: argparse.Namespace) -> int:
+    """The ``--rearm-delay`` path: print the delay, stamp the marker if needed."""
+    marker_path = os.path.expanduser(args.marker)
+    marker = _load_marker_file(marker_path)
+
+    # A PRESENT-but-invalid `cadence_seconds` is a silent-fallback hazard, so
+    # it gets its own loud reason token — distinct from the `next_due_at`
+    # reasons below, which describe a different field.
+    cadence_notice = _cadence_notice(marker)
+    if cadence_notice is not None:
+        sys.stderr.write(
+            f"loop_prompt: invalid_cadence: {cadence_notice} in "
+            f"{marker_path} — using the default cadence "
+            f"{DEFAULT_CADENCE_SECONDS}s; set cadence_seconds to a positive "
+            f"integer.\n"
+        )
+
+    decision = compute_rearm(
+        marker,
+        now=datetime.now(timezone.utc),
+        is_heartbeat=(args.wake_kind == "heartbeat"),
+    )
+
+    if decision.write_next_due_at:
+        _write_next_due_at(marker_path, marker, decision.next_due_at)
+
+    if decision.reason in ("migrated_absent", "migrated_invalid"):
+        detail = (
+            "absent"
+            if decision.reason == "migrated_absent"
+            else "present but invalid"
+        )
+        sys.stderr.write(
+            f"loop_prompt: {decision.reason}: next_due_at is {detail} in "
+            f"{marker_path} — migrating the loop deadline now; later arms "
+            f"preserve it.\n"
+        )
+
+    # stdout carries the integer and NOTHING else, so `delay=$(...)` composes.
+    sys.stdout.write(f"{decision.delay_seconds}\n")
+    return 0
+
 
 def _main() -> None:
     parser = argparse.ArgumentParser(
@@ -172,7 +468,10 @@ def _main() -> None:
         epilog=(
             "Read the core message from stdin, write the marked prompt to stdout.\n"
             "Example:\n"
-            "  echo 'Checking for new work.' | python loop_prompt.py --kind working"
+            "  echo 'Checking for new work.' | python loop_prompt.py --kind working\n"
+            "\n"
+            "Or compute a preserve-deadline re-arm delay (#3005):\n"
+            "  python loop_prompt.py --rearm-delay --wake-kind other\n"
         ),
     )
     parser.add_argument(
@@ -181,7 +480,35 @@ def _main() -> None:
         default=None,
         help="Loop kind string embedded in the machine-readable meta line (e.g. 'working').",
     )
+    parser.add_argument(
+        "--rearm-delay",
+        dest="rearm_delay",
+        action="store_true",
+        help=(
+            "Print the integer seconds to pass to ScheduleWakeup for this wake "
+            "(preserve-deadline re-arm, #3005) and stamp the marker if needed."
+        ),
+    )
+    parser.add_argument(
+        "--wake-kind",
+        dest="wake_kind",
+        choices=("heartbeat", "other"),
+        default="other",
+        help=(
+            "Whether this wake is the loop heartbeat or an 'other' wake "
+            "(Monitor notice, DM, baton flip, human prompt). Default: other."
+        ),
+    )
+    parser.add_argument(
+        "--marker",
+        metavar="PATH",
+        default=DEFAULT_MARKER_PATH,
+        help=f"Loop marker path (default: {DEFAULT_MARKER_PATH}).",
+    )
     args = parser.parse_args()
+
+    if args.rearm_delay:
+        sys.exit(_rearm_main(args))
 
     core = sys.stdin.read()
     meta: dict = {}

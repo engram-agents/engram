@@ -479,6 +479,39 @@ try:
 except Exception:
     _LOOP_WAKE_MARKER = _LOOP_WAKE_MARKER_FALLBACK
 
+# ---------------------------------------------------------------------------
+# The helper command the nudge PRINTS must RUN AS PRINTED.  The resolution
+# above already found the real tools/ dir (`_LP_TOOLS_DIR`), so print THAT:
+# a static guess is copied from one deploy layout and broken in the other —
+# the bare `tools/loop_prompt.py` this replaced resolved in NO cwd, not even
+# the repo root, because the source tree keeps the file at `src/engram/tools/`.
+# Only when the import resolution FAILED does the printed command fall back
+# to a sh form whose `:-` default covers a plugin-topology seat with the
+# variable set AND one that has the plugin installed but
+# `$CLAUDE_PLUGIN_ROOT` unset in its shell (measured: unset in an agent's
+# Bash env, login shell included).
+# ---------------------------------------------------------------------------
+
+_LOOP_PROMPT_FALLBACK_PATH = (
+    '"${CLAUDE_PLUGIN_ROOT:-$HOME/.engram/marketplace/plugins/engram}'
+    '/tools/loop_prompt.py"'
+)
+
+
+def _loop_prompt_rearm_command() -> str:
+    """The `loop_prompt.py --rearm-delay` command the nudge prints.
+
+    Names the path RESOLVED at import when resolution succeeded, so the
+    printed command is correct in whichever layout this hook runs from;
+    falls back to the `${CLAUDE_PLUGIN_ROOT:-…}` sh form otherwise.
+    """
+    if _LP_TOOLS_DIR is not None:
+        helper = f'"{_LP_TOOLS_DIR / "loop_prompt.py"}"'
+    else:
+        helper = _LOOP_PROMPT_FALLBACK_PATH
+    return f"python3 {helper} --rearm-delay --wake-kind other"
+
+
 # The wake-arming tool's name(s), as they appear in a tool_use block's
 # "name" field. A small literal/alias set, deliberately -- see invariant 5
 # in the module docstring: a rename should cause over-firing (this set no
@@ -536,7 +569,11 @@ def _is_managed_codex_runtime() -> bool:
 _NUDGE_TEXT = (
     "[Loop Arm Check: a loop marker is active and this turn shows no "
     "ScheduleWakeup call. Arm now — ScheduleWakeup with this file's "
-    "loop_prompt copied verbatim — then run CronList to verify the armed "
+    "loop_prompt copied verbatim — after asking the helper for this turn's "
+    f"delay: run `{_loop_prompt_rearm_command()}` and "
+    "pass the integer it prints to ScheduleWakeup (a nudge-driven arm "
+    "PRESERVES the deadline; do NOT arm the bare full cadence — that pushes "
+    "the due moment out, #3005). Then run CronList to verify the armed "
     "prompt leads with "
     f"{_LOOP_WAKE_MARKER}. CronList alone never satisfies this check, only "
     "verifies after the real arming action. Arming is idempotent: a "
