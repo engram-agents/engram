@@ -1027,3 +1027,175 @@ def write(
         timeout=timeout,
         socket_path=_resolve_socket_path(socket_path),
     )
+
+
+# ---------------------------------------------------------------------------
+# Read-only connection shim (#3665 U6b stage 2b)
+# ---------------------------------------------------------------------------
+#
+# ONE client-side shape for code written against `conn.execute(sql, params)
+# .fetchone()/.fetchall()` (engram_core.generalization_chain,
+# engram_idf.extract_keywords) to read through the owner. Every non-Ok result
+# raises OwnerReadError; there is NO fallback to a direct open of knowledge.db
+# and no database-library import here. The SQL is sent literally: the owner still
+# matches each statement byte for byte against its registry.
+
+_monotonic = time.monotonic  # module-level so tests can drive the budget clock
+
+
+class OwnerReadError(Exception):
+    """An owner read did not produce rows. `.kind` is one of
+    unavailable / rejected / unusable_answer / budget_exhausted /
+    client_failure; `.result` is the exact Unavailable/Rejected object (else
+    None). str() is one short line and never carries SQL text or row data."""
+
+    def __init__(self, kind, result=None):
+        self.kind = kind
+        self.result = result
+        text = "owner read failed: " + kind
+        if kind == "rejected" and isinstance(result, Rejected):
+            text += " (" + " ".join(str(result.reason).split()) + ")"
+        super().__init__(text)
+
+
+def _cells_ok(row):
+    if not isinstance(row, (list, tuple)):
+        return False
+    for cell in row:
+        if cell is None:
+            continue
+        if isinstance(cell, bool) or not isinstance(cell, (int, float, str)):
+            return False
+    return True
+
+
+class _OwnerCursor:
+    """fetchone()/fetchall() over tuples, consuming. Deliberately minimal:
+    no iteration, rowcount or description."""
+
+    __slots__ = ("_rows", "_pos")
+
+    def __init__(self, rows):
+        self._rows = rows
+        self._pos = 0
+
+    def fetchone(self):
+        if self._pos >= len(self._rows):
+            return None
+        row = self._rows[self._pos]
+        self._pos += 1
+        return row
+
+    def fetchall(self):
+        rest = self._rows[self._pos:]
+        self._pos = len(self._rows)
+        return rest
+
+    def __iter__(self):
+        raise TypeError(
+            "the owner read cursor does not support iteration; use fetchone()/fetchall()"
+        )
+
+
+def _idf_df_terms(sql, params):
+    """-> the term list when (sql, params) is the IDF batch statement with exactly
+    one str parameter that is a JSON list of str; else None (ordinary `read`
+    route -- the owner then rules on it; this raises nothing of its own).
+    `engram_idf` is imported lazily to keep the client import-light."""
+    try:
+        from engram_idf import IDF_BATCH_SQL
+    except Exception:
+        return None
+    if sql != IDF_BATCH_SQL or len(params) != 1 or not isinstance(params[0], str):
+        return None
+    try:
+        terms = json.loads(params[0])
+    except ValueError:
+        return None
+    if isinstance(terms, list) and all(isinstance(t, str) for t in terms):
+        return terms
+    return None
+
+
+# #3665: the owner's typed `df` op refuses an empty term, a term over
+# DF_TERM_MAX_BYTES UTF-8 bytes and an empty list by name, while the IDF
+# tokenizer (`[a-z]{2,}[a-z0-9_]*`) has no length bound. The shim therefore
+# drops such terms before sending (they cannot score) and sends no request at
+# all when nothing remains. Literal copies of engramd_owner.DF_TERM_MAX_BYTES /
+# DF_TERMS_MAX (the client stays import-light); a cell pins the equality.
+# Parity limit: a vocabulary term longer than 256 bytes would be scored on the
+# direct path but not through the owner.
+_DF_TERM_MAX_BYTES = 256
+_DF_TERMS_MAX = 1000
+
+
+class OwnerReadConnection:
+    """Read-only connection shim over the owner's `read` method.
+
+    `total_budget` is the whole-fire seconds for ALL reads together; each
+    execute() uses min(per_call_timeout or total_budget, remaining). `.calls`
+    counts owner round trips attempted (a budget refusal is not one)."""
+
+    __slots__ = ("_total", "_per_call", "_socket_path", "_start", "_closed", "calls")
+
+    def __init__(self, total_budget, per_call_timeout=None, *, socket_path=None):
+        self._total = total_budget
+        self._per_call = per_call_timeout
+        self._socket_path = socket_path
+        self._start = _monotonic()
+        self._closed = False
+        self.calls = 0
+
+    def execute(self, sql, params=()):
+        if self._closed:
+            raise RuntimeError("closed")
+        if not isinstance(sql, str):
+            raise TypeError("sql must be a str")
+        if not isinstance(params, (tuple, list)):
+            raise TypeError("params must be a tuple or list")
+        remaining = self._total - (_monotonic() - self._start)
+        if remaining <= 0:
+            raise OwnerReadError("budget_exhausted")
+        method, payload = "read", {"sql": sql, "args": list(params)}
+        df_terms = _idf_df_terms(sql, params)
+        if df_terms is not None and len(df_terms) <= _DF_TERMS_MAX:
+            # #3665: the IDF batch statement is not a registrable read template
+            # (virtual table); the owner serves it as the typed `df` method.
+            # More than the ceiling stays on the ordinary route (the owner rules).
+            df_terms = [
+                t for t in df_terms if t and len(t.encode("utf-8", "surrogatepass")) <= _DF_TERM_MAX_BYTES
+            ]
+            if not df_terms:
+                return _OwnerCursor([])  # nothing can score: no round trip, no `.calls`
+            method, payload = "df", {"terms": df_terms}
+        timeout = min(self._per_call or self._total, remaining)
+        self.calls += 1
+        try:
+            result = read(
+                method,
+                payload,
+                timeout=timeout,
+                socket_path=self._socket_path,
+            )
+        except (Exception, SystemExit) as exc:
+            raise OwnerReadError("client_failure") from exc
+        if isinstance(result, Ok):
+            rows = result.result
+            if not isinstance(rows, list) or not all(_cells_ok(r) for r in rows):
+                raise OwnerReadError("unusable_answer")
+            return _OwnerCursor([tuple(r) for r in rows])
+        if isinstance(result, Unavailable):
+            raise OwnerReadError("unavailable", result)
+        if isinstance(result, Rejected):
+            raise OwnerReadError("rejected", result)
+        raise OwnerReadError("unusable_answer")
+
+    def close(self):
+        self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False

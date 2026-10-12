@@ -19,9 +19,20 @@ See alpha issue #177 for full design rationale and empirical motivation.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import sqlite3
+
+# Distinct terms per batched document-frequency query in extract_keywords
+# (#3665): keeps request/response sizes far below the engramd owner's
+# 1 MiB / 8 MiB limits. Read at call time (tests may lower it).
+IDF_BATCH_TERMS = 1000
+
+# The batch document-frequency statement, byte-exact. The engramd owner-client
+# shim (engramd_client.OwnerReadConnection.execute) compares against this
+# constant to route the statement to the owner's typed `df` method (#3665).
+IDF_BATCH_SQL = "SELECT term, doc FROM nodes_fts_vocab WHERE term IN (SELECT value FROM json_each(?))"
 
 # ---------------------------------------------------------------------------
 # Stopword lists
@@ -252,19 +263,40 @@ def extract_keywords(
 
     tokens = tokenize(text)
 
-    scored: list[tuple[str, float]] = []
+    # Distinct, non-stopword tokens in first-seen order (the tie order of the
+    # final stable sort).
+    candidates: list[str] = []
     seen: set[str] = set()
-
     for token in tokens:
         if token in stopwords:
             continue
         if token in seen:
             continue
         seen.add(token)
+        candidates.append(token)
 
-        score = idf(conn, token, n_docs=n_docs)
-        if score is None:
+    # Document frequencies in batches: ONE json_each-bound statement per
+    # IDF_BATCH_TERMS distinct terms (#3665), instead of one query per token.
+    # A term absent from the vocabulary is absent from ``dfs`` -> unknown.
+    # Rows are read by index and only fetchall() is used, so a bare
+    # execute()->fetchone()/fetchall() connection (the owner-client shim)
+    # serves this too.
+    dfs: dict[str, int] = {}
+    batch = IDF_BATCH_TERMS
+    for start in range(0, len(candidates), batch):
+        chunk = candidates[start:start + batch]
+        for vrow in conn.execute(
+            IDF_BATCH_SQL,
+            (json.dumps(chunk),),
+        ).fetchall():
+            dfs[vrow[0]] = vrow[1]
+
+    scored: list[tuple[str, float]] = []
+    for token in candidates:
+        df = dfs.get(token)
+        if df is None or df <= 0 or df > n_docs:
             continue
+        score = math.log(n_docs / df)
         if score < min_idf:
             continue
         scored.append((token, score))

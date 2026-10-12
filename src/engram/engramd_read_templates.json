@@ -88,6 +88,13 @@
       ]
     },
     {
+      "key": "9d938f92196ce5c30108d90b0c926ae6f8d10b89e963219bcf12415dce414a39",
+      "sql": "SELECT term, doc FROM nodes_fts_vocab WHERE term IN (SELECT value FROM json_each(?))",
+      "sites": [
+        "engram_idf.py:extract_keywords"
+      ]
+    },
+    {
       "key": "9f6da2c7f988f5d2d40b7cdf6afe3d1fef5abb993b47a72b16fe9070cc0c3c05",
       "sql": "SELECT count(*) FROM nodes",
       "sites": [
@@ -137,13 +144,6 @@
       ]
     },
     {
-      "key": "cbfeed1901ba8473aa2edd65b9a0f92931b0ae1d537e2b0d6ed3ee7b6f5c70c6",
-      "sql": "SELECT doc FROM nodes_fts_vocab WHERE term = ?",
-      "sites": [
-        "engram_idf.py:idf"
-      ]
-    },
-    {
       "key": "cefc616a2876d56a7b84ead98f75fa894f5a3678510f4d5c5bbac0b78061feb8",
       "sql": "SELECT count(*) FROM nodes WHERE is_current = 1",
       "sites": [
@@ -162,7 +162,6 @@
       "sql": "SELECT COUNT(*) FROM nodes WHERE is_current = 1",
       "sites": [
         "engram_idf.py:extract_keywords",
-        "engram_idf.py:idf",
         "hooks/claude/engram-lesson-tripwire-hook.py:check_in_turn_recall"
       ]
     },

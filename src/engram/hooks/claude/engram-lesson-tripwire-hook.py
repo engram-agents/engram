@@ -97,6 +97,7 @@ _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context, write_route_ledger, tool_fire_key
+from _hooklib import import_owner_flags as _hooklib_import_owner_flags
 # #3628: this hook runs on EVERY tool call. Every file open goes through these
 # non-blocking, regular-file-only helpers (a FIFO makes a plain open() wait for
 # a peer and the harness kills the hook silently); a non-regular target raises
@@ -129,6 +130,137 @@ except Exception:
 
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
 DB_PATH = Path(ENGRAM_HOME) / "knowledge.db"
+CONFIG_PATH = os.path.join(ENGRAM_HOME, "config.json")
+
+# ---------------------------------------------------------------------------
+# U6b stage 2c-1 (#3665) -- the flagged read through the engramd owner
+# ---------------------------------------------------------------------------
+# With `engramd.lesson_tripwire_reads_via_owner` true in $ENGRAM_HOME/config.json
+# (read ONLY through engramd_owner_flags.flag_on), the four read sites of this
+# hook -- load_tripwires, render_triggered_principles (the chain), the prevention
+# load in load_prevention_lessons, and check_in_turn_recall (its COUNT and
+# engram_idf.extract_keywords) -- read through ONE engramd_client.OwnerReadConnection
+# shared by the whole fire, and never open knowledge.db. Flag OFF is the direct
+# path, unchanged. Modelled on U6a (engram-stop-hook.py).
+#
+# Owner failure (any OwnerReadError, or the client failing to import): the failing
+# site returns its EMPTY result for this fire (never a deny, never presented as "no
+# tripwires matched"), the first failure is recorded, and main() adds ONE loud
+# notice to the tripwire block's head, rate-limited through the shared probe-notice
+# stamp under kind `tripwire-owner`. A failed flag helper reads OFF and is reported
+# (stderr line every run; the same line once per window under `tripwire-owner-flag`).
+
+# The hook is registered with a 3 s timeout (hooks/hooks.json): the whole fire's owner
+# time is bounded at 2.0 s (3 s minus interpreter start and the rest of the fire), each
+# read at 1.0 s, both end-to-end (the shim re-arms every read against the remaining budget).
+OWNER_FIRE_BUDGET_S = 2.0
+OWNER_READ_TIMEOUT_S = 1.0
+
+_OWNER_FLAG_KEY = "lesson_tripwire_reads_via_owner"
+OWNER_NOTICE_KEY = "tripwire-owner"
+OWNER_FLAG_NOTICE_KEY = "tripwire-owner-flag"
+
+# Set by main() for ONE run (None outside main(): standalone callers of the sites stay
+# on the direct path). {"on": bool, "conn": shim or None, "failure": dict or None}.
+_OWNER_RUN = None
+
+# Set by _owner_reads_enabled() when the flag helper fails at import or at `flag_on`
+# (class NAME only, never the message); reset at the top of every call.
+_OWNER_FLAGS_FAILURE = None
+
+
+class _ClientImportFailure(Exception):
+    """engramd_client could not be imported. args = (cause class name,)."""
+
+
+def _import_owner_flags():
+    """Thin alias (#3665): the body lives once in `_hooklib.import_owner_flags`; the name
+    stays a module attribute because callers and tests patch it."""
+    return _hooklib_import_owner_flags(ENGRAM_HOME)
+
+
+def _owner_flags_failure_line():
+    """The one report line, or None when no failure is recorded / anything goes wrong."""
+    if _OWNER_FLAGS_FAILURE is None:
+        return None
+    try:
+        cls = "".join(ch if ch.isprintable() else "?" for ch in str(_OWNER_FLAGS_FAILURE))[:80]
+        return f"engram-lesson-tripwire-hook: owner flag helper failed: {cls}"
+    except Exception:
+        return None
+
+
+def _owner_reads_enabled() -> bool:
+    """`engramd.lesson_tripwire_reads_via_owner`, read ONLY through
+    engramd_owner_flags.flag_on (one definition shared with the owner launcher); anything
+    but the boolean `true` is OFF, the direct path. ANY exception (and a SystemExit)
+    importing the helper or calling `flag_on` reads OFF -- the hook cannot know the flag is
+    ON -- and its CLASS NAME (never the message) is recorded in `_OWNER_FLAGS_FAILURE`
+    (reset on every call) for main() to report. KeyboardInterrupt is not caught."""
+    global _OWNER_FLAGS_FAILURE
+    _OWNER_FLAGS_FAILURE = None
+    try:
+        engramd_owner_flags = _import_owner_flags()
+        # `is True`: only the JSON boolean true is ON; a truthy non-bool must not read as ON.
+        return engramd_owner_flags.flag_on(_OWNER_FLAG_KEY, CONFIG_PATH) is True
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 -- see docstring
+        try:
+            _OWNER_FLAGS_FAILURE = type(exc).__name__
+        except Exception:
+            _OWNER_FLAGS_FAILURE = "unknown"
+        return False
+
+
+def _import_engramd_client():
+    """Lazy import (flag OFF must never import it), resolved layout-agnostically via the
+    shared resolver -- plugin root first, then a walk-parents search; never a fixed
+    parents[N] (project CLAUDE.md, "Plugin build restructures code paths")."""
+    runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engramd_client.py")
+    # Position 0 even if already present further down: an earlier insertion must not let
+    # another directory win this import.
+    sys.path[:] = [runtime_dir] + [p for p in sys.path if p != runtime_dir]
+    import engramd_client
+    return engramd_client
+
+
+def _owner_active() -> bool:
+    return _OWNER_RUN is not None and bool(_OWNER_RUN.get("on"))
+
+
+def _owner_conn():
+    """The ONE OwnerReadConnection of this fire, created lazily at first use and shared by
+    all four read sites. Raises _ClientImportFailure when the client cannot be imported."""
+    run = _OWNER_RUN
+    if run["conn"] is None:
+        try:
+            ec = _import_engramd_client()
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 -- any import failure is an owner failure; KeyboardInterrupt is not caught
+            raise _ClientImportFailure(type(exc).__name__) from exc
+        run["conn"] = ec.OwnerReadConnection(
+            total_budget=OWNER_FIRE_BUDGET_S, per_call_timeout=OWNER_READ_TIMEOUT_S)
+    return run["conn"]
+
+
+def _is_owner_exc(exc: BaseException) -> bool:
+    return isinstance(exc, _ClientImportFailure) or (
+        type(exc).__name__ == "OwnerReadError" and hasattr(exc, "kind"))
+
+
+def _record_owner_failure(site: str, exc: BaseException) -> bool:
+    """Record the FIRST owner failure of this run (kind, the typed Unavailable/Rejected
+    result, the cause CLASS name only). Returns True when `exc` was an owner failure (even
+    if an earlier one is already kept); False leaves the caller to treat it as it always did."""
+    if not _owner_active() or not _is_owner_exc(exc):
+        return False
+    run = _OWNER_RUN
+    if run["failure"] is None:
+        if isinstance(exc, _ClientImportFailure):
+            kind, result, cause = "client_import", None, (exc.args[0] if exc.args else "unknown")
+        else:
+            kind, result = exc.kind, getattr(exc, "result", None)
+            cause = type(exc.__cause__).__name__ if exc.__cause__ is not None else None
+        run["failure"] = {"site": site, "kind": kind, "result": result, "cause": cause}
+    return True
 
 # ---------------------------------------------------------------------------
 # #2858 -- tripwire-block preview cap (harness-truncation defense)
@@ -297,6 +429,109 @@ def _pending_loader_notice():
         return "", None
 
 
+# #3665 -- the owner-failure notice. Two parts as in U6a: what the agent can do itself, and
+# what to tell the human. Dynamic text is bounded and control-character-free; the exception
+# CLASS of a client failure is shown, never its message, SQL text or row data.
+_OWNER_NOTICE_CAP = 1400
+_OWNER_FLAG_OFF_STEP = (
+    "To go back to the direct-read path meanwhile, set "
+    "engramd.lesson_tripwire_reads_via_owner to false in $ENGRAM_HOME/config.json."
+)
+_OWNER_AGENT_BASE = [
+    "Do NOT read knowledge.db directly to work around this; tell the human what is shown here.",
+    "Do not retry in a loop: this notice repeats at most once per window.",
+]
+
+
+def _notice_lines(title: str, items) -> str:
+    return "  " + title + ":\n" + "\n".join(
+        f"    - {_sanitize_exc_text(str(i), 200)}" for i in items)
+
+
+def _owner_failure_notice(failure: dict) -> str:
+    """The loud text for one recorded owner failure. Never raises beyond what the caller
+    guards; bounded to _OWNER_NOTICE_CAP characters."""
+    site, kind, result = failure["site"], failure["kind"], failure.get("result")
+    cause = _sanitize_exc_text(str(failure.get("cause") or ""), 80)
+    head = (
+        f"[lesson-tripwire] ENGRAM UNAVAILABLE: tripwires and lessons {COULD_NOT_READ} this fire "
+        f"(the engramd owner read failed at {site}: {kind}). "
+        'This is NOT "no tripwires matched": the check could not run, so a tripwire or a '
+        "blocking lesson may have been missed. No tool call was blocked."
+    )
+    lines = [head]
+    agent = list(_OWNER_AGENT_BASE)
+    human = []
+    if kind == "unavailable" and result is not None:
+        lines.append(
+            f"  Socket: {_sanitize_exc_text(str(result.socket_path), 200)} "
+            f"(bound {OWNER_READ_TIMEOUT_S}s per read, {OWNER_FIRE_BUDGET_S}s per fire)")
+        agent += list(result.agent_steps)
+        human += list(result.human_steps)
+    elif kind == "rejected" and result is not None:
+        lines.append(f"  Reason: {_sanitize_exc_text(str(result.reason), 200)}")
+        lines.append(f"  Remedy: {_sanitize_exc_text(str(result.remedy), 200)}")
+        lines.append("  This refusal is not retryable: repeating the same request cannot change the answer.")
+        human.append("Act on the Remedy line above (typically: register the template / restart the owner "
+                     "on a matching version).")
+    elif kind == "unusable_answer":
+        lines.append("  The owner returned an answer of the wrong shape.")
+        human.append("Restart the engramd owner on the current version and report this if it persists.")
+    elif kind == "budget_exhausted":
+        lines.append(f"  The fire's owner time budget ({OWNER_FIRE_BUDGET_S}s) ran out before this read.")
+        human.append("Check why the owner answers slowly (engramd logs, host load).")
+    elif kind == "client_import":
+        lines.append(f"  The engramd client module (engramd_client.py) could not be loaded (cause: {cause}).")
+        human.append("Check that engramd_client.py exists at the plugin root (the directory above hooks/); "
+                     "re-run the plugin install or upgrade if it is missing.")
+    else:  # client_failure and anything a future client adds
+        lines.append(f"  The engramd client failed while reading (cause: {cause or kind}).")
+        human.append("This is a client-side bug: report it with the cause line above.")
+    human.append(_OWNER_FLAG_OFF_STEP)
+    lines += [_notice_lines("Agent steps", agent), _notice_lines("Human steps", human)]
+    return "\n".join(lines)[:_OWNER_NOTICE_CAP]
+
+
+COULD_NOT_READ = "could NOT be read"
+
+
+def _pending_owner_notice():
+    """Return (text, kind): the one owner-side line to inject this run, or ("", None).
+    A recorded owner failure -> the loud notice under `tripwire-owner`; a failed flag helper
+    -> its report line under `tripwire-owner-flag` (the two cannot co-occur: a failed helper
+    reads the flag OFF). Both ride the shared probe-notice window, so a repeat inside the
+    window is silent on stdout. The caller stamps the window only after the response was
+    printed and flushed. Never raises."""
+    try:
+        run = _OWNER_RUN
+        if run is not None and run.get("failure") is not None:
+            text, key = _owner_failure_notice(run["failure"]), OWNER_NOTICE_KEY
+        else:
+            text, key = _owner_flags_failure_line(), OWNER_FLAG_NOTICE_KEY
+        if not text or not probe_notice_due(ENGRAM_HOME, key):
+            return "", None
+        return text, key
+    except Exception:
+        return "", None
+
+
+def _write_owner_stderr_lines() -> None:
+    """The per-run stderr lines (every run, class/kind only): the failed flag helper, and the
+    first owner failure. Never raises."""
+    try:
+        line = _owner_flags_failure_line()
+        if line is not None:
+            sys.stderr.write(line + "\n")
+        run = _OWNER_RUN
+        if run is not None and run.get("failure") is not None:
+            f = run["failure"]
+            sys.stderr.write(
+                f"engram-lesson-tripwire-hook: owner read failed: {f['kind']} at {f['site']}\n"[:300])
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def load_tripwires(db_path: Path = DB_PATH):
     """Return list of (pattern_str, nudge_str, node_id, priority_str) from
     active lessons with situation_pattern.
@@ -312,18 +547,26 @@ def load_tripwires(db_path: Path = DB_PATH):
     here (not left as None) so every downstream consumer can compare by
     string equality without an extra None-check; a lesson with no opinion
     sorts exactly like a lesson explicitly marked "normal"."""
-    if not db_path.exists():
+    # #3665: with the owner flag ON the fire's shared shim stands in for the connection and
+    # knowledge.db is never opened (no existence check of the local file either: the store
+    # belongs to the owner). An OWNER failure is recorded for the loud notice instead of as a
+    # loader failure; the result is EMPTY either way. One execute site, so the read-template
+    # registry lists this function once.
+    owner = _owner_active()
+    if not owner and not db_path.exists():
         return []
     try:
-        conn = connect_regular_ro(db_path, timeout=2.0)
+        conn = _owner_conn() if owner else connect_regular_ro(db_path, timeout=2.0)
         rows = conn.execute(_QUERY).fetchall()
-        conn.close()
+        if not owner:
+            conn.close()
         return [
             (row[2], row[1], row[0], row[3] or "normal")
             for row in rows if row[1] and row[2]
         ]
     except Exception as exc:
-        _record_loader_failure("load_tripwires", exc)
+        if not (owner and _record_owner_failure("load_tripwires", exc)):
+            _record_loader_failure("load_tripwires", exc)
         return []
 
 
@@ -566,9 +809,14 @@ def render_triggered_principles(
         return ""
 
     conn = None
+    owner = _owner_active()
     try:
-        conn = connect_regular_ro(db_path, timeout=1.0)
-        conn.row_factory = sqlite3.Row
+        if owner:
+            # #3665: the fire's shared shim; positional rows (no row_factory exists on it).
+            conn = _owner_conn()
+        else:
+            conn = connect_regular_ro(db_path, timeout=1.0)
+            conn.row_factory = sqlite3.Row
         # head_id -> {"nodes": {resolved_id: entry, ...}, "hit_ids": [node_id, ...]}
         heads_seen: dict = {}
         head_order: list = []
@@ -625,10 +873,13 @@ def render_triggered_principles(
                     head_order.append(head_id)
                 heads_seen[head_id]["hit_ids"].append(node_id)
                 heads_seen[head_id]["nodes"].update(nodes)
-    except Exception:
+    except Exception as exc:
+        if owner:
+            _record_owner_failure("render_triggered_principles", exc)
         return ""
     finally:
-        if conn is not None:
+        # the owner shim is shared by every site of the fire: not closed here
+        if conn is not None and not owner:
             try:
                 conn.close()
             except Exception:
@@ -909,18 +1160,23 @@ def load_prevention_lessons(db_path: Path = DB_PATH):
     """Return list of {id, pattern, prevention_type, nudge} for lessons
     whose prevention_type is 'shadow' or 'blocking' (advisory/absent
     lessons are excluded — they have nothing to log or deny here)."""
-    if not db_path.exists():
+    # #3665: see load_tripwires. A failed owner read is an EMPTY result plus a recorded owner
+    # failure -- never "no lessons" silently, and the deny gate stays fail-open.
+    owner = _owner_active()
+    if not owner and not db_path.exists():
         return []
     try:
-        conn = connect_regular_ro(db_path, timeout=2.0)
+        conn = _owner_conn() if owner else connect_regular_ro(db_path, timeout=2.0)
         rows = conn.execute(_PREVENTION_QUERY).fetchall()
-        conn.close()
+        if not owner:
+            conn.close()
         return [
             {"id": row[0], "pattern": row[1], "prevention_type": row[2], "nudge": row[3] or ""}
             for row in rows if row[1] and row[2]
         ]
     except Exception as exc:
-        _record_loader_failure("load_prevention_lessons", exc)
+        if not (owner and _record_owner_failure("load_prevention_lessons", exc)):
+            _record_loader_failure("load_prevention_lessons", exc)
         return []
 
 
@@ -1540,7 +1796,10 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
             # config-supplied frozenset — including an empty one (filtering
             # disabled) — passes through unchanged.
             junk = cfg["junk_stoplist"] if cfg["junk_stoplist"] is not None else JUNK_STOPLIST
-            conn = connect_regular_ro(DB_PATH, timeout=1.0)
+            # #3665: with the owner flag ON the fire's shared shim stands in for the
+            # connection (the SQL strings below are registry templates, byte for byte).
+            owner = _owner_active()
+            conn = _owner_conn() if owner else connect_regular_ro(DB_PATH, timeout=1.0)
             try:
                 if cfg["min_idf"] is not None:
                     effective_min_idf = cfg["min_idf"]
@@ -1561,13 +1820,17 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
                     conn, match_target, min_idf=effective_min_idf, top_k=5,
                     stopwords=STOPWORDS | junk)
             finally:
-                conn.close()
+                if not owner:
+                    conn.close()
             terms = [tok for tok, _score in pairs]
             # rec-3 (#266): drop junk-class shell/code tokens BEFORE the
             # novelty check + fire, so execution noise neither triggers recall
             # nor pollutes the term-memory/ledger. Targeted, not a min_idf bump.
             terms = _apply_junk_stoplist(terms, junk)
-        except Exception:
+        except Exception as exc:
+            # #3665: an owner failure here is recorded for the loud notice (the site still
+            # returns ""); anything else is swallowed exactly as before.
+            _record_owner_failure("check_in_turn_recall", exc)
             return ""
         if not terms:
             return ""
@@ -1750,6 +2013,20 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
 
 
 def main() -> None:
+    """One fire. The owner state (#3665) lives for exactly this call: reset on entry and on
+    every way out, so the sites called outside main() (the existing suites) stay direct."""
+    global _OWNER_RUN, _OWNER_FLAGS_FAILURE
+    _OWNER_RUN = None
+    _OWNER_FLAGS_FAILURE = None
+    try:
+        _main_impl()
+    finally:
+        _write_owner_stderr_lines()  # every run: class/kind only, whichever way the fire ended
+        _OWNER_RUN = None
+
+
+def _main_impl() -> None:
+    global _OWNER_RUN
     LOADER_FAILURES.clear()  # #3503: the record is per run
     try:
         hook_input = json.load(sys.stdin)
@@ -1757,6 +2034,11 @@ def main() -> None:
         # #3521 row 9: out of scope -- malformed harness input keeps its
         # silent exit (the outer-handler crash notice below does not cover it).
         sys.exit(0)
+
+    # #3665: the flag, read once per fire. A failed helper reads OFF and is reported (the
+    # stderr line is written at the end of the fire, with any owner failure).
+    _OWNER_RUN = {"on": _owner_reads_enabled(), "conn": None, "failure": None}
+    owner_notice, owner_notice_key = "", None
 
     # #3521 row 9: set right after a response JSON was printed, so the outer
     # handler never prints a second object.
@@ -1833,6 +2115,45 @@ def main() -> None:
         # #3503: at most one visible loader-failure line per window; "" when
         # nothing failed (clean path: head/body below stay byte-identical).
         loader_notice, loader_notice_now = _pending_loader_notice()
+        # #3665: the owner-side line (a recorded owner failure, or a failed flag helper), at
+        # most once per window under its own kind. It joins the loader line in the block's head
+        # (owner failures bypass the loader record, so one failure never yields both).
+        owner_notice, owner_notice_key = _pending_owner_notice()
+        head_notice = "\n".join(x for x in (owner_notice, loader_notice) if x)
+
+        def _late_owner_notice() -> None:
+            """The chain and the recall sites run AFTER the block was rendered, so an owner
+            failure at either is only known now. Add the notice then: re-render the block with
+            it in the head (or create the block when there were no hits), exactly as the
+            earlier notice would have been. If that pushes the joined string past the total
+            budget while the chain is in it, the chain goes whole (block > chain > recall)."""
+            nonlocal parts, _block_call, owner_notice, owner_notice_key, head_notice
+            nonlocal _chain_cut, _chain_in_parts, _chain_cut_lines
+            if owner_notice_key == OWNER_NOTICE_KEY:
+                return  # already carried by the head (the first failure is the one kept)
+            text, key = _pending_owner_notice()
+            if key != OWNER_NOTICE_KEY:
+                return
+            owner_notice, owner_notice_key = text, key
+            head_notice = "\n".join(x for x in (owner_notice, loader_notice) if x)
+            if _block_call is not None:
+                head = f"{head_notice}\n{TRIPWIRE_HEADER}" if _block_call[1] else head_notice
+                _block_call = (head, _block_call[1], _block_call[2])
+                parts[0] = emit_context(_block_call[0], _block_call[1], **_block_call[2])
+            else:
+                budgets = get_harness_budgets(detect_harness())
+                _block_call = (
+                    head_notice, [], dict(budget=budgets["budget"], target=TRIPWIRE_BLOCK_CHAR_CEILING))
+                parts.insert(0, emit_context(_block_call[0], _block_call[1], **_block_call[2]))
+            if _tb_budget is not None and _chain_in_parts and len("\n".join(parts)) > _tb_budget:
+                _chain_part = parts[1]
+                parts = [p for p in parts if p is not _chain_part]
+                _chain_cut, _chain_in_parts = True, False
+                _chain_cut_lines = _chain_part.count("\n") + 1
+                for _row in _ws4_rows:
+                    if "chain_rendered" in _row:
+                        _row["chain_cut"], _row["chain_rendered"] = True, False
+
         # #2858 Piece 1 — order by specificity (pattern length, descending)
         # before rendering/capping. Ties preserve check_command's original
         # (DB-query) order — sorted() is stable, so this is just the sort
@@ -1944,7 +2265,7 @@ def main() -> None:
                 # #3503: the failure line, when due, is part of the head (so it
                 # shares emit_context's target/budget accounting and sits above
                 # the bullets); unchanged TRIPWIRE_HEADER otherwise.
-                f"{loader_notice}\n{TRIPWIRE_HEADER}" if loader_notice else TRIPWIRE_HEADER,
+                f"{head_notice}\n{TRIPWIRE_HEADER}" if head_notice else TRIPWIRE_HEADER,
                 bullets,
                 dict(
                     budget=budgets["budget"],
@@ -1969,13 +2290,14 @@ def main() -> None:
             shown_hits = hits[: len(hits) - len(cut_hits)] if cut_hits else hits
             if not shown_hits and hits:
                 shown_hits = hits[:1]
-        elif loader_notice:
+        elif head_notice:
             # #3503: a loader failed and there are no hits, so the block would
             # otherwise be silent -- the line IS the block, still rendered by
-            # emit_context (trailer first, same budget rules).
+            # emit_context (trailer first, same budget rules). #3665: likewise for
+            # the owner-side line.
             budgets = get_harness_budgets(detect_harness())
             _block_call = (
-                loader_notice,
+                head_notice,
                 [],
                 dict(budget=budgets["budget"], target=TRIPWIRE_BLOCK_CHAR_CEILING),
             )
@@ -2171,6 +2493,13 @@ def main() -> None:
                     else:
                         _append_ws4_fire_ledger(_fallback_row)
 
+        # #3665: an owner failure at the chain site is only known now; add the notice before the
+        # recall is sized (so its room accounts for it). Fail-open like everything below.
+        try:
+            _late_owner_notice()
+        except Exception:
+            pass
+
         # alpha#1944 step 2 — shadow-block logging. Independently guarded,
         # same posture as in-turn recall below: a logging failure must never
         # suppress a tripwire hit, and a tripwire failure must never suppress
@@ -2225,6 +2554,11 @@ def main() -> None:
         except Exception:
             recall = ""
             _pending_shown.clear()
+        # #3665: and an owner failure at the recall site is only known after it ran.
+        try:
+            _late_owner_notice()
+        except Exception:
+            pass
         if recall:
             parts.append(recall)
 
@@ -2293,6 +2627,13 @@ def main() -> None:
             except Exception:
                 sys.exit(0)
             _mark_loader_notice_shown(loader_notice_now)
+        if owner_notice:
+            # #3665: the same ordering for the owner-side window (its own stamp).
+            try:
+                sys.stdout.flush()
+            except Exception:
+                sys.exit(0)
+            mark_probe_notice(ENGRAM_HOME, owner_notice_key)
         # #3670: the shown record is appended only once the response has been
         # written out AND flushed; a failed print/flush records nothing, so no
         # unseen id is ever recorded. A printed-but-oversized string (the

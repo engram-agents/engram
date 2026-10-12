@@ -101,6 +101,8 @@ def sandbox(tmp_path):
     for p in HOOKS_SRC.iterdir():
         if p.is_file() and p.suffix == ".py":
             shutil.copy2(p, hooks / p.name)
+    # the deployed layout ships the flag helper at the plugin root (#3665)
+    shutil.copy2(REPO_ROOT / "src" / "engram" / "engramd_owner_flags.py", tmp_path / "engramd_owner_flags.py")
     home = tmp_path / "home"
     eh = home / ".engram"
     eh.mkdir(parents=True)

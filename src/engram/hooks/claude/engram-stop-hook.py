@@ -201,6 +201,7 @@ _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import atomic_write_json, resolve_runtime_dir
+from _hooklib import import_owner_flags as _hooklib_import_owner_flags
 # #3628: the config reads are non-blocking and regular-file-only.
 from _hooklib import open_regular_text, connect_regular_ro
 
@@ -407,41 +408,9 @@ class _OwnerReadFailure(Exception):
 
 
 def _import_owner_flags():
-    """Lazy import of the plugin-root module engramd_owner_flags (#3663), resolved
-    like _import_engramd_client: the shared resolver, never a fixed parents[N]. An
-    explicit ENGRAM_RUNTIME_DIR that does not hold the module (it exists to redirect
-    the CLIENT import) is retried once without the override, so redirecting the
-    client can never make a flag that is ON read as OFF.
-
-    Each candidate dir (the explicit one first, then the resolved one) is tried in turn
-    and any `Exception` from a candidate is remembered, not raised, so a bad copy in one
-    candidate does not hide a good copy in the next. After the loop: if nothing failed,
-    or the last failure is a plain "module not found" for this module, raises
-    ImportError("... not found ..."); otherwise re-raises the LAST failure (its own
-    class, so the visible report names it). KNOWN LIMIT: a SystemExit from an
-    explicit-dir copy is not an Exception; it propagates at once and a good copy in
-    the resolved dir is not tried. The caller still reads OFF (its catch takes
-    SystemExit) and reports the class."""
-    from _hooklib import resolve_runtime_dir
-
-    explicit = os.environ.pop("ENGRAM_RUNTIME_DIR", None)
-    try:
-        resolved = resolve_runtime_dir(ENGRAM_HOME, "engramd_owner_flags.py")
-    finally:
-        if explicit is not None:
-            os.environ["ENGRAM_RUNTIME_DIR"] = explicit
-    last = None
-    for runtime_dir in ([explicit] if explicit else []) + [resolved]:
-        if runtime_dir not in sys.path:
-            sys.path.insert(0, runtime_dir)
-        try:
-            import engramd_owner_flags
-            return engramd_owner_flags
-        except Exception as exc:  # a bad copy in one candidate must not hide a good one in the next
-            last = exc
-    if last is None or (isinstance(last, ModuleNotFoundError) and last.name == "engramd_owner_flags"):
-        raise ImportError("engramd_owner_flags.py not found under the runtime dir")
-    raise last  # the class of the LAST failure, so the visible report names it
+    """Thin alias (#3665): the body lives once in `_hooklib.import_owner_flags`; the name
+    stays a module attribute because callers and tests patch it."""
+    return _hooklib_import_owner_flags(ENGRAM_HOME)
 
 
 # Whether the failed-flag-helper report is ALSO handed to the agent as

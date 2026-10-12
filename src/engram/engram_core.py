@@ -1576,7 +1576,7 @@ def _resolve_to_current(conn: sqlite3.Connection, node_id: str) -> "str | None":
     ).fetchone()
     if not row:
         return None
-    if row["is_current"] == 1:
+    if row[0] == 1:  # SELECT is_current
         return node_id
     return _current_successor(conn, node_id)
 
@@ -1691,7 +1691,7 @@ def generalization_chain(
     start_resolved = _resolve_to_current(conn, node_id)
 
     roots_raw: "list[str]" = []
-    if start_row["type"] in GENERALIZES_PRINCIPLE_TYPES:
+    if start_row[1] in GENERALIZES_PRINCIPLE_TYPES:  # SELECT id, type
         if start_resolved is not None:
             roots_raw = [start_resolved]
     else:
@@ -1700,7 +1700,7 @@ def generalization_chain(
                WHERE source_id = ? AND relation IN ('exemplifies', 'instantiates')""",
             (node_id,),
         ).fetchall()
-        roots_raw = [r["target_id"] for r in rows]
+        roots_raw = [r[0] for r in rows]  # SELECT target_id
 
     nodes: dict = {}
     heads: "list[str]" = []
@@ -1739,7 +1739,7 @@ def generalization_chain(
             # then fired on it -- a false positive on a graph with no cycle.
             resolved_any_parent = False
             for pe in parent_edges:
-                raw_parent = pe["source_id"]
+                raw_parent = pe[0]  # SELECT source_id
                 resolved_parent = _resolve_to_current(conn, raw_parent)
                 if resolved_parent is None:
                     continue
@@ -1845,7 +1845,7 @@ def generalization_chain(
         for _row in conn.execute(
             "SELECT id, recall_summary FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
             (json.dumps(list(nodes)),),
-        ):
+        ).fetchall():
             if _row[0] in nodes:
                 nodes[_row[0]]["recall_summary"] = _row[1]
     for _nid in nodes:
@@ -1855,7 +1855,7 @@ def generalization_chain(
         for _row in conn.execute(
             "SELECT id, claim FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
             (json.dumps(list(heads)),),
-        ):
+        ).fetchall():
             if _row[0] in nodes:
                 nodes[_row[0]]["claim"] = _row[1]
     for _hid in heads:
@@ -8832,7 +8832,7 @@ def _current_successor(conn, node_id: str) -> "str | None":
     ).fetchone()
     if not row:
         return None
-    nxt = row["superseded_by"]
+    nxt = row[0]  # SELECT superseded_by
     while nxt and nxt not in seen:
         seen.add(nxt)
         nrow = conn.execute(
@@ -8841,9 +8841,9 @@ def _current_successor(conn, node_id: str) -> "str | None":
         ).fetchone()
         if not nrow:
             return None
-        if nrow["is_current"] == 1:
+        if nrow[1] == 1:  # SELECT superseded_by, is_current
             return nxt
-        nxt = nrow["superseded_by"]
+        nxt = nrow[0]
     return None
 
 

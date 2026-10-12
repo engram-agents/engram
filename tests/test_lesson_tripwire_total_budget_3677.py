@@ -136,6 +136,8 @@ def flat(tmp_path_factory):
     new.mkdir()
     for p in HOOK_SRC_DIR.glob("*.py"):
         shutil.copy(p, new / p.name)
+    # the deployed layout ships the flag helper at the plugin root (#3665)
+    shutil.copy(PROJECT_ROOT / "src" / "engram" / "engramd_owner_flags.py", root / "engramd_owner_flags.py")
     dev = root / "dev"
     shutil.copytree(new, dev)
     try:

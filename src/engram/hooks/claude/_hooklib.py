@@ -166,6 +166,51 @@ def resolve_runtime_dir(engram_home: str, sentinel: str) -> str:
     return os.path.expanduser("~/engram-alpha")  # last-ditch, unchanged
 
 
+def import_owner_flags(engram_home: str):
+    """Lazy import of the plugin-root module engramd_owner_flags (#3663), resolved
+    like _import_engramd_client: the shared resolver, never a fixed parents[N]. An
+    explicit ENGRAM_RUNTIME_DIR that does not hold the module (it exists to redirect
+    the CLIENT import) is retried once without the override, so redirecting the
+    client can never make a flag that is ON read as OFF.
+
+    Hoisted once from the byte-similar copies in engram-stop-hook.py and
+    engram-user-identity-hook.py (#3665); each hook keeps a thin `_import_owner_flags`
+    alias that passes its own ENGRAM_HOME.
+
+    Each candidate dir (the explicit one first, then the resolved one) is tried in turn
+    and any `Exception` from a candidate is remembered, not raised, so a bad copy in one
+    candidate does not hide a good copy in the next. After the loop: if nothing failed,
+    or the last failure is a plain "module not found" for this module, raises
+    ImportError("... not found ..."); otherwise re-raises the LAST failure (its own
+    class, so the visible report names it). KNOWN LIMITS: (a) a SystemExit from an
+    explicit-dir copy is not an Exception; it propagates at once and a good copy in
+    the resolved dir is not tried (the caller still reads OFF -- its catch takes
+    SystemExit -- and reports the class); (b) a resolved dir already on sys.path
+    behind a bad explicit copy is not retried.
+
+    The ENGRAM_RUNTIME_DIR pop/restore and the sys.path insert are process-global
+    side effects and stay inside this one function: after a call, success or raise,
+    ENGRAM_RUNTIME_DIR is exactly what it was before."""
+    explicit = os.environ.pop("ENGRAM_RUNTIME_DIR", None)
+    try:
+        resolved = resolve_runtime_dir(engram_home, "engramd_owner_flags.py")
+    finally:
+        if explicit is not None:
+            os.environ["ENGRAM_RUNTIME_DIR"] = explicit
+    last = None
+    for runtime_dir in ([explicit] if explicit else []) + [resolved]:
+        if runtime_dir not in sys.path:
+            sys.path.insert(0, runtime_dir)
+        try:
+            import engramd_owner_flags
+            return engramd_owner_flags
+        except Exception as exc:  # a bad copy in one candidate must not hide a good one in the next
+            last = exc
+    if last is None or (isinstance(last, ModuleNotFoundError) and last.name == "engramd_owner_flags"):
+        raise ImportError("engramd_owner_flags.py not found under the runtime dir")
+    raise last  # the class of the LAST failure, so the visible report names it
+
+
 def resolve_own_server_py_path(engram_home: str) -> str:
     """Resolve the path to THIS agent's own MCP server.py.
 

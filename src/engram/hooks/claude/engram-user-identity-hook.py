@@ -45,6 +45,7 @@ _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import atomic_write_json, emit_context
+from _hooklib import import_owner_flags as _hooklib_import_owner_flags
 # #3628: the config / sticky-marker reads are non-blocking and regular-file-only.
 from _hooklib import open_regular_text
 from _harness import detect_harness, get_harness_budgets
@@ -101,31 +102,9 @@ def get_person_nodes() -> list[dict]:
 
 
 def _import_owner_flags():
-    """Lazy import of the plugin-root module engramd_owner_flags (#3663), resolved
-    like _import_engramd_client: the shared resolver, never a fixed parents[N]. An
-    explicit ENGRAM_RUNTIME_DIR that does not hold the module (it exists to redirect
-    the CLIENT import) is retried once without the override, so redirecting the
-    client can never make a flag that is ON read as OFF. Raises ImportError."""
-    from _hooklib import resolve_runtime_dir
-
-    explicit = os.environ.pop("ENGRAM_RUNTIME_DIR", None)
-    try:
-        resolved = resolve_runtime_dir(ENGRAM_HOME, "engramd_owner_flags.py")
-    finally:
-        if explicit is not None:
-            os.environ["ENGRAM_RUNTIME_DIR"] = explicit
-    last = None
-    for runtime_dir in ([explicit] if explicit else []) + [resolved]:
-        if runtime_dir not in sys.path:
-            sys.path.insert(0, runtime_dir)
-        try:
-            import engramd_owner_flags
-            return engramd_owner_flags
-        except Exception as exc:  # a bad copy in one candidate must not hide a good one in the next
-            last = exc
-    if last is None or (isinstance(last, ModuleNotFoundError) and last.name == "engramd_owner_flags"):
-        raise ImportError("engramd_owner_flags.py not found under the runtime dir")
-    raise last  # the class of the LAST failure, so the visible report names it
+    """Thin alias (#3665): the body lives once in `_hooklib.import_owner_flags`; the name
+    stays a module attribute because callers and tests patch it."""
+    return _hooklib_import_owner_flags(ENGRAM_HOME)
 
 
 # Room reserved in the bounded render for the failure report line (136 chars at most: the

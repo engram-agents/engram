@@ -282,6 +282,21 @@ def test_df_byte_cap_counts_utf8_bytes_not_characters(df_owner):
     assert isinstance(result, ec.Rejected) and result.reason == "df_term_too_long"
 
 
+@requires_linux_owner
+def test_df_lone_surrogate_term_is_ok_and_contributes_no_row(df_owner):
+    """The byte-cap check encodes with 'surrogatepass', so a lone-surrogate term
+    cannot raise inside validation (a plain utf-8 encode raises -> internal_error
+    plus a traceback). Alongside a real term: ok, the real row present, no row
+    for the surrogate. Alone: ok with []."""
+    oracle = _direct(df_owner.store_path, ["formula"])
+    assert oracle  # not vacuous
+    got = _as_dict(_df(df_owner, ["formula", "\ud800"]))
+    assert got == oracle
+    assert "\ud800" not in got
+    alone = _df(df_owner, ["\ud800"])
+    assert isinstance(alone, ec.Ok) and alone.result == []
+
+
 # --- nothing is prepared on a refused request (every refusal reason) ---------
 
 @pytest.mark.parametrize("params,reason", [(p.values[0], p.values[1]) for p in REASON_CASES])

@@ -478,6 +478,8 @@ _LINE_KEY = _re.compile(r":\d+$")
 # two lesson-tripwire-hook keys when their SQL gained the json_valid guard: a
 # SQL change legitimately moves its own key; a re-key must still move none.)
 # #3551 added a new template (the focused-ids read in _hooklib._focused_ids): its own key.
+# #3665: extract_keywords batches its df lookup (new key 9d938f92...), so the per-token
+# idf template (cbfeed19...) is no longer reachable from any hook root and is gone.
 _FROZEN_TEMPLATE_KEYS = frozenset({
     "087e3f5506c5f2ef7d6de772c9085141f77fd026db29b1f55e39bcc16323eeeb",
     "0280b9b584a3522d55be45f09ec258c28ec2d8b8e0e3cf80267097f593c71462",
@@ -497,7 +499,7 @@ _FROZEN_TEMPLATE_KEYS = frozenset({
     "a81aff5ee1cfc444b6044abc808bcd8573b6e94d771e505c5119ca6678b91046",
     "b1f125b644a0e5d0a8d1e81628d17e7b876b5dbce632cfbb7a4ba48732623765",
     "c7ebb686c91c35f89f5bff3b5f1e3b9a746e2568d35a35899fc868a0d8d99223",
-    "cbfeed1901ba8473aa2edd65b9a0f92931b0ae1d537e2b0d6ed3ee7b6f5c70c6",
+    "9d938f92196ce5c30108d90b0c926ae6f8d10b89e963219bcf12415dce414a39",
     "cefc616a2876d56a7b84ead98f75fa894f5a3678510f4d5c5bbac0b78061feb8",
     "d8ae87a01e31523ab8daab4fc634e227cfdb00339c30995e50a0fe82f6b67be8",
     "755fd8686d5feac4204716df355f3c6656f9505332e06102735d02ab15135c23",

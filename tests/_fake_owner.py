@@ -3,13 +3,21 @@
 The real owner refuses to start off Linux (Darwin arm is #3666), so a differential
 harness written only against it cannot be shown to FAIL on a Mac. This stub speaks the
 client's wire (`{"contract_version","method","params","request_id"}` newline-framed JSON
-over an AF_UNIX stream socket) for exactly two methods:
+over an AF_UNIX stream socket) for exactly three methods:
 
   * `ping`  -> ok
+  * `df`    -> the IDF batch statement over `{"terms": [...]}`: a faithful stand-in of the
+               real owner's typed `df` op (same validation order, same reason strings, the
+               byte-exact statement on a read-only connection; a store without the vocab
+               table -> `vocab_table_absent`). tests/test_engramd_client_df_shim_3665.py
+               compares it to a REAL owner reason-by-reason, so it cannot drift silently.
   * `read`  -> the statement must equal, byte for byte, an entry of the committed
                `src/engram/engramd_read_templates.json` (else `unregistered_template`,
                the real owner's reason), and is executed against a read-only connection
-               to `<home>/knowledge.db`; rows go back as JSON lists in SQLite order.
+               to `<home>/knowledge.db`; rows go back as JSON lists in SQLite order. The IDF
+               batch statement is refused here with `unregistered_template` (the real
+               owner's answer: the committed registry still lists it, the owner drops it at
+               load); it travels only as `df`.
 
 It is a stand-in for the transport and the registry gate, NOT a re-implementation of the
 owner (no authorizer, no deadline, no size cap). Live-owner cells stay the Linux seat's.
@@ -17,16 +25,66 @@ owner (no authorizer, no deadline, no size cap). Live-owner cells stay the Linux
 from __future__ import annotations
 
 import json
+import re
 import socket
 import sqlite3
 import threading
 from pathlib import Path
+
+# Literal copies on purpose (the fake is an independent stand-in; the pin cells in
+# test_engramd_client_df_shim_3665.py assert each equals the production constant).
+IDF_BATCH_SQL = "SELECT term, doc FROM nodes_fts_vocab WHERE term IN (SELECT value FROM json_each(?))"
+DF_TERMS_MAX = 1000
+DF_TERM_MAX_BYTES = 256
+_DF_VOCAB_DDL_SQL = "SELECT sql FROM sqlite_master WHERE name = 'nodes_fts_vocab'"
+_DF_VOCAB_VARIANT_RE = re.compile(
+    r"""USING\s+fts5vocab\s*\(\s*(?:"[^"]*"|'[^']*'|\[[^\]]*\]|`[^`]*`|[\w$]+)\s*,\s*["'\[`]?\s*(\w+)\s*["'\]`]?\s*\)""",
+    re.IGNORECASE,
+)
+_DF_SQL_COMMENT_RE = re.compile(r"/\*.*?(?:\*/|\Z)|--[^\n]*", re.DOTALL)
 
 _TEMPLATES = Path(__file__).resolve().parent.parent / "src" / "engram" / "engramd_read_templates.json"
 
 
 def registered_sql() -> set:
     return {t["sql"] for t in json.loads(_TEMPLATES.read_text())["templates"]}
+
+
+def statement_of(method, params):
+    """The (sql, args) a request stands for: `df` is the IDF batch statement bound to the
+    JSON-encoded term list; `read` is its own sql/args; anything else is (None, None)."""
+    params = params or {}
+    if method == "df":
+        return IDF_BATCH_SQL, [json.dumps(params.get("terms"))]
+    if method == "read":
+        return params.get("sql"), params.get("args")
+    return None, None
+
+
+def _rej(reason, detail, remedy="n/a"):
+    return {"status": "rejected", "reason": reason, "detail": detail, "remedy": remedy}
+
+
+def df_refusal(params):
+    """None when valid, else the rejection -- the real owner's order: shape, list, empty,
+    too many, then per element in index order not-str, empty, too long (UTF-8 bytes)."""
+    if not isinstance(params, dict) or set(params) != {"terms"}:
+        return _rej("df_params_shape", "df params must be a dict with exactly the key 'terms'")
+    terms = params["terms"]
+    if not isinstance(terms, list):
+        return _rej("df_terms_not_list", "'terms' must be a list")
+    if not terms:
+        return _rej("df_terms_empty", "'terms' is an empty list")
+    if len(terms) > DF_TERMS_MAX:
+        return _rej("df_terms_too_many", f"'terms' has {len(terms)} entries")
+    for i, term in enumerate(terms):
+        if not isinstance(term, str):
+            return _rej("df_term_not_str", f"terms[{i}] is not a string")
+        if term == "":
+            return _rej("df_term_empty", f"terms[{i}] is the empty string")
+        if len(term.encode("utf-8", "surrogatepass")) > DF_TERM_MAX_BYTES:
+            return _rej("df_term_too_long", f"terms[{i}] exceeds {DF_TERM_MAX_BYTES} UTF-8 bytes")
+    return None
 
 
 class FakeOwner:
@@ -91,15 +149,43 @@ class FakeOwner:
         finally:
             conn.close()
 
+    def _answer_df(self, params) -> dict:
+        refusal = df_refusal(params)
+        if refusal is not None:
+            return refusal
+        db = self.home / "knowledge.db"
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            ddl = conn.execute(_DF_VOCAB_DDL_SQL).fetchall()
+            if not ddl:
+                return _rej("vocab_table_absent", "nodes_fts_vocab is not in this store's sqlite_master")
+            match = _DF_VOCAB_VARIANT_RE.search(_DF_SQL_COMMENT_RE.sub(" ", ddl[0][0] or ""))
+            if match is None or match.group(1).lower() != "row":
+                return _rej("unsupported_vocab_variant", "nodes_fts_vocab is not an fts5vocab(..., 'row') table")
+            rows = [list(r) for r in conn.execute(IDF_BATCH_SQL, (json.dumps(params["terms"]),))]
+        finally:
+            conn.close()
+        return {"status": "ok", "result": rows}
+
     def _answer(self, request: dict) -> dict:
         method = request.get("method")
         if method == "ping":
             return {"status": "ok", "result": "pong"}
+        if method == "df":
+            return self._answer_df(request.get("params"))
         if method != "read":
             return {"status": "rejected", "reason": "unknown_operation",
-                    "detail": f"fake owner serves ping/read only, got {method!r}", "remedy": "n/a"}
+                    "detail": f"fake owner serves ping/read/df only, got {method!r}", "remedy": "n/a"}
         params = request.get("params") or {}
         sql = params.get("sql")
+        if sql == IDF_BATCH_SQL:
+            # The real owner drops a template over a virtual table (FTS5 vocab) at load
+            # (logged as virtual_table_template) although the committed JSON still lists the
+            # statement, so the lookup at request time answers `unregistered_template`
+            # (measured on the real owner); the IDF batch travels only as the typed `df` op.
+            return {"status": "rejected", "reason": "unregistered_template",
+                    "detail": "the statement is not in the committed read-template list",
+                    "remedy": "use the typed df operation"}
         if sql not in self._registered:
             return {"status": "rejected", "reason": "unregistered_template",
                     "detail": "the statement is not in the committed read-template list",
