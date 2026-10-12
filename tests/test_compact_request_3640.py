@@ -33,6 +33,9 @@ Contract pinned (one cell or more each):
   P9  the hook file is found in both the deployed (hooks/) and the source
       (hooks/claude/) layouts
   P10 tools/compact-request.py is a working entry point (symlink, CLI exit codes)
+  P11 --clear: removes every pending file, exit 0; exit 4 when a removal fails, and only a failed
+      removal of request.json leaves the request live; --session is ignored, and every run removes
+      any older request whatever its session
 """
 from __future__ import annotations
 
@@ -585,3 +588,63 @@ def test_p11_clear_cli_exit_code(tmp_path):
     out = subprocess.run([sys.executable, str(LINK_PATH), "--clear"], capture_output=True, text=True, env=env, timeout=60)
     assert out.returncode == 0, out.stderr
     assert list(d.iterdir()) == []
+
+
+def _unlink_failing_for(monkeypatch, name: str) -> None:
+    real_unlink = Path.unlink
+
+    def fake_unlink(self, *args, **kwargs):
+        if self.name == name:
+            raise PermissionError(13, "Permission denied")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fake_unlink)
+
+
+def test_p11_clear_exit_4_when_the_old_request_cannot_be_removed(tool, monkeypatch, tmp_path, capsys):
+    home = _make_home(tmp_path)
+    d = _seed_compact_dir(home)
+    monkeypatch.setenv("ENGRAM_HOME", str(home))
+    _unlink_failing_for(monkeypatch, "request.json")
+    assert tool.main(["--clear"]) == 4
+    assert "cannot remove the old request" in capsys.readouterr().err
+    assert (d / "request.json").exists()
+
+
+def test_p11_clear_exit_4_when_a_later_file_cannot_be_removed(tool, monkeypatch, tmp_path, capsys):
+    home = _make_home(tmp_path)
+    d = _seed_compact_dir(home)
+    monkeypatch.setenv("ENGRAM_HOME", str(home))
+    _unlink_failing_for(monkeypatch, "context.md")
+    assert tool.main(["--clear"]) == 4
+    err = capsys.readouterr().err
+    assert "context.md" in err
+    assert "the old request" not in err
+    assert not (d / "request.json").exists()
+
+
+def test_p11_clear_ignores_session(tool, monkeypatch, tmp_path):
+    home = _make_home(tmp_path)
+    d = _seed_compact_dir(home)
+    (d / "request.json").write_text(json.dumps({"session_id": "sess-A"}), encoding="utf-8")
+    monkeypatch.setenv("ENGRAM_HOME", str(home))
+    assert tool.main(["--clear", "--session", "sess-B"]) == 0
+    assert not (d / "request.json").exists()
+
+
+def test_p11_any_run_removes_another_sessions_request(tool, monkeypatch, tmp_path):
+    home = _make_home(tmp_path, anchors=0)  # the rider fails, so the run is refused
+    d = _seed_compact_dir(home)
+    (d / "request.json").write_text(json.dumps({"session_id": "sess-A"}), encoding="utf-8")
+    assert _run(tool, monkeypatch, home, session="sess-B") == 3
+    assert not (d / "request.json").exists()
+
+
+def test_p11_any_run_exit_4_when_the_old_request_cannot_be_removed(tool, monkeypatch, tmp_path, capsys):
+    # the first removal runs on EVERY invocation, not only --clear: a normal run fails the same way
+    home = _make_home(tmp_path)
+    d = _seed_compact_dir(home)
+    _unlink_failing_for(monkeypatch, "request.json")
+    assert _run(tool, monkeypatch, home) == 4
+    assert "cannot remove the old request" in capsys.readouterr().err
+    assert (d / "request.json").read_text(encoding="utf-8") == "x"  # the old request, untouched

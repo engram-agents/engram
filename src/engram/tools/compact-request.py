@@ -13,7 +13,7 @@ files under ``$ENGRAM_HOME/compact/``:
                      acts on. A kill before that rename leaves no request.
 
 Usage:
-    compact-request.py --clear [--session <id>]     (a declined nap: remove any pending request, exit 0)
+    compact-request.py --clear [--session <id>]     (a declined nap: remove any pending request; exit 0, or 4 if a file could not be removed; --session is ignored)
     compact-request.py --session <id> --backup-ok true|false
                        [--checkpoint-at <ISO>] [--wake-armed-at HH:MMZ] [--wake-for HH:MMZ]
 
@@ -21,7 +21,9 @@ Refusals (exit 3, one stderr line naming the check, nothing written):
     * --backup-ok false (the checkpoint's backup verdict)
     * the warm briefing fails any of: exactly one ``^## From this session`` anchor,
       a non-empty arc below it, a file mtime at or after the last checkpoint
-Exit codes: 0 written, 2 usage, 3 refused, 4 could not assemble or write (nothing written).
+Exit codes: 0 written (or cleared, with --clear), 2 usage, 3 refused, 4 could not remove a file
+(any run: the old request; with --clear: also inflight/context.md/context.sha256; stderr names it) or
+could not assemble or write (nothing written).
 
 Any older request.json is removed first, whatever the outcome, so a stale
 request can never fire beside a newer (or refused) one. The context never

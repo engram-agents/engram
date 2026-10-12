@@ -20,7 +20,8 @@ compaction carries the assembled context (focus list, history arc, warm-briefing
 - The no-`loop-wake` guarantee covers OUR message only (the tool scrubs the context it writes). Under BESIDE the
   engine's own messages are passed through exactly as the engine made them; this mod never edits the engine's summary.
 - A request that was written but not consumed (its turn was aborted, or the mod was off) stays live for up to 30 minutes in the
-  same session. A declined ask-first step runs `compact-request.py --clear`, which removes it; only a nap that never reaches Step 9 leaves it live.
+  same session. A declined ask-first step runs `compact-request.py --clear`, which removes it when it exits 0 (exit 4 names the file it could not remove); only a nap that never reaches Step 9 leaves it live.
+- There is one request per `ENGRAM_HOME`. Every run of `compact-request.py` removes any older `request.json` first, whatever `--session` says, and `--clear` ignores `--session`. With a shared `ENGRAM_HOME`, one seat's run can remove another seat's pending request. Harmless: the next nap writes it again.
 - Consume-once rests on parse-failure-as-absent plus the write-before-compact ordering, NOT on write atomicity
   (`$.fs.write` gives none): the tombstone is a full overwrite, and no prefix of it is valid JSON.
 
