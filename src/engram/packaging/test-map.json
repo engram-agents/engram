@@ -521,6 +521,13 @@
       "note": "engram-alpha#3095. test_write_op_census.py loads the module via importlib.util.spec_from_file_location (not a static `import`), same reasoning as tools/reconcile_lesson_demotions.py's own mapping -- invisible to the layer-1 AST import graph despite having a valid module name, so it needs this layer-2 mapping."
     },
     {
+      "path_prefix_or_glob": "tools/compact-request.py",
+      "test_globs": [
+        "tests/test_compact_request_3640.py"
+      ],
+      "note": "Request half of agent-decided compaction (#3640): rider, atomic write order, size cap, no wake token, hook lookup in both layouts."
+    },
+    {
       "path_prefix_or_glob": "tools/worktree-gc.py",
       "test_globs": [
         "tests/test_worktree_gc.py"

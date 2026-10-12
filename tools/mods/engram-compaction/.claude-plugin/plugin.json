@@ -1,0 +1,16 @@
+{
+  "name": "engram-compaction",
+  "version": "0.1.0",
+  "author": {
+    "name": "ENGRAM project"
+  },
+  "description": "Agent-decided compaction at the nap boundary (part of #3640). The nap leaves a request under $ENGRAM_HOME/compact/; at the end of the next answered turn this mod consumes it once and compacts, carrying the context the nap assembled. Default off.",
+  "userConfig": {
+    "enabled": {
+      "type": "boolean",
+      "title": "Enabled",
+      "description": "Master switch. false registers nothing: no request is consumed and no compaction is started or answered.",
+      "default": false
+    }
+  }
+}

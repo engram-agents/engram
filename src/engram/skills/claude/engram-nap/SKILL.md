@@ -280,6 +280,19 @@ Report briefly to the user:
 
 If the nap fired because a compaction warning is active, explicitly say: "Ready to compact — the context burst is preserved in ENGRAM."
 
+## Step 9 — Request compaction
+
+Last, after Step 5b and the focus rotation (Step 7): the context the tool assembles carries the focus list and the warm-briefing arc, so both must be final. This step only leaves a request; the `engram-compaction` mod, if the person switched it on, acts on it when the turn that runs this step is answered, so end the turn normally and do not tell the person it will compact "next turn". With the mod off the request is never read (the files stay on disk; an unconsumed request ages out after 30 minutes).
+
+- **A loop marker exists** (`~/.engram/loop-mode.json`): run the tool, no question.
+- **No loop marker:** ask first, once — "Compact now? The nap just persisted everything." — and run the tool only on yes. On a no, run `python tools/compact-request.py --clear`, so a decline always means no compaction.
+
+```bash
+python tools/compact-request.py --session <your session id> --backup-ok <true|false>
+```
+
+`--backup-ok` is the Step 3 verdict (`true` only on `✓ backup ok`). Under a loop marker you may add `--wake-armed-at HH:MMZ --wake-for HH:MMZ` (the armed ScheduleWakeup's times) so the post-compaction context names them. The tool refuses (exit 3) when the backup failed or the warm briefing is not in order (one anchor, a non-empty arc, written since the checkpoint), and says which check on stderr; say so once and move on. Exit 4 means nothing was written; say that too. Never retry in a loop.
+
 ---
 
 ## Why naps don't advance the turn counter
