@@ -152,17 +152,202 @@ def test_the_unattributed_remainder_is_reported_not_hidden(plain):
     assert row["p50_ms"] >= 0
 
 
+# Accounting is judged on the BEST of up to this many independent profiles
+# (#3721, Borges's design-seat ruling). Unattributed time from a real regression
+# is persistent and shows in every profile; contention from a long suite run is
+# transient and inflates one. A single profile missed the 10% bound once in a
+# 1h36m nightly (rest/e2e 0.116) and never in 30 standalone profiles (quiet
+# worst 0.076), so the bound stays and the sample changes.
+ACCOUNTING_PROFILES = 3
+
+
+def _accounted(profile):
+    """True when this profile's unattributed p50 is within the bound."""
+    e2e = profile["end_to_end"]["p50_ms"]
+    rest = profile["unattributed"]["p50_ms"]
+    return rest <= max(0.05, 0.10 * e2e)
+
+
+def _stages_account(profiles):
+    """Best of the given profiles: the stages account for the call if ANY one
+    profile is within the bound. Returns (ok, [(rest, e2e), ...])."""
+    seen = [(p["unattributed"]["p50_ms"], p["end_to_end"]["p50_ms"]) for p in profiles]
+    return any(_accounted(p) for p in profiles), seen
+
+
+def _best_of(first, take_next, cap=ACCOUNTING_PROFILES):
+    """Profiles to judge: `first`, then further ones from `take_next()` only
+    while none so far is within the bound, at most `cap` in all. Stopping at
+    the first pass gives the same verdict as taking all `cap`."""
+    profiles = [first]
+    while not _stages_account(profiles)[0] and len(profiles) < cap:
+        profiles.append(take_next())
+    return profiles
+
+
+def _synthetic(rest, e2e):
+    return {"unattributed": {"p50_ms": rest}, "end_to_end": {"p50_ms": e2e}}
+
+
+# The decision rule, pinned without a live owner (cells written before the
+# rule; Borges's ruling on #3721). e2e = 1.0 ms, so the bound is 0.10 ms.
+
+def test_accounting_passes_on_three_quiet_profiles():
+    """Cell 1, today's behaviour. Mutation: require every profile to be
+    over the bound, or invert the comparison -> red."""
+    ok, _ = _stages_account([_synthetic(0.07, 1.0)] * 3)
+    assert ok
+
+
+def test_accounting_passes_when_one_profile_is_inflated():
+    """Cell 2, the nightly shape: one transient spike at ratio 0.15 beside two
+    quiet profiles. Mutation: judge on the worst profile (all() instead of
+    any()), or on a single profile that happens to be the inflated one -> red."""
+    ok, _ = _stages_account([_synthetic(0.15, 1.0), _synthetic(0.07, 1.0), _synthetic(0.07, 1.0)])
+    assert ok
+
+
+def test_accounting_fails_on_persistent_unattributed_time():
+    """Cell 3, the discriminating one: a stage that stopped being timed leaks
+    into the remainder in EVERY profile. Mutation: widen the bound to 0.20, or
+    pass unconditionally -> red, while cells 1 and 2 stay green."""
+    ok, seen = _stages_account([_synthetic(0.15, 1.0), _synthetic(0.16, 1.0), _synthetic(0.15, 1.0)])
+    assert not ok, seen
+
+
+def test_accounting_passes_on_a_negative_remainder():
+    """Cell 4: under load the stage sum can exceed end-to-end (Sol measured a
+    negative remainder on #3721); that is not unattributed time. Mutation:
+    compare the absolute remainder -> red."""
+    ok, _ = _stages_account([_synthetic(-0.2, 1.0)] * 3)
+    assert ok
+
+
+# The retry that removes the transient miss, pinned with a fake producer (the
+# reviewer-fairy's round-1 finding: the decision cells above stayed green with
+# the retry removed).
+
+def _producer(*profiles):
+    draws = iter(profiles)
+    calls = []
+
+    def take_next():
+        calls.append(1)
+        return next(draws)
+    return take_next, calls
+
+
+def test_best_of_retries_past_an_inflated_first_profile():
+    """The nightly shape end to end: the first profile is inflated, the
+    second is quiet -> judged pass after exactly one more draw. Mutation:
+    never retry (judge the first profile alone) -> red."""
+    take_next, calls = _producer(_synthetic(0.07, 1.0), _synthetic(0.07, 1.0))
+    profiles = _best_of(_synthetic(0.15, 1.0), take_next)
+    assert _stages_account(profiles)[0]
+    assert len(calls) == 1
+
+
+def test_best_of_takes_no_extra_profile_when_the_first_passes():
+    """A quiet run costs one profile, as before #3721. Mutation: always take
+    `cap` profiles -> red."""
+    take_next, calls = _producer(_synthetic(0.07, 1.0), _synthetic(0.07, 1.0))
+    _best_of(_synthetic(0.07, 1.0), take_next)
+    assert calls == []
+
+
+def test_best_of_stops_at_the_cap_when_none_passes():
+    """Persistent unattributed time: exactly cap - 1 extra draws, then fail.
+    Mutation: cap off by one either way -> red."""
+    take_next, calls = _producer(*[_synthetic(0.15, 1.0)] * 5)
+    profiles = _best_of(_synthetic(0.15, 1.0), take_next)
+    # Literals, not the constant compared to itself: the ruling is three
+    # (Sol's colleague pass, M-c: ACCOUNTING_PROFILES = 2 stayed green).
+    assert len(calls) == 2
+    assert len(profiles) == 3
+    assert not _stages_account(profiles)[0]
+
+
+# The bound's own parameters, pinned at its edge (Sol's colleague pass: no cell
+# sat at the bound, so `<` for `<=`, a 0.11 factor and a 0.0 floor all stayed
+# green).
+
+def test_accounting_bound_is_inclusive_at_ten_percent():
+    """e2e 1.0 ms: rest 0.10 passes, rest 0.1001 fails. Mutation: `<` for
+    `<=` -> the first red; factor 0.11 or 0.20 -> the second red."""
+    assert _stages_account([_synthetic(0.10, 1.0)])[0]
+    assert not _stages_account([_synthetic(0.1001, 1.0)])[0]
+
+
+def test_accounting_floor_is_point_zero_five_ms_on_a_fast_call():
+    """e2e 0.2 ms, where 10% is 0.02 ms, so the 0.05 ms floor decides: rest
+    0.04 passes, rest 0.06 fails. Mutation: floor 0.0 -> the first red;
+    floor 0.10 -> the second red."""
+    assert _stages_account([_synthetic(0.04, 0.2)])[0]
+    assert not _stages_account([_synthetic(0.06, 0.2)])[0]
+
+
+def _live_accounting(tool, store, plain):
+    """The live test's body: `plain` first, then FRESH profiles drawn from the
+    real profiler on the same store. Kept apart from the test so a fake `tool`
+    can pin what the retry draws (Sol's blocker, M-d: a retry that re-judges
+    `plain` instead of drawing a new profile left all 52 green)."""
+    return _best_of(plain, lambda: tool.profile(n=60, home=store, warmup=10))
+
+
+class _FakeTool:
+    def __init__(self, *profiles):
+        self._draws = iter(profiles)
+        self.calls = []
+
+    def profile(self, **kwargs):
+        self.calls.append(kwargs)
+        return next(self._draws)
+
+
+def test_live_retry_judges_a_fresh_profile_not_plain_again():
+    """Inflated `plain`, quiet fresh draw -> pass, and the judged profiles
+    include the fresh one. Mutation: the retry returns `plain` again ->
+    red. Also pins the retry's sample: n=60, warmup 10, same store."""
+    store = object()
+    fresh = _synthetic(0.07, 1.0)
+    tool = _FakeTool(fresh, _synthetic(0.07, 1.0))
+    plain = _synthetic(0.15, 1.0)
+    profiles = _live_accounting(tool, store, plain)
+    assert profiles == [plain, fresh]
+    assert profiles[1] is fresh
+    assert _stages_account(profiles)[0]
+    assert tool.calls == [{"n": 60, "home": store, "warmup": 10}]
+
+
+def test_live_retry_fails_with_every_drawn_pair_reported():
+    """Inflated `plain` and inflated draws -> fail, and the message carries
+    the fake's own pairs, so a failure shows what was actually judged."""
+    tool = _FakeTool(_synthetic(0.16, 1.0), _synthetic(0.17, 1.0), _synthetic(0.07, 1.0))
+    profiles = _live_accounting(tool, object(), _synthetic(0.15, 1.0))
+    ok, seen = _stages_account(profiles)
+    assert not ok
+    assert seen == [(0.15, 1.0), (0.16, 1.0), (0.17, 1.0)]
+    assert len(tool.calls) == 2
+
+
 @requires_linux_owner
-def test_stages_account_for_the_end_to_end_call(plain):
+def test_stages_account_for_the_end_to_end_call(tool, store, plain):
     """The stages tile the independently timed end-to-end call: what they do
     not cover is small. Mutation: stop timing the owner's store read (or any
     other stage of real size), so its time leaks into the remainder -> red on
     a store large enough for that read to matter; on any store, compute
     end-to-end as the stage sum instead of timing it -> red via the
-    injected-remainder test below."""
-    e2e = plain["end_to_end"]["p50_ms"]
-    rest = plain["unattributed"]["p50_ms"]
-    assert rest <= max(0.05, 0.10 * e2e), (rest, e2e)
+    injected-remainder test below.
+
+    Best of up to ACCOUNTING_PROFILES profiles (#3721): further profiles are
+    taken only while none so far is within the bound, so a quiet run costs one
+    profile as before. Stopping at the first pass gives the same verdict as
+    taking all of them. What the retry draws is pinned by the fake-tool cells
+    above; the retry's sample size is pinned there too, but only as the
+    arguments passed, not as a measured adequacy."""
+    profiles = _live_accounting(tool, store, plain)
+    ok, seen = _stages_account(profiles)
+    assert ok, seen
 
 
 @requires_linux_owner
