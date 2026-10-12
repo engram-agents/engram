@@ -95,7 +95,7 @@ def _stub_idf(terms_by_call: list[list[str]]):
     """
     calls = {"n": 0}
 
-    def extract_keywords(conn, text, min_idf=4.0, top_k=5, stopwords=None):
+    def extract_keywords(conn, text, min_idf=4.0, top_k=5, stopwords=None, n_docs=None):
         i = min(calls["n"], len(terms_by_call) - 1)
         calls["n"] += 1
         return [(t, 7.5) for t in terms_by_call[i]]
@@ -161,7 +161,7 @@ def _stub_idf_capture(terms):
     it was called with, into the returned dict (key 'min_idf')."""
     captured = {}
 
-    def extract_keywords(conn, text, min_idf=4.0, top_k=5, stopwords=None):
+    def extract_keywords(conn, text, min_idf=4.0, top_k=5, stopwords=None, n_docs=None):
         captured["min_idf"] = min_idf
         captured["stopwords"] = stopwords
         return [(t, 7.5) for t in terms]
@@ -596,7 +596,7 @@ def test_zero_docs_is_silent_no_daemon_call(tmp_path, monkeypatch):
     _enable(hook, str(tmp_path))
     _seed_node_count(hook.DB_PATH, 0)
 
-    def failing_extract_keywords(conn, text, min_idf=4.0, top_k=5):
+    def failing_extract_keywords(conn, text, min_idf=4.0, top_k=5, stopwords=None, n_docs=None):
         raise AssertionError("extract_keywords must not be called when n_docs == 0")
 
     fake = types.ModuleType("engram_idf")

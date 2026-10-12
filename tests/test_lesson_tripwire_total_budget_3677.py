@@ -81,7 +81,7 @@ conn.execute("INSERT OR REPLACE INTO nodes VALUES ('seed_1','observation','s',1,
 conn.commit(); conn.close()
 fake = types.ModuleType("engram_idf")
 terms = list(scen["terms"])
-fake.extract_keywords = lambda conn, text, min_idf=4.0, top_k=5, stopwords=None: [(t, 7.5) for t in terms]
+fake.extract_keywords = lambda conn, text, min_idf=4.0, top_k=5, stopwords=None, n_docs=None: [(t, 7.5) for t in terms]
 fake.STOPWORDS = frozenset()
 fake.JUNK_STOPLIST = frozenset()
 sys.modules["engram_idf"] = fake

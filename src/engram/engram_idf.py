@@ -234,6 +234,7 @@ def extract_keywords(
     min_idf: float = 4.0,
     top_k: int = 10,
     stopwords: frozenset[str] | None = None,
+    n_docs: int | None = None,
 ) -> list[tuple[str, float]]:
     """Extract the top-K high-IDF keywords from *text*.
 
@@ -245,18 +246,27 @@ def extract_keywords(
       4. Keep only tokens with ``idf >= min_idf``.
       5. Return the top *top_k* tokens sorted by IDF descending.
 
-    To avoid repeated ``COUNT(*)`` queries, n_docs is resolved once at the top
-    of the function and passed to :func:`idf` for every token.
+    *n_docs* is the count of current nodes used for IDF normalisation.  When
+    omitted (``None``) it is resolved with ONE ``COUNT(*)`` at the top of the
+    function.  A caller that already holds the count passes it (#3740) and no
+    COUNT statement is executed here.  It must be an int >= 0 (``bool`` is
+    refused); anything else raises :class:`ValueError` -- a caller bug is loud,
+    never silently recounted.  ``n_docs=0`` returns ``[]``.
 
     Returns a list of ``(token, idf_score)`` pairs.
     """
     if stopwords is None:
         stopwords = STOPWORDS
 
-    row = conn.execute(
-        "SELECT COUNT(*) FROM nodes WHERE is_current = 1"
-    ).fetchone()
-    n_docs = row[0] if row else 0
+    if n_docs is None:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE is_current = 1"
+        ).fetchone()
+        n_docs = row[0] if row else 0
+    elif isinstance(n_docs, bool) or not isinstance(n_docs, int) or n_docs < 0:
+        raise ValueError(
+            f"n_docs must be a non-negative int or None, got {n_docs!r}"
+        )
 
     if n_docs == 0:
         return []

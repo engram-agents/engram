@@ -112,7 +112,7 @@ _STUB_MODULES = {
         "    return []\n"
     ),
     "engram_idf.py": (
-        "def extract_keywords(conn, text, min_idf=None, top_k=5):\n"
+        "def extract_keywords(conn, text, min_idf=None, top_k=5, stopwords=None, n_docs=None):\n"
         "    return []\n"
     ),
 }

@@ -591,6 +591,94 @@ def test_s6_control_flag_off_with_the_file_missing_is_the_empty_result(site, cmd
     assert not missing.exists()
 
 
+# (f) #3740 Cut B -- ONE current-node COUNT per fire, on both paths
+# =========================================================================================
+
+@pytest.mark.parametrize("owner_kind", OWNER_KINDS)
+def test_f_flag_on_a_full_fire_sends_exactly_one_count_to_the_owner(owner_kind, home, monkeypatch):
+    """#3740 Cut B: check_in_turn_recall counts current nodes and passes the count to
+    extract_keywords, so a full flag-ON fire sends the COUNT statement exactly once.
+    Mutation: the hook stops passing n_docs -> two COUNT requests -> red."""
+    make_store(home)
+    set_config(home, flag=True)
+    mod = load_hook(home, monkeypatch)
+    with owner_of(owner_kind, home):
+        seen = spying_read(monkeypatch)
+        run = run_main(mod)
+    assert run.exc == "SystemExit(0)", run.exc
+    assert "[ENGRAM in-turn recall" in run.ctx, "vacuous: the recall site did not run"
+    sqls = [s for s, _ in seen]
+    assert VOCAB_SQL in sqls
+    assert sqls.count(COUNT_SQL) == 1, sqls.count(COUNT_SQL)
+
+
+def test_f_flag_off_a_full_fire_executes_the_count_exactly_once(home, monkeypatch):
+    """#3740 Cut B, direct path: the COUNT runs once on the hook's own connection.
+    Mutation: the hook stops passing n_docs -> two COUNT executions -> red."""
+    make_store(home)
+    set_config(home, flag=None)
+    mod = load_hook(home, monkeypatch)
+    statements = []
+    real = mod.connect_regular_ro
+
+    def traced(*a, **k):
+        c = real(*a, **k)
+        c.set_trace_callback(statements.append)
+        return c
+    monkeypatch.setattr(mod, "connect_regular_ro", traced)
+    run = run_main(mod)
+    assert run.exc == "SystemExit(0)", run.exc
+    assert "[ENGRAM in-turn recall" in run.ctx, "vacuous: the recall site did not run"
+    assert any("json_each" in s for s in statements), "vacuous: the IDF batch never ran"
+    assert statements.count(COUNT_SQL) == 1, statements.count(COUNT_SQL)
+
+
+EXPLICIT_MIN_IDF = {"auto_surface": {"in_turn_recall": {"min_idf": 0.1}}}
+
+
+@pytest.mark.parametrize("owner_kind", OWNER_KINDS)
+def test_f_explicit_min_idf_flag_on_a_full_fire_sends_exactly_one_count(owner_kind, home, monkeypatch):
+    """#3740 Cut B: with an explicit in-turn-recall `min_idf` in config the hook has no count of
+    its own and passes n_docs=None, so the single COUNT happens inside extract_keywords: still
+    exactly one COUNT request per fire, and the recall block is still emitted.
+    Mutations: the hook passes n_docs=0 -> no recall (red); the hook also counts itself -> two
+    COUNTs (red)."""
+    make_store(home)
+    set_config(home, flag=True, extra=EXPLICIT_MIN_IDF)
+    mod = load_hook(home, monkeypatch)
+    assert mod._in_turn_config()["min_idf"] == 0.1, "vacuous: the explicit min_idf was not read"
+    with owner_of(owner_kind, home):
+        seen = spying_read(monkeypatch)
+        run = run_main(mod)
+    assert run.exc == "SystemExit(0)", run.exc
+    assert "[ENGRAM in-turn recall" in run.ctx, "vacuous: the recall site did not run"
+    sqls = [s for s, _ in seen]
+    assert VOCAB_SQL in sqls
+    assert sqls.count(COUNT_SQL) == 1, sqls.count(COUNT_SQL)
+
+
+def test_f_explicit_min_idf_flag_off_a_full_fire_executes_the_count_exactly_once(home, monkeypatch):
+    """#3740 Cut B, direct path, explicit `min_idf`: the one COUNT runs inside extract_keywords.
+    Mutations: n_docs=0 -> no recall (red); the hook also counts itself -> two COUNTs (red)."""
+    make_store(home)
+    set_config(home, flag=..., extra=EXPLICIT_MIN_IDF)
+    mod = load_hook(home, monkeypatch)
+    assert mod._in_turn_config()["min_idf"] == 0.1, "vacuous: the explicit min_idf was not read"
+    statements = []
+    real = mod.connect_regular_ro
+
+    def traced(*a, **k):
+        c = real(*a, **k)
+        c.set_trace_callback(statements.append)
+        return c
+    monkeypatch.setattr(mod, "connect_regular_ro", traced)
+    run = run_main(mod)
+    assert run.exc == "SystemExit(0)", run.exc
+    assert "[ENGRAM in-turn recall" in run.ctx, "vacuous: the recall site did not run"
+    assert any("json_each" in s for s in statements), "vacuous: the IDF batch never ran"
+    assert statements.count(COUNT_SQL) == 1, statements.count(COUNT_SQL)
+
+
 # =========================================================================================
 # C1 differential
 # =========================================================================================

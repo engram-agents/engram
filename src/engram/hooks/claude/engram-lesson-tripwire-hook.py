@@ -1816,6 +1816,9 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
             owner = _owner_active()
             conn = _owner_conn() if owner else connect_regular_ro(DB_PATH, timeout=1.0)
             try:
+                # #3740: the current-node count, when this site computes it, is
+                # handed to extract_keywords so the COUNT runs once per fire.
+                n_docs = None
                 if cfg["min_idf"] is not None:
                     effective_min_idf = cfg["min_idf"]
                 else:
@@ -1833,7 +1836,7 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
                 # below stays as a backstop.
                 pairs = extract_keywords(
                     conn, match_target, min_idf=effective_min_idf, top_k=5,
-                    stopwords=STOPWORDS | junk)
+                    stopwords=STOPWORDS | junk, n_docs=n_docs)
             finally:
                 if not owner:
                     conn.close()

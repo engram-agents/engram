@@ -329,7 +329,7 @@ def _setup_tripwire(tmp_path, tag, terms=("alphaterm", "betaterm")):
     conn.commit()
     conn.close()
     fake = types.ModuleType("engram_idf")
-    fake.extract_keywords = lambda conn, text, min_idf=4.0, top_k=5, stopwords=None: [
+    fake.extract_keywords = lambda conn, text, min_idf=4.0, top_k=5, stopwords=None, n_docs=None: [
         (t, 7.5) for t in terms]
     fake.STOPWORDS = frozenset()
     fake.JUNK_STOPLIST = _REAL_JUNK_STOPLIST
