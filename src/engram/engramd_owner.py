@@ -2591,7 +2591,7 @@ class EngramdOwner:
                     "status": "rejected",
                     "reason": "vocab_table_absent",
                     "detail": "nodes_fts_vocab is not in this store's sqlite_master",
-                    "remedy": "the vocab table is created by the IDF writer path (engram_idf.ensure_vocab_table); the caller treats every term as df=0 until it exists",
+                    "remedy": "the vocab table is created by the IDF writer path (engram_idf.ensure_vocab_table); the owner-connection shim treats every term as absent from the vocabulary and returns no rows, so IDF scoring yields no keywords until it exists",
                 }
             match = _DF_VOCAB_VARIANT_RE.search(_DF_SQL_COMMENT_RE.sub(" ", ddl[0][0] or ""))
             if match is None or match.group(1).lower() != "row":

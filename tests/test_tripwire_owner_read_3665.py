@@ -530,6 +530,68 @@ def test_a_the_same_zero_opens_cell_as_a_real_process(home, tmp_path):
 
 
 # =========================================================================================
+# S6 -- the flag-ON path never consults the local store file
+# =========================================================================================
+
+def _point_loader_at_missing_store(monkeypatch, mod, site: str, home: Path) -> Path:
+    """`main()` calls each loader with no argument, so the path it would open directly is the
+    function's `db_path` default. Re-point that default (for ONE site) at a file that does
+    not exist while the owner keeps serving the real store in `home`."""
+    missing = home / "nowhere" / "knowledge.db"
+    assert not missing.exists() and (home / "knowledge.db").exists()
+    monkeypatch.setattr(getattr(mod, site), "__defaults__", (missing,))
+    return missing
+
+
+@pytest.mark.parametrize("owner_kind", OWNER_KINDS)
+@pytest.mark.parametrize("site,cmd,needle", [
+    ("load_tripwires", FULL_CMD, "Nudge for tripwire one"),
+    ("load_prevention_lessons", BLOCK_CMD, "blockpat"),
+], ids=["load_tripwires", "load_prevention_lessons"])
+def test_s6_flag_on_the_hook_ignores_a_missing_local_store_file(site, cmd, needle, owner_kind, home, monkeypatch):
+    """Flag ON, owner up and serving a populated store, but the path this loader would open
+    directly has NO knowledge.db: the block is still delivered (tripwire nudge / blocking
+    deny), exit 0, empty stderr, no store open, no owner notice. The flag-on branch must not
+    consult the local file.
+    Mutation: a `db_path.exists()` guard (return []) on the flag-ON branch of the named
+    loader -> that loader's result is empty -> the nudge / the deny is missing -> red.
+    Anti-vacuity: the same re-pointing with the flag OFF yields the empty result."""
+    make_store(home)
+    set_config(home, flag=True)
+    mod = load_hook(home, monkeypatch)
+    _point_loader_at_missing_store(monkeypatch, mod, site, home)
+    with owner_of(owner_kind, home):
+        opens = Opens().install(monkeypatch, mod)
+        run = run_main(mod, cmd)
+    assert run.exc == "SystemExit(0)", run.exc
+    assert run.stderr == "", run.stderr
+    assert opens.record == [], opens.record
+    assert COULD_NOT not in run.ctx and "UNAVAILABLE" not in run.ctx, run.ctx
+    if site == "load_tripwires":
+        assert needle in run.ctx, run.ctx
+        assert not run.denied
+    else:
+        assert run.denied, run.stdout
+        assert needle in run.stdout, run.stdout
+
+
+@pytest.mark.parametrize("site,cmd", [("load_tripwires", FULL_CMD), ("load_prevention_lessons", BLOCK_CMD)],
+                         ids=["load_tripwires", "load_prevention_lessons"])
+def test_s6_control_flag_off_with_the_file_missing_is_the_empty_result(site, cmd, home, monkeypatch):
+    """Anti-vacuity for the S6 cells: with the flag OFF the missing file IS consulted and the
+    loader returns nothing, so the S6 cells' success comes from the owner, not from a path
+    the hook could have read anyway.
+    Mutation: none needed (it pins the direct path's own existence guard) -> if the S6
+    re-pointing did not take effect this goes red."""
+    make_store(home)
+    set_config(home, flag=False)
+    mod = load_hook(home, monkeypatch)
+    missing = _point_loader_at_missing_store(monkeypatch, mod, site, home)
+    assert getattr(mod, site)() == []
+    assert not missing.exists()
+
+
+# =========================================================================================
 # C1 differential
 # =========================================================================================
 
@@ -606,6 +668,44 @@ def test_c1_owner_and_direct_agree_on_rows_stdout_and_state(name, cmd, owner_kin
         assert "Anchor head line" in levels["stdout"][1]
     if name == "surfacing_nudge":
         assert "Surfacing nudge four" in levels["stdout"][1]
+
+
+def _drop_vocab_table(home: Path) -> None:
+    conn = sqlite3.connect(str(home / "knowledge.db"))
+    conn.execute("DROP TABLE nodes_fts_vocab")
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize("owner_kind", OWNER_KINDS)
+def test_c1_vocab_table_absent_flag_on_is_byte_identical_to_flag_off(owner_kind, home, monkeypatch):
+    """Design seat ruling (U6b follow-up): `vocab_table_absent` is a fact about the graph, not an
+    owner failure. With nodes_fts_vocab dropped, flag-ON stdout, stderr and state equal flag-OFF
+    (Sol's parity method), the tripwire block still prints, and no 'ENGRAM UNAVAILABLE' / loud
+    owner notice appears. Anti-vacuity: the owner really got (and refused) a `df` request, and
+    the control cell above (vocab present) shows the same command produces the same block.
+    Mutation M_NO_MAP (shim raises on vocab_table_absent) -> the recall site's catch still
+    empties the recall, but the owner notice lands in stdout -> red."""
+    monkeypatch.setattr(engram_idf, "IDF_BATCH_TERMS", 40)
+    make_store(home)
+    _drop_vocab_table(home)
+    sent = []
+    real = ec.read
+
+    def spy(method, params, **k):
+        res = real(method, params, **k)
+        sent.append((method, res))
+        return res
+
+    monkeypatch.setattr(ec, "read", spy)
+    levels, _answers = _levels(home, monkeypatch, FULL_CMD, owner_kind)
+    assert differing(levels) == set(), {k: v for k, v in levels.items() if v[0] != v[1]}
+    out_off, out_on = levels["stdout"]
+    assert "Nudge for tripwire one" in out_on and "Nudge for tripwire one" in out_off
+    for text in (out_on, levels["stderr"][1]):
+        assert "ENGRAM UNAVAILABLE" not in text and COULD_NOT not in text, text
+    absent = [m for m, r in sent if m == "df" and isinstance(r, ec.Rejected) and r.reason == "vocab_table_absent"]
+    assert absent, "the owner was never asked for df: the cell would pass vacuously"
 
 
 def _mutated_answer(extra_row):

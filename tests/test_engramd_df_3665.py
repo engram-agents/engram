@@ -443,6 +443,10 @@ def test_df_vocab_absent_is_named_and_the_owner_does_not_create_it(home):
         assert isinstance(result, ec.Rejected), result
         assert result.reason == "vocab_table_absent"
         assert result.detail and result.remedy
+        # The remedy describes what the owner-connection shim actually does (U6b follow-up):
+        # no df=0 claim, the shim treats every term as absent from the vocabulary.
+        assert "df=0" not in result.remedy
+        assert "absent from the vocabulary" in result.remedy
         assert isinstance(ec.read("ping", {}, timeout=2.0, socket_path=owner.socket_path), ec.Ok)
     finally:
         owner.stop()

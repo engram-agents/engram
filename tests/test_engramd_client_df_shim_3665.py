@@ -138,6 +138,72 @@ def test_idf_statement_with_non_list_of_str_params_falls_through_to_read(monkeyp
     assert stub.calls[0][1] == {"sql": IDF_SQL_LITERAL, "args": list(params)}
 
 
+# --- 3b: only the BYTE-EXACT statement routes to df ------------------------------------------
+
+NEAR_MISS_SQL = [
+    pytest.param(IDF_SQL_LITERAL + " LIMIT 1", id="limit-suffix"),
+    pytest.param(IDF_SQL_LITERAL + " ", id="trailing-space"),
+    pytest.param(IDF_SQL_LITERAL + ";", id="trailing-semicolon"),
+    pytest.param(IDF_SQL_LITERAL.lower(), id="lower-case"),
+    pytest.param(IDF_SQL_LITERAL.replace("WHERE term", "WHERE  term"), id="extra-internal-whitespace"),
+]
+
+
+def test_near_miss_cells_differ_from_the_statement_and_three_of_them_extend_it():
+    """Anti-vacuity: each near miss is a different string; the extending ones (suffix,
+    space, semicolon) start with the statement, which is what a startswith mutant accepts."""
+    for param in NEAR_MISS_SQL:
+        assert param.values[0] != IDF_SQL_LITERAL
+    for suffix in (" LIMIT 1", " ", ";"):
+        assert (IDF_SQL_LITERAL + suffix).startswith(IDF_SQL_LITERAL)
+
+
+@pytest.mark.parametrize("sql", NEAR_MISS_SQL)
+def test_a_near_miss_statement_takes_the_ordinary_read_route(monkeypatch, sql):
+    """The shim routes to `df` ONLY when sql == IDF_BATCH_SQL byte for byte: a near miss with
+    a perfectly valid JSON-list-of-str param is sent as read("read", {sql, args}) unchanged.
+    Mutation: loosen the match to `sql.startswith(IDF_BATCH_SQL)` -> the suffix / space /
+    semicolon cells go via `df` -> red; the exact-statement routing cells stay green."""
+    stub = StubRead(ec.Ok(result=[]))
+    monkeypatch.setattr(ec, "read", stub)
+    ec.OwnerReadConnection(2.0).execute(sql, (json.dumps(TERMS),))
+    assert [c[0] for c in stub.calls] == ["read"]
+    assert stub.calls[0][1] == {"sql": sql, "args": [json.dumps(TERMS)]}
+
+
+@pytest.mark.parametrize("sql", NEAR_MISS_SQL)
+def test_a_near_miss_statement_over_the_fake_owner_is_rejected_unregistered_template(home, sql):
+    """Against the FakeOwner the near miss is a Rejected `unregistered_template`, surfaced by
+    the shim as OwnerReadError kind "rejected" (never rows from the df op).
+    Mutation: prefix match -> the shim sends `df`, the fake answers rows -> no error -> red."""
+    _backup_small_corpus(home)
+    with FakeOwner(home) as o:
+        shim = ec.OwnerReadConnection(5.0, socket_path=o.socket_path)
+        with pytest.raises(ec.OwnerReadError) as ei:
+            shim.execute(sql, (json.dumps(["formula"]),))
+        methods = [q["method"] for q in o.requests]
+    assert ei.value.kind == "rejected", ei.value
+    assert isinstance(ei.value.result, ec.Rejected) and ei.value.result.reason == "unregistered_template"
+    assert "df" not in methods
+
+
+@requires_linux_owner
+@pytest.mark.parametrize("sql", NEAR_MISS_SQL)
+def test_a_near_miss_statement_over_a_real_owner_is_rejected_unregistered_template(home, sql):
+    """The same against a REAL owner. Mutation: as the fake-owner cell -> red."""
+    _store(home)
+    owner = eo.EngramdOwner(home, request_deadline=0.6)
+    owner.start(install_signal_handlers=False)
+    try:
+        shim = ec.OwnerReadConnection(5.0, socket_path=owner.socket_path)
+        with pytest.raises(ec.OwnerReadError) as ei:
+            shim.execute(sql, (json.dumps(["formula"]),))
+    finally:
+        owner.stop()
+    assert ei.value.kind == "rejected", ei.value
+    assert isinstance(ei.value.result, ec.Rejected) and ei.value.result.reason == "unregistered_template"
+
+
 # --- 4 ------------------------------------------------------------------------
 
 def test_df_route_budget_and_call_accounting(monkeypatch):
@@ -509,3 +575,156 @@ def test_fake_df_matches_the_real_owner_on_an_accepted_spelling():
         f, r = p.ask({"terms": ["formula", "algorithm"]})
     assert isinstance(f, ec.Ok) and isinstance(r, ec.Ok), (f, r)
     assert sorted(f.result) == sorted(r.result) and r.result
+
+
+# --- 11: vocab_table_absent is a fact about the graph, not an owner failure (U6b follow-up) ---------
+#
+# Design seat ruling (crossing 10237): on the df route the shim maps the owner's
+# `vocab_table_absent` rejection to the EMPTY result (every term absent from the vocabulary);
+# every other rejection, and every non-df route, still raises OwnerReadError "rejected".
+# Written BEFORE the implementation.
+
+def _small_corpus_without_vocab(home):
+    """_SMALL_CORPUS in home/knowledge.db with nodes_fts_vocab dropped."""
+    _backup_small_corpus(home)
+    conn = sqlite3.connect(str(home / "knowledge.db"))
+    conn.execute("DROP TABLE nodes_fts_vocab")
+    conn.commit()
+    conn.close()
+
+
+def _assert_empty_cursor(cur):
+    assert cur.fetchone() is None
+    assert cur.fetchall() == []
+
+
+def test_vocab_table_absent_over_the_fake_owner_is_an_empty_cursor(home):
+    """CELL 1 (fake owner): the df rejection vocab_table_absent -> empty cursor, one round trip counted.
+    Mutation M_NO_MAP (shim raises) -> red."""
+    _small_corpus_without_vocab(home)
+    with FakeOwner(home) as o:
+        shim = ec.OwnerReadConnection(5.0, socket_path=o.socket_path)
+        cur = shim.execute(_idf_sql(), (json.dumps(["formula"]),))
+        methods = [q["method"] for q in o.requests]
+    _assert_empty_cursor(cur)
+    assert shim.calls == 1 and methods == ["df"]
+
+
+@requires_linux_owner
+def test_vocab_table_absent_over_a_real_owner_is_an_empty_cursor(home):
+    """CELL 1 (real owner): the underlying reply really is the owner's vocab_table_absent."""
+    _small_corpus_without_vocab(home)
+    owner = eo.EngramdOwner(home, request_deadline=0.6)
+    owner.start(install_signal_handlers=False)
+    try:
+        raw = ec.read("df", {"terms": ["formula"]}, timeout=5.0, socket_path=owner.socket_path)
+        shim = ec.OwnerReadConnection(5.0, socket_path=owner.socket_path)
+        cur = shim.execute(_idf_sql(), (json.dumps(["formula"]),))
+    finally:
+        owner.stop()
+    assert isinstance(raw, ec.Rejected) and raw.reason == "vocab_table_absent", raw
+    _assert_empty_cursor(cur)
+    assert shim.calls == 1
+
+
+@requires_linux_owner
+@pytest.mark.parametrize("variant", ["col", "instance"])
+def test_unsupported_vocab_variant_still_raises_over_a_real_owner(home, variant):
+    """CELL 2a: only vocab_table_absent is mapped; an unsupported variant stays a rejection.
+    Mutation M_MAP_ALL_REJECTED -> red."""
+    _store(home, variant)
+    owner = eo.EngramdOwner(home, request_deadline=0.6)
+    owner.start(install_signal_handlers=False)
+    try:
+        shim = ec.OwnerReadConnection(5.0, socket_path=owner.socket_path)
+        with pytest.raises(ec.OwnerReadError) as ei:
+            shim.execute(_idf_sql(), (json.dumps(["formula"]),))
+    finally:
+        owner.stop()
+    assert ei.value.kind == "rejected"
+    assert isinstance(ei.value.result, ec.Rejected) and ei.value.result.reason == "unsupported_vocab_variant"
+
+
+def test_unsupported_vocab_variant_still_raises_over_the_fake_owner(home):
+    """CELL 2a (fake owner). Mutation M_MAP_ALL_REJECTED -> red."""
+    _store(home, "col")
+    with FakeOwner(home) as o:
+        shim = ec.OwnerReadConnection(5.0, socket_path=o.socket_path)
+        with pytest.raises(ec.OwnerReadError) as ei:
+            shim.execute(_idf_sql(), (json.dumps(["formula"]),))
+    assert ei.value.kind == "rejected" and ei.value.result.reason == "unsupported_vocab_variant"
+
+
+@pytest.mark.parametrize("reason", ["df_term_empty", "df_terms_empty", "owner_stopping",
+                                    "deadline_exceeded", "read_failed", "unsupported_vocab_variant",
+                                    # look-alikes: the mapping is the EXACT string, not a fuzzy match
+                                    "VOCAB_TABLE_ABSENT", " vocab_table_absent",
+                                    "vocab_table_absent ", "vocab_table_present",
+                                    "vocab_table_absent_x", "vocab_table", "absent"])
+def test_every_other_rejection_on_the_df_route_still_raises(monkeypatch, reason):
+    """CELL 2b: a stub returns the Rejected; every reason except vocab_table_absent raises
+    kind "rejected" carrying the result. Mutation M_MAP_ALL_REJECTED -> red."""
+    rj = ec.Rejected(reason=reason, detail="d", remedy="m")
+    monkeypatch.setattr(ec, "read", StubRead(rj))
+    conn = ec.OwnerReadConnection(2.0)
+    with pytest.raises(ec.OwnerReadError) as ei:
+        conn.execute(_idf_sql(), (json.dumps(TERMS),))
+    assert ei.value.kind == "rejected" and ei.value.result is rj
+    assert conn.calls == 1
+
+
+def test_vocab_table_absent_on_the_ordinary_read_route_still_raises(monkeypatch):
+    """CELL 2c: the mapping is df-route only. A non-IDF read, and an IDF statement that
+    falls through to `read` (params not a JSON list), that get vocab_table_absent still raise.
+    Mutation M_MAP_ON_READ_ROUTE -> red."""
+    rj = ec.Rejected(reason="vocab_table_absent", detail="d", remedy="m")
+    stub = StubRead(rj)
+    monkeypatch.setattr(ec, "read", stub)
+    for sql, params in [(OTHER_SQL, ()), (IDF_SQL_LITERAL, ("not json",))]:
+        with pytest.raises(ec.OwnerReadError) as ei:
+            ec.OwnerReadConnection(2.0).execute(sql, params)
+        assert ei.value.kind == "rejected" and ei.value.result is rj
+    assert [c[0] for c in stub.calls] == ["read", "read"]
+
+
+def test_vocab_table_absent_on_the_df_route_is_empty_and_counted_with_a_stub(monkeypatch):
+    """CELL 1 (stub): the empty cursor does not depend on a particular owner; Unavailable stays an error.
+    Mutation M_NO_MAP -> red."""
+    stub = StubRead(ec.Rejected(reason="vocab_table_absent", detail="d", remedy="m"))
+    monkeypatch.setattr(ec, "read", stub)
+    conn = ec.OwnerReadConnection(2.0)
+    _assert_empty_cursor(conn.execute(_idf_sql(), (json.dumps(TERMS),)))
+    assert conn.calls == 1 and [c[0] for c in stub.calls] == ["df"]
+    monkeypatch.setattr(ec, "read", StubRead(ec.Unavailable(socket_path="/tmp/x.sock", bound=1.0, agent_steps=["a"], human_steps=["h"])))
+    with pytest.raises(ec.OwnerReadError) as ei:
+        ec.OwnerReadConnection(2.0).execute(_idf_sql(), (json.dumps(TERMS),))
+    assert ei.value.kind == "unavailable"
+
+
+def test_extract_keywords_over_the_shim_with_the_vocab_table_dropped_is_empty(home):
+    """CELL 3: no keyword passes when every term is absent. Direct-path observation: the
+    direct connection RAISES sqlite3.OperationalError inside extract_keywords (no such table);
+    the hook's recall-site `except Exception` is what makes the direct observable empty.
+    Mutation M_NO_MAP -> OwnerReadError, red."""
+    _small_corpus_without_vocab(home)
+    text = "the ranking formula orders nodes with algorithm convergence"
+    with pytest.raises(sqlite3.OperationalError):
+        engram_idf.extract_keywords(_direct_row_conn(home), text, min_idf=0.0)
+    with FakeOwner(home) as o:
+        shim = ec.OwnerReadConnection(5.0, socket_path=o.socket_path)
+        assert engram_idf.extract_keywords(shim, text, min_idf=0.0) == []
+        assert "df" in [q["method"] for q in o.requests]
+
+
+@requires_linux_owner
+def test_extract_keywords_over_a_real_owner_with_the_vocab_table_dropped_is_empty(home):
+    """CELL 3 (real owner)."""
+    _small_corpus_without_vocab(home)
+    owner = eo.EngramdOwner(home, request_deadline=0.6)
+    owner.start(install_signal_handlers=False)
+    try:
+        shim = ec.OwnerReadConnection(5.0, socket_path=owner.socket_path)
+        out = engram_idf.extract_keywords(shim, "the ranking formula algorithm", min_idf=0.0)
+    finally:
+        owner.stop()
+    assert out == []

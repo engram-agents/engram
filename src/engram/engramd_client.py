@@ -1187,6 +1187,12 @@ class OwnerReadConnection:
         if isinstance(result, Unavailable):
             raise OwnerReadError("unavailable", result)
         if isinstance(result, Rejected):
+            if method == "df" and result.reason == "vocab_table_absent":
+                # The vocab table not existing is a fact about the graph, not an
+                # owner failure: every term is absent from the vocabulary, so the
+                # df answer is the empty result (the direct path's observable is
+                # the same: no keywords). Every other rejection still raises.
+                return _OwnerCursor([])
             raise OwnerReadError("rejected", result)
         raise OwnerReadError("unusable_answer")
 
