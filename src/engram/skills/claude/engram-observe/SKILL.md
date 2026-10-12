@@ -303,8 +303,9 @@ cost for any of its other clauses that stay unextracted.
 
 ## 6. Response keys that carry their own remedy
 
-Two keys come back on every `engram_add_observation` response and need nothing from you at call
-time — which is why they are documented here and not in the tool description:
+Three advisory keys can come back on an `engram_add_observation` response, and none needs anything
+from you at call time. The first two are documented only here, not in the tool description; the
+third is also named in the description of each write tool that returns it:
 
 - **`anchoring_advisory`** — measures how many of the claim's hard facts (node ids, issue/PR refs,
   hex shas, 3+-digit numbers, dates/times) are literal substrings of `quoted_text`. When
@@ -315,3 +316,8 @@ time — which is why they are documented here and not in the tool description:
   conditional rather than a permanent guarantee.
 - **`predictive_hint`** — appears when `predicted_event`/`resolution_timeframe` were passed without
   `is_predictive`. Advisory only; suppressed whenever `is_predictive` is true.
+- **`recall_summary_overrun`** — appears only when the stripped `recall_summary` is over the 140
+  target (soft-accepted, `needs_tightening` set); it names the length. Advisory only; the node is
+  created. The same key comes back from `engram_derive`, `engram_add_definition`,
+  `engram_add_conjecture` and `engram_add_lesson`. The remedy is to write the next summary at or
+  under 140, or tighten this one; the sleep cycle's summary pass also picks it up.

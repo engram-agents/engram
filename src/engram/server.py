@@ -1838,7 +1838,7 @@ def engram_add_observation(payload_json: str) -> str:
             fs_class (str, optional): Falsification-sensitivity class — "re-executable" (Class 1: claim can be re-tested by re-running the measurement) or "frozen" (Class 2: claim records a past event that cannot be re-executed). Omit or pass null to let the Phase-1 proxy (derived from quote_type) apply. When provided, takes priority over the proxy and the FALSIFICATION line drops the "(proxy:quote_type)" label. When the class is ambiguous (e.g. a re-readable file that records past state), omit and let the proxy apply — hesitation is the correct signal to omit.
             source_repo (str, optional): Absolute path to an alternative git repository to use for git operations. When omitted, the git repo is auto-detected from the file:// URL's directory. Use this for cross-repo citations where the cited file lives outside the target repo (e.g. a plugin file deployed to ~/.engram/ that is committed in the plugin source tree ~/engram-alpha/).
             repo_path (str, optional): Relative path within source_repo where the committed copy of the cited file lives (e.g. "src/engram/server.py"). Required when source_repo is provided and the cited file:// URL path is outside source_repo — used for git status and cat-file checks instead of the auto-derived path. Without repo_path, the path is derived from the file URL relative to the source_repo root, which fails when the file lives outside source_repo. Example: cite file:///home/user/.engram/marketplace/plugins/engram/server.py with source_repo="/home/user/engram-alpha" and repo_path="src/engram/server.py".
-            recall_summary (str, optional, always provide when you can): Compress your interpretation/claim into a ≤140-char recall-scent string shown to agents on future recall — don't start from a blank line. Omitting it clean-accepts but is flagged summary_missing (distinct from needs_tightening — a fail-loud-surface flag for the backfill sweep, not an error); a provided summary over 140 chars is soft-accepted (flagged needs_tightening for later cleanup); an excessively long summary is hard-rejected with no node created.
+            recall_summary (str, optional, always provide when you can): Compress your interpretation/claim into a ≤140-char recall-scent string shown to agents on future recall — don't start from a blank line. Omitting it clean-accepts but is flagged summary_missing (distinct from needs_tightening — a fail-loud-surface flag for the backfill sweep, not an error); a provided summary over 140 chars is soft-accepted (flagged needs_tightening for later cleanup), and the response carries recall_summary_overrun with the length; an excessively long summary is hard-rejected with no node created.
             recall_keywords (array of str, optional, always provide when you can): 3-6 short keyword strings for structural recognition cues. Never rejected regardless of count — normalized (trimmed, deduped case-sensitively, capped at 6).
             evidence_type (str, optional): What engram-snapshot (or you) captured, from a closed vocabulary: forum_thread, session_transcript, local_file, web_page, pdf. Stored on the evidence node's metadata at capture time. First-capture-wins on an evidence node that already carries a value: your value is never silently overwritten, and a DIFFERING value surfaces as evidence_type_conflict in the response instead of being dropped or applied. Not inferred from content or fs_class — pass exactly what engram-snapshot's own output emitted (its evidence_type key), or omit.
             original_url (str, optional): The pre-archive source URL/path engram-snapshot resolved (its own original_url output field) — e.g. the live forum thread URL or web page URL that was archived into the file:// evidence you're citing here. Stored on the evidence node's metadata. Same first-capture-wins semantics as evidence_type (a differing value surfaces as original_url_conflict, never silently overwrites). Omit for evidence that was never snapshotted — it must not appear on such nodes.
@@ -1959,7 +1959,7 @@ def engram_add_observation_batch(payload_json: str) -> str:
                 recall_summary (always provide when you can — ≤140-char recall-scent
                 string compressing this item's interpretation/claim; omission clean-accepts
                 but is flagged summary_missing (distinct from needs_tightening — a
-                fail-loud-surface flag, not an error), soft-accepted (needs_tightening flagged); an excessively long summary
+                fail-loud-surface flag, not an error), soft-accepted (needs_tightening flagged), and each item's result carries recall_summary_overrun with the length; an excessively long summary
                 hard-rejects that item only — other items in the batch are unaffected), recall_keywords (always provide
                 when you can — array of 3-6 short keyword strings; never rejected
                 regardless of count).
@@ -4092,7 +4092,7 @@ def engram_add_definition(payload_json: str) -> str:
                 renders on inspect). Omitting it clean-accepts but is flagged
                 summary_missing (distinct from needs_tightening — a fail-loud-
                 surface flag, not an error); over 140 chars soft-accepts (flagged needs_tightening for later
-                cleanup); an excessively long summary hard-rejects with no
+                cleanup), and the response carries recall_summary_overrun with the length; an excessively long summary hard-rejects with no
                 node created.
             recall_keywords (array of str, optional, always provide when you can):
                 3-6 short keyword strings. Never rejected regardless of count.
@@ -4194,7 +4194,7 @@ def engram_add_conjecture(payload_json: str) -> str:
                 inspect). Omitting it clean-accepts but is flagged summary_missing
                 (distinct from needs_tightening — a fail-loud-surface flag, not an
                 error); over 140 chars soft-accepts (flagged needs_tightening for later
-                cleanup); an excessively long summary hard-rejects with no
+                cleanup), and the response carries recall_summary_overrun with the length; an excessively long summary hard-rejects with no
                 node created.
             recall_keywords (array of str, optional, always provide when you can):
                 3-6 short keyword strings. Never rejected regardless of count.
@@ -5926,7 +5926,7 @@ def engram_add_lesson(payload_json: str) -> str:
                 renders on inspect). Omitting it clean-accepts but is flagged
                 summary_missing (distinct from needs_tightening — a fail-loud-
                 surface flag, not an error); over 140 chars soft-accepts (flagged needs_tightening for later
-                cleanup); an excessively long summary hard-rejects with no
+                cleanup), and the response carries recall_summary_overrun with the length; an excessively long summary hard-rejects with no
                 node created.
             recall_keywords (array of str, optional, always provide when you can):
                 3-6 short keyword strings. Never rejected regardless of count.
@@ -6659,7 +6659,7 @@ def engram_derive(payload_json: str) -> str:
                 renders on inspect). Omitting it clean-accepts but is flagged
                 summary_missing (distinct from needs_tightening — a fail-loud-
                 surface flag, not an error); over 140 chars soft-accepts (flagged needs_tightening for later
-                cleanup); an excessively long summary hard-rejects with no
+                cleanup), and the response carries recall_summary_overrun with the length; an excessively long summary hard-rejects with no
                 node created.
             recall_keywords (array of str, optional, always provide when you can):
                 3-6 short keyword strings. Never rejected regardless of count.

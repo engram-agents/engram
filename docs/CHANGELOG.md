@@ -11,6 +11,16 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Substrate (recall, forgetting, search, graph integrity)
 
+- **Write tools say so when a recall_summary runs over the target (#3726, part
+  of #3537).** When the stripped summary is over 140 chars (and under the hard
+  reject), the write response carries `recall_summary_overrun` naming the
+  length; it is absent at or under 140. `engram_add_observation` (and
+  `engram_add_observation_batch`, per item), `engram_derive`,
+  `engram_add_definition`, `engram_add_conjecture` and `engram_add_lesson`
+  all attach it. Advisory only: the node is still created, flagged
+  `needs_tightening`. Known limit: it is not attached on the post-commit
+  durability-failure responses.
+
 - **The remaining `json_extract(metadata, ...)` read sites now guard with
   `json_valid` too (#3485, follow-up to #3425).** Measured: one non-JSON blob
   in `nodes.metadata` made BOTH lesson-tripwire loaders (`load_tripwires`,
