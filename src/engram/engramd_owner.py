@@ -412,6 +412,38 @@ SNAPSHOT_RESPONSE_RESERVE = 0.25  # seconds
 # test can monkeypatch it.
 READ_RESPONSE_RESERVE = 0.25  # seconds
 
+# #3665: the typed `df` method (design seat ruling, crossing 9958). DF_TERMS_MAX
+# bounds one request: 1000 is the IDF hook's real batch size
+# (engram_idf.IDF_BATCH_TERMS on U6b, where a cell pins the equality), so a
+# full hook batch is exactly one request. DF_TERM_MAX_BYTES caps one term in
+# UTF-8 BYTES. Measured 2026-10-12: the longest term in a real vocab
+# (~/.engram/knowledge.db nodes_fts_vocab, 15536 terms) is 64 bytes (a sha256
+# hex token); engram_idf.tokenize (`[a-z]{2,}[a-z0-9_]*`) has NO upper bound on
+# token length, so the cap is a chosen bound: next power of two >= 2x the
+# measured max is 128, floored at 256.
+# DF_SQL is the ONE fixed statement `df` executes -- byte-identical to
+# engram_idf.IDF_BATCH_SQL, with the terms bound as a single JSON-list
+# parameter; no client text ever becomes SQL. DF_VOCAB_DDL_SQL reads the vocab
+# table's DDL so only the `row` fts5vocab variant is served. Both run on
+# `_client_read_conn` under its authorizer floor.
+DF_TERMS_MAX = 1000
+DF_TERM_MAX_BYTES = 256
+DF_SQL = "SELECT term, doc FROM nodes_fts_vocab WHERE term IN (SELECT value FROM json_each(?))"
+DF_VOCAB_DDL_SQL = "SELECT sql FROM sqlite_master WHERE name = 'nodes_fts_vocab'"
+# fts5vocab(<table>, <type>) with the identifier / type optionally quoted any of
+# the ways SQLite accepts; the type is captured and compared case-insensitively.
+_DF_VOCAB_VARIANT_RE = re.compile(
+    r"""USING\s+fts5vocab\s*\(\s*(?:"[^"]*"|'[^']*'|\[[^\]]*\]|`[^`]*`|[\w$]+)\s*,\s*["'\[`]?\s*(\w+)\s*["'\]`]?\s*\)""",
+    re.IGNORECASE,
+)
+# SQL comments are removed from the stored DDL before the pattern above runs, so
+# a commented-out `USING fts5vocab(..., row)` cannot be read as the module clause.
+# A comment marker inside a quoted identifier would truncate the DDL, which can
+# only fail CLOSED (no match -> unsupported_vocab_variant), never open.
+_DF_SQL_COMMENT_RE = re.compile(r"/\*.*?(?:\*/|\Z)|--[^\n]*", re.DOTALL)
+# The ONLY statements `_ClientReadGate.execute_typed` will prepare (#3665 F2).
+_TYPED_STATEMENTS = frozenset({DF_SQL, DF_VOCAB_DDL_SQL})
+
 # Owner-side bound on a client `read` RESULT, as serialised on the wire (U4d
 # round 2, S3). The client refuses any response over ec.MAX_RESPONSE_BYTES
 # (10 MiB) and reads that as Unavailable -- which tells the agent to restart a
@@ -754,14 +786,22 @@ CLIENT_READ_ALWAYS_ALLOWED_ACTIONS = frozenset(
     }
 )
 
-# No real caller is wired to a pragma yet -- this build adds no client
-# dispatch path at all (see the module docstring's "Two connections"
-# section). `user_version` is kept as the one harmless read-only pragma
-# with an obvious future use (a census / health-check probe of the
-# store's schema version). Add more names here only once a real caller
-# needs them, through the same measurement discipline as the baseline
-# above -- this is a builder's-call design choice, not a measured set.
-CLIENT_READ_PRAGMA_ALLOWLIST = frozenset({"user_version"})
+# Read-form pragmas the client-read floor admits. `user_version` is the
+# harmless schema-version probe. `data_version` (#3665, U6b) was added as a
+# MEASURED widening: SQLite's fts5vocab virtual table runs
+# `PRAGMA data_version` internally on every scan, so the typed `df` method
+# (a document-frequency lookup over nodes_fts_vocab) cannot run on this
+# connection without it. Rulings: design seat (#3665 comment 6124428822) --
+# typed owner method `df`, and allow `data_version` in READ form only;
+# security seat (#3665 comment 6124451743) -- no hold; measured on Linux /
+# SQLite 3.45.1, `data_version` is the only new pragma and adds zero new
+# action codes. Residual, accepted: a coarse write-timing oracle -- an int
+# counter that changes when ANOTHER connection commits, carrying no store
+# content. Any further name needs the same measurement discipline as the
+# baseline above (measure what fires, record it, get the security seat's
+# read); it is not a free edit. The write form stays denied by the
+# `arg2 is not None` guard in `_client_read_authorizer`.
+CLIENT_READ_PRAGMA_ALLOWLIST = frozenset({"user_version", "data_version"})
 
 
 def _client_read_authorizer(action_code, arg1, arg2, db_name, trigger_or_view):
@@ -983,6 +1023,50 @@ def _render_read_rows(outcome) -> "tuple[dict, int]":
     return _RenderedReadOk(rows, _assemble_read_ok(fragments)), wire_bytes
 
 
+def _df_rejection(reason: str, detail: str, remedy: str) -> dict:
+    return {"status": "rejected", "reason": reason, "detail": detail, "remedy": remedy}
+
+
+def _df_param_refusal(params) -> "dict | None":
+    """Validate a `df` request; None = valid, else the wire rejection. EACH
+    violation has its own named reason. Check order (the first violated wins):
+    shape, list, empty, too many, then per element in index order: not-str,
+    empty, too long (UTF-8 bytes). Touches no connection."""
+    if not isinstance(params, dict) or set(params) != {"terms"}:
+        return _df_rejection(
+            "df_params_shape",
+            "df params must be a dict with exactly the key 'terms'",
+            "send {'terms': [<str>, ...]} and no other key",
+        )
+    terms = params["terms"]
+    if not isinstance(terms, list):
+        return _df_rejection(
+            "df_terms_not_list", f"'terms' must be a list, got {type(terms).__name__}", "send 'terms' as a list of strings"
+        )
+    if not terms:
+        return _df_rejection("df_terms_empty", "'terms' is an empty list", "send at least one term")
+    if len(terms) > DF_TERMS_MAX:
+        return _df_rejection(
+            "df_terms_too_many",
+            f"'terms' has {len(terms)} entries; the maximum is {DF_TERMS_MAX}",
+            f"split the batch into requests of at most {DF_TERMS_MAX} terms",
+        )
+    for i, term in enumerate(terms):
+        if not isinstance(term, str):
+            return _df_rejection(
+                "df_term_not_str", f"terms[{i}] is {type(term).__name__}, not a string", "send every term as a string"
+            )
+        if term == "":
+            return _df_rejection("df_term_empty", f"terms[{i}] is the empty string", "drop empty terms before sending")
+        if len(term.encode("utf-8", "surrogatepass")) > DF_TERM_MAX_BYTES:
+            return _df_rejection(
+                "df_term_too_long",
+                f"terms[{i}] exceeds {DF_TERM_MAX_BYTES} UTF-8 bytes",
+                f"terms are capped at {DF_TERM_MAX_BYTES} bytes; drop or shorten the term",
+            )
+    return None
+
+
 class _ClientReadGate:
     """Holds ONLY the client-read connection. Any future client-facing
     read operation (U4c's read-template registry, U4d's real client
@@ -1032,6 +1116,22 @@ class _ClientReadGate:
                 remedy="the statement was admitted but failed at execution; if the parameters "
                 "are valid this may be an owner-side fault (schema drift), see the owner log",
             )
+
+    def execute_typed(self, sql: str, params: tuple = (), *, deadline: float) -> list:
+        """Entry point for a TYPED owner method's fixed statement (#3665 `df`):
+        skips the read-template registry and goes straight to
+        `_execute_admitted`. Sound because the registry exists to vet
+        CLIENT-SUPPLIED SQL text, and here none can exist: `sql` must be a
+        member of the module-level `_TYPED_STATEMENTS` (enforced here, not
+        merely documented -- any other string raises ValueError before anything
+        is prepared), parameters are bound, and the authorizer floor on this
+        connection (the second, independent layer) still applies to everything
+        that is prepared. Still holds only the client-read connection, so the
+        routing guarantee is unchanged. SQLite errors propagate to the caller's
+        `_read_failed` / deadline mapping."""
+        if sql not in _TYPED_STATEMENTS:
+            raise ValueError(f"execute_typed: not a typed statement: {sql[:60]}")
+        return self._execute_admitted(sql, params, deadline=deadline)
 
     def _execute_admitted(self, sql: str, params: tuple, *, deadline: float) -> list:
         """The deadline-armed execute path, reached only for a statement the
@@ -1382,6 +1482,7 @@ class EngramdOwner:
             "ping": lambda params, deadline: self._handle_ping(params, deadline),
             "snapshot": lambda params, deadline: self._handle_snapshot(params, deadline),
             "read": lambda params, deadline: self._handle_read(params, deadline),
+            "df": lambda params, deadline: self._handle_df(params, deadline),
         }
 
     # -- lifecycle ------------------------------------------------------
@@ -2415,30 +2516,98 @@ class EngramdOwner:
             args = tuple(args)
         # A non-list `args` is passed through as-is: the template list's own check
         # refuses it as `invalid_parameter` (one source of refusal reasons).
+        failure, outcome = self._run_client_read(
+            deadline, lambda execution_deadline: gate.execute(sql, args, deadline=execution_deadline)
+        )
+        if failure is not None:
+            return failure
+        if isinstance(outcome, rr.Rejected):
+            return outcome.as_wire()
+        # Serialize once (#3678 cut 2): sized and sent from the same fragments.
+        reply, _counted = _render_read_rows(outcome)
+        return reply
+
+    def _run_client_read(self, deadline: float, run) -> "tuple[dict | None, object]":
+        """The lock / deadline / error tail shared by `read` and `df`.
+        -> (failure_reply, outcome): `failure_reply` is a rejection dict (no time
+        left, deadline abort, or a SQLite error) and `outcome` is then None;
+        otherwise `failure_reply` is None and `outcome` is whatever
+        `run(execution_deadline)` returned, computed under
+        `self._client_read_lock`."""
         execution_deadline = deadline - READ_RESPONSE_RESERVE
         remaining = execution_deadline - time.monotonic()
         if remaining <= 0 or not self._client_read_lock.acquire(timeout=remaining):
             return self._read_deadline_rejection(
                 "no execution time was left inside the request deadline (after reserving time to deliver the response)"
-            )
+            ), None
         try:
             try:
-                outcome = gate.execute(sql, args, deadline=execution_deadline)
+                return None, run(execution_deadline)
             except sqlite3.OperationalError as exc:
                 # sqlite3.SQLITE_INTERRUPT and exc.sqlite_errorcode are Python
                 # 3.11 additions (3.10.7+ is supported): no bare access here.
                 # 9 is SQLITE_INTERRUPT; "interrupted" is the < 3.11 fallback.
                 if getattr(exc, "sqlite_errorcode", None) == getattr(sqlite3, "SQLITE_INTERRUPT", 9) \
                         or str(exc) == "interrupted":
-                    return self._read_deadline_rejection("the read was aborted at the request deadline")
-                return self._read_failed(exc)
+                    return self._read_deadline_rejection("the read was aborted at the request deadline"), None
+                return self._read_failed(exc), None
             except sqlite3.Error as exc:  # incl. DataError: a cell over SQLITE_LIMIT_LENGTH
-                return self._read_failed(exc)
+                return self._read_failed(exc), None
         finally:
             self._client_read_lock.release()
-        if isinstance(outcome, rr.Rejected):
-            return outcome.as_wire()
-        # Serialize once (#3678 cut 2): sized and sent from the same fragments.
+
+    def _handle_df(self, params: dict, deadline: float) -> dict:
+        """The typed `df` method (U6b, #3665): document frequencies for a list of
+        terms from `nodes_fts_vocab`. Wire: params = {"terms": [<str>, ...]}
+        (1..DF_TERMS_MAX, no other key; each violation has its own named
+        reason, see `_df_param_refusal`); reply `ok` carries `result` = rows
+        `[term, doc]` for each term PRESENT in the vocabulary (absent terms
+        contribute no row; row order is not part of the contract).
+
+        Order: (1) validate -- nothing is prepared on the store connection for a
+        refused request; (2) only then touch `self._client_read_gate`, the same
+        client-read-only route as `read` (never `_owner_conn` / `_owner_lock`);
+        (3) the vocab table must be the `row` fts5vocab variant; (4) run the
+        fixed DF_SQL with the terms bound as ONE JSON-list parameter."""
+        refusal = _df_param_refusal(params)
+        if refusal is not None:
+            return refusal
+        terms = params["terms"]
+        gate = self._client_read_gate
+        if gate is None:
+            return {
+                "status": "rejected",
+                "reason": "owner_stopping",
+                "detail": "the owner is shutting down; its read path is closed",
+                "remedy": "retry once the owner has restarted",
+            }
+
+        def run(execution_deadline: float):
+            ddl = gate.execute_typed(DF_VOCAB_DDL_SQL, (), deadline=execution_deadline)
+            if not ddl:
+                # Never created here: the client-read authorizer denies CREATE,
+                # and the owner does not build the vocab table on a read path.
+                return {
+                    "status": "rejected",
+                    "reason": "vocab_table_absent",
+                    "detail": "nodes_fts_vocab is not in this store's sqlite_master",
+                    "remedy": "the vocab table is created by the IDF writer path (engram_idf.ensure_vocab_table); the caller treats every term as df=0 until it exists",
+                }
+            match = _DF_VOCAB_VARIANT_RE.search(_DF_SQL_COMMENT_RE.sub(" ", ddl[0][0] or ""))
+            if match is None or match.group(1).lower() != "row":
+                return {
+                    "status": "rejected",
+                    "reason": "unsupported_vocab_variant",
+                    "detail": "nodes_fts_vocab is not an fts5vocab(..., 'row') table; df needs the row shape (term, doc, cnt)",
+                    "remedy": "the col and instance variants return different column shapes and row semantics; recreate the vocab table as the row variant",
+                }
+            return gate.execute_typed(DF_SQL, (json.dumps(terms),), deadline=execution_deadline)
+
+        failure, outcome = self._run_client_read(deadline, run)
+        if failure is not None:
+            return failure
+        if isinstance(outcome, dict):
+            return outcome
         reply, _counted = _render_read_rows(outcome)
         return reply
 

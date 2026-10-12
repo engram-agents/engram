@@ -2715,6 +2715,15 @@ def test_client_read_gate_holds_no_reference_to_owner_internal_connection(owner_
     assert "_client_read_gate" in touched
     assert not touched & {"_owner_conn", "_owner_lock", "_client_read_conn"}, touched
 
+    # #3665 round 2 (F3): the lock / execute tail moved into `_run_client_read`
+    # and the typed `df` method has its own handler; neither may reference the
+    # owner-internal connection or lock. Mutation: reference `self._owner_conn`
+    # inside `_run_client_read` -> red.
+    for fn in (eo.EngramdOwner._handle_df, eo.EngramdOwner._run_client_read):
+        fn_tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        fn_touched = {n.attr for n in ast.walk(fn_tree) if isinstance(n, ast.Attribute)}
+        assert not fn_touched & {"_owner_conn", "_owner_lock"}, (fn.__name__, fn_touched)
+
     # And live, over the socket: `read` calls the gate (a spy stands in for it)
     # while `_owner_conn` is a tripwire that fails on any use.
     seen = []
