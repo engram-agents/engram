@@ -10256,6 +10256,23 @@ def _validate_recall_fields(recall_summary: str, recall_keywords) -> tuple:
     return (summary, keywords, needs_tightening, summary_missing, None)
 
 
+def _recall_summary_overrun_note(summary_len: int) -> Optional[str]:
+    """One-line write-response note for a recall_summary over the target (#3537).
+
+    ``summary_len`` is the .strip()'d length _validate_recall_fields judged.
+    Returns the note for the soft-accept band (len > RECALL_SUMMARY_TARGET),
+    None otherwise. Every write path attaches the result under the key
+    ``recall_summary_overrun`` only when it is not None, so the wording lives
+    here and cannot drift between tools. Advisory: never blocks.
+    """
+    if summary_len > RECALL_SUMMARY_TARGET:
+        return (
+            f"recall_summary {summary_len} chars > {RECALL_SUMMARY_TARGET} "
+            f"target (soft-accepted, flagged needs_tightening)"
+        )
+    return None
+
+
 def _validate_premises(
     supporting_ids: list,
     conn: sqlite3.Connection,

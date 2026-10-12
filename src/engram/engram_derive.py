@@ -419,6 +419,9 @@ def _derive_impl(
             result["independence_advisory"] = independence_advisory
         if success.get("embedding_failure"):  # #345 PR3 B4 (R1: renamed key)
             result["embedding_failure"] = success["embedding_failure"]
+        _overrun = core._recall_summary_overrun_note(len(_recall_summary or ""))
+        if _overrun:  # #3537
+            result["recall_summary_overrun"] = _overrun
 
         # --- engram.tool.engram_call event — success path (DESIGN.md §4.2) ---
         # alpha #2574 WS5: see the blocked-path site above for the full

@@ -1995,6 +1995,11 @@ def _add_observation_impl(
             source_class, confidence,
         )
 
+        # recall_summary over the 140 target (#3537) — say so in the response.
+        _overrun = core._recall_summary_overrun_note(len(_recall_summary or ""))
+        if _overrun:
+            result["recall_summary_overrun"] = _overrun
+
         # Handle prediction decomposition
         prediction_id = None
         _pred_emb_outcome = None

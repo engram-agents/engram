@@ -448,6 +448,9 @@ def _add_definition_impl(
         _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
         if _emb_block:
             _result["embedding_failure"] = _emb_block  # R1: renamed key
+        _overrun = core._recall_summary_overrun_note(len(_recall_summary or ""))
+        if _overrun:  # #3537
+            _result["recall_summary_overrun"] = _overrun
         return json.dumps(_result)
     finally:
         conn.close()
@@ -572,6 +575,9 @@ def _add_conjecture_impl(
         _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
         if _emb_block:
             _result["embedding_failure"] = _emb_block  # R1: renamed key
+        _overrun = core._recall_summary_overrun_note(len(_recall_summary or ""))
+        if _overrun:  # #3537
+            _result["recall_summary_overrun"] = _overrun
         return json.dumps(_result)
     finally:
         conn.close()
@@ -1406,6 +1412,9 @@ def _add_lesson_impl(
         _emb_block = core._embedding_response_block(_emb_outcome)
         if _emb_block:
             _stripped["embedding_failure"] = _emb_block
+        _overrun = core._recall_summary_overrun_note(len(_recall_summary or ""))
+        if _overrun:  # #3537
+            _stripped["recall_summary_overrun"] = _overrun
         return json.dumps(_stripped)
     finally:
         conn.close()
