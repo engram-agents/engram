@@ -225,6 +225,7 @@
   "hooks/claude/engram-lesson-tripwire-hook.py:_import_engramd_client",
   "hooks/claude/engram-lesson-tripwire-hook.py:_owner_active",
   "hooks/claude/engram-lesson-tripwire-hook.py:_owner_conn",
+  "hooks/claude/engram-lesson-tripwire-hook.py:_focused_read_conn",
   "hooks/claude/engram-lesson-tripwire-hook.py:_is_owner_exc",
   "hooks/claude/engram-lesson-tripwire-hook.py:_record_owner_failure",
   "hooks/claude/engram-lesson-tripwire-hook.py:_notice_lines",

@@ -1634,20 +1634,30 @@ def prune_shown_records(
     return deleted
 
 
-def _focused_ids() -> tuple:
-    """(ids, readable): ids currently focused, read-only, one query, closed in
-    a `finally`. Any DB problem (missing file, locked, no column) -> readable
-    False."""
+def _focused_ids(read_conn=None) -> tuple:
+    """(ids, readable): ids currently focused, read-only, one query. Any DB
+    problem (missing file, locked, no column) -> readable False.
+
+    `read_conn` (#3710, U8): a connection the CALLER owns, e.g. the tripwire
+    hook's engramd owner shim, so a flag-ON fire never opens knowledge.db. It
+    is used as-is and never closed here, and a failure on it reads False with
+    no fallback to a direct open. Without it: one direct read-only open,
+    closed in a `finally`, as before. One execute either way, so the read
+    registry keeps one site for this template."""
     conn = None
+    owned = read_conn is None
     try:
-        home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
-        # Short lock wait: this source is optional and an unreadable result is
-        # already handled (readable False -> in_context None), so a locked DB
-        # must not cost the surface hook a full second.
-        db_path = Path(home) / "knowledge.db"
-        # timeout bounds lock waits, not a FIFO open, so it is not part of the
-        # FIFO defence; connect_regular_ro refuses a non-regular file.
-        conn = connect_regular_ro(db_path, timeout=0.2)
+        if owned:
+            home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+            # Short lock wait: this source is optional and an unreadable result is
+            # already handled (readable False -> in_context None), so a locked DB
+            # must not cost the surface hook a full second.
+            db_path = Path(home) / "knowledge.db"
+            # timeout bounds lock waits, not a FIFO open, so it is not part of the
+            # FIFO defence; connect_regular_ro refuses a non-regular file.
+            conn = connect_regular_ro(db_path, timeout=0.2)
+        else:
+            conn = read_conn
         rows = conn.execute(
             "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
         ).fetchall()
@@ -1655,7 +1665,7 @@ def _focused_ids() -> tuple:
     except Exception:
         return set(), False
     finally:
-        if conn is not None:
+        if owned and conn is not None:
             try:
                 conn.close()
             except Exception:
@@ -1686,7 +1696,7 @@ def _in_context_for(node_id, created_at, *, shown_ids, shown_ok, started,
     return False, None
 
 
-def make_in_context_resolver(session_id, routes_dir: Path, marker=None):
+def make_in_context_resolver(session_id, routes_dir: Path, marker=None, read_conn=None):
     """Build `resolve(node_id, created_at) -> (in_context, why)` for ONE ledger
     write. Reads the sources once, so call it BEFORE appending the line
     being written (a node is never "already shown" by the very fire being
@@ -1703,7 +1713,8 @@ def make_in_context_resolver(session_id, routes_dir: Path, marker=None):
     summary a few lines after it, so it is probably not in the file yet when the
     marker is written. A session that has not compacted (count 0 or unknown)
     never opens the transcript. `marker` is the already-read marker dict (read
-    here when omitted)."""
+    here when omitted). `read_conn` is passed to `_focused_ids` (the only
+    source that reads the store; see there)."""
     if marker is None:
         marker = _read_session_marker(session_id)
     count = _marker_compaction_count(marker)
@@ -1714,7 +1725,7 @@ def make_in_context_resolver(session_id, routes_dir: Path, marker=None):
     shown_ids = set(shown_ids) | rec_ids
     shown_ok = shown_ok and rec_ok
     started = _parse_iso_utc(marker.get("started_at")) if marker else None
-    focused, focused_ok = _focused_ids()
+    focused, focused_ok = _focused_ids(read_conn=read_conn)
     if count:
         summary_ids, summary_ok = _last_summary_ids(marker.get("transcript_path"))
     else:
@@ -1747,18 +1758,19 @@ def in_context_exclusion_enabled(engram_home=None) -> bool:
         return False
 
 
-def build_exclusion_resolver(session_id):
+def build_exclusion_resolver(session_id, read_conn=None):
     """`resolve(node_id, created_at) -> (in_context, why)` for the live
     exclusion, or None when it cannot be built (fail-open: None = drop nothing).
     Same resolver the probe ledger uses; the probe routes dir is read only when
-    the probe is live for this session."""
+    the probe is live for this session. `read_conn`: see `_focused_ids`."""
     try:
         sid = _safe_session_name(session_id)
         if sid is None:
             return None
         marker = _read_session_marker(sid)
         return make_in_context_resolver(
-            sid, route_probe_dir() / sid / "routes", marker=marker)
+            sid, route_probe_dir() / sid / "routes", marker=marker,
+            read_conn=read_conn)
     except Exception:
         return None
 
@@ -1851,10 +1863,12 @@ def write_route_ledger(
     source: str,
     default_cut: str = "cap",
     extra: Optional[dict] = None,
+    read_conn=None,
 ) -> None:
     """Append one ledger line (see block comment). Never raises; at most one
     stderr line. `cut_reasons` maps id -> the route's own cut name; any
-    candidate neither shown nor named gets `default_cut`."""
+    candidate neither shown nor named gets `default_cut`. `read_conn`: passed
+    to the in-context resolver (see `_focused_ids`)."""
     try:
         sid = session_id if isinstance(session_id, str) else ""
         # "unknown" is the hooks' own missing-session placeholder, and a
@@ -1871,7 +1885,8 @@ def write_route_ledger(
             return  # probe not live for this session: true optional, silent
         # Read the in_context sources BEFORE this line is appended (C4).
         marker = _read_session_marker(sid)
-        resolver = make_in_context_resolver(sid, session_dir / "routes", marker=marker)
+        resolver = make_in_context_resolver(sid, session_dir / "routes", marker=marker,
+                                            read_conn=read_conn)
         candidates, missing = build_route_candidates(result, in_context=resolver)
         shown_set = set(shown)
         cut = {

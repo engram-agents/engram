@@ -241,6 +241,21 @@ def _owner_conn():
     return run["conn"]
 
 
+def _focused_read_conn():
+    """(build, conn) for the in-context resolver's one store read, `_hooklib._focused_ids`
+    (#3710, U8). Flag OFF: (True, None), the direct path as before. Flag ON: (True, the
+    fire's owner connection). Flag ON but the client cannot be imported: the failure is
+    recorded (one loud notice) and (False, None): the caller builds NO resolver (drops
+    nothing), because the alternative is a direct open on a flag-ON fire."""
+    if not _owner_active():
+        return True, None
+    try:
+        return True, _owner_conn()
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 -- KeyboardInterrupt is not caught
+        _record_owner_failure("focused_ids", exc)
+        return False, None
+
+
 def _is_owner_exc(exc: BaseException) -> bool:
     return isinstance(exc, _ClientImportFailure) or (
         type(exc).__name__ == "OwnerReadError" and hasattr(exc, "kind"))
@@ -1888,12 +1903,16 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
             if not hook_input:
                 return
             try:
+                _build, _rc = _focused_read_conn()
+                if not _build:
+                    return
                 write_route_ledger(
                     "tool_recall", hook_input.get("session_id"),
                     tool_fire_key(hook_input.get("tool_name"), hook_input.get("tool_input")),
                     recall_query, result_, shown_, cut_,
                     source="daemon", default_cut="not_in_pool",
                     extra={"novel_terms": list(novel)},
+                    read_conn=_rc,
                 )
             except Exception as exc:  # e.g. an unserialisable tool_input: fail-open
                 print(f"route-ledger: {type(exc).__name__}: {exc}"[:300], file=sys.stderr)
@@ -1927,9 +1946,10 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
         # cornerstone are exempt on THIS route: a tripwire's job is
         # action-time salience, so it re-shows even what is in context.
         try:
-            if in_context_exclusion_enabled(ENGRAM_HOME):
+            _build, _rc = _focused_read_conn() if in_context_exclusion_enabled(ENGRAM_HOME) else (False, None)
+            if _build:
                 _resolver = build_exclusion_resolver(
-                    hook_input.get("session_id") if hook_input else None)
+                    hook_input.get("session_id") if hook_input else None, read_conn=_rc)
                 _drop = in_context_drop_ids(
                     [n for n in pool if isinstance(n, dict)], _resolver,
                     exempt_types=("lesson", "cornerstone"))
