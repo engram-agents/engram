@@ -21,6 +21,8 @@ in its final summary.
 Usage:
     python3 tools/release-cutover.py --version v0.1.0 --target /path/to/public/repo
     python3 tools/release-cutover.py --version v0.1.0 --target /path/to/public/repo --push
+    python3 tools/release-cutover.py --version v0.1.0 --target /path/to/public/repo \\
+        --source /path/to/other/checkout --scan-leaks /path/to/scan-leaks.py
 """
 
 import argparse
@@ -268,7 +270,11 @@ def main():
                         help="Path to the minus-set file. Default: <source>/release-minus-set.txt.")
     parser.add_argument("--leak-roster", default=None,
                         help="Path to .scan-leaks-local.json for personal-pattern gate. "
-                             "Default: <source>/.scan-leaks-local.json if present.")
+                             "Default: <source>/.scan-leaks-local.json if present. "
+                             "A path that is not a regular file warns on stderr.")
+    parser.add_argument("--scan-leaks", default=None, metavar="PATH",
+                        help="Path to the leak-scanner script used for the gate. "
+                             "Default: <source>/tools/scan-leaks.py.")
     parser.add_argument("--author", default=None,
                         help='Author for the release commit, e.g. "Jane Doe <jane@example.com>". '
                              "Default: parsed from LICENSE copyright line.")
@@ -321,7 +327,8 @@ def main():
 
     minus_set_path = args.minus_set or str(source / "release-minus-set.txt")
     leak_roster_default = source / ".scan-leaks-local.json"
-    scan_leaks_script = source / "tools" / "scan-leaks.py"
+    scan_leaks_script = (Path(args.scan_leaks) if args.scan_leaks
+                         else source / "tools" / "scan-leaks.py")
 
     # ------------------------------------------------------------------
     # Step 1: Validate inputs
@@ -363,7 +370,7 @@ def main():
         print(f"ERROR: minus-set file not found: {minus_set_path}", file=sys.stderr)
         sys.exit(1)
 
-    if not scan_leaks_script.exists():
+    if not scan_leaks_script.is_file():
         print(f"ERROR: scan-leaks.py not found at: {scan_leaks_script}", file=sys.stderr)
         sys.exit(1)
 
@@ -458,6 +465,18 @@ def main():
             leak_roster_path = str(leak_roster_default)
         if leak_roster_path:
             leak_cmd += ["--config-path", leak_roster_path]
+            if not Path(leak_roster_path).expanduser().is_file():
+                # Still passed through (scanner treats it as absent); a
+                # mistyped path must not be silent. expanduser() mirrors the
+                # scanner's own path handling (a ~ the shell left unexpanded
+                # still names a real roster).
+                print("WARNING: name-roster half of the leak gate did NOT run "
+                      f"(roster file not found: {leak_roster_path}); "
+                      "structural patterns only.", file=sys.stderr)
+        else:
+            print("WARNING: name-roster half of the leak gate did NOT run "
+                  "(no --leak-roster and no <source>/.scan-leaks-local.json); "
+                  "structural patterns only.", file=sys.stderr)
         leak_result = subprocess.run(leak_cmd, capture_output=True, text=True)
         print(leak_result.stdout, end="")
         if leak_result.returncode != 0:

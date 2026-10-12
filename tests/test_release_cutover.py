@@ -117,12 +117,16 @@ def _make_target_repo(tmp: Path) -> Path:
     return tgt
 
 
-def _run_tool(args: list[str]) -> subprocess.CompletedProcess:
-    """Run the tool as a subprocess and return the result (no check — tests inspect exit code)."""
+def _run_tool(args: list[str], env: dict | None = None) -> subprocess.CompletedProcess:
+    """Run the tool as a subprocess and return the result (no check — tests inspect exit code).
+
+    ``env`` (optional) is the environment of the tool subprocess ONLY.
+    """
     return subprocess.run(
         [sys.executable, str(TOOL_PATH)] + args,
         capture_output=True,
         text=True,
+        env=env,
     )
 
 
@@ -1134,3 +1138,191 @@ class TestFinalSummaryRemainingSteps:
         assert "  target tag   : v0.1.0 @ " in out
         assert "=== Final summary ===" in out
         assert "CAVEAT: scan-leaks is necessary-but-not-sufficient" in out
+
+
+# ---------------------------------------------------------------------------
+# --scan-leaks PATH flag + loud warning when the name roster did not run
+# (umwelt#1034 PR A). Contract:
+#   S1 --scan-leaks overrides the default <source>/tools/scan-leaks.py
+#   S2 a nonexistent --scan-leaks path fails closed, names that path, and
+#      leaves the target untouched
+#   S3 no flag -> default resolution unchanged
+#   R1 no roster resolves -> one stderr WARNING line, still exit 0
+#   R2/R3 roster by flag / by default file -> no WARNING
+#   R4 the warning is keyed on roster-path resolution, not scanner stdout
+# ---------------------------------------------------------------------------
+
+_ROSTER_WARNING_PREFIX = "WARNING: name-roster half of the leak gate did NOT run"
+
+
+def _target_state(tgt: Path) -> tuple[str, str]:
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(tgt),
+                         capture_output=True, text=True, check=True).stdout
+    porcelain = subprocess.run(["git", "status", "--porcelain"], cwd=str(tgt),
+                               capture_output=True, text=True, check=True).stdout
+    return sha, porcelain
+
+
+def _release_commit_exists(tgt: Path) -> bool:
+    log = subprocess.run(["git", "log", "--format=%s"], cwd=str(tgt),
+                         capture_output=True, text=True, check=True).stdout
+    return "v0.1.0" in log
+
+
+_BASE_ARGS = ["--version", "v0.1.0", "--yes",
+              "--author", "Test Author <test@test.local>"]
+
+
+def _write_roster(path: Path) -> None:
+    path.write_text(json.dumps({
+        "patterns": [{"regex": r"\b(Zzyzx)\b", "label": "personal name"}],
+    }))
+
+
+class TestScanLeaksFlagAndRosterWarning:
+    def test_s1_flag_overrides_missing_default(self, tmp_path):
+        src = _make_source_repo(tmp_path)
+        _git(["rm", "-q", "tools/scan-leaks.py"], cwd=str(src))
+        _git(["commit", "-qm", "drop scanner"], cwd=str(src))
+        assert not (src / "tools" / "scan-leaks.py").exists()
+        tgt = _make_target_repo(tmp_path)
+        result = _run_tool(_BASE_ARGS + ["--source", str(src), "--target", str(tgt),
+                                         "--scan-leaks", str(SCAN_LEAKS_PATH)])
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout}\nstderr: {result.stderr}")
+        assert _release_commit_exists(tgt)
+
+    def test_s2_nonexistent_flag_fails_closed(self, tmp_path):
+        # Default scanner IS present: only the resolved (flag) path can fail.
+        src = _make_source_repo(tmp_path)
+        assert (src / "tools" / "scan-leaks.py").exists()
+        tgt = _make_target_repo(tmp_path)
+        before = _target_state(tgt)
+        bogus = "/nonexistent/x.py"
+        result = _run_tool(_BASE_ARGS + ["--source", str(src), "--target", str(tgt),
+                                         "--scan-leaks", bogus])
+        assert result.returncode != 0
+        assert "scan-leaks.py not found" in result.stderr
+        assert bogus in result.stderr
+        assert _target_state(tgt) == before
+
+    def test_s3_default_unchanged(self, tmp_path):
+        src = _make_source_repo(tmp_path)
+        tgt = _make_target_repo(tmp_path)
+        result = _run_tool(_BASE_ARGS + ["--source", str(src), "--target", str(tgt)])
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout}\nstderr: {result.stderr}")
+        assert "scan-leaks.py not found" not in result.stderr
+        assert _release_commit_exists(tgt)
+
+    def test_r1_warning_when_no_roster(self, tmp_path):
+        src = _make_source_repo(tmp_path)
+        assert not (src / ".scan-leaks-local.json").exists()
+        tgt = _make_target_repo(tmp_path)
+        result = _run_tool(_BASE_ARGS + ["--source", str(src), "--target", str(tgt)])
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout}\nstderr: {result.stderr}")
+        assert _release_commit_exists(tgt)
+        assert result.stderr.count(_ROSTER_WARNING_PREFIX) == 1, result.stderr
+
+    def test_r2_no_warning_with_roster_flag(self, tmp_path):
+        src = _make_source_repo(tmp_path)
+        roster = tmp_path / "roster.json"
+        _write_roster(roster)
+        tgt = _make_target_repo(tmp_path)
+        result = _run_tool(_BASE_ARGS + ["--source", str(src), "--target", str(tgt),
+                                         "--leak-roster", str(roster)])
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout}\nstderr: {result.stderr}")
+        assert _ROSTER_WARNING_PREFIX not in result.stderr
+
+    def test_r3_no_warning_with_default_roster_file(self, tmp_path):
+        src = _make_source_repo(tmp_path)
+        _write_roster(src / ".scan-leaks-local.json")
+        tgt = _make_target_repo(tmp_path)
+        result = _run_tool(_BASE_ARGS + ["--source", str(src), "--target", str(tgt)])
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout}\nstderr: {result.stderr}")
+        assert _ROSTER_WARNING_PREFIX not in result.stderr
+
+    def test_r4_warning_does_not_depend_on_scanner_stdout(self, tmp_path):
+        # A stub scanner whose stdout never says 'personal-name scan skipped'
+        # must still get the warning when no roster resolves; a stub that
+        # prints the phrase must NOT trigger it when a roster resolves.
+        stub = tmp_path / "stub-scan.py"
+        stub.write_text("import sys\nprint('stub scanner ok')\nsys.exit(0)\n")
+        src = _make_source_repo(tmp_path)
+        tgt = _make_target_repo(tmp_path)
+        r = _run_tool(_BASE_ARGS + ["--source", str(src), "--target", str(tgt),
+                                    "--scan-leaks", str(stub)])
+        assert r.returncode == 0, r.stderr
+        assert r.stderr.count(_ROSTER_WARNING_PREFIX) == 1, r.stderr
+
+        stub2 = tmp_path / "stub-scan2.py"
+        stub2.write_text("import sys\nprint('personal-name scan skipped')\nsys.exit(0)\n")
+        roster = tmp_path / "roster.json"
+        _write_roster(roster)
+        tmp2 = tmp_path / "second"
+        tmp2.mkdir()
+        src2 = _make_source_repo(tmp2)
+        tgt2 = _make_target_repo(tmp2)
+        r2 = _run_tool(_BASE_ARGS + ["--source", str(src2), "--target", str(tgt2),
+                                     "--scan-leaks", str(stub2),
+                                     "--leak-roster", str(roster)])
+        assert r2.returncode == 0, r2.stderr
+        assert _ROSTER_WARNING_PREFIX not in r2.stderr
+
+    def test_r5_mistyped_roster_flag_warns(self, tmp_path):
+        src = _make_source_repo(tmp_path)
+        tgt = _make_target_repo(tmp_path)
+        bogus = str(tmp_path / "does-not-exist.json")
+        result = _run_tool(_BASE_ARGS + ["--source", str(src), "--target", str(tgt),
+                                         "--leak-roster", bogus])
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout}\nstderr: {result.stderr}")
+        assert _release_commit_exists(tgt)
+        assert result.stderr.count(_ROSTER_WARNING_PREFIX) == 1, result.stderr
+        assert bogus in result.stderr
+
+    def test_r7_directory_roster_is_not_a_file(self, tmp_path):
+        src = _make_source_repo(tmp_path)
+        tgt = _make_target_repo(tmp_path)
+        a_dir = tmp_path / "roster-dir"
+        a_dir.mkdir()
+        result = _run_tool(_BASE_ARGS + ["--source", str(src), "--target", str(tgt),
+                                         "--leak-roster", str(a_dir)])
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout}\nstderr: {result.stderr}")
+        assert _release_commit_exists(tgt)
+        assert result.stderr.count(_ROSTER_WARNING_PREFIX) == 1, result.stderr
+        assert str(a_dir) in result.stderr
+
+    def test_q1_tilde_roster_is_expanded_not_warned(self, tmp_path):
+        # The shell does not expand ~ after '=' (or inside quotes); the scanner
+        # does (.expanduser()), so a real roster named via ~ must not draw the
+        # "not found" warning.
+        src = _make_source_repo(tmp_path)
+        tgt = _make_target_repo(tmp_path)
+        fake_home = tmp_path / "fakehome"
+        fake_home.mkdir()
+        _write_roster(fake_home / "r.json")
+        env = dict(os.environ, HOME=str(fake_home))
+        result = _run_tool(_BASE_ARGS + ["--source", str(src), "--target", str(tgt),
+                                         "--leak-roster=~/r.json"], env=env)
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout}\nstderr: {result.stderr}")
+        assert _release_commit_exists(tgt)
+        assert _ROSTER_WARNING_PREFIX not in result.stderr, result.stderr
+
+    def test_q2_scan_leaks_directory_fails_closed(self, tmp_path):
+        src = _make_source_repo(tmp_path)
+        tgt = _make_target_repo(tmp_path)
+        before = _target_state(tgt)
+        a_dir = tmp_path / "scanner-dir"
+        a_dir.mkdir()
+        result = _run_tool(_BASE_ARGS + ["--source", str(src), "--target", str(tgt),
+                                         "--scan-leaks", str(a_dir)])
+        assert result.returncode != 0
+        assert str(a_dir) in result.stderr
+        assert "not found at" in result.stderr
+        assert _target_state(tgt) == before

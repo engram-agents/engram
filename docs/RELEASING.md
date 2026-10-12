@@ -392,7 +392,19 @@ Key flags (from `--help`):
   persona-specific dev tools, the `tests/` tree, and `.github/` (private CI).
   Review it if new private-only paths appear.
 - `--leak-roster` — path to `.scan-leaks-local.json` for the personal-name
-  pattern gate; default `<source>/.scan-leaks-local.json` if present.
+  pattern gate; default `<source>/.scan-leaks-local.json` if present. When
+  neither resolves, or the resolved path is not a regular file (mistyped
+  path, directory), the tool prints `WARNING: name-roster half of the leak
+  gate did NOT run ...` to stderr (non-fatal: structural patterns only). A
+  roster file that exists but is unusable (`{}` or malformed JSON) draws no
+  WARNING line; the final summary's `leak gate` label reading `PASS (structural
+  patterns only; personal-name scan skipped ...)` is the signal (measured for
+  both cases, 2026-10-12).
+- `--scan-leaks` — path to the leak-scanner script; default
+  `<source>/tools/scan-leaks.py`. Use it when `--source` is a repo that does
+  not carry that script. A path that is not an existing file (nonexistent, or
+  a directory) fails closed before the target is touched; the path must be a
+  Python scanner, and the tool does not inspect its contents.
 - `--author` — commit author; defaults to whatever's parsed from the LICENSE
   copyright line.
 - `--push` — push the branch + tag to the target's origin after committing.
@@ -444,7 +456,9 @@ deterministic from `<source-ref>` + the minus-set, so a colleague can rebuild
 it into a scratch clone (never the real remote, never `--push`) and compare
 `git rev-parse vX.Y.Z^{tree}`. Commits will differ (author, date); the tree
 must not. **Two runs, because they cannot be combined:** (a) **roster-less**
-(`--leak-roster /nonexistent/none.json`) produces the tree to compare;
+(`--leak-roster /nonexistent/none.json`; expect the `WARNING: name-roster half
+... did NOT run` line on stderr, which is this run working as intended)
+produces the tree to compare;
 (b) **with your own roster** the gate fires on every roster hit and aborts
 *before the target is written* — that run yields the personal-name axis and
 deliberately produces no tree. Expect the abort in (b); it is the gate
