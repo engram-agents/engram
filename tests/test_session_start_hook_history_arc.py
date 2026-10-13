@@ -406,6 +406,7 @@ def test_history_arc_precedes_calibration_and_is_adjacent_to_checkpoint(engram_h
         "VALUES (?, ?, ?, ?, 1, 'active')",
         ("ob_0099", "observation_factual", "Ordering-test node.", seeded),
     )
+    conn.execute("PRAGMA user_version = 1")  # #3741: a real store carries a schema version; the flag-OFF calibration block now runs only on one
     conn.commit()
     conn.close()
 

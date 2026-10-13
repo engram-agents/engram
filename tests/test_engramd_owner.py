@@ -2408,7 +2408,7 @@ _EXPENSIVE_CARTESIAN_SQL = (
 
 
 @requires_linux_owner
-def test_expensive_read_is_aborted_by_deadline_and_cheap_read_is_not(owner_running):
+def test_expensive_read_is_aborted_by_deadline_and_cheap_read_is_not(owner_running, tmp_path):
     """Design doc test 12: a deliberately expensive read is aborted by the
     deadline, and a cheap read is not. Bounds VM-instruction cost only
     (test 19 covers the size axis; the end-to-end-deadline axis, test 20,
@@ -2428,7 +2428,7 @@ def test_expensive_read_is_aborted_by_deadline_and_cheap_read_is_not(owner_runni
     fixture_registry = rr.build_registry(
         ["SELECT 1", _EXPENSIVE_CARTESIAN_SQL], sqlite3.connect(":memory:")
     )
-    gate = eo._ClientReadGate(owner_running._client_read_conn, registry=fixture_registry)
+    gate = eo._ClientReadGate(owner_running._client_read_conn, registry=fixture_registry, home=tmp_path)
 
     # Cheap read: comfortably under a generous deadline, completes.
     rows = gate.execute("SELECT 1", deadline=time.monotonic() + 5.0)
@@ -2633,7 +2633,7 @@ def test_snapshot_copies_from_the_owner_internal_connection_not_client_read(engr
 
 
 @requires_linux_owner
-def test_single_value_size_is_bounded_independently_of_progress_handler(owner_running):
+def test_single_value_size_is_bounded_independently_of_progress_handler(owner_running, tmp_path):
     """Design doc test 19: single-value size is bounded independently of
     the progress handler. `SELECT zeroblob(N)` above the configured
     SQLITE_LIMIT_LENGTH is refused on the client-read connection; a
@@ -2655,7 +2655,7 @@ def test_single_value_size_is_bounded_independently_of_progress_handler(owner_ru
     under_sql = f"SELECT length(zeroblob({limit - 1}))"
     over_sql = f"SELECT zeroblob({limit + 1})"
     fixture_registry = rr.build_registry([under_sql, over_sql], sqlite3.connect(":memory:"))
-    gate = eo._ClientReadGate(owner_running._client_read_conn, registry=fixture_registry)
+    gate = eo._ClientReadGate(owner_running._client_read_conn, registry=fixture_registry, home=tmp_path)
 
     under = gate.execute(under_sql, deadline=time.monotonic() + 5.0)
     assert under == [(limit - 1,)]

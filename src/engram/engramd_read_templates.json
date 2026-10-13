@@ -188,6 +188,7 @@
     }
   ],
   "authorizer_governed": [
+    "hooks/claude/engram-session-start-hook.py:_main_impl",
     "hooks/claude/engram-surface-hook.py:_check_db_liveness"
   ],
   "write_sites": [

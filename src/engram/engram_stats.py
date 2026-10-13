@@ -63,6 +63,83 @@ _CONFIDENCE_BEARING_TYPES = (
 )
 
 
+# ---------------------------------------------------------------------------
+# #3741: the window + by_type pieces shared by `engram_stats` and the engramd
+# `confidence_by_type` owner op, so the two are equal by construction.
+# ---------------------------------------------------------------------------
+
+STATS_MODES = ("all", "1-turn", "7-turn", "30-turn")
+
+# Turn-unit → wall-clock approximation: 1 turn ≈ 24h (dream cycle advances ~daily).
+# Accurate in steady-state; drifts during high/low-velocity periods. Future: record
+# last_turn_advance in config.json and use that boundary directly.
+_MODE_HOURS = {"1-turn": 24, "7-turn": 168, "30-turn": 720}
+
+
+def _now_utc() -> datetime:
+    """The one clock for the mode window: `_stats_impl` and the owner op both call it."""
+    return datetime.now(timezone.utc)
+
+
+def _window_for_mode(mode, now: datetime) -> tuple:
+    """The ONLY place a mode becomes SQL: returns (created_at_filter, filter_args).
+
+    Raises ValueError for a non-str mode or one not in STATS_MODES (the inner guard: a
+    list/dict/None mode must not reach a dict lookup). The cutoff format is unchanged:
+    %Y-%m-%dT%H:%M:%SZ, compared as a string."""
+    if not isinstance(mode, str) or mode not in STATS_MODES:
+        raise ValueError(f"unknown stats mode (expected one of {list(STATS_MODES)})")
+    if mode == "all":
+        return "", []
+    cutoff_dt = now - timedelta(hours=_MODE_HOURS[mode])
+    return " AND created_at >= ?", [cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")]
+
+
+def _confidence_by_type(conn: sqlite3.Connection, created_at_filter: str, filter_args: list) -> dict:
+    """The by_type section of the confidence distribution (n, mean, p25..p95 per node type).
+
+    Reads rows by POSITION (r[0]): the engramd owner's client-read connection has no
+    row_factory. Status filter: is_current=1 AND (status IS NULL OR status != 'retracted')."""
+    _base_filter = (
+        " AND is_current = 1"
+        " AND (status IS NULL OR status != 'retracted')"
+    )
+    by_type: dict = {}
+    for ntype in _CONFIDENCE_BEARING_TYPES:
+        rows = conn.execute(
+            "SELECT confidence FROM nodes WHERE type = ?"
+            + _base_filter
+            + created_at_filter
+            + " AND confidence IS NOT NULL ORDER BY confidence ASC",
+            [ntype] + filter_args,
+        ).fetchall()
+        confidences = [r[0] for r in rows]
+        if not confidences:
+            continue
+        n = len(confidences)
+        mean_val = round(sum(confidences) / n, 3)
+        by_type[ntype] = {
+            "n": n,
+            "mean": mean_val,
+            "p25": round(_percentile(confidences, 25), 2),
+            "p50": round(_percentile(confidences, 50), 2),
+            "p75": round(_percentile(confidences, 75), 2),
+            "p90": round(_percentile(confidences, 90), 2),
+            "p95": round(_percentile(confidences, 95), 2),
+        }
+    return by_type
+
+
+def confidence_by_type(conn: sqlite3.Connection, modes, now: datetime) -> dict:
+    """{mode: {"by_type": ...}} for each mode. Read-only: no write, no tool_timing, no
+    migration, no _get_db -- the caller supplies the connection."""
+    out: dict = {}
+    for mode in modes:
+        created_at_filter, filter_args = _window_for_mode(mode, now)
+        out[mode] = {"by_type": _confidence_by_type(conn, created_at_filter, filter_args)}
+    return out
+
+
 def _compute_confidence_distribution(
     conn: sqlite3.Connection,
     created_at_filter: str,
@@ -86,31 +163,8 @@ def _compute_confidence_distribution(
         " AND (status IS NULL OR status != 'retracted')"
     )
 
-    # ── by_type: full quantile stats ──────────────────────────────────────
-    # _CONFIDENCE_BEARING_TYPES is now a module-level constant (promoted #1225).
-    by_type: dict = {}
-    for ntype in _CONFIDENCE_BEARING_TYPES:
-        rows = conn.execute(
-            "SELECT confidence FROM nodes WHERE type = ?"
-            + _base_filter
-            + created_at_filter
-            + " AND confidence IS NOT NULL ORDER BY confidence ASC",
-            [ntype] + filter_args,
-        ).fetchall()
-        confidences = [r["confidence"] for r in rows]
-        if not confidences:
-            continue
-        n = len(confidences)
-        mean_val = round(sum(confidences) / n, 3)
-        by_type[ntype] = {
-            "n": n,
-            "mean": mean_val,
-            "p25": round(_percentile(confidences, 25), 2),
-            "p50": round(_percentile(confidences, 50), 2),
-            "p75": round(_percentile(confidences, 75), 2),
-            "p90": round(_percentile(confidences, 90), 2),
-            "p95": round(_percentile(confidences, 95), 2),
-        }
+    # ── by_type: full quantile stats (shared with the engramd confidence_by_type op, #3741) ──
+    by_type = _confidence_by_type(conn, created_at_filter, filter_args)
 
     # ── by_quote_type: mean only, restricted to observation_factual ────────
     by_quote_type: dict = {}
@@ -240,21 +294,16 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
         return wanted is None or section in wanted
 
     # ── Build window filter ────────────────────────────────────────────────
-    # Turn-unit → wall-clock approximation: 1 turn ≈ 24h (dream cycle advances ~daily).
-    # Accurate in steady-state; drifts during high/low-velocity periods. Future: record
-    # last_turn_advance in config.json and use that boundary directly.
-    _MODE_HOURS = {"1-turn": 24, "7-turn": 168, "30-turn": 720}
-    now_utc = datetime.now(timezone.utc)
+    # (mode → SQL lives in _window_for_mode, shared with the owner's confidence_by_type op.)
+    now_utc = _now_utc()
     window_meta: Optional[dict] = None
     created_at_filter = ""   # empty string = no filter (mode="all")
     filter_args: list = []
 
     if mode != "all":
         hours = _MODE_HOURS[mode]
-        cutoff_dt = now_utc - timedelta(hours=hours)
-        cutoff_iso = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        created_at_filter = " AND created_at >= ?"
-        filter_args = [cutoff_iso]
+        created_at_filter, filter_args = _window_for_mode(mode, now_utc)
+        cutoff_iso = filter_args[0]
         window_meta = {
             "mode": mode,
             "approx_hours": hours,

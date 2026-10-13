@@ -55,12 +55,13 @@ session-start hook as a FRESH PROCESS per fire (the harness runs it that way; th
 the interpreter, the imports and the calibration block's EngramClient), baseline = the
 engramd.session_start_reads_via_owner flag OFF, owner = flag ON with a REAL owner already up (WARM).
 The contract is the design seat's ruling on #3747, an ALLOW-LIST: on the flag-ON path EVERY recorded
-open of knowledge.db must carry a stack frame whose file BASENAME is exactly `engram_client.py` (the
-calibration block, which U9 deliberately does not migrate: #3741); any other open is a violation that
-names the opener's frames (not "no open from the six readers": a deny-list passes silently when a
-seventh opener appears). Calibration opens are counted and reported, never gated on their value.
-ONE constant, CALIBRATION_STILL_OPENS, drives both modes: True = allow-list {calibration} and the
-must-engage raise on; False (flip it when #3741 lands) = allow-list empty, raise off, `opens == 0`.
+open of knowledge.db is a violation that names the opener's frames (not "no open from the six readers":
+a deny-list passes silently when a seventh opener appears). Since #3741 the calibration block also reads
+through the owner on the flag-ON path (one typed `confidence_by_type` request), so the allow-list is empty
+and the gate cell is `opens_flag_on == 0`; on flag OFF the calibration block still opens the store through
+`engram_client.py` and is counted, never gated. ONE constant, CALIBRATION_STILL_OPENS (now False), drives
+both modes: True = allow-list = opens with a frame in `engram_client.py` and the must-engage raise on
+(the pre-#3741 world, kept for the cells that test it); False = allow-list empty, raise off, `opens == 0`.
 If no open is attributed to the calibration path on either path the arm RAISES (ArmBlind, "exclusion
 never engaged") instead of passing; so it does when a reader is not reached on a path, or a WARM fire
 prints a `waited N ms` notice. The gate cell is the INSTALLED layout's sequential p50 owner/baseline
@@ -1039,20 +1040,24 @@ def _bind_tripwire(home: Path, exclusion: bool, hook_path: Path, cleanups: List[
 # $ENGRAM_HOME/config.json the hook's six store readers (the count(*) of _check_backup_staleness,
 # _check_embedding_restore_flag, focus_block, saved_focus_sets_block, session_checkpoint_block,
 # sleep_status_block) read through ONE OwnerReadConnection and never open knowledge.db. The calibration
-# block in main() (`EngramClient().call("engram_stats", ...)`) is NOT migrated (#3741): it still opens the
-# store on BOTH paths, and it is the hook's dominant cost because it loads the server runtime.
+# block in main() was migrated by #3741: on the flag-ON path it asks the owner for ONE typed
+# `confidence_by_type` and never opens the store; on flag OFF it is unchanged (`EngramClient().call(
+# "engram_stats", ...)`, which still opens the store and is the hook's dominant cost because it loads the
+# server runtime). So flag OFF still shows opens, which is what keeps a zero on flag ON from being a
+# blind counter.
 #
-# THE CONTRACT (the design seat's ruling on #3747, Borges), shape (a), an ALLOW-LIST: on the flag-ON path
-# EVERY recorded open of knowledge.db must be attributed to the calibration path; any other open is a
-# violation and the violation names the opener's frames. The calibration path is identified by a stack
+# THE CONTRACT (the design seat's ruling on #3747, Borges), shape (a), an ALLOW-LIST: while
+# CALIBRATION_STILL_OPENS is true (the pre-#3741 world), EVERY recorded flag-ON open of knowledge.db must
+# be attributed to the calibration path; any other open is a violation and names the opener's frames.
+# With the constant False (now) the allow-list is empty. The calibration path is identified by a stack
 # frame whose file BASENAME equals exactly `engram_client.py` -- not `engramd_client.py` (the owner shim,
 # which must never open the store) and not a substring match. Calibration opens are counted and reported,
 # never gated on their value. It is NOT "no open from the six readers": a deny-list passes silently when a
 # seventh opener appears anywhere in main() or its callees.
 #
 # ONE constant drives both modes (CALIBRATION_STILL_OPENS): True -> allow-list = {calibration path} and the
-# must-engage raise is on; False (someone flips it when #3741 lands) -> allow-list empty, must-engage off,
-# the cell becomes `opens == 0`. If NO open is attributed to the calibration path on either path the arm
+# must-engage raise is on; False (flipped when #3741 landed) -> allow-list empty, must-engage off,
+# the cell is `opens == 0`. If NO open is attributed to the calibration path on either path the arm
 # RAISES (ArmBlind "exclusion never engaged"): zero means the attribution, the layout or the fixture is
 # blind (the #3739 lesson), which is a loud error, never a pass and never a violation-list entry.
 #
@@ -1068,7 +1073,7 @@ def _bind_tripwire(home: Path, exclusion: bool, hook_path: Path, cleanups: List[
 SS_FLAG_KEY = "session_start_reads_via_owner"
 SS_READERS = ("_check_backup_staleness", "_check_embedding_restore_flag", "focus_block",
               "saved_focus_sets_block", "session_checkpoint_block", "sleep_status_block")
-CALIBRATION_STILL_OPENS = True            # flip to False when #3741 (the calibration migration) lands
+CALIBRATION_STILL_OPENS = False           # #3741 landed (the calibration block reads through the owner); was True
 CALIBRATION_FRAME_BASENAME = "engram_client.py"   # exact basename equality, never a substring
 N_COLD = 30                               # cold-row fires (a reported row, not a gate): small on purpose
 SS_INJECTED_THROUGH = "2026-06-01T00:00:00+00:00"   # the pre-written marker's checkpoint boundary
@@ -1897,9 +1902,10 @@ def format_table(result: Dict) -> str:
             "a REAL owner already up (WARM). One home serves both paths: the config file is rewritten (untimed) "
             "before each timed fire of the sequential and cold-cache arms, once per phase in the contended arm "
             "(two concurrent fires per path). Per-fire files are cleaned between fires (untimed). The contract "
-            "line above is the design seat's allow-list (#3747): every flag-ON open of the store must carry an "
-            f"`{CALIBRATION_FRAME_BASENAME}` frame (the calibration block, not migrated until #3741; "
-            f"CALIBRATION_STILL_OPENS={CALIBRATION_STILL_OPENS}); calibration opens are counted, never gated "
+            "line above is the design seat's allow-list (#3747): with CALIBRATION_STILL_OPENS true every flag-ON "
+            f"open of the store must carry an `{CALIBRATION_FRAME_BASENAME}` frame (the calibration block, before "
+            f"#3741 migrated it); now CALIBRATION_STILL_OPENS={CALIBRATION_STILL_OPENS}, so the allow-list is "
+            "empty and the gate is opens_flag_on == 0; flag-OFF calibration opens are counted, never gated "
             "on their value. The COLD row is reported, not a gate: the owner launcher and the hook start in the "
             "same instant, with the wait read from the hook's own notice. GATE (the merge seat runs it on the "
             "production build): sequential p50 owner/baseline <= 1.0; every other row is reported.")

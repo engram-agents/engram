@@ -104,10 +104,14 @@ ENGRAM_HOME = (
 # ONE engramd_client.OwnerReadConnection shared by the whole fire and never open
 # knowledge.db. Flag OFF is the direct path. Modelled on U6b (engram-lesson-tripwire-hook.py).
 #
-# NOT migrated here (option A, the design seat's ruling on #3735): the calibration block in
-# main() (`EngramClient().call("engram_stats", ...)`) still opens the store directly, and on a
-# fresh home it is what builds the schema. So a flag-ON fire is NOT zero-open; that block is
-# its own unit (#3741).
+# The calibration block in main() is migrated by #3741: flag ON, it asks the owner ONE typed
+# `confidence_by_type` request (modes ["all", "7-turn"]) through the same shared connection and
+# renders it with the unchanged `format_calibration_block`; it never opens the store, never
+# imports engram_client / server / engram_core, and has NO fallback to the old EngramClient
+# path -- an owner failure (down, an older owner answering `unknown_operation`, budget spent)
+# renders no block and is recorded like any other owner failure. Flag OFF keeps the EngramClient
+# path unchanged (its writes included), behind a read-only `PRAGMA user_version > 0` guard so it
+# can no longer build a store that is absent or empty. A flag-ON fire is therefore zero-open.
 #
 # Owner failure (any OwnerReadError, or the client failing to import): the failing function
 # returns the degraded result it returns for a failed direct read (never a fallback to a direct
@@ -157,6 +161,7 @@ _OWNER_BLOCK_NAMES = {
     "saved_focus_sets_block": "saved focus-sets",
     "session_checkpoint_block": "session checkpoint",
     "sleep_status_block": "sleep status",
+    "calibration": "calibration block",
 }
 _OWNER_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
@@ -387,12 +392,21 @@ def _owner_failure_text(run: dict) -> str:
     if run.get("wait") is not None:
         waited = f"; waited {int(run['wait']['ms'])} ms for the owner socket"
     blocks = ", ".join(_OWNER_BLOCK_NAMES.get(s, s) for s in run["degraded"])
+    # #3741: an owner that predates the `confidence_by_type` op answers `unknown_operation`. Decided
+    # by TYPE (kind "rejected", a client `Rejected` result, its `.reason`), never by message text.
+    remedy = (
+        "To read the store directly meanwhile, set engramd.session_start_reads_via_owner "
+        "to false in $ENGRAM_HOME/config.json."
+    )
+    rejected_cls = getattr(run.get("ec"), "Rejected", None)
+    if (f["kind"] == "rejected" and rejected_cls is not None and isinstance(result, rejected_cls)
+            and result.reason == "unknown_operation" and f["site"] == "calibration"):
+        remedy = "The owner predates confidence_by_type; restart the owner."
     line = (
         f"⚠️  ENGRAM substrate health: engramd owner read failed at "
         f"{_sanitize_owner_text(f['site'], 60)} ({_sanitize_owner_text(f['kind'], 40)}{detail}){waited}. "
         f"Missing this fire (the read failed; it is NOT empty): {blocks}. "
-        "To read the store directly meanwhile, set engramd.session_start_reads_via_owner "
-        "to false in $ENGRAM_HOME/config.json."
+        + remedy
     )
     return line[:_OWNER_NOTICE_CAP]
 
@@ -4425,25 +4439,80 @@ def _main_impl() -> None:
     # is the hook's dominant cost. Keeping it after the cheap blocks means a
     # timeout here degrades only calibration, which is an anchor rather than a
     # continuity guarantee, instead of taking the focus list down with it.
+    #
+    # #3741: flag ON -> ONE typed `confidence_by_type` owner request, no direct open, no fallback.
+    # Flag OFF -> the EngramClient path below, unchanged (writes included), but only on a store
+    # that exists with a schema (`PRAGMA user_version > 0`, read-only): it used to build one.
     try:
-        _runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
-        os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
-        if _runtime_dir not in sys.path:
-            sys.path.insert(0, _runtime_dir)
-        from engram_client import EngramClient
-        _client = EngramClient()
-        _stats_all = _client.call(
-            "engram_stats", {"payload_json": json.dumps({"sections": ["confidence", "memory"]})}
-        )
-        _stats_7d = _client.call(
-            "engram_stats", {"payload_json": json.dumps({"mode": "7-turn", "sections": ["confidence"]})}
-        )
-        _current_turn = _stats_all.get("memory", {}).get("current_turn", 0)
-        _cal_block = format_calibration_block(
-            _stats_all.get("confidence", {}),
-            _stats_7d.get("confidence", {}),
-            _current_turn,
-        )
+        if _owner_active():
+            try:
+                _cal = _owner_conn().confidence_by_type(["all", "7-turn"])
+                # Shape check: an `ok` reply that is not the documented shape is an owner failure
+                # like any other (recorded, one health line), never a KeyError / TypeError the
+                # outer try would swallow with no trace. `bool` is an int subclass: refused.
+                _by_mode = _cal.get("by_mode") if isinstance(_cal, dict) else None
+                if not (
+                    isinstance(_by_mode, dict)
+                    and isinstance(_cal.get("current_turn"), int)
+                    and not isinstance(_cal.get("current_turn"), bool)
+                    and all(
+                        isinstance(_by_mode.get(_m), dict) and isinstance(_by_mode[_m].get("by_type"), dict)
+                        for _m in ("all", "7-turn")
+                    )
+                    # Per-type values: format_calibration_block prints n with `:4d` (an int, not a
+                    # float, even a whole one) and p25/p50/p75/p95 with `:.2f` (int or float); bool is
+                    # refused for all. Anything else would raise inside the formatter (or print a
+                    # wrong count), a non-owner exception the outer try swallows with no health line.
+                    and all(
+                        isinstance(_v, dict)
+                        and isinstance(_v.get("n"), int)
+                        and not isinstance(_v.get("n"), bool)
+                        and all(
+                            isinstance(_v.get(_k), (int, float)) and not isinstance(_v.get(_k), bool)
+                            for _k in ("p25", "p50", "p75", "p95")
+                        )
+                        for _m in ("all", "7-turn")
+                        for _v in _by_mode[_m]["by_type"].values()
+                    )
+                ):
+                    raise _OWNER_RUN["ec"].OwnerReadError("unusable_answer")
+                _cal_block = format_calibration_block(
+                    {"by_type": _by_mode["all"]["by_type"]},
+                    {"by_type": _by_mode["7-turn"]["by_type"]},
+                    _cal["current_turn"],
+                )
+                _owner_note_served()
+            except Exception as _cal_exc:
+                # Every owner failure is recorded (one health line per fire); NO fallback.
+                if not _record_owner_failure("calibration", _cal_exc):
+                    raise
+                _cal_block = ""
+        else:
+            _cal_block = ""
+            _guard = connect_regular_ro(ENGRAM_DB_PATH, timeout=1.0)
+            try:
+                _has_schema = _guard.execute("PRAGMA user_version").fetchone()[0] > 0
+            finally:
+                _guard.close()
+            if _has_schema:
+                _runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
+                os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
+                if _runtime_dir not in sys.path:
+                    sys.path.insert(0, _runtime_dir)
+                from engram_client import EngramClient
+                _client = EngramClient()
+                _stats_all = _client.call(
+                    "engram_stats", {"payload_json": json.dumps({"sections": ["confidence", "memory"]})}
+                )
+                _stats_7d = _client.call(
+                    "engram_stats", {"payload_json": json.dumps({"mode": "7-turn", "sections": ["confidence"]})}
+                )
+                _current_turn = _stats_all.get("memory", {}).get("current_turn", 0)
+                _cal_block = format_calibration_block(
+                    _stats_all.get("confidence", {}),
+                    _stats_7d.get("confidence", {}),
+                    _current_turn,
+                )
         if _cal_block:
             _blocks.append((_P_REST, _cal_block))
     except Exception:

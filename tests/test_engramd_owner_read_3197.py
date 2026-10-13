@@ -251,7 +251,7 @@ _BIG = (
 
 
 @requires_linux_owner
-def test_o6_overrunning_read_gets_the_deadline_rejection_not_a_hang(real_owner):
+def test_o6_overrunning_read_gets_the_deadline_rejection_not_a_hang(real_owner, tmp_path):
     """The request deadline (0.6 s here) applies end to end to `read`: an
     expensive admitted statement is aborted and the client gets
     Rejected(deadline_exceeded) well inside the client's own 3 s bound.
@@ -260,7 +260,7 @@ def test_o6_overrunning_read_gets_the_deadline_rejection_not_a_hang(real_owner):
     Mutation: let the OperationalError escape the handler -> connection
     dropped -> Unavailable -> red."""
     fixture_registry = rr.build_registry([_BIG], sqlite3.connect(":memory:"))
-    real_owner._client_read_gate = eo._ClientReadGate(real_owner._client_read_conn, registry=fixture_registry)
+    real_owner._client_read_gate = eo._ClientReadGate(real_owner._client_read_conn, registry=fixture_registry, home=tmp_path)
     start = time.monotonic()
     result = _read(real_owner, _BIG, [], timeout=3.0)
     elapsed = time.monotonic() - start

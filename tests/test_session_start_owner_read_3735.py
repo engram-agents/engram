@@ -223,6 +223,16 @@ def stub_modules(monkeypatch):
     monkeypatch.setitem(sys.modules, "engram_client", MagicMock(EngramClient=_NoCalibration))
 
 
+def stub_calibration_reads(monkeypatch):
+    """#3741: the in-process twin of `stub_modules`' `_NoCalibration` for the flag-ON path -- the
+    calibration block's owner request is answered locally with an empty distribution (renders no
+    block), so a cell about the six blocks / the wait is not about calibration."""
+    monkeypatch.setattr(
+        ec.OwnerReadConnection, "confidence_by_type",
+        lambda self, modes: {"current_turn": 0, "by_mode": {m: {"by_type": {}} for m in modes}},
+        raising=False)
+
+
 def quiet(mod):
     """Make a hook module hermetic: nothing but the store/state under ENGRAM_HOME is read."""
     mod.detect_harness = lambda: "claude-code"
@@ -582,6 +592,16 @@ mod.peer_topology_block = lambda a: ""
 mod.starred_block = lambda h: ""
 for k, v in scen.get("module_attrs", {}).items():
     setattr(mod, k, v)
+if scen.get("stub_calibration", True) and hasattr(mod, "_import_engramd_client"):  # the oracle hook has none
+    # #3741: with the flag ON the calibration block asks the owner (`confidence_by_type`); "stubbed
+    # away" now also means that request is answered locally with an empty distribution.
+    _orig_import = mod._import_engramd_client
+    def _stub_import():
+        m = _orig_import()
+        m.OwnerReadConnection.confidence_by_type = (
+            lambda self, modes: {"current_turn": 0, "by_mode": {md: {"by_type": {}} for md in modes}})
+        return m
+    mod._import_engramd_client = _stub_import
 sys.stdin = io.StringIO(json.dumps(scen["stdin"]))
 real_out, real_err = sys.stdout, sys.stderr
 sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
@@ -692,41 +712,50 @@ def test_a_flag_on_full_fire_in_the_deployed_layout_has_zero_opens_attributed_to
         assert seen == ALL_EIGHT, sorted(ALL_EIGHT ^ seen)
 
 
-def test_a2_characterization_the_calibration_block_is_the_only_remaining_opener(home, tmp_path):
-    """CHARACTERIZATION (option A, design seat's ruling): with the flag ON and the owner up, the
-    REAL calibration block (`EngramClient().call("engram_stats")`) still opens the store directly:
-    every remaining open is attributed to the hook's own main flow, none to the six. On a FRESH home
-    (no store) the file and its schema are built by those calibration opens and by none of the six
-    (which create nothing). When the calibration block moves (#3741), flip this cell deliberately.
-    Mutation: stub the calibration block away (M21) -> no remaining opener -> red."""
-    build_store(home)
-    set_flag(home, True)
+@requires_linux_owner
+def test_a2_post_3741_the_calibration_block_is_served_by_the_owner_and_nothing_opens(
+        home, tmp_path, monkeypatch):
+    """FLIPPED DELIBERATELY by #3741 (was `test_a2_characterization_the_calibration_block_is_the_only_
+    remaining_opener`, which pinned option A: the calibration block still opened the store directly
+    and, on a fresh home, built the schema). Post-#3741, flag ON with the REAL calibration block (not
+    stubbed) and the owner up: the hook opens the store ZERO times, asks the owner for
+    `confidence_by_type` (seen through a spy on the client's `read`), and on a FRESH home (no
+    store, no owner) nothing is built: no store file, no open at all.
+    It also pins WHAT the hook asks and renders: exactly one `confidence_by_type` request whose params
+    are exactly `{"modes": ["all", "7-turn"]}` (the spy is widened here to record params), and a block
+    equal to the one the current code renders for the same store (the history-free oracle of
+    test_calibration_owner_op_3741, which also seeds confidence rows so the block is not empty).
+    Carries the owner-platform marker: it starts a REAL owner.
+    Red until #3741 lands (the block still goes through EngramClient and opens directly).
+    Mutation: keep the old EngramClient path for flag ON (M1) -> opens -> red."""
+    import test_calibration_owner_op_3741 as cal  # lazy: that module imports this one
+    spy_line = 'calls.append([method, (params or {}).get("sql") if method == "read" else None])'
+    widened = RUNNER.replace(spy_line, spy_line.replace("else None])", "else None, params])"))
+    assert widened != RUNNER, "RUNNER's spy line changed shape: params could not be recorded"
+    monkeypatch.setattr(sys.modules[__name__], "RUNNER", widened)
+    cal.live_store(home, flag=True, turn=41)  # build_store + confidence rows + flag ON + turn 41
     seed_marker(home)
+    expected = cal.oracle_calibration_block(home, tmp_path)
+    assert cal.CAL_MARK in expected and "turn 41" in expected, expected  # the oracle is not vacuous
     root = flattened_root(tmp_path)
     hook = root / "hooks" / "engram-session-start-hook.py"
-    with FakeOwner(home):
-        out = run_hook_subprocess(hook, home, tmp_path, stub_calibration=False)
+    with owner_of("real", home):
+        out = run_hook_subprocess(hook, home, tmp_path, stub_calibration=False, spy_read=True,
+                                  runtime_dir=root)
     assert out["rc"] == 0, out
-    assert attributed_to_six(out["opens"]) == [], out["opens"]
-    rest = {o["caller"] for o in out["opens"]}
-    # `None`: opens made by the calibration runtime on threads of its own (no hook frame on that stack)
-    assert "_main_impl" in rest and rest <= {"_main_impl", "main", None}, out["opens"]
-    # fresh home: the six create nothing, the calibration block builds the schema
+    assert out["opens"] == [], out["opens"]
+    asked = [c for c in out["calls"] if c[0] == "confidence_by_type"]
+    assert len(asked) == 1, out["calls"]
+    assert asked[0][2] == {"modes": ["all", "7-turn"]}, asked[0]
+    assert cal._calibration_block(out["ctx"]) == cal._calibration_block(expected), (out["ctx"], expected)
+    # fresh home: nothing opens and nothing is built (formerly: the calibration block built the schema)
     fresh = tmp_path / "fresh"
     fresh.mkdir()
     set_flag(fresh, True)
     out2 = run_hook_subprocess(hook, fresh, tmp_path, stub_calibration=False)
     assert out2["rc"] == 0, out2
-    assert attributed_to_six(out2["opens"]) == [], out2["opens"]
-    assert out2["opens"], "nothing opened the fresh store: the schema did not come from the calibration block"
-    created = [o for o in out2["opens"] if not o["exists_before"] and not o["ro"]]
-    assert created and all(o["caller"] in ("_main_impl", "main", None) for o in created), out2["opens"]
-    conn = sqlite3.connect(str(fresh / "knowledge.db"))
-    try:
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    finally:
-        conn.close()
-    assert "nodes" in tables, tables
+    assert out2["opens"] == [], out2["opens"]
+    assert out2["store_exists"] is False, out2["store_size"]
 
 
 # =========================================================================================
@@ -1143,6 +1172,7 @@ def test_d1_the_owner_comes_up_late_the_blocks_are_served_after_one_bounded_wait
     Mutation: no wait (M3-family: wait disabled) -> the blocks degrade -> red; the retry sends a
     different statement or twice (M19) -> the statement log differs -> red."""
     mod = full_fire_setup(home, monkeypatch)
+    stub_calibration_reads(monkeypatch)
     seen = Script(monkeypatch, lambda m, s, n: None)
     with LateOwner("fake", home, 0.15):
         run = run_main(mod, home)
@@ -1184,6 +1214,7 @@ def test_d1_the_wait_is_the_same_under_the_real_owner(owner_kind, home, monkeypa
     """d1 against both owners: ready after 150 ms -> every block served, one 'then served' line.
     Mutation: a wait that never polls (sleeps the whole bound) -> N ~ 500 ms > the tolerance -> red."""
     mod = full_fire_setup(home, monkeypatch)
+    stub_calibration_reads(monkeypatch)
     with LateOwner(owner_kind, home, 0.15):
         run = run_main(mod, home)
     assert run.exc is None, run.exc
@@ -1259,6 +1290,7 @@ def test_d5_an_owner_that_is_up_has_no_wait_and_no_wait_line(home, monkeypatch):
     """Owner already up: zero ping attempts, no wait line, no notice. Mutation: a ping before the
     first read (an unconditional probe) -> pings > 0 -> red."""
     mod = full_fire_setup(home, monkeypatch)
+    stub_calibration_reads(monkeypatch)
     s = Script(monkeypatch, lambda m, sql, n: None)
     with FakeOwner(home):
         run = run_main(mod, home)
@@ -1835,6 +1867,7 @@ def test_k_the_successful_wait_line_is_not_rate_limited(home, monkeypatch):
     line shows on EVERY such fire (no stamp is consulted or written for it).
     Mutation: rate-limit the wait line (M11) -> the second fire lacks it -> red."""
     mod = full_fire_setup(home, monkeypatch)
+    stub_calibration_reads(monkeypatch)
     for _ in range(2):
         with LateOwner("fake", home, 0.12):
             run = run_main(load_ss(home, monkeypatch), home)

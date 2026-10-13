@@ -672,7 +672,7 @@ def test_chain_is_in_the_method_table_displacement_guarded_with_no_registration_
     -> red. No registration verb exists on the dispatch surface."""
     assert "chain" in chain_owner._methods
     assert "chain" not in eo.NO_STORE_METHODS
-    assert {"ping", "snapshot", "read", "df", "chain"} == set(chain_owner._methods)
+    assert {"ping", "snapshot", "read", "df", "chain", "confidence_by_type"} == set(chain_owner._methods)
     assert not [m for m in chain_owner._methods if re.search(r"regist", m, re.I)]
     tree = ast.parse(Path(eo.__file__).read_text(encoding="utf-8"))
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_dispatch")
@@ -916,7 +916,7 @@ def _proxy_gate(home):
     db = chain_store(home)
     conn = sqlite3.connect(str(db), check_same_thread=False)
     proxy = _HandlerRecordingConnection(conn)
-    return conn, proxy, eo._ClientReadGate(proxy)
+    return conn, proxy, eo._ClientReadGate(proxy, home=home)
 
 
 def test_r2_run_chain_leaves_no_progress_handler_armed_after_it_returns(home):
@@ -960,7 +960,7 @@ def _unstarted_owner(home):
     db = chain_store(home)
     conn = sqlite3.connect(str(db), check_same_thread=False)
     owner = eo.EngramdOwner(home)
-    owner._client_read_gate = eo._ClientReadGate(conn)
+    owner._client_read_gate = eo._ClientReadGate(conn, home=home)
     return owner, conn
 
 
@@ -972,7 +972,7 @@ class _AccessorSpy:
         self.owner, self.raises = owner, raises
         self.locked_at_call = []
 
-    def __call__(self):
+    def __call__(self, home):
         self.locked_at_call.append(self.owner._client_read_lock.locked())
         if self.raises is not None:
             raise self.raises

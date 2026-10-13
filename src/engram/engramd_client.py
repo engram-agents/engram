@@ -1233,6 +1233,41 @@ class OwnerReadConnection:
             raise OwnerReadError("rejected", result)
         raise OwnerReadError("unusable_answer")
 
+    def confidence_by_type(self, modes):
+        """The by_type confidence distribution for each of `modes` as ONE owner round trip
+        (#3741): sends the typed `confidence_by_type` method and returns the owner's dict
+        `{"current_turn": int, "by_mode": {mode: {"by_type": ...}}}` (JSON-decoded). Mirrors
+        `generalization_chain` exactly: closed -> RuntimeError, budget exhausted ->
+        OwnerReadError("budget_exhausted") (nothing sent, nothing counted), otherwise one counted
+        round trip; a non-dict answer is OwnerReadError("unusable_answer"); Unavailable /
+        Rejected (`.result` attached) / a client crash map as in `execute`. Deliberately thin:
+        nothing is validated here, the owner refuses a bad `modes` by name."""
+        if self._closed:
+            raise RuntimeError("closed")
+        remaining = self._total - (_monotonic() - self._start)
+        if remaining <= 0:
+            raise OwnerReadError("budget_exhausted")
+        timeout = min(self._per_call or self._total, remaining)
+        self.calls += 1
+        try:
+            result = read(
+                "confidence_by_type",
+                {"modes": modes},
+                timeout=timeout,
+                socket_path=self._socket_path,
+            )
+        except (Exception, SystemExit) as exc:
+            raise OwnerReadError("client_failure") from exc
+        if isinstance(result, Ok):
+            if not isinstance(result.result, dict):
+                raise OwnerReadError("unusable_answer")
+            return result.result
+        if isinstance(result, Unavailable):
+            raise OwnerReadError("unavailable", result)
+        if isinstance(result, Rejected):
+            raise OwnerReadError("rejected", result)
+        raise OwnerReadError("unusable_answer")
+
     def close(self):
         self._closed = True
 

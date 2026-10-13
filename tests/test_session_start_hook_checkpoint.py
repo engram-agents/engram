@@ -109,6 +109,7 @@ def _make_nodes_db(engram_home: Path, rows: list[dict]) -> None:
                 row.get("status", "active"),
             ),
         )
+    conn.execute("PRAGMA user_version = 1")  # #3741: a real store carries a schema version; the flag-OFF calibration block now runs only on one
     conn.commit()
     conn.close()
 

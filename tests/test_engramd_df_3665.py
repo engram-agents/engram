@@ -546,7 +546,7 @@ def test_execute_typed_refuses_a_non_member_statement_before_preparing_anything(
     conn.set_authorizer(lambda *a: calls.append(a) or sqlite3.SQLITE_OK)
     conn.set_trace_callback(traced.append)
     try:
-        gate = eo._ClientReadGate(conn)
+        gate = eo._ClientReadGate(conn, home=tmp_path)
         evil = "SELECT 'a-statement-that-is-well-over-sixty-characters-long-xxxxxxxxxxxxxxxxxxxxx'"
         with pytest.raises(ValueError) as info:
             gate.execute_typed(evil, (), deadline=time.monotonic() + 5.0)
@@ -562,7 +562,7 @@ def test_execute_typed_still_runs_both_members(tmp_path):
     db = _store(tmp_path)
     conn = sqlite3.connect(str(db))
     try:
-        gate = eo._ClientReadGate(conn)
+        gate = eo._ClientReadGate(conn, home=tmp_path)
         deadline = time.monotonic() + 5.0
         ddl = gate.execute_typed(eo.DF_VOCAB_DDL_SQL, (), deadline=deadline)
         assert len(ddl) == 1 and "fts5vocab" in ddl[0][0]

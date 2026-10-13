@@ -120,7 +120,7 @@ def test_06_one_byte_mutation_of_a_registered_template_is_rejected(schema, mutat
     OK_SQL.lower(),
     OK_SQL.replace("= ?", "=  ?"),
 ])
-def test_06_one_byte_mutation_is_refused_through_the_gate_and_never_prepared(schema, mutated):
+def test_06_one_byte_mutation_is_refused_through_the_gate_and_never_prepared(schema, mutated, tmp_path):
     """Same cells as above but through `_ClientReadGate.execute`, the path a
     real client takes (R13 requires design test 6 to go red when the registry
     lookup is deleted from the GATE; a cell that calls Registry.check directly
@@ -131,7 +131,7 @@ def test_06_one_byte_mutation_is_refused_through_the_gate_and_never_prepared(sch
     conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT, body TEXT, meta TEXT)")
     calls = []
     conn.set_authorizer(lambda *a: (calls.append(a), sqlite3.SQLITE_OK)[1])
-    gate = eo._ClientReadGate(conn, registry=reg)
+    gate = eo._ClientReadGate(conn, registry=reg, home=tmp_path)
     out = gate.execute(mutated, ("a",), deadline=DEADLINE_FAR)
     assert isinstance(out, rr.Rejected) and out.reason == "unregistered_template"
     assert calls == []
@@ -151,7 +151,7 @@ def test_rejected_wire_shape_carries_status_reason_detail_remedy():
 
 # --- R2: default-deny, nothing executes -------------------------------------
 
-def test_refused_request_prepares_zero_statements_and_changes_nothing():
+def test_refused_request_prepares_zero_statements_and_changes_nothing(tmp_path):
     """Mutation: on a miss, execute anyway and also return the rejection ->
     the counting authorizer sees activity and the sentinel row count moves."""
     conn = sqlite3.connect(":memory:")
@@ -165,7 +165,7 @@ def test_refused_request_prepares_zero_statements_and_changes_nothing():
         return sqlite3.SQLITE_OK
 
     conn.set_authorizer(counting)
-    gate = eo._ClientReadGate(conn, registry=rr.EMPTY_REGISTRY)
+    gate = eo._ClientReadGate(conn, registry=rr.EMPTY_REGISTRY, home=tmp_path)
     out = gate.execute("DELETE FROM notes", (), deadline=DEADLINE_FAR)
     assert isinstance(out, rr.Rejected) and out.reason == "unregistered_template"
     assert calls == [], "a refused request must not prepare any statement"
@@ -173,20 +173,20 @@ def test_refused_request_prepares_zero_statements_and_changes_nothing():
     assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 1
 
 
-def test_gate_without_a_registry_is_the_empty_registry_and_refuses_everything():
+def test_gate_without_a_registry_is_the_empty_registry_and_refuses_everything(tmp_path):
     conn = sqlite3.connect(":memory:")
-    gate = eo._ClientReadGate(conn)
+    gate = eo._ClientReadGate(conn, home=tmp_path)
     out = gate.execute("SELECT 1", (), deadline=DEADLINE_FAR)
     assert isinstance(out, rr.Rejected) and out.reason == "unregistered_template"
 
 
-def test_gate_executes_a_registered_template(schema):
+def test_gate_executes_a_registered_template(schema, tmp_path):
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT, body TEXT, meta TEXT)")
     conn.execute("INSERT INTO notes (title) VALUES ('hello')")
     conn.commit()
     reg = _admit(OK_SQL, schema)
-    gate = eo._ClientReadGate(conn, registry=reg)
+    gate = eo._ClientReadGate(conn, registry=reg, home=tmp_path)
     assert gate.execute(OK_SQL, ("hello",), deadline=DEADLINE_FAR) == [(1, "hello")]
 
 
@@ -501,14 +501,14 @@ def test_15_like_escaped_agrees_with_the_existing_like_escape_helper():
         assert rr.PARAM_RULES["like_escaped"](_like_escape(raw)) is None
 
 
-def test_15_invalid_parameter_reaches_the_request_path_and_is_not_executed(schema):
+def test_15_invalid_parameter_reaches_the_request_path_and_is_not_executed(schema, tmp_path):
     sql = "SELECT id FROM notes WHERE title LIKE ? ESCAPE '\\'"
     reg = rr.build_registry([sql], schema, param_policies={sql: {0: "like_escaped"}})
     conn = sqlite3.connect(":memory:")
     calls = []
     conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT, body TEXT, meta TEXT)")
     conn.set_authorizer(lambda *a: (calls.append(a), sqlite3.SQLITE_OK)[1])
-    gate = eo._ClientReadGate(conn, registry=reg)
+    gate = eo._ClientReadGate(conn, registry=reg, home=tmp_path)
     out = gate.execute(sql, ("a_c",), deadline=DEADLINE_FAR)
     assert isinstance(out, rr.Rejected)
     assert out.reason == "invalid_parameter" and out.detail == "like_escaped"
@@ -534,7 +534,7 @@ def test_07_registered_attach_template_is_denied_by_the_authorizer_layer(tmp_pat
     assert sql in reg.templates.values(), "ATTACH must be ADMITTED at registration"
     conn = sqlite3.connect(":memory:")
     conn.set_authorizer(eo._client_read_authorizer)
-    gate = eo._ClientReadGate(conn, registry=reg)
+    gate = eo._ClientReadGate(conn, registry=reg, home=tmp_path)
     with pytest.raises(sqlite3.Error):
         gate.execute(sql, (), deadline=DEADLINE_FAR)
     assert not target.exists()
@@ -742,16 +742,16 @@ def test_check_admits_every_sqlite_bindable_parameter_type(schema, good):
 
 
 @pytest.mark.parametrize("bad", [{"a": 1}, [1], 2 ** 70])
-def test_gate_returns_rejected_and_never_raises_on_an_unbindable_parameter(schema, bad):
+def test_gate_returns_rejected_and_never_raises_on_an_unbindable_parameter(schema, bad, tmp_path):
     reg = _admit("SELECT id FROM notes WHERE id = ?", schema)
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT, body TEXT, meta TEXT)")
-    gate = eo._ClientReadGate(conn, registry=reg)
+    gate = eo._ClientReadGate(conn, registry=reg, home=tmp_path)
     out = gate.execute("SELECT id FROM notes WHERE id = ?", (bad,), deadline=DEADLINE_FAR)
     assert isinstance(out, rr.Rejected) and out.reason == "invalid_parameter"
 
 
-def test_gate_does_not_leak_a_sqlite_error_for_malformed_json_into_json_each(schema):
+def test_gate_does_not_leak_a_sqlite_error_for_malformed_json_into_json_each(schema, tmp_path):
     """`json_each(?)` with malformed JSON raises OperationalError at execute.
     The gate must turn a SQLite error raised by an ADMITTED statement into a
     Rejected(reason='read_failed'), never propagate it."""
@@ -759,7 +759,7 @@ def test_gate_does_not_leak_a_sqlite_error_for_malformed_json_into_json_each(sch
     reg = _admit(sql, schema)
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT, body TEXT, meta TEXT)")
-    gate = eo._ClientReadGate(conn, registry=reg)
+    gate = eo._ClientReadGate(conn, registry=reg, home=tmp_path)
     out = gate.execute(sql, ("[1,2",), deadline=DEADLINE_FAR)
     assert isinstance(out, rr.Rejected) and out.reason == "read_failed"
 
@@ -816,17 +816,17 @@ def test_check_admits_well_formed_unicode_and_embedded_nul(schema, good):
     assert _admit(sql, schema).check(sql, (good,)) is None
 
 
-def test_gate_never_raises_on_a_lone_surrogate(schema):
+def test_gate_never_raises_on_a_lone_surrogate(schema, tmp_path):
     sql = "SELECT id FROM notes WHERE title = ?"
     reg = _admit(sql, schema)
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT, body TEXT, meta TEXT)")
-    gate = eo._ClientReadGate(conn, registry=reg)
+    gate = eo._ClientReadGate(conn, registry=reg, home=tmp_path)
     out = gate.execute(sql, ("\ud800",), deadline=DEADLINE_FAR)
     assert isinstance(out, rr.Rejected) and out.reason == "invalid_parameter"
 
 
-def test_read_failed_conversion_is_logged_so_schema_drift_is_not_silent(schema, caplog):
+def test_read_failed_conversion_is_logged_so_schema_drift_is_not_silent(schema, caplog, tmp_path):
     """Code 1 also covers an owner-side fault (a table renamed after start).
     The conversion must leave a WARNING naming the template key so the
     operator can see it. Mutation: convert without logging -> red."""
@@ -834,7 +834,7 @@ def test_read_failed_conversion_is_logged_so_schema_drift_is_not_silent(schema, 
     reg = _admit(sql, schema)
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT, body TEXT, meta TEXT)")
-    gate = eo._ClientReadGate(conn, registry=reg)
+    gate = eo._ClientReadGate(conn, registry=reg, home=tmp_path)
     conn.execute("ALTER TABLE notes RENAME TO notes_old")  # schema drift after start
     with caplog.at_level("WARNING"):
         out = gate.execute(sql, (1,), deadline=DEADLINE_FAR)
@@ -855,7 +855,7 @@ def test_a_busy_database_error_propagates_through_the_gate(tmp_path, schema):
     reg = _admit(sql, schema)
     reader = sqlite3.connect(path, timeout=0)
     try:
-        gate = eo._ClientReadGate(reader, registry=reg)
+        gate = eo._ClientReadGate(reader, registry=reg, home=tmp_path)
         with pytest.raises(sqlite3.OperationalError) as ei:
             gate.execute(sql, (1,), deadline=DEADLINE_FAR)
         assert getattr(ei.value, "sqlite_errorcode", None) == 5
@@ -915,24 +915,24 @@ def test_r8_like_escaped_on_a_like_without_an_escape_clause_is_refused_at_regist
     assert reg.refused[LIKE_NO_E].reason == "policy_template_mismatch"
 
 
-def test_r8_the_no_escape_template_cannot_leak_through_the_gate_either(schema):
+def test_r8_the_no_escape_template_cannot_leak_through_the_gate_either(schema, tmp_path):
     """End to end on Mira's fixture: titles `a\\secret`, `a\\%`, `a%`. Whatever the
     registry does with the no-ESCAPE template, the gate must NOT return the
     backslash rows for the parameter `a\\%`."""
     conn = _titles_conn(["a\\secret", "a\\%", "a%"])
     reg = _reg(LIKE_NO_E, schema, {0: "like_escaped"})
-    gate = eo._ClientReadGate(conn, registry=reg)
+    gate = eo._ClientReadGate(conn, registry=reg, home=tmp_path)
     out = gate.execute(LIKE_NO_E, ("a\\%",), deadline=DEADLINE_FAR)
     assert isinstance(out, rr.Rejected), out
 
 
-def test_r8_like_escaped_with_escape_backslash_admits_and_matches_literally(schema):
+def test_r8_like_escaped_with_escape_backslash_admits_and_matches_literally(schema, tmp_path):
     """The same fixture under the paired template: `a\\%` means the literal text
     `a%`, so ONLY the row `a%` comes back."""
     conn = _titles_conn(["a\\secret", "a\\%", "a%"])
     reg = _reg(LIKE_E, schema, {0: "like_escaped"})
     assert LIKE_E not in reg.refused
-    gate = eo._ClientReadGate(conn, registry=reg)
+    gate = eo._ClientReadGate(conn, registry=reg, home=tmp_path)
     assert gate.execute(LIKE_E, ("a\\%",), deadline=DEADLINE_FAR) == [("a%",)]
 
 
@@ -988,10 +988,10 @@ def test_r8_glob_literal_refuses_the_live_wildcards_at_request_time(schema):
     assert reg.check(sql, ("abc",)) is None
 
 
-def test_r8_glob_literal_end_to_end_cannot_enumerate_with_a_wildcard(schema):
+def test_r8_glob_literal_end_to_end_cannot_enumerate_with_a_wildcard(schema, tmp_path):
     conn = _titles_conn(["abc", "abd", "a*"])
     sql = "SELECT title FROM notes WHERE title GLOB ?"
-    gate = eo._ClientReadGate(conn, registry=_reg(sql, schema, {0: "glob_literal"}))
+    gate = eo._ClientReadGate(conn, registry=_reg(sql, schema, {0: "glob_literal"}), home=tmp_path)
     assert isinstance(gate.execute(sql, ("a*",), deadline=DEADLINE_FAR), rr.Rejected)
     assert gate.execute(sql, ("abc",), deadline=DEADLINE_FAR) == [("abc",)]
 

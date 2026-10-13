@@ -475,6 +475,14 @@ CHAIN_NODE_ID_MAX_BYTES = 256
 CHAIN_MAX_DEPTH_CAP = 4
 CHAIN_RESULT_MAX_BYTES = MAX_READ_RESPONSE_BYTES
 
+# #3741: the typed `confidence_by_type` method. At most this many modes per request (the
+# four window modes of engram_stats); a longer list is REFUSED by name, never clamped
+# (docs/2652-security-slice-design.md section 3.6, typed-op input bounds).
+CBT_MAX_MODES = 4
+# The mode names (equal to engram_stats.STATS_MODES; a cell pins the equality). Held here so
+# validation, which runs before any runtime import, needs no import.
+CBT_MODES = ("all", "1-turn", "7-turn", "30-turn")
+
 # How often the LISTENING socket's accept() wakes up to check the shutdown
 # flag. Short enough that .stop() returns quickly in tests (this process's
 # accept loop has nothing else to do between wakeups, unlike
@@ -1130,15 +1138,71 @@ def _chain_param_refusal(params) -> "dict | None":
     return None
 
 
-def _engram_core():
-    """Import `engram_core` LAZILY, on the first `chain` request. It is large, and the
-    owner's startup must not pay for it. Measured: importing it opens no database, creates
-    no file and starts no thread (its one process-level effect is
+def _cbt_param_refusal(params) -> "dict | None":
+    """Validate a `confidence_by_type` request; None = valid, else the wire rejection. EACH
+    violation has its own named reason; nothing the caller sent is echoed. Check order (the
+    first violated wins): shape (a dict with exactly the key 'modes'), modes not a list, modes
+    empty, modes longer than CBT_MAX_MODES (refused, never clamped: section 3.6); then ONE pass
+    over the elements in list order, each checked not-str -> unknown -> duplicate-of-an-earlier-
+    element (the element's type is checked BEFORE its membership test, so a list / dict element
+    cannot raise). Touches no connection."""
+    if not isinstance(params, dict) or set(params) != {"modes"}:
+        return _df_rejection(
+            "cbt_params_shape",
+            "confidence_by_type params must be a dict with exactly the key 'modes'",
+            "send {'modes': [<str>, ...]} and no other key",
+        )
+    modes = params["modes"]
+    if not isinstance(modes, list):
+        return _df_rejection(
+            "cbt_modes_not_list", f"'modes' must be a list, got {type(modes).__name__}", "send 'modes' as a list of strings"
+        )
+    if not modes:
+        return _df_rejection("cbt_modes_empty", "'modes' is empty", "send at least one mode")
+    if len(modes) > CBT_MAX_MODES:
+        return _df_rejection(
+            "cbt_modes_too_many",
+            f"'modes' has more than {CBT_MAX_MODES} entries",
+            f"send at most {CBT_MAX_MODES} modes; the request is refused, not shortened",
+        )
+    # CBT_MODES, not engram_stats.STATS_MODES: validation must not import the runtime.
+    seen: list = []
+    for i, mode in enumerate(modes):
+        if not isinstance(mode, str):
+            return _df_rejection(
+                "cbt_mode_not_str", f"modes[{i}] is {type(mode).__name__}, not a string", "send every mode as a string"
+            )
+        if mode not in CBT_MODES:
+            return _df_rejection(
+                "cbt_mode_unknown", f"modes[{i}] is not a known mode", f"known modes: {', '.join(CBT_MODES)}"
+            )
+        if mode in seen:
+            return _df_rejection("cbt_mode_duplicate", f"modes[{i}] repeats an earlier entry", "send each mode once")
+        seen.append(mode)
+    return None
+
+
+def _engram_core(home):
+    """Import `engram_core` LAZILY, on the first `chain` / `confidence_by_type` request. It is
+    large, and the owner's startup must not pay for it. Measured: importing it opens no
+    database, creates no file and starts no thread (its one process-level effect is
     `os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "1")`); cells pin the first two. It resolves
     from this module's own directory, where the plugin build puts it beside this file.
-    ImportError propagates to `_handle_chain`, which names it."""
+
+    `home` is REQUIRED (#3741, Borges Q1): the owner's own ENGRAM home. engram_core resolves
+    its paths from the process env at import; the owner's home may differ from that, so every
+    call re-points the core at `home` with `engram_core._configure_paths(home)` -- module
+    globals only, no database opened, nothing created -- and core (`_get_current_turn` reads
+    CONFIG_PATH) and owner share one home by construction. (Re-pointing on every call, not
+    only the first, keeps a process that hosts a second owner on another home correct; it is
+    idempotent.) `home=None` is a TypeError: an optional home would silently read the
+    process-env home's config.json, re-opening the unconfigured path this requirement closes.
+    ImportError propagates to the handler, which names it."""
+    if home is None:
+        raise TypeError("_engram_core requires the owner's home (home=None would read the process-env home)")
     import engram_core
 
+    engram_core._configure_paths(home)
     return engram_core
 
 
@@ -1154,8 +1218,13 @@ class _ClientReadGate:
     by this unit, is what checks the floor can't be bypassed by a
     registry bug)."""
 
-    def __init__(self, conn: sqlite3.Connection, registry: "rr.Registry | None" = None) -> None:
+    def __init__(
+        self, conn: sqlite3.Connection, registry: "rr.Registry | None" = None, *, home: "Path"
+    ) -> None:
         self._conn = conn
+        # #3741: the owner's home, handed to `_engram_core(home)` by the typed ops that run
+        # engram_core code. Required (keyword-only): a gate without a home is a TypeError.
+        self._home = home
         # U4c (#3196): the read-template registry. None means the EMPTY
         # registry -- a gate built without one refuses everything; it never
         # defaults to permissive.
@@ -1237,12 +1306,34 @@ class _ClientReadGate:
         `engram_core.generalization_chain` itself refuses a negative or non-int depth (ValueError);
         the owner op's own named refusal (`chain_max_depth_negative` / `chain_max_depth_not_int`)
         runs first, so that error is never reached from a client request."""
-        core = _engram_core()
+        core = _engram_core(self._home)
         _arm_read_deadline(self._conn, deadline)
         try:
             return core.generalization_chain(self._conn, node_id, max_depth)
         finally:
             # same slate-clearing as _execute_admitted: no stale deadline for the next call
+            self._conn.set_progress_handler(None, 0)
+
+    def run_confidence_by_type(self, modes: list, *, deadline: float) -> dict:
+        """Entry point for the typed `confidence_by_type` method (#3741): the by_type confidence
+        distribution for each mode, computed by `engram_stats.confidence_by_type` (the SAME code
+        `engram_stats` runs, so the two are equal by construction) on THIS client-read connection
+        with the request deadline armed, plus the owner home's `current_turn`. Returns
+        `{"current_turn": int, "by_mode": {mode: {"by_type": ...}}}`.
+
+        Like `run_chain` it is NOT `execute_typed` and `_TYPED_STATEMENTS` is not widened: the
+        statements are fixed code in engram_stats, the client sends only mode NAMES (already
+        validated by `_cbt_param_refusal`), and the authorizer floor on this connection applies to
+        everything prepared. Read-only: no write, no tool_timing, no migration, no `_get_db`.
+        SQLite errors and ImportError propagate to the caller's mapping."""
+        core = _engram_core(self._home)
+        import engram_stats  # after _engram_core(home): the core must be pointed at the home first
+
+        _arm_read_deadline(self._conn, deadline)
+        try:
+            by_mode = engram_stats.confidence_by_type(self._conn, modes, engram_stats._now_utc())
+            return {"current_turn": int(core._get_current_turn()), "by_mode": by_mode}
+        finally:
             self._conn.set_progress_handler(None, 0)
 
     def _execute_admitted(self, sql: str, params: tuple, *, deadline: float) -> list:
@@ -1596,6 +1687,7 @@ class EngramdOwner:
             "read": lambda params, deadline: self._handle_read(params, deadline),
             "df": lambda params, deadline: self._handle_df(params, deadline),
             "chain": lambda params, deadline: self._handle_chain(params, deadline),
+            "confidence_by_type": lambda params, deadline: self._handle_confidence_by_type(params, deadline),
         }
 
     # -- lifecycle ------------------------------------------------------
@@ -1724,7 +1816,7 @@ class EngramdOwner:
         # Any load problem yields an EMPTY registry (everything refused),
         # never a permissive one.
         self._client_read_gate = _ClientReadGate(
-            self._client_read_conn, self._load_read_registry(dynamic_templates)
+            self._client_read_conn, self._load_read_registry(dynamic_templates), home=self.engram_home
         )
 
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -2577,7 +2669,7 @@ class EngramdOwner:
             "detail": f"no such operation: {method!r}",
             "remedy": (
                 "check the method name against the owner's supported "
-                "operations (this build: ping, snapshot, read)"
+                f"operations (this build: {', '.join(self._methods)})"
             ),
         }
 
@@ -2764,7 +2856,7 @@ class EngramdOwner:
         # deadline; a failed import acquires nothing. `run_chain` calls the accessor again,
         # which is then a `sys.modules` hit.
         try:
-            _engram_core()
+            _engram_core(self.engram_home)
         except ImportError as exc:
             return self._chain_runtime_unavailable(exc)
 
@@ -2797,6 +2889,62 @@ class EngramdOwner:
             "reason": "chain_runtime_unavailable",
             "detail": f"the owner could not import engram_core: {type(exc).__name__}",
             "remedy": "the owner's runtime is incomplete (engram_core.py must sit beside engramd_owner.py); reinstall the plugin and restart the owner",
+        }
+
+    def _handle_confidence_by_type(self, params: dict, deadline: float) -> dict:
+        """The typed `confidence_by_type` method (#3741): the by_type confidence distribution for
+        up to CBT_MAX_MODES windows as ONE request, for the session-start calibration block.
+        Wire: params = {"modes": [<str>, ...]} (exactly that key; each violation has its own
+        named reason, see `_cbt_param_refusal`; an over-long list is refused, never clamped,
+        section 3.6); reply `ok` carries `result` = {"current_turn": int, "by_mode": {mode:
+        {"by_type": {type: {n, mean, p25, p50, p75, p90, p95}}}}}.
+
+        Runs engram_stats' OWN `confidence_by_type` on the client-read connection (see
+        `_ClientReadGate.run_confidence_by_type`); it is read-only -- no write, no tool_timing, no
+        migration.
+
+        Order (as `chain`): (1) validate -- nothing is prepared for a refused request; (2) the
+        lazy runtime import, after validation and BEFORE `_client_read_lock` (a cold import must
+        not hold the lock `read` / `df` wait on; a failed import acquires nothing) -- an owner
+        whose runtime lacks the modules answers `cbt_runtime_unavailable`; (3) the shared
+        lock / deadline / error tail."""
+        refusal = _cbt_param_refusal(params)
+        if refusal is not None:
+            return refusal
+        modes = list(params["modes"])
+        gate = self._client_read_gate
+        if gate is None:
+            return {
+                "status": "rejected",
+                "reason": "owner_stopping",
+                "detail": "the owner is shutting down; its read path is closed",
+                "remedy": "retry once the owner has restarted",
+            }
+        try:
+            _engram_core(self.engram_home)
+            import engram_stats  # noqa: F401 -- warm the import outside the lock
+        except ImportError as exc:
+            return self._cbt_runtime_unavailable(exc)
+
+        def run(execution_deadline: float):
+            return gate.run_confidence_by_type(modes, deadline=execution_deadline)
+
+        try:
+            failure, outcome = self._run_client_read(deadline, run)
+        except ImportError as exc:  # the runtime vanished between the import above and the read
+            return self._cbt_runtime_unavailable(exc)
+        if failure is not None:
+            return failure
+        return {"status": "ok", "result": outcome}
+
+    @staticmethod
+    def _cbt_runtime_unavailable(exc: Exception) -> dict:
+        logging.getLogger("engramd_owner").warning("confidence_by_type: runtime could not be imported: %s", exc)
+        return {
+            "status": "rejected",
+            "reason": "cbt_runtime_unavailable",
+            "detail": f"the owner could not import its stats runtime: {type(exc).__name__}",
+            "remedy": "the owner's runtime is incomplete (engram_core.py and engram_stats.py must sit beside engramd_owner.py); reinstall the plugin and restart the owner",
         }
 
     def _read_failed(self, exc: Exception) -> dict:

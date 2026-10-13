@@ -180,11 +180,12 @@ def _open(*frames, arg="/h/knowledge.db"):
     return {"arg": arg, "thread": "MainThread", "stack": list(frames)}
 
 
-def test_a_calibration_frame_is_allowed_and_everything_else_is_a_violation_naming_its_frames(tool):
+def test_a_calibration_frame_is_allowed_and_everything_else_is_a_violation_naming_its_frames(tool, monkeypatch):
     """Allow-list by exact BASENAME `engram_client.py`. Mutations: match by substring ('client.py') ->
     the engramd_client.py open is allowed -> red; match by endswith('engram_client.py') -> the
     myengram_client.py open is allowed -> red; deny-list the six readers instead -> the unattributed
     open from main() passes -> red; name no frames in the violation -> red."""
+    monkeypatch.setattr(tool, "CALIBRATION_STILL_OPENS", True)  # #3741: the mini hook's calibration still opens; this cell tests the True mode
     calib = _open("/plugin/hooks/engram-session-start-hook.py:main:4400",
                   "/plugin/engram_client.py:call:88", "/plugin/engram_core.py:_get_db:9")
     shim = _open("/plugin/hooks/engram-session-start-hook.py:focus_block:1790",
@@ -218,27 +219,28 @@ def test_an_open_with_no_stack_is_a_violation_not_silently_attributed(tool):
 # -- (h) the one constant ----------------------------------------------------------------------
 
 def test_one_constant_drives_both_modes_and_they_cannot_drift(tool, monkeypatch):
-    """CALIBRATION_STILL_OPENS True: calibration allowed, must-engage on. False (#3741 landed):
-    allow-list empty -- a calibration open IS a violation -- and zero opens is clean. Mutations: a
+    """CALIBRATION_STILL_OPENS False (the default since #3741 landed): allow-list empty -- a
+    calibration open IS a violation -- and zero opens is clean. True: calibration allowed, must-engage on. Mutations: a
     second constant / a hard-coded allow-list in either function, or must-engage reading its own
     flag -> the monkeypatch flips one mode and not the other -> red."""
     calib = _open("/plugin/hooks/engram-session-start-hook.py:main:4400", "/plugin/engram_client.py:call:88")
-    assert tool.CALIBRATION_STILL_OPENS is True
-    assert tool.attribute_opens([calib], Path(HOOK)) == {"calibration": [calib], "violations": []}
-    assert tool.exclusion_must_engage() is True
-    monkeypatch.setattr(tool, "CALIBRATION_STILL_OPENS", False)
+    assert tool.CALIBRATION_STILL_OPENS is False  # #3741 landed: the shipped default is the post-migration mode
     got = tool.attribute_opens([calib], Path(HOOK))
     assert got["calibration"] == [] and len(got["violations"]) == 1
     assert tool.attribute_opens([], Path(HOOK)) == {"calibration": [], "violations": []}
     assert tool.exclusion_must_engage() is False
+    monkeypatch.setattr(tool, "CALIBRATION_STILL_OPENS", True)
+    assert tool.attribute_opens([calib], Path(HOOK)) == {"calibration": [calib], "violations": []}
+    assert tool.exclusion_must_engage() is True
 
 
 # -- (b)-(f), (j) the sanity run on the mini hook -------------------------------------------------
 
-def test_the_gate_passes_on_the_clean_mini_hook_and_reports_calibration_opens(tool, tmp_path):
+def test_the_gate_passes_on_the_clean_mini_hook_and_reports_calibration_opens(tool, tmp_path, monkeypatch):
     """Borges cell 1. Calibration opens counted (>= 1) on both paths, zero violations, readers reached on
     both paths, outputs equal after normalising, the flag state each path saw is the intended one.
     Mutation: gate on opens_flag_on == 0 -> red (calibration opens exist); report no calibration count -> red."""
+    monkeypatch.setattr(tool, "CALIBRATION_STILL_OPENS", True)  # #3741: the mini hook's calibration still opens; this cell tests the True mode
     r = tool.session_start_sanity(_mini(tool, tmp_path))
     assert r["calibration_opens_off"] >= 1 and r["calibration_opens_on"] >= 1
     assert r["open_violations"] == []
@@ -248,27 +250,30 @@ def test_the_gate_passes_on_the_clean_mini_hook_and_reports_calibration_opens(to
     assert r["flag_seen"] == {"off": False, "on": True}
 
 
-def test_a_migrated_reader_that_reopens_the_store_is_a_violation_naming_that_reader(tool, tmp_path):
+def test_a_migrated_reader_that_reopens_the_store_is_a_violation_naming_that_reader(tool, tmp_path, monkeypatch):
     """Borges cell 2. Mutation: attribute by 'any open under a reader function' / drop the violation list -> red."""
+    monkeypatch.setattr(tool, "CALIBRATION_STILL_OPENS", True)  # #3741: the mini hook's calibration still opens; this cell tests the True mode
     hook = _sub(MINI_HOOK, FOCUS_LINE, FOCUS_REOPENS_ON_THE_OWNER_PATH)
     r = tool.session_start_sanity(_mini(tool, tmp_path, hook=hook))
     assert len(r["open_violations"]) == 1
     assert "focus_block" in r["open_violations"][0]
 
 
-def test_an_extra_inline_connect_in_main_outside_every_reader_is_a_violation(tool, tmp_path):
+def test_an_extra_inline_connect_in_main_outside_every_reader_is_a_violation(tool, tmp_path, monkeypatch):
     """Borges cell 3: the deny-list miss. Mutation: a deny-list of the six readers -> main()'s open is not a
     reader's -> passes -> red."""
+    monkeypatch.setattr(tool, "CALIBRATION_STILL_OPENS", True)  # #3741: the mini hook's calibration still opens; this cell tests the True mode
     hook = _sub(MINI_HOOK, "    #MAIN_EXTRA_BEFORE", "    sqlite3.connect(DB).close()")
     r = tool.session_start_sanity(_mini(tool, tmp_path, hook=hook))
     assert len(r["open_violations"]) == 1
     assert ":main:" in r["open_violations"][0]
 
 
-def test_a_compensating_mutant_that_keeps_the_open_count_identity_is_still_caught(tool, tmp_path):
+def test_a_compensating_mutant_that_keeps_the_open_count_identity_is_still_caught(tool, tmp_path, monkeypatch):
     """Borges cell 4. One reader re-opens on the ON path AND the calibration opens one fewer on the ON
     path, so opens_on == opens_off - 6 still holds (asserted below, so this cell proves it separates the
     allow-list from a count-delta gate). Mutation: gate on the count identity instead of attribution -> red."""
+    monkeypatch.setattr(tool, "CALIBRATION_STILL_OPENS", True)  # #3741: the mini hook's calibration still opens; this cell tests the True mode
     hook = _sub(MINI_HOOK, FOCUS_LINE, FOCUS_REOPENS_ON_THE_OWNER_PATH)
     client = _sub(MINI_ENGRAM_CLIENT, "times = 2  #TIMES",
                   "times = 1 if json.load(open(os.path.join(os.environ['ENGRAM_HOME'], 'config.json')))"
@@ -280,10 +285,11 @@ def test_a_compensating_mutant_that_keeps_the_open_count_identity_is_still_caugh
     assert len(r["open_violations"]) == 1 and "focus_block" in r["open_violations"][0]
 
 
-def test_an_inert_calibration_raises_exclusion_never_engaged_instead_of_passing(tool, tmp_path):
+def test_an_inert_calibration_raises_exclusion_never_engaged_instead_of_passing(tool, tmp_path, monkeypatch):
     """Borges cell 5: zero opens attributed to the calibration path means the attribution, the layout or the
     fixture is blind. Mutation: return a pass / put it in the violation list instead of raising; drop the
     must-engage check -> red."""
+    monkeypatch.setattr(tool, "CALIBRATION_STILL_OPENS", True)  # #3741: the mini hook's calibration still opens; this cell tests the True mode
     rig = _mini(tool, tmp_path, client="raise ImportError('inert')\n")
     with pytest.raises(tool.ArmBlind, match="exclusion never engaged"):
         tool.session_start_sanity(rig)
@@ -296,6 +302,9 @@ def test_must_engage_is_off_when_the_constant_is_false(tool, tmp_path, monkeypat
     rig = _mini(tool, tmp_path, client="raise ImportError('inert')\n")
     r = tool.session_start_sanity(rig)
     assert r["opens_flag_on"] == 0 and r["open_violations"] == []
+    # positive control: the counter DOES see opens on the flag-OFF path (the six readers open the store
+    # there), so the zero on flag ON is not a blind counter
+    assert r["opens_flag_off"] >= 1
 
 
 def test_a_reader_that_never_reads_makes_the_arm_raise_naming_it(tool, tmp_path):
@@ -622,7 +631,9 @@ def test_the_arm_on_the_real_session_start_hook_passes_the_gate_on_the_installed
     for layout in (tool.build_installed_layout(tmp_path / "plugin"), tool.source_layout()):
         r = tool.measure_in_layout(layout, hook="session-start", n=12, nodes=300, warmup=3, n_cold=3)
         assert tool.ss_contract_violations(r) == []
-        assert r["calibration_opens_on"] >= 1 and r["calibration_opens_off"] >= 1
+        assert r["opens_flag_on"] == 0  # #3741: the calibration block reads through the owner, so a flag-ON fire opens nothing
+        # positive control: the counter is not blind in this layout (the six readers open the store on flag OFF)
+        assert r["opens_flag_off"] >= 1
         assert sorted(r["readers_reached_on"]) == sorted(READERS)
 
 
