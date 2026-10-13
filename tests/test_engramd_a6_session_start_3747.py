@@ -12,11 +12,12 @@ must-engage raise is on; False, once #3741 lands: allow-list empty, raise off, `
 If no open is attributed to the calibration path on EITHER path the arm RAISES "exclusion never
 engaged" (the #3739 lesson). WARM (owner up before the fire) is the gate; COLD is a reported row.
 
-The hook under test (U9) is not on dev yet, so every contract cell below runs against a SYNTHETIC
-mini session-start hook built here (six reader functions with the real names, a calibration call
-into a stub `engram_client.py`, a stub owner shim, a flag read from config.json). Mutants are
-produced by editing the mini hook's source text. The ONE cell on the REAL hook is
-`xfail(strict=True)`: when #3746 lands it XPASSes, which is a failure, which demands its flip.
+The contract cells below run against a SYNTHETIC mini session-start hook built here (six reader
+functions with the real names, a calibration call into a stub `engram_client.py`, a stub owner shim,
+a flag read from config.json). Mutants are produced by editing the mini hook's source text. The ONE
+cell on the REAL hook was `xfail(strict=True)` while U9 (#3746) was not on dev; it was written to
+XPASS, which fails the suite, which demanded its flip. It is flipped in #3746 itself: that cell
+passing on the real hook is the gate's point.
 
 Every cell's docstring names the mutation it must turn red under.
 """
@@ -48,7 +49,7 @@ def _load_tool():
     return mod
 
 
-_TOOL = _load_tool()  # module level so the xfail marker below can name the tool's own ArmBlind class
+_TOOL = _load_tool()  # module level: the tool is loaded once for the whole file
 
 
 @pytest.fixture(scope="module")
@@ -611,14 +612,13 @@ def test_the_audit_hook_never_raises_when_stack_capture_fails(tool, tmp_path, mo
     assert len(rec) in (0, 1)
 
 
-# -- the REAL hook: written now, cannot be green on dev -----------------------------------------------
+# -- the REAL hook: written before U9, flipped from xfail(strict=True) in #3746 itself ----------------
 
 @requires_linux_owner
-@pytest.mark.xfail(strict=True, raises=_TOOL.ArmBlind, reason="needs U9 #3746; flip when it lands")
 def test_the_arm_on_the_real_session_start_hook_passes_the_gate_on_the_installed_and_source_layouts(tool, tmp_path):
     """End to end on the real hook (needs the U9 flag in the hook: `engramd.session_start_reads_via_owner`).
-    xfail(strict=True): the day #3746 merges this XPASSes, which fails the suite, which demands this mark's
-    removal. Mutation: any cell above's mutant reaching the real hook -> red once flipped."""
+    Was xfail(strict=True) until #3746; the mark is removed in the same PR that lands U9, so this now runs and
+    must pass. Mutation: any cell above's mutant reaching the real hook -> red."""
     for layout in (tool.build_installed_layout(tmp_path / "plugin"), tool.source_layout()):
         r = tool.measure_in_layout(layout, hook="session-start", n=12, nodes=300, warmup=3, n_cold=3)
         assert tool.ss_contract_violations(r) == []

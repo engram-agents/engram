@@ -83,12 +83,366 @@ from _hooklib import connect_regular_ro
 # #3521: shared advisory-probe `unknown` rendering (once per session here, so
 # only the stderr line + the one injected line are used; no rate-limit stamp).
 from _hooklib import probe_unknown_line, write_probe_unknown_stderr
+# #3735 (U9): the owner-failure notice shares the probe-notice rate-limit stamp, and the
+# flag helper is imported through the one shared resolver (never a fixed parents[N]).
+from _hooklib import mark_probe_notice, probe_notice_due
+from _hooklib import import_owner_flags as _hooklib_import_owner_flags
 from _harness import detect_harness, get_harness_budgets
 
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
     or os.path.expanduser("~/.engram")
 )
+
+# ---------------------------------------------------------------------------
+# U9 (#3735, part of #2652) -- the flagged read through the engramd owner
+# ---------------------------------------------------------------------------
+# With `engramd.session_start_reads_via_owner` true in $ENGRAM_HOME/config.json (read ONLY
+# through engramd_owner_flags.flag_on), the six functions that read the store -- the
+# `count(*)` sub-read of _check_backup_staleness, _check_embedding_restore_flag, focus_block,
+# saved_focus_sets_block, session_checkpoint_block and sleep_status_block -- read through
+# ONE engramd_client.OwnerReadConnection shared by the whole fire and never open
+# knowledge.db. Flag OFF is the direct path. Modelled on U6b (engram-lesson-tripwire-hook.py).
+#
+# NOT migrated here (option A, the design seat's ruling on #3735): the calibration block in
+# main() (`EngramClient().call("engram_stats", ...)`) still opens the store directly, and on a
+# fresh home it is what builds the schema. So a flag-ON fire is NOT zero-open; that block is
+# its own unit (#3741).
+#
+# Owner failure (any OwnerReadError, or the client failing to import): the failing function
+# returns the degraded result it returns for a failed direct read (never a fallback to a direct
+# open), the failure is recorded, and main() adds ONE line to the substrate-health block,
+# rate-limited through the shared probe-notice stamp under kind `session-start-owner`.
+#
+# COLD START. SessionStart hooks of one block run in parallel, and on a cold start this hook's
+# first reads reach the owner socket before the owner listens (measured: the reads at +44..55 ms,
+# the owner answering ~115..140 ms after its launcher starts). So the FIRST read of a fire that
+# gets Unavailable(reason "down"), before any owner read has succeeded, waits (once per fire,
+# bounded) for the socket to answer `ping`, retries that statement once, and continues; when the
+# bound runs out the owner is marked DOWN for the rest of the fire (no further sockets, no
+# further waits). The wait lives here, not in engramd_client.py: that shim is shared with the
+# tripwire hook (a 3 s PreToolUse hot path) and must not gain a wait.
+
+# The hook is registered with a 5 s timeout (hooks/hooks.json). Owner time is bounded at 3.0 s
+# for the whole fire, each read at 1.0 s, and the cold-start wait at 0.5 s: wait + budget <= 4.0,
+# leaving a 1.0 s reserve for the rest of the fire (~0.75 s measured on the direct path, with
+# the calibration block).
+OWNER_FIRE_BUDGET_S = 3.0
+OWNER_READ_TIMEOUT_S = 1.0
+OWNER_COLD_START_WAIT_S = 0.5
+OWNER_COLD_START_POLL_S = 0.025
+OWNER_PING_TIMEOUT_S = 0.2
+
+_OWNER_FLAG_KEY = "session_start_reads_via_owner"
+OWNER_NOTICE_KEY = "session-start-owner"
+_OWNER_NOTICE_CAP = 480
+
+# Set by main() for ONE run (None outside main(): standalone callers of the six functions
+# stay on the direct path). See _fresh_owner_run for the keys.
+_OWNER_RUN = None
+
+# Set by _owner_reads_enabled() when the flag helper fails at import or at `flag_on`
+# (class NAME only, never the message); reset at the top of every call.
+_OWNER_FLAGS_FAILURE = None
+
+# Module-level so tests can drive the clock.
+_mono = time.monotonic
+_sleep = time.sleep
+
+# The block each function's failure takes out of this fire, as the notice names it.
+_OWNER_BLOCK_NAMES = {
+    "_check_backup_staleness": "git backup check",
+    "_check_embedding_restore_flag": "embedding restore check",
+    "focus_block": "focus list",
+    "saved_focus_sets_block": "saved focus-sets",
+    "session_checkpoint_block": "session checkpoint",
+    "sleep_status_block": "sleep status",
+}
+_OWNER_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+class _ClientImportFailure(Exception):
+    """engramd_client could not be imported. args = (cause class name,)."""
+
+
+def _fresh_owner_run(on: bool) -> dict:
+    """The owner state of one fire. `conn`/`ec`/`t0`: the shared shim, the client module and
+    the monotonic start of the fire's owner budget (lazy); `failure`: the FIRST owner failure
+    {site, kind, result, cause}; `degraded`: every site that hit an owner failure, in order;
+    `served`: some owner read succeeded; `wait`: {"ms", "outcome": served|still_down} once the
+    cold-start wait ran; `down`: the failure to replay once the wait bound ran out."""
+    return {"on": bool(on), "conn": None, "ec": None, "t0": None, "failure": None,
+            "degraded": [], "served": False, "wait": None, "down": None}
+
+
+def _import_owner_flags():
+    """Thin alias (#3665): the body lives once in `_hooklib.import_owner_flags`; the name
+    stays a module attribute because callers and tests patch it."""
+    return _hooklib_import_owner_flags(ENGRAM_HOME)
+
+
+def _owner_flags_failure_line():
+    """The one stderr line for a failed flag helper, or None. Class name only."""
+    if _OWNER_FLAGS_FAILURE is None:
+        return None
+    try:
+        cls = "".join(ch if ch.isprintable() else "?" for ch in str(_OWNER_FLAGS_FAILURE))[:80]
+        return f"engram-session-start-hook: owner flag helper failed: {cls}"
+    except Exception:
+        return None
+
+
+def _owner_reads_enabled() -> bool:
+    """`engramd.session_start_reads_via_owner`, read ONLY through
+    engramd_owner_flags.flag_on (one definition shared with the owner launcher); anything
+    but the boolean `true` is OFF, the direct path. ANY exception (and a SystemExit)
+    importing the helper or calling `flag_on` reads OFF -- the hook cannot know the flag is
+    ON -- and its CLASS NAME (never the message) is recorded in `_OWNER_FLAGS_FAILURE`
+    (reset on every call) for the stderr report. KeyboardInterrupt is not caught."""
+    global _OWNER_FLAGS_FAILURE
+    _OWNER_FLAGS_FAILURE = None
+    try:
+        engramd_owner_flags = _import_owner_flags()
+        # `is True`: only the JSON boolean true is ON; a truthy non-bool must not read as ON.
+        return engramd_owner_flags.flag_on(
+            _OWNER_FLAG_KEY, os.path.join(ENGRAM_HOME, "config.json")) is True
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 -- see docstring
+        try:
+            _OWNER_FLAGS_FAILURE = type(exc).__name__
+        except Exception:
+            _OWNER_FLAGS_FAILURE = "unknown"
+        return False
+
+
+def _import_engramd_client():
+    """Lazy import (flag OFF must never import it), resolved layout-agnostically via the
+    shared resolver -- plugin root first, then a walk-parents search; never a fixed
+    parents[N] (project CLAUDE.md, "Plugin build restructures code paths")."""
+    runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engramd_client.py")
+    # Position 0 even if already present further down: an earlier insertion must not let
+    # another directory win this import.
+    sys.path[:] = [runtime_dir] + [p for p in sys.path if p != runtime_dir]
+    import engramd_client
+    return engramd_client
+
+
+def _owner_active() -> bool:
+    return _OWNER_RUN is not None and bool(_OWNER_RUN.get("on"))
+
+
+def _owner_conn():
+    """The ONE OwnerReadConnection of this fire, created lazily at first use and shared by
+    all six functions (none of them closes it). Raises _ClientImportFailure when the client
+    cannot be imported, and replays the recorded failure at once when the cold-start wait
+    already ran out (the owner is DOWN for the rest of this fire: no more sockets)."""
+    run = _OWNER_RUN
+    down = run["down"]
+    if down is not None:
+        raise type(down)(down.kind, down.result)
+    if run["conn"] is None:
+        try:
+            ec = _import_engramd_client()
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 -- any import failure is an owner failure; KeyboardInterrupt is not caught
+            raise _ClientImportFailure(type(exc).__name__) from exc
+        run["ec"] = ec
+        run["t0"] = _mono()
+        run["conn"] = ec.OwnerReadConnection(
+            total_budget=OWNER_FIRE_BUDGET_S, per_call_timeout=OWNER_READ_TIMEOUT_S)
+    return run["conn"]
+
+
+def _is_owner_exc(exc: BaseException) -> bool:
+    return isinstance(exc, _ClientImportFailure) or (
+        type(exc).__name__ == "OwnerReadError" and hasattr(exc, "kind"))
+
+
+def _record_owner_failure(site: str, exc: BaseException) -> bool:
+    """Record an owner failure of this run: the site joins `degraded`, and the FIRST failure is
+    kept whole (kind, the typed Unavailable/Rejected result, the cause CLASS name only).
+    Returns True when `exc` was an owner failure; False leaves the caller to treat it as it
+    always did (a sqlite3 error, a bug)."""
+    if not _owner_active() or not _is_owner_exc(exc):
+        return False
+    run = _OWNER_RUN
+    if site not in run["degraded"]:
+        run["degraded"].append(site)
+    if run["failure"] is None:
+        if isinstance(exc, _ClientImportFailure):
+            kind, result, cause = "client_import", None, (exc.args[0] if exc.args else "unknown")
+        else:
+            kind, result = exc.kind, getattr(exc, "result", None)
+            cause = type(exc.__cause__).__name__ if exc.__cause__ is not None else None
+        run["failure"] = {"site": site, "kind": kind, "result": result, "cause": cause}
+    return True
+
+
+def _owner_note_served() -> None:
+    """An owner read succeeded: from here on there is no cold-start wait."""
+    if _owner_active():
+        _OWNER_RUN["served"] = True
+
+
+def _owner_wait_outcome(outcome: str) -> None:
+    run = _OWNER_RUN
+    if run is not None and run.get("wait") is not None:
+        run["wait"]["outcome"] = outcome
+
+
+def _owner_cold_start_wait(exc: BaseException) -> bool:
+    """True iff the failed read should be retried ONCE (the owner answered `ping` within the
+    bound). The wait applies only when ALL hold: the flag is ON; no owner read of this fire has
+    succeeded yet; no wait ran yet; `exc` is an OwnerReadError of kind `unavailable` whose
+    result carries reason "down" (nothing was listening). `Rejected` (the owner is up and
+    refuses) and every other Unavailable reason (timeout, protocol, busy, ...) never wait.
+    It polls `ping` every OWNER_COLD_START_POLL_S until the owner answers, OWNER_COLD_START_WAIT_S
+    (or the rest of the fire budget) is spent, or the ping is refused outright; an exhausted
+    bound marks the owner DOWN for the rest of the fire. OWNER_COLD_START_WAIT_S <= 0 turns the
+    wait off. Never raises."""
+    try:
+        run = _OWNER_RUN
+        if run is None or not run.get("on") or run["served"] or run["wait"] is not None:
+            return False
+        if not (type(exc).__name__ == "OwnerReadError" and getattr(exc, "kind", None) == "unavailable"):
+            return False
+        if getattr(getattr(exc, "result", None), "reason", None) != "down":
+            return False
+        bound = OWNER_COLD_START_WAIT_S
+        ec = run["ec"]
+        if not bound or bound <= 0 or ec is None:
+            return False
+        start = _mono()
+        remaining = OWNER_FIRE_BUDGET_S - (start - run["t0"])
+        deadline = start + max(0.0, min(bound, remaining))
+        ready = False
+        while True:
+            left = OWNER_FIRE_BUDGET_S - (_mono() - run["t0"])
+            if left <= 0:
+                break
+            until_deadline = deadline - _mono()
+            if until_deadline <= 0:
+                break  # the wait bound is spent: never ping past it
+            try:
+                res = ec.read("ping", {}, timeout=min(OWNER_PING_TIMEOUT_S, left, until_deadline),
+                              socket_path=None)
+            except Exception:  # noqa: BLE001 -- the wait is advisory
+                break
+            if isinstance(res, ec.Ok):
+                ready = True
+                break
+            if isinstance(res, ec.Rejected):
+                break  # the owner is up and refuses: waiting cannot help
+            now = _mono()
+            if now >= deadline:
+                break
+            _sleep(min(OWNER_COLD_START_POLL_S, deadline - now))
+        run["wait"] = {"ms": int(round((_mono() - start) * 1000)),
+                       "outcome": "served" if ready else "still_down"}
+        if not ready:
+            run["down"] = exc
+        return ready
+    except Exception:  # noqa: BLE001 -- never raises
+        return False
+
+
+def _owner_read(read, conn):
+    """`read(conn)`: one read of the fire. The statement itself stays a literal at its call
+    site (the read-template scan keys it to the calling function); this only adds the
+    cold-start rule around it. On the direct path (a sqlite3 connection, no fire state) it is
+    a plain call."""
+    try:
+        result = read(conn)
+    except Exception as exc:  # noqa: BLE001 -- re-raised unless the cold-start rule retries it
+        if not _owner_cold_start_wait(exc):
+            raise
+        try:
+            result = read(conn)  # exactly ONE retry of the same statement
+        except Exception:
+            _owner_wait_outcome("still_down")
+            raise
+    _owner_note_served()
+    return result
+
+
+def _sanitize_owner_text(text, limit: int) -> str:
+    """Each control character -> one space, then cut to `limit` characters."""
+    try:
+        return _OWNER_CONTROL_RE.sub(" ", str(text))[:limit]
+    except Exception:
+        return "<unprintable>"[:limit]
+
+
+def _owner_failure_text(run: dict) -> str:
+    """The ONE health line for a recorded owner failure: failing site, failure kind (and the
+    Unavailable/Rejected reason code), the wait in ms when one ran, and every degraded block.
+    Bounded; dynamic text is control-character-free; never SQL text, row data or a message."""
+    f = run["failure"]
+    detail = ""
+    result = f.get("result")
+    reason = getattr(result, "reason", None) if result is not None else None
+    if reason:
+        detail = f", reason: {_sanitize_owner_text(reason, 40)}"
+    elif f["kind"] == "client_import" and f.get("cause"):
+        detail = f", cause: {_sanitize_owner_text(f['cause'], 40)}"
+    waited = ""
+    if run.get("wait") is not None:
+        waited = f"; waited {int(run['wait']['ms'])} ms for the owner socket"
+    blocks = ", ".join(_OWNER_BLOCK_NAMES.get(s, s) for s in run["degraded"])
+    line = (
+        f"⚠️  ENGRAM substrate health: engramd owner read failed at "
+        f"{_sanitize_owner_text(f['site'], 60)} ({_sanitize_owner_text(f['kind'], 40)}{detail}){waited}. "
+        f"Missing this fire (the read failed; it is NOT empty): {blocks}. "
+        "To read the store directly meanwhile, set engramd.session_start_reads_via_owner "
+        "to false in $ENGRAM_HOME/config.json."
+    )
+    return line[:_OWNER_NOTICE_CAP]
+
+
+def _owner_wait_text(wait: dict) -> str:
+    return (
+        "ℹ️  ENGRAM substrate health: engramd owner was not ready at the first read; "
+        f"waited {int(wait['ms'])} ms, then served"
+    )
+
+
+def _pending_owner_health():
+    """-> (lines, stamp_key): the owner line(s) for this fire's substrate-health block.
+    A recorded failure -> the failure line, shown at most once per window (the shared
+    probe-notice stamp, kind `session-start-owner`), the caller stamping only AFTER the
+    response was written. A wait that was served and no failure -> one informational line,
+    NOT rate-limited (it happens only on a real cold start). Never raises."""
+    try:
+        run = _OWNER_RUN
+        if run is None or not run.get("on"):
+            return [], None
+        if run["failure"] is not None:
+            if probe_notice_due(ENGRAM_HOME, OWNER_NOTICE_KEY):
+                return [_owner_failure_text(run)], OWNER_NOTICE_KEY
+            return [], None
+        wait = run.get("wait")
+        if wait is not None and wait.get("outcome") == "served":
+            return [_owner_wait_text(wait)], None
+        return [], None
+    except Exception:
+        return [], None
+
+
+def _write_owner_stderr_lines() -> None:
+    """The per-run stderr lines (every run, class/kind and site only): a failed flag helper,
+    and the first owner failure. Never raises."""
+    try:
+        line = _owner_flags_failure_line()
+        if line is not None:
+            sys.stderr.write(line + "\n")
+        run = _OWNER_RUN
+        if run is not None and run.get("failure") is not None:
+            f = run["failure"]
+            sys.stderr.write(
+                f"engram-session-start-hook: owner read failed: "
+                f"{_sanitize_owner_text(f['kind'], 40)} at {_sanitize_owner_text(f['site'], 60)}\n"[:300])
+        sys.stderr.flush()
+    except Exception:
+        pass
+
 
 # Module-scope emitter resolve+insert (gh#2570 §1): probes for
 # engram_log_emitter.py specifically, distinct from the engram_client.py
@@ -387,13 +741,21 @@ def _check_backup_staleness(engram_home: str) -> tuple[bool, str | None]:
         if not os.path.exists(sql_path):
             # sql absent — only meaningful if the DB has actual nodes to back up.
             # A freshly bootstrapped empty schema (no nodes) doesn't need a backup yet.
+            # #3735: with the owner flag ON this count -- the only store read of this
+            # function; the mtime comparison below is a file stat -- goes through the fire's
+            # owner connection (never closed here). #3735 fix B: the direct path opens through
+            # connect_regular_ro (read-only, FIFO-safe) like every other opener in this hook.
+            _owner = _owner_active()
             try:
-                _conn = sqlite3.connect(db_path, timeout=1.0)
+                _conn = _owner_conn() if _owner else connect_regular_ro(db_path, timeout=1.0)
                 try:
-                    _count = _conn.execute("SELECT count(*) FROM nodes").fetchone()[0]
+                    _count = _owner_read(
+                        lambda c: c.execute("SELECT count(*) FROM nodes").fetchone()[0], _conn)
                 finally:
-                    _conn.close()
-            except Exception:
+                    if not _owner:
+                        _conn.close()
+            except Exception as _exc:
+                _record_owner_failure("_check_backup_staleness", _exc)
                 _count = 0
             if _count == 0:
                 return True, None
@@ -440,9 +802,18 @@ def _check_embedding_restore_flag(engram_home: str) -> tuple[bool | None, str | 
     the full rationale) and from engram_core.py's server-side
     _get_embedding_restore_flag.
 
-    Returns (True, None) when the flag is unset/clear, the DB is absent, or
-    the table doesn't exist yet (a DB that predates this feature) — the
-    latter two healthy BY DESIGN (nothing to restore).
+    Owner flag OFF (the direct read): returns (True, None) when the restore
+    flag is unset/clear, the DB is absent, or the table doesn't exist yet (a
+    DB that predates this feature) — the latter two healthy BY DESIGN
+    (nothing to restore). That "healthy by design" is flag-OFF ONLY.
+
+    Owner flag ON (#3735, Borges's ruling on PR #3746): a table the owner
+    dropped at startup is refused as `unregistered_template`, and the result
+    is UNKNOWN — (None, "OwnerReadError: ...unregistered_template...") — by
+    design, NOT healthy: the owner gives that same reason for an empty
+    registry, which is a real outage, so it cannot be told apart from a
+    merely absent table. The ON/OFF divergence is accepted and pinned by
+    tests/test_session_start_owner_read_3735.py.
 
     Returns (None, "<ExcType>: <message>") — UNKNOWN (#3521) — on any other
     read failure (not a database, locked, a queried column missing, any other
@@ -454,15 +825,18 @@ def _check_embedding_restore_flag(engram_home: str) -> tuple[bool | None, str | 
     count, cause, and remedy.
     """
     db_path = os.path.join(engram_home, "knowledge.db")
-    if not os.path.exists(db_path):
+    # #3735 (D10): with the owner flag ON the local store file is NOT consulted -- the store
+    # belongs to the owner, and a store this process cannot see is still read through it.
+    owner = _owner_active()
+    if not owner and not os.path.exists(db_path):
         return True, None
     conn = None
     try:
-        conn = connect_regular_ro(db_path, timeout=1.0)
-        row = conn.execute(
+        conn = _owner_conn() if owner else connect_regular_ro(db_path, timeout=1.0)
+        row = _owner_read(lambda c: c.execute(
             "SELECT not_fully_restored, null_count, cause FROM "
             "embedding_restore_state WHERE singleton_key = 1"
-        ).fetchone()
+        ).fetchone(), conn)
         if not row or not row[0]:
             return True, None
         null_count, cause = row[1], row[2]
@@ -481,16 +855,19 @@ def _check_embedding_restore_flag(engram_home: str) -> tuple[bool | None, str | 
         )
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).lower():
-            return True, None  # table doesn't exist yet (pre-feature DB) — healthy by design
+            return True, None  # table doesn't exist yet (pre-feature DB) — healthy by design (flag OFF; under flag ON the owner refuses the dropped template -> UNKNOWN)
         # #3521: locked database / missing queried column / I/O error are also
         # OperationalError but are NOT "nothing to restore" — UNKNOWN.
         return None, f"{type(exc).__name__}: {exc}"
     except Exception as exc:
         # #3521: never raises, never blocks session start, but cannot report
-        # healthy for a state it could not read.
+        # healthy for a state it could not read. #3735: an OWNER failure to serve the
+        # statement is this same UNKNOWN (never "healthy": it is not a sqlite3 "no such
+        # table"), and is recorded for the one owner notice.
+        _record_owner_failure("_check_embedding_restore_flag", exc)
         return None, f"{type(exc).__name__}: {exc}"
     finally:
-        if conn is not None:
+        if conn is not None and not owner:
             try:
                 conn.close()
             except Exception:
@@ -1412,20 +1789,26 @@ def focus_block(engram_home: str) -> str:
     """
     try:
         db_path = os.path.join(engram_home, "knowledge.db")
-        if not os.path.exists(db_path):
+        # #3735 (D10): with the owner flag ON the local store file is not consulted.
+        owner = _owner_active()
+        if not owner and not os.path.exists(db_path):
             return ""
 
         conn = None
         try:
-            conn = connect_regular_ro(db_path, timeout=1.0)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
+            conn = _owner_conn() if owner else connect_regular_ro(db_path, timeout=1.0)
+            # Columns are read BY INDEX (id, claim, focus_reason, focused_at): the owner
+            # shim has no row_factory.
+            rows = _owner_read(lambda c: c.execute(
                 "SELECT id, claim, focus_reason, focused_at FROM nodes "
                 "WHERE focused_at IS NOT NULL AND is_current = 1 "
                 "ORDER BY focused_at"
-            ).fetchall()
+            ).fetchall(), conn)
+        except Exception as exc:
+            _record_owner_failure("focus_block", exc)
+            raise
         finally:
-            if conn is not None:
+            if conn is not None and not owner:
                 try:
                     conn.close()
                 except Exception:
@@ -1443,11 +1826,11 @@ def focus_block(engram_home: str) -> str:
         # displayed window (see docstring). Row order is preserved throughout.
         row_infos = []
         for row in rows:
-            node_id = row["id"]
-            claim = row["claim"]
-            focus_reason = row["focus_reason"]
+            node_id = row[0]
+            claim = row[1]
+            focus_reason = row[2]
             stale_marker = ""
-            focused_dt = _parse_iso_timestamp(row["focused_at"])
+            focused_dt = _parse_iso_timestamp(row[3])
             if focused_dt is not None:
                 age_days = (now - focused_dt).days
                 if age_days > staleness_days:
@@ -1615,23 +1998,29 @@ def saved_focus_sets_block(engram_home: str) -> str:
     """
     try:
         db_path = os.path.join(engram_home, "knowledge.db")
-        if not os.path.exists(db_path):
+        # #3735 (D10): with the owner flag ON the local store file is not consulted.
+        owner = _owner_active()
+        if not owner and not os.path.exists(db_path):
             return ""
 
         conn = None
         try:
-            conn = connect_regular_ro(db_path, timeout=1.0)
-            conn.row_factory = sqlite3.Row
-            active_row = conn.execute(
+            conn = _owner_conn() if owner else connect_regular_ro(db_path, timeout=1.0)
+            # Columns are read BY INDEX: the owner shim has no row_factory.
+            active_row = _owner_read(lambda c: c.execute(
                 "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
-            ).fetchone()
-            active_name = active_row["active_set_name"] if active_row else None
-            rows = conn.execute(
+            ).fetchone(), conn)
+            active_name = active_row[0] if active_row else None
+            # (name, node_ids, description, created_at)
+            rows = _owner_read(lambda c: c.execute(
                 "SELECT name, node_ids, description, created_at FROM focus_sets "
                 "ORDER BY name ASC"
-            ).fetchall()
+            ).fetchall(), conn)
+        except Exception as exc:
+            _record_owner_failure("saved_focus_sets_block", exc)
+            raise
         finally:
-            if conn is not None:
+            if conn is not None and not owner:
                 try:
                     conn.close()
                 except Exception:
@@ -1639,19 +2028,19 @@ def saved_focus_sets_block(engram_home: str) -> str:
 
         entries = []
         for row in rows:
-            if row["name"] == active_name:
+            if row[0] == active_name:
                 continue
             try:
-                node_ids = json.loads(row["node_ids"])
+                node_ids = json.loads(row[1])
                 node_count = len(node_ids) if isinstance(node_ids, list) else 0
             except (json.JSONDecodeError, TypeError):
                 node_count = 0
-            saved_date = (row["created_at"] or "")[:10]
+            saved_date = (row[3] or "")[:10]
             entries.append({
-                "name": row["name"],
+                "name": row[0],
                 "node_count": node_count,
                 "saved_date": saved_date,
-                "description": (row["description"] or "").strip(),
+                "description": (row[2] or "").strip(),
             })
 
         if not entries:
@@ -1787,11 +2176,25 @@ def _liveness_tag(row) -> str:
 
     Fail-soft like everything else in this block: a row missing either
     column returns "" rather than raising.
+
+    #3735: the by-NAME form (a sqlite3.Row / mapping). session_checkpoint_block reads its
+    rows by INDEX now (the owner shim returns plain tuples) and calls
+    `_liveness_tag_values` directly; this wrapper keeps the old signature for any other
+    caller.
     """
     try:
-        if row["is_current"]:
+        return _liveness_tag_values(row["is_current"], row["status"])
+    except Exception:
+        return ""
+
+
+def _liveness_tag_values(is_current, status) -> str:
+    """The by-value core of `_liveness_tag` (see there for the `is_current`-not-`status`
+    reasoning): "" for a current node, " [retracted]" / " [superseded]" otherwise."""
+    try:
+        if is_current:
             return ""
-        if (row["status"] or "").strip().lower() == "retracted":
+        if (status or "").strip().lower() == "retracted":
             return " [retracted]"
         return " [superseded]"
     except Exception:
@@ -1863,21 +2266,27 @@ def session_checkpoint_block(engram_home: str, injected_through: str | None) -> 
         return ""
     try:
         db_path = os.path.join(engram_home, "knowledge.db")
-        if not os.path.exists(db_path):
+        # #3735 (D10): with the owner flag ON the local store file is not consulted.
+        owner = _owner_active()
+        if not owner and not os.path.exists(db_path):
             return ""
 
         conn = None
         try:
-            conn = connect_regular_ro(db_path, timeout=1.0)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
+            conn = _owner_conn() if owner else connect_regular_ro(db_path, timeout=1.0)
+            # Columns are read BY INDEX (id, type, claim, recall_summary, created_at,
+            # is_current, status): the owner shim has no row_factory.
+            rows = _owner_read(lambda c: c.execute(
                 "SELECT id, type, claim, recall_summary, created_at, "
                 "is_current, status FROM nodes "
                 "WHERE created_at >= ? ORDER BY created_at ASC",
                 (injected_through,),
-            ).fetchall()
+            ).fetchall(), conn)
+        except Exception as exc:
+            _record_owner_failure("session_checkpoint_block", exc)
+            raise
         finally:
-            if conn is not None:
+            if conn is not None and not owner:
                 try:
                     conn.close()
                 except Exception:
@@ -1888,13 +2297,13 @@ def session_checkpoint_block(engram_home: str, injected_through: str | None) -> 
 
         entries = []
         for row in rows:
-            claim = (row["claim"] or "").strip()
-            recall_summary = (row["recall_summary"] or "").strip()
+            claim = (row[2] or "").strip()
+            recall_summary = (row[3] or "").strip()
             # Property-based exclusion (not type-based) — see docstring.
             if not (claim or recall_summary):
                 continue
             text = recall_summary if recall_summary else claim[:100]
-            entries.append((row["id"], row["type"], text, _liveness_tag(row)))
+            entries.append((row[0], row[1], text, _liveness_tag_values(row[5], row[6])))
 
         if not entries:
             return ""
@@ -2773,14 +3182,20 @@ def sleep_status_block() -> str:
         except (OSError, ValueError, json.JSONDecodeError):
             marker = None
 
+    owner = _owner_active()  # #3735: the fire's owner connection, or the direct path
     if marker is None:
         total_nodes: int | None = None
         try:
-            conn = sqlite3.connect(ENGRAM_DB_PATH, timeout=2.0)
-            cur = conn.execute("SELECT COUNT(*) FROM nodes")
-            total_nodes = cur.fetchone()[0]
-            conn.close()
-        except sqlite3.Error:
+            # #3735 fix B: connect_regular_ro, not a raw read-write sqlite3.connect -- on an
+            # absent store the raw connect CREATED a 0-byte knowledge.db.
+            conn = _owner_conn() if owner else connect_regular_ro(ENGRAM_DB_PATH, timeout=2.0)
+            total_nodes = _owner_read(
+                lambda c: c.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], conn)
+            if not owner:
+                conn.close()
+        except Exception as exc:
+            if not _record_owner_failure("sleep_status_block", exc) and not isinstance(exc, sqlite3.Error):
+                raise
             return ""
         if total_nodes is None or total_nodes < SLEEP_BASELINE_NODE_THRESHOLD:
             return ""
@@ -2799,15 +3214,18 @@ def sleep_status_block() -> str:
         return ""
     nodes_since: int | None = None
     try:
-        conn = sqlite3.connect(ENGRAM_DB_PATH, timeout=2.0)
-        cur = conn.execute(
+        conn = _owner_conn() if owner else connect_regular_ro(ENGRAM_DB_PATH, timeout=2.0)
+        nodes_since = _owner_read(lambda c: c.execute(
             "SELECT COUNT(*) FROM nodes WHERE created_at > ?",
             (completed_at_str,),
-        )
-        nodes_since = cur.fetchone()[0]
-        conn.close()
-    except sqlite3.Error:
-        pass
+        ).fetchone()[0], conn)
+        if not owner:
+            conn.close()
+    except Exception as exc:
+        # An unknown count is not a quiet day: nodes_since stays None and the banner prints
+        # "node count unavailable" (an owner failure takes this same branch).
+        if not _record_owner_failure("sleep_status_block", exc) and not isinstance(exc, sqlite3.Error):
+            raise
     if nodes_since is not None and nodes_since < SLEEP_DEBT_MIN_NODES_THRESHOLD:
         return ""
     nodes_part = (
@@ -3344,6 +3762,20 @@ def write_session_start_overflow(cut_blocks: list, now: float | None = None) -> 
 
 
 def main() -> None:
+    """One fire. The owner state (#3735) lives for exactly this call: reset on entry and on
+    every way out, so the six functions called outside main() (the existing suites) stay on
+    the direct path."""
+    global _OWNER_RUN, _OWNER_FLAGS_FAILURE
+    _OWNER_RUN = None
+    _OWNER_FLAGS_FAILURE = None
+    try:
+        _main_impl()
+    finally:
+        _write_owner_stderr_lines()  # every run: class/kind and site only, whichever way the fire ended
+        _OWNER_RUN = None
+
+
+def _main_impl() -> None:
     # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
     # return in this function.
     write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})
@@ -3520,6 +3952,10 @@ def main() -> None:
     _mcp_stale_pid = None
     if mcp_status is True and _startup_mcp_health_probe_allowed():
         _mcp_stale_pid = _dead_marker_pid(ENGRAM_HOME)
+    # #3735: the owner flag, read ONCE per fire, before the first of the six store readers
+    # runs. A failed helper reads OFF and is reported on stderr at the end of the fire.
+    global _OWNER_RUN
+    _OWNER_RUN = _fresh_owner_run(_owner_reads_enabled())
     stale_ok, stale_reason = _check_backup_staleness(ENGRAM_HOME)
     viz_status, viz_reason = _check_viz_server_health(ENGRAM_HOME)
     embed_restore_ok, embed_restore_reason = _check_embedding_restore_flag(ENGRAM_HOME)
@@ -4035,6 +4471,14 @@ def main() -> None:
     # below -- it is deliberately NOT passed to emit_context() itself (see
     # _harness.py's own docstring on why head_budget and target are
     # different concepts).
+    # #3735: the owner line(s), now that every reader of the fire has run. They join the
+    # substrate-health lines (priority class _P_HEALTH), so they are folded into `head` or
+    # queued as the highest-priority body item exactly like every other health line.
+    _owner_lines, _owner_stamp_key = _pending_owner_health()
+    if _owner_lines:
+        _health_lines.extend(_owner_lines)
+        _health_text = "\n".join(_health_lines)
+
     _harness_name = detect_harness()
     _budgets = get_harness_budgets(_harness_name)
 
@@ -4166,6 +4610,17 @@ def main() -> None:
     }
     output_str = json.dumps(output_obj)
     print(output_str)
+
+    if _owner_stamp_key:
+        # #3735: the rate-limit window is consumed only once the line has actually been
+        # written out; a fire that dies before this point (or a failed flush) stamps
+        # nothing, so the next failure shows the line again.
+        try:
+            sys.stdout.flush()
+        except Exception:
+            _owner_stamp_key = None
+        if _owner_stamp_key:
+            mark_probe_notice(ENGRAM_HOME, _owner_stamp_key)
 
     _duration_ms = int((time.perf_counter() - _t0) * 1000)
 
