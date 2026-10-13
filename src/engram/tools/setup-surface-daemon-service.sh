@@ -8,16 +8,34 @@
 #
 # Usage:
 #   tools/setup-surface-daemon-service.sh
-#   tools/setup-surface-daemon-service.sh --owner     # the engramd OWNER, Linux only (#3663)
+#   tools/setup-surface-daemon-service.sh --owner     # the engramd OWNER (#3663 Linux, #3709 macOS)
 #
-# --owner installs the engramd owner (engramd_owner.py) instead, as the systemd USER
-# unit engramd-owner-<id>.service rendered from engramd-owner.service.template, where
-# <id> is the first 8 hex chars of sha256 over the NORMALIZED (absolute, physical,
-# no trailing slash) ENGRAM_HOME -- one unit per ENGRAM_HOME, not per user. Linux only:
-# on macOS it exits non-zero and writes/calls nothing (there is no macOS launcher
-# for the owner yet, #3709). The ephemeral-path refusal below
-# applies to engramd_owner.py's physical path in this mode. Without --owner the
-# behaviour is exactly what it always was.
+# --owner installs the engramd owner (engramd_owner.py) instead. One supervisor entry per
+# ENGRAM_HOME, not per user, named with <id> = first 8 hex chars of sha256 over the
+# NORMALIZED (absolute, physical, no trailing slash) ENGRAM_HOME, derived by
+# tools/engramd-owner-home-key.sh -- the one helper hooks/start-engramd-owner.sh also uses:
+#   Linux  → the systemd USER unit engramd-owner-<id>.service rendered from
+#            engramd-owner.service.template (restarts are bounded by systemd's start limit).
+#   Darwin → the LaunchAgent com.engram.engramd-owner.<id> rendered from
+#            engramd-owner.plist.template to ~/Library/LaunchAgents/<label>.plist, then
+#            `launchctl bootout gui/<uid>/<label>` (failure ignored) and
+#            `launchctl bootstrap gui/<uid> <plist>` (#3709). KeepAlive is
+#            {SuccessfulExit: false} with ThrottleInterval 60: exit 0 is not restarted, a
+#            non-zero exit retries once a minute with NO start limit (the template's header
+#            says why that is acceptable).
+#   Darwin, before anything is written: ENGRAM_HOME is run through the owner's own
+#            `engramd_owner.py --preflight` (platform support, socket-path length, the
+#            ~/Documents|Desktop|Downloads TCC home check: the functions start() runs, not
+#            copies) first on the tilde-expanded absolute path, BEFORE the home is created
+#            (a mkdir under ~/Documents is itself a TCC access), and again on the physical
+#            path (it can be longer). A refusal exits non-zero with the owner's reason and
+#            leaves no home dir, no LaunchAgents dir, no plist and no launchctl call: a
+#            refusal under KeepAlive is a respawn loop by construction.
+# The ephemeral-path refusal below applies to engramd_owner.py's physical path in this
+# mode. Without --owner the behaviour is exactly what it always was.
+#
+# --owner refuses any ENGRAM_HOME with a `..` path component (exit 2, before anything is written):
+# mkdir and cd/pwd -P read `..` after a symlink differently. Names like `a..b` are fine.
 #
 # The script detects the OS via `uname -s`:
 #   Linux  → renders engram-surface-daemon.service.template and installs it as a
@@ -70,14 +88,12 @@ if [[ "${ENGRAM_SETUP_ALLOW_PATH:-}" == "1" ]]; then
     ALLOW_PATH=1
 fi
 
-# --owner is Linux only (#3663): refuse on anything else BEFORE touching anything.
+# --owner supports Linux (systemd --user) and macOS (launchd) only: refuse anything else
+# BEFORE touching anything.
 if [[ "$OWNER_MODE" == "1" ]]; then
     _owner_os="$(uname -s)"
-    if [[ "$_owner_os" == "Darwin" ]]; then
-        echo "ERROR: --owner is not supported on macOS yet: there is no macOS (launchd) launcher for the owner yet (#3709). Nothing was written or loaded." >&2
-        exit 1
-    elif [[ "$_owner_os" != "Linux" ]]; then
-        echo "ERROR: --owner supports Linux (systemd --user) only; this is $_owner_os. Nothing was written." >&2
+    if [[ "$_owner_os" != "Linux" && "$_owner_os" != "Darwin" ]]; then
+        echo "ERROR: --owner supports Linux (systemd --user) and macOS (launchd) only; this is $_owner_os. Nothing was written." >&2
         exit 1
     fi
 fi
@@ -257,6 +273,10 @@ _owner_bad_char() {
         # in every value (one uniform rule).
         *'{{'*) printf 'open-brace-pair' ;;
         *'}}'*) printf 'close-brace-pair' ;;
+        # The macOS plist is XML: `<` and `>` would break it. (Linux units carry them fine, and
+        # the Linux --owner behaviour is unchanged.)
+        *'<'*) [[ "$OS" == "Darwin" ]] && printf 'less-than' || return 1 ;;
+        *'>'*) [[ "$OS" == "Darwin" ]] && printf 'greater-than' || return 1 ;;
         *) return 1 ;;
     esac
 }
@@ -276,30 +296,87 @@ if [[ "$OWNER_MODE" == "1" ]]; then
         *) _owner_home_raw="$ENGRAM_HOME" ;;
     esac
     _owner_refuse_if_bad "ENGRAM_HOME" "$_owner_home_raw"
+    # A `..` anywhere in the home is refused (both platforms, one rule). `mkdir -p` follows the
+    # kernel (a `..` after a symlink goes to the link TARGET's parent) while `cd`/`pwd -P` read it
+    # lexically, so the directory created could be a different one than the one planned and checked.
+    case "/$_owner_home_raw/" in
+        */../*)
+            echo "ERROR: the home path must not contain '..' components (ENGRAM_HOME=$(printf '%q' "$_owner_home_raw")); a '..' after a symlink makes mkdir create a different directory than the one checked. Give the path without '..'. No unit was written or loaded." >&2
+            exit 2
+            ;;
+    esac
     _owner_refuse_if_bad "the python path" "$PYTHON_BIN"
     _owner_refuse_if_bad "the owner script path" "$DAEMON_PY"
 fi
 
+# macOS --owner: run the OWNER'S OWN start-time refusals (platform support, socket-path length, the
+# TCC home check) through `engramd_owner.py --preflight`, before anything is written. The owner's
+# reason goes to our stderr; nothing has been created yet when it refuses. ENGRAM_HOME is passed in
+# the environment, as launchd will pass it.
+_owner_preflight() {
+    # $1 = absolute ENGRAM_HOME to check, $2 = which pass (for the message)
+    local _out _rc
+    _out="$(ENGRAM_HOME="$1" "$PYTHON_BIN" "$DAEMON_PY" --preflight 2>&1)" && _rc=0 || _rc=$?
+    if [[ "$_rc" != "0" ]]; then
+        echo "ERROR: the owner would refuse to start with ENGRAM_HOME=$1 ($2); registering it would only respawn. Nothing was written or loaded." >&2
+        [[ -n "$_out" ]] && echo "$_out" >&2
+        exit 1
+    fi
+}
+
 if [[ "$OWNER_MODE" == "1" ]]; then
     # Normalize ENGRAM_HOME (after the refusals above, so a refusal creates nothing):
-    # ~ expanded, created, made absolute and physical, no trailing slash. The unit name
-    # is keyed on this string, so every spelling of one home must give the same one.
+    # ~ expanded, created, made absolute and physical, no trailing slash. The unit name /
+    # label is keyed on this string (by the shared helper), so every spelling of one home
+    # must give the same one.
     case "$ENGRAM_HOME" in
         "~") ENGRAM_HOME="$HOME" ;;
         "~/"*) ENGRAM_HOME="$HOME/${ENGRAM_HOME#"~/"}" ;;
     esac
+    # The ONE home-key helper (tools/engramd-owner-home-key.sh): the key derivation AND the
+    # physical-path resolution live there, and nowhere else.
+    _home_key_sh="$_script_dir/engramd-owner-home-key.sh"
+    _owner_source_home_key() {
+        if [[ ! -f "$_home_key_sh" ]]; then
+            echo "ERROR: home-key helper not found: $_home_key_sh" >&2
+            exit 1
+        fi
+        # shellcheck source=engramd-owner-home-key.sh
+        source "$_home_key_sh"
+    }
+    if [[ "$OS" == "Darwin" ]]; then
+        # Absolute (a relative home is relative to this cwd, as the owner reads it).
+        [[ "$ENGRAM_HOME" == /* ]] || ENGRAM_HOME="$PWD/$ENGRAM_HOME"
+        while [[ "$ENGRAM_HOME" != "/" && "$ENGRAM_HOME" == */ ]]; do ENGRAM_HOME="${ENGRAM_HOME%/}"; done
+        # Both preflights run BEFORE any directory is created: a mkdir under ~/Documents would
+        # itself be a TCC access, and a refusal must leave no home dir behind. The physical path
+        # is computed without creating anything (deepest existing ancestor, resolved, plus the
+        # not-yet-existing remainder), so it is checked first too.
+        _owner_source_home_key
+        _owner_preflight "$ENGRAM_HOME" "as given"
+        _owner_physical_planned="$(engramd_owner_physical_path "$ENGRAM_HOME")" || {
+            echo "ERROR: cannot work out the physical path of ENGRAM_HOME=$ENGRAM_HOME. Nothing was written or loaded." >&2
+            exit 1
+        }
+        _owner_refuse_if_bad "ENGRAM_HOME (physical path)" "$_owner_physical_planned"
+        # The physical path can be longer than the spelling that passed above.
+        _owner_preflight "$_owner_physical_planned" "physical path"
+    fi
     mkdir -p "$ENGRAM_HOME"
     ENGRAM_HOME="$(cd "$ENGRAM_HOME" && pwd -P)"
     _owner_refuse_if_bad "ENGRAM_HOME (physical path)" "$ENGRAM_HOME"
     while [[ "$ENGRAM_HOME" != "/" && "$ENGRAM_HOME" == */ ]]; do ENGRAM_HOME="${ENGRAM_HOME%/}"; done
-    if command -v sha256sum &>/dev/null; then
-        _home_id="$(printf '%s' "$ENGRAM_HOME" | sha256sum | cut -c1-8)"
-    elif command -v shasum &>/dev/null; then
-        _home_id="$(printf '%s' "$ENGRAM_HOME" | shasum -a 256 | cut -c1-8)"
-    else
-        echo "ERROR: neither sha256sum nor shasum found; cannot key the unit name on ENGRAM_HOME." >&2
+    if [[ "$OS" == "Darwin" && "$ENGRAM_HOME" != "$_owner_physical_planned" ]]; then
+        # Something moved between the plan and the mkdir (a race, or a case this plan did not
+        # foresee). Refuse rather than guess; what mkdir created is left in place.
+        echo "ERROR: ENGRAM_HOME resolved to $ENGRAM_HOME after it was created, but $_owner_physical_planned was planned and checked. Refusing to register a different home than the one checked. Nothing was written or loaded (the home dir itself was created and is left in place)." >&2
         exit 1
     fi
+    _owner_source_home_key
+    _home_id="$(engramd_owner_home_key "$ENGRAM_HOME")" || {
+        echo "ERROR: cannot key the unit name / label on ENGRAM_HOME." >&2
+        exit 1
+    }
     echo "=== ENGRAM owner service setup ==="
 else
     echo "=== ENGRAM surface daemon service setup ==="
@@ -384,21 +461,35 @@ elif [[ "$OS" == "Darwin" ]]; then
     fi
 
     PLIST_TEMPLATE="$TEMPLATE_DIR/engram-surface-daemon.plist.template"
+    PLIST_LABEL="com.engram.surface-daemon"
+    PLIST_LOG_NAME="surface-daemon.log"
+    if [[ "$OWNER_MODE" == "1" ]]; then
+        PLIST_TEMPLATE="$TEMPLATE_DIR/engramd-owner.plist.template"
+        PLIST_LABEL="com.engram.engramd-owner.$_home_id"
+        PLIST_LOG_NAME="engramd-owner.log"
+    fi
     if [[ ! -f "$PLIST_TEMPLATE" ]]; then
         echo "ERROR: plist template not found: $PLIST_TEMPLATE" >&2
         exit 1
     fi
 
-    PLIST_LABEL="com.engram.surface-daemon"
     AGENTS_DIR="$HOME/Library/LaunchAgents"
     PLIST_DEST="$AGENTS_DIR/$PLIST_LABEL.plist"
     mkdir -p "$AGENTS_DIR"
 
     echo "Step 1: Rendering LaunchAgent plist → $PLIST_DEST"
-    sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
-        -e "s|{{ENGRAM_HOOKS_DIR}}|$HOOKS_DIR|g" \
-        -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
-        "$PLIST_TEMPLATE" > "$PLIST_DEST"
+    if [[ "$OWNER_MODE" == "1" ]]; then
+        sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
+            -e "s|{{ENGRAM_OWNER_PY}}|$DAEMON_PY|g" \
+            -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
+            -e "s|{{LABEL}}|$PLIST_LABEL|g" \
+            "$PLIST_TEMPLATE" > "$PLIST_DEST"
+    else
+        sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
+            -e "s|{{ENGRAM_HOOKS_DIR}}|$HOOKS_DIR|g" \
+            -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
+            "$PLIST_TEMPLATE" > "$PLIST_DEST"
+    fi
     echo "  done."
 
     echo
@@ -412,7 +503,7 @@ elif [[ "$OS" == "Darwin" ]]; then
     echo
     echo "=== Setup complete ==="
     echo "  Check status:  launchctl list | grep engram"
-    echo "  Logs file:     $ENGRAM_HOME/surface-daemon.log"
+    echo "  Logs file:     $ENGRAM_HOME/$PLIST_LOG_NAME"
 
 # ---------------------------------------------------------------------------
 # Unsupported OS

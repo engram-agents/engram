@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # start-engramd-owner.sh -- SessionStart fallback that starts the engramd OWNER when
-# nothing supervises it (engram-alpha#3663, U5 of #2652). Linux only.
+# nothing supervises it (engram-alpha#3663, U5 of #2652; macOS arm: #3709). Linux and macOS.
 #
 # Gated on the owner flags. If NO `engramd.*_via_owner` flag is on in
 # $ENGRAM_HOME/config.json (today's default on every seat) this hook does nothing at
@@ -8,29 +8,36 @@
 # through ONE helper, engramd_owner_flags.py (plugin root), via the plugin venv python.
 #
 # With at least one flag on:
-#   * a live owner for this ENGRAM_HOME (engramd.pid names a positive pid that is alive,
-#     and /proc/<pid>/cmdline contains `engramd_owner`; the same FAMILY of rule as
-#     engram_pidfile.recorded_pid_is_alive but not identical: no pidfile-mtime vs
-#     process-start-time check here, and stricter on the marker -- an unrelated live
-#     process without `engramd_owner` in its argv never counts)
+#   * a live owner for this ENGRAM_HOME (engramd.pid names a positive pid that is alive and
+#     whose argv contains `engramd_owner`, decided by engram_pidfile.recorded_live_pid in its
+#     STRICT mode, require_marker=True: the marker is required of any live pid whatever its
+#     start time, an unreadable argv counts as alive, and an unrelated live process without
+#     `engramd_owner` in its argv never counts)
 #                                                        -> launch nothing, say nothing
-#   * the supervised systemd --user unit for THIS home (engramd-owner-<id>.service,
-#     <id> = first 8 hex of sha256 over the physical ENGRAM_HOME -- the same key
-#     tools/setup-surface-daemon-service.sh --owner uses) is registered
-#                                                        -> launch nothing (active: silent;
-#                                                           registered but not active: one line)
-#   * systemd answers "no such unit", `systemctl` is absent, or `systemctl --user`
-#     cannot answer (no user bus, e.g. WSL)              -> launch the owner detached,
-#                                                           ONE line containing UNSUPERVISED
-#   * systemd's answer is ambiguous (timeout, empty)     -> launch nothing, say so
+#   * engram_pidfile cannot be imported                -> launch nothing, say so (ambiguous)
+#   * the supervised unit / job for THIS home is registered. The home key <id> is the first 8
+#     hex of sha256 over the physical ENGRAM_HOME, derived by tools/engramd-owner-home-key.sh,
+#     the one helper tools/setup-surface-daemon-service.sh --owner also uses:
+#       Linux:  the systemd --user unit engramd-owner-<id>.service
+#       macOS:  the launchd job com.engram.engramd-owner.<id> (`launchctl print`, asked and
+#               parsed by the I/O helper under a Python-side timeout)
+#                                                        -> launch nothing (running / active:
+#                                                           silent; registered but not running:
+#                                                           one line naming the state, and on
+#                                                           macOS the last exit status)
+#   * the supervisor answers "no such unit / job"        -> launch the owner detached,
+#     (Linux also: `systemctl` is absent, or `systemctl --user` cannot answer -- no user bus,
+#     e.g. WSL)                                             ONE line containing UNSUPERVISED
+#   * the supervisor's answer is ambiguous (timeout, empty, unparseable, rc other than the
+#     measured not-found one; on macOS also `launchctl` missing)
+#                                                        -> launch nothing, say so
 #                                                           (a missing owner is recoverable;
 #                                                           a duplicate is not)
 #   * the flags cannot be read at all                    -> launch nothing, say so
 #   * the launch fails (cannot spawn, or the owner dies within ~1s)
 #                                                        -> one line saying it could not be
 #                                                           started, naming the log
-#   * macOS                                              -> nothing launched, one line
-#   * any other non-Linux OS                             -> nothing launched, one line naming the OS
+#   * any other OS                                       -> nothing launched, one line naming the OS
 #
 # Always exits 0 (never breaks a session start). stdout is at most ONE bounded
 # SessionStart additionalContext JSON object (the stdout audit requires JSON-or-nothing);
@@ -139,12 +146,8 @@ if [ -z "$IO_PY" ] || [ ! -f "$IO_PY" ]; then
     exit 0
 fi
 _os="$(uname -s 2>/dev/null)"
-if [ "$_os" != "Linux" ]; then
-    if [ "$_os" = "Darwin" ]; then
-        _report "ENGRAM owner not launched: there is no macOS launcher for the owner yet (#3709); an owner flag is on. ENGRAM_HOME=$ENGRAM_HOME"
-    else
-        _report "ENGRAM owner not launched: ${_os:-this OS} is not supported (the owner launcher is Linux-only); an owner flag is on. ENGRAM_HOME=$ENGRAM_HOME"
-    fi
+if [ "$_os" != "Linux" ] && [ "$_os" != "Darwin" ]; then
+    _report "ENGRAM owner not launched: ${_os:-this OS} is not supported by the owner launcher; an owner flag is on. ENGRAM_HOME=$ENGRAM_HOME"
     exit 0
 fi
 
@@ -167,86 +170,130 @@ case "$_verdict" in
         ;;
 esac
 
-# ---- 4. is the supervised unit for THIS home registered? ---------------------------
-if command -v sha256sum >/dev/null 2>&1; then
-    _home_id="$(printf '%s' "$ENGRAM_HOME" | sha256sum | cut -c1-8)"
-elif command -v shasum >/dev/null 2>&1; then
-    _home_id="$(printf '%s' "$ENGRAM_HOME" | shasum -a 256 | cut -c1-8)"
-else
-    _report "ENGRAM owner not launched (cannot compute the unit name: no sha256sum; ambiguous). ENGRAM_HOME=$ENGRAM_HOME"
+# ---- 4. is the supervised unit / job for THIS home registered? -----------------------
+# The home key (first 8 hex of sha256 over the physical home) comes from the ONE shared helper,
+# the same one tools/setup-surface-daemon-service.sh --owner names the unit / label with.
+HOME_KEY_SH="$PLUGIN_ROOT/tools/engramd-owner-home-key.sh"
+_home_id=""
+if [ -f "$HOME_KEY_SH" ]; then
+    # shellcheck source=/dev/null
+    . "$HOME_KEY_SH" 2>/dev/null && _home_id="$(engramd_owner_home_key "$ENGRAM_HOME" 2>/dev/null)"
+fi
+if [ -z "$_home_id" ]; then
+    _report "ENGRAM owner not launched (cannot compute the home key: $HOME_KEY_SH missing or failed; ambiguous). ENGRAM_HOME=$ENGRAM_HOME"
     exit 0
 fi
-UNIT="engramd-owner-$_home_id.service"
 
-# Prints: none | nobus | notfound | active | registered:<ActiveState> | ambiguous:<why>
-_unit_state() {
-    local out rc load_state active_state
-    if ! command -v systemctl >/dev/null 2>&1; then
-        printf 'none'
-        return
-    fi
-    if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
-        export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-    fi
-    if command -v timeout >/dev/null 2>&1; then
-        out="$(timeout 3 systemctl --user show "$UNIT" -p LoadState,ActiveState,SubState 2>&1)"
-    else
-        out="$(systemctl --user show "$UNIT" -p LoadState,ActiveState,SubState 2>&1)"
-    fi
-    rc=$?
-    if [ "$rc" -eq 124 ]; then
-        printf 'ambiguous:systemctl timed out'
-        return
-    fi
-    if [ "$rc" -ne 0 ]; then
-        printf 'nobus'
-        return
-    fi
-    load_state="$(printf '%s\n' "$out" | sed -n 's/^LoadState=//p')"
-    if [ -z "$load_state" ]; then
-        printf 'ambiguous:systemctl answered with no LoadState'
-        return
-    fi
-    if [ "$load_state" = "not-found" ]; then
-        printf 'notfound'
-        return
-    fi
-    active_state="$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p')"
-    if [ "$active_state" = "active" ]; then
-        printf 'active'
-    else
-        printf 'registered:%s' "${active_state:-unknown}"
-    fi
-}
+if [ "$_os" = "Darwin" ]; then
+    # ---- 4a. macOS: the launchd job com.engram.engramd-owner.<key> ----------------------
+    # `launchctl print gui/<uid>/<label>` is asked and parsed by the Python I/O helper (it owns
+    # the timeout: stock macOS has no GNU `timeout`). It prints one of
+    #   running | registered:<state>:<last exit or none> | notfound | ambiguous:<why>
+    LABEL="com.engram.engramd-owner.$_home_id"
+    _state="$("$PYTHON_BIN" "$IO_PY" launchd_state "$LABEL" 2>/dev/null)"
+    _sup="launchd: ${_state:-no answer}"
+    case "$_state" in
+        running) exit 0 ;;
+        registered:*)
+            _rest="${_state#registered:}"
+            _report "ENGRAM owner job $LABEL is registered but ${_rest%:*} (last exit ${_rest##*:}); leaving it to launchd, no second owner launched. ENGRAM_HOME=$ENGRAM_HOME"
+            exit 0
+            ;;
+        ambiguous:*)
+            _report "ENGRAM owner not launched (launchd state is ambiguous: ${_state#ambiguous:}); a duplicate is worse than a missing owner. ENGRAM_HOME=$ENGRAM_HOME"
+            exit 0
+            ;;
+        notfound) ;;
+        *)
+            _report "ENGRAM owner not launched (launchd state is ambiguous: unrecognized answer). ENGRAM_HOME=$ENGRAM_HOME"
+            exit 0
+            ;;
+    esac
+else
+    # ---- 4b. Linux: the systemd --user unit engramd-owner-<key>.service -----------------
+    UNIT="engramd-owner-$_home_id.service"
 
-_state="$(_unit_state)"
-case "$_state" in
-    active) exit 0 ;;
-    registered:*)
-        _report "ENGRAM owner unit $UNIT is registered but ${_state#registered:}; leaving it to systemd, no second owner launched. ENGRAM_HOME=$ENGRAM_HOME"
-        exit 0
-        ;;
-    ambiguous:*)
-        _report "ENGRAM owner not launched (systemd state is ambiguous: ${_state#ambiguous:}); a duplicate is worse than a missing owner. ENGRAM_HOME=$ENGRAM_HOME"
-        exit 0
-        ;;
-    none | nobus | notfound) ;;
-    *)
-        _report "ENGRAM owner not launched (systemd state is ambiguous: unrecognized answer). ENGRAM_HOME=$ENGRAM_HOME"
-        exit 0
-        ;;
-esac
+    # Prints: none | nobus | notfound | active | registered:<ActiveState> | ambiguous:<why>
+    _unit_state() {
+        local out rc load_state active_state
+        if ! command -v systemctl >/dev/null 2>&1; then
+            printf 'none'
+            return
+        fi
+        if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
+            export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+        fi
+        if command -v timeout >/dev/null 2>&1; then
+            out="$(timeout 3 systemctl --user show "$UNIT" -p LoadState,ActiveState,SubState 2>&1)"
+        else
+            out="$(systemctl --user show "$UNIT" -p LoadState,ActiveState,SubState 2>&1)"
+        fi
+        rc=$?
+        if [ "$rc" -eq 124 ]; then
+            printf 'ambiguous:systemctl timed out'
+            return
+        fi
+        if [ "$rc" -ne 0 ]; then
+            printf 'nobus'
+            return
+        fi
+        load_state="$(printf '%s\n' "$out" | sed -n 's/^LoadState=//p')"
+        if [ -z "$load_state" ]; then
+            printf 'ambiguous:systemctl answered with no LoadState'
+            return
+        fi
+        if [ "$load_state" = "not-found" ]; then
+            printf 'notfound'
+            return
+        fi
+        active_state="$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p')"
+        if [ "$active_state" = "active" ]; then
+            printf 'active'
+        else
+            printf 'registered:%s' "${active_state:-unknown}"
+        fi
+    }
+
+    _state="$(_unit_state)"
+    _sup="systemd: $_state"
+    case "$_state" in
+        active) exit 0 ;;
+        registered:*)
+            _report "ENGRAM owner unit $UNIT is registered but ${_state#registered:}; leaving it to systemd, no second owner launched. ENGRAM_HOME=$ENGRAM_HOME"
+            exit 0
+            ;;
+        ambiguous:*)
+            _report "ENGRAM owner not launched (systemd state is ambiguous: ${_state#ambiguous:}); a duplicate is worse than a missing owner. ENGRAM_HOME=$ENGRAM_HOME"
+            exit 0
+            ;;
+        none | nobus | notfound) ;;
+        *)
+            _report "ENGRAM owner not launched (systemd state is ambiguous: unrecognized answer). ENGRAM_HOME=$ENGRAM_HOME"
+            exit 0
+            ;;
+    esac
+fi
 
 # ---- 5. unsupervised launch --------------------------------------------------------
 OWNER_PY="$PLUGIN_ROOT/engramd_owner.py"
 
-# The `State: Z` guard is UNTESTED, and I could not make a deterministic cell for it. The
+# The zombie guard is UNTESTED, and I could not make a deterministic cell for it. The
 # owner is started by the Python helper (the helper exits, so the owner is reparented and its
-# exit is reaped by init / a subreaper, not by this shell): a dead owner stops answering
-# `kill -0` within moments, so the zombie branch is not reliably observable at the 0.2 s poll.
-# It is kept as a belt; do not read it as covered.
+# exit is reaped by init / launchd / a subreaper, not by this shell): a dead owner stops
+# answering `kill -0` within moments, so the zombie branch is not reliably observable at the
+# 0.2 s poll. It is kept as a belt; do not read it as covered. Linux reads /proc/<pid>/status;
+# macOS has no /proc, so there `ps -o stat=` is asked (when ps exists; otherwise `kill -0`
+# alone decides, as it did when this guard only had the /proc arm).
 _alive() {
-    kill -0 "$1" 2>/dev/null && ! grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null
+    kill -0 "$1" 2>/dev/null || return 1
+    if [ -r "/proc/$1/status" ]; then
+        grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null && return 1
+    elif [ "$_os" = "Darwin" ] && command -v ps >/dev/null 2>&1; then
+        case "$(ps -o stat= -p "$1" 2>/dev/null)" in
+            *Z*) return 1 ;;
+        esac
+    fi
+    return 0
 }
 
 if [ ! -f "$OWNER_PY" ]; then
@@ -292,7 +339,7 @@ if [ "$_ok" -eq 0 ]; then
 fi
 
 if [ "$_ok" -eq 1 ]; then
-    _report "UNSUPERVISED: engramd_owner launched (pid $_pid); no supervisor reachable (systemd: $_state). ENGRAM_HOME=$ENGRAM_HOME. $_log_note"
+    _report "UNSUPERVISED: engramd_owner launched (pid $_pid); no supervisor reachable ($_sup). ENGRAM_HOME=$ENGRAM_HOME. $_log_note"
 else
     _report "ENGRAM owner could not be started: the process exited within a second. ENGRAM_HOME=$ENGRAM_HOME. $_log_note"
 fi

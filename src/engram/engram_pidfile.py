@@ -306,7 +306,9 @@ def recorded_pid_is_alive(pid_path, program_marker: str | None = None) -> bool:
     return recorded_live_pid(pid_path, program_marker) is not None
 
 
-def recorded_live_pid(pid_path, program_marker: str | None = None) -> int | None:
+def recorded_live_pid(
+    pid_path, program_marker: str | None = None, *, require_marker: bool = False
+) -> int | None:
     """The pid `pid_path` names when it is a live process that could have
     written it, else None (#3707). One read of the pidfile: a caller that needs
     the pid must not read it separately from the liveness check, or the two
@@ -327,7 +329,24 @@ def recorded_live_pid(pid_path, program_marker: str | None = None) -> int | None
     that started after the pidfile counts as a REUSED pid only if its
     cmdline does not contain the marker (so clock drift cannot make a live
     instance read dead); unreadable cmdline -> True. None -> start-time-only.
+
+    `require_marker=True` (#3709) is the STRICT mode, named so a caller opts in
+    and the default rule stays exactly what every existing caller relies on.
+    The marker is then required of ANY live pid, whatever its start time: the
+    pid reads alive only if its cmdline contains `program_marker` (unreadable
+    cmdline -> still alive, never guess dead), and the start-time comparison
+    is not consulted. The default rule consults the marker only for a process
+    that started after the pidfile, so a live non-owner OLDER than the pidfile
+    reads alive there; that shape needs no malice (a plain `cp` of a home
+    rewrites the pidfile's mtime), and a caller that must not mistake such a
+    process for its owner (the SessionStart hook, which would otherwise
+    never launch the owner) passes `require_marker=True`. The one start-time
+    read still made is the Darwin ESRCH check (the process exited between
+    `os.kill` and the read: gone, not unreadable). Requires `program_marker`
+    (ValueError otherwise: a strict check against no marker is meaningless).
     """
+    if require_marker and not program_marker:
+        raise ValueError("require_marker=True needs a program_marker")
     try:
         with open_regular_text(pid_path) as f:
             pid = int(f.read().strip())
@@ -369,6 +388,12 @@ def recorded_live_pid(pid_path, program_marker: str | None = None) -> int | None
         # ProcessLookupError escaping it is still ESRCH (no such process), so
         # reading it as dead here stays correct. The two clauses go together.
         return None
+    if require_marker:
+        # Strict (#3709): the marker decides, whatever the start time said.
+        cmdline = _read_process_cmdline(pid)
+        if cmdline is None:
+            return pid  # cannot tell reuse from a live owner -- never guess dead
+        return pid if program_marker in cmdline else None
     if start_time is None:
         return pid
     if not _started_after_pidfile(start_time, mtime):

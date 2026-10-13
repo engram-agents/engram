@@ -1,0 +1,81 @@
+gui/501/com.engram.viz-server = {
+	active count = 1
+	path = /Users/PLACEHOLDER_USER/Library/LaunchAgents/com.engram.viz-server.plist
+	type = LaunchAgent
+	state = running
+
+	program = /Users/PLACEHOLDER_USER/.engram/venv/bin/python3
+	arguments = {
+		/Users/PLACEHOLDER_USER/.engram/venv/bin/python3
+		-m
+		viz.server
+		--bind
+		127.0.0.1
+		--port
+		5001
+		--config
+		/Users/PLACEHOLDER_USER/.engram/viz-agents.json
+	}
+
+	working directory = /Users/PLACEHOLDER_USER/.engram/marketplace/plugins/engram
+
+	stdout path = /Users/PLACEHOLDER_USER/.engram/viz-server.log
+	stderr path = /Users/PLACEHOLDER_USER/.engram/viz-server.err
+	inherited environment = {
+		DEVELOPER_DIR => /Library/Developer/CommandLineTools
+		SSH_AUTH_SOCK => /var/run/com.apple.launchd.WlX68P5Rif/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => com.engram.viz-server
+	}
+
+	domain = gui/501 [100024]
+	asid = 100024
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 2
+	pid = 70718
+	immediate reason = inefficient
+	forks = 24
+	execs = 2
+	initialized = 1
+	trampolined = 1
+	started suspended = 0
+	proxy started suspended = 0
+	checked allocations = 0 (queried = 1)
+	checked allocations reason = no host
+	checked allocations flags = 0x0
+	last terminating signal = Terminated: 15
+
+	resource coalition = {
+		ID = 1529
+		type = resource
+		state = active
+		active count = 1
+		name = com.engram.viz-server
+	}
+
+	jetsam coalition = {
+		ID = 1530
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.engram.viz-server
+	}
+
+	spawn type = background (5)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+
+	properties = keepalive | runatload | inferred program
+}

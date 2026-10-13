@@ -591,6 +591,11 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/engramd-owner-home-key.sh",
+      "tier": "essential",
+      "note": "engram-alpha#3709: the one derivation of the per-ENGRAM_HOME key shared by setup-surface-daemon-service.sh --owner and hooks/start-engramd-owner.sh. Essential because the essential-tier hook sources it."
+    },
+    {
       "path": "tools/config_schema.py",
       "tier": "convenience"
     },
@@ -1236,6 +1241,11 @@
       "path": "templates/engramd-owner.service.template",
       "tier": "convenience",
       "note": "engram-alpha#3663 (U5, part of #2652): systemd --user unit for the engramd owner, rendered by tools/setup-surface-daemon-service.sh --owner (Linux only; the launchd plist is a later unit)."
+    },
+    {
+      "path": "templates/engramd-owner.plist.template",
+      "tier": "convenience",
+      "note": "engram-alpha#3709: launchd LaunchAgent for the engramd owner, rendered by tools/setup-surface-daemon-service.sh --owner on macOS."
     },
     {
       "path": "templates/engram-viz-user.service.template",

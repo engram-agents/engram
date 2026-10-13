@@ -8,13 +8,23 @@ helpers in _hooklib (`open_regular_text`, `open_regular_text_append`: O_NONBLOCK
 fstat that rejects anything but a regular file). No second opener lives in this file.
 
 Subcommands (the shell switches on what they print; they never raise, and exit 0):
-  live <home>                  -> alive | none | notregular:<kind>
-      `<home>/engramd.pid` names a positive pid that is alive AND whose
-      /proc/<pid>/cmdline contains `engramd_owner` (cmdline unreadable: alive -- never
-      guess dead). A missing / garbage / non-positive / dead / marker-less pidfile is
-      `none`. A pidfile that is not a regular file is `notregular:<kind>` (fifo,
-      directory, socket, device, or symlink-to-<kind>): a planted special file is an
-      abnormal state.
+  live <home>                  -> alive | none | notregular:<kind> | ambiguous:<why>
+      `<home>/engramd.pid` names a positive pid that is alive AND whose argv contains
+      `engramd_owner`, decided by engram_pidfile's STRICT mode
+      (`recorded_live_pid(..., require_marker=True)`, #3709): the marker is required of
+      any live pid whatever its start time, and an unreadable argv counts as alive
+      (never guess dead). Same rule on Linux and macOS: this file reads no /proc.
+      A missing / garbage / non-positive / dead / marker-less pidfile is `none`. A
+      pidfile that is not a regular file is `notregular:<kind>` (fifo, directory, socket,
+      device, or symlink-to-<kind>) -- checked FIRST, before engram_pidfile is touched, so
+      a planted special file can neither block the open nor reach it. If engram_pidfile
+      cannot be imported the answer is `ambiguous:<why>` (never `none`: the shell then
+      launches nothing).
+  launchd_state <label>        -> running | registered:<state>:<last exit or none> | notfound
+                                  | ambiguous:<why>
+      Runs `launchctl print gui/<uid>/<label>` under a Python-side timeout
+      (LAUNCHD_BOUND_SECONDS; stock macOS has no GNU `timeout`) and hands the result to
+      `parse_launchctl_print`. launchctl missing or timing out is ambiguous.
   report <home> <message>      -> one JSON object on stdout
       Appends `[ts] [start-engramd-owner] <message>` (the FULL message) to
       `<home>/engramd-owner.log` when that is a regular file (silently skipped
@@ -32,6 +42,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -45,6 +56,7 @@ from _harness import detect_harness, get_harness_budgets  # noqa: E402
 from _hooklib import emit_context, open_regular_text, open_regular_text_append  # noqa: E402
 
 _MARKER = "engramd_owner"
+LAUNCHD_BOUND_SECONDS = 3.0  # `launchctl print` is killed past this (Linux's systemctl bound is 3 s too)
 _HEAD_CLIP = 600  # chars of message injected; the full message always goes to the log
 
 
@@ -71,36 +83,105 @@ def _non_regular_kind(path: str):
     return f"symlink-to-{kind}" if stat.S_ISLNK(lst.st_mode) else kind
 
 
+def _import_pidfile():
+    """engram_pidfile, from the plugin root (the parent of hooks/ in the flattened bundle,
+    two up from hooks/claude/ in the source tree) when it is there, else wherever the
+    interpreter finds it. Raises ImportError when it cannot be found at all."""
+    for up in (1, 2):
+        cand = _this_dir
+        for _ in range(up):
+            cand = os.path.dirname(cand)
+        if os.path.isfile(os.path.join(cand, "engram_pidfile.py")):
+            if cand not in sys.path:
+                sys.path.insert(0, cand)
+            break
+    import engram_pidfile
+
+    return engram_pidfile
+
+
 def live(home: str) -> str:
     pid_path = os.path.join(home, "engramd.pid")
+    # FIRST, before engram_pidfile is imported or called: a planted FIFO/special file at
+    # engramd.pid must be reported without ever being opened by anything but the
+    # non-blocking helper (engram_pidfile opens it plainly, which would block).
+    kind = _non_regular_kind(pid_path)
+    if kind:
+        return f"notregular:{kind}"
     try:
-        with open_regular_text(pid_path, encoding="utf-8") as f:
-            raw = f.read(64)
-    except (FileNotFoundError, ValueError):  # missing / not UTF-8: garbage, as before
-        return "none"
-    except OSError:
-        kind = _non_regular_kind(pid_path)
-        return f"notregular:{kind}" if kind else "none"  # unreadable regular file: as before, none
-    text = raw.strip()
-    if not text.isascii() or not text.isdigit():
-        return "none"
+        ep = _import_pidfile()
+    except Exception as exc:  # cannot check -> ambiguous, never `none` (a duplicate is worse)
+        return f"ambiguous:engram_pidfile not importable ({type(exc).__name__})"
     try:
-        pid = int(text)
-    except ValueError:
-        return "none"
-    if pid <= 0:  # `kill -0 0` signals the process group and succeeds; not a process
-        return "none"
+        # strict mode: marker required for any live pid, unreadable argv counts as alive
+        pid = ep.recorded_live_pid(pid_path, _MARKER, require_marker=True)
+    except Exception as exc:
+        return f"ambiguous:engram_pidfile failed ({type(exc).__name__})"
+    return "alive" if pid is not None else "none"
+
+
+def parse_launchctl_print(rc: int, stdout: str, stderr: str) -> str:
+    """The verdict for one `launchctl print gui/<uid>/<label>` result.
+
+    running | registered:<state>:<last exit code or none> | notfound | ambiguous:<why>
+
+    Shapes measured on macOS 26.6.2 (tests/fixtures/launchctl_3709/README.md):
+      * unknown label: rc 113, stdout empty, stderr `Bad request.` + `Could not find
+        service "<label>" in domain for user gui: <uid>` -> notfound. BOTH the rc and the
+        text are required: either alone is ambiguous.
+      * known job: rc 0; the job's own state is the ONE-TAB-indented `state =` line.
+        The nested dicts below it carry `state = active` at deeper indent, which is not
+        the job's state, so only that exact indent counts. `last exit code =` is read
+        the same way (a running job has none).
+    Everything else (a different rc, empty output, no top-level state line) is
+    ambiguous: the shell launches nothing."""
+    if rc == 113:
+        if "Could not find service" in (stderr or ""):
+            return "notfound"
+        return "ambiguous:launchctl exited 113 without the not-found text"
+    if rc != 0:
+        return f"ambiguous:launchctl print exited {rc}"
+    if not (stdout or "").strip():
+        return "ambiguous:launchctl print answered with empty output"
+    state = last = None
+    for line in stdout.splitlines():
+        if line.startswith("\tstate = ") and state is None:
+            state = line[len("\tstate = "):].strip()
+        elif line.startswith("\tlast exit code = ") and last is None:
+            last = line[len("\tlast exit code = "):].strip()
+    if not state:
+        return "ambiguous:launchctl print answered with no top-level state line"
+    state = state.replace(":", " ")  # ':' separates the fields of the verdict
+    if state == "running":
+        return "running"
+    last = (last or "none").replace(":", " ")
+    return f"registered:{state}:{last}"
+
+
+def launchd_state(label: str) -> str:
+    argv = ["launchctl", "print", f"gui/{os.getuid()}/{label}"]
     try:
-        os.kill(pid, 0)
-    except (OSError, OverflowError):
-        return "none"
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, errors="replace", start_new_session=True,
+        )
+    except FileNotFoundError:
+        return "ambiguous:launchctl not found on PATH"
+    except OSError as exc:
+        return f"ambiguous:launchctl could not be run ({type(exc).__name__})"
     try:
-        # kernel-provided /proc file, not a path anyone can plant a FIFO at
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            cmdline = f.read()
-    except OSError:
-        return "alive"  # cannot tell reuse from a live owner -- never guess dead
-    return "alive" if _MARKER.encode() in cmdline else "none"
+        out, err = proc.communicate(timeout=LAUNCHD_BOUND_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        try:
+            proc.communicate(timeout=1.0)
+        except Exception:
+            pass
+        return f"ambiguous:launchctl print timed out after {LAUNCHD_BOUND_SECONDS:g}s"
+    return parse_launchctl_print(proc.returncode, out, err)
 
 
 def _clip_middle(text: str, limit: int) -> str:
@@ -153,6 +234,8 @@ def main(argv: list) -> int:
         cmd = argv[1]
         if cmd == "live" and len(argv) == 3:
             print(live(argv[2]))
+        elif cmd == "launchd_state" and len(argv) == 3:
+            print(launchd_state(argv[2]))
         elif cmd == "report" and len(argv) == 4:
             report(argv[2], argv[3])
         elif cmd == "launch" and len(argv) == 5:

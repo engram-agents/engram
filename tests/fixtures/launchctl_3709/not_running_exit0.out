@@ -1,0 +1,84 @@
+gui/501/com.engram.aleph-wake = {
+	active count = 0
+	path = /Users/PLACEHOLDER_USER/Library/LaunchAgents/com.engram.aleph-wake.plist
+	type = LaunchAgent
+	state = not running
+
+	program = /Users/PLACEHOLDER_USER/.engram/autostart/aleph/aleph-wake-launch.sh
+	arguments = {
+		/Users/PLACEHOLDER_USER/.engram/autostart/aleph/aleph-wake-launch.sh
+	}
+
+	stdout path = /Users/PLACEHOLDER_USER/.engram/logs/aleph-wake-launchd.log
+	stderr path = /Users/PLACEHOLDER_USER/.engram/logs/aleph-wake-launchd.log
+	inherited environment = {
+		DEVELOPER_DIR => /Library/Developer/CommandLineTools
+		SSH_AUTH_SOCK => /var/run/com.apple.launchd.WlX68P5Rif/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => com.engram.aleph-wake
+	}
+
+	domain = gui/501 [100024]
+	asid = 100024
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 11
+	last exit code = 0
+
+	event triggers = {
+		com.engram.aleph-wake.268435489 => {
+			keepalive = 0
+			service = com.engram.aleph-wake
+			stream = com.apple.launchd.calendarinterval
+			monitor = com.apple.UserEventAgent-Aqua
+			descriptor = {
+				"Minute" => 30
+				"Hour" => 8
+			}
+		}
+	}
+
+	event channels = {
+		"com.apple.launchd.calendarinterval" = {
+			port = 0xdcf13
+			active = 0
+			managed = 1
+			reset = 0
+			hide = 0
+			watching = 1
+		}
+	}
+
+	resource coalition = {
+		ID = 127773
+		type = resource
+		state = active
+		active count = 1
+		name = com.engram.aleph-wake
+	}
+
+	jetsam coalition = {
+		ID = 127774
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.engram.aleph-wake
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+
+	properties = inferred program
+}

@@ -47,6 +47,7 @@ HOOKS_JSON = SRC / "hooks" / "hooks.json"
 TEMPLATES = SRC / "templates"
 OWNER_TEMPLATE = TEMPLATES / "engramd-owner.service.template"
 FLAGS_PY = SRC / "engramd_owner_flags.py"
+HOME_KEY_HELPER = SRC / "tools" / "engramd-owner-home-key.sh"  # #3709
 U4D_HOOK_DIR = SRC / "hooks" / "claude"
 TIERS = REPO / "src" / "build" / "packaging" / "tiers.json"
 
@@ -126,6 +127,8 @@ class Sandbox:
                     self.plugin / "hooks" / "claude" / "engram-surface-daemon.py")
         self.installer = self.plugin / "tools" / "setup-surface-daemon-service.sh"
         shutil.copy(INSTALLER, self.installer)
+        # #3709: the installer sources the shared home-key helper from its own tools/ directory.
+        shutil.copy(HOME_KEY_HELPER, self.plugin / "tools" / HOME_KEY_HELPER.name)
         _stub(self.stubs, "uname", f'#!/usr/bin/env bash\necho "{os_name}"\n')
         self.syslog = tmp / "systemctl.log"
         self.launchlog = tmp / "launchctl.log"
@@ -359,19 +362,6 @@ def test_owner_mode_refuses_an_ephemeral_owner_script_path(sb):
 
 # ---- C7: Darwin ----------------------------------------------------------------
 
-def test_c7_darwin_owner_mode_writes_nothing_and_calls_nothing(tmp_path):
-    sb = Sandbox(tmp_path, os_name="Darwin")
-    r = sb.run("--owner", engram_home=str(tmp_path / "seat-a"))
-    assert r.returncode != 0, (r.stdout, r.stderr)
-    assert "macOS" in (r.stdout + r.stderr)
-    assert "#3709" in (r.stdout + r.stderr)
-    assert "#3194" not in (r.stdout + r.stderr) and "permission layer" not in (r.stdout + r.stderr)
-    assert not (sb.home / "Library").exists(), "a LaunchAgents plist (or its dir) was written"
-    assert not sb.unit_dir.exists() or list(sb.unit_dir.iterdir()) == []
-    assert not sb.launchlog.exists(), sb.launchlog.read_text() if sb.launchlog.exists() else ""
-    assert sb.systemctl_calls() == []
-
-
 # ---- C8: default mode unchanged -------------------------------------------------
 
 def test_c8_default_mode_renders_the_same_surface_daemon_unit(sb):
@@ -484,7 +474,20 @@ class Seat:
         elif engramd is not None:
             p.write_text(json.dumps({"engramd": engramd}))
 
+    def _ship_3709_files(self):
+        """#3709: the hook sources the shared home-key helper from <plugin root>/tools/ and its `live`
+        verb imports engram_pidfile from the plugin root.  A subclass that lays out tools/ itself
+        (the #3709 DSeat, whose with_pidfile decides whether engram_pidfile exists) is left alone."""
+        tools = self.plugin / "tools"
+        if tools.exists():
+            return
+        tools.mkdir()
+        shutil.copy(HOME_KEY_HELPER, tools / HOME_KEY_HELPER.name)
+        shutil.copy(SRC / "engram_pidfile.py", self.plugin / "engram_pidfile.py")
+        shutil.copy(SRC / "engram_regular_io.py", self.plugin / "engram_regular_io.py")  # engram_pidfile imports it (#3772)
+
     def run(self, extra_env: dict | None = None, script: Path | None = None, keep_plugin_root: bool = False):
+        self._ship_3709_files()
         env = {"HOME": str(self.home), "ENGRAM_HOME": str(self.eh),
                "PATH": f"{self.stubs}:{self.tools}", "TMPDIR": str(self.tmp)}
         if keep_plugin_root:
@@ -498,6 +501,7 @@ class Seat:
         killed (it is our own process group) and reported as a failure, never left hanging the suite."""
         import signal
         import time
+        self._ship_3709_files()
         env = {"HOME": str(self.home), "ENGRAM_HOME": str(self.eh),
                "PATH": f"{self.stubs}:{self.tools}", "TMPDIR": str(self.tmp)}
         env.update(extra_env or {})
@@ -739,19 +743,6 @@ def test_helper_failure_is_ambiguous_launch_nothing_say_so(seat):
     assert r.returncode == 0 and seat.launched() == []
     lines = context_lines(r)
     assert len(lines) == 1 and "flag" in lines[0].lower(), r.stdout
-
-
-def test_darwin_with_a_flag_on_says_one_line_and_launches_nothing(tmp_path):
-    seat = Seat(tmp_path, os_name="Darwin")
-    seat.config(FLAG_ON)
-    seat.systemctl("nobus")
-    r = seat.run()
-    assert r.returncode == 0 and seat.launched() == []
-    lines = context_lines(r)
-    assert len(lines) == 1 and "macOS" in lines[0]
-    assert "#3709" in lines[0]
-    assert "#3194" not in lines[0] and "permission layer" not in lines[0]
-    assert not seat.syslog.exists()
 
 
 def test_other_non_linux_os_with_a_flag_on_names_that_os_not_macos(tmp_path):

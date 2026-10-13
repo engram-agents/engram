@@ -1755,20 +1755,11 @@ class EngramdOwner:
         (_handle_signal) just calls .stop(), the same method tests call
         directly.
         """
-        self._check_platform_support()
-
-        # #3696: an over-long socket path is refused by name BEFORE the first
-        # filesystem mutation (engram_home.mkdir below), so a refusal leaves
-        # nothing behind. Byte length, shared reason text with the client;
-        # the limit is per-platform (Darwin's 103 since #3666).
-        too_long = ec.socket_path_too_long_reason(self.socket_path)
-        if too_long is not None:
-            raise OwnerSocketPathTooLong(too_long)
-
-        # #3666 (Darwin only, no-op elsewhere): pure -- no filesystem access --
-        # and so also before the first read under engram_home
-        # (_read_install_tier below) and the first mutation (mkdir).
-        self._check_darwin_home_not_tcc_protected()
+        # The refusals that precede any filesystem mutation (platform support,
+        # socket-path length, Darwin TCC home, a non-regular pidfile), in one
+        # place so `--preflight` runs exactly these and cannot drift from them
+        # (#3709).
+        self.check_start_refusals()
 
         # #3349: refuse on a Python without sqlite3 setlimit (< 3.11)
         # before ANY file, connection, socket or thread exists.
@@ -1783,22 +1774,6 @@ class EngramdOwner:
         )
 
         self.engram_home.mkdir(parents=True, exist_ok=True)
-
-        # #3768: refuse by name when the pidfile path is already not a regular
-        # file, BEFORE anything is bound or opened (and before the stale-socket
-        # check below, which can read the pidfile). lstat does not follow, so a
-        # symlink counts. A missing path is the normal fresh start; any other
-        # lstat error surfaces as it always did.
-        try:
-            pid_stat = os.lstat(self.pid_path)
-        except FileNotFoundError:
-            pass
-        else:
-            # A hard-linked regular file is refused too: writing it would
-            # rewrite another name's content.
-            if not stat.S_ISREG(pid_stat.st_mode) or pid_stat.st_nlink > 1:
-                raise OwnerPidfileNotRegular(
-                    self._pidfile_refusal_text(pid_stat.st_mode, pid_stat.st_nlink))
 
         # `run/` (the socket's parent) MUST be hardened -- and, load-
         # bearing, its own symlink/ownership refusal checked -- BEFORE
@@ -1983,6 +1958,50 @@ class EngramdOwner:
         finally:
             if schema_conn is not None and (not dynamic or not loaded):
                 schema_conn.close()
+
+    def check_start_refusals(self) -> None:
+        """The refusals `start()` makes before it reads or creates anything,
+        in `start()`'s order; raises the same exceptions `start()` raises.
+        Pure: no mutation, and the only filesystem access is the one `lstat`
+        of the pidfile in check 4 (each check below is documented pure).
+        `main()`'s `--preflight` calls exactly this, so the
+        installer's up-front check (#3709) is the owner's own logic and a
+        refusal that would respawn under a supervisor is caught before
+        anything is registered.
+
+        1. `_check_platform_support()`.
+        2. #3696: an over-long socket path is refused by name BEFORE the first
+           filesystem mutation, so a refusal leaves nothing behind. Byte
+           length, shared reason text with the client; the limit is
+           per-platform (Darwin's 103 since #3666).
+        3. #3666 (Darwin only, no-op elsewhere): pure -- no filesystem access --
+           and so also before the first read under engram_home and the first
+           mutation (mkdir).
+        4. #3768: the pidfile path, when it exists, must be a regular file with
+           one link: a FIFO, symlink, directory or multiply-hard-linked file is
+           refused by name (`OwnerPidfileNotRegular`, exit 4 from `main()`)
+           before anything is bound. Here, and not only in `start()`, because
+           launchd has no per-exit-code retry exclusion: the installer's
+           `--preflight` must refuse what would otherwise respawn every
+           throttle interval forever (#3709). One `lstat`, which does not
+           follow, so a symlink counts; a missing path (or home) is the normal
+           fresh start and passes, which is what makes this safe before mkdir.
+           The race between this check and the write is closed in
+           `_write_pidfile`, which keeps its own checks."""
+        self._check_platform_support()
+        too_long = ec.socket_path_too_long_reason(self.socket_path)
+        if too_long is not None:
+            raise OwnerSocketPathTooLong(too_long)
+        self._check_darwin_home_not_tcc_protected()
+        try:
+            pid_stat = os.lstat(self.pid_path)
+        except FileNotFoundError:
+            return
+        # A hard-linked regular file is refused too: writing it would rewrite
+        # another name's content.
+        if not stat.S_ISREG(pid_stat.st_mode) or pid_stat.st_nlink > 1:
+            raise OwnerPidfileNotRegular(
+                self._pidfile_refusal_text(pid_stat.st_mode, pid_stat.st_nlink))
 
     def _check_platform_support(self) -> None:
         """Refuse to start rather than silently degrade the permission
@@ -3637,8 +3656,21 @@ class EngramdOwner:
 # ---------------------------------------------------------------------------
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
     owner = EngramdOwner()
+    if "--preflight" in args:
+        # #3709: run only the refusals start() makes before it touches anything
+        # (ENGRAM_HOME from the environment). Mutates nothing; silent exit 0
+        # when start() would get past them, else the owner's own reason on
+        # stderr and exit 1 (the same code main() gives every refusal).
+        try:
+            owner.check_start_refusals()
+        except (OwnerSocketPathTooLong, OwnerHomeTccProtected, OwnerPermissionUnsupported,
+                OwnerPidfileNotRegular) as exc:
+            print(f"[engramd] {exc}", file=sys.stderr)
+            return 1
+        return 0
     try:
         owner.start(install_signal_handlers=True)
     except OwnerAlreadyRunning as exc:

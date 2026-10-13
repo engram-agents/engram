@@ -1,0 +1,1201 @@
+"""#3709 part 2: the macOS (launchd) launcher for the engramd owner.  RED CELLS -- written before
+the implementation.  Contract: the #3709 spec + the design-seat ruling (Q1-Q7).
+
+Cell groups
+  K1  one home key, three consumers (the installer, the SessionStart hook, the plist label)
+  K2  the rendered plist, its XML refusals, and the two launchctl calls
+  K4  the Darwin fallback, four outcomes, against fake launchctl built from REAL captures
+  K5  liveness on engram_pidfile's named strict mode, both platforms
+  K6  the owner's `--preflight`, and `--owner` on Darwin refusing before it writes anything
+  K7  the #3519 guards (fake launchctl first on PATH, temp HOME, ephemeral-path refusal)
+  R1  one real-launchd cell (Darwin only), which also covers K3 (restart semantics)
+
+#3519: every cell except R1 puts its OWN recording fake `launchctl` first on a hermetic PATH and
+runs with HOME in a tmp dir.  No cell registers a `com.engram.engramd-owner.*` label with a real
+launchctl; an autouse guard (below) diffs the real registrations around every cell to prove it.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import importlib.util
+import os
+import plistlib
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import uuid
+from pathlib import Path
+
+import pytest
+
+# Reuse the #3663 harness by import (tests/ is on sys.path; the module imports cleanly).
+from test_owner_launcher_3663 import (  # noqa: E402
+    FLAG_ON,
+    HOOK,
+    HOOK_IO,
+    INSTALLER,
+    REPO,
+    SRC,
+    TEMPLATES,
+    Sandbox,
+    Seat,
+    _expected_id,
+    _physical,
+    _stub,
+    context_lines,
+)
+
+import engram_pidfile as ep  # noqa: E402  (conftest puts src/engram on sys.path)
+
+# ===========================================================================
+# NAMES THE IMPLEMENTATION MUST PROVIDE (every invented name is in this block)
+# ===========================================================================
+# Shared home-key helper (K1).  Bash 3.2 compatible.  Run as `bash <helper> <home>` it prints the
+# 8-hex key for <home> (tilde expanded, physical via `cd && pwd -P`, trailing slashes stripped,
+# sha256, first 8 hex) and exits 0; SOURCED, it defines the shell function HOME_KEY_FUNC with the
+# same behaviour.  It lives in tools/ next to setup-surface-daemon-service.sh, and the hook finds
+# it at <plugin root>/tools/.
+HOME_KEY_HELPER = SRC / "tools" / "engramd-owner-home-key.sh"
+HOME_KEY_FUNC = "engramd_owner_home_key"
+# The plist template (K2).  Placeholders the installer substitutes (R1 renders the same four).
+PLIST_TEMPLATE = TEMPLATES / "engramd-owner.plist.template"
+PLIST_PLACEHOLDERS = ("{{PYTHON}}", "{{ENGRAM_OWNER_PY}}", "{{ENGRAM_HOME}}", "{{LABEL}}")
+LABEL_PREFIX = "com.engram.engramd-owner."  # label = LABEL_PREFIX + <8-hex home key>
+# Hook I/O helper (_engramd_owner_hook_io.py): the new verb and the parser function it uses.
+#   launchd_state <label>  -> one line: running | registered:<state>:<last exit or none> | notfound
+#                             | ambiguous:<why>
+#   parse_launchctl_print(rc: int, stdout: str, stderr: str) -> str   (the same verdict strings)
+LAUNCHD_VERB = "launchd_state"
+LAUNCHD_PARSE_FUNC = "parse_launchctl_print"
+LAUNCHD_BOUND_SECONDS = 3.0  # the Python-side timeout on `launchctl print` (Linux uses 3 s)
+LAUNCHD_SLACK_SECONDS = 6.0  # generous slack on top of the bound for process start-up etc.
+# `live` verb: ambiguous verdict when engram_pidfile cannot be imported.
+LIVE_AMBIGUOUS_PREFIX = "ambiguous"
+# engram_pidfile named strict mode: marker required for ANY live pid, whatever its start time.
+STRICT_KW = "require_marker"
+# Owner preflight entry point: `python engramd_owner.py --preflight` (ENGRAM_HOME from env).
+PREFLIGHT_FLAG = "--preflight"
+# ===========================================================================
+
+OWNER_PY = SRC / "engramd_owner.py"
+PIDFILE_PY = SRC / "engram_pidfile.py"
+FIXTURES = REPO / "tests" / "fixtures" / "launchctl_3709"
+UID = os.getuid()
+OWNER_RUN_TIMEOUT = 8.0  # a preflight must exit by itself; an owner that is SERVING never does
+IS_DARWIN = sys.platform == "darwin"
+
+
+# ---------------------------------------------------------------------------
+# #3519 guard: nothing here may register a production-shaped owner label with a real launchctl
+# ---------------------------------------------------------------------------
+
+def _real_owner_labels() -> set:
+    if not IS_DARWIN:
+        return set()
+    # `list` is read-only (the conftest shim passes it through); absolute path so the shim is moot.
+    r = subprocess.run(["/bin/launchctl", "list"], capture_output=True, text=True, timeout=20)
+    return {ln.split()[-1] for ln in r.stdout.splitlines()
+            if ln.split() and ln.split()[-1].startswith(LABEL_PREFIX)}
+
+
+@pytest.fixture(autouse=True)
+def _no_real_owner_registration_leaks():
+    before = _real_owner_labels()
+    yield
+    leaked = _real_owner_labels() - before
+    assert not leaked, f"a cell registered production-shaped owner label(s) with REAL launchd: {sorted(leaked)}"
+
+
+# ---------------------------------------------------------------------------
+# Harness extensions (copies of nothing: subclasses of the #3663 Sandbox / Seat)
+# ---------------------------------------------------------------------------
+
+def label_for(home: Path) -> str:
+    return LABEL_PREFIX + _expected_id(_physical(home))
+
+
+class DSandbox(Sandbox):
+    """#3663 Sandbox + the shared helper copied next to the installer + a pinned venv python.
+    `real_owner=True` swaps the stub owner for a symlink to the REAL owner (K6 preflight)."""
+
+    def __init__(self, tmp: Path, os_name: str = "Darwin", real_owner: bool = False):
+        tmp.mkdir(parents=True, exist_ok=True)
+        super().__init__(tmp, os_name=os_name)
+        if HOME_KEY_HELPER.exists():
+            shutil.copy(HOME_KEY_HELPER, self.plugin / "tools" / HOME_KEY_HELPER.name)
+        venv_bin = self.home / ".engram" / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        self.python = _stub(venv_bin, "python3", f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        if real_owner:
+            (self.plugin / "engramd_owner.py").unlink()
+            (self.plugin / "engramd_owner.py").symlink_to(OWNER_PY)
+
+    @property
+    def agents_dir(self) -> Path:
+        return self.home / "Library" / "LaunchAgents"
+
+    def launchctl_calls(self) -> list:
+        if not self.launchlog.exists():
+            return []
+        return [ln.split() for ln in self.launchlog.read_text().splitlines() if ln.strip()]
+
+    def assert_nothing_written(self, *engram_homes: Path):
+        assert not (self.home / "Library").exists(), "a LaunchAgents dir/plist was created"
+        assert not self.launchlog.exists(), f"launchctl was called: {self.launchlog.read_text()}"
+        for h in engram_homes:
+            assert not h.exists(), f"the home dir was created: {h}"
+
+
+class DSeat(Seat):
+    """#3663 Seat + the helper under <plugin>/tools/ + engram_pidfile at the plugin root + a fake
+    `launchctl` driven by a mode file, whose canned outputs are the REAL captures in FIXTURES."""
+
+    def __init__(self, tmp: Path, os_name: str = "Darwin", with_pidfile: bool = True):
+        tmp.mkdir(parents=True, exist_ok=True)
+        super().__init__(tmp, os_name=os_name)
+        for t in ("shasum", "sha256sum", "id", "head", "tr", "cat"):  # hermetic PATH, Mac and Linux
+            found = shutil.which(t)
+            if found and not (self.tools / t).exists():
+                (self.tools / t).symlink_to(found)
+        (self.plugin / "tools").mkdir()
+        if HOME_KEY_HELPER.exists():
+            shutil.copy(HOME_KEY_HELPER, self.plugin / "tools" / HOME_KEY_HELPER.name)
+        if with_pidfile:
+            shutil.copy(PIDFILE_PY, self.plugin / "engram_pidfile.py")
+            # engram_pidfile imports engram_regular_io since #3772 (dev), so a plugin root that
+            # ships one ships the other
+            shutil.copy(SRC / "engram_regular_io.py", self.plugin / "engram_regular_io.py")
+        self.lmode = tmp / "launchctl.mode"
+        self.llog = tmp / "launchctl.log"
+        self.derived = tmp / "derived"
+        self.derived.mkdir()
+        # Derived (not hand-typed) variants of the real captures:
+        running = (FIXTURES / "running.out").read_text()
+        kept = [ln for ln in running.splitlines(keepends=True) if not ln.startswith("\tstate = ")]
+        assert len(kept) == len(running.splitlines(keepends=True)) - 1, "fixture has no one top-level state line"
+        assert any(ln.startswith("\t\tstate = ") for ln in kept), "fixture lost its nested state lines"
+        (self.derived / "nostate.out").write_text("".join(kept))
+        nr = (FIXTURES / "not_running_exit0.out").read_text()
+        nolast = [ln for ln in nr.splitlines(keepends=True) if not ln.startswith("\tlast exit code = ")]
+        assert len(nolast) == len(nr.splitlines(keepends=True)) - 1
+        (self.derived / "not_running_nolast.out").write_text("".join(nolast))
+        nf = (FIXTURES / "notfound.err").read_text()
+        (self.derived / "badrequest_only.err").write_text(nf.splitlines()[0] + "\n")
+
+    def set_os(self, name: str):
+        _stub(self.stubs, "uname", f'#!/usr/bin/env bash\necho "{name}"\n')
+
+    def launchctl(self, mode: str):
+        self.lmode.write_text(mode)
+        F, D = FIXTURES, self.derived
+        _stub(self.stubs, "launchctl", textwrap.dedent(f"""\
+            #!/usr/bin/env bash
+            echo "$*" >> "{self.llog}"
+            case "$(cat "{self.lmode}")" in
+              running) cat "{F}/running.out";;
+              not_running) cat "{F}/not_running_exit0.out";;
+              not_running_nolast) cat "{D}/not_running_nolast.out";;
+              spawn_scheduled) cat "{F}/spawn_scheduled_exit1.out";;
+              notfound) cat "{F}/notfound.err" >&2; exit "$(tr -d '[:space:]' < "{F}/notfound.rc")";;
+              timeout) exec sleep 30;;
+              empty) exit 0;;
+              nostate) cat "{D}/nostate.out";;
+              rc113_notext) cat "{D}/badrequest_only.err" >&2; exit "$(tr -d '[:space:]' < "{F}/notfound.rc")";;
+              other_rc) cat "{F}/notfound.err" >&2; exit 2;;
+              *) exit 99;;
+            esac
+            """))
+
+    def launchctl_log(self) -> list:
+        return self.llog.read_text().splitlines() if self.llog.exists() else []
+
+    def label(self) -> str:
+        return label_for(self.eh)
+
+    def expected_print(self) -> str:
+        return f"print gui/{UID}/{self.label()}"
+
+    def io(self, *args, timeout: float = 15.0) -> str:
+        """Run the hook I/O helper directly (as the hook would) and return its stripped stdout."""
+        env = {"HOME": str(self.home), "PATH": f"{self.stubs}:{self.tools}", "TMPDIR": str(self.tmp)}
+        io_py = self.plugin / "hooks" / "_engramd_owner_hook_io.py"
+        try:
+            r = subprocess.run([sys.executable, str(io_py), *map(str, args)], capture_output=True, text=True,
+                               env=env, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"hook I/O helper {args} did not return within {timeout}s (blocked)")
+        return r.stdout.strip()
+
+
+@pytest.fixture
+def dseat(tmp_path):
+    return DSeat(tmp_path / "seat")
+
+
+@pytest.fixture
+def short_base():
+    """A SHORT physical base dir (AF_UNIX socket paths must fit): pytest's tmp_path is ~100 chars
+    on macOS and would sit on the 103-byte Darwin limit by itself."""
+    base = Path(os.path.realpath(tempfile.mkdtemp(prefix="k", dir="/tmp")))
+    try:
+        yield base
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def _plist_of(path: Path) -> dict:
+    return plistlib.loads(path.read_bytes())
+
+
+def _helper_key(arg: str, home: Path, bash: str = "bash") -> str:
+    assert HOME_KEY_HELPER.exists(), f"missing (not implemented yet): {HOME_KEY_HELPER.relative_to(REPO)}"
+    r = subprocess.run([bash, str(HOME_KEY_HELPER), arg], capture_output=True, text=True,
+                       env={"HOME": str(home), "PATH": os.environ["PATH"]})
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    return r.stdout.strip()
+
+
+# ===========================================================================
+# K1 -- one home key, three consumers (Q1)
+# ===========================================================================
+
+def test_k1_helper_gives_sha256_of_the_physical_home_for_every_spelling(tmp_path):
+    real = tmp_path / "real-seat"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    home = tmp_path / "h"
+    (home / "sub").mkdir(parents=True)
+    expected = _expected_id(_physical(real))
+    for spelling in (str(real), str(real) + "/", str(real) + "//", str(link), str(link) + "/"):
+        assert _helper_key(spelling, home) == expected, spelling
+    assert _helper_key("~/sub", home) == _expected_id(_physical(home / "sub"))
+
+
+def test_k1_helper_is_sourceable_and_defines_the_function(tmp_path):
+    assert HOME_KEY_HELPER.exists(), f"missing (not implemented yet): {HOME_KEY_HELPER.relative_to(REPO)}"
+    real = tmp_path / "real-seat"
+    real.mkdir()
+    r = subprocess.run(["bash", "-c", f'source "$1" && {HOME_KEY_FUNC} "$2"', "_", str(HOME_KEY_HELPER), str(real)],
+                       capture_output=True, text=True, env={"HOME": str(tmp_path), "PATH": os.environ["PATH"]})
+    assert r.returncode == 0 and r.stdout.strip() == _expected_id(_physical(real)), (r.returncode, r.stdout, r.stderr)
+
+
+@pytest.mark.skipif(not (IS_DARWIN and os.access("/bin/bash", os.X_OK)),
+                    reason="the stock bash 3.2 is a macOS thing; elsewhere /bin/bash is already modern")
+def test_k1_helper_runs_under_the_stock_bash_3_2(tmp_path):
+    real = tmp_path / "real-seat"
+    real.mkdir()
+    assert _helper_key(str(real), tmp_path, bash="/bin/bash") == _expected_id(_physical(real))
+
+
+def _code_lines(path: Path) -> str:
+    return "\n".join(ln for ln in path.read_text().splitlines() if not ln.lstrip().startswith("#"))
+
+
+@pytest.mark.parametrize("script", [INSTALLER, HOOK], ids=lambda p: p.name)
+def test_k1_neither_consumer_computes_sha256_itself(script):
+    code = _code_lines(script)
+    assert "sha256sum" not in code and "shasum" not in code, \
+        f"{script.name} still hashes ENGRAM_HOME by hand (comment lines excluded)"
+
+
+def test_k1_all_consumers_agree_for_a_home_with_a_symlink_in_it(tmp_path):
+    """Linux unit name, Darwin plist label + filename, the label the hook asks launchctl about, and
+    the unit the hook asks systemctl about are all sha256(physical)[:8] -- for one symlinked home."""
+    seat = DSeat(tmp_path / "hk")
+    link = tmp_path / "link"
+    link.symlink_to(seat.eh)  # macOS /var -> /private/var is the live case of this shape
+    key = _expected_id(_physical(seat.eh))
+    spelled = str(link) + "/"
+
+    unit = DSandbox(tmp_path / "lin", os_name="Linux").install_owner(spelled)
+    assert unit.name == f"engramd-owner-{key}.service"
+
+    dar = DSandbox(tmp_path / "dar", os_name="Darwin")
+    r = dar.run("--owner", engram_home=spelled)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    plist = dar.agents_dir / f"{LABEL_PREFIX}{key}.plist"
+    assert plist.exists(), sorted(p.name for p in dar.agents_dir.glob("*")) if dar.agents_dir.exists() else "no dir"
+    assert _plist_of(plist)["Label"] == f"{LABEL_PREFIX}{key}"
+
+    seat.config(FLAG_ON)
+    seat.set_os("Darwin")
+    seat.launchctl("notfound")
+    seat.run({"ENGRAM_HOME": str(link)})
+    assert seat.launchctl_log() and seat.launchctl_log()[0] == f"print gui/{UID}/{LABEL_PREFIX}{key}", \
+        seat.launchctl_log()
+
+    seat.set_os("Linux")
+    seat.systemctl("notfound")
+    seat.run({"ENGRAM_HOME": str(link)})
+    assert f"engramd-owner-{key}.service" in seat.syslog.read_text()
+
+
+def test_k1_tilde_spelling_gives_the_same_label_and_filename(tmp_path):
+    dar = DSandbox(tmp_path / "dar", os_name="Darwin")
+    r = dar.run("--owner", engram_home="~/.engram")
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    key = _expected_id(_physical(dar.home / ".engram"))
+    assert (dar.agents_dir / f"{LABEL_PREFIX}{key}.plist").exists()
+
+
+# ===========================================================================
+# K2 -- the plist (Q2), its XML refusals, the two launchctl calls
+# ===========================================================================
+
+def _install(tmp_path):
+    """Run `--owner` on a faked Darwin and return (sandbox, home, plist path, parsed plist).  A
+    plain function (not a fixture) so a missing feature is a FAILED cell, not a setup ERROR."""
+    sb = DSandbox(tmp_path / "i", os_name="Darwin")
+    home = sb.tmp / "seat-a"
+    r = sb.run("--owner", engram_home=str(home))
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    plist = sb.agents_dir / f"{label_for(home)}.plist"
+    assert plist.exists(), "no plist at $HOME/Library/LaunchAgents/<label>.plist"
+    return sb, home, plist, _plist_of(plist)
+
+
+def test_k2_plist_label_and_program_arguments(tmp_path):
+    installed = _install(tmp_path)
+    sb, home, _p, d = installed
+    assert d["Label"] == label_for(home)
+    py, owner = d["ProgramArguments"]
+    assert py == str(sb.python)
+    assert owner == _physical(sb.plugin) + "/engramd_owner.py" and "engramd_owner" in owner
+
+
+def test_k2_plist_environment_and_logs(tmp_path):
+    installed = _install(tmp_path)
+    _sb, home, _p, d = installed
+    assert d["EnvironmentVariables"]["ENGRAM_HOME"] == _physical(home)
+    log = f"{_physical(home)}/engramd-owner.log"
+    assert d["StandardOutPath"] == log and d["StandardErrorPath"] == log
+
+
+def test_k2_plist_restart_policy_is_the_ruled_one(tmp_path):
+    installed = _install(tmp_path)
+    _sb, _h, _p, d = installed
+    assert d["RunAtLoad"] is True
+    assert d["KeepAlive"] == {"SuccessfulExit": False}, d.get("KeepAlive")
+    assert d["ThrottleInterval"] == 60 and isinstance(d["ThrottleInterval"], int)
+
+
+def test_k2_rendered_plist_has_no_unsubstituted_placeholder(tmp_path):
+    installed = _install(tmp_path)
+    _sb, _h, plist, _d = installed
+    assert "{{" not in plist.read_text() and "}}" not in plist.read_text()
+
+
+@pytest.mark.skipif(shutil.which("plutil") is None, reason="plutil only exists on macOS")
+def test_k2_rendered_plist_passes_plutil_lint(tmp_path):
+    installed = _install(tmp_path)
+    _sb, _h, plist, _d = installed
+    r = subprocess.run(["plutil", "-lint", str(plist)], capture_output=True, text=True)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+
+
+def test_k2_install_makes_exactly_bootout_then_bootstrap(tmp_path):
+    installed = _install(tmp_path)
+    sb, home, plist, _d = installed
+    assert sb.launchctl_calls() == [
+        ["bootout", f"gui/{UID}/{label_for(home)}"],
+        ["bootstrap", f"gui/{UID}", str(plist)],
+    ], sb.launchctl_calls()
+
+
+@pytest.mark.parametrize("char", ["<", ">"])
+def test_k2_xml_metacharacter_in_the_home_is_refused_before_anything_is_written(tmp_path, char):
+    sb = DSandbox(tmp_path / "i", os_name="Darwin")
+    home = sb.tmp / f"se{char}at"
+    r = sb.run("--owner", engram_home=str(home))
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    assert "unsupported in --owner mode" in r.stderr, r.stderr
+    sb.assert_nothing_written(home)
+
+
+def test_k2_control_existing_refusals_stay_on_darwin(tmp_path):
+    sb = DSandbox(tmp_path / "i", os_name="Darwin")
+    home = sb.tmp / "se at"
+    r = sb.run("--owner", engram_home=str(home))
+    assert r.returncode == 2 and "unsupported in --owner mode" in r.stderr, (r.returncode, r.stderr)
+    sb.assert_nothing_written(home)
+
+
+# ===========================================================================
+# K4 -- the Darwin fallback, four outcomes (Q3), fake launchctl from REAL captures
+# ===========================================================================
+
+def _darwin_hook(seat: DSeat, mode: str | None):
+    seat.config(FLAG_ON)
+    if mode is not None:
+        seat.launchctl(mode)
+    return seat.run_timed(limit=LAUNCHD_BOUND_SECONDS + LAUNCHD_SLACK_SECONDS + 10)
+
+
+def _lines_of(got, seat: DSeat) -> list:
+    """The hook's additionalContext lines, with the seat's tmp path masked: the path carries the
+    TEST NAME (e.g. `..._ambiguous_...`) and must never satisfy a keyword assertion by accident."""
+    rc, out, _err, _t = got
+
+    class R:
+        stdout = out
+    masked = []
+    for ln in context_lines(R):
+        for p in sorted({str(seat.tmp), _physical(seat.tmp)}, key=len, reverse=True):
+            ln = ln.replace(p, "<TMP>")
+        masked.append(ln)
+    return masked
+
+
+def test_k4_running_launches_nothing_and_says_nothing(dseat):
+    got = _darwin_hook(dseat, "running")
+    assert got[0] == 0 and got[1].strip() == "", got
+    assert dseat.launched() == []
+    assert dseat.launchctl_log() == [dseat.expected_print()], "asked launchctl about the wrong label"
+
+
+@pytest.mark.parametrize("mode,state,last", [("not_running", "not running", "0"),
+                                             ("spawn_scheduled", "spawn scheduled", "1")])
+def test_k4_registered_launches_nothing_and_names_state_and_last_exit(dseat, mode, state, last):
+    got = _darwin_hook(dseat, mode)
+    lines = _lines_of(got, dseat)
+    assert got[0] == 0 and dseat.launched() == []
+    assert len(lines) == 1, got[1]
+    assert f"registered but {state}" in lines[0], lines[0]
+    assert f"last exit {last}" in lines[0], lines[0]
+    assert "leaving it to launchd" in lines[0], lines[0]
+    assert "UNSUPERVISED" not in got[1]
+    assert dseat.launchctl_log() == [dseat.expected_print()]
+
+
+def test_k4_notfound_launches_unsupervised_with_the_one_line(dseat):
+    got = _darwin_hook(dseat, "notfound")
+    lines = _lines_of(got, dseat)
+    assert got[0] == 0
+    assert len(dseat.launched()) == 1, "service-not-found must fall back to the unsupervised launch"
+    assert len(lines) == 1 and "UNSUPERVISED" in lines[0], got[1]
+    assert dseat.launchctl_log() == [dseat.expected_print()]
+
+
+@pytest.mark.parametrize("mode", ["empty", "nostate", "rc113_notext", "other_rc"])
+def test_k4_ambiguous_answer_launches_nothing_and_says_so(dseat, mode):
+    got = _darwin_hook(dseat, mode)
+    lines = _lines_of(got, dseat)
+    assert got[0] == 0 and dseat.launched() == [], (mode, got)
+    assert len(lines) == 1 and "ambiguous" in lines[0], (mode, got[1])
+    assert "UNSUPERVISED" not in got[1]
+    assert dseat.launchctl_log() == [dseat.expected_print()]
+
+
+def test_k4_timeout_launches_nothing_and_returns_within_the_bound(dseat):
+    dseat.config(FLAG_ON)
+    dseat.launchctl("timeout")  # the fake `exec sleep 30`s, far past the bound
+    got = dseat.run_timed(limit=LAUNCHD_BOUND_SECONDS + LAUNCHD_SLACK_SECONDS)  # pytest.fail if it blocks
+    lines = _lines_of(got, dseat)
+    assert got[3] < LAUNCHD_BOUND_SECONDS + LAUNCHD_SLACK_SECONDS
+    assert dseat.launched() == []
+    assert len(lines) == 1 and "ambiguous" in lines[0], got[1]
+    assert dseat.launchctl_log() == [dseat.expected_print()], "asked launchctl nothing / the wrong thing"
+
+
+def test_k4_launchctl_missing_from_path_is_ambiguous_not_the_no_bus_case(dseat):
+    got = _darwin_hook(dseat, None)  # no launchctl stub on the hermetic PATH
+    lines = _lines_of(got, dseat)
+    assert got[0] == 0 and dseat.launched() == [], got
+    assert len(lines) == 1 and "ambiguous" in lines[0], got[1]
+    assert "UNSUPERVISED" not in got[1]
+
+
+@pytest.mark.parametrize("mode,verdict", [
+    ("running", "running"),
+    ("not_running", "registered:not running:0"),
+    ("not_running_nolast", "registered:not running:none"),
+    ("spawn_scheduled", "registered:spawn scheduled:1"),
+    ("notfound", "notfound"),
+])
+def test_k4_verb_prints_the_verdict(dseat, mode, verdict):
+    dseat.launchctl(mode)
+    assert dseat.io(LAUNCHD_VERB, dseat.label()) == verdict
+
+
+@pytest.mark.parametrize("mode", ["empty", "nostate", "rc113_notext", "other_rc"])
+def test_k4_verb_ambiguous_verdicts(dseat, mode):
+    dseat.launchctl(mode)
+    assert dseat.io(LAUNCHD_VERB, dseat.label()).startswith("ambiguous:")
+
+
+def test_k4_verb_timeout_is_ambiguous_within_the_bound(dseat):
+    dseat.launchctl("timeout")
+    t0 = time.monotonic()
+    out = dseat.io(LAUNCHD_VERB, dseat.label(), timeout=LAUNCHD_BOUND_SECONDS + LAUNCHD_SLACK_SECONDS)
+    assert out.startswith("ambiguous:"), out
+    assert time.monotonic() - t0 < LAUNCHD_BOUND_SECONDS + LAUNCHD_SLACK_SECONDS
+
+
+def test_k4_verb_takes_the_top_level_state_line_not_a_nested_one(dseat):
+    """The nested coalition dicts carry `state = active`; a parser that takes the LAST or ANY
+    `state =` line would report that, not the job's own state."""
+    dseat.launchctl("spawn_scheduled")
+    out = dseat.io(LAUNCHD_VERB, dseat.label())
+    assert "active" not in out and out.startswith("registered:spawn scheduled"), out
+
+
+# ===========================================================================
+# K5 -- liveness on engram_pidfile's strict mode (Q4), both platforms
+# ===========================================================================
+
+@contextlib.contextmanager
+def live_process(argv):
+    p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    try:
+        time.sleep(0.3)
+        yield p
+    finally:
+        p.kill()
+        p.wait()
+
+
+NON_OWNER = ["/bin/sleep", "300"]
+OWNER_LIKE = [sys.executable, "-c", "import time; time.sleep(300)", "engramd_owner"]
+
+
+def write_pidfile(home: Path, pid, *, process_is_older: bool) -> Path:
+    """`process_is_older`: the process started BEFORE the pidfile's mtime (the default rule then
+    reads it alive without ever looking at its argv).  False: it started long AFTER."""
+    p = home / "engramd.pid"
+    p.write_text(f"{pid}\n")
+    t = time.time() + (3600 if process_is_older else -3600)
+    os.utime(p, (t, t))
+    return p
+
+
+def test_k5_default_rule_is_unchanged_for_existing_callers(tmp_path):
+    """Control (passes before AND after): without the strict keyword, a live non-owner older than
+    the pidfile reads ALIVE and a younger one reads dead."""
+    with live_process(NON_OWNER) as p:
+        older = write_pidfile(tmp_path, p.pid, process_is_older=True)
+        assert ep.recorded_live_pid(older, "engramd_owner") == p.pid
+        younger = write_pidfile(tmp_path, p.pid, process_is_older=False)
+        assert ep.recorded_live_pid(younger, "engramd_owner") is None
+
+
+@pytest.mark.parametrize("older", [True, False], ids=["older-than-pidfile", "younger-than-pidfile"])
+def test_k5_strict_mode_live_non_owner_reads_none(tmp_path, older):
+    with live_process(NON_OWNER) as p:
+        pf = write_pidfile(tmp_path, p.pid, process_is_older=older)
+        assert ep.recorded_live_pid(pf, "engramd_owner", **{STRICT_KW: True}) is None
+
+
+@pytest.mark.parametrize("older", [True, False], ids=["older-than-pidfile", "younger-than-pidfile"])
+def test_k5_strict_mode_owner_argv_reads_alive(tmp_path, older):
+    with live_process(OWNER_LIKE) as p:
+        pf = write_pidfile(tmp_path, p.pid, process_is_older=older)
+        assert ep.recorded_live_pid(pf, "engramd_owner", **{STRICT_KW: True}) == p.pid
+
+
+def test_k5_strict_mode_unreadable_cmdline_keeps_the_conservative_direction(tmp_path, monkeypatch):
+    """Unreadable cmdline -> alive (the hook's rule today: never guess dead)."""
+    with live_process(NON_OWNER) as p:
+        monkeypatch.setattr(ep, "_read_process_cmdline", lambda pid: None)
+        for older in (True, False):
+            pf = write_pidfile(tmp_path, p.pid, process_is_older=older)
+            assert ep.recorded_live_pid(pf, "engramd_owner", **{STRICT_KW: True}) == p.pid, older
+
+
+def test_k5_strict_mode_dead_pid_and_garbage_read_none(tmp_path):
+    q = subprocess.Popen(NON_OWNER)
+    q.kill()
+    q.wait()
+    for content in (f"{q.pid}\n", "garbage", "", "0", "-5"):
+        pf = tmp_path / "engramd.pid"
+        pf.write_text(content)
+        assert ep.recorded_live_pid(pf, "engramd_owner", **{STRICT_KW: True}) is None, content
+
+
+# ---- the hook's `live` verb on top of it ----------------------------------------------
+
+def test_k5a_live_non_owner_started_after_the_pidfile_reads_none(tmp_path):
+    seat = DSeat(tmp_path / "s")
+    with live_process(NON_OWNER) as p:
+        write_pidfile(seat.eh, p.pid, process_is_older=False)
+        assert seat.io("live", seat.eh) == "none"
+
+
+def test_k5b_live_non_owner_started_BEFORE_the_pidfile_reads_none(tmp_path):
+    """Stays red under engram_pidfile's DEFAULT rule (older non-owner reads alive there): only the
+    named strict mode satisfies it.  The shape is reachable without malice: a plain `cp` of a home
+    rewrites the pidfile's mtime."""
+    seat = DSeat(tmp_path / "s")
+    with live_process(NON_OWNER) as p:
+        write_pidfile(seat.eh, p.pid, process_is_older=True)
+        assert seat.io("live", seat.eh) == "none"
+
+
+@pytest.mark.parametrize("older", [True, False], ids=["older-than-pidfile", "younger-than-pidfile"])
+def test_k5c_live_owner_argv_reads_alive(tmp_path, older):
+    seat = DSeat(tmp_path / "s")
+    with live_process(OWNER_LIKE) as p:
+        write_pidfile(seat.eh, p.pid, process_is_older=older)
+        assert seat.io("live", seat.eh) == "alive"
+
+
+@pytest.mark.parametrize("kind", ["fifo", "directory", "symlink-to-fifo"])
+def test_k5d_non_regular_pidfile_is_reported_and_never_blocks(tmp_path, kind):
+    seat = DSeat(tmp_path / "s")
+    pf = seat.eh / "engramd.pid"
+    if kind == "fifo":
+        os.mkfifo(pf)
+    elif kind == "directory":
+        pf.mkdir()
+    else:
+        os.mkfifo(seat.eh / "elsewhere.fifo")
+        pf.symlink_to(seat.eh / "elsewhere.fifo")
+    assert seat.io("live", seat.eh, timeout=5) == f"notregular:{kind}"
+
+
+def _load_io_module(monkeypatch, spy):
+    monkeypatch.syspath_prepend(str(HOOK_IO.parent))
+    monkeypatch.setitem(sys.modules, "engram_pidfile", spy)
+    spec = importlib.util.spec_from_file_location("_engramd_owner_hook_io_3709", HOOK_IO)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class PidfileSpy:
+    def __init__(self, result=None):
+        self.calls = []
+        self.result = result
+
+    def recorded_live_pid(self, path, program_marker=None, **kw):
+        self.calls.append((str(path), program_marker, kw))
+        return self.result
+
+    def recorded_pid_is_alive(self, path, program_marker=None, **kw):
+        self.calls.append((str(path), program_marker, kw))
+        return self.result is not None
+
+
+@contextlib.contextmanager
+def alarm(seconds: int):
+    def _boom(*_a):
+        raise AssertionError(f"blocked for more than {seconds}s")
+    old = signal.signal(signal.SIGALRM, _boom)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+@pytest.mark.parametrize("kind", ["fifo", "directory"])
+def test_k5d_engram_pidfile_is_never_called_for_a_non_regular_pidfile(tmp_path, monkeypatch, kind):
+    spy = PidfileSpy(result=os.getpid())
+    mod = _load_io_module(monkeypatch, spy)
+    pf = tmp_path / "engramd.pid"
+    os.mkfifo(pf) if kind == "fifo" else pf.mkdir()
+    with alarm(5):
+        verdict = mod.live(str(tmp_path))
+    assert verdict == f"notregular:{kind}", verdict
+    assert spy.calls == [], "the non-regular pre-check must come FIRST; engram_pidfile was reached"
+
+
+def test_k5_live_delegates_to_engram_pidfile_strict_mode_and_reads_no_proc(tmp_path, monkeypatch):
+    import builtins
+    import inspect
+    spy = PidfileSpy(result=os.getpid())
+    mod = _load_io_module(monkeypatch, spy)
+    (tmp_path / "engramd.pid").write_text(f"{os.getpid()}\n")
+    proc_opens = []
+    real_open = builtins.open
+
+    def watching_open(f, *a, **k):
+        if isinstance(f, str) and f.startswith("/proc"):
+            proc_opens.append(f)
+        return real_open(f, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", watching_open)
+    assert mod.live(str(tmp_path)) == "alive"
+    monkeypatch.undo()
+    assert len(spy.calls) == 1, spy.calls
+    _path, marker, kw = spy.calls[0]
+    assert marker == "engramd_owner" and kw.get(STRICT_KW) is True, spy.calls
+    assert proc_opens == [], f"live() still reads /proc itself: {proc_opens}"
+    spy.result = None
+    monkeypatch.setitem(sys.modules, "engram_pidfile", spy)
+    assert mod.live(str(tmp_path)) == "none"
+    assert "/proc" not in inspect.getsource(mod.live)
+
+
+def test_k5_unimportable_engram_pidfile_is_ambiguous_never_none(tmp_path):
+    seat = DSeat(tmp_path / "s", with_pidfile=False)  # no engram_pidfile.py anywhere reachable
+    (seat.eh / "engramd.pid").write_text(f"{os.getpid()}\n")
+    assert seat.io("live", seat.eh).startswith(LIVE_AMBIGUOUS_PREFIX)
+
+
+def test_k5_hook_import_failure_launches_nothing_and_says_so(tmp_path):
+    seat = DSeat(tmp_path / "s", with_pidfile=False)
+    (seat.eh / "engramd.pid").write_text(f"{os.getpid()}\n")
+    seat.config(FLAG_ON)
+    seat.launchctl("notfound")
+    rc, out, _e, _t = seat.run_timed(limit=30)
+    assert rc == 0 and seat.launched() == [], out
+    assert len(_lines_of((rc, out, _e, _t), seat)) == 1 and "ambiguous" in " ".join(_lines_of((rc, out, _e, _t), seat))
+
+
+def test_k5f_darwin_hook_a_stale_pidfile_naming_a_live_non_owner_does_not_suppress_the_launch(tmp_path):
+    """The headline Darwin case: today (no /proc) such a pidfile reads ALIVE and the owner is never
+    launched.  Here the process is OLDER than the pidfile (the plain-`cp` shape)."""
+    seat = DSeat(tmp_path / "s", os_name="Darwin")
+    seat.config(FLAG_ON)
+    seat.launchctl("notfound")
+    with live_process(NON_OWNER) as p:
+        write_pidfile(seat.eh, p.pid, process_is_older=True)
+        rc, out, _e, _t = seat.run_timed(limit=60)
+    assert rc == 0
+    assert len(seat.launched()) == 1, "a live non-owner pid in engramd.pid suppressed the owner launch"
+    assert any("UNSUPERVISED" in ln for ln in _lines_of((rc, out, _e, _t), seat))
+
+
+# ===========================================================================
+# K6 -- preflight from the owner's own predicates (Q5)
+# ===========================================================================
+
+def run_owner(args, *, home: Path, engram_home: Path, extra_code: str | None = None):
+    """Run the REAL owner script; a preflight exits by itself.  An owner that starts SERVING
+    (i.e. --preflight was ignored) is killed at the timeout and reported as the missing feature."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ENGRAM_")}
+    env.update({"HOME": str(home), "ENGRAM_HOME": str(engram_home), "ENGRAM_NO_EMBEDDINGS": "1"})
+    argv = [sys.executable, str(OWNER_PY), *args]
+    if extra_code is not None:
+        argv = [sys.executable, "-c", extra_code]
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                         start_new_session=True, cwd=str(home))
+    timed_out = False
+    try:
+        out, err = p.communicate(timeout=OWNER_RUN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    if timed_out:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.communicate()
+        pytest.fail(f"the owner did not exit within {OWNER_RUN_TIMEOUT}s with {args}: it started SERVING "
+                    f"instead of running a preflight")
+    return p.returncode, out, err
+
+
+def tree_snapshot(root: Path) -> dict:
+    snap = {}
+    for p in sorted(root.rglob("*")):
+        st = p.lstat()
+        snap[str(p.relative_to(root))] = (st.st_mode, st.st_size, st.st_mtime_ns,
+                                          p.read_bytes() if p.is_file() and not p.is_symlink() else None)
+    return snap
+
+
+def test_k6_healthy_home_preflight_is_silent_exit_zero_and_creates_nothing(short_base):
+    home = short_base / "eh"
+    rc, out, err = run_owner([PREFLIGHT_FLAG], home=short_base, engram_home=home)
+    assert (rc, out, err) == (0, "", ""), (rc, out, err)
+    assert not home.exists(), "a preflight created the (nonexistent) home"
+
+
+def test_k6_existing_home_is_byte_identical_after_preflight(short_base):
+    home = short_base / "eh"
+    (home / "notes").mkdir(parents=True)
+    (home / "config.json").write_text("{}")
+    (home / "notes" / "a.txt").write_text("keep")
+    before = tree_snapshot(home)
+    rc, out, err = run_owner([PREFLIGHT_FLAG], home=short_base, engram_home=home)
+    assert rc == 0, (rc, out, err)
+    assert tree_snapshot(home) == before, "preflight mutated the home"
+    assert not (home / "run").exists()
+
+
+def test_k6_over_long_home_is_refused_with_the_owners_reason_and_a_healthy_control_passes(short_base):
+    long_home = short_base / ("h" * 120)
+    rc, out, err = run_owner([PREFLIGHT_FLAG], home=short_base, engram_home=long_home)
+    assert rc != 0 and "AF_UNIX" in err and str(long_home) in err, (rc, out, err)
+    assert not long_home.exists()
+    # control: the same invocation on a healthy home must exit 0 (a preflight that always refuses,
+    # or one that is simply the owner's start(), would not)
+    rc, out, err = run_owner([PREFLIGHT_FLAG], home=short_base, engram_home=short_base / "ok")
+    assert (rc, out, err) == (0, "", ""), (rc, out, err)
+
+
+@pytest.mark.skipif(not IS_DARWIN, reason="the owner's TCC check keys on its Darwin arm (_owner_arm), "
+                                          "which a uname stub cannot reach")
+def test_k6_tcc_protected_home_is_refused_with_the_owners_reason_and_a_healthy_control_passes(short_base):
+    fake_home = short_base / "u"
+    fake_home.mkdir()
+    home = fake_home / "Documents" / "eh"
+    rc, out, err = run_owner([PREFLIGHT_FLAG], home=fake_home, engram_home=home)
+    assert rc != 0 and "TCC" in err, (rc, out, err)
+    assert not (fake_home / "Documents").exists(), "the preflight touched ~/Documents"
+    rc, out, err = run_owner([PREFLIGHT_FLAG], home=fake_home, engram_home=fake_home / "eh")
+    assert (rc, out, err) == (0, "", ""), (rc, out, err)
+
+
+def test_k6_preflight_and_start_share_one_predicate(short_base):
+    """Alter the shared check: BOTH entry points change.  (Healthy control first, so a preflight
+    that does not exist cannot pass by the owner's own start() refusing.)"""
+    rc, out, err = run_owner([PREFLIGHT_FLAG], home=short_base, engram_home=short_base / "ok")
+    assert (rc, out, err) == (0, "", ""), (rc, out, err)
+    patch = (f"import sys; sys.path.insert(0, {str(SRC)!r}); import engramd_client as ec; "
+             f"ec.socket_path_too_long_reason = lambda p: 'SENTINEL-3709-REASON'; ")
+    pre = patch + (f"import runpy; sys.argv = [{str(OWNER_PY)!r}, {PREFLIGHT_FLAG!r}]; "
+                   f"runpy.run_path({str(OWNER_PY)!r}, run_name='__main__')")
+    rc, out, err = run_owner([], home=short_base, engram_home=short_base / "ok2", extra_code=pre)
+    assert rc != 0 and "SENTINEL-3709-REASON" in err, ("preflight", rc, out, err)
+    start = patch + ("import engramd_owner as eo; o = eo.EngramdOwner()\n"
+                     "try:\n    o.start(install_signal_handlers=False)\n"
+                     "except Exception as e:\n    print('RAISED', e)\n")
+    rc, out, err = run_owner([], home=short_base, engram_home=short_base / "ok3", extra_code=start)
+    assert "SENTINEL-3709-REASON" in out, ("start", rc, out, err)
+
+
+# ---- `--owner` on Darwin runs the preflight before it writes anything ---------------------------
+
+def test_k6_owner_mode_over_long_home_is_refused_before_anything_is_created(tmp_path, short_base):
+    sb = DSandbox(tmp_path / "i", os_name="Darwin", real_owner=True)
+    home = short_base / ("h" * 120)
+    r = sb.run("--owner", engram_home=str(home))
+    assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)
+    assert "AF_UNIX" in r.stdout + r.stderr, (r.stdout, r.stderr)
+    sb.assert_nothing_written(home)
+
+
+def test_k6_owner_mode_checks_again_after_physical_normalization(tmp_path, short_base):
+    """The tilde-expanded raw spelling is short and passes; its PHYSICAL path is longer than the
+    AF_UNIX limit and must be refused by the second preflight, still before any plist."""
+    target = short_base / ("a" * 55) / ("b" * 55) / "eh"
+    target.mkdir(parents=True)
+    link = short_base / "s"
+    link.symlink_to(target)
+    sb = DSandbox(tmp_path / "i", os_name="Darwin", real_owner=True)
+    r = sb.run("--owner", engram_home=str(link))
+    assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)
+    assert "AF_UNIX" in r.stdout + r.stderr, (r.stdout, r.stderr)
+    sb.assert_nothing_written()
+
+
+def test_k6x_owner_mode_new_home_under_symlinked_parent_is_refused_before_any_mkdir(tmp_path, short_base):
+    """The home does not exist yet, so the physical path must be computed WITHOUT creating it: the
+    short spelling passes the first preflight, the physical one (through the symlinked parent) is
+    over the AF_UNIX limit.  The refusal must leave no home dir, no ~/Library, no launchctl call."""
+    deep = short_base / ("a" * 55) / ("b" * 55)
+    deep.mkdir(parents=True)
+    link = short_base / "s"
+    link.symlink_to(deep)
+    sb = DSandbox(tmp_path / "i", os_name="Darwin", real_owner=True)
+    r = sb.run("--owner", engram_home=str(link / "eh"))
+    assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)
+    assert "AF_UNIX" in r.stdout + r.stderr, (r.stdout, r.stderr)
+    assert not (deep / "eh").exists(), "the home dir was created before the physical-path preflight"
+    assert not (link / "eh").exists()
+    sb.assert_nothing_written()
+
+
+def _tree_listing(*roots: Path):
+    return sorted(str(p) for r in roots for p in [r, *r.rglob("*")])
+
+
+@pytest.mark.parametrize("os_name", ["Darwin", "Linux"])
+def test_k6z_owner_mode_home_with_dotdot_after_a_symlink_is_refused_before_anything_is_created(tmp_path, short_base, os_name):
+    """`lnk2 -> real/sub`, home `lnk2/../new`: a lexical plan says `.../new`, `mkdir -p` creates
+    `.../real/new`.  Any `..` component in the home is refused, named, before anything is created."""
+    (short_base / "real" / "sub").mkdir(parents=True)
+    (short_base / "lnk2").symlink_to(short_base / "real" / "sub")
+    sb = DSandbox(tmp_path / "i", os_name=os_name, real_owner=True)
+    before = _tree_listing(short_base, tmp_path)
+    r = sb.run("--owner", engram_home=f"{short_base}/lnk2/../new")
+    assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)
+    assert "must not contain '..' components" in r.stdout + r.stderr, (r.stdout, r.stderr)
+    assert _tree_listing(short_base, tmp_path) == before, "a directory was created"
+    sb.assert_nothing_written()
+
+
+# Every spelling of a `..` component.  `{b}` is the (short) base dir; the two relative homes are
+# resolved against the installer's cwd (the sandbox tmp) and reach the refusal as given: it runs on
+# the raw value, before the home is made absolute.
+DOTDOT_REFUSED = {
+    "start-relative": "../x",
+    "start-after-base": "{b}/../x",
+    "middle": "{b}/a/../x",
+    "end": "{b}/a/..",
+    "trailing-slash": "{b}/a/../",
+    "only-dotdot-after-base": "{b}/../..",
+    "only-dotdot-relative": "..",
+}
+# Names that CONTAIN dots but are not a `..` component: never refused for that reason.
+DOTDOT_ACCEPTED = {
+    "inside": "{b}/a..b",
+    "leading": "{b}/..foo",
+    "trailing": "{b}/foo..",
+    "three-dots-dir": "{b}/a/.../b",
+}
+
+
+@pytest.mark.parametrize("os_name", ["Darwin", "Linux"])
+@pytest.mark.parametrize("spelling", list(DOTDOT_REFUSED))
+def test_k6z_owner_mode_home_with_dotdot_in_any_position_is_refused_before_anything_is_created(tmp_path, short_base, os_name, spelling):
+    """A `..` as the first, a middle, the last, a trailing-slash, or the only component is refused
+    (exit 2, named error), with nothing created: no dir, no ~/Library, no launchctl call."""
+    sb = DSandbox(tmp_path / "i", os_name=os_name, real_owner=True)
+    before = _tree_listing(short_base, tmp_path)
+    r = sb.run("--owner", engram_home=DOTDOT_REFUSED[spelling].format(b=short_base))
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    assert "must not contain '..' components" in r.stdout + r.stderr, (r.stdout, r.stderr)
+    assert _tree_listing(short_base, tmp_path) == before, "a directory was created"
+    sb.assert_nothing_written()
+
+
+@pytest.mark.parametrize("os_name", ["Darwin", "Linux"])
+@pytest.mark.parametrize("spelling", list(DOTDOT_ACCEPTED))
+def test_k6z_owner_mode_home_with_dots_in_a_name_is_not_taken_for_dotdot(tmp_path, short_base, os_name, spelling):
+    """`a..b`, `..foo`, `foo..`, `a/.../b` hold dots but no `..` component.  The `..` refusal must
+    not fire; the install itself may go on or stop for another reason (nothing real is registered:
+    the sandbox's launchctl/systemctl are recording stubs)."""
+    sb = DSandbox(tmp_path / "i", os_name=os_name, real_owner=True)
+    r = sb.run("--owner", engram_home=DOTDOT_ACCEPTED[spelling].format(b=short_base))
+    assert "'..' components" not in r.stdout + r.stderr, (r.returncode, r.stdout, r.stderr)
+
+
+@pytest.mark.skipif(not IS_DARWIN, reason="the owner's TCC check keys on its Darwin arm (_owner_arm)")
+def test_k6y_owner_mode_new_home_through_symlink_into_tcc_folder_is_refused_before_any_mkdir(short_base):
+    sb = DSandbox(short_base / "i", os_name="Darwin", real_owner=True)
+    link = short_base / "t"
+    link.symlink_to(sb.home / "Documents" / "x")  # the target does not exist: a dangling link
+    r = sb.run("--owner", engram_home=str(link / "eh"))
+    assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)
+    assert "TCC" in r.stdout + r.stderr, (r.stdout, r.stderr)
+    assert not (sb.home / "Documents").exists(), "mkdir reached through the symlink into ~/Documents"
+    sb.assert_nothing_written()
+
+
+@pytest.mark.skipif(not IS_DARWIN, reason="the owner's TCC check keys on its Darwin arm (_owner_arm)")
+def test_k6_owner_mode_tcc_home_is_refused_before_mkdir_plist_or_launchctl(short_base):
+    # short base: $HOME/Documents/eh/run/engramd.sock must fit AF_UNIX, or the socket-length
+    # refusal (which comes first in start()) would fire instead of the TCC one
+    sb = DSandbox(short_base / "i", os_name="Darwin", real_owner=True)
+    home = sb.home / "Documents" / "eh"
+    r = sb.run("--owner", engram_home=str(home))
+    assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)
+    assert "TCC" in r.stdout + r.stderr, (r.stdout, r.stderr)
+    assert not (sb.home / "Documents").exists(), "mkdir under ~/Documents happened before the preflight"
+    sb.assert_nothing_written(home)
+
+
+# A non-regular pidfile makes the owner exit 4 at start (#3768); systemd stops retrying on that code,
+# launchd's KeepAlive {SuccessfulExit: false} has no per-code exclusion and would relaunch every 60 s.
+# So `--owner` must refuse before registering, from the same check start() runs.
+def _plant_fifo(path: Path, sentinel: Path):
+    os.mkfifo(path)
+
+
+def _plant_hardlink(path: Path, sentinel: Path):
+    os.link(sentinel, path)
+
+
+def _plant_symlink(path: Path, sentinel: Path):
+    path.symlink_to(sentinel)
+
+
+@pytest.mark.parametrize("plant", [_plant_fifo, _plant_hardlink, _plant_symlink],
+                         ids=["fifo", "hardlink", "symlink"])
+def test_k6_owner_mode_non_regular_pidfile_is_refused_before_plist_or_launchctl(short_base, plant):
+    import engramd_client as ecl  # conftest puts src/engram on sys.path
+    sb = DSandbox(short_base / "i", os_name="Darwin", real_owner=True)
+    home = short_base / "eh"
+    home.mkdir()
+    sentinel = short_base / "sentinel"
+    sentinel.write_bytes(b"SENTINEL-3768-DO-NOT-TOUCH")
+    pid_path = ecl.pid_path_for_home(home)
+    plant(pid_path, sentinel)
+    before_home = sorted(p.name for p in home.iterdir())
+    r = sb.run("--owner", engram_home=str(home))
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)
+    assert "refusing to start: the pidfile path" in out and str(pid_path) in out, (r.stdout, r.stderr)
+    sb.assert_nothing_written()  # no ~/Library, no plist, no launchctl call
+    assert sorted(p.name for p in home.iterdir()) == before_home, "the install changed the home"
+    assert sentinel.read_bytes() == b"SENTINEL-3768-DO-NOT-TOUCH"
+
+
+# ===========================================================================
+# K7 -- #3519 guards
+# ===========================================================================
+
+def test_k7_darwin_owner_mode_with_an_ephemeral_owner_script_is_refused_before_any_write(tmp_path):
+    sb = DSandbox(tmp_path / "i", os_name="Darwin")
+    home = sb.tmp / "seat-a"
+    r = sb.run("--owner", engram_home=str(home), allow_path=False)
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    assert "engramd_owner.py" in r.stderr and "ephemeral" in r.stderr, r.stderr
+    sb.assert_nothing_written(home)
+
+
+def test_k7_darwin_owner_mode_never_touches_systemd(tmp_path):
+    """Replaces the old 3663 cell's systemd half: a successful Darwin `--owner` makes no systemctl
+    call (the Sandbox's recording stub is on PATH) and writes no systemd unit dir."""
+    sb = DSandbox(tmp_path / "i", os_name="Darwin")
+    r = sb.run("--owner", engram_home=str(sb.tmp / "seat-a"))
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert sb.launchctl_calls(), "control: the Darwin install did go through launchctl"
+    assert sb.systemctl_calls() == [], sb.systemctl_calls()
+    assert not sb.unit_dir.exists() or list(sb.unit_dir.iterdir()) == [], sb.unit_dir
+
+
+def test_k7_darwin_hook_never_calls_systemctl(tmp_path):
+    """Replaces the old 3663 cell's systemd half: on Darwin the hook asks launchd only.  A RECORDING
+    systemctl stub is on PATH, and the notfound path (the one that goes on to launch) is taken."""
+    seat = DSeat(tmp_path / "s", os_name="Darwin")
+    seat.config(FLAG_ON)
+    seat.systemctl("nobus")  # recording stub (Seat.systemctl logs every call to seat.syslog)
+    seat.launchctl("notfound")
+    rc, out, _e, _t = seat.run_timed(limit=LAUNCHD_BOUND_SECONDS + LAUNCHD_SLACK_SECONDS + 10)
+    assert rc == 0 and len(seat.launched()) == 1, (rc, out)  # control: the launchd path ran to the end
+    assert seat.launchctl_log() == [seat.expected_print()]
+    assert not seat.syslog.exists(), seat.syslog.read_text()
+
+
+# ===========================================================================
+# R1 (+ K3) -- one REAL launchd cell, Darwin only
+# ===========================================================================
+
+# SECURITY REVIEW: this is the ONE deliberate exception to the #3519 guard.  The conftest shim
+# refuses `launchctl bootstrap`/`bootout` by design; this cell calls the real tool by ABSOLUTE
+# path.  It is gated on (a) macOS, and (b) every label starting with TEST_LABEL_PREFIX, checked
+# before the first real call.  It never touches a `com.engram.engramd-owner.*` label.
+REAL_LAUNCHCTL = "/bin/launchctl"
+TEST_LABEL_PREFIX = "com.engram.test."
+
+
+def _load_parser():
+    monkey_path = str(HOOK_IO.parent)
+    if monkey_path not in sys.path:
+        sys.path.insert(0, monkey_path)
+    spec = importlib.util.spec_from_file_location("_engramd_owner_hook_io_r1", HOOK_IO)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return getattr(mod, LAUNCHD_PARSE_FUNC)
+
+
+def _real_print(label: str):
+    r = subprocess.run([REAL_LAUNCHCTL, "print", f"gui/{UID}/{label}"], capture_output=True, text=True, timeout=30)
+    return r.returncode, r.stdout, r.stderr
+
+
+def _sweep_leftover_test_jobs() -> list:
+    """If an earlier run was SIGKILLed mid-R1, its `finally` never ran and its test jobs (exit1 /
+    exit3 retry every ThrottleInterval, `sleep 600` lingers) are still registered.  List launchd
+    (read-only), boot out every leftover label that starts with TEST_LABEL_PREFIX, and touch NOTHING
+    else: any other label is left alone, and this never issues a call for it.  Returns the labels
+    it booted out."""
+    r = subprocess.run([REAL_LAUNCHCTL, "list"], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, ("launchctl list failed", r.returncode, r.stderr)
+    # `launchctl list` rows are tab-separated: PID, last exit status, label.
+    found = [cols[2] for cols in (ln.split("\t") for ln in r.stdout.splitlines()) if len(cols) == 3]
+    stale = [lab for lab in found if lab.startswith(TEST_LABEL_PREFIX)]
+    for lab in stale:
+        assert lab.startswith(TEST_LABEL_PREFIX)  # the only labels this module ever passes to bootout
+        subprocess.run([REAL_LAUNCHCTL, "bootout", f"gui/{UID}/{lab}"], capture_output=True, text=True, timeout=30)
+    again = subprocess.run([REAL_LAUNCHCTL, "list"], capture_output=True, text=True, timeout=30).stdout
+    still = [lab for lab in stale if f"\t{lab}" in again]
+    assert not still, f"could not boot out leftover test jobs from an earlier run: {still}"
+    return stale
+
+
+@pytest.mark.skipif(not IS_DARWIN, reason="real launchd exists only on macOS")
+def test_r1_real_launchd_restart_semantics_and_parser(tmp_path):
+    # If pytest is SIGKILLed mid-cell, the `finally` below cannot run and `com.engram.test.r1-*`
+    # jobs stay registered; this sweep (test-prefixed labels only) cleans them at the next start.
+    _sweep_leftover_test_jobs()
+    suffix = f"{os.getpid()}-{uuid.uuid4().hex[:6]}"
+    labels = {k: f"{TEST_LABEL_PREFIX}r1-{k}-{suffix}" for k in ("sleep", "exit0", "exit1", "exit3")}
+    never = f"{TEST_LABEL_PREFIX}r1-never-registered-{suffix}"
+    for lab in (*labels.values(), never):
+        if not lab.startswith(TEST_LABEL_PREFIX):
+            pytest.fail(f"refusing to run: label {lab!r} lacks the {TEST_LABEL_PREFIX!r} test prefix")
+
+    # rc 125 ("Domain does not support specified action") means this uid has no GUI launchd domain
+    # (no logged-in GUI session), so nothing can be bootstrapped into gui/<uid>.  That is a property
+    # of the host, not a defect in the code under test, so it is a skip, not a failure.  Skip ONLY on
+    # 125: any other result (notfound, or anything else) keeps its normal path below.  Probed before
+    # any bootstrap, so a skip never registers anything.
+    probe_rc, _probe_out, probe_err = _real_print(never)
+    if probe_rc == 125:
+        pytest.skip(f"no GUI launchd domain for uid {UID} (no logged-in GUI session): "
+                    f"`launchctl print gui/{UID}/<label>` exited 125 ({probe_err.strip()!r}); R1 needs one")
+
+    # Policy comes from the SHIPPED template (rendered), never retyped here.
+    assert PLIST_TEMPLATE.exists(), f"missing (not implemented yet): {PLIST_TEMPLATE.relative_to(REPO)}"
+    text = PLIST_TEMPLATE.read_text()
+    for ph, val in zip(PLIST_PLACEHOLDERS, ("/usr/bin/python3", "/x/engramd_owner.py", "/x/home", "com.engram.test.tpl")):
+        text = text.replace(ph, val)
+    tpl = plistlib.loads(text.encode())
+    keepalive, throttle = tpl["KeepAlive"], tpl["ThrottleInterval"]
+    parse = _load_parser()
+
+    stamps = tmp_path / "stamps"
+    stamps.mkdir()
+    plists = {}
+    for kind, lab in labels.items():
+        argv = (["/bin/sleep", "600"] if kind == "sleep" else
+                ["/bin/sh", "-c", f"date +%s >> {stamps / kind}.runs; exit {kind[-1]}"])
+        d = {"Label": lab, "ProgramArguments": argv, "RunAtLoad": True, "KeepAlive": keepalive,
+             "ThrottleInterval": throttle, "StandardOutPath": "/dev/null", "StandardErrorPath": "/dev/null"}
+        plists[kind] = tmp_path / f"{lab}.plist"
+        plists[kind].write_bytes(plistlib.dumps(d))
+
+    def verdict(label):
+        return parse(*_real_print(label))
+
+    def wait_for(label, want, within=20.0):
+        end = time.monotonic() + within
+        while time.monotonic() < end:
+            if verdict(label) == want:
+                return
+            time.sleep(0.5)
+        pytest.fail(f"{label}: wanted {want!r}, last saw {verdict(label)!r}")
+
+    try:
+        assert verdict(never) == "notfound"
+        t0 = time.monotonic()
+        for kind, lab in labels.items():
+            r = subprocess.run([REAL_LAUNCHCTL, "bootstrap", f"gui/{UID}", str(plists[kind])],
+                               capture_output=True, text=True, timeout=30)
+            assert r.returncode == 0, (kind, r.stdout, r.stderr)
+        wait_for(labels["sleep"], "running")
+        wait_for(labels["exit0"], "registered:not running:0")
+        wait_for(labels["exit1"], "registered:spawn scheduled:1")
+        wait_for(labels["exit3"], "registered:spawn scheduled:3")
+        # K3: wait out the template's own ThrottleInterval, then count real runs.
+        remaining = t0 + throttle + 10 - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        runs = {k: len((stamps / f"{k}.runs").read_text().split()) for k in ("exit0", "exit1", "exit3")}
+        assert runs["exit0"] == 1, f"exit 0 was restarted: {runs}"
+        assert runs["exit1"] >= 2 and runs["exit3"] >= 2, f"exit 1 / exit 3 were not restarted: {runs}"
+        assert verdict(labels["sleep"]) == "running"
+        assert verdict(labels["exit0"]) == "registered:not running:0"
+    finally:
+        leaked = []
+        for lab in labels.values():
+            subprocess.run([REAL_LAUNCHCTL, "bootout", f"gui/{UID}/{lab}"], capture_output=True, text=True, timeout=30)
+        for lab in labels.values():
+            end = time.monotonic() + 10
+            while time.monotonic() < end and verdict(lab) != "notfound":
+                time.sleep(0.3)
+            if verdict(lab) != "notfound":
+                leaked.append(lab)
+        if leaked:
+            pytest.fail(f"test jobs still registered after bootout: {leaked}")
