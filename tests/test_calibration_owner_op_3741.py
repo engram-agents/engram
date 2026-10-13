@@ -456,6 +456,27 @@ def test_c2_a_node_in_the_cutoffs_own_second_is_excluded_on_both_paths(leg, home
     assert got["by_mode"]["all"]["by_type"]["definition"]["n"] == 3  # control: all three exist
 
 
+C2B_EXTRA = [
+    ("df_c2d", "definition", 0.40, "2026-10-12T12:00:30Z", "active", 1),               # EQUAL to the cutoff: INCLUDED
+    ("df_c2c", "definition", 0.90, "2026-10-12T12:00:31.000001+00:00", "active", 1),   # next second: INCLUDED (control)
+]
+
+
+@pytest.mark.parametrize("leg", LEGS)
+def test_c2b_a_node_whose_created_at_equals_the_cutoff_is_included_on_both_paths(leg, home, tmp_path, monkeypatch):
+    """C2b (follow-up to the colleague read of #3759). The window filter is `created_at >= cutoff`;
+    no other cell has a row whose `created_at` EQUALS the cutoff string, so changing `>=` to `>`
+    survived. Real rows are written `...+00:00` and never equal a `...Z` cutoff, so this pins the
+    operator itself, on both paths: a row stamped exactly '2026-10-12T12:00:30Z' is in the 1-turn
+    window. Mutation: `>=` -> `>` in `_window_for_mode` -> the 1-turn definition bucket drops to n=1 -> red."""
+    db = pinned_store(home, extra=C2B_EXTRA)
+    pin_clock(monkeypatch, NOW_PIN)
+    reference = reference_by_type(db, tmp_path, ["1-turn"])["1-turn"]
+    assert reference["definition"]["n"] == 2, reference["definition"]
+    got = op_by_mode(leg, home, db, tmp_path, monkeypatch, modes=["1-turn"])
+    assert got["by_mode"]["1-turn"]["by_type"]["definition"]["n"] == 2, got["by_mode"]["1-turn"]["by_type"].get("definition")
+
+
 # =========================================================================================
 # C3 -- validation table
 # =========================================================================================
@@ -897,6 +918,9 @@ def _bad_replies():
     del no_7["by_mode"]["7-turn"]
     str_turn = _good_reply()
     str_turn["current_turn"] = "41"
+    # bool is an int subclass: the hook refuses it explicitly (follow-up to the colleague read of #3759)
+    bool_turn = _good_reply()
+    bool_turn["current_turn"] = True
     list_by_type = _good_reply()
     list_by_type["by_mode"]["all"]["by_type"] = []
     # Per-type values: the formatter reads n and p25/p50/p75/p95 of each value (reviewer round 1).
@@ -913,7 +937,8 @@ def _bad_replies():
     whole_float_n = _good_reply()
     whole_float_n["by_mode"]["7-turn"]["by_type"]["observation_factual"]["n"] = 3.0
     return [("missing_by_mode", no_by_mode), ("missing_7_turn", no_7),
-            ("current_turn_a_string", str_turn), ("by_type_a_list", list_by_type),
+            ("current_turn_a_string", str_turn), ("current_turn_a_bool", bool_turn),
+            ("by_type_a_list", list_by_type),
             ("by_type_value_an_int", int_value), ("by_type_value_missing_p50", no_p50),
             ("by_type_value_n_a_string", str_n), ("by_type_value_n_a_float", float_n),
             ("by_type_value_n_a_whole_float", whole_float_n)]
