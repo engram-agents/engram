@@ -1674,7 +1674,15 @@ def generalization_chain(
     Public helper — WS2 (render) consumes this directly; keep the return
     shape stable across a signature change (add fields, don't repurpose
     existing ones) once WS2 branches off this tip.
+
+    Raises ``ValueError`` for a ``max_depth`` that is negative or not an ``int`` (a ``bool``
+    is refused too): a negative depth would expand nothing and then report ``truncated``,
+    which is a false statement. ``0`` is valid and returns the roots only.
     """
+    if isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 0:
+        raise ValueError(
+            f"generalization_chain: max_depth must be a non-negative int, got {max_depth!r}"
+        )
     start_row = conn.execute(
         "SELECT id, type FROM nodes WHERE id = ?", (node_id,)
     ).fetchone()
@@ -1686,6 +1694,7 @@ def generalization_chain(
             "nodes": {},
             "heads": [],
             "truncated": False,
+            "cycle_detected": False,
         }
 
     start_resolved = _resolve_to_current(conn, node_id)

@@ -788,7 +788,8 @@ def render_triggered_principles(
     contract (`cycle_detected` requires `truncated: False`), so the two
     checks below never fire on the same hit.
 
-    Returns "" on: no hits, no importable generalization_chain, any DB/walk
+    Returns "" on: no hits, no importable generalization_chain (not consulted when the
+    connection is the owner shim, which serves the walk itself, #3740), any DB/walk
     failure, or no hit producing a real chain and no hit reporting
     cycle_detected or a truncated-with-no-head walk. Never raises -- this
     hook's T2 "never blocks" contract (see module docstring) applies to
@@ -819,16 +820,24 @@ def render_triggered_principles(
         return ""
     if db_path is None:
         db_path = DB_PATH
-    generalization_chain = _import_generalization_chain()
-    if generalization_chain is None:
-        return ""
-
+    generalization_chain = None
     conn = None
     owner = _owner_active()
+    if not owner:
+        generalization_chain = _import_generalization_chain()
+        if generalization_chain is None:
+            return ""
     try:
         if owner:
             # #3665: the fire's shared shim; positional rows (no row_factory exists on it).
             conn = _owner_conn()
+            if not callable(getattr(conn, "generalization_chain", None)):
+                # no owner-served walk on this connection: walk here, as before
+                generalization_chain = _import_generalization_chain()
+                if generalization_chain is None:
+                    return ""
+            # else (#3740 R1): the shim serves the walk through the owner; the hook neither
+            # imports engram_core nor depends on it being importable in this process.
         else:
             conn = connect_regular_ro(db_path, timeout=1.0)
             conn.row_factory = sqlite3.Row
@@ -859,7 +868,14 @@ def render_triggered_principles(
             node_id = hit.get("node_id") if isinstance(hit, dict) else None
             if not node_id:
                 continue
-            chain = generalization_chain(conn, node_id)
+            # #3740 Cut A: the owner shim carries the whole walk as ONE typed `chain` request
+            # (the owner runs engram_core.generalization_chain itself); a plain sqlite
+            # connection has no such method and walks as before. An OwnerReadError from the
+            # shim propagates to the handler below, like any other owner failure.
+            if hasattr(conn, "generalization_chain"):
+                chain = conn.generalization_chain(node_id)
+            else:
+                chain = generalization_chain(conn, node_id)
             nodes = chain.get("nodes") or {}
             start_resolved = chain.get("start_resolved_id")
             heads = chain.get("heads") or []

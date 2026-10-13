@@ -329,13 +329,17 @@ def sql_set_of(sites) -> set:
 
 CHAIN_SITES = ("engram_core.py:generalization_chain", "engram_core.py:_resolve_to_current",
                "engram_core.py:_current_successor")
+# #3740 Cut A: with the flag ON the chain walk travels as ONE typed `chain` request per hit
+# (recorded by `statement_of` at method level as "chain"); the per-hop statements of CHAIN_SITES
+# are sent only by the direct path.
+CHAIN_OP = "chain"
 
 
 def site_sql(mod) -> dict:
     return {
         "load_tripwires": {mod._QUERY},
         "load_prevention_lessons": {mod._PREVENTION_QUERY},
-        "render_triggered_principles": sql_set_of(CHAIN_SITES),
+        "render_triggered_principles": {CHAIN_OP},
         "check_in_turn_recall": {COUNT_SQL, VOCAB_SQL},
     }
 
@@ -427,6 +431,7 @@ except SystemExit as e:
 sys.stdout = real_out
 json.dump({"stdout": buf.getvalue(), "rc": rc, "opens": opens,
            "client_imported": "engramd_client" in sys.modules,
+           "core_imported": "engram_core" in sys.modules,
            "flags_imported": "engramd_owner_flags" in sys.modules}, open(out_path, "w"))
 '''
 
@@ -510,9 +515,11 @@ def test_a_flag_on_owner_up_a_full_fire_opens_the_store_zero_times(owner_kind, h
     for site, wanted in site_sql(mod).items():
         assert wanted & set(sqls), f"the {site} site never reached the owner"
     assert sqls.count(VOCAB_SQL) >= 2, "the long match text did not cross an IDF batch boundary"
-    # every statement but the IDF batch is registered; the IDF batch went ONLY as `df`
-    assert all(s in registered_sql() for s in sqls if s != VOCAB_SQL)
+    # every statement but the IDF batch (typed `df`) and the chain walk (typed `chain`) is
+    # registered; the IDF batch went ONLY as `df`, the chain ONLY as `chain`
+    assert all(s in registered_sql() for s in sqls if s not in (VOCAB_SQL, CHAIN_OP))
     assert {m for m, s, _ in seen_m if s == VOCAB_SQL} == {"df"}
+    assert {m for m, s, _ in seen_m if s == CHAIN_OP} == {"chain"}
 
 
 def test_a_the_same_zero_opens_cell_as_a_real_process(home, tmp_path):
@@ -699,6 +706,17 @@ def _direct_rows(db: Path, sql: str, args):
         conn.close()
 
 
+def _direct_chain_for(db: Path, args):
+    """The raw-level oracle for a typed `chain` answer: engram_core.generalization_chain run
+    directly on the same store, JSON-normalised (what the owner's wire carries)."""
+    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return json.loads(json.dumps(engram_core.generalization_chain(conn, args[0], args[1])))
+    finally:
+        conn.close()
+
+
 def _levels(home, monkeypatch, cmd, owner_kind, mutate_answer=None):
     """Flag OFF (direct) vs flag ON (owner) on the SAME store -> {level: (old, new)}."""
     mod = load_hook(home, monkeypatch)
@@ -722,7 +740,8 @@ def _levels(home, monkeypatch, cmd, owner_kind, mutate_answer=None):
         r_on = run_main(mod, cmd)
         monkeypatch.setattr(ec, "read", real)
     s_on = snapshot(home)
-    raw_old = [(sql, _direct_rows(home / "knowledge.db", sql, args)) for sql, args, _ in answers]
+    raw_old = [(sql, _direct_chain_for(home / "knowledge.db", args) if sql == CHAIN_OP
+                else _direct_rows(home / "knowledge.db", sql, args)) for sql, args, _ in answers]
     raw_new = [(sql, res) for sql, _, res in answers]
     return {
         "raw": (raw_old, raw_new),
@@ -843,7 +862,8 @@ def test_c1_statement_set_every_sent_statement_is_in_the_registry(owner_kind, ho
     statements are each present. Mutation: edit one SQL string in the hook (a stray space)
     -> the statement is not registered -> red. The IDF batch statement (VOCAB_SQL) is the one
     exception to the registry: it travels ONLY as the typed `df` op (recorded here as the
-    statement it stands for) and must never appear as a `read`. Mutation: route the IDF
+    statement it stands for) and must never appear as a `read`; the chain walk is the other
+    (typed `chain`, recorded at method level). Mutation: route the IDF
     statement via `read` -> ("read", VOCAB_SQL) is seen -> red."""
     make_store(home)
     set_config(home, flag=True)
@@ -855,10 +875,15 @@ def test_c1_statement_set_every_sent_statement_is_in_the_registry(owner_kind, ho
         run = run_main(mod)
     assert run.exc == "SystemExit(0)"
     sent = {s for _, s, _ in seen}
-    assert sent - {VOCAB_SQL} <= registry, sorted(sent - {VOCAB_SQL} - registry)
+    typed = {VOCAB_SQL, CHAIN_OP}
+    assert sent - typed <= registry, sorted(sent - typed - registry)
     assert ("df", VOCAB_SQL) in {(m, s) for m, s, _ in seen}
     assert ("read", VOCAB_SQL) not in {(m, s) for m, s, _ in seen}
-    assert {mod._QUERY, mod._PREVENTION_QUERY, COUNT_SQL, VOCAB_SQL} <= sent
+    # #3740: the chain walk is the typed `chain` op, recorded at method level; none of the
+    # walk's per-hop statements is sent as a `read` any more
+    assert ("chain", CHAIN_OP) in {(m, s) for m, s, _ in seen}
+    assert not {s for m, s, _ in seen if m == "read"} & sql_set_of(CHAIN_SITES)
+    assert {mod._QUERY, mod._PREVENTION_QUERY, COUNT_SQL, VOCAB_SQL, CHAIN_OP} <= sent
 
 
 # =========================================================================================
@@ -1299,7 +1324,7 @@ def test_c4_a_slow_owner_cannot_stretch_the_fire_past_its_budget(home, monkeypat
     # healthy request count for reference
     with FakeOwner(home) as ref_owner:
         run_main(mod)
-    healthy = len([q for q in ref_owner.requests if q["method"] == "read"])
+    healthy = len(ref_owner.requests)
     reset_state(home)
     original = FakeOwner._answer
 
@@ -1324,7 +1349,7 @@ def test_c4_a_slow_owner_cannot_stretch_the_fire_past_its_budget(home, monkeypat
         run = run_main(mod)
         elapsed = time.monotonic() - start
         time.sleep(0.4)  # let delayed handler threads finish while the store still exists
-    reads = len([q for q in owner.requests if q["method"] == "read"])
+    reads = len(owner.requests)
     assert elapsed < 0.6 + 1.0, elapsed
     assert "budget_exhausted" in kinds, kinds
     assert reads < healthy, (reads, healthy)
@@ -1405,7 +1430,7 @@ def test_c5_flattened_deployed_layout_finds_the_flag_helper_and_the_client(home,
     ctx = json.loads(out["stdout"])["hookSpecificOutput"]["additionalContext"]
     assert "Nudge for tripwire one" in ctx and COULD_NOT not in ctx, ctx
     sqls = {statement_of(q["method"], q.get("params"))[0] for q in owner.requests} - {None}
-    assert VOCAB_SQL in sqls and COUNT_SQL in sqls and len(sqls) >= 6
+    assert VOCAB_SQL in sqls and COUNT_SQL in sqls and CHAIN_OP in sqls and len(sqls) >= 5
 
 
 @pytest.mark.parametrize("other", ["stop_reads_via_owner", "user_identity_reads_via_owner"])
@@ -1633,3 +1658,286 @@ def test_tb_a_late_failure_at_the_last_site_keeps_the_total_inside_the_budget(ho
         monkeypatch.setattr(ec, "read", failing_read("unavailable", site_sql(mod)["check_in_turn_recall"], home))
         run = run_main(mod)
     assert COULD_NOT in run.ctx and len(run.ctx) <= 2300, len(run.ctx)
+
+
+# =========================================================================================
+# #3740 Cut A -- the generalization chain walk is ONE typed `chain` owner op per hit
+# =========================================================================================
+
+def _by_method(seen_m) -> dict:
+    out: dict = {}
+    for m, _s, _a in seen_m:
+        out[m] = out.get(m, 0) + 1
+    return out
+
+
+@pytest.mark.parametrize("owner_kind", OWNER_KINDS)
+def test_chain_a_fire_with_two_hits_sends_exactly_two_chain_requests_and_no_per_hop_statement(
+        owner_kind, home, monkeypatch):
+    """Flag ON, the existing fixture: two hits (ls_0001 under cs_0001, and ls_0002, a head with
+    no parent). The hook sends exactly TWO `chain` requests (one per hit, default depth) and NONE
+    of the walk's per-hop statements: not `SELECT id, type`, not `SELECT is_current`, not `SELECT
+    source_id ... generalizes`, not the batched recall_summary / claim reads. The whole fire is
+    6 owner requests (3 reads: tripwire load, prevention load, the in-turn recall's ONE COUNT(*)
+    since Cut B; 2 chain; 1 df), down from 19 (18 read + 1 df) on dev. Mutation M_HOOK_STILL_PER_HOP (the hook
+    keeps walking hop by hop through the shim) -> no `chain` request, per-hop statements
+    present, 19 requests -> red."""
+    make_store(home)
+    set_config(home, flag=True)
+    mod = load_hook(home, monkeypatch)
+    with owner_of(owner_kind, home):
+        seen_m = spying_read(monkeypatch, with_method=True)
+        run = run_main(mod)
+    assert run.exc == "SystemExit(0)" and "[triggered principles]" in run.ctx
+    chains = [a for m, _s, a in seen_m if m == "chain"]
+    assert len(chains) == 2, chains
+    assert {a[0] for a in chains} == {"ls_0001", "ls_0002"} and {a[1] for a in chains} == {4}
+    per_hop = sql_set_of(CHAIN_SITES)
+    assert per_hop, "the per-hop statement set must be non-empty or this cell is vacuous"
+    sent_sql = {s for m, s, _a in seen_m if m == "read"}
+    assert not sent_sql & per_hop, sorted(sent_sql & per_hop)
+    for needle in ("SELECT id, type FROM nodes WHERE id = ?", "SELECT is_current FROM nodes WHERE id = ?",
+                   "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'generalizes'",
+                   "SELECT id, recall_summary FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
+                   "SELECT id, claim FROM nodes WHERE id IN (SELECT value FROM json_each(?))"):
+        assert needle in per_hop, needle  # the list above really is the old per-hop set
+        assert needle not in sent_sql
+    assert _by_method(seen_m) == {"read": 3, "chain": 2, "df": 1}, _by_method(seen_m)
+    assert len(seen_m) == 6 <= 9
+
+
+def test_chain_the_hook_asks_the_shim_and_never_calls_the_core_function_with_the_flag_on(home, monkeypatch):
+    """With the flag ON the hook calls `conn.generalization_chain(node_id)` on the owner shim;
+    `engram_core.generalization_chain(conn, ...)` (the hook-side function object) is never
+    called. Flag OFF it is called, with a plain sqlite connection and the shim never exists.
+    Mutation: ignore the shim method (always call the core function) -> the flag-ON cell
+    sees the core function called with the shim -> red on the ON side."""
+    make_store(home)
+    mod = load_hook(home, monkeypatch)
+    calls = []
+    real = engram_core.generalization_chain
+
+    def spy(conn, node_id, max_depth=4):
+        calls.append((type(conn).__name__, node_id, max_depth))
+        return real(conn, node_id, max_depth)
+
+    mod._GENERALIZATION_CHAIN_IMPORT_ATTEMPTED = True
+    mod._GENERALIZATION_CHAIN_FN = spy
+    set_config(home, flag=False)
+    off = run_main(mod)
+    assert [c[1] for c in calls] == ["ls_0001", "ls_0002"]
+    assert {c[0] for c in calls} == {"Connection"} and "[triggered principles]" in off.ctx
+    calls.clear()
+    reset_state(home)
+    set_config(home, flag=True)
+    with FakeOwner(home):
+        on = run_main(mod)
+    assert calls == [], calls
+    assert "[triggered principles]" in on.ctx
+    assert on.stdout == off.stdout
+
+
+@pytest.mark.parametrize("owner_kind", OWNER_KINDS)
+def test_chain_an_owner_refusal_of_the_chain_op_is_loud_never_a_deny_never_an_empty_chain(
+        owner_kind, home, monkeypatch):
+    """The owner refuses the chain op by NAME (chain_result_too_large, the bound lowered so the
+    first hit's chain exceeds it): the failure takes the SAME path as any other owner failure --
+    one loud notice naming the site and the reason, no deny, no store open, no
+    `[triggered principles]` section posing as 'no chain', and the other sites still ran.
+    Mutation M_SWALLOW (the hook turns an owner chain failure into an empty chain) -> no notice
+    -> red."""
+    make_store(home)
+    set_config(home, flag=True)
+    monkeypatch.setattr(eo, "CHAIN_RESULT_MAX_BYTES", 300)
+    import _fake_owner
+    monkeypatch.setattr(_fake_owner, "CHAIN_RESULT_MAX_BYTES", 300)
+    mod = load_hook(home, monkeypatch)
+    with owner_of(owner_kind, home):
+        seen_m = spying_read(monkeypatch, with_method=True)
+        opens = Opens().install(monkeypatch, mod)
+        run = run_main(mod)
+    _assert_no_deny_no_open(run, opens)
+    ctx = run.ctx
+    assert_loud_notice(ctx, "render_triggered_principles")
+    assert "chain_result_too_large" in ctx
+    assert "[triggered principles]" not in ctx
+    assert "Nudge for tripwire one" in ctx, "the tripwire nudge block must not be suppressed"
+    assert ctx.count(COULD_NOT) == 1, ctx
+    assert any(m == "chain" for m, _s, _a in seen_m)
+    assert len([ln for ln in run.stderr.splitlines() if "owner read failed" in ln]) == 1, run.stderr
+
+
+# =========================================================================================
+# #3740 Cut A round 2 -- R1: with the owner shim, the hook does not import engram_core
+# =========================================================================================
+
+def _recording_import(mod):
+    """Replace the hook's lazy engram_core accessor with a recorder that reports engram_core
+    as UNIMPORTABLE (None, the accessor's own failure answer). Returns the call list."""
+    calls = []
+
+    def unimportable():
+        calls.append(1)
+        return None
+
+    mod._import_generalization_chain = unimportable
+    return calls
+
+
+@pytest.mark.parametrize("owner_kind", OWNER_KINDS)
+def test_r1_a_flag_on_the_principles_block_is_served_by_the_owner_when_engram_core_is_unimportable_in_the_hook(
+        owner_kind, home, monkeypatch):
+    """Flag ON: the shim's `generalization_chain` serves the walk through the owner, so the
+    hook's own engram_core import is dead weight and its failure must not drop the block.
+    The accessor reports engram_core unimportable; the `[triggered principles]` block is
+    still delivered, with no owner-failure notice, and the accessor is never even called.
+    Mutation M_IMPORT_FIRST (the hook imports first and returns "" on None) -> the block is
+    missing and the accessor was called -> red."""
+    make_store(home)
+    set_config(home, flag=True)
+    mod = load_hook(home, monkeypatch)
+    calls = _recording_import(mod)
+    with owner_of(owner_kind, home):
+        run = run_main(mod)
+    assert run.exc == "SystemExit(0)", run.exc
+    assert "[triggered principles]" in run.ctx and "Principle head" in run.ctx, run.ctx
+    assert COULD_NOT not in run.ctx, run.ctx
+    assert calls == [], "the hook imported engram_core although the owner shim serves the chain"
+
+
+def test_r1_b_flag_off_and_engram_core_unimportable_is_the_empty_block_exactly_as_before(home, monkeypatch):
+    """Flag OFF (a plain sqlite connection, no shim method): behaviour is unchanged -- an
+    unimportable engram_core yields no `[triggered principles]` block, and the accessor IS
+    consulted. Control for the cell above: the same recorder, the other connection kind.
+    Mutation M_NEVER_IMPORT (skip the import on the direct path too) -> the accessor is not
+    called -> red."""
+    make_store(home)
+    set_config(home, flag=False)
+    mod = load_hook(home, monkeypatch)
+    calls = _recording_import(mod)
+    run = run_main(mod)
+    assert run.exc == "SystemExit(0)", run.exc
+    assert "[triggered principles]" not in run.ctx, run.ctx
+    assert "Nudge for tripwire one" in run.ctx
+    assert calls, "the direct path must still ask for engram_core"
+    # with it importable the same fire does render the block (the cell is not vacuous)
+    reset_state(home)
+    mod2 = load_hook(home, monkeypatch)
+    assert "[triggered principles]" in run_main(mod2).ctx
+
+
+def test_r1_c_a_flag_on_process_does_not_import_engram_core_and_a_flag_off_process_does(home, tmp_path):
+    """A REAL process each: after a flag-ON fire `engram_core` is not in sys.modules (nothing
+    else in the hook's import closure imports it) while the block was delivered; the flag-OFF
+    fire of the same store does import it (so the check can fail). Mutation M_IMPORT_FIRST ->
+    the ON process has engram_core loaded -> red."""
+    make_store(home)
+    set_config(home, flag=True)
+    with FakeOwner(home):
+        r, on = run_subprocess(_HOOK_PATH, home, tmp_path, forbid_opens=True)
+    assert on["rc"] == 0, (on, r.stderr)
+    assert "[triggered principles]" in json.loads(on["stdout"])["hookSpecificOutput"]["additionalContext"]
+    assert on["core_imported"] is False, "the flag-ON hook process imported engram_core"
+    set_config(home, flag=None)
+    r2, off = run_subprocess(_HOOK_PATH, home, tmp_path, forbid_opens=False)
+    assert off["rc"] == 0 and off["core_imported"] is True, (off, r2.stderr)
+
+
+# =========================================================================================
+# #3740 Cut A round 2 -- R3: other owner failures at the chain call are loud too
+# =========================================================================================
+
+def _chain_failure_is_loud(run, opens, owner_requests):
+    _assert_no_deny_no_open(run, opens)
+    ctx = run.ctx
+    assert_loud_notice(ctx, "render_triggered_principles")
+    assert "[triggered principles]" not in ctx, "a failed chain must not read as 'no chain'"
+    assert "Nudge for tripwire one" in ctx, "the tripwire nudge block must not be suppressed"
+    assert ctx.count(COULD_NOT) == 1, ctx
+    assert len([ln for ln in run.stderr.splitlines() if "owner read failed" in ln]) == 1, run.stderr
+    other = {statement_of(q["method"], q.get("params"))[0] for q in owner_requests} - {None, CHAIN_OP}
+    assert other, "the other sites still ran"
+
+
+def test_r3_a_new_hook_against_an_older_owner_unknown_operation_is_loud(home, monkeypatch):
+    """The owner does not know method `chain` (an older owner): it answers `unknown_operation`.
+    The hook takes the loud owner-failure path (naming the reason), never a deny, never an
+    empty chain. Expected green on the round-1 code. Mutation M_SWALLOW (an owner failure at
+    the chain call becomes an empty chain) -> no notice -> red."""
+    make_store(home)
+    set_config(home, flag=True)
+    mod = load_hook(home, monkeypatch)
+    original = FakeOwner._answer
+
+    def older_owner(self, request):
+        if request.get("method") == "chain":
+            return {"status": "rejected", "reason": "unknown_operation",
+                    "detail": "unknown method 'chain'", "remedy": "upgrade the owner"}
+        return original(self, request)
+
+    monkeypatch.setattr(FakeOwner, "_answer", older_owner)
+    with FakeOwner(home) as owner:
+        seen_m = spying_read(monkeypatch, with_method=True)
+        opens = Opens().install(monkeypatch, mod)
+        run = run_main(mod)
+    assert any(m == "chain" for m, _s, _a in seen_m), "the chain request was never sent"
+    _chain_failure_is_loud(run, opens, owner.requests)
+    assert "unknown_operation" in run.ctx
+
+
+def test_r3_b_unavailable_at_the_chain_call_is_loud(home, monkeypatch):
+    """The owner is unreachable exactly at the chain call (other reads served). Loud notice with
+    the steps, no deny, no empty chain. Expected green on the round-1 code. Mutation M_SWALLOW
+    -> no notice -> red."""
+    make_store(home)
+    set_config(home, flag=True)
+    mod = load_hook(home, monkeypatch)
+    with FakeOwner(home) as owner:
+        monkeypatch.setattr(ec, "read", failing_read("unavailable", {CHAIN_OP}, home))
+        opens = Opens().install(monkeypatch, mod)
+        run = run_main(mod)
+    _chain_failure_is_loud(run, opens, owner.requests)
+    assert AGENT_STEP in run.ctx and HUMAN_STEP in run.ctx
+    assert not any(q["method"] == "chain" for q in owner.requests)
+
+
+def test_r3_c_budget_exhausted_at_the_chain_call_is_loud(home, monkeypatch):
+    """The fire's time budget runs out exactly at the chain call: the clock the shim reads
+    jumps past the budget right after the request that precedes the first chain request. The
+    shim sends nothing for the chain and the hook takes the loud owner-failure path (no deny,
+    no empty chain). Expected green on the round-1 code. Mutation M_SWALLOW -> red."""
+    make_store(home)
+    set_config(home, flag=True)
+    mod = load_hook(home, monkeypatch)
+    with FakeOwner(home):
+        probe = spying_read(monkeypatch, with_method=True)
+        run_main(mod)
+    methods = [m for m, _s, _a in probe]
+    assert "chain" in methods
+    before_chain = methods.index("chain")  # owner requests served before the first chain request
+    assert before_chain >= 1
+    monkeypatch.undo()
+    reset_state(home)
+    mod = load_hook(home, monkeypatch)
+    offset = [0.0]
+    real_clock = time.monotonic
+    monkeypatch.setattr(ec, "_monotonic", lambda: real_clock() + offset[0])
+    real_read = ec.read
+    served = []
+
+    def read_then_jump(method, params, **k):
+        out = real_read(method, params, **k)
+        served.append(method)
+        if len(served) == before_chain:
+            offset[0] = 1e6  # the budget is gone before the next shim call
+        return out
+
+    monkeypatch.setattr(ec, "read", read_then_jump)
+    with FakeOwner(home):
+        opens = Opens().install(monkeypatch, mod)
+        run = run_main(mod)
+    assert "chain" not in served, served
+    _assert_no_deny_no_open(run, opens)
+    assert_loud_notice(run.ctx, "render_triggered_principles")
+    assert "[triggered principles]" not in run.ctx
+    assert "budget" in run.ctx.lower(), run.ctx

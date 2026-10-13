@@ -777,6 +777,10 @@ and revision 2 named none of them.
 Row-level / per-caller result scoping remains out of scope, and is a *different* limitation from the
 one above — revision 1 conflated the two.
 
+### 3.6 Typed-op input bounds
+
+**Typed-op input bounds.** An owner op may **clamp** an out-of-range input only when it is an upper bound on magnitude **and the reply already reports what the clamp cut off**: the chain op's `max_depth` above `CHAIN_MAX_DEPTH_CAP` qualifies, because any cut it causes comes back as `truncated: true`. Every other out-of-range input is **refused by name**, before any statement: a wrong type, a negative value, an unknown enum member, a duplicate, and **any over-limit list**, because clamping a list silently drops an item the caller asked for and nothing in the reply says so. A new op that wants to clamp names the reply field that reports the cut; if it can't, it refuses.
+
 ---
 
 ## 4. The attacks — four named by #3097, plus a fifth

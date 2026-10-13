@@ -1196,6 +1196,43 @@ class OwnerReadConnection:
             raise OwnerReadError("rejected", result)
         raise OwnerReadError("unusable_answer")
 
+    def generalization_chain(self, node_id, max_depth=4):
+        """The generalization chain of `node_id` as ONE owner round trip (#3740 Cut A):
+        sends the typed `chain` method, whose owner runs `engram_core.generalization_chain`
+        itself, and returns that function's dict (JSON-decoded). The same budget, timeout and
+        `.calls` accounting as `execute`: closed -> RuntimeError, budget exhausted ->
+        OwnerReadError("budget_exhausted") (nothing sent, nothing counted), otherwise one
+        counted round trip. A non-dict answer is OwnerReadError("unusable_answer");
+        Unavailable / Rejected / a client crash map exactly as in `execute`. Deliberately
+        thin: nothing is validated here (an over-length node id is sent and the owner refuses
+        it by name), and `max_depth`'s default is a literal copy of the owner's
+        CHAIN_MAX_DEPTH_CAP and of the function's own default (a cell pins both)."""
+        if self._closed:
+            raise RuntimeError("closed")
+        remaining = self._total - (_monotonic() - self._start)
+        if remaining <= 0:
+            raise OwnerReadError("budget_exhausted")
+        timeout = min(self._per_call or self._total, remaining)
+        self.calls += 1
+        try:
+            result = read(
+                "chain",
+                {"node_id": node_id, "max_depth": max_depth},
+                timeout=timeout,
+                socket_path=self._socket_path,
+            )
+        except (Exception, SystemExit) as exc:
+            raise OwnerReadError("client_failure") from exc
+        if isinstance(result, Ok):
+            if not isinstance(result.result, dict):
+                raise OwnerReadError("unusable_answer")
+            return result.result
+        if isinstance(result, Unavailable):
+            raise OwnerReadError("unavailable", result)
+        if isinstance(result, Rejected):
+            raise OwnerReadError("rejected", result)
+        raise OwnerReadError("unusable_answer")
+
     def close(self):
         self._closed = True
 

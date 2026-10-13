@@ -457,6 +457,24 @@ _TYPED_STATEMENTS = frozenset({DF_SQL, DF_VOCAB_DDL_SQL})
 # for any result the owner will actually send.
 MAX_READ_RESPONSE_BYTES = 8 * 1024 * 1024
 
+# #3740 Cut A: the typed `chain` method (design seat ruling, issue comment
+# 6133024506). It runs `engram_core.generalization_chain` ITSELF on the
+# client-read connection (no second implementation of the walk) and returns its
+# dict. CHAIN_NODE_ID_MAX_BYTES caps the start id in UTF-8 BYTES: real node ids
+# are a short prefix and a counter (a dozen bytes or so), and 256 is the same chosen
+# ceiling as DF_TERM_MAX_BYTES. CHAIN_MAX_DEPTH_CAP is the CLAMP ceiling for
+# `max_depth` and equals the default of generalization_chain's signature (a cell
+# pins the equality through `inspect`): the hook never asks for more, and a
+# larger request is served at the cap, not refused. CHAIN_RESULT_MAX_BYTES is the
+# bound `read` applies to its serialised reply, reused rather than invented
+# twice: `claim` is unbounded by design, so an oversized chain is refused by
+# NAME (`chain_result_too_large`), never truncated. Read at CALL time, so a test
+# can monkeypatch it. The cap is enforced AFTER the reply is built: peak memory for one
+# request is bounded by the store's size (the walk reads `claim` unbounded), not by this cap.
+CHAIN_NODE_ID_MAX_BYTES = 256
+CHAIN_MAX_DEPTH_CAP = 4
+CHAIN_RESULT_MAX_BYTES = MAX_READ_RESPONSE_BYTES
+
 # How often the LISTENING socket's accept() wakes up to check the shutdown
 # flag. Short enough that .stop() returns quickly in tests (this process's
 # accept loop has nothing else to do between wakeups, unlike
@@ -1067,6 +1085,63 @@ def _df_param_refusal(params) -> "dict | None":
     return None
 
 
+def _chain_param_refusal(params) -> "dict | None":
+    """Validate a `chain` request; None = valid, else the wire rejection. EACH
+    violation has its own named reason. Check order (the first violated wins):
+    shape, node_id type, node_id empty, node_id too long (UTF-8 BYTES, counted
+    with surrogatepass so a lone surrogate is measured rather than raising),
+    node_id not encodable (a lone surrogate cannot be bound as a SQL parameter),
+    max_depth type (bool is not an int), max_depth negative. A `max_depth` above
+    CHAIN_MAX_DEPTH_CAP is NOT a violation: it is clamped by the handler.
+    Touches no connection; the node id is never echoed into a detail."""
+    if not isinstance(params, dict) or set(params) != {"node_id", "max_depth"}:
+        return _df_rejection(
+            "chain_params_shape",
+            "chain params must be a dict with exactly the keys 'node_id' and 'max_depth'",
+            "send {'node_id': <str>, 'max_depth': <int>} and no other key",
+        )
+    node_id, max_depth = params["node_id"], params["max_depth"]
+    if not isinstance(node_id, str):
+        return _df_rejection(
+            "chain_node_id_not_str", f"'node_id' must be a string, got {type(node_id).__name__}", "send 'node_id' as a string"
+        )
+    if node_id == "":
+        return _df_rejection("chain_node_id_empty", "'node_id' is the empty string", "send a node id")
+    if len(node_id.encode("utf-8", "surrogatepass")) > CHAIN_NODE_ID_MAX_BYTES:
+        return _df_rejection(
+            "chain_node_id_too_long",
+            f"'node_id' exceeds {CHAIN_NODE_ID_MAX_BYTES} UTF-8 bytes",
+            f"node ids are capped at {CHAIN_NODE_ID_MAX_BYTES} bytes; send the real id",
+        )
+    try:
+        node_id.encode("utf-8")
+    except UnicodeEncodeError:
+        return _df_rejection(
+            "chain_node_id_not_utf8",
+            "'node_id' contains a lone surrogate, which cannot be encoded as UTF-8",
+            "send a node id that is valid text",
+        )
+    if isinstance(max_depth, bool) or not isinstance(max_depth, int):
+        return _df_rejection(
+            "chain_max_depth_not_int", f"'max_depth' must be an integer, got {type(max_depth).__name__}", "send 'max_depth' as an int"
+        )
+    if max_depth < 0:
+        return _df_rejection("chain_max_depth_negative", "'max_depth' is negative", "send 0 or a positive depth")
+    return None
+
+
+def _engram_core():
+    """Import `engram_core` LAZILY, on the first `chain` request. It is large, and the
+    owner's startup must not pay for it. Measured: importing it opens no database, creates
+    no file and starts no thread (its one process-level effect is
+    `os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "1")`); cells pin the first two. It resolves
+    from this module's own directory, where the plugin build puts it beside this file.
+    ImportError propagates to `_handle_chain`, which names it."""
+    import engram_core
+
+    return engram_core
+
+
 class _ClientReadGate:
     """Holds ONLY the client-read connection. Any future client-facing
     read operation (U4c's read-template registry, U4d's real client
@@ -1132,6 +1207,43 @@ class _ClientReadGate:
         if sql not in _TYPED_STATEMENTS:
             raise ValueError(f"execute_typed: not a typed statement: {sql[:60]}")
         return self._execute_admitted(sql, params, deadline=deadline)
+
+    def run_chain(self, node_id: str, max_depth: int, *, deadline: float) -> dict:
+        """Entry point for the typed `chain` method (#3740): run
+        `engram_core.generalization_chain(<this connection>, node_id, max_depth)` with the
+        request deadline armed, and return its dict. It is NOT `execute_typed` and does NOT
+        touch `_TYPED_STATEMENTS`: the walk's statements are fixed code inside engram_core,
+        not text from the client, so there is no statement string for the gate to vet, and
+        the set stays exactly `df`'s two. What still holds: this gate has only the
+        client-read connection (routing), the permanent authorizer floor applies to every
+        statement the walk prepares (a denied one surfaces as a SQLite error), and the
+        progress handler stops the walk at `deadline`, exactly as `_execute_admitted` does.
+        The caller has already validated and clamped `node_id` / `max_depth`. SQLite errors
+        and ImportError propagate to the caller's mapping.
+
+        Why one deadline covers the whole walk: the progress handler's VM-step counter
+        accumulates across the walk's ~9 REUSED cached statements (the connection's statement
+        cache keeps them across the walk's hops), so the handler fires on the walk's total work,
+        not once per statement. A future change that builds per-call SQL text in engram_core
+        (new text per hop, a cache miss each time) would weaken that, and the deadline with it;
+        re-measure before making such a change.
+
+        What the deadline does NOT reach: the final `cycle_detected` DFS inside
+        `generalization_chain` issues zero SQL, so the progress handler cannot fire in it, by
+        construction. Its cost is O(V+E) of the reached subgraph (about 40k dict operations at
+        20k fan-in, sub-millisecond). A future change that moves work into that DFS would void
+        the deadline guarantee silently; re-measure before making one.
+
+        `engram_core.generalization_chain` itself refuses a negative or non-int depth (ValueError);
+        the owner op's own named refusal (`chain_max_depth_negative` / `chain_max_depth_not_int`)
+        runs first, so that error is never reached from a client request."""
+        core = _engram_core()
+        _arm_read_deadline(self._conn, deadline)
+        try:
+            return core.generalization_chain(self._conn, node_id, max_depth)
+        finally:
+            # same slate-clearing as _execute_admitted: no stale deadline for the next call
+            self._conn.set_progress_handler(None, 0)
 
     def _execute_admitted(self, sql: str, params: tuple, *, deadline: float) -> list:
         """The deadline-armed execute path, reached only for a statement the
@@ -1483,6 +1595,7 @@ class EngramdOwner:
             "snapshot": lambda params, deadline: self._handle_snapshot(params, deadline),
             "read": lambda params, deadline: self._handle_read(params, deadline),
             "df": lambda params, deadline: self._handle_df(params, deadline),
+            "chain": lambda params, deadline: self._handle_chain(params, deadline),
         }
 
     # -- lifecycle ------------------------------------------------------
@@ -2610,6 +2723,81 @@ class EngramdOwner:
             return outcome
         reply, _counted = _render_read_rows(outcome)
         return reply
+
+    def _handle_chain(self, params: dict, deadline: float) -> dict:
+        """The typed `chain` method (#3740 Cut A): the generalization chain of one node as
+        ONE request, instead of a hop-by-hop walk of 12-14 round trips. Wire: params =
+        {"node_id": <str>, "max_depth": <int>} (exactly these keys; each violation has its
+        own named reason, see `_chain_param_refusal`); reply `ok` carries `result` = the dict
+        `engram_core.generalization_chain` returned, JSON round-tripped (keys are strings).
+        A `max_depth` above CHAIN_MAX_DEPTH_CAP is CLAMPED to it, not rejected.
+
+        This runs engram_core's OWN function on the client-read connection; it does not
+        re-implement the walk, so the owner and direct paths are equal by construction.
+        The client sends no SQL: `node_id` is bound as a parameter of statements fixed in
+        engram_core, and `_TYPED_STATEMENTS` is not widened (see `_ClientReadGate.run_chain`).
+
+        Order: (1) validate -- nothing is prepared on the store connection for a refused
+        request; (2) only then touch `self._client_read_gate`, the same client-read-only
+        route as `read` / `df` (never `_owner_conn` / `_owner_lock`), through the shared
+        lock / deadline / error tail; (3) bound the serialised reply by
+        CHAIN_RESULT_MAX_BYTES -- `claim` is unbounded by design, so an oversized chain is a
+        named `chain_result_too_large`, never a truncated chain. A store without the tables
+        the walk reads is a named `read_failed`, as for any SQLite error; an owner whose
+        runtime lacks engram_core answers `chain_runtime_unavailable`."""
+        refusal = _chain_param_refusal(params)
+        if refusal is not None:
+            return refusal
+        node_id = params["node_id"]
+        depth = min(params["max_depth"], CHAIN_MAX_DEPTH_CAP)
+        gate = self._client_read_gate
+        if gate is None:
+            return {
+                "status": "rejected",
+                "reason": "owner_stopping",
+                "detail": "the owner is shutting down; its read path is closed",
+                "remedy": "retry once the owner has restarted",
+            }
+
+        # Import engram_core HERE: after validation, before `_client_read_lock`. A cold import
+        # (tens of ms) must not hold the lock that `read` / `df` wait on, nor eat the walk's
+        # deadline; a failed import acquires nothing. `run_chain` calls the accessor again,
+        # which is then a `sys.modules` hit.
+        try:
+            _engram_core()
+        except ImportError as exc:
+            return self._chain_runtime_unavailable(exc)
+
+        def run(execution_deadline: float):
+            return gate.run_chain(node_id, depth, deadline=execution_deadline)
+
+        try:
+            failure, outcome = self._run_client_read(deadline, run)
+        except ImportError as exc:  # engram_core vanished between the import above and the walk
+            return self._chain_runtime_unavailable(exc)
+        if failure is not None:
+            return failure
+        # Serialise once: the bound is counted on, and the reply sent as, the SAME text.
+        result_text = json.dumps(outcome)
+        wire_text = '{"status": "ok", "result": ' + result_text + "}"
+        if len(wire_text) > CHAIN_RESULT_MAX_BYTES:
+            return {
+                "status": "rejected",
+                "reason": "chain_result_too_large",
+                "detail": f"the chain is {len(wire_text)} bytes serialised; the maximum is {CHAIN_RESULT_MAX_BYTES}; nothing was sent",
+                "remedy": "this is a property of the data (an unbounded `claim` on a head), not an outage -- do NOT restart the owner; the chain cannot be served through the owner",
+            }
+        return _RenderedReadOk(outcome, wire_text)
+
+    @staticmethod
+    def _chain_runtime_unavailable(exc: Exception) -> dict:
+        logging.getLogger("engramd_owner").warning("chain: engram_core could not be imported: %s", exc)
+        return {
+            "status": "rejected",
+            "reason": "chain_runtime_unavailable",
+            "detail": f"the owner could not import engram_core: {type(exc).__name__}",
+            "remedy": "the owner's runtime is incomplete (engram_core.py must sit beside engramd_owner.py); reinstall the plugin and restart the owner",
+        }
 
     def _read_failed(self, exc: Exception) -> dict:
         logging.getLogger("engramd_owner").warning(
