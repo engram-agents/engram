@@ -329,6 +329,8 @@ def test_c7_darwin_owner_mode_writes_nothing_and_calls_nothing(tmp_path):
     r = sb.run("--owner", engram_home=str(tmp_path / "seat-a"))
     assert r.returncode != 0, (r.stdout, r.stderr)
     assert "macOS" in (r.stdout + r.stderr)
+    assert "#3709" in (r.stdout + r.stderr)
+    assert "#3194" not in (r.stdout + r.stderr) and "permission layer" not in (r.stdout + r.stderr)
     assert not (sb.home / "Library").exists(), "a LaunchAgents plist (or its dir) was written"
     assert not sb.unit_dir.exists() or list(sb.unit_dir.iterdir()) == []
     assert not sb.launchlog.exists(), sb.launchlog.read_text() if sb.launchlog.exists() else ""
@@ -712,6 +714,19 @@ def test_darwin_with_a_flag_on_says_one_line_and_launches_nothing(tmp_path):
     assert r.returncode == 0 and seat.launched() == []
     lines = context_lines(r)
     assert len(lines) == 1 and "macOS" in lines[0]
+    assert "#3709" in lines[0]
+    assert "#3194" not in lines[0] and "permission layer" not in lines[0]
+    assert not seat.syslog.exists()
+
+
+def test_other_non_linux_os_with_a_flag_on_names_that_os_not_macos(tmp_path):
+    seat = Seat(tmp_path, os_name="FreeBSD")
+    seat.config(FLAG_ON)
+    seat.systemctl("nobus")
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    lines = context_lines(r)
+    assert len(lines) == 1 and "FreeBSD" in lines[0] and "macOS" not in lines[0], r.stdout
     assert not seat.syslog.exists()
 
 

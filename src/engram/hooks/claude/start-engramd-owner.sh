@@ -30,6 +30,7 @@
 #                                                        -> one line saying it could not be
 #                                                           started, naming the log
 #   * macOS                                              -> nothing launched, one line
+#   * any other non-Linux OS                             -> nothing launched, one line naming the OS
 #
 # Always exits 0 (never breaks a session start). stdout is at most ONE bounded
 # SessionStart additionalContext JSON object (the stdout audit requires JSON-or-nothing);
@@ -137,8 +138,13 @@ if [ -z "$IO_PY" ] || [ ! -f "$IO_PY" ]; then
     printf 'start-engramd-owner: _engramd_owner_hook_io.py not found; owner not launched\n' >&2
     exit 0
 fi
-if [ "$(uname -s 2>/dev/null)" != "Linux" ]; then
-    _report "ENGRAM owner not launched: macOS is not supported yet (permission layer, #3194); an owner flag is on. ENGRAM_HOME=$ENGRAM_HOME"
+_os="$(uname -s 2>/dev/null)"
+if [ "$_os" != "Linux" ]; then
+    if [ "$_os" = "Darwin" ]; then
+        _report "ENGRAM owner not launched: there is no macOS launcher for the owner yet (#3709); an owner flag is on. ENGRAM_HOME=$ENGRAM_HOME"
+    else
+        _report "ENGRAM owner not launched: ${_os:-this OS} is not supported (the owner launcher is Linux-only); an owner flag is on. ENGRAM_HOME=$ENGRAM_HOME"
+    fi
     exit 0
 fi
 

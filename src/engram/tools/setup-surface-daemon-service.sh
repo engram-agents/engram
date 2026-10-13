@@ -14,8 +14,8 @@
 # unit engramd-owner-<id>.service rendered from engramd-owner.service.template, where
 # <id> is the first 8 hex chars of sha256 over the NORMALIZED (absolute, physical,
 # no trailing slash) ENGRAM_HOME -- one unit per ENGRAM_HOME, not per user. Linux only:
-# on macOS it exits non-zero and writes/calls nothing (the owner refuses to start
-# there until the Darwin permission arm lands, #3194). The ephemeral-path refusal below
+# on macOS it exits non-zero and writes/calls nothing (there is no macOS launcher
+# for the owner yet, #3709). The ephemeral-path refusal below
 # applies to engramd_owner.py's physical path in this mode. Without --owner the
 # behaviour is exactly what it always was.
 #
@@ -74,7 +74,7 @@ fi
 if [[ "$OWNER_MODE" == "1" ]]; then
     _owner_os="$(uname -s)"
     if [[ "$_owner_os" == "Darwin" ]]; then
-        echo "ERROR: --owner is not supported on macOS yet: the engramd owner refuses to start there (permission layer, #3194); the launchd unit is a later unit. Nothing was written or loaded." >&2
+        echo "ERROR: --owner is not supported on macOS yet: there is no macOS (launchd) launcher for the owner yet (#3709). Nothing was written or loaded." >&2
         exit 1
     elif [[ "$_owner_os" != "Linux" ]]; then
         echo "ERROR: --owner supports Linux (systemd --user) only; this is $_owner_os. Nothing was written." >&2
