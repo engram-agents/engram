@@ -3248,6 +3248,11 @@ def _take_pre_migration_backup_if_pending(
     return backup_ok
 
 
+# #3766: the one statement that creates the created_at index. Used by migration rung 8 AND the
+# every-start self-heal in _run_db_one_time_setup, so the two cannot drift.
+_CREATED_AT_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_nodes_created_at ON nodes(created_at)"
+
+
 def _rung_ready(conn: sqlite3.Connection, target: int, backup_ok: bool) -> bool:
     """Whether migration rung `target` may run right now.
 
@@ -4034,17 +4039,17 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     current_user_version = conn.execute("PRAGMA user_version").fetchone()[0]
 
     # _PRE_MIGRATION_LATEST_VERSION tracks the highest rung's target version
-    # below (currently rung 7 -> PRAGMA user_version = 7). No single named
+    # below (currently rung 8 -> PRAGMA user_version = 8). No single named
     # constant exists elsewhere in this function for "the latest schema
     # version" — each rung below hardcodes its own target inline — so this
     # local mirrors that existing convention rather than inventing a new
     # module-level constant this PR would be the only user of. Bump this
-    # alongside adding any future rung 8. (Mechanically checked against the
+    # alongside adding any future rung 9. (Mechanically checked against the
     # rungs' own PRAGMA user_version = N literals by
     # test_2181_pre_migration_latest_version_constant_matches_max_rung_target
     # — forgetting the bump fails loudly at test time instead of silently
     # skipping the new rung's backup.)
-    _PRE_MIGRATION_LATEST_VERSION = 7
+    _PRE_MIGRATION_LATEST_VERSION = 8
 
     # See _take_pre_migration_backup_if_pending's docstring for the full
     # contract (what True/False mean, why the failure posture is inverted
@@ -4776,6 +4781,25 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                 file=sys.stderr,
             )
 
+    # Migration version 8 (#3766): an index on nodes(created_at), so the U9b
+    # session-checkpoint reads (`created_at >= ?`, COUNT and LIST) SEARCH the
+    # index instead of scanning every row. One CREATE INDEX IF NOT EXISTS, so a
+    # crash between it and the version bump re-runs harmlessly; on failure the
+    # version stays 7 and the rung retries on the next start.
+    if _rung_ready(conn, 8, _pre_migration_backup_ok):
+        try:
+            conn.execute(_CREATED_AT_INDEX_SQL)
+            conn.execute("PRAGMA user_version = 8")
+            conn.commit()
+        except sqlite3.DatabaseError as _migration8_err:
+            conn.rollback()
+            print(
+                "[_run_db_one_time_setup] migration 8 (#3766 nodes(created_at) "
+                "index) FAILED, will retry on next "
+                f"startup: {_migration8_err!r}",
+                file=sys.stderr,
+            )
+
     # Self-heal: at user_version >= 7 the guard must exist. Re-created every
     # startup (IF NOT EXISTS) so a trigger lost to a hand edit is restored.
     if conn.execute("PRAGMA user_version").fetchone()[0] >= 7:
@@ -4786,6 +4810,21 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
             print(
                 "[_run_db_one_time_setup] metadata JSON guard self-heal "
                 f"FAILED: {_mdg_err!r}",
+                file=sys.stderr,
+            )
+
+    # Self-heal (#3766): at user_version >= 8 the created_at index must exist.
+    # Re-created every startup (IF NOT EXISTS, a no-op when present) so an index
+    # lost to a hand edit is restored. Gated on the LIVE version >= 8, so it never
+    # papers over a failed rung 8 (the rung itself owns that retry).
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 8:
+        try:
+            conn.execute(_CREATED_AT_INDEX_SQL)
+            conn.commit()
+        except sqlite3.DatabaseError as _cai_err:
+            print(
+                "[_run_db_one_time_setup] created_at index self-heal "
+                f"FAILED: {_cai_err!r}",
                 file=sys.stderr,
             )
 

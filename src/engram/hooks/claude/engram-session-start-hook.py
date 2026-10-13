@@ -2305,9 +2305,13 @@ def session_checkpoint_block(engram_home: str, injected_through: str | None) -> 
 
     Placement (see main()): this function's call site sits BEFORE the
     #1819 ordering-invariant comment, in the same cheap tier as
-    focus_block(). Measured 2026-08-15: the underlying query is a FULL
-    TABLE SCAN — there is no index on created_at — and costs 1.2ms over
-    2957 nodes. Cheap today; at 30k+ nodes this will be the first thing
+    focus_block(). The 2026-08-15 measurement was taken before #3766, when
+    there was no index on created_at and the query was a FULL TABLE SCAN
+    costing 1.2ms over 2957 nodes; since migration rung 8 (#3766) both U9b
+    statements plan `SEARCH nodes USING INDEX idx_nodes_created_at`
+    (EXPLAIN QUERY PLAN, 2026-10-13, SQLite 3.45.1 here and 3.53.0 per the
+    design seat), and the index is re-ensured on every start at
+    user_version >= 8. Cheap today; at 30k+ nodes this will be the first thing
     someone wants to speed up, and by then this number will be stale —
     that is the whole reason this spec exists: an undated in-file
     measurement on this same hook (focus_block's SIZE figure) already went
