@@ -62,6 +62,8 @@ import platform
 import struct
 from pathlib import Path
 
+from engram_regular_io import open_regular_text
+
 # Clock skew / tick-rounding slack between the pidfile's mtime and the
 # process start time derived from /proc (btime has 1 s resolution, starttime
 # has 1/CLK_TCK). A process started more than this after the pidfile's last
@@ -318,16 +320,29 @@ def recorded_live_pid(pid_path, program_marker: str | None = None) -> int | None
     See the module docstring for the conservative-True bound when the start
     time is unreadable.
 
+    A pidfile path that is not a regular file (FIFO, socket, device,
+    directory) is "no live pid", answered without blocking (#3768).
+
     `program_marker` (a substring of the owning program's argv): a process
     that started after the pidfile counts as a REUSED pid only if its
     cmdline does not contain the marker (so clock drift cannot make a live
     instance read dead); unreadable cmdline -> True. None -> start-time-only.
     """
     try:
-        with open(pid_path) as f:
+        with open_regular_text(pid_path) as f:
             pid = int(f.read().strip())
         mtime = os.stat(pid_path).st_mtime
-    except (OSError, ValueError):
+    except OSError as exc:
+        if (
+            exc.errno in (errno.EINVAL, errno.EISDIR)
+            and "not a regular file" in str(exc)
+        ):
+            _log.warning(
+                "pidfile %s is not a regular file; treating as no live pid",
+                pid_path,
+            )
+        return None
+    except ValueError:
         return None
     if pid <= 0:
         # os.kill(0, 0) / os.kill(-1, 0) signal a process group / every
