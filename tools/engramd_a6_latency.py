@@ -31,10 +31,13 @@ not survive across SQLite builds (the doc shows this), so the build is named.
     python tools/engramd_a6_latency.py [--n 300] [--nodes 5000] [--people 5]
                                        [--warmup 30] [--store PATH]
 Exit 0 ok; 1 the two paths answered differently; 2 bad input (N below the 300 floor,
---store is the live store, or --exclusion without --hook tripwire); 3 (--hook tripwire
-only) a U8 contract violation (see u8_contract_violations). Exit 1 does NOT occur for
-`--hook tripwire`: the two paths answering differently is a differing stdout, which is itself
-a U8 violation, and exit 3 outranks exit 1.
+--store is the live store, or --exclusion without --hook tripwire); 3 (--hook tripwire or
+session-start only) a contract violation (see u8_contract_violations / ss_contract_violations);
+4 (--hook tripwire or session-start) a BLIND ARM: the run raised ArmBlind or LayoutViolation, so no
+number was produced (one stderr line names the exception).
+Exit 1 does NOT occur for tripwire or session-start: the two paths answering differently is a
+differing stdout, which is itself a violation, and exit 3 outranks exit 1. A blind arm is never
+exit 1; it is exit 4.
 
 `--hook tripwire` (U6b stage 2c-2, #3665; the U8 gate, #3710) measures ONE FULL FIRE of the
 lesson-tripwire hook's main() on a fixed payload -- all four of its store-read sites run --
@@ -42,17 +45,36 @@ baseline = the engramd.lesson_tripwire_reads_via_owner flag OFF (the hook opens 
 owner = flag ON with a REAL owner process. `--exclusion on` turns the in-context exclusion
 on (config flag + a live probe directory under the hook process's HOME). The result also
 carries the direct store opens counted per fire (the gate quantity is `opens_flag_on == 0`).
+
+`--hook session-start` (A6 arm for U9, #3735; this arm #3747) measures ONE FULL FIRE of the
+session-start hook as a FRESH PROCESS per fire (the harness runs it that way; the dominant cost is
+the interpreter, the imports and the calibration block's EngramClient), baseline = the
+engramd.session_start_reads_via_owner flag OFF, owner = flag ON with a REAL owner already up (WARM).
+The contract is the design seat's ruling on #3747, an ALLOW-LIST: on the flag-ON path EVERY recorded
+open of knowledge.db must carry a stack frame whose file BASENAME is exactly `engram_client.py` (the
+calibration block, which U9 deliberately does not migrate: #3741); any other open is a violation that
+names the opener's frames (not "no open from the six readers": a deny-list passes silently when a
+seventh opener appears). Calibration opens are counted and reported, never gated on their value.
+ONE constant, CALIBRATION_STILL_OPENS, drives both modes: True = allow-list {calibration} and the
+must-engage raise on; False (flip it when #3741 lands) = allow-list empty, raise off, `opens == 0`.
+If no open is attributed to the calibration path on either path the arm RAISES (ArmBlind, "exclusion
+never engaged") instead of passing; so it does when a reader is not reached on a path, or a WARM fire
+prints a `waited N ms` notice. The gate cell is the INSTALLED layout's sequential p50 owner/baseline
+<= 1.0 on the production build; the contended and cold-cache arms and the COLD row (owner launched in
+the same instant as the hook, --n-cold fires) are reported. Exit 3 on a contract violation.
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime
 import importlib.util
 import io
 import json
 import math
 import os
 import platform
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -60,6 +82,8 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
+import uuid
 from pathlib import Path
 from urllib.parse import unquote_to_bytes
 from typing import Callable, Dict, List, Optional
@@ -69,7 +93,8 @@ SRC_ENGRAM = REPO_ROOT / "src" / "engram"
 HOOK_PATH = SRC_ENGRAM / "hooks" / "claude" / "engram-user-identity-hook.py"
 STOP_HOOK_PATH = SRC_ENGRAM / "hooks" / "claude" / "engram-stop-hook.py"
 TRIPWIRE_HOOK_PATH = SRC_ENGRAM / "hooks" / "claude" / "engram-lesson-tripwire-hook.py"
-HOOKS = ("user-identity", "stop", "tripwire")  # --hook; the default stays user-identity
+SESSION_START_HOOK_PATH = SRC_ENGRAM / "hooks" / "claude" / "engram-session-start-hook.py"
+HOOKS = ("user-identity", "stop", "tripwire", "session-start")  # --hook; the default stays user-identity
 N_FLOOR = 300
 
 
@@ -105,6 +130,7 @@ LAYOUTS = ("source", "installed")
 # build-relative path -> source-relative path: the runtime files a measurement
 # loads. Byte-identical between the build and the tree is what makes the
 # installed cell a measurement of THIS tree.
+LAYOUT_NAME = "source"  # set by _apply_layout in a layout child; the session-start arm sets CLAUDE_PLUGIN_ROOT only for "installed"
 RUNTIME_FILES = {
     "engramd_owner.py": "src/engram/engramd_owner.py",
     "engramd_client.py": "src/engram/engramd_client.py",
@@ -132,6 +158,30 @@ RUNTIME_FILES = {
     "engram_search_rules.py": "src/engram/engram_search_rules.py",
     "tools/__init__.py": "src/engram/tools/__init__.py",
     "tools/recall_summary_validator.py": "src/engram/tools/recall_summary_validator.py",
+    # U9 / #3747: the session-start arm's fire (derived by running the sanity driver in a built layout, both
+    # flag states, and scanning what it loaded from the build; the closure cell keeps this list honest). The
+    # calibration block's EngramClient loads the server runtime, hence the many engram_*.py modules and server.py.
+    "hooks/engram-session-start-hook.py": "src/engram/hooks/claude/engram-session-start-hook.py",
+    "hooks/context_tracker.py": "src/engram/hooks/claude/context_tracker.py",
+    "engram_anchoring.py": "src/engram/engram_anchoring.py",
+    "engram_client.py": "src/engram/engram_client.py",
+    "engram_conformance.py": "src/engram/engram_conformance.py",
+    "engram_cornerstone.py": "src/engram/engram_cornerstone.py",
+    "engram_dag_conformance.py": "src/engram/engram_dag_conformance.py",
+    "engram_derive.py": "src/engram/engram_derive.py",
+    "engram_epistemic.py": "src/engram/engram_epistemic.py",
+    "engram_focus.py": "src/engram/engram_focus.py",
+    "engram_lifecycle.py": "src/engram/engram_lifecycle.py",
+    "engram_log_emitter.py": "src/engram/engram_log_emitter.py",
+    "engram_observation.py": "src/engram/engram_observation.py",
+    "engram_query.py": "src/engram/engram_query.py",
+    "engram_recall_summaries.py": "src/engram/engram_recall_summaries.py",
+    "engram_revision.py": "src/engram/engram_revision.py",
+    "engram_stats.py": "src/engram/engram_stats.py",
+    "engram_tasks.py": "src/engram/engram_tasks.py",
+    "engram_telemetry_store.py": "src/engram/engram_telemetry_store.py",
+    "engram_trust.py": "src/engram/engram_trust.py",
+    "server.py": "src/engram/server.py",
 }
 
 
@@ -145,7 +195,7 @@ class Layout:
     stage profiler, and a dataclass needs its module registered in sys.modules."""
 
     def __init__(self, name: str, root: Path, stop_hook: Path, user_hook: Path,
-                 tripwire_hook: Optional[Path] = None) -> None:
+                 tripwire_hook: Optional[Path] = None, session_start_hook: Optional[Path] = None) -> None:
         self.name = name
         self.root = Path(root)            # the directory holding engramd_owner.py / engramd_client.py
         self.stop_hook = Path(stop_hook)
@@ -153,23 +203,28 @@ class Layout:
         # the lesson-tripwire hook (#3665); beside the stop hook when not named
         self.tripwire_hook = (Path(tripwire_hook) if tripwire_hook is not None
                               else self.stop_hook.parent / "engram-lesson-tripwire-hook.py")
+        # the session-start hook (#3747); beside the stop hook when not named
+        self.session_start_hook = (Path(session_start_hook) if session_start_hook is not None
+                                   else self.stop_hook.parent / "engram-session-start-hook.py")
 
     def to_json(self) -> str:
         return json.dumps({"name": self.name, "root": str(self.root),
                            "stop_hook": str(self.stop_hook), "user_hook": str(self.user_hook),
-                           "tripwire_hook": str(self.tripwire_hook)})
+                           "tripwire_hook": str(self.tripwire_hook),
+                           "session_start_hook": str(self.session_start_hook)})
 
     @staticmethod
     def from_json(text: str) -> "Layout":
         d = json.loads(text)
         return Layout(name=d["name"], root=Path(d["root"]),
                       stop_hook=Path(d["stop_hook"]), user_hook=Path(d["user_hook"]),
-                      tripwire_hook=Path(d["tripwire_hook"]) if d.get("tripwire_hook") else None)
+                      tripwire_hook=Path(d["tripwire_hook"]) if d.get("tripwire_hook") else None,
+                      session_start_hook=Path(d["session_start_hook"]) if d.get("session_start_hook") else None)
 
 
 def source_layout() -> Layout:
     return Layout(name="source", root=SRC_ENGRAM, stop_hook=STOP_HOOK_PATH, user_hook=HOOK_PATH,
-                  tripwire_hook=TRIPWIRE_HOOK_PATH)
+                  tripwire_hook=TRIPWIRE_HOOK_PATH, session_start_hook=SESSION_START_HOOK_PATH)
 
 
 def build_installed_layout(out_dir: Path) -> Layout:
@@ -187,7 +242,8 @@ def build_installed_layout(out_dir: Path) -> Layout:
     layout = Layout(name="installed", root=out_dir,
                     stop_hook=out_dir / "hooks" / "engram-stop-hook.py",
                     user_hook=out_dir / "hooks" / "engram-user-identity-hook.py",
-                    tripwire_hook=out_dir / "hooks" / "engram-lesson-tripwire-hook.py")
+                    tripwire_hook=out_dir / "hooks" / "engram-lesson-tripwire-hook.py",
+                    session_start_hook=out_dir / "hooks" / "engram-session-start-hook.py")
     drift = layout_matches_tree(layout)
     if drift:
         raise LayoutViolation(f"the build differs from the tree under test: {drift}")
@@ -221,9 +277,11 @@ def _apply_layout(layout: Layout) -> None:
     """Point this module at `layout`. Only ever called in a FRESH process (the
     `--_layout-child` mode), before any runtime module is imported, so nothing
     from the other layout can already sit in sys.modules."""
-    global SRC_ENGRAM, STOP_HOOK_PATH, HOOK_PATH, TRIPWIRE_HOOK_PATH
+    global SRC_ENGRAM, STOP_HOOK_PATH, HOOK_PATH, TRIPWIRE_HOOK_PATH, SESSION_START_HOOK_PATH, LAYOUT_NAME
     SRC_ENGRAM, STOP_HOOK_PATH, HOOK_PATH = layout.root, layout.stop_hook, layout.user_hook
     TRIPWIRE_HOOK_PATH = layout.tripwire_hook
+    SESSION_START_HOOK_PATH = layout.session_start_hook
+    LAYOUT_NAME = layout.name
 
 
 def _count_parent_walks(layout: Layout) -> Dict[str, int]:
@@ -276,7 +334,15 @@ def measure_in_layout(layout: Layout, **kwargs) -> Dict:
          "--_kwargs", json.dumps({k: (str(v) if isinstance(v, Path) else v) for k, v in kwargs.items()})],
         capture_output=True, text=True, timeout=1800)
     if proc.returncode != 0:
-        raise RuntimeError(f"{layout.name}-layout run failed (rc {proc.returncode}): {proc.stderr[-1500:]}")
+        msg = f"{layout.name}-layout run failed (rc {proc.returncode}): {proc.stderr[-1500:]}"
+        # The child's last traceback line is `<ExcName>: <text>`; a blind arm / layout violation comes back
+        # TYPED (both are RuntimeErrors, so existing handlers still match) so main() can give it exit 4.
+        last = next((ln for ln in reversed(proc.stderr.strip().splitlines()) if ln.strip()), "")
+        m = re.match(r"(?:[\w.]+\.)?(ArmBlind|LayoutViolation)\b:?\s*(.*)", last)
+        if m:
+            raise (ArmBlind if m.group(1) == "ArmBlind" else LayoutViolation)(
+                f"{layout.name}-layout run failed (rc {proc.returncode}): {m.group(2)}")
+        raise RuntimeError(msg)
     result = json.loads(proc.stdout.strip().splitlines()[-1])
     result["layout"] = layout.name
     result["layout_root"] = str(layout.root)
@@ -694,8 +760,32 @@ def _audit_open_hook(event: str, args) -> None:
         for window in list(_ACTIVE_WINDOWS):
             if resolved == window["target"]:
                 window["record"].append(str(args[0]))
+                if window.get("stacks"):
+                    window["record"].details.append(_open_details(args[0]))
     except Exception:
         return
+
+
+def _open_details(arg) -> Dict:
+    """One recorded open with its Python stack, taken INSIDE the audit hook (the audit event fires inside the
+    connect call, so the frame two up from here is the code that made it). Each frame is `file:function:line`,
+    outermost first (the order traceback.extract_stack uses), file as the frame's full path. Never raises: a
+    failed walk records an empty stack, which attribute_opens reads as unattributed."""
+    try:
+        frames = traceback.StackSummary.extract(traceback.walk_stack(sys._getframe(2)), lookup_lines=False)
+        stack = [f"{f.filename}:{f.name}:{f.lineno}" for f in reversed(frames)]
+    except Exception:
+        stack = []
+    return {"arg": str(arg), "thread": threading.current_thread().name, "stack": stack}
+
+
+class _OpenRecord(list):
+    """The record of a `stacks=True` window: still a list of the opened strings (so `len(rec)` and
+    `rec == [...]` mean what they always meant); the stacks ride beside it in `.details`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.details: List[Dict] = []
 
 
 def _ensure_audit_hook() -> None:
@@ -707,16 +797,18 @@ def _ensure_audit_hook() -> None:
 
 
 @contextlib.contextmanager
-def _counting_store_opens(db: Path):
+def _counting_store_opens(db: Path, stacks: bool = False):
     """Count EVERY open of the store file `db` made by any route, in any thread, while this
     window is active: the `sqlite3.connect` audit event fires for sqlite3.connect,
     sqlite3.Connection(...), _sqlite3.connect, an early-bound `from sqlite3 import connect` and
     connect_regular_ro (which calls sqlite3.connect once inside), so each open is counted exactly
     once with no wrapping. The match is the realpath of the argument (see _store_path_of) against
     the realpath of the store copy: opens of other files (a pack DB, the probe) and `:memory:` are
-    ignored. Opens outside the window are not counted. Yields the record list."""
+    ignored. Opens outside the window are not counted. Yields the record list. With `stacks=True` the
+    yielded list is an _OpenRecord whose `.details` holds each open's thread and stack (#3747); without
+    it the record is the plain list it always was."""
     _ensure_audit_hook()
-    window = {"target": os.path.realpath(str(db)), "record": []}
+    window = {"target": os.path.realpath(str(db)), "record": _OpenRecord() if stacks else [], "stacks": stacks}
     _ACTIVE_WINDOWS.append(window)
     try:
         yield window["record"]
@@ -843,6 +935,522 @@ def _bind_tripwire(home: Path, exclusion: bool, hook_path: Path, cleanups: List[
         "opens_flag_on": opens["flag_on"], "opens_flag_off": opens["flag_off"]}
 
 
+# --- the session-start hook: one FRESH-PROCESS fire (U9 gate, #3747, part of #2652) -----------------
+#
+# The unit under gate is U9 (#3735): with `engramd.session_start_reads_via_owner` true in
+# $ENGRAM_HOME/config.json the hook's six store readers (the count(*) of _check_backup_staleness,
+# _check_embedding_restore_flag, focus_block, saved_focus_sets_block, session_checkpoint_block,
+# sleep_status_block) read through ONE OwnerReadConnection and never open knowledge.db. The calibration
+# block in main() (`EngramClient().call("engram_stats", ...)`) is NOT migrated (#3741): it still opens the
+# store on BOTH paths, and it is the hook's dominant cost because it loads the server runtime.
+#
+# THE CONTRACT (the design seat's ruling on #3747, Borges), shape (a), an ALLOW-LIST: on the flag-ON path
+# EVERY recorded open of knowledge.db must be attributed to the calibration path; any other open is a
+# violation and the violation names the opener's frames. The calibration path is identified by a stack
+# frame whose file BASENAME equals exactly `engram_client.py` -- not `engramd_client.py` (the owner shim,
+# which must never open the store) and not a substring match. Calibration opens are counted and reported,
+# never gated on their value. It is NOT "no open from the six readers": a deny-list passes silently when a
+# seventh opener appears anywhere in main() or its callees.
+#
+# ONE constant drives both modes (CALIBRATION_STILL_OPENS): True -> allow-list = {calibration path} and the
+# must-engage raise is on; False (someone flips it when #3741 lands) -> allow-list empty, must-engage off,
+# the cell becomes `opens == 0`. If NO open is attributed to the calibration path on either path the arm
+# RAISES (ArmBlind "exclusion never engaged"): zero means the attribution, the layout or the fixture is
+# blind (the #3739 lesson), which is a loud error, never a pass and never a violation-list entry.
+#
+# WARM (the owner is up before the fire) is the gate; COLD (owner launched in the same instant as the
+# hook) is a reported row, with the wait read from the hook's own notice line.
+#
+# Each timed fire is a FRESH interpreter (`python <hook>` fed a SessionStart JSON on stdin), because the
+# harness runs the hook that way and the dominant cost is import + EngramClient, which an in-process call
+# would hide. The fire's environment is a scratch HOME / TMPDIR / ENGRAM_HOME; nothing else from the seat
+# is passed on. One home serves both paths: the hook reads the flag from $ENGRAM_HOME/config.json, so the
+# config file is rewritten (untimed) before each timed fire.
+
+SS_FLAG_KEY = "session_start_reads_via_owner"
+SS_READERS = ("_check_backup_staleness", "_check_embedding_restore_flag", "focus_block",
+              "saved_focus_sets_block", "session_checkpoint_block", "sleep_status_block")
+CALIBRATION_STILL_OPENS = True            # flip to False when #3741 (the calibration migration) lands
+CALIBRATION_FRAME_BASENAME = "engram_client.py"   # exact basename equality, never a substring
+N_COLD = 30                               # cold-row fires (a reported row, not a gate): small on purpose
+SS_INJECTED_THROUGH = "2026-06-01T00:00:00+00:00"   # the pre-written marker's checkpoint boundary
+_WAIT_ANY_RE = re.compile(r"waited \d+ ms")
+_WAIT_SERVED_RE = re.compile(r"waited (\d+) ms, then served")
+
+
+class ArmBlind(RuntimeError):
+    """The arm cannot see what it claims to measure (an unreached reader, an exclusion that never engaged,
+    a warm fire that waited): a loud error, never a pass and never a violation-list entry."""
+
+
+def exclusion_must_engage() -> bool:
+    """True while the calibration path still opens the store (the must-engage raise is on)."""
+    return bool(CALIBRATION_STILL_OPENS)
+
+
+def _frame_basename(frame: str) -> str:
+    return os.path.basename(frame.rsplit(":", 2)[0])
+
+
+def _short_frame(frame: str) -> str:
+    path, func, line = frame.rsplit(":", 2) if frame.count(":") >= 2 else (frame, "?", "?")
+    return f"{os.path.basename(path)}:{func}:{line}"
+
+
+def _is_calibration_open(o: Dict) -> bool:
+    return any(_frame_basename(f) == CALIBRATION_FRAME_BASENAME for f in (o.get("stack") or []))
+
+
+def attribute_opens(opens: List[Dict], hook_file) -> Dict:
+    """The allow-list. `opens` are recorded opens ({"arg", "thread", "stack": ["file:function:line", ...]},
+    outermost frame first). An open is ALLOWED only while CALIBRATION_STILL_OPENS is true and its stack holds
+    a frame whose file basename is exactly CALIBRATION_FRAME_BASENAME; every other open is a violation naming
+    the innermost frame and every frame in the hook file as `file:function:line`. Pure."""
+    hook_base = os.path.basename(str(hook_file))
+    calibration, violations = [], []
+    for o in opens:
+        if CALIBRATION_STILL_OPENS and _is_calibration_open(o):
+            calibration.append(o)
+            continue
+        stack = list(o.get("stack") or [])
+        inner = _short_frame(stack[-1]) if stack else "<no stack>"
+        in_hook = [_short_frame(f) for f in stack if _frame_basename(f) == hook_base]
+        violations.append(
+            f"unattributed open of the store ({o.get('arg')}) in thread {o.get('thread')}: innermost frame "
+            f"{inner}; frames in {hook_base}: {', '.join(in_hook) or 'none'}")
+    return {"calibration": calibration, "violations": violations}
+
+
+def reader_of(stack_names) -> Optional[str]:
+    """The innermost SS_READERS function in `stack_names` ([(file, function), ...], innermost first)."""
+    for _file, func in stack_names:
+        if func in SS_READERS:
+            return func
+    return None
+
+
+def parse_owner_wait_ms(text: str) -> Optional[int]:
+    """The hook's own cold-start notice -- `waited N ms, then served` -- as N, or None when absent."""
+    m = _WAIT_SERVED_RE.search(text or "")
+    return int(m.group(1)) if m else None
+
+
+def assert_no_warm_wait(texts: List[str], where: str) -> None:
+    """A warm fire (owner up before it) never prints a `waited N ms` notice; if one did, the warm assumption
+    broke and every warm number is suspect. Raises ArmBlind."""
+    for t in texts:
+        m = _WAIT_ANY_RE.search(t or "")
+        if m:
+            raise ArmBlind(f"warm fire waited ({where}: {m.group(0)!r}): the owner was not up when the hook "
+                           "fired, so the warm assumption broke")
+
+
+def summarise_cold(rows: List[Dict]) -> Dict:
+    """The cold row from [{"wall_ms", "wait_ms" (None/0 = the owner won the race), "failed"?}]. Reported, never a gate."""
+    waits = sorted(r["wait_ms"] for r in rows if r.get("wait_ms"))
+    walls = sorted(r["wall_ms"] for r in rows)
+    return {"n": len(rows), "served_without_wait": len(rows) - len(waits),
+            "owner_failed": sum(1 for r in rows if r.get("failed")),
+            "wait_ms_p50": _pctl(waits, 0.50) if waits else None, "wait_ms_max": waits[-1] if waits else None,
+            "hook_p50_ms": _pctl(walls, 0.50) if walls else None, "hook_max_ms": walls[-1] if walls else None}
+
+
+# The output's non-determinism, found by diffing two fires of the SAME path (decision 6): the session id
+# (a uuid), the overflow file's `<UTC timestamp>-<pid>.md` name, and the scratch paths (ENGRAM_HOME, the
+# fire's HOME/TMPDIR). Each is a named span; nothing else is masked.
+_SS_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_SS_OVERFLOW_NAME_RE = re.compile(r"\d{8}T\d{6}Z-\d+\.md")
+
+
+def normalise_session_start_output(text: str, *scratch_paths) -> str:
+    """Mask exactly the spans that differ between two fires of one path; everything else (every content line,
+    the owner notice) is left as printed. `scratch_paths` are the literal scratch directories (their realpath
+    spellings too)."""
+    out = text
+    spellings = set()
+    for p in scratch_paths:
+        if p:
+            spellings.add(str(p))
+            spellings.add(os.path.realpath(str(p)))
+    for sp in sorted(spellings, key=len, reverse=True):
+        out = out.replace(sp, "<SCRATCH>")
+    out = _SS_UUID_RE.sub("<SESSION-ID>", out)
+    return _SS_OVERFLOW_NAME_RE.sub("<OVERFLOW>.md", out)
+
+
+def ss_contract_violations(result: Dict) -> List[str]:
+    """The gate on one `--hook session-start` result ([] = clear). Pure.
+
+      * stdout_match is not True    -- the flag-OFF and flag-ON fires printed different (normalised) text;
+      * open_violations             -- the allow-list's violations on the flag-ON path (each names the
+                                       opener's frames); a missing / non-list value fails CLOSED.
+    Calibration opens, the cold row and the timing ratio are reported, never violations."""
+    out: List[str] = []
+    if result.get("stdout_match") is not True:
+        out.append("stdout_match is not true: the flag-OFF and flag-ON fires printed different text "
+                   "(after normalising the named non-determinism)")
+    ov = result.get("open_violations")
+    if not isinstance(ov, list):
+        out.append(f"open_violations is missing or not a list ({ov!r}): the allow-list verdict is unknown")
+    else:
+        out.extend(str(v) for v in ov)
+    return out
+
+
+def _seed_session_start_fixture(home: Path) -> None:
+    """Add the session-start fixture to the store copy in `home` (synthetic or a real-store copy; ids are
+    `a6_*`) so each of the six readers EXECUTES its store read:
+      * an axiom (the server runtime the calibration block loads refuses a store with none);
+      * focused nodes (focus_block's `focused_at IS NOT NULL` query returns rows);
+      * a saved focus set that is not the active one (saved_focus_sets_block renders it);
+      * nodes created after SS_INJECTED_THROUGH (session_checkpoint_block's window);
+      * the embedding_restore_state singleton, clear (the schema creates it; ensured here for a copy), and an
+        embedding on every node (see below).
+    The backup count only runs while knowledge.sql is ABSENT, and sleep_status_block's only while
+    sessions/last-sleep-success.json is absent: this fixture simply never creates either file."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    rows = [
+        ("a6_ax_seed", "axiom", "a6 fixture seed axiom", "2026-01-01T00:00:00", None, None),
+        ("a6_focus_1", "observation", "a6 focused node one", "2026-01-02T00:00:00", now, "a6 shared focus reason"),
+        ("a6_focus_2", "observation", "a6 focused node two", "2026-01-02T00:00:01", now, "a6 shared focus reason"),
+        ("a6_ck_1", "observation", "a6 node created after the checkpoint boundary", "2026-09-01T00:00:00", None, None),
+        ("a6_ck_2", "derivation", "a6 second node after the boundary", "2026-09-01T00:00:01", None, None),
+    ]
+    conn = sqlite3.connect(str(home / "knowledge.db"))
+    try:
+        conn.executemany(
+            "INSERT OR IGNORE INTO nodes (id, type, claim, created_at, metadata, is_current, memory_status, "
+            "focused_at, focus_reason) VALUES (?, ?, ?, ?, '{}', 1, 'active', ?, ?)",
+            [(i, t, c, ca, fa, fr) for i, t, c, ca, fa, fr in rows])
+        conn.execute("INSERT OR IGNORE INTO focus_state (singleton_key, active_set_name) VALUES (1, NULL)")
+        conn.execute("INSERT OR IGNORE INTO focus_sets (name, node_ids, description, created_at) "
+                     "VALUES ('a6_set_one', ?, 'a6 saved set', '2026-08-01T00:00:00')", (json.dumps(["a6_focus_1"]),))
+        conn.execute("INSERT OR IGNORE INTO embedding_restore_state (singleton_key, not_fully_restored, null_count) "
+                     "VALUES (1, 0, 0)")
+        # Every node carries an embedding. The calibration block loads the server runtime, whose one-time DB
+        # setup finds nodes WITHOUT one, sets the store's embedding-restore flag (the next fire then prints a
+        # health line the previous fire caused) and starts a background `engram-embedding-restore-regen`
+        # thread that opens the store from a stack with no `engram_client.py` frame -- measured on the
+        # synthetic store; a production store has embeddings and starts neither.
+        conn.execute("UPDATE nodes SET embedding = '[0.0]' WHERE embedding IS NULL")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# The sanity driver: ONE untimed fire per path, run as a subprocess so it has the fire's real environment.
+# It installs the tool's own audit-hook counting (stacks on), wraps the owner shim's `execute` to record the
+# calling reader, runs the hook's main() on the same stdin, and writes everything to a JSON file.
+_SS_DRIVER = r'''
+import contextlib, importlib.abc, importlib.machinery, io, json, os, runpy, sys
+cfg = json.loads(sys.argv[1])
+sys.path.insert(0, cfg["tools_dir"])
+import engramd_a6_latency as a6
+sys.path.remove(cfg["tools_dir"])
+owner_calls = []
+
+def _wrap(module):
+    cls = getattr(module, "OwnerReadConnection", None)
+    if cls is None:
+        return
+    orig = cls.execute
+    def execute(self, sql, params=()):
+        names, f = [], sys._getframe(1)
+        while f is not None and len(names) < 16:
+            names.append((f.f_code.co_filename, f.f_code.co_name))
+            f = f.f_back
+        owner_calls.append(names)
+        return orig(self, sql, params)
+    cls.execute = execute
+
+class _Finder(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        if name != "engramd_client":
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(name, path)
+        if spec is None or spec.loader is None:
+            return None
+        loader, orig_exec = spec.loader, spec.loader.exec_module
+        def exec_module(module):
+            orig_exec(module)
+            _wrap(module)
+        loader.exec_module = exec_module
+        return spec
+
+sys.meta_path.insert(0, _Finder())
+g = runpy.run_path(cfg["hook"], run_name="ss_hook_under_test")
+live = g["main"].__globals__   # run_path returns a COPY of the module dict; the functions run against this one
+flag_seen = []
+orig_flag = live.get("_owner_reads_enabled")
+if orig_flag is not None:
+    def _probe(*a, **k):
+        r = orig_flag(*a, **k)
+        flag_seen.append(r)
+        return r
+    live["_owner_reads_enabled"] = _probe
+sys.stdin = io.StringIO(cfg["stdin"])
+out, err = io.StringIO(), io.StringIO()
+with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+    with a6._counting_store_opens(a6.Path(cfg["db"]), stacks=True) as rec:
+        try:
+            g["main"]()
+        except SystemExit:
+            pass
+def _file(name):
+    m = sys.modules.get(name)
+    return getattr(m, "__file__", None) if m is not None else None
+json.dump({"opens": rec.details, "owner_calls": owner_calls, "flag_seen": flag_seen,
+           "flag_helper_present": orig_flag is not None,
+           "loaded": a6._runtime_modules_loaded(a6.Path(cfg["layout_root"]), [a6.Path(cfg["hook"])]),
+           "engramd_client_file": _file("engramd_client"), "engram_client_file": _file("engram_client"),
+           "stdout": out.getvalue(), "stderr": err.getvalue()[-2000:]}, open(cfg["out"], "w"))
+'''
+
+
+class SessionStartRig:
+    """One session-start measurement setup: the hook file, the scratch ENGRAM_HOME (`home`, holding the store),
+    and a scratch directory (`scratch`) that is the fire's HOME and TMPDIR. `installed` says the hook sits in a
+    built plugin (CLAUDE_PLUGIN_ROOT = `layout_root` is then set for the fire, as the harness does)."""
+
+    def __init__(self, hook_path, home, scratch, layout_root, installed: bool = False) -> None:
+        self.hook_path, self.home, self.scratch = Path(hook_path), Path(home), Path(scratch)
+        self.layout_root, self.installed = Path(layout_root), installed
+        (self.scratch / "tmp").mkdir(parents=True, exist_ok=True)
+        self.transcript = self.scratch / "transcript.jsonl"
+        self.env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.scratch), "ENGRAM_HOME": str(self.home),
+                    "AGENTS_SHARED_DIR": str(self.scratch / "shared"), "TMPDIR": str(self.scratch / "tmp"),
+                    "PYTHONDONTWRITEBYTECODE": "1", "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+                    "HF_HUB_OFFLINE": "1"}
+        hf = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+        if os.path.isdir(hf):
+            self.env["HF_HOME"] = hf   # the embedder's cache, read-only (HF_HUB_OFFLINE): no download, no write
+        if installed:
+            self.env["CLAUDE_PLUGIN_ROOT"] = str(self.layout_root)
+
+    # -- per-fire state, all untimed -------------------------------------------------------------
+    def write_config(self, flag: bool) -> None:
+        (self.home / "config.json").write_text(json.dumps({"engramd": {SS_FLAG_KEY: bool(flag)}}))
+
+    def write_marker(self, sid: str) -> None:
+        """The session marker with `injected_through` set, so session_checkpoint_block's read executes."""
+        sessions = self.home / "sessions"
+        sessions.mkdir(exist_ok=True)
+        (sessions / f"{sid}.json").write_text(json.dumps({
+            "session_id": sid, "transcript_path": str(self.transcript), "source": "startup", "cwd": str(self.scratch),
+            "started_at": "2026-10-01T00:00:00+00:00", "session_started_at": "2026-10-01T00:00:00+00:00",
+            "role": "interactive", "purpose": "a6", "injected_through": SS_INJECTED_THROUGH, "compaction_count": 0}))
+
+    def clean(self) -> None:
+        """Remove what earlier fires wrote (markers, overflow files, logs, telemetry) so every fire starts from the
+        same state; the store, the config and the owner's run/ directory stay."""
+        for sub in ("sessions", "session-start-overflow", "logs", "telemetry"):
+            shutil.rmtree(self.home / sub, ignore_errors=True)
+
+    def payload(self, sid: str) -> str:
+        return json.dumps({"session_id": sid, "transcript_path": str(self.transcript), "cwd": str(self.scratch),
+                           "source": "startup", "hook_event_name": "SessionStart"})
+
+    # -- fires --------------------------------------------------------------------------------------
+    def fire(self, sid: str) -> str:
+        """ONE fire: a fresh interpreter on the hook, the SessionStart JSON on stdin. Returns its stdout."""
+        p = subprocess.run([sys.executable, str(self.hook_path)], input=self.payload(sid), env=self.env,
+                           capture_output=True, text=True, timeout=60)
+        if p.returncode != 0:
+            raise RuntimeError(f"the session-start fire exited {p.returncode}: {p.stderr[-800:]}")
+        return p.stdout
+
+    def run_driver(self, sid: str) -> Dict:
+        """The sanity driver for ONE fire (the config and marker are the caller's). Returns its JSON."""
+        out_path = self.scratch / f"driver-{uuid.uuid4().hex}.json"
+        cfg = {"tools_dir": str(Path(__file__).resolve().parent), "hook": str(self.hook_path),
+               "db": str(self.home / "knowledge.db"), "layout_root": str(self.layout_root),
+               "stdin": self.payload(sid), "out": str(out_path)}
+        script = self.scratch / "ss_driver.py"
+        script.write_text(_SS_DRIVER)
+        p = subprocess.run([sys.executable, str(script), json.dumps(cfg)], env=self.env, capture_output=True,
+                           text=True, timeout=120)
+        if p.returncode != 0 or not out_path.is_file():
+            raise RuntimeError(f"the session-start sanity driver failed (rc {p.returncode}): {p.stderr[-1500:]}")
+        return json.loads(out_path.read_text())
+
+    def make_paths(self):
+        return _SSFire(self, "baseline", False), _SSFire(self, "owner", True)
+
+
+class _SSFire:
+    """One measured path: callable = ONE fire (a fresh process). `reset()` (untimed, the `before` of the arms)
+    starts a new session id and writes its marker; while `clean_each` it also clears the earlier fires' files and
+    REWRITES THE FLAG for this path -- the sequential and cold arms interleave the paths, so the config must be
+    this path's before every timed fire. The contended arm turns `clean_each` off and calls `phase_start()` once:
+    two threads of one path would delete each other's files otherwise."""
+
+    def __init__(self, rig: SessionStartRig, name: str, flag: bool) -> None:
+        self.rig, self.name, self.flag = rig, name, flag
+        self.clean_each = True
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self.texts: List[str] = []
+
+    def phase_start(self) -> None:
+        self.rig.clean()
+        self.rig.write_config(self.flag)
+
+    def reset(self) -> None:
+        if self.clean_each:
+            self.rig.clean()
+            self.rig.write_config(self.flag)
+        self._local.sid = str(uuid.uuid4())
+        self.rig.write_marker(self._local.sid)
+
+    def __call__(self) -> str:
+        sid = getattr(self._local, "sid", None)
+        if sid is None:
+            self.reset()
+            sid = self._local.sid
+        text = self.rig.fire(sid)
+        if self.flag:
+            with self._lock:
+                self.texts.append(text)
+        self._local.sid = None
+        return text
+
+
+def _readers_reached_off(run: Dict, hook_file) -> List[str]:
+    hook_base = os.path.basename(str(hook_file))
+    got = set()
+    for o in run["opens"]:
+        names = [(f.rsplit(":", 2)[0], f.rsplit(":", 2)[1]) for f in reversed(o.get("stack") or [])
+                 if f.count(":") >= 2 and _frame_basename(f) == hook_base]
+        r = reader_of(names)
+        if r:
+            got.add(r)
+    return sorted(got)
+
+
+def _readers_reached_on(run: Dict, hook_file) -> List[str]:
+    hook_base = os.path.basename(str(hook_file))
+    got = set()
+    for names in run["owner_calls"]:
+        r = reader_of([(f, fn) for f, fn in names if os.path.basename(f) == hook_base])
+        if r:
+            got.add(r)
+    return sorted(got)
+
+
+def session_start_sanity(rig: SessionStartRig) -> Dict:
+    """The untimed, once-per-path sanity run, and the contract checks that need no timing. Runs the sanity
+    driver with the flag OFF then ON (same store, same stdin shape), and:
+      * RAISES ArmBlind when a path did not see the flag state it was configured with;
+      * RAISES ArmBlind naming any of the six readers not reached on a path (OFF: an open attributed to it;
+        ON: an owner read called by it) -- the payload does not reach every read site;
+      * RAISES ArmBlind "warm fire waited" when the flag-ON fire printed a `waited N ms` notice;
+      * RAISES ArmBlind "exclusion never engaged" when, with CALIBRATION_STILL_OPENS true, a path has no open
+        attributed to the calibration path (zero means the attribution, layout or fixture is blind);
+      * otherwise returns the counts, the allow-list's violations for the flag-ON path, and stdout_match."""
+    runs: Dict[str, Dict] = {}
+    for name, flag in (("off", False), ("on", True)):
+        rig.clean()
+        sid = str(uuid.uuid4())
+        rig.write_config(flag)
+        rig.write_marker(sid)
+        runs[name] = rig.run_driver(sid)
+        run = runs[name]
+        if not run["flag_helper_present"] or not run["flag_seen"] or any(f is not flag for f in run["flag_seen"]):
+            raise ArmBlind(f"the flag-{name.upper()} fire did not see the flag state {flag} it was configured with "
+                           f"(the hook's own reader returned {run['flag_seen']}, helper present: "
+                           f"{run['flag_helper_present']})")
+        if rig.installed:
+            for key in ("engramd_client_file", "engram_client_file"):
+                f = run.get(key)
+                if f and rig.layout_root.resolve() not in Path(f).resolve().parents:
+                    raise LayoutViolation(f"{key} was loaded from {f}, not from the build {rig.layout_root}")
+    reached = {"flag-OFF": _readers_reached_off(runs["off"], rig.hook_path),
+               "flag-ON": _readers_reached_on(runs["on"], rig.hook_path)}
+    for path, got in reached.items():
+        missing = [r for r in SS_READERS if r not in got]
+        if missing:
+            raise ArmBlind(f"reader {missing[0]} was not reached on the {path} path (missing: {', '.join(missing)}): "
+                           "the payload does not reach every read site")
+    assert_no_warm_wait([runs["on"]["stdout"]], "the sanity fire")
+    calib = {n: sum(1 for o in runs[n]["opens"] if _is_calibration_open(o)) for n in ("off", "on")}
+    if exclusion_must_engage():
+        for n in ("off", "on"):
+            if calib[n] == 0:
+                raise ArmBlind(
+                    f"exclusion never engaged on the flag-{n.upper()} path: no open is attributed to the calibration "
+                    f"path (a frame in {CALIBRATION_FRAME_BASENAME}) -- the attribution, the layout or the fixture "
+                    "is blind")
+    att_on = attribute_opens(runs["on"]["opens"], rig.hook_path)
+    scratch = [rig.home, rig.scratch]
+    norm = {n: normalise_session_start_output(runs[n]["stdout"], *scratch) for n in ("off", "on")}
+    return {"opens_flag_off": len(runs["off"]["opens"]), "opens_flag_on": len(runs["on"]["opens"]),
+            "calibration_opens_off": calib["off"], "calibration_opens_on": calib["on"],
+            "open_violations": att_on["violations"],
+            "readers_reached_off": reached["flag-OFF"], "readers_reached_on": reached["flag-ON"],
+            "stdout_match": norm["off"] == norm["on"], "stdout_bytes": len(runs["on"]["stdout"].encode("utf-8")),
+            "flag_seen": {"off": runs["off"]["flag_seen"][0], "on": runs["on"]["flag_seen"][0]},
+            "loaded": sorted(set(runs["off"]["loaded"]) | set(runs["on"]["loaded"])),
+            "normalised": norm}
+
+
+def session_start_loaded_files(layout: "Layout", nodes: int = 300) -> List[str]:
+    """Root-relative runtime files a session-start fire loads from `layout` (both flag states, a real owner):
+    the data that RUNTIME_FILES must cover. The closure cell compares against it."""
+    home = make_test_store(nodes=nodes)
+    scratch = Path(tempfile.mkdtemp(prefix="a6-ss-"))
+    handle = None
+    try:
+        _seed_session_start_fixture(home)
+        handle = launch_owner(home)
+        rig = SessionStartRig(layout.session_start_hook, home, scratch, layout.root, installed=layout.name == "installed")
+        loaded = set()
+        for flag in (False, True):
+            rig.clean()
+            sid = str(uuid.uuid4())
+            rig.write_config(flag)
+            rig.write_marker(sid)
+            loaded.update(rig.run_driver(sid)["loaded"])
+        return sorted(loaded)
+    finally:
+        if handle is not None:
+            handle.stop()
+        shutil.rmtree(home, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _cold_row(rig: SessionStartRig, home: Path, n_cold: int, state: Dict) -> Dict:
+    """The COLD row (reported, not a gate): `n_cold` fires, each with the owner STOPPED beforehand; the owner
+    launcher and the flag-ON hook are started in the same instant (two Popens, no sleep between) and the hook's
+    wall time and its own `waited N ms, then served` notice are recorded (None = the owner won the race)."""
+    rows: List[Dict] = []
+    env = dict(os.environ, ENGRAM_HOME=str(home))
+    env.pop("ENGRAM_OWNER_ALLOW_DYNAMIC_TEMPLATES", None)
+    for _ in range(n_cold):
+        if state.get("handle") is not None:
+            state["handle"].stop()
+            state["handle"] = None
+        for stale in ("engramd.sock",):
+            try:
+                (home / "run" / stale).unlink()
+            except FileNotFoundError:
+                pass
+        rig.clean()
+        sid = str(uuid.uuid4())
+        rig.write_config(True)
+        rig.write_marker(sid)
+        t0 = time.perf_counter_ns()
+        owner = subprocess.Popen(owner_argv(), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 cwd=str(home))
+        state["handle"] = OwnerHandle(owner, home)
+        hook = subprocess.Popen([sys.executable, str(rig.hook_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env=rig.env)
+        out, _err = hook.communicate(rig.payload(sid), timeout=60)
+        wall = (time.perf_counter_ns() - t0) / 1e6
+        rows.append({"wall_ms": wall, "wait_ms": parse_owner_wait_ms(out),
+                     "failed": "engramd owner read failed" in out})
+    return summarise_cold(rows)
+
+
 # --- timing ----------------------------------------------------------------------
 
 def _pctl(sorted_ms: List[float], q: float) -> float:
@@ -915,7 +1523,8 @@ def _runtime_modules_loaded(root: Path, extra_files: List[Path]) -> List[str]:
 
 def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 30,
             store: Optional[Path] = None, hook: str = "user-identity",
-            exclusion: bool = False, tripwire_hook_path: Optional[Path] = None) -> Dict:
+            exclusion: bool = False, tripwire_hook_path: Optional[Path] = None,
+            session_start_hook_path: Optional[Path] = None, n_cold: int = N_COLD) -> Dict:
     if hook not in HOOKS:
         raise ValueError(f"unknown hook {hook!r}; one of {HOOKS}")
     home = make_test_store(nodes=nodes, people=people, source=store)
@@ -925,6 +1534,8 @@ def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 
     try:
         if hook == "tripwire":
             _seed_tripwire_fixture(home)  # before the owner opens the store
+        if hook == "session-start":
+            _seed_session_start_fixture(home)
         handle = launch_owner(home)
         raw_cmdline = _owner_command_line(handle.proc.pid)
         owner_argv = [a.decode() for a in raw_cmdline.split(b"\0") if a]
@@ -934,6 +1545,20 @@ def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 
             hook_file = Path(tripwire_hook_path) if tripwire_hook_path is not None else TRIPWIRE_HOOK_PATH
             baseline, owner, answers_match, answer_size, extra = _bind_tripwire(home, exclusion, hook_file, cleanups)
             shared = extra.pop("_shared")
+        elif hook == "session-start":
+            hook_file = (Path(session_start_hook_path) if session_start_hook_path is not None
+                         else SESSION_START_HOOK_PATH)
+            fire_scratch = Path(tempfile.mkdtemp(prefix="a6-ssfire-"))
+            cleanups.append(lambda: shutil.rmtree(fire_scratch, ignore_errors=True))
+            rig = SessionStartRig(hook_file, home, fire_scratch, SRC_ENGRAM, installed=LAYOUT_NAME == "installed")
+            sanity = session_start_sanity(rig)  # raises ArmBlind: a blind arm is an error, never a pass
+            baseline, owner = rig.make_paths()
+            answers_match, answer_size = sanity["stdout_match"], sanity["stdout_bytes"]
+            extra = {k: sanity[k] for k in ("opens_flag_off", "opens_flag_on", "calibration_opens_off",
+                                            "calibration_opens_on", "open_violations", "readers_reached_off",
+                                            "readers_reached_on", "stdout_match", "flag_seen")}
+            extra["runtime_modules_loaded"] = sanity["loaded"]
+            shared = None
         else:
             bind = _bind_stop if hook == "stop" else _bind_user_identity
             baseline, owner, answers_match, answer_size, extra = bind(home)
@@ -973,9 +1598,14 @@ def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 
                 with lock:
                     lat.extend(mine)
 
+            if hasattr(fn, "phase_start"):  # session-start: each path is its own phase (config once)
+                fn.clean_each = False
+                fn.phase_start()
             threads = [threading.Thread(target=worker) for _ in range(2)]
             [t.start() for t in threads]
             [t.join() for t in threads]
+            if hasattr(fn, "phase_start"):
+                fn.clean_each = True
             rows.append(_summarise("contended", path, lat))
 
         # cold cache: OS page cache for the store evicted before every call
@@ -993,6 +1623,14 @@ def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 
             b.append(_timed(baseline, before=_cold_before(baseline)))
             o.append(_timed(owner, before=_cold_before(owner)))
         rows += [_summarise("cold-cache", "baseline", b), _summarise("cold-cache", "owner", o)]
+        owner_pid = handle.proc.pid
+        if hook == "session-start":
+            assert_no_warm_wait(owner.texts, "the timed warm fires")
+            state = {"handle": handle}
+            try:
+                extra["cold"] = _cold_row(rig, home, n_cold, state)
+            finally:
+                handle = state["handle"]
 
         _c = sqlite3.connect(str(db))
         node_count = _c.execute("SELECT count(*) FROM nodes").fetchone()[0]
@@ -1010,7 +1648,7 @@ def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 
             "rows": rows, "n": n, "warmup": warmup, "hook": hook,
             "cold_cache_evicts": _can_evict_page_cache(),
             "answers_match": answers_match, "answer_size": answer_size, **extra,
-            "owner_pid": handle.proc.pid,
+            "owner_pid": owner_pid,
             "owner_cmdline": owner_cmdline, "node_count": node_count,
             "owner_argv": owner_argv, "journal_mode": journal_mode,
             "db_bytes": db.stat().st_size,
@@ -1067,27 +1705,55 @@ def u8_contract_violations(result: Dict) -> List[str]:
     return out
 
 
+def _session_start_header_lines(result: Dict) -> List[str]:
+    cold = result.get("cold")
+    seq = {r["path"]: r for r in result["rows"] if r["arm"] == "sequential"}
+    ratio = seq["owner"]["p50_ms"] / seq["baseline"]["p50_ms"]
+    lines = [
+        f"Contract (allow-list, CALIBRATION_STILL_OPENS={CALIBRATION_STILL_OPENS}): direct opens of the store per "
+        f"fire: flag ON {result['opens_flag_on']} (of which calibration-path {result['calibration_opens_on']}), "
+        f"flag OFF {result['opens_flag_off']} (calibration-path {result['calibration_opens_off']}); "
+        f"unattributed flag-ON opens: {len(result['open_violations'])}; stdout_match={result['stdout_match']}; "
+        f"readers reached OFF {len(result['readers_reached_off'])}/{len(SS_READERS)}, "
+        f"ON {len(result['readers_reached_on'])}/{len(SS_READERS)}",
+        f"GATE cell -- sequential p50 owner/baseline = {ratio:.3f}x "
+        f"({'<= 1.0: PASS' if ratio <= 1.0 else '> 1.0: FAIL'}; the merge seat's number is the production build's)",
+    ]
+    if cold:
+        lines.append(
+            f"COLD row (reported, not a gate): {cold['n']} fires, owner launched in the same instant as the hook: "
+            f"served without a wait {cold['served_without_wait']}/{cold['n']}, wait p50 "
+            f"{'-' if cold['wait_ms_p50'] is None else str(cold['wait_ms_p50']) + ' ms'}, max "
+            f"{'-' if cold['wait_ms_max'] is None else str(cold['wait_ms_max']) + ' ms'}, hook wall p50 "
+            f"{cold['hook_p50_ms']:.0f} ms, owner read failed {cold['owner_failed']}/{cold['n']}")
+    return lines
+
+
 def format_table(result: Dict) -> str:
     env = result["env"]
     stop = result.get("hook") == "stop"
     tripwire = result.get("hook") == "tripwire"
+    session_start = result.get("hook") == "session-start"
     lines = [
         f"Host: {env['platform']} ({env['cpus']} CPUs) | Python {env['python']} | SQLite {env['sqlite']}",
         f"Store copy: {result['node_count']} nodes, {result['db_bytes']} bytes, "
         f"journal_mode={result.get('journal_mode', '?')}, "
         + (f"{result['answer_count']} current nodes" if stop
-           else f"{result['answer_size']} stdout bytes per fire" if tripwire
+           else f"{result['answer_size']} stdout bytes per fire" if (tripwire or session_start)
            else f"{result['people_count']} person rows")
         + f" | N={result['n']} per path per arm "
         f"(contended: 2 threads x N) after {result['warmup']} warm-up calls",
         f"Real owner: pid {result['owner_pid']}, cmdline `{result['owner_cmdline'].strip()}`; "
         + ("owner count and muted decision == baseline: " if stop
-           else "owner stdout == baseline stdout: " if tripwire else "owner rows == baseline rows: ")
+           else "owner stdout == baseline stdout: " if tripwire
+           else "owner stdout == baseline stdout (normalised): " if session_start
+           else "owner rows == baseline rows: ")
         + f"{result['answers_match']}",
         *([f"Tripwire fire (exclusion: {'ON' if result['exclusion'] else 'OFF'}): "
            f"probe_dir_live={result['probe_dir_live']} recall_reached={result['recall_reached']} "
            f"stdout_match={result['stdout_match']} | direct store opens per fire: "
            f"opens_flag_on={result['opens_flag_on']} opens_flag_off={result['opens_flag_off']}"] if tripwire else []),
+        *(_session_start_header_lines(result) if session_start else []),
         "",
         "| arm | path | p50 ms | p99 ms | mean ms | p50 owner/baseline | p99 owner/baseline |",
         "|---|---|---|---|---|---|---|",
@@ -1103,10 +1769,14 @@ def format_table(result: Dict) -> str:
                      f"{r['mean_ms']:.3f} | {p50x} | {p99x} |")
     lines += [
         "",
-        "Notes: function-level timings (interpreter start and imports excluded; one per hook invocation "
-        "on either path). Contended threads share one GIL (both paths alike). Cold-cache evicts the OS "
-        "page cache only; the owner's in-process SQLite cache stays warm. Ratios do not survive across "
-        "SQLite builds. Owner path includes the per-call runtime-dir resolution and client round trip.",
+        ("Notes: every value is the wall time of one FRESH process (interpreter start and imports INCLUDED; "
+         "the contended arm runs two such processes at once per path). Cold-cache evicts the OS page cache "
+         "only; the owner's in-process SQLite cache stays warm. Ratios do not survive across SQLite builds."
+         if session_start else
+         "Notes: function-level timings (interpreter start and imports excluded; one per hook invocation "
+         "on either path). Contended threads share one GIL (both paths alike). Cold-cache evicts the OS "
+         "page cache only; the owner's in-process SQLite cache stays warm. Ratios do not survive across "
+         "SQLite builds. Owner path includes the per-call runtime-dir resolution and client round trip."),
     ]
     if result.get("cold_cache_evicts") is False:
         lines.append(
@@ -1120,6 +1790,21 @@ def format_table(result: Dict) -> str:
             "`_query_recall_daemon`, identical on both paths. Per-fire state files are reset between "
             "fires (untimed). The contended arm runs a separate hook module per thread. "
             "opens_flag_* count DIRECT opens of the store copy during one fire.")
+    if session_start:
+        lines.append(
+            "Session-start hook (U9 #3735, A6 arm #3747): every timed fire is a FRESH interpreter running the hook "
+            "on a SessionStart JSON (the dominant cost is the interpreter, the imports and the calibration "
+            "block's EngramClient, which an in-process call would hide), in a scratch HOME/TMPDIR/ENGRAM_HOME. "
+            "baseline = engramd.session_start_reads_via_owner OFF (six direct store reads); owner = flag ON with "
+            "a REAL owner already up (WARM). One home serves both paths: the config file is rewritten (untimed) "
+            "before each timed fire of the sequential and cold-cache arms, once per phase in the contended arm "
+            "(two concurrent fires per path). Per-fire files are cleaned between fires (untimed). The contract "
+            "line above is the design seat's allow-list (#3747): every flag-ON open of the store must carry an "
+            f"`{CALIBRATION_FRAME_BASENAME}` frame (the calibration block, not migrated until #3741; "
+            f"CALIBRATION_STILL_OPENS={CALIBRATION_STILL_OPENS}); calibration opens are counted, never gated "
+            "on their value. The COLD row is reported, not a gate: the owner launcher and the hook start in the "
+            "same instant, with the wait read from the hook's own notice. GATE (the merge seat runs it on the "
+            "production build): sequential p50 owner/baseline <= 1.0; every other row is reported.")
     if stop:
         lines.append(
             "Stop hook (U6a, #3664): both paths are timed through the hook's own `_maturity_muted()` "
@@ -1141,13 +1826,16 @@ def _is_live_store(path: Path) -> bool:
 
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
-        description="A6 latency delta for a hook's owner read (user-identity: U4d, #3197; stop: U6a, #3664).")
+        description="A6 latency delta for a hook's owner read (user-identity: U4d, #3197; stop: U6a, #3664; "
+                    "tripwire: U6b/U8; session-start: U9, #3747).")
     p.add_argument("--hook", choices=HOOKS, default="user-identity",
                    help="which hook's owner read to measure (default: user-identity)")
     p.add_argument("--exclusion", choices=("off", "on"), default=None,
                    help="(--hook tripwire only) the in-context exclusion: 'on' sets "
                         "recall_in_context_exclusion.enabled and makes the probe dir live (default: off)")
     p.add_argument("--n", type=int, default=N_FLOOR)
+    p.add_argument("--n-cold", type=int, default=N_COLD,
+                   help=f"(--hook session-start only) cold-row fires (default {N_COLD}; reported, not a gate)")
     p.add_argument("--nodes", type=int, default=5000)
     p.add_argument("--people", type=int, default=5)
     p.add_argument("--warmup", type=int, default=30)
@@ -1173,22 +1861,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     kwargs = dict(n=args.n, nodes=args.nodes, people=args.people, warmup=args.warmup,
                   store=args.store, hook=args.hook, exclusion=(args.exclusion == "on"))
+    if args.hook == "session-start":
+        kwargs["n_cold"] = args.n_cold
     wanted = LAYOUTS if args.layout == "both" else (args.layout,)
     results = []
     with tempfile.TemporaryDirectory(prefix="a6-build-") as build_dir:
         for name in ("installed", "source"):
             if name not in wanted:
                 continue
-            layout = build_installed_layout(Path(build_dir) / "plugin") if name == "installed" else source_layout()
-            results.append(measure_in_layout(layout, **kwargs))
+            try:  # the build step raises LayoutViolation too (layout_matches_tree): same exit 4
+                layout = build_installed_layout(Path(build_dir) / "plugin") if name == "installed" else source_layout()
+                results.append(measure_in_layout(layout, **kwargs))
+            except (ArmBlind, LayoutViolation) as exc:
+                print(f"engramd_a6_latency: BLIND ARM ({type(exc).__name__}) -- no number produced: "
+                      f"{' '.join(str(exc).split())[:600]}", file=sys.stderr)
+                return 4
     print(format_layouts(results))
     if args.hook == "tripwire":
         violations = [f"[{r.get('layout', '?')} layout] {v}" for r in results for v in u8_contract_violations(r)]
         if violations:
             print("\nU8 contract violations:\n" + "\n".join(f"  - {v}" for v in violations))
             return 3
-    # (so exit 1 never occurs for --hook tripwire: a differing stdout -- answers_match False -- is
-    # a stdout_match violation and has already returned 3 above)
+    if args.hook == "session-start":
+        violations = [f"[{r.get('layout', '?')} layout] {v}" for r in results for v in ss_contract_violations(r)]
+        if violations:
+            print("\nSession-start contract violations:\n" + "\n".join(f"  - {v}" for v in violations))
+            return 3
+    # (so exit 1 never occurs for --hook tripwire or session-start: a differing stdout -- answers_match
+    # False -- is a stdout_match violation and has already returned 3 above)
     return 0 if all(r["answers_match"] for r in results) else 1
 
 
