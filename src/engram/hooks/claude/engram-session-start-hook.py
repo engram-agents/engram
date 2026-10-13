@@ -2169,6 +2169,40 @@ def starred_block(engram_home: str) -> str:
 # once already for want of one.
 CHECKPOINT_LIST_CAP = 200
 
+# #3761 (U9b): session_checkpoint_block reads TWO statements instead of fetching every row of
+# the window. Both are fixed module-level literals (the owner admits exact bytes, and the
+# read-template scan keys a module-level constant to the function that executes it).
+#
+# * The exclusion predicate is Python's `not ((claim or "").strip() or (recall_summary or "").strip())`
+#   moved into SQL. `str.strip()` removes every character whose `isspace()` is true (29 of them);
+#   SQLite's one-argument `trim()` removes only U+0020, so the explicit set is passed as the
+#   second argument. The set is exactly `{c for c in map(chr, range(0x110000)) if c.isspace()}`;
+#   tests/test_session_start_checkpoint_u9b_3761.py asserts that equality and executes the SQL
+#   against Python's `strip()` for every code point.
+# * The list statement returns `substr(trim(claim), 1, 100)` -- Python's `claim.strip()[:100]`
+#   (substr counts characters, as the slice does) -- so no full claim text crosses the owner
+#   socket. The Python side renders that text AS RETURNED: it is already trimmed and cut, and a
+#   second strip would differ from `claim.strip()[:100]` when the cut ends in whitespace.
+# * `LIMIT 200` is CHECKPOINT_LIST_CAP, as a literal because the template text is fixed (a test
+#   pins the two together). `rowid` breaks `created_at` ties deterministically.
+_CHECKPOINT_COUNT_SQL = (
+    "SELECT COUNT(*) FROM nodes WHERE created_at >= ? AND "
+    "(trim(coalesce(claim, ''), '\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f \x85\xa0\u1680\u2000\u2001\u2002\u2003"
+    "\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '' OR "
+    "trim(coalesce(recall_summary, ''), '\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f \x85\xa0\u1680\u2000\u2001\u2002\u2003"
+    "\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '')"
+)
+_CHECKPOINT_LIST_SQL = (
+    "SELECT id, type, substr(trim(coalesce(claim, ''), '\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f \x85\xa0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000'), 1, 100), "
+    "recall_summary, created_at, is_current, status FROM nodes WHERE created_at >= ? AND "
+    "(trim(coalesce(claim, ''), '\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f \x85\xa0\u1680\u2000\u2001\u2002\u2003"
+    "\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '' OR "
+    "trim(coalesce(recall_summary, ''), '\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f \x85\xa0\u1680\u2000\u2001\u2002\u2003"
+    "\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '') "
+    "ORDER BY created_at ASC, rowid ASC LIMIT 200"
+)
+
 
 def _liveness_tag(row) -> str:
     """Return " [superseded]" / " [retracted]" for a node no longer current.
@@ -2263,6 +2297,12 @@ def session_checkpoint_block(engram_home: str, injected_through: str | None) -> 
     Capped at CHECKPOINT_LIST_CAP with an explicit "... +N more" line —
     never truncated silently.
 
+    #3761 (U9b): the window is read with TWO statements (a COUNT and a list capped at
+    CHECKPOINT_LIST_CAP rows whose claim column is already `substr(trim(claim), 1, 100)`), so a
+    long-gap window no longer ships every row's full claim text through the owner socket. The
+    output is byte-identical to the old full fetch; see _CHECKPOINT_COUNT_SQL for the
+    whitespace-set and ordering details.
+
     Placement (see main()): this function's call site sits BEFORE the
     #1819 ordering-invariant comment, in the same cheap tier as
     focus_block(). Measured 2026-08-15: the underlying query is a FULL
@@ -2288,14 +2328,16 @@ def session_checkpoint_block(engram_home: str, injected_through: str | None) -> 
         conn = None
         try:
             conn = _owner_conn() if owner else connect_regular_ro(db_path, timeout=1.0)
-            # Columns are read BY INDEX (id, type, claim, recall_summary, created_at,
-            # is_current, status): the owner shim has no row_factory.
+            # Columns are read BY INDEX (id, type, claim text, recall_summary, created_at,
+            # is_current, status): the owner shim has no row_factory. Index 2 is
+            # substr(trim(claim), 1, 100), not the claim (#3761).
+            # COUNT first, then the capped list. The two are not one snapshot: a node filed
+            # between them shows up in only one, so the total below is the larger of the two
+            # (overlap, never a gap).
+            window_count = _owner_read(lambda c: c.execute(
+                _CHECKPOINT_COUNT_SQL, (injected_through,)).fetchone()[0], conn)
             rows = _owner_read(lambda c: c.execute(
-                "SELECT id, type, claim, recall_summary, created_at, "
-                "is_current, status FROM nodes "
-                "WHERE created_at >= ? ORDER BY created_at ASC",
-                (injected_through,),
-            ).fetchall(), conn)
+                _CHECKPOINT_LIST_SQL, (injected_through,)).fetchall(), conn)
         except Exception as exc:
             _record_owner_failure("session_checkpoint_block", exc)
             raise
@@ -2311,20 +2353,23 @@ def session_checkpoint_block(engram_home: str, injected_through: str | None) -> 
 
         entries = []
         for row in rows:
-            claim = (row[2] or "").strip()
+            # row[2] is already `claim.strip()[:100]` (done in SQL): do NOT strip or cut it again.
+            claim = row[2] or ""
             recall_summary = (row[3] or "").strip()
-            # Property-based exclusion (not type-based) — see docstring.
+            # Property-based exclusion (not type-based) — see docstring. The SQL applies the
+            # same predicate; this keeps the rendering loop self-consistent.
             if not (claim or recall_summary):
                 continue
-            text = recall_summary if recall_summary else claim[:100]
+            text = recall_summary if recall_summary else claim
             entries.append((row[0], row[1], text, _liveness_tag_values(row[5], row[6])))
 
         if not entries:
             return ""
 
-        total = len(entries)
         display_entries = entries[:CHECKPOINT_LIST_CAP]
-        remaining = total - len(display_entries)
+        # The two statements are not atomic: never report fewer than were listed, never negative.
+        total = max(window_count or 0, len(entries))
+        remaining = max(0, total - len(display_entries))
 
         header = f"[Nodes created since checkpoint ({injected_through}) — {total} node(s)]:"
         block_lines = [header]

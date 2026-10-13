@@ -104,17 +104,23 @@ SQL_EMBED = "SELECT not_fully_restored, null_count, cause FROM embedding_restore
 SQL_FOCUS = "SELECT id, claim, focus_reason, focused_at FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1 ORDER BY focused_at"
 SQL_ACTIVE = "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
 SQL_SETS = "SELECT name, node_ids, description, created_at FROM focus_sets ORDER BY name ASC"
-SQL_CHECKPOINT = ("SELECT id, type, claim, recall_summary, created_at, is_current, status FROM nodes "
-                  "WHERE created_at >= ? ORDER BY created_at ASC")
+# U9b (#3761): the checkpoint reader sends TWO statements (a COUNT, then a capped list); their
+# text is read from the committed registry (never retyped) and told apart by shape. The
+# independent text pin of the two statements lives in tests/test_session_start_checkpoint_u9b_3761.py.
+_CK_SQLS = [t["sql"] for t in json.loads((Path(__file__).resolve().parent.parent / "src" / "engram"
+            / "engramd_read_templates.json").read_text())["templates"]
+            if "hooks/claude/engram-session-start-hook.py:session_checkpoint_block" in t["sites"]]
+SQL_CK_COUNT = next((s for s in _CK_SQLS if s.startswith("SELECT COUNT(*) FROM nodes WHERE created_at >= ?")), "<no count template>")
+SQL_CK_LIST = next((s for s in _CK_SQLS if " LIMIT " in s), "<no list template>")
 SQL_SLEEP1 = "SELECT COUNT(*) FROM nodes"
 SQL_SLEEP2 = "SELECT COUNT(*) FROM nodes WHERE created_at > ?"
-ALL_EIGHT = {SQL_BACKUP, SQL_EMBED, SQL_FOCUS, SQL_ACTIVE, SQL_SETS, SQL_CHECKPOINT, SQL_SLEEP1, SQL_SLEEP2}
+ALL_NINE = {SQL_BACKUP, SQL_EMBED, SQL_FOCUS, SQL_ACTIVE, SQL_SETS, SQL_CK_COUNT, SQL_CK_LIST, SQL_SLEEP1, SQL_SLEEP2}
 FN_SQL = {
     "_check_backup_staleness": {SQL_BACKUP},
     "_check_embedding_restore_flag": {SQL_EMBED},
     "focus_block": {SQL_FOCUS},
     "saved_focus_sets_block": {SQL_ACTIVE, SQL_SETS},
-    "session_checkpoint_block": {SQL_CHECKPOINT},
+    "session_checkpoint_block": {SQL_CK_COUNT, SQL_CK_LIST},
     "sleep_status_block": {SQL_SLEEP1, SQL_SLEEP2},
 }
 
@@ -687,8 +693,8 @@ def test_a_flag_on_full_fire_in_the_deployed_layout_has_zero_opens_attributed_to
     path is captured by Python audit events and attributed by stack to the calling hook function.
     The calibration block is stubbed away here (cell (a2) pins it), so NO open at all may remain,
     and in particular none attributed to the six. Every block is delivered. Two fires (no sleep
-    marker; stale marker) so that all eight registered statements are needed; with the fake owner
-    its request log shows each of the eight was asked.
+    marker; stale marker) so that all nine registered statements are needed; with the fake owner
+    its request log shows each of the nine was asked.
     Mutation: leave ONE function on the direct path (M1 x6) -> an attributed open -> red."""
     build_store(home)
     set_flag(home, True)
@@ -709,7 +715,7 @@ def test_a_flag_on_full_fire_in_the_deployed_layout_has_zero_opens_attributed_to
         if owner_kind == "fake":
             seen = {(r.get("params") or {}).get("sql") for r in owner.requests if r.get("method") == "read"}
     if owner_kind == "fake":
-        assert seen == ALL_EIGHT, sorted(ALL_EIGHT ^ seen)
+        assert seen == ALL_NINE, sorted(ALL_NINE ^ seen)
 
 
 @requires_linux_owner
@@ -955,7 +961,7 @@ def test_b_session_checkpoint_block_owner_equals_direct(case, owner_kind, home, 
         monkeypatch.setattr(sys.modules[__name__], "CHECKPOINT_FROM", "2030-01-01T00:00:00Z")
     direct, via, calls = _direct_and_owner(mod, "session_checkpoint_block", home, owner_kind, monkeypatch)
     assert via == direct
-    assert [c[0] for c in calls] == [SQL_CHECKPOINT]
+    assert [c[0] for c in calls] == [SQL_CK_COUNT, SQL_CK_LIST]
     if case == "window":
         assert "[ck_0002] (observation) [superseded]" in direct and "[ck_0003] (observation) [retracted]" in direct
         assert "ck_0004" not in direct and "checkpoint summary one" in direct
@@ -1148,7 +1154,7 @@ def test_c_the_owner_entirely_down_in_a_full_fire_gives_one_notice_naming_every_
     own UNKNOWN line (the function's degraded result, D8) is a separate pre-existing line.
     Mutation: one notice per failing function -> count > 1 -> red."""
     full = full_fire_setup(home, monkeypatch)
-    run, opens = full_fire_failing(full, home, monkeypatch, failure, ALL_EIGHT)
+    run, opens = full_fire_failing(full, home, monkeypatch, failure, ALL_NINE)
     assert run.exc is None, run.exc
     assert run.ctx.count(NOTICE_PHRASE) == 1, run.ctx
     line = [ln for ln in run.ctx.split("\n") if NOTICE_PHRASE in ln][0]
@@ -1587,10 +1593,10 @@ def test_g_anti_vacuity_the_same_blind_path_with_the_flag_off_yields_the_empty_r
 def test_h_the_statements_sent_are_exactly_the_registered_templates_of_each_function(owner_kind, home, monkeypatch):
     """Across all scenarios of the six functions the owner receives, per function, exactly the
     statements the committed registry lists for that function's site, byte for byte (no extra
-    whitespace, LIMIT or semicolon), and across the whole set all eight are exercised. The registry
+    whitespace, LIMIT or semicolon), and across the whole set all nine are exercised. The registry
     side is read from the committed JSON, never retyped.
     Mutation: change ONE SQL byte in ONE function (M18 x8) -> that statement is unregistered -> red."""
-    assert {s for fn in SIX for s in sql_set_of_function(fn)} == ALL_EIGHT
+    assert {s for fn in SIX for s in sql_set_of_function(fn)} == ALL_NINE
     for fn in SIX:
         assert sql_set_of_function(fn) == FN_SQL[fn]
     build_store(home)

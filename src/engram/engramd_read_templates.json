@@ -9,13 +9,6 @@
       ]
     },
     {
-      "key": "11d79fc4ecfafd263296a4ea553d76e8c995e961af23049158d6d89e80bf8088",
-      "sql": "SELECT id, type, claim, recall_summary, created_at, is_current, status FROM nodes WHERE created_at >= ? ORDER BY created_at ASC",
-      "sites": [
-        "hooks/claude/engram-session-start-hook.py:session_checkpoint_block"
-      ]
-    },
-    {
       "key": "2743db24b60c27d0ad4e70e440219d2904a12aa08d4fdca11760b8445b3fdc9c",
       "sql": "SELECT id, recall_summary FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
       "sites": [
@@ -85,6 +78,13 @@
       "sql": "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1 ORDER BY focused_at",
       "sites": [
         "hooks/claude/_hooklib.py:_focused_ids"
+      ]
+    },
+    {
+      "key": "931a3e96f918cd7e53e396133a92bfb3330843c4041d026c78b99ce950be6ab7",
+      "sql": "SELECT id, type, substr(trim(coalesce(claim, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000'), 1, 100), recall_summary, created_at, is_current, status FROM nodes WHERE created_at >= ? AND (trim(coalesce(claim, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '' OR trim(coalesce(recall_summary, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '') ORDER BY created_at ASC, rowid ASC LIMIT 200",
+      "sites": [
+        "hooks/claude/engram-session-start-hook.py:session_checkpoint_block"
       ]
     },
     {
@@ -170,6 +170,13 @@
       "sql": "SELECT name, node_ids, description, created_at FROM focus_sets ORDER BY name ASC",
       "sites": [
         "hooks/claude/engram-session-start-hook.py:saved_focus_sets_block"
+      ]
+    },
+    {
+      "key": "eb98e5fd2e29cdedca963c60ecac97ab41292f87fe87d6c1f5b7575db3871e26",
+      "sql": "SELECT COUNT(*) FROM nodes WHERE created_at >= ? AND (trim(coalesce(claim, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '' OR trim(coalesce(recall_summary, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '')",
+      "sites": [
+        "hooks/claude/engram-session-start-hook.py:session_checkpoint_block"
       ]
     },
     {
