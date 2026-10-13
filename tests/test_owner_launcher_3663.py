@@ -240,6 +240,41 @@ def test_c2_exit3_displaced_must_be_restarted(rendered):
     assert svc["Restart"] == ["on-failure"]
 
 
+def _exit_pidfile_not_regular() -> int:
+    if str(SRC) not in sys.path:
+        sys.path.insert(0, str(SRC))
+    import engramd_owner
+    return engramd_owner.EXIT_PIDFILE_NOT_REGULAR
+
+
+def test_c2_exit4_pidfile_not_regular_is_not_restarted(rendered):
+    """#3768: exit 4 (EXIT_PIDFILE_NOT_REGULAR) cannot be fixed by retrying, so the unit lists it in
+    RestartPreventExitStatus -- exactly it: the value comes from the owner's constant (no drift),
+    contains neither 1 nor 3 (both must still restart), and SuccessExitStatus stays absent.
+    Rendered through the installer with a faked uname, so it runs on macOS and Linux."""
+    unit, _h, ini, _s = rendered
+    code = str(_exit_pidfile_not_regular())
+    svc = ini["Service"]
+    assert svc.get("RestartPreventExitStatus") == [code], svc.get("RestartPreventExitStatus")
+    raw = [ln.strip() for ln in unit.read_text().splitlines()
+           if ln.strip().startswith("RestartPreventExitStatus=")]
+    assert raw == [f"RestartPreventExitStatus={code}"], raw
+    assert "RestartPreventExitStatus" not in ini.get("Unit", {})
+    assert "SuccessExitStatus" not in svc
+    assert not ({"1", "3"} & set(svc["RestartPreventExitStatus"][0].replace(",", " ").split()))
+    assert svc["Restart"] == ["on-failure"]
+
+
+def test_c2_exit4_is_in_the_exit_code_comment_table(rendered):
+    """The 'supervised by meaning' comment table names exit 4 by its constant."""
+    unit, _h, _ini, _s = rendered
+    code = str(_exit_pidfile_not_regular())
+    rows = [ln for ln in unit.read_text().splitlines()
+            if ln.lstrip().startswith("#") and "EXIT_PIDFILE_NOT_REGULAR" in ln]
+    assert rows, "no comment-table line names EXIT_PIDFILE_NOT_REGULAR"
+    assert any(re.match(rf"#\s+{code}\s+EXIT_PIDFILE_NOT_REGULAR", ln.strip()) for ln in rows), rows
+
+
 # ---- C3: one owner per ENGRAM_HOME -------------------------------------------
 
 def _name(path: Path) -> str:

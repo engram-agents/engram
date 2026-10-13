@@ -54,6 +54,11 @@ back-off; `main()` below is what turns that exception into `sys.exit(1)`
 for the real process entry point, while tests can assert on the exception
 directly.
 
+A pidfile path that exists and is not a regular file (FIFO, symlink,
+directory) is refused the same way (#3768): `OwnerPidfileNotRegular`, and
+`main()` returns `EXIT_PIDFILE_NOT_REGULAR` (4), distinct from 1 and from
+`EXIT_DISPLACED` (3).
+
 ## Socket path resolution -- replicated, not shared; the "never modify
 ## engramd_client.py" note below is U3's OWN historical scope bound, now
 ## superseded for the socket-path constant specifically (#3194)
@@ -267,6 +272,13 @@ _PIDFILE_PROGRAM_MARKER = ec.PIDFILE_PROGRAM_MARKER
 # displaced exit from a clean one. main() ends the process with os._exit(
 # EXIT_DISPLACED) on this path -- see main() for why finalization is skipped.
 EXIT_DISPLACED = 3
+
+# #3768: exit status of an owner that REFUSED TO START because its pidfile path
+# exists and is not a regular file (FIFO, symlink, directory, ...). Its own
+# code, not the surface daemon's run-without-pidfile fallback: the owner's
+# pidfile carries liveness, so an owner without one reads as down while it
+# holds the socket. main() returns it (nothing was bound or left behind).
+EXIT_PIDFILE_NOT_REGULAR = 4
 
 # #3240 item 2: methods that never touch the store and so are exempt from the
 # displacement self-check. Every OTHER registered method is guarded by
@@ -614,6 +626,19 @@ class OwnerStalePathUnsafe(RuntimeError):
     design doc names). A distinct exception from OwnerAlreadyRunning
     because the underlying condition is different: this is not "a live
     owner is already here", it's "something unsafe to touch is here"."""
+
+
+class OwnerPidfileNotRegular(RuntimeError):
+    """Raised by EngramdOwner.start() when the pidfile path
+    (<ENGRAM_HOME>/engramd.pid) exists and is not a regular file (#3768): a
+    FIFO (a write-open would wait for a reader forever), a symlink (a write
+    would follow it and truncate its target), a directory, or anything else.
+    Raised before the socket is bound when the path is already wrong, and
+    after cleaning up the socket and store connections when it turns wrong
+    between that check and the write. A distinct exception, with its own exit
+    code (EXIT_PIDFILE_NOT_REGULAR), because the owner cannot fall back to
+    running without a pidfile: the pidfile carries its liveness, and an owner
+    without one reads as down while it holds the socket."""
 
 
 class OwnerSocketPathTooLong(RuntimeError):
@@ -1716,6 +1741,10 @@ class EngramdOwner:
         OwnerHomeTccProtected if engram_home is under ~/Documents,
         ~/Desktop or ~/Downloads -- before anything under it is read or
         created (#3666).
+        Raises OwnerPidfileNotRegular if the pidfile path exists and is
+        not a regular file (#3768) -- before the stale-socket check and the
+        bind in the common case; a path that turns non-regular between that
+        check and the pidfile write is refused there, after cleaning up.
 
         `install_signal_handlers=False` (tests only -- see
         tests/test_engramd_owner.py's owner_running fixture) skips
@@ -1754,6 +1783,22 @@ class EngramdOwner:
         )
 
         self.engram_home.mkdir(parents=True, exist_ok=True)
+
+        # #3768: refuse by name when the pidfile path is already not a regular
+        # file, BEFORE anything is bound or opened (and before the stale-socket
+        # check below, which can read the pidfile). lstat does not follow, so a
+        # symlink counts. A missing path is the normal fresh start; any other
+        # lstat error surfaces as it always did.
+        try:
+            pid_stat = os.lstat(self.pid_path)
+        except FileNotFoundError:
+            pass
+        else:
+            # A hard-linked regular file is refused too: writing it would
+            # rewrite another name's content.
+            if not stat.S_ISREG(pid_stat.st_mode) or pid_stat.st_nlink > 1:
+                raise OwnerPidfileNotRegular(
+                    self._pidfile_refusal_text(pid_stat.st_mode, pid_stat.st_nlink))
 
         # `run/` (the socket's parent) MUST be hardened -- and, load-
         # bearing, its own symlink/ownership refusal checked -- BEFORE
@@ -1835,7 +1880,7 @@ class EngramdOwner:
         self._server.listen(self.listen_backlog)  # OWNER_LISTEN_BACKLOG (#3680)
         self._server.settimeout(self.accept_poll_interval)
 
-        self.pid_path.write_text(str(os.getpid()))
+        self._write_pidfile()
 
         if install_signal_handlers:
             signal.signal(signal.SIGTERM, self._handle_signal)
@@ -1844,6 +1889,76 @@ class EngramdOwner:
         self._shutdown.clear()
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._accept_thread.start()
+
+    @staticmethod
+    def _kind_of_mode(mode: int) -> str:
+        if stat.S_ISFIFO(mode):
+            return "FIFO"
+        if stat.S_ISLNK(mode):
+            return "symlink"
+        if stat.S_ISDIR(mode):
+            return "directory"
+        return "non-regular file"
+
+    def _pidfile_refusal_text(self, mode: int | None, nlink: int | None = None) -> str:
+        if mode is not None and stat.S_ISREG(mode) and nlink is not None and nlink != 1:
+            what = f"has {nlink} hard links, not a single regular file"
+        else:
+            kind = self._kind_of_mode(mode) if mode is not None else "non-regular file"
+            what = f"is a {kind}, not a regular file"
+        return (
+            f"refusing to start: the pidfile path {self.pid_path} {what}; "
+            f"nothing was bound. Remove it and start again"
+        )
+
+    def _write_pidfile(self) -> None:
+        """Write this process's pid to the pidfile (#3768). The open is
+        race-free: explicit flags, `O_NOFOLLOW` (a symlink is refused, not
+        followed), `O_NONBLOCK` (a FIFO with no reader fails with ENXIO
+        instead of waiting), then `fstat` must say regular file. This write
+        path REFUSES symlinks on purpose -- on a write the follow IS the
+        truncation of the target -- unlike the read-side liveness check in
+        `engram_pidfile.recorded_live_pid`, which follows symlinks bounded by
+        `O_NONBLOCK` + `fstat`; do not "fix" one side to match the other.
+        `O_NOFOLLOW` guards symlinks only: the `st_nlink == 1` check on the
+        open fd, plus truncating (`ftruncate`) only AFTER that check and never
+        with `O_TRUNC` inside `open(2)`, is the hard-link guard.
+
+        ENXIO, ELOOP, EISDIR, EOPNOTSUPP, ENODEV and a non-regular `fstat` become
+        OwnerPidfileNotRegular after releasing what start() already
+        acquired (the socket and both store connections; the accept thread
+        does not exist yet). Any other OSError propagates unchanged."""
+        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+        try:
+            fd = os.open(self.pid_path, flags, 0o666)
+        except OSError as exc:
+            # A socket-type file gives ENXIO (Linux) / EOPNOTSUPP (macOS);
+            # ENODEV covers a device node with no driver. getattr so a
+            # platform lacking one of them still imports.
+            not_regular_errnos = {
+                getattr(errno, name)
+                for name in ("ENXIO", "ELOOP", "EISDIR", "EOPNOTSUPP", "ENODEV")
+                if hasattr(errno, name)
+            }
+            if exc.errno not in not_regular_errnos:
+                raise
+            self._cleanup()
+            raise OwnerPidfileNotRegular(self._pidfile_refusal_text(self._lstat_mode())) from exc
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                self._cleanup()
+                raise OwnerPidfileNotRegular(self._pidfile_refusal_text(st.st_mode, st.st_nlink))
+            os.ftruncate(fd, 0)
+            os.write(fd, str(os.getpid()).encode("ascii"))
+        finally:
+            os.close(fd)
+
+    def _lstat_mode(self) -> int | None:
+        try:
+            return os.lstat(self.pid_path).st_mode
+        except OSError:
+            return None
 
     def _load_read_registry(self, dynamic: bool) -> "rr.Registry":
         """Load the committed template list, classifying each template
@@ -2235,15 +2350,60 @@ class EngramdOwner:
         # signal firing after a newer instance already wrote its own fresh
         # pidfile (which would otherwise delete the NEW instance's pidfile
         # out from under it).
+        #
+        # #3768: this read decides whether to UNLINK, so it refuses symlinks
+        # and non-regular files (O_NOFOLLOW, O_NONBLOCK, then fstat): a FIFO
+        # must not hang it and must not be unlinked, a symlink is not ours.
         still_ours = False
+        not_regular_kind = None
+        hard_links = None
         try:
-            with open(self.pid_path) as f:
-                still_ours = int(f.read().strip()) == os.getpid()
-        except (OSError, ValueError):
-            # No pidfile, or unreadable/garbage content -- nothing to
-            # protect, proceed with removing it (matches the surface
-            # daemon's identical fallback).
-            still_ours = True
+            fd = os.open(self.pid_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                not_regular_kind = "symlink"
+            else:
+                # No pidfile, or unreadable -- nothing to protect, proceed
+                # with removing it (matches the surface daemon's identical
+                # fallback) -- unless the path is something other than a
+                # regular file that open() merely failed on (e.g. a
+                # socket-type file: ENXIO on Linux, EOPNOTSUPP on macOS),
+                # which is not ours to unlink.
+                still_ours = True
+                try:
+                    lmode = os.lstat(self.pid_path).st_mode
+                except OSError:
+                    pass
+                else:
+                    if not stat.S_ISREG(lmode):
+                        still_ours = False
+                        not_regular_kind = self._kind_of_mode(lmode)
+        else:
+            try:
+                fst = os.fstat(fd)
+                mode = fst.st_mode
+                if not stat.S_ISREG(mode):
+                    not_regular_kind = self._kind_of_mode(mode)
+                elif fst.st_nlink > 1:
+                    # hard-linked: another name shares this inode, not ours
+                    hard_links = fst.st_nlink
+                else:
+                    try:
+                        with os.fdopen(fd, closefd=False) as f:
+                            still_ours = int(f.read().strip()) == os.getpid()
+                    except (OSError, ValueError):
+                        # garbage/unreadable content: same fallback as above
+                        still_ours = True
+            finally:
+                os.close(fd)
+        if not_regular_kind is not None:
+            logging.getLogger("engramd_owner").warning(
+                "pidfile %s is a %s, not a regular file; leaving it alone",
+                self.pid_path, not_regular_kind)
+        if hard_links is not None:
+            logging.getLogger("engramd_owner").warning(
+                "pidfile %s has %d hard links; leaving it alone",
+                self.pid_path, hard_links)
         if still_ours:
             try:
                 self.pid_path.unlink()
@@ -3493,6 +3653,9 @@ def main() -> int:
     except OwnerPermissionUnsupported as exc:
         print(f"[engramd] {exc}", file=sys.stderr)
         return 1
+    except OwnerPidfileNotRegular as exc:
+        print(f"[engramd] {exc}", file=sys.stderr)
+        return EXIT_PIDFILE_NOT_REGULAR
     print(f"[engramd] listening on {owner.socket_path} (pid {os.getpid()})", file=sys.stderr)
     owner.wait_forever()
     # Reading _displaced right after wait_forever() is safe because stop()

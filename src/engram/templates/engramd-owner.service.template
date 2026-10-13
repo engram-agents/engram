@@ -24,9 +24,12 @@ Environment=ENGRAM_HOME={{ENGRAM_HOME}}
 #   3  EXIT_DISPLACED        -> restarted by Restart=on-failure (until the start limit
 #                               trips, as for exit 1): the owner shut down on a displaced
 #                               substrate without closing the store, so it must never read
-#                               as a success. Hence deliberately NO SuccessExitStatus= and
-#                               no RestartPreventExitStatus= here.
+#                               as a success. Hence deliberately NO SuccessExitStatus=, and
+#                               exits 1 and 3 are never in RestartPreventExitStatus=.
+#   4  EXIT_PIDFILE_NOT_REGULAR -> NOT restarted (RestartPreventExitStatus=4): retrying
+#                               cannot fix a planted path
 Restart=on-failure
+RestartPreventExitStatus=4
 RestartSec=10s
 # `append:` log routing requires systemd >= 240 (same floor as the surface daemon unit).
 StandardOutput=append:{{ENGRAM_HOME}}/engramd-owner.log
