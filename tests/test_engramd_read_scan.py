@@ -480,8 +480,10 @@ _LINE_KEY = _re.compile(r":\d+$")
 # #3551 added a new template (the focused-ids read in _hooklib._focused_ids): its own key.
 # #3665: extract_keywords batches its df lookup (new key 9d938f92...), so the per-token
 # idf template (cbfeed19...) is no longer reachable from any hook root and is gone.
+# #3742: the focused-ids read gained ORDER BY focused_at (087e3f55... -> 8fd6a2ad...); a SQL
+# change legitimately moves its own key.
 _FROZEN_TEMPLATE_KEYS = frozenset({
-    "087e3f5506c5f2ef7d6de772c9085141f77fd026db29b1f55e39bcc16323eeeb",
+    "8fd6a2adcab8ffb85efcf1e3b22c7433632f94a0d820c60cf37d4ba22ebd154e",
     "0280b9b584a3522d55be45f09ec258c28ec2d8b8e0e3cf80267097f593c71462",
     "11d79fc4ecfafd263296a4ea553d76e8c995e961af23049158d6d89e80bf8088",
     "2743db24b60c27d0ad4e70e440219d2904a12aa08d4fdca11760b8445b3fdc9c",

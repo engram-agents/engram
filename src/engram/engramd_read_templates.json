@@ -9,13 +9,6 @@
       ]
     },
     {
-      "key": "087e3f5506c5f2ef7d6de772c9085141f77fd026db29b1f55e39bcc16323eeeb",
-      "sql": "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1",
-      "sites": [
-        "hooks/claude/_hooklib.py:_focused_ids"
-      ]
-    },
-    {
       "key": "11d79fc4ecfafd263296a4ea553d76e8c995e961af23049158d6d89e80bf8088",
       "sql": "SELECT id, type, claim, recall_summary, created_at, is_current, status FROM nodes WHERE created_at >= ? ORDER BY created_at ASC",
       "sites": [
@@ -85,6 +78,13 @@
       "sql": "\nSELECT\n    id,\n    COALESCE(\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.scaffolding_nudge'),\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.anchor_line'),\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.surfacing_nudge'),\n        claim\n    ) AS nudge,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.tripwire_priority')  AS priority\nFROM nodes\nWHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')\n  AND is_current = 1\n  AND memory_status = 'active'\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') IS NOT NULL\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') != ''\n",
       "sites": [
         "hooks/claude/engram-lesson-tripwire-hook.py:load_tripwires"
+      ]
+    },
+    {
+      "key": "8fd6a2adcab8ffb85efcf1e3b22c7433632f94a0d820c60cf37d4ba22ebd154e",
+      "sql": "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1 ORDER BY focused_at",
+      "sites": [
+        "hooks/claude/_hooklib.py:_focused_ids"
       ]
     },
     {

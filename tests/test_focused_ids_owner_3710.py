@@ -51,7 +51,7 @@ for _p in (_SRC_ENGRAM, _HOOKS_SRC):
 
 import engramd_client as ec  # noqa: E402
 
-FOCUSED_SQL = "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
+FOCUSED_SQL = "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1 ORDER BY focused_at"
 SESSION = "s-3665"  # the session id test_tripwire_owner_read_3665.payload() sends
 EXCLUSION_ON = {"recall_in_context_exclusion": {"enabled": True}}
 

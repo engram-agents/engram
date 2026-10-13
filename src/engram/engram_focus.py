@@ -149,7 +149,7 @@ def _clear_active_set_name_if_diverged(conn):
     saved_set = set(resolved)
 
     active_rows = conn.execute(
-        "SELECT id FROM nodes WHERE focused_at IS NOT NULL"
+        "SELECT id FROM nodes WHERE focused_at IS NOT NULL ORDER BY focused_at"
     ).fetchall()
     active_set = {r["id"] for r in active_rows}
 
@@ -206,7 +206,7 @@ def _focus_impl(node_ids: str, reason: str) -> str:
         missing = [i for i in ids if i not in found_map]
 
         current_focus_rows = conn.execute(
-            "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
+            "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1 ORDER BY focused_at"
         ).fetchall()
         current_focus_ids = {r["id"] for r in current_focus_rows}
 
@@ -253,7 +253,7 @@ def _focus_impl(node_ids: str, reason: str) -> str:
         conn.commit()
 
         focused_now = conn.execute(
-            "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
+            "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1 ORDER BY focused_at"
         ).fetchall()
         state_now = conn.execute(
             "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
@@ -322,7 +322,7 @@ def _unfocus_impl(node_ids: str) -> str:
             conn.commit()
 
         remaining = conn.execute(
-            "SELECT COUNT(*) as n FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
+            "SELECT COUNT(*) as n FROM nodes WHERE focused_at >= '' AND is_current = 1"
         ).fetchone()["n"]
         state_now = conn.execute(
             "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"

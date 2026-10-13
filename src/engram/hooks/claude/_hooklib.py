@@ -1659,7 +1659,7 @@ def _focused_ids(read_conn=None) -> tuple:
         else:
             conn = read_conn
         rows = conn.execute(
-            "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
+            "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1 ORDER BY focused_at"
         ).fetchall()
         return {r[0] for r in rows}, True
     except Exception:
