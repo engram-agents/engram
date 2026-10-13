@@ -29,12 +29,16 @@ client threads share one GIL, which affects both paths equally; the ratio does
 not survive across SQLite builds (the doc shows this), so the build is named.
 
     python tools/engramd_a6_latency.py [--n 300] [--nodes 5000] [--people 5]
-                                       [--warmup 30] [--store PATH]
+                                       [--warmup 30] [--store PATH] [--layout-timeout 1800]
 Exit 0 ok; 1 the two paths answered differently; 2 bad input (N below the 300 floor,
 --store is the live store, or --exclusion without --hook tripwire); 3 (--hook tripwire or
 session-start only) a contract violation (see u8_contract_violations / ss_contract_violations);
-4 (--hook tripwire or session-start) a BLIND ARM: the run raised ArmBlind or LayoutViolation, so no
-number was produced (one stderr line names the exception).
+4 (any --hook) a BLIND ARM: the run raised ArmBlind or LayoutViolation, or the plugin build step
+exceeded its fixed 600 s limit, so no number was produced (one stderr line names the cause); 5 a layout child outran --layout-timeout
+(#3755; EXIT_LAYOUT_TIMEOUT; one stderr line names the layout, the limit and the flag; the child runs in
+its own process group and the whole group is killed, so no engramd owner is left behind).
+`--layout-timeout SECONDS` (int > 0, default 1800) is the per-layout child limit; the session-start arm
+on a real-size store can need more (each fire is a fresh process), so raise it there.
 Exit 1 does NOT occur for tripwire or session-start: the two paths answering differently is a
 differing stdout, which is itself a violation, and exit 3 outranks exit 1. A blind arm is never
 exit 1; it is exit 4.
@@ -127,6 +131,8 @@ def owner_argv() -> List[str]:
 
 BUILD_SCRIPT = REPO_ROOT / "tools" / "build-plugin.sh"
 LAYOUTS = ("source", "installed")
+EXIT_LAYOUT_TIMEOUT = 5          # a layout child outran --layout-timeout (#3755); 0-4 are taken (see the docstring)
+DEFAULT_LAYOUT_TIMEOUT = 1800    # seconds; the per-layout child limit when --layout-timeout is not given
 # build-relative path -> source-relative path: the runtime files a measurement
 # loads. Byte-identical between the build and the tree is what makes the
 # installed cell a measurement of THIS tree.
@@ -325,14 +331,60 @@ def _count_parent_walks(layout: Layout) -> Dict[str, int]:
     return counter
 
 
-def measure_in_layout(layout: Layout, **kwargs) -> Dict:
+_KILL_GRACE_S = 2.0   # SIGTERM -> SIGKILL grace for a timed-out layout child's process group
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Terminate `proc` and every descendant in its process group: SIGTERM, a short grace, then SIGKILL.
+    `proc` must have been started with start_new_session=True (its pid is then the group id). The SIGKILL
+    goes to the group even when the leader already exited, because an orphaned grandchild (the engramd owner)
+    stays in the group. ProcessLookupError and PermissionError (Darwin EPERM on a zombie-only group)
+    from killpg mean there is nothing left to signal; any other OSError propagates. Without os.killpg (non-POSIX) only the direct child is killed, as before."""
+    if not hasattr(os, "killpg"):
+        proc.kill()
+        proc.wait()
+        return
+    for sig, grace in ((15, _KILL_GRACE_S), (9, None)):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            # ProcessLookupError: the group is gone. PermissionError: on Darwin killpg on a group whose only
+            # member is an unreaped zombie raises EPERM; same meaning, nothing left to signal.
+            break
+        if grace is not None:
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                pass
+    proc.wait()
+
+
+def _run_in_own_group(cmd: List[str], timeout: int) -> subprocess.CompletedProcess:
+    """subprocess.run(cmd, capture_output, text, timeout) except the child leads its own session, and on
+    expiry (or any interruption) its whole group is killed before TimeoutExpired is raised: subprocess.run
+    kills only the direct child, which orphaned the engramd owner the child had launched (#3755)."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except BaseException as exc:
+        _kill_group(proc)
+        if isinstance(exc, subprocess.TimeoutExpired):
+            raise subprocess.TimeoutExpired(cmd, timeout) from None
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def measure_in_layout(layout: Layout, layout_timeout: int = DEFAULT_LAYOUT_TIMEOUT, **kwargs) -> Dict:
     """Run measure() for `layout` in a FRESH process (no runtime module from
     another layout can be cached), return its result. An installed-layout
-    result is checked by check_installed_run() before it is returned."""
-    proc = subprocess.run(
+    result is checked by check_installed_run() before it is returned.
+    `layout_timeout` (seconds) bounds the child; expiry kills the child's WHOLE process group (the engramd
+    owner it launched included, #3755) and raises subprocess.TimeoutExpired."""
+    proc = _run_in_own_group(
         [sys.executable, str(Path(__file__).resolve()), "--_layout-child", layout.to_json(),
          "--_kwargs", json.dumps({k: (str(v) if isinstance(v, Path) else v) for k, v in kwargs.items()})],
-        capture_output=True, text=True, timeout=1800)
+        timeout=layout_timeout)
     if proc.returncode != 0:
         msg = f"{layout.name}-layout run failed (rc {proc.returncode}): {proc.stderr[-1500:]}"
         # The child's last traceback line is `<ExcName>: <text>`; a blind arm / layout violation comes back
@@ -1824,6 +1876,16 @@ def _is_live_store(path: Path) -> bool:
     return any(target == p.resolve() for p in live)
 
 
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be an integer > 0 (got {text!r})")
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be an integer > 0 (got {value})")
+    return value
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
         description="A6 latency delta for a hook's owner read (user-identity: U4d, #3197; stop: U6a, #3664; "
@@ -1845,6 +1907,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="which code layout to measure (#3678): 'installed' builds the plugin from this "
                         "tree into a scratch dir and is the gate cell; 'source' is the checkout; "
                         "default both")
+    p.add_argument("--layout-timeout", type=_positive_int, default=DEFAULT_LAYOUT_TIMEOUT, metavar="SECONDS",
+                   help=f"per-layout child time limit in seconds, an int > 0 (default {DEFAULT_LAYOUT_TIMEOUT}); "
+                        "the session-start arm on a large store can need more")
     p.add_argument("--_layout-child", dest="layout_child", default=None, help=argparse.SUPPRESS)
     p.add_argument("--_kwargs", dest="child_kwargs", default="{}", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
@@ -1870,8 +1935,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             if name not in wanted:
                 continue
             try:  # the build step raises LayoutViolation too (layout_matches_tree): same exit 4
-                layout = build_installed_layout(Path(build_dir) / "plugin") if name == "installed" else source_layout()
-                results.append(measure_in_layout(layout, **kwargs))
+                try:  # the build has its OWN fixed limit; --layout-timeout must not be blamed for it
+                    layout = build_installed_layout(Path(build_dir) / "plugin") if name == "installed" else source_layout()
+                except subprocess.TimeoutExpired as exc:
+                    print(f"engramd_a6_latency: error -- the plugin build step for layout '{name}' exceeded "
+                          f"its fixed {int(exc.timeout)}s limit (no number produced)", file=sys.stderr)
+                    return 4
+                results.append(measure_in_layout(layout, layout_timeout=args.layout_timeout, **kwargs))
+            except subprocess.TimeoutExpired:
+                print(f"engramd_a6_latency: error -- layout '{name}' exceeded --layout-timeout "
+                      f"{args.layout_timeout}s (session-start on a large store can need more; "
+                      "pass --layout-timeout)", file=sys.stderr)
+                return EXIT_LAYOUT_TIMEOUT
             except (ArmBlind, LayoutViolation) as exc:
                 print(f"engramd_a6_latency: BLIND ARM ({type(exc).__name__}) -- no number produced: "
                       f"{' '.join(str(exc).split())[:600]}", file=sys.stderr)

@@ -821,6 +821,7 @@ def test_a_hook_that_opens_the_store_directly_on_the_flag_on_path_is_caught(tool
 
     def in_process(layout, **kw):
         kw = dict(kw, n=20, warmup=2, tripwire_hook_path=state["hook"])
+        kw.pop("layout_timeout", None)  # the child-process limit (#3755) is not a measure() argument
         return dict(tool.measure(**kw), layout=layout.name, layout_root=str(layout.root), parent_walk_calls=0)
 
     monkeypatch.setattr(tool, "measure_in_layout", in_process)

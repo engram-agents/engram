@@ -444,14 +444,14 @@ def test_a_layout_child_that_dies_with_an_arm_blind_traceback_surfaces_as_arm_bl
             self.stderr = err
     layout = tool.source_layout()
     tb = 'Traceback (most recent call last):\n  File "x", line 1, in <module>\n{}: {}\n'
-    monkeypatch.setattr(tool.subprocess, "run", lambda *a, **k: P(tb.format("ArmBlind", "reader focus_block missed")))
+    monkeypatch.setattr(tool, "_run_in_own_group", lambda *a, **k: P(tb.format("ArmBlind", "reader focus_block missed")))
     with pytest.raises(tool.ArmBlind, match="focus_block"):
         tool.measure_in_layout(layout, hook="session-start")
     assert tool.main(["--hook", "session-start", "--layout", "source"]) == 4
-    monkeypatch.setattr(tool.subprocess, "run", lambda *a, **k: P(tb.format("LayoutViolation", "drifted")))
+    monkeypatch.setattr(tool, "_run_in_own_group", lambda *a, **k: P(tb.format("LayoutViolation", "drifted")))
     with pytest.raises(tool.LayoutViolation, match="drifted"):
         tool.measure_in_layout(layout, hook="session-start")
-    monkeypatch.setattr(tool.subprocess, "run", lambda *a, **k: P(tb.format("KeyError", "boom")))
+    monkeypatch.setattr(tool, "_run_in_own_group", lambda *a, **k: P(tb.format("KeyError", "boom")))
     with pytest.raises(RuntimeError) as exc:
         tool.measure_in_layout(layout, hook="session-start")
     assert not isinstance(exc.value, (tool.ArmBlind, tool.LayoutViolation))
