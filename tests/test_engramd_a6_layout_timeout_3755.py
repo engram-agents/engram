@@ -349,3 +349,215 @@ def test_other_oserror_from_killpg_still_propagates(tool, monkeypatch):
                 os.waitpid(pid, 0)
             except (ProcessLookupError, ChildProcessError, PermissionError):
                 pass
+
+
+# ---- #3757: a timeout is honoured in BOUNDED time; an ambiguous killpg ProcessLookupError is not "dead" ----
+_BOUND_MARGIN_S = 2.0
+
+
+def _bound(tool, layout_timeout: float) -> float:
+    return layout_timeout + 2 * tool._KILL_GRACE_S + _BOUND_MARGIN_S
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX")
+def test_timeout_is_bounded_in_time_not_only_eventually_clean(tool, fake_child, monkeypatch):
+    """#3757 C1, beside the C7 'grandchild gone' check: the whole call returns within layout_timeout +
+    2*grace + margin. Mutation: start_new_session=False with the old unbounded proc.wait() (killpg raises
+    ProcessLookupError, read as 'group gone', wait blocks for the child's natural 120 s: this goes red)."""
+    monkeypatch.setenv("A6_FAKE_MODE", "hang")
+    t0 = time.time()
+    with pytest.raises(subprocess.TimeoutExpired):
+        tool.measure_in_layout(tool.source_layout(), layout_timeout=1)
+    assert time.time() - t0 < _bound(tool, 1), "a timeout was not honoured in bounded time"
+    assert _wait_gone(int(fake_child.read_text()))
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX")
+def test_main_timeout_path_is_bounded_in_time(tool, fake_child, monkeypatch, capsys):
+    """#3757 C1 through main(): exit 5 within the same bound. Mutation: as above."""
+    monkeypatch.setenv("A6_FAKE_MODE", "hang")
+    monkeypatch.setattr(tool, "check_installed_run", lambda result, layout: None)
+    t0 = time.time()
+    assert tool.main(["--layout", "source", "--layout-timeout", "1"]) == tool.EXIT_LAYOUT_TIMEOUT
+    assert time.time() - t0 < _bound(tool, 1), "a timeout was not honoured in bounded time"
+    assert _wait_gone(int(fake_child.read_text()))
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX")
+def test_not_a_group_leader_falls_back_to_killing_the_child_and_says_so(tool, monkeypatch, capsys):
+    """#3757 C2. The child is NOT a group leader (_START_NEW_SESSION False), so killpg(pid) raises
+    ProcessLookupError while the leader is ALIVE. That must not read as 'dead': TimeoutExpired within the
+    bound, the direct child reaped, one stderr line saying the group kill failed and the direct child was
+    killed. Honest bound: grandchildren are NOT killed in this case. Mutation: drop the proc.poll() is None
+    fallback (the wait is bounded by the final kill, but no stderr line is written: this goes red)."""
+    monkeypatch.setattr(tool, "_START_NEW_SESSION", False)
+    monkeypatch.setattr(tool, "_KILL_GRACE_S", 0.3)
+    spawned: list = []
+    real_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        p = real_popen(*a, **kw)
+        spawned.append(p)
+        return p
+    monkeypatch.setattr(tool.subprocess, "Popen", spy)
+    t0 = time.time()
+    with pytest.raises(subprocess.TimeoutExpired):
+        tool._run_in_own_group([sys.executable, "-c", _PLAIN_SLEEP], timeout=1)
+    assert time.time() - t0 < _bound(tool, 1)
+    assert spawned and spawned[0].poll() is not None, "the direct child was not reaped"
+    err = capsys.readouterr().err
+    lines = [ln for ln in err.splitlines() if ln.strip()]
+    assert len(lines) == 1, lines
+    assert "killpg" in lines[0] and "direct child" in lines[0]
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX")
+def test_leader_dead_plus_processlookuperror_stays_silent(tool, monkeypatch, capsys):
+    """#3757 C2 boundary: leader already dead + ProcessLookupError is the normal 'group gone' path and writes
+    nothing to stderr. Mutation: write the fallback line unconditionally (this goes red)."""
+    monkeypatch.setattr(tool, "_KILL_GRACE_S", 0.3)
+    real = os.killpg
+
+    def fake(pgid, sig):
+        real(pgid, sig)
+        time.sleep(0.3)   # SIGTERM kills the sleeper; give it time to die so the leader reads dead
+        raise ProcessLookupError(3, "No such process")
+    monkeypatch.setattr(tool.os, "killpg", fake)
+    with pytest.raises(subprocess.TimeoutExpired):
+        tool._run_in_own_group([sys.executable, "-c", _PLAIN_SLEEP], timeout=1)
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX")
+def test_final_wait_is_bounded_when_the_child_survives_sigkill_of_the_group(tool, monkeypatch):
+    """#3757 C3. killpg 'succeeds' but delivers nothing (a swallowed error), the child ignores TERM and is
+    never signalled: the final wait must be one more grace then proc.kill(), not unbounded. Mutation: an
+    unbounded final proc.wait() (blocks for the child's 30 s: this goes red)."""
+    monkeypatch.setattr(tool, "_KILL_GRACE_S", 0.3)
+    monkeypatch.setattr(tool.os, "killpg", lambda pgid, sig: None)
+    t0 = time.time()
+    with pytest.raises(subprocess.TimeoutExpired):
+        tool._run_in_own_group([sys.executable, "-c", _IGNORE_TERM], timeout=1)
+    assert time.time() - t0 < _bound(tool, 1)
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX")
+def test_not_a_leader_fallback_kills_the_direct_child_now_not_one_grace_later(tool, monkeypatch, capsys):
+    """#3757 round 2, finding 1. In the not-a-leader fallback the direct child must die AT the fallback, not
+    when the later bounded final wait times out and kills it one grace later. The child ignores SIGTERM and
+    _KILL_GRACE_S is large, so the two cases are a whole grace apart: with the fallback kill the call returns
+    about `timeout` after start; without it, `timeout + grace`. Mutation: the fallback proc.kill() -> pass
+    (every other cell stays green, because the final wait kills the child anyway: this goes red)."""
+    grace = 3.0
+    monkeypatch.setattr(tool, "_START_NEW_SESSION", False)
+    monkeypatch.setattr(tool, "_KILL_GRACE_S", grace)
+    t0 = time.time()
+    with pytest.raises(subprocess.TimeoutExpired):
+        tool._run_in_own_group([sys.executable, "-c", _IGNORE_TERM], timeout=1)
+    elapsed = time.time() - t0
+    assert "direct child" in capsys.readouterr().err
+    # the no-kill version needs >= 1 + grace (4.0 s); 1 s of timeout + 1.5 s margin for load stays well below
+    assert elapsed < 1 + grace / 2, f"the fallback did not kill the direct child at once ({elapsed:.2f}s)"
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX")
+def test_every_wait_is_bounded_even_when_the_child_cannot_be_reaped(tool, monkeypatch, capsys):
+    """#3757 round 2, finding 2. A child that never dies (uninterruptible sleep): killpg and kill do nothing,
+    every timed wait expires. The caller must still get TimeoutExpired in bounded time, one stderr line says
+    the child could not be reaped after SIGKILL, and EVERY proc.wait call carried a timeout. Mutation: the
+    final proc.wait() without a timeout (this goes red)."""
+    monkeypatch.setattr(tool, "_KILL_GRACE_S", 0.2)
+    monkeypatch.setattr(tool.os, "killpg", lambda pgid, sig: None)
+    spawned: list = []
+    waits: list = []
+    real_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        p = real_popen(*a, **kw)
+        spawned.append(p)
+        real_wait = p.wait
+
+        def wait(timeout=None):
+            waits.append(timeout)
+            if timeout is None:
+                raise AssertionError("unbounded proc.wait()")
+            raise subprocess.TimeoutExpired(a[0], timeout)
+        p.wait = wait
+        p.kill = lambda: None
+        p._real_wait = real_wait
+        return p
+    monkeypatch.setattr(tool.subprocess, "Popen", spy)
+    t0 = time.time()
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            tool._run_in_own_group([sys.executable, "-c", _PLAIN_SLEEP], timeout=1)
+        elapsed = time.time() - t0
+        err = capsys.readouterr().err
+    finally:
+        for p in spawned:
+            p.send_signal(9)
+            p._real_wait(timeout=5)
+    assert waits and all(w is not None for w in waits), waits
+    assert elapsed < _bound(tool, 1)
+    lines = [ln for ln in err.splitlines() if ln.strip()]
+    assert len(lines) == 1 and "reaped" in lines[0] and "SIGKILL" in lines[0], lines
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX")
+@pytest.mark.parametrize("new_session", [True, False], ids=["group-leader", "not-a-leader-fallback"])
+def test_timeout_closes_both_pipes_the_seam_opened(tool, monkeypatch, capsys, new_session):
+    """#3757 round 3. After a real timeout the Popen's stdout AND stderr pipes are closed (they were left
+    open on the exception path: a file-descriptor leak per timeout, two 'unclosed file' ResourceWarnings
+    under -W error::ResourceWarning), in the group-leader path and in the not-a-leader fallback. Mutations:
+    remove both closes (red); close only stdout (red)."""
+    import gc
+    import warnings
+
+    monkeypatch.setattr(tool, "_START_NEW_SESSION", new_session)
+    monkeypatch.setattr(tool, "_KILL_GRACE_S", 0.3)
+    spawned: list = []
+    real_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        p = real_popen(*a, **kw)
+        spawned.append(p)
+        return p
+    monkeypatch.setattr(tool.subprocess, "Popen", spy)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ResourceWarning)
+        with pytest.raises(subprocess.TimeoutExpired):
+            tool._run_in_own_group([sys.executable, "-c", _PLAIN_SLEEP], timeout=1)
+        proc = spawned[0]
+        assert proc.stdout is not None and proc.stderr is not None, "the seam no longer pipes: cell is void"
+        assert proc.stdout.closed, "stdout pipe left open after a timeout"
+        assert proc.stderr.closed, "stderr pipe left open after a timeout"
+        spawned.clear()
+        del proc
+        gc.collect()
+    unclosed = [str(w.message) for w in caught if "unclosed file" in str(w.message)]
+    assert not unclosed, unclosed
+
+
+def test_pipes_are_closed_even_when_the_group_kill_itself_raises(tool, monkeypatch):
+    """#3757 round 3. _kill_group propagating an OSError (the 'other OSError still propagates' contract) must
+    not skip the pipe closes: the same fd leak by another route. Mutation: closes in try/else instead of
+    try/finally (this goes red; the timeout cell above stays green)."""
+    spawned: list = []
+    real_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        p = real_popen(*a, **kw)
+        spawned.append(p)
+        return p
+    monkeypatch.setattr(tool.subprocess, "Popen", spy)
+
+    def boom(proc):
+        proc.kill()
+        proc.wait(timeout=5)
+        raise OSError("kill failed")
+    monkeypatch.setattr(tool, "_kill_group", boom)
+    with pytest.raises(OSError, match="kill failed"):
+        tool._run_in_own_group([sys.executable, "-c", _PLAIN_SLEEP], timeout=1)
+    proc = spawned[0]
+    assert proc.stdout is not None and proc.stderr is not None
+    assert proc.stdout.closed and proc.stderr.closed

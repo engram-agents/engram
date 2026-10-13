@@ -334,12 +334,28 @@ def _count_parent_walks(layout: Layout) -> Dict[str, int]:
 _KILL_GRACE_S = 2.0   # SIGTERM -> SIGKILL grace for a timed-out layout child's process group
 
 
+_START_NEW_SESSION = True   # a seam: tests flip it to drive the "child is not a group leader" degraded case
+
+
 def _kill_group(proc: subprocess.Popen) -> None:
     """Terminate `proc` and every descendant in its process group: SIGTERM, a short grace, then SIGKILL.
     `proc` must have been started with start_new_session=True (its pid is then the group id). The SIGKILL
     goes to the group even when the leader already exited, because an orphaned grandchild (the engramd owner)
-    stays in the group. ProcessLookupError and PermissionError (Darwin EPERM on a zombie-only group)
-    from killpg mean there is nothing left to signal; any other OSError propagates. Without os.killpg (non-POSIX) only the direct child is killed, as before."""
+    stays in the group. PermissionError (Darwin EPERM on a zombie-only group) from killpg means there is
+    nothing left to signal; any other OSError propagates. Without os.killpg (non-POSIX) only the direct
+    child is killed, as before.
+
+    ProcessLookupError from killpg is AMBIGUOUS: the group is gone, or the pid is not a group id at all
+    (the child was not started as a session leader). The leader tells them apart: dead (`proc.poll()` not
+    None) is the normal "group gone" path and silent; still ALIVE means the group kill did not work, so one
+    stderr line says so and the direct child is killed with proc.kill(). Honest bound: in that degraded
+    case the grandchildren are NOT killed; the fallback stops an unbounded wait, it does not recover the
+    group kill.
+
+    Every wait here is bounded: after the loop the child gets one more grace, then proc.kill() and a final
+    wait of one more grace. If even that expires (a child that survives SIGKILL, e.g. in uninterruptible
+    sleep) one stderr line says so and the function returns, so the caller still raises TimeoutExpired; a
+    swallowed error can never turn a timeout into an unbounded wait."""
     if not hasattr(os, "killpg"):
         proc.kill()
         proc.wait()
@@ -347,28 +363,58 @@ def _kill_group(proc: subprocess.Popen) -> None:
     for sig, grace in ((15, _KILL_GRACE_S), (9, None)):
         try:
             os.killpg(proc.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            # ProcessLookupError: the group is gone. PermissionError: on Darwin killpg on a group whose only
-            # member is an unreaped zombie raises EPERM; same meaning, nothing left to signal.
+        except ProcessLookupError:
+            if proc.poll() is None:
+                print(f"engramd_a6_latency: killpg({proc.pid}) found no such group while the child is "
+                      f"still running; falling back to killing the direct child only (descendants not "
+                      f"killed)", file=sys.stderr)
+                proc.kill()
+            break
+        except PermissionError:
+            # On Darwin killpg on a group whose only member is an unreaped zombie raises EPERM; nothing
+            # left to signal.
             break
         if grace is not None:
             try:
                 proc.wait(timeout=grace)
             except subprocess.TimeoutExpired:
                 pass
-    proc.wait()
+    try:
+        proc.wait(timeout=_KILL_GRACE_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=_KILL_GRACE_S)
+        except subprocess.TimeoutExpired:
+            print(f"engramd_a6_latency: child {proc.pid} could not be reaped after SIGKILL within "
+                  f"{_KILL_GRACE_S}s; continuing", file=sys.stderr)
 
 
 def _run_in_own_group(cmd: List[str], timeout: int) -> subprocess.CompletedProcess:
     """subprocess.run(cmd, capture_output, text, timeout) except the child leads its own session, and on
     expiry (or any interruption) its whole group is killed before TimeoutExpired is raised: subprocess.run
-    kills only the direct child, which orphaned the engramd owner the child had launched (#3755)."""
+    kills only the direct child, which orphaned the engramd owner the child had launched (#3755). The
+    expiry is honoured in bounded time (timeout + two kill graces) even when the group kill cannot work
+    (#3757, see _kill_group). On that path both pipes are closed after the kill (a timeout otherwise leaked
+    two file descriptors and, under -W error::ResourceWarning, two 'unclosed file' warnings); on success
+    communicate() has already closed them."""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            start_new_session=True)
+                            start_new_session=_START_NEW_SESSION)
     try:
         out, err = proc.communicate(timeout=timeout)
     except BaseException as exc:
-        _kill_group(proc)
+        try:
+            _kill_group(proc)
+        finally:
+            # communicate() closes the pipes only on its own success path; here they would leak until GC,
+            # also when _kill_group itself raises. Each close is guarded on its own so one failing close
+            # cannot skip the other.
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
         if isinstance(exc, subprocess.TimeoutExpired):
             raise subprocess.TimeoutExpired(cmd, timeout) from None
         raise
