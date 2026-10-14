@@ -48,6 +48,7 @@ import math
 import os
 import select
 import secrets
+import shlex
 import signal
 import socket
 import struct
@@ -95,7 +96,16 @@ except ImportError:
               "pidfile helper, installed beside the engram plugin); set "
               "CLAUDE_PLUGIN_ROOT or reinstall", file=sys.stderr)
         sys.exit(1)
-from engram_regular_io import NotRegularFile, kind_of_path, read_regular_text, write_pidfile
+from engram_regular_io import (
+    NotRegularFile,
+    append_regular_line,
+    kind_of_path,
+    open_regular_append_strict,
+    read_regular_text,
+    read_regular_text_strict,
+    write_pidfile,
+    write_regular_bytes_synced,
+)
 
 from websockets.sync.client import connect as ws_connect
 
@@ -107,6 +117,7 @@ DEFAULT_UMWELT_CONFIG = Path(os.environ.get("UMWELT_CONFIG", Path.home() / ".umw
 DEFAULT_THREAD_OVERRIDE = os.environ.get("CODEX_THREAD_ID")
 STATUS_VERSION = 2
 DEFAULT_REFUSAL_RECHECK_S = 60.0
+EXIT_LOG_NOT_REGULAR = 4  # `start` on a non-regular watcher.log (#3781)
 STATE_VERSION = 6
 MAX_RECENT_DELIVERED = 256
 MAX_MONITOR_RECOVERY_TURNS = 32
@@ -189,11 +200,25 @@ class Logger:
         self.path = path
         self.stdout = stdout
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # #3781: the log is a DIAGNOSTIC sink. A watcher.log that is a FIFO /
+        # directory / socket / symlink / hard link degrades to stderr and keeps
+        # running; the refusal is reported once per transition, never per line.
+        self.degraded = False  # True when the last line went to stderr
+        self._refusal_reported = False
 
     def log(self, message: str) -> None:
         line = f"{utc_now()} {message}"
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        try:
+            append_regular_line(self.path, line)
+            self.degraded = False
+            self._refusal_reported = False
+        except NotRegularFile as exc:
+            self.degraded = True
+            if not self._refusal_reported:
+                self._refusal_reported = True
+                print(f"codex-umwelt-wake: log file {exc}; writing log lines to stderr instead",
+                      file=sys.stderr, flush=True)
+            print(line, file=sys.stderr, flush=True)
         if self.stdout:
             print(line, flush=True)
 
@@ -216,18 +241,78 @@ def bounded_meta(value: Any, limit: int = 72) -> str:
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    # #3781: the temp file must be ONE regular file; NotRegularFile otherwise,
+    # nothing touched. Same bytes as json.dump(indent=2, sort_keys=True) + "\n",
+    # fsynced before the replace as before.
+    data = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    write_regular_bytes_synced(tmp, data.encode("utf-8"))
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        # The tmp was written by us (the strict write above succeeded), so a
+        # failed replace (e.g. the destination is a directory) must not leave it
+        # behind. Never reached when the strict write refused the tmp path.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class StateRefused(BaseException):
+    """The state file, or the temp file its atomic write goes through, is not ONE
+    regular file (#3781). A state INVARIANT, so the watcher reports and idles
+    (cmd_run); it never falls back to default_state() and never exits.
+
+    A BaseException on purpose: attempt_delivery and the persist callbacks sit
+    under many `except Exception` handlers that would turn this into a logged
+    delivery error and a retry on the next cycle, i.e. a wake delivered again
+    every cycle because its state could not be saved. Only cmd_run catches it.
+    .op is "read" or "write"; .exc is the NotRegularFile."""
+
+    def __init__(self, op: str, exc: NotRegularFile) -> None:
+        super().__init__(op, str(exc))
+        self.op = op
+        self.exc = exc
+
+
+def state_refusal_advice(refused: "StateRefused") -> str:
+    """The operator's next step for a refused state file, by what the path IS.
+
+    A symlink or hard link to a regular file IS the state (queue, inflight batch,
+    cursors): removing it reads as default_state(), the next poll re-seeds every
+    cursor to now, and everything queued or missed meanwhile is lost. So a READ
+    refusal of those two kinds gets a ready-to-run copy-and-replace command (one
+    line; 'run: ' to '; removing it instead' is the command, for tests and
+    operators alike). A FIFO, directory, socket (nothing to keep) and any WRITE
+    refusal (the .tmp path holds no state) keep 'Remove it to resume'."""
+    if refused.op == "read" and refused.exc.kind in ("symlink", "hard-linked file"):
+        p = shlex.quote(refused.exc.path)
+        new = shlex.quote(refused.exc.path + ".new")
+        return (f"Replace it with a regular copy of its content, run: "
+                f"cp -- {p} {new} && mv -- {new} {p}; "
+                f"removing it instead restarts from now and LOSES the queue and any "
+                f"crossings missed meanwhile (if the link target is gone the state is gone)")
+    return "Remove it to resume"
+
+
+def write_state(paths: "RuntimePaths", state: dict[str, Any]) -> None:
+    try:
+        atomic_write_json(paths.state_path, state)
+    except NotRegularFile as exc:
+        raise StateRefused("write", exc) from exc
 
 
 def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+    """The state-file read. A path that is not ONE regular file (FIFO, directory,
+    socket, symlink, hard link) raises NotRegularFile (#3781): falling back to the
+    default there would silently reset persisted state. Absent, unreadable, or
+    corrupt JSON still read as the default (corrupt JSON is #3786, unchanged)."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(read_regular_text_strict(path, encoding="utf-8"))
         return data if isinstance(data, dict) else dict(default)
+    except NotRegularFile:
+        raise
     except Exception:
         return dict(default)
 
@@ -2327,9 +2412,11 @@ def wait_for_acceptable_pidfile(paths: RuntimePaths, logger: Logger | None, slee
             if not reported:
                 line = (f"codex-umwelt-wake: refusing to start: the pidfile path {exc}; "
                         f"will recheck every {interval:g}s. Remove it to start")
-                print(line, file=sys.stderr, flush=True)
                 if logger is not None:
                     logger.log(line)
+                # A degraded logger already put the line on stderr (#3781).
+                if logger is None or not getattr(logger, "degraded", False):
+                    print(line, file=sys.stderr, flush=True)
                 reported = True
             sleep(interval)
 
@@ -2346,8 +2433,22 @@ def remove_pid(paths: RuntimePaths) -> None:
             pass
 
 
+_STATUS_REFUSAL_REPORTED = False
+
+
 def update_status(paths: RuntimePaths, payload: dict[str, Any]) -> None:
-    atomic_write_json(paths.status_path, payload)
+    """status.json is a DIAGNOSTIC sink (#3781): any OSError writing it (a temp
+    path that is not ONE regular file, a directory at the destination, EACCES,
+    ENOSPC) skips the write and reports once per transition on stderr; it never
+    ends the watcher."""
+    global _STATUS_REFUSAL_REPORTED
+    try:
+        atomic_write_json(paths.status_path, payload)
+        _STATUS_REFUSAL_REPORTED = False
+    except OSError as exc:
+        if not _STATUS_REFUSAL_REPORTED:
+            _STATUS_REFUSAL_REPORTED = True
+            print(f"codex-umwelt-wake: status not written: {exc}", file=sys.stderr, flush=True)
 
 
 def _read_regular_or_note(path: Path, what: str) -> str | None:
@@ -2398,7 +2499,11 @@ def run_cycle(
     started_at: str,
     codex_monitor: CodexItemCompletedMonitor | None = None,
 ) -> dict[str, Any]:
-    state = normalize_state(load_json(paths.state_path, default_state()))
+    try:
+        loaded_state = load_json(paths.state_path, default_state())
+    except NotRegularFile as exc:
+        raise StateRefused("read", exc) from exc
+    state = normalize_state(loaded_state)
     base_status = default_status(paths)
     try:
         transport = resolve_transport_target(app_server)
@@ -2429,7 +2534,7 @@ def run_cycle(
                 state=state,
                 sessions_dir=sessions_dir,
                 thread_override=thread_override,
-                persist_state=lambda current_state: atomic_write_json(paths.state_path, current_state),
+                persist_state=lambda current_state: write_state(paths, current_state),
             )
         if context is not None:
             try:
@@ -2437,17 +2542,17 @@ def run_cycle(
             except Exception as exc:
                 umwelt_detail = f"poll failed: {exc}"
                 logger.log(f"umwelt poll failed: {exc}")
-        atomic_write_json(paths.state_path, state)
+        write_state(paths, state)
         result = attempt_delivery(
             state,
             app_server=app_server,
             sessions_dir=sessions_dir,
             thread_override=thread_override,
             logger=logger,
-            persist_state=lambda current_state: atomic_write_json(paths.state_path, current_state),
-            after_inflight_persist=lambda current_state, _inflight: atomic_write_json(paths.state_path, current_state),
+            persist_state=lambda current_state: write_state(paths, current_state),
+            after_inflight_persist=lambda current_state, _inflight: write_state(paths, current_state),
         )
-        atomic_write_json(paths.state_path, state)
+        write_state(paths, state)
         status_mode = result.status
         status_detail = result.detail
         if umwelt_detail is not None:
@@ -2517,6 +2622,17 @@ def build_paths(state_dir: Path) -> RuntimePaths:
     )
 
 
+def _idle_wait(seconds: float) -> None:
+    """Sleep up to `seconds`, returning early once a stop is requested (the
+    signal handlers only set a flag, and time.sleep resumes after one)."""
+    deadline = time.monotonic() + seconds
+    while not _STOP_REQUESTED:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.2, remaining))
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     global _STOP_REQUESTED
     _STOP_REQUESTED = False
@@ -2534,18 +2650,39 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     codex_monitor = CodexItemCompletedMonitor(app_server=args.app_server, logger=logger)
 
+    exit_code = 0
+    state_refusal_reported = False
     try:
         while True:
-            run_cycle(
-                paths=paths,
-                umwelt_config=args.umwelt_config,
-                app_server=args.app_server,
-                sessions_dir=args.sessions_dir,
-                thread_override=args.thread_id,
-                logger=logger,
-                started_at=started_at,
-                codex_monitor=codex_monitor,
-            )
+            try:
+                run_cycle(
+                    paths=paths,
+                    umwelt_config=args.umwelt_config,
+                    app_server=args.app_server,
+                    sessions_dir=args.sessions_dir,
+                    thread_override=args.thread_id,
+                    logger=logger,
+                    started_at=started_at,
+                    codex_monitor=codex_monitor,
+                )
+                state_refusal_reported = False
+            except StateRefused as refused:
+                # #3781: the state file (or its temp file) is not ONE regular
+                # file. Report ONCE through the (degraded-safe) logger, then idle
+                # and recheck; never fall back to default_state(), never exit.
+                interval = _refusal_recheck_seconds()
+                if not state_refusal_reported:
+                    logger.log(f"codex-umwelt-wake: refusing to {refused.op} the state file: "
+                               f"{refused.exc}; idling, will recheck every {interval:g}s. "
+                               f"{state_refusal_advice(refused)}")
+                    state_refusal_reported = True
+                if args.once:
+                    exit_code = 1
+                    break
+                _idle_wait(interval)
+                if _STOP_REQUESTED:
+                    break
+                continue
             if args.once or _STOP_REQUESTED:
                 break
             time.sleep(args.interval)
@@ -2566,7 +2703,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 }
             )
             update_status(paths, stopped)
-    return 0
+    return exit_code
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -2590,14 +2727,26 @@ def cmd_start(args: argparse.Namespace) -> int:
     ]
     if args.thread_id:
         cmd.extend(["--thread-id", args.thread_id])
-    log_handle = paths.log_path.open("a", encoding="utf-8")
-    subprocess.Popen(
-        cmd,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    # #3781: an interactive one-shot. A watcher.log that is not ONE regular file
+    # is refused LOUDLY before anything is spawned (the same strict open gives
+    # the handle Popen takes as the child's stdout).
+    try:
+        log_handle = open_regular_append_strict(paths.log_path)
+    except NotRegularFile as exc:
+        print(f"codex-umwelt-wake: refusing to start: the log path {exc}; "
+              f"nothing was started. Remove it and start again",
+              file=sys.stderr, flush=True)
+        return EXIT_LOG_NOT_REGULAR
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    finally:
+        log_handle.close()
     logger.log("spawned background watcher")
     return 0
 

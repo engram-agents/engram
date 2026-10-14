@@ -96,9 +96,30 @@ def write_pidfile(path, data: bytes) -> None:
         write access to the directory that holds the pidfile (the same
         precondition the guard already assumes), and there is no portable
         remedy."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = _open_single_regular(path, os.O_WRONLY | os.O_CREAT)
     try:
-        fd = os.open(path, flags, 0o666)
+        os.ftruncate(fd, 0)
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
+def _open_single_regular(path, flags, mode=0o666):
+    """The ONE strict-open sequence (#3773, extracted for #3781): open `path`
+    with `flags` PLUS O_NOFOLLOW|O_NONBLOCK and never O_TRUNC, map ENXIO,
+    ELOOP, EISDIR, EOPNOTSUPP and ENODEV to NotRegularFile (any other OSError
+    propagates unchanged), then fstat the fd: not a regular file, or
+    st_nlink != 1 -> close it and raise NotRegularFile. Returns the open fd of
+    a single regular file. The caller owns the fd and closes it.
+
+    O_NOFOLLOW refuses a symlink (on a write the follow IS the truncation of
+    its target); O_NONBLOCK makes a reader-less FIFO fail with ENXIO instead of
+    waiting. `write_pidfile`, `append_regular_line`,
+    `write_regular_bytes_synced`, `read_regular_text_strict` and
+    `open_regular_append_strict` all go through here, so a refusal means the
+    same thing at every one of them."""
+    try:
+        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, mode)
     except OSError as exc:
         # getattr so a platform lacking one of them still imports.
         not_regular = {
@@ -109,18 +130,86 @@ def write_pidfile(path, data: bytes) -> None:
         if exc.errno not in not_regular:
             raise
         try:
-            mode = os.lstat(path).st_mode
+            mode_seen = os.lstat(path).st_mode
         except OSError:
-            mode = None
-        raise NotRegularFile(path, mode, None) from exc
+            mode_seen = None
+        raise NotRegularFile(path, mode_seen, None) from exc
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
             raise NotRegularFile(path, st.st_mode, st.st_nlink)
-        os.ftruncate(fd, 0)
-        os.write(fd, data)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _write_all(fd, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def append_regular_line(path, text: str) -> None:
+    """Append `text` and a newline to `path`, which must be ONE regular file
+    (#3781): the strict open of `write_pidfile` (no symlink, no hard link, no
+    FIFO / directory / socket; NotRegularFile otherwise, nothing touched) with
+    O_APPEND|O_WRONLY|O_CREAT added, one write, close. UTF-8. For the
+    diagnostic logs whose callers must degrade, not hang or write through a
+    link; the older open_regular_text_append follows symlinks and does not
+    check st_nlink, and its many callers keep that behaviour."""
+    fd = _open_single_regular(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    try:
+        _write_all(fd, (text + "\n").encode("utf-8"))
     finally:
         os.close(fd)
+
+
+def write_regular_bytes_synced(path, data: bytes) -> None:
+    """Replace the content of `path`, which must be ONE regular file, with
+    `data` and fsync before closing (#3781). The strict open of
+    `write_pidfile` (O_TRUNC is never passed at open: a refused target is
+    never touched; the truncate is an ftruncate AFTER the fstat check), then
+    ftruncate, write, os.fsync, close. For the atomic-write temp files, whose
+    callers `os.replace` them into place and rely on the data being durable
+    first. NotRegularFile for a refused target."""
+    fd = _open_single_regular(path, os.O_WRONLY | os.O_CREAT)
+    try:
+        os.ftruncate(fd, 0)
+        _write_all(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def read_regular_text_strict(path, encoding=None) -> str:
+    """The whole text of `path`, which must be ONE regular file (#3781): the
+    strict open (no O_CREAT) so a symlink or hard link is REFUSED too, where
+    read_regular_text follows a symlink on purpose. NotRegularFile for a
+    refused target, FileNotFoundError for an absent one, never blocks. For a
+    state file whose refusal must not read as 'absent' or 'empty'."""
+    fd = _open_single_regular(path, os.O_RDONLY)
+    try:
+        f = os.fdopen(fd, "r", encoding=encoding)
+    except BaseException:
+        os.close(fd)
+        raise
+    with f:
+        return f.read()
+
+
+def open_regular_append_strict(path):
+    """A binary append handle on `path`, which must be ONE regular file (#3781):
+    the strict open with O_APPEND|O_WRONLY|O_CREAT, then O_NONBLOCK cleared so
+    the handle behaves as a plain blocking file when it is handed on (e.g. as a
+    child's stdout). NotRegularFile for a refused target. The caller closes it."""
+    fd = _open_single_regular(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    try:
+        os.set_blocking(fd, True)
+        return os.fdopen(fd, "ab")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def kind_of_path(path):

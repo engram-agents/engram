@@ -167,7 +167,13 @@ except ImportError:
               "pidfile helper, installed beside the engram plugin); set "
               "CLAUDE_PLUGIN_ROOT or reinstall", file=sys.stderr)
         sys.exit(1)
-from engram_regular_io import NotRegularFile, kind_of_path, read_regular_text, write_pidfile
+from engram_regular_io import (
+    NotRegularFile,
+    kind_of_path,
+    read_regular_text,
+    write_pidfile,
+    write_regular_bytes_synced,
+)
 
 EXIT_PIDFILE_NOT_REGULAR = 4
 
@@ -458,6 +464,7 @@ class Supervisor:
         self.pidfile = pidfile
         self.lock = threading.Lock()  # R3: shared across every reader thread
         self.shutdown = threading.Event()
+        self._status_refusal_reported = False  # #3781: once per transition
 
     # -- lifecycle -----------------------------------------------------
     def start_child(self, name: str) -> None:
@@ -549,9 +556,30 @@ class Supervisor:
             }
         tmp = self.status_file + ".tmp"
         Path(tmp).parent.mkdir(parents=True, exist_ok=True)
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, self.status_file)
+        # #3781: the status file is a DIAGNOSTIC sink. A temp path that is not ONE
+        # regular file (FIFO, directory, socket, symlink, hard link) skips this
+        # write and is reported once per transition; the supervisor keeps
+        # running and `--check` reads the status as stale.
+        tmp_written = False
+        try:
+            write_regular_bytes_synced(tmp, json.dumps(data).encode("utf-8"))
+            tmp_written = True
+            os.replace(tmp, self.status_file)
+        except OSError as exc:
+            # A refused strict tmp write leaves the planted path untouched; only
+            # a failed replace after a good write (e.g. a directory at the
+            # destination) unlinks our own tmp.
+            if tmp_written:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            if not self._status_refusal_reported:
+                self._status_refusal_reported = True
+                print(f"monitor-supervisor: status not written: {exc}",
+                      file=sys.stderr, flush=True)
+            return
+        self._status_refusal_reported = False
 
     def _status_loop(self) -> None:
         while not self.shutdown.wait(self.status_interval):
