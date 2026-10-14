@@ -106,8 +106,8 @@ jobs:
         # assignment's `)" || true` are two layers, each sufficient alone. The
         # summary-append guard is separately load-bearing (a full disk can make
         # that write fail). `continue-on-error: true` is the last backstop.
-        # `steps.suite.outcome` stays the only thing the ci-nightly notify steps
-        # below key on; this step is not read by them.
+        # The ci-nightly notify steps below key on `steps.suite.outcome` and
+        # `steps.timing.outcome` (#3784); this step is not read by them.
         # Paired with the `after suite` step to attribute disk growth to the
         # suite (e.g. pytest tmp_path dirs) rather than to guesswork.
         continue-on-error: true
@@ -190,8 +190,15 @@ jobs:
           # -o tmp_path_retention_policy=failed (#3539): pytest's default keeps
           # every test's tmp_path (measured 1.8G retained on a green night);
           # with "failed", passing tests' dirs are removed, failing tests keep theirs.
+          #
+          # -m "not timing" (#3784): a cell that asserts a measured ratio or
+          # latency bound judges the TRACER under --cov (the stage-accounting
+          # cell read ~0.118 against its 10% bound, 0.072-0.076 without
+          # coverage). Those cells are deselected here and judged by the
+          # separate no-coverage `timing` step below, on the same runner.
           pytest tests/ src/forum/tests/ -v --tb=short \
             -o tmp_path_retention_policy=failed \
+            -m "not timing" \
             --cov=src --cov-branch \
             --cov-report=xml:coverage.xml --cov-report=html:htmlcov --cov-report=term \
             2>&1 | tee /tmp/nightly-output.log
@@ -228,6 +235,43 @@ jobs:
           {
             printf '### disk usage — after suite\n\n```\n%s\n```\n' "$OUT" >> "$GITHUB_STEP_SUMMARY"
           } 2>/dev/null || true
+
+      - name: Run timing cells (no coverage)
+        # #3784 — the cells the suite step deselects with -m "not timing", run
+        # with NO tracer so their measured ratios are judged in the regime they
+        # were calibrated in. `!cancelled()` so a red coverage step does not
+        # drop this signal. Its own id: both ci-nightly notify steps read this
+        # step's outcome AND the suite step's, so a red timing step opens the
+        # issue and a green suite cannot close an issue while timing is red.
+        # `-m timing` always collects at least the stage-accounting cell (a cell
+        # that skips still counts as collected), so pytest's exit code 5 (no
+        # tests collected) cannot occur while the marker is in use; it is
+        # deliberately NOT swallowed, so a deleted marker turns this step red.
+        # `-rs` lists skips, so a cell that skipped under an unexpected tracer
+        # shows its named reason instead of passing quietly.
+        if: ${{ !cancelled() }}
+        id: timing
+        shell: bash
+        run: |
+          set -o pipefail
+          # `|| rc=$?` keeps pytest's own exit code (pipefail makes the pipeline
+          # status pytest's) without tripping the runner's `-e`.
+          rc=0
+          pytest tests/ src/forum/tests/ -v --tb=short -rs \
+            -o tmp_path_retention_policy=failed \
+            -m timing \
+            2>&1 | tee /tmp/nightly-timing.log || rc=$?
+          # Under a tracer every timing cell SKIPS (conftest.py's
+          # TRACER_SKIP_REASON) and pytest still exits 0: the bound would be
+          # unjudged while the step is green and the ci-nightly issue could
+          # close. So a skip reason in this step's own log fails the step. The
+          # text is the tail of TRACER_SKIP_REASON; a test pins that it stays so.
+          # `grep` sits in an `if`, so a no-match (1) never trips -e/pipefail.
+          if grep -q -F 'judged in the no-coverage timing step' /tmp/nightly-timing.log; then
+            echo "::error::timing cells were skipped under a tracer, so the timing bound was NOT judged"
+            [ "$rc" -ne 0 ] || rc=1
+          fi
+          exit "$rc"
 
       - name: Upload coverage artifacts
         # A red suite should still yield its partial report (#2774) — hence
@@ -372,7 +416,7 @@ jobs:
         # it replaces was too broad — true on any prior step's failure, so a
         # failed label step on a green night filed a false issue with a
         # passing log tail.
-        if: ${{ !cancelled() && steps.suite.outcome != 'success' }}
+        if: ${{ !cancelled() && (steps.suite.outcome != 'success' || steps.timing.outcome != 'success') }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -382,10 +426,18 @@ jobs:
           DATE="$(date -u +%Y-%m-%d)"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           TAIL="$(tail -n 40 /tmp/nightly-output.log 2>/dev/null || echo '(log unavailable — the job failed before the pytest step ran)')"
+          # #3784: a red timing step must show its own tail too.
+          TIMING_TAIL="$(tail -n 40 /tmp/nightly-timing.log 2>/dev/null || echo '(timing log unavailable)')"
           BODY="Nightly full-suite run failed: ${RUN_URL}
 
           \`\`\`
           ${TAIL}
+          \`\`\`
+
+          Timing step (no coverage):
+
+          \`\`\`
+          ${TIMING_TAIL}
           \`\`\`"
           EXISTING="$(gh issue list --label ci-nightly --state open --json number --jq '.[0].number // empty')"
           if [ -n "$EXISTING" ]; then
@@ -401,7 +453,7 @@ jobs:
         # Fires when the suite succeeded and the job was not cancelled. A
         # bare `steps.suite.outcome == 'success'` would inherit the default
         # success() and be skipped whenever the label step failed.
-        if: ${{ !cancelled() && steps.suite.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.suite.outcome == 'success' && steps.timing.outcome == 'success' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

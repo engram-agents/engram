@@ -32,9 +32,13 @@ BEFORE = "disk usage — before suite"
 AFTER = "disk usage — after suite"
 
 ON_FAILURE_NAME = "on failure — open or update the ci-nightly issue"
-ON_FAILURE_IF = "${{ !cancelled() && steps.suite.outcome != 'success' }}"
+ON_FAILURE_IF = (
+    "${{ !cancelled() && (steps.suite.outcome != 'success' || steps.timing.outcome != 'success') }}"
+)
 ON_SUCCESS_NAME = "on success — close any open ci-nightly issue"
-ON_SUCCESS_IF = "${{ !cancelled() && steps.suite.outcome == 'success' }}"
+ON_SUCCESS_IF = (
+    "${{ !cancelled() && steps.suite.outcome == 'success' && steps.timing.outcome == 'success' }}"
+)
 
 
 @pytest.fixture(scope="module")

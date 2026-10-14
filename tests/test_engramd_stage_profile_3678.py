@@ -30,7 +30,6 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -146,11 +145,41 @@ def test_stage_sides_partition_the_names(tool):
 
 @requires_linux_owner
 def test_the_unattributed_remainder_is_reported_not_hidden(plain):
-    """Control: with no injection the remainder is its own row. Mutation:
-    omit it, or fold it into a stage -> red."""
-    row = plain["unattributed"]
-    assert row["n"] >= 60
-    assert row["p50_ms"] >= 0
+    """Control: with no injection the remainder is its own row, a real sample
+    (n >= 60) whose p50 is not below the clock-noise floor (a small negative
+    is noise; see UNATTRIBUTED_NEG_FLOOR_MS). Mutation: omit the row, or fold
+    it into a stage -> red."""
+    assert _remainder_row_ok(plain["unattributed"]), plain["unattributed"]
+
+
+def _row(p50, n=60):
+    return {"n": n, "p50_ms": p50}
+
+
+def test_the_remainder_row_tolerates_clock_noise_below_zero():
+    """Contract (#3784): a p50 of -0.04 ms is clock-independence noise (the CI
+    runner read -0.0116 and -0.0083). Mutation: the old `>= 0` -> red."""
+    assert _remainder_row_ok(_row(-0.04))
+    assert _remainder_row_ok(_row(0.0))
+    assert _remainder_row_ok(_row(0.02))
+
+
+def test_the_remainder_row_still_refuses_real_over_attribution():
+    """-0.06 ms is past the floor. Mutation: drop the floor / widen it -> red."""
+    assert not _remainder_row_ok(_row(-0.06))
+    assert not _remainder_row_ok(_row(-0.2))
+
+
+def test_the_remainder_row_needs_a_real_sample():
+    """A row with n < 60 is not a measured remainder. Mutation: drop the n
+    check -> red."""
+    assert not _remainder_row_ok(_row(0.02, n=59))
+    assert not _remainder_row_ok(_row(0.02, n=0))
+
+
+def test_the_negative_floor_is_point_zero_five_ms():
+    """The literal, not the constant compared with itself."""
+    assert UNATTRIBUTED_NEG_FLOOR_MS == 0.05
 
 
 # Accounting is judged on the BEST of up to this many independent profiles
@@ -161,14 +190,19 @@ def test_the_unattributed_remainder_is_reported_not_hidden(plain):
 # worst 0.076), so the bound stays and the sample changes.
 ACCOUNTING_PROFILES = 3
 
-# Wait this long before EACH extra profile (#3784). The nightly of 2026-10-14
-# missed with all three back-to-back profiles, taken within ~1 s, inflated by
-# nearly the same amount (0.104, 0.101, 0.105 vs the 0.10 bound; quiet-host
-# 0.073-0.078): the draws shared one contention episode. HYPOTHESIS, not a
-# fact: spacing the draws puts them in different episodes. If a nightly misses
-# with spaced draws the hypothesis is falsified, and the next move is to
-# measure the runner's quiet ratio -- NOT to widen the bound.
-RETRY_SPACING_S = 10
+# The remainder's sign is clock noise near zero (#3784, Borges's ruling): it is the
+# end-to-end call minus stages timed on independent clocks, so a small negative
+# p50 is not over-attribution. The contract is that the row is REPORTED, never
+# hidden or folded into a stage. Measured 2026-10-14: the CI runner read -0.0116
+# and -0.0083 ms; Borges's Linux seat read +0.018 to +0.025 ms (n=20 per
+# commit). The floor is about 4x the worst CI reading; over-attribution larger
+# than it stays red.
+UNATTRIBUTED_NEG_FLOOR_MS = 0.05
+
+
+def _remainder_row_ok(row):
+    """The reported remainder row: a real sample, p50 not below the noise floor."""
+    return row["n"] >= 60 and row["p50_ms"] >= -UNATTRIBUTED_NEG_FLOOR_MS
 
 
 def _accounted(profile):
@@ -195,15 +229,13 @@ def _judge_and_report(profiles, write):
     return ok, seen
 
 
-def _best_of(first, take_next, cap=ACCOUNTING_PROFILES, pause=time.sleep):
+def _best_of(first, take_next, cap=ACCOUNTING_PROFILES):
     """Profiles to judge: `first`, then further ones from `take_next()` only
     while none so far is within the bound, at most `cap` in all. Stopping at
-    the first pass gives the same verdict as taking all `cap`. Each extra draw
-    is preceded by `pause(RETRY_SPACING_S)` (#3784); a first profile that
-    passes costs no wait."""
+    the first pass gives the same verdict as taking all `cap`. The draws are
+    back to back (no spacing; #3784 re-ruled it out)."""
     profiles = [first]
     while not _stages_account(profiles)[0] and len(profiles) < cap:
-        pause(RETRY_SPACING_S)
         profiles.append(take_next())
     return profiles
 
@@ -265,7 +297,7 @@ def test_best_of_retries_past_an_inflated_first_profile():
     second is quiet -> judged pass after exactly one more draw. Mutation:
     never retry (judge the first profile alone) -> red."""
     take_next, calls = _producer(_synthetic(0.07, 1.0), _synthetic(0.07, 1.0))
-    profiles = _best_of(_synthetic(0.15, 1.0), take_next, pause=lambda s: None)
+    profiles = _best_of(_synthetic(0.15, 1.0), take_next)
     assert _stages_account(profiles)[0]
     assert len(calls) == 1
 
@@ -274,7 +306,7 @@ def test_best_of_takes_no_extra_profile_when_the_first_passes():
     """A quiet run costs one profile, as before #3721. Mutation: always take
     `cap` profiles -> red."""
     take_next, calls = _producer(_synthetic(0.07, 1.0), _synthetic(0.07, 1.0))
-    _best_of(_synthetic(0.07, 1.0), take_next, pause=lambda s: None)
+    _best_of(_synthetic(0.07, 1.0), take_next)
     assert calls == []
 
 
@@ -282,7 +314,7 @@ def test_best_of_stops_at_the_cap_when_none_passes():
     """Persistent unattributed time: exactly cap - 1 extra draws, then fail.
     Mutation: cap off by one either way -> red."""
     take_next, calls = _producer(*[_synthetic(0.15, 1.0)] * 5)
-    profiles = _best_of(_synthetic(0.15, 1.0), take_next, pause=lambda s: None)
+    profiles = _best_of(_synthetic(0.15, 1.0), take_next)
     # Literals, not the constant compared to itself: the ruling is three
     # (Sol's colleague pass, M-c: ACCOUNTING_PROFILES = 2 stayed green).
     assert len(calls) == 2
@@ -309,12 +341,12 @@ def test_accounting_floor_is_point_zero_five_ms_on_a_fast_call():
     assert not _stages_account([_synthetic(0.06, 0.2)])[0]
 
 
-def _live_accounting(tool, store, plain, pause=time.sleep):
+def _live_accounting(tool, store, plain):
     """The live test's body: `plain` first, then FRESH profiles drawn from the
     real profiler on the same store. Kept apart from the test so a fake `tool`
     can pin what the retry draws (Sol's blocker, M-d: a retry that re-judges
     `plain` instead of drawing a new profile left all 52 green)."""
-    return _best_of(plain, lambda: tool.profile(n=60, home=store, warmup=10), pause=pause)
+    return _best_of(plain, lambda: tool.profile(n=60, home=store, warmup=10))
 
 
 class _FakeTool:
@@ -335,7 +367,7 @@ def test_live_retry_judges_a_fresh_profile_not_plain_again():
     fresh = _synthetic(0.07, 1.0)
     tool = _FakeTool(fresh, _synthetic(0.07, 1.0))
     plain = _synthetic(0.15, 1.0)
-    profiles = _live_accounting(tool, store, plain, pause=lambda s: None)
+    profiles = _live_accounting(tool, store, plain)
     assert profiles == [plain, fresh]
     assert profiles[1] is fresh
     assert _stages_account(profiles)[0]
@@ -346,76 +378,16 @@ def test_live_retry_fails_with_every_drawn_pair_reported():
     """Inflated `plain` and inflated draws -> fail, and the message carries
     the fake's own pairs, so a failure shows what was actually judged."""
     tool = _FakeTool(_synthetic(0.16, 1.0), _synthetic(0.17, 1.0), _synthetic(0.07, 1.0))
-    profiles = _live_accounting(tool, object(), _synthetic(0.15, 1.0), pause=lambda s: None)
+    profiles = _live_accounting(tool, object(), _synthetic(0.15, 1.0))
     ok, seen = _stages_account(profiles)
     assert not ok
     assert seen == [(0.15, 1.0), (0.16, 1.0), (0.17, 1.0)]
     assert len(tool.calls) == 2
 
 
-# Retry spacing (#3784) and reporting. CONTRACT, written before the code:
-#   C1 the wait is BETWEEN draws: pause(10) immediately before each extra draw;
-#   C2 a first profile that passes costs one profile and no wait;
-#   C3 spacing does not soften a persistent miss: still fails, cap-1 pauses;
-#   C4 _judge_and_report writes exactly one line with every judged pair, on pass
-#      AND fail, and returns the same (ok, seen) as _stages_account;
-#   C5 _live_accounting threads `pause` through to the retry.
-
-def _event_log():
-    events = []
-
-    def pause(seconds):
-        events.append(f"pause:{seconds}")
-    return events, pause
-
-
-def _logging_producer(events, *profiles):
-    draws = iter(profiles)
-
-    def take_next():
-        events.append("draw")
-        return next(draws)
-    return take_next
-
-
-def test_the_wait_is_between_draws_not_before_the_first_judgement():
-    """C1: inflated first profile, passing second draw -> the wait comes
-    immediately before the draw. Mutation: drop the pause call, or pause after
-    the draw -> red."""
-    events, pause = _event_log()
-    take_next = _logging_producer(events, _synthetic(0.07, 1.0))
-    _best_of(_synthetic(0.15, 1.0), take_next, pause=pause)
-    assert events == ["pause:10", "draw"]
-
-
-def test_a_first_profile_that_passes_costs_no_wait_and_no_draw():
-    """C2. Mutation: pause before the first judgement or on the pass path ->
-    red."""
-    events, pause = _event_log()
-    take_next = _logging_producer(events, _synthetic(0.07, 1.0))
-    _best_of(_synthetic(0.07, 1.0), take_next, pause=pause)
-    assert events == []
-
-
-def test_spacing_does_not_soften_a_persistent_miss():
-    """C3: three persistent 0.15-ratio profiles still fail, with exactly
-    cap - 1 waits, one before each extra draw. Mutation: one wait in total
-    instead of one per draw -> red. (The bound itself is pinned at its edge by
-    test_accounting_bound_is_inclusive_at_ten_percent, not here: 0.15 would
-    still fail a slightly wider bound.)"""
-    events, pause = _event_log()
-    take_next = _logging_producer(events, *[_synthetic(0.15, 1.0)] * 5)
-    profiles = _best_of(_synthetic(0.15, 1.0), take_next, pause=pause)
-    ok, seen = _stages_account(profiles)
-    assert not ok, seen
-    assert events == ["pause:10", "draw", "pause:10", "draw"]
-
-
-def test_the_retry_spacing_is_ten_seconds():
-    """The ruling's number, pinned as a literal rather than the constant
-    compared to itself. Mutation: RETRY_SPACING_S = 0 -> red."""
-    assert RETRY_SPACING_S == 10
-
+# Reporting (#3784). CONTRACT, written before the code: _judge_and_report writes
+# exactly one line with every judged pair, on pass AND fail, and returns the same
+# (ok, seen) as _stages_account.
 
 def test_a_passing_run_reports_every_judged_pair():
     """C4: write called exactly once, the line carries each pair's values, and
@@ -444,24 +416,7 @@ def test_a_failing_run_reports_every_judged_pair_once():
         assert value in lines[0]
 
 
-def test_live_accounting_threads_the_pause_to_the_fresh_draw():
-    """C5: the pause is taken before the fresh draw, in order; and not at all
-    when `plain` passes. Mutation: _live_accounting drops `pause` (the retry
-    sleeps for real) -> red."""
-    events, pause = _event_log()
-
-    class _LoggingTool:
-        def profile(self, **kwargs):
-            events.append("draw")
-            return _synthetic(0.07, 1.0)
-
-    _live_accounting(_LoggingTool(), object(), _synthetic(0.15, 1.0), pause=pause)
-    assert events == ["pause:10", "draw"]
-    events.clear()
-    _live_accounting(_LoggingTool(), object(), _synthetic(0.07, 1.0), pause=pause)
-    assert events == []
-
-
+@pytest.mark.timing
 @requires_linux_owner
 def test_stages_account_for_the_end_to_end_call(tool, store, plain, request):
     """The stages tile the independently timed end-to-end call: what they do
@@ -478,9 +433,8 @@ def test_stages_account_for_the_end_to_end_call(tool, store, plain, request):
     above; the retry's sample size is pinned there too, but only as the
     arguments passed, not as a measured adequacy.
 
-    Extra profiles are spaced RETRY_SPACING_S apart with the real time.sleep
-    (#3784), and the judged pairs are written to the terminal on every run so
-    they show under `pytest -v` without `-s`."""
+    The judged pairs are written to the terminal on every run (#3784) so they
+    show under `pytest -v` without `-s`."""
     reporter = request.config.pluginmanager.get_plugin("terminalreporter")
     write = reporter.write_line if reporter is not None else (lambda line: None)
     profiles = _live_accounting(tool, store, plain)
@@ -523,6 +477,7 @@ def test_every_client_and_owner_stage_is_injectable(tool):
     assert set(tool.INJECTABLE_STAGES) == set(tool.CLIENT_STAGES) | set(tool.OWNER_STAGES)
 
 
+@pytest.mark.timing
 @requires_linux_owner
 @pytest.mark.parametrize("target", _INJECTABLE)
 def test_an_injected_delay_lands_in_its_own_stage_and_no_other(tool, store, plain, target):
@@ -562,6 +517,7 @@ FUNCTION_TO_STAGE = [
 ]
 
 
+@pytest.mark.timing
 @requires_linux_owner
 @pytest.mark.parametrize("side,function,stage", FUNCTION_TO_STAGE,
                          ids=[f"{st}<-{fn}" for _, fn, st in FUNCTION_TO_STAGE])

@@ -170,3 +170,69 @@ def _service_manager_guard(service_manager_shim_dir, monkeypatch):
     monkeypatch.setenv(
         "PATH", f"{service_manager_shim_dir}{os.pathsep}{os.environ.get('PATH', os.defpath)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# #3784 -- the `timing` marker: a cell that asserts a measured ratio or latency
+# bound judges the TRACER under coverage (the stage-accounting cell read ~0.118
+# against its 10% bound, 0.072-0.076 without). The nightly deselects them from the
+# coverage step (-m "not timing") and judges them in a no-coverage step (-m timing);
+# this hook is the loud backstop: a timing cell that finds a tracer SKIPS with the
+# named reason. It never passes and never silently returns there.
+#
+# One hook keyed on the marker, not a per-cell fixture: it runs in
+# pytest_runtest_setup with tryfirst, i.e. BEFORE any fixture (a module-scoped
+# fixture is set up before a function-scoped one whatever the argument order, so
+# a guard fixture cannot skip ahead of an expensive module fixture), and a new
+# `timing` cell is guarded automatically. This root conftest reaches both test roots.
+
+TRACER_SKIP_REASON = "timing cell under an active tracer; judged in the no-coverage timing step"
+
+
+def _probe_settrace():
+    import sys
+
+    return sys.gettrace() is not None
+
+
+def _probe_monitoring():
+    """The sys.monitoring coverage tool (coverage.py on 3.12+ with COVERAGE_CORE=sysmon)."""
+    import sys
+
+    if not hasattr(sys, "monitoring"):
+        return False
+    return sys.monitoring.get_tool(sys.monitoring.COVERAGE_ID) is not None
+
+
+def _probe_coverage():
+    """An active coverage.Coverage; coverage need not be installed."""
+    try:
+        import coverage
+    except ImportError:
+        return False
+    return coverage.Coverage.current() is not None
+
+
+_TRACER_PROBES = (_probe_settrace, _probe_monitoring, _probe_coverage)
+
+
+def _tracer_active():
+    """True when any tracer probe fires. A probe that raises counts as 'no tracer'."""
+    for probe in _TRACER_PROBES:
+        try:
+            if probe():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _skip_under_tracer():
+    if _tracer_active():
+        pytest.skip(TRACER_SKIP_REASON)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item):
+    if item.get_closest_marker("timing") is not None:
+        _skip_under_tracer()
