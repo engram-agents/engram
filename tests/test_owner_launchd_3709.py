@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import json
 import os
 import plistlib
 import shutil
@@ -144,6 +145,26 @@ class DSandbox(Sandbox):
             return []
         return [ln.split() for ln in self.launchlog.read_text().splitlines() if ln.strip()]
 
+    def bootstrap_rc(self, rc: int):
+        """Replace the recording launchctl stub with one that fails `bootstrap` with `rc` (#3780).
+        Every call is still recorded; every other verb exits 0.  No real launchctl is involved."""
+        _stub(self.stubs, "launchctl",
+              f'#!/usr/bin/env bash\necho "$@" >> "{self.launchlog}"\n'
+              f'if [ "$1" = bootstrap ]; then echo "Bootstrap failed: {rc}" >&2; exit {rc}; fi\nexit 0\n')
+
+    def run_env(self, *args: str, engram_home: str, drop: tuple = (), extra: dict | None = None,
+                bash: str = "bash"):
+        """Sandbox.run with the environment shaped (#3780): `drop` names removed, `extra` added.
+        `bash` is the EXPLICIT interpreter (not whatever PATH finds first)."""
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("ENGRAM_HOME", "ENGRAM_HOOKS_DIR", "ENGRAM_SETUP_ALLOW_PATH", *drop)}
+        env["HOME"] = str(self.home)
+        env["PATH"] = f"{self.stubs}:{os.environ['PATH']}"
+        env["ENGRAM_HOME"] = engram_home
+        env.update(extra or {})
+        return subprocess.run([bash, str(self.installer), *args, "--allow-path"], capture_output=True,
+                              text=True, env=env, cwd=str(self.tmp))
+
     def assert_nothing_written(self, *engram_homes: Path):
         assert not (self.home / "Library").exists(), "a LaunchAgents dir/plist was created"
         assert not self.launchlog.exists(), f"launchctl was called: {self.launchlog.read_text()}"
@@ -205,6 +226,7 @@ class DSeat(Seat):
               timeout) exec sleep 30;;
               empty) exit 0;;
               nostate) cat "{D}/nostate.out";;
+              no_gui_domain) cat "{F}/no_gui_domain.err" >&2; exit "$(tr -d '[:space:]' < "{F}/no_gui_domain.rc")";;
               rc113_notext) cat "{D}/badrequest_only.err" >&2; exit "$(tr -d '[:space:]' < "{F}/notfound.rc")";;
               other_rc) cat "{F}/notfound.err" >&2; exit 2;;
               *) exit 99;;
@@ -427,6 +449,128 @@ def test_k2_control_existing_refusals_stay_on_darwin(tmp_path):
     sb.assert_nothing_written(home)
 
 
+# ---- B (#3780): the CLASS of control bytes is refused, not a list of members -------------------
+# The guard's own comment says why (the plist is XML; the unit is read by systemd); whatever a
+# `case` list of members does not name falls through.  So every C0 byte 0x01..0x1F plus DEL 0x7F
+# is tested, on both platform arms, under the default env and under a hostile locale env (the
+# class arm pins LC_ALL=C: `[[:cntrl:]]` is locale-dependent).  NUL (0x00) cannot be passed in an
+# argv/env string, so it is not here.
+C0_BYTES = [*range(0x01, 0x20), 0x7F]
+HOSTILE_LOCALE = {"LANG": "tr_TR.UTF-8", "LC_CTYPE": "ja_JP.eucJP", "LC_COLLATE": "tr_TR.UTF-8"}
+LOCALE_ENVS = {"default-env": ((), {}), "hostile-locale": (("LC_ALL",), HOSTILE_LOCALE)}
+
+# (#3780) The interpreter is passed EXPLICITLY, never via PATH: the stock macOS /bin/bash 3.2 mangles
+# a multibyte path under a multibyte locale (its internal \001 escape byte leaks into `pwd -P`'s
+# output), a modern bash does not, so a cell that takes "whatever bash PATH finds" proves nothing.
+_BREW_BASH = next((b for b in ("/opt/homebrew/bin/bash", "/usr/local/bin/bash") if os.access(b, os.X_OK)), None)
+BASHES = [
+    pytest.param("/bin/bash", id="bin-bash",
+                 marks=pytest.mark.skipif(not os.access("/bin/bash", os.X_OK), reason="no /bin/bash")),
+    pytest.param(_BREW_BASH or "/opt/homebrew/bin/bash", id="brew-bash",
+                 marks=pytest.mark.skipif(_BREW_BASH is None,
+                                          reason="no brew bash (/opt/homebrew/bin/bash, /usr/local/bin/bash)")),
+]
+
+
+@pytest.mark.parametrize("bash", BASHES)
+@pytest.mark.parametrize("env_id", list(LOCALE_ENVS))
+@pytest.mark.parametrize("os_name", ["Darwin", "Linux"])
+@pytest.mark.parametrize("byte", C0_BYTES, ids=lambda b: f"0x{b:02X}")
+def test_k2b_every_c0_byte_and_del_in_the_home_is_refused_before_anything_is_written(tmp_path, byte, os_name, env_id, bash):
+    sb = DSandbox(tmp_path / "i", os_name=os_name)
+    home = sb.tmp / f"h{chr(byte)}x"
+    drop, extra = LOCALE_ENVS[env_id]
+    r = sb.run_env("--owner", engram_home=str(home), drop=drop, extra=extra, bash=bash)
+    assert r.returncode == 2,(r.returncode, r.stdout, r.stderr)
+    assert "unsupported in --owner mode" in r.stderr, r.stderr
+    assert f"control byte 0x{byte:02X}" in r.stderr, r.stderr
+    assert r.stderr.count("ERROR") == 1, r.stderr
+    if os_name == "Darwin":
+        sb.assert_nothing_written(home)
+    else:
+        assert not sb.unit_dir.exists() or list(sb.unit_dir.iterdir()) == [], "a (partial) unit was written"
+        assert sb.systemctl_calls() == [], "something was loaded"
+        assert not home.exists(), "the bad home was created"
+
+
+@pytest.mark.parametrize("bash", BASHES)
+@pytest.mark.parametrize("os_name", ["Darwin", "Linux"])
+def test_k2b_c1_char_in_the_home_is_not_a_control_byte_under_a_utf8_caller_locale(tmp_path, os_name, bash):
+    """Pins the `local LC_ALL=C` in `_owner_bad_char`: U+0085 (bytes c2 85) matches `[[:cntrl:]]` under
+    a UTF-8 locale but not under C.  The ruled class is 0x01-0x1F and 0x7F; U+0085 is a legal XML 1.0
+    char.  The caller env is forced to a UTF-8 locale, so only the pin keeps it accepted."""
+    sb = DSandbox(tmp_path / "i", os_name=os_name)
+    home = sb.tmp / "a\u0085b"
+    r = sb.run_env("--owner", engram_home=str(home), extra={"LC_ALL": "en_US.UTF-8"}, bash=bash)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "control byte" not in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("other", ["<", "{{"])
+def test_k2b_a_value_with_a_control_byte_and_a_later_arm_character_reports_the_control_byte(tmp_path, other):
+    """Position: the class arm sits before the `{{` / `<` arms, as the arms it replaced did."""
+    sb = DSandbox(tmp_path / "i", os_name="Darwin")
+    home = sb.tmp / f"h{other}\x07x"
+    r = sb.run("--owner", engram_home=str(home))
+    assert r.returncode == 2 and "control byte 0x07" in r.stderr, (r.returncode, r.stderr)
+    sb.assert_nothing_written(home)
+
+
+@pytest.mark.parametrize("bash", BASHES)
+@pytest.mark.parametrize("os_name", ["Darwin", "Linux"])
+@pytest.mark.parametrize("env_id", list(LOCALE_ENVS))
+def test_k2b_control_non_ascii_and_ordinary_names_are_not_taken_for_control_bytes(tmp_path, os_name, env_id, bash):
+    """Guard against an over-wide class: bytes >= 0x80 (a UTF-8 name) are not control bytes, in any
+    locale; the install goes through."""
+    sb = DSandbox(tmp_path / "i", os_name=os_name)
+    drop, extra = LOCALE_ENVS[env_id]
+    r = sb.run_env("--owner", engram_home=str(sb.tmp / "café-seat"), drop=drop, extra=extra,
+                   bash=bash)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "control byte" not in r.stderr, r.stderr
+
+
+# (premade dirs, ENGRAM_HOME relative to the sandbox tmp).  The installer resolves the DEEPEST EXISTING
+# ancestor through `pwd -P`, so the three layouts reach that capture with a non-ASCII path in three
+# different places: nowhere (only the not-yet-existing remainder is non-ASCII), the home itself, and a
+# parent of the home.
+LABEL_LAYOUTS = {
+    "fresh-home": ((), "café-seat"),
+    "existing-home": (("café-seat",), "café-seat"),
+    "existing-utf8-parent": (("café-p",), "café-p/seat"),
+}
+
+
+@pytest.mark.parametrize("layout", list(LABEL_LAYOUTS))
+@pytest.mark.parametrize("bash", BASHES)
+@pytest.mark.parametrize("env_id", list(LOCALE_ENVS))
+def test_k2b_utf8_home_gets_the_same_label_from_the_installer_and_the_hook(tmp_path, env_id, bash, layout):
+    """(#3780) The installer and the start hook both compute the launchd label from the home's
+    PHYSICAL path.  Under a multibyte locale the stock bash 3.2 mangles that path (\\001 after each byte
+    of a multibyte char) unless the path step is pinned to LC_ALL=C.  Both callers must land on the
+    label computed from the TRUE physical path (computed here by Python, not by bash): comparing the
+    two bash sides to each other alone would pass if both were mangled the same way."""
+    drop, extra = LOCALE_ENVS[env_id]
+    premade, rel = LABEL_LAYOUTS[layout]
+    sb = DSandbox(tmp_path / "inst", os_name="Darwin")
+    for d in premade:
+        (sb.tmp / d).mkdir()
+    r = sb.run_env("--owner", engram_home=str(sb.tmp / rel), drop=drop, extra=extra, bash=bash)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    plists = sorted(p.name for p in sb.agents_dir.glob("*.plist"))
+    assert plists == [f"{label_for(sb.tmp / rel)}.plist"], plists
+
+    seat = DSeat(tmp_path / "hook")
+    home = seat.tmp / rel
+    home.mkdir(parents=True)  # the hook never creates a home: it must exist
+    (home / "config.json").write_text(json.dumps({"engramd": FLAG_ON}))
+    seat.set_os("Darwin")
+    seat.launchctl("notfound")
+    seat.run({"ENGRAM_HOME": str(home), **extra}, bash=bash)
+    asked = [ln for ln in seat.launchctl_log() if ln.startswith("print ")]
+    assert asked == [f"print gui/{UID}/{label_for(home)}"], (asked, label_for(home))
+
+
 # ===========================================================================
 # K4 -- the Darwin fallback, four outcomes (Q3), fake launchctl from REAL captures
 # ===========================================================================
@@ -544,6 +688,147 @@ def test_k4_verb_takes_the_top_level_state_line_not_a_nested_one(dseat):
     dseat.launchctl("spawn_scheduled")
     out = dseat.io(LAUNCHD_VERB, dseat.label())
     assert "active" not in out and out.startswith("registered:spawn scheduled"), out
+
+
+# ===========================================================================
+# A (#3780) -- rc 125 is its own named state: no_gui_domain
+# ===========================================================================
+# rc 125 from `launchctl print gui/<uid>/...` means the DOMAIN is absent (no GUI login session), so a
+# bootstrap into it cannot work.  Not `notfound` (that path launches), not a bare ambiguous (that
+# neither launches nor explains).  Real capture: tests/fixtures/launchctl_3709/no_gui_domain.*
+
+NO_GUI_ERR = (FIXTURES / "no_gui_domain.err").read_text()
+NO_GUI_RC = int((FIXTURES / "no_gui_domain.rc").read_text())
+NO_GUI_TEXT = "Domain does not support specified action"
+
+
+def test_a2_the_fixture_is_the_real_capture():
+    assert NO_GUI_RC == 125, NO_GUI_RC
+    assert NO_GUI_ERR == f"Could not print domain: 125: {NO_GUI_TEXT}\n", repr(NO_GUI_ERR)
+
+
+def test_a1_parser_rc125_with_the_domain_text_is_no_gui_domain():
+    assert _load_parser()(NO_GUI_RC, "", NO_GUI_ERR) == "no_gui_domain"
+
+
+def test_a1_parser_rc125_without_the_text_stays_ambiguous():
+    """Both the rc AND the text are required, as for rc 113."""
+    parse = _load_parser()
+    assert parse(125, "", "") == "ambiguous:launchctl print exited 125"
+    assert parse(125, "", "Bad request.\n") == "ambiguous:launchctl print exited 125"
+
+
+@pytest.mark.parametrize("rc,expected_prefix", [
+    (113, "ambiguous:launchctl exited 113 without the not-found text"),
+    (1, "ambiguous:launchctl print exited 1"),
+    (2, "ambiguous:launchctl print exited 2"),
+])
+def test_a1_parser_the_text_with_any_other_rc_is_unchanged(rc, expected_prefix):
+    assert _load_parser()(rc, "", NO_GUI_ERR) == expected_prefix
+
+
+def test_a1_parser_the_text_with_rc0_is_unchanged():
+    assert _load_parser()(0, "", NO_GUI_ERR) == "ambiguous:launchctl print answered with empty output"
+
+
+def test_a1_notfound_is_unchanged():
+    nf = (FIXTURES / "notfound.err").read_text()
+    assert _load_parser()(113, "", nf) == "notfound"
+
+
+def test_a1_verb_prints_no_gui_domain(dseat):
+    dseat.launchctl("no_gui_domain")
+    assert dseat.io(LAUNCHD_VERB, dseat.label()) == "no_gui_domain"
+
+
+def test_a3_hook_says_one_line_and_launches_nothing(dseat):
+    got = _darwin_hook(dseat, "no_gui_domain")
+    lines = _lines_of(got, dseat)
+    assert got[0] == 0, got
+    assert lines == [
+        f"ENGRAM owner not supervised: no launchd GUI domain for uid {UID} (no GUI login session). "
+        f"The owner is not used on this seat. ENGRAM_HOME=<TMP>/seat"
+    ], (lines, got[1])
+    assert dseat.launched() == [], "an owner was launched on a seat with no GUI domain"
+    assert not (dseat.eh / "engramd.pid").exists(), "a pidfile appeared"
+    assert dseat.launchctl_log() == [dseat.expected_print()], "something other than the one print was asked"
+    assert "UNSUPERVISED" not in got[1]
+
+
+def test_a3_hook_with_the_flags_off_still_says_nothing(dseat):
+    """Control: the gate on the owner flags is before the launchd question; a seat that never asked
+    for an owner hears nothing about its missing GUI domain."""
+    dseat.launchctl("no_gui_domain")
+    got = dseat.run_timed(limit=LAUNCHD_BOUND_SECONDS + LAUNCHD_SLACK_SECONDS + 10)
+    assert got[0] == 0 and got[1].strip() == "" and dseat.launchctl_log() == [], got
+
+
+def _fail_bootstrap_with(tmp_path, rc: int, os_name: str = "Darwin", mode_args: tuple = ("--owner",)):
+    sb = DSandbox(tmp_path / "i", os_name=os_name)
+    sb.bootstrap_rc(rc)
+    home = sb.tmp / "seat-a"
+    r = sb.run(*mode_args, engram_home=str(home))
+    return sb, home, r
+
+
+def test_a4_installer_on_bootstrap_125_exits_3_with_the_named_message_and_the_plist_stays(tmp_path):
+    sb, home, r = _fail_bootstrap_with(tmp_path, 125)
+    plist = sb.agents_dir / f"{label_for(home)}.plist"
+    assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
+    assert (f"ERROR: launchd has no GUI domain for uid {UID} (no GUI login session). {plist} was written but "
+            f"is not active now; whether launchd loads it at this account's next GUI login has not been "
+            f"measured. The owner is not supervised on this seat.") in r.stderr.splitlines(), r.stderr
+    assert plist.exists(), "the plist is said to be written, so it must be"
+    assert "Loaded." not in r.stdout and "Setup complete" not in r.stdout, r.stdout
+
+
+def test_a4_installer_on_any_other_bootstrap_failure_keeps_launchctls_rc(tmp_path):
+    sb, home, r = _fail_bootstrap_with(tmp_path, 5)
+    assert r.returncode == 5, (r.returncode, r.stdout, r.stderr)
+    assert "no GUI domain" not in r.stderr, r.stderr
+
+
+def test_a4_installer_on_bootstrap_0_is_unchanged(tmp_path):
+    sb, home, r = _fail_bootstrap_with(tmp_path, 0)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "Loaded." in r.stdout and "no GUI domain" not in r.stderr
+    assert [c[0] for c in sb.launchctl_calls()] == ["bootout", "bootstrap"]
+
+
+def test_a4_the_surface_daemon_path_shares_the_bootstrap_and_gets_the_same_handling_in_generic_words(tmp_path):
+    """Without --owner the same bootstrap call runs.  125 there is the same absent domain; the
+    message names the surface daemon, not the owner."""
+    sb, _home, r = _fail_bootstrap_with(tmp_path, 125, mode_args=())
+    assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
+    assert f"launchd has no GUI domain for uid {UID} (no GUI login session)" in r.stderr, r.stderr
+    assert "The surface daemon is not supervised on this seat." in r.stderr, r.stderr
+    assert "The owner" not in r.stderr, r.stderr
+
+
+def test_a5_r1_skip_keys_on_the_parser_verdict_not_a_raw_125(monkeypatch):
+    # (a) the real capture: skip, with the named reason
+    monkeypatch.setattr(sys.modules[__name__], "_real_print", lambda label: (NO_GUI_RC, "", NO_GUI_ERR))
+    reason = _no_gui_domain_skip_reason("com.engram.test.x")
+    assert reason and "no GUI launchd domain" in reason and "no_gui_domain" in reason, reason
+    # (b) a bare 125 (no domain text) is ambiguous, not the named state: no skip
+    monkeypatch.setattr(sys.modules[__name__], "_real_print", lambda label: (125, "", ""))
+    assert _no_gui_domain_skip_reason("com.engram.test.x") is None
+    # (c) the normal not-found of a GUI seat: no skip
+    nf = (FIXTURES / "notfound.err").read_text()
+    monkeypatch.setattr(sys.modules[__name__], "_real_print", lambda label: (113, "", nf))
+    assert _no_gui_domain_skip_reason("com.engram.test.x") is None
+
+
+def test_a5_r1_leak_check_reads_the_registry_list_not_the_print_verdict():
+    out = ("PID\tStatus\tLabel\n"
+           "-\t0\tcom.apple.thing\n"
+           "123\t0\tcom.engram.test.r1-sleep-9-abc\n"
+           "-\t1\tcom.engram.test.r1-exit1-9-abc-other\n")
+    mine = ["com.engram.test.r1-sleep-9-abc", "com.engram.test.r1-exit1-9-abc", "com.engram.test.r1-exit0-9-abc"]
+    # exact label match: a longer label that merely starts with mine is not mine
+    assert _leaked_labels(mine, out) == ["com.engram.test.r1-sleep-9-abc"]
+    assert _leaked_labels(mine, "PID\tStatus\tLabel\n-\t0\tcom.apple.thing\n") == []
+    assert _leaked_labels([], out) == []
 
 
 # ===========================================================================
@@ -818,6 +1103,24 @@ def test_k6_existing_home_is_byte_identical_after_preflight(short_base):
     assert rc == 0, (rc, out, err)
     assert tree_snapshot(home) == before, "preflight mutated the home"
     assert not (home / "run").exists()
+
+
+@pytest.mark.parametrize("shape", ["home-is-a-file", "component-is-a-file"])
+def test_k6_d_preflight_under_a_non_directory_is_a_one_line_refusal_not_a_traceback(short_base, shape):
+    """#3780 D: a pidfile path under a regular file raised ENOTDIR out of the `lstat` and escaped as a
+    traceback (still exit 1).  Now a one-line refusal in the style of the other preflight refusals."""
+    planted = short_base / "afile"
+    planted.write_text("not a directory")
+    home = planted if shape == "home-is-a-file" else planted / "eh"
+    rc, out, err = run_owner([PREFLIGHT_FLAG], home=short_base, engram_home=home)
+    assert rc == 1, (rc, out, err)
+    assert "Traceback" not in err and "NotADirectoryError" not in err, err
+    lines = [ln for ln in err.splitlines() if ln.strip()]
+    assert len(lines) == 1, err
+    assert lines[0].startswith("[engramd] "), err
+    assert str(planted) in lines[0], err
+    assert "not a directory" in lines[0], err
+    assert out == ""
 
 
 def test_k6_over_long_home_is_refused_with_the_owners_reason_and_a_healthy_control_passes(short_base):
@@ -1114,6 +1417,27 @@ def _sweep_leftover_test_jobs() -> list:
     return stale
 
 
+def _no_gui_domain_skip_reason(label: str):
+    """The R1 skip reason when this uid has no GUI launchd domain, else None (#3780 A5).  Keys on the
+    parser's `no_gui_domain` verdict, so the rc-125 rule has ONE definition (the hook's parser) and a
+    bare 125 without the domain text is not mistaken for it.  Read-only: one `launchctl print`."""
+    rc, out, err = _real_print(label)
+    verdict = _load_parser()(rc, out, err)
+    if verdict == "no_gui_domain":
+        return (f"no GUI launchd domain for uid {UID} (no logged-in GUI session): the hook's parser "
+                f"says no_gui_domain for `launchctl print gui/{UID}/<label>` (rc {rc}, {err.strip()!r}); "
+                f"R1 needs one")
+    return None
+
+
+def _leaked_labels(labels, list_output: str) -> list:
+    """The labels in `labels` that are still registered according to `launchctl list` output: one row
+    per job, tab-separated PID / last exit status / label.  Exact label match.  REAL state, not the
+    `print` verdict (which is not `notfound` on every host where nothing leaked, e.g. a no-GUI one)."""
+    registered = {cols[2] for cols in (ln.split("\t") for ln in list_output.splitlines()) if len(cols) == 3}
+    return [lab for lab in labels if lab in registered]
+
+
 @pytest.mark.skipif(not IS_DARWIN, reason="real launchd exists only on macOS")
 def test_r1_real_launchd_restart_semantics_and_parser(tmp_path):
     # If pytest is SIGKILLed mid-cell, the `finally` below cannot run and `com.engram.test.r1-*`
@@ -1126,15 +1450,13 @@ def test_r1_real_launchd_restart_semantics_and_parser(tmp_path):
         if not lab.startswith(TEST_LABEL_PREFIX):
             pytest.fail(f"refusing to run: label {lab!r} lacks the {TEST_LABEL_PREFIX!r} test prefix")
 
-    # rc 125 ("Domain does not support specified action") means this uid has no GUI launchd domain
-    # (no logged-in GUI session), so nothing can be bootstrapped into gui/<uid>.  That is a property
-    # of the host, not a defect in the code under test, so it is a skip, not a failure.  Skip ONLY on
-    # 125: any other result (notfound, or anything else) keeps its normal path below.  Probed before
-    # any bootstrap, so a skip never registers anything.
-    probe_rc, _probe_out, probe_err = _real_print(never)
-    if probe_rc == 125:
-        pytest.skip(f"no GUI launchd domain for uid {UID} (no logged-in GUI session): "
-                    f"`launchctl print gui/{UID}/<label>` exited 125 ({probe_err.strip()!r}); R1 needs one")
+    # No GUI launchd domain for this uid (no logged-in GUI session) means nothing can be bootstrapped
+    # into gui/<uid>: a property of the host, not a defect in the code under test, so a skip.  Keyed
+    # on the parser's named `no_gui_domain` verdict (#3780), not on a raw rc.  Probed before any
+    # bootstrap, so a skip never registers anything.  Any other result keeps its normal path below.
+    skip_reason = _no_gui_domain_skip_reason(never)
+    if skip_reason:
+        pytest.skip(skip_reason)
 
     # Policy comes from the SHIPPED template (rendered), never retyped here.
     assert PLIST_TEMPLATE.exists(), f"missing (not implemented yet): {PLIST_TEMPLATE.relative_to(REPO)}"
@@ -1188,14 +1510,15 @@ def test_r1_real_launchd_restart_semantics_and_parser(tmp_path):
         assert verdict(labels["sleep"]) == "running"
         assert verdict(labels["exit0"]) == "registered:not running:0"
     finally:
-        leaked = []
         for lab in labels.values():
             subprocess.run([REAL_LAUNCHCTL, "bootout", f"gui/{UID}/{lab}"], capture_output=True, text=True, timeout=30)
-        for lab in labels.values():
-            end = time.monotonic() + 10
-            while time.monotonic() < end and verdict(lab) != "notfound":
-                time.sleep(0.3)
-            if verdict(lab) != "notfound":
-                leaked.append(lab)
+        # Read REAL state: a label is leaked only if `launchctl list` still shows it.
+        end = time.monotonic() + 10
+        while True:
+            listing = subprocess.run([REAL_LAUNCHCTL, "list"], capture_output=True, text=True, timeout=30).stdout
+            leaked = _leaked_labels(list(labels.values()), listing)
+            if not leaked or time.monotonic() >= end:
+                break
+            time.sleep(0.3)
         if leaked:
             pytest.fail(f"test jobs still registered after bootout: {leaked}")

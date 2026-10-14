@@ -28,6 +28,13 @@
 #   * the supervisor answers "no such unit / job"        -> launch the owner detached,
 #     (Linux also: `systemctl` is absent, or `systemctl --user` cannot answer -- no user bus,
 #     e.g. WSL)                                             ONE line containing UNSUPERVISED
+#   * macOS: launchd has NO GUI domain for this uid (`launchctl print gui/<uid>/<label>` exits
+#     125 "Domain does not support specified action": no GUI login session, #3780)
+#                                                        -> launch nothing, ONE line saying the
+#                                                           owner is not supervised and not used
+#                                                           on this seat. Not "not found": a
+#                                                           bootstrap into an absent domain
+#                                                           cannot work, so nothing is retried
 #   * the supervisor's answer is ambiguous (timeout, empty, unparseable, rc other than the
 #     measured not-found one; on macOS also `launchctl` missing)
 #                                                        -> launch nothing, say so
@@ -64,7 +71,16 @@ case "$ENGRAM_HOME" in
 esac
 # No home directory yet -> no config -> no flags: nothing to do, and nothing to create.
 [ -d "$ENGRAM_HOME" ] || exit 0
-ENGRAM_HOME="$(cd "$ENGRAM_HOME" 2>/dev/null && pwd -P)" || exit 0
+# The physical step runs under a function-scoped LC_ALL=C and assigns by NAME: bash 3.2 mangles the
+# bytes of a `$(...)` capture (inserting \001 after each byte >= 0x80) when the CAPTURING shell is
+# in a multibyte locale, so a pin inside the substitution is not enough, and the installer computes
+# this same path the same way (#3780). Only this function's shell is pinned, never the hook's.
+_physical_dir_into() {
+    local LC_ALL=C _pd
+    _pd="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+    printf -v "$2" '%s' "$_pd"
+}
+_physical_dir_into "$ENGRAM_HOME" ENGRAM_HOME || exit 0
 
 LOG_PATH="$ENGRAM_HOME/engramd-owner.log"  # used only to NAME the log in messages; never opened here
 
@@ -188,7 +204,7 @@ if [ "$_os" = "Darwin" ]; then
     # ---- 4a. macOS: the launchd job com.engram.engramd-owner.<key> ----------------------
     # `launchctl print gui/<uid>/<label>` is asked and parsed by the Python I/O helper (it owns
     # the timeout: stock macOS has no GNU `timeout`). It prints one of
-    #   running | registered:<state>:<last exit or none> | notfound | ambiguous:<why>
+    #   running | registered:<state>:<last exit or none> | notfound | no_gui_domain | ambiguous:<why>
     LABEL="com.engram.engramd-owner.$_home_id"
     _state="$("$PYTHON_BIN" "$IO_PY" launchd_state "$LABEL" 2>/dev/null)"
     _sup="launchd: ${_state:-no answer}"
@@ -197,6 +213,13 @@ if [ "$_os" = "Darwin" ]; then
         registered:*)
             _rest="${_state#registered:}"
             _report "ENGRAM owner job $LABEL is registered but ${_rest%:*} (last exit ${_rest##*:}); leaving it to launchd, no second owner launched. ENGRAM_HOME=$ENGRAM_HOME"
+            exit 0
+            ;;
+        no_gui_domain)
+            # rc 125 from the domain probe: the domain is absent (no GUI login session), so the seat
+            # runs ownerless, like one with no owner installed. No launch: an unsupervised spawn is a
+            # separate process-management surface (#3780).
+            _report "ENGRAM owner not supervised: no launchd GUI domain for uid $(id -u 2>/dev/null || printf '?') (no GUI login session). The owner is not used on this seat. ENGRAM_HOME=$ENGRAM_HOME"
             exit 0
             ;;
         ambiguous:*)
@@ -284,6 +307,11 @@ OWNER_PY="$PLUGIN_ROOT/engramd_owner.py"
 # 0.2 s poll. It is kept as a belt; do not read it as covered. Linux reads /proc/<pid>/status;
 # macOS has no /proc, so there `ps -o stat=` is asked (when ps exists; otherwise `kill -0`
 # alone decides, as it did when this guard only had the /proc arm).
+# When `ps -o stat=` prints NOTHING (the pid vanished between the `kill -0` and the read), the
+# `case` below matches no `*Z*` and this returns ALIVE. That is the conservative direction for
+# this caller: the pid is gone, so the next poll's `kill -0` says dead and the normal path
+# (including the race re-check) runs one poll later, whereas answering DEAD on an empty read
+# could condemn a live owner on a transient `ps` failure.
 _alive() {
     kill -0 "$1" 2>/dev/null || return 1
     if [ -r "/proc/$1/status" ]; then

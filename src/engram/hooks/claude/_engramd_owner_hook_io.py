@@ -21,10 +21,12 @@ Subcommands (the shell switches on what they print; they never raise, and exit 0
       cannot be imported the answer is `ambiguous:<why>` (never `none`: the shell then
       launches nothing).
   launchd_state <label>        -> running | registered:<state>:<last exit or none> | notfound
-                                  | ambiguous:<why>
+                                  | no_gui_domain | ambiguous:<why>
       Runs `launchctl print gui/<uid>/<label>` under a Python-side timeout
       (LAUNCHD_BOUND_SECONDS; stock macOS has no GNU `timeout`) and hands the result to
-      `parse_launchctl_print`. launchctl missing or timing out is ambiguous.
+      `parse_launchctl_print`. launchctl missing or timing out is ambiguous. `no_gui_domain`
+      (#3780) means this uid has no launchd GUI domain at all (no GUI login session), so a
+      bootstrap into it cannot work: the shell says so and launches nothing.
   report <home> <message>      -> one JSON object on stdout
       Appends `[ts] [start-engramd-owner] <message>` (the FULL message) to
       `<home>/engramd-owner.log` when that is a regular file (silently skipped
@@ -57,6 +59,7 @@ from _hooklib import emit_context, open_regular_text, open_regular_text_append  
 
 _MARKER = "engramd_owner"
 LAUNCHD_BOUND_SECONDS = 3.0  # `launchctl print` is killed past this (Linux's systemctl bound is 3 s too)
+_NO_GUI_DOMAIN_TEXT = "Domain does not support specified action"  # rc 125's stderr, measured (#3780)
 _HEAD_CLIP = 600  # chars of message injected; the full message always goes to the log
 
 
@@ -123,12 +126,17 @@ def live(home: str) -> str:
 def parse_launchctl_print(rc: int, stdout: str, stderr: str) -> str:
     """The verdict for one `launchctl print gui/<uid>/<label>` result.
 
-    running | registered:<state>:<last exit code or none> | notfound | ambiguous:<why>
+    running | registered:<state>:<last exit code or none> | notfound | no_gui_domain
+    | ambiguous:<why>
 
     Shapes measured on macOS 26.6.2 (tests/fixtures/launchctl_3709/README.md):
       * unknown label: rc 113, stdout empty, stderr `Bad request.` + `Could not find
         service "<label>" in domain for user gui: <uid>` -> notfound. BOTH the rc and the
         text are required: either alone is ambiguous.
+      * no GUI domain for this uid (no GUI login session; #3780): rc 125, stdout empty,
+        stderr `Could not print domain: 125: Domain does not support specified action`
+        -> no_gui_domain. Again BOTH the rc and the text are required. This is not a
+        not-found: the domain itself is absent, so a bootstrap would fail too.
       * known job: rc 0; the job's own state is the ONE-TAB-indented `state =` line.
         The nested dicts below it carry `state = active` at deeper indent, which is not
         the job's state, so only that exact indent counts. `last exit code =` is read
@@ -139,6 +147,10 @@ def parse_launchctl_print(rc: int, stdout: str, stderr: str) -> str:
         if "Could not find service" in (stderr or ""):
             return "notfound"
         return "ambiguous:launchctl exited 113 without the not-found text"
+    if rc == 125:
+        if _NO_GUI_DOMAIN_TEXT in (stderr or ""):
+            return "no_gui_domain"
+        return f"ambiguous:launchctl print exited {rc}"
     if rc != 0:
         return f"ambiguous:launchctl print exited {rc}"
     if not (stdout or "").strip():

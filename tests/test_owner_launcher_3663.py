@@ -486,14 +486,15 @@ class Seat:
         shutil.copy(SRC / "engram_pidfile.py", self.plugin / "engram_pidfile.py")
         shutil.copy(SRC / "engram_regular_io.py", self.plugin / "engram_regular_io.py")  # engram_pidfile imports it (#3772)
 
-    def run(self, extra_env: dict | None = None, script: Path | None = None, keep_plugin_root: bool = False):
+    def run(self, extra_env: dict | None = None, script: Path | None = None, keep_plugin_root: bool = False,
+            bash: str = "bash"):
         self._ship_3709_files()
         env = {"HOME": str(self.home), "ENGRAM_HOME": str(self.eh),
                "PATH": f"{self.stubs}:{self.tools}", "TMPDIR": str(self.tmp)}
         if keep_plugin_root:
             env["CLAUDE_PLUGIN_ROOT"] = str(self.plugin)
         env.update(extra_env or {})
-        return subprocess.run(["bash", str(script or self.hook)], capture_output=True, text=True,
+        return subprocess.run([bash, str(script or self.hook)], capture_output=True, text=True,
                               env=env, cwd=str(self.tmp), timeout=60)
 
     def run_timed(self, extra_env: dict | None = None, limit: float = 3.0):
@@ -1093,7 +1094,9 @@ def test_h9_u4d_owner_reads_enabled_is_false_and_does_not_raise_on_a_deeply_nest
 # ---- I1 / K1: --owner refuses characters sed and systemd would mangle ----------------------------
 
 BAD_CHARS = {
-    "space": " ", "tab": "\t", "newline": "\n", "carriage-return": "\r", "ampersand": "&",
+    # #3780: tab / LF / CR are members of the one control-byte class arm, named by their byte.
+    "space": " ", "control byte 0x09": "\t", "control byte 0x0A": "\n", "control byte 0x0D": "\r",
+    "ampersand": "&",
     "backslash": "\\", "pipe": "|", "percent": "%", "double-quote": '"', "single-quote": "'",
     "dollar": "$",
     # {{ and }}: the owner/python paths are substituted by sed BEFORE ENGRAM_HOME, so a literal

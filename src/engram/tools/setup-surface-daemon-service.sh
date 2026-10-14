@@ -34,6 +34,12 @@
 # The ephemeral-path refusal below applies to engramd_owner.py's physical path in this
 # mode. Without --owner the behaviour is exactly what it always was.
 #
+# Exit codes: 0 done; 1 an error (missing tool or template, a preflight refusal); 2 a refused
+# value (unsupported character, `..`, ephemeral path); 3 (#3780, Darwin) launchd has no GUI
+# domain for this uid (`launchctl bootstrap gui/<uid>` exits 125: no GUI login session). The
+# plist WAS written but is not active now; whether launchd loads it at this account's next GUI
+# login has not been measured. Any other launchctl bootstrap failure exits with launchctl's own rc.
+#
 # --owner refuses any ENGRAM_HOME with a `..` path component (exit 2, before anything is written):
 # mkdir and cd/pwd -P read `..` after a symlink differently. Names like `a..b` are fine.
 #
@@ -192,7 +198,7 @@ _physical_path() {
         fi
         n=$((n + 1))
     done
-    local d b
+    local d b LC_ALL=C  # C: a path value is bytes; bash 3.2 mangles a multibyte capture otherwise (#3780)
     d="$(dirname "$p")"
     b="${p##*/}"
     if d="$(cd "$d" 2>/dev/null && pwd -P)"; then
@@ -216,7 +222,7 @@ _under_root() {
 }
 
 _ephemeral_reason() {
-    local path="$1" root
+    local path="$1" root LC_ALL=C  # C: the `pwd -P` capture below is a path value (#3780)
     local roots=(/tmp /private/tmp /var/tmp /private/var/tmp /var/folders /private/var/folders)
     if [[ -n "${TMPDIR:-}" ]]; then
         roots+=("$TMPDIR")
@@ -256,11 +262,19 @@ OS="$(uname -s)"
 # expand, quotes are interpreted). A wrong-home unit named for home X is silent wrong
 # supervision, so refuse BEFORE the destination is opened or any directory is created.
 _owner_bad_char() {
+    local LC_ALL=C _prefix
     case "$1" in
         *' '*) printf 'space' ;;
-        *$'\t'*) printf 'tab' ;;
-        *$'\n'*) printf 'newline' ;;
-        *$'\r'*) printf 'carriage-return' ;;
+        # ONE arm for the CLASS of control bytes (0x01-0x1F and 0x7F), not a list of members:
+        # the plist is XML and systemd reads the unit line by line, so whatever a member list does
+        # not name (BEL, ESC, ...) would fall through. `[[:cntrl:]]` is locale-dependent, so the
+        # match runs under LC_ALL=C (the `local` below is function-scoped). On LINUX this is a
+        # small behaviour change: the arms it replaces named only tab, LF and CR, so the other
+        # C0 bytes and DEL are now refused there too. NUL cannot occur in a shell string.
+        *[[:cntrl:]]*)
+            _prefix="${1%%[[:cntrl:]]*}"
+            printf 'control byte 0x%02X' "'${1:${#_prefix}:1}"
+            ;;
         *'&'*) printf 'ampersand' ;;
         *'\'*) printf 'backslash' ;;
         *'|'*) printf 'pipe' ;;
@@ -282,10 +296,14 @@ _owner_bad_char() {
 }
 _owner_refuse_if_bad() {
     # $1 = what the value is, $2 = the value
-    local _name _art="a"
+    local _name _what
     if _name="$(_owner_bad_char "$2")"; then
-        case "$_name" in a*|e*|i*|o*|u*) _art="an" ;; esac
-        echo "ERROR: unsupported in --owner mode: $1 contains $_art $_name character ($(printf '%q' "$2")); the unit would be rendered or read wrongly. No unit was written or loaded." >&2
+        case "$_name" in
+            "control byte "*) _what="$_name" ;;
+            a*|e*|i*|o*|u*) _what="an $_name character" ;;
+            *) _what="a $_name character" ;;
+        esac
+        echo "ERROR: unsupported in --owner mode: $1 contains $_what ($(printf '%q' "$2")); the unit would be rendered or read wrongly. No unit was written or loaded." >&2
         exit 2
     fi
 }
@@ -324,6 +342,17 @@ _owner_preflight() {
     fi
 }
 
+# _owner_physical_dir_into <dir> <varname>: assign the `cd && pwd -P` physical path of <dir> to the
+# variable NAMED by $2 (no stdout; non-zero if <dir> cannot be entered). The capture runs inside this
+# function under its own `local LC_ALL=C`: bash 3.2 mangles the bytes of a `$(...)` capture (inserting
+# \001 after each byte >= 0x80) when the CAPTURING shell is in a multibyte locale, and a pin written
+# inside the substitution does not help. Only this function's shell is pinned, never the script (#3780).
+_owner_physical_dir_into() {
+    local LC_ALL=C _pd
+    _pd="$(cd "$1" && pwd -P)" || return 1
+    printf -v "$2" '%s' "$_pd"
+}
+
 if [[ "$OWNER_MODE" == "1" ]]; then
     # Normalize ENGRAM_HOME (after the refusals above, so a refusal creates nothing):
     # ~ expanded, created, made absolute and physical, no trailing slash. The unit name /
@@ -354,7 +383,7 @@ if [[ "$OWNER_MODE" == "1" ]]; then
         # not-yet-existing remainder), so it is checked first too.
         _owner_source_home_key
         _owner_preflight "$ENGRAM_HOME" "as given"
-        _owner_physical_planned="$(engramd_owner_physical_path "$ENGRAM_HOME")" || {
+        engramd_owner_physical_path "$ENGRAM_HOME" _owner_physical_planned || {
             echo "ERROR: cannot work out the physical path of ENGRAM_HOME=$ENGRAM_HOME. Nothing was written or loaded." >&2
             exit 1
         }
@@ -363,7 +392,7 @@ if [[ "$OWNER_MODE" == "1" ]]; then
         _owner_preflight "$_owner_physical_planned" "physical path"
     fi
     mkdir -p "$ENGRAM_HOME"
-    ENGRAM_HOME="$(cd "$ENGRAM_HOME" && pwd -P)"
+    _owner_physical_dir_into "$ENGRAM_HOME" ENGRAM_HOME
     _owner_refuse_if_bad "ENGRAM_HOME (physical path)" "$ENGRAM_HOME"
     while [[ "$ENGRAM_HOME" != "/" && "$ENGRAM_HOME" == */ ]]; do ENGRAM_HOME="${ENGRAM_HOME%/}"; done
     if [[ "$OS" == "Darwin" && "$ENGRAM_HOME" != "$_owner_physical_planned" ]]; then
@@ -497,7 +526,24 @@ elif [[ "$OS" == "Darwin" ]]; then
     # Modern bootstrap/bootout API (macOS 10.11+); load/unload are Apple-deprecated.
     # bootout targets the service by domain/label; bootstrap takes the plist path.
     launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST"
+    # rc 125 from bootstrap into gui/<uid> = no launchd GUI domain for this uid (no GUI login
+    # session, #3780). Named, with its own exit code (3); any other failure keeps launchctl's rc.
+    # The installer keys on rc 125 alone: bootstrap's stderr for this case was not captured verbatim
+    # (unlike `print`, where the parser also requires the "Domain does not support specified action"
+    # text). An rc of 125 from `bootstrap gui/<uid>` is treated as no GUI domain.
+    # The sentence is ONE constant: Clio's measurement of what launchd does at the next GUI login
+    # may change it, and then it is a one-line edit.
+    _svc_subject="The surface daemon"
+    [[ "$OWNER_MODE" == "1" ]] && _svc_subject="The owner"
+    _NO_GUI_DOMAIN_MSG="ERROR: launchd has no GUI domain for uid $(id -u) (no GUI login session). $PLIST_DEST was written but is not active now; whether launchd loads it at this account's next GUI login has not been measured. $_svc_subject is not supervised on this seat."
+    _bootstrap_rc=0
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST" || _bootstrap_rc=$?
+    if [[ "$_bootstrap_rc" == "125" ]]; then
+        echo "$_NO_GUI_DOMAIN_MSG" >&2
+        exit 3
+    elif [[ "$_bootstrap_rc" != "0" ]]; then
+        exit "$_bootstrap_rc"
+    fi
     echo "  Loaded."
 
     echo

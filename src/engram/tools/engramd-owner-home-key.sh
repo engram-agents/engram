@@ -28,8 +28,16 @@
 # the not-yet-existing remainder. A dangling symlink among the remainder is followed (its target
 # replaces the component), so the answer is where a later `mkdir -p` would really create things.
 # Absolute paths only; bash 3.2 (no `realpath -m`). Exit 1, nothing on stdout, on failure.
+#
+# Optional 2nd argument: the NAME of a variable to assign the result to (no stdout). A caller that
+# wants a non-ASCII path in a variable must use it: bash 3.2 mangles the bytes of a `$(...)` capture
+# (inserting its internal \001 escape byte after each byte >= 0x80) when the CAPTURING shell runs in
+# a multibyte locale, whatever this function pins inside, so the stdout form is only safe where the
+# caller's locale is safe (#3780). Every capture INSIDE this file runs under the function-scoped
+# `local LC_ALL=C` and is therefore exact.
 engramd_owner_physical_path() {
-    local path="${1-}" anc rest comp link hops=0 phys
+    # LC_ALL=C: a path VALUE is bytes, so the locale must not touch it (see above; #3780).
+    local LC_ALL=C path="${1-}" outvar="${2-}" anc rest comp link hops=0 phys
     case "$path" in
         /*) ;;
         *) echo "engramd-owner-home-key: not an absolute path: $path" >&2; return 1 ;;
@@ -72,11 +80,15 @@ engramd_owner_physical_path() {
     fi
     [ "$phys" = "/" ] && phys=""
     [ -n "$phys$rest" ] || phys="/"
-    printf '%s%s\n' "$phys" "$rest"
+    if [ -n "$outvar" ]; then
+        printf -v "$outvar" '%s%s' "$phys" "$rest"
+    else
+        printf '%s%s\n' "$phys" "$rest"
+    fi
 }
 
 engramd_owner_home_key() {
-    local home="${1-}" physical
+    local LC_ALL=C home="${1-}" physical  # C: path/hash bytes, not locale text (#3780)
     case "$home" in
         "~") home="$HOME" ;;
         "~/"*) home="$HOME/${home#"~/"}" ;;

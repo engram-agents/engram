@@ -2133,7 +2133,15 @@ class EngramdOwner:
            for the same no-per-exit-code-retry reason as check 4. Runs even
            when the pidfile is absent. One `stat` (follows symlinks, does not
            block on a FIFO) through `_refuse_non_regular_store`, the very
-           helper `_connect_store_ro` uses; a missing store or home passes."""
+           helper `_connect_store_ro` uses; a missing store or home passes.
+
+        The installer runs `--preflight` with the INSTALLER'S environment, not
+        launchd's (#3780). That is safe today because every Darwin-arm
+        predicate here is stdlib or uses an absolute path. A future
+        PATH-dependent predicate would diverge silently: the preflight would
+        pass while the launchd-run owner refused with exit 1 every 60 s
+        (ThrottleInterval). So the predicates in this method must stay
+        independent of the environment."""
         self._check_platform_support()
         too_long = ec.socket_path_too_long_reason(self.socket_path)
         if too_long is not None:
@@ -3848,6 +3856,15 @@ def main(argv: list[str] | None = None) -> int:
         except refusals as exc:
             print(f"[engramd] {exc}", file=sys.stderr)
             return _refusal_exit_code(exc)
+        except NotADirectoryError as exc:
+            # #3780: the pidfile path sits under something that is not a directory (ENGRAM_HOME is
+            # a regular file, or a path component is). The `lstat` in check 4 raised ENOTDIR and it
+            # escaped as a traceback (still exit 1). One line, same style, same exit code (1).
+            print(f"[engramd] refusing to start: a path the preflight checks under ENGRAM_HOME has a "
+                  f"component that is not a directory (e.g. the pidfile path {owner.pid_path}; "
+                  f"{exc.strerror or 'ENOTDIR'}); nothing was bound. Fix ENGRAM_HOME and start again",
+                  file=sys.stderr)
+            return 1
         return 0
     try:
         owner.start(install_signal_handlers=True)
