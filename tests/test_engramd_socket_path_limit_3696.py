@@ -35,6 +35,7 @@ from pathlib import Path
 import pytest
 
 from _owner_platform import requires_linux_owner
+from _owner_store import seed_current_store
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ENGRAM = str(REPO_ROOT / "src" / "engram")
@@ -153,6 +154,8 @@ def test_overlong_path_with_an_existing_home_is_refused_untouched(tmp_base, run_
 @requires_linux_owner
 def test_longest_bindable_path_starts_and_answers(tmp_base):
     home = _home_for_socket_bytes(tmp_base, LONGEST_BINDABLE_BYTES)
+    home.mkdir()
+    seed_current_store(home)  # #3753: the owner refuses a store below the latest schema version
     owner = _new_owner(home)
     owner.start(install_signal_handlers=False)
     try:
@@ -183,6 +186,8 @@ def test_multibyte_path_at_the_limit_in_bytes_starts(tmp_base):
     if not _fs_accepts_multibyte(tmp_base):
         pytest.skip("filesystem rejects multi-byte file names")
     home = _home_for_socket_bytes(tmp_base, LONGEST_BINDABLE_BYTES, multibyte=3)
+    home.mkdir()
+    seed_current_store(home)  # #3753: the owner refuses a store below the latest schema version
     owner = _new_owner(home)
     owner.start(install_signal_handlers=False)
     try:

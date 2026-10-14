@@ -3286,6 +3286,14 @@ def _rung_ready(conn: sqlite3.Connection, target: int, backup_ok: bool) -> bool:
     return live == target - 1
 
 
+# The latest schema version: the highest `PRAGMA user_version = N` a migration rung in
+# _run_db_one_time_setup writes. ONE home (#3753): the migration code reads it for the
+# pre-migration backup, and engramd_owner's start() gate refuses a store whose
+# user_version is below it (read through this module attribute at call time, never
+# copied). Adding a rung means bumping this single line.
+LATEST_SCHEMA_VERSION = 8
+
+
 def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     """Run the one-shot backfill/migration/DAG-check block for `conn`.
 
@@ -4038,18 +4046,14 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     # retractions — this is expected by design, not a sign of corruption (#781).
     current_user_version = conn.execute("PRAGMA user_version").fetchone()[0]
 
-    # _PRE_MIGRATION_LATEST_VERSION tracks the highest rung's target version
-    # below (currently rung 8 -> PRAGMA user_version = 8). No single named
-    # constant exists elsewhere in this function for "the latest schema
-    # version" — each rung below hardcodes its own target inline — so this
-    # local mirrors that existing convention rather than inventing a new
-    # module-level constant this PR would be the only user of. Bump this
-    # alongside adding any future rung 9. (Mechanically checked against the
-    # rungs' own PRAGMA user_version = N literals by
-    # test_2181_pre_migration_latest_version_constant_matches_max_rung_target
-    # — forgetting the bump fails loudly at test time instead of silently
-    # skipping the new rung's backup.)
-    _PRE_MIGRATION_LATEST_VERSION = 8
+    # The highest rung's target version is the module-level LATEST_SCHEMA_VERSION
+    # (#3753): the migration reads it here, and the owner's schema-version gate
+    # reads the same name, so there is no second copy to drift. Bump it alongside
+    # adding any future rung. (Mechanically checked against the rungs' own
+    # PRAGMA user_version = N literals by
+    # test_2181_latest_schema_version_constant_matches_max_rung_target -- forgetting
+    # the bump fails loudly at test time instead of silently skipping the new
+    # rung's backup.)
 
     # See _take_pre_migration_backup_if_pending's docstring for the full
     # contract (what True/False mean, why the failure posture is inverted
@@ -4058,7 +4062,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     # rung check below is what makes a failed backup actually block the
     # rungs it guards.
     _pre_migration_backup_ok = _take_pre_migration_backup_if_pending(
-        conn, current_user_version, _PRE_MIGRATION_LATEST_VERSION
+        conn, current_user_version, LATEST_SCHEMA_VERSION
     )
 
     if _rung_ready(conn, 1, _pre_migration_backup_ok):

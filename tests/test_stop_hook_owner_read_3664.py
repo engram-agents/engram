@@ -45,6 +45,7 @@ from unittest.mock import patch
 import pytest
 
 from _owner_platform import requires_linux_owner
+from _owner_store import stamp_current_schema
 from _fake_owner import FakeOwner, registered_sql
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -708,6 +709,8 @@ def test_c3_rejected_by_a_real_owner_is_loud_and_never_opens_the_store(home, mon
     fall back to the store -> red."""
     (home / "knowledge.db").write_bytes(b"")
     sqlite3.connect(str(home / "knowledge.db")).close()
+    # #3753: current schema version but NO tables, so the owner starts and drops every template at load
+    stamp_current_schema(home / "knowledge.db")
     set_config(home, flag=True)
     mod = load_hook(home, monkeypatch)
     with owner_of("real", home):

@@ -44,6 +44,7 @@ from pathlib import Path
 import pytest
 
 from _owner_platform import requires_linux_owner
+from _owner_store import stamp_current_schema
 
 _SRC_ENGRAM = str(Path(__file__).resolve().parent.parent / "src" / "engram")
 if _SRC_ENGRAM not in sys.path:
@@ -142,6 +143,7 @@ def bare_store(home: Path, *, with_nodes: bool = False) -> Path:
         conn.execute("INSERT INTO nodes VALUES ('ls_x', 'lesson', 'c', 1, NULL, NULL)")
     conn.commit()
     conn.close()
+    stamp_current_schema(db)  # #3753: the owner refuses a store below the latest schema version (the walk tables are still absent)
     return db
 
 

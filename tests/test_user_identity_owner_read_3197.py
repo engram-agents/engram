@@ -37,6 +37,7 @@ from unittest.mock import patch
 import pytest
 
 from _owner_platform import requires_linux_owner
+from _owner_store import stamp_current_schema
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ENGRAM = str(REPO_ROOT / "src" / "engram")
@@ -418,11 +419,12 @@ def test_c3_owner_down_is_loud_two_kinds_of_steps_and_never_opens_the_store(prom
 @requires_linux_owner
 def test_c3_rejected_by_a_real_owner_is_loud_names_reason_and_remedy(home, monkeypatch):
     """A registry drift bug for real: the store has no `nodes` table, so the
-    owner's registry drops the statement and answers unregistered_template.
+    owner's registry drops the statement at load and answers refused_at_load (#3753).
     Mutation: treat Rejected as an empty answer, or fall back to the store
     -> red."""
     db = home / "knowledge.db"
     sqlite3.connect(str(db)).close()
+    stamp_current_schema(db)  # #3753: current version, no tables -> started owner, every template dropped
     set_flag(home, True)
     mod = load_hook(home, monkeypatch)
     with started_owner(home):
@@ -430,11 +432,11 @@ def test_c3_rejected_by_a_real_owner_is_loud_names_reason_and_remedy(home, monke
         stdout, exc, _m = run_main(mod, "Alice: hello")
     assert not [s for s in seen if "knowledge.db" in s], seen
     ctx = additional_context(stdout)
-    assert "unregistered_template" in ctx
+    assert "refused_at_load" in ctx
     assert "refused" in ctx.lower()
-    # The owner's own remedy text travels verbatim (the registry's remedy
-    # names the registration step).
-    assert "register" in ctx.lower()
+    # The owner's own remedy text travels verbatim (#3753: it names the store and the
+    # restart, not the registration step).
+    assert "restart the owner" in ctx.lower()
 
 
 def test_c3_an_unusable_ok_result_is_loud_not_zero_people(home, monkeypatch):

@@ -40,6 +40,7 @@ from pathlib import Path
 import pytest
 
 from _owner_platform import requires_linux_owner
+from _owner_store import seed_current_store
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ENGRAM = str(REPO_ROOT / "src" / "engram")
@@ -59,6 +60,7 @@ RESTART_STEP_PREFIX = "Check whether the engramd process is running and (re)star
 @pytest.fixture
 def engram_home():
     d = tempfile.mkdtemp(prefix="edb-")
+    seed_current_store(d)  # #3753: the owner refuses a home with no current-schema store
     try:
         yield Path(d)
     finally:

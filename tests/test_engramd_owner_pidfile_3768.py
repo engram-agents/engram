@@ -10,7 +10,7 @@ runs in a CHILD process under a kill timeout, so a regression is a red cell and
 not a hung run):
 
   1. FIFO at the pidfile path before start: `OwnerPidfileNotRegular`, no
-     socket, via `main()` exit code `EXIT_PIDFILE_NOT_REGULAR` and stderr
+     socket, via `main()` exit code `EXIT_PATH_NOT_REGULAR` and stderr
      naming the path and "FIFO".
   2. FIFO swapped in AFTER the pre-bind check: same refusal, the owner's own
      socket removed, both store connections closed, no hang.
@@ -50,6 +50,7 @@ if _SRC_ENGRAM not in sys.path:
     sys.path.insert(0, _SRC_ENGRAM)
 
 from _owner_platform import requires_supported_owner  # noqa: E402
+from _owner_store import seed_current_store  # noqa: E402
 import engramd_owner as eo  # noqa: E402
 
 pytestmark = requires_supported_owner
@@ -126,6 +127,10 @@ print(json.dumps({
 @pytest.fixture
 def home():
     d = tempfile.mkdtemp(prefix="p68-")  # short: AF_UNIX path limits
+    # #3753: the schema gate runs BEFORE the pidfile check, so a cell expecting a pidfile
+    # refusal (or a successful start) needs a current-schema store. Explicit, not the
+    # conftest default: most cells run the owner in a CHILD process the default cannot reach.
+    seed_current_store(d)
     try:
         yield Path(d)
     finally:
@@ -207,7 +212,7 @@ def test_fifo_before_start_via_main_exit_code_and_stderr(home):
     """Mutation: drop the pre-bind check, or the main() catch -> wrong exit code."""
     os.mkfifo(_pidfile(home))
     proc = _run_main(home)
-    assert proc.returncode == eo.EXIT_PIDFILE_NOT_REGULAR == 4, (proc.returncode, proc.stderr)
+    assert proc.returncode == eo.EXIT_PATH_NOT_REGULAR == 4, (proc.returncode, proc.stderr)
     assert str(_pidfile(home)) in proc.stderr and "FIFO" in proc.stderr
     assert not os.path.lexists(_socket(home))
 

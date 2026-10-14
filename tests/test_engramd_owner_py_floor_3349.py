@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 
 from _owner_platform import requires_linux_owner
+from _owner_store import seed_current_store
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ENGRAM = str(REPO_ROOT / "src" / "engram")
@@ -41,6 +42,7 @@ import engramd_owner as eo  # noqa: E402
 @pytest.fixture
 def engram_home():
     d = tempfile.mkdtemp(prefix="edo-")
+    seed_current_store(d)  # #3753: the owner refuses a home with no current-schema store
     try:
         yield Path(d)
     finally:
@@ -132,6 +134,9 @@ def test_start_refusal_leaves_stale_socket_untouched(engram_home, monkeypatch):
     _check_stale_socket_or_raise would unlink; the refusal must come first,
     so the file is still there afterwards."""
     owner = eo.EngramdOwner(engram_home)
+    # This cell pins that the refusal comes before ANY creation, store included; the fixture's
+    # seeded store (#3753) is removed so the `store_path` check below still means that.
+    owner.store_path.unlink()
     run_dir = owner.socket_path.parent
     run_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
     stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

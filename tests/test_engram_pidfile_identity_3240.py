@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from _owner_platform import requires_linux_owner
+from _owner_store import seed_current_store
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ENGRAM = str(REPO_ROOT / "src" / "engram")
@@ -97,6 +98,7 @@ def test_P1_helper_reused_pid_is_not_alive(home, sleeper):
 def test_P1_owner_start_succeeds_over_reused_pid(home, sleeper):
     import engramd_owner as eo
 
+    seed_current_store(home)  # #3753: the gate runs before the checks under test
     probe = eo.EngramdOwner(home)
     probe.socket_path.parent.mkdir(parents=True, exist_ok=True)
     dummy = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -279,6 +281,7 @@ def test_P10_unreadable_cmdline_is_conservatively_alive(home, sleeper, monkeypat
 def test_P11_owner_does_not_steal_from_drifted_live_owner(home, marker_proc):
     import engramd_owner as eo
 
+    seed_current_store(home)  # #3753: the gate runs before the checks under test
     probe = eo.EngramdOwner(home)
     probe.socket_path.parent.mkdir(parents=True, exist_ok=True)
     dummy = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

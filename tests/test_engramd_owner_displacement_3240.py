@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from _owner_platform import requires_linux_owner
+from _owner_store import stamp_current_schema
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ENGRAM = str(REPO_ROOT / "src" / "engram")
@@ -64,6 +65,7 @@ def _seed_wal_store(home: Path) -> None:
     conn.executemany("INSERT INTO widgets (name) VALUES (?)", [("a",), ("b",)])
     conn.commit()
     conn.close()
+    stamp_current_schema(home / eo.DEFAULT_STORE_NAME)  # #3753 (D5 starts the owner in a child)
 
 
 def _snap(owner, dest: Path):
@@ -275,6 +277,7 @@ def test_D8_restart_resets_displaced_flag(owner, home):
     conn.execute("INSERT INTO widgets (name) VALUES ('a')")
     conn.commit()
     conn.close()
+    stamp_current_schema(fresh)  # #3753
     owner.store_path = fresh
     owner.start(install_signal_handlers=False)
     assert owner._displaced is False

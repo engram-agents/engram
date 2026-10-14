@@ -32,6 +32,7 @@ import pytest
 
 from _fake_owner import FakeOwner
 from _owner_platform import requires_linux_owner  # noqa: F401  (live-owner variants)
+from _owner_store import stamp_current_schema
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ENGRAM = str(REPO_ROOT / "src" / "engram")
@@ -63,6 +64,7 @@ def _to_file(mem, home):
     dest = sqlite3.connect(str(home / "knowledge.db"))
     mem.backup(dest)
     dest.close()
+    stamp_current_schema(home / "knowledge.db")  # #3753: the owner refuses a store below the latest schema version (backup() replaces the header)
 
 
 def _direct_row_conn(home):

@@ -43,6 +43,7 @@ from pathlib import Path
 import pytest
 
 from _owner_platform import requires_linux_owner
+from _owner_store import stamp_current_schema
 
 _SRC_ENGRAM = str(Path(__file__).resolve().parent.parent / "src" / "engram")
 if _SRC_ENGRAM not in sys.path:
@@ -86,6 +87,7 @@ def _store(home: Path, vocab_variant: str | None = "row") -> Path:
         )
     conn.commit()
     conn.close()
+    stamp_current_schema(db)  # #3753: the owner refuses a store below the latest schema version
     return db
 
 

@@ -337,6 +337,36 @@ def mock_dns_resolution(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _owner_gate_sees_current_store(request, monkeypatch):
+    """Default for any in-process `EngramdOwner.start()` (#3753): the owner refuses a store whose
+    `PRAGMA user_version` is below `engram_core.LATEST_SCHEMA_VERSION`, and hand-built test stores
+    (`CREATE TABLE nodes ...`) sit at 0. This wraps the gate so that, immediately before the REAL
+    gate runs, an EXISTING, non-empty SQLite store that has tables and is behind gets stamped
+    (`_owner_store.stamp_if_behind`). It is NOT a no-op: the real gate still runs on every start, and
+    it still refuses an absent store, a 0-byte or non-SQLite file, a non-regular path, a locked
+    store, and a newer one; those tests keep working. It does hide ONE thing, a behind store that
+    has tables, so a test that wants that refusal (the gate's own file, or any test of a behind
+    store) carries `@pytest.mark.owner_schema_gate_real`.
+
+    Reach: in-process only. An owner started in a child process (subprocess scripts) or against an
+    ABSENT store needs an explicit `tests/_owner_store.py` stamp in its fixture;
+    tests/test_owner_test_stamp_discipline_3753.py makes a new owner test module state which."""
+    if request.node.get_closest_marker("owner_schema_gate_real"):
+        return
+    eo = sys.modules.get("engramd_owner")
+    real = getattr(eo, "_require_store_schema_current", None)
+    if real is None:
+        return
+    from _owner_store import stamp_if_behind
+
+    def gate_with_default_stamp(store_path):
+        stamp_if_behind(store_path)
+        return real(store_path)
+
+    monkeypatch.setattr(eo, "_require_store_schema_current", gate_with_default_stamp)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_git_config_leak(monkeypatch, tmp_path):
     """#2126: no `git` subprocess spawned by a test may read or write the real
     user's global/system git config.

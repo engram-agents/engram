@@ -49,6 +49,7 @@ from _fake_owner import FakeOwner, statement_of  # noqa: E402
 from test_engramd_client_read_shim_3665 import Clock, StubRead  # noqa: E402
 from test_engramd_df_3665 import REASON_CASES, _store, _store_with_vocab_ddl  # noqa: E402
 from test_idf_batch_3665 import _SMALL_CORPUS, _make_db  # noqa: E402
+from _owner_store import stamp_current_schema  # noqa: E402
 
 IDF_SQL_LITERAL = (
     "SELECT term, doc FROM nodes_fts_vocab WHERE term IN (SELECT value FROM json_each(?))"
@@ -261,6 +262,7 @@ def test_extract_keywords_over_a_live_owner_equals_direct(home, text, min_idf):
     dest = sqlite3.connect(str(home / "knowledge.db"))
     mem.backup(dest)
     dest.close()
+    stamp_current_schema(home / "knowledge.db")  # #3753: the owner refuses a store below the latest schema version (backup() replaces the header)
     direct = engram_idf.extract_keywords(_direct_row_conn(home), text, min_idf=min_idf)
     owner = eo.EngramdOwner(home, request_deadline=0.6)
     owner.start(install_signal_handlers=False)
@@ -401,6 +403,7 @@ def _backup_small_corpus(home):
     dest = sqlite3.connect(str(home / "knowledge.db"))
     mem.backup(dest)
     dest.close()
+    stamp_current_schema(home / "knowledge.db")  # #3753: the owner refuses a store below the latest schema version (backup() replaces the header)
 
 
 def test_extract_keywords_with_a_300_byte_token_over_the_fake_owner_equals_direct(home):
@@ -447,14 +450,15 @@ def test_statement_of_normalises_df_and_read_requests():
 
 
 def test_fake_owner_refuses_the_idf_statement_on_read_like_the_real_owner(home):
-    """The real owner drops the listed IDF template at load -> `unregistered_template` (measured on the real owner); the
-    fake must say the same, or a suite could pass with the batch travelling as `read`.
+    """The real owner drops the listed IDF template at load -> `refused_at_load`, detail `virtual_table_template` (#3753;
+    it was `unregistered_template` before); the fake must say the same, or a suite could pass with the batch travelling as `read`.
     Mutation: the fake answers the IDF statement on `read` with ok -> red."""
     _backup_small_corpus(home)
     with FakeOwner(home) as o:
         res = ec.read("read", {"sql": IDF_SQL_LITERAL, "args": [json.dumps(["formula"])]},
                       timeout=5.0, socket_path=o.socket_path)
-    assert isinstance(res, ec.Rejected) and res.reason == "unregistered_template", res
+    assert isinstance(res, ec.Rejected) and res.reason == "refused_at_load", res
+    assert res.detail == "virtual_table_template", res
 
 
 @requires_linux_owner
@@ -468,7 +472,8 @@ def test_the_real_owner_also_refuses_the_idf_statement_on_read(home):
                       timeout=5.0, socket_path=owner.socket_path)
     finally:
         owner.stop()
-    assert isinstance(res, ec.Rejected) and res.reason == "unregistered_template", res
+    assert isinstance(res, ec.Rejected) and res.reason == "refused_at_load", res
+    assert res.detail == "virtual_table_template", res
 
 
 # --- 10: FAITHFULNESS -- the fake's df against a REAL owner ------------------------------

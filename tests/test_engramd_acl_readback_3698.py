@@ -45,6 +45,7 @@ from pathlib import Path
 import pytest
 
 from _owner_platform import requires_linux_kernel, requires_linux_owner
+from _owner_store import seed_current_store
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ENGRAM = str(REPO_ROOT / "src" / "engram")
@@ -103,6 +104,7 @@ def _home_with_run(base: Path, *acl_args: str) -> tuple[Path, Path]:
     run = home / "run"
     run.mkdir(parents=True)
     _setfacl(*acl_args, str(run))
+    seed_current_store(home)  # #3753: start()/main() callers pass the schema gate first
     return home, run
 
 
@@ -310,6 +312,7 @@ def test_healthy_real_strip_under_default_acl_parent_starts_and_serves(tmp_base)
     home = tmp_base / "h"
     home.mkdir()
     _skip_if_socket_path_too_long(home)
+    seed_current_store(home)  # #3753
     _setfacl("-d", "-m", f"u:{_NOBODY}:rwx", str(home))
     probe = home / "probe"
     probe.mkdir()

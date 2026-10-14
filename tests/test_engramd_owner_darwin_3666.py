@@ -43,6 +43,7 @@ if _SRC_ENGRAM not in sys.path:
 import _owner_platform as op  # noqa: E402  (imported at COLLECTION: it evaluates the predicate once, unpatched)
 import engramd_client as ec  # noqa: E402
 import engramd_owner as eo  # noqa: E402
+from _owner_store import seed_current_store  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "darwin",
@@ -62,6 +63,7 @@ _CHMOD = "/bin/chmod"  # literal on purpose: these cells do not trust the module
 def home():
     """A short-path temp ENGRAM_HOME (AF_UNIX paths are capped at 103 bytes here)."""
     d = tempfile.mkdtemp(prefix="d66-")
+    seed_current_store(d)  # #3753: the owner refuses a home with no current-schema store
     try:
         yield Path(d)
     finally:
@@ -537,6 +539,8 @@ def test_tcc_prefix_match_is_case_insensitive_like_the_default_volume(fake_user_
 
 def test_home_outside_the_tcc_folders_starts(fake_user_home):
     for ok in (fake_user_home / "e", fake_user_home / "Documents2" / "e"):
+        ok.mkdir(parents=True)
+        seed_current_store(ok)  # #3753
         owner = _owner(ok)
         owner.start(install_signal_handlers=False)
         try:

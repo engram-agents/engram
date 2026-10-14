@@ -1661,7 +1661,7 @@ def _latest_rung_target():
     meant adding rung 5 (#2324) broke eight unrelated tests that were only
     ever trying to say "the ladder finished". Hand-listing a value the
     codebase owns is the same staleness trap this file's own
-    _PRE_MIGRATION_LATEST_VERSION test exists to catch; deriving it means
+    LATEST_SCHEMA_VERSION test exists to catch; deriving it means
     rung 6 costs nothing here.
     """
     import ast
@@ -2234,16 +2234,18 @@ def test_2181_pre_migration_backup_skips_for_in_memory_connection(capsys):
         shutil.rmtree(core_test_dir, ignore_errors=True)
 
 
-def test_2181_pre_migration_latest_version_constant_matches_max_rung_target():
-    """Hardening (flagged, now closed): _PRE_MIGRATION_LATEST_VERSION has
-    no structural link to the rungs -- it is a hand-maintained mirror of
+def test_2181_latest_schema_version_constant_matches_max_rung_target():
+    """Hardening (flagged, now closed): the latest schema version has no
+    structural link to the rungs -- it is a hand-maintained mirror of
     "the highest PRAGMA user_version = N a rung actually writes". Add a
     rung 5 and forget to bump the constant, and current_user_version < 4
     is False for an already-v4 graph, so no backup is taken before rung 5
     rewrites data -- silent, and in the reassuring direction. This test
     parses engram_core.py, finds every `conn.execute("PRAGMA user_version
     = N")` literal actually written inside _run_db_one_time_setup, and
-    asserts the constant equals the max.
+    asserts the MODULE-LEVEL `LATEST_SCHEMA_VERSION` (#3753: promoted from a
+    function-local so the owner's start() gate reads the same constant)
+    equals the max.
     """
     import ast
     import re
@@ -2281,17 +2283,28 @@ def test_2181_pre_migration_latest_version_constant_matches_max_rung_target():
     )
     max_rung_version = max(versions_written)
 
-    latest_const_match = re.search(
-        r"_PRE_MIGRATION_LATEST_VERSION\s*=\s*(\d+)", func_source
+    # The constant lives at MODULE level (a top-level assignment), and the
+    # migration function must not carry a function-local copy of it.
+    module_assigns = [
+        n for n in tree.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "LATEST_SCHEMA_VERSION" for t in n.targets)
+    ]
+    assert len(module_assigns) == 1, (
+        "expected exactly one module-level `LATEST_SCHEMA_VERSION = <int>` in engram_core.py"
     )
-    assert latest_const_match is not None, (
-        "_PRE_MIGRATION_LATEST_VERSION assignment not found inside "
-        "_run_db_one_time_setup"
+    assert isinstance(module_assigns[0].value, ast.Constant) and isinstance(
+        module_assigns[0].value.value, int
     )
-    latest_const = int(latest_const_match.group(1))
+    latest_const = module_assigns[0].value.value
+    assert not re.search(r"\bLATEST_SCHEMA_VERSION\s*=", func_source), (
+        "_run_db_one_time_setup must read the module-level LATEST_SCHEMA_VERSION, "
+        "not assign a local copy"
+    )
+    assert "LATEST_SCHEMA_VERSION" in func_source
 
     assert latest_const == max_rung_version, (
-        f"_PRE_MIGRATION_LATEST_VERSION={latest_const} must equal the "
+        f"LATEST_SCHEMA_VERSION={latest_const} must equal the "
         f"highest `PRAGMA user_version = N` literal a rung actually writes "
         f"({max_rung_version}) -- add a rung without bumping this constant "
         f"and the pre-migration backup silently stops firing before the "

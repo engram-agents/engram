@@ -39,6 +39,7 @@ from pathlib import Path
 import pytest
 
 from _owner_platform import requires_linux_owner
+from _owner_store import seed_current_store, stamp_current_schema
 
 _SRC_ENGRAM = str(Path(__file__).resolve().parent.parent / "src" / "engram")
 if _SRC_ENGRAM not in sys.path:
@@ -202,6 +203,7 @@ def test_no_setting_downgrades_a_refusal_to_a_warning():
 @pytest.fixture
 def owner_running():
     home = Path(tempfile.mkdtemp(prefix="edo-"))
+    seed_current_store(home)  # #3753: the owner refuses a store below the latest schema version
     owner = eo.EngramdOwner(home, request_deadline=0.6)
     owner.start(install_signal_handlers=False)
     try:
@@ -592,6 +594,7 @@ def _home_with_store(tmp_path: Path, *, install_tier=None) -> Path:
     conn.execute("INSERT INTO notes (title) VALUES ('hello')")
     conn.commit()
     conn.close()
+    stamp_current_schema(home / "knowledge.db")  # #3753: the owner refuses a store below the latest schema version
     if install_tier is not None:
         (home / "config.json").write_text(_json.dumps({"install_tier": install_tier}))
     return home

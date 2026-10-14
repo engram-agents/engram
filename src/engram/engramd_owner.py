@@ -56,8 +56,9 @@ directly.
 
 A pidfile path that exists and is not a regular file (FIFO, symlink,
 directory) is refused the same way (#3768): `OwnerPidfileNotRegular`, and
-`main()` returns `EXIT_PIDFILE_NOT_REGULAR` (4), distinct from 1 and from
-`EXIT_DISPLACED` (3).
+`main()` returns `EXIT_PATH_NOT_REGULAR` (4), distinct from 1 and from
+`EXIT_DISPLACED` (3). A store path that is not a regular file is refused with
+the same code (`OwnerStorePathNotRegular`): retrying cannot fix a planted path.
 
 ## Socket path resolution -- replicated, not shared; the "never modify
 ## engramd_client.py" note below is U3's OWN historical scope bound, now
@@ -274,12 +275,25 @@ _PIDFILE_PROGRAM_MARKER = ec.PIDFILE_PROGRAM_MARKER
 # EXIT_DISPLACED) on this path -- see main() for why finalization is skipped.
 EXIT_DISPLACED = 3
 
-# #3768: exit status of an owner that REFUSED TO START because its pidfile path
-# exists and is not a regular file (FIFO, symlink, directory, ...). Its own
-# code, not the surface daemon's run-without-pidfile fallback: the owner's
-# pidfile carries liveness, so an owner without one reads as down while it
-# holds the socket. main() returns it (nothing was bound or left behind).
-EXIT_PIDFILE_NOT_REGULAR = 4
+# #3768, #3753: exit status of an owner that REFUSED TO START because its pidfile path
+# or its store path exists and is not a regular file (FIFO, symlink, directory,
+# socket, device, ...). Retrying cannot fix a planted path, so the unit does not
+# restart it. For the pidfile it is its own code, not the surface daemon's
+# run-without-pidfile fallback: the owner's pidfile carries liveness, so an owner
+# without one reads as down while it holds the socket. main() returns it (nothing
+# was bound or left behind).
+EXIT_PATH_NOT_REGULAR = 4
+# #3753: exit status of an owner that refused to start because the store is BEHIND the
+# schema this code was written against (no knowledge.db, or PRAGMA user_version below
+# engram_core.LATEST_SCHEMA_VERSION). Distinct from 0/1/3/4 so a supervisor and the log can
+# tell it from "another owner holds the seat" (1), "displaced" (3) and "a pidfile or store
+# path is not a regular file" (4). Non-zero, so Restart=on-failure / launchd retry it: the usual cause is the
+# first migration not having run yet. It is 5, NOT 2: CPython itself exits 2 when it cannot
+# open the script it was asked to run (`python /nonexistent/x.py`, i.e. a deleted
+# ExecStart), so a unit's exit table would read that as "store behind schema". A refusal
+# code must not share a value with the interpreter's own failure codes (1 and 2); 1 stays
+# only as OwnerAlreadyRunning's historic code (main() returns the literal).
+EXIT_STORE_BEHIND_SCHEMA = 5
 
 # #3240 item 2: methods that never touch the store and so are exempt from the
 # displacement self-check. Every OTHER registered method is guarded by
@@ -637,7 +651,7 @@ class OwnerPidfileNotRegular(RuntimeError):
     Raised before the socket is bound when the path is already wrong, and
     after cleaning up the socket and store connections when it turns wrong
     between that check and the write. A distinct exception, with its own exit
-    code (EXIT_PIDFILE_NOT_REGULAR), because the owner cannot fall back to
+    code (EXIT_PATH_NOT_REGULAR), because the owner cannot fall back to
     running without a pidfile: the pidfile carries its liveness, and an owner
     without one reads as down while it holds the socket."""
 
@@ -691,6 +705,149 @@ class OwnerPythonTooOld(RuntimeError):
     bounds client-read result size with them; without them it must refuse
     to start with this named reason, never run an unbounded read
     connection."""
+
+
+class OwnerStoreBehindSchema(RuntimeError):
+    """Raised by EngramdOwner.start() when the store is behind the schema this
+    code expects (#3753): knowledge.db does not exist, cannot be read as a
+    SQLite file, or its `PRAGMA user_version` is below
+    `engram_core.LATEST_SCHEMA_VERSION`. (A store path that is not a regular
+    file is a different refusal, OwnerStorePathNotRegular.) Started anyway, the owner would
+    classify its read templates against the old schema, drop every one that
+    needs a newer table, and keep them dropped for its whole lifetime. The
+    message names the version found and the version required (or, when the
+    version cannot be read, whether the store is locked/busy, corrupt, or the
+    check's own import failed). Raised before anything is opened read-write
+    and before run/ exists, so a refusal creates no knowledge.db and no run/.
+    One qualification: a WAL-mode store (the real one) may gain
+    `knowledge.db-wal` / `knowledge.db-shm` sidecar files, because SQLite
+    creates them for any connection to a WAL database, `mode=ro` included
+    (measured: -wal 0 bytes, -shm a 32 KiB wal-index, the database file
+    unchanged)."""
+
+
+class OwnerStorePathNotRegular(RuntimeError):
+    """Raised when the store path (<ENGRAM_HOME>/knowledge.db) exists and is not
+    a regular file (#3753): a FIFO (a read-only open would wait for a writer
+    forever), a directory, a socket or a device. A symlink is followed, so one
+    to a regular file is fine and one to a FIFO is refused. A separate class
+    from OwnerStoreBehindSchema (not a subclass, so neither handler can shadow
+    the other): main() maps it to EXIT_PATH_NOT_REGULAR, which the unit does not
+    restart, because retrying cannot fix a planted path."""
+
+
+def _file_kind(mode: int) -> str:
+    for name, test in (("fifo", stat.S_ISFIFO), ("directory", stat.S_ISDIR),
+                       ("socket", stat.S_ISSOCK), ("character device", stat.S_ISCHR),
+                       ("block device", stat.S_ISBLK)):
+        if test(mode):
+            return name
+    return "other non-regular file"
+
+
+def _refuse_non_regular_store(store_path) -> None:
+    """Raise OwnerStorePathNotRegular if `store_path` exists and is not a regular file (#3753,
+    #3785). The ONE store-path predicate: `_connect_store_ro` (start) and
+    `check_start_refusals` (`--preflight`) both call it.
+
+    `os.stat` FOLLOWS symlinks and does not block on a FIFO: a symlink to a regular file is
+    accepted, a symlink to a FIFO is refused. A missing or unstattable path passes (it is not
+    a blocking object; the caller reports it). Pure: one stat, no mutation."""
+    try:
+        st = os.stat(Path(store_path).resolve())
+    except OSError:
+        return
+    if not stat.S_ISREG(st.st_mode):
+        raise OwnerStorePathNotRegular(
+            f"the store path {store_path} is not a regular file (it is a {_file_kind(st.st_mode)}); "
+            f"refusing to open it: a read-only open of a FIFO would block forever"
+        )
+
+
+def _connect_store_ro(store_path) -> "sqlite3.Connection":
+    """A `mode=ro` URI connection to the store: never creates the file, never
+    writes. The one place the owner opens the store read-only (the start-time
+    schema gate and the read-template classification both go through it).
+
+    Refuses (OwnerStorePathNotRegular, via `_refuse_non_regular_store`) anything that is
+    not a regular file BEFORE connecting: a read-only open (O_RDONLY) of a FIFO blocks
+    until a writer appears, so the check must not be left to sqlite (every earlier store
+    open here was read-write, which fails at once on a FIFO). A missing path is left to
+    the caller's own 'no knowledge.db' branch (sqlite then fails fast on it)."""
+    _refuse_non_regular_store(store_path)
+    return sqlite3.connect(Path(store_path).resolve().as_uri() + "?mode=ro", uri=True)
+
+
+def _require_store_schema_current(store_path) -> None:
+    """Refuse (OwnerStoreBehindSchema) unless `store_path` exists and its
+    `PRAGMA user_version` is >= `engram_core.LATEST_SCHEMA_VERSION` (#3753).
+
+    Reads the version on a `mode=ro` URI connection, never a read-write one,
+    so a missing file is not created as a side effect (a WAL-mode store may
+    still gain -wal/-shm sidecars (no row data) from the probe; `immutable=1` is NOT
+    used because a version bump still in the WAL would then read stale). `>=` passes: an older
+    owner on a newer store is the upgrade-restart case. The required version
+    is read from engram_core at CALL time (module attribute, not a copy), so
+    the migration code and this gate share one constant."""
+    # The one place start() pays for the engram_core import (_engram_core avoids it until
+    # the first typed op). A missing dependency must refuse cleanly, not traceback: it is
+    # reported as OwnerStoreBehindSchema, so main() gives it the same retryable exit code.
+    # A distinct class was judged not worth a second exit code for an install fault the
+    # supervisor's bounded retry handles the same way.
+    try:
+        import engram_core
+    except ImportError as exc:
+        raise OwnerStoreBehindSchema(
+            f"cannot check the store's schema version: import of engram_core failed "
+            f"({type(exc).__name__}: {exc}); the owner's runtime is incomplete"
+        ) from exc
+
+    required = engram_core.LATEST_SCHEMA_VERSION
+    try:
+        present = Path(store_path).exists()
+    except OSError as exc:
+        raise OwnerStoreBehindSchema(
+            f"cannot stat the store at {store_path} ({type(exc).__name__}: {exc}); "
+            f"requires schema version {required}"
+        ) from exc
+    if not present:
+        raise OwnerStoreBehindSchema(
+            f"no knowledge.db at {store_path}: the store has not been created or migrated yet "
+            f"(this owner requires schema version {required}); run the migration "
+            f"(any ENGRAM session start does) and the supervisor will retry"
+        )
+    conn = None
+    try:
+        conn = _connect_store_ro(store_path)
+        found = conn.execute("PRAGMA user_version").fetchone()[0]
+    except sqlite3.OperationalError as exc:
+        text = str(exc).lower()
+        if "locked" in text or "busy" in text:
+            # Retryable and NOT evidence the store is behind: a migration may hold the lock.
+            raise OwnerStoreBehindSchema(
+                f"the store at {store_path} is locked/busy ({exc}); a migration may be running, "
+                f"so its schema version could not be read; the supervisor will retry "
+                f"(this owner requires schema version {required})"
+            ) from exc
+        raise OwnerStoreBehindSchema(
+            f"cannot open the store at {store_path} to read its schema version "
+            f"({type(exc).__name__}: {exc}); this owner requires schema version {required}"
+        ) from exc
+    except sqlite3.Error as exc:
+        raise OwnerStoreBehindSchema(
+            f"the store at {store_path} is not a valid, intact SQLite database "
+            f"({type(exc).__name__}: {exc}); its schema version cannot be read "
+            f"(this owner requires schema version {required})"
+        ) from exc
+    finally:
+        if conn is not None:
+            conn.close()
+    if found < required:
+        raise OwnerStoreBehindSchema(
+            f"the store at {store_path} is at schema version {found}, but this owner requires "
+            f"{required}: it would classify its read templates against the old schema and drop "
+            f"those needing newer tables; migrate the store, then start the owner"
+        )
 
 
 def _require_sqlite_setlimit(conn_cls=None, module=None) -> None:
@@ -1746,6 +1903,14 @@ class EngramdOwner:
         not a regular file (#3768) -- before the stale-socket check and the
         bind in the common case; a path that turns non-regular between that
         check and the pidfile write is refused there, after cleaning up.
+        Raises OwnerStoreBehindSchema if knowledge.db does
+        not exist, cannot be read, or has `PRAGMA user_version` below
+        `engram_core.LATEST_SCHEMA_VERSION` (#3753) -- before anything is
+        created or opened read-write, so the refusal creates no knowledge.db
+        and no run/. Raises OwnerStorePathNotRegular if the store path is not
+        a regular file (FIFO, directory, socket), checked before any open, since
+        a read-only open of a FIFO would block (a WAL-mode store may gain -wal/-shm sidecars (no row data) from
+        the read-only probe).
 
         `install_signal_handlers=False` (tests only -- see
         tests/test_engramd_owner.py's owner_running fixture) skips
@@ -1773,6 +1938,15 @@ class EngramdOwner:
         dynamic_templates = rr.resolve_dynamic_flag(
             os.environ, _read_install_tier(self.engram_home)
         )
+
+        # #3753: refuse a store that is behind this code's schema (or absent) BEFORE the
+        # first filesystem mutation (the mkdir below) and so before any connect() to it:
+        # a read-only probe, so a refusal creates no knowledge.db and no run/ (a WAL-mode
+        # store may gain -wal/-shm sidecars (no row data): SQLite makes them even for mode=ro).
+        # It sits after every pure refusal above (platform, path length, TCC, setlimit,
+        # dynamic flag), which touch nothing, and ahead of the live-owner check below:
+        # a second launch against a behind store is told about the store, not the seat.
+        _require_store_schema_current(self.store_path)
 
         self.engram_home.mkdir(parents=True, exist_ok=True)
 
@@ -1910,7 +2084,7 @@ class EngramdOwner:
         schema_conn = None
         loaded = False
         try:
-            schema_conn = sqlite3.connect(self.store_path.resolve().as_uri() + "?mode=ro", uri=True)
+            schema_conn = _connect_store_ro(self.store_path)
             registry = rr.load_registry(path, schema_conn, dynamic=dynamic)
             loaded = True
             return registry
@@ -1926,8 +2100,9 @@ class EngramdOwner:
     def check_start_refusals(self) -> None:
         """The refusals `start()` makes before it reads or creates anything,
         in `start()`'s order; raises the same exceptions `start()` raises.
-        Pure: no mutation, and the only filesystem access is the one `lstat`
-        of the pidfile in check 4 (each check below is documented pure).
+        Pure: no mutation, and the only filesystem accesses are the one `lstat`
+        of the pidfile in check 4 and the one `stat` of the store in check 5
+        (each check below is documented pure).
         `main()`'s `--preflight` calls exactly this, so the
         installer's up-front check (#3709) is the owner's own logic and a
         refusal that would respawn under a supervisor is caught before
@@ -1951,7 +2126,14 @@ class EngramdOwner:
            follow, so a symlink counts; a missing path (or home) is the normal
            fresh start and passes, which is what makes this safe before mkdir.
            The race between this check and the write is closed in
-           `_write_pidfile`, which keeps its own checks."""
+           `_write_pidfile`, which keeps its own checks.
+        5. #3785: the store path (<ENGRAM_HOME>/knowledge.db), when it exists,
+           must be a regular file: a FIFO, directory, socket or device is
+           refused by name (`OwnerStorePathNotRegular`, exit 4 from `main()`),
+           for the same no-per-exit-code-retry reason as check 4. Runs even
+           when the pidfile is absent. One `stat` (follows symlinks, does not
+           block on a FIFO) through `_refuse_non_regular_store`, the very
+           helper `_connect_store_ro` uses; a missing store or home passes."""
         self._check_platform_support()
         too_long = ec.socket_path_too_long_reason(self.socket_path)
         if too_long is not None:
@@ -1960,12 +2142,13 @@ class EngramdOwner:
         try:
             pid_stat = os.lstat(self.pid_path)
         except FileNotFoundError:
-            return
+            pid_stat = None  # fresh start: fall through to check 5, do not return
         # A hard-linked regular file is refused too: writing it would rewrite
         # another name's content.
-        if not stat.S_ISREG(pid_stat.st_mode) or pid_stat.st_nlink > 1:
+        if pid_stat is not None and (not stat.S_ISREG(pid_stat.st_mode) or pid_stat.st_nlink > 1):
             raise OwnerPidfileNotRegular(
                 self._pidfile_refusal_text(pid_stat.st_mode, pid_stat.st_nlink))
+        _refuse_non_regular_store(self.store_path)
 
     def _check_platform_support(self) -> None:
         """Refuse to start rather than silently degrade the permission
@@ -3620,38 +3803,57 @@ class EngramdOwner:
 # ---------------------------------------------------------------------------
 
 
+# The ONE exception -> exit-code table `main()` uses, for `--preflight` and for `start()` alike
+# (#3785, Borges's ruling on PR #3776): two hand-written tables had drifted (--preflight gave a
+# planted pidfile 1, start() gave it 4). Looked up with isinstance, in order; none of these
+# classes subclasses another (all are direct RuntimeError subclasses), so the order carries no
+# meaning today, but a future subclass must be listed BEFORE its base. `--preflight` only ever
+# raises the classes `check_start_refusals` raises; OwnerAlreadyRunning, OwnerAclNotStripped and
+# OwnerStoreBehindSchema are start()-only.
+# Owner* classes deliberately absent (OwnerStalePathUnsafe, OwnerPeerCredentialsMalformed,
+# OwnerPythonTooOld) are not mapped and propagate.
+_REFUSAL_EXIT: tuple[tuple[type[RuntimeError], int], ...] = (
+    (OwnerAlreadyRunning, 1),
+    (OwnerSocketPathTooLong, 1),
+    (OwnerHomeTccProtected, 1),
+    (OwnerAclNotStripped, 1),
+    (OwnerPermissionUnsupported, 1),
+    (OwnerPidfileNotRegular, EXIT_PATH_NOT_REGULAR),  # retrying cannot fix a planted path
+    (OwnerStorePathNotRegular, EXIT_PATH_NOT_REGULAR),
+    # Its own code (not 1, not os._exit): non-zero, so the supervisor retries while the first
+    # migration finishes.
+    (OwnerStoreBehindSchema, EXIT_STORE_BEHIND_SCHEMA),
+)
+
+
+def _refusal_exit_code(exc: BaseException) -> int | None:
+    """The exit code `_REFUSAL_EXIT` gives `exc`, or None if it is not a mapped refusal."""
+    for cls, code in _REFUSAL_EXIT:
+        if isinstance(exc, cls):
+            return code
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     owner = EngramdOwner()
+    refusals = tuple(cls for cls, _code in _REFUSAL_EXIT)
     if "--preflight" in args:
         # #3709: run only the refusals start() makes before it touches anything
         # (ENGRAM_HOME from the environment). Mutates nothing; silent exit 0
         # when start() would get past them, else the owner's own reason on
-        # stderr and exit 1 (the same code main() gives every refusal).
+        # stderr and the code `_REFUSAL_EXIT` gives it (the same one start() gives).
         try:
             owner.check_start_refusals()
-        except (OwnerSocketPathTooLong, OwnerHomeTccProtected, OwnerPermissionUnsupported,
-                OwnerPidfileNotRegular) as exc:
+        except refusals as exc:
             print(f"[engramd] {exc}", file=sys.stderr)
-            return 1
+            return _refusal_exit_code(exc)
         return 0
     try:
         owner.start(install_signal_handlers=True)
-    except OwnerAlreadyRunning as exc:
+    except refusals as exc:
         print(f"[engramd] {exc}", file=sys.stderr)
-        return 1
-    except (OwnerSocketPathTooLong, OwnerHomeTccProtected) as exc:
-        print(f"[engramd] {exc}", file=sys.stderr)
-        return 1
-    except OwnerAclNotStripped as exc:
-        print(f"[engramd] {exc}", file=sys.stderr)
-        return 1
-    except OwnerPermissionUnsupported as exc:
-        print(f"[engramd] {exc}", file=sys.stderr)
-        return 1
-    except OwnerPidfileNotRegular as exc:
-        print(f"[engramd] {exc}", file=sys.stderr)
-        return EXIT_PIDFILE_NOT_REGULAR
+        return _refusal_exit_code(exc)
     print(f"[engramd] listening on {owner.socket_path} (pid {os.getpid()})", file=sys.stderr)
     owner.wait_forever()
     # Reading _displaced right after wait_forever() is safe because stop()

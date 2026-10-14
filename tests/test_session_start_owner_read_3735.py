@@ -858,14 +858,15 @@ def test_b_embedding_restore_missing_table_is_healthy_directly_and_unknown_throu
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 def test_embedding_check_flag_on_off_divergence_is_pinned_under_the_real_owner(home, monkeypatch):
     """PR #3746 design ruling (Borges), NO behaviour change, divergence PINNED against the REAL
-    owner (the fake/Script stubs cannot show the registry's own `unregistered_template`) on a
+    owner (the fake/Script stubs cannot show the registry's own `refused_at_load`) on a
     real-schema store whose `embedding_restore_state` table is DROPPED before the owner starts:
       flag OFF -> (True, None)  (sqlite3 "no such table" is healthy by design);
-      flag ON  -> (None, "OwnerReadError...unregistered_template...") -- UNKNOWN, never healthy,
-                  because the owner gives that same reason for an empty registry (a real outage);
+      flag ON  -> (None, "OwnerReadError...refused_at_load...") -- UNKNOWN, never healthy (since #3753
+                  the reason is `refused_at_load`; an EMPTY registry, a real outage, is still
+                  `unregistered_template`, and the hook does not branch on the reason);
                   the failure is recorded at this site with kind `rejected`, and a full fire carries
                   the owner-failure notice exactly once.
-    Mutations: (M1) flag-ON branch maps a Rejected `unregistered_template` to (True, None) -> the ON
+    Mutations: (M1) flag-ON branch maps a Rejected `refused_at_load` to (True, None) -> the ON
     assertions go red; (M2) flag-OFF branch treats "no such table" as UNKNOWN -> the OFF assertion
     goes red; (M3) no notice emitted for this failure -> the notice count goes red."""
     mod = full_fire_setup(home, monkeypatch)  # build_store + flag ON + marker; hermetic hook module
@@ -884,7 +885,7 @@ def test_embedding_check_flag_on_off_divergence_is_pinned_under_the_real_owner(h
             via = mod._check_embedding_restore_flag(str(home))
         assert via[0] is None, via
         assert via[1].startswith("OwnerReadError"), via
-        assert "unregistered_template" in via[1], via
+        assert "refused_at_load" in via[1], via
         assert run["failure"]["site"] == "_check_embedding_restore_flag", run["failure"]
         assert run["failure"]["kind"] == "rejected", run["failure"]
         fire = run_main(mod, home)

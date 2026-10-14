@@ -73,6 +73,13 @@ SAFE_PLACEHOLDER_OPERATORS = frozenset({"=", "==", "<", ">", "<=", ">=", "<>", "
 
 _REMEDY_REGISTER = "register at build time, or use a typed read operation"
 
+# #3753 shape 2: the cause of a `refused_at_load` is the STORE, not the registration list.
+_REMEDY_REFUSED_AT_LOAD = (
+    "the owner classified this template at start-up against the store it opened, and dropped it: "
+    "the store lacks something it needs, or the owner started against an older schema; migrate the "
+    "store and restart the owner"
+)
+
 
 # ---------------------------------------------------------------------------
 # Wire shapes and exceptions
@@ -703,6 +710,15 @@ class Registry:
                             detail="sql is not encodable as UTF-8",
                             remedy="send the registered statement text as a str")
         if self._templates.get(key) != sql:
+            dropped = self._refused.get(sql)
+            if dropped is not None:
+                # #3753: listed, but the loader dropped it at load (re-classification against the
+                # live store failed). The cause is the store, not the list: say so, carrying the
+                # original reason as the detail so a caller can tell "your store lacks table X"
+                # from "your owner is older than your hook" (`unregistered_template`).
+                return Rejected(reason="refused_at_load", detail=dropped.reason,
+                                remedy=f"{_REMEDY_REFUSED_AT_LOAD} (original remedy: {dropped.remedy})"
+                                if dropped.remedy else _REMEDY_REFUSED_AT_LOAD)
             return Rejected(reason="unregistered_template", detail=key, remedy=_REMEDY_REGISTER)
         if not isinstance(params, (tuple, list)):
             return Rejected(reason="invalid_parameter",

@@ -822,12 +822,13 @@ def _check_embedding_restore_flag(engram_home: str) -> tuple[bool | None, str | 
     (nothing to restore). That "healthy by design" is flag-OFF ONLY.
 
     Owner flag ON (#3735, Borges's ruling on PR #3746): a table the owner
-    dropped at startup is refused as `unregistered_template`, and the result
-    is UNKNOWN — (None, "OwnerReadError: ...unregistered_template...") — by
-    design, NOT healthy: the owner gives that same reason for an empty
-    registry, which is a real outage, so it cannot be told apart from a
-    merely absent table. The ON/OFF divergence is accepted and pinned by
-    tests/test_session_start_owner_read_3735.py.
+    dropped at startup is refused as `refused_at_load` (detail: the original
+    reason; since #3753 -- before that it was `unregistered_template`), and the
+    result is UNKNOWN — (None, "OwnerReadError: ...refused_at_load...") — by
+    design, NOT healthy: this hook does not branch on the reason, and an empty
+    registry (`unregistered_template`, a real outage) is UNKNOWN too, so a
+    merely absent table is still not reported healthy. The ON/OFF divergence is
+    accepted and pinned by tests/test_session_start_owner_read_3735.py.
 
     Returns (None, "<ExcType>: <message>") — UNKNOWN (#3521) — on any other
     read failure (not a database, locked, a queried column missing, any other

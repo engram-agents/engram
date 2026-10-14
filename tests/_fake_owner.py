@@ -20,9 +20,10 @@ over an AF_UNIX stream socket) for exactly four methods:
                `src/engram/engramd_read_templates.json` (else `unregistered_template`,
                the real owner's reason), and is executed against a read-only connection
                to `<home>/knowledge.db`; rows go back as JSON lists in SQLite order. The IDF
-               batch statement is refused here with `unregistered_template` (the real
-               owner's answer: the committed registry still lists it, the owner drops it at
-               load); it travels only as `df`.
+               batch statement is refused here with `refused_at_load` / detail
+               `virtual_table_template` (the real owner's answer since #3753: the committed
+               registry still lists it, the owner drops it at load, and says so rather than
+               calling it unregistered); it travels only as `df`.
 
 It is a stand-in for the transport and the registry gate, NOT a re-implementation of the
 owner (no authorizer, no deadline, no size cap). Live-owner cells stay the Linux seat's.
@@ -241,10 +242,11 @@ class FakeOwner:
         if sql == IDF_BATCH_SQL:
             # The real owner drops a template over a virtual table (FTS5 vocab) at load
             # (logged as virtual_table_template) although the committed JSON still lists the
-            # statement, so the lookup at request time answers `unregistered_template`
-            # (measured on the real owner); the IDF batch travels only as the typed `df` op.
-            return {"status": "rejected", "reason": "unregistered_template",
-                    "detail": "the statement is not in the committed read-template list",
+            # statement, so since #3753 the lookup at request time answers `refused_at_load`
+            # with the original reason as detail (a statement never listed is still
+            # `unregistered_template`, below); the IDF batch travels only as the typed `df` op.
+            return {"status": "rejected", "reason": "refused_at_load",
+                    "detail": "virtual_table_template",
                     "remedy": "use the typed df operation"}
         if sql not in self._registered:
             return {"status": "rejected", "reason": "unregistered_template",
