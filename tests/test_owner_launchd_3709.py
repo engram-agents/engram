@@ -17,11 +17,13 @@ launchctl; an autouse guard (below) diffs the real registrations around every ce
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import importlib.util
 import json
 import os
 import plistlib
+import re
 import shutil
 import signal
 import subprocess
@@ -99,7 +101,7 @@ def _real_owner_labels() -> set:
     if not IS_DARWIN:
         return set()
     # `list` is read-only (the conftest shim passes it through); absolute path so the shim is moot.
-    r = subprocess.run(["/bin/launchctl", "list"], capture_output=True, text=True, timeout=20)
+    r = subprocess.run(["/bin/launchctl", "list"], capture_output=True, encoding="utf-8", errors="replace", timeout=20)
     return {ln.split()[-1] for ln in r.stdout.splitlines()
             if ln.split() and ln.split()[-1].startswith(LABEL_PREFIX)}
 
@@ -124,9 +126,10 @@ class DSandbox(Sandbox):
     """#3663 Sandbox + the shared helper copied next to the installer + a pinned venv python.
     `real_owner=True` swaps the stub owner for a symlink to the REAL owner (K6 preflight)."""
 
-    def __init__(self, tmp: Path, os_name: str = "Darwin", real_owner: bool = False):
+    def __init__(self, tmp: Path, os_name: str = "Darwin", real_owner: bool = False,
+                 plugin_name: str = "plugin", home_name: str = "home"):
         tmp.mkdir(parents=True, exist_ok=True)
-        super().__init__(tmp, os_name=os_name)
+        super().__init__(tmp, os_name=os_name, plugin_name=plugin_name, home_name=home_name)
         if HOME_KEY_HELPER.exists():
             shutil.copy(HOME_KEY_HELPER, self.plugin / "tools" / HOME_KEY_HELPER.name)
         venv_bin = self.home / ".engram" / "venv" / "bin"
@@ -143,7 +146,7 @@ class DSandbox(Sandbox):
     def launchctl_calls(self) -> list:
         if not self.launchlog.exists():
             return []
-        return [ln.split() for ln in self.launchlog.read_text().splitlines() if ln.strip()]
+        return [ln.split() for ln in self.launchlog.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
     def bootstrap_rc(self, rc: int):
         """Replace the recording launchctl stub with one that fails `bootstrap` with `rc` (#3780).
@@ -163,11 +166,11 @@ class DSandbox(Sandbox):
         env["ENGRAM_HOME"] = engram_home
         env.update(extra or {})
         return subprocess.run([bash, str(self.installer), *args, "--allow-path"], capture_output=True,
-                              text=True, env=env, cwd=str(self.tmp))
+                              encoding="utf-8", errors="replace", env=env, cwd=str(self.tmp))
 
     def assert_nothing_written(self, *engram_homes: Path):
         assert not (self.home / "Library").exists(), "a LaunchAgents dir/plist was created"
-        assert not self.launchlog.exists(), f"launchctl was called: {self.launchlog.read_text()}"
+        assert not self.launchlog.exists(), f"launchctl was called: {self.launchlog.read_text(encoding="utf-8")}"
         for h in engram_homes:
             assert not h.exists(), f"the home dir was created: {h}"
 
@@ -196,16 +199,16 @@ class DSeat(Seat):
         self.derived = tmp / "derived"
         self.derived.mkdir()
         # Derived (not hand-typed) variants of the real captures:
-        running = (FIXTURES / "running.out").read_text()
+        running = (FIXTURES / "running.out").read_text(encoding="utf-8")
         kept = [ln for ln in running.splitlines(keepends=True) if not ln.startswith("\tstate = ")]
         assert len(kept) == len(running.splitlines(keepends=True)) - 1, "fixture has no one top-level state line"
         assert any(ln.startswith("\t\tstate = ") for ln in kept), "fixture lost its nested state lines"
         (self.derived / "nostate.out").write_text("".join(kept))
-        nr = (FIXTURES / "not_running_exit0.out").read_text()
+        nr = (FIXTURES / "not_running_exit0.out").read_text(encoding="utf-8")
         nolast = [ln for ln in nr.splitlines(keepends=True) if not ln.startswith("\tlast exit code = ")]
         assert len(nolast) == len(nr.splitlines(keepends=True)) - 1
         (self.derived / "not_running_nolast.out").write_text("".join(nolast))
-        nf = (FIXTURES / "notfound.err").read_text()
+        nf = (FIXTURES / "notfound.err").read_text(encoding="utf-8")
         (self.derived / "badrequest_only.err").write_text(nf.splitlines()[0] + "\n")
 
     def set_os(self, name: str):
@@ -234,7 +237,7 @@ class DSeat(Seat):
             """))
 
     def launchctl_log(self) -> list:
-        return self.llog.read_text().splitlines() if self.llog.exists() else []
+        return self.llog.read_text(encoding="utf-8").splitlines() if self.llog.exists() else []
 
     def label(self) -> str:
         return label_for(self.eh)
@@ -247,7 +250,7 @@ class DSeat(Seat):
         env = {"HOME": str(self.home), "PATH": f"{self.stubs}:{self.tools}", "TMPDIR": str(self.tmp)}
         io_py = self.plugin / "hooks" / "_engramd_owner_hook_io.py"
         try:
-            r = subprocess.run([sys.executable, str(io_py), *map(str, args)], capture_output=True, text=True,
+            r = subprocess.run([sys.executable, str(io_py), *map(str, args)], capture_output=True, encoding="utf-8", errors="replace",
                                env=env, timeout=timeout)
         except subprocess.TimeoutExpired:
             pytest.fail(f"hook I/O helper {args} did not return within {timeout}s (blocked)")
@@ -276,7 +279,7 @@ def _plist_of(path: Path) -> dict:
 
 def _helper_key(arg: str, home: Path, bash: str = "bash") -> str:
     assert HOME_KEY_HELPER.exists(), f"missing (not implemented yet): {HOME_KEY_HELPER.relative_to(REPO)}"
-    r = subprocess.run([bash, str(HOME_KEY_HELPER), arg], capture_output=True, text=True,
+    r = subprocess.run([bash, str(HOME_KEY_HELPER), arg], capture_output=True, encoding="utf-8", errors="replace",
                        env={"HOME": str(home), "PATH": os.environ["PATH"]})
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     return r.stdout.strip()
@@ -304,7 +307,7 @@ def test_k1_helper_is_sourceable_and_defines_the_function(tmp_path):
     real = tmp_path / "real-seat"
     real.mkdir()
     r = subprocess.run(["bash", "-c", f'source "$1" && {HOME_KEY_FUNC} "$2"', "_", str(HOME_KEY_HELPER), str(real)],
-                       capture_output=True, text=True, env={"HOME": str(tmp_path), "PATH": os.environ["PATH"]})
+                       capture_output=True, encoding="utf-8", errors="replace", env={"HOME": str(tmp_path), "PATH": os.environ["PATH"]})
     assert r.returncode == 0 and r.stdout.strip() == _expected_id(_physical(real)), (r.returncode, r.stdout, r.stderr)
 
 
@@ -317,7 +320,7 @@ def test_k1_helper_runs_under_the_stock_bash_3_2(tmp_path):
 
 
 def _code_lines(path: Path) -> str:
-    return "\n".join(ln for ln in path.read_text().splitlines() if not ln.lstrip().startswith("#"))
+    return "\n".join(ln for ln in path.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#"))
 
 
 @pytest.mark.parametrize("script", [INSTALLER, HOOK], ids=lambda p: p.name)
@@ -356,7 +359,7 @@ def test_k1_all_consumers_agree_for_a_home_with_a_symlink_in_it(tmp_path):
     seat.set_os("Linux")
     seat.systemctl("notfound")
     seat.run({"ENGRAM_HOME": str(link)})
-    assert f"engramd-owner-{key}.service" in seat.syslog.read_text()
+    assert f"engramd-owner-{key}.service" in seat.syslog.read_text(encoding="utf-8")
 
 
 def test_k1_tilde_spelling_gives_the_same_label_and_filename(tmp_path):
@@ -411,14 +414,14 @@ def test_k2_plist_restart_policy_is_the_ruled_one(tmp_path):
 def test_k2_rendered_plist_has_no_unsubstituted_placeholder(tmp_path):
     installed = _install(tmp_path)
     _sb, _h, plist, _d = installed
-    assert "{{" not in plist.read_text() and "}}" not in plist.read_text()
+    assert "{{" not in plist.read_text(encoding="utf-8") and "}}" not in plist.read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(shutil.which("plutil") is None, reason="plutil only exists on macOS")
 def test_k2_rendered_plist_passes_plutil_lint(tmp_path):
     installed = _install(tmp_path)
     _sb, _h, plist, _d = installed
-    r = subprocess.run(["plutil", "-lint", str(plist)], capture_output=True, text=True)
+    r = subprocess.run(["plutil", "-lint", str(plist)], capture_output=True, encoding="utf-8", errors="replace")
     assert r.returncode == 0, (r.stdout, r.stderr)
 
 
@@ -571,6 +574,32 @@ def test_k2b_utf8_home_gets_the_same_label_from_the_installer_and_the_hook(tmp_p
     assert asked == [f"print gui/{UID}/{label_for(home)}"], (asked, label_for(home))
 
 
+@pytest.mark.parametrize("mode", [(), ("--owner",)], ids=["surface-daemon", "owner"])
+@pytest.mark.parametrize("os_name", ["Darwin", "Linux"])
+def test_k2c_template_render_is_byte_identical_under_a_hostile_multibyte_locale(tmp_path, os_name, mode):
+    """(#3794) BSD `sed` rejects bytes that are not valid in the caller's multibyte locale
+    (`RE error: illegal byte sequence`) -- the Linux unit template carries 3 non-ASCII bytes, and a
+    UTF-8 home / plugin path is non-ASCII too.  The render must be the same bytes under the hostile
+    locale as under LC_ALL=C, on the stock /bin/bash, for both templates and both modes."""
+    if not os.access("/bin/bash", os.X_OK):
+        pytest.skip("no /bin/bash")
+    # ONE sandbox, rendered twice in place: the owner label embeds a hash of the physical home, so two
+    # homes would differ for a reason that has nothing to do with sed.
+    sb = DSandbox(tmp_path / "inst", os_name=os_name, plugin_name="plügin-é", home_name="hóme-é")
+    home = sb.tmp / "seat-é"
+    dest = sb.agents_dir if os_name == "Darwin" else sb.unit_dir
+    renders = {}
+    for env_id, (drop, extra) in {"c": ((), {"LC_ALL": "C"}), "hostile": (("LC_ALL",), HOSTILE_LOCALE)}.items():
+        r = sb.run_env(*mode, engram_home=str(home), drop=drop, extra=extra, bash="/bin/bash")
+        assert r.returncode == 0, (env_id, r.returncode, r.stdout, r.stderr)
+        files = sorted(dest.glob("*.plist" if os_name == "Darwin" else "*.service"))
+        assert len(files) == 1, files
+        renders[env_id] = files[0].read_bytes()
+        files[0].unlink()
+    assert "hóme-é".encode() in renders["c"] or "plügin-é".encode() in renders["c"], "no UTF-8 path was rendered"
+    assert renders["hostile"] == renders["c"]
+
+
 # ===========================================================================
 # K4 -- the Darwin fallback, four outcomes (Q3), fake launchctl from REAL captures
 # ===========================================================================
@@ -697,8 +726,8 @@ def test_k4_verb_takes_the_top_level_state_line_not_a_nested_one(dseat):
 # bootstrap into it cannot work.  Not `notfound` (that path launches), not a bare ambiguous (that
 # neither launches nor explains).  Real capture: tests/fixtures/launchctl_3709/no_gui_domain.*
 
-NO_GUI_ERR = (FIXTURES / "no_gui_domain.err").read_text()
-NO_GUI_RC = int((FIXTURES / "no_gui_domain.rc").read_text())
+NO_GUI_ERR = (FIXTURES / "no_gui_domain.err").read_text(encoding="utf-8")
+NO_GUI_RC = int((FIXTURES / "no_gui_domain.rc").read_text(encoding="utf-8"))
 NO_GUI_TEXT = "Domain does not support specified action"
 
 
@@ -732,7 +761,7 @@ def test_a1_parser_the_text_with_rc0_is_unchanged():
 
 
 def test_a1_notfound_is_unchanged():
-    nf = (FIXTURES / "notfound.err").read_text()
+    nf = (FIXTURES / "notfound.err").read_text(encoding="utf-8")
     assert _load_parser()(113, "", nf) == "notfound"
 
 
@@ -814,7 +843,7 @@ def test_a5_r1_skip_keys_on_the_parser_verdict_not_a_raw_125(monkeypatch):
     monkeypatch.setattr(sys.modules[__name__], "_real_print", lambda label: (125, "", ""))
     assert _no_gui_domain_skip_reason("com.engram.test.x") is None
     # (c) the normal not-found of a GUI seat: no skip
-    nf = (FIXTURES / "notfound.err").read_text()
+    nf = (FIXTURES / "notfound.err").read_text(encoding="utf-8")
     monkeypatch.setattr(sys.modules[__name__], "_real_print", lambda label: (113, "", nf))
     assert _no_gui_domain_skip_reason("com.engram.test.x") is None
 
@@ -1062,7 +1091,7 @@ def run_owner(args, *, home: Path, engram_home: Path, extra_code: str | None = N
     argv = [sys.executable, str(OWNER_PY), *args]
     if extra_code is not None:
         argv = [sys.executable, "-c", extra_code]
-    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", env=env,
                          start_new_session=True, cwd=str(home))
     timed_out = False
     try:
@@ -1367,7 +1396,262 @@ def test_k7_darwin_hook_never_calls_systemctl(tmp_path):
     rc, out, _e, _t = seat.run_timed(limit=LAUNCHD_BOUND_SECONDS + LAUNCHD_SLACK_SECONDS + 10)
     assert rc == 0 and len(seat.launched()) == 1, (rc, out)  # control: the launchd path ran to the end
     assert seat.launchctl_log() == [seat.expected_print()]
-    assert not seat.syslog.exists(), seat.syslog.read_text()
+    assert not seat.syslog.exists(), seat.syslog.read_text(encoding="utf-8")
+
+
+# ===========================================================================
+# #3794 -- launcher path handling under bash 3.2 multibyte locales (after #3789)
+# ===========================================================================
+# Under a multibyte LC_CTYPE the stock /bin/bash 3.2 inserts \001 after each byte >= 0x80 of a `$(...)`
+# capture made by the CAPTURING shell, whatever the captured function pins inside.  Only a capture made
+# INSIDE a function pinned with `local LC_ALL=C`, or a `printf -v` out of one, is exact.  Every cell
+# below runs under an EXPLICIT interpreter (BASHES) with the hostile locale, and compares against the
+# TRUE path computed by Python, never against what the other bash side computed.
+_HOSTILE_DROP, _HOSTILE_EXTRA = LOCALE_ENVS["hostile-locale"]
+
+
+def _utf8_stub_python(directory: Path) -> Path:
+    """A `python3` that answers `-c 'print(sys.executable)'` with ITS OWN (non-ASCII) path."""
+    p = directory / "python3"
+    return _stub(directory, "python3", f'#!/bin/sh\nprintf \'%s\\n\' "{p}"\n')
+
+
+@pytest.mark.parametrize("python_from", ["venv", "path-fallback"])
+@pytest.mark.parametrize("bash", BASHES)
+def test_a4_owner_plist_content_is_byte_exact_with_utf8_home_plugin_and_python_paths(tmp_path, bash, python_from):
+    """A1 + A4 (#3794): render the owner plist (fake launchctl, never a real bootstrap) with a UTF-8
+    ENGRAM_HOME, a UTF-8 plugin/install path and a UTF-8 tmp tree, then parse it and compare EVERY path
+    value with the true bytes.  `path-fallback` drops the venv python so the installer asks `python3`
+    (a stub on a UTF-8 PATH entry) for sys.executable: that is a path capture too."""
+    sb = DSandbox(tmp_path / "café-inst", os_name="Darwin", plugin_name="café-plugin")
+    if python_from == "path-fallback":
+        shutil.rmtree(sb.home / ".engram" / "venv")
+        py = _utf8_stub_python(sb.stubs)
+    else:
+        py = sb.python
+    home = sb.tmp / "café-seat"
+    r = sb.run_env("--owner", engram_home=str(home), drop=_HOSTILE_DROP, extra=_HOSTILE_EXTRA, bash=bash)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    plist = sb.agents_dir / f"{label_for(home)}.plist"
+    assert plist.exists(), sorted(p.name for p in sb.agents_dir.glob("*"))
+    raw = plist.read_bytes()
+    try:
+        d = plistlib.loads(raw)
+    except Exception as e:  # a \001 byte is not legal XML
+        pytest.fail(f"the plist does not even parse ({e!r}); bytes: {raw!r}")
+    log = f"{_physical(home)}/engramd-owner.log"
+    assert d["ProgramArguments"] == [str(py), _physical(sb.plugin) + "/engramd_owner.py"], d["ProgramArguments"]
+    assert d["EnvironmentVariables"]["ENGRAM_HOME"] == _physical(home), d["EnvironmentVariables"]
+    assert d["StandardOutPath"] == log and d["StandardErrorPath"] == log, (d["StandardOutPath"], d["StandardErrorPath"])
+    assert b"\x01" not in raw
+
+
+@pytest.mark.parametrize("layout", ["plain", "symlink-chain"])
+@pytest.mark.parametrize("bash", BASHES)
+def test_a2_daemon_real_keeps_a_utf8_install_path_exact(tmp_path, bash, layout):
+    """A2 (#3794): `_physical_path` pinned only AFTER its readlink loop, and its caller captured its
+    stdout at top level.  The plugin root is ASCII here (so A1 is not what this cell sees); the daemon
+    lives in a UTF-8 hooks dir given by ENGRAM_HOOKS_DIR.  `DAEMON_REAL` shows up verbatim in the
+    ephemeral-path WARN (tmp is ephemeral).  `symlink-chain` also runs the readlink/dirname captures."""
+    sb = DSandbox(tmp_path / "inst", os_name="Darwin")
+    real_dir = sb.tmp / "café-real"
+    real_dir.mkdir()
+    (real_dir / "engram-surface-daemon.py").write_text("# stub daemon\n")
+    hooks = real_dir
+    if layout == "symlink-chain":
+        hooks = sb.tmp / "café-hooks"
+        hooks.mkdir()
+        (hooks / "engram-surface-daemon.py").symlink_to("../café-real/engram-surface-daemon.py")
+    r = sb.run_env(engram_home=str(sb.tmp / "seat-a"), drop=_HOSTILE_DROP, bash=bash,
+                   extra={**_HOSTILE_EXTRA, "ENGRAM_HOOKS_DIR": str(hooks)})
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    expected = f"{_physical(real_dir)}/engram-surface-daemon.py"
+    assert f"ephemeral daemon path {expected} (" in r.stderr, (expected, r.stderr)
+
+
+@pytest.mark.parametrize("python_from", ["venv", "path-fallback"])
+@pytest.mark.parametrize("bash", BASHES)
+def test_a1_hook_finds_its_plugin_root_and_python_with_utf8_paths_byte_exact(tmp_path, bash, python_from):
+    """A1 (#3794), hook side: the plugin root / IO helper are found by walking up from BASH_SOURCE and
+    the python by `command -v`, all of them path captures at the hook's top level.  The whole seat is
+    under a UTF-8 dir, so the launch argv must carry the exact bytes of the plugin path."""
+    seat = DSeat(tmp_path / "café-hook")
+    if python_from == "path-fallback":
+        venv_py = seat.home / ".engram" / "venv" / "bin" / "python3"
+        body = venv_py.read_text(encoding="utf-8")
+        venv_py.unlink()
+        _stub(seat.stubs, "python3", body)
+    seat.config(FLAG_ON)
+    seat.set_os("Darwin")
+    seat.launchctl("notfound")
+    r = seat.run(dict(_HOSTILE_EXTRA), bash=bash)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    launched = seat.record.read_text(encoding="utf-8").splitlines() if seat.record.exists() else []
+    assert launched == [_physical(seat.plugin) + "/engramd_owner.py"], (launched, r.stdout, r.stderr)
+
+
+# ---- A3: the `printf -v "$name"` namespace trap ------------------------------------------------
+# A function that assigns to a caller-NAMED variable with `printf -v` hits its own local when the
+# caller's name equals one of its locals: rc 0, caller's variable unset (reproduced by the round-3
+# reviewer).  The contract: such a name is REFUSED (rc != 0, ONE stderr line naming it, nothing
+# assigned), and an ordinary name keeps working.  The locals carry a unique prefix and the guard
+# refuses any name starting with it, plus `LC_ALL` (the pin, itself a local of every one of them).
+def _fn_source(script: Path, name: str) -> str:
+    text = script.read_text(encoding="utf-8")
+    m = re.search(rf"^{re.escape(name)}\(\) \{{\n.*?^\}}\n", text, re.S | re.M)
+    assert m, f"function {name} not found at the start of a line in {script.relative_to(REPO)}"
+    return m.group(0)
+
+
+# id -> (prefix of the function's own locals, shell definitions, call template, argument kind)
+A3_TARGETS = {
+    "helper-physical-path": ("_eopp_", lambda: f'source "{HOME_KEY_HELPER}"',
+                             'engramd_owner_physical_path "$1" {n}', "dir"),
+    "installer-physical-dir-into": ("_opdi_", lambda: _fn_source(INSTALLER, "_owner_physical_dir_into"),
+                                    '_owner_physical_dir_into "$1" {n}', "dir"),
+    "hook-physical-dir-into": ("_pdi_", lambda: _fn_source(HOOK, "_physical_dir_into"),
+                               '_physical_dir_into "$1" {n}', "dir"),
+    "installer-physical-path": ("_pp_", lambda: _fn_source(INSTALLER, "_physical_path"),
+                                '_physical_path "$1" {n}', "file"),
+    "installer-pinned-into": ("_pin_", lambda: _fn_source(INSTALLER, "_pinned_into"),
+                              '_pinned_into {n} printf %s "$1"', "dir"),
+    "hook-pinned-into": ("_pin_", lambda: _fn_source(HOOK, "_pinned_into"),
+                         '_pinned_into {n} printf %s "$1"', "dir"),
+}
+# every local name any of these functions had before the fix, plus the pin itself
+OLD_LOCAL_NAMES = ["path", "outvar", "anc", "rest", "comp", "link", "hops", "phys", "_pd", "p", "target",
+                   "n", "d", "b", "LC_ALL"]
+
+
+def _a3_run(tmp_path, bash, target, name):
+    prefix, defs, call, kind = A3_TARGETS[target]
+    d = tmp_path / "d"
+    d.mkdir(exist_ok=True)
+    arg = d
+    if kind == "file":
+        arg = d / "f.txt"
+        arg.write_text("x")
+    script = (f'{defs()}\nunset {name}\n{call.format(n=name)}\nrc=$?\nprintf "rc=%s\\n" "$rc"\n'
+              f'if [ "${{{name}+set}}" = set ]; then printf "val=%s\\n" "${{{name}}}"; else echo UNSET; fi\n')
+    r = subprocess.run([bash, "-c", script, "x", str(arg)], capture_output=True, encoding="utf-8",
+                       errors="replace", env={"PATH": os.environ["PATH"], "HOME": str(tmp_path)})
+    lines = r.stdout.splitlines()
+    assert lines and lines[0].startswith("rc="), (r.stdout, r.stderr)
+    rc = int(lines[0][3:])
+    val = lines[1][4:] if len(lines) > 1 and lines[1].startswith("val=") else None
+    expected = str(arg) if target.endswith("pinned-into") else _physical(arg)
+    return rc, val, expected, r.stderr
+
+
+@pytest.mark.parametrize("bash", BASHES)
+@pytest.mark.parametrize("target", list(A3_TARGETS))
+def test_a3_a_name_the_function_cannot_assign_is_never_silently_dropped(tmp_path, bash, target):
+    """Whatever name is passed, the outcome is one of two: assigned CORRECTLY (rc 0, caller's variable
+    holds the value), or refused (rc != 0, the name on stderr, the variable untouched).  The bug was a
+    third outcome: rc 0 with the caller's variable unset."""
+    bad = []
+    for name in OLD_LOCAL_NAMES + [A3_TARGETS[target][0] + s for s in ("x", "path", "phys")]:
+        rc, val, expected, err = _a3_run(tmp_path, bash, target, name)
+        if rc == 0 and val != expected:
+            bad.append((name, "rc 0 but the caller's variable is " + ("unset" if val is None else repr(val))))
+        elif rc != 0 and (val is not None or name not in err):
+            bad.append((name, f"refused without naming it / after assigning: {val!r} {err!r}"))
+    assert not bad, bad
+
+
+@pytest.mark.parametrize("bash", BASHES)
+@pytest.mark.parametrize("target", list(A3_TARGETS))
+def test_a3_the_functions_own_local_names_are_refused_with_one_stderr_line(tmp_path, bash, target):
+    prefix = A3_TARGETS[target][0]
+    for name in (prefix + "x", prefix + "phys", "LC_ALL"):
+        rc, val, _exp, err = _a3_run(tmp_path, bash, target, name)
+        assert rc != 0 and val is None, (name, rc, val)
+        lines = [ln for ln in err.splitlines() if ln.strip()]
+        assert len(lines) == 1 and name in lines[0], (name, err)
+
+
+@pytest.mark.parametrize("bash", BASHES)
+@pytest.mark.parametrize("target", list(A3_TARGETS))
+def test_a3_control_the_names_the_callers_really_pass_still_work(tmp_path, bash, target):
+    for name in ("ENGRAM_HOME", "_owner_physical_planned", "PLUGIN_ROOT"):
+        rc, val, expected, err = _a3_run(tmp_path, bash, target, name)
+        assert (rc, val, err) == (0, expected, ""), (name, rc, val, expected, err)
+
+
+@pytest.mark.parametrize("bash", BASHES)
+@pytest.mark.parametrize("script", [INSTALLER, HOOK], ids=["installer", "hook"])
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_a3_pinned_into_returns_the_commands_rc_and_assigns_its_value(tmp_path, bash, script, exit_code):
+    """`_pinned_into VAR cmd...` must behave like `VAR=$(cmd...)`: the return status is the COMMAND's
+    (not a constant 0), the variable still receives the command's stdout even when it failed, and the
+    command's stderr passes through untouched (the caller's `|| ...` / `set -e` paths depend on the rc)."""
+    defs = _fn_source(script, "_pinned_into")
+    prog = (f'{defs}\n_probe() {{ printf %s "/some/path"; echo probe-stderr >&2; return {exit_code}; }}\n'
+            'unset OUT\n_pinned_into OUT _probe\nrc=$?\nprintf "rc=%s\\n" "$rc"\n'
+            'if [ "${OUT+set}" = set ]; then printf "val=%s\\n" "$OUT"; else echo UNSET; fi\n')
+    r = subprocess.run([bash, "-c", prog], capture_output=True, encoding="utf-8", errors="replace",
+                       env={"PATH": os.environ["PATH"], "HOME": str(tmp_path)})
+    assert r.stdout.splitlines() == [f"rc={exit_code}", "val=/some/path"], (r.stdout, r.stderr)
+    assert r.stderr == "probe-stderr\n", r.stderr
+
+
+# ===========================================================================
+# #3790 -- the harness itself must not decode the scripts' UTF-8 output with the locale codec
+# ===========================================================================
+LAUNCHER_TEST_FILES = [Path(__file__), Path(__file__).with_name("test_owner_launcher_3663.py")]
+
+
+def _locale_decode_lines(source: str) -> list:
+    """Line numbers of every call that decodes with the LOCALE codec: `text=True` /
+    `universal_newlines=True` on a subprocess call, or a `read_text(...)` with no `encoding`."""
+    out = []
+    for n in ast.walk(ast.parse(source)):
+        if not isinstance(n, ast.Call):
+            continue
+        for kw in n.keywords:
+            if (kw.arg in ("text", "universal_newlines") and isinstance(kw.value, ast.Constant)
+                    and kw.value.value is True):
+                out.append(n.lineno)
+        if (isinstance(n.func, ast.Attribute) and n.func.attr == "read_text"
+                and not any(k.arg == "encoding" for k in n.keywords) and len(n.args) < 1):
+            out.append(n.lineno)
+    return sorted(out)
+
+
+def test_b_the_scan_sees_a_planted_locale_decode():
+    """Control for the cell below: the same scan, on planted matches, reports them (and only them)."""
+    assert _locale_decode_lines("import subprocess\nsubprocess.run(['x'], capture_output=True, text=True)\n") == [2]
+    assert _locale_decode_lines("p.read_text()\nq.read_text(errors='x')\n") == [1, 2]
+    assert _locale_decode_lines("subprocess.run(['x'], encoding='utf-8', errors='replace')\n"
+                                "p.read_text(encoding='utf-8')\n") == []
+
+
+@pytest.mark.parametrize("path", LAUNCHER_TEST_FILES, ids=lambda p: p.name)
+def test_b_no_launcher_test_decodes_with_the_locale_codec(path):
+    """`text=True` and a bare `read_text()` decode with the locale's preferred encoding: under a
+    non-UTF-8 pytest locale that raises UnicodeDecodeError on the scripts' UTF-8 output (the `→` in the
+    installer's own lines) or on a UTF-8 source file, before any assertion runs (#3790).  Every such call
+    states `encoding="utf-8"` (and `errors="replace"` on subprocess output)."""
+    assert _locale_decode_lines(path.read_text(encoding="utf-8")) == []
+
+
+def test_b_a_script_call_decodes_under_a_non_utf8_pytest_process_locale():
+    """The behavioural half: a SUBPROCESS pytest (a pytest's own locale cannot change mid-session)
+    under LC_CTYPE=ja_JP.eucJP runs one cell that drives the installer, whose output carries `→`."""
+    env = {k: v for k, v in os.environ.items() if k != "LC_ALL"}
+    env.update(HOSTILE_LOCALE)
+    env["ENGRAM_NO_EMBEDDINGS"] = "1"
+    probe = subprocess.run([sys.executable, "-c", "import locale; print(locale.getpreferredencoding(False))"],
+                           capture_output=True, encoding="utf-8", errors="replace", env=env)
+    if probe.stdout.strip().lower().replace("-", "").replace("_", "") == "utf8":
+        pytest.skip(f"the hostile locale is not available here (preferred encoding {probe.stdout.strip()!r}): "
+                    "the cell would prove nothing")
+    target = f"{Path(__file__).with_name('test_owner_launcher_3663.py')}::test_c1_unit_execstart_argv_contains_engramd_owner"
+    r = subprocess.run([sys.executable, "-m", "pytest", target, "-q", "-p", "no:cacheprovider"],
+                       capture_output=True, encoding="utf-8", errors="replace", env=env, cwd=str(REPO), timeout=300)
+    out = r.stdout + r.stderr
+    assert "UnicodeDecodeError" not in out, out[-3000:]
+    assert r.returncode == 0 and "1 passed" in out, (r.returncode, out[-3000:])
 
 
 # ===========================================================================
@@ -1393,7 +1677,7 @@ def _load_parser():
 
 
 def _real_print(label: str):
-    r = subprocess.run([REAL_LAUNCHCTL, "print", f"gui/{UID}/{label}"], capture_output=True, text=True, timeout=30)
+    r = subprocess.run([REAL_LAUNCHCTL, "print", f"gui/{UID}/{label}"], capture_output=True, encoding="utf-8", errors="replace", timeout=30)
     return r.returncode, r.stdout, r.stderr
 
 
@@ -1403,15 +1687,15 @@ def _sweep_leftover_test_jobs() -> list:
     (read-only), boot out every leftover label that starts with TEST_LABEL_PREFIX, and touch NOTHING
     else: any other label is left alone, and this never issues a call for it.  Returns the labels
     it booted out."""
-    r = subprocess.run([REAL_LAUNCHCTL, "list"], capture_output=True, text=True, timeout=30)
+    r = subprocess.run([REAL_LAUNCHCTL, "list"], capture_output=True, encoding="utf-8", errors="replace", timeout=30)
     assert r.returncode == 0, ("launchctl list failed", r.returncode, r.stderr)
     # `launchctl list` rows are tab-separated: PID, last exit status, label.
     found = [cols[2] for cols in (ln.split("\t") for ln in r.stdout.splitlines()) if len(cols) == 3]
     stale = [lab for lab in found if lab.startswith(TEST_LABEL_PREFIX)]
     for lab in stale:
         assert lab.startswith(TEST_LABEL_PREFIX)  # the only labels this module ever passes to bootout
-        subprocess.run([REAL_LAUNCHCTL, "bootout", f"gui/{UID}/{lab}"], capture_output=True, text=True, timeout=30)
-    again = subprocess.run([REAL_LAUNCHCTL, "list"], capture_output=True, text=True, timeout=30).stdout
+        subprocess.run([REAL_LAUNCHCTL, "bootout", f"gui/{UID}/{lab}"], capture_output=True, encoding="utf-8", errors="replace", timeout=30)
+    again = subprocess.run([REAL_LAUNCHCTL, "list"], capture_output=True, encoding="utf-8", errors="replace", timeout=30).stdout
     still = [lab for lab in stale if f"\t{lab}" in again]
     assert not still, f"could not boot out leftover test jobs from an earlier run: {still}"
     return stale
@@ -1460,7 +1744,7 @@ def test_r1_real_launchd_restart_semantics_and_parser(tmp_path):
 
     # Policy comes from the SHIPPED template (rendered), never retyped here.
     assert PLIST_TEMPLATE.exists(), f"missing (not implemented yet): {PLIST_TEMPLATE.relative_to(REPO)}"
-    text = PLIST_TEMPLATE.read_text()
+    text = PLIST_TEMPLATE.read_text(encoding="utf-8")
     for ph, val in zip(PLIST_PLACEHOLDERS, ("/usr/bin/python3", "/x/engramd_owner.py", "/x/home", "com.engram.test.tpl")):
         text = text.replace(ph, val)
     tpl = plistlib.loads(text.encode())
@@ -1494,7 +1778,7 @@ def test_r1_real_launchd_restart_semantics_and_parser(tmp_path):
         t0 = time.monotonic()
         for kind, lab in labels.items():
             r = subprocess.run([REAL_LAUNCHCTL, "bootstrap", f"gui/{UID}", str(plists[kind])],
-                               capture_output=True, text=True, timeout=30)
+                               capture_output=True, encoding="utf-8", errors="replace", timeout=30)
             assert r.returncode == 0, (kind, r.stdout, r.stderr)
         wait_for(labels["sleep"], "running")
         wait_for(labels["exit0"], "registered:not running:0")
@@ -1504,18 +1788,18 @@ def test_r1_real_launchd_restart_semantics_and_parser(tmp_path):
         remaining = t0 + throttle + 10 - time.monotonic()
         if remaining > 0:
             time.sleep(remaining)
-        runs = {k: len((stamps / f"{k}.runs").read_text().split()) for k in ("exit0", "exit1", "exit3")}
+        runs = {k: len((stamps / f"{k}.runs").read_text(encoding="utf-8").split()) for k in ("exit0", "exit1", "exit3")}
         assert runs["exit0"] == 1, f"exit 0 was restarted: {runs}"
         assert runs["exit1"] >= 2 and runs["exit3"] >= 2, f"exit 1 / exit 3 were not restarted: {runs}"
         assert verdict(labels["sleep"]) == "running"
         assert verdict(labels["exit0"]) == "registered:not running:0"
     finally:
         for lab in labels.values():
-            subprocess.run([REAL_LAUNCHCTL, "bootout", f"gui/{UID}/{lab}"], capture_output=True, text=True, timeout=30)
+            subprocess.run([REAL_LAUNCHCTL, "bootout", f"gui/{UID}/{lab}"], capture_output=True, encoding="utf-8", errors="replace", timeout=30)
         # Read REAL state: a label is leaked only if `launchctl list` still shows it.
         end = time.monotonic() + 10
         while True:
-            listing = subprocess.run([REAL_LAUNCHCTL, "list"], capture_output=True, text=True, timeout=30).stdout
+            listing = subprocess.run([REAL_LAUNCHCTL, "list"], capture_output=True, encoding="utf-8", errors="replace", timeout=30).stdout
             leaked = _leaked_labels(list(labels.values()), listing)
             if not leaked or time.monotonic() >= end:
                 break

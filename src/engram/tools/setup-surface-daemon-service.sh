@@ -105,10 +105,37 @@ if [[ "$OWNER_MODE" == "1" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# _pinned_into <varname> <cmd...>: run <cmd...> and assign its stdout (trailing newlines stripped, as
+# `$(...)` does) to the variable NAMED by $1; the return status is the command's. Every PATH value this
+# script captures goes through here (#3794): bash 3.2 mangles the bytes of a `$(...)` capture (inserting
+# \001 after each byte >= 0x80) when the CAPTURING shell is in a multibyte locale, and a pin written
+# inside the substitution does not help. The capture runs INSIDE this function under its own
+# `local LC_ALL=C`; only this function's shell is pinned, never the script's (#3780).
+# A name that is one of this function's own locals (`_pin_*`, `LC_ALL`) is refused: `printf -v` would
+# assign the local and leave the caller's variable unset with rc 0. Exit 1, one stderr line.
+# ---------------------------------------------------------------------------
+_pinned_into() {
+    local LC_ALL=C _pin_name="${1-}" _pin_v _pin_rc=0
+    case "$_pin_name" in
+        _pin_*|LC_ALL)
+            echo "ERROR: cannot assign to the variable name '$_pin_name': it is one of _pinned_into's own local names" >&2
+            return 1
+            ;;
+    esac
+    shift
+    _pin_v="$("$@")" || _pin_rc=$?
+    printf -v "$_pin_name" '%s' "$_pin_v"
+    return "$_pin_rc"
+}
+_resolve_self() { readlink -f "$1" 2>/dev/null || echo "$1"; }
+_cd_pwd() { cd "$1" && pwd; }
+_sys_python() { python3 -c 'import sys; print(sys.executable)' 2>/dev/null || echo ""; }
+
+# ---------------------------------------------------------------------------
 # Resolve script location and repo root (template source)
 # ---------------------------------------------------------------------------
-_self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
-_script_dir="$(dirname "$_self")"
+_pinned_into _self _resolve_self "${BASH_SOURCE[0]}"
+_pinned_into _script_dir dirname "$_self"
 
 # Templates live alongside this script's parent bundle root.
 # In a plugin install the layout is:
@@ -118,7 +145,7 @@ _script_dir="$(dirname "$_self")"
 # In a repo-clone install, script_dir is src/engram/tools/ → step up two
 # levels to reach src/engram/. Either way, the template dir is:
 #   <script_dir>/../templates/
-PLUGIN_ROOT="$(cd "$_script_dir/.." && pwd)"
+_pinned_into PLUGIN_ROOT _cd_pwd "$_script_dir/.."
 TEMPLATE_DIR="$PLUGIN_ROOT/templates"
 
 # ---------------------------------------------------------------------------
@@ -155,7 +182,7 @@ ENGRAM_VENV_PYTHON="$HOME/.engram/venv/bin/python3"
 if [[ -x "$ENGRAM_VENV_PYTHON" ]]; then
     PYTHON_BIN="$ENGRAM_VENV_PYTHON"
 else
-    PYTHON_BIN="$(python3 -c 'import sys; print(sys.executable)' 2>/dev/null || echo "")"
+    _pinned_into PYTHON_BIN _sys_python
 fi
 
 if [[ -z "$PYTHON_BIN" ]]; then
@@ -188,27 +215,42 @@ fi
 # directory with `cd ... && pwd -P`.
 # ---------------------------------------------------------------------------
 _physical_path() {
-    local p="$1" target n=0
-    while [[ -L "$p" && $n -lt 40 ]]; do
-        target="$(readlink "$p")"
-        if [[ "$target" == /* ]]; then
-            p="$target"
+    # LC_ALL=C from the first line: a path VALUE is bytes, and bash 3.2 mangles a multibyte capture otherwise
+    # (#3780), the readlink/dirname captures of the loop below included (#3794).
+    # Optional 2nd argument: the NAME of a variable to assign the result to (no stdout), because a
+    # `$(_physical_path ...)` at the caller's top level is itself an unpinned capture. A name that is one of
+    # this function's own locals (`_pp_*`, `LC_ALL`) is refused: exit 1, one stderr line.
+    local LC_ALL=C _pp_p="${1-}" _pp_out="${2-}" _pp_target _pp_n=0 _pp_d _pp_b _pp_res
+    case "$_pp_out" in
+        _pp_*|LC_ALL)
+            echo "ERROR: cannot assign to the variable name '$_pp_out': it is one of _physical_path's own local names" >&2
+            return 1
+            ;;
+    esac
+    while [[ -L "$_pp_p" && $_pp_n -lt 40 ]]; do
+        _pp_target="$(readlink "$_pp_p")"
+        if [[ "$_pp_target" == /* ]]; then
+            _pp_p="$_pp_target"
         else
-            p="$(dirname "$p")/$target"
+            _pp_p="$(dirname "$_pp_p")/$_pp_target"
         fi
-        n=$((n + 1))
+        _pp_n=$((_pp_n + 1))
     done
-    local d b LC_ALL=C  # C: a path value is bytes; bash 3.2 mangles a multibyte capture otherwise (#3780)
-    d="$(dirname "$p")"
-    b="${p##*/}"
-    if d="$(cd "$d" 2>/dev/null && pwd -P)"; then
-        if [[ "$d" == "/" ]]; then
-            echo "/$b"
+    _pp_d="$(dirname "$_pp_p")"
+    _pp_b="${_pp_p##*/}"
+    if _pp_d="$(cd "$_pp_d" 2>/dev/null && pwd -P)"; then
+        if [[ "$_pp_d" == "/" ]]; then
+            _pp_res="/$_pp_b"
         else
-            echo "$d/$b"
+            _pp_res="$_pp_d/$_pp_b"
         fi
     else
-        echo "$p"
+        _pp_res="$_pp_p"
+    fi
+    if [[ -n "$_pp_out" ]]; then
+        printf -v "$_pp_out" '%s' "$_pp_res"
+    else
+        echo "$_pp_res"
     fi
 }
 
@@ -241,7 +283,7 @@ _ephemeral_reason() {
     return 1
 }
 
-DAEMON_REAL="$(_physical_path "$DAEMON_PY")"
+_physical_path "$DAEMON_PY" DAEMON_REAL
 if _why="$(_ephemeral_reason "$DAEMON_REAL")"; then
     if [[ "$ALLOW_PATH" == "1" ]]; then
         echo "WARN: registering a service for an ephemeral daemon path $DAEMON_REAL ($_why); proceeding because --allow-path / ENGRAM_SETUP_ALLOW_PATH=1 was given." >&2
@@ -347,10 +389,18 @@ _owner_preflight() {
 # function under its own `local LC_ALL=C`: bash 3.2 mangles the bytes of a `$(...)` capture (inserting
 # \001 after each byte >= 0x80) when the CAPTURING shell is in a multibyte locale, and a pin written
 # inside the substitution does not help. Only this function's shell is pinned, never the script (#3780).
+# A name that is one of this function's own locals (`_opdi_*`, `LC_ALL`) is refused: exit 1, one stderr line
+# (`printf -v` would assign the local and leave the caller's variable unset with rc 0; #3794).
 _owner_physical_dir_into() {
-    local LC_ALL=C _pd
-    _pd="$(cd "$1" && pwd -P)" || return 1
-    printf -v "$2" '%s' "$_pd"
+    local LC_ALL=C _opdi_dir="${1-}" _opdi_name="${2-}" _opdi_pd
+    case "$_opdi_name" in
+        _opdi_*|LC_ALL)
+            echo "ERROR: cannot assign to the variable name '$_opdi_name': it is one of _owner_physical_dir_into's own local names" >&2
+            return 1
+            ;;
+    esac
+    _opdi_pd="$(cd "$_opdi_dir" && pwd -P)" || return 1
+    printf -v "$_opdi_name" '%s' "$_opdi_pd"
 }
 
 if [[ "$OWNER_MODE" == "1" ]]; then
@@ -446,16 +496,17 @@ if [[ "$OS" == "Linux" ]]; then
     fi
 
     SERVICE_DEST="$HOME/.config/systemd/user/$SERVICE_NAME"
-    mkdir -p "$(dirname "$SERVICE_DEST")"
+    _pinned_into _service_dir dirname "$SERVICE_DEST"
+    mkdir -p "$_service_dir"
 
     echo "Step 1: Rendering systemd unit → $SERVICE_DEST"
     if [[ "$OWNER_MODE" == "1" ]]; then
-        sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
+        LC_ALL=C sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
             -e "s|{{ENGRAM_OWNER_PY}}|$DAEMON_PY|g" \
             -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
             "$SERVICE_TEMPLATE" > "$SERVICE_DEST"
     else
-        sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
+        LC_ALL=C sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
             -e "s|{{ENGRAM_HOOKS_DIR}}|$HOOKS_DIR|g" \
             -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
             "$SERVICE_TEMPLATE" > "$SERVICE_DEST"
@@ -508,13 +559,13 @@ elif [[ "$OS" == "Darwin" ]]; then
 
     echo "Step 1: Rendering LaunchAgent plist → $PLIST_DEST"
     if [[ "$OWNER_MODE" == "1" ]]; then
-        sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
+        LC_ALL=C sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
             -e "s|{{ENGRAM_OWNER_PY}}|$DAEMON_PY|g" \
             -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
             -e "s|{{LABEL}}|$PLIST_LABEL|g" \
             "$PLIST_TEMPLATE" > "$PLIST_DEST"
     else
-        sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
+        LC_ALL=C sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
             -e "s|{{ENGRAM_HOOKS_DIR}}|$HOOKS_DIR|g" \
             -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
             "$PLIST_TEMPLATE" > "$PLIST_DEST"

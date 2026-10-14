@@ -75,12 +75,39 @@ esac
 # bytes of a `$(...)` capture (inserting \001 after each byte >= 0x80) when the CAPTURING shell is
 # in a multibyte locale, so a pin inside the substitution is not enough, and the installer computes
 # this same path the same way (#3780). Only this function's shell is pinned, never the hook's.
+# A name that is one of this function's own locals (`_pdi_*`, `LC_ALL`) is refused: return 1 and one stderr
+# line (`printf -v` would assign the local and leave the caller's variable unset with rc 0; #3794).
 _physical_dir_into() {
-    local LC_ALL=C _pd
-    _pd="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
-    printf -v "$2" '%s' "$_pd"
+    local LC_ALL=C _pdi_dir="${1-}" _pdi_name="${2-}" _pdi_pd
+    case "$_pdi_name" in
+        _pdi_*|LC_ALL)
+            echo "start-engramd-owner: cannot assign to the variable name '$_pdi_name': it is one of _physical_dir_into's own local names" >&2
+            return 1
+            ;;
+    esac
+    _pdi_pd="$(cd "$_pdi_dir" 2>/dev/null && pwd -P)" || return 1
+    printf -v "$_pdi_name" '%s' "$_pdi_pd"
 }
 _physical_dir_into "$ENGRAM_HOME" ENGRAM_HOME || exit 0
+
+# _pinned_into <varname> <cmd...>: run <cmd...> and assign its stdout (trailing newlines stripped, as `$(...)`
+# does) to the variable NAMED by $1; the return status is the command's. The plugin root, the I/O helper and
+# the python path are PATH values, so their captures go through here (#3794), for the reason given above:
+# the capture runs INSIDE this function under its own `local LC_ALL=C`, never in the hook's own shell.
+# A name that is one of this function's own locals (`_pin_*`, `LC_ALL`) is refused: return 1, one stderr line.
+_pinned_into() {
+    local LC_ALL=C _pin_name="${1-}" _pin_v _pin_rc=0
+    case "$_pin_name" in
+        _pin_*|LC_ALL)
+            echo "start-engramd-owner: cannot assign to the variable name '$_pin_name': it is one of _pinned_into's own local names" >&2
+            return 1
+            ;;
+    esac
+    shift
+    _pin_v="$("$@")" || _pin_rc=$?
+    printf -v "$_pin_name" '%s' "$_pin_v"
+    return "$_pin_rc"
+}
 
 LOG_PATH="$ENGRAM_HOME/engramd-owner.log"  # used only to NAME the log in messages; never opened here
 
@@ -136,12 +163,12 @@ _find_plugin_root() {
 
 PYTHON_BIN="$HOME/.engram/venv/bin/python3"
 if [ ! -x "$PYTHON_BIN" ]; then
-    PYTHON_BIN="$(command -v python3 2>/dev/null)"
+    _pinned_into PYTHON_BIN command -v python3 2>/dev/null
 fi
 
 # ---- 1. do any owner flags want an owner? -----------------------------------------
-PLUGIN_ROOT="$(_find_plugin_root)"
-IO_PY="$(_find_io_helper)"
+_pinned_into PLUGIN_ROOT _find_plugin_root
+_pinned_into IO_PY _find_io_helper
 if [ -z "$PLUGIN_ROOT" ] || [ -z "$PYTHON_BIN" ]; then
     _report "ENGRAM owner not launched (could not read the owner flags: engramd_owner_flags.py or python not found; ambiguous). ENGRAM_HOME=$ENGRAM_HOME"
     exit 0

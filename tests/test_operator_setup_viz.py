@@ -91,10 +91,14 @@ def _make_patched_script(plugin_engram_dir: str, dest: Path) -> None:
     with a fixed assignment pointing at the given fake plugin dir.
     """
     original = SETUP_SCRIPT.read_text()
-    patched = original.replace(
-        'PLUGIN_ENGRAM_DIR="$(dirname "$(dirname "$_self")")"',
-        f'PLUGIN_ENGRAM_DIR="{plugin_engram_dir}"',
+    target = 'PLUGIN_ENGRAM_DIR="$(dirname "$(dirname "$_self")")"'
+    # A str.replace that matches nothing is a silent no-op; fail loudly if
+    # the line is ever reshaped (#3794).
+    assert original.count(target) == 1, (
+        f"operator-setup-viz.sh: expected the patch target "
+        f"{target!r} exactly once, found {original.count(target)}"
     )
+    patched = original.replace(target, f'PLUGIN_ENGRAM_DIR="{plugin_engram_dir}"')
     dest.write_text(patched)
     dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 

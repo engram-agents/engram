@@ -58,7 +58,7 @@ _TOOLS = ("bash", "env", "sha256sum", "cut", "dirname", "readlink", "timeout", "
 
 def _stub(directory: Path, name: str, body: str) -> Path:
     p = directory / name
-    p.write_text(body)
+    p.write_text(body, encoding="utf-8")  # a stub body may carry a non-ASCII path (#3794)
     p.chmod(0o755)
     return p
 
@@ -148,7 +148,7 @@ class Sandbox:
         argv = ["bash", str(self.installer), *args]
         if allow_path:
             argv.append("--allow-path")
-        return subprocess.run(argv, capture_output=True, text=True, env=env, cwd=str(self.tmp))
+        return subprocess.run(argv, capture_output=True, encoding="utf-8", errors="replace", env=env, cwd=str(self.tmp))
 
     @property
     def unit_dir(self) -> Path:
@@ -169,7 +169,7 @@ class Sandbox:
     def systemctl_calls(self) -> list[list[str]]:
         if not self.syslog.exists():
             return []
-        return [ln.split() for ln in self.syslog.read_text().splitlines() if ln.strip()]
+        return [ln.split() for ln in self.syslog.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
 
 @pytest.fixture
@@ -189,7 +189,7 @@ def _expected_id(engram_home: str) -> str:
 def rendered(sb):
     home = sb.tmp / "seat-a"
     unit = sb.install_owner(str(home))
-    return unit, home, parse_unit(unit.read_text()), sb
+    return unit, home, parse_unit(unit.read_text(encoding="utf-8")), sb
 
 
 # ---- C1: argv carries engramd_owner (unit) ----------------------------------
@@ -259,7 +259,7 @@ def test_c2_exit4_pidfile_not_regular_is_not_restarted(rendered):
     code = str(_exit_path_not_regular())
     svc = ini["Service"]
     assert svc.get("RestartPreventExitStatus") == [code], svc.get("RestartPreventExitStatus")
-    raw = [ln.strip() for ln in unit.read_text().splitlines()
+    raw = [ln.strip() for ln in unit.read_text(encoding="utf-8").splitlines()
            if ln.strip().startswith("RestartPreventExitStatus=")]
     assert raw == [f"RestartPreventExitStatus={code}"], raw
     assert "RestartPreventExitStatus" not in ini.get("Unit", {})
@@ -272,7 +272,7 @@ def test_c2_exit4_is_in_the_exit_code_comment_table(rendered):
     """The 'supervised by meaning' comment table names exit 4 by its constant."""
     unit, _h, _ini, _s = rendered
     code = str(_exit_path_not_regular())
-    rows = [ln for ln in unit.read_text().splitlines()
+    rows = [ln for ln in unit.read_text(encoding="utf-8").splitlines()
             if ln.lstrip().startswith("#") and "EXIT_PATH_NOT_REGULAR" in ln]
     assert rows, "no comment-table line names EXIT_PATH_NOT_REGULAR"
     assert any(re.match(rf"#\s+{code}\s+EXIT_PATH_NOT_REGULAR", ln.strip()) for ln in rows), rows
@@ -305,10 +305,10 @@ def test_c3_different_homes_give_different_non_colliding_names(sb):
 def test_c3_name_is_stable_across_re_render(sb):
     home = str(sb.tmp / "seat-a")
     first = sb.install_owner(home)
-    text1 = first.read_text()
+    text1 = first.read_text(encoding="utf-8")
     second = sb.install_owner(home)
     assert first == second and len(sb.owner_units()) == 1
-    assert second.read_text() == text1
+    assert second.read_text(encoding="utf-8") == text1
 
 
 def test_c3_name_is_a_valid_unit_name_keyed_on_the_physical_home_hash(sb):
@@ -368,12 +368,12 @@ def test_c8_default_mode_renders_the_same_surface_daemon_unit(sb):
     home = sb.tmp / "seat-a"
     r = sb.run(engram_home=str(home))
     assert r.returncode == 0, (r.stdout, r.stderr)
-    out = (sb.unit_dir / "engram-surface-daemon.service").read_text()
+    out = (sb.unit_dir / "engram-surface-daemon.service").read_text(encoding="utf-8")
     hooks_dir = sb.plugin / "hooks" / "claude"
     py = subprocess.run(["python3", "-c", "import sys; print(sys.executable)"],
-                        capture_output=True, text=True, env={**os.environ, "HOME": str(sb.home),
+                        capture_output=True, encoding="utf-8", errors="replace", env={**os.environ, "HOME": str(sb.home),
                         "PATH": f"{sb.stubs}:{os.environ['PATH']}"}).stdout.strip()
-    expected = (TEMPLATES / "engram-surface-daemon.service.template").read_text() \
+    expected = (TEMPLATES / "engram-surface-daemon.service.template").read_text(encoding="utf-8") \
         .replace("{{PYTHON}}", py).replace("{{ENGRAM_HOOKS_DIR}}", str(hooks_dir)) \
         .replace("{{ENGRAM_HOME}}", str(home))
     assert out == expected
@@ -494,7 +494,7 @@ class Seat:
         if keep_plugin_root:
             env["CLAUDE_PLUGIN_ROOT"] = str(self.plugin)
         env.update(extra_env or {})
-        return subprocess.run([bash, str(script or self.hook)], capture_output=True, text=True,
+        return subprocess.run([bash, str(script or self.hook)], capture_output=True, encoding="utf-8", errors="replace",
                               env=env, cwd=str(self.tmp), timeout=60)
 
     def run_timed(self, extra_env: dict | None = None, limit: float = 3.0):
@@ -508,7 +508,7 @@ class Seat:
         env.update(extra_env or {})
         t0 = time.monotonic()
         p = subprocess.Popen(["bash", str(self.hook)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, env=env, cwd=str(self.tmp), start_new_session=True)
+                             encoding="utf-8", errors="replace", env=env, cwd=str(self.tmp), start_new_session=True)
         try:
             out, err = p.communicate(timeout=limit)
         except subprocess.TimeoutExpired:
@@ -522,10 +522,10 @@ class Seat:
         return self.eh / "engramd-owner.log"
 
     def log_lines(self) -> list[str]:
-        return self.log.read_text().splitlines() if self.log.exists() else []
+        return self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
 
     def launched(self) -> list[str]:
-        return self.record.read_text().splitlines() if self.record.exists() else []
+        return self.record.read_text(encoding="utf-8").splitlines() if self.record.exists() else []
 
     def unit_name(self) -> str:
         return f"engramd-owner-{_expected_id(_physical(self.eh))}.service"
@@ -608,7 +608,7 @@ def test_c6_fallback_log_lives_under_engram_home_and_catches_owner_output(seat):
     seat.run()
     logs = list(seat.eh.glob("*.log"))
     assert len(logs) == 1, logs
-    assert "owner-stub-output" in logs[0].read_text(), "owner stdout was not routed to the log"
+    assert "owner-stub-output" in logs[0].read_text(encoding="utf-8"), "owner stdout was not routed to the log"
 
 
 def test_f2_launched_owner_gets_the_normalized_engram_home(seat):
@@ -630,8 +630,8 @@ def test_f3_unit_active_for_this_home_launches_nothing(seat):
     assert r.returncode == 0
     assert seat.launched() == []
     assert "UNSUPERVISED" not in r.stdout + r.stderr + "".join(seat.log_lines())
-    assert seat.unit_name() in seat.syslog.read_text(), "asked about the wrong unit name"
-    assert all(c.split()[:2] == ["--user", "show"] for c in seat.syslog.read_text().splitlines()), \
+    assert seat.unit_name() in seat.syslog.read_text(encoding="utf-8"), "asked about the wrong unit name"
+    assert all(c.split()[:2] == ["--user", "show"] for c in seat.syslog.read_text(encoding="utf-8").splitlines()), \
         "the fallback must only READ systemd state"
 
 
@@ -662,7 +662,7 @@ def test_hook_and_installer_agree_on_the_unit_name(tmp_path):
     seat.config(FLAG_ON)
     seat.systemctl("notfound")
     seat.run()
-    assert unit.name in seat.syslog.read_text(), (unit.name, seat.syslog.read_text())
+    assert unit.name in seat.syslog.read_text(encoding="utf-8"), (unit.name, seat.syslog.read_text(encoding="utf-8"))
 
 
 # ---- F4: flag on and the launch fails -> loud, exit 0 ------------------------------
@@ -802,7 +802,7 @@ def test_source_tree_layout_resolves_the_owner_script_next_to_the_flags_module(s
 # ---- hooks.json / tiers ----------------------------------------------------------------
 
 def _tiers() -> dict[str, dict]:
-    data = json.loads(TIERS.read_text())
+    data = json.loads(TIERS.read_text(encoding="utf-8"))
     out = {}
     for entry in data["mechanisms"] if "mechanisms" in data else []:
         out[entry["path"]] = entry
@@ -810,7 +810,7 @@ def _tiers() -> dict[str, dict]:
 
 
 def test_hooks_json_registers_the_fallback_on_session_start_and_resolves_when_flattened():
-    cfg = json.loads(HOOKS_JSON.read_text())
+    cfg = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
     cmds = [h["command"] for g in cfg["hooks"]["SessionStart"] for h in g["hooks"]]
     mine = [c for c in cmds if "start-engramd-owner.sh" in c]
     assert len(mine) == 1, cmds
@@ -886,7 +886,7 @@ def test_h_flag_on_never_blocks_on_a_fifo(tmp_path):
             f"m=u.module_from_spec(s);s.loader.exec_module(m);"
             f"print(m.flag_on('user_identity_reads_via_owner',{str(fifo)!r}))")
     assert FLAGS_PY.is_file()
-    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=20)
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, encoding="utf-8", errors="replace", timeout=20)
     assert r.stdout.strip() == "False", (r.stdout, r.stderr)
 
 
@@ -917,7 +917,7 @@ def test_h_cli_prints_on_or_off_for_an_engram_home(tmp_path):
     home = tmp_path / "h"
     home.mkdir()
     def run():
-        return subprocess.run([sys.executable, str(FLAGS_PY), str(home)], capture_output=True, text=True)
+        return subprocess.run([sys.executable, str(FLAGS_PY), str(home)], capture_output=True, encoding="utf-8", errors="replace")
     assert run().stdout.strip() == "off"
     (home / "config.json").write_text(json.dumps({"engramd": {"a_via_owner": True}}))
     r = run()
@@ -937,7 +937,7 @@ def _hook_probe(root_hooks: Path, engram_home: Path, extra: str = "") -> subproc
     env = {k: v for k, v in os.environ.items()
            if k not in ("CLAUDE_PLUGIN_ROOT", "ENGRAM_RUNTIME_DIR", "PYTHONPATH")}
     env["ENGRAM_HOME"] = str(engram_home)
-    return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env,
+    return subprocess.run([sys.executable, "-c", code], capture_output=True, encoding="utf-8", errors="replace", env=env,
                           cwd=str(engram_home))
 
 
@@ -1022,7 +1022,7 @@ def test_f5_control_no_live_owner_after_the_wait_is_still_the_loud_failure(seat)
 # ---- (a) no status line on every seat's session start -----------------------------------
 
 def test_hooks_json_entry_has_no_status_message_and_keeps_its_timeout():
-    cfg = json.loads(HOOKS_JSON.read_text())
+    cfg = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
     (entry,) = [h for g in cfg["hooks"]["SessionStart"] for h in g["hooks"]
                 if "start-engramd-owner.sh" in h["command"]]
     assert "statusMessage" not in entry, entry
@@ -1032,7 +1032,7 @@ def test_hooks_json_entry_has_no_status_message_and_keeps_its_timeout():
 # ---- (c) the helper's docstring no longer claims a reader that does not exist ---------------
 
 def test_no_stale_claim_of_a_second_flag_reader_in_the_helper():
-    text = _require(FLAGS_PY).read_text()
+    text = _require(FLAGS_PY).read_text(encoding="utf-8")
     assert "still carries its own copy" not in text
     assert "follow-up" not in text
     assert "#3664" in text and "must call flag_on" in text
@@ -1073,7 +1073,7 @@ def test_h9_any_owner_flag_on_is_false_and_does_not_raise_on_a_deeply_nested_con
 def test_h9_cli_prints_off_and_exits_zero_on_a_deeply_nested_config(tmp_path):
     assert FLAGS_PY.is_file()
     _deep_config(tmp_path)
-    r = subprocess.run([sys.executable, str(FLAGS_PY), str(tmp_path)], capture_output=True, text=True)
+    r = subprocess.run([sys.executable, str(FLAGS_PY), str(tmp_path)], capture_output=True, encoding="utf-8", errors="replace")
     assert r.returncode == 0 and r.stdout.strip() == "off", (r.returncode, r.stdout, r.stderr[-300:])
 
 
@@ -1152,7 +1152,7 @@ def test_i1_owner_mode_refuses_a_bad_character_in_the_owner_script_path(tmp_path
 def test_i1_control_an_ordinary_home_renders_and_environment_equals_the_input_byte_for_byte(sb):
     home = _physical(sb.tmp / "seat-a_b.c-d")
     unit = sb.install_owner(home)
-    assert f"ENGRAM_HOME={home}" in parse_unit(unit.read_text())["Service"]["Environment"]
+    assert f"ENGRAM_HOME={home}" in parse_unit(unit.read_text(encoding="utf-8"))["Service"]["Environment"]
 
 
 def test_i1_default_mode_still_accepts_what_it_always_accepted(sb):
@@ -1177,7 +1177,7 @@ def test_i3_a_pidfile_that_is_not_a_positive_pid_is_not_a_live_owner(seat, conte
 # ---- K3: exit-code wording is bounded by the start limit -------------------------------------------
 
 def test_k3_template_does_not_promise_an_unconditional_restart():
-    text = _require(OWNER_TEMPLATE).read_text()
+    text = _require(OWNER_TEMPLATE).read_text(encoding="utf-8")
     assert "MUST be restarted" not in text
     assert "reset-failed" in text and "start limit" in text.lower()
 
@@ -1277,7 +1277,7 @@ def _k7_run(hook: Path, home: Path, prompt: str = "Alice: hello there"):
     env["ENGRAM_HOME"] = str(home)
     env["HOME"] = str(home)
     p = subprocess.run([sys.executable, str(hook)], input=json.dumps({"prompt": prompt}),
-                       capture_output=True, text=True, env=env, timeout=60, cwd=str(home))
+                       capture_output=True, encoding="utf-8", errors="replace", env=env, timeout=60, cwd=str(home))
     return p.returncode, p.stdout, p.stderr
 
 
@@ -1343,7 +1343,7 @@ def test_k8a_refusal_message_uses_the_right_article(sb, name, ch, article):
 # ---- K8(b): no long run of stray alignment spaces in the hook header ---------------------------------------
 
 def test_k8b_live_owner_bullet_does_not_trail_off_into_a_long_run_of_spaces():
-    text = _require(HOOK).read_text()
+    text = _require(HOOK).read_text(encoding="utf-8")
     (line,) = [ln for ln in text.splitlines() if "never counts)" in ln]
     assert line.rstrip() == line.rstrip().split("never counts)")[0] + "never counts)", line
     assert "->" not in line and not re.search(r"\) {4,}", line), line
@@ -1435,7 +1435,7 @@ K10_PRE_IMPORT_REPORT_HOOK = (REPO / "tests" / "fixtures" / "owner_launcher_3663
 
 @pytest.mark.parametrize("platform", ["claude-code", None])
 def test_k10_the_healthy_path_is_byte_identical_to_the_commit_before_the_import_report(tmp_path, platform):
-    old_text = K10_PRE_IMPORT_REPORT_HOOK.read_text()
+    old_text = K10_PRE_IMPORT_REPORT_HOOK.read_text(encoding="utf-8")
     assert old_text, "frozen pre-import-report hook fixture is empty"
     outs = []
     for name, text in (("old", old_text), ("new", None)):
@@ -1443,7 +1443,7 @@ def test_k10_the_healthy_path_is_byte_identical_to_the_commit_before_the_import_
         d.mkdir()
         hook = _k7_bundle(d, "real", platform=platform)
         if text is not None:
-            hook.write_text(text)
+            hook.write_text(text, encoding="utf-8")
         home = _k7_home(d, None, role=BIG_ROLE)
         rc, out, err = _k7_run(hook, home)
         assert rc == 0
@@ -1550,7 +1550,7 @@ def _k12_probe(tmp_path: Path, rt_mode: str, bundle_mode: str, rt_exc: str = "Ru
         """)
     env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PLUGIN_ROOT", "PYTHONPATH")}
     env.update(ENGRAM_HOME=str(home), ENGRAM_RUNTIME_DIR=str(rt))
-    return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, cwd=str(home))
+    return subprocess.run([sys.executable, "-c", code], capture_output=True, encoding="utf-8", errors="replace", env=env, cwd=str(home))
 
 
 def test_k12_a_raising_copy_in_the_explicit_runtime_dir_does_not_hide_the_good_bundle_copy(tmp_path):
@@ -1743,7 +1743,7 @@ def test_k15_a_report_for_a_very_long_home_is_bounded_trailer_first_json_and_kee
     assert len(ctx) <= 1000, len(ctx)
     assert ctx.splitlines()[0].startswith("▸ "), ctx[:80]
     assert lead in ctx, ctx[:300]
-    logged = (home / "engramd-owner.log").read_text()
+    logged = (home / "engramd-owner.log").read_text(encoding="utf-8")
     assert _physical(home) in logged, "the full home must remain in the log line"
 
 
@@ -1784,7 +1784,7 @@ def test_k15_helper_report_for_a_nonexistent_very_long_home_is_bounded_and_creat
     message = f"{prefix}ENGRAM_HOME={home}"
     helper = seat.plugin / "hooks" / "_engramd_owner_hook_io.py"
     r = subprocess.run([sys.executable, str(helper), "report", str(home), message], capture_output=True,
-                       text=True, timeout=20, cwd=str(tmp_path),
+                       encoding="utf-8", errors="replace", timeout=20, cwd=str(tmp_path),
                        env={"HOME": str(seat.home), "ENGRAM_HOME": str(seat.eh), "PATH": os.environ.get("PATH", "")})
     assert r.returncode == 0, r.stderr[-300:]
     ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]

@@ -497,12 +497,17 @@ class TestHooksDirResolution(unittest.TestCase):
         """Write a copy of SETUP_SCRIPT with PLUGIN_ROOT hard-coded to plugin_root."""
         original = SETUP_SCRIPT.read_text()
         # Replace the PLUGIN_ROOT computation line with a fixed assignment.
-        # The original line is:
-        #   PLUGIN_ROOT="$(cd "$_script_dir/.." && pwd)"
-        patched = original.replace(
-            'PLUGIN_ROOT="$(cd "$_script_dir/.." && pwd)"',
-            f'PLUGIN_ROOT="{plugin_root}"',
+        # The current line (pinned via the locale-safe helper, #3790) is:
+        #   _pinned_into PLUGIN_ROOT _cd_pwd "$_script_dir/.."
+        target = '_pinned_into PLUGIN_ROOT _cd_pwd "$_script_dir/.."'
+        # A str.replace that matches nothing is a silent no-op: PLUGIN_ROOT
+        # would then resolve from the copy's temp dir.  Fail loudly instead
+        # if the line is ever reshaped (#3794).
+        assert original.count(target) == 1, (
+            f"setup-surface-daemon-service.sh: expected the patch target "
+            f"{target!r} exactly once, found {original.count(target)}"
         )
+        patched = original.replace(target, f'PLUGIN_ROOT="{plugin_root}"')
         dest.write_text(patched)
         dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 

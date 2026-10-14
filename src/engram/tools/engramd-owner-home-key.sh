@@ -34,36 +34,45 @@
 # (inserting its internal \001 escape byte after each byte >= 0x80) when the CAPTURING shell runs in
 # a multibyte locale, whatever this function pins inside, so the stdout form is only safe where the
 # caller's locale is safe (#3780). Every capture INSIDE this file runs under the function-scoped
-# `local LC_ALL=C` and is therefore exact.
+# `local LC_ALL=C` and is therefore exact. A name that is one of this function's own locals (anything
+# starting `_eopp_`, or `LC_ALL`) is refused -- exit 1, one stderr line, nothing assigned -- rather than
+# assigned to the local with the caller's variable left unset (#3794).
 engramd_owner_physical_path() {
     # LC_ALL=C: a path VALUE is bytes, so the locale must not touch it (see above; #3780).
-    local LC_ALL=C path="${1-}" outvar="${2-}" anc rest comp link hops=0 phys
-    case "$path" in
+    local LC_ALL=C _eopp_path="${1-}" _eopp_outvar="${2-}" _eopp_anc _eopp_rest _eopp_comp _eopp_link _eopp_hops=0 _eopp_phys
+    # `printf -v "$_eopp_outvar"` would assign this function's OWN local, not the caller's variable, if the
+    # caller's name were one of its locals (rc 0, caller's variable left unset; #3794): refuse such a name.
+    case "$_eopp_outvar" in
+        _eopp_*|LC_ALL)
+            echo "engramd-owner-home-key: cannot assign to the variable name '$_eopp_outvar': it is one of this function's own local names" >&2
+            return 1 ;;
+    esac
+    case "$_eopp_path" in
         /*) ;;
-        *) echo "engramd-owner-home-key: not an absolute path: $path" >&2; return 1 ;;
+        *) echo "engramd-owner-home-key: not an absolute path: $_eopp_path" >&2; return 1 ;;
     esac
     while :; do
-        anc="$path" rest=""
-        while [ "$anc" != "/" ] && [ ! -e "$anc" ]; do
-            comp="${anc##*/}"
-            rest="/$comp$rest"
-            anc="${anc%/*}"
-            [ -n "$anc" ] || anc="/"
+        _eopp_anc="$_eopp_path" _eopp_rest=""
+        while [ "$_eopp_anc" != "/" ] && [ ! -e "$_eopp_anc" ]; do
+            _eopp_comp="${_eopp_anc##*/}"
+            _eopp_rest="/$_eopp_comp$_eopp_rest"
+            _eopp_anc="${_eopp_anc%/*}"
+            [ -n "$_eopp_anc" ] || _eopp_anc="/"
         done
         # The first missing component may be a dangling symlink: follow it and look again.
-        if [ -n "$rest" ]; then
-            comp="${rest#/}"; comp="${comp%%/*}"
-            if [ -L "${anc%/}/$comp" ]; then
-                hops=$((hops + 1))
-                if [ "$hops" -gt 40 ]; then
+        if [ -n "$_eopp_rest" ]; then
+            _eopp_comp="${_eopp_rest#/}"; _eopp_comp="${_eopp_comp%%/*}"
+            if [ -L "${_eopp_anc%/}/$_eopp_comp" ]; then
+                _eopp_hops=$((_eopp_hops + 1))
+                if [ "$_eopp_hops" -gt 40 ]; then
                     echo "engramd-owner-home-key: too many symbolic links resolving $1" >&2
                     return 1
                 fi
-                link="$(readlink "${anc%/}/$comp")" || return 1
-                rest="${rest#/"$comp"}"
-                case "$link" in
-                    /*) path="$link$rest" ;;
-                    *) path="${anc%/}/$link$rest" ;;
+                _eopp_link="$(readlink "${_eopp_anc%/}/$_eopp_comp")" || return 1
+                _eopp_rest="${_eopp_rest#/"$_eopp_comp"}"
+                case "$_eopp_link" in
+                    /*) _eopp_path="$_eopp_link$_eopp_rest" ;;
+                    *) _eopp_path="${_eopp_anc%/}/$_eopp_link$_eopp_rest" ;;
                 esac
                 continue
             fi
@@ -71,19 +80,19 @@ engramd_owner_physical_path() {
         break
     done
     # A `.`/`..` in the part that does not exist cannot be resolved without creating it.
-    case "$rest/" in
+    case "$_eopp_rest/" in
         */./*|*/../*) echo "engramd-owner-home-key: cannot resolve '.' or '..' in the not-yet-existing part of $1" >&2; return 1 ;;
     esac
-    if ! phys="$(cd "$anc" 2>/dev/null && pwd -P)" || [ -z "$phys" ]; then
-        echo "engramd-owner-home-key: cannot resolve the physical path of $anc" >&2
+    if ! _eopp_phys="$(cd "$_eopp_anc" 2>/dev/null && pwd -P)" || [ -z "$_eopp_phys" ]; then
+        echo "engramd-owner-home-key: cannot resolve the physical path of $_eopp_anc" >&2
         return 1
     fi
-    [ "$phys" = "/" ] && phys=""
-    [ -n "$phys$rest" ] || phys="/"
-    if [ -n "$outvar" ]; then
-        printf -v "$outvar" '%s%s' "$phys" "$rest"
+    [ "$_eopp_phys" = "/" ] && _eopp_phys=""
+    [ -n "$_eopp_phys$_eopp_rest" ] || _eopp_phys="/"
+    if [ -n "$_eopp_outvar" ]; then
+        printf -v "$_eopp_outvar" '%s%s' "$_eopp_phys" "$_eopp_rest"
     else
-        printf '%s%s\n' "$phys" "$rest"
+        printf '%s%s\n' "$_eopp_phys" "$_eopp_rest"
     fi
 }
 
