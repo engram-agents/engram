@@ -17,6 +17,7 @@ via PATH; no real systemd or launchd interaction occurs.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import stat
 import sys
@@ -38,6 +39,41 @@ def _write_stub(directory: Path, name: str, content: str) -> Path:
     p.chmod(p.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return p
 
+
+def _make_patched_script(plugin_root: str, dest: Path) -> None:
+    """Write a copy of SETUP_SCRIPT with PLUGIN_ROOT hard-coded to plugin_root."""
+    original = SETUP_SCRIPT.read_text()
+    # Replace the PLUGIN_ROOT computation line with a fixed assignment.
+    # The current line (pinned via the locale-safe helper, #3790) is:
+    #   _pinned_into PLUGIN_ROOT _cd_pwd "$_script_dir/.."
+    target = '_pinned_into PLUGIN_ROOT _cd_pwd "$_script_dir/.."'
+    # A str.replace that matches nothing is a silent no-op: PLUGIN_ROOT
+    # would then resolve from the copy's temp dir.  Fail loudly instead
+    # if the line is ever reshaped (#3794).
+    assert original.count(target) == 1, (
+        f"setup-surface-daemon-service.sh: expected the patch target "
+        f"{target!r} exactly once, found {original.count(target)}"
+    )
+    patched = original.replace(target, f'PLUGIN_ROOT="{plugin_root}"')
+    dest.write_text(patched)
+    dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _make_env(stub_dir: str, fake_home: str, fake_engram_home: str,
+              extra: dict | None = None) -> dict:
+    env = {
+        **os.environ,
+        "PATH": f"{stub_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+        "HOME": fake_home,
+        "ENGRAM_HOME": fake_engram_home,
+        # #3519 item 1: these cells run from temp dirs / worktrees.
+        "ENGRAM_SETUP_ALLOW_PATH": "1",
+    }
+    # Always clear ENGRAM_HOOKS_DIR from inherited env unless caller sets it
+    env.pop("ENGRAM_HOOKS_DIR", None)
+    if extra:
+        env.update(extra)
+    return env
 
 
 class TestSetupScriptSyntax(unittest.TestCase):
@@ -82,87 +118,61 @@ class TestOSDetection(unittest.TestCase):
         _write_stub(stub_dir, "launchctl", body)
         return str(log)
 
+    def _drive_real_installer(self, os_name: str, stub_dir: str, fake_home: str):
+        """Run the REAL installer (patched only at its PLUGIN_ROOT line, as
+        TestHooksDirResolution does) for os_name against a fake plugin layout.
+
+        Only the OS-level binaries are stubbed (uname, python3, and the
+        recording systemctl/launchctl); the render, the paths and the
+        service-manager calls are all the real script's (#3801). Returns
+        (result, fake_engram_home, call_log_path).
+        """
+        stub_path = Path(stub_dir)
+        fake_engram_home = Path(fake_home) / ".engram"
+        fake_engram_home.mkdir(parents=True, exist_ok=True)
+
+        _write_stub(stub_path, "uname", f'#!/usr/bin/env bash\necho "{os_name}"\n')
+        # The installer runs `python3 -c 'import sys; print(sys.executable)'`
+        # to fill PYTHON_BIN; the stub answers with that one line.
+        _write_stub(stub_path, "python3", '#!/usr/bin/env bash\necho "/usr/bin/python3"\n')
+        if os_name == "Linux":
+            log_path = self._systemctl_recording_stub(stub_path)
+        else:
+            log_path = self._launchctl_recording_stub(stub_path)
+
+        # Fake plugin layout (mirrors production plugin)
+        plugin_root = Path(fake_home) / "plugin"
+        template_dir = plugin_root / "templates"
+        hooks_dir = plugin_root / "hooks" / "claude"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        template_dir.mkdir(parents=True, exist_ok=True)
+        (hooks_dir / "engram-surface-daemon.py").symlink_to(DAEMON_PY)
+        for f in TEMPLATE_DIR.iterdir():
+            if f.is_file():
+                shutil.copy(f, template_dir / f.name)
+
+        patched = Path(fake_home) / "setup_patched.sh"
+        _make_patched_script(str(plugin_root), patched)
+        env = _make_env(stub_dir, fake_home, str(fake_engram_home))
+        result = subprocess.run(
+            ["bash", str(patched)],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        return result, fake_engram_home, Path(log_path)
+
     def test_linux_targets_systemd_user_dir(self):
         """On Linux, the rendered unit file must land in ~/.config/systemd/user/."""
         with tempfile.TemporaryDirectory() as stub_dir, \
              tempfile.TemporaryDirectory() as fake_home:
 
-            stub_path = Path(stub_dir)
-            fake_engram_home = Path(fake_home) / ".engram"
-            fake_engram_home.mkdir(parents=True, exist_ok=True)
-
-            # Stubs
-            _write_stub(stub_path, "uname", '#!/usr/bin/env bash\necho "Linux"\n')
-            _write_stub(stub_path, "python3", '#!/usr/bin/env bash\necho "/usr/bin/python3"\n')
-            log_path = Path(stub_dir) / "systemctl-calls.log"
-            _write_stub(
-                stub_path,
-                "systemctl",
-                textwrap.dedent(f"""\
-                    #!/usr/bin/env bash
-                    echo "$@" >> "{log_path}"
-                    exit 0
-                    """),
+            result, fake_engram_home, log_path = self._drive_real_installer(
+                "Linux", stub_dir, fake_home,
             )
-
-            # Fake plugin layout (mirrors production plugin)
-            hooks_dir = Path(fake_home) / "plugin" / "hooks" / "claude"
-            template_dir = Path(fake_home) / "plugin" / "templates"
-            tools_dir = Path(fake_home) / "plugin" / "tools"
-            hooks_dir.mkdir(parents=True, exist_ok=True)
-            template_dir.mkdir(parents=True, exist_ok=True)
-            tools_dir.mkdir(parents=True, exist_ok=True)
-            (hooks_dir / "engram-surface-daemon.py").symlink_to(DAEMON_PY)
-            # Copy templates we need
-            import shutil
-            for f in TEMPLATE_DIR.iterdir():
-                if f.is_file():
-                    shutil.copy(f, template_dir / f.name)
-
-            # Wrapper: override PLUGIN_ROOT so the script finds our fake layout
-            plugin_root = Path(fake_home) / "plugin"
-            wrapper = Path(fake_home) / "run.sh"
-            wrapper.write_text(
-                textwrap.dedent(f"""\
-                    #!/usr/bin/env bash
-                    set -euo pipefail
-                    # Override path resolution by pre-setting PLUGIN_ROOT
-                    # The real script does: PLUGIN_ROOT="$(cd "$_script_dir/.." && pwd)"
-                    # We replicate the derived vars the script uses
-                    PLUGIN_ROOT="{plugin_root}"
-                    TEMPLATE_DIR="$PLUGIN_ROOT/templates"
-                    HOOKS_DIR="$PLUGIN_ROOT/hooks/claude"
-                    ENGRAM_HOME="{fake_engram_home}"
-                    ENGRAM_VENV_PYTHON=""
-                    PYTHON_BIN="/usr/bin/python3"
-
-                    # Inline the OS-specific section from the real script
-                    OS="Linux"
-                    SERVICE_TEMPLATE="$TEMPLATE_DIR/engram-surface-daemon.service.template"
-                    SERVICE_NAME="engram-surface-daemon.service"
-                    SERVICE_DEST="$HOME/.config/systemd/user/$SERVICE_NAME"
-                    mkdir -p "$(dirname "$SERVICE_DEST")"
-                    sed -e "s|{{{{PYTHON}}}}|$PYTHON_BIN|g" \\
-                        -e "s|{{{{ENGRAM_HOOKS_DIR}}}}|$HOOKS_DIR|g" \\
-                        -e "s|{{{{ENGRAM_HOME}}}}|$ENGRAM_HOME|g" \\
-                        "$SERVICE_TEMPLATE" > "$SERVICE_DEST"
-                    systemctl --user daemon-reload
-                    systemctl --user enable --now "$SERVICE_NAME"
-                    """)
-            )
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-
-            env = {
-                **os.environ,
-                "PATH": f"{stub_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
-                "HOME": fake_home,
-                "ENGRAM_HOME": str(fake_engram_home),
-            }
-            result = subprocess.run(
-                ["bash", str(wrapper)],
-                capture_output=True,
-                text=True,
-                env=env,
+            self.assertEqual(
+                result.returncode, 0,
+                f"Real installer must succeed on Linux;\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
 
             # Check the unit file landed in the right place
@@ -172,6 +182,14 @@ class TestOSDetection(unittest.TestCase):
                 f"Linux branch must write unit to {expected_service}; got:\n{result.stdout}\n{result.stderr}",
             )
 
+            # What the real render produced: the placeholders are filled
+            unit = expected_service.read_text()
+            self.assertIn(
+                f"Environment=ENGRAM_HOME={fake_engram_home}", unit,
+                "Rendered unit must carry the substituted ENGRAM_HOME",
+            )
+            self.assertNotIn("{{", unit, "Rendered unit must have no unsubstituted placeholder")
+
             # Check systemctl was invoked
             self.assertTrue(
                 log_path.exists() and log_path.read_text().strip(),
@@ -180,90 +198,46 @@ class TestOSDetection(unittest.TestCase):
             calls = log_path.read_text()
             self.assertIn("--user", calls, "systemctl must be called with --user")
             self.assertIn("engram-surface-daemon.service", calls)
+            # The recording stub logs one `"$@"` line per call.  The real enable
+            # call must be present as a whole line: the `--user daemon-reload`
+            # line alone satisfies the substring checks above.
+            self.assertIn(
+                "--user enable --now engram-surface-daemon.service",
+                calls.splitlines(),
+                f"systemctl must be called exactly as `--user enable --now <unit>`; calls:\n{calls}",
+            )
 
     def test_darwin_targets_launchagents_dir(self):
         """On Darwin, the rendered plist must land in ~/Library/LaunchAgents/."""
         with tempfile.TemporaryDirectory() as stub_dir, \
              tempfile.TemporaryDirectory() as fake_home:
 
-            stub_path = Path(stub_dir)
-            fake_engram_home = Path(fake_home) / ".engram"
-            fake_engram_home.mkdir(parents=True, exist_ok=True)
-
-            # Stubs
-            _write_stub(stub_path, "uname", '#!/usr/bin/env bash\necho "Darwin"\n')
-            _write_stub(stub_path, "python3", '#!/usr/bin/env bash\necho "/usr/bin/python3"\n')
-            log_path = Path(stub_dir) / "launchctl-calls.log"
-            _write_stub(
-                stub_path,
-                "launchctl",
-                textwrap.dedent(f"""\
-                    #!/usr/bin/env bash
-                    echo "$@" >> "{log_path}"
-                    exit 0
-                    """),
+            # The recording launchctl stub exits 0, so the real script takes
+            # its success path (a bootstrap rc of 125 is its no-GUI exit 3).
+            result, fake_engram_home, log_path = self._drive_real_installer(
+                "Darwin", stub_dir, fake_home,
             )
-
-            # Fake plugin layout
-            import shutil
-            plugin_root = Path(fake_home) / "plugin"
-            template_dir = plugin_root / "templates"
-            hooks_dir = plugin_root / "hooks" / "claude"
-            hooks_dir.mkdir(parents=True, exist_ok=True)
-            template_dir.mkdir(parents=True, exist_ok=True)
-            (hooks_dir / "engram-surface-daemon.py").symlink_to(DAEMON_PY)
-            for f in TEMPLATE_DIR.iterdir():
-                if f.is_file():
-                    shutil.copy(f, template_dir / f.name)
+            self.assertEqual(
+                result.returncode, 0,
+                f"Real installer must succeed on Darwin;\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
 
             plist_label = "com.engram.surface-daemon"
             plist_dest = Path(fake_home) / "Library" / "LaunchAgents" / f"{plist_label}.plist"
-
-            wrapper = Path(fake_home) / "run.sh"
-            wrapper.write_text(
-                textwrap.dedent(f"""\
-                    #!/usr/bin/env bash
-                    set -euo pipefail
-                    PLUGIN_ROOT="{plugin_root}"
-                    TEMPLATE_DIR="$PLUGIN_ROOT/templates"
-                    HOOKS_DIR="$PLUGIN_ROOT/hooks/claude"
-                    ENGRAM_HOME="{fake_engram_home}"
-                    PYTHON_BIN="/usr/bin/python3"
-
-                    OS="Darwin"
-                    PLIST_TEMPLATE="$TEMPLATE_DIR/engram-surface-daemon.plist.template"
-                    PLIST_LABEL="com.engram.surface-daemon"
-                    AGENTS_DIR="$HOME/Library/LaunchAgents"
-                    PLIST_DEST="$AGENTS_DIR/$PLIST_LABEL.plist"
-                    mkdir -p "$AGENTS_DIR"
-                    sed -e "s|{{{{PYTHON}}}}|$PYTHON_BIN|g" \\
-                        -e "s|{{{{ENGRAM_HOOKS_DIR}}}}|$HOOKS_DIR|g" \\
-                        -e "s|{{{{ENGRAM_HOME}}}}|$ENGRAM_HOME|g" \\
-                        "$PLIST_TEMPLATE" > "$PLIST_DEST"
-                    launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
-                    launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST"
-                    """)
-            )
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-
-            env = {
-                **os.environ,
-                "PATH": f"{stub_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
-                "HOME": fake_home,
-                "ENGRAM_HOME": str(fake_engram_home),
-            }
-            result = subprocess.run(
-                ["bash", str(wrapper)],
-                capture_output=True,
-                text=True,
-                env=env,
-            )
 
             # Check the plist landed in the right place
             self.assertTrue(
                 plist_dest.exists(),
                 f"Darwin branch must write plist to {plist_dest}; stderr:\n{result.stderr}",
             )
+
+            # What the real render produced: the placeholders are filled
+            plist = plist_dest.read_text()
+            self.assertIn(
+                f"<string>{fake_engram_home}</string>", plist,
+                "Rendered plist must carry the substituted ENGRAM_HOME",
+            )
+            self.assertNotIn("{{", plist, "Rendered plist must have no unsubstituted placeholder")
 
             # Check launchctl was invoked with modern bootstrap API
             self.assertTrue(
@@ -274,37 +248,32 @@ class TestOSDetection(unittest.TestCase):
             self.assertIn("bootstrap", calls, "launchctl must be called with 'bootstrap' (modern API)")
             self.assertIn("bootout", calls, "launchctl must be called with 'bootout' (modern cleanup)")
             self.assertIn("com.engram.surface-daemon", calls)
+            # Whole-line pins on the real calls (the stub logs one `"$@"` line per
+            # call); substrings above would also match a wrong-domain call.
+            uid = os.getuid()
+            call_lines = calls.splitlines()
+            self.assertIn(
+                f"bootout gui/{uid}/{plist_label}", call_lines,
+                f"launchctl bootout must target gui/<uid>/<label>; calls:\n{calls}",
+            )
+            self.assertIn(
+                f"bootstrap gui/{uid} {plist_dest}", call_lines,
+                f"launchctl bootstrap must target gui/<uid> with the plist; calls:\n{calls}",
+            )
 
     def test_rendered_linux_unit_contains_idle_timeout_zero(self):
-        """The rendered systemd unit must contain ENGRAM_DAEMON_IDLE_TIMEOUT=0."""
-        with tempfile.TemporaryDirectory() as fake_home:
-            import shutil
+        """The unit the real installer renders must contain ENGRAM_DAEMON_IDLE_TIMEOUT=0."""
+        with tempfile.TemporaryDirectory() as stub_dir, \
+             tempfile.TemporaryDirectory() as fake_home:
 
-            fake_engram_home = Path(fake_home) / ".engram"
-            fake_engram_home.mkdir(parents=True, exist_ok=True)
-            plugin_root = Path(fake_home) / "plugin"
-            template_dir = plugin_root / "templates"
-            hooks_dir = plugin_root / "hooks" / "claude"
-            hooks_dir.mkdir(parents=True, exist_ok=True)
-            template_dir.mkdir(parents=True, exist_ok=True)
-            for f in TEMPLATE_DIR.iterdir():
-                if f.is_file():
-                    shutil.copy(f, template_dir / f.name)
-
-            service_template = template_dir / "engram-surface-daemon.service.template"
-            service_out = Path(fake_home) / "engram-surface-daemon.service"
-
-            subprocess.run(
-                [
-                    "sed",
-                    "-e", "s|{{PYTHON}}|/usr/bin/python3|g",
-                    "-e", f"s|{{{{ENGRAM_HOOKS_DIR}}}}|{hooks_dir}|g",
-                    "-e", f"s|{{{{ENGRAM_HOME}}}}|{fake_engram_home}|g",
-                    str(service_template),
-                ],
-                stdout=service_out.open("w"),
-                check=True,
+            result, fake_engram_home, _log = self._drive_real_installer(
+                "Linux", stub_dir, fake_home,
             )
+            self.assertEqual(
+                result.returncode, 0,
+                f"Real installer must succeed on Linux;\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            service_out = Path(fake_home) / ".config" / "systemd" / "user" / "engram-surface-daemon.service"
             content = service_out.read_text()
             self.assertIn(
                 "ENGRAM_DAEMON_IDLE_TIMEOUT=0",
@@ -318,35 +287,18 @@ class TestOSDetection(unittest.TestCase):
             )
 
     def test_rendered_plist_contains_idle_timeout_zero(self):
-        """The rendered launchd plist must contain ENGRAM_DAEMON_IDLE_TIMEOUT=0."""
-        with tempfile.TemporaryDirectory() as fake_home:
-            import shutil
+        """The plist the real installer renders must contain ENGRAM_DAEMON_IDLE_TIMEOUT=0."""
+        with tempfile.TemporaryDirectory() as stub_dir, \
+             tempfile.TemporaryDirectory() as fake_home:
 
-            fake_engram_home = Path(fake_home) / ".engram"
-            fake_engram_home.mkdir(parents=True, exist_ok=True)
-            plugin_root = Path(fake_home) / "plugin"
-            template_dir = plugin_root / "templates"
-            hooks_dir = plugin_root / "hooks" / "claude"
-            hooks_dir.mkdir(parents=True, exist_ok=True)
-            template_dir.mkdir(parents=True, exist_ok=True)
-            for f in TEMPLATE_DIR.iterdir():
-                if f.is_file():
-                    shutil.copy(f, template_dir / f.name)
-
-            plist_template = template_dir / "engram-surface-daemon.plist.template"
-            plist_out = Path(fake_home) / "com.engram.surface-daemon.plist"
-
-            subprocess.run(
-                [
-                    "sed",
-                    "-e", "s|{{PYTHON}}|/usr/bin/python3|g",
-                    "-e", f"s|{{{{ENGRAM_HOOKS_DIR}}}}|{hooks_dir}|g",
-                    "-e", f"s|{{{{ENGRAM_HOME}}}}|{fake_engram_home}|g",
-                    str(plist_template),
-                ],
-                stdout=plist_out.open("w"),
-                check=True,
+            result, fake_engram_home, _log = self._drive_real_installer(
+                "Darwin", stub_dir, fake_home,
             )
+            self.assertEqual(
+                result.returncode, 0,
+                f"Real installer must succeed on Darwin;\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            plist_out = Path(fake_home) / "Library" / "LaunchAgents" / "com.engram.surface-daemon.plist"
             content = plist_out.read_text()
             self.assertIn(
                 "ENGRAM_DAEMON_IDLE_TIMEOUT",
@@ -493,40 +445,6 @@ class TestHooksDirResolution(unittest.TestCase):
     This lets us control the layout without modifying the real source file.
     """
 
-    def _make_patched_script(self, plugin_root: str, dest: Path) -> None:
-        """Write a copy of SETUP_SCRIPT with PLUGIN_ROOT hard-coded to plugin_root."""
-        original = SETUP_SCRIPT.read_text()
-        # Replace the PLUGIN_ROOT computation line with a fixed assignment.
-        # The current line (pinned via the locale-safe helper, #3790) is:
-        #   _pinned_into PLUGIN_ROOT _cd_pwd "$_script_dir/.."
-        target = '_pinned_into PLUGIN_ROOT _cd_pwd "$_script_dir/.."'
-        # A str.replace that matches nothing is a silent no-op: PLUGIN_ROOT
-        # would then resolve from the copy's temp dir.  Fail loudly instead
-        # if the line is ever reshaped (#3794).
-        assert original.count(target) == 1, (
-            f"setup-surface-daemon-service.sh: expected the patch target "
-            f"{target!r} exactly once, found {original.count(target)}"
-        )
-        patched = original.replace(target, f'PLUGIN_ROOT="{plugin_root}"')
-        dest.write_text(patched)
-        dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-
-    def _make_env(self, stub_dir: str, fake_home: str, fake_engram_home: str,
-                  extra: dict | None = None) -> dict:
-        env = {
-            **os.environ,
-            "PATH": f"{stub_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
-            "HOME": fake_home,
-            "ENGRAM_HOME": fake_engram_home,
-            # #3519 item 1: these cells run from temp dirs / worktrees.
-            "ENGRAM_SETUP_ALLOW_PATH": "1",
-        }
-        # Always clear ENGRAM_HOOKS_DIR from inherited env unless caller sets it
-        env.pop("ENGRAM_HOOKS_DIR", None)
-        if extra:
-            env.update(extra)
-        return env
-
     def test_bundle_layout_resolves_flat_hooks_dir(self):
         """Bundle layout (flat hooks/): script resolves HOOKS_DIR to <plugin_root>/hooks,
         not hooks/claude/, and the rendered ExecStart points at the flat daemon path."""
@@ -562,9 +480,9 @@ class TestHooksDirResolution(unittest.TestCase):
 
             # Patched script with PLUGIN_ROOT fixed to our fake plugin_root
             patched = Path(fake_home) / "setup_patched.sh"
-            self._make_patched_script(str(plugin_root), patched)
+            _make_patched_script(str(plugin_root), patched)
 
-            env = self._make_env(stub_dir, fake_home, str(fake_engram_home))
+            env = _make_env(stub_dir, fake_home, str(fake_engram_home))
             result = subprocess.run(
                 ["bash", str(patched)],
                 capture_output=True,
@@ -633,9 +551,9 @@ class TestHooksDirResolution(unittest.TestCase):
             )
 
             patched = Path(fake_home) / "setup_patched.sh"
-            self._make_patched_script(str(plugin_root), patched)
+            _make_patched_script(str(plugin_root), patched)
 
-            env = self._make_env(stub_dir, fake_home, str(fake_engram_home))
+            env = _make_env(stub_dir, fake_home, str(fake_engram_home))
             result = subprocess.run(
                 ["bash", str(patched)],
                 capture_output=True,
@@ -694,9 +612,9 @@ class TestHooksDirResolution(unittest.TestCase):
             (override_dir / "engram-surface-daemon.py").symlink_to(DAEMON_PY)
 
             patched = Path(fake_home) / "setup_patched.sh"
-            self._make_patched_script(str(plugin_root), patched)
+            _make_patched_script(str(plugin_root), patched)
 
-            env = self._make_env(
+            env = _make_env(
                 stub_dir, fake_home, str(fake_engram_home),
                 extra={"ENGRAM_HOOKS_DIR": str(override_dir)},
             )
@@ -757,10 +675,10 @@ class TestHooksDirResolution(unittest.TestCase):
             # Intentionally do NOT create engram-surface-daemon.py anywhere
 
             patched = Path(fake_home) / "setup_patched.sh"
-            self._make_patched_script(str(plugin_root), patched)
+            _make_patched_script(str(plugin_root), patched)
 
             # ENGRAM_HOOKS_DIR must NOT be set
-            env = self._make_env(stub_dir, fake_home, str(fake_engram_home))
+            env = _make_env(stub_dir, fake_home, str(fake_engram_home))
             self.assertNotIn("ENGRAM_HOOKS_DIR", env)
 
             result = subprocess.run(
