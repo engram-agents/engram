@@ -1266,3 +1266,548 @@ def test_h5_supervisor_process_survives_eacces_on_the_status_directory(work):
         os.chmod(d, 0o700)
     assert "Traceback" not in err, err
     assert err.count("status not written") == 1, err
+
+
+# =====================================================================
+# #3793 -- Logger.log must not raise on ANY OSError (the log is never a
+# kill switch); #3795 -- copy advice only for a link that resolves to a
+# regular file; #3796 -- two plain reads must not block on a FIFO.
+# =====================================================================
+
+import errno
+
+needs_nonroot = pytest.mark.skipif(
+    os.geteuid() == 0, reason="root bypasses file modes: a real EACCES cannot be produced")
+
+_BROKEN_STREAM = r"""
+class Broken:
+    def __init__(self, exc): self.exc = exc
+    def write(self, s): raise self.exc
+    def flush(self): raise self.exc
+"""
+
+
+@needs_nonroot
+def test_1a_watcher_survives_an_unwritable_log_file_and_names_the_errno(work):
+    """1a: watcher.log is a regular 0o400 file (the state dir stays writable).  A
+    healthy idle watcher logs nothing, so a refused umwelt config (a FIFO) makes it
+    log: that one line must reach the degraded logger.  The real watcher stays alive
+    over many cycles, ends rc 0 on SIGTERM, stderr carries exactly ONE refusal line
+    naming EACCES and the log path, and the log line itself reaches stderr.
+    Mutations: `except OSError` removed (the watcher dies, rc 1); catching only
+    NotRegularFile; refusal on every line; no errno name; no path."""
+    log = work / "watcher.log"
+    log.write_text("")
+    os.chmod(log, 0o400)
+    cfg = work / "umwelt-fifo"
+    os.mkfifo(cfg)
+    proc = _spawn(work, _config_args(cfg))
+    try:
+        _alive_for(proc, 3.0)
+    except BaseException:
+        _kill(proc)
+        raise
+    _out, err = _end(proc)
+    assert proc.returncode == 0, err[-400:]
+    assert "Traceback" not in err, err
+    lines = err.splitlines()
+    refusals = [ln for ln in lines if "log write failed" in ln]
+    assert len(refusals) == 1, lines
+    assert "EACCES" in refusals[0] and str(log) in refusals[0], refusals
+    logged = [ln for ln in lines if "not a regular file (FIFO)" in ln and "log write failed" not in ln]
+    assert len(logged) == 1 and str(cfg) in logged[0], lines
+    assert log.read_text() == ""
+
+
+@needs_nonroot
+def test_1b_logger_recovers_when_the_file_becomes_writable_and_reports_again(work):
+    """1b: refused (0o400) -> chmod 0o600 -> the next line lands in the FILE and
+    degraded is False -> 0o400 again -> the refusal is reported AGAIN.
+    Mutations: the reported flag never resets; degraded never cleared."""
+    r = child(WAKE, work, r"""
+log = Path(tmp) / "watcher.log"
+log.write_text(""); os.chmod(log, 0o400)
+lg = m.Logger(log, stdout=False)
+lg.log("one"); d1 = lg.degraded
+os.chmod(log, 0o600)
+lg.log("two"); d2 = lg.degraded
+os.chmod(log, 0o400)
+lg.log("three"); d3 = lg.degraded
+result = {"d": [d1, d2, d3], "text": log.read_text()}
+""")
+    assert r["d"] == [True, False, True]
+    assert r["text"].count("two") == 1 and "one" not in r["text"] and "three" not in r["text"]
+    err = r["_stderr"].splitlines()
+    assert sum("log write failed" in ln for ln in err) == 2, err
+    assert sum("two" in ln for ln in err) == 0
+
+
+@pytest.mark.parametrize("name", ["ENOSPC", "EROFS", "EDQUOT", "EIO", "EACCES"])
+def test_1c_logger_never_raises_on_any_oserror_and_names_that_errno(work, name):
+    """1c: the file append raises OSError(errno.X): Logger.log returns, the line goes
+    to stderr, and the refusal line carries THAT errno's name and the path.
+    Mutations: catch only EACCES (or EACCES+ENOSPC): the others propagate; the
+    refusal line without the errno name; without the path."""
+    r = child(WAKE, work, r"""
+import errno
+def boom(path, line): raise OSError(getattr(errno, sys.argv[3]), "injected")
+m.append_regular_line = boom
+lg = m.Logger(Path(tmp) / "watcher.log", stdout=False)
+lg.log("the-line")
+result = {"degraded": lg.degraded}
+""".replace("sys.argv[3]", repr(name)))
+    assert r["degraded"] is True
+    err = r["_stderr"].splitlines()
+    refusal = [ln for ln in err if "log write failed" in ln]
+    assert len(refusal) == 1, err
+    assert name in refusal[0] and str(work / "watcher.log") in refusal[0], refusal
+    assert sum("the-line" in ln for ln in err) == 1
+    others = {"ENOSPC", "EROFS", "EDQUOT", "EIO", "EACCES"} - {name}
+    assert not any(o in refusal[0] for o in others)
+
+
+@pytest.mark.parametrize("case,exc_src,expect", [
+    ("no-errno", 'OSError("boom")', "OSError"),
+    ("unmapped-errno", 'OSError(9999, "weird")', "errno 9999"),
+])
+def test_1c_logger_names_an_oserror_without_a_mapped_errno(work, case, exc_src, expect):
+    """1c: the append raises an OSError whose errno is None, or one absent from
+    errno.errorcode: Logger.log still returns, stderr carries ONE refusal line naming
+    the class (`OSError`) / `errno 9999` plus the log path, and the data line.
+    Mutation: `errno.errorcode[exc.errno]` (KeyError out of the log call)."""
+    r = child(WAKE, work, r"""
+def boom(path, line): raise EXC_SRC
+m.append_regular_line = boom
+lg = m.Logger(Path(tmp) / "watcher.log", stdout=False)
+lg.log("the-line")
+result = {"degraded": lg.degraded}
+""".replace("EXC_SRC", exc_src))
+    assert r["degraded"] is True
+    err = r["_stderr"].splitlines()
+    refusal = [ln for ln in err if "log write failed" in ln]
+    assert len(refusal) == 1, err
+    assert expect in refusal[0] and str(work / "watcher.log") in refusal[0], refusal
+    assert sum("the-line" in ln for ln in err) == 1, err
+
+
+def test_1d_refusal_is_reported_once_across_consecutive_failures(work):
+    """1d: 5 failing calls -> ONE refusal line and 5 log lines on stderr.
+    Mutation: the refusal printed on every failing call."""
+    r = child(WAKE, work, r"""
+import errno
+def boom(path, line): raise OSError(errno.EACCES, "injected")
+m.append_regular_line = boom
+lg = m.Logger(Path(tmp) / "watcher.log", stdout=False)
+for i in range(5):
+    lg.log(f"message-{i}")
+result = {}
+""")
+    err = r["_stderr"].splitlines()
+    assert sum("log write failed" in ln for ln in err) == 1, err
+    for i in range(5):
+        assert sum(f"message-{i}" in ln for ln in err) == 1, err
+
+
+@pytest.mark.parametrize("stream", ["epipe", "closed"])
+@pytest.mark.parametrize("path_kind", ["fifo", "eacces"])
+def test_1e_a_broken_stderr_drops_the_line_silently(work, stream, path_kind):
+    """1e: the stderr fallback itself never raises (a write raising EPIPE; a closed
+    file raising ValueError), for a NotRegularFile path and an injected EACCES path.
+    Mutations: the fallback print unguarded (each stream kind separately)."""
+    r = child(WAKE, work, _BROKEN_STREAM + r"""
+import errno, io
+if SK == "fifo":
+    os.mkfifo(Path(tmp) / "watcher.log")
+else:
+    def boom(path, line): raise OSError(errno.EACCES, "injected")
+    m.append_regular_line = boom
+lg = m.Logger(Path(tmp) / "watcher.log", stdout=False)
+real = sys.stderr
+if ST == "epipe":
+    sys.stderr = Broken(OSError(errno.EPIPE, "broken pipe"))
+else:
+    f = io.StringIO(); f.close(); sys.stderr = f
+lg.log("a"); lg.log("b")
+sys.stderr = real
+result = {"degraded": lg.degraded}
+""".replace("SK", repr(path_kind)).replace("ST", repr(stream)))
+    assert r["degraded"] is True
+
+
+@pytest.mark.parametrize("stream", ["epipe", "closed"])
+def test_1e_a_broken_stdout_echo_never_raises(work, stream):
+    """1e: stdout=True with a broken stdout (and a healthy log): Logger.log returns.
+    Mutation: the stdout echo unguarded."""
+    r = child(WAKE, work, _BROKEN_STREAM + r"""
+import errno, io
+lg = m.Logger(Path(tmp) / "watcher.log", stdout=True)
+real = sys.stdout
+if ST == "epipe":
+    sys.stdout = Broken(OSError(errno.EPIPE, "broken pipe"))
+else:
+    f = io.StringIO(); f.close(); sys.stdout = f
+lg.log("a"); lg.log("b")
+sys.stdout = real
+result = {"text": (Path(tmp) / "watcher.log").read_text()}
+""".replace("ST", repr(stream)))
+    assert r["text"].count("\n") == 2
+
+
+def test_1c_notregularfile_message_is_unchanged_and_wins_over_the_oserror_clause(work):
+    """The NotRegularFile clause stays FIRST: a FIFO log still says `log file <path> is
+    a FIFO, not a regular file`, not the generic OSError line.  Mutation: `except
+    OSError` placed before `except NotRegularFile`."""
+    os.mkfifo(work / "watcher.log")
+    r = child(WAKE, work, r"""
+lg = m.Logger(Path(tmp) / "watcher.log", stdout=False)
+lg.log("x")
+result = {}
+""")
+    err = r["_stderr"]
+    assert "log file " in err and "is a FIFO, not a regular file" in err, err
+    assert "log write failed" not in err
+
+
+# ---- #3795 ---------------------------------------------------------------
+
+def _plant_state_case(work, case):
+    real = work / "real-state.json"
+    real.write_text(json.dumps(QUEUE_STATE))
+    state = work / "state.json"
+    if case == "link-reg":
+        os.symlink(real, state)
+    elif case == "link-chain":
+        os.symlink(real, work / "mid")
+        os.symlink(work / "mid", state)
+    elif case == "hardlink":
+        os.link(real, state)
+    elif case == "link-fifo":
+        os.mkfifo(work / "tf")
+        os.symlink(work / "tf", state)
+    elif case == "link-dir":
+        os.mkdir(work / "td")
+        os.symlink(work / "td", state)
+    elif case == "link-dangling":
+        os.symlink(work / "nowhere", state)
+    elif case == "link-loop":
+        os.symlink(work / "loopb", state)
+        os.symlink(state, work / "loopb")
+
+
+COPY_CASES = ["link-reg", "link-chain", "hardlink"]
+REMOVE_CASES = ["link-fifo", "link-dir", "link-dangling", "link-loop"]
+
+
+@pytest.mark.parametrize("case", COPY_CASES + REMOVE_CASES)
+def test_2_state_advice_copy_only_when_the_link_resolves_to_a_regular_file(work, case):
+    """2a-2g, from the REAL watcher's log line: a symlink (also a chain) or hard link
+    that ends at a regular file keeps the `cp --` advice; a symlink to a FIFO /
+    directory, a dangling link and a loop get `Remove it to resume` and no `cp --`.
+    A hang in the advice is a missing line -> failure after 8 s.  Mutations: advice
+    for every symlink; os.lstat for os.stat (chain); exists() for S_ISREG; the
+    target opened to test it; the hard-link kind losing the advice."""
+    _plant_state_case(work, case)
+    proc = _spawn(work)
+    try:
+        line = _await_idle_line(work)
+        assert proc.poll() is None
+    finally:
+        _kill(proc)
+    if case in COPY_CASES:
+        assert "cp -- " in line and REMOVE_ADVICE not in line, line
+    else:
+        assert "cp --" not in line and REMOVE_ADVICE in line, line
+
+
+@pytest.mark.parametrize("case", ["link-fifo", "link-dangling", "link-loop", "link-dir"])
+def test_2_state_refusal_advice_function_returns_for_unresolvable_links(work, case):
+    """The function itself, in a child with a hard bound: it returns the remove advice,
+    never raises, never blocks.  Mutation: the target opened (hangs on the FIFO)."""
+    _plant_state_case(work, case)
+    r = child(WAKE, work, r"""
+p = os.path.join(tmp, "state.json")
+exc = m.NotRegularFile(p, os.lstat(p).st_mode)
+result = {"kind": exc.kind, "advice": m.state_refusal_advice(m.StateRefused("read", exc))}
+""")
+    assert r["kind"] == "symlink"
+    assert r["advice"] == REMOVE_ADVICE
+
+
+# ---- #3796 ---------------------------------------------------------------
+
+def _marker(path, session_id="sess-1"):
+    path.write_text(json.dumps({"session_id": session_id, "role": "interactive",
+                                "transcript_path": "/x/.codex/sessions/t.jsonl",
+                                "started_at": "2026-01-01T00:00:00+00:00"}))
+
+
+def test_3a_list_session_candidates_skips_a_fifo_marker_silently(work):
+    """3a: a valid marker and a FIFO named x.json: returns within the bound, lists the
+    valid marker, prints nothing; no reader ever opened the FIFO side (a writer-less
+    FIFO still refuses a non-blocking write-open).  Mutations: read_text restored
+    (hangs); a FIFO marker reported."""
+    sd = work / "sessions"
+    sd.mkdir()
+    _marker(sd / "ok.json")
+    os.mkfifo(sd / "x.json")
+    r = child(WAKE, work, r"""
+cands = m.list_session_candidates(Path(tmp) / "sessions")
+result = {"ids": [c.thread_id for c in cands]}
+""")
+    assert r["ids"] == ["sess-1"]
+    assert r["_stderr"] == ""
+    with pytest.raises(OSError) as ei:
+        os.open(sd / "x.json", os.O_WRONLY | os.O_NONBLOCK)
+    assert ei.value.errno == errno.ENXIO
+
+
+def test_3b_list_session_candidates_follows_symlinks_and_skips_directories(work):
+    """3b: a symlinked marker still lists; a directory named d.json is skipped.
+    Mutation: a non-following reader (the symlink marker vanishes)."""
+    sd = work / "sessions"
+    sd.mkdir()
+    _marker(work / "real-marker.dat", "via-link")
+    os.symlink(work / "real-marker.dat", sd / "link.json")
+    os.mkdir(sd / "d.json")
+    r = child(WAKE, work, r"""
+cands = m.list_session_candidates(Path(tmp) / "sessions")
+result = {"ids": [c.thread_id for c in cands]}
+""")
+    assert r["ids"] == ["via-link"]
+    assert r["_stderr"] == ""
+
+
+def test_3a_list_session_candidates_survives_a_marker_that_vanishes_after_the_read(work):
+    """3a: a marker that reads fine but whose stat() then raises FileNotFoundError
+    (it vanished between the read and the recency stat): the function returns the other
+    valid markers and does not raise.  Mutation: the unguarded `path.stat()` in the
+    candidate's recency tuple (FileNotFoundError escapes)."""
+    sd = work / "sessions"
+    sd.mkdir()
+    _marker(sd / "ok.json")
+    _marker(sd / "gone.json", "gone-id")
+    r = child(WAKE, work, r"""
+gone = str(Path(tmp) / "sessions" / "gone.json")
+real_stat = Path.stat
+calls = []
+def fake_stat(self, *a, **kw):
+    if str(self) == gone:
+        calls.append(1)
+        raise FileNotFoundError(2, "vanished", gone)
+    return real_stat(self, *a, **kw)
+Path.stat = fake_stat
+try:
+    cands = m.list_session_candidates(Path(tmp) / "sessions")
+    out = {"exc": None, "ids": [c.thread_id for c in cands]}
+except BaseException as exc:
+    out = {"exc": type(exc).__name__, "ids": None}
+finally:
+    Path.stat = real_stat
+out["calls"] = len(calls)
+result = out
+""")
+    assert r["exc"] is None, r
+    assert r["ids"] == ["sess-1"], r
+    assert r["calls"] >= 1, r
+
+
+@pytest.mark.parametrize("kind", ["fifo", "dir"])
+def test_3c_load_umwelt_context_reports_a_non_regular_config(work, kind):
+    """3c: a FIFO / directory config: no hang, raises NotRegularFile naming the kind.
+    Mutations: read_text restored (hangs); NotRegularFile swallowed inside."""
+    plant(kind, work / "cfg.json")
+    r = child(WAKE, work, r"""
+try:
+    m.load_umwelt_context(Path(tmp) / "cfg.json")
+    out = {"exc": None}
+except m.NotRegularFile as exc:
+    out = {"exc": "NotRegularFile", "kind": exc.kind, "path": exc.path}
+result = out
+""")
+    assert r["exc"] == "NotRegularFile", r
+    assert r["kind"] == KIND_WORD[kind] and r["path"] == str(work / "cfg.json")
+
+
+def test_3c_load_umwelt_context_unchanged_for_missing_corrupt_and_symlinked(work):
+    """3c: missing -> None; corrupt -> None; a symlink to a valid config -> the
+    context; a symlink to a FIFO reports as a FIFO.  Mutation: a non-following reader."""
+    (work / "corrupt.json").write_text("{not json")
+    (work / "valid.json").write_text(json.dumps({"agent": "Tester", "world_url": "http://w/"}))
+    os.symlink(work / "valid.json", work / "link.json")
+    os.mkfifo(work / "tf")
+    os.symlink(work / "tf", work / "linkfifo.json")
+    r = child(WAKE, work, r"""
+def go(name):
+    try:
+        c = m.load_umwelt_context(Path(tmp) / name)
+        return None if c is None else [c.self_name, c.world_url]
+    except m.NotRegularFile as exc:
+        return "NRF:" + exc.kind
+result = {n: go(n) for n in ("missing.json", "corrupt.json", "link.json", "linkfifo.json")}
+""")
+    assert r["missing.json"] is None and r["corrupt.json"] is None
+    assert r["link.json"] == ["tester", "http://w"]
+    assert r["linkfifo.json"] == "NRF:FIFO"
+
+
+def test_3c_load_umwelt_context_stats_the_config_once(work):
+    """3c: the decision comes from ONE stat.  A path that reads as a FIFO on the
+    first stat and is gone on the second still reports NotRegularFile (FIFO), never
+    FileNotFoundError, and the config path is stat'ed exactly once.  Mutation: a
+    second os.stat after the kind check (the FileNotFoundError escapes)."""
+    r = child(WAKE, work, r"""
+import stat as _stat
+target = os.path.join(tmp, "cfg.json")
+real_stat = os.stat
+calls = []
+def fake_stat(p, *a, **kw):
+    if str(p) != target:
+        return real_stat(p, *a, **kw)
+    calls.append(1)
+    if len(calls) == 1:
+        return os.stat_result((_stat.S_IFIFO | 0o600, 1, 1, 1, 0, 0, 0, 0, 0, 0))
+    raise FileNotFoundError(2, "gone", target)
+os.stat = fake_stat
+try:
+    m.load_umwelt_context(Path(target))
+    out = {"exc": None}
+except m.NotRegularFile as exc:
+    out = {"exc": "NotRegularFile", "kind": exc.kind}
+except BaseException as exc:
+    out = {"exc": type(exc).__name__}
+finally:
+    os.stat = real_stat
+out["calls"] = len(calls)
+result = out
+""")
+    assert r["exc"] == "NotRegularFile", r
+    assert r["kind"] == "FIFO" and r["calls"] == 1, r
+
+
+def _config_args(cfg):
+    return ("--umwelt-config", str(cfg))
+
+
+def _await(pred, timeout=8.0, what="condition"):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        got = pred()
+        if got:
+            return got
+        time.sleep(0.1)
+    pytest.fail(f"{what} not reached within {timeout}s")
+
+
+def _cfg_reports(work):
+    return [ln for ln in _log_lines(work) if "umwelt config" in ln and "not a regular file" in ln]
+
+
+def _status(work):
+    try:
+        return json.loads((work / "status.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def test_3d_watcher_with_a_fifo_umwelt_config_reports_once_and_waits(work):
+    """3d: the real watcher with --umwelt-config <FIFO>: alive over many cycles, ONE
+    log line naming path + kind, status waiting_for_umwelt with path/kind in detail,
+    rc 0 on SIGTERM.  Mutations: read_text restored (hangs, no cycle); NotRegularFile
+    swallowed (no report); reported every cycle; run_cycle re-raises (the watcher
+    dies, mode never waiting)."""
+    cfg = work / "umwelt-fifo"
+    os.mkfifo(cfg)
+    proc = _spawn(work, _config_args(cfg))
+    try:
+        _alive_for(proc, 3.0)
+        st = _status(work)
+    except BaseException:
+        _kill(proc)
+        raise
+    _out, err = _end(proc)
+    assert proc.returncode == 0, err[-400:]
+    assert "Traceback" not in err, err
+    reports = _cfg_reports(work)
+    assert len(reports) == 1, _log_lines(work)
+    assert str(cfg) in reports[0] and "FIFO" in reports[0]
+    assert st.get("mode") == "waiting_for_umwelt", st
+    assert str(cfg) in st["detail"] and "FIFO" in st["detail"], st
+    # Nobody opened the FIFO: a non-blocking write-open still finds no reader.
+    with pytest.raises(OSError) as ei:
+        os.open(cfg, os.O_WRONLY | os.O_NONBLOCK)
+    assert ei.value.errno == errno.ENXIO
+
+
+def test_3e_config_report_follows_transitions(work):
+    """3e: FIFO reported; removed (config missing) -> no new report; FIFO planted again
+    -> reported AGAIN; replaced with a valid config -> the polling path runs.
+    Mutations: flag never reset (no second report); reported every cycle."""
+    cfg = work / "umwelt.json"
+    os.mkfifo(cfg)
+    proc = _spawn(work, _config_args(cfg))
+    try:
+        _await(lambda: _cfg_reports(work), what="first report")
+        os.unlink(cfg)
+        time.sleep(1.2)
+        assert len(_cfg_reports(work)) == 1
+        os.mkfifo(cfg)
+        _await(lambda: len(_cfg_reports(work)) == 2, what="second report")
+        time.sleep(1.0)
+        assert len(_cfg_reports(work)) == 2
+        os.unlink(cfg)
+        cfg.write_text(json.dumps({"agent": "tester", "world_url": "http://127.0.0.1:1"}))
+        _await(lambda: any("umwelt poll failed" in ln for ln in _log_lines(work)),
+               what="the polling path after a valid config")
+        assert proc.poll() is None
+        assert len(_cfg_reports(work)) == 2
+    finally:
+        _kill(proc)
+
+
+def test_3f_config_and_state_refusals_do_not_suppress_each_other(work):
+    """3f: config FIFO reported first, THEN the state file becomes a FIFO: the state
+    refusal is reported too; and the other way round (state refused first, repaired,
+    then the config FIFO is reported).  Mutation: one shared flag."""
+    cfg = work / "umwelt.json"
+    os.mkfifo(cfg)
+    proc = _spawn(work, _config_args(cfg))
+    try:
+        _await(lambda: _cfg_reports(work), what="config report")
+        if (work / "state.json").exists():
+            os.unlink(work / "state.json")
+        os.mkfifo(work / "state.json")
+        _await(lambda: [ln for ln in _log_lines(work) if "idling, will recheck" in ln],
+               what="state report after the config report")
+    finally:
+        _kill(proc)
+
+
+def test_3f_state_refused_first_then_config_is_still_reported(work):
+    """3f (reverse): state FIFO reported (idle), repaired, then the config FIFO is
+    reported on the cycle that runs.  Mutation: one shared flag that the state
+    refusal sets and nothing clears for the config."""
+    cfg = work / "umwelt.json"
+    os.mkfifo(cfg)
+    os.mkfifo(work / "state.json")
+    proc = _spawn(work, _config_args(cfg))
+    try:
+        _await(lambda: [ln for ln in _log_lines(work) if "idling, will recheck" in ln],
+               what="state report")
+        assert _cfg_reports(work) == []
+        os.unlink(work / "state.json")
+        _await(lambda: _cfg_reports(work), what="config report after the state repaired")
+    finally:
+        _kill(proc)
+
+
+def test_3g_regular_config_behaves_as_before(work):
+    """3g: a regular config: no config report, the poll path runs."""
+    cfg = work / "umwelt.json"
+    cfg.write_text(json.dumps({"agent": "tester", "world_url": "http://127.0.0.1:1"}))
+    proc = _spawn(work, _config_args(cfg))
+    try:
+        _await(lambda: any("umwelt poll failed" in ln for ln in _log_lines(work)), what="poll")
+        assert _cfg_reports(work) == []
+        assert _status(work).get("mode") != "waiting_for_umwelt" or "poll failed" in _status(work).get("detail", "")
+    finally:
+        _kill(proc)

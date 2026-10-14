@@ -42,6 +42,7 @@ import argparse
 import base64
 from collections import deque
 import contextlib
+import errno
 import hashlib
 import json
 import math
@@ -51,6 +52,7 @@ import secrets
 import shlex
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -213,14 +215,33 @@ class Logger:
             self.degraded = False
             self._refusal_reported = False
         except NotRegularFile as exc:
-            self.degraded = True
+            self._degrade(f"codex-umwelt-wake: log file {exc}; writing log lines to stderr instead", line)
+        except OSError as exc:
+            # #3793: ANY other failure of the append (EACCES, ENOSPC, EROFS, EDQUOT,
+            # EIO ...) degrades the same way: a log is never a kill switch.
+            if exc.errno is None:
+                what = type(exc).__name__
+            else:
+                what = errno.errorcode.get(exc.errno, f"errno {exc.errno}")
+            self._degrade(f"codex-umwelt-wake: log write failed: {what} on {self.path}; "
+                          f"writing log lines to stderr instead", line)
+        if self.stdout:
+            try:
+                print(line, flush=True)
+            except (OSError, ValueError):
+                pass  # a broken stdout must not end the watcher either
+
+    def _degrade(self, refusal: str, line: str) -> None:
+        """Send `line` to stderr and report `refusal` once per transition. The
+        stderr fallback never raises: a closed or broken stderr drops the line."""
+        self.degraded = True
+        try:
             if not self._refusal_reported:
                 self._refusal_reported = True
-                print(f"codex-umwelt-wake: log file {exc}; writing log lines to stderr instead",
-                      file=sys.stderr, flush=True)
+                print(refusal, file=sys.stderr, flush=True)
             print(line, file=sys.stderr, flush=True)
-        if self.stdout:
-            print(line, flush=True)
+        except (OSError, ValueError):
+            pass
 
 
 def utc_now() -> str:
@@ -276,6 +297,16 @@ class StateRefused(BaseException):
         self.exc = exc
 
 
+def _resolves_to_regular_file(path: str) -> bool:
+    """True only when `path` (following the whole symlink chain) is a regular file.
+    os.stat never opens the target, so a link to a FIFO cannot block here (#3795);
+    a dangling link, a loop or an unreadable link is not a regular file."""
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
 def state_refusal_advice(refused: "StateRefused") -> str:
     """The operator's next step for a refused state file, by what the path IS.
 
@@ -285,8 +316,15 @@ def state_refusal_advice(refused: "StateRefused") -> str:
     refusal of those two kinds gets a ready-to-run copy-and-replace command (one
     line; 'run: ' to '; removing it instead' is the command, for tests and
     operators alike). A FIFO, directory, socket (nothing to keep) and any WRITE
-    refusal (the .tmp path holds no state) keep 'Remove it to resume'."""
-    if refused.op == "read" and refused.exc.kind in ("symlink", "hard-linked file"):
+    refusal (the .tmp path holds no state) keep 'Remove it to resume'.
+
+    A symlink gets the copy advice ONLY when it resolves (the whole chain) to a
+    regular file. A dangling link, a link loop, or a link to a FIFO, directory or
+    other non-regular target gets 'Remove it to resume' like the other non-regular
+    kinds: there is no state behind it to copy."""
+    if refused.op == "read" and (
+            refused.exc.kind == "hard-linked file"
+            or (refused.exc.kind == "symlink" and _resolves_to_regular_file(refused.exc.path))):
         p = shlex.quote(refused.exc.path)
         new = shlex.quote(refused.exc.path + ".new")
         return (f"Replace it with a regular copy of its content, run: "
@@ -869,8 +907,18 @@ def has_non_heartbeat_event(events: list[dict[str, Any]]) -> bool:
 
 
 def load_umwelt_context(path: Path) -> UmweltContext | None:
+    # #3796: a FIFO config would block a plain read forever. One os.stat (follows
+    # symlinks, never opens) decides: an unstat-able path is "not configured"; a
+    # non-regular one is raised (not folded into None) so run_cycle can report it
+    # once, from that same result (a second stat could race a vanished path).
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        raise NotRegularFile(path, st.st_mode)
+    try:
+        data = json.loads(read_regular_text(path, encoding="utf-8"))
     except Exception:
         return None
     if not isinstance(data, dict):
@@ -1109,7 +1157,7 @@ def list_session_candidates(sessions_dir: Path) -> list[SessionCandidate]:
     candidates: list[SessionCandidate] = []
     for path in sessions_dir.glob("*.json"):
         try:
-            marker = json.loads(path.read_text(encoding="utf-8"))
+            marker = json.loads(read_regular_text(path, encoding="utf-8"))
         except Exception:
             continue
         if not isinstance(marker, dict):
@@ -1127,12 +1175,16 @@ def list_session_candidates(sessions_dir: Path) -> list[SessionCandidate]:
             transcript_mtime = transcript.stat().st_mtime
         except OSError:
             transcript_mtime = 0.0
+        try:
+            marker_mtime = path.stat().st_mtime
+        except OSError:
+            continue  # the marker itself vanished after the read: nothing to list
         candidates.append(
             SessionCandidate(
                 thread_id=session_id,
                 marker_path=path,
                 transcript_path=transcript,
-                recency=(parse_started_at(marker), transcript_mtime, path.stat().st_mtime),
+                recency=(parse_started_at(marker), transcript_mtime, marker_mtime),
             )
         )
     candidates.sort(key=lambda item: item.recency, reverse=True)
@@ -2498,7 +2550,12 @@ def run_cycle(
     logger: Logger,
     started_at: str,
     codex_monitor: CodexItemCompletedMonitor | None = None,
+    refusal_flags: set[str] | None = None,
 ) -> dict[str, Any]:
+    # refusal_flags: per-SUBJECT "already reported" marks, carried across cycles by
+    # cmd_run; None (a one-off call) reports on every call.
+    if refusal_flags is None:
+        refusal_flags = set()
     try:
         loaded_state = load_json(paths.state_path, default_state())
     except NotRegularFile as exc:
@@ -2525,8 +2582,19 @@ def run_cycle(
         }
     )
 
-    context = load_umwelt_context(umwelt_config)
-    umwelt_detail = None if context is not None else f"missing or invalid {umwelt_config}"
+    try:
+        context = load_umwelt_context(umwelt_config)
+    except NotRegularFile as exc:
+        # #3796: a non-regular umwelt config is "umwelt not configured", reported
+        # once per transition; the cycle continues as for a missing config.
+        context = None
+        umwelt_detail = f"umwelt config {exc.path} is not a regular file ({exc.kind})"
+        if "umwelt_config" not in refusal_flags:
+            refusal_flags.add("umwelt_config")
+            logger.log(f"codex-umwelt-wake: {umwelt_detail}; treating umwelt as not configured")
+    else:
+        refusal_flags.discard("umwelt_config")
+        umwelt_detail = None if context is not None else f"missing or invalid {umwelt_config}"
 
     try:
         if codex_monitor is not None:
@@ -2652,6 +2720,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     exit_code = 0
     state_refusal_reported = False
+    refusal_flags: set[str] = set()
     try:
         while True:
             try:
@@ -2664,6 +2733,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     logger=logger,
                     started_at=started_at,
                     codex_monitor=codex_monitor,
+                    refusal_flags=refusal_flags,
                 )
                 state_refusal_reported = False
             except StateRefused as refused:
