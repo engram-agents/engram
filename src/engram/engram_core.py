@@ -412,6 +412,185 @@ _db_setup_done_paths: set[str] = set()
 _db_setup_lock = threading.Lock()
 
 
+# ── #3767: cross-process lock around the one-time DB setup ──────────────────
+# _db_setup_lock above only serializes THREADS of one process. The setup is
+# not one SQLite transaction (it opens with executescript, which COMMITs,
+# commits between steps, and writes a pre-migration backup FILE mid-way), so
+# a BEGIN IMMEDIATE cannot span it: the first internal commit releases the
+# write lock and a second process walks in mid-setup. Two processes starting
+# at once (e.g. the flag-OFF session-start path and the MCP server) therefore
+# could both run a rung -- measured: doubled edit_history rows and a doubled
+# pre-migration backup. An exclusive flock on a sidecar file serializes the
+# WHOLE setup instead, and the kernel releases it when the holder dies, so a
+# crashed holder cannot leave a stale lock.
+#
+# Two caller classes, chosen explicitly by the caller (never guessed):
+#   "hook"   -- a harness-budgeted hook fire. Try the lock for at most
+#               SETUP_LOCK_HOOK_WAIT_S; still held -> raise DbSetupLockBusy
+#               (the hook skips its DB-dependent blocks for this fire).
+#   "server" -- MCP server start, CLI, anything without a harness budget
+#               (the DEFAULT). Wait up to SETUP_LOCK_SERVER_WAIT_S, logging
+#               to stderr every SETUP_LOCK_LOG_INTERVAL_S; then
+#               DbSetupLockTimeout.
+# Neither class ever runs the setup unlocked. 600 s rests on two seats' rung-4
+# re-embed timings at <= 11k nodes; a larger store or a slower embedder can
+# exceed it, and then the server fails loud rather than hanging.
+SETUP_LOCK_SUFFIX = ".setup.lock"
+SETUP_LOCK_HOOK_WAIT_S = 2
+SETUP_LOCK_SERVER_WAIT_S = 600
+SETUP_LOCK_LOG_INTERVAL_S = 15
+_SETUP_LOCK_POLL_S = 0.05
+SETUP_WAIT_HOOK = "hook"
+SETUP_WAIT_SERVER = "server"
+
+
+class DbSetupLockError(RuntimeError):
+    """Base for the setup-lock failures. The setup did NOT run."""
+
+
+class DbSetupLockBusy(DbSetupLockError):
+    """HOOK class: the setup lock was still held after SETUP_LOCK_HOOK_WAIT_S."""
+
+
+class DbSetupLockTimeout(DbSetupLockError):
+    """SERVER class: the setup lock was still held after SETUP_LOCK_SERVER_WAIT_S."""
+
+
+class DbSetupLockUnusable(DbSetupLockError):
+    """The lock file could not be opened or flocked; setup refused to run unlocked."""
+
+
+def _read_setup_lock_holder_pid(fd: int) -> str:
+    """Best-effort holder pid from the lock file. Informational only -- never
+    liveness (the flock is the truth). "unknown" if unreadable or not yet written."""
+    try:
+        parts = os.pread(fd, 64, 0).decode("ascii", "replace").split()
+        return parts[0] if parts else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _acquire_db_setup_lock(setup_wait: str) -> int:
+    """Take the exclusive cross-process setup lock; return the open fd.
+
+    The caller MUST pass the fd to _release_db_setup_lock in a finally. Raises
+    DbSetupLockBusy / DbSetupLockTimeout / DbSetupLockUnusable (all
+    DbSetupLockError) and NEVER degrades to running unlocked -- deliberately
+    NOT _with_state_lock's degrade-to-unlocked path: proceeding without the
+    lock IS the race this lock exists to close.
+    """
+    if setup_wait == SETUP_WAIT_HOOK:
+        wait_s, is_hook = SETUP_LOCK_HOOK_WAIT_S, True
+    elif setup_wait == SETUP_WAIT_SERVER:
+        wait_s, is_hook = SETUP_LOCK_SERVER_WAIT_S, False
+    else:
+        raise ValueError(
+            f"setup_wait must be {SETUP_WAIT_HOOK!r} or {SETUP_WAIT_SERVER!r}, got {setup_wait!r}"
+        )
+    lock_path = str(DB_PATH) + SETUP_LOCK_SUFFIX
+    fd = None
+    try:
+        import fcntl
+        import stat as _stat
+
+        # Always 0600, NOT mirrored from the store: flock works on a read-only
+        # fd, so any account that can open the lock file could hold the lock
+        # and stall every start for up to SETUP_LOCK_SERVER_WAIT_S. The file
+        # carries only a pid. O_NOFOLLOW: a symlink at the lock path would
+        # otherwise pass the fstat check below and let the holder ftruncate
+        # whatever it points at (e.g. the store); ELOOP -> Unusable.
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            raise OSError("not a regular file")
+        if st.st_nlink != 1:
+            # A hard link shares the inode: O_NOFOLLOW and S_ISREG both pass,
+            # and the fchmod / holder ftruncate + pid write below would land on
+            # whatever else names it (e.g. the store). Checked on the fd, before
+            # any write; same check as engram_regular_io.write_pidfile.
+            raise OSError(
+                f"{st.st_nlink} hard links (expected exactly 1); this usually "
+                "means the ENGRAM home was copied with hard links (e.g. "
+                "`cp -al` or `rsync --link-dest`). The lock file holds no "
+                "data, and deleting it removes only this name, never the "
+                "other link's data: with ENGRAM stopped, delete "
+                f"{lock_path} and it is recreated on the next start"
+            )
+        if _stat.S_IMODE(st.st_mode) != 0o600:
+            # os.open's mode is umask-filtered and ignored for an existing
+            # file; fchmod makes the 0600 invariant hold regardless. If we
+            # cannot (not our file), refuse rather than lock under a file
+            # other accounts can hold.
+            os.fchmod(fd, 0o600)
+    except Exception as exc:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        raise DbSetupLockUnusable(
+            f"cannot use setup lock file {lock_path}: {type(exc).__name__}: {exc}; "
+            f"refusing to run the one-time DB setup without it"
+        ) from exc
+
+    deadline = time.monotonic() + wait_s
+    next_log = 0.0
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                pass  # EWOULDBLOCK/EAGAIN: held by another process -- wait below
+            now = time.monotonic()
+            holder = _read_setup_lock_holder_pid(fd)
+            if now >= deadline:
+                if is_hook:
+                    raise DbSetupLockBusy(
+                        f"ENGRAM is upgrading its store in another process (pid {holder}); "
+                        f"memory blocks skipped this time"
+                    )
+                raise DbSetupLockTimeout(
+                    f"timed out after {wait_s}s waiting for setup lock {lock_path} held by "
+                    f"pid {holder}; the store was left untouched"
+                )
+            if not is_hook and now >= next_log:
+                print(
+                    f"[engram] waiting for setup lock held by pid {holder} ({lock_path})",
+                    file=sys.stderr,
+                )
+                next_log = now + SETUP_LOCK_LOG_INTERVAL_S
+            time.sleep(min(_SETUP_LOCK_POLL_S, max(deadline - now, 0.001)))
+    except DbSetupLockError:
+        os.close(fd)
+        raise
+    except Exception as exc:
+        os.close(fd)
+        raise DbSetupLockUnusable(
+            f"cannot flock setup lock file {lock_path}: {type(exc).__name__}: {exc}; "
+            f"refusing to run the one-time DB setup without it"
+        ) from exc
+    # Holder pid: informational only (both wait messages name it).
+    try:
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, f"{os.getpid()}\n".encode("ascii"), 0)
+    except Exception:
+        pass
+    return fd
+
+
+def _release_db_setup_lock(fd: int) -> None:
+    try:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+
+
 def _configure_paths(data_dir: str | Path) -> None:
     """Reconfigure ALL module-level path globals from a single data_dir.
 
@@ -3306,7 +3485,11 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     NULL/absence checks) -- only the CALL FREQUENCY changed, from 'every
     _get_db() call' to 'first call per resolved DB path, per process.'
 
-    Caller contract: only invoke while holding _db_setup_lock, and only
+    Caller contract: only invoke while holding _db_setup_lock AND the
+    cross-process setup file lock (#3767: _acquire_db_setup_lock -- every
+    state read below, user_version and each backfill's own gate, then happens
+    INSIDE that lock, so a process that waited sees the holder's finished work
+    and re-runs no rung and writes no second backup), and only
     mark the path done (add to _db_setup_done_paths) AFTER this function
     returns without raising -- a failure here must leave the path
     unmarked so the next _get_db() call retries the whole block
@@ -3314,7 +3497,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
 
     Returns: True iff the caller must start the async embedding
     restore-completeness regeneration thread (#3075 C5 round 2) AFTER
-    releasing _db_setup_lock -- see the "Restore-completeness check" block
+    releasing _db_setup_lock AND the setup file lock -- see the "Restore-completeness check" block
     below and _run_embedding_restore_regeneration's own docstring. False in
     every other case (no NULL embeddings, or the embedder is unavailable --
     that last case is handled synchronously, in-line, before this function
@@ -4952,7 +5135,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     return _needs_async_embedding_regen
 
 
-def _get_db() -> sqlite3.Connection:
+def _get_db(setup_wait: str = SETUP_WAIT_SERVER) -> sqlite3.Connection:
     """Get a database connection, creating tables if needed.
 
     Fails LOUD if the DB file is missing or seed-empty — the plugin packaging
@@ -4977,6 +5160,12 @@ def _get_db() -> sqlite3.Connection:
     Both are scoped to the env that sets them (bootstrap subprocess + pytest
     session). The production MCP server never sets either, so guards stay
     active for real user flows.
+
+    setup_wait (#3767): which caller class waits for the cross-process setup
+    lock. SETUP_WAIT_SERVER (default) waits up to SETUP_LOCK_SERVER_WAIT_S;
+    SETUP_WAIT_HOOK (harness-budgeted hooks MUST pass it) tries for
+    SETUP_LOCK_HOOK_WAIT_S then raises DbSetupLockBusy. Only consulted when
+    this process still has to run the one-time setup.
     """
     bootstrap_mode = (
         os.environ.get("ENGRAM_BOOTSTRAP") == "1"
@@ -5098,7 +5287,23 @@ def _get_db() -> sqlite3.Connection:
     if resolved_db_path not in _db_setup_done_paths or not _schema_present():
         with _db_setup_lock:
             if resolved_db_path not in _db_setup_done_paths or not _schema_present():
-                _needs_async_embedding_regen = _run_db_one_time_setup(conn)
+                # #3767: cross-process lock around the WHOLE setup. State is
+                # (re)read only inside it: _run_db_one_time_setup reads
+                # user_version and every backfill gate after this point. The
+                # async regen thread below still starts after BOTH locks are
+                # released.
+                try:
+                    _setup_fd = _acquire_db_setup_lock(setup_wait)
+                except DbSetupLockError:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    raise
+                try:
+                    _needs_async_embedding_regen = _run_db_one_time_setup(conn)
+                finally:
+                    _release_db_setup_lock(_setup_fd)
                 _db_setup_done_paths.add(resolved_db_path)
 
     # #3075 C5 round 2 (Borges's design ruling): start the NULL-only

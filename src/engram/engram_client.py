@@ -359,14 +359,24 @@ class EngramClient:
     parallel evaluations with isolated graphs.
     """
 
-    def __init__(self, db_dir: Optional[str] = None, server_module_path: str = ""):
+    def __init__(self, db_dir: Optional[str] = None, server_module_path: str = "",
+                 setup_wait: Optional[str] = None):
         """Initialize the client.
-        
+
         Args:
             db_dir: Path to the database directory. Defaults to ~/.engram.
                     Use different paths for isolated eval runs.
             server_module_path: Path to the directory containing server.py.
                                 If empty, assumes server.py is importable.
+            setup_wait: (#3767) caller class for the cross-process one-time DB
+                        setup lock. None (default) = lazy: the first tool call
+                        runs the setup as the server class (waits up to
+                        engram_core.SETUP_LOCK_SERVER_WAIT_S). "hook" = a
+                        harness-budgeted hook: the setup runs NOW, here, with
+                        the short hook wait, and engram_core.DbSetupLockBusy
+                        propagates from this constructor if another process
+                        holds the lock (so no later tool call can fall into
+                        the long server-class wait).
         """
         if server_module_path and server_module_path not in sys.path:
             sys.path.insert(0, server_module_path)
@@ -428,6 +438,19 @@ class EngramClient:
 
         self._server = _server
         self._server._ensure_data_dir()
+
+        if setup_wait is not None:
+            # #3767: run the one-time DB setup now, under the caller's class.
+            # Setup-lock failures propagate (the hook degrades on them); any
+            # other error is left for the first tool call to raise as it
+            # always has, so construction semantics are otherwise unchanged.
+            _core = _server.core
+            try:
+                _core._get_db(setup_wait=setup_wait).close()
+            except _core.DbSetupLockError:
+                raise
+            except Exception:
+                pass
 
         # Build function dispatch table
         self._tools = {}

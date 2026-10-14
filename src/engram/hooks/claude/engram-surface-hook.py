@@ -1934,7 +1934,11 @@ def query_fts_fallback(prompt: str, top_k: int = 10) -> dict | None:
         if PROJECT_DIR not in sys.path:
             sys.path.insert(0, PROJECT_DIR)
         from engram_client import EngramClient
-        client = EngramClient()
+        # #3767: hook class -- if another process is running the one-time DB
+        # setup, EngramClient raises DbSetupLockBusy after ~2 s instead of
+        # waiting minutes; the except below degrades to None (no surface this
+        # prompt), the same as every other failure here.
+        client = EngramClient(setup_wait="hook")
         return client.call("engram_surface", {"query": prompt, "top_k": top_k, "semantic": False})
     except Exception:
         return None

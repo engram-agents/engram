@@ -4550,7 +4550,21 @@ def _main_impl() -> None:
                 if _runtime_dir not in sys.path:
                     sys.path.insert(0, _runtime_dir)
                 from engram_client import EngramClient
-                _client = EngramClient()
+                # #3767: hook class. Another process holding the one-time
+                # setup lock (> ~2 s) is a deliberate degrade, not an error:
+                # skip the calibration block and say so in one line.
+                try:
+                    _client = EngramClient(setup_wait="hook")
+                except Exception as _busy_exc:
+                    # engram_client purges and re-imports engram_core on each
+                    # construction, so match the class by name, not identity.
+                    if type(_busy_exc).__name__ != "DbSetupLockBusy":
+                        raise
+                    _health_lines.append(str(_busy_exc))
+                    _health_text = "\n".join(_health_lines)
+                    # Re-raise: the enclosing `except Exception: pass` is the
+                    # hook's never-block exit and skips the rest of this block.
+                    raise
                 _stats_all = _client.call(
                     "engram_stats", {"payload_json": json.dumps({"sections": ["confidence", "memory"]})}
                 )
