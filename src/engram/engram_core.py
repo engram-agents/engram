@@ -420,9 +420,9 @@ _db_setup_lock = threading.Lock()
 # write lock and a second process walks in mid-setup. Two processes starting
 # at once (e.g. the flag-OFF session-start path and the MCP server) therefore
 # could both run a rung -- measured: doubled edit_history rows and a doubled
-# pre-migration backup. An exclusive flock on a sidecar file serializes the
-# WHOLE setup instead, and the kernel releases it when the holder dies, so a
-# crashed holder cannot leave a stale lock.
+# pre-migration backup. An exclusive flock on a sidecar lock directory
+# serializes the WHOLE setup instead, and the kernel releases it when the
+# holder dies, so a crashed holder cannot leave a stale lock.
 #
 # Two caller classes, chosen explicitly by the caller (never guessed):
 #   "hook"   -- a harness-budgeted hook fire. Try the lock for at most
@@ -435,7 +435,20 @@ _db_setup_lock = threading.Lock()
 # Neither class ever runs the setup unlocked. 600 s rests on two seats' rung-4
 # re-embed timings at <= 11k nodes; a larger store or a slower embedder can
 # exceed it, and then the server fails loud rather than hanging.
-SETUP_LOCK_SUFFIX = ".setup.lock"
+# The lock object is a 0700 DIRECTORY, <db>.setup.lockdir (#3791 C), not a file:
+# a lock FILE can be hard-linked by another account, and refusing a hard-linked
+# lock file meant telling the user to delete it, which lets a fresh process in
+# beside a live holder. A directory cannot be hard-linked. `<db>.setup.lock`
+# FILES left by the previous version are LEGACY: ignored, never touched, never
+# mentioned. The pid of the holder is written to the regular file `holder`
+# inside the directory, for the wait messages only; exclusion is the flock.
+# Mixed-version bound: an OLD (file-locking) process whose setup overlaps a NEW
+# (directory-locking) process's setup takes a different lock object, so the two
+# do not exclude each other for that one overlap. Accepted by the design seat:
+# closing it would need the new code to also take the old file lock, which
+# brings back the hard-link refusal and its delete remedy this change removes.
+SETUP_LOCK_SUFFIX = ".setup.lockdir"
+SETUP_LOCK_HOLDER_NAME = "holder"
 SETUP_LOCK_HOOK_WAIT_S = 2
 SETUP_LOCK_SERVER_WAIT_S = 600
 SETUP_LOCK_LOG_INTERVAL_S = 15
@@ -457,59 +470,101 @@ class DbSetupLockTimeout(DbSetupLockError):
 
 
 class DbSetupLockUnusable(DbSetupLockError):
-    """The lock file could not be opened or flocked; setup refused to run unlocked."""
+    """The lock directory could not be opened, validated or flocked; setup refused to run unlocked."""
 
 
-def _read_setup_lock_holder_pid(fd: int) -> str:
-    """Best-effort holder pid from the lock file. Informational only -- never
-    liveness (the flock is the truth). "unknown" if unreadable or not yet written."""
-    try:
-        parts = os.pread(fd, 64, 0).decode("ascii", "replace").split()
-        return parts[0] if parts else "unknown"
-    except Exception:
-        return "unknown"
+def _read_setup_lock_holder_pid(dir_fd: int) -> str:
+    """Best-effort holder pid, from the `holder` file inside the lock directory
+    (opened relative to the directory fd we hold). Informational only -- never
+    liveness and never exclusion (the flock on the directory is the truth).
 
-
-def _open_db_setup_lock_file(lock_path: str) -> int:
-    """Open + validate the setup lock file; return the open fd (not yet flocked).
-
-    Every failure raises DbSetupLockUnusable naming the path. Called again by
-    _acquire_db_setup_lock when the post-flock inode recheck finds the name no
-    longer refers to the locked file (#3791).
+    Never blocks: O_NONBLOCK, so a FIFO planted at that name cannot stall the
+    waiter, and a non-regular file is not read at all. "unknown" on ANY
+    failure (absent, unreadable, garbage, not a regular file).
     """
     fd = None
     try:
         import stat as _stat
 
-        # Always 0600, NOT mirrored from the store: flock works on a read-only
-        # fd, so any account that can open the lock file could hold the lock
-        # and stall every start for up to SETUP_LOCK_SERVER_WAIT_S. The file
-        # carries only a pid. O_NOFOLLOW: a symlink at the lock path would
-        # otherwise pass the fstat check below and let the holder ftruncate
-        # whatever it points at (e.g. the store); ELOOP -> Unusable.
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        fd = os.open(
+            SETUP_LOCK_HOLDER_NAME,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+            dir_fd=dir_fd,
+        )
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            return "unknown"
+        parts = os.read(fd, 64).decode("ascii", "replace").split()
+        if parts and parts[0].isascii() and parts[0].isdigit():
+            return parts[0]
+        return "unknown"
+    except Exception:
+        return "unknown"
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+
+def _open_db_setup_lock_dir(lock_path: str) -> int:
+    """Create (if absent) + open + validate the setup lock DIRECTORY; return the
+    open fd (not yet flocked).
+
+    #3791 (C): the lock object is a directory, not a file. A directory cannot
+    be hard-linked, and only its owner can open a 0700 one, so no other account
+    can hold the lock and stall every start. Created 0700 (a lost create race,
+    FileExistsError, is fine), opened O_RDONLY|O_DIRECTORY|O_NOFOLLOW: a
+    symlink or a non-directory at the name is refused, never followed.
+    The owner check compares against the EFFECTIVE uid, so a lock directory
+    owned by another account is refused even when running as root.
+
+    Every failure raises DbSetupLockUnusable naming the path. Called again by
+    _acquire_db_setup_lock when the post-flock inode recheck finds the name no
+    longer refers to the locked directory (#3791).
+    """
+    fd = None
+    try:
+        import errno as _errno
+        import stat as _stat
+
+        try:
+            os.mkdir(lock_path, 0o700)
+        except FileExistsError:
+            pass
+        try:
+            fd = os.open(lock_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as exc:
+            # Linux reports ENOTDIR (not ELOOP) for O_DIRECTORY|O_NOFOLLOW on a
+            # symlink, so tell the two apart by looking at the name itself.
+            try:
+                is_link = _stat.S_ISLNK(os.lstat(lock_path).st_mode)
+            except OSError:
+                is_link = False
+            if is_link:
+                raise OSError("is a symbolic link, not a directory") from exc
+            if exc.errno == _errno.ENOTDIR:
+                raise OSError("is not a directory") from exc
+            raise
         st = os.fstat(fd)
-        if not _stat.S_ISREG(st.st_mode):
-            raise OSError("not a regular file")
-        if st.st_nlink != 1:
-            # A hard link shares the inode: O_NOFOLLOW and S_ISREG both pass,
-            # and the fchmod / holder ftruncate + pid write below would land on
-            # whatever else names it (e.g. the store). Checked on the fd, before
-            # any write; same check as engram_regular_io.write_pidfile.
+        if st.st_uid != os.geteuid():
             raise OSError(
-                f"{st.st_nlink} hard links (expected exactly 1); this usually "
-                "means the ENGRAM home was copied with hard links (e.g. "
-                "`cp -al` or `rsync --link-dest`). The lock file holds no "
-                "data, and deleting it removes only this name, never the "
-                "other link's data: with ENGRAM stopped, delete "
-                f"{lock_path} and it is recreated on the next start"
+                f"is owned by uid {st.st_uid}, not the current uid {os.geteuid()}"
             )
-        if _stat.S_IMODE(st.st_mode) != 0o600:
-            # os.open's mode is umask-filtered and ignored for an existing
-            # file; fchmod makes the 0600 invariant hold regardless. If we
-            # cannot (not our file), refuse rather than lock under a file
-            # other accounts can hold.
-            os.fchmod(fd, 0o600)
+        mode = _stat.S_IMODE(st.st_mode)
+        if mode != 0o700:
+            # mkdir's mode is umask-filtered and ignored for an existing
+            # directory; fchmod makes the 0700 invariant hold regardless. If we
+            # cannot, refuse rather than lock under a directory other accounts
+            # can open.
+            try:
+                os.fchmod(fd, 0o700)
+            except Exception as exc:
+                what = "wider than 0o700" if mode & 0o077 else "not 0o700"
+                raise OSError(
+                    f"has mode {mode:#o}, {what}, and cannot be set to 0o700: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
     except Exception as exc:
         if fd is not None:
             try:
@@ -517,7 +572,7 @@ def _open_db_setup_lock_file(lock_path: str) -> int:
             except Exception:
                 pass
         raise DbSetupLockUnusable(
-            f"cannot use setup lock file {lock_path}: {type(exc).__name__}: {exc}; "
+            f"cannot use setup lock directory {lock_path}: {type(exc).__name__}: {exc}; "
             f"refusing to run the one-time DB setup without it"
         ) from exc
     return fd
@@ -556,10 +611,10 @@ def _acquire_db_setup_lock(setup_wait: str) -> int:
         import fcntl
     except Exception as exc:
         raise DbSetupLockUnusable(
-            f"cannot use setup lock file {lock_path}: {type(exc).__name__}: {exc}; "
+            f"cannot use setup lock directory {lock_path}: {type(exc).__name__}: {exc}; "
             f"refusing to run the one-time DB setup without it"
         ) from exc
-    fd = _open_db_setup_lock_file(lock_path)
+    fd = _open_db_setup_lock_dir(lock_path)
     deadline = time.monotonic() + wait_s
     next_log = 0.0
 
@@ -581,17 +636,18 @@ def _acquire_db_setup_lock(setup_wait: str) -> int:
             except BlockingIOError:
                 pass  # EWOULDBLOCK/EAGAIN: held by another process -- wait below
             else:
-                # #3791 (A): recheck that the fd we now hold still IS the file at
-                # the path. CLOSES: a waiter that was blocked on the OLD inode
-                # when someone deleted the name -- it now holds a deleted inode
-                # and would otherwise run beside a fresh process that created
-                # the new file; here it closes, re-opens (re-creating the file)
-                # and retries inside the SAME deadline. DOES NOT CLOSE: a FRESH
-                # process arriving after the delete creates a new inode, locks
-                # it at once and passes its own recheck, so it runs beside the
-                # ORIGINAL holder. That window stays documented ("with ENGRAM
-                # stopped" in the refusal text). A missing name counts as a
-                # mismatch.
+                # #3791 (A): recheck that the fd we now hold still IS the
+                # directory at the path. CLOSES: a waiter that was blocked on
+                # the OLD inode when the name went away -- it now holds an
+                # orphaned inode and would otherwise run beside a fresh process
+                # that created the new directory; here it closes, re-opens
+                # (re-creating the directory) and retries inside the SAME
+                # deadline. DOES NOT CLOSE: a FRESH process arriving after the
+                # name went away creates a new inode, locks it at once and
+                # passes its own recheck, so it runs beside the ORIGINAL
+                # holder. No ENGRAM code removes the directory and no message
+                # tells anyone to; only someone doing it by hand opens that
+                # window. A missing name counts as a mismatch.
                 if _lock_fd_names_path(fd, lock_path):
                     break
                 if time.monotonic() >= deadline:
@@ -599,7 +655,7 @@ def _acquire_db_setup_lock(setup_wait: str) -> int:
                 os.close(fd)
                 fd = None
                 time.sleep(min(_SETUP_LOCK_POLL_S, max(deadline - time.monotonic(), 0.001)))
-                fd = _open_db_setup_lock_file(lock_path)
+                fd = _open_db_setup_lock_dir(lock_path)
                 continue
             now = time.monotonic()
             holder = _read_setup_lock_holder_pid(fd)
@@ -620,13 +676,18 @@ def _acquire_db_setup_lock(setup_wait: str) -> int:
         if fd is not None:
             os.close(fd)
         raise DbSetupLockUnusable(
-            f"cannot flock setup lock file {lock_path}: {type(exc).__name__}: {exc}; "
+            f"cannot flock setup lock directory {lock_path}: {type(exc).__name__}: {exc}; "
             f"refusing to run the one-time DB setup without it"
         ) from exc
-    # Holder pid: informational only (both wait messages name it).
+    # Holder pid: informational only (both wait messages name it). Written only
+    # now that the flock is HELD, so a waiter can never overwrite the holder's
+    # file. A strict regular-file write (refuses FIFO / symlink / hard link);
+    # any failure just leaves the pid unknown to waiters.
     try:
-        os.ftruncate(fd, 0)
-        os.pwrite(fd, f"{os.getpid()}\n".encode("ascii"), 0)
+        _regular_io.write_pidfile(
+            os.path.join(lock_path, SETUP_LOCK_HOLDER_NAME),
+            f"{os.getpid()}\n".encode("ascii"),
+        )
     except Exception:
         pass
     return fd
@@ -3539,7 +3600,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     _get_db() call' to 'first call per resolved DB path, per process.'
 
     Caller contract: only invoke while holding _db_setup_lock AND the
-    cross-process setup file lock (#3767: _acquire_db_setup_lock -- every
+    cross-process setup lock directory (#3767: _acquire_db_setup_lock -- every
     state read below, user_version and each backfill's own gate, then happens
     INSIDE that lock, so a process that waited sees the holder's finished work
     and re-runs no rung and writes no second backup), and only
@@ -3550,8 +3611,8 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
 
     Returns: True iff the caller must start the async embedding
     restore-completeness regeneration thread (#3075 C5 round 2) AFTER
-    releasing _db_setup_lock AND the setup file lock -- see the "Restore-completeness check" block
-    below and _run_embedding_restore_regeneration's own docstring. False in
+    releasing _db_setup_lock AND the setup lock directory -- see the
+    "Restore-completeness check" block below and _run_embedding_restore_regeneration's own docstring. False in
     every other case (no NULL embeddings, or the embedder is unavailable --
     that last case is handled synchronously, in-line, before this function
     returns; #345 PR2 retired the separate "disabled by config" case, which

@@ -13,7 +13,7 @@ separate processes can see the cross-process race.
 Cells (labels follow the spec AMENDMENT: Borges's f/g/h/l, Aleph's i/j/k):
   (f) HOOK-class waiter facing a held lock returns within ~2 s, skips, names holder pid, writes nothing
   (g) SERVER-class waiter logs the holder pid and proceeds once the holder releases
-  (h) the pid in the lock file matches the holder's
+  (h) the pid file inside the lock directory matches the holder's
   (i) mutual exclusion, deterministic (the primary red cell)
   (j) lock path unusable: named error naming the path, setup did not run
   (k) serial behaviour unchanged
@@ -44,7 +44,10 @@ import pytest
 # Names the implementation must provide.  Change them HERE if the
 # implementation chooses differently; nothing else in this file hardcodes them.
 # ---------------------------------------------------------------------------
-LOCK_SUFFIX = ".setup.lock"                  # lock file = <db path> + LOCK_SUFFIX; holder pid written into it
+LOCK_SUFFIX = ".setup.lockdir"               # lock DIRECTORY = <db path> + LOCK_SUFFIX (#3791 C; engram_core.SETUP_LOCK_SUFFIX)
+# `<db>.setup.lock` FILES from the previous version are LEGACY: ignored, never deleted, never mentioned.
+LEGACY_LOCK_SUFFIX = ".setup.lock"
+HOLDER_NAME = "holder"                       # informational pid file INSIDE the lock directory (never the exclusion)
 SETUP_WAIT_KWARG = "setup_wait"              # engram_core._get_db(setup_wait=...); default (absent) = server class
 SETUP_WAIT_HOOK = "hook"                     # value selecting the hook class
 HOOK_WAIT_CONSTANT = "SETUP_LOCK_HOOK_WAIT_S"      # engram_core.<name> == 2 (seconds)
@@ -52,7 +55,7 @@ SERVER_WAIT_CONSTANT = "SETUP_LOCK_SERVER_WAIT_S"  # engram_core.<name> == 600 (
 BUSY_ERROR_NAME = "DbSetupLockBusy"          # engram_core.<name>: HOOK class, lock still held after the hook wait;
 BUSY_MSG_FRAGMENT = "ENGRAM is upgrading its store in another process (pid "   # its message carries this text + holder pid
 TIMEOUT_ERROR_NAME = "DbSetupLockTimeout"    # engram_core.<name>: SERVER class deadline passed (store untouched)
-UNUSABLE_ERROR_NAME = "DbSetupLockUnusable"  # engram_core.<name>: lock file cannot be opened/flocked (message names the path)
+UNUSABLE_ERROR_NAME = "DbSetupLockUnusable"  # engram_core.<name>: lock directory cannot be opened/validated/flocked (message names the path)
 WAITING_LOG_FRAGMENT = "waiting for setup lock held by pid "   # server-class stderr line, then the pid
 # (the tests patch the two *_WAIT_S module constants in the child; no env var seam)
 # Hook call sites (cell l) must pass setup_wait=<hook class> to EngramClient(...)/_get_db(...).
@@ -183,12 +186,31 @@ CHILD = textwrap.dedent(
         setattr(ec, os.environ["SERVER_WAIT_CONSTANT"], float(os.environ["SERVER_WAIT_S"]))
 
     if os.environ.get("PATCH_FCHMOD_EPERM") == "1":
-        # #3791: make "cannot tighten the lock file to 0600" reproducible without root
+        # #3791: make "cannot tighten the lock directory to 0700" reproducible without root
         # or a second uid. Opt-in only; off for every other cell.
         import errno
         def _fchmod_eperm(fd, mode):
             raise PermissionError(errno.EPERM, "Operation not permitted")
         os.fchmod = _fchmod_eperm
+
+    if os.environ.get("PATCH_FSTAT_UID") == "1":
+        # #3791 (C): make the lock directory look owned by ANOTHER uid, without root.
+        # Opt-in only. os.fstat reports uid+1 for the lock directory's own fd only.
+        import stat as _st, types as _types
+        _real_fstat = os.fstat
+        def _fstat_other_uid(fd):
+            r = _real_fstat(fd)
+            if _st.S_ISDIR(r.st_mode):
+                try:
+                    cur = os.lstat(str(ec.DB_PATH) + os.environ["LOCK_SUFFIX"])
+                except OSError:
+                    return r
+                if (cur.st_dev, cur.st_ino) == (r.st_dev, r.st_ino):
+                    d = {n: getattr(r, n) for n in dir(r) if n.startswith("st_")}
+                    d["st_uid"] = r.st_uid + 1
+                    return _types.SimpleNamespace(**d)
+            return r
+        os.fstat = _fstat_other_uid
 
     if os.environ.get("LOCK_SPY") == "1":
         # #3791 (A): observe the LOCK ACQUISITION itself (the `entered` marker only
@@ -201,7 +223,7 @@ CHILD = textwrap.dedent(
         ec._acquire_db_setup_lock = _acq_spy
 
         # Also observe the FIRST time the real flock is refused (BlockingIOError):
-        # that proves this process holds an fd on the lock file's inode that exists
+        # that proves this process holds an fd on the lock directory's inode that exists
         # at that moment and is waiting on its holder. The cells use `blocked` to
         # make "W is blocked on A's OLD inode" a fact instead of a sleep.
         import fcntl
@@ -226,6 +248,9 @@ CHILD = textwrap.dedent(
                 return types.SimpleNamespace(st_dev=r.st_dev, st_ino=r.st_ino + (1 << 40))
             return r
         os.stat = _stat_mismatch
+
+    if os.environ.get("UMASK") is not None:
+        os.umask(int(os.environ["UMASK"]))   # #3791 (C): a created directory must be 0700 whatever the umask
 
     touch("started")
     if os.environ.get("GO") == "1":
@@ -419,8 +444,9 @@ def template_home(tmp_path_factory, child_script):
     assert LATEST_UV > PRE_UV, (LATEST_UV, PRE_UV)
     shutil.rmtree(home / "db-backup", ignore_errors=True)
     # Every test home starts like a pre-lock store, as real seats do today, so
-    # each cell also exercises the first creation of the lock file.
-    Path(str(_db(home)) + LOCK_SUFFIX).unlink(missing_ok=True)
+    # each cell also exercises the first creation of the lock directory.
+    shutil.rmtree(str(_db(home)) + LOCK_SUFFIX, ignore_errors=True)
+    Path(str(_db(home)) + LEGACY_LOCK_SUFFIX).unlink(missing_ok=True)
     s = snapshot(home)
     assert s["user_version"] == PRE_UV and s["nodes"] == N_NODES and s["edit_history_count"] == 0, s
     return home
@@ -629,20 +655,38 @@ def test_d_server_deadline_raises_named_error_and_leaves_store_untouched(
 
 
 # ---------------------------------------------------------------------------
-# (j) lock file unusable
+# #3791 (C): the lock object is a DIRECTORY, <db>.setup.lockdir, mode 0700.
+# Refusals (all the EXISTING class DbSetupLockUnusable, message names the path,
+# the setup body never ran): (j) symlink (j2), (j) not a directory, (j5/j6)
+# owner is not the current uid, (m3) mode wider than 0700 that cannot be
+# tightened.  No refusal message tells anyone to delete or remove anything
+# (cell r): ENGRAM may be running, and deleting a held lock admits a second
+# process.
 # ---------------------------------------------------------------------------
-def test_j_unusable_lock_path_raises_named_error_naming_path_and_setup_not_run(
-    home, ctl, child_script, children
-):
-    lock_path = Path(str(_db(home)) + LOCK_SUFFIX)
-    lock_path.mkdir()  # a directory at the lock path: open(O_RDWR) fails (EISDIR)
+import re  # noqa: E402
 
-    B = _spawn(children, child_script, home, ctl, "B")
-    rb = B.finish(timeout=30)
+_REMEDY_RE = re.compile(r"delet|remov|\brm\b", re.IGNORECASE)
+_LEGACY_MENTION_RE = re.compile(re.escape(LEGACY_LOCK_SUFFIX) + r"(?!dir)")
+
+
+def _scrub(msg, home):
+    """The message minus the (pytest-named) home path, so a test directory's
+    name can never fake or hide a remedy word."""
+    return (msg or "").replace(str(home), "<home>")
+
+
+def _assert_refused(B, rb, home, fragment):
+    """The shared refusal contract: exact class, path named, the per-cell
+    message fragment, setup never ran, store untouched, no remedy text."""
+    lock_path = Path(str(_db(home)) + LOCK_SUFFIX)
+    msg = rb["error_msg"] or ""
     assert rb["error_type"] == UNUSABLE_ERROR_NAME, (
-        f"expected {UNUSABLE_ERROR_NAME} for an unusable lock path, got {rb}"
+        f"expected {UNUSABLE_ERROR_NAME}, got {rb}"
     )
-    assert str(lock_path) in (rb["error_msg"] or ""), "error must name the lock path"
+    assert rb["error_type"] not in (BUSY_ERROR_NAME, TIMEOUT_ERROR_NAME), rb
+    assert str(lock_path) in msg, "error must name the lock path: " + repr(msg)
+    assert fragment in msg, f"error must say {fragment!r}: {msg!r}"
+    assert not _REMEDY_RE.search(_scrub(msg, home)), "refusal tells the user to delete/remove: " + repr(msg)
     assert not B.marker("entered"), "setup body ran without the lock"
     assert rb["rung_true"] == []
     s = snapshot(home)
@@ -650,9 +694,28 @@ def test_j_unusable_lock_path_raises_named_error_naming_path_and_setup_not_run(
 
 
 # ---------------------------------------------------------------------------
+# (j) the lock path exists but is not a directory (O_DIRECTORY -> ENOTDIR)
+# ---------------------------------------------------------------------------
+def test_j_regular_file_at_lock_path_is_refused_not_a_directory_and_setup_not_run(
+    home, ctl, child_script, children
+):
+    lock_path = Path(str(_db(home)) + LOCK_SUFFIX)
+    payload = b"a regular file squatting on the lock directory name\n"
+    lock_path.write_bytes(payload)
+    os.chmod(lock_path, 0o644)
+
+    B = _spawn(children, child_script, home, ctl, "B")
+    rb = B.finish(timeout=30)
+    _assert_refused(B, rb, home, "not a directory")
+    assert "symbolic link" not in rb["error_msg"], rb["error_msg"]
+    assert lock_path.is_file() and lock_path.read_bytes() == payload, "the squatting file was touched"
+    assert (lock_path.stat().st_mode & 0o777) == 0o644, "the squatting file's mode was changed"
+
+
+# ---------------------------------------------------------------------------
 # (j2) a symlink at the lock path must not be followed (O_NOFOLLOW)
 # ---------------------------------------------------------------------------
-def test_j2_symlink_at_lock_path_is_refused_and_target_untouched(
+def test_j2_symlink_to_a_file_at_lock_path_is_refused_and_target_untouched(
     home, ctl, child_script, children
 ):
     lock_path = Path(str(_db(home)) + LOCK_SUFFIX)
@@ -663,157 +726,274 @@ def test_j2_symlink_at_lock_path_is_refused_and_target_untouched(
 
     B = _spawn(children, child_script, home, ctl, "B")
     rb = B.finish(timeout=30)
-    assert rb["error_type"] == UNUSABLE_ERROR_NAME, (
-        f"expected {UNUSABLE_ERROR_NAME} for a symlink at the lock path, got {rb}"
-    )
-    assert str(lock_path) in (rb["error_msg"] or ""), "error must name the lock path"
+    _assert_refused(B, rb, home, "symbolic link")
     assert sentinel.read_bytes() == payload, "the symlink target was modified"
     assert lock_path.is_symlink(), "the symlink was replaced"
-    assert not B.marker("entered"), "setup body ran without the lock"
-    assert rb["rung_true"] == []
-    s = snapshot(home)
-    assert s["user_version"] == PRE_UV and s["backups"] == 0 and s["edit_history_count"] == 0, s
 
 
-# ---------------------------------------------------------------------------
-# (j3) a hard link at the lock path shares an inode with its target: O_NOFOLLOW
-#      and S_ISREG both pass, so the holder's fchmod / ftruncate / pid write
-#      would land on the target.  Refuse on st_nlink != 1, before any write.
-# ---------------------------------------------------------------------------
-def test_j3_hardlink_at_lock_path_is_refused_and_target_untouched(
+def test_j2b_symlink_to_a_usable_directory_is_refused_nothing_written_through_it(
     home, ctl, child_script, children
 ):
+    """The discriminating symlink cell: the target is a directory we own at
+    0700, so a follow would LOCK it and write the holder pid into it.  Only
+    O_NOFOLLOW refuses (a symlink to a FILE is refused by O_DIRECTORY anyway)."""
     lock_path = Path(str(_db(home)) + LOCK_SUFFIX)
-    sentinel = Path(home) / "sentinel.bin"
-    payload = b"SENTINEL-bytes-that-must-survive\n" * 5
-    sentinel.write_bytes(payload)
-    os.chmod(sentinel, 0o640)  # not 0600: an fchmod on the shared inode would show
-    os.link(sentinel, lock_path)
+    target = Path(home) / "elsewhere"
+    target.mkdir(mode=0o700)
+    os.chmod(target, 0o700)
+    lock_path.symlink_to(target)
 
     B = _spawn(children, child_script, home, ctl, "B")
     rb = B.finish(timeout=30)
-    assert rb["error_type"] == UNUSABLE_ERROR_NAME, (
-        f"expected {UNUSABLE_ERROR_NAME} for a hard-linked lock file, got {rb}"
-    )
-    assert str(lock_path) in (rb["error_msg"] or ""), "error must name the lock path"
-    assert "hard link" in (rb["error_msg"] or ""), "error must say the file has hard links"
-    # The message must say how to recover: the remedy verb AND the path it
-    # applies to, adjacent ("delete <lock_path>"), not merely the path.
-    assert f"delete {lock_path}" in (rb["error_msg"] or ""), (
-        "error must tell the user to delete the lock file: " + repr(rb["error_msg"])
-    )
-    assert "with ENGRAM stopped" in (rb["error_msg"] or ""), (
-        "error must say to stop ENGRAM before deleting: " + repr(rb["error_msg"])
-    )
-    assert sentinel.read_bytes() == payload, "the hard-link target's bytes were modified"
-    assert (sentinel.stat().st_mode & 0o777) == 0o640, (
-        "the hard-link target's mode was changed: " + oct(sentinel.stat().st_mode & 0o777)
-    )
-    assert not B.marker("entered"), "setup body ran without the lock"
-    assert rb["rung_true"] == []
-    s = snapshot(home)
-    assert s["user_version"] == PRE_UV and s["backups"] == 0 and s["edit_history_count"] == 0, s
+    _assert_refused(B, rb, home, "symbolic link")
+    assert lock_path.is_symlink() and os.readlink(lock_path) == str(target), "the symlink was replaced"
+    assert list(target.iterdir()) == [], "something was written through the symlink"
+    assert (target.stat().st_mode & 0o777) == 0o700
 
 
-def test_j4_hardlink_to_the_store_is_refused_and_store_intact(
+# ---------------------------------------------------------------------------
+# (j5) the owner is not the current uid: unit-level (os.fstat knob, no root)
+# ---------------------------------------------------------------------------
+def test_j5_directory_owned_by_another_uid_is_refused_and_not_written_into(
     home, ctl, child_script, children
 ):
     lock_path = Path(str(_db(home)) + LOCK_SUFFIX)
-    before_bytes = raw_store_bytes(home)
-    before_mode = _db(home).stat().st_mode & 0o777
-    os.link(_db(home), lock_path)  # the lock path now names the store's own inode
+    B = _spawn(children, child_script, home, ctl, "B", PATCH_FSTAT_UID=1)
+    rb = B.finish(timeout=30)
+    _assert_refused(B, rb, home, "owned by uid")
+    assert str(os.geteuid() + 1) in rb["error_msg"], "the foreign uid should be named: " + rb["error_msg"]
+    assert lock_path.is_dir(), "the knob cell should have created the directory"
+    assert list(lock_path.iterdir()) == [], "a holder pid was written into a directory we do not own"
 
+
+@pytest.mark.skipif(
+    os.geteuid() != 0,
+    reason="needs root: a real directory owned by another uid can only be made with chown, "
+           "which an unprivileged account cannot do; the unit-level cell j5 covers the logic",
+)
+def test_j6_real_directory_owned_by_another_uid_is_refused(home, ctl, child_script, children):
+    lock_path = Path(str(_db(home)) + LOCK_SUFFIX)
+    lock_path.mkdir(mode=0o700)
+    os.chown(lock_path, 65534, -1)
     B = _spawn(children, child_script, home, ctl, "B")
-    try:
-        rb = B.finish(timeout=30)
-    except AssertionError as exc:
-        # Unguarded, the holder flocks + truncates the store's own inode, and the
-        # setup that follows then hangs on the wrecked store.
-        raise AssertionError(f"B did not refuse the store-linked lock file: {exc}") from exc
-    assert rb["error_type"] == UNUSABLE_ERROR_NAME, (
-        f"expected {UNUSABLE_ERROR_NAME} for a lock file hard-linked to the store, got {rb}"
-    )
-    assert str(lock_path) in (rb["error_msg"] or ""), "error must name the lock path"
-    assert raw_store_bytes(home) == before_bytes, "the store's bytes were modified"
-    assert (_db(home).stat().st_mode & 0o777) == before_mode, "the store's mode was changed"
-    conn = sqlite3.connect(str(_db(home)))
-    try:
-        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-    finally:
-        conn.close()
-    assert not B.marker("entered"), "setup body ran without the lock"
-    assert rb["rung_true"] == []
-    s = snapshot(home)
-    assert s["user_version"] == PRE_UV and s["backups"] == 0 and s["edit_history_count"] == 0, s
+    rb = B.finish(timeout=30)
+    _assert_refused(B, rb, home, "owned by uid")
+    assert lock_path.stat().st_uid == 65534 and list(lock_path.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
-# (m) the lock file is always 0600, whatever the store's mode
+# (m) the lock directory is always 0700 and ours, whatever the store's mode
 # ---------------------------------------------------------------------------
-def test_m_lock_file_mode_is_0600_even_when_store_is_world_readable(
+def test_m_lock_directory_is_0700_and_ours_even_when_store_is_world_readable(
     home, ctl, child_script, children
 ):
-    os.chmod(_db(home), 0o666)  # mirrored-mode code would give 0666 & ~umask
+    os.chmod(_db(home), 0o666)
     lock_path = Path(str(_db(home)) + LOCK_SUFFIX)
     A = _spawn(children, child_script, home, ctl, "A", PAUSE=1)
     assert A.wait_marker("inside")
-    assert (lock_path.stat().st_mode & 0o777) == 0o600, oct(lock_path.stat().st_mode & 0o777)
+    st = lock_path.stat()
+    assert lock_path.is_dir() and not lock_path.is_symlink()
+    assert (st.st_mode & 0o777) == 0o700, oct(st.st_mode & 0o777)
+    assert st.st_uid == os.geteuid(), "the lock directory must be owned by the current user"
     A.touch("release")
     assert A.finish()["ok"]
-    assert (lock_path.stat().st_mode & 0o777) == 0o600, oct(lock_path.stat().st_mode & 0o777)
+    assert (lock_path.stat().st_mode & 0o777) == 0o700, oct(lock_path.stat().st_mode & 0o777)
 
 
-def test_m2_existing_wider_lock_file_is_tightened_to_0600(home, ctl, child_script, children):
+def test_m2_existing_wider_lock_directory_is_tightened_to_0700(home, ctl, child_script, children):
     lock_path = Path(str(_db(home)) + LOCK_SUFFIX)
-    lock_path.write_text("")
-    os.chmod(lock_path, 0o644)
+    lock_path.mkdir()
+    os.chmod(lock_path, 0o755)
     B = _spawn(children, child_script, home, ctl, "B")
     assert B.finish(timeout=60)["ok"]
-    assert (lock_path.stat().st_mode & 0o777) == 0o600, oct(lock_path.stat().st_mode & 0o777)
+    assert (lock_path.stat().st_mode & 0o777) == 0o700, oct(lock_path.stat().st_mode & 0o777)
 
 
 # ---------------------------------------------------------------------------
-# (m3) an existing wider lock file we cannot tighten is REFUSED, not locked under (#3791)
+# (m3) an existing wider lock directory we cannot tighten is REFUSED, not locked under (#3791)
 # ---------------------------------------------------------------------------
 LOCK_SENTINEL = "stale-pid-not-ours\n"
 
 
-def test_m3_untightenable_wider_lock_file_is_refused_unchanged_and_setup_not_run(
+def test_m3_untightenable_wider_lock_directory_is_refused_unchanged_and_setup_not_run(
     home, ctl, child_script, children
 ):
-    """F1 + F3: fchmod fails (EPERM, injected in the child) on a 0644 lock file."""
+    """fchmod fails (EPERM, injected in the child) on a 0755 lock directory."""
     lock_path = Path(str(_db(home)) + LOCK_SUFFIX)
-    lock_path.write_text(LOCK_SENTINEL)
-    os.chmod(lock_path, 0o644)
+    lock_path.mkdir()
+    (lock_path / HOLDER_NAME).write_text(LOCK_SENTINEL)
+    os.chmod(lock_path, 0o755)
     B = _spawn(children, child_script, home, ctl, "B", PATCH_FCHMOD_EPERM=1)
     rb = B.finish(timeout=30)
-    # F3: exactly the Unusable class, not a Busy / Timeout sibling.
-    assert rb["error_type"] == UNUSABLE_ERROR_NAME, (
-        f"expected {UNUSABLE_ERROR_NAME} when the lock file cannot be tightened, got {rb}"
-    )
-    assert rb["error_type"] not in (BUSY_ERROR_NAME, TIMEOUT_ERROR_NAME), rb
-    assert str(lock_path) in (rb["error_msg"] or ""), "error must name the lock path"
-    assert not B.marker("entered"), "setup body ran under a lock file other accounts can hold"
-    assert rb["rung_true"] == []
-    s = snapshot(home)
-    assert s["user_version"] == PRE_UV and s["backups"] == 0 and s["edit_history_count"] == 0, s
-    # the refusal must not have changed the file it refused
-    assert (lock_path.stat().st_mode & 0o777) == 0o644, oct(lock_path.stat().st_mode & 0o777)
-    assert lock_path.read_text() == LOCK_SENTINEL
+    _assert_refused(B, rb, home, "wider than 0o700")
+    # the refusal must not have changed what it refused
+    assert (lock_path.stat().st_mode & 0o777) == 0o755, oct(lock_path.stat().st_mode & 0o777)
+    assert sorted(p.name for p in lock_path.iterdir()) == [HOLDER_NAME]
+    assert (lock_path / HOLDER_NAME).read_text() == LOCK_SENTINEL
 
 
-def test_m4_fchmod_is_not_attempted_when_the_lock_file_is_already_0600(
+def test_m4_fchmod_is_not_attempted_when_the_lock_directory_is_already_0700(
     home, ctl, child_script, children
 ):
-    """F2 positive control: same injected fchmod failure, but a 0600 file needs no fchmod."""
+    """Positive control: same injected fchmod failure, but a 0700 directory needs no fchmod."""
     lock_path = Path(str(_db(home)) + LOCK_SUFFIX)
-    lock_path.write_text("")
-    os.chmod(lock_path, 0o600)
+    lock_path.mkdir()
+    os.chmod(lock_path, 0o700)
     B = _spawn(children, child_script, home, ctl, "B", PATCH_FCHMOD_EPERM=1)
     rb = B.finish(timeout=60)
     assert rb["ok"], rb
     assert B.marker("entered")
-    assert (lock_path.stat().st_mode & 0o777) == 0o600
+    assert (lock_path.stat().st_mode & 0o777) == 0o700
+
+
+def test_m5_a_freshly_created_lock_directory_is_born_0700_not_tightened_afterwards(
+    home, ctl, child_script, children
+):
+    """With fchmod broken, only a directory created at 0700 can still be used: a
+    create-wide-then-tighten implementation would be refused here."""
+    lock_path = Path(str(_db(home)) + LOCK_SUFFIX)
+    assert not lock_path.exists()
+    B = _spawn(children, child_script, home, ctl, "B", PATCH_FCHMOD_EPERM=1, UMASK=0)
+    rb = B.finish(timeout=60)
+    assert rb["ok"], rb
+    assert (lock_path.stat().st_mode & 0o777) == 0o700, oct(lock_path.stat().st_mode & 0o777)
+
+
+# ---------------------------------------------------------------------------
+# (r) NO refusal message tells anyone to delete or remove anything
+# ---------------------------------------------------------------------------
+def test_r_no_refusal_message_tells_anyone_to_delete_or_remove_anything(
+    tmp_path, template_home, child_script, children
+):
+    seen = {}
+
+    def fresh(name):
+        h = tmp_path / f"r_{name}"
+        shutil.copytree(template_home, h)
+        d = tmp_path / f"r_ctl_{name}"
+        d.mkdir()
+        return h, d
+
+    def run(name, plant=None, role="B", **extra):
+        h, d = fresh(name)
+        if plant:
+            plant(Path(str(_db(h)) + LOCK_SUFFIX), h)
+        c = _spawn(children, child_script, h, d, role, **extra)
+        r = c.finish(timeout=60)
+        assert r["error_msg"], (name, r)
+        seen[name] = _scrub(r["error_msg"], h)
+
+    def plant_symlink(lp, h):
+        lp.symlink_to(Path(h) / "nowhere")
+
+    def plant_file(lp, h):
+        lp.write_text("x")
+
+    def plant_wide(lp, h):
+        lp.mkdir()
+        os.chmod(lp, 0o755)
+
+    run("symlink", plant_symlink)
+    run("notdir", plant_file)
+    run("owner", None, PATCH_FSTAT_UID=1)
+    run("wider", plant_wide, PATCH_FCHMOD_EPERM=1)
+    run("mismatch", None, WAIT_CLASS="hook", HOOK_WAIT_S=0.5, STAT_ALWAYS_MISMATCH=1)
+
+    # Busy (hook) and Timeout (server): a live holder
+    h, d = fresh("held")
+    A = _hold(children, child_script, h, d, "A")
+    assert A.wait_marker("locked"), "A never locked: " + A.err.read_text()[-500:]
+    hook = _spawn(children, child_script, h, d, "H", WAIT_CLASS="hook")
+    seen["busy"] = _scrub(hook.finish(timeout=30)["error_msg"], h)
+    srv = _spawn(children, child_script, h, d, "S", SERVER_WAIT_S=0.5)
+    seen["timeout"] = _scrub(srv.finish(timeout=30)["error_msg"], h)
+    A.touch("release")
+    assert A.finish()["ok"]
+
+    assert set(seen) == {"symlink", "notdir", "owner", "wider", "mismatch", "busy", "timeout"}
+    for name, msg in seen.items():
+        assert msg, name
+        assert not _REMEDY_RE.search(msg), f"the {name} refusal tells the user to delete/remove: {msg!r}"
+        assert not _LEGACY_MENTION_RE.search(msg), f"the {name} refusal mentions a legacy .setup.lock: {msg!r}"
+
+    # And the code itself carries no remedy / hard-link text in the lock functions
+    # (the hard-link refusal and its delete remedy are gone with the lock FILE).
+    import ast
+    import inspect
+    import textwrap as _tw
+    import engram_core as ec
+
+    for fn_name in ("_open_db_setup_lock_dir", "_acquire_db_setup_lock", "_read_setup_lock_holder_pid",
+                    "_release_db_setup_lock", "_lock_fd_names_path"):
+        fn = getattr(ec, fn_name, None)
+        assert fn is not None, f"engram_core.{fn_name} missing"
+        tree = ast.parse(_tw.dedent(inspect.getsource(fn)))
+        assert "st_nlink" not in {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}, (
+            f"{fn_name} still reads st_nlink (the hard-link refusal)"
+        )
+        fdef = tree.body[0]
+        doc = fdef.body[0].value if (
+            fdef.body and isinstance(fdef.body[0], ast.Expr) and isinstance(fdef.body[0].value, ast.Constant)
+        ) else None
+        # every string literal that could reach a message (the docstring is not one)
+        lits = [n.value for n in ast.walk(tree)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str) and n is not doc]
+        for lit in lits:
+            assert "hard link" not in lit, f"{fn_name} still carries the hard-link text: {lit!r}"
+            assert not _REMEDY_RE.search(lit), f"{fn_name} carries remedy text in {lit!r}"
+
+
+# ---------------------------------------------------------------------------
+# (l) LEGACY <db>.setup.lock files from the previous version are ignored:
+#     never deleted, never written, never mentioned
+# ---------------------------------------------------------------------------
+def test_l1_stale_legacy_lock_file_is_ignored_untouched_and_unmentioned(
+    home, ctl, child_script, children
+):
+    legacy = Path(str(_db(home)) + LEGACY_LOCK_SUFFIX)
+    legacy.write_bytes(b"4242\n")
+    os.chmod(legacy, 0o644)
+    before = (legacy.read_bytes(), legacy.stat().st_mode, legacy.stat().st_nlink)
+
+    B = _spawn(children, child_script, home, ctl, "B")
+    rb = B.finish(timeout=60)
+    assert rb["ok"], rb
+    _assert_done_once(home, "(l1)")
+    assert legacy.is_file()
+    assert (legacy.read_bytes(), legacy.stat().st_mode, legacy.stat().st_nlink) == before
+    assert not _LEGACY_MENTION_RE.search(B.err.read_text() + B.out.read_text())
+
+
+def test_l2_hard_linked_legacy_lock_file_is_ignored_and_both_names_untouched(
+    home, ctl, child_script, children
+):
+    legacy = Path(str(_db(home)) + LEGACY_LOCK_SUFFIX)
+    other = Path(home) / "other-account-name.bin"
+    payload = b"SENTINEL-bytes-that-must-survive\n" * 5
+    other.write_bytes(payload)
+    os.chmod(other, 0o640)
+    os.link(other, legacy)
+
+    B = _spawn(children, child_script, home, ctl, "B")
+    rb = B.finish(timeout=60)
+    assert rb["ok"], rb
+    _assert_done_once(home, "(l2)")
+    assert legacy.read_bytes() == payload and other.read_bytes() == payload
+    assert legacy.stat().st_nlink == 2 and (other.stat().st_mode & 0o777) == 0o640
+    assert not _LEGACY_MENTION_RE.search(B.err.read_text() + B.out.read_text())
+
+
+def test_l3_a_refusal_with_a_legacy_file_present_does_not_mention_it(
+    home, ctl, child_script, children
+):
+    legacy = Path(str(_db(home)) + LEGACY_LOCK_SUFFIX)
+    legacy.write_bytes(b"4242\n")
+    Path(str(_db(home)) + LOCK_SUFFIX).symlink_to(Path(home) / "nowhere")
+    B = _spawn(children, child_script, home, ctl, "B")
+    rb = B.finish(timeout=30)
+    _assert_refused(B, rb, home, "symbolic link")
+    assert not _LEGACY_MENTION_RE.search(_scrub(rb["error_msg"], home)), rb["error_msg"]
+    assert legacy.read_bytes() == b"4242\n"
 
 
 # ---------------------------------------------------------------------------
@@ -900,18 +1080,111 @@ def test_g_server_class_waiter_logs_holder_pid_then_proceeds_after_release(
 
 
 # ---------------------------------------------------------------------------
-# (h) the pid in the lock file matches the holder's
+# (h) the pid file INSIDE the lock directory matches the holder's; a non-holder
+#     never overwrites it.  The pid file is informational: the exclusion is the
+#     directory's flock.
 # ---------------------------------------------------------------------------
-def test_h_lock_file_carries_holder_pid(home, ctl, child_script, children):
+def _holder_file(home):
+    return Path(str(_db(home)) + LOCK_SUFFIX) / HOLDER_NAME
+
+
+def test_h_lock_directory_carries_holder_pid_in_a_regular_file(home, ctl, child_script, children):
     A = _spawn(children, child_script, home, ctl, "A", PAUSE=1)
     assert A.wait_marker("inside")
     lock_path = Path(str(_db(home)) + LOCK_SUFFIX)
-    assert lock_path.is_file(), f"no lock file at {lock_path} while A holds the lock"
-    assert lock_path.read_text().split() and str(A.proc.pid) in lock_path.read_text().split(), (
-        f"lock file content {lock_path.read_text()!r} does not carry holder pid {A.proc.pid}"
+    assert lock_path.is_dir(), f"no lock directory at {lock_path} while A holds the lock"
+    hf = _holder_file(home)
+    assert hf.is_file() and not hf.is_symlink(), f"no regular pid file {hf}"
+    assert hf.read_text().split() == [str(A.proc.pid)], (
+        f"pid file content {hf.read_text()!r} does not carry holder pid {A.proc.pid}"
     )
+    assert sorted(p.name for p in lock_path.iterdir()) == [HOLDER_NAME], "the lock directory holds more than the pid file"
     A.touch("release")
     assert A.finish()["ok"]
+
+
+def test_h2_a_non_holder_never_overwrites_the_holders_pid_file(home, ctl, child_script, children):
+    A = _hold(children, child_script, home, ctl, "A")
+    assert A.wait_marker("locked"), "A never locked: " + A.err.read_text()[-500:]
+    hf = _holder_file(home)
+    assert hf.read_text().split() == [str(A.proc.pid)]
+    for role, extra in (("H", {"WAIT_CLASS": "hook"}), ("S", {"SERVER_WAIT_S": 0.5})):
+        W = _spawn(children, child_script, home, ctl, role, **extra)
+        rw = W.finish(timeout=30)
+        assert rw["error_type"] in (BUSY_ERROR_NAME, TIMEOUT_ERROR_NAME), rw
+        assert hf.read_text().split() == [str(A.proc.pid)], (
+            f"{role}: a waiter overwrote the holder's pid file: {hf.read_text()!r}"
+        )
+    A.touch("release")
+    assert A.finish()["ok"]
+
+
+@pytest.mark.parametrize("kind", ["missing", "garbage", "fifo"])
+def test_p_unreadable_pid_file_still_waits_correctly_says_pid_unknown_and_never_enters(
+    kind, home, ctl, child_script, children
+):
+    import stat as _stat
+
+    A = _hold(children, child_script, home, ctl, "A")
+    assert A.wait_marker("locked"), "A never locked: " + A.err.read_text()[-500:]
+    hf = _holder_file(home)
+    hf.unlink()
+    if kind == "garbage":
+        hf.write_bytes(b"not-a-pid \xff\xfe\n")
+    elif kind == "fifo":
+        os.mkfifo(hf)
+    kept = hf.read_bytes() if kind == "garbage" else None
+
+    H = _spawn(children, child_script, home, ctl, "H", WAIT_CLASS="hook")
+    rh = H.finish(timeout=30)  # a pid read that blocks on the FIFO hangs here
+    assert rh["error_type"] == BUSY_ERROR_NAME, f"{kind}: the waiter must still wait and then say Busy, got {rh}"
+    assert "(pid unknown)" in rh["error_msg"], rh["error_msg"]
+    assert rh["elapsed"] <= 10.0, f"{kind}: took {rh['elapsed']:.1f}s"
+    assert not H.marker("entered") and rh["rung_true"] == []
+    S = _spawn(children, child_script, home, ctl, "S", SERVER_WAIT_S=0.5)
+    rs = S.finish(timeout=30)
+    assert rs["error_type"] == TIMEOUT_ERROR_NAME and "held by pid unknown" in rs["error_msg"], rs
+    # the waiter neither created, replaced nor rewrote the holder's pid file
+    if kind == "missing":
+        assert not os.path.lexists(hf)
+    elif kind == "garbage":
+        assert hf.read_bytes() == kept
+    else:
+        assert _stat.S_ISFIFO(os.lstat(hf).st_mode)
+
+    A.touch("release")
+    assert A.finish()["ok"]
+    # A later acquirer is not broken by the odd pid file either (it is informational).
+    C = _spawn(children, child_script, home, ctl, "C")
+    assert C.finish(timeout=60)["ok"]
+    _assert_done_once(home, f"(p {kind})")
+    if kind == "fifo":
+        assert _stat.S_ISFIFO(os.lstat(hf).st_mode), "a FIFO pid file must be left alone, not replaced"
+    else:
+        assert hf.read_text().split() == [str(C.proc.pid)]
+
+
+# ---------------------------------------------------------------------------
+# (s) SIGKILL of the holder mid-hold: the kernel drops the flock with the fd, a
+#     waiter acquires inside its deadline.
+# ---------------------------------------------------------------------------
+def test_s_sigkilled_holder_mid_hold_lets_a_waiter_acquire_within_the_deadline(
+    home, ctl, child_script, children
+):
+    A = _hold(children, child_script, home, ctl, "A")
+    assert A.wait_marker("locked"), "A never locked: " + A.err.read_text()[-500:]
+    W = _spawn(children, child_script, home, ctl, "W", LOCK_SPY=1, WAIT_CLASS="hook", HOOK_WAIT_S=20)
+    assert W.wait_marker("blocked", timeout=30), "W never blocked on A's lock: " + W.err.read_text()[-500:]
+    assert not W.marker("locked")
+    A.proc.kill()  # SIGKILL: no finally, no release
+    A.proc.wait(timeout=10)
+    assert A.proc.returncode == -9, A.proc.returncode
+    rw = W.finish(timeout=60)
+    assert rw["ok"], rw
+    assert W.marker("locked")
+    assert rw["elapsed"] < 20, f"W did not acquire inside its deadline: {rw['elapsed']:.1f}s"
+    assert _holder_file(home).read_text().split() == [str(W.proc.pid)], "the new holder's pid replaced the dead one's"
+    _assert_done_once(home, "(s)")
 
 
 # ---------------------------------------------------------------------------
@@ -1064,10 +1337,10 @@ def test_a_five_racers_100_trials_no_doubled_history_one_backup(
 
 # ---------------------------------------------------------------------------
 # #3791 (A): inode recheck after the flock.
-# CLOSES: a WAITER blocked on the lock file's OLD inode when the name was deleted.
+# CLOSES: a WAITER blocked on the lock directory's OLD inode when the name was deleted.
 # DOES NOT CLOSE: a FRESH process arriving after the delete creates a new inode,
 # locks it at once and runs beside the ORIGINAL holder (asserted in A1 below, so
-# the cell documents the remaining window; the refusal text says "with ENGRAM stopped").
+# the cell documents the remaining window).
 # ---------------------------------------------------------------------------
 def _hold(children, script, home, ctl, role):
     c = Child(script, home, ctl, role, MODE="hold")
@@ -1077,6 +1350,14 @@ def _hold(children, script, home, ctl, role):
 
 def _lock_path(home):
     return Path(str(_db(home)) + LOCK_SUFFIX)
+
+
+def _drop_lockdir(home):
+    """Delete the lock directory's NAME while a holder still has it open: remove
+    the pid file, then rmdir (a directory cannot be unlinked)."""
+    lp = _lock_path(home)
+    (lp / HOLDER_NAME).unlink(missing_ok=True)
+    lp.rmdir()
 
 
 def test_a1_waiter_on_orphaned_inode_does_not_enter_beside_a_fresh_holder(
@@ -1089,7 +1370,7 @@ def test_a1_waiter_on_orphaned_inode_does_not_enter_beside_a_fresh_holder(
     # W has really hit the lock held on A's (only, at this moment) inode.
     assert W.wait_marker("blocked", timeout=30), "W never blocked on A's lock: " + W.err.read_text()[-500:]
     assert not W.marker("locked"), "W acquired the lock while A holds it"
-    _lock_path(home).unlink()  # delete the NAME; A still holds the orphaned inode
+    _drop_lockdir(home)  # delete the NAME; A still holds the orphaned inode
 
     B = _hold(children, child_script, home, ctl, "B")
     # The documented remaining window: a FRESH process locks the new inode at once.
@@ -1107,7 +1388,7 @@ def test_a1_waiter_on_orphaned_inode_does_not_enter_beside_a_fresh_holder(
     _assert_done_once(home, "(a1)")
 
 
-def test_a2_waiter_on_orphaned_inode_converges_on_the_recreated_file(
+def test_a2_waiter_on_orphaned_inode_converges_on_the_recreated_directory(
     home, ctl, child_script, children
 ):
     A = _hold(children, child_script, home, ctl, "A")
@@ -1116,16 +1397,17 @@ def test_a2_waiter_on_orphaned_inode_converges_on_the_recreated_file(
     assert W.wait_marker("started"), "W never started"
     assert W.wait_marker("blocked", timeout=30), "W never blocked on A's lock: " + W.err.read_text()[-500:]
     assert not W.marker("locked")
-    _lock_path(home).unlink()
+    _drop_lockdir(home)
     A.touch("release")
     assert W.wait_marker("locked", timeout=10), "W never acquired after the name was deleted and A released"
     rw = W.finish(timeout=60)
     assert rw["ok"], rw
     assert A.finish()["ok"]
     lp = _lock_path(home)
-    assert lp.is_file(), "the retry did not re-create the lock file"
-    assert str(W.proc.pid) in lp.read_text().split(), (
-        f"lock file {lp.read_text()!r} does not carry W's pid {W.proc.pid}"
+    assert lp.is_dir(), "the retry did not re-create the lock directory"
+    assert (lp.stat().st_mode & 0o777) == 0o700, "the re-created lock directory must be 0700"
+    assert str(W.proc.pid) in (lp / HOLDER_NAME).read_text().split(), (
+        f"pid file {(lp / HOLDER_NAME).read_text()!r} does not carry W's pid {W.proc.pid}"
     )
     _assert_done_once(home, "(a2)")
 
@@ -1142,8 +1424,8 @@ def test_a4_reopen_failure_after_mismatch_raises_the_typed_error_and_leaks_nothi
     target = Path(ctl) / "symlink-target.bin"
     payload = b"TARGET-bytes-that-must-survive\n" * 3
     target.write_bytes(payload)
-    lp.unlink()                # delete the NAME; A still holds the orphaned inode
-    lp.symlink_to(target)      # the name now refers to something else: re-open hits ELOOP
+    _drop_lockdir(home)        # delete the NAME; A still holds the orphaned inode
+    lp.symlink_to(target)      # the name now refers to something else: the re-open refuses a symlink
     A.touch("release")
     rw = W.finish(timeout=60)
     assert rw["error_type"] == UNUSABLE_ERROR_NAME, (
