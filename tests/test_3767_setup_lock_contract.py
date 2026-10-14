@@ -163,6 +163,14 @@ CHILD = textwrap.dedent(
     if os.environ.get("SERVER_WAIT_S"):
         setattr(ec, os.environ["SERVER_WAIT_CONSTANT"], float(os.environ["SERVER_WAIT_S"]))
 
+    if os.environ.get("PATCH_FCHMOD_EPERM") == "1":
+        # #3791: make "cannot tighten the lock file to 0600" reproducible without root
+        # or a second uid. Opt-in only; off for every other cell.
+        import errno
+        def _fchmod_eperm(fd, mode):
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+        os.fchmod = _fchmod_eperm
+
     touch("started")
     if os.environ.get("GO") == "1":
         while not os.path.exists(os.path.join(CTL, "go")):
@@ -692,6 +700,50 @@ def test_m2_existing_wider_lock_file_is_tightened_to_0600(home, ctl, child_scrip
     B = _spawn(children, child_script, home, ctl, "B")
     assert B.finish(timeout=60)["ok"]
     assert (lock_path.stat().st_mode & 0o777) == 0o600, oct(lock_path.stat().st_mode & 0o777)
+
+
+# ---------------------------------------------------------------------------
+# (m3) an existing wider lock file we cannot tighten is REFUSED, not locked under (#3791)
+# ---------------------------------------------------------------------------
+LOCK_SENTINEL = "stale-pid-not-ours\n"
+
+
+def test_m3_untightenable_wider_lock_file_is_refused_unchanged_and_setup_not_run(
+    home, ctl, child_script, children
+):
+    """F1 + F3: fchmod fails (EPERM, injected in the child) on a 0644 lock file."""
+    lock_path = Path(str(_db(home)) + LOCK_SUFFIX)
+    lock_path.write_text(LOCK_SENTINEL)
+    os.chmod(lock_path, 0o644)
+    B = _spawn(children, child_script, home, ctl, "B", PATCH_FCHMOD_EPERM=1)
+    rb = B.finish(timeout=30)
+    # F3: exactly the Unusable class, not a Busy / Timeout sibling.
+    assert rb["error_type"] == UNUSABLE_ERROR_NAME, (
+        f"expected {UNUSABLE_ERROR_NAME} when the lock file cannot be tightened, got {rb}"
+    )
+    assert rb["error_type"] not in (BUSY_ERROR_NAME, TIMEOUT_ERROR_NAME), rb
+    assert str(lock_path) in (rb["error_msg"] or ""), "error must name the lock path"
+    assert not B.marker("entered"), "setup body ran under a lock file other accounts can hold"
+    assert rb["rung_true"] == []
+    s = snapshot(home)
+    assert s["user_version"] == PRE_UV and s["backups"] == 0 and s["edit_history_count"] == 0, s
+    # the refusal must not have changed the file it refused
+    assert (lock_path.stat().st_mode & 0o777) == 0o644, oct(lock_path.stat().st_mode & 0o777)
+    assert lock_path.read_text() == LOCK_SENTINEL
+
+
+def test_m4_fchmod_is_not_attempted_when_the_lock_file_is_already_0600(
+    home, ctl, child_script, children
+):
+    """F2 positive control: same injected fchmod failure, but a 0600 file needs no fchmod."""
+    lock_path = Path(str(_db(home)) + LOCK_SUFFIX)
+    lock_path.write_text("")
+    os.chmod(lock_path, 0o600)
+    B = _spawn(children, child_script, home, ctl, "B", PATCH_FCHMOD_EPERM=1)
+    rb = B.finish(timeout=60)
+    assert rb["ok"], rb
+    assert B.marker("entered")
+    assert (lock_path.stat().st_mode & 0o777) == 0o600
 
 
 # ---------------------------------------------------------------------------
