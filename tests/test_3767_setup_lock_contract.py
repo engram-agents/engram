@@ -131,6 +131,25 @@ CHILD = textwrap.dedent(
         print("RESULT " + json.dumps(res))
         sys.exit(0)
 
+    if MODE == "hold":
+        # #3791 (A): take the lock and hold it, with NO setup body, so no two setups
+        # interleave. Server class. `locked` = the lock was acquired.
+        touch("started")
+        res = {"ok": True, "error_type": None, "error_msg": None}
+        try:
+            fd = ec._acquire_db_setup_lock(ec.SETUP_WAIT_SERVER)
+            touch("locked")
+            end = time.time() + 90
+            while not os.path.exists(os.path.join(CTL, ROLE + ".release")):
+                if time.time() > end:
+                    raise SystemExit("hold was never released")
+                time.sleep(0.02)
+            ec._release_db_setup_lock(fd)
+        except BaseException as e:
+            res.update(ok=False, error_type=type(e).__name__, error_msg=str(e))
+        print("RESULT " + json.dumps(res))
+        sys.exit(0)
+
     # MODE == "run": instrument the setup body, then call _get_db().
     rung_true = []
     _orig_rung = ec._rung_ready
@@ -171,12 +190,61 @@ CHILD = textwrap.dedent(
             raise PermissionError(errno.EPERM, "Operation not permitted")
         os.fchmod = _fchmod_eperm
 
+    if os.environ.get("LOCK_SPY") == "1":
+        # #3791 (A): observe the LOCK ACQUISITION itself (the `entered` marker only
+        # fires when the setup has pending work, so it cannot see a wrong acquire).
+        _orig_acq = ec._acquire_db_setup_lock
+        def _acq_spy(setup_wait):
+            fd = _orig_acq(setup_wait)
+            touch("locked")
+            return fd
+        ec._acquire_db_setup_lock = _acq_spy
+
+        # Also observe the FIRST time the real flock is refused (BlockingIOError):
+        # that proves this process holds an fd on the lock file's inode that exists
+        # at that moment and is waiting on its holder. The cells use `blocked` to
+        # make "W is blocked on A's OLD inode" a fact instead of a sleep.
+        import fcntl
+        _real_flock = fcntl.flock
+        def _flock_spy(fd, op):
+            try:
+                return _real_flock(fd, op)
+            except BlockingIOError:
+                if not os.path.exists(os.path.join(CTL, ROLE + ".blocked")):
+                    touch("blocked")
+                raise
+        fcntl.flock = _flock_spy
+
+    if os.environ.get("STAT_ALWAYS_MISMATCH") == "1":
+        # #3791 (A): for the lock path, os.stat reports an inode that can never equal
+        # the fd's, so the post-flock recheck mismatches forever. Opt-in only.
+        import types
+        _real_stat = os.stat
+        def _stat_mismatch(path, *a, **k):
+            r = _real_stat(path, *a, **k)
+            if str(path).endswith(os.environ["LOCK_SUFFIX"]):
+                return types.SimpleNamespace(st_dev=r.st_dev, st_ino=r.st_ino + (1 << 40))
+            return r
+        os.stat = _stat_mismatch
+
     touch("started")
     if os.environ.get("GO") == "1":
         while not os.path.exists(os.path.join(CTL, "go")):
             pass
 
+    def count_fds():
+        # #3791: portable open-descriptor count (fstat each slot; no /proc needed).
+        n = 0
+        for i in range(0, 1024):
+            try:
+                os.fstat(i)
+            except OSError:
+                continue
+            n += 1
+        return n
+
     res = {"ok": True, "error_type": None, "error_msg": None}
+    res["nfds_before"] = count_fds()
     t0 = time.time()
     try:
         if os.environ.get("WAIT_CLASS") == "hook":
@@ -187,6 +255,7 @@ CHILD = textwrap.dedent(
     except BaseException as e:  # report, never crash silently
         res.update(ok=False, error_type=type(e).__name__, error_msg=str(e))
     res["elapsed"] = time.time() - t0
+    res["nfds_after"] = count_fds()
     res["rung_true"] = rung_true
     print("RESULT " + json.dumps(res))
     '''
@@ -208,6 +277,7 @@ def _child_env(home, ctl, role, **extra):
         SERVER_WAIT_CONSTANT=SERVER_WAIT_CONSTANT,
         WAIT_KWARG=SETUP_WAIT_KWARG,
         WAIT_HOOK=SETUP_WAIT_HOOK,
+        LOCK_SUFFIX=LOCK_SUFFIX,
     )
     env.update({k: str(v) for k, v in extra.items()})
     return env
@@ -989,4 +1059,121 @@ def test_a_five_racers_100_trials_no_doubled_history_one_backup(
     assert not (doubled or bad_backups or diverged or errors), (
         f"{TRIALS} trials x {N} racers: doubled edit_history={doubled}, "
         f"backups!=1={bad_backups}, store!=serial reference in trials {diverged}, errors={errors[:3]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #3791 (A): inode recheck after the flock.
+# CLOSES: a WAITER blocked on the lock file's OLD inode when the name was deleted.
+# DOES NOT CLOSE: a FRESH process arriving after the delete creates a new inode,
+# locks it at once and runs beside the ORIGINAL holder (asserted in A1 below, so
+# the cell documents the remaining window; the refusal text says "with ENGRAM stopped").
+# ---------------------------------------------------------------------------
+def _hold(children, script, home, ctl, role):
+    c = Child(script, home, ctl, role, MODE="hold")
+    children.append(c)
+    return c
+
+
+def _lock_path(home):
+    return Path(str(_db(home)) + LOCK_SUFFIX)
+
+
+def test_a1_waiter_on_orphaned_inode_does_not_enter_beside_a_fresh_holder(
+    home, ctl, child_script, children
+):
+    A = _hold(children, child_script, home, ctl, "A")
+    assert A.wait_marker("locked"), "A never locked: " + A.err.read_text()[-500:]
+    W = _spawn(children, child_script, home, ctl, "W", LOCK_SPY=1)
+    assert W.wait_marker("started"), "W never started"
+    # W has really hit the lock held on A's (only, at this moment) inode.
+    assert W.wait_marker("blocked", timeout=30), "W never blocked on A's lock: " + W.err.read_text()[-500:]
+    assert not W.marker("locked"), "W acquired the lock while A holds it"
+    _lock_path(home).unlink()  # delete the NAME; A still holds the orphaned inode
+
+    B = _hold(children, child_script, home, ctl, "B")
+    # The documented remaining window: a FRESH process locks the new inode at once.
+    assert B.wait_marker("locked", timeout=10), "fresh B did not lock the re-created file"
+    A.touch("release")
+    time.sleep(1.5)  # fixed window in which W must stay out: B holds the CURRENT file
+    assert not W.marker("locked"), (
+        "W acquired the lock beside B: it took the orphaned inode after A released and did not recheck"
+    )
+    B.touch("release")
+    assert W.wait_marker("locked", timeout=30), "W never acquired after B released: " + W.err.read_text()[-500:]
+    rw = W.finish(timeout=60)
+    assert rw["ok"], rw
+    assert A.finish()["ok"] and B.finish()["ok"]
+    _assert_done_once(home, "(a1)")
+
+
+def test_a2_waiter_on_orphaned_inode_converges_on_the_recreated_file(
+    home, ctl, child_script, children
+):
+    A = _hold(children, child_script, home, ctl, "A")
+    assert A.wait_marker("locked"), "A never locked: " + A.err.read_text()[-500:]
+    W = _spawn(children, child_script, home, ctl, "W", LOCK_SPY=1)
+    assert W.wait_marker("started"), "W never started"
+    assert W.wait_marker("blocked", timeout=30), "W never blocked on A's lock: " + W.err.read_text()[-500:]
+    assert not W.marker("locked")
+    _lock_path(home).unlink()
+    A.touch("release")
+    assert W.wait_marker("locked", timeout=10), "W never acquired after the name was deleted and A released"
+    rw = W.finish(timeout=60)
+    assert rw["ok"], rw
+    assert A.finish()["ok"]
+    lp = _lock_path(home)
+    assert lp.is_file(), "the retry did not re-create the lock file"
+    assert str(W.proc.pid) in lp.read_text().split(), (
+        f"lock file {lp.read_text()!r} does not carry W's pid {W.proc.pid}"
+    )
+    _assert_done_once(home, "(a2)")
+
+
+def test_a4_reopen_failure_after_mismatch_raises_the_typed_error_and_leaks_nothing(
+    home, ctl, child_script, children
+):
+    A = _hold(children, child_script, home, ctl, "A")
+    assert A.wait_marker("locked"), "A never locked: " + A.err.read_text()[-500:]
+    W = _spawn(children, child_script, home, ctl, "W", LOCK_SPY=1)
+    assert W.wait_marker("started"), "W never started"
+    assert W.wait_marker("blocked", timeout=30), "W never blocked on A's lock: " + W.err.read_text()[-500:]
+    lp = _lock_path(home)
+    target = Path(ctl) / "symlink-target.bin"
+    payload = b"TARGET-bytes-that-must-survive\n" * 3
+    target.write_bytes(payload)
+    lp.unlink()                # delete the NAME; A still holds the orphaned inode
+    lp.symlink_to(target)      # the name now refers to something else: re-open hits ELOOP
+    A.touch("release")
+    rw = W.finish(timeout=60)
+    assert rw["error_type"] == UNUSABLE_ERROR_NAME, (
+        f"a failing re-open after the recheck mismatch must raise {UNUSABLE_ERROR_NAME}, got {rw}"
+    )
+    assert str(lp) in (rw["error_msg"] or ""), "error must name the lock path"
+    assert not W.marker("entered"), "the setup body ran without a validly held lock"
+    assert rw["rung_true"] == []
+    assert lp.is_symlink() and os.readlink(lp) == str(target), "the symlink was replaced"
+    assert target.read_bytes() == payload, "the symlink target was modified"
+    # The mismatch branch closed the old fd; the failed re-open must not close it twice
+    # (EBADF) nor leave one open.
+    assert rw["nfds_after"] == rw["nfds_before"], (
+        f"descriptor leak on the re-open failure path: {rw['nfds_before']} -> {rw['nfds_after']}"
+    )
+    assert A.finish()["ok"]
+
+
+def test_a3_endless_mismatch_still_honours_the_deadline(home, ctl, child_script, children):
+    before_bytes = raw_store_bytes(home)
+    W = _spawn(children, child_script, home, ctl, "W", WAIT_CLASS="hook", HOOK_WAIT_S=1,
+               STAT_ALWAYS_MISMATCH=1)
+    rw = W.finish(timeout=20)  # a hang fails here instead of freezing the suite
+    assert rw["error_type"] == BUSY_ERROR_NAME, (
+        f"endless recheck mismatch must end in {BUSY_ERROR_NAME} at the deadline, got {rw}"
+    )
+    assert rw["elapsed"] <= 1 + 5, f"deadline not honoured under endless mismatch: {rw['elapsed']:.1f}s"
+    assert not W.marker("entered"), "the setup ran despite the lock never being validly held"
+    assert raw_store_bytes(home) == before_bytes, "W wrote to the store"
+    # ~20 mismatching retries each close their fd; none may survive the call.
+    assert rw["nfds_after"] == rw["nfds_before"], (
+        f"descriptor leak on the recheck retry/deadline path: {rw['nfds_before']} -> {rw['nfds_after']}"
     )

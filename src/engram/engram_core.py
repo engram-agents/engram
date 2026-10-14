@@ -470,27 +470,15 @@ def _read_setup_lock_holder_pid(fd: int) -> str:
         return "unknown"
 
 
-def _acquire_db_setup_lock(setup_wait: str) -> int:
-    """Take the exclusive cross-process setup lock; return the open fd.
+def _open_db_setup_lock_file(lock_path: str) -> int:
+    """Open + validate the setup lock file; return the open fd (not yet flocked).
 
-    The caller MUST pass the fd to _release_db_setup_lock in a finally. Raises
-    DbSetupLockBusy / DbSetupLockTimeout / DbSetupLockUnusable (all
-    DbSetupLockError) and NEVER degrades to running unlocked -- deliberately
-    NOT _with_state_lock's degrade-to-unlocked path: proceeding without the
-    lock IS the race this lock exists to close.
+    Every failure raises DbSetupLockUnusable naming the path. Called again by
+    _acquire_db_setup_lock when the post-flock inode recheck finds the name no
+    longer refers to the locked file (#3791).
     """
-    if setup_wait == SETUP_WAIT_HOOK:
-        wait_s, is_hook = SETUP_LOCK_HOOK_WAIT_S, True
-    elif setup_wait == SETUP_WAIT_SERVER:
-        wait_s, is_hook = SETUP_LOCK_SERVER_WAIT_S, False
-    else:
-        raise ValueError(
-            f"setup_wait must be {SETUP_WAIT_HOOK!r} or {SETUP_WAIT_SERVER!r}, got {setup_wait!r}"
-        )
-    lock_path = str(DB_PATH) + SETUP_LOCK_SUFFIX
     fd = None
     try:
-        import fcntl
         import stat as _stat
 
         # Always 0600, NOT mirrored from the store: flock works on a read-only
@@ -532,28 +520,91 @@ def _acquire_db_setup_lock(setup_wait: str) -> int:
             f"cannot use setup lock file {lock_path}: {type(exc).__name__}: {exc}; "
             f"refusing to run the one-time DB setup without it"
         ) from exc
+    return fd
 
+
+def _lock_fd_names_path(fd: int, lock_path: str) -> bool:
+    """True iff fd and lock_path name the same file (st_dev, st_ino). A missing
+    name (deleted, not re-created) is a mismatch, not an error."""
+    try:
+        cur = os.stat(lock_path, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    st = os.fstat(fd)
+    return (st.st_dev, st.st_ino) == (cur.st_dev, cur.st_ino)
+
+
+def _acquire_db_setup_lock(setup_wait: str) -> int:
+    """Take the exclusive cross-process setup lock; return the open fd.
+
+    The caller MUST pass the fd to _release_db_setup_lock in a finally. Raises
+    DbSetupLockBusy / DbSetupLockTimeout / DbSetupLockUnusable (all
+    DbSetupLockError) and NEVER degrades to running unlocked -- deliberately
+    NOT _with_state_lock's degrade-to-unlocked path: proceeding without the
+    lock IS the race this lock exists to close.
+    """
+    if setup_wait == SETUP_WAIT_HOOK:
+        wait_s, is_hook = SETUP_LOCK_HOOK_WAIT_S, True
+    elif setup_wait == SETUP_WAIT_SERVER:
+        wait_s, is_hook = SETUP_LOCK_SERVER_WAIT_S, False
+    else:
+        raise ValueError(
+            f"setup_wait must be {SETUP_WAIT_HOOK!r} or {SETUP_WAIT_SERVER!r}, got {setup_wait!r}"
+        )
+    lock_path = str(DB_PATH) + SETUP_LOCK_SUFFIX
+    try:
+        import fcntl
+    except Exception as exc:
+        raise DbSetupLockUnusable(
+            f"cannot use setup lock file {lock_path}: {type(exc).__name__}: {exc}; "
+            f"refusing to run the one-time DB setup without it"
+        ) from exc
+    fd = _open_db_setup_lock_file(lock_path)
     deadline = time.monotonic() + wait_s
     next_log = 0.0
+
+    def _expired(holder):
+        if is_hook:
+            return DbSetupLockBusy(
+                f"ENGRAM is upgrading its store in another process (pid {holder}); "
+                f"memory blocks skipped this time"
+            )
+        return DbSetupLockTimeout(
+            f"timed out after {wait_s}s waiting for setup lock {lock_path} held by "
+            f"pid {holder}; the store was left untouched"
+        )
+
     try:
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
             except BlockingIOError:
                 pass  # EWOULDBLOCK/EAGAIN: held by another process -- wait below
+            else:
+                # #3791 (A): recheck that the fd we now hold still IS the file at
+                # the path. CLOSES: a waiter that was blocked on the OLD inode
+                # when someone deleted the name -- it now holds a deleted inode
+                # and would otherwise run beside a fresh process that created
+                # the new file; here it closes, re-opens (re-creating the file)
+                # and retries inside the SAME deadline. DOES NOT CLOSE: a FRESH
+                # process arriving after the delete creates a new inode, locks
+                # it at once and passes its own recheck, so it runs beside the
+                # ORIGINAL holder. That window stays documented ("with ENGRAM
+                # stopped" in the refusal text). A missing name counts as a
+                # mismatch.
+                if _lock_fd_names_path(fd, lock_path):
+                    break
+                if time.monotonic() >= deadline:
+                    raise _expired(_read_setup_lock_holder_pid(fd))
+                os.close(fd)
+                fd = None
+                time.sleep(min(_SETUP_LOCK_POLL_S, max(deadline - time.monotonic(), 0.001)))
+                fd = _open_db_setup_lock_file(lock_path)
+                continue
             now = time.monotonic()
             holder = _read_setup_lock_holder_pid(fd)
             if now >= deadline:
-                if is_hook:
-                    raise DbSetupLockBusy(
-                        f"ENGRAM is upgrading its store in another process (pid {holder}); "
-                        f"memory blocks skipped this time"
-                    )
-                raise DbSetupLockTimeout(
-                    f"timed out after {wait_s}s waiting for setup lock {lock_path} held by "
-                    f"pid {holder}; the store was left untouched"
-                )
+                raise _expired(holder)
             if not is_hook and now >= next_log:
                 print(
                     f"[engram] waiting for setup lock held by pid {holder} ({lock_path})",
@@ -562,10 +613,12 @@ def _acquire_db_setup_lock(setup_wait: str) -> int:
                 next_log = now + SETUP_LOCK_LOG_INTERVAL_S
             time.sleep(min(_SETUP_LOCK_POLL_S, max(deadline - now, 0.001)))
     except DbSetupLockError:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
         raise
     except Exception as exc:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
         raise DbSetupLockUnusable(
             f"cannot flock setup lock file {lock_path}: {type(exc).__name__}: {exc}; "
             f"refusing to run the one-time DB setup without it"
