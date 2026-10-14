@@ -110,7 +110,11 @@ module-level CHECK_RUNNER seam, which tests replace with captured output.
 Exit codes: 0 all four PASS; 1 any FAIL or extra child; 2 pidfile
 missing/unreadable/not an integer (ONE line, `CHECK FAIL supervisor not
 armed: ...`); 3 neither backend works -- no /proc AND ps unusable (ONE line,
-`CHECK FAIL unsupported platform`).
+`CHECK FAIL unsupported platform`). Exit 4 (start, #3773): the pidfile path is
+not a single regular file (a FIFO, symlink, hard link, directory, socket ...):
+ONE stderr line names it, nothing was started, no child was spawned; the same
+meaning as the engramd owner's EXIT_PIDFILE_NOT_REGULAR. A pidfile or status
+file that is not a regular file is read as unknown and never blocks `--check`.
 
 See --help for every override (script paths, pidfile/status-file locations,
 backoff/status-interval tuning, and the --*-cmd-json escape hatches the test
@@ -129,6 +133,43 @@ import sys
 import threading
 import time
 from pathlib import Path
+
+
+def _find_helper_dir() -> Path | None:
+    """The directory holding engram_regular_io.py: CLAUDE_PLUGIN_ROOT first,
+    then a walk of this file's parents (the installed plugin has the helper at
+    the plugin root with tools/ beside it; the source tree has it in
+    src/engram/). Never a fixed parents[N]: the build flattens the layout."""
+    cands: list[Path] = []
+    root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if root:
+        cands.append(Path(root))
+    here = Path(__file__).resolve()
+    for p in (here.parent, *here.parents):
+        cands.append(p)
+        cands.append(p / "src" / "engram")
+    for c in cands:
+        if (c / "engram_regular_io.py").exists():
+            return c
+    return None
+
+
+try:
+    import engram_regular_io  # noqa: F401
+except ImportError:
+    _helper_dir = _find_helper_dir()
+    if _helper_dir is not None:
+        sys.path.append(str(_helper_dir))
+    try:
+        import engram_regular_io  # noqa: F401
+    except ImportError:
+        print("monitor-supervisor: cannot import engram_regular_io (the shared "
+              "pidfile helper, installed beside the engram plugin); set "
+              "CLAUDE_PLUGIN_ROOT or reinstall", file=sys.stderr)
+        sys.exit(1)
+from engram_regular_io import NotRegularFile, kind_of_path, read_regular_text, write_pidfile
+
+EXIT_PIDFILE_NOT_REGULAR = 4
 
 TAGS = {
     "bell": "[bell]",
@@ -289,9 +330,16 @@ def reap_stale_supervisor(pidfile_path: str) -> None:
         (evidently stale/wrong) pidfile entry is left alone.
     """
     try:
-        old_pid = int(Path(pidfile_path).read_text().strip())
+        old_pid = int(read_regular_text(pidfile_path).strip())
     except (OSError, ValueError):
-        return  # no pidfile, or unreadable -- nothing recorded, nothing to reap
+        # no pidfile, or unreadable -- nothing recorded, nothing to reap. A
+        # pidfile that resolves to a FIFO / directory / socket (#3773) is
+        # named, once, and nothing is killed.
+        kind = kind_of_path(pidfile_path)
+        if kind is not None:
+            print(f"[supervisor] pidfile {pidfile_path} is a {kind}, not a regular "
+                  f"file; not reaping", file=sys.stderr, flush=True)
+        return
     if old_pid == os.getpid():
         return
     try:
@@ -827,7 +875,7 @@ def _load_status(status_file: str, max_status_age: float | None):
     stale: str | None = None
     note = ""
     try:
-        data = json.loads(Path(status_file).read_text())
+        data = json.loads(read_regular_text(status_file))
         if not isinstance(data, dict):
             raise ValueError("not an object")
         generated = float(data["generated_at"])
@@ -845,7 +893,12 @@ def _load_status(status_file: str, max_status_age: float | None):
         if age > limit:
             stale = f"status file missing/stale (age {age:.0f}s, max {limit:g}s)"
     except Exception as exc:  # missing, unparseable, no generated_at
-        stale = f"status file missing/stale ({exc.__class__.__name__})"
+        kind = kind_of_path(status_file) if isinstance(exc, OSError) else None
+        if kind is not None:
+            # #3773: a FIFO / directory / socket is UNKNOWN, named, never read.
+            stale = f"status file is a {kind}, not a regular file"
+        else:
+            stale = f"status file missing/stale ({exc.__class__.__name__})"
         if not isinstance(data, dict):
             data = None
     children = data.get("children") if isinstance(data, dict) else None
@@ -929,10 +982,15 @@ def run_check(pidfile: str, status_file: str, max_status_age: float | None) -> i
             print("CHECK FAIL unsupported platform: no /proc and ps is unusable")
             return 3
     try:
-        sup_pid = int(Path(pidfile).read_text().strip())
+        sup_pid = int(read_regular_text(pidfile).strip())
         if sup_pid <= 0:
             raise ValueError(f"non-positive pid {sup_pid}")
     except (OSError, ValueError) as exc:
+        kind = kind_of_path(pidfile)
+        if kind is not None:
+            print(f"CHECK FAIL supervisor not armed: pidfile {pidfile} is a {kind}, "
+                  f"not a regular file")
+            return 2
         print(f"CHECK FAIL supervisor not armed: pidfile {pidfile} {exc.__class__.__name__}: {exc}")
         return 2
 
@@ -1017,7 +1075,15 @@ def main(argv: list[str] | None = None) -> None:
     if os.getpgrp() != os.getpid():
         os.setpgrp()
     Path(args.pidfile).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.pidfile).write_text(str(os.getpid()))
+    try:
+        write_pidfile(args.pidfile, str(os.getpid()).encode("ascii"))
+    except NotRegularFile as exc:
+        # #3773: refuse by name, exit 4, BEFORE any child is spawned. This
+        # process has no restarting unit, so a distinct exit code is safe.
+        print(f"monitor-supervisor: refusing to start: the pidfile path {exc}; "
+              f"nothing was started. Remove it and start again",
+              file=sys.stderr, flush=True)
+        sys.exit(EXIT_PIDFILE_NOT_REGULAR)
 
     cmds = build_child_commands(args)
     supervisor = Supervisor(cmds, args.status_file, args.status_interval, args.pidfile)

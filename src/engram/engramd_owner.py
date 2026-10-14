@@ -255,6 +255,7 @@ import engram_pidfile
 import engram_walguard
 import engramd_client as ec
 import engramd_read_registry as rr
+from engram_regular_io import NotRegularFile, describe_file_kind, write_pidfile
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -1867,13 +1868,7 @@ class EngramdOwner:
 
     @staticmethod
     def _kind_of_mode(mode: int) -> str:
-        if stat.S_ISFIFO(mode):
-            return "FIFO"
-        if stat.S_ISLNK(mode):
-            return "symlink"
-        if stat.S_ISDIR(mode):
-            return "directory"
-        return "non-regular file"
+        return describe_file_kind(mode)
 
     def _pidfile_refusal_text(self, mode: int | None, nlink: int | None = None) -> str:
         if mode is not None and stat.S_ISREG(mode) and nlink is not None and nlink != 1:
@@ -1887,53 +1882,22 @@ class EngramdOwner:
         )
 
     def _write_pidfile(self) -> None:
-        """Write this process's pid to the pidfile (#3768). The open is
-        race-free: explicit flags, `O_NOFOLLOW` (a symlink is refused, not
-        followed), `O_NONBLOCK` (a FIFO with no reader fails with ENXIO
-        instead of waiting), then `fstat` must say regular file. This write
-        path REFUSES symlinks on purpose -- on a write the follow IS the
-        truncation of the target -- unlike the read-side liveness check in
-        `engram_pidfile.recorded_live_pid`, which follows symlinks bounded by
-        `O_NONBLOCK` + `fstat`; do not "fix" one side to match the other.
-        `O_NOFOLLOW` guards symlinks only: the `st_nlink == 1` check on the
-        open fd, plus truncating (`ftruncate`) only AFTER that check and never
-        with `O_TRUNC` inside `open(2)`, is the hard-link guard.
+        """Write this process's pid to the pidfile (#3768). The write
+        sequence (O_NOFOLLOW, O_NONBLOCK, no O_TRUNC, fstat regular-and-
+        single-link, only then ftruncate) is the shared
+        `engram_regular_io.write_pidfile` (#3773), also used by the collab
+        tools; this write path REFUSES symlinks on purpose, unlike the
+        read-side liveness check in `engram_pidfile.recorded_live_pid`.
 
-        ENXIO, ELOOP, EISDIR, EOPNOTSUPP, ENODEV and a non-regular `fstat` become
-        OwnerPidfileNotRegular after releasing what start() already
-        acquired (the socket and both store connections; the accept thread
-        does not exist yet). Any other OSError propagates unchanged."""
-        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+        A refusal (`NotRegularFile`) becomes OwnerPidfileNotRegular after
+        releasing what start() already acquired (the socket and both store
+        connections; the accept thread does not exist yet). Any other
+        OSError propagates unchanged."""
         try:
-            fd = os.open(self.pid_path, flags, 0o666)
-        except OSError as exc:
-            # A socket-type file gives ENXIO (Linux) / EOPNOTSUPP (macOS);
-            # ENODEV covers a device node with no driver. getattr so a
-            # platform lacking one of them still imports.
-            not_regular_errnos = {
-                getattr(errno, name)
-                for name in ("ENXIO", "ELOOP", "EISDIR", "EOPNOTSUPP", "ENODEV")
-                if hasattr(errno, name)
-            }
-            if exc.errno not in not_regular_errnos:
-                raise
+            write_pidfile(self.pid_path, str(os.getpid()).encode("ascii"))
+        except NotRegularFile as exc:
             self._cleanup()
-            raise OwnerPidfileNotRegular(self._pidfile_refusal_text(self._lstat_mode())) from exc
-        try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-                self._cleanup()
-                raise OwnerPidfileNotRegular(self._pidfile_refusal_text(st.st_mode, st.st_nlink))
-            os.ftruncate(fd, 0)
-            os.write(fd, str(os.getpid()).encode("ascii"))
-        finally:
-            os.close(fd)
-
-    def _lstat_mode(self) -> int | None:
-        try:
-            return os.lstat(self.pid_path).st_mode
-        except OSError:
-            return None
+            raise OwnerPidfileNotRegular(self._pidfile_refusal_text(exc.st_mode, exc.nlink)) from exc
 
     def _load_read_registry(self, dynamic: bool) -> "rr.Registry":
         """Load the committed template list, classifying each template

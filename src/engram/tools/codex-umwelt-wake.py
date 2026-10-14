@@ -26,6 +26,15 @@ Environment overrides:
   UMWELT_CONFIG                     default ~/.umwelt/config.json
   CODEX_UMWELT_WAKE_INTERVAL        default 2.0 seconds
   CODEX_UMWELT_WAKE_NO_REAP         non-empty => skip single-instance reap
+  CODEX_UMWELT_WAKE_REFUSAL_RECHECK_S
+                                    default 60 seconds between rechecks while
+                                    the pidfile path is not a regular file
+
+A pidfile path that is not a single regular file (a FIFO, symlink, hard link,
+directory, socket ...) is never read through a blocking open and never written
+through. `run` reports the refusal ONCE and idles, rechecking slowly, starting
+normally the moment the path is acceptable; it never exits on it, because a
+supervising unit that restarts on exit would relaunch it every few seconds.
 """
 from __future__ import annotations
 
@@ -35,6 +44,7 @@ from collections import deque
 import contextlib
 import hashlib
 import json
+import math
 import os
 import select
 import secrets
@@ -52,6 +62,41 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+
+def _find_helper_dir() -> Path | None:
+    """The directory holding engram_regular_io.py: CLAUDE_PLUGIN_ROOT first,
+    then a walk of this file's parents (the installed plugin has the helper at
+    the plugin root with tools/ beside it; the source tree has it in
+    src/engram/). Never a fixed parents[N]: the build flattens the layout."""
+    cands: list[Path] = []
+    root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if root:
+        cands.append(Path(root))
+    here = Path(__file__).resolve()
+    for p in (here.parent, *here.parents):
+        cands.append(p)
+        cands.append(p / "src" / "engram")
+    for c in cands:
+        if (c / "engram_regular_io.py").exists():
+            return c
+    return None
+
+
+try:
+    import engram_regular_io  # noqa: F401
+except ImportError:
+    _helper_dir = _find_helper_dir()
+    if _helper_dir is not None:
+        sys.path.append(str(_helper_dir))
+    try:
+        import engram_regular_io  # noqa: F401
+    except ImportError:
+        print("codex-umwelt-wake: cannot import engram_regular_io (the shared "
+              "pidfile helper, installed beside the engram plugin); set "
+              "CLAUDE_PLUGIN_ROOT or reinstall", file=sys.stderr)
+        sys.exit(1)
+from engram_regular_io import NotRegularFile, kind_of_path, read_regular_text, write_pidfile
+
 from websockets.sync.client import connect as ws_connect
 
 ENGRAM_HOME = Path(os.environ.get("ENGRAM_HOME", Path.home() / ".engram"))
@@ -61,6 +106,7 @@ DEFAULT_INTERVAL = float(os.environ.get("CODEX_UMWELT_WAKE_INTERVAL", "2.0"))
 DEFAULT_UMWELT_CONFIG = Path(os.environ.get("UMWELT_CONFIG", Path.home() / ".umwelt" / "config.json"))
 DEFAULT_THREAD_OVERRIDE = os.environ.get("CODEX_THREAD_ID")
 STATUS_VERSION = 2
+DEFAULT_REFUSAL_RECHECK_S = 60.0
 STATE_VERSION = 6
 MAX_RECENT_DELIVERED = 256
 MAX_MONITOR_RECOVERY_TURNS = 32
@@ -2222,8 +2268,17 @@ def reap_prior(paths: RuntimePaths, logger: Logger | None = None) -> None:
     if os.environ.get("CODEX_UMWELT_WAKE_NO_REAP"):
         return
     try:
-        old = int(paths.pid_path.read_text(encoding="utf-8").strip())
+        old = int(read_regular_text(paths.pid_path, encoding="utf-8").strip())
     except Exception:
+        # #3773: a pidfile that is a FIFO / directory / socket is named once
+        # and nothing is killed.
+        kind = kind_of_path(paths.pid_path)
+        if kind is not None:
+            note = f"pidfile {paths.pid_path} is a {kind}, not a regular file; not reaping"
+            if logger is not None:
+                logger.log(note)
+            else:
+                print(f"codex-umwelt-wake: {note}", file=sys.stderr)
         return
     if old == os.getpid():
         return
@@ -2240,15 +2295,50 @@ def reap_prior(paths: RuntimePaths, logger: Logger | None = None) -> None:
 
 
 def write_pid(paths: RuntimePaths) -> None:
+    """Write this pid through the shared non-blocking, symlink- and hard-link-
+    refusing write (#3773). Lets NotRegularFile propagate."""
     paths.state_dir.mkdir(parents=True, exist_ok=True)
-    paths.pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    write_pidfile(paths.pid_path, f"{os.getpid()}\n".encode("ascii"))
+
+
+def _refusal_recheck_seconds() -> float:
+    """Seconds between rechecks while the pidfile path is refused; read at call
+    time so a test can shorten it. Unparseable or non-positive -> the default."""
+    try:
+        value = float(os.environ.get("CODEX_UMWELT_WAKE_REFUSAL_RECHECK_S", DEFAULT_REFUSAL_RECHECK_S))
+    except ValueError:
+        return DEFAULT_REFUSAL_RECHECK_S
+    # time.sleep(inf) raises OverflowError: a non-finite value is a bad value.
+    return value if math.isfinite(value) and value > 0 else DEFAULT_REFUSAL_RECHECK_S
+
+
+def wait_for_acceptable_pidfile(paths: RuntimePaths, logger: Logger | None, sleep=time.sleep) -> None:
+    """write_pid, and while the pidfile path is refused: report ONCE (stderr and
+    the log), then sleep and try again, forever. Never exits on its own: the
+    watcher's unit restarts on exit, so an exit would be relaunched every few
+    seconds. Returns once write_pid succeeds."""
+    reported = False
+    while True:
+        try:
+            write_pid(paths)
+            return
+        except NotRegularFile as exc:
+            interval = _refusal_recheck_seconds()
+            if not reported:
+                line = (f"codex-umwelt-wake: refusing to start: the pidfile path {exc}; "
+                        f"will recheck every {interval:g}s. Remove it to start")
+                print(line, file=sys.stderr, flush=True)
+                if logger is not None:
+                    logger.log(line)
+                reported = True
+            sleep(interval)
 
 
 def remove_pid(paths: RuntimePaths) -> None:
     try:
-        pid = int(paths.pid_path.read_text(encoding="utf-8").strip())
+        pid = int(read_regular_text(paths.pid_path, encoding="utf-8").strip())
     except Exception:
-        return
+        return  # absent, unreadable, or not a regular file: leave the path alone
     if pid == os.getpid():
         try:
             paths.pid_path.unlink()
@@ -2260,10 +2350,32 @@ def update_status(paths: RuntimePaths, payload: dict[str, Any]) -> None:
     atomic_write_json(paths.status_path, payload)
 
 
-def current_status(paths: RuntimePaths) -> dict[str, Any]:
-    status = load_json(paths.status_path, default_status(paths))
+def _read_regular_or_note(path: Path, what: str) -> str | None:
+    """The text of a regular file, or None; when the path is a FIFO / directory /
+    socket, ONE stderr line names it (#3773) instead of blocking on it."""
     try:
-        pid = int(paths.pid_path.read_text(encoding="utf-8").strip())
+        return read_regular_text(path, encoding="utf-8")
+    except Exception:
+        kind = kind_of_path(path)
+        if kind is not None:
+            print(f"codex-umwelt-wake: {what} {path} is a {kind}, not a regular file",
+                  file=sys.stderr)
+        return None
+
+
+def current_status(paths: RuntimePaths) -> dict[str, Any]:
+    status = default_status(paths)
+    status_text = _read_regular_or_note(paths.status_path, "status file")
+    if status_text is not None:
+        try:
+            data = json.loads(status_text)
+            if isinstance(data, dict):
+                status = data
+        except Exception:
+            pass
+    try:
+        pid_text = _read_regular_or_note(paths.pid_path, "pidfile")
+        pid = int(pid_text.strip()) if pid_text is not None else None
     except Exception:
         pid = None
     running = False
@@ -2414,7 +2526,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if not args.once:
         reap_prior(paths, logger)
-        write_pid(paths)
+        try:
+            wait_for_acceptable_pidfile(paths, logger)
+        except KeyboardInterrupt:
+            return 130  # SIGINT while idling on a refused pidfile: no traceback
         install_signal_handlers(paths, started_at)
 
     codex_monitor = CodexItemCompletedMonitor(app_server=args.app_server, logger=logger)
@@ -2490,8 +2605,12 @@ def cmd_start(args: argparse.Namespace) -> int:
 def cmd_stop(args: argparse.Namespace) -> int:
     paths = build_paths(args.state_dir)
     try:
-        pid = int(paths.pid_path.read_text(encoding="utf-8").strip())
+        pid = int(read_regular_text(paths.pid_path, encoding="utf-8").strip())
     except Exception:
+        kind = kind_of_path(paths.pid_path)
+        if kind is not None:
+            print(f"codex-umwelt-wake: pidfile is a {kind}, not a regular file", file=sys.stderr)
+            return 1
         print("codex-umwelt-wake: no pidfile", file=sys.stderr)
         return 1
     status, cmdline = proc_cmdline(pid)

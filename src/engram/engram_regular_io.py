@@ -20,9 +20,122 @@ that core's ``_reset_principle_enactments`` and the two hooks all share.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
+
+
+def describe_file_kind(mode: int) -> str:
+    """The one word for what `mode` (an st_mode) says a non-regular path is
+    (#3773). The ONE kind mapping: the engramd owner and the collab tools all
+    name a refused path through it. Anything not listed (and a regular mode,
+    which callers do not ask about) reads "non-regular file"."""
+    if stat.S_ISFIFO(mode):
+        return "FIFO"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "character device"
+    if stat.S_ISBLK(mode):
+        return "block device"
+    return "non-regular file"
+
+
+class NotRegularFile(OSError):
+    """A pidfile write target that is not a single regular file (#3773).
+
+    str(exc) is "<path> is a <kind>, not a regular file", or, for a regular
+    file with st_nlink != 1, "<path> has <n> hard links, not a single regular
+    file". Fields: .path, .st_mode (int | None), .nlink (int | None), .kind
+    (the describe_file_kind word, or "hard-linked file")."""
+
+    def __init__(self, path, st_mode=None, nlink=None):
+        self.path = str(path)
+        self.st_mode = st_mode
+        self.nlink = nlink
+        if st_mode is not None and stat.S_ISREG(st_mode) and nlink is not None and nlink != 1:
+            self.kind = "hard-linked file"
+            text = f"{self.path} has {nlink} hard links, not a single regular file"
+        else:
+            self.kind = describe_file_kind(st_mode) if st_mode is not None else "non-regular file"
+            text = f"{self.path} is a {self.kind}, not a regular file"
+        super().__init__(text)
+
+    def __str__(self) -> str:
+        return self.args[0]
+
+
+def write_pidfile(path, data: bytes) -> None:
+    """Write `data` to a pidfile that must be ONE regular file (#3773; the
+    sequence the engramd owner merged in #3768, now shared).
+
+    Open with O_WRONLY|O_CREAT|O_NOFOLLOW|O_NONBLOCK and mode 0o666 (umask
+    applies) and NO O_TRUNC: O_NOFOLLOW refuses a symlink (on a write the
+    follow IS the truncation of its target), O_NONBLOCK makes a reader-less
+    FIFO fail with ENXIO instead of waiting. ENXIO, ELOOP, EISDIR, EOPNOTSUPP
+    and ENODEV become NotRegularFile; any other OSError propagates unchanged.
+    Then fstat the open fd: not a regular file, or st_nlink != 1 (a hard link
+    shares another name's inode) -> close it and raise NotRegularFile. Only
+    then ftruncate and write, so a refused target is never touched.
+
+    This write path REFUSES symlinks on purpose; the read side
+    (open_regular_text) follows them. Do not "fix" one side to match the other.
+
+    Two stated bounds of the hard-link guard:
+      * st_nlink is not trustworthy on every filesystem. On an odd or
+        network-mounted home a LEGITIMATE pidfile can report st_nlink != 1 and
+        be refused, so its caller does not start. That is the failure
+        direction of this guard, opposite to the one it was added for.
+      * A hard link created between the fstat and the ftruncate still
+        truncates the shared inode. The window is two syscalls deep, it needs
+        write access to the directory that holds the pidfile (the same
+        precondition the guard already assumes), and there is no portable
+        remedy."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        fd = os.open(path, flags, 0o666)
+    except OSError as exc:
+        # getattr so a platform lacking one of them still imports.
+        not_regular = {
+            getattr(errno, name)
+            for name in ("ENXIO", "ELOOP", "EISDIR", "EOPNOTSUPP", "ENODEV")
+            if hasattr(errno, name)
+        }
+        if exc.errno not in not_regular:
+            raise
+        try:
+            mode = os.lstat(path).st_mode
+        except OSError:
+            mode = None
+        raise NotRegularFile(path, mode, None) from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise NotRegularFile(path, st.st_mode, st.st_nlink)
+        os.ftruncate(fd, 0)
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
+def kind_of_path(path):
+    """What `path` resolves to, in one word, when it is not a regular file
+    (#3773): the describe_file_kind word, or None for a regular file, an
+    absent path, or one that cannot be stat'ed. os.stat follows symlinks and
+    never opens, so it cannot block on a FIFO. It exists so a READ failure
+    can say what the file is in one line."""
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return None
+    if stat.S_ISREG(mode):
+        return None
+    return describe_file_kind(mode)
 
 
 def _not_regular_error(fd, path):

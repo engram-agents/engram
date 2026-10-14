@@ -32,7 +32,7 @@
       },
       {
         "file": "tools/codex-umwelt-wake.py",
-        "line": 515,
+        "line": 561,
         "reason": "Codex RPC notification-drain dispatch (getattr(rpc, 'drain_buffered_notifications', None)); this file contains zero emit()/emit_if_initialized() calls and is not on any site's backward-walk path.",
         "zero_emit_file": true
       }
@@ -257,7 +257,7 @@
     {
       "path": "engram_regular_io.py",
       "tier": "essential",
-      "note": "Non-blocking, regular-file-only text opens (open_regular_text / read_regular_text / open_regular_text_write / open_regular_text_append; #3591, #3628): a FIFO at a config/marker/log path raises OSError instead of hanging a hook under its 5 s timeout. Stdlib-only. Essential because engram_config_io and engram_log_emitter import it (hard dependencies) (hooks/_hooklib.py keeps its own identical copy, pinned by tests/test_regular_io_parity_3628.py). Layering: hooks import core, never the reverse."
+      "note": "Non-blocking, regular-file-only text opens (open_regular_text / read_regular_text / open_regular_text_write / open_regular_text_append; #3591, #3628): a FIFO at a config/marker/log path raises OSError instead of hanging a hook under its 5 s timeout. Stdlib-only. Also holds the shared pidfile write (write_pidfile, NotRegularFile, describe_file_kind, kind_of_path; #3773). Essential because engram_config_io and engram_log_emitter import it (hard dependencies), as does engramd_owner.py, and so do the Convenience-tier tools monitor-supervisor.py and codex-umwelt-wake.py (hard dependencies; they refuse with a named error if it is missing) (hooks/_hooklib.py keeps its own identical copy, pinned by tests/test_regular_io_parity_3628.py). Layering: hooks import core, never the reverse."
     },
     {
       "path": "engram_search_rules.py",
