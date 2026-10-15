@@ -1616,12 +1616,56 @@ def _make_special(kind: str, path: Path):
     elif kind == "directory":
         path.mkdir()
     elif kind == "socket":
+        # AF_UNIX paths are capped at 104 (macOS) / 108 (Linux) bytes, and the limit applies to the string
+        # handed to bind(); bind by a relative name from the parent so a deep tmp prefix cannot trip it (#3808).
         sock = _socket.socket(_socket.AF_UNIX)
-        sock.bind(str(path))
+        cwd = os.getcwd()
+        try:
+            os.chdir(path.parent)
+            sock.bind(path.name)
+        except BaseException:
+            sock.close()
+            raise
+        finally:
+            os.chdir(cwd)
         return sock
     else:
         raise AssertionError(kind)
     return None
+
+
+def test_make_special_socket_binds_a_path_longer_than_the_af_unix_limit(tmp_path):
+    """#3808: the helper binds by a RELATIVE name, so a deep tmp prefix cannot trip `AF_UNIX path too long`.
+    Needs no /proc, so it runs on every OS."""
+    deep = tmp_path / ("d" * 20)
+    while len(str(deep / "engramd.pid")) <= 110:  # > 108 (Linux) and > 104 (macOS)
+        deep = deep / ("d" * 20)
+    deep.mkdir(parents=True)
+    path = deep / "engramd.pid"
+    assert len(str(path).encode()) > 108, len(str(path).encode())
+    before = os.getcwd()
+    sock = _make_special("socket", path)
+    try:
+        assert stat.S_ISSOCK(os.lstat(path).st_mode)
+        assert os.getcwd() == before, "the helper must restore the cwd"
+    finally:
+        sock.close()
+    assert sock.fileno() == -1, "the socket must be closed at the end"
+
+
+@pytest.mark.parametrize("failure", ["missing-parent", "name-already-taken"])
+def test_make_special_socket_restores_the_cwd_when_it_raises(tmp_path, failure):
+    """missing-parent fails at chdir; name-already-taken fails at bind AFTER the chdir succeeded (the case
+    where only the `finally` restores the cwd)."""
+    if failure == "missing-parent":
+        path = tmp_path / "no-such-dir" / "engramd.pid"
+    else:
+        path = tmp_path / "engramd.pid"
+        path.write_text("x")
+    before = os.getcwd()
+    with pytest.raises(OSError):
+        _make_special("socket", path)
+    assert os.getcwd() == before, "the cwd must be restored even when the helper raises"
 
 
 # ---- K14: a planted special file at engramd.pid never blocks the hook; nothing is launched ------------------
