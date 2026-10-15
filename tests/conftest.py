@@ -10,6 +10,10 @@ import socket
 import subprocess
 import sys
 import tempfile
+# #3784 (b): pre-import so a sys.modules clear in another thread (patch.dict
+# exit) cannot break pytest's lazy `import tracemalloc` in thread_exception_hook,
+# which masks the real thread exception. Must stay at module level.
+import tracemalloc  # noqa: F401
 import types
 
 import pytest
