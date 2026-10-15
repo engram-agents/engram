@@ -515,3 +515,42 @@ def fresh_module(mod: types.ModuleType) -> types.ModuleType:
             del sys.modules[key]
     import importlib
     return importlib.import_module(mod_name)
+
+
+def _load_release_helper():
+    """Return the `_release_server_copies` module, or None; never raises. Resolved by absolute
+    path from this file, not by `sys.path`: a NESTED pytest session loads this conftest from
+    another rootdir where `tests/` is not importable. Reuses a `sys.modules` entry so the fixture
+    and a test file's own import share one module object (one state)."""
+    try:
+        mod = sys.modules.get("_release_server_copies")
+        if mod is not None:
+            return mod
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).with_name("_release_server_copies.py")
+        spec = importlib.util.spec_from_file_location("_release_server_copies", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["_release_server_copies"] = mod  # registered BEFORE exec
+        try:
+            spec.loader.exec_module(mod)
+        except BaseException:
+            sys.modules.pop("_release_server_copies", None)
+            raise
+        return mod
+    except Exception:
+        return None
+
+
+@pytest.fixture(autouse=True)
+def _release_replaced_server_copies_3807():
+    """#3807: after each test, free the memo caches that pin replaced `server` copies, so tests
+    that purge + re-import `server` do not leak ~4 MB per test. Teardown only; a no-op unless the
+    `server` module object changed since the last sweep. Never raises."""
+    yield
+    helper = _load_release_helper()
+    if helper is not None:
+        helper.release_if_server_changed()
