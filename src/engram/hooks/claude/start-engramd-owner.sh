@@ -13,7 +13,11 @@
 #     STRICT mode, require_marker=True: the marker is required of any live pid whatever its
 #     start time, an unreadable argv counts as alive, and an unrelated live process without
 #     `engramd_owner` in its argv never counts)
-#                                                        -> launch nothing, say nothing
+#     AND that owner SERVES, decided by the `serving` probe (#3736): the owner's own socket is
+#     asked for a `ping` within the helper's named bound. Serving -> launch nothing, say nothing.
+#     Alive but no healthy ping answer within that bound -> launch nothing (a second owner is
+#     worse than a missing one) and ONE line saying so. The probe could not run (no importable
+#     client, or the answer is unrecognized) -> nothing is claimed and nothing is launched.
 #   * engram_pidfile cannot be imported                -> launch nothing, say so (ambiguous)
 #   * the supervised unit / job for THIS home is registered. The home key <id> is the first 8
 #     hex of sha256 over the physical ENGRAM_HOME, derived by tools/engramd-owner-home-key.sh,
@@ -27,7 +31,16 @@
 #                                                           macOS the last exit status)
 #   * the supervisor answers "no such unit / job"        -> launch the owner detached,
 #     (Linux also: `systemctl` is absent, or `systemctl --user` cannot answer -- no user bus,
-#     e.g. WSL)                                             ONE line containing UNSUPERVISED
+#     e.g. WSL)                                             ONE line: UNSUPERVISED when it then
+#                                                           serves a `ping` (#3736), the same
+#                                                           line plus the not-serving state when
+#                                                           it does not, its own "exited during
+#                                                           the serving probe" line when it died
+#                                                           inside the probe (NOT the "exited
+#                                                           within a second" one: it outlived
+#                                                           the watch), or the "could not be
+#                                                           started" line when it died inside
+#                                                           the watch
 #   * macOS: launchd has NO GUI domain for this uid (`launchctl print gui/<uid>/<label>` exits
 #     125 "Domain does not support specified action": no GUI login session, #3780)
 #                                                        -> launch the owner detached, UNSUPERVISED,
@@ -204,9 +217,28 @@ fi
 _live_verdict() {
     "$PYTHON_BIN" "$IO_PY" live "$ENGRAM_HOME" 2>/dev/null
 }
+# #3736: a live pid is not a serving owner. The helper owns the bound (stock macOS has no GNU
+# `timeout`): it asks the owner's own socket for a `ping` within its named window and prints
+# serving | notserving:<what was observed within that window> | ambiguous:<why>. It launches
+# nothing. `notserving:` is a BUDGETED claim, never "the owner does not serve".
+_probe_serving() {
+    "$PYTHON_BIN" "$IO_PY" serving "$ENGRAM_HOME" 2>/dev/null
+}
 _verdict="$(_live_verdict)"
 case "$_verdict" in
-    alive) exit 0 ;;
+    alive)
+        # The pid exists, but only the socket says whether the owner SERVES (#3736). Report the
+        # not-serving state ONCE and launch nothing: a second owner against a live pid is the
+        # hazard this hook exists to avoid. When the probe cannot run (no importable client) it
+        # answers `ambiguous:` and nothing is claimed -- today's behaviour, a live pid is left
+        # alone. Liveness is re-read before reporting: a process that died while the probe ran is
+        # the exited state, not the not-serving one, and must not be misdiagnosed as wedged.
+        _serving="$(_probe_serving)"
+        if [ "${_serving%%:*}" = "notserving" ] && [ "$(_live_verdict)" = "alive" ]; then
+            _report "ENGRAM owner is alive but NOT SERVING: engramd.pid names a live engramd_owner, with ${_serving#notserving:}; no second owner was launched. ENGRAM_HOME=$ENGRAM_HOME"
+        fi
+        exit 0
+        ;;
     none) ;;
     notregular:*)
         _report "ENGRAM owner not launched: engramd.pid is not a regular file (${_verdict#notregular:}); a planted special file is abnormal, launching nothing. ENGRAM_HOME=$ENGRAM_HOME"
@@ -427,7 +459,27 @@ if [ "$_ok" -eq 0 ]; then
 fi
 
 if [ "$_ok" -eq 1 ]; then
-    _report "UNSUPERVISED: engramd_owner launched (pid $_pid); no supervisor reachable ($_sup). ENGRAM_HOME=$ENGRAM_HOME. $_log_note"
+    # The process survived the watch -- but alive is still not serving (#3736). Ask the socket,
+    # then decide. Liveness is re-read before the REPORT (never before the probe): a process that
+    # died while the probe ran is its own state, not this one -- a dead owner and a wedged one need
+    # different remedies, so the three states must never collapse into one line.
+    _serving="$(_probe_serving)"
+    if ! _alive "$_pid"; then
+        # Died DURING the probe: it was launched, it was alive at the end of the launch watch, and
+        # it is gone at report time. Its OWN line, because "exited within a second" is false for a
+        # process that outlived the ~1.2 s watch (#3736 round-2 F1) -- and because sharing the
+        # exited line made the two paths indistinguishable, which is exactly what let a process
+        # that died inside the WATCH (probe never reached) pass as this state.
+        case "$_serving" in
+            notserving:*) _probe_note="; the serving probe observed ${_serving#notserving:}" ;;
+            *) _probe_note="" ;;
+        esac
+        _report "ENGRAM owner exited during the serving probe: engramd_owner (pid $_pid) was alive at the end of the launch watch and gone at report time${_probe_note}; no supervisor reachable ($_sup). ENGRAM_HOME=$ENGRAM_HOME. $_log_note"
+    elif [ "${_serving%%:*}" = "notserving" ]; then
+        _report "UNSUPERVISED: engramd_owner launched (pid $_pid) but it is NOT SERVING: ${_serving#notserving:}; no supervisor reachable ($_sup). ENGRAM_HOME=$ENGRAM_HOME. $_log_note"
+    else
+        _report "UNSUPERVISED: engramd_owner launched (pid $_pid); no supervisor reachable ($_sup). ENGRAM_HOME=$ENGRAM_HOME. $_log_note"
+    fi
 else
     _launch_failed "the process exited within a second" "$_log_note"
 fi
