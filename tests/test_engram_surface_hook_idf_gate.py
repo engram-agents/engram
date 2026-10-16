@@ -376,6 +376,7 @@ class TestShouldPrepend(unittest.TestCase):
 
             hook = _load_hook_module()
             hook.ENGRAM_HOME = tmp
+            hook.CONFIG_PATH = os.path.join(hook.ENGRAM_HOME, "config.json")  # #3827: CONFIG_PATH is the hook's one config source
             cfg = hook._get_auto_surface_config()
             self.assertFalse(cfg["idf_gate_enabled"])
         finally:
@@ -389,6 +390,7 @@ class TestShouldPrepend(unittest.TestCase):
         try:
             hook = _load_hook_module()
             hook.ENGRAM_HOME = tmp
+            hook.CONFIG_PATH = os.path.join(hook.ENGRAM_HOME, "config.json")  # #3827: CONFIG_PATH is the hook's one config source
             cfg = hook._get_auto_surface_config()
             self.assertTrue(cfg["idf_gate_enabled"])
             self.assertEqual(cfg["idf_gate_min_idf"], 4.0)

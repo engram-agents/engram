@@ -57,6 +57,8 @@ from _hooklib import open_regular_text, open_regular_text_write
 # #3628: every mode=ro sqlite connect refuses a FIFO / directory (raising a
 # sqlite3.OperationalError + OSError) instead of hanging.
 from _hooklib import connect_regular_ro
+# U10 (#3821): the flag helper's lazy importer, shared with the other owner-backed hooks.
+from _hooklib import import_owner_flags as _hooklib_import_owner_flags
 from _harness import detect_harness, get_harness_budgets
 try:
     from _hooklib import atomic_write_json
@@ -143,6 +145,293 @@ _SURFACE_FIRE_SITE = "surface-hook.surface_fire"
 _TRIGGER_FIRE_SITE = "surface-hook.trigger_fire"
 _RENDER_SIZE_SITE = "surface-hook.render_size"
 
+# ---------------------------------------------------------------------------
+# U10 (#3821, part of #2652) -- the flagged read through the engramd owner
+# ---------------------------------------------------------------------------
+# With `engramd.surface_reads_via_owner` true in $ENGRAM_HOME/config.json (read ONLY through
+# engramd_owner_flags.flag_on), the hook's store reads go through ONE
+# engramd_client.OwnerReadConnection shared by the whole fire and never open knowledge.db:
+#   row 1  _check_embedding_restore_flag     the `read` op (registered template)
+#   row 2  _dormant_focus_set_candidates     the `read` op (two registered templates)
+#   row 3  _render_triggered_principles_section   the typed `chain` op
+#   row 4  main -> _should_prepend -> engram_idf.extract_keywords   COUNT template + typed `df`
+#   row 5  in-context exclusion / route ledger -> _hooklib._focused_ids   via the shim
+#   row 6  _check_db_liveness                DERIVED from row 1's read (amended 13:56Z; fold 3): the
+#                                            fire's own store read answers Ok -> healthy, no extra trip;
+#                                            only when it FAILS is one `ping` sent, to tell owner-down
+#                                            from 'owner up, store unreadable'. `ping` alone is
+#                                            store-free (blind to a store that broke AFTER the owner
+#                                            started, #1218), which is why the verdict rides a store read
+#   row 7  query_fts_fallback                NOT TAKEN (an in-hook server runtime, the #3741
+#                                            class): the recall daemon down renders the hook's
+#                                            existing daemon-down notice and no recall block
+#   row 8  _advance_person_moment_cursor     STAYS DIRECT on both flag values (an RW
+#                                            sqlite3.connect, a registered write site): the named
+#                                            remainder, it moves with the first owner write unit.
+# Flag OFF is today's direct path, unchanged. Modelled on U6b (engram-lesson-tripwire-hook.py)
+# and U9 (engram-session-start-hook.py).
+#
+# Owner failure (any OwnerReadError, or the client failing to import): the failing site returns
+# the degraded value it returns for a failed direct read (never a stale value presented as an
+# answer, never a fallback to a direct open, never row 7's in-hook fallback), the FIRST failure is
+# recorded whole (kind, the typed Unavailable/Rejected result), and main() adds ONE loud line at
+# the head, rate-limited through the shared probe-notice stamp under kind `surface-owner`. A
+# failed flag helper reads OFF and is reported (stderr line every run; the same line once per
+# window under `surface-owner-flag`).
+
+# The hook is registered with a 10 s timeout (hooks/hooks.json). Owner time for the whole fire is
+# bounded at 3.0 s, each read at 1.0 s (the liveness store read rides the fire's connection and
+# budget); the liveness ping is bounded at 1.0 s on top.
+OWNER_FIRE_BUDGET_S = 3.0
+OWNER_READ_TIMEOUT_S = 1.0
+
+_OWNER_FLAG_KEY = "surface_reads_via_owner"
+CONFIG_PATH = os.path.join(ENGRAM_HOME, "config.json")  # module-level so the A6 arm can re-point it (as the stop and tripwire hooks)
+OWNER_NOTICE_KEY = "surface-owner"
+OWNER_FLAG_NOTICE_KEY = "surface-owner-flag"
+_OWNER_NOTICE_CAP = 700
+
+# Set by main() for ONE run (None outside main(): standalone callers of the sites stay on the
+# direct path). {"on": bool, "conn": shim or None, "failure": dict or None, "degraded": [sites]}.
+_OWNER_RUN = None
+
+# Set by _owner_reads_enabled() when the flag helper fails at import or at `flag_on` (class NAME
+# only, never the message); reset at the top of every call.
+_OWNER_FLAGS_FAILURE = None
+
+# The block each site's failure takes out of this fire, as the notice names it.
+_OWNER_BLOCK_NAMES = {
+    "_check_embedding_restore_flag": "embedding restore check",
+    "_dormant_focus_set_candidates": "saved focus-set pointers",
+    "_render_triggered_principles_section": "triggered principles",
+    "_should_prepend": "keyword gate",
+    "_focused_ids": "in-context exclusion",
+    "_check_db_liveness": "DB liveness",
+}
+# Row 6 results the owner path distinguishes (kept on _OWNER_RUN["liveness_stage"]).
+_LIVENESS_OWNER_DOWN = "owner_down"
+_LIVENESS_STORE_UNREADABLE = "store_unreadable"
+# Within store_unreadable (the owner answers `ping`, the read did not serve), two refusals are BUILD
+# conditions, not a damaged store: their remedy is not disk health. Kept on _OWNER_RUN["liveness_skew"].
+_SKEW_VERSION = "version"   # `unregistered_template`: the owner's build does not know this template
+_SKEW_SCHEMA = "schema"     # `refused_at_load` (not the missing-table detail): re-classification against the live store failed
+_OWNER_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+class _ClientImportFailure(Exception):
+    """engramd_client could not be imported. args = (cause class name,)."""
+
+
+def _import_owner_flags():
+    """Thin alias: the body lives once in `_hooklib.import_owner_flags`; the name stays a module
+    attribute because callers and tests patch it."""
+    return _hooklib_import_owner_flags(ENGRAM_HOME)
+
+
+def _owner_flags_failure_line():
+    """The one report line for a failed flag helper, or None. Class name only."""
+    if _OWNER_FLAGS_FAILURE is None:
+        return None
+    try:
+        cls = "".join(ch if ch.isprintable() else "?" for ch in str(_OWNER_FLAGS_FAILURE))[:80]
+        return f"engram-surface-hook: owner flag helper failed: {cls}"
+    except Exception:
+        return None
+
+
+def _owner_reads_enabled() -> bool:
+    """`engramd.surface_reads_via_owner`, read ONLY through engramd_owner_flags.flag_on (one
+    definition shared with the owner launcher); anything but the boolean `true` is OFF, the
+    direct path. ANY exception (and a SystemExit) importing the helper or calling `flag_on`
+    reads OFF -- the hook cannot know the flag is ON -- and its CLASS NAME (never the message) is
+    recorded in `_OWNER_FLAGS_FAILURE` (reset on every call) for main() to report.
+    KeyboardInterrupt is not caught."""
+    global _OWNER_FLAGS_FAILURE
+    _OWNER_FLAGS_FAILURE = None
+    try:
+        engramd_owner_flags = _import_owner_flags()
+        # `is True`: only the JSON boolean true is ON; a truthy non-bool must not read as ON.
+        return engramd_owner_flags.flag_on(
+            _OWNER_FLAG_KEY, CONFIG_PATH) is True
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 -- see docstring
+        try:
+            _OWNER_FLAGS_FAILURE = type(exc).__name__
+        except Exception:
+            _OWNER_FLAGS_FAILURE = "unknown"
+        return False
+
+
+def _import_engramd_client():
+    """Lazy import (flag OFF must never import it), resolved layout-agnostically via the shared
+    resolver -- plugin root first, then a walk-parents search; never a fixed parents[N] (project
+    CLAUDE.md, "Plugin build restructures code paths")."""
+    runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engramd_client.py")
+    # Position 0 even if already present further down: an earlier insertion must not let another
+    # directory win this import.
+    sys.path[:] = [runtime_dir] + [p for p in sys.path if p != runtime_dir]
+    import engramd_client
+    return engramd_client
+
+
+def _owner_active() -> bool:
+    return _OWNER_RUN is not None and bool(_OWNER_RUN.get("on"))
+
+
+def _owner_client():
+    """The engramd_client module for this fire. Raises _ClientImportFailure."""
+    try:
+        return _import_engramd_client()
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 -- any import failure is an owner failure; KeyboardInterrupt is not caught
+        raise _ClientImportFailure(type(exc).__name__) from exc
+
+
+def _owner_conn():
+    """The ONE OwnerReadConnection of this fire, created lazily at first use and shared by every
+    site (none of them closes it). Raises _ClientImportFailure when the client cannot be
+    imported."""
+    run = _OWNER_RUN
+    if run["conn"] is None:
+        ec = _owner_client()
+        run["conn"] = ec.OwnerReadConnection(
+            total_budget=OWNER_FIRE_BUDGET_S, per_call_timeout=OWNER_READ_TIMEOUT_S)
+    return run["conn"]
+
+
+def _focused_read_conn():
+    """(build, conn) for the in-context resolver's one store read, `_hooklib._focused_ids`
+    (#3710, U8) -- for BOTH callers in main (the live exclusion resolver and the route ledger's).
+    Flag OFF: (True, None), the direct path as before. Flag ON: (True, the fire's owner
+    connection). Flag ON but the client cannot be imported: the failure is recorded (one loud
+    owner line) and (False, None): the caller builds NO resolver and writes no ledger line,
+    because the alternative is a direct open on a flag-ON fire. (A read that fails INSIDE
+    `_focused_ids` is recorded through the `on_failure` callback the callers pass (#3827; `_hooklib` ignores a callback that raises): a
+    refusal scoped to that one template reaches no other site of the fire.)"""
+    if not _owner_active():
+        return True, None
+    try:
+        return True, _owner_conn()
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 -- KeyboardInterrupt is not caught
+        _record_owner_failure("_focused_ids", exc)
+        return False, None
+
+
+def _is_owner_exc(exc: BaseException) -> bool:
+    return isinstance(exc, _ClientImportFailure) or (
+        type(exc).__name__ == "OwnerReadError" and hasattr(exc, "kind"))
+
+
+def _record_owner_failure(site: str, exc: BaseException) -> bool:
+    """Record an owner failure of this run: the site joins `degraded`, and the FIRST failure is
+    kept whole (kind, the typed Unavailable/Rejected result, the cause CLASS name only). Returns
+    True when `exc` was an owner failure; False leaves the caller to treat it as it always did
+    (a sqlite3 error, a bug)."""
+    if not _owner_active() or not _is_owner_exc(exc):
+        return False
+    run = _OWNER_RUN
+    if site not in run["degraded"]:
+        run["degraded"].append(site)
+    if run["failure"] is None:
+        if isinstance(exc, _ClientImportFailure):
+            kind, result, cause = "client_import", None, (exc.args[0] if exc.args else "unknown")
+        else:
+            kind, result = exc.kind, getattr(exc, "result", None)
+            cause = type(exc.__cause__).__name__ if exc.__cause__ is not None else None
+        run["failure"] = {"site": site, "kind": kind, "result": result, "cause": cause}
+    return True
+
+
+def _sanitize_owner_text(text, limit: int) -> str:
+    """Each control character -> one space, then cut to `limit` characters."""
+    try:
+        return _OWNER_CONTROL_RE.sub(" ", str(text))[:limit]
+    except Exception:
+        return "<unprintable>"[:limit]
+
+
+def _owner_failure_text(run: dict) -> str:
+    """The ONE loud line for a recorded owner failure: the failing site, the failure kind (and
+    the Unavailable/Rejected reason code), every degraded block, and the remedy. It says the
+    reads could NOT be read -- the failed read is not an empty answer. Bounded; dynamic text is
+    control-character-free; never SQL text, row data or an exception message."""
+    f = run["failure"]
+    detail = ""
+    reason = getattr(f.get("result"), "reason", None) if f.get("result") is not None else None
+    if reason:
+        detail = f", reason: {_sanitize_owner_text(reason, 40)}"
+    elif f["kind"] == "client_import" and f.get("cause"):
+        detail = f", cause: {_sanitize_owner_text(f['cause'], 40)}"
+    blocks = ", ".join(_OWNER_BLOCK_NAMES.get(s, s) for s in run["degraded"])
+    line = (
+        f"⚠️  ENGRAM UNAVAILABLE: the engramd owner read failed at "
+        f"{_sanitize_owner_text(f['site'], 60)} ({_sanitize_owner_text(f['kind'], 40)}{detail}). "
+        f"This prompt's {blocks} could NOT be read (the read failed; it is NOT empty). "
+        f"Do not open knowledge.db directly to work around this. "
+        f"To read the store directly meanwhile, set engramd.surface_reads_via_owner to false "
+        f"in $ENGRAM_HOME/config.json."
+    )
+    return line[:_OWNER_NOTICE_CAP]
+
+
+def _pending_owner_notice():
+    """Return (text, kind): the one owner-side line to inject this run, or ("", None). A recorded
+    owner failure -> the loud line under `surface-owner`; a failed flag helper -> its report line
+    under `surface-owner-flag` (the two cannot co-occur: a failed helper reads the flag OFF). Both
+    ride the shared probe-notice window, so a repeat inside the window is silent on stdout. The
+    caller stamps the window only after the response was printed. Never raises."""
+    try:
+        run = _OWNER_RUN
+        if run is not None and run.get("failure") is not None:
+            text, key = _owner_failure_text(run), OWNER_NOTICE_KEY
+        else:
+            text, key = _owner_flags_failure_line(), OWNER_FLAG_NOTICE_KEY
+        if not text or not probe_notice_due(ENGRAM_HOME, key):
+            return "", None
+        return text, key
+    except Exception:
+        return "", None
+
+
+def _write_owner_stderr_lines() -> None:
+    """The per-run stderr lines (every run, class/kind only): the failed flag helper, and the
+    first owner failure. Never raises."""
+    try:
+        line = _owner_flags_failure_line()
+        if line is not None:
+            sys.stderr.write(line + "\n")
+        run = _OWNER_RUN
+        if run is not None and run.get("failure") is not None:
+            f = run["failure"]
+            sys.stderr.write(
+                f"engram-surface-hook: owner read failed: {f['kind']} at {f['site']}\n"[:300])
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _owner_ping_failure():
+    """None when the owner answers `ping` (the owner IS alive: the liveness answer, row 6);
+    else the OwnerReadError / _ClientImportFailure describing why it did not. One round trip,
+    bounded at OWNER_READ_TIMEOUT_S; never raises."""
+    try:
+        ec = _owner_client()
+        try:
+            res = ec.read("ping", {}, timeout=OWNER_READ_TIMEOUT_S)
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 -- a client crash is a typed failure
+            err = ec.OwnerReadError("client_failure")
+            err.__cause__ = exc
+            return err
+        if isinstance(res, ec.Ok):
+            return None
+        if isinstance(res, ec.Unavailable):
+            return ec.OwnerReadError("unavailable", res)
+        if isinstance(res, ec.Rejected):
+            return ec.OwnerReadError("rejected", res)
+        return ec.OwnerReadError("unusable_answer")
+    except _ClientImportFailure as exc:
+        return exc
+    except Exception as exc:  # noqa: BLE001 -- never raises
+        return exc
+
 
 def _check_db_liveness(db_path: str) -> tuple[bool, str]:
     """Lightweight SQLite probe. Returns (True, 'ok') or (False, reason).
@@ -151,7 +440,78 @@ def _check_db_liveness(db_path: str) -> tuple[bool, str]:
     Catches SQLite I/O errors and DatabaseError (corrupt WAL, not-a-database).
     Fail-open on unexpected exceptions so probe bugs never break the hook.
     See #1218 (surface serves stale daemon cache under complete DB failure).
+
+    Owner flag ON (#3821, row 6, amended 13:56Z; derived in fold 3 so it costs NO extra trip):
+    liveness is read off the outcome of the fire's OWN store read, `_check_embedding_restore_flag`
+    (a registered template read every fire makes; it runs once here and its value is cached for
+    main()'s later call). The local file is neither consulted nor opened.
+
+    SCOPE of 'healthy': the owner SERVED A READ OF THE RESTORE TABLE (`embedding_restore_state`), or
+    reported that one table absent. It does NOT assert the rest of the store is intact: a store with
+    `nodes` / `edges` dropped still reads liveness-healthy. That fire is loud elsewhere -- the other
+    owner reads fail and main() leads the context with the `ENGRAM UNAVAILABLE` owner line (pinned by
+    a real-owner cell). The flag-OFF probe (`PRAGMA user_version`) has the same scope.
+      read Ok                                  -> (True, 'ok'): the owner answered a read of the
+                                                  restore table; NO `ping`.
+      read answered that table absent          -> (True, 'ok') too: `read_failed` naming exactly
+        `no such table: embedding_restore_state` (any OTHER missing table is a failed read), or
+        `refused_at_load` with the registry's `classification_incomplete` (how a store lacking the
+        table reads at the client; its detail names no table); the restore flag itself stays
+        UNKNOWN through its own path.
+      read failed                              -> ONE `ping` tells the two failures apart:
+        ping fails -> (False, 'engramd owner did not answer ping: <kind>')            [owner_down]
+        ping Ok    -> owner up, the read did not serve                                  [store_unreadable]
+          with its own reason per refusal: `unregistered_template` (version skew: the owner's build
+          does not know the template), any other `refused_at_load` (schema skew), otherwise 'the
+          store is unreadable: <kind>' (the only text that carries the disk-health advice).
+      read `budget_exhausted`                  -> nothing was learned about the store: owner side,
+        (False, 'engramd owner did not answer the liveness read: budget_exhausted'), no ping.
+    Every failure is recorded (typed, one loud owner line) and the stage is kept on _OWNER_RUN for
+    main(). A read that answers with something unusable (not a list, a row that is not a row, a row
+    too short) is a failed read, never healthy. This path never inherits the
+    `except Exception: return True, 'ok'` fail-open below. Flag OFF: today's probe, unchanged.
     """
+    if _owner_active():
+        _check_embedding_restore_flag(db_path, True)
+        exc = _OWNER_RUN["restore"]["exc"]
+        if exc is None:
+            return True, "ok"
+        rej = getattr(exc, "result", None) if getattr(exc, "kind", None) == "rejected" else None
+        rej_reason = getattr(rej, "reason", "") if rej is not None else ""
+        rej_detail = str(getattr(rej, "detail", "")) if rej is not None else ""
+        if (rej_reason == "refused_at_load" and rej_detail == "classification_incomplete") or (
+                rej_reason == "read_failed" and "no such table: embedding_restore_state" in rej_detail.lower()):
+            return True, "ok"
+        if not _is_owner_exc(exc):
+            # a bug-shaped failure on the owner path (e.g. a short row): a failed read, typed
+            try:
+                err = _owner_client().OwnerReadError("client_failure")
+                err.__cause__ = exc
+                exc = err
+            except _ClientImportFailure as cie:
+                exc = cie
+        kind = getattr(exc, "kind", "client_import" if isinstance(exc, _ClientImportFailure) else "failure")
+        if kind == "budget_exhausted":
+            _record_owner_failure("_check_db_liveness", exc)
+            _OWNER_RUN["liveness_stage"] = _LIVENESS_OWNER_DOWN
+            return False, f"engramd owner did not answer the liveness read: {kind}"
+        ping_failure = _owner_ping_failure()
+        if ping_failure is not None:
+            _record_owner_failure("_check_db_liveness", ping_failure)
+            _OWNER_RUN["liveness_stage"] = _LIVENESS_OWNER_DOWN
+            pkind = getattr(ping_failure, "kind", "client_import" if isinstance(ping_failure, _ClientImportFailure) else "failure")
+            return False, f"engramd owner did not answer ping: {pkind}"
+        _record_owner_failure("_check_db_liveness", exc)
+        _OWNER_RUN["liveness_stage"] = _LIVENESS_STORE_UNREADABLE
+        if rej_reason == "unregistered_template":
+            _OWNER_RUN["liveness_skew"] = _SKEW_VERSION
+            return False, ("engramd owner is up but does not know the liveness read "
+                           "(unregistered_template: the owner's build is older than this hook)")
+        if rej_reason == "refused_at_load":
+            _OWNER_RUN["liveness_skew"] = _SKEW_SCHEMA
+            return False, ("engramd owner is up but dropped the liveness read at load "
+                           f"(refused_at_load: {_sanitize_owner_text(rej_detail, 40)})")
+        return False, f"engramd owner is up but the store is unreadable: {kind}"
     if not os.path.exists(db_path):
         return False, "knowledge.db not found"
     conn = None
@@ -284,7 +644,7 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool | None, str | N
         return None, f"{type(exc).__name__}: {exc}"
 
 
-def _check_embedding_restore_flag(db_path: str) -> tuple[bool | None, str | None]:
+def _check_embedding_restore_flag(db_path: str, _for_liveness: bool = False) -> tuple[bool | None, str | None]:
     """Check the embedding restore-completeness flag (#3075 C5 round 2,
     Borges's design ruling).
 
@@ -311,53 +671,85 @@ def _check_embedding_restore_flag(db_path: str) -> tuple[bool | None, str | None
     additionalContext (per Borges's ruling: "the hooks are the load-bearing
     channel, because they reach the agent without it calling anything").
     """
-    if not os.path.exists(db_path):
+    # #3821 (row 1): with the owner flag ON the local store file is NOT consulted -- the store
+    # belongs to the owner -- and the row is read through the fire's owner connection.
+    owner = _owner_active()
+    if owner:
+        # ONE read per fire (fold 3): `_check_db_liveness` derives row 6 from this very read, so
+        # whichever of the two asks first performs it and the other takes the cached answer.
+        cached = _OWNER_RUN.get("restore")
+        if cached is not None:
+            if cached["exc"] is not None and not cached["recorded"]:
+                cached["recorded"] = True
+                _record_owner_failure("_check_embedding_restore_flag", cached["exc"])
+            return cached["result"]
+    if not owner and not os.path.exists(db_path):
         return True, None
     conn = None
+    failed = None
+    result = None
     try:
-        conn = connect_regular_ro(db_path, timeout=1.0)
+        conn = _owner_conn() if owner else connect_regular_ro(db_path, timeout=1.0)
         row = conn.execute(
             "SELECT not_fully_restored, null_count, cause FROM "
             "embedding_restore_state WHERE singleton_key = 1"
         ).fetchone()
         if not row or not row[0]:
-            return True, None
+            result = (True, None)
+            return result
         null_count, cause = row[1], row[2]
         if cause and cause.startswith("detection-failed"):
             # ROUND 4 (Borges's colleague pass, PR#3076 finding A):
             # null_count=-1 here is a SENTINEL — detection itself raised,
             # so the real count is unknown, not zero. A distinct message
             # avoids a nonsensical "-1 node(s) lack embeddings" line.
-            return False, (
+            result = (False, (
                 f"ENGRAM DB restore-completeness state UNKNOWN ({cause}) "
                 f"— recall may be degraded; remedy: run "
                 f"tools/engram-regenerate-embeddings.py to check/repair."
-            )
-        return False, (
+            ))
+            return result
+        result = (False, (
             f"ENGRAM DB NOT FULLY RESTORED: {null_count} node(s) lack "
             f"embeddings, recall degraded/blocked; cause: {cause}; "
             f"remedy: run tools/engram-regenerate-embeddings.py once an "
             f"embedder is available (or wait — a regeneration may already "
             f"be running in the background)."
-        )
+        ))
+        return result
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).lower():
             # embedding_restore_state doesn't exist yet (DB predates this
             # feature) — healthy BY DESIGN, same as "no flag ever set."
-            return True, None
+            result = (True, None)
+            return result
         # #3521: a locked database, a missing queried column, an I/O error:
         # also OperationalError, but NOT "nothing to restore" -- UNKNOWN.
-        return None, f"{type(exc).__name__}: {exc}"
+        result = (None, f"{type(exc).__name__}: {exc}")
+        return result
     except Exception as exc:
         # #3521: never raises and never blocks, but cannot report healthy for
-        # a state it could not read (garbage file, any other failure).
-        return None, f"{type(exc).__name__}: {exc}"
+        # a state it could not read (garbage file, any other failure). #3821: an OWNER
+        # failure to serve the statement is this same UNKNOWN (never "healthy": it is not a
+        # sqlite3 "no such table"), and is recorded for the one loud owner line. Under the
+        # flag a table the owner dropped is refused, hence UNKNOWN too (as in the
+        # session-start hook; the ON/OFF divergence is by design).
+        failed = exc
+        if not (owner and _for_liveness):
+            _record_owner_failure("_check_embedding_restore_flag", exc)
+        # (asked by `_check_db_liveness`: recorded by main()'s own later call instead, after
+        # liveness has recorded its verdict first)
+        result = (None, f"{type(exc).__name__}: {exc}")
+        return result
     finally:
-        if conn is not None:
+        if conn is not None and not owner:
             try:
                 conn.close()
             except Exception:
                 pass
+        if owner:
+            _OWNER_RUN["restore"] = {"result": result, "exc": failed,
+                                     "recorded": not (_for_liveness and failed is not None)}
 
 
 def _probe_unknown_notice(pending: list, probe: str, label: str, suffix: str, reason) -> str:
@@ -413,7 +805,7 @@ RETIREMENT_CEILING_PROMPTS = 160  # design doc §4: "effectively retired"
 def get_user_name() -> str:
     """Read primary_user from $ENGRAM_HOME/config.json; fall back to 'the human'."""
     try:
-        with open_regular_text(os.path.join(ENGRAM_HOME, "config.json"), encoding="utf-8") as f:
+        with open_regular_text(CONFIG_PATH, encoding="utf-8") as f:
             config = json.load(f)
         return str(config.get("primary_user") or "the human")
     except (OSError, json.JSONDecodeError, AttributeError, TypeError):
@@ -470,7 +862,7 @@ def _get_auto_surface_config() -> dict:
     with defaults if config absent / malformed / section missing. Never raises.
     Cheap (one file read per hook fire — sub-ms typically).
     """
-    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    config_path = CONFIG_PATH
     defaults = {
         "short_prompt_threshold_chars": DEFAULT_SHORT_PROMPT_THRESHOLD_CHARS,
         "prev_response_tail_chars": DEFAULT_PREV_RESPONSE_TAIL_CHARS,
@@ -544,7 +936,7 @@ def _get_suppression_config() -> dict:
     absent / malformed / section missing. Never raises. Same read pattern
     as _get_auto_surface_config.
     """
-    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    config_path = CONFIG_PATH
     defaults = {
         "k": DEFAULT_SUPPRESSION_K,
         "m": DEFAULT_SUPPRESSION_M,
@@ -580,7 +972,7 @@ def _get_echo_guard_config() -> dict:
     section missing. Never raises. Same read pattern as
     _get_suppression_config.
     """
-    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    config_path = CONFIG_PATH
     defaults = {"minutes": DEFAULT_ECHO_GUARD_MINUTES}
     try:
         with open_regular_text(config_path, encoding="utf-8") as f:
@@ -973,7 +1365,7 @@ def _get_person_moment_cooldown_config() -> dict:
     above), so both sides implement this read separately, same as every
     other primitive shared only by value in this file.
     """
-    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    config_path = CONFIG_PATH
     defaults = {"seconds": float(_PERSON_MOMENT_COOLDOWN_SECONDS)}
     try:
         with open_regular_text(config_path, encoding="utf-8") as f:
@@ -1268,7 +1660,7 @@ def _get_budget_config() -> dict:
     / section missing. Never raises. Same read pattern as
     _get_auto_surface_config / _get_suppression_config.
     """
-    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    config_path = CONFIG_PATH
     defaults = {
         "total_chars": DEFAULT_RECALL_BUDGET_TOTAL_CHARS,
         "enabled": DEFAULT_RECALL_BUDGET_ENABLED,
@@ -1384,20 +1776,28 @@ def _dormant_focus_set_candidates(rendered_ids: set) -> tuple[list[dict], int]:
     _DORMANT_FOCUS_SET_LINES_CAP top-N cut and the shared render budget.
     """
     conn = None
+    # #3821 (row 2): flag ON reads both statements through the fire's owner connection. Its rows
+    # are tuples, so the columns are read by index on both paths (`active_set_name`; then
+    # `name, node_ids, last_loaded_at`).
+    owner = _owner_active()
     try:
-        conn = connect_regular_ro(KNOWLEDGE_DB_PATH, timeout=1.0)
-        conn.row_factory = sqlite3.Row
+        conn = _owner_conn() if owner else connect_regular_ro(KNOWLEDGE_DB_PATH, timeout=1.0)
+        if not owner:
+            conn.row_factory = sqlite3.Row
         active_row = conn.execute(
             "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
         ).fetchone()
-        active_name = active_row["active_set_name"] if active_row else None
+        active_name = active_row[0] if active_row else None
         rows = conn.execute(
             "SELECT name, node_ids, last_loaded_at FROM focus_sets"
         ).fetchall()
-    except Exception:
+    except Exception as exc:
+        # An OWNER failure is recorded for the loud owner line: an empty list read off an
+        # outage must not pass for "no dormant set matches".
+        _record_owner_failure("_dormant_focus_set_candidates", exc)
         return [], 0
     finally:
-        if conn is not None:
+        if conn is not None and not owner:
             try:
                 conn.close()
             except Exception:
@@ -1406,11 +1806,11 @@ def _dormant_focus_set_candidates(rendered_ids: set) -> tuple[list[dict], int]:
     sets_checked = len(rows)
     candidates: list[dict] = []
     for row in rows:
-        name = row["name"]
+        name = row[0]
         if name == active_name:
             continue
         try:
-            ids = json.loads(row["node_ids"])
+            ids = json.loads(row[1])
             if not isinstance(ids, list):
                 continue
         except (json.JSONDecodeError, TypeError):
@@ -1421,7 +1821,7 @@ def _dormant_focus_set_candidates(rendered_ids: set) -> tuple[list[dict], int]:
         candidates.append({
             "name": name,
             "matched": matched,
-            "last_loaded_at": row["last_loaded_at"] or "",
+            "last_loaded_at": row[2] or "",
         })
 
     # Stable two-pass sort: secondary key (most-recent last_loaded_at) first,
@@ -1519,14 +1919,21 @@ def _render_triggered_principles_section(ordered_ids: list, db_path: "str | None
         return ""
     if db_path is None:
         db_path = KNOWLEDGE_DB_PATH
-    generalization_chain = _import_generalization_chain()
-    if generalization_chain is None:
-        return ""
+    # #3821 (row 3): flag ON sends each walk as ONE typed `chain` request through the fire's owner
+    # connection (the owner runs engram_core.generalization_chain itself); this process then
+    # neither imports engram_core nor opens the store. `db_path` is not consulted.
+    owner = _owner_active()
+    generalization_chain = None
+    if not owner:
+        generalization_chain = _import_generalization_chain()
+        if generalization_chain is None:
+            return ""
 
     conn = None
     try:
-        conn = connect_regular_ro(db_path, timeout=1.0)
-        conn.row_factory = sqlite3.Row
+        conn = _owner_conn() if owner else connect_regular_ro(db_path, timeout=1.0)
+        if not owner:
+            conn.row_factory = sqlite3.Row
         head_order: list = []
         head_summaries: dict = {}  # head_id -> recall_summary (from its own chain entry)
         # #2753 WS2 round 2 -- candidate ids whose own chain() call reported
@@ -1543,7 +1950,7 @@ def _render_triggered_principles_section(ordered_ids: list, db_path: "str | None
         # tripwire-hook function.
         truncated_ids: list = []
         for nid in ordered_ids:
-            chain = generalization_chain(conn, nid)
+            chain = conn.generalization_chain(nid) if owner else generalization_chain(conn, nid)
             nodes = chain.get("nodes") or {}
             start_resolved = chain.get("start_resolved_id")
             heads = chain.get("heads") or []
@@ -1564,10 +1971,11 @@ def _render_triggered_principles_section(ordered_ids: list, db_path: "str | None
                     head_entry = nodes.get(head_id, {})
                     head_summaries[head_id] = head_entry.get("recall_summary") or ""
                     head_order.append(head_id)
-    except Exception:
+    except Exception as exc:
+        _record_owner_failure("_render_triggered_principles_section", exc)
         return ""
     finally:
-        if conn is not None:
+        if conn is not None and not owner:
             try:
                 conn.close()
             except Exception:
@@ -1604,7 +2012,7 @@ def _get_attached_packs() -> list[dict]:
     Only entries with enabled=True and non-empty id+path are returned.
     """
     try:
-        config_path = os.path.join(ENGRAM_HOME, "config.json")
+        config_path = CONFIG_PATH
         with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
         packs = config.get("attached_packs", [])
@@ -1882,10 +2290,13 @@ def _should_prepend(prompt: str, conn: sqlite3.Connection, cfg: dict) -> bool:
         if keywords:
             return False  # prompt has self-anchoring keywords
         return True  # no high-IDF keywords — prepend for context
-    except Exception:
+    except Exception as exc:
         # Fallback to legacy char-length heuristic if engram_idf unavailable
         # (ImportError) or any DB error occurs (vocab table missing, mode=ro
         # conflict, etc). Preserves previous behavior on infra failure.
+        # #3821: an OWNER failure is also recorded, so the heuristic stands in for a read
+        # that failed LOUDLY (the one owner line), never as a silent plausible answer.
+        _record_owner_failure("_should_prepend", exc)
         return len(scored_prompt) < cfg["short_prompt_threshold_chars"]
 
 
@@ -3646,6 +4057,18 @@ def _assemble_response(head_blocks: list, body_blocks: list, kept_out=None) -> d
 
 
 def main():
+    """One fire. The owner state (#3821) lives for exactly this call: set by `_main_impl` and
+    reset here on every way out, so a later standalone caller of a site is never left reading
+    through a stale shim."""
+    global _OWNER_RUN
+    try:
+        _main_impl()
+    finally:
+        _OWNER_RUN = None
+
+
+def _main_impl():
+    global _OWNER_RUN
     # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
     # return/exit in this function.
     write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})
@@ -3659,6 +4082,10 @@ def main():
     if not prompt or prompt.startswith("/") or prompt.startswith("!"):
         print(json.dumps({}))
         sys.exit(0)
+
+    # #3821: the owner state of THIS fire (the flag is read once, only through flag_on). Flag
+    # OFF: {"on": False}, every site on its direct path.
+    _OWNER_RUN = {"on": _owner_reads_enabled(), "conn": None, "failure": None, "degraded": []}
 
     # #3613: producers wrap the meaningful text of a notification in an
     # ENGRAM marker; the recall QUERY is built from that text only. `prompt`
@@ -3694,7 +4121,9 @@ def main():
         elif _as_cfg["idf_gate_enabled"]:
             # IDF-based gate: open a read-only DB connection for keyword lookup.
             # extract_keywords doesn't use sqlite-vec, so skip the extension load.
-            conn = connect_regular_ro(KNOWLEDGE_DB_PATH)
+            # #3821 (row 4): flag ON, the fire's shared owner connection stands in (never
+            # closed here: it belongs to the whole fire).
+            conn = _owner_conn() if _owner_active() else connect_regular_ro(KNOWLEDGE_DB_PATH)
             should_prepend = _should_prepend(recall_query, conn, _as_cfg)
         else:
             # Feature flag off — legacy char-length heuristic.
@@ -3707,12 +4136,14 @@ def main():
             )
             if prev_tail:
                 embed_query = f"{prev_tail}\n\n{recall_query}"
-    except Exception:
+    except Exception as exc:
         # Any unexpected failure in gate logic must not break the hook.
-        # Degrade to no-prepend (embed_query stays None).
+        # Degrade to no-prepend (embed_query stays None). #3821: an unimportable owner client
+        # (raised by _owner_conn above) is recorded for the loud owner line.
+        _record_owner_failure("_should_prepend", exc)
         embed_query = None
     finally:
-        if conn is not None:
+        if conn is not None and not _owner_active():
             conn.close()
 
     # Try daemon first (fast, semantic), fall back to FTS-only
@@ -3733,7 +4164,16 @@ def main():
         # the raw prompt. Prepending prev-response-tail to a keyword search
         # would pollute results with arbitrary prior-context tokens — exactly
         # what the design intentionally avoided in the daemon path.
-        result = query_fts_fallback(recall_query)
+        # #3821 (row 7): with the owner flag ON this path is NOT TAKEN -- it runs the server
+        # runtime inside the hook (the #3741 class), a degraded read of the store (design
+        # 5.5). `result` stays None: the daemon-down notice below is the existing, honest
+        # signal, and no recall block is rendered.
+        # Telemetry caveat: `fallback_to_fts` below is `not used_daemon`, so it still reads True
+        # when the daemon is down with the flag ON although the fallback is NOT taken here; read
+        # it as "the daemon did not answer", not "FTS ran". (Kept as is: flag-OFF telemetry must
+        # stay byte-identical.)
+        if not _owner_active():
+            result = query_fts_fallback(recall_query)
     _daemon_latency_ms = int((time.perf_counter() - _daemon_t0) * 1000)
 
     # Emit engram.surface.fire event for the structured event log.
@@ -3986,7 +4426,37 @@ def main():
     # in-memory cache nodes while the SQLite file itself is inaccessible
     # (WAL failure, disk I/O error, corruption). See #1218 / #786.
     db_ok, db_reason = _check_db_liveness(KNOWLEDGE_DB_PATH)
-    if not db_ok:
+    # #3821 (row 6), flag ON: a failed PING is an OWNER failure, reported by the one loud owner
+    # line below; the "check disk health / WAL" text would blame the wrong thing, so that block
+    # stays suppressed for it. A ping that answered with the STORE READ failing is the opposite:
+    # the owner is fine and the store is what to check, so it gets its own distinct block that
+    # keeps the disk-health / WAL advice (and points the restart at the owner).
+    if not db_ok and _owner_active():
+        if (_OWNER_RUN or {}).get("liveness_stage") == _LIVENESS_STORE_UNREADABLE:
+            _skew = (_OWNER_RUN or {}).get("liveness_skew")
+            if _skew == _SKEW_VERSION:
+                # a BUILD condition: the disk-health / WAL advice cannot help
+                head_blocks.append(
+                    f"⚠️  ENGRAM substrate health:\n"
+                    f"  DB liveness: FAILED (the engramd owner is up but its build does not know this read: version skew)\n"
+                    f"  → Reads through the owner may fail. Surface nodes above may be stale pre-failure cache.\n"
+                    f"  Recovery: redeploy / restart the engramd owner so it matches this plugin."
+                )
+            elif _skew == _SKEW_SCHEMA:
+                head_blocks.append(
+                    f"⚠️  ENGRAM substrate health:\n"
+                    f"  DB liveness: FAILED (the engramd owner is up but dropped this read at load: the store lacks something it needs)\n"
+                    f"  → Reads through the owner may fail. Surface nodes above may be stale pre-failure cache.\n"
+                    f"  Recovery: migrate the store to the schema this plugin expects, then restart the engramd owner."
+                )
+            else:
+                head_blocks.append(
+                    f"⚠️  ENGRAM substrate health:\n"
+                    f"  DB liveness: FAILED (the engramd owner is up but the store is unreadable: {_sanitize_owner_text(db_reason.rsplit(': ', 1)[-1], 40)})\n"
+                    f"  → Reads through the owner will fail. Surface nodes above may be stale pre-failure cache.\n"
+                    f"  Recovery: check disk health / WAL integrity of knowledge.db, then restart the engramd owner."
+                )
+    elif not db_ok:
         head_blocks.append(
             f"⚠️  ENGRAM substrate health:\n"
             f"  DB liveness: FAILED ({db_reason})\n"
@@ -4055,8 +4525,17 @@ def main():
         # on. None => format_nudge renders exactly as before.
         _in_context_resolver = None
         try:
-            if in_context_exclusion_enabled(ENGRAM_HOME):
-                _in_context_resolver = build_exclusion_resolver(hook_input.get("session_id"))
+            if in_context_exclusion_enabled(os.path.dirname(CONFIG_PATH)):
+                if _owner_active():
+                    # #3821 (row 5): the focused-ids read goes through the owner (U8's
+                    # read_conn), never a direct open; no connection -> no resolver.
+                    _build, _rc = _focused_read_conn()
+                    if _build:
+                        _in_context_resolver = build_exclusion_resolver(
+                            hook_input.get("session_id"), read_conn=_rc,
+                            on_failure=lambda _e: _record_owner_failure("_focused_ids", _e))
+                else:
+                    _in_context_resolver = build_exclusion_resolver(hook_input.get("session_id"))
         except Exception:
             _in_context_resolver = None
         nudge = format_nudge(
@@ -4190,16 +4669,34 @@ def main():
     # the text sent to the daemon/FTS (the recall query; embed_query, when set,
     # only widens the semantic side and is recorded separately).
     if not _recall_skipped:  # empty marker: no recall ran, nothing to record
-        write_route_ledger(
-            "prompt_surface", hook_input.get("session_id"), prompt_fire_key(prompt),
-            recall_query, result, _route_out.get("shown", []), _route_out.get("cut_reasons", {}),
-            source="daemon" if used_daemon else "fallback",
-            extra={"embed_query": embed_query} if embed_query is not None else None,
-        )
+        # #3821 (row 5): the ledger builds its own in-context resolver when the probe is live for
+        # this session -- the same `_focused_ids` read, through the owner when the flag is ON
+        # (without it this is the second direct open of a flag-ON fire, U8's hole).
+        _ledger_kw, _ledger_build = {}, True
+        if _owner_active():
+            _ledger_build, _rc = _focused_read_conn()
+            _ledger_kw = {"read_conn": _rc, "on_failure": lambda _e: _record_owner_failure("_focused_ids", _e)}
+        if _ledger_build:  # False only for an unimportable owner client (recorded): never a direct open
+            write_route_ledger(
+                "prompt_surface", hook_input.get("session_id"), prompt_fire_key(prompt),
+                recall_query, result, _route_out.get("shown", []), _route_out.get("cut_reasons", {}),
+                source="daemon" if used_daemon else "fallback",
+                extra={"embed_query": embed_query} if embed_query is not None else None,
+                **_ledger_kw,
+            )
         # #3613 S1 / #3621: the shown record is written below, after the response
         # was printed, once we know whether the recall block survived emit_context's
         # final cut. (Still after the in-context resolver was built above.)
         _record_shown = True
+
+    # #3821: the owner-side line (a recorded owner failure, or a failed flag helper), at the head,
+    # once per rate-limit window; the stamp is written below only after the response was printed.
+    # Every read has run by now, so a failure at any of them is known here.
+    _owner_notice, _owner_notice_key = _pending_owner_notice()
+    if _owner_notice:
+        head_blocks.insert(0, _owner_notice)
+        probe_stamps_pending.append(_owner_notice_key)
+    _write_owner_stderr_lines()
 
     _kept_blocks: list = []
     response = _assemble_response(head_blocks, body_blocks, _kept_blocks)

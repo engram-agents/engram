@@ -31,8 +31,8 @@ not survive across SQLite builds (the doc shows this), so the build is named.
     python tools/engramd_a6_latency.py [--n 300] [--nodes 5000] [--people 5]
                                        [--warmup 30] [--store PATH] [--layout-timeout 1800]
 Exit 0 ok; 1 the two paths answered differently; 2 bad input (N below the 300 floor,
---store is the live store, or --exclusion without --hook tripwire); 3 (--hook tripwire or
-session-start only) a contract violation (see u8_contract_violations / ss_contract_violations);
+--store is the live store, --exclusion without --hook tripwire, the surface-only switches on another
+hook, or no real-store source for --hook surface); 3 (--hook tripwire, session-start or surface only) a contract violation (see u8_contract_violations / ss_contract_violations);
 4 (any --hook) a BLIND ARM: the run raised ArmBlind or LayoutViolation, or the plugin build step
 exceeded its fixed 600 s limit, so no number was produced (one stderr line names the cause); 5 a layout child outran --layout-timeout
 (#3755; EXIT_LAYOUT_TIMEOUT; one stderr line names the layout, the limit and the flag; the child runs in
@@ -49,6 +49,16 @@ baseline = the engramd.lesson_tripwire_reads_via_owner flag OFF (the hook opens 
 owner = flag ON with a REAL owner process. `--exclusion on` turns the in-context exclusion
 on (config flag + a live probe directory under the hook process's HOME). The result also
 carries the direct store opens counted per fire (the gate quantity is `opens_flag_on == 0`).
+
+`--hook surface` (A6 arm for the surface hook's owner reads, #3821 contract item 4) measures ONE FULL FIRE of the
+surface hook's main() per sample, baseline = engramd.surface_reads_via_owner OFF, owner = flag ON with a REAL owner, the
+recall daemon stubbed identically at `query_daemon` on both paths. It measures TWO cells per layout -- a synthetic store and
+a COPY of a real store (`--real-store PATH`, default $ENGRAM_HOME/knowledge.db; a read-only backup into a scratch
+directory, never measured in place) -- and the verdict line names the REAL-STORE cell on the INSTALLED layout as THE GATE
+CELL (sequential p50 owner/baseline <= 1.0); `--no-real-store` or `--layout source` leaves no gate cell, so the run prints
+NOT A PASS and exits 3. A hook without the flag is a BLIND ARM (exit 4, the flag named). Contended and cold-cache are printed
+as owed measurements; any arm the owner loses is printed as a FINDING (not an exit code). Exit 3 also covers a stdout
+mismatch, a missed recall block, or a flag-ON open of the store other than the named person-moment cursor write.
 
 `--hook session-start` (A6 arm for U9, #3735; this arm #3747) measures ONE FULL FIRE of the
 session-start hook as a FRESH PROCESS per fire (the harness runs it that way; the dominant cost is
@@ -99,7 +109,8 @@ HOOK_PATH = SRC_ENGRAM / "hooks" / "claude" / "engram-user-identity-hook.py"
 STOP_HOOK_PATH = SRC_ENGRAM / "hooks" / "claude" / "engram-stop-hook.py"
 TRIPWIRE_HOOK_PATH = SRC_ENGRAM / "hooks" / "claude" / "engram-lesson-tripwire-hook.py"
 SESSION_START_HOOK_PATH = SRC_ENGRAM / "hooks" / "claude" / "engram-session-start-hook.py"
-HOOKS = ("user-identity", "stop", "tripwire", "session-start")  # --hook; the default stays user-identity
+SURFACE_HOOK_PATH = SRC_ENGRAM / "hooks" / "claude" / "engram-surface-hook.py"
+HOOKS = ("user-identity", "stop", "tripwire", "session-start", "surface")  # --hook; the default stays user-identity
 N_FLOOR = 300
 
 
@@ -169,6 +180,9 @@ RUNTIME_FILES = {
     # flag states, and scanning what it loaded from the build; the closure cell keeps this list honest). The
     # calibration block's EngramClient loads the server runtime, hence the many engram_*.py modules and server.py.
     "hooks/engram-session-start-hook.py": "src/engram/hooks/claude/engram-session-start-hook.py",
+    # #3821: the surface arm's hook. Its fire loads nothing the tripwire / session-start entries above do not already
+    # cover (derived by firing the built hook; the closure cell in tests/test_engramd_a6_latency.py keeps it honest).
+    "hooks/engram-surface-hook.py": "src/engram/hooks/claude/engram-surface-hook.py",
     "hooks/context_tracker.py": "src/engram/hooks/claude/context_tracker.py",
     "engram_anchoring.py": "src/engram/engram_anchoring.py",
     "engram_client.py": "src/engram/engram_client.py",
@@ -202,7 +216,8 @@ class Layout:
     stage profiler, and a dataclass needs its module registered in sys.modules."""
 
     def __init__(self, name: str, root: Path, stop_hook: Path, user_hook: Path,
-                 tripwire_hook: Optional[Path] = None, session_start_hook: Optional[Path] = None) -> None:
+                 tripwire_hook: Optional[Path] = None, session_start_hook: Optional[Path] = None,
+                 surface_hook: Optional[Path] = None) -> None:
         self.name = name
         self.root = Path(root)            # the directory holding engramd_owner.py / engramd_client.py
         self.stop_hook = Path(stop_hook)
@@ -213,12 +228,16 @@ class Layout:
         # the session-start hook (#3747); beside the stop hook when not named
         self.session_start_hook = (Path(session_start_hook) if session_start_hook is not None
                                    else self.stop_hook.parent / "engram-session-start-hook.py")
+        # the surface hook (#3821); beside the stop hook when not named
+        self.surface_hook = (Path(surface_hook) if surface_hook is not None
+                             else self.stop_hook.parent / "engram-surface-hook.py")
 
     def to_json(self) -> str:
         return json.dumps({"name": self.name, "root": str(self.root),
                            "stop_hook": str(self.stop_hook), "user_hook": str(self.user_hook),
                            "tripwire_hook": str(self.tripwire_hook),
-                           "session_start_hook": str(self.session_start_hook)})
+                           "session_start_hook": str(self.session_start_hook),
+                           "surface_hook": str(self.surface_hook)})
 
     @staticmethod
     def from_json(text: str) -> "Layout":
@@ -226,12 +245,14 @@ class Layout:
         return Layout(name=d["name"], root=Path(d["root"]),
                       stop_hook=Path(d["stop_hook"]), user_hook=Path(d["user_hook"]),
                       tripwire_hook=Path(d["tripwire_hook"]) if d.get("tripwire_hook") else None,
-                      session_start_hook=Path(d["session_start_hook"]) if d.get("session_start_hook") else None)
+                      session_start_hook=Path(d["session_start_hook"]) if d.get("session_start_hook") else None,
+                      surface_hook=Path(d["surface_hook"]) if d.get("surface_hook") else None)
 
 
 def source_layout() -> Layout:
     return Layout(name="source", root=SRC_ENGRAM, stop_hook=STOP_HOOK_PATH, user_hook=HOOK_PATH,
-                  tripwire_hook=TRIPWIRE_HOOK_PATH, session_start_hook=SESSION_START_HOOK_PATH)
+                  tripwire_hook=TRIPWIRE_HOOK_PATH, session_start_hook=SESSION_START_HOOK_PATH,
+                  surface_hook=SURFACE_HOOK_PATH)
 
 
 def build_installed_layout(out_dir: Path) -> Layout:
@@ -250,7 +271,8 @@ def build_installed_layout(out_dir: Path) -> Layout:
                     stop_hook=out_dir / "hooks" / "engram-stop-hook.py",
                     user_hook=out_dir / "hooks" / "engram-user-identity-hook.py",
                     tripwire_hook=out_dir / "hooks" / "engram-lesson-tripwire-hook.py",
-                    session_start_hook=out_dir / "hooks" / "engram-session-start-hook.py")
+                    session_start_hook=out_dir / "hooks" / "engram-session-start-hook.py",
+                    surface_hook=out_dir / "hooks" / "engram-surface-hook.py")
     drift = layout_matches_tree(layout)
     if drift:
         raise LayoutViolation(f"the build differs from the tree under test: {drift}")
@@ -284,10 +306,11 @@ def _apply_layout(layout: Layout) -> None:
     """Point this module at `layout`. Only ever called in a FRESH process (the
     `--_layout-child` mode), before any runtime module is imported, so nothing
     from the other layout can already sit in sys.modules."""
-    global SRC_ENGRAM, STOP_HOOK_PATH, HOOK_PATH, TRIPWIRE_HOOK_PATH, SESSION_START_HOOK_PATH, LAYOUT_NAME
+    global SRC_ENGRAM, STOP_HOOK_PATH, HOOK_PATH, TRIPWIRE_HOOK_PATH, SESSION_START_HOOK_PATH, SURFACE_HOOK_PATH, LAYOUT_NAME
     SRC_ENGRAM, STOP_HOOK_PATH, HOOK_PATH = layout.root, layout.stop_hook, layout.user_hook
     TRIPWIRE_HOOK_PATH = layout.tripwire_hook
     SESSION_START_HOOK_PATH = layout.session_start_hook
+    SURFACE_HOOK_PATH = layout.surface_hook
     LAYOUT_NAME = layout.name
 
 
@@ -470,11 +493,30 @@ LAYOUT_LABELS = {
 }
 
 
+SURFACE_LAYOUT_LABELS = {
+    "installed": "INSTALLED layout (plugin built from the tree under test; never installed)",
+    "source": LAYOUT_LABELS["source"],
+}
+
+
+def _cell_heading(r: Dict) -> str:
+    """The heading of a cell-tagged (`--hook surface`) result: the cell, and whether it is THE gate cell."""
+    cell, layout = r["store_cell"], r["layout"]
+    if cell == GATE_CELL:
+        title = ("real-store copy -- THE GATE CELL (verdict below)" if layout == GATE_LAYOUT
+                 else f"real-store copy -- not the gate cell ({layout} layout)")
+    else:
+        title = "synthetic store -- reported, NOT the gate cell"
+    return f"{title}: {SURFACE_LAYOUT_LABELS[layout]}"
+
+
 def format_layouts(results: List[Dict]) -> str:
     order = {"installed": 0, "source": 1}
+    cell_order = {c: i for i, c in enumerate(CELLS)}
     parts = []
-    for r in sorted(results, key=lambda r: order.get(r.get("layout"), 9)):
-        parts.append(f"### {LAYOUT_LABELS[r['layout']]}\n"
+    for r in sorted(results, key=lambda r: (cell_order.get(r.get("store_cell"), 0), order.get(r.get("layout"), 9))):
+        heading = _cell_heading(r) if r.get("store_cell") else LAYOUT_LABELS[r["layout"]]
+        parts.append(f"### {heading}\n"
                      f"Runtime root: {r['layout_root']} | parent-walk calls during the run: {r['parent_walk_calls']}\n\n"
                      + format_table(r))
     return "\n\n".join(parts)
@@ -1556,6 +1598,329 @@ def _cold_row(rig: SessionStartRig, home: Path, n_cold: int, state: Dict) -> Dic
 
 # --- timing ----------------------------------------------------------------------
 
+# --- the surface hook: one FULL FIRE (A6 arm for #3821 / the surface read unit, part of #2652) -------------------
+#
+# The arm times the surface hook's own main() on one fixed UserPromptSubmit payload, stdin/stdout/stderr captured in
+# process (the tripwire arm's shape). Both paths run the SAME hook file as two module instances: baseline reads its
+# flag from config.json (engramd.surface_reads_via_owner = false), owner from config-owner-on.json beside it
+# (= true), through the hook's own `_owner_reads_enabled()` over its module-level CONFIG_PATH (the convention the
+# stop and tripwire hooks use). A hook that has no such flag is ArmBlind, with the flag named: the arm measures
+# nothing rather than two identical paths.
+#
+# THE RECALL SEAM. The hook asks the recall DAEMON (a separate embedding service on recall-daemon.sock) through
+# `query_daemon`; that one name is replaced on BOTH paths by the same canned answer (STUB_DAEMON_RESULT, as the
+# tripwire arm does at `_query_recall_daemon`). With a non-None answer the hook never takes `query_fts_fallback` (its
+# in-hook server runtime, the #3741 class), so no path pays a daemon or a fallback. Honest because the daemon is not
+# an owner read and sits on neither path's store access; a common cost removed makes the owner/baseline ratio LARGER.
+#
+# THE GATE CELL. The design's A6 gate is one warm-cache delta (docs/2652-engrammanager-design.md SS6.1), and the store
+# axis flipped it on two hooks (the stop hook, #3675; the tripwire, #3740: 0.94x on a synthetic store, 1.03-1.04x on a
+# real copy). So the arm measures TWO cells -- a synthetic store and a COPY of a real store -- and the verdict is the
+# REAL-STORE cell on the INSTALLED layout; a synthetic-only result is never a pass (surface_gate).
+
+SURFACE_FLAG_KEY = "surface_reads_via_owner"
+SURFACE_EXPECTED_SQLITE = "3.53.0"          # the plugin venv's build the gate is stated for (SS6.1 axes); named, never assumed
+SURFACE_SESSION_ID = "a6-surface-session"
+SURFACE_PROMPT = "what is the plan for the engram owner reads today please"
+SURFACE_RECALL_NEEDLE = "[ENGRAM Recall:"   # the recall block the stub's answer renders into
+SURFACE_REMAINDER_FUNC = "_advance_person_moment_cursor"   # the one RW open left direct on both flag values (#3821 row 8)
+CELLS = ("synthetic", "real-store")
+GATE_LAYOUT, GATE_CELL = "installed", "real-store"
+
+
+def _seed_surface_fixture(home: Path) -> None:
+    """Ensure the fts5 vocab table the hook's IDF gate reads exists in the store copy in `home` (synthetic or a
+    real-store copy). Nothing else is added: the fire's reads run on whatever the store holds."""
+    _ensure_src_importable()
+    import engram_idf
+
+    conn = sqlite3.connect(str(home / "knowledge.db"))
+    try:
+        engram_idf.ensure_vocab_table(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _require_surface_flag(mod, hook_path: Path) -> None:
+    """ArmBlind unless the loaded hook module reads `engramd.surface_reads_via_owner` the way the arm drives it:
+    a callable `_owner_reads_enabled` over a module-level `CONFIG_PATH`, and the flag key named in the hook's source."""
+    problems = []
+    try:
+        if SURFACE_FLAG_KEY not in Path(hook_path).read_text(encoding="utf-8", errors="replace"):
+            problems.append(f"its source never names {SURFACE_FLAG_KEY!r}")
+    except OSError as exc:
+        problems.append(f"its source is unreadable ({exc})")
+    if not callable(getattr(mod, "_owner_reads_enabled", None)):
+        problems.append("it has no _owner_reads_enabled()")
+    if not hasattr(mod, "CONFIG_PATH"):
+        problems.append("it has no module-level CONFIG_PATH")
+    if problems:
+        raise ArmBlind(
+            f"the surface hook {Path(hook_path).name} has no engramd.{SURFACE_FLAG_KEY} flag the arm can drive "
+            f"({'; '.join(problems)}): flag OFF and flag ON would be the same path, so no number is produced. "
+            "The arm needs the surface-reads-via-owner hook change (#3821) on this tree.")
+
+
+class _SurfaceShared:
+    """What the two measured paths of one run share."""
+
+    def __init__(self, home: Path, hook_path: Path) -> None:
+        self.home, self.hook_path = home, hook_path
+        self.stdin, self.stdout, self.stderr = (_ThreadStreams(sys.stdin), _ThreadStreams(sys.stdout),
+                                                _ThreadStreams(sys.stderr))
+        self.recall_reached: List[bool] = []   # one entry per fire of either path
+        self.keep: set = set()                 # relative paths that are NOT per-fire state (set once, after setup)
+
+    def snapshot(self) -> None:
+        self.keep = set(self._walk())
+
+    def _walk(self):
+        for dirpath, dirnames, filenames in os.walk(self.home):
+            rel_dir = os.path.relpath(dirpath, self.home)
+            if rel_dir == ".":
+                dirnames[:] = [d for d in dirnames if d != "run"]   # the owner's socket directory is never touched
+            for name in filenames:
+                yield os.path.normpath(os.path.join(rel_dir, name))
+
+    def clear_fire_state(self) -> None:
+        """Remove every file the hook wrote since setup (counters, trigger state, shown records ...) so each fire
+        starts from the same state. The store (and its -wal/-shm) and the config files are never touched."""
+        for rel in list(self._walk()):
+            if rel in self.keep or os.path.basename(rel).startswith("knowledge.db"):
+                continue
+            try:
+                os.unlink(os.path.join(self.home, rel))
+            except FileNotFoundError:
+                pass
+
+
+class _SurfaceFire:
+    """One measured path: callable = ONE fire of main(); `prepare()` loads this thread's hook module and stubs its
+    recall daemon (untimed); `reset()` clears per-fire state (untimed)."""
+
+    def __init__(self, shared: _SurfaceShared, name: str, config_path: Path) -> None:
+        self.shared, self.name, self.config_path = shared, name, config_path
+        self._local = threading.local()
+        self.modules: List[object] = []
+
+    def prepare(self):
+        inst = getattr(self._local, "mod", None)
+        if inst is None:
+            sh, tag = self.shared, f"{self.name}-{threading.get_ident()}"
+            mod = load_hook(sh.home, sh.hook_path, f"engram_surface_hook_a6_{tag}")
+            _require_surface_flag(mod, sh.hook_path)
+            mod.CONFIG_PATH = str(self.config_path)
+            mod.query_daemon = lambda prompt, top_k=10, embed_query=None: STUB_DAEMON_RESULT   # the SAME stub on both paths
+            sid = f"{SURFACE_SESSION_ID}-{tag}"   # one session per (path, thread): concurrent fires must not share state
+            self._local.payload = json.dumps({"session_id": sid, "transcript_path": "", "prompt": SURFACE_PROMPT})
+            self._local.mod = inst = mod
+            self.modules.append(mod)
+        return inst
+
+    def reset(self) -> None:
+        self.prepare()
+        self.shared.clear_fire_state()
+
+    def __call__(self) -> str:
+        mod, sh = self.prepare(), self.shared
+        out = io.StringIO()
+        sh.stdin.set_target(io.StringIO(self._local.payload))
+        sh.stdout.set_target(out)
+        sh.stderr.set_target(io.StringIO())
+        try:
+            mod.main()
+        except SystemExit:
+            pass
+        finally:
+            sh.stdin.clear_target()
+            sh.stdout.clear_target()
+            sh.stderr.clear_target()
+        text = out.getvalue()
+        sh.recall_reached.append(SURFACE_RECALL_NEEDLE in text)
+        return text
+
+
+def surface_attribute_opens(opens: List[Dict], hook_file) -> Dict:
+    """The surface allow-list. `opens` are the recorded flag-ON opens of the store ({"arg", "thread", "stack":
+    ["file:function:line", ...]}, outermost first). An open is the NAMED REMAINDER only if its stack holds a frame
+    for the function SURFACE_REMAINDER_FUNC in the hook's own file (the person-moment cursor write, which stays direct on
+    both flag values until the first owner write unit); every other open is a violation naming the innermost
+    frame and the frames in the hook file. Pure."""
+    hook_base = os.path.basename(str(hook_file))
+    remainder, violations = [], []
+    for o in opens:
+        stack = list(o.get("stack") or [])
+        if any(_frame_basename(f) == hook_base and f.rsplit(":", 2)[-2:-1] == [SURFACE_REMAINDER_FUNC] for f in stack):
+            remainder.append(o)
+            continue
+        inner = _short_frame(stack[-1]) if stack else "<no stack>"
+        in_hook = [_short_frame(f) for f in stack if _frame_basename(f) == hook_base]
+        violations.append(
+            f"unattributed open of the store ({o.get('arg')}) in thread {o.get('thread')}: innermost frame "
+            f"{inner}; frames in {hook_base}: {', '.join(in_hook) or 'none'}")
+    return {"remainder": remainder, "violations": violations}
+
+
+def _bind_surface(home: Path, hook_path: Path, cleanups: List[Callable[[], None]]):
+    """-> (baseline_fn, owner_fn, answers_match, answer_size, extra_result_keys).
+
+    HOME is pointed at a scratch directory and the stream proxies installed for the whole arm (`cleanups` undoes
+    both, and the sys.path / helper-module swap): the hook's probe and state paths hang off `Path.home()` and
+    ENGRAM_HOME. One sanity fire per path (flag OFF, flag ON) on cleared state gives the stdout comparison, the
+    recall check and the per-path store-open record (stacks, counted in every thread)."""
+    hooks_dir = str(Path(hook_path).resolve().parent)
+    saved_modules = {n: sys.modules.get(n) for n in ("_hooklib", "_harness")}
+    saved_path = list(sys.path)
+    for name, mod in saved_modules.items():   # run the helpers that sit beside THIS hook file, not another layout's
+        if mod is not None and Path(getattr(mod, "__file__", "") or "").resolve().parent != Path(hooks_dir):
+            del sys.modules[name]
+    sys.path[:] = [hooks_dir] + [p for p in sys.path if p != hooks_dir]
+
+    def restore_imports():
+        sys.path[:] = saved_path
+        for name, mod in saved_modules.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+    cleanups.append(restore_imports)
+
+    saved_home = os.environ.get("HOME")
+    scratch_home = Path(tempfile.mkdtemp(prefix="a6-hookhome-"))
+    os.environ["HOME"] = str(scratch_home)
+
+    def restore_home():
+        if saved_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = saved_home
+        shutil.rmtree(scratch_home, ignore_errors=True)
+    cleanups.append(restore_home)
+
+    shared = _SurfaceShared(home, hook_path)
+    saved_streams = (sys.stdin, sys.stdout, sys.stderr)
+    sys.stdin, sys.stdout, sys.stderr = shared.stdin, shared.stdout, shared.stderr
+
+    def restore_streams():
+        sys.stdin, sys.stdout, sys.stderr = saved_streams
+    cleanups.append(restore_streams)
+
+    off_path, on_path = home / "config.json", home / "config-owner-on.json"
+    off_path.write_text(json.dumps({"engramd": {SURFACE_FLAG_KEY: False}}))
+    on_path.write_text(json.dumps({"engramd": {SURFACE_FLAG_KEY: True}}))
+    baseline, owner = _SurfaceFire(shared, "baseline", off_path), _SurfaceFire(shared, "owner", on_path)
+    base_mod, owner_mod = baseline.prepare(), owner.prepare()   # (raises ArmBlind for a hook without the flag)
+    if base_mod._owner_reads_enabled() or not owner_mod._owner_reads_enabled():
+        raise RuntimeError("the two paths are not flag OFF / flag ON as configured")
+    shared.snapshot()
+
+    db = home / "knowledge.db"
+    opens, texts, records = {}, {}, {}
+    for name, fn in (("flag_off", baseline), ("flag_on", owner)):
+        fn.reset()
+        with _counting_store_opens(db, stacks=True) as rec:
+            texts[name] = fn()
+        opens[name] = len(rec)
+        records[name] = list(rec.details)
+    attributed = surface_attribute_opens(records["flag_on"], hook_path)
+    stdout_match = texts["flag_off"] == texts["flag_on"]
+    baseline.reset()
+    owner.reset()
+    shared.recall_reached.clear()
+    return baseline, owner, stdout_match, len(texts["flag_on"].encode("utf-8")), {
+        "_shared": shared, "stdout_match": stdout_match,
+        "opens_flag_on": opens["flag_on"], "opens_flag_off": opens["flag_off"],
+        "remainder_opens_flag_on": len(attributed["remainder"]), "open_violations": attributed["violations"]}
+
+
+def surface_contract_violations(result: Dict) -> List[str]:
+    """The contract gate on ONE `--hook surface` result (one layout x one store cell), as human-readable violations
+    ([] = clear). Pure: no I/O, the input is not modified.
+
+      * recall_reached is not True  -- a fire never reached the recall block, so the stubbed seam did not run;
+      * stdout_match is not True    -- flag OFF and flag ON printed different bytes;
+      * open_violations             -- every flag-ON open of the store that is not the named remainder
+                                       (SURFACE_REMAINDER_FUNC), each naming its frames; a missing or non-list value
+                                       fails CLOSED.
+    The open COUNTS and the timing ratio are reported, never violations here (the ratio is surface_gate's)."""
+    out: List[str] = []
+    if result.get("recall_reached") is not True:
+        out.append("recall_reached is not true: a fire never reached the recall block (the stubbed daemon seam did not run)")
+    if result.get("stdout_match") is not True:
+        out.append("stdout_match is not true: the flag-OFF and flag-ON fires printed different bytes")
+    ov = result.get("open_violations")
+    if not isinstance(ov, list):
+        out.append(f"open_violations is missing or not a list ({ov!r}): the allow-list verdict is unknown")
+    else:
+        out.extend(str(v) for v in ov)
+    return out
+
+
+def _arm_ratios(result: Dict) -> Dict[str, float]:
+    """arm -> p50 owner/baseline for one result's rows."""
+    by = {(r["arm"], r["path"]): r for r in result.get("rows") or []}
+    return {arm: by[(arm, "owner")]["p50_ms"] / by[(arm, "baseline")]["p50_ms"]
+            for arm in ("sequential", "contended", "cold-cache") if (arm, "owner") in by and (arm, "baseline") in by}
+
+
+def _is_gate_cell(r: Dict) -> bool:
+    return r.get("layout") == GATE_LAYOUT and r.get("store_cell") == GATE_CELL
+
+
+def surface_gate(results: List[Dict]) -> Dict:
+    """The A6 verdict for `--hook surface`. The GATE CELL is the REAL-STORE copy on the INSTALLED layout, sequential
+    p50 owner/baseline <= 1.0. No other cell can decide it: a result without that cell is `NOT A PASS` whatever the
+    synthetic numbers say. Returns {gate_cell_present, passes, ratio, verdict, findings, owed}; `findings` lists
+    every arm of every cell where the owner LOSES (> 1.0x); `owed` always names the contended and cold-cache
+    arms as owed measurements (reported, not gates). Pure."""
+    gate = next((r for r in results if _is_gate_cell(r)), None)
+    findings = []
+    for r in results:
+        for arm, ratio in _arm_ratios(r).items():
+            if ratio > 1.0:
+                findings.append(f"FINDING: the owner LOSES the {arm} arm on the {r.get('layout', '?')} layout, "
+                                f"{r.get('store_cell', '?')} cell: p50 owner/baseline {ratio:.2f}x (> 1.0)")
+    owed = ["OWED (Linux seat; reported, not gates): the contended arm (two concurrent clients) and the cold-cache arm, "
+            "each against its same-arm direct baseline"]
+    if any(r.get("cold_cache_evicts") is False for r in results):
+        owed.append("OWED: this host has no os.posix_fadvise, so its cold-cache rows did NOT evict the page cache")
+    others = ", ".join(
+        f"{r.get('layout', '?')}/{r.get('store_cell', '?')} {_arm_ratios(r)['sequential']:.2f}x"
+        for r in results if r is not gate and "sequential" in _arm_ratios(r))
+    if gate is None:
+        have = ", ".join(f"{r.get('layout', '?')}/{r.get('store_cell', '?')}" for r in results) or "nothing"
+        verdict = (f"SURFACE A6 VERDICT -- NO GATE CELL: the {GATE_CELL} copy on the {GATE_LAYOUT} layout was not "
+                   f"measured (have: {have}). NOT A PASS: a synthetic-only or source-layout result never counts "
+                   "(the store axis flipped the tripwire's gate, #3740).")
+        if others:
+            verdict += f" Reported, not the gate: {others}."
+        return {"gate_cell_present": False, "passes": False, "ratio": None, "verdict": verdict,
+                "findings": findings, "owed": owed}
+    ratio = _arm_ratios(gate).get("sequential")
+    if ratio is None:
+        return {"gate_cell_present": False, "passes": False, "ratio": None, "findings": findings, "owed": owed,
+                "verdict": "SURFACE A6 VERDICT -- NO GATE CELL: the gate cell has no sequential rows. NOT A PASS."}
+    passes = ratio <= 1.0
+    sqlite_v = (gate.get("env") or {}).get("sqlite", "?")
+    build = (f"SQLite {sqlite_v}" if sqlite_v == SURFACE_EXPECTED_SQLITE else
+             f"SQLite {sqlite_v} (expected {SURFACE_EXPECTED_SQLITE}: the build is an axis, this verdict is for "
+             f"{sqlite_v} only)")
+    verdict = (f"SURFACE A6 VERDICT -- GATE CELL = real-store copy, {GATE_LAYOUT} layout: sequential p50 "
+               f"owner/baseline = {ratio:.2f}x -> {'PASS (<= 1.0)' if passes else 'FAIL (> 1.0)'}; {build}.")
+    if others:
+        verdict += f" Reported, NOT the gate: {others}."
+    return {"gate_cell_present": True, "passes": passes, "ratio": ratio, "verdict": verdict,
+            "findings": findings, "owed": owed}
+
+
+def surface_gate_violations(results: List[Dict]) -> List[str]:
+    """[] when the gate cell was measured; else ONE violation (exit 3): a run without the real-store copy on the
+    installed layout cannot be reported as a pass. Pure."""
+    gate = surface_gate(results)
+    return [] if gate["gate_cell_present"] else [gate["verdict"]]
+
+
 def _pctl(sorted_ms: List[float], q: float) -> float:
     return sorted_ms[max(0, math.ceil(q * len(sorted_ms)) - 1)]
 
@@ -1627,7 +1992,8 @@ def _runtime_modules_loaded(root: Path, extra_files: List[Path]) -> List[str]:
 def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 30,
             store: Optional[Path] = None, hook: str = "user-identity",
             exclusion: bool = False, tripwire_hook_path: Optional[Path] = None,
-            session_start_hook_path: Optional[Path] = None, n_cold: int = N_COLD) -> Dict:
+            session_start_hook_path: Optional[Path] = None, n_cold: int = N_COLD,
+            surface_hook_path: Optional[Path] = None) -> Dict:
     if hook not in HOOKS:
         raise ValueError(f"unknown hook {hook!r}; one of {HOOKS}")
     home = make_test_store(nodes=nodes, people=people, source=store)
@@ -1639,6 +2005,8 @@ def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 
             _seed_tripwire_fixture(home)  # before the owner opens the store
         if hook == "session-start":
             _seed_session_start_fixture(home)
+        if hook == "surface":
+            _seed_surface_fixture(home)  # before the owner opens the store
         handle = launch_owner(home)
         raw_cmdline = _owner_command_line(handle.proc.pid)
         owner_argv = [a.decode() for a in raw_cmdline.split(b"\0") if a]
@@ -1647,6 +2015,10 @@ def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 
         if hook == "tripwire":
             hook_file = Path(tripwire_hook_path) if tripwire_hook_path is not None else TRIPWIRE_HOOK_PATH
             baseline, owner, answers_match, answer_size, extra = _bind_tripwire(home, exclusion, hook_file, cleanups)
+            shared = extra.pop("_shared")
+        elif hook == "surface":
+            hook_file = Path(surface_hook_path) if surface_hook_path is not None else SURFACE_HOOK_PATH
+            baseline, owner, answers_match, answer_size, extra = _bind_surface(home, hook_file, cleanups)
             shared = extra.pop("_shared")
         elif hook == "session-start":
             hook_file = (Path(session_start_hook_path) if session_start_hook_path is not None
@@ -1745,7 +2117,8 @@ def measure(n: int = N_FLOOR, nodes: int = 5000, people: int = 5, warmup: int = 
             # present. That is all it shows -- the directory EXISTED. It does not show the
             # exclusion engaged; that is proven by the separate sanity fire in _bind_tripwire
             # (resolver built + the probe's route ledger written).
-            extra["probe_dir_live"] = bool(shared.probe_seen) and all(shared.probe_seen)
+            if hook == "tripwire":
+                extra["probe_dir_live"] = bool(shared.probe_seen) and all(shared.probe_seen)
             extra["runtime_modules_loaded"] = _runtime_modules_loaded(SRC_ENGRAM, [hook_file])
         return {
             "rows": rows, "n": n, "warmup": warmup, "hook": hook,
@@ -1837,18 +2210,19 @@ def format_table(result: Dict) -> str:
     stop = result.get("hook") == "stop"
     tripwire = result.get("hook") == "tripwire"
     session_start = result.get("hook") == "session-start"
+    surface = result.get("hook") == "surface"
     lines = [
         f"Host: {env['platform']} ({env['cpus']} CPUs) | Python {env['python']} | SQLite {env['sqlite']}",
         f"Store copy: {result['node_count']} nodes, {result['db_bytes']} bytes, "
         f"journal_mode={result.get('journal_mode', '?')}, "
         + (f"{result['answer_count']} current nodes" if stop
-           else f"{result['answer_size']} stdout bytes per fire" if (tripwire or session_start)
+           else f"{result['answer_size']} stdout bytes per fire" if (tripwire or session_start or surface)
            else f"{result['people_count']} person rows")
         + f" | N={result['n']} per path per arm "
         f"(contended: 2 threads x N) after {result['warmup']} warm-up calls",
         f"Real owner: pid {result['owner_pid']}, cmdline `{result['owner_cmdline'].strip()}`; "
         + ("owner count and muted decision == baseline: " if stop
-           else "owner stdout == baseline stdout: " if tripwire
+           else "owner stdout == baseline stdout: " if (tripwire or surface)
            else "owner stdout == baseline stdout (normalised): " if session_start
            else "owner rows == baseline rows: ")
         + f"{result['answers_match']}",
@@ -1856,6 +2230,10 @@ def format_table(result: Dict) -> str:
            f"probe_dir_live={result['probe_dir_live']} recall_reached={result['recall_reached']} "
            f"stdout_match={result['stdout_match']} | direct store opens per fire: "
            f"opens_flag_on={result['opens_flag_on']} opens_flag_off={result['opens_flag_off']}"] if tripwire else []),
+        *([f"Surface fire: recall_reached={result['recall_reached']} stdout_match={result['stdout_match']} | direct store "
+           f"opens per fire: opens_flag_on={result['opens_flag_on']} (of which the named remainder, "
+           f"{SURFACE_REMAINDER_FUNC}: {result.get('remainder_opens_flag_on', '?')}; unattributed: "
+           f"{len(result['open_violations'])}) opens_flag_off={result['opens_flag_off']}"] if surface else []),
         *(_session_start_header_lines(result) if session_start else []),
         "",
         "| arm | path | p50 ms | p99 ms | mean ms | p50 owner/baseline | p99 owner/baseline |",
@@ -1893,6 +2271,18 @@ def format_table(result: Dict) -> str:
             "`_query_recall_daemon`, identical on both paths. Per-fire state files are reset between "
             "fires (untimed). The contended arm runs a separate hook module per thread. "
             "opens_flag_* count DIRECT opens of the store copy during one fire.")
+    if surface:
+        lines.append(
+            "Surface hook (#3821, part of #2652): ONE FULL FIRE of main() on a fixed UserPromptSubmit payload "
+            f"(baseline = engramd.{SURFACE_FLAG_KEY} OFF, direct opens; owner = flag ON, a real owner). The recall "
+            "daemon's answer is a fixed stub at `query_daemon`, identical on both paths, so neither path takes the "
+            "in-hook FTS fallback. Per-fire state files are cleared between fires (untimed). The contended arm runs a "
+            "separate hook module per thread. opens_flag_* count DIRECT opens of the store copy during one fire; the "
+            "flag-ON allow-list is the person-moment cursor write (the named remainder) and nothing else. GATE (the "
+            f"merge seat runs it on the production build, SQLite {SURFACE_EXPECTED_SQLITE}): the REAL-STORE copy on "
+            "the INSTALLED layout, sequential p50 owner/baseline <= 1.0; a synthetic store is reported but never "
+            "decides. The contended and cold-cache arms are owed measurements, reported not gated; an arm the owner "
+            "loses is a stated finding.")
     if session_start:
         lines.append(
             "Session-start hook (U9 #3735, A6 arm #3747): every timed fire is a FRESH interpreter running the hook "
@@ -1947,6 +2337,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--exclusion", choices=("off", "on"), default=None,
                    help="(--hook tripwire only) the in-context exclusion: 'on' sets "
                         "recall_in_context_exclusion.enabled and makes the probe dir live (default: off)")
+    p.add_argument("--real-store", type=Path, default=None, metavar="PATH",
+                   help="(--hook surface only) the store to COPY for the real-store (gate) cell: a read-only backup "
+                        "into a scratch directory, never measured or written in place (default: the seat's own "
+                        "$ENGRAM_HOME/knowledge.db)")
+    p.add_argument("--no-real-store", action="store_true",
+                   help="(--hook surface only) measure the synthetic cell alone: reported, but there is no gate "
+                        "cell, so the run is never a pass (exit 3)")
     p.add_argument("--n", type=int, default=N_FLOOR)
     p.add_argument("--n-cold", type=int, default=N_COLD,
                    help=f"(--hook session-start only) cold-row fires (default {N_COLD}; reported, not a gate)")
@@ -1967,6 +2364,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = p.parse_args(argv)
     if args.exclusion is not None and args.hook != "tripwire":
         p.error("--exclusion is valid only with --hook tripwire")
+    if args.hook != "surface" and (args.real_store is not None or args.no_real_store):
+        p.error("--real-store and --no-real-store are valid only with --hook surface")
+    if args.hook == "surface" and args.store is not None:
+        p.error("--store is not used by --hook surface (it measures a synthetic store AND a real-store copy); "
+                "name the copy source with --real-store")
+    if args.real_store is not None and args.no_real_store:
+        p.error("--real-store and --no-real-store are mutually exclusive")
     if args.layout_child:
         return _layout_child(args.layout_child, args.child_kwargs)
     if args.n < N_FLOOR:
@@ -1980,30 +2384,63 @@ def main(argv: Optional[List[str]] = None) -> int:
                   store=args.store, hook=args.hook, exclusion=(args.exclusion == "on"))
     if args.hook == "session-start":
         kwargs["n_cold"] = args.n_cold
+    # the cells of the run: one (store as given) for every hook but surface, which measures a synthetic store and a
+    # COPY of a real store (the gate cell), both on every layout
+    cells = [(None, args.store)]
+    real_home = None
+    if args.hook == "surface":
+        cells = [("synthetic", None)]
+        if not args.no_real_store:
+            real_src = args.real_store or (Path(os.environ.get("ENGRAM_HOME") or (Path.home() / ".engram"))
+                                           / "knowledge.db")
+            if not real_src.is_file():
+                print(f"engramd_a6_latency: error -- the real-store source {real_src} is not a file; the real-store "
+                      "copy is the GATE cell. Name one with --real-store PATH (or --no-real-store for a synthetic-only "
+                      "run, which is never a pass).", file=sys.stderr)
+                return 2
+            real_home = make_test_store(source=real_src)   # a consistent read-only backup copy; the source is only read
+            cells.append(("real-store", real_home / "knowledge.db"))
     wanted = LAYOUTS if args.layout == "both" else (args.layout,)
     results = []
-    with tempfile.TemporaryDirectory(prefix="a6-build-") as build_dir:
-        for name in ("installed", "source"):
-            if name not in wanted:
-                continue
-            try:  # the build step raises LayoutViolation too (layout_matches_tree): same exit 4
-                try:  # the build has its OWN fixed limit; --layout-timeout must not be blamed for it
-                    layout = build_installed_layout(Path(build_dir) / "plugin") if name == "installed" else source_layout()
-                except subprocess.TimeoutExpired as exc:
-                    print(f"engramd_a6_latency: error -- the plugin build step for layout '{name}' exceeded "
-                          f"its fixed {int(exc.timeout)}s limit (no number produced)", file=sys.stderr)
+    try:
+        with tempfile.TemporaryDirectory(prefix="a6-build-") as build_dir:
+            for name in ("installed", "source"):
+                if name not in wanted:
+                    continue
+                try:  # the build step raises LayoutViolation too (layout_matches_tree): same exit 4
+                    try:  # the build has its OWN fixed limit; --layout-timeout must not be blamed for it
+                        layout = build_installed_layout(Path(build_dir) / "plugin") if name == "installed" else source_layout()
+                    except subprocess.TimeoutExpired as exc:
+                        print(f"engramd_a6_latency: error -- the plugin build step for layout '{name}' exceeded "
+                              f"its fixed {int(exc.timeout)}s limit (no number produced)", file=sys.stderr)
+                        return 4
+                    for cell, store in cells:
+                        result = measure_in_layout(layout, layout_timeout=args.layout_timeout,
+                                                   **dict(kwargs, store=store))
+                        if cell is not None:
+                            result["store_cell"] = cell
+                        results.append(result)
+                except subprocess.TimeoutExpired:
+                    print(f"engramd_a6_latency: error -- layout '{name}' exceeded --layout-timeout "
+                          f"{args.layout_timeout}s (session-start on a large store can need more; "
+                          "pass --layout-timeout)", file=sys.stderr)
+                    return EXIT_LAYOUT_TIMEOUT
+                except (ArmBlind, LayoutViolation) as exc:
+                    print(f"engramd_a6_latency: BLIND ARM ({type(exc).__name__}) -- no number produced: "
+                          f"{' '.join(str(exc).split())[:600]}", file=sys.stderr)
                     return 4
-                results.append(measure_in_layout(layout, layout_timeout=args.layout_timeout, **kwargs))
-            except subprocess.TimeoutExpired:
-                print(f"engramd_a6_latency: error -- layout '{name}' exceeded --layout-timeout "
-                      f"{args.layout_timeout}s (session-start on a large store can need more; "
-                      "pass --layout-timeout)", file=sys.stderr)
-                return EXIT_LAYOUT_TIMEOUT
-            except (ArmBlind, LayoutViolation) as exc:
-                print(f"engramd_a6_latency: BLIND ARM ({type(exc).__name__}) -- no number produced: "
-                      f"{' '.join(str(exc).split())[:600]}", file=sys.stderr)
-                return 4
+    finally:
+        if real_home is not None:
+            shutil.rmtree(real_home, ignore_errors=True)
     print(format_layouts(results))
+    if args.hook == "surface":
+        gate = surface_gate(results)
+        print("\n" + "\n".join([gate["verdict"], *gate["findings"], *gate["owed"]]))
+        violations = [f"[{r.get('layout', '?')} layout, {r.get('store_cell', '?')} cell] {v}"
+                      for r in results for v in surface_contract_violations(r)] + surface_gate_violations(results)
+        if violations:
+            print("\nSurface contract violations:\n" + "\n".join(f"  - {v}" for v in violations))
+            return 3
     if args.hook == "tripwire":
         violations = [f"[{r.get('layout', '?')} layout] {v}" for r in results for v in u8_contract_violations(r)]
         if violations:
@@ -2014,7 +2451,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if violations:
             print("\nSession-start contract violations:\n" + "\n".join(f"  - {v}" for v in violations))
             return 3
-    # (so exit 1 never occurs for --hook tripwire or session-start: a differing stdout -- answers_match
+    # (so exit 1 never occurs for --hook tripwire, session-start or surface: a differing stdout -- answers_match
     # False -- is a stdout_match violation and has already returned 3 above)
     return 0 if all(r["answers_match"] for r in results) else 1
 

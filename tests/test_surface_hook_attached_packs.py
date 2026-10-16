@@ -125,6 +125,7 @@ class TestGetAttachedPacks(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="engram_pack_test_")
         self.hook = _load_hook_module()
         self.hook.ENGRAM_HOME = self.tmp
+        self.hook.CONFIG_PATH = os.path.join(self.hook.ENGRAM_HOME, "config.json")  # #3827: CONFIG_PATH is the hook's one config source
 
     def tearDown(self):
         import shutil
@@ -220,6 +221,7 @@ class TestQueryAttachedPacks(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="engram_pack_query_test_")
         self.hook = _load_hook_module()
         self.hook.ENGRAM_HOME = self.tmp
+        self.hook.CONFIG_PATH = os.path.join(self.hook.ENGRAM_HOME, "config.json")  # #3827: CONFIG_PATH is the hook's one config source
 
     def tearDown(self):
         import shutil
@@ -759,6 +761,7 @@ class TestStandaloneMiniNudgeFooter(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="engram_minifooter_test_")
         self.hook = _load_hook_module()
         self.hook.ENGRAM_HOME = self.tmp
+        self.hook.CONFIG_PATH = os.path.join(self.hook.ENGRAM_HOME, "config.json")  # #3827: CONFIG_PATH is the hook's one config source
         # Wire up no prompt-counter, no write-reminder, no repair marker, etc.
         # by pointing all auxiliary paths into the tmp dir (they'll be absent → no-op).
         self.hook.COUNTER_PATH = os.path.join(self.tmp, "prompt-counter.json")

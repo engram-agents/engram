@@ -1932,6 +1932,7 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
                     source="daemon", default_cut="not_in_pool",
                     extra={"novel_terms": list(novel)},
                     read_conn=_rc,
+                    on_failure=lambda _e: _record_owner_failure("focused_ids", _e),
                 )
             except Exception as exc:  # e.g. an unserialisable tool_input: fail-open
                 print(f"route-ledger: {type(exc).__name__}: {exc}"[:300], file=sys.stderr)
@@ -1968,7 +1969,8 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
             _build, _rc = _focused_read_conn() if in_context_exclusion_enabled(ENGRAM_HOME) else (False, None)
             if _build:
                 _resolver = build_exclusion_resolver(
-                    hook_input.get("session_id") if hook_input else None, read_conn=_rc)
+                    hook_input.get("session_id") if hook_input else None, read_conn=_rc,
+                    on_failure=lambda _e: _record_owner_failure("focused_ids", _e))
                 _drop = in_context_drop_ids(
                     [n for n in pool if isinstance(n, dict)], _resolver,
                     exempt_types=("lesson", "cornerstone"))

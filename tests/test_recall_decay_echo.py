@@ -109,6 +109,7 @@ class DecayEchoTestBase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="engram_decay_echo_test_")
         self.hook = _load_hook_module()
         self.hook.ENGRAM_HOME = self.tmp
+        self.hook.CONFIG_PATH = os.path.join(self.hook.ENGRAM_HOME, "config.json")  # #3827: CONFIG_PATH is the hook's one config source
 
     def tearDown(self):
         import shutil
