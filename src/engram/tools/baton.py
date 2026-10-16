@@ -166,6 +166,52 @@ def _load_config() -> dict:
     return {}
 
 
+_HANDOFF_HINT_MAX = 300
+_HANDOFF_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _handoff_hint(config, caller, to_agent) -> Optional[str]:
+    """The one stderr line a cross-agent turn change owes the flipper when this seat's comms_surface is
+    NOT the forum (#3843, part of #3039), else None. A flip IS delivered live by the agent-scoped updates feed,
+    but only to a seat that is up right now; it is not replayed to a seat that comes back (the updates monitor's
+    seed skips the backlog). The durable hand-off under `comms_surface: umwelt` is an addressed crossing
+    (`send_crossing` / `wake`); a flip not followed by one parks the PR invisibly on a down seat.
+
+    SCOPE: `flip` and `advance` only. `init` with a non-self initial turn hands the baton over with the same
+    not-durable caveat but is deliberately not covered here (#3843 names flip/advance). The pool-sentinel
+    exemption is best-effort: it compares against THIS seat's primary_user (the seat-dependent legacy helper
+    `cmd_flip` already validates with), so on another seat a hand-off to the sentinel may still hint -- a
+    harmless false positive. A malformed or unreadable config.json loads as {} and reads as `forum`, so the
+    hint is quietly absent there.
+
+    Returns None for: a `forum` surface (key absent, unreadable, not a string, empty -- the forum's own
+    hook delivers batons), a turn handed to the caller itself, a missing recipient, or the pool sentinel.
+    Total: any input, never raises. The reason text never rides along; the recipient handle is
+    control-character-free and the line is bounded."""
+    try:
+        if not isinstance(config, dict):
+            return None
+        surface = config.get("comms_surface")
+        if not isinstance(surface, str) or surface.strip().lower() in ("", "forum"):
+            return None
+        if not isinstance(to_agent, str) or not to_agent.strip():
+            return None
+        to = _HANDOFF_CTRL.sub(" ", to_agent.strip())
+        if to.lower() == str(caller or "").strip().lower():
+            return None
+        try:
+            if _is_legacy_pool_sentinel(to):
+                return None
+        except Exception:
+            pass  # sentinel unresolvable: a hint to a human is a harmless false positive
+        line = (f"baton: the turn moved to {to}. Its live notice reaches only a seat that is up right now and is not "
+                f"replayed to one that comes back; the durable hand-off is an addressed crossing: send_crossing or "
+                f"wake to {to} (comms_surface={surface.strip()[:40]}).")
+        return _HANDOFF_CTRL.sub(" ", line)[:_HANDOFF_HINT_MAX]
+    except Exception:
+        return None
+
+
 def _get_agent_name(config: Optional[dict] = None) -> str:
     """Resolve this agent's own name.
 
@@ -1016,6 +1062,9 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     print(f"baton flip: {project_id} → {to_agent}")
     print(f"  from:   {from_agent}")
     print(f"  reason: {reason}")
+    _hint = _handoff_hint(config, agent_name, to_agent)
+    if _hint:
+        print(_hint, file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -1117,6 +1166,9 @@ def cmd_advance(args: argparse.Namespace, config: dict, agent_name: str, client:
     print(f"  approval: {approval.get('state', '?')} ({approval.get('detail', '')})")
     for w in out.get("warnings") or []:
         print(f"warning: {w}", file=sys.stderr)
+    _hint = _handoff_hint(config, agent_name, out.get("turn") or to_agent)
+    if _hint:
+        print(_hint, file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
