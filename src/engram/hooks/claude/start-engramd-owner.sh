@@ -30,11 +30,15 @@
 #     e.g. WSL)                                             ONE line containing UNSUPERVISED
 #   * macOS: launchd has NO GUI domain for this uid (`launchctl print gui/<uid>/<label>` exits
 #     125 "Domain does not support specified action": no GUI login session, #3780)
-#                                                        -> launch nothing, ONE line saying the
-#                                                           owner is not supervised and not used
-#                                                           on this seat. Not "not found": a
-#                                                           bootstrap into an absent domain
-#                                                           cannot work, so nothing is retried
+#                                                        -> launch the owner detached, UNSUPERVISED,
+#                                                           reason "launchd: no GUI domain" (#3823):
+#                                                           a flag is on, so its readers call an
+#                                                           owner; an absent one blocks them. If that
+#                                                           launch fails: ONE line led by `OWNER
+#                                                           REFUSED: no launchd GUI domain`, naming
+#                                                           the ON flags, the recovery, and (when the
+#                                                           stop flag is ON) that the stop hook blocks.
+#                                                           Never "not used".
 #   * the supervisor's answer is ambiguous (timeout, empty, unparseable, rc other than the
 #     measured not-found one; on macOS also `launchctl` missing)
 #                                                        -> launch nothing, say so
@@ -43,7 +47,8 @@
 #   * the flags cannot be read at all                    -> launch nothing, say so
 #   * the launch fails (cannot spawn, or the owner dies within ~1s)
 #                                                        -> one line saying it could not be
-#                                                           started, naming the log
+#                                                           started, naming the log (on a seat with
+#                                                           no GUI domain: the named refusal above)
 #   * any other OS                                       -> nothing launched, one line naming the OS
 #
 # Always exits 0 (never breaks a session start). stdout is at most ONE bounded
@@ -243,11 +248,13 @@ if [ "$_os" = "Darwin" ]; then
             exit 0
             ;;
         no_gui_domain)
-            # rc 125 from the domain probe: the domain is absent (no GUI login session), so the seat
-            # runs ownerless, like one with no owner installed. No launch: an unsupervised spawn is a
-            # separate process-management surface (#3780).
-            _report "ENGRAM owner not supervised: no launchd GUI domain for uid $(id -u 2>/dev/null || printf '?') (no GUI login session). The owner is not used on this seat. ENGRAM_HOME=$ENGRAM_HOME"
-            exit 0
+            # rc 125 from the domain probe: the domain is absent (no GUI login session), so there is
+            # no launchd to supervise the owner and nothing to retry (a bootstrap into an absent domain
+            # cannot work). A flag is ON, so its readers WILL call an owner: the same answer as the
+            # Linux no-bus / WSL path -- fall through to the unsupervised launch (#3823). If that launch
+            # fails, _launch_failed prints the named refusal instead of "not used".
+            _nogui=1
+            _sup="launchd: no GUI domain"
             ;;
         ambiguous:*)
             _report "ENGRAM owner not launched (launchd state is ambiguous: ${_state#ambiguous:}); a duplicate is worse than a missing owner. ENGRAM_HOME=$ENGRAM_HOME"
@@ -351,8 +358,34 @@ _alive() {
     return 0
 }
 
+# A failed owner start. On a seat with no launchd GUI domain (#3823) a flag is ON and there is no
+# supervisor to fall back on, so the generic "could not be started" line is not enough: it must be the
+# named refusal -- the ON flags, the recovery, and what the flagged readers will do (the stop hook
+# never falls back to the store once its flag reads ON, so an absent owner blocks every stop chain).
+# The words "not used" never appear here: the owner IS used, it is just absent.
+# ORDER MATTERS: _engramd_owner_hook_io.py report() clips the MIDDLE of any message over 600 chars
+# (_HEAD_CLIP), so the parts the contract promises -- flags, recovery, the readers' fate -- come first
+# and are short, and the path-bearing detail (the failure reason, ENGRAM_HOME) comes last. No path
+# appears twice and no log path is repeated: a long home must not push the promises into the middle.
+_launch_failed() {
+    local _names _fate
+    if [ "${_nogui:-0}" -ne 1 ]; then
+        _report "ENGRAM owner could not be started: $1. ENGRAM_HOME=$ENGRAM_HOME. $2"
+        return
+    fi
+    _names="$("$PYTHON_BIN" "$PLUGIN_ROOT/engramd_owner_flags.py" "$ENGRAM_HOME" --names 2>/dev/null)"
+    # What the flagged readers do is stated only for the one reader whose behaviour is verified (the stop
+    # hook never falls back to the store once its flag reads ON, so it blocks every stop). A seat whose ON
+    # flags do not include stop_reads_via_owner must not be told its stop hook blocks.
+    case ",$_names," in
+        *,stop_reads_via_owner,*) _fate="The stop hook blocks every stop until an owner answers." ;;
+        *) _fate="The flagged readers have no owner until one answers." ;;
+    esac
+    _report "OWNER REFUSED: no launchd GUI domain. Flags ON: ${_names:-unreadable}. Fix: set them false in config.json, or log in to a GUI session. $_fate Owner launch failed: $1. ENGRAM_HOME=$ENGRAM_HOME"
+}
+
 if [ ! -f "$OWNER_PY" ]; then
-    _report "ENGRAM owner could not be started: $OWNER_PY not found. ENGRAM_HOME=$ENGRAM_HOME. See $LOG_PATH"
+    _launch_failed "$OWNER_PY not found" "See $LOG_PATH"
     exit 0
 fi
 
@@ -365,7 +398,7 @@ case "$_launch" in
     [0-9]*" log") _pid="${_launch%% *}"; _log_note="Log: $LOG_PATH" ;;
     [0-9]*" nolog") _pid="${_launch%% *}"; _log_note="The log is unavailable (not a regular file): owner output discarded" ;;
     *)
-        _report "ENGRAM owner could not be started: the launch failed. ENGRAM_HOME=$ENGRAM_HOME. See $LOG_PATH"
+        _launch_failed "the launch failed" "See $LOG_PATH"
         exit 0
         ;;
 esac
@@ -396,6 +429,6 @@ fi
 if [ "$_ok" -eq 1 ]; then
     _report "UNSUPERVISED: engramd_owner launched (pid $_pid); no supervisor reachable ($_sup). ENGRAM_HOME=$ENGRAM_HOME. $_log_note"
 else
-    _report "ENGRAM owner could not be started: the process exited within a second. ENGRAM_HOME=$ENGRAM_HOME. $_log_note"
+    _launch_failed "the process exited within a second" "$_log_note"
 fi
 exit 0

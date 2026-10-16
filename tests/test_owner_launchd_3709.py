@@ -604,8 +604,8 @@ def test_k2c_template_render_is_byte_identical_under_a_hostile_multibyte_locale(
 # K4 -- the Darwin fallback, four outcomes (Q3), fake launchctl from REAL captures
 # ===========================================================================
 
-def _darwin_hook(seat: DSeat, mode: str | None):
-    seat.config(FLAG_ON)
+def _darwin_hook(seat: DSeat, mode: str | None, flags: dict | None = None):
+    seat.config(flags if flags is not None else FLAG_ON)
     if mode is not None:
         seat.launchctl(mode)
     return seat.run_timed(limit=LAUNCHD_BOUND_SECONDS + LAUNCHD_SLACK_SECONDS + 10)
@@ -770,18 +770,199 @@ def test_a1_verb_prints_no_gui_domain(dseat):
     assert dseat.io(LAUNCHD_VERB, dseat.label()) == "no_gui_domain"
 
 
-def test_a3_hook_says_one_line_and_launches_nothing(dseat):
+# ---- #3823: a flag-ON seat with no GUI domain gets a working owner or a loud named refusal --------
+# Contract C1-C4 (engram-alpha#3823).  C1(a): the unsupervised launch, as on Linux no-bus / WSL.
+# C1(b): when that launch fails, one line led by OWNER REFUSED naming every ON owner flag, the exact
+# recovery, and that the stop hook blocks.  "not used" alone never appears while a flag is on.
+
+NO_GUI_REASON = "launchd: no GUI domain"
+WITH_STOP = {**FLAG_ON, "stop_reads_via_owner": True}  # the stop hook's flag is ON: its sentence is true
+
+
+def _only_print(dseat):
+    assert dseat.launchctl_log() == [dseat.expected_print()], "something other than the one print was asked"
+
+
+def test_c1a_no_gui_domain_launches_unsupervised_with_the_reason(dseat):
     got = _darwin_hook(dseat, "no_gui_domain")
     lines = _lines_of(got, dseat)
     assert got[0] == 0, got
-    assert lines == [
-        f"ENGRAM owner not supervised: no launchd GUI domain for uid {UID} (no GUI login session). "
-        f"The owner is not used on this seat. ENGRAM_HOME=<TMP>/seat"
-    ], (lines, got[1])
-    assert dseat.launched() == [], "an owner was launched on a seat with no GUI domain"
-    assert not (dseat.eh / "engramd.pid").exists(), "a pidfile appeared"
-    assert dseat.launchctl_log() == [dseat.expected_print()], "something other than the one print was asked"
-    assert "UNSUPERVISED" not in got[1]
+    assert len(dseat.launched()) == 1, "a flag-ON seat with no GUI domain must get an owner launch"
+    assert len(lines) == 1 and lines[0].startswith("UNSUPERVISED"), (lines, got[1])
+    assert NO_GUI_REASON in lines[0], lines[0]
+    assert "not used" not in got[1] and "OWNER REFUSED" not in got[1], got[1]
+    _only_print(dseat)  # nothing is bootstrapped: the domain does not exist
+
+
+def _fail_launch(dseat):
+    dseat.fail_flag.write_text("x")
+
+
+def test_c1b_failed_launch_is_a_named_refusal_that_says_the_readers_will_block(dseat):
+    _fail_launch(dseat)
+    got = _darwin_hook(dseat, "no_gui_domain", WITH_STOP)
+    lines = _lines_of(got, dseat)
+    assert got[0] == 0, got
+    assert len(lines) == 1, got[1]
+    line = lines[0]
+    assert line.startswith("OWNER REFUSED: no launchd GUI domain"), line
+    assert "user_identity_reads_via_owner" in line and "stop_reads_via_owner" in line, "the refusal names the ON flags"
+    assert "stop hook blocks every stop" in line, "C4: the wording must agree with what the stop hook does"
+    assert "set them false in config.json" in line, "the recovery by flag"
+    assert "GUI login" in line or "GUI session" in line, "the recovery by logging in"
+    assert "not used" not in got[1] and "UNSUPERVISED" not in got[1], got[1]
+    assert any("OWNER REFUSED" in ln for ln in dseat.log_lines()), "the refusal is also logged"
+    _only_print(dseat)
+
+
+def test_c1b_the_stop_hook_sentence_is_only_said_when_the_stop_flag_is_on(dseat):
+    """The stop hook is the one reader whose behaviour C4 verifies (it blocks every stop). A seat whose ON
+    flags do not include `stop_reads_via_owner` must not be told its stop hook blocks."""
+    _fail_launch(dseat)
+    no_stop = _lines_of(_darwin_hook(dseat, "no_gui_domain", FLAG_ON), dseat)[0]
+    assert "stop hook" not in no_stop and "The flagged readers have no owner until one answers." in no_stop, no_stop
+    with_stop = _lines_of(_darwin_hook(dseat, "no_gui_domain", WITH_STOP), dseat)[0]
+    assert "The stop hook blocks every stop until an owner answers." in with_stop, with_stop
+    # a flag whose name merely CONTAINS the stop flag's must not trigger the sentence
+    lookalike = {**FLAG_ON, "pre_stop_reads_via_owner": True}
+    other = _lines_of(_darwin_hook(dseat, "no_gui_domain", lookalike), dseat)[0]
+    assert "stop hook blocks" not in other and "pre_stop_reads_via_owner" in other, other
+
+
+def test_c1b_the_refusal_names_every_on_flag_and_only_those(dseat):
+    _fail_launch(dseat)
+    dseat.config({"user_identity_reads_via_owner": True, "stop_reads_via_owner": True,
+                  "tripwire_reads_via_owner": False, "stop_reads_via_owner_note": True,
+                  "unrelated": True, "session_start_reads_via_owner": "true"})
+    dseat.launchctl("no_gui_domain")
+    got = dseat.run_timed(limit=LAUNCHD_BOUND_SECONDS + LAUNCHD_SLACK_SECONDS + 10)
+    line = _lines_of(got, dseat)[0]
+    assert line.startswith("OWNER REFUSED"), line
+    assert "stop_reads_via_owner" in line and "user_identity_reads_via_owner" in line, line
+    assert "tripwire_reads_via_owner" not in line and "session_start_reads_via_owner" not in line, line
+    assert "unrelated" not in line and "_note" not in line, line
+
+
+def test_c1b_a_missing_owner_script_is_the_same_refusal(dseat):
+    (dseat.plugin / "engramd_owner.py").unlink()
+    got = _darwin_hook(dseat, "no_gui_domain", WITH_STOP)
+    lines = _lines_of(got, dseat)
+    assert got[0] == 0 and dseat.launched() == [], got
+    assert len(lines) == 1 and lines[0].startswith("OWNER REFUSED: no launchd GUI domain"), got[1]
+    assert "stop hook blocks every stop" in lines[0] and "not used" not in lines[0], lines[0]
+
+
+def test_c1b_an_owner_that_dies_within_a_second_is_the_same_refusal(dseat):
+    """The launch is spawned but the owner exits (the stub exits 7): not a running owner."""
+    _fail_launch(dseat)
+    got = _darwin_hook(dseat, "no_gui_domain")
+    assert len(dseat.launched()) == 1, "the launch was attempted"
+    assert _lines_of(got, dseat)[0].startswith("OWNER REFUSED"), got[1]
+
+
+def test_c1b_a_launch_that_cannot_spawn_is_the_same_refusal(dseat):
+    """The I/O helper's `launch` verb answers `fail` (the spawn raised OSError): the third failure site."""
+    venv_bin = dseat.home / ".engram" / "venv" / "bin"
+    _stub(venv_bin, "python3", textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        for a in "$@"; do case "$a" in
+          *engramd_owner_flags.py) exec "{sys.executable}" "$@";;
+          *_engramd_owner_hook_io.py) if [ "$2" = "launch" ]; then echo fail; exit 0; fi; exec "{sys.executable}" "$@";;
+        esac; done
+        exit 1
+        """))
+    got = _darwin_hook(dseat, "no_gui_domain", WITH_STOP)
+    lines = _lines_of(got, dseat)
+    assert got[0] == 0, got
+    assert len(lines) == 1 and lines[0].startswith("OWNER REFUSED: no launchd GUI domain"), got[1]
+    assert "Owner launch failed: the launch failed." in lines[0] and "stop hook blocks every stop" in lines[0], lines[0]
+
+
+def _deep_home(base: Path, chars: int = 330) -> Path:
+    """A real, creatable home path of about `chars` characters (PATH_MAX-safe on macOS, unlike _long_home)."""
+    home = base
+    while len(str(home)) < chars:
+        home = home / ("d" * 40)
+    home.mkdir(parents=True)
+    return home
+
+
+def test_c1b_the_promises_sit_in_the_head_that_the_600_char_clip_keeps(dseat):
+    """report() keeps ~298 chars at each end of a message over 600 and cuts the middle (_HEAD_CLIP). The
+    promises -- flags, recovery, what the stop hook does -- must be in the first 298, so a long home or a
+    long tmp path (which only ever lengthen the TAIL) cannot lose them.  Three flags is the realistic
+    worst case."""
+    _fail_launch(dseat)
+    flags = {"stop_reads_via_owner": True, "lesson_tripwire_reads_via_owner": True,
+             "session_start_reads_via_owner": True}
+    home = _deep_home(dseat.tmp / "deep")
+    (home / "config.json").write_text(json.dumps({"engramd": flags}))
+    dseat.launchctl("no_gui_domain")
+    rc, out, err, _ = dseat.run_timed({"ENGRAM_HOME": str(home)}, limit=20)
+    assert rc == 0, err[-300:]
+    logged = [ln for ln in (home / "engramd-owner.log").read_text(encoding="utf-8").splitlines() if "OWNER REFUSED" in ln]
+    assert len(logged) == 1, logged
+    msg = logged[0].split("[start-engramd-owner] ", 1)[1]
+    assert len(msg) > 600, "the cell must be on the clipped side of the bound to mean anything"
+    head = msg[:298]
+    for flag in flags:
+        assert flag in head, (flag, head)
+    assert "log in to a GUI session" in head and "set them false in config.json" in head, head
+    assert "stop hook blocks every stop" in head, head
+    ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    for flag in flags:
+        assert flag in ctx, "the delivered context lost a flag name"
+    assert "stop hook blocks every stop" in ctx and "log in to a GUI session" in ctx, ctx
+
+
+@pytest.mark.parametrize("platform", [None, "claude-code"], ids=["floor-4000", "claude-code-9500"])
+def test_c1b_the_refusal_for_a_very_long_home_keeps_its_lead_words_and_its_bound(dseat, platform):
+    from test_owner_launcher_3663 import _long_home
+    if platform:
+        (dseat.plugin / "platform.json").write_text(json.dumps({"platform": platform}))
+    _fail_launch(dseat)
+    home = _long_home(dseat.tmp)
+    (home / "config.json").write_text(json.dumps({"engramd": WITH_STOP}))
+    dseat.launchctl("no_gui_domain")
+    rc, out, err, _ = dseat.run_timed({"ENGRAM_HOME": str(home)}, limit=20)
+    assert rc == 0, err[-300:]
+    ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    assert len(ctx) <= 1000, len(ctx)
+    assert "OWNER REFUSED" in ctx and "stop hook blocks every stop" in ctx and "user_identity_reads_via_owner" in ctx, ctx[:400]
+
+
+def test_c1b_flags_helper_names_exactly_the_on_flags_and_agrees_with_any_on(tmp_path):
+    """`--names` and `any_owner_flag_on` are one rule: the names are non-empty iff the helper says `on`."""
+    helper = SRC / "engramd_owner_flags.py"
+    cases = [({"b_via_owner": True, "a_via_owner": True, "c_via_owner": False}, "a_via_owner,b_via_owner", "on"),
+             ({"a_via_owner": "true", "a_via_owner_x": True, "plain": True}, "", "off"),
+             ({}, "", "off")]
+    for i, (engramd, names, verdict) in enumerate(cases):
+        home = tmp_path / f"h{i}"
+        home.mkdir()
+        (home / "config.json").write_text(json.dumps({"engramd": engramd}))
+        got = subprocess.run([sys.executable, str(helper), str(home), "--names"], capture_output=True, encoding="utf-8")
+        assert got.returncode == 0 and got.stdout.strip() == names, (engramd, got)
+        v = subprocess.run([sys.executable, str(helper), str(home)], capture_output=True, encoding="utf-8")
+        assert v.stdout.strip() == verdict, (engramd, v)
+
+
+def test_c3_a_gui_domain_is_unchanged(dseat):
+    """Control: with a GUI domain the supervised paths are exactly as before (running: silent;
+    notfound: the UNSUPERVISED launch with the launchd answer, not the no-GUI reason)."""
+    got = _darwin_hook(dseat, "running")
+    assert got[0] == 0 and got[1].strip() == "" and dseat.launched() == [], got
+    nf = _darwin_hook(dseat, "notfound")
+    lines = _lines_of(nf, dseat)
+    assert len(dseat.launched()) == 1 and lines[0].startswith("UNSUPERVISED"), nf
+    assert NO_GUI_REASON not in lines[0], lines[0]
+
+
+def test_c4_the_reader_really_blocks_when_the_flag_is_on_and_the_owner_is_down():
+    """C4 drift guard: the refusal says the stop hook blocks.  The stop hook's own docstring is where
+    that behaviour is stated; if it stops saying so, the refusal wording is a lie and this fails."""
+    text = (SRC / "hooks" / "claude" / "engram-stop-hook.py").read_text(encoding="utf-8")
+    assert "never falls back" in text, "the stop hook no longer documents the no-fallback behaviour"
 
 
 def test_a3_hook_with_the_flags_off_still_says_nothing(dseat):
