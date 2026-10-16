@@ -884,7 +884,11 @@ mistake as treating a fixture list as a specification.
 Contract-first — each test names the mutation that must turn it red.
 
 1. **Peer-uid mismatch → `Rejected(peer_identity)`.** *Mutation: make the uid check a no-op.*
-   ⚠ **Needs a second uid; cannot run on the author's seat — §6.**
+   ⚠ **Built twice (§6).** The real-socket cell
+   `tests/test_engramd_owner.py::test_peer_uid_mismatch_is_rejected` uses a uid-0 peer (passwordless
+   `sudo`: Linux CI runners only), and a uid-0 peer cannot tell the mismatch rule from the uid-0
+   clause, so **that cell alone** does not kill the stated mutation. **The suite does**, through the
+   fake-credential cells on each arm that feed a non-root foreign uid (`own + 1`) — named in §6.
 2. **The peer struct is parsed by `unpack_from`, and a 4-byte buffer RAISES.** *Mutation: replace the
    parse with the slice form `int.from_bytes(raw[4:8], "little")` — the test must go red because the
    slice returns 0 rather than raising.* **Runs anywhere, no privileges.** ⚠ Revision 1's version of
@@ -992,10 +996,54 @@ are entangled and the design was not built.
 
 ---
 
-## 6. The control this design cannot run, named rather than omitted
+## 6. The cross-uid control — what now runs, and what it cannot show
 
-**The cross-uid rejection test (test 1) has not been run, so the peer-credential read is unverified
-in the only direction that matters.**
+**Status, 2026-10-16 (this section was stale; corrected here, #3842).** The text below, from
+revision 5, said the cross-uid rejection test "has not been run". That stopped being true when the
+build landed. What runs, and what it can and cannot show:
+
+- **The CI cell.** `tests/test_engramd_owner.py::test_peer_uid_mismatch_is_rejected` (added by
+  PR #3201 as an unconditional skip; made to run where `sudo -n` works by PR #3421, closing #3197)
+  connects a real foreign peer, **uid 0 via passwordless `sudo`**, after a same-uid control that is
+  served. It PASSED in the main full suite (`tests.yml` run 38829935115 on `main`, 2026-10-16), and
+  it FAILED on the scratch branch `scratch/3197-crossuid-mutant` on 2026-10-05 (run 37316689182: the
+  uid-0 client was served `Ok`), so it has been seen to fail. It runs on Linux CI runners only;
+  agent seats skip it (no passwordless `sudo`).
+- **A live run.** Lei ran a uid-0 control against a live owner on 2026-09-29 (`Rejected
+  peer_identity`, recorded on #3201).
+- **The bound, documented at the cell.** `_check_peer_credentials` has two rejection branches: the
+  uid **mismatch**, and **uid 0 with a non-root owner**, with identical `peer_identity` reason and
+  `detail`. So a uid-0 peer is refused even if the mismatch rule is deleted, and the uid-0 cell
+  **cannot show that the mismatch rule works**. This is already stated in the comment above
+  `test_peer_uid_mismatch_is_rejected` (written 2026-10-05). The Darwin arm folds both conditions
+  into one `if`, so the same holds there.
+- **The mismatch rule IS tested, at unit level, on both arms**, by cells that hand the check a
+  manufactured credential carrying a non-root foreign uid (`own + 1`) and require `peer_identity`:
+  Linux — `tests/test_engramd_owner_displacement_3240.py::test_snapshot_dest_rights_premise_peer_uid_equals_owner`
+  (Linux-only file); Darwin — `tests/test_engramd_owner_darwin_3666.py::test_peercred_uid_mismatch_is_rejected_peer_identity`.
+  The Darwin file is skipped unless `sys.platform == "darwin"`, and every CI workflow runs on
+  `ubuntu-latest`, so the Darwin cell runs on Mac seats only, never in CI. These exercise the parse
+  and the decision; they do **not** exercise the kernel supplying a
+  foreign peer over a real socket.
+- **Real socket, non-root foreign peer, Linux: REJECTED (2026-10-16, recorded on #3097).** Borges ran
+  an owner as uid 1002 on a throwaway home at dev `3191ab3c` (Linux 6.6.87.2, WSL2), with `run/` at
+  0711 and the socket at 0777, so file permissions are not what refuses. Control: the owner's own uid
+  was served (`contract_version 1.1`). Arm: Zephyr connected as uid 1008 and got
+  `{"status": "rejected", "reason": "peer_identity", "detail": "connecting uid 1008 is not this
+  owner's uid 1002", "remedy": "connect to the socket under your own $ENGRAM_HOME"}`. Nothing was
+  served, and the listener stayed alive (`ss -xl`). Two runs each; Kepler accepted the result on
+  #3097. This is the discriminating control: a non-root peer is refused only by the mismatch rule.
+  Two things the run surfaced, both tracked on #3845 and neither a security weakness: the owner closes
+  with the request unread, so a client that sends first and then reads to EOF receives the typed
+  refusal and then a `ConnectionResetError` on its next read (the shipped client stops at the newline
+  and is unaffected); and the owner logs no line on a refusal.
+- **Real socket, any foreign peer, Darwin: not run.** The author's Mac has a second account (Clio's);
+  a probe from her own session waits for the user's go-ahead (#3097).
+
+The rest of this section is revision 5's reasoning, kept because it is still the reason the parse
+form (§2.2) and test 2 matter. Read its present tense as Darwin-only: the second-uid control it asks
+for ran on Linux on 2026-10-16 (above), and "until one runs" below now applies to the Darwin arm
+alone.
 
 P2 returned `uid=501` and the process's own uid is 501 — consistent with reading the peer *and* with
 reading ourselves. P4 exercises the **option** axis; P3 shows the **level** axis is the one that fails
@@ -1030,8 +1078,8 @@ important thing the review produced.
 | **Two new budgets with no number** (§4) | `SQLITE_LIMIT_LENGTH` and the end-to-end request deadline — including its per-method variant for `snapshot` — both need values chosen against the owner contract (§8). |
 | **Tier 2 is DEFERRED, not designed** (§3.2) | U4's reached reads that are not literals are the two variable-arity `IN` f-strings, which are tier-1 `json_each` cases (§3.2, corrected after #3196), so tier 2 is off its path. Outline only; it gets specified by the unit that needs it. Deferring it is deliberate — revision 2 specified it speculatively and that was the larger error of the two in §3.2. |
 | **The authorizer's action allowlist is an OBLIGATION, not a finished list** (§3.1) | Owed by U4: derive it from the census plus the owner's operations, and check every denied action for a caller that swallows the denial. `SQLITE_TRANSACTION` is the first known member, not the last. |
-| **The Linux peer-credential arm is UNMEASURED by me** (§2.2) | **Partly measured by the reviewer in revision 5** — a same-uid `SO_PEERCRED` read, 12 bytes, correct decode (§6). The foreign-uid rejection is measured by no one. Needs a first-hand run on a Linux seat before U4 builds. Documented is not measured — the whole of §1 exists because that distinction has cost this fleet real rounds. |
-| **Cross-uid rejection control** (§6) | Not run. Needs a second uid; the host-account route needs the user's OK. |
+| **The Linux peer-credential arm is UNMEASURED by me** (§2.2) | **Partly measured by the reviewer in revision 5** — a same-uid `SO_PEERCRED` read, 12 bytes, correct decode (§6). ~~The foreign-uid rejection is measured by no one.~~ **Corrected 2026-10-16:** a uid-0 foreign peer is rejected in CI and was rejected live on 09-29 (§6), but uid 0 cannot discriminate the mismatch rule; a manufactured non-root credential is rejected in a unit cell on each arm, and a real-socket non-root foreign peer was rejected on Linux on 2026-10-16 (§6). Darwin's real-socket arm is still unrun. Documented is not measured — the whole of §1 exists because that distinction has cost this fleet real rounds. |
+| **Cross-uid rejection control** (§6) | **Updated 2026-10-16:** a uid-0 real-socket control runs in CI (`test_peer_uid_mismatch_is_rejected`) and ran live on 09-29, but uid 0 cannot discriminate the mismatch rule (§6). The mismatch rule is unit-tested on both arms with a manufactured non-root foreign credential (§6). Real-socket non-root foreign peer on Linux: **rejected** (uid 1008 against a uid-1002 owner, 2026-10-16, #3097; §6). Real-socket foreign peer on Darwin: not run; waits for the user's go-ahead. |
 | **The 37 unclassifiable census sites** (§3.2) | Unresolved by a call-site instrument. Each must be classified by hand or by a call-path walk before tier 1's registry is called complete. |
 | Row-level / per-caller result scoping | Out of scope, named in §3.5 so it is not read as covered. |
 | Supervision per platform | Already Kepler's, already open in the parent §7. Untouched here. |
