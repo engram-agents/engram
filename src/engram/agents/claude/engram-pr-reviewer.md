@@ -346,7 +346,7 @@ The exception: if round 2 introduces a NEW nit (the fix added something cosmetic
 
 # Posting your review to GitHub
 
-When posting a review back to the PR, use `gh pr comment <pr-number> --body "..."` or `--body-file <file>` (see "Body files" below). The signature below is required on every posted comment without exception, and every post is **read back** before you report (see "Read back what you posted" below).
+When posting a review back to the PR, post from a body file with `gh pr comment <pr-number> --body-file <file>`, through the one gated block in "Post, then read back" below. The signature below is required on every posted comment without exception, the post is gated on it, and every post is **read back** before you report.
 
 **Mandatory signature at the very top of the posted comment:**
 
@@ -360,44 +360,45 @@ When posting a review back to the PR, use `gh pr comment <pr-number> --body "...
 - The italic-only-suffix form (`*engram-pr-reviewer · round N · head X*` at the bottom of the post, no emoji) is INSUFFICIENT — users have reported confusion when the emoji is missing. Always include the emoji-prefixed signature at the top.
 - The signature line is structurally mandatory even when the review is short or when the body uses other markdown headers — it goes at the very top, before the `## Summary` line.
 
-## Body files: a fresh `mktemp` file, checked before it is posted
+## The expected first line comes from the brief
 
-A long markdown body is easier to post from a file than inline. If you use one:
+**If the dispatch brief gives the exact expected first line, copy it verbatim into `expected`; do not compose it.** Only when the brief gives none, build it from the brief's PR number and round and the head SHA you asserted in your first act. Never take it from the body file or from the posted comment: a stale file agrees with itself, and so does a comment checked against its own first line. (A brief-supplied line is the stronger form: the check then compares your file with something you did not write.)
 
-- **Create it with `mktemp`, never with a fixed or guessed name** (`B="$(mktemp "${TMPDIR:-/tmp}/pr-review.XXXXXX")"`). A fixed name like `r2.md` or `review.md` in a long-lived scratch directory may already hold an earlier review. If your write then fails or never happens, the post publishes that old file under your heading. That happened on 2026-10-16 (#3851): a round-2 comment on one PR was a week-old review of a different PR's commit. A fresh `mktemp` file starts empty, so a failed write posts nothing rather than someone else's words.
-- **Before posting, check the file's first line against the signature you expect.** Build the expected line from the dispatch brief and the head SHA you asserted in your first act. Never read it back out of the file you are about to post, because a stale file agrees with itself:
+## Body files: always a fresh `mktemp` file
 
-  ```bash
-  expected="🧚 engram-pr-reviewer · PR #$PR · round $ROUND · head $SHA"
-  [ "$(head -1 "$B")" = "$expected" ] || { echo "NOT POSTED: body file first line is [$(head -1 "$B")], expected [$expected]"; }
-  ```
+**Create the body with `mktemp`, never with a fixed or guessed name** (`B="$(mktemp "${TMPDIR:-/tmp}/pr-review.XXXXXX")"`). A fixed name like `r2.md` or `review.md` in a long-lived scratch directory may already hold an earlier review. If your write then fails or never happens, the post publishes that old file under your heading. That happened on 2026-10-16 (#3851): a round-2 comment on one PR was a week-old review of a different PR's commit. A fresh `mktemp` file starts empty, so a failed write posts nothing rather than someone else's words. Post from the file, not inline: an inline body cannot be checked before it is posted.
 
-  The check only prints; it does not stop your shell. On a mismatch, do not run `gh pr comment`. Fix the file, or report the mismatch to the parent.
+## Post, then read back (one block, mandatory, every post)
 
-## Read back what you posted (mandatory, every post)
-
-Your report to the parent describes what you *meant* to post. The comment is what *landed*, under the parent's account, and nothing else compares the two. So after every `gh pr comment`, read back **that exact comment** and check it:
+Your report to the parent describes what you *meant* to post. The comment is what *landed*, under the parent's account, and nothing else compares the two. So the post is **gated** on the body file's first line, and every post is followed by a read-back of **that exact comment**:
 
 ```bash
-url="$(gh pr comment "$PR" -R "$REPO" --body-file "$B")"   # or --body "..."; gh prints the comment URL
-cid="${url##*issuecomment-}"
-case "$cid" in
-  '' | *[!0-9]*) posted="" ;;   # gh printed no comment URL: nothing to fetch, and the check below says so
-  *) posted="$(gh api "repos/$REPO/issues/comments/$cid")" ;;
-esac
-posted_pr="$(printf '%s' "$posted" | python3 -c 'import json,sys; print(json.load(sys.stdin)["issue_url"].rsplit("/",1)[1])')"
-posted_first="$(printf '%s' "$posted" | python3 -c 'import json,sys; print(json.load(sys.stdin)["body"].splitlines()[0])')"
-has_verdict="$(printf '%s' "$posted" | python3 -c 'import json,sys; print(sum(1 for l in json.load(sys.stdin)["body"].splitlines() if l.startswith("## Verdict")))')"
-expected="🧚 engram-pr-reviewer · PR #$PR · round $ROUND · head $SHA"
-if [ "$posted_pr" = "$PR" ] && [ "$posted_first" = "$expected" ] && [ "$has_verdict" -ge 1 ]; then
-  echo "READ-BACK OK: comment $cid on PR #$posted_pr: $posted_first"
+expected="🧚 engram-pr-reviewer · PR #$PR · round $ROUND · head $SHA"   # or the brief's exact line, quoted so the shell keeps it literal
+if [ "$(head -1 "$B")" != "$expected" ]; then
+  echo "NOT POSTED: body file first line is [$(head -1 "$B")], expected [$expected]"
+elif ! grep -q '^## Verdict' "$B"; then
+  echo "NOT POSTED: body file has no '## Verdict' section (truncated?)"
 else
-  echo "READ-BACK MISMATCH: comment [$cid] (gh printed [$url]) landed on PR #$posted_pr; expected first line [$expected], posted first line [$posted_first]; '## Verdict' lines: $has_verdict"
+  url="$(gh pr comment "$PR" -R "$REPO" --body-file "$B")"   # gh prints the comment URL
+  cid="${url##*issuecomment-}"
+  case "$cid" in
+    '' | *[!0-9]*) posted="" ;;   # gh printed no comment URL: nothing to fetch, and the check below says so
+    *) posted="$(gh api "repos/$REPO/issues/comments/$cid")" ;;
+  esac
+  posted_pr="$(printf '%s' "$posted" | python3 -c 'import json,sys; print(json.load(sys.stdin)["issue_url"].rsplit("/",1)[1])')"
+  posted_first="$(printf '%s' "$posted" | python3 -c 'import json,sys; print(json.load(sys.stdin)["body"].splitlines()[0])')"
+  has_verdict="$(printf '%s' "$posted" | python3 -c 'import json,sys; print(sum(1 for l in json.load(sys.stdin)["body"].splitlines() if l.startswith("## Verdict")))')"
+  if [ "$posted_pr" = "$PR" ] && [ "$posted_first" = "$expected" ] && [ "$has_verdict" -ge 1 ]; then
+    echo "READ-BACK OK: comment $cid on PR #$posted_pr: $posted_first"
+  else
+    echo "READ-BACK MISMATCH: comment [$cid] (gh printed [$url]) landed on PR #$posted_pr; expected first line [$expected], posted first line [$posted_first]; '## Verdict' lines: $has_verdict"
+  fi
 fi
 ```
 
+- **A first-line mismatch, or a body with no `## Verdict` section, posts nothing.** `gh pr comment` sits inside the gate, so posting a stale, wrong or truncated file would take a deliberate edit of the block, not just ignoring a printed line. On `NOT POSTED`, fix the file or report the mismatch to the parent. The read-back still checks `## Verdict` too, because a body can also be cut short on its way to GitHub.
 - **Fetch the comment by the id `gh` printed, not "the latest comment".** Someone else may comment in the same second. If `gh pr comment` failed and printed no URL, there is no id; the block then reports a MISMATCH that shows what `gh` printed.
-- **If your sandbox refuses a variable or a command form, use literal values or another tool.** One seat's guard refused `HEAD=` as a variable name and a variable repo inside `gh`; another refused `head -1` in the pre-post check. The block therefore uses `SHA`, and you may write the repo and numbers literally or do the same comparison in a few lines of Python. What must not change: `expected` is built from the brief and your asserted head, never from the file or the posted body, and every check runs (the pre-post first-line check, and all three read-back checks).
+- **If your sandbox refuses a variable or a command form, use literal values or another tool, but keep the gate a gate.** One seat's guard refused `HEAD=` as a variable name and a variable repo inside `gh`; another refused `head -1`. You may write the repo and numbers literally, or do the comparison in a few lines of Python. What must not change: `expected` comes from the brief (or the brief's values and your asserted head), never from the file or the posted comment; a first-line mismatch must stop the post, not merely print; and all three read-back checks run.
 - **The three checks each catch a different failure.**
   - The PR the comment landed on catches a wrong `<pr-number>`.
   - The first line catches a body written for another PR or another head. A stale file names another PR or head.
