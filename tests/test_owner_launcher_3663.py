@@ -2832,7 +2832,14 @@ if [ "$_os" = "Darwin" ]; then
     _state="$("$PYTHON_BIN" "$IO_PY" launchd_state "$LABEL" 2>/dev/null)"
     _sup="launchd: ${_state:-no answer}"
     case "$_state" in
-        running) exit 0 ;;
+        running)
+            # #3849: up is not serving. Probe; report ONE line only for `notserving:` with no live
+            # owner recorded. Serving / ambiguous / an owner that just wrote its pidfile: silent.
+            if _supervised_not_serving; then
+                _report "ENGRAM owner job $LABEL is running but no live owner is recorded in engramd.pid, and its socket did not serve within the probe window: ${_serving#notserving:}; no second owner was launched. It may still be starting; if this persists across session starts, run: launchctl kickstart -k gui/$(id -u)/$LABEL. ENGRAM_HOME=$ENGRAM_HOME"
+            fi
+            exit 0
+            ;;
         registered:*)
             _rest="${_state#registered:}"
             _report "ENGRAM owner job $LABEL is registered but ${_rest%:*} (last exit ${_rest##*:}); leaving it to launchd, no second owner launched. ENGRAM_HOME=$ENGRAM_HOME"
@@ -2911,10 +2918,30 @@ def test_c5_the_launchers_macos_branch_is_unchanged_byte_for_byte():
         header comment ABOVE the slice at old lines 24..28.
     So the property this cell guards -- the Linux work must not leak into the Darwin branch --
     still holds, unweakened: any future edit inside the slice still reddens here. Re-baseline
-    deliberately if a macOS change is intended."""
+    deliberately if a macOS change is intended.
+
+    RE-BASELINED for #3849 (2026-10-16). The change IS intended and macOS-side: the supervised
+    Darwin `running)` arm used to `exit 0` unconditionally, so an owner job that was up but not
+    serving (the residual case) was silent. It now probes the socket (`_supervised_not_serving`)
+    and reports ONE line only for `notserving:` with no live owner recorded; serving, ambiguous,
+    or an owner that just wrote its pidfile stay silent, and the arm still ends in `exit 0`
+    (see the hook header).
+
+    MECHANICAL PROOF that this is the ONLY delta (computed, not estimated). Slice re-derived with
+    the same two markers this cell uses; OLD = the previous `LAUNCHER_DARWIN_BASELINE` (sha256
+    34a9034f861ddcc1c15116f99fa597d28c2e08795a225493bae270366d383568, 1899 bytes, 35 lines), NEW =
+    the slice of this branch's hook (re-derived after the round-1 hedge/positive-`none` fixes,
+    which moved the `_report` line inside the `running)` arm). `diff -u OLD NEW`, computed against
+    the pre-#3849 hook (`99b85494`), is ONE hunk (`@@ -7,7 +7,14 @@`): 1 line removed
+    (`        running) exit 0 ;;`), 8 added, all inside the `running)` arm; every other
+    arm (`registered:*`, `no_gui_domain`, `ambiguous:*`, `notfound`, `*`) and every line outside
+    the `case` is byte-identical. New slice: sha256
+    0fd398c5d7d4fc850133ada94904ef800e29b5bbd37176e269faca6b524bdb3a, 2536 bytes, 42 lines.
+    Any edit to another arm still reddens here."""
     text = _require(HOOK).read_text(encoding="utf-8")
     start = text.index('if [ "$_os" = "Darwin" ]; then')
     end = text.index("    # ---- 4b. Linux: the systemd --user unit")
     actual = text[start:end]
     assert actual == LAUNCHER_DARWIN_BASELINE, (
-        "#3831 must not change the launcher's macOS branch.\n--- actual ---\n" + actual)
+        "the launcher's macOS branch must not change except as documented in this test's "
+        "RE-BASELINED paragraphs.\n--- actual ---\n" + actual)

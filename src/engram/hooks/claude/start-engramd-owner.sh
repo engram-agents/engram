@@ -25,7 +25,25 @@
 #       Linux:  the systemd --user unit engramd-owner-<id>.service
 #       macOS:  the launchd job com.engram.engramd-owner.<id> (`launchctl print`, asked and
 #               parsed by the I/O helper under a Python-side timeout)
-#                                                        -> launch nothing (running / active:
+#                                                        -> launch nothing (running / active: the
+#                                                           socket is probed first (#3849), because step 3
+#                                                           only probes a LIVE RECORDED owner and an up
+#                                                           unit / job may have none (still before its
+#                                                           pidfile write, pidfile missing or stale, or
+#                                                           not an engramd_owner). Not serving AND a
+#                                                           positive `none` on a liveness re-read (alive,
+#                                                           notregular:* or an unreadable answer claim
+#                                                           nothing) -> ONE line (never "alive": no owner
+#                                                           pid is established) carrying the probe's
+#                                                           observation, "no second owner was launched",
+#                                                           "it may still be starting" (a budgeted claim:
+#                                                           a cold start can miss the window) and the
+#                                                           restart remedy "if this persists" (Linux
+#                                                           `systemctl --user restart <unit>`, macOS
+#                                                           `launchctl kickstart -k gui/<uid>/<label>`);
+#                                                           on Linux that line replaces the NRestarts one.
+#                                                           Serving, ambiguous, or an owner that wrote its
+#                                                           pidfile during the probe -> as before:
 #                                                           silent -- UNLESS it has restarted >= 3
 #                                                           times, when ONE line names the restart
 #                                                           count and the exit the record holds. #3831:
@@ -266,6 +284,21 @@ case "$_verdict" in
         ;;
 esac
 
+# #3849: step 3 probes a LIVE RECORDED owner; the supervised arms below are reached only when no
+# live owner is recorded (the owner is still before its engramd.pid write, the pidfile is missing or
+# stale, or the unit's process is not an engramd_owner). When the unit / job is UP, ask the same
+# probe. Returns 0 only for `notserving:` AND a POSITIVE `none` on the liveness re-read: any other
+# answer (`alive` -- an owner that wrote its pidfile during the probe is step 3's, on the next fire --
+# or `notregular:*`, or an error / empty read, which step 3 treats as its own ambiguous line) claims
+# nothing. `serving` and `ambiguous:` return 1 too. The observation is left in _serving for the
+# report line.
+_supervised_not_serving() {
+    _serving="$(_probe_serving)"
+    [ "${_serving%%:*}" = "notserving" ] || return 1
+    [ "$(_live_verdict)" = "none" ] || return 1
+    return 0
+}
+
 # ---- 4. is the supervised unit / job for THIS home registered? -----------------------
 # The home key (first 8 hex of sha256 over the physical home) comes from the ONE shared helper,
 # the same one tools/setup-surface-daemon-service.sh --owner names the unit / label with.
@@ -289,7 +322,14 @@ if [ "$_os" = "Darwin" ]; then
     _state="$("$PYTHON_BIN" "$IO_PY" launchd_state "$LABEL" 2>/dev/null)"
     _sup="launchd: ${_state:-no answer}"
     case "$_state" in
-        running) exit 0 ;;
+        running)
+            # #3849: up is not serving. Probe; report ONE line only for `notserving:` with no live
+            # owner recorded. Serving / ambiguous / an owner that just wrote its pidfile: silent.
+            if _supervised_not_serving; then
+                _report "ENGRAM owner job $LABEL is running but no live owner is recorded in engramd.pid, and its socket did not serve within the probe window: ${_serving#notserving:}; no second owner was launched. It may still be starting; if this persists across session starts, run: launchctl kickstart -k gui/$(id -u)/$LABEL. ENGRAM_HOME=$ENGRAM_HOME"
+            fi
+            exit 0
+            ;;
         registered:*)
             _rest="${_state#registered:}"
             _report "ENGRAM owner job $LABEL is registered but ${_rest%:*} (last exit ${_rest##*:}); leaving it to launchd, no second owner launched. ENGRAM_HOME=$ENGRAM_HOME"
@@ -588,10 +628,17 @@ else
     _sup="systemd: $_state"
     case "$_state" in
         active)
-            # A RUNNING unit is serving, so the launcher stays silent -- UNLESS it has restarted
+            # #3849: an active unit is not thereby serving. Probe first; when it does not serve and
+            # no live owner is recorded, ONE line (the not-serving one, alone: it also stands in for
+            # the NRestarts line) and nothing launched. Otherwise (serving, ambiguous, or an owner
+            # that just wrote its pidfile) today's behaviour: silent -- UNLESS it has restarted
             # repeatedly (NRestarts >= 3), the one loud signal a healthy-looking unit gives
             # (#3831). Its line says it is running and NOT being retried (#3835). An empty detail
             # (any read failure) keeps today's silence.
+            if _supervised_not_serving; then
+                _report "ENGRAM owner unit $UNIT is active but no live owner is recorded in engramd.pid, and its socket did not serve within the probe window: ${_serving#notserving:}; no second owner was launched. It may still be starting; if this persists across session starts, run: systemctl --user restart $UNIT. ENGRAM_HOME=$ENGRAM_HOME"
+                exit 0
+            fi
             _detail="$(_unit_detail)"
             if [ -n "$_detail" ] && [ "$(_owner_verdict "$_detail")" = "loud" ]; then
                 _report "$(_owner_loud_line "$_detail")"
