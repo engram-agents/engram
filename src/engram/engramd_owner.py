@@ -537,6 +537,25 @@ WORKER_THREAD_PREFIX = "engramd-worker"
 IDLE_WORKER_CAP = 4
 IDLE_WORKER_TIMEOUT = 60.0  # seconds
 
+# Peer-credential refusals (#3845). After the typed rejection the owner does
+# shutdown(SHUT_WR) and DRAINS the refused peer's request (never parsing it) before
+# closing: closing with unread bytes in the receive queue makes a client that reads to
+# EOF get ConnectionResetError after the (delivered) rejection. The drain is bounded by
+# min(REFUSAL_DRAIN_BUDGET, the remaining request deadline) and by max_request_bytes.
+# A refused peer that sends nothing is therefore held up to this budget instead of
+# being closed at once. Each refusal logs one WARNING, rate-limited per peer uid with a
+# lazy window (no timer): PEER_REFUSAL_LOG_WINDOW seconds, at most
+# PEER_REFUSAL_LOG_MAX_UIDS uids tracked (oldest evicted). At most MAX_REFUSAL_DRAINS
+# drains run at once, GLOBAL across peers, so a flood of silent foreign connections
+# cannot cost one held handler thread each. A refusal that finds no free slot sends the
+# rejection and closes at once -- no shutdown, no drain, no hold -- so only an
+# overflowing read-to-EOF send-first client loses the clean EOF (it gets
+# ConnectionResetError after the delivered rejection). The log line is written either way.
+REFUSAL_DRAIN_BUDGET = 0.5  # seconds
+MAX_REFUSAL_DRAINS = 8
+PEER_REFUSAL_LOG_WINDOW = 60  # seconds
+PEER_REFUSAL_LOG_MAX_UIDS = 64
+
 # Accept backlog (#3680). listen(5) let a burst of ~6+ simultaneous hook processes
 # overflow the kernel's accept queue: the client's connect() failed at once with EAGAIN
 # although the owner was healthy. The kernel caps this at net.core.somaxconn (Linux) /
@@ -2023,6 +2042,12 @@ class EngramdOwner:
         self._idle = 0
         self._jobs: "queue.SimpleQueue" = queue.SimpleQueue()
         self._worker_seq = itertools.count(1)
+        # Peer-refusal log limiter (#3845): peer uid -> [window_start, suppressed].
+        self._peer_refusal_lock = threading.Lock()
+        self._peer_refusal_log: dict = {}
+        # Refusal drains in flight (#3845); the lock is never held across I/O.
+        self._refusal_drains_lock = threading.Lock()
+        self._refusal_drains = 0
 
         self._server: socket.socket | None = None
         # Owner-internal connection (was `_store_conn` in U3) -- serves
@@ -2995,6 +3020,86 @@ class EngramdOwner:
             }
         return None
 
+    def _refused_peer_uids(self, conn: socket.socket) -> tuple:
+        """(peer_uid, owner_uid) for the refusal log (#3845). Re-reads the kernel
+        credentials, so `_check_peer_credentials` keeps returning only the wire dict.
+        peer_uid is None if the re-read fails; this never raises."""
+        own_uid = os.getuid()
+        try:
+            if _owner_arm() == "darwin":
+                raw = conn.getsockopt(SOL_LOCAL, socket.LOCAL_PEERCRED, DARWIN_PEERCRED_STRUCT_SIZE)
+                return struct.unpack_from(DARWIN_PEERCRED_STRUCT_FORMAT, raw)[1], own_uid
+            raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, PEERCRED_STRUCT_SIZE)
+            return struct.unpack_from(PEERCRED_STRUCT_FORMAT, raw)[1], own_uid
+        except Exception:
+            return None, own_uid
+
+    def _log_peer_refusal(self, conn: socket.socket, rejection: dict) -> None:
+        """One bounded WARNING per refusal window per peer uid (#3845). Names the peer
+        uid, the owner uid and the reason; never any request bytes. The window is lazy
+        (no timer): the first refusal after a window expires carries "N suppressed in
+        the previous window". A burst followed by silence therefore never prints its
+        count."""
+        peer_uid, own_uid = self._refused_peer_uids(conn)
+        reason = rejection.get("reason")
+        now = time.monotonic()
+        with self._peer_refusal_lock:
+            entry = self._peer_refusal_log.get(peer_uid)
+            if entry is not None and now - entry[0] < PEER_REFUSAL_LOG_WINDOW:
+                entry[1] += 1
+                return
+            carried = entry[1] if entry is not None else 0
+            self._peer_refusal_log.pop(peer_uid, None)  # re-insert last: order = window start
+            while len(self._peer_refusal_log) >= PEER_REFUSAL_LOG_MAX_UIDS:
+                del self._peer_refusal_log[next(iter(self._peer_refusal_log))]
+            self._peer_refusal_log[peer_uid] = [now, 0]
+        tail = f"; {carried} suppressed in the previous window" if carried else ""
+        try:
+            logging.getLogger("engramd_owner").warning(
+                "peer refused: uid %s (owner uid %s), reason %s; further refusals from uid %s "
+                "suppressed for %ds%s",
+                peer_uid, own_uid, reason, peer_uid, PEER_REFUSAL_LOG_WINDOW, tail)
+        except Exception:
+            pass  # a raising logging.Filter must never cost the peer its typed rejection or the drain
+
+    def _take_refusal_drain_slot(self) -> bool:
+        """Non-blocking: True if a drain slot was free (and is now taken)."""
+        with self._refusal_drains_lock:
+            if self._refusal_drains >= MAX_REFUSAL_DRAINS:
+                return False
+            self._refusal_drains += 1
+            return True
+
+    def _release_refusal_drain_slot(self) -> None:
+        with self._refusal_drains_lock:
+            self._refusal_drains -= 1
+
+    def _drain_refused_request(self, conn: socket.socket, deadline: float) -> None:
+        """After the typed rejection: shutdown(SHUT_WR), then read and DISCARD the
+        refused peer's request until EOF, the drain budget, or max_request_bytes (#3845).
+        Never parses what it reads."""
+        try:
+            conn.shutdown(socket.SHUT_WR)
+        except OSError:
+            return
+        budget = min(REFUSAL_DRAIN_BUDGET, deadline - time.monotonic())
+        if budget <= 0:
+            return
+        end = time.monotonic() + budget
+        consumed = 0
+        while consumed < self.max_request_bytes:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return
+            conn.settimeout(remaining)
+            try:
+                chunk = conn.recv(min(65536, self.max_request_bytes - consumed))
+            except OSError:
+                return  # includes socket.timeout
+            if not chunk:
+                return  # EOF
+            consumed += len(chunk)
+
     def _check_peer_credentials_darwin(self, conn: socket.socket) -> dict | None:
         """Darwin arm of the peer check (#3666, design doc §2.2 + §2.5): same
         return contract as `_check_peer_credentials()` -- a §2.3 rejection wire
@@ -3055,6 +3160,7 @@ class EngramdOwner:
         try:
             rejection = self._check_peer_credentials(conn)
             if rejection is not None:
+                self._log_peer_refusal(conn, rejection)
                 # Bounded by the SAME remaining deadline as every other
                 # send in this method (reviewer-fairy catch on #3201: this
                 # send previously had no timeout at all, unlike the
@@ -3069,6 +3175,12 @@ class EngramdOwner:
                         conn.sendall((json.dumps(rejection) + "\n").encode("utf-8"))
                     except OSError:
                         pass
+                    else:
+                        if self._take_refusal_drain_slot():
+                            try:
+                                self._drain_refused_request(conn, deadline)
+                            finally:
+                                self._release_refusal_drain_slot()
                 return
             line = self._read_request_line(conn, deadline)
             if line is None:
