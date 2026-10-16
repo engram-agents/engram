@@ -272,8 +272,10 @@
       "path_prefix_or_glob": "hooks/claude/engram-utility-credit-mention-stop.py",
       "test_globs": [
         "tests/test_engram_utility_credit_mention_stop.py",
-        "tests/test_utility_use_action.py"
-      ]
+        "tests/test_utility_use_action.py",
+        "tests/test_utility_credit_owner_write_3822.py"
+      ],
+      "note": "engram-alpha#3822 (U11 Stage B): test_utility_credit_owner_write_3822.py added -- the flagged owner-write path (differential at the write, zero opens, owner-down / skew / readback / indeterminate-retry cells); the hook is loaded via importlib (hyphenated name), invisible to the import graph."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-loop-arm-stop-hook.py",

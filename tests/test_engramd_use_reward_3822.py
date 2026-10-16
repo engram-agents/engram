@@ -917,6 +917,26 @@ def test_a_denial_inside_the_restamp_savepoint_is_not_swallowed_as_a_restamp_err
 
 
 @requires_linux_owner
+def test_a_valid_call_after_a_restamp_savepoint_denial_is_ok_on_the_same_connection(owner, monkeypatch):
+    """The denial path must leave the owner connection transaction-free: after the swallowed-then-refused denial above, a
+    SECOND valid use_reward on the SAME owner and connection is `Ok` with the expected bump, not `Rejected
+    use_reward_txn_open`. Mutation: remove the denial path's abort() AND the final belt-and-braces rollback together -> this
+    cell (alone) goes red; each removed alone stays green because the other covers it."""
+    def evil_restamp(conn, node_ids, **kw):
+        conn.execute("UPDATE nodes SET claim = 'pwned'")
+
+    monkeypatch.setattr(er, "restamp", evil_restamp)
+    res = call(owner, ["n_mid"])
+    assert isinstance(res, ec.Rejected) and res.reason == "write_denied", res
+    monkeypatch.undo()
+    res2 = call(owner, ["n_mid"])
+    assert isinstance(res2, ec.Ok), res2
+    assert res2.result["updated"] == ["n_mid"] and res2.result["bumped"] == 1
+    assert three(owner.store_path)["n_mid"][0] == 0.55
+    assert not owner._owner_conn.in_transaction
+
+
+@requires_linux_owner
 def test_a_surprise_trigger_is_denied_by_name_and_the_op_is_refused(owner):
     """A trigger added to the store that would fire on utility_score is not in the admitted set: its body is
     denied at prepare time, the op is refused and rolled back."""

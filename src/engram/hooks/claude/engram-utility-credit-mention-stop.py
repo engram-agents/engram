@@ -65,6 +65,7 @@ import re
 import sqlite3
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -80,6 +81,7 @@ if _HOOK_DIR not in sys.path:
     sys.path.insert(0, _HOOK_DIR)
 from _hooklib import atomic_write_json, resolve_runtime_dir
 from _hooklib import read_state_json_classified  # #3521 row 40
+from _hooklib import import_owner_flags as _hooklib_import_owner_flags  # #3822 Stage B
 # #3628: every read and the log append are non-blocking and regular-file-only.
 from _hooklib import open_regular_text, open_regular_text_append
 
@@ -179,6 +181,170 @@ def _mention_alpha_or_none():
         return None
 
 
+# --- #3822 Stage B: the owner write, behind `engramd.utility_credit_writes_via_owner` ---------------------------
+# The flag is read ONLY through engramd_owner_flags.flag_on over the module-level CONFIG_PATH. Flag OFF (the default) is
+# today's code path, unchanged. Flag ON: the bump goes to the owner's typed `use_reward` op and the store is never opened
+# from here; every non-success outcome is a loud loss, never a fall back to the store.
+_OWNER_FLAG_KEY = "utility_credit_writes_via_owner"
+_OWNER_FLAGS_FAILURE = None  # class NAME of a flag-helper failure (reset per read); bump_utility reports it
+
+# Time. The Stop hook is registered with timeout 5 s (hooks/hooks.json). Both owner attempts together may wait at most
+# OWNER_WRITE_BUDGET_S, leaving OWNER_WRITE_RESERVE_S for interpreter start, telemetry, enactment detection and the
+# emitter: BUDGET + RESERVE = 3.5 + 1.5 = 5.0 <= 5. Attempt 1 waits min(T, BUDGET); the single retry (same request_id,
+# only after an INDETERMINATE first attempt) waits min(T, what is left) and only if at least OWNER_RETRY_MIN_S is left.
+OWNER_WRITE_BUDGET_S = 3.5
+OWNER_WRITE_RESERVE_S = 1.5
+OWNER_RETRY_MIN_S = 0.25
+# T is the client's named bound for this op, engramd_client.USE_REWARD_CLIENT_TIMEOUT (2.0 s; the owner's lock wait is 1.0 s,
+# so a typed `busy` arrives inside it). Imported by name at call time: the hook keeps no copy of the number. Worst case with
+# the retry: attempt 1 waits min(2.0, 3.5) = 2.0, the retry min(2.0, 3.5 - 2.0 = 1.5) = 1.5, total 3.5 = the budget.
+_monotonic = time.monotonic  # module-level so tests can drive the clock
+
+
+class _OwnerWriteLost(Exception):
+    """The bump was not (or not verifiably) applied through the owner. `args[0]` is the complete log line."""
+
+
+def _import_owner_flags():
+    """Thin alias; the body lives once in `_hooklib.import_owner_flags`. A module attribute because tests patch it."""
+    return _hooklib_import_owner_flags(ENGRAM_HOME)
+
+
+def _owner_writes_enabled() -> bool:
+    """`engramd.utility_credit_writes_via_owner`, read ONLY through engramd_owner_flags.flag_on. Anything but the JSON
+    boolean true is OFF. ANY exception (and a SystemExit) importing the helper or calling `flag_on` reads OFF -- the hook
+    cannot know the flag is ON -- and its CLASS NAME (never the message) is recorded in `_OWNER_FLAGS_FAILURE`, which
+    bump_utility reports: recorded, not silent. KeyboardInterrupt is not caught.
+
+    Flag OFF still performs this read on every fire (the helper import plus one config read), so "the OFF path is unchanged"
+    means the same results, the same store content and the same log content, not that nothing extra runs."""
+    global _OWNER_FLAGS_FAILURE
+    _OWNER_FLAGS_FAILURE = None
+    try:
+        engramd_owner_flags = _import_owner_flags()
+        return engramd_owner_flags.flag_on(_OWNER_FLAG_KEY, CONFIG_PATH) is True
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 -- see docstring
+        try:
+            _OWNER_FLAGS_FAILURE = type(exc).__name__
+        except Exception:
+            _OWNER_FLAGS_FAILURE = "unknown"
+        return False
+
+
+def _import_engramd_client():
+    """Lazy import (flag OFF never imports it), resolved layout-agnostically via the shared resolver -- plugin root first,
+    then a walk-parents search; never a fixed parents[N] (project CLAUDE.md, "Plugin build restructures code paths")."""
+    runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engramd_client.py")
+    sys.path[:] = [runtime_dir] + [p for p in sys.path if p != runtime_dir]
+    import engramd_client
+    return engramd_client
+
+
+def _code(value, fallback: str = "unknown") -> str:
+    """A reason code from the client/owner reduced to `[A-Za-z0-9_]{1,64}`; anything else is `fallback`. The log never
+    carries free text from the owner."""
+    text = value if isinstance(value, str) else ""
+    return text if re.fullmatch(r"[A-Za-z0-9_]{1,64}", text) else fallback
+
+
+OWNER_RESTAMP_ERROR_MAX = 400  # chars of an owner-supplied restamp_error kept in the log (real messages measured ~260, path included)
+
+
+def _one_line(value, limit: int | None = None) -> str:
+    """Owner-supplied text reduced to ONE bounded printable line: every run of whitespace or control characters becomes a
+    single space, then the text is cut to `limit` (default OWNER_RESTAMP_ERROR_MAX) characters with a trailing '...'.
+    The direct path's restamp_error comes from this process's own shared function and is logged as before."""
+    limit = OWNER_RESTAMP_ERROR_MAX if limit is None else limit
+    text = "".join(ch if ch.isprintable() else " " for ch in str(value))
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _owner_write_timeout(ec) -> float:
+    return float(ec.USE_REWARD_CLIENT_TIMEOUT)
+
+
+def _owner_use_reward(node_ids) -> int:
+    """Send ONE `use_reward` (action "mention") for `node_ids` and return the count bumped. Raises _OwnerWriteLost with the
+    log line for every outcome that is not a good ack. Params are EXACTLY {node_ids, action, request_id}: no alpha, no
+    value, no config path (the owner derives alpha from USE_ALPHA and reads its own config). One request_id per fire,
+    reused for the single retry of an INDETERMINATE first attempt (the owner's dedupe then answers duplicate=true, no
+    second bump); determinate outcomes are never retried."""
+    try:
+        ec = _import_engramd_client()
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 -- any import failure is an owner failure
+        raise _OwnerWriteLost(
+            f"bump_utility failed: owner client unavailable ({type(exc).__name__}); the store is not opened as a fallback"
+        ) from exc
+    rid = str(uuid.uuid4())
+    params = {"node_ids": list(node_ids), "action": _ACTION, "request_id": rid}
+    bound = _owner_write_timeout(ec)
+    started = _monotonic()
+    result = None
+    after_indeterminate = False
+    for attempt in (1, 2):
+        remaining = OWNER_WRITE_BUDGET_S - (_monotonic() - started)
+        if attempt == 2 and remaining < OWNER_RETRY_MIN_S:
+            break
+        result = ec.write("use_reward", params, request_id=rid, timeout=max(0.0, min(bound, remaining)))
+        if isinstance(result, ec.Unavailable) and result.reason in ("timeout", "protocol"):
+            after_indeterminate = True
+            continue  # INDETERMINATE: the op may have committed; retry once with the SAME request_id
+        break
+    return _owner_outcome(ec, result, after_indeterminate)
+
+
+def _indeterminate_after_retry(code: str) -> str:
+    return f"bump_utility indeterminate: {code}; the first attempt may have been applied once"
+
+
+def _owner_outcome(ec, result, after_indeterminate: bool = False) -> int:
+    """Map the final result to the count or to _OwnerWriteLost. `after_indeterminate`: the FIRST attempt was indeterminate
+    (it may be running or committed), so a non-Ok answer to the retry says nothing about whether the bump was applied:
+    every such outcome except readback_mismatch (committed but unverified, wherever it occurs) is reported as
+    INDETERMINATE, never with the 'not applied' / 'failed' words reserved for outcomes of a first attempt."""
+    if isinstance(result, ec.Ok):
+        body = result.result
+        bumped = body.get("bumped") if isinstance(body, dict) else None
+        if not isinstance(bumped, int) or isinstance(bumped, bool):
+            if after_indeterminate:
+                raise _OwnerWriteLost(_indeterminate_after_retry("unusable_answer"))
+            raise _OwnerWriteLost(
+                f"bump_utility failed: owner returned an unusable acknowledgement ({type(body).__name__})")
+        err = body.get("restamp_error")
+        if err:
+            _log(f"restamp failed: {_one_line(err)}")
+        return bumped
+    if isinstance(result, ec.Unavailable):
+        if result.reason in ("timeout", "protocol"):
+            raise _OwnerWriteLost(
+                "bump_utility indeterminate: owner did not answer (may have been applied once)")
+        if after_indeterminate:
+            raise _OwnerWriteLost(_indeterminate_after_retry(f"unavailable_{_code(result.reason)}"))
+        if result.reason == "internal":
+            raise _OwnerWriteLost(
+                "bump_utility indeterminate: owner client error (internal); the request may have been sent")
+        raise _OwnerWriteLost(f"bump_utility failed: owner unavailable (reason={_code(result.reason)})")
+    if isinstance(result, ec.Rejected):
+        reason = _code(result.reason, "invalid_reason")
+        if after_indeterminate and reason != "readback_mismatch":
+            raise _OwnerWriteLost(_indeterminate_after_retry(reason))
+        if reason == "busy":
+            raise _OwnerWriteLost("bump_utility failed: owner busy (not applied)")
+        if reason == "unknown_operation":
+            raise _OwnerWriteLost(
+                "bump_utility failed: owner rejected: unknown_operation: contract skew, this owner does not know "
+                "use_reward; restart or upgrade the engramd owner to this plugin's version (the bump was not applied)")
+        if reason == "readback_mismatch":
+            raise _OwnerWriteLost(
+                "bump_utility committed but unverified: owner readback_mismatch; the bump may have been applied once "
+                "and must not be blindly repeated")
+        raise _OwnerWriteLost(f"bump_utility failed: owner rejected: {reason}")
+    if after_indeterminate:
+        raise _OwnerWriteLost(_indeterminate_after_retry("unusable_answer"))
+    raise _OwnerWriteLost(f"bump_utility failed: owner returned an unusable answer ({type(result).__name__})")
+
+
 def bump_utility(
     node_ids,
     alpha: float | None = None,
@@ -201,9 +367,23 @@ def bump_utility(
     The restamp runs in its own SAVEPOINT there and a failure comes back as
     `restamp_error`; this hook commits (the bump always survives) and logs the
     error to LOG_PATH -- visible, never silent.
+
+    #3822 Stage B: with `engramd.utility_credit_writes_via_owner` ON the write goes to the owner's `use_reward` op
+    (`_owner_use_reward`) and this function never opens `db_path`, never reaches the WAL pragma and does not need
+    `engram_restamp`; `db_path` and `config_path` are ignored (the owner owns its store and reads its own config). An
+    explicit `alpha`, or `restamp=False`, is refused with ValueError: the owner op has exactly one shape (action
+    "mention", alpha from the shared table, bump then restamp), so honouring either would silently write something else.
     """
     if not node_ids:
         return 0
+    if _owner_writes_enabled():
+        if alpha is not None:
+            raise ValueError("an explicit alpha is not supported with owner writes (the owner derives alpha from USE_ALPHA)")
+        if not restamp:
+            raise ValueError("restamp=False is not supported with owner writes (the owner op always restamps)")
+        return _owner_use_reward(node_ids)
+    if _OWNER_FLAGS_FAILURE is not None:
+        _log(f"bump_utility: owner flag helper failed ({_code(_OWNER_FLAGS_FAILURE)}); using the direct path")
     if engram_restamp is None:
         raise RuntimeError(f"engram_restamp unavailable ({_RESTAMP_IMPORT_ERROR})")
     conn = sqlite3.connect(db_path, timeout=5.0)
@@ -618,6 +798,8 @@ def credit_mentions(
         stats["updated_count"] = bump_utility(
             mentioned, alpha, db_path, restamp=True, config_path=config_path
         )
+    except _OwnerWriteLost as e:
+        _log(str(e.args[0]))
     except Exception as e:
         _log(f"bump_utility failed: {type(e).__name__}: {e}")
     return stats
