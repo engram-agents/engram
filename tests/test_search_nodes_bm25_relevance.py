@@ -270,3 +270,50 @@ def test_fts_sim_merge_bump_promotes_above_floor(monkeypatch):
         f"Expected relevance={expected_rel:.6f} (sim={captured_sim}, bump={expected_bump:.6f}), "
         f"got {entry['relevance_normalized']:.6f}"
     )
+
+
+# ── #345 PR2, A2 ──────────────────────────────────────────────────────────
+
+def test_semantic_available_ignores_enabled_false(monkeypatch):
+    """(#345 PR2, A2) `semantic_available` (engram_query.py ~1761) no
+    longer consults the retired `enabled` key: with `enabled: False`
+    mocked, the semantic merge still runs (identical setup to
+    test_fts_sim_merge_bump_promotes_above_floor, just enabled=False) and
+    the FTS hit still gets its similarity + bump from the stubbed
+    _semantic_search.
+
+    Mutation target: restoring the
+    `core._embedder.is_available() and core._get_embedding_config().get("enabled", True)`
+    check here turns this RED (similarity reverts to None/absent -- no
+    merge, no bump -- since semantic_available would be False).
+    """
+    server = fresh_server()
+    _add_obs(server, "xylophone rhythm instrument unique term")
+    conn = server._get_db()
+
+    class _StubEmbedder:
+        def is_available(self): return True
+    monkeypatch.setattr(server, "_embedder", _StubEmbedder())
+    monkeypatch.setattr(server.core, "_embedder", _StubEmbedder())
+    monkeypatch.setattr(server.core, "_get_embedding_config", lambda: {"enabled": False})
+
+    captured_sim = 0.50
+    def _stub_sem(conn, q, top_k=10, min_similarity=0.0, **kw):
+        row = conn.execute("SELECT id FROM nodes WHERE type='observation_factual' LIMIT 1").fetchone()
+        return [{"id": row["id"], "similarity": captured_sim, "type": "observation_factual",
+                 "claim": "x", "confidence": 0.8}]
+    monkeypatch.setattr(server, "_semantic_search", _stub_sem)
+    monkeypatch.setattr(server.core, "_semantic_search", _stub_sem)
+
+    result = server._search_nodes(
+        conn, "xylophone", top_k=5, use_semantic=True, return_debug=True,
+    )
+    debug = result["debug"]
+    per_result = debug["per_result"]
+    assert len(per_result) >= 1, "Expected at least one keyword hit to survive floor"
+    entry = per_result[0]
+    assert entry["match_type"] == "keyword"
+    assert entry["similarity"] == pytest.approx(captured_sim, abs=1e-9), (
+        f"expected the semantic merge to run despite enabled=False -- "
+        f"similarity should be {captured_sim}, got {entry['similarity']}"
+    )

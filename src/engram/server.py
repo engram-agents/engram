@@ -867,10 +867,9 @@ NXDOMAIN_ERRNOS = _observation_mod.NXDOMAIN_ERRNOS
 
 # Relations permitted for after-creation edge addition via engram_add_edge.
 # Derived from the addable_after_creation flag in EDGE_CLASSIFICATIONS.
-# Currently equals _REMOVABLE_EDGE_RELATIONS (about, exemplifies, instantiates,
-# serves, subtask_of, tensions) — coincidental; PR 3 will diverge them by
-# adding the new relevance-marker relation. Do NOT collapse into a single
-# constant.
+# Currently equals _REMOVABLE_EDGE_RELATIONS (about, bears_on, exemplifies,
+# generalizes, instantiates, serves, subtask_of, tensions) — coincidental; a
+# future relation may diverge them. Do NOT collapse into a single constant.
 
 # VALID_ERROR_TYPES and _THRESHOLD_GATE_DISCIPLINE_HINT moved to engram_revision.py
 # (family E) in #872 wave 6; aliased above in wave-6 compat forwarders block.
@@ -1839,7 +1838,7 @@ def engram_add_observation(payload_json: str) -> str:
             fs_class (str, optional): Falsification-sensitivity class — "re-executable" (Class 1: claim can be re-tested by re-running the measurement) or "frozen" (Class 2: claim records a past event that cannot be re-executed). Omit or pass null to let the Phase-1 proxy (derived from quote_type) apply. When provided, takes priority over the proxy and the FALSIFICATION line drops the "(proxy:quote_type)" label. When the class is ambiguous (e.g. a re-readable file that records past state), omit and let the proxy apply — hesitation is the correct signal to omit.
             source_repo (str, optional): Absolute path to an alternative git repository to use for git operations. When omitted, the git repo is auto-detected from the file:// URL's directory. Use this for cross-repo citations where the cited file lives outside the target repo (e.g. a plugin file deployed to ~/.engram/ that is committed in the plugin source tree ~/engram-alpha/).
             repo_path (str, optional): Relative path within source_repo where the committed copy of the cited file lives (e.g. "src/engram/server.py"). Required when source_repo is provided and the cited file:// URL path is outside source_repo — used for git status and cat-file checks instead of the auto-derived path. Without repo_path, the path is derived from the file URL relative to the source_repo root, which fails when the file lives outside source_repo. Example: cite file:///home/user/.engram/marketplace/plugins/engram/server.py with source_repo="/home/user/engram-alpha" and repo_path="src/engram/server.py".
-            recall_summary (str, optional, always provide when you can): Compress your interpretation/claim into a ≤140-char recall-scent string shown to agents on future recall — don't start from a blank line. Omitting it clean-accepts but is flagged summary_missing (distinct from needs_tightening — a fail-loud-surface flag for the backfill sweep, not an error); a provided summary over 140 chars is soft-accepted (flagged needs_tightening for later cleanup); an excessively long summary is hard-rejected with no node created.
+            recall_summary (str, optional, always provide when you can): Compress your interpretation/claim into a ≤140-char recall-scent string shown to agents on future recall — don't start from a blank line. Omitting it clean-accepts but is flagged summary_missing (distinct from needs_tightening — a fail-loud-surface flag for the backfill sweep, not an error); a provided summary over 140 chars is soft-accepted (flagged needs_tightening for later cleanup), and the response carries recall_summary_overrun with the length; an excessively long summary is hard-rejected with no node created.
             recall_keywords (array of str, optional, always provide when you can): 3-6 short keyword strings for structural recognition cues. Never rejected regardless of count — normalized (trimmed, deduped case-sensitively, capped at 6).
             evidence_type (str, optional): What engram-snapshot (or you) captured, from a closed vocabulary: forum_thread, session_transcript, local_file, web_page, pdf. Stored on the evidence node's metadata at capture time. First-capture-wins on an evidence node that already carries a value: your value is never silently overwritten, and a DIFFERING value surfaces as evidence_type_conflict in the response instead of being dropped or applied. Not inferred from content or fs_class — pass exactly what engram-snapshot's own output emitted (its evidence_type key), or omit.
             original_url (str, optional): The pre-archive source URL/path engram-snapshot resolved (its own original_url output field) — e.g. the live forum thread URL or web page URL that was archived into the file:// evidence you're citing here. Stored on the evidence node's metadata. Same first-capture-wins semantics as evidence_type (a differing value surfaces as original_url_conflict, never silently overwrites). Omit for evidence that was never snapshotted — it must not appear on such nodes.
@@ -1960,7 +1959,7 @@ def engram_add_observation_batch(payload_json: str) -> str:
                 recall_summary (always provide when you can — ≤140-char recall-scent
                 string compressing this item's interpretation/claim; omission clean-accepts
                 but is flagged summary_missing (distinct from needs_tightening — a
-                fail-loud-surface flag, not an error), soft-accepted (needs_tightening flagged); an excessively long summary
+                fail-loud-surface flag, not an error), soft-accepted (needs_tightening flagged), and each item's result carries recall_summary_overrun with the length; an excessively long summary
                 hard-rejects that item only — other items in the batch are unaffected), recall_keywords (always provide
                 when you can — array of 3-6 short keyword strings; never rejected
                 regardless of count).
@@ -2263,7 +2262,7 @@ def engram_inspect(payload_json: str) -> str:
 # Set of legitimate field names for the engram_query payload.
 _QUERY_FIELDS = frozenset({
     "query", "types", "min_confidence", "include_superseded",
-    "top_k", "return_debug", "summary_top_k",
+    "top_k", "return_debug", "summary_top_k", "refresh_recall",
 })
 
 
@@ -2319,6 +2318,8 @@ def engram_query(payload_json: str) -> str:
             query (str, required): Natural language search query.
             types (str, optional): Comma-separated node types to filter
                 (e.g. 'derivation,observation_factual'). Empty = all types.
+                Evidence nodes are never search results; use engram_list
+                with node_type=evidence to list them.
             min_confidence (float, optional): Only return nodes at or above this
                 confidence threshold (0.0–1.0). Default 0.0.
             include_superseded (bool, optional): If True, include non-current
@@ -2333,6 +2334,14 @@ def engram_query(payload_json: str) -> str:
                 recall_keywords only (Tier 2). Default 3. Clamped to [0, top_k].
                 Set to 0 for all-keywords; set >= top_k for all-summaries.
                 Ignored when return_debug=True (full shape returned instead).
+            refresh_recall (bool, optional): Default True. False = measurement
+                mode: results and ranking identical (a person node's
+                special_moment render is also skipped, since it writes), but
+                surfaced nodes are NOT re-stamped (no importance / recall_turn /
+                recall_count change). For probes and harnesses; never for
+                ordinary recall. The response gains a top-level
+                "refresh_recall": false key only when False. Truthiness, like
+                return_debug: the string "false" is truthy and refreshes.
 
     Returns:
         Default (return_debug=False): tiered shape
@@ -2777,7 +2786,10 @@ def engram_cascade_resolve(payload_json: str) -> str:
         no contradictions), re_cascade (an explanation of what did and
         did not propagate), and — only when resolution_kind is `superseded`
         or `retracted` — delegated_to + delegated_result, naming the verb
-        this resolution handed off to and what it returned.
+        this resolution handed off to and what it returned. The #3625
+        bears_on hint keys (`bears_on_hints`, `bears_on_hint_prompt`,
+        `bears_on_hint_error`) arrive NESTED under `delegated_result`, never
+        at the top level of this response.
         On refusal, {"error": "..."} — with blocking_ancestors + next_call
         when the node is not on the frontier, or eligible +
         acknowledge_blocked_by when the shape is not available.
@@ -3712,6 +3724,63 @@ def engram_stats(payload_json: str = "{}") -> str:
     return _stats_mod._stats_impl(mode=mode, sections=sections_param)
 
 
+# DESIGN INTENT — engram_sign (engram-alpha#3450)
+# ------------------------------------------------
+# The lineage-transparent signature: one predictable line every agent appends
+# to every EXTERNAL communication. All fields are read mechanically by
+# engram_signature.build_signature (shared with tools/engram-sign.py); any
+# unreadable field is a refusal naming the field, never a placeholder line.
+# Read-only: no graph access, no writes, no network.
+@mcp.tool(
+    name="engram_sign",
+    capability=(
+        "Return the signature line (emoji, name, model lineage, ENGRAM version, accountable "
+        "human) to append to external communications; refuses naming the field if any is unreadable."
+    ),
+    annotations={
+        "title": "Lineage-Transparent Signature Line",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_sign(payload_json: str = "{}") -> str:
+    """Build the signature line to end every external communication with.
+
+    Never hand-type the line. On a refusal, fix the named field; never
+    improvise a line.
+
+    Args:
+        payload_json: JSON object (as a string) with these optional fields:
+            session_id (str, optional): session whose transcript names the
+                running model. Default: the harness's CLAUDE_CODE_SESSION_ID in the
+                server's environment (then CLAUDE_SESSION_ID / ANTHROPIC_SESSION_ID);
+                with no id the tool refuses (session_marker) rather than guessing a marker.
+
+    Returns:
+        JSON: {"status": "ok", "line": <str>, "parts": {...}} or
+        {"status": "refused", "field": <str>, "reason": <str>}.
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+    unknown = set(params.keys()) - {"session_id"}
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     "Allowed: ['session_id']"
+        })
+    sid = params.get("session_id")
+    if sid is not None and not isinstance(sid, str):
+        return json.dumps({"error": "session_id must be a string"})
+    import engram_signature
+    res = engram_signature.build_signature(core.DATA_DIR, session_id=sid)
+    if res.ok:
+        return json.dumps({"status": "ok", "line": res.line, "parts": res.parts})
+    return json.dumps({"status": "refused", "field": res.field, "reason": res.reason})
+
+
 # DESIGN INTENT — engram_diagnose
 # -------------------------------
 # Quantitative health audit for both user + agent consumption. Side-effect-free
@@ -3791,6 +3860,18 @@ def engram_diagnose() -> str:
           pairs that exceeded thresholds in the 7-day window — may be >
           worst_hours_shown if more than 10 buckets are flagged. See
           the cornerstone-evolution derivation/the cornerstone-evolution derivation/the cornerstone-frame-evolution open question for context.
+
+        - metadata_quarantine (#3425): ALWAYS present, 0 included.
+          {entity_kind, count, live_invalid_count, sample_ids, flare}.
+          count = ROWS in the metadata_quarantine table (migration rung 7
+          copied the raw blob of every node whose nodes.metadata was not valid
+          JSON there and set the node's metadata to NULL; a node re-quarantined
+          after a restore counts twice). sample_ids = DISTINCT node ids
+          (<= 10). live_invalid_count = nodes whose metadata is invalid RIGHT
+          NOW (slipped past the write guard). flare is true when EITHER count
+          is > 0 -- zero-or-investigate. To close the finding: review the raw
+          blobs in metadata_quarantine, then DELETE the reviewed rows and fix
+          or null any live invalid blob; flare clears when both counts are 0.
     """
     return _stats_mod._diagnose_impl()
 
@@ -3850,8 +3931,9 @@ def engram_history(payload_json: str) -> str:
             node_id (str, optional): Filter edits to a specific node
                 (edits mode only).
             action (str, optional): Filter by action type: created,
-                reopened, resolved, retracted, stale_flagged, superseded,
-                tainted, trust_tier_set (edits mode only).
+                prediction_decomposed, reopened, resolved, retracted,
+                stale_flagged, superseded, tainted, trust_tier_set (edits
+                mode only).
             since (str, optional): ISO timestamp — return only entries after
                 this time.
             limit (int, optional): Max entries to return (default 50,
@@ -4010,7 +4092,7 @@ def engram_add_definition(payload_json: str) -> str:
                 renders on inspect). Omitting it clean-accepts but is flagged
                 summary_missing (distinct from needs_tightening — a fail-loud-
                 surface flag, not an error); over 140 chars soft-accepts (flagged needs_tightening for later
-                cleanup); an excessively long summary hard-rejects with no
+                cleanup), and the response carries recall_summary_overrun with the length; an excessively long summary hard-rejects with no
                 node created.
             recall_keywords (array of str, optional, always provide when you can):
                 3-6 short keyword strings. Never rejected regardless of count.
@@ -4112,7 +4194,7 @@ def engram_add_conjecture(payload_json: str) -> str:
                 inspect). Omitting it clean-accepts but is flagged summary_missing
                 (distinct from needs_tightening — a fail-loud-surface flag, not an
                 error); over 140 chars soft-accepts (flagged needs_tightening for later
-                cleanup); an excessively long summary hard-rejects with no
+                cleanup), and the response carries recall_summary_overrun with the length; an excessively long summary hard-rejects with no
                 node created.
             recall_keywords (array of str, optional, always provide when you can):
                 3-6 short keyword strings. Never rejected regardless of count.
@@ -4351,7 +4433,11 @@ _ADD_PERSON_FIELDS = frozenset({
     # Required
     "name",
     # Typed relational fields (shared human + agent; mutable-with-trace)
-    "relation", "pronouns", "trust_tier", "aliases", "location_contact",
+    "relation", "pronouns", "aliases", "location_contact",
+    # Accepted at creation, but NOT mutable-with-trace via engram_update_person
+    # (alpha#1825 — one gate for trust_tier). Internal-circle tiers are
+    # refused here too; see engram_add_person's capability text.
+    "trust_tier",
     # Agent-specific identity fields (immutable)
     "lineage", "architecture", "first_session_date",
     # Immutable identity
@@ -4390,7 +4476,8 @@ _ADD_PERSON_FIELDS = frozenset({
     capability=(
         "Records a person node with typed relational fields only — NOT free-form facts "
         "(those are observations via engram_link_about). At most one is_self=true node "
-        "per graph."
+        "per graph. trust_tier our_side and above (and self) is refused at creation — "
+        "create, then engram_set_trust_tier."
     ),
     annotations={
         "title": "Record a Person",
@@ -4417,8 +4504,14 @@ def engram_add_person(payload_json: str) -> str:
             pronouns (str, optional): Free-form pronoun string. Mutable-with-trace.
             trust_tier (str, optional): Trust tier string — same values as the
                 nodes.trust_tier column ("self", "primary_user", "user_family",
-                "our_side", "known_external", "unknown", "suspect").
-                Mutable-with-trace (elevated review flag on change).
+                "our_side", "known_external", "unknown", "suspect"). NOT
+                mutable via engram_update_person (alpha#1825 — use
+                engram_set_trust_tier for any later change). A tier at/above
+                the internal-circle threshold (our_side, user_family,
+                primary_user, self) is refused here too, with no node
+                created — create the person, then call engram_set_trust_tier.
+                Tiers below the threshold (known_external, unknown, suspect)
+                and empty still work as before.
             aliases (str or list, optional): Alternative names for Stage 1
                 auto-suggest matching. CSV string or JSON list. Mutable-with-trace.
             location_contact (str, optional): Address/contact info. Mutable-with-trace.
@@ -4465,23 +4558,29 @@ _UPDATE_PERSON_FIELDS = frozenset({
 
 # DESIGN INTENT — engram_update_person
 # ------------------------------------
-# In-place update of mutable person-node fields: relation, pronouns, trust_tier,
-# aliases, location_contact. Does NOT create a new node (not a supersede).
-# Immutable fields (name, birthday, lineage, architecture, first_session_date)
-# are rejected — corrections require supersede.
+# In-place update of mutable person-node fields: relation, pronouns, aliases,
+# location_contact. Does NOT create a new node (not a supersede). Immutable
+# fields (name, birthday, lineage, architecture, first_session_date) are
+# rejected — corrections require supersede. trust_tier is neither mutable
+# nor immutable here — alpha#1825 closed the generic-writer bypass of the
+# primary-user approval gate; any `updates` containing "trust_tier" is
+# refused whole, naming engram_set_trust_tier as the remedy.
 #
 # Field-trace audit: every mutable change appends {prior_value, changed_at} to
 # metadata.field_traces[field] — append-only, never mutates existing entries.
 #
 # Cascade flag: emits a 'field-value-changed' flag into metadata.field_changed_flags
-# of all current nodes that cite or are about this person. trust_tier changes
-# carry review_required=True (elevated, non-dismissible); all others are cheap
-# (dismissible). Coarse-emit: node-scoped, not field-scoped.
+# of all current nodes that cite or are about this person. review_required/
+# dismissible is a general per-field mechanism; it is always
+# review_required=False/dismissible=True now that trust_tier can never
+# appear in `updates`. Coarse-emit: node-scoped, not field-scoped.
 @mcp.tool(
     name="engram_update_person",
     capability=(
-        "In-place edit of MUTABLE person fields only (relation, pronouns, trust_tier, "
-        "aliases, location_contact). Immutable fields rejected — use engram_supersede."
+        "In-place edit of MUTABLE person fields only (relation, pronouns, "
+        "aliases, location_contact). Immutable fields rejected — use "
+        "engram_supersede. trust_tier is rejected too — use "
+        "engram_set_trust_tier."
     ),
     annotations={
         "title": "Update Mutable Fields on a Person Node",
@@ -4499,20 +4598,26 @@ def engram_update_person(payload_json: str) -> str:
     nodes that cite or are about this person.
 
     Immutable fields (name, birthday, lineage, architecture, first_session_date)
-    are rejected — use engram_supersede for corrections.
+    are rejected — use engram_supersede for corrections. trust_tier is
+    rejected too (alpha#1825) — use engram_set_trust_tier, which enforces
+    the primary-user approval gate for every trust_tier change, up or down.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
             node_id (str, required): Person node ID (pn_NNNN). Must be
                 type='person' and is_current=1.
             updates (dict, required): Map of field → new_value. Mutable fields:
-                relation, pronouns, trust_tier, aliases, location_contact.
+                relation, pronouns, aliases, location_contact.
                 Attempting to update an immutable field returns an error.
+                Attempting to update trust_tier returns an error naming
+                engram_set_trust_tier as the remedy.
             reason (str, optional): Human-readable explanation for the change.
 
     Returns:
         JSON with status, node_id, updated_fields, field_traces_delta,
-        cascade_flagged_nodes. trust_tier_elevated=True when trust_tier changed.
+        cascade_flagged_nodes. trust_tier_elevated is always False — kept
+        for response-shape compatibility; trust_tier can no longer be
+        changed via this tool (alpha#1825).
     """
     params, err = _parse_payload(payload_json)
     if err:
@@ -5172,7 +5277,10 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # SQL surgery. Whitelist is the safety mechanism: only non-cascade, non-
 # structural-commitment edges can be removed via this tool.
 #
-# Whitelist (safe to remove): about, tensions, subtask_of, serves, exemplifies.
+# Whitelist (safe to remove): every relation with `removable: True` in
+# EDGE_CLASSIFICATIONS (core._REMOVABLE_EDGE_RELATIONS; today: about,
+# tensions, subtask_of, serves, exemplifies, instantiates, generalizes,
+# bears_on #3615).
 #
 # BLOCKED (require engram-surgical or substrate-level correction):
 #   - provenance-bearing: every relation with `provenance: True` in
@@ -5206,7 +5314,7 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
     name="engram_remove_edge",
     capability=(
         "Deletes ONLY a whitelisted non-cascade edge (about, tensions, subtask_of, "
-        "serves, exemplifies, instantiates, generalizes). Cascade/provenance edges "
+        "serves, exemplifies, instantiates, generalizes, bears_on). Cascade/provenance edges "
         "blocked — use engram-surgical."
     ),
     annotations={
@@ -5220,7 +5328,8 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 def engram_remove_edge(payload_json: str) -> str:
     """Remove a non-cascade edge between two nodes.
 
-    Whitelist-scoped (about, tensions, subtask_of, serves, exemplifies).
+    Whitelist-scoped (about, tensions, subtask_of, serves, exemplifies,
+    instantiates, generalizes, bears_on).
     Cascade / structural / provenance edges blocked — use engram-surgical for
     those. Idempotent: no_op_not_found is a successful return.
 
@@ -5265,7 +5374,8 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # groupings) previously required engram-surgical or an engram_supersede call.
 #
 # Whitelist (safe to add): about, exemplifies, serves, subtask_of, tensions,
-# generalizes. All are non-cascade, non-structural-commitment, non-provenance
+# instantiates, generalizes, bears_on (#3615; question -> claim, endpoints in
+# engram_core._relation_endpoint_error). All are non-cascade, non-structural-commitment, non-provenance
 # relations.
 #
 # BLOCKED (require node-add-time payload or dedicated mutation tool):
@@ -5310,7 +5420,7 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
     name="engram_add_edge",
     capability=(
         "Adds ONLY a whitelisted non-cascade edge between EXISTING nodes (about, "
-        "exemplifies, serves, subtask_of, tensions, instantiates, generalizes). "
+        "exemplifies, serves, subtask_of, tensions, instantiates, generalizes, bears_on). "
         "Idempotent."
     ),
     annotations={
@@ -5325,12 +5435,12 @@ def engram_add_edge(payload_json: str) -> str:
     """Add a non-cascade edge between two existing nodes.
 
     Whitelist-scoped (about, exemplifies, instantiates, serves, subtask_of,
-    tensions, generalizes). Cascade / structural / provenance edges blocked
+    tensions, generalizes, bears_on). Cascade / structural / provenance edges blocked
     — those must be created at node-add time (via the source node's
     payload) or via the dedicated mutation tool (supersede / retract).
     Generic add-edge is only for non-claim-bearing topological edges.
 
-    Relation boundaries (the four-way split):
+    Relation boundaries (the five-way split):
       exemplifies  — this incident is an instance of this lesson's
                      error/success pattern (incident → lesson ONLY; feeds
                      the tripwire engine).
@@ -5350,6 +5460,14 @@ def engram_add_edge(payload_json: str) -> str:
                      exemplifies/instantiates). Cycle-guarded at write
                      time. Coexists with `supported_by` — never a
                      replacement for it.
+      bears_on     — this QUESTION, once answered, will count for or
+                     against that claim (#3615; question → claim-bearing
+                     node or contradiction ONLY; direction-neutral, no
+                     cascade, no confidence change). engram_resolve names
+                     the question's live targets when it is answered, and
+                     engram_list(sort_by="bears_on") ranks open questions
+                     by how many live claims ride on them. Also writable at
+                     ask time via engram_ask's `bears_on` field.
 
     Idempotent: no_op_already_exists is a successful return.
 
@@ -5402,17 +5520,42 @@ _RETYPE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation", "new_rela
 #   supported_by -> about
 #   derives_from -> about
 #   derives_from -> exemplifies   (target must be a lesson or cornerstone)
-#   cites        -> about
+#   cites        -> every relation with addable_after_creation (today: about,
+#                   exemplifies, generalizes, instantiates, serves, subtask_of,
+#                   tensions, bears_on) -- derived from EDGE_CLASSIFICATIONS, not typed;
+#                   #2243 step 3 part A. The new relation's own endpoint rules
+#                   are the ones engram_add_edge enforces (one shared helper,
+#                   engram_core._relation_endpoint_error), so a retype
+#                   to X is refused exactly when add_edge to X would be for
+#                   the same node types (a bound on the node-type endpoint
+#                   rules only: a retype to subtask_of ALSO runs the
+#                   grounding-family cycle check, which add_edge does not, so
+#                   a retype can be refused where add_edge would not be);
+#                   exemplifies still needs a lesson or
+#                   cornerstone target. A loose cites on a superseded or
+#                   retracted source IS retypable (current-ness is not required).
+#                   A cites from an observation to its evidence (an ev_ node;
+#                   the pair core._cites_pair_error accepts) is provenance and
+#                   is NEVER retypable, to any relation, about included.
 # Any move outside this table is refused, INCLUDING the reverse (stronger)
-# direction of any of the four above — a re-type may only take a claim of
+# direction of any of the above — a re-type may only take a claim of
 # support AWAY, never add one after the fact (the same invariant
 # addable_after_creation=False already protects).
 #
 # Refusals (in order): missing/empty required field (including `reason` —
-# the correction is never silent); move not in RETYPE_ALLOWED_MOVES; target
-# type mismatch for a conditional move; source/target node not found; no
-# edge of the stated relation between them; a pending cascade marker on
-# EITHER endpoint (settle the cascade first via engram_cascade_resolve).
+# the correction is never silent); move not in RETYPE_ALLOWED_MOVES;
+# source/target node not found; an observation -> evidence cites (provenance,
+# never retypable, checked once that edge exists); target type mismatch for a
+# conditional move; no edge of the stated relation between them; a pending cascade marker on
+# EITHER endpoint (settle the cascade first via engram_cascade_resolve); the
+# new relation's own endpoint rules (instantiates / generalizes pair / bears_on), its
+# temporal order (subtask_of) and its acyclicity family.
+#
+# Side effects after commit, best-effort (same as engram_add_edge): a retype
+# INTO exemplifies rebuilds the incidents + cornerstone-anchors caches
+# (result carries `cache_rebuild`); a retype into exemplifies / instantiates /
+# serves / tensions rebuilds the principle-trigger registry. It does NOT reset
+# principle enactments: a relabel of an existing edge is not new evidence.
 #
 # Confidence: if the OLD relation is cascade-bearing (core.CASCADE_RELATIONS
 # — today only derives_from and acknowledged_derives_from), retyping it away
@@ -5432,8 +5575,8 @@ _RETYPE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation", "new_rela
     name="engram_retype_edge",
     capability=(
         "Corrects a wrong edge relation by making it WEAKER (never stronger) "
-        "in one audited transaction — e.g. a supported_by/derives_from/cites "
-        "edge that was really only 'about' or an 'exemplifies' case. "
+        "in one audited transaction — e.g. a supported_by/derives_from/loose-cites "
+        "edge (never an observation's cites to its evidence) that was really only an 'about', 'bears_on', 'exemplifies', 'generalizes', 'instantiates', 'serves', 'subtask_of' or 'tensions' case. "
         "Refuses moves outside a fixed allowed-move table, a pending-marker "
         "endpoint, or a missing reason."
     ),
@@ -5459,8 +5602,15 @@ def engram_retype_edge(payload_json: str) -> str:
                 (relation, new_relation) pair must be one of the allowed
                 moves: supported_by->about, derives_from->about,
                 derives_from->exemplifies (target must be a lesson or
-                cornerstone), cites->about. Any other pair — including the
-                reverse of any of these — is refused.
+                cornerstone), and loose cites->X for every relation X addable after
+                creation (about, bears_on [question source, claim-bearing or
+                contradiction target], exemplifies [lesson/cornerstone target],
+                generalizes, instantiates, serves, subtask_of, tensions);
+                a cites from an observation to its evidence is provenance
+                and is never retypable;
+                the new relation must also pass the endpoint rules
+                engram_add_edge applies to it. Any other pair — including
+                the reverse of any of these — is refused.
             reason (str, required): Why this edge was wrong. Required and
                 cannot be empty; recorded in the edit-history audit trail
                 alongside both the old and new relation.
@@ -5662,7 +5812,8 @@ def engram_goal_tension(payload_json: str) -> str:
 _ADD_LESSON_FIELDS = frozenset({
     "claim", "incident_ids", "scaffolding_nudge", "logical_chain",
     "reasoning_type", "context_ids", "situation_pattern", "bypass_prose_check",
-    "prevention_type", "recall_summary", "recall_keywords", "generalized_by",
+    "prevention_type", "tripwire_priority", "recall_summary", "recall_keywords",
+    "generalized_by",
 })
 
 
@@ -5760,13 +5911,22 @@ def engram_add_lesson(payload_json: str) -> str:
                 earns blocking only via engram_update_lesson, after a real shadow
                 window with measured zero false positives; nothing can mint straight
                 to blocking.
+            tripwire_priority (str, optional): One of "normal" (default) or "high"
+                (alpha#3270/#3112). The PreToolUse tripwire hook's display cap
+                ranks "high" lessons before "normal" ones, falling back to the
+                existing pattern-length tiebreak within a tier — a lesson with
+                no tripwire_priority set (every lesson minted before this field
+                existed) sorts exactly as before. "high" means the author would
+                rather be interrupted for this than for any broad reminder, not
+                a measured safety claim — mintable directly, no shadow-window
+                gate.
             recall_summary (str, optional, always provide when you can): Compress
                 the corrective pattern into a ≤140-char recall-scent string — don't
                 start from a blank line. Not content preservation (the full claim
                 renders on inspect). Omitting it clean-accepts but is flagged
                 summary_missing (distinct from needs_tightening — a fail-loud-
                 surface flag, not an error); over 140 chars soft-accepts (flagged needs_tightening for later
-                cleanup); an excessively long summary hard-rejects with no
+                cleanup), and the response carries recall_summary_overrun with the length; an excessively long summary hard-rejects with no
                 node created.
             recall_keywords (array of str, optional, always provide when you can):
                 3-6 short keyword strings. Never rejected regardless of count.
@@ -5780,7 +5940,10 @@ def engram_add_lesson(payload_json: str) -> str:
     Returns:
         JSON with lesson ID, confidence, linked incidents, and similar
         existing lessons for consolidation hints. On payload-parsing failure,
-        returns {"error": "..."}.
+        returns {"error": "..."}. When the claim is command-shaped and no
+        situation_pattern was given, also returns `unarmed_warning` (advisory
+        only, #3209): no action-moment pattern, recall-only; add one via
+        engram_update_lesson, or ignore if recall-only is intended.
 
     See _add_lesson_impl for full semantics.
     """
@@ -5947,8 +6110,9 @@ _UPDATE_LESSON_FIELDS = frozenset({
 @mcp.tool(
     name="engram_update_lesson",
     capability=(
-        "In-place edit of ONLY situation_pattern + scaffolding_nudge — claim/confidence "
-        "stay supersede-only. Prose-shaped patterns rejected unless overridden."
+        "In-place edit of situation_pattern, scaffolding_nudge, prevention_type, "
+        "tripwire_priority — claim/confidence stay supersede-only. Prose-shaped "
+        "patterns rejected unless overridden."
     ),
     annotations={
         "title": "Update Mutable Fields on a Lesson Node",
@@ -5967,8 +6131,9 @@ def engram_update_lesson(payload_json: str) -> str:
     (action="lesson_field_updated") — an in-place update still shows up as
     a graph-mutation event, distinct from creating a new node.
 
-    Mutable fields (#1826, widened 2026-08-03; #1944 widened again for
-    prevention_type): situation_pattern, scaffolding_nudge, prevention_type
+    Mutable fields (#1826, widened 2026-08-03; #1944 widened for
+    prevention_type; #3270/#3112 widened for tripwire_priority):
+    situation_pattern, scaffolding_nudge, prevention_type, tripwire_priority
     — mechanical retrieval/actionability metadata you can refine from real
     firing experience, never the lesson's epistemic content (claim,
     logical_chain, confidence, reasoning_type stay supersede-only).
@@ -5989,13 +6154,19 @@ def engram_update_lesson(payload_json: str) -> str:
     what an update is for, earned after a real shadow window (measured
     zero false positives), never re-litigated by this validation.
 
+    tripwire_priority must be one of "normal", "high" (#3270/#3112) — an
+    explicit, author-set display-priority signal for the PreToolUse
+    tripwire hook's cap (see engram_add_lesson's docstring for the full
+    mechanism). No earn-it gate in either direction, unlike prevention_type.
+
     Args:
         payload_json: JSON object (as a string) with these fields:
             node_id (str, required): Lesson node ID (ls_NNNN). Must be
                 type='lesson' and is_current=1.
             updates (dict, required): Map of field → new_value. Mutable
-                fields: situation_pattern, scaffolding_nudge, prevention_type.
-                Attempting to update any other field returns an error.
+                fields: situation_pattern, scaffolding_nudge, prevention_type,
+                tripwire_priority. Attempting to update any other field
+                returns an error.
             reason (str, optional): Human-readable explanation for the change.
             bypass_prose_check (bool, optional): Default False. Same
                 override semantics as engram_add_lesson's field of the same
@@ -6461,7 +6632,8 @@ def engram_derive(payload_json: str) -> str:
             derivation_mode (str, optional): LEGACY — use reasoning_type instead.
                 Kept for backward compatibility: "chain" or "corroboration".
             context_ids (str, optional): Comma-separated node IDs for context
-                references (e.g. definitions). Creates 'cites' edges.
+                references (e.g. definitions). Creates 'about' edges (cites is
+                observation->evidence only).
             use_stale (bool, optional): RETIRED (#2324) — accepted for
                 compatibility, NO EFFECT. Stale is a hard block now; passing
                 this returns a loud use_stale_retired notice rather than
@@ -6487,7 +6659,7 @@ def engram_derive(payload_json: str) -> str:
                 renders on inspect). Omitting it clean-accepts but is flagged
                 summary_missing (distinct from needs_tightening — a fail-loud-
                 surface flag, not an error); over 140 chars soft-accepts (flagged needs_tightening for later
-                cleanup); an excessively long summary hard-rejects with no
+                cleanup), and the response carries recall_summary_overrun with the length; an excessively long summary hard-rejects with no
                 node created.
             recall_keywords (array of str, optional, always provide when you can):
                 3-6 short keyword strings. Never rejected regardless of count.
@@ -6607,7 +6779,7 @@ def engram_contradict(payload_json: str) -> str:
 
 
 _ASK_FIELDS = frozenset({
-    "question", "context_ids", "category", "lacks",
+    "question", "context_ids", "category", "lacks", "bears_on",
 })
 
 
@@ -6628,12 +6800,19 @@ _ASK_FIELDS = frozenset({
 # lacks: external_evidence routes to research). Sharpens what KIND of help
 # the question needs.
 #
+# bears_on (#3615, optional): ids of the claim-bearing nodes (or contradictions)
+# the eventual answer will count for or against. Strict and all-or-nothing,
+# unlike context_ids: a bad id refuses the call and no question is created.
+# engram_resolve later names the live targets; engram_list(sort_by="bears_on")
+# ranks open questions by how many live claims ride on them.
+#
 # Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99).
 @mcp.tool(
     name="engram_ask",
     capability=(
         "Registers a persistent open question that survives across sessions via "
-        "recall/dream scans. Pair with engram_resolve for the answer."
+        "recall/dream scans. Pair with engram_resolve for the answer. Optional "
+        "bears_on names the claims the answer will count for or against."
     ),
     annotations={
         "title": "Register Open Research Question",
@@ -6660,6 +6839,13 @@ def engram_ask(payload_json: str) -> str:
             lacks (str, optional): What's missing — one of
                 external_evidence / empirical_data / human_decision /
                 implementation / synthesis / prerequisite.
+            bears_on (str, optional): Comma-separated IDs of claim-bearing
+                nodes (or contradictions) the eventual answer will count for
+                or against (#3615). Writes `bears_on` edges with the
+                question, in one transaction. STRICT, unlike context_ids:
+                every id must exist, be current and pass the engram_add_edge
+                endpoint rule, or the whole call is refused naming the
+                offending id and NO question is created.
 
     Returns:
         JSON with the new question node ID. On payload-parsing failure,
@@ -6763,6 +6949,29 @@ def engram_resolve(payload_json: str) -> str:
         confidence. On payload-parsing failure, returns {"error": "..."}.
         When partial_resolution is due to threshold gate, includes
         discipline_hint advising against chain dilution.
+        When the target is a question with `bears_on` edges (#3615; also on
+        the idempotent no_op path), the return adds `bears_on` (the LIVE
+        DIRECT targets, each {target_id, target_type}; a superseded target
+        is never listed), `bears_on_prompt` (asks, for each, whether the
+        answer supports or weakens it; it says "partially resolved" when the
+        resolve left the question partially_resolved),
+        `bears_on_hints` + `bears_on_hint_prompt` (#3625: a target
+        superseded, or retracted with a replacement, whose live replacement
+        is a legal target the question is not yet wired to, found by
+        following supersede or retract chains; ONE hint per replacement;
+        each entry carries the exact engram_add_edge call, and the old edge
+        stays as provenance; declining a hint leaves no trace, so resolving
+        the question again re-hints the same replacement),
+        `bears_on_hint_error` ("<ExceptionType>:
+        <message>", present only if computing the surfacing failed after the
+        resolve committed; the resolve itself still succeeded) and
+        `bears_on_omitted_noncurrent` (count of non-current targets that
+        produced no hint: retracted without a replacement, no live
+        replacement, replacement already wired, or not a legal target;
+        absent at 0).
+        engram_resolve changes none of those targets'
+        confidence — acting on the prompt is a separate, deliberate step.
+        Absent for any other target.
 
     Side effect (#1777, #1952 PR3): if target already carries a
     recall_summary, a real status change (not the idempotent no_op path)
@@ -6869,6 +7078,13 @@ def engram_supersede(payload_json: str) -> str:
     Returns:
         JSON with old_node_id, new_node_id, the stale downstream list,
         and stale_count. On payload-parsing failure, returns {"error": "..."}.
+        When a current question has a `bears_on` edge to old_node_id, also
+        `bears_on_hints` + `bears_on_hint_prompt` (#3625; read-only; each
+        entry carries the exact engram_add_edge call, the old edge stays as
+        provenance; declining leaves no trace, so engram_resolve re-hints that
+        replacement each time the question is resolved); absent otherwise. If computing the hint fails after the
+        supersede committed, the supersede still succeeds and the return
+        carries `bears_on_hint_error` ("<ExceptionType>: <message>") instead.
 
     See _supersede_impl for full semantics + workflow + validation rules.
     """
@@ -7014,6 +7230,13 @@ def engram_retract(payload_json: str) -> str:
     Returns:
         JSON with retraction details, tainted downstream nodes, and optional
         replacement. On payload-parsing failure, returns {"error": "..."}.
+        With a replacement_id, also `bears_on_hints` +
+        `bears_on_hint_prompt` (#3625; read-only) for current questions that
+        bore on the retracted node; declining leaves no trace, so engram_resolve
+        re-hints that replacement each time the question is resolved; absent
+        otherwise. If computing the hint
+        fails after the retraction committed, the retraction still succeeds
+        and the return carries `bears_on_hint_error` instead.
 
     See _retract_impl for full semantics + error-type catalog.
     """
@@ -7592,7 +7815,9 @@ def engram_list(payload_json: str = "{}") -> str:
     status as plain strings. Returns the compact triage shape; the `claim`
     key carries `recall_summary` when populated — truncated to 200 chars
     with an ellipsis if longer — falling back to the claim truncated to
-    130 chars.
+    130 chars. Question rows also carry `bears_on_count` (live `bears_on`
+    targets) and `bears_on_weight` (their summed importance_score, 3 places) —
+    the open-question priority signal (#3615); other types get neither key.
 
     Structured-filter mode (issue #81): pass filters_json with a recursive
     condition tree. Supports multi-field AND/OR/NOT composition, text
@@ -7629,6 +7854,19 @@ def engram_list(payload_json: str = "{}") -> str:
         categorical_tag, intensity_hint, and other node-table columns.
         Unknown field → error with the full valid-fields list.
 
+    Metadata keys (#3402): `metadata.<key>` reads ONE top-level key of a
+        node's metadata JSON, in filters AND in fields_json (read-only).
+        <key> must match ^[A-Za-z_][A-Za-z0-9_]{0,63}$ (no nesting, no dots);
+        anything else → error naming that pattern. The key is passed to SQLite
+        as a bound parameter, never interpolated. All atomic ops work as for
+        columns. A JSON true extracts as 1 and false as 0, so
+        {"field": "metadata.support_lost", "op": "eq", "value": 1} finds nodes
+        flagged support_lost. A key that is absent — or a row whose metadata
+        is not valid JSON — extracts as NULL (is_null matches it; in fields_json
+        the row carries the key with value null). Plain `metadata` is NOT a
+        filter field; in fields_json it returns the raw metadata JSON string
+        (the same value engram_inspect view="deep" shows).
+
     Example payload (yesterday's wiki-PR batch-verification use case):
         filters_json = json.dumps({
             "logic": "AND",
@@ -7653,7 +7891,11 @@ def engram_list(payload_json: str = "{}") -> str:
                 filters_json (errors loudly).
             sort_by (str, optional): Sort order — 'id' (default), 'created'
                 (newest first), 'importance' (highest first), 'recalls'
-                (most recalled first). Unrecognized non-empty value errors
+                (most recalled first), 'bears_on' (#3615: most live
+                bears_on targets first, then highest summed target
+                importance, then id ASC; sort_order flips count/weight
+                direction, id stays ASC; non-question rows count 0).
+                Unrecognized non-empty value errors
                 loudly rather than silently falling back to 'id' order.
             sort_order (str, optional): Direction override — 'asc' or 'desc'
                 (case-insensitive). Empty = use sort_by's own default
@@ -7766,8 +8008,10 @@ def engram_query_pattern(payload_json: str) -> str:
                   chain nearby (semantic) that may resolve them.
                 - stale_load_bearing: high-importance + low-recall non-
                   cornerstone nodes (re-engagement candidates).
-                - cornerstone_candidate: heavily-cited high-importance
-                  observations/derivations only (emergent-practice anchoring
+                - cornerstone_candidate: high-importance observations/
+                  derivations being cited recently (distinct current citers
+                  gained in the preset's recent window, not lifetime;
+                  observations/derivations only, emergent-practice anchoring
                   candidates; axioms/goals/definitions excluded as
                   fundamental-by-type — see the engram-* skills / MCP docstrings / #180).
                 - tainted_still_valid: tainted derivations whose substantive
@@ -8170,36 +8414,66 @@ def _embedding_startup_gate() -> None:
         MCP connection timeout and leave every engram_* tool unavailable for
         the session. Do NOT collapse that split — it is load-bearing.
 
-    `ENGRAM_NO_EMBEDDINGS=1` bypasses this entire gate. It is documented test
-    scaffolding (release_gates.py, dump_mcp_schema.py) and the escape hatch
-    for an operator who must start deliberately degraded.
+    `ENGRAM_NO_EMBEDDINGS=1` bypasses this entire gate. It is test/dev
+    scaffolding ONLY -- used by the test suite, release_gates.py,
+    dump_mcp_schema.py, run-all-tests.sh, and rc-upgrade-verify.py -- and is
+    NOT a supported production mode (#345, #3350). Checked FIRST, before
+    config is even read.
 
-    `embedding.enabled: false` also bypasses this gate — see the comment at
-    that check below for why this is deliberately NOT also-fatal.
+    `embedding.enabled: false` is now ALSO fatal (#345 PR2): the toggle is
+    retired -- embeddings are mandatory, full stop. A config that still
+    carries `enabled: false` (a stale file from before retirement, or a
+    deliberate opt-out that no longer exists) refuses to start with a
+    message naming the key and the fix, exactly like the missing/uncached
+    model cases below. This REPLACES the old deliberate-opt-out bypass: an
+    operator who previously relied on `enabled: false` to boot without the
+    ~500MB sentence_transformers dependency must delete the key and either
+    install the dependency or use ENGRAM_NO_EMBEDDINGS=1 for a genuinely
+    test/dev-only degraded start.
+
+    This gate covers the MCP server entry point only (`server.py` run as
+    `__main__`), by design -- see the `if __name__ == "__main__":` guard
+    around its call site. The surface daemon imports this module (`import
+    server as _server`) rather than executing it, so it never reaches this
+    gate and, like every other now-ungated call site, silently ignores the
+    retired `enabled` key. That is acceptable: the daemon only serves recall
+    (reads), and the refusing MCP server is the loud signal that reaches the
+    operator on any seat with a stale key.
     """
     import sys
 
     if os.environ.get("ENGRAM_NO_EMBEDDINGS"):
+        print(
+            "[engram] WARNING: embeddings disabled by ENGRAM_NO_EMBEDDINGS "
+            "-- this is test/dev scaffolding only, not a supported "
+            "production mode (#345, #3350). Every node written this "
+            "session will have no embedding.",
+            file=sys.stderr,
+        )
         return
 
-    # config["embedding"]["enabled"] (default True) is a real, still-active,
-    # documented toggle (README-AGENT.md, viz UI affordance) honored by 5
-    # call sites in engram_core.py / engram_query.py. Retiring it entirely is
-    # a *separate* slice of #345 (not landed here). Bypass rather than
-    # also-fatal is deliberate, not an oversight: an operator who has
-    # deliberately set `enabled: false` -- plausibly because they never
-    # installed the ~500MB sentence_transformers dependency -- previously
-    # got a clean boot with semantic search cleanly disabled at every query
-    # site. Making this fatal would change a documented, currently-honored
-    # configuration's behavior without the documentation, migration note, or
-    # release-note that the toggle's eventual retirement will carry. This
-    # gate closes the *unintentional* hole (a missing or uncached model);
-    # the *deliberate* opt-out keeps working as documented until it is
-    # retired on purpose. Checked before is_available() so an operator who
-    # disabled embeddings never sees a fatal about sentence_transformers.
     emb_config = _get_embedding_config()
-    if not emb_config.get("enabled", True):
-        return
+    if "enabled" in emb_config and emb_config["enabled"] is not True:
+        _enabled_value = emb_config["enabled"]
+        print(
+            f"[engram] FATAL: embedding.enabled is set to {_enabled_value!r} in "
+            "~/.engram/config.json. This key was RETIRED by #345 -- "
+            "embeddings are mandatory, and starting with it present and not "
+            "the boolean true would file nodes with NULL embeddings, "
+            "permanently excluded from semantic recall at any threshold, "
+            "for any query.",
+            file=sys.stderr,
+        )
+        print("", file=sys.stderr)
+        print("  To fix, delete the key from ~/.engram/config.json:", file=sys.stderr)
+        print('    {"embedding": {"model": "..."}}  # no "enabled" key', file=sys.stderr)
+        print("", file=sys.stderr)
+        print(
+            "  To start deliberately degraded (test/dev only): "
+            "ENGRAM_NO_EMBEDDINGS=1",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if not _embedder.is_available():
         print(

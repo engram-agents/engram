@@ -124,7 +124,7 @@ def _add_goal_impl(
     Args:
         claim: The goal statement — a desired state or direction.
         motivation: Why this goal matters — what drives it.
-        context_ids: Optional comma-separated node IDs for context. Creates cites edges.
+        context_ids: Optional comma-separated node IDs for context. Creates about edges.
 
     Returns:
         JSON with the new goal node ID.
@@ -154,10 +154,7 @@ def _add_goal_impl(
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, cid, now)
                 except sqlite3.IntegrityError:
                     pass
 
@@ -167,7 +164,7 @@ def _add_goal_impl(
         # _stamp_new_node writes the anchor in one pass instead of computing
         # an interim value from confidence/surprise and then overwriting it
         # [alpha#2266, alpha#2268].
-        core._stamp_new_node(conn, node_id, importance_base=2.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=2.0)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
@@ -208,13 +205,17 @@ def _add_goal_impl(
                 ),
             })
 
-        return json.dumps({
+        _result = {
             "status": "created",
             "goal_id": node_id,
             "claim": claim,
             "motivation": motivation,
             "context_nodes": context,
-        })
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        return json.dumps(_result)
     finally:
         conn.close()
 
@@ -250,7 +251,7 @@ def _add_task_impl(
         description: What needs to be done — concrete and actionable.
         goal_id: The goal this task serves. Creates a 'serves' edge.
         implements_ids: Comma-separated conjecture or question IDs this task
-            addresses. Creates 'cites' edges.
+            addresses. Creates 'about' edges (cites is observation->evidence only).
         parent_task_id: If this is a subtask, the parent task ID. Creates
             a 'subtask_of' edge. Parent is auto-promoted to milestone scope.
         scope: "milestone" or "routine" (default). Milestones retain higher
@@ -304,10 +305,7 @@ def _add_task_impl(
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (iid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, iid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, iid, now)
                 except sqlite3.IntegrityError:
                     pass
 
@@ -328,8 +326,13 @@ def _add_task_impl(
                     (node_id, parent_task_id, now),
                 )
                 # Auto-promote parent to milestone scope
-                parent_meta = json.loads(parent["metadata"]) if parent["metadata"] else {}
+                parent_meta = core._metadata_dict(parent["metadata"])
                 if parent_meta.get("scope") != "milestone":
+                    # #3413: a non-object blob reads as {} and is REPLACED by
+                    # the dict written below; the helper logs it (the
+                    # engram_add_task response has no warnings field).
+                    parent_meta, _ = core._metadata_dict_for_write(
+                        parent["metadata"], parent_task_id, "engram_add_task")
                     parent_meta["scope"] = "milestone"
                     conn.execute(
                         "UPDATE nodes SET metadata = ? WHERE id = ?",
@@ -340,10 +343,10 @@ def _add_task_impl(
         # Pass importance_base directly so _stamp_new_node writes the anchor
         # in one pass instead of computing an interim value from
         # confidence/surprise and then overwriting it [alpha#2266, alpha#2268].
-        core._stamp_new_node(conn, node_id, importance_base=TASK_IMPORTANCE["planned"])
+        _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=TASK_IMPORTANCE["planned"])
 
         # Citation USE-bumps (alpha #177 area 4, Lei 2026-05-19 tier-2):
-        # implements_ids (cites edges) and goal_id (serves edge) are
+        # implements_ids (about edges) and goal_id (serves edge) are
         # deliberate references to existing nodes — bump as tier-2 citations.
         # Only bump goal_id if the serves edge was actually created (is_current).
         cite_targets: list[str] = []
@@ -420,6 +423,9 @@ def _add_task_impl(
         if non_current_parent_task_id:
             result["non_current_parent_task_id"] = non_current_parent_task_id
 
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            result["embedding_failure"] = _emb_block  # R1: renamed key
         return json.dumps(result)
     finally:
         conn.close()
@@ -471,7 +477,11 @@ def _update_task_impl(
             return json.dumps({"error": f"'{task_id}' is not a task node (type: {task['type']})."})
 
         old_status = task["status"]
-        meta = json.loads(task["metadata"]) if task["metadata"] else {}
+        # #3413: this function ALWAYS re-dumps `meta`, so a non-object blob is
+        # replaced by a dict; the helper logs it (no warnings field on the
+        # engram_update_task response).
+        meta, _ = core._metadata_dict_for_write(
+            task["metadata"], task_id, "engram_update_task")
         scope = meta.get("scope", "routine")
 
         # Determine new importance base
@@ -624,7 +634,7 @@ def _report_feeling_impl(
             dimension and should leave this unset.
         context_ids: Optional comma-separated node IDs the report cites
             (e.g. an observation or exchange that precipitated it).
-            Creates 'cites' edges.
+            Creates 'about' edges (cites is observation->evidence only).
 
     Returns:
         JSON with the new feeling node ID, formatted claim, captured
@@ -737,18 +747,15 @@ def _report_feeling_impl(
             ),
         )
 
-        # Optional context_ids → 'cites' edges (new → old convention).
+        # Optional context_ids → 'about' edges (new → old convention; an ev_ id
+        # from an observation source would stay 'cites', see _insert_context_edge).
         context = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
         cited_ids: list = []
         for cid in context:
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) "
-                        "VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, cid, now)
                     cited_ids.append(cid)
                 except sqlite3.IntegrityError:
                     pass
@@ -757,7 +764,7 @@ def _report_feeling_impl(
         # importance_base directly so _stamp_new_node writes the anchor in
         # one pass instead of computing an interim value from
         # confidence/surprise and then overwriting it [alpha#2266, alpha#2268].
-        core._stamp_new_node(conn, node_id, importance_base=2.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=2.0)
 
         conn.commit()
 
@@ -797,7 +804,7 @@ def _report_feeling_impl(
                 ),
             })
 
-        return json.dumps({
+        _result = {
             "status": "created",
             "feeling_id": node_id,
             "claim": formatted_claim,
@@ -807,7 +814,11 @@ def _report_feeling_impl(
             "intensity_hint": intensity_value,
             "context_nodes": cited_ids,
             "context_fingerprint": fingerprint,
-        })
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        return json.dumps(_result)
     finally:
         conn.close()
 
@@ -858,7 +869,10 @@ def _deactivate_goal_impl(
         if not row["is_current"]:
             return json.dumps({"error": f"Node '{goal_id}' is not current (already retracted or superseded)."})
 
-        meta = json.loads(row["metadata"]) if row["metadata"] else {}
+        # #3413: deactivation always writes a dict back, so a non-object blob
+        # is replaced; logged by the helper (no warnings field on the response).
+        meta, _ = core._metadata_dict_for_write(
+            row["metadata"], goal_id, "engram_deactivate_goal")
         current_state = meta.get("lifecycle_state")
         if current_state == "paused":
             return json.dumps({"error": "goal already deactivated"})
@@ -919,7 +933,10 @@ def _activate_goal_impl(
         if not row["is_current"]:
             return json.dumps({"error": f"Node '{goal_id}' is not current (already retracted or superseded)."})
 
-        meta = json.loads(row["metadata"]) if row["metadata"] else {}
+        # #3413: read helper, not the write one: a non-object blob reads as {}
+        # (no "paused"), so the call refuses below and nothing is written or
+        # replaced.
+        meta = core._metadata_dict(row["metadata"])
         current_state = meta.get("lifecycle_state")
         if current_state != "paused":
             return json.dumps({"error": "goal is not deactivated"})

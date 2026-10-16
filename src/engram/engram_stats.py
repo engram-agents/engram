@@ -63,6 +63,83 @@ _CONFIDENCE_BEARING_TYPES = (
 )
 
 
+# ---------------------------------------------------------------------------
+# #3741: the window + by_type pieces shared by `engram_stats` and the engramd
+# `confidence_by_type` owner op, so the two are equal by construction.
+# ---------------------------------------------------------------------------
+
+STATS_MODES = ("all", "1-turn", "7-turn", "30-turn")
+
+# Turn-unit → wall-clock approximation: 1 turn ≈ 24h (dream cycle advances ~daily).
+# Accurate in steady-state; drifts during high/low-velocity periods. Future: record
+# last_turn_advance in config.json and use that boundary directly.
+_MODE_HOURS = {"1-turn": 24, "7-turn": 168, "30-turn": 720}
+
+
+def _now_utc() -> datetime:
+    """The one clock for the mode window: `_stats_impl` and the owner op both call it."""
+    return datetime.now(timezone.utc)
+
+
+def _window_for_mode(mode, now: datetime) -> tuple:
+    """The ONLY place a mode becomes SQL: returns (created_at_filter, filter_args).
+
+    Raises ValueError for a non-str mode or one not in STATS_MODES (the inner guard: a
+    list/dict/None mode must not reach a dict lookup). The cutoff format is unchanged:
+    %Y-%m-%dT%H:%M:%SZ, compared as a string."""
+    if not isinstance(mode, str) or mode not in STATS_MODES:
+        raise ValueError(f"unknown stats mode (expected one of {list(STATS_MODES)})")
+    if mode == "all":
+        return "", []
+    cutoff_dt = now - timedelta(hours=_MODE_HOURS[mode])
+    return " AND created_at >= ?", [cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")]
+
+
+def _confidence_by_type(conn: sqlite3.Connection, created_at_filter: str, filter_args: list) -> dict:
+    """The by_type section of the confidence distribution (n, mean, p25..p95 per node type).
+
+    Reads rows by POSITION (r[0]): the engramd owner's client-read connection has no
+    row_factory. Status filter: is_current=1 AND (status IS NULL OR status != 'retracted')."""
+    _base_filter = (
+        " AND is_current = 1"
+        " AND (status IS NULL OR status != 'retracted')"
+    )
+    by_type: dict = {}
+    for ntype in _CONFIDENCE_BEARING_TYPES:
+        rows = conn.execute(
+            "SELECT confidence FROM nodes WHERE type = ?"
+            + _base_filter
+            + created_at_filter
+            + " AND confidence IS NOT NULL ORDER BY confidence ASC",
+            [ntype] + filter_args,
+        ).fetchall()
+        confidences = [r[0] for r in rows]
+        if not confidences:
+            continue
+        n = len(confidences)
+        mean_val = round(sum(confidences) / n, 3)
+        by_type[ntype] = {
+            "n": n,
+            "mean": mean_val,
+            "p25": round(_percentile(confidences, 25), 2),
+            "p50": round(_percentile(confidences, 50), 2),
+            "p75": round(_percentile(confidences, 75), 2),
+            "p90": round(_percentile(confidences, 90), 2),
+            "p95": round(_percentile(confidences, 95), 2),
+        }
+    return by_type
+
+
+def confidence_by_type(conn: sqlite3.Connection, modes, now: datetime) -> dict:
+    """{mode: {"by_type": ...}} for each mode. Read-only: no write, no tool_timing, no
+    migration, no _get_db -- the caller supplies the connection."""
+    out: dict = {}
+    for mode in modes:
+        created_at_filter, filter_args = _window_for_mode(mode, now)
+        out[mode] = {"by_type": _confidence_by_type(conn, created_at_filter, filter_args)}
+    return out
+
+
 def _compute_confidence_distribution(
     conn: sqlite3.Connection,
     created_at_filter: str,
@@ -86,31 +163,8 @@ def _compute_confidence_distribution(
         " AND (status IS NULL OR status != 'retracted')"
     )
 
-    # ── by_type: full quantile stats ──────────────────────────────────────
-    # _CONFIDENCE_BEARING_TYPES is now a module-level constant (promoted #1225).
-    by_type: dict = {}
-    for ntype in _CONFIDENCE_BEARING_TYPES:
-        rows = conn.execute(
-            "SELECT confidence FROM nodes WHERE type = ?"
-            + _base_filter
-            + created_at_filter
-            + " AND confidence IS NOT NULL ORDER BY confidence ASC",
-            [ntype] + filter_args,
-        ).fetchall()
-        confidences = [r["confidence"] for r in rows]
-        if not confidences:
-            continue
-        n = len(confidences)
-        mean_val = round(sum(confidences) / n, 3)
-        by_type[ntype] = {
-            "n": n,
-            "mean": mean_val,
-            "p25": round(_percentile(confidences, 25), 2),
-            "p50": round(_percentile(confidences, 50), 2),
-            "p75": round(_percentile(confidences, 75), 2),
-            "p90": round(_percentile(confidences, 90), 2),
-            "p95": round(_percentile(confidences, 95), 2),
-        }
+    # ── by_type: full quantile stats (shared with the engramd confidence_by_type op, #3741) ──
+    by_type = _confidence_by_type(conn, created_at_filter, filter_args)
 
     # ── by_quote_type: mean only, restricted to observation_factual ────────
     by_quote_type: dict = {}
@@ -144,11 +198,7 @@ def _compute_confidence_distribution(
     ).fetchall()
     _rt_buckets: dict = {}  # reasoning_type → list of confidence values
     for row in deriv_rows:
-        try:
-            meta = json.loads(row["metadata"])
-            rtype = meta.get("reasoning_type")
-        except (json.JSONDecodeError, TypeError):
-            rtype = None
+        rtype = core._metadata_dict(row["metadata"]).get("reasoning_type")
         if not rtype:
             rtype = "legacy_untyped"
         _rt_buckets.setdefault(rtype, []).append(row["confidence"])
@@ -170,11 +220,7 @@ def _compute_confidence_distribution(
     ).fetchall()
     _sc_buckets: dict = {}
     for row in obs_rows:
-        try:
-            meta = json.loads(row["metadata"])
-            sc = meta.get("source_class", "external")
-        except (json.JSONDecodeError, TypeError):
-            sc = "external"
+        sc = core._metadata_dict(row["metadata"]).get("source_class", "external")
         _sc_buckets.setdefault(sc, []).append(row["confidence"])
     for sc, vals in _sc_buckets.items():
         by_source_class[sc] = {
@@ -248,21 +294,16 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
         return wanted is None or section in wanted
 
     # ── Build window filter ────────────────────────────────────────────────
-    # Turn-unit → wall-clock approximation: 1 turn ≈ 24h (dream cycle advances ~daily).
-    # Accurate in steady-state; drifts during high/low-velocity periods. Future: record
-    # last_turn_advance in config.json and use that boundary directly.
-    _MODE_HOURS = {"1-turn": 24, "7-turn": 168, "30-turn": 720}
-    now_utc = datetime.now(timezone.utc)
+    # (mode → SQL lives in _window_for_mode, shared with the owner's confidence_by_type op.)
+    now_utc = _now_utc()
     window_meta: Optional[dict] = None
     created_at_filter = ""   # empty string = no filter (mode="all")
     filter_args: list = []
 
     if mode != "all":
         hours = _MODE_HOURS[mode]
-        cutoff_dt = now_utc - timedelta(hours=hours)
-        cutoff_iso = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        created_at_filter = " AND created_at >= ?"
-        filter_args = [cutoff_iso]
+        created_at_filter, filter_args = _window_for_mode(mode, now_utc)
+        cutoff_iso = filter_args[0]
         window_meta = {
             "mode": mode,
             "approx_hours": hours,
@@ -376,11 +417,8 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
                 filter_args,
             ).fetchall()
             for d in derivations:
-                try:
-                    meta = json.loads(d["metadata"])
-                    rtype = meta.get("reasoning_type", "legacy_untyped")
-                except (json.JSONDecodeError, TypeError):
-                    rtype = "legacy_untyped"
+                rtype = core._metadata_dict(d["metadata"]).get(
+                    "reasoning_type", "legacy_untyped")
                 reasoning_breakdown[rtype] = reasoning_breakdown.get(rtype, 0) + 1
             result["reasoning_type_breakdown"] = reasoning_breakdown
 
@@ -475,7 +513,7 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
             # config.json identity fields (agent_name, multi_agent) — fill gaps
             if core.CONFIG_PATH.exists():
                 try:
-                    _cfg = json.loads(core.CONFIG_PATH.read_text(encoding="utf-8"))
+                    _cfg = core._config_io.read_config_json(core.CONFIG_PATH)
                     for _field in ("agent_name", "multi_agent"):
                         if _field in _cfg and _field not in ver:
                             ver[_field] = _cfg[_field]
@@ -752,11 +790,8 @@ def _diagnose_impl() -> str:
             "SELECT metadata FROM nodes WHERE type = 'derivation' AND is_current = 1 AND metadata IS NOT NULL"
         ).fetchall()
         for d in dvs:
-            try:
-                meta = json.loads(d["metadata"])
-                rtype = meta.get("reasoning_type", "legacy_untyped")
-            except (json.JSONDecodeError, TypeError):
-                rtype = "legacy_untyped"
+            rtype = core._metadata_dict(d["metadata"]).get(
+                "reasoning_type", "legacy_untyped")
             reasoning_breakdown[rtype] = reasoning_breakdown.get(rtype, 0) + 1
         epistemic["reasoning_types"] = reasoning_breakdown
 
@@ -768,10 +803,14 @@ def _diagnose_impl() -> str:
         memory["current_turn"] = current_turn
 
         t2 = core._get_tier_threshold(conn, 2)
+        # tier2_queryable counts the SEARCHABLE population only (evidence is
+        # out of search and out of the tier budget -- core.SEARCH_EXCLUDED_TYPES);
+        # tier3_total below still counts every current node, evidence included.
         tier2_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
+            f"SELECT COUNT(*) as c FROM nodes WHERE {core._searchable_where_sql()} "
+            "AND COALESCE(importance_score, 0) >= ?",
             (t2,),
-        ).fetchone()["c"] if t2 > 0 else total_current
+        ).fetchone()["c"]
         memory["tiers"] = {
             "tier2_queryable": tier2_count,
             "tier2_threshold": round(t2, 4),
@@ -846,7 +885,7 @@ def _diagnose_impl() -> str:
         provenance["evidence_by_source_type"] = {r["st"]: r["c"] for r in stype_rows}
 
         # Trust status check
-        _diag_config = json.loads(core.CONFIG_PATH.read_text()) if core.CONFIG_PATH.exists() else {}
+        _diag_config = core._config_io.read_config_json(core.CONFIG_PATH)
         trusted_domains = set(_diag_config.get("trust_pool", []))
         untrusted = conn.execute(
             """SELECT source_domain, COUNT(*) as c FROM nodes
@@ -874,13 +913,49 @@ def _diagnose_impl() -> str:
         metrics["partition_conformance"] = _conformance_mod.check_partition_conformance(conn)
 
         # ── DAG Conformance (#2357) ────────────────────────────────────────
-        # Real edge-walk acyclicity over the `dag: True` relation set —
+        # Real edge-walk acyclicity over the per-family dag_family relation sets (#3210) —
         # deliberately a separate module/check from partition_conformance
         # above (engram_dag_conformance.py's own docstring explains why: a
         # DAG cycle is a different property from the CB/NCB partition, with
         # a different owner). Zero-or-investigate, same as partition
         # conformance — no severity, no scoring, no acknowledged state.
         metrics["dag_conformance"] = _dag_conformance_mod.check_dag_conformance(conn)
+
+        # ── Metadata quarantine (#3425) ────────────────────────────────────
+        # Rows whose nodes.metadata was NOT valid JSON, quarantined by
+        # migration rung 7 (raw blob kept in metadata_quarantine, the node's
+        # metadata set to NULL). Always present, 0 included -- silence must be
+        # distinguishable from health, so a missing table reports count 0
+        # rather than omitting the key. Same zero-or-investigate shape as the
+        # conformance blocks above: non-zero count => flare True.
+        try:
+            _mq_count = conn.execute(
+                "SELECT COUNT(*) FROM metadata_quarantine"
+            ).fetchone()[0]
+            _mq_ids = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT DISTINCT node_id FROM metadata_quarantine "
+                    "ORDER BY node_id LIMIT 10"
+                ).fetchall()
+            ]
+        except sqlite3.OperationalError:  # table absent: nothing quarantined
+            _mq_count, _mq_ids = 0, []
+        # live_invalid_count: rows that are invalid RIGHT NOW (slipped past
+        # the guard: restore of an old dump, hand edit, guard dropped). The
+        # read belt turns them into NULL fields silently, so this count is
+        # what keeps that from being a default that hides a failed read.
+        _mq_live = conn.execute(
+            "SELECT COUNT(*) FROM nodes "
+            "WHERE metadata IS NOT NULL AND NOT json_valid(metadata)"
+        ).fetchone()[0]
+        metrics["metadata_quarantine"] = {
+            "entity_kind": "node",
+            "count": _mq_count,
+            "live_invalid_count": _mq_live,
+            "sample_ids": _mq_ids,
+            "flare": _mq_count > 0 or _mq_live > 0,
+        }
 
         # ── Agent Experience ─────────────────────────────────────────────
         experience: dict = {}
@@ -1212,7 +1287,7 @@ def _diagnose_impl() -> str:
         # that file describes concepts by label without cs_ identifiers.
         try:
             cs_rows = conn.execute(
-                "SELECT id, claim, json_extract(metadata, '$.tag') AS tag"
+                "SELECT id, claim, json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.tag') AS tag"
                 " FROM nodes WHERE type='cornerstone' AND is_current=1"
                 " ORDER BY id"
             ).fetchall()
@@ -1318,10 +1393,7 @@ def _diagnose_impl() -> str:
                 channels: list[str] = []
                 if nid in covered_ids:
                     channels.append("registry_trigger")
-                try:
-                    meta = json.loads(row["metadata"]) if row["metadata"] else {}
-                except (TypeError, json.JSONDecodeError):
-                    meta = {}
+                meta = core._metadata_dict(row["metadata"])
                 if meta.get("situation_pattern"):
                     channels.append("situation_pattern")
                 if nid in _pc_wb_text:

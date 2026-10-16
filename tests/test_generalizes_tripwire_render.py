@@ -135,15 +135,20 @@ def _hit(node_id: str, nudge: str = "nudge") -> dict:
 
 class TestTripwireShapeCarriesNodeId(unittest.TestCase):
 
-    def test_load_tripwires_returns_three_tuples(self):
+    def test_load_tripwires_returns_four_tuples(self):
         server = fresh_server()
         ls1 = _seed_lesson(server, pattern=r"rm -rf", nudge="careful")
         tripwires = load_tripwires(db_path=_db_path())
         self.assertEqual(len(tripwires), 1)
-        pattern, nudge, node_id = tripwires[0]
+        pattern, nudge, node_id, priority = tripwires[0]
         self.assertEqual(pattern, r"rm -rf")
         self.assertEqual(nudge, "careful")
         self.assertEqual(node_id, ls1)
+        # alpha#3270/#3112: a lesson minted with no tripwire_priority opinion
+        # coerces to "normal" here, not None -- every pre-existing lesson in
+        # the corpus (minted before this field existed) must sort exactly as
+        # it did before this feature landed.
+        self.assertEqual(priority, "normal")
 
     def test_check_command_hits_are_dicts_with_node_id(self):
         server = fresh_server()
@@ -152,10 +157,14 @@ class TestTripwireShapeCarriesNodeId(unittest.TestCase):
         hits = check_command("rm -rf /tmp/x", tripwires)
         # #2858 added a 3rd "pattern" key to each hit (the firing
         # situation_pattern itself, used by main() to order hits by
-        # specificity before rendering) -- assert the full dict shape
-        # check_command's own docstring documents, not just the two keys
-        # this test predates that change.
-        self.assertEqual(hits, [{"nudge": "careful", "node_id": ls1, "pattern": r"rm -rf"}])
+        # specificity before rendering); #3270/#3112 added a 4th "priority"
+        # key (the lesson's tripwire_priority, "normal" when unset) -- assert
+        # the full dict shape check_command's own docstring documents, not
+        # just the keys older revisions of this test predate.
+        self.assertEqual(
+            hits,
+            [{"nudge": "careful", "node_id": ls1, "pattern": r"rm -rf", "priority": "normal"}],
+        )
 
 
 # ---------------------------------------------------------------------------

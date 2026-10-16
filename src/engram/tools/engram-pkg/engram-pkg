@@ -1262,6 +1262,8 @@ def _render_origin(node_row: dict) -> dict:
         meta = json.loads(raw_meta)
     except (json.JSONDecodeError, TypeError):
         meta = {}
+    if not isinstance(meta, dict):  # valid JSON, not an object (#3413)
+        meta = {}
     return meta.get("origin") or {}
 
 

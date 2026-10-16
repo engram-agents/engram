@@ -115,6 +115,7 @@ def _make_focused_db(engram_home: Path) -> None:
         "INSERT INTO nodes (id, claim, focused_at, focus_reason, is_current) VALUES (?, ?, ?, ?, ?)",
         ("ob_9001", "Order-invariant guard claim.", "2026-07-09T10:00:00Z", "order test", 1),
     )
+    conn.execute("PRAGMA user_version = 1")  # #3741: a real store carries a schema version; the flag-OFF calibration block now runs only on one
     conn.commit()
     conn.close()
 

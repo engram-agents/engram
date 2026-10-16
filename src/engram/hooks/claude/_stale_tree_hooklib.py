@@ -32,7 +32,18 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Optional
+
+# _hooklib.py sits beside this file in both build topologies, so -- as
+# _stophooklib does -- make that directory importable before importing it: a
+# loader such as spec_from_file_location (every test that loads this module by
+# path) does not add it, and no hook bootstrap has run in that process.
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+# #3628: the config read is non-blocking and regular-file-only.
+from _hooklib import open_regular_text
 
 
 def load_watch_list(engram_home: Optional[str] = None) -> list[dict]:
@@ -55,7 +66,7 @@ def load_watch_list(engram_home: Optional[str] = None) -> list[dict]:
 
     config_path = os.path.join(engram_home, "config.json")
     try:
-        with open(config_path, encoding="utf-8") as f:
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
     except (OSError, ValueError):
         return []

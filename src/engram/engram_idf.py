@@ -19,9 +19,20 @@ See alpha issue #177 for full design rationale and empirical motivation.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import sqlite3
+
+# Distinct terms per batched document-frequency query in extract_keywords
+# (#3665): keeps request/response sizes far below the engramd owner's
+# 1 MiB / 8 MiB limits. Read at call time (tests may lower it).
+IDF_BATCH_TERMS = 1000
+
+# The batch document-frequency statement, byte-exact. The engramd owner-client
+# shim (engramd_client.OwnerReadConnection.execute) compares against this
+# constant to route the statement to the owner's typed `df` method (#3665).
+IDF_BATCH_SQL = "SELECT term, doc FROM nodes_fts_vocab WHERE term IN (SELECT value FROM json_each(?))"
 
 # ---------------------------------------------------------------------------
 # Stopword lists
@@ -223,6 +234,7 @@ def extract_keywords(
     min_idf: float = 4.0,
     top_k: int = 10,
     stopwords: frozenset[str] | None = None,
+    n_docs: int | None = None,
 ) -> list[tuple[str, float]]:
     """Extract the top-K high-IDF keywords from *text*.
 
@@ -234,37 +246,67 @@ def extract_keywords(
       4. Keep only tokens with ``idf >= min_idf``.
       5. Return the top *top_k* tokens sorted by IDF descending.
 
-    To avoid repeated ``COUNT(*)`` queries, n_docs is resolved once at the top
-    of the function and passed to :func:`idf` for every token.
+    *n_docs* is the count of current nodes used for IDF normalisation.  When
+    omitted (``None``) it is resolved with ONE ``COUNT(*)`` at the top of the
+    function.  A caller that already holds the count passes it (#3740) and no
+    COUNT statement is executed here.  It must be an int >= 0 (``bool`` is
+    refused); anything else raises :class:`ValueError` -- a caller bug is loud,
+    never silently recounted.  ``n_docs=0`` returns ``[]``.
 
     Returns a list of ``(token, idf_score)`` pairs.
     """
     if stopwords is None:
         stopwords = STOPWORDS
 
-    row = conn.execute(
-        "SELECT COUNT(*) FROM nodes WHERE is_current = 1"
-    ).fetchone()
-    n_docs = row[0] if row else 0
+    if n_docs is None:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE is_current = 1"
+        ).fetchone()
+        n_docs = row[0] if row else 0
+    elif isinstance(n_docs, bool) or not isinstance(n_docs, int) or n_docs < 0:
+        raise ValueError(
+            f"n_docs must be a non-negative int or None, got {n_docs!r}"
+        )
 
     if n_docs == 0:
         return []
 
     tokens = tokenize(text)
 
-    scored: list[tuple[str, float]] = []
+    # Distinct, non-stopword tokens in first-seen order (the tie order of the
+    # final stable sort).
+    candidates: list[str] = []
     seen: set[str] = set()
-
     for token in tokens:
         if token in stopwords:
             continue
         if token in seen:
             continue
         seen.add(token)
+        candidates.append(token)
 
-        score = idf(conn, token, n_docs=n_docs)
-        if score is None:
+    # Document frequencies in batches: ONE json_each-bound statement per
+    # IDF_BATCH_TERMS distinct terms (#3665), instead of one query per token.
+    # A term absent from the vocabulary is absent from ``dfs`` -> unknown.
+    # Rows are read by index and only fetchall() is used, so a bare
+    # execute()->fetchone()/fetchall() connection (the owner-client shim)
+    # serves this too.
+    dfs: dict[str, int] = {}
+    batch = IDF_BATCH_TERMS
+    for start in range(0, len(candidates), batch):
+        chunk = candidates[start:start + batch]
+        for vrow in conn.execute(
+            IDF_BATCH_SQL,
+            (json.dumps(chunk),),
+        ).fetchall():
+            dfs[vrow[0]] = vrow[1]
+
+    scored: list[tuple[str, float]] = []
+    for token in candidates:
+        df = dfs.get(token)
+        if df is None or df <= 0 or df > n_docs:
             continue
+        score = math.log(n_docs / df)
         if score < min_idf:
             continue
         scored.append((token, score))

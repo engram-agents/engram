@@ -10,6 +10,10 @@ import socket
 import subprocess
 import sys
 import tempfile
+# #3784 (b): pre-import so a sys.modules clear in another thread (patch.dict
+# exit) cannot break pytest's lazy `import tracemalloc` in thread_exception_hook,
+# which masks the real thread exception. Must stay at module level.
+import tracemalloc  # noqa: F401
 import types
 
 import pytest
@@ -199,6 +203,63 @@ if "ENGRAM_HOME" not in os.environ:
     os.environ["ENGRAM_HOME"] = _FALLBACK_ENGRAM_HOME
 
 
+# #3328 -- keys that test helpers write straight into os.environ (not via
+# monkeypatch) and never restore. Twelve tests/test_session_start_hook_*.py
+# _load_hook_module helpers set ENGRAM_HOME to a long pytest tmp_path (and the
+# effective_role one also sets ENGRAM_SESSION_ROLE / pops ENGRAM_RUNTIME_DIR);
+# the leak overwrote this conftest's short throwaway ENGRAM_HOME for every later
+# test in the process, which grows _hooklib's load-time overflow placeholder and
+# flipped test_hook_injection_bounds depending on what ran before it.
+_LEAKY_ENV_KEYS = ("ENGRAM_HOME", "ENGRAM_SESSION_ROLE", "ENGRAM_RUNTIME_DIR")
+
+
+@pytest.fixture(autouse=True)
+def _restore_leaky_env_keys():
+    """Restore ENGRAM_HOME / ENGRAM_SESSION_ROLE / ENGRAM_RUNTIME_DIR after each test.
+
+    Snapshot at setup (present-or-absent), restore at teardown: re-set a key the
+    test changed or popped, re-delete a key that was absent before the test."""
+    before = {k: os.environ.get(k) for k in _LEAKY_ENV_KEYS}
+    yield
+    for k, v in before.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
+@pytest.fixture(autouse=True)
+def _reset_telemetry_process_file_path(monkeypatch):
+    """Start every test with no cached telemetry file path / emitter instance (#3539).
+
+    engram_telemetry_store caches ONE per-process file path in
+    ``_PROCESS_FILE_PATH`` on first use, resolved under ``$ENGRAM_HOME/telemetry``.
+    In production ENGRAM_HOME never changes within a process, so that is right.
+    Under pytest the first test to emit telemetry pinned the path inside ITS OWN
+    tmp ENGRAM_HOME and every later test wrote there: a silent cross-test leak
+    under the default ``tmp_path_retention_policy=all``, and FileNotFoundError on
+    stderr under ``=failed`` (that dir is deleted at teardown).
+
+    Reset to None before each test (monkeypatch restores the prior value after,
+    so the store's atexit finalize still sees whatever was cached before).
+    No-op when the module has not been imported yet: the first use then resolves
+    against the ENGRAM_HOME in force. The store is imported under one name only
+    (``engram_telemetry_store``, via src/engram on sys.path), so one lookup covers it."""
+    mod = sys.modules.get("engram_telemetry_store")
+    if mod is not None:
+        monkeypatch.setattr(mod, "_PROCESS_FILE_PATH", None)
+    # engram_log_emitter has the SAME shape: its ``_EMITTER_INSTANCE`` singleton
+    # caches ``logs_dir`` (``$ENGRAM_HOME/logs``) at first init(). Under
+    # ``=failed`` retention the second leak surfaced as
+    # ``[engram-emitter] emit(...) FAILED: FileNotFoundError`` once the telemetry
+    # path was fixed. The emitter opens-appends-closes per event (no held handle,
+    # no atexit), so dropping the instance leaves nothing open.
+    emitter = sys.modules.get("engram_log_emitter")
+    if emitter is not None:
+        monkeypatch.setattr(emitter, "_EMITTER_INSTANCE", None)
+    yield
+
+
 @pytest.fixture(autouse=True)
 def _stop_snapshot_worker():
     """Stop + reset the #1673 async snapshot worker after each test.
@@ -277,6 +338,36 @@ def mock_dns_resolution(request, monkeypatch):
         return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", port or 0))]
 
     monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
+
+
+@pytest.fixture(autouse=True)
+def _owner_gate_sees_current_store(request, monkeypatch):
+    """Default for any in-process `EngramdOwner.start()` (#3753): the owner refuses a store whose
+    `PRAGMA user_version` is below `engram_core.LATEST_SCHEMA_VERSION`, and hand-built test stores
+    (`CREATE TABLE nodes ...`) sit at 0. This wraps the gate so that, immediately before the REAL
+    gate runs, an EXISTING, non-empty SQLite store that has tables and is behind gets stamped
+    (`_owner_store.stamp_if_behind`). It is NOT a no-op: the real gate still runs on every start, and
+    it still refuses an absent store, a 0-byte or non-SQLite file, a non-regular path, a locked
+    store, and a newer one; those tests keep working. It does hide ONE thing, a behind store that
+    has tables, so a test that wants that refusal (the gate's own file, or any test of a behind
+    store) carries `@pytest.mark.owner_schema_gate_real`.
+
+    Reach: in-process only. An owner started in a child process (subprocess scripts) or against an
+    ABSENT store needs an explicit `tests/_owner_store.py` stamp in its fixture;
+    tests/test_owner_test_stamp_discipline_3753.py makes a new owner test module state which."""
+    if request.node.get_closest_marker("owner_schema_gate_real"):
+        return
+    eo = sys.modules.get("engramd_owner")
+    real = getattr(eo, "_require_store_schema_current", None)
+    if real is None:
+        return
+    from _owner_store import stamp_if_behind
+
+    def gate_with_default_stamp(store_path):
+        stamp_if_behind(store_path)
+        return real(store_path)
+
+    monkeypatch.setattr(eo, "_require_store_schema_current", gate_with_default_stamp)
 
 
 @pytest.fixture(autouse=True)
@@ -428,3 +519,42 @@ def fresh_module(mod: types.ModuleType) -> types.ModuleType:
             del sys.modules[key]
     import importlib
     return importlib.import_module(mod_name)
+
+
+def _load_release_helper():
+    """Return the `_release_server_copies` module, or None; never raises. Resolved by absolute
+    path from this file, not by `sys.path`: a NESTED pytest session loads this conftest from
+    another rootdir where `tests/` is not importable. Reuses a `sys.modules` entry so the fixture
+    and a test file's own import share one module object (one state)."""
+    try:
+        mod = sys.modules.get("_release_server_copies")
+        if mod is not None:
+            return mod
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).with_name("_release_server_copies.py")
+        spec = importlib.util.spec_from_file_location("_release_server_copies", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["_release_server_copies"] = mod  # registered BEFORE exec
+        try:
+            spec.loader.exec_module(mod)
+        except BaseException:
+            sys.modules.pop("_release_server_copies", None)
+            raise
+        return mod
+    except Exception:
+        return None
+
+
+@pytest.fixture(autouse=True)
+def _release_replaced_server_copies_3807():
+    """#3807: after each test, free the memo caches that pin replaced `server` copies, so tests
+    that purge + re-import `server` do not leak ~4 MB per test. Teardown only; a no-op unless the
+    `server` module object changed since the last sweep. Never raises."""
+    yield
+    helper = _load_release_helper()
+    if helper is not None:
+        helper.release_if_server_changed()

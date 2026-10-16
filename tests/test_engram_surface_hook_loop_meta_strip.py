@@ -204,13 +204,13 @@ class TestStripLoopMetaLines(unittest.TestCase):
         prompt = format_loop_prompt(CORE_LONG, kind="heartbeat")
         stripped = hook._strip_loop_meta_lines(prompt)
         self.assertNotIn("<loop-meta", stripped)
-        self.assertEqual(stripped, f"<loop-wake>\n{CORE_LONG}")
+        self.assertEqual(stripped, f"<loop-wake>\n{CORE_LONG}\n\u27e6ENGRAM\u27e7\u27e6/ENGRAM\u27e7")
 
     def test_strips_single_meta_line_seq(self):
         prompt = format_loop_prompt(CORE_LONG, seq=3)
         stripped = hook._strip_loop_meta_lines(prompt)
         self.assertNotIn("<loop-meta", stripped)
-        self.assertEqual(stripped, f"<loop-wake>\n{CORE_LONG}")
+        self.assertEqual(stripped, f"<loop-wake>\n{CORE_LONG}\n\u27e6ENGRAM\u27e7\u27e6/ENGRAM\u27e7")
 
     def test_strips_all_meta_lines_not_just_first(self):
         """format_loop_prompt only ever emits one meta line, so build a

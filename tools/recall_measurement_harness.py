@@ -427,12 +427,27 @@ def compute_same_session_echo(
 
 
 def _parse_iso_ts(ts_str: str) -> Optional[float]:
+    """Parse an ISO-8601 timestamp string to epoch seconds.
+
+    Offset-less strings are read as UTC, not local wall time (#1801):
+    every source this module reads writes UTC explicitly (the events
+    store's `...Z`, the transcript's `...Z`), so UTC is the one consistent
+    reading, and `datetime.fromisoformat(...).timestamp()` on a NAIVE
+    datetime otherwise silently reads it as local time -- a
+    `--split-at` boundary given without an offset would then select a
+    window shifted by the host's local UTC offset. `Z` and
+    explicit-offset strings are unaffected; they were already
+    unambiguous.
+    """
     if not ts_str:
         return None
     try:
         if ts_str.endswith("Z"):
             ts_str = ts_str[:-1] + "+00:00"
-        return datetime.fromisoformat(ts_str).timestamp()
+        dt = datetime.fromisoformat(ts_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
     except (ValueError, TypeError):
         return None
 
@@ -1074,7 +1089,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--split-at",
         default=None,
-        help="ISO-8601 timestamp; run before/after slices + deltas.",
+        help="ISO-8601 timestamp (offset-less is read as UTC, #1801); "
+        "run before/after slices + deltas.",
     )
     args = parser.parse_args(argv)
 

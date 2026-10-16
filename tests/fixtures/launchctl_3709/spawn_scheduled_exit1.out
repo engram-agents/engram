@@ -1,0 +1,64 @@
+gui/501/com.engram.test.exit1-16420 = {
+	active count = 0
+	path = /private/tmp/claude-501/-Users-PLACEHOLDER_USER-GitHub-ai-portfolio/95539515-d80f-49d7-80f7-878f48ed7395/scratchpad/lctl/com.engram.test.exit1-16420.plist
+	type = LaunchAgent
+	state = spawn scheduled
+
+	program = /bin/sh
+	arguments = {
+		/bin/sh
+		-c
+		date +%s >> /private/tmp/claude-501/-Users-PLACEHOLDER_USER-GitHub-ai-portfolio/95539515-d80f-49d7-80f7-878f48ed7395/scratchpad/lctl/stamps/com.engram.test.exit1-16420.runs; exit 1
+	}
+
+	inherited environment = {
+		DEVELOPER_DIR => /Library/Developer/CommandLineTools
+		SSH_AUTH_SOCK => /var/run/com.apple.launchd.WlX68P5Rif/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => com.engram.test.exit1-16420
+	}
+
+	domain = gui/501 [100024]
+	asid = 100024
+	minimum runtime = 60
+	exit timeout = 5
+	runs = 1
+	last exit code = 1
+
+	semaphores = {
+		successful exit => 0
+	}
+
+	resource coalition = {
+		ID = 202388
+		type = resource
+		state = active
+		active count = 1
+		name = com.engram.test.exit1-16420
+	}
+
+	jetsam coalition = {
+		ID = 202389
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.engram.test.exit1-16420
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+
+	properties = runatload | inferred program
+}

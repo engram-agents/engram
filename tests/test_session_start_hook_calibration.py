@@ -213,12 +213,24 @@ def _run_hook_main(module, hook_input: dict) -> dict:
     return json.loads(buf.getvalue().strip())
 
 
+def _seed_store(engram_home: Path) -> None:
+    """#3741: the flag-OFF calibration block runs only on a store that exists with a schema version
+    (`PRAGMA user_version > 0`, read-only); a bare home gets no block. A real store always has one."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(engram_home / "knowledge.db"))
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+
+
 def test_calibration_block_present_on_startup(tmp_path):
     """Calibration block appears in additionalContext for source=startup."""
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     (engram_home / "sessions").mkdir()
 
+    _seed_store(engram_home)
     mod = _load_hook_module(engram_home)
 
     mock_client_instance = _make_mock_engram_client(_CANNED_CONF_ALL, _CANNED_CONF_7D)
@@ -242,6 +254,7 @@ def test_calibration_block_present_on_compact(tmp_path):
     engram_home.mkdir()
     (engram_home / "sessions").mkdir()
 
+    _seed_store(engram_home)
     mod = _load_hook_module(engram_home)
 
     mock_client_instance = _make_mock_engram_client(_CANNED_CONF_ALL, _CANNED_CONF_7D)
@@ -313,6 +326,7 @@ def test_calibration_block_format_in_context(tmp_path):
     engram_home.mkdir()
     (engram_home / "sessions").mkdir()
 
+    _seed_store(engram_home)
     mod = _load_hook_module(engram_home)
 
     mock_client_instance = _make_mock_engram_client(_CANNED_CONF_ALL, _CANNED_CONF_7D)
@@ -362,6 +376,7 @@ def test_calibration_block_present_for_non_interactive_role(tmp_path):
     engram_home.mkdir()
     (engram_home / "sessions").mkdir()
 
+    _seed_store(engram_home)
     os.environ["ENGRAM_SESSION_ROLE"] = "heartbeat"
     try:
         mod = _load_hook_module(engram_home)

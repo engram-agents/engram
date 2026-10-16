@@ -210,7 +210,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -542,6 +542,62 @@ def find_unparsed_removed_test_lines(pr_body: str) -> list[str]:
             continue
         unparsed.append(line.strip())
     return unparsed
+
+
+_LIST_BULLET_RE = re.compile(r"^[-*+][ \t]+")
+
+
+def find_backtick_wrapped_marker_ids(pr_body: str) -> list[str]:
+    """#3244 — ids of lines that ARE a whole `Removed-test:` marker wrapped
+    in one pair of single backticks (after optional whitespace / list bullet).
+
+    Positive detection, not inference: a line counts only when, with that one
+    surrounding pair stripped, it parses via the module's own `_MARKER_RE`
+    (no second marker regex). An inline-code aside that merely mentions the
+    keyword is not a whole marker line, so it does not count.
+
+    Fenced blocks are skipped: the inline strip passes a fence through
+    untouched (#2539/#2540), so a wrapped line inside one was not swallowed
+    by the strip (it fails to parse for a different reason, which the #2393
+    warning already reports). Pure. Ids in order of appearance, de-duplicated.
+    """
+    if not pr_body:
+        return []
+    ids: list[str] = []
+    for is_fenced, segment in _split_out_fenced_code_blocks(pr_body):
+        if is_fenced:
+            continue
+        for line in segment.splitlines():
+            text = _LIST_BULLET_RE.sub("", line.strip())
+            if len(text) < 3 or text[0] != "`" or text[-1] != "`":
+                continue
+            inner = text[1:-1]
+            if "`" in inner:
+                continue
+            m = _MARKER_RE.match(inner)
+            if m and m.group("id") not in ids:
+                ids.append(m.group("id"))
+    return ids
+
+
+def swallowed_marker_hint(pr_body: str) -> str | None:
+    """#3244 — advisory hint for the failure path, kept OUT of the parser.
+
+    The inline-code strip is deliberate (see `parse_removed_test_markers`),
+    but a marker line wrapped whole in backticks vanishes silently, so the
+    gate fails with the same text as "no marker written". Returns a hint
+    naming the wrapped id(s) whenever at least one such line exists,
+    regardless of whether other markers parsed. The caller must only use it
+    when the check is already failing. Pure.
+    """
+    ids = find_backtick_wrapped_marker_ids(pr_body)
+    if not ids:
+        return None
+    return (
+        "these Removed-test lines are wrapped in backticks and were ignored: "
+        + ", ".join(ids)
+        + "; remove the backticks (inline code is ignored by design)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1328,6 +1384,12 @@ def main(argv: list[str] | None = None) -> int:
 
     markers = markers + range_markers
     report = evaluate(base_ids, head_ids, markers, tuple(unparsed_removed_test_lines))
+
+    # #3244: only when about to fail, and only advisory (a warning).
+    if not report.passed:
+        hint = swallowed_marker_hint(pr_body)
+        if hint:
+            report = replace(report, warnings=report.warnings + (hint,))
 
     if args.format == "json":
         print(format_report_json(report))

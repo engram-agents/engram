@@ -30,8 +30,8 @@ its own knowledge.db):
   - goal: epistemic humility                      → {{GL_EPISTEMIC_HUMILITY}}
 
 Edges:
-  - axiom (honesty ⊥ discretion) cites axiom (honesty) [via context_ids]
-  - goal (epistemic humility) cites axiom (honesty)    [via context_ids]
+  - axiom (honesty ⊥ discretion) about axiom (honesty) [via context_ids]
+  - goal (epistemic humility) about axiom (honesty)    [via context_ids]
 """
 
 import json

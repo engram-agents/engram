@@ -121,6 +121,9 @@ from pathlib import Path
 
 import pytest
 
+from _owner_platform import requires_linux_owner
+from _owner_store import seed_current_store
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ENGRAM = str(REPO_ROOT / "src" / "engram")
 if _SRC_ENGRAM not in sys.path:
@@ -128,6 +131,7 @@ if _SRC_ENGRAM not in sys.path:
 
 import engramd_client as ec  # noqa: E402
 import engramd_owner as eo  # noqa: E402
+import engramd_read_registry as rr  # noqa: E402
 
 # setfacl/getfacl availability -- tests 11 (ACL) rely on real POSIX-ACL
 # tooling; the whole class of test is Linux-ACL-specific and skips
@@ -159,6 +163,7 @@ def engram_home():
     tests/test_surface_daemon_pid_reap.py).
     """
     d = tempfile.mkdtemp(prefix="edo-")
+    seed_current_store(d)  # #3753: the owner refuses a home with no current-schema store
     try:
         yield Path(d)
     finally:
@@ -229,6 +234,7 @@ def _raw_request(socket_path: Path, payload: dict, *, timeout: float = 2.0) -> d
 # ---------------------------------------------------------------------------
 
 
+@requires_linux_owner
 def test_second_instance_refuses_to_start_and_first_remains_unaffected(engram_home):
     owner1 = eo.EngramdOwner(engram_home, request_deadline=REQUEST_DEADLINE)
     owner1.start(install_signal_handlers=False)
@@ -250,6 +256,7 @@ def test_second_instance_refuses_to_start_and_first_remains_unaffected(engram_ho
 # ---------------------------------------------------------------------------
 
 
+@requires_linux_owner
 def test_stale_socket_and_pid_does_not_block_restart(engram_home):
     dead_pid = _spawn_and_kill()
     # Read the resolved socket path (now inside run/, #3194) off a
@@ -289,6 +296,7 @@ def test_stale_socket_and_pid_does_not_block_restart(engram_home):
 # ---------------------------------------------------------------------------
 
 
+@requires_linux_owner
 def test_handshake_major_version_mismatch_is_rejected(owner_running):
     response = _raw_request(
         owner_running.socket_path,
@@ -300,11 +308,12 @@ def test_handshake_major_version_mismatch_is_rejected(owner_running):
     assert response["remedy"]
 
 
+@requires_linux_owner
 def test_handshake_minor_version_mismatch_is_accepted(owner_running):
-    # Owner's contract version is engramd_client.CONTRACT_VERSION ("1.0" --
+    # Owner's contract version is engramd_client.CONTRACT_VERSION ("1.1" --
     # MAJOR "1"). Sending "1.7" is a MINOR skew on the SAME major, which
     # check_contract_version() accepts (None -- proceed to serve the call).
-    assert owner_running.contract_version == "1.0"
+    assert owner_running.contract_version == "1.1"
     response = _raw_request(
         owner_running.socket_path,
         {"contract_version": "1.7", "method": "ping", "params": {}, "request_id": None},
@@ -319,6 +328,7 @@ def test_handshake_minor_version_mismatch_is_accepted(owner_running):
 # ---------------------------------------------------------------------------
 
 
+@requires_linux_owner
 def test_ping_reports_ok_with_contract_version_and_store_path(owner_running):
     result = ec.read("ping", {}, timeout=1.0, socket_path=owner_running.socket_path)
     assert isinstance(result, ec.Ok)
@@ -332,6 +342,7 @@ def test_ping_reports_ok_with_contract_version_and_store_path(owner_running):
 # ---------------------------------------------------------------------------
 
 
+@requires_linux_owner
 def test_snapshot_writes_consistent_copy_with_matching_row_counts(engram_home):
     # Seed the store BEFORE the owner starts (mirrors a real seat: bootstrap
     # creates knowledge.db, then the owner starts and holds it open) --
@@ -365,6 +376,7 @@ def test_snapshot_writes_consistent_copy_with_matching_row_counts(engram_home):
         owner.stop()
 
 
+@requires_linux_owner
 def test_snapshot_missing_dest_path_param_is_rejected(owner_running):
     """Not one of the 10 numbered contract items -- covers this build's own
     documented design choice for snapshot()'s param shape (see the fairy
@@ -374,6 +386,7 @@ def test_snapshot_missing_dest_path_param_is_rejected(owner_running):
     assert result.reason == "invalid_params"
 
 
+@requires_linux_owner
 def test_snapshot_nonexistent_dest_parent_is_rejected_cleanly(owner_running):
     """Not one of the 10 numbered contract items -- covers this build's own
     documented design choice: reject cleanly rather than silently create
@@ -396,6 +409,7 @@ def test_snapshot_nonexistent_dest_parent_is_rejected_cleanly(owner_running):
 # ---------------------------------------------------------------------------
 
 
+@requires_linux_owner
 def test_clean_shutdown_removes_socket_and_client_sees_unavailable(engram_home):
     owner = eo.EngramdOwner(engram_home, request_deadline=REQUEST_DEADLINE)
     owner.start(install_signal_handlers=False)
@@ -419,6 +433,7 @@ def test_clean_shutdown_removes_socket_and_client_sees_unavailable(engram_home):
 # ---------------------------------------------------------------------------
 
 
+@requires_linux_owner
 def test_unknown_operation_returns_rejected_not_unavailable(owner_running):
     result = ec.read("no_such_method", {}, timeout=1.0, socket_path=owner_running.socket_path)
     assert isinstance(result, ec.Rejected)
@@ -470,6 +485,7 @@ def _trickle_and_measure(socket_path: Path, bound: float) -> tuple[float, bytes]
     return elapsed, response
 
 
+@requires_linux_owner
 def test_trickling_client_is_dropped_at_the_end_to_end_deadline(owner_running):
     bound = owner_running.request_deadline
     elapsed, response = _trickle_and_measure(owner_running.socket_path, bound)
@@ -503,6 +519,7 @@ def test_trickling_client_is_dropped_at_the_end_to_end_deadline(owner_running):
 # ---------------------------------------------------------------------------
 
 
+@requires_linux_owner
 def test_one_slow_client_does_not_block_another(owner_running):
     bound = owner_running.request_deadline
     result_holder: dict = {}
@@ -537,6 +554,7 @@ def test_one_slow_client_does_not_block_another(owner_running):
 # ---------------------------------------------------------------------------
 
 
+@requires_linux_owner
 def test_oversized_incoming_request_is_dropped_and_owner_stays_up(owner_running):
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(str(owner_running.socket_path))
@@ -575,6 +593,7 @@ def _getfacl_text(path: Path) -> str:
 @pytest.mark.skipif(
     not _HAS_SETFACL, reason="setfacl/getfacl not on PATH -- Linux-ACL-specific test"
 )
+@requires_linux_owner
 def test_run_dir_is_0700_with_no_acl_entries_after_start(engram_home):
     # The fixture plants a DEFAULT ACL on the PARENT (engram_home) before
     # start() -- mirroring this fleet's real ~/.engram shape (measured on
@@ -617,6 +636,7 @@ def test_run_dir_is_0700_with_no_acl_entries_after_start(engram_home):
 # ---------------------------------------------------------------------------
 
 
+@requires_linux_owner
 def test_socket_file_mode_is_not_bind_default(owner_running):
     mode = stat.S_IMODE(owner_running.socket_path.stat().st_mode)
     assert mode == eo.SOCKET_FILE_MODE, oct(mode)
@@ -625,26 +645,112 @@ def test_socket_file_mode_is_not_bind_default(owner_running):
 
 # ---------------------------------------------------------------------------
 # Test 13 -- peer-uid mismatch -> Rejected(peer_identity) (design doc SS5
-# test 1). Needs a second uid; not runnable on this same-seat CI process.
+# test 1; issue #3194, made an automated control by #3197).
+#
+# What it controls: a client whose uid differs from the owner's gets
+# Rejected(reason="peer_identity") from EngramdOwner._check_peer_credentials
+# (SO_PEERCRED read on every accepted connection). The control ran by hand
+# once on 2026-09-29 (a sudo uid-0 client against a uid-1006 owner); this is
+# that run, repeatable.
+#
+# Why it needs sudo: the socket is 0o700 in a 0o700 directory, so the only
+# principal that can even connect from another uid is root. `sudo -n` (no
+# password prompt) is therefore the only way to produce a foreign peer.
+#
+# Where it runs: GitHub's ubuntu-latest runners have passwordless sudo, so it
+# runs in tests.yml (the full suite on the dev->main release PR) and in
+# affected-tests.yml when dispatched by hand. Agent seats have no passwordless
+# sudo, and there it SKIPS BY NAME (the reason says which precondition
+# failed); it never passes silently.
+#
+# Discrimination: the SAME helper script is first run as this process's own
+# uid and must get an accepted ping (so a helper that always errors cannot
+# satisfy the foreign-uid assertion), and every assertion is on the helper's
+# parsed typed result, never on stderr text. Mutant for a runner: make
+# _check_peer_credentials return None unconditionally -> this test goes red.
+#
+# What it does NOT discriminate: the foreign peer here is always uid 0, and
+# _check_peer_credentials rejects uid 0 through a SECOND branch (the
+# `peer_uid == 0 and own_uid != 0` defence-in-depth clause) as well as the
+# `peer_uid != own_uid` branch, with identical output. So this real-socket
+# test proves a non-owner uid-0 peer is rejected by the live owner, but it
+# cannot tell WHICH branch fired; removing only the mismatch branch would
+# leave it green. The non-root mismatch branch is covered by the fake-conn
+# cell in tests/test_engramd_owner_displacement_3240.py
+# (test_snapshot_dest_rights_premise_peer_uid_equals_owner, peer uid own+1).
 # ---------------------------------------------------------------------------
 
+# Prints the typed result of one `ping` as a single JSON object. Run as a
+# separate process (own uid under sudo), so it imports engramd_client the same
+# way any client would.
+_CROSSUID_HELPER = """\
+import dataclasses, json, sys
+from pathlib import Path
+import engramd_client as ec
+r = ec.read("ping", {}, timeout=5.0, socket_path=Path(sys.argv[1]))
+print(json.dumps({"type": type(r).__name__, **dataclasses.asdict(r)}))
+"""
 
-@pytest.mark.skip(
-    reason=(
-        "design doc SS5 test 1 / issue #3194: needs a genuinely different "
-        "uid connecting to the owner's socket, which a same-seat CI "
-        "process cannot produce. The peer-credential READ mechanism "
-        "itself (SO_PEERCRED decoding a REAL foreign uid correctly) was "
-        "already verified in a prior manual cross-uid measurement between "
-        "two live agent processes on this fleet (issue #3194 / PR #3100's "
-        "comment thread) -- not a repeatable pytest fixture, which is why "
-        "this lands as a skip rather than a same-uid workaround. Issue "
-        "#3194 calls this out explicitly: 'U4d (the first live migration) "
-        "should not ship until it has run' as an automated control."
+
+def _run_crossuid_helper(socket_path: Path, *, via_sudo: bool) -> dict:
+    # Explicit environment: sudo resets the caller's, and bytecode writes are
+    # off so a root run cannot leave root-owned __pycache__ in the checkout.
+    cmd = [
+        "env",
+        f"PYTHONPATH={_SRC_ENGRAM}",
+        "PYTHONDONTWRITEBYTECODE=1",
+        sys.executable,
+        "-c",
+        _CROSSUID_HELPER,
+        str(socket_path),
+    ]
+    if via_sudo:
+        cmd = ["sudo", "-n"] + cmd
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, (
+        f"helper (via_sudo={via_sudo}) exited {proc.returncode}; stderr={proc.stderr!r}"
     )
-)
-def test_peer_uid_mismatch_is_rejected():
-    pass
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError) as exc:
+        raise AssertionError(
+            f"helper (via_sudo={via_sudo}) printed no JSON result: "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        ) from exc
+
+
+@requires_linux_owner
+def test_peer_uid_mismatch_is_rejected(owner_running):
+    if os.getuid() == 0:
+        pytest.skip(
+            "cross-uid control needs a foreign uid: this process already runs as uid 0, "
+            "so sudo cannot produce a different uid (#3197)"
+        )
+    if shutil.which("sudo") is None:
+        pytest.skip("cross-uid control needs sudo: `sudo` is not on PATH (#3197)")
+    try:
+        probe = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        pytest.skip("cross-uid control needs passwordless sudo: `sudo -n true` timed out (#3197)")
+    if probe.returncode != 0:
+        pytest.skip(
+            "cross-uid control needs passwordless sudo: `sudo -n true` failed "
+            f"(exit {probe.returncode}) -- runs on GitHub runners, skips on agent seats (#3197)"
+        )
+
+    own_uid = os.getuid()
+
+    # Control (discrimination): the same helper as OUR uid gets an accepted ping.
+    own = _run_crossuid_helper(owner_running.socket_path, via_sudo=False)
+    assert own["type"] == "Ok", f"same-uid helper did not get an accepted ping: {own!r}"
+    assert own["result"]["store_path"] == str(owner_running.store_path), own
+
+    # Act: the same helper as uid 0 is refused by name.
+    foreign = _run_crossuid_helper(owner_running.socket_path, via_sudo=True)
+    assert foreign["type"] == "Rejected", f"foreign-uid client was not rejected: {foreign!r}"
+    assert foreign["reason"] == "peer_identity", foreign
+    assert "uid 0" in foreign["detail"], foreign
+    assert f"uid {own_uid}" in foreign["detail"], foreign
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +775,7 @@ class _FakeConnShortPeercred:
         return b"\x00\x00\x00\x00"  # 4 bytes -- shorter than PEERCRED_STRUCT_SIZE (12)
 
 
+@requires_linux_owner  # reads socket.SO_PEERCRED, part of the owner's predicate
 def test_peer_struct_parse_form_raises_on_short_buffer(engram_home):
     owner = eo.EngramdOwner(engram_home, request_deadline=REQUEST_DEADLINE)
     with pytest.raises(struct.error):
@@ -681,6 +788,7 @@ def test_peer_struct_parse_form_raises_on_short_buffer(engram_home):
 # ---------------------------------------------------------------------------
 
 
+@requires_linux_owner
 def test_stale_socket_replacement_refuses_symlink(engram_home):
     owner = eo.EngramdOwner(engram_home, request_deadline=REQUEST_DEADLINE)
     owner.socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -697,6 +805,7 @@ def test_stale_socket_replacement_refuses_symlink(engram_home):
     assert target.read_text() == "not a socket"
 
 
+@requires_linux_owner
 def test_stale_socket_replacement_refuses_non_socket_regular_file(engram_home):
     owner = eo.EngramdOwner(engram_home, request_deadline=REQUEST_DEADLINE)
     owner.socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -735,6 +844,7 @@ def _silent_peer_and_measure(socket_path: Path, bound: float) -> tuple[float, by
     return elapsed, response
 
 
+@requires_linux_owner
 def test_silent_peer_is_dropped_within_deadline_and_owner_stays_up(owner_running):
     bound = owner_running.request_deadline
     elapsed, response = _silent_peer_and_measure(owner_running.socket_path, bound)
@@ -786,6 +896,7 @@ def test_resolve_engram_home_returns_absolute_path_across_cwds(tmp_path, monkeyp
 # ---------------------------------------------------------------------------
 
 
+@requires_linux_owner
 def test_simultaneous_double_launch_surfaces_as_owner_already_running(engram_home):
     """Read test_second_instance_refuses_to_start_and_first_remains_unaffected
     (test 1) first: that test goes through two full EngramdOwner.start()
@@ -883,6 +994,7 @@ def _seed_large_store(store_path: Path, *, rows: int = 40_000, blob_size: int = 
     conn.close()
 
 
+@requires_linux_owner
 def test_snapshot_deadline_exceeded_aborts_work_and_releases_lock(engram_home):
     store_path = engram_home / eo.DEFAULT_STORE_NAME
     _seed_large_store(store_path)
@@ -994,6 +1106,7 @@ def test_snapshot_request_deadline_default_exceeds_base_request_deadline():
 # ---------------------------------------------------------------------------
 
 
+@requires_linux_owner
 def test_run_dir_symlink_is_refused_target_untouched_no_socket_bound(engram_home):
     outside = engram_home / "outside"
     outside.mkdir(mode=0o755)
@@ -1037,6 +1150,7 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+@requires_linux_owner
 def test_snapshot_abort_preserves_pre_existing_destination_byte_identical(engram_home):
     store_path = engram_home / eo.DEFAULT_STORE_NAME
     _seed_large_store(store_path)
@@ -1086,6 +1200,7 @@ def test_snapshot_abort_preserves_pre_existing_destination_byte_identical(engram
         owner.stop()
 
 
+@requires_linux_owner
 def test_snapshot_abort_on_absent_destination_leaves_it_absent(engram_home):
     store_path = engram_home / eo.DEFAULT_STORE_NAME
     _seed_large_store(store_path)
@@ -1115,6 +1230,7 @@ def test_snapshot_abort_on_absent_destination_leaves_it_absent(engram_home):
         owner.stop()
 
 
+@requires_linux_owner
 def test_snapshot_success_atomically_replaces_pre_existing_destination(engram_home):
     store_path = engram_home / eo.DEFAULT_STORE_NAME
     conn = sqlite3.connect(str(store_path))
@@ -1267,6 +1383,7 @@ def _expected_full_snapshot_sha(store_path: Path) -> str:
             pass
 
 
+@requires_linux_owner
 def test_snapshot_response_time_bounded_by_deadline_under_slow_fsync(engram_home, monkeypatch):
     """(d) Borges's round-5 ruling, item 2: the finalize work (fsync then
     os.replace) runs on a worker thread; the REQUEST thread waits on the
@@ -1358,6 +1475,7 @@ def test_snapshot_response_time_bounded_by_deadline_under_slow_fsync(engram_home
         owner.stop()
 
 
+@requires_linux_owner
 def test_snapshot_capacity_gate_rejects_busy_without_starting_backup(engram_home, monkeypatch):
     """(e) Borges's round-5 ruling, item 3: SNAPSHOT_FINALIZE_SLOTS bounds
     concurrent finalize work. With that many finalizes already held (each
@@ -1445,6 +1563,7 @@ def test_snapshot_capacity_gate_rejects_busy_without_starting_backup(engram_home
         owner.stop()
 
 
+@requires_linux_owner
 def test_snapshot_deadline_abandoned_before_commit_never_replaces(engram_home, monkeypatch):
     """(f) Borges's round-5 ruling, item 4: when the deadline passes while
     the finalize worker is still inside fsync (before it ever reaches the
@@ -1540,6 +1659,7 @@ def test_snapshot_deadline_abandoned_before_commit_never_replaces(engram_home, m
         owner.stop()
 
 
+@requires_linux_owner
 def test_snapshot_indeterminate_commit_when_deadline_lands_during_replace(engram_home, monkeypatch):
     """(g) Borges's round-5 ruling, item 4's R1 residual: a test-only
     delay is injected specifically inside os.replace, straddling the
@@ -1635,6 +1755,7 @@ def test_snapshot_indeterminate_commit_when_deadline_lands_during_replace(engram
         owner.stop()
 
 
+@requires_linux_owner
 def test_snapshot_fsync_oserror_aborts_with_snapshot_failed_and_cleans_up(engram_home, monkeypatch):
     """(h) fsync OSError, carried over from round 4's original intent and
     retested against the new bounded-worker shape. A generous (non-tiny)
@@ -1763,6 +1884,7 @@ class _ClockShim:
         return getattr(time, name)
 
 
+@requires_linux_owner
 def test_r6_abandon_reaches_real_client_as_deadline_exceeded_within_request_deadline(
     engram_home, monkeypatch
 ):
@@ -1837,6 +1959,7 @@ def _committing_scenario(engram_home, monkeypatch):
     return owner, dest_path, sentinel_sha, expected_new_sha, request_deadline, replace_delay
 
 
+@requires_linux_owner
 def test_r6_committing_reaches_real_client_as_indeterminate_within_request_deadline(
     engram_home, monkeypatch
 ):
@@ -1884,6 +2007,7 @@ def test_r6_committing_reaches_real_client_as_indeterminate_within_request_deadl
         owner.stop()
 
 
+@requires_linux_owner
 def test_r6_committing_wire_response_carries_commit_indeterminate(engram_home, monkeypatch):
     """R6-4(ii), raw wire: the response the owner puts on the socket carries
     the top-level `commit: "indeterminate"` key (the real client's Rejected
@@ -1913,6 +2037,7 @@ def test_r6_committing_wire_response_carries_commit_indeterminate(engram_home, m
         owner.stop()
 
 
+@requires_linux_owner
 def test_r6_send_gate_still_drops_a_response_composed_after_the_request_deadline(engram_home):
     """R6-3: the send gate in `_handle_connection()` is UNCHANGED -- a
     response composed after the REQUEST deadline is still dropped and the
@@ -1947,6 +2072,7 @@ def test_r6_send_gate_still_drops_a_response_composed_after_the_request_deadline
         owner.stop()
 
 
+@requires_linux_owner
 def test_r6_degenerate_execution_deadline_returns_bounded_rejection_without_work(
     engram_home, monkeypatch
 ):
@@ -1996,6 +2122,7 @@ def test_r6_degenerate_execution_deadline_returns_bounded_rejection_without_work
         owner.stop()
 
 
+@requires_linux_owner
 def test_r6_reserve_is_read_at_call_time_not_captured(engram_home, monkeypatch):
     """R6-1: the constant is read when a snapshot call runs. An owner
     already constructed and started sees a monkeypatched reserve on its
@@ -2021,6 +2148,7 @@ def test_r6_reserve_is_read_at_call_time_not_captured(engram_home, monkeypatch):
         owner.stop()
 
 
+@requires_linux_owner
 def test_r6_worker_commit_gate_uses_execution_deadline_not_request_deadline(
     engram_home, monkeypatch
 ):
@@ -2066,6 +2194,7 @@ def test_r6_worker_commit_gate_uses_execution_deadline_not_request_deadline(
         owner.stop()
 
 
+@requires_linux_owner
 def test_r6_backup_progress_check_uses_execution_deadline_not_request_deadline(
     engram_home, monkeypatch
 ):
@@ -2117,6 +2246,7 @@ def test_r6_backup_progress_check_uses_execution_deadline_not_request_deadline(
         owner.stop()
 
 
+@requires_linux_owner
 def test_r6_invalid_params_and_destination_take_precedence_over_degenerate_guard(engram_home):
     """G2 (reviewer follow-up): `invalid_params` and `invalid_destination`
     are decided BEFORE the degenerate-deadline guard, so a caller with a bad
@@ -2162,6 +2292,7 @@ def test_r6_invalid_params_and_destination_take_precedence_over_degenerate_guard
         owner.stop()
 
 
+@requires_linux_owner
 def test_r6_mid_backup_abort_reaches_real_client_as_deadline_exceeded_within_request_deadline(
     engram_home, monkeypatch
 ):
@@ -2278,7 +2409,8 @@ _EXPENSIVE_CARTESIAN_SQL = (
 )
 
 
-def test_expensive_read_is_aborted_by_deadline_and_cheap_read_is_not(owner_running):
+@requires_linux_owner
+def test_expensive_read_is_aborted_by_deadline_and_cheap_read_is_not(owner_running, tmp_path):
     """Design doc test 12: a deliberately expensive read is aborted by the
     deadline, and a cheap read is not. Bounds VM-instruction cost only
     (test 19 covers the size axis; the end-to-end-deadline axis, test 20,
@@ -2291,7 +2423,14 @@ def test_expensive_read_is_aborted_by_deadline_and_cheap_read_is_not(owner_runni
     not a fixed constant: shortening the deadline must shorten the abort
     point.
     """
-    gate = owner_running._client_read_gate
+    # U4c (#3196): the owner's own gate now refuses every statement not in
+    # the committed template list, so this test (whose subject is the
+    # deadline axis, not the registry) gets a gate over the SAME client-read
+    # connection with a fixture registry admitting the two statements it uses.
+    fixture_registry = rr.build_registry(
+        ["SELECT 1", _EXPENSIVE_CARTESIAN_SQL], sqlite3.connect(":memory:")
+    )
+    gate = eo._ClientReadGate(owner_running._client_read_conn, registry=fixture_registry, home=tmp_path)
 
     # Cheap read: comfortably under a generous deadline, completes.
     rows = gate.execute("SELECT 1", deadline=time.monotonic() + 5.0)
@@ -2320,6 +2459,7 @@ def test_expensive_read_is_aborted_by_deadline_and_cheap_read_is_not(owner_runni
     assert elapsed_short < elapsed_long, (elapsed_short, elapsed_long)
 
 
+@requires_linux_owner
 def test_snapshot_runs_on_owner_internal_path_and_error_is_not_swallowed(engram_home):
     """Design doc test 17, WITH A DOCUMENTED MEASURED DEVIATION from its
     literal mutation -- see this section's module-level comment above and
@@ -2441,6 +2581,7 @@ def test_snapshot_runs_on_owner_internal_path_and_error_is_not_swallowed(engram_
         owner.stop()
 
 
+@requires_linux_owner
 def test_snapshot_copies_from_the_owner_internal_connection_not_client_read(engram_home):
     """Mira's finding on PR #3221 (round 4): nothing previously distinguished WHICH
     connection `.backup()` runs on. Both connections point at the same
@@ -2493,7 +2634,8 @@ def test_snapshot_copies_from_the_owner_internal_connection_not_client_read(engr
         owner.stop()
 
 
-def test_single_value_size_is_bounded_independently_of_progress_handler(owner_running):
+@requires_linux_owner
+def test_single_value_size_is_bounded_independently_of_progress_handler(owner_running, tmp_path):
     """Design doc test 19: single-value size is bounded independently of
     the progress handler. `SELECT zeroblob(N)` above the configured
     SQLITE_LIMIT_LENGTH is refused on the client-read connection; a
@@ -2507,14 +2649,21 @@ def test_single_value_size_is_bounded_independently_of_progress_handler(owner_ru
     zeroblob STILL returns in full -- proving the handler is not what
     bounds size.
     """
-    gate = owner_running._client_read_gate
     limit = eo.CLIENT_READ_LIMIT_LENGTH
+    # U4c (#3196): a `?` inside a function argument (`zeroblob(?)`) is an
+    # unsafe placeholder the registry refuses (R7), so the two statements are
+    # registered as LITERALS carrying the same sizes (limit-1 / limit+1), over
+    # a fixture registry on the owner's real client-read connection.
+    under_sql = f"SELECT length(zeroblob({limit - 1}))"
+    over_sql = f"SELECT zeroblob({limit + 1})"
+    fixture_registry = rr.build_registry([under_sql, over_sql], sqlite3.connect(":memory:"))
+    gate = eo._ClientReadGate(owner_running._client_read_conn, registry=fixture_registry, home=tmp_path)
 
-    under = gate.execute("SELECT length(zeroblob(?))", (limit - 1,), deadline=time.monotonic() + 5.0)
+    under = gate.execute(under_sql, deadline=time.monotonic() + 5.0)
     assert under == [(limit - 1,)]
 
     with pytest.raises(sqlite3.Error):
-        gate.execute("SELECT zeroblob(?)", (limit + 1,), deadline=time.monotonic() + 5.0)
+        gate.execute(over_sql, deadline=time.monotonic() + 5.0)
 
     # Control: progress handler armed but never firing (generous
     # deadline), and NO setlimit anywhere on this bare connection -- the
@@ -2534,6 +2683,7 @@ def test_single_value_size_is_bounded_independently_of_progress_handler(owner_ru
         control_conn.close()
 
 
+@requires_linux_owner
 def test_client_read_gate_holds_no_reference_to_owner_internal_connection(owner_running):
     """Design doc test 22: client SQL cannot reach the unrestricted
     connection, asserted STRUCTURALLY -- the object a future client-facing
@@ -2552,7 +2702,58 @@ def test_client_read_gate_holds_no_reference_to_owner_internal_connection(owner_
             f"_ClientReadGate.{attr_name} holds the owner-internal connection"
         )
 
+    # U4d (#3197, cell O3): the client-facing `read` method now exists, so the
+    # property is asserted for it too -- the handler reaches the store ONLY
+    # through `_client_read_gate`, never through either connection directly.
+    # Mutation: have `_handle_read` execute on `self._owner_conn` (or on
+    # `self._client_read_conn` bypassing the gate) -> red.
+    import ast
+    import inspect
+    import textwrap
 
+    assert "read" in owner_running._methods
+    handler = ast.parse(textwrap.dedent(inspect.getsource(eo.EngramdOwner._handle_read)))
+    touched = {n.attr for n in ast.walk(handler) if isinstance(n, ast.Attribute)}
+    assert "_client_read_gate" in touched
+    assert not touched & {"_owner_conn", "_owner_lock", "_client_read_conn"}, touched
+
+    # #3665 round 2 (F3): the lock / execute tail moved into `_run_client_read`
+    # and the typed `df` method has its own handler; neither may reference the
+    # owner-internal connection or lock. Mutation: reference `self._owner_conn`
+    # inside `_run_client_read` -> red.
+    for fn in (eo.EngramdOwner._handle_df, eo.EngramdOwner._run_client_read):
+        fn_tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        fn_touched = {n.attr for n in ast.walk(fn_tree) if isinstance(n, ast.Attribute)}
+        assert not fn_touched & {"_owner_conn", "_owner_lock"}, (fn.__name__, fn_touched)
+
+    # And live, over the socket: `read` calls the gate (a spy stands in for it)
+    # while `_owner_conn` is a tripwire that fails on any use.
+    seen = []
+
+    class _SpyGate:
+        def execute(self, sql, params=(), *, deadline):
+            seen.append((sql, params))
+            return [(1, "x")]
+
+    class _Tripwire:
+        def __getattr__(self, name):
+            if name == "close":
+                return lambda: None
+            raise AssertionError(f"`read` touched the owner-internal connection: .{name}")
+
+    real_gate, real_conn = owner_running._client_read_gate, owner_running._owner_conn
+    owner_running._client_read_gate, owner_running._owner_conn = _SpyGate(), _Tripwire()
+    try:
+        result = ec.read("read", {"sql": "SELECT 1", "args": ["a"]}, timeout=2.0,
+                         socket_path=owner_running.socket_path)
+    finally:
+        owner_running._client_read_gate, owner_running._owner_conn = real_gate, real_conn
+    assert isinstance(result, ec.Ok), result
+    assert result.result == [[1, "x"]]
+    assert seen == [("SELECT 1", ("a",))]
+
+
+@requires_linux_owner
 def test_start_wires_the_restrictive_authorizer_onto_the_real_client_read_conn(owner_running):
     """Exercises owner_running._client_read_conn directly -- the actual
     connection object opened and authorizer-wired by start(), not an
@@ -2590,6 +2791,7 @@ def test_start_wires_the_restrictive_authorizer_onto_the_real_client_read_conn(o
     assert conn.execute("SELECT 1").fetchall() == [(1,)]
 
 
+@requires_linux_owner
 def test_cleanup_blocks_on_owner_lock_held_by_an_in_flight_operation(owner_running):
     """Simulates an in-flight _handle_snapshot() by acquiring
     owner._owner_lock directly in THIS test's own thread, then calling
@@ -2622,3 +2824,152 @@ def test_cleanup_blocks_on_owner_lock_held_by_an_in_flight_operation(owner_runni
     assert not cleanup_thread.is_alive()
     assert owner._owner_conn is None
     assert owner._client_read_conn is None
+
+
+# ---------------------------------------------------------------------------
+# #3292 -- the owner refuses on an UNSUPPORTED platform BY DESIGN (#3194). This
+# test carries no requires_linux_owner marker: it runs on every platform, and is
+# the one that proves the refusal the other tests' skip marker relies on.
+# #3666: Darwin is now a SUPPORTED platform (its own prerequisites, below), so
+# the "unsupported" case here is FreeBSD -- a platform that is neither.
+# ---------------------------------------------------------------------------
+
+
+def test_start_refuses_on_an_unsupported_platform_before_any_side_effect(engram_home, monkeypatch):
+    monkeypatch.setattr(eo.platform, "system", lambda: "FreeBSD")
+    fresh_home = engram_home / "not-yet-created"
+    assert not fresh_home.exists()
+    threads_before = set(threading.enumerate())
+    owner = eo.EngramdOwner(fresh_home)
+    with pytest.raises(eo.OwnerPermissionUnsupported) as ei:
+        owner.start(install_signal_handlers=False)
+    assert "FreeBSD" in str(ei.value)
+    assert not fresh_home.exists()
+    assert not owner.socket_path.exists()
+    assert not owner.pid_path.exists()
+    assert not owner.store_path.exists()
+    assert owner._accept_thread is None
+    assert set(threading.enumerate()) == threads_before
+
+
+# ---------------------------------------------------------------------------
+# #3292 fold 2 -- ONE predicate, `eo.platform_unsupported_reason()`, is what
+# both the owner's refusal and the test marker key on. These cells carry no
+# marker: they run (and must pass) on every platform.
+# ---------------------------------------------------------------------------
+
+
+def _patch_platform(monkeypatch, *, system="Linux", setfacl=True, peercred=True):
+    monkeypatch.setattr(eo.platform, "system", lambda: system)
+    monkeypatch.setattr(
+        eo.shutil, "which", lambda name, *a, **k: "/usr/bin/" + name if setfacl else None
+    )
+    if peercred:
+        monkeypatch.setattr(eo.socket, "SO_PEERCRED", 17, raising=False)
+    else:
+        monkeypatch.delattr(eo.socket, "SO_PEERCRED", raising=False)
+
+
+_PLATFORM_CASES = [
+    pytest.param({"system": "FreeBSD"}, "platform.system()", id="unsupported-platform"),
+    pytest.param({"setfacl": False}, "setfacl", id="no-setfacl"),
+    pytest.param({"peercred": False}, "SO_PEERCRED", id="no-so-peercred"),
+]
+
+
+def test_platform_unsupported_reason_none_when_all_satisfied(monkeypatch):
+    _patch_platform(monkeypatch)
+    assert eo.platform_unsupported_reason() is None
+
+
+@pytest.mark.parametrize("kw,needle", _PLATFORM_CASES)
+def test_platform_unsupported_reason_names_each_failing_condition(monkeypatch, kw, needle):
+    _patch_platform(monkeypatch, **kw)
+    reason = eo.platform_unsupported_reason()
+    assert reason is not None
+    assert needle in reason
+
+
+def test_platform_unsupported_reason_order_platform_first(monkeypatch):
+    _patch_platform(monkeypatch, system="FreeBSD", peercred=False)
+    assert "platform.system()" in eo.platform_unsupported_reason()
+    _patch_platform(monkeypatch, setfacl=False, peercred=False)
+    assert "setfacl" in eo.platform_unsupported_reason()
+
+
+@pytest.mark.parametrize("kw,needle", _PLATFORM_CASES)
+def test_start_refusal_message_equals_shared_predicate(engram_home, monkeypatch, kw, needle):
+    _patch_platform(monkeypatch, **kw)
+    expected = eo.platform_unsupported_reason()
+    assert expected is not None and needle in expected
+    fresh_home = engram_home / "not-yet-created"
+    threads_before = set(threading.enumerate())
+    owner = eo.EngramdOwner(fresh_home)
+    with pytest.raises(eo.OwnerPermissionUnsupported) as ei:
+        owner.start(install_signal_handlers=False)
+    assert str(ei.value) == expected
+    assert not fresh_home.exists()
+    assert not owner.socket_path.exists()
+    assert not owner.pid_path.exists()
+    assert not owner.store_path.exists()
+    assert owner._accept_thread is None
+    assert set(threading.enumerate()) == threads_before
+
+
+# ---------------------------------------------------------------------------
+# #3666 -- the Darwin branch of the same predicate. SIMULATED here so the logic
+# is checked on every platform (patching each primitive the branch reads, never
+# `platform.system` alone -- #3375); the REAL-Mac evidence for the same
+# prerequisites is tests/test_engramd_owner_darwin_3666.py.
+# ---------------------------------------------------------------------------
+
+
+def _patch_darwin(monkeypatch, *, peercred=True, chmod=True, devfd=True):
+    monkeypatch.setattr(eo.platform, "system", lambda: "Darwin")
+    if peercred:
+        monkeypatch.setattr(eo.socket, "LOCAL_PEERCRED", 1, raising=False)
+    else:
+        monkeypatch.delattr(eo.socket, "LOCAL_PEERCRED", raising=False)
+    monkeypatch.setattr(eo, "DARWIN_CHMOD", __file__ if chmod else "/nonexistent-3666/chmod")
+    monkeypatch.setattr(
+        eo, "DARWIN_DEV_FD", str(Path(__file__).parent) if devfd else "/nonexistent-3666/fd"
+    )
+
+
+_DARWIN_CASES = [
+    pytest.param({"peercred": False}, "LOCAL_PEERCRED", id="darwin-no-local-peercred"),
+    pytest.param({"chmod": False}, "/nonexistent-3666/chmod", id="darwin-no-chmod"),
+    pytest.param({"devfd": False}, "/nonexistent-3666/fd", id="darwin-no-dev-fd"),
+]
+
+
+def test_platform_unsupported_reason_none_for_a_darwin_with_every_prerequisite(monkeypatch):
+    _patch_darwin(monkeypatch)
+    assert eo.platform_unsupported_reason() is None
+
+
+@pytest.mark.parametrize("kw,needle", _DARWIN_CASES)
+def test_darwin_reason_names_the_one_missing_prerequisite(monkeypatch, kw, needle):
+    _patch_darwin(monkeypatch, **kw)
+    reason = eo.platform_unsupported_reason()
+    assert reason is not None and needle in reason
+    # a Darwin seat is never asked for Linux's tools
+    assert "setfacl" not in reason and "SO_PEERCRED" not in reason
+
+
+@pytest.mark.parametrize("kw,needle", _DARWIN_CASES)
+def test_darwin_start_refusal_message_equals_shared_predicate(engram_home, monkeypatch, kw, needle):
+    _patch_darwin(monkeypatch, **kw)
+    expected = eo.platform_unsupported_reason()
+    fresh_home = engram_home / "not-yet-created"
+    owner = eo.EngramdOwner(fresh_home)
+    with pytest.raises(eo.OwnerPermissionUnsupported) as ei:
+        owner.start(install_signal_handlers=False)
+    assert str(ei.value) == expected
+    assert not fresh_home.exists()
+
+
+def test_marker_and_predicate_agree_at_import_time():
+    # The mark's skipif condition was evaluated at import; the predicate is
+    # evaluated now. The platform does not change within a run, so they agree.
+    assert requires_linux_owner.args[0] == (eo.platform_unsupported_reason() is not None)

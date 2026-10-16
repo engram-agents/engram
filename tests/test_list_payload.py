@@ -128,6 +128,103 @@ def test_non_object_payload_rejected():
 
 
 # ---------------------------------------------------------------------------
+# nested JSON-string sub-field TypeError (issue #1753)
+# ---------------------------------------------------------------------------
+#
+# filters_json / fields_json are typed str, but a caller can send a real
+# JSON array/object (not a JSON-encoded string) at the untrusted MCP
+# boundary. Before the fix, json.loads(<list>) / json.loads(<dict>) raises
+# an uncaught TypeError instead of the structured error envelope the
+# JSONDecodeError branch already returns for malformed strings. Sibling
+# defect class to #1683 (payload_json).
+
+def test_impl_filters_json_as_list_rejected_not_raised():
+    """A real list (not a JSON string) for filters_json must return the
+    structured error envelope, naming the field — never an uncaught TypeError."""
+    server = fresh_server()
+    r = json.loads(server._list_impl(
+        filters_json=[{"field": "type", "op": "eq", "value": "observation_factual"}],
+    ))
+    assert r.get("status") == "error", r
+    assert "filters_json" in r["error"], r["error"]
+    assert "list" in r["error"], r["error"]
+
+
+def test_impl_filters_json_as_dict_rejected_not_raised():
+    """A real dict (not a JSON string) for filters_json must return the
+    structured error envelope, naming the field — never an uncaught TypeError."""
+    server = fresh_server()
+    r = json.loads(server._list_impl(
+        filters_json={"field": "type", "op": "eq", "value": "observation_factual"},
+    ))
+    assert r.get("status") == "error", r
+    assert "filters_json" in r["error"], r["error"]
+    assert "dict" in r["error"], r["error"]
+
+
+def test_impl_fields_json_as_list_rejected_not_raised():
+    """A real list (not a JSON string) for fields_json must return the
+    structured error envelope, naming the field — never an uncaught TypeError."""
+    server = fresh_server()
+    r = json.loads(server._list_impl(fields_json=["id", "claim"]))
+    assert r.get("status") == "error", r
+    assert "fields_json" in r["error"], r["error"]
+    assert "list" in r["error"], r["error"]
+
+
+def test_impl_fields_json_as_dict_rejected_not_raised():
+    """A real dict (not a JSON string) for fields_json must return the
+    structured error envelope, naming the field — never an uncaught TypeError."""
+    server = fresh_server()
+    r = json.loads(server._list_impl(fields_json={"id": "claim"}))
+    assert r.get("status") == "error", r
+    assert "fields_json" in r["error"], r["error"]
+    assert "dict" in r["error"], r["error"]
+
+
+def test_impl_filters_json_valid_string_still_works():
+    """C2 regression guard: a well-formed JSON-string filters_json is
+    unaffected by the TypeError fix."""
+    server = fresh_server()
+    _add_observation(server, "Observation node for filters_json valid-string regression test.")
+    r = json.loads(server._list_impl(
+        filters_json=json.dumps({"field": "type", "op": "eq", "value": "observation_factual"}),
+    ))
+    assert r.get("status") == "ok", r
+    assert r.get("mode") == "structured", r
+
+
+def test_impl_filters_json_malformed_string_still_reports_decode_error():
+    """C2 regression guard: a malformed JSON string still produces today's
+    invalid-JSON message, unchanged by the TypeError fix."""
+    server = fresh_server()
+    r = json.loads(server._list_impl(filters_json="{not valid json"))
+    assert r.get("status") == "error", r
+    assert "invalid JSON" in r["error"], r["error"]
+
+
+def test_impl_fields_json_valid_string_still_works():
+    """C2 regression guard: a well-formed JSON-string fields_json is
+    unaffected by the TypeError fix."""
+    server = fresh_server()
+    _add_observation(server, "Observation node for fields_json valid-string regression test.")
+    r = json.loads(server._list_impl(
+        filters_json=json.dumps({"field": "type", "op": "eq", "value": "observation_factual"}),
+        fields_json=json.dumps(["id", "claim"]),
+    ))
+    assert r.get("status") == "ok", r
+
+
+def test_impl_fields_json_malformed_string_still_reports_decode_error():
+    """C2 regression guard: a malformed JSON string still produces today's
+    invalid-JSON message, unchanged by the TypeError fix."""
+    server = fresh_server()
+    r = json.loads(server._list_impl(fields_json="{not valid json"))
+    assert r.get("status") == "error", r
+    assert "invalid JSON" in r["error"], r["error"]
+
+
+# ---------------------------------------------------------------------------
 # 5. sort_by / node_type refuse-unrecognized-values (engram-alpha#1927)
 # ---------------------------------------------------------------------------
 #

@@ -20,9 +20,11 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
+from _short_socket import MAX_SOCKET_PATH_BYTES, short_socket_path
 
 AGENTCTL_MAC = Path(__file__).resolve().parent.parent / "tools" / "agentctl-mac"
 AGENTCTL_LINUX = Path(__file__).resolve().parent.parent / "tools" / "agentctl"
@@ -181,6 +183,54 @@ def test_codex_d_expands_to_bypass_approvals():
     assert "--dangerously-skip-permissions" not in out
 
 
+def test_codex_resume_with_bypass_is_rejected_by_shared_expansion():
+    rc, out, err = _run("session", "luria", "-dc", "--platform", "codex", "--dry-run")
+    assert rc != 0
+    assert not out
+    assert "remote resume forbids permission override" in err.lower()
+
+
+def test_codex_globally_prefixed_resume_with_bypass_is_rejected_by_shared_expansion():
+    rc, out, err = _run(
+        "session",
+        "luria",
+        "-d",
+        "--platform",
+        "codex",
+        "--dry-run",
+        "--config",
+        "foo=bar",
+        "resume",
+        "--last",
+    )
+    assert rc != 0
+    assert not out
+    assert "remote resume forbids permission override" in err.lower()
+    assert "requested bypass was not applied" in err.lower()
+    assert "no session was resumed" in err.lower()
+
+
+def test_codex_prompt_after_dashdash_does_not_trigger_remote_resume_guard():
+    """A literal -- is Codex's prompt boundary, not wrapper-only syntax."""
+    rc, out, err = _run(
+        "session",
+        "luria",
+        "--platform",
+        "codex",
+        "--dry-run",
+        "--",
+        "resume",
+        "--dangerously-bypass-approvals-and-sandbox",
+    )
+    assert rc == 0, err
+    assert out.split() == [
+        "codex",
+        "--",
+        "resume",
+        "--dangerously-bypass-approvals-and-sandbox",
+    ]
+
+
 def test_codex_r_is_silently_consumed_for_compatibility():
     rc, out, err = _run("session", "luria", "-r", "--platform", "codex", "--dry-run")
     assert rc == 0
@@ -298,13 +348,11 @@ def test_passthrough_args_after_dashdash_land_verbatim():
     assert "abc123" in words
 
 
-def test_dashdash_separator_itself_not_forwarded():
-    """The literal `--` token must be consumed as a separator, never appear
-    in the expanded output (matches tools/agentctl's own _parse_session_flags
-    behavior: a leading -- is shifted off, not passed through)."""
+def test_dashdash_separator_is_forwarded_as_platform_prompt_boundary():
+    """The literal `--` must reach Codex as its prompt boundary."""
     rc, out, _ = _run("session", "luria", "--dry-run", "--", "--resume", "abc123")
     assert rc == 0
-    assert "--" not in out.split()
+    assert "--" in out.split()
 
 
 def test_dry_run_after_dashdash_is_passthrough_not_intercepted():
@@ -457,7 +505,27 @@ def _run_managed_mac_codex(
     version_output: str | None = None,
     socket_is_real: bool = True,
 ) -> tuple[subprocess.CompletedProcess[str], str, Path]:
-    socket_path = tmp_path / "app-server-control.sock"
+    with short_socket_path() as socket_path:
+        return _run_managed_mac_codex_at(
+            tmp_path,
+            socket_path,
+            *args,
+            session_exists=session_exists,
+            start_rc=start_rc,
+            version_output=version_output,
+            socket_is_real=socket_is_real,
+        )
+
+
+def _run_managed_mac_codex_at(
+    tmp_path: Path,
+    socket_path: Path,
+    *args: str,
+    session_exists: bool,
+    start_rc: int,
+    version_output: str | None,
+    socket_is_real: bool,
+) -> tuple[subprocess.CompletedProcess[str], str, Path]:
     sock = _make_unix_socket(socket_path) if socket_is_real else None
     if not socket_is_real:
         socket_path.write_text("not a socket", encoding="utf-8")
@@ -487,6 +555,21 @@ def _run_managed_mac_codex(
     finally:
         if sock is not None:
             sock.close()
+
+
+def test_short_socket_path_stays_under_the_af_unix_limit_even_with_a_long_tmpdir(tmp_path, monkeypatch):
+    """The helper's socket path must not depend on tmp_path/TMPDIR length (#3292)."""
+    long_tmp = tmp_path / ("x" * 120)
+    long_tmp.mkdir()
+    # tempfile caches its default dir, so setenv("TMPDIR") alone would be a no-op
+    # once gettempdir() has run; set the cache itself so a helper that falls back
+    # to the default tempdir (drops dir="/tmp") lands in the long dir and fails.
+    monkeypatch.setattr(tempfile, "tempdir", str(long_tmp))
+    with short_socket_path() as path:
+        assert len(os.fsencode(path)) < MAX_SOCKET_PATH_BYTES
+        sock = _make_unix_socket(path)  # a real bind, as macOS would do
+        sock.close()
+    assert not path.parent.exists()
 
 
 def test_mac_codex_ensures_verified_daemon_then_starts_remote_tui_in_cwd(tmp_path):

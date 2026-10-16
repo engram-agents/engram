@@ -238,7 +238,7 @@ def test_live_fetch_success_cursor_advanced(tmp_cursor, tmp_cache, monkeypatch):
     assert not tmp_cache.exists()
 
     # Stub _fetch_threads to return a non-None empty list (success, no threads)
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: ([], None))
 
     before_call = datetime.now(timezone.utc)
 
@@ -291,7 +291,7 @@ def test_unreachable_no_cache_cursor_unchanged(tmp_cursor, tmp_cache, monkeypatc
 
     # No cache file, and _fetch_threads returns None (server unreachable)
     assert not tmp_cache.exists()
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: None)
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: (None, "connect: ConnectionRefusedError: refused"))
 
     # main() exits silently (threads=None -> no-op)
     try:
@@ -327,9 +327,9 @@ def test_mention_line_present_when_mentions_returned(
 
     mention = _make_inbox_item(tid="99", title="Review my PR", author="luria")
 
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: ([], None))
     monkeypatch.setattr(hook, "_fetch_inbox",
-                        lambda url, name, deadline: [mention])
+                        lambda url, name, deadline: ([mention], None))
 
     output = _run_main(hook, capture_output=True)
 
@@ -358,8 +358,8 @@ def test_mention_line_absent_on_none_generic_unaffected(
     _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
 
     monkeypatch.setattr(hook, "_fetch_threads",
-                        lambda url, since, agent, deadline: [{"id": "1", "title": "hello"}])
-    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: None)
+                        lambda url, since, agent, deadline: ([{"id": "1", "title": "hello"}], None))
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: (None, "http-500: HTTP 500"))
 
     output = _run_main(hook, capture_output=True)
 
@@ -403,9 +403,9 @@ def test_907_banner_clears_when_inbox_no_longer_returns_mention(
     inbox_items = [mention]
 
     def fetch_inbox_dynamic(url, name, deadline):
-        return list(inbox_items)
+        return list(inbox_items), None
 
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: ([], None))
     monkeypatch.setattr(hook, "_fetch_inbox", fetch_inbox_dynamic)
 
     # Prompt 1: mention present in inbox → banner appears
@@ -428,7 +428,7 @@ def test_907_banner_clears_when_inbox_no_longer_returns_mention(
     hook2 = _load_hook()
     _patch_hook_paths(hook2, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
     _stub_config(hook2, monkeypatch)
-    monkeypatch.setattr(hook2, "_fetch_threads", lambda url, since, agent, deadline: [])
+    monkeypatch.setattr(hook2, "_fetch_threads", lambda url, since, agent, deadline: ([], None))
     monkeypatch.setattr(hook2, "_fetch_inbox", fetch_inbox_dynamic)
 
     # Prompt 2: inbox is empty → banner must clear (exit 0, no output)
@@ -464,12 +464,12 @@ def test_mentions_persist_when_inbox_still_returns_item(
 
     mention = _make_inbox_item(tid="7", title="A colleague needs you", author="colleague-a")
 
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: ([], None))
 
     def fetch_inbox(url, name, deadline):
         # Returns the same mention regardless — simulates a server where the
         # thread has not been marked read yet.
-        return [mention]
+        return [mention], None
 
     monkeypatch.setattr(hook, "_fetch_inbox", fetch_inbox)
 
@@ -519,9 +519,9 @@ def test_cache_stores_and_reads_both_threads_and_mentions(
 
     def stub_fetch_inbox(url, name, deadline):
         fetch_inbox_calls.append((url, name))
-        return []
+        return [], None
 
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: ([], None))
     monkeypatch.setattr(hook, "_fetch_inbox", stub_fetch_inbox)
 
     output = _run_main(hook, capture_output=True)
@@ -606,7 +606,7 @@ def test_stale_cache_fallback_renders_mentions(
     tmp_cache.write_text(json.dumps(stale_payload))
 
     # Server unreachable: _fetch_threads returns None
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: None)
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: (None, "connect: ConnectionRefusedError: refused"))
 
     output = _run_main(hook, capture_output=True)
 
@@ -638,9 +638,9 @@ def test_both_lines_ordering_mention_above_generic(
     mention = _make_inbox_item(tid="10", title="Needs review", author="luria")
 
     monkeypatch.setattr(hook, "_fetch_threads",
-                        lambda url, since, agent, deadline: [{"id": "2", "title": "new thread"}])
+                        lambda url, since, agent, deadline: ([{"id": "2", "title": "new thread"}], None))
     monkeypatch.setattr(hook, "_fetch_inbox",
-                        lambda url, name, deadline: [mention])
+                        lambda url, name, deadline: ([mention], None))
 
     output = _run_main(hook, capture_output=True)
     assert output.strip(), "Expected non-empty output"
@@ -684,10 +684,10 @@ def test_empty_agent_name_no_mentions_fetch_generic_works(
 
     def stub_fetch_inbox(url, name, deadline):
         fetch_inbox_calls.append(name)
-        return [_make_inbox_item()]
+        return [_make_inbox_item()], None
 
     monkeypatch.setattr(hook, "_fetch_threads",
-                        lambda url, since, agent, deadline: [{"id": "3", "title": "thread"}])
+                        lambda url, since, agent, deadline: ([{"id": "3", "title": "thread"}], None))
     monkeypatch.setattr(hook, "_fetch_inbox", stub_fetch_inbox)
 
     output = _run_main(hook, capture_output=True)
@@ -714,11 +714,13 @@ def test_empty_agent_name_no_mentions_fetch_generic_works(
 # ---------------------------------------------------------------------------
 
 def test_fetch_inbox_swallows_404(monkeypatch):
-    """_fetch_inbox must return None (not raise) when the server returns 404.
+    """_fetch_inbox must not raise on a 404 and must report it as the
+    `unsupported` state: `([], "unsupported")`.
 
-    This is the low-level contract: any HTTP error including 404 is swallowed
-    so that a missing /api/agent/<name>/inbox endpoint on an old server is
-    indistinguishable from "no mentions" from the caller's perspective.
+    #3521 row 5: a missing /api/agent/<name>/inbox endpoint on an old server is
+    healthy by design -- known-empty, no line, cached as `[]` -- and, unlike
+    every OTHER failure (which is now `(None, reason)` = unknown), it IS
+    "no mentions" from the caller's perspective.
 
     gh#3107: _fetch_inbox now drives http.client.HTTPConnection (via
     _fetch_with_deadline), not urlopen -- mocked at the new layer. A non-2xx
@@ -734,6 +736,12 @@ def test_fetch_inbox_swallows_404(monkeypatch):
             return b""
 
     class FakeConn:
+        # `sock = None`: the fetch captures conn.sock before getresponse().
+        # Without the attribute that line raised AttributeError and the old
+        # swallow-all handler returned None -- this test passed WITHOUT ever
+        # reaching the 404 status check it is named for (found by #3521 row 5,
+        # whose classified fetch reports that AttributeError as an unknown).
+        sock = None
         def __init__(self, host, port, timeout=None):
             pass
         def connect(self):
@@ -750,8 +758,8 @@ def test_fetch_inbox_swallows_404(monkeypatch):
     result = hook._fetch_inbox(
         "http://localhost:5002", "testbot", hook.time.monotonic() + 5.0
     )
-    assert result is None, (
-        "_fetch_inbox must return None on a 404 status (old server)"
+    assert result == ([], "unsupported"), (
+        "_fetch_inbox must report a 404 status (old server) as unsupported"
     )
 
 
@@ -772,9 +780,9 @@ def test_old_server_404_inbox_silent_skip_in_main(
     _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
 
     monkeypatch.setattr(hook, "_fetch_threads",
-                        lambda url, since, agent, deadline: [{"id": "5", "title": "new thread"}])
+                        lambda url, since, agent, deadline: ([{"id": "5", "title": "new thread"}], None))
     # Simulate what _fetch_inbox returns after swallowing a 404
-    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: None)
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: ([], "unsupported"))
 
     output = _run_main(hook, capture_output=True)
 
@@ -848,7 +856,8 @@ def test_fetch_inbox_filters_reply_on_my_thread(monkeypatch):
     result = hook._fetch_inbox(
         "http://localhost:5002", "testbot", hook.time.monotonic() + 5.0
     )
-    assert result is not None, "_fetch_inbox must succeed"
+    result, reason = result
+    assert result is not None and reason is None, "_fetch_inbox must succeed"
     assert len(result) == 1, (
         f"_fetch_inbox must return only at_mention items; got {result!r}"
     )
@@ -874,8 +883,8 @@ def test_reply_on_my_thread_only_inbox_no_banner(
 
     # _fetch_inbox returns [] because all inbox items are reply_on_my_thread
     # (the real _fetch_inbox filters; this simulates that filtered result)
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
-    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: [])
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: ([], None))
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: ([], None))
 
     output = _run_main(hook, capture_output=True)
 
@@ -1381,10 +1390,10 @@ def test_same_second_post_not_excluded_by_cursor(
     def stub_fetch_threads(url, since, agent, deadline):
         captured_since.append(since)
         # Simulate a post that arrived at T:00.000500Z (same second, after cursor)
-        return [{"id": "99", "title": "Same-second post"}]
+        return [{"id": "99", "title": "Same-second post"}], None
 
     monkeypatch.setattr(hook, "_fetch_threads", stub_fetch_threads)
-    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: [])
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: ([], None))
 
     output = _run_main(hook, capture_output=True)
 
@@ -1449,9 +1458,9 @@ def test_forum_mode_explicit_matches_absent_key_default(
         _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
         monkeypatch.setattr(
             hook, "_fetch_threads",
-            lambda url, since, agent, deadline: [{"id": "2", "title": "new thread"}],
+            lambda url, since, agent, deadline: ([{"id": "2", "title": "new thread"}], None),
         )
-        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: [mention])
+        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: ([mention], None))
         return _run_main(hook, capture_output=True)
 
     output_absent = _run(None)
@@ -1478,8 +1487,8 @@ def test_forum_mode_parity_holds_in_silent_state(
         _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
         _stub_config_with_comms_surface(hook, monkeypatch, comms_surface)
         _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
-        monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
-        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: [])
+        monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: ([], None))
+        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: ([], None))
         return _run_main(hook, capture_output=True)
 
     output_absent = _run(None)
@@ -1504,9 +1513,9 @@ def test_umwelt_mode_mention_pending_emits_advisory(
 
     monkeypatch.setattr(
         hook, "_fetch_threads",
-        lambda url, since, agent, deadline: [{"id": "9", "title": "some new thread"}],
+        lambda url, since, agent, deadline: ([{"id": "9", "title": "some new thread"}], None),
     )
-    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: [mention])
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: ([mention], None))
 
     output = _run_main(hook, capture_output=True)
 
@@ -1539,9 +1548,9 @@ def test_umwelt_mode_broadcast_only_no_emission(
 
     monkeypatch.setattr(
         hook, "_fetch_threads",
-        lambda url, since, agent, deadline: [{"id": "9", "title": "broadcast-only thread"}],
+        lambda url, since, agent, deadline: ([{"id": "9", "title": "broadcast-only thread"}], None),
     )
-    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: [])
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: ([], None))
 
     output = _run_main(hook, capture_output=True)
 
@@ -1565,8 +1574,8 @@ def test_umwelt_mode_advisory_pluralizes_count(
         _make_inbox_item(tid="2", title="Second", author="b"),
     ]
 
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
-    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: mentions)
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: ([], None))
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: (mentions, None))
 
     output = _run_main(hook, capture_output=True)
 

@@ -68,11 +68,16 @@ def _make_project_dict(
     turn_reason: str = "colleague-review request",
     participants: "list | None" = None,
     seq: int = 1,
+    github: "str | None" = None,
 ) -> dict:
-    """Build a project dict matching the shape returned by GET /api/projects."""
+    """Build a project dict matching the shape returned by GET /api/projects.
+
+    github: optional explicit github: anchor field. #1918: a live status
+    needs a repo-qualified one (pr/<owner>/<repo>/<N>); the bare PR-<N> id
+    fallback has no repo and never fetches."""
     if turn_since is None:
         turn_since = datetime.now(timezone.utc) - timedelta(minutes=30)
-    return {
+    d = {
         "project_id": project_id,
         "title": title,
         "status": status,
@@ -82,6 +87,9 @@ def _make_project_dict(
         "participants": participants or ["ariadne", "borges"],
         "seq": seq,
     }
+    if github is not None:
+        d["github"] = github
+    return d
 
 
 def _ts(offset_minutes: int) -> datetime:
@@ -95,7 +103,9 @@ def _ts(offset_minutes: int) -> datetime:
 
 def _write_config(engram_home: Path, agent_name: str = "ariadne") -> None:
     """Write a minimal multi-agent config.json into engram_home."""
-    cfg = {"mode": "multi", "agent_name": agent_name}
+    # #3546: a forum is configured by forum.url, not by agent_name alone.
+    cfg = {"mode": "multi", "agent_name": agent_name,
+           "forum": {"url": "http://127.0.0.1:5002"}}
     (engram_home / "config.json").write_text(json.dumps(cfg))
 
 
@@ -238,11 +248,11 @@ class TestCacheHit:
 
         # Prime the cache with a fresh entry
         cache = {}
-        mod._cache_set(cache, "pr/455", "OPEN · review:APPROVED")
+        mod._cache_set(cache, "pr/example-org/example-repo/455", "OPEN · review:APPROVED")
         # Entry is <1s old → should be treated as fresh
 
         with patch.object(mod, "_fetch_pr_status") as mock_fetch:
-            result = mod._get_live_status("pr/455", cache)
+            result = mod._get_live_status("pr/example-org/example-repo/455", cache)
 
         assert result == "OPEN · review:APPROVED"
         mock_fetch.assert_not_called()
@@ -281,16 +291,15 @@ class TestCacheStale:
         # Build a stale cache entry (>30s ago)
         stale_time = time.time() - 60  # 60s ago
         cache = {
-            "pr/455": {"fetched_at": stale_time, "render": "OPEN (stale)"}
+            "pr/example-org/example-repo/455": {"fetched_at": stale_time, "render": "OPEN (stale)"}
         }
 
         with patch.object(mod, "_fetch_pr_status", return_value="MERGED") as mock_fetch:
-            result = mod._get_live_status("pr/455", cache)
+            result = mod._get_live_status("pr/example-org/example-repo/455", cache)
 
-        # repo kwarg since #1715; bare anchors resolve to the shipped default
-        # repo (the PUBLIC engram repo — intentional: end-user installs anchor
-        # there; dev batons are repo-qualified so never hit the default).
-        mock_fetch.assert_called_once_with("455", repo=mod._DEFAULT_GITHUB_REPO)
+        # repo kwarg since #1715: a qualified anchor fetches ITS OWN repo.
+        # (#1918: a bare anchor has no default repo and is never fetched.)
+        mock_fetch.assert_called_once_with("455", repo="example-org/example-repo")
         assert result == "MERGED"
 
     def test_stale_entry_updates_cache(self, tmp_engram_home):
@@ -298,14 +307,14 @@ class TestCacheStale:
         mod = _load_hook_module(tmp_engram_home)
 
         stale_time = time.time() - 60
-        cache = {"pr/100": {"fetched_at": stale_time, "render": "OLD"}}
+        cache = {"pr/example-org/example-repo/100": {"fetched_at": stale_time, "render": "OLD"}}
 
         with patch.object(mod, "_fetch_pr_status", return_value="OPEN"):
-            mod._get_live_status("pr/100", cache)
+            mod._get_live_status("pr/example-org/example-repo/100", cache)
 
         # Cache should now have the fresh value
-        assert cache["pr/100"]["render"] == "OPEN"
-        assert cache["pr/100"]["fetched_at"] > stale_time
+        assert cache["pr/example-org/example-repo/100"]["render"] == "OPEN"
+        assert cache["pr/example-org/example-repo/100"]["fetched_at"] > stale_time
 
 
 # ===========================================================================
@@ -321,13 +330,13 @@ class TestQuickFail:
 
         # Stale cache entry available
         stale_time = time.time() - 60
-        cache = {"pr/200": {"fetched_at": stale_time, "render": "OPEN (fallback)"}}
+        cache = {"pr/example-org/example-repo/200": {"fetched_at": stale_time, "render": "OPEN (fallback)"}}
 
         with patch.object(
             mod, "_fetch_pr_status",
             side_effect=subprocess.TimeoutExpired(cmd="gh", timeout=4)
         ):
-            result = mod._get_live_status("pr/200", cache)
+            result = mod._get_live_status("pr/example-org/example-repo/200", cache)
 
         # Should fall back to stale cached render
         assert result == "OPEN (fallback)"
@@ -339,7 +348,7 @@ class TestQuickFail:
         cache = {}  # No cache at all
 
         with patch.object(mod, "_fetch_pr_status", return_value=None):
-            result = mod._get_live_status("pr/300", cache)
+            result = mod._get_live_status("pr/example-org/example-repo/300", cache)
 
         assert result == ""
 
@@ -354,7 +363,7 @@ class TestQuickFail:
             side_effect=RuntimeError("unexpected")
         ):
             # _get_live_status wraps in try/except — should never raise
-            result = mod._get_live_status("pr/400", cache)
+            result = mod._get_live_status("pr/example-org/example-repo/400", cache)
 
         assert result == ""
 
@@ -478,7 +487,7 @@ class TestCachePersistence:
 
         cache = {}
         with patch.object(mod, "_fetch_pr_status", return_value="OPEN"):
-            mod._get_live_status("pr/900", cache)
+            mod._get_live_status("pr/example-org/example-repo/900", cache)
 
         # Save the cache as main() would
         mod._save_cache(cache)
@@ -486,8 +495,8 @@ class TestCachePersistence:
         cache_file = tmp_engram_home / "baton-status-cache.json"
         assert cache_file.exists()
         saved = json.loads(cache_file.read_text())
-        assert "pr/900" in saved
-        assert saved["pr/900"]["render"] == "OPEN"
+        assert "pr/example-org/example-repo/900" in saved
+        assert saved["pr/example-org/example-repo/900"]["render"] == "OPEN"
 
     def test_cache_load_roundtrip(self, tmp_engram_home):
         """_save_cache / _load_cache round-trip preserves entries."""
@@ -532,9 +541,9 @@ class TestLiveClauseInOutput:
         appends the clause.  Also verifies that the cache file persists after
         the main() pass (main() calls _save_cache with the non-empty cache).
 
-        Note: the live clause originates from the PR-NNN id fallback anchor
-        (project_id PR-1000 → pr/1000), not from a github: frontmatter field
-        (which the /api/projects list endpoint no longer carries).
+        Note: #1918 -- the live clause now needs a repo-QUALIFIED anchor
+        (github: pr/<owner>/<repo>/1000); a bare PR-NNN id fallback anchor
+        has no repo and renders "needs a qualified anchor" instead.
         """
         _write_config(tmp_engram_home)
         mod = _load_hook_module(tmp_engram_home)
@@ -542,7 +551,7 @@ class TestLiveClauseInOutput:
         # Pre-populate cache so _get_live_status returns without calling gh.
         cache_file = tmp_engram_home / "baton-status-cache.json"
         cache_file.write_text(json.dumps({
-            "pr/1000": {
+            "pr/example-org/example-repo/1000": {
                 "fetched_at": time.time(),
                 "render": "OPEN · review:APPROVED",
             }
@@ -554,6 +563,7 @@ class TestLiveClauseInOutput:
                 "PR-1000",
                 turn="ariadne",
                 turn_reason="needs final review",
+                github="pr/example-org/example-repo/1000",
             )],
             gh_ok=True,
         )
@@ -658,7 +668,8 @@ def test_tools_resolution_in_flattened_deployed_topology(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     (home / "config.json").write_text(
-        json.dumps({"mode": "multi", "agent_name": "ariadne"})
+        json.dumps({"mode": "multi", "agent_name": "ariadne",
+                    "forum": {"url": "http://127.0.0.1:5002"}})
     )
     env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
     env["ENGRAM_HOME"] = str(home)

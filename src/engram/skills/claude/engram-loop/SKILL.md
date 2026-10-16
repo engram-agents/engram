@@ -320,7 +320,7 @@ pending-work — not just an "I'm looping" flag:
 ```bash
 cat > ~/.engram/loop-mode.json <<JSON
 {
-  "FIRST_ACTION": "THE RE-ARM NOW HAPPENS LAST, NOT FIRST — see Step 2 item 3 (arm-last ritual; if the turn carries a reply the human must see, item 3's reply-carrying split applies: batch the arm with a sibling tool call in one parallel block, reply as the turn's final text, #2098). Do the iteration's actual work first, using this marker's 'state' + 'instructions' fields. At the END of the turn — the FINAL action, after the work is done AND this marker's 'state' field is rewritten to reflect it: ScheduleWakeup at cadence_seconds, unconditionally (no CronList-before-arm check — replacement is unconditional, so a redundant arm is free, never stacks). For the prompt COPY THIS FILE'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word 'stub' invites paraphrasing, so don't. Then CronList again and confirm the armed prompt actually LEADS with the <loop-wake> marker — an ABSENT marker, or one that is present but not leading, makes the wake self-stamp as user activity and the loop defers perpetually. An escaped &lt;loop-wake&gt; is fine: the classifiers HTML-unescape before matching, so a mangled marker still classifies correctly; absence and position are what they cannot rescue.",
+  "FIRST_ACTION": "THE RE-ARM NOW HAPPENS LAST, NOT FIRST — see Step 2 item 3 (arm-last ritual; if the turn carries a reply the human must see, item 3's reply-carrying split applies: batch the arm with a sibling tool call in one parallel block, reply as the turn's final text, #2098). Do the iteration's actual work first, using this marker's 'state' + 'instructions' fields. At the END of the turn — the FINAL action, after the work is done AND this marker's 'state' field is rewritten to reflect it: ask the helper for this turn's delay (\"${CLAUDE_PLUGIN_ROOT:-$HOME/.engram/marketplace/plugins/engram}/tools/loop_prompt.py\" --rearm-delay --wake-kind heartbeat|other, Step 2 item 3c) and ScheduleWakeup at the integer it prints, unconditionally (no CronList-before-arm check — replacement is unconditional, so a redundant arm is free, never stacks). For the prompt COPY THIS FILE'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word 'stub' invites paraphrasing, so don't. Then CronList again and confirm the armed prompt actually LEADS with the <loop-wake> marker — an ABSENT marker, or one that is present but not leading, makes the wake self-stamp as user activity and the loop defers perpetually. An escaped &lt;loop-wake&gt; is fine: the classifiers HTML-unescape before matching, so a mangled marker still classifies correctly; absence and position are what they cannot rescue.",
   "activated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "kind": "work|research|autonomous|heartbeat",
   "topic": "<one-line loop topic>",
@@ -339,9 +339,11 @@ JSON
   field name marks *reading* order, not *execution* order: read this first
   so the end-of-turn arm invariant is in view before diving into `state` and
   letting it degrade into something to remember. **This is the BACKSTOP; the
-  wake prompt (Step 2 §2) is the primary channel** — the marker gets
-  rewritten wholesale each iteration, so an invariant living here can be
-  silently lost, whereas the prompt cannot. Keep both: they fail differently
+  wake prompt (Step 2 §2) is the primary channel** — the prompt is written
+  once per arm and consumed immediately, whereas the marker's `state` field
+  is rewritten every iteration (the `jq` patch — Step 2 item 3b), so an
+  invariant parked in `state` can be silently lost. Keep both: they fail
+  differently
   (a hand-armed wake missing the stub is caught by this field; a first arm
   that omitted the line propagates through every later arm and is caught
   only here). Never reorder it below `state`. The text is fixed; copy it
@@ -354,9 +356,21 @@ JSON
 - `state` — the live handoff, **rewritten each iteration** (Step 2 item 3b) so
   the marker always reflects where the loop is. This is what a post-compaction
   self (or a teammate) reads to resume.
+- `cadence_seconds` — the loop's **input** cadence: hand-written at the
+  template's `1800` default, and overwritten whenever a cadence is named
+  (Step 2 item 1's cases (a)/(b)). It is the interval the helper (Step 2
+  item 3c) prints and the arm obeys. Unlike `next_due_at` below it is INPUT,
+  not derived — hand-writing it is correct and expected.
 - `loop_prompt` — the exact text passed to `ScheduleWakeup`'s `prompt` parameter.
   The deference-detector cooldown hook uses this to distinguish cron heartbeats
   from real user messages.
+- `next_due_at` — **never hand-written, and deliberately absent from the
+  template above.** The helper
+  (`"${CLAUDE_PLUGIN_ROOT:-$HOME/.engram/marketplace/plugins/engram}/tools/loop_prompt.py" --rearm-delay`, Step 2 item 3c) creates it on the
+  FIRST arm (the heartbeat, R1) and is its **single writer** thereafter
+  (#3005). Do not add it to this heredoc and do not hand-type a timestamp: a
+  hand-typed value is exactly the silent full-cadence fallback the
+  preserve-deadline fix exists to prevent.
 
 **Why the marker carries the state, not the wakeup prompt:** it makes the armed
 prompt a tiny self-declaring stub (Step 2), and keeps the canonical loop state on
@@ -432,9 +446,19 @@ cannot be stale.)*
        (e.g., "loop every 30 minutes", "wake me hourly"). A user-named
        cadence persists for the loop's duration — apply it on every
        re-arm until the user changes it; no per-iteration re-confirmation.
+       **Record that cadence in the marker's `cadence_seconds`** — that
+       field is the value the helper (item 3c) prints and the arm obeys, so
+       it is the one path by which a named cadence reaches the wake. Write
+       it as a NUMBER, with `--argjson` (item 3b explains why):
+
+       ```bash
+       tmp=$(mktemp ~/.engram/loop-mode.json.XXXXXX) && jq --argjson c 3300 '.cadence_seconds = $c' ~/.engram/loop-mode.json > "$tmp" \
+         && mv "$tmp" ~/.engram/loop-mode.json
+       ```
    (b) The loop is watching a long-period external signal the user has named
        (a CI run, a deploy ETA, a remote queue) — and the cadence matches
-       that signal.
+       that signal. **Record it in `cadence_seconds` too (the same write
+       as (a)).**
 
    Self-selecting an interval beyond the 1800s default as an "idle fallback"
    is a discipline lapse, not a sensible default — even when the queue feels
@@ -442,8 +466,8 @@ cannot be stale.)*
    the Monitor, not the heartbeat).
 
    **Never omit the re-arm.** The heartbeat is the loop's lifeline — at the
-   end of every iteration, re-arm `ScheduleWakeup` (1800s, or the
-   user-named cadence from case (a)/(b)) before ending the turn. Even when
+   end of every iteration, re-arm `ScheduleWakeup` at the delay the helper
+   prints (Step 2 item 3c) before ending the turn. Even when
    pacing at a slower interval, the loop continues; only an explicit user
    "stop" ends it. Without the re-arm, the loop becomes unreachable except
    via fairy task-notifications + new user input, creating a stuck state the
@@ -484,22 +508,32 @@ cannot be stale.)*
    > not execute.** If present → continue per its contents: do the iteration's
    > work, rewrite the marker's `state` to reflect what the burst produced,
    > and **at the END of the turn — the FINAL action, only after the work and
-   > the state-rewrite are done — `ScheduleWakeup` at this loop's cadence with
-   > this same stub** (unconditionally; no check-before-arm). Then `CronList`
+   > the state-rewrite are done — `ScheduleWakeup` at **the delay the helper
+   > prints** (Step 2 item 3c) with this same stub** (unconditionally; no
+   > check-before-arm). Then `CronList`
    > to confirm the armed prompt leads with `<loop-wake>`. **If this turn's
    > work includes a reply the human must see: batch the arm WITH a sibling
    > tool call (the marker `state` rewrite is the natural one) in a single
    > parallel block, then put the reply after it as the turn's FINAL text —
    > a solo arm ends the turn and a trailing arm swallows the reply (Step 2
    > item 3's reply-carrying split, #2098).***
+   >
+   > ⟦ENGRAM⟧⟦/ENGRAM⟧
+
+   The stub's LAST line is the **empty ENGRAM marker** — keep it, verbatim,
+   as the final line of the armed prompt. A loop-wake has no meaningful text to
+   recall on, and the empty marker tells the recall hooks to skip recall for
+   that message (#3613). `format_loop_prompt` adds it for you when the core you
+   pass has none, and never adds a second one when it is already there.
 
    **The re-arm line lives in the PROMPT, and that is the primary channel —
    not the marker.** Two reasons, and the first is the load-bearing one:
 
-   - **The marker is rewritten wholesale every iteration** (`cat > …loop-mode.json`).
-     An invariant stored inside mutable per-iteration state is one careless
-     heredoc away from vanishing, and its absence is silent. The prompt is
-     written once per arm and consumed immediately — nothing rewrites it.
+   - **The marker's `state` field is rewritten every iteration** (Step 2 item
+     3b's `jq` patch). An invariant stored inside mutable per-iteration state
+     is one careless edit away from vanishing, and its absence is silent. The
+     prompt is written once per arm and consumed immediately — nothing
+     rewrites it.
    - **The prompt ARRIVES; the marker must be FETCHED.** The stub *is* the wake:
      it is in context the moment the turn starts, with no read required to
      see it. Keeping the arm-at-end instruction here means it can't be missed
@@ -529,13 +563,45 @@ cannot be stale.)*
    the marker's `state` is rewritten:
 
    a. *…do the iteration's actual work…*
-   b. **Rewrite the marker's `state`** via `cat > ~/.engram/loop-mode.json` or
-      a `jq` patch: pending work, in-flight fairies, key node IDs, next step.
-      The marker is the CANONICAL HANDOFF; the wake prompt is just a pointer.
-   c. **`ScheduleWakeup` at `cadence_seconds`**, unconditionally — no
-      check-before-arm (removed above; a redundant arm replaces, never
-      stacks, and is free) — with the MINIMAL STUB prompt (per §2 above). Do
-      NOT stuff state into the prompt — the marker carries it.
+   b. **Rewrite the marker's `state`** with a **`jq` patch** — required for
+      iterations, not a `cat > … <<JSON` wholesale rewrite: pending work,
+      in-flight fairies, key node IDs, next step. (A wholesale rewrite
+      silently drops `next_due_at`, which makes the next non-heartbeat wake
+      migrate again — the #3005 defect, reintroduced silently. Step 1's FIRST
+      write is the one place the heredoc is correct.) The marker is the
+      CANONICAL HANDOFF; the wake prompt is just a pointer.
+
+      ```bash
+      tmp=$(mktemp ~/.engram/loop-mode.json.XXXXXX) \
+        && jq --arg s "<new state>" '.state = $s' ~/.engram/loop-mode.json > "$tmp" \
+        && mv "$tmp" ~/.engram/loop-mode.json
+      ```
+
+      `--arg` binds a **string** — right for `state`, wrong for any NUMERIC
+      field: a numeric patch (e.g. `cadence_seconds`) must use `--argjson`,
+      because `--arg c 3300` writes the string `"3300"`, which the helper
+      rejects and falls back to the 1800 default.
+
+   c. **Ask the helper for this turn's delay, then arm at it.** Run
+
+      ```bash
+      python3 "${CLAUDE_PLUGIN_ROOT:-$HOME/.engram/marketplace/plugins/engram}/tools/loop_prompt.py" --rearm-delay --wake-kind <KIND>
+      ```
+
+      and pass the integer it prints to `ScheduleWakeup` — unconditionally (no
+      check-before-arm: a redundant arm replaces, never stacks, and is free) —
+      with the MINIMAL STUB prompt (per §2 above). Do NOT stuff state into the
+      prompt — the marker carries it.
+
+      **`<KIND>` — heartbeat or other.** A wake whose prompt LEADS with
+      `<loop-wake>` is the **`heartbeat`**; **anything else — a Monitor expiry
+      notice, a DM, a baton flip, a human prompt — is `other`.** On
+      `heartbeat` the helper prints the full `cadence_seconds` and stamps
+      `next_due_at`; on `other` it prints the **remaining** time to that same
+      due moment, so a wake arriving early no longer pushes the deadline out.
+      A deadline already at or inside the last minute **clamps to 60s** (a real
+      wake rather than a busy loop), and the first arm that has to create
+      `next_due_at` prints a one-line migration notice on stderr.
    d. **Verify**: `CronList` and confirm the armed prompt actually LEADS with
       the `<loop-wake>` marker. The Stop hook now also checks this
       (`engram-loop-arm-stop-hook.py` gates on a `ScheduleWakeup` tool_CALL
@@ -546,8 +612,10 @@ cannot be stale.)*
    required, every iteration.** Both live at the end because both need the
    same thing: only there do you know what the burst actually produced, so
    only there can the handoff (`state`) be complete and the arm cover the
-   ground actually just travelled (the cadence resets from *now*, not from
-   when the burst started).
+   ground actually just travelled (on a heartbeat the cadence resets from
+   *now*, not from when the burst started; on any other wake, item 3c
+   PRESERVES the original deadline instead — a reset is exactly what #3005
+   removes).
 
    **Why arm-LAST is correct now, and it is the whole point of the step.**
    The 2026-07-31 incident below is real, and it's still the reason the
@@ -577,8 +645,11 @@ cannot be stale.)*
       cache warm" semantics.
 
    Because the rule is simply "arm at the end of every burst," a Monitor/DM/
-   peer wake's turn also ends with an arm, so the idle floor refreshes on
-   every real wake automatically, with no monitor-specific re-arm rule needed.
+   peer wake's turn also ends with an arm — and because such a wake is
+   `other`, that arm **preserves the original deadline** (item 3c) instead of
+   sliding it. That preservation **is** the monitor-specific re-arm rule: a
+   notice arriving faster than the cadence would otherwise push the due moment
+   out forever and the heartbeat would never fire (#3005).
 
    | forgotten | consequence | recoverable? |
    |---|---|---|

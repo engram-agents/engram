@@ -394,7 +394,7 @@ def test_set_status_missing_project_raises(store, allocator):
 
 def test_close_updates_status_and_appends_log(store, allocator):
     seq = close(
-        store, allocator, "PR-1",
+        store, allocator, "PR-1", invoker="ariadne",
         new_status="merged",
         reason="scope complete",
         ts="2026-06-26T12:00:00Z",
@@ -411,7 +411,7 @@ def test_close_updates_status_and_appends_log(store, allocator):
 def test_close_byte_exact_golden(store, allocator):
     """Byte-exact: log line format is '- {ts} close: {status} — {reason}'."""
     close(
-        store, allocator, "PR-1",
+        store, allocator, "PR-1", invoker="ariadne",
         new_status="merged",
         reason="scope complete",
         ts="2026-06-26T12:00:00Z",
@@ -423,7 +423,7 @@ def test_close_byte_exact_golden(store, allocator):
 def test_close_does_not_touch_turn_fields(store, allocator):
     """close() only mutates the status field; turn / turn_since / turn_reason are unchanged."""
     close(
-        store, allocator, "PR-1",
+        store, allocator, "PR-1", invoker="ariadne",
         new_status="merged",
         reason="done",
         ts="2026-06-26T12:00:00Z",
@@ -436,14 +436,14 @@ def test_close_does_not_touch_turn_fields(store, allocator):
 
 
 def test_close_returns_monotonic_seq(store, allocator):
-    seq1 = close(store, allocator, "PR-1", new_status="abandoned", reason="first")
-    seq2 = close(store, allocator, "PR-1", new_status="merged", reason="second")
+    seq1 = close(store, allocator, "PR-1", invoker="ariadne", new_status="abandoned", reason="first")
+    seq2 = close(store, allocator, "PR-1", invoker="ariadne", new_status="merged", reason="second")
     assert seq2 > seq1
 
 
 def test_close_missing_project_raises(store, allocator):
     with pytest.raises(ProjectNotFound):
-        close(store, allocator, "PR-nope", new_status="merged", reason="done")
+        close(store, allocator, "PR-nope", invoker="ariadne", new_status="merged", reason="done")
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +481,7 @@ def closed_allocator(closed_store):
 def test_reopen_updates_status_and_appends_log(closed_store, closed_allocator):
     seq = reopen(
         closed_store, closed_allocator, "PR-2",
-        invoker="luria",
+        invoker="ariadne",
         new_status="in-progress",
         ts="2026-06-26T12:00:00Z",
     )
@@ -498,19 +498,19 @@ def test_reopen_byte_exact_golden(closed_store, closed_allocator):
     """Byte-exact: log line format is '- {ts} reopened → {invoker}: status was {old} → {new}'."""
     reopen(
         closed_store, closed_allocator, "PR-2",
-        invoker="luria",
+        invoker="ariadne",
         new_status="in-progress",
         ts="2026-06-26T12:00:00Z",
     )
     raw = closed_store.read_project("PR-2")
-    assert "- 2026-06-26T12:00:00Z reopened → luria: status was merged → in-progress" in raw
+    assert "- 2026-06-26T12:00:00Z reopened → ariadne: status was merged → in-progress" in raw
 
 
 def test_reopen_reads_current_status_for_log(closed_store, closed_allocator):
     """The 'status was X' fragment must reflect the pre-reopen status read from the file, not a caller arg."""
     reopen(
         closed_store, closed_allocator, "PR-2",
-        invoker="luria",
+        invoker="ariadne",
         new_status="in-progress",
         ts="2026-06-26T12:00:00Z",
     )
@@ -522,7 +522,7 @@ def test_reopen_does_not_touch_turn_fields(closed_store, closed_allocator):
     """reopen() only mutates the status field; turn / turn_since / turn_reason are unchanged."""
     reopen(
         closed_store, closed_allocator, "PR-2",
-        invoker="luria",
+        invoker="ariadne",
         new_status="in-progress",
         ts="2026-06-26T12:00:00Z",
     )
@@ -535,7 +535,7 @@ def test_reopen_does_not_touch_turn_fields(closed_store, closed_allocator):
 
 def test_reopen_missing_project_raises(store, allocator):
     with pytest.raises(ProjectNotFound):
-        reopen(store, allocator, "PR-nope", invoker="luria", new_status="in-progress")
+        reopen(store, allocator, "PR-nope", invoker="ariadne", new_status="in-progress")
 
 
 # ---------------------------------------------------------------------------
@@ -1071,7 +1071,7 @@ def test_init_returns_seq_1_for_fresh_store(tmp_path):
 
 def test_merge_sets_status_and_log(store, allocator):
     seq = merge(store, allocator, "PR-1", merged_by="luria",
-                ts="2026-06-27T14:00:00Z")
+                ts="2026-06-27T14:00:00Z", require_participant=False)
     assert seq == 1
     raw = store.read_project("PR-1")
     # After merge, the file is archived — read_project returns None
@@ -1085,13 +1085,13 @@ def test_merge_sets_status_and_log(store, allocator):
 
 def test_merge_forced_log(store, allocator):
     seq = merge(store, allocator, "PR-1", merged_by="luria", forced=True,
-                ts="2026-06-27T14:00:00Z")
+                ts="2026-06-27T14:00:00Z", require_participant=False)
     archive_raw = (store.root / "archive" / "PR-1.md").read_text()
     assert "(FORCED past gates 3-4)" in archive_raw
 
 
 def test_merge_archives_to_archive_dir(store, allocator):
-    merge(store, allocator, "PR-1", merged_by="luria")
+    merge(store, allocator, "PR-1", merged_by="luria", require_participant=False)
     # file no longer in projects/
     assert not (store.projects_dir / "PR-1.md").exists()
     # file now in archive/
@@ -1149,7 +1149,7 @@ def test_archive_project_seq_suffix_increments(store):
 
 def test_recover_max_seq_counts_archived(store, allocator):
     # merge archives the file; seq must survive in recover_max_seq
-    seq = merge(store, allocator, "PR-1", merged_by="luria")
+    seq = merge(store, allocator, "PR-1", merged_by="luria", require_participant=False)
     hi = store.recover_max_seq()
     assert hi >= seq
 
@@ -1785,7 +1785,7 @@ class TestU2aRound3EightNewlyWiredConversions:
 
     def test_close_stamps_phase_on_legacy_baton(self, store, allocator):
         close(
-            store, allocator, "PR-1", new_status="merged", reason="closing",
+            store, allocator, "PR-1", invoker="ariadne", new_status="merged", reason="closing",
             phase="merge", ts="2026-09-30T00:00:00Z",
         )
         raw = store.read_project("PR-1")
@@ -1799,7 +1799,7 @@ class TestU2aRound3EightNewlyWiredConversions:
         s.write_project("PR-1", _baton_with_phase(turn="ariadne", phase="peer"), seq=0)
         a = SeqAllocator(recover=s.recover_max_seq)
         close(
-            s, a, "PR-1", new_status="merged", reason="closing",
+            s, a, "PR-1", invoker="ariadne", new_status="merged", reason="closing",
             phase="merge", ts="2026-09-30T00:00:00Z",
         )
         raw = s.read_project("PR-1")
@@ -1967,7 +1967,7 @@ class TestU2aRound3EightNewlyWiredConversions:
     def test_merge_stamps_phase_on_legacy_baton(self, store, allocator):
         merge(
             store, allocator, "PR-1", merged_by="luria",
-            phase="merge", ts="2026-09-30T00:00:00Z",
+            phase="merge", ts="2026-09-30T00:00:00Z", require_participant=False,
         )
         archive_raw = (store.root / "archive" / "PR-1.md").read_text()
         fields, _ = md.parse_frontmatter(archive_raw)
@@ -1981,7 +1981,7 @@ class TestU2aRound3EightNewlyWiredConversions:
         a = SeqAllocator(recover=s.recover_max_seq)
         merge(
             s, a, "PR-1", merged_by="luria",
-            phase="merge", ts="2026-09-30T00:00:00Z",
+            phase="merge", ts="2026-09-30T00:00:00Z", require_participant=False,
         )
         archive_raw = (s.root / "archive" / "PR-1.md").read_text()
         fields, _ = md.parse_frontmatter(archive_raw)

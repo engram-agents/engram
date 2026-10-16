@@ -38,6 +38,9 @@ from pathlib import Path
 from typing import NamedTuple, Optional, Union
 from urllib.parse import urlparse
 
+import engram_restamp as _restamp  # noqa: E402
+import engram_config_io as _config_io  # noqa: E402
+import engram_regular_io as _regular_io  # noqa: E402
 from engram_confidence import (  # noqa: E402
     CONFIDENCE_MAP,
     PREDICTIVE_CONFIDENCE_CAP,
@@ -49,6 +52,14 @@ from engram_confidence import (  # noqa: E402
     REASONING_CLASS,
     REASONING_DISCOUNT,
     ABDUCTIVE_CONFIDENCE_CAP,
+)
+# The one definition of "not searchable" lives in a stdlib-only module so the
+# surface hook (which cannot import this file) builds the rule from the same
+# source. Re-exported here under the original names.
+from engram_search_rules import (  # noqa: E402,F401
+    SEARCH_EXCLUDED_TYPES,
+    not_search_excluded_sql as _not_search_excluded_sql,
+    searchable_where_sql as _searchable_where_sql,
 )
 
 
@@ -113,6 +124,18 @@ class EmbeddingManager:
         self._model = None
         self._model_name = None
         self._failed_models = set()  # cache download failures
+        # #345 PR3 B2 Rider 1: a SIBLING dict, not a repurposing of
+        # _failed_models itself. _failed_models stays a plain set with its
+        # existing semantics (server.py's pre-warm .add(), several tests'
+        # .discard()) completely unchanged — converting it to a dict would
+        # silently break every existing .discard() call (dict has no such
+        # method). This dict tracks ONLY the cooldown state the write path
+        # needs: model_name -> the UTC ISO timestamp of the last in-write
+        # revive() attempt that STILL failed. Absence of a key (or an
+        # expired entry) means the next failing write may revive
+        # immediately -- matching "a model put into the failed state with
+        # NO timestamp... may be revived on the first failing write."
+        self._revive_cooldown: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def _load_model(self, model_name: str):
@@ -217,6 +240,105 @@ class EmbeddingManager:
             vectors = self._model.encode(texts, convert_to_numpy=True)
         return vectors.tolist()
 
+    def _load_model_local_only(self, model_name: str) -> None:
+        """Load the model from the LOCAL HuggingFace cache ONLY -- no
+        online fallback (#345 PR3 M4, Kepler's ruling seq 6544, on Mira's
+        finding seq 6539 during PR#3343's round-3 review).
+
+        Used ONLY by revive(), which runs INSIDE the caller's open write
+        transaction (_compute_and_store_embedding_with_revive -- the
+        caller does not commit until after _stamp_new_node returns). A
+        network download under that open transaction would hold the
+        writer's lock for an UNBOUNDED network round-trip; a local-cache
+        load is disk-bound and seconds-scale, not network-bound.
+        _load_model's own online-fallback branch stays exactly as it was
+        for SERVER START, which runs outside any write transaction. The
+        operator remedy for a genuine re-download (a cache that was never
+        populated, or a model name that changed) stays `/mcp` reconnect,
+        which goes through the ordinary, full-fallback _load_model path,
+        never this one.
+
+        Same double-checked-locking shape as _load_model (fast path
+        outside the lock, re-check inside) -- must be called OUTSIDE
+        self._lock by the caller, same reentrancy constraint revive()'s
+        own docstring explains.
+
+        On failure, re-adds model_name to `_failed_models` with NO
+        timestamp -- same as any other first-time load failure; the
+        write-path wrapper's own cooldown dict (`_revive_cooldown`) is
+        what actually prevents a retry storm against a genuinely-dead
+        local cache.
+        """
+        if self._model is not None and self._model_name == model_name:
+            return
+        if model_name in self._failed_models:
+            return
+        with self._lock:
+            if self._model is not None and self._model_name == model_name:
+                return
+            if model_name in self._failed_models:
+                return
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._model = SentenceTransformer(model_name, local_files_only=True)
+                self._model_name = model_name
+            except Exception as e:
+                import sys
+                print(
+                    f"[engram] revive(): local-cache-only reload of "
+                    f"'{model_name}' failed (no online fallback -- this "
+                    f"runs inside an open write transaction): {e}",
+                    file=sys.stderr,
+                )
+                self._model = None
+                self._model_name = None
+                self._failed_models.add(model_name)
+
+    def revive(self, model_name: str) -> bool:
+        """Drop a failed model and attempt to reload it, in-process only
+        (#345 PR3 B2).
+
+        Called by the write path at most once per failing write (and only
+        when no cooldown is active — see EMBED_REVIVE_COOLDOWN_S and
+        _compute_and_store_embedding_with_revive). NEVER touches the
+        surface daemon or any other process — Kepler's ruling (#345):
+        "it is a separate supervised process; the write path must not
+        reach across."
+
+        The cached model and model_name are cleared, and model_name is
+        removed from `_failed_models`, UNDER self._lock -- then
+        _load_model_local_only(model_name) is called OUTSIDE the lock.
+        This two-step shape (rather than holding self._lock across the
+        whole method) is deliberate and necessary: self._lock is a plain
+        threading.Lock (non-reentrant), and _load_model_local_only
+        acquires it again internally on the slow path -- calling it while
+        still holding the lock here would self-deadlock. Its own
+        double-checked-locking already gives the reload its correctness
+        guarantee.
+
+        Round 4 (M4, Kepler's ruling): reloads LOCAL-FILES-ONLY ONLY --
+        see _load_model_local_only's own docstring for why this must
+        never fall back to an online download. The in-write cost bound
+        is therefore ONE LOCAL model load (seconds, disk-bound -- NOT the
+        0.06-0.26s figure in _compute_and_store_embedding_with_revive's
+        docstring, which was a cached in-process reload measured on one
+        Mac seat and is not an upper bound for a genuine local-disk
+        load), at most once per EMBED_REVIVE_COOLDOWN_S, inside the
+        writer's open transaction.
+
+        Returns True if the model is now loaded and usable, False if the
+        reload failed (in which case _load_model_local_only's own except
+        block has already re-added model_name to `_failed_models`, with
+        no timestamp -- same as any other first-time load failure).
+        """
+        with self._lock:
+            if self._model_name == model_name:
+                self._model = None
+                self._model_name = None
+            self._failed_models.discard(model_name)
+        self._load_model_local_only(model_name)
+        return self._model is not None and self._model_name == model_name
+
     @staticmethod
     def cosine_similarity(a: list[float], b: list[float]) -> float:
         """Compute cosine similarity between two vectors."""
@@ -290,6 +412,299 @@ _db_setup_done_paths: set[str] = set()
 _db_setup_lock = threading.Lock()
 
 
+# ── #3767: cross-process lock around the one-time DB setup ──────────────────
+# _db_setup_lock above only serializes THREADS of one process. The setup is
+# not one SQLite transaction (it opens with executescript, which COMMITs,
+# commits between steps, and writes a pre-migration backup FILE mid-way), so
+# a BEGIN IMMEDIATE cannot span it: the first internal commit releases the
+# write lock and a second process walks in mid-setup. Two processes starting
+# at once (e.g. the flag-OFF session-start path and the MCP server) therefore
+# could both run a rung -- measured: doubled edit_history rows and a doubled
+# pre-migration backup. An exclusive flock on a sidecar lock directory
+# serializes the WHOLE setup instead, and the kernel releases it when the
+# holder dies, so a crashed holder cannot leave a stale lock.
+#
+# Two caller classes, chosen explicitly by the caller (never guessed):
+#   "hook"   -- a harness-budgeted hook fire. Try the lock for at most
+#               SETUP_LOCK_HOOK_WAIT_S; still held -> raise DbSetupLockBusy
+#               (the hook skips its DB-dependent blocks for this fire).
+#   "server" -- MCP server start, CLI, anything without a harness budget
+#               (the DEFAULT). Wait up to SETUP_LOCK_SERVER_WAIT_S, logging
+#               to stderr every SETUP_LOCK_LOG_INTERVAL_S; then
+#               DbSetupLockTimeout.
+# Neither class ever runs the setup unlocked. 600 s rests on two seats' rung-4
+# re-embed timings at <= 11k nodes; a larger store or a slower embedder can
+# exceed it, and then the server fails loud rather than hanging.
+# The lock object is a 0700 DIRECTORY, <db>.setup.lockdir (#3791 C), not a file:
+# a lock FILE can be hard-linked by another account, and refusing a hard-linked
+# lock file meant telling the user to delete it, which lets a fresh process in
+# beside a live holder. A directory cannot be hard-linked. `<db>.setup.lock`
+# FILES left by the previous version are LEGACY: ignored, never touched, never
+# mentioned. The pid of the holder is written to the regular file `holder`
+# inside the directory, for the wait messages only; exclusion is the flock.
+# Mixed-version bound: an OLD (file-locking) process whose setup overlaps a NEW
+# (directory-locking) process's setup takes a different lock object, so the two
+# do not exclude each other for that one overlap. Accepted by the design seat:
+# closing it would need the new code to also take the old file lock, which
+# brings back the hard-link refusal and its delete remedy this change removes.
+SETUP_LOCK_SUFFIX = ".setup.lockdir"
+SETUP_LOCK_HOLDER_NAME = "holder"
+SETUP_LOCK_HOOK_WAIT_S = 2
+SETUP_LOCK_SERVER_WAIT_S = 600
+SETUP_LOCK_LOG_INTERVAL_S = 15
+_SETUP_LOCK_POLL_S = 0.05
+SETUP_WAIT_HOOK = "hook"
+SETUP_WAIT_SERVER = "server"
+
+
+class DbSetupLockError(RuntimeError):
+    """Base for the setup-lock failures. The setup did NOT run."""
+
+
+class DbSetupLockBusy(DbSetupLockError):
+    """HOOK class: the setup lock was still held after SETUP_LOCK_HOOK_WAIT_S."""
+
+
+class DbSetupLockTimeout(DbSetupLockError):
+    """SERVER class: the setup lock was still held after SETUP_LOCK_SERVER_WAIT_S."""
+
+
+class DbSetupLockUnusable(DbSetupLockError):
+    """The lock directory could not be opened, validated or flocked; setup refused to run unlocked."""
+
+
+def _read_setup_lock_holder_pid(dir_fd: int) -> str:
+    """Best-effort holder pid, from the `holder` file inside the lock directory
+    (opened relative to the directory fd we hold). Informational only -- never
+    liveness and never exclusion (the flock on the directory is the truth).
+
+    Never blocks: O_NONBLOCK, so a FIFO planted at that name cannot stall the
+    waiter, and a non-regular file is not read at all. "unknown" on ANY
+    failure (absent, unreadable, garbage, not a regular file).
+    """
+    fd = None
+    try:
+        import stat as _stat
+
+        fd = os.open(
+            SETUP_LOCK_HOLDER_NAME,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+            dir_fd=dir_fd,
+        )
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            return "unknown"
+        parts = os.read(fd, 64).decode("ascii", "replace").split()
+        if parts and parts[0].isascii() and parts[0].isdigit():
+            return parts[0]
+        return "unknown"
+    except Exception:
+        return "unknown"
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+
+def _open_db_setup_lock_dir(lock_path: str) -> int:
+    """Create (if absent) + open + validate the setup lock DIRECTORY; return the
+    open fd (not yet flocked).
+
+    #3791 (C): the lock object is a directory, not a file. A directory cannot
+    be hard-linked, and only its owner can open a 0700 one, so no other account
+    can hold the lock and stall every start. Created 0700 (a lost create race,
+    FileExistsError, is fine), opened O_RDONLY|O_DIRECTORY|O_NOFOLLOW: a
+    symlink or a non-directory at the name is refused, never followed.
+    The owner check compares against the EFFECTIVE uid, so a lock directory
+    owned by another account is refused even when running as root.
+
+    Every failure raises DbSetupLockUnusable naming the path. Called again by
+    _acquire_db_setup_lock when the post-flock inode recheck finds the name no
+    longer refers to the locked directory (#3791).
+    """
+    fd = None
+    try:
+        import errno as _errno
+        import stat as _stat
+
+        try:
+            os.mkdir(lock_path, 0o700)
+        except FileExistsError:
+            pass
+        try:
+            fd = os.open(lock_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as exc:
+            # Linux reports ENOTDIR (not ELOOP) for O_DIRECTORY|O_NOFOLLOW on a
+            # symlink, so tell the two apart by looking at the name itself.
+            try:
+                is_link = _stat.S_ISLNK(os.lstat(lock_path).st_mode)
+            except OSError:
+                is_link = False
+            if is_link:
+                raise OSError("is a symbolic link, not a directory") from exc
+            if exc.errno == _errno.ENOTDIR:
+                raise OSError("is not a directory") from exc
+            raise
+        st = os.fstat(fd)
+        if st.st_uid != os.geteuid():
+            raise OSError(
+                f"is owned by uid {st.st_uid}, not the current uid {os.geteuid()}"
+            )
+        mode = _stat.S_IMODE(st.st_mode)
+        if mode != 0o700:
+            # mkdir's mode is umask-filtered and ignored for an existing
+            # directory; fchmod makes the 0700 invariant hold regardless. If we
+            # cannot, refuse rather than lock under a directory other accounts
+            # can open.
+            try:
+                os.fchmod(fd, 0o700)
+            except Exception as exc:
+                what = "wider than 0o700" if mode & 0o077 else "not 0o700"
+                raise OSError(
+                    f"has mode {mode:#o}, {what}, and cannot be set to 0o700: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+    except Exception as exc:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        raise DbSetupLockUnusable(
+            f"cannot use setup lock directory {lock_path}: {type(exc).__name__}: {exc}; "
+            f"refusing to run the one-time DB setup without it"
+        ) from exc
+    return fd
+
+
+def _lock_fd_names_path(fd: int, lock_path: str) -> bool:
+    """True iff fd and lock_path name the same file (st_dev, st_ino). A missing
+    name (deleted, not re-created) is a mismatch, not an error."""
+    try:
+        cur = os.stat(lock_path, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    st = os.fstat(fd)
+    return (st.st_dev, st.st_ino) == (cur.st_dev, cur.st_ino)
+
+
+def _acquire_db_setup_lock(setup_wait: str) -> int:
+    """Take the exclusive cross-process setup lock; return the open fd.
+
+    The caller MUST pass the fd to _release_db_setup_lock in a finally. Raises
+    DbSetupLockBusy / DbSetupLockTimeout / DbSetupLockUnusable (all
+    DbSetupLockError) and NEVER degrades to running unlocked -- deliberately
+    NOT _with_state_lock's degrade-to-unlocked path: proceeding without the
+    lock IS the race this lock exists to close.
+    """
+    if setup_wait == SETUP_WAIT_HOOK:
+        wait_s, is_hook = SETUP_LOCK_HOOK_WAIT_S, True
+    elif setup_wait == SETUP_WAIT_SERVER:
+        wait_s, is_hook = SETUP_LOCK_SERVER_WAIT_S, False
+    else:
+        raise ValueError(
+            f"setup_wait must be {SETUP_WAIT_HOOK!r} or {SETUP_WAIT_SERVER!r}, got {setup_wait!r}"
+        )
+    lock_path = str(DB_PATH) + SETUP_LOCK_SUFFIX
+    try:
+        import fcntl
+    except Exception as exc:
+        raise DbSetupLockUnusable(
+            f"cannot use setup lock directory {lock_path}: {type(exc).__name__}: {exc}; "
+            f"refusing to run the one-time DB setup without it"
+        ) from exc
+    fd = _open_db_setup_lock_dir(lock_path)
+    deadline = time.monotonic() + wait_s
+    next_log = 0.0
+
+    def _expired(holder):
+        if is_hook:
+            return DbSetupLockBusy(
+                f"ENGRAM is upgrading its store in another process (pid {holder}); "
+                f"memory blocks skipped this time"
+            )
+        return DbSetupLockTimeout(
+            f"timed out after {wait_s}s waiting for setup lock {lock_path} held by "
+            f"pid {holder}; the store was left untouched"
+        )
+
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass  # EWOULDBLOCK/EAGAIN: held by another process -- wait below
+            else:
+                # #3791 (A): recheck that the fd we now hold still IS the
+                # directory at the path. CLOSES: a waiter that was blocked on
+                # the OLD inode when the name went away -- it now holds an
+                # orphaned inode and would otherwise run beside a fresh process
+                # that created the new directory; here it closes, re-opens
+                # (re-creating the directory) and retries inside the SAME
+                # deadline. DOES NOT CLOSE: a FRESH process arriving after the
+                # name went away creates a new inode, locks it at once and
+                # passes its own recheck, so it runs beside the ORIGINAL
+                # holder. No ENGRAM code removes the directory and no message
+                # tells anyone to; only someone doing it by hand opens that
+                # window. A missing name counts as a mismatch.
+                if _lock_fd_names_path(fd, lock_path):
+                    break
+                if time.monotonic() >= deadline:
+                    raise _expired(_read_setup_lock_holder_pid(fd))
+                os.close(fd)
+                fd = None
+                time.sleep(min(_SETUP_LOCK_POLL_S, max(deadline - time.monotonic(), 0.001)))
+                fd = _open_db_setup_lock_dir(lock_path)
+                continue
+            now = time.monotonic()
+            holder = _read_setup_lock_holder_pid(fd)
+            if now >= deadline:
+                raise _expired(holder)
+            if not is_hook and now >= next_log:
+                print(
+                    f"[engram] waiting for setup lock held by pid {holder} ({lock_path})",
+                    file=sys.stderr,
+                )
+                next_log = now + SETUP_LOCK_LOG_INTERVAL_S
+            time.sleep(min(_SETUP_LOCK_POLL_S, max(deadline - now, 0.001)))
+    except DbSetupLockError:
+        if fd is not None:
+            os.close(fd)
+        raise
+    except Exception as exc:
+        if fd is not None:
+            os.close(fd)
+        raise DbSetupLockUnusable(
+            f"cannot flock setup lock directory {lock_path}: {type(exc).__name__}: {exc}; "
+            f"refusing to run the one-time DB setup without it"
+        ) from exc
+    # Holder pid: informational only (both wait messages name it). Written only
+    # now that the flock is HELD, so a waiter can never overwrite the holder's
+    # file. A strict regular-file write (refuses FIFO / symlink / hard link);
+    # any failure just leaves the pid unknown to waiters.
+    try:
+        _regular_io.write_pidfile(
+            os.path.join(lock_path, SETUP_LOCK_HOLDER_NAME),
+            f"{os.getpid()}\n".encode("ascii"),
+        )
+    except Exception:
+        pass
+    return fd
+
+
+def _release_db_setup_lock(fd: int) -> None:
+    try:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+
+
 def _configure_paths(data_dir: str | Path) -> None:
     """Reconfigure ALL module-level path globals from a single data_dir.
 
@@ -322,28 +737,11 @@ def _configure_paths(data_dir: str | Path) -> None:
     _walguard_disabled_logged = False
 
 
-USE_ALPHA = {
-    # Tier 1 — deep cognitive load
-    "derive":          0.15,
-    "supersede":       0.15,
-    "contradict":      0.15,
-    "resolve":         0.15,
-    "lesson_incident":   0.15,  # legacy key; preserved for backward-compat
-    "register_exemplar": 0.15,  # unified key (used by engram_register_exemplar)
-    # Tier 2 — moderate engagement
-    "inspect":         0.10,
-    "subgraph":        0.10,
-    "mention":         0.10,
-    "focus":           0.10,  # focus_swap also uses this key — both outgoing+incoming sets
-    "history":         0.10,
-    "citation":        0.10,
-    # Tier 3 — loose touch
-    "focus_load":      0.05,
-    "unfocus":         0.05,
-}
-
-
-USE_ALPHA_DEFAULT = 0.10  # Fallback for unknown actions
+# The use-action table, its default alpha and the Q-update live in the
+# lightweight engram_restamp module (shared with the mention Stop hook); these
+# are re-exports so no caller or server.py re-export changes.
+USE_ALPHA = _restamp.USE_ALPHA
+USE_ALPHA_DEFAULT = _restamp.USE_ALPHA_DEFAULT
 
 
 UTIL_BETA = 0.10
@@ -437,7 +835,7 @@ def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
 
             # Write default config
             if not CONFIG_PATH.exists():
-                CONFIG_PATH.write_text(json.dumps({
+                _config_io.write_config_json(CONFIG_PATH, {
                     "trust_pool": [],
                     "confidence_map": CONFIDENCE_MAP,
                     "memory": {
@@ -447,7 +845,7 @@ def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
                     },
                     "mode": "single",
                     "counterparts": [],
-                }))
+                })
 
             _ensure_data_dir()
             yield sandbox_path
@@ -467,6 +865,22 @@ def _as_csv(v) -> str:
     if isinstance(v, list):
         return ",".join(str(x) for x in v)
     return v or ""
+
+
+# Contradiction status vocabulary (#3355). Two DIFFERENT questions, two different sets;
+# do not unify them.
+#   UNSETTLED (this constant): "does this contradiction still need adjudication
+#   work?" -> active OR partially_resolved. Used by the obsolescence scan, reflect,
+#   and (pinned by test) the health measurement. `open` is QUESTION vocabulary and
+#   never a contradiction status.
+#   OPEN (#1654, `_open_contradiction_ids`): "has no resolves closure landed?" ->
+#   status 'active' only; deliberately NOT this set.
+UNSETTLED_CONTRADICTION_STATUSES = ("active", "partially_resolved")
+
+
+def _unsettled_contradiction_status_sql() -> str:
+    """``IN (...)`` placeholder list for UNSETTLED_CONTRADICTION_STATUSES."""
+    return ",".join("?" * len(UNSETTLED_CONTRADICTION_STATUSES))
 
 
 VALID_NODE_TYPES = {
@@ -589,6 +1003,92 @@ GENERALIZES_PRINCIPLE_TYPES = frozenset(
 )
 
 
+def _relation_endpoint_error(relation: str, source_row, target_row) -> "str | None":
+    """The relation-specific ENDPOINT-TYPE gates for writing ``relation``
+    between two nodes, or None when the pair is acceptable.
+
+    ONE guarded writer for these rules (#2243 step 3 part A): both
+    ``_add_edge_impl`` (a new edge) and ``_retype_edge_impl`` (an existing
+    edge's new relation) call this, so a re-type to X is refused with X's own
+    text exactly when add_edge to X would be refused for the same node types.
+    That equivalence is bounded to THESE node-type endpoint rules: a re-type
+    to ``subtask_of`` also runs the grounding-family cycle check, which
+    add_edge does not, so a re-type can be refused where add_edge would not be.
+    Rows need ``id`` and ``type``.
+
+    Covers: the ``instantiates`` boundary gates (#530: not a lesson target,
+    target in INSTANTIATES_TARGET_TYPES, claim-bearing source) and the
+    ``generalizes`` endpoint-pair rule (#2753 epic, WS1, D1), and the
+    ``bears_on`` rule (#3615: question source; claim-bearing or contradiction
+    target).
+
+    Deliberately NOT here: is-current checks and the already-exists no-op
+    (add-only), the ``generalizes`` cycle walk and the ``temporal_causal``
+    order check (applied generically by each caller).
+    """
+    source_id, target_id = source_row["id"], target_row["id"]
+    if relation == "instantiates":
+        if target_row["type"] == "lesson":
+            return (
+                f"'instantiates' does not accept lesson targets — an "
+                f"incident that is an instance of a lesson's pattern is "
+                f"wired via `exemplifies` (engram_register_exemplar / "
+                f"engram_lesson_register_incident), which feeds the "
+                f"tripwire engine. Target '{target_id}' is a lesson."
+            )
+        if target_row["type"] not in INSTANTIATES_TARGET_TYPES:
+            return (
+                f"'instantiates' targets must be one of "
+                f"{sorted(INSTANTIATES_TARGET_TYPES)} — the "
+                f"principle-family node the source realizes. Target "
+                f"'{target_id}' is type '{target_row['type']}'. For "
+                f"intent-shaped task→goal contribution use `serves`; "
+                f"for incident→lesson membership use `exemplifies`."
+            )
+        if not _is_claim_bearing(source_row["type"]):
+            return (
+                f"'instantiates' sources must be claim-bearing "
+                f"({sorted(CLAIM_BEARING_TYPES)}); source "
+                f"'{source_id}' is type '{source_row['type']}'."
+            )
+    if relation == "generalizes":
+        pair = (source_row["type"], target_row["type"])
+        if pair not in GENERALIZES_ALLOWED_PAIRS:
+            return (
+                f"'generalizes' does not accept a "
+                f"{source_row['type']} -> {target_row['type']} pair. "
+                f"Allowed: {sorted(GENERALIZES_ALLOWED_PAIRS)}. "
+                f"Concrete nodes keep `exemplifies` (incident -> "
+                f"lesson) / `instantiates` (claim -> principle) — "
+                f"`generalizes` is reserved for principle -> "
+                f"principle abstraction (source '{source_id}' is "
+                f"type '{source_row['type']}', target '{target_id}' is "
+                f"type '{target_row['type']}')."
+            )
+    if relation == "bears_on":
+        # #3615: question -> claim-bearing node (or contradiction). The target
+        # set is DERIVED from CLAIM_BEARING_TYPES (never re-listed, the
+        # #2252 rule) plus `contradiction`. Shared with engram_ask's strict
+        # `bears_on` field and with engram_retype_edge.
+        if source_row["type"] != "question":
+            return (
+                f"'bears_on' sources must be type 'question' — the edge says "
+                f"\"once this question is answered, the answer will count "
+                f"for or against the target\". Source '{source_id}' is type "
+                f"'{source_row['type']}'."
+            )
+        if (
+            target_row["type"] not in CLAIM_BEARING_TYPES
+            and target_row["type"] != "contradiction"
+        ):
+            return (
+                f"'bears_on' targets must be claim-bearing "
+                f"({sorted(CLAIM_BEARING_TYPES)}) or a 'contradiction'; "
+                f"target '{target_id}' is type '{target_row['type']}'."
+            )
+    return None
+
+
 VALID_RELATIONS = {
     "cites",
     "supported_by",
@@ -669,10 +1169,22 @@ VALID_RELATIONS = {
                      # (addable_after_creation/removable both True). Also
                      # writable at mint time via `generalized_by` on
                      # engram_add_lesson/engram_add_cornerstone.
-                     # dag=True (real structural acyclicity — see its
-                     # EDGE_CLASSIFICATIONS entry) and CYCLE-GUARDED AT
+                     # in the abstraction acyclicity family (real structural
+                     # acyclicity — see its EDGE_CLASSIFICATIONS entry) and CYCLE-GUARDED AT
                      # WRITE TIME (see _generalizes_cycle_path below), not
                      # merely audited after the fact.
+    "bears_on",  # #3615: question -> claim-bearing node (or contradiction):
+                 # "once this question is answered, the answer will count for
+                 # or against that claim". Direction-neutral, relevance only:
+                 # no cascade, no confidence propagation, DAG-exempt (the
+                 # answer may pre-date the question's filing), not grounding
+                 # (a promise about future evidence is not evidence).
+                 # Endpoints are enforced in
+                 # engram_core._relation_endpoint_error. Surfaced by
+                 # engram_resolve; its out-degree is engram_list's
+                 # sort_by="bears_on" priority signal. Addable/removable
+                 # after creation; also writable at ask time via
+                 # engram_ask's `bears_on` field.
 }
 
 
@@ -685,12 +1197,26 @@ VALID_RELATIONS = {
 #     order: source created at-or-after target). This is what every existing
 #     call site (the supersede/add_edge timestamp guards, the startup scan)
 #     actually measures, honestly named.
-#   dag — the real, structural property: is this relation safe from cycles?
+#   dag_family (#3210; replaced the bool `dag`) — the real, structural
+#     property: which acyclicity FAMILY, if any, is this relation in?
+#     "grounding" (cites, derives_from, acknowledged_derives_from,
+#     predicted_by, retracts, subtask_of, supersedes, supported_by: all point
+#     dependent -> premise), "abstraction" (generalizes), or None (not
+#     acyclicity-checked). A cycle is only meaningful WITHIN a family: grounding
+#     runs both ways relative to generality, so `generalizes` (general ->
+#     specific) cannot share one acyclicity check with it -- a deduction-shaped
+#     pair (specific supported_by general, general generalizes specific) is a
+#     legal 2-cycle in the union. Every walk -- the batch audit, the write-time
+#     guards, the retype guard -- derives its relation set from this field via
+#     dag_family_relations(), never a literal. `dag` is no longer a key;
+#     "is this relation acyclicity-checked" is `dag_family is not None`
+#     (== DAG_RELATIONS membership).
+#     Historical note, from when the key was the bool `dag`:
 #     For every relation that existed before this split, dag == temporal_causal
 #     (the two never diverged until now, so no relation needed re-judging).
 #     `acknowledged_derives_from` is the first and so far only relation where
-#     they differ: dag=True (a cycle through it would be genuinely bad — see
-#     its entry), temporal_causal=False (it is deliberately backwards in time,
+#     they differ: in the grounding family (a cycle through it would be
+#     genuinely bad — see its entry), temporal_causal=False (it is deliberately backwards in time,
 #     by construction).
 # dag is per-relation, not scoped to CASCADE_RELATIONS — structural relations
 # like supersedes/retracts/subtask_of need cycle protection too and are not
@@ -700,7 +1226,7 @@ EDGE_CLASSIFICATIONS = {
     "about": {
         "cascade": False,
         "temporal_causal": False,
-        "dag": False,
+        "dag_family": None,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -708,7 +1234,7 @@ EDGE_CLASSIFICATIONS = {
     "cites": {
         "cascade": False,
         "temporal_causal": True,
-        "dag": True,
+        "dag_family": "grounding",
         "removable": False,    # provenance load-bearing; removal would orphan claims
         "addable_after_creation": False,  # legacy dual-use; PR 3 introduces new relation for relevance-marking
         "provenance": True,
@@ -716,7 +1242,7 @@ EDGE_CLASSIFICATIONS = {
     "contradicts": {
         "cascade": False,
         "temporal_causal": False,    # advisory check exempts contradicts (the contradicts-dag-exempt observation)
-        "dag": False,
+        "dag_family": None,
         "removable": False,    # structural commitment; alters epistemic stance
         "addable_after_creation": False,
         "provenance": False,
@@ -724,7 +1250,7 @@ EDGE_CLASSIFICATIONS = {
     "derives_from": {
         "cascade": True,       # taint/stale propagation
         "temporal_causal": True,
-        "dag": True,
+        "dag_family": "grounding",
         "removable": False,    # cascade-bearing
         "addable_after_creation": False,
         "provenance": True,    # traced by _trace_evidence_roots in engram_core.py
@@ -741,16 +1267,16 @@ EDGE_CLASSIFICATIONS = {
         # But it is NOT exempt from acyclicity. Constructed through public
         # verbs only: base → P, X derives_from P, P′ derives_from X (legal —
         # X is unmarked at that moment), supersede P → P′, then acknowledge X.
-        # The ack edge closes X → P′ → X. A real per-relation dag flag is what
-        # catches that a plain "cascade relations are acyclic because they're
-        # temporal_causal" argument cannot: dag=True, checked by a real edge
+        # The ack edge closes X → P′ → X. A real per-relation acyclicity family
+        # is what catches that a plain "cascade relations are acyclic because
+        # they're temporal_causal" argument cannot: grounding family, checked by a real edge
         # walk (see engram_dag_conformance.check_dag_conformance and the
         # write-time guard that #2349 lands at §12.7), independent of the
         # temporal direction.
         "cascade": True,        # must participate in cascade walks — that is
                                  # the entire reason this relation exists.
         "temporal_causal": False,
-        "dag": True,
+        "dag_family": "grounding",
         "removable": False,     # cascade-bearing, mirrors derives_from.
         "addable_after_creation": False,
         "provenance": True,
@@ -758,7 +1284,7 @@ EDGE_CLASSIFICATIONS = {
     "exemplifies": {
         "cascade": False,
         "temporal_causal": False,    # advisory check exempts exemplifies (lesson edges, the exemplifies-dag-exempt observation)
-        "dag": False,
+        "dag_family": None,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -772,22 +1298,36 @@ EDGE_CLASSIFICATIONS = {
         # to an older principle — the edge is allowed to point backwards in
         # time, same shape as `instantiates`/`serves`.
         #
-        # dag=True is the flag that matters here (wording fix on #2753,
-        # 2026-09-08 16:3xZ): real structural acyclicity — a cycle in
+        # The acyclicity family (abstraction) is what matters here (wording
+        # fix on #2753, 2026-09-08 16:3xZ): real structural acyclicity — a cycle in
         # generalization/exemplification makes no sense, so `generalizes`
         # joins the relation set `engram_dag_conformance` walks (see
         # DAG_RELATIONS below) AND is cycle-guarded at WRITE time (see
         # _generalizes_cycle_path) — conformance is the after-the-fact
         # audit, the write guard is what stops a cycle landing.
         #
-        # classification-tier + dag=True is a combination present nowhere
-        # else in this table (every classification-tier relation today —
-        # instantiates/serves/exemplifies — is dag=False); this is an
+        # classification-tier + an acyclicity family is a combination present
+        # nowhere else in this table (every classification-tier relation
+        # today — instantiates/serves/exemplifies — has dag_family None); this is an
         # INTENTIONAL divergence from the tier's usual dag pattern,
         # acknowledged in EDGE_TIER_DIVERGENCE_ACK below.
         "cascade": False,
         "temporal_causal": False,
-        "dag": True,
+        "dag_family": "abstraction",
+        "removable": True,
+        "addable_after_creation": True,
+        "provenance": False,
+    },
+    "bears_on": {
+        # #3615: question -> claim relevance marker. Non-cascade: the answer's
+        # direction (support or weaken) is unknown when the edge is written, so
+        # nothing propagates. temporal_causal=False: the answer may pre-date
+        # the question's filing. dag_family None: a promise about future
+        # evidence is not grounding. removable: over-applied wiring must be
+        # correctable. The edge ROW survives a retract of either end.
+        "cascade": False,
+        "temporal_causal": False,
+        "dag_family": None,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -795,7 +1335,7 @@ EDGE_CLASSIFICATIONS = {
     "instantiates": {
         "cascade": False,      # pure relevance marker — no confidence propagation
         "temporal_causal": False,    # realization is not a temporal dependency (see VALID_RELATIONS note)
-        "dag": False,
+        "dag_family": None,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -808,7 +1348,7 @@ EDGE_CLASSIFICATIONS = {
                                 # own author; do not restore it.
         "temporal_causal": True,      # same provenance-chain shape as supported_by, which
                                 # this edge is split out of.
-        "dag": True,
+        "dag_family": "grounding",
         "removable": False,    # provenance load-bearing, mirrors supported_by.
         "addable_after_creation": False,  # minted once at node-add time
                                            # (engram_observation.py); never hand-addable.
@@ -820,7 +1360,7 @@ EDGE_CLASSIFICATIONS = {
                                # (a question filed and immediately resolved by a pre-existing node
                                # has resolver.created_at < question.created_at — correct, not a
                                # violation). Exemption added 2026-06-10, issue #1076.
-        "dag": False,
+        "dag_family": None,
         "removable": False,    # structural commitment
         "addable_after_creation": False,
         "provenance": False,
@@ -836,7 +1376,7 @@ EDGE_CLASSIFICATIONS = {
                                 # walking this relation would make a retract cascade's first
                                 # taint target the very node that is correcting it.
         "temporal_causal": True,
-        "dag": True,
+        "dag_family": "grounding",
         "removable": False,
         "addable_after_creation": False,
         "provenance": False,
@@ -846,7 +1386,7 @@ EDGE_CLASSIFICATIONS = {
         "temporal_causal": False,    # same shape as instantiates: a goal can be articulated after the node
                                # that serves it — serves.source legitimately pre-dates serves.target.
                                # Exemption added 2026-06-10, issue #1076 (three-tier edge taxonomy).
-        "dag": False,
+        "dag_family": None,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -854,7 +1394,7 @@ EDGE_CLASSIFICATIONS = {
     "subtask_of": {
         "cascade": False,
         "temporal_causal": True,
-        "dag": True,
+        "dag_family": "grounding",
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -867,7 +1407,7 @@ EDGE_CLASSIFICATIONS = {
                                 # at non-current nodes, so a stale cascade:True here would only
                                 # ever fire on invariant-violating data.
         "temporal_causal": True,
-        "dag": True,
+        "dag_family": "grounding",
         "removable": False,    # structural mutation; use engram-surgical for emergencies
         "addable_after_creation": False,
         "provenance": False,
@@ -880,7 +1420,7 @@ EDGE_CLASSIFICATIONS = {
                                 # accomplishes nothing. provenance/temporal_causal/dag/removable
                                 # deliberately UNCHANGED — this is a cascade-only flip.
         "temporal_causal": True,
-        "dag": True,
+        "dag_family": "grounding",
         "removable": False,
         "addable_after_creation": False,
         "provenance": True,    # traced by _trace_evidence_roots in engram_core.py
@@ -890,7 +1430,7 @@ EDGE_CLASSIFICATIONS = {
         "temporal_causal": False,    # relational tier (dependency/relational/classification): symmetric/cross-temporal
                                # like contradicts (already exempt). A tension between nodes has no causal
                                # direction; either can pre-date the other legitimately.
-        "dag": False,
+        "dag_family": None,
                                # Exemption added 2026-06-10, issue #1076 (three-tier edge taxonomy).
         "removable": True,
         "addable_after_creation": True,
@@ -1023,11 +1563,11 @@ def prediction_pairing_exemption_sql(target_col: str = "n.id") -> "tuple[str, tu
 # (the three-tier edge taxonomy: dependency / relational / classification).
 # Maintained as a SEPARATE dict from
 # EDGE_CLASSIFICATIONS so that existing consumers of that dict (which iterate
-# its schema of {cascade, temporal_causal, dag, removable,
+# its schema of {cascade, temporal_causal, dag_family, removable,
 # addable_after_creation, provenance}) are not affected.
 #
 # Tier→temporal_causal expectation (#2357 renamed dag_check→temporal_causal;
-# this tier map is about creation-order, not the newer `dag` acyclicity flag
+# this tier map is about creation-order, not the newer `dag_family` acyclicity field
 # — see EDGE_CLASSIFICATIONS's own header comment for why the two split):
 #   dependency     ⇒ temporal_causal=True   (causal / provenance chain; temporal order matters)
 #   relational     ⇒ temporal_causal=False  (symmetric or cross-temporal; no causal direction)
@@ -1067,6 +1607,7 @@ EDGE_TIERS: dict[str, str] = {
     "tensions":     "relational",
     "about":        "relational",
     "resolves":     "relational",   # epistemic-stance edge: a resolution closes a question/contradiction (pairs with contradicts), not a realization/membership
+    "bears_on":     "relational",   # #3615: question -> claim; cross-temporal (the answer may pre-date the question), temporal_causal=False matches the tier
     # classification tier: realization / membership; temporal_causal=False expected
     "instantiates": "classification",
     "serves":       "classification",
@@ -1075,7 +1616,7 @@ EDGE_TIERS: dict[str, str] = {
                                     # abstraction edge, temporal_causal=False
                                     # (matches this tier's expectation — the
                                     # INTENTIONAL divergence here is on the
-                                    # `dag` flag, not `temporal_causal`; see
+                                    # `dag_family` field, not `temporal_causal`; see
                                     # EDGE_TIER_DIVERGENCE_ACK below and the
                                     # hard-failing test in
                                     # test_edge_tier_audit.py that checks it).
@@ -1087,26 +1628,27 @@ EDGE_TIERS: dict[str, str] = {
 # (test_edge_tier_audit.py) skips emitting a warning for acknowledged entries,
 # preserving the ability to intentionally diverge without noisy CI output.
 #
-# #2753 WS1 widening: also the home for an intentional `dag`/tier divergence
-# (distinct from the temporal_causal divergence above — see `generalizes`
-# below, the first relation where the two kinds differ). The soft warn in
-# test_edge_tier_audit.py checks temporal_causal only and would NOT catch a
-# `dag`-only divergence's absence here; test_edge_tier_audit.py also carries
+# #2753 WS1 widening: also the home for an intentional `dag_family`/tier
+# divergence (distinct from the temporal_causal divergence above — see
+# `generalizes` below, the first relation where the two kinds differ). The
+# soft warn in test_edge_tier_audit.py checks temporal_causal only and would
+# NOT catch a `dag_family`-only divergence's absence here; test_edge_tier_audit.py also carries
 # a HARD-FAILING test for exactly that gap (added alongside this entry).
 EDGE_TIER_DIVERGENCE_ACK: dict[str, str] = {
     "acknowledged_derives_from": (
         "#2357: deliberately backwards in creation time — the acknowledging "
         "node necessarily predates the replacement it acknowledges. Real "
-        "acyclicity is still enforced via dag=True, checked by an edge walk "
+        "acyclicity is still enforced via the grounding family, checked by an edge walk "
         "rather than the temporal_causal timestamp comparison."
     ),
     "generalizes": (
         "#2753 epic WS1, R1 (Lei's ruling, 2026-09-08 16:28Z): classification "
-        "tier, but dag=True — every other classification-tier relation today "
-        "(instantiates/serves/exemplifies) is dag=False. Real structural "
+        "tier, but in the abstraction acyclicity family — every other "
+        "classification-tier relation today "
+        "(instantiates/serves/exemplifies) has dag_family None. Real structural "
         "acyclicity genuinely matters here (a cycle in generalization/"
         "exemplification makes no sense), so this is an intentional "
-        "divergence on the `dag` flag, not `temporal_causal` (which matches "
+        "divergence on the `dag_family` field, not `temporal_causal` (which matches "
         "its tier's expectation at False, unremarkable on its own). Cycle "
         "prevention is enforced at WRITE time (see _generalizes_cycle_path) "
         "as well as by the batch conformance walk (DAG_RELATIONS)."
@@ -1117,9 +1659,10 @@ EDGE_TIER_DIVERGENCE_ACK: dict[str, str] = {
 # check — the name predates #2357's dag/temporal_causal split and is kept for
 # call-site stability, but every current reader (the startup consistency scan,
 # the generic add_edge_impl timestamp guard) wants the temporal_causal set, not
-# the newer real-acyclicity `dag` set. Do not repoint this at `dag` without
-# updating every reader — the two sets differ (acknowledged_derives_from is
-# temporal_causal=False but dag=True).
+# the newer real-acyclicity set (DAG_RELATIONS, `dag_family is not None`). Do
+# not repoint this at that set without updating every reader — the two sets
+# differ (acknowledged_derives_from is temporal_causal=False but in the
+# grounding family).
 DAG_EXEMPT_RELATIONS = frozenset(
     r for r, c in EDGE_CLASSIFICATIONS.items() if not c["temporal_causal"]
 )
@@ -1128,7 +1671,19 @@ DAG_EXEMPT_RELATIONS = frozenset(
 # CASCADE_RELATIONS (walked for taint/stale propagation), this set exists
 # purely to bound the cycle-detection walk — see
 # engram_dag_conformance.check_dag_conformance.
-DAG_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c["dag"])
+DAG_RELATIONS = frozenset(
+    r for r, c in EDGE_CLASSIFICATIONS.items() if c["dag_family"] is not None
+)
+
+DAG_FAMILIES = ("grounding", "abstraction")
+
+
+def dag_family_relations(family: str) -> "frozenset[str]":
+    """The relations in one acyclicity family (#3210), derived from
+    EDGE_CLASSIFICATIONS at call time -- never a hand-picked literal."""
+    return frozenset(
+        r for r, c in EDGE_CLASSIFICATIONS.items() if c["dag_family"] == family
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1138,13 +1693,35 @@ DAG_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c["dag"]
 # all provenance-bearing; about/exemplifies are not. Any move not in this
 # table is refused, including every move in the opposite (stronger)
 # direction. The value is None (no extra condition) or a tuple of node
-# `type` values the TARGET must already be one of.
+# `type` values the TARGET must already be one of. (#2243 step 3 part A
+# widens a loose `cites` (one that is not observation -> evidence) to every
+# addable relation; see the block below.) A `cites` between an observation
+# and its evidence (the pair core._cites_pair_error accepts) is provenance and
+# is never retypable: engram_retype_edge refuses it before this table's moves
+# are applied.
 # ---------------------------------------------------------------------------
+#
+# #2243 step 3 part A: a LOOSE `cites` may be re-typed to EVERY relation that
+# is addable after creation (Lei's ruling: loose cites -> `about` or another
+# non-provenance edge type). That half of the table is DERIVED from
+# EDGE_CLASSIFICATIONS, never a hand-typed list, so a relation that gains or
+# loses addable_after_creation moves with it. The relation-specific endpoint
+# rules for the new relation are enforced by the same helper engram_add_edge
+# uses (engram_core._relation_endpoint_error).
+
+# Required TARGET node types for any re-type into `exemplifies` (one
+# definition, shared by derives_from->exemplifies and cites->exemplifies).
+EXEMPLIFIES_TARGET_TYPES = ("lesson", "cornerstone")
+
 RETYPE_ALLOWED_MOVES: "dict[tuple[str, str], tuple[str, ...] | None]" = {
     ("supported_by", "about"): None,
     ("derives_from", "about"): None,
-    ("derives_from", "exemplifies"): ("lesson", "cornerstone"),
-    ("cites", "about"): None,
+    ("derives_from", "exemplifies"): EXEMPLIFIES_TARGET_TYPES,
+    **{
+        ("cites", _r): (EXEMPLIFIES_TARGET_TYPES if _r == "exemplifies" else None)
+        for _r, _c in EDGE_CLASSIFICATIONS.items()
+        if _c["addable_after_creation"]
+    },
 }
 
 
@@ -1152,43 +1729,50 @@ RETYPE_ALLOWED_MOVES: "dict[tuple[str, str], tuple[str, ...] | None]" = {
 # `generalizes` substrate (#2753 epic, WS1).
 # ---------------------------------------------------------------------------
 
-def _generalizes_cycle_path(
-    conn: sqlite3.Connection, source_id: str, target_id: str
+def _dag_cycle_path(
+    conn: sqlite3.Connection, relation: str, source_id: str, target_id: str,
+    *, resolve: bool = True,
 ) -> "list[str] | None":
-    """Would inserting ``source_id --generalizes--> target_id`` close a
-    cycle among LIVE ``generalizes`` edges? Returns the cycle (list of node
-    ids, first == last) if so, else None.
+    """Would inserting ``source_id --relation--> target_id`` close a cycle
+    among LIVE edges of ``relation``'s acyclicity FAMILY? Returns the cycle
+    (list of node ids, first == last) if so, else None. A relation with no
+    family (``dag_family is None``) has no walk: always None.
 
-    #2753 epic WS1 (D1): the write-time cycle guard — refuse the edge and
-    return the cycle path in the error. Conformance
+    #3210: the one write-time cycle helper. The walked relation set is the
+    family of the edge being written, read from ``EDGE_CLASSIFICATIONS`` via
+    ``dag_family_relations`` -- no relation literal here. ``grounding`` and
+    ``abstraction`` are separate families because grounding runs both ways
+    relative to generality, so a deduction-shaped ``generalizes`` edge
+    (specific supported_by general, then general generalizes specific) is
+    legal and must not be refused by a union walk.
+
+    #2753 epic WS1 (D1) origin: the write-time guard for ``generalizes`` --
+    refuse the edge and return the cycle path in the error. Conformance
     (``engram_dag_conformance.check_dag_conformance``) is the after-the-fact
-    BATCH audit; this is the TARGETED check that stops a cycle landing in
-    the first place, called from every ``generalizes``-writing path (the
-    generic ``engram_add_edge``, and the ``generalized_by`` mint-time wiring
-    on ``engram_add_lesson``/``engram_add_cornerstone``).
+    BATCH audit over the same families; this is the TARGETED check that stops
+    a cycle landing in the first place.
 
-    Scoped to the ``generalizes`` relation ONLY, not the full
-    ``DAG_RELATIONS`` set — ``generalizes`` is a distinct specialization/
-    abstraction hierarchy from e.g. ``cites``/``derives_from``/
-    ``subtask_of``, and folding unrelated dag-bearing relations into one
-    targeted write-time check would conflate independent hierarchies that
-    happen to share the ``dag: True`` flag for unrelated reasons. (The
-    full-graph, all-``DAG_RELATIONS`` batch walk is what
-    ``engram_dag_conformance`` already does, separately.)
+    BFS from ``target_id`` over existing edges of the family (source->target):
+    if ``source_id`` is reachable FROM ``target_id``, the candidate edge would
+    close ``target_id -> ... -> source_id -> target_id``.
 
-    BFS from ``target_id`` over existing LIVE ``generalizes`` edges
-    (source->target, i.e. general->specific): if ``source_id`` is reachable
-    FROM ``target_id``, the candidate edge would close
-    ``target_id -> ... -> source_id -> target_id``. CURRENT-only
-    (``is_current = 1`` nodes/edges), same convention as
-    ``check_dag_conformance``.
+    ``resolve`` (default True) puts every endpoint through the supersedes
+    chain, as the ``generalizes`` guard and the conformance audit do. The
+    acknowledgement writer passes ``resolve=False`` -- it keeps the raw-edge
+    semantics of the cascade guard it sits beside (``_cascade_reaches``); see
+    its call site for why.
     """
+    family = EDGE_CLASSIFICATIONS.get(relation, {}).get("dag_family")
+    if family is None:
+        return None
     if source_id == target_id:
         return [source_id, target_id]
+    relations = sorted(dag_family_relations(family))
+    placeholders = ",".join("?" * len(relations))
 
-    # Walk the RESOLVED generalizes graph -- every edge's endpoints put
-    # through _resolve_to_current, exactly as generalization_chain resolves
-    # them on the read side.
+    # Walk the RESOLVED graph -- every edge's endpoints put through
+    # _resolve_to_current, exactly as generalization_chain resolves them on
+    # the read side (and as engram_dag_conformance resolves them).
     #
     # The earlier shape filtered on `s.is_current = 1 AND t.is_current = 1`
     # instead, and that was a real hole (found in #2812 review). An edge
@@ -1204,13 +1788,17 @@ def _generalizes_cycle_path(
     _resolved: "dict[str, str | None]" = {}
 
     def _res(nid: str) -> "str | None":
+        if not resolve:
+            return nid
         if nid not in _resolved:
             _resolved[nid] = _resolve_to_current(conn, nid)
         return _resolved[nid]
 
     adjacency: "dict[str, set]" = {}
     for row in conn.execute(
-        "SELECT source_id, target_id FROM edges WHERE relation = 'generalizes'"
+        f"SELECT source_id, target_id FROM edges "
+        f"WHERE relation IN ({placeholders})",
+        tuple(relations),
     ):
         r_src = _res(row["source_id"])
         r_tgt = _res(row["target_id"])
@@ -1243,6 +1831,26 @@ def _generalizes_cycle_path(
     return None
 
 
+def _generalizes_cycle_path(
+    conn: sqlite3.Connection, source_id: str, target_id: str
+) -> "list[str] | None":
+    """Would inserting ``source_id --generalizes--> target_id`` close a
+    cycle among LIVE ``generalizes`` edges? Returns the cycle (list of node
+    ids, first == last) if so, else None.
+
+    #2753 epic WS1 (D1): the write-time cycle guard, called from every
+    ``generalizes``-writing path (the generic ``engram_add_edge``, and the
+    ``generalized_by`` mint-time wiring on ``engram_add_lesson``/
+    ``engram_add_cornerstone``). #3210: now a thin caller of
+    ``_dag_cycle_path`` -- ``generalizes`` is the sole member of the
+    ``abstraction`` family, so the walk is the same ``generalizes``-only,
+    resolve-through-supersedes walk as before (#2812/#2813), but the walked
+    set is read from ``EDGE_CLASSIFICATIONS`` rather than hard-coded.
+    Deliberately NOT walked over the grounding family: see ``_dag_cycle_path``.
+    """
+    return _dag_cycle_path(conn, "generalizes", source_id, target_id)
+
+
 def _resolve_to_current(conn: sqlite3.Connection, node_id: str) -> "str | None":
     """Resolve ``node_id`` to its CURRENT version via the supersedes chain.
 
@@ -1261,7 +1869,7 @@ def _resolve_to_current(conn: sqlite3.Connection, node_id: str) -> "str | None":
     ).fetchone()
     if not row:
         return None
-    if row["is_current"] == 1:
+    if row[0] == 1:  # SELECT is_current
         return node_id
     return _current_successor(conn, node_id)
 
@@ -1359,7 +1967,15 @@ def generalization_chain(
     Public helper — WS2 (render) consumes this directly; keep the return
     shape stable across a signature change (add fields, don't repurpose
     existing ones) once WS2 branches off this tip.
+
+    Raises ``ValueError`` for a ``max_depth`` that is negative or not an ``int`` (a ``bool``
+    is refused too): a negative depth would expand nothing and then report ``truncated``,
+    which is a false statement. ``0`` is valid and returns the roots only.
     """
+    if isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 0:
+        raise ValueError(
+            f"generalization_chain: max_depth must be a non-negative int, got {max_depth!r}"
+        )
     start_row = conn.execute(
         "SELECT id, type FROM nodes WHERE id = ?", (node_id,)
     ).fetchone()
@@ -1371,12 +1987,13 @@ def generalization_chain(
             "nodes": {},
             "heads": [],
             "truncated": False,
+            "cycle_detected": False,
         }
 
     start_resolved = _resolve_to_current(conn, node_id)
 
     roots_raw: "list[str]" = []
-    if start_row["type"] in GENERALIZES_PRINCIPLE_TYPES:
+    if start_row[1] in GENERALIZES_PRINCIPLE_TYPES:  # SELECT id, type
         if start_resolved is not None:
             roots_raw = [start_resolved]
     else:
@@ -1385,7 +2002,7 @@ def generalization_chain(
                WHERE source_id = ? AND relation IN ('exemplifies', 'instantiates')""",
             (node_id,),
         ).fetchall()
-        roots_raw = [r["target_id"] for r in rows]
+        roots_raw = [r[0] for r in rows]  # SELECT target_id
 
     nodes: dict = {}
     heads: "list[str]" = []
@@ -1424,7 +2041,7 @@ def generalization_chain(
             # then fired on it -- a false positive on a graph with no cycle.
             resolved_any_parent = False
             for pe in parent_edges:
-                raw_parent = pe["source_id"]
+                raw_parent = pe[0]  # SELECT source_id
                 resolved_parent = _resolve_to_current(conn, raw_parent)
                 if resolved_parent is None:
                     continue
@@ -1514,34 +2131,33 @@ def generalization_chain(
     #                    head's claim in full, middle rungs as one-liners"),
     #                    so it never touches a middle rung.
     #
-    # COUPLING, named rather than coded around: the IN-list's parameter count
-    # scales with the REACHED SET -- and ``max_depth`` bounds only that set's
-    # DEPTH. Its BREADTH is bounded by nothing here: a node may be generalized
-    # by several parents, so each rung can widen, and the only real ceiling is
-    # the graph's population of principle nodes (each is expanded at most
-    # once). At the default depth 4, on a graph whose lesson/cornerstone/
-    # axiom/goal count is in the hundreds, the list is trivially small. So the
-    # knob that would bite first is principle-node GROWTH or a raised
-    # max_depth -- not chain length -- against SQLite's build-dependent
-    # variable limit (999 on pre-3.32 builds, 32766 since). Chunk the IN-list
-    # if either ever approaches it.
+    # COUPLING, retired by #3324 (U4c-0): each read binds the reached set as
+    # ONE JSON-array parameter and filters with ``IN (SELECT value FROM
+    # json_each(?))``, so the bound-variable count is 1 regardless of set
+    # size and SQLite's variable limit no longer applies here. ``max_depth``
+    # bounds only the set's DEPTH and its breadth is bounded by nothing, so
+    # that matters: no chunking is needed at any size. json_each needs
+    # SQLite's JSON1 (built in from 3.38; measured on 3.45.1 and 3.53.0 on
+    # the Linux seats; macOS seats not measured). A missing json_each raises
+    # sqlite3.OperationalError -- deliberately uncaught, never empty. Still
+    # TWO queries total, independent of chain size. The SQL text is a fixed
+    # inline literal on purpose (no f-string, no concatenation): it is the
+    # single template U4c's byte-exact read registry (#3196) can admit.
     if nodes:
-        _ph = ",".join("?" * len(nodes))
         for _row in conn.execute(
-            f"SELECT id, recall_summary FROM nodes WHERE id IN ({_ph})",
-            tuple(nodes),
-        ):
+            "SELECT id, recall_summary FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
+            (json.dumps(list(nodes)),),
+        ).fetchall():
             if _row[0] in nodes:
                 nodes[_row[0]]["recall_summary"] = _row[1]
     for _nid in nodes:
         nodes[_nid].setdefault("recall_summary", None)
 
     if heads:
-        _ph = ",".join("?" * len(heads))
         for _row in conn.execute(
-            f"SELECT id, claim FROM nodes WHERE id IN ({_ph})",
-            tuple(heads),
-        ):
+            "SELECT id, claim FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
+            (json.dumps(list(heads)),),
+        ).fetchall():
             if _row[0] in nodes:
                 nodes[_row[0]]["claim"] = _row[1]
     for _hid in heads:
@@ -2030,7 +2646,7 @@ def _ensure_data_dir():
             "mode": "single",
             "counterparts": [],
         }
-        CONFIG_PATH.write_text(json.dumps(default_config, indent=2))
+        _config_io.write_config_json(CONFIG_PATH, default_config)
 
 
 VALID_SOURCE_TYPES = {"document", "conversation", "file", "web_page"}
@@ -2694,6 +3310,78 @@ def _recreate_fts_sync_triggers(
             pass
 
 
+# ── #3425: nodes.metadata must be valid JSON or NULL ───────────────────────
+# A non-JSON blob in nodes.metadata makes SQL json_extract(metadata, ...)
+# abort the WHOLE query ("malformed JSON"). It is a WRITE-path defect that
+# surfaces at read sites, so the fix is write-side: two BEFORE triggers that
+# refuse an invalid write (SQLite has no ADD CONSTRAINT; the trigger is this
+# file's existing pattern, cf. the nodes_fts_* set above). Valid JSON of ANY
+# shape stays allowed -- non-object JSON is the separate #3423 class.
+# Created at migration rung 7 and re-ensured on every startup at
+# user_version >= 7 (CREATE TRIGGER IF NOT EXISTS), so a trigger lost to a
+# hand edit or a restore is healed on the next start. Neither trigger's SQL
+# mentions nodes_fts, so engram_backup's FTS-trigger drop plan leaves them in
+# a dump and a restore keeps the guard.
+_METADATA_GUARD_MSG = "nodes.metadata must be valid JSON or NULL"
+_METADATA_GUARD_TRIGGER_NAMES = (
+    "nodes_metadata_json_guard_insert",
+    "nodes_metadata_json_guard_update",
+)
+
+
+def _ensure_metadata_json_guard_triggers(conn: sqlite3.Connection) -> None:
+    """Create the two metadata write-guard triggers (idempotent)."""
+    conn.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS nodes_metadata_json_guard_insert
+        BEFORE INSERT ON nodes
+        WHEN NEW.metadata IS NOT NULL AND NOT json_valid(NEW.metadata)
+        BEGIN
+            SELECT RAISE(ABORT, '{_METADATA_GUARD_MSG}');
+        END
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS nodes_metadata_json_guard_update
+        BEFORE UPDATE OF metadata ON nodes
+        WHEN NEW.metadata IS NOT NULL AND NOT json_valid(NEW.metadata)
+        BEGIN
+            SELECT RAISE(ABORT, '{_METADATA_GUARD_MSG}');
+        END
+        """
+    )
+
+
+def _quarantine_invalid_metadata(conn: sqlite3.Connection) -> int:
+    """Copy every invalid-JSON nodes.metadata blob to metadata_quarantine,
+    then NULL it on the node. Returns the number of rows quarantined. Does
+    NOT commit: the caller's rung owns the transaction, so a failure between
+    the copy and the NULLing rolls both back. (The `CREATE TABLE IF NOT
+    EXISTS` below autocommits; the INSERT then opens the transaction that the
+    caller's CREATE TRIGGERs must join, so this must run before them.)
+
+    Idempotent: a quarantined row has metadata NULL, so a second run finds
+    nothing to copy. Side effects of the UPDATE: it names only `metadata`,
+    and no trigger in this schema is declared on that column (the FTS
+    triggers fire on text columns / status / is_current), so nothing else
+    is rewritten. Edit history is written by Python call sites, not by a
+    trigger.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS metadata_quarantine ("
+        "node_id TEXT NOT NULL, raw TEXT, quarantined_at TEXT NOT NULL)"
+    )
+    invalid_where = "metadata IS NOT NULL AND NOT json_valid(metadata)"
+    conn.execute(
+        "INSERT INTO metadata_quarantine (node_id, raw, quarantined_at) "
+        f"SELECT id, metadata, ? FROM nodes WHERE {invalid_where}",
+        (_now(),),
+    )
+    cur = conn.execute(f"UPDATE nodes SET metadata = NULL WHERE {invalid_where}")
+    return cur.rowcount
+
+
 # ── #2181: pre-migration backup ─────────────────────────────────────────────
 # A migration-keyed binary copy taken because a migration is ABOUT TO RUN —
 # not merely whenever the agent last napped. Migration rung 4 (#2170)
@@ -2853,6 +3541,11 @@ def _take_pre_migration_backup_if_pending(
     return backup_ok
 
 
+# #3766: the one statement that creates the created_at index. Used by migration rung 8 AND the
+# every-start self-heal in _run_db_one_time_setup, so the two cannot drift.
+_CREATED_AT_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_nodes_created_at ON nodes(created_at)"
+
+
 def _rung_ready(conn: sqlite3.Connection, target: int, backup_ok: bool) -> bool:
     """Whether migration rung `target` may run right now.
 
@@ -2886,6 +3579,14 @@ def _rung_ready(conn: sqlite3.Connection, target: int, backup_ok: bool) -> bool:
     return live == target - 1
 
 
+# The latest schema version: the highest `PRAGMA user_version = N` a migration rung in
+# _run_db_one_time_setup writes. ONE home (#3753): the migration code reads it for the
+# pre-migration backup, and engramd_owner's start() gate refuses a store whose
+# user_version is below it (read through this module attribute at call time, never
+# copied). Adding a rung means bumping this single line.
+LATEST_SCHEMA_VERSION = 8
+
+
 def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     """Run the one-shot backfill/migration/DAG-check block for `conn`.
 
@@ -2898,7 +3599,11 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     NULL/absence checks) -- only the CALL FREQUENCY changed, from 'every
     _get_db() call' to 'first call per resolved DB path, per process.'
 
-    Caller contract: only invoke while holding _db_setup_lock, and only
+    Caller contract: only invoke while holding _db_setup_lock AND the
+    cross-process setup lock directory (#3767: _acquire_db_setup_lock -- every
+    state read below, user_version and each backfill's own gate, then happens
+    INSIDE that lock, so a process that waited sees the holder's finished work
+    and re-runs no rung and writes no second backup), and only
     mark the path done (add to _db_setup_done_paths) AFTER this function
     returns without raising -- a failure here must leave the path
     unmarked so the next _get_db() call retries the whole block
@@ -2906,11 +3611,12 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
 
     Returns: True iff the caller must start the async embedding
     restore-completeness regeneration thread (#3075 C5 round 2) AFTER
-    releasing _db_setup_lock -- see the "Restore-completeness check" block
-    below and _run_embedding_restore_regeneration's own docstring. False in
-    every other case (no NULL embeddings, embeddings disabled by config, or
-    the embedder is unavailable -- those last two are handled synchronously,
-    in-line, before this function returns). The caller (_get_db()) MUST NOT
+    releasing _db_setup_lock AND the setup lock directory -- see the
+    "Restore-completeness check" block below and _run_embedding_restore_regeneration's own docstring. False in
+    every other case (no NULL embeddings, or the embedder is unavailable --
+    that last case is handled synchronously, in-line, before this function
+    returns; #345 PR2 retired the separate "disabled by config" case, which
+    used to also return False here). The caller (_get_db()) MUST NOT
     start that thread while still holding _db_setup_lock -- doing so is
     exactly the round-1 defect this round fixes.
     """
@@ -3474,18 +4180,12 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
         if not _fresh_regeneration_lease_held(conn):
             _null_emb_before = _count_missing_embeddings(conn)
             if _null_emb_before > 0:
-                emb_config = _get_embedding_config()
-                if not emb_config.get("enabled", True):
-                    # Gate the REGENERATION on `enabled` (Borges's ruling,
-                    # point 3) -- but the FLAG still fires, naming the
-                    # cause, matching the server.py:8017 startup-gate
-                    # precedent's own wording for why a deliberate opt-out
-                    # stays non-fatal.
-                    _set_embedding_restore_flag(
-                        conn, null_count=_null_emb_before, cause="disabled-by-config",
-                        respect_lease=True,
-                    )
-                elif not _embedder.is_available():
+                # #345 PR2 (A2): the `enabled`-gated branch that used to
+                # live here (cause="disabled-by-config") is REMOVED -- the
+                # toggle is retired and the startup gate already refuses
+                # to start with `enabled: false`, so that cause is now
+                # unreachable code. See this function's own docstring.
+                if not _embedder.is_available():
                     # Judgment call (documented in the PR handoff): Borges's
                     # ruling named `enabled` as the synchronous gate explicitly;
                     # extending the same synchronous treatment to a verifiably
@@ -3643,18 +4343,14 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     # retractions — this is expected by design, not a sign of corruption (#781).
     current_user_version = conn.execute("PRAGMA user_version").fetchone()[0]
 
-    # _PRE_MIGRATION_LATEST_VERSION tracks the highest rung's target version
-    # below (currently rung 6 -> PRAGMA user_version = 6). No single named
-    # constant exists elsewhere in this function for "the latest schema
-    # version" — each rung below hardcodes its own target inline — so this
-    # local mirrors that existing convention rather than inventing a new
-    # module-level constant this PR would be the only user of. Bump this
-    # alongside adding any future rung 7. (Mechanically checked against the
-    # rungs' own PRAGMA user_version = N literals by
-    # test_2181_pre_migration_latest_version_constant_matches_max_rung_target
-    # — forgetting the bump fails loudly at test time instead of silently
-    # skipping the new rung's backup.)
-    _PRE_MIGRATION_LATEST_VERSION = 6
+    # The highest rung's target version is the module-level LATEST_SCHEMA_VERSION
+    # (#3753): the migration reads it here, and the owner's schema-version gate
+    # reads the same name, so there is no second copy to drift. Bump it alongside
+    # adding any future rung. (Mechanically checked against the rungs' own
+    # PRAGMA user_version = N literals by
+    # test_2181_latest_schema_version_constant_matches_max_rung_target -- forgetting
+    # the bump fails loudly at test time instead of silently skipping the new
+    # rung's backup.)
 
     # See _take_pre_migration_backup_if_pending's docstring for the full
     # contract (what True/False mean, why the failure posture is inverted
@@ -3663,7 +4359,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     # rung check below is what makes a failed backup actually block the
     # rungs it guards.
     _pre_migration_backup_ok = _take_pre_migration_backup_if_pending(
-        conn, current_user_version, _PRE_MIGRATION_LATEST_VERSION
+        conn, current_user_version, LATEST_SCHEMA_VERSION
     )
 
     if _rung_ready(conn, 1, _pre_migration_backup_ok):
@@ -3972,33 +4668,11 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                 engram_backup.rebuild_fts_index(_fts4_db_path)
 
             _fts4_cols = list(engram_backup.NODES_FTS_COLUMNS)
-            _fts4_cols_sql = ", ".join(_fts4_cols)
 
-            # rebuild_fts_index's 'rebuild' step repopulates FTS from every
-            # row in `nodes` (including is_current=0 ones) and its own
-            # cleanup only excludes status='retracted' rows — it has no
-            # is_current awareness. Migration 3 above additionally excludes
-            # superseded (is_current=0, non-retracted) rows from FTS, and
-            # that exclusion does not survive a rebuild_fts_index call
-            # untouched. Reassert it here with the same delete-insert
-            # migration 3 uses (now over the new column set) so this rung
-            # doesn't regress migration 3's guarantee. Safe to run every
-            # time this rung executes, including on a retry after an
-            # earlier failed attempt, because rebuild_fts_index's own
-            # 'rebuild' step, immediately above, unconditionally repopulates
-            # every row first — so the rows targeted below are always
-            # present in the index at this point, never already-absent (the
-            # specific condition that makes FTS5's 'delete' magic-insert
-            # raise "database disk image is malformed").
-            _fts4_select_sql = ", ".join(f"COALESCE({c}, '')" for c in _fts4_cols)
-            conn.execute(
-                f"""
-                INSERT INTO nodes_fts(nodes_fts, rowid, {_fts4_cols_sql})
-                SELECT 'delete', rowid, {_fts4_select_sql}
-                FROM nodes
-                WHERE is_current = 0 AND status != 'retracted'
-                """
-            )
+            # rebuild_fts_index itself excludes retracted AND superseded
+            # (is_current=0) rows from the index (#2746), so there is nothing
+            # to re-assert here: a second 'delete' on an already-excluded
+            # rowid corrupts ranked queries (#2742).
 
             # Triggers — rebuild_fts_index doesn't touch these, and they
             # were already dropped above (BEFORE the rebuild, to close the
@@ -4028,10 +4702,8 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
             # rungs 1-3's own retry-safety convention. Every step above is
             # independently safe to re-run: rebuild_fts_index is idempotent;
             # DROP+CREATE TRIGGER is idempotent; the claim backfill UPDATE
-            # recomputes the same value; the supersede-cleanup delete-insert
-            # is safe to re-run because rebuild_fts_index's own rebuild step
-            # always runs immediately before it (see above); re-embedding is
-            # idempotent by construction (it overwrites, never appends).
+            # recomputes the same value; re-embedding is idempotent by
+            # construction (it overwrites, never appends).
             conn.execute("PRAGMA user_version = 4")
             conn.commit()
         except sqlite3.DatabaseError as _migration4_err:
@@ -4355,9 +5027,8 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     # server start after the plugin upgrade carrying this migration. A
     # SECOND per-seat rebuild is then needed — to clear whatever accumulated
     # in the gap between the emergency rebuild and the trigger's arrival,
-    # and (once #2746's rebuild_fts_index contract fix lands) to move the
-    # seat onto the trigger's own contract, which currently disagrees with
-    # rebuild_fts_index about whether a superseded row belongs in the index.
+    # and to move the seat onto the trigger's own contract, which
+    # rebuild_fts_index now agrees with (#2746: superseded rows excluded).
     # A graph landing on this rung may still carry orphaned postings from
     # edits made before the trigger reached it; this rung only guarantees no
     # NEW orphan is created going forward.
@@ -4370,6 +5041,91 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                 "[_run_db_one_time_setup] migration 6 (#2742 rewrite-resync "
                 "trigger version bump) FAILED, will retry on next startup: "
                 f"{_migration6_err!r}",
+                file=sys.stderr,
+            )
+
+    # Migration version 7 (#3425): nodes.metadata must be valid JSON or NULL.
+    # Quarantine the existing invalid rows (raw blob copied to
+    # metadata_quarantine, then metadata set to NULL), then install the write
+    # guard. WHY THIS ORDER (it is NOT that invalid rows would block the
+    # triggers: the NULLing UPDATE has NEW.metadata IS NULL, so the trigger
+    # WHEN is false either way): Python sqlite3 opens its implicit transaction
+    # only before DML. The INSERT..SELECT / UPDATE must therefore run BEFORE
+    # the CREATE TRIGGERs so the DDL joins that transaction; with the triggers
+    # first, CREATE TRIGGER autocommits and a later fault would leave both
+    # guards installed at user_version 6. Done in this order, a failure
+    # anywhere rolls back the copy, the NULLing and the triggers, leaves
+    # user_version at 6, and the rung retries on the next start. One residue:
+    # `CREATE TABLE IF NOT EXISTS metadata_quarantine` itself autocommits, so
+    # an EMPTY quarantine table can survive a failed rung (harmless: IF NOT
+    # EXISTS, and engram_diagnose reports 0). engram_diagnose reports the
+    # quarantine row count and the live invalid count.
+    if _rung_ready(conn, 7, _pre_migration_backup_ok):
+        try:
+            _mq_count = _quarantine_invalid_metadata(conn)
+            _ensure_metadata_json_guard_triggers(conn)
+            conn.execute("PRAGMA user_version = 7")
+            conn.commit()
+            if _mq_count:
+                print(
+                    "[_run_db_one_time_setup] migration 7 (#3425): quarantined "
+                    f"{_mq_count} node(s) with non-JSON metadata into "
+                    "metadata_quarantine (raw blob kept, metadata set to NULL).",
+                    file=sys.stderr,
+                )
+        except sqlite3.DatabaseError as _migration7_err:
+            conn.rollback()
+            print(
+                "[_run_db_one_time_setup] migration 7 (#3425 metadata JSON "
+                "write guard + quarantine) FAILED, will retry on next "
+                f"startup: {_migration7_err!r}",
+                file=sys.stderr,
+            )
+
+    # Migration version 8 (#3766): an index on nodes(created_at), so the U9b
+    # session-checkpoint reads (`created_at >= ?`, COUNT and LIST) SEARCH the
+    # index instead of scanning every row. One CREATE INDEX IF NOT EXISTS, so a
+    # crash between it and the version bump re-runs harmlessly; on failure the
+    # version stays 7 and the rung retries on the next start.
+    if _rung_ready(conn, 8, _pre_migration_backup_ok):
+        try:
+            conn.execute(_CREATED_AT_INDEX_SQL)
+            conn.execute("PRAGMA user_version = 8")
+            conn.commit()
+        except sqlite3.DatabaseError as _migration8_err:
+            conn.rollback()
+            print(
+                "[_run_db_one_time_setup] migration 8 (#3766 nodes(created_at) "
+                "index) FAILED, will retry on next "
+                f"startup: {_migration8_err!r}",
+                file=sys.stderr,
+            )
+
+    # Self-heal: at user_version >= 7 the guard must exist. Re-created every
+    # startup (IF NOT EXISTS) so a trigger lost to a hand edit is restored.
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 7:
+        try:
+            _ensure_metadata_json_guard_triggers(conn)
+            conn.commit()
+        except sqlite3.DatabaseError as _mdg_err:
+            print(
+                "[_run_db_one_time_setup] metadata JSON guard self-heal "
+                f"FAILED: {_mdg_err!r}",
+                file=sys.stderr,
+            )
+
+    # Self-heal (#3766): at user_version >= 8 the created_at index must exist.
+    # Re-created every startup (IF NOT EXISTS, a no-op when present) so an index
+    # lost to a hand edit is restored. Gated on the LIVE version >= 8, so it never
+    # papers over a failed rung 8 (the rung itself owns that retry).
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 8:
+        try:
+            conn.execute(_CREATED_AT_INDEX_SQL)
+            conn.commit()
+        except sqlite3.DatabaseError as _cai_err:
+            print(
+                "[_run_db_one_time_setup] created_at index self-heal "
+                f"FAILED: {_cai_err!r}",
                 file=sys.stderr,
             )
 
@@ -4493,7 +5249,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     return _needs_async_embedding_regen
 
 
-def _get_db() -> sqlite3.Connection:
+def _get_db(setup_wait: str = SETUP_WAIT_SERVER) -> sqlite3.Connection:
     """Get a database connection, creating tables if needed.
 
     Fails LOUD if the DB file is missing or seed-empty — the plugin packaging
@@ -4518,6 +5274,12 @@ def _get_db() -> sqlite3.Connection:
     Both are scoped to the env that sets them (bootstrap subprocess + pytest
     session). The production MCP server never sets either, so guards stay
     active for real user flows.
+
+    setup_wait (#3767): which caller class waits for the cross-process setup
+    lock. SETUP_WAIT_SERVER (default) waits up to SETUP_LOCK_SERVER_WAIT_S;
+    SETUP_WAIT_HOOK (harness-budgeted hooks MUST pass it) tries for
+    SETUP_LOCK_HOOK_WAIT_S then raises DbSetupLockBusy. Only consulted when
+    this process still has to run the one-time setup.
     """
     bootstrap_mode = (
         os.environ.get("ENGRAM_BOOTSTRAP") == "1"
@@ -4639,7 +5401,23 @@ def _get_db() -> sqlite3.Connection:
     if resolved_db_path not in _db_setup_done_paths or not _schema_present():
         with _db_setup_lock:
             if resolved_db_path not in _db_setup_done_paths or not _schema_present():
-                _needs_async_embedding_regen = _run_db_one_time_setup(conn)
+                # #3767: cross-process lock around the WHOLE setup. State is
+                # (re)read only inside it: _run_db_one_time_setup reads
+                # user_version and every backfill gate after this point. The
+                # async regen thread below still starts after BOTH locks are
+                # released.
+                try:
+                    _setup_fd = _acquire_db_setup_lock(setup_wait)
+                except DbSetupLockError:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    raise
+                try:
+                    _needs_async_embedding_regen = _run_db_one_time_setup(conn)
+                finally:
+                    _release_db_setup_lock(_setup_fd)
                 _db_setup_done_paths.add(resolved_db_path)
 
     # #3075 C5 round 2 (Borges's design ruling): start the NULL-only
@@ -4670,17 +5448,18 @@ def _get_db() -> sqlite3.Connection:
     # init writes it before the first _get_db() call), so this guard fires
     # only on personal-install DBs where the empty state means bootstrap crash.
     if not bootstrap_mode:
-        is_knowledge_pack = False
-        try:
-            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            is_knowledge_pack = bool(cfg.get("is_knowledge_pack", False))
-        except Exception:
-            pass
-        if not is_knowledge_pack:
-            seed_count = conn.execute(
-                "SELECT COUNT(*) FROM nodes WHERE type='axiom'"
-            ).fetchone()[0]
-            if seed_count == 0:
+        seed_count = conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE type='axiom'"
+        ).fetchone()[0]
+        if seed_count == 0:
+            # Config is read only here, so a healthy graph does no config parse.
+            is_knowledge_pack = False
+            try:
+                cfg = _config_io.read_config_json(CONFIG_PATH)
+                is_knowledge_pack = bool(cfg.get("is_knowledge_pack", False))
+            except Exception:
+                pass
+            if not is_knowledge_pack:
                 conn.close()
                 raise RuntimeError(_seed_missing_message())
 
@@ -4733,6 +5512,78 @@ def _get_db() -> sqlite3.Connection:
             )
 
     return conn
+
+
+def _metadata_dict(raw) -> dict:
+    """Return a `nodes.metadata` value as a dict, always (#3413).
+
+    Contract:
+      * str holding a JSON object -> that object, parsed.
+      * an already-parsed dict -> returned as-is (same object).
+      * None / "" / any other falsy value -> {}.
+      * invalid JSON -> {}.
+      * valid JSON that is NOT an object (`[1,2]`, `"str"`, `5`, `null`,
+        `true`, `1.5`, `""`, `[]`) -> {}   (non-object blob -> {}).
+      * any other non-str, non-dict value (a parsed list, bytes, ...) -> {}.
+        str only: bytes are not decoded, `nodes.metadata` is TEXT.
+
+    Pure: no logging. A non-object blob carries no keys a reader could use,
+    so it is not an error the read path should spam on. Every caller that
+    does `.get`, `[k]`, `in` or a write-back on parsed metadata goes through
+    this, so the bad state cannot reach a dict operation.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if not raw or not isinstance(raw, str):
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError, RecursionError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _metadata_dict_for_write(raw, node_id, tool) -> "tuple[dict, Optional[str]]":
+    """Write-side twin of `_metadata_dict` (#3413): returns (dict, warning).
+
+    A write site parses metadata, mutates it and re-dumps it. A blob that is
+    not a JSON object is treated as {} and the site then writes a DICT back;
+    replacing on-disk bytes without saying so would be a suppression, so this
+    variant says so, once, itself (no site can forget the log):
+
+      * dict / str holding a JSON object -> (that dict, None), silent.
+      * None / "" / any other falsy value -> ({}, None), silent: there was no
+        blob, so nothing carrying information is replaced.
+      * valid JSON that is not an object, invalid JSON, or a truthy non-str
+        non-dict value -> ({}, warning_text), ONE line to stderr naming the
+        node id, the blob's type and `tool`. (Invalid JSON counts as a
+        replaced non-object.)
+
+    The caller adds `warning_text` to its response's `warnings` field when the
+    tool has one. stderr, never stdout: stdout is the MCP channel.
+    """
+    if isinstance(raw, dict):
+        return raw, None
+    if not raw:
+        return {}, None
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError, RecursionError):
+            tname = "invalid JSON"
+        else:
+            if isinstance(parsed, dict):
+                return parsed, None
+            tname = "null" if parsed is None else type(parsed).__name__
+    else:
+        tname = type(raw).__name__
+    kind = tname if tname == "invalid JSON" else f"of type {tname}"
+    text = (
+        f"engram: node {node_id} metadata was {kind}, not an object; "
+        f"replaced with a dict on write (tool={tool})"
+    )
+    print(text, file=sys.stderr)
+    return {}, text
 
 
 def _now() -> str:
@@ -4871,14 +5722,7 @@ def _sanitize_fts_query_legacy(text: str) -> Optional[str]:
 
 def _get_memory_config() -> dict:
     """Get memory management config."""
-    if CONFIG_PATH.exists():
-        config = json.loads(CONFIG_PATH.read_text())
-        return config.get("memory", {
-            "decay_base": 1.014, "current_turn": 0,
-            "tier2_max_nodes": 1000,
-        })
-    return {"decay_base": 1.014, "current_turn": 0,
-            "tier2_max_nodes": 1000}
+    return _restamp.read_memory_config(CONFIG_PATH)
 
 
 def _get_current_turn() -> int:
@@ -4887,14 +5731,11 @@ def _get_current_turn() -> int:
 
 def _set_current_turn(turn: int):
     """Update the turn counter in config."""
-    if CONFIG_PATH.exists():
-        config = json.loads(CONFIG_PATH.read_text())
-    else:
-        config = {}
+    config = _config_io.read_config_json(CONFIG_PATH)
     if "memory" not in config:
         config["memory"] = {}
     config["memory"]["current_turn"] = turn
-    CONFIG_PATH.write_text(json.dumps(config, indent=2))
+    _config_io.write_config_json(CONFIG_PATH, config)
 
 
 def _write_feeling_nudge(source: str) -> bool:
@@ -5026,7 +5867,7 @@ def _compute_importance(base: float, turn: int, decay_base: float = None) -> flo
     """Compute importance score: base × a^turn."""
     if decay_base is None:
         decay_base = _get_memory_config().get("decay_base", 1.014)
-    return round(base * (decay_base ** turn), 6)
+    return _restamp.compute_importance(base, turn, decay_base)
 
 
 def _importance_base_for_node(
@@ -5041,7 +5882,18 @@ def _importance_base_for_node(
     return round(confidence * (1.0 + surprise), 4)
 
 
-def _get_tier_threshold(conn: sqlite3.Connection, tier: int) -> float:
+# SEARCH_EXCLUDED_TYPES, _not_search_excluded_sql and _searchable_where_sql are
+# defined ONCE in engram_search_rules.py (imported at the top of this file):
+# the ONE definition of "not searchable" (Lei 2026-10-08, tracker #2005 §4).
+# Node types in that set are reached by TRAVERSAL (cites edges, engram_inspect,
+# engram_get_subgraph, engram_list), never by SEARCH (FTS or semantic), and they
+# do not consume tier-2 slots -- the tier budget exists purely for search
+# efficiency. Do NOT hand-write ``type != 'evidence'`` elsewhere.
+
+
+def _get_tier_threshold(
+    conn: sqlite3.Connection, tier: int, max_nodes: Optional[int] = None
+) -> float:
     """Compute the importance_score threshold for a visibility tier.
 
     Instead of a fixed threshold, we compute dynamically based on target
@@ -5052,17 +5904,26 @@ def _get_tier_threshold(conn: sqlite3.Connection, tier: int) -> float:
                              Callers use tier=2 instead.
     Tier 2 (queryable): used by reflect, checkpoint, stats, query, add_* similarity-hints
     Tier 3 (total): no threshold, everything visible
+
+    Only the SEARCHABLE population (_searchable_where_sql: current and not a
+    SEARCH_EXCLUDED_TYPES type, i.e. evidence today) is counted and ranked --
+    excluded types neither consume tier-2 slots nor shift the cutoff.
+
+    max_nodes: optional cap override (default: config ``tier2_max_nodes``).
+    The engram_surface tier A/B comparison passes its test cap here instead
+    of re-implementing this logic.
     """
     if tier >= 3:
         return 0.0  # no filter
 
-    mem = _get_memory_config()
-    # Tier 1 is retired; fall through to tier-2 handling for any legacy callers.
-    max_nodes = mem.get("tier2_max_nodes", 1000)
+    if max_nodes is None:
+        mem = _get_memory_config()
+        # Tier 1 is retired; fall through to tier-2 handling for any legacy callers.
+        max_nodes = mem.get("tier2_max_nodes", 1000)
 
-    # Count active current nodes
+    # Count active current searchable nodes
     total = conn.execute(
-        "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1"
+        f"SELECT COUNT(*) as c FROM nodes WHERE {_searchable_where_sql()}"
     ).fetchone()["c"]
 
     if total <= max_nodes:
@@ -5070,8 +5931,8 @@ def _get_tier_threshold(conn: sqlite3.Connection, tier: int) -> float:
 
     # Find the importance_score cutoff that keeps only the top N nodes
     row = conn.execute(
-        """SELECT importance_score FROM nodes
-           WHERE is_current = 1
+        f"""SELECT importance_score FROM nodes
+           WHERE {_searchable_where_sql()}
            ORDER BY importance_score DESC
            LIMIT 1 OFFSET ?""",
         (max_nodes - 1,),
@@ -5180,7 +6041,8 @@ def _compute_recall_set_continuity(conn: sqlite3.Connection, checkpoint_mode: st
     tier2_threshold = _get_tier_threshold(conn, 2)
     current_ids = {
         row["id"] for row in conn.execute(
-            "SELECT id FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
+            f"SELECT id FROM nodes WHERE {_searchable_where_sql()} "
+            "AND COALESCE(importance_score, 0) >= ?",
             (tier2_threshold,),
         ).fetchall()
     }
@@ -5253,7 +6115,7 @@ def _compute_recall_set_continuity(conn: sqlite3.Connection, checkpoint_mode: st
 
 def _stamp_new_node(conn: sqlite3.Connection, node_id: str,
                      confidence: float = 0.5, surprise: float = 0.0,
-                     importance_base: float = None):
+                     importance_base: float = None) -> "EmbeddingOutcome":
     """Set importance and compute embedding on a freshly created node.
 
     By default, importance_base is derived from confidence/surprise via
@@ -5262,6 +6124,15 @@ def _stamp_new_node(conn: sqlite3.Connection, node_id: str,
     confidence/surprise are then ignored for the importance computation,
     which avoids computing a throwaway interim value the caller would
     otherwise immediately overwrite [alpha#2250].
+
+    #345 PR3 B1: RETURNS the EmbeddingOutcome (previously discarded) so
+    every node-creating tool impl can propagate a failed embed into its
+    own response (B4). Embedding is computed via
+    _compute_and_store_embedding_with_revive, not the bare
+    _compute_and_store_embedding -- the write path gets the B2/B3 in-write
+    revive + cooldown + flag behaviour; _reembed_nodes (the backfill/
+    restore path) still calls the bare function directly and is
+    unaffected by any of this.
     """
     base = (importance_base if importance_base is not None
             else _importance_base_for_node(confidence, surprise))
@@ -5271,8 +6142,8 @@ def _stamp_new_node(conn: sqlite3.Connection, node_id: str,
         "UPDATE nodes SET importance_base = ?, importance_score = ?, recall_turn = ? WHERE id = ?",
         (base, score, turn, node_id),
     )
-    # Compute and store embedding
-    _compute_and_store_embedding(conn, node_id)
+    # Compute and store embedding (#345 PR3: with in-write revive)
+    outcome = _compute_and_store_embedding_with_revive(conn, node_id)
     # Log creation event to edit_history
     row = conn.execute(
         "SELECT type, confidence FROM nodes WHERE id = ?", (node_id,)
@@ -5280,6 +6151,7 @@ def _stamp_new_node(conn: sqlite3.Connection, node_id: str,
     if row:
         _log_edit(conn, "created", node_id, row["type"],
                   {"confidence": row["confidence"]})
+    return outcome
 
 
 def _utility_reward(conn: sqlite3.Connection, node_ids: list[str], action: str) -> int:
@@ -5295,38 +6167,97 @@ def _utility_reward(conn: sqlite3.Connection, node_ids: list[str], action: str) 
     (e.g. comma-split supporting_ids with the same node listed twice).
     Returns the count of nodes updated.
 
+    The sequence (bump, then restamp when the action is in
+    `engram_restamp.RESTAMP_ACTIONS`) is owned by `engram_restamp.use_reward`.
+    The restamp is decoration on a write: it must never abort or roll back the
+    write, nor lose the utility bump, so use_reward reads the memory config
+    inside a guard (lazily -- `_get_memory_config` is passed uncalled) and runs
+    the restamp in a SAVEPOINT; a failure of either comes back as
+    `restamp_error` and is logged here as a WARNING -- visible, never silent.
+
     Caller is responsible for committing the connection after this call
     returns — `_utility_reward` issues UPDATEs but does not commit. Direct
     callers (engram_inspect, engram_get_subgraph) commit explicitly;
     `_create_derivation` relies on `_derive_impl` / `_resolve_impl` to
     commit the surrounding transaction.
     """
-    if not node_ids:
-        return 0
-    # Dedup while preserving first-occurrence order so the bump is idempotent
-    # on duplicates within one call. Old recall_window-based model was
-    # immune via dict-key semantics; the action-keyed model has to enforce
-    # this explicitly at the bump boundary so every caller (existing or
-    # future) inherits the invariant.
-    deduped: list[str] = list(dict.fromkeys(node_ids))
-    alpha = USE_ALPHA.get(action, USE_ALPHA_DEFAULT)
-    updated = 0
-    for nid in deduped:
-        row = conn.execute(
-            "SELECT utility_score FROM nodes WHERE id = ?", (nid,)
-        ).fetchone()
-        if row is None:
-            continue
-        q_old = row["utility_score"] if isinstance(row, sqlite3.Row) else (row[0] or 0.0)
-        if q_old is None:
-            q_old = 0.0
-        q_new = round(q_old + alpha * (1.0 - q_old), 6)
-        conn.execute(
-            "UPDATE nodes SET utility_score = ? WHERE id = ?",
-            (q_new, nid),
+    result = _restamp.use_reward(
+        conn, node_ids, action, memory_config=_get_memory_config
+    )
+    if result.restamp_error:
+        logging.getLogger(__name__).warning(
+            "recall_turn restamp not applied for action=%s (%d node(s)): %s",
+            action, result.bumped, result.restamp_error,
         )
-        updated += 1
-    return updated
+    return result.bumped
+
+
+def _is_observation_node(conn: sqlite3.Connection, node_id: str) -> bool:
+    """True iff `node_id` exists and its `nodes.type` is in the observation
+    family (`observation_factual`, `observation_predictive`: the prefix
+    predicate, so a new `observation_*` type joins by default). A missing row
+    is not an observation."""
+    row = conn.execute("SELECT type FROM nodes WHERE id = ?", (node_id,)).fetchone()
+    return bool(row) and str(row[0]).startswith("observation_")
+
+
+def _cites_pair_error(conn: sqlite3.Connection, source_id: str,
+                      target_id: str) -> "str | None":
+    """The ONE definition of which (source, target) pairs may carry `cites`:
+    an observation source and an `ev_` evidence target. Returns None when the
+    pair is accepted, else the refusal text (target checked first). Used by
+    `_insert_cites_edge` (the writer) and by `engram_retype_edge`'s guard,
+    which refuses to retype an edge of an accepted pair: that edge is
+    provenance."""
+    if not str(target_id).startswith("ev_"):
+        return (
+            "cites targets evidence nodes only; use 'about' for a context "
+            f"reference: {target_id}"
+        )
+    if not _is_observation_node(conn, source_id):
+        return (
+            "cites carries observation->evidence only; source is not an "
+            f"observation node: {source_id}"
+        )
+    return None
+
+
+def _insert_cites_edge(conn: sqlite3.Connection, source_id: str, target_id: str,
+                       now: str) -> None:
+    """The ONLY writer of relation 'cites' (#2243, Lei's ruling 2026-10-06).
+
+    `cites` carries observation -> evidence ONLY. Refuses with ValueError when
+    the target is not an `ev_` node (use 'about' for a context reference) or
+    the source row is not an observation node (read from `nodes.type`; the
+    source row must already exist, which every writer guarantees by inserting
+    its node before its edges). Writes nothing on refusal. A duplicate edge
+    raises sqlite3.IntegrityError as before; callers keep their wrapper.
+    """
+    err = _cites_pair_error(conn, source_id, target_id)
+    if err is not None:
+        raise ValueError(err)
+    conn.execute(
+        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
+        (source_id, target_id, now),
+    )
+
+
+def _insert_context_edge(conn: sqlite3.Connection, source_id: str, target_id: str,
+                         now: str) -> None:
+    """Write a context-reference edge (`context_ids` / `implements_ids`).
+
+    `cites` only when the source is an observation AND the target is an `ev_`
+    node (delegating to `_insert_cites_edge`); everything else is `about`, a
+    non-provenance, non-DAG relation (#2243). Duplicate edges raise
+    sqlite3.IntegrityError exactly as the raw INSERTs did.
+    """
+    if str(target_id).startswith("ev_") and _is_observation_node(conn, source_id):
+        _insert_cites_edge(conn, source_id, target_id, now)
+        return
+    conn.execute(
+        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'about', ?)",
+        (source_id, target_id, now),
+    )
 
 
 def _log_edit(conn: sqlite3.Connection, action: str, node_id: str,
@@ -5385,7 +6316,11 @@ def _backfill_edit_history(conn: sqlite3.Connection):
         "SELECT id, type, metadata FROM nodes WHERE status = 'retracted'"
     ).fetchall()
     for r in retracted:
-        meta = json.loads(r["metadata"] or "{}")
+        # #3413: DB-init migration, must never crash. Reads only (edit_history
+        # rows are written, the node's metadata is NOT), so nothing on disk is
+        # replaced and the silent read helper is the right one: a write-side
+        # log here would claim a replacement that does not happen.
+        meta = _metadata_dict(r["metadata"])
         conn.execute(
             """INSERT INTO edit_history (timestamp, turn, action, node_id, node_type, details)
                VALUES (?, 0, 'retracted', ?, ?, ?)""",
@@ -5410,11 +6345,16 @@ def _backfill_edit_history(conn: sqlite3.Connection):
 
 
 def _get_embedding_config() -> dict:
-    """Get embedding configuration."""
-    if CONFIG_PATH.exists():
-        config = json.loads(CONFIG_PATH.read_text())
-        return config.get("embedding", {"model": DEFAULT_EMBEDDING_MODEL, "enabled": True})
-    return {"model": DEFAULT_EMBEDDING_MODEL, "enabled": True}
+    """Get embedding configuration.
+
+    No longer defaults (or reads) an `enabled` key (#345 PR2, A3) -- the
+    toggle is retired; embeddings are mandatory. A config file that still
+    carries a literal `enabled: false` is caught by the startup gate
+    (server._embedding_startup_gate), which refuses to start before any
+    caller of this function ever runs.
+    """
+    config = _config_io.read_config_json(CONFIG_PATH)
+    return config.get("embedding", {"model": DEFAULT_EMBEDDING_MODEL})
 
 
 # Mechanical hedge prefix _report_feeling_impl (engram_tasks.py) writes onto
@@ -5509,9 +6449,10 @@ def _count_missing_embeddings(conn: sqlite3.Connection) -> int:
     - Round 3's COMPLETION site (_finalize_embedding_restore_flag) went
       the other way: it trusted the just-completed pass's own
       `counts["failed"]` tally instead of re-checking state. Since
-      EmbeddingOutcome.status == "skipped" covers THREE distinct causes
-      uniformly (disabled-by-config, embedder-unavailable, empty-text —
-      see that type's own docstring), an embedder that dropped BETWEEN
+      EmbeddingOutcome.status == "skipped" covered THREE distinct causes
+      uniformly at the time (disabled-by-config, embedder-unavailable,
+      empty-text — #345 PR2 later retired the first; see that type's own
+      docstring), an embedder that dropped BETWEEN
       the synchronous detection gate scheduling the pass and the pass
       itself actually running made every node report "skipped" (not
       "failed"), so counts["failed"] == 0 and round 3 silently CLEARED
@@ -5539,14 +6480,65 @@ def _count_missing_embeddings(conn: sqlite3.Connection) -> int:
     return sum(1 for nid in node_ids if _embedding_text_for_node(conn, nid))
 
 
+def _safe_count_missing_embeddings(conn: sqlite3.Connection) -> int:
+    """Non-throwing wrapper around _count_missing_embeddings, for the
+    WRITE PATH ONLY (#345 PR3 M1, Mira's BLOCKER on PR#3343's round-4
+    review + Kepler's clarification on the ruling).
+
+    _count_missing_embeddings re-runs _embedding_text_for_node over EVERY
+    node currently missing an embedding -- including the node THIS write
+    just failed on. When that node's own text-extraction bug is
+    PERSISTENT (not the one-shot fault TestK2StageContractCells'
+    parametrized "text" case exercises), _count_missing_embeddings
+    re-raises the very same exception while
+    _compute_and_store_embedding_with_revive is building the restore
+    flag's null_count -- so the flag/count path itself threw: no flag was
+    ever set, nothing was reported, and the exception escaped all the way
+    out of _stamp_new_node (Mira's reproduction: a single claim node with
+    _embedding_text_for_node patched to always raise).
+
+    Falls back to a plain SQL count of current nodes with a NULL
+    embedding when the precise scan raises -- that query touches no
+    per-node Python logic, so the same persistent fault cannot make it
+    raise too. Per Kepler's clarification, this still counts the
+    just-failed node as debt (it has a NULL embedding, so the raw SQL
+    COUNT includes it), the stage is already recorded on the
+    EmbeddingOutcome by _compute_and_store_embedding itself, and this
+    function never re-raises out of the write-path wrapper.
+
+    The fallback MAY OVER-count: it has no way to skip permanently-
+    unembeddable node types (e.g. an evidence node with no source_title),
+    which the precise scan's own _embedding_text_for_node call
+    deliberately excludes (see _count_missing_embeddings' own docstring).
+    An over-count is the safe direction here -- it can only make the
+    restore flag's null_count too HIGH, never silently hide real debt --
+    and the next sleep backfill's own fresh, precise
+    _count_missing_embeddings call (outside this write path) corrects it
+    either way.
+    """
+    try:
+        return _count_missing_embeddings(conn)
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "null-count scan raised while building the write-time restore "
+            "flag: %r -- falling back to a raw NULL-embedding SQL count "
+            "(may over-count permanently-unembeddable node types).", exc,
+        )
+        return conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE is_current=1 AND embedding IS NULL"
+        ).fetchone()[0]
+
+
 class EmbeddingOutcome(NamedTuple):
     """Return value of _compute_and_store_embedding (#3075 C2).
 
     status: one of "embedded" / "skipped" / "failed" — never bare None any
         more; every call site must interpret an explicit status.
-      - "skipped": an EXPECTED no-op — embeddings disabled via config, the
-        embedder unavailable, or empty text for this node type. No WARNING
-        logged; this is normal, silent operation.
+      - "skipped": an EXPECTED no-op — the embedder unavailable, or empty
+        text for this node type (#345 PR2 retired the third cause,
+        "embeddings disabled via config": that key is now fatal at
+        startup, so a running server can never reach this status for that
+        reason). No WARNING logged; this is normal, silent operation.
       - "embedded": the JSON nodes.embedding write succeeded (the canonical
         store). vec_mirror_ok is False if the vec_nodes KNN mirror-write
         degraded (a TOLERATED failure — JSON stays authoritative — but now
@@ -5558,11 +6550,63 @@ class EmbeddingOutcome(NamedTuple):
         function — never silent.
     node_id: the node this outcome describes.
     detail: exception type/message when status == "failed"; None otherwise.
+
+    #345 PR3 B1/B2: three further fields, all defaulted so every EXISTING
+    constructor call (this file, tests) is untouched. Populated ONLY by
+    _compute_and_store_embedding_with_revive (the write-path wrapper
+    _stamp_new_node calls) -- never by _compute_and_store_embedding itself,
+    which stays exactly as it was for every OTHER caller (_reembed_nodes /
+    the backfill tool / the sleep skill), per Kepler's "the write path
+    must not reach across" and this PR's own choice not to touch those
+    call sites:
+      - revive_attempted_at: UTC ISO timestamp of the in-write revive
+        attempt (None if the final status never needed one, i.e. the
+        first try already embedded).
+      - revive_result: "recovered" | "still-failing" | "cooldown" | None.
+      - next_revive_not_before: UTC ISO timestamp before which the next
+        revive attempt is refused, set whenever revive_result is
+        "still-failing" or "cooldown"; None otherwise.
+
+    Round 2 (R2): a `stage` field, set by _compute_and_store_embedding on
+    EVERY "failed" outcome (None for "skipped"/"embedded"), naming WHICH of
+    the three distinct failure points produced it:
+      - "embed": the embedder itself -- embed() raised, or returned an
+        empty/None vector despite is_available()/non-empty text. The ONLY
+        stage the write-path wrapper may revive, start a cooldown for, or
+        describe as "embedder down" -- the other two stages are not an
+        embedder-health signal at all.
+      - "text": _embedding_text_for_node raised (e.g. the original
+        TypeError-on-tuple-row_factory bug class) -- a bug in extracting
+        this node's embeddable text, unrelated to the embedder.
+      - "store": the nodes.embedding UPDATE itself raised (e.g. "database
+        is locked") -- the vector was computed fine; only persisting it
+        failed.
+    Any failure this function cannot attribute to one of the three stages
+    above (e.g. a config-read error ahead of all three) still gets a stage
+    -- defaulted to "embed", the closest-fit bucket, since the broad
+    except below was always the embedding pipeline's own catch-all and
+    this preserves its existing revive-and-flag behavior for genuinely
+    unanticipated exceptions rather than silently skipping it. Judgment
+    call -- flagged in the PR handoff.
     """
     status: str
     node_id: str
     detail: str | None = None
     vec_mirror_ok: bool = True
+    revive_attempted_at: str | None = None
+    revive_result: str | None = None
+    next_revive_not_before: str | None = None
+    stage: str | None = None
+
+
+# #345 PR3 B2 Rider 1 (Kepler's ruling): after an in-write revive still
+# fails, the model goes back into a cooldown so a burst of writes against a
+# genuinely-dead model pays one reload attempt, not one per node. 300s is a
+# judgment call within Kepler's stated range ("a few minutes is right —
+# long enough that a burst of writes pays once, short enough that a
+# transient recovers within a session"), matching this file's existing
+# constant-naming convention (_REGENERATION_LEASE_STALENESS_SECONDS).
+EMBED_REVIVE_COOLDOWN_S = 300
 
 
 def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "EmbeddingOutcome":
@@ -5581,15 +6625,44 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "Emb
     """
     try:
         emb_config = _get_embedding_config()
-        if not emb_config.get("enabled", True) or not _embedder.is_available():
+        if not _embedder.is_available():
             return EmbeddingOutcome(status="skipped", node_id=node_id)
 
-        text = _embedding_text_for_node(conn, node_id)
+        # Stage "text" (#345 PR3 R2): a bug extracting this node's
+        # embeddable text (e.g. the original TypeError-on-tuple-
+        # row_factory bug class) is unrelated to the embedder's health --
+        # tagged separately so the write path never revives/cooldowns the
+        # embedder, or claims it is "down", for a text-extraction bug.
+        try:
+            text = _embedding_text_for_node(conn, node_id)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "embedding text extraction FAILED for node %s: %r — node "
+                "left without an embedding.",
+                node_id, exc,
+            )
+            return EmbeddingOutcome(
+                status="failed", node_id=node_id, detail=repr(exc), stage="text",
+            )
         if not text:
             return EmbeddingOutcome(status="skipped", node_id=node_id)
 
         model_name = emb_config.get("model", DEFAULT_EMBEDDING_MODEL)
-        vector = _embedder.embed(text, model_name)
+
+        # Stage "embed" (#345 PR3 R2): the only stage the write-path
+        # wrapper may revive, cooldown, or call "embedder down".
+        try:
+            vector = _embedder.embed(text, model_name)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "embedding computation FAILED for node %s: %r — node left "
+                "without an embedding (recall degraded for this node until "
+                "re-embedded).",
+                node_id, exc,
+            )
+            return EmbeddingOutcome(
+                status="failed", node_id=node_id, detail=repr(exc), stage="embed",
+            )
         if not vector:
             # The embedder reported itself available and the text was
             # non-empty, yet no vector came back (no exception raised) —
@@ -5604,13 +6677,26 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "Emb
             )
             return EmbeddingOutcome(
                 status="failed", node_id=node_id,
-                detail="embed() returned empty/None",
+                detail="embed() returned empty/None", stage="embed",
             )
 
-        conn.execute(
-            "UPDATE nodes SET embedding = ? WHERE id = ?",
-            (json.dumps(vector), node_id),
-        )
+        # Stage "store" (#345 PR3 R2): the vector computed fine; only
+        # persisting it failed (e.g. "database is locked") -- not an
+        # embedder-health signal, so no revive/cooldown either.
+        try:
+            conn.execute(
+                "UPDATE nodes SET embedding = ? WHERE id = ?",
+                (json.dumps(vector), node_id),
+            )
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "embedding STORE FAILED for node %s: %r — vector computed "
+                "but not persisted; node left without an embedding.",
+                node_id, exc,
+            )
+            return EmbeddingOutcome(
+                status="failed", node_id=node_id, detail=repr(exc), stage="store",
+            )
         vec_mirror_ok = True
         # Mirror into the vec KNN index. vec0 doesn't support UPSERT on
         # virtual tables, so delete-then-insert handles the rare re-embed.
@@ -5622,23 +6708,388 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str) -> "Emb
                     (node_id, _sqlite_vec.serialize_float32(vector)),
                 )
             except sqlite3.OperationalError:
-                # vec_nodes missing or locked — JSON still canonical. A
-                # TOLERATED degradation (#3075 C2 explicitly keeps this
-                # non-fatal), but now visible on the outcome instead of
-                # being silently swallowed.
+                # vec_nodes missing/locked -- the LONG-TOLERATED #3075
+                # contract (#3075 C2 explicitly keeps this non-fatal):
+                # SILENT degradation, no WARNING. Round 4 (M3, Mira's own
+                # regression on her round-3 R-S2 fix below): #3075's own
+                # minimal test fixtures have no vec_nodes table at all, so
+                # on any seat where sqlite-vec IS actually available this
+                # exact exception fires on EVERY write in those fixtures
+                # -- R-S2's single widened `except Exception` logged a
+                # WARNING here too, which turned two previously-green
+                # #3075 tests (test_enabled_false_is_ignored_still_embeds,
+                # test_all_succeed) red on such a seat. Kept separate from
+                # the branch below so this one specific, long-tolerated
+                # exception type stays exactly as quiet as it always was.
+                vec_mirror_ok = False
+            except Exception as exc:
+                # Any OTHER exception from this step (round 3, R-S2 --
+                # e.g. _sqlite_vec.serialize_float32 raising) — JSON still
+                # canonical either way. Still a TOLERATED degradation
+                # (#3075 C2), but now visible via a WARNING instead of
+                # being silently swallowed. Narrowed to only
+                # sqlite3.OperationalError before R-S2 — any OTHER
+                # exception type here fell through to the outer catch-all
+                # below, which defaults stage="embed" and wrongly implies
+                # the embedder (not the vec mirror) is unhealthy, even
+                # though both the embedder and the canonical
+                # nodes.embedding write already succeeded.
+                logging.getLogger(__name__).warning(
+                    "vec_nodes mirror write failed for node %s: %r -- the "
+                    "canonical nodes.embedding write succeeded; KNN index "
+                    "degraded for this node.", node_id, exc,
+                )
                 vec_mirror_ok = False
 
         return EmbeddingOutcome(
             status="embedded", node_id=node_id, vec_mirror_ok=vec_mirror_ok,
         )
     except Exception as exc:
+        # Anything NOT already attributed to "text"/"embed"/"store" above
+        # (e.g. a config-read error ahead of all three) -- defaulted to
+        # "embed", the closest-fit bucket; see EmbeddingOutcome's docstring.
         logging.getLogger(__name__).warning(
             "embedding computation FAILED for node %s: %r — node left "
             "without an embedding (recall degraded for this node until "
             "re-embedded).",
             node_id, exc,
         )
-        return EmbeddingOutcome(status="failed", node_id=node_id, detail=repr(exc))
+        return EmbeddingOutcome(
+            status="failed", node_id=node_id, detail=repr(exc), stage="embed",
+        )
+
+
+def _maybe_clear_write_embed_failed_flag(conn: sqlite3.Connection) -> None:
+    """Rider 3 (#345 PR3 B3, Kepler's ruling): react to a lingering
+    `write-embed-failed` restore flag the moment SOME write embeds
+    successfully (normally, or after a recovered in-write revive) --
+    not only at the next sleep backfill ("a flag that says 'embedder
+    down' for hours after it came back is the surface lying in the other
+    direction").
+
+    Called by _compute_and_store_embedding_with_revive on EVERY outcome
+    whose final status is "embedded" (never "skipped" — a skip is not a
+    recovery).
+
+    Round 4 (M2, Kepler's ruling, seq 6540): a recovered write RECOUNTS
+    rather than unconditionally clearing -- Mira's finding (round-4
+    review on #3343) was that the embedder recovering proves only that
+    the EMBEDDER is healthy again, not that every OTHER node is now
+    embedded; the old unconditional clear made both hooks report
+    all-clear (not_fully_restored=False, null_count=0) while a different,
+    still-NULL node's debt silently disappeared from both readers until
+    the next sleep scan happened to notice. The recount
+    (_safe_count_missing_embeddings -- M1's non-throwing wrapper, used
+    here too since this call sits on the same write path M1 was fixing)
+    runs inside the caller's still-open transaction, same respect_lease/
+    commit=False contract as before:
+      - n == 0: every node is genuinely embedded now -- clear the row
+        (unchanged from before this round).
+      - n > 0: real per-node debt remains elsewhere -- REWRITE the row
+        (not clear it) with null_count=n and cause
+        "per-node-failures (write-embed-failed recovered at <T>)", so
+        #3075's OWN backfill owns that debt from here on, and the write
+        path stops claiming "embedder down" for a condition the embedder
+        itself no longer has. Both hooks' readers (_check_embedding_
+        restore_flag in engram-surface-hook.py and engram-session-start-
+        hook.py) already report "NOT FULLY RESTORED" for any cause that
+        doesn't start with "detection-failed" -- no hook change needed.
+
+    NEVER acts on any OTHER cause (per-node-failures / embedder-unavailable
+    / detection-failed / regeneration-* / the legacy disabled-by-config
+    value) -- those belong to the restore pathway (#3075) and are cleared
+    only by its own backfill, never by this write-time path. The
+    startswith check (rather than equality) tolerates the cause string's
+    trailing "revive <T> -> <R>; next revive not before <N>" suffix, which
+    varies per write.
+
+    Round 3 (R-S1): this clear/rewrite assumes one LIVE MCP server
+    process per knowledge.db at a time -- a process restart (the flag
+    persisting across the restart, then a later process's write clearing
+    it) is the intended case this exists for. Two concurrent live
+    processes against the same knowledge.db, each with its own
+    EmbeddingManager singleton, are NOT covered: one process's lucky
+    successful write could react to a
+    flag that still accurately describes a DIFFERENT process's ongoing
+    failure.
+    """
+    flag = _get_embedding_restore_flag(conn)
+    cause = flag.get("cause") or ""
+    if not cause.startswith("write-embed-failed"):
+        return
+    n = _safe_count_missing_embeddings(conn)
+    if n == 0:
+        _clear_embedding_restore_flag(conn, respect_lease=True, commit=False)
+        return
+    _set_embedding_restore_flag(
+        conn,
+        null_count=n,
+        cause=f"per-node-failures (write-embed-failed recovered at {_now()})",
+        respect_lease=True,
+        commit=False,
+    )
+
+
+def _compute_and_store_embedding_with_revive(
+    conn: sqlite3.Connection, node_id: str,
+) -> "EmbeddingOutcome":
+    """Write-path wrapper around _compute_and_store_embedding (#345 PR3
+    B1-B3, per Kepler's binding ruling on issue #345).
+
+    ONLY called from _stamp_new_node -- i.e. only on the write path. Every
+    OTHER caller of _compute_and_store_embedding (_reembed_nodes, and
+    therefore _reembed_all_nodes / _reembed_null_nodes / the backfill tool
+    / the sleep skill's restore pass) is UNTOUCHED: this function wraps
+    _compute_and_store_embedding rather than modifying it in place, so the
+    revive/cooldown/flag-clear behaviour below applies only to node
+    creation, never to a bulk restore pass (explicitly out of scope per
+    the spec's DO NOT list: "change the backfill tool or the sleep
+    skill").
+
+    On a "failed" outcome whose stage is "embed" (R2), with no cooldown
+    active for this model: calls EmbeddingManager.revive() once (drop +
+    reload, in-process only, never touching the surface daemon), then
+    retries the embed for this node ONCE in the same write (B2). If the
+    retry embeds, the model's cooldown is cleared and any lingering
+    `write-embed-failed` flag is cleared too (Rider 3). If the retry still
+    fails, the model enters a cooldown (Rider 1: EMBED_REVIVE_COOLDOWN_S)
+    and the restore flag is set with `respect_lease=True` (B3).
+
+    On a "failed" outcome whose stage is "text" or "store" (R2): no
+    revive, no cooldown -- the embedder itself is not implicated (the
+    vector was computed correctly for "store"; text extraction is an
+    unrelated bug for "text"). The flag is still set (`respect_lease=
+    True`), with a cause naming the stage and detail directly, and
+    revive_attempted_at/revive_result/next_revive_not_before all stay at
+    their None defaults -- there was never a revive attempt to record.
+
+    On a "failed" outcome DURING an active cooldown: no revive is
+    attempted; revive_result is "cooldown" and next_revive_not_before
+    echoes the existing cooldown deadline (Rider 1).
+
+    On a first-try "embedded" outcome (the overwhelming common case, no
+    revive ever attempted): still checks-and-maybe-clears a lingering
+    `write-embed-failed` flag (Rider 3 applies to EVERY successful write,
+    not only revived ones).
+
+    "skipped" passes through unchanged -- no revive, no flag read/write
+    (B4: skipped adds nothing to a tool's response, and Rider 3 is scoped
+    to "embedded" outcomes only).
+
+    Round 2 (R4): the revive above runs INSIDE the caller's open SQLite
+    write transaction (_stamp_new_node has already executed its importance
+    UPDATE on `conn` before calling this function, and does not commit
+    until after it returns) -- an in-process model reload therefore holds
+    that transaction open for its own duration.
+
+    Round 4 (M4, Kepler's ruling seq 6544): the in-write cost bound is ONE
+    LOCAL model load (seconds, disk-bound -- a genuine cold read off the
+    local HuggingFace cache, NOT a cached in-process reload), at most
+    once per EMBED_REVIVE_COOLDOWN_S (300s) per model, inside the writer
+    lock. The earlier figure measured here (2026-10-03, one Mac seat,
+    cached all-MiniLM-L6-v2, sentence-transformers already imported as it
+    is in a running server: 0.06-0.26s per reload) was a cached
+    in-process reload, not a disk-bound cache load, and is NOT an upper
+    bound for this cost -- see EmbeddingManager.revive() and
+    _load_model_local_only's own docstrings for why the write path never
+    falls back to an online download (which WOULD be unbounded) for this
+    specific call.
+
+    Round 3 (R-B1, BLOCKER on reviewer comment 5972004666): every
+    `_set_embedding_restore_flag` call reached from this function (and
+    `_maybe_clear_write_embed_failed_flag`'s own `_clear_embedding_
+    restore_flag` call) passes `commit=False` -- those two helpers
+    predate this PR and always committed unconditionally, which is
+    correct for their ORIGINAL callers (each owns its own isolated
+    transaction) but was never safe once THIS function started calling
+    them from inside `_stamp_new_node`'s caller's own open write
+    transaction: an unconditional commit there would durably commit the
+    caller's ENTIRE pending transaction early, not just the flag row,
+    breaking the atomic-create contract several call sites document (e.g.
+    engram_trust.py's "Atomic create" comment). `commit=False` here, the
+    default `commit=True` everywhere else, so every pre-existing caller
+    of either helper is unchanged. CLASS SWEEP (every function reachable
+    from this wrapper, confirmed to neither commit nor roll back `conn`):
+    _compute_and_store_embedding (and its own _embedding_text_for_node /
+    `_embedder`.is_available/_load_model/embed calls -- none touch `conn`
+    at all), _maybe_clear_write_embed_failed_flag,
+    _get_embedding_restore_flag, _ensure_embedding_restore_state_table,
+    _count_missing_embeddings, _get_embedding_config,
+    `_embedder`.revive/._revive_cooldown (no `conn` access whatsoever).
+    _set_embedding_restore_flag / _clear_embedding_restore_flag
+    themselves no longer commit when called with `commit=False`, as
+    above. The ONLY two functions that ever called conn.commit() on this
+    path were those two helpers -- now gated by this kwarg.
+    """
+    outcome = _compute_and_store_embedding(conn, node_id)
+
+    if outcome.status == "skipped":
+        return outcome
+
+    if outcome.status == "embedded":
+        _maybe_clear_write_embed_failed_flag(conn)
+        return outcome
+
+    # outcome.status == "failed" from here on.
+
+    # #345 PR3 round 2 (R2): only an "embed"-stage failure is an
+    # embedder-health signal. A "text" or "store" stage failure means the
+    # embedder itself is fine -- the vector was computed correctly -- so
+    # no revive is attempted, no cooldown is started, and the flag/message
+    # built below must not claim the embedder is down.
+    if outcome.stage != "embed":
+        _set_embedding_restore_flag(
+            conn,
+            null_count=_safe_count_missing_embeddings(conn),
+            cause=f"write-embed-failed: {outcome.stage} error: {outcome.detail}",
+            respect_lease=True,
+            commit=False,
+        )
+        return outcome
+
+    model_name = _get_embedding_config().get("model", DEFAULT_EMBEDDING_MODEL)
+
+    # #345 PR3 round 2 (R3): production code does not branch on whether
+    # `_embedder` is the real EmbeddingManager or a test double -- any
+    # caller-substituted double (tests that replace the whole `_embedder`
+    # singleton) must carry a real `_revive_cooldown` dict and a `revive()`
+    # method, same as the production class. See test_strip_agent_facing_
+    # fields.py / test_action_hints.py / test_polarity_nli.py's doubles.
+    cooldown_started = _embedder._revive_cooldown.get(model_name)
+    now_dt = datetime.now(timezone.utc)
+
+    if cooldown_started:
+        not_before_dt = (
+            datetime.fromisoformat(cooldown_started)
+            + timedelta(seconds=EMBED_REVIVE_COOLDOWN_S)
+        )
+        if now_dt < not_before_dt:
+            final_outcome = outcome._replace(
+                revive_attempted_at=cooldown_started,
+                revive_result="cooldown",
+                next_revive_not_before=not_before_dt.isoformat(),
+            )
+            _set_embedding_restore_flag(
+                conn,
+                null_count=_safe_count_missing_embeddings(conn),
+                cause=(
+                    f"write-embed-failed: revive {final_outcome.revive_attempted_at} "
+                    f"-> {final_outcome.revive_result}; next revive not before "
+                    f"{final_outcome.next_revive_not_before}"
+                ),
+                respect_lease=True,
+                commit=False,
+            )
+            return final_outcome
+        # Cooldown expired on wall-clock time alone -- fall through to a
+        # fresh revive attempt below, same as a never-cooled-down model.
+
+    # No active cooldown: attempt one in-process revive, then retry the
+    # embed for this node ONCE in the same write (B2).
+    revive_attempted_at = _now()
+    _embedder.revive(model_name)
+    retry_outcome = _compute_and_store_embedding(conn, node_id)
+
+    if retry_outcome.status == "embedded":
+        _embedder._revive_cooldown.pop(model_name, None)
+        final_outcome = retry_outcome._replace(
+            revive_attempted_at=revive_attempted_at,
+            revive_result="recovered",
+        )
+        _maybe_clear_write_embed_failed_flag(conn)
+        return final_outcome
+
+    # Still failing (retry_outcome.status in {"failed", "skipped"} -- a
+    # skip here would mean the embedder became unavailable mid-revive,
+    # itself an unexpected state; treated the same as "failed" for the
+    # write-path contract, since the node still needs flagging either way).
+    _embedder._revive_cooldown[model_name] = revive_attempted_at
+    next_revive_not_before = (
+        datetime.now(timezone.utc) + timedelta(seconds=EMBED_REVIVE_COOLDOWN_S)
+    ).isoformat()
+    final_outcome = retry_outcome._replace(
+        status="failed",
+        revive_attempted_at=revive_attempted_at,
+        revive_result="still-failing",
+        next_revive_not_before=next_revive_not_before,
+    )
+    _set_embedding_restore_flag(
+        conn,
+        null_count=_safe_count_missing_embeddings(conn),
+        cause=(
+            f"write-embed-failed: revive {revive_attempted_at} -> "
+            f"still-failing; next revive not before {next_revive_not_before}"
+        ),
+        respect_lease=True,
+        commit=False,
+    )
+    return final_outcome
+
+
+def _embedding_response_block(outcome: "EmbeddingOutcome") -> dict | None:
+    """Build the B4 'embedding_failure' response block for a tool's return
+    value (#345 PR3 B4, per Kepler's binding ruling).
+
+    Round 3 (K1): the key is `embedding_failure`, not `embedding` --
+    `_strip_agent_facing` removes every key named `embedding` from every
+    tool response (`_AGENT_STRIP_KEYS`), so a block returned under that
+    name would never reach the agent.
+
+    Round 2 (R1): the outer key every caller assigns this block to is named
+    `embedding_failure`, not `embedding` -- `_AGENT_STRIP_KEYS` strips any
+    key literally named "embedding" from every @mcp.tool response (it
+    exists to drop a node's raw vector payload), which silently discarded
+    this block wherever a call site also ran `_strip_agent_facing` on its
+    result (found in round 1: `engram_add_observation_batch` lost the block
+    entirely via its own recursive strip over `results`). Renaming the key
+    sidesteps the collision outright; the strip-then-add workarounds at the
+    two affected call sites are no longer needed.
+
+    Returns None for "skipped" and "embedded" outcomes (B4: "skipped and
+    embedded add nothing to the response (no new keys, no message)") --
+    callers treat None as "add nothing."
+
+    For a "failed" outcome (status still failed after B1/B2's in-write
+    revive attempt), returns a dict with the 5 fields B4 specifies plus a
+    "message" key carrying the one-line loud report. The message key lives
+    INSIDE this block rather than as a new top-level "message" key on the
+    tool's response -- several tool impls (e.g. _ask_impl) already use a
+    top-level "message" key for their own unrelated success text, and B4
+    does not say where the message goes; nesting it here avoids clobbering
+    those existing keys. Documented as a judgment call in the PR handoff.
+
+    Rider 2 (Kepler's ruling): the message must name the operator's own
+    revive -- reconnect the MCP server (/mcp) so the model reloads, and
+    check the model cache if that still doesn't help. Round 2 (R2): this
+    only applies to a "embed"-stage failure -- the embedder is the thing
+    down. A "text"/"store"-stage failure never claims the embedder is
+    down (it isn't); the message instead names the actual stage and
+    detail, with no /mcp mention, since reconnecting the MCP server would
+    not fix a text-extraction bug or a locked database.
+    """
+    if outcome.status != "failed":
+        return None
+    if outcome.stage == "embed":
+        message = (
+            f"embedder down (revive attempted at {outcome.revive_attempted_at}, "
+            f"result: {outcome.revive_result}); node stored unembedded, "
+            f"backfill at next sleep. To revive: reconnect the MCP server "
+            f"(/mcp) so the model reloads; if that doesn't help, check the "
+            f"model cache."
+        )
+    else:
+        message = (
+            f"embedding not stored ({outcome.stage} error: {outcome.detail}); "
+            f"node stored unembedded, backfill at next sleep."
+        )
+    return {
+        "status": outcome.status,
+        "detail": outcome.detail,
+        "revive_attempted_at": outcome.revive_attempted_at,
+        "revive_result": outcome.revive_result,
+        "next_revive_not_before": outcome.next_revive_not_before,
+        "message": message,
+    }
 
 
 def _reembed_nodes(conn: sqlite3.Connection, node_ids: list[str], caller_name: str) -> dict:
@@ -5775,7 +7226,7 @@ def _ensure_embedding_restore_state_table(conn: sqlite3.Connection) -> None:
 
 def _set_embedding_restore_flag(
     conn: sqlite3.Connection, *, null_count: int, cause: str,
-    respect_lease: bool = False,
+    respect_lease: bool = False, commit: bool = True,
 ) -> bool:
     """Persist the "DB not fully restored" flag (#3075 C5 round 2).
 
@@ -5785,14 +7236,17 @@ def _set_embedding_restore_flag(
     engram-surface-hook.py's own _check_embedding_restore_flag) and by
     engram_stats/engram_diagnose.
 
-    `cause` is one of "disabled-by-config" / "embedder-unavailable" /
+    `cause` is one of "embedder-unavailable" /
     "per-node-failures" / "detection-failed: <ExceptionType>" (round 5) /
     "regeneration-pending" (the provisional value written before the async
     regeneration thread has run) / "regeneration-running" (#3077 — a
     SINGLE-FLIGHT LEASE, written via _try_acquire_regeneration_lease, not
     this function directly, once the thread actually starts working — see
     that function and _run_embedding_restore_regeneration below, which
-    overwrites this row again with the real outcome on completion).
+    overwrites this row again with the real outcome on completion). A DB
+    predating #345 PR2 may still carry the legacy value
+    "disabled-by-config" in an OLD row -- never written fresh any more
+    (the toggle that produced it is retired and now fatal at startup).
 
     #3077 round 4 (Borges's colleague-pass required fix on PR#3078):
     `respect_lease=True` makes this write ATOMICALLY conditional on no
@@ -5819,7 +7273,16 @@ def _set_embedding_restore_flag(
     exactly).
 
     Commits immediately — this is a small, standalone bookkeeping write,
-    not part of the caller's own larger transaction.
+    not part of the caller's own larger transaction. UNLESS `commit=False`
+    (round 3, R-B1): the write-path wrapper
+    (`_compute_and_store_embedding_with_revive`) calls this function from
+    INSIDE `_stamp_new_node`'s caller's own open write transaction, where
+    an unconditional commit would durably commit the caller's ENTIRE
+    pending transaction early, not just this flag row. `commit=False`
+    defers to the caller's own `conn.commit()`/`conn.rollback()`; the
+    default `commit=True` preserves every PRE-EXISTING caller (the
+    detection site, the lease finalize write, the manual regen script)
+    exactly as before.
     """
     _ensure_embedding_restore_state_table(conn)
     if respect_lease:
@@ -5835,7 +7298,8 @@ def _set_embedding_restore_flag(
             "   OR embedding_restore_state.updated_at < ?",
             (null_count, cause, _now(), _cutoff),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
         return cur.rowcount > 0
     conn.execute(
         "INSERT INTO embedding_restore_state "
@@ -5846,12 +7310,13 @@ def _set_embedding_restore_flag(
         "cause=excluded.cause, updated_at=excluded.updated_at",
         (null_count, cause, _now()),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return True
 
 
 def _clear_embedding_restore_flag(
-    conn: sqlite3.Connection, *, respect_lease: bool = False,
+    conn: sqlite3.Connection, *, respect_lease: bool = False, commit: bool = True,
 ) -> bool:
     """Clear the restore-completeness flag (#3075 C5 round 2) — called after
     a fully-successful regeneration (every NULL-embedding node now has an
@@ -5868,6 +7333,13 @@ def _clear_embedding_restore_flag(
     `_set_embedding_restore_flag`'s own `respect_lease` parameter; see
     that function's docstring for the full rationale, not duplicated
     here.
+
+    Round 3 (R-B1): `commit=False` — same reasoning, same caller
+    obligation (the write-path's `_maybe_clear_write_embed_failed_flag`
+    passes it), same default-True-preserves-every-existing-caller
+    contract as `_set_embedding_restore_flag`'s own `commit` parameter;
+    see that function's docstring for the full rationale, not duplicated
+    here.
     """
     _ensure_embedding_restore_state_table(conn)
     if respect_lease:
@@ -5882,7 +7354,8 @@ def _clear_embedding_restore_flag(
             "   OR embedding_restore_state.updated_at < ?",
             (_now(), _cutoff),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
         return cur.rowcount > 0
     conn.execute(
         "INSERT INTO embedding_restore_state "
@@ -5892,7 +7365,8 @@ def _clear_embedding_restore_flag(
         "not_fully_restored=0, null_count=0, cause=NULL, updated_at=excluded.updated_at",
         (_now(),),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return True
 
 
@@ -5961,11 +7435,13 @@ def _finalize_embedding_restore_flag(
     itself; that decision is always the re-count.
 
     Cause is derived from the CURRENT embedder state at decision time —
-    not from the pass's own history: "disabled-by-config" if embeddings
-    are now disabled via config, "embedder-unavailable" if the embedder
-    now reports unavailable, else "per-node-failures" (a genuinely
-    available, enabled embedder that still couldn't embed every
+    not from the pass's own history: "embedder-unavailable" if the
+    embedder now reports unavailable, else "per-node-failures" (a
+    genuinely available embedder that still couldn't embed every
     remaining node — the one case that IS a real, actionable failure).
+    (#345 PR2 retired the third, `enabled`-gated cause,
+    "disabled-by-config", that used to be checked first here — see this
+    function's own call site.)
 
     Shared by both call sites that finalize this flag after a
     regeneration pass — `_run_embedding_restore_regeneration` (the async
@@ -5992,10 +7468,12 @@ def _finalize_embedding_restore_flag(
     if _missing == 0:
         _clear_embedding_restore_flag(conn, respect_lease=respect_lease)
         return
-    emb_config = _get_embedding_config()
-    if not emb_config.get("enabled", True):
-        _cause = "disabled-by-config"
-    elif not _embedder.is_available():
+    # #345 PR2 (A2): the `enabled`-gated "disabled-by-config" cause that
+    # used to be checked first here is REMOVED, extending the spec's
+    # explicit ~3477 instruction to this structurally identical branch --
+    # same unreachable cause, same reasoning (the toggle is retired; the
+    # startup gate already refuses to start with `enabled: false`).
+    if not _embedder.is_available():
         _cause = "embedder-unavailable"
     else:
         _cause = "per-node-failures"
@@ -6190,10 +7668,10 @@ def _run_embedding_restore_regeneration(db_path: str) -> None:
     (round 4) decides clear-vs-set from a FRESH, skip-aware state
     re-count of missing embeddings — never from this pass's own returned
     counts dict — with a cause determined by re-checking the CURRENT
-    embedder/config state at that point: "embedder-unavailable" if it
-    dropped mid-run, "disabled-by-config" if embeddings were disabled
-    mid-run, "per-node-failures" if it's still available/enabled and
-    individual embed() calls simply failed. See that function's own
+    embedder state at that point: "embedder-unavailable" if it dropped
+    mid-run, "per-node-failures" if it's still available and individual
+    embed() calls simply failed (#345 PR2 retired the third,
+    `enabled`-gated cause, "disabled-by-config"). See that function's own
     docstring for the full round 2/3/4 history this line summarizes.
     Because this always writes a DIFFERENT cause than
     "regeneration-running" (or clears the flag outright), the lease is
@@ -6263,13 +7741,13 @@ def _get_thresholds_config() -> dict:
     }
     if CONFIG_PATH.exists():
         try:
-            config = json.loads(CONFIG_PATH.read_text())
+            config = _config_io.read_config_json(CONFIG_PATH)
             user = config.get("thresholds", {})
             if isinstance(user, dict):
                 merged = dict(defaults)
                 merged.update(user)
                 return merged
-        except (json.JSONDecodeError, OSError):
+        except (_config_io.ConfigUnreadableError, OSError):
             pass
     return defaults
 
@@ -6717,7 +8195,7 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                     lines.append(f"Basis: {n['logical_chain'][:200]}")
             elif ntype == "definition":
                 lines.append(f"### {n['id']} [{status_tag}]")
-                meta = json.loads(n["metadata"]) if n["metadata"] else {}
+                meta = _metadata_dict(n["metadata"])
                 term = meta.get("term", "")
                 defn = meta.get("definition", n["claim"] or "")
                 lines.append(f"Term: {term}")
@@ -6817,7 +8295,7 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 if n["logical_chain"]:
                     lines.append(f"Analysis: {n['logical_chain'][:200]}")
             elif ntype == "task":
-                meta = json.loads(n["metadata"]) if n["metadata"] else {}
+                meta = _metadata_dict(n["metadata"])
                 scope = meta.get("scope", "routine")
                 lines.append(f"### {n['id']} [{n['status'] or 'planned'}] [{scope}] [{status_tag}]")
                 lines.append(f"Task: {n['claim']}")
@@ -6827,6 +8305,7 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 ).fetchall()
                 for e in serves_edges:
                     lines.append(f"Serves: {e['target_id']}")
+                # tasks are not snapshot-rendered (see test_c2_task_nodes_are_not_rendered_in_the_snapshot_at_all); a new task's implements_ids edge is `about`: add it here when tasks are rendered.
                 impl_edges = conn.execute(
                     "SELECT target_id, relation FROM edges WHERE source_id = ? AND relation IN ('cites', 'subtask_of')",
                     (n["id"],),
@@ -6834,7 +8313,7 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 for e in impl_edges:
                     lines.append(f"{e['relation'].replace('_', ' ').title()}: {e['target_id']}")
             elif ntype == "person":
-                meta = json.loads(n["metadata"]) if n["metadata"] else {}
+                meta = _metadata_dict(n["metadata"])
                 person_name = meta.get("name", "")
                 person_role = meta.get("role", "")
                 lines.append(f"### {n['id']} [{status_tag}]")
@@ -6844,7 +8323,7 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 if n["logical_chain"]:
                     lines.append(f"Background: {n['logical_chain'][:200]}")
             elif ntype == "lesson":
-                meta = json.loads(n["metadata"]) if n["metadata"] else {}
+                meta = _metadata_dict(n["metadata"])
                 lines.append(f"### {n['id']} [{conf_str}] [{status_tag}]")
                 lines.append(f"Claim: {n['claim']}")
                 nudge = meta.get("scaffolding_nudge", "")
@@ -6858,9 +8337,10 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 incidents = [r["source_id"] for r in incident_rows]
                 if incidents:
                     lines.append(f"Incidents: {', '.join(incidents)}")
-                # Cites edges for context still flow lesson → context_node.
+                # Context edges flow lesson → context_node: `about` since #2243,
+                # `cites` for legacy rows written before it.
                 ctx_rows = conn.execute(
-                    "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'cites'",
+                    "SELECT target_id FROM edges WHERE source_id = ? AND relation IN ('cites', 'about')",
                     (n["id"],),
                 ).fetchall()
                 ctx_ids = [r["target_id"] for r in ctx_rows]
@@ -7231,7 +8711,9 @@ def _commit_snapshot_async(
 
     # 1. #786 read-mark on conn — a real-page read forces a genuine WAL read mark so
     #    the capture sees a consistent committed view (identical discipline to the
-    #    sync dump; verified conn.backup() works while this txn is open). Guard: don't
+    #    sync dump). The capture itself backs up from a fresh read-only connection,
+    #    never from conn (#3232: conn.backup() hangs forever if conn holds an
+    #    uncommitted write), so conn's transaction state cannot block it. Guard: don't
     #    BEGIN if conn already has an open transaction.
     #    #3222: a failure here is NOT silent. The capture still runs (durability
     #    wins) but the result dict carries read_mark="failed" + read_mark_error and
@@ -7721,7 +9203,7 @@ def _current_successor(conn, node_id: str) -> "str | None":
     ).fetchone()
     if not row:
         return None
-    nxt = row["superseded_by"]
+    nxt = row[0]  # SELECT superseded_by
     while nxt and nxt not in seen:
         seen.add(nxt)
         nrow = conn.execute(
@@ -7730,9 +9212,9 @@ def _current_successor(conn, node_id: str) -> "str | None":
         ).fetchone()
         if not nrow:
             return None
-        if nrow["is_current"] == 1:
+        if nrow[1] == 1:  # SELECT superseded_by, is_current
             return nxt
-        nxt = nrow["superseded_by"]
+        nxt = nrow[0]
     return None
 
 
@@ -7822,6 +9304,12 @@ def _reflect_keywords(row) -> list | None:
 # ---------------------------------------------------------------------------
 
 
+# Bounds for the KNN widening in _semantic_search: at most 4 rounds (k = 40,
+# 160, 640, 2560 for the default top_k), and k never above sqlite-vec's 4096 cap.
+_KNN_MAX_ROUNDS = 4
+_KNN_MAX_K = 4096
+
+
 def _semantic_search(
     conn: sqlite3.Connection,
     query_text: str,
@@ -7837,7 +9325,8 @@ def _semantic_search(
     (SIMD cosine distance). Joined back to nodes for metadata + filtered
     by is_current, importance_threshold, type_filter, min_similarity.
     KNN is applied before filtering, so overfetch (top_k * OVERFETCH) to
-    allow post-filtering without starving the result set.
+    allow post-filtering without starving the result set, and widen the
+    overfetch (bounded) when the filters still leave fewer than top_k.
 
     Slow path (fallback): O(N) pure-Python cosine — only used when the
     sqlite-vec extension failed to load.
@@ -7851,7 +9340,7 @@ def _semantic_search(
     """
     try:
         emb_config = _get_embedding_config()
-        if not emb_config.get("enabled", True) or not _embedder.is_available():
+        if not _embedder.is_available():
             return []
 
         model_name = emb_config.get("model", DEFAULT_EMBEDDING_MODEL)
@@ -7862,66 +9351,89 @@ def _semantic_search(
         # ── Fast path: sqlite-vec KNN ──────────────────────────────────────
         if _VEC_BACKEND_AVAILABLE and _sqlite_vec is not None and len(query_vector) == 384:
             try:
-                # Overfetch so post-filter by is_current / importance / type
-                # can still yield top_k. Cap at a reasonable ceiling — KNN
-                # cost grows with k, and we rarely need more than ~40 rows
-                # surviving the filter.
-                overfetch = max(top_k * 4, 40)
-                vec_rows = conn.execute(
-                    "SELECT node_id, distance FROM vec_nodes "
-                    "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-                    (_sqlite_vec.serialize_float32(query_vector), overfetch),
-                ).fetchall()
-                if not vec_rows:
-                    return []
+                # vec0 has no metadata column to pre-filter on (a type/current
+                # column would need a vec_nodes schema migration), so the KNN
+                # runs BEFORE the is_current / importance / type filters.
+                # Fetch k = max(top_k*4, 40) first, then WIDEN (x4 per round, at
+                # most _KNN_MAX_ROUNDS rounds, k capped at _KNN_MAX_K) while the
+                # filters left fewer than top_k results AND the KNN still has
+                # candidates at or above min_similarity. Without this, a block of
+                # nearer-but-filtered rows (evidence today) takes the KNN slots
+                # and the semantic leg returns fewer than top_k even though
+                # enough searchable nodes exist. vec0 scans every row regardless
+                # of k, so a larger k only adds heap and result-row cost.
+                query_blob = _sqlite_vec.serialize_float32(query_vector)
+                k = max(top_k * 4, 40)
+                scored: list = []
+                for _round in range(_KNN_MAX_ROUNDS):
+                    vec_rows = conn.execute(
+                        "SELECT node_id, distance FROM vec_nodes "
+                        "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                        (query_blob, k),
+                    ).fetchall()
+                    if not vec_rows:
+                        return []
 
-                # Distance → similarity: distance_metric=cosine returns
-                # (1 - cos_sim). Pre-filter by min_similarity before the JOIN
-                # to avoid fetching nodes we'll discard.
-                keep = []
-                for row in vec_rows:
-                    sim = 1.0 - float(row[1])
-                    if sim >= min_similarity:
-                        keep.append((row[0], sim))
-                if not keep:
-                    return []
+                    # Distance → similarity: distance_metric=cosine returns
+                    # (1 - cos_sim). Pre-filter by min_similarity before the JOIN
+                    # to avoid fetching nodes we'll discard.
+                    keep = []
+                    for row in vec_rows:
+                        sim = 1.0 - float(row[1])
+                        if sim >= min_similarity:
+                            keep.append((row[0], sim))
 
-                ids = [k[0] for k in keep]
-                placeholders = ",".join("?" * len(ids))
-                # When include_superseded=False: require is_current=1 (excludes
-                # both superseded and retracted). When include_superseded=True:
-                # allow superseded (is_current=0) but always exclude retracted —
-                # retracted nodes were never valid (defense-in-depth).
-                where_parts = [f"id IN ({placeholders})"]
-                if not include_superseded:
-                    where_parts.append("is_current = 1")
-                where_parts.append("(status IS NULL OR status != 'retracted')")
-                where_parts.append("COALESCE(importance_score, 0) >= ?")
-                where_clause = " AND ".join(where_parts)
-                meta_rows = conn.execute(
-                    f"SELECT id, type, claim, confidence, quote_type, importance_score "
-                    f"FROM nodes WHERE {where_clause}",
-                    ids + [importance_threshold],
-                ).fetchall()
-                meta = {r["id"]: r for r in meta_rows}
+                    scored = []
+                    if keep:
+                        ids = [k_[0] for k_ in keep]
+                        placeholders = ",".join("?" * len(ids))
+                        # When include_superseded=False: require is_current=1
+                        # (excludes both superseded and retracted). When
+                        # include_superseded=True: allow superseded (is_current=0)
+                        # but always exclude retracted — retracted nodes were
+                        # never valid (defense-in-depth).
+                        where_parts = [f"id IN ({placeholders})"]
+                        if not include_superseded:
+                            where_parts.append("is_current = 1")
+                        where_parts.append("(status IS NULL OR status != 'retracted')")
+                        where_parts.append(_not_search_excluded_sql())
+                        where_parts.append("COALESCE(importance_score, 0) >= ?")
+                        where_clause = " AND ".join(where_parts)
+                        meta_rows = conn.execute(
+                            f"SELECT id, type, claim, confidence, quote_type, importance_score "
+                            f"FROM nodes WHERE {where_clause}",
+                            ids + [importance_threshold],
+                        ).fetchall()
+                        meta = {r["id"]: r for r in meta_rows}
 
-                scored = []
-                for node_id, sim in keep:
-                    r = meta.get(node_id)
-                    if r is None:
-                        continue  # filtered out (non-current / retracted / below threshold)
-                    if type_filter and r["type"] not in type_filter:
-                        continue
-                    scored.append({
-                        "id": r["id"],
-                        "type": r["type"],
-                        "claim": r["claim"],
-                        "confidence": r["confidence"],
-                        "quote_type": r["quote_type"],
-                        "similarity": round(sim, 4),
-                    })
+                        for node_id, sim in keep:
+                            r = meta.get(node_id)
+                            if r is None:
+                                continue  # filtered out (non-current / retracted / excluded type / below threshold)
+                            if type_filter and r["type"] not in type_filter:
+                                continue
+                            scored.append({
+                                "id": r["id"],
+                                "type": r["type"],
+                                "claim": r["claim"],
+                                "confidence": r["confidence"],
+                                "quote_type": r["quote_type"],
+                                "similarity": round(sim, 4),
+                            })
+                            if len(scored) >= top_k:
+                                break
+
                     if len(scored) >= top_k:
                         break
+                    # Widen only if it can add candidates: the KNN returned a
+                    # full page (more rows may exist), the page's farthest row
+                    # is still at or above min_similarity (rows beyond it are
+                    # below the floor), and k has headroom.
+                    exhausted = len(vec_rows) < k
+                    past_floor = (1.0 - float(vec_rows[-1][1])) < min_similarity
+                    if exhausted or past_floor or k >= _KNN_MAX_K:
+                        break
+                    k = min(k * 4, _KNN_MAX_K)
                 return scored
             except sqlite3.OperationalError:
                 pass  # fall through to Python cosine
@@ -7936,6 +9448,7 @@ def _semantic_search(
                      FROM nodes
                      WHERE (status IS NULL OR status != 'retracted')
                      AND embedding IS NOT NULL
+                     AND {excluded}
                      AND COALESCE(importance_score, 0) >= ?"""
         else:
             sql = """SELECT id, type, claim, confidence, is_current, embedding,
@@ -7944,8 +9457,11 @@ def _semantic_search(
                      WHERE is_current = 1
                      AND (status IS NULL OR status != 'retracted')
                      AND embedding IS NOT NULL
+                     AND {excluded}
                      AND COALESCE(importance_score, 0) >= ?"""
-        rows = conn.execute(sql, (importance_threshold,)).fetchall()
+        rows = conn.execute(
+            sql.format(excluded=_not_search_excluded_sql()), (importance_threshold,)
+        ).fetchall()
 
         scored = []
         for r in rows:
@@ -8041,6 +9557,7 @@ def _similar_existing_matches(
                 "FROM nodes_fts fts "
                 "JOIN nodes n ON n.rowid = fts.rowid "
                 f"WHERE nodes_fts MATCH ? AND n.is_current = 1 "
+                f"AND {_not_search_excluded_sql('n')} "
                 f"AND n.type IN ({type_placeholders}) "
                 "AND COALESCE(n.importance_score, 0) >= ? "
                 "ORDER BY rank "
@@ -8057,7 +9574,7 @@ def _similar_existing_matches(
                 for col in extra_columns:
                     rec[col] = r[col]
                 if extra_metadata_keys:
-                    meta = json.loads(r["metadata"]) if r["metadata"] else {}
+                    meta = _metadata_dict(r["metadata"])
                     for key in extra_metadata_keys:
                         rec[key] = meta.get(key, "")
                 matches.append(rec)
@@ -8068,7 +9585,7 @@ def _similar_existing_matches(
         # Semantic complement. _semantic_search returns standardized
         # records (no per-caller column augmentation), so extras come
         # from a per-match SELECT against `nodes`.
-        if _embedder.is_available() and _get_embedding_config().get("enabled", True):
+        if _embedder.is_available():
             _th = _get_thresholds_config()
             sem_results = _semantic_search(
                 conn, claim,
@@ -8100,7 +9617,7 @@ def _similar_existing_matches(
                         for col in extra_columns:
                             rec[col] = row[col]
                         if extra_metadata_keys:
-                            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+                            meta = _metadata_dict(row["metadata"])
                             for key in extra_metadata_keys:
                                 rec[key] = meta.get(key, "")
                 matches.append(rec)
@@ -8204,7 +9721,7 @@ def _compute_confidence(
                 return round(conf, 3)
 
             # Legacy fallback: use derivation_mode
-            config = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+            config = _config_io.read_config_json(CONFIG_PATH)
             chain_decay = config.get("chain_decay", 0.95)
             corrob_decay = config.get("corroboration_decay", 0.98)
 
@@ -8262,6 +9779,85 @@ CONFIDENCE_RECOMPUTABLE_TYPES = frozenset({
 })
 
 
+def _acknowledged_superseded_premises(conn: sqlite3.Connection,
+                                      node_id: str) -> set:
+    """#3531: the CASCADE_RELATIONS targets of ``node_id`` that its confidence
+    recompute must NOT count, because the node has acknowledged a replacement.
+
+    A target X (of EITHER relation) is returned iff ``node_id`` has an
+    `acknowledged_derives_from` edge to some A that supersedes X, directly or
+    through a chain of `supersedes` edges (edge direction: successor -> old).
+    So a re-acknowledgement (T <- S <- S2, acks to both S and S2) keeps only
+    the latest, S2. A target the node has not yet acknowledged a replacement
+    for (a still-pending one) stays. A node with no acknowledgement edge gets
+    the empty set, so the cascade frontier's behaviour is untouched.
+
+    Malformed supersede cycle: X is dropped only if A does NOT also supersede X
+    back, so mutually-superseding ack targets never drop each other and the
+    premise set is never emptied by a cycle.
+    """
+    acked = [r["target_id"] for r in conn.execute(
+        "SELECT target_id FROM edges WHERE source_id = ? "
+        "AND relation = 'acknowledged_derives_from'", (node_id,)).fetchall()]
+    if not acked:
+        return set()
+    memo: dict = {}
+
+    def _ancestors(start: str) -> set:
+        # Supersede-ancestors of ``start`` (contains ``start`` itself only
+        # through a malformed cycle).
+        if start in memo:
+            return memo[start]
+        found: set = set()
+        frontier = [start]
+        while frontier:
+            cur = frontier.pop()
+            for r in conn.execute(
+                    "SELECT target_id FROM edges WHERE source_id = ? "
+                    "AND relation = 'supersedes'", (cur,)).fetchall():
+                if r["target_id"] not in found:
+                    found.add(r["target_id"])
+                    frontier.append(r["target_id"])
+        memo[start] = found
+        return found
+
+    _rels = sorted(CASCADE_RELATIONS)
+    targets = {r["target_id"] for r in conn.execute(
+        f"SELECT target_id FROM edges WHERE source_id = ? AND relation IN "
+        f"({','.join('?' for _ in _rels)})", (node_id, *_rels)).fetchall()}
+    dropped: set = set()
+    for a in acked:
+        for x in _ancestors(a) & targets:
+            if x != a and a not in _ancestors(x):
+                dropped.add(x)
+    return dropped
+
+
+def _recompute_premise_ids(conn: sqlite3.Connection, node_id: str) -> list:
+    """The ONE definition of the premise set a confidence recompute of
+    ``node_id`` reads (#3531): every CASCADE_RELATIONS target (`derives_from`
+    + `acknowledged_derives_from`), ordered by target id, each at most once
+    (a node holding BOTH edges to one premise lists it once -- a doubled
+    premise would be noisy-ORed twice), EXCEPT a premise
+    (either relation) whose replacement the node has acknowledged (see
+    `_acknowledged_superseded_premises`). Shared by `_recompute_node_confidence`
+    and tools/surgical.py::_compute_confidence_for_node so the two copies of
+    the confidence arithmetic cannot disagree about which premises count.
+    """
+    _rels = sorted(CASCADE_RELATIONS)
+    _superseded = _acknowledged_superseded_premises(conn, node_id)
+    return [
+        r["target_id"] for r in conn.execute(
+            f"SELECT DISTINCT target_id FROM edges "
+            f"WHERE source_id = ? AND relation IN "
+            f"({','.join('?' for _ in _rels)}) "
+            f"ORDER BY target_id",
+            (node_id, *_rels),
+        ).fetchall()
+        if r["target_id"] not in _superseded
+    ]
+
+
 def _recompute_node_confidence(conn: sqlite3.Connection, node_id: str,
                                *, write: bool = True) -> dict:
     """Recompute one existing node's confidence from its own stored formula
@@ -8313,10 +9909,7 @@ def _recompute_node_confidence(conn: sqlite3.Connection, node_id: str,
             f"to recompute from (see CONFIDENCE_RECOMPUTABLE_TYPES)"
         )
 
-    try:
-        meta = json.loads(row["metadata"]) if row["metadata"] else {}
-    except (TypeError, json.JSONDecodeError):
-        meta = {}
+    meta = _metadata_dict(row["metadata"])
 
     if ntype == "axiom":
         new = 1.0
@@ -8351,16 +9944,7 @@ def _recompute_node_confidence(conn: sqlite3.Connection, node_id: str,
         # never consulted — the recompute would run on the acknowledge path and
         # find nothing to change, which is exactly the inert behaviour measured
         # while the edge was deferred (0.833 -> 0.833, changed: []).
-        _rels = sorted(CASCADE_RELATIONS)
-        premise_ids = [
-            r["target_id"] for r in conn.execute(
-                f"SELECT target_id FROM edges "
-                f"WHERE source_id = ? AND relation IN "
-                f"({','.join('?' for _ in _rels)}) "
-                f"ORDER BY target_id",
-                (node_id, *_rels),
-            ).fetchall()
-        ]
+        premise_ids = _recompute_premise_ids(conn, node_id)
         if not premise_ids:
             return _skip("derivation has no derives_from premises")
         have_conf = conn.execute(
@@ -8418,10 +10002,7 @@ def _rebuild_incidents_cache() -> dict:
         index: dict[str, dict] = {}
         lesson_count: set[str] = set()
         for r in rows:
-            try:
-                meta = json.loads(r["lesson_meta"]) if r["lesson_meta"] else {}
-            except (TypeError, json.JSONDecodeError):
-                meta = {}
+            meta = _metadata_dict(r["lesson_meta"])
             index[r["incident_id"]] = {
                 "lesson_id": r["lesson_id"],
                 "lesson_claim": r["lesson_claim"],
@@ -8476,10 +10057,7 @@ def _rebuild_cornerstone_anchors_cache() -> dict:
         index: dict[str, dict] = {}
         cornerstone_count: set[str] = set()
         for r in rows:
-            try:
-                meta = json.loads(r["cs_meta"]) if r["cs_meta"] else {}
-            except (TypeError, json.JSONDecodeError):
-                meta = {}
+            meta = _metadata_dict(r["cs_meta"])
             index[r["exemplar_id"]] = {
                 "cornerstone_id": r["cornerstone_id"],
                 "cornerstone_claim": r["cs_claim"],
@@ -8583,10 +10161,7 @@ def _rebuild_principle_triggers() -> dict:
             for r in rows:
                 if r["trigger_id"] == r["principle_id"]:
                     continue
-                try:
-                    meta = json.loads(r["meta"]) if r["meta"] else {}
-                except (TypeError, json.JSONDecodeError):
-                    meta = {}
+                meta = _metadata_dict(r["meta"])
                 entry: dict = {
                     "principle_id": r["principle_id"],
                     "kind": kind,
@@ -8611,7 +10186,10 @@ def _rebuild_principle_triggers() -> dict:
                 by_kind[k] = by_kind.get(k, 0) + 1
 
         os.makedirs(os.path.dirname(PRINCIPLE_TRIGGERS_PATH), exist_ok=True)
-        with open(PRINCIPLE_TRIGGERS_PATH, "w") as f:
+        # Non-blocking, regular-file-only write (#3628): reached from
+        # server._ensure_schema_bootstrap, so a FIFO here must raise OSError
+        # (callers catch Exception), never hang startup.
+        with _regular_io.open_regular_text_write(PRINCIPLE_TRIGGERS_PATH) as f:
             json.dump(index, f, indent=2)
 
         return {
@@ -8630,23 +10208,34 @@ def _with_state_lock(lock_path, fn):
     one blocks -- the critical section is a fast local file read+write (no
     daemon round-trip), so a brief wait is cheap and correctness (no lost
     update) matters more than never-block here. Degrades to running fn()
-    unlocked if fcntl/lockfile-open fails (non-POSIX, permissions) -- same
+    unlocked if fcntl, the lockfile open, or the flock call itself fails
+    (non-POSIX, permissions, a file type or filesystem without flock
+    support) -- same
     never-crash contract as #1709's degrade path, just without the
     non-blocking contention branch (there's nothing to suppress; fn() still
     runs, just unprotected).
 
-    #1720: this exact ~15-line helper is duplicated in
-    src/engram/hooks/claude/engram-surface-hook.py rather than shared -- this
-    module (engram_core.py, MCP server process) and the hook script (a
-    separate subprocess invoked by Claude Code) have no shared import surface
-    today, and a new shared module for ~15 lines isn't worth the engineering
-    (see spec docs/specs/1720-principle-state-write-race.md). If either copy
-    changes, check the other.
+    #1720: this exact ~15-line helper is duplicated rather than shared, in
+    THREE files (#3658): this one (engram_core.py, MCP server process),
+    src/engram/hooks/claude/engram-surface-hook.py and
+    src/engram/hooks/claude/engram-utility-credit-mention-stop.py (hook
+    scripts, each a separate subprocess invoked by Claude Code). Hooks do not
+    import each other and may not import this module, so there is no shared
+    import surface today, and a new shared module for ~15 lines isn't worth
+    the engineering (see spec docs/specs/1720-principle-state-write-race.md).
+    If any copy changes, change the other two; tests/test_utility_state_lock_3658.py
+    pins all three AST-identical (docstring dropped).
     """
+    fd = None
     try:
         import fcntl
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)  # blocking -- no LOCK_NB
     except Exception as exc:
+        # #3658 review: BOTH setup steps (the open and the flock) degrade here;
+        # flock can raise on a file the open accepted (EOPNOTSUPP on a FIFO on
+        # macOS). The lock was never taken, so it is never unlocked: just close
+        # the fd and run fn() unlocked.
         # #1743: this degrade was silent -- nothing distinguished "locked and
         # protected" from "running unlocked," the same diagnosis-costing gap
         # #1737/#1742 fixed for the non-blocking cooldown lock. Emit one
@@ -8669,9 +10258,13 @@ def _with_state_lock(lock_path, fn):
             )
         except Exception:
             pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
         return fn()  # degrade: run unlocked rather than crash or skip
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)  # blocking -- no LOCK_NB
         return fn()
     finally:
         try:
@@ -8718,11 +10311,24 @@ def _reset_principle_enactments(principle_id: str) -> None:
     lock_path = path + ".lock"
 
     def _do_reset():
-        try:
-            with open(path, "r") as f:
-                state = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            state = {}
+        # #3521 row 40: one read rule shared with the hooks (ABSENT -> {}, a
+        # JSON object -> as-is, anything else -> UNKNOWN). On UNKNOWN the file
+        # is neither moved (only the per-prompt surface hook does that) nor
+        # written: a corrupt / non-dict / unreadable / symlinked state file
+        # keeps its bytes. The one stderr line is printed HERE, before any
+        # caller's `except Exception: pass` could eat it; nothing is raised.
+        state, reason, _movable = _regular_io.read_state_json_classified(path)
+        if reason is not None:
+            try:
+                msg = re.sub(r"[\x00-\x1f\x7f]", " ", reason)[:200]
+                print(
+                    f"[engram principle-trigger-state] unusable state file "
+                    f"({msg}) -- enactment reset skipped; file left untouched",
+                    file=sys.stderr,
+                )
+            except Exception:
+                pass
+            return
         entry = state.get(principle_id)
         if isinstance(entry, int):
             entry = {"last_fired_prompt": entry, "strength": 1.0, "enactments": 0, "fires": 0}
@@ -8780,8 +10386,11 @@ def _open_contradiction_ids(conn: sqlite3.Connection, node_id: str) -> list:
     yet. A contradiction's status only leaves 'active' (→ 'resolved' or
     'partially_resolved') once a resolves edge is wired against it
     (_resolve_impl), so status='active' IS the "no resolves closure" test
-    from the issue text — matches the existing obsolescence-scan convention
-    (engram_query._pattern_contradiction_obsolescence_ready).
+    from the issue text. This is the OPEN set (active only), deliberately
+    narrower than UNSETTLED_CONTRADICTION_STATUSES: the obsolescence scan
+    (engram_query._pattern_contradiction_obsolescence_ready) uses the unsettled
+    set, because a partially_resolved contradiction no longer blocks a derive
+    but is still unfinished, so an obsolete side on it is a resolution candidate.
     """
     rows = conn.execute(
         """SELECT DISTINCT ct.id FROM edges e
@@ -9018,6 +10627,23 @@ def _validate_recall_fields(recall_summary: str, recall_keywords) -> tuple:
     return (summary, keywords, needs_tightening, summary_missing, None)
 
 
+def _recall_summary_overrun_note(summary_len: int) -> Optional[str]:
+    """One-line write-response note for a recall_summary over the target (#3537).
+
+    ``summary_len`` is the .strip()'d length _validate_recall_fields judged.
+    Returns the note for the soft-accept band (len > RECALL_SUMMARY_TARGET),
+    None otherwise. Every write path attaches the result under the key
+    ``recall_summary_overrun`` only when it is not None, so the wording lives
+    here and cannot drift between tools. Advisory: never blocks.
+    """
+    if summary_len > RECALL_SUMMARY_TARGET:
+        return (
+            f"recall_summary {summary_len} chars > {RECALL_SUMMARY_TARGET} "
+            f"target (soft-accepted, flagged needs_tightening)"
+        )
+    return None
+
+
 def _validate_premises(
     supporting_ids: list,
     conn: sqlite3.Connection,
@@ -9154,11 +10780,7 @@ def _validate_premises(
                 ).fetchone()
                 r_reason = None
                 if rrow and rrow["metadata"]:
-                    try:
-                        rmeta = json.loads(rrow["metadata"])
-                        r_reason = rmeta.get("retraction_reason")
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                    r_reason = _metadata_dict(rrow["metadata"]).get("retraction_reason")
                 retraction_info.append({
                     "retracted_by": rid,
                     "retraction_reason_excerpt": (r_reason or "")[:_WARNING_EXCERPT_LEN],
@@ -9516,7 +11138,7 @@ def _self_lineage() -> str:
     premises, producing false diversity and suppressing ⚠⚠ (Mira #750)."""
     global _self_lineage_warned
     try:
-        cfg = json.loads(CONFIG_PATH.read_text())
+        cfg = _config_io.read_config_json(CONFIG_PATH)
         val = (cfg.get("self_lineage") or "").strip()
         if val and not _LINEAGE_RE.fullmatch(val):
             if not _self_lineage_warned:
@@ -9531,6 +11153,35 @@ def _self_lineage() -> str:
         return val
     except Exception:
         return ""
+
+
+def model_id_to_lineage(model_id: str) -> str:
+    """Map a harness model id to ``provider:family`` (e.g. ``anthropic:fable``);
+    ``""`` when the id does not map.
+
+    This is the code form of the model-identity gate's prose mapping in
+    ``templates/components/model-identity-gate.md`` ("map the model tag to its
+    family, compare against ``self_lineage``"): the gate stays a discipline,
+    this helper only reads. Built on ``engram_trust._parse_model_id`` (not a
+    second parser): a ``[...]`` suffix such as ``claude-opus-4-7[1m]`` is
+    stripped first, the parser must report a provider and a ``claude-`` family,
+    and the result must satisfy ``_LINEAGE_RE``. Fail-closed like
+    ``_self_lineage()``: anything else is ``""``, never a guess.
+    """
+    if not isinstance(model_id, str):
+        return ""
+    # Lazy import: engram_trust imports engram_core at module level.
+    from engram_trust import _parse_model_id
+
+    mid = re.sub(r"\[[^\]]*\]\s*$", "", model_id.strip()).strip()
+    if not mid:
+        return ""
+    parsed = _parse_model_id(mid)
+    family = parsed.get("family", "")
+    if not parsed.get("provider") or not family.startswith("claude-"):
+        return ""
+    value = f"{parsed['provider']}:{family[len('claude-'):]}"
+    return value if _LINEAGE_RE.fullmatch(value) else ""
 
 
 def _standpoint_cluster_key(
@@ -10130,7 +11781,7 @@ def _create_derivation(
     """Shared derivation-creation core for engram_derive and engram_resolve.
 
     Runs the MECH-5 premise guard, computes confidence, INSERTs the
-    derivation row, wires derives_from + cites edges, stamps the node,
+    derivation row, wires derives_from + about (context) edges, stamps the node,
     and issues utility rewards. Does NOT commit — caller owns the
     transaction boundary so resolve can append a resolves edge and
     update the target atomically.
@@ -10145,7 +11796,8 @@ def _create_derivation(
         supporting_ids: pre-validated claim-bearing premise IDs
         reasoning_type: required — caller resolves legacy derivation_mode
             → reasoning_type default before calling
-        context_ids: optional 'cites' targets; missing IDs are silently
+        context_ids: optional context targets ('about' edges; an observation
+            source naming an ev_ id keeps 'cites'); missing IDs are silently
             filtered (legacy engram_derive behavior)
         use_stale: RETIRED (#2324) — accepted, inert, and loud about it.
             NOT an opt-in: stale premises block unconditionally. Passing
@@ -10268,15 +11920,12 @@ def _create_derivation(
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    _insert_context_edge(conn, node_id, cid, now)
                     ctx_used.append(cid)
                 except sqlite3.IntegrityError:
                     pass
 
-    _stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
+    _emb_outcome = _stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
 
     bumped_count = 0
     if supporting_ids:
@@ -10286,6 +11935,12 @@ def _create_derivation(
         "node_id": node_id,
         "confidence": confidence,
         "reasoning_type": reasoning_type,
+        # #345 PR3 B1/B4 (R1: key renamed "embedding" -> "embedding_failure"
+        # to avoid _AGENT_STRIP_KEYS collision -- see _embedding_response_
+        # block's docstring): the caller (_derive_impl) merges this into its
+        # own response's "embedding_failure" key only when non-None
+        # (_embedding_response_block returns None for "skipped"/"embedded").
+        "embedding_failure": _embedding_response_block(_emb_outcome),
         "reasoning_class": rclass,
         # "stale_ids" is DELIBERATELY ABSENT (#2324). It used to carry the
         # premises a use_stale=True override let through; with stale now a

@@ -41,3 +41,29 @@ class InvalidAgentName(ValueError):
 def is_valid_agent_name(name: str) -> bool:
     """True if ``name`` is a safe agent/DM identifier (matches the allowlist)."""
     return bool(_AGENT_NAME_RE.match(name))
+
+
+# ---------------------------------------------------------------------------
+# Project (baton) id -- #3286
+# ---------------------------------------------------------------------------
+
+# The CLI's rule, verbatim: ``_PROJECT_ID_RE`` in ``src/engram/tools/baton.py``.
+# The server cannot import the CLI, so the pattern is duplicated here and
+# ``src/forum/tests/test_project_id_traversal_3286.py`` fails if the two drift.
+# Always apply with ``fullmatch`` (the CLI's ``.match`` + ``$`` lets one trailing
+# newline through; a project id becomes a file name here, so it must not).
+PROJECT_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*-[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+class InvalidProjectId(ValueError):
+    """A project id that cannot safely name a baton file under the store.
+
+    Raised by the file store's single path helper (path separator, NUL, empty,
+    non-string, ``.``/``..``, or a path that resolves outside the store through a
+    symlink). Routes map it to 404 (GET) or 422 (writes).
+    """
+
+
+def is_valid_project_id(project_id) -> bool:
+    """True if ``project_id`` is a string matching the CLI's project-id rule."""
+    return isinstance(project_id, str) and PROJECT_ID_RE.fullmatch(project_id) is not None

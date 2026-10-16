@@ -1,0 +1,594 @@
+"""Contract tests for tools/erase_session_block.py (#3141).
+
+`engram-sleep` Step 3 erases the warm-briefing's volatile "## From this
+session" section.  Described line-by-line, the natural implementation
+(`"\\n".join(lines[:anchor_index])`) silently drops ONE BYTE of the protected
+region above the anchor (the blank line before the heading).  The tool erases
+by CHARACTER OFFSET and asserts byte-identity of everything above the anchor
+as a post-condition.  Every cell names the plausible-wrong implementation it
+discriminates.  Every cell uses tmp_path; ENGRAM_HOME is pointed at tmp_path
+in subprocess runs so the real ~/.engram is never touched.
+"""
+
+import importlib.util
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+TOOL = REPO_ROOT / "src" / "engram" / "tools" / "erase_session_block.py"
+TEMPLATE = REPO_ROOT / "src" / "engram" / "templates" / "template.warm-briefing.md"
+HEADING = "## From this session"
+
+
+def _load():
+    spec = importlib.util.spec_from_file_location("erase_session_block", TOOL)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture()
+def tool():
+    return _load()
+
+
+def _join_variant(text: str) -> str:
+    """Plausible-wrong: line-oriented erase via splitlines + join."""
+    lines = text.splitlines()
+    idx = max(i for i, l in enumerate(lines) if re.match(r"## From this session", l))
+    # join() turns the blank line's terminator into a separator, so the heading
+    # lands one "\n" early: the prefix is exactly one byte short.
+    return "\n".join(lines[:idx]) + HEADING + "\n"
+
+
+def _run(args, tmp_path, **kw):
+    env = dict(os.environ, ENGRAM_HOME=str(tmp_path / "fake_engram_home"))
+    return subprocess.run(
+        [sys.executable, str(TOOL), *args], capture_output=True, text=True, env=env, **kw
+    )
+
+
+def _write(tmp_path, text, name="wb.md"):
+    p = tmp_path / name
+    p.write_bytes(text.encode("utf-8"))
+    return p
+
+
+LETTER = "# Letter\n\nDear agent,\nlove, Lei\n\n"  # ends with a blank line
+
+
+# T1 -------------------------------------------------------------------
+def test_t1_issue_case_prefix_byte_identical(tool):
+    # one blank line between the letter's last line and the heading
+    prefix = "# Letter\n\nDear agent,\nlove, Lei\n\n"
+    text = prefix + HEADING + "\n- arc 1\n- arc 2\n- arc 3\n"
+    out = tool._erase_core(text)
+    assert out == prefix + HEADING + "\n"
+    assert len(out[: len(prefix)]) == len(prefix)
+    # CONTROL: the join variant loses exactly one byte of the prefix
+    wrong = _join_variant(text)
+    wrong_prefix = wrong[: wrong.index(HEADING)]
+    assert len(wrong_prefix) == len(prefix) - 1
+    assert wrong != out
+
+
+# T2 -------------------------------------------------------------------
+def test_t2_last_anchor_is_target(tool):
+    early = HEADING + "\nuser pasted this old heading\nmore user words\n"
+    text = "# Letter\n" + early + "\nend of letter\n\n" + HEADING + "\n- arc\n"
+    out = tool._erase_core(text)
+    assert out == "# Letter\n" + early + "\nend of letter\n\n" + HEADING + "\n"
+    # first-match variant truncates the letter
+    first = re.search(r"(?m)^## From this session", text).start()
+    wrong = text[:first] + HEADING + "\n"
+    assert "end of letter" not in wrong and "end of letter" in out
+
+
+# T3 -------------------------------------------------------------------
+def test_t3_unanchored_occurrences_ignored(tool):
+    text = (
+        "# L\n  ## From this session\nsee ## From this session here\n"
+        "<!-- keep the ## From this session heading -->\n\n"
+    )
+    out = tool._erase_core(text)
+    # no anchored match -> case B: stub appended, everything else intact
+    assert out == text + HEADING + "\n"
+    out2, info = tool.erase_session_block(text)
+    assert out2 == out
+
+
+# T4 -------------------------------------------------------------------
+def test_t4_already_bare_cli_noop(tmp_path):
+    p = _write(tmp_path, LETTER + HEADING + "\n")
+    before = p.read_bytes()
+    m = p.stat().st_mtime_ns
+    r = _run(["--file", str(p)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "already bare: no change" in r.stdout
+    assert p.read_bytes() == before and p.stat().st_mtime_ns == m
+
+
+def test_t4_bare_without_trailing_newline(tool):
+    text = LETTER + HEADING
+    out = tool._erase_core(text)
+    assert out == LETTER + HEADING + "\n"
+    # a wrong impl that appends a second heading / blank line would differ
+    assert out.count(HEADING) == 1
+
+
+# T5 -------------------------------------------------------------------
+def test_t5_no_section_stub_appended(tool):
+    text = "# L\nbody"  # no trailing newline
+    out = tool._erase_core(text)
+    assert out == "# L\nbody\n" + HEADING + "\n"  # exactly one newline added
+    text2 = "# L\nbody\n"
+    assert tool._erase_core(text2) == text2 + HEADING + "\n"
+    assert out.startswith(text)
+
+
+# T6 -------------------------------------------------------------------
+def test_t6_drift_stop_level2_and_level1(tool, tmp_path):
+    for bad in ("## Notes from the user", "# X"):
+        text = LETTER + HEADING + "\n- arc\n" + bad + "\nuser words\n"
+        p = _write(tmp_path, text)
+        with pytest.raises(tool.DriftStop) as ei:
+            tool.erase_session_block(text)
+        assert bad in str(ei.value)
+        assert str(text[: text.index(bad)].count("\n") + 1) in str(ei.value)
+        r = _run(["--file", str(p)], tmp_path)
+        assert r.returncode == 3
+        assert p.read_bytes() == text.encode()
+
+
+def test_t6_level3_subheading_allowed(tool):
+    text = LETTER + HEADING + "\n### sub\n- arc\n"
+    assert tool._erase_core(text) == LETTER + HEADING + "\n"
+    tool.erase_session_block(text)  # must not raise
+
+
+# T7 -------------------------------------------------------------------
+def test_t7_cli(tmp_path):
+    text = LETTER + HEADING + "\n- a\n- b\n"
+    p = _write(tmp_path, text)
+    m = p.stat().st_mtime_ns
+    r = _run(["--file", str(p), "--dry-run"], tmp_path)
+    assert r.returncode == 0 and p.read_bytes() == text.encode()
+    assert p.stat().st_mtime_ns == m
+    r = _run(["--file", str(p)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert p.read_bytes() == (LETTER + HEADING + "\n").encode()
+    assert re.search(
+        rf"erased: kept {len(LETTER)} chars above the anchor \(byte-identical\), "
+        r"removed 8 chars / 2 lines",
+        r.stdout,
+    ), r.stdout
+    m2 = p.stat().st_mtime_ns
+    r = _run(["--file", str(p)], tmp_path)
+    assert r.returncode == 0 and "already bare" in r.stdout
+    assert p.stat().st_mtime_ns == m2
+    r = _run(["--file", str(tmp_path / "nope.md")], tmp_path)
+    assert r.returncode == 2
+
+
+def test_t7_default_path_uses_engram_home(tmp_path):
+    home = tmp_path / "fake_engram_home"
+    home.mkdir()
+    (home / "warm-briefing.md").write_bytes((LETTER + HEADING + "\n- x\n").encode())
+    r = _run([], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert (home / "warm-briefing.md").read_bytes() == (LETTER + HEADING + "\n").encode()
+
+
+# T8 TEETH -------------------------------------------------------------
+def test_t8_postcondition_fires_on_join_variant(tool, monkeypatch, tmp_path):
+    text = LETTER + HEADING + "\n- arc\n"
+    monkeypatch.setattr(tool, "_erase_core", _join_variant)
+    with pytest.raises(tool.PostconditionError):
+        tool.erase_session_block(text)
+
+
+def test_t8_p1_isolated_same_length_prefix_corruption(tool, monkeypatch):
+    # A wrong core that rewrites a prefix char but keeps its LENGTH, the anchor
+    # position and idempotence: P2/P3/P4 all stay green, only P1 (byte
+    # identity) can catch it. Without this cell P1 is masked by P3's position check.
+    def corrupt(text):
+        i = text.index(HEADING)
+        return text[:i].replace("Dear", "DEAR") + HEADING + "\n"
+
+    monkeypatch.setattr(tool, "_erase_core", corrupt)
+    with pytest.raises(tool.PostconditionError, match="P1"):
+        tool.erase_session_block(LETTER + HEADING + "\n- arc\n")
+
+
+def test_t8_cli_exit4_file_untouched(tmp_path):
+    text = LETTER + HEADING + "\n- arc\n"
+    p = _write(tmp_path, text)
+    # run the CLI main() with _erase_core patched to the join variant
+    code = (
+        "import importlib.util,sys,re\n"
+        f"s=importlib.util.spec_from_file_location('e',{str(TOOL)!r})\n"
+        "m=importlib.util.module_from_spec(s);s.loader.exec_module(m)\n"
+        "H='## From this session'\n"
+        "def j(t):\n"
+        "    l=t.splitlines();i=max(k for k,x in enumerate(l) if x.startswith(H))\n"
+        "    return '\\n'.join(l[:i])+H+'\\n'\n"
+        "m._erase_core=j\n"
+        f"sys.exit(m.main(['--file',{str(p)!r}]))\n"
+    )
+    env = dict(os.environ, ENGRAM_HOME=str(tmp_path / "h"))
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
+    assert r.returncode == 4, (r.stdout, r.stderr)
+    assert p.read_bytes() == text.encode()
+
+
+# T9 CRLF --------------------------------------------------------------
+def test_t9_crlf_preserved(tool, tmp_path):
+    prefix = "# L\r\n\r\nDear\r\nlove\r\n\r\n"
+    text = prefix + HEADING + "\r\n- arc\r\n"
+    p = _write(tmp_path, text)
+    r = _run(["--file", str(p)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    got = p.read_bytes()
+    assert got.startswith(prefix.encode())  # no \r\n -> \n translation
+    assert got == prefix.encode() + (HEADING + "\n").encode()
+
+
+# T10 template ---------------------------------------------------------
+def test_t10_template_noop(tool):
+    text = TEMPLATE.read_bytes().decode("utf-8")
+    assert text.endswith("\n" + HEADING + "\n"), "template no longer ends bare; STOP"
+    assert tool._erase_core(text) == text
+
+
+# T11 drift regex: ATX level-1/2 per CommonMark (best-effort proxy) -----
+@pytest.mark.parametrize(
+    "bad",
+    [" ## Foo", "   ## Foo", "##\tFoo", "##", "#", "## ", " # Foo"],
+)
+def test_t11_drift_stop_wider_atx_forms(bad, tmp_path):
+    # Plausible-wrong: BELOW_RE = r"^#{1,2} " misses indented / tab / bare headings.
+    text = LETTER + HEADING + "\n- arc\n" + bad + "\nuser words\n"
+    p = _write(tmp_path, text)
+    r = _run(["--file", str(p)], tmp_path)
+    assert r.returncode == 3, (bad, r.stdout, r.stderr)
+    assert p.read_bytes() == text.encode()
+
+
+@pytest.mark.parametrize(
+    "ok", ["#tag", "##Foo", "    ## Foo", "### sub", "####x", "\t## Foo"]
+)
+def test_t11_not_a_heading_erase_proceeds(ok, tool):
+    # 4+ spaces = indented code block; #tag / ##Foo / ### / #### are not level-1/2 ATX.
+    text = LETTER + HEADING + "\n- arc\n" + ok + "\nmore\n"
+    assert tool._erase_core(text) == LETTER + HEADING + "\n"
+    tool.erase_session_block(text)  # must not raise DriftStop
+
+
+# T11b CRLF: the line is split on "\n" only, so a bare heading is "##\r" -------
+CRLF_LETTER = "# L\r\n\r\nDear\r\nlove\r\n\r\n"
+
+
+@pytest.mark.parametrize("bad", ["##", "#", " ##"])
+def test_t11_drift_stop_bare_heading_in_crlf_file(bad, tmp_path):
+    # Plausible-wrong: BELOW_RE terminator `(?:[ \t]|$)` misses the "\r" of "##\r".
+    text = CRLF_LETTER + HEADING + "\r\n- arc\r\n" + bad + "\r\nuser words\r\n"
+    p = _write(tmp_path, text)
+    r = _run(["--file", str(p)], tmp_path)
+    assert r.returncode == 3, (bad, r.stdout, r.stderr)
+    assert p.read_bytes() == text.encode()
+
+
+@pytest.mark.parametrize("ok", ["#tag", "##Foo", "    ## Foo"])
+def test_t11_not_a_heading_in_crlf_file_erase_proceeds(ok, tool):
+    # The CR-tolerant terminator must not turn non-headings into drift-STOPs.
+    text = CRLF_LETTER + HEADING + "\r\n- arc\r\n" + ok + "\r\nmore\r\n"
+    assert tool._erase_core(text) == CRLF_LETTER + HEADING + "\n"
+    tool.erase_session_block(text)  # must not raise DriftStop
+
+
+# T12 TEETH for P2 / P3 / P4 (one wrong core each, violating ONLY that clause)
+def _assert_wrong_core_refused(tool, monkeypatch, tmp_path, core, clause):
+    text = LETTER + HEADING + "\n- arc\n"
+    monkeypatch.setattr(tool, "_erase_core", core)
+    with pytest.raises(tool.PostconditionError, match=clause):
+        tool.erase_session_block(text)
+    p = _write(tmp_path, text)
+    assert tool.main(["--file", str(p)]) == 4
+    assert p.read_bytes() == text.encode()
+
+
+def test_t12_p2_final_line_not_bare_heading(tool, monkeypatch, tmp_path):
+    # Keeps the prefix (P1), anchor at the boundary (P3) and is idempotent (P4);
+    # only P2 sees the trailing " x".
+    def core(text):
+        i = text.index(HEADING)
+        return text[:i] + HEADING + " x\n"
+
+    _assert_wrong_core_refused(tool, monkeypatch, tmp_path, core, "P2")
+
+
+def test_t12_p3_last_anchor_off_prefix_boundary(tool, monkeypatch, tmp_path):
+    # Inserts one blank line between the preserved prefix and the heading:
+    # P1 (prefix intact), P2 (final line bare), count (1) all hold and the core is
+    # idempotent (P4); only P3's boundary-position clause sees the shift.
+    def core(text):
+        i = text.index(HEADING)
+        head = text[:i]
+        if not head.endswith("\n\n\n"):
+            head += "\n"
+        return head + HEADING + "\n"
+
+    _assert_wrong_core_refused(tool, monkeypatch, tmp_path, core, "P3")
+
+
+def test_t12_p4_not_idempotent(tool, monkeypatch, tmp_path):
+    # Correct on a section-bearing input (P1-P3 pass), but on an already-bare
+    # input it appends a marker, so erasing its own output differs.
+    def core(text):
+        if text.endswith(HEADING + "\n"):
+            return text + "marker\n"
+        i = text.index(HEADING)
+        return text[:i] + HEADING + "\n"
+
+    _assert_wrong_core_refused(tool, monkeypatch, tmp_path, core, "P4")
+
+
+# T13 in-place write (#3419) ---------------------------------------------
+# The erase must write the EXISTING file in place: a temp file + os.replace gives
+# the briefing a new inode and silently drops its ACL / xattrs (measured on
+# macOS), and a `deny delete` ACL makes the replace fail.  Every cell uses a
+# scratch file under tmp_path; ENGRAM_HOME points at tmp_path (via _run).
+SECTION_TEXT = LETTER + HEADING + "\n- arc 1\n- arc 2\n"
+BARE_TEXT = LETTER + HEADING + "\n"
+
+
+def _set_xattr(path, name, value):
+    """Set a user xattr; return (getter, "") or (None, skip-reason) when unsupported."""
+    if hasattr(os, "setxattr") and hasattr(os, "getxattr"):
+        try:
+            os.setxattr(path, "user." + name, value)
+        except OSError:
+            return None, "filesystem under tmp_path has no user-xattr support"
+        return (lambda: os.getxattr(path, "user." + name)), ""
+    if shutil.which("xattr"):
+        r = subprocess.run(
+            ["xattr", "-w", "com." + name, value.decode(), str(path)],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            return None, f"xattr CLI refused: {r.stderr.strip()}"
+
+        def get():
+            return subprocess.run(
+                ["xattr", "-p", "com." + name, str(path)], capture_output=True, text=True
+            ).stdout.strip().encode()
+
+        return get, ""
+    return None, "neither os.setxattr nor the xattr CLI is available on this platform"
+
+
+def test_i1_inode_and_mode_unchanged_after_erase(tmp_path):
+    # Plausible-wrong: temp file + os.replace (new inode).
+    p = _write(tmp_path, SECTION_TEXT)
+    os.chmod(p, 0o640)
+    before = os.stat(p)
+    r = _run(["--file", str(p)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    after = os.stat(p)
+    assert after.st_ino == before.st_ino
+    assert after.st_mode == before.st_mode
+    assert p.read_bytes() == BARE_TEXT.encode()
+
+
+def test_i2_xattr_preserved(tmp_path):
+    # Plausible-wrong: temp file + os.replace drops xattrs.
+    p = _write(tmp_path, SECTION_TEXT)
+    get, why = _set_xattr(p, "test.marker", b"hello")
+    if get is None:
+        pytest.skip(why)
+    assert get() == b"hello"
+    r = _run(["--file", str(p)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert get() == b"hello"
+    assert p.read_bytes() == BARE_TEXT.encode()
+
+
+def test_i3_hard_link_sees_new_content(tmp_path):
+    # Plausible-wrong: os.replace re-points only one name; the link keeps old bytes.
+    p = _write(tmp_path, SECTION_TEXT)
+    link = tmp_path / "wb-link.md"
+    try:
+        os.link(p, link)
+    except OSError as e:
+        pytest.skip(f"hard links unsupported here: {e}")
+    r = _run(["--file", str(p)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert link.read_bytes() == BARE_TEXT.encode()
+    assert os.stat(link).st_ino == os.stat(p).st_ino
+
+
+def test_i4_write_failure_restores_original_exit2(tool, monkeypatch, tmp_path, capsys):
+    # The first fsync (after truncate, before the write is durable) raises; the tool
+    # must put the ORIGINAL bytes back in place and exit 2 naming the restore.
+    # Plausible-wrong: no restore -> a half-written / truncated briefing.
+    p = _write(tmp_path, SECTION_TEXT)
+    ino = os.stat(p).st_ino
+    real = os.fsync
+    calls = {"n": 0}
+
+    def flaky(fd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(5, "injected I/O error")
+        return real(fd)
+
+    monkeypatch.setattr(tool.os, "fsync", flaky)
+    assert tool.main(["--file", str(p)]) == 2
+    err = capsys.readouterr().err
+    assert "original bytes restored" in err and "NOT restored" not in err
+    assert "injected I/O error" in err
+    assert p.read_bytes() == SECTION_TEXT.encode()
+    assert os.stat(p).st_ino == ino
+
+
+def test_i4_partial_write_is_restored(tool, monkeypatch, tmp_path, capsys):
+    # The write itself dies halfway (file truncated, 3 chars of new text land, then an error):
+    # the original bytes must come back.
+    p = _write(tmp_path, SECTION_TEXT)
+    real_open = open
+
+    class Half:
+        def __init__(self, f):
+            self._f, self._n = f, 0
+
+        def __getattr__(self, k):
+            return getattr(self._f, k)
+
+        def __enter__(self):
+            self._f.__enter__()
+            return self
+
+        def __exit__(self, *a):
+            return self._f.__exit__(*a)
+
+        def write(self, s):
+            self._n += 1
+            if self._n == 1:
+                self._f.truncate(0)  # the file is already cut short when the error hits
+                self._f.write(s[:3])
+                self._f.flush()
+                raise OSError(28, "disk full")
+            return self._f.write(s)
+
+    opened = {"n": 0}
+
+    def fake_open(file, mode="r", *a, **k):
+        f = real_open(file, mode, *a, **k)
+        if "+" in mode:
+            opened["n"] += 1
+            if opened["n"] == 1:  # only the main write fails; the restore open is clean
+                return Half(f)
+        return f
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    rc = tool.main(["--file", str(p)])
+    monkeypatch.undo()
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "original bytes restored" in err and "NOT restored" not in err
+    assert p.read_bytes() == SECTION_TEXT.encode()
+
+
+def test_i5_readback_mismatch_restores_exit4(tool, monkeypatch, tmp_path, capsys):
+    # A writer that silently writes WRONG bytes (same length): only the read-back
+    # can notice.  Plausible-wrong: trust the write and report "erased".
+    p = _write(tmp_path, SECTION_TEXT)
+
+    def bad_writer(path, data, original):
+        with open(path, "r+", encoding="utf-8", newline="") as f:
+            f.seek(0)
+            f.write(data.replace("Dear", "DEAR"))
+            f.truncate()
+
+    monkeypatch.setattr(tool, "_write_in_place", bad_writer, raising=False)
+    assert tool.main(["--file", str(p)]) == 4
+    err = capsys.readouterr().err
+    assert "post-condition" in err
+    assert "original bytes restored" in err and "NOT restored" not in err
+    assert p.read_bytes() == SECTION_TEXT.encode()
+
+
+def test_i5_correct_write_passes_readback(tool, tmp_path, capsys):
+    p = _write(tmp_path, SECTION_TEXT)
+    assert tool.main(["--file", str(p)]) == 0
+    assert p.read_bytes() == BARE_TEXT.encode()
+    assert "erased:" in capsys.readouterr().out
+
+
+# ---- round-1 cells (#3419): longer-new-text failure, restore truncate, Ctrl-C, open failure
+
+NO_ANCHOR = "hello"  # case B: no anchor, so the new text ("hello\n## From this session\n") is LONGER
+
+
+def _first_fsync_raises(tool, monkeypatch, exc):
+    real = os.fsync
+    calls = {"n": 0}
+
+    def flaky(fd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise exc
+        return real(fd)
+
+    monkeypatch.setattr(tool.os, "fsync", flaky)
+
+
+def test_r1_case_b_failure_restores_exact_original_exit2(tool, monkeypatch, tmp_path, capsys):
+    # The new text is longer than the old; the failure hits after the full longer text
+    # is on disk.  Plausible-wrong: restore writes the short original but leaves the
+    # longer file's tail (no truncate) -> length/bytes differ.
+    p = _write(tmp_path, NO_ANCHOR)
+    _first_fsync_raises(tool, monkeypatch, OSError(5, "injected I/O error"))
+    assert tool.main(["--file", str(p)]) == 2
+    err = capsys.readouterr().err
+    assert "original bytes restored" in err and "NOT restored" not in err
+    assert p.read_bytes() == NO_ANCHOR.encode()
+    assert os.stat(p).st_size == len(NO_ANCHOR)
+
+
+def test_r1_restore_truncates_longer_leftover(tool, tmp_path):
+    # Direct pin on _restore_in_place: the file currently holds LONGER bytes than the
+    # original.  Plausible-wrong: restore without truncate() leaves the tail.
+    p = _write(tmp_path, NO_ANCHOR + "\n" + HEADING + "\n")
+    assert tool._restore_in_place(p, NO_ANCHOR) is True
+    assert p.read_bytes() == NO_ANCHOR.encode()
+
+
+def test_r1_keyboardinterrupt_restores_and_propagates(tool, monkeypatch, tmp_path):
+    # Ctrl-C during the write: the original is restored AND the interrupt is not
+    # swallowed.  Plausible-wrong: `except BaseException` that eats it (or a restore
+    # that swallows a second one).
+    p = _write(tmp_path, SECTION_TEXT)
+    _first_fsync_raises(tool, monkeypatch, KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        tool.main(["--file", str(p)])
+    monkeypatch.undo()
+    assert p.read_bytes() == SECTION_TEXT.encode()
+
+
+def test_r2_restore_does_not_swallow_a_second_interrupt(tool, monkeypatch, tmp_path):
+    # A second Ctrl-C landing inside the restore's OWN fsync must propagate.
+    # Plausible-wrong: the pre-r1 `except BaseException` in _restore_in_place eats it.
+    p = _write(tmp_path, SECTION_TEXT)
+
+    def boom(fd):
+        raise KeyboardInterrupt("second")
+
+    monkeypatch.setattr(tool.os, "fsync", boom)
+    with pytest.raises(KeyboardInterrupt):
+        tool._restore_in_place(p, "abc")
+
+
+@pytest.mark.skipif(
+    hasattr(os, "getuid") and os.getuid() == 0,
+    reason="root bypasses file mode bits, so a 0444 file is still writable",
+)
+def test_r1_open_failure_reports_untouched_not_damaged(tool, tmp_path, capsys):
+    # open(path, "r+") itself fails (read-only file): nothing was written, so the
+    # message must say untouched.  Plausible-wrong: "NOT restored: file may be damaged".
+    p = _write(tmp_path, SECTION_TEXT)
+    os.chmod(p, 0o444)
+    try:
+        assert tool.main(["--file", str(p)]) == 2
+        err = capsys.readouterr().err
+        assert "untouched" in err
+        assert "damaged" not in err and "NOT restored" not in err
+        assert p.read_bytes() == SECTION_TEXT.encode()
+    finally:
+        os.chmod(p, 0o644)

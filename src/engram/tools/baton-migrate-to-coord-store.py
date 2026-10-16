@@ -53,7 +53,7 @@ from forum_api import ForumClient, ForumHttpError, ForumNetworkError
 # ---------------------------------------------------------------------------
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
+_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):[ \t]*(.*)$", re.MULTILINE)
 _PARTICIPANTS_LIST_RE = re.compile(r"^\[?(.*?)\]?$")
 
 

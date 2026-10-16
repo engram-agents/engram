@@ -344,8 +344,10 @@ def _do_request(req: urllib.request.Request, url: str) -> dict:
         if e.code == 404:
             print(f"forum: not found (404): {err_msg}", file=sys.stderr)
             sys.exit(EXIT_NOT_FOUND)
-        elif e.code == 400:
-            print(f"forum: validation error (400): {err_msg}", file=sys.stderr)
+        elif 400 <= e.code < 500:
+            # #3436 r3: every 4xx but 404 is a refusal of the request, not a server
+            # fault -- a 422 typed-field refusal used to be labelled "server error".
+            print(f"forum: validation error ({e.code}): {err_msg}", file=sys.stderr)
             sys.exit(EXIT_VALIDATION)
         else:
             print(f"forum: server error ({e.code}): {err_msg}", file=sys.stderr)
@@ -458,6 +460,41 @@ def _fetch_inbox(forum_url: str, agent_name: str) -> Optional[dict]:
 
 
 
+def _format_age(hours: float) -> str:
+    """Render an age in hours as 'N d' / 'N h' / 'N m' (largest whole unit)."""
+    if hours >= 24:
+        return f"{int(hours // 24)} d"
+    if hours >= 1:
+        return f"{int(hours)} h"
+    return f"{max(int(hours * 60), 0)} m"
+
+
+def _backup_status_line(health: Optional[dict]) -> Optional[str]:
+    """One-line backup age from /health's ``backup`` block (#3276 B8).
+
+    None when /health is unreachable or carries no ``backup`` key (old or
+    unconfigured server). The warning marker appears only when deps.backup is
+    "degraded".
+    """
+    if not isinstance(health, dict) or not isinstance(health.get("backup"), dict):
+        return None
+    degraded = (health.get("deps") or {}).get("backup") == "degraded"
+    age = health["backup"].get("age_hours")
+    if isinstance(age, (int, float)):
+        line = f"backup: last ok {_format_age(float(age))} ago"
+    else:
+        line = "backup: NO successful backup recorded (stamp missing or unreadable)"
+        degraded = True  # a missing stamp is never ok
+    if not degraded:
+        return line
+    mark = "\u26a0"
+    try:
+        mark.encode(getattr(sys.stdout, "encoding", None) or "utf-8")
+    except (UnicodeEncodeError, LookupError):
+        mark = "[!]"  # stdout cannot carry U+26A0; never crash `forum status` over a marker
+    return f"{line}  {mark}"
+
+
 def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     forum_url = _resolve_forum_url(config)
 
@@ -523,6 +560,13 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         by_count = sorted(unread_by_category.items(), key=lambda x: -x[1])
         print("  by category:          " + "  ".join(f"{s}:{c}" for s, c in by_count))
     print(f"online:       {online_count} of {registered} registered")
+
+    # Backup age (#3276): advisory; a failed /health read never changes status output.
+    backup_line = _backup_status_line(
+        _api_get(f"{forum_url}/health", swallow_errors=True)
+    )
+    if backup_line:
+        print(backup_line)
 
     # Mention summary line — only when mention items were found
     if mention_items:

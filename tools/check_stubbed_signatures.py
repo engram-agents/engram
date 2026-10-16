@@ -30,6 +30,29 @@ Two detection lanes
    narrowing to "looks like a monkeypatch call" is exactly the kind of
    judgment call this mechanical gate exists to remove.
 
+   NOISE FALLBACK (#3334): "exact name" does not mean "rare name". Measured
+   on PR #3321, the generic bare names `__init__` and `execute` resolved to
+   ~255 of ~280 test files, running nearly the whole suite. So narrow names
+   now have the same fallback as the WIDE lane: when a name's raw match count
+   exceeds NARROW_RESOLVE_THRESHOLD (10, strictly greater-than), the raw
+   result is discarded and the MODULE-SCOPED pattern (see the WIDE lane
+   below) is built from the basenames of the files where that name's
+   signature change occurred, i.e. the destination files of the hunks that
+   hold the same-hunk def pair. At or below the threshold the raw result is
+   kept unchanged.
+
+   TWO LIMITS of the fallback, both real: (a) false negatives -- a test that
+   references the module only by a partial name is invisible to it (same as
+   WIDE); (b) over-selection -- the pattern is an unanchored substring grep,
+   so a short generic basename (`server`, `__init__` -> `init`) can select
+   MORE files than the raw grep did (measured on the real tree: `(server)`
+   selects 356 files, `(init)` 239). So the fallback is taken ONLY when it
+   selects strictly FEWER files than the raw result; otherwise the raw result
+   is kept, never worse than before #3334. Likewise, when no usable pattern
+   exists (no hit files, a basename with no tokens, or a path the header
+   regex cannot read such as a quoted non-ASCII path) the raw result is kept
+   rather than the name being silently dropped.
+
    Both the both-sides requirement and the same-hunk requirement were
    measured necessary, not merely tidy — see collect_narrow_names' own
    docstring for the two noise explosions (370 files, then 218 files) that
@@ -132,11 +155,22 @@ WIDE_WATCHLIST: tuple[str, ...] = (
 
 # Above this many raw bare-name hits, a wide-name's raw grep result is
 # discarded as too noisy to act on (see module docstring) and the
-# module-scoped fallback is used instead. Narrow names have no such
-# threshold -- they are exact function/method names, not common English
-# words or stdlib module names, so a large raw hit count is itself
-# meaningful signal rather than noise.
+# module-scoped fallback is used instead.
 WIDE_RESOLVE_THRESHOLD = 10
+
+# Same rule for NARROW names, own constant (#3334). The earlier belief that a
+# narrow name is an exact function name, so a large raw hit count is itself
+# signal, was falsified by measurement: on PR #3321 the generic bare names
+# `__init__` and `execute` resolved to ~255 of ~280 test files. Above this
+# many raw hits the module-scoped fallback (built from the files where the
+# signature change occurred) replaces the raw result -- but only if it
+# selects strictly fewer files (short generic basenames can over-select), and
+# only if a pattern exists (else raw is kept). The fallback also cannot see a
+# test that references the module by a partial name. "Strictly fewer" bounds
+# each name, not the union across names; the union can contain files raw
+# would not select. Strictly greater-than:
+# exactly this many raw files keeps the raw result.
+NARROW_RESOLVE_THRESHOLD = 10
 
 # Matches a `def`/`async def <name>(` line on either side of a unified diff
 # ('+' added or '-' removed; explicitly NOT '+++'/'---' file headers).
@@ -302,18 +336,42 @@ def collect_narrow_names(diff_text: str) -> set[str]:
     solve. Noted here, previously undocumented, so a future miss against
     this shape is recognized against this paragraph rather than rediscovered
     as a surprise."""
-    result: set[str] = set()
+    return set(collect_narrow_hits(diff_text))
+
+
+def collect_narrow_hits(diff_text: str) -> dict[str, set[str]]:
+    """Same detection as collect_narrow_names (a bare name whose `def` line is
+    on BOTH an added and a removed line WITHIN THE SAME HUNK -- see that
+    docstring for the two measured exclusions and the relocation LIMIT), but
+    each name maps to the set of destination file paths (from the
+    `diff --git a/X b/X` header, the same regex the WIDE lane uses) of the
+    hunks where the pair occurs. The files feed the module-scoped fallback
+    in resolve_narrow_hits (#3334)."""
+    result: dict[str, set[str]] = {}
+    current_file: str | None = None
     hunk_added: set[str] = set()
     hunk_removed: set[str] = set()
 
     def _flush() -> None:
-        result.update(hunk_added & hunk_removed)
+        if current_file is None:
+            # A def pair with no diff --git header has no file to map to;
+            # keep the name (detection is unchanged) with an empty set.
+            for name in hunk_added & hunk_removed:
+                result.setdefault(name, set())
+            return
+        for name in hunk_added & hunk_removed:
+            result.setdefault(name, set()).add(current_file)
 
     for line in diff_text.splitlines():
         if line.startswith("@@") or line.startswith("diff --git "):
             _flush()
             hunk_added = set()
             hunk_removed = set()
+            if line.startswith("diff --git "):
+                header = _DIFF_GIT_HEADER_RE.match(line)
+                # A header the regex cannot read (git quotes non-ASCII paths)
+                # must not leave the PREVIOUS file attributed to this hunk.
+                current_file = header.group(1) if header else None
             continue
         m = _DEF_LINE_RE.match(line)
         if not m:
@@ -393,6 +451,54 @@ def resolve_narrow_names(repo_root: Path, names: set[str], head: str) -> set[str
     return resolved
 
 
+def resolve_narrow_hits(
+    repo_root: Path, narrow_hits: dict[str, set[str]], head: str
+) -> set[str]:
+    """Like resolve_narrow_names, but with the module-scoped noise fallback
+    the WIDE lane has (#3334): when a name's raw word-bounded grep returns
+    MORE than NARROW_RESOLVE_THRESHOLD files, the module-scoped pattern built
+    from the files where THIS name's signature change occurred is tried, and
+    its result replaces the raw result only when it selects strictly FEWER
+    files. Otherwise (fallback not smaller, or no usable pattern: None or an
+    empty hit-file set) the raw result is kept, so a name is never silently
+    dropped. At or below the threshold raw is kept unchanged."""
+    resolved: set[str] = set()
+    for name, hit_files in sorted(narrow_hits.items()):
+        raw_files = _git_grep_files(repo_root, name, head, fixed=True, word=True)
+        if len(raw_files) > NARROW_RESOLVE_THRESHOLD:
+            # One diagnostic line per over-threshold name, on STDERR only
+            # (CI reads stdout + exit code; stdout stays paths-only).
+            prefix = f"check_stubbed_signatures: narrow {name!r}: "
+            head_msg = f"{len(raw_files)} raw > {NARROW_RESOLVE_THRESHOLD}"
+            pattern = _module_scoped_pattern(hit_files)
+            if pattern is not None:
+                fallback_files = _git_grep_files(
+                    repo_root, pattern, head, fixed=False, word=False
+                )
+                if len(fallback_files) < len(raw_files):
+                    print(
+                        f"{prefix}{head_msg}, module fallback -> "
+                        f"{len(fallback_files)} files",
+                        file=sys.stderr,
+                    )
+                    resolved.update(fallback_files)
+                    continue
+                print(
+                    f"{prefix}{head_msg}, module fallback would select "
+                    f"{len(fallback_files)} (not fewer), kept raw",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"{prefix}{head_msg}, no usable fallback pattern, kept raw",
+                    file=sys.stderr,
+                )
+            # No usable pattern, or the fallback is not strictly smaller:
+            # keep the raw result (over-select, never silently miss).
+        resolved.update(raw_files)
+    return resolved
+
+
 def resolve_wide_names(
     repo_root: Path, wide_hits: dict[str, set[str]], head: str
 ) -> set[str]:
@@ -454,11 +560,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         diff_text = get_diff(repo_root, args.base, args.head)
-        narrow_names = collect_narrow_names(diff_text)
+        narrow_hits = collect_narrow_hits(diff_text)
         wide_hits = collect_wide_hits(diff_text)
 
         affected: set[str] = set()
-        affected |= resolve_narrow_names(repo_root, narrow_names, args.head)
+        affected |= resolve_narrow_hits(repo_root, narrow_hits, args.head)
         affected |= resolve_wide_names(repo_root, wide_hits, args.head)
     except GitCommandError as exc:
         print(f"check_stubbed_signatures: error — {exc}", file=sys.stderr)

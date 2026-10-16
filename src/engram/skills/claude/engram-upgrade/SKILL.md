@@ -149,7 +149,7 @@ This single script is the whole agent-side upgrade: it **reads your `config.json
 | hooks / skills / tools | **source-live** — loaded from the marketplace *source* per invocation (`CLAUDE_PLUGIN_ROOT`=source). Hooks + skills are live-verified; tools follow the same mechanism but are inferred, not independently fired | live on the next prompt after Step 3's rebuild; the sequence is a harmless no-op for them |
 | **agents (fairies)** | **cache-loaded** — registered from `installed_plugins.json` `installPath` (a cache snapshot), reload/restart-gated; live-verified #1639 | **steps 1 + 2 REQUIRED** |
 | `server.py` (MCP) | **process-pinned** — running process from session start | **step 3 (`/mcp` reconnect) REQUIRED** |
-| `hooks.json` registration | read at session start | `/reload-plugins` reloads hooks in-session (it reloaded 19 in the #1639 case); a full restart is the conservative fallback if a registration change doesn't take effect (not independently re-verified) |
+| `hooks.json` registration | read at session start | `/reload-plugins` reloads hooks in-session (it reloaded 19 in the #1639 case); a full restart is the fallback only if a registration change doesn't take effect. Measured for a removal (#3265, 2026-10-01: 28 = 20 + 8, no restart) and an addition (#1892, 2026-08-03: 29 = 22 + 7, the new Stop hook fired); one seat each, two dates (harness versions not recorded) |
 
 > **Correction (2026-07-02, #1639):** a prior version of this step called the cache refresh "optional bookkeeping" and treated **all** of hooks/skills/tools/agents as source-live. That was **wrong for agents** — they are cache-loaded, so agent-spec fixes (e.g. the #1551 dual-prefix MCP grant) silently never activated on plugin installs, and dream-fairies ran with zero ENGRAM MCP access for cycles. The `/plugin marketplace update` + `/reload-plugins` steps are **required**, not optional, whenever a build may have touched an agent spec. hooks/skills/tools remain genuinely source-live — the correction is scoped to agents plus the "run the full sequence to be safe" default.
 
@@ -185,7 +185,7 @@ If anything looks wrong after reconnecting (missing nodes, a query that used to 
 4. Copy it over the live DB, now that the server is stopped and no sidecar can reappear underneath it: `cp ~/.engram/db-backup/<chosen-file> ~/.engram/knowledge.db`.
 5. Relaunch/reconnect the MCP server (`/mcp`, or however the user brought it back in step 1) and re-verify with `engram_stats` (Step 8).
 
-**If Step 2's change set touched `hooks/hooks.json`, a `/mcp` reconnect is NOT enough** — `/mcp` reloads only the MCP server process, not the hook registration. Step 4's **`/reload-plugins`** re-registers hooks in-session (it reloaded 19 hooks in the #1639 case), so running the full Step-4 sequence should pick up a registration change; a **full Claude Code restart** is the conservative fallback if a dangling-file error (removed hook) or a silently-not-firing added hook persists after `/reload-plugins`. (The in-session `/reload-plugins` path for a *registration* change is plausible but not independently re-verified — restart if in doubt.) The `install-local-marketplace.sh` script will have printed an `⚠️  HOOK REGISTRATION CHANGED` banner if this applies.
+**If Step 2's change set touched `hooks/hooks.json`, a `/mcp` reconnect is NOT enough** — `/mcp` reloads only the MCP server process, not the hook registration. Step 4's **`/reload-plugins`** re-registers hooks in-session (it reloaded 19 hooks in the #1639 case), so running the full Step-4 sequence should pick up a registration change; a **full Claude Code restart** is the conservative fallback if a dangling-file error (removed hook) or a silently-not-firing added hook persists after `/reload-plugins`. (The in-session `/reload-plugins` path for a *registration* change was measured twice, in-session: for an addition (#1892, 2026-08-03: it reported the new 29-hook set and the new Stop hook fired) and for a removal (#3265, 2026-10-01: the new 28-hook set). One seat each, two dates (harness versions not recorded) — restart if a registration demonstrably does not take effect.) The `install-local-marketplace.sh` script will have printed an `⚠️  HOOK REGISTRATION CHANGED` banner if this applies.
 
 **Checkpoint**: user reconnected (or explicitly deferred, noted as code-not-yet-running).
 
@@ -252,6 +252,24 @@ python "$SOURCE_DIR/tools/check-claude-md-drift.py" \
 # Codex (template.AGENTS.md is single-source; raw diff is sufficient):
 diff "$SOURCE_DIR"/src/engram/templates/template.AGENTS.md /path/to/live/AGENTS.md
 ```
+
+**Does my LIVE file carry everything the template carries?** The base-to-head diff above cannot answer that: it cannot see a hunk an earlier rebuild skipped without merging, because every later range starts after that hunk and the seat looks clean (engram-alpha#3604). The live mode checks the live file directly against the rendered template, in one direction: every rendered template unit (heading, paragraph, list item, table row) must be present in the live file; only the missing ones are printed (first line plus its line in the rendered template); extras are ignored. It finds absence only: text inside a comment, fence or quote still counts as present. It never edits the file. Expect some noise by design: a unit you deliberately reworded is printed as missing, and the output does not say which MISSING lines are real lag and which are your own rewrites (on two seats measured, about 14 of 169 units each); judge each line. A unit you extended at its END still matches; one with text inserted in the MIDDLE does not. The home path may be written `~/.engram` or in full in your file; either matches. If your `seed-manifest.json` predates a seed id the template now uses, the tool exits 2 and names the id: pass it with `--seed-id KEY=VALUE` (repeatable).
+
+```bash
+# Each Bash call is a fresh shell: re-derive everything here.
+SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
+HEAD_REF=$(grep '^alpha_sha=' ~/.engram/.deployed-version | cut -d= -f2-)
+# Needs a deploy whose tool has --live (engram-alpha#3604). An older tool does not say so: it fails with "the following arguments are required: --base".
+python3 "$SOURCE_DIR/tools/check-claude-md-drift.py" --help 2>&1 | grep -q -- '--live' || echo "STOP: the deployed check-claude-md-drift.py predates --live; rebuild from a tag that carries #3604 first"
+python3 "$SOURCE_DIR/tools/check-claude-md-drift.py" --repo "$SOURCE_DIR" --head "$HEAD_REF" \
+    --live ~/.claude/CLAUDE.md --user-name "<your user>" --agent-name "<your name>" \
+    --self-node-id "<your pn_ id>" --engram-home ~/.engram --seed-manifest ~/.engram/seed-manifest.json
+# Exit 0 = nothing missing; exit 1 = MISSING lines (merge or consciously decline each); exit 2 = input/render error (never read as "0 missing").
+```
+
+`--head` is the seat's DEPLOYED commit (`alpha_sha`), not the origin tip: the check asks what the template the seat actually deployed carries, and an origin tip may carry template changes the seat has not deployed yet, which would be reported as missing.
+
+Add `--multi-agent` to also check `template.CLAUDE.multi-agent.md` as its own paragraph set; hand-merged seats often reword or re-head those paragraphs, so expect false "missing" there.
 
 - Inverse-merge template-side additions that are identity- or discipline-forming into the live file; **preserve agent-local customizations** (the template is the floor, not the ceiling).
 - Mechanical change → just copy. Judgment-laden (new discipline, conflicts with local content) → surface the diff to the user and decide together.

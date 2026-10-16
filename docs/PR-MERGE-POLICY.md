@@ -297,3 +297,176 @@ The "flip to Lei" half applies **only to substrate PRs** (in engram-alpha). For 
 ## Origin
 
 The 2026-06-24 v0.1.3 merge wave merged #1399 — a retraction-initiation provenance **research instrument** (a substrate feature) — without Lei's pre-merge read. It was additive + dormant, so low-cost — but it's exactly the class that should get his eye first (the "what do we measure about agency, and how is it enforced" question is a direction call, not a code call). This policy is the durable form of that lesson. The per-project scope (umwelt/soma delegation) and the Lei-absence day-grant carve-out were added 2026-07-08 after the policy's own SSoT-file gap — this doc had been authored 2026-06-25 but left unmerged for two weeks — surfaced live during a substrate merge-authority call (engram-alpha #1654) that had to be reasoned from memory because the doc wasn't in the repo.
+
+## Moved from CLAUDE.md § PR merge-readiness — CI-green gate (both modes) (moved 2026-10-03, #3322)
+
+*Verbatim; moved, not edited. CLAUDE.md keeps the rule and a pointer here.*
+
+Merge-readiness has **two** gates, not one: a PR is merge-ready only when it is
+**review-converged AND CI-green on the current tip.** This is a property of the PR,
+not of the coordination topology — it holds identically in single-agent and
+multi-agent mode. (Multi-agent: it gates the `baton flip → <maintainer>` below.
+Single-agent: it gates surfacing the PR as ready / flipping the solo cursor to the
+maintainer. Same rule, different surface — so a single-agent contributor is just as
+bound by it.)
+
+Before presenting a PR as merge-ready, check CI on the current tip:
+
+```
+gh pr view <N> --json statusCheckRollup,mergeStateStatus
+```
+
+**Read the two fields in order — `mergeStateStatus` first, the rollup only if it is
+not `CLEAN` — and the asymmetry between them IS the rule: `CLEAN` is sufficient to
+conclude green; anything else (`UNKNOWN`, `BLOCKED`, `BEHIND`, `DIRTY`, `UNSTABLE`) is
+NOT evidence of red and must fall through to the *deduped* rollup rather than fail the
+PR.** Falling through is not the same as being ready to merge, though: `DIRTY` is a
+merge conflict (8 of 8 measured also read `mergeable: CONFLICTING`) and has to be
+resolved no matter how green CI is. Reading "not CLEAN" as "not green" is a different
+bug in the same place — and it is the common case, not an edge case: measured
+2026-08-30, 12 of this repo's 19 open PRs read non-`CLEAN` (8 `DIRTY`, 4 `BLOCKED`).
+Neither state says anything about whether CI passed. The naive read of the rollup —
+"every `statusCheckRollup[].conclusion` is `SUCCESS`" — is WRONG too, and this doc
+carried it until 2026-08-30:
+
+1. **`mergeStateStatus: CLEAN` is the verdict — stop there.** GitHub computes it from
+   the latest run per check, so CLEAN already accounts for superseded runs. No
+   per-check reading is needed.
+2. **The rollup does NOT dedupe.** `statusCheckRollup` is scoped to the head commit —
+   runs on superseded SHAs never appear in it — but it carries **every** run on that
+   commit, not just the latest. So a stale `FAILURE` or `CANCELLED` from a superseded
+   same-SHA run sits in the list beside the current `SUCCESS`, and requiring every
+   entry to be `SUCCESS` false-blocks a genuinely green PR. Measured 2026-08-30 on
+   #2371: `mergeStateStatus: CLEAN` while its rollup carried `pr-checks=CANCELLED`
+   beside `pr-checks=SUCCESS`.
+3. **Two runs of one check can land on the SAME SHA — that is what the dedupe is
+   for.** Filtering by head SHA adds nothing, since the rollup is already head-scoped.
+   On #2410, `pr-checks` completed `CANCELLED` at 13:19:06Z and `SUCCESS` at 13:19:42Z,
+   36 seconds apart, both on `82ba043e`; on #2419 two `pr-checks` `FAILURE`s (14:29:02Z
+   and 14:44:41Z) sit beside the `SUCCESS` at 14:46:01Z, all three on the merged tip
+   `edc20d56`. The workflow fires on `edited` as well as `synchronize`, so a trigger
+   that changes no code can start a second run on a SHA already checked. What the
+   earlier run leaves behind turns on overlap, and the two above are one of each: #2410's
+   second run was **created** while the first was still running — an overlap in the runs
+   (`gh run list --json name,headSha,createdAt,updatedAt`) but not in the rollup, whose
+   job-level `startedAt` for that run falls a few seconds later, after the first had
+   completed — so `cancel-in-progress` on the per-PR concurrency group killed it, hence
+   the `CANCELLED`; #2419's runs never overlapped (each started only after the previous
+   had finished), so nothing was cancelled and those `FAILURE`s are just the runs' own
+   conclusions. The dedupe is load-bearing WITHIN one SHA — and only there: there is no
+   across-SHAs case, because a superseded SHA's runs are not in the rollup to begin with.
+4. **Use the rollup only to find WHICH check to read when the state is not CLEAN** —
+   and dedupe to the latest run per check name before judging, where *latest* means
+   most recently **completed**: `_dedupe_checks_by_latest()` compares `completedAt`,
+   and ordering by `startedAt` instead picks a different winner whenever one run starts
+   earlier but finishes later. `gh run list --branch <branch> --json
+   name,headSha,conclusion,updatedAt` in time order is the direct way to see which run
+   is the current one — that command exposes no `completedAt`, but on a finished run
+   its `updatedAt` is ≈ the completion time (measured ~1s later, on five runs).
+   This dedupe is the test verdict, but see rule 3 of "Merge-seat test rules" below: a
+   cancelled newest same-SHA run still blocks the merge; rerun it.
+5. **`UNKNOWN` is not red — measured, not reasoned.** `mergeStateStatus` is computed
+   asynchronously and only for open PRs. It has been observed reading `UNKNOWN` twice a
+   minute apart on a PR that was genuinely fine, then `CLEAN` minutes later, then
+   merging without incident; and the REST `mergeable_state` still reads `unknown` after
+   a successful merge, on a PR that is definitively merged with a merge-commit SHA. So
+   the field is trustworthy in one direction only: `CLEAN` concludes green, `UNKNOWN`
+   concludes nothing. Treat it as the *pending* case below (hold, re-check on the next
+   tick), never as a failure.
+
+**Reference implementation: `_pr_ci_state()` in `src/engram/tools/baton.py`** (with its
+helper `_dedupe_checks_by_latest()`) does exactly the above — returns green
+immediately on `mergeStateStatus == CLEAN`, and otherwise dedupes the rollup to the
+latest run per check name before its red pass and its pending pass. The tool has been
+correct since #1366 — the defect was found and the dedupe prescribed on 2026-06-24
+during release dogfooding, and shipped in code then; only the prose half went
+unassigned, and stayed unapplied until the same defect was re-derived from scratch on
+2026-08-30. For those two months a hand-check that followed the doc could false-block
+a PR the baton CLI would have called green. Read the rule off what those two
+functions **do** (their behaviour, not their prose) rather than re-deriving it — if
+doc and tool drift again, one of them is now visibly contradicting a named function,
+and the doc is the side that moves.
+
+- **Green** → present as merge-ready.
+- **Pending / running** → do NOT present as ready yet. CI is async: hold (keep the
+  turn with yourself), **re-check on the next loop tick**, advance only once green.
+  This is the one legitimate case where a converged PR sits un-advanced for a tick.
+- **Failed** → it's a **blocker**: back to the author for a fix round, same as any
+  reviewer blocker. Never present a red PR as ready.
+
+**Re-check after ANY post-approval commit.** A moved tip (e.g. folding a late
+reviewer nit after the approve) re-triggers CI and can fail on the new commit even
+though the approved commit was green — CI-green must hold on the tip the maintainer
+would actually merge.
+
+*Origin: converged-but-red PRs reached "ready" framing twice (a CI gate was red while
+review-convergence was checked but CI was not). v1 is this discipline (vigilance); the
+structural form — a flip-to-maintainer guard that refuses when CI is red, mechanical
+like the CI tag-once gate — is the better v2 (mechanical gate > vigilance), tracked as
+a follow-up.*
+
+*Amended 2026-08-30: two PRs that same afternoon carried superseded runs in the rollup
+beside a genuinely green tip, both on the tip's own SHA — #2410 (one stale `CANCELLED`)
+and #2419, the v0.5.0-rc1 release cut (two stale `FAILURE`s). The pre-amendment rule reads both as not-green, and
+would have held the release cut. Both are merged and both still carry those entries, so
+merging does not clean the rollup and the evidence stays checkable.*
+
+### Merge-seat test rules (added 2026-10-06, #3479)
+
+Three rules for the seat that runs tests before merging. They sit with the CI-green
+gate above because they answer the same question from the other side: CI-green says
+the PR's checks passed; these say what the seat's own run must be and how to read it.
+
+**1. The seat's own test run is on a SCRATCH MERGE of the base tip plus the PR head,
+never on the head alone.** The run answers *does the base work after this lands*. A
+head-only green is necessary (the PR works) and not sufficient (the base works after
+it): another PR can land on the base between the peer approval and the merge, and the
+two compose badly. No review layer sees that tree except the merge seat — the fairy
+and the colleague review the head.
+
+```
+git fetch origin <base> '+refs/pull/N/head:refs/pr/N'
+git worktree add --detach <scratch> origin/<base>
+git -C <scratch> merge --no-edit refs/pr/N
+{ git -C <scratch> merge-base --is-ancestor origin/<base> HEAD && git -C <scratch> merge-base --is-ancestor refs/pr/N HEAD; } && echo MERGE-OK || { echo "MERGE-FAILED: stop"; false; }
+# run the PR's tests + the repo guard set here
+```
+
+The one fast path is "head is already rebased on the base tip", where head == merged
+tree; assert `git merge-base --is-ancestor origin/<base> refs/pr/N` before taking it.
+
+*Evidence:* umwelt #878/#872 on 2026-09-29. On 2026-10-06, umwelt #1016 and #1017
+against #1002; #1016 was caught on a scratch merge, and #1017 is the head-only-run
+escape (the seat ran the PR's five test files on the head alone, 380 passed, and
+merged; main was red on three cells minutes later).
+
+**2. A failure seen on the scratch merge belongs to the PR only if that test cell is
+GREEN on the base alone (or the PR adds it).** Otherwise it is the base's and goes to
+the seat that broke it, and must not be held against the PR. To tell the two apart, run the failing cell on the base tip.
+
+*Evidence:* Borges's run on umwelt #1021 (2026-10-06) kept main's own red off the PR.
+
+**3. A cancelled same-SHA run can block the merge even when another run passed.**
+Observed: a required status check can read as not-satisfied — the PR stays `BLOCKED`
+and the merge is refused — when the newest run of that check on the head SHA was
+`CANCELLED`, even though another run on the same SHA passed. `gh run rerun <the
+cancelled run id>` cleared it. Never argue from the deduplication above ("another run
+passed, so the gate is satisfied"); rerun the cancelled run.
+
+The cause seen, on alpha #3489 only: two `pull_request` runs on the same SHA were
+created in the same second, after a push and a PR-body edit seconds apart, and
+concurrency cancelled one. On #3476 we know only that the newest same-SHA run was
+cancelled by concurrency; what triggered the second run is not known. The
+explanation that fits is that GitHub keys the required check on the newest same-SHA
+run, not the most recently completed one. That is the merge seat's reading from two
+measurements, no documentation; the fact and the remedy above are as measured.
+Untested advice: edit the PR body before pushing, or wait for the push's run to start.
+
+*Evidence:* two measurements, 2026-10-06.
+(1) alpha #3476, ~16:43Z: the newest same-SHA run was cancelled by concurrency, the PR
+was `BLOCKED` and the merge refused ("base branch policy prohibits"), even though an
+older run was green and a valid approval existed; `gh run rerun` of the cancelled run
+gave `CLEAN` as soon as it completed.
+(2) alpha #3489, ~17:13–17:20Z: read `BLOCKED | pr-checks:CANCELLED, pr-checks:SUCCESS`
+(two runs on the same SHA, started in the same second by a push and a body edit);
+`gh run rerun` of the cancelled run gave `CLEAN | SUCCESS, SUCCESS`.

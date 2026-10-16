@@ -353,16 +353,16 @@ def test_cascade_implies_dag_check_still_holds():
     needing to cross-reference the other file.
     """
     for relation in CASCADE_RELATIONS:
-        assert EDGE_CLASSIFICATIONS[relation]["dag"], (
-            f"{relation} carries cascade=True but dag=False"
+        assert EDGE_CLASSIFICATIONS[relation]["dag_family"] is not None, (
+            f"{relation} carries cascade=True but has no dag_family"
         )
     # The two relations this stage specifically corrected must both still
-    # carry dag=True even though cascade dropped to False — dag (like the
+    # stay in the grounding family even though cascade dropped to False — the acyclicity family (like the
     # temporal_causal it was split from) is a separate, unrelated design
     # dimension (retracts/supersedes are legitimately acyclic edges
     # regardless of whether they cascade).
-    assert EDGE_CLASSIFICATIONS["retracts"]["dag"] is True
-    assert EDGE_CLASSIFICATIONS["supersedes"]["dag"] is True
+    assert EDGE_CLASSIFICATIONS["retracts"]["dag_family"] == "grounding"
+    assert EDGE_CLASSIFICATIONS["supersedes"]["dag_family"] == "grounding"
 
 
 # ---------------------------------------------------------------------------

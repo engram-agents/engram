@@ -62,6 +62,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from engram_regular_io import read_regular_text
+
 
 # ---------------------------------------------------------------------------
 # Recovery guidance (#1947)
@@ -749,7 +751,9 @@ def read_degraded_marker(data_dir: str | Path) -> Optional[dict]:
     """
     p = _marker_path(data_dir)
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        # Non-blocking, regular-file-only read (#3628): a FIFO here must not
+        # hang the caller; it is "unreadable", i.e. treated as absent.
+        return json.loads(read_regular_text(p, encoding="utf-8"))
     except FileNotFoundError:
         return None
     except Exception:

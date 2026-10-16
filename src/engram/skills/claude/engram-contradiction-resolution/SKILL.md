@@ -9,7 +9,7 @@ How to drive a contradiction (ct_XXXX) to a clean substrate state. Focused on th
 
 The skill exists because the chain-dilution contradiction-resolution saga (2026-05-09 to 2026-05-20, seven resolution attempts) revealed two failure patterns:
 1. **Chain dilution**: each resolution attempt cited the prior resolution chain, compounding confidence drop until threshold-based status couldn't fire.
-2. **Substrate blindness to supersede**: a contradiction whose contradicting node had already been superseded continued to read as `open` / `partially_resolved` because the substrate didn't cascade supersede to the contradiction node.
+2. **Substrate blindness to supersede**: a contradiction whose contradicting node had already been superseded continued to read as `active` / `partially_resolved` because the substrate didn't cascade supersede to the contradiction node.
 
 The 2026-05-20 substrate change (issue #229) closes both: supersede/retract now cascade to contradictions, and `engram_resolve` is now pure-wire (callers compose the resolving derivation via `engram_derive` first, then wire it).
 
@@ -19,7 +19,7 @@ The 2026-05-20 substrate change (issue #229) closes both: supersede/retract now 
 
 ## When to use
 
-- A contradiction (ct_XXXX) is `open` or `partially_resolved` and needs to be driven to resolution.
+- A contradiction (ct_XXXX) is `active` or `partially_resolved` and needs to be driven to resolution.
 - A contradiction surfaced as `stale_by_premise` (one of its contradicting sides was superseded — supersede cascade fired).
 - A contradiction surfaced as `tainted_by` (one of its contradicting sides was retracted — retract cascade fired).
 - Dream-fairy-2 (contradictions-ripe-for-resolution) flagged a contradiction for action.
@@ -223,6 +223,6 @@ When you scan for contradictions ripe for resolution, your decision tree — dri
 
 1. `warnings.tainted_by` non-empty (present at all — the key is omitted entirely on a clean node, never present-but-empty)? → tainted-contradiction path.
 2. `warnings.stale_by` non-empty? → stale-contradiction path. Decide case 1 (substantive resolve) vs case 2 (preserve and rewire).
-3. `status == "open"` or `"partially_resolved"` with no `warnings` key at all? → standard resolution path. But first check: has either contradicting node been superseded since the contradiction was created? If yes, the supersede may have happened BEFORE the cascade landed — treat as stale-contradiction path anyway.
+3. `status == "active"` or `"partially_resolved"` with no `warnings` key at all? → standard resolution path. But first check: has either contradicting node been superseded since the contradiction was created? If yes, the supersede may have happened BEFORE the cascade landed — treat as stale-contradiction path anyway.
 
 Always cite root nodes in any new resolving derivation. Never chain off a prior weak resolution.

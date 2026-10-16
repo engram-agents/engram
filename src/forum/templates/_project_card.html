@@ -18,7 +18,7 @@
     <span class="pcard__kind" title="{{ item.kind }}">{{ kind_emoji.get(item.kind, '·') }}</span>
     <span class="pcard__id mono">{{ item.project }}</span>
     <span class="pcard__badge" style="color: {{ sc }}; border-color: color-mix(in oklab, {{ sc }} 32%, var(--line));">
-      {%- if item.gh_unknown %}<span title="gh state unavailable">?</span> {% endif -%}
+      {%- if item.gh_unknown %}<span title="{% if item.gh_state == 'unqualified' %}needs a repo-qualified anchor{% else %}gh state unavailable{% endif %}">?</span> {% endif -%}
       {{ eff }}
       {%- if item.gh_state %} <span class="pcard__ghstate">(gh: {{ item.gh_state }})</span>{% endif -%}
     </span>

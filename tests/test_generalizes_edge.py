@@ -128,7 +128,7 @@ def test_generalizes_in_valid_relations_and_classifications():
     c = core.EDGE_CLASSIFICATIONS["generalizes"]
     assert c["cascade"] is False
     assert c["temporal_causal"] is False
-    assert c["dag"] is True
+    assert c["dag_family"] == "abstraction"
     assert c["removable"] is True
     assert c["addable_after_creation"] is True
     assert c["provenance"] is False

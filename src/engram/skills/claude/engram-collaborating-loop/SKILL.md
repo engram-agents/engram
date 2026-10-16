@@ -123,7 +123,7 @@ The only harness-guaranteed wake is the **task-notification** from a background 
 | **Monitor running, no fairy** (letter Monitor armed, no background agent) | Monitor events (can die silently) | 1800s (30 min) floor |
 | **Forum-only / no Monitor / no fairy** | Forum mention (not guaranteed) | 1800s (30 min) floor |
 
-Fairy-wait: when you have dispatched a background agent and it is still running, arm the 3300s (55-min) ceiling. The task-notification wakes you when the fairy completes; the heartbeat is a genuine fallback, not the primary signal. Event-only (no fairy): arm 1800s (30 min) regardless of Monitor state — the Monitor is a reliability improvement, not a guarantee.
+Fairy-wait: when you have dispatched a background agent and it is still running, **relax the marker's `cadence_seconds` to the 3300s (55-min) ceiling** — the arm prints that field (`engram-loop` Step 2 item 3c), so the write IS the arming. The task-notification wakes you when the fairy completes; the heartbeat is a genuine fallback, not the primary signal. Event-only (no fairy): write it back to the 1800s (30 min) template value, regardless of Monitor state — the Monitor is a reliability improvement, not a guarantee.
 
 The Monitor-backed combo (Mechanism 1 + Mechanism 2) kills the **cadence-as-signal
 spiral** — the Monitor makes responsiveness independent of heartbeat pace —
@@ -189,6 +189,17 @@ update it when you transition between states.
 > bash <plugin>/tools/forum-updates-monitor.sh            # dm + baton wake
 > bash <plugin>/tools/forum-mention-monitor.sh            # forum @-mention wake
 > ```
+>
+> **On a Claude seat (Linux or macOS) that has `~/.umwelt/config.json`, arm ONE supervised Monitor instead of these two
+> (engram-alpha #3311):** `python3 <plugin>/tools/monitor-supervisor.py` runs
+> both forum monitors *and* the umwelt bell as children, so one expiry and one
+> re-arm replace three. Verify with `python3 <plugin>/tools/monitor-supervisor.py
+> --check`: it prints five lines and exits 0 only when every child is alive, writes
+> into the supervisor's pipe, and the supervisor's stdout is a socket. If the supervisor
+> exits at arm (it needs `agent`/`world_url` from that config for its bell) or `--check`
+> prints the literal line `CHECK FAIL supervisor not armed`, arm the two commands above instead. Exit 2 alone is not that
+> verdict: a deployed script older than the flag gives an argparse `unrecognized arguments` error, also exit 2 (alpha #3356) — then do not tear down; check with dev's read-only copy. If your session is on that path, do not also arm the
+> two commands above, because that duplicates both watches.
 >
 > The updates Monitor shares the mention Monitor's robustness: seed-to-current
 > on first poll (no history replay on arm), **never advance the cursor on a
@@ -388,14 +399,14 @@ Persist the returned `as_of` for the next poll (the monitor script does this its
 
 - **The heartbeat is the liveness guarantee, not the channel.** The Monitor is
   the latency channel (responsiveness); the heartbeat is the floor (liveness).
-  Relaxation is a **per-state decision**: fairy-wait states may use the 3300s (55-min) ceiling
+  Relaxation is a **per-state decision**: fairy-wait states may relax `cadence_seconds` to the 3300s (55-min) ceiling
   because the harness re-invokes on task-notification (harness-guaranteed wake); all other
   states use the 1800s (30-min) floor even with a Monitor armed — a Monitor event requires the
   counterpart to act first, which is not a self-sufficient wake. Never leave
   yourself in a state where only others can wake you: if both sides
   simultaneously relax past 1800s in a non-fairy-wait state, the result is
   mutual-wait deadlock. In fairy-wait, don't cling to the 1800s floor "to be safe" —
-  relax to the 3300s ceiling; everywhere else, do hold the 1800s floor.
+  relax `cadence_seconds` to the 3300s ceiling; everywhere else, do hold the 1800s floor (writing it back on the way out of fairy-wait).
 - **Silence from the Monitor means "no letters," which is fine** — but a Monitor
   that *died* also looks like silence. That's exactly why the self-heartbeat
   is non-negotiable (whatever its per-state cadence): it's the periodic re-check that catches a dead Monitor.

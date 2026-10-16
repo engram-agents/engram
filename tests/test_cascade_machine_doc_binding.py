@@ -120,8 +120,9 @@ def _parse_resolution_kinds_bullet(section_text):
 
 def _parse_acknowledged_derives_from_flags(section_text):
     """Parse the third bullet's "`acknowledged_derives_from` carries
-    `cascade: True`, `temporal_causal: False`, `dag: True` in
-    `EDGE_CLASSIFICATIONS`." clause into {flag: bool}."""
+    `cascade: True`, `temporal_causal: False`, `dag_family: grounding` in
+    `EDGE_CLASSIFICATIONS`." clause into {flag: bool | str} (#3210: the
+    bool `dag` became the string `dag_family`)."""
     m = re.search(
         r"`acknowledged_derives_from` carries(.*?)in `EDGE_CLASSIFICATIONS`\.",
         section_text,
@@ -130,21 +131,27 @@ def _parse_acknowledged_derives_from_flags(section_text):
     if not m:
         raise AssertionError(
             "Could not find the '`acknowledged_derives_from` carries "
-            "`cascade: True`, `temporal_causal: False`, `dag: True` in "
+            "`cascade: True`, `temporal_causal: False`, `dag_family: grounding` in "
             "`EDGE_CLASSIFICATIONS`.' bullet shape in §13 of "
             "docs/cascade-machine.md — update "
             "_parse_acknowledged_derives_from_flags to match the doc's "
             "current prose."
         )
-    pairs = re.findall(r"`(cascade|temporal_causal|dag): (True|False)`", m.group(1))
+    pairs = re.findall(
+        r"`(cascade|temporal_causal|dag_family): (True|False|grounding|abstraction)`",
+        m.group(1),
+    )
     if len(pairs) != 3:
         raise AssertionError(
             f"Expected exactly 3 flag:value pairs (cascade, temporal_causal, "
-            f"dag) in the acknowledged_derives_from bullet, found "
+            f"dag_family) in the acknowledged_derives_from bullet, found "
             f"{len(pairs)}: {pairs} — the doc's bullet prose has changed "
             f"shape; update _parse_acknowledged_derives_from_flags."
         )
-    return {name: (value == "True") for name, value in pairs}
+    return {
+        name: (value if name == "dag_family" else value == "True")
+        for name, value in pairs
+    }
 
 
 def _parse_marker_status_bullet(section_text):
@@ -214,7 +221,7 @@ def test_resolution_kinds_matches_doc():
 
 def test_acknowledged_derives_from_flags_match_doc():
     """§13 bullet 3: the doc's claimed flags for acknowledged_derives_from
-    (cascade True, temporal_causal False, dag True) equal
+    (cascade True, temporal_causal False, dag_family grounding) equal
     EDGE_CLASSIFICATIONS["acknowledged_derives_from"] on those three keys."""
     DOC_ACK_DERIVES_FROM_FLAGS = _parse_acknowledged_derives_from_flags(
         _section_text()
@@ -223,7 +230,7 @@ def test_acknowledged_derives_from_flags_match_doc():
     mismatches = [
         f"{key}: doc says {DOC_ACK_DERIVES_FROM_FLAGS[key]}, "
         f"EDGE_CLASSIFICATIONS says {code_flags[key]}"
-        for key in ("cascade", "temporal_causal", "dag")
+        for key in ("cascade", "temporal_causal", "dag_family")
         if DOC_ACK_DERIVES_FROM_FLAGS[key] != code_flags[key]
     ]
     assert not mismatches, (

@@ -27,7 +27,8 @@ def app(tmp_path):
     # seed one baton for mutation tests
     _init(store, allocator, "PR-42",
           title="test pr", status="in-progress", turn="ariadne",
-          participants=["ariadne", "luria"], turn_reason="start")
+          participants=["ariadne", "luria"], turn_reason="start",
+          transition_phase="fairy")  # #3296: a phase-less baton resolves via the pool sentinel
 
     application = create_app(db_path, audit_path)
     application.config["TESTING"] = True
@@ -125,7 +126,7 @@ class TestProjectInit:
     def test_creates_new_project(self, client):
         resp = client.post("/api/projects", json={
             "agent": "luria",
-            "project_id": "PR-99",
+            "project_id": "PR-99", "github": "pr/example-org/example-repo/99",
             "title": "New Baton",
             "status": "in-progress",
             "turn": "luria",
@@ -141,7 +142,7 @@ class TestProjectInit:
         # PR-42 already seeded
         resp = client.post("/api/projects", json={
             "agent": "luria",
-            "project_id": "PR-42",
+            "project_id": "PR-42", "github": "pr/example-org/example-repo/42",
             "title": "Dup",
             "status": "in-progress",
             "turn": "luria",
@@ -180,7 +181,7 @@ class TestProjectInit:
         # responses don't (yet) surface turn_by.
         client.post("/api/projects", json={
             "agent": "luria",
-            "project_id": "PR-102",
+            "project_id": "PR-102", "github": "pr/example-org/example-repo/102",
             "title": "t",
             "status": "in-progress",
             "turn": "ariadne",  # by_agent (luria) != turn (ariadne)
@@ -199,7 +200,7 @@ class TestProjectInit:
         from forum.coordination.markdown import parse_frontmatter
 
         client.post("/api/projects", json={
-            "agent": "clio", "project_id": "PR-103", "title": "t",
+            "agent": "clio", "project_id": "PR-103", "github": "pr/example-org/example-repo/103", "title": "t",
             "status": "in-progress", "turn": "clio",
             "participants": ["clio", "ariadne"], "turn_reason": "start",
             "colleague": "ariadne", "author": "clio",
@@ -216,7 +217,7 @@ class TestProjectInit:
         from forum.coordination.markdown import parse_frontmatter
 
         client.post("/api/projects", json={
-            "agent": "luria", "project_id": "PR-104", "title": "t",
+            "agent": "luria", "project_id": "PR-104", "github": "pr/example-org/example-repo/104", "title": "t",
             "status": "in-progress", "turn": "luria",
             "participants": ["luria"], "turn_reason": "start",
         })
@@ -225,7 +226,10 @@ class TestProjectInit:
         fields, _ = parse_frontmatter(raw)
         assert "author" not in fields
 
-    def test_flip_never_touches_author_field(self, client, app):
+    def test_flip_never_touches_author_field(self, client, app, monkeypatch):
+        # #3366: the baton now carries a pr/ anchor, so its flips run through the gate,
+        # which needs the pool sentinel; set it here rather than rely on the host's config.
+        monkeypatch.setenv("BATON_POOL_SENTINEL", "casey")
         """#2961's whole premise depends on `author` staying fixed across
         turn-changes, unlike `turn_by` (which flip() deliberately
         overwrites every time). Flip the baton twice and confirm `author`
@@ -233,7 +237,7 @@ class TestProjectInit:
         from forum.coordination.markdown import parse_frontmatter
 
         client.post("/api/projects", json={
-            "agent": "clio", "project_id": "PR-105", "title": "t",
+            "agent": "clio", "project_id": "PR-105", "github": "pr/example-org/example-repo/105", "title": "t",
             "status": "in-progress", "turn": "clio",
             "participants": ["clio", "ariadne"], "turn_reason": "start",
             "colleague": "ariadne", "author": "clio",
@@ -257,7 +261,7 @@ class TestProjectInit:
     def test_participants_as_string(self, client):
         resp = client.post("/api/projects", json={
             "agent": "luria",
-            "project_id": "PR-101",
+            "project_id": "PR-101", "github": "pr/example-org/example-repo/101",
             "title": "t",
             "status": "in-progress",
             "turn": "luria",
@@ -282,7 +286,7 @@ class TestProjectInit:
         used to shape participants + a client-side print."""
         resp = client.post("/api/projects", json={
             "agent": "luria",
-            "project_id": "PR-103",
+            "project_id": "PR-103", "github": "pr/example-org/example-repo/103",
             "title": "t",
             "status": "in-progress",
             "turn": "luria",
@@ -297,7 +301,7 @@ class TestProjectInit:
     def test_colleague_omitted_when_not_passed(self, client):
         client.post("/api/projects", json={
             "agent": "luria",
-            "project_id": "PR-104",
+            "project_id": "PR-104", "github": "pr/example-org/example-repo/104",
             "title": "t",
             "status": "in-progress",
             "turn": "luria",
@@ -403,7 +407,7 @@ class TestProjectFlipGate:
         yield
         gate._POOL_SENTINEL_CACHE.clear()
 
-    def _seed(self, app, project_id, *, github, turn, colleague=None, author=None, participants=("borges", "sol")):
+    def _seed(self, app, project_id, *, github, turn, colleague=None, author=None, participants=("borges", "sol"), phase=None):
         store = app.config["COORD_STORE"]
         allocator = app.config["COORD_ALLOCATOR"]
         _init(
@@ -411,6 +415,7 @@ class TestProjectFlipGate:
             title="gate test", status="in-progress", turn=turn,
             participants=list(participants), turn_reason="start",
             github=github, colleague=colleague, author=author,
+            transition_phase=phase,
         )
 
     # -- (a) maintainer-role flip on an UNQUALIFIED pr/<N> anchor: refused,
@@ -442,7 +447,7 @@ class TestProjectFlipGate:
         monkeypatch.setattr(gate, "_pr_approval_state", lambda pr, repo=None: ("no_approval", "no APPROVED review"))
         self._seed(
             app, "PR-2884c", github="pr/example-org/example-repo/503", turn="borges",
-            colleague="sol", participants=("borges", "sol"),
+            colleague="sol", participants=("borges", "sol"), phase="merge",
         )
         resp = client.post("/api/projects/PR-2884c/flip", json={
             "agent": "borges", "to_agent": SENTINEL, "reason": "ready",
@@ -457,7 +462,7 @@ class TestProjectFlipGate:
         monkeypatch.setattr(gate, "_pr_approval_state", lambda pr, repo=None: ("fresh", "approval covers tip"))
         self._seed(
             app, "PR-2884d", github="pr/example-org/example-repo/504", turn="borges",
-            colleague="sol", participants=("borges", "sol"),
+            colleague="sol", participants=("borges", "sol"), phase="merge",
         )
         resp = client.post("/api/projects/PR-2884d/flip", json={
             "agent": "borges", "to_agent": SENTINEL, "reason": "ready",
@@ -528,6 +533,10 @@ class TestProjectFlipGate:
         self._seed(
             app, "PR-2926-no-author", github="pr/example-org/example-repo/2927", turn="ariadne",
             colleague="ariadne", author=None, participants=("clio", "ariadne"),
+            # phase=merge: pins the OLD weak gate (within `merge` it still applies);
+            # with a colleague set and no phase the flip would resolve as peer->merge
+            # and be judged by the strict #3039 U2b gate instead.
+            phase="merge",
         )
         resp = client.post("/api/projects/PR-2926-no-author/flip", json={
             "agent": "ariadne", "to_agent": "clio", "reason": "one blocker, back to author",
@@ -615,7 +624,7 @@ class TestProjectFlipGate:
         monkeypatch.setattr(gate, "_pr_approval_state", lambda pr, repo=None: ("no_approval", "no APPROVED review"))
         self._seed(
             app, "PR-2884i", github="pr/example-org/example-repo/509", turn="borges",
-            colleague="sol", participants=("borges", "sol"),
+            colleague="sol", participants=("borges", "sol"), phase="merge",
         )
         store = app.config["COORD_STORE"]
         result = server_mod._check_flip_gate(store, "PR-2884i", SENTINEL)
@@ -629,9 +638,18 @@ class TestProjectFlipGate:
 # POST /api/projects/<pid>/claim
 # ---------------------------------------------------------------------------
 
+def _seed_bunch(app):
+    # deliberate fixture change (#3039 U2b round 2): claim/release are bunch verbs; a PR-shaped baton is refused
+    _init(app.config["COORD_STORE"], app.config["COORD_ALLOCATOR"], "pool-42",
+          title="test bunch", status="in-progress", turn="ariadne",
+          participants=["ariadne", "luria"], turn_reason="start")
+
+
 class TestProjectClaim:
-    def test_claim_returns_201(self, client):
-        resp = client.post("/api/projects/PR-42/claim", json={
+    def test_claim_returns_201(self, client, app):
+        # deliberate fixture change (#3039 U2b round 2): claim/release are bunch verbs; a PR-shaped baton is refused
+        _seed_bunch(app)
+        resp = client.post("/api/projects/pool-42/claim", json={
             "agent": "luria",
             "pool_sentinel": "lei",
         })
@@ -650,8 +668,10 @@ class TestProjectClaim:
         })
         assert resp.status_code == 404
 
-    def test_claim_returns_turn_and_status(self, client):
-        data = client.post("/api/projects/PR-42/claim", json={
+    def test_claim_returns_turn_and_status(self, client, app):
+        # deliberate fixture change (#3039 U2b round 2): claim/release are bunch verbs; a PR-shaped baton is refused
+        _seed_bunch(app)
+        data = client.post("/api/projects/pool-42/claim", json={
             "agent": "luria",
             "pool_sentinel": "lei",
         }).get_json()
@@ -664,16 +684,20 @@ class TestProjectClaim:
 # ---------------------------------------------------------------------------
 
 class TestProjectRelease:
-    def test_release_returns_201(self, client):
-        resp = client.post("/api/projects/PR-42/release", json={
+    def test_release_returns_201(self, client, app):
+        # deliberate fixture change (#3039 U2b round 2): claim/release are bunch verbs; a PR-shaped baton is refused
+        _seed_bunch(app)
+        resp = client.post("/api/projects/pool-42/release", json={
             "agent": "ariadne",
             "pool_sentinel": "lei",
             "reason": "all done",
         })
         assert resp.status_code == 201
 
-    def test_release_done_true(self, client):
-        resp = client.post("/api/projects/PR-42/release", json={
+    def test_release_done_true(self, client, app):
+        # deliberate fixture change (#3039 U2b round 2): claim/release are bunch verbs; a PR-shaped baton is refused
+        _seed_bunch(app)
+        resp = client.post("/api/projects/pool-42/release", json={
             "agent": "ariadne",
             "pool_sentinel": "lei",
             "reason": "done",
@@ -682,7 +706,7 @@ class TestProjectRelease:
         assert resp.status_code == 201
         # verify title was marked (done) via list endpoint
         data = client.get("/api/projects?active_only=false").get_json()
-        proj = next((p for p in data["projects"] if p["project_id"] == "PR-42"), None)
+        proj = next((p for p in data["projects"] if p["project_id"] == "pool-42"), None)
         assert proj is not None
         assert "(done)" in proj["title"]
 
@@ -701,8 +725,10 @@ class TestProjectRelease:
         })
         assert resp.status_code == 404
 
-    def test_release_returns_turn_and_status(self, client):
-        data = client.post("/api/projects/PR-42/release", json={
+    def test_release_returns_turn_and_status(self, client, app):
+        # deliberate fixture change (#3039 U2b round 2): claim/release are bunch verbs; a PR-shaped baton is refused
+        _seed_bunch(app)
+        data = client.post("/api/projects/pool-42/release", json={
             "agent": "ariadne",
             "pool_sentinel": "lei",
             "reason": "back to pool",
@@ -802,11 +828,23 @@ class TestProjectRename:
 # POST /api/projects/<pid>/anchor
 # ---------------------------------------------------------------------------
 
+def _seed_fairy_baton(client, pid="PR-43"):
+    """A `fairy`-phase PR baton (anchor settable); the route under test is /anchor.
+    R6: the phase-less PR-42 above may resolve past `fairy` (unresolvable pool
+    sentinel in this fixture), where the anchor is write-once with no exceptions."""
+    cfg = client.application.config
+    _init(cfg["COORD_STORE"], cfg["COORD_ALLOCATOR"], pid,
+          title="fairy pr", status="in-progress", turn="ariadne",
+          participants=["ariadne", "luria"], turn_reason="start", transition_phase="fairy")
+    return pid
+
+
 class TestProjectAnchor:
     def test_anchor_returns_201(self, client):
-        resp = client.post("/api/projects/PR-42/anchor", json={
+        pid = _seed_fairy_baton(client)
+        resp = client.post(f"/api/projects/{pid}/anchor", json={
             "agent": "ariadne",
-            "github": "pr/42",
+            "github": "pr/43",
         })
         assert resp.status_code == 201
 
@@ -824,9 +862,10 @@ class TestProjectAnchor:
         assert resp.status_code == 404
 
     def test_anchor_returns_turn_and_status(self, client):
-        data = client.post("/api/projects/PR-42/anchor", json={
+        pid = _seed_fairy_baton(client)
+        data = client.post(f"/api/projects/{pid}/anchor", json={
             "agent": "ariadne",
-            "github": "pr/42",
+            "github": "pr/43",
         }).get_json()
         assert data["turn"] == "ariadne"
         assert data["status"] == "in-progress"

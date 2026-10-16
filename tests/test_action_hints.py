@@ -61,6 +61,13 @@ def _stub_semantic_with(server, similarity, target_id, target_claim):
     # Force the embedder gate so the semantic-search branch fires
     class _StubEmb:
         def is_available(self_): return True
+        # #345 PR3 R3: a double substituting the whole _embedder singleton
+        # must carry the same _revive_cooldown dict + revive() method as
+        # the real EmbeddingManager -- production code no longer
+        # hasattr-guards around a double lacking them.
+        def __init__(self_):
+            self_._revive_cooldown = {}
+        def revive(self_, model_name): pass
     server.core._embedder = _StubEmb()
     server.core._get_embedding_config = lambda: {"enabled": True}
 

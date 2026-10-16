@@ -286,28 +286,21 @@ def test_bump_utility_empty_set_noop(tmp_db):
 
 
 def test_credit_mentions_alpha_matches_server_use_alpha():
-    """ALPHA_MENTION must match server.py:USE_ALPHA['mention'].
+    """The hook has NO private alpha: its default is the shared table's
+    USE_ALPHA['mention'] (engram_restamp), the same table server.py re-exports.
 
-    The hook keeps ALPHA_MENTION as a local literal (to avoid importing the
-    full server module at hook-fire time). This test is the cross-file
-    invariant check: import server.USE_ALPHA at TEST time and assert the
-    two values agree. If they diverge (either side updates without the
-    other), this test fails and surfaces the drift loudly.
+    Replaces the old ALPHA_MENTION-literal drift check -- there is no second
+    copy left to drift. Still asserts the cross-file invariant: the hook's
+    alpha IS the table value server.USE_ALPHA exposes.
     """
-    # The hook's _load_hook execution inserts ENGRAM_HOME (~/.engram) at
-    # sys.path[0], so a plain `import server` would resolve to the deployed
-    # snapshot, not the worktree under test. Re-prioritize REPO_ROOT here
-    # so the assertion checks THIS branch's server.py.
     sys.path.insert(0, str(REPO_ROOT))
     for key in list(sys.modules):
         if key == "server" or key.startswith("engram_"):
             del sys.modules[key]
     import server  # heavy import OK at test time, NOT at hook fire
-    assert hook.ALPHA_MENTION == server.USE_ALPHA["mention"], (
-        f"Hook's ALPHA_MENTION={hook.ALPHA_MENTION} drifted from "
-        f"server.py:USE_ALPHA['mention']={server.USE_ALPHA['mention']}. "
-        f"Update both together; the comment in the hook flags this invariant."
-    )
+    assert not hasattr(hook, "ALPHA_MENTION")
+    assert hook._mention_alpha() == hook.engram_restamp.USE_ALPHA["mention"]
+    assert hook._mention_alpha() == server.USE_ALPHA["mention"]
 
 
 def test_credit_mentions_bumps_all_mentioned_ids_present_in_db(tmp_db):

@@ -141,10 +141,14 @@ def _write_config(
 
     agent_name=None omits the agent_name field entirely (for the
     no-forum-configured gate tests); forum_url, if given, sets forum.url.
+    #3546: agent_name alone no longer configures a forum, so a config that
+    names an agent also gets a (never-contacted: the fetch is stubbed) forum.url.
     """
     cfg = {"mode": mode}
     if agent_name is not None:
         cfg["agent_name"] = agent_name
+        if forum_url is None:
+            forum_url = "http://127.0.0.1:5002"
     if forum_url is not None:
         cfg["forum"] = {"url": forum_url}
     (engram_home / "config.json").write_text(json.dumps(cfg))
@@ -550,7 +554,9 @@ class TestMainRendering:
         """PR-anchored baton with cached status shows live clause in the output."""
         _write_config(engram_home)
         mod = _load_hook_module(engram_home)
-        _write_baton_cache(engram_home, {"pr/999": "OPEN · review:APPROVED"})
+        _write_baton_cache(
+            engram_home, {"pr/example-org/example-repo/999": "OPEN · review:APPROVED"}
+        )
 
         @staticmethod
         def _which(name):
@@ -562,7 +568,10 @@ class TestMainRendering:
             with patch.object(mod, "subprocess") as mock_sub:
                 mock_sub.run.return_value = type("CP", (), {"returncode": 0})()
                 stdout, stderr, rc = _call_main(mod, projects=[
-                    _make_project_dict("PR-999", turn="borges"),
+                    _make_project_dict(
+                        "PR-999", turn="borges",
+                        github="pr/example-org/example-repo/999",
+                    ),
                 ], gh_ok=True)
 
         ctx = _parse_ctx(stdout)
@@ -581,9 +590,10 @@ class TestParsePrAnchorRepoQualified:
     gh would reject as a garbage PR-number positional arg. _parse_pr_anchor
     fixes this; these tests lock its contract directly."""
 
-    def test_bare_anchor_resolves_default_repo(self, engram_home):
+    def test_bare_anchor_has_no_repo(self, engram_home):
+        """#1918: no default repo -- a bare anchor parses to None."""
         mod = _load_hook_module(engram_home)
-        assert mod._parse_pr_anchor("pr/1005") == (mod._DEFAULT_GITHUB_REPO, "1005")
+        assert mod._parse_pr_anchor("pr/1005") is None
 
     def test_qualified_anchor_resolves_its_own_repo(self, engram_home):
         mod = _load_hook_module(engram_home)
@@ -648,8 +658,9 @@ class TestAutoArchivePure:
     def test_merged_in_cache_invokes_close_merged(self, engram_home):
         """MERGED in cache -> baton close --status merged."""
         mod = self._mod(engram_home)
-        projects = [_make_project_dict("PR-1100", turn="borges", status="in-progress")]
-        cache = self._fresh_cache("pr/1100", "MERGED")
+        projects = [_make_project_dict("PR-1100", turn="borges", status="in-progress",
+                                       github="pr/example-org/example-repo/1100")]
+        cache = self._fresh_cache("pr/example-org/example-repo/1100", "MERGED")
 
         with patch.object(mod.shutil, "which", side_effect=self._which):
             with patch.object(mod, "subprocess") as mock_sub:
@@ -665,8 +676,9 @@ class TestAutoArchivePure:
     def test_closed_in_cache_invokes_close_cancelled(self, engram_home):
         """CLOSED in cache -> baton close --status cancelled."""
         mod = self._mod(engram_home)
-        projects = [_make_project_dict("PR-2800", turn="borges", status="in-review")]
-        cache = self._fresh_cache("pr/2800", "CLOSED")
+        projects = [_make_project_dict("PR-2800", turn="borges", status="in-review",
+                                       github="pr/example-org/example-repo/2800")]
+        cache = self._fresh_cache("pr/example-org/example-repo/2800", "CLOSED")
 
         with patch.object(mod.shutil, "which", side_effect=self._which):
             with patch.object(mod, "subprocess") as mock_sub:
@@ -682,8 +694,9 @@ class TestAutoArchivePure:
     def test_open_in_cache_no_baton_close(self, engram_home):
         """OPEN in cache -> no baton close (not a terminal state)."""
         mod = self._mod(engram_home)
-        projects = [_make_project_dict("PR-1200", turn="borges", status="in-review")]
-        cache = self._fresh_cache("pr/1200", "OPEN")
+        projects = [_make_project_dict("PR-1200", turn="borges", status="in-review",
+                                       github="pr/example-org/example-repo/1200")]
+        cache = self._fresh_cache("pr/example-org/example-repo/1200", "OPEN")
 
         with patch.object(mod.shutil, "which", side_effect=self._which):
             with patch.object(mod, "subprocess") as mock_sub:
@@ -696,7 +709,8 @@ class TestAutoArchivePure:
     def test_uncached_anchor_no_baton_close(self, engram_home):
         """Empty cache -> no close (cache-only guard: uncached anchors are skipped)."""
         mod = self._mod(engram_home)
-        projects = [_make_project_dict("PR-1201", turn="borges", status="in-review")]
+        projects = [_make_project_dict("PR-1201", turn="borges", status="in-review",
+                                       github="pr/example-org/example-repo/1201")]
         cache: dict = {}
 
         with patch.object(mod.shutil, "which", side_effect=self._which):
@@ -712,8 +726,9 @@ class TestAutoArchivePure:
     def test_already_merged_status_idempotency(self, engram_home):
         """Baton with status=merged is skipped even if cache says MERGED."""
         mod = self._mod(engram_home)
-        projects = [_make_project_dict("PR-2200", turn="maintainer", status="merged")]
-        cache = self._fresh_cache("pr/2200", "MERGED")
+        projects = [_make_project_dict("PR-2200", turn="maintainer", status="merged",
+                                       github="pr/example-org/example-repo/2200")]
+        cache = self._fresh_cache("pr/example-org/example-repo/2200", "MERGED")
 
         with patch.object(mod.shutil, "which", side_effect=self._which):
             with patch.object(mod, "subprocess") as mock_sub:
@@ -728,8 +743,9 @@ class TestAutoArchivePure:
     def test_already_cancelled_status_idempotency(self, engram_home):
         """Baton with status=cancelled is skipped even if cache says CLOSED."""
         mod = self._mod(engram_home)
-        projects = [_make_project_dict("PR-2900", turn="borges", status="cancelled")]
-        cache = self._fresh_cache("pr/2900", "CLOSED")
+        projects = [_make_project_dict("PR-2900", turn="borges", status="cancelled",
+                                       github="pr/example-org/example-repo/2900")]
+        cache = self._fresh_cache("pr/example-org/example-repo/2900", "CLOSED")
 
         with patch.object(mod.shutil, "which", side_effect=self._which):
             with patch.object(mod, "subprocess") as mock_sub:
@@ -879,19 +895,30 @@ class TestAutoArchivePure:
     def test_subprocess_raises_no_crash(self, engram_home):
         """subprocess.run raising must not propagate out of _auto_archive."""
         mod = self._mod(engram_home)
-        projects = [_make_project_dict("PR-1300", turn="borges", status="in-review")]
-        cache = self._fresh_cache("pr/1300", "MERGED")
+        projects = [_make_project_dict("PR-1300", turn="borges", status="in-review",
+                                       github="pr/example-org/example-repo/1300")]
+        cache = self._fresh_cache("pr/example-org/example-repo/1300", "MERGED")
+
+        attempted: list = []
 
         def _exploding_run(args, **kwargs):
+            attempted.append(list(args))
             if args[:2] == ["baton", "close"]:
                 raise OSError("baton not found")
             return type("CP", (), {"returncode": 0})()
 
+        stderr_buf = io.StringIO()
         with patch.object(mod.shutil, "which", side_effect=self._which):
             with patch.object(mod, "subprocess") as mock_sub:
                 mock_sub.run.side_effect = _exploding_run
-                # Must not raise
-                mod._auto_archive_merged_pr_batons(projects, cache)
+                with redirect_stderr(stderr_buf):
+                    # Must not raise
+                    mod._auto_archive_merged_pr_batons(projects, cache)
+
+        # The raise path was really exercised: close attempted with the right
+        # argv, and the raise was caught and reported.
+        assert attempted == [["baton", "close", "PR-1300", "--status", "merged"]]
+        assert "baton auto-archive: close PR-1300 raised:" in stderr_buf.getvalue()
 
 
 class TestAutoArchiveAnchorFirst:
@@ -1041,10 +1068,11 @@ class TestAutoArchiveIntegration:
         """
         _write_config(engram_home)
         mod = _load_hook_module(engram_home)
-        _write_baton_cache(engram_home, {"pr/2100": "MERGED"})
+        _write_baton_cache(engram_home, {"pr/example-org/example-repo/2100": "MERGED"})
         projects = [
             _make_project_dict("PR-2100", turn="maintainer", status="in-progress",
-                               turn_reason="colleague-approved; ready for merge"),
+                               turn_reason="colleague-approved; ready for merge",
+                               github="pr/example-org/example-repo/2100"),
         ]
 
         with patch.object(mod.shutil, "which", side_effect=self._which):
@@ -1062,9 +1090,10 @@ class TestAutoArchiveIntegration:
         """gh unavailable (_gh_available returns False) -> auto-archive pass skipped."""
         _write_config(engram_home)
         mod = _load_hook_module(engram_home)
-        _write_baton_cache(engram_home, {"pr/2400": "MERGED"})
+        _write_baton_cache(engram_home, {"pr/example-org/example-repo/2400": "MERGED"})
         projects = [
-            _make_project_dict("PR-2400", turn="maintainer", status="in-progress"),
+            _make_project_dict("PR-2400", turn="maintainer", status="in-progress",
+                               github="pr/example-org/example-repo/2400"),
         ]
         close_calls: list = []
 
@@ -1090,10 +1119,11 @@ class TestAutoArchiveIntegration:
         """
         _write_config(engram_home)
         mod = _load_hook_module(engram_home)
-        _write_baton_cache(engram_home, {"pr/2700": "MERGED"})
+        _write_baton_cache(engram_home, {"pr/example-org/example-repo/2700": "MERGED"})
         projects = [
             _make_project_dict("PR-2700", turn="maintainer", status="in-progress",
-                               turn_reason="colleague-approved"),
+                               turn_reason="colleague-approved",
+                               github="pr/example-org/example-repo/2700"),
         ]
         close_calls: list = []
 
@@ -1116,11 +1146,12 @@ class TestAutoArchiveIntegration:
         """Non-zero baton close returncode -> stderr log; stdout stays empty."""
         _write_config(engram_home)
         mod = _load_hook_module(engram_home)
-        _write_baton_cache(engram_home, {"pr/2500": "MERGED"})
+        _write_baton_cache(engram_home, {"pr/example-org/example-repo/2500": "MERGED"})
         # Baton at turn=maintainer -> no in-court rendering, stdout must stay empty
         projects = [
             _make_project_dict("PR-2500", turn="maintainer", status="in-progress",
-                               turn_reason="ready for merge"),
+                               turn_reason="ready for merge",
+                               github="pr/example-org/example-repo/2500"),
         ]
 
         def _failing_run(args, **kwargs):
@@ -1148,14 +1179,18 @@ class TestAutoArchiveIntegration:
         """baton close subprocess raising must not crash main(); in-court JSON still emitted."""
         _write_config(engram_home)
         mod = _load_hook_module(engram_home)
-        _write_baton_cache(engram_home, {"pr/1300": "MERGED"})
+        _write_baton_cache(engram_home, {"pr/example-org/example-repo/1300": "MERGED"})
         # Baton in borges's court -> rendering loop produces JSON output
         projects = [
             _make_project_dict("PR-1300", turn="borges", status="in-review",
-                               turn_reason="awaiting merge"),
+                               turn_reason="awaiting merge",
+                               github="pr/example-org/example-repo/1300"),
         ]
 
+        attempted: list = []
+
         def _exploding_run(args, **kwargs):
+            attempted.append(list(args))
             if args[:2] == ["baton", "close"]:
                 raise OSError("baton not found")
             return type("CP", (), {"returncode": 0})()
@@ -1166,10 +1201,188 @@ class TestAutoArchiveIntegration:
                 stdout, stderr, rc = _call_main(mod, projects=projects, gh_ok=True)
 
         assert rc == 0
+        # The raise path was really exercised (close attempted, raise caught).
+        closes = [a for a in attempted if a[:2] == ["baton", "close"]]
+        assert closes == [["baton", "close", "PR-1300", "--status", "merged"]]
+        assert "baton auto-archive: close PR-1300 raised:" in stderr
         response = json.loads(stdout)
         assert "hookSpecificOutput" in response
         ctx = response["hookSpecificOutput"]["additionalContext"]
         assert "PR-1300" in ctx, "in-court baton must still appear despite baton-close crash"
+
+
+# ---------------------------------------------------------------------------
+# #1918 class (#1650 / #1919): NO default repo for a bare pr/<N> anchor.
+# ---------------------------------------------------------------------------
+
+def _load_hook_module_env(engram_home: Path, extra_env: dict, unset: tuple = ()):
+    """Like _load_hook_module, but with extra env set (and some vars removed)
+    during import. The hook used to read $ENGRAM_DEFAULT_GITHUB_REPO at import
+    time, so "a seat that sets the variable" must set it around exec_module."""
+    spec = importlib.util.spec_from_file_location("engram_baton_prompt_hook", HOOK_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    with patch.dict(os.environ, {"ENGRAM_HOME": str(engram_home), **extra_env}):
+        for name in unset:
+            os.environ.pop(name, None)
+        spec.loader.exec_module(mod)
+    return mod
+
+
+class TestNoDefaultRepoBareAnchor:
+    """A bare pr/<N> anchor is never resolved against a default repo, whatever
+    ENGRAM_DEFAULT_GITHUB_REPO says: never fetched, never cached, never
+    auto-archived, and the skip is counted once per run on stderr."""
+
+    DEV = "example-org/dev-repo"
+
+    @staticmethod
+    def _which(name: str):
+        if name in ("baton", "gh"):
+            return name
+        return None
+
+    def _mod(self, engram_home: Path, env: "dict | None" = None):
+        _write_config(engram_home)
+        # With no env given, the variable is really UNSET during import (c2).
+        return _load_hook_module_env(
+            engram_home, env or {}, unset=("ENGRAM_DEFAULT_GITHUB_REPO",) if not env else (),
+        )
+
+    @staticmethod
+    def _argvs(mock_sub) -> list:
+        return [c.args[0] for c in mock_sub.run.call_args_list if c.args]
+
+    @staticmethod
+    def _gh_argvs(argvs) -> list:
+        return [a for a in argvs if a and a[0] == "gh"]
+
+    @staticmethod
+    def _close_argvs(argvs) -> list:
+        return [a for a in argvs if a[:2] == ["baton", "close"]]
+
+    def _run_archive(self, mod, projects, cache):
+        stderr_buf = io.StringIO()
+        with patch.object(mod.shutil, "which", side_effect=self._which):
+            with patch.object(mod, "subprocess") as mock_sub:
+                mock_sub.run.return_value = type("CP", (), {"returncode": 0})()
+                with redirect_stderr(stderr_buf):
+                    mod._auto_archive_merged_pr_batons(projects, cache)
+        return self._argvs(mock_sub), stderr_buf.getvalue()
+
+    # (c1) env var set to the dev repo, bare baton, cached MERGED -> no close.
+    def test_c1_env_set_bare_baton_merged_in_cache_is_not_closed(self, engram_home):
+        mod = self._mod(engram_home, {"ENGRAM_DEFAULT_GITHUB_REPO": self.DEV})
+        projects = [_make_project_dict("PR-4101", turn="maintainer", status="in-progress")]
+        cache = {"pr/4101": {"fetched_at": time.time(), "render": "MERGED"}}
+        argvs, _ = self._run_archive(mod, projects, cache)
+        assert self._close_argvs(argvs) == [], f"bare baton must not be closed: {argvs}"
+
+    # (c1b) control: the same setup with a QUALIFIED anchor IS closed.
+    def test_c1b_control_qualified_anchor_is_closed(self, engram_home):
+        mod = self._mod(engram_home, {"ENGRAM_DEFAULT_GITHUB_REPO": self.DEV})
+        anchor = f"pr/{self.DEV}/4101"
+        projects = [_make_project_dict(
+            "PR-4101", turn="maintainer", status="in-progress", github=anchor,
+        )]
+        cache = {anchor: {"fetched_at": time.time(), "render": "MERGED"}}
+        argvs, _ = self._run_archive(mod, projects, cache)
+        assert self._close_argvs(argvs) == [["baton", "close", "PR-4101", "--status", "merged"]]
+
+    # (c1, end-to-end) gh would say MERGED for the dev repo's #N: through
+    # main(), the bare baton is neither fetched nor closed.
+    def test_c1_e2e_env_set_gh_says_merged_bare_baton_untouched(self, engram_home):
+        mod = self._mod(engram_home, {"ENGRAM_DEFAULT_GITHUB_REPO": self.DEV})
+        projects = [_make_project_dict("PR-4102", turn="borges", status="in-review")]
+        recorded: list = []
+
+        def _fake_run(args, **kwargs):
+            recorded.append(list(args))
+            return type("CP", (), {"returncode": 0, "stdout": "MERGED|", "stderr": ""})()
+
+        with patch.object(mod.shutil, "which", side_effect=self._which):
+            with patch.object(mod, "subprocess") as mock_sub:
+                mock_sub.run.side_effect = _fake_run
+                _call_main(mod, projects=projects, gh_ok=True)
+        assert self._gh_argvs(recorded) == [], f"bare anchor must make no gh call: {recorded}"
+        assert self._close_argvs(recorded) == []
+        # ...and nothing was cached for it.
+        cache_file = engram_home / "baton-status-cache.json"
+        if cache_file.exists():
+            assert "pr/4102" not in json.loads(cache_file.read_text())
+
+    # (c2) env var UNSET: same refusal, and NO gh call at all (public repo
+    # included). Asserted on the recorded argv, not just the outcome.
+    def test_c2_env_unset_no_gh_call_and_no_close(self, engram_home):
+        mod = self._mod(engram_home)  # variable unset
+        projects = [_make_project_dict("PR-4103", turn="borges", status="in-review")]
+        recorded: list = []
+
+        def _fake_run(args, **kwargs):
+            recorded.append(list(args))
+            return type("CP", (), {"returncode": 0, "stdout": "MERGED|", "stderr": ""})()
+
+        with patch.object(mod.shutil, "which", side_effect=self._which):
+            with patch.object(mod, "subprocess") as mock_sub:
+                mock_sub.run.side_effect = _fake_run
+                _call_main(mod, projects=projects, gh_ok=True)
+        assert self._gh_argvs(recorded) == [], f"gh was called: {recorded}"
+        assert not any("engram-agents/engram" in " ".join(a) for a in recorded), recorded
+        assert self._close_argvs(recorded) == []
+
+    def test_c2_get_live_status_bare_makes_no_fetch_and_caches_nothing(self, engram_home):
+        mod = self._mod(engram_home)
+        cache: dict = {}
+        with patch.object(mod, "_fetch_pr_status") as fetch:
+            out = mod._get_live_status("pr/4104", cache)
+        fetch.assert_not_called()
+        assert cache == {}
+        assert "qualified anchor" in out
+
+    # (c3) one counted skip line per run, right count.
+    def test_c3_counted_skip_line_once_per_run(self, engram_home):
+        mod = self._mod(engram_home, {"ENGRAM_DEFAULT_GITHUB_REPO": self.DEV})
+        q = f"pr/{self.DEV}/4110"
+        projects = [
+            _make_project_dict("PR-4105", turn="maintainer", status="in-progress"),
+            _make_project_dict("PR-4106", turn="borges", status="in-review"),
+            _make_project_dict("PR-4107", turn="ariadne", status="planning", github="pr/4107"),
+            _make_project_dict("PR-4110", turn="maintainer", status="in-progress", github=q),
+            _make_project_dict("pool-x", turn="maintainer", status="in-progress",
+                               github="project/4"),
+        ]
+        cache = {q: {"fetched_at": time.time(), "render": "OPEN"}}
+        argvs, stderr = self._run_archive(mod, projects, cache)
+        skip_lines = [l for l in stderr.splitlines() if "unqualified" in l]
+        assert len(skip_lines) == 1, stderr
+        assert "skipped 3 baton(s)" in skip_lines[0], skip_lines[0]
+        assert "baton anchor <id> --github pr/<owner>/<repo>/<N>" in skip_lines[0]
+
+    def test_c3_no_skip_line_when_nothing_skipped(self, engram_home):
+        mod = self._mod(engram_home)
+        projects = [_make_project_dict("pool-x", turn="maintainer", status="in-progress",
+                                       github="project/4")]
+        _, stderr = self._run_archive(mod, projects, {})
+        assert "unqualified" not in stderr
+
+    # Render path: a bare-anchored in-court baton says it needs a qualified
+    # anchor instead of showing a GitHub status.
+    def test_render_bare_anchor_says_needs_qualified_anchor(self, engram_home):
+        mod = self._mod(engram_home, {"ENGRAM_DEFAULT_GITHUB_REPO": self.DEV})
+        _write_baton_cache(engram_home, {"pr/4120": "MERGED"})  # stale/poisoned entry
+        projects = [_make_project_dict("PR-4120", turn="borges", status="in-review")]
+        with patch.object(mod.shutil, "which", side_effect=self._which):
+            with patch.object(mod, "subprocess") as mock_sub:
+                mock_sub.run.return_value = type(
+                    "CP", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+                stdout, _, _ = _call_main(mod, projects=projects, gh_ok=True)
+        ctx = _parse_ctx(stdout)
+        assert "needs a qualified anchor" in ctx, ctx
+        assert "MERGED" not in ctx, ctx
+
+    def test_parse_pr_anchor_bare_is_none_even_with_env_set(self, engram_home):
+        mod = self._mod(engram_home, {"ENGRAM_DEFAULT_GITHUB_REPO": self.DEV})
+        assert mod._parse_pr_anchor("pr/1005") is None
+        assert mod._parse_pr_anchor(f"pr/{self.DEV}/1005") == (self.DEV, "1005")
 
 
 # ---------------------------------------------------------------------------
@@ -1259,3 +1472,52 @@ def test_hooklib_resolution_in_flattened_deployed_topology(tmp_path):
         f"deployed-topology hook's emit_context envelope diverged "
         f"(stdout={r.stdout!r} stderr={r.stderr!r})"
     )
+
+
+# ===========================================================================
+# #1813 -- frontmatter field separator must not cross a newline
+# ===========================================================================
+#
+# The hook's own _FRONTMATTER_FIELD_RE used `\s*` as the key/value separator,
+# and `\s` matches `\n`. An empty, UNQUOTED field therefore swallowed the
+# entire next field's line as its own value. Tests go through the hook's
+# real `_parse_frontmatter`, not the bare regex, so they pin behaviour
+# rather than a string.
+def test_1813_empty_unquoted_field_does_not_swallow_next_field(engram_home):
+    mod = _load_hook_module(engram_home)
+    raw = (
+        "---\n"
+        "project: PR-1813\n"
+        "turn_by: \n"
+        "participants: [borges]\n"
+        "status: open\n"
+        "---\n"
+        "body\n"
+    )
+    fields, _ = mod._parse_frontmatter(raw)
+    assert fields["turn_by"] == ""
+    assert fields["participants"] == "[borges]"
+    assert fields["status"] == "open"
+
+
+def test_1813_unchanged_cases_still_parse_correctly(engram_home):
+    mod = _load_hook_module(engram_home)
+    # key: value (space) / key:value (no space) / a value containing ": " /
+    # quoted-empty / a trailing field at the end of the block -- all must
+    # parse exactly as before the fix.
+    raw = (
+        "---\n"
+        "project: PR-1813\n"
+        "title:no-space-value\n"
+        "colon_value: a value: with a colon\n"
+        'turn_reason: ""\n'
+        "participants: [borges, ariadne]\n"
+        "---\n"
+        "body\n"
+    )
+    fields, _ = mod._parse_frontmatter(raw)
+    assert fields["project"] == "PR-1813"
+    assert fields["title"] == "no-space-value"
+    assert fields["colon_value"] == "a value: with a colon"
+    assert fields["turn_reason"] == '""'
+    assert fields["participants"] == "[borges, ariadne]"

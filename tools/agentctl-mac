@@ -279,9 +279,10 @@ while [[ $# -gt 0 ]]; do
     fi
     case "$1" in
         --)
-            # Consumed as a separator, not forwarded -- matches
-            # tools/agentctl's own _parse_session_flags, which does the same
-            # single-leading-`--`-shift rather than passing it through.
+            # Preserve the user-supplied separator for Codex: it marks the
+            # prompt boundary, so dropping it would make prompt text look
+            # like a resume subcommand to the shared expansion guard.
+            EXTRA+=("$1")
             seen_dashdash=1
             shift ;;
         --dry-run)

@@ -303,6 +303,7 @@ crash the session.
 import html
 import json
 import os
+import stat
 import sys
 import time
 from pathlib import Path
@@ -379,6 +380,55 @@ try:
 except Exception:
     _STOPHOOKLIB_OK = False
 
+# #3628: the two marker reads below (platform.json, loop-mode.json) must be
+# non-blocking and regular-file-only. They use _hooklib's helper when it can be
+# imported. This hook's contract (see the emitter resolver note above, and
+# test_emits_via_fallback_when_stophooklib_import_fails) is that it must still
+# work, and still emit its nudge, when it runs with NO sibling lib at all, so it
+# cannot hard-import _hooklib: on ImportError it defines the same two helpers
+# itself. The fallback bodies are pinned identical to _hooklib's by
+# tests/test_regular_io_parity_3628.py (AST + behavioural) -- never edit one
+# without the other.
+try:
+    from _hooklib import open_regular_text
+except Exception:
+    def _not_regular_error(fd, path):
+        """The OSError for a path that opened but is not a regular file. A
+        directory keeps the IsADirectoryError a plain open() raises for it; any
+        other kind (FIFO, socket, device) is an EINVAL OSError. Does not close fd:
+        the caller's except clause does, once."""
+        import errno
+        try:
+            is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+        except OSError:
+            is_dir = False
+        code = errno.EISDIR if is_dir else errno.EINVAL
+        return OSError(code, os.strerror(code) + " (not a regular file)", str(path))
+
+    def open_regular_text(path, encoding=None):
+        """`open(path, encoding=encoding)` for a read that must never block (#3591).
+
+        A plain open() of a FIFO waits for a writer; a hook under a 5 s timeout
+        hangs and is killed. This opens O_NONBLOCK (returns at once on a FIFO),
+        fstat-checks that the target is a regular file, and returns a text file
+        object over the fd. Anything else raises OSError (IsADirectoryError for a
+        directory, EINVAL otherwise), so a call site that already treats an
+        unreadable file as absent -- `except OSError` or broader -- needs only
+        `open(p)` -> `open_regular_text(p)`. FileNotFoundError / PermissionError
+        come from os.open exactly as from open(). For a regular file the result is
+        the same text wrapper open() returns."""
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise _not_regular_error(fd, path)
+            return os.fdopen(fd, "r", encoding=encoding)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+
 # ---------------------------------------------------------------------------
 # loop_prompt import — SSoT for the loop-wake marker (same pattern as
 # engram-time-bar-hook.py / engram-deference-detector-prompt.py). Resolve
@@ -429,6 +479,39 @@ try:
 except Exception:
     _LOOP_WAKE_MARKER = _LOOP_WAKE_MARKER_FALLBACK
 
+# ---------------------------------------------------------------------------
+# The helper command the nudge PRINTS must RUN AS PRINTED.  The resolution
+# above already found the real tools/ dir (`_LP_TOOLS_DIR`), so print THAT:
+# a static guess is copied from one deploy layout and broken in the other —
+# the bare `tools/loop_prompt.py` this replaced resolved in NO cwd, not even
+# the repo root, because the source tree keeps the file at `src/engram/tools/`.
+# Only when the import resolution FAILED does the printed command fall back
+# to a sh form whose `:-` default covers a plugin-topology seat with the
+# variable set AND one that has the plugin installed but
+# `$CLAUDE_PLUGIN_ROOT` unset in its shell (measured: unset in an agent's
+# Bash env, login shell included).
+# ---------------------------------------------------------------------------
+
+_LOOP_PROMPT_FALLBACK_PATH = (
+    '"${CLAUDE_PLUGIN_ROOT:-$HOME/.engram/marketplace/plugins/engram}'
+    '/tools/loop_prompt.py"'
+)
+
+
+def _loop_prompt_rearm_command() -> str:
+    """The `loop_prompt.py --rearm-delay` command the nudge prints.
+
+    Names the path RESOLVED at import when resolution succeeded, so the
+    printed command is correct in whichever layout this hook runs from;
+    falls back to the `${CLAUDE_PLUGIN_ROOT:-…}` sh form otherwise.
+    """
+    if _LP_TOOLS_DIR is not None:
+        helper = f'"{_LP_TOOLS_DIR / "loop_prompt.py"}"'
+    else:
+        helper = _LOOP_PROMPT_FALLBACK_PATH
+    return f"python3 {helper} --rearm-delay --wake-kind other"
+
+
 # The wake-arming tool's name(s), as they appear in a tool_use block's
 # "name" field. A small literal/alias set, deliberately -- see invariant 5
 # in the module docstring: a rename should cause over-firing (this set no
@@ -465,7 +548,7 @@ def _runtime_platform() -> str | None:
             candidates.append(Path(value))
     for runtime_dir in candidates:
         try:
-            with open(runtime_dir / "platform.json", encoding="utf-8") as f:
+            with open_regular_text(runtime_dir / "platform.json", encoding="utf-8") as f:
                 data = json.load(f)
             platform = data.get("platform")
             if isinstance(platform, str):
@@ -486,7 +569,11 @@ def _is_managed_codex_runtime() -> bool:
 _NUDGE_TEXT = (
     "[Loop Arm Check: a loop marker is active and this turn shows no "
     "ScheduleWakeup call. Arm now — ScheduleWakeup with this file's "
-    "loop_prompt copied verbatim — then run CronList to verify the armed "
+    "loop_prompt copied verbatim — after asking the helper for this turn's "
+    f"delay: run `{_loop_prompt_rearm_command()}` and "
+    "pass the integer it prints to ScheduleWakeup (a nudge-driven arm "
+    "PRESERVES the deadline; do NOT arm the bare full cadence — that pushes "
+    "the due moment out, #3005). Then run CronList to verify the armed "
     "prompt leads with "
     f"{_LOOP_WAKE_MARKER}. CronList alone never satisfies this check, only "
     "verifies after the real arming action. Arming is idempotent: a "
@@ -524,7 +611,7 @@ def _pacer_is_schedule_wakeup(loop_marker_path: str) -> bool:
     fail-toward-emitting policy.
     """
     try:
-        with open(loop_marker_path, encoding="utf-8") as f:
+        with open_regular_text(loop_marker_path, encoding="utf-8") as f:
             marker = json.load(f)
     except Exception:
         return False

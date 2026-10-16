@@ -244,7 +244,7 @@ def test_invariant_5_derives_to_empty_by_construction():
     special-casing it."""
     non_dag_cascade = {
         r for r, c in core.EDGE_CLASSIFICATIONS.items()
-        if r in core.CASCADE_RELATIONS and not c["dag"]
+        if r in core.CASCADE_RELATIONS and c["dag_family"] is None
     }
     assert non_dag_cascade == set(), (
         "a cascade relation now lacks dag — invariant 5 should no "
@@ -455,14 +455,14 @@ def test_control_e_invariant_5_endpoint_filter_reaches_guarded_branch(monkeypatc
     edge); restoring the clause made it pass again, with the rest of the
     suite green throughout.
     """
-    monkeypatch.setitem(core.EDGE_CLASSIFICATIONS[_CASCADE_RELATION], "dag", False)
+    monkeypatch.setitem(core.EDGE_CLASSIFICATIONS[_CASCADE_RELATION], "dag_family", None)
 
     # Sanity: the patch really does make cascade_ndc non-empty, else this
     # test would silently fall back to exercising the short-circuit guard
     # it claims to bypass.
     cascade, cascade_ndc = conformance._derive_cascade()
     assert cascade_ndc == {_CASCADE_RELATION}, (
-        "monkeypatching EDGE_CLASSIFICATIONS[relation]['dag'] did not "
+        "monkeypatching EDGE_CLASSIFICATIONS[relation]['dag_family'] did not "
         "make cascade_ndc non-empty — this test is not reaching the "
         "guarded branch it exists to cover"
     )

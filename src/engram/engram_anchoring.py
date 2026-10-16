@@ -195,8 +195,6 @@ def quote_claim_similarity(quoted_text: str, claim: str) -> "tuple[Optional[floa
     """
     try:
         emb_config = core._get_embedding_config()
-        if not emb_config.get("enabled", True):
-            return None, "embeddings disabled in config"
         if not core._embedder.is_available():
             return None, "embedder unavailable"
         model = emb_config.get("model", core.DEFAULT_EMBEDDING_MODEL)

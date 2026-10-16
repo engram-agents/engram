@@ -95,6 +95,11 @@ _NAV_TABS = [
     ("config", "Config"),
 ]
 
+# The Moments tab is NOT in _NAV_TABS: it is conditional (engram-alpha#3511,
+# principle 4 "hide when empty") -- _render_nav adds it, just before Config,
+# only when the caller says the resolved agent has at least one moment.
+_MOMENTS_TAB = ("moments", "Moments")
+
 # Kept as an importable constant even though it no longer bakes any page
 # (nav.js is served as a real static file, referenced via <script src> --
 # see the module docstring) -- several regression tests assert directly
@@ -117,7 +122,8 @@ _NAV_PLACEHOLDER = "<!--NAV_PLACEHOLDER-->"
 _FOOTER_PLACEHOLDER = "<!--FOOTER_PLACEHOLDER-->"
 
 
-def _render_nav(active_tab: str, agent: str | None = None) -> str:
+def _render_nav(active_tab: str, agent: str | None = None,
+                show_moments: bool = False) -> str:
     """Return the HTML fragment for the shared top nav bar, computed at
     REQUEST TIME (engram-alpha#2555 PR B amendment-1, requirement 2 + 3).
 
@@ -127,7 +133,9 @@ def _render_nav(active_tab: str, agent: str | None = None) -> str:
     from ``/static/nav.js``) populates it (single-agent mode keeps it
     hidden permanently).
 
-    active_tab: one of {"graph", "health", "stats", "config"}.
+    active_tab: one of {"graph", "health", "stats", "config", "moments"}.
+    show_moments: add the Moments tab (before Config). False by default --
+        the tab appears only when the resolved agent has >= 1 moment.
     agent: the EFFECTIVE agent for this request -- ``agents._resolve_agent``'s
         resolved name (explicit ``?agent=`` else the live ``DEFAULT_AGENT``,
         or the exact unregistered name if one was requested and unknown,
@@ -139,7 +147,10 @@ def _render_nav(active_tab: str, agent: str | None = None) -> str:
         ``?agent=`` appended to any link) in that edge case.
     """
     links = []
-    for tab_key, label in _NAV_TABS:
+    tabs = list(_NAV_TABS)
+    if show_moments:
+        tabs.insert(len(tabs) - 1, _MOMENTS_TAB)  # before Config, which stays last
+    for tab_key, label in tabs:
         href = urls.url_for(tab_key, agent=agent)
         if tab_key == active_tab:
             links.append(f'  <a href="{href}" style="font-weight:600;">{label}</a>')
@@ -170,3 +181,4 @@ HTML = _read_template("graph.html")
 HEALTH_HTML = _read_template("health.html")
 STATS_HTML = _read_template("stats.html")
 CONFIG_HTML = _read_template("config.html")
+MOMENTS_HTML = _read_template("moments.html")

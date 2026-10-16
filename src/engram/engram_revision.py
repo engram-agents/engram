@@ -1100,6 +1100,27 @@ class _CascadeCycleError(Exception):
         )
 
 
+class _GroundingCycleError(_CascadeCycleError):
+    """#3210: the acknowledgement edge would close a cycle through the wider
+    GROUNDING family (e.g. via a `cites` or `supported_by` edge) even though
+    no path over CASCADE_RELATIONS alone closes it. A subclass of
+    `_CascadeCycleError`, so every existing `except _CascadeCycleError` still
+    catches it; `_cascade_resolve_impl` branches on the subclass to name the
+    repair route, which differs: the closing path contains an edge that
+    should not be a premise, and the fix is `engram_retype_edge`, not a
+    different resolution kind.
+    """
+
+    def __init__(self, node_id: str, replacement_id: str, cycle: "list[str]"):
+        self.cycle = list(cycle)
+        super().__init__(node_id, replacement_id)
+        self.args = (
+            f"acknowledging {node_id!r} would close a grounding cycle "
+            f"{' -> '.join(self.cycle)} (the closing path runs through a "
+            f"non-cascade grounding edge such as cites/supported_by).",
+        )
+
+
 def _cascade_record_acknowledgement_edges(conn, node_id: str,
                                           affected: list, now: str) -> list:
     """§4: an acknowledgement records that the node now ALSO rests on each
@@ -1112,10 +1133,11 @@ def _cascade_record_acknowledgement_edges(conn, node_id: str,
     order. Filed as `derives_from` it produced one DAG-time violation per
     acknowledgement, measured, because `derives_from` carries
     `temporal_causal: True` (#2357 renamed that flag from dag_check; the
-    creation-order semantics are the renamed flag's, NOT the new `dag`
-    edge-walk flag's). `acknowledged_derives_from` carries
-    `temporal_causal: False` for exactly that structural reason — and
-    `dag: True`, because it is still not permitted to close a cycle — which
+    creation-order semantics are the renamed flag's, NOT the acyclicity
+    edge-walk's). `acknowledged_derives_from` carries
+    `temporal_causal: False` for exactly that structural reason — and sits in
+    the grounding acyclicity family, because it is still not permitted to
+    close a cycle — which
     keeps `derives_from`'s creation-order check honest everywhere else.
 
     WHY IT MUST EXIST AT ALL: an acknowledgement OUTLIVES the repair window.
@@ -1193,6 +1215,34 @@ def _cascade_record_acknowledgement_edges(conn, node_id: str,
             # `_cascade_reaches` — do not write a second walker.
             if _cascade_reaches(conn, node_id, replacement):
                 raise _CascadeCycleError(node_id, replacement)
+            # #3210: the cascade walk above is deliberately cascade-scoped
+            # (§12.4's proof; it also serves the supersede/retract guards)
+            # and cannot see a loop that closes through a non-cascade
+            # grounding edge (`cites`, `supported_by`, ...) -- admitted here,
+            # then reported by conformance. So ALSO check the whole grounding
+            # family. RAW edges, not resolved through supersedes (resolve=
+            # False): that keeps this check's semantics identical to the
+            # cascade guard it sits beside, so everything the cascade guard
+            # admitted or refused before is unchanged except for paths that
+            # use a non-cascade grounding edge.
+            # WHY resolve=False (measured in review): an ack edge X -> R,
+            # where R replaced X's premise P, resolves to the SAME edge as
+            # the existing X -> P. So under resolution the ack adds no edge
+            # to the resolved graph, and a resolved check here could only
+            # re-report a cycle that ALREADY exists -- and would then refuse
+            # every ack inside an existing cycle. The audit sees that cycle
+            # from the second supersede on, before any ack. The remaining
+            # guard/audit gap is at the supersede and retract writers, which
+            # are guarded only by the cascade-scoped `_cascade_reaches`, by
+            # §12.4 design; it is not this writer's to close.
+            # The grounding family contains CASCADE_RELATIONS, so everything
+            # the check above refuses is still refused (it runs first).
+            g_cycle = core._dag_cycle_path(
+                conn, "acknowledged_derives_from", node_id, replacement,
+                resolve=False,
+            )
+            if g_cycle is not None:
+                raise _GroundingCycleError(node_id, replacement, g_cycle)
             conn.execute(
                 "INSERT INTO edges (source_id, target_id, relation, created_at) "
                 "VALUES (?, ?, 'acknowledged_derives_from', ?)",
@@ -1532,6 +1582,49 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
                 # this call is committed (no ack edges, no marker
                 # resolution, no audit entry).
                 conn.rollback()
+                if isinstance(exc, _GroundingCycleError):
+                    return json.dumps({
+                        "error": f"Cycle guard: acknowledging {exc.node_id!r} "
+                                 f"would write an acknowledged_derives_from "
+                                 f"edge to {exc.replacement_id!r}, closing a "
+                                 f"cycle through the grounding relations: "
+                                 f"{' -> '.join(exc.cycle)}. The closing path "
+                                 f"contains an edge that should not be a "
+                                 f"premise — typically a mistyped context "
+                                 f"edge. Repair: if the path contains a "
+                                 f"retypable edge (a loose cites -- not an observation's "
+                                 f"link to its evidence -- / supported_by / "
+                                 f"derives_from that is not the node's last "
+                                 f"cascade premise), retype it with "
+                                 f"engram_retype_edge to about, then "
+                                 f"acknowledge again. Otherwise (the path "
+                                 f"runs only through supersedes, retracts, "
+                                 f"subtask_of, predicted_by or "
+                                 f"acknowledged_derives_from edges, or "
+                                 f"derives_from -> about is refused because "
+                                 f"it is the last cascade premise) the path "
+                                 f"cannot be repaired through the MCP tools "
+                                 f"and needs engram_surgical.",
+                        "guard": "acknowledgement_would_close_grounding_cycle",
+                        "node_id": exc.node_id,
+                        "replacement_id": exc.replacement_id,
+                        "relation": "acknowledged_derives_from",
+                        "cycle": exc.cycle,
+                        "remedy": "if the closing path contains a retypable "
+                                  "edge (a loose cites -- not an observation's link "
+                                  "to its evidence -- / supported_by / derives_from "
+                                  "that is not the node's last cascade "
+                                  "premise), retype it with "
+                                  "engram_retype_edge to about, then retry "
+                                  "the acknowledgement; otherwise the path "
+                                  "cannot be repaired through the MCP tools "
+                                  "and needs engram_surgical.",
+                        "next_call": "engram_retype_edge(source_id=..., "
+                                     "target_id=..., relation=..., "
+                                     "new_relation='about', reason=...)",
+                        "phase": "apply",
+                        "markers_unchanged": True,
+                    })
                 return json.dumps({
                     "error": f"Cycle guard: acknowledging {exc.node_id!r} "
                              f"would write an acknowledged_derives_from edge "
@@ -1800,7 +1893,9 @@ def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
 
 
 def _detect_zero_support(
-    conn: sqlite3.Connection, affected_node_id: str
+    conn: sqlite3.Connection, affected_node_id: str,
+    tool: str = "engram_retract/engram_supersede",
+    warnings_out: "list | None" = None,
 ) -> "tuple[list[dict], list[dict]]":
     """Find cornerstones/lessons whose live-support state changed due to a
     cascade operation settling (retract or supersede).
@@ -1829,6 +1924,10 @@ def _detect_zero_support(
     Args:
         conn: Open DB connection with write access (caller commits).
         affected_node_id: The node that was retracted or superseded (already is_current=0).
+        tool: the calling tool's name, for the #3413 replaced-blob log line.
+        warnings_out: when given, the #3413 replaced-blob warning text is
+            appended to it (the caller adds it to its response if the tool
+            has a warning field).
 
     Returns:
         Tuple (newly_support_lost, newly_support_restored) — each a list of
@@ -1878,11 +1977,17 @@ def _detect_zero_support(
             continue  # Only count live cs/ls nodes
 
         total_live = core._count_live_exemplars(conn, cs_ls_id, cs_ls_node["type"])
-        meta = json.loads(cs_ls_node["metadata"] or "{}")
+        meta = core._metadata_dict(cs_ls_node["metadata"])
 
         if total_live == 0:
             # Mark support_lost in metadata.
             if not meta.get("support_lost"):
+                # #3413: a non-object blob reads as {} and is REPLACED by the
+                # dict written below; the write-side helper logs that.
+                meta, _replaced = core._metadata_dict_for_write(
+                    cs_ls_node["metadata"], cs_ls_id, tool)
+                if _replaced and warnings_out is not None:
+                    warnings_out.append(_replaced)
                 meta["support_lost"] = True
                 conn.execute(
                     "UPDATE nodes SET metadata = ? WHERE id = ?",
@@ -1920,6 +2025,288 @@ def _detect_zero_support(
 # ---------------------------------------------------------------------------
 # E impls
 # ---------------------------------------------------------------------------
+
+def _bears_on_hint_entry(question_id, old_id, repl_row) -> dict:
+    """One ``bears_on_hints`` entry (#3625). The ``add_edge_call`` is exactly a
+    valid ``engram_add_edge`` payload."""
+    return {
+        "question_id": question_id,
+        "from_target": old_id,
+        "replacement_id": repl_row["id"],
+        "replacement_type": repl_row["type"],
+        "add_edge_call": {
+            "source_id": question_id,
+            "target_id": repl_row["id"],
+            "relation": "bears_on",
+        },
+    }
+
+
+def _bears_on_replacement_ok(conn, question_id, repl_row) -> bool:
+    """True when a hint pointing ``question_id`` at ``repl_row`` is legal: the
+    question is not already wired to the replacement and the shared endpoint
+    rule would accept the pair. Currency of the question and of the
+    replacement is the caller's job."""
+    if conn.execute(
+        "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ? "
+        "AND relation = 'bears_on' LIMIT 1",
+        (question_id, repl_row["id"]),
+    ).fetchone():
+        return False
+    return core._relation_endpoint_error(
+        "bears_on", {"id": question_id, "type": "question"}, repl_row
+    ) is None
+
+
+def _bears_on_replacement_hints(conn, old_id, replacement_id) -> list:
+    """The ``bears_on_hints`` for ``old_id`` replaced by ``replacement_id``
+    (#3625): one entry per CURRENT question with a ``bears_on`` edge to
+    ``old_id`` (ordered by question id) that is not already wired to the
+    replacement and for which the replacement is a legal ``bears_on`` target.
+    ``[]`` when the replacement is not current. Read-only. Costs ONE indexed
+    query when ``old_id`` has no incoming ``bears_on`` edge (supersede and
+    retract are hot paths)."""
+    qrows = conn.execute(
+        "SELECT DISTINCT e.source_id AS id FROM edges e "
+        "JOIN nodes q ON q.id = e.source_id "
+        "WHERE e.target_id = ? AND e.relation = 'bears_on' "
+        "AND q.type = 'question' AND q.is_current = 1 "
+        "ORDER BY e.source_id",
+        (old_id,),
+    ).fetchall()
+    if not qrows:
+        return []
+    repl = conn.execute(
+        "SELECT id, type, is_current FROM nodes WHERE id = ?", (replacement_id,)
+    ).fetchone()
+    if not repl or repl["is_current"] != 1:
+        return []
+    return [
+        _bears_on_hint_entry(q["id"], old_id, repl)
+        for q in qrows
+        if _bears_on_replacement_ok(conn, q["id"], repl)
+    ]
+
+
+def _bears_on_hint_prompt(hints) -> str:
+    """ONE string for a non-empty ``bears_on_hints`` list: names each
+    question, the old and the new target, gives the exact
+    ``engram_add_edge`` call, and says the old edge stays as provenance."""
+    lines = []
+    for h in hints:
+        lines.append(
+            f"- question {h['question_id']} bore on {h['from_target']}, which "
+            f"was replaced by {h['replacement_id']} ({h['replacement_type']}). "
+            f"If it still bears on the replacement, call engram_add_edge with "
+            f"{json.dumps(h['add_edge_call'])}."
+        )
+    return (
+        "A question that bears_on a replaced claim may still bear on its "
+        "replacement; you decide, nothing was added for you:\n"
+        + "\n".join(lines)
+        + "\nThe old edge stays as provenance: it is hidden and does not "
+        "count toward the question's importance, and adding the new edge "
+        "removes nothing."
+    )
+
+
+def _bears_on_hint_fields(conn, old_id, replacement_id) -> dict:
+    """The return keys for a supersede / retract-with-replacement: the
+    ``bears_on_hints`` + ``bears_on_hint_prompt`` pair, or ``{}`` when there
+    is nothing to hint. Looks ``_bears_on_replacement_hints`` up at call time."""
+    hints = _bears_on_replacement_hints(conn, old_id, replacement_id)
+    if not hints:
+        return {}
+    return {
+        "bears_on_hints": hints,
+        "bears_on_hint_prompt": _bears_on_hint_prompt(hints),
+    }
+
+
+def _bears_on_best_effort(fn, *args) -> dict:
+    """Run an ADVISORY bears_on surfacing step that executes after its
+    mutation has committed (#3625). On any Exception the step is dropped and
+    ``{"bears_on_hint_error": "<ExceptionType>: <message, ~200 chars>"}`` is
+    returned instead, so the caller still gets the committed mutation's
+    normal success payload (a retry of a committed supersede would fail with
+    "not current") and can see that the hint is missing. Never silent: the
+    error key is the signal."""
+    try:
+        return fn(*args)
+    except Exception as e:  # noqa: BLE001 - advisory, must never fail the call
+        return {"bears_on_hint_error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+_BEARS_ON_CHAIN_HOP_CAP = 50
+
+
+def _bears_on_replacement_of(conn, node_id):
+    """The live replacement of a non-current ``node_id`` for the resolve hint
+    (#3625), or None. Follows the full mixed chain to its live end: at each
+    hop a node was either SUPERSEDED (its ``superseded_by``) or RETRACTED WITH
+    a replacement (the source of a ``retracts`` edge into it:
+    ``_retract_impl`` writes ``replacement --retracts--> node``). Among
+    several ``retracts`` sources a current one wins, then the lowest id, for
+    determinism; a dead-end branch falls back to the next. The "a current
+    ``retracts`` source wins over a non-current one" preference is UNPINNED by
+    tests and structural: it cannot be reached through public verbs
+    (retracting an already-superseded node is refused), so only a hand-built
+    fixture could fail it. A visited set
+    guards cycles and ``_BEARS_ON_CHAIN_HOP_CAP`` bounds the depth. None when
+    the chain ends without a live node (retracted without a replacement, or
+    no edge at all)."""
+    seen = {node_id}
+
+    def walk(cur, depth):
+        if depth > _BEARS_ON_CHAIN_HOP_CAP:
+            return None
+        row = conn.execute(
+            "SELECT is_current, superseded_by FROM nodes WHERE id = ?", (cur,)
+        ).fetchone()
+        if row is None:
+            return None
+        if cur != node_id and row["is_current"] == 1:
+            return cur
+        nexts = []
+        if row["superseded_by"]:
+            nexts.append(row["superseded_by"])
+        nexts += [
+            r["id"] for r in conn.execute(
+                "SELECT e.source_id AS id FROM edges e "
+                "JOIN nodes n ON n.id = e.source_id "
+                "WHERE e.target_id = ? AND e.relation = 'retracts' "
+                "ORDER BY n.is_current DESC, e.source_id",
+                (cur,),
+            ).fetchall()
+        ]
+        for nxt in nexts:
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            end = walk(nxt, depth + 1)
+            if end is not None:
+                return end
+        return None
+
+    return walk(node_id, 0)
+
+
+def _bears_on_resolve_fields(conn, question_row, resolution_status=None) -> dict:
+    """The `bears_on` surfacing for an engram_resolve return (#3615, #3625).
+
+    When ``question_row`` is a question with >=1 ``bears_on`` edge, returns
+    ``bears_on`` (the LIVE DIRECT targets only, as
+    ``{"target_id","target_type"}``; a superseded target is never listed, not
+    even as its successor), ``bears_on_prompt`` (one string naming each live
+    target and asking whether the answer supports or weakens it) and
+    ``bears_on_omitted_noncurrent`` (the count of non-current targets that
+    produced NO hint: retracted without a replacement, no live successor or
+    replacement, replacement already wired to the question, or not a legal
+    target; omitted at 0). A non-current target (superseded, or retracted
+    WITH a replacement) whose end-of-chain replacement
+    (``_bears_on_replacement_of``, following supersede or retract chains)
+    passes the hint conditions goes under ``bears_on_hints`` (same entry
+    shape as supersede/retract) with a ``bears_on_hint_prompt``; ONE hint per
+    (question, replacement): the first target by edge order supplies
+    ``from_target`` and later targets sharing that replacement are covered by
+    it, not counted as omitted. The agent decides whether to add the edge.
+    Callers wrap this in ``_bears_on_best_effort`` (a failure becomes
+    ``bears_on_hint_error``, never an exception). Returns ``{}`` when the question has no
+    ``bears_on`` edge, so the response shape of every other resolve is
+    unchanged. Read-only: it touches no status, edge or confidence.
+
+    ``resolution_status`` is the outcome of THIS resolve (``resolved`` or
+    ``partially_resolved``); the prompt wording depends on it. ``None`` (the
+    idempotent no_op path) uses the question's stored status.
+    """
+    if question_row["type"] != "question":
+        return {}
+    rows = conn.execute(
+        "SELECT n.id AS id, n.type AS type, n.is_current AS is_current "
+        "FROM edges e JOIN nodes n ON n.id = e.target_id "
+        "WHERE e.source_id = ? AND e.relation = 'bears_on' ORDER BY e.id",
+        (question_row["id"],),
+    ).fetchall()
+    if not rows:
+        return {}
+    if resolution_status is None:
+        resolution_status = question_row["status"]
+    partial = resolution_status == "partially_resolved"
+
+    live: list = []
+    seen: set = set()
+    hints: list = []
+    hinted: set = set()
+    skipped = 0
+    for r in rows:
+        if r["is_current"] == 1:
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                live.append({"target_id": r["id"], "target_type": r["type"]})
+            continue
+        # Non-current target (#3625): hint toward the END of its supersede
+        # chain when the hint conditions hold; otherwise count it as omitted.
+        succ = _bears_on_replacement_of(conn, r["id"])
+        trow = (
+            conn.execute(
+                "SELECT id, type FROM nodes WHERE id = ?", (succ,)
+            ).fetchone()
+            if succ is not None else None
+        )
+        if trow is not None and _bears_on_replacement_ok(
+            conn, question_row["id"], trow
+        ):
+            # One hint per (question, replacement): the first target by edge
+            # order supplies from_target; a later target sharing the same
+            # replacement is covered by that hint (not "omitted").
+            if trow["id"] not in hinted:
+                hinted.add(trow["id"])
+                hints.append(
+                    _bears_on_hint_entry(question_row["id"], r["id"], trow))
+        else:
+            skipped += 1
+
+    out: dict = {"bears_on": live}
+    if live:
+        ids = ", ".join(t["target_id"] for t in live)
+        if partial:
+            out["bears_on_prompt"] = (
+                f"This question was wired to bear on: {ids}. It is only "
+                f"partially resolved so far; does the answer so far support "
+                f"or weaken each of them? The picture may change when it is "
+                f"fully resolved. Update each with the usual tools "
+                f"(engram_derive, engram_contradict, engram_supersede, "
+                f"engram_retract) as warranted; engram_resolve itself "
+                f"changed none of their confidence."
+            )
+        else:
+            out["bears_on_prompt"] = (
+                f"This question was wired to bear on: {ids}. Now that it is "
+                f"answered, does the answer support or weaken each of them? "
+                f"Update each with the usual tools (engram_derive, "
+                f"engram_contradict, engram_supersede, engram_retract) as "
+                f"warranted; engram_resolve itself changed none of their "
+                f"confidence."
+            )
+    elif hints:
+        out["bears_on_prompt"] = (
+            "This question was wired to bear on claims, but none of them is "
+            "current any more; see bears_on_hints for the replacement(s) it "
+            "may still bear on."
+        )
+    else:
+        out["bears_on_prompt"] = (
+            "This question was wired to bear on claims, but none of them is "
+            "current any more (each was retracted, or superseded with no "
+            "replacement it could be pointed at); nothing to re-assess."
+        )
+    if hints:
+        out["bears_on_hints"] = hints
+        out["bears_on_hint_prompt"] = _bears_on_hint_prompt(hints)
+    if skipped:
+        out["bears_on_omitted_noncurrent"] = skipped
+    return out
+
 
 def _resolve_impl(
     target_id: str = "",
@@ -1970,7 +2357,24 @@ def _resolve_impl(
 
     Returns:
         JSON with the wired edge, target's new status, and the resolving
-        node's confidence.
+        node's confidence. When the target is a question with ``bears_on``
+        edges (#3615, #3625), also ``bears_on`` (the LIVE DIRECT targets,
+        ``target_id`` + ``target_type``; a superseded target is never
+        listed), ``bears_on_prompt`` (asks whether the answer supports or
+        weakens each; worded as "partially resolved" when this resolve left
+        the question partially_resolved), ``bears_on_hints`` +
+        ``bears_on_hint_prompt`` (a target superseded, or retracted with a
+        replacement, whose live replacement (found by following supersede
+        or retract chains) the question may still bear on, one hint per
+        replacement, with the exact ``engram_add_edge`` call; the old edge
+        stays as provenance), ``bears_on_hint_error`` (present only if
+        computing the surfacing failed after the resolve committed; the
+        resolve still succeeded) and
+        ``bears_on_omitted_noncurrent`` (count of non-current targets that
+        produced no hint: retracted without a replacement, no live
+        replacement, replacement already wired, or not a legal target;
+        absent at 0) — on the idempotent
+        ``no_op`` path too. Absent for every other resolve.
     """
     RESOLVABLE_TYPES = {"question", "contradiction", "prediction", "conjecture", "goal_tension"}
     VALID_PREDICTION_OUTCOMES = {"confirmed", "partially_confirmed", "refuted", "partially_refuted"}
@@ -2098,10 +2502,12 @@ def _resolve_impl(
                 "target_id": target_id,
                 "resolving_node_id": resolving_node_id,
                 "target_status": target["status"],
+                # #3615: a retry keeps the bears_on prompt (empty dict when n/a).
+                **_bears_on_best_effort(_bears_on_resolve_fields, conn, target),
             })
 
         confidence = resolver["confidence"] if resolver["confidence"] is not None else 1.0
-        config = json.loads(core.CONFIG_PATH.read_text()) if core.CONFIG_PATH.exists() else {}
+        config = core._config_io.read_config_json(core.CONFIG_PATH)
         threshold = config.get("resolution_confidence_threshold", core.DEFAULT_RESOLUTION_THRESHOLD)
 
         now = core._now()
@@ -2178,6 +2584,13 @@ def _resolve_impl(
                 f"then call engram_resolve again to wire it."
             )
             result["discipline_hint"] = _THRESHOLD_GATE_DISCIPLINE_HINT
+
+        # #3615: name the question's bears_on targets (read-only; absent keys
+        # when the target is not a question or has no bears_on edges).
+        # Advisory and computed after the commit: a failure here is reported
+        # as `bears_on_hint_error`, never raised (a retry would fail).
+        result.update(_bears_on_best_effort(
+            _bears_on_resolve_fields, conn, target, resolution_status))
 
         return json.dumps(result)
     finally:
@@ -2486,8 +2899,10 @@ def _supersede_impl(
         # linked about→old_node becomes stranded after old is marked non-current.
         # Option A: old edge stays (audit trail); a live edge is inserted on the
         # current node for each source that doesn't already point at new_node.
-        # Scope: `about` is the recall-routing person-edge. (A `cites`→person
-        # edge via context_ids is annotation-only and intentionally NOT migrated.)
+        # Scope: `about` is the recall-routing person-edge. (A context_ids
+        # reference to a person is written as `about` since #2243 — it used to
+        # be a `cites`→person edge, annotation-only and NOT migrated — so it
+        # joins this pool and migrates on person supersede.)
         # Gate on old type only — new is guaranteed the same type by the
         # type-equality validation above.
         if old["type"] == "person":
@@ -2533,12 +2948,16 @@ def _supersede_impl(
                 "SELECT metadata, trust_tier FROM nodes WHERE id = ?",
                 (old_node_id,),
             ).fetchone()
-            old_self_meta = json.loads(old_self["metadata"]) if old_self["metadata"] else {}
+            old_self_meta = core._metadata_dict(old_self["metadata"])
             if old_self_meta.get("is_self"):
                 new_row = conn.execute(
                     "SELECT metadata FROM nodes WHERE id = ?", (new_node_id,)
                 ).fetchone()
-                new_self_meta = json.loads(new_row["metadata"]) if new_row["metadata"] else {}
+                # #3413: a non-object blob on the NEW node is replaced by the
+                # dict written below; logged (the supersede response has no
+                # warnings field).
+                new_self_meta, _ = core._metadata_dict_for_write(
+                    new_row["metadata"], new_node_id, "engram_supersede")
                 new_self_meta["is_self"] = True
                 conn.execute(
                     "UPDATE nodes SET metadata = ?, trust_tier = ? WHERE id = ?",
@@ -2672,7 +3091,8 @@ def _supersede_impl(
         # the restore side; see _detect_zero_support's docstring for why
         # this write-time check is a convenience and not the load-bearing
         # discharge (that's engram_lifecycle._reflect_impl, Part 1).
-        support_lost_cs_ls, support_restored_cs_ls = _detect_zero_support(conn, old_node_id)
+        support_lost_cs_ls, support_restored_cs_ls = _detect_zero_support(
+            conn, old_node_id, tool="engram_supersede")
 
         core._log_edit(conn, "superseded", old_node_id, old["type"],
                   {"replaced_by": new_node_id, "reason": supersede_reason or None})
@@ -2750,6 +3170,10 @@ def _supersede_impl(
         if support_restored_cs_ls:
             result["support_restored"] = support_restored_cs_ls
             result["support_restored_count"] = len(support_restored_cs_ls)
+        # #3625: read-only hint that a question's bears_on may still hold
+        # toward the replacement. Keys absent when there is nothing to hint.
+        result.update(_bears_on_best_effort(
+            _bears_on_hint_fields, conn, old_node_id, new_node_id))
         return json.dumps(result)
     finally:
         conn.close()
@@ -3158,14 +3582,20 @@ def _retract_impl(
         # self-anchors — silently breaking link_about default-targeting,
         # focus='self' emergence-scan, and trust_tier='self' assignment.
         # Detect now (before the retract flips is_current=0) so we can warn.
-        _retract_node_meta = json.loads(node["metadata"] or "{}")
+        _retract_node_meta = core._metadata_dict(node["metadata"])
         _self_anchor_retracted = (
             node["type"] == "person"
             and bool(_retract_node_meta.get("is_self"))
         )
 
         # 1. Mark the node as retracted
-        retract_meta = json.loads(node["metadata"] or "{}")
+        # #3413: a non-object blob is replaced by the dict written below;
+        # logged by the helper and added to the response's `warning` field.
+        _replaced_blob_warnings: list = []
+        retract_meta, _replaced = core._metadata_dict_for_write(
+            node["metadata"], node_id, "engram_retract")
+        if _replaced:
+            _replaced_blob_warnings.append(_replaced)
         retract_meta["retracted"] = True
         retract_meta["error_type"] = error_type
         retract_meta["retraction_reason"] = reason
@@ -3188,7 +3618,7 @@ def _retract_impl(
         # Retracting the resolution should revert the target to 'open' so it
         # can be re-resolved with proper provenance.
         reopened_targets = []
-        retract_config = json.loads(core.CONFIG_PATH.read_text()) if core.CONFIG_PATH.exists() else {}
+        retract_config = core._config_io.read_config_json(core.CONFIG_PATH)
         retract_threshold = retract_config.get("resolution_confidence_threshold", core.DEFAULT_RESOLUTION_THRESHOLD)
         resolution_edges = conn.execute(
             "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'resolves'",
@@ -3345,7 +3775,11 @@ def _retract_impl(
                 ).fetchone()
                 if not pred or not pred["is_current"]:
                     continue  # already retracted/superseded — nothing to do
-                pred_meta = json.loads(pred["metadata"] or "{}")
+                # #3413: same replacement rule for the prediction's blob.
+                pred_meta, _replaced = core._metadata_dict_for_write(
+                    pred["metadata"], pred_id, "engram_retract")
+                if _replaced:
+                    _replaced_blob_warnings.append(_replaced)
                 pred_meta["retracted"] = True
                 pred_meta["error_type"] = error_type
                 pred_meta["retraction_reason"] = (
@@ -3486,7 +3920,9 @@ def _retract_impl(
         # the restore side; see _detect_zero_support's docstring for why
         # this write-time check is a convenience and not the load-bearing
         # discharge (that's engram_lifecycle._reflect_impl, Part 1).
-        support_lost_cs_ls, support_restored_cs_ls = _detect_zero_support(conn, node_id)
+        support_lost_cs_ls, support_restored_cs_ls = _detect_zero_support(
+            conn, node_id, tool="engram_retract",
+            warnings_out=_replaced_blob_warnings)
 
         # Log retraction and taint events.
         # #2613 §3 change 3 / §5: the replacement decision is recorded HERE,
@@ -3586,6 +4022,9 @@ def _retract_impl(
             result["retracted_predictions_count"] = len(retracted_predictions)
         if replacement_id:
             result["replacement_id"] = replacement_id
+            # #3625: only WITH a replacement; read-only, keys absent at none.
+            result.update(_bears_on_best_effort(
+                _bears_on_hint_fields, conn, node_id, replacement_id))
         if _self_anchor_retracted:
             result["warning"] = (
                 "Retracted node was the agent's self-anchor (is_self=True). "
@@ -3593,6 +4032,14 @@ def _retract_impl(
                 "engram_link_about default-targeting, focus='self' emergence-scan, "
                 "and trust_tier='self' assignment are broken until a new person node "
                 "is created with is_self=True (or an existing one is promoted)."
+            )
+        if _replaced_blob_warnings:
+            # #3413: the retract response's one warning field is the singular
+            # `warning` string (set above only for a self-anchor); extend it
+            # rather than inventing a key.
+            result["warning"] = "\n".join(
+                ([result["warning"]] if result.get("warning") else [])
+                + _replaced_blob_warnings
             )
 
         # --- engram.tool.engram_call event (DESIGN.md §4.2) ---

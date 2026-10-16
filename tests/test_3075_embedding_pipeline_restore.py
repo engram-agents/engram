@@ -289,17 +289,29 @@ class TestC2ComputeAndStoreEmbeddingOutcome:
 
     # -- expected skips: no WARNING, embedding stays NULL --------------
 
-    def test_skipped_when_embeddings_disabled_via_config(self, monkeypatch, caplog):
+    def test_enabled_false_is_ignored_still_embeds(self, monkeypatch, caplog):
+        """(#345 PR2, A2) The retired `enabled` key is no longer consulted
+        at this call site: `enabled: False` must NOT skip the embed -- the
+        node still gets embedded exactly as if the key were absent.
+        Mutation target for the site->test map: restoring the
+        `emb_config.get("enabled", True)` check here turns this RED
+        (status would revert to 'skipped', embedding would stay NULL)."""
         conn = self._db([{"id": "n1", "claim": "some claim text"}])
         monkeypatch.setattr(
             engram_core, "_get_embedding_config",
             lambda: {"enabled": False, "model": "x"},
         )
         monkeypatch.setattr(engram_core._embedder, "is_available", lambda: True)
+        fake_vector = [0.1] * 384
+        monkeypatch.setattr(engram_core._embedder, "embed", lambda text, model_name: fake_vector)
         with caplog.at_level(logging.WARNING, logger="engram_core"):
             outcome = engram_core._compute_and_store_embedding(conn, "n1")
-        assert outcome.status == "skipped"
-        assert self._embedding_of(conn, "n1") is None
+        assert outcome.status == "embedded", (
+            f"expected 'embedded' (enabled=False must be ignored), got {outcome!r}"
+        )
+        assert self._embedding_of(conn, "n1") is not None, (
+            "expected the embedding to actually be stored despite enabled=False"
+        )
         assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
         conn.close()
 
@@ -752,16 +764,19 @@ class TestC5RestoreRegeneratesEmbeddings:
         finally:
             shutil.rmtree(core_test_dir, ignore_errors=True)
 
-    def test_disabled_by_config_sets_flag_no_regeneration(self):
-        """(new, round 2) embeddings disabled via config.json
-        (embedding.enabled=false) -> the flag fires SYNCHRONOUSLY with
-        cause "disabled-by-config", naming the count; NO regeneration is
-        attempted (Borges's ruling point 3: "gate the regeneration on
-        enabled, but the flag still fires"). This is the server.py:8017
-        precedent's counterpart for the restore-completeness check: an
-        operator who deliberately disabled embeddings must not see this
-        fire as an unexpected error, and must not have embed() called at
-        all.
+    def test_enabled_false_ignored_regeneration_still_runs(self):
+        """(#345 PR2, A2) The retired `enabled` key is no longer consulted
+        at the restore-flag DETECTION site (~3477): `enabled: False` must
+        NOT gate the regeneration off any more -- embed() IS called, the
+        flag CLEARS, and the cause is never "disabled-by-config" (that
+        path is now unreachable code, removed per the spec). This
+        supersedes the old round-2 test of the same scenario, which
+        asserted the now-retired bypass as a requirement.
+
+        Mutation target: restoring the `emb_config.get("enabled", True)`
+        check at ~3477 turns this RED (embed_mock would go uncalled, flag
+        would stay set with cause "disabled-by-config", null_after would
+        stay 3).
         """
         core, core_test_dir = _fresh_core_in_tmp("engram_test_3075_c5_disabled_")
         try:
@@ -770,9 +785,8 @@ class TestC5RestoreRegeneratesEmbeddings:
             self._insert_null_embedding_nodes(conn, 3)
             conn.close()
 
-            embed_mock = mock.Mock(
-                side_effect=AssertionError("embed() must not be called when disabled-by-config")
-            )
+            fake_vector = [0.1] * 384
+            embed_mock = mock.Mock(return_value=fake_vector)
             with mock.patch.object(core._embedder, "is_available", return_value=True), \
                  mock.patch.object(core._embedder, "embed", embed_mock), \
                  mock.patch.object(
@@ -782,16 +796,25 @@ class TestC5RestoreRegeneratesEmbeddings:
                 core._db_setup_done_paths.clear()
                 conn2 = core._get_db()
 
-            embed_mock.assert_not_called()
+                settled = self._wait_until(
+                    lambda: not core._get_embedding_restore_flag(conn2)["not_fully_restored"]
+                )
+            assert settled, (
+                "restore-completeness flag never cleared within the timeout"
+            )
+            embed_mock.assert_called()
             flag = core._get_embedding_restore_flag(conn2)
             null_after = conn2.execute(
                 "SELECT COUNT(*) FROM nodes WHERE is_current=1 AND embedding IS NULL"
             ).fetchone()[0]
             conn2.close()
-            assert null_after == 3, "disabled-by-config must not embed anything"
-            assert flag["not_fully_restored"] is True
-            assert flag["null_count"] == 3
-            assert flag["cause"] == "disabled-by-config"
+            assert null_after == 0, (
+                "enabled=False must be ignored -- all 3 nodes should have been embedded"
+            )
+            assert flag["not_fully_restored"] is False
+            assert flag["cause"] != "disabled-by-config", (
+                f"'disabled-by-config' is retired, unreachable code -- got cause {flag['cause']!r}"
+            )
         finally:
             shutil.rmtree(core_test_dir, ignore_errors=True)
 
@@ -1221,28 +1244,24 @@ class TestC5RestoreRegeneratesEmbeddings:
         finally:
             shutil.rmtree(core_test_dir, ignore_errors=True)
 
-    def test_disabled_by_config_mid_run_flag_stays_set_correct_cause(self):
-        """(round 4, confirmatory coverage for the round-4 delta reviewer-
-        fairy's own suggestion.) Round 3's completion-side cause logic
-        collapsed disabled-by-config and embedder-unavailable into a
-        single embedder-unavailable check; round 4 restores the same
-        3-way branch (disabled-by-config / embedder-unavailable /
-        per-node-failures) the detection site already had, but no test
-        exercised the disabled-mid-run leg specifically -- only the
-        embedder-unavailable-mid-run leg
-        (test_embedder_unavailable_mid_run_flag_stays_set_not_silently_cleared,
-        above). The fairy traced this branch as already correct by
-        reading the code; this test is confirmatory (already GREEN
-        against round 4 as shipped, not a can-it-fail RED-first case --
-        there was no behavior change here, only a coverage gap).
+    def test_enabled_false_mid_run_ignored_cause_is_not_disabled(self):
+        """(#345 PR2, A2) The retired `enabled` key is no longer consulted
+        at the restore-flag COMPLETION site (~5995) either -- extending
+        the spec's explicit ~3477 instruction to this structurally
+        identical branch (same unreachable "disabled-by-config" cause,
+        same 3-way-branch shape), since both produce the literal cause
+        string the spec says becomes unreachable. Flagged as a judgment
+        call in the handoff.
 
-        Mirrors the mid-run-unavailable test but for embeddings DISABLED
-        (not unavailable) mid-run: if config disables embeddings between
-        the synchronous detection gate scheduling the async pass and the
-        pass itself running, every node is again genuinely "skipped",
-        and the flag must stay set with cause "disabled-by-config" (NOT
-        "embedder-unavailable" -- the embedder itself is fine, config is
-        why nothing embedded).
+        This SUPERSEDES the old round-4 test of the same mid-run scenario,
+        which asserted the now-retired cause as a requirement: with
+        `enabled: False` and the embedder genuinely available, the pass
+        must now actually embed every node (embed() mocked to succeed),
+        clearing the flag -- cause must never be "disabled-by-config".
+
+        Mutation target: restoring the `emb_config.get("enabled", True)`
+        check at ~5995 turns this RED (cause would revert to
+        "disabled-by-config", null_after would stay 3).
         """
         core, core_test_dir = _fresh_core_in_tmp("engram_test_3075_c5_r4_disabled_midrun_")
         try:
@@ -1251,7 +1270,9 @@ class TestC5RestoreRegeneratesEmbeddings:
             self._insert_null_embedding_nodes(conn, 3)  # real embeddable claim text
             conn.close()
 
+            fake_vector = [0.1] * 384
             with mock.patch.object(core._embedder, "is_available", return_value=True), \
+                 mock.patch.object(core._embedder, "embed", return_value=fake_vector), \
                  mock.patch.object(
                      core, "_get_embedding_config",
                      return_value={"enabled": False, "model": "x"},
@@ -1265,14 +1286,13 @@ class TestC5RestoreRegeneratesEmbeddings:
             ).fetchone()[0]
             check_conn.close()
 
-            assert null_after == 3, "nothing could be embedded -- all 3 stay NULL"
-            assert flag["not_fully_restored"] is True
-            assert flag["cause"] == "disabled-by-config", (
-                f"expected cause 'disabled-by-config' (config, not the "
-                f"embedder itself, is why nothing embedded), got "
-                f"{flag['cause']!r}"
+            assert null_after == 0, (
+                "enabled=False must be ignored -- all 3 nodes should have been embedded"
             )
-            assert flag["null_count"] == 3
+            assert flag["not_fully_restored"] is False
+            assert flag["cause"] != "disabled-by-config", (
+                f"'disabled-by-config' is retired, unreachable code -- got cause {flag['cause']!r}"
+            )
         finally:
             shutil.rmtree(core_test_dir, ignore_errors=True)
 

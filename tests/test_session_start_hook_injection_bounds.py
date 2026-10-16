@@ -318,6 +318,7 @@ class TestSmallInputNothingCut:
             "VALUES (?, ?, ?, ?, ?)",
             ("ob_8001", "Small-input order-check claim.", "2026-09-28T00:00:00Z", "order check", 1),
         )
+        conn.execute("PRAGMA user_version = 1")  # #3741: a real store carries a schema version; the flag-OFF calibration block now runs only on one
         conn.commit()
         conn.close()
 
@@ -460,6 +461,12 @@ class TestRealSeatShape:
         # tool-caps blocks are present under the real-seat shape.
         short_tool_caps_stub = "MARK-SHORTCAPS-" + ("k" * 800)
         mod.tool_capability_short_block = lambda: short_tool_caps_stub
+
+        import sqlite3
+        _store = sqlite3.connect(str(engram_home / "knowledge.db"))
+        _store.execute("PRAGMA user_version = 1")  # #3741: a real store carries a schema version; the flag-OFF calibration block now runs only on one
+        _store.commit()
+        _store.close()
 
         with _mock_engram_client():
             result = _run_hook_main(mod, {

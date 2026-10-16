@@ -72,15 +72,18 @@ class TestCheckMcpWriteToolMarker:
         assert ok is False
         assert "pid" in reason
 
-    def test_exception_returns_ok(self, tmp_path):
-        """Any unexpected error → True (advisory, never block)."""
+    def test_exception_returns_unknown(self, tmp_path):
+        """Any unexpected error → None (UNKNOWN, #3521): the probe still never
+        raises or blocks, but it no longer reports "writes alive" for a marker
+        it could not read. (Was test_exception_returns_ok, pinning True.)"""
         engram_home = tmp_path / "engram"
         engram_home.mkdir()
         mod = _load_hook_module(engram_home=engram_home)
         # Point at a path that will error on open (directory, not file)
         (engram_home / "mcp-tools-ready.json").mkdir()
         ok, reason = mod._check_mcp_write_tool_marker(str(engram_home))
-        assert ok is True
+        assert ok is None
+        assert reason
 
     def test_marker_with_dead_pid_and_no_server_returns_false(self, tmp_path, monkeypatch):
         """When marker PID is dead AND no server.py is running → liveness is False."""

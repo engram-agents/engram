@@ -119,31 +119,31 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 - **tests**: test_derive_payload.py, test_cascade_semantics.py
 
 **7. engram_ask** — Open research question.
-- **contract**: `{question, [context_ids, category, lacks]}`
-- **guards**: dedup is caller responsibility; questions are non-claim-bearing (cannot be derivation premises)
+- **contract**: `{question, [context_ids, category, lacks, bears_on]}`
+- **guards**: dedup is caller responsibility; questions are non-claim-bearing (cannot be derivation premises); `bears_on` (#3615) is strict and all-or-nothing, unlike lenient `context_ids`: every id must exist, be current, and pass the add_edge endpoint rule (question -> claim-bearing node or contradiction), else the call is refused and no question is created
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED
-- **tests**: test_open_questions.py
+- **tests**: test_open_questions.py, test_bears_on_3615.py
 
 ### Node Mutations (Supersede, Retract, Resolve)
 
 **8. engram_supersede** — Link replacement node to old node.
 - **contract**: `{old_node_id, new_node_id, [supersede_reason]}`
-- **guards**: DAG invariant (new.created_at ≥ old.created_at); same-type only; new node must not already supersede another; no-drop discipline on load-bearing claims; stale-cascade to derivation dependents
+- **guards**: DAG invariant (new.created_at ≥ old.created_at); same-type only; new node must not already supersede another; no-drop discipline on load-bearing claims; stale-cascade to derivation dependents; the return may carry read-only `bears_on_hints` (#3625) for current questions that `bears_on` the old node, or `bears_on_hint_error` if computing them failed after the supersede committed (the supersede still succeeded); declining a hint leaves no trace, so `engram_resolve` re-hints that replacement each time the question is resolved
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED
 - **tests**: test_cascade_semantics.py, test_cascade_derived_sets.py
 
 **9. engram_retract** — Mark claim as erroneous.
 - **contract**: `{node_id, error_type, reason, [replacement_id]}`
-- **guards**: taint-cascade to derivation dependents; contradiction nodes touching retracted node also flagged tainted; retraction is permanent (no undo)
+- **guards**: taint-cascade to derivation dependents; contradiction nodes touching retracted node also flagged tainted; retraction is permanent (no undo); with a `replacement_id` the return may carry read-only `bears_on_hints` (#3625), or `bears_on_hint_error` if computing them failed after the retraction committed; declining a hint leaves no trace, so `engram_resolve` re-hints that replacement each time the question is resolved
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED
 - **tests**: test_retract_and_quotes.py, test_cascade_semantics.py
 
 **10. engram_resolve** — Wire resolves edge (question/contradiction/prediction/conjecture/goal_tension).
 - **contract**: `{target_id, resolving_node_id, [prediction_outcome]}`
-- **guards**: pure-wire (does NOT create derivation); threshold 0.7 on resolving node's confidence to flip status; max-of-resolves (weak later resolver cannot downgrade); idempotent on duplicate edges; bool-string type check on bool params
+- **guards**: pure-wire (does NOT create derivation); threshold 0.7 on resolving node's confidence to flip status; max-of-resolves (weak later resolver cannot downgrade); idempotent on duplicate edges; bool-string type check on bool params; a question with `bears_on` edges (#3615) returns `bears_on` (live direct targets only), `bears_on_prompt` (worded as partial when the question is only partially resolved), `bears_on_hints` + `bears_on_hint_prompt` (#3625: a target superseded, or retracted with a replacement, whose live replacement, found by following supersede or retract chains, the question may still bear on; one hint per replacement; the agent adds the edge, the old edge stays as provenance; declining a hint leaves no trace, so resolving the question again re-hints the same replacement), `bears_on_hint_error` (present only if computing the hint failed after the resolve committed; the resolve itself still succeeded) and `bears_on_omitted_noncurrent` (non-current targets that produced no hint), also on the idempotent no_op path, and changes no target confidence
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED (pure-wire redesign per issue #229)
 - **tests**: test_resolve_goal_tension.py, test_open_questions.py
@@ -260,8 +260,8 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 - **tests**: *(unverified)*
 
 **26. engram_query** — Voluntary semantic recall (deliberate search).
-- **contract**: `{query, [types, min_confidence, include_superseded, top_k, summary_top_k, return_debug]}`
-- **guards**: refreshes recall on matched nodes (strengthens memory — distinct from surface); tiered return (Tier 1 summaries / Tier 2 keywords); return_debug=True for full legacy shape (eval/harness)
+- **contract**: `{query, [types, min_confidence, include_superseded, top_k, summary_top_k, return_debug, refresh_recall]}`
+- **guards**: refreshes recall on matched nodes (strengthens memory — distinct from surface; `refresh_recall=false` = measurement mode, results and ranking identical but no re-stamp; a person node's special_moment render is also skipped, since it writes, for probes and harnesses only); tiered return (Tier 1 summaries / Tier 2 keywords); return_debug=True for full legacy shape (eval/harness)
 - **readOnlyHint**: True
 - **status-candidate**: PROD-VERIFIED
 - **tests**: test_query_tiers.py
@@ -281,8 +281,8 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 - **tests**: *(unverified)*
 
 **29. engram_list** — Enumerate by single-field or structured filter.
-- **contract**: `{[node_type, status, sort_by, sort_order, limit, filters_json, fields_json, unlimited, include_superseded]}`
-- **guards**: dual-mode (legacy shorthand OR recursive condition tree); filters_json supports AND/OR/NOT + 15 atomic operators; virtual fields cites/cited_by; limit default 100, ceiling 500 (legacy); unlimited=True in structured mode; include_superseded=False default
+- **contract**: `{[node_type, status, sort_by, sort_order, limit, filters_json, fields_json, unlimited, include_superseded]}`; sort_by: id, created, importance, recalls, bears_on
+- **guards**: question rows carry `bears_on_count` / `bears_on_weight` (live targets only, #3615); dual-mode (legacy shorthand OR recursive condition tree); filters_json supports AND/OR/NOT + 15 atomic operators; virtual fields cites/cited_by; limit default 100, ceiling 500 (legacy); unlimited=True in structured mode; include_superseded=False default
 - **readOnlyHint**: True
 - **status-candidate**: PROD-VERIFIED (structured-filter mode per issue #81)
 - **tests**: test_list_structured_filter.py, test_list_single_field.py
@@ -305,14 +305,14 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 ### Edge Management
 
 **39. engram_add_edge** — Add non-cascade edge post-creation.
-- **contract**: `{source_id, target_id, relation}`; safe whitelist: about, exemplifies, serves, subtask_of, tensions
+- **contract**: `{source_id, target_id, relation}`; safe whitelist: about, exemplifies, serves, subtask_of, tensions, instantiates, generalizes, bears_on (question -> claim-bearing node or contradiction, #3615)
 - **guards**: whitelist blocks cascade/structural-commitment/provenance edges; idempotent (no_op_already_exists); DAG guard for dag-checked relations
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED
 - **tests**: test_engram_add_edge.py
 
 **40. engram_remove_edge** — Remove non-cascade edge (correction tool).
-- **contract**: `{source_id, target_id, relation}`; same whitelist
+- **contract**: `{source_id, target_id, relation}`; same whitelist (about, tensions, subtask_of, serves, exemplifies, instantiates, generalizes, bears_on)
 - **guards**: whitelist; idempotent; audit-logged
 - **readOnlyHint**: False · **destructiveHint**: True
 - **status-candidate**: PROD-VERIFIED

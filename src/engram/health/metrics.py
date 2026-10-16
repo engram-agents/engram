@@ -88,6 +88,7 @@ import json
 import sqlite3
 
 from .config import UNAVAILABLE, _Unavailable
+from .rows import named_rows
 
 
 # ---------------------------------------------------------------------------
@@ -138,14 +139,14 @@ def pending_premise_rate(conn: sqlite3.Connection) -> float | _Unavailable:
 
     claim_bearing_types = tuple(sorted(core.CLAIM_BEARING_TYPES))
     placeholders = ",".join("?" * len(claim_bearing_types))
-    total = conn.execute(
+    total = named_rows(conn,
         f"SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND type IN ({placeholders})",
         claim_bearing_types,
     ).fetchone()["c"]
     if total == 0:
         return UNAVAILABLE
 
-    pending = conn.execute(
+    pending = named_rows(conn,
         f"""SELECT COUNT(DISTINCT n.id) as c
             FROM nodes n
             JOIN cascade_markers m ON m.node_id = n.id
@@ -180,7 +181,7 @@ def open_contradiction_rate(conn: sqlite3.Connection) -> float | _Unavailable:
     empty population, its sibling(s) returning UNAVAILABLE for the same
     condition) was itself the inconsistency this fold closes.
     """
-    rows = conn.execute(
+    rows = named_rows(conn,
         "SELECT status FROM nodes WHERE type = 'contradiction' AND is_current = 1"
     ).fetchall()
     total = len(rows)
@@ -203,7 +204,7 @@ def uncited_observation_rate(conn: sqlite3.Connection) -> float | _Unavailable:
     empty_denominator: UNAVAILABLE — a graph can't meaningfully have an
     "uncited rate" over zero observations.
     """
-    rows = conn.execute(
+    rows = named_rows(conn,
         "SELECT evidence_id FROM nodes WHERE is_current = 1"
         " AND type IN ('observation_factual', 'observation_predictive')"
     ).fetchall()
@@ -225,13 +226,13 @@ def dangling_evidence_rate(conn: sqlite3.Connection) -> float | _Unavailable:
     empty_denominator: UNAVAILABLE — same 0/0 reasoning as
     uncited_observation_rate.
     """
-    total = conn.execute(
+    total = named_rows(conn,
         "SELECT COUNT(*) as c FROM nodes WHERE type = 'evidence' AND is_current = 1"
     ).fetchone()["c"]
     if total == 0:
         return UNAVAILABLE
 
-    dangling = conn.execute(
+    dangling = named_rows(conn,
         """SELECT COUNT(*) as c FROM nodes n
            WHERE n.type = 'evidence' AND n.is_current = 1
              AND NOT EXISTS (
@@ -289,7 +290,7 @@ def recall_summary_coverage(conn: sqlite3.Connection) -> float | _Unavailable:
 
     claim_bearing_types = tuple(sorted(core.CLAIM_BEARING_TYPES))
     placeholders = ",".join("?" * len(claim_bearing_types))
-    rows = conn.execute(
+    rows = named_rows(conn,
         f"SELECT recall_summary FROM nodes WHERE is_current = 1 AND type IN ({placeholders})",
         claim_bearing_types,
     ).fetchall()
@@ -320,7 +321,7 @@ def recall_keywords_coverage(conn: sqlite3.Connection) -> float | _Unavailable:
 
     claim_bearing_types = tuple(sorted(core.CLAIM_BEARING_TYPES))
     placeholders = ",".join("?" * len(claim_bearing_types))
-    rows = conn.execute(
+    rows = named_rows(conn,
         f"SELECT recall_keywords FROM nodes WHERE is_current = 1 AND type IN ({placeholders})",
         claim_bearing_types,
     ).fetchall()
@@ -388,14 +389,14 @@ def embedding_coverage(conn: sqlite3.Connection) -> float | _Unavailable:
 
     claim_bearing_types = tuple(sorted(core.CLAIM_BEARING_TYPES))
     placeholders = ",".join("?" * len(claim_bearing_types))
-    total = conn.execute(
+    total = named_rows(conn,
         f"SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND type IN ({placeholders})",
         claim_bearing_types,
     ).fetchone()["c"]
     if total == 0:
         return UNAVAILABLE
 
-    missing = conn.execute(
+    missing = named_rows(conn,
         f"SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND type IN ({placeholders})"
         " AND embedding IS NULL",
         claim_bearing_types,
@@ -428,7 +429,7 @@ def giant_component_fraction(conn: sqlite3.Connection) -> float | _Unavailable:
 
     claim_bearing_types = tuple(sorted(core.CLAIM_BEARING_TYPES))
     placeholders = ",".join("?" * len(claim_bearing_types))
-    node_rows = conn.execute(
+    node_rows = named_rows(conn,
         f"SELECT id FROM nodes WHERE is_current = 1 AND type IN ({placeholders})",
         claim_bearing_types,
     ).fetchall()
@@ -437,7 +438,7 @@ def giant_component_fraction(conn: sqlite3.Connection) -> float | _Unavailable:
     if total == 0:
         return UNAVAILABLE
 
-    edge_rows = conn.execute("SELECT source_id, target_id FROM edges").fetchall()
+    edge_rows = named_rows(conn, "SELECT source_id, target_id FROM edges").fetchall()
     adj: dict = {}
     for e in edge_rows:
         s, t = e["source_id"], e["target_id"]

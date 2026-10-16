@@ -61,6 +61,7 @@ import threading
 from datetime import datetime, timezone
 
 from .. import agents as viz_agents
+from .sqlite_ro import connect_ro
 
 # Matches health.engine.write_snapshot's own filename shape exactly:
 #   filename = f"{turn}-{checkpoint_mode}-{ts}.json"
@@ -615,7 +616,18 @@ def _resolve_effective_embedding_enabled(agent_config: dict) -> "tuple[bool, str
     (``engram_core._get_embedding_config``) reads ``config["embedding"]``
     (singular) -- this function reads the REAL key, matching every other
     reader of this same config file (``engram_core.py``,
-    ``viz/data/health.py``'s own ``current_turn`` read)."""
+    ``viz/data/health.py``'s own ``current_turn`` read).
+
+    `embedding.enabled` was retired by #345 (embeddings are mandatory),
+    and a RUNNING server/MCP process can never carry `enabled: false`
+    (the startup gate refuses to start first). This function's
+    `config_enabled` read is nonetheless kept deliberately: it feeds
+    `health.engine.build_snapshot`'s `embedding_enabled` override, a
+    health-SCORING path rather than an embed/search gate, and a stale
+    on-disk config (or the config of a different, non-running agent on a
+    shared host) can still carry the retired key -- this function reports
+    that ground truth rather than pretending the key no longer exists.
+    """
     import engram_core as core  # lazy -- see module docstring
 
     config_enabled = bool(
@@ -672,7 +684,7 @@ def _build_live_health_v2_payload(agent_name: str, db_path: str) -> dict:
         # viz/data/health.py's get_health_data already uses (comment there:
         # "multi-agent peer-DB safety is enforced by OS file permissions
         # ... not by this URI flag").
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = connect_ro(db_path)
         conn.row_factory = sqlite3.Row
     except sqlite3.OperationalError as exc:
         return {

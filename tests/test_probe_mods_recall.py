@@ -1,0 +1,1325 @@
+"""Contract tests for tools/probes/mods-recall — the converter and the eval.
+
+Contract-first (CLAUDE.md "Contract-first tests", spec part of #3362): these
+assertions were written BEFORE convert_ratings.py / probe_eval.py existed.
+
+All fixtures are hand-built step / rating JSON in ``tmp_path``; nothing under
+``~/.engram`` is read or written. Node ids like ``ob_1234`` are fine here
+(tests/ is repo-only); they never appear in tools/probes/** source.
+
+Contracts pinned:
+  1. one TEST RRU per (step, arm); summary counts match; an extra rating for
+     a missing step shows up as ratings_without_step == 1
+  2. an unrated step -> no golden, steps_unrated == 1, exit 0
+  3. relevance mapping exact: good->2, noise->0, surfaced-unmarked->1;
+     unsurfaced-good -> present, relevance 2, notes == "unsurfaced"
+  4. an unknown blind letter -> SystemExit naming turnId, index, letter
+  5. a malformed step file -> SystemExit naming the file; nothing written
+  6. probe_eval: golden-aligned arm nDCG@10 == 1.0, reversed arm strictly lower;
+     pair table counts match
+  7. latency: msOverStep None when stepMs missing; medians/p90 over present
+     values only; the report prints the excluded count
+  8. control: swapping noise->1 makes the mapping assertion (test 3) fail
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PROBE_DIR = REPO_ROOT / "tools" / "probes" / "mods-recall"
+
+
+def _load(name: str):
+    """Import a script from the hyphenated plugin folder by file path."""
+    path = PROBE_DIR / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"probe_{name}", path)
+    assert spec and spec.loader, f"cannot load {path}"
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture()
+def convert():
+    return _load("convert_ratings")
+
+
+@pytest.fixture()
+def evaluator():
+    return _load("probe_eval")
+
+
+# ---------------------------------------------------------------------------
+# fixture builders
+# ---------------------------------------------------------------------------
+
+TURN = "aaaaaaaa-1111-2222-3333-444444444444"
+TURN8 = "aaaaaaaa"
+Q8 = "t" + TURN8  # query ids / golden names lead with a constant "t"
+BLIND = {"A": "thinking_tail", "B": "thinking_full"}
+
+
+def _cand(node_id: str, rank: int, **extra) -> dict:
+    row = {
+        "id": node_id,
+        "type": "observation",
+        "claim": f"claim of {node_id}",
+        "rank": rank,
+        "composite_score": 1.0 - rank / 100,
+        "similarity": 0.5,
+        "match_type": "semantic",
+        "armsHit": ["thinking_tail"],
+        "inContext": False,
+        "principle": False,
+    }
+    row.update(extra)
+    return row
+
+
+def _arm(name: str, ids: list[str], *, ms: float = 100.0, step_ms=1000.0, **extra) -> dict:
+    row = {
+        "arm": name,
+        "query": f"query for {name}",
+        "candidates": [_cand(i, r + 1) for r, i in enumerate(ids)],
+        "ms": ms,
+        "msOverStep": (ms / step_ms) if step_ms else None,
+    }
+    row.update(extra)
+    return row
+
+
+def _step(index: int, arms: dict[str, list[str]], *, turn: str = TURN,
+          step_ms=1000.0, blind: dict | None = None, **extra) -> dict:
+    row = {
+        "turnId": turn,
+        "index": index,
+        "model": "test-model",
+        "stopReason": "tool_use",
+        "stepMs": step_ms,
+        "messagesScanned": 3,
+        "engram_server": "engram",
+        "armBlind": blind if blind is not None else BLIND,
+        "arms": {name: _arm(name, ids, step_ms=step_ms) for name, ids in arms.items()},
+        "ts": 1,
+    }
+    row.update(extra)
+    return row
+
+
+def _write(path: Path, obj) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj))
+    return path
+
+
+def _session(tmp_path: Path) -> Path:
+    root = tmp_path / "session"
+    (root / "steps").mkdir(parents=True)
+    return root
+
+
+def _put_step(root: Path, step: dict) -> Path:
+    return _write(root / "steps" / f"{step['turnId']}-{step['index']:03d}.json", step)
+
+
+def _put_request(root: Path, turn: str = TURN, shown: dict | None = None) -> Path:
+    """The request file the mod writes at turn end; by default it shows every
+    candidate id of every step file of that turn (so nothing is "unshown")."""
+    if shown is None:
+        shown = {}
+        for path in sorted((root / "steps").glob("*.json")):
+            try:
+                step = json.loads(path.read_text())
+            except ValueError:
+                continue
+            if step.get("turnId") != turn or not step.get("arms"):
+                continue
+            blind = step.get("armBlind") or {}
+            shown[str(step["index"])] = {
+                letter: [c["id"] for c in step["arms"].get(arm, {}).get("candidates", [])]
+                for letter, arm in blind.items()
+            }
+    return _write(root / "requests" / f"{turn}.json",
+                  {"turnId": turn, "shown": shown, "chars": 100, "omittedSteps": 0})
+
+
+def _put_rating(root: Path, steps: list[dict], *, turn: str = TURN, ts: int = 10,
+                request: bool = True) -> Path:
+    if request and not (root / "requests" / f"{turn}.json").exists():
+        _put_request(root, turn)
+    return _write(
+        root / "ratings" / f"{turn}-{ts}.json",
+        {"ts": ts, "sessionId": "s", "turnId": turn, "steps": steps, "ratedBy": "test-model"},
+    )
+
+
+def _standard_session(tmp_path: Path) -> Path:
+    """Two steps with arms (2 arms each), step 3 rated, step 4 unrated, plus
+    one rating for a step (9) that has no step file at all."""
+    root = _session(tmp_path)
+    _put_step(root, _step(3, {"thinking_tail": ["ob_0001", "ob_0002", "ob_0003"],
+                              "thinking_full": ["ob_0002", "ob_0004"]}))
+    _put_step(root, _step(4, {"thinking_tail": ["ob_0005"], "thinking_full": ["ob_0006"]}))
+    _put_rating(root, [
+        {"index": 3, "good": ["ob_0001"], "noise": ["ob_0004"]},
+        {"index": 9, "good": ["ob_0099"], "noise": []},
+    ])
+    return root
+
+
+def _golden_by_id(out: Path, name: str) -> dict:
+    data = json.loads((out / "golden" / name).read_text())
+    return {c["id"]: c for c in data["ranked_candidates"]}
+
+
+# ---------------------------------------------------------------------------
+# 1. one TEST RRU per (step, arm); summary counts; ratings_without_step
+# ---------------------------------------------------------------------------
+
+
+def test_one_test_rru_per_step_arm_and_summary_counts(convert, tmp_path):
+    root = _standard_session(tmp_path)
+    out = tmp_path / "out"
+    summary = convert.convert(root, out)
+
+    assert summary["steps_total"] == 2
+    assert summary["steps_with_arms"] == 2
+    assert summary["steps_rated"] == 1
+    assert summary["steps_unrated"] == 1
+    assert summary["ratings_without_step"] == 1
+    assert summary["test_rrus_written"] == 4  # 2 steps x 2 arms
+    assert summary["goldens_written"] == 1
+    assert set(summary) == {
+        "steps_total", "steps_with_arms", "steps_rated", "steps_unrated",
+        "ratings_without_step", "test_rrus_written", "goldens_written",
+        "steps_skipped_by_reason", "steps_terminal",
+    }
+
+    files = sorted(p.name for p in (out / "test").glob("*.json"))
+    assert files == sorted([
+        f"{TURN}-3-thinking_tail.json", f"{TURN}-3-thinking_full.json",
+        f"{TURN}-4-thinking_tail.json", f"{TURN}-4-thinking_full.json",
+    ])
+    rru = json.loads((out / "test" / f"{TURN}-3-thinking_tail.json").read_text())
+    assert rru["query_id"] == f"{Q8}-s3"
+    assert rru["query_text"] == "query for thinking_tail"
+    assert [n["id"] for n in rru["ranked_nodes"]] == ["ob_0001", "ob_0002", "ob_0003"]
+    assert [n["rank"] for n in rru["ranked_nodes"]] == [1, 2, 3]
+    assert rru["ranked_nodes"][0]["signals"]["composite_score"] is not None
+    assert rru["metadata"]["arm"] == "thinking_tail"
+    assert rru["metadata"]["armLetter"] == "A"
+    assert rru["metadata"]["stepMs"] == 1000.0
+    assert rru["metadata"]["msOverStep"] == pytest.approx(0.1)
+    assert rru["metadata"]["model"] == "test-model"
+
+
+def test_summary_identities_hold_on_a_skipped_step(convert, tmp_path):
+    root = _standard_session(tmp_path)
+    _put_step(root, {"turnId": TURN, "index": 5, "skipped": "short-thinking",
+                     "armBlind": BLIND, "ts": 1})
+    summary = convert.convert(root, tmp_path / "out")
+    assert summary["steps_total"] == 3
+    assert summary["steps_with_arms"] == 2  # the skipped row has no arms
+    assert summary["steps_with_arms"] == summary["steps_rated"] + summary["steps_unrated"]
+
+
+# ---------------------------------------------------------------------------
+# 2. unrated step -> no golden, steps_unrated == 1, exit 0
+# ---------------------------------------------------------------------------
+
+
+def test_unrated_step_has_no_golden_and_exits_zero(convert, tmp_path):
+    root = _session(tmp_path)
+    _put_step(root, _step(4, {"thinking_tail": ["ob_0005"], "thinking_full": ["ob_0006"]}))
+    out = tmp_path / "out"
+    assert convert.main([str(root), "--out", str(out)]) == 0
+    assert list((out / "golden").glob("*.json")) == []
+    summary = convert.convert(root, tmp_path / "out2")
+    assert summary["steps_unrated"] == 1
+    assert summary["steps_rated"] == 0
+    assert summary["goldens_written"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 3. relevance mapping exact (+ 8. the control that keeps it honest)
+# ---------------------------------------------------------------------------
+
+
+def _assert_relevance_mapping(convert, tmp_path: Path) -> None:
+    """The mapping contract; also the thing the control mutates."""
+    root = _session(tmp_path)
+    _put_step(root, _step(3, {"thinking_tail": ["ob_0001", "ob_0002", "ob_0003"],
+                              "thinking_full": ["ob_0002", "ob_0004"]}))
+    _put_rating(root, [{"index": 3, "good": ["ob_0001", "ob_0077"], "noise": ["ob_0004"]}])
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    golden = _golden_by_id(out, f"q_{Q8}-s3.json")
+    assert golden["ob_0001"]["grading"]["relevance"] == 2  # good
+    assert golden["ob_0004"]["grading"]["relevance"] == 0  # noise
+    assert golden["ob_0002"]["grading"]["relevance"] == 1  # surfaced, unmarked
+    assert golden["ob_0003"]["grading"]["relevance"] == 1  # surfaced, unmarked
+    # good but no arm surfaced it -> kept, flagged
+    assert golden["ob_0077"]["grading"]["relevance"] == 2
+    assert golden["ob_0077"]["notes"] == "unsurfaced"
+    assert golden["ob_0001"].get("notes", "") != "unsurfaced"
+    # the union of arm candidates plus the unsurfaced rated id, nothing else
+    assert set(golden) == {"ob_0001", "ob_0002", "ob_0003", "ob_0004", "ob_0077"}
+
+
+def test_relevance_mapping_exact(convert, tmp_path):
+    _assert_relevance_mapping(convert, tmp_path)
+
+
+def test_control_noise_mapped_to_one_is_caught_by_the_mapping_test(convert, tmp_path, monkeypatch):
+    """Control: swap noise->1 and the mapping assertion MUST fail."""
+    monkeypatch.setitem(convert.RELEVANCE, "noise", 1)
+    with pytest.raises(AssertionError):
+        _assert_relevance_mapping(convert, tmp_path)
+
+
+def test_golden_loads_through_the_repo_loader(convert, tmp_path):
+    from tools.recall_harness.golden_loader import load_golden_set
+
+    root = _standard_session(tmp_path)
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    loaded = load_golden_set(str(out / "golden"))
+    assert list(loaded) == [f"{Q8}-s3"]
+    assert loaded[f"{Q8}-s3"].relevant_ids == {"ob_0001"}
+
+
+# ---------------------------------------------------------------------------
+# 4. unknown blind letter -> SystemExit naming turnId, index, letter
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_blind_letter_exits_nonzero_naming_turn_index_letter(convert, tmp_path):
+    root = _session(tmp_path)
+    _put_step(root, _step(3, {"thinking_tail": ["ob_0001"], "thinking_full": ["ob_0002"]}))
+    _put_rating(root, [{"index": 3, "good": ["ob_0001"], "pair": {"Z": "better"}}])
+    with pytest.raises(SystemExit) as exc:
+        convert.convert(root, tmp_path / "out")
+    assert exc.value.code not in (0, None)
+    message = str(exc.value)
+    assert TURN in message and "3" in message and "Z" in message
+
+
+def test_pairs_are_unblinded_through_armblind(convert, tmp_path):
+    root = _session(tmp_path)
+    _put_step(root, _step(3, {"thinking_tail": ["ob_0001"], "thinking_full": ["ob_0002"]}))
+    _put_rating(root, [{"index": 3, "good": ["ob_0001"], "pair": {"A": "better"}}])
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    rows = [json.loads(line) for line in (out / "pairs.jsonl").read_text().splitlines()]
+    assert rows == [{"turnId": TURN, "index": 3, "armA": "thinking_tail",
+                     "armB": "thinking_full", "verdict": "better"}]
+
+
+# ---------------------------------------------------------------------------
+# 5. malformed step file -> non-zero naming the file; nothing partial written
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_step_file_exits_naming_it_and_writes_nothing(convert, tmp_path):
+    root = _standard_session(tmp_path)
+    bad = root / "steps" / f"{TURN}-007.json"
+    bad.write_text("{ this is not json")
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit) as exc:
+        convert.convert(root, out)
+    assert exc.value.code not in (0, None)
+    assert bad.name in str(exc.value)
+    # nothing partial left behind claimed as complete
+    leftovers = [p for p in out.rglob("*") if p.is_file()] if out.exists() else []
+    assert leftovers == []
+
+
+def test_refuses_to_overwrite_existing_output_without_flag(convert, tmp_path):
+    root = _standard_session(tmp_path)
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    with pytest.raises(SystemExit):
+        convert.convert(root, out)
+    assert convert.convert(root, out, overwrite=True)["test_rrus_written"] == 4
+
+
+# ---------------------------------------------------------------------------
+# 6. probe_eval over a 2-arm fixture
+# ---------------------------------------------------------------------------
+
+
+def _eval_fixture(tmp_path: Path):
+    gdir, tdir = tmp_path / "golden", tmp_path / "test"
+    gdir.mkdir()
+    tdir.mkdir()
+    _write(gdir / "q_aaaaaaaa-s3.json", {
+        "query_id": "aaaaaaaa-s3", "query_text": "q",
+        "ranked_candidates": [
+            {"id": "ob_0001", "grading": {"relevance": 2}},
+            {"id": "ob_0002", "grading": {"relevance": 2}},
+            {"id": "ob_0003", "grading": {"relevance": 1}},
+            {"id": "ob_0004", "grading": {"relevance": 0}},
+        ],
+    })
+    # a rated step no arm retrieved anything useful for: its good id is a miss
+    _write(gdir / "q_cccccccc-s5.json", {
+        "query_id": "cccccccc-s5", "query_text": "q",
+        "ranked_candidates": [
+            {"id": "ob_0077", "grading": {"relevance": 2}, "notes": "unsurfaced"},
+            {"id": "ob_0078", "grading": {"relevance": 1}},
+        ],
+    })
+
+    def rru(arm: str, ids: list[str], ms=100.0, step_ms=1000.0, qid="aaaaaaaa-s3", **flags):
+        return {
+            "query_id": qid, "query_text": "q",
+            "ranked_nodes": [
+                {"id": i, "rank": r + 1, "grading": None,
+                 "signals": {"inContext": flags.get("in_context", False),
+                             "principle": flags.get("principle", False)}, "notes": ""}
+                for r, i in enumerate(ids)
+            ],
+            "metadata": {"arm": arm, "armLetter": "A", "ms": ms, "stepMs": step_ms,
+                         "msOverStep": (ms / step_ms) if step_ms else None,
+                         "model": "m", "sessionId": "s"},
+        }
+
+    _write(tdir / "x.json", rru("arm_x", ["ob_0001", "ob_0002", "ob_0003", "ob_0004"]))
+    _write(tdir / "y.json", rru("arm_y", ["ob_0004", "ob_0003", "ob_0002", "ob_0001"]))
+    pairs = tmp_path / "pairs.jsonl"
+    pairs.write_text("\n".join(json.dumps(r) for r in [
+        {"turnId": TURN, "index": 3, "armA": "arm_x", "armB": "arm_y", "verdict": "better"},
+        {"turnId": TURN, "index": 4, "armA": "arm_x", "armB": "arm_y", "verdict": "better"},
+        {"turnId": TURN, "index": 5, "armA": "arm_x", "armB": "arm_y", "verdict": "worse"},
+    ]) + "\n")
+    return gdir, tdir, pairs, rru
+
+
+def test_eval_ranks_golden_aligned_arm_above_reversed(evaluator, tmp_path):
+    gdir, tdir, pairs, _ = _eval_fixture(tmp_path)
+    result = evaluator.evaluate(str(gdir), str(tdir), str(pairs))
+    arms = result["arms"]
+    assert arms["arm_x"]["ndcg_at_k_10"] == 1.0
+    assert arms["arm_y"]["ndcg_at_k_10"] < arms["arm_x"]["ndcg_at_k_10"]
+    assert arms["arm_x"]["n_steps"] == 1 and arms["arm_y"]["n_steps"] == 1
+    assert result["pairs"][("arm_x", "arm_y")] == {"better": 2, "same": 0, "worse": 1}
+    # golden-relevance-2 id nobody surfaced is an arm miss
+    assert result["misses"] == {"cccccccc-s5": ["ob_0077"]}
+
+
+def test_eval_report_writes_one_row_per_arm_pairs_and_misses(evaluator, tmp_path):
+    gdir, tdir, pairs, _ = _eval_fixture(tmp_path)
+    out = tmp_path / "report.md"
+    assert evaluator.main(["--golden", str(gdir), "--test", str(tdir),
+                           "--pairs", str(pairs), "--out", str(out)]) == 0
+    text = out.read_text()
+    assert "| arm_x |" in text and "| arm_y |" in text
+    assert "arm_x" in text and "better" in text
+    assert "ob_0077" in text
+
+
+def test_eval_unrated_step_is_reported_not_scored(evaluator, tmp_path):
+    gdir, tdir, pairs, rru = _eval_fixture(tmp_path)
+    _write(tdir / "z.json", rru("arm_x", ["ob_0009"], qid="bbbbbbbb-s1"))
+    result = evaluator.evaluate(str(gdir), str(tdir), str(pairs))
+    assert result["unrated"] == ["bbbbbbbb-s1"]
+    assert result["arms"]["arm_x"]["n_steps"] == 1  # the unrated one is not scored
+
+
+def test_eval_fails_loudly_when_a_golden_file_is_silently_skippable(evaluator, tmp_path):
+    """golden_loader drops names with '_v'; the eval must not let a golden
+    vanish unannounced."""
+    gdir, tdir, pairs, _ = _eval_fixture(tmp_path)
+    _write(gdir / "q_aaaaaaaa-s9_v2.json", {
+        "query_id": "aaaaaaaa-s9", "query_text": "q",
+        "ranked_candidates": [{"id": "ob_0001", "grading": {"relevance": 2}}]})
+    with pytest.raises(SystemExit) as exc:
+        evaluator.evaluate(str(gdir), str(tdir), str(pairs))
+    assert "q_aaaaaaaa-s9_v2.json" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# 7. latency handling
+# ---------------------------------------------------------------------------
+
+
+def test_msoverstep_is_null_when_stepms_missing(convert, tmp_path):
+    root = _session(tmp_path)
+    step = _step(3, {"thinking_tail": ["ob_0001"], "thinking_full": ["ob_0002"]}, step_ms=None)
+    del step["stepMs"]
+    _put_step(root, step)
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    rru = json.loads((out / "test" / f"{TURN}-3-thinking_tail.json").read_text())
+    assert rru["metadata"]["msOverStep"] is None
+    assert rru["metadata"]["stepMs"] is None
+    assert rru["metadata"]["ms"] == 100.0  # ms itself is still real
+    # stepMs == 0 is also "unknown", never a fake 0 ratio
+    root2 = tmp_path / "s2"
+    (root2 / "steps").mkdir(parents=True)
+    zero = _step(3, {"thinking_tail": ["ob_0001"]}, step_ms=0)
+    _put_step(root2, zero)
+    convert.convert(root2, tmp_path / "out2")
+    rru0 = json.loads((tmp_path / "out2" / "test" / f"{TURN}-3-thinking_tail.json").read_text())
+    assert rru0["metadata"]["msOverStep"] is None
+
+
+def test_latency_stats_use_present_values_only_and_report_exclusions(evaluator, tmp_path):
+    gdir, tdir, pairs, rru = _eval_fixture(tmp_path)
+    # three more arm_x RRUs on the SAME rated step id with varied latency;
+    # one has no stepMs (msOverStep None).
+    for n, (ms, step_ms) in enumerate([(200.0, 1000.0), (300.0, None), (400.0, 1000.0)]):
+        _write(tdir / f"extra{n}.json", rru("arm_x", ["ob_0001"], ms=ms, step_ms=step_ms))
+    result = evaluator.evaluate(str(gdir), str(tdir), str(pairs))
+    x = result["arms"]["arm_x"]
+    # ms present for all 4 arm_x RRUs: 100,200,300,400
+    assert x["median_ms"] == 250.0
+    assert x["p90_ms"] == 400.0
+    # msOverStep present for 3 of 4: 0.1, 0.2, 0.4 -> median 0.2
+    assert x["median_ms_over_step"] == pytest.approx(0.2)
+    assert x["ms_over_step_excluded"] == 1
+    out = tmp_path / "report.md"
+    evaluator.main(["--golden", str(gdir), "--test", str(tdir), "--out", str(out)])
+    assert "excluded" in out.read_text()
+
+
+def test_main_without_pairs_still_writes_report(evaluator, tmp_path):
+    gdir, tdir, _, _ = _eval_fixture(tmp_path)
+    out = tmp_path / "r.md"
+    assert evaluator.main(["--golden", str(gdir), "--test", str(tdir), "--out", str(out)]) == 0
+    assert out.exists()
+
+
+# ---------------------------------------------------------------------------
+# golden filename hazard: a turnId starting with "v"
+# ---------------------------------------------------------------------------
+
+
+def test_turn_id_starting_with_v_round_trips_through_convert_and_eval(convert, evaluator, tmp_path):
+    turn = "vvvv1234-1111-2222-3333-444444444444"
+    root = _session(tmp_path)
+    _put_step(root, _step(3, {"thinking_tail": ["ob_0001", "ob_0002"],
+                              "thinking_full": ["ob_0002", "ob_0003"]}, turn=turn))
+    _put_rating(root, [{"index": 3, "good": ["ob_0001"]}], turn=turn)
+    out = tmp_path / "out"
+    summary = convert.convert(root, out)
+    assert summary["goldens_written"] == 1
+    names = [p.name for p in (out / "golden").glob("*.json")]
+    assert names == ["q_tvvvv1234-s3.json"]
+    result = evaluator.evaluate(str(out / "golden"), str(out / "test"), None)
+    assert result["n_goldens"] == 1
+    assert result["unrated"] == []
+    assert result["arms"]["thinking_tail"]["n_steps"] == 1
+
+
+# ---------------------------------------------------------------------------
+# unshown candidates (the rater only sees what the request showed)
+# ---------------------------------------------------------------------------
+
+
+def _unshown_session(tmp_path: Path) -> Path:
+    """arm X (thinking_tail) surfaces 5 ids; the request showed only the top 3."""
+    root = _session(tmp_path)
+    _put_step(root, _step(3, {"thinking_tail": ["ob_0001", "ob_0002", "ob_0003", "ob_0004", "ob_0005"],
+                              "thinking_full": ["ob_0001", "ob_0006"]}))
+    _put_request(root, shown={"3": {"A": ["ob_0001", "ob_0002", "ob_0003"], "B": ["ob_0001"]}})
+    # ob_0004 (rank 4, unshown) is rated good anyway, as if read from the files
+    _put_rating(root, [{"index": 3, "good": ["ob_0001", "ob_0004"]}], request=False)
+    return root
+
+
+def test_unshown_surfaced_ids_are_marked_in_the_golden_and_relevance_stays_one(convert, tmp_path):
+    root = _unshown_session(tmp_path)
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    golden = _golden_by_id(out, f"q_{Q8}-s3.json")
+    for unshown in ("ob_0005", "ob_0006"):  # surfaced, never shown, unrated
+        assert golden[unshown]["notes"] == "unshown"
+        assert golden[unshown]["grading"]["relevance"] == 1
+    assert golden["ob_0002"].get("notes", "") == ""  # shown, neutral
+    assert golden["ob_0001"].get("notes", "") == ""
+    # a rated id keeps its rating; unshown does not override a rating the agent gave
+    assert golden["ob_0004"]["grading"]["relevance"] == 2
+    assert golden["ob_0004"].get("notes", "") != "unsurfaced"
+
+
+def test_test_rru_carries_the_ids_the_request_showed(convert, tmp_path):
+    root = _unshown_session(tmp_path)
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    rru = json.loads((out / "test" / f"{TURN}-3-thinking_tail.json").read_text())
+    assert rru["metadata"]["shownIds"] == ["ob_0001", "ob_0002", "ob_0003"]
+
+
+def test_missing_requests_file_for_a_rated_turn_exits_naming_the_turn(convert, tmp_path):
+    root = _session(tmp_path)
+    _put_step(root, _step(3, {"thinking_tail": ["ob_0001"], "thinking_full": ["ob_0002"]}))
+    _put_rating(root, [{"index": 3, "good": ["ob_0001"]}], request=False)
+    with pytest.raises(SystemExit) as exc:
+        convert.convert(root, tmp_path / "out")
+    assert exc.value.code not in (0, None)
+    assert TURN in str(exc.value) and "request" in str(exc.value)
+    assert not (tmp_path / "out").exists() or not list((tmp_path / "out").rglob("*.json"))
+
+
+def test_unrated_turn_needs_no_requests_file(convert, tmp_path):
+    root = _session(tmp_path)
+    _put_step(root, _step(3, {"thinking_tail": ["ob_0001"]}))
+    assert convert.convert(root, tmp_path / "out")["steps_unrated"] == 1
+
+
+def test_eval_reports_unshown_rate_and_shown_only_truncates(convert, evaluator, tmp_path):
+    root = _unshown_session(tmp_path)
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    full = evaluator.evaluate(str(out / "golden"), str(out / "test"), None)
+    # thinking_tail surfaced 5 ids, 2 of them marked unshown (ob_0005 and... ob_0004 is rated, so 1)
+    tail = full["arms"]["thinking_tail"]
+    assert tail["unshown_rate"] == pytest.approx(1 / 5)
+    assert full["arms"]["thinking_full"]["unshown_rate"] == pytest.approx(1 / 2)
+    assert full["shown_only"] is False
+
+    shown = evaluator.evaluate(str(out / "golden"), str(out / "test"), None, shown_only=True)
+    assert shown["shown_only"] is True
+    # ob_0004 (good, rank 4) was never shown: --shown-only drops it from the ranking
+    assert shown["arms"]["thinking_tail"]["recall_at_k_10"] < full["arms"]["thinking_tail"]["recall_at_k_10"]
+    report = tmp_path / "r.md"
+    assert evaluator.main(["--golden", str(out / "golden"), "--test", str(out / "test"),
+                           "--shown-only", "--out", str(report)]) == 0
+    text = report.read_text()
+    assert "shown-only" in text and "unshown" in text
+
+
+# ---------------------------------------------------------------------------
+# pair keys: A and B only
+# ---------------------------------------------------------------------------
+
+
+def test_pair_key_other_than_a_or_b_exits_naming_turn_index_letter(convert, tmp_path):
+    root = _session(tmp_path)
+    blind = {"A": "thinking_tail", "B": "thinking_full", "C": "tool_input"}
+    _put_step(root, _step(3, {"thinking_tail": ["ob_0001"], "thinking_full": ["ob_0002"],
+                              "tool_input": ["ob_0003"]}, blind=blind))
+    _put_rating(root, [{"index": 3, "good": ["ob_0001"], "pair": {"C": "better"}}])
+    with pytest.raises(SystemExit) as exc:
+        convert.convert(root, tmp_path / "out")
+    assert exc.value.code not in (0, None)
+    message = str(exc.value)
+    assert TURN in message and "3" in message and "'C'" in message
+    # never a silent C-vs-A: no output was written
+    assert not (tmp_path / "out").exists() or not list((tmp_path / "out").rglob("*.json"))
+
+
+def test_pair_key_b_is_accepted_and_compares_against_a(convert, tmp_path):
+    root = _session(tmp_path)
+    _put_step(root, _step(3, {"thinking_tail": ["ob_0001"], "thinking_full": ["ob_0002"]}))
+    _put_rating(root, [{"index": 3, "good": ["ob_0001"], "pair": {"B": "worse"}}])
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    rows = [json.loads(line) for line in (out / "pairs.jsonl").read_text().splitlines()]
+    assert rows == [{"turnId": TURN, "index": 3, "armA": "thinking_full",
+                     "armB": "thinking_tail", "verdict": "worse"}]
+
+
+# ---------------------------------------------------------------------------
+# novel_terms.py: which graph arm E reads
+# ---------------------------------------------------------------------------
+
+
+def test_novel_terms_default_db_follows_engram_home(tmp_path):
+    import sqlite3
+    import subprocess
+
+    home = tmp_path / "seat-home"
+    home.mkdir()
+    db = home / "knowledge.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE nodes (id TEXT, is_current INTEGER)")
+    conn.commit()
+    conn.close()
+    env = {**os.environ, "ENGRAM_HOME": str(home)}
+    run = subprocess.run(
+        [sys.executable, str(PROBE_DIR / "novel_terms.py"), "--state", str(tmp_path / "seen.json")],
+        input="some thinking text", capture_output=True, text=True, env=env, timeout=30)
+    assert run.returncode == 0, run.stderr
+    out = json.loads(run.stdout)
+    assert out["db"] == str(db)
+    assert out["terms"] == [] and out["novel"] == []  # empty graph: nothing to extract
+
+
+def test_novel_terms_default_db_without_engram_home_is_dot_engram(monkeypatch):
+    nt = _load("novel_terms")
+    monkeypatch.delenv("ENGRAM_HOME", raising=False)
+    assert nt.default_db() == Path.home() / ".engram" / "knowledge.db"
+    monkeypatch.setenv("ENGRAM_HOME", "/somewhere/else")
+    assert nt.default_db() == Path("/somewhere/else") / "knowledge.db"
+
+
+# ---------------------------------------------------------------------------
+# input validation BEFORE any write (path traversal via ids / arm names)
+# ---------------------------------------------------------------------------
+
+
+def _tree(path: Path) -> set[str]:
+    return {str(p.relative_to(path)) for p in path.rglob("*")}
+
+
+def _assert_dies_naming(convert, tmp_path: Path, root: Path, file_name: str, field: str) -> None:
+    before = _tree(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        convert.convert(root, tmp_path / "out")
+    assert exc.value.code not in (0, None)
+    message = str(exc.value)
+    assert file_name in message and field in message
+    # nothing written anywhere under the tmp parent, inside or outside --out
+    assert _tree(tmp_path) == before
+
+
+def test_step_turn_id_with_traversal_is_refused_before_any_write(convert, tmp_path):
+    root = _session(tmp_path)
+    bad = _write(root / "steps" / "evil-000.json",
+                 _step(0, {"tool_input": ["ob_0001"]}, turn="../../escape"))
+    _assert_dies_naming(convert, tmp_path, root, bad.name, "turnId")
+
+
+def test_rating_turn_id_with_traversal_is_refused_before_any_write(convert, tmp_path):
+    root = _standard_session(tmp_path)
+    bad = _write(root / "ratings" / "evil-1.json",
+                 {"ts": 1, "sessionId": "s", "turnId": "../x", "steps": [{"index": 3, "good": []}]})
+    _assert_dies_naming(convert, tmp_path, root, bad.name, "turnId")
+
+
+def test_request_turn_id_with_traversal_is_refused_before_any_write(convert, tmp_path):
+    root = _standard_session(tmp_path)
+    bad = _write(root / "requests" / "evil.json", {"turnId": "../x", "shown": {}})
+    _assert_dies_naming(convert, tmp_path, root, bad.name, "turnId")
+
+
+def test_arm_name_with_traversal_is_refused_before_any_write(convert, tmp_path):
+    root = _session(tmp_path)
+    step = _step(0, {"thinking_tail": ["ob_0001"]})
+    step["arms"]["../../evil"] = _arm("../../evil", ["ob_0002"])
+    bad = _put_step(root, step)
+    _assert_dies_naming(convert, tmp_path, root, bad.name, "arm")
+
+
+def test_unknown_arm_negative_index_and_bad_blind_letter_are_refused(convert, tmp_path):
+    cases = [
+        (lambda st: st["arms"].__setitem__("not_an_arm", _arm("not_an_arm", ["ob_0001"])), "arm"),
+        (lambda st: st.__setitem__("index", -1), "index"),
+        (lambda st: st.__setitem__("armBlind", {"a": "thinking_tail", "B": "thinking_full"}), "armBlind"),
+        (lambda st: st.__setitem__("armBlind", {"A": "../evil", "B": "thinking_full"}), "armBlind"),
+    ]
+    for n, (mutate, field) in enumerate(cases):
+        sub = tmp_path / f"case{n}"
+        sub.mkdir()
+        root = _session(sub)
+        step = _step(0, {"thinking_tail": ["ob_0001"], "thinking_full": ["ob_0002"]})
+        mutate(step)
+        bad = _write(root / "steps" / "x.json", step)
+        _assert_dies_naming(convert, sub, root, bad.name, field)
+
+
+def test_valid_session_still_converts_control(convert, tmp_path):
+    root = _standard_session(tmp_path)
+    summary = convert.convert(root, tmp_path / "out")
+    assert summary["test_rrus_written"] == 4 and summary["goldens_written"] == 1
+
+
+def test_eval_rejects_a_test_rru_the_converter_would_have_refused(evaluator, tmp_path):
+    gdir, tdir, _, rru = _eval_fixture(tmp_path)
+    bad = rru("../../evil", ["ob_0001"])
+    _write(tdir / "bad_arm.json", bad)
+    with pytest.raises(SystemExit) as exc:
+        evaluator.evaluate(str(gdir), str(tdir), None)
+    assert "bad_arm.json" in str(exc.value) and "arm" in str(exc.value)
+    (tdir / "bad_arm.json").unlink()
+    _write(tdir / "bad_q.json", rru("arm_x", ["ob_0001"], qid="../../q"))
+    with pytest.raises(SystemExit) as exc:
+        evaluator.evaluate(str(gdir), str(tdir), None)
+    assert "bad_q.json" in str(exc.value) and "query_id" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# output permissions: files 0600, dirs 0700, a shared --out is refused
+# ---------------------------------------------------------------------------
+
+posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits are not meaningful here")
+
+
+def _modes(root: Path):
+    return [(p, p.stat().st_mode & 0o777, p.is_dir()) for p in [root, *root.rglob("*")]]
+
+
+@posix_only
+def test_converter_outputs_are_0600_files_in_0700_dirs(convert, tmp_path):
+    old = os.umask(0o022)
+    try:
+        out = tmp_path / "out"
+        convert.convert(_standard_session(tmp_path), out)
+    finally:
+        os.umask(old)
+    entries = _modes(out)
+    assert len(entries) > 5
+    for path, mode, is_dir in entries:
+        assert mode == (0o700 if is_dir else 0o600), f"{path} is {oct(mode)}"
+
+
+@posix_only
+def test_preexisting_shared_out_is_refused_naming_path_and_mode(convert, tmp_path):
+    root = _standard_session(tmp_path)
+    out = tmp_path / "shared"
+    out.mkdir()
+    os.chmod(out, 0o755)
+    with pytest.raises(SystemExit) as exc:
+        convert.convert(root, out)
+    assert str(out) in str(exc.value) and "0o755" in str(exc.value)
+    assert list(out.iterdir()) == []
+
+
+@posix_only
+def test_overwrite_rerun_keeps_modes(convert, tmp_path):
+    root = _standard_session(tmp_path)
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    convert.convert(root, out, overwrite=True)
+    for path, mode, is_dir in _modes(out):
+        assert mode == (0o700 if is_dir else 0o600), f"{path} is {oct(mode)}"
+
+
+@posix_only
+def test_eval_report_is_0600(evaluator, tmp_path):
+    gdir, tdir, pairs, _ = _eval_fixture(tmp_path)
+    report = tmp_path / "report.md"
+    old = os.umask(0o022)
+    try:
+        evaluator.main(["--golden", str(gdir), "--test", str(tdir), "--out", str(report)])
+        evaluator.main(["--golden", str(gdir), "--test", str(tdir), "--out", str(report)])  # replace
+    finally:
+        os.umask(old)
+    assert report.stat().st_mode & 0o777 == 0o600
+
+
+# ---------------------------------------------------------------------------
+# trailing-newline bypass: "$" matches before a final newline; checks must fullmatch
+# ---------------------------------------------------------------------------
+
+NL = chr(10)
+
+
+def test_step_turn_id_with_trailing_newline_is_refused(convert, tmp_path):
+    root = _session(tmp_path)
+    bad = _write(root / "steps" / "nl-000.json", _step(0, {"tool_input": ["ob_0001"]}, turn="abc" + NL))
+    _assert_dies_naming(convert, tmp_path, root, bad.name, "turnId")
+
+
+def test_rating_turn_id_with_trailing_newline_is_refused(convert, tmp_path):
+    root = _standard_session(tmp_path)
+    bad = _write(root / "ratings" / "nl-1.json",
+                 {"ts": 1, "sessionId": "s", "turnId": "abc" + NL, "steps": [{"index": 3, "good": []}]})
+    _assert_dies_naming(convert, tmp_path, root, bad.name, "turnId")
+
+
+def test_blind_letter_with_trailing_newline_is_refused(convert, tmp_path):
+    root = _session(tmp_path)
+    step = _step(0, {"thinking_tail": ["ob_0001"], "thinking_full": ["ob_0002"]})
+    step["armBlind"] = {"A" + NL: "thinking_tail", "B": "thinking_full"}
+    bad = _write(root / "steps" / "x.json", step)
+    _assert_dies_naming(convert, tmp_path, root, bad.name, "armBlind")
+
+
+def test_eval_rejects_trailing_newline_ids(evaluator, tmp_path):
+    gdir, tdir, _, rru = _eval_fixture(tmp_path)
+    _write(tdir / "nl_q.json", rru("arm_x", ["ob_0001"], qid="abc" + NL))
+    with pytest.raises(SystemExit) as exc:
+        evaluator.evaluate(str(gdir), str(tdir), None)
+    assert "nl_q.json" in str(exc.value)
+    (tdir / "nl_q.json").unlink()
+    _write(tdir / "nl_arm.json", rru("arm_x" + NL, ["ob_0001"]))
+    with pytest.raises(SystemExit) as exc:
+        evaluator.evaluate(str(gdir), str(tdir), None)
+    assert "nl_arm.json" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# querySource / envelope travel into RRU metadata; eval splits by querySource
+# ---------------------------------------------------------------------------
+
+
+def _source_session(tmp_path: Path) -> Path:
+    root = _session(tmp_path)
+    s3 = _step(3, {"thinking_tail": ["ob_0001"], "thinking_full": ["ob_0002"]}, querySource="thinking", visibleChars=50)
+    s4 = _step(4, {"thinking_tail": ["ob_0003"], "thinking_full": ["ob_0004"]}, querySource="visible", visibleChars=700)
+    s4["arms"]["thinking_full"]["envelope"] = "result-string"
+    _put_step(root, s3)
+    _put_step(root, s4)
+    _put_rating(root, [{"index": 3, "good": ["ob_0001"]}, {"index": 4, "good": ["ob_0003"]}])
+    return root
+
+
+def test_query_source_visible_chars_and_envelope_reach_rru_metadata(convert, tmp_path):
+    out = tmp_path / "out"
+    convert.convert(_source_session(tmp_path), out)
+    a = json.loads((out / "test" / f"{TURN}-3-thinking_tail.json").read_text())["metadata"]
+    b = json.loads((out / "test" / f"{TURN}-4-thinking_full.json").read_text())["metadata"]
+    assert (a["querySource"], a["visibleChars"], a["envelope"]) == ("thinking", 50, None)
+    assert (b["querySource"], b["visibleChars"], b["envelope"]) == ("visible", 700, "result-string")
+
+
+def test_eval_table_splits_steps_by_query_source(convert, evaluator, tmp_path):
+    out = tmp_path / "out"
+    convert.convert(_source_session(tmp_path), out)
+    result = evaluator.evaluate(str(out / "golden"), str(out / "test"), None)
+    assert result["arms"]["thinking_tail"]["by_query_source"] == {"thinking": 1, "visible": 1}
+    report = tmp_path / "r.md"
+    evaluator.main(["--golden", str(out / "golden"), "--test", str(out / "test"), "--out", str(report)])
+    assert "thinking: 1, visible: 1" in report.read_text()
+
+
+# ---------------------------------------------------------------------------
+# #3398: terminal / short-material steps are counted by reason, never dropped
+# ---------------------------------------------------------------------------
+
+def _skip_reason_session(tmp_path: Path) -> Path:
+    root = _standard_session(tmp_path)
+    _put_step(root, {"turnId": TURN, "index": 5, "skipped": "terminal", "terminal": True,
+                     "querySource": "visible", "armBlind": BLIND, "ts": 1})
+    _put_step(root, {"turnId": TURN, "index": 6, "skipped": "short-material", "terminal": False,
+                     "querySource": "visible", "armBlind": BLIND, "ts": 1})
+    return root
+
+
+def test_summary_counts_skipped_steps_by_reason_and_identities_hold(convert, tmp_path):
+    summary = convert.convert(_skip_reason_session(tmp_path), tmp_path / "out")
+    assert summary["steps_skipped_by_reason"] == {"terminal": 1, "short-material": 1}
+    assert summary["steps_terminal"] == 1
+    assert summary["steps_total"] == summary["steps_with_arms"] + 2
+    assert summary["steps_total"] == summary["steps_with_arms"] + sum(summary["steps_skipped_by_reason"].values())
+    assert summary["steps_terminal"] == summary["steps_skipped_by_reason"].get("terminal", 0)
+    on_disk = json.loads((tmp_path / "out" / "summary.json").read_text())
+    assert on_disk["steps_skipped_by_reason"] == {"terminal": 1, "short-material": 1}
+
+
+def test_summary_with_no_skipped_steps_has_an_empty_reason_map(convert, tmp_path):
+    summary = convert.convert(_standard_session(tmp_path), tmp_path / "out")
+    assert summary["steps_skipped_by_reason"] == {}
+    assert summary["steps_terminal"] == 0
+
+
+def test_terminal_row_that_ran_arms_fails_the_terminal_identity_naming_the_mismatch(convert, tmp_path):
+    # terminal:true AND arms present, no skipped: counted terminal but not skipped-as-terminal
+    root = _standard_session(tmp_path)
+    _put_step(root, _step(7, {"thinking_tail": ["ob_0005"]}, terminal=True))
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit) as err:
+        convert.convert(root, out)
+    message = str(err.value)
+    assert "completeness check FAILED" in message
+    assert "steps_terminal 1 != steps skipped as 'terminal' 0" in message
+    # the check runs after the test/golden/pairs files are written and before summary.json,
+    # so a failed run leaves no summary.json for probe_eval to read as a clean answer
+    assert not (out / "summary.json").exists()
+
+
+def test_failed_completeness_on_a_reused_out_leaves_no_stale_summary(convert, tmp_path):
+    # a clean run leaves summary.json; a later FAILED run into the same --out (overwrite)
+    # must not leave that old file behind for probe_eval to read as current
+    root = _standard_session(tmp_path)
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    assert (out / "summary.json").exists()
+    _put_step(root, _step(7, {"thinking_tail": ["ob_0005"]}, terminal=True))
+    with pytest.raises(SystemExit) as err:
+        convert.convert(root, out, overwrite=True)
+    assert "steps_terminal 1 != steps skipped as 'terminal' 0" in str(err.value)
+    assert not (out / "summary.json").exists()
+
+
+def test_eval_report_prints_steps_skipped_by_reason(convert, evaluator, tmp_path):
+    out = tmp_path / "out"
+    convert.convert(_skip_reason_session(tmp_path), out)
+    report = tmp_path / "r.md"
+    evaluator.main(["--golden", str(out / "golden"), "--test", str(out / "test"), "--out", str(report)])
+    lines = report.read_text().splitlines()
+    goldens_at = next(i for i, l in enumerate(lines) if l.startswith("goldens:"))
+    assert lines[goldens_at + 1] == "steps skipped by reason: terminal 1 · short-material 1"
+
+
+def test_eval_report_says_none_for_no_skipped_steps(convert, evaluator, tmp_path):
+    out = tmp_path / "out"
+    convert.convert(_standard_session(tmp_path), out)
+    report = tmp_path / "r.md"
+    evaluator.main(["--golden", str(out / "golden"), "--test", str(out / "test"), "--out", str(report)])
+    assert "steps skipped by reason: none" in report.read_text().splitlines()
+
+
+UNKNOWN_LINE = ("steps skipped by reason: unknown "
+                "(summary.json absent or unreadable beside the test dir)")
+
+
+def _report_lines_with_summary(convert, evaluator, tmp_path: Path, summary_text) -> list[str]:
+    """Convert a session, replace summary.json with `summary_text` (None = delete it), report."""
+    out = tmp_path / "out"
+    convert.convert(_skip_reason_session(tmp_path), out)
+    if summary_text is None:
+        (out / "summary.json").unlink()
+    else:
+        (out / "summary.json").write_text(summary_text)
+    report = tmp_path / "r.md"
+    evaluator.main(["--golden", str(out / "golden"), "--test", str(out / "test"), "--out", str(report)])
+    return report.read_text().splitlines()
+
+
+@pytest.mark.parametrize("summary_text", [
+    None,                                   # summary.json missing
+    "{not json",                            # malformed
+    json.dumps([1, 2]),                     # list-valued
+    json.dumps({"steps_total": 3}),         # key absent
+    json.dumps({"steps_skipped_by_reason": [["terminal", 1]]}),  # key present, wrong type
+], ids=["missing", "malformed", "list", "key-absent", "key-wrong-type"])
+def test_eval_report_says_unknown_never_none_when_the_summary_cannot_answer(
+        convert, evaluator, tmp_path, summary_text):
+    lines = _report_lines_with_summary(convert, evaluator, tmp_path, summary_text)
+    assert UNKNOWN_LINE in lines
+    assert "steps skipped by reason: none" not in lines
+
+
+def test_eval_report_says_none_for_an_empty_reason_map_in_summary_json(convert, evaluator, tmp_path):
+    lines = _report_lines_with_summary(convert, evaluator, tmp_path, json.dumps({"steps_skipped_by_reason": {}}))
+    assert "steps skipped by reason: none" in lines
+    assert UNKNOWN_LINE not in lines
+
+
+def test_short_proxy_material_arm_skip_is_status_skipped_and_excluded_from_scoring(convert, evaluator, tmp_path):
+    root = _session(tmp_path)
+    step = _step(3, {"thinking_tail": ["ob_0001"], "thinking_full": ["ob_0002"]})
+    step["arms"]["thinking_full"] = {"arm": "thinking_full", "ms": 0, "skipped": "short-proxy-material"}
+    _put_step(root, step)
+    _put_rating(root, [{"index": 3, "good": ["ob_0001"], "noise": []}])
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    meta = json.loads((out / "test" / f"{TURN}-3-thinking_full.json").read_text())["metadata"]
+    assert (meta["status"], meta["skipped"]) == ("skipped", "short-proxy-material")
+    result = evaluator.evaluate(str(out / "golden"), str(out / "test"), None)
+    assert result["arms"]["thinking_full"]["excluded_arm_runs"] == 1
+    assert result["arms"]["thinking_full"]["n_steps"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Static guard (#3378): no real-async hop in the hook path
+# ---------------------------------------------------------------------------
+# The mods-recall hook step job once awaited crypto.subtle.digest, a real-async
+# hop the test kit's fake clock cannot settle -> a timing flake. This guard
+# keeps the cause class out: it scans hook SOURCE (not *.test.ts) with comments
+# stripped, so a comment that names the thing we avoid does not trip it.
+# kit.ts is included: it holds no timer/fetch/subtle token today, so there is
+# no reason to exempt it. Out of scope: `new Promise(` wrapping a timer.
+
+_REAL_ASYNC_TOKENS = ("crypto.subtle", "setTimeout(", "setInterval(", "fetch(")
+_HOOKS_DIR = PROBE_DIR / "hooks"
+
+
+def _strip_ts_comments(src: str) -> str:
+    """Blank out // and /* */ comments, keeping every newline (line numbers hold).
+
+    String-aware for '...', "..." and `...` so a '//' inside a literal is not a
+    comment. Does not model regex literals or template ${} nesting; hook source
+    has none that matter (a miss there fails loud on the green run, not silent).
+    """
+    out, i, n, quote = [], 0, len(src), None
+    while i < n:
+        c, two = src[i], src[i:i + 2]
+        if quote:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(src[i + 1])
+                i += 1
+            elif c == quote:
+                quote = None
+        elif two == "//":
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        elif two == "/*":
+            end = src.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            out.append("".join(ch for ch in src[i:end] if ch == "\n"))
+            i = end
+            continue
+        else:
+            if c in "'\"`":
+                quote = c
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _hook_sources() -> list[Path]:
+    return sorted(p for p in _HOOKS_DIR.glob("*.ts") if not p.name.endswith(".test.ts"))
+
+
+def test_hook_source_has_no_real_async_hop():
+    files = _hook_sources()
+    scanned = [p.name for p in files]
+    # zero files must be distinguishable from zero hits (a renamed dir must not pass vacuously)
+    assert files, f"no hook source found under {_HOOKS_DIR} (scanned: {scanned})"
+    hits = []
+    for p in files:
+        for lineno, line in enumerate(_strip_ts_comments(p.read_text()).splitlines(), 1):
+            hits.extend(f"{p.name}:{lineno}: {tok}" for tok in _REAL_ASYNC_TOKENS if tok in line)
+    assert not hits, f"real-async hop in the hook path: {hits} (scanned: {scanned})"
+
+
+# ---------------------------------------------------------------------------
+# #3458 section B: the live routes (R = prompt_surface, T = tool_recall)
+#
+# Contract-first: these cells were written BEFORE the converter / eval changes.
+# The join file `route-joins/<turnId>.json` is what hooks/rating.ts writes at
+# turn.complete; the ledger line shape is #3458 section A's contract.
+# ---------------------------------------------------------------------------
+
+ROUTE_FIRE_KEY = "Read:b2b3bcf85e6c8ba9"
+
+
+def _ledger_line(route: str, fire_key: str, cands: list[tuple], shown: list[str], **extra) -> dict:
+    """cands: (id, similarity, utility) in the route's own ranked order."""
+    line = {
+        "ts": 1000, "route": route, "session_id": "s", "fire_key": fire_key,
+        "query": f"live query of {route}",
+        "candidates": [
+            {"id": i, "type": "observation", "rank": r + 1, "similarity": sim,
+             "importance_score": 0.2, "utility": util, "composite_score": 0.5,
+             "match_type": "semantic", "recall_turn": 7, "created_at": "2026-10-01T00:00:00Z",
+             "in_context": False}
+            for r, (i, sim, util) in enumerate(cands)
+        ],
+        "missing_signals": [], "shown": shown, "cut": {}, "source": "test",
+    }
+    line.update(extra)
+    return line
+
+
+def _put_route_join(root: Path, step_index: int, attaches: list[dict], *, turn: str = TURN,
+                    also_by_arm: dict | None = None) -> Path:
+    entry = {"routeOnlyIds": [], "alsoByArm": also_by_arm or {},
+             "routes": [{"route": a["line"]["route"], "letter": a["letter"],
+                         "fire_key": a["line"]["fire_key"], "line": a["line"],
+                         **({"unmatched": True} if a.get("unmatched") else {})} for a in attaches]}
+    path = root / "route-joins" / f"{turn}.json"
+    existing = json.loads(path.read_text()) if path.exists() else {"turnId": turn, "ts": 1, "steps": {}}
+    existing["steps"][str(step_index)] = entry
+    return _write(path, existing)
+
+
+def _route_session(tmp_path: Path):
+    root = _session(tmp_path)
+    _put_step(root, _step(1, {"thinking_tail": ["ob_0001", "ob_0002"], "tool_input": ["ob_0003"]},
+                          blind={"A": "thinking_tail", "D": "tool_input"}))
+    line = _ledger_line("tool_recall", ROUTE_FIRE_KEY,
+                        [("ob_0003", 0.6, 0.1), ("ob_0701", 0.55, 0.2), ("ob_0702", 0.4, None)],
+                        ["ob_0003", "ob_0701"], missing_signals=["utility"])
+    _put_route_join(root, 1, [{"line": line, "letter": "T"}], also_by_arm={"ob_0003": ["D"]})
+    # the request showed ob_0003 once (route cell, "also D"), so arm D's cell no longer lists it
+    _put_request(root, shown={"1": {"A": ["ob_0001", "ob_0002"], "D": [], "T": ["ob_0003", "ob_0701"]}})
+    _put_rating(root, [{"index": 1, "good": ["ob_0701"], "noise": ["ob_0002"]}])
+    return root, line
+
+
+def test_rating_a_route_id_round_trips_into_a_golden_and_a_route_rru(convert, tmp_path):
+    root, line = _route_session(tmp_path)
+    out = tmp_path / "out"
+    summary = convert.convert(root, out)
+    golden = _golden_by_id(out, f"q_{Q8}-s1.json")
+    assert golden["ob_0701"]["grading"]["relevance"] == 2  # the route-only id the agent rated good
+    assert "notes" not in golden["ob_0701"]  # surfaced by the route, not "unsurfaced"
+    assert golden["ob_0702"]["notes"] == "unshown"  # in the ledger candidates, never shown, never rated
+    assert summary["goldens_written"] == 1 and summary["steps_rated"] == 1
+
+    rru = json.loads((out / "test" / f"{TURN}-1-route-tool_recall-0.json").read_text())
+    md = rru["metadata"]
+    assert md["arm"] == "route:tool_recall" and md["armLetter"] == "T"
+    assert md["shownIds"] == ["ob_0003", "ob_0701"]  # the ledger's shown
+    assert md["missing_signals"] == ["utility"]
+    assert md["fire_key"] == ROUTE_FIRE_KEY
+    assert rru["query_text"] == "live query of tool_recall"
+    # ranking = the ledger's FULL candidate order, recorded signals carried per item
+    assert [n["id"] for n in rru["ranked_nodes"]] == ["ob_0003", "ob_0701", "ob_0702"]
+    assert [n["rank"] for n in rru["ranked_nodes"]] == [1, 2, 3]
+    assert rru["ranked_nodes"][1]["signals"]["similarity"] == 0.55
+    assert rru["ranked_nodes"][2]["signals"]["utility"] is None
+    assert "id" not in rru["ranked_nodes"][0]["signals"]
+    assert summary["test_rrus_written"] == 3  # 2 arm RRUs + 1 route RRU
+
+
+def test_arm_shown_ids_include_ids_a_route_cell_listed_once_with_also(convert, tmp_path):
+    root, _ = _route_session(tmp_path)
+    out = tmp_path / "out"
+    convert.convert(root, out)
+    d = json.loads((out / "test" / f"{TURN}-1-tool_input.json").read_text())
+    # ob_0003 was removed from D's request cell and shown under T "·also D": D still showed it
+    assert d["metadata"]["shownIds"] == ["ob_0003"]
+    a = json.loads((out / "test" / f"{TURN}-1-thinking_tail.json").read_text())
+    assert a["metadata"]["shownIds"] == ["ob_0001", "ob_0002"]
+
+
+def test_unmatched_route_flag_is_carried_into_the_route_rru(convert, tmp_path):
+    root = _session(tmp_path)
+    _put_step(root, _step(0, {"thinking_tail": ["ob_0001"]}, blind={"A": "thinking_tail"}))
+    line = _ledger_line("tool_recall", "Read:0000000000000000", [("ob_0801", 0.5, 0.1)], ["ob_0801"])
+    _put_route_join(root, 0, [{"line": line, "letter": "T", "unmatched": True}])
+    convert.convert(root, tmp_path / "out")
+    rru = json.loads((tmp_path / "out" / "test" / f"{TURN}-0-route-tool_recall-0.json").read_text())
+    assert rru["metadata"]["unmatched"] is True
+
+
+def test_prompt_surface_route_rru_is_named_for_its_route(convert, tmp_path):
+    root = _session(tmp_path)
+    _put_step(root, _step(0, {"thinking_tail": ["ob_0001"]}, blind={"A": "thinking_tail"}))
+    line = _ledger_line("prompt_surface", "abc123", [("ob_0801", 0.5, 0.1)], ["ob_0801"])
+    _put_route_join(root, 0, [{"line": line, "letter": "R"}])
+    convert.convert(root, tmp_path / "out")
+    rru = json.loads((tmp_path / "out" / "test" / f"{TURN}-0-route-prompt_surface-0.json").read_text())
+    assert rru["metadata"]["arm"] == "route:prompt_surface" and rru["metadata"]["armLetter"] == "R"
+
+
+def test_known_arms_accept_both_route_names_and_an_unsafe_name_is_still_refused(evaluator, tmp_path):
+    assert "route:prompt_surface" in evaluator._KNOWN_ARMS
+    assert "route:tool_recall" in evaluator._KNOWN_ARMS
+    gdir, tdir, _, rru = _eval_fixture(tmp_path)
+    _write(tdir / "r.json", rru("route:tool_recall", ["ob_0001"]))
+    evaluator.evaluate(str(gdir), str(tdir), None)  # accepted, scored as an arm
+    (tdir / "r.json").unlink()
+    _write(tdir / "bad.json", rru("route:../../evil", ["ob_0001"]))
+    with pytest.raises(SystemExit) as exc:
+        evaluator.evaluate(str(gdir), str(tdir), None)
+    assert "bad.json" in str(exc.value) and "arm" in str(exc.value)
+
+
+def test_route_arms_are_reported_in_the_existing_arm_table(evaluator, tmp_path):
+    gdir, tdir, _, rru = _eval_fixture(tmp_path)
+    _write(tdir / "r.json", rru("route:prompt_surface", ["ob_0001", "ob_0002"]))
+    result = evaluator.evaluate(str(gdir), str(tdir), None)
+    assert result["arms"]["route:prompt_surface"]["n_steps"] == 1
+    assert "| route:prompt_surface |" in evaluator.render_report(result)
+
+
+# ---- the signal sweep ------------------------------------------------------
+
+SWEEP_QID = "tsweep001-s1"
+
+
+def _sweep_fixture(tmp_path: Path, cands: list[tuple], rel: dict[str, int], route="route:tool_recall"):
+    """One golden + one route test RRU. cands: (id, similarity, utility) in ledger order;
+    rel: id -> golden relevance (absent = surfaced-unmarked = 1)."""
+    gdir, tdir = tmp_path / "golden", tmp_path / "test"
+    gdir.mkdir()
+    tdir.mkdir()
+    _write(gdir / f"q_{SWEEP_QID}.json", {
+        "query_id": SWEEP_QID, "query_text": "q",
+        "ranked_candidates": [{"id": i, "grading": {"relevance": rel.get(i, 1)}} for i, _, _ in cands],
+    })
+    _write(tdir / "route.json", {
+        "query_id": SWEEP_QID, "query_text": "q",
+        "ranked_nodes": [{"id": i, "rank": r + 1, "grading": None, "notes": "",
+                          "signals": {"similarity": sim, "utility": util, "rank": r + 1}}
+                         for r, (i, sim, util) in enumerate(cands)],
+        "metadata": {"arm": route, "armLetter": "T", "status": "ok", "model": "m", "sessionId": "s"},
+    })
+    return gdir, tdir
+
+
+def _rows(result, route="route:tool_recall"):
+    return {r["setting"]: r for r in result[route]}
+
+
+def test_sweep_floor_0_5_drops_the_one_noise_item_and_p_at_5_rises(evaluator, tmp_path):
+    # ob_0901 (noise) is the ONLY candidate below similarity 0.5; at floor 0.30 it sits in the top 5
+    cands = [("ob_0901", 0.45, 0.1), ("ob_0902", 0.80, 0.1), ("ob_0903", 0.70, 0.1),
+             ("ob_0904", 0.60, 0.1), ("ob_0905", 0.55, 0.1), ("ob_0906", 0.52, 0.1)]
+    rel = {"ob_0901": 0, "ob_0902": 2, "ob_0903": 2, "ob_0904": 2, "ob_0905": 2, "ob_0906": 2}
+    gdir, tdir = _sweep_fixture(tmp_path, cands, rel)
+    result = evaluator.signal_sweep(str(gdir), str(tdir))
+    rows = _rows(result)
+    assert rows["floor 0.30"]["precision_at_k_5"] == pytest.approx(0.8)
+    assert rows["floor 0.50"]["precision_at_k_5"] == pytest.approx(1.0)
+    assert rows["floor 0.50"]["precision_at_k_5"] > rows["floor 0.30"]["precision_at_k_5"]
+    # the sweep covers 0.30 .. 0.70 in steps of 0.05
+    assert [r["setting"] for r in result["route:tool_recall"] if r["setting"].startswith("floor")] == [
+        f"floor {0.30 + 0.05 * i:.2f}" for i in range(9)]
+    assert rows["floor 0.30"]["n_steps"] == 1
+
+
+def test_sweep_formula_reorders_as_computed_by_hand(evaluator, tmp_path):
+    # 0.6*similarity + 0.4*utility, by hand:
+    #   a 0.6*0.9+0.4*0.0=0.54   b 0.6*0.5+0.4*1.0=0.70   c 0.6*0.6+0.4*0.5=0.56
+    #   d 0.6*0.8+0.4*0.0=0.48   e 0.6*0.7+0.4*0.0=0.42   g 0.6*0.4+0.4*1.0=0.64   (g starts LAST)
+    # order by formula: b 0.70, g 0.64, c 0.56, a 0.54, d 0.48, e 0.42
+    cands = [("ob_0911", 0.9, 0.0), ("ob_0912", 0.5, 1.0), ("ob_0913", 0.6, 0.5),
+             ("ob_0914", 0.8, 0.0), ("ob_0915", 0.7, 0.0), ("ob_0916", 0.4, 1.0)]
+    ordered, nulls = evaluator.rerank_by_formula(
+        [{"id": i, "similarity": s, "utility": u} for i, s, u in cands], "0.6*similarity+0.4*utility")
+    assert [c["id"] for c in ordered] == ["ob_0912", "ob_0916", "ob_0913", "ob_0911", "ob_0914", "ob_0915"]
+    assert nulls == 0
+    rel = {"ob_0916": 2}  # the one good item: last in the ledger, 2nd by the formula
+    gdir, tdir = _sweep_fixture(tmp_path, cands, rel)
+    result = evaluator.signal_sweep(str(gdir), str(tdir), formula="0.6*similarity+0.4*utility")
+    rows = _rows(result)
+    assert rows["floor 0.30"]["precision_at_k_5"] == pytest.approx(0.0)  # ledger order: good item is 6th
+    assert rows["formula 0.6*similarity+0.4*utility"]["precision_at_k_5"] == pytest.approx(0.2)
+
+
+def test_sweep_formula_naming_an_absent_signal_is_refused_naming_it(evaluator, tmp_path):
+    gdir, tdir = _sweep_fixture(tmp_path, [("ob_0921", 0.5, 0.1)], {})
+    with pytest.raises(SystemExit) as exc:
+        evaluator.signal_sweep(str(gdir), str(tdir), formula="similarity + stickiness")
+    assert "stickiness" in str(exc.value)
+
+
+def test_sweep_formula_syntax_and_calls_outside_the_allowlist_are_refused(evaluator, tmp_path):
+    gdir, tdir = _sweep_fixture(tmp_path, [("ob_0921", 0.5, 0.1)], {})
+    for bad in ("similarity +", "__import__('os').system('true')", "similarity.__class__"):
+        with pytest.raises(SystemExit):
+            evaluator.signal_sweep(str(gdir), str(tdir), formula=bad)
+
+
+def test_sweep_formula_deep_power_nesting_is_refused_and_shallow_is_allowed(evaluator, tmp_path):
+    gdir, tdir = _sweep_fixture(tmp_path, [("ob_0922", 0.5, 0.1)], {})
+    # left-nested: every exponent is a small constant, yet the value explodes with depth
+    with pytest.raises(SystemExit, match="nests"):
+        evaluator.signal_sweep(str(gdir), str(tdir), formula="((((9**10)**10)**10)**10)**10")
+    with pytest.raises(SystemExit):
+        evaluator.signal_sweep(str(gdir), str(tdir), formula="9**10**10")  # right operand not a constant
+    # three levels and the ordinary small powers still parse
+    evaluator.signal_sweep(str(gdir), str(tdir), formula="((similarity**2)**2)**2")
+    evaluator.signal_sweep(str(gdir), str(tdir), formula="similarity**2 + utility**3")
+
+
+def test_sweep_null_signal_is_zero_and_counted_in_null_signal_rows(evaluator, tmp_path):
+    cands = [("ob_0931", 0.9, None), ("ob_0932", 0.5, 0.9), ("ob_0933", 0.6, None)]
+    ordered, nulls = evaluator.rerank_by_formula(
+        [{"id": i, "similarity": s, "utility": u} for i, s, u in cands], "utility")
+    assert [c["id"] for c in ordered] == ["ob_0932", "ob_0931", "ob_0933"]  # nulls score 0, ledger order kept among ties
+    assert nulls == 2
+    gdir, tdir = _sweep_fixture(tmp_path, cands, {"ob_0932": 2})
+    rows = _rows(evaluator.signal_sweep(str(gdir), str(tdir), formula="utility"))
+    assert rows["formula utility"]["null_signal_rows"] == 2
+    assert rows["floor 0.30"]["null_signal_rows"] == 0  # similarity is recorded on every candidate
+
+
+def test_sweep_cli_prints_one_table_per_route_and_formula_needs_signal_sweep(evaluator, tmp_path):
+    gdir, tdir = _sweep_fixture(tmp_path, [("ob_0941", 0.9, 0.1), ("ob_0942", 0.4, 0.1)], {"ob_0941": 2})
+    out = tmp_path / "sweep.md"
+    assert evaluator.main(["--golden", str(gdir), "--test", str(tdir), "--out", str(out),
+                           "--signal-sweep", "--formula", "similarity"]) == 0
+    text = out.read_text()
+    assert "## route:tool_recall" in text and "null_signal_rows" in text and "floor 0.70" in text
+    with pytest.raises(SystemExit):
+        evaluator.main(["--golden", str(gdir), "--test", str(tdir), "--out", str(tmp_path / "x.md"),
+                        "--formula", "similarity"])

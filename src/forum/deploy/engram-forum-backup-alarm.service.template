@@ -1,0 +1,45 @@
+# ENGRAM forum DB backup — failure alarm (systemd --user oneshot) TEMPLATE
+#
+# >>>TEMPLATE-ONLY (install-forum-service.sh strips this block when rendering)
+#     {{FORUM_HOME}} is a placeholder. install-forum-service.sh renders it to the
+#     forum's service dir (--service-dir) and installs the result as
+#     engram-forum-backup-alarm.service, on every run.
+# <<<TEMPLATE-ONLY
+#
+# Started ONLY by engram-forum-backup.service's OnFailure= (#3276). Posts one
+# forum thread "forum backup FAILED <date>" with the failed unit's last 20
+# journal lines, @mentioning the seats in FORUM_BACKUP_ALARM_MENTION (the
+# mention monitor is what reaches a seat in real time).
+#
+# Deliberately NO [Install] section: nothing may start this unit at login or
+# boot, or it would post a false alarm every time. If the post itself fails
+# (forum down) this unit exits non-zero and shows in:
+#   systemctl --user --failed
+#
+# Per-install settings (Environment= lines, or a drop-in):
+#   FORUM_BACKUP_ALARM_MENTION   forum agent names to @mention (space/comma
+#                                separated; quote the whole assignment when it
+#                                contains spaces). NOT set here: install-forum-
+#                                service.sh writes it into the drop-in
+#                                engram-forum-backup-alarm.service.d/mention.conf
+#                                (default: the installing admin's agent name).
+#                                Empty = the alarm still posts, without a mention.
+#                                The mention monitor matches the literal
+#                                `@<agent_name>` (src/forum/db.py get_mentions).
+#   FORUM_BACKUP_ALARM_AGENT     poster (default forum-backup, set below)
+#   FORUM_BACKUP_ALARM_CATEGORY  forum category slug (default: tools-hooks)
+#   FORUM_URL                    forum base URL (default http://localhost:5002)
+
+[Unit]
+Description=ENGRAM forum DB backup failure alarm (posts a forum thread)
+
+[Service]
+Type=oneshot
+# Post as a distinct agent: the forum excludes an agent's own posts from its
+# mentions, so posting as a mentioned seat would wake nobody.
+Environment=FORUM_BACKUP_ALARM_AGENT=forum-backup
+ExecStart={{FORUM_HOME}}/.venv/bin/python \
+    {{FORUM_HOME}}/app/tools/forum_backup.py \
+    --alarm --unit engram-forum-backup.service
+StandardOutput=journal
+StandardError=journal

@@ -7,13 +7,13 @@ reads (nodes: id/is_current/superseded_by; edges:
 source_id/target_id/relation).
 
 Coverage:
-  1. Clean graph (no dag=True edges at all) -> cycle_found False.
-  2. A genuine acyclic chain over dag=True relations -> cycle_found False.
+  1. Clean graph (no acyclicity-family edges at all) -> cycle_found False.
+  2. A genuine acyclic chain over acyclicity-family relations -> cycle_found False.
   3. Borges's exact construction (PR #2342 round-1 finding, the motivating
      case for #2357): base -> P, X derives_from P, P' derives_from X
      (legal — X is unmarked at that moment), supersede P -> P' (modeled here
      as a plain `supersedes` edge, since this module doesn't care which
-     dag=True relation forms the cycle), then acknowledge X (X
+     acyclicity-family relation forms the cycle), then acknowledge X (X
      acknowledged_derives_from P') — closes X -> P' -> X. Must report
      cycle_found True with a path containing both X and P'.
   4. CURRENT-ONLY: a cycle that exists solely among non-current
@@ -22,9 +22,9 @@ Coverage:
      2026-08-28 ruling on #2300 Defect 2): supersede/retract is how a real
      violation gets fixed, so counting non-current state could never let
      this metric register progress.
-  5. Control: a relation NOT in DAG_RELATIONS (e.g. `about`, dag=False)
+  5. Control: a relation NOT in DAG_RELATIONS (e.g. `about`, dag_family None)
      forming a cycle must NOT be flagged — proves the walk is scoped to
-     `dag: True` relations, not every edge in the graph.
+     acyclicity-family relations, not every edge in the graph.
   6. Control: monkeypatching DAG_RELATIONS empty makes a genuine cycle
      invisible — proves the checker actually walks the relation set it's
      given rather than being vacuously clean by construction.
@@ -332,7 +332,7 @@ def test_vanilla_supersedes_edge_not_flagged():
 
 def test_vanilla_retracts_edge_not_flagged():
     """#2943 sibling: same phantom-self-loop bug, on `retracts` instead of
-    `supersedes` -- both relations are dag=True and both are the historical
+    `supersedes` -- both relations are in the grounding family and both are the historical
     record that defines node currency, so both hit the same collapse."""
     conn = _new_conn()
     _add_node(conn, "a", is_current=1)
@@ -444,11 +444,11 @@ def test_genuine_raw_self_edge_still_caught():
 
 
 def test_non_dag_relation_cycle_not_flagged():
-    """A cycle over a relation NOT in DAG_RELATIONS (dag=False) must not be
-    flagged — proves the walk is scoped to dag=True relations specifically,
-    not every edge in the graph."""
+    """A cycle over a relation NOT in DAG_RELATIONS (dag_family None) must not be
+    flagged — proves the walk is scoped to acyclicity-family relations
+    specifically, not every edge in the graph."""
     assert "about" not in core.DAG_RELATIONS, (
-        "test premise: 'about' must be dag=False for this control to mean "
+        "test premise: 'about' must have dag_family None for this control to mean "
         "anything"
     )
     conn = _new_conn()

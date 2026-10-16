@@ -88,7 +88,7 @@ def test_axiom_is_claim_bearing():
 
 
 def test_axiom_with_context():
-    """Axiom with context_ids should create cites edges."""
+    """Axiom with context_ids creates `about` edges (cites is observation->evidence only, #2243)."""
     client = fresh_client()
     ob = client.call("engram_add_observation", {
         "url": "https://example.com/test",
@@ -105,10 +105,11 @@ def test_axiom_with_context():
     })
     assert ob["observation_id"] in ax["context_nodes"]
     sub = client.call("engram_get_subgraph", {"node_id": ax["axiom_id"]})
-    # topology: look for outgoing cites edges from the axiom
+    # topology: look for outgoing about edges from the axiom
     topo_entries = sub["topology"].get(ax["axiom_id"], [])
-    cites = [e for e in topo_entries if e["relation"] == "cites" and e["direction"] == "outgoing"]
-    assert len(cites) == 1
+    about = [e for e in topo_entries if e["relation"] == "about" and e["direction"] == "outgoing"]
+    assert len(about) == 1
+    assert not [e for e in topo_entries if e["relation"] == "cites"]
 
 
 # ── Definition tests ──────────────────────────────────────────────────────

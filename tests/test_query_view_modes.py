@@ -214,6 +214,22 @@ def test_query_return_debug_preserves_legacy_shape():
         assert "id" in first
 
 
+def test_query_default_tiered_does_not_leak_composite_score_or_signals():
+    """#3458: composite_score is additive on return_debug rows only; the
+    default tiered engram_query entries must carry neither it nor `signals`."""
+    _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
+    for i in range(5):
+        _add_observation(obs, f"Leak check claim number {i} about gamma protocol")
+
+    r = json.loads(qry._query_impl(query="gamma protocol", top_k=5))
+    results = r["results"]
+    assert len(results) > 0, "Expected at least one result"
+    for entry in results:
+        assert "composite_score" not in entry, f"composite_score leaked: {entry}"
+        assert "signals" not in entry, f"signals leaked: {entry}"
+
+
 def test_query_return_debug_composite_score_present():
     """When return_debug=True and search has results with debug, composite_score appears."""
     _fresh_mods()

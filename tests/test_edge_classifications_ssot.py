@@ -47,7 +47,12 @@ def test_dag_exempt_matches_pre_refactor_set():
     # acknowledged in EDGE_TIER_DIVERGENCE_ACK.
     expected = frozenset({"contradicts", "about", "exemplifies", "instantiates",
                           "resolves", "tensions", "serves",
-                          "acknowledged_derives_from", "generalizes"})
+                          "acknowledged_derives_from", "generalizes",
+                          # `bears_on` added (#3615): question -> claim, the
+                          # answer's direction is unknown when the edge is
+                          # written and the answer may pre-date the question's
+                          # filing, so it is exempt from creation-order.
+                          "bears_on"})
     # Allow the new constant to add `cites` ONLY if a separate ob/dv
     # cites the design call that allowed it.
     assert DAG_EXEMPT_RELATIONS == expected, (
@@ -61,7 +66,8 @@ def test_removable_matches_pre_refactor_set():
     # `generalizes` removable per #2753 epic WS1, D1 — same shape (a pure
     # routing/classification edge, over-applied wiring must be correctable).
     expected = frozenset({"about", "tensions", "subtask_of", "serves", "exemplifies",
-                          "instantiates", "generalizes"})
+                          "instantiates", "generalizes",
+                          "bears_on"})  # #3615: over-applied wiring is correctable
     assert _REMOVABLE_EDGE_RELATIONS == expected, (
         f"_REMOVABLE_EDGE_RELATIONS drift: got {sorted(_REMOVABLE_EDGE_RELATIONS)}, "
         f"expected {sorted(expected)}."
@@ -69,7 +75,7 @@ def test_removable_matches_pre_refactor_set():
 
 def test_all_relations_have_full_field_set():
     """Every entry has all 6 fields set (catches typos / partial edits)."""
-    expected_fields = {"cascade", "temporal_causal", "dag", "removable",
+    expected_fields = {"cascade", "temporal_causal", "dag_family", "removable",
                        "addable_after_creation", "provenance"}
     for relation, classification in EDGE_CLASSIFICATIONS.items():
         missing = expected_fields - set(classification.keys())
@@ -99,6 +105,8 @@ def test_no_unclassified_relations_in_schema():
         "supported_by", "tensions",
         "generalizes",  # #2753 (2026-09-10) — epic WS1, D1: general ->
                          # specific abstraction/classification edge.
+        "bears_on",     # #3615 — question -> claim: the eventual answer will
+                         # count for or against the claim. Non-cascade.
     }
     assert set(EDGE_CLASSIFICATIONS.keys()) == known_relations, (
         f"Drift between EDGE_CLASSIFICATIONS and known relations: "

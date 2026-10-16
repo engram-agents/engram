@@ -28,11 +28,12 @@ import os
 import sqlite3
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import engram_core as core
+import engram_restamp
 from engram_log_emitter import Emitter, emit_if_initialized
 
 # alpha #2574 WS5: engram_telemetry_store.py ships at tier=convenience (WS1's
@@ -137,9 +138,16 @@ PATTERN_QUERY_PRESETS: dict[str, dict[str, float | int]] = {
     # Whether to make this dict config-loadable (Tier 2 in issue #76's tier
     # model) vs leave hardcoded (Tier 3) is the open design question — for
     # now the dict stays here, values calibrated against v4 evidence.
-    "high_precision": {"cosine_threshold": 0.65, "top_k": 5,  "min_confidence": 0.70},
-    "balanced":       {"cosine_threshold": 0.55, "top_k": 15, "min_confidence": 0.50},
-    "high_recall":    {"cosine_threshold": 0.45, "top_k": 30, "min_confidence": 0.00},
+    #
+    # recent_window_days (#3154) is read ONLY by cornerstone_candidate: the window
+    # (in days) over which citations gained count toward its ranking. Same
+    # tighter/looser bracketing as the other knobs: 30 / 60 / 120.
+    "high_precision": {"cosine_threshold": 0.65, "top_k": 5,  "min_confidence": 0.70,
+                       "recent_window_days": 30},
+    "balanced":       {"cosine_threshold": 0.55, "top_k": 15, "min_confidence": 0.50,
+                       "recent_window_days": 60},
+    "high_recall":    {"cosine_threshold": 0.45, "top_k": 30, "min_confidence": 0.00,
+                       "recent_window_days": 120},
 }
 
 
@@ -175,7 +183,7 @@ def _pattern_telemetry_log(pattern_name: str, preset: str,
 def _pattern_contradiction_obsolescence_ready(
     conn, preset_params: dict, **_filters
 ) -> list[dict]:
-    """Active contradictions where one side is retracted/superseded.
+    """Unsettled (active or partially_resolved) contradictions where one side is retracted/superseded.
 
     A contradiction with one side already obsolete is resolution-by-
     obsolescence ready: the agent can write a derivation citing the
@@ -184,7 +192,7 @@ def _pattern_contradiction_obsolescence_ready(
     signal is.
 
     Score: 1.0 if exactly one side is non-current AND the contradiction
-    is still status='active'; 0.5 if both sides are non-current (likely
+    is still unsettled (active/partially_resolved); 0.5 if both sides are non-current (likely
     already moot but the contradiction node wasn't resolved); 0.0 if
     neither side is obsolete (returned only at high_recall).
 
@@ -194,10 +202,14 @@ def _pattern_contradiction_obsolescence_ready(
     threshold = float(preset_params.get("cosine_threshold", 0.50))
     top_k = int(preset_params.get("top_k", 15))
 
+    # Unsettled set (active + partially_resolved), shared with reflect (#3355);
+    # NOT the narrower "open" set of core._open_contradiction_ids.
     contradictions = conn.execute(
         "SELECT id, claim, status FROM nodes "
-        "WHERE type='contradiction' AND is_current=1 AND status='active' "
-        "ORDER BY id DESC"
+        "WHERE type='contradiction' AND is_current=1 "
+        f"AND status IN ({core._unsettled_contradiction_status_sql()}) "
+        "ORDER BY id DESC",
+        core.UNSETTLED_CONTRADICTION_STATUSES,
     ).fetchall()
 
     candidates: list[dict] = []
@@ -452,10 +464,7 @@ def _visible_protection_channels(
         (node_id,),
     ).fetchall()
     for (lmeta_json,) in lesson_rows:
-        try:
-            lmeta = json.loads(lmeta_json) if lmeta_json else {}
-        except (TypeError, json.JSONDecodeError):
-            lmeta = {}
+        lmeta = core._metadata_dict(lmeta_json)
         if lmeta.get("situation_pattern"):
             return ["situation_pattern"]
 
@@ -524,10 +533,7 @@ def _pattern_stale_load_bearing(
 
     candidates: list[dict] = []
     for nid, ntype, claim, imp_base, imp_score, recalls, meta_json in rows:
-        try:
-            meta = json.loads(meta_json) if meta_json else {}
-        except (TypeError, json.JSONDecodeError):
-            meta = {}
+        meta = core._metadata_dict(meta_json)
         # Protection-channel floor: skip nodes kept live by any channel other
         # than deliberate recall — their inflation gap is benign, not erosion.
         if _visible_protection_channels(conn, nid, meta, doc_text, registry_ids):
@@ -560,7 +566,7 @@ def _pattern_stale_load_bearing(
 def _pattern_cornerstone_candidate(
     conn, preset_params: dict, **_filters
 ) -> list[dict]:
-    """Heavily-cited observations/derivations that may warrant cornerstone anchoring.
+    """Observations/derivations being cited NOW that may warrant cornerstone anchoring.
 
     Candidate pool is **observations and derivations only** — emergent-practice
     nodes whose load-bearing role has accumulated through use. Axioms, goals,
@@ -569,11 +575,29 @@ def _pattern_cornerstone_candidate(
     an emergence signal — nominating them was the #180 false-positive. See
     the engram-* skills / MCP docstrings for the axiom/goal/cornerstone semantic distinctions.
 
-    A cornerstone candidate is a node that has been load-bearing in the
-    graph (cited by many derivations / observations) but isn't yet anchored
-    as a cornerstone. Score: importance_base × (1 + citation_count / 10).
-    Gating uses importance_base (time-invariant) so the threshold is stable
-    across turns.
+    What is measured (#3154): **citations gained inside a recent window**
+    (`recent_window_days` from the preset: 30 / 60 / 120), not lifetime
+    citations. The earlier score, importance_base x (1 + lifetime_cites/10),
+    was age-biased twice over: importance_base saturates (hundreds of nodes tie
+    at the same value, so a `LIMIT` on it kept whatever came first in storage
+    order, i.e. the oldest nodes), and with importance_base flat the score
+    reduced to lifetime citations, i.e. node age. Measured on a real graph, all
+    of the top 15 came from the oldest month and the dream-fairy category-4
+    scan returned the same set on every draw. Ranking by recent gain keeps an
+    old node **only if it is still being cited**; age itself is not penalised.
+
+    Counts are of DISTINCT, CURRENT citing sources ("claims resting on this
+    node now"): one source citing the same target by several relations counts
+    once, and a retracted/superseded citer (`is_current=0`) no longer rests on
+    anything, so it is not counted (its successor, if any, counts via its own
+    edge). `recent` counts a source if any of its qualifying edges falls inside
+    the window.
+
+    Gate: `recent >= min_recent_citations` (3). Lifetime citations are no
+    longer a gate. There is no pre-cap: eligibility and counts are computed in
+    one SQL aggregate over all eligible nodes.
+    Order (deterministic): recent DESC, lifetime DESC, created_at DESC, id ASC.
+    `score` is the recent count (kept for consumers).
 
     A node already wired to an existing cornerstone (any incoming edge whose
     source is a current cornerstone — e.g. a cornerstone's own `supported_by`
@@ -583,98 +607,110 @@ def _pattern_cornerstone_candidate(
     count would double-count the very relationship that disqualifies it
     (#1913).
 
-    Returns: list of {id, type, claim, score, importance_base, citation_count,
-    recall_count, suggested_action}.
+    The recency comparison is done on SQLite `datetime()` of both sides, not on
+    raw strings: `edges.created_at` is written as `...ffffff+00:00` in
+    production but legacy/hand-written rows carry `Z` or a space separator, and
+    a raw text compare against an ISO `T` cutoff misorders those. An
+    unparseable timestamp yields NULL, which is never >= cutoff (not recent).
+
+    Returns: list of {id, type, claim, score, importance_base,
+    recent_citation_count, citation_count (lifetime), recall_count,
+    suggested_action}.
     """
     top_k = int(preset_params.get("top_k", 15))
-    min_citations = 3  # below this, not load-bearing enough to anchor
+    min_recent_citations = 3  # below this, not being cited enough NOW to anchor
+    window_days = float(preset_params.get("recent_window_days", 60))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
 
+    # One aggregate, no per-node queries. Counts are COUNT(DISTINCT source) over
+    # current citing sources (the `src` join), so multi-relation duplicates and
+    # retracted/superseded citers do not inflate them.
+    #
+    # Anchored exclusion (NOT EXISTS) is deliberately relation-agnostic: ANY
+    # incoming edge from a current cornerstone disqualifies the candidate, not
+    # just the supported_by/cites/derives_from relations the citation count
+    # tallies. "Wired to a cornerstone" is what matters, not by which
+    # relation — a future edge type sourced from a cornerstone should
+    # disqualify too without needing this list updated in lockstep.
+    #
+    # #2255 colleague-review fix: the relation set in the JOIN below is a THIRD,
+    # deliberately distinct relation set from core.CITATION_SUPPORT_RELATIONS
+    # ({derives_from, supported_by}) — do not unify the two. This is
+    # cornerstone-candidate SCORING, not the uncited-observation check: it
+    # includes 'cites', which CITATION_SUPPORT_RELATIONS excludes on purpose
+    # (see that constant's own comment in engram_core.py). Unifying onto
+    # CITATION_SUPPORT_RELATIONS would drop 'cites' from the count
+    # entirely. Measured on two independent ENGRAM graphs, that removes
+    # roughly two-thirds of it (63% and 67%) — so cornerstone-candidate
+    # scoring would silently lose most of its citation signal and
+    # min_recent_citations would filter a different population. Do not state
+    # absolute edge counts here: they are install-specific (every ENGRAM
+    # graph has a different edge population) and would be wrong for
+    # every other reader — the two-graph agreement in direction is the
+    # portable fact, not either graph's number.
+    #
+    # #2252 W6 design decision: `predicted_by` is DELIBERATELY EXCLUDED
+    # from this tuple — do not add it back. Cornerstone candidacy asks
+    # whether an observation is LOAD-BEARING: whether other CLAIMS rest
+    # on it. Predictions are non-claim-bearing (#2252 Q1 FINAL). A
+    # prediction attached to an observation is a tracker, not a
+    # dependent claim, so it should never have counted as a load-bearing
+    # citation. The pre-split behaviour — where the pairing edge's
+    # `supported_by` name made it count here by accident, because it
+    # shared a literal with the real citation relations — was the bug;
+    # excluding `predicted_by` is the correction, not a regression.
+    #
+    # Known transient inconsistency, owned by W3: because the W6
+    # migration is additive (old `supported_by` pairing edges are never
+    # deleted, only paralleled with a new `predicted_by` edge), a
+    # migrated pre-W6 prediction's stale `supported_by` edge STILL
+    # counts toward its observation's citation counts here, while a
+    # newly-minted post-W6 prediction (predicted_by only) does not.
+    # This is a known artifact of the additive migration, not an
+    # oversight — it resolves when W3 retires the stale `supported_by`
+    # pairing edges.
     rows = conn.execute(
-        "SELECT id, type, claim, importance_base, recall_count "
-        "FROM nodes "
-        "WHERE is_current=1 "
-        "AND (type LIKE 'observation%' OR type = 'derivation') "
-        "AND COALESCE(importance_base, 0) > 0.7 "
-        "ORDER BY importance_base DESC LIMIT 50"
+        "SELECT n.id, n.type, n.claim, n.importance_base, n.recall_count, "
+        "       COUNT(DISTINCT e.source_id) AS lifetime_cites, "
+        "       COUNT(DISTINCT CASE WHEN datetime(e.created_at) >= datetime(:cutoff) "
+        "                           THEN e.source_id END) AS recent_cites "
+        "FROM nodes n "
+        "JOIN edges e ON e.target_id = n.id "
+        "     AND e.relation IN ('supported_by', 'cites', 'derives_from') "
+        "JOIN nodes src ON src.id = e.source_id AND src.is_current = 1 "
+        "WHERE n.is_current=1 "
+        "AND (n.type LIKE 'observation%' OR n.type = 'derivation') "
+        "AND COALESCE(n.importance_base, 0) > 0.7 "
+        "AND NOT EXISTS ("
+        "    SELECT 1 FROM edges a JOIN nodes c ON a.source_id = c.id "
+        "    WHERE a.target_id = n.id AND c.type='cornerstone' AND c.is_current=1"
+        ") "
+        "GROUP BY n.id "
+        "HAVING recent_cites >= :min_recent "
+        "ORDER BY recent_cites DESC, lifetime_cites DESC, n.created_at DESC, n.id ASC "
+        "LIMIT :top_k",
+        {"cutoff": cutoff, "min_recent": min_recent_citations, "top_k": top_k},
     ).fetchall()
 
     candidates: list[dict] = []
-    for nid, ntype, claim, imp_base, recalls in rows:
-        # Deliberately relation-agnostic: ANY incoming edge from a current
-        # cornerstone disqualifies the candidate, not just the
-        # supported_by/cites/derives_from relations the citation count below
-        # tallies. "Wired to a cornerstone" is what matters, not by which
-        # relation — a future edge type sourced from a cornerstone should
-        # disqualify too without needing this list updated in lockstep.
-        already_anchored = conn.execute(
-            "SELECT COUNT(*) FROM edges e "
-            "JOIN nodes n ON e.source_id = n.id "
-            "WHERE e.target_id=? AND n.type='cornerstone' AND n.is_current=1",
-            (nid,),
-        ).fetchone()[0]
-        if already_anchored:
-            continue
-        # #2255 colleague-review fix: this is a THIRD, deliberately distinct
-        # relation set from core.CITATION_SUPPORT_RELATIONS ({derives_from,
-        # supported_by}) — do not unify the two. This is cornerstone-candidate
-        # SCORING, not the uncited-observation check: it includes 'cites',
-        # which CITATION_SUPPORT_RELATIONS excludes on purpose (see that
-        # constant's own comment in engram_core.py). Unifying onto
-        # CITATION_SUPPORT_RELATIONS would drop 'cites' from the count
-        # entirely. Measured on two independent ENGRAM graphs, that removes
-        # roughly two-thirds of it (63% and 67%) — so cornerstone-candidate
-        # scoring would silently lose most of its citation signal and
-        # min_citations would filter a different population. Do not state
-        # absolute edge counts here: they are install-specific (every ENGRAM
-        # graph has a different edge population) and would be wrong for
-        # every other reader — the two-graph agreement in direction is the
-        # portable fact, not either graph's number.
-        #
-        # #2252 W6 design decision: `predicted_by` is DELIBERATELY EXCLUDED
-        # from this tuple — do not add it back. Cornerstone candidacy asks
-        # whether an observation is LOAD-BEARING: whether other CLAIMS rest
-        # on it. Predictions are non-claim-bearing (#2252 Q1 FINAL). A
-        # prediction attached to an observation is a tracker, not a
-        # dependent claim, so it should never have counted as a load-bearing
-        # citation. The pre-split behaviour — where the pairing edge's
-        # `supported_by` name made it count here by accident, because it
-        # shared a literal with the real citation relations — was the bug;
-        # excluding `predicted_by` is the correction, not a regression.
-        #
-        # Known transient inconsistency, owned by W3: because the W6
-        # migration is additive (old `supported_by` pairing edges are never
-        # deleted, only paralleled with a new `predicted_by` edge), a
-        # migrated pre-W6 prediction's stale `supported_by` edge STILL
-        # counts toward its observation's cite_count here, while a
-        # newly-minted post-W6 prediction (predicted_by only) does not.
-        # This is a known artifact of the additive migration, not an
-        # oversight — it resolves when W3 retires the stale `supported_by`
-        # pairing edges.
-        cite_count = conn.execute(
-            "SELECT COUNT(*) FROM edges WHERE target_id=? "
-            "AND relation IN ('supported_by', 'cites', 'derives_from')",
-            (nid,),
-        ).fetchone()[0]
-        if cite_count < min_citations:
-            continue
+    for nid, ntype, claim, imp_base, recalls, lifetime_cites, recent_cites in rows:
         imp_base = imp_base or 0.0
-        score = imp_base * (1 + cite_count / 10.0)
         candidates.append({
             "id": nid,
             "type": ntype,
             "claim": (claim[:160] + "...") if claim and len(claim) > 160 else claim,
-            "score": round(score, 3),
+            "score": recent_cites,
             "importance_base": round(imp_base, 3),
-            "citation_count": cite_count,
+            "recent_citation_count": recent_cites,
+            "citation_count": lifetime_cites,
             "recall_count": recalls or 0,
             "suggested_action": (
                 f"Consider engram_focus or engram_add_cornerstone for {nid} — "
-                f"{cite_count} downstream citations suggest it's load-bearing."
+                f"{recent_cites} distinct current citers in the last {window_days:g} days "
+                f"({lifetime_cites} lifetime) suggest it's load-bearing now."
             ),
         })
-
-    candidates.sort(key=lambda c: c["score"], reverse=True)
-    return candidates[:top_k]
+    return candidates
 
 
 def _pattern_tainted_still_valid(
@@ -850,7 +886,7 @@ def _get_min_queryable_importance(
         tier2_threshold = core._get_tier_threshold(conn, 2)
     row = conn.execute(
         "SELECT MIN(importance_score) FROM nodes "
-        "WHERE is_current = 1 AND importance_score > 0 "
+        f"WHERE {core._searchable_where_sql()} AND importance_score > 0 "
         "  AND importance_score >= ?",
         (max(0.0, tier2_threshold),),
     ).fetchone()
@@ -860,24 +896,15 @@ def _get_min_queryable_importance(
 
 
 def _refresh_recall(conn: sqlite3.Connection, node_ids: list[str]):
-    """Re-stamp recalled nodes with current turn's importance."""
-    mem = core._get_memory_config()
-    turn = mem.get("current_turn", 0)
-    decay_base = mem.get("decay_base", 1.014)
-    for nid in node_ids:
-        row = conn.execute(
-            "SELECT importance_base, recall_count FROM nodes WHERE id = ?",
-            (nid,),
-        ).fetchone()
-        if row:
-            new_score = core._compute_importance(
-                row["importance_base"] or 0.5, turn, decay_base
-            )
-            conn.execute(
-                """UPDATE nodes SET importance_score = ?, recall_turn = ?,
-                   recall_count = ? WHERE id = ?""",
-                (new_score, turn, (row["recall_count"] or 0) + 1, nid),
-            )
+    """Re-stamp recalled nodes with current turn's importance.
+
+    The restamp formula lives in engram_restamp.restamp (shared with the
+    prose-mention Stop hook, which passes count_recall=False); deliberate
+    recall is the caller that also increments recall_count.
+    """
+    engram_restamp.restamp(
+        conn, node_ids, count_recall=True, memory_config=core._get_memory_config()
+    )
     conn.commit()
 
 
@@ -1136,26 +1163,28 @@ def _build_inspect_recall_view(
     #   _RECALL_OMIT above, so it already passes through node_recall
     #   unconditionally (confirmed pre-existing; this was the "partly wired"
     #   case the issue itself names).
-    _raw_meta = node.get("metadata")
-    if _raw_meta:
-        try:
-            _meta = json.loads(_raw_meta) if isinstance(_raw_meta, str) else _raw_meta
-            if "quote_verified" in _meta:
-                node_recall["quote_verified"] = _meta["quote_verified"]
-            if node.get("type") == "derivation" and "warrant" in _meta and _meta["warrant"]:
-                node_recall["warrant"] = _meta["warrant"]
-            if node.get("type") == "person":
-                if _meta.get("pronouns"):
-                    node_recall["pronouns"] = _meta["pronouns"]
-                if _meta.get("relation"):
-                    node_recall["relation"] = _meta["relation"]
-                _moments = _meta.get("special_moments")
-                if isinstance(_moments, list) and _moments:
-                    _moment_text = _select_and_render_person_moment(conn, node_id)
-                    if _moment_text:
-                        node_recall["special_moment"] = _moment_text
-        except (json.JSONDecodeError, TypeError):
-            pass
+    # `_metadata_dict` hands back {} for a non-object / invalid blob (#3413),
+    # so there is nothing to promote and no dict op can crash.
+    _meta = core._metadata_dict(node.get("metadata"))
+    if "quote_verified" in _meta:
+        node_recall["quote_verified"] = _meta["quote_verified"]
+    # support_lost: set when a cited premise was retracted/superseded
+    # away (#3402). Promoted only when truthy, so a cleared flag
+    # (false) leaves no key.
+    if _meta.get("support_lost"):
+        node_recall["support_lost"] = True
+    if node.get("type") == "derivation" and "warrant" in _meta and _meta["warrant"]:
+        node_recall["warrant"] = _meta["warrant"]
+    if node.get("type") == "person":
+        if _meta.get("pronouns"):
+            node_recall["pronouns"] = _meta["pronouns"]
+        if _meta.get("relation"):
+            node_recall["relation"] = _meta["relation"]
+        _moments = _meta.get("special_moments")
+        if isinstance(_moments, list) and _moments:
+            _moment_text = _select_and_render_person_moment(conn, node_id)
+            if _moment_text:
+                node_recall["special_moment"] = _moment_text
 
     response: dict = {
         "node": node_recall,
@@ -1336,12 +1365,7 @@ def _extract_warnings(
                     "retraction_reason_excerpt": None,
                 })
                 continue
-            rmeta: dict = {}
-            if row["metadata"]:
-                try:
-                    rmeta = json.loads(row["metadata"])
-                except (json.JSONDecodeError, TypeError):
-                    rmeta = {}
+            rmeta = core._metadata_dict(row["metadata"])
             claim = row["claim"] or ""
             reason = rmeta.get("retraction_reason") or ""
             t_entries.append({
@@ -1648,9 +1672,7 @@ def _search_nodes(
     """
     # Default embed_query to query if not explicitly provided (backward compat).
     effective_embed_query = embed_query if embed_query is not None else query
-    type_filter = set(t.strip() for t in core._as_csv(types).split(",") if t.strip()) or None
-    if type_filter:
-        type_filter = {_TYPE_ALIASES.get(t, t) for t in type_filter}
+    type_filter = _parse_type_filter(types)
     tier2_threshold = core._get_tier_threshold(conn, 2)
 
     # --- Debug signal capture (pre-search) ---
@@ -1696,10 +1718,11 @@ def _search_nodes(
         # value. Previously hardcoded as top_k * 3 — became the binding
         # constraint at the old MMR_POOL_MULTIPLIER ≥ 3.
         fts_rows = conn.execute(
-            """SELECT n.*, fts.rank
+            f"""SELECT n.*, fts.rank
                FROM nodes_fts fts
                JOIN nodes n ON n.rowid = fts.rowid
                WHERE nodes_fts MATCH ?
+                 AND {core._not_search_excluded_sql('n')}
                ORDER BY fts.rank
                LIMIT ?""",
             (fts_query, pool_size * 3),
@@ -1758,7 +1781,7 @@ def _search_nodes(
     # search results. Used to apply the floor + multiplicative bump (alpha
     # #207/#208) when merging FTS hits with semantic hits.
     sim_lookup: dict[str, float] = {}
-    semantic_available = use_semantic and core._embedder.is_available() and core._get_embedding_config().get("enabled", True)
+    semantic_available = use_semantic and core._embedder.is_available()
     if semantic_available:
         # Overfetch semantic so FTS-hit similarities (if above floor) are
         # available for the bump computation. min_similarity=FTS_SIM_FLOOR
@@ -1972,12 +1995,19 @@ def _search_nodes(
     output = _mmr_rerank(output, top_k=top_k, mmr_lambda=core.MMR_LAMBDA)
 
     # Strip internal-only fields before returning to callers.
+    # #3458: keep the pre-MMR composite on the row as `composite_score` (the
+    # exact value used for ordering) so the surface signals can report it.
     for node in output:
-        node.pop("_composite", None)
+        node["composite_score"] = node.pop("_composite", None)
+        node["ranked"] = True  # #3551: went through composite ranking
         node.pop("_embedding", None)
-    # Strip _embedding from special_pool too (set during Tier 1).
+    # Strip _embedding from special_pool too (set during Tier 1). Special-type
+    # bypass rows are never composite-ranked -> composite_score is null, never
+    # a computed substitute.
     for node in special_pool:
         node.pop("_embedding", None)
+        node["composite_score"] = None
+        node["ranked"] = False  # #3551: bypass row, null composite is by design
 
     # ══ FINAL MERGE: generic (top_k) + special-type bypass results ══════
     # top_k is the generic-result budget. Special-type results append after,
@@ -2110,7 +2140,7 @@ def _get_person_moment_cooldown_seconds() -> float:
     """
     try:
         if core.CONFIG_PATH.exists():
-            config = json.loads(core.CONFIG_PATH.read_text())
+            config = core._config_io.read_config_json(core.CONFIG_PATH)
             section = config.get("person_moment_cooldown", {})
             if isinstance(section, dict):
                 return float(section.get("seconds", _PERSON_MOMENT_COOLDOWN_SECONDS))
@@ -2259,10 +2289,7 @@ def _select_and_render_person_moment(
     row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (node_id,)).fetchone()
     if not row:
         return None
-    try:
-        meta = json.loads(row["metadata"]) if row["metadata"] else {}
-    except (json.JSONDecodeError, TypeError):
-        return None
+    meta = core._metadata_dict(row["metadata"])
     moments = meta.get("special_moments")
     if not isinstance(moments, list) or not moments:
         return None
@@ -2397,6 +2424,28 @@ def _conn_total_count(where_clause: str, params: list) -> int:
 # Impl functions (moved from server.py)
 # ---------------------------------------------------------------------------
 
+# #3458 half C — per-candidate ranking signals exposed on the surface response.
+# name -> key on the ranked row it is read from. Read-only: a key the row lacks
+# is None (never computed here), so the ledger can tell "absent" from a value.
+# #3551 adds `ranked` (set in _search_nodes: True = composite-ranked, False =
+# special-type bypass row, whose null composite_score is by design); a seventh
+# entry in the same dict, so signals_present and the ledger reader pick it up.
+_SURFACE_SIGNAL_ROW_KEYS = {
+    "similarity": "similarity",
+    "importance_score": "importance_score",
+    "utility": "utility_score",
+    "composite_score": "composite_score",
+    "match_type": "match_type",
+    "recall_turn": "recall_turn",
+    "ranked": "ranked",
+}
+
+
+def _surface_signals(row: dict) -> dict:
+    """The #3458 ranking signals (+ #3551 `ranked`) for one row (None when absent)."""
+    return {name: row.get(key) for name, key in _SURFACE_SIGNAL_ROW_KEYS.items()}
+
+
 def _surface_impl(
     query: str,
     top_k: int = 10,
@@ -2415,6 +2464,9 @@ def _surface_impl(
     engram_surface call (from an agent, not the daemon) has no use for a
     384-float array in its own context, so it's opt-in rather than always
     computed+stripped (mirrors the `return_debug` idiom on _search_nodes).
+
+    The no-results early return carries no `signals_present` key; consumers
+    treat an absent key as empty (#3458).
     """
     conn = core._get_db()
     try:
@@ -2453,7 +2505,7 @@ def _surface_impl(
         # None (not computed / model unavailable) is a valid, expected value
         # — the hook falls back to today's count-only classification on it.
         query_embedding = None
-        if include_query_embedding and core._embedder.is_available() and core._get_embedding_config().get("enabled", True):
+        if include_query_embedding and core._embedder.is_available():
             try:
                 model_name = core._get_embedding_config().get("model", core.DEFAULT_EMBEDDING_MODEL)
                 effective_embed_query = embed_query if embed_query is not None else query
@@ -2492,6 +2544,7 @@ def _surface_impl(
                     "created_minutes_ago": core._created_minutes_ago(n.get("created_at"), now=now_utc),
                     "recall_summary": n.get("recall_summary"),
                     "recall_keywords": json.loads(n.get("recall_keywords") or "null"),
+                    "signals": _surface_signals(n),
                 }
                 if ntype == "question":
                     entry["status"] = n.get("status", "open")
@@ -2509,11 +2562,7 @@ def _surface_impl(
                     # that reads this response over the daemon socket) can do
                     # its own suppression-gated selection + cursor-advance —
                     # see engram-surface-hook.py's _select_person_moment_candidate.
-                    _pmeta_raw = n.get("metadata")
-                    try:
-                        _pmeta = json.loads(_pmeta_raw) if _pmeta_raw else {}
-                    except (json.JSONDecodeError, TypeError):
-                        _pmeta = {}
+                    _pmeta = core._metadata_dict(n.get("metadata"))
                     if _pmeta.get("pronouns"):
                         entry["pronouns"] = _pmeta["pronouns"]
                     if _pmeta.get("relation"):
@@ -2553,6 +2602,7 @@ def _surface_impl(
                 "created_minutes_ago": core._created_minutes_ago(n.get("created_at"), now=now_utc),
                 "recall_summary": n.get("recall_summary"),
                 "recall_keywords": json.loads(n.get("recall_keywords") or "null"),
+                "signals": _surface_signals(n),
             }
             for n in claim_nodes[:3]
         ]
@@ -2642,6 +2692,7 @@ def _surface_impl(
                 # #1779 round 1).
                 "created_at": n.get("created_at"),
                 "created_minutes_ago": core._created_minutes_ago(n.get("created_at"), now=now_utc),
+                "signals": _surface_signals(n),
             }
             # Lightweight boolean taint/staleness signal (MECH-5 follow-up) —
             # reuse the warned_nodes map already built above rather than
@@ -2672,6 +2723,12 @@ def _surface_impl(
             "issues": {},
             "matched_ids": matched_ids,
             "matched_meta": matched_meta,
+            # Signal names non-null on >=1 candidate (#3458): lets a reader
+            # tell "absent on this build" from "null for this node".
+            "signals_present": [
+                name for name in _SURFACE_SIGNAL_ROW_KEYS
+                if any(m["signals"][name] is not None for m in matched_meta)
+            ],
             "search_methods": {
                 "keyword_matches": search["keyword_matches"],
                 "semantic_matches": search["semantic_matches"],
@@ -2690,21 +2747,14 @@ def _surface_impl(
         test_config = mem.get("test")
         if test_config and test_config.get("enabled"):
             test_max = test_config.get("tier2_max_nodes", 1000)
-            # Compute test threshold using same logic as _get_tier_threshold
+            # Test threshold comes from the SAME function as the real one (with
+            # the test cap as a parameter), so the two can never disagree about
+            # which population is counted. total_current is the searchable
+            # population (evidence excluded) -- the "total_searchable" below.
             total_current = conn.execute(
-                "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1"
+                f"SELECT COUNT(*) as c FROM nodes WHERE {core._searchable_where_sql()}"
             ).fetchone()["c"]
-            if total_current <= test_max:
-                test_threshold = 0.0
-            else:
-                row_t = conn.execute(
-                    """SELECT importance_score FROM nodes
-                       WHERE is_current = 1
-                       ORDER BY importance_score DESC
-                       LIMIT 1 OFFSET ?""",
-                    (test_max - 1,),
-                ).fetchone()
-                test_threshold = row_t["importance_score"] if row_t else 0.0
+            test_threshold = core._get_tier_threshold(conn, 2, max_nodes=test_max)
 
             # Check which base results would be excluded by test config
             tier2_threshold_base = core._get_tier_threshold(conn, 2)
@@ -2871,6 +2921,38 @@ def _inspect_impl(
         conn.close()
 
 
+def _parse_type_filter(types: str) -> Optional[set]:
+    """The ``types`` CSV as a set of canonical node types (aliases resolved), or
+    None when empty. The one parse shared by _search_nodes and the engram_query
+    note."""
+    type_filter = set(t.strip() for t in core._as_csv(types).split(",") if t.strip()) or None
+    if type_filter:
+        type_filter = {_TYPE_ALIASES.get(t, t) for t in type_filter}
+    return type_filter
+
+
+def _search_excluded_types_note(types: str) -> Optional[str]:
+    """A short note when ``types`` names a SEARCH_EXCLUDED_TYPES type, else None.
+
+    All requested types excluded -> the empty result is explained (it is not
+    "no matches"); mixed -> the excluded ones are named as ignored. The type
+    names come from core.SEARCH_EXCLUDED_TYPES, never a literal.
+    """
+    type_filter = _parse_type_filter(types)
+    if not type_filter:
+        return None
+    ignored = sorted(type_filter & set(core.SEARCH_EXCLUDED_TYPES))
+    if not ignored:
+        return None
+    names = ", ".join(ignored)
+    list_hints = " or ".join(f"engram_list with node_type={t}" for t in ignored)
+    if type_filter <= set(core.SEARCH_EXCLUDED_TYPES):
+        return (f"{names} is never a search result, so this query matches nothing "
+                f"by design; to list it use {list_hints}.")
+    return (f"{names} ignored: never a search result; the other requested types "
+            f"were searched normally. To list it use {list_hints}.")
+
+
 def _query_impl(
     query: str,
     types: str = "",
@@ -2879,10 +2961,12 @@ def _query_impl(
     top_k: int = 10,
     return_debug: bool = False,
     summary_top_k: int = 3,
+    refresh_recall: bool = True,
 ) -> str:
     """Impl for engram_query — callable with named kwargs for in-server callers."""
     conn = core._get_db()
     try:
+        excluded_note = _search_excluded_types_note(types)
         search = _search_nodes(
             conn, query, types=types, min_confidence=min_confidence,
             include_superseded=include_superseded, top_k=top_k,
@@ -2902,17 +2986,16 @@ def _query_impl(
             # above. Gated on `not return_debug`: return_debug=True's
             # contract is "preserve full legacy shape verbatim" (eval/harness
             # contract per the docstring below), so no new fields are added
-            # to node dicts on that path — metadata is popped unconditionally
-            # either way (see node.pop("metadata", ...) below), so
-            # return_debug output is genuinely unchanged by this fix.
+            # to node dicts on that path by THIS extraction — metadata is
+            # popped unconditionally either way (see node.pop("metadata", ...)
+            # below). Note return_debug=True result rows DO gain two additive
+            # fields, `composite_score` (#3458) and `ranked` (#3551), both set in
+            # _search_nodes;
+            # `debug.per_result` is unchanged.
             # trust_tier needs no extraction here — it's already a raw
             # column carried through by _node_to_dict unconditionally.
             if not return_debug and node.get("type") == "person":
-                _pmeta_raw = node.get("metadata")
-                try:
-                    _pmeta = json.loads(_pmeta_raw) if _pmeta_raw else {}
-                except (json.JSONDecodeError, TypeError):
-                    _pmeta = {}
+                _pmeta = core._metadata_dict(node.get("metadata"))
                 if _pmeta.get("pronouns"):
                     node["pronouns"] = _pmeta["pronouns"]
                 if _pmeta.get("relation"):
@@ -2923,8 +3006,11 @@ def _query_impl(
                 node["warnings"] = w
             output.append(node)
 
-        # Refresh recall for all accessed nodes.
-        if output:
+        # Refresh recall for all accessed nodes. refresh_recall=False is the
+        # read-only measurement mode (#3362): ranking above is already done and
+        # is unaffected; only the re-stamp write is skipped (mirrors
+        # engram_inspect's dream_mode skip).
+        if output and refresh_recall:
             accessed_ids = [n["id"] for n in output]
             _refresh_recall(conn, accessed_ids)
 
@@ -2950,6 +3036,7 @@ def _query_impl(
                     "result_count": len(output),
                     "type_filter": types or None,
                     "source_class_filter": None,
+                    "refresh_recall": bool(refresh_recall),
                 },
                 site="server.engram_query",
             )
@@ -2993,18 +3080,36 @@ def _query_impl(
             }
             if "debug" in search:
                 response_body["debug"] = search["debug"]
+            if excluded_note:
+                response_body["note"] = excluded_note
+            if not refresh_recall:
+                response_body["refresh_recall"] = False
             return json.dumps(core._strip_agent_facing(response_body))
 
         # Default path: tiered summary/keywords shape (Wave C recall_summary rollout).
         # Clamp summary_top_k to [0, len(output)] so callers don't have to worry
         # about off-by-one edge cases.
         effective_top_k = max(0, min(summary_top_k, len(output)))
-        tiered = _build_tiered_results(output, effective_top_k, conn=conn)
-        return json.dumps(core._strip_agent_facing({
+        # The default conn=conn lets a person node in the Tier-1 top-k go
+        # through _select_and_render_person_moment, which rotates
+        # metadata.special_moment_cursor (UPDATE + commit) and burns the
+        # cross-surface cooldown ledger -- a write. refresh_recall=False is
+        # the read-only measurement mode, so pass conn=None: person nodes then
+        # simply never attempt a moment (same as engram_query_pattern).
+        tiered = _build_tiered_results(
+            output, effective_top_k,
+            conn=conn if refresh_recall else None,
+        )
+        tiered_body = {
             "results": tiered,
             "query": query,
             "total_matches": len(output),
-        }))
+        }
+        if excluded_note:
+            tiered_body["note"] = excluded_note
+        if not refresh_recall:
+            tiered_body["refresh_recall"] = False
+        return json.dumps(core._strip_agent_facing(tiered_body))
     finally:
         conn.close()
 
@@ -3272,6 +3377,8 @@ def _list_impl(
         parse_filters,
         validate_fields,
         contains_field,
+        is_metadata_key_field,
+        metadata_select_expr,
     )
 
     structured_mode = bool(filters_json) or bool(fields_json)
@@ -3281,12 +3388,18 @@ def _list_impl(
     filter_sql_frag: str = ""
     filter_params: list = []
     projected_fields: list[str] = []
+    select_params: list = []  # bound params for projected metadata.<key> expressions
 
     if filters_json:
         try:
             filters_obj = json.loads(filters_json)
         except json.JSONDecodeError as e:
             return json.dumps({"status": "error", "error": f"filters_json: invalid JSON — {e}"})
+        except TypeError:
+            return json.dumps({
+                "status": "error",
+                "error": f"filters_json must be a JSON string, got {type(filters_json).__name__}",
+            })
         try:
             filter_sql_frag, filter_params = parse_filters(filters_obj)
         except FilterError as e:
@@ -3314,6 +3427,11 @@ def _list_impl(
             fields_obj = json.loads(fields_json)
         except json.JSONDecodeError as e:
             return json.dumps({"status": "error", "error": f"fields_json: invalid JSON — {e}"})
+        except TypeError:
+            return json.dumps({
+                "status": "error",
+                "error": f"fields_json must be a JSON string, got {type(fields_json).__name__}",
+            })
         try:
             projected_fields = validate_fields(fields_obj)
         except FilterError as e:
@@ -3358,6 +3476,10 @@ def _list_impl(
         "created": ("created_at", "DESC"),
         "importance": ("importance_score", "DESC"),
         "recalls": ("recall_count", "DESC"),
+        # #3615: the open-question priority signal. The ORDER BY is built
+        # specially below (count, then weight, then id ASC), so the column
+        # here is only the primary key, `bears_on_count`.
+        "bears_on": ("bo_cnt", "DESC"),
     }
     if sort_by and sort_by not in sort_columns:
         return json.dumps({
@@ -3375,6 +3497,12 @@ def _list_impl(
         })
     resolved_direction = sort_order.upper() if sort_order else default_direction
     order = f"{column} {resolved_direction}"
+    if sort_by == "bears_on":
+        # #3615: count, then weight (same direction), then id ASC for a stable
+        # order. COALESCE: a question with no live bears_on edge has no
+        # aggregate row (LEFT JOIN NULL) and counts as 0 / 0.0.
+        order = (f"COALESCE(bo_cnt, 0) {resolved_direction}, "
+                 f"COALESCE(bo_wt, 0.0) {resolved_direction}, id ASC")
 
     # Limit semantics (per issue #81 + Lei's state-table refinement):
     #   unlimited=True OR limit=None  → no cap
@@ -3405,7 +3533,18 @@ def _list_impl(
         # Always include 'id' so callers can correlate even if they didn't
         # ask for it; preserves order otherwise.
         cols_to_fetch = ["id"] + [f for f in projected_fields if f != "id"]
-        select_cols = ", ".join(f'"{c}"' for c in cols_to_fetch)
+        _sel_parts: list[str] = []
+        for c in cols_to_fetch:
+            if is_metadata_key_field(c):
+                # metadata.<key>: json_extract with a BOUND path; row key stays
+                # the requested name because dict(zip(cols_to_fetch, row)) is
+                # positional. Absent key / malformed JSON -> NULL (#3402).
+                _expr, _p = metadata_select_expr(c)
+                _sel_parts.append(_expr)
+                select_params.extend(_p)
+            else:
+                _sel_parts.append(f'"{c}"')
+        select_cols = ", ".join(_sel_parts)
     else:
         # Default compact triage shape. recall_summary is fetched alongside
         # claim so the triage entry can surface the curated summary when one
@@ -3416,16 +3555,38 @@ def _list_impl(
         ]
         select_cols = ", ".join(f'"{c}"' for c in cols_to_fetch)
 
+    # #3615: per-question bears_on aggregate (count + summed importance of the
+    # CURRENT targets). The grouped-subquery JOIN is used ONLY for
+    # sort_by="bears_on" (the ORDER BY needs it, and `limit` must apply after
+    # the sort). Every other compact list fetches its page first and then runs
+    # one extra query for just the question rows on that page (below), so the
+    # default path pays nothing when the page holds no question.
+    # Aliased bo_* so no unqualified column in `where`/filters can collide.
+    # A retracted/superseded target is excluded: the signal counts live stakes.
+    need_bears_on = sort_by == "bears_on"
+    from_clause = "nodes"
+    if need_bears_on:
+        if not projected_fields:
+            select_cols += ", COALESCE(bo_cnt, 0), COALESCE(bo_wt, 0.0)"
+        from_clause = (
+            "nodes LEFT JOIN ("
+            "SELECT e.source_id AS bo_src, COUNT(*) AS bo_cnt, "
+            "SUM(COALESCE(t.importance_score, 0.0)) AS bo_wt "
+            "FROM edges e JOIN nodes t ON t.id = e.target_id "
+            "WHERE e.relation = 'bears_on' AND t.is_current = 1 "
+            "GROUP BY e.source_id) AS bo ON bo.bo_src = nodes.id"
+        )
+
     if effective_limit == 0:
         rows: list = []
     else:
         conn = core._get_db()
-        query = f"SELECT {select_cols} FROM nodes WHERE {where} ORDER BY {order}"
+        query = f"SELECT {select_cols} FROM {from_clause} WHERE {where} ORDER BY {order}"
         if effective_limit is not None:
             query += " LIMIT ?"
-            rows = conn.execute(query, params + [effective_limit]).fetchall()
+            rows = conn.execute(query, select_params + params + [effective_limit]).fetchall()
         else:
-            rows = conn.execute(query, params).fetchall()
+            rows = conn.execute(query, select_params + params).fetchall()
 
     entries = []
     if projected_fields:
@@ -3441,8 +3602,34 @@ def _list_impl(
         # ellipsis) or falls back to the original claim truncated to
         # LIST_CLAIM_FALLBACK_DISPLAY_CAP chars for legacy nodes that haven't
         # been backfilled yet. Key name unchanged for downstream compat.
+        # #3615: when the aggregate was not joined (every sort but
+        # "bears_on"), fetch count + live-target weight for just the question
+        # rows on this page in ONE query; no question on the page -> no query.
+        bo_by_q: dict = {}
+        if not need_bears_on:
+            q_ids = [r[0] for r in rows if r[1] == "question"]
+            if q_ids:
+                marks = ",".join("?" * len(q_ids))
+                # `+t.is_current` is deliberate: unary plus keeps SQLite from
+                # driving this lookup off idx_nodes_current (a scan of every
+                # current node, ~230 ms at 20k nodes) instead of the page's
+                # own bears_on edges. Pinned by a query-plan test.
+                for src, cnt, wt in conn.execute(
+                    "SELECT e.source_id, COUNT(*), "
+                    "SUM(COALESCE(t.importance_score, 0.0)) "
+                    "FROM edges e JOIN nodes t ON t.id = e.target_id "
+                    "WHERE e.relation = 'bears_on' AND +t.is_current = 1 "
+                    f"AND e.source_id IN ({marks}) GROUP BY e.source_id",
+                    q_ids,
+                ).fetchall():
+                    bo_by_q[src] = (cnt, wt)
         for row in rows:
-            nid, ntype, claim, st, conf, recalls, imp, created, mem_st, rs = row
+            (nid, ntype, claim, st, conf, recalls, imp, created, mem_st, rs,
+             *bo_cols) = row
+            if bo_cols:
+                bo_count, bo_weight = bo_cols
+            else:
+                bo_count, bo_weight = bo_by_q.get(nid, (0, 0.0))
             if rs and len(rs) <= LIST_CLAIM_SUMMARY_DISPLAY_CAP:
                 # Display-only bound, independent of the write-path validators
                 # (see LIST_CLAIM_SUMMARY_DISPLAY_CAP) — use as-is.
@@ -3469,6 +3656,10 @@ def _list_impl(
             }
             if conf is not None:
                 entry["confidence"] = round(conf, 3)
+            if ntype == "question":
+                # #3615: open-question priority signal (live targets only).
+                entry["bears_on_count"] = int(bo_count)
+                entry["bears_on_weight"] = round(float(bo_weight), 3)
             entries.append(entry)
 
     truncated_count = (total - len(entries)) if total > len(entries) else 0

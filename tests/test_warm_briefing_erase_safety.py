@@ -166,7 +166,9 @@ STRUCTURAL_COMMENT = (
     "by POSITION, not by a re-append step that could be skipped. Exact "
     "anchor + procedure: engram-sleep Step 3, engram-nap section 5b. Never "
     "write that heading, with its heading prefix, anywhere in this file "
-    "except as its final line. -->"
+    "except once, as the LAST line matching it — the section it opens runs "
+    "to EOF, so after a nap the arc sits below the heading and only an "
+    "end-of-day erase leaves it bare as the file's final line. -->"
 )
 
 
@@ -287,9 +289,10 @@ def _erase_correct(text: str) -> str:
     lines = text.splitlines()
     anchored_indices = [i for i, line in enumerate(lines) if line == HEADING]
     assert anchored_indices, "fixture must contain at least one anchored heading"
-    target = anchored_indices[-1]
-    kept = lines[:target]
-    return "\n".join(kept) + "\n\n" + HEADING + "\n"
+    # #3141: erase by CHARACTER OFFSET so the region above the anchor stays
+    # byte-identical (a line-join rebuild is not byte-faithful).
+    start = list(re.finditer(r"(?m)^## From this session", text))[-1].start()
+    return text[:start] + HEADING + "\n"
 
 
 def _erase_wrong_first_match(text: str) -> str:
@@ -443,3 +446,49 @@ def test_correct_erase_preserves_a_user_letter_that_a_wrong_one_destroys():
     assert correct_result != wrong_first_match_result
     assert correct_result != wrong_substring_result
     assert wrong_first_match_result != wrong_substring_result
+
+
+# ---------------------------------------------------------------------------
+# 5. test_fixture_comment_is_byte_identical_to_the_shipped_template_comment
+# ---------------------------------------------------------------------------
+#
+# The STRUCTURAL INVARIANT comment is a hand copy: the same sentence is
+# written out in the shipped template AND as the module-level
+# STRUCTURAL_COMMENT fixture above, with nothing binding the two -- the drift
+# class this whole change is about. This test makes the binding explicit so
+# the fixture can no longer silently diverge from the shipped template.
+
+
+def test_fixture_comment_is_byte_identical_to_the_shipped_template_comment():
+    """Drift guard -- bind the module-level STRUCTURAL_COMMENT fixture to the
+    shipped template's own STRUCTURAL INVARIANT comment line.
+
+    Contract:
+      - Read the shipped template; extract its single line starting
+        ``<!-- STRUCTURAL INVARIANT:``.
+      - Assert that line equals STRUCTURAL_COMMENT exactly -- byte-identical,
+        with no normalization.
+
+    The fixture and the template are a hand-copied pair with no other binding,
+    so the assertion must FAIL if EITHER copy alone changes: editing the
+    template's sentence makes the extracted line diverge from the fixture,
+    and editing the fixture makes STRUCTURAL_COMMENT diverge from the shipped
+    line. It is a drift guard, not a behavioural check -- it passes whenever
+    the two copies agree, which is the state on the tip.
+    """
+    text = TEMPLATE_PATH.read_text(encoding="utf-8")
+    comment_lines = [
+        line
+        for line in text.splitlines()
+        if line.startswith("<!-- STRUCTURAL INVARIANT:")
+    ]
+    assert len(comment_lines) == 1, (
+        "expected exactly one shipped-template line starting "
+        f"'<!-- STRUCTURAL INVARIANT:', found {len(comment_lines)} -- the "
+        "STRUCTURAL_COMMENT fixture is bound to that single line"
+    )
+    assert comment_lines[0] == STRUCTURAL_COMMENT, (
+        "the shipped template's STRUCTURAL INVARIANT comment and the "
+        "module-level STRUCTURAL_COMMENT fixture have drifted apart: the two "
+        "hand copies must stay byte-identical"
+    )

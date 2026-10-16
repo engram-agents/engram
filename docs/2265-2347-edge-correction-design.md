@@ -84,7 +84,8 @@ stays blocked. This proposal does not touch that.
 | `supported_by` | `about` | the target was related, not a premise |
 | `derives_from` | `about` | same |
 | `derives_from` (target is a lesson or cornerstone) | `exemplifies` | the source is an example of the principle |
-| `cites` | `about` | the target was not really a source |
+| `cites` | `about` | the target was not really a source. Not for a `cites` from an observation to its evidence (an `ev_` node): that edge is provenance and is refused for every move (see the next row). |
+| `cites` | every relation that is `addable_after_creation` (`about`, `bears_on`, `exemplifies`, `generalizes`, `instantiates`, `serves`, `subtask_of`, `tensions`) | a loose `cites` (any pair `engram_core._cites_pair_error` would refuse, i.e. not observation -> `ev_`) that was really a non-provenance link; an observation -> evidence `cites` is refused for every new relation, `about` included (#2243 step 3; the set is derived from `EDGE_CLASSIFICATIONS`). `exemplifies` still needs a lesson or cornerstone target. The new relation must pass the same endpoint rules `engram_add_edge` applies to it (one shared helper). |
 
 Any move that is not in the table is refused, and the refusal lists the moves that are
 allowed. The normative "applies a lesson as a rule" case gets its own row once that

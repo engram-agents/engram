@@ -170,7 +170,8 @@ def _derive_impl(
         derivation_mode: LEGACY — use reasoning_type instead. If reasoning_type is provided, this is ignored.
             Kept for backward compatibility: "chain" or "corroboration".
         context_ids: Optional comma-separated node IDs for context references (e.g. definitions).
-            Creates 'cites' edges (not 'derives_from') — these don't affect confidence computation.
+            Creates 'about' edges (not 'derives_from'; an evidence id is also 'about' here, since 'cites'
+            is observation->evidence only) — these don't affect confidence computation.
         use_stale: RETIRED (#2324) — accepted for compatibility, but it has NO EFFECT.
             A stale premise is now a hard block, and passing this flag returns a loud
             `use_stale_retired` notice on both the refusal and the success payload
@@ -416,6 +417,11 @@ def _derive_impl(
             result["built_on_contested"] = success["contested_ids"]
         if independence_advisory:
             result["independence_advisory"] = independence_advisory
+        if success.get("embedding_failure"):  # #345 PR3 B4 (R1: renamed key)
+            result["embedding_failure"] = success["embedding_failure"]
+        _overrun = core._recall_summary_overrun_note(len(_recall_summary or ""))
+        if _overrun:  # #3537
+            result["recall_summary_overrun"] = _overrun
 
         # --- engram.tool.engram_call event — success path (DESIGN.md §4.2) ---
         # alpha #2574 WS5: see the blocked-path site above for the full
@@ -565,7 +571,7 @@ def _contradict_impl(
             (node_id, node_id_b, now),
         )
 
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=1.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, confidence=0.5, surprise=1.0)
         core._utility_reward(conn, [node_id_a, node_id_b], action="contradict")
         conn.commit()
 
@@ -648,18 +654,20 @@ def _contradict_impl(
             except Exception:
                 pass
 
-        return json.dumps(
-            {
-                "status": "created",
-                "contradiction_id": node_id,
-                "conflicts": {
-                    "node_a": {"id": node_id_a, "claim": node_a["claim"]},
-                    "node_b": {"id": node_id_b, "claim": node_b["claim"]},
-                },
-                "description": description,
-                "root_cause": root_cause or "Not analyzed yet",
-            }
-        )
+        _result = {
+            "status": "created",
+            "contradiction_id": node_id,
+            "conflicts": {
+                "node_a": {"id": node_id_a, "claim": node_a["claim"]},
+                "node_b": {"id": node_id_b, "claim": node_b["claim"]},
+            },
+            "description": description,
+            "root_cause": root_cause or "Not analyzed yet",
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        return json.dumps(_result)
     finally:
         conn.close()
 
@@ -669,6 +677,7 @@ def _ask_impl(
     context_ids: str = "",
     category: str = "",
     lacks: str = "",
+    bears_on: str = "",
 ) -> str:
     """Internal implementation — see engram_ask MCP tool for the public
     payload schema. Kept callable with named kwargs for in-server callers.
@@ -695,6 +704,13 @@ def _ask_impl(
         lacks: Optional blocker — what's missing to resolve. One of:
             external_evidence, empirical_data, human_decision, implementation,
             synthesis, prerequisite. Can be updated later during sweeps.
+        bears_on: Optional comma-separated node IDs of claim-bearing nodes (or
+            contradictions) the eventual answer will count for or against
+            (#3615). Writes `bears_on` edges in the same transaction as the
+            question. STRICT, unlike context_ids: every id must exist, be
+            current, and pass the shared endpoint rule
+            (engram_core._relation_endpoint_error); otherwise the whole
+            call is refused naming the offending id and NO question is created.
 
     Returns:
         JSON with the new question node ID.
@@ -713,6 +729,38 @@ def _ask_impl(
 
     conn = core._get_db()
     try:
+        # #3615: strict, all-or-nothing `bears_on` validation, BEFORE any id is
+        # allocated or row written, so a refused call leaves no question and no
+        # edges. Held to the same endpoint rule as engram_add_edge /
+        # engram_retype_edge (one shared helper, in engram_core).
+        bears_targets: list[str] = []
+        for tid in (s.strip() for s in core._as_csv(bears_on).split(",")):
+            if tid and tid not in bears_targets:
+                bears_targets.append(tid)
+        if bears_targets:
+            for tid in bears_targets:
+                trow = conn.execute(
+                    "SELECT id, type, is_current FROM nodes WHERE id = ?", (tid,)
+                ).fetchone()
+                if not trow:
+                    return json.dumps({"error": (
+                        f"bears_on target '{tid}' not found. No question was "
+                        f"created (bears_on is strict, unlike context_ids)."
+                    )})
+                if not trow["is_current"]:
+                    return json.dumps({"error": (
+                        f"bears_on target '{tid}' is not current (retracted or "
+                        f"superseded). No question was created. Use "
+                        f"engram_inspect('{tid}') to find the current successor."
+                    )})
+                ep_err = core._relation_endpoint_error(
+                    "bears_on", {"id": "(new question)", "type": "question"}, trow
+                )
+                if ep_err is not None:
+                    return json.dumps({"error": (
+                        f"{ep_err} No question was created."
+                    )})
+
         node_id = core._next_id(conn, "question")
         now = core._now()
 
@@ -732,14 +780,19 @@ def _ask_impl(
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, cid, now)
                 except sqlite3.IntegrityError:
                     pass
 
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.5)
+        # `bears_on` edges (#3615): same transaction as the question node.
+        for tid in bears_targets:
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, created_at) "
+                "VALUES (?, ?, 'bears_on', ?)",
+                (node_id, tid, now),
+            )
+
+        _emb_outcome = core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.5)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
@@ -791,6 +844,14 @@ def _ask_impl(
             result["category"] = category
         if lacks:
             result["lacks"] = lacks
+        if bears_targets:
+            result["bears_on"] = bears_targets
+        # #345 PR3 B4: the message key here lives INSIDE this block, not
+        # merged at top level -- this tool already uses a top-level
+        # "message" key for its own unrelated success text (see above).
+        _emb_block = core._embedding_response_block(_emb_outcome)
+        if _emb_block:
+            result["embedding_failure"] = _emb_block  # R1: renamed key
         return json.dumps(result)
     finally:
         conn.close()

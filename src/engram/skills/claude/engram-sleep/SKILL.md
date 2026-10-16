@@ -51,6 +51,7 @@ sequential, no branching:
   Step 7 — Wait for the drawn fairies + collect reports
   Step 8 — Spawn the dream master with the full report bundle
   Step 9 — Receive the dream master's final return and relay to the user
+  Step 9.5 — Triage the dream's awake-seat findings (do / file / defer) and append the dispositions to the dream record
 
 The dream master owns the heavy consolidation (engram_reflect, agenda
 walk, supersedes/resolves/promotes, engram_advance_turn, dream record).
@@ -193,11 +194,11 @@ Common missed-node types:
 
 At the end of sleep, the day is over. The warm-briefing's "From this session" section is per-context-window state managed by naps (see `engram-nap` §5b for the in-sync-with-current-CW rule). At sleep-end, the next day starts fresh — erase the section content. Next morning's first nap will create a new in-sync block.
 
-**Action:** open `~/.engram/warm-briefing.md` and locate the target **mechanically**, not by reading:
+**Action:** the tool is `"$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/erase_session_block.py"` — this is THE way to do the erase (#3141). **LOOK first, then run:** read the section below the last `## From this session` anchor (or run the tool with `--dry-run` and read its `removed N chars / K lines` summary), apply the drift-STOP check below, and only THEN run the tool for real. The tool implements the four steps below by character offset and asserts the byte-identity post-condition before writing. Exit codes: **0** = done, or already bare (no change); **3** = drift-STOP — surface to the user, do NOT erase; **2** or **4** = stop and report. Exit 3 and an exit 4 from a pre-write post-condition leave the file untouched; exit 2 (IO error) and an exit 4 from the read-back check MAY have written, so read stderr ("original bytes restored" vs "NOT restored") and check the file before doing anything else. **Exit 0 means the byte-identity and structural checks passed — it does NOT mean no user words sit in or below the section:** the tool only detects ATX `#`/`##` headings (a best-effort proxy), so the prose clause of the drift-STOP stays your own judgement. If the tool is absent, do it by hand as follows (the by-hand offset rule is the fallback), locating the target **mechanically**, not by reading `~/.engram/warm-briefing.md`:
 
 1. Find every line matching the anchored regex `^## From this session` — **line-anchored, never a substring search.** A mid-line or quoted occurrence is prose, not the heading, and must never match.
 2. Take the **LAST** such line. Not the first. If the file has drifted so the phrase appears more than once, the last one is the real section; an earlier one sits inside the user's preserved notes.
-3. Delete from that line through **EOF**.
+3. Erase by **CHARACTER OFFSET, not by lines**: keep `text[:match.start()]` of that last anchored match — the file read and written with no line-ending translation — then append the bare heading (next item). A line-oriented rebuild (`"\n".join(lines[:i])`) silently drops one byte above the anchor (the blank line before the heading). **Post-condition: everything above the anchor is byte-identical to before.**
 4. **Re-append** the bare `## From this session` heading as an empty stub for tomorrow's first nap — and nothing else. The `<!-- STRUCTURAL INVARIANT: ... -->` comment sits ABOVE that heading, so the delete never reaches it and it needs no restoration. That placement is deliberate: the anchor is protected by POSITION rather than by a re-append step a hurried sleep could skip.
 
 Steps 1 and 2 are the whole safety property. A substring match, or a first match, lands inside the user's letter and truncates it — that is exactly how a letter was destroyed before.
@@ -307,6 +308,49 @@ engram_update_lesson(payload_json=json.dumps({
 
 Empty `candidates` list is the common case (most cycles) — no lesson has ever crossed the lease threshold. Log the outcome (count reconciled, or "none this cycle") in today's history file alongside the other Phase A milestones. This step runs in Phase A, by the awake parent, not the dream master. Not because the dream master lacks the tool access — its own spec grants `tools: *` and it already calls `engram_update_lesson`-adjacent tools (supersede, retract, derive, resolve, contradict, update_task) — but because it needs no fairy investigation and no consolidation judgment, only a mechanical read-then-write, and inserting an unreviewed new step into that dense, heavily-negotiated spec is a cost this task doesn't need to pay.
 
+### Step 3.9 — Embedding backfill (engram-alpha#345 PR1 part (c))
+
+The in-process MCP-server embedder can leave a node with a NULL embedding — a disabled-by-config toggle, a cold-cache model load that failed in the background, or a transient per-node embed error. `tools/engram-regenerate-embeddings.py` backfills every such row idempotently, but nothing in the sleep routine ran it before this step: the store-and-flag design #345 settled on (store the node, flag the gap, report loudly) is only safe to leave as a long-lived default because this backfill exists AND runs routinely — Lei's rationale, verbatim, relayed 2026-10-03. This step is that routine run.
+
+Run the tool with `--json` via the engram venv python and the plugin path (same invocation shape as Steps 4.5–4.7). stderr is captured to a `mktemp` file rather than a fixed path (never reuse a predictable `/tmp` name across concurrent sleep runs) so a failure's reason survives without corrupting the stdout JSON parse below, and the file is removed in every branch:
+
+```bash
+embed_backfill_stderr=$(mktemp)
+embed_backfill_json=$("$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/engram-regenerate-embeddings.py" --json 2>"$embed_backfill_stderr")
+embed_backfill_rc=$?
+if [ $embed_backfill_rc -eq 0 ] && [ -n "$embed_backfill_json" ]; then
+    EMBED_BEFORE=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['before_null'])" "$embed_backfill_json")
+    EMBED_AFTER=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['after_null'])" "$embed_backfill_json")
+    EMBED_EMBEDDED=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['embedded'])" "$embed_backfill_json")
+    EMBED_FAILED=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['failed'])" "$embed_backfill_json")
+    if [ "$EMBED_AFTER" -gt 0 ]; then
+        embed_backfill_status="⚠ $EMBED_AFTER still unembedded (before=$EMBED_BEFORE, embedded=$EMBED_EMBEDDED, failed=$EMBED_FAILED)"
+    else
+        embed_backfill_status="✓ embedding backfill OK (before=$EMBED_BEFORE, embedded=$EMBED_EMBEDDED, failed=$EMBED_FAILED)"
+    fi
+else
+    embed_backfill_last_line=$(tail -n 1 "$embed_backfill_stderr")
+    embed_backfill_status="⚠ embedding backfill FAILED (exit $embed_backfill_rc): $embed_backfill_last_line"
+fi
+rm -f "$embed_backfill_stderr"
+```
+
+**Non-blocking, like 4.5–4.7**: a failure here (non-zero exit, unparseable output) is recorded, never aborts sleep — the day's nodes are already in the graph; this is maintenance on top of them, not a precondition for anything downstream in Phase A or B.
+
+The tool contends for the SQLite write lock like any other writer against a live MCP server (default busy timeout); a lock failure surfaces as a non-zero exit and is recorded by `embed_backfill_status` below as a loud `⚠`, not silently retried.
+
+**Record in today's history file (Step 4)**, in the exact shape `- embedding backfill: $embed_backfill_status`, e.g.:
+
+```
+- embedding backfill: $embed_backfill_status
+```
+
+`$embed_backfill_status` is a SINGLE variable computed above that already covers every branch — success with nothing remaining (`✓ ...`), success with a remainder (`⚠ N still unembedded ...`), and a fatal failure (`⚠ embedding backfill FAILED (exit N): <last stderr line>`) — so this one template, used unconditionally, is the only history line this step ever emits; there is no separate success-only template that could leave the failure branch's fields blank.
+
+**`after_null > 0` must be stated LOUDLY, never dropped silently** — this is already built into `embed_backfill_status` above (the `⚠ N still unembedded` prefix), so the history line is loud on that case by construction, not by a second template.
+
+**Pass the same line to the dream master** — carry `$embed_backfill_status` forward to Step 8, which adds one line to the COHORT METADATA block of the spawn prompt (`- Embedding backfill (Phase A): <embed_backfill_status>`) and one instruction sentence telling the dream master to copy it into the dream record — see Step 8 below.
+
 ### Step 4 — Reconcile today's history file (awake-state milestone log)
 
 `~/.engram/history/YYYY-MM-DD.md` is the **awake-state milestone log** — PRs shipped, decisions made, features delivered, key conversations. Distinct from the dream-record file that the dream master writes at `~/.engram/history/dream/YYYY-MM-DD.md` (filename = the NYC-local date the record was WRITTEN, per that spec's own Output contract), which captures consolidation output.
@@ -336,21 +380,25 @@ The directory is git-tracked for version history and diff-ability — per-day fi
 
 **Strategically reconcile `~/.engram/ask-{{USER_NAME}}.md`.** This file is the live daily discussion queue — ONLY the top 3 questions pending {{USER_NAME}}'s action, decision, or input. Across the day items change state (PRs merge, questions get answered, decisions get made). End-of-day reconcile catches anything that slipped during the day. **The prune side is a deterministic sweep, not a memory exercise** — a prepend-only reconcile leaves merged PRs sitting under "Ready" headings (the 2026-06-05 incident: three PRs merged at 17:1x survived that evening's reconcile as "Ready, all CI-green"; engram-alpha #830):
 
-- **Deterministic external-state sweep (the prune gate).** Extract every PR/issue number the file mentions, then check each against ground truth — not against your recollection of the day:
+- **Deterministic external-state sweep (the prune gate).** Extract every `owner/repo#N` PR/issue reference the file mentions, then check each against ground truth — not against your recollection of the day. **References MUST be written `owner/repo#N` (e.g. `engram-agents/engram#3188`), never a bare `#N`** — a bare number has no repo to check against, and `gh` silently resolves it against whichever repo happens to be the current checkout. On a multi-repo ask-file, two repos can share a PR/issue number; the cwd repo's own same-numbered item then answers in place of the real one, with no error (engram-alpha#3188: a bare `#N` swept from `engram-alpha`'s checkout reported four live `ai-portfolio` PRs as `MERGED`, four separate times, each time caught only because an agent happened to notice the repo name in the entry's own text):
 
   ```bash
-  grep -oE '#[0-9]+' ~/.engram/ask-{{USER_NAME}}.md | tr -d '#' | sort -un | while read -r n; do
-    state=$(gh pr view "$n" --json state -q .state 2>/dev/null) \
-      || state=$(gh issue view "$n" --json state -q .state 2>/dev/null) \
+  grep -oE '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+' ~/.engram/ask-{{USER_NAME}}.md | sort -u | while read -r ref; do
+    repo="${ref%#*}"
+    n="${ref#*#}"
+    state=$(gh pr view "$n" --repo "$repo" --json state -q .state 2>/dev/null) \
+      || state=$(gh issue view "$n" --repo "$repo" --json state -q .state 2>/dev/null) \
       || state=UNKNOWN
-    echo "#$n $state"
+    echo "$repo#$n $state"
   done
   ```
 
-  For every number reporting `MERGED`/`CLOSED`: if the entry's *only* pending state was that PR/issue (a "Ready"/"merge-queue"/"awaiting merge" line), **prune the entry**. If the entry carries an undecided sub-question alongside the resolved reference, keep the entry but strike the resolved reference. `UNKNOWN` (cross-repo numbers, rate limits) → leave untouched. **`#N` is not one namespace**: only sweep a number whose surrounding entry text reads as a GitHub PR/issue reference (preceded by `PR` / `issue` / `[closes`, or sitting in merge-queue context); numbers from any other namespace — forum posts, GitHub Projects, anything else `#`-prefixed — are NOT GitHub references and must be treated as `UNKNOWN`, because small numbers collide with ancient merged PRs and the failure direction is wrong-pruning a LIVE item. The prune authority is strictly limited to externally-checkable facts — the decision must be derivable from the `gh` output alone, never from your reading of what the user probably wants. Run from the repo the numbers belong to; for multi-repo ask-files, repeat per repo with `--repo` — a number from another repo can collide with a real local PR/issue number and silently report the wrong state.
+  For every reference reporting `MERGED`/`CLOSED`: if the entry's *only* pending state was that PR/issue (a "Ready"/"merge-queue"/"awaiting merge" line), **prune the entry**. If the entry carries an undecided sub-question alongside the resolved reference, keep the entry but strike the resolved reference. `UNKNOWN` (rate limits, a typo'd repo) → leave untouched. **A bare `#N` is never prune-eligible, unconditionally** — the extraction pattern above only matches `owner/repo#N`, so a bare number is never even a candidate; if one slips into the file some other way, treat it as `UNKNOWN (no repo)` and leave it alone rather than resolving it against the cwd repo as a fallback. The prune authority is strictly limited to externally-checkable facts from a correctly-repo-scoped `gh` call — the decision must be derivable from that output alone, never from your reading of what the user probably wants, and never from a same-number coincidence in the wrong repo. The pattern can also match a non-GitHub `path/segment#digits` string (a doc path with a line anchor, a markdown heading link) — harmless (the `gh --repo` call on a non-repo string just fails to `UNKNOWN`), but worth recognizing as the same not-a-reference class the `#N`-is-not-one-namespace guidance already names.
+
+  **One-time migration note:** any pre-existing entry written in the old bare-`#N` or bare-`repo#N` shorthand (e.g. `alpha#2400`) will not be matched by the new pattern at all — it drops out of sweep coverage silently (no `UNKNOWN` line, no error) rather than being flagged. The failure direction stays safe (under-detection, never a wrong prune), and the commit-log walk below is the fallback, but rewrite any such entry to full `owner/repo#N` the next time you touch it so it's covered by the deterministic gate again.
 - **Walk the day's commit log** (`git -C ~/engram-alpha log --since=6am`, plus other agent-touched repos) for resolutions the sweep can't see (questions answered in-session, decisions made verbally) — strike those too.
 - **Enforce the three-question cap after pruning.** Rank all still-unresolved questions by urgency and impact. Keep only the top 3 digest lines. Move every non-selected question to `~/.engram/ask-{{USER_NAME}}-backlog.md`, retaining its detail-slug link and leaving its detail section intact. Also move cross-day questions that are no longer actionable today. Never drop an unresolved fourth question merely to satisfy the cap.
-- **Audit trail**: list the pruned entries in the commit message body (`#N <one-line summary> — MERGED/CLOSED per gh`, same format as the dream-master's step 10), so a wrong prune is one `git -C ~/.engram revert` away.
+- **Audit trail**: list the pruned entries in the commit message body (`owner/repo#N <one-line summary> — MERGED/CLOSED per gh`, same format as the dream-master's step 10), so a wrong prune is one `git -C ~/.engram revert` away.
 - **Commit the file in .engram git** alongside the history file (same commit or separate, your call): `git -C ~/.engram add ask-{{USER_NAME}}.md ask-{{USER_NAME}}-backlog.md && git -C ~/.engram commit -m "ask-{{USER_NAME}}: end-of-day reconcile"`.
 
 This step exists because ask-{{USER_NAME}}.md is auto-loaded into every fresh session — stale items there make {{USER_NAME}} re-read items that are already resolved, and a stale "Ready" line invites a wasted merge attempt. The deterministic sweep is the structural defense against ask-list drift (mechanical gate > vigilance — the associative walk alone demonstrably drifts). (Installs without an ask-{{USER_NAME}}.md file can skip this sub-step; it's a no-op when the file doesn't exist. Installs without `gh` or without a GitHub-backed workflow: skip the sweep, keep the commit-log walk.)
@@ -977,6 +1025,7 @@ Agent(
     - Batch-summary cohort dir: <COHORT_DIR>
     - Recall summaries already applied by parent in Step 7.5: X applied, Y failures deferred to next cycle
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)
+    - Embedding backfill (Phase A): <embed_backfill_status>
 
     Call engram_reflect first for your initial agenda. Read every dream-fairy report from disk (tonight's drawn set, listed above — NOT a fixed count; check the list, not a hardcoded number). Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items.
 
@@ -991,7 +1040,7 @@ Agent(
     FIRST because a plain supersede/retract is REFUSED on a node carrying a pending marker
     (#2343/#2392), and the supersedes/retractions buckets below WILL CONTAIN such nodes.
 
-    Then execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures → coverage_gaps; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Include tonight's lottery-draw provenance (drawn/weights-before/weights-after, given above) in the dream record's own text — this is the durable log the design calls for. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
+    Then execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures → coverage_gaps; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Include tonight's lottery-draw provenance (drawn/weights-before/weights-after, given above) in the dream record's own text — this is the durable log the design calls for. Also copy the Embedding backfill line from COHORT METADATA above verbatim into the dream record (engram-alpha#345 PR1 part (c)). Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
 
     FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + the cascade-sweep line (pending-at-start -> remaining, passes run, and any loud stop verbatim) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
     run_in_background=true
@@ -1011,8 +1060,36 @@ The dream master returns:
 - Recall summaries: applied / fixed-at-spot / unfixable counts
 - Health score delta
 - Flagged-for-user count
+- awake-seat items: N (count of numbered items in `## For the awake seat`; 0 when the block is `none`)
 
-Relay this to the user in 3-6 short bullets. Surface the dream-record path so the user can read the "Flagged for the user" section in the morning review. Then stop. The session is over.
+Relay this to the user in 3-6 short bullets. Surface the dream-record path so the user can read the "Flagged for the user" section in the morning review. Then go to Step 9.5.
+
+### Step 9.5 — Triage the dream's awake-seat findings (parent; do now / file / defer)
+
+For EVERY item under `## For the awake seat` and `## Open for tomorrow` in the dream record the master just returned, write exactly ONE disposition:
+
+- `do now` — one command or one write (a question resolvable by one measurement; a task node to close; a one-line fix). Do it, and cite the resulting node id / commit / command output in the disposition line.
+- `file` — larger than one step: a GitHub issue (preferred when code, tooling or a skill changes) or an `engram_add_task` node whose text cites the dream record path. Write `file (#N)` or `file (tk_XXXX)`. An item already covered by an open issue or task is `file (existing #N)`.
+- `defer` — only with a one-line reason: `defer — <reason>`. A reason is required; "noted", "carried" and "for the awake seat" are NOT dispositions.
+
+Append the dispositions to the dream record as a new final section `## Sleep-end triage (parent)` — one line per item. **Keys, by POSITION:** awake-seat items are keyed by the master's number (`1. do now — …`, `2. file (#N) — …`); open-for-tomorrow items are keyed by their position in order of appearance, `o1`, `o2`, … (`o1. defer — <reason>`), whatever each bullet starts with (a node id such as `qu_XXXX`, an `ob_XXXX`, or plain text) — masters do not reliably write `qu_` bullets, but the parent can always count position. The section lists `1. …`, `2. …` first, then `o1. …`, `o2. …`. **Heading suffix:** a record's `## Open for tomorrow` heading may carry a parenthetical suffix (e.g. `## Open for tomorrow (awake work)`); match on the heading's prefix. The morning check in `session-start-reading` compares item counts per section against triage lines per prefix.
+
+**Empty block.** If `## For the awake seat` is the literal line `none` and `## Open for tomorrow` is empty, still append `## Sleep-end triage (parent)` with the single line `none (0 items)` and log `sleep-end triage: 0 items`.
+
+**Partial return.** If the master returned partial and the `## For the awake seat` block is ABSENT, append the section with one line `master returned partial — block absent; triaged from the fairy reports instead:` followed by any dispositions. Step 9.5 triages only what the fairy reports already contain; it runs no master step. Anything unfinished still goes to the next cohort via the "Don't retry an interrupted dream" guardrail below.
+
+Then commit, mirroring the master's own record commit (a second commit on the same file):
+
+```bash
+git -C ~/.engram add history/dream/YYYY-MM-DD.md
+git -C ~/.engram commit -m "dream YYYY-MM-DD: sleep-end triage"
+```
+
+Log one line in today's history file: `sleep-end triage: N items — D do-now, F filed, X deferred`. Then stop. The session is over.
+
+**Bounded exception to "Why Phase A is pre-turn-advance" (below).** Step 9.5's do-now writes land after `engram_advance_turn`, the case that section calls "artificially placed in the next cohort". Accepted deliberately and bounded: a do-now write acts on a dream finding, not on the just-ended cohort, so it belongs to the next cohort by content, not by accident. A morning read would file them in the same turn.
+
+**Why here.** The parent that spawned the master is the only guaranteed reader of its return, in context and awake; the master cannot act on its own findings (it files no observations and dispatches nothing). A morning read of the same block is kept as a backstop check (`session-start-reading`), not the primary path (alpha #3403).
 
 ---
 
@@ -1024,7 +1101,7 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 
 ## Guardrails
 
-- **Parent does NOT call `engram_reflect`, `engram_advance_turn`, or write the dream record.** Those are dream-master responsibilities. The parent's job is orchestration + relay.
+- **Parent does NOT call `engram_reflect` or `engram_advance_turn`, and does NOT write the dream record.** Those are dream-master responsibilities. One bounded exception: the Step 9.5 `## Sleep-end triage (parent)` append to the dream record, and its commit. The parent's job is otherwise orchestration + relay.
 
 - **Parent's context is light by design.** Dispatch + routing messages costs little context. If your context fills up during the routing phase, **nap first to clear it, then return and dispatch the full lottery-drawn set** — do not reduce or drop fairies from `types_to_run`. The dream master's context is separate and unaffected by parent compaction. (See the Phase B mandatory invariant above: context pressure is never a reason to skip fairies.)
 

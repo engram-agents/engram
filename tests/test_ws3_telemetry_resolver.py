@@ -367,7 +367,9 @@ def _drive_surface_hook_to_trigger_fire(mod, monkeypatch, principle_rendered):
     # `_principle_rendered = []` when it's falsy (the semantic-keyword
     # fallback path) -- returning "" would silently zero out the very
     # `_principle_rendered` value this stub exists to control.
-    mod.check_principle_triggers_full = lambda matched_ids, prompt_count: (
+    # #3521 row 7: main() now also passes the optional `unknown` list; row 40
+    # adds the optional `state_unknown` list the same way.
+    mod.check_principle_triggers_full = lambda matched_ids, prompt_count, unknown=None, state_unknown=None: (
         "[stub principle trigger text]",
         principle_rendered,
     )

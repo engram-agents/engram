@@ -47,13 +47,15 @@ Plus the two original #276 daemon-thread tests, updated for the new split
 Plus two round-2 tests (`embedding-gate-round2.md`), folding the round-1
 review's blocker + escalated suggestion on PR #2485:
 
-  7. test_enabled_false_bypasses_gate_entirely — `embedding.enabled: false`
-     in config; the gate must return normally (no SystemExit), must not
-     reach `is_available()`/`_embedding_cache_status()` (full bypass, same
-     shape as the ENGRAM_NO_EMBEDDINGS bypass), must start no thread, and
-     must print nothing. This is a regression fix: the round-1 gate never
-     read `enabled` at all, so this documented, still-live opt-out could no
-     longer boot the server.
+  7. test_enabled_false_exits_nonzero_with_recovery_message — (#345 PR2,
+     retiring the toggle) `embedding.enabled: false` in config is now FATAL:
+     the gate must `sys.exit(1)` and the stderr message must name the key
+     (`embedding.enabled`), the issue (#345), and the fix (delete the key).
+     This SUPERSEDES the old round-2 bypass test of the same number — the
+     toggle's own test, updated in place rather than left asserting retired
+     behavior. `test_no_embeddings_env_bypasses_even_with_enabled_false`
+     (test 3's class) confirms ENGRAM_NO_EMBEDDINGS=1 still bypasses even
+     when `enabled: false` is also set — checked FIRST, unchanged.
 
   8. test_cache_key_slash_handling — `_embedding_cache_status` mirrors
      `SentenceTransformer`'s clause-3 org-prefix rule: a slash-containing
@@ -222,12 +224,115 @@ class TestNoEmbeddingsBypassesGate:
                 # Must return normally -- no SystemExit.
                 server._embedding_startup_gate()
 
+            # (#3350) The gate must print EXACTLY ONE WARNING line to
+            # stderr when bypassed -- loud, not silent. Ignore the
+            # "sqlite-vec unavailable" notice: that is printed by
+            # `_import_server()` above (at `import engram_core` time) on any
+            # interpreter without sqlite-vec installed, and has nothing to
+            # do with the gate under test here.
             captured = capsys.readouterr()
-            assert captured.err == "", (
-                f"expected no error output when bypassed, got: {captured.err!r}"
+            gate_lines = [
+                line for line in captured.err.splitlines()
+                if "sqlite-vec unavailable" not in line
+            ]
+            assert len(gate_lines) == 1, (
+                f"expected exactly one stderr line from the gate when "
+                f"bypassed (ignoring the sqlite-vec import notice), got: "
+                f"{gate_lines!r}"
+            )
+            assert gate_lines[0].startswith("[engram] WARNING:"), (
+                f"expected the one line to start with '[engram] WARNING:', "
+                f"got: {gate_lines[0]!r}"
+            )
+            assert "ENGRAM_NO_EMBEDDINGS" in gate_lines[0], (
+                f"expected the WARNING line to name ENGRAM_NO_EMBEDDINGS, "
+                f"got: {gate_lines[0]!r}"
             )
         finally:
             os.environ.pop("ENGRAM_NO_EMBEDDINGS", None)
+
+    def test_no_embeddings_env_bypasses_even_with_enabled_false(self, capsys):
+        """(#345 PR2) ENGRAM_NO_EMBEDDINGS=1 is checked FIRST, before config
+        is even read -- so it still fully bypasses even when the (now-fatal)
+        `enabled: false` key is also present. _get_embedding_config must
+        never be called when bypassed."""
+        os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
+        try:
+            server = _import_server()
+
+            with mock.patch.object(
+                server, "_get_embedding_config",
+                side_effect=AssertionError("_get_embedding_config() must not be called when NO_EMBEDDINGS bypasses first"),
+            ), mock.patch.object(
+                server._embedder, "is_available",
+                side_effect=AssertionError("is_available() must not be called when bypassed"),
+            ), mock.patch.object(
+                server, "_embedding_cache_status",
+                side_effect=AssertionError("_embedding_cache_status() must not be called when bypassed"),
+            ):
+                # Must return normally -- no SystemExit.
+                server._embedding_startup_gate()
+
+            # (#3350) Same contract as test 3: exactly one WARNING line,
+            # checked FIRST so this fires even with enabled: false also
+            # present. Ignore the "sqlite-vec unavailable" notice: that is
+            # printed by `_import_server()` above (at `import engram_core`
+            # time) on any interpreter without sqlite-vec installed, and has
+            # nothing to do with the gate under test here.
+            captured = capsys.readouterr()
+            gate_lines = [
+                line for line in captured.err.splitlines()
+                if "sqlite-vec unavailable" not in line
+            ]
+            assert len(gate_lines) == 1, (
+                f"expected exactly one stderr line from the gate when "
+                f"bypassed (ignoring the sqlite-vec import notice), got: "
+                f"{gate_lines!r}"
+            )
+            assert gate_lines[0].startswith("[engram] WARNING:"), (
+                f"expected the one line to start with '[engram] WARNING:', "
+                f"got: {gate_lines[0]!r}"
+            )
+            assert "ENGRAM_NO_EMBEDDINGS" in gate_lines[0], (
+                f"expected the WARNING line to name ENGRAM_NO_EMBEDDINGS, "
+                f"got: {gate_lines[0]!r}"
+            )
+        finally:
+            os.environ.pop("ENGRAM_NO_EMBEDDINGS", None)
+
+
+# ---------------------------------------------------------------------------
+# Test 3b (#3350): no WARNING line when ENGRAM_NO_EMBEDDINGS is unset and
+# the embedder is healthy -- the new print must be scoped to the bypass
+# branch only, not leak onto the happy path.
+# ---------------------------------------------------------------------------
+
+class TestNoWarningWhenEnvUnsetAndHealthy:
+    def test_no_warning_line_when_unset_and_embedder_healthy(self, capsys):
+        os.environ.pop("ENGRAM_NO_EMBEDDINGS", None)
+        server = _import_server()
+
+        _FakeThread.instances = []
+        with mock.patch.object(server._embedder, "is_available", return_value=True), \
+             mock.patch.object(server, "_embedding_cache_status", return_value=True), \
+             mock.patch.object(server, "_get_embedding_config", return_value={"model": MODEL}), \
+             mock.patch.object(
+                 server._embedder, "_load_model",
+                 side_effect=AssertionError("_load_model must not be called synchronously"),
+             ), \
+             mock.patch("threading.Thread", side_effect=lambda **kw: _FakeThread(**kw)):
+            # Must not raise.
+            server._embedding_startup_gate()
+
+        captured = capsys.readouterr()
+        gate_lines = [
+            line for line in captured.err.splitlines()
+            if "sqlite-vec unavailable" not in line
+        ]
+        assert not any(line.startswith("[engram] WARNING:") for line in gate_lines), (
+            f"expected no WARNING line on the healthy, unset-env path, got: "
+            f"{gate_lines!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -333,11 +438,11 @@ class TestPrewarmHandlesLoadException:
 
 
 # ---------------------------------------------------------------------------
-# Test 7 (round 2): embedding.enabled: false fully bypasses the gate
+# Test 7 (#345 PR2 -- retired): embedding.enabled: false is now FATAL
 # ---------------------------------------------------------------------------
 
-class TestEnabledFalseBypassesGate:
-    def test_enabled_false_bypasses_gate_entirely(self, capsys):
+class TestEnabledFalseIsFatal:
+    def test_enabled_false_exits_nonzero_with_recovery_message(self, capsys):
         os.environ.pop("ENGRAM_NO_EMBEDDINGS", None)
         server = _import_server()
 
@@ -346,22 +451,99 @@ class TestEnabledFalseBypassesGate:
             return_value={"model": MODEL, "enabled": False},
         ), mock.patch.object(
             server._embedder, "is_available",
-            side_effect=AssertionError("is_available() must not be called when enabled=False"),
+            side_effect=AssertionError("is_available() must not be called when enabled=False is already fatal"),
         ), mock.patch.object(
             server, "_embedding_cache_status",
-            side_effect=AssertionError("_embedding_cache_status() must not be called when enabled=False"),
+            side_effect=AssertionError("_embedding_cache_status() must not be called when enabled=False is already fatal"),
         ), mock.patch("threading.Thread", side_effect=lambda **kw: _FakeThread(**kw)):
             _FakeThread.instances = []
-            # Must return normally -- no SystemExit.
-            server._embedding_startup_gate()
+            with pytest.raises(SystemExit) as exc_info:
+                server._embedding_startup_gate()
 
+        assert exc_info.value.code != 0, (
+            f"expected non-zero exit, got {exc_info.value.code!r}"
+        )
         assert _FakeThread.instances == [], (
             f"expected no thread dispatch, got {_FakeThread.instances}"
         )
 
         captured = capsys.readouterr()
-        assert captured.err == "", (
-            f"expected no error output when enabled=False, got: {captured.err!r}"
+        assert "embedding.enabled" in captured.err, (
+            f"expected the retired key name 'embedding.enabled' in stderr, got: {captured.err!r}"
+        )
+        assert "#345" in captured.err, (
+            f"expected the retirement issue '#345' in stderr, got: {captured.err!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 7b (round 2, R1 -- PR #3339 review suggestion 1): the gate must use
+# `is not True`, not Python truthiness, so a non-bool "enabled" value (e.g.
+# a quoted string "false") is ALSO fatal instead of silently passing.
+# ---------------------------------------------------------------------------
+
+class TestEnabledNonTrueValuesAreFatal:
+    @pytest.mark.parametrize("value", ["false", "no", "true", 0, None, False])
+    def test_non_true_value_exits_nonzero_with_recovery_message(self, capsys, value):
+        os.environ.pop("ENGRAM_NO_EMBEDDINGS", None)
+        server = _import_server()
+
+        with mock.patch.object(
+            server, "_get_embedding_config",
+            return_value={"model": MODEL, "enabled": value},
+        ), mock.patch.object(
+            server._embedder, "is_available",
+            side_effect=AssertionError("is_available() must not be called when enabled is not True"),
+        ), mock.patch.object(
+            server, "_embedding_cache_status",
+            side_effect=AssertionError("_embedding_cache_status() must not be called when enabled is not True"),
+        ), mock.patch("threading.Thread", side_effect=lambda **kw: _FakeThread(**kw)):
+            _FakeThread.instances = []
+            with pytest.raises(SystemExit) as exc_info:
+                server._embedding_startup_gate()
+
+        assert exc_info.value.code != 0, (
+            f"expected non-zero exit for enabled={value!r}, got {exc_info.value.code!r}"
+        )
+        assert _FakeThread.instances == [], (
+            f"expected no thread dispatch for enabled={value!r}, got {_FakeThread.instances}"
+        )
+
+        captured = capsys.readouterr()
+        assert "embedding.enabled" in captured.err, (
+            f"expected the retired key name in stderr for enabled={value!r}, got: {captured.err!r}"
+        )
+        assert repr(value) in captured.err, (
+            f"expected the offending value's repr ({value!r}) in stderr, got: {captured.err!r}"
+        )
+        assert "falsy" not in captured.err, (
+            f"message must no longer say 'falsy', got: {captured.err!r}"
+        )
+
+    @pytest.mark.parametrize("config", [
+        {"model": MODEL, "enabled": True},
+        {"model": MODEL},  # key absent entirely
+    ])
+    def test_true_or_absent_does_not_exit_from_this_branch(self, config):
+        os.environ.pop("ENGRAM_NO_EMBEDDINGS", None)
+        server = _import_server()
+
+        _FakeThread.instances = []
+        with mock.patch.object(server._embedder, "is_available", return_value=True), \
+             mock.patch.object(server, "_embedding_cache_status", return_value=True), \
+             mock.patch.object(server, "_get_embedding_config", return_value=config), \
+             mock.patch.object(
+                 server._embedder, "_load_model",
+                 side_effect=AssertionError("_load_model must not be called synchronously"),
+             ), \
+             mock.patch("threading.Thread", side_effect=lambda **kw: _FakeThread(**kw)):
+            # Must not raise -- if the enabled-value branch wrongly fires for
+            # True/absent, this raises SystemExit instead of proceeding.
+            server._embedding_startup_gate()
+
+        assert len(_FakeThread.instances) == 1, (
+            f"expected the gate to proceed past the enabled check for "
+            f"config={config!r}, got {_FakeThread.instances}"
         )
 
 

@@ -274,6 +274,36 @@ def test_query_embedding_returns_computed_vector_when_available():
     )
 
 
+def test_query_embedding_ignores_enabled_false():
+    """(#345 PR2, A2) The `include_query_embedding` gate (engram_query.py
+    ~2456) no longer consults the retired `enabled` key: with
+    `enabled: False` mocked (embedder otherwise available), the computed
+    vector must still pass through -- identical setup to
+    test_query_embedding_returns_computed_vector_when_available, just
+    enabled=False.
+
+    Mutation target: restoring the
+    `core._get_embedding_config().get("enabled", True)` check here turns
+    this RED (query_embedding reverts to None).
+    """
+    import unittest.mock as mock
+    server = fresh_server()
+    _seed_one_observation(server, "query-embedding-enabled-false-test")
+    fake_vector = [0.4, 0.5, 0.6]
+    with mock.patch("engram_query.core._embedder.is_available", return_value=True), \
+         mock.patch("engram_query.core._get_embedding_config", return_value={"model": "fake-model", "enabled": False}), \
+         mock.patch("engram_query.core._embedder.embed", return_value=fake_vector):
+        result_str = server._surface_impl(
+            query="query embedding test claim", semantic=False, include_query_embedding=True,
+        )
+    r = json.loads(result_str)
+    assert "error" not in r, f"Unexpected error: {r}"
+    assert r.get("match_count", 0) > 0, f"Expected a match, got: {r}"
+    assert r.get("query_embedding") == fake_vector, (
+        f"expected the mocked vector despite enabled=False, got: {r.get('query_embedding')}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 9. _created_minutes_ago (engram_core) — companion to _humanized_ago, feeds
 #    the same-session-echo guard's numeric N-minutes threshold check.

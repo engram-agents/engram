@@ -72,6 +72,8 @@ from forum_api import (
 # ("Scope note") for why: they keep their own verbatim definitions further
 # down in this file, unchanged by this refactor.
 from baton_gate import (
+    GITHUB_ANCHOR_ACCEPTED_FORMS,
+    PR_ANCHOR_TWO_ROUTE_HINT,
     _parse_github_anchor,
     _dedupe_checks_by_latest,
     _pr_ci_state,
@@ -142,8 +144,8 @@ def _require_forum(config=None) -> None:
     """
     if not _is_forum_configured(config):
         print(
-            "baton: no forum configured (set forum.url or agent_name in "
-            "config.json); baton requires a configured forum.",
+            "baton: no forum configured (set forum.url in config.json); "
+            "baton requires a configured forum.",
             file=sys.stderr,
         )
         sys.exit(EXIT_STATE)
@@ -201,18 +203,24 @@ def _get_agent_name(config: Optional[dict] = None) -> str:
 
 
 def _is_forum_configured(config: Optional[dict] = None) -> bool:
-    """Return True if forum is explicitly configured (url or agent_name set).
+    """Return True if a forum is configured: ``forum.url`` is a non-empty string.
 
-    Gates write commands: if neither forum.url nor agent_name is in config,
-    baton refuses with an actionable message. Mirrors ia.py / the engram hook
-    helper.
+    Gates write commands: no ``forum.url`` -> baton refuses with an actionable
+    message (``status`` / ``show`` exit 0 silently). ``agent_name`` alone is
+    this agent's identity, not forum configuration, and does not pass the
+    gate. Total: any other shape (non-dict config or ``forum``, non-string or
+    blank ``url``) is "not configured" and never raises. Same rule as the
+    forum/baton/inter-agent prompt hooks, ``ia.py`` and ``engram_client.py``.
     """
     if config is None:
         config = _load_config()
-    forum_cfg = config.get("forum", {})
-    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
-    has_agent = bool(config.get("agent_name", "").strip())
-    return has_url or has_agent
+    if not isinstance(config, dict):
+        return False
+    forum_cfg = config.get("forum")
+    if not isinstance(forum_cfg, dict):
+        return False
+    url = forum_cfg.get("url")
+    return isinstance(url, str) and bool(url.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +228,7 @@ def _is_forum_configured(config: Optional[dict] = None) -> bool:
 # ---------------------------------------------------------------------------
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
+_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):[ \t]*(.*)$", re.MULTILINE)
 
 # Participants list format: [alice, bob] or alice,bob
 _PARTICIPANTS_LIST_RE = re.compile(r"^\[?(.*?)\]?$")
@@ -314,6 +322,19 @@ _PROJECT_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*-[A-Za-z0-9][A-Za-z0-9_-]*$
 # with the sibling copy in hooks/claude/engram-baton-prompt-hook.py.
 _PR_BATON_NAME_RE = re.compile(r"^(?:[A-Z][A-Z0-9]*-)?PR-")
 
+# The NUMBER-carrying subset of _PR_BATON_NAME_RE (#2916): the same optional
+# single prefix segment, then "PR-<N>", optionally followed by a "-<slug>"
+# tail (PR-37-paper). Group 1 is the PR number. MATCH IT ON project_id.upper(),
+# exactly like the effective classifier (_is_pr_shaped does
+# _PR_BATON_NAME_RE.match(id.upper())), so case variants such as "umwelt-pr-5"
+# -- which ARE PR batons -- also derive an anchor and get the refusal instead
+# of the silent anchorless dead end. `cmd_init` uses it for BOTH the bare
+# pr/<N> auto-derive and the colleague-warning check, so "is a PR baton" and
+# "derives an anchor" agree. The prefix is NEVER mapped to a repo (#1918:
+# there is no default repo) -- only the number is read from the id; the repo
+# must come from --repo / --github.
+_PR_BATON_NUMBER_RE = re.compile(r"^(?:[A-Z][A-Z0-9]*-)?PR-(\d+)(?:-.+)?$")
+
 # _GITHUB_ANCHOR_RE and _parse_github_anchor now live in baton_gate.py
 # (#2884, second half) -- imported above, shared with src/forum/server.py's
 # api_project_flip. See baton_gate.py for the full "#1918: no default repo"
@@ -367,7 +388,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     if len(participants) < 1:
         print(
             "baton init: --participants requires at least one agent name "
-            "(e.g. --participants borges,ariadne).",
+            "(e.g. --participants alice,bob).",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -378,12 +399,10 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     # no APPROVED review will be rejected. Without it, the gate falls back to
     # single-agent (warn-only) mode.
     colleague_name = getattr(args, "colleague", None)
-    colleague_note = ""
     if colleague_name:
         colleague_name = colleague_name.strip().lower()
         if colleague_name and colleague_name not in participants:
             participants.append(colleague_name)
-        colleague_note = f"Colleague reviewer: {colleague_name}"
 
     # Default turn: the invoking agent (if in participants) else first participant
     if args.turn:
@@ -418,8 +437,8 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         if not _GITHUB_ANCHOR_RE.match(github_anchor):
             print(
                 f"baton init: invalid --github value '{github_anchor}'. "
-                "Expected pr/<N>, pr/<owner>/<repo>/<N>, or project/<N> "
-                "(e.g. pr/490, pr/engram-agents/engram-paper/22, project/4).",
+                f"Accepted forms: {GITHUB_ANCHOR_ACCEPTED_FORMS} "
+                "(e.g. pr/490, pr/owner/repo/22, project/4, project/owner/4).",
                 file=sys.stderr,
             )
             sys.exit(EXIT_VALIDATION)
@@ -431,9 +450,26 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     # different places pre-#1715, is exactly what let a repo-unqualified
     # match silently corrupt a cross-repo baton's stored status).
     if github_anchor is None:
-        _pr_from_id = re.match(r"^(?:PR-|pr-)(\d+)$", project_id)
+        _pr_from_id = _PR_BATON_NUMBER_RE.match(project_id.upper())
         if _pr_from_id:
             github_anchor = f"pr/{_pr_from_id.group(1)}"
+
+    def _refuse_unanchored_pr_shaped(repo_hint: Optional[str]) -> None:
+        """#3364: two-route refusal for a PR-shaped id with no resolvable anchor."""
+        _slot = f"{repo_hint}/<N>" if repo_hint else "<owner>/<repo>/<N>"
+        print(
+            f"baton init: refusing to create '{project_id}': its id is "
+            "PR-shaped but no PR anchor can be resolved from it (no number to "
+            "derive, no --github), so it would be a PR baton nothing can "
+            "verify at the peer->merge gate. Pick the route that matches: "
+            f"{PR_ANCHOR_TWO_ROUTE_HINT}.\n"
+            f"    it IS a PR:     baton init {project_id} ... "
+            f"--github pr/{_slot}\n"
+            f"    it is NOT a PR: baton init {project_id} ... "
+            "--github project/<N>   (a bunch), or use a non-PR-shaped id",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
 
     # --repo qualifies a pr/<N> anchor to pr/<owner>/<repo>/<N> (#1715).
     # Effectively REQUIRED for every PR-baton now (#1918: there is no
@@ -445,11 +481,13 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         if not re.match(r"^[\w.-]+/[\w.-]+$", repo_arg):
             print(
                 f"baton init: invalid --repo value '{repo_arg}'. "
-                "Expected owner/repo (e.g. engram-agents/engram-paper).",
+                "Expected owner/repo (e.g. owner/repo).",
                 file=sys.stderr,
             )
             sys.exit(EXIT_VALIDATION)
         parsed = _parse_github_anchor(github_anchor) if github_anchor else None
+        if not github_anchor and _is_pr_shaped(project_id, ""):
+            _refuse_unanchored_pr_shaped(repo_arg)
         if parsed is None or parsed[0] != "pr":
             print(
                 "baton init: --repo only applies to a PR anchor "
@@ -511,11 +549,14 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     # deliberately.
     #
     # Scope note: fires only when an anchor RESOLVES TO A PR and is
-    # unqualified. A baton with no github anchor at all (a DESIGN-* project,
-    # or a PR-shaped id the auto-derive regex doesn't match, e.g.
-    # UMWELT-PR-<N>) is untouched -- cmd_gc already counts those as ungauged,
-    # and widening this to cover them needs a broader notion of "is this a PR
-    # baton" than project_id shape alone. Tracked in #1924, not guessed at.
+    # unqualified. The auto-derive covers every number-carrying PR-baton id
+    # (_PR_BATON_NUMBER_RE: PR-<N>, <PREFIX>-PR-<N>, PR-<N>-<slug>, #2916), so
+    # UMWELT-PR-<N> is refused without --repo/--github just like bare PR-<N>
+    # -- it used to mint with NO anchor, silently, and dead-end at the
+    # peer->merge flip. The prefix is deliberately NOT mapped to a repo.
+    # A baton with no github anchor at all (a DESIGN-* project, a bunch id,
+    # an id with two prefix segments) is untouched -- cmd_gc already
+    # counts those as ungauged.
     _final_anchor = _parse_github_anchor(github_anchor) if github_anchor else None
     if _final_anchor is not None and _final_anchor[0] == "pr" and _final_anchor[1] is None:
         _n = _final_anchor[2]
@@ -531,6 +572,21 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
+
+    # #3364: fail closed on a PR-SHAPED id that resolved NO anchor (no
+    # --github, no number derivable from the id: "PR-autopull", "PR-12abc").
+    # It would classify as a PR baton (fairy phase) yet carry nothing the
+    # peer->merge gate can verify, and the anchor is write-once after fairy
+    # phase -- the same dead end #2916 closed for derivable ids. Refuse here,
+    # before the POST, while the author can still fix it. Anchor-first, as
+    # everywhere: an explicit anchor (incl. project/<N>) decides. This is
+    # DISJOINT from the #1924/#2916 refusal above (that one needs a resolved
+    # unqualified anchor; this one needs github_anchor empty), so their
+    # relative order is not load-bearing. With --repo, the same refusal is
+    # raised earlier from the --repo guard (which would otherwise exit first
+    # with a less helpful message).
+    if not github_anchor and _is_pr_shaped(project_id, ""):
+        _refuse_unanchored_pr_shaped(repo_arg)
 
     title = args.title or project_id
     init_reason = f"project initialized by {agent_name or 'unknown'}"
@@ -582,7 +638,11 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         sys.exit(EXIT_IO)
     except ForumHttpError as e:
         if e.status == 409:
-            print(f"baton init: project already exists: {project_id}", file=sys.stderr)
+            # #3432: surface the server's own text -- for a case-variant refusal it
+            # names the requested AND the existing id(s), which a seat needs to pick
+            # the live one. An exact duplicate's server text is the same wording
+            # as before ("project already exists: <id>").
+            print(f"baton init: {_server_refusal_text(e)}", file=sys.stderr)
         else:
             print(f"baton init: server error {e.status}: {e.body}", file=sys.stderr)
         sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
@@ -602,8 +662,8 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     # participants (participants ⊆ {initial turn holder, sentinel}), warn at
     # creation time
     # so the gap surfaces here rather than silently at flip.
-    _is_bare_pr_id = re.match(r"^(?:PR-|pr-)(\d+)$", project_id)
-    if _is_bare_pr_id:
+    _is_pr_baton_id = _PR_BATON_NUMBER_RE.match(project_id.upper())
+    if _is_pr_baton_id:
         _sentinel = _pool_sentinel()
         # Colleague candidates: participants other than the initial turn
         # holder and the pool sentinel. (This is about the COLLEAGUE gate --
@@ -956,6 +1016,107 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     print(f"baton flip: {project_id} → {to_agent}")
     print(f"  from:   {from_agent}")
     print(f"  reason: {reason}")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: advance  (#3039 U2b -- the strict peer -> merge edge)
+# ---------------------------------------------------------------------------
+
+# The two limits the strict gate carries. Kept as module constants so --help,
+# the protocol doc and the tests quote ONE wording.
+ADVANCE_D2_LIMIT = (
+    "This gate proves an authenticated non-author GitHub approval by a mapped "
+    "account on the current head; it does not prove that the assigned colleague "
+    "approved (the colleague and agent fields are caller-declared and mutable), "
+    "nor who ran this command."
+)
+ADVANCE_C4_LIMIT = (
+    "The GitHub verdict and the forum write are not one cross-system transaction: "
+    "a CHANGES_REQUESTED review landing between them still advances (the window is "
+    "one HTTP round trip)."
+)
+
+
+def _advance_error_text(body: str) -> str:
+    """Pull the server's `error` string out of a JSON error body, else the raw body."""
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict) and parsed.get("error"):
+            return str(parsed["error"])
+    except (ValueError, TypeError):
+        pass
+    return body
+
+
+def cmd_advance(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
+    """`baton advance <PR-ID> [--to MERGE-SEAT]` -- thin client of the SERVER-authoritative
+    peer -> merge gate. The server decides; this only builds the request and prints both
+    verdicts. There is no force / skip path."""
+    _require_forum(config)
+
+    project_id = args.project_id
+    err = _validate_project_id(project_id)
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    raw = _api_get_raw(client, project_id)
+    fields, body = _parse_frontmatter(raw)
+    if not fields:
+        print(
+            f"baton advance: cannot parse frontmatter for '{project_id}'. "
+            "The record may be malformed.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    to_agent = (args.to or "").strip().lower()
+    if not to_agent:
+        # Friendly default only: the merge seat is the one participant who is
+        # neither the author nor the colleague. Ambiguous => ask, never guess.
+        participants_str = fields.get("participants", "").strip()
+        participants = _parse_participants(participants_str) if participants_str else []
+        author = fields.get("author", "").strip().lower() or _derive_legacy_author(body)
+        colleague = fields.get("colleague", "").strip().lower()
+        candidates = [p for p in participants if p not in (author, colleague)]
+        if len(candidates) != 1:
+            print(
+                f"baton advance: cannot tell who the merge seat is for '{project_id}' "
+                f"(participants other than author and colleague: {candidates or 'none'}). "
+                "Name it: baton advance " + shlex.quote(project_id) + " --to <merge-seat>",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        to_agent = candidates[0]
+
+    from_agent = fields.get("turn", agent_name or "unknown").strip().lower()
+    try:
+        out = client.post(f"/api/projects/{project_id}/advance", {
+            "agent": agent_name or from_agent,
+            "to_agent": to_agent,
+            "reason": args.reason,
+        })
+    except ForumNetworkError as e:
+        print(f"baton advance: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton advance: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton advance: refused ({e.status}): {_advance_error_text(e.body)}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
+
+    if not out.get("advanced"):
+        print(f"baton advance: {project_id} is already at phase merge -- nothing to do "
+              "(no new turn, no wake).")
+        return
+    print(f"baton advance: {project_id} peer → merge, turn → {out.get('turn', to_agent)}")
+    ci = out.get("ci") or {}
+    approval = out.get("approval") or {}
+    print(f"  CI:       {ci.get('state', '?')} ({ci.get('detail', '')})")
+    print(f"  approval: {approval.get('state', '?')} ({approval.get('detail', '')})")
+    for w in out.get("warnings") or []:
+        print(f"warning: {w}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -1703,6 +1864,18 @@ def cmd_show(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
 # Subcommand: close
 # ---------------------------------------------------------------------------
 
+def _server_refusal_text(e: "ForumHttpError") -> str:
+    """The server's own ``error`` string from a 403/409 refusal body (#3313),
+    falling back to the raw body when it is not the usual ``{"error": ...}`` JSON."""
+    try:
+        parsed = json.loads(e.body)
+        if isinstance(parsed, dict) and parsed.get("error"):
+            return str(parsed["error"])
+    except (ValueError, TypeError):
+        pass
+    return str(e.body)
+
+
 def cmd_close(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     _require_forum(config)
 
@@ -1757,6 +1930,11 @@ def cmd_close(args: argparse.Namespace, config: dict, agent_name: str, client: F
         if e.status == 404:
             print(f"baton close: project not found: {project_id}", file=sys.stderr)
             sys.exit(EXIT_STATE)
+        if e.status in (403, 409):
+            # #3313: server-side refusal (non-participant / already closed) --
+            # print the server's message verbatim; nothing was written.
+            print(f"baton close: refused (HTTP {e.status}): {_server_refusal_text(e)}", file=sys.stderr)
+            sys.exit(EXIT_VALIDATION)
         print(f"baton close: server error {e.status}: {e.body}", file=sys.stderr)
         sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
     print(f"baton close: {project_id} → {new_status}")
@@ -1831,6 +2009,10 @@ def cmd_reopen(args: argparse.Namespace, config: dict, agent_name: str, client: 
         if e.status == 404:
             print(f"baton reopen: project not found: {project_id}", file=sys.stderr)
             sys.exit(EXIT_STATE)
+        if e.status in (403, 409):
+            # #3313: server-side refusal -- print the server's message verbatim.
+            print(f"baton reopen: refused (HTTP {e.status}): {_server_refusal_text(e)}", file=sys.stderr)
+            sys.exit(EXIT_VALIDATION)
         print(f"baton reopen: server error {e.status}: {e.body}", file=sys.stderr)
         sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
     print(f"baton reopen: {project_id} → {new_status}")
@@ -2015,7 +2197,20 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
             })
             print(f"baton gc: closed {project_id} → {new_status} ({repo}#{pr_num})")
             closed += 1
-        except (ForumNetworkError, ForumHttpError) as e:
+        except ForumHttpError as e:
+            if e.status in (403, 409, 503):
+                # #3416: the server derives the PR state itself (the client's
+                # new_status is advisory only). 409 = refused (PR still OPEN /
+                # already closed); 503 = server could not read GitHub; 403 =
+                # unanchored baton and the caller is not a participant (same
+                # refusal /status gives). Either way nothing was written; print
+                # the server's own message.
+                print(f"baton gc: server refused {project_id} (HTTP {e.status}): "
+                      f"{_server_refusal_text(e)}", file=sys.stderr)
+            else:
+                print(f"baton gc: write failed for {project_id}: {e!r}", file=sys.stderr)
+            failed += 1
+        except ForumNetworkError as e:
             print(f"baton gc: write failed for {project_id}: {e!r}", file=sys.stderr)
             failed += 1
         except Exception as e:
@@ -2137,8 +2332,8 @@ def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str, client: 
     if not _GITHUB_ANCHOR_RE.match(github_anchor):
         print(
             f"baton anchor: invalid --github value '{github_anchor}'. "
-            "Expected pr/<N>, pr/<owner>/<repo>/<N>, or project/<N> "
-            "(e.g. pr/490, pr/engram-agents/engram-paper/22, project/4).",
+            f"Accepted forms: {GITHUB_ANCHOR_ACCEPTED_FORMS} "
+            "(e.g. pr/490, pr/owner/repo/22, project/4, project/owner/4).",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -2329,6 +2524,31 @@ def cmd_set_colleague(args: argparse.Namespace, config: dict, agent_name: str, c
 # ---------------------------------------------------------------------------
 # Subcommand: merge  (gate-checked merge verb — #999 + #1000)
 # ---------------------------------------------------------------------------
+
+_ALREADY_CLOSED_TEXT = "refusing to overwrite a closed status"
+
+
+def _merge_already_closed_status(e: "ForumHttpError"):
+    """#3494: the closed status named by an already-closed 409 from POST /merge,
+    else None. Reads the machine field (``reason == "already_closed"``); an older
+    server has none, so fall back to the stable fragment of its error text.
+    Returns ``""`` if recognised but the status cannot be read (callers must test
+    ``is not None``, not truthiness)."""
+    try:
+        parsed = json.loads(e.body)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if parsed.get("reason") == "already_closed":
+        status = parsed.get("status")
+        return str(status).strip() if status else ""
+    err = parsed.get("error")
+    if isinstance(err, str) and _ALREADY_CLOSED_TEXT in err:
+        m = re.search(r"is already (\S+?);", err)
+        return m.group(1) if m else ""
+    return None
+
 
 def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Squash-merge a PR through the baton gate ladder.
@@ -2626,6 +2846,35 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
         sys.exit(EXIT_IO)
     except ForumHttpError as e:
         print(f"baton merge: baton closure failed ({e.status}): {e.body}", file=sys.stderr)
+        _closed_as = _merge_already_closed_status(e) if e.status == 409 else None
+        if _closed_as is not None:
+            # #3494: someone closed the baton between Gate 1's read and this
+            # write (the window spans `gh pr merge`). The GitHub merge DID
+            # succeed; "retry later" would 409 again, so say what happened.
+            _as = f" as {_closed_as}" if _closed_as else ""
+            _check = (
+                "If that status is merged, nothing more is needed."
+                if _closed_as
+                else "Check the baton's status: if it is merged, nothing more is needed."
+            )
+            print(
+                f"  (GitHub merge succeeded, but the baton was already closed{_as} "
+                f"when the closure was written -- someone closed it "
+                f"after this command read it. {_check} "
+                f"Otherwise: baton reopen {project_id}, then "
+                f"baton close {project_id} --status merged)",
+                file=sys.stderr,
+            )
+        elif e.status in (409, 503):
+            # #3416: the server re-reads GitHub itself before closing. 409 = it
+            # does not (yet) see the PR as MERGED; 503 = it could not read
+            # GitHub. Nothing was written; the GitHub merge above did succeed.
+            print(
+                f"  (GitHub merge succeeded; the server could not confirm it. "
+                f"Retry later, or close the baton: baton close {project_id} "
+                f"--status merged)",
+                file=sys.stderr,
+            )
         sys.exit(EXIT_IO)
 
     print(f"baton merge: PR #{pr_number} merged (squash)")
@@ -2646,7 +2895,6 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Protocol docs: docs/baton-protocol.md\n"
-            "Projects dir:  /home/agents-shared/forum/projects/ (manual deploy)\n"
         ),
     )
     subparsers = parser.add_subparsers(dest="subcommand", metavar="subcommand")
@@ -2673,7 +2921,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_init.add_argument(
         "--participants", metavar="AGENTS", required=True,
-        help="Comma-separated list of participant agent names (e.g. borges,ariadne)",
+        help="Comma-separated list of participant agent names (e.g. alice,bob)",
     )
     p_init.add_argument(
         "--status",
@@ -2689,15 +2937,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--github", metavar="ANCHOR",
         help=(
             "GitHub anchor for live status in the auto-pull hook. "
-            "Format: pr/<N>, pr/<owner>/<repo>/<N>, or project/<N> "
-            "(e.g. pr/490, pr/engram-agents/engram-paper/22, project/4). "
+            f"Format: {GITHUB_ANCHOR_ACCEPTED_FORMS} "
+            "(e.g. pr/490, pr/owner/repo/22, project/4, project/owner/4). "
             "A PR-<N> project_id auto-derives pr/<N> if this is omitted."
         ),
     )
     p_init.add_argument(
         "--repo", metavar="OWNER/REPO",
         help=(
-            "Repo-qualify a PR anchor (e.g. engram-agents/engram-paper). "
+            "Repo-qualify a PR anchor (e.g. owner/repo). "
             "Effectively REQUIRED for every PR-baton (#1918: there is no "
             "default repo) -- an unqualified pr/<N> anchor is refused and "
             "counted (never guessed against) by gc/flip/merge."
@@ -2742,6 +2990,50 @@ def build_parser() -> argparse.ArgumentParser:
     p_flip.add_argument(
         "--force", action="store_true", default=False,
         help="skip the CI-green guard (override a flaky/known-red check)",
+    )
+
+    # -- advance --
+    p_advance = subparsers.add_parser(
+        "advance",
+        help="Strict peer → merge phase edge, gated server-side on the colleague's GitHub approval",
+        description=(
+            "Move a PR baton from phase 'peer' to phase 'merge' and hand the turn to "
+            "the merge seat.\n\n"
+            "The SERVER decides. It requires: a repo-qualified PR anchor; a colleague on "
+            "the baton; that colleague's mapped GitHub account to have a CURRENT APPROVED "
+            "review on the PR head (its latest opinionated review -- a later "
+            "CHANGES_REQUESTED or DISMISSED revokes it; COMMENTED does not); CI not red "
+            "or pending. CI state 'unknown' only warns; an unknown or incomplete "
+            "approval verdict REFUSES. The two verdicts are printed separately.\n\n"
+            "Idempotent: running it again once the baton is at 'merge' changes nothing "
+            "(no new turn, no wake). There is no force option and no skip option. A "
+            "'baton flip' to the merge seat that resolves as this transition is held to "
+            "the same gate and refused identically.\n\n"
+            "Limits, stated so they are not assumed away.\n"
+            "  * " + ADVANCE_D2_LIMIT + "\n"
+            "  * " + ADVANCE_C4_LIMIT + "\n"
+            "  * The agent -> GitHub-login map lives in a protected file named by the "
+            "forum server's --baton-login-map / $ENGRAM_BATON_LOGIN_MAP; with none "
+            "configured the gate refuses."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_advance.add_argument(
+        "project_id",
+        metavar="PROJECT-ID",
+        help="PR baton identifier (e.g. PR-123)",
+    )
+    p_advance.add_argument(
+        "--to", metavar="MERGE-SEAT", default=None,
+        help=(
+            "The merge seat to hand the turn to (a participant, or the pool sentinel). "
+            "Defaults to the one participant who is neither author nor colleague; "
+            "required when that is ambiguous."
+        ),
+    )
+    p_advance.add_argument(
+        "--reason", metavar="REASON", default="colleague-APPROVED; ready for merge",
+        help="Turn-log reason (default: 'colleague-APPROVED; ready for merge')",
     )
 
     # -- claim --
@@ -2955,8 +3247,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_anchor.add_argument(
         "--github", metavar="ANCHOR", required=True,
         help=(
-            "GitHub anchor value: pr/<N>, pr/<owner>/<repo>/<N>, or project/<N> "
-            "(e.g. pr/490, pr/engram-agents/engram-paper/22, project/4). "
+            f"GitHub anchor value: {GITHUB_ANCHOR_ACCEPTED_FORMS} "
+            "(e.g. pr/490, pr/owner/repo/22, project/4, project/owner/4). "
             "Repo-qualify (#1715, #1918) every PR anchor -- there is no "
             "default repo, and gc/flip/merge refuse an unqualified one."
         ),
@@ -3025,7 +3317,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Squash-merge a PR after passing the baton gate ladder:\n"
             "  1. Baton exists for PR-N          (never forceable)\n"
-            "  2. turn == pool sentinel            (never forceable)\n"
+            "  2. turn is a maintainer-role holder (never forceable): the pool\n"
+            "     sentinel, or a named agent who is neither the registered\n"
+            "     colleague nor the PR's author\n"
             "  3. CI green                         (--force skips)\n"
             "  4. Approval fresh (oid-compare)     (--force skips)\n"
             "  5. gh pr merge N --squash\n"
@@ -3033,7 +3327,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Prevents merging a PR that hasn't been presented to the maintainer\n"
             "via the baton flip pipeline, or merging with failing CI or a stale\n"
             "approval. --force overrides only the CI and approval gates (3-4);\n"
-            "a missing baton or unflipped turn is never forceable."
+            "a missing baton or a turn still with the colleague or the author is\n"
+            "never forceable."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -3046,7 +3341,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true", default=False,
         help=(
             "Skip CI-green and approval-fresh gates (3-4). "
-            "Does NOT skip baton-exists or turn-sentinel gates (1-2)."
+            "Does NOT skip baton-exists or turn-holder gates (1-2)."
         ),
     )
     p_merge.add_argument(
@@ -3076,6 +3371,8 @@ def main() -> None:
         cmd_init(args, config, agent_name, client)
     elif args.subcommand == "flip":
         cmd_flip(args, config, agent_name, client)
+    elif args.subcommand == "advance":
+        cmd_advance(args, config, agent_name, client)
     elif args.subcommand == "claim":
         cmd_claim(args, config, agent_name, client)
     elif args.subcommand == "release":

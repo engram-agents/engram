@@ -1,0 +1,12 @@
+{
+  "_comment": "SYNTHETIC TEMPLATE of the agent -> GitHub-login map read by the forum server's strict baton peer->merge gate (#3039 U2b). This is NOT the deployed map: the real file is installed by the forum admin at a root-owned, non-agent-writable path named by --baton-login-map / $ENGRAM_BATON_LOGIN_MAP (proposed location, not yet chosen: /etc/engram-forum/baton-login-map.json), owned by root or a --baton-login-map-admin-uid, with no group/world-writable directory above it. Real identities never go in this repo. 'repos' is the admin-owned table binding a baton id's prefix (PR-9001 -> 'PR', UMWELT-PR-925 -> 'UMWELT-PR') to the one owner/repo its github anchor may name. See docs/baton-protocol.md.",
+  "version": 1,
+  "map": {
+    "example-agent-one": ["example-gh-one"],
+    "example-agent-two": ["example-gh-two"]
+  },
+  "repos": {
+    "PR": "example-org/example-repo",
+    "OTHER-PR": "example-org/other-repo"
+  }
+}

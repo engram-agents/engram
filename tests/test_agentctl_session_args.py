@@ -18,6 +18,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from _short_socket import short_socket_path
+
 AGENTCTL = Path(__file__).resolve().parent.parent / "tools" / "agentctl"
 
 
@@ -95,13 +97,83 @@ def test_codex_c_subcommand_transform():
     assert lines[2] == "--last"
 
 
-def test_codex_c_d_combined_has_both_resume_and_bypass():
-    """codex -c -d must produce resume --last AND the bypass flag."""
-    rc, lines, _ = _run("codex", "borges", "-c", "-d")
+def _assert_codex_resume_bypass_is_rejected(*args: str) -> None:
+    """A remote Codex resume must not be combined with a permission override."""
+    rc, lines, stderr = _run("codex", "borges", *args)
+    assert rc != 0
+    assert not lines, f"rejected invocation must emit no command: {lines!r}"
+    assert "remote resume forbids permission override" in stderr.lower()
+    assert "requested bypass was not applied" in stderr.lower()
+    assert "no session was resumed" in stderr.lower()
+    assert "inspect /permissions" in stderr.lower()
+    assert "new full-access thread" in stderr.lower()
+
+
+def test_codex_cd_aliases_are_rejected_before_command_expansion():
+    _assert_codex_resume_bypass_is_rejected("-c", "-d")
+
+
+def test_codex_dc_aliases_are_rejected_before_command_expansion():
+    _assert_codex_resume_bypass_is_rejected("-d", "-c")
+
+
+def test_codex_dc_bundle_is_rejected_before_command_expansion():
+    _assert_codex_resume_bypass_is_rejected("-dc")
+
+
+def test_codex_cd_bundle_is_rejected_before_command_expansion():
+    _assert_codex_resume_bypass_is_rejected("-cd")
+
+
+def test_codex_explicit_bypass_with_continue_is_rejected_before_command_expansion():
+    _assert_codex_resume_bypass_is_rejected(
+        "-c", "--dangerously-bypass-approvals-and-sandbox"
+    )
+
+
+def test_codex_explicit_resume_after_separate_global_config_with_bypass_is_rejected_before_command_expansion():
+    _assert_codex_resume_bypass_is_rejected(
+        "--config", "foo=bar", "resume", "--last", "-d"
+    )
+
+
+def test_codex_explicit_resume_after_equal_global_config_with_bypass_before_it_is_rejected_before_command_expansion():
+    _assert_codex_resume_bypass_is_rejected(
+        "-d", "--config=foo=bar", "resume", "--last"
+    )
+
+
+def test_codex_prompt_after_passthrough_separator_does_not_count_as_a_resume_subcommand():
+    rc, lines, stderr = _run(
+        "codex",
+        "borges",
+        "--",
+        "resume",
+        "--dangerously-bypass-approvals-and-sandbox",
+    )
+    assert rc == 0, stderr
+    assert lines == [
+        "codex",
+        "--",
+        "resume",
+        "--dangerously-bypass-approvals-and-sandbox",
+    ]
+
+
+def test_codex_c_and_d_remain_valid_individually():
+    rc, lines, _ = _run("codex", "borges", "-c")
     assert rc == 0
-    assert "resume" in lines
-    assert "--last" in lines
-    assert "--dangerously-bypass-approvals-and-sandbox" in lines
+    assert lines == ["codex", "resume", "--last"]
+
+    rc, lines, _ = _run("codex", "borges", "-d")
+    assert rc == 0
+    assert lines == ["codex", "--dangerously-bypass-approvals-and-sandbox"]
+
+
+def test_claude_dc_bundle_remains_valid():
+    rc, lines, _ = _run("claude", "borges", "-dc")
+    assert rc == 0
+    assert lines == ["claude", "--dangerously-skip-permissions", "--continue"]
 
 
 def test_codex_r_is_silently_consumed_for_compatibility():
@@ -679,7 +751,31 @@ def _run_managed_codex(
     socket_is_real: bool = True,
     inside_managed_tmux: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], str]:
-    socket_path = tmp_path / "app-server-control.sock"
+    with short_socket_path() as socket_path:
+        return _run_managed_codex_at(
+            tmp_path,
+            socket_path,
+            *args,
+            session_exists=session_exists,
+            start_rc=start_rc,
+            version_rc=version_rc,
+            version_output=version_output,
+            socket_is_real=socket_is_real,
+            inside_managed_tmux=inside_managed_tmux,
+        )
+
+
+def _run_managed_codex_at(
+    tmp_path: Path,
+    socket_path: Path,
+    *args: str,
+    session_exists: bool,
+    start_rc: int,
+    version_rc: int,
+    version_output: str | None,
+    socket_is_real: bool,
+    inside_managed_tmux: bool,
+) -> tuple[subprocess.CompletedProcess[str], str]:
     sock = _make_unix_socket(socket_path) if socket_is_real else None
     if not socket_is_real:
         socket_path.write_text("not a socket", encoding="utf-8")
@@ -780,17 +876,59 @@ def test_codex_managed_session_non_socket_path_has_no_local_fallback(tmp_path):
     assert "codex --remote" not in calls
 
 
-def test_codex_managed_session_forwards_resume_arguments_into_remote_tui(tmp_path):
+def test_codex_managed_session_rejects_resume_with_bypass_before_daemon_or_tui(tmp_path):
     proc, calls = _run_managed_codex(
         tmp_path,
         "resume",
         "--last",
         "--dangerously-bypass-approvals-and-sandbox",
     )
+    assert proc.returncode != 0
+    assert "remote resume forbids permission override" in proc.stderr.lower()
+    assert "requested bypass was not applied" in proc.stderr.lower()
+    assert "no session was resumed" in proc.stderr.lower()
+    assert "inspect /permissions" in proc.stderr.lower()
+    assert "new full-access thread" in proc.stderr.lower()
+    assert not calls, "rejection must occur before daemon/tmux commands"
+
+
+def test_codex_managed_session_rejects_globally_prefixed_resume_with_bypass_before_daemon_or_tui(tmp_path):
+    proc, calls = _run_managed_codex(
+        tmp_path,
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--config=foo=bar",
+        "resume",
+        "--last",
+    )
+    assert proc.returncode != 0
+    assert "remote resume forbids permission override" in proc.stderr.lower()
+    assert "requested bypass was not applied" in proc.stderr.lower()
+    assert "no session was resumed" in proc.stderr.lower()
+    assert "inspect /permissions" in proc.stderr.lower()
+    assert "new full-access thread" in proc.stderr.lower()
+    assert not calls, "rejection must occur before daemon/tmux commands"
+
+
+def test_codex_managed_session_does_not_match_bypass_text_inside_a_prompt(tmp_path):
+    proc, calls = _run_managed_codex(
+        tmp_path,
+        "explain --dangerously-bypass-approvals-and-sandbox",
+    )
     assert proc.returncode == 0, proc.stderr
-    new_session = next(line for line in calls.splitlines() if line.startswith("tmux new-session"))
-    assert "codex\\ --remote\\ unix://" in new_session
-    assert "resume\\ --last\\ --dangerously-bypass-approvals-and-sandbox" in new_session
+    assert "codex app-server daemon start" in calls
+    assert "tmux new-session" in calls
+
+
+def test_codex_managed_session_does_not_treat_a_prompt_as_a_resume_subcommand(tmp_path):
+    proc, calls = _run_managed_codex(
+        tmp_path,
+        "--",
+        "resume",
+        "--dangerously-bypass-approvals-and-sandbox",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "codex app-server daemon start" in calls
+    assert "tmux new-session" in calls
 
 
 def test_codex_managed_session_rejects_an_explicit_remote_override(tmp_path):

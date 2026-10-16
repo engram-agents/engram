@@ -33,6 +33,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from .names import InvalidProjectId
 from .store import (
     CoordinationStore,
     DmMessage,
@@ -46,7 +47,7 @@ CLOSED_STATUSES = frozenset({"merged", "cancelled"})
 
 # Frontmatter grammar — identical to tools/baton.py so both read the same files.
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
+_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):[ \t]*(.*)$", re.MULTILINE)
 _PARTICIPANTS_LIST_RE = re.compile(r"^\[?(.*?)\]?$")
 
 # DM header line: --- seq=42 from=ariadne to=sol at=<iso> lines=2 ---
@@ -169,6 +170,44 @@ class FileStore(CoordinationStore):
         self.projects_dir = self.root / "projects"
         self.dm_dir = self.root / "dm"
 
+    # --- path containment (#3286) ------------------------------------------
+    def _contained_dir(self, sub: str) -> Path:
+        """``<root>/<sub>`` iff it really is that directory once symlinks resolve.
+
+        The root itself may be a symlink (an admin's layout): both sides are
+        compared RESOLVED. But ``projects/`` / ``archive/`` must not lead
+        anywhere other than ``<resolved root>/<sub>``. Returns the resolved path.
+        """
+        want = self.root.resolve() / sub
+        if (self.root / sub).resolve() != want:
+            raise InvalidProjectId(f"store directory {sub!r} resolves outside the store root")
+        return want
+
+    def _project_file(self, project_id, *, sub: str = "projects", suffix: str = "") -> Path:
+        """The ONLY way a project id becomes a path (read/write/archive/exists).
+
+        Refuses (``InvalidProjectId``) an id that is not a non-empty str, contains
+        a slash, a backslash or NUL, or is ``.``/``..``; then requires the target
+        to sit directly in the contained ``sub`` directory and NOT to be a symlink
+        (a link is refused even when it points inside the store; so is a dangling
+        one). Returns a path built from the resolved directory, so later I/O cannot
+        be redirected through a symlinked parent. (A check-then-use window remains
+        against a concurrent local attacker who can already write in ``projects/``;
+        ``os.replace`` replaces a final-component link rather than following it.)
+        """
+        if (
+            not isinstance(project_id, str)
+            or not project_id
+            or project_id in (".", "..")
+            or any(c in project_id for c in ("/", "\\", "\x00"))
+        ):
+            raise InvalidProjectId(f"invalid project id: {project_id!r}")
+        base = self._contained_dir(sub)
+        path = base / f"{project_id}{suffix}.md"
+        if os.path.islink(path) or path.resolve().parent != base:
+            raise InvalidProjectId(f"project path is not a plain file in the store: {project_id!r}")
+        return path
+
     # --- baton / board (projects) ------------------------------------------
     def read_projects(self, *, active_only: bool = True) -> list[ProjectRecord]:
         if not self.projects_dir.is_dir():
@@ -219,29 +258,28 @@ class FileStore(CoordinationStore):
         return records
 
     def read_project(self, project_id: str) -> Optional[str]:
-        path = self.projects_dir / f"{project_id}.md"
+        path = self._project_file(project_id)
         try:
             return path.read_text(encoding="utf-8")
         except OSError:
             return None
 
     def write_project(self, project_id: str, content: str, *, seq: int) -> None:
-        path = self.projects_dir / f"{project_id}.md"
+        path = self._project_file(project_id)
         _atomic_write(path, _embed_seq(content, seq))
 
     def archive_project(self, project_id: str) -> None:
-        src = self.projects_dir / f"{project_id}.md"
+        src = self._project_file(project_id)
+        dst = self._project_file(project_id, sub="archive")  # also validates archive/
         if not src.exists():
             return  # idempotent: already archived or never written
-        dst_dir = self.root / "archive"
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        dst = dst_dir / f"{project_id}.md"
-        if dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(dst):
             # Guard against silent clobber on pid reuse (#1512): suffix with seq.
             seq = 1
-            while (dst_dir / f"{project_id}.{seq}.md").exists():
+            while os.path.lexists(self._project_file(project_id, sub="archive", suffix=f".{seq}")):
                 seq += 1
-            dst = dst_dir / f"{project_id}.{seq}.md"
+            dst = self._project_file(project_id, sub="archive", suffix=f".{seq}")
         src.rename(dst)  # atomic POSIX rename (same fs)
 
     # --- DM ----------------------------------------------------------------

@@ -17,9 +17,9 @@ Design (issue #1080, Lei 2026-06-10 decision):
   - HARD assert (#2753 epic WS1, R2): a SEPARATE divergence axis — the `dag`
     flag (real structural acyclicity, #2357) against the SAME tier
     expectation table — is NOT covered by the soft warn above (which checks
-    temporal_causal only). `generalizes` is classification-tier with
-    dag=True, diverging from every other classification-tier relation
-    (dag=False) — and the soft warn above would NEVER catch its ack entry
+    temporal_causal only). `generalizes` is classification-tier in the
+    abstraction acyclicity family, diverging from every other
+    classification-tier relation (dag_family None) — and the soft warn above would NEVER catch its ack entry
     going missing, because it never looks at `dag` at all. This is exactly
     the gap R2 names: "the existing guard will NOT catch its absence."
     test_generalizes_dag_tier_divergence_must_be_acknowledged below is a
@@ -145,9 +145,9 @@ def test_temporal_causal_tier_drift_warn():
 # above NEVER inspects `dag` at all, so an unacknowledged `dag`/tier
 # divergence would ship silently through that check with no signal
 # whatsoever — R2's exact concern. `generalizes` (classification tier,
-# dag=True) is the first relation to diverge on this axis; every other
-# classification-tier relation today (instantiates/serves/exemplifies) is
-# dag=False, matching the tier's usual (though not name-encoded) pattern.
+# abstraction family) is the first relation to diverge on this axis; every other
+# classification-tier relation today (instantiates/serves/exemplifies) has
+# dag_family None, matching the tier's usual (though not name-encoded) pattern.
 #
 # Reuses `_TIER_DAG_EXPECTATION` for the expected-per-tier value: despite
 # its name (predating #2357's dag/temporal_causal split), its values
@@ -178,7 +178,7 @@ def _unacknowledged_dag_tier_divergences(
             continue  # stale tier entry — the completeness test above catches this
 
         expected_dag = _TIER_DAG_EXPECTATION[tier]
-        actual_dag = classifications[relation]["dag"]
+        actual_dag = classifications[relation]["dag_family"] is not None
         if actual_dag != expected_dag and relation not in ack:
             unacknowledged.append(relation)
     return unacknowledged

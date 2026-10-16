@@ -118,7 +118,7 @@ from typing import Optional
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import atomic_write_json
+from _hooklib import atomic_write_json, open_regular_text
 
 
 def resolve_transcript_path(
@@ -156,7 +156,7 @@ def resolve_transcript_path(
             sessions_dir = os.path.join(engram_home, "sessions")
         marker_path = os.path.join(sessions_dir, f"{session_id}.json")
         try:
-            with open(marker_path, encoding="utf-8") as f:
+            with open_regular_text(marker_path, encoding="utf-8") as f:
                 marker = json.load(f)
             candidate = marker.get("transcript_path")
             if candidate and os.path.exists(candidate):
@@ -176,7 +176,7 @@ def read_offset_state(state_file_path: str) -> tuple[Optional[str], int]:
     does not swallow errors itself so that policy decision stays with the
     caller (different callers may want different fail directions).
     """
-    with open(state_file_path, encoding="utf-8") as f:
+    with open_regular_text(state_file_path, encoding="utf-8") as f:
         state = json.load(f)
     return state.get("transcript_path"), int(state.get("byte_offset", 0))
 
@@ -214,7 +214,10 @@ def read_delta(transcript_path: str, stored_offset: int, current_size: int) -> b
     rotation-guard comparison and for the read length here -- avoids a
     second stat() call racing against the first.
     """
-    with open(transcript_path, "rb") as f:
+    # open_regular_text is non-blocking and regular-file-only (#3628); bytes are
+    # read through its .buffer (the BufferedReader open(.., "rb") returned).
+    with open_regular_text(transcript_path) as tf:
+        f = tf.buffer
         f.seek(stored_offset)
         return f.read(current_size - stored_offset)
 

@@ -393,6 +393,170 @@ On decline: tell the user: "No problem. You can start the viz server manually an
 
 **Defer the `enable-linger` hint if your name isn't finalized yet** (Linux accept path only) — same reason as Step 5.5: the script prints a `sudo loginctl enable-linger <user>` suggestion; if you're still on `agent-newborn-*`, defer until after finalize-name (Step 7). (If the username is already final — no rename pending — the hint is fine as-is.)
 
+## Step 5.7 — Forum connection (optional)
+
+Hooks and CLIs treat a non-empty string `forum.url` in `~/.engram/config.json` as "forum configured", and nothing infers it. This is the only step that can ask the user for it. It is optional, and it is asked on every install, single-agent too (a single-host agent can have a forum).
+
+**Asked once.** Run the block below FIRST with no answer file (no `forum-url.answer`, see "Passing the answer" below). If it prints `set_forum_url.py is not installed here (no forum components on this install): skip this step`, this install has no forum components: SKIP the question, do not ask it, and move on (you may mention that a forum can be connected later by installing the convenience tier). In that case the operator's hint (below) is NOT offered, because the tool that would apply it is not there; the hint is left where it is. Otherwise, if `forum.url` is already set (identity-resolve mode, a re-run, an operator that set it), it prints the value it found, says it is already set, and you SKIP the question: tell the user what is set and move on. (If an operator's hint was still lying around, the block also removes it and prints `stale forum-url.hint removed`; nothing for you to do.) If it prints that the key is not set, ask the question.
+
+**The operator's hint.** An operator who created this account with `agentctl spawn --forum-url URL` leaves one line in `~/.engram/forum-url.hint`. The block reads only that file's first line, and only through a short Python read (it is never sourced, and nothing else reads it). If the line is an `http://` or `https://` URL and `forum.url` is not set, the block's one line names it: `forum.url is not set (ask the question; the operator who created this account suggested <URL>: offer it as the default)`. If the file is there but its first line is not a usable `http(s)` URL, the block says it is ignoring it and prints the plain not-set line; do not offer anything. When a URL is suggested, ask the same question below with one change: put the suggestion first, as the proposed default.
+
+> **Optional — is there an ENGRAM forum I should connect to?** The operator who created this account suggested `<URL>`. Use it / give a different URL / no forum?
+
+"Use it" is answer (a) or (b) with that URL; "give a different URL" is answer (b) with the user's URL; "no forum" is answer (c). The user's confirmation, not the hint, decides: never write the hinted URL to `forum-url.answer` unless the user chose it, and never write it any other way. Without a suggestion, ask the three-answer question as written below.
+
+Ask the user ONE question with three answers:
+
+> **Optional — is there an ENGRAM forum I should connect to?**
+>
+> - **(a) On this host.** I'll use `http://localhost:5002`. 5002 is the installer's default port; if yours differs, tell me the port.
+> - **(b) On another host.** Type the LAN URL of the forum (for example `http://192.168.1.50:5002`).
+> - **(c) No forum.** I'll leave it unset; nothing changes, and the forum, baton and letter hooks stay correctly silent. *(Pick this if you are unsure — you can add a forum any time.)*
+
+The URL is never guessed and never taken from the `FORUM_URL` environment variable, a file, or `hostname`; only the user's answer counts. For (a) with a different port, write the URL the user gave. For (c), write nothing: the key stays absent, and you do not run the block again. Run the consume fence (`forum-url-hint-consume`, see "Consuming the hint" below) so an operator's hint does not come back on a rerun. If the user is unsure, (c) is the default.
+
+For (a) or (b), write the key ONLY by running `set_forum_url.py` through the block below, with the user's URL in the answer file. Never edit `config.json` inline for this key; the tool validates the URL and writes atomically. The block finds the tool the way the other steps find plugin tools (plugin root first, then the runtime's marketplace path), and a missing tool is an `ERROR` line, not a first-session abort.
+
+**Passing the answer.** The user's URL reaches the block as data, in a file, never as shell text. Write the user's URL to `$ENGRAM_HOME/forum-url.answer` (default `~/.engram/forum-url.answer`) with your file-writing tool (the Write tool on Claude Code, `apply_patch` on Codex), as exactly one line. NEVER with a shell command (`echo`, `printf`, `cat <<`, `tee`, a heredoc): shell text is parsed, and a value built to break out of its quoting would then run as commands. If `forum-url.answer` already exists before you write it (a leftover from an earlier attempt), Read it first and then write the new content over it with your file tool; if the first run of the block (made with no answer from the user) reports a `written:` line or an exit status you did not cause, tell the user that URL came from an earlier answer. A shell command is never the fallback when the file tool refuses. If your runtime has no file-writing tool that is not a shell command, do NOT write the answer with a heredoc or any shell command; choose answer (c) (no forum) and tell the user they can set it later with `set_forum_url.py <URL>`. If the user's answer is more than one line, or contains whitespace, do not write it: tell the user it is not a URL and ask again. For (a), write `http://localhost:5002`, or, with a different port, the URL the user gave. For "use it" on the operator's hint, write the hinted URL (the block printed it). Then run the block, alone, in one Bash call (the first run, with no answer yet, is the block alone with no file). The block reads that file and nothing else (no environment variable), requires one `http(s)` URL line in a regular file of at most 4096 bytes, deletes the file whatever happens, and hands the value to the tool as one quoted argument. If it prints `forum-url.answer is not a usable single-line http(s) URL: ignoring it`, nothing was run and the file is gone: tell the user the answer was not a usable URL and ask again.
+
+The block:
+
+```bash
+# forum-url-step
+# The user's URL for answer (a) or (b) arrives only as the file $ENGRAM_HOME/forum-url.answer
+# (written by the agent's file tool); an absent file = no answer yet.
+CFG="${ENGRAM_HOME:-$HOME/.engram}/config.json"
+PY="$HOME/.engram/venv/bin/python3"
+[ -x "$PY" ] || PY=python3
+EXISTING="$("$PY" - "$CFG" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        u = (json.load(f).get("forum") or {}).get("url")
+except Exception:
+    u = None
+print(u.strip() if isinstance(u, str) and u.strip() else "")
+PYEOF
+)"
+ANSWER_FILE="${ENGRAM_HOME:-$HOME/.engram}/forum-url.answer"
+# The answer: read through Python, never sourced, eval'd or expanded by the shell.
+# Prints "absent", "invalid" or "valid <url>" (a valid line has no whitespace).
+ANSWER_STATE="$("$PY" - "$ANSWER_FILE" <<'PYEOF'
+import os, re, stat, sys
+try:
+    # O_NOFOLLOW refuses a symlink; O_NONBLOCK keeps a FIFO from blocking the open.
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except FileNotFoundError:
+    print("absent")
+    raise SystemExit
+except Exception:
+    print("invalid")
+    raise SystemExit
+try:
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        print("invalid")
+        raise SystemExit
+    raw = os.read(fd, 4097)
+finally:
+    os.close(fd)
+try:
+    text = raw.decode("utf-8")
+except Exception:
+    print("invalid")
+    raise SystemExit
+line = text.rstrip("\n")
+ok = (len(raw) <= 4096 and re.match(r"https?://.+", line)
+      and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in line))
+print("valid " + line if ok else "invalid")
+PYEOF
+)"
+# Consumed whatever the outcome (rm without -r: the link, never its target).
+if [ -e "$ANSWER_FILE" ] || [ -L "$ANSWER_FILE" ]; then
+  rm -f -- "$ANSWER_FILE"
+fi
+ANSWER=""
+case "$ANSWER_STATE" in
+  "valid "*) ANSWER="${ANSWER_STATE#valid }" ;;
+  invalid) echo "forum-url.answer is not a usable single-line http(s) URL: ignoring it" ;;
+esac
+HINT_FILE="${ENGRAM_HOME:-$HOME/.engram}/forum-url.hint"
+# The operator's hint: the first line only, read through Python, never sourced.
+# Prints "absent", "invalid" or "valid <url>".
+HINT_STATE="$("$PY" - "$HINT_FILE" <<'PYEOF'
+import os, re, stat, sys
+try:
+    # Not a regular file (a FIFO would block the open): invalid, before opening.
+    if not stat.S_ISREG(os.stat(sys.argv[1]).st_mode):
+        print("invalid")
+        raise SystemExit
+    with open(sys.argv[1], encoding="utf-8") as f:
+        line = f.readline(4097).strip()
+except FileNotFoundError:
+    print("absent")
+    raise SystemExit
+except Exception:
+    print("invalid")
+    raise SystemExit
+ok = (len(line) <= 4096 and re.match(r"https?://.+", line)
+      and not re.search(r"[\s\x00-\x1f\x7f]", line))
+print("valid " + line if ok else "invalid")
+PYEOF
+)"
+TOOL="${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/tools/set_forum_url.py}"
+[ -f "$TOOL" ] || TOOL="$HOME/.engram/marketplace/plugins/engram/tools/set_forum_url.py"
+FORCE=""
+[ "${FORUM_FORCE:-}" = "1" ] && FORCE=1
+if [ -z "$ANSWER" ]; then
+  if [ ! -f "$TOOL" ]; then
+    echo "set_forum_url.py is not installed here (no forum components on this install): skip this step"
+  elif [ -n "$EXISTING" ]; then
+    echo "forum.url is already set: $EXISTING (skip the question)"
+    if [ -e "$HINT_FILE" ] || [ -L "$HINT_FILE" ]; then
+      rm -f -- "$HINT_FILE" && echo "stale forum-url.hint removed (forum.url is already set)"
+    fi
+  elif [ "${HINT_STATE%% *}" = "valid" ]; then
+    echo "forum.url is not set (ask the question; the operator who created this account suggested ${HINT_STATE#valid }: offer it as the default)"
+  else
+    echo "forum.url is not set (ask the question; answer (c) leaves it unset)"
+    [ "$HINT_STATE" = "invalid" ] && echo "forum-url.hint is present but its first line is not a usable http(s) URL: ignoring it"
+  fi
+else
+  if [ ! -f "$TOOL" ]; then
+    echo "ERROR: cannot locate set_forum_url.py (continuing without a forum; forum.url stays as it was)"
+  else
+    "$PY" "$TOOL" "$ANSWER" ${FORCE:+--force} 2>&1
+    echo "set_forum_url.py exit status: $?"
+  fi
+fi
+:
+```
+
+Show the tool's own output to the user verbatim. Then by exit status:
+
+- **0** — written, or already that value. Done.
+- **3** — a DIFFERENT `forum.url` is already set. Tell the user what is set. Do not pass `--force` unless the user says so explicitly (they have to ask to overwrite it); without that, leave it as it is and continue. (To overwrite when they do ask, see the force fence below.)
+- **2** — refused (a bad URL, or a missing or unreadable config). Show the reason; the config is untouched. Continue first-session: a refused forum URL never blocks identity formation. If the user wants to retry with a corrected URL, run the block again.
+
+**Overwriting (exit 3 only).** ONLY after the user has explicitly asked to overwrite the different `forum.url`, write the answer file again (the block consumed it), then paste this fence right before the block and run both together in one Bash call. The block adds `--force` to the tool call only when `FORUM_FORCE` is exactly `1`. Never insert it on your own initiative.
+
+```bash
+# forum-url-force
+export FORUM_FORCE=1
+```
+
+If the block prints the `ERROR` line, tell the user the forum can be connected later by running `set_forum_url.py` from the plugin's `tools/` directory, and continue.
+
+**Consuming the hint.** After the question has been answered, run this fence, in its own Bash call, after ANY answer, including "no forum" (answer (c)), "give a different URL" and "use it", and also when the tool refused the URL. It deletes the operator's hint and nothing else, so a "no forum" answer does not come back as an offer on a later first-session run. It prints one line when it removed something and nothing when there was no hint. Skip it only when the step was skipped (tool not installed). If the session ends before the question is answered, the hint stays for the next run, which is intended.
+
+```bash
+# forum-url-hint-consume
+HINT_FILE="${ENGRAM_HOME:-$HOME/.engram}/forum-url.hint"
+if [ -e "$HINT_FILE" ] || [ -L "$HINT_FILE" ]; then
+  rm -f -- "$HINT_FILE" && echo "forum-url.hint consumed"
+fi
+:
+```
+
 ## Step 6 — Finalize (the substitution step)
 
 Do this step LAST, only after the dialogue is genuinely complete. If the session aborts mid-dialogue, the marker file should still be present so the next session re-enters this skill.
@@ -415,6 +579,16 @@ fi
 
 Then follow the branch for the detected target:
 
+**The warm-briefing anchor assertion — required after ANY write to `~/.engram/warm-briefing.md`, both targets.** Step 6 rewrites that file whole, so it carries the same obligation as every other writer of it (`engram-sleep` Step 3, `engram-nap` Step 5). The invariant: exactly ONE line matching `^## From this session`, and it is the LAST line of the file (at first session the section is empty, so the bare heading is the final line), with the `<!-- STRUCTURAL INVARIANT: ... -->` comment above it. Verify after writing:
+
+```bash
+_a=$(grep -c '^## From this session$' "$HOME/.engram/warm-briefing.md")
+_last=$(tail -n 1 "$HOME/.engram/warm-briefing.md")
+[ "$_a" = 1 ] && [ "$_last" = '## From this session' ] || echo "FAIL: warm-briefing anchor lost, duplicated, or moved off the end — restore the file from the template and redo the substitution; never hand-patch the heading"
+```
+
+A lost or duplicated anchor is not cosmetic: `engram-sleep` Step 3's erase keys on the LAST matching heading through EOF, so a lost heading makes a later sleep APPEND a stub instead of erasing (freezing the stale arc above it), and a duplicate strands everything between the two headings as preserved user notes. Full reasoning: `engram-nap` Step 5 post-condition.
+
 ---
 
 ### Step 6 — Claude target (TARGET=claude)
@@ -431,7 +605,7 @@ Then follow the branch for the detected target:
    - Any other `{{...}}` markers present — consult the user if ambiguous, do not guess.
 4. Write the resolved files back. Enumerate each one explicitly: `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, `~/.claude/output-styles/proactive-with-carveouts.md` (if present — this file ships with the Proactive-with-Carveouts output style; older installs without it can skip), `~/.claude/skills/internal-external-decision/SKILL.md` (if present — same provenance), `~/.claude/skills/engram-upgrade/SKILL.md` (if present — references ask-{{USER_NAME}}.md in checkpoint + anti-pattern sections). Silent drop of any required file would leave it firing forever with raw `{{AGENT_NAME}}`/`{{USER_NAME}}`/`{{COUNTERPART_NAME}}` placeholders in the prose.
 5. **Bootstrap the ask-{{USER_NAME}}.md auto-load surface.** Run `touch "$HOME/.engram/ask-<USER_NAME>.md"` substituting the resolved user name — e.g. for USER_NAME=alice, run `touch ~/.engram/ask-alice.md`. This ensures session-start reads don't silently no-op on a fresh install before the agent has written anything. The filename matches whatever the user's name is (resolved during this dialogue, not hard-coded at install time).
-6. **Verify**: no literal `{{...}}` placeholders remain in any of the written files. Check with:
+6. **Verify**: no literal `{{...}}` placeholders remain in any of the written files, and the warm-briefing anchor assertion above. Check the placeholders with:
    ```bash
    grep -r '{{' ~/.claude/CLAUDE.md ~/.engram/warm-briefing.md 2>/dev/null && echo "WARN: unresolved placeholders"
    ```
@@ -461,7 +635,7 @@ The codex file set is different. Bootstrap wrote identity surfaces across four f
 
 3. Write all four resolved files back. For `config.toml`, the instructions= body contains the agent-specific prose; rewrite the full file with the resolved content (the bootstrap merge wrote the identity keys; this step resolves placeholders within them).
 
-4. **Verify**: no literal `{{...}}` placeholders remain in any of the four surfaces:
+4. **Verify**: no literal `{{...}}` placeholders remain in any of the four surfaces, and the warm-briefing anchor assertion above. Check the placeholders with:
    ```bash
    grep -rn '{{' ~/.codex/config.toml ~/.codex/AGENTS.md \
        ~/.engram/codex-compact-prompt.md ~/.engram/warm-briefing.md 2>/dev/null \

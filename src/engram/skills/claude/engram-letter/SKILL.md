@@ -79,7 +79,7 @@ Workflow:
 | Hook reports N unread, I already ran `ia read <counterpart>` on all of them | `ia read` doesn't advance the cursor — this is expected, not a bug | Run `ia mark-read` (no args) |
 | `ia cursor --set <iso-timestamp-string>` rejected | Wrong format — post-migration the cursor is a plain **integer**, not ISO-8601 | Use `ia cursor --set <int>`, e.g. the value `ia status` last reported plus some margin, or just run `ia mark-read` instead |
 | `ia write --to X --re <fn>` or `--title` rejected as unrecognized | Stale flags from the old file-protocol CLI — no longer exist | Use `--subject TEXT` instead of `--title`; there is no reply-threading flag, DMs are just a flat per-counterpart thread |
-| `ia` exits non-zero in single-agent mode | Mode gate — the CLI is multi-agent-only | Set `mode='multi'` in `~/.engram/config.json` and restart MCP |
+| `ia` exits 3 with `no forum configured` | Forum gate — no `forum.url` in `config.json` (`agent_name` alone is identity and does not count) | Set `forum.url` in `~/.engram/config.json` (same-host: `http://localhost:5002`) and restart MCP |
 | DM commands fail, `ia status` still works | Forum API unreachable; `status` degrades gracefully, the rest don't | Check forum reachability (`curl <forum.url>/health` or similar); retry once it's back |
 
 ---

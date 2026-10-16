@@ -247,7 +247,7 @@ def test_goal_supersede_no_confidence():
 # ── Context edges ───────────────────────────────────────────────────────
 
 def test_goal_with_context_ids():
-    """Goal should accept context_ids and create cites edges."""
+    """Goal should accept context_ids and create about edges (#2243)."""
     client = fresh_client()
     obs = client.call("engram_add_observation", {
         "quoted_text": "Motivating observation",
@@ -265,7 +265,7 @@ def test_goal_with_context_ids():
     })
     assert obs["observation_id"] in g.get("context_nodes", []), f"Context not in goal: {g}"
 
-    # Verify edge exists — context_ids creates a 'cites' edge (contextual in recall view).
+    # Verify edge exists — context_ids creates an 'about' edge (contextual in recall view).
     node = client.call("engram_inspect", {"node_id": g["goal_id"]})
     neighbor_ids = [n["id"] for n in node["contextual_neighbors"]]
     assert obs["observation_id"] in neighbor_ids, f"Edge not found. Contextual neighbors: {node['contextual_neighbors']}"

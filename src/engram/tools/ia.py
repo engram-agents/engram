@@ -112,17 +112,24 @@ def _get_agent_name(config: Optional[dict] = None) -> str:
 
 
 def _is_forum_configured(config: Optional[dict] = None) -> bool:
-    """Return True if forum is explicitly configured (url or agent_name set).
+    """Return True if a forum is configured: ``forum.url`` is a non-empty string.
 
-    Silent no-op gate: if neither forum.url nor agent_name is in config, skip
-    the hook to avoid noise on non-forum installs. Mirrors engram hook helper.
+    Gates every DM command: no ``forum.url`` -> ``ia`` refuses with an
+    actionable message. ``agent_name`` alone is this agent's identity, not
+    forum configuration, and does not pass the gate. Total: any other shape
+    (non-dict config or ``forum``, non-string or blank ``url``) is "not
+    configured" and never raises. Same rule as the forum/baton/inter-agent
+    prompt hooks' ``_is_forum_configured``, ``baton.py`` and ``engram_client.py``.
     """
     if config is None:
         config = _load_config()
-    forum_cfg = config.get("forum", {})
-    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
-    has_agent = bool(config.get("agent_name", "").strip())
-    return has_url or has_agent
+    if not isinstance(config, dict):
+        return False
+    forum_cfg = config.get("forum")
+    if not isinstance(forum_cfg, dict):
+        return False
+    url = forum_cfg.get("url")
+    return isinstance(url, str) and bool(url.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +148,7 @@ def _check_forum_configured(config: Optional[dict] = None) -> None:
         else:
             try:
                 json.loads(config_path.read_text())
-                forum_detail = "(no forum.url or agent_name set in config.json)"
+                forum_detail = "(no forum.url set in config.json)"
             except (json.JSONDecodeError, OSError):
                 forum_detail = "(config.json invalid — failed to parse)"
         print(
@@ -150,7 +157,7 @@ def _check_forum_configured(config: Optional[dict] = None) -> None:
             file=sys.stderr,
         )
         print(
-            "To enable: set forum.url or agent_name in config.json and restart MCP.",
+            "To enable: set forum.url in config.json and restart MCP.",
             file=sys.stderr,
         )
         print(
@@ -630,7 +637,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "All DM commands require a configured forum (forum.url or agent_name in config.json).\n"
+            "All DM commands require a configured forum (forum.url set in config.json).\n"
             "Forum API must be reachable for DM commands; `status` is graceful if unreachable.\n"
         ),
     )
@@ -667,7 +674,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_read.add_argument(
         "counterpart",
         metavar="COUNTERPART",
-        help="The other agent in the thread (e.g. 'borges')",
+        help="The other agent in the thread (e.g. 'alice')",
     )
     p_read.add_argument(
         "--since-seq", dest="since_seq", type=int, default=0, metavar="N",
@@ -697,7 +704,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_write.add_argument(
         "--to", required=True, metavar="AGENT[,AGENT,...]",
         help=(
-            "Recipient(s) — one name or a comma-separated list (e.g. 'ariadne,borges'). "
+            "Recipient(s) — one name or a comma-separated list (e.g. 'alice,bob'). "
             "Each recipient gets their own 1:1 DM thread with the same body."
         ),
     )

@@ -112,6 +112,9 @@ plus `tools/` (CLIs, at repo root), `src/forum/` (the forum service), and
   `sys.get_int_max_str_digits` CVE fix that current `transformers` needs at import;
   any 3.11.0-final or later is also fine. 3.10.0–3.10.6 and 3.11.0rc1 are
   specifically broken.
+  The engramd owner (a default-off, Linux-only component) additionally requires
+  Python 3.11+: it bounds result size with `sqlite3.Connection.setlimit`, and
+  refuses to start with a named error on older interpreters.
 - **git**.
 - An existing **Claude Code** installation (the MCP client that talks to the server).
 - Writable `~/.claude/` and `~/.engram/`.
@@ -579,7 +582,7 @@ hand-edit; *(restart)* = takes effect after a Claude Code restart.
 
 | Field | Type | Description |
 |---|---|---|
-| `embedding.enabled` | bool | Semantic recall via sentence-transformer embeddings. |
+| `embedding.enabled` | bool | **Retired by #345** — embeddings are mandatory. If this key is present with any value other than true, the server refuses to start; delete the key to fix. |
 | `embedding.model` | str | Sentence-transformer model identifier. |
 
 **Drowsiness / cadence:**
@@ -717,6 +720,10 @@ installs never need this.
   `share`). Not part of the single-agent plugin bundle.
 - **`tools/ia.py`** (inter-agent letters), **`tools/baton.py`** (turn-state),
   **`tools/forum.py`** (broadcast forum) — the coordination CLIs.
+
+The forum **server** is installed separately, once per host, by one account:
+[`docs/FORUM-SERVER.md`](docs/FORUM-SERVER.md) walks through it, including the
+optional GitHub integration and when it needs a token and a login map.
 
 See `docs/baton-protocol.md` and the `USER_GUIDE.md` multi-agent appendix for the
 human-facing overview, and the `engram-letter` / `engram-baton` / `engram-forum`

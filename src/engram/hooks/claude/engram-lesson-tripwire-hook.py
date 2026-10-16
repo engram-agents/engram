@@ -90,16 +90,192 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context
+from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context, write_route_ledger, tool_fire_key
+from _hooklib import import_owner_flags as _hooklib_import_owner_flags
+# #3628: this hook runs on EVERY tool call. Every file open goes through these
+# non-blocking, regular-file-only helpers (a FIFO makes a plain open() wait for
+# a peer and the harness kills the hook silently); a non-regular target raises
+# OSError, which every handler below already swallows (`except Exception`).
+from _hooklib import (
+    open_regular_text, open_regular_text_append, open_regular_text_write,
+    read_regular_text,
+)
+from _hooklib import (
+    append_shown_record, build_exclusion_resolver, in_context_drop_ids,
+    in_context_exclusion_enabled,
+)
+# #3628: every mode=ro sqlite connect goes through this (refuses a FIFO or
+# directory instead of hanging; raises a sqlite3.OperationalError + OSError).
+from _hooklib import connect_regular_ro
+# #3521 row 9: a crash reaching main()'s outer handler must not look like
+# "no lesson matched" (see the handler at the bottom of main()).
+from _hooklib import (
+    mark_probe_notice, probe_notice_due, probe_unknown_line,
+    write_probe_unknown_stderr,
+)
 from _harness import detect_harness, get_harness_budgets
+# #3613: meaningful-span marker. Fail-open: an older/absent helper degrades to
+# "no marker" (the pre-change behaviour), never an import crash.
+try:
+    from _hooklib import marker_recall_query
+except Exception:
+    def marker_recall_query(text):
+        return ("none", text)
 
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
 DB_PATH = Path(ENGRAM_HOME) / "knowledge.db"
+CONFIG_PATH = os.path.join(ENGRAM_HOME, "config.json")
+
+# ---------------------------------------------------------------------------
+# U6b stage 2c-1 (#3665) -- the flagged read through the engramd owner
+# ---------------------------------------------------------------------------
+# With `engramd.lesson_tripwire_reads_via_owner` true in $ENGRAM_HOME/config.json
+# (read ONLY through engramd_owner_flags.flag_on), the four read sites of this
+# hook -- load_tripwires, render_triggered_principles (the chain), the prevention
+# load in load_prevention_lessons, and check_in_turn_recall (its COUNT and
+# engram_idf.extract_keywords) -- read through ONE engramd_client.OwnerReadConnection
+# shared by the whole fire, and never open knowledge.db. Flag OFF is the direct
+# path, unchanged. Modelled on U6a (engram-stop-hook.py).
+#
+# Owner failure (any OwnerReadError, or the client failing to import): the failing
+# site returns its EMPTY result for this fire (never a deny, never presented as "no
+# tripwires matched"), the first failure is recorded, and main() adds ONE loud
+# notice to the tripwire block's head, rate-limited through the shared probe-notice
+# stamp under kind `tripwire-owner`. A failed flag helper reads OFF and is reported
+# (stderr line every run; the same line once per window under `tripwire-owner-flag`).
+
+# The hook is registered with a 3 s timeout (hooks/hooks.json): the whole fire's owner
+# time is bounded at 2.0 s (3 s minus interpreter start and the rest of the fire), each
+# read at 1.0 s, both end-to-end (the shim re-arms every read against the remaining budget).
+OWNER_FIRE_BUDGET_S = 2.0
+OWNER_READ_TIMEOUT_S = 1.0
+
+_OWNER_FLAG_KEY = "lesson_tripwire_reads_via_owner"
+OWNER_NOTICE_KEY = "tripwire-owner"
+OWNER_FLAG_NOTICE_KEY = "tripwire-owner-flag"
+
+# Set by main() for ONE run (None outside main(): standalone callers of the sites stay
+# on the direct path). {"on": bool, "conn": shim or None, "failure": dict or None}.
+_OWNER_RUN = None
+
+# Set by _owner_reads_enabled() when the flag helper fails at import or at `flag_on`
+# (class NAME only, never the message); reset at the top of every call.
+_OWNER_FLAGS_FAILURE = None
+
+
+class _ClientImportFailure(Exception):
+    """engramd_client could not be imported. args = (cause class name,)."""
+
+
+def _import_owner_flags():
+    """Thin alias (#3665): the body lives once in `_hooklib.import_owner_flags`; the name
+    stays a module attribute because callers and tests patch it."""
+    return _hooklib_import_owner_flags(ENGRAM_HOME)
+
+
+def _owner_flags_failure_line():
+    """The one report line, or None when no failure is recorded / anything goes wrong."""
+    if _OWNER_FLAGS_FAILURE is None:
+        return None
+    try:
+        cls = "".join(ch if ch.isprintable() else "?" for ch in str(_OWNER_FLAGS_FAILURE))[:80]
+        return f"engram-lesson-tripwire-hook: owner flag helper failed: {cls}"
+    except Exception:
+        return None
+
+
+def _owner_reads_enabled() -> bool:
+    """`engramd.lesson_tripwire_reads_via_owner`, read ONLY through
+    engramd_owner_flags.flag_on (one definition shared with the owner launcher); anything
+    but the boolean `true` is OFF, the direct path. ANY exception (and a SystemExit)
+    importing the helper or calling `flag_on` reads OFF -- the hook cannot know the flag is
+    ON -- and its CLASS NAME (never the message) is recorded in `_OWNER_FLAGS_FAILURE`
+    (reset on every call) for main() to report. KeyboardInterrupt is not caught."""
+    global _OWNER_FLAGS_FAILURE
+    _OWNER_FLAGS_FAILURE = None
+    try:
+        engramd_owner_flags = _import_owner_flags()
+        # `is True`: only the JSON boolean true is ON; a truthy non-bool must not read as ON.
+        return engramd_owner_flags.flag_on(_OWNER_FLAG_KEY, CONFIG_PATH) is True
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 -- see docstring
+        try:
+            _OWNER_FLAGS_FAILURE = type(exc).__name__
+        except Exception:
+            _OWNER_FLAGS_FAILURE = "unknown"
+        return False
+
+
+def _import_engramd_client():
+    """Lazy import (flag OFF must never import it), resolved layout-agnostically via the
+    shared resolver -- plugin root first, then a walk-parents search; never a fixed
+    parents[N] (project CLAUDE.md, "Plugin build restructures code paths")."""
+    runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engramd_client.py")
+    # Position 0 even if already present further down: an earlier insertion must not let
+    # another directory win this import.
+    sys.path[:] = [runtime_dir] + [p for p in sys.path if p != runtime_dir]
+    import engramd_client
+    return engramd_client
+
+
+def _owner_active() -> bool:
+    return _OWNER_RUN is not None and bool(_OWNER_RUN.get("on"))
+
+
+def _owner_conn():
+    """The ONE OwnerReadConnection of this fire, created lazily at first use and shared by
+    all four read sites. Raises _ClientImportFailure when the client cannot be imported."""
+    run = _OWNER_RUN
+    if run["conn"] is None:
+        try:
+            ec = _import_engramd_client()
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 -- any import failure is an owner failure; KeyboardInterrupt is not caught
+            raise _ClientImportFailure(type(exc).__name__) from exc
+        run["conn"] = ec.OwnerReadConnection(
+            total_budget=OWNER_FIRE_BUDGET_S, per_call_timeout=OWNER_READ_TIMEOUT_S)
+    return run["conn"]
+
+
+def _focused_read_conn():
+    """(build, conn) for the in-context resolver's one store read, `_hooklib._focused_ids`
+    (#3710, U8). Flag OFF: (True, None), the direct path as before. Flag ON: (True, the
+    fire's owner connection). Flag ON but the client cannot be imported: the failure is
+    recorded (one loud notice) and (False, None): the caller builds NO resolver (drops
+    nothing), because the alternative is a direct open on a flag-ON fire."""
+    if not _owner_active():
+        return True, None
+    try:
+        return True, _owner_conn()
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 -- KeyboardInterrupt is not caught
+        _record_owner_failure("focused_ids", exc)
+        return False, None
+
+
+def _is_owner_exc(exc: BaseException) -> bool:
+    return isinstance(exc, _ClientImportFailure) or (
+        type(exc).__name__ == "OwnerReadError" and hasattr(exc, "kind"))
+
+
+def _record_owner_failure(site: str, exc: BaseException) -> bool:
+    """Record the FIRST owner failure of this run (kind, the typed Unavailable/Rejected
+    result, the cause CLASS name only). Returns True when `exc` was an owner failure (even
+    if an earlier one is already kept); False leaves the caller to treat it as it always did."""
+    if not _owner_active() or not _is_owner_exc(exc):
+        return False
+    run = _OWNER_RUN
+    if run["failure"] is None:
+        if isinstance(exc, _ClientImportFailure):
+            kind, result, cause = "client_import", None, (exc.args[0] if exc.args else "unknown")
+        else:
+            kind, result = exc.kind, getattr(exc, "result", None)
+            cause = type(exc.__cause__).__name__ if exc.__cause__ is not None else None
+        run["failure"] = {"site": site, "kind": kind, "result": result, "cause": cause}
+    return True
 
 # ---------------------------------------------------------------------------
 # #2858 -- tripwire-block preview cap (harness-truncation defense)
@@ -140,47 +316,279 @@ TRIPWIRE_BLOCK_CHAR_CEILING = 1800
 # tests share exactly one copy of the literal text.
 TRIPWIRE_HEADER = "[lesson-tripwire] Action-moment pattern matched — remember:"
 
+# #3485: every json_extract reads through CASE WHEN json_valid(metadata) THEN
+# metadata END. A non-JSON blob in nodes.metadata otherwise makes SQLite abort
+# the WHOLE query ("malformed JSON"), and load_tripwires' `except Exception:
+# return []` then silences the tripwire layer for EVERY lesson, not just the
+# bad row. The guarded read yields NULL for a bad blob, so only that row drops
+# out. (Plain SQL text, no helper: the hook cannot import server code.)
 _QUERY = """
 SELECT
     id,
     COALESCE(
-        json_extract(metadata, '$.scaffolding_nudge'),
-        json_extract(metadata, '$.anchor_line'),
-        json_extract(metadata, '$.surfacing_nudge'),
+        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.scaffolding_nudge'),
+        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.anchor_line'),
+        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.surfacing_nudge'),
         claim
     ) AS nudge,
-    json_extract(metadata, '$.situation_pattern')  AS pattern
+    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,
+    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.tripwire_priority')  AS priority
 FROM nodes
 WHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')
   AND is_current = 1
   AND memory_status = 'active'
-  AND json_extract(metadata, '$.situation_pattern') IS NOT NULL
-  AND json_extract(metadata, '$.situation_pattern') != ''
+  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') IS NOT NULL
+  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') != ''
 """
 
 
+# ---------------------------------------------------------------------------
+# #3503 -- make the loaders' fail-soft `except` VISIBLE
+# ---------------------------------------------------------------------------
+# Both loaders below end in `except Exception: return []`, so a caller could not
+# tell "no lessons" from "the loader failed" (a locked file past the timeout, a
+# missing table after a partial migration, a file that is not a database all
+# looked identical to an empty lesson set). The loaders still return [] and
+# never raise (fail-soft is the hook's whole contract); the failure is now also
+#   1. recorded in LOADER_FAILURES (reset at the top of every main() run),
+#   2. written as ONE sanitized stderr line (the `route-ledger:` convention), and
+#   3. surfaced to the agent as ONE bounded line inside the tripwire block
+#      (rendered by emit_context, see main()), at most once per
+#      LOADER_NOTICE_WINDOW_SECONDS, tracked by a small stamp file.
+LOADER_FAILURES: list = []
+LOADER_NOTICE_WINDOW_SECONDS = 1800
+# State file beside the hook's other state (ENGRAM_HOME, like the overflow dir
+# and the ledgers). Module constant so a test can point it elsewhere.
+LOADER_NOTICE_STAMP_PATH = Path(ENGRAM_HOME) / "lesson-tripwire-loader-notice.json"
+_LOADER_NAMES = ("load_tripwires", "load_prevention_lessons")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _sanitize_exc_text(text: str, limit: int) -> str:
+    """Each control character (newline included) -> one space, then cut to
+    `limit` characters, so an exception message is always one bounded line."""
+    return _CONTROL_CHARS_RE.sub(" ", text)[:limit]
+
+
+def _record_loader_failure(loader: str, exc: BaseException) -> None:
+    """Record one loader failure and write exactly one stderr line:
+    `lesson-tripwire: <loader> failed: <ExcType>: <message>` (message
+    sanitized, <= 200 chars; whole line <= 300). Never raises."""
+    try:
+        etype = _sanitize_exc_text(type(exc).__name__, 80)
+        try:
+            msg = _sanitize_exc_text(str(exc), 200)
+        except Exception:
+            msg = "<unprintable exception message>"
+        LOADER_FAILURES.append({"loader": loader, "exc_type": etype, "message": msg})
+        sys.stderr.write(f"lesson-tripwire: {loader} failed: {etype}: {msg}"[:300] + "\n")
+    except Exception:
+        pass
+
+
+def _loader_notice_now() -> float:
+    return time.time()
+
+
+def _loader_notice_due(now: float) -> bool:
+    """True unless a notice was shown within the last window. An absent,
+    unreadable, corrupt, wrongly-shaped or future-dated stamp is "due": the
+    rate limit must fail VISIBLE, never silent. Never raises."""
+    try:
+        shown_at = json.loads(read_regular_text(LOADER_NOTICE_STAMP_PATH, encoding="utf-8"))["shown_at"]
+        if isinstance(shown_at, bool) or not isinstance(shown_at, (int, float)):
+            return True
+        return not (0 <= now - shown_at < LOADER_NOTICE_WINDOW_SECONDS)
+    except Exception:
+        return True
+
+
+def _mark_loader_notice_shown(now: float) -> None:
+    """Start a new rate-limit window. Never raises (an unwritable stamp just
+    means the next failure shows the line again)."""
+    try:
+        LOADER_NOTICE_STAMP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(LOADER_NOTICE_STAMP_PATH, {"shown_at": now})
+    except Exception:
+        pass
+
+
+def _pending_loader_notice():
+    """Return (line, now): the one visible line to inject this run, or ("", None).
+
+    A recorded failure of EITHER loader is shown (rate-limited), including a
+    prevention-only failure with no tripwire hits: the hook never blocks on an
+    infrastructure failure, so a failed prevention load leaves the blocking
+    gate off for the run and this line is the only visible signal. With no
+    hits the line is the whole block (main renders it through emit_context).
+    The caller writes the rate-limit stamp only after the response carrying
+    the line has been printed.
+    Shape: `[lesson-tripwire] <loaders> failed (<ExcType>); tripwires or
+    blocking lessons may be missing this prompt`, <= 200 chars, no exception
+    message text."""
+    try:
+        if not LOADER_FAILURES:
+            return "", None
+        names = [n for n in _LOADER_NAMES if any(f["loader"] == n for f in LOADER_FAILURES)]
+        now = _loader_notice_now()
+        if not _loader_notice_due(now):
+            return "", None
+        types: list = []
+        for f in LOADER_FAILURES:
+            if f["exc_type"] not in types:
+                types.append(f["exc_type"])
+        types_s = "/".join(t[:40] for t in types)[:80]
+        line = f"[lesson-tripwire] {', '.join(names)} failed ({types_s}); tripwires or blocking lessons may be missing this prompt"
+        return line[:200], now
+    except Exception:
+        return "", None
+
+
+# #3665 -- the owner-failure notice. Two parts as in U6a: what the agent can do itself, and
+# what to tell the human. Dynamic text is bounded and control-character-free; the exception
+# CLASS of a client failure is shown, never its message, SQL text or row data.
+_OWNER_NOTICE_CAP = 1400
+_OWNER_FLAG_OFF_STEP = (
+    "To go back to the direct-read path meanwhile, set "
+    "engramd.lesson_tripwire_reads_via_owner to false in $ENGRAM_HOME/config.json."
+)
+_OWNER_AGENT_BASE = [
+    "Do NOT read knowledge.db directly to work around this; tell the human what is shown here.",
+    "Do not retry in a loop: this notice repeats at most once per window.",
+]
+
+
+def _notice_lines(title: str, items) -> str:
+    return "  " + title + ":\n" + "\n".join(
+        f"    - {_sanitize_exc_text(str(i), 200)}" for i in items)
+
+
+def _owner_failure_notice(failure: dict) -> str:
+    """The loud text for one recorded owner failure. Never raises beyond what the caller
+    guards; bounded to _OWNER_NOTICE_CAP characters."""
+    site, kind, result = failure["site"], failure["kind"], failure.get("result")
+    cause = _sanitize_exc_text(str(failure.get("cause") or ""), 80)
+    head = (
+        f"[lesson-tripwire] ENGRAM UNAVAILABLE: tripwires and lessons {COULD_NOT_READ} this fire "
+        f"(the engramd owner read failed at {site}: {kind}). "
+        'This is NOT "no tripwires matched": the check could not run, so a tripwire or a '
+        "blocking lesson may have been missed. No tool call was blocked."
+    )
+    lines = [head]
+    agent = list(_OWNER_AGENT_BASE)
+    human = []
+    if kind == "unavailable" and result is not None:
+        lines.append(
+            f"  Socket: {_sanitize_exc_text(str(result.socket_path), 200)} "
+            f"(bound {OWNER_READ_TIMEOUT_S}s per read, {OWNER_FIRE_BUDGET_S}s per fire)")
+        agent += list(result.agent_steps)
+        human += list(result.human_steps)
+    elif kind == "rejected" and result is not None:
+        lines.append(f"  Reason: {_sanitize_exc_text(str(result.reason), 200)}")
+        lines.append(f"  Remedy: {_sanitize_exc_text(str(result.remedy), 200)}")
+        lines.append("  This refusal is not retryable: repeating the same request cannot change the answer.")
+        human.append("Act on the Remedy line above (typically: register the template / restart the owner "
+                     "on a matching version).")
+    elif kind == "unusable_answer":
+        lines.append("  The owner returned an answer of the wrong shape.")
+        human.append("Restart the engramd owner on the current version and report this if it persists.")
+    elif kind == "budget_exhausted":
+        lines.append(f"  The fire's owner time budget ({OWNER_FIRE_BUDGET_S}s) ran out before this read.")
+        human.append("Check why the owner answers slowly (engramd logs, host load).")
+    elif kind == "client_import":
+        lines.append(f"  The engramd client module (engramd_client.py) could not be loaded (cause: {cause}).")
+        human.append("Check that engramd_client.py exists at the plugin root (the directory above hooks/); "
+                     "re-run the plugin install or upgrade if it is missing.")
+    else:  # client_failure and anything a future client adds
+        lines.append(f"  The engramd client failed while reading (cause: {cause or kind}).")
+        human.append("This is a client-side bug: report it with the cause line above.")
+    human.append(_OWNER_FLAG_OFF_STEP)
+    lines += [_notice_lines("Agent steps", agent), _notice_lines("Human steps", human)]
+    return "\n".join(lines)[:_OWNER_NOTICE_CAP]
+
+
+COULD_NOT_READ = "could NOT be read"
+
+
+def _pending_owner_notice():
+    """Return (text, kind): the one owner-side line to inject this run, or ("", None).
+    A recorded owner failure -> the loud notice under `tripwire-owner`; a failed flag helper
+    -> its report line under `tripwire-owner-flag` (the two cannot co-occur: a failed helper
+    reads the flag OFF). Both ride the shared probe-notice window, so a repeat inside the
+    window is silent on stdout. The caller stamps the window only after the response was
+    printed and flushed. Never raises."""
+    try:
+        run = _OWNER_RUN
+        if run is not None and run.get("failure") is not None:
+            text, key = _owner_failure_notice(run["failure"]), OWNER_NOTICE_KEY
+        else:
+            text, key = _owner_flags_failure_line(), OWNER_FLAG_NOTICE_KEY
+        if not text or not probe_notice_due(ENGRAM_HOME, key):
+            return "", None
+        return text, key
+    except Exception:
+        return "", None
+
+
+def _write_owner_stderr_lines() -> None:
+    """The per-run stderr lines (every run, class/kind only): the failed flag helper, and the
+    first owner failure. Never raises."""
+    try:
+        line = _owner_flags_failure_line()
+        if line is not None:
+            sys.stderr.write(line + "\n")
+        run = _OWNER_RUN
+        if run is not None and run.get("failure") is not None:
+            f = run["failure"]
+            sys.stderr.write(
+                f"engram-lesson-tripwire-hook: owner read failed: {f['kind']} at {f['site']}\n"[:300])
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def load_tripwires(db_path: Path = DB_PATH):
-    """Return list of (pattern_str, nudge_str, node_id) from active lessons
-    with situation_pattern.
+    """Return list of (pattern_str, nudge_str, node_id, priority_str) from
+    active lessons with situation_pattern.
 
     #2753 epic WS2: node_id was added (3rd tuple element, minimal extension
     of the pre-existing (pattern, nudge) shape) so check_command's hits can
     carry the firing node's id for generalization_chain() lookups, without
-    touching what the existing nudge block renders."""
-    if not db_path.exists():
+    touching what the existing nudge block renders.
+
+    alpha#3270/#3112: priority was added (4th tuple element) carrying the
+    lesson's tripwire_priority metadata field -- "high" or "normal", NULL
+    on every lesson minted before this field existed. Coerced to "normal"
+    here (not left as None) so every downstream consumer can compare by
+    string equality without an extra None-check; a lesson with no opinion
+    sorts exactly like a lesson explicitly marked "normal"."""
+    # #3665: with the owner flag ON the fire's shared shim stands in for the connection and
+    # knowledge.db is never opened (no existence check of the local file either: the store
+    # belongs to the owner). An OWNER failure is recorded for the loud notice instead of as a
+    # loader failure; the result is EMPTY either way. One execute site, so the read-template
+    # registry lists this function once.
+    owner = _owner_active()
+    if not owner and not db_path.exists():
         return []
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        conn = _owner_conn() if owner else connect_regular_ro(db_path, timeout=2.0)
         rows = conn.execute(_QUERY).fetchall()
-        conn.close()
-        return [(row[2], row[1], row[0]) for row in rows if row[1] and row[2]]
-    except Exception:
+        if not owner:
+            conn.close()
+        return [
+            (row[2], row[1], row[0], row[3] or "normal")
+            for row in rows if row[1] and row[2]
+        ]
+    except Exception as exc:
+        if not (owner and _record_owner_failure("load_tripwires", exc)):
+            _record_loader_failure("load_tripwires", exc)
         return []
 
 
 def check_command(match_target: str, tripwires) -> list:
-    """Return list of {"nudge": str, "node_id": str, "pattern": str} dicts
-    for every situation_pattern that matches match_target.
+    """Return list of {"nudge": str, "node_id": str, "pattern": str,
+    "priority": str} dicts for every situation_pattern that matches
+    match_target.
 
     #2753 epic WS2: hits carry node_id (in addition to the pre-existing
     nudge text) so the caller can compute generalization_chain() per hit for
@@ -193,12 +601,25 @@ def check_command(match_target: str, tripwires) -> list:
     order hits by specificity (len(pattern), descending) before rendering
     and capping, per the preview-truncation fix above. This does NOT change
     the matching logic or the circumstances under which a hit fires -- still
-    exactly one hit per matching pattern."""
+    exactly one hit per matching pattern.
+
+    alpha#3270/#3112: `tripwires` entries are unpacked with a variadic tail
+    (`*rest`) rather than a strict 4-tuple, so every existing caller that
+    constructs bare (pattern, nudge, node_id) 3-tuples by hand (test
+    fixtures, mocked load_tripwires) keeps working unchanged -- priority
+    defaults to "normal" when the 4th element is absent, identical to what
+    load_tripwires() itself now coerces a NULL column to. Only
+    load_tripwires()'s own real DB-reading path needs the 4th element;
+    nothing about the matching logic changes."""
     hits = []
-    for pattern, nudge, node_id in tripwires:
+    for pattern, nudge, node_id, *rest in tripwires:
+        priority = rest[0] if rest else "normal"
         try:
             if re.search(pattern, match_target, re.IGNORECASE):
-                hits.append({"nudge": nudge, "node_id": node_id, "pattern": pattern})
+                hits.append({
+                    "nudge": nudge, "node_id": node_id, "pattern": pattern,
+                    "priority": priority,
+                })
         except re.error:
             pass  # malformed pattern — skip silently
     return hits
@@ -258,7 +679,8 @@ def write_tripwire_overflow(cut_hits: list, now: float | None = None) -> str:
             f"[{hit.get('node_id', '?')}] {hit.get('nudge', '')}"
             for hit in cut_hits
         ]
-        overflow_path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+        with open_regular_text_write(overflow_path, encoding="utf-8") as f:
+            f.write("\n\n".join(blocks) + "\n")
         return str(overflow_path)
     except Exception:
         return ""
@@ -366,7 +788,8 @@ def render_triggered_principles(
     contract (`cycle_detected` requires `truncated: False`), so the two
     checks below never fire on the same hit.
 
-    Returns "" on: no hits, no importable generalization_chain, any DB/walk
+    Returns "" on: no hits, no importable generalization_chain (not consulted when the
+    connection is the owner shim, which serves the walk itself, #3740), any DB/walk
     failure, or no hit producing a real chain and no hit reporting
     cycle_detected or a truncated-with-no-head walk. Never raises -- this
     hook's T2 "never blocks" contract (see module docstring) applies to
@@ -397,14 +820,27 @@ def render_triggered_principles(
         return ""
     if db_path is None:
         db_path = DB_PATH
-    generalization_chain = _import_generalization_chain()
-    if generalization_chain is None:
-        return ""
-
+    generalization_chain = None
     conn = None
+    owner = _owner_active()
+    if not owner:
+        generalization_chain = _import_generalization_chain()
+        if generalization_chain is None:
+            return ""
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
-        conn.row_factory = sqlite3.Row
+        if owner:
+            # #3665: the fire's shared shim; positional rows (no row_factory exists on it).
+            conn = _owner_conn()
+            if not callable(getattr(conn, "generalization_chain", None)):
+                # no owner-served walk on this connection: walk here, as before
+                generalization_chain = _import_generalization_chain()
+                if generalization_chain is None:
+                    return ""
+            # else (#3740 R1): the shim serves the walk through the owner; the hook neither
+            # imports engram_core nor depends on it being importable in this process.
+        else:
+            conn = connect_regular_ro(db_path, timeout=1.0)
+            conn.row_factory = sqlite3.Row
         # head_id -> {"nodes": {resolved_id: entry, ...}, "hit_ids": [node_id, ...]}
         heads_seen: dict = {}
         head_order: list = []
@@ -432,7 +868,14 @@ def render_triggered_principles(
             node_id = hit.get("node_id") if isinstance(hit, dict) else None
             if not node_id:
                 continue
-            chain = generalization_chain(conn, node_id)
+            # #3740 Cut A: the owner shim carries the whole walk as ONE typed `chain` request
+            # (the owner runs engram_core.generalization_chain itself); a plain sqlite
+            # connection has no such method and walks as before. An OwnerReadError from the
+            # shim propagates to the handler below, like any other owner failure.
+            if hasattr(conn, "generalization_chain"):
+                chain = conn.generalization_chain(node_id)
+            else:
+                chain = generalization_chain(conn, node_id)
             nodes = chain.get("nodes") or {}
             start_resolved = chain.get("start_resolved_id")
             heads = chain.get("heads") or []
@@ -461,10 +904,13 @@ def render_triggered_principles(
                     head_order.append(head_id)
                 heads_seen[head_id]["hit_ids"].append(node_id)
                 heads_seen[head_id]["nodes"].update(nodes)
-    except Exception:
+    except Exception as exc:
+        if owner:
+            _record_owner_failure("render_triggered_principles", exc)
         return ""
     finally:
-        if conn is not None:
+        # the owner shim is shared by every site of the fire: not closed here
+        if conn is not None and not owner:
             try:
                 conn.close()
             except Exception:
@@ -563,7 +1009,7 @@ def _ws4_config() -> dict:
     """
     inactive = {"active": False, "seed": None}
     try:
-        with open(Path(ENGRAM_HOME) / "config.json", "r", encoding="utf-8") as f:
+        with open_regular_text(Path(ENGRAM_HOME) / "config.json", encoding="utf-8") as f:
             config = json.load(f)
         section = (config.get("experiments", {}) or {}).get("ws4_chain_ab", {}) or {}
         if section.get("enabled") is not True:
@@ -594,7 +1040,7 @@ def _ws4_config() -> dict:
 def _build_ws4_ledger_entry(
     *, ts, ts_iso, hook_input, raw_tool_use_id, nonce, draw_basis, seed,
     arm, shown_lesson_ids, cut_lesson_ids, heads_by_lesson, nudge_chars,
-    principles_block, chain_rendered, error,
+    principles_block, chain_rendered, error, chain_cut=False,
 ) -> dict:
     """Assemble one full WS4 fire-ledger row (schema per the WS4 spec).
 
@@ -628,6 +1074,10 @@ def _build_ws4_ledger_entry(
         "nudge_chars": nudge_chars,
         "chain_chars": len(principles_block),
         "chain_rendered": chain_rendered,
+        # #3677: True iff the final total-budget pass dropped the chain block.
+        # chain_chars above stays the WOULD-RENDER length; chain_rendered is
+        # whether the chain was delivered (False when cut).
+        "chain_cut": bool(chain_cut),
     }
     if error is not None:
         entry["error"] = error
@@ -641,10 +1091,67 @@ def _append_ws4_fire_ledger(entry: dict) -> None:
     the chain block main() already decided to render or withhold -- this
     call always happens strictly AFTER that decision, purely to log it."""
     try:
-        with open(WS4_LEDGER_PATH, "a", encoding="utf-8") as f:
+        with open_regular_text_append(WS4_LEDGER_PATH, encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# #3677 -- the final total-budget pass. main() joins [tripwire block, chain,
+# in-turn recall]; the block alone is bounded by emit_context, but the joined
+# string was not, and the harness cuts the TAIL of an oversized injection (where
+# the chain and recall sit). The pass cuts in whole units, recall (whole id
+# lines from the end) first, then the chain (one whole block), never the block,
+# and says so on the FIRST line, counted inside the budget via the reserve.
+# Priority order: block, then chain, then recall; the chain also goes when the
+# marker would not fit after the recall is gone (better than truncating a lesson
+# hit in-band to save a chain).
+# ---------------------------------------------------------------------------
+
+# Room taken off the budget whenever the pass must cut, so the first-line clause
+# (" · tail cut: R recall lines, C chain lines", <= 52 chars for 6-digit counts)
+# can never push the total over the budget. Nothing is reserved when nothing is cut.
+_TAIL_CUT_RESERVE = 64
+_TRAILER_PREFIX_RE = re.compile(r"^▸ \d+ shown · \d+ cut")
+
+
+def _tail_cut_clause(recall_cut: int, chain_cut_lines: int, own_line: bool = False) -> str:
+    """The first-line marker. Inside a tripwire trailer it is a clause that sits
+    right after "N cut"; with no tripwire block it is its own first line."""
+    text = f"tail cut: {recall_cut} recall lines, {chain_cut_lines} chain lines"
+    return f"▸ {text}" if own_line else f" · {text}"
+
+
+def _apply_tail_cut(parts: list, recall_cut: int, chain_cut_lines: int, has_block: bool) -> list:
+    """Return `parts` with the marker on the FIRST line (a new list; never mutates).
+    With a tripwire block, the clause goes after `▸ N shown · M cut` and before any
+    ` · head trimmed` / ` — see <path>` text, so the trailer's path stays last."""
+    out = list(parts)
+    if has_block and out:
+        m = _TRAILER_PREFIX_RE.match(out[0])
+        if m:
+            out[0] = out[0][: m.end()] + _tail_cut_clause(recall_cut, chain_cut_lines) + out[0][m.end():]
+            return out
+    return [_tail_cut_clause(recall_cut, chain_cut_lines, own_line=True)] + out
+
+
+def _place_chain(parts: list, block: str, budget) -> tuple:
+    """(delivered, cut_lines): whether the chain block is kept whole by C3's rule,
+    and, when it is dropped, how many lines the dropped block had (else 0)."""
+    if _chain_fits(parts, block, budget):
+        return True, 0
+    return False, block.count("\n") + 1
+
+
+def _chain_fits(parts: list, block: str, budget) -> bool:
+    """C3's chain rule: keep the chain iff the pieces so far plus the whole chain
+    block fit the budget. Fail-open toward delivering (any error, or no known
+    budget, keeps the chain exactly as before #3677)."""
+    try:
+        return budget is None or len("\n".join(parts + [block])) <= budget
+    except Exception:
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -662,19 +1169,21 @@ def _append_ws4_fire_ledger(entry: dict) -> None:
 
 PREVENTION_LEDGER_PATH = Path(ENGRAM_HOME) / "lesson-prevention-ledger.jsonl"
 
+# #3485: same json_valid guard as _QUERY above (one bad blob must not abort the
+# whole read and silence every shadow/blocking lesson).
 _PREVENTION_QUERY = """
 SELECT
     id,
-    json_extract(metadata, '$.situation_pattern')  AS pattern,
-    json_extract(metadata, '$.prevention_type')    AS prevention_type,
-    COALESCE(json_extract(metadata, '$.scaffolding_nudge'), claim) AS nudge
+    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,
+    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.prevention_type')    AS prevention_type,
+    COALESCE(json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.scaffolding_nudge'), claim) AS nudge
 FROM nodes
 WHERE type = 'lesson'
   AND is_current = 1
   AND memory_status = 'active'
-  AND json_extract(metadata, '$.situation_pattern') IS NOT NULL
-  AND json_extract(metadata, '$.situation_pattern') != ''
-  AND json_extract(metadata, '$.prevention_type') IN ('shadow', 'blocking')
+  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') IS NOT NULL
+  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') != ''
+  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.prevention_type') IN ('shadow', 'blocking')
 """
 
 
@@ -682,17 +1191,23 @@ def load_prevention_lessons(db_path: Path = DB_PATH):
     """Return list of {id, pattern, prevention_type, nudge} for lessons
     whose prevention_type is 'shadow' or 'blocking' (advisory/absent
     lessons are excluded — they have nothing to log or deny here)."""
-    if not db_path.exists():
+    # #3665: see load_tripwires. A failed owner read is an EMPTY result plus a recorded owner
+    # failure -- never "no lessons" silently, and the deny gate stays fail-open.
+    owner = _owner_active()
+    if not owner and not db_path.exists():
         return []
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        conn = _owner_conn() if owner else connect_regular_ro(db_path, timeout=2.0)
         rows = conn.execute(_PREVENTION_QUERY).fetchall()
-        conn.close()
+        if not owner:
+            conn.close()
         return [
             {"id": row[0], "pattern": row[1], "prevention_type": row[2], "nudge": row[3] or ""}
             for row in rows if row[1] and row[2]
         ]
-    except Exception:
+    except Exception as exc:
+        if not (owner and _record_owner_failure("load_prevention_lessons", exc)):
+            _record_loader_failure("load_prevention_lessons", exc)
         return []
 
 
@@ -783,7 +1298,7 @@ def _demotion_config() -> dict:
     pattern matches legitimate calls and should stop blocking.
     """
     try:
-        with open(Path(ENGRAM_HOME) / "config.json", "r", encoding="utf-8") as f:
+        with open_regular_text(Path(ENGRAM_HOME) / "config.json", encoding="utf-8") as f:
             config = json.load(f)
         section = (config.get("lessons", {}) or {}).get("blocking_demotion", {}) or {}
         return {
@@ -805,7 +1320,7 @@ def _count_recent_overrides(lesson_id: str, window_days: float, now: float) -> i
     cutoff = now - (window_days * 86400)
     count = 0
     try:
-        with open(PREVENTION_LEDGER_PATH) as f:
+        with open_regular_text(PREVENTION_LEDGER_PATH) as f:
             for line in f:
                 try:
                     entry = json.loads(line)
@@ -911,7 +1426,7 @@ def _log_threshold_crossed(now: float, deny: dict) -> None:
     except Exception:
         pass
     try:
-        with open(PREVENTION_LEDGER_PATH, "a") as f:
+        with open_regular_text_append(PREVENTION_LEDGER_PATH) as f:
             f.write(json.dumps({
                 "ts": now,
                 "lesson_id": lesson_id,
@@ -933,7 +1448,7 @@ def _append_prevention_ledger(now: float, hits: list) -> None:
     if not hits:
         return
     try:
-        with open(PREVENTION_LEDGER_PATH, "a") as f:
+        with open_regular_text_append(PREVENTION_LEDGER_PATH) as f:
             for hit in hits:
                 f.write(json.dumps({
                     "ts": now,
@@ -1013,7 +1528,7 @@ def _append_ledger(build_entry) -> None:
     added."""
     try:
         entry = build_entry()
-        with open(LEDGER_PATH, "a") as f:
+        with open_regular_text_append(LEDGER_PATH) as f:
             f.write(json.dumps(entry) + "\n")
     except Exception:
         pass
@@ -1070,7 +1585,7 @@ def _in_turn_config() -> dict:
         "junk_stoplist": None,
     }
     try:
-        with open(Path(ENGRAM_HOME) / "config.json", "r", encoding="utf-8") as f:
+        with open_regular_text(Path(ENGRAM_HOME) / "config.json", encoding="utf-8") as f:
             config = json.load(f)
         section = (config.get("auto_surface", {}) or {}).get("in_turn_recall", {}) or {}
         raw_min_idf = section.get("min_idf")
@@ -1150,13 +1665,43 @@ def _query_recall_daemon(query: str, top_k: int = 5) -> dict | None:
         return None
 
 
-def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> str:
+_RECALL_FOOTER = "\n  (ambient action-moment recall; engram_inspect(id) for detail)"
+
+
+def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
+                         record_out: dict | None = None,
+                         max_chars: int | None = None, cut_reserve: int = 0) -> str:
     """Budgeted general recall at action-moment, behind the novelty gate.
 
     hook_input (#1749): the raw PreToolUse payload, passed through from
     main() so the fire ledger can stamp session_id/transcript_path/tool_name
     per entry. Optional -- existing callers/tests that don't pass it keep
-    working, with those fields recorded as null."""
+    working, with those fields recorded as null.
+
+    record_out (#3670): optional out-parameter for the shown record. When a
+    dict is passed, a gate-passing fire stores the ids it rendered in
+    ``record_out["ids"]`` (possibly ``[]``) and does NOT append the record
+    itself: the caller appends it only after the response was written out,
+    so a record never claims more than was shown. When None (every other
+    caller: tests, tools/perf/bench_in_turn_recall.py) no shown record is
+    appended at all -- appending here, before anything was printed, was the
+    bug. The return type and the route ledger write are unchanged.
+
+    There is no emit_context cut on the recall text, but main() appends it LAST
+    to the joined additionalContext, and the harness silently cuts the TAIL of
+    an oversized injection. So main() records ``record_out["ids"]`` only when
+    the WHOLE joined string fits the harness budget; otherwise it records an
+    empty-ids line (under-record, never over-record).
+
+    max_chars / cut_reserve (#3677): the final total-budget pass. ``max_chars``
+    is the room the rendered recall may take (None = no cap, today's behaviour).
+    When the full rendering is longer than it, id lines are cut WHOLE from the
+    END until the REAL rendered string (header + footer included) fits
+    ``max_chars - cut_reserve`` -- BEFORE the route ledger, ``recent_ids`` and
+    the fire-ledger row are written, so all of them list only the survivors (a
+    cut id is shown again on a later fire). Cut ids carry the route-ledger cut
+    name "tail_budget"; ``record_out["tail_cut_lines"]`` is how many id lines
+    were cut. If no id line survives the result is "" with outcome "budget_cut"."""
     import time
 
     cfg = _in_turn_config()
@@ -1178,7 +1723,12 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
     lock_degrade_reason = ""
     try:
         import fcntl
-        lock_fd = os.open(str(STATE_PATH) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        # O_NONBLOCK (#3628): defence in depth. Measured on macOS, O_CREAT|O_RDWR
+        # on a FIFO already returns at once and the flock below then fails
+        # ENOTSUP (-> suppress, "" -- unchanged); O_NONBLOCK keeps a platform
+        # where that open could wait from hanging. No effect on a regular file.
+        lock_fd = os.open(str(STATE_PATH) + ".lock",
+                          os.O_CREAT | os.O_RDWR | os.O_NONBLOCK, 0o600)
     except Exception as exc:
         # fcntl unavailable (non-POSIX) or the lockfile couldn't be opened
         # (e.g. permissions) — degrade to the unlocked path exactly as
@@ -1224,7 +1774,7 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
         # except: any state-read failure (incl. PermissionError) must
         # degrade to empty state, never block the tripwire path.
         try:
-            with open(STATE_PATH, "r") as f:
+            with open_regular_text(STATE_PATH) as f:
                 state = json.load(f)
             if not isinstance(state, dict):
                 state = {}
@@ -1277,8 +1827,14 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
             # config-supplied frozenset — including an empty one (filtering
             # disabled) — passes through unchanged.
             junk = cfg["junk_stoplist"] if cfg["junk_stoplist"] is not None else JUNK_STOPLIST
-            conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=1.0)
+            # #3665: with the owner flag ON the fire's shared shim stands in for the
+            # connection (the SQL strings below are registry templates, byte for byte).
+            owner = _owner_active()
+            conn = _owner_conn() if owner else connect_regular_ro(DB_PATH, timeout=1.0)
             try:
+                # #3740: the current-node count, when this site computes it, is
+                # handed to extract_keywords so the COUNT runs once per fire.
+                n_docs = None
                 if cfg["min_idf"] is not None:
                     effective_min_idf = cfg["min_idf"]
                 else:
@@ -1296,15 +1852,19 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
                 # below stays as a backstop.
                 pairs = extract_keywords(
                     conn, match_target, min_idf=effective_min_idf, top_k=5,
-                    stopwords=STOPWORDS | junk)
+                    stopwords=STOPWORDS | junk, n_docs=n_docs)
             finally:
-                conn.close()
+                if not owner:
+                    conn.close()
             terms = [tok for tok, _score in pairs]
             # rec-3 (#266): drop junk-class shell/code tokens BEFORE the
             # novelty check + fire, so execution noise neither triggers recall
             # nor pollutes the term-memory/ledger. Targeted, not a min_idf bump.
             terms = _apply_junk_stoplist(terms, junk)
-        except Exception:
+        except Exception as exc:
+            # #3665: an owner failure here is recorded for the loud notice (the site still
+            # returns ""); anything else is swallowed exactly as before.
+            _record_owner_failure("check_in_turn_recall", exc)
             return ""
         if not terms:
             return ""
@@ -1351,9 +1911,42 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
                 "outcome": outcome,
             }
 
+        # Route ledger (#3458 A): one line per gate-passing fire when the
+        # probe is live for this session (opt-in by presence, fail-open --
+        # see _hooklib.write_route_ledger). Observation only. This route has
+        # no FTS fallback (daemon-only), so source is always "daemon"; a
+        # daemon that returned nothing records zero candidates.
+        recall_query = " ".join(novel)
+
+        def _route_ledger(result_, shown_: list, cut_: dict) -> None:
+            if not hook_input:
+                return
+            try:
+                _build, _rc = _focused_read_conn()
+                if not _build:
+                    return
+                write_route_ledger(
+                    "tool_recall", hook_input.get("session_id"),
+                    tool_fire_key(hook_input.get("tool_name"), hook_input.get("tool_input")),
+                    recall_query, result_, shown_, cut_,
+                    source="daemon", default_cut="not_in_pool",
+                    extra={"novel_terms": list(novel)},
+                    read_conn=_rc,
+                )
+            except Exception as exc:  # e.g. an unserialisable tool_input: fail-open
+                print(f"route-ledger: {type(exc).__name__}: {exc}"[:300], file=sys.stderr)
+            # #3613 S1 / #3670: the shown record is NOT appended here (this runs
+            # before anything is printed). The pending ids are handed to main(),
+            # which appends once the response was written out, still after the
+            # ledger's resolver read its sources. Written whatever the
+            # exclusion kill switch says.
+            if record_out is not None:
+                record_out["ids"] = list(shown_)
+
         # Gate passed — query the daemon with the novel terms.
-        result = _query_recall_daemon(" ".join(novel))
+        result = _query_recall_daemon(recall_query)
         if not result or not result.get("match_count"):
+            _route_ledger(result, [], {})
             _record_fire()
             _write_state()
             _append_ledger(lambda: _ledger_entry("no_matches", 0, [], 0))
@@ -1364,12 +1957,41 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
         rendered_ids = []
         skipped_recent = 0
         pool = (result.get("special_nodes") or []) + (result.get("top_claims") or [])
+        _cut_names: dict = {}  # route ledger: id -> this route's own cut name
+        # #3613 live in-context exclusion: drop candidates already in the
+        # model's context BEFORE the max_lines cap, so the next ones backfill.
+        # Default OFF (`recall_in_context_exclusion.enabled`); fail-open (a
+        # resolver that cannot be built or called drops nothing). lesson /
+        # cornerstone are exempt on THIS route: a tripwire's job is
+        # action-time salience, so it re-shows even what is in context.
+        try:
+            _build, _rc = _focused_read_conn() if in_context_exclusion_enabled(ENGRAM_HOME) else (False, None)
+            if _build:
+                _resolver = build_exclusion_resolver(
+                    hook_input.get("session_id") if hook_input else None, read_conn=_rc)
+                _drop = in_context_drop_ids(
+                    [n for n in pool if isinstance(n, dict)], _resolver,
+                    exempt_types=("lesson", "cornerstone"))
+                if _drop:
+                    pool = [n for n in pool if not (isinstance(n, dict) and n.get("id") in _drop)]
+                    _cut_names.update({i: "in_context" for i in _drop})
+        except Exception:
+            pass
         for n in pool:
-            if len(lines) >= cfg["max_lines"]:
-                break
             nid = n.get("id", "?")
+            if len(lines) >= cfg["max_lines"]:
+                # cfg["max_lines"] reached: every remaining pool entry is cut
+                # by that cap (named "max_lines" for the ledger). The cap
+                # branch continues past the cap to record those cut names;
+                # the rendered lines and counts are unchanged.
+                if nid in recent_ids:
+                    _cut_names[nid] = "dedup"
+                else:
+                    _cut_names[nid] = "max_lines"
+                continue
             if nid in recent_ids:
                 skipped_recent += 1
+                _cut_names[nid] = "dedup"
                 continue
             kw = n.get("recall_keywords")
             kw_str = (" · ".join(f"`{k}`" for k in kw) + " — ") if isinstance(kw, list) and kw else ""
@@ -1377,10 +1999,30 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
             lines.append(f"  - [{nid}] {kw_str}{body}")
             rendered_ids.append(nid)
 
+        # #3677: the total-budget cut, BEFORE anything below records what was
+        # shown. Whole id lines from the END; measured on the real rendering.
+        tail_cut = 0
+        if max_chars is not None and lines:
+            _header = f"[ENGRAM in-turn recall — novel terms: {', '.join(novel)}]\n"
+            if len(_header + "\n".join(lines) + _RECALL_FOOTER) > max_chars:
+                _limit = max_chars - cut_reserve
+                keep = len(lines)
+                while keep > 0 and len(_header + "\n".join(lines[:keep]) + _RECALL_FOOTER) > _limit:
+                    keep -= 1
+                for _nid in rendered_ids[keep:]:
+                    _cut_names[_nid] = "tail_budget"
+                tail_cut = len(lines) - keep
+                lines = lines[:keep]
+                rendered_ids = rendered_ids[:keep]
+        if record_out is not None:
+            record_out["tail_cut_lines"] = tail_cut
+
+        _route_ledger(result, rendered_ids, _cut_names)
         _record_fire()
         if not lines:
             _write_state()
-            _append_ledger(lambda: _ledger_entry("all_suppressed", result.get("match_count", 0), [], skipped_recent))
+            _outcome = "budget_cut" if tail_cut else "all_suppressed"
+            _append_ledger(lambda: _ledger_entry(_outcome, result.get("match_count", 0), [], skipped_recent))
             return ""
 
         ids = state.get("recent_ids", [])
@@ -1394,7 +2036,7 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
         return (
             f"[ENGRAM in-turn recall — novel terms: {', '.join(novel)}]\n"
             + "\n".join(lines)
-            + "\n  (ambient action-moment recall; engram_inspect(id) for detail)"
+            + _RECALL_FOOTER
         )
     finally:
         if lock_fd is not None and lock_acquired:
@@ -1410,11 +2052,39 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
 
 
 def main() -> None:
+    """One fire. The owner state (#3665) lives for exactly this call: reset on entry and on
+    every way out, so the sites called outside main() (the existing suites) stay direct."""
+    global _OWNER_RUN, _OWNER_FLAGS_FAILURE
+    _OWNER_RUN = None
+    _OWNER_FLAGS_FAILURE = None
+    try:
+        _main_impl()
+    finally:
+        _write_owner_stderr_lines()  # every run: class/kind only, whichever way the fire ended
+        _OWNER_RUN = None
+
+
+def _main_impl() -> None:
+    global _OWNER_RUN
+    LOADER_FAILURES.clear()  # #3503: the record is per run
     try:
         hook_input = json.load(sys.stdin)
     except (json.JSONDecodeError, EOFError, ValueError):
+        # #3521 row 9: out of scope -- malformed harness input keeps its
+        # silent exit (the outer-handler crash notice below does not cover it).
         sys.exit(0)
 
+    # #3665: the flag, read once per fire. A failed helper reads OFF and is reported (the
+    # stderr line is written at the end of the fire, with any owner failure).
+    _OWNER_RUN = {"on": _owner_reads_enabled(), "conn": None, "failure": None}
+    owner_notice, owner_notice_key = "", None
+
+    # #3521 row 9: set right after a response JSON was printed, so the outer
+    # handler never prints a second object.
+    response_printed = False
+    # #3677: WS4 rows are written after the total-budget pass (a late chain drop
+    # patches them); the crash handler below flushes any still pending.
+    _ws4_rows: list = []
     try:
         match_target = build_match_target(hook_input)
         if not match_target or not match_target.strip():
@@ -1461,12 +2131,68 @@ def main() -> None:
                 }
             }
             print(json.dumps(response))
+            # Defensive only: sys.exit(0) below raises SystemExit, which the
+            # `except Exception` handler cannot see, so this is not load-bearing.
+            response_printed = True
             sys.exit(0)
 
         parts = []
 
+        # #3677 -- final total-budget pass state. _tb_budget None (an unreadable
+        # budget) disables the pass: fail-open toward delivering, as before.
+        try:
+            _tb_budget = get_harness_budgets(detect_harness())["budget"]
+        except Exception:
+            _tb_budget = None
+        _block_call = None        # (head, body, kwargs) of the tripwire block's emit_context call
+        _chain_cut = False        # the chain block was dropped by the pass
+        _chain_cut_lines = 0      # lines in the dropped chain block
+        _chain_in_parts = False   # the chain block is currently in `parts`
+
         tripwires = load_tripwires()
         hits = check_command(match_target, tripwires) if tripwires else []
+        # #3503: at most one visible loader-failure line per window; "" when
+        # nothing failed (clean path: head/body below stay byte-identical).
+        loader_notice, loader_notice_now = _pending_loader_notice()
+        # #3665: the owner-side line (a recorded owner failure, or a failed flag helper), at
+        # most once per window under its own kind. It joins the loader line in the block's head
+        # (owner failures bypass the loader record, so one failure never yields both).
+        owner_notice, owner_notice_key = _pending_owner_notice()
+        head_notice = "\n".join(x for x in (owner_notice, loader_notice) if x)
+
+        def _late_owner_notice() -> None:
+            """The chain and the recall sites run AFTER the block was rendered, so an owner
+            failure at either is only known now. Add the notice then: re-render the block with
+            it in the head (or create the block when there were no hits), exactly as the
+            earlier notice would have been. If that pushes the joined string past the total
+            budget while the chain is in it, the chain goes whole (block > chain > recall)."""
+            nonlocal parts, _block_call, owner_notice, owner_notice_key, head_notice
+            nonlocal _chain_cut, _chain_in_parts, _chain_cut_lines
+            if owner_notice_key == OWNER_NOTICE_KEY:
+                return  # already carried by the head (the first failure is the one kept)
+            text, key = _pending_owner_notice()
+            if key != OWNER_NOTICE_KEY:
+                return
+            owner_notice, owner_notice_key = text, key
+            head_notice = "\n".join(x for x in (owner_notice, loader_notice) if x)
+            if _block_call is not None:
+                head = f"{head_notice}\n{TRIPWIRE_HEADER}" if _block_call[1] else head_notice
+                _block_call = (head, _block_call[1], _block_call[2])
+                parts[0] = emit_context(_block_call[0], _block_call[1], **_block_call[2])
+            else:
+                budgets = get_harness_budgets(detect_harness())
+                _block_call = (
+                    head_notice, [], dict(budget=budgets["budget"], target=TRIPWIRE_BLOCK_CHAR_CEILING))
+                parts.insert(0, emit_context(_block_call[0], _block_call[1], **_block_call[2]))
+            if _tb_budget is not None and _chain_in_parts and len("\n".join(parts)) > _tb_budget:
+                _chain_part = parts[1]
+                parts = [p for p in parts if p is not _chain_part]
+                _chain_cut, _chain_in_parts = True, False
+                _chain_cut_lines = _chain_part.count("\n") + 1
+                for _row in _ws4_rows:
+                    if "chain_rendered" in _row:
+                        _row["chain_cut"], _row["chain_rendered"] = True, False
+
         # #2858 Piece 1 — order by specificity (pattern length, descending)
         # before rendering/capping. Ties preserve check_command's original
         # (DB-query) order — sorted() is stable, so this is just the sort
@@ -1474,6 +2200,19 @@ def main() -> None:
         # fire, only the order they're considered for the character-ceiling
         # selection below (a longer, more specific pattern is judged more
         # likely to be the useful nudge when not everything can fit).
+        #
+        # alpha#3270/#3112 — pattern length alone is a proxy for specificity
+        # that is UNCORRELATED with how much the lesson's author wants it to
+        # win a scarce slot: measured twice independently, a short pattern
+        # guarding a destructive/costly action (git stash; a comment-vs-
+        # review-state gh call) lost its slot to a longer, broad, low-cost
+        # reminder. Kepler's ruling: rank the author-set tripwire_priority
+        # field first ("high" before "normal"), THEN the existing
+        # -len(pattern) tiebreak within a tier. A hit set where every
+        # priority is "normal" (every lesson minted before this field
+        # existed, or one that never opted in) reduces to exactly today's
+        # pure-length order -- this is a strict refinement of the old key,
+        # not a replacement of it.
         #
         # Reviewer-fairy round 1 (PR #2860): this resort also changes the
         # order `shown_hits` carries into render_triggered_principles below
@@ -1487,7 +2226,13 @@ def main() -> None:
         # ordering nothing downstream depends on.
         shown_hits = []
         if hits:
-            hits = sorted(hits, key=lambda h: -len(h.get("pattern") or ""))
+            hits = sorted(
+                hits,
+                key=lambda h: (
+                    0 if h.get("priority") == "high" else 1,
+                    -len(h.get("pattern") or ""),
+                ),
+            )
             # #2863 WS2 — render via the shared _hooklib.emit_context()
             # helper instead of this hook's own former select_and_cap_hits/
             # _render_tripwire_block/_build_trailer (removed above).
@@ -1524,17 +2269,51 @@ def main() -> None:
                 cut_n = len(items)
                 cut = hits[-cut_n:] if 0 < cut_n <= len(hits) else []
                 cut_hits_holder["cut"] = cut
-                return write_tripwire_overflow(cut) if cut else ""
+                if not cut:
+                    return ""
+                path = write_tripwire_overflow(cut)
+                if not path:
+                    return ""
+                # alpha#3112's cheapest independent-of-ranking mitigation:
+                # name the cut node IDs right in the trailer, not just a
+                # count -- a reader deciding whether to open the overflow
+                # file at all needs to know WHICH lessons got cut, and the
+                # cases this bug actually bit on (git-stash; comment-vs-
+                # review-state) are exactly the ones worth that one glance.
+                # Appended space-separated after the path: _build_context_
+                # trailer's own overflow_path capture group is `(\S+)`, so
+                # this parenthetical never gets swallowed into the path
+                # itself and every existing caller/test that reads the
+                # trailer's path group is unaffected.
+                ids = ", ".join(h.get("node_id", "?") for h in cut)
+                return f"{path} ({ids})"
+
+            # #3677: remembers the first call's overflow path, so the (rare)
+            # corner re-render of this block under a smaller budget does not write
+            # a second overflow file for the same cut items.
+            _ow_memo: dict = {}
+
+            def _cached_overflow_writer(items: list) -> str:
+                key = tuple(items)
+                if key not in _ow_memo:
+                    _ow_memo[key] = _tripwire_overflow_writer(items)
+                return _ow_memo[key]
 
             budgets = get_harness_budgets(detect_harness())
-            parts.append(emit_context(
-                TRIPWIRE_HEADER,
+            _block_call = (
+                # #3503: the failure line, when due, is part of the head (so it
+                # shares emit_context's target/budget accounting and sits above
+                # the bullets); unchanged TRIPWIRE_HEADER otherwise.
+                f"{head_notice}\n{TRIPWIRE_HEADER}" if head_notice else TRIPWIRE_HEADER,
                 bullets,
-                budget=budgets["budget"],
-                target=TRIPWIRE_BLOCK_CHAR_CEILING,
-                allow_single_overflow=True,
-                overflow_writer=_tripwire_overflow_writer,
-            ))
+                dict(
+                    budget=budgets["budget"],
+                    target=TRIPWIRE_BLOCK_CHAR_CEILING,
+                    allow_single_overflow=True,
+                    overflow_writer=_cached_overflow_writer,
+                ),
+            )
+            parts.append(emit_context(_block_call[0], _block_call[1], **_block_call[2]))
 
             # shown_hits feeds render_triggered_principles below (Piece 3)
             # — never the full, uncapped `hits`, so a "[triggered
@@ -1550,6 +2329,18 @@ def main() -> None:
             shown_hits = hits[: len(hits) - len(cut_hits)] if cut_hits else hits
             if not shown_hits and hits:
                 shown_hits = hits[:1]
+        elif head_notice:
+            # #3503: a loader failed and there are no hits, so the block would
+            # otherwise be silent -- the line IS the block, still rendered by
+            # emit_context (trailer first, same budget rules). #3665: likewise for
+            # the owner-side line.
+            budgets = get_harness_budgets(detect_harness())
+            _block_call = (
+                head_notice,
+                [],
+                dict(budget=budgets["budget"], target=TRIPWIRE_BLOCK_CHAR_CEILING),
+            )
+            parts.append(emit_context(_block_call[0], _block_call[1], **_block_call[2]))
 
         # #2753 epic WS2 (D3 point 1) — generalization-chain render, ADDITIVE
         # after the nudge block above and independently guarded: a failure
@@ -1585,7 +2376,13 @@ def main() -> None:
             ws4_cfg = _ws4_config()
             if not ws4_cfg["active"]:
                 if principles_block:
-                    parts.append(principles_block)
+                    # #3677: whole-block rule, decided where the chain is appended.
+                    _delivered, _cl = _place_chain(parts, principles_block, _tb_budget)
+                    if _delivered:
+                        parts.append(principles_block)
+                        _chain_in_parts = True
+                    else:
+                        _chain_cut, _chain_cut_lines = True, _cl
             else:
                 # Round 2 (reviewer-fairy suggestion #1 on PR #3166): arm
                 # computation and ledger-row construction now get their OWN
@@ -1630,9 +2427,15 @@ def main() -> None:
                         ) & 1
                         arm = "chain" if draw == 1 else "control"
                         if arm == "chain":
-                            parts.append(principles_block)
-                            appended_chain = True
-                            chain_rendered = True
+                            # #3677: the arm draw above is untouched by the cut.
+                            _delivered, _cl = _place_chain(parts, principles_block, _tb_budget)
+                            if _delivered:
+                                parts.append(principles_block)
+                                appended_chain = True
+                                chain_rendered = True
+                                _chain_in_parts = True
+                            else:
+                                _chain_cut, _chain_cut_lines = True, _cl
                         # control arm: principles_block computed but withheld.
                 except Exception as exc:
                     # Dev-parity fallback -- render exactly as the INACTIVE
@@ -1641,9 +2444,14 @@ def main() -> None:
                     # of silently dropped. Guard against double-appending if
                     # the exception struck AFTER a successful chain-arm
                     # append above.
-                    if principles_block and not appended_chain:
-                        parts.append(principles_block)
-                        chain_rendered = True
+                    if principles_block and not appended_chain and not _chain_cut:
+                        _delivered, _cl = _place_chain(parts, principles_block, _tb_budget)
+                        if _delivered:
+                            parts.append(principles_block)
+                            chain_rendered = True
+                            _chain_in_parts = True
+                        else:
+                            _chain_cut, _chain_cut_lines = True, _cl
                     arm = "error"
                     arm_error = f"{type(exc).__name__}: {str(exc)[:200]}"
 
@@ -1661,6 +2469,16 @@ def main() -> None:
                 # dropping the fire.
                 now = None
                 ts_iso = None
+                # #3677: the row is written AT CREATION, as on dev (a hook killed
+                # during the recall keeps it), except in the sliver where a late
+                # chain drop (the marker not fitting once the recall is gone) could
+                # still change it: only then is it held until the pass has settled.
+                _defer_row = False
+                try:
+                    _defer_row = (_tb_budget is not None and
+                                  len("\n".join(parts)) > _tb_budget - _TAIL_CUT_RESERVE)
+                except Exception:
+                    _defer_row = False
                 try:
                     import time as _time
                     from datetime import datetime as _ws4_dt, timezone as _ws4_tz
@@ -1676,8 +2494,12 @@ def main() -> None:
                         nudge_chars=nudge_chars,
                         principles_block=principles_block,
                         chain_rendered=chain_rendered, error=arm_error,
+                        chain_cut=_chain_cut,
                     )
-                    _append_ws4_fire_ledger(entry)
+                    if _defer_row:
+                        _ws4_rows.append(entry)
+                    else:
+                        _append_ws4_fire_ledger(entry)
                 except Exception as row_exc:
                     # Row construction itself failed -- still count the
                     # fire with a MINIMAL row (fixed 8-field shape) rather
@@ -1686,7 +2508,7 @@ def main() -> None:
                     # is what raised -- the minimal row is written with
                     # whatever timestamp is available. The write below
                     # keeps its own internal fail-open behaviour.
-                    _append_ws4_fire_ledger({
+                    _fallback_row = {
                         "schema_version": 1,
                         "experiment": "ws4_chain_ab",
                         "ts": now,
@@ -1704,7 +2526,18 @@ def main() -> None:
                         # decision itself was corrupted, not just its
                         # downstream bookkeeping.
                         "error": arm_error or f"{type(row_exc).__name__}: {str(row_exc)[:200]}",
-                    })
+                    }
+                    if _defer_row:
+                        _ws4_rows.append(_fallback_row)
+                    else:
+                        _append_ws4_fire_ledger(_fallback_row)
+
+        # #3665: an owner failure at the chain site is only known now; add the notice before the
+        # recall is sized (so its room accounts for it). Fail-open like everything below.
+        try:
+            _late_owner_notice()
+        except Exception:
+            pass
 
         # alpha#1944 step 2 — shadow-block logging. Independently guarded,
         # same posture as in-turn recall below: a logging failure must never
@@ -1725,26 +2558,196 @@ def main() -> None:
 
         # In-turn ambient recall (#1690) — independently guarded; a recall
         # failure must never suppress a tripwire hit (and vice versa).
+        # #3613: lesson matching above/below stays on the RAW match_target (a
+        # tripwire must fire on the raw action). Only the in-turn recall's
+        # term source is narrowed to the marked span; an empty marker skips it.
         try:
-            recall = check_in_turn_recall(match_target, hook_input)
+            _recall_state, _recall_text = marker_recall_query(match_target)
+        except Exception:
+            _recall_state, _recall_text = "none", match_target
+        # #3670: the shown record is appended only AFTER the response was
+        # written out. check_in_turn_recall leaves the pending ids in
+        # _pending_shown; a call that raised discards them (the model saw no
+        # recall text), and a fire that passed the gate but rendered nothing
+        # leaves ids == [] so the per-fire line (prompt_index) stays continuous.
+        _pending_shown: dict = {}
+        # #3677: the room the recall may take, decided from what is already in
+        # `parts`, so the recall is trimmed (and its state written) ONCE, for the
+        # survivors. After a chain cut the reserve is already owed (a cut happened);
+        # otherwise it is taken only if the recall itself has to be cut.
+        _recall_kw: dict = {}
+        try:
+            if _tb_budget is not None:
+                _room = _tb_budget - (len("\n".join(parts)) + 1 if parts else 0)
+                if _chain_cut:
+                    _recall_kw = {"max_chars": _room - _TAIL_CUT_RESERVE}
+                else:
+                    _recall_kw = {"max_chars": _room, "cut_reserve": _TAIL_CUT_RESERVE}
+        except Exception:
+            _recall_kw = {}
+        try:
+            if _recall_state == "empty":
+                recall = ""
+            else:
+                recall = check_in_turn_recall(_recall_text, hook_input, _pending_shown, **_recall_kw)
         except Exception:
             recall = ""
+            _pending_shown.clear()
+        # #3665: and an owner failure at the recall site is only known after it ran.
+        try:
+            _late_owner_notice()
+        except Exception:
+            pass
         if recall:
             parts.append(recall)
 
+        # #3677: the first-line marker, counted inside the budget. Fail-open: an
+        # exception here leaves `parts` exactly as it was (dev-shaped output).
+        try:
+            _recall_cut_n = int(_pending_shown.get("tail_cut_lines", 0) or 0)
+            if _tb_budget is not None and (_recall_cut_n or _chain_cut):
+                _final = _apply_tail_cut(parts, _recall_cut_n, _chain_cut_lines, _block_call is not None)
+                if len("\n".join(_final)) > _tb_budget and _chain_in_parts:
+                    # The chain fit by the whole-block rule but the clause does not,
+                    # and the recall is already gone (its room was below the
+                    # reserve). Priority is block > chain > recall, so the chain
+                    # goes too, whole: truncating a lesson hit in-band to keep a
+                    # chain would be the worse trade.
+                    _chain_part = parts[1] if (_block_call is not None and len(parts) > 1) else parts[0]
+                    parts = [p for p in parts if p is not _chain_part]
+                    _chain_cut, _chain_in_parts = True, False
+                    _chain_cut_lines = _chain_part.count("\n") + 1
+                    for _row in _ws4_rows:
+                        if "chain_rendered" in _row:
+                            _row["chain_cut"], _row["chain_rendered"] = True, False
+                    _final = _apply_tail_cut(parts, _recall_cut_n, _chain_cut_lines, _block_call is not None)
+                if len("\n".join(_final)) > _tb_budget and _block_call is not None:
+                    # Corner: the block alone is within the reserve of the budget.
+                    # Re-render it (deterministic) under budget - reserve; the
+                    # overflow path is reused, not rewritten (see _cached_overflow_writer).
+                    _new_block = emit_context(
+                        _block_call[0], _block_call[1],
+                        **{**_block_call[2], "budget": _tb_budget - _TAIL_CUT_RESERVE})
+                    parts = [_new_block] + parts[1:]
+                    _final = _apply_tail_cut(parts, _recall_cut_n, _chain_cut_lines, True)
+                if len("\n".join(_final)) <= _tb_budget:
+                    parts = _final
+        except Exception:
+            pass
+        # WS4 rows are written once the pass has settled (a late chain drop patches them).
+        while _ws4_rows:
+            _append_ws4_fire_ledger(_ws4_rows.pop(0))
+
         if not parts:
+            # Nothing is printed, nothing was shown: the empty-ids line is true.
+            if "ids" in _pending_shown:
+                try:
+                    append_shown_record("tool_recall", hook_input.get("session_id"),
+                                        _pending_shown["ids"])
+                except Exception:  # fail-open: a non-dict hook_input etc.
+                    pass
             sys.exit(0)
 
+        additionalContext = "\n".join(parts)
         response = {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
-                "additionalContext": "\n".join(parts),
+                "additionalContext": additionalContext,
             }
         }
         print(json.dumps(response))
+        response_printed = True
+        if loader_notice:
+            # #3503: the window is consumed only once the line has actually
+            # been written out; an exit before this point (or a failed
+            # print/flush) leaves no stamp, so the next failure shows it again.
+            try:
+                sys.stdout.flush()
+            except Exception:
+                sys.exit(0)
+            _mark_loader_notice_shown(loader_notice_now)
+        if owner_notice:
+            # #3665: the same ordering for the owner-side window (its own stamp).
+            try:
+                sys.stdout.flush()
+            except Exception:
+                sys.exit(0)
+            mark_probe_notice(ENGRAM_HOME, owner_notice_key)
+        # #3670: the shown record is appended only once the response has been
+        # written out AND flushed; a failed print/flush records nothing, so no
+        # unseen id is ever recorded. A printed-but-oversized string (the
+        # harness may cut its tail, where the recall sits) records empty ids.
+        try:
+            sys.stdout.flush()
+        except Exception:
+            sys.exit(0)
+        if "ids" in _pending_shown:
+            # The recall block is appended LAST and has no emit_context cut of
+            # its own, but the joined string is subject to the HARNESS tail cut:
+            # when it exceeds the harness budget the recall may not have reached
+            # the model, so record EMPTY ids (the line still lands, keeping
+            # prompt_index continuous). Fail-open toward under-recording: a
+            # budget lookup that raises is treated as over budget.
+            # NOTE (Borges, #3674 review): get_harness_budgets()["budget"]
+            # (9,500 on claude-code) sits a little UNDER the measured harness
+            # ceiling, so this check also under-records in that narrow band.
+            # That is the intended direction: do NOT "fix" it to the measured
+            # number.
+            # #3677: since the total-budget pass above this can no longer fire
+            # (the joined string is <= budget by construction); kept as a guard.
+            try:
+                _fits = len(additionalContext) <= get_harness_budgets(
+                    detect_harness())["budget"]
+            except Exception:
+                _fits = False
+            try:
+                append_shown_record("tool_recall", hook_input.get("session_id"),
+                                    _pending_shown["ids"] if _fits else [])
+            except Exception:  # fail-open: a non-dict hook_input etc.
+                pass
         sys.exit(0)
 
-    except Exception:
+    except Exception as exc:
+        # #3521 row 9: a crash here used to be byte-identical to a healthy
+        # "nothing matched" run (exit 0, empty stdout, empty stderr). Now: one
+        # stderr line always, and -- only if no response was printed yet and the
+        # rate-limit window is open -- one UNKNOWN context line. Never denies,
+        # always exits 0, and the handler itself must never raise.
+        try:
+            while _ws4_rows:  # #3677: a pending WS4 row is still a fire
+                _append_ws4_fire_ledger(_ws4_rows.pop(0))
+        except Exception:
+            pass
+        try:
+            reason = f"{type(exc).__name__}: {exc}"
+            write_probe_unknown_stderr("engram-lesson-tripwire-hook", "tripwire-run", reason)
+            if not response_printed and probe_notice_due(ENGRAM_HOME, "tripwire-run"):
+                line = probe_unknown_line(
+                    "lesson-tripwire", reason,
+                    "tripwire checks were skipped for this call",
+                    prefix="[lesson-tripwire] ",
+                )
+                print(json.dumps({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "additionalContext": line,
+                    }
+                }))
+                sys.stdout.flush()
+                mark_probe_notice(ENGRAM_HOME, "tripwire-run")
+        except BaseException:
+            # The print/flush above may have failed because the stdout reader is
+            # gone; a normal sys.exit(0) would then fail again in interpreter
+            # shutdown's stdout flush and replace the exit code (120). os._exit
+            # skips that flush; stderr is flushed first so the line is not lost.
+            try:
+                sys.stderr.flush()
+            except BaseException:
+                pass
+            # Only a hook run as a script may skip shutdown: an in-process caller
+            # (such as a test) must get a catchable SystemExit, never a killed process.
+            if __name__ == "__main__":
+                os._exit(0)
         sys.exit(0)  # hook failures must never block a tool call
 
 

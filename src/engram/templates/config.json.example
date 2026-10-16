@@ -32,8 +32,7 @@
   },
 
   "embedding": {
-    "model": "all-MiniLM-L6-v2",
-    "enabled": true
+    "model": "all-MiniLM-L6-v2"
   },
 
   "user": {

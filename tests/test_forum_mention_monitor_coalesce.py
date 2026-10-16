@@ -35,7 +35,11 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "src" / "engram" / "tools" / "forum-mention-monitor.sh"
 
-_FLUSH_RE = re.compile(r"^\U0001f4e3 (\d+) new @-mentions? across (\d+) threads?: (.+)$")
+# #3613: the summary has no meaningful text (wrapper words + thread ids), so it
+# ends with the EMPTY ENGRAM marker (skip recall), not a span.
+_FLUSH_RE = re.compile(
+    r"^\U0001f4e3 (\d+) new @-mentions? across (\d+) threads?: (.+) \u27e6ENGRAM\u27e7\u27e6/ENGRAM\u27e7$"
+)
 
 
 class _MockMentionsServer:

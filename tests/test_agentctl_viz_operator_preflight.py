@@ -35,7 +35,14 @@ assumed-flaky.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
+
+# One shared probe for the GNU `stat -c` primitive (defined with the hint tests).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_agentctl_forum_hint_3563 import needs_gnu_stat  # noqa: E402
 
 AGENTCTL = Path(__file__).resolve().parent.parent / "tools" / "agentctl"
 AGENTCTL_SOURCE = AGENTCTL.read_text()
@@ -430,6 +437,7 @@ class TestResolveVizOperatorFromConfigReal:
         assert proc.stdout.strip() == ""
         assert proc.stderr.strip() == ""
 
+    @needs_gnu_stat
     def test_real_test_owned_file_is_rejected_with_warning_not_silence(self, tmp_path):
         """GENUINE (not simulated) exercise of the real stat(1) call: a real
         file owned by whatever account runs this test suite is never

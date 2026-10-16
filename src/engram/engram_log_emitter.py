@@ -27,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from engram_regular_io import open_regular_text, open_regular_text_append
+
 # Module-level singleton — first init() call wins; subsequent calls return
 # the existing instance bound to the same session context. This matches
 # the "one emitter per process" semantics.
@@ -259,7 +261,7 @@ class Emitter:
         # warned about once per process, not once per event.
         with self._write_lock:
             file_existed = target.exists()
-            with open(target, "a", encoding="utf-8") as f:
+            with open_regular_text_append(target, encoding="utf-8") as f:
                 f.write(line + "\n")
                 # NOT wrapped in the not-a-drop carve-out below (round-1
                 # review, PR #3168): a flush() failure means the bytes
@@ -315,7 +317,7 @@ class Emitter:
             config_path = self._engram_home / "config.json"
             if not config_path.exists():
                 return None
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open_regular_text(config_path, encoding="utf-8") as f:
                 config = json.load(f)
             turn = config.get("memory", {}).get("current_turn")
             if turn is not None:

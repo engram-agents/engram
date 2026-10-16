@@ -14,6 +14,11 @@ name: pr-checks
 #   5b. stray-baton-path-check  (#2316 — advisory, never blocks job)
 #   6. invariant-checks          (was invariant-checks.yml — used to run Python 3.11)
 #   7. manifest-gate             (was manifest-gate.yml — Python 3.12)
+#   7b. artifact-drift guards    (#2340 — tool-capability-index +
+#      instruction-manifestation pilots; same staleness-by-omission class as
+#      manifest-gate's tiers.json check, but ran in no workflow until now.
+#      The capability-index half is path-gated — unlike prior-art #2371,
+#      which installed fastmcp unconditionally and was parked on that cost.)
 #   7c. stdlib-only guards      (#2376 — 5 SSoT/sync/drift gates measured to need
 #      nothing beyond stdlib+pytest, same carve-out as manifest-gate above)
 #   8. test-id-set-check         (#2350 — BLOCKING; a deleted test cannot fail, so a
@@ -134,6 +139,7 @@ jobs:
       # Uses body-text grep (same as trap-check): GitHub's closingIssuesReferences
       # GraphQL field is dormant on stacked/non-default-base PRs.
       - name: anti-dup — check target issues for already-closed or competing open PRs
+        if: success() || failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -210,6 +216,7 @@ jobs:
       # files. Existing references are grandfathered; the scrub of the existing
       # corpus happens incrementally in follow-up PRs to issue #51.
       - name: no-new-shipped-node-ids — fail on newly-added concrete ENGRAM node IDs in shipped files
+        if: success() || failure()
         run: |
           BASE_REF="origin/${{ github.base_ref }}"
           # The pattern follows engram_ids.py's documented broad shape:
@@ -341,6 +348,7 @@ jobs:
       # (verified on a stacked-PR review); the body regex works at creation time
       # regardless of base.
       - name: pr-body-close-keyword — fail on off-target close-keyword in the PR body
+        if: success() || failure()
         env:
           # Title + body passed via env, NOT inline ${{ }} in run:, to avoid
           # shell injection from author-controlled content.
@@ -364,6 +372,88 @@ jobs:
           if [ -z "$BODY_MS" ]; then
             echo "No close-keyword references in the PR body. ✓"
             exit 0
+          fi
+
+          # #3344 — a `[part of #N]` title means "#N stays open", so ANY body
+          # close-keyword for that same N is the negated-close trap ("this does
+          # not close #N" auto-closes #N: the parser ignores negation). Unlike
+          # the checks around it, this rule STRIPS fenced blocks (``` / ~~~) and
+          # inline code spans first (rules below), because the real parser ignores keywords
+          # inside them (#1191, #2630) — unstripped it false-fires on safe
+          # backticked examples (measured: #2759). The no-title-target WARN and
+          # the off-target check below are unchanged and still grep raw.
+          PART_OF_NS=$(printf '%s' "$PR_TITLE" \
+            | grep -ioE '\[part[[:space:]]+of[[:space:]]+#[0-9]+\]' \
+            | grep -oE '[0-9]+' | sort -u)
+          if [ -n "$PART_OF_NS" ]; then
+            # CommonMark rules, per line: a fence opened by a run of N >= 3
+            # backticks (or tildes) closes only at a line starting with a run of
+            # the SAME character at least N long; an unterminated fence swallows
+            # the rest of the body. A fence may be indented at most 3 spaces
+            # (a tab counts to the next multiple of 4); 4+ is an indented code
+            # block, not a fence, so its keyword is scanned (fail-closed; this
+            # also scans a fence nested in a list item at 4+ spaces). A
+            # backtick fence line whose info string holds a backtick (e.g. a
+            # line that begins with an inline triple-backtick span) is not a
+            # fence. An inline span opened by a run
+            # of k backticks closes at the next run of EXACTLY k on the same
+            # line; an unmatched run is literal. Multi-line spans and indented
+            # code blocks (4+ spaces, fence markers included) are NOT recognised,
+            # so they stay scanned (fail-closed).
+            STRIPPED_BODY=$(printf '%s\n' "$PR_BODY" | awk '
+              function runlen(s, i, c,   n) {
+                n = 0
+                while (substr(s, i + n, 1) == c) n++
+                return n
+              }
+              function strip_spans(s,   out, i, k, j, m, found) {
+                out = ""; i = 1
+                while (i <= length(s)) {
+                  if (substr(s, i, 1) != "`") { out = out substr(s, i, 1); i++; continue }
+                  k = runlen(s, i, "`"); j = i + k; found = 0
+                  while (j <= length(s)) {
+                    if (substr(s, j, 1) == "`") {
+                      m = runlen(s, j, "`")
+                      if (m == k) { found = 1; break }
+                      j += m
+                    } else j++
+                  }
+                  if (found) i = j + k
+                  else { out = out substr(s, i, k); i += k }
+                }
+                return out
+              }
+              {
+                line = $0; w = 0; p = 1
+                while ((ch = substr(line, p, 1)) == " " || ch == "\t") {
+                  w += (ch == "\t") ? 4 - (w % 4) : 1; p++
+                }
+                line = substr(line, p)
+                c = substr(line, 1, 1); n = 0
+                if (c == "`" || c == "~") n = runlen(line, 1, c)
+                if (w >= 4) n = 0
+                if (c == "`" && n >= 3 && index(substr(line, n + 1), "`") > 0) n = 0
+              }
+              infence != "" {
+                if (c == infence && n >= fencelen) infence = ""
+                next
+              }
+              n >= 3 { infence = c; fencelen = n; next }
+              { print strip_spans($0) }')
+            STRIPPED_MS=$(printf '%s' "$STRIPPED_BODY" \
+              | grep -ioE '\b(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]+#[0-9]+' \
+              | grep -oE '[0-9]+' | sort -u)
+            PART_OF_TRAPS=$(printf '%s\n' "$STRIPPED_MS" | grep -xF "$PART_OF_NS" || true)
+            if [ -n "$PART_OF_TRAPS" ]; then
+              for N in $PART_OF_TRAPS; do
+                echo "::error::The title says [part of #$N] but the PR body has a close-keyword for #$N, so merging this PR would auto-close #$N."
+              done
+              echo ""
+              echo "GitHub's auto-close parser ignores negation, so 'this does not close #N' closes #N exactly like 'closes #N'. Keywords inside inline code spans (any backtick-run length, same line) or fenced blocks (~~~ / \`\`\`, closed by a same-character run at least as long as the opener) are ignored by the parser and are not flagged; multi-line spans and indented code blocks are not recognised, so a keyword there is still flagged. A fence indented 4 or more spaces is not a fence (CommonMark allows at most 3)."
+              echo "Paraphrase so no close-keyword precedes the number:"
+              echo "  instead of: \"does not close #N\"   use: \"#N stays open\" or \"part of #N\""
+              exit 1
+            fi
           fi
 
           # No title target → can't distinguish intended-close from trap.
@@ -416,6 +506,7 @@ jobs:
       #   \bagentname-nick\b
       - name: name-leak-warn — check for name-leak roster secret
         id: roster-check
+        if: success() || failure()
         run: |
           if [ -z "$NAME_LEAK_ROSTER" ]; then
             echo "NAME_LEAK_ROSTER not configured — name-leak warn-gate skipped" \
@@ -428,7 +519,7 @@ jobs:
           NAME_LEAK_ROSTER: ${{ secrets.NAME_LEAK_ROSTER }}
 
       - name: name-leak-warn — compute diff and scan for name mentions
-        if: steps.roster-check.outputs.skip == 'false'
+        if: (success() || failure()) && steps.roster-check.outputs.skip == 'false'
         id: scan
         continue-on-error: true
         run: |
@@ -453,7 +544,7 @@ jobs:
           NAME_LEAK_ROSTER: ${{ secrets.NAME_LEAK_ROSTER }}
 
       - name: name-leak-warn — post or update PR comment
-        if: steps.roster-check.outputs.skip == 'false'
+        if: (success() || failure()) && steps.roster-check.outputs.skip == 'false'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -518,6 +609,7 @@ jobs:
       # (which correctly narrates `master` as history) is out of scope by
       # design — see tools/stray_master_ref_check.py's module docstring.
       - name: stray-master-ref-check — scan workflows + ops shell for stray master refs
+        if: success() || failure()
         continue-on-error: true
         run: |
           python3 tools/stray_master_ref_check.py | tee -a "$GITHUB_STEP_SUMMARY"
@@ -534,6 +626,7 @@ jobs:
       # stray-master-ref-check's load-bearing-surfaces-only scope) — see
       # tools/stray_baton_path_check.py's module docstring for why.
       - name: stray-baton-path-check — scan for the stale pre-cutover baton path
+        if: success() || failure()
         continue-on-error: true
         run: |
           python3 tools/stray_baton_path_check.py | tee -a "$GITHUB_STEP_SUMMARY"
@@ -566,27 +659,73 @@ jobs:
       # Split rationale mirrors manifest-gate.yml: cheap stdlib+pytest gates run on
       # every dev PR independently of the selective unit-test path in affected-tests.yml.
       - name: Set up Python 3.12 (invariant-checks)
+        id: setup-python-invariant
+        if: success() || failure()
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: invariant-checks — install deps (pytest + pyyaml for frontmatter-lint)
+        id: install-deps-invariant
+        if: success() || failure()
         run: pip install pytest pyyaml
 
       - name: invariant-checks — scan-leaks (whole-repo structural invariant)
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
         # Runs the real-repo integration test: scans the checked-out tree for
         # structural leak patterns (private dev-repo URLs, main-repo paths) with
         # no local personal-name config (CI has none). Exit 1 = leak found.
         run: python3 -m pytest tests/test_scan_leaks.py -q
 
       - name: invariant-checks — frontmatter-lint (all skill SKILL.md frontmatters)
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
         # Checks every src/engram/skills/claude/*/SKILL.md: delimiters present,
         # yaml.safe_load parses, name + description fields non-empty, name
         # matches directory. Fails on the first YAML-breaking colon or malformed
         # frontmatter block.
         run: python3 -m pytest tests/test_skill_frontmatter_lint.py -q
 
+      - name: invariant-checks — close-keyword gate tests (#3344)
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
+        # tools/test_*.py is outside tests.yml's `pytest tests/ src/forum/tests/`
+        # roots, so without this step the gate's own tests ran nowhere and rotted
+        # (13 errors against a deleted workflow file). The harness extracts the
+        # pr-body-close-keyword step from this file and runs it hermetically;
+        # needs only pytest + pyyaml (installed above). A harness test asserts
+        # this step stays wired.
+        run: python3 -m pytest tools/test_pr_body_close_keyword_gate.py -q
+
+      - name: invariant-checks — read-scan roots coverage + committed templates drift
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
+        # test_r10 fails when a hook function is missing from
+        # tools/engramd_read_scan.config.json `roots`; test_r12 fails when the
+        # committed src/engram/engramd_read_templates.json differs from a fresh
+        # scan. Both exist to fire the moment a new hook function arrives, but
+        # dev PRs run only this workflow (the full suite runs on dev->main), so
+        # #3371 added two session-start hook functions, merged green, and left
+        # r10 red on dev. Measured in a fresh venv with ONLY pytest installed:
+        # these two node ids = 2 passed in ~1.7 s wall; the whole file is 76
+        # tests in ~21 s, too slow for here, hence two node ids not the file.
+        run: >-
+          python3 -m pytest -q
+          "tests/test_engramd_read_scan.py::test_r10_roots_config_covers_every_hook_function_and_no_module_level_execute_site"
+          "tests/test_engramd_read_scan.py::test_r12_committed_file_equals_a_fresh_scan_of_the_real_tree"
+
+      - name: invariant-checks — forum-service process-spawn ratchet (#3518)
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
+        # Enumerates every process spawn on the forum service's executable surface
+        # (non-test src/forum/*.py + the gate module server._load_baton_gate loads)
+        # and fails on one that is not on the allow-list, or whose allow-listed
+        # call lacks the identity kwargs. It ratchets the #3283 class (a fourth
+        # ambient gh call missed by a spec) and, like read-scan r10/r12 above, is
+        # a repo-level property a dev PR would otherwise never run (dev PRs run
+        # only this workflow). Stdlib + pytest only. Measured in a fresh venv with
+        # ONLY pytest installed: the whole file, 92 tests, ~0.5 s wall, so the
+        # file path is listed rather than node ids.
+        run: python3 -m pytest -q tests/test_forum_process_spawn_ratchet_3518.py
+
       - name: invariant-checks — health L0 set hash (MAJOR-bump gate)
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
         # Pins a SHA over the canonical L0 measurement set — every
         # MeasurementDef's (name, population, definition_inputs). An add,
         # remove, or silent redefinition through a remote constant (e.g.
@@ -598,6 +737,7 @@ jobs:
         run: python3 -m pytest tests/test_health_measurements.py -q
 
       - name: invariant-checks — health version tag-diff gate (engram-alpha#2563 Gap 3)
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
         # Checks health/version.py's (MAJOR, MINOR) against how HEAD's L0
         # measurement set differs from the last deployable tag (refs/tags/v*
         # union refs/tags/deploy/*). Two independent checks: well-formedness
@@ -615,6 +755,21 @@ jobs:
           python3 -m pytest tests/test_health_version_gate.py -q
           python3 -c "import importlib.util as u; s=u.spec_from_file_location('g','tests/test_health_version_gate.py'); g=u.module_from_spec(s); s.loader.exec_module(g); status, msg = g.run_live_gate(); print(f'health-version gate (live): {status} | {msg}')"
 
+      - name: invariant-checks — claude-md-budget (project CLAUDE.md <= 75,000 bytes now, 40,000 is the #3322 round-2 target)
+        if: success() || failure()
+        # CLAUDE.md loads into every session started from this repo, and had grown
+        # to ~115 KB of mostly dated measurement history. Rules stay in CLAUDE.md;
+        # evidence lives in docs/. One `wc` — stdlib, well inside the under-one-
+        # minute cost rule (Branching convention). The nothing-lost half of the
+        # contract is tests/test_claude_md_moves.py (docs/claude-md-moves.json).
+        run: |
+          size="$(wc -c < CLAUDE.md)"
+          if [ "$size" -gt 75000 ]; then
+            echo "::error::CLAUDE.md is $size bytes; the budget is 75000 (round 1 of #3322; round 2 lowers it to 40000). Move dated measurement history to docs/ (rules stay) and list the move in docs/claude-md-moves.json."
+            exit 1
+          fi
+          echo "CLAUDE.md is $size bytes (budget 75000)."
+
       # ── 7. manifest-gate ───────────────────────────────────────────────
       # (from manifest-gate.yml)
       # Cheap tag-once tiering gate — runs on EVERY dev PR (and main PRs).
@@ -629,23 +784,133 @@ jobs:
       # the full requirements-dev.txt stack — it stays in tests.yml (main-only
       # matrix).  See tests.yml for the full-suite rationale.
       - name: Set up Python 3.12 (manifest-gate)
+        id: setup-python-manifest
+        if: success() || failure()
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: manifest-gate — install pytest
+        id: install-pytest-manifest
+        if: success() || failure()
         run: pip install pytest
 
       - name: manifest-gate — run tag-once manifest gate
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         run: python3 -m pytest tests/test_tiers_manifest.py -q
 
       - name: manifest-gate — run tiers↔test-map completeness check
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         # Asserts every tool tagged in tiers.json has a test-map.json entry
         # (mapped or unmapped).  Pure stdlib + pytest — no heavy deps needed.
         # Moved here from the main-only full suite (tests.yml) so missing
         # entries are caught at dev-PR time rather than only at release-cut.
         # See issue #1147.
         run: python3 -m pytest tests/test_run_touched_tests.py::TestMappingCompleteness -q
+
+      # ── 7b. artifact-drift guards ───────────────────────────────────────
+      # #2340 — two checked-in generated-artifact drift guards ran in NO
+      # workflow at all until now: dev PRs never exercised them, so staleness
+      # was only ever caught by luck (an unrelated branch tripping the same
+      # test locally) or at release-cut. Same "staleness-by-omission" class
+      # test_tiers_manifest.py already guards above — an artifact that goes
+      # stale by NOT being edited when its generator's inputs change, which a
+      # diff-anchored review is structurally blind to (the stale file is
+      # never in the diff).
+      #
+      # Prior art: #2371 (open, parked since 08-29 on cost). That PR
+      # installs fastmcp unconditionally for both guards together; the
+      # merge-seat read there was that the capability-index half's
+      # `pip install fastmcp` (~7.5s on CI, #2371's own measurement) is a
+      # cost-model item against the #1597 dev-PR CI budget (3000 min/month,
+      # all repos), which needs the budget owner's ruling. This version
+      # shrinks that ask rather than removing it: the pilots guard (below)
+      # needs nothing beyond this job's existing pytest+pyyaml install (invariant-checks, step 6 above — no new
+      # install), so it runs unconditionally at ~0.4s marginal cost; the
+      # capability-index guard is PATH-GATED so the fastmcp install only
+      # pays on PRs that could plausibly stale the index. Built on a separate branch;
+      # #2371 itself is untouched.
+      - name: artifact-drift guards — instruction-manifestation pilots (rendered harness contract)
+        if: (success() || failure()) && steps.install-deps-invariant.outcome == 'success' && steps.setup-python-manifest.outcome == 'success'
+        # tests/test_instruction_manifestation_pilots.py checks the rendered
+        # harness contract (deploy/tool_policy_facts.py's output) against the
+        # pilot fixtures; needs only pytest+pyyaml, already installed at
+        # invariant-checks above (step 6) — no new install step. Unconditional
+        # (not path-gated): the cost is low enough (6 passed, 0.40s measured
+        # in a pytest+pyyaml venv) that gating it would add gate-complexity
+        # without a corresponding saving, unlike the capability-index guard
+        # below.
+        run: python3 -m pytest tests/test_instruction_manifestation_pilots.py -q
+
+      # tool_capability_index.txt (checked in, generated by
+      # tools/engram-generate-tool-capability-index.py from the `capability=`
+      # text declared in src/engram/server.py — confirmed the only file
+      # declaring it: `grep -rln --include='*.py' 'capability=' src` returns
+      # only src/engram/server.py) can go stale the same way: a `capability=`
+      # string edited in server.py with no matching regen of the .txt file is
+      # invisible to a diff-anchored review, same staleness-by-omission shape
+      # as tiers.json above.
+      #
+      # Path-gated (not unconditional), unlike the pilots guard above: this
+      # one is a real cost-model item. tests/test_tool_capability_index.py
+      # imports src/engram/server.py, which imports `fastmcp` at module scope
+      # — a real ModuleNotFoundError on a bare runner (measured: cold `pip
+      # install fastmcp` 16.4s locally; #2371 measured ~7.5s on CI). The path
+      # list below is complete, not just the two files normally in play: the
+      # generated index itself, its generator, its own test, and this
+      # workflow file (a change to the gate's own logic should re-run what it
+      # gates). No `paths:`-filter idiom exists in this repo's workflows (see
+      # hooks-stdout-audit's note above, which this step's git-diff shape
+      # borrows) — follows the same roster-check / scan pair idiom instead:
+      # an id: + $GITHUB_OUTPUT flag gates the heavier steps that follow,
+      # same as check-stubbed-signatures / hooks-stdout-audit above. Means
+      # ~0s added for PRs that don't touch those paths.
+      #
+      # Fails CLOSED on a git-diff failure (e.g. a mis-resolved base ref):
+      # explicitly captures git diff's own exit status and exits non-zero
+      # rather than letting an empty $CHANGED read as "not touched" — the
+      # same explicit-STATUS-check shape check-stubbed-signatures uses above.
+      # (hooks-stdout-audit's variant also stops on a git-diff failure, via
+      # the runner's default `bash -e`, but with no message; the explicit
+      # check here names the cause in the log.) Relies on
+      # this job's shared `actions/checkout@v4` step having `fetch-depth: 0`
+      # (set at the top of this file) so the three-dot diff against
+      # origin/${{ github.base_ref }} has the base history to diff against.
+      - name: capidx-gate — check whether the diff touches capability-index-affected paths
+        id: capidx-gate
+        if: success() || failure()
+        run: |
+          set +e
+          CHANGED=$(git diff --no-renames --name-only "origin/${{ github.base_ref }}...HEAD")
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::git diff failed (exit $STATUS) — cannot determine whether capability-index-affected paths changed; failing closed rather than defaulting to skip."
+            exit "$STATUS"
+          fi
+          MATCHED=$(echo "$CHANGED" | grep -E '^(src/engram/server\.py|src/engram/tool_capability_index\.txt|tools/engram-generate-tool-capability-index\.py|tests/test_tool_capability_index\.py|\.github/workflows/pr-checks\.yml)$' || true)
+          if [ -n "$MATCHED" ]; then
+            echo "capidx-gate: diff touches $(echo "$MATCHED" | tr '\n' ' ') — guard will run."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "capidx-gate: diff does not touch capability-index-affected paths — guard self-skips."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: artifact-drift guards — install fastmcp (tool-capability-index guard's server.py import dependency)
+        id: install-fastmcp
+        if: (success() || failure()) && steps.capidx-gate.outcome == 'success' && steps.capidx-gate.outputs.run == 'true'
+        # Pinned to match requirements/requirements-lock.txt's fastmcp==3.3.0
+        # (not the unpinned `pip install fastmcp` #2371 used) — only the
+        # import surface this test needs, not the full requirements.txt
+        # stack (sentence-transformers/huggingface_hub/sqlite-vec are not
+        # required; server.py degrades gracefully to its documented O(N)
+        # fallback when sqlite-vec is absent — see #728).
+        run: pip install "fastmcp==3.3.0"
+
+      - name: artifact-drift guards — tool-capability-index (generated artifact vs. live capability= text)
+        if: (success() || failure()) && steps.capidx-gate.outputs.run == 'true' && steps.install-fastmcp.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
+        run: python3 -m pytest tests/test_tool_capability_index.py -q
 
       # ── 7c. stdlib-only guards ────────────────────────────────────────────
       # #2376 — five more SSoT/sync/drift guards that ran in no CI workflow at
@@ -663,7 +928,8 @@ jobs:
       # (SKILL.md retired, all 4 tests unconditionally skipped) — wiring a
       # step that runs, does nothing, and can never fail would read as
       # coverage that isn't there.
-      - name: stdlib-only guards — claude-md-drift, plugin-manifest-import-sync, tool-policy-sync, upgrade-drift-sources, build-plugin-hooks-consistency
+      - name: stdlib-only guards — claude-md-drift, plugin-manifest-import-sync, tool-policy-sync, upgrade-drift-sources, build-plugin-hooks-consistency, claude-md-moves, prev-release-hooks-gate
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         run: |
           python3 -m pytest \
             tests/test_check_claude_md_drift.py \
@@ -671,7 +937,61 @@ jobs:
             tests/test_tool_policy_sync.py \
             tests/test_upgrade_drift_sources.py \
             tests/test_build_plugin_hooks_consistency.py \
+            tests/test_claude_md_moves.py \
+            tests/test_prev_release_hooks_gate.py \
             -q
+
+      # ── 7c-1. 2652 migration-ledger completeness (#2652) ──────────────────
+      # docs/2652-migration-ledger.md lists every `sqlite3.connect(` line in
+      # tracked src/engram, one Section-2 row each. Dev PRs do not run the
+      # pytest suite, so a test alone would not gate them: this runs the
+      # stdlib-only check directly (git + python, ~0.1s). Three checks: per-file
+      # row counts (so line drift from unrelated edits stays green), the
+      # Section-1 state tallies against the Section-2 `state` column, and the
+      # Section-2 citations (function + anchor, verified in the named function).
+      - name: stdlib-only guards — 2652 migration-ledger completeness
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success'
+        run: python3 tools/check_2652_ledger.py
+
+      # ── 7c-2. test files outside tests.yml's roots (#3346) ────────────────
+      # tests.yml collects `tests/` and `src/forum/tests/` only. Nine healthy
+      # test files sat in tools/ and src/engram/tools/, named test_*.py, and
+      # ran in NO CI job at all: a test nothing runs cannot fail, so it
+      # cannot warn when it goes stale either (two sibling files, since
+      # retired, errored on every fixture for months unnoticed). This step
+      # runs them, plus tests/test_ci_wiring_guard.py, which fails if any
+      # tracked test_*.py outside tests.yml's roots is named by no workflow.
+      #
+      # Measured (not assumed) to fit the stdlib carve-out above: a fresh
+      # venv with ONLY `pip install pytest` runs all nine plus the guard
+      # clean. test_forum_backup.py and test_forum_cli.py skip their forum-
+      # server cells there ("forum package required" / "Flask/deps missing");
+      # tests.yml runs those cells with the full forum requirements. The
+      # per-file results and wall time are in the PR body.
+      #
+      # test_tripwire.py gets its OWN pytest invocation: it lives in
+      # src/engram/tools/, so pytest puts src/engram on sys.path and the
+      # tests/conftest.py #2565 collision guard aborts the whole run for
+      # every later `tools.*` import (measured: 8 collection errors when it
+      # shares a command with tools/test_pre_dispatch_check.py). `rc`
+      # keeps one failing command from hiding the other.
+      - name: stdlib-only guards — unrun tools/ tests + CI-wiring guard (#3346)
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
+        run: |
+          rc=0
+          python3 -m pytest \
+            tools/test_backup_claude_projects.py \
+            tools/test_backup_session_logs.py \
+            tools/test_forum_backup.py \
+            tools/test_forum_backup_alarm.py \
+            tools/test_forum_backup_stamp.py \
+            tools/test_forum_cli.py \
+            tools/test_forum_status_backup.py \
+            tools/test_pre_dispatch_check.py \
+            tests/test_ci_wiring_guard.py \
+            -q || rc=1
+          python3 -m pytest src/engram/tools/test_tripwire.py -q || rc=1
+          exit $rc
 
       # ── 7d. cascade behaviour acceptance (playbox) ──────────────────────
       # The #2013 cascade machine is accepted by BEHAVIOUR: tests/cascade_
@@ -687,6 +1007,7 @@ jobs:
       # `server` lazily inside a function, never at module scope, so no
       # fastmcp is pulled in; nothing here needs a cost-model ruling.
       - name: cascade behaviour acceptance — playbox scenarios CD-01..09 + harness
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         run: |
           python3 -m pytest \
             tests/cascade_scenarios \
@@ -721,6 +1042,7 @@ jobs:
       # tools/test_id_set_check.py's module docstring for the full marker
       # syntax and the accounting rules.
       - name: test-id-set-check — fail on a shrinking test-id set without a Removed-test marker
+        if: success() || failure()
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -763,6 +1085,7 @@ jobs:
       # `fetch-depth: 0` / `fetch-tags: true`. Measured locally: 83 passed
       # in ~6s.
       - name: test-id-set-check-unit-tests — run tests/test_test_id_set_check.py (includes the #2950 TEST_SCAN_ROOTS <-> tests.yml sync gate)
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         run: python3 -m pytest tests/test_test_id_set_check.py -q
 
       # ── 9. hooks-stdout-audit ───────────────────────────────────────────
@@ -795,6 +1118,7 @@ jobs:
       # free, same reasoning as test-id-set-check above.
       - name: hooks-stdout-audit — check whether the diff touches src/engram/hooks/ or hooks.json
         id: hooks-diff-check
+        if: success() || failure()
         run: |
           BASE_REF="origin/${{ github.base_ref }}"
           # --no-renames: --name-only collapses a detected rename to the
@@ -814,7 +1138,7 @@ jobs:
           fi
 
       - name: hooks-stdout-audit — run test_hooks_json_stdout_audit.py
-        if: steps.hooks-diff-check.outputs.run == 'true'
+        if: (success() || failure()) && steps.hooks-diff-check.outputs.run == 'true' && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         run: python3 -m pytest tests/test_hooks_json_stdout_audit.py -q
 
       # ── 10. team-practice-drift-gate (umwelt#811) ───────────────────────
@@ -867,6 +1191,7 @@ jobs:
       # analogous App-token case.
       - name: team-practice-drift-gate — checkout team-practice
         id: team-practice-checkout
+        if: success() || failure()
         continue-on-error: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
         uses: actions/checkout@v4
         with:
@@ -876,7 +1201,7 @@ jobs:
           persist-credentials: false
 
       - name: team-practice-drift-gate — run sync_team_practice.py --check
-        if: steps.team-practice-checkout.outcome == 'success'
+        if: (success() || failure()) && steps.team-practice-checkout.outcome == 'success'
         run: |
           python3 team-practice/tools/sync_team_practice.py --check CLAUDE.md \
             --team-practice team-practice/TEAM-PRACTICE.md
@@ -900,7 +1225,7 @@ jobs:
       # clear diagnosis. Cheap to get right now rather than rediscover
       # later.
       - name: team-practice-drift-gate — advisory notice (checkout unavailable)
-        if: steps.team-practice-checkout.outcome != 'success'
+        if: (success() || failure()) && steps.team-practice-checkout.outcome != 'success'
         run: |
           if [ "${{ github.event.pull_request.head.repo.full_name != github.repository }}" = "true" ]; then
             echo "::warning::team-practice-drift-gate could not check out engram-agents/team-practice from this fork PR (fork PRs cannot carry this repo's secrets by design). CLAUDE.md's generated-region drift is NOT being checked on this run — see umwelt#811."
@@ -929,6 +1254,7 @@ jobs:
       # flag gates the heavier steps that follow).
       - name: check-stubbed-signatures — compute stub-affected test files
         id: stub-check
+        if: success() || failure()
         run: |
           set +e
           python3 tools/check_stubbed_signatures.py --base "origin/${{ github.base_ref }}" > /tmp/stub_affected_tests.txt
@@ -948,7 +1274,8 @@ jobs:
           fi
 
       - name: Set up Python 3.12 (check-stubbed-signatures)
-        if: steps.stub-check.outputs.has_hits == 'true'
+        id: setup-python-stub
+        if: (success() || failure()) && steps.stub-check.outputs.has_hits == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -956,7 +1283,8 @@ jobs:
           cache-dependency-path: requirements/requirements-dev.txt
 
       - name: check-stubbed-signatures — install dependencies for affected tests
-        if: steps.stub-check.outputs.has_hits == 'true'
+        id: install-deps-stub
+        if: (success() || failure()) && steps.stub-check.outputs.has_hits == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements/requirements-dev.txt
@@ -972,6 +1300,6 @@ jobs:
           fi
 
       - name: check-stubbed-signatures — run stub-affected tests
-        if: steps.stub-check.outputs.has_hits == 'true'
+        if: (success() || failure()) && steps.stub-check.outputs.has_hits == 'true' && steps.setup-python-stub.outcome == 'success' && steps.install-deps-stub.outcome == 'success'
         run: python3 -m pytest $(cat /tmp/stub_affected_tests.txt) -v --tb=short
 

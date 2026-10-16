@@ -56,7 +56,7 @@ SCHEMA: list[dict] = [
     # Embedding (read-only)
     {"key": "embedding.enabled", "section": "embedding", "tier": TIER_B, "type": "boolean",
      "control": "checkbox", "label": "Embedding enabled",
-     "tooltip": "Semantic recall via sentence-transformer embeddings. Read-only here — disable/enable would orphan existing nodes' embeddings.",
+     "tooltip": "Retired by #345 -- embeddings are mandatory. If this key is present with any value other than true, the server refuses to start; delete the key to fix.",
      "editable": False, "restart_required": False, "alert_when_false": True},
     {"key": "embedding.model", "section": "embedding", "tier": TIER_B, "type": "string",
      "control": "text", "label": "Embedding model",

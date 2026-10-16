@@ -80,8 +80,11 @@ EXIT_VALIDATION = 1
 EXIT_IO = 2
 EXIT_STATE = 3
 
+# A forum is configured by forum.url alone (#3552); agent_name is identity only.
+FORUM_CFG = {"url": "http://test-forum:5002"}
+
 # Config used for all multi-agent direct-call tests
-MULTI_CONFIG = {"mode": "multi", "agent_name": "borges", "primary_user": "casey"}
+MULTI_CONFIG = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG, "primary_user": "casey"}
 
 # Repo root, for tests that assert on shipped documentation surfaces.
 REPO_ROOT = Path(__file__).parent.parent
@@ -222,7 +225,8 @@ def _write_config(
     primary_user: str = "casey",
 ) -> None:
     """Write a minimal config.json into engram_home with mode=multi."""
-    cfg = {"mode": "multi", "agent_name": agent_name, "primary_user": primary_user}
+    cfg = {"mode": "multi", "agent_name": agent_name, "forum": FORUM_CFG,
+           "primary_user": primary_user}
     (engram_home / "config.json").write_text(json.dumps(cfg))
 
 
@@ -897,7 +901,7 @@ class TestSingleAgentGuard:
         assert "no forum configured" in captured.err
 
     def test_init_single_mode_with_agent_name_succeeds(self, capsys, monkeypatch):
-        """cmd_init with mode=single but agent_name set proceeds past the gate."""
+        """cmd_init with mode=single but forum.url set proceeds past the gate."""
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
 
@@ -908,7 +912,7 @@ class TestSingleAgentGuard:
             repo="engram-agents/engram-paper",
         )
         _baton.cmd_init(
-            args, {"mode": "single", "agent_name": "borges"}, "borges", client,
+            args, {"mode": "single", "agent_name": "borges", "forum": FORUM_CFG}, "borges", client,
         )
         client.post.assert_called()
 
@@ -2014,13 +2018,16 @@ class TestClaim:
             'prog': 'baton',
             'usage': None,
             'description': 'Multi-agent turn-state CLI — declare whose move it is on a shared project via explicit baton files.',
-            'epilog': 'Protocol docs: docs/baton-protocol.md\nProjects dir:  /home/agents-shared/forum/projects/ (manual deploy)\n',
+            'epilog': 'Protocol docs: docs/baton-protocol.md\n',
             'subparsers:metavar': 'subcommand',
             'subparsers:help': None,
             'subcommand:init:metavar': 'init',
             'subcommand:init:help': 'Create a new project baton file',
             'subcommand:flip:metavar': 'flip',
             'subcommand:flip:help': 'Pass the baton to another participant',
+            # #3039 U2b: a new user-facing surface, pinned here in the same breath.
+            'subcommand:advance:metavar': 'advance',
+            'subcommand:advance:help': "Strict peer → merge phase edge, gated server-side on the colleague's GitHub approval",
             'subcommand:claim:metavar': 'claim',
             'subcommand:claim:help': 'Claim a Project-layer baton from the pool (pool → self)',
             'subcommand:release:metavar': 'release',
@@ -2957,7 +2964,7 @@ class TestAnchor:
 
         client = _make_client({"seq": 1})
         args = argparse.Namespace(
-            project_id="PR-no-github", title="no anchor",
+            project_id="DESIGN-no-github", title="no anchor",
             participants="borges,ariadne", status="planning",
             turn=None, github=None, colleague=None,
         )
@@ -3141,7 +3148,8 @@ class TestPoolSentinel:
         This is the core fresh-install correctness test from issue #606:
         a non-casey primary_user install must work end-to-end.
         """
-        alice_config = {"mode": "multi", "agent_name": "borges", "primary_user": "alice"}
+        alice_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "alice"}
         _write_config(engram_home, agent_name="borges", primary_user="alice")
         # _pool_sentinel() reads os.environ.get("ENGRAM_HOME") directly, not the
         # module-level constant.  Use setenv (not setattr) to redirect the config read.
@@ -3189,7 +3197,8 @@ class TestPoolSentinel:
         the raw config string, so a capitalized primary_user would silently
         fail all sentinel comparisons.  The fix applies .lower() in _pool_sentinel().
         """
-        alice_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alice"}
+        alice_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alice"}
         _write_config(engram_home, agent_name="borges", primary_user="Alice")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3234,7 +3243,8 @@ class TestPoolSentinel:
         but pools are often initialized with just the first token ('alex').
         _is_pool_sentinel must accept both forms.
         """
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alex Chen"}
         _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3280,7 +3290,8 @@ class TestPoolSentinel:
         with turn='alex' (short form, written by baton flip) would block merge
         with "turn is with lei — not presented for merge."
         """
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alex Chen"}
         _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3315,7 +3326,8 @@ class TestPoolSentinel:
         a PR's review at a NAMED maintainer agent (e.g. "kepler"), never
         the literal pool sentinel string. Pre-#2913, `_is_pool_sentinel`
         alone would refuse this exact, correct, real-world state."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Lei Shi"}
         _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3342,7 +3354,8 @@ class TestPoolSentinel:
         is still in review, not presented for merge -- must stay refused,
         same as it always has (the fix adds an exemption for NAMED
         maintainers, it does not turn Gate 2 into a rubber stamp)."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Lei Shi"}
         _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3361,6 +3374,7 @@ class TestPoolSentinel:
         assert exc_info.value.code == EXIT_VALIDATION
         captured = capsys.readouterr()
         assert "not presented for merge" in captured.err
+        assert "turn is with ariadne" in captured.err  # names the holder
 
     def test_merge_gate2_refuses_while_turn_back_with_author(self, engram_home, monkeypatch, capsys):
         """Companion control: turn == the PR's own author (explicit
@@ -3368,7 +3382,8 @@ class TestPoolSentinel:
         colleague sent it back with a blocker -- must stay refused, not be
         read as merge-ready just because it isn't the literal colleague
         field either."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Lei Shi"}
         _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3392,6 +3407,7 @@ class TestPoolSentinel:
         assert exc_info.value.code == EXIT_VALIDATION
         captured = capsys.readouterr()
         assert "not presented for merge" in captured.err
+        assert "turn is with clio" in captured.err  # names the holder
 
     def test_merge_gate2_refuses_empty_turn(self, engram_home, monkeypatch, capsys):
         """Edge case named in Gate 2's own comment: a baton with no `turn`
@@ -3407,7 +3423,8 @@ class TestPoolSentinel:
         the realistic shape (production writers never emit an empty
         `turn:` line) and the one that actually reaches Gate 2's
         `if not current_turn` branch cleanly."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Lei Shi"}
         _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3441,7 +3458,8 @@ class TestPoolSentinel:
         `gh pr merge --squash`, that's the most dangerous instance of the
         whole #1715 bug class. Prove the gate actually fires against the
         ANCHOR's repo, not just that some CI check happened."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alex Chen"}
         _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3473,7 +3491,8 @@ class TestPoolSentinel:
         number is a red flag worth refusing on, not silently picking one --
         this would otherwise be a way for a mismatched/stale anchor to merge
         the wrong PR entirely."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alex Chen"}
         _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3498,7 +3517,8 @@ class TestPoolSentinel:
         """The actual gate-5 `gh pr merge` invocation must carry --repo --
         this is the single most consequential call in the whole #1715 bug
         class (an irreversible squash-merge)."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alex Chen"}
         _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3538,7 +3558,8 @@ class TestPoolSentinel:
         irreversible `gh pr merge --squash`. Supersedes the old
         test_merge_bare_anchor_resolves_default_repo, which asserted the
         exact behavior this issue fixes."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alex Chen"}
         _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3569,7 +3590,8 @@ class TestPoolSentinel:
         """#1918: --force skips CI/approval quality gates (3-4), never the
         repo-identity gate -- it has never meant 'merge without knowing
         which repo'."""
-        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        owner_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "Alex Chen"}
         _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -3613,17 +3635,18 @@ class TestPoolSentinel:
         assert "no forum configured" in captured.err
 
     def test_missing_mode_with_forum_configured_succeeds_past_gate(self, capsys):
-        """cmd_claim with mode absent but agent_name set proceeds past the gate.
+        """cmd_claim with mode absent but forum.url set proceeds past the gate.
 
         Control case for the above: an otherwise-empty config with just
-        agent_name set is NOT held at the forum-configured gate — it reaches
+        forum.url (and agent_name) set is NOT held at the forum-configured gate — it reaches
         the project-ID validation instead (EXIT_VALIDATION, not EXIT_STATE).
         """
         client = _make_client()
         args = argparse.Namespace(project_id="badid")
 
         with pytest.raises(SystemExit) as exc_info:
-            _baton.cmd_claim(args, {"agent_name": "borges"}, "borges", client)
+            _baton.cmd_claim(args, {"agent_name": "borges", "forum": FORUM_CFG},
+                             "borges", client)
         assert exc_info.value.code == EXIT_VALIDATION
         captured = capsys.readouterr()
         assert "invalid project ID" in captured.err
@@ -3997,14 +4020,14 @@ class TestSetColleague:
         assert exc_info.value.code == EXIT_STATE
 
     def test_set_colleague_single_mode_with_agent_name_succeeds(self, capsys):
-        """set-colleague with mode=single but agent_name set proceeds past the gate."""
+        """set-colleague with mode=single but forum.url set proceeds past the gate."""
         client = _make_client(
             post_return={"seq": 6, "participant_added": True},
             get_return={"raw": _make_raw_baton("PR-707")},
         )
         args = argparse.Namespace(project_id="PR-707", colleague="alex")
         _baton.cmd_set_colleague(
-            args, {"mode": "single", "agent_name": "borges"}, "borges", client,
+            args, {"mode": "single", "agent_name": "borges", "forum": FORUM_CFG}, "borges", client,
         )
         client.post.assert_called()
 
@@ -4270,6 +4293,187 @@ class TestInitRepoQualification:
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
         _, body = client.post.call_args[0]
         assert body.get("github") == "pr/engram-agents/engram-paper/22"
+
+
+class TestInitPrefixedPrBatonAnchor:
+    """#2916: the auto-derive (and the colleague warning) must cover every id
+    _PR_BATON_NAME_RE classifies as a PR baton AND that carries a number --
+    PR-<N>, <UPPERCASE-PREFIX>-PR-<N>, PR-<N>-<slug> -- not only bare PR-<N>.
+    Before, UMWELT-PR-959 minted with NO anchor, silently, and the dead end
+    surfaced at the peer->merge flip (anchor is write-once at fairy phase).
+    The refusal (#1924) is unchanged; only its reach is widened. The repo is
+    never inferred from the prefix (#1918: no default repo)."""
+
+    @staticmethod
+    def _args(project_id, github=None, repo=None, participants="borges,ariadne",
+              colleague=None):
+        return argparse.Namespace(
+            project_id=project_id, title="t", participants=participants,
+            status="planning", turn=None, github=github, repo=repo,
+            colleague=colleague,
+        )
+
+    @pytest.fixture(autouse=True)
+    def _sentinel(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+    @pytest.mark.parametrize("pid", ["UMWELT-PR-1234", "SOMA-PR-5", "PR-37-paper"])
+    def test_prefixed_id_without_repo_is_refused(self, pid, capsys):
+        client = _make_client({"seq": 1})
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(self._args(pid), MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()  # no baton created
+        err = capsys.readouterr().err
+        assert "--repo" in err
+        assert "auto-derived" in err
+
+    @pytest.mark.parametrize("pid,repo,expected", [
+        ("UMWELT-PR-1234", "engram-agents/umwelt", "pr/engram-agents/umwelt/1234"),
+        ("SOMA-PR-5", "engram-agents/soma", "pr/engram-agents/soma/5"),
+        ("PR-37-paper", "engram-agents/engram-paper",
+         "pr/engram-agents/engram-paper/37"),
+    ])
+    def test_prefixed_id_with_repo_derives_qualified_anchor(self, pid, repo, expected):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(self._args(pid, repo=repo), MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["github"] == expected
+
+    def test_prefixed_id_with_qualified_github_accepted_unchanged(self):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(
+            self._args("UMWELT-PR-1234", github="pr/engram-agents/umwelt/1234"),
+            MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["github"] == "pr/engram-agents/umwelt/1234"
+
+    def test_prefixed_id_conflicting_repo_still_refused(self):
+        client = _make_client({"seq": 1})
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(
+                self._args("UMWELT-PR-1234",
+                           github="pr/engram-agents/umwelt/1234",
+                           repo="engram-agents/soma"),
+                MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+
+    @pytest.mark.parametrize("pid", ["DESIGN-foo", "pool-x", "XPR-5", "MY-X-PR-5"])
+    def test_non_pr_ids_derive_no_anchor_and_no_refusal(self, pid):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(self._args(pid), MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert not body.get("github")
+
+    # The effective classifier (_is_pr_shaped) matches _PR_BATON_NAME_RE on
+    # project_id.upper(), so case variants ARE PR batons (fairy phase); the
+    # derive must agree or they hit the #2916 dead end.
+    CASE_VARIANTS = ["umwelt-pr-5", "umwelt-PR-5", "UMWELT-pr-5"]
+
+    @pytest.mark.parametrize("pid", CASE_VARIANTS)
+    def test_case_variant_without_repo_is_refused(self, pid, capsys):
+        client = _make_client({"seq": 1})
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(self._args(pid), MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        assert "--repo" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("pid", CASE_VARIANTS)
+    def test_case_variant_with_repo_derives_qualified_anchor(self, pid):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(self._args(pid, repo="o/r"), MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["github"] == "pr/o/r/5"
+
+    # --- #3364: fail closed on a PR-shaped id that resolves NO anchor ------
+    # (REPLACES #3363's test_name_shaped_but_numberless_id_inits_without_anchor,
+    # which recorded PR-12abc minting anchorless as current behaviour.)
+
+    @pytest.mark.parametrize("pid", ["PR-autopull", "PR-12abc"])
+    def test_pr_shaped_id_with_no_resolvable_anchor_is_refused(self, pid, capsys):
+        client = _make_client({"seq": 1})
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(self._args(pid), MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()  # no baton created
+        err = capsys.readouterr().err
+        # both routes through (contract 7)
+        assert "--github pr/<owner>/<repo>/<N>" in err
+        assert "--github project/<N>" in err
+        assert "non-PR" in err
+
+    def test_pr_shaped_id_with_explicit_qualified_anchor_accepted(self):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(
+            self._args("PR-umwelt-466", github="pr/engram-agents/umwelt/466"),
+            MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["github"] == "pr/engram-agents/umwelt/466"
+        assert body["transition_phase"] == "fairy"
+
+    def test_pr_shaped_name_with_project_anchor_is_a_bunch(self):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(self._args("PR-autopull", github="project/12"),
+                        MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["github"] == "project/12"
+        assert _baton._is_pr_shaped("PR-autopull", body["github"]) is False
+        assert body["transition_phase"] == "pool"  # not the PR fairy gate
+
+    @pytest.mark.parametrize("pid", ["PR-umwelt-466", "PR-autopull"])
+    def test_numberless_pr_shaped_id_with_repo_shows_two_route_hint(self, pid, capsys):
+        """--repo is the natural invocation; it must reach the two-route
+        hint, not the generic '--repo only applies to a PR anchor' error."""
+        client = _make_client({"seq": 1})
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(self._args(pid, repo="a/b"), MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        err = capsys.readouterr().err
+        assert "--github pr/a/b/<N>" in err  # given --repo used in the example
+        assert "--github project/<N>" in err
+
+    def test_non_pr_id_with_repo_keeps_existing_repo_error(self, capsys):
+        client = _make_client({"seq": 1})
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(self._args("DESIGN-x", repo="a/b"),
+                            MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        err = capsys.readouterr().err
+        assert "--repo only applies to a PR anchor" in err
+        assert "project/<N>" not in err
+
+    def test_numbered_pr_id_with_repo_still_accepted(self):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(self._args("PR-5", repo="a/b"), MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["github"] == "pr/a/b/5"
+
+    @pytest.mark.parametrize("pid", ["DESIGN-x", "pool-x"])
+    def test_non_pr_ids_still_init_without_anchor(self, pid):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(self._args(pid), MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert not body.get("github")
+        assert body["transition_phase"] == "pool"
+
+    @pytest.mark.parametrize("pid", ["UMWELT-PR-1234", "PR-37-paper", "PR-9"])
+    def test_colleague_warning_fires_without_colleague(self, pid, capsys):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(
+            self._args(pid, repo="engram-agents/umwelt", participants="borges"),
+            MULTI_CONFIG, "borges", client)
+        assert "no colleague participant" in capsys.readouterr().err
+
+    def test_colleague_warning_silent_for_non_pr_id(self, capsys):
+        client = _make_client({"seq": 1})
+        _baton.cmd_init(self._args("DESIGN-foo", participants="borges"),
+                        MULTI_CONFIG, "borges", client)
+        assert "no colleague participant" not in capsys.readouterr().err
 
 
 class TestInitAuthorIsInvoker:
@@ -5672,9 +5876,9 @@ class TestApprovalStateParsing:
     Adapted for the current signature, `_pr_approval_state(pr_number, repo)`:
     `repo` is now REQUIRED (#1715/#1918 removed the `gh repo view`
     cwd-inference fallback -- a caller with no repo-qualified anchor now gets
-    "unknown" rather than a silent guess), and the function makes a SINGLE
-    `subprocess.run` call (the GraphQL query only) instead of the old
-    repo-view-then-graphql two-call shape.
+    "unknown" rather than a silent guess), and the function reads the PR head
+    and the review rows over REST (`gh api repos/<repo>/pulls/<N>` and
+    `.../reviews`, #3541) instead of one GraphQL query.
     """
 
     @pytest.fixture
@@ -5684,38 +5888,40 @@ class TestApprovalStateParsing:
     REPO = "engram-agents/engram-paper"
 
     @staticmethod
-    def _gql_payload(head_oid, review_nodes):
-        """Build the GraphQL response envelope expected by _pr_approval_state."""
-        return {
-            "data": {
-                "repository": {
-                    "pullRequest": {
-                        "headRefOid": head_oid,
-                        "reviews": {"nodes": review_nodes},
-                    }
-                }
-            }
-        }
+    def _rest_payload(head_oid, review_nodes):
+        """The REST rows `_pr_approval_state` reads (#3541): `pulls/<N>` gives
+        head.sha, `pulls/<N>/reviews` gives rows with `state` + `commit_id`.
+        Test inputs keep the old `{"state", "commit": {"oid"}}` node shape and
+        are translated here, so the assertions in each test are unchanged."""
+        rows = []
+        for n in review_nodes:
+            commit = n.get("commit")
+            rows.append({"state": n["state"],
+                         "commit_id": commit.get("oid") if isinstance(commit, dict) else None})
+        return {"head": head_oid, "rows": rows}
 
     @classmethod
-    def _mock_gql_result(cls, payload, returncode=0, stderr=""):
-        """Build a mock subprocess.CompletedProcess-like object for the single
-        `gh api graphql` call _pr_approval_state now makes."""
-        return _mock.MagicMock(
-            returncode=returncode,
-            stdout=json.dumps(payload) if payload is not None else "",
-            stderr=stderr,
-        )
+    def _mock_rest_run(cls, payload, returncode=0, stderr=""):
+        """A `subprocess.run` stand-in routing on the `gh api <path>` argument."""
+        def _run(argv, *a, **kw):
+            if returncode != 0:
+                return _mock.MagicMock(returncode=returncode, stdout="", stderr=stderr)
+            if "/reviews?" in argv[2]:
+                body = payload["rows"]
+            else:
+                body = {"headRefOid": payload["head"], "author": {"login": "someone"}}
+            return _mock.MagicMock(returncode=0, stdout=json.dumps(body), stderr="")
+        return _run
 
     # --- core verdict tests ---
 
     def test_state_fresh_when_approval_oid_matches_tip(self, baton):
         """APPROVED review with commit.oid == headRefOid -> fresh."""
-        tip = "aabbccdd1122334455667788"
-        mock_result = self._mock_gql_result(self._gql_payload(tip, [
+        tip = "aabbccdd1122334455667788" + "0" * 16
+        mock_result = self._mock_rest_run(self._rest_payload(tip, [
             {"state": "APPROVED", "commit": {"oid": tip}},
         ]))
-        with _mock.patch("subprocess.run", return_value=mock_result):
+        with _mock.patch("subprocess.run", mock_result):
             state, detail = baton._pr_approval_state("1", repo=self.REPO)
         assert state == "fresh"
         assert tip[:8] in detail
@@ -5724,12 +5930,12 @@ class TestApprovalStateParsing:
         """APPROVED review exists but commit.oid != headRefOid (rebase case)
         -- stale even if the approval's committedDate would be OLDER than the
         tip."""
-        tip = "aaaa0000111122223333"
-        old_oid = "bbbb9999888877776666"
-        mock_result = self._mock_gql_result(self._gql_payload(tip, [
+        tip = "aaaa0000111122223333" + "0" * 20
+        old_oid = "bbbb9999888877776666" + "0" * 20
+        mock_result = self._mock_rest_run(self._rest_payload(tip, [
             {"state": "APPROVED", "commit": {"oid": old_oid}},
         ]))
-        with _mock.patch("subprocess.run", return_value=mock_result):
+        with _mock.patch("subprocess.run", mock_result):
             state, detail = baton._pr_approval_state("1", repo=self.REPO)
         assert state == "stale"
         assert tip[:8] in detail
@@ -5737,34 +5943,34 @@ class TestApprovalStateParsing:
 
     def test_state_no_approval_without_approved_reviews(self, baton):
         """Only COMMENTED / CHANGES_REQUESTED reviews -> no_approval."""
-        tip = "deadbeef00001111"
-        mock_result = self._mock_gql_result(self._gql_payload(tip, [
+        tip = "deadbeef00001111" + "0" * 24
+        mock_result = self._mock_rest_run(self._rest_payload(tip, [
             {"state": "COMMENTED", "commit": {"oid": "old111"}},
             {"state": "CHANGES_REQUESTED", "commit": {"oid": "old222"}},
         ]))
-        with _mock.patch("subprocess.run", return_value=mock_result):
+        with _mock.patch("subprocess.run", mock_result):
             state, _ = baton._pr_approval_state("1", repo=self.REPO)
         assert state == "no_approval"
 
     def test_state_dismissed_only_is_no_approval(self, baton):
         """DISMISSED reviews only -> no_approval (not stale)."""
-        tip = "cafebabe12345678"
-        mock_result = self._mock_gql_result(self._gql_payload(tip, [
+        tip = "cafebabe12345678" + "0" * 24
+        mock_result = self._mock_rest_run(self._rest_payload(tip, [
             {"state": "DISMISSED", "commit": {"oid": "old333"}},
         ]))
-        with _mock.patch("subprocess.run", return_value=mock_result):
+        with _mock.patch("subprocess.run", mock_result):
             state, _ = baton._pr_approval_state("1", repo=self.REPO)
         assert state == "no_approval"
 
     def test_state_fresh_with_commit_null_and_matching_approval(self, baton):
         """A review node with commit: null is non-matching but not an error;
         a second node that matches the tip still produces fresh."""
-        tip = "1234567890abcdef"
-        mock_result = self._mock_gql_result(self._gql_payload(tip, [
+        tip = "1234567890abcdef" + "0" * 24
+        mock_result = self._mock_rest_run(self._rest_payload(tip, [
             {"state": "APPROVED", "commit": None},
             {"state": "APPROVED", "commit": {"oid": tip}},
         ]))
-        with _mock.patch("subprocess.run", return_value=mock_result):
+        with _mock.patch("subprocess.run", mock_result):
             state, detail = baton._pr_approval_state("1", repo=self.REPO)
         assert state == "fresh"
         assert tip[:8] in detail
@@ -5773,10 +5979,10 @@ class TestApprovalStateParsing:
 
     def test_state_unknown_on_gql_failure(self, baton):
         """GraphQL call failure -> unknown (with gh's stderr text)."""
-        mock_result = self._mock_gql_result(
+        mock_result = self._mock_rest_run(
             None, returncode=1, stderr="gh: not logged in",
         )
-        with _mock.patch("subprocess.run", return_value=mock_result):
+        with _mock.patch("subprocess.run", mock_result):
             state, detail = baton._pr_approval_state("1", repo=self.REPO)
         assert state == "unknown"
         assert "not logged in" in detail
@@ -5825,16 +6031,14 @@ class TestApprovalStateParsing:
         ergonomics."""
         calls = []
 
+        tip = "abc123ff" + "0" * 32
+        routed = self._mock_rest_run(self._rest_payload(tip, [
+            {"state": "APPROVED", "commit": {"oid": tip}},
+        ]))
+
         def _fake_run(argv, **kwargs):
             calls.append(argv)
-            return _mock.MagicMock(
-                returncode=0,
-                stderr="",
-                stdout=(
-                    '{"data": {"repository": {"pullRequest": {"headRefOid": "abc123ff",'
-                    ' "reviews": {"nodes": [{"state": "APPROVED", "commit": {"oid": "abc123ff"}}]}}}}}'
-                ),
-            )
+            return routed(argv, **kwargs)
 
         with _mock.patch("subprocess.run", _fake_run):
             state, detail = baton._pr_approval_state("#123", repo=self.REPO)
@@ -5845,8 +6049,8 @@ class TestApprovalStateParsing:
         """A PR with zero reviews of any kind is no_approval (reviewer-fairy
         suggestion on the original PR: pin the empty-list path so a future
         edit can't silently turn it into unknown)."""
-        mock_result = self._mock_gql_result(self._gql_payload("abc123ff", []))
-        with _mock.patch("subprocess.run", return_value=mock_result):
+        mock_result = self._mock_rest_run(self._rest_payload("abc123ff" + "0" * 32, []))
+        with _mock.patch("subprocess.run", mock_result):
             state, detail = baton._pr_approval_state("123", repo=self.REPO)
         assert state == "no_approval"
 
@@ -6327,6 +6531,7 @@ class TestInitPhaseWrite:
             project_id="UMWELT-PR-775", title="pr test",
             participants="borges,ariadne", status="planning",
             turn=None, github=None, colleague=None,
+            repo="engram-agents/umwelt",  # #2916: prefixed PR ids now need it
         )
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
 
@@ -6424,6 +6629,12 @@ def _real_forum_client(tmp_path) -> _RealForumClientAdapter:
     if sys.path[:1] != [_SRC_DIR]:
         sys.path.insert(0, _SRC_DIR)
 
+    # forum.server pulls forum.db, render and flask; skip when a third-party dep
+    # is absent (tests/_forum_deps.py), keep internal ImportErrors loud.
+    from _forum_deps import import_forum_or_skip
+
+    import_forum_or_skip("forum.server")
+
     from forum.coordination import SeqAllocator
     from forum.coordination.store_file import FileStore
     from forum.db import init_db
@@ -6456,7 +6667,8 @@ class TestDoubleClaimRegressionEndToEnd:
         # Seed the bunch baton via the REAL `cmd_init` call, exactly as
         # `baton init pool-9910 --turn "lei shi" ...` would -- phase: pool,
         # turn at the pool sentinel.
-        real_config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        real_config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         init_args = argparse.Namespace(
             project_id="pool-9910", title="a real bunch",
             participants="borges,ariadne", status="planning",
@@ -6754,7 +6966,11 @@ class TestRound4ConversionThenTransitionEndToEnd:
         client = _real_forum_client(tmp_path)
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
-        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        # server-side gate needs a resolvable sentinel too (production servers have primary_user configured)
+        import forum.server as _forum_server
+        monkeypatch.setattr(_forum_server._load_baton_gate(), "_resolve_pool_sentinel", lambda *a, **kw: "lei shi")
+        config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         self._seed(client, "pool-9840", _make_raw_baton(
             "pool-9840", turn="lei shi", participants="[borges, ariadne]",
         ))
@@ -6772,7 +6988,8 @@ class TestRound4ConversionThenTransitionEndToEnd:
         client = _real_forum_client(tmp_path)
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
-        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         self._seed(client, "pool-9841", _make_raw_baton(
             "pool-9841", turn="lei shi", participants="[borges, ariadne]", phase="pool",
         ))
@@ -6936,7 +7153,8 @@ class TestRound5LegacyConversionEndToEnd:
         client = _real_forum_client(tmp_path)
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
-        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         pid = "pool-9950"
         self._seed(client, pid, _make_raw_baton(
             pid, turn="borges", participants="[borges, ariadne]",
@@ -6957,7 +7175,8 @@ class TestRound5LegacyConversionEndToEnd:
         client = _real_forum_client(tmp_path)
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
-        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         pid = "pool-9951"
         self._seed(client, pid, _make_raw_baton(
             pid, turn="borges", participants="[borges, ariadne]", phase="claimed",
@@ -6977,7 +7196,8 @@ class TestRound5LegacyConversionEndToEnd:
         client = _real_forum_client(tmp_path)
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
-        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         monkeypatch.setenv("BATON_POOL_SENTINEL", "lei shi")
         pid = "PR-9952"
         self._seed(client, pid, _make_raw_baton(
@@ -7003,7 +7223,8 @@ class TestRound5LegacyConversionEndToEnd:
         client = _real_forum_client(tmp_path)
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei shi")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
-        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         monkeypatch.setenv("BATON_POOL_SENTINEL", "lei shi")
         pid = "PR-9953"
         self._seed(client, pid, _make_raw_baton(
@@ -7029,7 +7250,8 @@ class TestRound5LegacyConversionEndToEnd:
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", ["lei shi"])
         monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("green", "mergeStateStatus=CLEAN"))
         monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr, repo=None: ("fresh", "approved at current tip"))
-        config = {"mode": "multi", "agent_name": "borges", "primary_user": "lei shi"}
+        config = {"mode": "multi", "agent_name": "borges", "forum": FORUM_CFG,
+            "primary_user": "lei shi"}
         monkeypatch.setenv("BATON_POOL_SENTINEL", "lei shi")
         # The SERVER mirrors cmd_flip's gate on a maintainer-role flip, through
         # its own loaded copy of baton_gate -- green-light that copy too.
@@ -7054,3 +7276,448 @@ class TestRound5LegacyConversionEndToEnd:
         assert "phase: 'merge' (transition)" in lines[1]
         fields, _ = _baton._parse_frontmatter(raw)
         assert fields["phase"] == "merge"
+
+
+# ===========================================================================
+# #1813 -- frontmatter field separator must not cross a newline
+# ===========================================================================
+#
+# _baton._FRONTMATTER_FIELD_RE used `\s*` as the key/value separator, and
+# `\s` matches `\n`. An empty, UNQUOTED field therefore swallowed the entire
+# next field's line as its own value. Tests go through the real
+# `_baton._parse_frontmatter` every baton read in this module calls, not the
+# bare regex, so they pin behaviour rather than a string.
+class TestFrontmatterFieldSeparatorNoNewlineCrossing:
+    def test_empty_unquoted_field_does_not_swallow_next_field(self):
+        raw = (
+            "---\n"
+            "project: PR-1813\n"
+            "turn_by: \n"
+            "participants: [borges]\n"
+            "status: open\n"
+            "---\n"
+            "body\n"
+        )
+        fields, _ = _baton._parse_frontmatter(raw)
+        assert fields["turn_by"] == ""
+        assert fields["participants"] == "[borges]"
+        assert fields["status"] == "open"
+
+    def test_unchanged_cases_still_parse_correctly(self):
+        # key: value (space) / key:value (no space) / a value containing
+        # ": " / quoted-empty / a trailing field at the end of the block --
+        # all must parse exactly as before the fix.
+        raw = (
+            "---\n"
+            "project: PR-1813\n"
+            "title:no-space-value\n"
+            "colon_value: a value: with a colon\n"
+            'turn_reason: ""\n'
+            "participants: [borges, ariadne]\n"
+            "---\n"
+            "body\n"
+        )
+        fields, _ = _baton._parse_frontmatter(raw)
+        assert fields["project"] == "PR-1813"
+        assert fields["title"] == "no-space-value"
+        assert fields["colon_value"] == "a value: with a colon"
+        assert fields["turn_reason"] == '""'
+        assert fields["participants"] == "[borges, ariadne]"
+
+
+# ===========================================================================
+# CATEGORY 13: ported from the retired tools/test_baton_colleague_gate.py and
+# tools/test_baton_merge_gate.py (#3346)
+#
+# Those two files targeted the pre-#1536 file-backed baton (they patched
+# `BATON_PROJECTS_DIR`, a constant #1536 deleted) and, living under tools/,
+# were collected by no CI job -- so they errored on every fixture for months
+# and nobody was told. Behaviours the current CLI still has are re-asserted
+# here against the forum-API design (mock ForumClient, repo-qualified github
+# anchor, `_pool_sentinel` pinned). Behaviours that no longer exist were not
+# ported; the mapping is in the #3346 PR body.
+# ===========================================================================
+
+_FLIP_GATE_ANCHOR = "pr/engram-agents/engram-paper"
+
+
+def _pin_gate_states(monkeypatch, *, ci=("green", "ok"), approval=("fresh", "ok")):
+    """Pin the sentinel and both gh-backed gate probes; return the call log."""
+    monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+    calls = []
+
+    def _ci(pr_num, repo=None):
+        calls.append(("ci", pr_num, repo))
+        return ci
+
+    def _ap(pr_num, repo=None):
+        calls.append(("approval", pr_num, repo))
+        return approval
+
+    monkeypatch.setattr(_baton, "_pr_ci_state", _ci)
+    monkeypatch.setattr(_baton, "_pr_approval_state", _ap)
+    return calls
+
+
+def _flip_to_sentinel(project_id, num, *, participants, turn, force=False):
+    """A mock client holding a PR baton at `turn`, plus the flip-to-sentinel args."""
+    client = _make_client(
+        post_return={"seq": 1},
+        get_return={"raw": _make_raw_baton(
+            project_id, github=f"{_FLIP_GATE_ANCHOR}/{num}",
+            turn=turn, participants=participants,
+        )},
+    )
+    args = argparse.Namespace(
+        project_id=project_id, to="casey", reason="ready to merge", force=force,
+    )
+    return client, args
+
+
+class TestFlipColleagueApprovalGate:
+    """The #1267 colleague gate on `baton flip <PR> <maintainer/sentinel>`,
+    re-asserted for the forum-API CLI (ported from the retired
+    tools/test_baton_colleague_gate.py, tests 1-5, 7, 12)."""
+
+    def test_no_approval_with_colleague_refuses(self, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch, approval=("no_approval", "no APPROVED review"))
+        client, args = _flip_to_sentinel(
+            "PR-300", 300, participants="[borges, ariadne]", turn="borges",
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        err = capsys.readouterr().err
+        assert "no colleague approval" in err
+        assert "300" in err
+        assert "non-author colleague" in err
+        client.post.assert_not_called()  # nothing written on refusal
+
+    def test_no_approval_with_colleague_force_proceeds_with_warning(self, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch, approval=("no_approval", "no APPROVED review"))
+        client, args = _flip_to_sentinel(
+            "PR-301", 301, participants="[borges, ariadne]", turn="borges", force=True,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        err = capsys.readouterr().err
+        assert "warning" in err.lower()
+        assert "no colleague approval" in err
+
+    def test_no_approval_without_colleague_single_agent_warns_and_proceeds(
+        self, monkeypatch, capsys
+    ):
+        _pin_gate_states(monkeypatch, approval=("no_approval", "no APPROVED review"))
+        client, args = _flip_to_sentinel(
+            "PR-302", 302, participants="[borges]", turn="borges",
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        err = capsys.readouterr().err
+        assert "single-agent mode" in err
+        assert "warning" in err.lower()
+
+    def test_fresh_approval_with_colleague_proceeds_silently(self, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch, approval=("fresh", "approval covers tip"))
+        client, args = _flip_to_sentinel(
+            "PR-303", 303, participants="[borges, ariadne]", turn="borges",
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        assert capsys.readouterr().err == ""
+
+    def test_stale_approval_with_colleague_refuses_via_the_stale_branch(
+        self, monkeypatch, capsys
+    ):
+        """The stale branch must fire before the no_approval branch is reached."""
+        _pin_gate_states(monkeypatch, approval=("stale", "tip moved after approval"))
+        client, args = _flip_to_sentinel(
+            "PR-304", 304, participants="[borges, ariadne]", turn="borges",
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        assert "tip moved after approval" in capsys.readouterr().err
+        client.post.assert_not_called()
+
+    def test_unknown_approval_warns_and_proceeds(self, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch, approval=("unknown", "gh timed out after 15s"))
+        client, args = _flip_to_sentinel(
+            "PR-306", 306, participants="[borges, ariadne]", turn="borges",
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        assert "could not verify post-approval state" in capsys.readouterr().err
+
+    def test_inverted_holder_refusal_does_not_name_the_author_as_approver(
+        self, monkeypatch, capsys
+    ):
+        """The colleague (ariadne) holds the baton and flips to the sentinel
+        with no approval. The colleague set is derived from participants minus
+        the holder, so it resolves to the AUTHOR (borges); the refusal must
+        stay generic and must not tell the reader borges is the approver."""
+        _pin_gate_states(monkeypatch, approval=("no_approval", "no APPROVED review"))
+        client, args = _flip_to_sentinel(
+            "PR-500", 500, participants="[borges, ariadne]", turn="ariadne",
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        err = capsys.readouterr().err
+        assert "non-author colleague" in err
+        assert "borges" not in err
+        client.post.assert_not_called()
+
+
+class TestInitColleagueParticipants:
+    """`baton init --colleague` shapes the POSTed participants list (ported
+    from the retired colleague-gate tests 9 and 11; the file-write body note
+    those tests also asserted no longer exists, see the #3346 mapping)."""
+
+    @staticmethod
+    def _args(pid, participants, colleague):
+        return argparse.Namespace(
+            project_id=pid, title="t", participants=participants,
+            turn="borges", status="in-progress", github=None,
+            repo="engram-agents/engram-paper", colleague=colleague,
+        )
+
+    def test_colleague_is_added_to_participants_and_silences_the_warning(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        client = _make_client(post_return={"seq": 1})
+        _baton.cmd_init(self._args("PR-401", "borges", "ariadne"), MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["participants"] == ["borges", "ariadne"]
+        assert body["colleague"] == "ariadne"
+        captured = capsys.readouterr()
+        assert "no colleague participant" not in captured.err
+        assert "colleague:    ariadne" in captured.out
+
+    def test_colleague_already_in_participants_is_not_duplicated(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        client = _make_client(post_return={"seq": 1})
+        _baton.cmd_init(
+            self._args("PR-402", "borges,ariadne", "ariadne"), MULTI_CONFIG, "borges", client,
+        )
+
+        _, body = client.post.call_args[0]
+        assert body["participants"].count("ariadne") == 1
+
+
+_MERGE_REPO = "example-org/example-repo"
+
+
+class _MergeHarness:
+    """Shared plumbing for the merge-gate ladder tests below."""
+
+    @staticmethod
+    def client_for(num, *, turn="casey", status="in-progress", github=True):
+        fm = {"turn": turn, "status": status, "participants": "[borges, ariadne]"}
+        if github:
+            fm["github"] = f"pr/{_MERGE_REPO}/{num}"
+        return _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(f"PR-{num}", **fm)},
+        )
+
+    @staticmethod
+    def stub_gh(monkeypatch, *, returncode=0, stderr="", raises=None):
+        calls = []
+
+        def _run(cmd, **kwargs):
+            calls.append(cmd)
+            if raises is not None:
+                raise raises
+            r = MagicMock()
+            r.returncode = returncode
+            r.stdout = ""
+            r.stderr = stderr
+            return r
+
+        monkeypatch.setattr(_baton.subprocess, "run", _run)
+        return calls
+
+    @staticmethod
+    def merge(client, pr, *, force=False, dry_run=False):
+        args = argparse.Namespace(pr=pr, force=force, dry_run=dry_run)
+        _baton.cmd_merge(args, MULTI_CONFIG, "borges", client)
+
+
+class TestMergeGateLadder(_MergeHarness):
+    """`baton merge` gate ladder re-asserted for the forum-API CLI (ported
+    from the retired tools/test_baton_merge_gate.py). Gate 2 refusals, the
+    repo-qualified CI-red refusal, the PR-number mismatch, the `--repo` flag
+    and the bare-anchor refusals already live in TestPoolSentinel above."""
+
+    def test_missing_baton_refuses_even_with_force_and_never_calls_gh(
+        self, monkeypatch, capsys
+    ):
+        _pin_gate_states(monkeypatch)
+        gh = self.stub_gh(monkeypatch)
+        client = _make_client()
+        client.get.side_effect = ForumHttpError(404, '{"error": "not found"}')
+        for force in (False, True):
+            with pytest.raises(SystemExit) as exc_info:
+                self.merge(client, "PR-508", force=force)
+            assert exc_info.value.code == EXIT_VALIDATION
+        assert "not found" in capsys.readouterr().err.lower()
+        assert gh == []
+        client.post.assert_not_called()
+
+    def test_happy_path_squash_merges_then_closes_the_baton_via_the_api(
+        self, monkeypatch, capsys
+    ):
+        _pin_gate_states(monkeypatch)
+        gh = self.stub_gh(monkeypatch)
+        client = self.client_for(502)
+        self.merge(client, "PR-502")
+
+        assert gh == [["gh", "pr", "merge", "502", "--squash", "--repo", _MERGE_REPO]]
+        path, body = client.post.call_args[0]
+        assert path == "/api/projects/PR-502/merge"
+        assert body["agent"] == "borges"
+        assert body["forced"] is False
+        assert "merged (squash)" in capsys.readouterr().out
+
+    def test_pending_ci_refuses_and_writes_nothing(self, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch, ci=("pending", "check 'tests' status=IN_PROGRESS"))
+        gh = self.stub_gh(monkeypatch)
+        client = self.client_for(504)
+        with pytest.raises(SystemExit) as exc_info:
+            self.merge(client, "PR-504")
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        assert "pending" in capsys.readouterr().err.lower()
+        assert gh == []
+        client.post.assert_not_called()
+
+    def test_stale_approval_refuses_and_writes_nothing(self, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch, approval=("stale", "tip oid abc1234 not covered"))
+        gh = self.stub_gh(monkeypatch)
+        client = self.client_for(506)
+        with pytest.raises(SystemExit) as exc_info:
+            self.merge(client, "PR-506")
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        assert "tip moved after approval" in capsys.readouterr().err
+        assert gh == []
+        client.post.assert_not_called()
+
+    def test_force_skips_ci_and_approval_and_records_the_actual_states(
+        self, monkeypatch, capsys
+    ):
+        """--force bypasses gates 3-4 but still queries them, so the warning
+        records what was bypassed; the closure POST carries forced=True."""
+        _pin_gate_states(
+            monkeypatch, ci=("red", "lint FAILURE"), approval=("stale", "tip oid mismatch"),
+        )
+        gh = self.stub_gh(monkeypatch)
+        client = self.client_for(505)
+        self.merge(client, "PR-505", force=True)
+
+        err = capsys.readouterr().err
+        assert "--force" in err
+        assert "actual: red" in err
+        assert "actual: stale" in err
+        assert len(gh) == 1
+        _, body = client.post.call_args[0]
+        assert body["forced"] is True
+
+    def test_no_approval_passes_through_gate_4(self, monkeypatch):
+        """no_approval is the colleague layer's jurisdiction, not the merge gate's."""
+        _pin_gate_states(monkeypatch, approval=("no_approval", "no APPROVED review"))
+        gh = self.stub_gh(monkeypatch)
+        self.merge(self.client_for(507), "PR-507")
+        assert len(gh) == 1
+
+    @pytest.mark.parametrize("which", ["ci", "approval"])
+    def test_unknown_gate_state_warns_and_proceeds(self, which, monkeypatch, capsys):
+        kwargs = {which: ("unknown", "gh not found on PATH")}
+        _pin_gate_states(monkeypatch, **kwargs)
+        gh = self.stub_gh(monkeypatch)
+        self.merge(self.client_for(514), "PR-514")
+
+        assert len(gh) == 1
+        assert "could not verify" in capsys.readouterr().err
+
+    def test_dry_run_prints_the_verdict_and_changes_nothing(self, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch)
+        gh = self.stub_gh(monkeypatch)
+        client = self.client_for(510)
+        self.merge(client, "PR-510", dry_run=True)
+
+        out = capsys.readouterr().out
+        assert "DRY-RUN" in out
+        assert "gate 1 (baton exists): PASS" in out
+        assert "gate 3 (CI)" in out and "gate 4 (approval)" in out
+        assert gh == []
+        client.post.assert_not_called()
+
+    def test_gh_nonzero_exit_is_exit_io_and_leaves_the_baton_alone(
+        self, monkeypatch, capsys
+    ):
+        _pin_gate_states(monkeypatch)
+        self.stub_gh(monkeypatch, returncode=1, stderr="PR is already merged")
+        client = self.client_for(511)
+        with pytest.raises(SystemExit) as exc_info:
+            self.merge(client, "PR-511")
+
+        assert exc_info.value.code == EXIT_IO
+        assert "Baton state unchanged" in capsys.readouterr().err
+        client.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "raises,needle",
+        [
+            (FileNotFoundError("gh not found"), "gh not found"),
+            (subprocess.TimeoutExpired(cmd="gh", timeout=60), "timed out"),
+        ],
+        ids=["gh-missing", "gh-timeout"],
+    )
+    def test_gh_missing_or_timeout_is_exit_io_and_leaves_the_baton_alone(
+        self, raises, needle, monkeypatch, capsys
+    ):
+        _pin_gate_states(monkeypatch)
+        self.stub_gh(monkeypatch, raises=raises)
+        client = self.client_for(512)
+        with pytest.raises(SystemExit) as exc_info:
+            self.merge(client, "PR-512")
+
+        assert exc_info.value.code == EXIT_IO
+        assert needle in capsys.readouterr().err
+        client.post.assert_not_called()
+
+    @pytest.mark.parametrize("arg", ["PR-516", "516", "#516"])
+    def test_pr_argument_forms_resolve_to_the_same_baton_and_pr(
+        self, arg, monkeypatch
+    ):
+        _pin_gate_states(monkeypatch)
+        gh = self.stub_gh(monkeypatch)
+        client = self.client_for(516)
+        self.merge(client, arg)
+
+        client.get.assert_called_with("/api/projects/PR-516")
+        assert gh[0][3] == "516"
+
+    @pytest.mark.parametrize("status", ["merged", "cancelled"])
+    def test_already_closed_baton_refuses(self, status, monkeypatch, capsys):
+        _pin_gate_states(monkeypatch)
+        gh = self.stub_gh(monkeypatch)
+        client = self.client_for(518, status=status)
+        with pytest.raises(SystemExit) as exc_info:
+            self.merge(client, "PR-518")
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        assert f"already {status}" in capsys.readouterr().err
+        assert gh == []
+        client.post.assert_not_called()

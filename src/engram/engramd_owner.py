@@ -54,6 +54,12 @@ back-off; `main()` below is what turns that exception into `sys.exit(1)`
 for the real process entry point, while tests can assert on the exception
 directly.
 
+A pidfile path that exists and is not a regular file (FIFO, symlink,
+directory) is refused the same way (#3768): `OwnerPidfileNotRegular`, and
+`main()` returns `EXIT_PATH_NOT_REGULAR` (4), distinct from 1 and from
+`EXIT_DISPLACED` (3). A store path that is not a regular file is refused with
+the same code (`OwnerStorePathNotRegular`): retrying cannot fix a planted path.
+
 ## Socket path resolution -- replicated, not shared; the "never modify
 ## engramd_client.py" note below is U3's OWN historical scope bound, now
 ## superseded for the socket-path constant specifically (#3194)
@@ -226,9 +232,13 @@ timer or module constant in its place.
 from __future__ import annotations
 
 import errno
+import itertools
 import json
+import logging
 import os
 import platform
+import queue
+import re
 import shutil
 import signal
 import socket
@@ -242,13 +252,64 @@ import threading
 import time
 from pathlib import Path
 
+import engram_pidfile
+import engram_walguard
 import engramd_client as ec
+import engramd_read_registry as rr
+from engram_regular_io import NotRegularFile, describe_file_kind, write_pidfile
 
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_PID_NAME = "engramd.pid"
+# The pidfile name and the argv marker live in the client (#3707: the client
+# reads the pidfile on a Darwin refused connect() and never imports the owner);
+# aliased here so existing owner code and tests keep their names.
+DEFAULT_PID_NAME = ec.DEFAULT_PID_NAME
+_PIDFILE_PROGRAM_MARKER = ec.PIDFILE_PROGRAM_MARKER
+
+# #3240 item 2: exit status of an owner that shut down on a DISPLACED
+# substrate (its -wal/-shm fds no longer match the files on disk). Distinct
+# from 0 (healthy) and 1 (OwnerAlreadyRunning) so a supervisor can tell a
+# displaced exit from a clean one. main() ends the process with os._exit(
+# EXIT_DISPLACED) on this path -- see main() for why finalization is skipped.
+EXIT_DISPLACED = 3
+
+# #3768, #3753: exit status of an owner that REFUSED TO START because its pidfile path
+# or its store path exists and is not a regular file (FIFO, symlink, directory,
+# socket, device, ...). Retrying cannot fix a planted path, so the unit does not
+# restart it. For the pidfile it is its own code, not the surface daemon's
+# run-without-pidfile fallback: the owner's pidfile carries liveness, so an owner
+# without one reads as down while it holds the socket. main() returns it (nothing
+# was bound or left behind).
+EXIT_PATH_NOT_REGULAR = 4
+# #3753: exit status of an owner that refused to start because the store is BEHIND the
+# schema this code was written against (no knowledge.db, or PRAGMA user_version below
+# engram_core.LATEST_SCHEMA_VERSION). Distinct from 0/1/3/4 so a supervisor and the log can
+# tell it from "another owner holds the seat" (1), "displaced" (3) and "a pidfile or store
+# path is not a regular file" (4). Non-zero, so Restart=on-failure / launchd retry it: the usual cause is the
+# first migration not having run yet. It is 5, NOT 2: CPython itself exits 2 when it cannot
+# open the script it was asked to run (`python /nonexistent/x.py`, i.e. a deleted
+# ExecStart), so a unit's exit table would read that as "store behind schema". A refusal
+# code must not share a value with the interpreter's own failure codes (1 and 2); 1 stays
+# only as OwnerAlreadyRunning's historic code (main() returns the literal).
+EXIT_STORE_BEHIND_SCHEMA = 5
+
+# #3240 item 2: methods that never touch the store and so are exempt from the
+# displacement self-check. Every OTHER registered method is guarded by
+# default (a new store method that forgets the guard fails safe).
+NO_STORE_METHODS = frozenset({"ping"})
+
+# #3240 item 2: connections of a displaced owner are parked here for the life
+# of the process and never closed or cleared. Merely dropping the references
+# does NOT avoid a clean close in CPython: an unreferenced sqlite3.Connection
+# is closed by GC, and interpreter finalization closes the rest -- and the
+# last close of a stale holder checkpoints an orphan WAL over newer data
+# (see engram_walguard's docs for the harm). A displaced process is meant to
+# EXIT (main() -> os._exit(EXIT_DISPLACED)); calling start() again in the same
+# process after a displaced stop is unsupported -- the parked fds make a fresh
+# store at the same path read as displaced. Restart the process instead.
+_DISPLACED_CONNECTIONS_KEEPALIVE: list = []
 DEFAULT_STORE_NAME = "knowledge.db"
 
 # Response-size cap for INCOMING requests TO the owner (contract item 10).
@@ -260,7 +321,10 @@ DEFAULT_STORE_NAME = "knowledge.db"
 # peer. See the fairy handoff's design-choices section for this reasoning
 # stated plainly, since the fairy spec left the exact number to the
 # builder's judgment.
-MAX_REQUEST_BYTES = 1 * 1024 * 1024  # 1 MiB
+#
+# #3707 round 3: the value now lives in engramd_client (the client checks it
+# before connecting, so it is the single source); this is an alias.
+MAX_REQUEST_BYTES = ec.MAX_REQUEST_BYTES
 
 # Production default for the per-request end-to-end deadline (contract item
 # 8), measured from ACCEPT. Generous enough for a legitimately slow
@@ -362,12 +426,117 @@ SNAPSHOT_FINALIZE_SLOTS = 2
 # iterations, idle and loaded, and report the MAX.
 SNAPSHOT_RESPONSE_RESERVE = 0.25  # seconds
 
+# The part of `read`'s request deadline held back for DELIVERING its response
+# (U4d, #3197) -- the same reason as SNAPSHOT_RESPONSE_RESERVE above: the send
+# gate in _handle_connection() drops a response composed after the REQUEST
+# deadline, so a read that overruns must stop SOONER or its own
+# `deadline_exceeded` rejection never reaches the client (it would read as
+# Unavailable). Same value, deliberately NOT re-measured for `read`: the
+# rejection it must deliver is a ~200-byte wire dict, smaller than the snapshot
+# timeout shapes the 0.25 s was measured against (80x margin there), and the
+# abort point is one progress-handler tick (PROGRESS_HANDLER_INSTRUCTION_COUNT
+# VM instructions, microseconds), not a backup step. Read at CALL time so a
+# test can monkeypatch it.
+READ_RESPONSE_RESERVE = 0.25  # seconds
+
+# #3665: the typed `df` method (design seat ruling, crossing 9958). DF_TERMS_MAX
+# bounds one request: 1000 is the IDF hook's real batch size
+# (engram_idf.IDF_BATCH_TERMS on U6b, where a cell pins the equality), so a
+# full hook batch is exactly one request. DF_TERM_MAX_BYTES caps one term in
+# UTF-8 BYTES. Measured 2026-10-12: the longest term in a real vocab
+# (~/.engram/knowledge.db nodes_fts_vocab, 15536 terms) is 64 bytes (a sha256
+# hex token); engram_idf.tokenize (`[a-z]{2,}[a-z0-9_]*`) has NO upper bound on
+# token length, so the cap is a chosen bound: next power of two >= 2x the
+# measured max is 128, floored at 256.
+# DF_SQL is the ONE fixed statement `df` executes -- byte-identical to
+# engram_idf.IDF_BATCH_SQL, with the terms bound as a single JSON-list
+# parameter; no client text ever becomes SQL. DF_VOCAB_DDL_SQL reads the vocab
+# table's DDL so only the `row` fts5vocab variant is served. Both run on
+# `_client_read_conn` under its authorizer floor.
+DF_TERMS_MAX = 1000
+DF_TERM_MAX_BYTES = 256
+DF_SQL = "SELECT term, doc FROM nodes_fts_vocab WHERE term IN (SELECT value FROM json_each(?))"
+DF_VOCAB_DDL_SQL = "SELECT sql FROM sqlite_master WHERE name = 'nodes_fts_vocab'"
+# fts5vocab(<table>, <type>) with the identifier / type optionally quoted any of
+# the ways SQLite accepts; the type is captured and compared case-insensitively.
+_DF_VOCAB_VARIANT_RE = re.compile(
+    r"""USING\s+fts5vocab\s*\(\s*(?:"[^"]*"|'[^']*'|\[[^\]]*\]|`[^`]*`|[\w$]+)\s*,\s*["'\[`]?\s*(\w+)\s*["'\]`]?\s*\)""",
+    re.IGNORECASE,
+)
+# SQL comments are removed from the stored DDL before the pattern above runs, so
+# a commented-out `USING fts5vocab(..., row)` cannot be read as the module clause.
+# A comment marker inside a quoted identifier would truncate the DDL, which can
+# only fail CLOSED (no match -> unsupported_vocab_variant), never open.
+_DF_SQL_COMMENT_RE = re.compile(r"/\*.*?(?:\*/|\Z)|--[^\n]*", re.DOTALL)
+# The ONLY statements `_ClientReadGate.execute_typed` will prepare (#3665 F2).
+_TYPED_STATEMENTS = frozenset({DF_SQL, DF_VOCAB_DDL_SQL})
+
+# Owner-side bound on a client `read` RESULT, as serialised on the wire (U4d
+# round 2, S3). The client refuses any response over ec.MAX_RESPONSE_BYTES
+# (10 MiB) and reads that as Unavailable -- which tells the agent to restart a
+# healthy owner for what is a deterministic, never-going-to-succeed oversize.
+# So the owner refuses first, as `Rejected(result_too_large)`: 8 MiB, a fixed
+# 2 MiB below the client's cap, far more than the envelope (`{"status": "ok",
+# "result": ...}` + request_id + framing newline, a few hundred bytes) can add.
+# It is measured row by row on the exact JSON the send path emits (json.dumps
+# defaults), so the check also stops the work: at most this bound plus one row
+# is ever serialised, which keeps serialisation inside the request deadline
+# for any result the owner will actually send.
+MAX_READ_RESPONSE_BYTES = 8 * 1024 * 1024
+
+# #3740 Cut A: the typed `chain` method (design seat ruling, issue comment
+# 6133024506). It runs `engram_core.generalization_chain` ITSELF on the
+# client-read connection (no second implementation of the walk) and returns its
+# dict. CHAIN_NODE_ID_MAX_BYTES caps the start id in UTF-8 BYTES: real node ids
+# are a short prefix and a counter (a dozen bytes or so), and 256 is the same chosen
+# ceiling as DF_TERM_MAX_BYTES. CHAIN_MAX_DEPTH_CAP is the CLAMP ceiling for
+# `max_depth` and equals the default of generalization_chain's signature (a cell
+# pins the equality through `inspect`): the hook never asks for more, and a
+# larger request is served at the cap, not refused. CHAIN_RESULT_MAX_BYTES is the
+# bound `read` applies to its serialised reply, reused rather than invented
+# twice: `claim` is unbounded by design, so an oversized chain is refused by
+# NAME (`chain_result_too_large`), never truncated. Read at CALL time, so a test
+# can monkeypatch it. The cap is enforced AFTER the reply is built: peak memory for one
+# request is bounded by the store's size (the walk reads `claim` unbounded), not by this cap.
+CHAIN_NODE_ID_MAX_BYTES = 256
+CHAIN_MAX_DEPTH_CAP = 4
+CHAIN_RESULT_MAX_BYTES = MAX_READ_RESPONSE_BYTES
+
+# #3741: the typed `confidence_by_type` method. At most this many modes per request (the
+# four window modes of engram_stats); a longer list is REFUSED by name, never clamped
+# (docs/2652-security-slice-design.md section 3.6, typed-op input bounds).
+CBT_MAX_MODES = 4
+# The mode names (equal to engram_stats.STATS_MODES; a cell pins the equality). Held here so
+# validation, which runs before any runtime import, needs no import.
+CBT_MODES = ("all", "1-turn", "7-turn", "30-turn")
+
 # How often the LISTENING socket's accept() wakes up to check the shutdown
 # flag. Short enough that .stop() returns quickly in tests (this process's
 # accept loop has nothing else to do between wakeups, unlike
 # engram-surface-daemon.py's heavier 5.0s, which also runs an idle watchdog
 # and an indexer tick this module has neither of).
 ACCEPT_POLL_INTERVAL = 0.2  # seconds
+
+# Connection handler threads (#3678, U7). Starting a fresh thread for every accepted
+# connection cost ~0.066 ms of each owner round trip (the U7 stage profile). A finished
+# handler now waits for the next connection instead of exiting; the accept loop hands a
+# connection to an IDLE handler when one exists and starts a new one only when none is
+# idle. Capacity is never below spawn-per-connection: a connection is never queued
+# behind a busy handler, so clients that hold their connections (until the request
+# deadline drops them) cannot starve a fresh client of a handler. Idle handlers beyond
+# IDLE_WORKER_CAP exit after IDLE_WORKER_TIMEOUT seconds idle, so a burst leaves at most
+# the cap behind; stop() releases every idle handler.
+WORKER_THREAD_PREFIX = "engramd-worker"
+IDLE_WORKER_CAP = 4
+IDLE_WORKER_TIMEOUT = 60.0  # seconds
+
+# Accept backlog (#3680). listen(5) let a burst of ~6+ simultaneous hook processes
+# overflow the kernel's accept queue: the client's connect() failed at once with EAGAIN
+# although the owner was healthy. The kernel caps this at net.core.somaxconn (Linux) /
+# the platform limit, so SOMAXCONN is "as large as the platform allows", not a number
+# picked by hand. It is NOT the concurrency control (there is none, by design: see
+# above); it only absorbs a burst of clients starting together.
+OWNER_LISTEN_BACKLOG = socket.SOMAXCONN
 
 # Mode applied to both the socket's `run/` parent directory and the socket
 # file itself (#3194, design doc §2.1 + Borges's issue-#3194 ruling). The
@@ -390,6 +559,44 @@ SOCKET_FILE_MODE = 0o700
 PEERCRED_STRUCT_FORMAT = "@3i"
 PEERCRED_STRUCT_SIZE = struct.calcsize(PEERCRED_STRUCT_FORMAT)  # 12 on this fleet's Linux seats
 
+# ---------------------------------------------------------------------------
+# Darwin arm (#3666, design doc §2.1, §2.2, §2.5). Everything below is used
+# only when `_owner_arm() == "darwin"` (#3708: `platform.system()` is the one
+# discriminator at every site); the Linux arm above is unchanged.
+# ---------------------------------------------------------------------------
+
+# Darwin xucred{cr_version, cr_uid, cr_ngroups, cr_groups[16]} -- LOCAL_PEERCRED's
+# wire shape. NATIVE alignment ("@") and a literal 76 are both load-bearing:
+# calcsize("@IIh16I") is 76, calcsize("=IIh16I") is 74, and a length pinned to
+# calcsize() would agree with the wrong ("=") format (design doc §2.2).
+DARWIN_PEERCRED_STRUCT_FORMAT = "@IIh16I"
+DARWIN_PEERCRED_STRUCT_SIZE = 76
+# cr_version of the xucred layout this parser understands (XUCRED_VERSION).
+DARWIN_XUCRED_VERSION = 0
+# getsockopt() level for AF_LOCAL options. Python exports neither SOL_LOCAL nor
+# LOCAL_PEERPID, so this is a literal (measured: design doc P2). It is NOT
+# SOL_SOCKET: LOCAL_PEERCRED at SOL_SOCKET succeeds and returns 4 zero bytes.
+SOL_LOCAL = 0
+
+# The Darwin socket-path limit (103 usable bytes, measured) lives with the
+# shared #3696 contract: engramd_client.DARWIN_SOCKET_PATH_MAX_BYTES.
+
+# Prerequisites of the Darwin permission layer, as named module constants so a
+# test can point one at a missing path and exercise the real existence check.
+# `chmod` is called by ABSOLUTE path, never found through PATH: a gnubin-first
+# PATH would resolve to GNU chmod (which may lack -N). `/dev/fd/<n>` is how the
+# strip and the read-back address the already-open run/ fd.
+DARWIN_CHMOD = "/bin/chmod"
+DARWIN_DEV_FD = "/dev/fd"
+
+# Folders macOS TCC guards by default for an unprivileged process, relative to
+# the user's home. THIS IS A DOCUMENTED HEURISTIC PREFIX LIST, NOT A TCC QUERY:
+# asking TCC (or probing the folder) would itself raise a consent dialog nobody
+# can answer on a launchd-run owner. The list is the three folders; it does not
+# follow symlinks (resolving one would touch the protected folder) and is not
+# claimed complete.
+DARWIN_TCC_PROTECTED_HOME_FOLDERS = ("Documents", "Desktop", "Downloads")
+
 
 class OwnerAlreadyRunning(RuntimeError):
     """Raised by EngramdOwner.start() when a confirmably-live owner already
@@ -411,12 +618,15 @@ class OwnerPermissionUnsupported(RuntimeError):
     START -- never to skip the check", extended here to the ACL-strip
     requirement of §2.1 and to a missing socket.SO_PEERCRED). A permission
     check that silently no-ops where it cannot run is worse than none --
-    the deployment would believe it has one. This build only implements
-    the Linux arm (issue #3194 scope bounds; Darwin's LOCAL_PEERCRED /
-    `chmod -N` equivalents are out of scope), so a non-Linux seat, a
-    seat missing the `setfacl` binary, or a Python/OS build with no
-    SO_PEERCRED all refuse to start via this exception rather than
-    starting with a silently-unenforced permission layer."""
+    the deployment would believe it has one. This build implements the
+    Linux arm (#3194) and the Darwin arm (#3666: LOCAL_PEERCRED, `/bin/chmod
+    -N` on the run/ fd). A seat on any other platform, or one missing an
+    arm's prerequisite (Linux: `setfacl` or `getfacl` -- #3698: the strip is
+    read back -- or SO_PEERCRED; Darwin: LOCAL_PEERCRED, `/bin/chmod`,
+    `/dev/fd`), refuses to start via this exception rather than starting
+    with a silently-unenforced permission layer. So does a strip command
+    that exits non-zero (both arms) or, on Darwin, does not finish within
+    its timeout; what the READ-BACK finds is OwnerAclNotStripped."""
 
 
 class OwnerStalePathUnsafe(RuntimeError):
@@ -431,6 +641,237 @@ class OwnerStalePathUnsafe(RuntimeError):
     design doc names). A distinct exception from OwnerAlreadyRunning
     because the underlying condition is different: this is not "a live
     owner is already here", it's "something unsafe to touch is here"."""
+
+
+class OwnerPidfileNotRegular(RuntimeError):
+    """Raised by EngramdOwner.start() when the pidfile path
+    (<ENGRAM_HOME>/engramd.pid) exists and is not a regular file (#3768): a
+    FIFO (a write-open would wait for a reader forever), a symlink (a write
+    would follow it and truncate its target), a directory, or anything else.
+    Raised before the socket is bound when the path is already wrong, and
+    after cleaning up the socket and store connections when it turns wrong
+    between that check and the write. A distinct exception, with its own exit
+    code (EXIT_PATH_NOT_REGULAR), because the owner cannot fall back to
+    running without a pidfile: the pidfile carries its liveness, and an owner
+    without one reads as down while it holds the socket."""
+
+
+class OwnerSocketPathTooLong(RuntimeError):
+    """Raised by EngramdOwner.start() when the socket path
+    (<ENGRAM_HOME>/run/engramd.sock) is longer in BYTES than an AF_UNIX
+    address allows (#3696; the Darwin limit since #3666 -- both are
+    `engramd_client.SOCKET_PATH_MAX_BYTES`). Raised before any filesystem
+    mutation, so neither engram_home nor run/ is created. The message is
+    `engramd_client.socket_path_too_long_reason()`'s text, shared with the
+    client's Unavailable detail."""
+
+
+class OwnerHomeTccProtected(RuntimeError):
+    """Raised by EngramdOwner.start() on Darwin when $ENGRAM_HOME sits under a
+    folder macOS TCC guards by default (#3666, design doc §2.5). A launchd-run
+    owner there would block on a consent dialog nobody can answer, so it
+    refuses instead. A heuristic prefix list, not a TCC query -- see
+    DARWIN_TCC_PROTECTED_HOME_FOLDERS."""
+
+
+class OwnerPeerCredentialsMalformed(RuntimeError):
+    """Raised by the Darwin peer check when the kernel's LOCAL_PEERCRED answer is
+    not the xucred this parser understands (length other than exactly 76, or
+    cr_version other than 0). Fail closed: the worker drops the connection and
+    the client reads it as Unavailable. A SHORT buffer does not reach this
+    class: `struct.unpack_from` raises `struct.error` first, as on Linux."""
+
+
+class OwnerAclNotStripped(RuntimeError):
+    """Raised by EngramdOwner.start() when the run/ directory's ACL, read back
+    through the same fd the `setfacl -b` strip used, still carries an entry
+    beyond the base user::/group::/other:: triple (a named user or group, a
+    mask::, any default: line) -- or when that read-back itself cannot be
+    completed (getfacl failed, timed out or printed nothing parseable), because
+    an unverifiable strip is the silent-gap shape (#3698, design doc §2.2).
+    Darwin (#3666) raises it for the same three outcomes of its own read-back
+    (`acl_get_fd_np` through the strip's fd): any entry left after `chmod -N`,
+    a read-back that cannot complete, and a mode other than 0700.
+    Raised before the stale-socket check and the bind, so no socket exists.
+    `home/` and `run/` are left behind, owned by this uid, set to mode 0700
+    (unless the Darwin mode check is what refused) and carrying whatever
+    ACL the strip failed to remove; the next
+    start() re-hardens `run/` on every start, so nothing needs cleaning up."""
+
+
+class OwnerPythonTooOld(RuntimeError):
+    """Raised by EngramdOwner.start() when the running Python's sqlite3
+    lacks `Connection.setlimit` / `SQLITE_LIMIT_LENGTH` (#3349). The owner
+    bounds client-read result size with them; without them it must refuse
+    to start with this named reason, never run an unbounded read
+    connection."""
+
+
+class OwnerStoreBehindSchema(RuntimeError):
+    """Raised by EngramdOwner.start() when the store is behind the schema this
+    code expects (#3753): knowledge.db does not exist, cannot be read as a
+    SQLite file, or its `PRAGMA user_version` is below
+    `engram_core.LATEST_SCHEMA_VERSION`. (A store path that is not a regular
+    file is a different refusal, OwnerStorePathNotRegular.) Started anyway, the owner would
+    classify its read templates against the old schema, drop every one that
+    needs a newer table, and keep them dropped for its whole lifetime. The
+    message names the version found and the version required (or, when the
+    version cannot be read, whether the store is locked/busy, corrupt, or the
+    check's own import failed). Raised before anything is opened read-write
+    and before run/ exists, so a refusal creates no knowledge.db and no run/.
+    One qualification: a WAL-mode store (the real one) may gain
+    `knowledge.db-wal` / `knowledge.db-shm` sidecar files, because SQLite
+    creates them for any connection to a WAL database, `mode=ro` included
+    (measured: -wal 0 bytes, -shm a 32 KiB wal-index, the database file
+    unchanged)."""
+
+
+class OwnerStorePathNotRegular(RuntimeError):
+    """Raised when the store path (<ENGRAM_HOME>/knowledge.db) exists and is not
+    a regular file (#3753): a FIFO (a read-only open would wait for a writer
+    forever), a directory, a socket or a device. A symlink is followed, so one
+    to a regular file is fine and one to a FIFO is refused. A separate class
+    from OwnerStoreBehindSchema (not a subclass, so neither handler can shadow
+    the other): main() maps it to EXIT_PATH_NOT_REGULAR, which the unit does not
+    restart, because retrying cannot fix a planted path."""
+
+
+def _file_kind(mode: int) -> str:
+    for name, test in (("fifo", stat.S_ISFIFO), ("directory", stat.S_ISDIR),
+                       ("socket", stat.S_ISSOCK), ("character device", stat.S_ISCHR),
+                       ("block device", stat.S_ISBLK)):
+        if test(mode):
+            return name
+    return "other non-regular file"
+
+
+def _refuse_non_regular_store(store_path) -> None:
+    """Raise OwnerStorePathNotRegular if `store_path` exists and is not a regular file (#3753,
+    #3785). The ONE store-path predicate: `_connect_store_ro` (start) and
+    `check_start_refusals` (`--preflight`) both call it.
+
+    `os.stat` FOLLOWS symlinks and does not block on a FIFO: a symlink to a regular file is
+    accepted, a symlink to a FIFO is refused. A missing or unstattable path passes (it is not
+    a blocking object; the caller reports it). Pure: one stat, no mutation."""
+    try:
+        st = os.stat(Path(store_path).resolve())
+    except OSError:
+        return
+    if not stat.S_ISREG(st.st_mode):
+        raise OwnerStorePathNotRegular(
+            f"the store path {store_path} is not a regular file (it is a {_file_kind(st.st_mode)}); "
+            f"refusing to open it: a read-only open of a FIFO would block forever"
+        )
+
+
+def _connect_store_ro(store_path) -> "sqlite3.Connection":
+    """A `mode=ro` URI connection to the store: never creates the file, never
+    writes. The one place the owner opens the store read-only (the start-time
+    schema gate and the read-template classification both go through it).
+
+    Refuses (OwnerStorePathNotRegular, via `_refuse_non_regular_store`) anything that is
+    not a regular file BEFORE connecting: a read-only open (O_RDONLY) of a FIFO blocks
+    until a writer appears, so the check must not be left to sqlite (every earlier store
+    open here was read-write, which fails at once on a FIFO). A missing path is left to
+    the caller's own 'no knowledge.db' branch (sqlite then fails fast on it)."""
+    _refuse_non_regular_store(store_path)
+    return sqlite3.connect(Path(store_path).resolve().as_uri() + "?mode=ro", uri=True)
+
+
+def _require_store_schema_current(store_path) -> None:
+    """Refuse (OwnerStoreBehindSchema) unless `store_path` exists and its
+    `PRAGMA user_version` is >= `engram_core.LATEST_SCHEMA_VERSION` (#3753).
+
+    Reads the version on a `mode=ro` URI connection, never a read-write one,
+    so a missing file is not created as a side effect (a WAL-mode store may
+    still gain -wal/-shm sidecars (no row data) from the probe; `immutable=1` is NOT
+    used because a version bump still in the WAL would then read stale). `>=` passes: an older
+    owner on a newer store is the upgrade-restart case. The required version
+    is read from engram_core at CALL time (module attribute, not a copy), so
+    the migration code and this gate share one constant."""
+    # The one place start() pays for the engram_core import (_engram_core avoids it until
+    # the first typed op). A missing dependency must refuse cleanly, not traceback: it is
+    # reported as OwnerStoreBehindSchema, so main() gives it the same retryable exit code.
+    # A distinct class was judged not worth a second exit code for an install fault the
+    # supervisor's bounded retry handles the same way.
+    try:
+        import engram_core
+    except ImportError as exc:
+        raise OwnerStoreBehindSchema(
+            f"cannot check the store's schema version: import of engram_core failed "
+            f"({type(exc).__name__}: {exc}); the owner's runtime is incomplete"
+        ) from exc
+
+    required = engram_core.LATEST_SCHEMA_VERSION
+    try:
+        present = Path(store_path).exists()
+    except OSError as exc:
+        raise OwnerStoreBehindSchema(
+            f"cannot stat the store at {store_path} ({type(exc).__name__}: {exc}); "
+            f"requires schema version {required}"
+        ) from exc
+    if not present:
+        raise OwnerStoreBehindSchema(
+            f"no knowledge.db at {store_path}: the store has not been created or migrated yet "
+            f"(this owner requires schema version {required}); run the migration "
+            f"(any ENGRAM session start does) and the supervisor will retry"
+        )
+    conn = None
+    try:
+        conn = _connect_store_ro(store_path)
+        found = conn.execute("PRAGMA user_version").fetchone()[0]
+    except sqlite3.OperationalError as exc:
+        text = str(exc).lower()
+        if "locked" in text or "busy" in text:
+            # Retryable and NOT evidence the store is behind: a migration may hold the lock.
+            raise OwnerStoreBehindSchema(
+                f"the store at {store_path} is locked/busy ({exc}); a migration may be running, "
+                f"so its schema version could not be read; the supervisor will retry "
+                f"(this owner requires schema version {required})"
+            ) from exc
+        raise OwnerStoreBehindSchema(
+            f"cannot open the store at {store_path} to read its schema version "
+            f"({type(exc).__name__}: {exc}); this owner requires schema version {required}"
+        ) from exc
+    except sqlite3.Error as exc:
+        raise OwnerStoreBehindSchema(
+            f"the store at {store_path} is not a valid, intact SQLite database "
+            f"({type(exc).__name__}: {exc}); its schema version cannot be read "
+            f"(this owner requires schema version {required})"
+        ) from exc
+    finally:
+        if conn is not None:
+            conn.close()
+    if found < required:
+        raise OwnerStoreBehindSchema(
+            f"the store at {store_path} is at schema version {found}, but this owner requires "
+            f"{required}: it would classify its read templates against the old schema and drop "
+            f"those needing newer tables; migrate the store, then start the owner"
+        )
+
+
+def _require_sqlite_setlimit(conn_cls=None, module=None) -> None:
+    """Fail closed unless sqlite3 offers `Connection.setlimit` and
+    `SQLITE_LIMIT_LENGTH`.
+
+    #3349: both are "Added in version 3.11" (Python sqlite3 docs); on 3.10
+    the `setlimit` call in start() would raise AttributeError mid-start,
+    after files and connections were already opened. Checked by FEATURE,
+    not by sys.version_info. `conn_cls` / `module` are injection seams for
+    tests (a C type cannot be delattr'd); they default to the real
+    sqlite3 at call time.
+    """
+    if module is None:
+        module = sqlite3
+    if conn_cls is None:
+        conn_cls = module.Connection
+    if not hasattr(conn_cls, "setlimit") or not hasattr(module, "SQLITE_LIMIT_LENGTH"):
+        raise OwnerPythonTooOld(
+            "engramd owner requires Python 3.11+ (sqlite3.Connection.setlimit and "
+            "SQLITE_LIMIT_LENGTH, which bound client-read result size, were added "
+            f"in 3.11); running Python {sys.version.split()[0]}. Refusing to start "
+            "rather than serve reads without the size bound (#3349)."
+        )
 
 
 class _SnapshotDeadlineExceeded(Exception):
@@ -554,14 +995,22 @@ CLIENT_READ_ALWAYS_ALLOWED_ACTIONS = frozenset(
     }
 )
 
-# No real caller is wired to a pragma yet -- this build adds no client
-# dispatch path at all (see the module docstring's "Two connections"
-# section). `user_version` is kept as the one harmless read-only pragma
-# with an obvious future use (a census / health-check probe of the
-# store's schema version). Add more names here only once a real caller
-# needs them, through the same measurement discipline as the baseline
-# above -- this is a builder's-call design choice, not a measured set.
-CLIENT_READ_PRAGMA_ALLOWLIST = frozenset({"user_version"})
+# Read-form pragmas the client-read floor admits. `user_version` is the
+# harmless schema-version probe. `data_version` (#3665, U6b) was added as a
+# MEASURED widening: SQLite's fts5vocab virtual table runs
+# `PRAGMA data_version` internally on every scan, so the typed `df` method
+# (a document-frequency lookup over nodes_fts_vocab) cannot run on this
+# connection without it. Rulings: design seat (#3665 comment 6124428822) --
+# typed owner method `df`, and allow `data_version` in READ form only;
+# security seat (#3665 comment 6124451743) -- no hold; measured on Linux /
+# SQLite 3.45.1, `data_version` is the only new pragma and adds zero new
+# action codes. Residual, accepted: a coarse write-timing oracle -- an int
+# counter that changes when ANOTHER connection commits, carrying no store
+# content. Any further name needs the same measurement discipline as the
+# baseline above (measure what fires, record it, get the security seat's
+# read); it is not a free edit. The write form stays denied by the
+# `arg2 is not None` guard in `_client_read_authorizer`.
+CLIENT_READ_PRAGMA_ALLOWLIST = frozenset({"user_version", "data_version"})
 
 
 def _client_read_authorizer(action_code, arg1, arg2, db_name, trigger_or_view):
@@ -680,6 +1129,266 @@ def _arm_read_deadline(
     conn.set_progress_handler(_check, n)
 
 
+# ---------------------------------------------------------------------------
+# Read-template registry wiring (U4c, #3196). Resolved and loaded in start(),
+# BEFORE the socket is bound; the owner gains NO socket operation from it.
+# ---------------------------------------------------------------------------
+
+READ_TEMPLATES_FILENAME = "engramd_read_templates.json"
+
+
+def _find_read_templates_path() -> "Path | None":
+    """Locate the committed template list WITHOUT assuming the source
+    layout (project CLAUDE.md, "Plugin build restructures code paths"):
+    the file BESIDE this module first, then `$CLAUDE_PLUGIN_ROOT`, then the
+    nearest ancestor of this module that actually contains the file -- never
+    a fixed `parents[N]`. The data file ships beside the module in both the
+    source and the flattened plugin layouts, so a stale CLAUDE_PLUGIN_ROOT
+    must not override it. None if it cannot be found (the registry is then
+    EMPTY: everything refused)."""
+    sibling = Path(__file__).resolve().with_name(READ_TEMPLATES_FILENAME)
+    if sibling.is_file():
+        return sibling
+    root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if root:
+        cand = Path(root) / READ_TEMPLATES_FILENAME
+        if cand.is_file():
+            return cand
+    here = Path(__file__).resolve()
+    for d in here.parents:
+        cand = d / READ_TEMPLATES_FILENAME
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _read_install_tier(engram_home: Path) -> "str | None":
+    """`install_tier` from `<ENGRAM_HOME>/config.json`; None if absent or
+    unreadable (which `resolve_dynamic_flag` treats as not-dev)."""
+    try:
+        cfg = json.loads((engram_home / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    tier = cfg.get("install_tier") if isinstance(cfg, dict) else None
+    return tier if isinstance(tier, str) else None
+
+
+# ---------------------------------------------------------------------------
+# Serialize-once read replies (#3678, U7 cut 2). Each row is JSON-encoded ONCE;
+# the response-size bound is counted on those fragments and the reply is
+# assembled from the SAME fragments, so the bytes checked are the bytes sent.
+# `_assemble_read_ok` reproduces json.dumps's default separators (", " and
+# ": ") and ensure_ascii exactly: the wire output is byte-identical to
+# json.dumps({"status": "ok", "result": rows}).
+# ---------------------------------------------------------------------------
+
+_READ_OK_PREFIX = '{"status": "ok", "result": ['
+_READ_OK_SUFFIX = ']}'
+_READ_OK_EMPTY_LEN = len('{"status": "ok", "result": []}')
+
+
+def _assemble_read_ok(fragments: list) -> str:
+    return _READ_OK_PREFIX + ", ".join(fragments) + _READ_OK_SUFFIX
+
+
+class _RenderedReadOk(dict):
+    """The `ok` reply of `read`, as the dict callers have always seen, carrying
+    the exact wire text built from the size-checked fragments. `_handle_connection`
+    sends `wire_text` instead of serializing the dict again. Do not mutate the
+    dict after construction: `wire_text` is a copy and would not follow."""
+
+    def __init__(self, rows: list, wire_text: str) -> None:
+        super().__init__(status="ok", result=rows)
+        self.wire_text = wire_text
+
+
+def _render_read_rows(outcome) -> "tuple[dict, int]":
+    """-> (reply, counted bytes). `reply` is a `_RenderedReadOk`, or the same
+    rejection dict as before (unsupported cell type; over MAX_READ_RESPONSE_BYTES).
+    The count keeps the old per-row allowance (+2 per row for the separator)."""
+    rows, fragments = [], []
+    wire_bytes = _READ_OK_EMPTY_LEN
+    for row in outcome:
+        cells = list(row)
+        for cell in cells:
+            if cell is not None and type(cell) not in (int, float, str):
+                return {
+                    "status": "rejected",
+                    "reason": "unsupported_value_type",
+                    "detail": f"a result cell has type {type(cell).__name__}; only None/int/float/str are served",
+                    "remedy": "select a text/number projection of the column, or extend the read contract deliberately",
+                }, wire_bytes
+        fragment = json.dumps(cells)
+        wire_bytes += len(fragment) + 2
+        if wire_bytes > MAX_READ_RESPONSE_BYTES:
+            return {
+                "status": "rejected",
+                "reason": "result_too_large",
+                "detail": f"the result is over {MAX_READ_RESPONSE_BYTES} bytes serialised (stopped counting at {wire_bytes}); nothing was sent",
+                "remedy": "this is a property of the statement and the data, not an outage -- do NOT restart the owner; narrow the statement (LIMIT / fewer columns) or ask for a paged read",
+            }, wire_bytes
+        rows.append(cells)
+        fragments.append(fragment)
+    return _RenderedReadOk(rows, _assemble_read_ok(fragments)), wire_bytes
+
+
+def _df_rejection(reason: str, detail: str, remedy: str) -> dict:
+    return {"status": "rejected", "reason": reason, "detail": detail, "remedy": remedy}
+
+
+def _df_param_refusal(params) -> "dict | None":
+    """Validate a `df` request; None = valid, else the wire rejection. EACH
+    violation has its own named reason. Check order (the first violated wins):
+    shape, list, empty, too many, then per element in index order: not-str,
+    empty, too long (UTF-8 bytes). Touches no connection."""
+    if not isinstance(params, dict) or set(params) != {"terms"}:
+        return _df_rejection(
+            "df_params_shape",
+            "df params must be a dict with exactly the key 'terms'",
+            "send {'terms': [<str>, ...]} and no other key",
+        )
+    terms = params["terms"]
+    if not isinstance(terms, list):
+        return _df_rejection(
+            "df_terms_not_list", f"'terms' must be a list, got {type(terms).__name__}", "send 'terms' as a list of strings"
+        )
+    if not terms:
+        return _df_rejection("df_terms_empty", "'terms' is an empty list", "send at least one term")
+    if len(terms) > DF_TERMS_MAX:
+        return _df_rejection(
+            "df_terms_too_many",
+            f"'terms' has {len(terms)} entries; the maximum is {DF_TERMS_MAX}",
+            f"split the batch into requests of at most {DF_TERMS_MAX} terms",
+        )
+    for i, term in enumerate(terms):
+        if not isinstance(term, str):
+            return _df_rejection(
+                "df_term_not_str", f"terms[{i}] is {type(term).__name__}, not a string", "send every term as a string"
+            )
+        if term == "":
+            return _df_rejection("df_term_empty", f"terms[{i}] is the empty string", "drop empty terms before sending")
+        if len(term.encode("utf-8", "surrogatepass")) > DF_TERM_MAX_BYTES:
+            return _df_rejection(
+                "df_term_too_long",
+                f"terms[{i}] exceeds {DF_TERM_MAX_BYTES} UTF-8 bytes",
+                f"terms are capped at {DF_TERM_MAX_BYTES} bytes; drop or shorten the term",
+            )
+    return None
+
+
+def _chain_param_refusal(params) -> "dict | None":
+    """Validate a `chain` request; None = valid, else the wire rejection. EACH
+    violation has its own named reason. Check order (the first violated wins):
+    shape, node_id type, node_id empty, node_id too long (UTF-8 BYTES, counted
+    with surrogatepass so a lone surrogate is measured rather than raising),
+    node_id not encodable (a lone surrogate cannot be bound as a SQL parameter),
+    max_depth type (bool is not an int), max_depth negative. A `max_depth` above
+    CHAIN_MAX_DEPTH_CAP is NOT a violation: it is clamped by the handler.
+    Touches no connection; the node id is never echoed into a detail."""
+    if not isinstance(params, dict) or set(params) != {"node_id", "max_depth"}:
+        return _df_rejection(
+            "chain_params_shape",
+            "chain params must be a dict with exactly the keys 'node_id' and 'max_depth'",
+            "send {'node_id': <str>, 'max_depth': <int>} and no other key",
+        )
+    node_id, max_depth = params["node_id"], params["max_depth"]
+    if not isinstance(node_id, str):
+        return _df_rejection(
+            "chain_node_id_not_str", f"'node_id' must be a string, got {type(node_id).__name__}", "send 'node_id' as a string"
+        )
+    if node_id == "":
+        return _df_rejection("chain_node_id_empty", "'node_id' is the empty string", "send a node id")
+    if len(node_id.encode("utf-8", "surrogatepass")) > CHAIN_NODE_ID_MAX_BYTES:
+        return _df_rejection(
+            "chain_node_id_too_long",
+            f"'node_id' exceeds {CHAIN_NODE_ID_MAX_BYTES} UTF-8 bytes",
+            f"node ids are capped at {CHAIN_NODE_ID_MAX_BYTES} bytes; send the real id",
+        )
+    try:
+        node_id.encode("utf-8")
+    except UnicodeEncodeError:
+        return _df_rejection(
+            "chain_node_id_not_utf8",
+            "'node_id' contains a lone surrogate, which cannot be encoded as UTF-8",
+            "send a node id that is valid text",
+        )
+    if isinstance(max_depth, bool) or not isinstance(max_depth, int):
+        return _df_rejection(
+            "chain_max_depth_not_int", f"'max_depth' must be an integer, got {type(max_depth).__name__}", "send 'max_depth' as an int"
+        )
+    if max_depth < 0:
+        return _df_rejection("chain_max_depth_negative", "'max_depth' is negative", "send 0 or a positive depth")
+    return None
+
+
+def _cbt_param_refusal(params) -> "dict | None":
+    """Validate a `confidence_by_type` request; None = valid, else the wire rejection. EACH
+    violation has its own named reason; nothing the caller sent is echoed. Check order (the
+    first violated wins): shape (a dict with exactly the key 'modes'), modes not a list, modes
+    empty, modes longer than CBT_MAX_MODES (refused, never clamped: section 3.6); then ONE pass
+    over the elements in list order, each checked not-str -> unknown -> duplicate-of-an-earlier-
+    element (the element's type is checked BEFORE its membership test, so a list / dict element
+    cannot raise). Touches no connection."""
+    if not isinstance(params, dict) or set(params) != {"modes"}:
+        return _df_rejection(
+            "cbt_params_shape",
+            "confidence_by_type params must be a dict with exactly the key 'modes'",
+            "send {'modes': [<str>, ...]} and no other key",
+        )
+    modes = params["modes"]
+    if not isinstance(modes, list):
+        return _df_rejection(
+            "cbt_modes_not_list", f"'modes' must be a list, got {type(modes).__name__}", "send 'modes' as a list of strings"
+        )
+    if not modes:
+        return _df_rejection("cbt_modes_empty", "'modes' is empty", "send at least one mode")
+    if len(modes) > CBT_MAX_MODES:
+        return _df_rejection(
+            "cbt_modes_too_many",
+            f"'modes' has more than {CBT_MAX_MODES} entries",
+            f"send at most {CBT_MAX_MODES} modes; the request is refused, not shortened",
+        )
+    # CBT_MODES, not engram_stats.STATS_MODES: validation must not import the runtime.
+    seen: list = []
+    for i, mode in enumerate(modes):
+        if not isinstance(mode, str):
+            return _df_rejection(
+                "cbt_mode_not_str", f"modes[{i}] is {type(mode).__name__}, not a string", "send every mode as a string"
+            )
+        if mode not in CBT_MODES:
+            return _df_rejection(
+                "cbt_mode_unknown", f"modes[{i}] is not a known mode", f"known modes: {', '.join(CBT_MODES)}"
+            )
+        if mode in seen:
+            return _df_rejection("cbt_mode_duplicate", f"modes[{i}] repeats an earlier entry", "send each mode once")
+        seen.append(mode)
+    return None
+
+
+def _engram_core(home):
+    """Import `engram_core` LAZILY, on the first `chain` / `confidence_by_type` request. It is
+    large, and the owner's startup must not pay for it. Measured: importing it opens no
+    database, creates no file and starts no thread (its one process-level effect is
+    `os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "1")`); cells pin the first two. It resolves
+    from this module's own directory, where the plugin build puts it beside this file.
+
+    `home` is REQUIRED (#3741, Borges Q1): the owner's own ENGRAM home. engram_core resolves
+    its paths from the process env at import; the owner's home may differ from that, so every
+    call re-points the core at `home` with `engram_core._configure_paths(home)` -- module
+    globals only, no database opened, nothing created -- and core (`_get_current_turn` reads
+    CONFIG_PATH) and owner share one home by construction. (Re-pointing on every call, not
+    only the first, keeps a process that hosts a second owner on another home correct; it is
+    idempotent.) `home=None` is a TypeError: an optional home would silently read the
+    process-env home's config.json, re-opening the unconfigured path this requirement closes.
+    ImportError propagates to the handler, which names it."""
+    if home is None:
+        raise TypeError("_engram_core requires the owner's home (home=None would read the process-env home)")
+    import engram_core
+
+    engram_core._configure_paths(home)
+    return engram_core
+
+
 class _ClientReadGate:
     """Holds ONLY the client-read connection. Any future client-facing
     read operation (U4c's read-template registry, U4d's real client
@@ -692,15 +1401,128 @@ class _ClientReadGate:
     by this unit, is what checks the floor can't be bypassed by a
     registry bug)."""
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(
+        self, conn: sqlite3.Connection, registry: "rr.Registry | None" = None, *, home: "Path"
+    ) -> None:
         self._conn = conn
+        # #3741: the owner's home, handed to `_engram_core(home)` by the typed ops that run
+        # engram_core code. Required (keyword-only): a gate without a home is a TypeError.
+        self._home = home
+        # U4c (#3196): the read-template registry. None means the EMPTY
+        # registry -- a gate built without one refuses everything; it never
+        # defaults to permissive.
+        self._registry = registry if registry is not None else rr.EMPTY_REGISTRY
 
-    def execute(self, sql: str, params: tuple = (), *, deadline: float) -> list:
-        """Minimal execute-with-deadline path, exercised by this build's
-        own tests (12, 19, 22) standing in for the not-yet-built real
-        client dispatch. Not a public operation of this build -- no
-        `method` in `EngramdOwner._dispatch()` calls this; nothing wires
-        a real client to it yet."""
+    def execute(self, sql: str, params: tuple = (), *, deadline: float):
+        """Registry lookup FIRST (R1-R3, R8), then the existing deadline
+        path. A refused request is RETURNED as an `rr.Rejected` -- never
+        raised, and nothing is prepared on the connection (R2). An admitted
+        statement runs the deadline path unchanged; its authorizer and
+        resource bounds remain the second, independent layer (R9)."""
+        refusal = self._registry.check(sql, params)
+        if refusal is not None:
+            return refusal
+        try:
+            return self._execute_admitted(sql, params, deadline=deadline)
+        except sqlite3.OperationalError as exc:
+            # The split is by SQLite's own error code. SQLITE_ERROR (1) is a
+            # statement-level error from a bad parameter (e.g. malformed JSON
+            # into json_each(?)): the CLIENT's fault, so it is returned. The
+            # deadline abort (SQLITE_INTERRUPT, 9) and the resource-limit abort
+            # (sqlite3.DataError / SQLITE_TOOBIG, not an OperationalError) are
+            # the OWNER's controls and propagate to the dispatcher. No
+            # sqlite_errorcode (Python < 3.11): not convertible -- fail loud.
+            if getattr(exc, "sqlite_errorcode", None) != 1:
+                raise
+            logging.getLogger("engramd_owner").warning(
+                "admitted read failed at execution (template %s): %s: %s",
+                rr.template_key(sql), type(exc).__name__, exc)
+            return rr.Rejected(
+                reason="read_failed",
+                detail=f"{type(exc).__name__}: {exc}"[:200],
+                remedy="the statement was admitted but failed at execution; if the parameters "
+                "are valid this may be an owner-side fault (schema drift), see the owner log",
+            )
+
+    def execute_typed(self, sql: str, params: tuple = (), *, deadline: float) -> list:
+        """Entry point for a TYPED owner method's fixed statement (#3665 `df`):
+        skips the read-template registry and goes straight to
+        `_execute_admitted`. Sound because the registry exists to vet
+        CLIENT-SUPPLIED SQL text, and here none can exist: `sql` must be a
+        member of the module-level `_TYPED_STATEMENTS` (enforced here, not
+        merely documented -- any other string raises ValueError before anything
+        is prepared), parameters are bound, and the authorizer floor on this
+        connection (the second, independent layer) still applies to everything
+        that is prepared. Still holds only the client-read connection, so the
+        routing guarantee is unchanged. SQLite errors propagate to the caller's
+        `_read_failed` / deadline mapping."""
+        if sql not in _TYPED_STATEMENTS:
+            raise ValueError(f"execute_typed: not a typed statement: {sql[:60]}")
+        return self._execute_admitted(sql, params, deadline=deadline)
+
+    def run_chain(self, node_id: str, max_depth: int, *, deadline: float) -> dict:
+        """Entry point for the typed `chain` method (#3740): run
+        `engram_core.generalization_chain(<this connection>, node_id, max_depth)` with the
+        request deadline armed, and return its dict. It is NOT `execute_typed` and does NOT
+        touch `_TYPED_STATEMENTS`: the walk's statements are fixed code inside engram_core,
+        not text from the client, so there is no statement string for the gate to vet, and
+        the set stays exactly `df`'s two. What still holds: this gate has only the
+        client-read connection (routing), the permanent authorizer floor applies to every
+        statement the walk prepares (a denied one surfaces as a SQLite error), and the
+        progress handler stops the walk at `deadline`, exactly as `_execute_admitted` does.
+        The caller has already validated and clamped `node_id` / `max_depth`. SQLite errors
+        and ImportError propagate to the caller's mapping.
+
+        Why one deadline covers the whole walk: the progress handler's VM-step counter
+        accumulates across the walk's ~9 REUSED cached statements (the connection's statement
+        cache keeps them across the walk's hops), so the handler fires on the walk's total work,
+        not once per statement. A future change that builds per-call SQL text in engram_core
+        (new text per hop, a cache miss each time) would weaken that, and the deadline with it;
+        re-measure before making such a change.
+
+        What the deadline does NOT reach: the final `cycle_detected` DFS inside
+        `generalization_chain` issues zero SQL, so the progress handler cannot fire in it, by
+        construction. Its cost is O(V+E) of the reached subgraph (about 40k dict operations at
+        20k fan-in, sub-millisecond). A future change that moves work into that DFS would void
+        the deadline guarantee silently; re-measure before making one.
+
+        `engram_core.generalization_chain` itself refuses a negative or non-int depth (ValueError);
+        the owner op's own named refusal (`chain_max_depth_negative` / `chain_max_depth_not_int`)
+        runs first, so that error is never reached from a client request."""
+        core = _engram_core(self._home)
+        _arm_read_deadline(self._conn, deadline)
+        try:
+            return core.generalization_chain(self._conn, node_id, max_depth)
+        finally:
+            # same slate-clearing as _execute_admitted: no stale deadline for the next call
+            self._conn.set_progress_handler(None, 0)
+
+    def run_confidence_by_type(self, modes: list, *, deadline: float) -> dict:
+        """Entry point for the typed `confidence_by_type` method (#3741): the by_type confidence
+        distribution for each mode, computed by `engram_stats.confidence_by_type` (the SAME code
+        `engram_stats` runs, so the two are equal by construction) on THIS client-read connection
+        with the request deadline armed, plus the owner home's `current_turn`. Returns
+        `{"current_turn": int, "by_mode": {mode: {"by_type": ...}}}`.
+
+        Like `run_chain` it is NOT `execute_typed` and `_TYPED_STATEMENTS` is not widened: the
+        statements are fixed code in engram_stats, the client sends only mode NAMES (already
+        validated by `_cbt_param_refusal`), and the authorizer floor on this connection applies to
+        everything prepared. Read-only: no write, no tool_timing, no migration, no `_get_db`.
+        SQLite errors and ImportError propagate to the caller's mapping."""
+        core = _engram_core(self._home)
+        import engram_stats  # after _engram_core(home): the core must be pointed at the home first
+
+        _arm_read_deadline(self._conn, deadline)
+        try:
+            by_mode = engram_stats.confidence_by_type(self._conn, modes, engram_stats._now_utc())
+            return {"current_turn": int(core._get_current_turn()), "by_mode": by_mode}
+        finally:
+            self._conn.set_progress_handler(None, 0)
+
+    def _execute_admitted(self, sql: str, params: tuple, *, deadline: float) -> list:
+        """The deadline-armed execute path, reached only for a statement the
+        registry admitted. Reached from `EngramdOwner._handle_read()` (the
+        client-facing `read` method, U4d #3197) via `execute()`."""
         _arm_read_deadline(self._conn, deadline)
         try:
             return self._conn.execute(sql, params).fetchall()
@@ -711,6 +1533,229 @@ class _ClientReadGate:
             # than silently inheriting a deadline that has already
             # passed.
             self._conn.set_progress_handler(None, 0)
+
+
+def _darwin_unsupported_reason() -> str | None:
+    """The Darwin branch of `platform_unsupported_reason()` (#3666, design doc
+    §2.5): None only when all three prerequisites hold; otherwise a refusal
+    naming the FIRST missing one. Each is read from its own primitive (the
+    `socket` attribute, the two module path constants) so a test can remove
+    exactly one -- never by patching `platform.system` alone (#3375)."""
+    if not hasattr(socket, "LOCAL_PEERCRED"):
+        return (
+            "refusing to start: this Python/OS build has no "
+            "socket.LOCAL_PEERCRED -- the Darwin peer-credential check "
+            "(design doc §2.2) cannot run here, and starting without it "
+            "would be a silent permission-layer gap"
+        )
+    if not os.path.exists(DARWIN_CHMOD):
+        return (
+            f"refusing to start: {DARWIN_CHMOD} is required to strip "
+            f"inherited ACLs on the socket's run/ directory (`chmod -N`, "
+            f"design doc §2.1) and was not found; it is called by absolute "
+            f"path, never through PATH"
+        )
+    if not os.path.isdir(DARWIN_DEV_FD):
+        return (
+            f"refusing to start: {DARWIN_DEV_FD} is not a directory -- the "
+            f"run/ strip and its ACL read-back address the open directory fd "
+            f"as {DARWIN_DEV_FD}/<fd> (design doc §2.5)"
+        )
+    return None
+
+
+def _darwin_acl_entries_via_fd(fd: int) -> list[str]:
+    """The ACL entries on the object behind `fd`, read THROUGH that fd with
+    libc's `acl_get_fd_np` (#3666, design doc §2.5's open read-back item).
+    Returns one text line per entry; `[]` means no ACL.
+
+    Measured on macOS 26.6.2: with no ACL, `acl_get_fd_np` returns NULL with
+    errno ENOENT (that is the documented "no ACL", not a failure); with an
+    entry it returns the acl_t, whose `acl_to_text` lists it. (`ls -led
+    /dev/fd/<fd>` was tried first and shows NO entry for a directory that
+    carries one, so it cannot serve as the read-back.) Any other failure, or a
+    libc without these symbols, raises OwnerAclNotStripped: an ACL we
+    could not read is not an ACL we may call absent."""
+    import ctypes  # lazy: Darwin-only, keeps the Linux import path untouched
+
+    try:
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        get_fd = libc.acl_get_fd_np
+        get_fd.restype = ctypes.c_void_p
+        get_fd.argtypes = [ctypes.c_int, ctypes.c_int]
+        to_text = libc.acl_to_text
+        to_text.restype = ctypes.c_void_p
+        to_text.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ssize_t)]
+        free = libc.acl_free
+        free.argtypes = [ctypes.c_void_p]
+        free.restype = ctypes.c_int
+    except (OSError, AttributeError) as exc:
+        raise OwnerAclNotStripped(
+            f"refusing to start: cannot read back the ACL on run/ (libc "
+            f"acl_get_fd_np unavailable: {exc}); an unverified strip is not "
+            f"accepted"
+        ) from exc
+
+    ACL_TYPE_EXTENDED = 0x00000100  # <sys/acl.h>
+    ctypes.set_errno(0)
+    acl = get_fd(fd, ACL_TYPE_EXTENDED)
+    if not acl:
+        err = ctypes.get_errno()
+        if err == errno.ENOENT:
+            return []
+        raise OwnerAclNotStripped(
+            f"refusing to start: ACL read-back on run/ failed "
+            f"(acl_get_fd_np errno {err}: {os.strerror(err)}); an unverified "
+            f"strip is not accepted"
+        )
+    try:
+        length = ctypes.c_ssize_t()
+        text_ptr = to_text(acl, ctypes.byref(length))
+        if not text_ptr:
+            err = ctypes.get_errno()
+            raise OwnerAclNotStripped(
+                f"refusing to start: ACL read-back on run/ found an ACL it "
+                f"could not render (acl_to_text errno {err}: "
+                f"{os.strerror(err)}); an unverified strip is not accepted"
+            )
+        try:
+            text = ctypes.string_at(text_ptr).decode("utf-8", "replace")
+        finally:
+            free(text_ptr)
+    finally:
+        free(acl)
+    # "!#acl 1" header, then one "kind:guid:name:id:allow|deny:perms" per entry.
+    return [ln for ln in text.splitlines() if ln and not ln.startswith("!#acl")]
+
+
+def _owner_arm() -> str | None:
+    """Which permission arm this seat runs (#3708): "linux", "darwin", or None
+    for any other platform. The decision now lives in the client, as
+    `ec.platform_arm()` (#3712), keyed on `platform.system()` ALONE: the client
+    also needs the platform (its socket-path limit) and must never import the
+    owner, so the one source sits on the side of the import direction both can
+    reach. This stays a name here because the platform gate, the TCC check,
+    `_harden_run_dir` and the peer check all ask it, and tests patch it. The
+    `hasattr(socket, ...)` prerequisite checks do not choose an arm; they ask
+    whether the chosen arm's tool exists."""
+    return ec.platform_arm()
+
+
+def platform_unsupported_reason() -> str | None:
+    """Why this seat cannot run the owner, or None when it can (#3194, #3292).
+
+    Linux: four checks, in this order, first failure wins: (1) not Linux,
+    (2) no `setfacl` on PATH, (3) no `getfacl` on PATH (the strip's
+    read-back, #3698), (4) no `socket.SO_PEERCRED`.
+    Darwin (#3666): `_darwin_unsupported_reason()` -- `socket.LOCAL_PEERCRED`,
+    `/bin/chmod` and `/dev/fd`, each named when missing. Any other platform
+    refuses.
+    `EngramdOwner._check_platform_support()` raises `OwnerPermissionUnsupported`
+    with the returned string, and the test suite's `requires_linux_owner`
+    marker skips on `is not None`, so the refusal and the skip share this one
+    definition."""
+    arm = _owner_arm()
+    if arm == "darwin":
+        return _darwin_unsupported_reason()
+    if arm != "linux":
+        return (
+            f"refusing to start: the socket permission layer (ACL "
+            f"strip on run/, SO_PEERCRED peer check) is only "
+            f"implemented for Linux and Darwin in this build; this seat "
+            f"reports platform.system() == {platform.system()!r}"
+        )
+    if shutil.which("setfacl") is None:
+        return (
+            "refusing to start: `setfacl` is required to strip "
+            "inherited ACLs on the socket's run/ directory (design "
+            "doc §2.1) and was not found on PATH"
+        )
+    if shutil.which("getfacl") is None:
+        return (
+            "refusing to start: `getfacl` is required to read back the "
+            "ACL strip on the socket's run/ directory (design doc §2.2: "
+            "an unverified strip is a silent gap) and was not found on PATH"
+        )
+    if not hasattr(socket, "SO_PEERCRED"):
+        return (
+            "refusing to start: this Python/OS build has no "
+            "socket.SO_PEERCRED -- the peer-credential check (design "
+            "doc §2.2) cannot run here, and starting without it would "
+            "be a silent permission-layer gap"
+        )
+    return None
+
+
+_ACL_LEFTOVER_LIST_MAX = 10
+_ACL_BASE_RE = re.compile(r"^(user|group|other)::\S*(\s+#.*)?$")
+
+
+def _read_acl_entries(fd: int, run_dir=None) -> list[str]:
+    """The ACL entries of the directory open as `fd`, one string per line,
+    blank and `#` comment lines dropped (#3698). Reads through
+    /proc/self/fd/<fd> -- the SAME fd the strip used -- never a path, so a
+    swap of run/ between strip and read-back cannot report a clean ACL for a
+    different directory. A getfacl failure (non-zero exit, timeout, missing
+    binary) or output with no entry at all raises OwnerAclNotStripped with its
+    own reason: an unverifiable strip refuses. stderr is NOT a failure signal
+    (getfacl always warns about the leading '/')."""
+    where = str(run_dir) if run_dir is not None else f"/proc/self/fd/{fd}"
+    try:
+        proc = subprocess.run(
+            ["getfacl", "-c", "-n", f"/proc/self/fd/{fd}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            pass_fds=[fd],
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise OwnerAclNotStripped(
+            f"refusing to start: `getfacl` on {where} timed out after "
+            f"{exc.timeout}s -- the ACL strip could not be verified"
+        ) from exc
+    except OSError as exc:
+        raise OwnerAclNotStripped(
+            f"refusing to start: `getfacl` could not be run on {where} "
+            f"({exc}) -- the ACL strip could not be verified"
+        ) from exc
+    if proc.returncode != 0:
+        raise OwnerAclNotStripped(
+            f"refusing to start: `getfacl` on {where} failed (exit "
+            f"{proc.returncode}): {proc.stderr.strip()} -- the ACL strip "
+            f"could not be verified"
+        )
+    entries = [
+        ln.strip()
+        for ln in proc.stdout.splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+    if not entries:
+        raise OwnerAclNotStripped(
+            f"refusing to start: `getfacl` on {where} printed no ACL entries "
+            f"(unparseable output) -- the ACL strip could not be verified"
+        )
+    return entries
+
+
+def _acl_leftovers(entries: list[str]) -> list[str]:
+    """The entries that make a stripped ACL NOT clean (#3698): everything but
+    exactly one each of user::, group::, other:: (any permission bits). A
+    named entry, mask::, any default: line or an unrecognised line is listed
+    verbatim; a missing or duplicated base entry is listed as a note."""
+    leftovers: list[str] = []
+    seen: dict[str, int] = {"user": 0, "group": 0, "other": 0}
+    for ln in entries:
+        m = _ACL_BASE_RE.match(ln)
+        if m is None:
+            leftovers.append(ln)
+        else:
+            seen[m.group(1)] += 1
+            if seen[m.group(1)] > 1:
+                leftovers.append(ln)
+    for kind, n in seen.items():
+        if n == 0:
+            leftovers.append(f"<missing base entry {kind}::>")
+    return leftovers
 
 
 class EngramdOwner:
@@ -735,13 +1780,16 @@ class EngramdOwner:
         max_request_bytes: int = MAX_REQUEST_BYTES,
         accept_poll_interval: float = ACCEPT_POLL_INTERVAL,
         contract_version: str = ec.CONTRACT_VERSION,
+        idle_worker_cap: int = IDLE_WORKER_CAP,
+        idle_worker_timeout: float = IDLE_WORKER_TIMEOUT,
+        listen_backlog: int = OWNER_LISTEN_BACKLOG,
     ) -> None:
         self.engram_home = _resolve_engram_home(engram_home)
         # The socket's parent directory (self.socket_path.parent) is the
         # `run/` directory this unit hardens -- see start()'s directory
         # setup below (#3194).
-        self.socket_path = self.engram_home / ec.SOCKET_DIR_NAME / ec.DEFAULT_SOCKET_NAME
-        self.pid_path = self.engram_home / DEFAULT_PID_NAME
+        self.socket_path = ec.socket_path_for_home(self.engram_home)
+        self.pid_path = ec.pid_path_for_home(self.engram_home)
         self.store_path = self.engram_home / DEFAULT_STORE_NAME
         self.request_deadline = request_deadline
         # snapshot()'s own, larger, named budget (#3194 round 2) -- a plain
@@ -755,6 +1803,17 @@ class EngramdOwner:
         self.max_request_bytes = max_request_bytes
         self.accept_poll_interval = accept_poll_interval
         self.contract_version = contract_version
+        self.idle_worker_cap = idle_worker_cap
+        self.idle_worker_timeout = idle_worker_timeout
+        # A plain attribute so a test can use a tiny backlog to hit "backlog full" (#3680).
+        self.listen_backlog = listen_backlog
+        # Handler hand-off (#3678): `_idle` counts handlers waiting on `_jobs`. Both are
+        # changed only under `_handoff_lock`, so a handler retiring on its idle timeout and
+        # the accept loop handing it a connection cannot strand that connection.
+        self._handoff_lock = threading.Lock()
+        self._idle = 0
+        self._jobs: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._worker_seq = itertools.count(1)
 
         self._server: socket.socket | None = None
         # Owner-internal connection (was `_store_conn` in U3) -- serves
@@ -777,6 +1836,13 @@ class EngramdOwner:
         # _cleanup() and _handle_snapshot() below; folds #3152 item 1 for
         # both).
         self._owner_lock = threading.Lock()
+        # Serialises `read` on the ONE shared `_client_read_conn` (U4d). The
+        # gate arms a per-call progress_handler on that connection and clears
+        # it in a `finally`; two request threads interleaving would clear each
+        # other's deadline mid-statement. Deliberately separate from
+        # `_owner_lock`: a long snapshot holds that one, and a read must not
+        # queue behind it (nor may a read ever take the owner-internal path).
+        self._client_read_lock = threading.Lock()
         self._shutdown = threading.Event()
         self._bound_socket = False
         self._accept_thread: threading.Thread | None = None
@@ -786,6 +1852,26 @@ class EngramdOwner:
         # is per-call). See SNAPSHOT_FINALIZE_SLOTS's own comment and
         # _handle_snapshot()'s docstring for the full protocol.
         self._finalize_slots = threading.BoundedSemaphore(SNAPSHOT_FINALIZE_SLOTS)
+        # #3240 item 2: set once engram_walguard.assert_not_displaced has
+        # confirmed this owner's -wal/-shm fds are displaced. From then on
+        # _cleanup() must NOT .close() either connection (a clean close of
+        # a stale holder checkpoints an orphan WAL over data other
+        # connections have since written -- see engram_walguard's docs).
+        self._displaced = False
+        # Method table: every KNOWN method. _dispatch() guards each one not
+        # in NO_STORE_METHODS, so registering a method here is all a new
+        # store-touching operation needs to be displacement-guarded.
+        # Entries late-bind through `self` (lambda) rather than capturing
+        # bound methods, so a replaced `self._handle_snapshot` (tests do
+        # this) is still what gets called.
+        self._methods = {
+            "ping": lambda params, deadline: self._handle_ping(params, deadline),
+            "snapshot": lambda params, deadline: self._handle_snapshot(params, deadline),
+            "read": lambda params, deadline: self._handle_read(params, deadline),
+            "df": lambda params, deadline: self._handle_df(params, deadline),
+            "chain": lambda params, deadline: self._handle_chain(params, deadline),
+            "confidence_by_type": lambda params, deadline: self._handle_confidence_by_type(params, deadline),
+        }
 
     # -- lifecycle ------------------------------------------------------
 
@@ -801,6 +1887,30 @@ class EngramdOwner:
         support the socket permission layer (#3194). Raises
         OwnerStalePathUnsafe if something other than a plain, ownerless
         socket sits at the socket path (#3194, design doc §2.4).
+        Raises OwnerPythonTooOld if the running Python's sqlite3 lacks
+        `Connection.setlimit` (Python < 3.11) -- before anything is created
+        (#3349). Raises OwnerSocketPathTooLong if the socket path exceeds
+        the AF_UNIX byte limit -- before engram_home or run/ is created
+        (#3696; per-platform limit since #3666). Raises OwnerAclNotStripped
+        if the run/ ACL read back through the strip's fd still carries any
+        entry beyond the base triple, or cannot be read back (#3698; on
+        Darwin also if run/ is not mode 0700 after the strip, #3666) --
+        before the stale-socket check and the bind. On Darwin, raises
+        OwnerHomeTccProtected if engram_home is under ~/Documents,
+        ~/Desktop or ~/Downloads -- before anything under it is read or
+        created (#3666).
+        Raises OwnerPidfileNotRegular if the pidfile path exists and is
+        not a regular file (#3768) -- before the stale-socket check and the
+        bind in the common case; a path that turns non-regular between that
+        check and the pidfile write is refused there, after cleaning up.
+        Raises OwnerStoreBehindSchema if knowledge.db does
+        not exist, cannot be read, or has `PRAGMA user_version` below
+        `engram_core.LATEST_SCHEMA_VERSION` (#3753) -- before anything is
+        created or opened read-write, so the refusal creates no knowledge.db
+        and no run/. Raises OwnerStorePathNotRegular if the store path is not
+        a regular file (FIFO, directory, socket), checked before any open, since
+        a read-only open of a FIFO would block (a WAL-mode store may gain -wal/-shm sidecars (no row data) from
+        the read-only probe).
 
         `install_signal_handlers=False` (tests only -- see
         tests/test_engramd_owner.py's owner_running fixture) skips
@@ -811,7 +1921,32 @@ class EngramdOwner:
         (_handle_signal) just calls .stop(), the same method tests call
         directly.
         """
-        self._check_platform_support()
+        # The refusals that precede any filesystem mutation (platform support,
+        # socket-path length, Darwin TCC home, a non-regular pidfile), in one
+        # place so `--preflight` runs exactly these and cannot drift from them
+        # (#3709).
+        self.check_start_refusals()
+
+        # #3349: refuse on a Python without sqlite3 setlimit (< 3.11)
+        # before ANY file, connection, socket or thread exists.
+        _require_sqlite_setlimit()
+
+        # R4 (#3196): the dynamic-template escape hatch is resolved FIRST,
+        # before any file, connection or socket is touched -- a flag set on
+        # a non-dev install raises DynamicTemplatesRefused with nothing
+        # to clean up.
+        dynamic_templates = rr.resolve_dynamic_flag(
+            os.environ, _read_install_tier(self.engram_home)
+        )
+
+        # #3753: refuse a store that is behind this code's schema (or absent) BEFORE the
+        # first filesystem mutation (the mkdir below) and so before any connect() to it:
+        # a read-only probe, so a refusal creates no knowledge.db and no run/ (a WAL-mode
+        # store may gain -wal/-shm sidecars (no row data): SQLite makes them even for mode=ro).
+        # It sits after every pure refusal above (platform, path length, TCC, setlimit,
+        # dynamic flag), which touch nothing, and ahead of the live-owner check below:
+        # a second launch against a behind store is told about the store, not the seat.
+        _require_store_schema_current(self.store_path)
 
         self.engram_home.mkdir(parents=True, exist_ok=True)
 
@@ -850,6 +1985,9 @@ class EngramdOwner:
         # contract requires the store to pre-exist, and a real seat's
         # bootstrap already creates knowledge.db before any daemon
         # starts.
+        # Fresh connections, fresh verdict: a previous run's displacement
+        # says nothing about the connections opened here.
+        self._displaced = False
         self._owner_conn = sqlite3.connect(str(self.store_path), check_same_thread=False)
         # Permissive by DESIGN, not authorizer-less -- see the module
         # docstring's "Two connections" section and
@@ -868,7 +2006,13 @@ class EngramdOwner:
         # The structurally-isolated object a future client-facing read
         # would call through (test 22) -- holds ONLY the connection just
         # opened above, never `_owner_conn`.
-        self._client_read_gate = _ClientReadGate(self._client_read_conn)
+        # U4c (#3196): the read-template registry, loaded and RE-CLASSIFIED
+        # against the live store's schema (R12) BEFORE the socket binds.
+        # Any load problem yields an EMPTY registry (everything refused),
+        # never a permissive one.
+        self._client_read_gate = _ClientReadGate(
+            self._client_read_conn, self._load_read_registry(dynamic_templates), home=self.engram_home
+        )
 
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._bind_socket_or_raise()
@@ -883,10 +2027,10 @@ class EngramdOwner:
         # a plain bind() leaves the socket at 0755). Defense-in-depth --
         # the `run/` directory above is the primary gate.
         os.chmod(str(self.socket_path), SOCKET_FILE_MODE)
-        self._server.listen(5)
+        self._server.listen(self.listen_backlog)  # OWNER_LISTEN_BACKLOG (#3680)
         self._server.settimeout(self.accept_poll_interval)
 
-        self.pid_path.write_text(str(os.getpid()))
+        self._write_pidfile()
 
         if install_signal_handlers:
             signal.signal(signal.SIGTERM, self._handle_signal)
@@ -896,37 +2040,169 @@ class EngramdOwner:
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._accept_thread.start()
 
+    @staticmethod
+    def _kind_of_mode(mode: int) -> str:
+        return describe_file_kind(mode)
+
+    def _pidfile_refusal_text(self, mode: int | None, nlink: int | None = None) -> str:
+        if mode is not None and stat.S_ISREG(mode) and nlink is not None and nlink != 1:
+            what = f"has {nlink} hard links, not a single regular file"
+        else:
+            kind = self._kind_of_mode(mode) if mode is not None else "non-regular file"
+            what = f"is a {kind}, not a regular file"
+        return (
+            f"refusing to start: the pidfile path {self.pid_path} {what}; "
+            f"nothing was bound. Remove it and start again"
+        )
+
+    def _write_pidfile(self) -> None:
+        """Write this process's pid to the pidfile (#3768). The write
+        sequence (O_NOFOLLOW, O_NONBLOCK, no O_TRUNC, fstat regular-and-
+        single-link, only then ftruncate) is the shared
+        `engram_regular_io.write_pidfile` (#3773), also used by the collab
+        tools; this write path REFUSES symlinks on purpose, unlike the
+        read-side liveness check in `engram_pidfile.recorded_live_pid`.
+
+        A refusal (`NotRegularFile`) becomes OwnerPidfileNotRegular after
+        releasing what start() already acquired (the socket and both store
+        connections; the accept thread does not exist yet). Any other
+        OSError propagates unchanged."""
+        try:
+            write_pidfile(self.pid_path, str(os.getpid()).encode("ascii"))
+        except NotRegularFile as exc:
+            self._cleanup()
+            raise OwnerPidfileNotRegular(self._pidfile_refusal_text(exc.st_mode, exc.nlink)) from exc
+
+    def _load_read_registry(self, dynamic: bool) -> "rr.Registry":
+        """Load the committed template list, classifying each template
+        against a DEDICATED short-lived read-only connection to the live
+        store (the audit installs an authorizer, so it must never run on
+        `_owner_conn` or `_client_read_conn`)."""
+        # An unfindable file is handed to the loader as a nonexistent path:
+        # it logs once and returns the EMPTY registry (R12).
+        path = _find_read_templates_path() or (self.engram_home / (READ_TEMPLATES_FILENAME + ".not-found"))
+        schema_conn = None
+        loaded = False
+        try:
+            schema_conn = _connect_store_ro(self.store_path)
+            registry = rr.load_registry(path, schema_conn, dynamic=dynamic)
+            loaded = True
+            return registry
+        except Exception as exc:  # fail closed: an unloadable registry is an empty one
+            logging.getLogger("engramd_owner").warning(
+                "read-template registry load failed (%s: %s); registry is EMPTY",
+                type(exc).__name__, exc)
+            return rr.EMPTY_REGISTRY
+        finally:
+            if schema_conn is not None and (not dynamic or not loaded):
+                schema_conn.close()
+
+    def check_start_refusals(self) -> None:
+        """The refusals `start()` makes before it reads or creates anything,
+        in `start()`'s order; raises the same exceptions `start()` raises.
+        Pure: no mutation, and the only filesystem accesses are the one `lstat`
+        of the pidfile in check 4 and the one `stat` of the store in check 5
+        (each check below is documented pure).
+        `main()`'s `--preflight` calls exactly this, so the
+        installer's up-front check (#3709) is the owner's own logic and a
+        refusal that would respawn under a supervisor is caught before
+        anything is registered.
+
+        1. `_check_platform_support()`.
+        2. #3696: an over-long socket path is refused by name BEFORE the first
+           filesystem mutation, so a refusal leaves nothing behind. Byte
+           length, shared reason text with the client; the limit is
+           per-platform (Darwin's 103 since #3666).
+        3. #3666 (Darwin only, no-op elsewhere): pure -- no filesystem access --
+           and so also before the first read under engram_home and the first
+           mutation (mkdir).
+        4. #3768: the pidfile path, when it exists, must be a regular file with
+           one link: a FIFO, symlink, directory or multiply-hard-linked file is
+           refused by name (`OwnerPidfileNotRegular`, exit 4 from `main()`)
+           before anything is bound. Here, and not only in `start()`, because
+           launchd has no per-exit-code retry exclusion: the installer's
+           `--preflight` must refuse what would otherwise respawn every
+           throttle interval forever (#3709). One `lstat`, which does not
+           follow, so a symlink counts; a missing path (or home) is the normal
+           fresh start and passes, which is what makes this safe before mkdir.
+           The race between this check and the write is closed in
+           `_write_pidfile`, which keeps its own checks.
+        5. #3785: the store path (<ENGRAM_HOME>/knowledge.db), when it exists,
+           must be a regular file: a FIFO, directory, socket or device is
+           refused by name (`OwnerStorePathNotRegular`, exit 4 from `main()`),
+           for the same no-per-exit-code-retry reason as check 4. Runs even
+           when the pidfile is absent. One `stat` (follows symlinks, does not
+           block on a FIFO) through `_refuse_non_regular_store`, the very
+           helper `_connect_store_ro` uses; a missing store or home passes.
+
+        The installer runs `--preflight` with the INSTALLER'S environment, not
+        launchd's (#3780). That is safe today because every Darwin-arm
+        predicate here is stdlib or uses an absolute path. A future
+        PATH-dependent predicate would diverge silently: the preflight would
+        pass while the launchd-run owner refused with exit 1 every 60 s
+        (ThrottleInterval). So the predicates in this method must stay
+        independent of the environment."""
+        self._check_platform_support()
+        too_long = ec.socket_path_too_long_reason(self.socket_path)
+        if too_long is not None:
+            raise OwnerSocketPathTooLong(too_long)
+        self._check_darwin_home_not_tcc_protected()
+        try:
+            pid_stat = os.lstat(self.pid_path)
+        except FileNotFoundError:
+            pid_stat = None  # fresh start: fall through to check 5, do not return
+        # A hard-linked regular file is refused too: writing it would rewrite
+        # another name's content.
+        if pid_stat is not None and (not stat.S_ISREG(pid_stat.st_mode) or pid_stat.st_nlink > 1):
+            raise OwnerPidfileNotRegular(
+                self._pidfile_refusal_text(pid_stat.st_mode, pid_stat.st_nlink))
+        _refuse_non_regular_store(self.store_path)
+
     def _check_platform_support(self) -> None:
         """Refuse to start rather than silently degrade the permission
         layer on a platform/toolchain this build cannot secure (#3194,
         design doc §2.2's posture -- "the fallback on an unrecognised
         platform is to REFUSE TO START, never to skip the check" --
         extended here to the ACL-strip requirement of §2.1). This build
-        only implements the Linux arm (issue #3194 scope bounds; Darwin's
-        LOCAL_PEERCRED / `chmod -N` equivalents are explicitly out of
-        scope), so a non-Linux seat, a seat missing `setfacl`, or a
-        Python/OS build with no socket.SO_PEERCRED all refuse here rather
-        than starting with a silently-unenforced permission layer."""
-        if platform.system() != "Linux":
-            raise OwnerPermissionUnsupported(
-                f"refusing to start: the socket permission layer (ACL "
-                f"strip on run/, SO_PEERCRED peer check) is only "
-                f"implemented for Linux in this build; this seat reports "
-                f"platform.system() == {platform.system()!r}"
-            )
-        if shutil.which("setfacl") is None:
-            raise OwnerPermissionUnsupported(
-                "refusing to start: `setfacl` is required to strip "
-                "inherited ACLs on the socket's run/ directory (design "
-                "doc §2.1) and was not found on PATH"
-            )
-        if not hasattr(socket, "SO_PEERCRED"):
-            raise OwnerPermissionUnsupported(
-                "refusing to start: this Python/OS build has no "
-                "socket.SO_PEERCRED -- the peer-credential check (design "
-                "doc §2.2) cannot run here, and starting without it would "
-                "be a silent permission-layer gap"
-            )
+        implements the Linux arm (#3194) and the Darwin arm (#3666), chosen
+        by `_owner_arm()` (#3708). Any other platform, a Linux seat missing
+        `setfacl`, `getfacl` or socket.SO_PEERCRED, or a Darwin seat missing
+        socket.LOCAL_PEERCRED, `/bin/chmod` or `/dev/fd` refuses here rather
+        than starting with a silently-unenforced permission layer.
+
+        The checks live in the module-level
+        `platform_unsupported_reason()` (#3292) -- the one definition the
+        test suite's `requires_linux_owner` marker also keys on, so the
+        refusal and the skip cannot disagree."""
+        reason = platform_unsupported_reason()
+        if reason is not None:
+            raise OwnerPermissionUnsupported(reason)
+
+    def _check_darwin_home_not_tcc_protected(self) -> None:
+        """Darwin only (#3666, design doc §2.5): refuse an ENGRAM_HOME under
+        ~/Documents, ~/Desktop or ~/Downloads. A heuristic prefix list, NOT a
+        TCC query (see DARWIN_TCC_PROTECTED_HOME_FOLDERS): probing those
+        folders would itself raise a consent dialog. Compared lexically and
+        case-insensitively (the default volume is case-insensitive), with no
+        filesystem access and no symlink resolution -- resolving a path inside
+        a protected folder is exactly the access this check exists to avoid."""
+        if _owner_arm() != "darwin":
+            return
+        home_parts = [p.casefold() for p in Path.home().parts]
+        parts = [p.casefold() for p in self.engram_home.parts]
+        for folder in DARWIN_TCC_PROTECTED_HOME_FOLDERS:
+            prefix = home_parts + [folder.casefold()]
+            if parts[: len(prefix)] == prefix:
+                raise OwnerHomeTccProtected(
+                    f"refusing to start: ENGRAM_HOME {self.engram_home} is "
+                    f"under ~/{folder}, a folder macOS TCC protects by "
+                    f"default; an owner started without a user at the screen "
+                    f"would block forever on a consent dialog nobody can "
+                    f"answer. Grant the owner's python Full Disk Access, or "
+                    f"move ENGRAM_HOME out of ~/Documents, ~/Desktop and "
+                    f"~/Downloads. (This is a heuristic folder list, not a "
+                    f"TCC query -- probing would raise the dialog.)"
+                )
 
     def _check_stale_socket_or_raise(self) -> None:
         """Contract items 1+2 (liveness / staleness) plus #3194's §2.4
@@ -1095,21 +2371,98 @@ class EngramdOwner:
                         f"directory this process doesn't own"
                     )
             os.fchmod(fd, RUN_DIR_MODE)
-            proc = subprocess.run(
-                ["setfacl", "-b", f"/proc/self/fd/{fd}"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                pass_fds=[fd],
-            )
+            if _owner_arm() == "darwin":
+                # #3666: the Darwin strip + fd-based read-back; the finally
+                # below still closes fd. The Linux setfacl arm is untouched.
+                self._strip_run_dir_acl_darwin(fd, run_dir)
+                return
+            try:
+                proc = subprocess.run(
+                    ["setfacl", "-b", f"/proc/self/fd/{fd}"],
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=30,
+                    pass_fds=[fd],
+                )
+            except subprocess.TimeoutExpired as exc:
+                # Parity with the Darwin `chmod -N` refusal (#3708): a hung
+                # strip is a named refusal, not a bare traceback.
+                raise OwnerPermissionUnsupported(
+                    f"refusing to start: `setfacl -b` on {run_dir} did not "
+                    f"finish within {exc.timeout}s"
+                ) from exc
             if proc.returncode != 0:
                 raise OwnerPermissionUnsupported(
                     f"refusing to start: `setfacl -b` on {run_dir} (via "
                     f"its open fd, never by re-resolving the path) "
                     f"failed (exit {proc.returncode}): {proc.stderr.strip()}"
                 )
+            # #3698: trust the strip only after reading it back, through the
+            # SAME fd (never the path), before the fd is closed.
+            leftovers = _acl_leftovers(_read_acl_entries(fd, run_dir))
+            if leftovers:
+                shown = leftovers[:_ACL_LEFTOVER_LIST_MAX]
+                rest = len(leftovers) - len(shown)
+                more = f" (and {rest} more)" if rest else ""
+                raise OwnerAclNotStripped(
+                    f"refusing to start: {run_dir} still carries leftover ACL "
+                    f"entries after `setfacl -b` (read back via its open fd): "
+                    f"{'; '.join(shown)}{more}"
+                )
         finally:
             os.close(fd)
+
+    def _strip_run_dir_acl_darwin(self, fd: int, run_dir: Path) -> None:
+        """Darwin arm of the `run/` ACL strip (#3666, design doc §2.1 + §2.5).
+
+        `/bin/chmod -N /dev/fd/<fd>` with the fd passed via `pass_fds`: the
+        strip acts on the fd's TARGET, not on whatever the path names now
+        (swap control measured in §2.5). Then the ACL is READ BACK through the
+        same fd -- never the path, so a swap between strip and read-back
+        cannot show a clean read for a different directory -- and any entry
+        left over refuses the start. `chmod -N` exiting 0 is not evidence the
+        strip worked; nothing on the Linux arm re-reads the ACL either (#3698)."""
+        try:
+            proc = subprocess.run(
+                [DARWIN_CHMOD, "-N", f"{DARWIN_DEV_FD}/{fd}"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=30,
+                pass_fds=[fd],
+            )
+        except subprocess.TimeoutExpired as exc:
+            # A hung strip is a refusal with a named reason, not a bare
+            # traceback out of _harden_run_dir (still fail-closed either way).
+            raise OwnerPermissionUnsupported(
+                f"refusing to start: `chmod -N` on {run_dir} did not finish "
+                f"within {exc.timeout}s"
+            ) from exc
+        if proc.returncode != 0:
+            raise OwnerPermissionUnsupported(
+                f"refusing to start: `chmod -N` on {run_dir} (via its open "
+                f"fd, never by re-resolving the path) failed (exit "
+                f"{proc.returncode}): {proc.stderr.strip()}"
+            )
+        leftover = _darwin_acl_entries_via_fd(fd)
+        if leftover:
+            raise OwnerAclNotStripped(
+                f"refusing to start: ACL read-back on {run_dir} (through the "
+                f"same open fd) still shows {len(leftover)} entr"
+                f"{'y' if len(leftover) == 1 else 'ies'} after `chmod -N` "
+                f"reported success: {'; '.join(leftover)}"
+            )
+        # The security argument rests on the MODE as well as the ACL: read it
+        # back through the same fd too. Measured on macOS 26.6.2: `chmod -N`
+        # leaves mode bits alone (0700 stays 0700, 0755 stays 0755), so this
+        # holds today; it refuses if a strip ever widens the mode.
+        mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        if mode != RUN_DIR_MODE:
+            raise OwnerAclNotStripped(
+                f"refusing to start: {run_dir} reads mode {oct(mode)} after "
+                f"the ACL strip, expected {oct(RUN_DIR_MODE)}"
+            )
 
     def _bind_socket_or_raise(self) -> None:
         """bind() the listening socket, translating the double-launch
@@ -1149,6 +2502,15 @@ class EngramdOwner:
         self._shutdown.set()
         if self._accept_thread is not None:
             self._accept_thread.join(timeout=self.accept_poll_interval + 2.0)
+        # Release every idle handler (#3678); a busy one exits after its request, when it
+        # sees _shutdown in _next_connection(). The tokens go in under the same lock that
+        # zeroes `_idle`: a handler whose idle timeout fires in between then finds a token
+        # waiting and takes it, rather than decrementing `_idle` below zero and leaving a
+        # stray token behind.
+        with self._handoff_lock:
+            idle, self._idle = self._idle, 0
+            for _ in range(idle):
+                self._jobs.put(None)
         self._cleanup()
 
     def _cleanup(self) -> None:
@@ -1162,15 +2524,60 @@ class EngramdOwner:
         # signal firing after a newer instance already wrote its own fresh
         # pidfile (which would otherwise delete the NEW instance's pidfile
         # out from under it).
+        #
+        # #3768: this read decides whether to UNLINK, so it refuses symlinks
+        # and non-regular files (O_NOFOLLOW, O_NONBLOCK, then fstat): a FIFO
+        # must not hang it and must not be unlinked, a symlink is not ours.
         still_ours = False
+        not_regular_kind = None
+        hard_links = None
         try:
-            with open(self.pid_path) as f:
-                still_ours = int(f.read().strip()) == os.getpid()
-        except (OSError, ValueError):
-            # No pidfile, or unreadable/garbage content -- nothing to
-            # protect, proceed with removing it (matches the surface
-            # daemon's identical fallback).
-            still_ours = True
+            fd = os.open(self.pid_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                not_regular_kind = "symlink"
+            else:
+                # No pidfile, or unreadable -- nothing to protect, proceed
+                # with removing it (matches the surface daemon's identical
+                # fallback) -- unless the path is something other than a
+                # regular file that open() merely failed on (e.g. a
+                # socket-type file: ENXIO on Linux, EOPNOTSUPP on macOS),
+                # which is not ours to unlink.
+                still_ours = True
+                try:
+                    lmode = os.lstat(self.pid_path).st_mode
+                except OSError:
+                    pass
+                else:
+                    if not stat.S_ISREG(lmode):
+                        still_ours = False
+                        not_regular_kind = self._kind_of_mode(lmode)
+        else:
+            try:
+                fst = os.fstat(fd)
+                mode = fst.st_mode
+                if not stat.S_ISREG(mode):
+                    not_regular_kind = self._kind_of_mode(mode)
+                elif fst.st_nlink > 1:
+                    # hard-linked: another name shares this inode, not ours
+                    hard_links = fst.st_nlink
+                else:
+                    try:
+                        with os.fdopen(fd, closefd=False) as f:
+                            still_ours = int(f.read().strip()) == os.getpid()
+                    except (OSError, ValueError):
+                        # garbage/unreadable content: same fallback as above
+                        still_ours = True
+            finally:
+                os.close(fd)
+        if not_regular_kind is not None:
+            logging.getLogger("engramd_owner").warning(
+                "pidfile %s is a %s, not a regular file; leaving it alone",
+                self.pid_path, not_regular_kind)
+        if hard_links is not None:
+            logging.getLogger("engramd_owner").warning(
+                "pidfile %s has %d hard links; leaving it alone",
+                self.pid_path, hard_links)
         if still_ours:
             try:
                 self.pid_path.unlink()
@@ -1194,6 +2601,30 @@ class EngramdOwner:
         # under a running backup(); it waits for it, then closes. No
         # in-flight _handle_snapshot() call can race this close.
         with self._owner_lock:
+            if not self._displaced and self._owner_conn is not None:
+                # #3240 item 3: an owner displaced but never asked for a
+                # store operation must not take the clean-close path just
+                # because no request tripped the guard. Check once here.
+                try:
+                    engram_walguard.assert_not_displaced(str(self.store_path))
+                except engram_walguard.SubstrateDisplaced as exc:
+                    self._displaced = True
+                    print(
+                        f"[engramd] substrate displaced detected at shutdown: {exc}",
+                        file=sys.stderr,
+                    )
+            if self._displaced:
+                # #3240 item 2: displaced substrate -- NEVER close. Park the
+                # connections in the module-level keepalive list: dropping
+                # the references would let GC (or interpreter finalization)
+                # close them, and the last close checkpoints an orphan WAL
+                # over newer data. main() then ends the process with
+                # os._exit(EXIT_DISPLACED) so finalization cannot run.
+                for conn in (self._owner_conn, self._client_read_conn):
+                    if conn is not None:
+                        _DISPLACED_CONNECTIONS_KEEPALIVE.append(conn)
+                self._owner_conn = None
+                self._client_read_conn = None
             if self._owner_conn is not None:
                 try:
                     self._owner_conn.close()
@@ -1217,25 +2648,14 @@ class EngramdOwner:
             self._shutdown.wait(timeout=1.0)
 
     def _recorded_pid_is_alive(self) -> bool:
-        """Mirrors engram-surface-daemon.py's _recorded_pid_is_alive()
-        exactly (contract items 1+2's shared mechanism): False for a
-        missing/unreadable/garbage pidfile, or a PID that signal 0 confirms
-        is dead. Best-effort -- any error means "assume dead" so a corrupt
-        pidfile never blocks a fresh owner from starting."""
-        try:
-            with open(self.pid_path) as f:
-                pid = int(f.read().strip())
-        except (OSError, ValueError):
-            return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except OSError:
-            # Any other errno (e.g. EPERM on a reused PID owned by someone
-            # else) -- treat as "not confirmably ours", same as dead.
-            return False
-        return True
+        """Delegates to engram_pidfile.recorded_pid_is_alive() -- the single
+        source shared with engram-surface-daemon.py (#3240 item 1): a
+        recorded pid counts as alive only if that process could have
+        written the pidfile (not merely any live process that reused the
+        pid). False for a missing/unreadable/garbage pidfile."""
+        return engram_pidfile.recorded_pid_is_alive(
+            self.pid_path, program_marker=_PIDFILE_PROGRAM_MARKER
+        )
 
     # -- accept loop ------------------------------------------------------
 
@@ -1248,7 +2668,50 @@ class EngramdOwner:
                 continue
             except OSError:
                 break
-            threading.Thread(target=self._handle_connection, args=(conn,), daemon=True).start()
+            self._dispatch_connection(conn)
+
+    def _dispatch_connection(self, conn: socket.socket) -> None:
+        """Give `conn` to an idle handler if there is one, else start a new handler.
+        Never queues a connection behind a busy handler (#3678)."""
+        with self._handoff_lock:
+            if self._idle > 0:
+                self._idle -= 1
+                self._jobs.put(conn)
+                return
+        threading.Thread(
+            target=self._worker, args=(conn,),
+            name=f"{WORKER_THREAD_PREFIX}-{next(self._worker_seq)}", daemon=True,
+        ).start()
+
+    def _worker(self, conn: "socket.socket | None") -> None:
+        """Serve `conn`, then wait for the next connection; exit on stop() or when idle
+        past `idle_worker_timeout` while more than `idle_worker_cap` handlers are idle."""
+        while conn is not None:
+            try:
+                self._handle_connection(conn)
+            except Exception:  # _handle_connection maps its own failures; keep the handler alive
+                logging.getLogger("engramd_owner").error(
+                    "unexpected exception in a connection handler", exc_info=True)
+            conn = self._next_connection()
+
+    def _next_connection(self) -> "socket.socket | None":
+        with self._handoff_lock:
+            if self._shutdown.is_set():
+                return None
+            self._idle += 1
+        while True:
+            try:
+                return self._jobs.get(timeout=self.idle_worker_timeout)  # None = stop()
+            except queue.Empty:
+                pass
+            with self._handoff_lock:
+                if not self._jobs.empty():
+                    # Handed a connection between the timeout and taking the lock: the
+                    # accept loop already counted this handler as busy.
+                    return self._jobs.get_nowait()
+                if self._shutdown.is_set() or self._idle > self.idle_worker_cap:
+                    self._idle -= 1
+                    return None
 
     def _check_peer_credentials(self, conn: socket.socket) -> dict | None:
         """Peer-credential check (#3194, design doc §2.2): defence in
@@ -1262,7 +2725,26 @@ class EngramdOwner:
         too-short buffer to 0 (read as uid 0) with no error, whereas
         `unpack_from` RAISES on a short buffer (contract test 2's
         discrimination mutation targets exactly this parse form, per
-        design doc §2.2/§5 test 2)."""
+        design doc §2.2/§5 test 2).
+
+        The arm is `_owner_arm()` (#3708), not the presence of an attribute:
+        darwin runs the LOCAL_PEERCRED check (#3666); linux runs this
+        SO_PEERCRED check and REFUSES if `socket.SO_PEERCRED` is absent --
+        never falling through to the Darwin check; any other platform
+        REFUSES. The check never no-ops."""
+        arm = _owner_arm()
+        if arm == "darwin":
+            return self._check_peer_credentials_darwin(conn)
+        if arm != "linux":
+            raise OwnerPermissionUnsupported(
+                f"refusing to check peer credentials: no peer-credential "
+                f"check exists for platform.system() == {platform.system()!r}"
+            )
+        if not hasattr(socket, "SO_PEERCRED"):
+            raise OwnerPermissionUnsupported(
+                "refusing to check peer credentials: this Linux Python/OS "
+                "build has no socket.SO_PEERCRED"
+            )
         raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, PEERCRED_STRUCT_SIZE)
         _peer_pid, peer_uid, _peer_gid = struct.unpack_from(PEERCRED_STRUCT_FORMAT, raw)
         own_uid = os.getuid()
@@ -1285,6 +2767,49 @@ class EngramdOwner:
         # property check, not a discriminating test", and no mutation is
         # invented for it here.
         if peer_uid == 0 and own_uid != 0:
+            return {
+                "status": "rejected",
+                "reason": "peer_identity",
+                "detail": f"connecting uid {peer_uid} is not this owner's uid {own_uid}",
+                "remedy": "connect to the socket under your own $ENGRAM_HOME",
+            }
+        return None
+
+    def _check_peer_credentials_darwin(self, conn: socket.socket) -> dict | None:
+        """Darwin arm of the peer check (#3666, design doc §2.2 + §2.5): same
+        return contract as `_check_peer_credentials()` -- a §2.3 rejection wire
+        dict for an unauthorised uid, None to proceed.
+
+        `getsockopt(SOL_LOCAL=0, LOCAL_PEERCRED, 76)`, parsed with
+        `struct.unpack_from("@IIh16I")` -- NEVER a slice, so a short buffer
+        (measured: an 8-byte request returns 8 bytes with no error; the wrong
+        LEVEL returns 4 zero bytes with no error) raises `struct.error`
+        instead of decoding to uid 0. Then the buffer must be EXACTLY 76 bytes
+        and `cr_version` must be 0, else `OwnerPeerCredentialsMalformed`
+        (fail closed; `cr_version == 0` is §2.5's added requirement)."""
+        if not hasattr(socket, "LOCAL_PEERCRED"):
+            raise OwnerPermissionUnsupported(
+                "refusing to check peer credentials: this platform has "
+                "neither socket.SO_PEERCRED nor socket.LOCAL_PEERCRED"
+            )
+        raw = conn.getsockopt(SOL_LOCAL, socket.LOCAL_PEERCRED, DARWIN_PEERCRED_STRUCT_SIZE)
+        cr_version, peer_uid, _ngroups, *_groups = struct.unpack_from(
+            DARWIN_PEERCRED_STRUCT_FORMAT, raw
+        )
+        if len(raw) != DARWIN_PEERCRED_STRUCT_SIZE:
+            raise OwnerPeerCredentialsMalformed(
+                f"LOCAL_PEERCRED returned {len(raw)} bytes, expected exactly "
+                f"{DARWIN_PEERCRED_STRUCT_SIZE}"
+            )
+        if cr_version != DARWIN_XUCRED_VERSION:
+            raise OwnerPeerCredentialsMalformed(
+                f"LOCAL_PEERCRED returned xucred cr_version {cr_version}, "
+                f"this parser understands only {DARWIN_XUCRED_VERSION}"
+            )
+        own_uid = os.getuid()
+        # uid mismatch, then §2.2's uid-0 clause (defence in depth: it changes
+        # no outcome given the mismatch rule, see _check_peer_credentials()).
+        if peer_uid != own_uid or (peer_uid == 0 and own_uid != 0):
             return {
                 "status": "rejected",
                 "reason": "peer_identity",
@@ -1346,7 +2871,24 @@ class EngramdOwner:
             method = request.get("method")
             if method == "snapshot":
                 deadline = accept_time + self.snapshot_request_deadline
-            response = self._dispatch(request, deadline)
+            try:
+                response = self._dispatch(request, deadline)
+            except Exception as exc:
+                # Catch-all for an UNEXPECTED exception in any method (the
+                # deadline/limit aborts and every other deliberate refusal are
+                # mapped INSIDE the handlers and returned, so they never reach
+                # here). Without it the thread died silently, the client saw a
+                # closed socket, read it as Unavailable and told the agent to
+                # restart a healthy owner. `Exception`, not BaseException:
+                # SystemExit / KeyboardInterrupt still propagate.
+                logging.getLogger("engramd_owner").error(
+                    "unexpected exception in method %r", request.get("method"), exc_info=True)
+                response = {
+                    "status": "rejected",
+                    "reason": "internal_error",
+                    "detail": f"{type(exc).__name__}: {exc}"[:200],
+                    "remedy": "owner bug (an unexpected exception inside the owner, not an outage): see the owner log",
+                }
             # Bound the response send by the SAME (possibly method-
             # extended) remaining deadline -- a client that stops reading
             # after sending its request shouldn't be able to hold this
@@ -1370,8 +2912,13 @@ class EngramdOwner:
             if remaining <= 0:
                 return
             conn.settimeout(remaining)
+            # A `read` reply arrives pre-rendered from its size-checked fragments
+            # (#3678 cut 2); everything else is serialized here as before.
+            text = getattr(response, "wire_text", None)
+            if text is None:
+                text = json.dumps(response)
             try:
-                conn.sendall((json.dumps(response) + "\n").encode("utf-8"))
+                conn.sendall((text + "\n").encode("utf-8"))
             except OSError:
                 pass
         finally:
@@ -1430,16 +2977,25 @@ class EngramdOwner:
         if not isinstance(params, dict):
             params = {}
 
-        if method == "ping":
-            return {
-                "status": "ok",
-                "result": {
-                    "contract_version": self.contract_version,
-                    "store_path": str(self.store_path),
-                },
-            }
-        if method == "snapshot":
-            return self._handle_snapshot(params, deadline)
+        handler = self._methods.get(method) if isinstance(method, str) else None
+        if handler is not None:
+            if method not in NO_STORE_METHODS:
+                # #3240 item 2: the owner's own displacement self-check,
+                # for EVERY known store-touching method (guarded by
+                # default; unknown methods never reach here, so they cost
+                # no /proc scan). detection_unavailable is NOT
+                # displacement -- assert_not_displaced returns quietly.
+                try:
+                    engram_walguard.assert_not_displaced(str(self.store_path))
+                except engram_walguard.SubstrateDisplaced as exc:
+                    self._displaced = True
+                    return {
+                        "status": "rejected",
+                        "reason": "substrate_displaced",
+                        "detail": str(exc),
+                        "remedy": exc.remedy,
+                    }
+            return handler(params, deadline)
 
         return {
             "status": "rejected",
@@ -1447,8 +3003,292 @@ class EngramdOwner:
             "detail": f"no such operation: {method!r}",
             "remedy": (
                 "check the method name against the owner's supported "
-                "operations (this build: ping, snapshot)"
+                f"operations (this build: {', '.join(self._methods)})"
             ),
+        }
+
+    def _handle_ping(self, params: dict, deadline: float) -> dict:
+        return {
+            "status": "ok",
+            "result": {
+                "contract_version": self.contract_version,
+                "store_path": str(self.store_path),
+            },
+        }
+
+    def _read_deadline_rejection(self, detail: str) -> dict:
+        return {
+            "status": "rejected",
+            "reason": "deadline_exceeded",
+            "detail": detail,
+            "remedy": "retry the read; if it keeps overrunning the statement or the store is too slow for the request deadline",
+        }
+
+    def _handle_read(self, params: dict, deadline: float) -> dict:
+        """The client-facing `read` method (U4d, #3197; contract 1.1).
+
+        Wire: params = {"sql": <str>, "args": <list>} (D1: the client sends the
+        SQL literal itself, which the committed read-template list is matched
+        against byte-for-byte); reply `ok` carries `result` = the rows as JSON lists in
+        SQLite's own order (D2). Cell types None/int/float/str only: a bytes
+        cell is `rejected` / `unsupported_value_type`, never encoded or dropped.
+
+        Routing (test 22): the ONLY object this touches is
+        `self._client_read_gate`, which holds only `_client_read_conn`. Never
+        `_owner_conn`, never `_owner_lock`.
+
+        Deadline: execution stops READ_RESPONSE_RESERVE before the request
+        deadline so the `deadline_exceeded` rejection can still be delivered;
+        the wait for the shared read connection is bounded by the same instant.
+        """
+        gate = self._client_read_gate
+        if gate is None:
+            return {
+                "status": "rejected",
+                "reason": "owner_stopping",
+                "detail": "the owner is shutting down; its read path is closed",
+                "remedy": "retry once the owner has restarted",
+            }
+        sql = params.get("sql")
+        args = params.get("args", [])
+        if isinstance(args, list):
+            args = tuple(args)
+        # A non-list `args` is passed through as-is: the template list's own check
+        # refuses it as `invalid_parameter` (one source of refusal reasons).
+        failure, outcome = self._run_client_read(
+            deadline, lambda execution_deadline: gate.execute(sql, args, deadline=execution_deadline)
+        )
+        if failure is not None:
+            return failure
+        if isinstance(outcome, rr.Rejected):
+            return outcome.as_wire()
+        # Serialize once (#3678 cut 2): sized and sent from the same fragments.
+        reply, _counted = _render_read_rows(outcome)
+        return reply
+
+    def _run_client_read(self, deadline: float, run) -> "tuple[dict | None, object]":
+        """The lock / deadline / error tail shared by `read` and `df`.
+        -> (failure_reply, outcome): `failure_reply` is a rejection dict (no time
+        left, deadline abort, or a SQLite error) and `outcome` is then None;
+        otherwise `failure_reply` is None and `outcome` is whatever
+        `run(execution_deadline)` returned, computed under
+        `self._client_read_lock`."""
+        execution_deadline = deadline - READ_RESPONSE_RESERVE
+        remaining = execution_deadline - time.monotonic()
+        if remaining <= 0 or not self._client_read_lock.acquire(timeout=remaining):
+            return self._read_deadline_rejection(
+                "no execution time was left inside the request deadline (after reserving time to deliver the response)"
+            ), None
+        try:
+            try:
+                return None, run(execution_deadline)
+            except sqlite3.OperationalError as exc:
+                # sqlite3.SQLITE_INTERRUPT and exc.sqlite_errorcode are Python
+                # 3.11 additions (3.10.7+ is supported): no bare access here.
+                # 9 is SQLITE_INTERRUPT; "interrupted" is the < 3.11 fallback.
+                if getattr(exc, "sqlite_errorcode", None) == getattr(sqlite3, "SQLITE_INTERRUPT", 9) \
+                        or str(exc) == "interrupted":
+                    return self._read_deadline_rejection("the read was aborted at the request deadline"), None
+                return self._read_failed(exc), None
+            except sqlite3.Error as exc:  # incl. DataError: a cell over SQLITE_LIMIT_LENGTH
+                return self._read_failed(exc), None
+        finally:
+            self._client_read_lock.release()
+
+    def _handle_df(self, params: dict, deadline: float) -> dict:
+        """The typed `df` method (U6b, #3665): document frequencies for a list of
+        terms from `nodes_fts_vocab`. Wire: params = {"terms": [<str>, ...]}
+        (1..DF_TERMS_MAX, no other key; each violation has its own named
+        reason, see `_df_param_refusal`); reply `ok` carries `result` = rows
+        `[term, doc]` for each term PRESENT in the vocabulary (absent terms
+        contribute no row; row order is not part of the contract).
+
+        Order: (1) validate -- nothing is prepared on the store connection for a
+        refused request; (2) only then touch `self._client_read_gate`, the same
+        client-read-only route as `read` (never `_owner_conn` / `_owner_lock`);
+        (3) the vocab table must be the `row` fts5vocab variant; (4) run the
+        fixed DF_SQL with the terms bound as ONE JSON-list parameter."""
+        refusal = _df_param_refusal(params)
+        if refusal is not None:
+            return refusal
+        terms = params["terms"]
+        gate = self._client_read_gate
+        if gate is None:
+            return {
+                "status": "rejected",
+                "reason": "owner_stopping",
+                "detail": "the owner is shutting down; its read path is closed",
+                "remedy": "retry once the owner has restarted",
+            }
+
+        def run(execution_deadline: float):
+            ddl = gate.execute_typed(DF_VOCAB_DDL_SQL, (), deadline=execution_deadline)
+            if not ddl:
+                # Never created here: the client-read authorizer denies CREATE,
+                # and the owner does not build the vocab table on a read path.
+                return {
+                    "status": "rejected",
+                    "reason": "vocab_table_absent",
+                    "detail": "nodes_fts_vocab is not in this store's sqlite_master",
+                    "remedy": "the vocab table is created by the IDF writer path (engram_idf.ensure_vocab_table); the owner-connection shim treats every term as absent from the vocabulary and returns no rows, so IDF scoring yields no keywords until it exists",
+                }
+            match = _DF_VOCAB_VARIANT_RE.search(_DF_SQL_COMMENT_RE.sub(" ", ddl[0][0] or ""))
+            if match is None or match.group(1).lower() != "row":
+                return {
+                    "status": "rejected",
+                    "reason": "unsupported_vocab_variant",
+                    "detail": "nodes_fts_vocab is not an fts5vocab(..., 'row') table; df needs the row shape (term, doc, cnt)",
+                    "remedy": "the col and instance variants return different column shapes and row semantics; recreate the vocab table as the row variant",
+                }
+            return gate.execute_typed(DF_SQL, (json.dumps(terms),), deadline=execution_deadline)
+
+        failure, outcome = self._run_client_read(deadline, run)
+        if failure is not None:
+            return failure
+        if isinstance(outcome, dict):
+            return outcome
+        reply, _counted = _render_read_rows(outcome)
+        return reply
+
+    def _handle_chain(self, params: dict, deadline: float) -> dict:
+        """The typed `chain` method (#3740 Cut A): the generalization chain of one node as
+        ONE request, instead of a hop-by-hop walk of 12-14 round trips. Wire: params =
+        {"node_id": <str>, "max_depth": <int>} (exactly these keys; each violation has its
+        own named reason, see `_chain_param_refusal`); reply `ok` carries `result` = the dict
+        `engram_core.generalization_chain` returned, JSON round-tripped (keys are strings).
+        A `max_depth` above CHAIN_MAX_DEPTH_CAP is CLAMPED to it, not rejected.
+
+        This runs engram_core's OWN function on the client-read connection; it does not
+        re-implement the walk, so the owner and direct paths are equal by construction.
+        The client sends no SQL: `node_id` is bound as a parameter of statements fixed in
+        engram_core, and `_TYPED_STATEMENTS` is not widened (see `_ClientReadGate.run_chain`).
+
+        Order: (1) validate -- nothing is prepared on the store connection for a refused
+        request; (2) only then touch `self._client_read_gate`, the same client-read-only
+        route as `read` / `df` (never `_owner_conn` / `_owner_lock`), through the shared
+        lock / deadline / error tail; (3) bound the serialised reply by
+        CHAIN_RESULT_MAX_BYTES -- `claim` is unbounded by design, so an oversized chain is a
+        named `chain_result_too_large`, never a truncated chain. A store without the tables
+        the walk reads is a named `read_failed`, as for any SQLite error; an owner whose
+        runtime lacks engram_core answers `chain_runtime_unavailable`."""
+        refusal = _chain_param_refusal(params)
+        if refusal is not None:
+            return refusal
+        node_id = params["node_id"]
+        depth = min(params["max_depth"], CHAIN_MAX_DEPTH_CAP)
+        gate = self._client_read_gate
+        if gate is None:
+            return {
+                "status": "rejected",
+                "reason": "owner_stopping",
+                "detail": "the owner is shutting down; its read path is closed",
+                "remedy": "retry once the owner has restarted",
+            }
+
+        # Import engram_core HERE: after validation, before `_client_read_lock`. A cold import
+        # (tens of ms) must not hold the lock that `read` / `df` wait on, nor eat the walk's
+        # deadline; a failed import acquires nothing. `run_chain` calls the accessor again,
+        # which is then a `sys.modules` hit.
+        try:
+            _engram_core(self.engram_home)
+        except ImportError as exc:
+            return self._chain_runtime_unavailable(exc)
+
+        def run(execution_deadline: float):
+            return gate.run_chain(node_id, depth, deadline=execution_deadline)
+
+        try:
+            failure, outcome = self._run_client_read(deadline, run)
+        except ImportError as exc:  # engram_core vanished between the import above and the walk
+            return self._chain_runtime_unavailable(exc)
+        if failure is not None:
+            return failure
+        # Serialise once: the bound is counted on, and the reply sent as, the SAME text.
+        result_text = json.dumps(outcome)
+        wire_text = '{"status": "ok", "result": ' + result_text + "}"
+        if len(wire_text) > CHAIN_RESULT_MAX_BYTES:
+            return {
+                "status": "rejected",
+                "reason": "chain_result_too_large",
+                "detail": f"the chain is {len(wire_text)} bytes serialised; the maximum is {CHAIN_RESULT_MAX_BYTES}; nothing was sent",
+                "remedy": "this is a property of the data (an unbounded `claim` on a head), not an outage -- do NOT restart the owner; the chain cannot be served through the owner",
+            }
+        return _RenderedReadOk(outcome, wire_text)
+
+    @staticmethod
+    def _chain_runtime_unavailable(exc: Exception) -> dict:
+        logging.getLogger("engramd_owner").warning("chain: engram_core could not be imported: %s", exc)
+        return {
+            "status": "rejected",
+            "reason": "chain_runtime_unavailable",
+            "detail": f"the owner could not import engram_core: {type(exc).__name__}",
+            "remedy": "the owner's runtime is incomplete (engram_core.py must sit beside engramd_owner.py); reinstall the plugin and restart the owner",
+        }
+
+    def _handle_confidence_by_type(self, params: dict, deadline: float) -> dict:
+        """The typed `confidence_by_type` method (#3741): the by_type confidence distribution for
+        up to CBT_MAX_MODES windows as ONE request, for the session-start calibration block.
+        Wire: params = {"modes": [<str>, ...]} (exactly that key; each violation has its own
+        named reason, see `_cbt_param_refusal`; an over-long list is refused, never clamped,
+        section 3.6); reply `ok` carries `result` = {"current_turn": int, "by_mode": {mode:
+        {"by_type": {type: {n, mean, p25, p50, p75, p90, p95}}}}}.
+
+        Runs engram_stats' OWN `confidence_by_type` on the client-read connection (see
+        `_ClientReadGate.run_confidence_by_type`); it is read-only -- no write, no tool_timing, no
+        migration.
+
+        Order (as `chain`): (1) validate -- nothing is prepared for a refused request; (2) the
+        lazy runtime import, after validation and BEFORE `_client_read_lock` (a cold import must
+        not hold the lock `read` / `df` wait on; a failed import acquires nothing) -- an owner
+        whose runtime lacks the modules answers `cbt_runtime_unavailable`; (3) the shared
+        lock / deadline / error tail."""
+        refusal = _cbt_param_refusal(params)
+        if refusal is not None:
+            return refusal
+        modes = list(params["modes"])
+        gate = self._client_read_gate
+        if gate is None:
+            return {
+                "status": "rejected",
+                "reason": "owner_stopping",
+                "detail": "the owner is shutting down; its read path is closed",
+                "remedy": "retry once the owner has restarted",
+            }
+        try:
+            _engram_core(self.engram_home)
+            import engram_stats  # noqa: F401 -- warm the import outside the lock
+        except ImportError as exc:
+            return self._cbt_runtime_unavailable(exc)
+
+        def run(execution_deadline: float):
+            return gate.run_confidence_by_type(modes, deadline=execution_deadline)
+
+        try:
+            failure, outcome = self._run_client_read(deadline, run)
+        except ImportError as exc:  # the runtime vanished between the import above and the read
+            return self._cbt_runtime_unavailable(exc)
+        if failure is not None:
+            return failure
+        return {"status": "ok", "result": outcome}
+
+    @staticmethod
+    def _cbt_runtime_unavailable(exc: Exception) -> dict:
+        logging.getLogger("engramd_owner").warning("confidence_by_type: runtime could not be imported: %s", exc)
+        return {
+            "status": "rejected",
+            "reason": "cbt_runtime_unavailable",
+            "detail": f"the owner could not import its stats runtime: {type(exc).__name__}",
+            "remedy": "the owner's runtime is incomplete (engram_core.py and engram_stats.py must sit beside engramd_owner.py); reinstall the plugin and restart the owner",
+        }
+
+    def _read_failed(self, exc: Exception) -> dict:
+        logging.getLogger("engramd_owner").warning(
+            "client read failed: %s: %s", type(exc).__name__, exc)
+        return {
+            "status": "rejected",
+            "reason": "read_failed",
+            "detail": f"{type(exc).__name__}: {exc}"[:200],
+            "remedy": "the statement was admitted but could not complete (an over-limit value, a locked or damaged store); see the owner log",
         }
 
     def _handle_snapshot(self, params: dict, deadline: float) -> dict:
@@ -1636,6 +3476,13 @@ class EngramdOwner:
                     "whose parent directory already exists"
                 ),
             }
+        # PREMISE (#3240 item 3): os.access() here tests the OWNER's rights,
+        # which equals the CALLER's rights only because the peer-credential
+        # gate (_check_peer_credentials) admits solely callers whose uid is
+        # the owner's. Admitting any cross-uid caller requires replacing
+        # this with a check against the CALLER's rights. Pinned by
+        # tests/test_engramd_owner_displacement_3240.py::
+        # test_snapshot_dest_rights_premise_peer_uid_equals_owner.
         if not os.access(parent, os.W_OK):
             return {
                 "status": "rejected",
@@ -1964,15 +3811,88 @@ class EngramdOwner:
 # ---------------------------------------------------------------------------
 
 
-def main() -> int:
+# The ONE exception -> exit-code table `main()` uses, for `--preflight` and for `start()` alike
+# (#3785, Borges's ruling on PR #3776): two hand-written tables had drifted (--preflight gave a
+# planted pidfile 1, start() gave it 4). Looked up with isinstance, in order; none of these
+# classes subclasses another (all are direct RuntimeError subclasses), so the order carries no
+# meaning today, but a future subclass must be listed BEFORE its base. `--preflight` only ever
+# raises the classes `check_start_refusals` raises; OwnerAlreadyRunning, OwnerAclNotStripped and
+# OwnerStoreBehindSchema are start()-only.
+# Owner* classes deliberately absent (OwnerStalePathUnsafe, OwnerPeerCredentialsMalformed,
+# OwnerPythonTooOld) are not mapped and propagate.
+_REFUSAL_EXIT: tuple[tuple[type[RuntimeError], int], ...] = (
+    (OwnerAlreadyRunning, 1),
+    (OwnerSocketPathTooLong, 1),
+    (OwnerHomeTccProtected, 1),
+    (OwnerAclNotStripped, 1),
+    (OwnerPermissionUnsupported, 1),
+    (OwnerPidfileNotRegular, EXIT_PATH_NOT_REGULAR),  # retrying cannot fix a planted path
+    (OwnerStorePathNotRegular, EXIT_PATH_NOT_REGULAR),
+    # Its own code (not 1, not os._exit): non-zero, so the supervisor retries while the first
+    # migration finishes.
+    (OwnerStoreBehindSchema, EXIT_STORE_BEHIND_SCHEMA),
+)
+
+
+def _refusal_exit_code(exc: BaseException) -> int | None:
+    """The exit code `_REFUSAL_EXIT` gives `exc`, or None if it is not a mapped refusal."""
+    for cls, code in _REFUSAL_EXIT:
+        if isinstance(exc, cls):
+            return code
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
     owner = EngramdOwner()
+    refusals = tuple(cls for cls, _code in _REFUSAL_EXIT)
+    if "--preflight" in args:
+        # #3709: run only the refusals start() makes before it touches anything
+        # (ENGRAM_HOME from the environment). Mutates nothing; silent exit 0
+        # when start() would get past them, else the owner's own reason on
+        # stderr and the code `_REFUSAL_EXIT` gives it (the same one start() gives).
+        try:
+            owner.check_start_refusals()
+        except refusals as exc:
+            print(f"[engramd] {exc}", file=sys.stderr)
+            return _refusal_exit_code(exc)
+        except NotADirectoryError as exc:
+            # #3780: the pidfile path sits under something that is not a directory (ENGRAM_HOME is
+            # a regular file, or a path component is). The `lstat` in check 4 raised ENOTDIR and it
+            # escaped as a traceback (still exit 1). One line, same style, same exit code (1).
+            print(f"[engramd] refusing to start: a path the preflight checks under ENGRAM_HOME has a "
+                  f"component that is not a directory (e.g. the pidfile path {owner.pid_path}; "
+                  f"{exc.strerror or 'ENOTDIR'}); nothing was bound. Fix ENGRAM_HOME and start again",
+                  file=sys.stderr)
+            return 1
+        return 0
     try:
         owner.start(install_signal_handlers=True)
-    except OwnerAlreadyRunning as exc:
+    except refusals as exc:
         print(f"[engramd] {exc}", file=sys.stderr)
-        return 1
+        return _refusal_exit_code(exc)
     print(f"[engramd] listening on {owner.socket_path} (pid {os.getpid()})", file=sys.stderr)
     owner.wait_forever()
+    # Reading _displaced right after wait_forever() is safe because stop()
+    # (and so _cleanup(), which can set the flag) runs in the signal handler
+    # on THIS main thread before wait_forever() returns. If stop() is ever
+    # called from another thread, wait for its cleanup to finish before this
+    # read, or finalization could close displaced connections.
+    if owner._displaced:
+        # #3240 item 2: skip interpreter finalization. The displaced
+        # connections are parked in _DISPLACED_CONNECTIONS_KEEPALIVE, but
+        # finalization would still close them (and the last close
+        # checkpoints an orphan WAL over newer data). Socket and pidfile
+        # were already removed by _cleanup().
+        print(
+            f"[engramd] exiting WITHOUT closing the store connections: the "
+            f"substrate was displaced (exit {EXIT_DISPLACED}); restart the "
+            f"owner against the current store",
+            file=sys.stderr,
+        )
+        sys.stderr.flush()
+        sys.stdout.flush()
+        os._exit(EXIT_DISPLACED)
     return 0
 
 

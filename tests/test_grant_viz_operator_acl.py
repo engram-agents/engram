@@ -63,6 +63,24 @@ def g():
     return _load_module()
 
 
+@pytest.fixture
+def fake_acl_tools(g, monkeypatch):
+    """Pretend setfacl/getfacl are installed. For main() tests that exercise
+    argument, dry-run, JSON and charset logic: main() refuses (rc 1) when
+    setfacl is absent (a Mac, or a Linux seat without the acl package), and
+    these tests are not about that. They are dry-run paths, so nothing runs
+    setfacl. The missing case is covered by
+    test_main_fails_loudly_when_setfacl_missing."""
+    real_which = shutil.which
+
+    def _which(cmd, *a, **k):
+        if cmd in ("setfacl", "getfacl"):
+            return f"/usr/bin/{cmd}"
+        return real_which(cmd, *a, **k)
+
+    monkeypatch.setattr(g.shutil, "which", _which)
+
+
 def _make_seat(root: Path, name: str, with_snapshots: bool = True) -> Path:
     seat = root / name
     engram_dir = seat / ".engram"
@@ -354,7 +372,7 @@ class TestRunAndMain:
         assert by_home[str(tmp_path / "agent-alice")]["skip_reason"] is None
         assert by_home[str(tmp_path / "agent-bob")]["skip_reason"] is not None
 
-    def test_main_dry_run_exit_zero_no_json(self, tmp_path, g, capsys):
+    def test_main_dry_run_exit_zero_no_json(self, tmp_path, g, fake_acl_tools, capsys):
         _make_seat(tmp_path, "agent-alice")
         rc = g.main(["--root-glob", str(tmp_path / "agent-*"), "--viz-operator", "testop"])
         assert rc == 0
@@ -362,7 +380,7 @@ class TestRunAndMain:
         assert "DRY-RUN" in out
         assert "WOULD RUN" in out
 
-    def test_main_json_output_is_valid_json(self, tmp_path, g, capsys):
+    def test_main_json_output_is_valid_json(self, tmp_path, g, fake_acl_tools, capsys):
         _make_seat(tmp_path, "agent-alice")
         rc = g.main(["--root-glob", str(tmp_path / "agent-*"), "--viz-operator", "testop", "--json"])
         assert rc == 0
@@ -520,7 +538,7 @@ class TestNoDefaultVizOperator:
         assert "VIZ_OPERATOR" in err
         assert g.AGENTCTL_CONFIG_PATH in err
 
-    def test_main_proceeds_when_viz_operator_set_via_env(self, tmp_path, g, monkeypatch, capsys):
+    def test_main_proceeds_when_viz_operator_set_via_env(self, tmp_path, g, fake_acl_tools, monkeypatch, capsys):
         _make_seat(tmp_path, "agent-alice")
         monkeypatch.setenv("VIZ_OPERATOR", "envop")
         monkeypatch.setattr(g, "AGENTCTL_CONFIG_PATH", str(tmp_path / "absent.conf"))
@@ -713,7 +731,7 @@ class TestVizOperatorCharsetGate:
         ])
         assert rc != 0
 
-    def test_main_proceeds_with_valid_charset(self, tmp_path, g, capsys):
+    def test_main_proceeds_with_valid_charset(self, tmp_path, g, fake_acl_tools, capsys):
         _make_seat(tmp_path, "agent-alice")
         rc = g.main([
             "--root-glob", str(tmp_path / "agent-*"),

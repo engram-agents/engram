@@ -155,7 +155,7 @@ SUGGESTION_ROUTING: list[tuple[str, str]] = [
     (r"\bengram_add_cornerstone\b", BUCKET_CORNERSTONE_MOVES),
     (r"\bengram_outgrow_cornerstone\b", BUCKET_CORNERSTONE_MOVES),
     # Task-closure patterns (Category 8 stale-task-ref suggestions).
-    # Canonical form: "close task and mark done — external reference #N <state>".
+    # Canonical form: "close task and mark done — external reference owner/repo#N <state>".
     # "close task" anchors on task; "mark.*task.*done" requires both words to
     # prevent false-positives like "mark contradiction done after resolution".
     (r"\b(close task|mark.*task.*done|update.*task|task.*done|stale.*task)\b", BUCKET_TASK_CLOSURES),

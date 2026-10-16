@@ -333,6 +333,21 @@ Once the rc has dogfooded clean, publish it to the public repo,
 repo carries **one squashed commit per version** — it is a clean, leak-scrubbed
 release snapshot, not a mirror of this repo's full history.
 
+> **Definition of released (Lei, 2026-10-02).** A version is reported as
+> *released* only when all three public surfaces are live, in this order:
+> (1) the public repo carries the tag and the Releases entry (the cutover
+> tool plus `gh release create`, below); (2) the website Versions entry is
+> live in both languages at engram-agents.org/versions; (3) the newsletter has
+> gone to the *ENGRAM Communications* subscribers. The tool does the tag half of (1); the Releases entry is a separate `gh release create` (a tag push never creates it, see *Announcing the public release*).
+> (2) and (3) are Ariadne's by standing assignment (Zephyr may do the Chinese
+> text); the two steps are specified under "Tell the public" below, and the
+> cutover tool's `--push` summary prints all three remaining steps as a block so
+> the success line cannot be mistaken for the finish line. Until (3) is done
+> the commander's reports say "repo released; website and newsletter
+> pending", never "released". Origin: v0.5.2 was reported released at
+> 2026-10-02 00:1xZ with (2) and (3) undone; the doc already carried both
+> steps, so the fix is the definition and the print, not a third copy.
+
 ### One-time setup
 
 Clone the public repo locally somewhere outside this checkout — this is the
@@ -377,7 +392,19 @@ Key flags (from `--help`):
   persona-specific dev tools, the `tests/` tree, and `.github/` (private CI).
   Review it if new private-only paths appear.
 - `--leak-roster` — path to `.scan-leaks-local.json` for the personal-name
-  pattern gate; default `<source>/.scan-leaks-local.json` if present.
+  pattern gate; default `<source>/.scan-leaks-local.json` if present. When
+  neither resolves, or the resolved path is not a regular file (mistyped
+  path, directory), the tool prints `WARNING: name-roster half of the leak
+  gate did NOT run ...` to stderr (non-fatal: structural patterns only). A
+  roster file that exists but is unusable (`{}` or malformed JSON) draws no
+  WARNING line; the final summary's `leak gate` label reading `PASS (structural
+  patterns only; personal-name scan skipped ...)` is the signal (measured for
+  both cases, 2026-10-12).
+- `--scan-leaks` — path to the leak-scanner script; default
+  `<source>/tools/scan-leaks.py`. Use it when `--source` is a repo that does
+  not carry that script. A path that is not an existing file (nonexistent, or
+  a directory) fails closed before the target is touched; the path must be a
+  Python scanner, and the tool does not inspect its contents.
 - `--author` — commit author; defaults to whatever's parsed from the LICENSE
   copyright line.
 - `--push` — push the branch + tag to the target's origin after committing.
@@ -429,7 +456,9 @@ deterministic from `<source-ref>` + the minus-set, so a colleague can rebuild
 it into a scratch clone (never the real remote, never `--push`) and compare
 `git rev-parse vX.Y.Z^{tree}`. Commits will differ (author, date); the tree
 must not. **Two runs, because they cannot be combined:** (a) **roster-less**
-(`--leak-roster /nonexistent/none.json`) produces the tree to compare;
+(`--leak-roster /nonexistent/none.json`; expect the `WARNING: name-roster half
+... did NOT run` line on stderr, which is this run working as intended)
+produces the tree to compare;
 (b) **with your own roster** the gate fires on every roster hit and aborts
 *before the target is written* — that run yields the personal-name axis and
 deliberately produces no tree. Expect the abort in (b); it is the gate
@@ -460,6 +489,7 @@ mistake. Create it with `gh release create <tag> --repo engram-agents/engram
 anything that links to it.
 Notify users (see below) pointing at the **public** repo's release page, not
 the private rc.
+Creating the Releases entry completes surface (1) only; see *Definition of released* above.
 
 ## Notify users
 
@@ -558,27 +588,34 @@ it sends is one-click-unsubscribe compliant (RFC 8058) and injects the headers
 itself. Adding your own produces two unsubscribe links, one of which does not
 work.
 
-**CAN-SPAM postal address: CHECKED, and the answer is that it is missing.**
-CAN-SPAM requires a valid physical postal address in commercial email.
-Buttondown's docs say *"Buttondown is compliant with the CAN-SPAM Act"*, but
-that is a claim about the platform, **not** a promise that it inserts *your*
-address into *your* sends. Measured on the delivered v0.4.0 newsletter
-(2026-08-21): the footer carries the issue line, subscribe / unsubscribe /
-view-online links, and a "Powered by Buttondown" line — **no postal address
-anywhere in the message.** So the unsubscribe half of CAN-SPAM is satisfied and
-the postal half is not.
+**CAN-SPAM postal address: SET — and the gate is the delivered footer, not the
+setting.** CAN-SPAM requires a valid physical postal address in commercial email.
+Buttondown does not invent one for you. The mailing address is held in the
+newsletter's **footer** setting, also readable over the API as the newsletter's
+`footer` (read non-empty 2026-10-03). That this field is what renders in the
+email is confirmed only by a delivered copy: Lei confirmed the address in a
+delivered email in a real inbox on 2026-09-05 (the v0.5.0 send).
 
-**What that means for you:** nothing today, because the subscriber list is us.
-It becomes a **hard blocker on the first send that reaches a genuinely external
-subscriber**, and the fix is configuration — set a mailing address in the
-Buttondown newsletter settings — not code. Check that it is set before that
-send, not after.
+**Every send: check two things, in this order — one before, one after:**
 
-*Method note, because it decides how you re-check this: the API's footer field
-returns empty, which is equally consistent with "no address" and with "the
-platform injects one at send time outside that field." Only a delivered email
-in a real inbox discriminates between the two. Re-verify by reading a send, not
-by reading the API.*
+1. **Before the send: the setting is present.** The newsletter's `footer` field over the API
+   (`GET /v1/newsletters`) is non-empty and still the mailing address. An empty
+   field means the address will be missing from the send: stop and tell the
+   maintainer.
+2. **After the send: the delivered footer is the real check.** A setting is evidence the address
+   *should* render; only a delivered email shows that it *did*. After the send,
+   read it in a subscriber's real inbox (HTML, not just the plain-text part)
+   when one is available to you. If none is, say so in the release report
+   rather than reporting the footer as verified.
+
+The subscriber count is **information, not a gate.** Report it if you read it;
+it does not decide whether a send may go.
+
+*History, kept because it explains the shape of the check: on 2026-08-21 the
+delivered v0.4.0 newsletter carried no postal address, and at that time the
+API's footer field read empty — which could not distinguish "no address" from
+"injected at send time". The address was set afterwards, and the field returned
+it non-empty when read on 2026-10-03. A delivered email is still the only discriminating read.*
 
 **⚠️ Drafting IS agent-executable; SENDING is a separate question.** As of
 2026-08-20 an API key is installed, so an agent can read the subscriber list and

@@ -281,10 +281,13 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
 
         # Memory tier stats (two-tier: queryable vs faded; tier-1 retired)
         t2 = core._get_tier_threshold(conn, 2)
+        # queryable = the SEARCHABLE population only (evidence excluded,
+        # core.SEARCH_EXCLUDED_TYPES); "total" in the log line counts every current node.
         tier2_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
+            f"SELECT COUNT(*) as c FROM nodes WHERE {core._searchable_where_sql()} "
+            "AND COALESCE(importance_score, 0) >= ?",
             (t2,),
-        ).fetchone()["c"] if t2 > 0 else current_count
+        ).fetchone()["c"]
 
         # Append to session log
         now = core._now()
@@ -627,10 +630,12 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         # Gate reflect sub-scans on tier-2 (queryable) threshold; tier-1 is retired.
         t2 = core._get_tier_threshold(conn, 2)
 
-        # 1. Unresolved contradictions (open and partially resolved)
+        # 1. Unresolved contradictions (unsettled: active and partially resolved)
         # LOW-VOLUME: source-swap description → recall_summary with claim fallback.
         contradictions = conn.execute(
-            "SELECT id, claim, recall_summary, status FROM nodes WHERE type = 'contradiction' AND status IN ('active', 'partially_resolved') AND is_current = 1"
+            "SELECT id, claim, recall_summary, status FROM nodes WHERE type = 'contradiction' "
+            f"AND status IN ({core._unsettled_contradiction_status_sql()}) AND is_current = 1",
+            core.UNSETTLED_CONTRADICTION_STATUSES,
         ).fetchall()
         report["unresolved_contradictions"] = [
             {"id": c["id"], "description": core._reflect_rs_or_claim(c, "claim"), "status": c["status"]} for c in contradictions
@@ -706,8 +711,8 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         goals = conn.execute(
             """SELECT id, claim, recall_summary, created_at FROM nodes
                WHERE type = 'goal' AND status = 'open' AND is_current = 1
-               AND (json_extract(metadata, '$.lifecycle_state') IS NULL
-                    OR json_extract(metadata, '$.lifecycle_state') = 'active')"""
+               AND (json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.lifecycle_state') IS NULL
+                    OR json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.lifecycle_state') = 'active')"""
         ).fetchall()
         report["active_goals"] = [
             {"id": g["id"], "goal": core._reflect_rs_or_claim(g, "claim"), "since": g["created_at"]}
@@ -723,7 +728,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         ).fetchall()
         active_tasks = []
         for t in tasks:
-            t_meta = json.loads(t["metadata"]) if t["metadata"] else {}
+            t_meta = core._metadata_dict(t["metadata"])
             serves = conn.execute(
                 "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'serves'",
                 (t["id"],),
@@ -748,8 +753,8 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
             report["known_people"] = [
                 {
                     "id": p["id"],
-                    "name": json.loads(p["metadata"]).get("name", "") if p["metadata"] else "",
-                    "role": json.loads(p["metadata"]).get("role", "") if p["metadata"] else "",
+                    "name": core._metadata_dict(p["metadata"]).get("name", ""),
+                    "role": core._metadata_dict(p["metadata"]).get("role", ""),
                     "since": p["created_at"],
                 }
                 for p in people
@@ -785,7 +790,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         ).fetchall()
         active_lessons = []
         for ls in lessons:
-            ls_meta = json.loads(ls["metadata"]) if ls["metadata"] else {}
+            ls_meta = core._metadata_dict(ls["metadata"])
             # Incidents point AT the lesson via `exemplifies` (incident → lesson).
             # Filter to is_current=1 sources so the list matches exemplar_count
             # semantics (live exemplars only; superseded source nodes excluded).
@@ -1074,7 +1079,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         ).fetchall()
         report["retracted_nodes"] = []
         for r in retracted:
-            meta = json.loads(r["metadata"] or "{}")
+            meta = core._metadata_dict(r["metadata"])
             report["retracted_nodes"].append({
                 "id": r["id"],
                 "type": r["type"],
@@ -1119,7 +1124,12 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         for r in support_lost_rows:
             live_count = core._count_live_exemplars(conn, r["id"], r["type"])
             if live_count > 0:
-                meta = json.loads(r["metadata"] or "{}")
+                # #3413: the LIKE pre-filter can match a non-object blob that
+                # merely CONTAINS the marker text (`[{"support_lost": true}]`);
+                # the re-dump then replaces it with a dict, so say so. The
+                # report has no `warnings` field; stderr is the signal.
+                meta, _ = core._metadata_dict_for_write(
+                    r["metadata"], r["id"], "engram_reflect")
                 meta.pop("support_lost", None)
                 conn.execute(
                     "UPDATE nodes SET metadata = ? WHERE id = ?",
@@ -1142,10 +1152,13 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         total_current = conn.execute(
             "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1"
         ).fetchone()["c"]
+        # tier2_queryable = the SEARCHABLE population only (evidence excluded,
+        # core.SEARCH_EXCLUDED_TYPES); total_current above counts every current node.
         tier2_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
+            f"SELECT COUNT(*) as c FROM nodes WHERE {core._searchable_where_sql()} "
+            "AND COALESCE(importance_score, 0) >= ?",
             (t2,),
-        ).fetchone()["c"] if t2 > 0 else total_current
+        ).fetchone()["c"]
 
         report["summary"] = {
             "contradictions": len(report["unresolved_contradictions"]),

@@ -256,6 +256,148 @@ def test_add_task_serves_refreshes_registry():
 
 
 # ---------------------------------------------------------------------------
+# #1721 -- goal tension trigger rebuild
+#
+# _goal_tension_impl INSERTs two `tensions` edges (goal_id_a, goal_id_b) but,
+# before this fix, never called _rebuild_principle_triggers() -- a new goal
+# tension did not appear in principle_triggers.json until some unrelated
+# write triggered a rebuild. C1: the successful (DURABLE) path refreshes the
+# registry with no manual rebuild call in between. C2: the rebuild is
+# best-effort -- a raise inside _rebuild_principle_triggers must not block
+# the tool's normal success result. C3: on a non-DURABLE verdict or any
+# early-error return, no rebuild is attempted at all (placement is after the
+# durability check passes, just before the success return). C3c (r2): the
+# non-DURABLE guard covers BOTH non-durable verdicts -- not just
+# DURABILITY_NOT_DURABLE but also DURABILITY_INDETERMINATE.
+# ---------------------------------------------------------------------------
+
+
+def test_goal_tension_refreshes_registry_without_manual_rebuild():
+    """C1: a successful (DURABLE) goal tension lands in the registry with no
+    manual _rebuild_principle_triggers() call in between -- the same wiring
+    already proven for serves edges above (test_generic_serves_edge_from_
+    observation_refreshes_registry, test_add_task_serves_refreshes_registry).
+    """
+    server = fresh_server()
+    import engram_core as core
+
+    goal_a = _seed_goal(server, aspiration="Goal A for tension wiring.")
+    goal_b = _seed_goal(server, aspiration="Goal B for tension wiring.")
+    r = json.loads(server.engram_goal_tension(payload_json=json.dumps({
+        "goal_id_a": goal_a, "goal_id_b": goal_b,
+        "description": "Tension wiring test.",
+    })))
+    assert r.get("status") == "created", r
+    tension_id = r["tension_id"]
+
+    reg = _read_registry(core)
+    assert tension_id in reg, "goal tension did not refresh the registry"
+    principal_ids = {e["principle_id"] for e in reg[tension_id]}
+    assert principal_ids == {goal_a, goal_b}, (
+        f"expected both goals as principal entries, got {principal_ids}"
+    )
+    assert all(e["mode"] == "tension" for e in reg[tension_id])
+    assert all(e["kind"] == "goal" for e in reg[tension_id])
+
+
+def test_goal_tension_rebuild_best_effort_on_raise(monkeypatch):
+    """C2: if _rebuild_principle_triggers raises, the goal tension is still
+    created and the tool returns its normal success result -- the same
+    best-effort pattern as the sibling call sites (e.g. L136)."""
+    server = fresh_server()
+    import engram_epistemic
+
+    goal_a = _seed_goal(server, aspiration="Goal A for best-effort rebuild test.")
+    goal_b = _seed_goal(server, aspiration="Goal B for best-effort rebuild test.")
+
+    monkeypatch.setattr(
+        engram_epistemic.core, "_rebuild_principle_triggers",
+        mock.Mock(side_effect=RuntimeError("rebuild boom")),
+    )
+    r = json.loads(server.engram_goal_tension(payload_json=json.dumps({
+        "goal_id_a": goal_a, "goal_id_b": goal_b,
+        "description": "Best-effort rebuild test.",
+    })))
+    assert r.get("status") == "created", (
+        f"rebuild failure must not block goal-tension success, got {r}"
+    )
+
+
+def test_goal_tension_non_durable_verdict_skips_rebuild(monkeypatch):
+    """C3 (durability branch): on a non-DURABLE verdict, no rebuild is
+    attempted -- proves the call is placed AFTER the durability check, not
+    before it (same fault-injection pattern as test_durability_readback.py's
+    test_goal_tension_fault_injected_not_durable_reports_failed_not_durable)."""
+    server = fresh_server()
+    import engram_epistemic
+
+    goal_a = _seed_goal(server, aspiration="Goal A for non-durable skip test.")
+    goal_b = _seed_goal(server, aspiration="Goal B for non-durable skip test.")
+
+    rebuild_mock = mock.Mock()
+    monkeypatch.setattr(engram_epistemic.core, "_rebuild_principle_triggers", rebuild_mock)
+    monkeypatch.setattr(
+        engram_epistemic.core, "verify_write_durability",
+        lambda *a, **k: (engram_epistemic.core.DURABILITY_NOT_DURABLE,
+                         {"same_conn": False, "fresh_conn": False}),
+    )
+    r = json.loads(server.engram_goal_tension(payload_json=json.dumps({
+        "goal_id_a": goal_a, "goal_id_b": goal_b,
+        "description": "Non-durable skip test.",
+    })))
+    assert r.get("status") == "failed_not_durable", r
+    rebuild_mock.assert_not_called()
+
+
+def test_goal_tension_indeterminate_verdict_skips_rebuild(monkeypatch):
+    """C3c (durability branch, INDETERMINATE): the guard
+    `_verdict != core.DURABILITY_DURABLE` covers both non-durable verdicts,
+    `failed_not_durable` AND `durability_indeterminate` -- the sibling test
+    above (test_goal_tension_non_durable_verdict_skips_rebuild) only forces
+    DURABILITY_NOT_DURABLE, so a plausible-wrong narrowing of the guard to
+    just the NOT-durable case would let an INDETERMINATE verdict fall
+    through to the rebuild and success path unnoticed. This test forces
+    DURABILITY_INDETERMINATE specifically."""
+    server = fresh_server()
+    import engram_epistemic
+
+    goal_a = _seed_goal(server, aspiration="Goal A for indeterminate skip test.")
+    goal_b = _seed_goal(server, aspiration="Goal B for indeterminate skip test.")
+
+    rebuild_mock = mock.Mock()
+    monkeypatch.setattr(engram_epistemic.core, "_rebuild_principle_triggers", rebuild_mock)
+    monkeypatch.setattr(
+        engram_epistemic.core, "verify_write_durability",
+        lambda *a, **k: (engram_epistemic.core.DURABILITY_INDETERMINATE,
+                         {"same_conn": True, "fresh_conn": False}),
+    )
+    r = json.loads(server.engram_goal_tension(payload_json=json.dumps({
+        "goal_id_a": goal_a, "goal_id_b": goal_b,
+        "description": "Indeterminate skip test.",
+    })))
+    assert r.get("status") == "durability_indeterminate", r
+    rebuild_mock.assert_not_called()
+
+
+def test_goal_tension_early_error_skips_rebuild(monkeypatch):
+    """C3 (early-error branch): a self-tension error return must not attempt
+    a rebuild at all."""
+    server = fresh_server()
+    import engram_epistemic
+
+    goal_a = _seed_goal(server, aspiration="Goal A for early-error skip test.")
+
+    rebuild_mock = mock.Mock()
+    monkeypatch.setattr(engram_epistemic.core, "_rebuild_principle_triggers", rebuild_mock)
+    r = json.loads(server.engram_goal_tension(payload_json=json.dumps({
+        "goal_id_a": goal_a, "goal_id_b": goal_a,
+        "description": "Self-tension should error before any rebuild.",
+    })))
+    assert "error" in r, r
+    rebuild_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # §3 Migration shim
 # ---------------------------------------------------------------------------
 
@@ -616,7 +758,7 @@ def test_load_tripwires_returns_axiom_and_goal_rows_with_surfacing_nudge(tmp_pat
         claim="Goal claim text.",
     )
     tripwires = hook.load_tripwires(db_path=db)
-    nudges = [n for _p, n, _nid in tripwires]
+    nudges = [n for _p, n, _nid, _priority in tripwires]
     assert "Axiom surfacing nudge." in nudges
     assert "Goal surfacing nudge." in nudges
 
@@ -635,7 +777,7 @@ def test_load_tripwires_falls_back_to_claim_when_no_nudge_field(tmp_path):
         claim="Cornerstone claim used as fallback nudge.",
     )
     tripwires = hook.load_tripwires(db_path=db)
-    nudges = [n for _p, n, _nid in tripwires]
+    nudges = [n for _p, n, _nid, _priority in tripwires]
     assert "Cornerstone claim used as fallback nudge." in nudges, (
         "row with situation_pattern but no nudge field must fall back to "
         "claim, not be silently dropped"

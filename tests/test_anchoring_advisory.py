@@ -22,6 +22,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_anchoring_advisory_")
@@ -111,6 +113,42 @@ def test_similarity_null_with_reason_when_embeddings_disabled():
     assert adv["quote_claim_similarity"] is None
     assert "similarity_status" in adv
     assert adv["similarity_status"].startswith("unavailable:")
+
+
+def test_quote_claim_similarity_ignores_enabled_false():
+    """(#345 PR2, A2) quote_claim_similarity (engram_anchoring.py ~198)
+    no longer consults the retired `enabled` key: with `enabled: False`
+    mocked (embedder otherwise available), a real similarity must still
+    compute -- NOT the old "embeddings disabled in config" unavailable
+    reason.
+
+    Mutation target: restoring the
+    `emb_config.get("enabled", True)` short-circuit here turns this RED
+    (similarity reverts to None, reason reverts to "embeddings disabled
+    in config").
+    """
+    import unittest.mock as mock
+    fresh_server()  # ensures engram_anchoring's `core` module is importable/configured
+    import engram_anchoring
+
+    with mock.patch.object(
+        engram_anchoring.core, "_get_embedding_config",
+        return_value={"enabled": False, "model": "x"},
+    ), mock.patch.object(
+        engram_anchoring.core._embedder, "is_available", return_value=True,
+    ), mock.patch.object(
+        engram_anchoring.core._embedder, "embed", return_value=[1.0, 0.0, 0.0],
+    ):
+        similarity, reason = engram_anchoring.quote_claim_similarity(
+            "some quoted text", "some claim text",
+        )
+
+    assert reason is None, (
+        f"expected a real similarity despite enabled=False, got reason={reason!r}"
+    )
+    assert similarity is not None and similarity == pytest.approx(1.0, abs=1e-9), (
+        f"expected cosine similarity 1.0 (identical mocked vectors), got {similarity!r}"
+    )
 
 
 # ── JSONL log ────────────────────────────────────────────────────────────

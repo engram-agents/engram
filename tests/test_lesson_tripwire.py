@@ -14,6 +14,15 @@ Coverage:
  10. test_build_match_target_bash — build_match_target extracts Bash command string
  11. test_build_match_target_mcp — build_match_target returns tool_name + args for MCP
  12. test_build_match_target_unknown — build_match_target returns "" for unknown tool_name
+
+alpha#3270/#3112 -- TestTripwirePriorityOrdering: the display-cap sort key
+ranks "high" tripwire_priority before "normal", THEN the pre-existing
+-len(pattern) tiebreak within a tier. Covers Kepler's own red-first fixture
+(a 15-char "high" pattern must win its slot over a 119-char "normal" one --
+the exact inversion of the pre-fix bug), the unset-priority regression
+guard (today's pure-length order is unchanged when no hit opts in), and the
+cut-node-IDs-in-the-trailer fold (alpha#3112's independent-of-ranking
+mitigation).
 """
 
 from __future__ import annotations
@@ -107,15 +116,17 @@ def _make_db(tmp_path: Path) -> Path:
 
 def _insert_lesson(
     db: Path, *, pattern: str = "", nudge: str = "do the right thing",
-    prevention_type: str = "", node_id: str = "",
+    prevention_type: str = "", tripwire_priority: str = "", node_id: str = "",
 ):
     """Insert a lesson row with optional situation_pattern (+ #1944
-    prevention_type) in metadata."""
+    prevention_type, #3270/#3112 tripwire_priority) in metadata."""
     meta: dict = {"scaffolding_nudge": nudge, "reasoning_type": "inductive_generalization"}
     if pattern:
         meta["situation_pattern"] = pattern
     if prevention_type:
         meta["prevention_type"] = prevention_type
+    if tripwire_priority:
+        meta["tripwire_priority"] = tripwire_priority
     conn = sqlite3.connect(str(db))
     conn.execute(
         "INSERT INTO nodes (id, type, is_current, memory_status, metadata, claim) "
@@ -339,12 +350,12 @@ class TestSituationPatternStoredViaMcp(unittest.TestCase):
 
         # Also verify that load_tripwires returns this lesson
         tripwires = load_tripwires(db_path=db_path)
-        patterns_in_tripwires = [p for p, _nudge, _node_id in tripwires]
+        patterns_in_tripwires = [p for p, _nudge, _node_id, _priority in tripwires]
         self.assertIn(pattern, patterns_in_tripwires, "Pattern must appear in load_tripwires output")
         # #2753 epic WS2: the 3rd tuple element is the firing node's own id
         # (the lesson_id minted above), so a caller can call
         # generalization_chain() on the actual hit.
-        node_ids_in_tripwires = [nid for _p, _nudge, nid in tripwires]
+        node_ids_in_tripwires = [nid for _p, _nudge, nid, _priority in tripwires]
         self.assertIn(lesson_id, node_ids_in_tripwires, "load_tripwires must carry the lesson's own node id")
 
 
@@ -1190,3 +1201,159 @@ class TestTripwirePreviewCap(unittest.TestCase):
             "'(overflow file unavailable)' wording or crashing",
         )
         self.assertNotIn("overflow file unavailable", additional_context)
+
+
+# ---------------------------------------------------------------------------
+# alpha#3270/#3112 -- tripwire_priority display-cap ordering
+# ---------------------------------------------------------------------------
+# Kepler's ruling (2026-10-01): an explicit, author-set `tripwire_priority`
+# field ("high"/"normal", default "normal") ranks before the pre-existing
+# -len(pattern) tiebreak. Red-first fixture = the two measured incidents:
+# a 119-char "normal" pattern vs a 15-char "high" pattern, display cap 1 ->
+# the high one must be shown. Field unset on every hit -> today's pure-
+# length order must be byte-identical to before this feature landed.
+
+
+class TestTripwirePriorityOrdering(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_tripwire_priority_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_high_priority_short_pattern_beats_normal_long_pattern(self):
+        """Kepler's own measured fixture, reproduced directly: a 119-char
+        'normal' pattern (standing in for Ariadne's broad working-tree-read
+        reminder) and a 15-char 'high' pattern (standing in for the git
+        stash lesson it beat) both match one command. Before this feature,
+        pure -len(pattern) ordering would show the 119-char hit and cut the
+        15-char one -- the exact inversion the two incidents reported. With
+        tripwire_priority ranked first, the 15-char 'high' hit must win the
+        single display slot instead."""
+        db = _make_db(Path(self.tmp))
+        normal_pattern = "normalreminder" + ("x" * 105)  # 119 chars total
+        self.assertEqual(len(normal_pattern), 119)
+        high_pattern = "git stash" + ("y" * 6)  # 15 chars total
+        self.assertEqual(len(high_pattern), 15)
+        normal_nudge = "You are reading the ambient working tree."
+        high_nudge = "Never git stash -- the stack is shared across worktrees."
+        _insert_lesson(
+            db, pattern=normal_pattern, nudge=normal_nudge,
+            tripwire_priority="normal", node_id="ls_normal",
+        )
+        _insert_lesson(
+            db, pattern=high_pattern, nudge=high_nudge,
+            tripwire_priority="high", node_id="ls_high",
+        )
+        tripwires = load_tripwires(db_path=db)
+        command = f"{normal_pattern} {high_pattern}"
+
+        # Sanity: both patterns really do match the command.
+        hits = check_command(command, tripwires)
+        self.assertEqual(len(hits), 2, "sanity: both seeded patterns must match")
+
+        with (
+            unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp),
+            unittest.mock.patch.object(
+                _hook, "TRIPWIRE_BLOCK_CHAR_CEILING",
+                len(high_nudge) + 40,  # room for exactly one bullet, not two
+            ),
+        ):
+            out = _run_hook_main(
+                {"tool_name": "Bash", "tool_input": {"command": command}},
+                tripwires=[
+                    (normal_pattern, normal_nudge, "ls_normal", "normal"),
+                    (high_pattern, high_nudge, "ls_high", "high"),
+                ],
+            )
+        response = json.loads(out.strip())
+        additional_context = response["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(
+            high_nudge, additional_context,
+            "the 'high'-priority short pattern must be shown, even though "
+            "its pattern is far shorter than the competing 'normal' one",
+        )
+        self.assertNotIn(
+            normal_nudge, additional_context,
+            "the longer 'normal'-priority pattern must be the one cut -- "
+            "this is the exact inversion of the pre-fix bug",
+        )
+
+    def test_unset_priority_on_every_hit_preserves_todays_pure_length_order(self):
+        """Regression guard: when no hit has an opinion (every lesson minted
+        before this field existed, or one that never opted in), the new
+        (priority_rank, -len(pattern)) key must reduce to EXACTLY today's
+        pure -len(pattern) order -- same shown/cut outcome as before this
+        feature landed, byte for byte."""
+        db = _make_db(Path(self.tmp))
+        pattern_long = "uniquelongpattern" + ("z" * 30)
+        pattern_short = "q"
+        nudge_long = "the longer, unset-priority nudge"
+        nudge_short = "the shorter, unset-priority nudge"
+        _insert_lesson(db, pattern=pattern_long, nudge=nudge_long, node_id="ls_long")
+        _insert_lesson(db, pattern=pattern_short, nudge=nudge_short, node_id="ls_short")
+        tripwires = load_tripwires(db_path=db)
+        # Confirm the DB round-trip itself coerces the missing field to
+        # "normal" rather than leaving None on the tuple.
+        priorities = {t[2]: t[3] for t in tripwires}
+        self.assertEqual(priorities, {"ls_long": "normal", "ls_short": "normal"})
+
+        command = f"{pattern_long} {pattern_short}"
+        with (
+            unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp),
+            unittest.mock.patch.object(
+                _hook, "TRIPWIRE_BLOCK_CHAR_CEILING", len(nudge_long) + 40,
+            ),
+        ):
+            out = _run_hook_main(
+                {"tool_name": "Bash", "tool_input": {"command": command}},
+                tripwires=[
+                    (pattern_long, nudge_long, "ls_long"),
+                    (pattern_short, nudge_short, "ls_short"),
+                ],
+            )
+        response = json.loads(out.strip())
+        additional_context = response["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(
+            nudge_long, additional_context,
+            "with every priority unset, the LONGER pattern must still win "
+            "the slot -- today's order must be unchanged",
+        )
+        self.assertNotIn(nudge_short, additional_context)
+
+    def test_cut_node_ids_are_named_in_the_trailer(self):
+        """alpha#3112's independent-of-ranking mitigation: when a hit is
+        cut, its node_id must appear in the trailer itself, not only inside
+        the overflow file -- a reader deciding whether to open that file
+        needs to know WHICH lesson got cut without opening anything."""
+        db = _make_db(Path(self.tmp))
+        pattern_huge = "hugepattern" + ("z" * 30)
+        pattern_small = "q"
+        huge_nudge = "H" * (TRIPWIRE_BLOCK_CHAR_CEILING + 500)
+        small_nudge = "small nudge text"
+        _insert_lesson(db, pattern=pattern_huge, nudge=huge_nudge, node_id="ls_cutid_huge")
+        _insert_lesson(db, pattern=pattern_small, nudge=small_nudge, node_id="ls_cutid_small")
+        command = f"{pattern_huge} {pattern_small}"
+        with unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp):
+            out = _run_hook_main(
+                {"tool_name": "Bash", "tool_input": {"command": command}},
+                tripwires=[
+                    (pattern_huge, huge_nudge, "ls_cutid_huge"),
+                    (pattern_small, small_nudge, "ls_cutid_small"),
+                ],
+            )
+        response = json.loads(out.strip())
+        additional_context = response["hookSpecificOutput"]["additionalContext"]
+        first_line = additional_context.split("\n", 1)[0]
+        trailer_match = _TRAILER_RE.match(first_line)
+        self.assertIsNotNone(trailer_match, f"expected a trailer line, got: {first_line!r}")
+        overflow_path = trailer_match.group(3)
+        self.assertIsNotNone(overflow_path, "cut_count > 0 must still name a real overflow path")
+        self.assertTrue(
+            os.path.exists(overflow_path),
+            "the trailer's path group must still resolve to a real file -- "
+            "appending the cut ids must not have corrupted the \\S+ path match",
+        )
+        self.assertIn(
+            "ls_cutid_small", first_line,
+            f"the cut node's own id must be named in the trailer line, got: {first_line!r}",
+        )

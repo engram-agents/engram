@@ -211,6 +211,20 @@ class TestResolveEngramHomeDirectReturn(unittest.TestCase):
         self.assertEqual(result, os.path.expanduser("~/.engram"))
 
 
+# The three real-bind classes below read /proc/net/unix; the condition is
+# that primitive's absence, never the platform name (#3333). Subclasses
+# inherit the skip from this base.
+def _has_proc_net_unix() -> bool:
+    return Path("/proc/net/unix").exists()
+
+
+_NEEDS_PROC_NET_UNIX = unittest.skipUnless(
+    _has_proc_net_unix(),
+    "needs /proc/net/unix (absent on this host)",
+)
+
+
+@_NEEDS_PROC_NET_UNIX
 class _RealBindFixture(unittest.TestCase):
     """Shared setup for the two end-to-end bind tests: a short-path temp
     directory (AF_UNIX's sun_path has a ~108-byte kernel limit, so this

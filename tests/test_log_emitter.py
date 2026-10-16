@@ -447,7 +447,8 @@ class _CountingWriteProxy:
 class TestWriteCallUnchanged(EmitterTestBase):
     """Contract item 4: the single f.write(line + "\\n") call stays one call.
 
-    Behavioural form (round-1 review, PR #3168): wrap builtins.open to
+    Behavioural form (round-1 review, PR #3168): wrap the append open
+    (builtins.open until #3628, now open_regular_text_append) to
     return a counting proxy around the real handle and assert exactly one
     .write() call happens during one emit() -- the reviewer verified this
     survives a comment/docstring containing the literal text ".write(" and
@@ -462,18 +463,20 @@ class TestWriteCallUnchanged(EmitterTestBase):
 
     def test_emit_makes_exactly_one_write_call(self):
         target = self.logs_dir / "sessions" / "sess_WC.l1.jsonl"
-        real_open = open
+        # Append seam since #3628: engram_regular_io.open_regular_text_append
+        # (non-blocking, regular-file-only), imported by name into the emitter.
+        real_open = engram_log_emitter.open_regular_text_append
         proxies = []
 
-        def fake_open(file, mode="r", *args, **kwargs):
-            fh = real_open(file, mode, *args, **kwargs)
-            if str(file) == str(target) and "a" in mode:
+        def fake_open(file, *args, **kwargs):
+            fh = real_open(file, *args, **kwargs)
+            if str(file) == str(target):
                 proxy = _CountingWriteProxy(fh)
                 proxies.append(proxy)
                 return proxy
             return fh
 
-        with mock.patch("builtins.open", side_effect=fake_open):
+        with mock.patch.object(engram_log_emitter, "open_regular_text_append", side_effect=fake_open):
             uuid = self.emitter.emit("engram.surface.fire", 1, {"k": "v"})
 
         self.assertIsNotNone(uuid)
@@ -497,7 +500,7 @@ class TestFlushFailureRoutesToDrop(FsyncTestBase):
         warnings = []
         self.emitter._stderr = warnings.append
         target = self.logs_dir / "sessions" / "sess_FLUSH.l1.jsonl"
-        real_open = open
+        real_open = engram_log_emitter.open_regular_text_append  # append seam since #3628
 
         class _FlushFailProxy:
             def __init__(self, fh):
@@ -518,13 +521,13 @@ class TestFlushFailureRoutesToDrop(FsyncTestBase):
             def __exit__(self, *exc_info):
                 return self._fh.__exit__(*exc_info)
 
-        def fake_open(file, mode="r", *args, **kwargs):
-            fh = real_open(file, mode, *args, **kwargs)
-            if str(file) == str(target) and "a" in mode:
+        def fake_open(file, *args, **kwargs):
+            fh = real_open(file, *args, **kwargs)
+            if str(file) == str(target):
                 return _FlushFailProxy(fh)
             return fh
 
-        with mock.patch("builtins.open", side_effect=fake_open):
+        with mock.patch.object(engram_log_emitter, "open_regular_text_append", side_effect=fake_open):
             result = self.emitter.emit("engram.surface.fire", 1, {"k": "v"})
 
         self.assertIsNone(result, "a flush() failure must be treated as a dropped event")

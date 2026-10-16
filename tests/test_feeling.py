@@ -14,7 +14,7 @@ Covers:
 10. nudge_source read from valid marker, marker cleared after read
 11. Expired marker treated as absent
 12. Corrupt marker swallowed (no raise), treated as absent
-13. Context_ids create 'cites' edges
+13. Context_ids create 'about' edges
 14. Reflect integration surfaces recent_feeling_reports
 15. engram_supersede rejects feeling_report
 16. intensity_hint out-of-range rejected, -1 sentinel omits
@@ -516,7 +516,7 @@ def test_feeling_marker_unknown_source_rejected():
 # ── Context IDs / cites edges ──────────────────────────────────────────
 
 def test_feeling_with_context_ids():
-    """context_ids should create 'cites' edges to the referenced nodes."""
+    """context_ids should create 'about' edges to the referenced nodes."""
     client, _ = fresh_client()
     obs = client.call("engram_add_observation", {
         "quoted_text": "A triggering observation",
@@ -535,7 +535,7 @@ def test_feeling_with_context_ids():
     assert obs_id in r.get("context_nodes", []), f"Context not in return: {r}"
 
     node = client.call("engram_inspect", {"node_id": r["feeling_id"]})
-    # context_ids creates a 'cites' edge, which is a contextual relation in recall view.
+    # context_ids creates an 'about' edge, which is a contextual relation in recall view.
     neighbor_ids = [n["id"] for n in node["contextual_neighbors"]]
     assert obs_id in neighbor_ids, f"Cites edge missing. Contextual neighbors: {node['contextual_neighbors']}"
 

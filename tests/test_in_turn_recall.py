@@ -95,7 +95,7 @@ def _stub_idf(terms_by_call: list[list[str]]):
     """
     calls = {"n": 0}
 
-    def extract_keywords(conn, text, min_idf=4.0, top_k=5, stopwords=None):
+    def extract_keywords(conn, text, min_idf=4.0, top_k=5, stopwords=None, n_docs=None):
         i = min(calls["n"], len(terms_by_call) - 1)
         calls["n"] += 1
         return [(t, 7.5) for t in terms_by_call[i]]
@@ -161,7 +161,7 @@ def _stub_idf_capture(terms):
     it was called with, into the returned dict (key 'min_idf')."""
     captured = {}
 
-    def extract_keywords(conn, text, min_idf=4.0, top_k=5, stopwords=None):
+    def extract_keywords(conn, text, min_idf=4.0, top_k=5, stopwords=None, n_docs=None):
         captured["min_idf"] = min_idf
         captured["stopwords"] = stopwords
         return [(t, 7.5) for t in terms]
@@ -596,7 +596,7 @@ def test_zero_docs_is_silent_no_daemon_call(tmp_path, monkeypatch):
     _enable(hook, str(tmp_path))
     _seed_node_count(hook.DB_PATH, 0)
 
-    def failing_extract_keywords(conn, text, min_idf=4.0, top_k=5):
+    def failing_extract_keywords(conn, text, min_idf=4.0, top_k=5, stopwords=None, n_docs=None):
         raise AssertionError("extract_keywords must not be called when n_docs == 0")
 
     fake = types.ModuleType("engram_idf")
@@ -677,14 +677,16 @@ def test_ledger_write_failure_does_not_break_recall(tmp_path, monkeypatch):
     _stub_idf([["replay", "harness"]])
     monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
 
-    real_open = open
+    # the hook appends through _hooklib.open_regular_text_append (#3628), so that
+    # is the seam where the append is made to fail
+    real_append = hook.open_regular_text_append
 
-    def broken_open(path, *a, **kw):
+    def broken_append(path, *a, **kw):
         if str(path) == str(hook.LEDGER_PATH):
             raise OSError("simulated: ledger append unavailable")
-        return real_open(path, *a, **kw)
+        return real_append(path, *a, **kw)
 
-    monkeypatch.setattr(hook, "open", broken_open, raising=False)
+    monkeypatch.setattr(hook, "open_regular_text_append", broken_append)
 
     out = hook.check_in_turn_recall("Bash python replay-bench harness run")
     assert "ENGRAM in-turn recall" in out

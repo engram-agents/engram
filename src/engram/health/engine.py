@@ -278,6 +278,7 @@ from . import metrics
 from . import model as health_engine_model
 from . import signals as health_signals
 from . import version as health_version
+from .rows import named_rows
 from .config import (
     AspectDef,
     EngineConfig,
@@ -1103,9 +1104,12 @@ _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
             "Fraction of current claim-bearing nodes with a NON-NULL embedding "
             "column (literal coverage, same convention). UNAVAILABLE — not a "
             "real coverage number — when the embedder is structurally "
-            "unavailable in this install (ENGRAM_NO_EMBEDDINGS=1, "
-            "sentence-transformers not installed, or embeddings disabled "
-            "in config): that state is a CONFIGURATION fact, not a HEALTH "
+            "unavailable in this install (ENGRAM_NO_EMBEDDINGS=1, or "
+            "sentence-transformers not installed; the `embedding.enabled: "
+            "false` config toggle was retired by #345 and is now fatal at "
+            "startup, so a running server can no longer reach this "
+            "UNAVAILABLE reason that way — a REPLAYED pre-#345 snapshot "
+            "still can): that state is a CONFIGURATION fact, not a HEALTH "
             "fact, and scoring it as a coverage number would make the "
             "composed score swing on whether a Python package happens to "
             "be installed. Test fixtures run with ENGRAM_NO_EMBEDDINGS=1, "
@@ -1210,7 +1214,7 @@ def _cascade_marker_age_diagnostics(conn: sqlite3.Connection, current_turn: int)
     docstring, matching the same current-node scoping every Aspect A/B/C
     signal function already uses.
     """
-    rows = conn.execute(
+    rows = named_rows(conn,
         """SELECT m.created_at AS created_at FROM cascade_markers m
            JOIN nodes n ON n.id = m.node_id
            WHERE m.status = 'pending' AND n.is_current = 1"""
@@ -1268,13 +1272,13 @@ def _activity_diagnostics(conn: sqlite3.Connection) -> dict:
     computed at.
     """
     def _resolution_rate(node_type: str, resolved_statuses: tuple[str, ...]) -> dict:
-        total = conn.execute(
+        total = named_rows(conn,
             "SELECT COUNT(*) as c FROM nodes WHERE type = ?", (node_type,)
         ).fetchone()["c"]
         if total == 0:
             return {"total": 0, "resolved": 0, "rate": None}
         status_placeholders = ",".join("?" * len(resolved_statuses))
-        resolved = conn.execute(
+        resolved = named_rows(conn,
             f"SELECT COUNT(*) as c FROM nodes WHERE type = ? AND status IN ({status_placeholders})",
             (node_type, *resolved_statuses),
         ).fetchone()["c"]
@@ -1283,10 +1287,10 @@ def _activity_diagnostics(conn: sqlite3.Connection) -> dict:
     cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
-    nodes_created_last_24h = conn.execute(
+    nodes_created_last_24h = named_rows(conn,
         "SELECT COUNT(*) as c FROM nodes WHERE created_at >= ?", (cutoff_iso,)
     ).fetchone()["c"]
-    supersede_edges_last_24h = conn.execute(
+    supersede_edges_last_24h = named_rows(conn,
         "SELECT COUNT(*) as c FROM edges WHERE relation = 'supersedes' AND created_at >= ?",
         (cutoff_iso,),
     ).fetchone()["c"]
@@ -2624,7 +2628,7 @@ def _count_null_embeddings(conn: sqlite3.Connection, population: str) -> int:
 
     claim_bearing_types = tuple(sorted(core.CLAIM_BEARING_TYPES))
     placeholders = ",".join("?" * len(claim_bearing_types))
-    return conn.execute(
+    return named_rows(conn,
         f"SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND type IN "
         f"({placeholders}) AND embedding IS NULL",
         claim_bearing_types,

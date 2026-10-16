@@ -57,9 +57,11 @@ Pack storage backup (#651):
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -76,7 +78,13 @@ DEFAULT_BACKUP_DIR = "/home/agents-shared/forum/backup"
 DEFAULT_AUDIT = "/home/agents-shared/forum/forum-audit.jsonl"
 
 # .gitignore content written once when we init the backup git repo
-GITIGNORE_CONTENT = "*.db\n*.tmp\n"
+# STAMP_NAME is ignored so writing the success stamp never makes a run "changed".
+STAMP_NAME = ".last-success.json"
+GITIGNORE_CONTENT = f"*.db\n*.tmp\n{STAMP_NAME}\n"
+
+# Alarm defaults (#3276). The category is overridable via FORUM_BACKUP_ALARM_CATEGORY.
+ALARM_DEFAULT_CATEGORY = "tools-hooks"
+ALARM_JOURNAL_LINES = 20
 
 # ---------------------------------------------------------------------------
 # Derived-data exclusion constants
@@ -400,6 +408,27 @@ def _git_init(backup_dir: Path) -> None:
         gi.write_text(GITIGNORE_CONTENT, encoding="utf-8")
 
 
+def _ensure_stamp_ignored(backup_dir: Path) -> None:
+    """Make sure the stamp is gitignored and untracked in an EXISTING repo (#3276).
+
+    _git_init writes .gitignore only on first init, so a backup repo that
+    predates the stamp has no stamp line and would commit the stamp every run.
+    Append the line if missing (never clobbering other lines) and, if the stamp
+    is already tracked, drop it from the index (the file itself is kept).
+    """
+    gi = backup_dir / ".gitignore"
+    existing = gi.read_text(encoding="utf-8") if gi.exists() else ""
+    if STAMP_NAME not in existing.splitlines():
+        sep = "" if (not existing or existing.endswith("\n")) else "\n"
+        gi.write_text(existing + sep + STAMP_NAME + "\n", encoding="utf-8")
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", STAMP_NAME],
+        cwd=str(backup_dir), capture_output=True, text=True,
+    )
+    if tracked.returncode == 0:
+        _run(["git", "rm", "--cached", "--quiet", STAMP_NAME], cwd=str(backup_dir))
+
+
 def _git_commit(backup_dir: Path) -> bool:
     """Stage all changes and commit.  Return True if a commit was made, False if nothing changed."""
     # Stage everything (honoring .gitignore)
@@ -419,6 +448,99 @@ def _git_commit(backup_dir: Path) -> bool:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     _run(["git", "commit", "-m", f"forum backup {ts}"], cwd=str(backup_dir))
     return True
+
+
+def _write_success_stamp(backup_dir: Path, committed: bool) -> None:
+    """Write <backup-dir>/.last-success.json atomically (temp + os.replace).
+
+    Called ONLY on the two success paths of main(); every failure path returns
+    before reaching it, so a failed run never refreshes the stamp (#3276 A2).
+    """
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(backup_dir), capture_output=True, text=True,
+    )
+    commit = head.stdout.strip() if head.returncode == 0 and head.stdout.strip() else None
+    stamp = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "commit": commit,
+        "committed": committed,
+    }
+    dest = backup_dir / STAMP_NAME
+    tmp = backup_dir / (STAMP_NAME + ".tmp")
+    try:
+        tmp.write_text(json.dumps(stamp), encoding="utf-8")
+        os.replace(str(tmp), str(dest))
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def alarm(*, client, mention: list, unit: str, journal_lines: list) -> int:
+    """Post ONE forum thread announcing that *unit* failed (#3276 C10/C11).
+
+    Pure apart from the client call: the CLI gathers *journal_lines*. Returns 0
+    on a 2xx post, 1 when the post fails (never raises), so the alarm unit
+    itself fails visibly when the forum is unreachable.
+    """
+    category = os.environ.get("FORUM_BACKUP_ALARM_CATEGORY", "").strip() or ALARM_DEFAULT_CATEGORY
+    agent = os.environ.get("FORUM_BACKUP_ALARM_AGENT", "").strip()
+    if not agent:
+        user = os.environ.get("USER", "").strip() or os.environ.get("LOGNAME", "").strip()
+        agent = user[len("agent-"):] if user.startswith("agent-") else user
+        agent = agent or "forum-backup"
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    tail = list(journal_lines)[-ALARM_JOURNAL_LINES:]
+    parts = [f"`{unit}` failed. Last {ALARM_JOURNAL_LINES} journal lines:", "", "```"]
+    parts.extend(tail if tail else ["(no journal output captured)"])
+    parts.append("```")
+    if mention:
+        parts.extend(["", " ".join(f"@{m}" for m in mention)])
+    else:
+        # Never skip the post over a missing mention; say so once (one journal line).
+        print(
+            "NOTE: FORUM_BACKUP_ALARM_MENTION is empty; posting without a mention",
+            file=sys.stderr,
+        )
+    payload = {
+        "agent": agent,
+        "thread_id": None,
+        "category_slug": category,
+        "title": f"forum backup FAILED {today}",
+        "body_md": "\n".join(parts),
+        "hostname": socket.gethostname(),
+    }
+    try:
+        client.post("/api/post", payload)
+    except Exception as exc:  # ForumNetworkError / ForumHttpError; never hide a failed alarm
+        print(f"ERROR: forum backup alarm post failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _alarm_cli(unit: str) -> int:
+    """CLI half of --alarm: gather the journal, build the client, call alarm()."""
+    try:
+        out = subprocess.run(
+            ["journalctl", "--user", "-u", unit, "-n", str(ALARM_JOURNAL_LINES), "-o", "cat"],
+            capture_output=True, text=True,
+        )
+        journal_lines = out.stdout.splitlines() if out.returncode == 0 else []
+    except OSError as exc:
+        print(f"NOTE: journalctl unavailable: {exc}", file=sys.stderr)
+        journal_lines = []
+
+    mention = os.environ.get("FORUM_BACKUP_ALARM_MENTION", "").replace(",", " ").split()
+
+    # forum_api is imported only here so the backup path stays stdlib-only and
+    # independent of it. Script run: tools/ is sys.path[0]; package run: tools.*.
+    try:
+        from forum_api import ForumClient  # type: ignore
+    except ImportError:
+        from tools.forum_api import ForumClient  # type: ignore
+    client = ForumClient(os.environ.get("FORUM_URL", "").strip() or "http://localhost:5002")
+    return alarm(client=client, mention=mention, unit=unit, journal_lines=journal_lines)
 
 
 def _row_counts(conn: sqlite3.Connection) -> dict[str, int]:
@@ -671,7 +793,24 @@ def main() -> int:
             "debugging. Default: strip derived data (correct for production)."
         ),
     )
+    parser.add_argument(
+        "--alarm",
+        action="store_true",
+        default=False,
+        help=(
+            "Alarm mode (#3276): post a forum thread that --unit failed, with its "
+            "last journal lines. Runs NO backup. Used by engram-forum-backup-alarm.service."
+        ),
+    )
+    parser.add_argument(
+        "--unit",
+        default="engram-forum-backup.service",
+        help="systemd --user unit whose failure --alarm reports.",
+    )
     args = parser.parse_args()
+
+    if args.alarm:
+        return _alarm_cli(args.unit)
 
     db_path = args.db
     backup_dir = Path(args.backup_dir)
@@ -788,12 +927,20 @@ def main() -> int:
 
     # --- commit (skip if nothing changed) ------------------------------------
     try:
+        _ensure_stamp_ignored(backup_dir)
         committed = _git_commit(backup_dir)
     except subprocess.CalledProcessError as exc:
         print(
             f"ERROR: git commit failed: {exc.stderr.strip() or exc}",
             file=sys.stderr,
         )
+        return 1
+
+    # --- success stamp (#3276): only reached on success, never after a `return 1` ---
+    try:
+        _write_success_stamp(backup_dir, committed)
+    except OSError as exc:
+        print(f"ERROR: writing success stamp failed: {exc}", file=sys.stderr)
         return 1
 
     if committed:
