@@ -15,7 +15,8 @@
 # NORMALIZED (absolute, physical, no trailing slash) ENGRAM_HOME, derived by
 # tools/engramd-owner-home-key.sh -- the one helper hooks/start-engramd-owner.sh also uses:
 #   Linux  → the systemd USER unit engramd-owner-<id>.service rendered from
-#            engramd-owner.service.template (restarts are bounded by systemd's start limit).
+#            engramd-owner.service.template (restarts are unbounded; the retry RATE is
+#            bounded by exponential backoff, systemd >= 254).
 #   Darwin → the LaunchAgent com.engram.engramd-owner.<id> rendered from
 #            engramd-owner.plist.template to ~/Library/LaunchAgents/<label>.plist, then
 #            `launchctl bootout gui/<uid>/<label>` (failure ignored) and

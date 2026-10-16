@@ -215,9 +215,14 @@ def test_c2_exit0_clean_stop_is_not_restarted(rendered):
             assert "0" not in v.split(), f"{key}={v} would restart a clean stop"
 
 
-def test_c2_exit1_already_running_is_restarted_but_bounded(rendered):
-    """Exit 1: restarted by Restart=on-failure, but bounded -- RestartSec plus StartLimit* in [Unit]
-    (5 starts in 300 s); once the limit trips the unit stays failed until reset-failed."""
+def test_c2_exit1_already_running_is_restarted_unbounded_with_backoff(rendered):
+    """Exit 1: restarted by Restart=on-failure and never stopped by a start limit --
+    StartLimitIntervalSec=0 disables it (#3831) -- with a bounded BACKOFF (RestartSteps /
+    RestartMaxDelaySec in [Service]) capping the retry rate instead of going permanently
+    `failed`. Before #3831 this was 5 starts in 300 s, after which the unit stayed failed and
+    every stop blocked until a human ran `systemctl --user reset-failed`. The
+    StartLimitIntervalSec=0 assertion itself lives in the C1 render cell below, so the C1
+    mutation reddens exactly that cell and not this one."""
     _u, _h, ini, _s = rendered
     svc, unit = ini["Service"], ini["Unit"]
     assert svc["Restart"][0] in ("on-failure", "always")
@@ -225,16 +230,22 @@ def test_c2_exit1_already_running_is_restarted_but_bounded(rendered):
         for v in svc.get(key, []):
             assert "1" not in v.split(), f"{key}={v} makes exit 1 un-restarted"
     assert _seconds(svc["RestartSec"][0]) >= 5
-    assert _seconds(unit["StartLimitIntervalSec"][0]) >= 60
-    burst = unit["StartLimitBurst"][0]
-    assert burst.isdigit() and 3 <= int(burst) <= 10, burst
-    assert "StartLimitIntervalSec" not in svc and "StartLimitBurst" not in svc, \
-        "StartLimit* belongs in [Unit]; in [Service] it is ignored"
+    # No start limit any more, so no inert StartLimitBurst may linger: StartLimit* belongs in
+    # [Unit] when it is used at all, and in [Service] systemd ignores it either way.
+    assert "StartLimitBurst" not in unit and "StartLimitBurst" not in svc, \
+        "an inert StartLimitBurst must not remain once StartLimitIntervalSec=0 disables the limit"
+    # The backoff that replaces the limit, in [Service] where systemd reads it.
+    steps = svc["RestartSteps"][0]
+    assert steps.isdigit() and int(steps) >= 1, steps
+    assert _seconds(svc["RestartMaxDelaySec"][0]) >= _seconds(svc["RestartSec"][0])
+    assert "StartLimitIntervalSec" not in svc and "RestartSteps" not in unit \
+        and "RestartMaxDelaySec" not in unit, "the restart directives belong in [Service]"
 
 
 def test_c2_exit3_displaced_must_be_restarted(rendered):
     """Exit 3 is never a success status (no SuccessExitStatus, not in RestartPreventExitStatus), so
-    Restart=on-failure restarts it -- until the start limit trips, like exit 1."""
+    Restart=on-failure restarts it -- unbounded, like exit 1 (#3831:
+    RestartSteps/RestartMaxDelaySec backoff instead of a start limit)."""
     _u, _h, ini, _s = rendered
     svc = ini["Service"]
     assert "SuccessExitStatus" not in svc, f"SuccessExitStatus={svc.get('SuccessExitStatus')}"
@@ -464,6 +475,101 @@ class Seat:
                         printf 'LoadState=loaded\\nActiveState=active\\nSubState=running\\n'; else nf; fi;;
               inactive) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
                         printf 'LoadState=loaded\\nActiveState=failed\\nSubState=failed\\n'; else nf; fi;;
+              # ---- #3831: restart-detail modes (additive; the hook reads state AND detail from
+              # ONE `show` spawn -- round 2 folded NRestarts/SubState/ExecMainStatus into the one
+              # `-p` list, so every mode below must be answerable by a single call) --
+              running-0) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=active\\nSubState=running\\nNRestarts=0\\nExecMainStatus=0\\n'; else nf; fi;;
+              # ROUND 6 (#3835, B1) -- RE-FIXTURED. This read `ExecMainStatus=1` with no
+              # `ExecMainCode`, i.e. `active/running` carrying an exit status. That record does not
+              # occur on systemd 255.4: systemd ZEROES ExecMainCode/ExecMainStatus when it spawns a
+              # new main process, so a running unit reads 0/0 whatever it exited with before
+              # (measured: 18 long-running services on this host read a large NRestarts with 0/0).
+              # The restart count is kept; the code/status pair is the measured one. The exit clause
+              # is therefore NOT printworthy here, and the loud line must say so (see C4's running-3
+              # cell and C8e, both rewritten this round).
+              running-3) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=active\\nSubState=running\\nNRestarts=3\\nExecMainStatus=0\\nExecMainCode=0\\n'; else nf; fi;;
+              # ROUND 6 (#3835, B1/B3): `ExecMainCode=1` ADDED -- this is `activating/auto-restart`,
+              # the one state where the exit IS retained (Sol measured `code 1, status 1` on a unit
+              # waiting to retry), so a fixture omitting the code models a record that does not
+              # occur. Without it the B1 gate reads code 0 and drops the exit clause; with it the
+              # clause and exit 5's meaning stay pinned (C4's restart-loop cell).
+              restart-loop) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=activating\\nSubState=auto-restart\\nNRestarts=5\\nExecMainStatus=5\\nExecMainCode=1\\n'; else nf; fi;;
+              failed-4) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=failed\\nSubState=failed\\nNRestarts=2\\nExecMainStatus=4\\nExecMainCode=1\\n'; else nf; fi;;
+              # ---- round 2 (#3835): the two states the round-1 fixture set could not reach ----
+              # `failed` at NRestarts >= 3: exit 4 is in RestartPreventExitStatus, so systemd will
+              # NOT retry it -- the unit IS permanently failed. Round 1 routed this to the LOUD
+              # line, whose retry clause said the opposite. (twin: `failed-4`, one restart lower)
+              failed-4-nr3) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=failed\\nSubState=failed\\nNRestarts=3\\nExecMainStatus=4\\nExecMainCode=1\\n'; else nf; fi;;
+              # A manual stop: `ActiveState=inactive` + `SubState=dead` -- the REAL pair, NOT
+              # `SubState=inactive`, which systemd never emits (see C7e). No failure to clear, so
+              # `reset-failed` would be a no-op. `ExecMainCode=1` (CLD_EXITED) is what makes this a
+              # REAL stop rather than a unit that never ran: both read `success`/`ExecMainStatus=0`,
+              # and only the code separates them (#3835 round 5, C9c; see the `never-started-0`
+              # twin below, which is the 70-unit population of units that never ran a process).
+              stopped-0) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nNRestarts=0\\nExecMainStatus=0\\nExecMainCode=1\\n'; else nf; fi;;
+              # ---- round 5 (#3835): the never-started population, measured on the parent's host
+              # as the `inactive`/`success` + ExecMainCode=0 row (70 of 402 units; `ExecMainStatus=0`
+              # as well, which is exactly why `Result`+`ExecMainStatus` alone cannot tell it apart
+              # from `stopped-0` above). LoadState/ActiveState/SubState/NRestarts/ExecMainCode/
+              # ExecMainStatus/Result are the live field values.
+              never-started-0) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nNRestarts=0\\nExecMainStatus=0\\nExecMainCode=0\\nResult=success\\n'; else nf; fi;;
+              # round 5: `auditd.service`'s shape, the live example for the `failed` arm --
+              # `failed`/`failed` + `Result=exit-code` while the record holds NO process exit
+              # (ExecMainCode=0) and reports status 0. The failed arm's exit clause would print
+              # `(last exit 0: clean stop)` for a unit systemd calls FAILED.
+              failed-0) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=failed\\nSubState=failed\\nNRestarts=5\\nExecMainStatus=0\\nExecMainCode=0\\nResult=exit-code\\n'; else nf; fi;;
+              # round 2: state readable, detail NOT -- the faithful single-spawn simulation of a
+              # detail read that could not be completed (round 1 made the whole call exit 1; with
+              # one spawn for state+detail that would read as `nobus` and launch, which is the
+              # wrong degrade. The state triplet is returned and the detail fields are absent.)
+              detail-broken) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=activating\\nSubState=auto-restart\\n'; else nf; fi;;
+              # ---- round 4 (#3835): `activating` with a substate that is NOT `auto-restart` --
+              # `restart-loop` pins only `auto-restart`. `activating` also carries `start` -- a
+              # unit actively starting again -- and the loud line's claims are FALSE there at
+              # NRestarts=0 (it has never restarted, and systemd is STARTING it, not retrying).
+              # C8a and C8b pin the two sides of that NRestarts boundary.
+              activating-start-0) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=activating\\nSubState=start\\nNRestarts=0\\nExecMainStatus=0\\n'; else nf; fi;;
+              activating-start-1) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=activating\\nSubState=start\\nNRestarts=1\\nExecMainStatus=1\\n'; else nf; fi;;
+              # ---- round 4: the loud threshold from below, and exits 0 and 3 through the loud line
+              # ROUND 6 (#3835, B1): `running-2` re-fixtured with `running-3` (see above) -- a running
+              # unit reads 0/0.
+              running-2) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=active\\nSubState=running\\nNRestarts=2\\nExecMainStatus=0\\nExecMainCode=0\\n'; else nf; fi;;
+              loud-exit0) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=active\\nSubState=running\\nNRestarts=3\\nExecMainStatus=0\\n'; else nf; fi;;
+              # ROUND 6 (#3835, B1): `ExecMainCode=1` ADDED for the same reason as `restart-loop` --
+              # `activating/auto-restart` retains the exit, so omitting the code models a record that
+              # does not occur. Retaining it keeps C8f's exit-3 meaning pin green under the B1 gate.
+              loud-exit3) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=activating\\nSubState=auto-restart\\nNRestarts=1\\nExecMainStatus=3\\nExecMainCode=1\\n'; else nf; fi;;
+              # ---- round 6 (#3835, B2/B3): records Sol measured on systemd 255.4 that no fixture
+              # above reaches --
+              # B2: the FIRST failure, waiting for the first retry. The exit IS recorded (code 1)
+              # while the counter still reads 0: `h2` in Sol's harness.
+              auto-restart-nr0) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=activating\\nSubState=auto-restart\\nNRestarts=0\\nExecMainStatus=1\\nExecMainCode=1\\n'; else nf; fi;;
+              # B3: SIGILL on a `Type=simple` unit -- `Result=core-dump ExecMainCode=3
+              # ExecMainStatus=4`. Code 3 is CLD_DUMPED, so status 4 is SIGNAL 4, not "exit 4": the
+              # ungated clause printed exit 4's own meaning and its "fix the path" remedy.
+              failed-killed-4) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=failed\\nSubState=failed\\nNRestarts=1\\nExecMainStatus=4\\nExecMainCode=3\\n'; else nf; fi;;
+              killed-loud-4) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=activating\\nSubState=auto-restart\\nNRestarts=1\\nExecMainStatus=4\\nExecMainCode=3\\n'; else nf; fi;;
+              # B3: SIGKILL is CLD_KILLED (code 2) -- a DIFFERENT si_code from SIGILL's CLD_DUMPED,
+              # so the signal arm is pinned on both, not on one value.
+              failed-killed-9) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=failed\\nSubState=failed\\nNRestarts=1\\nExecMainStatus=9\\nExecMainCode=2\\n'; else nf; fi;;
             esac
             """))
 
@@ -1872,3 +1978,943 @@ def test_k15_long_home_does_not_swallow_any_other_oserror(tmp_path, monkeypatch)
 def test_the_io_helper_is_tiered_essential_with_a_flattening_dest():
     entry = _tiers().get("hooks/claude/_engramd_owner_hook_io.py")
     assert entry and entry["tier"] == "essential" and entry["dest"] == "hooks/_engramd_owner_hook_io.py", entry
+
+
+# ---------------------------------------------------------------------------
+# #3831 -- the owner unit must not go permanently failed (restarts + bounded backoff)
+# ---------------------------------------------------------------------------
+#
+# On a seat with any `engramd.*_via_owner` flag on, a crash loop reached systemd's start limit
+# and the unit went permanently `failed` -- after which EVERY stop blocked until a human ran
+# `reset-failed`. macOS has no such limit (launchd throttles and keeps trying), so this was also
+# a platform-parity defect. The fix: StartLimitIntervalSec=0 (unlimited restarts) + a bounded
+# exponential backoff, and a launcher line so a restart loop is LOUD rather than quiet.
+
+# ---- C1: the rendered unit disables the start limit and adds the backoff --------------------
+#
+# MUTATION CONTROL for this cell: restore `StartLimitIntervalSec=300` in
+# templates/engramd-owner.service.template and re-run -- THIS cell goes red
+# (StartLimitIntervalSec != ["0"]) while the other render cells (exit 0/1/3/4 semantics, argv,
+# ENGRAM_HOME, the log routing) stay green. A mutation that reddens everything proves nothing.
+
+def test_c1_rendered_unit_disables_the_start_limit_and_adds_the_backoff(rendered):
+    unit, _h, ini, _s = rendered
+    u, svc = ini["Unit"], ini["Service"]
+    # StartLimitIntervalSec=0 DISABLES the rate limit: a crash loop restarts forever instead of
+    # going permanently `failed`. It belongs in [Unit]; in [Service] systemd ignores it.
+    assert u.get("StartLimitIntervalSec") == ["0"], u.get("StartLimitIntervalSec")
+    # An inert directive left in a file people read to learn the restart policy is the exact
+    # "code should not mislead" problem this unit fixes: StartLimitBurst must not linger.
+    assert "StartLimitBurst" not in u and "StartLimitBurst" not in svc, \
+        "StartLimitBurst is inert under StartLimitIntervalSec=0 and must not remain"
+    # The backoff that replaces the limit, in [Service] where systemd reads it.
+    assert svc.get("RestartSteps") == ["5"], svc.get("RestartSteps")
+    assert svc.get("RestartMaxDelaySec") == ["300s"], svc.get("RestartMaxDelaySec")
+    assert "RestartSteps" not in u and "RestartMaxDelaySec" not in u
+    # Unchanged by #3831.
+    assert svc["Restart"] == ["on-failure"]
+    assert _seconds(svc["RestartSec"][0]) == 10
+    assert svc["RestartPreventExitStatus"] == ["4"]
+
+
+def test_c1b_the_rendered_header_states_the_systemd_254_floor_for_the_backoff(rendered):
+    """RestartSteps/RestartMaxDelaySec are systemd >= 254. Below that they are UNKNOWN KEYS
+    (warned and IGNORED), so the unit degrades to "restart forever, no backoff" -- never to a
+    refused unit. The header must say so, next to the existing >= 240 `append:` note, so an
+    editor who deletes the two directives is made to revisit the sentence. A light prose pin, by
+    design: it names the floor and the two directives together."""
+    unit, _h, _ini, _s = rendered
+    lines = unit.read_text(encoding="utf-8").splitlines()
+    named = [i for i, ln in enumerate(lines)
+             if ln.lstrip().startswith("#") and "254" in ln
+             and "RestartSteps" in ln and "RestartMaxDelaySec" in ln]
+    assert named, "no header comment names the >= 254 floor together with the two directives"
+    steps_at = next(i for i, ln in enumerate(lines) if ln.strip().startswith("RestartSteps="))
+    assert named[0] < steps_at, "the >= 254 floor note belongs in the header, before the directive"
+    assert any(ln.lstrip().startswith("#") and "240" in ln for ln in lines), \
+        "the pre-existing >= 240 `append:` note must stay next to it"
+
+
+# ---- C3: exit 4 is still not restarted -------------------------------------------------------
+
+def test_c3_exit4_stays_out_of_restarts_under_the_new_policy(rendered):
+    """#3831 must not convert a planted-path refusal into an infinite retry loop: exit 4 is still
+    the ONE status RestartPreventExitStatus lists (so the unbounded policy never retries it), and
+    the file's raw line agrees."""
+    unit, _h, ini, _s = rendered
+    code = str(_exit_path_not_regular())
+    svc = ini["Service"]
+    assert svc.get("RestartPreventExitStatus") == [code], svc.get("RestartPreventExitStatus")
+    raw = [ln.strip() for ln in unit.read_text(encoding="utf-8").splitlines()
+           if ln.strip().startswith("RestartPreventExitStatus=")]
+    assert raw == [f"RestartPreventExitStatus={code}"], raw
+    assert not ({"1", "3"} & set(svc["RestartPreventExitStatus"][0].replace(",", " ").split()))
+    assert svc["Restart"] == ["on-failure"]
+
+
+def test_c3_both_planted_path_refusals_map_to_exit4():
+    """The issue's item 3 note: OwnerPidfileNotRegular and OwnerStorePathNotRegular are BOTH
+    exit 4 (EXIT_PATH_NOT_REGULAR), so the one RestartPreventExitStatus=4 excludes both. Read off
+    the owner's own shared refusal->exit table (no drift, no second copy of the mapping)."""
+    if str(SRC) not in sys.path:
+        sys.path.insert(0, str(SRC))
+    import engramd_owner
+    assert engramd_owner.EXIT_PATH_NOT_REGULAR == 4
+    assert engramd_owner._refusal_exit_code(engramd_owner.OwnerPidfileNotRegular()) \
+        == engramd_owner.EXIT_PATH_NOT_REGULAR
+    assert engramd_owner._refusal_exit_code(engramd_owner.OwnerStorePathNotRegular()) \
+        == engramd_owner.EXIT_PATH_NOT_REGULAR
+
+
+# ---- C4: the launcher's loud line ------------------------------------------------------------
+#
+# Under the new policy a persistent fault systemd RESTARTS no longer reaches `failed` -- it reads
+# `activating (auto-restart)` forever, a QUIETER failure than a failed unit. Exit 4, in
+# RestartPreventExitStatus, is the exception: it still reaches a permanent stop, by design, pre-PR
+# and post-PR alike. So the launcher
+# surfaces it: ONE bounded additionalContext object naming the restart count, the last exit
+# status, the MEANING of that status, and the remedy. `_unit_detail()` returns an EMPTY detail on
+# ANY failure, and an empty detail degrades to today's message exactly: a broken detail read must
+# never be louder or more confident than the read it replaced.
+
+def test_c4_a_restarting_unit_gets_exactly_one_loud_line_with_count_status_and_remedy(seat):
+    seat.config(FLAG_ON)
+    seat.systemctl("restart-loop", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0
+    assert seat.launched() == [], "a registered unit must never get a second owner"
+    assert len(r.stdout.splitlines()) == 1, r.stdout  # ONE bounded JSON object, the stdout contract
+    lines = context_lines(r)
+    assert len(lines) == 1, lines
+    (line,) = lines
+    assert seat.unit_name() in line and "auto-restart" in line, line
+    assert "NRestarts=5" in line, line                      # the restart count
+    assert "last exit 5" in line, line                     # the last exit status
+    assert "schema" in line and "migration" in line, line  # the MEANING of status 5
+    assert "reset-failed" in line, line                    # the remedy
+    assert any(line in ln for ln in seat.log_lines()), seat.log_lines()
+
+
+def test_c4_a_healthy_running_unit_produces_no_line(seat):
+    """Silent when healthy: a running unit with NRestarts=0 produces no line at all."""
+    seat.config(FLAG_ON)
+    seat.systemctl("running-0", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0
+    assert r.stdout == "" and r.stderr == "", (r.stdout, r.stderr)
+    assert seat.launched() == []
+    assert seat.log_lines() == [], seat.log_lines()
+
+
+def test_c4_a_running_unit_that_has_restarted_three_times_is_loud(seat):
+    """`NRestarts >= 3` is a loud trigger even while the unit is RUNNING: a unit that crashed
+    three times and came back looks healthy and is not. (The healthy cell above pins the
+    NRestarts=0 side of the same boundary.)
+
+    ROUND 6 (#3835, B1) -- RE-ASSERTED, not weakened. Its two exit-clause assertions (`last exit 1`,
+    `another owner holds this seat`) were true only of fixture `running-3` as it was written:
+    `active/running` carrying `ExecMainStatus=1`. That record does not occur -- systemd zeroes
+    ExecMainCode/ExecMainStatus when it spawns the new main process, so a running unit reads 0/0 --
+    and the fixture is now the measured one, so the clause those assertions named must NOT be
+    printed. The LOUDNESS claim, which is what this cell exists for, is unchanged; the exit clause's
+    absence is now pinned beside it (as in the rewritten C8e)."""
+    seat.config(FLAG_ON)
+    seat.systemctl("running-3", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    lines = context_lines(r)
+    assert len(lines) == 1 and "NRestarts=3" in lines[0], r.stdout
+    assert "is now running" in lines[0], lines[0]
+    assert "last exit" not in lines[0], lines[0]
+
+
+def test_c4_a_planted_path_failure_says_which_it_is_and_names_the_remedy(seat):
+    """`registered but failed`: the line must say WHICH failure it is (exit 4 = a planted
+    non-regular path) and name the remedy, `reset-failed` (the issue's item 4)."""
+    seat.config(FLAG_ON)
+    seat.systemctl("failed-4", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    lines = context_lines(r)
+    assert len(lines) == 1 and seat.unit_name() in lines[0], r.stdout
+    assert "failed" in lines[0] and "last exit 4" in lines[0], lines[0]
+    assert "planted" in lines[0] and "reset-failed" in lines[0], lines[0]
+
+
+def test_c4_a_broken_unit_detail_read_degrades_to_todays_message_and_launches_nothing(seat):
+    """`_unit_detail()`'s failure contract: the detail FIELDS are absent from the single `show`
+    record here. Round 2 put state and detail on ONE spawn, so a detail that could not be read is
+    a record with no NRestarts/ExecMainStatus -- not a failing call, which would read as `nobus`
+    and launch (the wrong degrade). The detail is EMPTY and the launcher falls back to exactly
+    today's message -- never a wrong or partial line, and never a remedy it did not establish."""
+    seat.config(FLAG_ON)
+    seat.systemctl("detail-broken", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    lines = context_lines(r)
+    assert len(lines) == 1, r.stdout
+    (line,) = lines
+    assert f"ENGRAM owner unit {seat.unit_name()} is registered but activating" in line, line
+    assert "leaving it to systemd, no second owner launched" in line, line
+    assert _physical(seat.eh) in line, line
+    assert "reset-failed" not in line, \
+        "a failed detail read must not name a remedy it could not establish"
+    assert "NRestarts" not in line, line
+
+
+# ---- C7 (round 3, #3835): route by STATE first, count second ---------------------------------
+#
+# The round-1 defect. `_detail_is_loud()` was `[ "$subst" = "auto-restart" ] || [ "$nr" -ge 3 ]`
+# -- it never consulted whether the unit was FAILED -- and `_owner_loud_line()` printed a
+# CONSTANT retry clause:
+#     "under the unbounded restart policy a restartable exit never goes permanently failed, so
+#      systemd keeps retrying."
+# For `detail = "3 failed 4"` that is the exact opposite of the truth: exit 4 is the one status
+# in RestartPreventExitStatus=4, so systemd will NEVER retry that unit -- it IS permanently
+# failed. Because NRestarts persists until `reset-failed`, ANY exit-4 refusal after three earlier
+# restarts reached that branch, and it made `_owner_down_line()`, which words `failed` correctly,
+# UNREACHABLE at NRestarts >= 3.
+#
+# Why the round-1 suite could not see it: its `failed-4` fixture sits at NRestarts=2, one below
+# the `>= 3` threshold. That cell, `test_c4_a_planted_path_failure_says_which_it_is_and_names_the
+# _remedy`, is NOT restated here and is left UNCHANGED by this round; its greenness beside C7b's
+# is the point -- the hole lived one restart above the fixture.
+#
+# The round-2 fix routed by SubState. Round 3 re-keys the SAME routing to ActiveState, systemd's
+# own state axis: a STOPPED unit reads `ActiveState=inactive` + `SubState=dead`, and
+# `SubState=inactive` is NEVER a value systemd emits, so round 2's `inactive` arm was unreachable
+# and a stopped unit fell through to today's message, which names NO remedy (C7a below is that
+# fix landing; C7e is the pin that keeps it there). The routing (`_owner_verdict` in the hook) is:
+#   failed      -> DOWN line, ALWAYS, whatever NRestarts; systemd will not retry it
+#   inactive    -> DOWN line; not a failure, it was stopped; remedy is `start` only, never
+#                  `reset-failed` (a no-op with nothing to clear)
+#   activating  -> LOUD line; here systemd IS retrying (the clause is true)
+#   active      -> silent unless NRestarts >= 3 -> loud; it RESTARTED and is now running, so it is
+#                  NOT being retried
+#   other/empty -> today's behaviour
+#
+# NAMING: these cells were C6a-C6e in round 2 and are renumbered to the spec's C7a-C7e, because
+# the axis they pin changed from SubState to ActiveState. C7e is the vocabulary pin.
+
+def test_c7a_a_stopped_unit_is_told_to_start_and_never_to_reset_failed(seat):
+    """C7a -- `ActiveState=inactive` + `SubState=dead`, the REAL stopped pair, reaches the DOWN
+    line; the text names `start` and does NOT name `reset-failed`. This is finding 3 ACTUALLY
+    landing, and it is RED against round 2: round 2 keyed the arm on `SubState == "inactive"`, a
+    value systemd never emits, so `dead` fell to "any other" -- today's message, which names no
+    remedy at all. (Round 2's `stopped-0` fixture printed the impossible `SubState=inactive`; it is
+    now the real pair.) The LOUD line must not be emitted for a stopped unit.
+
+    ROUND 4 (#3835): the asserted clause moved from "it was stopped rather than failed" to "it is
+    not running (stopped, or never started)". `ActiveState=inactive` + `SubState=dead` is emitted
+    for a unit that was NEVER STARTED as well as for a manual stop, so the old clause over-stated
+    the history -- the same claim-must-not-outrun-its-bound class as this round's Defect 1.
+
+    ROUND 5 (#3835): this fixture now carries `ExecMainCode=1`, so the unit really did run and exit
+    before it was stopped, and its line therefore keeps the exit clause. That is the point of the
+    C9 group: an `inactive` unit with NO recorded exit gets a different line (C9a), and C9c pins this
+    side of the boundary. The assertions here are the remedy and the history clause, not the exit
+    clause."""
+    seat.config(FLAG_ON)
+    seat.systemctl("stopped-0", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    lines = context_lines(r)
+    assert len(lines) == 1, r.stdout
+    (line,) = lines
+    assert "is registered but inactive" in line, line          # the DOWN line
+    assert "it is not running (stopped, or never started)" in line, line  # exact: `inactive`
+    #   covers a never-started unit too, so no over-stated history claim
+    assert "systemctl --user start" in line, line              # the remedy
+    assert "reset-failed" not in line, \
+        "a stopped unit has nothing to clear: `reset-failed` is a no-op and must not be named"
+    assert "has restarted" not in line, "the LOUD line was emitted for a stopped unit"
+
+
+def test_c7b_a_failed_unit_at_three_restarts_reaches_the_down_line_not_the_loud_one(seat):
+    """C7b -- `failed`/`failed` + exit 4 reaches the DOWN line at NRestarts >= 3, AND the text
+    does not claim systemd is retrying. This is the reachability fix: under round 1 the count-first
+    predicate sent it to the LOUD line, whose constant clause said systemd "keeps retrying" -- the
+    opposite of the truth for the one status in RestartPreventExitStatus. The only difference from
+    the pre-existing C4 cell is the restart count, which is exactly the axis round 1 got wrong."""
+    seat.config(FLAG_ON)
+    seat.systemctl("failed-4-nr3", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    lines = context_lines(r)
+    assert len(lines) == 1, r.stdout
+    (line,) = lines
+    assert "is registered but failed" in line, line                  # the DOWN line ...
+    assert "systemd will not retry it" in line, line                 # ... and it says so
+    assert "has restarted" not in line, "the LOUD line was emitted for a FAILED unit"
+    assert "NRestarts=" not in line, line
+    assert "keeps retrying" not in line, line
+    assert "never goes permanently failed" not in line, line
+    assert "last exit 4" in line, line                               # the status ...
+    assert "planted" in line, line                                   # ... and its MEANING
+
+
+def test_c7c_a_mid_restart_unit_still_gets_the_loud_line_saying_systemd_is_retrying(seat):
+    """C7c -- `activating`/`auto-restart` is the ONE state where the loud clause is TRUE: the unit
+    really is being retried (Restart=on-failure + StartLimitIntervalSec=0), and the line must keep
+    saying so.
+
+    DISCLOSURE (carried from round 2, #3835): this cell PASSED BEFORE its implementation. It pins
+    behaviour round 1 already had right -- the old `[ "$subst" = "auto-restart" ] || [ "$nr" -ge 3 ]`
+    predicate already routed `auto-restart` to the loud line -- so it is a REGRESSION GUARD, not a
+    red-first cell, and is NOT evidence of a defect this round caught. (Round-2 name: C6c.)"""
+    seat.config(FLAG_ON)
+    seat.systemctl("restart-loop", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    (line,) = context_lines(r)
+    assert "auto-restart" in line and "NRestarts=5" in line, line
+    assert "systemd keeps retrying" in line, line
+
+
+def test_c7d_a_running_unit_that_restarted_three_times_is_not_claimed_to_be_retried(seat):
+    """C7d -- `active`/`running` + NRestarts >= 3 IS loud, but the unit is RUNNING: it restarted
+    and came back, so it is NOT being retried. The loud clause must not appear (round 1 emitted it
+    here)."""
+    seat.config(FLAG_ON)
+    seat.systemctl("running-3", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    (line,) = context_lines(r)
+    assert "NRestarts=3" in line, line
+    assert "is now running" in line, line
+    assert "keeps retrying" not in line, line
+    assert "never goes permanently failed" not in line, line
+
+
+def test_c7e_the_vocabulary_pin_substate_inactive_is_not_a_value_systemd_emits(seat):
+    """C7e (VOCABULARY PIN) -- `SubState=inactive` is NOT a value systemd emits: a STOPPED unit is
+    `ActiveState=inactive` + `SubState=dead`. MEASURED on systemd 255 by planting a `Type=oneshot`
+    unit (`ExecStart=/bin/true`): `systemctl --user show <u> -p ActiveState -p SubState` reads
+    `inactive`/`dead` both before it has ever been started and after a clean start; only a FAILURE
+    reads `failed`/`failed`. So the routing must key on ActiveState, and this cell is what stops a
+    well-meaning "fix" from re-keying it back to SubState.
+
+    SCOPE (round 4, #3835 nit): assertion (1) below reads THIS TEST FILE's own `systemctl` stub
+    text, so it cannot fail as a function of any hook implementation -- it pins the FIXTURES'
+    vocabulary, not the hook's behaviour, and must never be counted as evidence about the hook.
+    Only assertion (2) is evidence about the hook.
+
+    Both assertions redden if the routing is re-keyed on SubState again: (1) no `systemctl` stub
+    fixture in this suite may print the impossible pair -- round 2's `stopped-0` did, which is
+    exactly why its unreachable `inactive` arm LOOKED covered; and (2) the REAL stopped pair must
+    reach a real verdict and not today's fallback. Under a SubState-keyed route `dead` maps to no
+    arm, the fallback ("leaving it to systemd") is emitted, and (2) fires."""
+    seat.config(FLAG_ON)
+    seat.systemctl("stopped-0", seat.unit_name())
+    stub = (seat.stubs / "systemctl").read_text(encoding="utf-8")
+    # Only the EMITTED payloads count -- a comment may name the impossible value (the fixture's own
+    # comment does, to say why it is not emitted), but a `printf` must never carry it.
+    emitted = "\n".join(ln for ln in stub.splitlines() if "printf" in ln)
+    assert "SubState=inactive" not in emitted, (
+        "a stub fixture prints `SubState=inactive`, which systemd never emits: a stopped unit is "
+        "`ActiveState=inactive` + `SubState=dead`. A cell built on that pair is testing an "
+        "impossible input and cannot be evidence of anything (see C7a).")
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    lines = context_lines(r)
+    assert len(lines) == 1, r.stdout
+    (line,) = lines
+    assert "leaving it to systemd" not in line, (
+        "the REAL stopped pair fell through to today's fallback: the routing is keyed on SubState, "
+        "not on ActiveState -- `dead` is not an `inactive` arm, so no remedy was named")
+    assert "systemctl --user start" in line, line
+
+
+def test_c7f_one_fire_makes_exactly_one_systemctl_show_call(seat):
+    """C7f -- state and detail must come from ONE `systemctl --user show` spawn (round-2 finding
+    2): two spawns can describe two different moments of a unit that changed between them. The
+    fields are folded into one `-p` list and the call COUNT is pinned, so a future re-introduction
+    of the second spawn reddens here even if both answers happen to agree. (Round-2 name: C6g;
+    orthogonal to the ActiveState re-keying, so it keeps its assertions verbatim.)"""
+    seat.config(FLAG_ON)
+    seat.systemctl("restart-loop", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0
+    raw = seat.syslog.read_text(encoding="utf-8").splitlines() if seat.syslog.exists() else []
+    shows = [ln.split() for ln in raw if ln.split()[1:2] == ["show"]]
+    assert len(shows) == 1, shows
+    (call,) = shows
+    assert call[0] == "--user", call
+    joined = " ".join(call)
+    # `ExecMainCode` is in the SAME `-p` list (#3835 round 5): the exit-clause gate must not have
+    # bought a second spawn to read it.
+    for key in ("LoadState", "ActiveState", "SubState", "NRestarts", "ExecMainStatus", "ExecMainCode"):
+        assert key in joined, (key, call)
+
+
+# ---- C8 (round 4, #3835): the loud line's claims must be TRUE in every state it is reached ----
+#
+# Round 3 re-keyed the routing onto ActiveState and that fix stands. Round 4 closes the hole one
+# level down -- the SAME defect class the PR exists to fix. `_owner_verdict` sent EVERY
+# `activating` substate to `loud`, so `activating` + `SubState=start` (systemd is STARTING the
+# unit again, not retrying it) at `NRestarts=0` (a unit that has NEVER restarted) was handed the
+# loud line, whose two claims are then false: "has restarted: NRestarts=0" is self-contradictory,
+# and "systemd keeps retrying" is false for a unit being started rather than retried. `activating`
+# also carries `reload`, `stop` and `final-sigterm`, and `restart-loop` pins only `auto-restart`,
+# so no cell in this suite reached the other substates.
+#
+# The corrected contract keys the loud verdict on BOTH fields (#3835 round 4):
+#   activating + auto-restart              -> loud    (systemd IS waiting to retry; clause true)
+#   activating + any other substate, N >= 1 -> loud   (it HAS restarted; clause true)
+#   activating + any other substate, N = 0  -> unknown -> today's claim-nothing message
+# The loud line's own two-arm clause selection is untouched (the round-4 spec forbids
+# restructuring it).
+#
+# NAMING: the older C8 (`test_c8_default_mode_...`, the `--owner`-free installer cell) is untouched;
+# these round-4 cells take the letters the round-4 spec assigns (C8a, C8b, ...).
+
+
+def test_c8a_activating_never_restarted_is_not_claimed_to_have_restarted(seat):
+    """C8a -- `activating` + `SubState=start` + `NRestarts=0`: systemd is STARTING this unit and it
+    has NEVER restarted, so the loud line's "has restarted: NRestarts=0" and "systemd keeps
+    retrying" are both false. The launcher must emit today's claim-nothing message instead.
+
+    RED against the round-3 hook, which routed every `activating` substate to loud. This is the
+    round-4 Defect 1 cell; the mutation that reddens it is `_owner_verdict` routing on ActiveState
+    alone again."""
+    seat.config(FLAG_ON)
+    seat.systemctl("activating-start-0", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    lines = context_lines(r)
+    assert len(lines) == 1, r.stdout
+    (line,) = lines
+    assert "is registered but activating" in line, line
+    assert "leaving it to systemd, no second owner launched" in line, line
+    assert "has restarted" not in line, (
+        "the loud line claims the unit restarted, but NRestarts=0: it never restarted")
+    assert "NRestarts=" not in line, line
+    assert "keeps retrying" not in line, (
+        "systemd is STARTING this unit, not retrying it: the retry clause is false here")
+    assert "reset-failed" not in line, (
+        "a claim-nothing fallback must not name a remedy it did not establish")
+
+
+def test_c8b_activating_with_a_restart_count_still_gets_the_true_loud_line(seat):
+    """C8b -- C8a's other boundary: `activating` + `SubState=start` with `NRestarts=1`. The unit
+    HAS restarted once and is starting again, so the loud line's claims are true by construction
+    and it must still be emitted; the fix for C8a must not send every non-`auto-restart`
+    `activating` state to silence.
+
+    DISCLOSURE: this cell PASSED BEFORE its implementation -- round 3 also emitted the loud line
+    here, by routing on ActiveState alone -- so it is a REGRESSION GUARD against OVER-correcting
+    C8a (a fix that maps all non-`auto-restart` `activating` states to `unknown`), not evidence of
+    a defect this round caught. (C7c carries the same disclosure.) Mutation: make `_owner_verdict`
+    return `unknown` for every non-`auto-restart` `activating` state -> THIS cell reddens while
+    C8a and C7c stay green."""
+    seat.config(FLAG_ON)
+    seat.systemctl("activating-start-1", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    (line,) = context_lines(r)
+    assert "has restarted" in line, line
+    assert "NRestarts=1" in line, line
+    assert "SubState=start" in line, line
+    assert "systemd keeps retrying" in line, line
+    assert "leaving it to systemd" not in line, line
+
+
+def test_c8c_the_planted_path_remedy_text_itself_fires_the_fix_the_path_step(seat):
+    """C8c -- the exit-4 remedy branch (`_owner_down_line`'s `[ "$main" = "4" ]` arm) must be
+    OBSERVED, not inferred. The pre-existing C4 cell asserts `"planted" in line`, which exit 4's
+    own `_owner_exit_meaning` parenthetical satisfies on its own -- so deleting the remedy branch
+    leaves all thirteen c4/c7 cells green. This cell pins the remedy text itself.
+
+    Mutation: delete the `[ "$main" = "4" ]` line (revert to the generic `reset-failed, then
+    start` remedy) -> THIS cell reddens and only this cell. A COVERAGE PIN: GREEN against the
+    round-3 hook, since the branch already exists and already reads correctly; it is red only
+    under that mutation."""
+    seat.config(FLAG_ON)
+    seat.systemctl("failed-4", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    (line,) = context_lines(r)
+    assert "fix the path, then run" in line, line
+    assert "reset-failed" in line, line
+
+
+def test_c8d_the_loud_threshold_is_silent_at_two_restarts(seat):
+    """C8d -- the loud threshold for a RUNNING unit (`active` + `NRestarts >= 3`) was pinned at 0
+    (C4's healthy cell) and at 3 (C4's loud cell) but never at 2, so the boundary was pinned from
+    one side only. A unit that restarted twice and is running now is not the repeated-crash signal
+    the loud line exists for: it stays silent.
+
+    Mutation: change the threshold to `-ge 2` -> THIS cell reddens while C4's NRestarts=0 and
+    NRestarts=3 cells both stay green. A COVERAGE PIN: GREEN against the round-3 hook."""
+    seat.config(FLAG_ON)
+    seat.systemctl("running-2", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    assert r.stdout == "" and r.stderr == "", (r.stdout, r.stderr)
+    assert seat.log_lines() == [], seat.log_lines()
+
+
+def test_c8e_the_loud_line_claims_no_clean_stop_for_a_unit_whose_record_holds_no_exit(seat):
+    """C8e -- REWRITTEN IN ROUND 6 (#3835, B1); it previously pinned a FALSE sentence.
+
+    WHAT IT PINNED: fixture `loud-exit0` (`active/running NRestarts=3 ExecMainStatus=0`) is a unit
+    that exited 1 three times and came back, so it reads `NRestarts=3` with `ExecMainCode=0
+    ExecMainStatus=0` -- systemd zeroes both when it spawns the new main process, so those fields
+    describe the CURRENT process, not the last exit. The cell asserted `last exit 0` and
+    `clean stop` appear, i.e. it REQUIRED the launcher to hand a crash-looping owner a clean bill of
+    health. It was described as a coverage pin for exit 0's meaning through the loud line; it was in
+    fact a pin on a line that must not exist, and it is the reason the suite could not see B1.
+
+    WHAT IT ASSERTS NOW: at `active`/`running` with `ExecMainCode=0` the loud line carries NO exit
+    clause -- neither `last exit` nor `clean stop` -- while still being LOUD (it names the restart
+    count, the SubState, and that a running unit is not being retried). The negative half is what
+    reddens if the B1 gate is reverted; the positive half is what reddens if the unit is made silent
+    instead of gated. (`loud-exit0` also has no `ExecMainCode` line, which `_unit_detail` reads as 0
+    -- the same record.)
+
+    DISCRIMINATION PARTNER: C9c (`inactive`/`dead` + ExecMainCode=1) still carries `last exit 0` and
+    `clean stop`, so this cell cannot be satisfied by dropping the exit clause everywhere."""
+    seat.config(FLAG_ON)
+    seat.systemctl("loud-exit0", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    (line,) = context_lines(r)
+    assert "is now running" in line, line
+    assert "NRestarts=3" in line, line
+    assert "last exit" not in line, (
+        "the loud line asserted a last exit for a unit whose record holds none: systemd zeroes "
+        "ExecMainCode/ExecMainStatus when it spawns the new main process (ExecMainCode=0)")
+    assert "clean stop" not in line, (
+        "a crash-looping owner that is running again was told it stopped cleanly")
+
+
+def test_c8f_the_loud_line_names_the_meaning_of_a_displaced_substrate_exit_three(seat):
+    """C8f -- `_owner_exit_meaning(3)` ("the owner shut down on a displaced substrate") was
+    unpinned: only exits 1 (C4's running-3) and 5 (C4/C7c's restart-loop) were reached. A unit
+    mid-restart whose last exit was 3 (EXIT_DISPLACED, restarted under the unbounded policy) is
+    loud, and the line must name exit 3's meaning.
+
+    Mutation: delete the `3)` arm of `_owner_exit_meaning` -> THIS cell reddens while the exit-1
+    and exit-5 cells stay green. A COVERAGE PIN: GREEN against the round-3 hook."""
+    seat.config(FLAG_ON)
+    seat.systemctl("loud-exit3", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    (line,) = context_lines(r)
+    assert "auto-restart" in line and "NRestarts=1" in line, line
+    assert "last exit 3" in line, line
+    assert "displaced substrate" in line, line
+
+
+# ---- C9 (round 5, #3835): no line may assert an exit the record does not hold -----------------
+#
+# THE CONTRACT (state it here, and the cells below assert it):
+#   1. No printed line may assert a process exit unless `ExecMainCode != 0`. When `ExecMainCode = 0`
+#      the line must say that NO exit status is recorded, and must not name an exit status or a
+#      meaning for one.
+#   2. Round 5 applied the gate to the DOWN arms only (`inactive`, and the `*)`/failed arm), on the
+#      reasoning that the LOUD line is reachable only where an exit exists BY CONSTRUCTION --
+#      `activating`/`auto-restart` (systemd is waiting to retry AFTER an exit), a non-`auto-restart`
+#      `activating` at NRestarts>=1, and `active` at NRestarts>=3 (runs completed).
+#      ROUND 6 (#3835, B1) FALSIFIED THAT: it is true of the HISTORY (NRestarts>=1) and false of the
+#      FIELD. The `active` arm and the non-`auto-restart` `activating` arm are both reachable with
+#      ExecMainCode=0, because systemd zeroes the code and status when it spawns the new main
+#      process. The gate therefore applies to BOTH lines now, and the loud line is three-way on the
+#      code (see the C10 group below and C8e). Round 5's `activating/auto-restart` reasoning was
+#      right and is unchanged: the exit IS retained there (measured `code 1`).
+#   3. Exactly one `systemctl show` spawn per fire (cell C7f pins it); `ExecMainCode` joins the one
+#      `-p` list and adds no second spawn.
+#   4. A failed/absent detail read still degrades to the plain message (cell C4, unchanged).
+#
+# `ExecMainCode` is the siginfo `si_code` of the main process: 0 = NOT SET (no process exit was
+# recorded), 1 = CLD_EXITED, 2 = CLD_KILLED, 3 = CLD_DUMPED. MEASURED over 402 units on the parent's
+# host: 70 read `inactive`/`success` with ExecMainCode=0 (never ran a process) against 16 with
+# ExecMainCode=1 + ExecMainStatus=0 (a real stop after a clean exit) -- `Result` + `ExecMainStatus`
+# alone cannot separate those two populations (both read success/0), which is why the exit clause
+# was asserted of a history the record did not hold. The `failed` arm has the same hole:
+# `auditd.service` is `failed`/`exit-code` with ExecMainCode=0, and the arm would have printed
+# `last exit 0: clean stop` for it. Fifth recurrence of this PR's defect class, third one level down.
+
+
+def test_c9a_a_never_started_unit_is_not_told_it_stopped_cleanly(seat):
+    """C9a -- `inactive`/`dead` + `ExecMainCode=0`: systemd recorded NO process exit, so this is one
+    of the 70 measured units that never ran a process (`ExecMainStatus=0` and `Result=success` too
+    -- the reason the code field, not the status, is the discriminator). The DOWN line must print
+    NO exit clause: neither `last exit` nor `clean stop`, the meaning of exit 0 that the record does
+    not hold. It must still name the `start` remedy and still cover BOTH histories ("stopped, or
+    never started").
+
+    RED against `a7cef5cc`: its `inactive` arm prints `(last exit 0: clean stop)` unconditionally --
+    asserting a clean stop for a unit that never ran a process, in the same sentence that admits it
+    may never have started. (Discrimination partner: C9c.)"""
+    seat.config(FLAG_ON)
+    seat.systemctl("never-started-0", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    lines = context_lines(r)
+    assert len(lines) == 1, r.stdout
+    (line,) = lines
+    assert "is registered but inactive" in line, line
+    assert "clean stop" not in line, (
+        "a never-started unit was told it stopped cleanly: ExecMainCode=0 records no exit at all")
+    assert "last exit" not in line, line
+    assert "systemctl --user start" in line, line
+    assert "stopped, or never started" in line, line
+    assert "reset-failed" not in line, line
+
+
+def test_c9b_a_failed_unit_with_no_recorded_exit_does_not_claim_a_clean_stop(seat):
+    """C9b -- the `*)`/failed arm's half of the same gate: `failed`/`failed` + `ExecMainCode=0` is
+    `auditd.service`'s live shape -- systemd reports the unit FAILED while the record holds no
+    process exit and reports status 0. The arm must not print `clean stop` (nor `last exit`), while
+    the remedy still names both `reset-failed` and `start`.
+
+    RED against `a7cef5cc`, whose failed arm prints `(last exit 0: clean stop)` for that unit."""
+    seat.config(FLAG_ON)
+    seat.systemctl("failed-0", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    lines = context_lines(r)
+    assert len(lines) == 1, r.stdout
+    (line,) = lines
+    assert "is registered but failed" in line, line
+    assert "clean stop" not in line, (
+        "a failed unit with no recorded exit was told it stopped cleanly")
+    assert "last exit" not in line, line
+    assert "reset-failed" in line, line
+    assert "systemctl --user start" in line, line
+
+
+def test_c9c_a_real_stop_still_reports_its_exit_status(seat):
+    """C9c -- the DISCRIMINATION PARTNER for C9a, and the reason C9a cannot be satisfied by deleting
+    the exit clause outright. `inactive`/`dead` + `ExecMainCode=1` is a unit that DID run and exit
+    cleanly before it was stopped (16 of the measured 402 units). Its exit clause must survive the
+    gate intact: `last exit 0` AND its meaning ("clean stop") are both present.
+
+    GREEN against `a7cef5cc` as well (the unconditional clause happened to be right HERE) -- so it
+    is a control, not evidence of the defect: it reddens only under the plausible-wrong fix that
+    drops the clause from every down line instead of gating it."""
+    seat.config(FLAG_ON)
+    seat.systemctl("stopped-0", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    lines = context_lines(r)
+    assert len(lines) == 1, r.stdout
+    (line,) = lines
+    assert "is registered but inactive" in line, line
+    assert "last exit 0" in line, line
+    assert "clean stop" in line, line
+
+
+# ---- C10 (round 6, #3835): the loud line's exit clause, and a signal is not an exit ------------
+#
+# Sol's colleague read (PR #3835 review 5552280898) ran this launcher's real routing code against
+# real systemd 255.4 and found three members of the C9 class that five rounds of diff-reading could
+# not see. Each cell below pairs the POSITIVE claim with the absence of the text that must not
+# appear, so neither "delete the clause" nor "print it always" can satisfy the group.
+#
+#   B1 -- the loud line's exit clause was UNGATED. systemd zeroes ExecMainCode/ExecMainStatus when
+#         it spawns a new main process, so `active`/`running` and non-`auto-restart` `activating`
+#         are reachable with code 0 and the line asserted an exit that is not in the record.
+#   B2 -- `activating`/`auto-restart` at NRestarts=0 is the FIRST failure, waiting for the first
+#         retry; the leading clause nevertheless read "has restarted: NRestarts=0".
+#   B3 -- ExecMainCode is the siginfo `si_code`: 1 = CLD_EXITED, 2 = CLD_KILLED, 3 = CLD_DUMPED.
+#         At 2 or 3, ExecMainStatus is a SIGNAL number. Testing only `!= 0` passed signal 4 to
+#         `_owner_exit_meaning`, printing exit 4's own meaning AND its "fix the path" remedy.
+#
+# The loud line's clause is now the SAME three-way gate as the down line's (`_owner_loud_line`),
+# and `_owner_exit_meaning` is still the only place a STATUS is given a meaning -- signal arms name
+# the signal and claim no meaning at all.
+
+def test_c10a_a_loud_restarting_unit_with_no_recorded_exit_names_no_exit(seat):
+    """C10a -- B1's second reachable state. `activating` + `SubState=start` at NRestarts>=1 is LOUD
+    (round 4's arm: the unit has restarted) but reaches the line with `ExecMainCode=0`: systemd has
+    already spawned the new main process, which is what makes the substate `start`. The loud claims
+    that survive -- the restart count, the SubState, the retry clause -- must still be there, and NO
+    exit clause may be named. Round 5 exempted this arm explicitly, calling the exit "by
+    construction"; it is by construction in the HISTORY and absent from the FIELD.
+
+    Mutation: restore the ungated clause in `_owner_loud_line` -> this cell and C8e redden; the
+    exit-carrying cells (C4's restart-loop, C8f) stay green."""
+    seat.config(FLAG_ON)
+    seat.systemctl("activating-start-1", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    (line,) = context_lines(r)
+    assert "has restarted" in line and "NRestarts=1" in line, line
+    assert "SubState=start" in line, line
+    assert "systemd keeps retrying" in line, line
+    assert "last exit" not in line, (
+        "the loud line named a last exit for a unit whose record holds ExecMainCode=0")
+
+
+def test_c10b_the_first_failure_is_not_claimed_to_have_restarted(seat):
+    """C10b -- B2. `activating`/`auto-restart` at NRestarts=0 is the unit's FIRST failure, waiting
+    for its first retry (Sol measured `Result=exit-code NRestarts=0 ExecMainCode=1
+    ExecMainStatus=1`). The leading clause read "has restarted: NRestarts=0" -- self-contradictory.
+    It must say the unit failed and is waiting for its first restart instead, while the state stays
+    LOUD (round 4's "loud whatever the count" decision is deliberately unchanged: the defect is the
+    sentence, not the volume) and the exit clause is retained, because `auto-restart` DOES hold the
+    exit.
+
+    Mutation: restore the constant leading clause -> THIS cell reddens and only this cell. No cell
+    fed this record before this round, so it is red-first."""
+    seat.config(FLAG_ON)
+    seat.systemctl("auto-restart-nr0", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    (line,) = context_lines(r)
+    assert "has failed" in line and "first restart" in line, line
+    assert "NRestarts=0" in line, line
+    assert "has restarted" not in line, (
+        "a unit that has restarted ZERO times was told it has restarted: NRestarts=0")
+    assert "systemd keeps retrying" in line, line
+    assert "last exit 1" in line and "another owner holds this seat" in line, line
+
+
+def test_c10c_a_signal_killed_unit_is_not_given_an_exit_status_or_its_remedy(seat):
+    """C10c -- B3 on the loud line. Sol measured SIGILL on a `Type=simple` unit as `code 3`
+    (CLD_DUMPED) with `ExecMainStatus=4`: status 4 is SIGNAL 4, not "exit 4". The ungated clause
+    printed exit 4's own meaning -- `a planted non-regular path (fix the path, then reset-failed)`
+    -- handing the reader a WRONG REMEDY, which is an instruction to act on. The line must name the
+    signal, must not name an exit, exit 4's meaning or its remedy, and must stay loud.
+
+    Mutation: restore `2 | 3` to the exit-status clause -> THIS cell, C10d and C10e redden while the
+    exit-4 control cell (C10f) stays green."""
+    seat.config(FLAG_ON)
+    seat.systemctl("killed-loud-4", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    (line,) = context_lines(r)
+    assert "killed by signal 4" in line, line
+    assert "systemd keeps retrying" in line, line
+    assert "last exit" not in line, line
+    assert "fix the path" not in line, (
+        "signal 4 is not exit 4: the exit-4 remedy must not be printed for CLD_KILLED/CLD_DUMPED")
+    assert "clean stop" not in line, line
+
+
+def test_c10d_a_failed_unit_killed_by_a_signal_gets_no_exit_remedy(seat):
+    """C10d -- B3 on the DOWN `*)`/failed arm. This is the arm the PR's round-5 gate DID guard, but
+    only on `code != 0`, so a signal number reached `_owner_exit_meaning` and the `[ "$main" = "4" ]`
+    remedy arm fired on SIGNAL 4. Both halves are asserted: the clause names the signal, and the
+    exit-4 remedy text is absent. The generic remedy (`reset-failed`, then `start`) survives -- it
+    is the right recovery for a failed unit whatever killed it.
+
+    Mutation: revert only the `2 | 3` arm -> HERE and C10c/C10e redden; C10f stays GREEN."""
+    seat.config(FLAG_ON)
+    seat.systemctl("failed-killed-4", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    (line,) = context_lines(r)
+    assert "is registered but failed" in line, line
+    assert "killed by signal 4" in line, line
+    assert "last exit" not in line, line
+    assert "fix the path" not in line, (
+        "SIGILL (code 3, status 4) was given exit 4's remedy: a wrong remedy is worse than none")
+    assert "planted" not in line, line          # exit 4's MEANING must not survive the signal arm
+    assert "reset-failed" in line and "systemctl --user start" in line, line
+
+
+def test_c10e_the_signal_arm_is_pinned_on_both_kill_codes(seat):
+    """C10e -- B3, second kill code. `code 2` is CLD_KILLED (SIGKILL), a different `si_code` from
+    C10d's CLD_DUMPED, and its status 9 is a signal number too. Pinned separately so an arm written
+    for only one of the two values is caught: this is the same "one arm, two boundaries" shape as
+    C8a/C8b."""
+    seat.config(FLAG_ON)
+    seat.systemctl("failed-killed-9", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    (line,) = context_lines(r)
+    assert "killed by signal 9" in line, line
+    assert "last exit" not in line, line
+    assert "unrecognized exit status" not in line, (
+        "signal 9 was passed to the exit-status table as if it were an exit status")
+
+
+def test_c10f_control_exit_four_keeps_its_own_remedy_through_the_signal_gate(seat):
+    """C10f -- THE CONTROL for C10c/C10d/C10e, and the reason the B3 gate cannot be satisfied by
+    deleting the exit clause or the remedy. `failed`/`failed` + `ExecMainCode=1` (CLD_EXITED) +
+    `ExecMainStatus=4` IS a real exit 4 -- the status in `RestartPreventExitStatus` -- so the exit
+    clause keeps BOTH its status and its meaning, and the `fix the path` remedy MUST still be
+    printed. It is GREEN both before and after this round; it reddens only under an over-correction
+    that makes the three-way arm swallow the code-1 case."""
+    seat.config(FLAG_ON)
+    seat.systemctl("failed-4", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    (line,) = context_lines(r)
+    assert "last exit 4" in line, line
+    assert "planted" in line, line
+    assert "fix the path, then run" in line, line
+    assert "killed by signal" not in line, line
+
+
+# ---- C5: macOS untouched ---------------------------------------------------------------------
+#
+# macOS BEHAVIOUR is unchanged by #3831 (a Linux-only fix). Asserted BY DIFF -- a byte-for-byte
+# comparison against the base commit's content -- never by reading for strings. The baselines are
+# frozen here rather than read with `git show` (nightly checks out at depth 1, so a SHA-based read
+# goes dead) and rather than stored as a fixture file (#3831's scope lists exactly four files).
+#
+# #3831 RE-BASELINED the plist cell: the guarantee is byte-identity OUTSIDE the header comment
+# block, so every XML key, value and array stays pinned against the base commit while the comment
+# -- which states this file's relationship to the systemd unit, the very unit #3831 changed -- is
+# permitted to move (see that cell's docstring). The launcher's macOS branch has no such carve-out
+# and stays whole-branch byte-identical. Re-baseline deliberately if a macOS change is intended.
+
+PLIST_BASELINE = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{LABEL}}</string>
+
+    <!-- Every launch path's argv MUST contain `engramd_owner` (engram_pidfile's program
+         marker): the script path below carries it. ENGRAM_HOME is read from
+         EnvironmentVariables, as for the surface daemon.
+
+         Exit codes are supervised by meaning, matching engramd-owner.service.template:
+           0  clean stop            -> NOT restarted. KeepAlive {SuccessfulExit: false}
+                                       restarts only after a NON-zero exit.
+           1  OwnerAlreadyRunning
+              (and every refusal)   -> restarted, once per ThrottleInterval.
+           3  EXIT_DISPLACED        -> restarted: the owner shut down on a displaced
+                                       substrate without closing the store, so it must
+                                       never read as a success.
+         Unlike the systemd unit there is NO start limit under launchd: a persistent
+         non-zero exit (a refusal the install-time preflight cannot see, or an owner
+         already running unsupervised) retries once every ThrottleInterval (60 s)
+         indefinitely. launchd shows that as `spawn scheduled`, and the line
+         start-engramd-owner.sh prints names the last exit status. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PYTHON}}</string>
+        <string>{{ENGRAM_OWNER_PY}}</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ENGRAM_HOME</key>
+        <string>{{ENGRAM_HOME}}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>{{ENGRAM_HOME}}/engramd-owner.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{ENGRAM_HOME}}/engramd-owner.log</string>
+</dict>
+</plist>
+"""
+
+LAUNCHER_DARWIN_BASELINE = """\
+if [ "$_os" = "Darwin" ]; then
+    # ---- 4a. macOS: the launchd job com.engram.engramd-owner.<key> ----------------------
+    # `launchctl print gui/<uid>/<label>` is asked and parsed by the Python I/O helper (it owns
+    # the timeout: stock macOS has no GNU `timeout`). It prints one of
+    #   running | registered:<state>:<last exit or none> | notfound | no_gui_domain | ambiguous:<why>
+    LABEL="com.engram.engramd-owner.$_home_id"
+    _state="$("$PYTHON_BIN" "$IO_PY" launchd_state "$LABEL" 2>/dev/null)"
+    _sup="launchd: ${_state:-no answer}"
+    case "$_state" in
+        running) exit 0 ;;
+        registered:*)
+            _rest="${_state#registered:}"
+            _report "ENGRAM owner job $LABEL is registered but ${_rest%:*} (last exit ${_rest##*:}); leaving it to launchd, no second owner launched. ENGRAM_HOME=$ENGRAM_HOME"
+            exit 0
+            ;;
+        no_gui_domain)
+            # rc 125 from the domain probe: the domain is absent (no GUI login session), so there is
+            # no launchd to supervise the owner and nothing to retry (a bootstrap into an absent domain
+            # cannot work). A flag is ON, so its readers WILL call an owner: the same answer as the
+            # Linux no-bus / WSL path -- fall through to the unsupervised launch (#3823). If that launch
+            # fails, _launch_failed prints the named refusal instead of "not used".
+            _nogui=1
+            _sup="launchd: no GUI domain"
+            ;;
+        ambiguous:*)
+            _report "ENGRAM owner not launched (launchd state is ambiguous: ${_state#ambiguous:}); a duplicate is worse than a missing owner. ENGRAM_HOME=$ENGRAM_HOME"
+            exit 0
+            ;;
+        notfound) ;;
+        *)
+            _report "ENGRAM owner not launched (launchd state is ambiguous: unrecognized answer). ENGRAM_HOME=$ENGRAM_HOME"
+            exit 0
+            ;;
+    esac
+else
+"""
+
+
+def _plist_without_header_comment(text: str) -> str:
+    """`text` minus its one header comment block. The comment is prose for a human; everything
+    else is what launchd actually reads, and that is the surface C5 pins."""
+    start = text.index("<!--")
+    end = text.index("-->", start) + len("-->")
+    return text[:start] + text[end:]
+
+
+def test_c5_the_launchd_plist_template_is_unchanged_outside_its_header_comment():
+    """#3831 is a Linux-only fix: the macOS owner artifact's BEHAVIOUR is untouched, asserted BY
+    DIFF. The guarantee here is byte-identity OUTSIDE the header comment block -- every XML key,
+    value and array is pinned against the base commit, while the comment is permitted to move.
+
+    RE-BASELINED for #3831 (2026-10-16). The comment's "Unlike the systemd unit there is NO start
+    limit under launchd" sentence was a CONTRAST with the unit #3831 changed, so the change made it
+    false; it was rewritten to state the new relationship (launchd: no start limit, a fixed 60 s
+    `ThrottleInterval`; systemd: no permanent stop either, now by bounded exponential backoff).
+    That rewrite is the ONLY permitted delta: anything outside the comment block that moves fails
+    this cell, so a later XML edit cannot ride in on a comment re-baseline."""
+    actual = (TEMPLATES / "engramd-owner.plist.template").read_text(encoding="utf-8")
+    assert _plist_without_header_comment(actual) == _plist_without_header_comment(PLIST_BASELINE), (
+        "#3831 must not change anything the launchd plist template DOES -- only its header "
+        "comment may move, and only to restate the restart-policy relationship. Re-baseline "
+        "deliberately if a macOS behaviour change is intended.\n--- actual ---\n" + actual)
+
+
+def test_c5_the_launchers_macos_branch_is_unchanged_byte_for_byte():
+    """The launcher's Darwin branch, sliced between two stable markers, asserted BY DIFF: the
+    `_unit_detail()` / backoff work is the Linux branch's, and must not have leaked across.
+
+    RE-BASELINED 2026-10-16 (round 4) because a SIBLING PR legitimately moved the slice. #3826
+    (`f36c75a0`, Clio, closed #3823) rewrote the Darwin `no_gui_domain` branch: the seat no longer
+    exits 0 with an "owner is not used" line; it sets `_nogui=1` and falls through to the
+    unsupervised launch, then refuses loudly if that launch fails. The slice grew 33 -> 35 lines.
+    The baseline is a snapshot of a SIBLING artifact's content, so a legitimate sibling change
+    makes it stale -- that is a false red, a defect in neither change. It is not a hole in this
+    PR's own work: the slice is byte-identical on the base and on this branch.
+
+    WHY THIS REFRESH IS LEGITIMATE, and not a guard being silenced. A refreshed baseline is the
+    exact move that hides a real leak, so it is proved rather than asserted, and the proof is
+    mechanical: the new baseline's bytes are the slice derived from the BASE branch's own current
+    content, and this branch's diff touches NOTHING inside the sliced region --
+      * the slice re-derived from `git show f36c75a0:<the hook>` and the slice re-derived from this
+        branch's working tree are byte-identical (sha256
+        34a9034f861ddcc1c15116f99fa597d28c2e08795a225493bae270366d383568, 1899 bytes, 35 lines);
+      * no hunk of `git diff f36c75a0...HEAD -- <the hook>` falls inside the sliced region (base
+        lines 235..269): every hunk except the first sits at old line >= 272, and the first is the
+        header comment ABOVE the slice at old lines 24..28.
+    So the property this cell guards -- the Linux work must not leak into the Darwin branch --
+    still holds, unweakened: any future edit inside the slice still reddens here. Re-baseline
+    deliberately if a macOS change is intended."""
+    text = _require(HOOK).read_text(encoding="utf-8")
+    start = text.index('if [ "$_os" = "Darwin" ]; then')
+    end = text.index("    # ---- 4b. Linux: the systemd --user unit")
+    actual = text[start:end]
+    assert actual == LAUNCHER_DARWIN_BASELINE, (
+        "#3831 must not change the launcher's macOS branch.\n--- actual ---\n" + actual)

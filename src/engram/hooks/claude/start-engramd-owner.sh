@@ -26,9 +26,25 @@
 #       macOS:  the launchd job com.engram.engramd-owner.<id> (`launchctl print`, asked and
 #               parsed by the I/O helper under a Python-side timeout)
 #                                                        -> launch nothing (running / active:
-#                                                           silent; registered but not running:
-#                                                           one line naming the state, and on
-#                                                           macOS the last exit status)
+#                                                           silent -- UNLESS it has restarted >= 3
+#                                                           times, when ONE line names the restart
+#                                                           count and the exit the record holds. #3831:
+#                                                           under the unbounded restart policy a
+#                                                           persistent fault reads
+#                                                           `activating (auto-restart)` forever --
+#                                                           a QUIETER failure than a `failed` unit --
+#                                                           so the launcher must surface it. #3835:
+#                                                           the line is routed by STATE first, count
+#                                                           second -- a `failed` unit always gets the
+#                                                           DOWN line (systemd will NOT retry it),
+#                                                           an `inactive` one the `start` remedy, and
+#                                                           only `activating`/`auto-restart` the loud
+#                                                           "systemd keeps retrying" clause. The
+#                                                           STATE axis is ActiveState, systemd's own:
+#                                                           a stopped unit is `inactive`+`dead`, and
+#                                                           `SubState=inactive` is NEVER emitted. macOS
+#                                                           reports the last exit status, but has no
+#                                                           restart counter to read)
 #   * the supervisor answers "no such unit / job"        -> launch the owner detached,
 #     (Linux also: `systemctl` is absent, or `systemctl --user` cannot answer -- no user bus,
 #     e.g. WSL)                                             ONE line: UNSUPERVISED when it then
@@ -302,40 +318,65 @@ else
     # ---- 4b. Linux: the systemd --user unit engramd-owner-<key>.service -----------------
     UNIT="engramd-owner-$_home_id.service"
 
-    # Prints: none | nobus | notfound | active | registered:<ActiveState> | ambiguous:<why>
-    _unit_state() {
-        local out rc load_state active_state
+    # ONE `systemctl --user show` spawn per fire serves BOTH the unit's state and its restart
+    # detail, so the two can never describe different moments (#3835 finding 2: round 1 asked
+    # twice, and a unit that changed between the two answers was reported inconsistently).  It
+    # assigns in the CALLER's shell -- never inside a subshell -- so the consumers below share
+    # the one call:
+    #   _show_kind = nosystemctl | timeout | nobus | ok
+    #   _show_out  = the raw output (only when _show_kind = ok)
+    # ExecMainCode joins the SAME list (#3835 round 5) -- one spawn, never a second (C7f).
+    _SHOW_PROPS="LoadState,ActiveState,SubState,NRestarts,ExecMainStatus,ExecMainCode"
+    _unit_show() {
+        _show_kind=""
+        _show_out=""
+        _show_rc=0
         if ! command -v systemctl >/dev/null 2>&1; then
-            printf 'none'
-            return
+            _show_kind="nosystemctl"
+            return 0
         fi
         if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
             export XDG_RUNTIME_DIR="/run/user/$(id -u)"
         fi
         if command -v timeout >/dev/null 2>&1; then
-            out="$(timeout 3 systemctl --user show "$UNIT" -p LoadState,ActiveState,SubState 2>&1)"
+            _show_out="$(timeout 3 systemctl --user show "$UNIT" -p "$_SHOW_PROPS" 2>&1)"
         else
-            out="$(systemctl --user show "$UNIT" -p LoadState,ActiveState,SubState 2>&1)"
+            _show_out="$(systemctl --user show "$UNIT" -p "$_SHOW_PROPS" 2>&1)"
         fi
-        rc=$?
-        if [ "$rc" -eq 124 ]; then
-            printf 'ambiguous:systemctl timed out'
-            return
-        fi
-        if [ "$rc" -ne 0 ]; then
-            printf 'nobus'
-            return
-        fi
-        load_state="$(printf '%s\n' "$out" | sed -n 's/^LoadState=//p')"
+        _show_rc=$?
+        case "$_show_rc" in
+            124) _show_kind="timeout"; _show_out="" ;;
+            0) _show_kind="ok" ;;
+            *) _show_kind="nobus"; _show_out="" ;;
+        esac
+        return 0
+    }
+
+    # The record's field layout, in ONE place (#3835 finding 5): pull one `Key=value` line out of
+    # the single show output. Nothing re-derives the record with `${1#* }` / `${2##* }` surgery.
+    _show_field() {
+        printf '%s\n' "$_show_out" | sed -n "s/^$1=//p"
+    }
+
+    # Prints: none | nobus | notfound | active | registered:<ActiveState> | ambiguous:<why>
+    # A PURE parse of the one spawn: it launches nothing and does not change the return vocabulary.
+    _unit_state() {
+        local load_state active_state
+        case "$_show_kind" in
+            nosystemctl) printf 'none'; return 0 ;;
+            timeout) printf 'ambiguous:systemctl timed out'; return 0 ;;
+            nobus) printf 'nobus'; return 0 ;;
+        esac
+        load_state="$(_show_field LoadState)"
         if [ -z "$load_state" ]; then
             printf 'ambiguous:systemctl answered with no LoadState'
-            return
+            return 0
         fi
         if [ "$load_state" = "not-found" ]; then
             printf 'notfound'
-            return
+            return 0
         fi
-        active_state="$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p')"
+        active_state="$(_show_field ActiveState)"
         if [ "$active_state" = "active" ]; then
             printf 'active'
         else
@@ -343,12 +384,247 @@ else
         fi
     }
 
+    # _unit_detail: NRestarts / ActiveState / SubState / ExecMainStatus / ExecMainCode for $UNIT as
+    # "<nr> <act> <subst> <main> <code>", or NOTHING on ANY failure (no systemctl, timeout,
+    # non-zero rc, no user bus, a missing or unparsable key). BOTH state fields are carried (#3835
+    # rounds 3-4): the launcher ROUTES on ActiveState, and -- within `activating` -- on SubState
+    # too, which the loud line also names. ExecMainCode is carried for the down arms' exit-clause
+    # gate (#3835 round 5, see _owner_down_line); it is NOT one of the fields whose absence empties
+    # the record -- a systemctl that did not answer the key leaves it empty, and an empty code
+    # reads as 0 ("no process exit recorded") below, never as a parse failure. The SAME spawn as
+    # _unit_state, so the two can never disagree. It launches nothing. An empty detail degrades
+    # every caller to today's message EXACTLY: a broken detail read must never be louder or more
+    # confident than the read it replaced (#3831).
+    _unit_detail() {
+        local nr act subst main code
+        [ "$_show_kind" = "ok" ] || return 0
+        nr="$(_show_field NRestarts)"
+        act="$(_show_field ActiveState)"
+        subst="$(_show_field SubState)"
+        main="$(_show_field ExecMainStatus)"
+        code="$(_show_field ExecMainCode)"
+        case "$nr" in '' | *[!0-9]*) return 0 ;; esac
+        [ -n "$act" ] || return 0
+        [ -n "$subst" ] || return 0
+        case "$main" in '' | *[!0-9]*) return 0 ;; esac
+        # '' (key absent) and any non-numeric value both mean the same as systemd's own 0 = NOT SET:
+        # no process exit was recorded. Never a parse failure, so the state's remedy survives.
+        case "$code" in '' | *[!0-9]*) code=0 ;; esac
+        printf '%s %s %s %s %s' "$nr" "$act" "$subst" "$main" "$code"
+    }
+
+    # _owner_verdict <detail>: the routing decision, STATE FIRST and count second (#3835 findings
+    # 1 and 4; re-keyed to ActiveState in round 3, EXTENDED to both fields in round 4). The STATE
+    # axis is ActiveState -- the field systemd's own state machine is keyed on -- NOT SubState: a
+    # STOPPED unit is `ActiveState=inactive` + `SubState=dead`, and `SubState=inactive` is NOT a
+    # value systemd ever emits (measured on systemd 255 with a planted `Type=oneshot` unit:
+    # `systemctl --user show <u> -p ActiveState -p SubState` reads `inactive`/`dead` both before it
+    # has ever been started and after a clean start; only a failure reads `failed`/`failed`).
+    # Round 2 keyed this on SubState, so its `inactive` arm was UNREACHABLE and a stopped unit fell
+    # through to today's message, which names NO remedy -- finding 3 not actually landing. The
+    # round-1 predicate was count-first -- `auto-restart OR NRestarts>=3` -- paired with a CONSTANT
+    # retry clause; for a FAILED unit at NRestarts>=3 that clause denied the very failure it was
+    # reporting, and it shadowed the correctly-worded DOWN line.
+    #
+    # Round 4: the LOUD verdict needs evidence the unit has ACTUALLY RESTARTED, so `activating` is
+    # split by SubState. `activating` carries `start`, `auto-restart`, `reload`, `stop` and
+    # `final-sigterm`; only `auto-restart` means systemd is WAITING to retry. Every other substate
+    # is an attempt in progress, and the loud line's "has restarted" / "systemd keeps retrying" are
+    # true there only once the unit has restarted (NRestarts >= 1). At `activating` + any other
+    # substate + NRestarts=0 the unit has NEVER restarted and is merely starting, so the loud claims
+    # would be FALSE -- "has restarted: NRestarts=0" is self-contradictory. That state degrades to
+    # today's claim-nothing message: the same defect class as round 1 (a clause true of one state
+    # asserted of another), recurring one level down. With this verdict the loud line's retry arm
+    # is reachable only when NRestarts >= 1, so its "has restarted" is true by construction.
+    # The count now decides only WITHIN `active`, and (as below) within a non-`auto-restart`
+    # `activating`. Prints one of:
+    #   down-failed | down-stopped | loud | silent | unknown
+    # `maintenance` (a seventh ActiveState on systemd 255: `systemctl --state=help` lists active,
+    # reloading, inactive, failed, activating, deactivating, maintenance) and any state a future
+    # systemd adds fall to the `*)` arm below: `unknown` -> today's claim-nothing message, which
+    # names no remedy. That is DELIBERATE, not an omission (#3835 round 5, S3): this launcher names
+    # a remedy only for the states it has measured, and a guessed remedy is worse than none.
+    _owner_verdict() {
+        local nr act subst _main _code
+        read -r nr act subst _main _code <<<"$1"
+        case "$act" in
+            failed)     printf 'down-failed' ;;
+            inactive)   printf 'down-stopped' ;;
+            activating)
+                # `auto-restart` IS the retry wait: loud whatever the count. Any other substate is
+                # loud only once the unit has restarted at least once; at 0 it never has, so the
+                # loud line would lie -- degrade to today's message instead.
+                if [ "$subst" = "auto-restart" ] || [ "$nr" -ge 1 ]; then
+                    printf 'loud'
+                else
+                    printf 'unknown'
+                fi
+                ;;
+            active)     if [ "$nr" -ge 3 ]; then printf 'loud'; else printf 'silent'; fi ;;
+            *)          printf 'unknown' ;;
+        esac
+    }
+
+    # The meaning of an owner exit status, from the template's own comment table. An
+    # unrecognized code is named as a number and claims nothing (never guess a meaning).
+    _owner_exit_meaning() {
+        case "$1" in
+            0) printf '%s' "clean stop" ;;
+            1) printf '%s' "another owner holds this seat" ;;
+            3) printf '%s' "the owner shut down on a displaced substrate" ;;
+            4) printf '%s' "a planted non-regular path (fix the path, then reset-failed)" ;;
+            5) printf '%s' "the store is behind this code's schema (the first migration has not run)" ;;
+            *) printf '%s' "unrecognized exit status" ;;
+        esac
+    }
+
+    # The ONE loud line for a unit that has restarted: names the restart count, the SubState, the
+    # last exit status and its MEANING. The retry clause is chosen by STATE, never a constant
+    # (#3835 finding 1; re-keyed to ActiveState in round 3): an `activating`/`auto-restart` unit IS
+    # being retried, so the clause is true there; a `running` unit restarted and came back, so it is
+    # NOT, and naming a remedy would be wrong. Round 4 leaves the two-arm selection BELOW exactly as
+    # it is and moves the guarantee to `_owner_verdict` instead: this function is now reached in the
+    # `*)` arm only for `activating`/`auto-restart` (genuinely being retried) or for a
+    # non-`auto-restart` `activating` at NRestarts >= 1 (so "has restarted" is true by construction),
+    # and in the `active` arm only at NRestarts >= 3. It must not be restructured further.
+    # Round 5 (#3835) left this line's exit clause UNGATED, on the reasoning that every state
+    # reaching it implies an exit by construction. That is true of the HISTORY (NRestarts>=1) and
+    # false of the FIELD: systemd zeroes ExecMainCode/ExecMainStatus when it spawns a new main
+    # process, so a `running` unit that exited 1 three times and came back reads NRestarts=3 with
+    # ExecMainCode=0 and ExecMainStatus=0 (measured on systemd 255.4; 18 long-running services on
+    # this host read a large NRestarts with 0/0). The ungated clause then printed `last exit 0:
+    # clean stop` -- a clean bill of health for a crash-looping owner. Round 6 (#3835, B1) gates the
+    # clause on ExecMainCode, the SAME gate the DOWN arms apply, and makes it three-way on that
+    # field (the siginfo `si_code`: 1 = CLD_EXITED, 2 = CLD_KILLED, 3 = CLD_DUMPED): 2 and 3 carry a
+    # SIGNAL number in ExecMainStatus, not an exit status, so they name the signal and no meaning,
+    # and no exit-status-specific remedy. Round 6 (B2) also stops the leading clause from naming a
+    # restart count at NRestarts=0, where the FIRST failure -- `activating`/`auto-restart` waiting
+    # for its first retry -- read "has restarted: NRestarts=0".
+    _owner_loud_line() {
+        local nr act subst main code retry remedy lead exit_clause
+        read -r nr act subst main code <<<"$1"
+        case "${code:-0}" in
+            1)     exit_clause="last exit $main: $(_owner_exit_meaning "$main")" ;;
+            2 | 3) exit_clause="killed by signal $main" ;;
+            *)     exit_clause="no exit status recorded" ;;
+        esac
+        if [ "$nr" -eq 0 ]; then
+            lead="has failed and is waiting for its first restart: NRestarts=$nr"
+        else
+            lead="has restarted: NRestarts=$nr"
+        fi
+        case "$act" in
+            active)
+                retry="it has restarted $nr times and is now running, so systemd is not retrying it"
+                remedy=""
+                ;;
+            *)
+                retry="under the unbounded restart policy a restartable exit never goes permanently failed, so systemd keeps retrying"
+                remedy=" Remedy: fix the fault, then run: systemctl --user reset-failed $UNIT."
+                ;;
+        esac
+        printf 'ENGRAM owner unit %s %s, SubState=%s, %s; %s.%s ENGRAM_HOME=%s' \
+            "$UNIT" "$lead" "$subst" "$exit_clause" "$retry" "$remedy" "$ENGRAM_HOME"
+    }
+
+    # The line for a registered unit that is DOWN. ActiveState decides the words AND the remedy
+    # (#3835; re-keyed from SubState in round 3 for the reason given at _owner_verdict): `failed` is
+    # a unit systemd will NOT retry (exit 4 is in RestartPreventExitStatus; any other exit reached
+    # the failed state some other way, and the remedy is to clear it and start); `inactive` is NOT a
+    # failure -- it may be a manual stop OR a unit that has never been started -- so nothing needs
+    # clearing and the remedy is `start` only (`reset-failed` must not be named: it is a no-op
+    # there). Round 4 (nit) words the `inactive` clause so it covers BOTH: the old "it was stopped
+    # rather than failed" over-stated the history for a never-started unit.
+    #
+    # Round 5 (#3835): the exit clause is asserted ONLY where the record HOLDS an exit. The two
+    # states this function serves are exactly the two a code-0 record can reach, and each was
+    # measured: 70 of 402 units read `inactive`/success with ExecMainCode=0 and ExecMainStatus=0 --
+    # never started, since a real stop after a clean exit also reads success/0 (16 units) and only
+    # the code separates them; and `auditd.service` reads `failed`/`exit-code` with code 0, so the
+    # `*)` arm below would print `last exit 0: clean stop` for a unit systemd calls FAILED. Both
+    # arms therefore print "no exit status recorded" at code 0 -- naming no status and no meaning.
+    # ExecMainCode is the siginfo `si_code` of the main
+    # process: 0 = not set (no process exit was recorded), 1 = CLD_EXITED, 2 = CLD_KILLED,
+    # 3 = CLD_DUMPED. An empty 5th field reads as 0 (see _unit_detail), never as a parse failure.
+    # Round 6 (#3835, B3): the clause is THREE-WAY on that field, not merely `!= 0`. At code 2 or 3
+    # ExecMainStatus is a SIGNAL number, so reading it as an exit status printed a wrong status AND a
+    # wrong remedy: SIGILL reads code 3 status 4, and the exit-4 arm below fired on signal 4 with
+    # "fix the path". A wrong remedy is worse than no remedy, so 2/3 name the signal, give it no
+    # meaning, and never take an exit-status-specific remedy. The loud line applies the same gate
+    # (#3835 round 6, B1: see _owner_loud_line).
+    _owner_down_line() {
+        local act="$1" detail="$2" _nr _act _subst main code exit_clause remedy
+        read -r _nr _act _subst main code <<<"$detail"
+        case "${code:-0}" in
+            1)     exit_clause="(last exit $main: $(_owner_exit_meaning "$main"))" ;;
+            2 | 3) exit_clause="(killed by signal $main)" ;;
+            *)     exit_clause="(no exit status recorded)" ;;
+        esac
+        case "$act" in
+            inactive)
+                printf 'ENGRAM owner unit %s is registered but %s %s; it is not running (stopped, or never started), so there is nothing to clear and no second owner was launched. Remedy: run: systemctl --user start %s. ENGRAM_HOME=%s' \
+                    "$UNIT" "$act" "$exit_clause" "$UNIT" "$ENGRAM_HOME"
+                ;;
+            *)
+                remedy="run: systemctl --user reset-failed $UNIT, then systemctl --user start $UNIT"
+                if [ "${code:-0}" = "1" ] && [ "$main" = "4" ]; then
+                    remedy="fix the path, then run: systemctl --user reset-failed $UNIT, then systemctl --user start $UNIT"
+                fi
+                printf 'ENGRAM owner unit %s is registered but %s %s; systemd will not retry it, so no second owner was launched. Remedy: %s. ENGRAM_HOME=%s' \
+                    "$UNIT" "$act" "$exit_clause" "$remedy" "$ENGRAM_HOME"
+                ;;
+        esac
+    }
+
+    # Today's message, used when the detail could not be read (empty) or the state is one this
+    # launcher does not recognize: it claims nothing it did not establish.
+    _owner_registered_plain() {
+        printf 'ENGRAM owner unit %s is registered but %s; leaving it to systemd, no second owner launched. ENGRAM_HOME=%s' \
+            "$UNIT" "$1" "$ENGRAM_HOME"
+    }
+
+    _unit_show
     _state="$(_unit_state)"
     _sup="systemd: $_state"
     case "$_state" in
-        active) exit 0 ;;
+        active)
+            # A RUNNING unit is serving, so the launcher stays silent -- UNLESS it has restarted
+            # repeatedly (NRestarts >= 3), the one loud signal a healthy-looking unit gives
+            # (#3831). Its line says it is running and NOT being retried (#3835). An empty detail
+            # (any read failure) keeps today's silence.
+            _detail="$(_unit_detail)"
+            if [ -n "$_detail" ] && [ "$(_owner_verdict "$_detail")" = "loud" ]; then
+                _report "$(_owner_loud_line "$_detail")"
+            fi
+            exit 0
+            ;;
         registered:*)
-            _report "ENGRAM owner unit $UNIT is registered but ${_state#registered:}; leaving it to systemd, no second owner launched. ENGRAM_HOME=$ENGRAM_HOME"
+            _act="${_state#registered:}"
+            _detail="$(_unit_detail)"
+            if [ -z "$_detail" ]; then
+                # The detail could not be read: today's message EXACTLY (see _unit_detail).
+                _report "$(_owner_registered_plain "$_act")"
+            else
+                # STATE first, count second (#3835 finding 1): a `failed` unit is a DOWN unit
+                # whatever its restart count, and the loud line is reserved for a unit systemd is
+                # actually retrying or one that restarted and came back.
+                #
+                # THE EXIT-CLAUSE CLASS (#3835 round 5), at the routing point: the DOWN arms --
+                # `down-failed` and `down-stopped`, i.e. `_owner_down_line` -- are the ONLY lines
+                # reachable for a unit whose record holds no process exit (measured: an `inactive`
+                # unit with ExecMainCode=0 is one of 70 that never ran, and `auditd.service` is
+                # `failed` with code 0), so both of those arms gate their exit clause on
+                # ExecMainCode. The LOUD arm does NOT, and need not: every state that reaches it
+                # implies an exit by construction (`_owner_loud_line` states the reasoning).
+                case "$(_owner_verdict "$_detail")" in
+                    down-failed | down-stopped) _report "$(_owner_down_line "$_act" "$_detail")" ;;
+                    loud)                       _report "$(_owner_loud_line "$_detail")" ;;
+                    silent) ;;
+                    # `unknown`: includes `maintenance` and any state a future systemd adds --
+                    # claim nothing (see _owner_verdict).
+                    *)                          _report "$(_owner_registered_plain "$_act")" ;;
+                esac
+            fi
             exit 0
             ;;
         ambiguous:*)
