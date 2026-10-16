@@ -50,6 +50,16 @@ Output: JSON to stdout —
   indistinguishable in the nightly ritual, which is exactly the failure
   class that left engram-alpha#2570's hook telemetry dark for months on
   more than one seat without anyone noticing.
+
+Owner read (engram-alpha#3824, U12 of #2652). With `engramd.reconcile_demotions_reads_via_owner`
+true in $ENGRAM_HOME/config.json (read only through engramd_owner_flags.flag_on; default OFF) the
+tool's ONE statement -- the per-ledgered-lesson `prevention_type` read -- goes to the engramd owner
+instead of opening knowledge.db, and the tool opens the store ZERO times. The same invariant holds
+there: the owner being down, older than this tool, or unable to classify the read against the live
+store RAISES ReconcileError (exit 1), each with its own message, because `{"candidates": []}` means
+"nothing to demote" and the sleep cycle acts on it. Flag ON never falls back to a direct open.
+`db_path.exists()` is replaced by a `ping` to the owner. An explicit `--db` naming a store other than
+this home's keeps the direct path: the owner serves one store, and the caller asked for that file.
 """
 
 from __future__ import annotations
@@ -124,6 +134,13 @@ DEFAULT_ENGRAM_HOME = Path(os.environ.get("ENGRAM_HOME") or Path.home() / ".engr
 DEFAULT_DB_PATH = DEFAULT_ENGRAM_HOME / "knowledge.db"
 DEFAULT_LEDGER_PATH = DEFAULT_ENGRAM_HOME / "lesson-prevention-ledger.jsonl"
 
+# --- owner read (#3824) ------------------------------------------------------
+OWNER_FLAG_KEY = "reconcile_demotions_reads_via_owner"
+# One run reads once per ledgered lesson id (a handful), once per sleep: no latency gate, but a bound so
+# a stuck owner is an error and not a hang. A JUDGEMENT, not a measurement.
+OWNER_READ_TOTAL_BUDGET_SECONDS = 60.0
+OWNER_READ_PER_CALL_SECONDS = 10.0
+
 
 class ReconcileError(RuntimeError):
     """The reconcile check itself could not run -- as opposed to running
@@ -190,6 +207,136 @@ def _read_ledger_lesson_ids(ledger_path: Path) -> set[str]:
     return lesson_ids
 
 
+def _runtime_dir() -> Path | None:
+    """The directory holding engramd_client.py (the plugin root when deployed, src/engram/ in the source
+    tree): $CLAUDE_PLUGIN_ROOT first, then a walk of ALL parent directories of this file (never a fixed
+    parents[N] -- the same two path hazards _resolve_hook_path documents)."""
+    roots: list[Path] = []
+    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
+    if plugin_root:
+        roots.append(Path(plugin_root))
+    roots.extend(Path(__file__).resolve().parents)
+    for root in roots:
+        try:
+            if (root / "engramd_client.py").exists():
+                return root
+        except OSError:
+            continue
+    return None
+
+
+def _import_runtime(name: str):
+    """Import a runtime module (engramd_client, engramd_owner_flags) from _runtime_dir()."""
+    runtime = _runtime_dir()
+    if runtime is None:
+        raise ImportError(f"{name}: no engramd_client.py found via CLAUDE_PLUGIN_ROOT or a walk of this file's parents")
+    if str(runtime) not in sys.path:
+        sys.path.insert(0, str(runtime))
+    return importlib.import_module(name)
+
+
+def _owner_flag_applies(db_path: Path) -> bool:
+    """True iff the owner flag is ON and `db_path` is THIS home's store. A flag that cannot be read is
+    OFF (the U4d precedent: fail to false); an explicit --db naming another store keeps the direct path."""
+    try:
+        flags = _import_runtime("engramd_owner_flags")
+        on = flags.flag_on(OWNER_FLAG_KEY, DEFAULT_ENGRAM_HOME / "config.json")
+    except Exception:
+        return False
+    if not on:
+        return False
+    return os.path.realpath(db_path) == os.path.realpath(DEFAULT_DB_PATH)
+
+
+def _owner_failure(client, failure) -> ReconcileError:
+    """The ReconcileError for an owner that did not give rows. Three refusals, three messages, because
+    their remedies differ: down -> start it; unregistered_template -> the running owner is OLDER than this
+    tool, restart it on the new build; refused_at_load -> the STORE failed classification, a restart will
+    not fix it. `failure` is an OwnerReadError, an Unavailable or a Rejected."""
+    result = getattr(failure, "result", failure)
+    kind = getattr(failure, "kind", None)
+    never_empty = " Not answering from an empty list: that would read as 'nothing to demote'."
+    if isinstance(result, client.Unavailable):
+        why = result.reason or "unavailable"
+        return ReconcileError(
+            f"engramd owner unavailable ({why}): start the owner (the SessionStart hook "
+            f"start-engramd-owner.sh launches it), or set engramd.{OWNER_FLAG_KEY} to false in "
+            f"{DEFAULT_ENGRAM_HOME / 'config.json'} to read the store directly.{never_empty}"
+        )
+    if isinstance(result, client.Rejected):
+        if result.reason == "unregistered_template":
+            return ReconcileError(
+                "the running engramd owner does not know this read (unregistered_template): it is older "
+                "than this tool, so restart the owner on the current build, or set "
+                f"engramd.{OWNER_FLAG_KEY} to false.{never_empty}"
+            )
+        if result.reason == "refused_at_load":
+            return ReconcileError(
+                f"the engramd owner dropped this read at load against the store (refused_at_load: "
+                f"{result.detail}). This is a store/schema problem: restarting the owner alone will not fix it, so "
+                f"migrate the store (any ENGRAM session start does), then restart the owner.{never_empty}"
+            )
+        return ReconcileError(
+            f"the engramd owner refused the read ({result.reason}: {result.detail}); {result.remedy}. If that does not "
+            f"help, set engramd.{OWNER_FLAG_KEY} to false to read the store directly.{never_empty}"
+        )
+    return ReconcileError(
+        f"the engramd owner read failed ({kind or 'unusable answer'}); retry once the owner is healthy, or set "
+        f"engramd.{OWNER_FLAG_KEY} to false to read the store directly. Not answering from an empty list."
+    )
+
+
+def _owner_socket(client) -> Path:
+    return client.socket_path_for_home(DEFAULT_ENGRAM_HOME)
+
+
+def _owner_ping() -> None:
+    """Flag ON replaces `db_path.exists()`: the owner must answer. Raises ReconcileError if it does not."""
+    try:
+        client = _import_runtime("engramd_client")
+    except Exception as exc:
+        raise ReconcileError(
+            f"engramd.{OWNER_FLAG_KEY} is on but engramd_client could not be loaded "
+            f"({type(exc).__name__}: {exc}); not reading the store directly. Fix the plugin install, or set "
+            f"the flag to false."
+        ) from exc
+    try:
+        result = client.read("ping", {}, timeout=OWNER_READ_PER_CALL_SECONDS, socket_path=_owner_socket(client))
+    except (Exception, SystemExit) as exc:  # client.read does not raise by contract (#3717); belt, as OwnerReadConnection
+        raise ReconcileError(
+            f"the engramd owner ping failed ({type(exc).__name__}); not reading the store directly. Start the "
+            f"owner, or set engramd.{OWNER_FLAG_KEY} to false.") from exc
+    if not isinstance(result, client.Ok):
+        raise _owner_failure(client, result)
+
+
+class _OwnerReader:
+    """The owner's read shim with sqlite's `execute(...).fetchone()` / `close()` face, turning every
+    OwnerReadError into the ReconcileError for its cause."""
+
+    def __init__(self, client):
+        self._client = client
+        self._conn = client.OwnerReadConnection(
+            OWNER_READ_TOTAL_BUDGET_SECONDS, OWNER_READ_PER_CALL_SECONDS, socket_path=_owner_socket(client)
+        )
+
+    def execute(self, sql, params=()):
+        try:
+            return self._conn.execute(sql, params)
+        except self._client.OwnerReadError as exc:
+            raise _owner_failure(self._client, exc) from exc
+
+    def close(self):
+        self._conn.close()
+
+
+def _open_reader(db_path: Path, use_owner: bool):
+    """The read connection: the owner shim under the flag, else a `mode=ro` sqlite connection."""
+    if use_owner:
+        return _OwnerReader(_import_runtime("engramd_client"))
+    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+
+
 def find_candidates(
     db_path: Path = DEFAULT_DB_PATH,
     ledger_path: Path = DEFAULT_LEDGER_PATH,
@@ -202,10 +349,15 @@ def find_candidates(
 
     Raises ReconcileError (never returns silently) if knowledge.db is
     missing or the ledger exists but can't be read -- see the module
-    docstring and ReconcileError for why this distinction is load-bearing."""
+    docstring and ReconcileError for why this distinction is load-bearing.
+    With engramd.reconcile_demotions_reads_via_owner on, the same holds for
+    the owner: down, older than this tool, or refusing the read raises."""
     if now is None:
         now = time.time()
-    if not db_path.exists():
+    use_owner = _owner_flag_applies(db_path)
+    if use_owner:
+        _owner_ping()  # the owner's answer replaces the db_path.exists() precondition (#3824)
+    elif not db_path.exists():
         raise ReconcileError(f"knowledge.db not found at {db_path}")
     hook = hook_module or _load_hook_module()
     # hook._count_recent_overrides reads the hook module's own
@@ -220,7 +372,7 @@ def find_candidates(
 
     cfg = hook._demotion_config()
     candidates: list[dict] = []
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+    conn = _open_reader(db_path, use_owner)
     try:
         for lesson_id in sorted(lesson_ids):
             # #3485: json_valid-guarded, so a non-JSON metadata blob on one

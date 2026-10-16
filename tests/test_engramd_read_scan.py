@@ -484,7 +484,9 @@ _LINE_KEY = _re.compile(r":\d+$")
 # idf template (cbfeed19...) is no longer reachable from any hook root and is gone.
 # #3742: the focused-ids read gained ORDER BY focused_at (087e3f55... -> 8fd6a2ad...); a SQL
 # change legitimately moves its own key.
+# #3824 (U12): the first tools/ template (33b71137...), tools/reconcile_lesson_demotions.py:find_candidates.
 _FROZEN_TEMPLATE_KEYS = frozenset({
+    "33b7113738f7310b25d3b9c6e109b18c3a790ba8c54879c25e8a774757703e3e",
     "8fd6a2adcab8ffb85efcf1e3b22c7433632f94a0d820c60cf37d4ba22ebd154e",
     "0280b9b584a3522d55be45f09ec258c28ec2d8b8e0e3cf80267097f593c71462",
     "931a3e96f918cd7e53e396133a92bfb3330843c4041d026c78b99ce950be6ab7",

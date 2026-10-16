@@ -5,7 +5,7 @@
 ## Summary (for Lei)
 
 - **Population:** 76 lines matched `sqlite3.connect(` in tracked `src/engram` at `21ec2944`, in 34 files; U9 (#3735) then replaced the three raw connects of the session-start hook with `connect_regular_ro` calls (rows 34-36, removed), so **73 lines in 33 files** now. 62 are executed calls, 11 are prose (comments, docstrings, instructions to an agent).
-- **State of the 40 live-store lines** (calls and doc instructions that reach `knowledge.db`): **owner 3** (the owner's own connections) · **direct 36** (32 calls + 4 doc instructions) · **behind-flag 1** (user-identity read, U4d; the stop hook's flag, U6a #3664, is behind-flag in Section 3 but adds no line here, because its read goes through the shared opener of row 33; so are the session-start hook's six readers, U9 #3735, `engramd.session_start_reads_via_owner`) · **flag-on 0** · **retired 0**. The other 33 lines are out of scope (other databases, or prose).
+- **State of the 40 live-store lines** (calls and doc instructions that reach `knowledge.db`): **owner 3** (the owner's own connections) · **direct 35** (31 calls + 4 doc instructions) · **behind-flag 2** (user-identity read, U4d; `tools/reconcile_lesson_demotions.py`, U12 #3824, `engramd.reconcile_demotions_reads_via_owner`; the stop hook's flag, U6a #3664, is behind-flag in Section 3 but adds no line here, because its read goes through the shared opener of row 33; so are the session-start hook's six readers, U9 #3735, `engramd.session_start_reads_via_owner`) · **flag-on 0** · **retired 0**. The other 33 lines are out of scope (other databases, or prose).
 - **Measured delta so far: one.** User-identity hook, owner round trip vs its own direct path, A6 on SQLite 3.53.0: **sequential 0.90x p50 / 0.95x p99 (the gate holds)**, contended 0.26x, cold 0.19x. One host, synthetic 5,005-node store, N=1000 (details in the A6 section). The stop hook's A6 cells were measured after this ledger's anchor (posted on #3675, and in U7's #3686) and, as of 2026-10-11, are due to enter its Section 3 row with #3686, which carries that row's update; until it does, the row reads `owed`.
 - **Next three units (as of 2026-10-11):** U6b lesson-tripwire hook behind `engramd.lesson_tripwire_reads_via_owner` (#3665) · U7 owner per-call floor (#3686) · owner accept backlog (#3680, PR #3690).
 - **Before any flag goes ON in production:** the owner launcher (U5, #3663) is merged as #3672 (merge commit `4f4cf46e`). It ships one `systemd --user` unit per `ENGRAM_HOME` (`src/engram/templates/engramd-owner.service.template`) and a SessionStart fallback (`start-engramd-owner.sh`) that acts only when an `engramd.*_via_owner` flag is ON. A seat's own hand-made unit is not visible to this ledger. **On Mac seats** the owner can start since the Darwin permission arm (#3703, closes #3666), but no launcher starts it there yet: both U5 paths still refuse on macOS (#3709).
@@ -35,8 +35,8 @@ The two are different populations measured by different instruments at different
 - **unit:** one row per matching LINE, deliberately. Row 55 is one line with two connects, so the 62 `call` rows are 62 lines and 63 connects.
 - **kind:** call 62 · prose 11
 - **target:** live store 25 · parameter 15 · other DB 26 · n/a (prose) 7 · unresolved 0
-- **state:** owner 3 · direct 36 · behind-flag 1 · flag-on 0 · retired 0 · out of scope 33
-- Of the 36 `direct` lines, 32 are calls and 4 are documents instructing an agent to open the store (rows 1, 42, 43 and 44: `engram-person-node-fairy.md`, `engram-first-session/SKILL.md`, and `engram-health-exam/SKILL.md` twice). Design §4.2 counts such documents as channels because following them regenerates the channel; they are kind `prose` and state `direct`.
+- **state:** owner 3 · direct 35 · behind-flag 2 · flag-on 0 · retired 0 · out of scope 33
+- Of the 35 `direct` lines, 31 are calls and 4 are documents instructing an agent to open the store (rows 1, 42, 43 and 44: `engram-person-node-fairy.md`, `engram-first-session/SKILL.md`, and `engram-health-exam/SKILL.md` twice). Design §4.2 counts such documents as channels because following them regenerates the channel; they are kind `prose` and state `direct`.
 - `parameter` rows are counted live when at least one caller passes the seat's store (named in each row). `engram_backup.py` `verify_roundtrip` (row 6) is the one judgement call: its only in-tree caller is its own CLI, so it is counted `direct` on the basis that an operator may pass the live store.
 
 ## 2. The ledger — one row per matching line (row 55 holds two connects; rows count lines, not connects)
@@ -117,7 +117,7 @@ Columns. **kind:** `call` or `prose`. **target:** `live store` (the seat's `$ENG
 | 71 | `tools/migrate_person_nodes.py` `_get_db()` `conn = sqlite3.connect(` | call | live store — WRITES (migration); `--db` default `~/.engram/knowledge.db` | rw | tool (CLI) | direct | — | n/a — no owner path planned yet |
 | 72 | `tools/migrate_prediction_pairing_edges.py` `_get_db()` `conn = sqlite3.connect(` | call | live store — WRITES (migration); `--db` default `~/.engram/knowledge.db` (`main`) | rw | tool (CLI) | direct | — | n/a — no owner path planned yet |
 | 73 | `tools/migrate_stranded_supported_by.py` `_get_db()` `conn = sqlite3.connect(` | call | live store — WRITES (migration); `--db` default `~/.engram/knowledge.db` (`main`) | rw | tool (CLI) | direct | — | n/a — no owner path planned yet |
-| 74 | `tools/reconcile_lesson_demotions.py` `find_candidates()` `conn = sqlite3.connect(` | call | live store — READ-ONLY; `--db` defaults to `ENGRAM_HOME/knowledge.db` (`DEFAULT_DB_PATH`); sole in-tree caller `main` | ro | tool (CLI) | direct | — | n/a — no owner path planned yet |
+| 74 | `tools/reconcile_lesson_demotions.py` `_open_reader()` `return sqlite3.connect(` | call | live store — READ-ONLY; the OLD path, kept live for flag OFF and for an explicit `--db` naming another store; flag `engramd.reconcile_demotions_reads_via_owner` (default OFF) routes the read through the owner instead (U12, #3824); `--db` defaults to `ENGRAM_HOME/knowledge.db` (`DEFAULT_DB_PATH`); sole in-tree caller `find_candidates`, called by `main` | ro | tool (CLI) | behind-flag | — | no Mac launcher yet (#3709) |
 | 75 | `tools/surgical.py` `_get_db()` `conn = sqlite3.connect(` | call | live store — WRITES (DB surgery tool); `DATA_DIR/knowledge.db` (module-level `DB_PATH`) | rw | tool (CLI) | direct | — | n/a — no owner path planned yet |
 | 76 | `viz/data/sqlite_ro.py` `connect_ro()` `return sqlite3.connect(` | call | parameter — the single viz read-only opener; callers pass each agent's knowledge.db (viz/agents.py `get_agents_meta`, data/graph.py, calibration.py, health.py, health_v2.py, moments.py) and, for stats, `logs/index.db` (viz/data/stats.py `get_stats_data`, not the store) | ro | viz | direct | — | n/a — no owner path planned yet |
 
@@ -127,7 +127,7 @@ Paths are relative to `src/engram/`.
 
 ## 3. The read-template registry — the migration queue
 
-Source: `src/engram/engramd_read_templates.json` at `21ec2944` (schema 1, 26 template entries). A template is one registered SQL shape; `sites` are the `file:function` callers allowed to use it. This is the per-caller view the hook-migration PRs update. Counts are **distinct templates per file**; one template can be registered for several callers. Read-only hooks first, fewest templates first.
+Source: `src/engram/engramd_read_templates.json` at `21ec2944` (schema 1, 26 template entries; 27 with U12's `tools/` template, see the `tools/` table below). A template is one registered SQL shape; `sites` are the `file:function` callers allowed to use it. This is the per-caller view the hook-migration PRs update. Counts are **distinct templates per file**; one template can be registered for several callers. Read-only hooks first, fewest templates first.
 
 | order | caller (file) | distinct templates | functions (template count) | state | unit | A6 delta | macOS |
 |---|---|---|---|---|---|---|---|
@@ -141,6 +141,14 @@ Source: `src/engram/engramd_read_templates.json` at `21ec2944` (schema 1, 26 tem
 | n/a | `engram_core.py` | 8 | `generalization_chain` (5), `_current_successor` (2), `_resolve_to_current` (1) | direct | non-hook; per design §6 the MCP server migrates last | — | no Mac launcher yet (#3709) |
 | n/a | `engram_idf.py` | 2 | `extract_keywords` (1), `idf` (2): 3 function-template pairs over 2 distinct templates; one of them is the COUNT template shared with the tripwire hook | direct | non-hook; see U6b's shared-template requirement | — | no Mac launcher yet (#3709) |
 | n/a | `engram_restamp.py` | 1 | `bump_utility` (1, also a registered write site) | direct | non-hook | — | no Mac launcher yet (#3709) |
+
+### `tools/` — the first tools unit (§6 order: hooks → tools → viz → server)
+
+Counts are distinct templates per file, as above. A tool is not a hook, but §6's rule still holds: each phase stays behind a flag until its equality control passes, so the old direct path stays live behind it. Scanner roots for tools are `tools/<file>:<function>` in `tools/engramd_read_scan.config.json`.
+
+| order | caller (file) | distinct templates | functions (template count) | state | unit | A6 delta | macOS |
+|---|---|---|---|---|---|---|---|
+| tools-1 | `tools/reconcile_lesson_demotions.py` | 1 | `find_candidates` (1: the per-ledgered-lesson `prevention_type` read, sha256 `33b71137…`) | behind-flag (`engramd.reconcile_demotions_reads_via_owner`, default OFF) | U12, #3824 (design seat; build seat, colleague review) | none gated: the tool runs once per sleep, so latency is not the risk; per-run time on both paths is reported in the PR | no Mac launcher yet (#3709); a Mac account with no GUI session gets an unsupervised owner or a named refusal (#3823) |
 
 **Registered write sites (3):** `engram_restamp.py:bump_utility` · `hooks/claude/engram-surface-hook.py:_advance_person_moment_cursor` · `hooks/claude/engram-utility-credit-mention-stop.py:bump_utility`.
 

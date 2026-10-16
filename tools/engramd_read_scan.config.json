@@ -484,7 +484,8 @@
   "hooks/claude/engram-utility-credit-mention-stop.py:credit_mentions",
   "hooks/claude/engram-utility-credit-mention-stop.py:main",
   "hooks/claude/engram-utility-credit-mention-stop.py:write_telemetry_record",
-  "hooks/claude/engram-session-start-hook.py:_check_json1"
+  "hooks/claude/engram-session-start-hook.py:_check_json1",
+  "tools/reconcile_lesson_demotions.py:find_candidates"
  ],
  "exclusions": [
   {

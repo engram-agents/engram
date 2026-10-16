@@ -23,6 +23,13 @@
       ]
     },
     {
+      "key": "33b7113738f7310b25d3b9c6e109b18c3a790ba8c54879c25e8a774757703e3e",
+      "sql": "SELECT json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.prevention_type') FROM nodes WHERE id = ? AND type = 'lesson' AND is_current = 1 AND memory_status = 'active'",
+      "sites": [
+        "tools/reconcile_lesson_demotions.py:find_candidates"
+      ]
+    },
+    {
       "key": "4795866d2d19b5085970ad79dd2705359930118747cd19d1ec6eb405627befb9",
       "sql": "SELECT id, type FROM nodes WHERE id = ?",
       "sites": [
