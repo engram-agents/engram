@@ -59,6 +59,13 @@
       ]
     },
     {
+      "key": "6b8a8373e14ff561366c89e57e0e982e4d416d952e467ae44ef2e13e9eb0cd42",
+      "sql": "SELECT id, type, claim, quoted_text, interpretation, recall_summary, predicted_event, resolution_timeframe FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
+      "sites": [
+        "tools/cohort_dispatch.py:_fetch_nodes"
+      ]
+    },
+    {
       "key": "6b93753474b01e7fc71620df964ee442e9b3b6a7c9d679d00c1b24c29c65b76e",
       "sql": "SELECT superseded_by, is_current FROM nodes WHERE id = ?",
       "sites": [

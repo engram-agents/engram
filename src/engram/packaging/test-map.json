@@ -345,8 +345,18 @@
     {
       "path_prefix_or_glob": "tools/cohort_dispatch.py",
       "test_globs": [
-        "tests/test_cohort_dispatch.py"
+        "tests/test_cohort_dispatch.py",
+        "tests/test_cohort_owner_read_3862.py"
       ]
+    },
+    {
+      "path_prefix_or_glob": "tools/_owner_read.py",
+      "test_globs": [
+        "tests/test_cohort_owner_read_3862.py",
+        "tests/test_reconcile_owner_read_3824.py",
+        "tests/test_reconcile_lesson_demotions.py"
+      ],
+      "note": "engram-alpha#3862. The shared owner-read helper for tools/: both tools that use it load by path (spec_from_file_location) in their cells, so the layer-1 import graph does not see it; a change here must rerun both consumers' cells."
     },
     {
       "path_prefix_or_glob": "tools/engramd_read_scan.py",
@@ -505,7 +515,8 @@
     {
       "path_prefix_or_glob": "tools/reconcile_lesson_demotions.py",
       "test_globs": [
-        "tests/test_reconcile_lesson_demotions.py"
+        "tests/test_reconcile_lesson_demotions.py",
+        "tests/test_reconcile_owner_read_3824.py"
       ],
       "note": "engram-alpha#2544. test_reconcile_lesson_demotions.py loads the module via importlib.util.spec_from_file_location (not a static `import`), same reasoning as the hyphenated hook files above -- invisible to the layer-1 AST import graph despite having a valid module name, so it needs this layer-2 mapping."
     },

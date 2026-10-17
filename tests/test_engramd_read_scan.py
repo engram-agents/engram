@@ -485,7 +485,9 @@ _LINE_KEY = _re.compile(r":\d+$")
 # #3742: the focused-ids read gained ORDER BY focused_at (087e3f55... -> 8fd6a2ad...); a SQL
 # change legitimately moves its own key.
 # #3824 (U12): the first tools/ template (33b71137...), tools/reconcile_lesson_demotions.py:find_candidates.
+# #3862 (U14): the second, tools/cohort_dispatch.py:_fetch_nodes (6b8a8373...), the registry's one json_each form.
 _FROZEN_TEMPLATE_KEYS = frozenset({
+    "6b8a8373e14ff561366c89e57e0e982e4d416d952e467ae44ef2e13e9eb0cd42",
     "33b7113738f7310b25d3b9c6e109b18c3a790ba8c54879c25e8a774757703e3e",
     "8fd6a2adcab8ffb85efcf1e3b22c7433632f94a0d820c60cf37d4ba22ebd154e",
     "0280b9b584a3522d55be45f09ec258c28ec2d8b8e0e3cf80267097f593c71462",

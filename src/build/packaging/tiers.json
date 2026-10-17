@@ -484,6 +484,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/_owner_read.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/dream_lottery.py",
       "tier": "essential"
     },

@@ -743,9 +743,10 @@ python3 -m tools.cohort_dispatch prepare \
   --ids "$COHORT_IDS" \
   --out "$COHORT_DIR" \
   --chunk-size 15 \
-  --expect-total "$COHORT_TOTAL" \
-  --db ~/.engram/knowledge.db
+  --expect-total "$COHORT_TOTAL"
 ```
+
+The store is `$ENGRAM_HOME/knowledge.db` (the tool resolves `ENGRAM_HOME` itself, one definition shared with the other owner-aware tools); pass `--db` only to read a different file.
 
 The script prints a JSON manifest to stdout listing chunk directories. Each chunk-N/ contains:
 - `payload.json` — the node content the fairy will see (no recall_summary/recall_keywords)
@@ -771,8 +772,7 @@ No per-chunk `prompt.md` is written. The dispatcher constructs a short prompt in
 
 ```bash
 python3 -m tools.cohort_dispatch verify-in \
-  --out "$COHORT_DIR" \
-  --db ~/.engram/knowledge.db
+  --out "$COHORT_DIR"
 # Exit code 0 → all checks pass; proceed to Step 6.
 # Exit code 1 → structured JSON error to stdout listing which chunk/check failed.
 #               Abort dispatch and investigate (likely a DB race or payload bug).
