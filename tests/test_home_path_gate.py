@@ -128,7 +128,7 @@ def _git(root, *args):
     )
 
 
-def _repo(tmp_path, files=None, baseline=None, allowlist=None):
+def _repo(tmp_path, files=None, baseline=None, allowlist=None, prefixes=None):
     """A scratch git repo. files: {relpath: text}. baseline: a dict
     {file: count} (schema 2), a list (schema 1), or None (no baseline file at
     all). allowlist: {file: {"class":..., "reason":...}} (schema 2 only)."""
@@ -139,12 +139,14 @@ def _repo(tmp_path, files=None, baseline=None, allowlist=None):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, encoding="utf-8")
     if baseline is not None:
-        _write_baseline(tmp_path, baseline, allowlist)
+        _write_baseline(tmp_path, baseline, allowlist, prefixes)
     _git(tmp_path, "add", "-A")
     return tmp_path
 
 
-def _write_baseline(root, baseline, allowlist=None):
+def _write_baseline(root, baseline, allowlist=None, prefixes=None):
+    """prefixes: None = the gate's own SCAN_PREFIXES, False = omit the key,
+    else the list to write."""
     mod = _load()
     p = root / mod.BASELINE_REL
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -152,6 +154,8 @@ def _write_baseline(root, baseline, allowlist=None):
         doc = {"schema": 1, "baseline": sorted(baseline), "allowlist": []}
     else:
         doc = {"schema": 2, "baseline": dict(baseline), "allowlist": dict(allowlist or {})}
+        if prefixes is not False:
+            doc["scan_prefixes"] = list(mod.SCAN_PREFIXES if prefixes is None else prefixes)
     p.write_text(json.dumps(doc), encoding="utf-8")
 
 
@@ -393,6 +397,52 @@ def test_files_outside_the_shipped_scope_are_not_scanned(tmp_path, rel):
     assert mod.check(root) == []
 
 
+# -- scope: src/engram/ and src/build/ ------------------------------------------
+
+BP = "src/build/engine/x.py"
+BQ = "src/build/engine/y.py"
+OLD = ["src/engram/"]
+
+
+def test_scan_prefixes_are_the_two_trees():
+    mod = _load()
+    assert tuple(mod.SCAN_PREFIXES) == ("src/engram/", "src/build/")
+    assert not hasattr(mod, "SCAN_PREFIX")
+
+
+@pytest.mark.parametrize(
+    "rel,scanned",
+    [
+        ("src/build/engine/build.py", True),
+        ("src/build/packaging/tiers.json", True),
+        ("src/build/tests/helper.py", False),
+        ("src/build/docs/guide.md", False),
+        ("src/build/engine/test_thing.py", False),
+        ("src/forum/server.py", False),
+        ("src/other/x.py", False),
+    ],
+)
+def test_src_build_is_scanned_and_the_exclusions_hold(tmp_path, rel, scanned):
+    mod = _load()
+    root = _repo(tmp_path, {rel: BARE}, baseline={rel: 1} if scanned else {})
+    assert (rel in mod.violations(root)) == scanned
+    assert mod.in_scope(rel) == scanned
+    assert mod.check(root) == []
+
+
+def test_a_src_build_violation_missing_from_the_baseline_is_red(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {BP: TWO}, baseline={})
+    assert any(BP in p for p in mod.check(root))
+
+
+def test_dangling_message_names_every_scanned_prefix(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {"src/engram/x.py": "pass\n"}, baseline={"src/build/gone.py": 1})
+    msg = next(p for p in mod.check(root) if "dangling" in p)
+    assert "src/engram/" in msg and "src/build/" in msg
+
+
 def test_untracked_file_is_not_scanned(tmp_path):
     mod = _load()
     root = _repo(tmp_path, {}, baseline={})
@@ -524,18 +574,113 @@ def test_d_baseline_entry_naming_an_out_of_scope_file_is_red(tmp_path):
 # -- C2 (e): growth against the base commit ---------------------------------
 
 def _two_commit_repo(tmp_path, base_baseline, head_baseline, head_files=None, base_allow=None,
-                     head_allow=None, base_files=None):
+                     head_allow=None, base_files=None, base_prefixes=None, head_prefixes=None):
     """Base commit with base_baseline (None = no baseline file); then a head
     working tree with head_baseline. Returns (root, base_sha)."""
     files = base_files or {A: TWO, B: TWO}
-    root = _repo(tmp_path, files, baseline=base_baseline, allowlist=base_allow)
+    root = _repo(tmp_path, files, baseline=base_baseline, allowlist=base_allow, prefixes=base_prefixes)
     base = _commit(root, "base")
     for rel, text in (head_files or {}).items():
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
         (root / rel).write_text(text)
-    _write_baseline(root, head_baseline, head_allow)
+    _write_baseline(root, head_baseline, head_allow, head_prefixes)
     _git(root, "add", "-A")
     return root, base
+
+
+# -- C2/C3: the scan scope is declared, and entering a prefix seeds once ----------
+
+def _widen(tmp_path, head_baseline, head_files=None, base_prefixes=None, head_prefixes=None,
+           base_files=None):
+    """Base: only src/engram/ (or base_prefixes); head adds src/build files."""
+    return _two_commit_repo(
+        tmp_path, base_baseline={}, head_baseline=head_baseline,
+        head_files=head_files if head_files is not None else {BP: TWO},
+        base_files=base_files if base_files is not None else {A: "x = 1\n"},
+        base_prefixes=OLD if base_prefixes is None else base_prefixes,
+        head_prefixes=head_prefixes,
+    )
+
+
+def test_widen_i_entering_prefix_seeded_at_its_exact_count_is_green(tmp_path):
+    mod = _load()
+    root, base = _widen(tmp_path, {BP: 2})
+    assert mod.check(root, base_sha=base) == []
+
+
+def test_widen_ii_entering_prefix_with_a_padded_count_is_red(tmp_path):
+    mod = _load()
+    root, base = _widen(tmp_path, {BP: 3})
+    problems = mod.check(root, base_sha=base)
+    assert len(problems) == 1 and "lower it to 2" in problems[0]
+
+
+def test_widen_ii_entering_prefix_with_a_lowered_count_is_red(tmp_path):
+    mod = _load()
+    root, base = _widen(tmp_path, {BP: 1})
+    problems = mod.check(root, base_sha=base)
+    assert len(problems) == 1 and BP in problems[0]
+
+
+def test_widen_iii_entering_prefix_violator_not_baselined_is_red(tmp_path):
+    mod = _load()
+    root, base = _widen(tmp_path, {})
+    assert any(BP in p for p in mod.check(root, base_sha=base))
+
+
+def test_widen_iv_after_the_prefix_is_in_the_base_a_new_entry_is_red_as_grew(tmp_path):
+    mod = _load()
+    root, base = _widen(tmp_path, {BP: 2}, base_prefixes=["src/engram/", "src/build/"])
+    problems = mod.check(root, base_sha=base)
+    assert len(problems) == 1 and "grew" in problems[0] and BP in problems[0]
+
+
+def test_widen_iv_after_the_prefix_is_in_the_base_a_higher_count_is_red_as_grew(tmp_path):
+    mod = _load()
+    root, base = _two_commit_repo(
+        tmp_path, base_baseline={BP: 2}, head_baseline={BP: 3}, head_files={BP: THREE},
+        base_files={BP: TWO}, base_prefixes=["src/engram/", "src/build/"],
+    )
+    assert any("grew" in p and BP in p for p in mod.check(root, base_sha=base))
+
+
+def test_widen_v_a_base_without_scan_prefixes_is_read_as_src_engram_only(tmp_path):
+    mod = _load()
+    root, base = _widen(tmp_path, {BP: 2}, base_prefixes=False)
+    assert mod.check(root, base_sha=base) == []
+
+
+def test_widen_v_a_base_without_scan_prefixes_gives_no_exemption_to_src_engram(tmp_path):
+    mod = _load()
+    root, base = _widen(tmp_path, {A: 2}, head_files={A: TWO}, base_prefixes=False)
+    assert any("grew" in p and A in p for p in mod.check(root, base_sha=base))
+
+
+def test_widen_vi_head_scan_prefixes_differing_from_the_gate_is_red(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {A: "x = 1\n"}, baseline={}, prefixes=["src/engram/"])
+    problems = mod.check(root)
+    assert len(problems) == 1 and "out of sync" in problems[0]
+
+
+def test_widen_vi_head_baseline_without_scan_prefixes_is_red(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {A: "x = 1\n"}, baseline={}, prefixes=False)
+    assert any("out of sync" in p for p in mod.check(root))
+
+
+def test_widen_vi_the_prefixes_must_match_in_content_not_only_in_length(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {A: "x = 1\n"}, baseline={}, prefixes=["src/engram/", "src/forum/"])
+    assert any("out of sync" in p for p in mod.check(root))
+
+
+def test_widen_vii_a_new_violator_under_the_old_prefix_is_still_red(tmp_path):
+    """Only an ENTERING prefix is exempt from the growth rule."""
+    mod = _load()
+    root, base = _widen(tmp_path, {BP: 2, A: 2}, head_files={BP: TWO, A: TWO})
+    problems = mod.check(root, base_sha=base)
+    assert len(problems) == 1 and "grew" in problems[0] and A in problems[0]
 
 
 def test_e_new_baseline_entry_is_red_as_grew(tmp_path):
@@ -1034,7 +1179,9 @@ def test_cli_seed_writes_schema2_counts_and_refuses_to_overwrite(tmp_path):
     root = _repo(tmp_path, {A: THREE, B: "x = 1\n"})
     assert mod.main(["--root", str(root), "--seed"]) == 0
     doc = json.loads((root / mod.BASELINE_REL).read_text())
-    assert doc == {"schema": 2, "baseline": {A: 3}, "allowlist": {}}
+    assert doc == {
+        "schema": 2, "scan_prefixes": list(mod.SCAN_PREFIXES), "baseline": {A: 3}, "allowlist": {},
+    }
     assert mod.main(["--root", str(root)]) == 0
     assert mod.main(["--root", str(root), "--seed"]) == 1
 

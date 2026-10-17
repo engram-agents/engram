@@ -1,6 +1,12 @@
 {
   "schema": 2,
+  "scan_prefixes": [
+    "src/engram/",
+    "src/build/"
+  ],
   "baseline": {
+    "src/build/engine/build.py": 3,
+    "src/build/engine/flows.py": 7,
     "src/engram/agents/claude/engram-dream-master.md": 23,
     "src/engram/bootstrap.py": 14,
     "src/engram/engram_client.py": 2,

@@ -7,8 +7,8 @@ that reaches the store (or anything else under the ENGRAM home) through a
 hard-coded `~/.engram` is a defect, even on a seat where `~/.engram` happens to
 be right today.
 
-WHAT IS A VIOLATION (R5, line level). A tracked file under `src/engram/`
-(excluding tests and docs) is scanned LINE BY LINE. A line that carries at least
+WHAT IS A VIOLATION (R5, line level). A tracked file under `src/engram/` or
+`src/build/` (SCAN_PREFIXES; excluding tests and docs) is scanned LINE BY LINE. A line that carries at least
 one hard-coded ENGRAM-home spelling (the SPELLINGS table below) is a violating
 line unless that same line
   * contains the substring `ENGRAM_HOME`, or
@@ -19,13 +19,17 @@ line unless that same line
     nothing).
 The unit is the PHYSICAL line (designer's ruling, no parser): `ENGRAM_HOME` on
 some OTHER line of the file, or on another line of the same multi-line
-statement, does not rescue a bare spelling line. Scope: every tracked `src/engram/` file except a `tests` or `docs` path
-component and `test_*` basenames. That is wider than "what ships at some tier":
+statement, does not rescue a bare spelling line. Scope: every tracked `src/engram/` or
+`src/build/` file except a `tests` or `docs` path component and `test_*`
+basenames. That is wider than "what ships at some tier":
 three of the issue's 13 files (the `migrate_*` one-shots) are manifest-excluded
 and never ship, but the issue names them as positive controls, so the gate
 reads the source tree, not the build manifest.
 
 KNOWN BOUNDS (the instrument is the issue's floor, made wider, not a proof):
+  * Only the SCAN_PREFIXES trees are read. src/forum (146 tracked files) and
+    every other tree outside both prefixes are NOT scanned; it is not measured
+    whether they carry violations.
   * The test is the substring `ENGRAM_HOME`, so a comment on the line, or a
     longer name containing it, also counts the line clean.
   * The resolver clause is the text of a RESOLVER_TOKENS match on the line; it
@@ -48,6 +52,8 @@ KNOWN BOUNDS (the instrument is the issue's floor, made wider, not a proof):
 
 THE BASELINE (tools/home_path_baseline.json, schema 2):
   {"schema": 2,
+   "scan_prefixes": ["src/engram/", "src/build/"],   (must equal SCAN_PREFIXES,
+                                       else RED "scope declaration out of sync")
    "baseline":  {"<relpath>": <number of violating LINES in that file>},
    "allowlist": {"<relpath>": {"class": "resolver"|"foreign-home"|
                                         "self-contained-no-lib",
@@ -76,7 +82,16 @@ The baseline is an exact, shrink-only ratchet:
      the base may be of either class if it is valid (rule f); a resolver
      entry is bounded by the declared RESOLVER_LAYERS, so a layer's resolver
      PR is not red by construction once it declares the layer.
-     The SEED is the only exception: the base commit has no baseline file at all
+     Files that ENTER SCOPE are seeded at the count measured at entry,
+     shrink-only from then on; this is not a transitional exception, it is the
+     same rule 6a used to seed the baseline: an entry whose path starts with a
+     prefix that is in the head's scan_prefixes and not in the base's (a base
+     baseline without the key is read as ["src/engram/"]) is exempt from the
+     "grew" comparison in that one PR, while the exactness rules a-c still
+     bind its count (a padded or lower count is RED). Once the base carries the
+     prefix, growth there is RED again; a new violator under an old prefix is
+     never exempt.
+     The SEED is the only other exception: the base commit has no baseline file at all
      (`git ls-tree` finds nothing at the path). An unresolvable base ref or an
      unreadable base baseline is RED, it is never read as a seed. A base
      baseline in schema 1 (the retired file-level list of names) is the
@@ -133,7 +148,13 @@ import sys
 from pathlib import Path
 
 BASELINE_REL = "tools/home_path_baseline.json"
-SCAN_PREFIX = "src/engram/"
+# The trees the gate reads. The baseline records this list as `scan_prefixes`
+# and the two must agree (a baseline written for another scope is RED). A prefix
+# that is new relative to the base baseline ENTERS SCOPE in that PR: its files
+# are seeded at the count measured at entry (see rule e).
+SCAN_PREFIXES = ("src/engram/", "src/build/")
+# The scope when schema 2 began; a base baseline without `scan_prefixes` is read as this.
+_LEGACY_PREFIXES = ["src/engram/"]
 HOME_TOKEN = "ENGRAM_HOME"
 _SCHEMA = 2
 CLASSES = ("resolver", "foreign-home", "self-contained-no-lib")
@@ -237,7 +258,7 @@ def _git(root, *args):
 
 
 def in_scope(rel):
-    if not rel.startswith(SCAN_PREFIX):
+    if not rel.startswith(SCAN_PREFIXES):
         return False
     parts = rel.split("/")
     if "tests" in parts[:-1] or "docs" in parts[:-1]:
@@ -248,7 +269,7 @@ def in_scope(rel):
 def scanned_files(root):
     """Tracked files in scope that exist on disk. Raises RuntimeError outside
     a git checkout."""
-    r = _git(root, "ls-files", "-z", "--", SCAN_PREFIX)
+    r = _git(root, "ls-files", "-z", "--", *SCAN_PREFIXES)
     if r.returncode != 0:
         raise RuntimeError(f"not a git checkout: {root} ({r.stderr.strip()})")
     root = Path(root)
@@ -300,7 +321,8 @@ def violations(root):
 
 
 def _parse_baseline(text):
-    """-> (schema, baseline, allowlist). Schema 1: baseline is a set of file
+    """-> (schema, baseline, allowlist, scan_prefixes). scan_prefixes is the
+    recorded list, or None when the key is absent (always None for schema 1). Schema 1: baseline is a set of file
     names (the retired file-level format), allowlist a set. Schema 2: baseline
     is {file: int >= 0}, allowlist is {file: entry dict}. Raises ValueError on a
     bad shape; the allowlist entries' class/reason are judged by check(), which
@@ -313,7 +335,7 @@ def _parse_baseline(text):
             v = data.get(key)
             if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
                 raise ValueError(f"'{key}' must be a list of strings (schema 1)")
-        return 1, set(data["baseline"]), set(data["allowlist"])
+        return 1, set(data["baseline"]), set(data["allowlist"]), None
     base = data.get("baseline")
     if not isinstance(base, dict):
         raise ValueError("'baseline' must be an object {file: count}")
@@ -323,11 +345,16 @@ def _parse_baseline(text):
     allow = data.get("allowlist")
     if not isinstance(allow, dict) or not all(isinstance(v, dict) for v in allow.values()):
         raise ValueError("'allowlist' must be an object {file: {class, reason}}")
-    return _SCHEMA, dict(base), dict(allow)
+    prefixes = data.get("scan_prefixes")
+    if prefixes is not None and (
+        not isinstance(prefixes, list) or not all(isinstance(x, str) for x in prefixes)
+    ):
+        raise ValueError("'scan_prefixes' must be a list of strings")
+    return _SCHEMA, dict(base), dict(allow), prefixes
 
 
 def load_baseline(root):
-    """-> (schema, baseline, allowlist) from the working tree."""
+    """-> (schema, baseline, allowlist, scan_prefixes) from the working tree."""
     return _parse_baseline((Path(root) / BASELINE_REL).read_text(encoding="utf-8"))
 
 
@@ -422,7 +449,7 @@ def check(root, base_sha=None):
     except RuntimeError as e:
         return [str(e)]
     try:
-        schema, baseline, allow = load_baseline(root)
+        schema, baseline, allow, prefixes = load_baseline(root)
     except FileNotFoundError:
         return [f"baseline file missing: {BASELINE_REL} (create it with --seed)"]
     except (ValueError, OSError) as e:
@@ -435,10 +462,16 @@ def check(root, base_sha=None):
         ]
 
     problems = _layer_problems()
+    if prefixes != list(SCAN_PREFIXES):
+        problems.append(
+            f"scope declaration out of sync with the gate: {BASELINE_REL} scan_prefixes is "
+            f"{prefixes!r}, the gate scans {list(SCAN_PREFIXES)!r}; set scan_prefixes to the "
+            f"gate's list (and seed any entering prefix, see rule e)"
+        )
     for label, entries in (("baseline", baseline), ("allowlist", allow)):
         for rel in sorted(set(entries) - files):
             problems.append(
-                f"dangling {label} entry (not a scanned tracked file under {SCAN_PREFIX}): {rel} "
+                f"dangling {label} entry (not a scanned tracked file under {', '.join(SCAN_PREFIXES)}): {rel} "
                 f"(a renamed baselined file reads as growth: fix the file in the same PR)"
             )
     problems += _allowlist_problems(allow, baseline)
@@ -483,8 +516,16 @@ def check(root, base_sha=None):
         if prob:
             problems.append(prob)
         elif base is not None and base[0] == _SCHEMA:
-            _, base_counts, _ = base
+            _, base_counts, _, base_prefixes = base
+            if base_prefixes is None:
+                base_prefixes = _LEGACY_PREFIXES
+            # A prefix in the gate's scope but not in the base's ENTERS SCOPE in
+            # this PR: its files are seeded at the count measured at entry. The
+            # exactness rules (a-c) above still bind those counts.
+            entering = tuple(x for x in SCAN_PREFIXES if x not in base_prefixes)
             for rel in sorted(baseline):
+                if entering and rel.startswith(entering):
+                    continue
                 if rel not in base_counts:
                     problems.append(
                         f"baseline grew: {rel} is not in {BASELINE_REL} at base {base_sha[:12]}; "
@@ -515,7 +556,12 @@ def _seed(root):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
-            {"schema": _SCHEMA, "baseline": dict(sorted(counts.items())), "allowlist": {}},
+            {
+                "schema": _SCHEMA,
+                "scan_prefixes": list(SCAN_PREFIXES),
+                "baseline": dict(sorted(counts.items())),
+                "allowlist": {},
+            },
             indent=2,
         )
         + "\n",
