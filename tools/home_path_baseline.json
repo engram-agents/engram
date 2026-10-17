@@ -26,7 +26,6 @@
     "src/engram/templates/template.CLAUDE.multi-agent.md",
     "src/engram/templates/template.warm-briefing.md",
     "src/engram/tools/backup_claude_projects.py",
-    "src/engram/tools/backup_knowledge_db.py",
     "src/engram/tools/backup_session_logs.py",
     "src/engram/tools/compute_task_time.py",
     "src/engram/tools/config_schema.py",

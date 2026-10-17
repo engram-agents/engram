@@ -359,9 +359,18 @@
       "test_globs": [
         "tests/test_cohort_owner_read_3862.py",
         "tests/test_reconcile_owner_read_3824.py",
-        "tests/test_reconcile_lesson_demotions.py"
+        "tests/test_reconcile_lesson_demotions.py",
+        "tests/test_backup_owner_snapshot_3872.py"
       ],
-      "note": "engram-alpha#3862. The shared owner-read helper for tools/: both tools that use it load by path (spec_from_file_location) in their cells, so the layer-1 import graph does not see it; a change here must rerun both consumers' cells."
+      "note": "engram-alpha#3862, #3872. The shared owner-read helper for tools/: the tools that use it load by path (spec_from_file_location) in their cells, so the layer-1 import graph does not see it; a change here must rerun every consumer's cells."
+    },
+    {
+      "path_prefix_or_glob": "tools/backup_knowledge_db.py",
+      "test_globs": [
+        "tests/test_backup_knowledge_db.py",
+        "tests/test_backup_owner_snapshot_3872.py"
+      ],
+      "note": "engram-alpha#3872 (U15): flag ON (engramd.backup_reads_via_owner) reads one owner snapshot; flag OFF is test_backup_knowledge_db.py unedited."
     },
     {
       "path_prefix_or_glob": "tools/engramd_read_scan.py",

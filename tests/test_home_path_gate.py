@@ -423,16 +423,18 @@ THE_13 = [
 ]
 
 
-# Five of the issue's 13 were fixed on dev after this gate was written, so they
-# are no longer violators and left the baseline; the other 8 are still checked
-# as violators AND baselined. Two read ENGRAM_HOME since #3869; three more in
-# PR 2 of #3863 (the walguard remedy text, the health-exam and upgrade skills).
+# Six of the issue's 13 were fixed after this gate was written, so they are no
+# longer violators and left the baseline; the other 7 are still checked as
+# violators AND baselined. Two read ENGRAM_HOME since #3869; three more in PR 2
+# of #3863 (the walguard remedy text, the health-exam and upgrade skills); one
+# since #3872 (the knowledge.db backup tool).
 FIXED_SINCE_THE_13 = {
     "src/engram/skills/claude/engram-sleep/SKILL.md": "reads ENGRAM_HOME since #3869",
     "src/engram/tools/cohort_dispatch.py": "reads ENGRAM_HOME since #3869",
     "src/engram/engram_walguard.py": "remedy text uses ${ENGRAM_HOME:-...} (PR 2 of #3863)",
     "src/engram/skills/claude/engram-health-exam/SKILL.md": "uses ${ENGRAM_HOME:-...} (PR 2 of #3863)",
     "src/engram/skills/claude/engram-upgrade/SKILL.md": "uses ${ENGRAM_HOME:-...} (PR 2 of #3863)",
+    "src/engram/tools/backup_knowledge_db.py": "reads ENGRAM_HOME since #3872",
 }
 
 
@@ -456,7 +458,7 @@ def test_the_13_named_files_are_all_violators_and_all_baselined():
     for f in FIXED_SINCE_THE_13:
         assert f not in baseline, f"fixed file must stay out of the baseline: {f}"
     still = [f for f in THE_13 if f not in FIXED_SINCE_THE_13]
-    assert len(still) == 8
+    assert len(still) == 7
     for f in still:
         assert f in v, f"positive control not detected: {f}"
         assert f in baseline, f"positive control not in baseline: {f}"

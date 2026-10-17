@@ -38,12 +38,16 @@ __all__ = [
     "failure",
     "ping",
     "open_reader",
+    "snapshot",
 ]
 
 # A stuck owner is an error and not a hang. A JUDGEMENT, not a measurement (a tool runs once per sleep,
 # so latency is not gated); a spec may override.
 DEFAULT_TOTAL_BUDGET_SECONDS = 60.0
 DEFAULT_PER_CALL_SECONDS = 10.0
+# The owner's own SNAPSHOT_REQUEST_DEADLINE is 30 s; the client must wait past it so the owner's typed timeout
+# reply arrives instead of this side giving up first. A JUDGEMENT, not a measurement.
+DEFAULT_SNAPSHOT_SECONDS = 35.0
 
 
 def engram_home() -> Path:
@@ -71,6 +75,7 @@ class OwnerReadSpec:
     never_empty: str
     total_budget: float = DEFAULT_TOTAL_BUDGET_SECONDS
     per_call: float = DEFAULT_PER_CALL_SECONDS
+    snapshot_timeout: float = DEFAULT_SNAPSHOT_SECONDS
 
 
 def runtime_dir() -> Path | None:
@@ -222,3 +227,81 @@ def open_reader(spec: OwnerReadSpec, db_path: Path, use_owner: bool):
     if use_owner:
         return _OwnerReader(spec, import_runtime("engramd_client"))
     return sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
+
+
+def snapshot(spec: OwnerReadSpec, dest_path: Path) -> Path:
+    """Ask the owner for one quiesced copy of the store at `dest_path` (an absolute path whose parent
+    directory already exists and is writable). Returns `dest_path` ONLY for a well-formed success; every
+    other outcome RAISES spec.error_cls, so a caller can never mistake it for a snapshot.
+
+    Indeterminate is failure. An `Unavailable` (a dropped connection) and a `Rejected` with
+    `commit == "indeterminate"` both mean the destination may or may not hold a complete snapshot (the
+    client's documented reading: "go look at dest_path"). This function does NOT go look: it never opens,
+    reads or connects to the file on any failure path, so a possibly-partial file is never trusted.
+
+    A well-formed success is an `Ok` whose result is a dict naming exactly `dest_path`, with a regular file
+    there. An `Ok` that fails any of those (a different path, a non-dict result, no file) is the
+    malformed-but-ok class and raises too."""
+    err, key = spec.error_cls, spec.flag_key
+    dest = str(dest_path)
+    if not Path(dest_path).is_absolute():
+        # The owner does not require an absolute path; a relative one would resolve against ITS cwd.
+        raise err("snapshot dest_path must be absolute (a relative path would resolve against the owner's cwd)")
+    try:
+        client = import_runtime("engramd_client")
+    except Exception as exc:
+        raise err(
+            f"engramd.{key} is on but engramd_client could not be loaded "
+            f"({type(exc).__name__}: {exc}); not reading the store directly. Fix the plugin install, or set "
+            f"the flag to false."
+        ) from exc
+    try:
+        result = client.read(
+            "snapshot", {"dest_path": dest}, timeout=spec.snapshot_timeout, socket_path=_socket(client, spec)
+        )
+    except (Exception, SystemExit) as exc:  # client.read does not raise by contract (#3717); belt, as ping
+        raise err(
+            f"the engramd owner snapshot failed ({type(exc).__name__}); the outcome is INDETERMINATE and nothing "
+            f"was archived. Not reading the store directly. Start the owner, or set engramd.{key} to false."
+        ) from exc
+    if isinstance(result, client.Unavailable):
+        if result.reason == "down":
+            # "down" = no owner listening (socket missing / refused): no request reached the owner, so nothing
+            # is indeterminate. Every other reason (timeout, protocol, busy, ...) may have reached it.
+            raise err(
+                "the engramd owner is DOWN (owner unavailable: down); no snapshot request reached it and "
+                "nothing was archived. Not reading the store directly. "
+                f"Start the owner and retry, or set engramd.{key} to false."
+            )
+        raise err(
+            f"the engramd owner snapshot outcome is INDETERMINATE (owner unavailable: {result.reason or 'unavailable'}); "
+            f"nothing was archived and the snapshot file was not trusted. Not reading the store directly. "
+            f"Start the owner and retry, or set engramd.{key} to false."
+        )
+    if isinstance(result, client.Rejected):
+        if getattr(result, "commit", None) == "indeterminate":
+            raise err(
+                f"the engramd owner snapshot outcome is INDETERMINATE ({result.reason}: {result.detail}); "
+                f"nothing was archived and the snapshot file was not trusted. Not reading the store directly. "
+                f"Retry once the owner is healthy, or set engramd.{key} to false."
+            )
+        raise failure(spec, client, result)
+    if not isinstance(result, client.Ok):
+        raise failure(spec, client, result)
+    answer = result.result
+    if not isinstance(answer, dict) or answer.get("dest_path") != dest:
+        raise err(
+            "the engramd owner answered the snapshot malformed (the result is not {'dest_path': <the requested "
+            "path>}); nothing was archived and the snapshot file was not trusted. Not reading the store "
+            f"directly. Check the owner build, or set engramd.{key} to false."
+        )
+    try:
+        is_file = os.path.isfile(dest)
+    except OSError:
+        is_file = False
+    if not is_file:
+        raise err(
+            "the engramd owner reported a snapshot but no regular file is at the requested path; nothing was "
+            f"archived. Not reading the store directly. Check the owner build, or set engramd.{key} to false."
+        )
+    return Path(dest)
