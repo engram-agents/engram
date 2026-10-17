@@ -755,6 +755,18 @@
       "note": "completeness guard for docs/2652-migration-ledger.md (#2652): per-file count of Section-2 rows vs sqlite3.connect( lines in tracked src/engram. Developer tier (T3): a repo-maintenance gate run by pr-checks; no install ever needs it. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly, same as tools/claude_md_moves_check.py."
     },
     {
+      "path": "tools/home_path_gate.py",
+      "tier": "dev",
+      "source": "tools/home_path_gate.py",
+      "note": "engram-alpha#3863 (PR 1): the pr-checks gate that fails on a NEW hard-coded ENGRAM home path (`~/.engram`, `Path.home() / \".engram\"`, `$HOME/.engram`, ...) in tracked src/engram files that never read ENGRAM_HOME; today's violators sit in tools/home_path_baseline.json, which may only shrink. Developer tier (T3): a repo-maintenance gate for ENGRAM development, run by pr-checks over the source tree; no install ever needs it. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly, same as tools/check_2652_ledger.py."
+    },
+    {
+      "path": "tools/home_path_baseline.json",
+      "tier": "dev",
+      "source": "tools/home_path_baseline.json",
+      "note": "engram-alpha#3863 (PR 1): the checked-in baseline + (empty) allowlist read by tools/home_path_gate.py. Tiered with the gate it feeds (dev, T3): one inseparable unit. Real data file directly under repo-root tools/, so 'source' is set explicitly."
+    },
+    {
       "path": "tools/recall_repetition_analysis.py",
       "tier": "dev",
       "source": "tools/recall_repetition_analysis.py",
