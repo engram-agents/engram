@@ -617,7 +617,7 @@ def _report_feeling_impl(
         precipitated it. Floating reports are less useful than situated ones.
 
     The server determines `nudge_source` mechanically by reading the marker
-    file ~/.engram/feeling-nudge-active.json — agents cannot supply it
+    file `core.DATA_DIR / "feeling-nudge-active.json"` (the ENGRAM home, `$ENGRAM_HOME`) — agents cannot supply it
     directly. If a recent nudge fired (post_compact, nap_checkpoint, or
     dream_review) the report is auto-tagged with that source; otherwise it
     is tagged "voluntary".

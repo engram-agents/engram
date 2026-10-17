@@ -184,7 +184,7 @@ def _run(script: Path, env_extra: dict, tmp_path: Path, port: int, seconds: floa
         json.dumps({"agent_name": "testagent", "forum": {"url": f"http://127.0.0.1:{port}"}})
     )
     env = os.environ.copy()
-    env.update(HOME=str(home), **env_extra)
+    env.update(HOME=str(home), ENGRAM_HOME=str(home / ".engram"), **env_extra)
     proc = subprocess.Popen(["bash", str(script)], stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, env=env)
     time.sleep(seconds)

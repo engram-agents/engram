@@ -874,7 +874,7 @@ if _config_metric_names != _signals_names or _signals_names != _verification_nam
 
 
 def _anchor_commit_sha() -> str | None:
-    """The ``.engram`` git commit SHA (design doc §4.1/§4.3 "anchor").
+    """The ENGRAM home's git commit SHA (design doc §4.1/§4.3 "anchor").
 
     Precedent: engram_snapshot_worker.py's ``_commit_snapshot`` reads the
     post-commit HEAD sha the same way — ``core._git("rev-parse", "HEAD")``,
@@ -1630,7 +1630,7 @@ def build_snapshot(
 # engram-alpha#2720: explicit, umask-independent permissions for
 # health-snapshots/ and everything written into it, so the operator viz
 # (spt, cross-user) can read snapshots without depending on a seat's
-# ~/.engram ACL having been set up (or set up with `-d`, or set up at all
+# ENGRAM-home ACL having been set up (or set up with `-d`, or set up at all
 # before this directory first existed) -- see the module docstring's
 # "The multi-tenant viz" framing in the issue for the failure this fixes.
 # Group-read, NOT group-write or world-anything: spt is a member of every
@@ -2151,7 +2151,7 @@ def write_snapshot(
     ``os.chmod`` right after each ``write_text`` call, rather than relying
     on the process umask -- a restrictive umask (or none at all) previously
     left snapshots unreadable by the cross-user, multi-tenant operator viz
-    on seats whose ``~/.engram`` never got a `default:user:spt:r-x` ACL (or
+    on seats whose ENGRAM home (``$ENGRAM_HOME``, default ``~/.engram``) never got a `default:user:spt:r-x` ACL (or
     got one before ``health-snapshots/`` existed). Group-read is
     sufficient because the operator viz account is a member of every
     seat's private group; this is belt-and-suspenders with, not a
@@ -2167,7 +2167,7 @@ def write_snapshot(
     discarded dict — but the PR2 spec explicitly scopes this PR to "produce
     the in-memory snapshot structure correctly" and leaves the concrete
     format/location open. This picks a location consistent with the rest of
-    ~/.engram's on-disk layout. It is deliberately NOT added to
+    the ENGRAM home's (``core.DATA_DIR``) on-disk layout. It is deliberately NOT added to
     engram_snapshot_worker.py's ``_COMMIT_FILES`` git-commit whitelist in
     this PR — that would be an async-snapshot-worker behavior change beyond
     "wire the checkpoint calls", and is flagged for the parent to decide

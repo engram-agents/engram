@@ -142,6 +142,7 @@ class _LineReader:
 def _start_monitor(script_path: Path, home: Path, purpose: str, extra_env: dict | None = None):
     env = os.environ.copy()
     env["HOME"] = str(home)
+    env["ENGRAM_HOME"] = str(home / ".engram")
     if extra_env:
         env.update(extra_env)
     proc = subprocess.Popen(
@@ -245,7 +246,7 @@ def _start_login_shell_duplicate(
     -c` wrapper because subprocess.Popen has no portable way to override
     argv[0] directly; the outer wrapper's own argv[0] is irrelevant (it never
     reaches the pgrep -f candidate stage — see the assertion in the test)."""
-    env = {**os.environ, "HOME": str(home)}
+    env = {**os.environ, "HOME": str(home), "ENGRAM_HOME": str(home / ".engram")}
     if extra_env:
         env.update(extra_env)
     return subprocess.Popen(
@@ -423,6 +424,7 @@ def test_no_reap_env_suppresses_the_warning(tmp_path, script_name):
 
         env = os.environ.copy()
         env["HOME"] = str(home_b)
+        env["ENGRAM_HOME"] = str(home_b / ".engram")
         env.update(extra_env)
         env[meta["no_reap_env"]] = "1"
         primary = subprocess.Popen(

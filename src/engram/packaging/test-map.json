@@ -624,18 +624,76 @@
       "path_prefix_or_glob": "tools/forum-mention-monitor.sh",
       "test_globs": [
         "tests/test_forum_mention_monitor_coalesce.py",
-        "tests/test_forum_monitor_malformed_200.py"
+        "tests/test_forum_monitor_malformed_200.py",
+        "tests/test_shell_engram_home_3863.py"
       ],
-      "note": "Both spawn the real script as a subprocess against a mock HTTP server. test_forum_mention_monitor_coalesce.py covers the cross-cycle coalesce window (#1616); test_forum_monitor_malformed_200.py covers ids()'s reported-vs-failed-to-report boundary and the seed/poll seen-set guards (#2225)."
+      "note": "Both spawn the real script as a subprocess against a mock HTTP server. test_forum_mention_monitor_coalesce.py covers the cross-cycle coalesce window (#1616); test_forum_monitor_malformed_200.py covers ids()'s reported-vs-failed-to-report boundary and the seed/poll seen-set guards (#2225). engram-alpha#3863 PR 3b adds test_shell_engram_home_3863.py: the monitor is run against a scratch config under a custom ENGRAM_HOME (and under the default) with a stub curl, to show which config.json it read."
     },
     {
       "path_prefix_or_glob": "tools/forum-updates-monitor.sh",
       "test_globs": [
         "tests/test_forum_monitor_duplicate_warn.py",
         "tests/test_pgrep_liveness_reap_patterns.py",
-        "tests/test_forum_monitor_malformed_200.py"
+        "tests/test_forum_monitor_malformed_200.py",
+        "tests/test_shell_engram_home_3863.py"
       ],
       "note": "test_forum_monitor_duplicate_warn.py spawns the real script as a subprocess (duplicate-instance warn behavior against real processes); test_pgrep_liveness_reap_patterns.py does not spawn it, instead extracting its _pgrep_pattern literal from the script text and matching it in pure Python against a synthetic process table; test_forum_monitor_malformed_200.py spawns it against a mock HTTP server for as_of()'s usable-watermark boundary and the seed/poll cursor guards (#2225)."
+    },
+    {
+      "path_prefix_or_glob": "launch-engram-server.sh",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: the MCP launcher resolves its venv from ENGRAM_HOME (behaviour cells run it against a stub venv python). Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
+      "path_prefix_or_glob": "tools/ghpr.sh",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: LOG_DIR and PYTHON resolve from ENGRAM_HOME (the assignments are extracted and evaluated; the CI sim is never run). Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
+      "path_prefix_or_glob": "tools/run-all-tests.sh",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: ENGRAM_PY resolves from ENGRAM_HOME (the assignment is extracted and evaluated; the suite is never run). Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
+      "path_prefix_or_glob": "engram_lifecycle.py",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: docstring/comment-only change; guard asserts the file names ENGRAM_HOME and holds no .engram string outside a docstring. Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
+      "path_prefix_or_glob": "engram_tasks.py",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: docstring/comment-only change; same guard. Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
+      "path_prefix_or_glob": "health/engine.py",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: docstring/comment-only change; same guard. Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/context_tracker_hook.py",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: docstring/comment-only change; same guard. Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
+      "path_prefix_or_glob": "viz/server.py",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: docstring/comment-only change; same guard. Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
     },
     {
       "path_prefix_or_glob": "tools/codex-umwelt-wake.py",
@@ -825,10 +883,6 @@
   ],
   "unmapped": [
     {
-      "path": "hooks/claude/context_tracker_hook.py",
-      "reason": "Superseded by context_tracker.py per tiers.json excluded list; no dedicated test"
-    },
-    {
       "path": "tools/_channel.py",
       "reason": "Internal multi-agent transport helper; no dedicated test file. Changes covered by ia.py test suite indirectly."
     },
@@ -887,14 +941,6 @@
     {
       "path": "tools/uninstall-local-marketplace.sh",
       "reason": "Uninstall script; no dedicated test file. Inverse of install-local-marketplace.sh; covered by manual verification."
-    },
-    {
-      "path": "tools/run-all-tests.sh",
-      "reason": "Unified test runner script; no dedicated test file. Verified manually by running it end-to-end against both suites."
-    },
-    {
-      "path": "tools/ghpr.sh",
-      "reason": "Local CI-cost simulator (git+gh wrapper bundling touched-test selection, cost logging, and gated PR push); no dedicated test file. Verified manually."
     }
   ],
   "server_import_allowlist": [

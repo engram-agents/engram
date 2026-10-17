@@ -101,7 +101,7 @@ Usage: forum-updates-monitor.sh [--purpose <key>] [--kinds dm,baton]
                    <pid>` by hand.
   --kinds <csv>    Comma-separated update kinds to watch (default: dm,baton).
 
-Resolves SELF and forum BASE URL from ~/.engram/config.json.
+Resolves SELF and forum BASE URL from ${ENGRAM_HOME:-$HOME/.engram}/config.json.
 URL resolution order: config.json forum.url > $FORUM_URL > http://localhost:5002
 
 Cursor-based on GET /api/updates (since,as_of] — baselines to the current as_of
@@ -144,10 +144,10 @@ esac
 # ---------------------------------------------------------------------------
 # resolve identity + forum URL (same precedence as forum-mention-monitor)
 # ---------------------------------------------------------------------------
-SELF="$(python3 -c 'import json,os,urllib.parse;print(urllib.parse.quote(json.load(open(os.path.expanduser("~/.engram/config.json"))).get("agent_name",""),safe=""))')"
-BASE="$(python3 -c 'import json,os
-c=json.load(open(os.path.expanduser("~/.engram/config.json")))
-print(((c.get("forum") or {}).get("url") or os.environ.get("FORUM_URL") or "http://localhost:5002").rstrip("/"))')"
+SELF="$(python3 -c 'import json,sys,urllib.parse;print(urllib.parse.quote(json.load(open(sys.argv[1])).get("agent_name",""),safe=""))' "${ENGRAM_HOME:-$HOME/.engram}/config.json")"
+BASE="$(python3 -c 'import json,os,sys
+c=json.load(open(sys.argv[1]))
+print(((c.get("forum") or {}).get("url") or os.environ.get("FORUM_URL") or "http://localhost:5002").rstrip("/"))' "${ENGRAM_HOME:-$HOME/.engram}/config.json")"
 URL_BASE="$BASE/api/updates?agent=$SELF&kinds=$KINDS"
 
 # ---------------------------------------------------------------------------
@@ -264,7 +264,7 @@ fi
 # cursor file — keyed to the polled URL so concurrent instances never share
 # state. Override with $FORUM_UPDATES_CURSOR_FILE (tests).
 # ---------------------------------------------------------------------------
-CURSOR="${FORUM_UPDATES_CURSOR_FILE:-$HOME/.engram/.forum-updates-cursor.$(printf '%s' "$URL_BASE" | cksum | cut -d' ' -f1)}"
+CURSOR="${FORUM_UPDATES_CURSOR_FILE:-${ENGRAM_HOME:-$HOME/.engram}/.forum-updates-cursor.$(printf '%s' "$URL_BASE" | cksum | cut -d' ' -f1)}"
 
 # helper: read /api/updates JSON on stdin, print one wake line per update.
 # Python uses ONLY double-quoted strings so the whole program can sit inside
@@ -377,7 +377,7 @@ POLL_SECONDS="${FORUM_UPDATES_POLL_SECONDS:-30}"
 # mention-monitor / _status_derive._recently_engaged(). Declared ABOVE the seed
 # (it used to sit between the seed and the poll loop) because the seed's
 # announce consults it too — see _engaged() below.
-LAST_USER_ACTIVITY="$HOME/.engram/last-user-activity"
+LAST_USER_ACTIVITY="${ENGRAM_HOME:-$HOME/.engram}/last-user-activity"
 _ENGAGED_WINDOW=360  # matches _status_derive._DEFAULT_ENGAGED_WINDOW
 
 # True (exit 0) while the user is actively conversing. No stamp file means

@@ -1015,7 +1015,8 @@ jobs:
       # health-exam, upgrade and sleep skills; test_walguard_home_path_3863.py:
       # the walguard remedy text; test_tools_engram_home_3863.py, PR 3a: every
       # tools/ default under the ENGRAM home follows ENGRAM_HOME, plus a
-      # code-position guard over the swept files).
+      # code-position guard over the swept files; test_shell_engram_home_3863.py, PR 3b: the launcher,
+      # the forum monitors and two dev scripts, plus the docstring-only core files).
       # tests/test_home_path_gate.py pins this step (the
       # gate call with --base-sha from a merge-base, and the pytest call).
       - name: home-path gate — fail on a new hard-coded ENGRAM home path (baseline may only shrink)
@@ -1024,7 +1025,7 @@ jobs:
           BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
           rc=0
           python3 tools/home_path_gate.py --base-sha "$BASE_SHA" || rc=1
-          python3 -m pytest tests/test_home_path_gate.py tests/test_skill_home_paths_3863.py tests/test_walguard_home_path_3863.py tests/test_tools_engram_home_3863.py -q || rc=1
+          python3 -m pytest tests/test_home_path_gate.py tests/test_skill_home_paths_3863.py tests/test_walguard_home_path_3863.py tests/test_tools_engram_home_3863.py tests/test_shell_engram_home_3863.py -q || rc=1
           exit $rc
 
       # ── 7d. cascade behaviour acceptance (playbox) ──────────────────────

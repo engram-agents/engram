@@ -1,17 +1,7 @@
 {
   "schema": 1,
   "baseline": [
-    "src/engram/engram_lifecycle.py",
-    "src/engram/engram_tasks.py",
-    "src/engram/health/engine.py",
-    "src/engram/hooks/claude/context_tracker_hook.py",
-    "src/engram/launch-engram-server.sh",
-    "src/engram/tools/forum-mention-monitor.sh",
-    "src/engram/tools/forum-updates-monitor.sh",
-    "src/engram/tools/ghpr.sh",
-    "src/engram/tools/grant_viz_operator_acl.py",
-    "src/engram/tools/run-all-tests.sh",
-    "src/engram/viz/server.py"
+    "src/engram/tools/grant_viz_operator_acl.py"
   ],
   "allowlist": []
 }
