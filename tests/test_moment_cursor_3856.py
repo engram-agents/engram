@@ -372,24 +372,38 @@ MALFORMED_TEXTS = ['{not json', '{"a":007}', '{"special_moment_cursor":}', '{"sp
 
 
 @pytest.mark.parametrize("text", MALFORMED_TEXTS)
-def test_the_self_guarded_cursor_predicate_never_raises_on_a_malformed_row_whatever_the_evaluation_order(db, text):
-    """PINS the self-guard on the module constant the UPDATE actually uses (`CURSOR_GUARDED_SQL_EXPR`, spliced into
-    `_ADVANCE_SQL`; no second copy). It is run ALONE and with the object test LAST, so it cannot lean on the object
-    test coming first. Mutation: `CURSOR_GUARDED_SQL_EXPR = CURSOR_SQL_EXPR` (guard removed) -> every case raises
+def test_the_column_wrapped_cursor_never_raises_on_a_malformed_row_whatever_the_evaluation_order(db, text):
+    """PINS the ONE cursor definition (#3865): every json_* call in `CURSOR_SQL_EXPR` / `_IS_OBJECT_SQL` reads
+    `CASE WHEN json_valid(metadata) THEN metadata END`, so each is safe ALONE and in any composition. Run alone and
+    with the object test LAST, so it cannot lean on the object test coming first. DECLARED change from U13: the old
+    nested guard read NULL on a malformed row; the column wrap reads 0 (the cursor rule's value for anything
+    unreadable), so this expects 0, not None. Mutation: bare `metadata` in `CURSOR_SQL_EXPR` -> every case raises
     `malformed JSON` and this goes red."""
     _drop_guards(db)
     put(db, "pn_bad", text)
     m = _mod()
-    assert m.CURSOR_GUARDED_SQL_EXPR in m._ADVANCE_SQL                      # one definition, used by the statement
+    assert m.CURSOR_SQL_EXPR in m._ADVANCE_SQL                               # one definition, used by the statement
+    assert not hasattr(m, "CURSOR_GUARDED_SQL_EXPR")                         # and no second, nested-guard copy
     conn = sqlite3.connect(str(db))
     try:
         assert conn.execute("SELECT json_valid(metadata) FROM nodes WHERE id='pn_bad'").fetchone() == (0,)
-        assert conn.execute("SELECT " + m.CURSOR_GUARDED_SQL_EXPR + " FROM nodes WHERE id='pn_bad'").fetchone() == (None,)
-        rows = conn.execute("SELECT 1 FROM nodes WHERE id='pn_bad' AND " + m.CURSOR_GUARDED_SQL_EXPR + " = 0 AND "
+        assert conn.execute("SELECT " + m.CURSOR_SQL_EXPR + " FROM nodes WHERE id='pn_bad'").fetchone() == (0,)
+        rows = conn.execute("SELECT 1 FROM nodes WHERE id='pn_bad' AND " + m.CURSOR_SQL_EXPR + " = 0 AND "
                             + m._IS_OBJECT_SQL).fetchall()                   # the object test LAST
         assert rows == []
     finally:
         conn.close()
+
+
+def test_a_non_object_array_row_is_not_object_and_the_blob_is_unchanged(db):
+    """Its own cell (#3865, mutation b): under the column wrap the cursor of an ARRAY row reads 0, so with from=0 the
+    cursor term matches and the object test is the ONLY thing excluding it. Drop `_IS_OBJECT_SQL` from `_ADVANCE_SQL`
+    and the UPDATE reports rowcount 1 (json_set on an array leaves the blob as it was): a false `applied: true`."""
+    put(db, "pn_arr", "[1,2]")
+    before = whole_row(db, "pn_arr")
+    assert advance(db, "pn_arr", 0) == {"applied": False, "cursor": None, "reason": "not_object"}
+    assert whole_row(db, "pn_arr") == before
+    assert raw_meta(db, "pn_arr") == "[1,2]"
 
 
 CORRUPT = {

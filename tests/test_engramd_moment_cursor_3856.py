@@ -410,7 +410,7 @@ def test_statement_trace_applied_commits_then_reads_back_and_stale_rolls_back(ow
     assert any(s.startswith("SELECT") for s in after_commit), stmts          # the read-back is after COMMIT
     ups = {s for s in stmts if s.startswith("UPDATE")}
     assert len(ups) == 1, ups
-    assert re.fullmatch(r"UPDATE nodes SET metadata = json_set\(metadata, \?, \? \+ \?\) WHERE id = \? AND type = \? "
+    assert re.fullmatch(r"UPDATE nodes SET metadata = json_set\(CASE WHEN json_valid\(metadata\) THEN metadata END, \?, \? \+ \?\) WHERE id = \? AND type = \? "
                         r"AND is_current = \? AND .*", next(iter(ups))), ups
     stmts.clear()
     ok_result(call(owner, "pn_a", 2))                                          # now stale
@@ -870,6 +870,28 @@ def test_a_displaced_store_refuses_the_write_at_dispatch_nothing_committed(owner
 
 
 # --- read-back (design 5.4): after COMMIT, from the committed store -------------------------------------
+
+
+def test_the_readback_alone_reads_0_on_a_malformed_row_and_the_true_cursor_on_a_valid_one(home):
+    """#3865: `_moment_cursor_readback` splices the shared `CURSOR_SQL_EXPR` and is callable on its own, so the
+    expression must be safe alone. Written red-first: on the nested-guard form the bare SELECT raised
+    `malformed JSON` on a malformed legacy row."""
+    db = make_store(home)
+    drop = sqlite3.connect(str(db))
+    drop.execute("DROP TRIGGER IF EXISTS nodes_metadata_json_guard_update")
+    drop.execute("DROP TRIGGER IF EXISTS nodes_metadata_json_guard_insert")
+    drop.commit()
+    drop.close()
+    put(db, "pn_bad", "{not json")
+    conn = sqlite3.connect(str(db))
+    try:
+        o = eo.EngramdOwner(home)           # unstarted: the readback touches no owner state
+        assert conn.execute("SELECT json_valid(metadata) FROM nodes WHERE id='pn_bad'").fetchone() == (0,)
+        assert o._moment_cursor_readback(conn, "pn_bad") == 0
+        assert o._moment_cursor_readback(conn, "pn_c") == 7
+        assert o._moment_cursor_readback(conn, "nope") is None
+    finally:
+        conn.close()
 
 
 @requires_linux_owner

@@ -9,8 +9,9 @@ server and the owner can all import it.
 Exports:
   read_cursor(value)        THE Python cursor rule: an int that is not a bool and lies in [-(2**53), 2**53),
                             else 0 (floats, strings, None, bool, absent, anything wider all give 0).
-  CURSOR_SQL_EXPR           the SQL expression for the STORED cursor under the SAME rule. Callers compose it
-                            by string; the statement has one definition.
+  CURSOR_SQL_EXPR           the SQL expression for the STORED cursor under the SAME rule (an unreadable blob reads
+                            0). Every json_* call in it reads the column through the #3485 wrap, so it is safe
+                            alone; callers compose it by string; the statement has one definition (#3865).
   advance_moment_cursor(conn, person_id, from_cursor)
                             -> {"applied": bool, "cursor": int | None, "reason": str | None}
 
@@ -51,29 +52,31 @@ _HI = 2 ** 53          # exclusive
 
 _PATH = "$.special_moment_cursor"
 
-# The stored cursor under the same rule as read_cursor. json_type says 'integer' for some values json_extract
-# then returns as a float (beyond int64), so the BETWEEN test is part of the rule, not decoration.
+# #3865: the project's ONE guard idiom (the #3485 gate's column-level wrap). EVERY json_* call below takes
+# `CASE WHEN json_valid(metadata) THEN metadata END` as its first argument, so an invalid blob becomes NULL before
+# json_type / json_extract can raise `malformed JSON`. Safety belongs to the expression, not to the composition: each
+# term is safe alone and in any order, so the one cursor definition can be spliced anywhere (the UPDATE, the
+# classifier SELECT, the owner's post-commit readback).
+_META = "CASE WHEN json_valid(metadata) THEN metadata END"
+
+# The stored cursor under the same rule as read_cursor; an unreadable blob reads 0, as the rule does for anything
+# that is not a window int. json_type says 'integer' for some values json_extract then returns as a float (beyond
+# int64), so the BETWEEN test is part of the rule, not decoration.
 CURSOR_SQL_EXPR = (
-    "CASE WHEN json_type(metadata, '$.special_moment_cursor') = 'integer'"
-    " AND json_extract(metadata, '$.special_moment_cursor') BETWEEN %d AND %d"
-    " THEN json_extract(metadata, '$.special_moment_cursor') ELSE 0 END" % (_LO, _HI - 1)
+    "CASE WHEN json_type(" + _META + ", '$.special_moment_cursor') = 'integer'"
+    " AND json_extract(" + _META + ", '$.special_moment_cursor') BETWEEN " + str(_LO) + " AND " + str(_HI - 1) +
+    " THEN json_extract(" + _META + ", '$.special_moment_cursor') ELSE 0 END"
 )
 
-# json_type() of malformed text raises, so the object test is guarded by json_valid in a CASE.
-_IS_OBJECT_SQL = "CASE WHEN json_valid(metadata) THEN json_type(metadata) END = 'object'"
-
-# The stored cursor, SELF-GUARDED: an invalid blob yields NULL (never reaching json_type / json_extract, which raise
-# `malformed JSON`) whatever order SQLite evaluates the ANDs in. The ONE definition the UPDATE splices in; a cell
-# runs it alone and with the object test last.
-CURSOR_GUARDED_SQL_EXPR = "CASE WHEN json_valid(metadata) THEN " + CURSOR_SQL_EXPR + " END"
+# NULL (so not 'object') for an invalid blob. Under the column wrap a non-object also reads cursor 0, so this term is
+# the ONLY thing that excludes an array / scalar / malformed row from the UPDATE: it must stay in `_ADVANCE_SQL`.
+_IS_OBJECT_SQL = "json_type(" + _META + ") = 'object'"
 
 _ADVANCE_SQL = (
-    "UPDATE nodes SET metadata = json_set(metadata, '$.special_moment_cursor', :from + 1)"
+    "UPDATE nodes SET metadata = json_set(" + _META + ", '$.special_moment_cursor', :from + 1)"
     " WHERE id = :id AND type = 'person' AND is_current = 1"
     " AND " + _IS_OBJECT_SQL +
-    # Self-guarded: whatever order SQLite evaluates the ANDs in, a malformed legacy row can never reach json_type /
-    # json_extract (which raise `malformed JSON`); an invalid blob makes this NULL, i.e. no match.
-    " AND " + CURSOR_GUARDED_SQL_EXPR + " = :from"
+    " AND " + CURSOR_SQL_EXPR + " = :from"
 )
 
 
