@@ -495,6 +495,20 @@ except Exception:
     _HOOKLIB_OK = False
 
 
+def _record_engram_home() -> None:
+    """#3863 PR 5 (R3): record this seat's resolved ENGRAM home in its login-home
+    registry entry so viz discovery and the ACL tool find a non-default home.
+    Prints nothing (hook stdout is the context channel) and never raises."""
+    try:
+        _dir = resolve_runtime_dir(ENGRAM_HOME, "engram_home_registry.py")
+        if _dir not in sys.path:
+            sys.path.insert(0, _dir)
+        from engram_home_registry import write_entry
+        write_entry(ENGRAM_HOME)
+    except Exception:
+        pass
+
+
 def _runtime_platform() -> str | None:
     """Return the baked plugin platform name when available.
 
@@ -3872,6 +3886,8 @@ def _main_impl() -> None:
             update_counterparts_from_registry(_agent_name, _config_path, AGENT_REGISTRY_DIR)
     except Exception:
         pass  # fail-soft: never break SessionStart for registration
+
+    _record_engram_home()
 
     if os.path.exists(CURRENT_USER_PATH):
         try:

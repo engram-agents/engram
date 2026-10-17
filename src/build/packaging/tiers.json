@@ -260,6 +260,11 @@
       "note": "Atomic write + retrying read of config.json (#3607). Stdlib-only. Essential because engram_core and engram_restamp import it (hard dependencies)."
     },
     {
+      "path": "engram_home_registry.py",
+      "tier": "convenience",
+      "note": "Per-seat ENGRAM home registry (#3863 PR 5, ruling R3): the SessionStart hook records a non-default home, viz discovery and the viz-operator ACL tool read it before their glob. Stdlib-only. Every importer is fail-soft (hook swallows, viz and the ACL tool fall back to the glob), so a missing copy degrades to today's behaviour."
+    },
+    {
       "path": "engram_regular_io.py",
       "tier": "essential",
       "note": "Non-blocking, regular-file-only text opens (open_regular_text / read_regular_text / open_regular_text_write / open_regular_text_append; #3591, #3628): a FIFO at a config/marker/log path raises OSError instead of hanging a hook under its 5 s timeout. Stdlib-only. Also holds the shared pidfile write (write_pidfile, NotRegularFile, describe_file_kind, kind_of_path; #3773). Essential because engram_config_io and engram_log_emitter import it (hard dependencies), as does engramd_owner.py, and so do the Convenience-tier tools monitor-supervisor.py and codex-umwelt-wake.py (hard dependencies; they refuse with a named error if it is missing) (hooks/_hooklib.py keeps its own identical copy, pinned by tests/test_regular_io_parity_3628.py). Layering: hooks import core, never the reverse."
