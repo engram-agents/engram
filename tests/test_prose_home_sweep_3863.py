@@ -403,7 +403,7 @@ SEED_MARKER = (
 )
 
 
-def run_block(script, tmp_path, mode):
+def run_block(script, tmp_path, mode, extra_env=None):
     """Run `script` with bash under a temp HOME/cwd. -> (CompletedProcess, home Path)."""
     user_home = tmp_path / "user"
     cwd = tmp_path / "cwd"
@@ -411,6 +411,7 @@ def run_block(script, tmp_path, mode):
     cwd.mkdir()
     env = {k: v for k, v in os.environ.items() if k not in ("ENGRAM_HOME", "CLAUDE_PLUGIN_ROOT")}
     env["HOME"] = str(user_home)
+    env.update(extra_env or {})
     if mode == "default":
         home = user_home / ".engram"
     else:
@@ -476,6 +477,182 @@ def test_scratch_log_block_writes_into_the_chosen_home(tmp_path, mode):
     assert r.returncode == 0, r.stderr
     text = (home / "loop-scratch.md").read_text(encoding="utf-8")
     assert "$(date" not in text and text.startswith("# Meta-Loop Scratch Log")
+
+
+# --- portability: GNU-only `sed -i` / `date -I` in shipped commands (#3889) -----------
+# macOS ships BSD userland: `sed -i` there takes a mandatory suffix argument, so the GNU
+# form `sed -i "s/a/b/" file` fails with "invalid command code", and `date -I` is not an
+# option at all. A shipped command must work on both, so it writes a temp file in the
+# same directory and `mv`s it over (or passes an attached suffix, `-i.bak`).
+
+_SED_INPLACE_BARE = re.compile(
+    r"""\bsed\b[^|;&\n]*?\s(?:-[A-Za-z]*i(?=\s|$)|--in-place(?=\s|$))"""
+)
+
+
+def gnu_only_sed_inplace(text):
+    """[(lineno, line)] of FENCED lines with `sed -i` / `--in-place` and no attached
+    suffix (`-i.bak`): GNU-only, and `-i ''` breaks GNU the other way round.
+
+    BOUNDS, so a pass is not read as more than it is. The regex is line-oriented and
+    does not flag: a `sed -i` split across a backslash continuation (`sed \\` newline
+    `-i`), a `-i` that follows `;`, `|` or `&` on the same line after the word `sed`
+    (the scan stops at those separators), the attached-empty-suffix forms `-i''` and
+    `-i""`, or a `-i` inside a quoted script (`sed -e 's/ -i /x/'` is even flagged
+    wrongly, a false positive on quoted text). It scans only `skills`, `agents` and
+    `templates` under src/engram/ (SHIPPED_PROSE_ROOTS); the shell text in hooks and
+    tools is out of scope. So a clean scan does NOT mean no GNU-only `sed -i` is
+    shipped."""
+    return [(n, ln.strip()) for n, ln in fenced_lines(text) if _SED_INPLACE_BARE.search(ln)]
+
+
+SHIPPED_PROSE_ROOTS = ("skills", "agents", "templates")
+
+
+def _shipped_md_files():
+    base = REPO / SRC
+    return sorted(p for root in SHIPPED_PROSE_ROOTS for p in (base / root).rglob("*.md"))
+
+
+def test_no_shipped_fenced_command_uses_gnu_only_sed_in_place():
+    bad = []
+    for path in _shipped_md_files():
+        rel = path.relative_to(REPO)
+        bad += [f"{rel}:{n}: {ln[:110]}" for n, ln in gnu_only_sed_inplace(path.read_text(encoding="utf-8"))]
+    assert not bad, (
+        "GNU-only `sed -i` (fails on macOS BSD sed); write a temp file in the same "
+        "directory and `mv` it over (#3889):\n  " + "\n  ".join(bad)
+    )
+
+
+class TestSedInPlacePlanted:
+    @pytest.mark.parametrize(
+        "line",
+        [
+            'sed -i "s/a/b/" f.txt',
+            "sed -i 's/a/b/' f.txt",
+            "sed -ni 's/a/b/p' f.txt",
+            "sed -i -e 's/a/b/' f.txt",
+            "sed -i '' 's/a/b/' f.txt",          # BSD-only; breaks GNU
+            "sed --in-place 's/a/b/' f.txt",
+            'cd d && sed -i "s/a/b/" f.txt',
+        ],
+    )
+    def test_gnu_only_forms_are_flagged(self, line):
+        assert gnu_only_sed_inplace(f"```bash\n{line}\n```\n")
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            'sed -i.bak "s/a/b/" f.txt',
+            "sed --in-place=.bak 's/a/b/' f.txt",
+            'sed "s/a/b/" f.txt > "$tmp" && mv "$tmp" f.txt',
+            "grep -i foo f.txt | sed 's/a/b/'",
+            "sed -n '/x/p' f.txt",
+        ],
+    )
+    def test_portable_forms_pass(self, line):
+        assert gnu_only_sed_inplace(f"```bash\n{line}\n```\n") == []
+
+    def test_prose_is_not_scanned(self):
+        assert gnu_only_sed_inplace("run `sed -i s/a/b/ f` to edit\n") == []
+
+
+BSD_SED = """#!/bin/sh
+# BSD sed stand-in: -i takes a mandatory suffix argument. A bare -i swallows the next
+# argument as the suffix, so the GNU form fails the way macOS does.
+for a in "$@"; do
+  case "$a" in
+    -i|--in-place) echo "sed: 1: \\"$a\\": invalid command code ." >&2; exit 1 ;;
+  esac
+done
+exec "$REAL_SED" "$@"
+"""
+BSD_DATE = """#!/bin/sh
+# BSD date stand-in: no -I (ISO) option.
+for a in "$@"; do
+  case "$a" in
+    -I*) echo "date: illegal option -- I" >&2; exit 1 ;;
+  esac
+done
+exec "$REAL_DATE" "$@"
+"""
+
+
+def _bsd_userland(tmp_path):
+    """-> (extra env, bin dir) putting BSD-style sed/date stand-ins first on PATH."""
+    bindir = tmp_path / "bsd-bin"
+    bindir.mkdir()
+    for name, body in (("sed", BSD_SED), ("date", BSD_DATE)):
+        f = bindir / name
+        f.write_text(body)
+        f.chmod(0o755)
+    extra = {
+        "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
+        "REAL_SED": shutil.which("sed"),
+        "REAL_DATE": shutil.which("date"),
+    }
+    return extra, bindir
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_scratch_log_block_works_on_a_bsd_style_userland(tmp_path, mode):
+    """The date step must work where `sed -i` needs a suffix and `date` has no -I."""
+    import datetime
+
+    extra, _ = _bsd_userland(tmp_path)
+    rel, pred = SCRATCH_BLOCK
+    r, home = run_block(block_where(rel, pred), tmp_path, mode, extra_env=extra)
+    assert r.returncode == 0, r.stderr
+    text = (home / "loop-scratch.md").read_text(encoding="utf-8")
+    today = {datetime.date.today().isoformat(), (datetime.date.today() - datetime.timedelta(days=1)).isoformat()}
+    first = text.splitlines()[0]
+    assert first.startswith("# Meta-Loop Scratch Log — ") and first.split("— ")[1] in today, first
+    assert "$(date" not in text
+    assert sorted(os.listdir(home)) == ["loop-scratch.md"], os.listdir(home)  # temp file was moved
+
+
+def _failing_tool_env(tmp_path, tool):
+    """PATH with a stub `tool` first that exits non-zero (sed: 3, mv: 5)."""
+    bindir = tmp_path / "fail-bin"
+    bindir.mkdir()
+    stub = bindir / tool
+    stub.write_text(f"#!/bin/sh\nexit {3 if tool == 'sed' else 5}\n")
+    stub.chmod(0o755)
+    return {"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}
+
+
+def _scratch_heredoc_body(block):
+    """The log text the block's own `cat > ... << 'SCRATCH'` writes."""
+    lines = block.splitlines()
+    start = next(i for i, ln in enumerate(lines) if "<< 'SCRATCH'" in ln) + 1
+    end = next(i for i in range(start, len(lines)) if lines[i] == "SCRATCH")
+    return "\n".join(lines[start:end]) + "\n"
+
+
+@pytest.mark.parametrize("tool", ["sed", "mv"])
+@pytest.mark.parametrize("mode", MODES)
+def test_scratch_log_block_leaves_no_temp_file_when_a_step_fails(tmp_path, tool, mode):
+    """If the date substitution fails (sed) or the move does (mv), the exit status stays
+    non-zero, no `loop-scratch.md.*` temp file is left in the home (a home with a space
+    in it when mode is custom-with-space), and the log the block just wrote is untouched."""
+    rel, pred = SCRATCH_BLOCK
+    block = block_where(rel, pred)
+    r, home = run_block(block, tmp_path, mode, extra_env=_failing_tool_env(tmp_path, tool))
+    assert r.returncode != 0, "the failure must not be swallowed"
+    assert sorted(os.listdir(home)) == ["loop-scratch.md"], os.listdir(home)
+    assert (home / "loop-scratch.md").read_text(encoding="utf-8") == _scratch_heredoc_body(block)
+
+
+def test_the_bsd_stand_ins_really_reject_the_gnu_forms(tmp_path):
+    """Planted control: the stand-ins fail the old line, so the test above can fail."""
+    extra, _ = _bsd_userland(tmp_path)
+    old = (
+        'cat > "${ENGRAM_HOME:-$HOME/.engram}"/s.md <<\'X\'\n# Log — $(date -I)\nX\n'
+        'sed -i "s/\\$(date -I)/$(date -I)/" "${ENGRAM_HOME:-$HOME/.engram}"/s.md\n'
+    )
+    r, _home = run_block(old, tmp_path, "default", extra_env=extra)
+    assert r.returncode != 0 and "invalid command code" in r.stderr + r.stdout
 
 
 @pytest.mark.parametrize("name", list(SYNTAX_ONLY_BLOCKS))

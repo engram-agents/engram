@@ -52,7 +52,7 @@ awkwardness, missing features, confusing behavior. Each entry: one line, timesta
 what happened. This list feeds the final friction-design iteration.
 
 SCRATCH
-sed -i "s/\$(date -I)/$(date -I)/" "${ENGRAM_HOME:-$HOME/.engram}"/loop-scratch.md
+tmp=$(mktemp "${ENGRAM_HOME:-$HOME/.engram}"/loop-scratch.md.XXXXXX) && { sed "s/\$(date -I)/$(date +%F)/" "${ENGRAM_HOME:-$HOME/.engram}"/loop-scratch.md > "$tmp" && mv "$tmp" "${ENGRAM_HOME:-$HOME/.engram}"/loop-scratch.md; } || { rm -f "$tmp"; false; }
 ```
 
 The scratch log accumulates decision forks, friction points, surprises, and modality switches across the entire session. It feeds the session briefing at the end. The dedicated **ENGRAM Friction Log** section collects tool/workflow friction throughout — this is the input for the mandatory friction-design iteration at session end.
