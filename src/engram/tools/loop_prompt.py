@@ -202,8 +202,22 @@ _MIN_DELAY_SECONDS: int = 60
 # Default cadence when the marker carries none.  Canonical loop default.
 DEFAULT_CADENCE_SECONDS: int = 1800
 
-# Default marker path (Step 0 of the engram-loop skill owns the absent case).
-DEFAULT_MARKER_PATH: str = "~/.engram/loop-mode.json"
+def default_marker_path() -> str:
+    """Default marker path: ``loop-mode.json`` under the ENGRAM home (Step 0 of the engram-loop
+    skill owns the absent case).
+
+    Resolved at CALL time through the ONE shared resolver, ``tools/_owner_read.engram_home()``
+    (#3863). The import is lazy and only the CLI reaches it: the hooks import this module as a bare
+    ``loop_prompt`` (the tools dir on sys.path, no ``tools`` package) for ``LOOP_WAKE_MARKER`` and
+    must not gain a sys.path edit or an import that can fail. The parent of this file's directory
+    is the package root in BOTH layouts (src/engram/ and the deployed plugin root).
+    """
+    pkg_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if pkg_root not in sys.path:
+        sys.path.insert(0, pkg_root)
+    from tools import _owner_read
+
+    return str(_owner_read.engram_home() / "loop-mode.json")
 
 
 @dataclass(frozen=True)
@@ -420,7 +434,7 @@ def _write_next_due_at(path: str, marker: dict, next_due_at: str) -> None:
 
 def _rearm_main(args: argparse.Namespace) -> int:
     """The ``--rearm-delay`` path: print the delay, stamp the marker if needed."""
-    marker_path = os.path.expanduser(args.marker)
+    marker_path = os.path.expanduser(args.marker or default_marker_path())
     marker = _load_marker_file(marker_path)
 
     # A PRESENT-but-invalid `cadence_seconds` is a silent-fallback hazard, so
@@ -502,8 +516,9 @@ def _main() -> None:
     parser.add_argument(
         "--marker",
         metavar="PATH",
-        default=DEFAULT_MARKER_PATH,
-        help=f"Loop marker path (default: {DEFAULT_MARKER_PATH}).",
+        default=None,
+        help="Loop marker path (default: loop-mode.json in the ENGRAM home, "
+             "i.e. $ENGRAM_HOME/loop-mode.json; resolved only on --rearm-delay).",
     )
     args = parser.parse_args()
 

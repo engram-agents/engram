@@ -644,6 +644,10 @@ def _tree(root, tool, layout):
     tools_dir.mkdir(parents=True)
     shutil.copy(HELPER, helper_dir / "engram_regular_io.py")
     shutil.copy(tool, tools_dir / tool.name)
+    # The deployed plugin ships the `tools` package and the shared ENGRAM-home resolver beside every
+    # tool (monitor-supervisor imports tools._owner_read since #3863); recreate that, not a bare script.
+    for sibling in ("__init__.py", "_owner_read.py"):
+        shutil.copy(TOOLS / sibling, tools_dir / sibling)
     return tools_dir / tool.name
 
 

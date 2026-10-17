@@ -1,7 +1,7 @@
 """Session-log backup tool — copy main session logs to a retention-independent archive.
 
 Backs up top-level Claude session logs (*.jsonl) from ~/.claude/projects/ to
-~/.engram/session-logs-archive/, skipping subagent logs (paths containing /subagents/).
+$ENGRAM_HOME/session-logs-archive/ (``~/.engram`` by default), skipping subagent logs (paths containing /subagents/).
 
 Top-level logs are cited as source_url evidence in ENGRAM nodes; subagent logs are
 ephemeral fairy/sub-agent transcripts that are never cited.  The archive gives the
@@ -31,8 +31,16 @@ import os
 import shutil
 import sys
 
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (U14, #3862; #3863). `tools` is
+# found one directory above this file in BOTH layouts (src/engram/ and the deployed plugin root).
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
+
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    archive_default = str(owner_read.engram_home() / "session-logs-archive")
     p = argparse.ArgumentParser(
         prog="backup_session_logs",
         description="Back up main Claude session logs (skip subagents/) to a persistent archive.",
@@ -44,8 +52,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--archive-dir",
-        default="~/.engram/session-logs-archive",
-        help="Destination archive directory (default: ~/.engram/session-logs-archive).",
+        default=archive_default,
+        help="Destination archive directory (default: %(default)s).",
     )
     p.add_argument(
         "--retain",

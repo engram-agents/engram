@@ -48,7 +48,7 @@ code inside ``run_draw`` or the functions it calls; (3) any code that loads,
 prepares, or mutates the state, config, or arguments handed to it -- including
 ``cmd_draw``'s own window between ``load_state`` and ``run_draw``, and any
 helper it calls there; and (4) any direct edit of a file this module reads that
-feeds selection -- the persisted state file (``~/.engram/dream-lottery.json``)
+feeds selection -- the persisted state file (``$ENGRAM_HOME/dream-lottery.json``)
 -- including by a process entirely outside this module. The weights, the
 RNG source, and the draw count illustrate what the constraint already
 covers, not its boundary -- a later parameter, folded-in
@@ -68,7 +68,7 @@ had to be written down in advance, before anyone had a result to justify
 reaching for it. Prescribed by Kepler in his consultant pass on DESIGN v3,
 accepted by Borges, both on issue #1991.
 
-State file: ``~/.engram/dream-lottery.json`` — schema in DEFAULT_STATE below.
+State file: ``$ENGRAM_HOME/dream-lottery.json`` (``~/.engram`` when ENGRAM_HOME is unset) — schema in DEFAULT_STATE below.
 Written eagerly at draw time (weights-in -> weights-out is one atomic
 event, matching the issue's own "logged draws" framing: weights-in, type
 drawn, weights-out are a single record). Known limitation, not fixed by
@@ -91,7 +91,7 @@ for types in ``ran_keys`` (the drawn set). A ``--count 0`` draw would leave
 on #1912's own review, verified live before shipping); ``--count`` is
 therefore rejected below 1.
 
-History file (issue #1909): ``~/.engram/dream-lottery-history.jsonl`` —
+History file (issue #1909): ``$ENGRAM_HOME/dream-lottery-history.jsonl`` —
 derived from the state path (``dream-lottery.json`` ->
 ``dream-lottery-history.jsonl``, same directory), not a fixed path, so a
 ``--state`` override (tests, alternate installs) stays isolated end to end.
@@ -114,7 +114,7 @@ caught and downgraded to a stderr warning: it must never fail the command
 or imply the draw itself didn't happen. See ``cmd_draw``.
 
 Usage:
-    python -m tools.dream_lottery draw --db ~/.engram/knowledge.db --turn 39
+    python -m tools.dream_lottery draw --turn 39   # --db defaults to knowledge.db in the ENGRAM home
     python -m tools.dream_lottery draw --turn 39 --force  # override the re-entrancy guard
     python -m tools.dream_lottery status
     python -m tools.dream_lottery history --limit 30
@@ -130,8 +130,16 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_STATE_PATH = os.path.expanduser("~/.engram/dream-lottery.json")
-DEFAULT_DB_PATH = os.path.expanduser("~/.engram/knowledge.db")
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (U14, #3862; #3863). `tools` is
+# found one directory above this file in BOTH layouts (src/engram/ and the deployed plugin root).
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
+
+# Evaluated at import time, as before; the home is the ONE shared resolver's (#3863).
+DEFAULT_STATE_PATH = str(owner_read.engram_home() / "dream-lottery.json")
+DEFAULT_DB_PATH = str(owner_read.default_db_path())
 
 
 def history_path_for_state(state_path: str) -> str:
@@ -141,7 +149,7 @@ def history_path_for_state(state_path: str) -> str:
     directory. Deriving from the state path (rather than a fixed constant)
     keeps a ``--state`` override (tests, alternate installs) isolated end
     to end -- a test pointing ``--state`` at tmp_path must not also leak a
-    history line into the real ``~/.engram/``.
+    history line into the real ENGRAM home.
     """
     p = Path(state_path)
     return str(p.with_name(f"{p.stem}-history.jsonl"))

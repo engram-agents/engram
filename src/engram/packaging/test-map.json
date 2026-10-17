@@ -360,7 +360,8 @@
         "tests/test_cohort_owner_read_3862.py",
         "tests/test_reconcile_owner_read_3824.py",
         "tests/test_reconcile_lesson_demotions.py",
-        "tests/test_backup_owner_snapshot_3872.py"
+        "tests/test_backup_owner_snapshot_3872.py",
+        "tests/test_tools_engram_home_3863.py"
       ],
       "note": "engram-alpha#3862, #3872. The shared owner-read helper for tools/: the tools that use it load by path (spec_from_file_location) in their cells, so the layer-1 import graph does not see it; a change here must rerun every consumer's cells."
     },
@@ -396,7 +397,8 @@
     {
       "path_prefix_or_glob": "tools/dream_lottery.py",
       "test_globs": [
-        "tests/test_dream_lottery.py"
+        "tests/test_dream_lottery.py",
+        "tests/test_tools_engram_home_3863.py"
       ]
     },
     {
@@ -421,7 +423,8 @@
       "path_prefix_or_glob": "tools/loop_prompt.py",
       "test_globs": [
         "tests/test_loop_prompt.py",
-        "tests/test_loop_rearm_3005.py"
+        "tests/test_loop_rearm_3005.py",
+        "tests/test_tools_engram_home_3863.py"
       ],
       "note": "engram-alpha#3005: the loop wake-prompt builder and, from round 1, the --rearm-delay helper (the single writer of next_due_at). It had no entry before round 2 (pre-existing gap). It is a tools/ file with no repo-root symlink yet, so _shipped_path_candidates de-prefixes a change to src/engram/tools/loop_prompt.py to this bare path."
     },
@@ -738,6 +741,62 @@
         "tests/test_health_engine_fresh_server_order.py"
       ],
       "note": "engram-alpha#2609: carries the identical health.* sys.modules-clearing fresh_server() pattern as test_health_engine_checkpoint_wiring.py -- the same ordering regression class applies to this file too."
+    },
+    {
+      "path_prefix_or_glob": "tools/backup_claude_projects.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "tools/backup_session_logs.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "tools/compute_task_time.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "tools/migrate_person_nodes.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "tools/migrate_prediction_pairing_edges.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "tools/migrate_stranded_supported_by.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "tools/monitor-supervisor.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "tools/tripwire.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
     }
   ],
   "unmapped": [
@@ -760,10 +819,6 @@
     {
       "path": "tools/recall_repetition_analysis.py",
       "reason": "Dev-tier measurement/acceptance-metric CLI (recall-triggering blueprint #1688 P1/#1689); no dedicated test file. Its core repeat-fraction formula is exercised indirectly by tests/test_surface_ledger_suppression.py's synthetic-verification test, which reuses the same trailing-k-window definition."
-    },
-    {
-      "path": "tools/compute_task_time.py",
-      "reason": "No dedicated test file found"
     },
     {
       "path": "tools/rc-upgrade-verify.py",

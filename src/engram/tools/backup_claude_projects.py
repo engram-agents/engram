@@ -1,11 +1,11 @@
 """Full-directory backup tool — mirror ~/.claude/projects/ to a persistent archive.
 
-Scope: ~/.claude/projects/ only. Does not back up ~/.engram/ (knowledge.db is
+Scope: ~/.claude/projects/ only. Does not back up the ENGRAM home (knowledge.db is
 covered by the dedicated SQL dump in Step 4.5). shutil.copy2 preserves source
 mtime -- --retain prunes by when the source file was last modified.
 
 Mirrors the complete ~/.claude/projects/ tree (all file types) to
-~/.engram/claude-projects-archive/, preserving directory structure.  Complements
+$ENGRAM_HOME/claude-projects-archive/ (``~/.engram`` by default), preserving directory structure.  Complements
 backup_session_logs.py (which archives .jsonl logs to a separate
 retention-independent location); this tool captures configs, subagent transcripts,
 and any other artifacts for disaster-recovery and migration-safety.
@@ -36,8 +36,16 @@ import shutil
 import sys
 from pathlib import Path
 
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (U14, #3862; #3863). `tools` is
+# found one directory above this file in BOTH layouts (src/engram/ and the deployed plugin root).
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
+
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    archive_default = str(owner_read.engram_home() / "claude-projects-archive")
     p = argparse.ArgumentParser(
         prog="backup_claude_projects",
         description="Mirror ~/.claude/projects/ to a persistent archive directory.",
@@ -49,8 +57,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--archive-dir",
-        default="~/.engram/claude-projects-archive",
-        help="Destination archive directory (default: ~/.engram/claude-projects-archive).",
+        default=archive_default,
+        help="Destination archive directory (default: %(default)s).",
     )
     p.add_argument(
         "--compress",
