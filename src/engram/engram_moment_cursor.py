@@ -52,28 +52,33 @@ _HI = 2 ** 53          # exclusive
 
 _PATH = "$.special_moment_cursor"
 
-# #3865: the project's ONE guard idiom (the #3485 gate's column-level wrap). EVERY json_* call below takes
-# `CASE WHEN json_valid(metadata) THEN metadata END` as its first argument, so an invalid blob becomes NULL before
-# json_type / json_extract can raise `malformed JSON`. Safety belongs to the expression, not to the composition: each
-# term is safe alone and in any order, so the one cursor definition can be spliced anywhere (the UPDATE, the
-# classifier SELECT, the owner's post-commit readback).
-_META = "CASE WHEN json_valid(metadata) THEN metadata END"
+# #3865 / #3867: the project's ONE guard idiom (the #3485 gate's column-level wrap), spelled LITERALLY at each of the five
+# json_* call sites below:
+#     CASE WHEN json_valid(metadata) THEN metadata END
+# so an invalid blob becomes NULL before json_type / json_extract / json_set can raise `malformed JSON`. The five copies
+# are ONE idiom, not five designs. They are not factored into a constant on purpose: the #3485 gate only certifies a
+# first argument it can SEE in the literal (a cut-off first argument is itself a gate site), so each copy is
+# gate-verified and dropping the guard at any one reddens the gate. Keep them identical. Safety belongs to the expression,
+# not to the composition: each term is safe alone and in any order, so the one cursor definition can be spliced anywhere
+# (the UPDATE, the classifier SELECT, the owner's post-commit readback).
 
 # The stored cursor under the same rule as read_cursor; an unreadable blob reads 0, as the rule does for anything
 # that is not a window int. json_type says 'integer' for some values json_extract then returns as a float (beyond
 # int64), so the BETWEEN test is part of the rule, not decoration.
 CURSOR_SQL_EXPR = (
-    "CASE WHEN json_type(" + _META + ", '$.special_moment_cursor') = 'integer'"
-    " AND json_extract(" + _META + ", '$.special_moment_cursor') BETWEEN " + str(_LO) + " AND " + str(_HI - 1) +
-    " THEN json_extract(" + _META + ", '$.special_moment_cursor') ELSE 0 END"
+    "CASE WHEN json_type(CASE WHEN json_valid(metadata) THEN metadata END, '$.special_moment_cursor') = 'integer'"
+    " AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.special_moment_cursor')"
+    " BETWEEN " + str(_LO) + " AND " + str(_HI - 1) +
+    " THEN json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.special_moment_cursor') ELSE 0 END"
 )
 
 # NULL (so not 'object') for an invalid blob. Under the column wrap a non-object also reads cursor 0, so this term is
 # the ONLY thing that excludes an array / scalar / malformed row from the UPDATE: it must stay in `_ADVANCE_SQL`.
-_IS_OBJECT_SQL = "json_type(" + _META + ") = 'object'"
+_IS_OBJECT_SQL = "json_type(CASE WHEN json_valid(metadata) THEN metadata END) = 'object'"
 
 _ADVANCE_SQL = (
-    "UPDATE nodes SET metadata = json_set(" + _META + ", '$.special_moment_cursor', :from + 1)"
+    "UPDATE nodes SET metadata = json_set(CASE WHEN json_valid(metadata) THEN metadata END,"
+    " '$.special_moment_cursor', :from + 1)"
     " WHERE id = :id AND type = 'person' AND is_current = 1"
     " AND " + _IS_OBJECT_SQL +
     " AND " + CURSOR_SQL_EXPR + " = :from"

@@ -44,13 +44,20 @@ docstring is not SQL and is excluded; comments are not strings) holding
     `CASE WHEN json_valid(<col>) THEN <col> END` over the same column; or
   * the `->` / `->>` operator whose left operand is a bare `metadata` column
     reference followed by a path/key/placeholder.
+  * a call whose FIRST ARGUMENT runs to the end of its string piece (the scan
+    never reached a top-level `,` or `)` before the literal ended) -- e.g. SQL
+    assembled by `+` concatenation or an f-string with the argument split from
+    the function name across pieces. The scan cannot see that argument, so it
+    refuses to certify it: such a call is a site, reported as "first argument
+    not visible in the literal" (#3867). Rule for authors: a json-function's
+    first argument must be visible in the literal.
 The write-guard triggers (`json_valid(NEW.metadata)`) are not reads: `json_valid`
 is not in the function set. A reference wrapped in the guard form is guarded.
 
 What the guard CANNOT catch (so a green guard is not "the class is closed"):
-  * SQL assembled by `+` concatenation or an f-string where the first argument
-    is split from the function name across pieces (only each literal piece is
-    scanned; a piece ending mid-call yields a first argument that is cut off);
+  * SQL assembled from several pieces where the whole statement is built by
+    interpolation (only each literal piece is scanned; the cut-off rule above
+    covers the pieces whose call is split, not statements built whole);
   * a first argument that reaches the column through a view, a CTE alias, a
     subselect column renamed away from `metadata`, or a Python variable
     interpolated into an f-string;
@@ -144,11 +151,29 @@ def _is_guard(arg):
     return c1.lower() == c2.lower() and bool(_COLREF_RE.match(c1))
 
 
+def _first_arg_end(text, start):
+    """(first-argument text, terminated). `terminated` is False when the scan ran
+    off the end of `text` without reaching a top-level `,` or `)`: the first
+    argument is cut off by the literal (#3867)."""
+    arg = _first_arg(text, start)
+    return arg, start + len(arg) < len(text)
+
+
+def cut_off_calls(text):
+    """Number of json-function calls in `text` whose first argument is not
+    visible: it runs to the end of the string piece (#3867)."""
+    return sum(1 for m in _CALL_RE.finditer(text) if not _first_arg_end(text, m.end())[1])
+
+
 def sql_sites(text):
-    """Number of unguarded metadata JSON reads in one SQL string."""
+    """Number of unguarded metadata JSON reads, plus json-function calls whose
+    first argument is cut off by the end of the literal, in one SQL string."""
     n = 0
     for m in _CALL_RE.finditer(text):
-        arg = _first_arg(text, m.end())
+        arg, terminated = _first_arg_end(text, m.end())
+        if not terminated:
+            n += 1  # cannot see the first argument: refuse to certify it
+            continue
         if not _META_RE.search(_SQ_LITERAL_RE.sub("''", arg)):
             continue  # first argument is not (or does not mention) the column
         if not _is_guard(arg):
@@ -299,6 +324,8 @@ def test_no_unguarded_metadata_json_read_outside_the_allow_list(tree_sites):
     assert not bad, (
         "unguarded `json_*(metadata, ...)` read (a non-JSON blob would abort the whole "
         "query). Wrap it: json_extract(CASE WHEN json_valid(metadata) THEN metadata END, ...). "
+        "Or: first argument not visible in the literal -- a json-function's first argument must be visible in the literal "
+        "(spell the CASE WHEN json_valid(...) wrap out in the same string piece as the call; do not concatenate or interpolate it). "
         "Sites (path, line, function): %r" % bad
     )
 
@@ -365,6 +392,10 @@ FLAGGED = {
         "SELECT json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.a'), "
         "json_extract(metadata, '$.b') FROM nodes"
     ),
+    # #3867: a first argument cut off by the end of its literal is a site (not visible).
+    "cut-off-empty-argument": "json_extract(",
+    "cut-off-partly-cut-argument": "SELECT json_extract(n.",
+    "cut-off-after-select-list": "SELECT json_type(",
 }
 
 NOT_FLAGGED = {
@@ -395,6 +426,56 @@ def test_scanner_does_not_flag(name):
     """Mutation: treat any `json_valid` mention (or the bare word `metadata`)
     as a hit -> the guarded / unrelated shapes go red."""
     assert sql_sites(NOT_FLAGGED[name]) == 0, NOT_FLAGGED[name]
+
+
+CUT_OFF = ["json_extract(", "SELECT json_extract(n.", "json_type(", "json_set(CASE WHEN json_valid(metadata)"]
+NOT_CUT_OFF = [
+    "json_extract(metadata, '$.a')",  # unguarded (a site for another reason) but fully visible
+    "SELECT json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.a') FROM nodes",
+    "json_each(x) j",
+    "json_extract(payload, '$.a')",
+]
+
+
+@pytest.mark.parametrize("text", CUT_OFF)
+def test_cut_off_predicate_true(text):
+    """#3867: the first argument ran to the end of the literal (never reached a
+    top-level `,` or `)`). `SELECT json_extract(n.` is partly cut, so an
+    empty-argument rule would miss it."""
+    assert cut_off_calls(text) == 1, text
+    assert sql_sites(text) == 1, text
+
+
+@pytest.mark.parametrize("text", NOT_CUT_OFF)
+def test_cut_off_predicate_false(text):
+    assert cut_off_calls(text) == 0, text
+
+
+def test_a_cut_off_call_that_also_mentions_the_column_is_one_site():
+    assert sql_sites("SELECT json_extract(n.metadata") == 1
+
+
+def test_python_scan_flags_a_first_argument_split_across_pieces():
+    """(a)/(b) #3867: the concatenated and f-string forms cut the first argument
+    off at the piece boundary, so the piece holding the call is a site."""
+    concat = 'X = "metadata"\nq = "json_type(" + X + ", \'$.k\')"\n'
+    fstr = 'X = "metadata"\nq = f"json_type({X}, \'$.k\')"\n'
+    partly = 'q = "json_extract(n." + "metadata, \'$.a\')"\n'
+    for src in (concat, fstr, partly):
+        got = python_sites(src, "scratch.py")
+        assert len(got) == 1 and got[0][0] == "scratch.py", (src, got)
+
+
+def test_python_scan_does_not_flag_a_fully_literal_guard_in_one_piece():
+    src = ('q = ("SELECT json_extract(CASE WHEN json_valid(metadata) THEN metadata END, \'$.a\')"\n'
+           '     " FROM nodes")\n')
+    assert python_sites(src, "scratch.py") == []
+
+
+def test_failure_message_tells_authors_the_first_argument_must_be_visible():
+    import inspect
+    src = inspect.getsource(test_no_unguarded_metadata_json_read_outside_the_allow_list)
+    assert "first argument must be visible in the literal" in src
 
 
 def test_scanner_counts_each_call_separately():
