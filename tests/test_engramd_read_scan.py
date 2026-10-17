@@ -486,7 +486,13 @@ _LINE_KEY = _re.compile(r":\d+$")
 # change legitimately moves its own key.
 # #3824 (U12): the first tools/ template (33b71137...), tools/reconcile_lesson_demotions.py:find_candidates.
 # #3862 (U14): the second, tools/cohort_dispatch.py:_fetch_nodes (6b8a8373...), the registry's one json_each form.
+# #3880 (U17): the dream master CLI's four statements, tools/dream_master_batch.py (safety row, the two coverage
+# aggregates, the null-embedding count).
 _FROZEN_TEMPLATE_KEYS = frozenset({
+    "dd2e6cba6f21ce5e503ad4df8038b2ad0dd1373b9b78eb080db4f53f2969165f",
+    "dc7290f0179bba722b17491571d6a68c5b113e0626d9af887f5b782da09e9ea7",
+    "d1307e3a9b89504f39d0a1d8d166c8537d1cda8e676008c74309aa5a7c83e762",
+    "3f93aa0253bf488bb49c711fe84f003f891e319b7d1ff110806fbfb50abeb035",
     "6b8a8373e14ff561366c89e57e0e982e4d416d952e467ae44ef2e13e9eb0cd42",
     "33b7113738f7310b25d3b9c6e109b18c3a790ba8c54879c25e8a774757703e3e",
     "8fd6a2adcab8ffb85efcf1e3b22c7433632f94a0d820c60cf37d4ba22ebd154e",

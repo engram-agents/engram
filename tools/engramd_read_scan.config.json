@@ -523,7 +523,11 @@
   "hooks/claude/engram-utility-credit-mention-stop.py:write_telemetry_record",
   "hooks/claude/engram-session-start-hook.py:_check_json1",
   "tools/reconcile_lesson_demotions.py:find_candidates",
-  "tools/cohort_dispatch.py:_fetch_nodes"
+  "tools/cohort_dispatch.py:_fetch_nodes",
+  "tools/dream_master_batch.py:fetch_safety_row",
+  "tools/dream_master_batch.py:recall_summary_counts",
+  "tools/dream_master_batch.py:recall_keywords_counts",
+  "tools/dream_master_batch.py:count_null_embeddings"
  ],
  "exclusions": [
   {

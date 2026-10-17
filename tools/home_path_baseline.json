@@ -1,7 +1,6 @@
 {
   "schema": 1,
   "baseline": [
-    "src/engram/agents/claude/engram-dream-fairy.md",
     "src/engram/agents/claude/engram-person-node-fairy.md",
     "src/engram/engram_lifecycle.py",
     "src/engram/engram_tasks.py",
