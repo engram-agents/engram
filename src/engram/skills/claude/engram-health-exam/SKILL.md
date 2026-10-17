@@ -128,7 +128,7 @@ The forum-prompt hook (`engram-forum-prompt-hook.py`) fires on every prompt and 
 
 ```bash
 # Check the surfaced cursor timestamp (portable across GNU/Linux and macOS):
-python3 -c "import os,time; p='${ENGRAM_HOME:-$HOME/.engram}/forum-surfaced-cursor.txt'; print(time.ctime(os.path.getmtime(p)), p)"
+python3 -c "import os,sys,time; p=sys.argv[1]+'/forum-surfaced-cursor.txt'; print(time.ctime(os.path.getmtime(p)), p)" "${ENGRAM_HOME:-$HOME/.engram}"
 
 # And confirm the surface hook is registered:
 cat "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram/hooks/hooks.json | python3 -m json.tool | grep -A3 "UserPromptSubmit"
@@ -216,10 +216,10 @@ sections. Proceed to the manual schema check.
 ```bash
 # Check what schema version the DB is at (stored in the SQLite user_version pragma):
 python3 -c "
-import sqlite3, os
-conn = sqlite3.connect('${ENGRAM_HOME:-$HOME/.engram}/knowledge.db')
+import sqlite3, os, sys
+conn = sqlite3.connect(sys.argv[1] + '/knowledge.db')
 print('DB user_version (schema version):', conn.execute('PRAGMA user_version').fetchone()[0])
-"
+" "${ENGRAM_HOME:-$HOME/.engram}"
 # Check what version the installed code expects (look for the migration sentinel):
 grep -n "user_version <\|PRAGMA user_version =" \
     "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram/engram_core.py | head -5
@@ -243,12 +243,12 @@ term (engram-alpha#2678, forum #398).
 ```bash
 python3 -c "
 import sys, sqlite3, os
-sys.path.insert(0, '${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram')
+sys.path.insert(0, sys.argv[1] + '/marketplace/plugins/engram')
 import engram_backup
-p = '${ENGRAM_HOME:-$HOME/.engram}/knowledge.db'
+p = sys.argv[1] + '/knowledge.db'
 conn = sqlite3.connect(f'file:{p}?mode=ro', uri=True)  # read-only -- this step reads a possibly-corrupt graph
 print(engram_backup.check_fts_integrity(conn))
-"
+" "${ENGRAM_HOME:-$HOME/.engram}"
 ```
 
 **PASS:** `{'status': 'ok', 'probed_terms': N}` — every vocabulary term both plain-matched and ranked
@@ -308,7 +308,7 @@ on a graph at least as large as the ones above.
 Skip this step if you do not use the viz dashboard (T2 feature, may not be installed).
 
 ```bash
-agent=$(python3 -c "import json,os; print(json.load(open('${ENGRAM_HOME:-$HOME/.engram}/config.json'))['agent_name'])")
+agent=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]+'/config.json'))['agent_name'])" "${ENGRAM_HOME:-$HOME/.engram}")
 curl -s "http://localhost:5001/api/health?agent=$agent" | python3 -m json.tool
 ```
 
@@ -336,7 +336,7 @@ cd "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram && python3 -m viz.
 ```bash
 python3 -c "
 import json, os, sys
-path = '${ENGRAM_HOME:-$HOME/.engram}/config.json'
+path = sys.argv[1] + '/config.json'
 try:
     d = json.load(open(path))
 except Exception as e:
@@ -348,7 +348,7 @@ print('agent_name   :', d.get('agent_name', 'MISSING'))
 
 drowsiness = d.get('cadence', {}).get('drowsiness_ceiling_tokens')
 print('drowsiness_ceiling_tokens:', drowsiness if drowsiness else 'NOT SET (will use fallback 152000)')
-"
+" "${ENGRAM_HOME:-$HOME/.engram}"
 ```
 
 **PASS:**

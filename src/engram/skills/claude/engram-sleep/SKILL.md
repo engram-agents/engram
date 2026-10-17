@@ -636,7 +636,7 @@ MARKER="${ENGRAM_HOME:-$HOME/.engram}/sessions/last-sleep-success.json"
 if [ ! -f "$MARKER" ]; then
   PREV_SLEEP=""
 else
-  PREV_SLEEP=$(python3 -c "import json; print(json.load(open('$MARKER'))['completed_at'])") || {
+  PREV_SLEEP=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['completed_at'])" "$MARKER") || {
     echo "ERROR: $MARKER exists but has no usable 'completed_at' key — cannot compute the cohort boundary. Fix or delete the marker before continuing." >&2
     exit 1
   }
@@ -746,7 +746,7 @@ python3 -m tools.cohort_dispatch prepare \
   --expect-total "$COHORT_TOTAL"
 ```
 
-The store is `$ENGRAM_HOME/knowledge.db` (the tool resolves `ENGRAM_HOME` itself, one definition shared with the other owner-aware tools); pass `--db` only to read a different file.
+The store is `${ENGRAM_HOME:-$HOME/.engram}/knowledge.db` (the tool resolves the home itself, one definition shared with the other owner-aware tools); pass `--db` only to read a different file.
 
 The script prints a JSON manifest to stdout listing chunk directories. Each chunk-N/ contains:
 - `payload.json` — the node content the fairy will see (no recall_summary/recall_keywords)
