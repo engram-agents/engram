@@ -1010,7 +1010,10 @@ jobs:
       # run HEAD is the merge commit, so the merge-base is the base branch's tip
       # as of that merge ref, not the PR's branch point: a stricter, more current
       # comparison. The gate's own tests run here too, since the full suite does
-      # not run on dev PRs. tests/test_home_path_gate.py pins this step (the
+      # not run on dev PRs, and so do the two line-level controls PR 2 added for
+      # what the file-level gate cannot see (test_skill_home_paths_3863.py: the
+      # health-exam, upgrade and sleep skills; test_walguard_home_path_3863.py:
+      # the walguard remedy text). tests/test_home_path_gate.py pins this step (the
       # gate call with --base-sha from a merge-base, and the pytest call).
       - name: home-path gate — fail on a new hard-coded ENGRAM home path (baseline may only shrink)
         if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
@@ -1018,7 +1021,7 @@ jobs:
           BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
           rc=0
           python3 tools/home_path_gate.py --base-sha "$BASE_SHA" || rc=1
-          python3 -m pytest tests/test_home_path_gate.py -q || rc=1
+          python3 -m pytest tests/test_home_path_gate.py tests/test_skill_home_paths_3863.py tests/test_walguard_home_path_3863.py -q || rc=1
           exit $rc
 
       # ── 7d. cascade behaviour acceptance (playbox) ──────────────────────

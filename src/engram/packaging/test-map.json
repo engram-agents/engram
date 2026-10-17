@@ -653,9 +653,10 @@
         "tests/test_skill_server_sync.py",
         "tests/test_tiers_manifest.py",
         "tests/test_health_exam_skill.py",
-        "tests/test_loop_rearm_3005.py"
+        "tests/test_loop_rearm_3005.py",
+        "tests/test_skill_home_paths_3863.py"
       ],
-      "note": "Any change to a skill directory triggers skill lint + tiers manifest, plus the health-exam shell-pattern gate, whose population is EVERY shipped skill doc rather than the health-exam one. Adding a more specific skills/claude/<name>/ entry above this one shadows it (first-match-wins), so such an entry must repeat this gate. engram-alpha#3005 round 3 adds test_loop_rearm_3005.py: its sweep cell walks EVERY swept root for the retired full-cadence arm phrase, and any skill doc (not only engram-loop's) is a carrier of that instruction."
+      "note": "Any change to a skill directory triggers skill lint + tiers manifest, plus the health-exam shell-pattern gate, whose population is EVERY shipped skill doc rather than the health-exam one. Adding a more specific skills/claude/<name>/ entry above this one shadows it (first-match-wins), so such an entry must repeat this gate. engram-alpha#3005 round 3 adds test_loop_rearm_3005.py: its sweep cell walks EVERY swept root for the retired full-cadence arm phrase, and any skill doc (not only engram-loop's) is a carrier of that instruction. engram-alpha#3863 PR 2 adds test_skill_home_paths_3863.py: a line-level check that engram-health-exam, engram-upgrade and engram-sleep carry no command-position hard-coded ENGRAM home path (the file-level home-path gate cannot see a skill that names ENGRAM_HOME once and pastes ~/.engram elsewhere)."
     },
     {
       "path_prefix_or_glob": "templates/",

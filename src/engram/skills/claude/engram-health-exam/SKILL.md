@@ -30,21 +30,21 @@ symlink can survive while its old install target disappears, so `test -L`
 alone is not enough to call it healthy.
 
 ```bash
-test -d ~/.engram/marketplace/plugins/engram
+test -d "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram
 # Loop variable is `p`, never `path`: in zsh `path` is a tied array bound to
 # $PATH, so `for path in ...` wipes PATH for the rest of the shell (#3068).
 for p in tools hooks; do
-  target=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$HOME/.engram/$p" 2>/dev/null) || target=""
-  if [ -e "$HOME/.engram/$p" ] && [ -n "$target" ] && [ -e "$target" ]; then
-      echo "PASS: ~/.engram/$p -> $target"
+  target=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${ENGRAM_HOME:-$HOME/.engram}/$p" 2>/dev/null) || target=""
+  if [ -e "${ENGRAM_HOME:-$HOME/.engram}/$p" ] && [ -n "$target" ] && [ -e "$target" ]; then
+      echo "PASS: ${ENGRAM_HOME:-$HOME/.engram}/$p -> $target"
   else
-      echo "FAIL: ~/.engram/$p is absent, dangling, or unresolvable"
+      echo "FAIL: ${ENGRAM_HOME:-$HOME/.engram}/$p is absent, dangling, or unresolvable"
   fi
   # `test -e` and `test -L` are builtins, so this still answers even if the resolver above died.
   # Gated on -e as well as -L: an ABSENT path is not "a real directory", and the
   # pinned-scatter remediation is the wrong fix for a path that simply is not there.
-  if [ -e "$HOME/.engram/$p" ] && [ ! -L "$HOME/.engram/$p" ]; then
-      echo "NOTE: ~/.engram/$p is a real directory, not a symlink — see engram-upgrade's pinned-scatter remediation"
+  if [ -e "${ENGRAM_HOME:-$HOME/.engram}/$p" ] && [ ! -L "${ENGRAM_HOME:-$HOME/.engram}/$p" ]; then
+      echo "NOTE: ${ENGRAM_HOME:-$HOME/.engram}/$p is a real directory, not a symlink — see engram-upgrade's pinned-scatter remediation"
   fi
 done
 ```
@@ -53,7 +53,7 @@ done
 existing targets. **FAIL:** either path is absent, dangling, or unresolvable
 (a `NOTE:` line means the path is a real directory rather than a symlink — it
 resolves, but it is pinned to whatever it last held). Repoint a dangling
-symlink to `~/.engram/marketplace/plugins/engram/<path>`; preserve a real
+symlink to `${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram/<path>`; preserve a real
 directory and follow `engram-upgrade`'s pinned-scatter remediation instead of
 replacing it blindly.
 
@@ -85,7 +85,7 @@ else
 fi
 
 # Attempt manual restart (plugin install):
-~/.engram/marketplace/plugins/engram/launch-engram-server.sh &
+"${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram/launch-engram-server.sh &
 # Then reconnect MCP: /mcp in Claude Code
 ```
 
@@ -97,11 +97,11 @@ The SessionStart hook writes a per-session marker. Verify it fired AND delivered
 
 ```bash
 # Check that the current session marker exists (hook wrote it):
-ls -t ~/.engram/sessions/ | head -5
+ls -t "${ENGRAM_HOME:-$HOME/.engram}"/sessions/ | head -5
 
 # Inspect the newest marker. The hook writes a fresh marker; it does not touch
 # warm-briefing.md, so that file's mtime is not a delivery signal.
-marker=$(ls -t ~/.engram/sessions/*.json 2>/dev/null | head -1)
+marker=$(ls -t "${ENGRAM_HOME:-$HOME/.engram}"/sessions/*.json 2>/dev/null | head -1)
 python3 -m json.tool "$marker"
 ```
 
@@ -114,24 +114,24 @@ warm-briefing pointer).
 Remediation — this is the #824 muted-stdout class:
 ```bash
 # Check the hook's recent output in the session log:
-tail -20 ~/.engram/sessions/$(ls -t ~/.engram/sessions/ | head -1)
+tail -20 "${ENGRAM_HOME:-$HOME/.engram}"/sessions/$(ls -t "${ENGRAM_HOME:-$HOME/.engram}"/sessions/ | head -1)
 
 # Verify the hook is registered in the plugin hooks config:
-cat ~/.engram/marketplace/plugins/engram/hooks/hooks.json | python3 -m json.tool | grep -A3 "session"
+cat "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram/hooks/hooks.json | python3 -m json.tool | grep -A3 "session"
 ```
 
 ---
 
 ## Step 3 — UserPromptSubmit hook delivery (forum-surfaced cursor)
 
-The forum-prompt hook (`engram-forum-prompt-hook.py`) fires on every prompt and updates `~/.engram/forum-surfaced-cursor.txt`.
+The forum-prompt hook (`engram-forum-prompt-hook.py`) fires on every prompt and updates `${ENGRAM_HOME:-$HOME/.engram}/forum-surfaced-cursor.txt`.
 
 ```bash
 # Check the surfaced cursor timestamp (portable across GNU/Linux and macOS):
-python3 -c "import os,time; p=os.path.expanduser('~/.engram/forum-surfaced-cursor.txt'); print(time.ctime(os.path.getmtime(p)), p)"
+python3 -c "import os,time; p='${ENGRAM_HOME:-$HOME/.engram}/forum-surfaced-cursor.txt'; print(time.ctime(os.path.getmtime(p)), p)"
 
 # And confirm the surface hook is registered:
-cat ~/.engram/marketplace/plugins/engram/hooks/hooks.json | python3 -m json.tool | grep -A3 "UserPromptSubmit"
+cat "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram/hooks/hooks.json | python3 -m json.tool | grep -A3 "UserPromptSubmit"
 ```
 
 **PASS:** `forum-surfaced-cursor.txt` exists and its mtime is from this session (within the last
@@ -151,7 +151,7 @@ else
     [ "$rc" -eq 1 ] && echo "daemon not running" || echo "could not check: pgrep exited $rc"
 fi
 # Restart the daemon if absent (it auto-restarts on next hook fire if the start-daemon script is registered):
-bash ~/.engram/marketplace/plugins/engram/hooks/start-engram-daemon.sh
+bash "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram/hooks/start-engram-daemon.sh
 ```
 
 ---
@@ -184,7 +184,7 @@ matches). Not a hard block, but degrades surfacing quality.
 
 Remediation:
 ```bash
-bash ~/.engram/marketplace/plugins/engram/hooks/start-engram-daemon.sh
+bash "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram/hooks/start-engram-daemon.sh
 # Wait 10s, then re-check pgrep
 ```
 
@@ -192,7 +192,7 @@ bash ~/.engram/marketplace/plugins/engram/hooks/start-engram-daemon.sh
 that changed the embedding model.
 ```bash
 # Re-generate embeddings (takes a few minutes on a large graph):
-python3 ~/.engram/marketplace/plugins/engram/tools/engram-regenerate-embeddings.py
+python3 "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram/tools/engram-regenerate-embeddings.py
 ```
 
 ---
@@ -217,12 +217,12 @@ sections. Proceed to the manual schema check.
 # Check what schema version the DB is at (stored in the SQLite user_version pragma):
 python3 -c "
 import sqlite3, os
-conn = sqlite3.connect(os.path.expanduser('~/.engram/knowledge.db'))
+conn = sqlite3.connect('${ENGRAM_HOME:-$HOME/.engram}/knowledge.db')
 print('DB user_version (schema version):', conn.execute('PRAGMA user_version').fetchone()[0])
 "
 # Check what version the installed code expects (look for the migration sentinel):
 grep -n "user_version <\|PRAGMA user_version =" \
-    ~/.engram/marketplace/plugins/engram/engram_core.py | head -5
+    "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram/engram_core.py | head -5
 ```
 
 If the DB user_version doesn't match the code's constant, a migration is needed — contact Lei. Schema
@@ -243,9 +243,9 @@ term (engram-alpha#2678, forum #398).
 ```bash
 python3 -c "
 import sys, sqlite3, os
-sys.path.insert(0, os.path.expanduser('~/.engram/marketplace/plugins/engram'))
+sys.path.insert(0, '${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram')
 import engram_backup
-p = os.path.expanduser('~/.engram/knowledge.db')
+p = '${ENGRAM_HOME:-$HOME/.engram}/knowledge.db'
 conn = sqlite3.connect(f'file:{p}?mode=ro', uri=True)  # read-only -- this step reads a possibly-corrupt graph
 print(engram_backup.check_fts_integrity(conn))
 "
@@ -308,7 +308,7 @@ on a graph at least as large as the ones above.
 Skip this step if you do not use the viz dashboard (T2 feature, may not be installed).
 
 ```bash
-agent=$(python3 -c "import json,os; print(json.load(open(os.path.expanduser('~/.engram/config.json')))['agent_name'])")
+agent=$(python3 -c "import json,os; print(json.load(open('${ENGRAM_HOME:-$HOME/.engram}/config.json'))['agent_name'])")
 curl -s "http://localhost:5001/api/health?agent=$agent" | python3 -m json.tool
 ```
 
@@ -326,7 +326,7 @@ systemctl --user status engram-viz-user.service 2>/dev/null || echo "no systemd 
 # Manual start (viz/server.py uses relative imports -- must run as a
 # module with the plugin engram dir as the working directory, not as a
 # direct script path):
-cd ~/.engram/marketplace/plugins/engram && python3 -m viz.server &
+cd "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram && python3 -m viz.server &
 ```
 
 ---
@@ -336,7 +336,7 @@ cd ~/.engram/marketplace/plugins/engram && python3 -m viz.server &
 ```bash
 python3 -c "
 import json, os, sys
-path = os.path.expanduser('~/.engram/config.json')
+path = '${ENGRAM_HOME:-$HOME/.engram}/config.json'
 try:
     d = json.load(open(path))
 except Exception as e:
@@ -357,7 +357,7 @@ print('drowsiness_ceiling_tokens:', drowsiness if drowsiness else 'NOT SET (will
 - `agent_name` is set (not `MISSING`).
 - `drowsiness_ceiling_tokens` is set (ideally 5–10% below the session's auto-compaction limit).
 
-**FAIL — missing fields:** add them to `~/.engram/config.json` using the `engram-first-session` skill
+**FAIL — missing fields:** add them to `${ENGRAM_HOME:-$HOME/.engram}/config.json` using the `engram-first-session` skill
 as the reference for correct values, or the viz-server config UI at `http://localhost:5001/config`.
 
 **FAIL — `drowsiness_ceiling_tokens` not set:** run `/context` in Claude Code to find the

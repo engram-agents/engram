@@ -86,9 +86,9 @@ _RECOVERY_CONDITION = (
 
 _RECOVERY_STEPS: list[str] = [
     "restart the MCP server (/mcp reconnect)",
-    "stop the surface daemon: kill -TERM $(cat ~/.engram/recall-daemon.pid)",
+    'stop the surface daemon: kill -TERM $(cat "${ENGRAM_HOME:-$HOME/.engram}/recall-daemon.pid")',
     'restart it: bash "$CLAUDE_PLUGIN_ROOT/hooks/start-engram-daemon.sh"',
-    'VERIFY before believing it worked: sqlite3 ~/.engram/knowledge.db '
+    'VERIFY before believing it worked: sqlite3 "${ENGRAM_HOME:-$HOME/.engram}/knowledge.db" '
     '"select count(*) from nodes" must succeed -- a reconnect that reports '
     'success is NOT evidence the index recovered',
 ]
