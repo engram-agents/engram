@@ -1,21 +1,23 @@
 """Contract tests for tools/home_path_gate.py [part of #3863].
 
-Written BEFORE the gate (contract-first, #3045). The contract:
+The gate is LINE-level (R5, the design seat's ruling on #3863), with a counted
+baseline (schema 2) and a classed allowlist (R4). The contract, written before
+the line-level implementation (contract-first, #3045):
 
-  * a shipped file (tracked, under src/engram, not a test or a doc) that
-    contains a hard-coded ENGRAM-home spelling and zero occurrences of the
-    token ENGRAM_HOME is a VIOLATION;
-  * every spelling in the gate's table has its own planted case: a new file
-    carrying it goes RED, and goes green when the file also reads ENGRAM_HOME;
-  * the checked-in baseline lists today's violators and may only SHRINK:
-      (1) a violator not in the baseline -> red
-      (2) a baseline entry that no longer violates -> red ("stale")
-      (3) a baseline or allowlist entry naming a missing file -> red
-      (4) head baseline entry absent from the base-ref baseline -> red; the
-          seed (base has no baseline file) is the only exception
-      (5) the allowlist exists and is EMPTY (no placeholder for a resolver)
-  * the scanner is live: it finds violators in the real tree, including the 13
-    files the issue names, so a pattern that matches nothing cannot pass.
+  C1 a line carrying any SPELLINGS match is clean iff that same line contains
+     the substring ENGRAM_HOME, or a call to the shared resolver
+     (`engram_home(`), or its file is allowlisted. ENGRAM_HOME on ANOTHER line
+     of the file no longer rescues a bare spelling line.
+  C2 baseline schema 2: {"schema": 2, "baseline": {file: violating-line
+     count}, "allowlist": {file: {"class": "resolver"|"foreign-home",
+     "reason": non-empty}}}. Rules: (a) violator absent from the baseline,
+     (b) count above baseline, (c) count below baseline ("lower it to N") or a
+     zero-count entry ("remove it"), (d) dangling entry, (e) with --base-sha:
+     growth against the base (a schema-1 base is the transition and is read as
+     a seed), (f) allowlist shape rules, (g) schema 1 on the head is red.
+  C6 the verdicts are asserted on PLANTED scratch git repos, never on counts
+     read from the real tree; one test runs the real tree and asserts only
+     that the ratchet is green.
 
 The fixtures use real `git init` scratch repos because the gate lists files
 with `git ls-files`.
@@ -23,6 +25,7 @@ with `git ls-files`.
 
 import importlib.util
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -126,27 +129,30 @@ def _git(root, *args):
 
 
 def _repo(tmp_path, files=None, baseline=None, allowlist=None):
-    """A scratch git repo. files: {relpath: text}; baseline/allowlist: lists
-    (None = no baseline file at all)."""
+    """A scratch git repo. files: {relpath: text}. baseline: a dict
+    {file: count} (schema 2), a list (schema 1), or None (no baseline file at
+    all). allowlist: {file: {"class":..., "reason":...}} (schema 2 only)."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
     _git(tmp_path, "init", "-q")
     for rel, text in (files or {}).items():
         p = tmp_path / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, encoding="utf-8")
     if baseline is not None:
-        _write_baseline(tmp_path, baseline, allowlist or [])
+        _write_baseline(tmp_path, baseline, allowlist)
     _git(tmp_path, "add", "-A")
     return tmp_path
 
 
-def _write_baseline(root, baseline, allowlist=()):
+def _write_baseline(root, baseline, allowlist=None):
     mod = _load()
     p = root / mod.BASELINE_REL
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(
-        json.dumps({"schema": 1, "baseline": sorted(baseline), "allowlist": sorted(allowlist)}),
-        encoding="utf-8",
-    )
+    if isinstance(baseline, list):
+        doc = {"schema": 1, "baseline": sorted(baseline), "allowlist": []}
+    else:
+        doc = {"schema": 2, "baseline": dict(baseline), "allowlist": dict(allowlist or {})}
+    p.write_text(json.dumps(doc), encoding="utf-8")
 
 
 def _commit(root, msg="c"):
@@ -155,9 +161,28 @@ def _commit(root, msg="c"):
     return _git(root, "rev-parse", "HEAD").stdout.strip()
 
 
+def _fd(reason="finds another seat's home"):
+    return {"class": "foreign-home", "reason": reason}
+
+
+def _res(reason="a resolver layer"):
+    return {"class": "resolver", "reason": reason}
+
+
+def _layer(path, name="tools", pinned=True):
+    return {"path": path, "layer": name, "parity_pinned": pinned}
+
+
+BARE = 'p = Path.home() / ".engram"\n'
+A = "src/engram/tools/a.py"
+B = "src/engram/tools/b.py"
+C = "src/engram/tools/c.py"
+# TWO: violating lines 2 and 4, two clean lines. THREE: lines 2, 4, 5.
+TWO = "import os\n" + BARE + "x = 1\n" + 'q = Path.home() / ".engram" / "y"\n'
+THREE = TWO + BARE
+
+
 PLANT_CASES = [(n, ext, line) for n, (ext, lines) in PLANTS.items() for line in lines]
-
-
 PLANT_IDS = [f"{c[0]}-{i}" for i, c in enumerate(PLANT_CASES)]
 
 
@@ -174,7 +199,7 @@ def test_every_table_spelling_has_a_planted_case():
 def test_planted_spelling_is_red_by_its_own_name(tmp_path, name, ext, line):
     mod = _load()
     rel = f"src/engram/tools/new_tool{ext}"
-    root = _repo(tmp_path, {rel: line + "\n"}, baseline=[])
+    root = _repo(tmp_path, {rel: line + "\n"}, baseline={})
     v = mod.violations(root)
     assert rel in v, f"{name}: planted line was not flagged: {line!r}"
     assert name in v[rel], f"{name}: flagged, but not by its own table row: {sorted(v[rel])}"
@@ -182,20 +207,167 @@ def test_planted_spelling_is_red_by_its_own_name(tmp_path, name, ext, line):
     assert any(rel in p for p in problems), problems
 
 
+# -- C1: the line is the unit ------------------------------------------------
+
 @pytest.mark.parametrize("name,ext,line", PLANT_CASES, ids=PLANT_IDS)
-def test_planted_spelling_is_green_when_file_reads_engram_home(tmp_path, name, ext, line):
+def test_planted_spelling_is_green_when_its_own_line_names_engram_home(tmp_path, name, ext, line):
     mod = _load()
     rel = f"src/engram/tools/new_tool{ext}"
-    root = _repo(tmp_path, {rel: line + "\n# reads ENGRAM_HOME first\n"}, baseline=[])
+    root = _repo(tmp_path, {rel: line + "  # ENGRAM_HOME\n"}, baseline={})
     assert rel not in mod.violations(root)
     assert mod.check(root) == []
+
+
+@pytest.mark.parametrize("name,ext,line", PLANT_CASES, ids=PLANT_IDS)
+def test_planted_spelling_stays_red_when_engram_home_is_on_another_line(tmp_path, name, ext, line):
+    """The new discriminating case: the token elsewhere in the file does not
+    rescue a bare spelling line (the old gate called this file clean)."""
+    mod = _load()
+    rel = f"src/engram/tools/new_tool{ext}"
+    root = _repo(tmp_path, {rel: line + "\n# reads ENGRAM_HOME first\n"}, baseline={})
+    assert rel in mod.violations(root), f"{name}: another line's token rescued {line!r}"
+    assert any(rel in p for p in mod.check(root))
+
+
+@pytest.mark.parametrize("name,ext,line", PLANT_CASES, ids=PLANT_IDS)
+def test_planted_spelling_is_green_when_its_line_calls_the_resolver(tmp_path, name, ext, line):
+    mod = _load()
+    rel = f"src/engram/tools/new_tool{ext}"
+    root = _repo(tmp_path, {rel: line + "  # engram_home()\n"}, baseline={})
+    assert rel not in mod.violations(root)
+    assert mod.check(root) == []
+
+
+BARE_NAME_LINES = [
+    'p = engram_home or Path.home() / ".engram"',
+    'p = args.engram_home or Path.home() / ".engram"',
+    'p = my_engram_home() or Path.home() / ".engram"',
+]
+
+
+@pytest.mark.parametrize("line", BARE_NAME_LINES)
+def test_resolver_clause_needs_a_call_not_a_bare_name(tmp_path, line):
+    """`engram_home` mentioned without a call (a variable, an attribute, a
+    longer function name) does not clean a spelling line."""
+    mod = _load()
+    rel = "src/engram/tools/new_tool.py"
+    root = _repo(tmp_path, {rel: line + "\n"}, baseline={})
+    assert rel in mod.violations(root), line
+
+
+def test_resolver_call_on_a_qualified_name_is_clean(tmp_path):
+    mod = _load()
+    rel = "src/engram/tools/new_tool.py"
+    root = _repo(
+        tmp_path, {rel: 'p = _owner_read.engram_home() or Path.home() / ".engram"\n'}, baseline={}
+    )
+    assert mod.violations(root) == {}
+
+
+# -- C1 is per PHYSICAL line: nothing but the line itself rescues (designer's
+# ruling; no parser). The split idiom is a RED, on purpose: 6b replaces it with
+# a resolver call. (name, relpath, text, verdict).
+OWN_LINE_CASES = [
+    # the token on the previous line of the SAME statement does not rescue
+    (
+        "same_statement_token_on_previous_line",
+        "src/engram/tools/p.py",
+        'ENGRAM_HOME = (os.environ.get("ENGRAM_HOME")\n'
+        '               or os.path.expanduser("~/.engram"))\n',
+        "red",
+    ),
+    (
+        "same_statement_token_on_later_line",
+        "src/engram/tools/p.py",
+        'p = (os.path.expanduser("~/.engram")\n     if not os.environ.get("ENGRAM_HOME") else None)\n',
+        "red",
+    ),
+    # the token one line above, in a different statement
+    (
+        "different_statement_above",
+        "src/engram/tools/p.py",
+        'h = os.environ.get("ENGRAM_HOME")\np = os.path.expanduser("~/.engram")\n',
+        "red",
+    ),
+    # the token only in a comment on the line above
+    (
+        "comment_above",
+        "src/engram/tools/p.py",
+        '# ENGRAM_HOME\np = os.path.expanduser("~/.engram")\n',
+        "red",
+    ),
+    # a docstring: the token on another docstring line does not rescue
+    (
+        "docstring_other_line",
+        "src/engram/tools/p.py",
+        '"""Tool.\n\nENGRAM_HOME is read elsewhere.\nThe default is ~/.engram/x.\n"""\n',
+        "red",
+    ),
+    (
+        "docstring_same_line",
+        "src/engram/tools/p.py",
+        '"""Tool.\n\nThe default is ~/.engram/x ($ENGRAM_HOME overrides).\n"""\n',
+        "green",
+    ),
+    # shell: a backslash-continued command does not join physical lines
+    (
+        "sh_continued_command_token_first",
+        "src/engram/tools/r.sh",
+        'ENGRAM_HOME="${ENGRAM_HOME:-x}" \\\n  run ~/.engram/y\n',
+        "red",
+    ),
+    # the resolver call on the spelling line, and nowhere else, is the rescue
+    (
+        "resolver_call_same_line",
+        "src/engram/tools/p.py",
+        'p = engram_home() or os.path.expanduser("~/.engram")\n',
+        "green",
+    ),
+    (
+        "resolver_call_on_the_line_above",
+        "src/engram/tools/p.py",
+        'h = engram_home()\np = os.path.expanduser("~/.engram")\n',
+        "red",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "name,rel,text,verdict", OWN_LINE_CASES, ids=[c[0] for c in OWN_LINE_CASES]
+)
+def test_only_the_physical_line_rescues(tmp_path, name, rel, text, verdict):
+    mod = _load()
+    root = _repo(tmp_path, {rel: text}, baseline={})
+    v = mod.violations(root)
+    if verdict == "green":
+        assert v == {}, f"{name}: expected clean, got {mod.violating_lines(root)}"
+    else:
+        assert rel in v, f"{name}: expected a violating line, the file was called clean"
+
+
+def test_resolver_tokens_is_the_one_place_resolver_names_live():
+    """RESOLVER_TOKENS is the single list of resolver-call regexes; today
+    exactly the `engram_home(` call. New resolver names are added only there."""
+    mod = _load()
+    assert isinstance(mod.RESOLVER_TOKENS, tuple) and len(mod.RESOLVER_TOKENS) == 1
+    rx = re.compile(mod.RESOLVER_TOKENS[0])
+    assert rx.search("x = engram_home()") and rx.search("_owner_read.engram_home( )")
+    assert not rx.search("x = engram_home") and not rx.search("my_engram_home()")
+
+
+def test_count_is_violating_lines_not_spelling_matches(tmp_path):
+    """One line matching two rows (path_home_div + quoted_segment) is ONE line."""
+    mod = _load()
+    root = _repo(tmp_path, {A: THREE}, baseline={})
+    assert mod.violation_counts(root) == {A: 3}
+    assert [n for n, _, _ in mod.violating_lines(root)[A]] == [2, 4, 5]
 
 
 @pytest.mark.parametrize("line", NEGATIVES)
 def test_non_home_spellings_are_not_flagged(tmp_path, line):
     mod = _load()
     rel = "src/engram/tools/other.py"
-    root = _repo(tmp_path, {rel: line + "\n"}, baseline=[])
+    root = _repo(tmp_path, {rel: line + "\n"}, baseline={})
     assert mod.violations(root) == {}
     assert mod.check(root) == []
 
@@ -216,85 +388,567 @@ def test_non_home_spellings_are_not_flagged(tmp_path, line):
 )
 def test_files_outside_the_shipped_scope_are_not_scanned(tmp_path, rel):
     mod = _load()
-    root = _repo(tmp_path, {rel: 'p = Path.home() / ".engram"\n'}, baseline=[])
+    root = _repo(tmp_path, {rel: BARE}, baseline={})
     assert mod.violations(root) == {}
     assert mod.check(root) == []
 
 
 def test_untracked_file_is_not_scanned(tmp_path):
     mod = _load()
-    root = _repo(tmp_path, {}, baseline=[])
+    root = _repo(tmp_path, {}, baseline={})
     p = root / "src/engram/tools/x.py"
     p.parent.mkdir(parents=True)
-    p.write_text('p = Path.home() / ".engram"\n')
+    p.write_text(BARE)
     assert mod.violations(root) == {}
 
 
 def test_spelling_in_a_skill_markdown_is_scanned(tmp_path):
     mod = _load()
     rel = "src/engram/skills/claude/engram-x/SKILL.md"
-    root = _repo(tmp_path, {rel: "run `~/.engram/venv/bin/python`\n"}, baseline=[])
+    root = _repo(tmp_path, {rel: "run `~/.engram/venv/bin/python`\n"}, baseline={})
     assert rel in mod.violations(root)
 
 
-# -- baseline rules ---------------------------------------------------------
+# -- C2 (a): a violator absent from the baseline ------------------------------
 
-def test_rule1_violator_missing_from_baseline_is_red(tmp_path):
+def test_a_violator_missing_from_baseline_is_red(tmp_path):
     mod = _load()
-    root = _repo(
-        tmp_path,
-        {"src/engram/tools/a.py": 'p = Path.home() / ".engram"\n'},
-        baseline=[],
-    )
+    root = _repo(tmp_path, {A: TWO}, baseline={})
     problems = mod.check(root)
-    assert len(problems) == 1 and "src/engram/tools/a.py" in problems[0]
+    assert len(problems) == 1 and A in problems[0]
 
 
-def test_rule1_violator_in_baseline_is_green(tmp_path):
+def test_a_violator_in_baseline_at_its_count_is_green(tmp_path):
     mod = _load()
-    root = _repo(
-        tmp_path,
-        {"src/engram/tools/a.py": 'p = Path.home() / ".engram"\n'},
-        baseline=["src/engram/tools/a.py"],
-    )
+    root = _repo(tmp_path, {A: TWO}, baseline={A: 2})
     assert mod.check(root) == []
 
 
-def test_rule2_stale_baseline_entry_is_red(tmp_path):
+# -- C2 (b): a count above the baseline ---------------------------------------
+
+def test_b_count_above_baseline_is_red(tmp_path):
     mod = _load()
-    root = _repo(
-        tmp_path,
-        {"src/engram/tools/a.py": "import os\nH = os.environ['ENGRAM_HOME']\n"},
-        baseline=["src/engram/tools/a.py"],
-    )
+    root = _repo(tmp_path, {A: THREE}, baseline={A: 2})
     problems = mod.check(root)
     assert len(problems) == 1
-    assert "stale" in problems[0] and "src/engram/tools/a.py" in problems[0]
+    assert A in problems[0] and "3" in problems[0] and "2" in problems[0]
 
 
-def test_rule3_baseline_entry_naming_missing_file_is_red(tmp_path):
+def test_known_bound_a_swap_inside_one_file_keeps_the_count_green(tmp_path):
+    """Known bound, see docstring: a count baseline cannot tell WHICH lines
+    violate. Fixing one violating line and adding a different bare-spelling
+    line in the same file keeps the count at 2, so the gate stays green. This
+    pins the bound: changing it (e.g. comparing line content) edits this test."""
     mod = _load()
-    root = _repo(tmp_path, {"src/engram/x.py": "pass\n"}, baseline=["src/engram/tools/gone.py"])
+    swapped = (
+        "import os\n"
+        + 'p = Path.home() / ".engram"  # ENGRAM_HOME\n'  # fixed
+        + "x = 1\n"
+        + 'q = Path.home() / ".engram" / "y"\n'  # still violating
+        + 'r = os.path.expanduser("~/.engram/z")\n'  # new bare spelling elsewhere
+    )
+    root = _repo(tmp_path, {A: swapped}, baseline={A: 2})
+    assert mod.violation_counts(root) == {A: 2}
+    assert mod.check(root) == []
+
+
+def test_b_a_new_violating_line_in_a_baselined_file_is_red(tmp_path):
+    """The point of the count: a file already baselined cannot take one more."""
+    mod = _load()
+    root = _repo(tmp_path, {A: TWO + "# ENGRAM_HOME is read elsewhere\n" + BARE}, baseline={A: 2})
+    assert len(mod.check(root)) == 1
+
+
+# -- C2 (c): the ratchet is exact --------------------------------------------
+
+def test_c_count_below_baseline_is_stale_and_says_the_new_number(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {A: TWO}, baseline={A: 3})
+    problems = mod.check(root)
+    assert len(problems) == 1
+    assert "stale" in problems[0] and "lower it to 2" in problems[0] and A in problems[0]
+
+
+def test_c_fixed_file_still_listed_is_stale_remove_it(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {A: "import os\nH = os.environ['ENGRAM_HOME']\n"}, baseline={A: 1})
+    problems = mod.check(root)
+    assert len(problems) == 1
+    assert "stale" in problems[0] and "remove it" in problems[0] and A in problems[0]
+
+
+def test_c_zero_count_entry_is_stale_remove_it(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {A: "x = 1\n"}, baseline={A: 0})
+    problems = mod.check(root)
+    assert len(problems) == 1 and "remove it" in problems[0]
+
+
+def test_c_a_line_fixed_by_naming_the_token_on_the_same_line_lowers_the_count(tmp_path):
+    mod = _load()
+    fixed = "import os\n" + BARE + "x = 1\n" + 'q = Path.home() / ".engram" / "y"  # ENGRAM_HOME\n'
+    root = _repo(tmp_path, {A: fixed}, baseline={A: 2})
+    problems = mod.check(root)
+    assert len(problems) == 1 and "lower it to 1" in problems[0]
+
+
+# -- C2 (d): dangling entries ------------------------------------------------
+
+def test_d_baseline_entry_naming_missing_file_is_red(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {"src/engram/x.py": "pass\n"}, baseline={"src/engram/tools/gone.py": 1})
     problems = mod.check(root)
     assert len(problems) == 1
     assert "dangling" in problems[0] and "src/engram/tools/gone.py" in problems[0]
 
 
-def test_rule5_allowlist_entry_naming_missing_file_is_red(tmp_path):
+def test_d_allowlist_entry_naming_missing_file_is_red(tmp_path):
     mod = _load()
+    mod.RESOLVER_LAYERS = [_layer("src/engram/resolver.py")]
     root = _repo(
-        tmp_path, {"src/engram/x.py": "pass\n"}, baseline=[], allowlist=["src/engram/resolver.py"]
+        tmp_path, {"src/engram/x.py": "pass\n"}, baseline={},
+        allowlist={"src/engram/resolver.py": _res()},
     )
     problems = mod.check(root)
     assert len(problems) == 1
     assert "dangling" in problems[0] and "allowlist" in problems[0]
 
 
-def test_allowlist_entry_exempts_an_existing_violating_file(tmp_path):
+def test_d_baseline_entry_naming_an_out_of_scope_file_is_red(tmp_path):
     mod = _load()
-    rel = "src/engram/tools/resolver.py"
-    root = _repo(tmp_path, {rel: 'p = Path.home() / ".engram"\n'}, baseline=[], allowlist=[rel])
+    root = _repo(tmp_path, {"tools/x.py": BARE, "src/engram/x.py": "pass\n"}, baseline={"tools/x.py": 1})
+    problems = mod.check(root)
+    assert len(problems) == 1 and "dangling" in problems[0]
+
+
+# -- C2 (e): growth against the base commit ---------------------------------
+
+def _two_commit_repo(tmp_path, base_baseline, head_baseline, head_files=None, base_allow=None,
+                     head_allow=None, base_files=None):
+    """Base commit with base_baseline (None = no baseline file); then a head
+    working tree with head_baseline. Returns (root, base_sha)."""
+    files = base_files or {A: TWO, B: TWO}
+    root = _repo(tmp_path, files, baseline=base_baseline, allowlist=base_allow)
+    base = _commit(root, "base")
+    for rel, text in (head_files or {}).items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text)
+    _write_baseline(root, head_baseline, head_allow)
+    _git(root, "add", "-A")
+    return root, base
+
+
+def test_e_new_baseline_entry_is_red_as_grew(tmp_path):
+    mod = _load()
+    root, base = _two_commit_repo(tmp_path, base_baseline={A: 2}, head_baseline={A: 2, B: 2})
+    problems = mod.check(root, base_sha=base)
+    assert len(problems) == 1
+    assert "grew" in problems[0] and B in problems[0]
+
+
+def test_e_a_higher_count_than_the_base_is_red_as_grew(tmp_path):
+    mod = _load()
+    root, base = _two_commit_repo(
+        tmp_path, base_baseline={A: 2, B: 2}, head_baseline={A: 3, B: 2}, head_files={A: THREE}
+    )
+    problems = mod.check(root, base_sha=base)
+    assert len(problems) == 1
+    assert "grew" in problems[0] and A in problems[0]
+
+
+def test_e_unchanged_baseline_is_green(tmp_path):
+    mod = _load()
+    both = {A: 2, B: 2}
+    root, base = _two_commit_repo(tmp_path, base_baseline=both, head_baseline=both)
+    assert mod.check(root, base_sha=base) == []
+
+
+def test_e_shrinking_baseline_is_green(tmp_path):
+    mod = _load()
+    root, base = _two_commit_repo(
+        tmp_path,
+        base_baseline={A: 2, B: 2},
+        head_baseline={A: 2},
+        head_files={B: "H = 'ENGRAM_HOME'\n"},
+    )
+    assert mod.check(root, base_sha=base) == []
+
+
+def test_e_a_lower_count_is_green(tmp_path):
+    mod = _load()
+    one = "import os\n" + BARE
+    root, base = _two_commit_repo(
+        tmp_path, base_baseline={A: 2, B: 2}, head_baseline={A: 1, B: 2}, head_files={A: one}
+    )
+    assert mod.check(root, base_sha=base) == []
+
+
+def test_e_seed_is_allowed_only_when_base_has_no_baseline_file(tmp_path):
+    mod = _load()
+    root, base = _two_commit_repo(tmp_path, base_baseline=None, head_baseline={A: 2, B: 2})
+    assert mod.check(root, base_sha=base) == []
+
+
+def test_e_unresolvable_base_ref_is_red_not_a_seed(tmp_path):
+    mod = _load()
+    root, _ = _two_commit_repo(tmp_path, base_baseline={A: 2, B: 2}, head_baseline={A: 2, B: 2})
+    problems = mod.check(root, base_sha="0" * 40)
+    assert problems and "base" in problems[0]
+
+
+def test_e_unreadable_base_baseline_is_red_not_a_seed(tmp_path):
+    mod = _load()
+    both = {A: 2, B: 2}
+    root, base = _two_commit_repo(tmp_path, base_baseline=both, head_baseline=both)
+    (root / mod.BASELINE_REL).write_text("{not json")
+    bad = _commit(root, "bad")
+    _write_baseline(root, both)
+    _git(root, "add", "-A")
+    assert mod.check(root, base_sha=bad)
+
+
+def test_e_schema1_base_lets_a_listed_file_take_its_true_count_once(tmp_path):
+    """The transition: a base baseline in schema 1 (a list of file names) is
+    read as {file: unknown}, so the first count for a listed file is free."""
+    mod = _load()
+    root, base = _two_commit_repo(tmp_path, base_baseline=[A], head_baseline={A: 2}, base_files={A: TWO})
+    assert mod.check(root, base_sha=base) == []
+
+
+def test_e_schema1_base_is_a_seed_for_the_line_level_baseline(tmp_path):
+    """The file-level base list cannot name the files that only the line-level
+    rule sees, so under a schema-1 base the head baseline is the seed of the
+    line-level ratchet: files absent from the old list are accepted once."""
+    mod = _load()
+    root, base = _two_commit_repo(tmp_path, base_baseline=[A], head_baseline={A: 2, B: 2})
+    assert mod.check(root, base_sha=base) == []
+
+
+def test_e_after_the_transition_growth_is_red_again(tmp_path):
+    """The schema-1 leniency is the transition only: once the base is schema 2
+    a new entry or a higher count is red."""
+    mod = _load()
+    root, base = _two_commit_repo(tmp_path, base_baseline={A: 2}, head_baseline={A: 2, B: 2})
+    assert any("grew" in p for p in mod.check(root, base_sha=base))
+
+
+def test_e_schema1_base_still_checks_the_head_against_the_tree(tmp_path):
+    """The transition skips the growth comparison, not rules (a)-(d)."""
+    mod = _load()
+    root, base = _two_commit_repo(tmp_path, base_baseline=[A], head_baseline={A: 9})
+    problems = mod.check(root, base_sha=base)
+    assert any("stale" in p for p in problems)
+
+
+# -- C2 (f): the allowlist ------------------------------------------------------
+
+def test_f_foreign_home_entry_with_a_reason_exempts_its_file(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {A: THREE}, baseline={}, allowlist={A: _fd()})
     assert mod.check(root) == []
+
+
+def test_f_resolver_entry_for_a_declared_layer_is_green_with_its_lines_baselined(tmp_path):
+    mod = _load()
+    mod.RESOLVER_LAYERS = [_layer(A)]
+    root = _repo(tmp_path, {A: THREE}, baseline={A: 3}, allowlist={A: _res()})
+    assert mod.check(root) == []
+
+
+# -- a resolver entry DECLARES a layer; it does not exempt the file -------------
+
+def test_f_resolver_file_with_other_violating_lines_is_green_at_its_exact_count(tmp_path):
+    mod = _load()
+    mod.RESOLVER_LAYERS = [_layer(A)]
+    root = _repo(tmp_path, {A: TWO}, baseline={A: 2}, allowlist={A: _res()})
+    assert mod.check(root) == []
+
+
+def test_f_resolver_file_does_not_hide_its_other_violating_lines(tmp_path):
+    """The same file with its baseline entry missing is RED: the lines count."""
+    mod = _load()
+    mod.RESOLVER_LAYERS = [_layer(A)]
+    root = _repo(tmp_path, {A: TWO}, baseline={}, allowlist={A: _res()})
+    problems = mod.check(root)
+    assert len(problems) == 1 and A in problems[0] and "2 line" in problems[0]
+
+
+def test_f_resolver_file_baselined_too_high_is_stale_lower_it(tmp_path):
+    mod = _load()
+    mod.RESOLVER_LAYERS = [_layer(A)]
+    root = _repo(tmp_path, {A: TWO}, baseline={A: 3}, allowlist={A: _res()})
+    problems = mod.check(root)
+    assert len(problems) == 1 and "lower it to 2" in problems[0]
+
+
+def test_f_resolver_file_with_a_new_violating_line_is_red(tmp_path):
+    mod = _load()
+    mod.RESOLVER_LAYERS = [_layer(A)]
+    root = _repo(tmp_path, {A: THREE}, baseline={A: 2}, allowlist={A: _res()})
+    assert len(mod.check(root)) == 1
+
+
+def test_f_resolver_file_fully_fixed_but_still_baselined_is_stale_remove_it(tmp_path):
+    mod = _load()
+    mod.RESOLVER_LAYERS = [_layer(A)]
+    root = _repo(tmp_path, {A: "x = 1\n"}, baseline={A: 2}, allowlist={A: _res()})
+    problems = mod.check(root)
+    assert len(problems) == 1 and "remove it" in problems[0]
+
+
+def test_f_resolver_file_may_be_in_both_lists_but_not_the_exempting_classes(tmp_path):
+    mod = _load()
+    mod.RESOLVER_LAYERS = [_layer(A)]
+    ok = _repo(tmp_path / "res", {A: TWO}, baseline={A: 2}, allowlist={A: _res()})
+    assert mod.check(ok) == []
+    for cls_entry in (_fd(), _sc()):
+        root = _repo(tmp_path / cls_entry["class"], {A: TWO}, baseline={A: 2}, allowlist={A: cls_entry})
+        assert any("both" in p and A in p for p in mod.check(root))
+
+
+@pytest.mark.parametrize(
+    "cls",
+    ["", "other", "Resolver", None, "foreign_home", "self-contained", "self_contained_no_lib"],
+)
+def test_f_class_outside_the_three_is_red(tmp_path, cls):
+    mod = _load()
+    root = _repo(tmp_path, {A: TWO}, baseline={}, allowlist={A: {"class": cls, "reason": "r"}})
+    problems = mod.check(root)
+    assert problems and any("class" in p and "self-contained-no-lib" in p for p in problems)
+
+
+def _sc(reason="a hook that by contract cannot import a resolver"):
+    return {"class": "self-contained-no-lib", "reason": reason}
+
+
+def test_f_the_classes_are_exactly_the_three():
+    mod = _load()
+    assert mod.CLASSES == ("resolver", "foreign-home", "self-contained-no-lib")
+
+
+def test_f_self_contained_no_lib_entry_with_a_reason_is_green_without_a_declared_layer(tmp_path):
+    """Only `resolver` is tied to RESOLVER_LAYERS; this class needs none."""
+    mod = _load()
+    assert A not in {l["path"] for l in mod.RESOLVER_LAYERS}
+    root = _repo(tmp_path, {A: THREE}, baseline={}, allowlist={A: _sc()})
+    assert mod.check(root) == []
+
+
+def test_f_self_contained_no_lib_has_no_cap(tmp_path):
+    mod = _load()
+    rels = [f"src/engram/hooks/h{i}.py" for i in range(len(mod.RESOLVER_LAYERS) + 3)]
+    root = _repo(tmp_path, {r: TWO for r in rels}, baseline={}, allowlist={r: _sc() for r in rels})
+    assert mod.check(root) == []
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "\n\t", None])
+def test_f_self_contained_no_lib_empty_reason_is_red(tmp_path, reason):
+    mod = _load()
+    root = _repo(tmp_path, {A: TWO}, baseline={}, allowlist={A: _sc(reason)})
+    assert any("reason" in p and A in p for p in mod.check(root))
+
+
+def test_f_self_contained_no_lib_entry_is_green_as_new_growth_under_a_schema2_base(tmp_path):
+    mod = _load()
+    root, base = _two_commit_repo(
+        tmp_path, base_baseline={A: 2, B: 2}, head_baseline={A: 2}, head_allow={B: _sc()}
+    )
+    assert mod.check(root, base_sha=base) == []
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "\n\t", None])
+def test_f_empty_reason_is_red(tmp_path, reason):
+    mod = _load()
+    root = _repo(tmp_path, {A: TWO}, baseline={}, allowlist={A: {"class": "foreign-home", "reason": reason}})
+    problems = mod.check(root)
+    assert problems and any("reason" in p for p in problems)
+
+
+def test_f_missing_reason_key_is_red(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {A: TWO}, baseline={}, allowlist={A: {"class": "foreign-home"}})
+    assert any("reason" in p for p in mod.check(root))
+
+
+def test_f_resolver_entry_for_an_undeclared_path_is_red(tmp_path):
+    mod = _load()
+    mod.RESOLVER_LAYERS = [_layer(A)]
+    root = _repo(tmp_path, {A: TWO, B: TWO}, baseline={}, allowlist={B: _res()})
+    problems = mod.check(root)
+    assert any(B in p and "no declared layer" in p for p in problems)
+
+
+def test_f_one_resolver_entry_per_declared_layer_is_green(tmp_path):
+    mod = _load()
+    mod.RESOLVER_LAYERS = [_layer(A, "tools"), _layer(B, "hooks")]
+    root = _repo(tmp_path, {A: TWO, B: TWO}, baseline={A: 2, B: 2}, allowlist={A: _res(), B: _res()})
+    assert mod.check(root) == []
+
+
+def test_f_a_resolver_copy_beyond_the_declared_layers_is_red(tmp_path):
+    """r1 (undeclared path) and r2 (more entries than layers) both speak."""
+    mod = _load()
+    mod.RESOLVER_LAYERS = [_layer(A, "tools"), _layer(B, "hooks")]
+    root = _repo(
+        tmp_path, {A: TWO, B: TWO, C: TWO}, baseline={},
+        allowlist={A: _res(), B: _res(), C: _res()},
+    )
+    problems = mod.check(root)
+    assert any(C in p and "no declared layer" in p for p in problems)
+    assert any("3 resolver" in p and "2 declared layer" in p for p in problems)
+
+
+def test_f_the_default_declared_layers_are_the_canonical_one_only():
+    mod = _load()
+    assert mod.RESOLVER_LAYERS == [
+        {"path": "src/engram/tools/_owner_read.py", "layer": "tools", "parity_pinned": True}
+    ]
+    assert not hasattr(mod, "MAX_RESOLVER_ENTRIES")
+
+
+@pytest.mark.parametrize(
+    "layer",
+    [
+        {"path": A, "layer": "tools", "parity_pinned": False},
+        {"path": A, "layer": "tools", "parity_pinned": 0},
+        {"path": A, "layer": "tools"},
+        {"path": A, "parity_pinned": True},
+        {"layer": "tools", "parity_pinned": True},
+        {"path": "", "layer": "tools", "parity_pinned": True},
+        {"path": A, "layer": "", "parity_pinned": True},
+        "src/engram/tools/a.py",
+    ],
+    ids=["unpinned", "pinned-0", "no-pin-key", "no-layer-key", "no-path-key", "empty-path",
+         "empty-layer", "not-a-dict"],
+)
+def test_r3_a_layer_declared_without_its_parity_pin_is_refused(tmp_path, layer):
+    mod = _load()
+    mod.RESOLVER_LAYERS = [layer]
+    root = _repo(tmp_path, {A: "x = 1\n"}, baseline={})
+    problems = mod.check(root)
+    assert problems and any("RESOLVER_LAYERS" in p for p in problems)
+
+
+def test_r4_duplicate_layer_paths_are_refused(tmp_path):
+    mod = _load()
+    mod.RESOLVER_LAYERS = [_layer(A, "tools"), _layer(A, "hooks")]
+    root = _repo(tmp_path, {A: "x = 1\n"}, baseline={})
+    assert any("RESOLVER_LAYERS" in p and "duplicate" in p for p in mod.check(root))
+
+
+def test_f_one_resolver_plus_foreign_homes_is_green(tmp_path):
+    mod = _load()
+    mod.RESOLVER_LAYERS = [_layer(A)]
+    root = _repo(
+        tmp_path, {A: TWO, B: TWO, C: TWO}, baseline={A: 2}, allowlist={A: _res(), B: _fd(), C: _fd()}
+    )
+    assert mod.check(root) == []
+
+
+def test_f_a_file_in_both_baseline_and_allowlist_is_red(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {A: TWO}, baseline={A: 2}, allowlist={A: _fd()})
+    problems = mod.check(root)
+    assert problems and any("both" in p and A in p for p in problems)
+
+
+def test_f_a_new_resolver_entry_for_a_declared_layer_is_green_under_a_schema2_base(tmp_path):
+    """The future resolver PR must not be red by construction; growth of the
+    allowlist is visible in review."""
+    mod = _load()
+    mod.RESOLVER_LAYERS = [_layer(B)]
+    root, base = _two_commit_repo(
+        tmp_path, base_baseline={A: 2, B: 2}, head_baseline={A: 2, B: 2}, head_allow={B: _res()}
+    )
+    assert mod.check(root, base_sha=base) == []
+
+
+def test_f_a_new_resolver_entry_for_an_undeclared_path_is_red_under_a_schema2_base(tmp_path):
+    mod = _load()
+    mod.RESOLVER_LAYERS = [_layer(A)]
+    root, base = _two_commit_repo(
+        tmp_path, base_baseline={A: 2, B: 2}, head_baseline={A: 2}, head_allow={B: _res()}
+    )
+    problems = mod.check(root, base_sha=base)
+    assert any(B in p and "no declared layer" in p for p in problems)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"class": "foreign-home", "reason": ""},
+        {"class": "foreign-home", "reason": "   "},
+        {"class": "resolver", "reason": ""},
+        {"class": "nope", "reason": "r"},
+    ],
+    ids=["fh-empty", "fh-blank", "res-empty", "unknown-class"],
+)
+def test_f_a_new_invalid_entry_is_red_under_a_schema2_base(tmp_path, entry):
+    mod = _load()
+    root, base = _two_commit_repo(
+        tmp_path, base_baseline={A: 2, B: 2}, head_baseline={A: 2}, head_allow={B: entry}
+    )
+    problems = mod.check(root, base_sha=base)
+    assert any(B in p and ("class" in p or "reason" in p) for p in problems)
+
+
+def test_f_allowlist_growth_with_a_foreign_home_is_green(tmp_path):
+    mod = _load()
+    root, base = _two_commit_repo(
+        tmp_path, base_baseline={A: 2, B: 2}, head_baseline={A: 2}, head_allow={B: _fd()}
+    )
+    assert mod.check(root, base_sha=base) == []
+
+
+# -- an exempting entry must exempt something ----------------------------------
+
+CLEAN = "import os\nH = os.environ['ENGRAM_HOME']\n"
+
+
+@pytest.mark.parametrize("entry", [_fd(), _sc()], ids=["foreign-home", "self-contained-no-lib"])
+def test_f_exempting_entry_for_a_clean_file_is_red(tmp_path, entry):
+    mod = _load()
+    root = _repo(tmp_path, {A: CLEAN}, baseline={}, allowlist={A: entry})
+    problems = mod.check(root)
+    assert len(problems) == 1
+    assert "exempts nothing" in problems[0] and "remove it" in problems[0] and A in problems[0]
+
+
+@pytest.mark.parametrize("entry", [_fd(), _sc()], ids=["foreign-home", "self-contained-no-lib"])
+def test_f_exempting_entry_for_a_file_with_violating_lines_is_green(tmp_path, entry):
+    mod = _load()
+    root = _repo(tmp_path, {A: TWO}, baseline={}, allowlist={A: entry})
+    assert mod.check(root) == []
+
+
+def test_f_exempting_entry_goes_stale_when_the_last_violating_line_is_fixed(tmp_path):
+    mod = _load()
+    fixed = "import os\n" + 'p = Path.home() / ".engram"  # ENGRAM_HOME\n'
+    root = _repo(tmp_path, {A: fixed}, baseline={}, allowlist={A: _fd()})
+    assert any("exempts nothing" in p for p in mod.check(root))
+
+
+def test_f_resolver_entry_for_a_clean_declared_layer_file_is_green(tmp_path):
+    """A resolver entry is a declaration, not an exemption: the file may be clean."""
+    mod = _load()
+    mod.RESOLVER_LAYERS = [_layer(A)]
+    root = _repo(tmp_path, {A: CLEAN}, baseline={}, allowlist={A: _res()})
+    assert mod.check(root) == []
+
+
+def test_f_the_old_allowlist_must_be_empty_rule_is_gone(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {A: TWO}, baseline={}, allowlist={A: _fd()})
+    assert mod.check(root) == []
+
+
+# -- C2 (g): schema ------------------------------------------------------------
+
+def test_g_schema1_on_the_head_is_red_migrate(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {A: TWO}, baseline=[A])
+    problems = mod.check(root)
+    assert problems and any("schema 2" in p and "migrate" in p for p in problems)
 
 
 def test_missing_baseline_file_is_red_without_a_base_ref(tmp_path):
@@ -306,192 +960,83 @@ def test_missing_baseline_file_is_red_without_a_base_ref(tmp_path):
 
 def test_malformed_baseline_is_red(tmp_path):
     mod = _load()
-    root = _repo(tmp_path, {"src/engram/x.py": "pass\n"}, baseline=[])
+    root = _repo(tmp_path, {"src/engram/x.py": "pass\n"}, baseline={})
     (root / mod.BASELINE_REL).write_text("{not json")
     assert mod.check(root)
 
 
-# -- rule 4: the baseline cannot grow ---------------------------------------
-
-def _two_commit_repo(tmp_path, base_baseline, head_baseline, head_files=None):
-    """Base commit with base_baseline (None = no baseline file); then a head
-    working tree with head_baseline. Returns (root, base_sha)."""
-    files = {
-        "src/engram/tools/a.py": 'p = Path.home() / ".engram"\n',
-        "src/engram/tools/b.py": 'p = Path.home() / ".engram"\n',
-    }
-    root = _repo(tmp_path, files, baseline=base_baseline)
-    base = _commit(root, "base")
-    for rel, text in (head_files or {}).items():
-        (root / rel).parent.mkdir(parents=True, exist_ok=True)
-        (root / rel).write_text(text)
-    _write_baseline(root, head_baseline)
-    _git(root, "add", "-A")
-    return root, base
-
-
-def test_rule4_baseline_growth_is_red(tmp_path):
+@pytest.mark.parametrize("bad", [-1, "3", 1.5, True, None])
+def test_non_integer_or_negative_count_is_red(tmp_path, bad):
     mod = _load()
-    root, base = _two_commit_repo(
-        tmp_path,
-        base_baseline=["src/engram/tools/a.py"],
-        head_baseline=["src/engram/tools/a.py", "src/engram/tools/b.py"],
+    root = _repo(tmp_path, {A: TWO}, baseline={})
+    (root / mod.BASELINE_REL).write_text(
+        json.dumps({"schema": 2, "baseline": {A: bad}, "allowlist": {}})
     )
-    problems = mod.check(root, base_sha=base)
-    assert len(problems) == 1
-    assert "grew" in problems[0] and "src/engram/tools/b.py" in problems[0]
+    assert mod.check(root)
 
 
-def test_rule4_unchanged_baseline_is_green(tmp_path):
-    mod = _load()
-    both = ["src/engram/tools/a.py", "src/engram/tools/b.py"]
-    root, base = _two_commit_repo(tmp_path, base_baseline=both, head_baseline=both)
-    assert mod.check(root, base_sha=base) == []
+# -- the real tree: the ratchet is green, nothing about how many ----------------
 
-
-def test_rule4_shrinking_baseline_is_green(tmp_path):
-    mod = _load()
-    both = ["src/engram/tools/a.py", "src/engram/tools/b.py"]
-    root, base = _two_commit_repo(
-        tmp_path,
-        base_baseline=both,
-        head_baseline=["src/engram/tools/a.py"],
-        head_files={"src/engram/tools/b.py": "H = 'ENGRAM_HOME'\n"},
-    )
-    assert mod.check(root, base_sha=base) == []
-
-
-def test_rule4_seed_is_allowed_only_when_base_has_no_baseline_file(tmp_path):
-    mod = _load()
-    both = ["src/engram/tools/a.py", "src/engram/tools/b.py"]
-    root, base = _two_commit_repo(tmp_path, base_baseline=None, head_baseline=both)
-    assert mod.check(root, base_sha=base) == []
-
-
-def test_rule4_unresolvable_base_ref_is_red_not_a_seed(tmp_path):
-    mod = _load()
-    both = ["src/engram/tools/a.py", "src/engram/tools/b.py"]
-    root, _ = _two_commit_repo(tmp_path, base_baseline=both, head_baseline=both)
-    problems = mod.check(root, base_sha="0" * 40)
-    assert problems and "base" in problems[0]
-
-
-def test_rule4_unreadable_base_baseline_is_red_not_a_seed(tmp_path):
-    mod = _load()
-    both = ["src/engram/tools/a.py", "src/engram/tools/b.py"]
-    root, base = _two_commit_repo(tmp_path, base_baseline=both, head_baseline=both)
-    # a base commit whose baseline file is not valid JSON
-    (root / mod.BASELINE_REL).write_text("{not json")
-    bad = _commit(root, "bad")
-    _write_baseline(root, both)
-    _git(root, "add", "-A")
-    problems = mod.check(root, base_sha=bad)
-    assert problems
-
-
-def test_rule4_does_not_let_allowlist_growth_hide_in_baseline_check(tmp_path):
-    """An allowlist entry added on the head is allowed (the resolver PR adds
-    its own), and is not mistaken for baseline growth."""
-    mod = _load()
-    root = _repo(
-        tmp_path,
-        {"src/engram/tools/r.py": 'p = Path.home() / ".engram"\n'},
-        baseline=[],
-    )
-    base = _commit(root, "base")
-    _write_baseline(root, [], allowlist=["src/engram/tools/r.py"])
-    _git(root, "add", "-A")
-    assert mod.check(root, base_sha=base) == []
-
-
-# -- the real tree ----------------------------------------------------------
-
-THE_13 = [
-    "src/engram/engram_walguard.py",
-    "src/engram/skills/claude/engram-health-exam/SKILL.md",
-    "src/engram/skills/claude/engram-sleep/SKILL.md",
-    "src/engram/skills/claude/engram-upgrade/SKILL.md",
-    "src/engram/tools/backup_knowledge_db.py",
-    "src/engram/tools/cohort_dispatch.py",
-    "src/engram/tools/dream_lottery.py",
-    "src/engram/tools/migrate_person_nodes.py",
-    "src/engram/tools/migrate_prediction_pairing_edges.py",
-    "src/engram/tools/migrate_stranded_supported_by.py",
-    "src/engram/tools/monitor-supervisor.py",
-    "src/engram/tools/tripwire.py",
-    "src/engram/viz/server.py",
-]
-
-
-# All 13 of the issue's files were fixed after this gate was written, so none is a
-# violator or baselined any more (the control below is vacuous once `still` is empty;
-# the "fixed file stays out of the baseline" loop is what keeps it meaningful). Two read
-# ENGRAM_HOME since #3869; three more in PR 2 of #3863 (the walguard remedy text, the
-# health-exam and upgrade skills); one since #3872 (the knowledge.db backup tool); six
-# more in PR 3a (the tools sweep); viz/server.py in PR 3b (its docstring only).
-FIXED_SINCE_THE_13 = {
-    "src/engram/skills/claude/engram-sleep/SKILL.md": "reads ENGRAM_HOME since #3869",
-    "src/engram/tools/cohort_dispatch.py": "reads ENGRAM_HOME since #3869",
-    "src/engram/engram_walguard.py": "remedy text uses ${ENGRAM_HOME:-...} (PR 2 of #3863)",
-    "src/engram/skills/claude/engram-health-exam/SKILL.md": "uses ${ENGRAM_HOME:-...} (PR 2 of #3863)",
-    "src/engram/skills/claude/engram-upgrade/SKILL.md": "uses ${ENGRAM_HOME:-...} (PR 2 of #3863)",
-    "src/engram/tools/backup_knowledge_db.py": "reads ENGRAM_HOME since #3872",
-    "src/engram/viz/server.py": "docstring names ENGRAM_HOME (PR 3b of #3863); viz/agents.py DEFAULT_DB is still hard-coded, a design question",
-    "src/engram/tools/dream_lottery.py": "the one resolver (PR 3a of #3863)",
-    "src/engram/tools/migrate_person_nodes.py": "the one resolver (PR 3a of #3863)",
-    "src/engram/tools/migrate_prediction_pairing_edges.py": "the one resolver (PR 3a of #3863)",
-    "src/engram/tools/migrate_stranded_supported_by.py": "the one resolver (PR 3a of #3863)",
-    "src/engram/tools/monitor-supervisor.py": "the one resolver (PR 3a of #3863)",
-    "src/engram/tools/tripwire.py": "the one resolver (PR 3a of #3863)",
-}
-
-
-def test_real_tree_is_green_with_the_checked_in_baseline():
+def test_real_tree_ratchet_is_green():
     mod = _load()
     assert mod.check(REPO) == []
 
 
-def test_scanner_is_live_on_the_real_tree():
-    """Vacuous-green guard: a table that matches nothing must not pass."""
-    mod = _load()
-    v = mod.violations(REPO)
-    assert len(v) >= len(THE_13) - len(FIXED_SINCE_THE_13)
+# The real allowlist is PINNED: adding or removing an entry is a deliberate act
+# that edits this test in the same commit (PR 6b will). The gate checks the
+# SHAPE of an entry; only this pin makes a new, unjustified entry visible.
+REAL_ALLOWLIST = {
+    "src/engram/tools/grant_viz_operator_acl.py": "foreign-home",
+}
 
 
-def test_the_13_named_files_are_all_violators_and_all_baselined():
-    mod = _load()
-    v = mod.violations(REPO)
-    baseline, _ = mod.load_baseline(REPO)
-    assert set(FIXED_SINCE_THE_13) <= set(THE_13)
-    for f in FIXED_SINCE_THE_13:
-        assert f not in baseline, f"fixed file must stay out of the baseline: {f}"
-    still = [f for f in THE_13 if f not in FIXED_SINCE_THE_13]
-    assert len(still) == 0
-    for f in still:
-        assert f in v, f"positive control not detected: {f}"
-        assert f in baseline, f"positive control not in baseline: {f}"
+def _real_allowlist():
+    return json.loads((REPO / "tools" / "home_path_baseline.json").read_text())["allowlist"]
 
 
-def test_real_baseline_is_sorted_and_duplicate_free():
-    mod = _load()
-    raw = json.loads((REPO / mod.BASELINE_REL).read_text())
-    assert raw["baseline"] == sorted(set(raw["baseline"]))
+def test_real_allowlist_keys_are_exactly_the_pinned_set():
+    assert set(_real_allowlist()) == set(REAL_ALLOWLIST)
 
 
-def test_real_allowlist_is_empty():
-    """No placeholder for the future resolver (Borges, #3863): the PR that
-    creates the resolver adds its own entry in the same commit."""
-    mod = _load()
-    _, allow = mod.load_baseline(REPO)
-    assert allow == set()
+def test_real_allowlist_classes_are_the_pinned_ones():
+    real = _real_allowlist()
+    assert {k: real[k]["class"] for k in real} == REAL_ALLOWLIST
 
+
+def test_real_allowlist_entries_all_carry_a_reason():
+    for k, entry in _real_allowlist().items():
+        assert isinstance(entry.get("reason"), str) and entry["reason"].strip(), k
+
+
+# -- the CLI --------------------------------------------------------------------
 
 def test_cli_exit_codes(tmp_path):
     mod = _load()
-    root = _repo(tmp_path, {"src/engram/tools/a.py": 'p = Path.home() / ".engram"\n'}, baseline=[])
+    root = _repo(tmp_path, {A: TWO}, baseline={})
     assert mod.main(["--root", str(root)]) == 1
-    _write_baseline(root, ["src/engram/tools/a.py"])
+    _write_baseline(root, {A: 2})
     assert mod.main(["--root", str(root)]) == 0
+
+
+def test_cli_report_lists_line_numbers_and_counts(tmp_path, capsys):
+    mod = _load()
+    root = _repo(tmp_path, {A: THREE}, baseline={})
+    assert mod.main(["--root", str(root), "--report"]) == 0
+    out = capsys.readouterr().out
+    assert A in out
+    assert re.search(rf"{re.escape(A)}\t3\b", out), out
+    for lineno in (2, 4, 5):
+        assert re.search(rf"^\s+{lineno}\t", out, re.M), (lineno, out)
+
+
+def test_cli_seed_writes_schema2_counts_and_refuses_to_overwrite(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {A: THREE, B: "x = 1\n"})
+    assert mod.main(["--root", str(root), "--seed"]) == 0
+    doc = json.loads((root / mod.BASELINE_REL).read_text())
+    assert doc == {"schema": 2, "baseline": {A: 3}, "allowlist": {}}
+    assert mod.main(["--root", str(root)]) == 0
+    assert mod.main(["--root", str(root), "--seed"]) == 1
 
 
 # -- the CI step is pinned (colleague review of #3870: four mutants of the
@@ -515,8 +1060,6 @@ def _gate_step_text():
 
 
 def test_ci_step_runs_the_gate_with_a_merge_base_sha():
-    import re
-
     step = _gate_step_text()
     assert re.search(
         r'^\s*BASE_SHA=\$\(git merge-base "origin/[^"]+" HEAD\)\s*$', step, re.M

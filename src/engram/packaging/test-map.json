@@ -345,7 +345,7 @@
     {
       "path_prefix_or_glob": "tools/home_path_gate.py",
       "test_globs": ["tests/test_home_path_gate.py"],
-      "note": "standalone stdlib CLI (not import-reachable); dedicated test plants each enumerated hard-coded-home spelling in scratch git repos and checks the baseline rules (new violator, stale, dangling, growth vs a base commit, empty allowlist) plus the real-tree controls (#3863)"
+      "note": "standalone stdlib CLI (not import-reachable); dedicated test plants each enumerated hard-coded-home spelling in scratch git repos (line-level: the token on another line does not rescue) and checks the schema-2 baseline rules (new violator, count above/below, stale, dangling, growth vs a base commit, classed allowlist, schema 1 on the head); the only real-tree test asserts the ratchet is green (#3863)"
     },
     {
       "path_prefix_or_glob": "tools/cohort_dispatch.py",

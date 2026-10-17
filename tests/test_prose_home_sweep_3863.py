@@ -627,17 +627,6 @@ def test_c5_baseline_is_exactly_the_base_minus_the_23_before_pr_3a_lands():
     assert len(_baseline_at_head()) == 47 - 23 == 24
 
 
-def test_c5_baseline_after_pr_3a_is_a_subset_of_what_3a_left_minus_the_23():
-    if not _3a_is_ancestor():
-        pytest.skip("PR 3a is not in the history yet; the exact-count test covers this world")
-    r = _git("show", f"{PR_3A_COMMIT}:tools/home_path_baseline.json")
-    assert r.returncode == 0, r.stderr
-    after_3a = set(json.loads(r.stdout)["baseline"])
-    head = _baseline_at_head()
-    assert head <= after_3a - {SRC + f for f in FILES}, sorted(head - (after_3a - {SRC + f for f in FILES}))
-    assert not head & {SRC + f for f in FILES}
-
-
 def test_c5_baseline_diff_from_dev_is_exactly_our_23():
     """Holds in every world: what we take out of the baseline, measured from where we
     forked from dev, is exactly those of our 23 that dev still baselines, and none of
@@ -671,14 +660,6 @@ def _baseline_at_head():
 def test_c5_none_of_the_23_is_baselined_any_more():
     still = sorted(SRC + f for f in FILES if SRC + f in _baseline_at_head())
     assert not still, f"swept files still in tools/home_path_baseline.json: {still}"
-
-
-def test_c5_head_baseline_only_shrank_from_the_base():
-    r = _git("show", f"{BASE}:tools/home_path_baseline.json")
-    if r.returncode != 0:
-        pytest.skip("base commit not available")
-    base = set(json.loads(r.stdout)["baseline"])
-    assert _baseline_at_head() <= base
 
 
 def test_c5_the_23_are_the_base_baseline_minus_the_later_prs():

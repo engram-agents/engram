@@ -999,13 +999,16 @@ jobs:
       # ── 7c-3. home-path gate (#3863) ───────────────────────────────────────
       # Lei's ruling (2026-10-17): the deployment uses ENGRAM_HOME wherever
       # possible, since the install allows a custom engram folder. This fails a
-      # PR that adds a NEW hard-coded ENGRAM home path (`~/.engram`,
+      # PR that adds a hard-coded ENGRAM home path (`~/.engram`,
       # `Path.home() / ".engram"`, `$HOME/.engram`, ...) to a tracked src/engram
-      # file that never reads ENGRAM_HOME. Today's violators sit in
-      # tools/home_path_baseline.json, which may only shrink: a fixed file must
-      # leave it (stale entry = red), and --base-sha makes a head entry absent
-      # from the merge-base's baseline red (the PR that creates the baseline is
-      # the only seed). BLOCKING, stdlib only (git + python, well under a
+      # line that does not itself name ENGRAM_HOME or call engram_home() (the
+      # gate is LINE-level: the token on another line does not count). Today's
+      # violating lines sit in tools/home_path_baseline.json as per-file counts
+      # that may only shrink: a fixed line must lower its count (a lower count or
+      # a zero entry = red "stale"), and --base-sha makes a higher count or a new
+      # entry red (the PR that creates the baseline is the only seed; a schema-1
+      # base is the one-time transition). The allowlist (classed, with reasons)
+      # holds one resolver at most plus foreign-home files. BLOCKING, stdlib only (git + python, well under a
       # second). Same merge-base line as test-id-set-check below. On a pull_request
       # run HEAD is the merge commit, so the merge-base is the base branch's tip
       # as of that merge ref, not the PR's branch point: a stricter, more current
