@@ -196,14 +196,21 @@ def _owner_applies(db_path: Path) -> bool:
     return owner_read.flag_applies(_owner_spec(), db_path)
 
 
-def _fetch_nodes(db_path: Path, node_ids: list[str]) -> list[dict]:
+def _fetch_nodes(db_path: Path, node_ids: list[str], use_owner: bool | None = None) -> list[dict]:
     """Read node content from ENGRAM SQLite. Read-only (the direct path opens mode=ro).
 
     Behind engramd.cohort_dispatch_reads_via_owner (default OFF) the read goes to the engramd owner when
     `db_path` is this home's store. Flag ON and the owner down, refusing or answering malformed RAISES
-    CohortOwnerReadError: never `[]`, never a partial list, never a direct fallback."""
+    CohortOwnerReadError: never `[]`, never a partial list, never a direct fallback.
+
+    `use_owner`: None (default) reads the flag here, once. A caller that has already decided (verify-in
+    needs the answer for its own db_path.exists() precondition) passes that decision so the flag is read
+    ONCE per run (#3871); then this function does not read it. The caller already decided, via
+    `owner_read.flag_applies` (which also applies the this-home's-store rule): never pass a value computed
+    any other way."""
     spec = _owner_spec()
-    use_owner = owner_read.flag_applies(spec, db_path)
+    if use_owner is None:
+        use_owner = owner_read.flag_applies(spec, db_path)
     if use_owner:
         owner_read.ping(spec)  # the owner's answer replaces the db_path.exists() precondition
     elif not db_path.exists():
@@ -707,7 +714,7 @@ def cmd_verify_in(args: argparse.Namespace) -> int:
     if all_ids_seen and (owner_serves or db_path.exists()):
         id_list = list(all_ids_seen.keys())
         try:
-            db_nodes = _fetch_nodes(db_path, id_list)
+            db_nodes = _fetch_nodes(db_path, id_list, use_owner=owner_serves)
         except (FileNotFoundError, CohortOwnerReadError) as exc:
             # ONE named failure. An owner that could not answer must not become "every id is absent":
             # the per-node "not found in DB" checks below only run on a real answer.
