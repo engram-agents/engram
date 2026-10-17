@@ -40,7 +40,7 @@ State them explicitly: "This session is anchored on: [goal IDs and summaries]"
 ### 3. Initialize scratch log
 
 ```bash
-cat > ~/.engram/loop-scratch.md << 'SCRATCH'
+cat > "${ENGRAM_HOME:-$HOME/.engram}"/loop-scratch.md << 'SCRATCH'
 # Meta-Loop Scratch Log — $(date -I)
 
 ## Session Goals
@@ -52,7 +52,7 @@ awkwardness, missing features, confusing behavior. Each entry: one line, timesta
 what happened. This list feeds the final friction-design iteration.
 
 SCRATCH
-sed -i "s/\$(date -I)/$(date -I)/" ~/.engram/loop-scratch.md
+sed -i "s/\$(date -I)/$(date -I)/" "${ENGRAM_HOME:-$HOME/.engram}"/loop-scratch.md
 ```
 
 The scratch log accumulates decision forks, friction points, surprises, and modality switches across the entire session. It feeds the session briefing at the end. The dedicated **ENGRAM Friction Log** section collects tool/workflow friction throughout — this is the input for the mandatory friction-design iteration at session end.
@@ -108,7 +108,7 @@ Run one iteration in the chosen modality. Follow the relevant specialized skill'
 
 **Key discipline:** Write to ENGRAM as you go. Every finding, every decision, every rejected approach. Compaction can fire at any time in loop mode — only what's in ENGRAM survives.
 
-**Primary-source discipline (research modality).** AI-aggregator surfaces (EmergentMind, LLM-generated surveys, auto-summary blogs) are discovery tools, not citable evidence. Always track to primary papers before recording observations — other agents building those pages lack ENGRAM's provenance/contradiction discipline, so their claims inherit hallucination risk. Known-unreliable domains are listed in `~/.engram/config.json`'s `yellow_domains`; `engram_add_observation` surfaces a `yellow_card_warning` when they're cited. The compound cost of a fabricated root claim across a meta-loop's 50 iterations is what this discipline prevents.
+**Primary-source discipline (research modality).** AI-aggregator surfaces (EmergentMind, LLM-generated surveys, auto-summary blogs) are discovery tools, not citable evidence. Always track to primary papers before recording observations — other agents building those pages lack ENGRAM's provenance/contradiction discipline, so their claims inherit hallucination risk. Known-unreliable domains are listed in `~/.engram/config.json`'s `yellow_domains` (under `$ENGRAM_HOME`, default `~/.engram`); `engram_add_observation` surfaces a `yellow_card_warning` when they're cited. The compound cost of a fabricated root claim across a meta-loop's 50 iterations is what this discipline prevents.
 
 **Yellow-card incident recording.** When primary-contact reveals a mismatch between an aggregator's claim and its primary sources — fabricated formalism, misattributed quote, invented citation, or a claim absent from the papers the aggregator supposedly synthesized — record the mismatch as a **yellow-card incident observation**. One mismatch = one observation; cite the aggregator URL as the failing source and the primary as the truth-check. Do this even if the domain is already yellow-carded — the incident log is how per-domain failure-rate knowledge compounds across sessions. Once accumulated incidents for a domain cross a threshold (schema + threshold TBD as a separate design task), the domain graduates to **RED-CARD** and is banned as independent evidence: observations rooted there will require separate corroboration from outside the domain before being trusted. Across a 50-iteration meta-loop, skipping incident records means every later iteration re-discovers the same failure from scratch.
 
@@ -217,14 +217,14 @@ Whether stopped by hard limit, user return, step-back decision, satisfaction, **
 Run one last consolidation round to digest any remaining raw material.
 
 ### 2. Session briefing
-Generate the session briefing following the template at `~/.engram/reports/SESSION_BRIEFING_TEMPLATE.md`.
+Generate the session briefing following the template at `~/.engram/reports/SESSION_BRIEFING_TEMPLATE.md` (under `$ENGRAM_HOME`, default `~/.engram`).
 
-Write it to `~/.engram/reports/briefing_YYYY-MM-DD_HHMMSS.md`.
+Write it to `~/.engram/reports/briefing_YYYY-MM-DD_HHMMSS.md` (under `$ENGRAM_HOME`, default `~/.engram`).
 
-The scratch log (`~/.engram/loop-scratch.md`) provides the raw material for decision forks, friction points, and modality history. The briefing synthesizes this into {{USER_NAME}}'s 2-3 minute scan format.
+The scratch log (`~/.engram/loop-scratch.md`, under `$ENGRAM_HOME`, default `~/.engram`) provides the raw material for decision forks, friction points, and modality history. The briefing synthesizes this into {{USER_NAME}}'s 2-3 minute scan format.
 
 ### 3. Verification report
-Write a detailed verification report to `~/.engram/reports/meta_loop_YYYY-MM-DD_HHMMSS.md`.
+Write a detailed verification report to `~/.engram/reports/meta_loop_YYYY-MM-DD_HHMMSS.md` (under `$ENGRAM_HOME`, default `~/.engram`).
 
 **Contents:**
 1. **Session metadata** — date, iterations, modality distribution, compactions, goals anchored
@@ -242,7 +242,7 @@ Remove the loop marker per **engram-loop** Step 3.
 
 ```bash
 # Archive the scratch log — raw session data is a goldmine for loop-diagnose and calibration
-mv ~/.engram/loop-scratch.md ~/.engram/reports/scratch_$(date +%Y-%m-%d_%H%M%S).md 2>/dev/null || true
+mv "${ENGRAM_HOME:-$HOME/.engram}"/loop-scratch.md "${ENGRAM_HOME:-$HOME/.engram}"/reports/scratch_$(date +%Y-%m-%d_%H%M%S).md 2>/dev/null || true
 ```
 
 ### 5. Checkpoint
@@ -253,8 +253,8 @@ engram_checkpoint(
 ```
 
 Tell the user:
-- "Session briefing: `~/.engram/reports/briefing_<filename>`"
-- "Verification report: `~/.engram/reports/meta_loop_<filename>`"
+- "Session briefing: `~/.engram/reports/briefing_<filename>`" (under `$ENGRAM_HOME`, default `~/.engram`)
+- "Verification report: `~/.engram/reports/meta_loop_<filename>`" (under `$ENGRAM_HOME`, default `~/.engram`)
 
 ---
 

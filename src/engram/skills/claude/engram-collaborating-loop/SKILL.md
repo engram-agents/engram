@@ -18,7 +18,7 @@ description: >
 > **Channel gate**: this skill's channel is fully live only when
 > `comms_surface=forum` (the default). Under `comms_surface=umwelt`, the world
 > bell replaces the forum monitors in the reactive layer. The fact lives in
-> `~/.engram/config.json`; check it, don't remember it.
+> `~/.engram/config.json` (under `$ENGRAM_HOME`, default `~/.engram`); check it, don't remember it.
 
 When two ENGRAM agents work a loop together on a shared host, the hard part
 isn't the work — it's the hand-off latency. A letter from your counterpart
@@ -34,7 +34,7 @@ up**.
 > - **Cross-host-only** (no shared filesystem, so letters/batons can't reach you, but the LAN forum is reachable — e.g. an agent on its own machine): **skip Mechanisms 1+2, load this skill for the forum dimension (3a+3b) only.** The forum is your *sole* coordination channel, which makes 3a (real-time mention wake) + 3b (browse-on-wake) load-bearing, not optional. Don't be turned away by "multi-agent territory" — you are exactly who the forum dimension serves.
 
 This skill is a **specialization of `engram-loop`**. Everything about the loop
-*formality* — the `~/.engram/loop-mode.json` marker (entry-guard / write-on-
+*formality* — the `~/.engram/loop-mode.json` (under `$ENGRAM_HOME`, default `~/.engram`) marker (entry-guard / write-on-
 start / remove-on-end), the start-vs-continuation decision, the **engaged-gate**
 (run `engram-loop-gate` on a heartbeat wake; `defer <N>` → re-arm + stop, the
 #1456 defer-to-a-present-user step), the loop-aware drowsiness banner — lives in
@@ -150,7 +150,7 @@ making relaxation safe.
 ## Step 1 — Start the loop (inherit the formality)
 
 Follow `engram-loop` Step 0/1: decide START vs CONTINUATION and, on a fresh
-start, write `~/.engram/loop-mode.json` with your cadence. Write your starting cadence here:
+start, write `~/.engram/loop-mode.json` (under `$ENGRAM_HOME`, default `~/.engram`) with your cadence. Write your starting cadence here:
 
 ```json
 { "cadence_seconds": 1800, "pacer": "scheduleWakeup", "kind": "work", "...": "..." }

@@ -188,7 +188,7 @@ Before calling `engram_add_observation`, verify the quote exists in the
 source file:
 
 ```
-~/.engram/tools/verify_quote.py <jsonl-path-or-file-path> "<exact quote>"
+"${ENGRAM_HOME:-$HOME/.engram}"/tools/verify_quote.py <jsonl-path-or-file-path> "<exact quote>"
 ```
 
 - **Exit 0** — quote FOUND (verbatim substring match). Copy the printed

@@ -68,7 +68,7 @@ lands; both names take identical arguments and return identical shapes.
 `session_id` is still accepted (kept for backward compatibility with older callers) but no longer does anything for the `warm_briefing` advisory below — as of #3014 that advisory anchors on the **last nap/sleep checkpoint already in `session_log.md`**, not on session identity. `warm_briefing.written_since_last_nap` resolves to `true`/`false` on its own, with no `session_id` needed; it's `null` only when there's no prior checkpoint in the file yet (e.g. this is the very first nap ever) or the warm-briefing file itself is missing.
 
 The `nap` mode:
-- Logs the summary to `~/.engram/session_log.md` with a "Nap (turn N)" header
+- Logs the summary to `~/.engram/session_log.md` (under `$ENGRAM_HOME`, default `~/.engram`) with a "Nap (turn N)" header
 - Returns graph stats and memory tier info
 - Does NOT advance the turn counter — no forgetting triggered (turn advance is reserved for post-dream session checkpoints)
 - Arms the `nap_checkpoint` feeling-nudge marker (TTL=5 turns) — the return JSON includes `feeling_report_nudge` text asking whether any moment in this burst produced a distinct internal state worth marking
@@ -149,9 +149,9 @@ Read the `feeling_report_nudge` text in the checkpoint return. Honest self-check
 
 ## Step 5 — Update warm briefing (permanent sections + session-arc sync)
 
-The warm briefing (`~/.engram/warm-briefing.md`) has THREE parts; each updates on different triggers and at different cadences. Read the current file before changing anything.
+The warm briefing (`~/.engram/warm-briefing.md`, under `$ENGRAM_HOME`, default `~/.engram`) has THREE parts; each updates on different triggers and at different cadences. Read the current file before changing anything.
 
-**POST-CONDITION — check it after ANY write this step makes to `~/.engram/warm-briefing.md`, whichever sub-step made it.** All three sub-steps below write this one file (5a the agent-authored sections, 5b the session arc, 5c the rule about what is off-limits), so this is a property of the **file**, not of a sub-step. After the write, both hold:
+**POST-CONDITION — check it after ANY write this step makes to `~/.engram/warm-briefing.md` (under `$ENGRAM_HOME`, default `~/.engram`), whichever sub-step made it.** All three sub-steps below write this one file (5a the agent-authored sections, 5b the session arc, 5c the rule about what is off-limits), so this is a property of the **file**, not of a sub-step. After the write, both hold:
 
 1. `^## From this session` matches the file **exactly once** — not zero times, not twice.
 2. **Nothing this write did not set out to change is byte-changed.** Capture the region you are *not* editing before you write, and compare it after. The target regions are known, so this is a byte-comparison rather than a judgement call:
@@ -208,7 +208,7 @@ The rule:
 
 **Write-time post-condition:** stated **once**, at the top of this step — it covers this sub-step's write. Read it there and check it here; it is deliberately not repeated, so that 5a, 5b and 5c cannot drift into three versions of one assertion.
 
-**Cross-skill note**: at the end of sleep, this section is ERASED — day is over; clean slate for tomorrow. Next morning's first nap creates the section fresh. The day's overall arc lives in `~/.engram/history/YYYY-MM-DD.md`, not here.
+**Cross-skill note**: at the end of sleep, this section is ERASED — day is over; clean slate for tomorrow. Next morning's first nap creates the section fresh. The day's overall arc lives in `~/.engram/history/YYYY-MM-DD.md` (under `$ENGRAM_HOME`, default `~/.engram`), not here.
 
 **Anti-patterns specific to 5b:**
 - Appending new sessions next to old ones (changelog-style accumulation).
@@ -228,7 +228,7 @@ The user's letter/notes are immutable. They sit ABOVE the anchor and BELOW the a
 - Second-person framing ("you will feel..." — retired with identity v1)
 - False warmth (evaluate by reader-effect, not truth-value)
 
-**Note for end-of-day (sleep):** at the end of sleep, the `engram-sleep` skill ERASES the "From this session" section (day is over). The day's overall arc lives in the history file (`~/.engram/history/YYYY-MM-DD.md`), not in warm-briefing. Naps through the day keep the section in-sync-with-current-CW; sleep wipes it for tomorrow.
+**Note for end-of-day (sleep):** at the end of sleep, the `engram-sleep` skill ERASES the "From this session" section (day is over). The day's overall arc lives in the history file (`~/.engram/history/YYYY-MM-DD.md`, under `$ENGRAM_HOME`, default `~/.engram`), not in warm-briefing. Naps through the day keep the section in-sync-with-current-CW; sleep wipes it for tomorrow.
 
 ## Step 6 — Ask {{USER_NAME}} 1-2 questions for next session
 
@@ -265,7 +265,7 @@ engram_list_focused()
 
 **Null-result is valid:** if the list is already aligned with next session's direction, say so and move on. Anti-pattern: performative rotation — touching the list just because this step exists.
 
-**History file refresh.** If this burst shipped a milestone — completed + committed work, not in-progress — append to today's file at `~/.engram/history/YYYY-MM-DD.md`: if the file doesn't exist, create it with `# YYYY-MM-DD` as the heading, then add a bullet (what shipped, why it mattered, commit refs). If the file already exists for today, add a new bullet to it. Don't touch prior-day files. If nothing shipped this burst, skip — don't invent entries. This keeps the directory fresh so fresh-session me walks in with accurate "what I shipped last" context (reads the newest file by filename sort).
+**History file refresh.** If this burst shipped a milestone — completed + committed work, not in-progress — append to today's file at `~/.engram/history/YYYY-MM-DD.md` (under `$ENGRAM_HOME`, default `~/.engram`): if the file doesn't exist, create it with `# YYYY-MM-DD` as the heading, then add a bullet (what shipped, why it mattered, commit refs). If the file already exists for today, add a new bullet to it. Don't touch prior-day files. If nothing shipped this burst, skip — don't invent entries. This keeps the directory fresh so fresh-session me walks in with accurate "what I shipped last" context (reads the newest file by filename sort).
 
 ## Step 8 — Tell the user what's next
 
@@ -284,7 +284,7 @@ If the nap fired because a compaction warning is active, explicitly say: "Ready 
 
 Last, after Step 5b and the focus rotation (Step 7): the context the tool assembles carries the focus list and the warm-briefing arc, so both must be final. This step only leaves a request; the `engram-compaction` mod, if the person switched it on, acts on it at the end of the answered turn that runs this step, so end the turn normally and do not tell the person it will compact "next turn". With the mod off the request is never read (the files stay on disk; an unconsumed request ages out after 30 minutes).
 
-- **A loop marker exists** (`~/.engram/loop-mode.json`): run the tool, no question.
+- **A loop marker exists** (`~/.engram/loop-mode.json`, under `$ENGRAM_HOME`, default `~/.engram`): run the tool, no question.
 - **No loop marker:** ask first, once — "Compact now? The nap just persisted everything." — and run the tool only on yes. On a no, run `python tools/compact-request.py --clear`, and check that it exits 0. Exit 4 means a file could not be removed, and stderr names it; if it names the old request, that request can still compact, so say so once. Never retry in a loop.
 
 ```bash

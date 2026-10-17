@@ -199,7 +199,7 @@ Some findings were already ruled on in an earlier dream and are waiting for a
 human decision (for example split author keys or standpoint restamps whose fix
 is blocked on a ruling). Reporting them as fresh findings makes the dream master
 re-adjudicate them every draw. So before you report, read the ledger the dream
-master keeps at `~/.engram/dream/person-fairy-known.json`:
+master keeps at `~/.engram/dream/person-fairy-known.json` (under `$ENGRAM_HOME`, default `~/.engram`):
 
 ```json
 {"version": 1, "entries": [
@@ -250,7 +250,7 @@ master keeps at `~/.engram/dream/person-fairy-known.json`:
   a line of the Known section. You only READ the ledger; the dream master is its
   only writer.
 
-Write the report to `~/.engram/dream/YYYY-MM-DD-person-fairy-report.md`
+Write the report to `~/.engram/dream/YYYY-MM-DD-person-fairy-report.md` (under `$ENGRAM_HOME`, default `~/.engram`)
 (mkdir -p if needed), same header shape as the dream-fairy report. Return:
 file path + top-5 TL;DR. If any Known entry grew (D >= 1), the TL;DR starts with
 the number of grown entries; if the ledger was unparseable, it starts with that
