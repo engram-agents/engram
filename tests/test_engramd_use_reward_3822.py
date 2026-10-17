@@ -210,12 +210,12 @@ def test_constants_are_named_and_pinned():
     assert eo.USE_REWARD_REQUEST_ID_MAX_BYTES == 128
     assert eo.USE_REWARD_DEDUPE_CAP == 1024
     assert eo.METHOD_KINDS == frozenset({"read", "write"})
-    assert ec.CONTRACT_VERSION == "1.2"
+    assert ec.CONTRACT_VERSION == "1.3"
 
 
-def test_the_closed_write_set_is_exactly_use_reward():
+def test_the_closed_write_set_is_exactly_the_two_ops():
     """8a. Adding a second write method must edit this pin (and the constant)."""
-    assert eo.WRITE_METHODS == frozenset({"use_reward"})
+    assert eo.WRITE_METHODS == frozenset({"use_reward", "advance_moment_cursor"})  # 2nd write: #3856
 
 
 @requires_linux_owner
@@ -223,7 +223,7 @@ def test_every_method_in_the_table_carries_a_kind_and_the_write_kinds_equal_the_
     assert set(owner._method_kinds) == set(owner._methods)
     assert all(k in eo.METHOD_KINDS for k in owner._method_kinds.values())
     declared_writes = {m for m, k in owner._method_kinds.items() if k == "write"}
-    assert declared_writes == {"use_reward"} == set(eo.WRITE_METHODS)
+    assert declared_writes == {"use_reward", "advance_moment_cursor"} == set(eo.WRITE_METHODS)
 
 
 @requires_linux_owner
@@ -1015,9 +1015,9 @@ def _release_later(blocker, seconds):
 
 @requires_linux_owner
 def test_a_locked_store_is_busy_rolled_back_and_not_recorded_as_done(owner, monkeypatch):
-    """The server/hooks write the store directly too. The op waits at most USE_REWARD_LOCK_WAIT (shortened here
+    """The server/hooks write the store directly too. The op waits at most OWNER_WRITE_LOCK_WAIT (shortened here
     for speed) and answers the typed, DETERMINATE `busy`; a later retry of the same request_id runs."""
-    monkeypatch.setattr(eo, "USE_REWARD_LOCK_WAIT", 0.3)
+    monkeypatch.setattr(eo, "OWNER_WRITE_LOCK_WAIT", 0.3)
     blocker = _hold_write_lock(owner)
     try:
         res = call(owner, ["n_mid"], request_id="busy-1")
@@ -1033,19 +1033,19 @@ def test_a_locked_store_is_busy_rolled_back_and_not_recorded_as_done(owner, monk
 def test_lock_wait_is_strictly_below_client_timeout_minus_reply_reserve():
     """THE inequality, asserted first and alone (no literal values here): the owner's whole waiting budget must be
     strictly less than what the client will wait minus the reply reserve, so a `busy` refusal ARRIVES before the
-    client gives up. Raising USE_REWARD_LOCK_WAIT above CLIENT_TIMEOUT - RESERVE, or shrinking either client
+    client gives up. Raising OWNER_WRITE_LOCK_WAIT above CLIENT_TIMEOUT - RESERVE, or shrinking either client
     constant under it, reddens THIS cell by name."""
-    assert eo.USE_REWARD_LOCK_WAIT < ec.USE_REWARD_CLIENT_TIMEOUT - ec.USE_REWARD_REPLY_RESERVE
+    assert eo.OWNER_WRITE_LOCK_WAIT < ec.OWNER_WRITE_CLIENT_TIMEOUT - ec.OWNER_WRITE_REPLY_RESERVE
 
 
 def test_lock_wait_constant_values_and_the_client_timeout_tie_are_pinned():
-    """The values (so a change is a visible decision) and the ties. USE_REWARD_CLIENT_TIMEOUT is DEFAULT_TIMEOUT on
+    """The values (so a change is a visible decision) and the ties. OWNER_WRITE_CLIENT_TIMEOUT is DEFAULT_TIMEOUT on
     purpose (one number a hook already passes); if they ever need to differ this cell is where that is decided."""
-    assert eo.USE_REWARD_LOCK_WAIT == 1.0
-    assert ec.USE_REWARD_CLIENT_TIMEOUT == 2.0
-    assert ec.USE_REWARD_REPLY_RESERVE == 0.5
-    assert ec.USE_REWARD_CLIENT_TIMEOUT == ec.DEFAULT_TIMEOUT
-    assert eo.USE_REWARD_LOCK_WAIT < eo.DEFAULT_REQUEST_DEADLINE  # and below the owner's own request deadline
+    assert eo.OWNER_WRITE_LOCK_WAIT == 1.0
+    assert ec.OWNER_WRITE_CLIENT_TIMEOUT == 2.0
+    assert ec.OWNER_WRITE_REPLY_RESERVE == 0.5
+    assert ec.OWNER_WRITE_CLIENT_TIMEOUT == ec.DEFAULT_TIMEOUT
+    assert eo.OWNER_WRITE_LOCK_WAIT < eo.DEFAULT_REQUEST_DEADLINE  # and below the owner's own request deadline
 
 
 @requires_linux_owner
@@ -1055,13 +1055,13 @@ def test_a_writer_holding_longer_than_the_budget_gets_busy_before_the_client_giv
     timer = _release_later(blocker, 3.5)  # far longer than the budget and than the client timeout
     try:
         t0 = _t.monotonic()
-        res = call(owner, ["n_mid", "n_null"], request_id="busy-long", timeout=ec.USE_REWARD_CLIENT_TIMEOUT)
+        res = call(owner, ["n_mid", "n_null"], request_id="busy-long", timeout=ec.OWNER_WRITE_CLIENT_TIMEOUT)
         elapsed = _t.monotonic() - t0
     finally:
         timer.cancel()
         _release(blocker)
     assert isinstance(res, ec.Rejected) and res.reason == "busy", res  # NOT Unavailable: a determinate answer
-    assert eo.USE_REWARD_LOCK_WAIT * 0.7 <= elapsed < ec.USE_REWARD_CLIENT_TIMEOUT - ec.USE_REWARD_REPLY_RESERVE + 0.4, elapsed
+    assert eo.OWNER_WRITE_LOCK_WAIT * 0.7 <= elapsed < ec.OWNER_WRITE_CLIENT_TIMEOUT - ec.OWNER_WRITE_REPLY_RESERVE + 0.4, elapsed
     cols = three(owner.store_path)
     assert cols["n_mid"] == (0.5, 0.4, 2) and cols["n_null"] == (None, 0.5, 1)  # all three columns unchanged
     assert owner._owner_conn.in_transaction is False
@@ -1074,7 +1074,7 @@ def test_a_writer_holding_shorter_than_the_budget_lets_the_op_succeed(owner):
     timer = _release_later(blocker, 0.3)
     try:
         t0 = _t.monotonic()
-        r = ok_result(call(owner, ["n_mid"], timeout=ec.USE_REWARD_CLIENT_TIMEOUT))
+        r = ok_result(call(owner, ["n_mid"], timeout=ec.OWNER_WRITE_CLIENT_TIMEOUT))
         elapsed = _t.monotonic() - t0
     finally:
         timer.join()
@@ -1101,20 +1101,20 @@ def test_the_budget_is_a_TOTAL_owner_lock_contention_and_sqlite_busy_wait_share_
     timer = _release_later(blocker, 3.5)
     try:
         t0 = _t.monotonic()
-        res = call(owner, ["n_mid"], request_id="busy-total", timeout=ec.USE_REWARD_CLIENT_TIMEOUT)
+        res = call(owner, ["n_mid"], request_id="busy-total", timeout=ec.OWNER_WRITE_CLIENT_TIMEOUT)
         elapsed = _t.monotonic() - t0
     finally:
         timer.cancel()
         _release(blocker)
         th.join()
     assert isinstance(res, ec.Rejected) and res.reason == "busy", res
-    assert eo.USE_REWARD_LOCK_WAIT * 0.8 <= elapsed < eo.USE_REWARD_LOCK_WAIT + 0.45, elapsed
+    assert eo.OWNER_WRITE_LOCK_WAIT * 0.8 <= elapsed < eo.OWNER_WRITE_LOCK_WAIT + 0.45, elapsed
     assert three(owner.store_path)["n_mid"] == (0.5, 0.4, 2)
 
 
 @requires_linux_owner
 def test_an_owner_lock_held_past_the_budget_is_busy_too(owner, monkeypatch):
-    monkeypatch.setattr(eo, "USE_REWARD_LOCK_WAIT", 0.3)
+    monkeypatch.setattr(eo, "OWNER_WRITE_LOCK_WAIT", 0.3)
     owner._owner_lock.acquire()
     try:
         res = call(owner, ["n_mid"])
@@ -1154,7 +1154,7 @@ def test_the_busy_timeout_is_set_for_the_op_only_and_restored_on_every_exit_path
     prior_is_back("raised")
     monkeypatch.setattr(er, "use_reward", real)
 
-    monkeypatch.setattr(eo, "USE_REWARD_LOCK_WAIT", 0.2)
+    monkeypatch.setattr(eo, "OWNER_WRITE_LOCK_WAIT", 0.2)
     blocker = _hold_write_lock(owner)
     try:
         assert call(owner, ["n_low"]).reason == "busy"
@@ -1172,7 +1172,7 @@ def test_the_busy_timeout_is_set_for_the_op_only_and_restored_on_every_exit_path
 
 @requires_linux_owner
 def test_a_busy_refusal_is_not_recorded_so_the_same_request_id_retry_runs(owner, monkeypatch):
-    monkeypatch.setattr(eo, "USE_REWARD_LOCK_WAIT", 0.2)
+    monkeypatch.setattr(eo, "OWNER_WRITE_LOCK_WAIT", 0.2)
     blocker = _hold_write_lock(owner)
     try:
         assert call(owner, ["n_mid"], request_id="retry-1").reason == "busy"
@@ -1240,16 +1240,16 @@ def test_another_sqlite_error_is_write_failed_not_an_unhandled_exception(owner, 
 
 
 @requires_linux_owner
-def test_ping_reports_contract_1_2(owner):
+def test_ping_reports_contract_1_3(owner):
     r = ec.read("ping", {}, socket_path=owner.socket_path, timeout=3.0)
-    assert isinstance(r, ec.Ok) and r.result["contract_version"] == "1.2"
-    assert owner.contract_version == "1.2"
+    assert isinstance(r, ec.Ok) and r.result["contract_version"] == "1.3"
+    assert owner.contract_version == "1.3"
 
 
 def test_minor_skew_is_tolerated_both_ways_so_the_new_method_is_additive():
-    assert ec.check_contract_version("1.1", owner="1.2") is None
-    assert ec.check_contract_version("1.2", owner="1.1") is None
-    assert ec.check_contract_version("2.0", owner="1.2").reason == "contract_version"
+    assert ec.check_contract_version("1.2", owner="1.3") is None
+    assert ec.check_contract_version("1.3", owner="1.2") is None
+    assert ec.check_contract_version("2.0", owner="1.3").reason == "contract_version"
 
 
 @requires_linux_owner
@@ -1269,7 +1269,7 @@ def test_skew_an_older_owner_without_use_reward_answers_unknown_operation_typed(
 
 _FLAT_MODULES = [
     "engramd_owner.py", "engramd_client.py", "engramd_read_registry.py", "engram_pidfile.py", "engram_walguard.py",
-    "engram_regular_io.py", "engram_restamp.py", "engram_config_io.py",
+    "engram_regular_io.py", "engram_restamp.py", "engram_config_io.py", "engram_moment_cursor.py",
 ]
 
 
@@ -1288,7 +1288,7 @@ def test_the_owner_resolves_engram_restamp_and_config_io_in_the_flattened_layout
     code = (
         "import sys; sys.path.insert(0, sys.argv[1]);"
         "import engramd_owner as o, engram_config_io as c;"
-        "print(o.er.__file__); print(c.__file__); print(o.WRITE_METHODS == frozenset({'use_reward'}))"
+        "print(o.er.__file__); print(c.__file__); print(o.WRITE_METHODS == frozenset({'use_reward', 'advance_moment_cursor'}))"
     )
     out = subprocess.run([sys.executable, "-I", "-c", code, str(flat)], cwd=other, env=env, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
@@ -1651,7 +1651,7 @@ def test_write_docstring_and_ledger_say_determinate_only_up_to_the_commit_and_ca
     text = (Path(__file__).resolve().parent.parent / "docs" / "2652-migration-ledger.md").read_text(encoding="utf-8")
     sec = text[text.index("## 6. Owner writes"):]
     assert "up to the COMMIT" in sec
-    assert "request deadline, never to the client's own timeout" in sec and "USE_REWARD_CLIENT_TIMEOUT" in sec
+    assert "request deadline, never to the client's own timeout" in sec and "OWNER_WRITE_CLIENT_TIMEOUT" in sec
     assert "use_reward_owner_busy" not in sec and "use_reward_store_busy" not in sec
 
 

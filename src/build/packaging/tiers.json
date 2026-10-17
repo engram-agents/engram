@@ -250,6 +250,11 @@
       "tier": "essential"
     },
     {
+      "path": "engram_moment_cursor.py",
+      "tier": "essential",
+      "note": "The one shared compare-and-set advance of a person's moment-rotation cursor (#3856). Stdlib-only. Essential because the surface hook and engram_query import it (hard dependencies; the hook degrades to no cursor advance if it is missing)."
+    },
+    {
       "path": "engram_config_io.py",
       "tier": "essential",
       "note": "Atomic write + retrying read of config.json (#3607). Stdlib-only. Essential because engram_core and engram_restamp import it (hard dependencies)."

@@ -88,8 +88,6 @@ ALLOW_LIST = {
     # (The runtime write paths are all routed through
     # `_metadata_dict_for_write` / `_metadata_dict`: no entry left for them.)
     # ---- still to be routed (#3425) ----------------------------------------
-    ("hooks/claude/engram-surface-hook.py", "_advance_person_moment_cursor"):
-        (1, "#3425", "hook write path (cursor re-dump), wrapped in `except Exception` so it FAILS OPEN (returns False); engram_core is importable here (the hook imports it lazily elsewhere), the local parse follows the convention of duplicating small primitives across the hook/server process boundary"),
     ("tools/inspect_raw.py", "_get_field_value"):
         (2, "#3425", "dev tooling: one `.get` read plus one deliberate raw `parsed_metadata` return"),
     ("tools/migrate_person_nodes.py", "run_report"):
@@ -116,7 +114,7 @@ ALLOW_LIST = {
 
 # The ratchet. Count of SITES carrying the "#3425" tag. LOWER this number
 # (never raise it) when a PR routes sites and deletes/lowers their entries.
-_MAX_3425_SITES = 7
+_MAX_3425_SITES = 6
 
 
 # --------------------------------------------------------------------------

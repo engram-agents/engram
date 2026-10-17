@@ -462,8 +462,8 @@ def test_df_vocab_absent_is_named_and_the_owner_does_not_create_it(home):
 @requires_linux_owner
 def test_df_additive_contract_version_stays_1_1(df_owner):
     # #3822 (U11): the later, additive `use_reward` write bumped the shared constant 1.1 -> 1.2.
-    assert ec.CONTRACT_VERSION == "1.2"
-    assert df_owner.contract_version == "1.2"
+    assert ec.CONTRACT_VERSION == "1.3"
+    assert df_owner.contract_version == "1.3"
 
 
 # --- registry class (contract cell 4) ---------------------------------------

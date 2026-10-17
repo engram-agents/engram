@@ -112,6 +112,19 @@ except Exception:
 # sentinel, per the one-call-per-module rule above. If the module cannot be
 # imported the pack query FAILS CLOSED (returns no pack results) rather than
 # risk returning evidence nodes.
+# #3856: the ONE shared compare-and-set cursor advance (stdlib-only). Own sentinel, per the one-call-per-module
+# rule above. An import failure leaves _advance_moment_cursor None: _advance_person_moment_cursor then returns
+# False (best effort) -- it never falls back to rewriting the whole metadata dict.
+_MOMENT_CURSOR_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_moment_cursor.py")
+if _MOMENT_CURSOR_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _MOMENT_CURSOR_RUNTIME_DIR)
+try:
+    from engram_moment_cursor import advance_moment_cursor as _advance_moment_cursor
+    from engram_moment_cursor import read_cursor as _read_moment_cursor
+except Exception:
+    _advance_moment_cursor = None
+    _read_moment_cursor = None
+
 _SEARCH_RULES_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_search_rules.py")
 if _SEARCH_RULES_RUNTIME_DIR not in sys.path:
     sys.path.insert(0, _SEARCH_RULES_RUNTIME_DIR)
@@ -165,11 +178,34 @@ _RENDER_SIZE_SITE = "surface-hook.render_size"
 #   row 7  query_fts_fallback                NOT TAKEN (an in-hook server runtime, the #3741
 #                                            class): the recall daemon down renders the hook's
 #                                            existing daemon-down notice and no recall block
-#   row 8  _advance_person_moment_cursor     STAYS DIRECT on both flag values (an RW
-#                                            sqlite3.connect, a registered write site): the named
-#                                            remainder, it moves with the first owner write unit.
+#   row 8  _advance_person_moment_cursor     NOT a read, so NOT behind the reads flag: it sits behind its
+#                                            own, INDEPENDENT flag `engramd.surface_writes_via_owner`
+#                                            (U13, #3856; default OFF; see "The write" below). This was
+#                                            the named U10 remainder; with it moved, every store access
+#                                            of this hook goes through the owner behind a flag.
 # Flag OFF is today's direct path, unchanged. Modelled on U6b (engram-lesson-tripwire-hook.py)
 # and U9 (engram-session-start-hook.py).
+#
+# Registry of this hook's owner sites (reads flag: rows 1-6; writes flag: row 8):
+#   reads  -> the `read` / `chain` / `df` / `ping` ops (rows 1-6, above)
+#   writes -> the typed `advance_moment_cursor` op (row 8): ONE call per rendered person moment,
+#             `write("advance_moment_cursor", {person_id, from_cursor})`, params exactly those two keys.
+#
+# The write (U13, #3856). `engramd.surface_writes_via_owner` is read ONLY through
+# engramd_owner_flags.flag_on, independent of `engramd.surface_reads_via_owner` (all four on/off
+# combinations are legal). Flag OFF: the phase-1 direct path (this process's own RW connection running
+# the shared compare-and-set `engram_moment_cursor.advance_moment_cursor`; it still never rewrites
+# another key). Flag ON: the advance goes ONLY to the owner, the hook makes ZERO direct connects to the
+# store for it, and NO owner outcome falls back to a direct write. Best effort, ONE attempt, no retry:
+# True only when the owner answered Ok with applied true; stale / not_person / not_object are quiet
+# Falses; Unavailable, Rejected (unknown_operation, busy, readback_mismatch, ...) and a client import
+# failure are False AND recorded loud (the first one per fire) under the existing `surface-owner` notice
+# kind, rate-limited by the shared probe-notice stamp. The moment still renders either way; a lost
+# advance only means the SAME moment may repeat sooner, the safe direction. The call gets
+# min(remaining hook budget, engramd_client.OWNER_WRITE_CLIENT_TIMEOUT): the hook is registered with a
+# 10 s timeout, and the write happens after render, so the remaining budget is the timeout minus a tail
+# reserve minus the time since this process started (see HOOK_TIMEOUT_S below). After one owner failure
+# the rest of the fire makes no further owner write.
 #
 # Owner failure (any OwnerReadError, or the client failing to import): the failing site returns
 # the degraded value it returns for a failed direct read (never a stale value presented as an
@@ -185,10 +221,26 @@ _RENDER_SIZE_SITE = "surface-hook.render_size"
 OWNER_FIRE_BUDGET_S = 3.0
 OWNER_READ_TIMEOUT_S = 1.0
 
+# U13 (#3856): the owner WRITE (the person-moment cursor advance) happens after render, in the same 10 s hook.
+# HOOK_TIMEOUT_S mirrors the registered timeout (pinned against hooks.json by a test). The write's call timeout is
+# min(HOOK_TIMEOUT_S - OWNER_WRITE_TAIL_RESERVE_S - (seconds since this process started),
+# engramd_client.OWNER_WRITE_CLIENT_TIMEOUT); under OWNER_WRITE_MIN_TIMEOUT_S left, the owner is not called.
+# Worst case with the owner slow: reads <= OWNER_FIRE_BUDGET_S (3.0) + the liveness ping (1.0), then ONE write
+# <= 2.0, so owner time <= 6.0 of 10 s; after the first owner failure no further write is attempted.
+HOOK_TIMEOUT_S = 10.0
+OWNER_WRITE_TAIL_RESERVE_S = 1.5
+OWNER_WRITE_MIN_TIMEOUT_S = 0.25
+_HOOK_STARTED = time.monotonic()  # a hook is one process per fire, so import time is the fire's start
+
 _OWNER_FLAG_KEY = "surface_reads_via_owner"
+_OWNER_WRITE_FLAG_KEY = "surface_writes_via_owner"
 CONFIG_PATH = os.path.join(ENGRAM_HOME, "config.json")  # module-level so the A6 arm can re-point it (as the stop and tripwire hooks)
 OWNER_NOTICE_KEY = "surface-owner"
 OWNER_FLAG_NOTICE_KEY = "surface-owner-flag"
+# The shared cursor module (engram_moment_cursor) failing to import is not an owner failure but would leave the SAME
+# first person moment rendering forever with no sign: it gets its own notice KIND through the same shared stamp.
+MOMENT_CURSOR_NOTICE_KEY = "surface-moment-cursor"
+_MOMENT_CURSOR_UNAVAILABLE_SEEN = False  # set when a person moment is selected while the module is missing; reset per fire
 _OWNER_NOTICE_CAP = 700
 
 # Set by main() for ONE run (None outside main(): standalone callers of the sites stay on the
@@ -259,6 +311,122 @@ def _owner_reads_enabled() -> bool:
         except Exception:
             _OWNER_FLAGS_FAILURE = "unknown"
         return False
+
+
+def _owner_writes_enabled() -> bool:
+    """`engramd.surface_writes_via_owner` (U13, #3856), read ONLY through engramd_owner_flags.flag_on over the
+    module-level CONFIG_PATH, exactly like `_owner_reads_enabled` and independent of it. Anything but the
+    JSON boolean `true` is OFF; ANY exception (and a SystemExit) importing the helper or calling `flag_on`
+    reads OFF and its CLASS NAME is recorded in `_OWNER_FLAGS_FAILURE` for main() to report under the
+    existing `surface-owner-flag` notice. The slot is shared with the reads flag, so this does NOT reset it
+    (the reads call, which runs first, does) and keeps the FIRST failure. KeyboardInterrupt is not caught."""
+    global _OWNER_FLAGS_FAILURE
+    try:
+        engramd_owner_flags = _import_owner_flags()
+        return engramd_owner_flags.flag_on(
+            _OWNER_WRITE_FLAG_KEY, CONFIG_PATH) is True
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 -- see docstring
+        if _OWNER_FLAGS_FAILURE is None:
+            try:
+                _OWNER_FLAGS_FAILURE = type(exc).__name__
+            except Exception:
+                _OWNER_FLAGS_FAILURE = "unknown"
+        return False
+
+
+def _new_owner_run() -> dict:
+    """The owner state of ONE fire: both flags read once, each only through flag_on."""
+    reads = _owner_reads_enabled()      # resets the shared flag-failure slot
+    writes = _owner_writes_enabled()
+    return {"on": reads, "writes_on": writes, "conn": None, "failure": None, "write_failure": None, "degraded": []}
+
+
+def _owner_write_timeout(ec):
+    """The call timeout for the owner write: min(remaining hook budget, OWNER_WRITE_CLIENT_TIMEOUT), or None when
+    less than OWNER_WRITE_MIN_TIMEOUT_S is left (the owner is then not called)."""
+    remaining = HOOK_TIMEOUT_S - OWNER_WRITE_TAIL_RESERVE_S - (time.monotonic() - _HOOK_STARTED)
+    timeout = min(remaining, ec.OWNER_WRITE_CLIENT_TIMEOUT)
+    return timeout if timeout >= OWNER_WRITE_MIN_TIMEOUT_S else None
+
+
+def _record_owner_write_failure(run: dict, kind: str, result=None, cause=None) -> None:
+    """Keep the FIRST owner-write failure of this run (kind, the typed Unavailable/Rejected result, the cause CLASS
+    name only)."""
+    if run.get("write_failure") is None:
+        run["write_failure"] = {"kind": kind, "result": result, "cause": cause}
+
+
+def _advance_via_owner(run: dict, person_id: str, from_cursor: int) -> bool:
+    """The flag-ON cursor advance: ONLY the owner, never a direct write, whatever it answers. ONE attempt, NO
+    retry (best effort: a lost advance only means the same moment may repeat sooner, the safe direction). True
+    only for Ok with applied true; stale / not_person / not_object are quiet Falses; every other outcome is False
+    and recorded (the first one per fire). After one owner failure the fire makes no further owner write."""
+    try:
+        if run.get("write_failure") is not None:
+            return False
+        try:
+            ec = _owner_client()
+        except _ClientImportFailure as exc:
+            _record_owner_write_failure(run, "client_import", cause=(exc.args[0] if exc.args else "unknown"))
+            return False
+        timeout = _owner_write_timeout(ec)
+        if timeout is None:
+            _record_owner_write_failure(run, "budget_exhausted")
+            return False
+        try:
+            res = ec.write("advance_moment_cursor", {"person_id": person_id, "from_cursor": from_cursor}, timeout=timeout)
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 -- a client crash is a typed failure; KeyboardInterrupt is not caught
+            _record_owner_write_failure(run, "client_failure", cause=type(exc).__name__)
+            return False
+        if isinstance(res, ec.Ok):
+            result = res.result
+            if isinstance(result, dict) and isinstance(result.get("applied"), bool):
+                return result["applied"] is True        # a stale answer is normal and quiet
+            _record_owner_write_failure(run, "unusable_answer")
+            return False
+        if isinstance(res, ec.Unavailable):
+            _record_owner_write_failure(run, "unavailable", res)
+        elif isinstance(res, ec.Rejected):
+            _record_owner_write_failure(run, "rejected", res)
+        else:
+            _record_owner_write_failure(run, "unusable_answer")
+        return False
+    except Exception:  # noqa: BLE001 -- best effort: the moment still renders
+        return False
+
+
+def _owner_write_failure_text(run: dict) -> str:
+    """The ONE loud line for a recorded owner-write failure. It says the cursor did NOT advance (so the same
+    moment may repeat) -- except where the owner may have committed (a timeout, a readback_mismatch), where it says
+    so. `Rejected(unknown_operation)` names the contract skew and the remedy. Bounded; dynamic text is
+    control-character-free; never SQL, row data or an exception message."""
+    f = run["write_failure"]
+    reason = getattr(f.get("result"), "reason", None) if f.get("result") is not None else None
+    flag_hint = ("To write directly meanwhile, set engramd.surface_writes_via_owner to false "
+                 "in $ENGRAM_HOME/config.json.")
+    if f["kind"] == "rejected" and reason == "unknown_operation":
+        line = (
+            "⚠️  ENGRAM: the engramd owner is older than this hook (contract skew: it does not know "
+            "advance_moment_cursor). The person moment cursor was NOT advanced, so the same moment may repeat; "
+            f"restart or upgrade the owner. {flag_hint}"
+        )
+        return line[:_OWNER_NOTICE_CAP]
+    detail = f" (reason: {_sanitize_owner_text(reason, 40)})" if reason else ""
+    if f["kind"] == "client_import" and f.get("cause"):
+        detail = f" (cause: {_sanitize_owner_text(f['cause'], 40)})"
+    if f["kind"] == "rejected" and reason == "readback_mismatch":
+        outcome = ("The owner committed the advance but could NOT verify it, so the cursor may have advanced; "
+                   "do not assume either way.")
+    elif f["kind"] == "unavailable" and reason in ("timeout", "protocol"):
+        outcome = "The owner did not answer in time, so the cursor may or may not have advanced."
+    else:
+        outcome = "The person moment was shown, but its rotation did NOT advance, so the same moment may repeat."
+    line = (
+        f"⚠️  ENGRAM: the engramd owner could not advance a person moment cursor "
+        f"({_sanitize_owner_text(f['kind'], 40)}{detail}). {outcome} "
+        f"Do not write knowledge.db directly. {flag_hint}"
+    )
+    return line[:_OWNER_NOTICE_CAP]
 
 
 def _import_engramd_client():
@@ -377,11 +545,18 @@ def _pending_owner_notice():
     owner failure -> the loud line under `surface-owner`; a failed flag helper -> its report line
     under `surface-owner-flag` (the two cannot co-occur: a failed helper reads the flag OFF). Both
     ride the shared probe-notice window, so a repeat inside the window is silent on stdout. The
-    caller stamps the window only after the response was printed. Never raises."""
+    caller stamps the window only after the response was printed. Never raises.
+
+    Priority (U13): when a read failure and a write failure occur in the SAME fire only the read failure reaches
+    this function's result; the write failure then reaches stderr only (`_write_owner_stderr_lines`)."""
     try:
         run = _OWNER_RUN
         if run is not None and run.get("failure") is not None:
             text, key = _owner_failure_text(run), OWNER_NOTICE_KEY
+        elif run is not None and run.get("write_failure") is not None:
+            text, key = _owner_write_failure_text(run), OWNER_NOTICE_KEY
+        elif _MOMENT_CURSOR_UNAVAILABLE_SEEN:
+            text, key = _moment_cursor_unavailable_text(), MOMENT_CURSOR_NOTICE_KEY
         else:
             text, key = _owner_flags_failure_line(), OWNER_FLAG_NOTICE_KEY
         if not text or not probe_notice_due(ENGRAM_HOME, key):
@@ -389,6 +564,28 @@ def _pending_owner_notice():
         return text, key
     except Exception:
         return "", None
+
+
+def _moment_cursor_unavailable_text() -> str:
+    """The one notice line when `engram_moment_cursor` could not be imported: no owner text, no exception message."""
+    return (
+        "⚠️  ENGRAM: moment cursor module unavailable: the rotation will not advance, so the same person moment "
+        "may repeat on every prompt. The surface hook could not import engram_moment_cursor; reinstall or "
+        "upgrade the plugin."
+    )[:_OWNER_NOTICE_CAP]
+
+
+def _note_moment_cursor_unavailable() -> None:
+    """A person moment was selected while the cursor module is missing: remember it for the notice (once per fire)
+    and write ONE stderr line. Never raises."""
+    global _MOMENT_CURSOR_UNAVAILABLE_SEEN
+    try:
+        if not _MOMENT_CURSOR_UNAVAILABLE_SEEN:
+            _MOMENT_CURSOR_UNAVAILABLE_SEEN = True
+            sys.stderr.write("engram-surface-hook: moment cursor module unavailable: the rotation will not advance\n")
+            sys.stderr.flush()
+    except Exception:
+        pass
 
 
 def _write_owner_stderr_lines() -> None:
@@ -403,6 +600,9 @@ def _write_owner_stderr_lines() -> None:
             f = run["failure"]
             sys.stderr.write(
                 f"engram-surface-hook: owner read failed: {f['kind']} at {f['site']}\n"[:300])
+        wf = run.get("write_failure") if run is not None else None
+        if wf is not None:
+            sys.stderr.write(f"engram-surface-hook: owner write failed: {wf['kind']}\n"[:300])
         sys.stderr.flush()
     except Exception:
         pass
@@ -1461,7 +1661,8 @@ def _select_person_moment_candidate(entry: dict) -> "tuple[str, int] | None":
     """Read-only selection: given a full-tier person special entry (carrying
     special_moments / special_moment_cursor from _surface_impl's response —
     see engram_query.py), decide whether a moment is eligible to render this
-    prompt. Returns (description, new_cursor) on eligibility, else None.
+    prompt. Returns (description, from_cursor) on eligibility, else None, where
+    from_cursor is the (rule-normalised) cursor the moment was selected at.
 
     Deliberately has NO side effects (no DB write, no cooldown record) —
     those only commit once the caller confirms the rendered line actually
@@ -1479,9 +1680,7 @@ def _select_person_moment_candidate(entry: dict) -> "tuple[str, int] | None":
         return None
     if _person_moment_in_cooldown(person_id):
         return None
-    cursor = entry.get("special_moment_cursor")
-    if not isinstance(cursor, int):
-        cursor = 0
+    cursor = _read_moment_cursor(entry.get("special_moment_cursor")) if _read_moment_cursor else 0
     idx = cursor % len(moments)
     moment = moments[idx]
     if not isinstance(moment, dict):
@@ -1489,57 +1688,38 @@ def _select_person_moment_candidate(entry: dict) -> "tuple[str, int] | None":
     description = moment.get("description")
     if not description:
         return None
-    return description, cursor + 1
+    if _read_moment_cursor is None:
+        _note_moment_cursor_unavailable()
+    return description, cursor
 
 
-def _advance_person_moment_cursor(person_id: str, new_cursor: int) -> bool:
-    """Persist the advanced moment-rotation cursor for person_id.
+def _advance_person_moment_cursor(person_id: str, from_cursor: int) -> bool:
+    """Advance the moment-rotation cursor for person_id FROM the value it was rendered at (#3856).
 
-    This is a NEW capability for this hook process: every other DB access in
-    this file is read-only (mode=ro liveness probes — see
-    _check_db_liveness). This is a single narrow, targeted write (bump one
-    JSON key on one row), matching the pattern _add_special_moment_impl /
-    _update_person_impl already use server-side (read current metadata,
-    mutate one key, write back the full dict — never a partial dict, which
-    would silently clobber pronouns/relation/aliases/field_traces/etc).
+    Runs the shared compare-and-set `engram_moment_cursor.advance_moment_cursor` on this hook's own RW
+    connection and commits. One SQL statement that touches only `special_moment_cursor`, so a concurrent
+    `engram_update_person` / `engram_add_special_moment` edit is never lost and two concurrent fires never
+    skip a moment (the loser reports `stale`). The old read-modify-write of the whole dict is gone.
 
-    Architectural precedent shift, named explicitly here for future readers
-    tracing this file's history: this is the FIRST write to knowledge.db
-    from the hook process (#1940). It's safe under the existing WAL mode +
-    this function's own best-effort/fail-open posture (any failure just
-    returns False, never raises past this function), but it establishes a
-    new capability class for this file — prior to this, "hook process" and
-    "DB writer" were mutually exclusive; they no longer are.
+    This is the FIRST (and, with the flag OFF, still direct) write to knowledge.db from the hook process
+    (#1940); it stays direct on the flag-OFF path (design 6).
 
-    Re-reads metadata fresh right before writing (narrows, does not
-    eliminate, the read-modify-write race against a concurrent
-    engram_add_special_moment / engram_update_person call — same
-    non-atomic-write precedent as those functions themselves; see PR body).
-
-    Best-effort: True on success, False on ANY failure (missing row, locked
-    DB, malformed JSON, ...) — fail-open, since a persistence hiccup here
-    must never prevent the moment from being shown this once (the caller
-    still renders the line regardless of this return value; only the
-    cooldown record — _record_person_moment_render, called separately by the
-    caller — and the cursor advance are at risk, and both failing just means
-    the SAME moment may repeat sooner than intended, the safe direction).
+    Best-effort: True only when the advance applied; False on ANY failure (stale, missing row, locked DB,
+    shared module not importable, ...). Fail-open: a persistence hiccup must never prevent the moment from
+    being shown this once. An import failure is False, never a fallback to a whole-dict rewrite.
     """
+    run = _OWNER_RUN
+    if run is not None and run.get("writes_on"):
+        # Flag ON (U13): ONLY the owner. No outcome of it, and no failure, ever reaches the direct code below.
+        return _advance_via_owner(run, person_id, from_cursor)
+    if _advance_moment_cursor is None:
+        return False
     conn = None
     try:
         conn = sqlite3.connect(KNOWLEDGE_DB_PATH, timeout=2.0)
-        row = conn.execute(
-            "SELECT metadata FROM nodes WHERE id = ?", (person_id,)
-        ).fetchone()
-        if not row or not row[0]:
-            return False
-        meta = json.loads(row[0])
-        meta["special_moment_cursor"] = new_cursor
-        conn.execute(
-            "UPDATE nodes SET metadata = ? WHERE id = ?",
-            (json.dumps(meta), person_id),
-        )
+        result = _advance_moment_cursor(conn, person_id, from_cursor)
         conn.commit()
-        return True
+        return bool(result.get("applied"))
     except Exception:
         return False
     finally:
@@ -1550,13 +1730,13 @@ def _advance_person_moment_cursor(person_id: str, new_cursor: int) -> bool:
                 pass
 
 
-def _commit_person_moment_render(person_id: str, new_cursor: int) -> None:
+def _commit_person_moment_render(person_id: str, from_cursor: int) -> None:
     """Side effects for an ACTUALLY-rendered person moment: advance the
     rotation cursor (DB write, best-effort) and record the cross-surface
     cooldown event (ledger write, best-effort). Called only after the
     caller's budget check confirms the line survives — see format_nudge.
     """
-    _advance_person_moment_cursor(person_id, new_cursor)
+    _advance_person_moment_cursor(person_id, from_cursor)
     _record_person_moment_render(person_id)
 
 
@@ -4061,10 +4241,13 @@ def main():
     reset here on every way out, so a later standalone caller of a site is never left reading
     through a stale shim."""
     global _OWNER_RUN
+    global _MOMENT_CURSOR_UNAVAILABLE_SEEN
+    _MOMENT_CURSOR_UNAVAILABLE_SEEN = False
     try:
         _main_impl()
     finally:
         _OWNER_RUN = None
+        _MOMENT_CURSOR_UNAVAILABLE_SEEN = False
 
 
 def _main_impl():
@@ -4085,7 +4268,7 @@ def _main_impl():
 
     # #3821: the owner state of THIS fire (the flag is read once, only through flag_on). Flag
     # OFF: {"on": False}, every site on its direct path.
-    _OWNER_RUN = {"on": _owner_reads_enabled(), "conn": None, "failure": None, "degraded": []}
+    _OWNER_RUN = _new_owner_run()
 
     # #3613: producers wrap the meaningful text of a notification in an
     # ENGRAM marker; the recall QUERY is built from that text only. `prompt`

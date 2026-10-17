@@ -331,8 +331,8 @@ def test_contract_version_is_1_1_on_the_wire_and_on_ping(real_owner):
     Mutation: leave the constant at "1.0" -> red."""
     # #3822 (U11): the later, additive `use_reward` write bumped the shared constant 1.1 -> 1.2 (the `read`
     # method itself landed at 1.1; the test name keeps that origin).
-    assert ec.CONTRACT_VERSION == "1.2"
-    assert real_owner.contract_version == "1.2"
+    assert ec.CONTRACT_VERSION == "1.3"
+    assert real_owner.contract_version == "1.3"
 
 
 

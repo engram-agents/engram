@@ -195,7 +195,7 @@ _OWNER_FLAGS_FAILURE = None  # class NAME of a flag-helper failure (reset per re
 OWNER_WRITE_BUDGET_S = 3.5
 OWNER_WRITE_RESERVE_S = 1.5
 OWNER_RETRY_MIN_S = 0.25
-# T is the client's named bound for this op, engramd_client.USE_REWARD_CLIENT_TIMEOUT (2.0 s; the owner's lock wait is 1.0 s,
+# T is the client's named bound for this op, engramd_client.OWNER_WRITE_CLIENT_TIMEOUT (2.0 s; the owner's lock wait is 1.0 s,
 # so a typed `busy` arrives inside it). Imported by name at call time: the hook keeps no copy of the number. Worst case with
 # the retry: attempt 1 waits min(2.0, 3.5) = 2.0, the retry min(2.0, 3.5 - 2.0 = 1.5) = 1.5, total 3.5 = the budget.
 _monotonic = time.monotonic  # module-level so tests can drive the clock
@@ -261,7 +261,7 @@ def _one_line(value, limit: int | None = None) -> str:
 
 
 def _owner_write_timeout(ec) -> float:
-    return float(ec.USE_REWARD_CLIENT_TIMEOUT)
+    return float(ec.OWNER_WRITE_CLIENT_TIMEOUT)
 
 
 def _owner_use_reward(node_ids) -> int:

@@ -116,13 +116,6 @@
       ]
     },
     {
-      "key": "a6822015a92b0414ca8b443bd623c4ce9be6f7637068d72f69e8711e2e6c1427",
-      "sql": "SELECT metadata FROM nodes WHERE id = ?",
-      "sites": [
-        "hooks/claude/engram-surface-hook.py:_advance_person_moment_cursor"
-      ]
-    },
-    {
       "key": "a81aff5ee1cfc444b6044abc808bcd8573b6e94d771e505c5119ca6678b91046",
       "sql": "SELECT COUNT(*) FROM nodes",
       "sites": [
@@ -207,7 +200,6 @@
   ],
   "write_sites": [
     "engram_restamp.py:bump_utility",
-    "hooks/claude/engram-surface-hook.py:_advance_person_moment_cursor",
     "hooks/claude/engram-utility-credit-mention-stop.py:bump_utility"
   ],
   "declared_out_of_scope": [

@@ -446,6 +446,23 @@ def _rej(reason, rid=None, commit=None):
                        commit=commit)
 
 
+def _current(obj):
+    """Rebind a scripted client result to the CURRENT classes. `importlib.reload(ec)` (done by
+    tests/test_engramd_platform_arm_3712.py, legitimately) re-executes engramd_client in place, so `ec.Ok` /
+    `ec.Rejected` / `ec.Unavailable` become new class objects, while results built at COLLECTION time (parametrize
+    argument lists, module constants) are instances of the old ones and fail the hook's `isinstance` checks. A frozen
+    dataclass instance whose class is named Ok / Rejected / Unavailable but is not the current `ec.<Name>` is rebuilt
+    from its fields with the current class (every field kept: commit, request_id, steps, ...); anything else
+    (strings, None, already-current objects) is returned unchanged."""
+    import dataclasses
+    name = type(obj).__name__
+    if name in ("Ok", "Rejected", "Unavailable") and dataclasses.is_dataclass(obj):
+        cls = getattr(ec, name)
+        if not isinstance(obj, cls):
+            return cls(**{f.name: getattr(obj, f.name) for f in dataclasses.fields(obj)})
+    return obj
+
+
 class FakeWrite:
     """Replaces ec.write: records (method, params, request_id, timeout), advances a fake clock by each timeout it
     'waits', answers from a script of results (callables get the call record)."""
@@ -456,7 +473,7 @@ class FakeWrite:
     def __call__(self, method, params, *, request_id=None, timeout=None, socket_path=None):
         self.calls.append({"method": method, "params": params, "request_id": request_id, "timeout": timeout})
         step = self.script.pop(0) if len(self.script) > 1 else self.script[0]
-        res = step(self.calls[-1]) if callable(step) else step
+        res = _current(step(self.calls[-1]) if callable(step) else step)
         if isinstance(res, ec.Unavailable) and res.reason in ("timeout", "protocol") and self.clock is not None:
             self.clock[0] += timeout
         return res
@@ -696,6 +713,32 @@ def test_busy_rejection_is_determinate_one_call_no_retry_and_its_own_words(home,
     assert bump_lines(hook) == ["bump_utility failed: owner busy (not applied)"]
 
 
+def test_results_built_before_a_reload_of_the_client_still_classify_as_typed_results(home, monkeypatch):
+    """REGRESSION (CI gate 2, #3859): `tests/test_engramd_platform_arm_3712.py` re-executes engramd_client IN PLACE
+    (`importlib.reload(ec)`), so `ec.Rejected` / `ec.Unavailable` / `ec.Ok` become NEW class objects. Scripted results
+    built at COLLECTION time (parametrize argument lists, module constants) are then instances of the OLD classes and
+    the hook's `isinstance(result, ec.Rejected)` is False: 'unusable answer', no retry. The fake owner rebinds each
+    result it returns to the CURRENT classes. Mutation: drop the rebind -> both flows below go red."""
+    import importlib
+    busy, timeout = _rej("busy"), _unavail("timeout")        # built from the classes as they are NOW
+    try:
+        importlib.reload(ec)                                 # exactly what platform_arm does inside its test
+        assert not isinstance(busy, ec.Rejected) and not isinstance(timeout, ec.Unavailable)     # the precondition
+        hook, fake, _ = with_fake(home, monkeypatch, [busy])
+        hook.credit_mentions(TEXT)
+        assert len(fake.calls) == 1
+        assert bump_lines(hook) == ["bump_utility failed: owner busy (not applied)"]
+        clock = [0.0]
+        (home / "b").mkdir()
+        hook, fake, _ = with_fake(home / "b", monkeypatch, [timeout, busy], clock=clock)
+        monkeypatch.setattr(hook, "_monotonic", lambda: clock[0])
+        hook.credit_mentions(TEXT)
+        assert len(fake.calls) == 2 and fake.calls[0]["request_id"] == fake.calls[1]["request_id"]
+        assert bump_lines(hook) == [RETRY_LINE.format(code="busy")]
+    finally:
+        importlib.reload(ec)
+
+
 @pytest.mark.parametrize("res,frag", [
     (_rej("write_denied"), "bump_utility failed: owner rejected: write_denied"),
     (_rej("use_reward_owner_busy"), "bump_utility failed: owner rejected: use_reward_owner_busy"),
@@ -809,7 +852,7 @@ def test_d_real_owner_first_attempt_times_out_after_commit_then_the_retry_gets_b
                     time.sleep(1.8)
             return r
         o._methods["use_reward"] = commit_then_hold
-        monkeypatch.setattr(ec, "USE_REWARD_CLIENT_TIMEOUT", 0.3)
+        monkeypatch.setattr(ec, "OWNER_WRITE_CLIENT_TIMEOUT", 0.3)
         hook = load_hook(home, monkeypatch)
         real_write = ec.write
         calls = []
@@ -851,7 +894,7 @@ def test_reply_lost_after_commit_the_single_retry_gets_the_stored_outcome_and_th
                 time.sleep(0.7)
             return r
         o._methods["use_reward"] = slow_after_commit
-        monkeypatch.setattr(ec, "USE_REWARD_CLIENT_TIMEOUT", 0.4, raising=False)
+        monkeypatch.setattr(ec, "OWNER_WRITE_CLIENT_TIMEOUT", 0.4, raising=False)
         hook = load_hook(home, monkeypatch)
         real_write = ec.write
         calls = []
@@ -892,7 +935,7 @@ def test_a_retry_with_a_NEW_request_id_would_double_bump_this_cell_pins_the_same
                 time.sleep(0.7)
             return r
         o._methods["use_reward"] = slow
-        monkeypatch.setattr(ec, "USE_REWARD_CLIENT_TIMEOUT", 0.4, raising=False)
+        monkeypatch.setattr(ec, "OWNER_WRITE_CLIENT_TIMEOUT", 0.4, raising=False)
         hook = load_hook(home, monkeypatch)
         hook.credit_mentions(TEXT)
     finally:
@@ -939,7 +982,7 @@ def test_two_attempts_never_wait_longer_than_the_budget_whatever_the_client_cons
     clock = [0.0]
     hook, fake, _ = with_fake(home, monkeypatch, [_unavail("timeout")], clock=clock)
     monkeypatch.setattr(hook, "_monotonic", lambda: clock[0])
-    monkeypatch.setattr(ec, "USE_REWARD_CLIENT_TIMEOUT", first, raising=False)
+    monkeypatch.setattr(ec, "OWNER_WRITE_CLIENT_TIMEOUT", first, raising=False)
     hook.credit_mentions(TEXT)
     waited = sum(c["timeout"] for c in fake.calls)
     assert waited <= hook.OWNER_WRITE_BUDGET_S + 1e-9
@@ -949,18 +992,18 @@ def test_two_attempts_never_wait_longer_than_the_budget_whatever_the_client_cons
 
 def test_the_hook_passes_the_clients_named_timeout_when_it_exists(home, monkeypatch):
     hook, fake, _ = with_fake(home, monkeypatch, [_ok()])
-    monkeypatch.setattr(ec, "USE_REWARD_CLIENT_TIMEOUT", 1.25, raising=False)
+    monkeypatch.setattr(ec, "OWNER_WRITE_CLIENT_TIMEOUT", 1.25, raising=False)
     hook.credit_mentions(TEXT)
     assert fake.calls[0]["timeout"] == 1.25
 
 
 def test_the_hook_uses_the_clients_own_constant_not_a_copy_of_the_number(home, monkeypatch):
-    """Unpatched, the timeout the hook sends is exactly `engramd_client.USE_REWARD_CLIENT_TIMEOUT` (2.0 s), and the hook source
+    """Unpatched, the timeout the hook sends is exactly `engramd_client.OWNER_WRITE_CLIENT_TIMEOUT` (2.0 s), and the hook source
     holds no local timeout constant. Mutation: hard-code another value in the hook -> red here and in the patched-constant cell."""
     hook, fake, _ = with_fake(home, monkeypatch, [_ok()])
     hook.credit_mentions(TEXT)
-    assert fake.calls[0]["timeout"] == ec.USE_REWARD_CLIENT_TIMEOUT == 2.0
-    assert not hasattr(hook, "_USE_REWARD_CLIENT_TIMEOUT_FALLBACK")
+    assert fake.calls[0]["timeout"] == ec.OWNER_WRITE_CLIENT_TIMEOUT == 2.0
+    assert not hasattr(hook, "_OWNER_WRITE_CLIENT_TIMEOUT_FALLBACK")
 
 
 def test_worst_case_total_wait_with_the_real_constants_is_the_budget_inside_the_stop_timeout(home, monkeypatch):
@@ -1153,7 +1196,7 @@ def test_fold4_a_retry_is_skipped_when_less_than_the_minimum_budget_is_left(home
     clock = [0.0]
     hook, fake, _ = with_fake(home, monkeypatch, [_unavail("timeout")], clock=clock)
     monkeypatch.setattr(hook, "_monotonic", lambda: clock[0])
-    monkeypatch.setattr(ec, "USE_REWARD_CLIENT_TIMEOUT", 3.4)
+    monkeypatch.setattr(ec, "OWNER_WRITE_CLIENT_TIMEOUT", 3.4)
     hook.credit_mentions(TEXT)
     assert hook.OWNER_WRITE_BUDGET_S - 3.4 < hook.OWNER_RETRY_MIN_S
     assert len(fake.calls) == 1 and fake.calls[0]["timeout"] == 3.4
@@ -1164,7 +1207,7 @@ def test_fold4_a_retry_still_runs_when_exactly_the_minimum_budget_is_left(home, 
     clock = [0.0]
     hook, fake, _ = with_fake(home, monkeypatch, [_unavail("timeout"), _ok()], clock=clock)
     monkeypatch.setattr(hook, "_monotonic", lambda: clock[0])
-    monkeypatch.setattr(ec, "USE_REWARD_CLIENT_TIMEOUT", hook.OWNER_WRITE_BUDGET_S - hook.OWNER_RETRY_MIN_S)
+    monkeypatch.setattr(ec, "OWNER_WRITE_CLIENT_TIMEOUT", hook.OWNER_WRITE_BUDGET_S - hook.OWNER_RETRY_MIN_S)
     hook.credit_mentions(TEXT)
     assert len(fake.calls) == 2 and fake.calls[1]["timeout"] == hook.OWNER_RETRY_MIN_S
 

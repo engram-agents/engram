@@ -173,6 +173,9 @@ RUNTIME_FILES = {
     "engram_pidfile.py": "src/engram/engram_pidfile.py",
     "engram_regular_io.py": "src/engram/engram_regular_io.py",
     "engram_restamp.py": "src/engram/engram_restamp.py",
+    # #3856: the shared person-moment cursor advance. The surface hook imports it at module level (and engramd_owner
+    # imports it), so a fire in the installed layout loads it; without this entry the closure cell would flag it.
+    "engram_moment_cursor.py": "src/engram/engram_moment_cursor.py",
     "engram_search_rules.py": "src/engram/engram_search_rules.py",
     "tools/__init__.py": "src/engram/tools/__init__.py",
     "tools/recall_summary_validator.py": "src/engram/tools/recall_summary_validator.py",

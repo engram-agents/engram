@@ -82,14 +82,17 @@ import engram_pidfile
 # "1.2" (U11, #3822): the owner gained its first WRITE, the typed `use_reward` method -- again an added
 # method, so MINOR (`check_contract_version` tolerates minor skew; an older owner answers a
 # `use_reward` call with Rejected(unknown_operation), which the caller must treat as loud).
-CONTRACT_VERSION = "1.2"
+# "1.3" (U13, #3856): the owner gained its second WRITE, the typed `advance_moment_cursor` method -- again an
+# added method, so MINOR (an older owner answers it with Rejected(unknown_operation), which the caller must treat
+# as loud). It takes no request_id: the compare-and-set makes a replay harmless.
+CONTRACT_VERSION = "1.3"
 # The `use_reward` write (#3822): the timeout a caller passes, and the slice of it reserved for the reply to
-# travel. The owner's total waiting budget (engramd_owner.USE_REWARD_LOCK_WAIT, 1.0 s) must stay strictly below
-# USE_REWARD_CLIENT_TIMEOUT - USE_REWARD_REPLY_RESERVE (1.5 s), so a `busy` refusal ARRIVES before the client
+# travel. The owner's total waiting budget (engramd_owner.OWNER_WRITE_LOCK_WAIT, 1.0 s) must stay strictly below
+# OWNER_WRITE_CLIENT_TIMEOUT - OWNER_WRITE_REPLY_RESERVE (1.5 s), so a `busy` refusal ARRIVES before the client
 # gives up; a test pins the inequality across the two modules. 2.0 s is DEFAULT_TIMEOUT; the 0.5 s reserve is a
 # judgement (loopback AF_UNIX reply plus a scheduler hiccup), not a measurement.
-USE_REWARD_CLIENT_TIMEOUT = 2.0
-USE_REWARD_REPLY_RESERVE = 0.5
+OWNER_WRITE_CLIENT_TIMEOUT = 2.0
+OWNER_WRITE_REPLY_RESERVE = 0.5
 DEFAULT_TIMEOUT = 2.0  # seconds -- matches _query_recall_daemon's sock.settimeout(2) precedent.
 DEFAULT_SOCKET_NAME = "engramd.sock"  # distinct from the existing recall-daemon.sock (a different service).
 # The socket's containing subdirectory, relative to $ENGRAM_HOME (#3194,

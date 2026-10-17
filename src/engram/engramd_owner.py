@@ -259,6 +259,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 import engram_pidfile
+import engram_moment_cursor as emc
 import engram_restamp as er
 import engram_walguard
 import engramd_client as ec
@@ -1795,10 +1796,10 @@ def _acl_leftovers(entries: list[str]) -> list[str]:
 # `ENGRAM_HOME/config.json`, read fresh on every call.
 
 # Every method in the table carries a kind. The write kinds are a DECLARED, CLOSED set: one constant, pinned
-# by tests/test_engramd_use_reward_3822.py to exactly {"use_reward"}. An unclassified method is
+# by tests/test_engramd_use_reward_3822.py to exactly {"use_reward", "advance_moment_cursor"}. An unclassified method is
 # default-deny at dispatch.
 METHOD_KINDS = frozenset({"read", "write"})
-WRITE_METHODS = frozenset({"use_reward"})
+WRITE_METHODS = frozenset({"use_reward", "advance_moment_cursor"})  # the 2nd write: #3856
 
 # The closed action enum (today one action). Anything else is refused before the store is touched.
 USE_REWARD_ACTIONS = frozenset({"mention"})
@@ -1812,9 +1813,9 @@ USE_REWARD_DEDUPE_CAP = 1024
 # The TOTAL time one use_reward may spend WAITING (seconds): the `_owner_lock` acquire PLUS SQLite's busy wait
 # for a competing direct writer share this one budget (the busy timeout for the op is the REMAINING budget).
 # When it runs out the op answers the typed, DETERMINATE `busy` with nothing committed. It is pinned by a test to
-# be strictly less than `engramd_client.USE_REWARD_CLIENT_TIMEOUT - USE_REWARD_REPLY_RESERVE`, so that answer
+# be strictly less than `engramd_client.OWNER_WRITE_CLIENT_TIMEOUT - OWNER_WRITE_REPLY_RESERVE`, so that answer
 # arrives before the client gives up. Read at call time.
-USE_REWARD_LOCK_WAIT = 1.0
+OWNER_WRITE_LOCK_WAIT = 1.0
 USE_REWARD_MONOTONE_FLOOR = 0.99  # ids at or above this utility are exempt from the monotone read-back invariant
 USE_REWARD_BUSY_RETRY_SLEEP = 0.02  # seconds between attempts while a direct writer holds the store's write lock
 
@@ -1862,7 +1863,10 @@ class _UseRewardGuard:
     """Per-op state for the authorizer: the denials seen, and the two phases in which a transaction COMMIT /
     ROLLBACK is the handler's own (a COMMIT issued from inside the shared function would be a partial commit)."""
 
-    def __init__(self) -> None:
+    def __init__(self, allows=None) -> None:
+        # The op's pure allowlist: `_use_reward_allows` by default, `_moment_cursor_allows` for the second write
+        # (#3856). One guard, one set of COMMIT / ROLLBACK / busy-PRAGMA phases, two allowlists.
+        self._allows = allows if allows is not None else _use_reward_allows
         self.denials: list = []
         self.allow_commit = False
         self.allow_rollback = False
@@ -1882,10 +1886,90 @@ class _UseRewardGuard:
         ):
             self.denials.append((action_code, arg1, arg2, db_name, trigger_or_view))
             return sqlite3.SQLITE_DENY
-        if _use_reward_allows(action_code, arg1, arg2, db_name, trigger_or_view):
+        if self._allows(action_code, arg1, arg2, db_name, trigger_or_view):
             return sqlite3.SQLITE_OK
         self.denials.append((action_code, arg1, arg2, db_name, trigger_or_view))
         return sqlite3.SQLITE_DENY
+
+
+# ---------------------------------------------------------------------------
+# The second write: the typed `advance_moment_cursor` op (#3856, U13 of #2652, phase 2)
+# ---------------------------------------------------------------------------
+#
+# The shared function `engram_moment_cursor.advance_moment_cursor` advances `metadata.special_moment_cursor` in ONE
+# compare-and-set UPDATE. NO request_id and no dedupe store: a replay is harmless (a retry after COMMIT finds
+# from + 1 and answers `stale`). The client supplies ONLY {person_id, from_cursor}; the owner computes the target.
+MOMENT_CURSOR_PERSON_ID_MAX_BYTES = 256
+
+# What U11's pinned property ("no column the op writes is one a trigger fires on") CANNOT be here: the metadata
+# JSON guard trigger fires on EVERY metadata update. So the property is a NAMED allow-set: every trigger on `nodes`
+# that can fire on `UPDATE nodes SET metadata` must be in it (pinned against sqlite_master by a test). A new trigger
+# on `metadata` is NOT admitted by editing this set to make a cell pass; it is reported to the design seat.
+MOMENT_CURSOR_ADMITTED_TRIGGERS = frozenset({"nodes_metadata_json_guard_update"})
+
+# Column-exact allowlist, MEASURED (authorizer-recorded) over real runs of the shared function on the real schema
+# (applied / stale / not_person / not_object and the read-back SELECT): reads of nodes.id / type / is_current /
+# metadata; ONE UPDATE target, nodes.metadata; the four json functions (json_valid arrives through the guard
+# trigger's WHEN clause and body; RAISE(ABORT) itself needs no authorization code).
+MOMENT_CURSOR_READ_COLUMNS = frozenset({"id", "type", "is_current", "metadata"})
+MOMENT_CURSOR_UPDATE_COLUMNS = frozenset({"metadata"})
+MOMENT_CURSOR_FUNCTIONS = frozenset({"json_set", "json_type", "json_extract", "json_valid"})
+
+
+def _moment_cursor_allows(action_code, arg1, arg2, db_name, trigger_or_view) -> bool:
+    """The op-scoped allowlist (pure) for `advance_moment_cursor`: True iff this authorizer call is one the op
+    needs. Everything else (INSERT, DELETE, other columns / tables / attached dbs, PRAGMA, DDL, other functions,
+    SAVEPOINT) is False. A statement originating in a trigger is admitted only if that trigger is NAMED in
+    MOMENT_CURSOR_ADMITTED_TRIGGERS (the metadata JSON guard), and is then held to the same rules."""
+    if trigger_or_view is not None and trigger_or_view not in MOMENT_CURSOR_ADMITTED_TRIGGERS:
+        return False
+    if action_code == sqlite3.SQLITE_SELECT:
+        return True
+    if action_code == sqlite3.SQLITE_READ:
+        return db_name == "main" and arg1 == "nodes" and arg2 in MOMENT_CURSOR_READ_COLUMNS
+    if action_code == sqlite3.SQLITE_UPDATE:
+        return db_name == "main" and arg1 == "nodes" and arg2 in MOMENT_CURSOR_UPDATE_COLUMNS
+    if action_code == sqlite3.SQLITE_FUNCTION:
+        return arg2 in MOMENT_CURSOR_FUNCTIONS
+    if action_code == sqlite3.SQLITE_TRANSACTION:
+        return arg1 in ("BEGIN", "COMMIT", "ROLLBACK")
+    return False
+
+
+def _moment_cursor_param_refusal(params) -> "dict | None":
+    """Validate an `advance_moment_cursor` request; None = valid, else the wire rejection. EACH violation has its
+    own named reason, checked in this order: (1) not a dict with exactly the keys 'person_id' and 'from_cursor'
+    (an extra key, `request_id` included, or a missing one); (2) person_id: not a str, empty, over
+    MOMENT_CURSOR_PERSON_ID_MAX_BYTES UTF-8 bytes (counted with surrogatepass), a lone surrogate (cannot be
+    bound); (3) from_cursor: not an int (a bool, float, str, null, list, dict), outside [-(2**53), 2**53).
+    Touches no connection, so a refused call executes no statement."""
+    p = "advance_moment_cursor_"
+    if not isinstance(params, dict) or set(params) != {"person_id", "from_cursor"}:
+        return _df_rejection(
+            p + "params_shape",
+            "advance_moment_cursor params must be a dict with exactly the keys 'person_id' and 'from_cursor'",
+            "send exactly {person_id, from_cursor}; there is no request_id and no target value")
+    person_id, from_cursor = params["person_id"], params["from_cursor"]
+    if not isinstance(person_id, str):
+        return _df_rejection(p + "person_id_not_str", f"'person_id' must be a string, got {type(person_id).__name__}",
+                             "send 'person_id' as a string")
+    if person_id == "":
+        return _df_rejection(p + "person_id_empty", "'person_id' is the empty string", "send a real person id")
+    if len(person_id.encode("utf-8", "surrogatepass")) > MOMENT_CURSOR_PERSON_ID_MAX_BYTES:
+        return _df_rejection(p + "person_id_too_long", f"'person_id' exceeds {MOMENT_CURSOR_PERSON_ID_MAX_BYTES} UTF-8 bytes",
+                             f"ids are capped at {MOMENT_CURSOR_PERSON_ID_MAX_BYTES} bytes; send the real id")
+    try:
+        person_id.encode("utf-8")
+    except UnicodeEncodeError:
+        return _df_rejection(p + "person_id_not_utf8", "'person_id' contains a lone surrogate, which cannot be bound as a SQL parameter",
+                             "send a well-formed string")
+    if isinstance(from_cursor, bool) or not isinstance(from_cursor, int):
+        return _df_rejection(p + "from_cursor_not_int", f"'from_cursor' must be an integer, got {type(from_cursor).__name__}",
+                             "send 'from_cursor' as the integer cursor you read")
+    if not (-(2 ** 53) <= from_cursor < 2 ** 53):
+        return _df_rejection(p + "from_cursor_out_of_range", "'from_cursor' is outside [-(2**53), 2**53)",
+                             "send the cursor you read; values outside the JSON-safe range are refused")
+    return None
 
 
 def _method_kind_refusal(method: str, kind) -> "dict | None":
@@ -1921,12 +2005,42 @@ def _displaced_rejection(exc) -> dict:
     }
 
 
-def _use_reward_busy(detail: str) -> dict:
+def _use_reward_busy(detail: str, remedy: "str | None" = None) -> dict:
     """The determinate `busy` refusal: the wait budget ran out BEFORE the write got the lock (or the commit could
-    take it), so nothing was committed and the op was rolled back. Not recorded for dedupe: a retry runs."""
+    take it), so nothing was committed and the op was rolled back. Not recorded for dedupe: a retry runs.
+    Shared by every owner write (`remedy` overrides the use_reward wording for an op with no request_id)."""
     return _df_rejection(
         "busy", f"{detail}; nothing was committed",
-        "retry once with the SAME request_id (nothing was written, so the retry runs fresh)")
+        remedy or "retry once with the SAME request_id (nothing was written, so the retry runs fresh)")
+
+
+def _write_abort(conn: sqlite3.Connection, guard: "_UseRewardGuard", op: str) -> None:
+    """Roll the op's transaction back (the guard's rollback phase is the handler's own)."""
+    guard.allow_rollback = True
+    try:
+        conn.rollback()
+    except sqlite3.Error:
+        logging.getLogger("engramd_owner").error("%s rollback failed", op, exc_info=True)
+
+
+def _write_denied(guard: "_UseRewardGuard", shared: str) -> dict:
+    """The one wire form of 'the op-scoped authorizer denied a statement' (the whole op was rolled back)."""
+    d = guard.denials[0]
+    return _df_rejection(
+        "write_denied",
+        f"the op-scoped authorizer denied a statement (action code {d[0]}, {d[1]!r}, {d[2]!r}); the whole op was rolled back",
+        f"owner build defect: the shared {shared} executed a statement outside the closed allowlist")
+
+
+def _write_sqlite_error(exc: sqlite3.Error, op: str, busy_remedy: "str | None", failed_remedy: str) -> dict:
+    """A sqlite3.Error BEFORE the commit: a locked/busy store is the typed determinate `busy` (carrying `_busy` so the
+    handler's retry loop retries it); anything else is `<op>_write_failed`. Both are rolled back already."""
+    text = str(exc).lower()
+    if "locked" in text or "busy" in text:
+        return {**_use_reward_busy("the store stayed locked by another writer for the whole lock-wait budget", busy_remedy),
+                "_busy": True}
+    return _df_rejection(f"{op}_write_failed", f"the store write failed ({type(exc).__name__}); the op was rolled back",
+                         failed_remedy)
 
 
 def _use_reward_param_refusal(params) -> "dict | None":
@@ -2106,13 +2220,14 @@ class EngramdOwner:
             "chain": lambda params, deadline: self._handle_chain(params, deadline),
             "confidence_by_type": lambda params, deadline: self._handle_confidence_by_type(params, deadline),
             "use_reward": lambda params, deadline: self._handle_use_reward(params, deadline),
+            "advance_moment_cursor": lambda params, deadline: self._handle_advance_moment_cursor(params, deadline),
         }
         # Every method carries a kind (8a). Kept ALONGSIDE `_methods` (tests replace handlers there). A method in
         # `_methods` with no entry here is default-deny at dispatch (8a-default), never treated as a read.
         # `snapshot` is `read`: it copies the store out and never writes into it.
         self._method_kinds = {
             "ping": "read", "snapshot": "read", "read": "read", "df": "read", "chain": "read",
-            "confidence_by_type": "read", "use_reward": "write",
+            "confidence_by_type": "read", "use_reward": "write", "advance_moment_cursor": "write",
         }
         # use_reward's dedupe store: request_id -> {"fp": (ids, action), "response": <first wire dict>}.
         # In-memory and LRU-bounded by USE_REWARD_DEDUPE_CAP; guarded by `_owner_lock`.
@@ -3382,7 +3497,7 @@ class EngramdOwner:
         """The typed `use_reward` write (kind `write`). Wire: params exactly {node_ids, action, request_id}.
 
         Order: (1) validate, touching no connection (`_use_reward_param_refusal`); (2) take `_owner_lock`, waiting
-        at most USE_REWARD_LOCK_WAIT (`busy` otherwise); the SQLite busy wait is the REMAINING part of that one budget; (3) UNDER THAT LOCK, dedupe check,
+        at most OWNER_WRITE_LOCK_WAIT (`busy` otherwise); the SQLite busy wait is the REMAINING part of that one budget; (3) UNDER THAT LOCK, dedupe check,
         execution and recording, so two concurrent calls with one request_id cannot both bump; (4) install the
         op-scoped restrictive authorizer on `_owner_conn` BEFORE the transaction opens and restore the permissive
         placeholder in a `finally` on every exit path; (5) run the SHARED `engram_restamp.use_reward` (bump THEN
@@ -3405,26 +3520,60 @@ class EngramdOwner:
         request_id: str = params["request_id"]
         fingerprint = _use_reward_fingerprint(node_ids, action)
 
+        def record(resp: dict) -> None:
+            """Remember a COMMITTED outcome (ok or committed_unverified) so a same-id retry replays it."""
+            self._use_reward_seen[request_id] = {"fp": fingerprint, "response": copy.deepcopy(resp)}
+            self._use_reward_seen.move_to_end(request_id)
+            while len(self._use_reward_seen) > USE_REWARD_DEDUPE_CAP:
+                self._use_reward_seen.popitem(last=False)
+
+        def dedupe_check() -> "dict | None":
+            prior = self._use_reward_seen.get(request_id)
+            if prior is None:
+                return None
+            self._use_reward_seen.move_to_end(request_id)
+            if prior["fp"] != fingerprint:
+                return _df_rejection(
+                    "use_reward_request_id_reused", "this request_id was already used for a different payload",
+                    "generate a fresh request_id per distinct operation; reuse one only to retry the SAME call")
+            replay = copy.deepcopy(prior["response"])
+            if replay.get("status") == "ok":
+                replay["result"]["duplicate"] = True
+            return replay
+
+        return self._owner_write(
+            "use_reward", deadline, _UseRewardGuard,
+            lambda conn, guard: self._use_reward_execute(conn, guard, node_ids, action, record),
+            intercept=dedupe_check, after=record)
+
+    def _owner_write(self, op: str, deadline: float, make_guard, attempt, *, intercept=None, after=None,
+                     busy_remedy: "str | None" = None) -> dict:
+        """The shared scaffold of every owner write (`WRITE_METHODS`); `_handle_use_reward` and
+        `_handle_advance_moment_cursor` both run through it (one definition of the wait budget, the lock, the
+        displacement re-check, the open-transaction refusal, the busy-timeout switch and the authorizer install /
+        restore). `op` names the op in the typed refusals (`<op>_owner_stopping`, `<op>_txn_open`).
+
+        Order: take `_owner_lock`, waiting at most OWNER_WRITE_LOCK_WAIT (`busy` otherwise; the SQLite busy wait is
+        the REMAINING part of that one budget); UNDER THAT LOCK, the optional `intercept()` (use_reward's dedupe
+        check: a non-None answer is returned as is), the in-lock displacement re-check, the open-transaction
+        refusal; then install the op-scoped restrictive authorizer (`make_guard()`) BEFORE the transaction opens
+        and `attempt(conn, guard)` it, retrying a `_busy` attempt every USE_REWARD_BUSY_RETRY_SLEEP until the
+        budget is spent; authorizer and busy_timeout are restored in a `finally` on every exit path. A response
+        carrying `_committed: True` is one whose COMMIT happened: the marker is stripped and `after(response)`
+        runs under the lock (use_reward records it for dedupe)."""
         wait_started = time.monotonic()
-        budget = max(0.0, min(USE_REWARD_LOCK_WAIT, deadline - wait_started))
+        budget = max(0.0, min(OWNER_WRITE_LOCK_WAIT, deadline - wait_started))
         if not self._owner_lock.acquire(timeout=budget):
-            return _use_reward_busy("the owner's write lock was not free within the lock-wait budget")
+            return _use_reward_busy("the owner's write lock was not free within the lock-wait budget", busy_remedy)
         try:
             conn = self._owner_conn
             if conn is None or self._displaced:
-                return _df_rejection("use_reward_owner_stopping", "the owner is stopping or its store handle is gone",
+                return _df_rejection(f"{op}_owner_stopping", "the owner is stopping or its store handle is gone",
                                      "retry once the owner is running again")
-            prior = self._use_reward_seen.get(request_id)
-            if prior is not None:
-                self._use_reward_seen.move_to_end(request_id)
-                if prior["fp"] != fingerprint:
-                    return _df_rejection(
-                        "use_reward_request_id_reused", "this request_id was already used for a different payload",
-                        "generate a fresh request_id per distinct operation; reuse one only to retry the SAME call")
-                replay = copy.deepcopy(prior["response"])
-                if replay.get("status") == "ok":
-                    replay["result"]["duplicate"] = True
-                return replay
+            if intercept is not None:
+                answered = intercept()
+                if answered is not None:
+                    return answered
 
             # The dispatch-time displacement check can be stale by the whole lock wait: re-check here, under the lock,
             # before anything is executed, and handle it exactly as `_dispatch` does.
@@ -3437,7 +3586,7 @@ class EngramdOwner:
             # `_owner_lock`, so this means a leaked transaction): nothing is executed, and it is left alone.
             if conn.in_transaction:
                 return _df_rejection(
-                    "use_reward_txn_open", "the owner's store connection already has a transaction open",
+                    f"{op}_txn_open", "the owner's store connection already has a transaction open",
                     "owner defect: a previous user of the connection left a transaction open; see the owner log")
             # SQLite's OWN busy wait is switched OFF for the op (busy_timeout = 0) and the wait is done here, as a
             # retry loop against the one budget. MEASURED (macOS, SQLite 3.53.4, Python 3.12): SQLite's busy
@@ -3450,24 +3599,17 @@ class EngramdOwner:
             give_up_at = wait_started + budget
             prev_busy_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
 
-            def record(resp: dict) -> None:
-                """Remember a COMMITTED outcome (ok or committed_unverified) so a same-id retry replays it."""
-                self._use_reward_seen[request_id] = {"fp": fingerprint, "response": copy.deepcopy(resp)}
-                self._use_reward_seen.move_to_end(request_id)
-                while len(self._use_reward_seen) > USE_REWARD_DEDUPE_CAP:
-                    self._use_reward_seen.popitem(last=False)
-
             # ONE try/finally opens here, before the first thing that changes the connection, and restores BOTH
             # changes on every exit (authorizer first, then the PRAGMA), each in its own inner try so one failing
             # cannot skip the other.
             guard = None
             try:
                 conn.execute("PRAGMA busy_timeout = 0")
-                guard = _UseRewardGuard()
+                guard = make_guard()
                 conn.set_authorizer(guard.authorizer)
                 while True:
                     guard.reset()
-                    response = self._use_reward_execute(conn, guard, node_ids, action, record)
+                    response = attempt(conn, guard)
                     if not response.get("_busy"):
                         break
                     left = give_up_at - time.monotonic()
@@ -3482,19 +3624,19 @@ class EngramdOwner:
                             guard.allow_rollback = True
                         conn.rollback()
                 except Exception:
-                    logging.getLogger("engramd_owner").error("use_reward final rollback failed", exc_info=True)
+                    logging.getLogger("engramd_owner").error("%s final rollback failed", op, exc_info=True)
                 try:
                     conn.set_authorizer(_owner_internal_authorizer)
                 except Exception:
-                    logging.getLogger("engramd_owner").error("use_reward authorizer restore failed", exc_info=True)
+                    logging.getLogger("engramd_owner").error("%s authorizer restore failed", op, exc_info=True)
                 try:
                     if guard is not None:
                         guard.allow_busy_pragma = True  # only matters if the permissive restore above failed
                     conn.execute(f"PRAGMA busy_timeout = {int(prev_busy_ms)}")
                 except Exception:
-                    logging.getLogger("engramd_owner").error("use_reward busy_timeout restore failed", exc_info=True)
-            if response.pop("_committed", False):
-                record(response)
+                    logging.getLogger("engramd_owner").error("%s busy_timeout restore failed", op, exc_info=True)
+            if response.pop("_committed", False) and after is not None:
+                after(response)
             return response
         finally:
             self._owner_lock.release()
@@ -3504,18 +3646,10 @@ class EngramdOwner:
         A response carrying `_committed: True` is one whose COMMIT happened (the caller records it for dedupe and
         strips the marker)."""
         def abort() -> None:
-            guard.allow_rollback = True
-            try:
-                conn.rollback()
-            except sqlite3.Error:
-                logging.getLogger("engramd_owner").error("use_reward rollback failed", exc_info=True)
+            _write_abort(conn, guard, "use_reward")
 
         def denied() -> dict:
-            d = guard.denials[0]
-            return _df_rejection(
-                "write_denied",
-                f"the op-scoped authorizer denied a statement (action code {d[0]}, {d[1]!r}, {d[2]!r}); the whole op was rolled back",
-                "owner build defect: the shared use_reward executed a statement outside the closed allowlist")
+            return _write_denied(guard, "use_reward")
 
         unique_ids = list(dict.fromkeys(node_ids))
         try:
@@ -3541,11 +3675,8 @@ class EngramdOwner:
             if guard.denials:
                 return denied()
             if isinstance(exc, sqlite3.Error):
-                text = str(exc).lower()
-                if "locked" in text or "busy" in text:
-                    return {**_use_reward_busy("the store stayed locked by another writer for the whole lock-wait budget"), "_busy": True}
-                return _df_rejection(
-                    "use_reward_write_failed", f"the store write failed ({type(exc).__name__}); the op was rolled back",
+                return _write_sqlite_error(
+                    exc, "use_reward", None,
                     "retry with the SAME request_id; if it persists check the store's disk and permissions")
             raise
         # COMMITTED. From here the write cannot be undone.
@@ -3598,6 +3729,96 @@ class EngramdOwner:
             if not isinstance(exc, Exception):
                 raise
             return {**unverified, "_committed": True}
+
+    # -- the owner's second write (#3856) --------------------------------------
+
+    def _handle_advance_moment_cursor(self, params: dict, deadline: float) -> dict:
+        """The typed `advance_moment_cursor` write (kind `write`). Wire: params exactly {person_id, from_cursor}; no
+        request_id (the shared compare-and-set makes a replay harmless: a retry after COMMIT finds from + 1 and
+        answers `stale` with it).
+
+        Order: validate, touching no connection (`_moment_cursor_param_refusal`); then the shared `_owner_write`
+        scaffold (the same wait budget, lock, displacement re-check, open-transaction refusal and busy-timeout
+        switch as use_reward) with the op's own restrictive authorizer (`_moment_cursor_allows`); BEGIN IMMEDIATE,
+        the SHARED `engram_moment_cursor.advance_moment_cursor`, COMMIT only when it applied (ROLLBACK otherwise:
+        there is nothing to write), then the read-back (design 5.4) from the committed store.
+
+        Outcomes: `ok` with {applied, cursor, reason} (an `applied: False` answer, `stale` / `not_person` /
+        `not_object`, is a typed ANSWER, not a refusal); `write_denied`; `busy` (nothing committed, determinate);
+        `advance_moment_cursor_write_failed` (rolled back); `readback_mismatch` (COMMITTED but unverified)."""
+        refusal = _moment_cursor_param_refusal(params)
+        if refusal is not None:
+            return refusal
+        person_id: str = params["person_id"]
+        from_cursor: int = params["from_cursor"]
+        return self._owner_write(
+            "advance_moment_cursor", deadline, lambda: _UseRewardGuard(allows=_moment_cursor_allows),
+            lambda conn, guard: self._advance_moment_cursor_execute(conn, guard, person_id, from_cursor),
+            busy_remedy="retry once with the same from_cursor (nothing was written, so the retry runs fresh)")
+
+    def _moment_cursor_readback(self, conn: sqlite3.Connection, person_id: str):
+        """The person's cursor under the ONE cursor rule, read from the store (None if there is no current person
+        row). Runs after COMMIT under the op allowlist; a test replaces it to perturb the post-commit value."""
+        row = conn.execute(
+            "SELECT " + emc.CURSOR_SQL_EXPR + " FROM nodes WHERE id = :id AND type = 'person' AND is_current = 1",
+            {"id": person_id},
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def _advance_moment_cursor_execute(self, conn: sqlite3.Connection, guard: "_UseRewardGuard", person_id: str,
+                                       from_cursor: int) -> dict:
+        """The transaction body of `_handle_advance_moment_cursor`; runs with the op allowlist installed and
+        `_owner_lock` held."""
+        op = "advance_moment_cursor"
+        try:
+            # Opened up front so a competing direct writer is met here (busy) rather than half way through.
+            conn.execute("BEGIN IMMEDIATE")
+            result = emc.advance_moment_cursor(conn, person_id, from_cursor)
+            if guard.denials:
+                _write_abort(conn, guard, op)
+                return _write_denied(guard, op)
+            if result["applied"]:
+                guard.allow_commit = True
+                conn.commit()
+                guard.allow_commit = False
+            else:
+                _write_abort(conn, guard, op)  # nothing to write: stale / not_person / not_object
+        except BaseException as exc:
+            guard.allow_commit = False
+            _write_abort(conn, guard, op)
+            if not isinstance(exc, Exception):
+                raise  # SystemExit / GeneratorExit / injected async exceptions: rolled back, then propagated
+            if guard.denials:
+                return _write_denied(guard, op)
+            if isinstance(exc, sqlite3.Error):
+                return _write_sqlite_error(
+                    exc, op, "retry once with the same from_cursor (nothing was written, so the retry runs fresh)",
+                    "retry once with the same from_cursor; if it persists check the store's disk and permissions")
+            raise
+        if not result["applied"]:
+            return {"status": "ok", "result": dict(result)}
+        # COMMITTED. From here the write cannot be undone: every failure below is committed-but-UNVERIFIED.
+        try:
+            # The committed value is read under the ONE cursor rule, so the comparison is against that rule applied
+            # to from + 1 too: at from = 2**53 - 1 the stored 2**53 is outside the window and reads as 0 (measured by
+            # the range-edge cell), and that is a verified commit, not a mismatch.
+            expected = emc.read_cursor(from_cursor + 1)
+            actual = self._moment_cursor_readback(conn, person_id)
+            if actual != expected:
+                return {**_df_rejection(
+                    "readback_mismatch",
+                    f"COMMITTED but UNVERIFIED: the committed cursor reads {actual!r}, expected {expected}; the commit cannot be undone",
+                    "do not blindly repeat; read the person's current cursor and decide (another writer may have advanced it)"),
+                    "commit": "committed_unverified"}
+            return {"status": "ok", "result": dict(result)}
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                raise
+            return {**_df_rejection(
+                "readback_mismatch",
+                f"COMMITTED but UNVERIFIED: the post-commit verification failed ({type(exc).__name__}); the commit stands and cannot be undone",
+                "do not blindly repeat; read the person's current cursor and decide"),
+                "commit": "committed_unverified"}
 
     def _read_deadline_rejection(self, detail: str) -> dict:
         return {

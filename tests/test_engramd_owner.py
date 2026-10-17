@@ -310,10 +310,10 @@ def test_handshake_major_version_mismatch_is_rejected(owner_running):
 
 @requires_linux_owner
 def test_handshake_minor_version_mismatch_is_accepted(owner_running):
-    # Owner's contract version is engramd_client.CONTRACT_VERSION ("1.2" --
+    # Owner's contract version is engramd_client.CONTRACT_VERSION ("1.3" --
     # MAJOR "1"). Sending "1.7" is a MINOR skew on the SAME major, which
     # check_contract_version() accepts (None -- proceed to serve the call).
-    assert owner_running.contract_version == "1.2"
+    assert owner_running.contract_version == "1.3"
     response = _raw_request(
         owner_running.socket_path,
         {"contract_version": "1.7", "method": "ping", "params": {}, "request_id": None},

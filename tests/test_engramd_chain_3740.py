@@ -674,7 +674,7 @@ def test_chain_is_in_the_method_table_displacement_guarded_with_no_registration_
     -> red. No registration verb exists on the dispatch surface."""
     assert "chain" in chain_owner._methods
     assert "chain" not in eo.NO_STORE_METHODS
-    assert {"ping", "snapshot", "read", "df", "chain", "confidence_by_type", "use_reward"} == set(chain_owner._methods)  # use_reward: #3822
+    assert {"ping", "snapshot", "read", "df", "chain", "confidence_by_type", "use_reward", "advance_moment_cursor"} == set(chain_owner._methods)  # use_reward: #3822; advance_moment_cursor: #3856
     assert not [m for m in chain_owner._methods if re.search(r"regist", m, re.I)]
     tree = ast.parse(Path(eo.__file__).read_text(encoding="utf-8"))
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_dispatch")
@@ -714,11 +714,11 @@ def test_chain_does_not_widen_the_typed_statement_set():
 
 
 @requires_linux_owner
-def test_chain_additive_contract_version_stays_1_1(chain_owner):
+def test_chain_additive_contract_version_stays_1_1(chain_owner):  # 1.2 -> 1.3 by #3856 (advance_moment_cursor), still additive
     # #3822 (U11): the later, additive `use_reward` write bumped the shared constant 1.1 -> 1.2; chain itself
     # added no bump (the name keeps its #3740 origin).
-    assert ec.CONTRACT_VERSION == "1.2"
-    assert chain_owner.contract_version == "1.2"
+    assert ec.CONTRACT_VERSION == "1.3"
+    assert chain_owner.contract_version == "1.3"
 
 
 # --- deadline --------------------------------------------------------------------------------

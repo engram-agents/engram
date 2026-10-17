@@ -451,7 +451,7 @@ def _make_version_checking_handler(owner_version: str):
 
 
 def test_contract_version_major_mismatch_is_rejected(fake_server):
-    # Owner is on "2.0"; this client sends "1.2" (CONTRACT_VERSION) -- MAJOR mismatch.
+    # Owner is on "2.0"; this client sends "1.3" (CONTRACT_VERSION) -- MAJOR mismatch.
     server = fake_server(_make_version_checking_handler(owner_version="2.0"))
 
     result = ec.read("engram_query", {}, timeout=1.0, socket_path=server.socket_path)
@@ -462,14 +462,14 @@ def test_contract_version_major_mismatch_is_rejected(fake_server):
 
 
 def test_contract_version_minor_mismatch_is_accepted(fake_server):
-    # A GENUINELY different MINOR: client sends "1.2" (CONTRACT_VERSION),
-    # owner is "1.3" -- MAJOR matches ("1" == "1") but MINOR differs (2 vs
-    # 3), so this proves the MINOR-skew-is-accepted branch, not just "same
+    # A GENUINELY different MINOR: client sends "1.3" (CONTRACT_VERSION),
+    # owner is "1.4" -- MAJOR matches ("1" == "1") but MINOR differs (3 vs
+    # 4), so this proves the MINOR-skew-is-accepted branch, not just "same
     # version passes trivially" (the old version of this test's own gap,
     # per Borges's finding: it sent the identical version string, so MINOR
     # skew was never actually exercised).
-    assert ec.CONTRACT_VERSION == "1.2"
-    server = fake_server(_make_version_checking_handler(owner_version="1.3"))
+    assert ec.CONTRACT_VERSION == "1.3"
+    server = fake_server(_make_version_checking_handler(owner_version="1.4"))
 
     result = ec.read("engram_query", {}, timeout=1.0, socket_path=server.socket_path)
 
