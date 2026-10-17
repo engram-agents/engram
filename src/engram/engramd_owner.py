@@ -264,7 +264,7 @@ import engram_restamp as er
 import engram_walguard
 import engramd_client as ec
 import engramd_read_registry as rr
-from engram_regular_io import NotRegularFile, describe_file_kind, write_pidfile
+from engram_regular_io import NotRegularFile, describe_file_kind, read_regular_text, write_pidfile
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -1191,9 +1191,12 @@ def _find_read_templates_path() -> "Path | None":
 
 def _read_install_tier(engram_home: Path) -> "str | None":
     """`install_tier` from `<ENGRAM_HOME>/config.json`; None if absent or
-    unreadable (which `resolve_dynamic_flag` treats as not-dev)."""
+    unreadable (which `resolve_dynamic_flag` treats as not-dev). Read through
+    `read_regular_text` (#3838): `start()` runs this before the owner serves, and
+    a FIFO at config.json would block a plain `read_text` until a writer appeared;
+    a non-regular file is an OSError here, i.e. None."""
     try:
-        cfg = json.loads((engram_home / "config.json").read_text(encoding="utf-8"))
+        cfg = json.loads(read_regular_text(engram_home / "config.json", encoding="utf-8"))
     except (OSError, ValueError):
         return None
     tier = cfg.get("install_tier") if isinstance(cfg, dict) else None
