@@ -412,7 +412,8 @@
     {
       "path_prefix_or_glob": "tools/config_schema.py",
       "test_globs": [
-        "tests/test_config_schema.py"
+        "tests/test_config_schema.py",
+        "tests/test_3898_embedding_device.py"
       ]
     },
     {
@@ -740,9 +741,10 @@
       "path_prefix_or_glob": "templates/",
       "test_globs": [
         "tests/test_tiers_manifest.py",
-        "tests/test_bootstrap_codex.py"
+        "tests/test_bootstrap_codex.py",
+        "tests/test_3898_embedding_device.py"
       ],
-      "note": "Template changes trigger manifest gate and bootstrap codex tests"
+      "note": "Template changes trigger manifest gate and bootstrap codex tests; test_3898_embedding_device.py reads config.json.example for the embedding.device / cpu_threads keys"
     },
     {
       "path_prefix_or_glob": "packaging/tiers.json",

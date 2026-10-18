@@ -247,7 +247,7 @@ class TestEmbedderConcurrentFirstTouch:
                     return _Vecs()
                 return _Vec()
 
-        def _fake_ctor(model_name):
+        def _fake_ctor(model_name, **kwargs):
             # Line up all 8 threads so they race into construction together
             # (best-effort — a slow thread that misses the barrier just
             # proceeds; the lock is what must serialize the real work, not
