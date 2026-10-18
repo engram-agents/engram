@@ -54,13 +54,6 @@ from typing import Optional
 # `import pwd` always binds the same singleton sys.modules['pwd'] object,
 # patching it here also patches what _prompthooklib.get_agent_name() sees.
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
-
-SURFACED_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-surfaced-cursor.txt")
-READ_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-read-cursor.txt")
 
 # If "new since last prompt" exceeds this, group-summarize instead of listing.
 LIST_CAP = 10
@@ -105,6 +98,7 @@ try:
         bootstrap_tools_dir as _bootstrap_tools_dir,
         # #3628: the cursor read/write are non-blocking and regular-file-only.
         hooklib_io as _hooklib_io,
+        engram_home_or_exit as _engram_home,
     )
     _PROMPTHOOKLIB_OK = True
 except Exception as _lib_exc:
@@ -122,6 +116,13 @@ try:
     _FORUM_API_OK = True
 except Exception:
     _FORUM_API_OK = False
+
+# The prompt-hook layer's own resolver (a parity-pinned copy in _prompthooklib, #3863). When that lib failed
+# to import, main() reports the class and exits before any use of this value.
+ENGRAM_HOME = str(_engram_home()) if _PROMPTHOOKLIB_OK else ""
+
+SURFACED_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-surfaced-cursor.txt")
+READ_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-read-cursor.txt")
 
 
 # ---------------------------------------------------------------------------

@@ -196,6 +196,9 @@ EXEMPTING_CLASSES = ("foreign-home", "self-contained-no-lib")
 # without `parity_pinned` truthy is refused (check() reports it).
 RESOLVER_LAYERS = [
     {"path": "src/engram/tools/_owner_read.py", "layer": "tools", "parity_pinned": True},
+    {"path": "src/engram/hooks/claude/_hooklib.py", "layer": "hooks", "parity_pinned": True},
+    {"path": "src/engram/hooks/claude/_prompthooklib.py", "layer": "prompt-hooks", "parity_pinned": True},
+    {"path": "src/engram/tools/forum_api.py", "layer": "shared-bin", "parity_pinned": True},
 ]
 # The shared-resolver names the gate treats as a clean token on a line. NEW
 # RESOLVER NAMES ARE ADDED ONLY HERE (a tuple of regexes); the docstring and the

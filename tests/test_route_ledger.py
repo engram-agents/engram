@@ -2,7 +2,7 @@
 
 The surface hook (route `prompt_surface`) and the lesson-tripwire hook's
 in-turn recall (route `tool_recall`) each append ONE JSON line per fire to
-`<HOME>/.engram/probe/mods-recall/<session_id>/routes/<route>.jsonl`, but only
+`<ENGRAM_HOME>/probe/mods-recall/<session_id>/routes/<route>.jsonl`, but only
 when `<...>/<session_id>/` already exists (opt-in by presence: the probe is
 live for that session). The ledger OBSERVES -- it never changes what a hook
 renders, ranks or cuts, and a ledger failure never reaches stdout.
@@ -67,7 +67,7 @@ def _home(tmp_path, monkeypatch):
 
 
 def _probe_root(tmp_path) -> Path:
-    return tmp_path / "home" / ".engram" / "probe" / "mods-recall"
+    return tmp_path / "engram" / "probe" / "mods-recall"
 
 
 def _live(tmp_path, session=SESSION) -> Path:

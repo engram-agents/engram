@@ -1108,10 +1108,13 @@ def test_f_a_resolver_copy_beyond_the_declared_layers_is_red(tmp_path):
     assert any("3 resolver" in p and "2 declared layer" in p for p in problems)
 
 
-def test_f_the_default_declared_layers_are_the_canonical_one_only():
+def test_f_the_default_declared_layers_are_the_four_self_contained_ones():
     mod = _load()
     assert mod.RESOLVER_LAYERS == [
-        {"path": "src/engram/tools/_owner_read.py", "layer": "tools", "parity_pinned": True}
+        {"path": "src/engram/tools/_owner_read.py", "layer": "tools", "parity_pinned": True},
+        {"path": "src/engram/hooks/claude/_hooklib.py", "layer": "hooks", "parity_pinned": True},
+        {"path": "src/engram/hooks/claude/_prompthooklib.py", "layer": "prompt-hooks", "parity_pinned": True},
+        {"path": "src/engram/tools/forum_api.py", "layer": "shared-bin", "parity_pinned": True},
     ]
     assert not hasattr(mod, "MAX_RESOLVER_ENTRIES")
 
@@ -1297,6 +1300,9 @@ def test_real_tree_ratchet_is_green():
 # SHAPE of an entry; only this pin makes a new, unjustified entry visible.
 REAL_ALLOWLIST = {
     "src/engram/tools/grant_viz_operator_acl.py": "foreign-home",
+    "src/engram/viz/agents.py": "foreign-home",
+    "src/engram/hooks/claude/engram-loop-arm-stop-hook.py": "self-contained-no-lib",
+    "src/engram/hooks/claude/engram-stale-tree-warn-hook.py": "self-contained-no-lib",
 }
 
 

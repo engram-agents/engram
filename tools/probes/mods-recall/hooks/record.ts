@@ -36,6 +36,8 @@ export type Io = {
   model: () => Promise<string>
   engineVersion: () => Promise<string>
   homeDir: () => Promise<string | undefined>
+  /** ENGRAM_HOME, or undefined when unset */
+  engramHome: () => Promise<string | undefined>
   pluginRoot: string
 }
 
@@ -114,11 +116,38 @@ export function pad3(n: number): string {
   return String(Math.max(0, Math.floor(n))).padStart(3, '0')
 }
 
+/** The unconfigured probeDir under an ENGRAM_HOME: the hook (_hooklib.route_probe_dir) uses the same path. */
+export const PROBE_SUBPATH = '/probe/mods-recall'
+
+/**
+ * ENGRAM_HOME when it is set, non-empty and RELATIVE; null otherwise. A relative value resolves against
+ * the calling process's cwd, so this mod, the hooks, the owner daemon and the server would each land in a
+ * different home: it is unsupported and the probe stays off (alpha #3863, 6b; the hooks refuse it too).
+ */
+export async function relativeEngramHome(io: Io): Promise<string | null> {
+  const eh = (await io.engramHome()) ?? ''
+  if (eh === '' || eh.startsWith('/') || eh === '~' || eh.startsWith('~/')) return null
+  return eh
+}
+
+/**
+ * The probeDir to use when the option was left at its default: `<ENGRAM_HOME>/probe/mods-recall`
+ * when ENGRAM_HOME is set, absolute (or `~`-led) and non-empty, else the `~/.engram/...` default.
+ * (A relative ENGRAM_HOME never gets here: initSession refuses it first.)
+ */
+export async function defaultProbeDir(io: Io, fallback: string): Promise<string> {
+  const eh = (await io.engramHome())?.replace(/\/+$/, '') ?? ''
+  if (eh.startsWith('/') || eh === '~' || eh.startsWith('~/')) return eh + PROBE_SUBPATH
+  return fallback
+}
+
 /**
  * `~` and `~/x` -> HOME-relative; null when HOME is needed but unset (the
  * caller then disables the probe: it never writes to a guessed path).
+ * An unconfigured probeDir (the DEFAULTS value) follows ENGRAM_HOME first.
  */
-export async function resolveProbeDir(io: Io, probeDir: string): Promise<string | null> {
+export async function resolveProbeDir(io: Io, probeDir: string, isDefault = false): Promise<string | null> {
+  if (isDefault) probeDir = await defaultProbeDir(io, probeDir)
   if (probeDir !== '~' && !probeDir.startsWith('~/')) return probeDir
   const home = await io.homeDir()
   if (home === undefined || home === '') return null

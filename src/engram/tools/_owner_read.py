@@ -51,8 +51,15 @@ DEFAULT_SNAPSHOT_SECONDS = 35.0
 
 
 def engram_home() -> Path:
-    """The ONE ENGRAM_HOME resolution for tools: $ENGRAM_HOME when set and non-empty, else ~/.engram."""
-    return Path(os.environ.get("ENGRAM_HOME") or Path.home() / ".engram")
+    """The ONE ENGRAM_HOME resolution for tools: $ENGRAM_HOME (default ~/.engram) when set and
+    non-empty, expanded and absolute; a RELATIVE value is refused (ValueError naming it). The self-contained layers (hooks, prompt hooks, shared-bin
+    flat copies) carry a copy of this body, pinned AST-identical by
+    tests/test_engram_home_parity_3863.py (the #3628 pattern)."""
+    raw = os.environ.get("ENGRAM_HOME") or "~/.engram"
+    home = os.path.expanduser(raw)
+    if not os.path.isabs(home):
+        raise ValueError("ENGRAM_HOME must be an absolute path, got %r" % (raw,))
+    return Path(os.path.abspath(home))
 
 
 def default_db_path() -> Path:

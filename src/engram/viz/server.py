@@ -10,8 +10,8 @@ browser. Stdlib-only. Three operating modes:
 * Auto-detect (default — no flags): scan accessible /home/* dirs + running
   user's home for .engram*/ folders ($ENGRAM_HOME's default is one); read agent_name from each config.json.
   If nothing found, falls back to the single-agent default (``DEFAULT_DB`` in viz/agents.py:
-  knowledge.db under ~/.engram, a literal path; DEFAULT_DB does not read $ENGRAM_HOME yet,
-  see engram-alpha#3863; agent_name lookup in viz/agents.py does read it).
+  knowledge.db under $ENGRAM_HOME, default ~/.engram, resolved once when viz/agents.py is
+  imported, see engram-alpha#3863; agent_name lookup in viz/agents.py reads it too).
   An optional --config layered on top overrides labels/default/exclude and can
   add agents that weren't auto-detected (back-compat with explicit-db entries).
 * Single-agent (--db PATH): register one anonymous 'default' agent at PATH

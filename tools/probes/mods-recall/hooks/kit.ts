@@ -21,6 +21,8 @@ export const ENGRAM_TOOL = 'mcp__plugin_engram_engram__engram_query'
 export const ENGRAM_SERVER = 'plugin_engram_engram'
 
 export type RigOptions = {
+  /** ENGRAM_HOME the mock env answers; default: unset */
+  engramHome?: string
   /** tool names `$.tool.list()` answers; default: one engram_query tool */
   tools?: string[]
   /** `$.mcp.call` behaviour per query text; default: two candidates */
@@ -64,7 +66,7 @@ export function mcpText(body: unknown) {
 export function rig(on: On, options: RigOptions = {}) {
   const clock = mock.clock(on, { now: 1_000 })
   const home = 'home' in options ? options.home : PROBE_HOME
-  mock.env(on, home === undefined ? {} : { HOME: home })
+  mock.env(on, { ...(home === undefined ? {} : { HOME: home }), ...(options.engramHome === undefined ? {} : { ENGRAM_HOME: options.engramHome }) })
 
   const seen = {
     writes: new Map<string, string>(),

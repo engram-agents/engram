@@ -38,16 +38,13 @@ from typing import Optional
 # importlib (e.g. in direct-import tests) — Python's automatic script-dir
 # addition only fires when ia.py is the __main__ entry point.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from forum_api import ForumClient, ForumHttpError, ForumNetworkError, forum_url_from_config
+from forum_api import ForumClient, ForumHttpError, ForumNetworkError, engram_home, forum_url_from_config
 
 # ---------------------------------------------------------------------------
 # Environment + paths
 # ---------------------------------------------------------------------------
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+ENGRAM_HOME = str(engram_home())
 
 # Read cursor: stores the /api/updates as_of integer.
 # Path kept stable so PR3b hook can still read it.

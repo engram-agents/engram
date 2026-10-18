@@ -48,12 +48,10 @@ from _hooklib import atomic_write_json, emit_context
 from _hooklib import import_owner_flags as _hooklib_import_owner_flags
 # #3628: the config / sticky-marker reads are non-blocking and regular-file-only.
 from _hooklib import open_regular_text
+from _hooklib import engram_home_or_exit
 from _harness import detect_harness, get_harness_budgets
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or os.path.expanduser("~/.engram")
-)
+ENGRAM_HOME = str(engram_home_or_exit())
 DB_PATH = os.path.join(ENGRAM_HOME, "knowledge.db")
 CURRENT_USER_PATH = os.path.join(ENGRAM_HOME, "current_user.json")
 CONFIG_PATH = os.path.join(ENGRAM_HOME, "config.json")

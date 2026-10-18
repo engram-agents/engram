@@ -796,7 +796,7 @@ def test_the_table_for_the_tripwire_arm_names_the_u8_quantities_and_keeps_the_ca
 
 
 def test_home_and_streams_are_restored_after_a_tripwire_run(tool, tripwire_runs):
-    """The arm points HOME at a scratch dir for the fire (route_probe_dir uses Path.home());
+    """The arm points HOME at a scratch dir for the fire (HOME is what the hook process sees; the probe dir itself sits under the scratch ENGRAM_HOME);
     the process's HOME and streams come back. Mutation: leave HOME or a stream proxy
     behind -> red."""
     assert os.environ.get("HOME") not in (None, "") and "a6-" not in os.environ["HOME"]
@@ -908,7 +908,7 @@ def test_an_exclusion_that_cannot_engage_is_an_error_not_a_clean_zero(tool, tmp_
     fail-open and drops nothing, so `opens_flag_on` would read 0 for the wrong reason. With
     exclusion ON the arm must refuse such a run loudly. Mutation: drop the engagement check
     -> measure() returns a clean-looking result -> red."""
-    needle = "return Path.home().joinpath(*ROUTE_PROBE_SUBPATH)"
+    needle = 'return engram_home() / "probe" / "mods-recall"'
 
     def break_probe(src):
         assert src.count(needle) == 1

@@ -112,7 +112,7 @@ def write_entry(engram_home, login_home=None) -> str:
         login = str(login_home) if login_home else os.path.expanduser("~")
         entry = os.path.join(login, ENTRY_NAME)
         home = os.path.abspath(str(engram_home))
-        default = os.path.join(os.path.abspath(login), ".engram")
+        default = os.path.join(os.path.abspath(login), ".engram")  # ENGRAM_HOME's default under a login home
         if os.path.realpath(home) == os.path.realpath(default):
             try:
                 st = os.lstat(entry)

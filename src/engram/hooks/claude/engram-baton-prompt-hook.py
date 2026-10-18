@@ -86,6 +86,7 @@ try:
         bootstrap_tools_dir as _bootstrap_tools_dir,
         # #3628: the cache read/write are non-blocking and regular-file-only.
         hooklib_io as _hooklib_io,
+        engram_home_or_exit as _engram_home,
     )
     _PROMPTHOOKLIB_OK = True
 except Exception as _lib_exc:
@@ -104,10 +105,9 @@ try:
 except Exception:
     _FORUM_API_OK = False
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+# The prompt-hook layer's own resolver (a parity-pinned copy in _prompthooklib, #3863). When that lib failed
+# to import, main() reports the class and exits before any use of this value.
+ENGRAM_HOME = str(_engram_home()) if _PROMPTHOOKLIB_OK else ""
 
 # Statuses that mean "closed" — these projects don't surface
 CLOSED_STATUSES = {"merged", "cancelled"}

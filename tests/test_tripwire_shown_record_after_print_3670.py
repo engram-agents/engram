@@ -91,12 +91,12 @@ def _seed_record(ids, *, route="prompt_surface", idx=0, session=SESSION):
 
 
 def _probe_lines(tmp_path, route, session=SESSION):
-    p = tmp_path / "home" / ".engram" / "probe" / "mods-recall" / session / "routes" / f"{route}.jsonl"
+    p = tmp_path / "engram" / "probe" / "mods-recall" / session / "routes" / f"{route}.jsonl"
     return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
 
 
 def _live_probe(tmp_path, session=SESSION):
-    (tmp_path / "home" / ".engram" / "probe" / "mods-recall" / session).mkdir(parents=True)
+    (tmp_path / "engram" / "probe" / "mods-recall" / session).mkdir(parents=True)
 
 
 def _load(tag, terms=("alphaterm", "betaterm"), enabled=True):

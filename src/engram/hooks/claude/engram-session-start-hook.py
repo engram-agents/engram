@@ -87,12 +87,10 @@ from _hooklib import probe_unknown_line, write_probe_unknown_stderr
 # flag helper is imported through the one shared resolver (never a fixed parents[N]).
 from _hooklib import mark_probe_notice, probe_notice_due
 from _hooklib import import_owner_flags as _hooklib_import_owner_flags
+from _hooklib import engram_home_or_exit
 from _harness import detect_harness, get_harness_budgets
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or os.path.expanduser("~/.engram")
-)
+ENGRAM_HOME = str(engram_home_or_exit())
 
 # ---------------------------------------------------------------------------
 # U9 (#3735, part of #2652) -- the flagged read through the engramd owner
@@ -3441,13 +3439,13 @@ def auto_sleep_cron_block() -> str:
         "\n"
         "AUTO-SLEEP CRON-PROMPT to register (use exactly this as the CronCreate prompt):\n"
         '"AUTO-SLEEP NIGHTLY consolidation. Before consolidating: (1) Read '
-        "~/.engram/sessions/last-sleep-success.json; if a sleep completed recently "
+        f"{ENGRAM_HOME}/sessions/last-sleep-success.json; if a sleep completed recently "
         "— within roughly the last work-cycle (~18-24h; use judgment) — tonight's "
         "cohort is already consolidated, so STOP: do NOT run any sleep and do NOT "
         "advance the turn (advance is IRREVERSIBLE), report 'auto-sleep skipped: "
         "consolidated Nh ago', and exit. (2) Else check for tonight's lock at "
-        "~/.engram/sleep-locks/$(date +%Y-%m-%d).lock. If it does NOT exist: "
-        "mkdir -p ~/.engram/sleep-locks, then atomically create it (O_EXCL via "
+        f"{ENGRAM_HOME}/sleep-locks/$(date +%Y-%m-%d).lock. If it does NOT exist: "
+        f"mkdir -p {ENGRAM_HOME}/sleep-locks, then atomically create it (O_EXCL via "
         "python open(path,'x') or bash 'set -C; >file'), then proceed to step (3). "
         "If the atomic create fails (race: another session created the lock between "
         "our check and create), treat the result as the DOES-exist path and check mtime. "

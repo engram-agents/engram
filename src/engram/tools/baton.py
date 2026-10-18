@@ -55,6 +55,7 @@ from forum_api import (
     ForumClient,
     ForumHttpError,
     ForumNetworkError,
+    engram_home,
     forum_url_from_config,
 )
 
@@ -86,10 +87,7 @@ from baton_gate import (
 # Environment + paths
 # ---------------------------------------------------------------------------
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+ENGRAM_HOME = str(engram_home())
 # Exit codes
 EXIT_OK = 0
 EXIT_VALIDATION = 1
@@ -1200,12 +1198,8 @@ def _pool_sentinel() -> str:
         return _POOL_SENTINEL_CACHE[0]
 
     # Read from config.json (same pattern as engram-surface-hook.py).
-    engram_home = (
-        os.environ.get("ENGRAM_HOME")
-        or str(Path.home() / ".engram")
-    )
     try:
-        config_path = Path(engram_home) / "config.json"
+        config_path = engram_home() / "config.json"
         pu = json.loads(config_path.read_text()).get("primary_user")
         if pu:
             _POOL_SENTINEL_CACHE.append(str(pu).lower())
@@ -1446,12 +1440,8 @@ def _pool_sentinel_resolvable() -> bool:
     """
     if _POOL_SENTINEL_CACHE:
         return True
-    engram_home = (
-        os.environ.get("ENGRAM_HOME")
-        or str(Path.home() / ".engram")
-    )
     try:
-        config_path = Path(engram_home) / "config.json"
+        config_path = engram_home() / "config.json"
         if json.loads(config_path.read_text()).get("primary_user"):
             return True
     except (OSError, ValueError, AttributeError):

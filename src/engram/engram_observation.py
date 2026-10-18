@@ -1012,7 +1012,7 @@ def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
             "BEFORE RETRYING: check the engram-observe skill (Step A.4) for the "
             "pre-verification script. For JSONL files, messages may not have flushed "
             "yet — verify the quote exists in the file BEFORE calling this tool. "
-            "Run: ~/.engram/tools/verify_quote.py <file> <phrase>"
+            "Run: ${ENGRAM_HOME:-$HOME/.engram}/tools/verify_quote.py <file> <phrase>"
         )
     # Near-matches are computed against `content` -- for a PDF that's raw
     # bytes decoded as UTF-8 with errors="replace", i.e. noise. Suggesting

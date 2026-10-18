@@ -45,6 +45,16 @@ import re
 import subprocess
 import sys
 
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863 6b): it would resolve against this process's cwd, a
+# different home than the daemon's or the server's. Fail open: one stderr line, nothing written, exit 0.
+# (Inline, not from _hooklib: this hook must still run when the sibling lib cannot import.)
+_ENGRAM_HOME_RAW = os.environ.get("ENGRAM_HOME") or ""
+if _ENGRAM_HOME_RAW and not os.path.isabs(os.path.expanduser(_ENGRAM_HOME_RAW)):
+    sys.stderr.write("engram hook: ENGRAM_HOME must be an absolute path, got %r; doing nothing\n" % (_ENGRAM_HOME_RAW,))
+    sys.exit(0)
+if _ENGRAM_HOME_RAW:
+    os.environ["ENGRAM_HOME"] = os.path.abspath(os.path.expanduser(_ENGRAM_HOME_RAW))  # `~/x` -> absolute for every raw reader
+
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
     or os.path.expanduser("~/.engram")

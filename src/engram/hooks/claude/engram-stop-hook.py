@@ -192,10 +192,11 @@ import sys
 import time
 from pathlib import Path
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or os.path.expanduser("~/.engram")
-)
+_HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOKS_DIR not in sys.path:
+    sys.path.insert(0, _HOOKS_DIR)
+from _hooklib import engram_home_or_exit  # noqa: E402
+ENGRAM_HOME = str(engram_home_or_exit())
 
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:

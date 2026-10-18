@@ -62,12 +62,22 @@ def _code_lines(text):
         yield n, line
 
 
+# The plugin venv is an install artifact at ~/.engram/venv, NOT under ENGRAM_HOME
+# (README-AGENT.md:187; Borges's ruling on #3863). A code line that spells it is
+# exempt from the canonical-expression rule and from the every-`.engram`-line rule,
+# as the gate exempts the venv by name; a trailing `# ...` comment on such a line is
+# exempt with it.
+_VENV_SPELLING = re.compile(r"(?:\$HOME|~)/\.engram/venv")
+
+
 def non_canonical_lines(text):
     """[(lineno, line)] of non-comment lines where `.engram` or `ENGRAM_HOME`
     appears outside the canonical expression."""
     out = []
     for n, line in _code_lines(text):
         rest = line.replace(_CANONICAL, "")
+        if _VENV_SPELLING.search(rest):
+            rest = _VENV_SPELLING.sub("", rest).split("#", 1)[0]
         if _ENGRAM_DIR.search(rest) or "ENGRAM_HOME" in rest:
             out.append((n, line.strip()))
     return out
@@ -81,7 +91,7 @@ def lines_naming_dot_engram_without_home(text):
     return [
         (n, line.strip())
         for n, line in enumerate(text.splitlines(), 1)
-        if _ENGRAM_DIR.search(line) and "ENGRAM_HOME" not in line
+        if _ENGRAM_DIR.search(_VENV_SPELLING.sub("", line)) and "ENGRAM_HOME" not in line
     ]
 
 
@@ -189,13 +199,16 @@ def _launcher_copy(tmp_path):
 
 
 class TestLauncher:
-    def test_custom_home_with_space_and_quote_uses_that_venv(self, tmp_path):
+    def test_custom_home_with_space_and_quote_does_not_move_the_venv(self, tmp_path):
+        """The venv lives at ~/.engram/venv whatever ENGRAM_HOME says (Borges's
+        ruling on #3863, README-AGENT.md:187)."""
         home = tmp_path / "my 'custom' home"
         home.mkdir()
-        py = _stub_venv(home)
+        user_home = tmp_path / "O'Brien home"
+        py = _stub_venv(user_home / ".engram")
         r = subprocess.run(
             ["bash", str(_launcher_copy(tmp_path))],
-            capture_output=True, text=True, env=_env(ENGRAM_HOME=home, HOME=tmp_path / "nohome"),
+            capture_output=True, text=True, env=_env(ENGRAM_HOME=home, HOME=user_home),
         )
         assert r.returncode == 0, r.stderr
         assert r.stdout.startswith(f"STUB {py} "), r.stdout
@@ -220,7 +233,7 @@ class TestLauncher:
         assert r.returncode == 0, r.stderr
         assert r.stdout.startswith(f"STUB {py} "), r.stdout
 
-    def test_missing_venv_names_the_resolved_path_and_exits_1(self, tmp_path):
+    def test_missing_venv_names_the_home_venv_path_and_exits_1(self, tmp_path):
         home = tmp_path / "empty home"
         home.mkdir()
         r = subprocess.run(
@@ -228,8 +241,9 @@ class TestLauncher:
             capture_output=True, text=True, env=_env(ENGRAM_HOME=home, HOME=tmp_path),
         )
         assert r.returncode == 1
-        assert f"venv python not found at {home}/venv/bin/python3" in r.stderr
-        assert f"{home}/venv" in r.stderr.split("Run Phase 0 setup:")[1]
+        assert f"venv python not found at {tmp_path}/.engram/venv/bin/python3" in r.stderr
+        assert "~/.engram/venv" in r.stderr.split("Run Phase 0 setup:")[1]
+        assert f"{home}/venv" not in r.stderr  # ENGRAM_HOME does not move the venv
 
 
 MONITORS = [

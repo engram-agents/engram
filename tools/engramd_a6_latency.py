@@ -964,8 +964,8 @@ def _bind_tripwire(home: Path, exclusion: bool, hook_path: Path, cleanups: List[
     """-> (baseline_fn, owner_fn, answers_match, answer_size, extra_result_keys).
 
     HOME is pointed at a scratch directory for the whole arm: the exclusion probe is live
-    when `$HOME/.engram/probe/mods-recall/<session_id>/` exists, and `route_probe_dir()` uses
-    `Path.home()` of the HOOK PROCESS, not ENGRAM_HOME. With exclusion ON that directory is
+    when `<ENGRAM_HOME>/probe/mods-recall/<session_id>/` exists (`route_probe_dir()` follows the
+    hook process's ENGRAM_HOME, which is `home` here). With exclusion ON that directory is
     created by each path's `prepare()` (one session per path and thread, plus a session marker
     and sessions/ dir so the shown record is written too); with it OFF nothing is created.
     `cleanups` undoes HOME and the stream proxies.
@@ -1001,7 +1001,7 @@ def _bind_tripwire(home: Path, exclusion: bool, hook_path: Path, cleanups: List[
     saved_home = os.environ.get("HOME")
     scratch_home = Path(tempfile.mkdtemp(prefix="a6-hookhome-"))
     os.environ["HOME"] = str(scratch_home)
-    probe_root = scratch_home / ".engram" / "probe" / "mods-recall"
+    probe_root = home / "probe" / "mods-recall"
 
     def restore_home():
         if saved_home is None:

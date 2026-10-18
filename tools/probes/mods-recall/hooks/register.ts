@@ -1,5 +1,5 @@
 import type { Register } from 'claude-code'
-import { parseConfig } from './config.ts'
+import { DEFAULTS, parseConfig } from './config.ts'
 import { discoverServer } from './recall.ts'
 import {
   RATE_DESCRIPTION,
@@ -11,6 +11,7 @@ import {
   SAFE_ID,
   logOnce,
   newProbe,
+  relativeEngramHome,
   resolveProbeDir,
   writeUnderRoot,
   type Eng,
@@ -97,6 +98,7 @@ function makeIo($: Eng): Io {
     model: () => $.session.model(),
     engineVersion: async () => (await $.session.version()).version,
     homeDir: () => $.env.get('HOME'),
+    engramHome: () => $.env.get('ENGRAM_HOME'),
     pluginRoot: $.plugin.root,
   }
 }
@@ -114,7 +116,14 @@ function flushConfigLog(io: Io, lines: string[]): void {
 async function initSession(io: Io, probe: Probe): Promise<void> {
   const rawId = await io.sessionId()
   const sessionId = SAFE_ID.test(rawId) ? rawId : rawId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 100) || 'session'
-  const dir = await resolveProbeDir(io, probe.cfg.probeDir)
+  const isDefaultDir = probe.cfg.probeDir === DEFAULTS.probeDir
+  const relative = isDefaultDir ? await relativeEngramHome(io) : null
+  if (relative !== null) {
+    probe.disabled = 'relative-engram-home'
+    logOnce(io, probe, 'relative-engram-home', `ENGRAM_HOME must be an absolute path, got ${JSON.stringify(relative)}; probe inactive`)
+    return
+  }
+  const dir = await resolveProbeDir(io, probe.cfg.probeDir, isDefaultDir)
   if (dir === null) {
     probe.disabled = 'no-home'
     logOnce(io, probe, 'no-home', 'HOME is unset and probeDir starts with ~; probe inactive (never writing to a guessed path)')

@@ -40,11 +40,9 @@ _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import open_regular_text
+from _hooklib import engram_home_or_exit
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+ENGRAM_HOME = str(engram_home_or_exit())
 SLEEP_MARKER = os.path.join(ENGRAM_HOME, "sessions", "last-sleep-success.json")
 
 # Hours since last successful sleep below which the nudge is suppressed.

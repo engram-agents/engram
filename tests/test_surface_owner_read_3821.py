@@ -798,7 +798,7 @@ def test_c2_flag_on_a_full_fire_opens_the_store_zero_times(owner_kind, probe_liv
     set_config(home, flag=True, exclusion=exclusion,
                extra={"attached_packs": [{"id": "pk", "path": str(pack), "enabled": True}]})
     if probe_live:
-        probe = Path(str(home / "h")) / ".engram" / "probe" / "mods-recall" / SID
+        probe = Path(str(home)) / "probe" / "mods-recall" / SID
         (probe / "routes").mkdir(parents=True)
     mod = load_hook(home, monkeypatch)
     seen = []

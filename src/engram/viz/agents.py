@@ -33,7 +33,8 @@ from .data.sqlite_ro import connect_ro
 # byte-identical served-output contract this PR's acceptance gates check.
 _disc_log = logging.getLogger("viz.agents.discover")
 
-DEFAULT_DB = str(Path.home() / ".engram" / "knowledge.db")
+_ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+DEFAULT_DB = str(Path(_ENGRAM_HOME) / "knowledge.db")
 DEFAULT_PORT = 5001
 
 # Agent registry — populated in main() from --config or --db.

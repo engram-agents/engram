@@ -59,6 +59,36 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 
+def engram_home() -> Path:
+    """The ENGRAM home for this layer: $ENGRAM_HOME (default ~/.engram) when set and non-empty,
+    expanded and absolute; a RELATIVE value is refused (ValueError naming it). A copy of
+    tools/_owner_read.engram_home() (the canonical body), kept
+    here because this layer must stay self-contained; tests/test_engram_home_parity_3863.py pins
+    the two AST-identical (the #3628 pattern)."""
+    raw = os.environ.get("ENGRAM_HOME") or "~/.engram"
+    home = os.path.expanduser(raw)
+    if not os.path.isabs(home):
+        raise ValueError("ENGRAM_HOME must be an absolute path, got %r" % (raw,))
+    return Path(os.path.abspath(home))
+
+
+def engram_home_or_exit() -> Path:
+    """engram_home() for a hook's import-time use: a refused (relative) ENGRAM_HOME is a fail-open
+    exit, not a traceback. The hook prints ONE stderr line naming the value, writes nothing and exits 0
+    (Claude Code reads any other non-zero exit as a non-blocking error and still shows the trace)."""
+    try:
+        home = engram_home()
+    except ValueError as exc:
+        sys.stderr.write("engram hook: %s; doing nothing\n" % (exc,))
+        sys.exit(0)
+    raw = os.environ.get("ENGRAM_HOME")
+    if raw and raw != str(home):
+        # `~/x` or `/a/../b`: modules that read the raw env var (the log emitter, the telemetry store)
+        # must see the same absolute home, not a literal `~` directory under the cwd.
+        os.environ["ENGRAM_HOME"] = str(home)
+    return home
+
+
 def resolve_tools_dir(marker_filename: str) -> Optional[Path]:
     """Resolve `tools/` across both build topologies and add it to sys.path.
 
@@ -377,9 +407,7 @@ def atomic_write_json(path, data, *, indent=None, encoding=None):
 # `head_budget` numbers a caller passes in here as `budget` / uses to pick
 # its own `target`.
 
-_ENGRAM_HOME_FOR_OVERFLOW_PLACEHOLDER = os.environ.get("ENGRAM_HOME") or str(
-    Path.home() / ".engram"
-)
+_ENGRAM_HOME_FOR_OVERFLOW_PLACEHOLDER = str(engram_home_or_exit())
 
 
 def _placeholder_overflow_path() -> str:
@@ -909,12 +937,13 @@ def emit_context(
 #
 #   <probeDir>/<session_id>/routes/<route>.jsonl
 #
-# probeDir rule (matches the mod exactly: config.ts DEFAULTS.probeDir =
-# '~/.engram/probe/mods-recall', record.ts resolveProbeDir = HOME-relative):
-# `$HOME/.engram/probe/mods-recall`, via Path.home(). NOT $ENGRAM_HOME -- the
-# mod derives its root from the user's home directory, so ENGRAM_HOME (which
-# may point at another data dir) must not move the ledger away from the
-# directory the probe is actually reading.
+# probeDir rule (mirrors the mod's default: config.ts DEFAULTS.probeDir
+# '~/.engram/probe/mods-recall', resolved by record.ts defaultProbeDir against
+# ENGRAM_HOME when that is set): `<engram_home()>/probe/mods-recall`, via the
+# layer's engram_home(). The mod and this hook must name the same directory,
+# or the hook records nothing for a probe that is live (alpha #3863, 6b; the
+# mod side and the hook side are pinned together by
+# tests/test_route_probe_dir_parity_3863.py).
 #
 # Opt-in by presence: nothing is written unless `<probeDir>/<session_id>/`
 # already exists. Absence of that directory means "the probe is not live for
@@ -934,8 +963,6 @@ def emit_context(
 import hashlib as _hashlib
 import time as _time
 
-ROUTE_PROBE_SUBPATH = (".engram", "probe", "mods-recall")
-
 # Per-candidate signal fields read from the route's own response. A field the
 # response does not carry for a candidate is null, and its name is listed once
 # in the line's `missing_signals`.
@@ -949,8 +976,8 @@ _ROUTE_SIGNAL_ALIASES = {"utility": ("utility", "utility_score")}
 
 
 def route_probe_dir() -> Path:
-    """`$HOME/.engram/probe/mods-recall` (see the block comment above)."""
-    return Path.home().joinpath(*ROUTE_PROBE_SUBPATH)
+    """`<engram_home()>/probe/mods-recall` (see the block comment above)."""
+    return engram_home() / "probe" / "mods-recall"
 
 
 def prompt_fire_key(prompt_text: str) -> str:

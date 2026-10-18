@@ -70,9 +70,9 @@ def _hooklib():
     return _hooklib
 
 
-def _probe_live(user_home: Path) -> Path:
-    """The route probe is live for SESSION when its dir exists under $HOME (route_probe_dir)."""
-    d = user_home.joinpath(".engram", "probe", "mods-recall", SESSION)
+def _probe_live(engram_home: Path) -> Path:
+    """The route probe is live for SESSION when its dir exists under ENGRAM_HOME (route_probe_dir)."""
+    d = engram_home.joinpath("probe", "mods-recall", SESSION)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -95,7 +95,7 @@ def test_a_flag_on_exclusion_on_probe_live_a_full_fire_opens_the_store_zero_time
     set_config(home, flag=True, extra=EXCLUSION_ON)
     user_home = tmp_path / "userhome"
     monkeypatch.setenv("HOME", str(user_home))
-    probe = _probe_live(user_home)
+    probe = _probe_live(home)
     mod = load_hook(home, monkeypatch)
     with owner_of(owner_kind, home):
         seen = spying_read(monkeypatch)
@@ -264,7 +264,7 @@ def test_write_route_ledger_passes_the_connection_through(home, tmp_path, monkey
     monkeypatch.setenv("ENGRAM_HOME", str(home))
     user_home = tmp_path / "userhome"
     monkeypatch.setenv("HOME", str(user_home))
-    _probe_live(user_home)
+    _probe_live(home)
     hl = _hooklib()
     got = []
     monkeypatch.setattr(hl, "_focused_ids", lambda read_conn=None: (got.append(read_conn), (set(), True))[1])
@@ -378,7 +378,7 @@ def test_g_on_failure_is_threaded_through_both_resolver_builders(home, tmp_path,
     monkeypatch.setenv("ENGRAM_HOME", str(home))
     user_home = tmp_path / "userhome"
     monkeypatch.setenv("HOME", str(user_home))
-    _probe_live(user_home)
+    _probe_live(home)
     hl = _hooklib()
     boom = ec.OwnerReadError("rejected")
     heard = []
@@ -413,7 +413,7 @@ def test_g_tripwire_flag_on_a_focused_template_refusal_is_recorded_once_and_the_
     user_home = tmp_path / "userhome"
     monkeypatch.setenv("HOME", str(user_home))
     if probe_live:
-        _probe_live(user_home)
+        _probe_live(home)
     mod = load_hook(home, monkeypatch)
     real = ec.read
 

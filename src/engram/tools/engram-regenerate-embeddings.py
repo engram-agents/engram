@@ -238,7 +238,7 @@ def backfill_embeddings(engram_home: Path, json_output: bool = False) -> None:
     if not db_path.exists():
         print(
             f"ERROR: knowledge.db not found at {db_path}\n"
-            "  Run: sqlite3 ~/.engram/knowledge.db < ~/.engram/knowledge.sql  first.",
+            "  Run: sqlite3 \"${ENGRAM_HOME:-$HOME/.engram}/knowledge.db\" < \"${ENGRAM_HOME:-$HOME/.engram}/knowledge.sql\"  first.",
             file=sys.stderr,
         )
         sys.exit(1)

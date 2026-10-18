@@ -68,10 +68,11 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+_HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOKS_DIR not in sys.path:
+    sys.path.insert(0, _HOOKS_DIR)
+from _hooklib import engram_home_or_exit  # noqa: E402
+ENGRAM_HOME = str(engram_home_or_exit())
 SESSIONS_DIR = os.path.join(ENGRAM_HOME, "sessions")
 
 _this_dir = str(Path(__file__).resolve().parent)

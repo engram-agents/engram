@@ -37,10 +37,16 @@ from collections import Counter, defaultdict
 from datetime import date, datetime
 from pathlib import Path
 
-ENGRAM_HOME = Path(
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+# The ONE ENGRAM-home resolver for tools lives beside this file (U14, #3862); resolve the package root
+# through the symlink so `from tools import ...` works run as a script, loaded by path, or from the
+# flattened plugin layout (same shim as reconcile_lesson_demotions.py).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+
+from tools import _owner_read as owner_read  # noqa: E402
+
+ENGRAM_HOME = owner_read.engram_home()
 LOG_PATH = Path(
     os.environ.get("ENGRAM_DEFERENCE_LOG", str(ENGRAM_HOME / "deference-detector.log"))
 )

@@ -50,15 +50,13 @@ from _status_derive import (  # noqa: E402
     _UNSET,
     LOOP_MODE_PATH,
 )
+from forum_api import engram_home  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Environment + paths
 # ---------------------------------------------------------------------------
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+ENGRAM_HOME = str(engram_home())
 
 # forum-read-cursor.txt is deprecated/vestigial — read-state is pure-server now (v2).
 # Neither `forum read` nor the forum prompt-hook consumes this file anymore.

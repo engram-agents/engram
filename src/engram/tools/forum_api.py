@@ -25,6 +25,7 @@ import socket
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 # Exit codes 0/2/3/4 mirror forum.py; EXIT_STATE=5 is a forum_api extension (ColleagueGateError).
@@ -38,6 +39,19 @@ EXIT_STATE       = 5
 # ---------------------------------------------------------------------------
 # Exception hierarchy
 # ---------------------------------------------------------------------------
+
+
+def engram_home() -> Path:
+    """The ENGRAM home for the shared-bin flat copies (ia, forum, _status_derive, baton):
+    $ENGRAM_HOME (default ~/.engram) when set and non-empty, expanded and absolute; a RELATIVE value is refused (ValueError naming it). A copy of
+    tools/_owner_read.engram_home() (the canonical body): ia and forum run as flat copies in
+    /home/agents-shared/bin with only this module beside them, so they cannot import _owner_read.
+    tests/test_engram_home_parity_3863.py pins the copies AST-identical (the #3628 pattern)."""
+    raw = os.environ.get("ENGRAM_HOME") or "~/.engram"
+    home = os.path.expanduser(raw)
+    if not os.path.isabs(home):
+        raise ValueError("ENGRAM_HOME must be an absolute path, got %r" % (raw,))
+    return Path(os.path.abspath(home))
 
 
 class ForumApiError(Exception):

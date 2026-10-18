@@ -50,18 +50,21 @@ import json
 import os
 import socket
 import time
+import sys
 import urllib.request
 from pathlib import Path
 from typing import Any, Optional
+
+# forum_api.py sits beside this file in the plugin tree and in the shared-bin flat copies; it owns
+# the layer's engram_home() (see its docstring), so a direct import of this module finds it too.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from forum_api import engram_home  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Environment + paths  (mirrored exactly from tools/forum.py — keep in sync)
 # ---------------------------------------------------------------------------
 
-ENGRAM_HOME: str = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+ENGRAM_HOME: str = str(engram_home())
 
 # loop-mode.json — the agent's own loop marker (written by engram-loop).
 LOOP_MODE_PATH: str = os.path.join(ENGRAM_HOME, "loop-mode.json")

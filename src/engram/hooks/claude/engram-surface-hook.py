@@ -24,12 +24,14 @@ from pathlib import Path
 HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+if HOOK_DIR not in sys.path:
+    sys.path.insert(0, HOOK_DIR)
+from _hooklib import engram_home_or_exit  # noqa: E402
+
+
 def _resolve_engram_home() -> str:
     """Per-install data dir: knowledge.db, sockets, briefing, history."""
-    return (
-        os.environ.get("ENGRAM_HOME")
-        or os.path.expanduser("~/.engram")
-    )
+    return str(engram_home_or_exit())
 
 
 ENGRAM_HOME = _resolve_engram_home()

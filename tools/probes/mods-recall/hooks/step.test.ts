@@ -7,6 +7,7 @@ import {
   LX,
   OB,
   candidateRow,
+  PROBE_HOME,
   PROBE_ROOT,
   START,
   STEP_RESULT,
@@ -200,6 +201,29 @@ test('HOME unset with a ~ probeDir: probe inactive, nothing written anywhere', a
   expect(seen.writes.size).toBe(0)
   expect(seen.registered.length).toBe(0)
   expect(seen.logs.some(l => l.includes('HOME is unset'))).toBe(true)
+})
+
+// alpha #3863 6b: the default probeDir follows ENGRAM_HOME, exactly as the hook's
+// _hooklib.route_probe_dir() does (pinned from the Python side by tests/test_route_probe_dir_parity_3863.py).
+test('default probeDir follows an absolute ENGRAM_HOME', async ($, on) => {
+  const { seen } = rig(on, { engramHome: '/eh-store' })
+  await $.session.start(START)
+  expect(seen.writes.has(`/eh-store/probe/mods-recall/sess-1/session.json`)).toBe(true)
+  expect([...seen.writes.keys()].some(k => k.startsWith(`${PROBE_HOME}/.engram/`))).toBe(false)
+})
+
+test('default probeDir ignores an EMPTY ENGRAM_HOME and uses HOME', async ($, on) => {
+  const { seen } = rig(on, { engramHome: '' })
+  await $.session.start(START)
+  expect(seen.writes.has(`${PROBE_ROOT}/session.json`)).toBe(true)
+})
+
+test('a RELATIVE ENGRAM_HOME is refused: probe inactive, nothing written, one log line naming the value', async ($, on) => {
+  const { seen } = rig(on, { engramHome: 'rel/store' })
+  await $.session.start(START)
+  expect(seen.writes.size).toBe(0)
+  expect(seen.registered.length).toBe(0)
+  expect(seen.logs.filter(l => l.includes('ENGRAM_HOME must be an absolute path') && l.includes('rel/store')).length).toBe(1)
 })
 
 test('session.start registers the rate tool and writes session.json', async ($, on) => {
