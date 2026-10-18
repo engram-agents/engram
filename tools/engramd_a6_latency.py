@@ -183,6 +183,9 @@ RUNTIME_FILES = {
     # flag states, and scanning what it loaded from the build; the closure cell keeps this list honest). The
     # calibration block's EngramClient loads the server runtime, hence the many engram_*.py modules and server.py.
     "hooks/engram-session-start-hook.py": "src/engram/hooks/claude/engram-session-start-hook.py",
+    # #3907: the per-seat home registry (#3863 PR 5). The session-start hook imports it to record a non-default
+    # home; without this entry the closure cell flags it. tiers.json ships it (convenience tier).
+    "engram_home_registry.py": "src/engram/engram_home_registry.py",
     # #3821: the surface arm's hook. Its fire loads nothing the tripwire / session-start entries above do not already
     # cover (derived by firing the built hook; the closure cell in tests/test_engramd_a6_latency.py keeps it honest).
     "hooks/engram-surface-hook.py": "src/engram/hooks/claude/engram-surface-hook.py",
