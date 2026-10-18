@@ -741,6 +741,10 @@ def _our_diff_files():
     merge-base with origin/dev, so what dev already carries is not ours. Without an
     origin/dev ref it falls back to the sweep's base commit, but only while PR 3a is
     not yet in the history (otherwise 3a's files would read as ours)."""
+    if _git("cat-file", "-e", "origin/dev:tests/test_prose_home_sweep_3863.py").returncode == 0:
+        # Dev already carries the sweep and this test: the scope guards are retired. A later
+        # PR (6c, and the venv ruling's fixes to the loop skill) legitimately edits these files.
+        pytest.skip("the sweep is already in dev; its scope guards are retired")
     mb = _git("merge-base", "HEAD", "origin/dev")
     if mb.returncode == 0:
         ref = mb.stdout.strip()
