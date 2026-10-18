@@ -26,6 +26,31 @@ three of the issue's 13 files (the `migrate_*` one-shots) are manifest-excluded
 and never ship, but the issue names them as positive controls, so the gate
 reads the source tree, not the build manifest.
 
+THE VENV EXEMPTION. The plugin venv lives at ~/.engram/venv REGARDLESS of
+ENGRAM_HOME (README-AGENT.md: it "must live at ~/.engram/venv/"); it is an
+installation artifact, not data of the ENGRAM home, so counting it would leave a
+baseline that could never reach zero. Ruling: Borges (design seat), #3863
+comment 6243172448, 2026-10-17. The forms are listed by name in
+VENV_EXEMPT_FORMS and ONLY those textual forms are exempt: `.engram/venv` when
+the next character is a path separator, whitespace, a quote, a backtick, `)`,
+`]`, `,`, `:`, `;`, a sentence-final `.` (a `.` followed by whitespace, a closing
+quote or backtick, or the end of the line, so `venv.old` and `venv.bak` are NOT
+exempt) or the end of the line, and the quoted-segment forms
+`".engram" / "venv"` and `".engram", "venv"`. Each match is masked on its own
+before the SPELLINGS run, so a data-home spelling elsewhere on the same line is
+still a violation (`cp ~/.engram/venv/bin/x ~/.engram/knowledge.db` counts 1).
+`.engram/venvs`, `.engram/venv-old` and `.engram/venv_x` are not exempt. The
+clean-token tests (ENGRAM_HOME, RESOLVER_TOKENS) run on the original line.
+A venv form is exempt only if no `..` path segment follows it in the same path
+token (form a: a `/..` later in the same run of non-whitespace, non-quote
+characters; form b: a later `".."` quoted segment of the same chain): a
+traversal out of the venv path, such as `~/.engram/venv/../knowledge.db`,
+reaches the data home and is treated as a data-home spelling, a violation. A
+`..` in a separate token (`~/.engram/venv/bin/a ../x`) does not disqualify.
+Bounds: the exemption is textual, so a URL or markdown link that contains
+`.engram/venv` is exempt too (a small widening: it was a violation before), and
+a traversal written in a form the patterns do not recognise stays invisible.
+
 KNOWN BOUNDS (the instrument is the issue's floor, made wider, not a proof):
   * Only the SCAN_PREFIXES trees are read. src/forum (146 tracked files) and
     every other tree outside both prefixes are NOT scanned; it is not measured
@@ -245,6 +270,39 @@ SPELLINGS = [
 ]
 
 
+# THE VENV EXEMPTION. The plugin venv lives at ~/.engram/venv REGARDLESS of
+# ENGRAM_HOME (README-AGENT.md: it "must live at ~/.engram/venv/"): it is an
+# installation artifact, not data of the ENGRAM home (Borges, design seat, #3863
+# comment 6243172448, 2026-10-17). Exempt BY NAME, and only these textual forms,
+# masked PER MATCH before the SPELLINGS run so a data-home spelling elsewhere on
+# the same line is still found.
+VENV_EXEMPT_FORMS = (
+    # (a) `.engram/venv` followed by a path separator, whitespace, a quote, a
+    # backtick, `)`, `]`, `,`, `:`, `;`, a sentence-final `.` (followed by
+    # whitespace, a closing quote or backtick, or the end of the line) or the end
+    # of the line. `.engram/venvs`,
+    # `.engram/venv-old`, `.engram/venv_x`, `.engram/venvy` do not match.
+    r"\.engram/venv(?=[/\s\"'`)\],:;]|\.(?:[\s\"'`]|$)|$)"
+    # not when a `..` path segment follows in the same path token: a traversal
+    # out of the venv path reaches the data home
+    r"(?![^\s\"'`]*/\.\.(?:[/\s\"'`]|$))",
+    # (b) the quoted-segment forms `".engram" / "venv"` and `".engram", "venv"`
+    # (either quote kind).
+    r"""["']\.engram["']\s*[/,]\s*["']venv["']"""
+    # not when a later quoted segment of the same chain is ".."
+    r"""(?!(?:\s*[/,]\s*["'][^"']*["'])*?\s*[/,]\s*["']\.\.["'])""",
+)
+_VENV_EXEMPT_RES = tuple(re.compile(f) for f in VENV_EXEMPT_FORMS)
+_VENV_MASK = "_venv_"  # neutral: no SPELLINGS row can match it
+
+
+def _mask_venv(line):
+    """The line with every venv-path form replaced by a neutral token."""
+    for rx in _VENV_EXEMPT_RES:
+        line = rx.sub(_VENV_MASK, line)
+    return line
+
+
 def _line_is_clean(line):
     """C1: a spelling line is clean when it names ENGRAM_HOME or calls the
     shared resolver."""
@@ -291,7 +349,8 @@ def violating_lines(root):
         for lineno, line in enumerate(text.split("\n"), 1):
             if _line_is_clean(line):
                 continue
-            names = [name for name, rx in SPELLINGS if rx.search(line)]
+            masked = _mask_venv(line)
+            names = [name for name, rx in SPELLINGS if rx.search(masked)]
             if names:
                 rows.append((lineno, line, names))
         if rows:
@@ -314,8 +373,9 @@ def violations(root):
         for _, line, names in rows:
             for name in names:
                 if name not in hits:
-                    m = rx_by_name[name].search(line)
-                    hits[name] = line[max(0, m.start() - 40) : m.end() + 40].strip()
+                    masked = _mask_venv(line)
+                    m = rx_by_name[name].search(masked)
+                    hits[name] = masked[max(0, m.start() - 40) : m.end() + 40].strip()
         out[rel] = hits
     return out
 

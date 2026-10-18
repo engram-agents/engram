@@ -443,6 +443,171 @@ def test_dangling_message_names_every_scanned_prefix(tmp_path):
     assert "src/engram/" in msg and "src/build/" in msg
 
 
+# -- THE VENV EXEMPTION (Borges, #3863): the plugin venv lives at ~/.engram/venv
+# regardless of ENGRAM_HOME, an installation artifact and not data of the home.
+
+EXEMPT_VENV_LINES = [
+    "PY=~/.engram/venv/bin/python3",
+    "PY=$HOME/.engram/venv/bin/python3",
+    "PY=${HOME}/.engram/venv",
+    'p = os.path.expanduser("~/.engram/venv/bin/python3")',
+    'p = Path.home() / ".engram" / "venv"',
+    'p = Path.home() / ".engram" / \'venv\' / "bin"',
+    'p = os.path.join(os.path.expanduser("~"), ".engram", "venv")',
+    "p = os.path.join(h, '.engram', 'venv')",
+    'p = Path.home() / ".engram"/"venv"',
+    # the character after `venv`
+    "run ~/.engram/venv ",
+    'run "~/.engram/venv"',
+    "run '~/.engram/venv'",
+    "run `~/.engram/venv`",
+    "run (~/.engram/venv)",
+    "run [~/.engram/venv]",
+    "run ~/.engram/venv, x",
+    "run ~/.engram/venv: x",
+    "run ~/.engram/venv; x",
+    "run ~/.engram/venv",
+    "run ~/.engram/venv\t",
+    # a sentence-final period (a `.` followed by whitespace or the end of the line)
+    'echo "create a venv at ~/.engram/venv." >&2',
+    "create a venv at ~/.engram/venv.",
+    "create a venv at ~/.engram/venv. Then run it.",
+    "create a venv at ~/.engram/venv.\t",
+    "say 'create a venv at ~/.engram/venv.' now",
+]
+
+
+@pytest.mark.parametrize("line", EXEMPT_VENV_LINES)
+def test_venv_forms_are_not_violations(tmp_path, line):
+    mod = _load()
+    root = _repo(tmp_path, {A: line + "\n"}, baseline={})
+    assert mod.violations(root) == {}, line
+    assert mod.check(root) == []
+
+
+NOT_VENV_FORMS = [
+    "run ~/.engram/venvs/bin/python3",
+    "run ~/.engram/venv-old/bin/python3",
+    "run ~/.engram/venv_x/bin/python3",
+    "run ~/.engram/venvy",
+    "run ~/.engram/venv.old/bin/python3",
+    "run ~/.engram/venv.bak",
+    "run ~/.engram/venv.x",
+    "create a venv at ~/.engram/venv.old.",
+    'p = Path.home() / ".engram" / "venvs"',
+    'p = Path.home() / ".engram" / "venv-old"',
+    'p = os.path.join(os.path.expanduser("~"), ".engram", "venv_x")',
+]
+
+
+@pytest.mark.parametrize("line", NOT_VENV_FORMS)
+def test_near_venv_names_are_still_violations(tmp_path, line):
+    mod = _load()
+    root = _repo(tmp_path, {A: line + "\n"}, baseline={})
+    assert A in mod.violations(root), line
+
+
+SAME_LINE_CASES = [
+    "cp ~/.engram/venv/bin/python3 ~/.engram/knowledge.db",
+    "$HOME/.engram/venv/bin/python3 -m x --db $HOME/.engram/knowledge.db",
+    'p = Path.home() / ".engram" / "venv"; q = Path.home() / ".engram" / "db"',
+    "venv data dir at ~/.engram/ never",
+]
+
+
+@pytest.mark.parametrize("line", SAME_LINE_CASES)
+def test_a_data_home_spelling_beside_a_venv_path_is_still_one_violating_line(tmp_path, line):
+    """The mask is per MATCH, not per line."""
+    mod = _load()
+    root = _repo(tmp_path, {A: line + "\n"}, baseline={})
+    assert mod.violation_counts(root) == {A: 1}, line
+
+
+@pytest.mark.parametrize("line", SAME_LINE_CASES[:3])
+def test_a_venv_line_that_names_engram_home_stays_clean(tmp_path, line):
+    mod = _load()
+    root = _repo(tmp_path, {A: line + "  # ENGRAM_HOME\n"}, baseline={})
+    assert mod.violations(root) == {}
+
+
+def test_the_venv_forms_live_in_one_named_constant():
+    mod = _load()
+    assert len(mod.VENV_EXEMPT_FORMS) == 2
+    canon = ["run ~/.engram/venv/bin/python3", 'p = Path.home() / ".engram" / "venv"']
+    for pattern, example in zip(mod.VENV_EXEMPT_FORMS, canon):
+        assert re.compile(pattern).search(example), (pattern, example)
+
+
+# -- a `..` traversal out of the venv path reaches the data home --------------
+
+TRAVERSAL_LINES = [
+    "cat ~/.engram/venv/../knowledge.db",
+    "cat $HOME/.engram/venv/../knowledge.db",
+    "cat /Users/bob/.engram/venv/bin/../../knowledge.db",
+    "cat ~/.engram/venv/..",
+    "cat ~/.engram/venv/bin/../../x",
+    'p = Path.home() / ".engram" / "venv" / ".." / "knowledge.db"',
+    'p = os.path.join(os.path.expanduser("~"), ".engram", "venv", "..", "knowledge.db")',
+    'p = os.path.join(os.path.expanduser("~"), ".engram", "venv", "bin", "..", "knowledge.db")',
+    "p = Path.home() / '.engram' / 'venv' / '..' / 'knowledge.db'",
+    'p = "~/.engram/venv/../knowledge.db"',
+]
+
+
+@pytest.mark.parametrize("line", TRAVERSAL_LINES)
+def test_a_dotdot_traversal_out_of_the_venv_path_is_a_violation(tmp_path, line):
+    mod = _load()
+    root = _repo(tmp_path, {A: line + "\n"}, baseline={})
+    assert A in mod.violations(root), line
+
+
+STILL_EXEMPT_LINES = [
+    "cat ~/.engram/venv/bin/python3",
+    "cat ~/.engram/venv/lib/python3.12/site-packages",
+    "cat ~/.engram/venv/bin/a ../x",
+    "cat ~/.engram/venv/bin/a ../../x",
+    'p = Path.home() / ".engram" / "venv" / "bin" / "python3"',
+    'p = os.path.join(os.path.expanduser("~"), ".engram", "venv", "bin", "python3")',
+    'p = (Path.home() / ".engram" / "venv"), Path("..")',
+    "cat ~/.engram/venv/bin/a; cat ../x",
+]
+
+
+@pytest.mark.parametrize("line", STILL_EXEMPT_LINES)
+def test_a_dotdot_elsewhere_does_not_disqualify_a_venv_path(tmp_path, line):
+    mod = _load()
+    root = _repo(tmp_path, {A: line + "\n"}, baseline={})
+    assert mod.violations(root) == {}, line
+
+
+# -- several venv forms on one line ----------------------------------------------
+
+def test_two_venv_paths_on_one_line_are_both_masked(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {A: "cp ~/.engram/venv/bin/a ~/.engram/venv/bin/b\n"}, baseline={})
+    assert mod.violations(root) == {}
+
+
+def test_two_quoted_venv_forms_on_one_line_are_both_masked(tmp_path):
+    mod = _load()
+    line = 'q = Path.home() / ".engram" / "venv"; r = Path.home() / ".engram" / "venv"'
+    root = _repo(tmp_path, {A: line + "\n"}, baseline={})
+    assert mod.violations(root) == {}
+
+
+def test_a_mixed_form_a_and_form_b_line_is_masked(tmp_path):
+    mod = _load()
+    line = 'q = Path.home() / ".engram" / "venv"; r = "~/.engram/venv/bin/x"'
+    root = _repo(tmp_path, {A: line + "\n"}, baseline={})
+    assert mod.violations(root) == {}
+
+
+def test_two_venv_paths_then_a_data_path_is_exactly_one_violating_line(tmp_path):
+    mod = _load()
+    root = _repo(tmp_path, {A: "cp ~/.engram/venv ~/.engram/venv ~/.engram/db\n"}, baseline={})
+    assert mod.violation_counts(root) == {A: 1}
+
+
 def test_untracked_file_is_not_scanned(tmp_path):
     mod = _load()
     root = _repo(tmp_path, {}, baseline={})
@@ -455,7 +620,7 @@ def test_untracked_file_is_not_scanned(tmp_path):
 def test_spelling_in_a_skill_markdown_is_scanned(tmp_path):
     mod = _load()
     rel = "src/engram/skills/claude/engram-x/SKILL.md"
-    root = _repo(tmp_path, {rel: "run `~/.engram/venv/bin/python`\n"}, baseline={})
+    root = _repo(tmp_path, {rel: "run `~/.engram/knowledge.db`\n"}, baseline={})
     assert rel in mod.violations(root)
 
 
