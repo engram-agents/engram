@@ -775,6 +775,15 @@ done
 if [ "$_ok" -eq 0 ]; then
     for _j in 1 2 3 4 5; do
         if [ "$(_live_verdict)" = "alive" ]; then
+            # #3736: the winner's live pid is not a serving owner either -- the same rule as step 3,
+            # and this was the last path that claimed liveness without asking the socket. A BUDGETED
+            # claim ("did not serve within the probe window"), never "does not serve". Liveness is
+            # re-read before reporting (a process that died during the probe is the exited state,
+            # not the not-serving one), and nothing is launched: a second owner is the hazard.
+            _serving="$(_probe_serving)"
+            if [ "${_serving%%:*}" = "notserving" ] && [ "$(_live_verdict)" = "alive" ]; then
+                _report "ENGRAM owner is alive but NOT SERVING: another launch for engramd.pid (most likely another session's hook; this launcher's own launch died inside the watch), with ${_serving#notserving:}; it did not serve within the probe window and may still be starting, and no second owner was launched. ENGRAM_HOME=$ENGRAM_HOME"
+            fi
             exit 0
         fi
         sleep 0.2

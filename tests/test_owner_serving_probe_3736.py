@@ -584,6 +584,208 @@ def test_d_an_already_alive_owner_that_dies_during_the_probe_is_not_reported_as_
 
 
 # ---------------------------------------------------------------------------
+# (d1)-(d4) and the mutation control: the RACE re-check -- our launch died, another session's owner won
+# ---------------------------------------------------------------------------
+
+def _arrange_lost_race(seat: Seat, order: str = "pidfile-already-there"):
+    """The established race arrangement (cell F5, tests/test_owner_launcher_3663.py): the stub
+    'owner' dies at once as a loser of the OwnerAlreadyRunning race does, while a live owner for
+    THIS home appears -- already there, or written 0.3 s later. The pidfile is written by the
+    launch stub itself, so step 3 ran with NO pidfile: the hook really launches and really loses,
+    which is what makes this the race path and not the already-alive one."""
+    seat.fail_flag.write_text("x")
+    winner = subprocess.Popen(["bash", "-c", "exec -a engramd_owner sleep 30"])
+    pidfile = seat.eh / "engramd.pid"
+    if order == "pidfile-already-there":
+        seat.pre_script.write_text(f"printf %s {winner.pid} > '{pidfile}'\n")
+    else:
+        seat.pre_script.write_text(
+            f"( sleep 0.3; printf %s {winner.pid} > '{pidfile}' ) >/dev/null 2>&1 &\n")
+    return winner
+
+
+def _stop(winner) -> None:
+    winner.kill()
+    winner.wait()
+
+
+@needs_proc
+@pytest.mark.parametrize("order", ["pidfile-already-there", "pidfile-written-late"])
+def test_d1_a_lost_race_with_a_serving_winner_is_silent(probe_seat, order):
+    """Cell (d1): our launch lost the race, and the winner really SERVES. Unchanged: silence.
+    The winner's socket is a real FakeOwner (the same fixture the (a) control uses), and the raw
+    helper verdict is asserted `serving` BEFORE the run -- so the silence cannot come from a probe
+    that could not run (`ambiguous:` also stays silent)."""
+    seat = probe_seat()
+    seat.config(FLAG_ON)
+    seat.systemctl("nobus")
+    with FakeOwner(seat.eh):
+        assert _raw_probe(seat) == "serving", "the (d1) control needs a probe that really ran"
+        winner = _arrange_lost_race(seat, order)
+        try:
+            rc, out, err, elapsed = seat.run_timed(limit=15)
+        finally:
+            _stop(winner)
+    assert rc == 0, err[-300:]
+    assert (out, err) == ("", ""), (out, err)
+    assert len(seat.launched()) == 1, "the race must have been attempted (and lost)"
+    assert _hook_log_lines(seat) == [], seat.log_lines()
+    assert elapsed < 15
+
+
+@needs_proc
+@pytest.mark.parametrize("order", ["pidfile-already-there", "pidfile-written-late"])
+def test_d2_a_lost_race_with_a_live_owner_that_is_not_serving_reports_once(probe_seat, order):
+    """Cell (d2): our launch lost the race and the winner owns a live pid but never binds a
+    socket. Today this exits 0 SILENTLY; it must instead be exactly ONE report -- this launcher's
+    own launch died, ANOTHER session's launch owns the live pid, and that owner did not serve
+    within the probe window (a BUDGETED claim). No second owner is launched."""
+    seat = probe_seat()
+    seat.config(FLAG_ON)
+    seat.systemctl("nobus")
+    verdict = _raw_probe(seat)
+    assert verdict.startswith("notserving:"), verdict
+    phrase = verdict[len("notserving:"):]
+    winner = _arrange_lost_race(seat, order)
+    try:
+        rc, out, err, elapsed = seat.run_timed(limit=15)
+    finally:
+        _stop(winner)
+    assert rc == 0, err[-300:]
+    assert elapsed < 15
+    assert len(seat.launched()) == 1, "exactly one attempted launch, and no second one for the race"
+    assert _probe_was_asked(seat), "the race re-check must probe a live pid, not assume it serves"
+    lines = context_lines(_cp(rc, out, err))
+    assert len(lines) == 1, out
+    line = lines[0]
+    assert "alive but NOT SERVING" in line, line
+    assert phrase in line, (phrase, line)  # the helper's own observation, not a retyped copy
+    assert "another launch for engramd.pid" in line, line  # who owns the live pid
+    assert "most likely another session's hook" in line, line  # INFERRED, never stated as fact
+    assert "this launcher's own launch died" in line, line
+    assert "within the probe window" in line, line  # BUDGETED: never "does not serve"
+    assert "may still be starting" in line, line  # the winner is seconds old: a budgeted claim too
+    assert _physical(seat.eh) in line, line
+    assert out.count(NOT_SERVING) == 1, out
+    assert len([ln for ln in seat.log_lines() if NOT_SERVING in ln]) == 1, seat.log_lines()
+    assert len(_hook_log_lines(seat)) == 1, seat.log_lines()
+
+
+@needs_proc
+def test_d3_a_winner_that_dies_during_the_probe_is_not_reported_as_not_serving(probe_seat):
+    """Cell (d3): the winner is alive when the race re-check reads it and dies while the probe
+    runs. A process that died is not a wedged one: liveness is re-read at report time, so there
+    is NO not-serving report -- today's silent exit 0 stands. `_probe_was_asked` is asserted so
+    the green cannot come from a run in which the owner died before the re-check ever saw it."""
+    seat = probe_seat()
+    seat.config(FLAG_ON)
+    seat.systemctl("nobus")
+    winner = _arrange_lost_race(seat)
+    watcher = threading.Thread(
+        target=lambda: (_wait_for_probe_call(seat), winner.kill(), winner.wait()), daemon=True)
+    watcher.start()
+    try:
+        rc, out, err, elapsed = seat.run_timed(limit=15)
+    finally:
+        watcher.join(timeout=10)
+        if winner.poll() is None:
+            _stop(winner)
+    assert rc == 0, err[-300:]
+    assert elapsed < 15
+    assert _probe_was_asked(seat), "the state requires a live pid at the probe, dying inside it"
+    assert NOT_SERVING not in out + err, (out, err)
+    assert "could not be started" not in out, "a process that died mid-probe is not the loud path"
+    assert _hook_log_lines(seat) == [], seat.log_lines()
+
+
+@needs_proc
+def test_d4_an_ambiguous_probe_on_the_race_path_claims_nothing(tmp_path):
+    """Cell (d4): the live winner's probe cannot run (the base Seat's bundle has no
+    engramd_client.py), so the helper answers `ambiguous:`. An ambiguous probe claims NOTHING
+    about the owner: unchanged silent exit 0, and no second owner."""
+    seat = Seat(tmp_path)  # no client in the bundle: the probe CANNOT answer serving/notserving
+    seat.config(FLAG_ON)
+    seat.systemctl("nobus")
+    winner = _arrange_lost_race(seat)
+    try:
+        rc, out, err, elapsed = seat.run_timed(limit=15)
+    finally:
+        _stop(winner)
+    assert rc == 0, err[-300:]
+    assert elapsed < 15
+    assert len(seat.launched()) == 1, seat.launched()
+    assert _probe_was_asked(seat), "the ambiguous answer only means something if it was asked"
+    assert _raw_probe(seat).startswith("ambiguous:"), "the fixture must really be ambiguous"
+    assert (out, err) == ("", ""), (out, err)
+    assert _hook_log_lines(seat) == [], seat.log_lines()
+
+
+# Verbatim, from the race re-check of start-engramd-owner.sh: the ONE report this path can send.
+# Asserted present exactly once, then substituted by the mutation below, so a drifted line is loud.
+_RACE_REPORT_TARGET = (
+    '                _report "ENGRAM owner is alive but NOT SERVING: another launch for '
+    'engramd.pid (most likely another session\'s hook; this launcher\'s own launch died inside '
+    'the watch), with ${_serving#notserving:}; it did not serve within the probe window and may '
+    'still be starting, and no second owner was launched. ENGRAM_HOME=$ENGRAM_HOME"\n'
+)
+
+
+def _mutate_launcher_to_drop_the_race_report(seat: Seat) -> None:
+    """Replace the race report with a no-op in this seat's OWN COPY of the launcher, keeping the
+    probe and the re-read: the only thing removed is the line (d2) asserts on."""
+    src = LAUNCHER.read_text(encoding="utf-8")
+    assert src.count(_RACE_REPORT_TARGET) == 1, (
+        "the race report line is not present exactly once -- start-engramd-owner.sh changed")
+    seat.hook.write_text(
+        src.replace(_RACE_REPORT_TARGET, "                :  # mutation: race report removed\n"),
+        encoding="utf-8")
+
+
+@needs_proc
+def test_mutation_removing_the_race_report_reddens_d2_while_d1_stays_silent(tmp_path):
+    """(d2)'s discriminating control: run the mutant that drops only the new report. The (d2)
+    fixture then produces NO not-serving line -- its `len(lines) == 1` assertion goes red -- while
+    the (d1) fixture is still silent (green). A cell observed only to pass proves nothing; this is
+    what makes (d2)'s green evidence about the report rather than about an exit that was silent
+    anyway. The probe is asserted REACHED on both runs, so the mutant is a mutation of the report
+    only, never of the re-check."""
+    d2_dir = tmp_path / "d2"
+    d2_dir.mkdir()
+    d1_dir = tmp_path / "d1"
+    d1_dir.mkdir()
+    s2, s1 = ProbeSeat(d2_dir), ProbeSeat(d1_dir)
+    try:
+        for s in (s2, s1):
+            s.config(FLAG_ON)
+            s.systemctl("nobus")
+            _mutate_launcher_to_drop_the_race_report(s)
+
+        winner = _arrange_lost_race(s2)
+        try:
+            rc, out, err, _ = s2.run_timed(limit=15)
+        finally:
+            _stop(winner)
+        assert rc == 0, err[-300:]
+        assert _probe_was_asked(s2), "only the report was removed: the probe must still run"
+        assert NOT_SERVING not in out + err, out  # (d2)'s assertion is RED under the mutant
+        assert _hook_log_lines(s2) == [], s2.log_lines()
+
+        with FakeOwner(s1.eh):
+            winner = _arrange_lost_race(s1)
+            try:
+                rc, out, err, _ = s1.run_timed(limit=15)
+            finally:
+                _stop(winner)
+        assert rc == 0, err[-300:]
+        assert _probe_was_asked(s1), "the serving probe must still be what makes (d1) silent"
+        assert (out, err) == ("", ""), (out, err)  # (d1) stays GREEN under the same mutant
+        assert _hook_log_lines(s1) == [], s1.log_lines()
+    finally:
+        s2.close()
+        s1.close()
+
+
+# ---------------------------------------------------------------------------
 # the predicate's own falsification: the report about the probe is not the probe
 # ---------------------------------------------------------------------------
 

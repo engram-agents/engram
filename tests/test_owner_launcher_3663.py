@@ -33,10 +33,13 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 
 import pytest
+
+from _fake_owner import FakeOwner  # noqa: E402  (tests/ is on sys.path, as every sibling assumes)
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "src" / "engram"
@@ -1083,37 +1086,125 @@ def test_u4d_helper_missing_from_the_bundle_fails_to_false_and_raises_nothing(tm
 # Round 2
 # ---------------------------------------------------------------------------
 
-# ---- F5: a launch that LOST a race is silent when a live owner exists -------------------
+# ---- F5: a launch that LOST a race -- silent when the winner SERVES, loud when it does not --
 
 def _hook_lines_in_log(seat: Seat) -> list[str]:
     return [ln for ln in seat.log_lines() if "] [start-engramd-owner]" in ln]
 
 
+def _race_winner(seat: Seat, order: str):
+    """The stub 'owner' dies at once (exit 7), as a loser of the OwnerAlreadyRunning race does,
+    while a live owner for THIS home appears -- already there, or written 0.3 s later. The
+    pidfile is written by the launch stub itself, so step 3 ran with NO pidfile: the hook really
+    launches and really loses, which is what makes this the race path."""
+    winner = subprocess.Popen(["bash", "-c", "exec -a engramd_owner sleep 30"])
+    pidfile = seat.eh / "engramd.pid"
+    if order == "pidfile-already-there":
+        seat.pre_script.write_text(f"printf %s {winner.pid} > '{pidfile}'\n")
+    else:
+        seat.pre_script.write_text(
+            f"( sleep 0.3; printf %s {winner.pid} > '{pidfile}' ) >/dev/null 2>&1 &\n")
+    return winner
+
+
+def _short_home_for_socket(seat: Seat) -> Path:
+    """#3736: an ENGRAM_HOME short enough to bind `<home>/run/engramd.sock`.
+
+    AF_UNIX sun_path is 104 bytes on macOS / 108 on Linux, and pytest's tmp_path nests far deeper
+    than that for this test's long name. Same workaround, same reason, as `sock_dir` in
+    tests/test_engramd_client.py and `ProbeSeat` in tests/test_owner_serving_probe_3736.py: a short
+    mkdtemp directory, never tmp_path. The client is copied into the bundle the same way those
+    fixtures do it, so the hook's `serving` probe can import it. `seat.eh` is the ONE home every
+    Seat path (config, pidfile, log, ENGRAM_HOME) resolves from, so reassigning it moves them all.
+    """
+    d = Path(tempfile.mkdtemp(prefix="f5srv-"))
+    eh = d / "eh"
+    eh.mkdir()
+    shutil.copy(SRC / "engramd_client.py", seat.plugin / "engramd_client.py")
+    seat.eh = eh
+    return d
+
+
+def _raw_probe(seat: Seat) -> str:
+    """The helper's OWN `serving` verdict, run directly: the shell's report is composed from
+    exactly this string, so the two cannot disagree. Same mechanism, same reason, as `_raw_probe`
+    in tests/test_owner_serving_probe_3736.py: a silent cell must prove its silence came from a
+    probe that RAN and answered `serving`, not from a probe that could not run (`ambiguous:`
+    also stays silent)."""
+    seat._ship_3709_files()  # the harness's own bundle setup (Seat.run() calls it too)
+    env = {"HOME": str(seat.home), "ENGRAM_HOME": str(seat.eh),
+           "PATH": f"{seat.stubs}:{seat.tools}", "TMPDIR": str(seat.tmp)}
+    r = subprocess.run(
+        [sys.executable, str(seat.plugin / "hooks" / "_engramd_owner_hook_io.py"),
+         "serving", str(seat.eh)],
+        capture_output=True, encoding="utf-8", errors="replace", env=env,
+        cwd=str(seat.tmp), timeout=30,
+    )
+    assert r.returncode == 0, r.stderr[-300:]
+    return r.stdout.strip()
+
+
 @needs_proc
 @pytest.mark.parametrize("order", ["pidfile-already-there", "pidfile-written-late"])
-def test_f5_a_loser_whose_launch_died_is_silent_when_a_live_owner_exists(seat, order):
-    """The stub 'owner' dies at once (exit 7), as a loser of the OwnerAlreadyRunning race does,
-    while a live owner for THIS home exists. Pre-check cannot see it (no pidfile yet), so the
-    hook only learns of it by re-checking after its own launch died."""
+def test_f5_a_loser_whose_launch_died_is_silent_when_the_winner_serves(seat, order):
+    """#3736 (d1): the winner owns a live pid AND answers `ping` -- the one race outcome that
+    stays silent. The socket is REAL (FakeOwner), so this is not a sleep standing in for
+    serving."""
+    d = _short_home_for_socket(seat)
+    try:
+        seat.config(FLAG_ON)
+        seat.systemctl("nobus")
+        seat.fail_flag.write_text("x")
+        winner = _race_winner(seat, order)
+        try:
+            with FakeOwner(seat.eh):
+                # Silence is only evidence if the probe RAN and answered `serving`: a probe that
+                # cannot import the client answers `ambiguous:` and also stays silent (#3736 F5).
+                assert _raw_probe(seat) == "serving", "the F5 control needs a probe that really ran"
+                r = seat.run()
+        finally:
+            winner.kill()
+            winner.wait()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    assert len(seat.launched()) == 1, "the hook should have attempted exactly one launch"
+    assert r.returncode == 0
+    assert r.stdout == "" and r.stderr == "", (r.stdout, r.stderr)
+    assert _hook_lines_in_log(seat) == [], seat.log_lines()
+
+
+@needs_proc
+@pytest.mark.parametrize("order", ["pidfile-already-there", "pidfile-written-late"])
+def test_f5_a_loser_whose_launch_died_reports_a_live_owner_that_is_not_serving(seat, order):
+    """#3736 (d2): the same lost race, but the winner never binds a socket. A live pid is not a
+    serving owner, so the loser must say so ONCE instead of exiting silently -- while still
+    launching no second owner. The report states the bound (the probe window), never that the
+    owner does not serve."""
     seat.config(FLAG_ON)
     seat.systemctl("nobus")
+    # the probe must be able to run, or its answer would be `ambiguous:` and nothing is claimed
+    shutil.copy(SRC / "engramd_client.py", seat.plugin / "engramd_client.py")
     seat.fail_flag.write_text("x")
-    winner = subprocess.Popen(["bash", "-c", "exec -a engramd_owner sleep 30"])
+    winner = _race_winner(seat, order)
     try:
-        pidfile = seat.eh / "engramd.pid"
-        if order == "pidfile-already-there":
-            seat.pre_script.write_text(f"printf %s {winner.pid} > '{pidfile}'\n")
-        else:
-            seat.pre_script.write_text(
-                f"( sleep 0.3; printf %s {winner.pid} > '{pidfile}' ) >/dev/null 2>&1 &\n")
         r = seat.run()
     finally:
         winner.kill()
         winner.wait()
     assert len(seat.launched()) == 1, "the hook should have attempted exactly one launch"
     assert r.returncode == 0
-    assert r.stdout == "" and r.stderr == "", (r.stdout, r.stderr)
-    assert _hook_lines_in_log(seat) == [], seat.log_lines()
+    lines = context_lines(r)
+    assert len(lines) == 1, r.stdout
+    line = lines[0]
+    assert "alive but NOT SERVING" in line, line
+    assert "(last: " in line, line  # the helper's own observation travels with the claim
+    assert "another launch for engramd.pid" in line, line
+    assert "most likely another session's hook" in line, line  # INFERRED, never stated as fact
+    assert "this launcher's own launch died" in line, line
+    assert "within the probe window" in line, line  # BUDGETED: never "does not serve"
+    assert "may still be starting" in line, line  # the winner is seconds old: a budgeted claim too
+    assert _physical(seat.eh) in line, line
+    assert len(_hook_lines_in_log(seat)) == 1, seat.log_lines()
 
 
 def test_f5_control_no_live_owner_after_the_wait_is_still_the_loud_failure(seat):
