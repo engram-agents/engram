@@ -214,8 +214,9 @@ def test_constants_are_named_and_pinned():
 
 
 def test_the_closed_write_set_is_exactly_the_two_ops():
-    """8a. Adding a second write method must edit this pin (and the constant)."""
-    assert eo.WRITE_METHODS == frozenset({"use_reward", "advance_moment_cursor"})  # 2nd write: #3856
+    """8a. Adding a write method must edit this pin (and the constant). (The name predates the 2nd-4th writes and is
+    kept so the test id stays stable for the test-id-set gate; the set pinned here is now the four ops.)"""
+    assert eo.WRITE_METHODS == frozenset({"use_reward", "advance_moment_cursor", "fill_embeddings", "finish_embedding_regen"})  # 2nd write: #3856; 3rd and 4th: #3879
 
 
 @requires_linux_owner
@@ -223,7 +224,7 @@ def test_every_method_in_the_table_carries_a_kind_and_the_write_kinds_equal_the_
     assert set(owner._method_kinds) == set(owner._methods)
     assert all(k in eo.METHOD_KINDS for k in owner._method_kinds.values())
     declared_writes = {m for m, k in owner._method_kinds.items() if k == "write"}
-    assert declared_writes == {"use_reward", "advance_moment_cursor"} == set(eo.WRITE_METHODS)
+    assert declared_writes == {"use_reward", "advance_moment_cursor", "fill_embeddings", "finish_embedding_regen"} == set(eo.WRITE_METHODS)
 
 
 @requires_linux_owner
@@ -1288,7 +1289,7 @@ def test_the_owner_resolves_engram_restamp_and_config_io_in_the_flattened_layout
     code = (
         "import sys; sys.path.insert(0, sys.argv[1]);"
         "import engramd_owner as o, engram_config_io as c;"
-        "print(o.er.__file__); print(c.__file__); print(o.WRITE_METHODS == frozenset({'use_reward', 'advance_moment_cursor'}))"
+        "print(o.er.__file__); print(c.__file__); print(o.WRITE_METHODS == frozenset({'use_reward', 'advance_moment_cursor', 'fill_embeddings', 'finish_embedding_regen'}))"
     )
     out = subprocess.run([sys.executable, "-I", "-c", code, str(flat)], cwd=other, env=env, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr

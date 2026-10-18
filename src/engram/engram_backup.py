@@ -479,8 +479,24 @@ def _fts_row_predicates(columns) -> tuple:
     )
 
 
-def rebuild_fts_index(db_path: str) -> bool:
+def rebuild_fts_index_on_conn(conn: sqlite3.Connection, label: str = "<connection>") -> bool:
+    """``rebuild_fts_index`` on a connection the CALLER owns (#3879): the same
+    rebuild, but it neither opens, commits nor closes anything. Every change stays
+    in the caller's open transaction until the caller commits or rolls back.
+    ``label`` only names the store in the repair log line (and must be non-empty).
+    There is ONE body: this is ``rebuild_fts_index(label, conn=conn)``.
+    """
+    return rebuild_fts_index(label, conn=conn)
+
+
+def rebuild_fts_index(db_path: str, *, conn: "sqlite3.Connection | None" = None) -> bool:
     """Rebuild the FTS5 index from the current rows of ``nodes`` (post-restore).
+
+    ``conn`` (keyword-only, #3879): rebuild on this caller-owned connection
+    instead of opening ``db_path``; nothing is committed or closed here, the
+    caller's transaction holds the change. ``db_path`` is then only a label.
+    Without ``conn`` the behaviour is exactly the original: open, rebuild,
+    commit, close.
 
     Self-contained restore-path fix (#781): creates the FTS table if absent,
     rebuilds from all current ``nodes`` rows (so retracted rows are present in
@@ -552,7 +568,9 @@ def rebuild_fts_index(db_path: str) -> bool:
             "unattached temp DB). Pass a real file path, or skip the "
             "rebuild entirely for in-memory connections."
         )
-    conn = sqlite3.connect(db_path)
+    owns_conn = conn is None
+    if owns_conn:
+        conn = sqlite3.connect(db_path)
     try:
         # Bail early if this isn't an ENGRAM-shaped DB.
         has_nodes = conn.execute(
@@ -654,10 +672,12 @@ def rebuild_fts_index(db_path: str) -> bool:
         restored_user_version = max(incoming_user_version, 1)
         conn.execute(f"PRAGMA user_version = {restored_user_version}")
 
-        conn.commit()
+        if owns_conn:
+            conn.commit()
         return True
     finally:
-        conn.close()
+        if owns_conn:
+            conn.close()
 
 
 def verify_roundtrip(src_db_path: str) -> dict:

@@ -7518,6 +7518,7 @@ def _get_embedding_restore_flag(conn: sqlite3.Connection) -> dict:
 
 def _finalize_embedding_restore_flag(
     conn: sqlite3.Connection, counts: dict, *, respect_lease: bool = False,
+    embedder_available: "bool | None" = None,
 ) -> None:
     """Clear/set the restore-completeness flag from a FRESH state re-count,
     not from the just-completed pass's own tally (#3075 C5 round 4,
@@ -7551,6 +7552,13 @@ def _finalize_embedding_restore_flag(
     _run_db_one_time_setup now shares). A state re-count can't be fooled
     by WHY a node stayed NULL, so neither round 2's nor round 3's
     failure mode is representable through this function any more.
+
+    `embedder_available` (#3879): who answers "is the embedder available?". `None` (the default; both existing
+    callers) probes `_embedder.is_available()` in THIS process, exactly as before. A bool is used as given and
+    `_embedder` is NOT touched: the engramd owner finishes a regeneration pass the tool ran, and the embedder the
+    cause is about is the TOOL's (the one it just used), not the owner's. Probing in the owner would import
+    sentence_transformers / torch into a process whose design keeps the model out (MEASURED ~4 s resident), and
+    could pick a different cause than the direct path when the two environments differ.
 
     `counts` is still accepted (both call sites already have it in scope
     from their own pass) and used only for a diagnostic WARNING when it
@@ -7596,7 +7604,9 @@ def _finalize_embedding_restore_flag(
     # explicit ~3477 instruction to this structurally identical branch --
     # same unreachable cause, same reasoning (the toggle is retired; the
     # startup gate already refuses to start with `enabled: false`).
-    if not _embedder.is_available():
+    if embedder_available is None:
+        embedder_available = _embedder.is_available()
+    if not embedder_available:
         _cause = "embedder-unavailable"
     else:
         _cause = "per-node-failures"

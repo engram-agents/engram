@@ -674,7 +674,7 @@ def test_chain_is_in_the_method_table_displacement_guarded_with_no_registration_
     -> red. No registration verb exists on the dispatch surface."""
     assert "chain" in chain_owner._methods
     assert "chain" not in eo.NO_STORE_METHODS
-    assert {"ping", "snapshot", "read", "df", "chain", "confidence_by_type", "use_reward", "advance_moment_cursor"} == set(chain_owner._methods)  # use_reward: #3822; advance_moment_cursor: #3856
+    assert {"ping", "snapshot", "read", "df", "chain", "confidence_by_type", "use_reward", "advance_moment_cursor", "fill_embeddings", "finish_embedding_regen"} == set(chain_owner._methods)  # use_reward: #3822; advance_moment_cursor: #3856; fill_embeddings / finish_embedding_regen: #3879
     assert not [m for m in chain_owner._methods if re.search(r"regist", m, re.I)]
     tree = ast.parse(Path(eo.__file__).read_text(encoding="utf-8"))
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_dispatch")

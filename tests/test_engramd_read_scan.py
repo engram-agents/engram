@@ -486,9 +486,14 @@ _LINE_KEY = _re.compile(r":\d+$")
 # change legitimately moves its own key.
 # #3824 (U12): the first tools/ template (33b71137...), tools/reconcile_lesson_demotions.py:find_candidates.
 # #3862 (U14): the second, tools/cohort_dispatch.py:_fetch_nodes (6b8a8373...), the registry's one json_each form.
+# #3879 (U16): the three regenerate-embeddings reads: the NULL count (f0cd101d...), the NULL id list (605333c4...)
+# and the per-node embedding-text row (99da5d73...), sites tools/engram-regenerate-embeddings.py:_owner_*.
 # #3880 (U17): the dream master CLI's four statements, tools/dream_master_batch.py (safety row, the two coverage
 # aggregates, the null-embedding count).
 _FROZEN_TEMPLATE_KEYS = frozenset({
+    "f0cd101df2bf713d48b6fa7557bcfc2ac76f978ed1d552e3c94e4ca82359cfd5",
+    "605333c4d1e12407862ff5f039a4a27289380a1f01469e87456170af0f921842",
+    "99da5d73eb6250a34c5c08a053ca046d0c294cb82ac443558806325c570c66da",
     "dd2e6cba6f21ce5e503ad4df8038b2ad0dd1373b9b78eb080db4f53f2969165f",
     "dc7290f0179bba722b17491571d6a68c5b113e0626d9af887f5b782da09e9ea7",
     "d1307e3a9b89504f39d0a1d8d166c8537d1cda8e676008c74309aa5a7c83e762",

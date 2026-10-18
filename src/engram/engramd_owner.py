@@ -240,6 +240,7 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 import os
 import platform
 import queue
@@ -1799,10 +1800,15 @@ def _acl_leftovers(entries: list[str]) -> list[str]:
 # `ENGRAM_HOME/config.json`, read fresh on every call.
 
 # Every method in the table carries a kind. The write kinds are a DECLARED, CLOSED set: one constant, pinned
-# by tests/test_engramd_use_reward_3822.py to exactly {"use_reward", "advance_moment_cursor"}. An unclassified method is
+# by tests/test_engramd_use_reward_3822.py to exactly the four below. An unclassified method is
 # default-deny at dispatch.
 METHOD_KINDS = frozenset({"read", "write"})
-WRITE_METHODS = frozenset({"use_reward", "advance_moment_cursor"})  # the 2nd write: #3856
+# the 2nd write: #3856; the 3rd and 4th: #3879 (the regenerate-embeddings tool's `fill_embeddings` / `finish_embedding_regen`)
+WRITE_METHODS = frozenset({"use_reward", "advance_moment_cursor", "fill_embeddings", "finish_embedding_regen"})
+# Writes whose handler also receives the WIRE envelope's `request_id` (as a third argument): their params are a
+# closed key set that cannot carry one (`fill_embeddings`: exactly {model, items}). use_reward carries its own
+# request_id inside params and is not in this set.
+WIRE_REQUEST_ID_METHODS = frozenset({"fill_embeddings"})
 
 # The closed action enum (today one action). Anything else is refused before the store is touched.
 USE_REWARD_ACTIONS = frozenset({"mention"})
@@ -1866,7 +1872,11 @@ class _UseRewardGuard:
     """Per-op state for the authorizer: the denials seen, and the two phases in which a transaction COMMIT /
     ROLLBACK is the handler's own (a COMMIT issued from inside the shared function would be a partial commit)."""
 
-    def __init__(self, allows=None) -> None:
+    def __init__(self, allows=None, vec_allows=None) -> None:
+        # `vec_allows`: an optional extra pure predicate consulted ONLY while `vec_phase` is open (the fill op's vec
+        # mirror, #3879): the admissions that are legitimate inside the mirror and nowhere else.
+        self._vec_allows = vec_allows
+        self.vec_phase = False
         # The op's pure allowlist: `_use_reward_allows` by default, `_moment_cursor_allows` for the second write
         # (#3856). One guard, one set of COMMIT / ROLLBACK / busy-PRAGMA phases, two allowlists.
         self._allows = allows if allows is not None else _use_reward_allows
@@ -1890,6 +1900,9 @@ class _UseRewardGuard:
             self.denials.append((action_code, arg1, arg2, db_name, trigger_or_view))
             return sqlite3.SQLITE_DENY
         if self._allows(action_code, arg1, arg2, db_name, trigger_or_view):
+            return sqlite3.SQLITE_OK
+        if self.vec_phase and self._vec_allows is not None and self._vec_allows(
+                action_code, arg1, arg2, db_name, trigger_or_view):
             return sqlite3.SQLITE_OK
         self.denials.append((action_code, arg1, arg2, db_name, trigger_or_view))
         return sqlite3.SQLITE_DENY
@@ -1972,6 +1985,259 @@ def _moment_cursor_param_refusal(params) -> "dict | None":
     if not (-(2 ** 53) <= from_cursor < 2 ** 53):
         return _df_rejection(p + "from_cursor_out_of_range", "'from_cursor' is outside [-(2**53), 2**53)",
                              "send the cursor you read; values outside the JSON-safe range are refused")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# The third and fourth writes: `fill_embeddings` and `finish_embedding_regen` (#3879, U16 of #2652)
+# ---------------------------------------------------------------------------
+#
+# The regenerate-embeddings tool keeps computing vectors (no owner path loads a model); the owner gets the WRITES.
+# `fill_embeddings` is a validated compare-and-set of `nodes.embedding` for up to 50 nodes (+ a reported best-effort
+# `vec_nodes` mirror); `finish_embedding_regen` rebuilds the FTS index on the owner's connection and runs today's
+# clear-or-finalize restore-flag branch through the SAME engram_core functions with `respect_lease=True`.
+FILL_EMBEDDINGS_MAX_ITEMS = 50  # per call; enforced before any SQL
+# The store's embedding dimension. engram_core has no single constant for it (the 384 is a literal in the vec0 DDL
+# `embedding float[384]` and in the vec mirror's `len(vector) == 384`): a test ties this constant to those literals.
+FILL_EMBEDDINGS_DIM = 384
+FILL_EMBEDDINGS_VEC_SAVEPOINT = "engram_fill_vec"  # the vec mirror's own SAVEPOINT: a vec failure never poisons the fill
+
+# MEASURED (authorizer-recorded over real runs on the real schema, which carries the seven pinned `nodes` triggers):
+# NO trigger or view fires on `UPDATE nodes SET embedding` (every trigger on `nodes` is on metadata / status /
+# is_current / claim-and-text columns), and none fires during the FTS rebuild or the restore-flag writes (the finish op
+# never writes `nodes`). So the set of triggers whose statements either op admits BY NAME is empty, pinned against
+# sqlite_master (USE_REWARD_NODES_TRIGGERS_PINNED) by a test, with a positive control that a claim UPDATE does fire one.
+FILL_EMBEDDINGS_ADMITTED_TRIGGERS: frozenset = frozenset()
+FINISH_EMBEDDING_REGEN_ADMITTED_TRIGGERS: frozenset = frozenset()
+
+# fill: column-exact allowlist, MEASURED: reads of nodes.id / is_current / embedding, ONE update target nodes.embedding.
+FILL_EMBEDDINGS_READ_COLUMNS = frozenset({"id", "is_current", "embedding"})
+FILL_EMBEDDINGS_UPDATE_COLUMNS = frozenset({"embedding"})
+# The vec0 table and its shadow tables. NOT measurable on a Python whose sqlite3 cannot load an extension (the macOS
+# framework Python): the names are vec0's documented shadow set for one TEXT-keyed vector column. A name missing here
+# is a denial INSIDE the vec savepoint, which degrades to `vec_mirrored: false` (reported, the nodes writes stand)
+# rather than failing the fill.
+_VEC_TABLE_NAME = re.compile(
+    r"^vec_nodes(_(chunks|rowids|info|auxiliary|vector_chunks\d{2}|metadatachunks\d{2}|metadatatext\d{2}))?$")
+
+# finish: MEASURED over the clear branch, the finalize branch (set and clear), a missing nodes_fts (the restore case: the
+# CREATE VIRTUAL TABLE and its shadow tables), a stale under-indexed nodes_fts (the DROP + CREATE repair) and a missing
+# embedding_restore_state table (the core function's CREATE TABLE IF NOT EXISTS).
+FINISH_NODES_READ_COLUMNS = frozenset({
+    "ROWID", "id", "type", "claim", "quoted_text", "interpretation", "trigger_text", "recall_summary", "recall_keywords",
+    "status", "is_current", "embedding", "source_title", "predicted_event",
+})
+FINISH_RESTORE_STATE_READ_COLUMNS = frozenset({"singleton_key", "not_fully_restored", "null_count", "cause", "updated_at"})
+FINISH_RESTORE_STATE_UPDATE_COLUMNS = frozenset({"not_fully_restored", "null_count", "cause", "updated_at"})
+FINISH_FUNCTIONS = frozenset({"coalesce", "count"})
+FINISH_PRAGMAS = frozenset({"user_version", "data_version"})
+
+
+def _is_vec_table(name) -> bool:
+    return isinstance(name, str) and _VEC_TABLE_NAME.match(name) is not None
+
+
+def _is_fts_table(name) -> bool:
+    """The `nodes_fts` family: the virtual table, its shadow tables (`nodes_fts_data` / `_idx` / `_docsize` / `_config`),
+    the optional `nodes_fts_vocab`, and the shadow tables' auto-indexes."""
+    return isinstance(name, str) and (
+        name == "nodes_fts" or name.startswith("nodes_fts_") or name.startswith("sqlite_autoindex_nodes_fts_"))
+
+
+def _fill_embeddings_allows(action_code, arg1, arg2, db_name, trigger_or_view) -> bool:
+    """The op-scoped allowlist (pure) for `fill_embeddings`: True iff this authorizer call is one the op needs.
+    Everything else (any other column / table / attached db, INSERT / DELETE on `nodes`, DDL, PRAGMA, other functions,
+    other savepoints) is False. A statement originating in a trigger or view is admitted only if that trigger is
+    NAMED in FILL_EMBEDDINGS_ADMITTED_TRIGGERS (empty: none fires). The vec mirror's statements run inside the op's
+    own savepoint and may touch only the vec0 table and its shadow tables."""
+    if trigger_or_view is not None and trigger_or_view not in FILL_EMBEDDINGS_ADMITTED_TRIGGERS:
+        return False
+    if action_code == sqlite3.SQLITE_SELECT:
+        return True
+    if action_code == sqlite3.SQLITE_READ:
+        return db_name == "main" and (
+            (arg1 == "nodes" and arg2 in FILL_EMBEDDINGS_READ_COLUMNS) or _is_vec_table(arg1))
+    if action_code == sqlite3.SQLITE_UPDATE:
+        return db_name == "main" and (
+            (arg1 == "nodes" and arg2 in FILL_EMBEDDINGS_UPDATE_COLUMNS) or _is_vec_table(arg1))
+    if action_code in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE):
+        return db_name == "main" and _is_vec_table(arg1)
+    if action_code == sqlite3.SQLITE_TRANSACTION:
+        return arg1 in ("BEGIN", "COMMIT", "ROLLBACK")
+    if action_code == sqlite3.SQLITE_SAVEPOINT:
+        return arg1 in ("BEGIN", "RELEASE", "ROLLBACK") and arg2 == FILL_EMBEDDINGS_VEC_SAVEPOINT
+    return False
+
+
+def _fill_vec_phase_allows(action_code, arg1, arg2, db_name, trigger_or_view) -> bool:
+    """The admissions that hold ONLY while the vec mirror runs (the guard's `vec_phase`; the guard consults this after
+    `_fill_embeddings_allows` has said no). MEASURED by Borges on Linux (PR #3900, SQLite 3.53.0, sqlite_vec 0.1.9) as
+    the complete set of authorizer calls outside the `vec_nodes` name family made by the mirror's exact sequence
+    (SAVEPOINT, DELETE, INSERT, ROLLBACK TO, RELEASE) on `vec0(node_id TEXT PRIMARY KEY, embedding float[384])`:
+      - SQLITE_READ on table `x`, column `node_id`: vec0's constructor declares its schema under the name `x`.
+      - SQLITE_FUNCTION `max`.
+    Nothing else: not column `embedding` of `x` (not requested in the census; this Mac cannot load vec0, so it was
+    not measured here and is left out), not another function (`load_extension` included), not a trigger-originated
+    statement. A request in the census that is missing here degrades the mirror to `vec_mirrored: false`."""
+    if trigger_or_view is not None:
+        return False
+    if action_code == sqlite3.SQLITE_READ:
+        return db_name == "main" and arg1 == "x" and arg2 == "node_id"
+    if action_code == sqlite3.SQLITE_FUNCTION:
+        return arg2 == "max"
+    return False
+
+
+def _finish_embedding_regen_allows(action_code, arg1, arg2, db_name, trigger_or_view) -> bool:
+    """The op-scoped allowlist (pure) for `finish_embedding_regen`. The op never writes `nodes`; it may read the
+    columns the restore-flag recount reads, write the FTS family and the restore-state row, and run the DDL the FTS
+    rebuild and the restore-state table's lazy create need (all confined to those names). A trigger-originated
+    statement is admitted only if NAMED in FINISH_EMBEDDING_REGEN_ADMITTED_TRIGGERS (empty)."""
+    if trigger_or_view is not None and trigger_or_view not in FINISH_EMBEDDING_REGEN_ADMITTED_TRIGGERS:
+        return False
+    if action_code == sqlite3.SQLITE_SELECT:
+        return True
+    if action_code == sqlite3.SQLITE_READ:
+        if _is_fts_table(arg1):  # `count(*)` over a shadow table reports db_name None and an empty column
+            return db_name in ("main", None)
+        return db_name == "main" and (
+            (arg1 == "nodes" and arg2 in FINISH_NODES_READ_COLUMNS)
+            or (arg1 == "embedding_restore_state" and arg2 in FINISH_RESTORE_STATE_READ_COLUMNS)
+            or arg1 == "sqlite_master")
+    if action_code == sqlite3.SQLITE_UPDATE:
+        return db_name == "main" and (
+            (arg1 == "embedding_restore_state" and arg2 in FINISH_RESTORE_STATE_UPDATE_COLUMNS) or arg1 == "sqlite_master")
+    if action_code == sqlite3.SQLITE_INSERT:
+        return db_name == "main" and (arg1 in ("embedding_restore_state", "sqlite_master") or _is_fts_table(arg1))
+    if action_code == sqlite3.SQLITE_DELETE:
+        return db_name == "main" and (arg1 == "sqlite_master" or _is_fts_table(arg1))
+    if action_code == sqlite3.SQLITE_CREATE_TABLE:
+        return db_name == "main" and (arg1 == "embedding_restore_state" or _is_fts_table(arg1))
+    if action_code in (sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_DROP_INDEX, sqlite3.SQLITE_DROP_TABLE):
+        return db_name == "main" and _is_fts_table(arg1)
+    if action_code in (sqlite3.SQLITE_CREATE_VTABLE, sqlite3.SQLITE_DROP_VTABLE):
+        return db_name == "main" and arg1 in ("nodes_fts", "nodes_fts_vocab") and arg2 in ("fts5", "fts5vocab")
+    if action_code == sqlite3.SQLITE_PRAGMA:
+        return (arg1 == "table_info" and arg2 in ("nodes", "nodes_fts")) or arg1 in FINISH_PRAGMAS
+    if action_code == sqlite3.SQLITE_FUNCTION:
+        return arg2 in FINISH_FUNCTIONS
+    if action_code == sqlite3.SQLITE_TRANSACTION:
+        return arg1 in ("BEGIN", "COMMIT", "ROLLBACK")
+    return False
+
+
+def _fill_rejection(token: str, detail: str, remedy: str, reason: str = "invalid_params") -> dict:
+    """A typed refusal. `reason` is the closed class (`invalid_params` | `bad_dimension` | `non_finite` |
+    `model_mismatch`); the detail BEGINS with a stable machine token naming the exact violation, so every violation is
+    its own refusal even inside the `invalid_params` class. Nothing the caller sent is echoed."""
+    return _df_rejection(reason, f"{token}: {detail}", remedy)
+
+
+def _fill_embeddings_param_refusal(params) -> "tuple[dict | None, list]":
+    """Validate a `fill_embeddings` request over ALL items; -> (refusal | None, items), where items is the list of
+    `(node_id, vector_as_list_of_float)` in call order. A refusal means NOTHING may be written. Check order (the first
+    violated wins): (1) params is a dict with exactly the keys {model, items}; (2) model is a str; (3) items is a list,
+    non-empty, at most FILL_EMBEDDINGS_MAX_ITEMS; then per item in order: (4) a dict with exactly {node_id, vector};
+    (5) node_id: a str, non-empty, at most USE_REWARD_NODE_ID_MAX_BYTES UTF-8 bytes (counted with surrogatepass), no
+    lone surrogate; (6) vector: a list of exactly FILL_EMBEDDINGS_DIM elements (`bad_dimension`), each an int or a float
+    and NOT a bool (`invalid_params`), each finite after conversion to float (`non_finite`: NaN, +-Infinity, or an int
+    too large to be a float). `model_mismatch` needs the store's config and is checked by the handler. Ints are
+    normalised to float so the stored text is what the embedder's floats serialise to. Touches no connection."""
+    p = "fill_embeddings params"
+    if not isinstance(params, dict) or set(params) != {"model", "items"}:
+        return _fill_rejection("params_shape", f"{p} must be a dict with exactly the keys 'model' and 'items'",
+                               "send exactly {model, items}; the request_id travels on the wire, not in params"), []
+    if not isinstance(params["model"], str):
+        return _fill_rejection("model_not_str", "'model' must be a string", "send the store's embedding model name as a string"), []
+    items = params["items"]
+    if not isinstance(items, list):
+        return _fill_rejection("items_not_list", f"'items' must be a list, got {type(items).__name__}", "send 'items' as a list"), []
+    if not items:
+        return _fill_rejection("items_empty", "'items' is empty", "send at least one item"), []
+    if len(items) > FILL_EMBEDDINGS_MAX_ITEMS:
+        return _fill_rejection("items_too_many", f"'items' has more than {FILL_EMBEDDINGS_MAX_ITEMS} entries",
+                               f"send at most {FILL_EMBEDDINGS_MAX_ITEMS} items per call; split the batch"), []
+    out: list = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict) or set(item) != {"node_id", "vector"}:
+            return _fill_rejection("item_shape", f"items[{i}] must be a dict with exactly the keys 'node_id' and 'vector'",
+                                   "send each item as {node_id, vector}"), []
+        nid, vector = item["node_id"], item["vector"]
+        if not isinstance(nid, str):
+            return _fill_rejection("node_id_not_str", f"items[{i}].node_id must be a string", "send every node id as a string"), []
+        if nid == "":
+            return _fill_rejection("node_id_empty", f"items[{i}].node_id is the empty string", "send real node ids"), []
+        if len(nid.encode("utf-8", "surrogatepass")) > USE_REWARD_NODE_ID_MAX_BYTES:
+            return _fill_rejection("node_id_too_long", f"items[{i}].node_id exceeds {USE_REWARD_NODE_ID_MAX_BYTES} UTF-8 bytes",
+                                   f"node ids are capped at {USE_REWARD_NODE_ID_MAX_BYTES} bytes; send the real id"), []
+        try:
+            nid.encode("utf-8")
+        except UnicodeEncodeError:
+            return _fill_rejection("node_id_not_utf8", f"items[{i}].node_id contains a lone surrogate, which cannot be bound",
+                                   "send node ids that are valid text"), []
+        if not isinstance(vector, list):
+            return _fill_rejection("vector_not_list", f"items[{i}].vector must be a list of numbers", "send 'vector' as a list"), []
+        if len(vector) != FILL_EMBEDDINGS_DIM:
+            return _fill_rejection(
+                "bad_dimension", f"items[{i}].vector must have exactly {FILL_EMBEDDINGS_DIM} elements",
+                f"send vectors of the store's dimension ({FILL_EMBEDDINGS_DIM}); the owner does not trust a client-supplied one",
+                reason="bad_dimension"), []
+        floats: list = []
+        for j, x in enumerate(vector):
+            if isinstance(x, bool) or not isinstance(x, (int, float)):
+                return _fill_rejection("vector_element_type", f"items[{i}].vector[{j}] must be an int or a float (not a bool)",
+                                       "send every element as a finite number"), []
+            try:
+                f = float(x)
+            except OverflowError:
+                f = math.inf  # an int too large to be a float: not a finite value
+            if not math.isfinite(f):
+                return _fill_rejection(
+                    "non_finite", f"items[{i}].vector[{j}] is not a finite number (NaN, Infinity or an int too large for a float)",
+                    "send finite numbers only; json.dumps emits NaN / Infinity by default, so a client must not pass them",
+                    reason="non_finite"), []
+            floats.append(f)
+        out.append((nid, floats))
+    return None, out
+
+
+def _fill_request_id_refusal(request_id) -> "dict | None":
+    """The wire envelope's request_id (the idempotency key): a non-empty str of at most USE_REWARD_REQUEST_ID_MAX_BYTES
+    UTF-8 bytes (a uuid4 string fits). A write always carries one on the wire (`engramd_client.write` generates it)."""
+    if (not isinstance(request_id, str) or request_id == ""
+            or len(request_id.encode("utf-8", "surrogatepass")) > USE_REWARD_REQUEST_ID_MAX_BYTES):
+        return _fill_rejection("request_id_invalid", "the write's request_id must be a non-empty string of at most "
+                               f"{USE_REWARD_REQUEST_ID_MAX_BYTES} UTF-8 bytes",
+                               "send the write through engramd_client.write, which always supplies one")
+    return None
+
+
+def _fill_embeddings_fingerprint(model: str, ids_and_texts) -> bytes:
+    """SHA-256 over (model, ids in order, sha256 of each vector's stored text): the idempotency payload identity.
+    The dedupe store keeps this 32-byte digest per request_id, never the vectors."""
+    body = [model, [[nid, hashlib.sha256(text.encode("utf-8")).hexdigest()] for nid, text in ids_and_texts]]
+    return hashlib.sha256(json.dumps(body, separators=(",", ":"), ensure_ascii=True).encode("ascii")).digest()
+
+
+def _finish_embedding_regen_param_refusal(params) -> "dict | None":
+    """Validate a `finish_embedding_regen` request: exactly {processed, embedded, skipped, failed, embedder_available},
+    the four counts non-negative ints (not bools) and `embedder_available` a real bool (not an int). None = valid.
+    Touches no connection."""
+    keys = ("processed", "embedded", "skipped", "failed")
+    if not isinstance(params, dict) or set(params) != set(keys) | {"embedder_available"}:
+        return _fill_rejection("params_shape", "finish_embedding_regen params must be a dict with exactly the keys "
+                               "'processed', 'embedded', 'skipped', 'failed' and 'embedder_available'",
+                               "send exactly the four counts of the pass and the tool's own embedder probe; there is "
+                               "no request_id and no path")
+    if not isinstance(params["embedder_available"], bool):
+        return _fill_rejection("embedder_available_not_bool", "'embedder_available' must be a bool",
+                               "send the result of the tool's own `_embedder.is_available()` as true or false")
+    for k in keys:
+        v = params[k]
+        if isinstance(v, bool) or not isinstance(v, int):
+            return _fill_rejection("count_not_int", f"'{k}' must be an integer", "send each count as a non-negative int")
+        if v < 0:
+            return _fill_rejection("count_negative", f"'{k}' is negative", "send each count as a non-negative int")
     return None
 
 
@@ -2224,6 +2490,9 @@ class EngramdOwner:
             "confidence_by_type": lambda params, deadline: self._handle_confidence_by_type(params, deadline),
             "use_reward": lambda params, deadline: self._handle_use_reward(params, deadline),
             "advance_moment_cursor": lambda params, deadline: self._handle_advance_moment_cursor(params, deadline),
+            # #3879. `fill_embeddings` is in WIRE_REQUEST_ID_METHODS: `_dispatch` passes it the envelope's request_id.
+            "fill_embeddings": lambda params, deadline, request_id=None: self._handle_fill_embeddings(params, deadline, request_id),
+            "finish_embedding_regen": lambda params, deadline: self._handle_finish_embedding_regen(params, deadline),
         }
         # Every method carries a kind (8a). Kept ALONGSIDE `_methods` (tests replace handlers there). A method in
         # `_methods` with no entry here is default-deny at dispatch (8a-default), never treated as a read.
@@ -2231,10 +2500,18 @@ class EngramdOwner:
         self._method_kinds = {
             "ping": "read", "snapshot": "read", "read": "read", "df": "read", "chain": "read",
             "confidence_by_type": "read", "use_reward": "write", "advance_moment_cursor": "write",
+            "fill_embeddings": "write", "finish_embedding_regen": "write",
         }
         # use_reward's dedupe store: request_id -> {"fp": (ids, action), "response": <first wire dict>}.
         # In-memory and LRU-bounded by USE_REWARD_DEDUPE_CAP; guarded by `_owner_lock`.
         self._use_reward_seen: "OrderedDict[str, dict]" = OrderedDict()
+        # fill_embeddings' own dedupe store (a separate namespace: the same request_id string may appear on two
+        # different ops): request_id -> {"fp": sha256 digest, "response": <first wire dict>}. Same bound and the same
+        # KNOWN LIMIT as use_reward's (dies with the process; the oldest entry is forgotten past the cap).
+        self._fill_embeddings_seen: "OrderedDict[str, dict]" = OrderedDict()
+        # The vec mirror's capability, probed ONCE per owner connection on the first fill: None = not tried yet,
+        # False = this process cannot load vec0 (so every fill acks `vec_mirrored: false`), else the serializer.
+        self._fill_vec_state = None
 
     # -- lifecycle ------------------------------------------------------
 
@@ -2352,6 +2629,7 @@ class EngramdOwner:
         # says nothing about the connections opened here.
         self._displaced = False
         self._owner_conn = sqlite3.connect(str(self.store_path), check_same_thread=False)
+        self._fill_vec_state = None  # a fresh connection: the vec0 probe (#3879) starts over
         # Permissive by DESIGN, not authorizer-less -- see the module
         # docstring's "Two connections" section and
         # _owner_internal_authorizer's own docstring for why.
@@ -3443,6 +3721,9 @@ class EngramdOwner:
                 except engram_walguard.SubstrateDisplaced as exc:
                     self._displaced = True
                     return _displaced_rejection(exc)
+            if method in WIRE_REQUEST_ID_METHODS:
+                # #3879: a write whose params cannot carry a request_id gets the envelope's (the idempotency key).
+                return handler(params, deadline, request.get("request_id"))
             return handler(params, deadline)
 
         return {
@@ -3821,6 +4102,341 @@ class EngramdOwner:
                 "readback_mismatch",
                 f"COMMITTED but UNVERIFIED: the post-commit verification failed ({type(exc).__name__}); the commit stands and cannot be undone",
                 "do not blindly repeat; read the person's current cursor and decide"),
+                "commit": "committed_unverified"}
+
+    # -- the owner's third and fourth writes (#3879) ---------------------------------------------
+
+    def _handle_fill_embeddings(self, params: dict, deadline: float, request_id=None) -> dict:
+        """The typed `fill_embeddings` write (kind `write`). Wire: params exactly {model, items: [{node_id, vector}]},
+        at most FILL_EMBEDDINGS_MAX_ITEMS items; `request_id` is the envelope's (see WIRE_REQUEST_ID_METHODS).
+
+        Order: (1) validate EVERY item, touching no connection (`_fill_embeddings_param_refusal`): one bad item rejects
+        the whole call with nothing written; (2) the request_id; (3) the model, against the OWNER'S OWN home config read
+        through the same function the server uses (`engram_core._get_embedding_config`, the tool's exact expression):
+        `model_mismatch` if it differs, so two vector spaces can never mix; (4) the shared `_owner_write` scaffold (the
+        one wait budget, lock, displacement re-check, open-transaction refusal, busy-timeout switch) with this op's
+        restrictive authorizer; UNDER THE LOCK a dedupe check by request_id (a replay answers the stored outcome with
+        `duplicate: True`; the same id with a different payload is refused); BEGIN IMMEDIATE, the per-item
+        compare-and-set `UPDATE nodes SET embedding = ? WHERE id = ? AND is_current = 1 AND embedding IS NULL`, the
+        classification of every item, the best-effort vec mirror of the CHANGED rows only (own savepoint), COMMIT, then
+        the read-back of every changed row.
+
+        Outcomes: `ok` {filled, skipped_not_null, skipped_not_current_or_missing, vec_mirrored}; the four validation
+        refusals; `write_denied`; `busy` (nothing committed); `fill_embeddings_write_failed` (rolled back);
+        `readback_mismatch` (COMMITTED but unverified, recorded so a replay re-reports instead of re-writing)."""
+        refusal, items = _fill_embeddings_param_refusal(params)
+        if refusal is not None:
+            return refusal
+        refusal = _fill_request_id_refusal(request_id)
+        if refusal is not None:
+            return refusal
+        model: str = params["model"]
+        try:
+            core = _engram_core(self.engram_home)
+            store_model = core._get_embedding_config().get("model", core.DEFAULT_EMBEDDING_MODEL)
+        except Exception as exc:
+            return _fill_rejection(
+                "model_config_unreadable", f"the store's embedding model could not be determined ({type(exc).__name__})",
+                "fix the owner home's config.json (or the owner's runtime); nothing was written", reason="model_config_unreadable")
+        if not isinstance(store_model, str) or model != store_model:
+            return _fill_rejection(
+                "model_mismatch", "'model' is not the store's configured embedding model",
+                "embed with the model named in the owner home's config.json; two vector spaces must never mix",
+                reason="model_mismatch")
+        texts = [json.dumps(vector) for _nid, vector in items]
+        work = [(nid, text, vector) for (nid, vector), text in zip(items, texts)]
+        fingerprint = _fill_embeddings_fingerprint(model, [(nid, text) for nid, text, _v in work])
+
+        def record(resp: dict) -> None:
+            """Remember a COMMITTED outcome (ok or committed_unverified) so a same-id retry replays it."""
+            self._fill_embeddings_seen[request_id] = {"fp": fingerprint, "response": copy.deepcopy(resp)}
+            self._fill_embeddings_seen.move_to_end(request_id)
+            while len(self._fill_embeddings_seen) > USE_REWARD_DEDUPE_CAP:
+                self._fill_embeddings_seen.popitem(last=False)
+
+        def dedupe_check() -> "dict | None":
+            prior = self._fill_embeddings_seen.get(request_id)
+            if prior is None:
+                return None
+            self._fill_embeddings_seen.move_to_end(request_id)
+            if prior["fp"] != fingerprint:
+                return _fill_rejection(
+                    "request_id_reused", "this request_id was already used for a different payload",
+                    "generate a fresh request_id per distinct operation; reuse one only to retry the SAME call")
+            replay = copy.deepcopy(prior["response"])
+            if replay.get("status") == "ok":
+                replay["result"]["duplicate"] = True
+            return replay
+
+        return self._owner_write(
+            "fill_embeddings", deadline, lambda: _UseRewardGuard(allows=_fill_embeddings_allows, vec_allows=_fill_vec_phase_allows),
+            lambda conn, guard: self._fill_embeddings_execute(conn, guard, work, record),
+            intercept=dedupe_check, after=record)
+
+    def _fill_vec_ready(self, conn: sqlite3.Connection):
+        """The vec mirror's serializer (`sqlite_vec.serialize_float32`, what the direct path uses) if THIS connection
+        can write `vec_nodes`, else None. Probed once per owner connection: import `sqlite_vec` and load vec0 onto the
+        owner's connection (the one place this process loads an extension; the loader switches loading back off). A
+        Python whose sqlite3 cannot enable extension loading (the macOS framework build) or an install without
+        sqlite-vec yields None for the process lifetime, and every fill then acks `vec_mirrored: false`. A test
+        replaces this method."""
+        if self._fill_vec_state is None:
+            try:
+                import sqlite_vec
+                conn.enable_load_extension(True)  # absent on a Python built without it: AttributeError -> unavailable
+                try:
+                    sqlite_vec.load(conn)
+                finally:
+                    conn.enable_load_extension(False)
+                self._fill_vec_state = sqlite_vec.serialize_float32
+            except Exception as exc:
+                logging.getLogger("engramd_owner").info("fill_embeddings: vec0 unavailable on the owner connection (%s)",
+                                                        type(exc).__name__)
+                self._fill_vec_state = False
+        return self._fill_vec_state or None
+
+    def _fill_embeddings_readback(self, conn: sqlite3.Connection, ids) -> dict:
+        """{id: stored embedding text (None if NULL or the row is gone)} for each of `ids`, read from the committed
+        store (design 5.4). Runs after COMMIT under the op allowlist; a test replaces it to perturb the post-commit value."""
+        out: dict = {}
+        for nid in ids:
+            row = conn.execute("SELECT embedding FROM nodes WHERE id = ?", (nid,)).fetchone()
+            out[nid] = None if row is None else row[0]
+        return out
+
+    def _fill_vec_mirror(self, conn: sqlite3.Connection, guard: "_UseRewardGuard", changed, serialize) -> bool:
+        """Mirror the CHANGED rows into `vec_nodes` (DELETE + INSERT per row, as the direct path does) inside the op's
+        own SAVEPOINT. True iff every row was mirrored. ANY failure (the vec0 module or table missing, a locked
+        table, a serializer error, or an authorizer denial of a vec statement) rolls back to the savepoint, drops the
+        denials recorded since it opened (a vec denial degrades the mirror, it does not fail the fill) and returns
+        False: the `nodes` writes stand and the ack says `vec_mirrored: false` (today's direct path swallows this)."""
+        n_denied_before = len(guard.denials)
+        sp = FILL_EMBEDDINGS_VEC_SAVEPOINT
+        conn.execute(f"SAVEPOINT {sp}")
+        guard.vec_phase = True  # opens AFTER the savepoint statement and closes in the finally: only the mirror's own statements
+        try:
+            for nid, _text, vector in changed:
+                conn.execute("DELETE FROM vec_nodes WHERE node_id = ?", (nid,))
+                conn.execute("INSERT INTO vec_nodes(node_id, embedding) VALUES (?, ?)", (nid, serialize(vector)))
+            conn.execute(f"RELEASE {sp}")
+            return True
+        except Exception as exc:
+            logging.getLogger("engramd_owner").warning(
+                "fill_embeddings: vec mirror failed (%s: %s); the embeddings are written, vec_nodes is not", type(exc).__name__, exc)
+            conn.execute(f"ROLLBACK TO {sp}")
+            conn.execute(f"RELEASE {sp}")
+            del guard.denials[n_denied_before:]
+            return False
+        finally:
+            guard.vec_phase = False
+
+    def _fill_embeddings_execute(self, conn: sqlite3.Connection, guard: "_UseRewardGuard", work: list, record) -> dict:
+        """The transaction body of `_handle_fill_embeddings`; runs with the op allowlist installed and `_owner_lock`
+        held. `work` is [(node_id, stored text, vector)]. A response carrying `_committed: True` is one whose COMMIT
+        happened (the scaffold records it for dedupe and strips the marker)."""
+        op = "fill_embeddings"
+        changed: list = []
+        not_null = missing = 0
+        mirrored = False
+        try:
+            serialize = self._fill_vec_ready(conn)  # a Python-level probe: no SQL, before the transaction opens
+            # Opened up front so a competing direct writer is met here (busy) rather than half way through.
+            conn.execute("BEGIN IMMEDIATE")
+            for nid, text, vector in work:
+                cur = conn.execute(
+                    "UPDATE nodes SET embedding = ? WHERE id = ? AND is_current = 1 AND embedding IS NULL", (text, nid))
+                if cur.rowcount == 1:
+                    changed.append((nid, text, vector))
+                    continue
+                row = conn.execute("SELECT is_current, embedding IS NULL FROM nodes WHERE id = ?", (nid,)).fetchone()
+                if row is not None and row[0] == 1 and row[1] == 0:
+                    not_null += 1  # current, and the CAS refused it: something already holds an embedding
+                else:
+                    missing += 1  # no such row, or not current
+            mirrored = serialize is not None
+            if serialize is not None and changed:
+                mirrored = self._fill_vec_mirror(conn, guard, changed, serialize)
+            if guard.denials:
+                _write_abort(conn, guard, op)
+                return _write_denied(guard, op)
+            guard.allow_commit = True
+            conn.commit()
+            guard.allow_commit = False
+        except BaseException as exc:
+            guard.allow_commit = False
+            _write_abort(conn, guard, op)
+            if not isinstance(exc, Exception):
+                raise  # SystemExit / GeneratorExit / injected async exceptions: rolled back, then propagated
+            if guard.denials:
+                return _write_denied(guard, op)
+            if isinstance(exc, sqlite3.Error):
+                return _write_sqlite_error(
+                    exc, op, "retry once with the SAME request_id (nothing was written, so the retry runs fresh)",
+                    "retry with the SAME request_id; if it persists check the store's disk and permissions")
+            raise
+        # COMMITTED. From here the write cannot be undone: every failure below is committed-but-UNVERIFIED.
+        try:
+            ids = [nid for nid, _t, _v in changed]
+            actual = self._fill_embeddings_readback(conn, ids) if ids else {}
+            bad = [nid for nid, text, _v in changed if actual.get(nid) != text]
+            if bad:
+                resp = {**_df_rejection(
+                    "readback_mismatch",
+                    f"COMMITTED but UNVERIFIED: the committed embedding differs from the one written for id(s) {bad}; the commit cannot be undone",
+                    "do not retry with a new request_id; retry with the SAME request_id to replay this outcome, and inspect the named nodes"),
+                    "commit": "committed_unverified", "_committed": True}
+                return resp
+            return {
+                "status": "ok",
+                "result": {
+                    "filled": len(changed),
+                    "skipped_not_null": not_null,
+                    "skipped_not_current_or_missing": missing,
+                    "vec_mirrored": bool(mirrored),
+                },
+                "_committed": True,
+            }
+        except BaseException as exc:
+            unverified = {**_df_rejection(
+                "readback_mismatch",
+                f"COMMITTED but UNVERIFIED: the post-commit verification failed ({type(exc).__name__}); the commit stands and cannot be undone",
+                "do not retry with a new request_id; retry with the SAME request_id to replay this outcome, and inspect the nodes"),
+                "commit": "committed_unverified"}
+            record(unverified)
+            if not isinstance(exc, Exception):
+                raise
+            return {**unverified, "_committed": True}
+
+    def _handle_finish_embedding_regen(self, params: dict, deadline: float) -> dict:
+        """The typed `finish_embedding_regen` write (kind `write`). Wire: params exactly {processed, embedded, skipped,
+        failed, embedder_available}: four non-negative ints and a real bool. `embedder_available` is the TOOL's probe
+        of the embedder it just used; the owner passes it to the core finalize and NEVER probes an embedder itself
+        (that would import sentence_transformers / torch into this process, and could pick a different cause than the
+        direct path). No request_id: a replay re-runs an idempotent rebuild and flag write.
+
+        Validate (touching no connection); import `engram_core` / `engram_backup` lazily (they are large / only this op
+        needs them); then the shared `_owner_write` scaffold with this op's authorizer and ONE transaction: the FTS
+        rebuild on the owner's connection (`engram_backup.rebuild_fts_index_on_conn`, the one body the path-taking
+        function also runs), then exactly today's tool-tail branch through the SAME core functions with
+        `respect_lease=True` (no second copy of the lease logic): ALWAYS `_finalize_embedding_restore_flag`, whose fresh
+        skip-aware recount clears the flag when no embeddable NULL remains and sets it otherwise. The owner never
+        branches on the client's `processed` (a stale or lying `processed == 0` must not clear a flag over real
+        NULLs; in every honest case the tool's own count 0 means recount 0, so this equals the direct path). The core function's own COMMIT is the transaction's commit
+        (the only one the op allows). Read-back: the FTS doc count equals the count of indexable `nodes` rows, and the
+        `embedding_restore_state` row is what the branch can have written.
+
+        Outcomes: `ok` {fts_rows, restore_state}; `write_denied`; `busy`; `finish_embedding_regen_write_failed` (the
+        whole op rolled back, the FTS rebuild included); `readback_mismatch` (COMMITTED but unverified)."""
+        refusal = _finish_embedding_regen_param_refusal(params)
+        if refusal is not None:
+            return refusal
+        counts = {k: params[k] for k in ("processed", "embedded", "skipped", "failed")}
+        try:
+            core = _engram_core(self.engram_home)
+            import engram_backup
+        except ImportError as exc:
+            return _df_rejection(
+                "finish_embedding_regen_runtime_unavailable", f"the owner's runtime lacks a module this op needs ({type(exc).__name__})",
+                "owner install fault: the owner's runtime is incomplete")
+        return self._owner_write(
+            "finish_embedding_regen", deadline, lambda: _UseRewardGuard(allows=_finish_embedding_regen_allows),
+            lambda conn, guard: self._finish_embedding_regen_execute(
+                conn, guard, counts, core, engram_backup, embedder_available=params["embedder_available"]),
+            busy_remedy="retry once (nothing was written, so the retry runs fresh)")
+
+    def _finish_embedding_regen_readback(self, conn: sqlite3.Connection) -> dict:
+        """{fts_rows, state} read from the committed store: the FTS index's document count (None if there is no
+        `nodes_fts`) and the `embedding_restore_state` row (None if absent). A test replaces it to perturb either."""
+        has_fts = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_fts'").fetchone()
+        fts_rows = conn.execute("SELECT COUNT(*) FROM nodes_fts_docsize").fetchone()[0] if has_fts else None
+        row = conn.execute(
+            "SELECT not_fully_restored, null_count, cause, updated_at FROM embedding_restore_state WHERE singleton_key = 1"
+        ).fetchone()
+        return {"fts_rows": fts_rows, "state": None if row is None else tuple(row)}
+
+    @staticmethod
+    def _restore_state_is_what_the_branch_wrote(pre, actual) -> bool:
+        """The restore row after the branch is one the branch can have written: a fresh foreign lease left it
+        EXACTLY as it was; else the cleared shape; else the set shape with a real cause (the finalize recount decides
+        which; the client's `processed` never does)."""
+        if actual is None:
+            return False
+        if pre is not None and pre[2] == "regeneration-running" and tuple(actual) == tuple(pre):
+            return True  # respect_lease: a fresh lease held by someone else was not overwritten
+        cleared = actual[0] == 0 and actual[1] == 0 and actual[2] is None
+        return cleared or (actual[0] == 1 and actual[1] > 0 and actual[2] in ("per-node-failures", "embedder-unavailable"))
+
+    def _finish_embedding_regen_execute(self, conn: sqlite3.Connection, guard: "_UseRewardGuard", counts: dict, core, backup,
+                                        *, embedder_available: bool) -> dict:
+        """The transaction body of `_handle_finish_embedding_regen`; runs with the op allowlist installed and
+        `_owner_lock` held. `embedder_available` is the tool's probe, handed to the core finalize as given."""
+        op = "finish_embedding_regen"
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            backup.rebuild_fts_index_on_conn(conn, str(self.store_path))
+            # EXPECTED fts rows: an independent count of the rows the index must hold (the shared partition predicate).
+            expected_fts = None
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_fts'").fetchone():
+                node_cols = {r[1] for r in conn.execute("PRAGMA table_info(nodes)").fetchall()}
+                _exclude, indexable = backup._fts_row_predicates(node_cols)
+                expected_fts = conn.execute(
+                    "SELECT COUNT(*) FROM nodes" + (f" WHERE {indexable}" if indexable else "")).fetchone()[0]
+            core._ensure_embedding_restore_state_table(conn)
+            pre = conn.execute(
+                "SELECT not_fully_restored, null_count, cause, updated_at FROM embedding_restore_state WHERE singleton_key = 1"
+            ).fetchone()
+            # The core function COMMITS (its own write path): that commit is this transaction's, the FTS rebuild included.
+            guard.allow_commit = True
+            try:
+                # ALWAYS the recount path: `processed` is the client's claim and decides nothing here. The core finalize
+                # clears when its fresh skip-aware recount is 0 and sets the flag otherwise (cause from the tool's probe).
+                core._finalize_embedding_restore_flag(
+                    conn, dict(counts), respect_lease=True, embedder_available=embedder_available)
+            finally:
+                guard.allow_commit = False
+            if guard.denials:
+                _write_abort(conn, guard, op)
+                return _write_denied(guard, op)
+            if conn.in_transaction:
+                guard.allow_commit = True
+                try:
+                    conn.commit()
+                finally:
+                    guard.allow_commit = False
+        except BaseException as exc:
+            guard.allow_commit = False
+            _write_abort(conn, guard, op)
+            if not isinstance(exc, Exception):
+                raise  # SystemExit / GeneratorExit / injected async exceptions: rolled back, then propagated
+            if guard.denials:
+                return _write_denied(guard, op)
+            if isinstance(exc, sqlite3.Error):
+                return _write_sqlite_error(
+                    exc, op, "retry once (nothing was written, so the retry runs fresh)",
+                    "retry once; if it persists check the store's disk and permissions")
+            raise
+        # COMMITTED. From here the write cannot be undone: every failure below is committed-but-UNVERIFIED.
+        try:
+            actual = self._finish_embedding_regen_readback(conn)
+            problems = []
+            if actual["fts_rows"] != expected_fts:
+                problems.append(f"the FTS index holds {actual['fts_rows']} documents, expected {expected_fts}")
+            if not self._restore_state_is_what_the_branch_wrote(pre, actual["state"]):
+                problems.append("the embedding_restore_state row is not what the branch wrote")
+            if problems:
+                return {**_df_rejection(
+                    "readback_mismatch", "COMMITTED but UNVERIFIED: " + "; ".join(problems) + "; the commit cannot be undone",
+                    "inspect the FTS index and the restore-state row; re-running the op is safe (a rebuild and a flag write)"),
+                    "commit": "committed_unverified"}
+            state = actual["state"]
+            return {"status": "ok", "result": {"fts_rows": actual["fts_rows"] or 0, "restore_state": None if state is None else state[2]}}
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                raise
+            return {**_df_rejection(
+                "readback_mismatch",
+                f"COMMITTED but UNVERIFIED: the post-commit verification failed ({type(exc).__name__}); the commit stands and cannot be undone",
+                "inspect the FTS index and the restore-state row; re-running the op is safe"),
                 "commit": "committed_unverified"}
 
     def _read_deadline_rejection(self, detail: str) -> dict:

@@ -658,7 +658,8 @@ def test_ledger_section_6_states_the_second_write_its_authorizer_and_the_stated_
     text = _ledger()
     sec = text[text.index("## 6. Owner writes"):]
     for needle in (
-        "advance_moment_cursor", "WRITE_METHODS", "{use_reward, advance_moment_cursor}",
+        "advance_moment_cursor", "WRITE_METHODS",
+        "{use_reward, advance_moment_cursor, fill_embeddings, finish_embedding_regen}",
         "nodes_metadata_json_guard_update", "json_valid", "WHEN clause",
         "No `request_id`", "compare-and-set", "OWNER_WRITE_LOCK_WAIT", "OWNER_WRITE_CLIENT_TIMEOUT",
         "1.3", "readback_mismatch", "between the COMMIT and the read-back",

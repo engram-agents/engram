@@ -66,6 +66,13 @@
       ]
     },
     {
+      "key": "605333c4d1e12407862ff5f039a4a27289380a1f01469e87456170af0f921842",
+      "sql": "SELECT id FROM nodes WHERE is_current=1 AND embedding IS NULL ORDER BY id",
+      "sites": [
+        "tools/engram-regenerate-embeddings.py:_owner_null_ids"
+      ]
+    },
+    {
       "key": "6b8a8373e14ff561366c89e57e0e982e4d416d952e467ae44ef2e13e9eb0cd42",
       "sql": "SELECT id, type, claim, quoted_text, interpretation, recall_summary, predicted_event, resolution_timeframe FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
       "sites": [
@@ -106,6 +113,13 @@
       "sql": "SELECT id, type, substr(trim(coalesce(claim, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000'), 1, 100), recall_summary, created_at, is_current, status FROM nodes WHERE created_at >= ? AND (trim(coalesce(claim, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '' OR trim(coalesce(recall_summary, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '') ORDER BY created_at ASC, rowid ASC LIMIT 200",
       "sites": [
         "hooks/claude/engram-session-start-hook.py:session_checkpoint_block"
+      ]
+    },
+    {
+      "key": "99da5d73eb6250a34c5c08a053ca046d0c294cb82ac443558806325c570c66da",
+      "sql": "SELECT type, claim, source_title, predicted_event, recall_summary, recall_keywords FROM nodes WHERE id = ?",
+      "sites": [
+        "tools/engram-regenerate-embeddings.py:_owner_text_row"
       ]
     },
     {
@@ -212,6 +226,13 @@
       "sql": "SELECT COUNT(*) FROM nodes WHERE created_at >= ? AND (trim(coalesce(claim, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '' OR trim(coalesce(recall_summary, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '')",
       "sites": [
         "hooks/claude/engram-session-start-hook.py:session_checkpoint_block"
+      ]
+    },
+    {
+      "key": "f0cd101df2bf713d48b6fa7557bcfc2ac76f978ed1d552e3c94e4ca82359cfd5",
+      "sql": "SELECT COUNT(*) FROM nodes WHERE is_current=1 AND embedding IS NULL",
+      "sites": [
+        "tools/engram-regenerate-embeddings.py:_owner_null_count"
       ]
     },
     {

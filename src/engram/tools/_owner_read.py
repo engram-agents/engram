@@ -39,6 +39,7 @@ __all__ = [
     "ping",
     "open_reader",
     "snapshot",
+    "write",
 ]
 
 # A stuck owner is an error and not a hang. A JUDGEMENT, not a measurement (a tool runs once per sleep,
@@ -48,6 +49,9 @@ DEFAULT_PER_CALL_SECONDS = 10.0
 # The owner's own SNAPSHOT_REQUEST_DEADLINE is 30 s; the client must wait past it so the owner's typed timeout
 # reply arrives instead of this side giving up first. A JUDGEMENT, not a measurement.
 DEFAULT_SNAPSHOT_SECONDS = 35.0
+# A typed owner write (U16, #3879) waits past the owner's own write-lock budget so the owner's typed answer
+# (busy, readback_mismatch) arrives instead of this side giving up first. A JUDGEMENT, not a measurement.
+DEFAULT_WRITE_SECONDS = 30.0
 
 
 def engram_home() -> Path:
@@ -83,6 +87,7 @@ class OwnerReadSpec:
     total_budget: float = DEFAULT_TOTAL_BUDGET_SECONDS
     per_call: float = DEFAULT_PER_CALL_SECONDS
     snapshot_timeout: float = DEFAULT_SNAPSHOT_SECONDS
+    write_timeout: float = DEFAULT_WRITE_SECONDS
 
 
 def runtime_dir() -> Path | None:
@@ -312,3 +317,74 @@ def snapshot(spec: OwnerReadSpec, dest_path: Path) -> Path:
             f"archived. Not reading the store directly. Check the owner build, or set engramd.{key} to false."
         )
     return Path(dest)
+
+
+def write(spec: OwnerReadSpec, method: str, params: dict, request_id: str | None = None):
+    """One typed owner WRITE (U16, #3879). Returns the owner's `result` ONLY for an `Ok` whose result is a
+    dict; every other outcome RAISES spec.error_cls, so a caller can never mistake a failed or unknown write
+    for a done one. Mirrors `snapshot()`: it never opens the store, on any path.
+
+    Four outcomes are named apart because their remedies differ:
+      DOWN            no owner listening: the request never reached it, nothing was written.
+      INDETERMINATE   Unavailable (timeout / protocol / ...) or Rejected(commit="indeterminate"): the owner
+                      may or may not have committed. The caller does not go look at the store; a re-run is
+                      safe only when the op is idempotent (fill_embeddings is: a compare-and-set).
+      COMMITTED, NOT VERIFIED   Rejected(commit="committed_unverified", e.g. readback_mismatch): the owner
+                      committed and its own read-back failed.
+      refused         any other Rejected: nothing was committed.
+    An `Ok` whose result is not a dict is the malformed class and raises too."""
+    err, key = spec.error_cls, spec.flag_key
+    try:
+        client = import_runtime("engramd_client")
+    except Exception as exc:
+        raise err(
+            f"engramd.{key} is on but engramd_client could not be loaded "
+            f"({type(exc).__name__}: {exc}); not writing the store directly. Fix the plugin install, or set "
+            f"the flag to false."
+        ) from exc
+    try:
+        result = client.write(
+            method, params, request_id=request_id, timeout=spec.write_timeout, socket_path=_socket(client, spec)
+        )
+    except (Exception, SystemExit) as exc:  # client.write does not raise by contract (#3717); belt, as ping
+        raise err(
+            f"the engramd owner {method} failed ({type(exc).__name__}); the outcome is INDETERMINATE. Not "
+            f"writing the store directly. Start the owner, or set engramd.{key} to false."
+        ) from exc
+    if isinstance(result, client.Unavailable):
+        if result.reason == "down":
+            raise err(
+                f"the engramd owner is DOWN (owner unavailable: down); the {method} request did not reach it "
+                f"and nothing was written. Not writing the store directly. Start the owner and retry, or set "
+                f"engramd.{key} to false."
+            )
+        raise err(
+            f"the engramd owner {method} outcome is INDETERMINATE (owner unavailable: "
+            f"{result.reason or 'unavailable'}); the write may or may not have committed. Not writing the "
+            f"store directly. Retry once the owner is healthy, or set engramd.{key} to false."
+        )
+    if isinstance(result, client.Rejected):
+        commit = getattr(result, "commit", None)
+        if commit == "indeterminate":
+            raise err(
+                f"the engramd owner {method} outcome is INDETERMINATE ({result.reason}: {result.detail}); the "
+                f"write may or may not have committed. Not writing the store directly. Retry once the owner "
+                f"is healthy, or set engramd.{key} to false."
+            )
+        if commit == "committed_unverified":
+            raise err(
+                f"the engramd owner {method} COMMITTED but could not verify it ({result.reason}: "
+                f"{result.detail}); {result.remedy}. Not writing the store directly."
+            )
+        raise err(
+            f"the engramd owner refused the {method} write ({result.reason}: {result.detail}); "
+            f"{result.remedy}. Nothing was written. Not writing the store directly. If that does not help, "
+            f"set engramd.{key} to false."
+        )
+    if not isinstance(result, client.Ok) or not isinstance(result.result, dict):
+        raise err(
+            f"the engramd owner answered the {method} write malformed (the result is not an object); the "
+            f"outcome is INDETERMINATE. Not writing the store directly. Check the owner build, or set "
+            f"engramd.{key} to false."
+        )
+    return result.result
