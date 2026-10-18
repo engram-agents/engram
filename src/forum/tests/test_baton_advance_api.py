@@ -686,6 +686,53 @@ class TestFlipIsTheSameGate:
         f, _ = world.fields()
         assert f["phase"] == "fairy"
 
+    # --- #3914: the fairy-phase 409 names the way out ------------------------
+    # Contract (message change only, status stays 409): in the strict
+    # peer->merge path, phase 'fairy' + a colleague => today's first sentence
+    # plus a hint naming the baton id and the colleague; fairy without a
+    # colleague, and any other non-peer phase => today's text exactly.
+    # Routes reaching the branch: POST .../advance and a POST .../flip to the
+    # merge seat on a colleague-bearing baton (both go through _advance_gate).
+
+    def _first_sentence(self, pid, phase):
+        return (f"'{pid}' is in phase {phase!r}, not 'peer'; the peer->merge "
+                "advance applies only to a baton in the peer phase.")
+
+    def test_3914_fairy_with_colleague_flip_to_seat_409_names_the_way_out(self, world):
+        # turn (holder) deliberately differs from the colleague.
+        world.seed(phase="fairy", turn=AUTHOR)
+        resp = world.flip(to=SEAT, agent=AUTHOR)
+        assert resp.status_code == 409
+        err = resp.get_json()["error"]
+        assert err.startswith(self._first_sentence("PR-9001", "fairy"))
+        assert err == (self._first_sentence("PR-9001", "fairy") + " "
+                       f"To reach peer, flip it to its colleague first (baton flip PR-9001 "
+                       f"{COLLEAGUE}), which writes the fairy->peer transition; then advance.")
+
+    def test_3914_fairy_with_colleague_advance_route_gives_the_same_409(self, world):
+        world.seed(phase="fairy", turn=AUTHOR)
+        via_advance = world.advance(agent=AUTHOR)
+        via_flip = world.flip(to=SEAT, agent=AUTHOR)
+        assert via_advance.status_code == via_flip.status_code == 409
+        assert via_advance.get_json() == via_flip.get_json()
+        assert f"baton flip PR-9001 {COLLEAGUE})" in via_advance.get_json()["error"]
+
+    def test_3914_fairy_without_colleague_409_is_todays_text_exactly(self, world):
+        world.seed(colleague=None, participants=(AUTHOR, SEAT), turn=AUTHOR, phase="fairy")
+        resp = world.advance(agent=AUTHOR)
+        assert resp.status_code == 409
+        err = resp.get_json()["error"]
+        assert err == self._first_sentence("PR-9001", "fairy")
+        assert "To reach peer" not in err
+
+    def test_3914_other_non_peer_phase_keeps_todays_text_exactly(self, world):
+        # An explicit non-fairy, non-peer, non-merge phase genuinely reaches the
+        # branch (cur_phase is the frontmatter value verbatim). Even with a colleague.
+        world.seed(phase="pool", turn=AUTHOR)
+        resp = world.advance(agent=AUTHOR)
+        assert resp.status_code == 409
+        assert resp.get_json()["error"] == self._first_sentence("PR-9001", "pool")
+
 
 # ---------------------------------------------------------------------------
 # C5 -- lock-only context on SeqAllocator

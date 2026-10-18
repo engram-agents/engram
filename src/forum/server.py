@@ -517,11 +517,18 @@ def _advance_gate(gate, pid: str, fields: dict, body: str, to_agent: str,
     if cur_phase == "merge":
         return (None, {"noop": True})
     if cur_phase not in ("peer", ""):
-        return (
-            (f"'{pid}' is in phase {cur_phase!r}, not 'peer'; the peer->merge "
-             "advance applies only to a baton in the peer phase.", 409),
-            None,
-        )
+        # #3914: message-only. A 'fairy' baton WITH a colleague reaches 'peer' only
+        # via a flip to that colleague (it writes fairy->peer), so say so, naming the
+        # baton id and the colleague. Fairy without a colleague (no such route) and
+        # every other phase keep the text below exactly. Status stays 409.
+        msg = (f"'{pid}' is in phase {cur_phase!r}, not 'peer'; the peer->merge "
+               "advance applies only to a baton in the peer phase.")
+        hint_colleague = (fields.get("colleague") or "").strip().lower()
+        if cur_phase == "fairy" and hint_colleague:
+            msg += (f" To reach peer, flip it to its colleague first "
+                    f"(baton flip {pid} {hint_colleague}), which writes the "
+                    "fairy->peer transition; then advance.")
+        return ((msg, 409), None)
 
     to_agent = (to_agent or "").strip().lower()
     current_holder = (fields.get("turn") or "").strip().lower()
