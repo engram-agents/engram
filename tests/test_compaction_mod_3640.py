@@ -7,7 +7,7 @@ are about the SOURCE are pinned here:
 
   M11 hook budget: no mod source calls `$.model` or `$.process`
   M9  fail-open: every `on(...)` registration carries a `.catch` that replays `next(e)`
-  M12 the manifest switch is `enabled`, a boolean, default FALSE
+  M12 the manifest switch is `enabled`, a boolean, default TRUE (Lei, 2026-10-18); off registers nothing
   M13 `session.compact` is registered WITHOUT a matcher (the harness leaves `trigger`
       undefined in a test; the trigger is checked inside the hook)
   M14 the replace/beside choice is ONE exported constant, default beside
@@ -44,11 +44,21 @@ def test_m9_every_registration_has_a_catch_replaying_next():
     assert len(catches) == len(registrations)
 
 
-def test_m12_manifest_switch_defaults_off():
+def test_m12_manifest_switch_defaults_on():
     manifest = json.loads((MOD / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
     enabled = manifest["userConfig"]["enabled"]
     assert enabled["type"] == "boolean"
-    assert enabled["default"] is False
+    assert enabled["default"] is True
+
+
+def test_m12_docs_and_manifest_do_not_still_say_default_off():
+    """The switch's default and the words that describe it move together."""
+    manifest = (MOD / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+    readme = (MOD / "README.md").read_text(encoding="utf-8")
+    register = (HOOKS / "register.ts").read_text(encoding="utf-8")
+    assert "Default off" not in manifest
+    assert "Default OFF" not in readme and "(default false)" not in readme
+    assert "Off by default" not in register
 
 
 def test_m12_off_registers_nothing():

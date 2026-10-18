@@ -282,7 +282,7 @@ If the nap fired because a compaction warning is active, explicitly say: "Ready 
 
 ## Step 9 — Request compaction
 
-Last, after Step 5b and the focus rotation (Step 7): the context the tool assembles carries the focus list and the warm-briefing arc, so both must be final. This step only leaves a request; the `engram-compaction` mod, if the person switched it on, acts on it at the end of the answered turn that runs this step, so end the turn normally and do not tell the person it will compact "next turn". With the mod off the request is never read (the files stay on disk; an unconsumed request ages out after 30 minutes).
+Last, after Step 5b and the focus rotation (Step 7): the context the tool assembles carries the focus list and the warm-briefing arc, so both must be final. This step only leaves a request; the `engram-compaction` mod, if the person has installed it (it is on by default once installed; `enabled: false` turns it off), acts on it at the end of the answered turn that runs this step, so end the turn normally and do not tell the person it will compact "next turn". With the mod off the request is never read (the files stay on disk; an unconsumed request ages out after 30 minutes).
 
 - **A loop marker exists** (`~/.engram/loop-mode.json`, under `$ENGRAM_HOME`, default `~/.engram`): run the tool, no question.
 - **No loop marker:** ask first, once — "Compact now? The nap just persisted everything." — and run the tool only on yes. On a no, run `python tools/compact-request.py --clear`, and check that it exits 0. Exit 4 means a file could not be removed, and stderr names it; if it names the old request, that request can still compact, so say so once. Never retry in a loop.
