@@ -23,6 +23,13 @@
       ]
     },
     {
+      "key": "1f0642346288d91dd8ece6a13066919a24df7fdc305f365332735f83a606fbc5",
+      "sql": "SELECT id, type, claim, confidence, recall_turn, status FROM nodes WHERE is_current = 1 AND COALESCE(status, '') != 'retracted' AND type IN (SELECT value FROM json_each(?))",
+      "sites": [
+        "tools/study_queue.py:store_candidates"
+      ]
+    },
+    {
       "key": "2743db24b60c27d0ad4e70e440219d2904a12aa08d4fdca11760b8445b3fdc9c",
       "sql": "SELECT id, recall_summary FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
       "sites": [
@@ -62,6 +69,13 @@
       "sql": "SELECT name, node_ids, last_loaded_at FROM focus_sets",
       "sites": [
         "hooks/claude/engram-surface-hook.py:_dormant_focus_set_candidates"
+      ]
+    },
+    {
+      "key": "4c297eed21620600e0366ba8d26aa74d052af13f9b2b449fbd82152edc7a21ff",
+      "sql": "SELECT claim FROM nodes WHERE id = ? AND is_current = 1 AND COALESCE(status, '') != 'retracted'",
+      "sites": [
+        "tools/study_queue.py:store_candidates"
       ]
     },
     {
@@ -261,6 +275,13 @@
       "sql": "\nSELECT\n    id,\n    COALESCE(\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.scaffolding_nudge'),\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.anchor_line'),\n        json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.surfacing_nudge'),\n        claim\n    ) AS nudge,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.tripwire_priority')  AS priority,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.match_scope')  AS match_scope,\n    recall_summary,\n    claim\nFROM nodes\nWHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')\n  AND is_current = 1\n  AND memory_status = 'active'\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') IS NOT NULL\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') != ''\n",
       "sites": [
         "hooks/claude/engram-lesson-tripwire-hook.py:load_tripwires"
+      ]
+    },
+    {
+      "key": "dff01272150b1be18634be6118c7082e02eede13b65b66e6ec90a90426db3213",
+      "sql": "SELECT node_id FROM cascade_markers WHERE status = 'pending' ORDER BY id",
+      "sites": [
+        "tools/study_queue.py:store_candidates"
       ]
     },
     {

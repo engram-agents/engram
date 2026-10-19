@@ -521,6 +521,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/study_queue.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/dream_pickup.py",
       "tier": "convenience"
     },
