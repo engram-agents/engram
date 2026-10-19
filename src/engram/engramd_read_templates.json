@@ -306,6 +306,13 @@
       ]
     },
     {
+      "key": "f37b0a7800a2cb0456683cb63b498d14c88d078aca4833d23107444d433c443d",
+      "sql": "SELECT id, type, embedding, confidence_history, metadata FROM nodes WHERE id = ?",
+      "sites": [
+        "tools/inspect_raw.py:read_row"
+      ]
+    },
+    {
       "key": "f3fb3410d99851f0e833a131cbdc574e9e676b124dd85d9841250a21f8e05c0a",
       "sql": "SELECT id, claim FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
       "sites": [

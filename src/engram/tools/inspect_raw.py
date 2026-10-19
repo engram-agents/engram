@@ -26,6 +26,17 @@ Available stripped fields:
 Honors ENGRAM_HOME environment variable (same pattern as server.py).
 Does NOT honor the #348 hardcoded-path bug — uses the env-var correctly.
 
+Reading the row (#2652, tools-7): the tool reads ONE row, through the shared owner-read helper
+(tools/_owner_read.py). Behind engramd.inspect_raw_reads_via_owner (default OFF) the read goes to the
+engramd owner; with the flag OFF the store is opened mode=ro. Neither path holds a write-capable handle.
+With the flag ON and the owner down, refusing or answering malformed, the tool exits 3 with an empty
+stdout and one stderr line (it never says "not found" and never falls back to a direct open). Exit
+codes: 0 ok, 1 node or store not found (or an unknown field), 2 usage (argparse), a RELATIVE ENGRAM_HOME
+(refused with one stderr line, as everywhere in the repo, alpha #3863) or a node id that is not valid UTF-8
+(it cannot name a node; refused before any read; the flag does not matter for either), 3 the row could
+not be read honestly (flag ON: owner down, refusing or answering malformed; either flag: a row that does not fit the node
+schema).
+
 Examples:
     ENGRAM_HOME=/tmp/test-engram python inspect_raw.py ob_NNNN
     python inspect_raw.py dv_NNNN --field confidence_history
@@ -35,9 +46,17 @@ Examples:
 import argparse
 import json
 import os
-import sqlite3
 import sys
 from pathlib import Path
+
+# Locate the shared tools helper: support both "run as module" and direct invocation (same pattern as
+# tools/weakest_load_bearing.py and tools/cohort_dispatch.py).
+_HERE = Path(__file__).resolve().parent
+_REPO_ROOT = _HERE.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools import _owner_read as owner_read  # noqa: E402
 
 DATA_DIR = Path(os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram"))
 DB_PATH = DATA_DIR / "knowledge.db"
@@ -62,20 +81,123 @@ _SYNTHETIC_FIELDS = frozenset({
 ALL_STRIPPED_FIELDS = _TABLE_STRIPPED_COLS | _METADATA_STRIPPED_KEYS | _SYNTHETIC_FIELDS
 
 
+# The one statement the tool sends, registered byte for byte in src/engram/engramd_read_templates.json under
+# the site tools/inspect_raw.py:read_row. The tool reads exactly: type, metadata (content_hash, git_sha,
+# parsed_metadata), the stripped table columns, and id for the WHERE. The row dict is built BY POSITION from
+# _ROW_COLUMNS: the owner's read connection has no row_factory, so sqlite3.Row names are never available.
+_ROW_COLUMNS = ("id", "type", "embedding", "confidence_history", "metadata")
+_ROW_SQL = "SELECT id, type, embedding, confidence_history, metadata FROM nodes WHERE id = ?"
+
+OWNER_FLAG_KEY = "inspect_raw_reads_via_owner"
+OWNER_READ_FAILED_EXIT = 3  # 1 means "node not found" and stays that; argparse uses 2
+BAD_HOME_EXIT = 2  # a relative ENGRAM_HOME: a misconfigured call, refused before any read (argparse's code too)
+BAD_ID_EXIT = BAD_HOME_EXIT  # a node id that is not valid UTF-8: the same kind of refusal (a bad call, before any read)
+
+
+class InspectRawOwnerReadError(RuntimeError):
+    """The owner could not give the node's row (flag ON), or gave a row that does not fit. Raised instead of
+    returning None: None reads downstream as "the node is not in the store", an answer the store never gave."""
+
+
+def _owner_spec() -> "owner_read.OwnerReadSpec":
+    return owner_read.OwnerReadSpec(
+        flag_key=OWNER_FLAG_KEY,
+        error_cls=InspectRawOwnerReadError,
+        home=owner_read.engram_home(),
+        never_empty="Not answering 'node not found': that would read as the node not existing in the store.",
+    )
+
+
+def _is_str_or_none(cell) -> bool:
+    return cell is None or isinstance(cell, str)
+
+
+def _checked_row(rows, node_id: str) -> "dict | None":
+    """The one row as a dict keyed by _ROW_COLUMNS, or None for zero rows. Anything that does not fit raises
+    ValueError (the caller turns it into the typed error): more than one row, a row that is not exactly
+    len(_ROW_COLUMNS) cells, an id that is not the requested one, a non-str type, a non-str-or-None other cell."""
+    if not isinstance(rows, (list, tuple)):
+        raise ValueError("the answer is not a list of rows")
+    if len(rows) == 0:
+        return None
+    if len(rows) > 1:
+        raise ValueError(f"{len(rows)} rows for one id")
+    row = rows[0]
+    if isinstance(row, (str, bytes)) or not isinstance(row, (list, tuple)) or len(row) != len(_ROW_COLUMNS):
+        raise ValueError(f"the row is not {len(_ROW_COLUMNS)} cells")
+    cells = dict(zip(_ROW_COLUMNS, row))
+    if not isinstance(cells["id"], str) or cells["id"] != node_id:
+        raise ValueError("the row's id is not the requested id")
+    if not isinstance(cells["type"], str):
+        raise ValueError("the row's type is not a string")
+    for name in ("embedding", "confidence_history", "metadata"):
+        if not _is_str_or_none(cells[name]):
+            raise ValueError(f"the row's {name} is neither text nor NULL")
+    return cells
+
+
+def read_row(db_path, node_id: str, use_owner: "bool | None" = None) -> "dict | None":
+    """The raw row of `node_id` in the store at `db_path`, read through the shared owner-read helper only.
+
+    Behind engramd.inspect_raw_reads_via_owner (default OFF) the read goes to the engramd owner when `db_path`
+    is this home's store; the owner's answer replaces the db_path.exists() precondition. Flag ON and the owner
+    down, refusing or answering malformed RAISES InspectRawOwnerReadError: never None, never a partial dict,
+    never a direct fallback. Flag OFF opens the store `mode=ro`. None means the store answered zero rows.
+
+    `use_owner`: None (default) reads the flag here, once; a caller that has already decided passes that
+    decision (computed by `owner_read.flag_applies`, never any other way)."""
+    db_path = Path(db_path)
+    spec = _owner_spec()
+    if use_owner is None:
+        use_owner = owner_read.flag_applies(spec, db_path)
+    if not use_owner and not db_path.exists():
+        raise FileNotFoundError(f"ENGRAM database not found: {db_path}")
+    # Failures from the owner-read helper (owner down, a refusal, an unusable answer, a failed ping, a client
+    # that will not load) propagate UNCHANGED: each already carries its own complete remedy, and some say the
+    # flag will not help. Only the malformed-row message below is this function's own, so its wording depends
+    # on use_owner (flag OFF names neither the owner nor the flag).
+    if use_owner:
+        owner_read.ping(spec)  # the owner's answer replaces the db_path.exists() precondition
+    conn = owner_read.open_reader(spec, db_path, use_owner)
+    try:
+        rows = conn.execute(_ROW_SQL, (node_id,)).fetchall()
+        try:
+            return _checked_row(rows, node_id)
+        except ValueError as exc:
+            via = "the engramd owner answered" if use_owner else "the store answered"
+            remedy = (f"retry once the owner is healthy, or set engramd.{spec.flag_key} to false to read "
+                      "the store directly" if use_owner else "check the store")
+            raise InspectRawOwnerReadError(
+                f"{via} a row that does not match the node schema ({exc}); {remedy}. {spec.never_empty}"
+            ) from exc
+    finally:
+        conn.close()
+
+
 def _get_row(node_id: str) -> dict | None:
-    if not DB_PATH.exists():
+    # Two usage refusals, each by its own narrow check BEFORE the read, so no handler around the read has to
+    # guess which of its ValueErrors it is looking at (a handler as wide as ValueError once reported a node id
+    # sqlite could not encode as a relative home).
+    try:
+        owner_read.engram_home()  # a RELATIVE ENGRAM_HOME is refused here (alpha #3863), the one resolution for tools
+    except ValueError as exc:
+        print(f"ERROR: {' '.join(str(exc).split())}", file=sys.stderr)
+        sys.exit(BAD_HOME_EXIT)
+    try:
+        node_id.encode("utf-8")  # a lone surrogate (a stray non-UTF-8 argv byte) cannot name a node: ids are UTF-8 text
+    except UnicodeEncodeError:
+        print(f"ERROR: node id is not valid UTF-8, so it cannot name a node: {node_id!r}", file=sys.stderr)
+        sys.exit(BAD_ID_EXIT)
+    try:
+        return read_row(DB_PATH, node_id)
+    except FileNotFoundError:
         print(f"ERROR: DB not found at {DB_PATH}", file=sys.stderr)
         print(f"  Set ENGRAM_HOME to point at your engram data directory.", file=sys.stderr)
         sys.exit(1)
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    try:
-        row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
-        if row is None:
-            return None
-        return dict(row)
-    finally:
-        conn.close()
+    except InspectRawOwnerReadError as exc:
+        # Empty stdout, one stderr line (the helper's own message, verbatim), a code of its own: never 1.
+        print(f"ERROR: {type(exc).__name__}: {' '.join(str(exc).split())}", file=sys.stderr)
+        sys.exit(OWNER_READ_FAILED_EXIT)
 
 
 def _get_field_value(row: dict, field: str):
