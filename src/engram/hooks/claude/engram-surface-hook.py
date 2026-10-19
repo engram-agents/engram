@@ -1116,7 +1116,7 @@ DEFAULT_SUPPRESSION_M = 3   # repeat-count threshold before full suppression
 # this field existed) fall back exactly to the count-only classification.
 DEFAULT_PROMPT_SIMILARITY_THRESHOLD = 0.75
 
-# Ledger retention (~/.engram/surface-ledger.json). Two independent bounds,
+# Ledger retention (~/.engram/surface-ledger.json, under $ENGRAM_HOME). Two independent bounds,
 # applied together (belt-and-suspenders — either alone would bound growth,
 # combining them tolerates occasional gaps without losing the trailing-k
 # signal): per-session entries older than DEFAULT_LEDGER_ENTRY_MAX_AGE_HOURS
@@ -1187,7 +1187,7 @@ def _get_echo_guard_config() -> dict:
 
 def _get_session_started_at(session_id: str | None) -> "datetime | None":
     """Read this session's started_at from its per-session marker file
-    (~/.engram/sessions/<session_id>.json, written by the SessionStart hook).
+    (~/.engram/sessions/<session_id>.json under $ENGRAM_HOME, written by the SessionStart hook).
 
     None on any failure (missing session_id, missing/malformed marker file,
     missing/malformed started_at) — the echo guard treats None as "can't
@@ -4505,11 +4505,11 @@ def _main_impl():
         user_name = get_user_name()
         # Resolve the daemon script path relative to this hook's own location.
         # Works for both install paths:
-        #   - Scatter: hook is at ~/.engram/hooks/engram-surface-hook.py
-        #     → daemon at ~/.engram/hooks/start-engram-daemon.sh
+        #   - Scatter: hook is at ~/.engram/hooks/engram-surface-hook.py (under $ENGRAM_HOME)
+        #     → daemon at ~/.engram/hooks/start-engram-daemon.sh (under $ENGRAM_HOME)
         #   - Plugin: hook is at ${plugin}/hooks/engram-surface-hook.py
         #     → daemon at ${plugin}/hooks/start-engram-daemon.sh
-        # Without this, the recovery path would point at ~/.engram/hooks/
+        # Without this, the recovery path would point at ~/.engram/hooks/ (under $ENGRAM_HOME)
         # which doesn't exist in plugin installs.
         daemon_script = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),

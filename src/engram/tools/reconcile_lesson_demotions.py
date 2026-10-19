@@ -279,7 +279,7 @@ def find_candidates(
     # hook._count_recent_overrides reads the hook module's own
     # PREVENTION_LEDGER_PATH global, not a parameter -- point it at the
     # same ledger this function was asked to use (matters for tests, which
-    # pass a temp-file ledger distinct from the real ~/.engram one).
+    # pass a temp-file ledger distinct from the real ~/.engram ($ENGRAM_HOME) one).
     hook.PREVENTION_LEDGER_PATH = ledger_path
 
     lesson_ids = _read_ledger_lesson_ids(ledger_path)  # raises ReconcileError, doesn't swallow

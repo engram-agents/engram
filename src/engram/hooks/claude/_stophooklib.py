@@ -138,7 +138,7 @@ def resolve_transcript_path(
       3. Else `None`.
 
     `sessions_dir` defaults to `$ENGRAM_HOME/sessions` (`$ENGRAM_HOME` or
-    `~/.engram`) -- the same formula every consumer of this module already
+    `~/.engram` when $ENGRAM_HOME is unset) -- the same formula every consumer of this module already
     computes for its own module-level `SESSIONS_DIR` constant. Callers that
     already have their own `SESSIONS_DIR` constant should pass it explicitly
     rather than rely on this default, to avoid any risk of the two diverging.

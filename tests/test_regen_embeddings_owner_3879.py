@@ -695,9 +695,10 @@ def step_3_9_block() -> str:
     return text[body_start:text.index("```", body_start)]
 
 
-def _venv_python_wrapper(home: Path) -> None:
-    """$ENGRAM_HOME/venv/bin/python3 as Step 3.9 invokes it: a wrapper onto THIS interpreter."""
-    exe = home / "venv" / "bin" / "python3"
+def _venv_python_wrapper(login_home: Path) -> None:
+    """$HOME/.engram/venv/bin/python3 as Step 3.9 invokes it: a wrapper onto THIS interpreter. The plugin
+    venv is always under the LOGIN home, whatever ENGRAM_HOME is (Borges' ruling on #3863)."""
+    exe = login_home / ".engram" / "venv" / "bin" / "python3"
     exe.parent.mkdir(parents=True, exist_ok=True)
     exe.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
@@ -731,7 +732,7 @@ def test_c3b_step_3_9_reads_a_real_owner_down_run_as_failed_never_as_zero_work(h
     home, fake_home = homes
     db = make_store(home / "knowledge.db", "many", 6)
     set_flag(home)
-    _venv_python_wrapper(home)
+    _venv_python_wrapper(fake_home)
     status = phase_a_status(home, fake_home, str(TOOL_PATH))
     assert status.startswith("⚠ embedding backfill FAILED (exit 3):"), status
     assert "owner" in status.lower() and "unavailable" in status.lower(), status
@@ -744,7 +745,7 @@ def test_c3b_step_3_9_parses_the_json_of_a_successful_owner_run(homes, monkeypat
     home, fake_home = homes
     make_store(home / "knowledge.db", "many", 7)
     set_flag(home)
-    _venv_python_wrapper(home)
+    _venv_python_wrapper(fake_home)
     with RegenOwner(home, configured_model(home)) as owner:
         res = run_tool(monkeypatch, capsys, home, ["--json"])
     assert res.rc == 0, res.err
@@ -758,7 +759,7 @@ def test_c3b_step_3_9_reads_a_replayed_owner_failure_as_failed(homes, monkeypatc
     home, fake_home = homes
     make_store(home / "knowledge.db", "many", 7)
     set_flag(home)
-    _venv_python_wrapper(home)
+    _venv_python_wrapper(fake_home)
     with RegenOwner(home, configured_model(home), "finish_rejected"):
         res = run_tool(monkeypatch, capsys, home, ["--json"])
     status = phase_a_status(home, fake_home, _replay_tool(home, res))

@@ -6,7 +6,7 @@ two provenance labels — DATA and CODE — per the design ruling on forum #389
 (reply #7271, the settled answer after an earlier partial one on the same
 thread).
 
-**Data sha**: the SELECTED agent's own ``~/.engram``-equivalent data
+**Data sha**: the SELECTED agent's own ``~/.engram``-equivalent (``$ENGRAM_HOME``) data
 directory's git HEAD (the "anchor" concept ``health/engine.py``'s
 ``_anchor_commit_sha()`` already computes for health snapshots) — but
 computed for the agent whose graph the page is rendering, not the viz
@@ -48,8 +48,8 @@ TRACKS the running ``server.py`` before accepting it -- footer's OWN prior
 walk had no such check, which is exactly what let it silently misattribute
 an unrelated ANCESTOR repo's HEAD as this code's provenance on a real
 plugin install (measured against the installed plugin copy:
-``_code_provenance()`` returned ``~/.engram``'s HEAD labeled
-``(worktree)`` -- ``~/.engram`` encloses the plugin-flattened ``viz/``
+``_code_provenance()`` returned ``~/.engram``'s HEAD (default ``$ENGRAM_HOME``) labeled
+``(worktree)`` -- ``~/.engram`` (``$ENGRAM_HOME``) encloses the plugin-flattened ``viz/``
 tree under a gitignored ``marketplace/`` and was never the code's own
 repo). A null ``sha`` whose reason means "genuinely no tracking checkout"
 (``version_info.is_plugin_fallback_reason``) falls back to the
@@ -117,7 +117,7 @@ def _data_provenance(data_dir: str | os.PathLike | None) -> str:
     """The DATA sha for the agent whose graph is being rendered.
 
     *data_dir* is the directory CONTAINING that agent's ``knowledge.db``
-    (i.e. its ``~/.engram``-equivalent root) -- the caller derives this
+    (i.e. its ``~/.engram``-equivalent ``$ENGRAM_HOME`` root) -- the caller derives this
     from the agent's already-resolved ``db_path``. Returns the literal
     string "unversioned" (never raises, never fabricates) when *data_dir*
     is falsy, doesn't exist, or isn't a git working tree.

@@ -139,7 +139,7 @@ def discover_agents(scan_roots=None) -> dict:
     """Auto-discover local ENGRAM agents by scanning home directories.
 
     For each root in scan_roots (default: every /home/* entry plus the running
-    user's own home), glob '<root>/.engram*', skip backup/baseline dirs, and
+    user's own home), glob '<root>/.engram*' (the default $ENGRAM_HOME name), skip backup/baseline dirs, and
     for each candidate require both knowledge.db and config.json. Read
     agent_name from config.json (the canonical field). Register the agent under
     that name with its db path.

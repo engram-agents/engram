@@ -126,7 +126,7 @@ agent nudged mid-conversation doesn't swallow its next reply. Measured
 on 2.1.235, not asserted universal.
 
 Fire condition -- for Claude, emit the normal nudge iff ALL of:
-  (a) `~/.engram/loop-mode.json` exists (never nag a non-loop session), AND
+  (a) `~/.engram/loop-mode.json` (under $ENGRAM_HOME) exists (never nag a non-loop session), AND
   (b) its `pacer` field identifies a `scheduleWakeup`-paced loop (see
       2026-07-31 round-6 note below), AND
   (c) this turn's transcript delta contains NO `tool_use` block that BOTH

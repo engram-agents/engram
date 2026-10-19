@@ -2124,7 +2124,7 @@ def _require_agent_name(agent_name: str) -> None:
     if not agent_name:
         print(
             "forum: agent_name is required but not set.\n"
-            "  Set 'agent_name' in ~/.engram/config.json or ensure $USER is set.",
+            "  Set 'agent_name' in ~/.engram/config.json (under $ENGRAM_HOME) or ensure $USER is set.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)

@@ -1466,7 +1466,9 @@ def test_k6z_owner_mode_home_with_dotdot_in_any_position_is_refused_before_anyth
     before = _tree_listing(short_base, tmp_path)
     r = sb.run("--owner", engram_home=DOTDOT_REFUSED[spelling].format(b=short_base))
     assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
-    assert "must not contain '..' components" in r.stdout + r.stderr, (r.stdout, r.stderr)
+    # a RELATIVE spelling is refused one step earlier, by the launcher's relative-ENGRAM_HOME guard (#3863 6c)
+    needle = "ENGRAM_HOME must be an absolute path" if spelling.endswith("-relative") else "must not contain '..' components"
+    assert needle in r.stdout + r.stderr, (r.stdout, r.stderr)
     assert _tree_listing(short_base, tmp_path) == before, "a directory was created"
     sb.assert_nothing_written()
 

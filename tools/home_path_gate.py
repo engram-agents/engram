@@ -50,6 +50,28 @@ reaches the data home and is treated as a data-home spelling, a violation. A
 Bounds: the exemption is textual, so a URL or markdown link that contains
 `.engram/venv` is exempt too (a small widening: it was a violation before), and
 a traversal written in a form the patterns do not recognise stays invisible.
+The exemption needs a HOME-ANCHORED prefix (#3863 6c): form (a) only when
+`.engram/venv` directly follows `~`, `$HOME`, `"$HOME"` or `${HOME}`; form (b) only
+when the quoted chain follows `Path.home() /`, `Path.home().joinpath(`,
+`Path.home(),` (also `str(Path.home()),`) or `os.path.expanduser("~"),`. Everything
+else is NOT exempt: an absolute `/home/<user>/.engram/venv/bin/python3` (bare,
+quoted, or as an assignment's value) is an `abs_user_home` violation, and a
+variable-held home (`os.path.join(h, ".engram", "venv")`) is a violation because
+the gate cannot know what `h` holds. The exempt forms are ONE public definition,
+VENV_EXEMPT_FORMS, applied by mask_venv(); tests/test_shell_engram_home_3863.py
+imports it, so the gate and the shell scan cannot disagree about a venv line.
+
+THE ENGRAM_HOME-DERIVED VENV CLASS (`engram_home_derived_venv`, #3863 6c). The venv
+is NOT under the ENGRAM home, so a line that builds it from the home is wrong even
+though it names ENGRAM_HOME: `${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python3`,
+`${ENGRAM_HOME}/venv/...`, `$ENGRAM_HOME/venv/...`, `engram_home() / "venv"`,
+`os.path.join(ENGRAM_HOME, "venv/bin/python3")`, `Path(os.environ["ENGRAM_HOME"]) / "venv"`.
+Such a line is a violation in its own class and is NOT rescued by the clean-token
+rule (the ENGRAM_HOME on it is the defect). Detected by ENGRAM_HOME_VENV_RE on the
+line AFTER the home-anchored venv forms are masked, so a line that names ENGRAM_HOME
+for a data path and spells the HOME venv elsewhere stays clean. Bound: one physical
+line, and an ENGRAM_HOME token followed within 60 characters (no `;`) by `/venv` or
+a quoted `venv`; a venv path built across lines stays invisible.
 
 KNOWN BOUNDS (the instrument is the issue's floor, made wider, not a proof):
   * Only the SCAN_PREFIXES trees are read. src/forum (146 tracked files) and
@@ -279,31 +301,62 @@ SPELLINGS = [
 # comment 6243172448, 2026-10-17). Exempt BY NAME, and only these textual forms,
 # masked PER MATCH before the SPELLINGS run so a data-home spelling elsewhere on
 # the same line is still found.
+# THE HOME ANCHORS (#3863 6c). An exempt venv form must follow one of these, so an
+# absolute `/home/<user>/.engram/venv` or a variable-held home is not exempt.
+# (a) shell/prose spellings, directly before `/.engram/venv`; (b) Python spellings,
+# directly before the quoted chain `".engram" / "venv"`.
+VENV_HOME_ANCHORS_A = (
+    r"~",
+    r"\$HOME\"?",
+    r"\$\{HOME\}\"?",
+)
+VENV_HOME_ANCHORS_B = (
+    r"Path\.home\(\)\s*/\s*",
+    r"Path\.home\(\)\s*\.joinpath\(\s*",
+    r"Path\.home\(\)\)?\s*,\s*",
+    r"""expanduser\(\s*["']~["']\s*\)\s*,\s*""",
+)
+_ANCHOR_A = "(?:" + "|".join(VENV_HOME_ANCHORS_A) + ")"
+_ANCHOR_B = "(?:" + "|".join(VENV_HOME_ANCHORS_B) + ")"
+
 VENV_EXEMPT_FORMS = (
-    # (a) `.engram/venv` followed by a path separator, whitespace, a quote, a
-    # backtick, `)`, `]`, `,`, `:`, `;`, a sentence-final `.` (followed by
-    # whitespace, a closing quote or backtick, or the end of the line) or the end
-    # of the line. `.engram/venvs`,
+    # (a) a home anchor, then `/.engram/venv` followed by a path separator,
+    # whitespace, a quote, a backtick, `)`, `]`, `,`, `:`, `;`, a sentence-final `.`
+    # (followed by whitespace, a closing quote or backtick, or the end of the line)
+    # or the end of the line. `.engram/venvs`,
     # `.engram/venv-old`, `.engram/venv_x`, `.engram/venvy` do not match.
-    r"\.engram/venv(?=[/\s\"'`)\],:;]|\.(?:[\s\"'`]|$)|$)"
+    _ANCHOR_A + r"/\.engram/venv(?=[/\s\"'`)\],:;]|\.(?:[\s\"'`]|$)|$)"
     # not when a `..` path segment follows in the same path token: a traversal
     # out of the venv path reaches the data home
     r"(?![^\s\"'`]*/\.\.(?:[/\s\"'`]|$))",
-    # (b) the quoted-segment forms `".engram" / "venv"` and `".engram", "venv"`
-    # (either quote kind).
-    r"""["']\.engram["']\s*[/,]\s*["']venv["']"""
+    # (b) a home anchor, then the quoted-segment forms `".engram" / "venv"` and
+    # `".engram", "venv"` (either quote kind).
+    _ANCHOR_B + r"""["']\.engram["']\s*[/,]\s*["']venv["']"""
     # not when a later quoted segment of the same chain is ".."
     r"""(?!(?:\s*[/,]\s*["'][^"']*["'])*?\s*[/,]\s*["']\.\.["'])""",
 )
 _VENV_EXEMPT_RES = tuple(re.compile(f) for f in VENV_EXEMPT_FORMS)
 _VENV_MASK = "_venv_"  # neutral: no SPELLINGS row can match it
 
+# The ENGRAM_HOME-derived venv class (see the docstring): the venv is not under the home.
+DERIVED_VENV_NAME = "engram_home_derived_venv"
+ENGRAM_HOME_VENV_RE = re.compile(
+    r"(?:ENGRAM_HOME|\bengram_home\(\))[^\n;]{0,60}?(?:/venv|[\"']venv)(?![\w-])"
+)
 
-def _mask_venv(line):
-    """The line with every venv-path form replaced by a neutral token."""
+
+def mask_venv(line):
+    """The line with every home-anchored venv-path form replaced by a neutral token.
+    The one public definition of the venv exemption (the shell scan imports it)."""
     for rx in _VENV_EXEMPT_RES:
         line = rx.sub(_VENV_MASK, line)
     return line
+
+
+def engram_home_derived_venv(line):
+    """True when the line builds the venv path from the ENGRAM home. Applied to the
+    line with the home-anchored venv forms masked."""
+    return bool(ENGRAM_HOME_VENV_RE.search(mask_venv(line)))
 
 
 def _line_is_clean(line):
@@ -339,6 +392,19 @@ def scanned_files(root):
     )
 
 
+def line_violations(line):
+    """The violation names for ONE physical line: the derived-venv class (never
+    rescued by ENGRAM_HOME on the line) and, for a line that is not clean, every
+    SPELLINGS row that matches after the home-anchored venv forms are masked."""
+    names = []
+    if engram_home_derived_venv(line):
+        names.append(DERIVED_VENV_NAME)
+    if not _line_is_clean(line):
+        masked = mask_venv(line)
+        names += [name for name, rx in SPELLINGS if rx.search(masked)]
+    return names
+
+
 def violating_lines(root):
     """{relpath: [(lineno, line, [spelling names])]} for every scanned file's
     violating lines: a line with a SPELLINGS match that does not itself contain
@@ -350,10 +416,7 @@ def violating_lines(root):
         text = (root / rel).read_text(encoding="utf-8", errors="replace")
         rows = []
         for lineno, line in enumerate(text.split("\n"), 1):
-            if _line_is_clean(line):
-                continue
-            masked = _mask_venv(line)
-            names = [name for name, rx in SPELLINGS if rx.search(masked)]
+            names = line_violations(line)
             if names:
                 rows.append((lineno, line, names))
         if rows:
@@ -370,13 +433,14 @@ def violations(root):
     """{relpath: {spelling_name: first matching snippet}} for every scanned
     file that has at least one violating line."""
     rx_by_name = dict(SPELLINGS)
+    rx_by_name[DERIVED_VENV_NAME] = ENGRAM_HOME_VENV_RE
     out = {}
     for rel, rows in violating_lines(root).items():
         hits = {}
         for _, line, names in rows:
             for name in names:
                 if name not in hits:
-                    masked = _mask_venv(line)
+                    masked = mask_venv(line)
                     m = rx_by_name[name].search(masked)
                     hits[name] = masked[max(0, m.start() - 40) : m.end() + 40].strip()
         out[rel] = hits

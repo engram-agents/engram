@@ -5,7 +5,7 @@
 # ---------------------------
 # engram-alpha has two independent deployables:
 #   1. The ENGRAM plugin — tests in tests/, run with the engram venv
-#      (${ENGRAM_HOME:-$HOME/.engram}/venv) which has sqlite-vec, anthropic, etc. Scope = `tests/`
+#      ($HOME/.engram/venv) which has sqlite-vec, anthropic, etc. Scope = `tests/`
 #      to mirror CI's tests.yml exactly (NOT full discovery — see the ENGRAM
 #      SUITE block for why over-collection of docs/archive produces false-RED).
 #   2. The forum service (src/forum/) — tests in src/forum/tests/ and
@@ -32,6 +32,26 @@
 # TIER: dev (developer tooling only — not shipped in any install tier)
 
 set -uo pipefail
+
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863): it would resolve against the calling process's cwd, a
+# different home for every process. Unset or empty means unset; a leading ~ is expanded against $HOME and
+# re-exported (~user is not expanded: it is not absolute, so it is refused). Checked before anything else
+# runs; `return` covers a script that is sourced, `exit` one that is executed.
+if [ -n "${ENGRAM_HOME-}" ]; then
+    _eh_raw="$ENGRAM_HOME"
+    case "$ENGRAM_HOME" in
+        "~") ENGRAM_HOME="${HOME-}"; export ENGRAM_HOME ;;
+        "~/"*) ENGRAM_HOME="${HOME-}/${ENGRAM_HOME#"~/"}"; export ENGRAM_HOME ;;
+    esac
+    case "$ENGRAM_HOME" in
+        /*) ;;
+        *)
+            printf "ENGRAM_HOME must be an absolute path, got '%s'\n" "$_eh_raw" >&2
+            unset _eh_raw
+            return 2 2>/dev/null || exit 2 ;;
+    esac
+    unset _eh_raw
+fi
 
 # ---------------------------------------------------------------------------
 # Repo root resolution — robust, not fixed parent count
@@ -60,7 +80,7 @@ cd "$REPO_ROOT" || {
 # checked AFTER arg parsing, gated per suite, so `--engram-only` does not error
 # on a missing forum venv it never uses.
 # ---------------------------------------------------------------------------
-ENGRAM_PY="${ENGRAM_PY:-${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python}"
+ENGRAM_PY="${ENGRAM_PY:-$HOME/.engram/venv/bin/python}"
 FORUM_PY="${FORUM_PY:-/home/agents-shared/forum/.venv/bin/python}"
 
 # ---------------------------------------------------------------------------

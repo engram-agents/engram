@@ -7,7 +7,7 @@ compactMetadata: preTokens, postTokens, durationMs) at /compact time; the
 context_tracker scans the JSONL for that marker to locate the post-compact
 window. The marker was transiently absent ~2026-05-07 but is confirmed back
 in live sessions (live-verified 2026-06-09). The PostCompact hook writes the
-JSONL byte offset at compact time into ~/.engram/last-compact-at.json as a
+JSONL byte offset at compact time into ~/.engram/last-compact-at.json (under $ENGRAM_HOME) as a
 correctness backstop — for sessions where compact_boundary is absent or
 stale the tracker falls back to the marker; for normal sessions it is a
 belt-and-suspenders efficiency hedge (avoids rescanning from the top).

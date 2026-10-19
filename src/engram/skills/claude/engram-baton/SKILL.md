@@ -157,4 +157,4 @@ Pass `--help` to any subcommand for the full flag list.
 - **Hook integration**: `hooks/claude/engram-baton-prompt-hook.py` — surfaces in-court batons + live GitHub status every prompt
 - **Project files**: `/home/agents-shared/forum/projects/<id>.md` (YAML frontmatter + audit-log body)
 - **Auto-pull cache**: `$ENGRAM_HOME/baton-status-cache.json` (30s TTL)
-- **Marker for self-paced loops**: `~/.engram/loop-mode.json` (see `engram-loop` skill for lifecycle)
+- **Marker for self-paced loops**: `~/.engram/loop-mode.json` (under `$ENGRAM_HOME`, default `~/.engram`; see `engram-loop` skill for lifecycle)

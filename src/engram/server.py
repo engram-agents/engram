@@ -90,7 +90,7 @@ except Exception:  # pragma: no cover -- import-failure fallback
 # action's intensity-of-impression (Lei 2026-05-19 design call).
 
 # Sandbox guard: set to True when running inside engram_sandbox() context.
-# When True, _ensure_data_dir() will refuse to create ~/.engram.
+# When True, _ensure_data_dir() will refuse to create ~/.engram ($ENGRAM_HOME).
 
 # ---------------------------------------------------------------------------
 # WAL/shm self-guard state (#786)
@@ -1015,7 +1015,7 @@ NXDOMAIN_ERRNOS = _observation_mod.NXDOMAIN_ERRNOS
 # Empirical similarity thresholds — calibrated 2026-05-09 against live graph.
 # (tight-semantic-group ROC AUC 0.984, peak F1 0.843 at t=0.41, peak F2
 # recall-weighted 0.868 at t=0.33). These DEFAULT constants encode the chosen
-# operating points; per-agent overrides live in ~/.engram/config.json under
+# operating points; per-agent overrides live in ~/.engram/config.json ($ENGRAM_HOME) under
 # the `thresholds` section (schema v3 — see tools/migration/migrate_config_v3.py).
 #
 # Downstream code references the *_get_thresholds_config()*-returned dict
@@ -1363,7 +1363,7 @@ def _log_engram_tool_event(
     result_status: Optional[str],
     params_dict: Optional[dict],
 ) -> None:
-    """Emit one engram.tool.engram_call event directly into ~/.engram/logs/index.db.
+    """Emit one engram.tool.engram_call event directly into ~/.engram/logs/index.db ($ENGRAM_HOME).
 
     This is the server-side event emission path (server.py Phase 4). It writes
     directly to index.db rather than via the JSONL emitter, because server.py
@@ -1836,8 +1836,8 @@ def engram_add_observation(payload_json: str) -> str:
             standpoint_lineage (str, optional): Training lineage of the source claim's producer, format "provider:family" (e.g. "anthropic:opus"). The most load-bearing bias axis for AI-agent premises; format-validated, rejected with a redirecting error if malformed. Marks the EVIDENCE SOURCE that produced the claim, not who authored this node — you always author your own nodes, including your interpretation; lineage differs only when you're citing another agent's or a human's evidence.
             standpoint_architecture (str, optional): Cognitive architecture of the source's producer. Enum: transformer | vision-spatial | embodied-sensorimotor | graph-neural | human | other. Tracks architectural (not just training) diversity — Class A calibration exposure. Use "human" for human sources, "transformer" for other LLMs, omit for self-observations when explicit tracking is not desired.
             fs_class (str, optional): Falsification-sensitivity class — "re-executable" (Class 1: claim can be re-tested by re-running the measurement) or "frozen" (Class 2: claim records a past event that cannot be re-executed). Omit or pass null to let the Phase-1 proxy (derived from quote_type) apply. When provided, takes priority over the proxy and the FALSIFICATION line drops the "(proxy:quote_type)" label. When the class is ambiguous (e.g. a re-readable file that records past state), omit and let the proxy apply — hesitation is the correct signal to omit.
-            source_repo (str, optional): Absolute path to an alternative git repository to use for git operations. When omitted, the git repo is auto-detected from the file:// URL's directory. Use this for cross-repo citations where the cited file lives outside the target repo (e.g. a plugin file deployed to ~/.engram/ that is committed in the plugin source tree ~/engram-alpha/).
-            repo_path (str, optional): Relative path within source_repo where the committed copy of the cited file lives (e.g. "src/engram/server.py"). Required when source_repo is provided and the cited file:// URL path is outside source_repo — used for git status and cat-file checks instead of the auto-derived path. Without repo_path, the path is derived from the file URL relative to the source_repo root, which fails when the file lives outside source_repo. Example: cite file:///home/user/.engram/marketplace/plugins/engram/server.py with source_repo="/home/user/engram-alpha" and repo_path="src/engram/server.py".
+            source_repo (str, optional): Absolute path to an alternative git repository to use for git operations. When omitted, the git repo is auto-detected from the file:// URL's directory. Use this for cross-repo citations where the cited file lives outside the target repo (e.g. a plugin file deployed to $ENGRAM_HOME (default ~/.engram/) that is committed in the plugin source tree ~/engram-alpha/).
+            repo_path (str, optional): Relative path within source_repo where the committed copy of the cited file lives (e.g. "src/engram/server.py"). Required when source_repo is provided and the cited file:// URL path is outside source_repo — used for git status and cat-file checks instead of the auto-derived path. Without repo_path, the path is derived from the file URL relative to the source_repo root, which fails when the file lives outside source_repo. Example: cite file:///home/user/.engram/marketplace/plugins/engram/server.py (a $ENGRAM_HOME) with source_repo="/home/user/engram-alpha" and repo_path="src/engram/server.py".
             recall_summary (str, optional, always provide when you can): Compress your interpretation/claim into a ≤140-char recall-scent string shown to agents on future recall — don't start from a blank line. Omitting it clean-accepts but is flagged summary_missing (distinct from needs_tightening — a fail-loud-surface flag for the backfill sweep, not an error); a provided summary over 140 chars is soft-accepted (flagged needs_tightening for later cleanup), and the response carries recall_summary_overrun with the length; an excessively long summary is hard-rejected with no node created.
             recall_keywords (array of str, optional, always provide when you can): 3-6 short keyword strings for structural recognition cues. Never rejected regardless of count — normalized (trimmed, deduped case-sensitively, capped at 6).
             evidence_type (str, optional): What engram-snapshot (or you) captured, from a closed vocabulary: forum_thread, session_transcript, local_file, web_page, pdf. Stored on the evidence node's metadata at capture time. First-capture-wins on an evidence node that already carries a value: your value is never silently overwritten, and a DIFFERING value surfaces as evidence_type_conflict in the response instead of being dropped or applied. Not inferred from content or fs_class — pass exactly what engram-snapshot's own output emitted (its evidence_type key), or omit.
@@ -3152,7 +3152,7 @@ def _compute_warm_briefing_advisory(warm_briefing_path: Path, last_checkpoint_at
     safe to call directly.
 
     Args:
-        warm_briefing_path: path to ~/.engram/warm-briefing.md (or the
+        warm_briefing_path: path to ~/.engram/warm-briefing.md ($ENGRAM_HOME) (or the
             configured data dir's copy).
         last_checkpoint_at: the timestamp string of the MOST RECENT
             nap-or-sleep checkpoint already present in session_log.md,
@@ -3363,7 +3363,7 @@ _ADVANCE_TURN_FIELDS = frozenset({
 # lossless persistence with NO turn-advance. Compaction-boundary checkpoints +
 # background roles always use nap, never advance_turn.
 #
-# Pairs with sleep-success marker (~/.engram/sessions/last-sleep-success.json)
+# Pairs with sleep-success marker (~/.engram/sessions/last-sleep-success.json, under $ENGRAM_HOME)
 # for the auto-sleep cron idempotency — caller checks "did we already consolidate
 # tonight?" before calling this.
 @mcp.tool(
@@ -7963,7 +7963,7 @@ def engram_list(payload_json: str = "{}") -> str:
 # decides what to do with each candidate (e.g., file a derivation that resolves
 # an open question, supersede a stale node, nominate a cornerstone).
 #
-# Each call appends a tuple to ~/.engram/pattern_query_telemetry.jsonl for
+# Each call appends a tuple to ~/.engram/pattern_query_telemetry.jsonl ($ENGRAM_HOME) for
 # empirical preset calibration (the KnowQL-inspired design discipline — internal eval surface is
 # preserved verbatim regardless of agent-facing tier transformation).
 #
@@ -7996,7 +7996,7 @@ def engram_query_pattern(payload_json: str) -> str:
     """Run a named compositional graph-pattern query.
 
     Mechanical traversal + ranking; agent applies judgment to results. Calls
-    are logged to ~/.engram/pattern_query_telemetry.jsonl for preset calibration.
+    are logged to ~/.engram/pattern_query_telemetry.jsonl ($ENGRAM_HOME) for preset calibration.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -8457,7 +8457,7 @@ def _embedding_startup_gate() -> None:
         _enabled_value = emb_config["enabled"]
         print(
             f"[engram] FATAL: embedding.enabled is set to {_enabled_value!r} in "
-            "~/.engram/config.json. This key was RETIRED by #345 -- "
+            "~/.engram/config.json ($ENGRAM_HOME). This key was RETIRED by #345 -- "
             "embeddings are mandatory, and starting with it present and not "
             "the boolean true would file nodes with NULL embeddings, "
             "permanently excluded from semantic recall at any threshold, "
@@ -8465,7 +8465,7 @@ def _embedding_startup_gate() -> None:
             file=sys.stderr,
         )
         print("", file=sys.stderr)
-        print("  To fix, delete the key from ~/.engram/config.json:", file=sys.stderr)
+        print("  To fix, delete the key from ~/.engram/config.json ($ENGRAM_HOME):", file=sys.stderr)
         print('    {"embedding": {"model": "..."}}  # no "enabled" key', file=sys.stderr)
         print("", file=sys.stderr)
         print(
@@ -8554,7 +8554,7 @@ def _embedding_startup_gate() -> None:
 
 
 def _write_mcp_ready_marker() -> None:
-    """Write ~/.engram/mcp-tools-ready.json before mcp.run().
+    """Write ~/.engram/mcp-tools-ready.json ($ENGRAM_HOME) before mcp.run().
 
     Signals that the server process successfully completed initialization
     (all heavy imports done, pre-warm thread spawned) and is about to
@@ -8583,7 +8583,7 @@ def _write_mcp_ready_marker() -> None:
 
 if __name__ == "__main__":
     _ensure_data_dir()
-    # Initialize ~/.engram/.git for the durable version-controlled snapshot.
+    # Initialize ~/.engram/.git ($ENGRAM_HOME) for the durable version-controlled snapshot.
     # Best-effort: if git is missing or init fails, core._git_available stays False
     # and engram_checkpoint / engram_advance_turn will report version_control.git_committed=False.
     _init_git()

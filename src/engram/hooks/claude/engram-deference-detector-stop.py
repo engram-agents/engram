@@ -208,7 +208,7 @@ def _last_assistant_structure(jsonl_path: str | None = None, session_id: str | N
     Resolution order for the JSONL path (Issue #140 fix):
       1. `jsonl_path` argument — from this hook's own stdin payload, which
          is race-free per-caller even when multiple Claude sessions run.
-      2. Per-session marker `~/.engram/sessions/<session_id>.json` by
+      2. Per-session marker `~/.engram/sessions/<session_id>.json` (under $ENGRAM_HOME) by
          session_id from stdin — same race-free guarantee.
     """
     if not _STOPHOOKLIB_OK:

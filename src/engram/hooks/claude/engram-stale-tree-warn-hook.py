@@ -5,7 +5,7 @@ engram-stale-tree-warn-hook.py — PreToolUse behind-count warning (Layer 2: CAT
 Part of #1203's stale-tree tripwire, the catch half. See
 engram-stale-tree-pull-hook.py's module docstring for the full two-layer
 design and the shared `stale_tree_watch` config field. Both hooks read the
-SAME field from ~/.engram/config.json via the shared _stale_tree_hooklib.py
+SAME field from ~/.engram/config.json (under $ENGRAM_HOME) via the shared _stale_tree_hooklib.py
 module (SSoT) — never hardcode repo paths here.
 
 Fires on PreToolUse for Read, Grep, Glob, and Bash (matcher wired in

@@ -27,7 +27,7 @@ Mode 2 — live-file presence check (engram-alpha#3604):
 
     python tools/check-claude-md-drift.py --repo <SRC_DIR> --head <REF> --live <FILE> \\
         --user-name N --agent-name N --self-node-id pn_NNNN --engram-home DIR \\
-        [--seed-manifest ~/.engram/seed-manifest.json] [--seed-id KEY=VALUE ...] [--multi-agent]
+        [--seed-manifest $ENGRAM_HOME/seed-manifest.json] [--seed-id KEY=VALUE ...] [--multi-agent]
 
 Arguments
 ---------
@@ -75,7 +75,7 @@ rendered paragraph must be present in the live file; only MISSING ones are
 reported; extras and ordering are ignored (the template is the floor).
 
 Home path.  {{ENGRAM_HOME}} comes from --engram-home, but a live file may write
-the home as the literal ``~/.engram...`` or as the absolute path (an unquoted
+the home as the literal ``~/.engram...`` (ENGRAM_HOME's default) or as the absolute path (an unquoted
 ``~`` on the command line is expanded by the shell).  A unit that contains the
 home is present if the live file has it with the home written EITHER way,
 whichever form --engram-home was given in.  Any other home (a different

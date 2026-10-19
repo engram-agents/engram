@@ -56,7 +56,7 @@ The maturity gate fails toward nudging (young-agent assumption); the #840 idle
 gate fails toward emitting (uncertainty assumption). Both fail directions resolve
 to emission, by different reasoning.
 
-Config: cadence.write_nudge_node_threshold in ~/.engram/config.json.
+Config: cadence.write_nudge_node_threshold in ~/.engram/config.json (under $ENGRAM_HOME).
   - Absent or unreadable → use default (300).
   - Set to 0 or negative → gate disabled; nudge always emits regardless of
     graph size. This lets an agent deliberately opt back into nudges.
@@ -115,7 +115,7 @@ given the improved precision.
 Fail direction: any parse failure in the new logic → EMIT (fail-open, consistent
 with #844/#840). A corrupted or partially-written delta never suppresses.
 
-Config: cadence.write_nudge_prose_threshold in ~/.engram/config.json.
+Config: cadence.write_nudge_prose_threshold in ~/.engram/config.json (under $ENGRAM_HOME).
   - Absent or unreadable → use default (400).
   - Set to 0 or negative → prose gate disabled; treat all prose as exceeding
     (emit unless an engram write is present).

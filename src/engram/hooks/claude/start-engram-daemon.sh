@@ -58,6 +58,26 @@
 #   4. Run this script.
 #   5. Confirm $ENGRAM_HOME/recall-daemon.sock and recall-daemon.pid exist.
 
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863): it would resolve against the calling process's cwd, a
+# different home for every process. Unset or empty means unset; a leading ~ is expanded against $HOME and
+# re-exported (~user is not expanded: it is not absolute, so it is refused). Checked before anything else
+# runs. A SessionStart hook fails open: one stderr line, nothing written, exit 0.
+if [ -n "${ENGRAM_HOME-}" ]; then
+    _eh_raw="$ENGRAM_HOME"
+    case "$ENGRAM_HOME" in
+        "~") ENGRAM_HOME="${HOME-}"; export ENGRAM_HOME ;;
+        "~/"*) ENGRAM_HOME="${HOME-}/${ENGRAM_HOME#"~/"}"; export ENGRAM_HOME ;;
+    esac
+    case "$ENGRAM_HOME" in
+        /*) ;;
+        *)
+            printf "engram hook: ENGRAM_HOME must be an absolute path, got '%s'; doing nothing\n" "$_eh_raw" >&2
+            unset _eh_raw
+            return 0 2>/dev/null || exit 0 ;;
+    esac
+    unset _eh_raw
+fi
+
 : "${ENGRAM_HOME:=$HOME/.engram}"
 
 # #2652 phase-0 unit 4 fold (second fold onto this unit, colleague-review
@@ -142,7 +162,7 @@ _log_supervision() {
 # End-anchored (colleague-review fold, Kepler): ENGRAM_HOME is the LAST
 # argv, so an unanchored pattern would also match a DIFFERENT, longer
 # ENGRAM_HOME that merely has this one as a string prefix (e.g. this
-# agent's real `~/.engram` vs. some other checkout's `~/.engram-backup`)
+# agent's real ENGRAM_HOME (default `~/.engram`) vs. some other checkout's `~/.engram-backup`)
 # -- the shorter path is a substring of the longer one's command line.
 # Named so tests/test_pgrep_liveness_reap_patterns.py can import the exact
 # pattern under test instead of re-typing a copy that could drift (#2029).

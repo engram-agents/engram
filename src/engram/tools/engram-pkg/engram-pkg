@@ -5,7 +5,7 @@ engram-pkg — CLI toolkit for authoring engram-package databases.
 Operates on any engram-package directory passed via --pkg or $ENGRAM_PKG.
 Wraps the EngramClient (which redirects all server paths to the package
 directory atomically) so you can author into the package without touching
-your personal engram at ~/.engram/.
+your personal engram at ~/.engram/ (under $ENGRAM_HOME).
 
 Usage:
     engram-pkg --pkg ~/engram-packages/wiki/ <subcommand> [args...]
@@ -1068,7 +1068,7 @@ def cmd_scope_export(args):
 
     Steps (per spec §6):
       (a) Compute the transitive provenance closure from --nodes root IDs,
-          reading the agent's live ~/.engram/knowledge.db read-only.
+          reading the agent's live ~/.engram/knowledge.db (under $ENGRAM_HOME) read-only.
       (b) Validate closure-completeness invariant (spec §3a) — hard-fail on
           any dangling edge.
       (c) engram-pkg init a fresh package dir at --out.

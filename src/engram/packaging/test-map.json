@@ -914,7 +914,7 @@
     },
     {
       "path": "tools/rc-upgrade-verify.py",
-      "reason": "rc1->rc2 upgrade operational tooling (#2411); no dedicated test file. Verified manually against a live graph (byte copy, never the live DB) and via a direct build-plugin.sh --tier dev dry run rather than an automated test, since it exercises the actual migration subprocess + a real knowledge.db copy end-to-end."
+      "reason": "rc1->rc2 upgrade operational tooling (#2411); no dedicated test file (its venv-path line has a text guard in tests/test_home_path_gate.py, #3863). Verified manually against a live graph (byte copy, never the live DB) and via a direct build-plugin.sh --tier dev dry run rather than an automated test, since it exercises the actual migration subprocess + a real knowledge.db copy end-to-end."
     },
     {
       "path": "tools/deference_baseline.py",

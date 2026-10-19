@@ -16,7 +16,7 @@ the running code (verified via ``git ls-files --error-unmatch`` against the
 real ``server.py`` living next to this module). On a real plugin install,
 the ``viz`` package's own directory has no ``.git`` -- walking parents can
 land on an unrelated ANCESTOR repo that merely encloses it (e.g.
-``~/.engram``, the agent's own git-versioned graph-history store, which
+``~/.engram`` (``$ENGRAM_HOME``), the agent's own git-versioned graph-history store, which
 gitignores ``marketplace/`` and does not track the plugin-flattened
 ``viz/`` tree living under it). Accepting that ancestor without checking
 tracking would silently report a completely unrelated repo's sha/branch/
@@ -64,8 +64,8 @@ used to carry its own, independent, DEPTH-BOUNDED walk with no tracking
 check, which is exactly what let it silently misattribute an unrelated
 ANCESTOR repo's HEAD as this code's own provenance on a real plugin install
 (measured: importing the installed plugin's ``footer.py`` and calling
-``_code_provenance()`` returned ``~/.engram``'s HEAD, labeled ``(worktree)``,
-because ``~/.engram`` encloses the plugin-flattened ``viz/`` tree under a
+``_code_provenance()`` returned ``~/.engram``'s HEAD (default ``$ENGRAM_HOME``), labeled ``(worktree)``,
+because ``~/.engram`` (``$ENGRAM_HOME``) encloses the plugin-flattened ``viz/`` tree under a
 gitignored ``marketplace/``). ``footer._code_provenance()`` now calls
 ``capture_version_info()`` directly rather than re-implementing the walk;
 when the result's ``sha`` is null because the code isn't tracked by any
@@ -103,7 +103,7 @@ def find_git_root(start: Path) -> "Path | None":
     that repo actually TRACKS the running code. On the real plugin-install
     topology, the viz package's own directory has no `.git` of its own, and
     walking parents can land on an unrelated ANCESTOR repo that merely
-    encloses it (e.g. `~/.engram`, the agent's own git-versioned
+    encloses it (e.g. `~/.engram` (= `$ENGRAM_HOME`), the agent's own git-versioned
     graph-history store, which gitignores `marketplace/` and so does not
     track the plugin-flattened `viz/` tree living under it). Callers MUST
     additionally verify tracking (see `_path_is_tracked` in

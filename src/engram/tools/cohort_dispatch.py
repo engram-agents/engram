@@ -163,7 +163,7 @@ def _check_file_owner(path: Path) -> None:
             f"this process is uid {my_uid}. This looks like a shared-/tmp "
             f"scratch-filename collision with another agent (see #2075) -- "
             f"the file may contain another agent's data, not yours. "
-            f"Use a per-agent path under $HOME/.engram/tmp/ instead of a "
+            f"Use a per-agent path under $ENGRAM_HOME/tmp/ (default $HOME/.engram/tmp/) instead of a "
             f"shared, predictable /tmp path."
         )
 

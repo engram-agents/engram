@@ -19,7 +19,7 @@ marker via ``fold_compact_instructions()``). #2067 removed the
 ``docs/compaction-continuity.md`` for why — so the Claude render is now a
 single-file read. ``compact-instructions.md`` still ships; it is now the
 source for the **Codex** compact-prompt path only (``bootstrap.py`` writes
-it to ``~/.engram/codex-compact-prompt.md`` and wires it into
+it to ``~/.engram/codex-compact-prompt.md`` ($ENGRAM_HOME) and wires it into
 ``~/.codex/config.toml`` as ``experimental_compact_prompt_file``) and no
 longer feeds the Claude render at all.
 

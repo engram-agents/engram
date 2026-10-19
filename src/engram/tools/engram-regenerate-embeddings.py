@@ -15,7 +15,7 @@ Usage:
 
 When to run:
     After restoring knowledge.db from the git-tracked SQL dump:
-        sqlite3 ~/.engram/knowledge.db < ~/.engram/knowledge.sql
+        sqlite3 "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.db < "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.sql
     The dump excludes embeddings (they are regenerable and their inclusion
     caused ~37 MB churn per commit). This script backfills them so semantic
     search works again.
@@ -34,7 +34,7 @@ Progress:
     Logs to stderr: total to backfill, count per batch, final summary.
 
 Restore procedure (full):
-    1. sqlite3 ~/.engram/knowledge.db < ~/.engram/knowledge.sql
+    1. sqlite3 "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.db < "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.sql
     2. python tools/engram-regenerate-embeddings.py
     3. Restart the MCP server (so it reloads the fresh DB + vec index).
 

@@ -147,7 +147,7 @@ def _get_polarity_config() -> dict:
     Disabled if `ENGRAM_NO_POLARITY` env var is set (test-mode escape
     hatch so tests don't have to download a 1.5GB model).
 
-    To enable: set `polarity.enabled = true` in `~/.engram/config.json`.
+    To enable: set `polarity.enabled = true` in `~/.engram/config.json` ($ENGRAM_HOME).
     """
     defaults = {
         "enabled": False,
@@ -340,7 +340,7 @@ def _check_yellow_card(domain: str):
 
     Yellow-carded domains are sources we've judged unreliable as independent
     evidence (AI-aggregators, content farms, known-hallucinating surfaces).
-    Populated in ~/.engram/config.json under `yellow_domains` as a list of
+    Populated in ~/.engram/config.json ($ENGRAM_HOME) under `yellow_domains` as a list of
     {domain, reason, engram_node} entries. Suffix-matched like trust_pool so
     subdomains inherit the flag.
     """
@@ -701,7 +701,7 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
     # instead of the directory inferred from the file path. This lets the
     # caller verify a file against a secondary repo (e.g. the plugin source
     # tree) when the file's containing directory resolves to a different repo
-    # (e.g. the ~/.engram data repo where plugin files are untracked).
+    # (e.g. the ~/.engram ($ENGRAM_HOME) data repo where plugin files are untracked).
     if source_repo:
         git_cwd = os.path.abspath(source_repo)
         if not os.path.isdir(git_cwd):
@@ -1012,7 +1012,7 @@ def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
             "BEFORE RETRYING: check the engram-observe skill (Step A.4) for the "
             "pre-verification script. For JSONL files, messages may not have flushed "
             "yet — verify the quote exists in the file BEFORE calling this tool. "
-            "Run: ${ENGRAM_HOME:-$HOME/.engram}/tools/verify_quote.py <file> <phrase>"
+            'Run: "${ENGRAM_HOME:-$HOME/.engram}"/tools/verify_quote.py <file> <phrase>'
         )
     # Near-matches are computed against `content` -- for a PDF that's raw
     # bytes decoded as UTF-8 with errors="replace", i.e. noise. Suggesting

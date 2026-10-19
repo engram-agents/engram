@@ -15,7 +15,7 @@
 #     $ENGRAM_HOME/diary/             private diary entries
 #     $ENGRAM_HOME/warm-briefing.md   relational context letter
 #     $ENGRAM_HOME/config.json        agent configuration
-#     $ENGRAM_HOME/venv/              Python environment
+#     $HOME/.engram/venv/              Python environment
 #     ~/.claude/CLAUDE.md             agent identity configuration
 #
 # For a complete data reset, remove $ENGRAM_HOME/ manually AFTER running this
@@ -34,6 +34,26 @@
 #   --target T    Host target: claude-code (default) or codex.
 
 set -euo pipefail
+
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863): it would resolve against the calling process's cwd, a
+# different home for every process. Unset or empty means unset; a leading ~ is expanded against $HOME and
+# re-exported (~user is not expanded: it is not absolute, so it is refused). Checked before anything else
+# runs; `return` covers a script that is sourced, `exit` one that is executed.
+if [ -n "${ENGRAM_HOME-}" ]; then
+    _eh_raw="$ENGRAM_HOME"
+    case "$ENGRAM_HOME" in
+        "~") ENGRAM_HOME="${HOME-}"; export ENGRAM_HOME ;;
+        "~/"*) ENGRAM_HOME="${HOME-}/${ENGRAM_HOME#"~/"}"; export ENGRAM_HOME ;;
+    esac
+    case "$ENGRAM_HOME" in
+        /*) ;;
+        *)
+            printf "ENGRAM_HOME must be an absolute path, got '%s'\n" "$_eh_raw" >&2
+            unset _eh_raw
+            return 2 2>/dev/null || exit 2 ;;
+    esac
+    unset _eh_raw
+fi
 
 log()  { printf '[uninstall-local-marketplace] %s\n' "$*"; }
 warn() { printf '[uninstall-local-marketplace] WARN: %s\n' "$*"; }
@@ -179,7 +199,7 @@ else
   log "   $ENGRAM_HOME/history/      — session history"
   log "   $ENGRAM_HOME/diary/        — diary entries"
   log "   $ENGRAM_HOME/config.json   — configuration"
-  log "   $ENGRAM_HOME/venv/         — Python environment"
+  log "   $HOME/.engram/venv/         — Python environment"
   log "   ~/.claude/CLAUDE.md        — agent identity"
   log " "
   log " To reinstall: bash tools/install-local-marketplace.sh"

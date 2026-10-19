@@ -802,7 +802,7 @@ def _find_plugin_tree_data_dir(start_dir: Path) -> Path | None:
     ENDS in ``marketplace/plugins/engram`` -- the deployed-plugin-tree shape
     -- AND that directly contains ``.engram-build-manifest.json``. Returns
     the parent of that directory's ``marketplace`` segment (i.e. the DATA
-    dir, e.g. ``~/.engram``), or ``None`` if no such ancestor exists.
+    dir, e.g. ``$ENGRAM_HOME``, default ``~/.engram``), or ``None`` if no such ancestor exists.
 
     The suffix check comes first deliberately: a bare
     ``.engram-build-manifest.json`` sitting somewhere unrelated must not be
@@ -820,7 +820,7 @@ def _find_code_repo_toplevel(start_dir: Path) -> Path | None:
     returned if that toplevel is a CODE checkout -- i.e. it contains
     ``src/engram/health/measurements.py``. Returns ``None`` on any git
     failure, or when the toplevel is some OTHER git work tree (notably the
-    DATA repo, e.g. ``~/.engram``, which has no ``src/`` at all). Never
+    DATA repo, e.g. ``$ENGRAM_HOME`` (default ``~/.engram``), which has no ``src/`` at all). Never
     raises."""
     try:
         result = subprocess.run(
@@ -903,8 +903,8 @@ def detect_engine_build(module_path: str | Path | None = None) -> str:
     WHY step 2 must run before step 3, and why this is not merely an
     ordering preference: the deployed plugin tree is NESTED INSIDE the data
     repo's own git work tree (measured on two seats --
-    ``git -C ~/.engram/marketplace/plugins/engram rev-parse --show-toplevel``
-    returns ``~/.engram`` itself, a real directory nesting, not a symlink).
+    ``git -C ~/.engram/marketplace/plugins/engram rev-parse --show-toplevel`` (default $ENGRAM_HOME)
+    returns ``~/.engram`` (``$ENGRAM_HOME``) itself, a real directory nesting, not a symlink).
     So a rule that asks the git question first, for a module executing from
     the deployed tree, returns the DATA repo's HEAD -- the exact #2600
     defect, reached through a principled-looking door. Only the
@@ -1770,7 +1770,7 @@ def _default_regenerate_under_build(
     build``'s rule step 1 always wins, so the guard never fires on a
     scratch path) and ``ENGRAM_HOME`` pointed at a second, unrelated fresh
     temp dir as a belt-and-braces measure (``series.py`` never reads it,
-    but nothing here should risk resolving a real ``~/.engram``).
+    but nothing here should risk resolving a real ``~/.engram`` (``$ENGRAM_HOME``)).
 
     Never imports the scratch tree's code into THIS process -- the
     ``sys.executable`` subprocess call is the whole point (module docstring
@@ -2469,7 +2469,7 @@ def replay_commit(
     Mechanism: ``git show <commit_sha>:knowledge.sql`` (a ``subprocess.run``
     ARGUMENT LIST -- never ``shell=True``, never a piped string) reads the
     dump's text straight from git's object store, without ever checking out
-    a working tree or touching the live ``~/.engram/knowledge.db`` (design
+    a working tree or touching the live ``~/.engram/knowledge.db`` (under ``$ENGRAM_HOME``) (design
     doc §4: "it never opens the live knowledge.db, never writes a temp DB,
     never touches the WAL"); ``sqlite3.connect(':memory:')`` +
     ``executescript`` restores it into an in-memory database that is
