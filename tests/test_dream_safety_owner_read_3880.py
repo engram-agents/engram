@@ -1023,7 +1023,9 @@ def test_round1_c6_section_3_header_counts_equal_the_registry():
     m = re.search(r"(\d+) template entries; (\d+) with the (\w+) `tools/` templates", LEDGER.read_text())
     assert m, "the Section 3 header sentence"
     assert (int(m.group(1)), int(m.group(2))) == (non_tools, total), (m.group(0), non_tools, total, tools)
-    words = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12}
+    words = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+             "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+             "nineteen": 19, "twenty": 20}
     assert words[m.group(3)] == tools
 
 

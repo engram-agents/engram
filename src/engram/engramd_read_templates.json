@@ -2,10 +2,24 @@
   "schema": 1,
   "templates": [
     {
+      "key": "0268e1aaf4c8ab7eb47f1f2727d2d8785bb56d5c155c532dd27e0c367894507e",
+      "sql": "SELECT claim, quote_type, evidence_id FROM nodes WHERE id = ?",
+      "sites": [
+        "tools/weakest_load_bearing.py:_node_detail"
+      ]
+    },
+    {
       "key": "0280b9b584a3522d55be45f09ec258c28ec2d8b8e0e3cf80267097f593c71462",
       "sql": "SELECT COUNT(*) FROM nodes WHERE created_at > ?",
       "sites": [
         "hooks/claude/engram-session-start-hook.py:sleep_status_block"
+      ]
+    },
+    {
+      "key": "05bd2f3941a89717b037e9d113acd015bd2dec4851c13fb120af5d781e56fedc",
+      "sql": "SELECT source_id, target_id FROM edges WHERE relation IN (SELECT value FROM json_each(?))",
+      "sites": [
+        "tools/weakest_load_bearing.py:_dependents_map"
       ]
     },
     {
@@ -51,6 +65,13 @@
       ]
     },
     {
+      "key": "52fbda88135f730c72dd9b99a25b49a5bdca690ec6afd99d44f0110251a3974c",
+      "sql": "SELECT node_id, cascade_event, root_node FROM cascade_markers WHERE status = 'pending' ORDER BY id",
+      "sites": [
+        "tools/weakest_load_bearing.py:_pending_markers"
+      ]
+    },
+    {
       "key": "5961b023ce8247394b6d859ca4d0959c3ae34d2e9be481a8fd726899c795ef8e",
       "sql": "SELECT not_fully_restored, null_count, cause FROM embedding_restore_state WHERE singleton_key = 1",
       "sites": [
@@ -59,10 +80,24 @@
       ]
     },
     {
+      "key": "5ae1d203ba0fc1fe6c359dffc2ee37c0be6d4b33cab8f8a8da24108c79c70d84",
+      "sql": "SELECT target_id FROM edges WHERE source_id = ? AND relation IN (SELECT value FROM json_each(?)) ORDER BY target_id",
+      "sites": [
+        "tools/weakest_load_bearing.py:_direct_premises"
+      ]
+    },
+    {
       "key": "5ca245030193bc0e9811e8af365843b66ab4c4d999bbf2d13b79eabc0df37ee8",
       "sql": "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'generalizes'",
       "sites": [
         "engram_core.py:generalization_chain"
+      ]
+    },
+    {
+      "key": "5d20068d948c7f26fbda3c1aba1bb024044429ca0fa87a888ebcf0e3bfbe8c1d",
+      "sql": "SELECT source_url, source_title FROM nodes WHERE id = ?",
+      "sites": [
+        "tools/weakest_load_bearing.py:_evidence_label"
       ]
     },
     {
@@ -158,10 +193,24 @@
       ]
     },
     {
+      "key": "b3a2d1ab2b1a718bce83ce77bb8362f0b59d94677d8c9026e49a1e957ca06e97",
+      "sql": "SELECT id, type, confidence, recall_turn FROM nodes WHERE is_current = 1 AND COALESCE(status, '') != 'retracted'",
+      "sites": [
+        "tools/weakest_load_bearing.py:_live_nodes"
+      ]
+    },
+    {
       "key": "bca59f0784091d50dfa65e9ee9d35288defe5503524b0e43437bb701e1dc7e80",
       "sql": "\nSELECT\n    id,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.prevention_type')    AS prevention_type,\n    COALESCE(json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.scaffolding_nudge'), claim) AS nudge\nFROM nodes\nWHERE type = 'lesson'\n  AND is_current = 1\n  AND memory_status = 'active'\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') IS NOT NULL\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') != ''\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.prevention_type') IN ('shadow', 'blocking')\n",
       "sites": [
         "hooks/claude/engram-lesson-tripwire-hook.py:load_prevention_lessons"
+      ]
+    },
+    {
+      "key": "c4c336fb9802f92e244bed1ab36b75acd83db33fc04a07015a3e9c344893a1d7",
+      "sql": "SELECT DISTINCT e.target_id FROM edges e JOIN nodes ct ON ct.id = e.source_id WHERE e.relation = 'contradicts' AND ct.type = 'contradiction' AND ct.is_current = 1 AND ct.status IN (SELECT value FROM json_each(?))",
+      "sites": [
+        "tools/weakest_load_bearing.py:_contested_ids"
       ]
     },
     {

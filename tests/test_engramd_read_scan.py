@@ -490,7 +490,16 @@ _LINE_KEY = _re.compile(r":\d+$")
 # and the per-node embedding-text row (99da5d73...), sites tools/engram-regenerate-embeddings.py:_owner_*.
 # #3880 (U17): the dream master CLI's four statements, tools/dream_master_batch.py (safety row, the two coverage
 # aggregates, the null-embedding count).
+# #3921: the weakest-load-bearing ranking's seven statements, tools/weakest_load_bearing.py (reached from the
+# root `rank`: live nodes, premise edges, contested, pending markers, direct premises, node detail, evidence).
 _FROZEN_TEMPLATE_KEYS = frozenset({
+    "b3a2d1ab2b1a718bce83ce77bb8362f0b59d94677d8c9026e49a1e957ca06e97",
+    "05bd2f3941a89717b037e9d113acd015bd2dec4851c13fb120af5d781e56fedc",
+    "c4c336fb9802f92e244bed1ab36b75acd83db33fc04a07015a3e9c344893a1d7",
+    "52fbda88135f730c72dd9b99a25b49a5bdca690ec6afd99d44f0110251a3974c",
+    "5ae1d203ba0fc1fe6c359dffc2ee37c0be6d4b33cab8f8a8da24108c79c70d84",
+    "0268e1aaf4c8ab7eb47f1f2727d2d8785bb56d5c155c532dd27e0c367894507e",
+    "5d20068d948c7f26fbda3c1aba1bb024044429ca0fa87a888ebcf0e3bfbe8c1d",
     "f0cd101df2bf713d48b6fa7557bcfc2ac76f978ed1d552e3c94e4ca82359cfd5",
     "605333c4d1e12407862ff5f039a4a27289380a1f01469e87456170af0f921842",
     "99da5d73eb6250a34c5c08a053ca046d0c294cb82ac443558806325c570c66da",
