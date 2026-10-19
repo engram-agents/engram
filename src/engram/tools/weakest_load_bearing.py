@@ -421,8 +421,10 @@ def read_ranking(db_path, n: int = 5, use_owner: "bool | None" = None) -> list:
         use_owner = owner_read.flag_applies(spec, db_path)
     if use_owner:
         owner_read.ping(spec)  # the owner's answer replaces the db_path.exists() precondition
-    elif not db_path.exists():
-        raise FileNotFoundError(f"ENGRAM database not found: {db_path}")
+    else:
+        # Kept before `_get_current_turn()` below: that reads config.json and raises on a torn one, which would
+        # hide a store problem behind a config error (the open_reader check comes only after it).
+        owner_read.check_store_path(db_path)
     current_turn = core._get_current_turn()
     conn = owner_read.open_reader(spec, db_path, use_owner)
     try:

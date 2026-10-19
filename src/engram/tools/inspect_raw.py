@@ -151,8 +151,16 @@ def read_row(db_path, node_id: str, use_owner: "bool | None" = None) -> "dict | 
     spec = _owner_spec()
     if use_owner is None:
         use_owner = owner_read.flag_applies(spec, db_path)
-    if not use_owner and not db_path.exists():
-        raise FileNotFoundError(f"ENGRAM database not found: {db_path}")
+    if not use_owner:
+        # Flag OFF: classify the store path before any open (#3960). Not found stays a FileNotFoundError (exit 1
+        # in the CLI); a path that cannot be checked, or is not a regular file (a FIFO would block the open), is
+        # "could not be read" (exit 3), with the helper's one-line message and a remedy that is never "create it".
+        # Kept: it maps the unusable classes to InspectRawOwnerReadError (exit 3); open_reader's own check would
+        # raise them unmapped.
+        try:
+            owner_read.check_store_path(db_path)
+        except owner_read.StoreUnusable as exc:
+            raise InspectRawOwnerReadError(str(exc)) from exc
     # Failures from the owner-read helper (owner down, a refusal, an unusable answer, a failed ping, a client
     # that will not load) propagate UNCHANGED: each already carries its own complete remedy, and some say the
     # flag will not help. Only the malformed-row message below is this function's own, so its wording depends

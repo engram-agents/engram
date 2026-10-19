@@ -273,8 +273,16 @@ def find_candidates(
     use_owner = _owner_flag_applies(db_path)
     if use_owner:
         _owner_ping()  # the owner's answer replaces the db_path.exists() precondition (#3824)
-    elif not db_path.exists():
-        raise ReconcileError(f"knowledge.db not found at {db_path}")
+    else:
+        # Kept: it wraps the classes in ReconcileError, and must run before the empty-ledger early return below,
+        # which never opens the store.
+        try:
+            owner_read.check_store_path(db_path)
+        except FileNotFoundError:
+            raise ReconcileError(f"knowledge.db not found at {db_path}") from None
+        except owner_read.StoreUnusable as exc:
+            # exit 1 is this tool's documented "genuine failure to check"; never an empty candidate list
+            raise ReconcileError(str(exc)) from exc
     hook = hook_module or _load_hook_module()
     # hook._count_recent_overrides reads the hook module's own
     # PREVENTION_LEDGER_PATH global, not a parameter -- point it at the

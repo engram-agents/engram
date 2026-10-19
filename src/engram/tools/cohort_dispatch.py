@@ -213,8 +213,7 @@ def _fetch_nodes(db_path: Path, node_ids: list[str], use_owner: bool | None = No
         use_owner = owner_read.flag_applies(spec, db_path)
     if use_owner:
         owner_read.ping(spec)  # the owner's answer replaces the db_path.exists() precondition
-    elif not db_path.exists():
-        raise FileNotFoundError(f"ENGRAM database not found: {db_path}")
+    # Flag OFF: `open_reader` runs `check_store_path` first (#3960); nothing happens in between.
     conn = owner_read.open_reader(spec, db_path, use_owner)
     try:
         rows = conn.execute(_FETCH_NODES_SQL, (json.dumps(node_ids),)).fetchall()
@@ -475,7 +474,12 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         return 1
 
     db_path = Path(args.db)
-    nodes = _fetch_nodes(db_path, node_ids)
+    try:
+        nodes = _fetch_nodes(db_path, node_ids)
+    except (FileNotFoundError, owner_read.StoreUnusable) as exc:
+        # No traceback (#3960). 1 is prepare's error code here (no artifact is written before this point).
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     if not nodes:
         print(f"error: none of the requested nodes found in {db_path}", file=sys.stderr)
@@ -706,16 +710,26 @@ def cmd_verify_in(args: argparse.Namespace) -> int:
     # Check 3: content integrity — every id resolves to a DB row with matching claim
     # With the owner flag ON the owner's answer replaces the db_path.exists() precondition.
     owner_serves = bool(all_ids_seen) and _owner_applies(db_path)
-    if all_ids_seen and not owner_serves and not db_path.exists():
-        print(
-            f"warning: DB path {db_path} not found — content-integrity check skipped",
-            file=sys.stderr,
-        )
-    if all_ids_seen and (owner_serves or db_path.exists()):
+    store_present = owner_serves
+    if all_ids_seen and not owner_serves:
+        try:
+            # Kept here: the not-found skip warning and the db_access error are decided on this one result.
+            owner_read.check_store_path(db_path)
+            store_present = True
+        except FileNotFoundError:
+            print(
+                f"warning: DB path {db_path} not found — content-integrity check skipped",
+                file=sys.stderr,
+            )
+        except owner_read.StoreUnusable as exc:
+            # #3960: an uncheckable store must NEVER silently skip the integrity check: record the one db_access
+            # failure here and skip the read (`store_present` stays False; no answer, so no per-node verdicts).
+            errors.append({"chunk": "all", "check": "db_access", "error": str(exc)})
+    if all_ids_seen and store_present:
         id_list = list(all_ids_seen.keys())
         try:
             db_nodes = _fetch_nodes(db_path, id_list, use_owner=owner_serves)
-        except (FileNotFoundError, CohortOwnerReadError) as exc:
+        except (FileNotFoundError, CohortOwnerReadError, owner_read.StoreUnusable) as exc:
             # ONE named failure. An owner that could not answer must not become "every id is absent":
             # the per-node "not found in DB" checks below only run on a real answer.
             errors.append({

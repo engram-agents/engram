@@ -8,7 +8,10 @@ A tool that reads the live store through the engramd owner behind a flag needs t
   3. "does the flag apply to THIS db?" (`flag_applies`: flag ON and the db is this home's store),
   4. the ping that replaces the `db_path.exists()` precondition (`ping`),
   5. a read connection: the owner shim under the flag, else a `mode=ro` sqlite connection
-     (`open_reader`), with every owner failure turned into the caller's own typed error.
+     (`open_reader`), with every owner failure turned into the caller's own typed error,
+  6. the flag-OFF store-path precheck that replaces the same precondition (`check_store_path`, #3960): it
+     classifies a path (not found, uncheckable, not a store) and never picks an exit code; each tool maps the
+     classes to the codes it documents.
 
 Each tool describes itself with one `OwnerReadSpec` (its flag key, its error class, its home, the
 sentence that says what an empty answer would have meant) and calls these functions with it. The
@@ -21,9 +24,11 @@ Imported by an essential tool (cohort_dispatch), so this module ships at tier es
 
 from __future__ import annotations
 
+import errno
 import importlib
 import os
 import sqlite3
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +43,10 @@ __all__ = [
     "failure",
     "ping",
     "open_reader",
+    "check_store_path",
+    "StoreUnusable",
+    "StoreUncheckable",
+    "StoreNotAStore",
     "snapshot",
     "write",
 ]
@@ -231,13 +240,89 @@ class _OwnerReader:
         self._conn.close()
 
 
+class StoreUnusable(Exception):
+    """The base of the two classes `check_store_path` raises for a path that is not a usable store. Neither an
+    OSError nor a FileNotFoundError, so no existing `except OSError` or `except FileNotFoundError` swallows
+    one as something else."""
+
+
+class StoreUncheckable(StoreUnusable):
+    """The path exists or may exist but could not be checked (a parent that cannot be searched, a symlink loop,
+    a dangling link, any other OSError). The remedy is to fix the path, never to create a store there."""
+
+
+class StoreNotAStore(StoreUnusable):
+    """The path resolves but is not a regular file (a FIFO, a directory, a socket, a device). The remedy is to
+    fix the path, never to create a store there."""
+
+
+def _errno_symbol(exc: OSError) -> str:
+    code = getattr(exc, "errno", None)
+    return errno.errorcode.get(code, "OSError") if code is not None else "OSError"
+
+
+def _uncheckable(db_path, exc: OSError) -> StoreUncheckable:
+    why = " ".join(str(exc.strerror or exc).split())
+    return StoreUncheckable(
+        f"cannot check the store at {db_path} ({_errno_symbol(exc)}: {why}); fix the path, do not create a "
+        f"store there"
+    )
+
+
+def _file_type_words(mode: int) -> str:
+    if stat.S_ISFIFO(mode):
+        return "a FIFO"
+    if stat.S_ISDIR(mode):
+        return "a directory"
+    if stat.S_ISSOCK(mode):
+        return "a socket"
+    if stat.S_ISCHR(mode) or stat.S_ISBLK(mode):
+        return "a device"
+    return "not a regular file"
+
+
+def check_store_path(db_path) -> None:
+    """Flag OFF replaces `db_path.exists()`. Returns None for a usable regular file (a symlink to one counts);
+    otherwise raises, classifying and NEVER choosing an exit code (each tool maps the classes itself):
+
+      no directory entry at all                    FileNotFoundError("ENGRAM database not found: <path>"),
+                                                   the type and text callers raise for a missing store
+      any other lstat failure (EACCES on a parent,
+        ENOTDIR, ...)                              StoreUncheckable
+      lstat ok, stat fails (ELOOP, a dangling link,
+        EACCES on the target)                      StoreUncheckable
+      stat ok, not a regular file                  StoreNotAStore (FIFO, directory, socket, device)
+
+    The check is `lstat` then `stat` on the resolved target and it NEVER opens the path: a plain open of a
+    FIFO blocks (macOS `mode=ro`), so this is the only order in which a FIFO cannot hang the caller.
+    Out of scope by ruling: a file swapped for a FIFO between this check and the open."""
+    try:
+        os.lstat(db_path)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"ENGRAM database not found: {db_path}") from None
+    except OSError as exc:
+        raise _uncheckable(db_path, exc) from exc
+    try:
+        st = os.stat(db_path)
+    except OSError as exc:
+        raise _uncheckable(db_path, exc) from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise StoreNotAStore(
+            f"the store path {db_path} is {_file_type_words(st.st_mode)}, not a regular file; fix the path, do "
+            f"not create a store there"
+        )
+
+
 def open_reader(spec: OwnerReadSpec, db_path: Path, use_owner: bool):
     """The read connection: the owner shim under the flag, else a `mode=ro` sqlite connection.
 
     The direct path opens read-only on BOTH flag values (the uri is percent-encoded, so a `?` or `#` in
-    the path cannot be read as a uri parameter)."""
+    the path cannot be read as a uri parameter). Flag OFF runs `check_store_path` first, so a FIFO (whose
+    `mode=ro` open blocks) is refused before any open for every caller, including one that forgot its own
+    precheck. The flag-ON branch is untouched: the owner answers for the store there."""
     if use_owner:
         return _OwnerReader(spec, import_runtime("engramd_client"))
+    check_store_path(db_path)
     return sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
 
 

@@ -120,7 +120,8 @@ def test_u1_an_unreadable_store_is_exit_3_one_honest_stderr_line(home, kind, mod
     assert len(lines) == 1, r.stderr
     line = lines[0]
     assert str(db) in line, line
-    assert EXPECTED[kind][1] in line, line
+    if kind != "directory":
+        assert EXPECTED[kind][1] in line, line
     # The "ERROR: InspectRawOwnerReadError:" prefix is the CLI's existing typed-error prefix on every exit-3 line
     # (the malformed-row line carries it too); the rule is about the message after it.
     prefix = "ERROR: InspectRawOwnerReadError: "
@@ -128,7 +129,12 @@ def test_u1_an_unreadable_store_is_exit_3_one_honest_stderr_line(home, kind, mod
     message = line[len(prefix):]
     for text in ("owner", "engramd", FLAG_KEY, "flag"):
         assert text not in message.lower(), (text, message)
-    assert REMEDY in message, message
+    if kind == "directory":
+        # #3960: a directory is refused by the store-path precheck before any open (same exit 3, a better
+        # message); the sqlite text and the lock remedy belong to the stores sqlite itself rejects.
+        assert "is a directory" in message and "fix the path" in message, message
+    else:
+        assert REMEDY in message, message
 
 
 @pytest.mark.parametrize("kind", STORES)
