@@ -37,8 +37,17 @@ def L(*ns):
     return "".join(f"c{n} = sqlite3.connect(p)\n" for n in ns)
 
 
-def _row(n, spec, state="direct"):
-    return f"| {n} | {spec} | call | live store | rw | x | {state} | — | — |\n"
+KINDS = ("call", "prose")
+TARGETS = ("live store", "parameter", "other DB", "n/a (prose)", "unresolved")
+
+
+def _target_cell(cat):
+    """A realistic target cell: the category, then free text."""
+    return "n/a — comment text" if cat == "n/a (prose)" else f"{cat}: free text"
+
+
+def _row(n, spec, state="direct", kind="call", target="live store"):
+    return f"| {n} | {spec} | {kind} | {_target_cell(target)} | rw | x | {state} | — | — |\n"
 
 
 def _tally(states):
@@ -61,14 +70,47 @@ def _state_line(c):
     return "- **state:** " + " · ".join(f"{k} {c[k]}" for k in STATES + (OOS,)) + "\n"
 
 
-def _ledger(rows, states=None, summary=None, state_line=None):
-    """summary/state_line: None = consistent default, "" = omit, else verbatim."""
+def _count(values, keys):
+    return {k: sum(1 for v in values if v == k) for k in keys}
+
+
+def _kind_line(c):
+    return "- **kind:** " + " · ".join(f"{k} {c[k]}" for k in KINDS) + "\n"
+
+
+def _target_line(c):
+    return "- **target:** " + " · ".join(f"{k} {c[k]}" for k in TARGETS) + "\n"
+
+
+def _unit_line(ncall, nlines=None, nconnects=None):
+    nlines = ncall if nlines is None else nlines
+    nconnects = ncall + 1 if nconnects is None else nconnects
+    return (
+        f"- **unit:** one row per matching LINE. Row 5 has two connects, so "
+        f"the {ncall} `call` rows are {nlines} lines and {nconnects} connects.\n"
+    )
+
+
+def _ledger(rows, states=None, summary=None, state_line=None, kinds=None, targets=None,
+            kind_line=None, target_line=None, unit_line=None):
+    """summary/state_line/kind_line/target_line/unit_line: None = consistent
+    default, "" = omit, else verbatim."""
     states = list(states) if states is not None else ["direct"] * len(rows)
+    kinds = list(kinds) if kinds is not None else ["call"] * len(rows)
+    targets = list(targets) if targets is not None else ["live store"] * len(rows)
     c = _tally(states)
     sm = _summary_line(c) if summary is None else summary
     sl = _state_line(c) if state_line is None else state_line
-    head = f"# ledger\n\n## Summary\n\n{sm}\n## 1. Population\n\ntext\n{sl}\n## 2. The ledger\n\n" + TABLE_HEAD
-    body = "".join(_row(i + 1, r, states[i]) for i, r in enumerate(rows))
+    kl = _kind_line(_count(kinds, KINDS)) if kind_line is None else kind_line
+    tl = _target_line(_count(targets, TARGETS)) if target_line is None else target_line
+    ul = _unit_line(kinds.count("call")) if unit_line is None else unit_line
+    head = (
+        f"# ledger\n\n## Summary\n\n{sm}\n## 1. Population\n\ntext\n{ul}{kl}{tl}{sl}\n"
+        "## 2. The ledger\n\n" + TABLE_HEAD
+    )
+    body = "".join(
+        _row(i + 1, r, states[i], kinds[i], targets[i]) for i, r in enumerate(rows)
+    )
     return head + body + FOOTER
 
 
@@ -344,10 +386,15 @@ def test_c6c_state_found_by_header_name_not_index(tmp_path):
     files = {"a.py": L(1, 2)}
     head = (
         "# l\n\n## Summary\n\n" + _summary_line(_tally(["direct", "owner"]))
-        + "\n## 1. P\n\n" + _state_line(_tally(["direct", "owner"]))
-        + "\n## 2. The ledger\n\n| # | site | state | note |\n|---|---|---|---|\n"
+        + "\n## 1. P\n\n" + _unit_line(2) + _kind_line({"call": 2, "prose": 0})
+        + _target_line(_count(["live store"] * 2, TARGETS))
+        + _state_line(_tally(["direct", "owner"]))
+        + "\n## 2. The ledger\n\n| # | site | kind | target | state | note |\n|---|---|---|---|---|---|\n"
     )
-    body = "| 1 | " + C("a.py", 1) + " | direct | retired soon |\n| 2 | " + C("a.py", 2) + " | owner | x |\n"
+    body = (
+        "| 1 | " + C("a.py", 1) + " | call | live store | direct | retired soon |\n"
+        "| 2 | " + C("a.py", 2) + " | call | live store | owner | x |\n"
+    )
     r = _run(_make_repo(tmp_path, files, [], ledger_text=head + body + FOOTER))
     assert r.returncode == 0, r.stdout + r.stderr
 
@@ -363,6 +410,224 @@ def test_c7_real_ledger_tally_matches_rows():
     r = _run(REPO)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "section 1" not in r.stdout
+
+
+# ---- kind / target / unit tallies are derived from the rows too (#2652) ----
+
+
+def _two(**kw):
+    return _ledger([C("a.py", 1), C("a.py", 2)], **kw)
+
+
+def _run2(tmp_path, text):
+    return _run(_make_repo(tmp_path, {"a.py": L(1, 2)}, [], ledger_text=text))
+
+
+def test_k1_consistent_mixed_kinds_and_targets_pass(tmp_path):
+    kinds = ["call", "prose", "call", "call", "prose"]
+    targets = ["live store", "n/a (prose)", "parameter", "other DB", "n/a (prose)"]
+    text = _ledger([C("a.py", i + 1) for i in range(5)], kinds=kinds, targets=targets)
+    r = _run(_make_repo(tmp_path, {"a.py": L(*range(1, 6))}, [], ledger_text=text))
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_k2_kind_line_number_alone_changed_fails_and_only_kind_fires(tmp_path):
+    # Discriminating control: mutate ONLY the kind line's number.
+    good = _two()
+    bad = good.replace("- **kind:** call 2 · prose 0", "- **kind:** call 3 · prose 0")
+    assert bad != good
+    assert _run2(tmp_path / "good", good).returncode == 0
+    r = _run2(tmp_path / "bad", bad)
+    assert r.returncode == 1
+    assert "section 1 kind: call says 3, rows give 2" in r.stdout
+    assert "section 1 state" not in r.stdout and "row " not in r.stdout
+
+
+def test_k3_prose_count_disagrees(tmp_path):
+    text = _two(kinds=["call", "prose"], targets=["live store", "n/a (prose)"],
+                kind_line="- **kind:** call 2 · prose 0\n")
+    r = _run2(tmp_path, text)
+    assert r.returncode == 1
+    assert "section 1 kind: call says 2, rows give 1" in r.stdout
+    assert "section 1 kind: prose says 0, rows give 1" in r.stdout
+
+
+def test_k4_unknown_kind_names_row_and_value(tmp_path):
+    text = _two().replace("| call |", "| calls |", 1)
+    r = _run2(tmp_path, text)
+    assert r.returncode == 1
+    assert "row 1: unknown kind 'calls'" in r.stdout
+
+
+def test_k5_kind_found_by_header_name_and_not_by_substring(tmp_path):
+    # Decoy: a whole-row substring count of `call` would see the word in the
+    # prose row's target and note. Columns are also reordered.
+    files = {"a.py": L(1, 2)}
+    head = (
+        "# l\n\n## Summary\n\n" + _summary_line(_tally(["direct", "direct"]))
+        + "\n## 1. P\n\n" + _unit_line(1) + _kind_line({"call": 1, "prose": 1})
+        + _target_line({"live store": 1, "parameter": 0, "other DB": 0,
+                        "n/a (prose)": 1, "unresolved": 0})
+        + _state_line(_tally(["direct", "direct"]))
+        + "\n## 2. The ledger\n\n| # | site | note | target | state | kind |\n|---|---|---|---|---|---|\n"
+    )
+    body = (
+        "| 1 | " + C("a.py", 1) + " | call call call | live store: call | direct | call |\n"
+        "| 2 | " + C("a.py", 2) + " | call it | n/a — call in a comment | direct | prose |\n"
+    )
+    r = _run(_make_repo(tmp_path, files, [], ledger_text=head + body + FOOTER))
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_k6_missing_or_unparseable_kind_line_fails_loudly(tmp_path):
+    r = _run2(tmp_path / "a", _two(kind_line=""))
+    assert r.returncode == 1
+    assert "could not parse section 1 tally: no `- **kind:**` line" in r.stdout
+    r = _run2(tmp_path / "b", _two(kind_line="- **kind:** call two\n"))
+    assert r.returncode == 1
+    assert "could not parse section 1 tally: `- **kind:**` line lacks call, prose" in r.stdout
+    r = _run2(tmp_path / "c", _two(kind_line="- **kind:** call 2 · prose 0\n" * 2))
+    assert r.returncode == 1
+    assert "more than one `- **kind:**` line" in r.stdout
+
+
+def test_g1_target_line_disagrees_names_category_and_numbers(tmp_path):
+    text = _two(targets=["live store", "parameter"],
+                target_line="- **target:** live store 2 · parameter 0 · other DB 0 · "
+                            "n/a (prose) 0 · unresolved 0\n")
+    r = _run2(tmp_path, text)
+    assert r.returncode == 1
+    assert "section 1 target: live store says 2, rows give 1" in r.stdout
+    assert "section 1 target: parameter says 0, rows give 1" in r.stdout
+
+
+def test_g2_every_category_prefix_form_classifies(tmp_path):
+    cells = {
+        "live store": ["live store", "live store — free", "live store: free"],
+        "parameter": ["parameter (`<db path>` placeholder)", "parameter — free"],
+        "other DB": ["other DB: free", "other DB"],
+        "n/a (prose)": ["n/a (site: module docstring)", "n/a — docstring", "n/a (prose)"],
+        "unresolved": ["unresolved — who knows"],
+    }
+    flat = [(cat, cell) for cat, cs in cells.items() for cell in cs]
+    n = len(flat)
+    c = _count([cat for cat, _ in flat], TARGETS)
+    text = _ledger([C("a.py", i + 1) for i in range(n)], target_line=_target_line(c))
+    for i, (_cat, cell) in enumerate(flat):
+        old = f"| {i + 1} | {C('a.py', i + 1)} | call | live store: free text |"
+        assert old in text
+        text = text.replace(old, f"| {i + 1} | {C('a.py', i + 1)} | call | {cell} |", 1)
+    r = _run(_make_repo(tmp_path, {"a.py": L(*range(1, n + 1))}, [], ledger_text=text))
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_g3_unknown_target_names_row_and_prefix(tmp_path):
+    text = _two().replace("live store: free text", "elsewhere: free text", 1)
+    r = _run2(tmp_path, text)
+    assert r.returncode == 1
+    assert "row 1: unknown target 'elsewhere'" in r.stdout
+
+
+def test_g3b_category_must_end_at_a_word_boundary(tmp_path):
+    text = _two().replace("live store: free text", "live stores: free text", 1)
+    r = _run2(tmp_path, text)
+    assert r.returncode == 1
+    assert "row 1: unknown target 'live stores'" in r.stdout
+
+
+def test_g4_missing_or_unparseable_target_line_fails_loudly(tmp_path):
+    r = _run2(tmp_path / "a", _two(target_line=""))
+    assert r.returncode == 1
+    assert "could not parse section 1 tally: no `- **target:**` line" in r.stdout
+    r = _run2(tmp_path / "b", _two(target_line="- **target:** live store 2 · parameter 0\n"))
+    assert r.returncode == 1
+    assert "`- **target:**` line lacks other DB, n/a (prose), unresolved" in r.stdout
+
+
+def test_u1_unit_line_call_count_must_equal_derived_call_rows(tmp_path):
+    r = _run2(tmp_path / "a", _two(unit_line=_unit_line(3, nlines=2)))
+    assert r.returncode == 1
+    assert "section 1 unit: call rows says 3, rows give 2" in r.stdout
+    r = _run2(tmp_path / "b", _two(unit_line=_unit_line(2, nlines=5)))
+    assert r.returncode == 1
+    assert "section 1 unit: lines says 5, rows give 2" in r.stdout
+
+
+def test_u2_connects_number_is_not_checked(tmp_path):
+    assert _run2(tmp_path, _two(unit_line=_unit_line(2, nconnects=999))).returncode == 0
+
+
+def test_u3_missing_or_unparseable_unit_line_fails_loudly(tmp_path):
+    r = _run2(tmp_path / "a", _two(unit_line=""))
+    assert r.returncode == 1
+    assert "could not parse section 1 tally: no `- **unit:**` line" in r.stdout
+    r = _run2(tmp_path / "b", _two(unit_line="- **unit:** one row per line.\n"))
+    assert r.returncode == 1
+    assert "`- **unit:**` line lacks 'the N `call` rows are N lines'" in r.stdout
+
+
+def test_u4_unit_counts_call_rows_not_all_rows(tmp_path):
+    text = _two(kinds=["call", "prose"], targets=["live store", "n/a (prose)"])
+    assert _run2(tmp_path, text).returncode == 0
+
+
+# ---- round 2: claimed-but-absent, every target category, failure paths ----
+
+
+def _target_line_with(**override):
+    base = {"live store": 2, "parameter": 0, "other DB": 0, "n/a (prose)": 0, "unresolved": 0}
+    base.update({k.replace("_", " "): v for k, v in override.items()})
+    return "- **target:** " + " · ".join(f"{k} {base[k]}" for k in TARGETS) + "\n"
+
+
+def test_r1_claimed_but_absent_category_is_reported(tmp_path):
+    # Section 1 claims a count for a category NO row has: the rows give 0.
+    # Catches an implementation that iterates only over the keys the rows hold.
+    r = _run2(tmp_path / "t", _two(target_line=_target_line_with(unresolved=3)))
+    assert r.returncode == 1
+    assert "section 1 target: unresolved says 3, rows give 0" in r.stdout
+    assert r.stdout.count("section 1 target:") == 1
+    r = _run2(tmp_path / "k", _two(kind_line="- **kind:** call 2 · prose 5\n"))
+    assert r.returncode == 1
+    assert "section 1 kind: prose says 5, rows give 0" in r.stdout
+    assert r.stdout.count("section 1 kind:") == 1
+
+
+def test_r2_each_target_category_is_compared_on_its_own(tmp_path):
+    # Rows give live store 1 plus one row of the category under test; Section 1
+    # drops that one category's count to 0 and nothing else. Catches an
+    # implementation that compares only a subset of the five categories.
+    for i, cat in enumerate(("parameter", "other DB", "n/a (prose)", "unresolved")):
+        kinds = ["call", "prose" if cat == "n/a (prose)" else "call"]
+        claimed = {k: 0 for k in TARGETS}
+        claimed["live store"] = 1
+        line = "- **target:** " + " · ".join(f"{k} {claimed[k]}" for k in TARGETS) + "\n"
+        r = _run2(tmp_path / str(i), _two(targets=["live store", cat], kinds=kinds,
+                                          target_line=line))
+        assert r.returncode == 1, cat
+        assert f"section 1 target: {cat} says 0, rows give 1" in r.stdout, cat
+        assert r.stdout.count("section 1 target:") == 1, cat
+
+
+def test_r3_missing_kind_or_target_column_fails_loudly(tmp_path):
+    good = _two()
+    r = _run2(tmp_path / "k", good.replace(" kind |", " type |", 1))
+    assert r.returncode == 1
+    assert "could not parse Section 2 kinds: no `kind` column in the table header" in r.stdout
+    assert "could not parse Section 2 targets" not in r.stdout
+    r = _run2(tmp_path / "t", good.replace(" target |", " dest |", 1))
+    assert r.returncode == 1
+    assert "could not parse Section 2 targets: no `target` column in the table header" in r.stdout
+    assert "could not parse Section 2 kinds" not in r.stdout
+
+
+def test_r4_repeated_target_or_unit_line_fails_loudly(tmp_path):
+    r = _run2(tmp_path / "t", _two(target_line=_target_line_with() * 2))
+    assert r.returncode == 1
+    assert "could not parse section 1 tally: more than one `- **target:**` line" in r.stdout
+    r = _run2(tmp_path / "u", _two(unit_line=_unit_line(2) * 2))
+    assert r.returncode == 1
+    assert "could not parse section 1 tally: more than one `- **unit:**` line" in r.stdout
 
 
 # ---- Section-2 citations are function + anchor, verified (contract A1-A11, #3704) ----

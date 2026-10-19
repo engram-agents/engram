@@ -31,9 +31,20 @@ HEADER NAME, and compares it with the two places Section 1 states it: the bold
 "State of the N live-store lines" sentence (which must also sum to N) and the
 `- **state:**` line. A state value outside the known set fails, naming the row.
 
-What this does NOT check: a row's other contents (the `target`, `access`,
-`kind`, `component` and `macOS` columns; the state column only for membership
-in the known set and for the tally). It does not check line numbers in prose
+It derives the `kind` (call, prose) and `target` (live store, parameter, other
+DB, n/a (prose), unresolved) tallies the same way, each column read BY HEADER
+NAME, and compares them with the `- **kind:**` and `- **target:**` lines. A
+target cell begins with its category and the rest is free text (`other DB: ...`,
+`parameter — ...`, `n/a (site: ...)`); the category is the leading text, ended
+by a non-alphanumeric character or the end of the cell, and `n/a` is the
+`n/a (prose)` category. The `- **unit:**` line's "the N `call` rows are N lines"
+must equal the derived `call` count, both numbers.
+
+What this does NOT check: the "C connects" number on the unit line (it is not
+derivable from the rows: it counts connects, and rows count lines); the free
+text after a target's category; the `access`, `component`, `A6 delta` and
+`macOS` columns; and the state, kind and target columns only for membership in
+their known sets and for the tallies. It does not check line numbers in prose
 outside the Section-2 first cell. A citation of an outer function also passes
 when the anchor sits in a def nested inside it (an `outer()` citation covers its
 closures); no current row relies on this. Line numbers follow `ast`: only
@@ -45,11 +56,15 @@ Exit 0 when consistent. Exit 1 with one `file: ledger N rows, tree M lines`
 line per differing file and a remedy line; also exit 1 ("could not parse") when
 Section 2 yields no rows, so zero parsed rows can never read as consistent;
 exit 1 with `section 1 <line>: <state> says N, rows give M` per disagreeing
-tally, `row N: unknown state '<value>'` per unknown state, "could not parse
-Section 2 states" when no row carries a recognised live-store state, and
-"could not parse section 1 tally" when either tally line is missing or lacks a
-number; exit 1 with one `row N: ...` line per bad citation; and
-exit 1 ("could not read <path>: <error>", one per file) when a tracked file
+tally (`section 1 kind: ...`, `section 1 target: ...`, and for the unit line
+`section 1 unit: call rows says N, rows give M` or `section 1 unit: lines says
+N, ...`), `row N: unknown state '<value>'` per unknown state (likewise
+`row N: unknown kind '<value>'` and `row N: unknown target '<category text>'`),
+"could not parse Section 2 states" when no row carries a recognised live-store
+state, "could not parse Section 2 kinds/targets" when that header column is
+absent, and "could not parse section 1 tally" naming the line when the state,
+summary, kind, target or unit line is missing, repeated, or lacks a number; exit 1
+with one `row N: ...` line per bad citation; and exit 1 ("could not read <path>: <error>", one per file) when a tracked file
 cannot be read, so an unread file can never read as consistent. Outside a
 checkout it exits 1 with the single line "not a git checkout: <root>".
 
@@ -81,12 +96,29 @@ SUMMARY_LINE = re.compile(r"State of the\s+(\d+)\s+live-store lines")
 BOLD_STATE = re.compile(r"\*\*(owner|direct|behind-flag|flag-on|retired)\s+(\d+)\*\*")
 PLAIN_STATE = re.compile(r"(owner|direct|behind-flag|flag-on|retired|out of scope)\s+(\d+)")
 OTHER_OOS = re.compile(r"The other\s+(\d+)\s+lines are out of scope")
+KINDS = ("call", "prose")
+TARGETS = ("live store", "parameter", "other DB", "n/a (prose)", "unresolved")
+# A target cell begins with its category; the rest is free text. The category
+# is matched as a whole leading word run (`live store`, `n/a`), so `live stores`
+# or `elsewhere` fail loudly. The Section-1 line names `n/a` as `n/a (prose)`.
+TARGET_PREFIX = {
+    "live store": "live store",
+    "parameter": "parameter",
+    "other DB": "other DB",
+    "n/a": "n/a (prose)",
+    "unresolved": "unresolved",
+}
+KIND_LINE = re.compile(r"^\s*-\s+\*\*kind:\*\*(.*)$")
+TARGET_LINE = re.compile(r"^\s*-\s+\*\*target:\*\*(.*)$")
+UNIT_LINE = re.compile(r"^\s*-\s+\*\*unit:\*\*(.*)$")
+UNIT_CALLS = re.compile(r"the\s+(\d+)\s+`call`\s+rows\s+are\s+(\d+)\s+lines")
 SECTION2 = re.compile(r"^##\s+2\.")
 ANY_SECTION = re.compile(r"^##\s")
 
 TALLY_REMEDY = (
     "make the Section-1 tally lines in docs/2652-migration-ledger.md equal "
-    "the counts of the Section-2 `state` column (or fix the row's state)"
+    "the counts of the Section-2 `state`, `kind` and `target` columns "
+    "(or fix the row)"
 )
 REMEDY = (
     "add/remove a Section-2 row in docs/2652-migration-ledger.md "
@@ -156,11 +188,14 @@ def ledger_counts(text):
     return counts
 
 
-def row_states(text):
-    """(states, problems): `states` is a list of (row number, state value) for
-    every Section-2 row, located by the `state` header cell. `problems` holds
-    the loud-failure lines."""
+def row_column(text, column, plural, report_width=True):
+    """(values, problems): `values` is a list of (row number, cell) for every
+    Section-2 row, located by the `column` header cell (by name, never by
+    index). `problems` holds the loud-failure lines. A row whose width differs
+    from the header is reported only when `report_width`, so the one width
+    problem is not repeated once per column."""
     states, problems = [], []
+    missing = f"could not parse Section 2 {plural}: no `{column}` column in the table header"
     in_section = False
     idx = ncols = None
     for line in _lines(text):
@@ -173,22 +208,28 @@ def row_states(text):
             continue
         if idx is None and line.lstrip().startswith("|"):
             cells = [c.lower() for c in _cells(line)]
-            if "state" in cells:
-                idx, ncols = cells.index("state"), len(cells)
+            if column in cells:
+                idx, ncols = cells.index(column), len(cells)
             continue
         if ROW.match(line):
             cells = _cells(line)
             num = cells[0]
             if idx is None:
-                problems.append("could not parse Section 2 states: no `state` column in the table header")
+                problems.append(missing)
                 return [], problems
             if len(cells) != ncols:
-                problems.append(f"row {num}: has {len(cells)} cells, header has {ncols}")
+                if report_width:
+                    problems.append(f"row {num}: has {len(cells)} cells, header has {ncols}")
                 continue
             states.append((num, cells[idx]))
     if idx is None:
-        problems.append("could not parse Section 2 states: no `state` column in the table header")
+        problems.append(missing)
     return states, problems
+
+
+def row_states(text):
+    """(states, problems): (row number, state value) for every Section-2 row."""
+    return row_column(text, "state", "states")
 
 
 def derived_tally(states):
@@ -207,6 +248,92 @@ def derived_tally(states):
             "live-store state (" + ", ".join(LIVE_STATES) + ")",
         )
     return tally, problems
+
+
+def target_category(cell):
+    """The Section-1 category a target cell begins with, or None."""
+    for prefix, category in TARGET_PREFIX.items():
+        if re.match(re.escape(prefix) + r"(?![A-Za-z0-9])", cell):
+            return category
+    return None
+
+
+def _target_label(cell):
+    """The leading text of an unrecognised cell, up to the first `:`, em dash
+    or `(`, for the failure message."""
+    return re.split(r"\s*(?::|—|\()", cell, maxsplit=1)[0].strip() or cell[:30]
+
+
+def derived_kind_target(text):
+    """(kinds, targets, problems): Counters keyed by Section-1 value, derived
+    from the `kind` and `target` columns read by header name."""
+    kinds, targets, problems = Counter(), Counter(), []
+    kind_cells, kp = row_column(text, "kind", "kinds", report_width=False)
+    target_cells, tp = row_column(text, "target", "targets", report_width=False)
+    problems += kp + tp
+    for num, value in kind_cells:
+        if value in KINDS:
+            kinds[value] += 1
+        else:
+            problems.append(f"row {num}: unknown kind '{value}'")
+    for num, cell in target_cells:
+        category = target_category(cell)
+        if category is None:
+            problems.append(f"row {num}: unknown target '{_target_label(cell)}'")
+        else:
+            targets[category] += 1
+    return kinds, targets, problems
+
+
+def _keyed_line(before, pattern, label, keys):
+    """Parse one `- **<label>:**` line of `<key> N` pairs into ({key: n}, problem)."""
+    lines = [m.group(1) for m in map(pattern.match, before) if m]
+    tag = f"`- **{label}:**`"
+    if len(lines) != 1:
+        return None, (
+            f"could not parse section 1 tally: no {tag} line"
+            if not lines
+            else f"could not parse section 1 tally: more than one {tag} line"
+        )
+    pairs = re.findall("(" + "|".join(re.escape(k) for k in keys) + r")\s+(\d+)", lines[0])
+    vals = {k: int(n) for k, n in pairs}
+    missing = [k for k in keys if k not in vals]
+    if missing:
+        return None, f"could not parse section 1 tally: {tag} line lacks " + ", ".join(missing)
+    return vals, None
+
+
+def section1_kind_target_unit(text):
+    """Return ({line name: {key: n}}, problems) for the kind, target and unit
+    lines of Section 1."""
+    found, problems = {}, []
+    before = _lines(text.split("\n## 2.", 1)[0])
+    for name, pattern, keys in (
+        ("kind", KIND_LINE, KINDS),
+        ("target", TARGET_LINE, TARGETS),
+    ):
+        vals, problem = _keyed_line(before, pattern, name, keys)
+        if problem:
+            problems.append(problem)
+        else:
+            found[name] = vals
+    unit = [m.group(1) for m in map(UNIT_LINE.match, before) if m]
+    if len(unit) != 1:
+        problems.append(
+            "could not parse section 1 tally: no `- **unit:**` line"
+            if not unit
+            else "could not parse section 1 tally: more than one `- **unit:**` line"
+        )
+    else:
+        m = UNIT_CALLS.search(unit[0])
+        if not m:
+            problems.append(
+                "could not parse section 1 tally: `- **unit:**` line lacks "
+                "'the N `call` rows are N lines'"
+            )
+        else:
+            found["unit"] = {"call rows": int(m.group(1)), "lines": int(m.group(2))}
+    return found, problems
 
 
 def section1_tallies(text):
@@ -274,6 +401,23 @@ def tally_problems(text):
             if vals["total"] != live:
                 problems.append(
                     f"section 1 {name}: total says {vals['total']}, rows give {live}"
+                )
+    kinds, targets, kt_problems = derived_kind_target(text)
+    problems += kt_problems
+    found, kt_sec = section1_kind_target_unit(text)
+    problems += kt_sec
+    derived = {"kind": (kinds, KINDS), "target": (targets, TARGETS)}
+    for name, (counter, keys) in derived.items():
+        for key in keys:
+            if name in found and found[name][key] != counter[key]:
+                problems.append(
+                    f"section 1 {name}: {key} says {found[name][key]}, rows give {counter[key]}"
+                )
+    if "unit" in found:
+        for key in ("call rows", "lines"):
+            if found["unit"][key] != kinds["call"]:
+                problems.append(
+                    f"section 1 unit: {key} says {found['unit'][key]}, rows give {kinds['call']}"
                 )
     return problems
 
