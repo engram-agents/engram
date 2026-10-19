@@ -1,19 +1,27 @@
-"""The one-time sweep scope guards are retired once the sweep is on dev [part of #3863].
+"""The one-time sweep scope guards are retired permanently [part of #3863].
 
 tests/test_prose_home_sweep_3863.py pinned the file list of the home-path prose sweep so
-that two sibling PRs could not touch the same files. Once the sweep and those PRs are on
-dev, the same three tests would fire against ANY later PR that edits one of the swept
-files, so their conflict-prevention job is over. They stay in the file, skipped.
+that two sibling PRs could not touch the same files while the sweep was in flight. The
+sweep merged as caebaf3c, which ended that job. The guards compare a FROZEN fact (the
+sweep commit's own diff) with the test file's MUTABLE constants (FILES and the PR 3a/3b
+sets), so any later PR that deletes or renames a swept file would turn them red, in the
+full suite only. They therefore stay in the file under their names, skipped
+unconditionally, and are to be deleted when the #3863 epic closes.
 
 CONTRACT (each clause is a test below; written before the change):
-  R1  Where origin/dev already carries the sweep test, `_our_diff_files()` skips.
+  R1  `_our_diff_files()` is the one retirement point and always skips, with the module's
+      RETIRED_REASON ("sweep merged as ..."). The reason is identical with and without an
+      origin/dev ref, with and without branch edits to swept files, in a repo that holds
+      a sweep commit and in a repo that holds none: the skip depends on nothing the
+      repo holds.
   R2  A branch that edits a swept file and a file owned by a sibling PR sees the three
       guard tests SKIPPED, not failed.
-  R4  Where origin/dev does NOT carry the sweep test (the pre-sweep world), the same
-      branch still makes the diff-reading guards FAIL, so the retirement is not an
-      unconditional skip.
+  R4  The four retired tests (the three scope guards plus the c5 diff-from-dev test) keep
+      their names and, run through an inner pytest in the scratch repo, are all SKIPPED
+      with a reason naming "sweep merged as", exit code 0, no FAILED.
   R3  The three guard tests keep their names and each still calls `_our_diff_files()`,
       so a rename or a deletion is a deliberate act and the skip reaches all three.
+  R5  The inner pytest output is plain whatever colour variables the caller exports.
 """
 
 from __future__ import annotations
@@ -36,6 +44,10 @@ GUARDS = (
     "test_disjoint_from_pr_3a_none_of_its_files_is_in_this_diff",
     "test_disjoint_from_pr_3b_none_of_its_files_is_in_this_diff",
 )
+# The c5 diff-from-dev test is retired by its own pytest.skip(RETIRED_REASON), not by
+# _our_diff_files(); only R4 runs it, so GUARDS (used by R2, R3, R5) is unchanged.
+C5_DIFF = "test_c5_baseline_diff_from_dev_is_exactly_our_23"
+RETIRED = GUARDS + (C5_DIFF,)
 # Files the copied sweep test loads at import time.
 COPIED = (
     SWEEP_TEST,
@@ -76,10 +88,14 @@ def _inner_pytest(repo, ids, *flags):
     )
 
 
-def _scratch_repo(tmp_path, dev_has_sweep=True):
-    """A repo whose origin/dev carries the sweep test (unless dev_has_sweep is False,
-    then the branch adds it), with a branch that edits one swept file and one file
-    owned by a sibling PR."""
+def _scratch_repo(tmp_path, with_sweep=False, dev_ref=True):
+    """A scratch repo with a base commit, an optional sweep commit, and a branch that
+    edits one swept file and one file owned by a sibling PR.
+
+    with_sweep=False: no sweep commit exists (the real SWEEP sha is absent), the shape
+    of a checkout that never fetched it. with_sweep=True: a commit that edits both files
+    is made, and the copied test's BASE and SWEEP are rewritten to this repo's own shas
+    (the COPY only, never the real file). dev_ref adds an origin/dev ref at the base."""
     repo = tmp_path / "scratch"
     for rel in COPIED:
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -94,23 +110,53 @@ def _scratch_repo(tmp_path, dev_has_sweep=True):
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
         (repo / rel).write_text("one\n")
     _run(repo, "add", "-A")
-    if not dev_has_sweep:
-        _run(repo, "rm", "-q", "--cached", SWEEP_TEST)
-    _run(repo, "commit", "-q", "-m", "dev")
-    _run(repo, "update-ref", "refs/remotes/origin/dev", "HEAD")
+    _run(repo, "commit", "-q", "-m", "base")
+    base = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    if dev_ref:
+        _run(repo, "update-ref", "refs/remotes/origin/dev", "HEAD")
+    if with_sweep:
+        for rel in (swept, sibling):
+            (repo / rel).write_text("one\ntwo\n")
+        _run(repo, "add", "-A")
+        _run(repo, "commit", "-q", "-m", "sweep edits a swept file and a sibling's file")
+        sweep = _run(repo, "rev-parse", "HEAD").stdout.strip()
+        copy = repo / SWEEP_TEST
+        text = copy.read_text()
+        text, n1 = re.subn(r'(?m)^BASE = "[0-9a-f]{40}"$', f'BASE = "{base}"', text)
+        text, n2 = re.subn(r'(?m)^SWEEP = "[0-9a-f]{40}"$', f'SWEEP = "{sweep}"', text)
+        assert (n1, n2) == (1, 1), "BASE/SWEEP constants not rewritable by line match"
+        copy.write_text(text)
+        _run(repo, "add", "-A")
+        _run(repo, "commit", "-q", "-m", "point the copied test at this repo's shas")
     _run(repo, "checkout", "-q", "-b", "later-pr")
     for rel in (swept, sibling):
-        (repo / rel).write_text("one\ntwo\n")
+        (repo / rel).write_text("one\ntwo\nthree\n")
     _run(repo, "add", "-A")
     _run(repo, "commit", "-q", "-m", "later pr edits swept files")
     return repo
 
 
 def test_r1_diff_files_skips_when_dev_already_carries_the_sweep(tmp_path):
-    repo = _scratch_repo(tmp_path)
-    mod = _load(repo / SWEEP_TEST)
-    with pytest.raises(pytest.skip.Exception, match="already in dev"):
-        mod._our_diff_files()
+    reasons = set()
+    n = 0
+    for with_sweep in (False, True):
+        for dev_ref in (True, False):
+            n += 1
+            repo = _scratch_repo(tmp_path / f"c{n}", with_sweep=with_sweep, dev_ref=dev_ref)
+            mod = _load(repo / SWEEP_TEST)
+            with pytest.raises(pytest.skip.Exception) as e:
+                mod._our_diff_files()  # with branch edits to swept files
+            reasons.add(str(e.value))
+            # Without branch edits to swept files: same answer.
+            _run(repo, "checkout", "-q", "main")
+            with pytest.raises(pytest.skip.Exception) as e:
+                mod._our_diff_files()
+            reasons.add(str(e.value))
+    # The with_sweep copies carry a rewritten SWEEP, so only the sha differs.
+    assert {re.sub(r"[0-9a-f]{8}", "<sha>", r) for r in reasons} == {
+        "sweep merged as <sha>; concurrent-edit guard no longer applies"
+    }, reasons
+    assert all("sweep merged as" in r for r in reasons), reasons
 
 
 def test_r2_a_later_branch_sees_the_three_guards_skipped_not_failed(tmp_path):
@@ -123,16 +169,22 @@ def test_r2_a_later_branch_sees_the_three_guards_skipped_not_failed(tmp_path):
     assert r.returncode == 0, r.stdout[-1500:]
 
 
-def test_r4_where_dev_lacks_the_sweep_test_the_diff_guards_still_fire(tmp_path):
-    repo = _scratch_repo(tmp_path, dev_has_sweep=False)
-    ids = [f"{SWEEP_TEST}::{n}" for n in GUARDS]
-    r = _inner_pytest(repo, ids, "-rfs")
-    out = r.stdout
-    # The scope test and the PR 3a disjointness test read the diff: both must fail.
-    assert f"FAILED {SWEEP_TEST}::{GUARDS[0]}" in out, out[-1500:]
-    assert f"FAILED {SWEEP_TEST}::{GUARDS[1]}" in out, out[-1500:]
-    assert "SKIPPED" not in out, out[-1500:]
-    assert r.returncode != 0, out[-1500:]
+def test_r4_the_retired_guards_keep_their_names_and_say_why_they_skip(tmp_path):
+    for with_sweep in (False, True):
+        repo = _scratch_repo(tmp_path / str(with_sweep), with_sweep=with_sweep)
+        ids = [f"{SWEEP_TEST}::{n}" for n in RETIRED]
+        r = _inner_pytest(repo, ids, "-rs")
+        out = r.stdout
+        assert re.search(r"\b4 skipped\b", out[-600:]), out[-1500:]
+        assert "passed" not in out[-600:], out[-1500:]
+        # Every SKIPPED line (-rs groups equal reasons) must carry the reason, and they
+        # must cover all four tests: one test with another reason cannot hide behind the rest.
+        lines = re.findall(r"(?m)^SKIPPED \[(\d+)\] .*$", out)
+        skipped = re.findall(r"(?m)^SKIPPED \[\d+\] .*$", out)
+        assert sum(map(int, lines)) == len(RETIRED), out[-1500:]
+        assert all("sweep merged as" in ln for ln in skipped), out[-1500:]
+        assert "FAILED" not in out and "failed" not in out[-600:], out[-1500:]
+        assert r.returncode == 0, out[-1500:]
 
 
 def test_r5_the_inner_pytest_output_is_plain_whatever_colour_the_caller_forces(tmp_path, monkeypatch):

@@ -30,9 +30,24 @@ CONTRACT (each clause is a test below; the tests were written before the sweep):
 
 The spelling table is IMPORTED from tools/home_path_gate.py, so this test and the
 gate cannot drift. The base-commit comparisons (C4, C5 list, C6) are snapshot
-checks pinned to the commit this sweep was cut from. They skip when git history
-is unavailable, and they retire themselves for a file once another commit has
-touched that file since the base (a later honest edit must not turn them red).
+checks pinned to the commit this sweep was cut from. They retire by CONTENT, never by
+history shape (#3925): they run only when BASE and the sweep commit are both available
+and the file under check still equals the file at the sweep commit; anything else is a
+skip. A commit count or an ancestry test reads wrong on a partial-history checkout,
+where BASE is present but the later commits are not.
+
+RETIRED PERMANENTLY (#3925, round 3): four tests are skipped unconditionally with
+RETIRED_REASON: the three scope guards (test_scope_only_the_23_..., test_disjoint_from_pr_3a_...,
+test_disjoint_from_pr_3b_...) and test_c5_baseline_diff_from_dev_is_exactly_our_23. They
+asserted a FROZEN fact (the sweep commit's own diff) against this file's MUTABLE constants
+(FILES, COVERED_BY_PR_3A, COVERED_BY_PR_3B), so any later PR that deleted or renamed a
+swept file would have turned them red, in the full suite only. Their job, stopping two PRs
+from editing the same files while the sweep was in flight, ended when the sweep merged as
+caebaf3c. They keep their names so test-id accounting stays clean. Delete all four, and
+RETIRED_REASON with them, when the #3863 epic closes.
+
+Every git command below whose failure can mean "the evidence is missing" (a commit or a
+blob absent from a partial or blobless checkout) skips; none parses or asserts on it.
 """
 
 from __future__ import annotations
@@ -52,6 +67,12 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 SRC = "src/engram/"
 BASE = "0d5bbeba0b2fde99a6db4e3dbf1a1fb1fb8edf3f"
+# The sweep commit (PR #3888), a descendant of BASE. A snapshot check runs only on
+# content that is still the sweep's own; see retire_reason().
+SWEEP = "caebaf3c6f237b9e727f648f41988969268efdab"
+# Why the four frozen-fact tests are skipped, unconditionally (see the module docstring).
+RETIRED_REASON = f"sweep merged as {SWEEP[:8]}; concurrent-edit guard no longer applies"
+BASELINE_REL = "tools/home_path_baseline.json"
 
 
 def _load(name, path):
@@ -139,26 +160,68 @@ def _text(rel):
     return (REPO / SRC / rel).read_text(encoding="utf-8")
 
 
-def _git(*args):
-    return subprocess.run(["git", *args], cwd=str(REPO), capture_output=True, text=True)
+def _git(*args, repo=None):
+    return subprocess.run(
+        ["git", *args], cwd=str(repo if repo is not None else REPO), capture_output=True, text=True
+    )
 
 
-def _base_text(rel):
-    r = _git("show", f"{BASE}:{SRC}{rel}")
+def _has_commit(repo, sha):
+    return _git("cat-file", "-e", f"{sha}^{{commit}}", repo=repo).returncode == 0
+
+
+def retire_reason(paths, repo=REPO, base=BASE, sweep=SWEEP):
+    """Why a snapshot check must retire (skip), or None when it must run.
+
+    It runs only if BASE and the sweep commit are both available in `repo` and every
+    path in `paths` (repo-relative) has, in the working tree, the same bytes as at the
+    sweep commit. It reads contents only: no commit count, no ancestry, no ref name.
+
+    It compares raw bytes and assumes LF checkouts: on a CRLF checkout (core.autocrlf)
+    every snapshot check retires, which is a safe skip and never a false failure.
+    """
+    if not _has_commit(repo, base):
+        return f"base commit {base[:8]} not available"
+    if not _has_commit(repo, sweep):
+        return f"sweep commit {sweep[:8]} not available (partial history)"
+    for p in paths:
+        at_sweep = subprocess.run(
+            ["git", "show", f"{sweep}:{p}"], cwd=str(repo), capture_output=True
+        )
+        f = Path(repo) / p
+        if at_sweep.returncode != 0 or not f.is_file() or f.read_bytes() != at_sweep.stdout:
+            return f"{p} differs from the sweep commit; snapshot check retired"
+        # The sweep is a squash several commits above BASE, so the snapshot "BASE plus the
+        # sweep's lines" holds only for a file no other commit edited between them: BASE's
+        # file must equal the file just before the sweep commit.
+        at_base = subprocess.run(["git", "show", f"{base}:{p}"], cwd=str(repo), capture_output=True)
+        before = subprocess.run(["git", "show", f"{sweep}^:{p}"], cwd=str(repo), capture_output=True)
+        if at_base.returncode != 0 or before.returncode != 0 or at_base.stdout != before.stdout:
+            return f"{p} was edited between the base and the sweep commit (or its parent is unavailable); snapshot check retired"
+    return None
+
+
+def _base_text(rel, repo=REPO, base=BASE):
+    r = _git("show", f"{base}:{SRC}{rel}", repo=repo)
     if r.returncode != 0:
-        pytest.skip(f"base commit {BASE[:8]} not available ({r.stderr.strip()[:80]})")
+        pytest.skip(f"base commit {base[:8]} or its file not available ({r.stderr.strip()[:80]})")
     return r.stdout
 
 
-def _fresh_snapshot(rel):
-    """Skip unless this file has at most the sweep commit on top of the base."""
-    if _git("rev-parse", "--verify", "--quiet", f"{BASE}^{{commit}}").returncode != 0:
-        pytest.skip("base commit not available")
-    r = _git("rev-list", "--count", f"{BASE}..HEAD", "--", f"{SRC}{rel}")
+def _base_baseline(repo=REPO, base=BASE):
+    """The baseline entries at the base commit; skips when that blob is not available
+    (the commit can be present while its blob is not, in a blobless clone)."""
+    r = _git("show", f"{base}:{BASELINE_REL}", repo=repo)
     if r.returncode != 0:
-        pytest.skip("git history unavailable")
-    if int(r.stdout.strip()) > 1:
-        pytest.skip("file changed again since the sweep; snapshot check retired")
+        pytest.skip(f"baseline at base commit {base[:8]} not available ({r.stderr.strip()[:80]})")
+    return set(json.loads(r.stdout)["baseline"])
+
+
+def _fresh_snapshot(rel, repo=REPO, base=BASE, sweep=SWEEP):
+    """Skip unless this file is still the sweep's own (retire_reason is None)."""
+    reason = retire_reason([f"{SRC}{rel}"], repo=repo, base=base, sweep=sweep)
+    if reason:
+        pytest.skip(reason)
 
 
 def has_spelling(line):
@@ -665,11 +728,10 @@ def test_codex_blocks_parse(name):
 # --- C4: nothing else changes ---------------------------------------------------
 
 
-@pytest.mark.parametrize("rel", FILES)
-def test_c4_only_the_required_lines_changed(rel):
-    _fresh_snapshot(rel)
-    base_lines = _base_text(rel).splitlines()
-    head_lines = _text(rel).splitlines()
+def assert_c4(rel, base_text, head_text):
+    """The C4 assertion body: texts in, AssertionError out."""
+    base_lines = base_text.splitlines()
+    head_lines = head_text.splitlines()
     assert len(head_lines) == len(base_lines), (
         f"{rel}: line count {len(base_lines)} -> {len(head_lines)}; the sweep adds a "
         "mention to a line, it never adds or removes one"
@@ -690,6 +752,12 @@ def test_c4_only_the_required_lines_changed(rel):
             f"{rel} L{i + 1}: a swept line lost or changed a word beyond the home spelling.\n"
             f"  base: {base_lines[i][:140]}\n  head: {h[:140]}"
         )
+
+
+@pytest.mark.parametrize("rel", FILES)
+def test_c4_only_the_required_lines_changed(rel):
+    _fresh_snapshot(rel)
+    assert_c4(rel, _base_text(rel), _text(rel))
 
 
 def words_preserved(base_line, head_line):
@@ -726,38 +794,11 @@ def test_twin_changed_exactly_one_line_and_it_is_the_component_line():
     assert words_preserved(base_lines[i], head_lines[i])
 
 
-# The tools-prose PR (#3883, "PR 3a") squash-merged into dev as this commit.
-PR_3A_COMMIT = "41cedc3f231740a79f41633fb368b5e16e93bb0a"
-
-
-def _3a_is_ancestor():
-    """True when PR 3a is already in this tree's history (an absent commit cannot be)."""
-    return _git("merge-base", "--is-ancestor", PR_3A_COMMIT, "HEAD").returncode == 0
-
-
-def _our_diff_files():
-    """Files this branch changes relative to where it forked from dev (working tree
-    included). Holds before AND after dev absorbed PR 3a: it is measured from the
-    merge-base with origin/dev, so what dev already carries is not ours. Without an
-    origin/dev ref it falls back to the sweep's base commit, but only while PR 3a is
-    not yet in the history (otherwise 3a's files would read as ours)."""
-    if _git("cat-file", "-e", "origin/dev:tests/test_prose_home_sweep_3863.py").returncode == 0:
-        # Dev already carries the sweep and this test: the scope guards are retired. A later
-        # PR (6c, and the venv ruling's fixes to the loop skill) legitimately edits these files.
-        pytest.skip("the sweep is already in dev; its scope guards are retired")
-    mb = _git("merge-base", "HEAD", "origin/dev")
-    if mb.returncode == 0:
-        ref = mb.stdout.strip()
-    elif _git("rev-parse", "--verify", "--quiet", f"{BASE}^{{commit}}").returncode == 0 and not _3a_is_ancestor():
-        ref = BASE
-    else:
-        pytest.skip("no origin/dev ref to measure this branch's own diff from")
-    r = _git("diff", "--name-only", ref)
-    assert r.returncode == 0, r.stderr
-    files = set(r.stdout.split())
-    if not any(SRC + f in files for f in FILES):
-        pytest.skip("this branch no longer carries the sweep (already in dev); nothing to guard")
-    return files
+def _our_diff_files(repo=REPO, sweep=SWEEP):
+    """The ONE retirement point of the scope guards: it skips, unconditionally. No git
+    call, no ref, no ancestry, no content check, whatever the repo holds. The arguments
+    stay so the callers and the planted tests keep their shape."""
+    pytest.skip(RETIRED_REASON)
 
 
 def test_scope_only_the_23_the_twin_the_baseline_and_this_test_changed():
@@ -790,52 +831,37 @@ def test_the_sweep_holds_no_python_file():
     assert [f for f in FILES if f.endswith(".py")] == []
 
 
-def _sweep_commit_is_alone_on_the_base():
-    if _git("rev-parse", "--verify", "--quiet", f"{BASE}^{{commit}}").returncode != 0:
-        pytest.skip("base commit not available")
-    n = _git("rev-list", "--count", f"{BASE}..HEAD")
-    if n.returncode != 0 or int(n.stdout.strip()) > 1:
-        pytest.skip("more than the sweep commit sits on the base; exact-count snapshot retired")
-    if _3a_is_ancestor():
-        pytest.skip("PR 3a is in the history; the exact count no longer applies")
+def _baseline_at_head(repo=REPO):
+    return set(json.loads((Path(repo) / "tools" / "home_path_baseline.json").read_text())["baseline"])
+
+
+def _exact_count_gate(repo=REPO, base=BASE, sweep=SWEEP):
+    """Skip unless the exact-count snapshot applies: the baseline at HEAD is still the
+    sweep's own AND PR 3a's baseline shrink is not in it (the entries 3a removes are
+    still present: that is what "before PR 3a lands" means, read from content)."""
+    reason = retire_reason([BASELINE_REL], repo=repo, base=base, sweep=sweep)
+    if reason:
+        pytest.skip(reason)
+    if not {SRC + f for f in COVERED_BY_PR_3A} <= _baseline_at_head(repo):
+        pytest.skip("PR 3a's baseline shrink is in this baseline; the exact count no longer applies")
+
+
+def assert_c5_exact(head_baseline, base_baseline, n_expected=47 - 23):
+    """The exact-count assertion body: sets in, AssertionError out."""
+    assert head_baseline == base_baseline - {SRC + f for f in FILES}
+    assert len(head_baseline) == n_expected
 
 
 def test_c5_baseline_is_exactly_the_base_minus_the_23_before_pr_3a_lands():
-    _sweep_commit_is_alone_on_the_base()
-    r = _git("show", f"{BASE}:tools/home_path_baseline.json")
-    base = set(json.loads(r.stdout)["baseline"])
-    assert _baseline_at_head() == base - {SRC + f for f in FILES}
-    assert len(_baseline_at_head()) == 47 - 23 == 24
+    _exact_count_gate()
+    assert_c5_exact(_baseline_at_head(), _base_baseline())
 
 
 def test_c5_baseline_diff_from_dev_is_exactly_our_23():
-    """Holds in every world: what we take out of the baseline, measured from where we
-    forked from dev, is exactly those of our 23 that dev still baselines, and none of
-    the files PR 3a or PR 3b sweeps."""
-    mb = _git("merge-base", "HEAD", "origin/dev")
-    if mb.returncode != 0:
-        pytest.skip("no origin/dev ref")
-    r = _git("show", f"{mb.stdout.strip()}:tools/home_path_baseline.json")
-    assert r.returncode == 0, r.stderr
-    then = set(json.loads(r.stdout)["baseline"])
-    ours = {SRC + f for f in FILES}
-    if not ours & then:
-        pytest.skip("dev already carries the sweep; nothing to compare")
-    covered = {SRC + f for f in COVERED_BY_PR_3A | COVERED_BY_PR_3B}
-    now = _baseline_at_head()
-    assert not now - then, f"entries ADDED to the baseline: {sorted(now - then)}"
-    removed = then - now
-    assert removed == ours & then, (
-        f"removed but not ours: {sorted(removed - ours)}; ours but kept: {sorted((ours & then) - removed)}"
-    )
-    assert not removed & covered
+    pytest.skip(RETIRED_REASON)  # retired permanently; see the module docstring
 
 
 # --- C5: baseline and list ------------------------------------------------------
-
-
-def _baseline_at_head():
-    return set(json.loads((REPO / "tools" / "home_path_baseline.json").read_text())["baseline"])
 
 
 def test_c5_none_of_the_23_is_baselined_any_more():
@@ -844,10 +870,7 @@ def test_c5_none_of_the_23_is_baselined_any_more():
 
 
 def test_c5_the_23_are_the_base_baseline_minus_the_later_prs():
-    r = _git("show", f"{BASE}:tools/home_path_baseline.json")
-    if r.returncode != 0:
-        pytest.skip("base commit not available")
-    base = {p[len(SRC):] for p in json.loads(r.stdout)["baseline"]}
+    base = {p[len(SRC):] for p in _base_baseline()}
     assert len(FILES) == len(set(FILES)) == 23
     assert LEFT_TO_LATER_PRS <= base and COVERED_BY_PR_3A <= base and COVERED_BY_PR_3B <= base
     assert base - LEFT_TO_LATER_PRS - COVERED_BY_PR_3A - COVERED_BY_PR_3B == set(FILES)
@@ -1017,3 +1040,278 @@ class TestPlanted:
         assert _skeleton(a) == _skeleton(b)
         assert _skeleton(a) != _skeleton(c)
         assert _skeleton(a) != _skeleton(d)
+
+
+# --- planted controls: the snapshot guards retire by CONTENT (#3925) --------------
+#
+# The guards used to retire on a commit COUNT (`rev-list --count BASE..HEAD`). On a
+# partial-history checkout BASE is present but the later commits are not, the count
+# reads <= 1, the guard does not retire, and it fails on files legitimately edited
+# later. These tests build real temp git repos and pin the content-keyed rule.
+
+_P_REL = "skills/claude/engram-x/SKILL.md"
+_P_BASE_TEXT = "cat ~/.engram/x\nkeep this line\n"
+_P_SWEEP_TEXT = "cat ~/.engram/x ($ENGRAM_HOME, default ~/.engram)\nkeep this line\n"
+_P_LATER_TEXT = _P_SWEEP_TEXT + "an honest later edit\n"
+_P_NOSHA = "f" * 40  # a sha that is in no repo: a SWEEP the checkout never fetched
+_BL = "tools/home_path_baseline.json"
+
+
+def _pg(repo, *args):
+    return subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+         "-c", "commit.gpgsign=false", *args],
+        capture_output=True, text=True, check=True,
+    )
+
+
+def _p_commit(repo, files, msg="c"):
+    for rel, text in files.items():
+        p = Path(repo) / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+    _pg(repo, "add", "-A")
+    _pg(repo, "commit", "-q", "--allow-empty", "-m", msg)
+    return _pg(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def _p_repo(tmp_path, name="r"):
+    repo = tmp_path / name
+    repo.mkdir()
+    _pg(repo, "init", "-q")
+    return repo
+
+
+def _p_full(tmp_path, name="r", head_text=None, between=0, sweep_text=_P_SWEEP_TEXT):
+    """base -> sweep -> (between unrelated commits) -> optional later edit of the file."""
+    repo = _p_repo(tmp_path, name)
+    base = _p_commit(repo, {SRC + _P_REL: _P_BASE_TEXT})
+    sweep = _p_commit(repo, {SRC + _P_REL: sweep_text})
+    for i in range(between):
+        _p_commit(repo, {f"unrelated{i}.txt": str(i)})
+    if head_text is not None:
+        _p_commit(repo, {SRC + _P_REL: head_text})
+    return repo, base, sweep
+
+
+def _must_run(fn, *args, **kw):
+    """Call a guard that must RUN here; a skip would be a silent vacuity, so it fails."""
+    try:
+        return fn(*args, **kw)
+    except pytest.skip.Exception as e:
+        raise AssertionError(f"the guard skipped but must run: {e}")
+
+
+def _p_shallow(tmp_path, repo):
+    shallow = tmp_path / "shallow"
+    subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{repo}", str(shallow)],
+                   check=True, capture_output=True)
+    return shallow
+
+
+class TestRetireByContent:
+    P = [SRC + _P_REL]
+
+    # (a) full history, file edited after the sweep -> retire (K3)
+    def test_a_full_history_file_edited_after_the_sweep_retires(self, tmp_path):
+        repo, base, sweep = _p_full(tmp_path, head_text=_P_LATER_TEXT)
+        assert retire_reason(self.P, repo=repo, base=base, sweep=sweep)
+
+    # (b) the CI cell: BASE reachable, SWEEP and everything after it absent (K2)
+    def test_b_partial_history_sweep_absent_retires_where_the_old_count_ran(self, tmp_path):
+        repo = _p_repo(tmp_path)
+        base = _p_commit(repo, {SRC + _P_REL: _P_BASE_TEXT})
+        _p_commit(repo, {SRC + _P_REL: _P_LATER_TEXT})  # HEAD directly on BASE
+        old = _pg(repo, "rev-list", "--count", f"{base}..HEAD", "--", SRC + _P_REL).stdout.strip()
+        assert int(old) <= 1, "the OLD commit-count rule would not retire here: this is the CI failure"
+        reason = retire_reason(self.P, repo=repo, base=base, sweep=_P_NOSHA)
+        assert reason and "sweep" in reason
+
+    def test_b_site1_the_snapshot_helper_skips_there_instead_of_running(self, tmp_path):
+        repo = _p_repo(tmp_path)
+        base = _p_commit(repo, {SRC + _P_REL: _P_BASE_TEXT})
+        _p_commit(repo, {SRC + _P_REL: _P_LATER_TEXT})
+        with pytest.raises(pytest.skip.Exception):
+            _fresh_snapshot(_P_REL, repo=repo, base=base, sweep=_P_NOSHA)
+
+    def test_k1_base_absent_retires(self, tmp_path):
+        repo, base, sweep = _p_full(tmp_path)
+        assert retire_reason(self.P, repo=repo, base=_P_NOSHA, sweep=sweep)
+
+    # (c) HEAD == SWEEP content -> the guard runs (K4)
+    def test_c_head_equals_sweep_content_runs(self, tmp_path):
+        repo, base, sweep = _p_full(tmp_path)
+        assert retire_reason(self.P, repo=repo, base=base, sweep=sweep) is None
+        _must_run(_fresh_snapshot, _P_REL, repo=repo, base=base, sweep=sweep)
+
+    # The sweep is a squash several commits above BASE: a file another commit edited
+    # between BASE and the sweep cannot be judged as "base plus the sweep's lines".
+    def test_a_file_edited_between_base_and_the_sweep_retires_even_at_sweep_content(self, tmp_path):
+        repo = _p_repo(tmp_path)
+        base = _p_commit(repo, {SRC + _P_REL: _P_BASE_TEXT})
+        _p_commit(repo, {SRC + _P_REL: _P_BASE_TEXT + "a foreign edit before the sweep\n"})
+        sweep = _p_commit(repo, {SRC + _P_REL: _P_SWEEP_TEXT + "a foreign edit before the sweep\n"})
+        assert retire_reason(self.P, repo=repo, base=base, sweep=sweep)
+
+    def test_a_sweep_whose_parent_is_absent_retires(self, tmp_path):
+        repo, base, sweep = _p_full(tmp_path)
+        shallow = _p_shallow(tmp_path, repo)
+        assert _has_commit(shallow, sweep) and not _has_commit(shallow, base)
+        assert retire_reason(self.P, repo=shallow, base=sweep, sweep=sweep)  # base==sweep: parent absent
+
+    # K5: unrelated commits between SWEEP and HEAD change nothing
+    def test_k5_unrelated_commits_after_the_sweep_do_not_change_the_answer(self, tmp_path):
+        repo, base, sweep = _p_full(tmp_path, between=3)
+        assert retire_reason(self.P, repo=repo, base=base, sweep=sweep) is None
+        repo2, base2, sweep2 = _p_full(tmp_path, name="r2", head_text=_P_LATER_TEXT, between=3)
+        assert retire_reason(self.P, repo=repo2, base=base2, sweep=sweep2)
+
+    # (d) vacuity: HEAD == SWEEP content with a violation planted in the swept file;
+    # the guard runs (does not retire) and the real c4 body still fails.
+    def test_d_c4_body_still_fails_on_a_planted_violation_when_the_guard_runs(self, tmp_path):
+        bad = _P_SWEEP_TEXT + "an extra line the sweep must not add\n"
+        repo, base, sweep = _p_full(tmp_path, sweep_text=bad)
+        assert retire_reason(self.P, repo=repo, base=base, sweep=sweep) is None
+        head = (repo / SRC / _P_REL).read_text()
+        with pytest.raises(AssertionError):
+            assert_c4(_P_REL, _P_BASE_TEXT, head)
+
+    def test_d_c4_body_passes_the_correct_sweep(self):
+        assert_c4(_P_REL, _P_BASE_TEXT, _P_SWEEP_TEXT)
+
+    def test_d_c4_body_fails_a_dropped_word(self):
+        with pytest.raises(AssertionError):
+            assert_c4(_P_REL, _P_BASE_TEXT, _P_SWEEP_TEXT.replace("keep this line", "keep that line"))
+
+    def test_d_c5_exact_body_fails_on_a_planted_extra_baseline_entry(self):
+        base = {SRC + f for f in FILES} | {"a.py", "b.py"}
+        good = {"a.py", "b.py"}
+        assert_c5_exact(good, base, n_expected=2)
+        with pytest.raises(AssertionError):
+            assert_c5_exact(good | {"extra.py"}, base, n_expected=2)
+        with pytest.raises(AssertionError):
+            assert_c5_exact(good | {SRC + FILES[0]}, base, n_expected=3)
+
+    # site 2: the exact-count gate
+    def _bl_repo(self, tmp_path, head_entries, sweep_entries=None):
+        repo = _p_repo(tmp_path)
+        entries = sweep_entries if sweep_entries is not None else head_entries
+        base = _p_commit(repo, {_BL: json.dumps({"baseline": ["x"]})})
+        sweep = _p_commit(repo, {_BL: json.dumps({"baseline": entries})})
+        if head_entries != entries:
+            _p_commit(repo, {_BL: json.dumps({"baseline": head_entries})})
+        return repo, base, sweep
+
+    def test_site2_exact_gate_runs_on_sweep_content_with_3a_unlanded(self, tmp_path):
+        ents = sorted(SRC + f for f in COVERED_BY_PR_3A)
+        repo, base, sweep = self._bl_repo(tmp_path, ents)
+        _must_run(_exact_count_gate, repo=repo, base=base, sweep=sweep)
+
+    def test_site2_exact_gate_skips_when_the_sweep_is_absent(self, tmp_path):
+        ents = sorted(SRC + f for f in COVERED_BY_PR_3A)
+        repo, base, _ = self._bl_repo(tmp_path, ents)
+        with pytest.raises(pytest.skip.Exception):
+            _exact_count_gate(repo=repo, base=base, sweep=_P_NOSHA)
+
+    def test_site2_exact_gate_skips_when_the_baseline_changed_after_the_sweep(self, tmp_path):
+        ents = sorted(SRC + f for f in COVERED_BY_PR_3A)
+        repo, base, sweep = self._bl_repo(tmp_path, ents + ["later.py"], sweep_entries=ents)
+        with pytest.raises(pytest.skip.Exception):
+            _exact_count_gate(repo=repo, base=base, sweep=sweep)
+
+    def test_site2_exact_gate_skips_once_3a_has_shrunk_the_baseline(self, tmp_path):
+        repo, base, sweep = self._bl_repo(tmp_path, ["other.py"])
+        with pytest.raises(pytest.skip.Exception):
+            _exact_count_gate(repo=repo, base=base, sweep=sweep)
+
+
+# --- planted controls: a git failure that means "the evidence is missing" skips (S2) ---
+#
+# A blobless or otherwise partial checkout can hold a COMMIT whose BLOB is absent. Then
+# `git show <commit>:<path>` fails and prints nothing; a guard that parses that output, or
+# asserts on its return code, fails with a JSON or git error instead of skipping. These
+# cells build that state for real (commit the file, delete its loose blob object) and
+# prove every guard skips there.
+
+
+def _p_drop_blob(repo, commit, rel):
+    """Delete the loose blob of `rel` at `commit`; assert the commit survives and
+    `git show commit:rel` now fails."""
+    blob = _pg(repo, "rev-parse", f"{commit}:{rel}").stdout.strip()
+    obj = Path(repo) / ".git" / "objects" / blob[:2] / blob[2:]
+    assert obj.is_file(), "blob is not loose; the cell cannot delete it"
+    obj.chmod(0o644)
+    obj.unlink()
+    assert _has_commit(repo, commit)
+    assert _git("show", f"{commit}:{rel}", repo=repo).returncode != 0
+
+
+def _p_blob_missing(tmp_path, name, files):
+    """A repo whose commit holds `files` but whose blobs for them are deleted from the
+    object store. Returns (repo, commit)."""
+    repo = _p_repo(tmp_path, name)
+    commit = _p_commit(repo, files)
+    for rel in files:
+        _p_drop_blob(repo, commit, rel)
+    return repo, commit
+
+
+class TestEvidenceMissing:
+    def test_the_cell_really_is_commit_present_blob_missing(self, tmp_path):
+        repo, commit = _p_blob_missing(tmp_path, "r", {_BL: json.dumps({"baseline": ["u1"]})})
+        assert _has_commit(repo, commit)
+        assert _git("show", f"{commit}:{_BL}", repo=repo).returncode != 0
+
+    def test_base_text_skips_when_the_base_blob_is_missing(self, tmp_path):
+        repo, base = _p_blob_missing(tmp_path, "r", {SRC + _P_REL: "unique base text 1\n"})
+        with pytest.raises(pytest.skip.Exception):
+            _base_text(_P_REL, repo=repo, base=base)
+
+    def test_base_text_returns_the_text_when_the_blob_is_there(self, tmp_path):
+        repo, base, _ = _p_full(tmp_path)
+        assert _must_run(_base_text, _P_REL, repo=repo, base=base) == _P_BASE_TEXT
+
+    def test_base_baseline_skips_when_the_base_blob_is_missing(self, tmp_path):
+        repo, base = _p_blob_missing(tmp_path, "r", {_BL: json.dumps({"baseline": ["u2"]})})
+        with pytest.raises(pytest.skip.Exception):
+            _base_baseline(repo=repo, base=base)
+
+    def test_base_baseline_returns_the_entries_when_the_blob_is_there(self, tmp_path):
+        repo = _p_repo(tmp_path)
+        base = _p_commit(repo, {_BL: json.dumps({"baseline": ["a", "b"]})})
+        assert _must_run(_base_baseline, repo=repo, base=base) == {"a", "b"}
+
+    def test_retire_reason_retires_when_the_base_blob_is_missing(self, tmp_path):
+        repo = _p_repo(tmp_path)
+        base = _p_commit(repo, {SRC + _P_REL: _P_BASE_TEXT + "unique 3\n"})
+        sweep = _p_commit(repo, {SRC + _P_REL: _P_SWEEP_TEXT})
+        _p_drop_blob(repo, base, SRC + _P_REL)
+        assert retire_reason([SRC + _P_REL], repo=repo, base=base, sweep=sweep)
+
+    def test_exact_count_gate_skips_when_the_base_baseline_blob_is_missing(self, tmp_path):
+        ents = sorted(SRC + f for f in COVERED_BY_PR_3A)
+        repo = _p_repo(tmp_path)
+        base = _p_commit(repo, {_BL: json.dumps({"baseline": ["x", "unique 4"]})})
+        sweep = _p_commit(repo, {_BL: json.dumps({"baseline": ents})})
+        _p_drop_blob(repo, base, _BL)
+        with pytest.raises(pytest.skip.Exception):
+            _exact_count_gate(repo=repo, base=base, sweep=sweep)
+
+
+# --- the four retired tests (the frozen-fact guards) -------------------------------
+
+
+class TestRetired:
+    def test_the_reason_names_what_retired_the_guards(self):
+        assert RETIRED_REASON == (
+            f"sweep merged as {SWEEP[:8]}; concurrent-edit guard no longer applies"
+        )
+        assert RETIRED_REASON == "sweep merged as caebaf3c; concurrent-edit guard no longer applies"
+
+    def test_diff_files_skips_unconditionally_even_where_the_old_code_would_run(self, tmp_path):
+        repo = _p_repo(tmp_path)
+        _p_commit(repo, {SRC + FILES[0]: _P_BASE_TEXT})
+        sweep = _p_commit(repo, {SRC + FILES[0]: _P_SWEEP_TEXT, _BL: "{}"})
+        with pytest.raises(pytest.skip.Exception) as e:
+            _our_diff_files(repo=repo, sweep=sweep)
+        assert str(e.value) == RETIRED_REASON
