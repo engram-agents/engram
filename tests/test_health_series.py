@@ -3875,3 +3875,114 @@ def test_cli_status_reports_derive_checks_and_verdicts(tmp_path):
     payload = json.loads(result.stdout)
     assert payload["counts"]["derive_checks"] == 1
     assert payload["latest_derive_verdicts"]["agree"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Unrestorable knowledge.sql commit (#3951): backfill records it and carries on
+# ---------------------------------------------------------------------------
+
+_GOOD_DUMP = (
+    "BEGIN TRANSACTION;\n"
+    "CREATE TABLE nodes (id TEXT PRIMARY KEY, claim TEXT);\n"
+    "INSERT INTO nodes VALUES('ob_1','first claim');\n"
+    "INSERT INTO nodes VALUES('ob_2','second claim');\n"
+    "COMMIT;\n"
+)
+
+
+def _truncated_dump_repo(tmp_path):
+    """good / truncated (cut mid-statement) / good. Returns (repo, shas)."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    good1 = _commit_knowledge(repo_dir, _GOOD_DUMP, _committer_iso(t0))
+    cut = _GOOD_DUMP[: _GOOD_DUMP.index("'second")]  # ends mid-statement: "...VALUES('ob_2',"
+    bad = _commit_knowledge(repo_dir, cut, _committer_iso(t0 + timedelta(minutes=1)))
+    good2 = _commit_knowledge(
+        repo_dir,
+        _GOOD_DUMP.replace("COMMIT;", "INSERT INTO nodes VALUES('ob_3','third');\nCOMMIT;"),
+        _committer_iso(t0 + timedelta(minutes=2)),
+    )
+    return repo_dir, good1, bad, good2
+
+
+def _skip_rows(db_path):
+    conn = series.open_store(db_path)
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM unrestorable_commits").fetchall()]
+    finally:
+        conn.close()
+
+
+def test_backfill_skips_truncated_commit_and_records_it(tmp_path):
+    repo_dir, good1, bad, good2 = _truncated_dump_repo(tmp_path)
+    db_path = tmp_path / "series.db"
+
+    result = series.backfill(repo_dir, db_path)  # must not raise
+
+    conn = series.open_store(db_path)
+    shas = {r["commit_sha"] for r in conn.execute("SELECT commit_sha FROM l0_points").fetchall()}
+    conn.close()
+    assert shas == {good1, good2}
+
+    rows = _skip_rows(db_path)
+    assert [r["commit_sha"] for r in rows] == [bad]
+    assert rows[0]["error_class"] == "OperationalError"
+    assert "incomplete input" in rows[0]["error_message"]
+    assert rows[0]["health_major"] == result["health_major"]
+    assert rows[0]["replay_decl_hash"] == result["detail"]["decl_hash"]
+    assert rows[0]["recorded_at"]
+
+    assert result["commits_done"] == 2
+    assert result["unrestorable_count"] == 1
+    assert result["unrestorable_shas"] == [bad]
+    assert result["detail"]["unrestorable_count"] == 1
+    assert result["detail"]["unrestorable_shas"] == [bad]
+    conn = series.open_store(db_path)
+    detail = json.loads(conn.execute("SELECT detail FROM replay_runs ORDER BY run_id DESC LIMIT 1").fetchone()["detail"])
+    conn.close()
+    assert detail["unrestorable_shas"] == [bad]
+
+
+def test_backfill_second_run_does_not_retry_skipped_commit(tmp_path):
+    repo_dir, good1, bad, good2 = _truncated_dump_repo(tmp_path)
+    db_path = tmp_path / "series.db"
+    series.backfill(repo_dir, db_path)
+    first_skip = _skip_rows(db_path)
+
+    result2 = series.backfill(repo_dir, db_path)  # must not raise
+
+    assert result2["commits_total"] == 0
+    assert result2["commits_done"] == 0
+    assert result2["unrestorable_count"] == 0
+    assert _skip_rows(db_path) == first_skip  # no new / duplicated skip row
+    conn = series.open_store(db_path)
+    assert conn.execute("SELECT COUNT(*) c FROM l0_points").fetchone()["c"] == 2
+    conn.close()
+
+
+def test_backfill_skip_is_scoped_to_major_and_decl_hash(tmp_path):
+    """A skip recorded under one health_major is not a skip under another."""
+    repo_dir, good1, bad, good2 = _truncated_dump_repo(tmp_path)
+    db_path = tmp_path / "series.db"
+    series.backfill(repo_dir, db_path, health_major=1)
+    result = series.backfill(repo_dir, db_path, health_major=2)
+    assert result["unrestorable_shas"] == [bad]
+    assert {r["health_major"] for r in _skip_rows(db_path)} == {1, 2}
+
+
+def test_series_readers_ignore_recorded_skip(tmp_path):
+    repo_dir, good1, bad, good2 = _truncated_dump_repo(tmp_path)
+    db_path = tmp_path / "series.db"
+    series.backfill(repo_dir, db_path)
+    assert [r["commit_sha"] for r in _skip_rows(db_path)] == [bad]
+
+    ex = series.export(db_path)
+    assert bad not in json.dumps(ex, default=str)
+    st = series.status(db_path)
+    # the skip is not a point: both counts reflect only the two restorable commits
+    assert [c["count"] for c in st["git_replay_counts"]] == [2]
+    assert st["counts"]["l0_points"] == 2
+    conn = series.open_store(db_path)
+    assert conn.execute("SELECT COUNT(*) c FROM l0_points WHERE commit_sha = ?", (bad,)).fetchone()["c"] == 0
+    conn.close()

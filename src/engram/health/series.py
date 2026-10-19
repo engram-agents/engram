@@ -174,6 +174,18 @@ __all__ = [
 ]
 
 
+class UnrestorableCommit(Exception):
+    """``replay_commit`` could not restore a commit's ``knowledge.sql`` (``git
+    show`` failed, or the dump does not load). ``backfill`` records the commit
+    and carries on; the original error is chained as ``__cause__``."""
+
+    def __init__(self, commit_sha: str, cause: BaseException):
+        self.commit_sha = commit_sha
+        self.error_class = type(cause).__name__
+        self.error_message = str(cause)
+        super().__init__(f"{commit_sha}: {self.error_class}: {self.error_message}")
+
+
 class SeriesIntegrityError(Exception):
     """Raised by ``ingest`` when two snapshot files declare the SAME
     ``health_version`` with DIFFERENT ``signal_defs``/``curve_defs``/
@@ -208,6 +220,24 @@ CREATE TABLE IF NOT EXISTS l0_points (
     measurements TEXT NOT NULL,
     unreplayable TEXT NOT NULL,
     PRIMARY KEY (commit_sha, health_major, source, replay_decl_hash)
+);
+
+-- Commits whose knowledge.sql could not be restored (truncated / unreadable).
+-- A dedicated table, NOT an l0_points row: l0_points feeds the health series,
+-- and a skip must contribute no point to any reader of it.
+-- Clearing a skip: delete its row. A row is keyed by (commit_sha,
+-- health_major, replay_decl_hash), so it is re-queued automatically when
+-- health_major or replay_decl_hash changes. A TRANSIENT failure reading the
+-- file from the repository is recorded too and stays skipped for that key
+-- until the row is deleted.
+CREATE TABLE IF NOT EXISTS unrestorable_commits (
+    commit_sha TEXT NOT NULL,
+    health_major INTEGER NOT NULL,
+    replay_decl_hash TEXT NOT NULL DEFAULT '',
+    error_class TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (commit_sha, health_major, replay_decl_hash)
 );
 
 CREATE TABLE IF NOT EXISTS derived_points (
@@ -2504,21 +2534,32 @@ def replay_commit(
     key set matches what ``health.measurements.compute_all_measurements``
     puts in a ``stored`` row's ``measurements`` block. ``unreplayable`` is
     ``{name: {"reason": ..., "class": "declared"|"discovered"}}`` for every
-    measurement NOT computed this way (D2's class shape)."""
+    measurement NOT computed this way (D2's class shape).
+
+    Raises ``UnrestorableCommit`` when the commit's ``knowledge.sql`` cannot
+    be restored (``git show`` fails, or ``executescript`` raises any
+    ``sqlite3.Error`` -- e.g. a truncated dump). Only that restore step is
+    translated; an error inside a measurement's own SQL still propagates."""
     registry = registry if registry is not None else health_measurements.MEASUREMENTS
 
-    result = subprocess.run(
-        ["git", "show", f"{commit_sha}:knowledge.sql"],
-        check=True,
-        capture_output=True,
-        text=True,
-        cwd=str(repo_dir),
-    )
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{commit_sha}:knowledge.sql"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(repo_dir),
+        )
+    except subprocess.CalledProcessError as e:
+        raise UnrestorableCommit(commit_sha, e) from e
 
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     try:
-        conn.executescript(result.stdout)
+        try:
+            conn.executescript(result.stdout)
+        except sqlite3.Error as e:
+            raise UnrestorableCommit(commit_sha, e) from e
 
         measurements: "dict[str, object]" = {
             "raw_schema_version": _current_health_major()
@@ -2654,11 +2695,20 @@ def backfill(
 
     Returns the run record dict (``reason``, ``started_at``, ``finished_
     at``, ``health_major``, ``commits_total`` (missing-commit count),
-    ``commits_done`` (rows actually inserted -- always equal to
-    ``commits_total`` today, since every missing commit is unconditionally
-    replayed and inserted), ``engine_build``, ``detail`` (``{per_reason_
+    ``commits_done`` (rows actually inserted --
+    ``commits_total - commits_done`` is the number of commits newly recorded
+    in ``unrestorable_commits`` this run, i.e. skipped rather than replayed), ``engine_build``, ``detail`` (``{per_reason_
     counts_of_unreplayable, decl_hash, disagreements}``)); the same record
-    (JSON-encoded ``detail``) is inserted into ``replay_runs``."""
+    (JSON-encoded ``detail``) is inserted into ``replay_runs``.
+
+    Skipped commits: a commit whose ``knowledge.sql`` cannot be restored
+    (``UnrestorableCommit``) gets a row in ``unrestorable_commits`` for the
+    current ``(health_major, replay_decl_hash)`` and is not retried on later
+    runs. To clear a recorded skip, delete its row; it is also re-queued
+    automatically when ``health_major`` or ``replay_decl_hash`` changes (the
+    key no longer matches). A TRANSIENT failure of the underlying file read
+    from the repository is recorded the same way, so it too stays skipped for
+    that key until its row is deleted."""
     registry = registry if registry is not None else health_measurements.MEASUREMENTS
 
     conn = open_store(db_path)
@@ -2704,13 +2754,46 @@ def backfill(
                 (effective_health_major, current_hash),
             ).fetchall()
         }
+        # Commits already recorded as unrestorable under this (health_major,
+        # replay_decl_hash) are not retried every run (#3951).
+        skipped_shas = {
+            r["commit_sha"]
+            for r in conn.execute(
+                "SELECT commit_sha FROM unrestorable_commits WHERE health_major = ? "
+                "AND replay_decl_hash = ?",
+                (effective_health_major, current_hash),
+            ).fetchall()
+        }
         all_commits = knowledge_commits(repo_dir)
-        missing = [(sha, ts) for sha, ts in all_commits if sha not in existing_shas]
+        missing = [
+            (sha, ts)
+            for sha, ts in all_commits
+            if sha not in existing_shas and sha not in skipped_shas
+        ]
 
         commits_done = 0
+        unrestorable_shas: "list[str]" = []
         per_reason_counts: "dict[str, int]" = {}
         for sha, committer_iso in missing:
-            measurements, unreplayable = replay_commit(repo_dir, sha, registry=registry)
+            try:
+                measurements, unreplayable = replay_commit(repo_dir, sha, registry=registry)
+            except UnrestorableCommit as e:
+                conn.execute(
+                    "INSERT OR IGNORE INTO unrestorable_commits "
+                    "(commit_sha, health_major, replay_decl_hash, error_class, "
+                    "error_message, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        sha,
+                        effective_health_major,
+                        current_hash,
+                        e.error_class,
+                        e.error_message,
+                        _utc_now_iso(now),
+                    ),
+                )
+                conn.commit()
+                unrestorable_shas.append(sha)
+                continue
             turn = parse_turn_from_message(_commit_message(repo_dir, sha))
             computed_at = _utc_now_iso(now)
             conn.execute(
@@ -2785,6 +2868,8 @@ def backfill(
             "per_reason_counts_of_unreplayable": per_reason_counts,
             "decl_hash": current_hash,
             "disagreements": disagreements,
+            "unrestorable_count": len(unrestorable_shas),
+            "unrestorable_shas": unrestorable_shas,
         }
         run_record = {
             "reason": reason,
@@ -2793,6 +2878,8 @@ def backfill(
             "health_major": effective_health_major,
             "commits_total": len(missing),
             "commits_done": commits_done,
+            "unrestorable_count": len(unrestorable_shas),
+            "unrestorable_shas": unrestorable_shas,
             "engine_build": build,
             "detail": detail,
         }

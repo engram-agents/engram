@@ -2576,3 +2576,184 @@ def test_2186_self_heal_skip_branch_fires_on_stale_in_memory_nodes_fts():
         )
     finally:
         shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Atomic write contract (#3951): dump_stripped never leaves a partial or
+# unloadable file at out_sql_path.
+# ---------------------------------------------------------------------------
+
+import stat  # noqa: E402
+
+
+class _Proxy:
+    """Stand-in for the ``sqlite3`` module inside engram_backup whose
+    ``connect`` builds connections of a chosen Connection subclass."""
+
+    def __init__(self, factory):
+        self._factory = factory
+
+    def connect(self, *args, **kwargs):
+        kwargs.setdefault("factory", self._factory)
+        return sqlite3.connect(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(sqlite3, name)
+
+
+def _patch_iterdump(monkeypatch, make_iter):
+    class _Conn(sqlite3.Connection):
+        def iterdump(self, *a, **k):
+            return make_iter(super().iterdump(*a, **k))
+
+    monkeypatch.setattr(engram_backup, "sqlite3", _Proxy(_Conn))
+
+
+def _prior_dump(tmp_path, mode=0o644):
+    out = tmp_path / "knowledge.sql"
+    out.write_bytes(b"-- previous good dump\n")
+    os.chmod(out, mode)
+    return out
+
+
+def _dir_listing(tmp_path):
+    return sorted(os.listdir(tmp_path))
+
+
+def test_a1_iterdump_raising_partway_keeps_old_file_and_no_temp(engram_db, tmp_path, monkeypatch):
+    out = _prior_dump(tmp_path)
+    before_bytes = out.read_bytes()
+
+    def boom(it):
+        for i, line in enumerate(it):
+            if i == 3:
+                raise OSError("simulated disk full")
+            yield line
+
+    _patch_iterdump(monkeypatch, boom)
+    listing = _dir_listing(tmp_path)
+    with pytest.raises(OSError):
+        engram_backup.dump_stripped(engram_db, str(out))
+    assert out.read_bytes() == before_bytes
+    assert _dir_listing(tmp_path) == listing  # no temp left behind
+
+
+def test_a1b_failure_with_no_prior_file_leaves_nothing(engram_db, tmp_path, monkeypatch):
+    out = tmp_path / "knowledge.sql"
+
+    def boom(it):
+        for i, line in enumerate(it):
+            if i == 3:
+                raise OSError("simulated disk full")
+            yield line
+
+    _patch_iterdump(monkeypatch, boom)
+    listing = _dir_listing(tmp_path)
+    with pytest.raises(OSError):
+        engram_backup.dump_stripped(engram_db, str(out))
+    assert not out.exists()
+    assert _dir_listing(tmp_path) == listing
+
+
+@pytest.mark.parametrize("variant", ["bad_sql_line", "dropped_inserts"])
+def test_a2_verify_failure_raises_keeps_old_file_and_no_temp(engram_db, tmp_path, monkeypatch, variant):
+    out = _prior_dump(tmp_path)
+    before_bytes = out.read_bytes()
+
+    def corrupt(it):
+        for line in it:
+            if variant == "bad_sql_line" and line.startswith("INSERT INTO"):
+                yield "THIS IS NOT VALID SQL ((;"
+            elif variant == "dropped_inserts" and line.startswith('INSERT INTO "nodes"'):
+                continue  # loads fine, but the node count no longer matches
+            else:
+                yield line
+
+    _patch_iterdump(monkeypatch, corrupt)
+    listing = _dir_listing(tmp_path)
+    with pytest.raises(Exception):
+        engram_backup.dump_stripped(engram_db, str(out))
+    assert out.read_bytes() == before_bytes
+    assert _dir_listing(tmp_path) == listing
+
+
+def test_a3_success_replaces_loads_counts_and_keeps_mode(engram_db, tmp_path):
+    out = _prior_dump(tmp_path, mode=0o640)
+    stats = engram_backup.dump_stripped(engram_db, str(out))
+
+    assert out.read_bytes() != b"-- previous good dump\n"
+    assert stat.S_IMODE(os.stat(out).st_mode) == 0o640
+    assert stats["bytes"] == out.stat().st_size
+    mem = sqlite3.connect(":memory:")
+    mem.executescript(out.read_text(encoding="utf-8"))
+    src_n = sqlite3.connect(engram_db).execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+    assert mem.execute("SELECT COUNT(*) FROM nodes").fetchone()[0] == src_n == 4
+    assert stats["verified_nodes"] == 4
+    assert _dir_listing(tmp_path) == sorted(["knowledge.db", "knowledge.sql"])
+
+
+def test_a3b_new_file_gets_0644(engram_db, tmp_path):
+    out = tmp_path / "knowledge.sql"
+    engram_backup.dump_stripped(engram_db, str(out))
+    assert stat.S_IMODE(os.stat(out).st_mode) == 0o644
+
+
+# --- #3951 round 2: a dump that does not end in a committed state must not verify ---
+
+
+def _good_dump_text(engram_db, tmp_path):
+    out = tmp_path / "good.sql"
+    engram_backup.dump_stripped(engram_db, str(out))
+    return out.read_text(encoding="utf-8")
+
+
+def test_b1_dump_cut_before_final_commit_fails_verify_keeps_old_file(engram_db, tmp_path, monkeypatch):
+    """executescript succeeds and the node count matches, but a real restore
+    rolls the open transaction back and the DB comes back empty."""
+    out = _prior_dump(tmp_path)
+    before_bytes = out.read_bytes()
+    real_verify = engram_backup._verify_dump_restores
+
+    def cut_before_commit(sql_path, expected_nodes):
+        with open(sql_path, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        idx = max(i for i, ln in enumerate(lines) if ln == "COMMIT;")
+        with open(sql_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines[:idx]) + "\n")
+        return real_verify(sql_path, expected_nodes)
+
+    monkeypatch.setattr(engram_backup, "_verify_dump_restores", cut_before_commit)
+    listing = _dir_listing(tmp_path)
+    with pytest.raises(Exception):
+        engram_backup.dump_stripped(engram_db, str(out))
+    assert out.read_bytes() == before_bytes
+    assert _dir_listing(tmp_path) == listing
+
+
+def test_b2_open_transaction_with_commit_shaped_tail_fails_verify(engram_db, tmp_path):
+    """The tail lines look right but the COMMIT is inside an unterminated
+    comment: only the live in_transaction check can see the transaction is open."""
+    text = _good_dump_text(engram_db, tmp_path)
+    lines = text.splitlines()
+    idx = max(i for i, ln in enumerate(lines) if ln == "COMMIT;")
+    bad = tmp_path / "bad.sql"
+    bad.write_text("\n".join(lines[:idx]) + "\n/*\n" + "\n".join(lines[idx:]) + "\n", encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        engram_backup._verify_dump_restores(str(bad), 4)
+
+
+def test_b3_dump_missing_trailing_user_version_fails_verify(engram_db, tmp_path):
+    text = _good_dump_text(engram_db, tmp_path)
+    lines = [ln for ln in text.splitlines() if ln]
+    assert lines[-2] == "COMMIT;" and lines[-1].startswith("PRAGMA user_version")
+    bad = tmp_path / "bad.sql"
+    bad.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        engram_backup._verify_dump_restores(str(bad), 4)
+
+
+def test_b4_well_formed_dump_still_verifies(engram_db, tmp_path):
+    text = _good_dump_text(engram_db, tmp_path)
+    good = tmp_path / "again.sql"
+    good.write_text(text, encoding="utf-8")
+    assert engram_backup._verify_dump_restores(str(good), 4) == 4
