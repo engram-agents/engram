@@ -147,7 +147,7 @@ def _release_lock():
 
 def _expected_control(loader):
     if loader == "load_tripwires":
-        return [("git push --force", "do not force push", "ls_good", "high")]
+        return [("git push --force", "do not force push", "ls_good", "high", "full")]  # 5th: match_scope (#3920)
     return [{"id": "ls_good", "pattern": "git push --force",
              "prevention_type": "shadow", "nudge": "do not force push"}]
 

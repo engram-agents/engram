@@ -346,3 +346,69 @@ class TestEmptyInventory(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# 7. alpha#3920: --compare-views
+# ---------------------------------------------------------------------------
+
+class TestCompareViews(unittest.TestCase):
+    """A lesson that matches a command still matches it on the command view; a lesson that only
+    matched prose inside a heredoc reports a lost match (REVIEW). Reports, never writes."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="engram_audit_views_"))
+        self.db = _make_db(self.tmp)
+        _insert_lesson(self.db, node_id="ls_slice", pattern=r"\bsed\s+-n\b")
+        _insert_lesson(self.db, node_id="ls_plain", pattern=r"\bgit\s+status\b")
+        _write_transcript(self.tmp / "s1.jsonl", [
+            _bash_entry("cat <<'EOF'\nuse sed -n to slice\nEOF"),
+            _bash_entry("sed -n 1,20p file"),
+            _bash_entry("git status"),
+        ])
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self):
+        buf = io.StringIO()
+        code = _audit.run_view_comparison(db_path=str(self.db),
+                                          transcript_glob=str(self.tmp / "*.jsonl"),
+                                          limit_files=3, out=buf)
+        return code, buf.getvalue()
+
+    def test_lost_match_is_reported_for_the_lesson_that_matched_prose(self):
+        code, out = self._run()
+        self.assertEqual(code, 0)
+        self.assertIn("[ls_slice] REVIEW", out)
+        self.assertIn("full=2 command=1 lost=1", out)
+
+    def test_lesson_without_match_scope_is_listed_as_full(self):
+        _, out = self._run()
+        self.assertIn("[ls_slice] REVIEW scope=full", out)
+
+    def test_a_lesson_with_no_lost_match_is_ok(self):
+        _, out = self._run()
+        self.assertIn("[ls_plain] ok", out)
+        self.assertIn("full=1 command=1 lost=0", out)
+
+    def test_collect_targets_pairs_gives_full_and_command(self):
+        cur, prior, _ = _audit.collect_targets(transcript_glob=str(self.tmp / "*.jsonl"),
+                                               limit_files=3, pairs=True)
+        pairs = cur + prior
+        self.assertTrue(all(isinstance(p, tuple) and len(p) == 2 for p in pairs))
+        heredoc = [p for p in pairs if "use sed -n to slice" in p[0]][0]
+        self.assertNotIn("use sed -n to slice", heredoc[1])
+
+    def test_default_collect_targets_is_unchanged(self):
+        cur, prior, _ = _audit.collect_targets(transcript_glob=str(self.tmp / "*.jsonl"), limit_files=3)
+        self.assertTrue(all(isinstance(t, str) for t in cur + prior))
+
+    def test_empty_inventory_exits_2(self):
+        buf, err = io.StringIO(), io.StringIO()
+        code = _audit.run_view_comparison(db_path=str(self.db),
+                                          transcript_glob=str(self.tmp / "none*.jsonl"),
+                                          out=buf, err=err)
+        self.assertEqual(code, 2)
+        self.assertIn("empty inventory", err.getvalue())

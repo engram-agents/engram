@@ -232,7 +232,7 @@ site("hooklib_focused_ids", "_hooklib.py",
 
 # lesson-tripwire  (:298, :550, :834, :1432)
 site("tripwire_load_tripwires", "engram-lesson-tripwire-hook.py",
-     f"result = [[list(t) for t in mod.load_tripwires({_PATHLIB_DB})], len(CALLS)]",
+     f"result = [[list(t)[:4] for t in mod.load_tripwires({_PATHLIB_DB})], len(CALLS)]",  # [:4]: alpha#3920 added a 5th element (match_scope)
      regular=lambda r: r[1] == 1 and len(r[0]) == 1 and r[0][0][2] == "fx-1",
      missing=lambda r: r == [[], 0], dangling=lambda r: r == [[], 0],
      **_bad(lambda r: r == [[], 0]))

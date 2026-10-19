@@ -140,7 +140,8 @@ class TestTripwireShapeCarriesNodeId(unittest.TestCase):
         ls1 = _seed_lesson(server, pattern=r"rm -rf", nudge="careful")
         tripwires = load_tripwires(db_path=_db_path())
         self.assertEqual(len(tripwires), 1)
-        pattern, nudge, node_id, priority = tripwires[0]
+        # alpha#3920: a 5th element (match_scope) follows the priority; the first four are unchanged.
+        pattern, nudge, node_id, priority, *_rest = tripwires[0]
         self.assertEqual(pattern, r"rm -rf")
         self.assertEqual(nudge, "careful")
         self.assertEqual(node_id, ls1)

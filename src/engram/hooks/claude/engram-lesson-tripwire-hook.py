@@ -342,7 +342,8 @@ SELECT
         claim
     ) AS nudge,
     json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,
-    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.tripwire_priority')  AS priority
+    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.tripwire_priority')  AS priority,
+    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.match_scope')  AS match_scope
 FROM nodes
 WHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')
   AND is_current = 1
@@ -557,9 +558,26 @@ def _write_owner_stderr_lines() -> None:
         pass
 
 
+# alpha#3920 (part of #3911): which view of the call a lesson's pattern runs against.
+#   "command"  the call with heredoc bodies / prose-field values hidden (opt-in, per lesson)
+#   "full"     today's raw target, byte for byte (the default, and what a lesson with NO
+#              match_scope gets: an unaudited seat must not silently lose a body-text lesson)
+# Anything else in the metadata is treated as "full" (a typo must not blind a lesson).
+MATCH_SCOPES = ("command", "full")
+DEFAULT_MATCH_SCOPE = "full"
+
+
+def _coerce_match_scope(value) -> str:
+    """NULL/absent -> the default view; a known value -> itself; anything else -> "full"."""
+    if value is None:
+        return DEFAULT_MATCH_SCOPE
+    return value if value in MATCH_SCOPES else "full"
+
+
 def load_tripwires(db_path: Path = DB_PATH):
-    """Return list of (pattern_str, nudge_str, node_id, priority_str) from
-    active lessons with situation_pattern.
+    """Return list of (pattern_str, nudge_str, node_id, priority_str, match_scope_str)
+    from active lessons with situation_pattern. (alpha#3920 added the 5th element,
+    "command" or "full"; callers unpack the tail variadically.)
 
     #2753 epic WS2: node_id was added (3rd tuple element, minimal extension
     of the pre-existing (pattern, nudge) shape) so check_command's hits can
@@ -586,7 +604,7 @@ def load_tripwires(db_path: Path = DB_PATH):
         if not owner:
             conn.close()
         return [
-            (row[2], row[1], row[0], row[3] or "normal")
+            (row[2], row[1], row[0], row[3] or "normal", _coerce_match_scope(row[4] if len(row) > 4 else None))
             for row in rows if row[1] and row[2]
         ]
     except Exception as exc:
@@ -595,7 +613,7 @@ def load_tripwires(db_path: Path = DB_PATH):
         return []
 
 
-def check_command(match_target: str, tripwires) -> list:
+def check_command(match_target: str, tripwires, command_target: str | None = None) -> list:
     """Return list of {"nudge": str, "node_id": str, "pattern": str,
     "priority": str} dicts for every situation_pattern that matches
     match_target.
@@ -624,8 +642,13 @@ def check_command(match_target: str, tripwires) -> list:
     hits = []
     for pattern, nudge, node_id, *rest in tripwires:
         priority = rest[0] if rest else "normal"
+        # alpha#3920: 5th element = match_scope. A lesson runs on the command view only when the
+        # caller supplied one AND the lesson's scope is "command" (opt-in; a bare tuple gets "full");
+        # a caller that passes no command_target keeps today's behaviour for every lesson.
+        scope = rest[1] if len(rest) > 1 else DEFAULT_MATCH_SCOPE
+        target = command_target if (command_target is not None and scope == "command") else match_target
         try:
-            if re.search(pattern, match_target, re.IGNORECASE):
+            if re.search(pattern, target, re.IGNORECASE):
                 hits.append({
                     "nudge": nudge, "node_id": node_id, "pattern": pattern,
                     "priority": priority,
@@ -1476,6 +1499,140 @@ def _append_prevention_ledger(now: float, hits: list) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# alpha#3920 (part of #3911): the two views of a call
+# ---------------------------------------------------------------------------
+# A pattern written for a COMMAND fired on prose that only mentions the command (a heredoc
+# body, an MCP `body`/`claim` field). Each call now has a `full` view (today's target) and a
+# `command` view with that prose hidden; a lesson's `match_scope` picks which one its pattern runs
+# on. Safe direction: anything that cannot be parsed falls back to the full text (a missed strip is
+# noise, a wrong strip is blindness).
+
+# MCP arguments whose VALUES are prose. One constant, so adding a field is a one-line change.
+PROSE_FIELDS = frozenset({
+    "body", "claim", "quoted_text", "interpretation", "logical_chain", "recall_summary",
+    "description", "text", "message", "content",
+})
+
+_HEREDOC_PLACEHOLDER = "<<HEREDOC>>"
+_PROSE_PLACEHOLDER = "<<TEXT>>"
+# A heredoc fed to an interpreter or a shell is a script, not prose: its body RUNS, so the command
+# view must not hide it (a wrong strip is blindness).
+_EXEC_WORDS = (r"(?:sudo|env|exec|xargs|eval|source|bash|sh|zsh|dash|ksh|fish|ssh|node|deno|bun|"
+               r"perl|ruby|php|lua|osascript|python[0-9.]*|pypy[0-9.]*|ipython[0-9.]*|"
+               r"sqlite3|psql|mysql|mariadb|sqlcmd|duckdb|redis-cli|mongosh)(?![\w-])")
+_EXEC_BEFORE_RE = re.compile(r"(?:^|[\s;&|(`/])" + _EXEC_WORDS)
+# `cat <<EOF | bash`: the consumer comes AFTER the operator.
+_EXEC_AFTER_RE = re.compile(r"\|\s*(?:[\w./=-]+\s+)*?" + _EXEC_WORDS)
+_HEREDOC_OP_RE = re.compile(r"""<<(-?)[ \t]*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Za-z_][A-Za-z0-9_]*)"|([A-Za-z_][A-Za-z0-9_]*))""")
+
+
+def _heredoc_ops_on_line(line: str) -> list:
+    """[(strip_tabs, delimiter, start, end)] for each heredoc operator on one line, in order. Operators inside
+    single or double quotes are ignored, and `<<<` (a here-string) is not a heredoc."""
+    ops = []
+    quote = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if line.startswith("<<<", i):
+            i += 3
+            continue
+        if line.startswith("<<", i):
+            m = _HEREDOC_OP_RE.match(line, i)
+            if m:
+                ops.append((m.group(1) == "-", m.group(2) or m.group(3) or m.group(4), i, m.end()))
+                i = m.end()
+                continue
+        i += 1
+    return ops
+
+
+def strip_heredoc_bodies(command: str) -> str:
+    """The command with each heredoc BODY replaced by `<<HEREDOC>>` (alpha#3920). The operator line
+    and the terminator line stay, and so does everything after the terminator. If any heredoc has no
+    terminator the original text is returned unchanged."""
+    if "<<" not in command:
+        return command
+    lines = command.split("\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        pending = _heredoc_ops_on_line(line)
+        for n, (strip_tabs, delim, op_start, op_end) in enumerate(pending):
+            # The operator's own consumer: text between the previous operator and this one, or
+            # after this one up to the next (`cat <<A; bash <<B`, `cat <<EOF | bash`).
+            before = line[(pending[n - 1][3] if n else 0):op_start]
+            after = line[op_end:(pending[n + 1][2] if n + 1 < len(pending) else len(line))]
+            runs = bool(_EXEC_BEFORE_RE.search(before) or _EXEC_AFTER_RE.search(after))
+            start = i
+            while i < len(lines):
+                cand = lines[i].lstrip("\t") if strip_tabs else lines[i]
+                if cand == delim:
+                    break
+                i += 1
+            else:
+                return command  # unterminated: never hide what cannot be parsed
+            out.extend(lines[start:i] if runs else [_HEREDOC_PLACEHOLDER])
+            out.append(lines[i])  # the terminator line stays
+            i += 1
+    return "\n".join(out)
+
+
+def _redact_prose(value, key=None):
+    if isinstance(value, dict):
+        return {k: _redact_prose(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_prose(v, key) for v in value]
+    if key in PROSE_FIELDS and isinstance(value, str):
+        return _PROSE_PLACEHOLDER
+    if key == "payload_json" and isinstance(value, str):
+        # ENGRAM's own tools take their arguments as one JSON-encoded string.
+        try:
+            inner = json.loads(value)
+        except Exception:
+            return value
+        if isinstance(inner, (dict, list)):
+            return json.dumps(_redact_prose(inner), separators=(",", ":"), ensure_ascii=False)
+    return value
+
+
+def build_match_views(hook_input: dict) -> tuple:
+    """(full, command) match targets for one call. `full` is exactly build_match_target's result."""
+    full = build_match_target(hook_input)
+    if not full:
+        return ("", "")
+    tool_name = hook_input.get("tool_name", "")
+    ti = hook_input.get("tool_input") or hook_input.get("input") or {}
+    if tool_name == "Bash":
+        return (full, strip_heredoc_bodies(full))
+    if tool_name.startswith("mcp__"):
+        try:
+            args_str = json.dumps(_redact_prose(ti), separators=(",", ":"), ensure_ascii=False)
+        except Exception:
+            return (full, full)
+        return (full, f"{tool_name} {args_str}")
+    return (full, full)
+
+
 def build_match_target(hook_input: dict) -> str:
     """Build the string to match situation_pattern against, or "" to skip.
 
@@ -2098,7 +2255,7 @@ def _main_impl() -> None:
     # patches them); the crash handler below flushes any still pending.
     _ws4_rows: list = []
     try:
-        match_target = build_match_target(hook_input)
+        match_target, command_target = build_match_views(hook_input)  # alpha#3920
         if not match_target or not match_target.strip():
             sys.exit(0)
 
@@ -2162,7 +2319,7 @@ def _main_impl() -> None:
         _chain_in_parts = False   # the chain block is currently in `parts`
 
         tripwires = load_tripwires()
-        hits = check_command(match_target, tripwires) if tripwires else []
+        hits = check_command(match_target, tripwires, command_target=command_target) if tripwires else []
         # #3503: at most one visible loader-failure line per window; "" when
         # nothing failed (clean path: head/body below stay byte-identical).
         loader_notice, loader_notice_now = _pending_loader_notice()

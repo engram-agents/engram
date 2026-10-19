@@ -91,18 +91,22 @@ def _load_build_match_target():
         "lesson_tripwire_hook_for_audit", _HOOK_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.build_match_target
+    return mod.build_match_target, mod.build_match_views
 
 
-build_match_target = _load_build_match_target()
+build_match_target, build_match_views = _load_build_match_target()
 
 
 def collect_targets(transcript_glob=DEFAULT_TRANSCRIPT_GLOB,
-                     limit_files=DEFAULT_N_TRANSCRIPTS, session=""):
+                     limit_files=DEFAULT_N_TRANSCRIPTS, session="", pairs=False):
     """Return (current_targets, prior_targets, filenames).
 
     Provenance is tracked per target so a LIVE verdict resting only on the
     current session can be distinguished from one with independent support.
+
+    pairs=True (alpha#3920): each target is a (full, command) tuple of the
+    hook's two views of the call instead of the full string alone; de-duplication
+    and the introspection filter still key on the full string.
     """
     files = sorted(glob.glob(transcript_glob, recursive=True),
                    key=os.path.getmtime, reverse=True)[:limit_files]
@@ -151,7 +155,9 @@ def collect_targets(transcript_glob=DEFAULT_TRANSCRIPT_GLOB,
                     if key in seen:
                         continue
                     seen.add(key)
-                    bucket.append(t)
+                    bucket.append(
+                        (t, build_match_views({"tool_name": name, "input": ti})[1])
+                        if pairs else t)
     return cur, prior, [os.path.basename(f) for f in files]
 
 
@@ -238,6 +244,60 @@ def run_audit(db_path=DEFAULT_DB, transcript_glob=DEFAULT_TRANSCRIPT_GLOB,
     return 0
 
 
+def run_view_comparison(db_path=DEFAULT_DB, transcript_glob=DEFAULT_TRANSCRIPT_GLOB,
+                        limit_files=DEFAULT_N_TRANSCRIPTS, session="", out=None, err=None):
+    """alpha#3920 migration aid: for each armed lesson, how many real targets does its pattern
+    match on the FULL view vs the COMMAND view of the call, and which full-view matches would
+    be lost under `command`. Every lesson defaults to `full`; a lesson whose lost matches are all
+    prose that only mentions its command is a candidate to opt into match_scope "command"
+    (engram_update_lesson); one whose lost matches are legitimate (it depends on heredoc or
+    prose-field text) must stay `full`. Reports; never
+    writes. Exit 0, or 2 on an empty inventory."""
+    if out is None:
+        out = sys.stdout
+    if err is None:
+        err = sys.stderr
+    cur, prior, srcs = collect_targets(transcript_glob=transcript_glob, limit_files=limit_files,
+                                       session=session, pairs=True)
+    pairs = cur + prior
+    if not pairs:
+        print("no transcript-derived targets; refusing to report from an empty inventory", file=err)
+        return 2
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    rows = conn.execute("select id,claim,metadata from nodes "
+                        "where type='lesson' and is_current=1").fetchall()
+    rep = []
+    for nid, claim, md in rows:
+        try:
+            m = json.loads(md) if md else {}
+        except Exception:
+            m = {}
+        pat = m.get("situation_pattern") or ""
+        if not pat:
+            continue
+        try:
+            rx = re.compile(pat, re.I)
+        except re.error:
+            continue
+        scope = m.get("match_scope") if m.get("match_scope") in ("command", "full") else "full"
+        n_full = sum(1 for f, _c in pairs if rx.search(f))
+        n_cmd = sum(1 for _f, c in pairs if rx.search(c))
+        lost = [f for f, c in pairs if rx.search(f) and not rx.search(c)]
+        rep.append((nid, scope, n_full, n_cmd, lost, claim[:55]))
+    print(f"targets: {len(pairs)} ({len(cur)} current-session + {len(prior)} prior, "
+          f"{len(srcs)} transcripts)", file=out)
+    print(f"armed lessons: {len(rep)}   with matches lost under `command`: "
+          f"{sum(1 for r in rep if r[4])}\n", file=out)
+    for nid, scope, n_full, n_cmd, lost, cl in sorted(rep, key=lambda r: (-len(r[4]), r[0])):
+        flag = "REVIEW" if lost else "ok"
+        print(f"[{nid}] {flag:6} scope={scope:7} full={n_full} command={n_cmd} lost={len(lost)}", file=out)
+        print(f"           {cl}", file=out)
+        for t in lost[:3]:
+            ex = t.split(" ", 1)[0] if t.startswith("mcp__") else t.replace("\n", " ")[:70]
+            print(f"             lost e.g. {ex}", file=out)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -267,7 +327,17 @@ def main() -> int:
              "ENGRAM_AUDIT_SESSION env var if not passed; this flag wins if both "
              "are set).",
     )
+    parser.add_argument(
+        "--compare-views", action="store_true",
+        help="alpha#3920: instead of the coverage audit, compare each lesson's matches on the "
+             "hook's FULL view vs its COMMAND view (heredoc bodies / prose fields hidden) and "
+             "list the matches that would be lost, to decide which lessons may opt "
+             "into match_scope=command (all lost matches are prose). Reports only.",
+    )
     args = parser.parse_args()
+    if args.compare_views:
+        return run_view_comparison(db_path=args.db, transcript_glob=args.transcript_glob,
+                                   limit_files=args.transcripts, session=args.session)
     return run_audit(db_path=args.db, transcript_glob=args.transcript_glob,
                       limit_files=args.transcripts, session=args.session)
 

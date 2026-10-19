@@ -350,12 +350,12 @@ class TestSituationPatternStoredViaMcp(unittest.TestCase):
 
         # Also verify that load_tripwires returns this lesson
         tripwires = load_tripwires(db_path=db_path)
-        patterns_in_tripwires = [p for p, _nudge, _node_id, _priority in tripwires]
+        patterns_in_tripwires = [p for p, _nudge, _node_id, _priority, *_rest in tripwires]
         self.assertIn(pattern, patterns_in_tripwires, "Pattern must appear in load_tripwires output")
         # #2753 epic WS2: the 3rd tuple element is the firing node's own id
         # (the lesson_id minted above), so a caller can call
         # generalization_chain() on the actual hit.
-        node_ids_in_tripwires = [nid for _p, _nudge, nid, _priority in tripwires]
+        node_ids_in_tripwires = [nid for _p, _nudge, nid, _priority, *_rest in tripwires]
         self.assertIn(lesson_id, node_ids_in_tripwires, "load_tripwires must carry the lesson's own node id")
 
 

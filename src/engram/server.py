@@ -6111,7 +6111,7 @@ _UPDATE_LESSON_FIELDS = frozenset({
     name="engram_update_lesson",
     capability=(
         "In-place edit of situation_pattern, scaffolding_nudge, prevention_type, "
-        "tripwire_priority — claim/confidence stay supersede-only. Prose-shaped "
+        "tripwire_priority, match_scope — claim/confidence stay supersede-only. Prose-shaped "
         "patterns rejected unless overridden."
     ),
     annotations={
@@ -6132,9 +6132,10 @@ def engram_update_lesson(payload_json: str) -> str:
     a graph-mutation event, distinct from creating a new node.
 
     Mutable fields (#1826, widened 2026-08-03; #1944 widened for
-    prevention_type; #3270/#3112 widened for tripwire_priority):
-    situation_pattern, scaffolding_nudge, prevention_type, tripwire_priority
-    — mechanical retrieval/actionability metadata you can refine from real
+    prevention_type; #3270/#3112 widened for tripwire_priority; #3920 for
+    match_scope):
+    situation_pattern, scaffolding_nudge, prevention_type, tripwire_priority,
+    match_scope — mechanical retrieval/actionability metadata you can refine from real
     firing experience, never the lesson's epistemic content (claim,
     logical_chain, confidence, reasoning_type stay supersede-only).
 
@@ -6159,13 +6160,22 @@ def engram_update_lesson(payload_json: str) -> str:
     tripwire hook's cap (see engram_add_lesson's docstring for the full
     mechanism). No earn-it gate in either direction, unlike prevention_type.
 
+    match_scope must be one of "command", "full" (#3920, part of #3911): the
+    view of the tool call the PreToolUse tripwire hook matches this lesson's
+    situation_pattern against. "command" hides heredoc bodies and MCP prose-field values, so a
+    pattern written for a command stops firing on prose that only mentions
+    it; "full" (also what a lesson with no match_scope gets) is the raw call, and is
+    right for lessons that depend on body text (a node-id leak check on a posted
+    message, a heredoc-composition check). Move a lesson to "command" only after
+    tools/lesson-pattern-audit.py --compare-views shows its lost matches are all prose.
+
     Args:
         payload_json: JSON object (as a string) with these fields:
             node_id (str, required): Lesson node ID (ls_NNNN). Must be
                 type='lesson' and is_current=1.
             updates (dict, required): Map of field → new_value. Mutable
                 fields: situation_pattern, scaffolding_nudge, prevention_type,
-                tripwire_priority. Attempting to update any other field
+                tripwire_priority, match_scope. Attempting to update any other field
                 returns an error.
             reason (str, optional): Human-readable explanation for the change.
             bypass_prose_check (bool, optional): Default False. Same

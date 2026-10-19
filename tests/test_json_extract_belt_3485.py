@@ -65,7 +65,8 @@ GOOD_META = {
     "scaffolding_nudge": "do not force push",
     "tripwire_priority": "high",
 }
-GOOD_TRIPWIRE = ("git push --force", "do not force push", "ls_good", "high")
+# alpha#3920: load_tripwires rows carry a 5th element, the lesson's match_scope ("full" when absent).
+GOOD_TRIPWIRE = ("git push --force", "do not force push", "ls_good", "high", "full")
 GOOD_PREVENTION = {
     "id": "ls_good",
     "pattern": "git push --force",
@@ -422,7 +423,7 @@ def _owner_read(owner, sql):
 @requires_linux_owner
 @pytest.mark.parametrize("site,expected", [
     ("engram-lesson-tripwire-hook.py:load_tripwires",
-     [["ls_good", "do not force push", "git push --force", "high"]]),
+     [["ls_good", "do not force push", "git push --force", "high", None]]),  # 5th column: match_scope (#3920), NULL here
     ("engram-lesson-tripwire-hook.py:load_prevention_lessons",
      [["ls_good", "git push --force", "shadow", "do not force push"]]),
 ])
