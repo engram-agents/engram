@@ -281,9 +281,10 @@
     {
       "path_prefix_or_glob": "hooks/claude/engram-loop-arm-stop-hook.py",
       "test_globs": [
-        "tests/test_loop_arm_stop_hook.py"
+        "tests/test_loop_arm_stop_hook.py",
+        "tests/test_quiet_wake_counter_3919.py"
       ],
-      "note": "2026-07-31-loop-arm-nudge-SPEC.md PR-B: new Stop hook, tested via direct subprocess invocation (same _run_hook pattern as test_stop_hook_prose_gate.py), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping."
+      "note": "2026-07-31-loop-arm-nudge-SPEC.md PR-B: new Stop hook, tested via direct subprocess invocation (same _run_hook pattern as test_stop_hook_prose_gate.py), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping. alpha #3919 M2: test_quiet_wake_counter_3919.py added -- the quiet-wake counter (classification, Bash read-only allowlist, counter/nudge interaction); the hook is loaded via importlib (hyphenated name) and run as a subprocess."
     },
     {
       "path_prefix_or_glob": "hooks/claude/clear-stale-engram-daemon.sh",
