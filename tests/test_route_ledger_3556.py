@@ -174,7 +174,7 @@ def _make_home(*, started=STARTED, count=_ABSENT, transcript=_ABSENT, focused=()
 
 
 def _probe(tmp_path) -> Path:
-    d = tmp_path / "home" / ".engram" / "probe" / "mods-recall" / SESSION
+    d = tmp_path / "engram" / "probe" / "mods-recall" / SESSION
     d.mkdir(parents=True, exist_ok=True)
     return d
 

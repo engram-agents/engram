@@ -166,25 +166,50 @@ fairy_report.findings[i].node_snapshot = {
 }
 ```
 
-**Before each MCP write**, do the following two-step safety check:
+**Before each MCP write**, do the following two-step safety check. **Never open
+`knowledge.db` yourself** — no database connection of your own, and no
+function that needs one. Read the current state through the CLI, which prints one JSON object
+(or `null`) on stdout:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/dream_master_batch.py" safety-row <target_id>
+```
 
 ```python
-current = fetch_safety_row(conn, target_id)   # cheap targeted DB read
+current = json.loads(cli_stdout)   # the CLI's one JSON line: a dict, or None for `null`
 check_snapshot_divergence(target_id, snapshot, current)  # raises if diverged
 # … proceed with MCP write only if no exception raised …
 ```
 
-`fetch_safety_row` (in `tools/dream_master_batch.py`) performs a single
-three-column SELECT — `is_current`, `status`, `superseded_by` — against
-`knowledge.db`.  This is the only DB read needed for the safety check; it is
-NOT a full `engram_inspect` and does not restore the ~50-turn cost the snapshot
-architecture was designed to eliminate.
+The CLI performs a single three-column SELECT — `is_current`, `status`,
+`superseded_by` — through the engramd owner (or, with the owner flag off,
+a read-only open that the CLI makes, never you).  This is the only DB read
+needed for the safety check; it is NOT a full `engram_inspect` and does not
+restore the ~50-turn cost the snapshot architecture was designed to eliminate.
+(`fetch_safety_row` in `tools/dream_master_batch.py` is the library function
+the CLI wraps; you do not call it.)
 
 If `check_snapshot_divergence` raises `SnapshotDivergence`, **skip the action**
 and log it in the dream record under a "Snapshot-diverged findings" sub-section.
 Do NOT silently execute on stale state.
 
-**Missing-node case** — when `fetch_safety_row` returns `None` (the node is not
+**A failed read is not a missing node.**  If the CLI exits non-zero (stdout is
+empty and stderr names an error class), the read FAILED: do not pass `None` to
+`check_snapshot_divergence`, do not retry by opening the store yourself.  Skip the
+action and log the node ID and the stderr line in the dream record under its
+own "Safety reads failed" section (a failed read means the state is UNKNOWN; a
+divergence means it CHANGED, so the two are never filed together), and continue.
+
+**Stop condition — Stop loud, never silent.**  After 3 consecutive failed safety
+reads, STOP the execution pass: with the owner down every read fails, and
+skipping the night's writes one finding at a time is the same failure told
+slowly.  Write the remaining node IDs and the last stderr line under "Safety
+reads failed", set its "Execution pass stopped" line to `yes`, and do not
+describe the execution pass as clean or complete.  A successful safety read
+(a row or `null`) resets the count to zero.
+After a stop, the repair-pass reads (steps 5 and 6: the `coverage` and `null-embeddings` CLI calls) still run once each; they have their own failure rules and do not count toward the 3.  You may then finish the night normally (advance the turn only per the Completion criteria below).
+
+**Missing-node case** — when the CLI prints `null` (exit 0: the node is not
 found in the DB, e.g. deleted or never committed), pass `None` directly to
 `check_snapshot_divergence`.  The function treats a missing node as divergent
 and raises `SnapshotDivergence` with `field="existence"`.  The caller's existing
@@ -197,7 +222,7 @@ Do NOT special-case the `None` path at the call site — let the guard handle it
   the fairy gathered while doing its analysis.  Use it to decide what action to
   take (resolve, supersede, retract, derive).  You do not re-inspect to second-
   guess the fairy's analysis.
-- **Fetch current state for the SAFETY CHECK only** — `fetch_safety_row` checks
+- **Fetch current state for the SAFETY CHECK only** — the `safety-row` CLI checks
   that the substrate is still in the state that makes the decision valid.  If
   the node was superseded or resolved after fairy dispatch, the decision is now
   wrong — skip + log.
@@ -378,7 +403,7 @@ Bias-toward-action on:
 - **Conjectures with movement** — promote (compose derivation via `engram_derive`, then wire via `engram_resolve(target_id=cj_XXXX, resolving_node_id=dv_NEW, prediction_outcome="supported")`) when evidence has accumulated; refute (compose derivation via `engram_derive`, then wire via `engram_resolve(target_id=cj_XXXX, resolving_node_id=dv_NEW, prediction_outcome="refuted")`) when counter-evidence is solid. Do NOT supersede — cross-type promotion (conjecture → derivation) is rejected.
 - **Lesson candidates** — when three or more incidents share a structural pattern and no lesson names it, file the lesson via `engram_add_lesson`. **This is a load-bearing addition** — lessons fire as tripwires across all future sessions. When you file one, emphasize it in the dream record's Lessons-filed section so the user reads it carefully in the morning review.
 - **Contradictions you uncover** — when consolidating reveals two existing nodes in genuine conflict (no contradiction node yet exists between them), file the contradiction via `engram_contradict`. Distinguish from `engram_resolve`, which closes an existing contradiction node — you may need both in sequence: `engram_contradict` to name the conflict, then `engram_derive` to compose the synthesis derivation, then `engram_resolve(target_id=ct_NEW, resolving_node_id=dv_NEW)` to wire the close.
-- **Category 7 missing-principle-edge suggestions** — for each suggestion from the Category 7 fairy report: call `check_snapshot_divergence` on the source node, then verify the edge still doesn't exist via `fetch_safety_row`, then wire accepted suggestions via `engram_add_edge(source_id=<src>, target_id=<dst>, relation=<instantiates|serves>)` — the tool takes exactly those three fields (no note parameter); carry the evidence snippet into the dream record next to the wired-edge line instead. Gate each one: review the similarity score and evidence snippet before committing. Skip any suggestion whose source node has diverged or whose edge now already exists. Log wired and skipped counts in the dream record.
+- **Category 7 missing-principle-edge suggestions** — for each suggestion from the Category 7 fairy report: call `check_snapshot_divergence` on the source node, then check the edge is still absent with `engram_inspect(<src>, view="edges", dream_mode=True)` (the source node's adjacency lists its edges; `safety-row` reads only the node's state, never edges), then wire accepted suggestions via `engram_add_edge(source_id=<src>, target_id=<dst>, relation=<instantiates|serves>)` — the tool takes exactly those three fields (no note parameter); carry the evidence snippet into the dream record next to the wired-edge line instead. Gate each one: review the similarity score and evidence snippet before committing. Skip any suggestion whose source node has diverged or whose edge now already exists (if you wire without the inspect, `engram_add_edge` is idempotent and answers `no_op_already_exists` for an existing edge: count that as skipped, not wired). Log wired and skipped counts in the dream record.
 - **Category 8 stale-task-ref closures** — for each suggestion from the Category 8 fairy report: call `check_snapshot_divergence` on the task node, then re-verify the external reference state via a fresh `gh pr view "$n" --repo "$repo" --json state` or `gh issue view "$n" --repo "$repo" --json state` call, with `$repo`/`$n` split from the suggestion's `owner/repo#N` reference (the fairy's snapshot was taken earlier). A bare `#N` (no repo) is skipped and logged, never closed and never resolved against the cwd repo. If `pr MERGED` or `issue CLOSED` confirmed (an unmerged `pr CLOSED` is skipped and logged, never closed): call `engram_update_task(task_id=<tk_id>, new_status='done', note='externally resolved: owner/repo#N <state> confirmed <ISO date>')`. Note: `engram_resolve` is NOT applicable to task nodes (`task` is not in `RESOLVABLE_TYPES`). If the fresh check returns OPEN or UNKNOWN: skip and log as "stale-but-still-open: <tk_id> owner/repo#N" in the dream record.
 - **Category 11 support-lost recommendations** — adjudicated per the **engram-support-lost** skill (load it before acting on the first Category 11 finding of the night). For each suggestion: `check_snapshot_divergence` on the target cornerstone/lesson, then rewire via `engram_register_exemplar` when the fairy's candidate exemplars hold up, leave the flag in place when the pattern is honestly still unanchored, or retract via the `engram-revise` classification discipline when the pattern no longer applies. Same agency disposition as the cascade sweep — resolve by default, leave open when the evidence doesn't settle it, escalate only for the rare goal/axiom-tension or need-human-input shapes.
 - **Category 12 generalization candidates** — you are the adjudicator for `generalizes`, and there is **no bulk path** by design. Wire accepted candidates **one at a time** via `engram_add_edge(source, 'generalizes', target)`, which routes through the endpoint whitelist and the write-time cycle guard. Four rules: **(1) Direction is the TYPE PAIR, never the relation that nominated it** — the generality order (`axiom, goal > cornerstone > lesson`) is read off the whitelist, and the same source relation yields opposite directions for different type pairs, so never hand-assemble a direction you were not given. **(2) The right question is "is the general one genuinely the more general FORM of the specific one?"** — not "are these related?" `cites` already covers related, and a `generalizes` edge that only means related is worse than no edge. **(3) Rejecting is a normal outcome and needs no justification** — wrong abstraction is worse than none. **(4) Keyword-overlap nominations are WEAK and usually siblings** under a parent that has not been minted; expect to reject most of them, and treat a run where you reject nearly all keyword nominations as the category working, not failing. Where the fairy marked a pair `AMBIGUOUS` (same type), the direction is yours to choose — and choosing neither is allowed. A candidate whose honest answer is "the intermediate principle does not exist yet" is an **authoring** item, not an edge: say so in the dream record rather than forcing a rung.
@@ -461,12 +486,12 @@ Iterate metric bindings in **declaration order** — the canonical order is `[m.
 
 5. **Admitted, available, `repair == "tool:batch-summary-fairy"`** (`recall_summary_coverage`, `recall_keywords_coverage`) — **observational only, dispatches nothing.**
    - `findings_count` = the cohort size (K, from "Recall-summary cohort" below — the parent's Step 7.5 log); `repairs_dispatched` = the applied count (A) from that same log.
-   - THEN, additionally, run a FRESH, READ-ONLY re-check now that the cohort pipeline's results are known — this is a call to the EXISTING signal function itself, no new SQL: `health.metrics.recall_summary_coverage(conn)` / `recall_keywords_coverage(conn)` (import from `health.metrics`, the same module `health/engine.py`'s own scoring path calls) — each already computes exactly "what fraction of claim-bearing nodes currently HAS a summary/keywords" as its raw signal [engram-alpha#2518, 2026-09-04: literal coverage, not the old lacking-fraction complement — see health/metrics.py's own updated docstrings].
+   - THEN, additionally, run a FRESH, READ-ONLY re-check now that the cohort pipeline's results are known — through the CLI, never by opening `knowledge.db` yourself: `python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/dream_master_batch.py" coverage recall_summary` / `... coverage recall_keywords`. Each prints ONE JSON line: the same fraction `health.metrics.recall_summary_coverage` / `recall_keywords_coverage` compute as their raw signal ("what fraction of claim-bearing nodes currently HAS a summary/keywords"), or the string `"UNAVAILABLE"` when no claim-bearing node is current. A non-zero exit with empty stdout means the read FAILED: it is not a coverage of 0 and not 1.0 — record the stderr line in the dream record next to this metric and treat the re-check as not done tonight (leave `status` as the cohort counts say). [engram-alpha#2518, 2026-09-04: literal coverage, not the old lacking-fraction complement — see health/metrics.py's own updated docstrings].
    - If that fresh rate is materially BELOW 1.0 (the cohort pipeline did NOT fully close the gap): record `status: "carried"`, and note the fresh residual rate in the dream record's own prose next to this metric (do not overwrite `findings_count`/`repairs_dispatched` with it — those stay the cohort's own Step 7.5 counts). This is a **scope-mismatch signal between two mechanisms** (the cohort pipeline vs. this metric's own detector), not a second repair pipeline — log it plainly as worth a follow-up issue if it recurs across multiple cycles. Do NOT attempt to fix the mismatch in this pass. Otherwise (the fresh rate is ~1.0 — the cohort pipeline closed the gap): `status: "done"`. `reason: null` in either case — JUDGMENT CALL (round 2): the scope-mismatch note stays in the dream record's own prose next to this metric, not duplicated into the JSON `reason` field, which stays reserved for the two "unavailable" causes in steps 1-2 above (see `health/engine.py`'s `REPAIR_RECORD_METRIC_FIELDS` comment for the same call made schema-side). [engram-alpha#2518, 2026-09-04: polarity flipped to match the literal-coverage signal change — see health/metrics.py's own updated docstrings]
    - **[engram-alpha#2981, 2026-09-17] EVERY night, regardless of which branch above fired, restate the backfill's matched-vs-taken numbers in this metric's dream-record prose line**: `backfill: <L> taken / <BACKFILL_TOTAL_MATCHED> matched (cap: 60)` — both numbers, verbatim from the parent's COHORT METADATA (above), not re-derived. This was previously stated only incidentally, when a human happened to notice the residual coverage and go look; making it a required line every night is what actually surfaces a binding cap without anyone having to read a dream record closely enough to ask. If `<BACKFILL_TOTAL_MATCHED>` is materially larger than `<L>` (i.e. the 60 cap is actually binding, not just present) on **three or more consecutive cycles**, say so explicitly and name it as a candidate for raising the cap or making it adaptive — the same "signal to raise it or file an issue" rule `engram-sleep/SKILL.md`'s cohort-selection section already states, now with the mechanical trigger to notice it by. [Reviewer-fairy suggestion, engram-alpha#2985] You wake cold each cycle with no memory of prior nights — check the last 2 nights' dream records in `~/.engram/history/dream/` (the directory this same spec's own "Output contract — dream record" section, below, already writes to): list the directory and take the 2 most recent by mtime, not by constructing `YYYY-MM-DD` from today's date — records have real gaps — a night with no sleep cycle leaves no record — so "today minus 1, minus 2" silently misses nights even though the filename correctly carries the NYC-local date the record was WRITTEN (not every install may have adopted that convention either) — for the same `backfill: <L> taken / <M> matched` line, materially binding on each. Three consecutive materially-binding nights (tonight plus those two) is the trigger; without this instruction "three or more consecutive cycles" is a vigilance ask with no mechanical anchor — exactly the shape this repo's own CLAUDE.md (Conclusion warrant discipline) names as easy to walk past.
 
 6. **Admitted, available, `repair == "tool:embedding-backfill"`** (`embedding_coverage`) — the ONE genuinely new scan + the ONE genuinely new direct action in this whole pass.
-   - Run the new read-only scanner, `health.engine._count_null_embeddings(conn, population)` (`population` = this metric's own declared `denominator_population`, today always `"claim_bearing_nodes"`) — a plain count of current claim-bearing nodes with a NULL `embedding` column. This is `findings_count`.
+   - Run the read-only scanner through the CLI, never by opening `knowledge.db` yourself: `python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/dream_master_batch.py" null-embeddings --population claim_bearing_nodes` (`population` = this metric's own declared `denominator_population`, today always `"claim_bearing_nodes"`) — it prints one JSON integer: the count of current claim-bearing nodes with a NULL `embedding` column. This is `findings_count`. A non-zero exit with empty stdout means the scan FAILED: that is not `findings_count: 0` — do not run the repair tool and do not report `"done"`; record `status: "carried"` with the stderr line in the dream record's prose, as in "Stop loud, never silent" below.
    - If `findings_count > 0`: run `python3 ~/.engram/marketplace/plugins/engram/tools/engram-regenerate-embeddings.py` (checked against its real CLI: an optional `--engram-home PATH`, defaulting to `$ENGRAM_HOME` or `~/.engram`; it backfills EVERY `is_current=1` node with a NULL embedding across the WHOLE graph, not scoped to claim-bearing types only — a strict superset of this metric's own population, which is fine: it is ONE tool invocation covering all of tonight's findings, never per-node) as a SINGLE Bash call. Record `repairs_dispatched: 1` (the one tool invocation, not a per-node count) once it runs. If `findings_count == 0`: nothing to do — do NOT run the tool at all; record `repairs_dispatched: 0`.
    - `status`: `"done"` if the tool call ran successfully (exit 0) **OR** if `findings_count == 0` — [round 3, engram-alpha#2519, Kepler's ruling, "so `skipped` means exactly one thing"] the scan genuinely examined this metric and found it clean; the repair tool wasn't dispatched, but the metric WAS fully examined tonight, which is a `"done"` outcome, not a `"skipped"` one. This REPLACES round 2's wording, which used `status: "skipped"` for this same zero-findings case — that reused the same status value the whole-pass skip-night case (the precondition section above) already uses to mean "not examined tonight at all," so one status value carried two different meanings distinguishable only by `reason`. `status: "skipped"` at the per-metric level is now reserved to mean ONLY "not examined tonight" (the whole-pass skip-night case above is the only case that currently produces it). `"carried"` if the tool call itself failed (see "Stop loud, never silent" immediately below). `reason: null` in all cases — JUDGMENT CALL (round 2), same as step 5: a `"carried"` outcome here logs its verbatim error text in the dream record's own prose (see "Stop loud, never silent" below), not in the JSON `reason` field.
    - **The tool's own stderr prints a server-restart suggestion (`pkill -f 'python.*server.py'`) as its last line — DO NOT ACT ON THIS.** Restarting the MCP server is outside this pass's scope, and `pkill -f` is banned outright regardless ("You do not kill processes you did not start", at the top of this file). Log the backfill counts from the tool's own stderr; leave the server process alone.
@@ -541,11 +566,12 @@ Do NOT call `engram_set_recall_summaries`. Do NOT attempt to re-read `final_payl
 You may call `engram_advance_turn` ONLY when ALL of these are true:
 
 - [ ] All dispatched fairy reports received (or marked timed-out by the parent) — this cycle's drawn set, per the lottery-draw provenance in your spawn prompt, not a fixed count
-- [ ] All fairy outputs validated and acted on
+- [ ] All fairy outputs validated and acted on (for a night that stopped on failed safety reads, the unprocessed nodes are recorded under "Safety reads failed" instead)
 - [ ] Tonight's lottery-draw provenance (drawn/weights-before/weights-after) recorded in the dream record (#1901's "logged draws" requirement)
 - [ ] Recall-summary results from parent's Step 7.5 recorded in dream record (applied / failures counts from cohort metadata)
 - [ ] All `engram_reflect` agenda items either acted on or flagged with reasoning
 - [ ] Cascade sweep (mode B) run to a **clear frontier**, or its non-clear end state recorded with node IDs and the reason (pass cap / loud stop / dry run). A sweep that stopped on `invariant_1_violation_suspected`, a `convergence_warning`, or a verb error is NOT complete — record it and flag it; never let it read as clean
+- [ ] The execution pass is completed, OR was stopped after 3 consecutive failed safety reads and is recorded under "Safety reads failed" (a stopped pass is a finished record, not an unfinished night)
 - [ ] Repair-pass provenance record written — best-effort, never blocks `advance_turn`, but the record itself (a normal `status: "ran"` night, or a `status: "skipped"` night with its reason — round 2, engram-alpha#2519: a skip night writes the record too, it no longer just logs the reason) must exist, never silence
 - [ ] Truly-unfixable cases written to the dream record with specific node IDs + reason
 - [ ] Dream-review feeling-nudge handled (filed or null-reported, honestly)
@@ -626,6 +652,10 @@ Format:
 - Remaining pending at end: N' (node IDs) — **and if N' > 0, why**: cap reached / loud stop / dry run
 - Loud stops: `invariant_1_violation_suspected` · `convergence_warning` · verb errors (verbatim) — or "none"
 - **Dry run this cycle?** yes/no. A dry run records packets and resolves nothing; it is not a clean sweep.
+
+## Safety reads failed
+- Failed reads: F (node ID + the stderr line, one each) — or "none". A failed read means the state is unknown; it is never filed as a divergence.
+- Execution pass stopped: yes/no (yes = 3 consecutive failed safety reads; then list the node IDs left unprocessed — the pass is not clean or complete)
 
 ## Resolutions
 - qu_XXXX → dv_YYYY (reasoning_type, conf): one-line claim

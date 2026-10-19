@@ -1,13 +1,13 @@
 # engram-compaction (part of #3640)
 
-Agent-decided compaction at the nap boundary. Default OFF.
+Agent-decided compaction at the nap boundary. Default ON once the mod is installed (Lei, 2026-10-18, after the one-day trial on #3640); `enabled: false` turns it off.
 
 The last step of the nap skill runs `tools/compact-request.py`, which leaves three files under
 `$ENGRAM_HOME/compact/` (`context.md`, `context.sha256`, and `request.json` last). With this mod
 switched on, the end of the next answered turn consumes the request once and compacts, and the
 compaction carries the assembled context (focus list, history arc, warm-briefing arc, loop marker fields).
 
-- `userConfig.enabled` (default false): false registers nothing.
+- `userConfig.enabled` (default true): false registers nothing.
 - The mods API has no file delete, so a consumed request (and the in-flight token) is overwritten with
   `{"consumed": true, "request_id": ...}`; a tombstone reads as absent.
 - The context message goes BESIDE the engine's own messages by default; `COMPACT_SHAPE` in

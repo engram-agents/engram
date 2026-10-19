@@ -153,30 +153,27 @@ def _indexer_loop(interval_s: int, shutdown_event: threading.Event) -> None:
         shutdown_event.wait(timeout=1.0)
 
 
+_HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOKS_DIR not in sys.path:
+    sys.path.insert(0, _HOOKS_DIR)
+from _hooklib import engram_home_or_exit  # noqa: E402
+
+
 def _resolve_engram_home() -> str:
     """Per-install data dir: knowledge.db, sockets, briefing, history.
 
-    Always returns an ABSOLUTE path (gh#2695): a relative ENGRAM_HOME would
-    make this process bind its AF_UNIX socket with a relative path string,
-    so /proc/net/unix records the bind exactly as passed to bind() --
-    relative text. start-engram-daemon.sh's unit-2 ownership guard
-    (#2652 phase-0) always compares against its own absolute $SOCKET_PATH
-    (built from whatever ENGRAM_HOME the HOOK resolved, which may differ in
-    absolute-vs-relative form and cwd from this process), so a relative
-    bind means the guard's path-text match finds zero rows, the guard
-    concludes "no live holder", and fails OPEN -- allowing exactly the
-    delete it exists to prevent. abspath() (not realpath()) is used
-    deliberately: it makes the path absolute relative to cwd without
-    resolving symlinks, which matches the existing expanduser-only
-    behavior for the already-absolute common case (an intermediate
-    symlinked ENGRAM_HOME component would keep resolving the same way it
-    always has -- realpath would be a second, unrelated behavior change
-    bundled into this fix).
+    Always an ABSOLUTE path, or this process exits: a RELATIVE ENGRAM_HOME is
+    REFUSED (alpha #3863 6b; engram_home_or_exit() prints one stderr line and
+    exits 0 before anything binds). Why it matters (gh#2695): a relative home
+    would make this process bind its AF_UNIX socket with a relative path
+    string, so /proc/net/unix records relative text, while
+    start-engram-daemon.sh's unit-2 ownership guard (#2652 phase-0) compares an
+    absolute $SOCKET_PATH, finds zero rows, concludes "no live holder" and
+    fails OPEN, allowing the delete it exists to prevent. Refusing the value
+    makes that structurally impossible; tests/test_resolve_engram_home_abspath.py
+    pins both the refusal and the pre-fix control that reproduces the bug.
     """
-    return os.path.abspath(
-        os.environ.get("ENGRAM_HOME")
-        or os.path.expanduser("~/.engram")
-    )
+    return str(engram_home_or_exit())
 
 
 ENGRAM_HOME = _resolve_engram_home()

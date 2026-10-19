@@ -183,7 +183,7 @@ def test_hook_selector_defaults_to_user_identity_and_passes_stop_through(tool, m
     assert seen == [("installed", "user-identity"), ("source", "user-identity"),
                     ("installed", "stop"), ("source", "stop")]
     with pytest.raises(SystemExit) as exc:
-        tool.main(["--hook", "surface"])
+        tool.main(["--hook", "nonesuch"])  # (was "surface" until #3821 made that a real arm)
     assert exc.value.code == 2
 
 
@@ -796,7 +796,7 @@ def test_the_table_for_the_tripwire_arm_names_the_u8_quantities_and_keeps_the_ca
 
 
 def test_home_and_streams_are_restored_after_a_tripwire_run(tool, tripwire_runs):
-    """The arm points HOME at a scratch dir for the fire (route_probe_dir uses Path.home());
+    """The arm points HOME at a scratch dir for the fire (HOME is what the hook process sees; the probe dir itself sits under the scratch ENGRAM_HOME);
     the process's HOME and streams come back. Mutation: leave HOME or a stream proxy
     behind -> red."""
     assert os.environ.get("HOME") not in (None, "") and "a6-" not in os.environ["HOME"]
@@ -908,7 +908,7 @@ def test_an_exclusion_that_cannot_engage_is_an_error_not_a_clean_zero(tool, tmp_
     fail-open and drops nothing, so `opens_flag_on` would read 0 for the wrong reason. With
     exclusion ON the arm must refuse such a run loudly. Mutation: drop the engagement check
     -> measure() returns a clean-looking result -> red."""
-    needle = "return Path.home().joinpath(*ROUTE_PROBE_SUBPATH)"
+    needle = 'return engram_home() / "probe" / "mods-recall"'
 
     def break_probe(src):
         assert src.count(needle) == 1
@@ -997,3 +997,609 @@ def test_opens_flag_on_missing_is_a_violation(tool):
 
 def test_opens_flag_on_int_zero_is_clean(tool):
     assert tool.u8_contract_violations(_clear_result(opens_flag_on=0)) == []
+
+
+# =====================================================================================================
+# --hook surface (A6 arm for the surface hook's owner reads, #3821 contract item 4, part of #2652)
+#
+# Written BEFORE the arm (contract-first). The contract, from the #3821 spec:
+#   * ONE full fire of the surface hook's main() per sample, flag OFF vs flag ON
+#     (engramd.surface_reads_via_owner, named by ONE constant), the recall daemon (`query_daemon`)
+#     stubbed IDENTICALLY on both paths, installed layout, N >= 300;
+#   * a hook that lacks the flag is a clear named error (ArmBlind -> exit 4), never a crash or a number;
+#   * BOTH a synthetic store and a REAL-STORE COPY are reported; the real-store cell on the INSTALLED layout is
+#     THE GATE CELL and the verdict line says so; a synthetic-only result is never a pass (exit 3);
+#   * the real store is only ever COPIED (never opened for write, never measured in place);
+#   * contended and cold arms are reported as owed measurements; any arm the owner loses is a finding;
+#   * exit codes and result shape as the tripwire arm: 3 = contract violation, 4 = blind arm, 2 = bad input.
+# Every test docstring names the mutation it must turn red under.
+# =====================================================================================================
+
+import hashlib  # noqa: E402
+import json  # noqa: E402
+import subprocess  # noqa: E402
+import textwrap  # noqa: E402
+
+MINI_SURFACE_SRC = textwrap.dedent('''
+    import json, os, sqlite3, sys
+    ENGRAM_HOME = os.environ["ENGRAM_HOME"]
+    KNOWLEDGE_DB_PATH = os.path.join(ENGRAM_HOME, "knowledge.db")
+    CONFIG_PATH = os.path.join(ENGRAM_HOME, "config.json")
+    COUNTER_PATH = os.path.join(ENGRAM_HOME, "prompt-counter.json")
+    def _owner_reads_enabled():
+        try:
+            with open(CONFIG_PATH) as f:
+                return json.load(f).get("engramd", {}).get("surface_reads_via_owner") is True
+        except Exception:
+            return False
+    def query_daemon(prompt, top_k=10, embed_query=None):
+        raise AssertionError("the real recall daemon was reached: the arm did not stub it")
+    def _advance_person_moment_cursor():
+        c = sqlite3.connect(KNOWLEDGE_DB_PATH); c.execute("SELECT 1"); c.close()
+    def _read_nodes():
+        if _owner_reads_enabled():
+            return 1
+        c = sqlite3.connect(KNOWLEDGE_DB_PATH)
+        try:
+            return c.execute("SELECT count(*) FROM nodes").fetchone()[0]
+        finally:
+            c.close()
+    def main():
+        hook_input = json.load(sys.stdin)
+        n = 0
+        try:
+            with open(COUNTER_PATH) as f:
+                n = json.load(f)["n"]
+        except Exception:
+            pass
+        with open(COUNTER_PATH, "w") as f:
+            json.dump({"n": n + 1}, f)
+        _read_nodes()
+        _advance_person_moment_cursor()
+        res = query_daemon(hook_input["prompt"])
+        text = "[ENGRAM Recall: %d nodes match your query]\\n" % res["match_count"]
+        text += "\\n".join(c["recall_summary"] for c in res["top_claims"]) + "\\nstate n=%d" % n
+        print(json.dumps({"hookSpecificOutput": {"additionalContext": text}}))
+        sys.exit(0)
+''')
+
+
+def _mini_surface(tmp_path, transform=None, name="engram-surface-hook.py"):
+    src = MINI_SURFACE_SRC
+    if transform is not None:
+        out = transform(src)
+        assert out != src
+        src = out
+    path = tmp_path / name
+    path.write_text(src)
+    return path
+
+
+def _no_flag(src):
+    """A hook as it is on a base WITHOUT #3821's flag: no _owner_reads_enabled, no flag key."""
+    return (src.replace("def _owner_reads_enabled():", "def _something_else():")
+            .replace("surface_reads_via_owner", "other_thing"))
+
+
+def _owner_path_still_reads(src):
+    """The plausible-wrong hook: the flag-ON path still opens the store from `_read_nodes` (an un-migrated read)."""
+    needle = "    if _owner_reads_enabled():\n        return 1\n"
+    assert src.count(needle) == 1
+    return src.replace(needle, "")
+
+
+def _surface_measure(tool, hook, **over):
+    kw = dict(n=20, nodes=300, warmup=3, hook="surface", surface_hook_path=hook)
+    kw.update(over)
+    return tool.measure(**kw)
+
+
+@pytest.fixture()
+def surface_run(tool, tmp_path, monkeypatch):
+    _fake_launch(tool, monkeypatch)
+    return _surface_measure(tool, _mini_surface(tmp_path))
+
+
+# -- the selector, the constants, the layout ----------------------------------------------------------
+
+def test_surface_is_a_hook_the_flag_has_one_name_and_the_default_stays_user_identity(tool):
+    """Mutation: leave `surface` out of HOOKS, rename the flag constant, or change the default hook -> red."""
+    assert "surface" in tool.HOOKS and tool.HOOKS[0] == "user-identity"
+    assert tool.SURFACE_FLAG_KEY == "surface_reads_via_owner"
+    assert tool.SURFACE_EXPECTED_SQLITE == "3.53.0"
+    assert tool.SURFACE_HOOK_PATH.name == "engram-surface-hook.py"
+
+
+def test_layout_carries_the_surface_hook_and_the_old_payload_still_loads(tool, tmp_path):
+    """Mutation: drop the field from to_json/from_json (the child would measure the SOURCE hook), or require it of
+    an old payload -> red."""
+    lay = tool.Layout(name="installed", root=tmp_path, stop_hook=tmp_path / "hooks" / "s.py",
+                      user_hook=tmp_path / "hooks" / "u.py", surface_hook=tmp_path / "hooks" / "x.py")
+    assert tool.Layout.from_json(lay.to_json()).surface_hook == tmp_path / "hooks" / "x.py"
+    assert tool.source_layout().surface_hook == tool.SURFACE_HOOK_PATH
+    old = tool.Layout(name="installed", root=tmp_path, stop_hook=tmp_path / "hooks" / "s.py",
+                      user_hook=tmp_path / "hooks" / "u.py")
+    assert old.surface_hook == tmp_path / "hooks" / "engram-surface-hook.py"
+    payload = json.loads(old.to_json())
+    payload.pop("surface_hook")
+    assert tool.Layout.from_json(json.dumps(payload)).surface_hook == tmp_path / "hooks" / "engram-surface-hook.py"
+
+
+def test_the_installed_layout_covers_the_surface_hook_and_detects_drift_in_it(tool, tmp_path):
+    """The byte check covers the surface hook: a drift in, or the absence of, the built copy is reported by name.
+    Mutation: leave the hook out of RUNTIME_FILES -> its drift goes unreported -> red."""
+    assert tool.RUNTIME_FILES.get("hooks/engram-surface-hook.py") == "src/engram/hooks/claude/engram-surface-hook.py"
+    layout = _scratch_build(tool, tmp_path)
+    assert tool.layout_matches_tree(layout) == []
+    target = layout.root / "hooks" / "engram-surface-hook.py"
+    target.write_bytes(target.read_bytes() + b"\n# drift\n")
+    assert "hooks/engram-surface-hook.py" in tool.layout_matches_tree(layout)
+    target.unlink()
+    assert "hooks/engram-surface-hook.py" in tool.layout_matches_tree(layout)
+
+
+def test_the_installed_layout_surface_fire_loads_only_files_listed_in_runtime_files(tool, tmp_path):
+    """The closure cell: a flat plugin root holding ONLY the RUNTIME_FILES copies can import and fire the surface
+    hook (a missing runtime file would raise ImportError in the child). Mutation: remove any file the fire needs
+    from RUNTIME_FILES -> the fire fails in the scratch build -> red."""
+    layout = _scratch_build(tool, tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    driver = textwrap.dedent('''
+        import io, json, os, sys, sqlite3, importlib.util
+        root = sys.argv[1]
+        sys.path[:0] = [root + "/hooks"]; sys.path.append(root)
+        import engram_core
+        c = sqlite3.connect(os.environ["ENGRAM_HOME"] + "/knowledge.db"); c.execute("PRAGMA journal_mode=WAL")
+        c.row_factory = sqlite3.Row; engram_core._run_db_one_time_setup(c); c.commit(); c.close()
+        sp = importlib.util.spec_from_file_location("surf", root + "/hooks/engram-surface-hook.py")
+        mod = importlib.util.module_from_spec(sp); sp.loader.exec_module(mod)
+        mod.query_daemon = lambda prompt, top_k=10, embed_query=None: {"match_count": 1, "top_claims": [{"id": "ob_x", "recall_summary": "s"}]}
+        sys.stdin = io.StringIO(json.dumps({"session_id": "s1", "prompt": "what is the plan for the owner reads today", "transcript_path": ""}))
+        out = io.StringIO(); real = sys.stdout; sys.stdout = out
+        try:
+            mod.main()
+        except SystemExit:
+            pass
+        sys.stdout = real
+        assert "[ENGRAM Recall:" in out.getvalue(), out.getvalue()
+        print("FIRED")
+    ''')
+    env = {"PATH": os.environ.get("PATH", ""), "ENGRAM_HOME": str(home), "HOME": str(home),
+           "CLAUDE_PLUGIN_ROOT": str(layout.root)}
+    proc = subprocess.run([sys.executable, "-c", driver, str(layout.root)], env=env, capture_output=True,
+                          text=True, timeout=300)
+    assert proc.returncode == 0 and "FIRED" in proc.stdout, proc.stderr[-1500:]
+
+
+# -- the hook lacks the flag -----------------------------------------------------------------------------
+
+def test_a_hook_without_the_flag_is_a_named_arm_blind_not_a_crash_or_a_number(tool, tmp_path, monkeypatch):
+    """The arm must say WHY: it names the flag key and does not return a result. Mutation: measure the two
+    identical (flag-less) paths and report a ratio, or raise a bare AttributeError -> red."""
+    _fake_launch(tool, monkeypatch)
+    hook = _mini_surface(tmp_path, _no_flag)
+    with pytest.raises(tool.ArmBlind) as exc:
+        _surface_measure(tool, hook)
+    msg = str(exc.value)
+    assert tool.SURFACE_FLAG_KEY in msg and "no number" in msg.lower()
+
+
+def test_main_exits_4_with_a_clear_stderr_line_when_the_hook_lacks_the_flag(tool, monkeypatch, capsys):
+    """Exit 4 is the blind-arm code (a layout child's ArmBlind traceback comes back typed). Mutation: let it
+    surface as RuntimeError (exit traceback) or exit 1 -> red."""
+    layout = lambda name: types.SimpleNamespace(name=name)
+    monkeypatch.setattr(tool, "build_installed_layout", lambda out: layout("installed"))
+    monkeypatch.setattr(tool, "source_layout", lambda: layout("source"))
+
+    def blind(lay, **kw):
+        raise tool.ArmBlind(f"the surface hook has no engramd.{tool.SURFACE_FLAG_KEY} flag: no number produced")
+
+    monkeypatch.setattr(tool, "measure_in_layout", blind)
+    assert tool.main(["--hook", "surface", "--no-real-store", "--layout", "source"]) == 4
+    err = capsys.readouterr().err
+    assert "BLIND ARM" in err and tool.SURFACE_FLAG_KEY in err
+
+
+# -- one full fire, flag OFF vs ON, the daemon stubbed identically ------------------------------------------
+
+def test_the_surface_arm_fires_main_on_both_paths_and_reports_the_tripwire_result_shape(tool, surface_run):
+    """Same result shape downstream readers parse: rows (arm x path, six rows), answers_match, answer_size,
+    env, owner_pid ... plus the surface keys. Mutation: drop an arm, a key, or return the rows unlabelled -> red."""
+    r = surface_run
+    assert r["hook"] == "surface"
+    assert {(x["arm"], x["path"]) for x in r["rows"]} == {
+        (a, p) for a in ("sequential", "contended", "cold-cache") for p in ("baseline", "owner")}
+    assert all(x["n"] >= 1 and x["p50_ms"] > 0 for x in r["rows"])
+    for key in ("answers_match", "answer_size", "owner_pid", "owner_cmdline", "node_count", "journal_mode",
+                "db_bytes", "env", "stdout_match", "recall_reached", "opens_flag_on", "opens_flag_off",
+                "open_violations"):
+        assert key in r, key
+    assert r["env"]["sqlite"] == sqlite3.sqlite_version
+
+
+def test_the_recall_daemon_is_stubbed_identically_on_both_paths(tool, surface_run):
+    """The mini hook's real `query_daemon` raises; the arm only gets a number if BOTH paths run with the stub, and
+    the stub's text appears in both fires' (equal) stdout. Mutation: stub only one path, or stub neither -> the
+    unstubbed fire raises AssertionError -> red."""
+    assert surface_run["recall_reached"] is True
+    assert surface_run["stdout_match"] is True
+    assert surface_run["answers_match"] is True
+    assert surface_run["answer_size"] > 0
+
+
+def test_per_fire_state_is_reset_so_the_paths_stay_comparable(tool, surface_run):
+    """The mini hook prints a per-fire counter it persists in ENGRAM_HOME (as the real hook's prompt counter does).
+    With N fires the paths only keep printing equal bytes if state is cleared between fires. Mutation: skip the
+    reset -> the sanity fires of the two paths differ -> stdout_match False -> red."""
+    assert surface_run["stdout_match"] is True
+
+
+def test_the_flag_off_path_opens_the_store_and_the_flag_on_path_only_the_named_remainder(tool, surface_run):
+    """OFF counts both opens (the read and the person-moment cursor); ON keeps exactly the cursor write, which the
+    allow-list attributes by frame (`_advance_person_moment_cursor`, the #3821 row-8 remainder), so it is NOT a
+    violation. Mutation: an opens counter stuck at 0, or no allow-list (every ON open a violation) -> red."""
+    assert surface_run["opens_flag_off"] == 2
+    assert surface_run["opens_flag_on"] == 1
+    assert surface_run["open_violations"] == []
+
+
+def test_a_flag_on_path_that_still_reads_directly_is_a_violation_naming_the_reader(tool, tmp_path, monkeypatch):
+    """The control: an un-migrated read on the flag-ON path (`_read_nodes` ignores the flag) opens the store and is
+    reported with its frame; surface_contract_violations carries it. Mutation: allow every ON open -> red."""
+    _fake_launch(tool, monkeypatch)
+    r = _surface_measure(tool, _mini_surface(tmp_path, _owner_path_still_reads))
+    assert r["opens_flag_on"] == 2
+    assert len(r["open_violations"]) == 1 and "_read_nodes" in r["open_violations"][0]
+    assert any("_read_nodes" in v for v in tool.surface_contract_violations(r))
+
+
+def test_the_arm_never_touches_the_process_home_streams_or_environment(tool, tmp_path, monkeypatch, surface_run):
+    """HOME / streams / ENGRAM_HOME come back after a surface run. Mutation: skip a cleanup -> red."""
+    assert "a6-" not in os.environ.get("HOME", "")
+    assert sys.stdout.__class__.__name__ != "_ThreadStreams"
+    assert sys.stdin.__class__.__name__ != "_ThreadStreams"
+    assert "a6-" not in os.environ.get("ENGRAM_HOME", "")
+
+
+# -- the pure contract gate -------------------------------------------------------------------------------
+
+def _surface_clear(**over):
+    r = {"hook": "surface", "recall_reached": True, "stdout_match": True, "open_violations": [],
+         "opens_flag_on": 1, "opens_flag_off": 6}
+    r.update(over)
+    return {k: v for k, v in r.items() if v is not _MISSING}
+
+
+SURFACE_VIOLATIONS = [
+    ("all clear", {}, []),
+    ("opens reported, never gated by count", {"opens_flag_on": 9}, []),
+    ("recall not reached", {"recall_reached": False}, ["recall_reached"]),
+    ("recall_reached missing", {"recall_reached": _MISSING}, ["recall_reached"]),
+    ("recall_reached truthy but not True", {"recall_reached": 1}, ["recall_reached"]),
+    ("stdout differs", {"stdout_match": False}, ["stdout_match"]),
+    ("stdout_match missing", {"stdout_match": _MISSING}, ["stdout_match"]),
+    ("stdout_match None", {"stdout_match": None}, ["stdout_match"]),
+    ("an unattributed ON open", {"open_violations": ["unattributed open of the store: frame x:_read_nodes:3"]},
+     ["_read_nodes"]),
+    ("open_violations missing fails closed", {"open_violations": _MISSING}, ["open_violations"]),
+    ("open_violations not a list fails closed", {"open_violations": None}, ["open_violations"]),
+    ("two at once", {"stdout_match": False, "recall_reached": False}, ["stdout_match", "recall_reached"]),
+]
+
+
+@pytest.mark.parametrize("name,over,expect", SURFACE_VIOLATIONS, ids=[r[0] for r in SURFACE_VIOLATIONS])
+def test_surface_contract_violations_table(tool, name, over, expect):
+    """One line per violation, by name. Mutation: ignore a key, treat truthy as True, or fail OPEN on a
+    missing open_violations -> a row goes red."""
+    got = tool.surface_contract_violations(_surface_clear(**over))
+    assert len(got) == len(expect), got
+    for key in expect:
+        assert any(key in g for g in got), (key, got)
+
+
+def test_surface_contract_violations_is_pure(tool, monkeypatch):
+    """Mutation: do I/O or mutate the input -> red."""
+    monkeypatch.setattr("builtins.open", lambda *a, **k: pytest.fail("I/O in a pure function"))
+    r = _surface_clear(stdout_match=False)
+    before = dict(r)
+    assert tool.surface_contract_violations(r)
+    assert r == before
+
+
+def _open(*frames, arg="/h/knowledge.db"):
+    return {"arg": arg, "thread": "MainThread", "stack": list(frames)}
+
+
+def test_the_allow_list_is_the_person_moment_cursor_and_nothing_else(tool):
+    """An ON open with an `_advance_person_moment_cursor` frame in the hook's own file is the named remainder; any
+    other open is a violation naming the innermost frame and the hook's own frames. Mutation: allow by any file,
+    allow everything, or allow nothing -> red."""
+    hook = "/plugin/hooks/engram-surface-hook.py"
+    cursor = _open(f"{hook}:main:3700", f"{hook}:_advance_person_moment_cursor:1137", "/py/sqlite3.py:connect:1")
+    reader = _open(f"{hook}:main:3700", f"{hook}:_check_embedding_restore_flag:318",
+                   "/plugin/_hooklib.py:connect_regular_ro:9")
+    got = tool.surface_attribute_opens([cursor, reader], hook)
+    assert got["remainder"] == [cursor]
+    assert len(got["violations"]) == 1
+    assert "_check_embedding_restore_flag" in got["violations"][0] and "connect_regular_ro" in got["violations"][0]
+    assert tool.surface_attribute_opens([_open()], hook)["violations"]          # no stack: a violation, not allowed
+    spoof = _open("/x/other.py:_advance_person_moment_cursor:1")                 # same name, not the hook's own file
+    assert tool.surface_attribute_opens([spoof], hook)["violations"]
+
+
+# -- the gate cell and the verdict ---------------------------------------------------------------------------
+
+def _rows(ratio, contended=0.9, cold=0.9):
+    """Six rows whose sequential owner/baseline p50 is `ratio` (and contended/cold as given)."""
+    out = []
+    for arm, rt in (("sequential", ratio), ("contended", contended), ("cold-cache", cold)):
+        base = {"arm": arm, "n": 300, "p50_ms": 10.0, "p99_ms": 12.0, "mean_ms": 10.0, "min_ms": 9.0}
+        out.append(dict(base, path="baseline"))
+        out.append(dict(base, path="owner", p50_ms=10.0 * rt, p99_ms=12.0 * rt, mean_ms=10.0 * rt))
+    return out
+
+
+def _cell(layout, cell, ratio, sqlite="3.53.0", **kw):
+    r = dict(_surface_clear(), layout=layout, layout_root="/r", parent_walk_calls=0, store_cell=cell,
+             rows=_rows(ratio, **kw), answers_match=True,
+             env={"platform": "x", "cpus": 1, "python": "3.12", "sqlite": sqlite})
+    return r
+
+
+def test_the_gate_cell_is_the_real_store_copy_on_the_installed_layout(tool):
+    """Synthetic 0.94x passes, the real copy misses at 1.04x (the tripwire's #3740 numbers): the verdict is the
+    REAL cell's, FAIL, and it names itself as the gate cell. Mutation: compute the verdict from the synthetic
+    cell, from the source layout, or from the worst-of-all-cells -> red."""
+    results = [_cell("installed", "synthetic", 0.94), _cell("installed", "real-store", 1.04),
+               _cell("source", "synthetic", 0.50), _cell("source", "real-store", 0.50)]
+    gate = tool.surface_gate(results)
+    assert gate["gate_cell_present"] is True
+    assert gate["passes"] is False
+    assert gate["ratio"] == pytest.approx(1.04)
+    v = gate["verdict"]
+    assert "GATE CELL" in v and "real-store" in v and "installed" in v
+    assert "1.04x" in v and "FAIL" in v and "PASS" not in v.replace("NOT A PASS", "")
+
+
+def test_the_real_store_cell_passing_while_the_synthetic_misses_is_a_pass(tool):
+    """The other direction (kills 'worst of both' and 'synthetic decides'). Mutation: gate on the synthetic -> red."""
+    gate = tool.surface_gate([_cell("installed", "synthetic", 1.20), _cell("installed", "real-store", 0.97)])
+    assert gate["passes"] is True and gate["ratio"] == pytest.approx(0.97)
+    assert "PASS" in gate["verdict"] and "GATE CELL" in gate["verdict"]
+    assert "synthetic" in gate["verdict"] and "1.20x" in gate["verdict"]   # reported, labelled not-the-gate
+
+
+@pytest.mark.parametrize("results", [
+    [_cell("installed", "synthetic", 0.80)],                                          # synthetic-only
+    [_cell("source", "synthetic", 0.80), _cell("source", "real-store", 0.80)],        # no installed layout
+    [],
+], ids=["synthetic-only", "source-only", "empty"])
+def test_without_the_real_store_cell_on_the_installed_layout_the_result_is_not_a_pass(tool, results):
+    """Mutation: pass on the synthetic number alone (or on a source-layout real cell) -> red."""
+    gate = tool.surface_gate(results)
+    assert gate["gate_cell_present"] is False and gate["passes"] is False
+    assert "NO GATE CELL" in gate["verdict"] and "NOT A PASS" in gate["verdict"]
+    assert tool.surface_gate_violations(results), "a missing gate cell must be a contract violation (exit 3)"
+
+
+def test_a_present_gate_cell_is_no_gate_violation(tool):
+    """Mutation: always report the missing-cell violation -> red."""
+    assert tool.surface_gate_violations([_cell("installed", "real-store", 1.5)]) == []
+
+
+def test_the_sqlite_build_is_named_and_a_non_expected_build_is_flagged(tool):
+    """3.53.0 is expected; another build is named in the verdict as the build axis, never silently passed.
+    Mutation: drop the version from the verdict, or flag the expected build -> red."""
+    ok = tool.surface_gate([_cell("installed", "real-store", 0.9, sqlite="3.53.0")])["verdict"]
+    other = tool.surface_gate([_cell("installed", "real-store", 0.9, sqlite="3.45.1")])["verdict"]
+    assert "3.53.0" in ok and "expected" not in ok.lower()
+    assert "3.45.1" in other and "expected 3.53.0" in other
+
+
+def test_an_arm_the_owner_loses_is_a_finding_and_contended_and_cold_are_owed(tool):
+    """Findings name the cell, arm and ratio; the contended and cold arms are always listed as owed measurements.
+    Mutation: drop the findings, or list owed only when they lose -> red."""
+    gate = tool.surface_gate([_cell("installed", "real-store", 0.95, contended=1.3, cold=0.8)])
+    joined = "\n".join(gate["findings"])
+    assert "contended" in joined and "1.30x" in joined and "real-store" in joined
+    assert "cold-cache" not in joined                                  # the owner wins cold here: not a finding
+    owed = "\n".join(gate["owed"])
+    assert "contended" in owed and "cold" in owed and "owed" in owed.lower()
+    clean = tool.surface_gate([_cell("installed", "real-store", 0.95)])
+    assert clean["findings"] == [] and "contended" in "\n".join(clean["owed"])
+
+
+# -- the CLI: two cells, the copy, exit codes --------------------------------------------------------------------
+
+def _patch_cli(tool, monkeypatch, seen, ratios=None, **over):
+    layout = lambda name: types.SimpleNamespace(name=name)
+    monkeypatch.setattr(tool, "build_installed_layout", lambda out: layout("installed"))
+    monkeypatch.setattr(tool, "source_layout", lambda: layout("source"))
+    ratios = ratios or {"synthetic": 0.94, "real-store": 0.97}
+    monkeypatch.setattr(tool, "format_layouts", lambda rs: "TABLE")   # (the table has its own cells)
+
+    def fake(lay, **kw):
+        cell = "real-store" if kw.get("store") is not None else "synthetic"
+        seen.append((lay.name, cell, kw.get("store"), kw["hook"]))
+        r = _cell(lay.name, cell, ratios[cell])
+        r.pop("store_cell")                      # the CLI tags it; a child process result does not carry it
+        r.update(over)
+        return r
+
+    monkeypatch.setattr(tool, "measure_in_layout", fake)
+    return fake
+
+
+def _live_home(tmp_path, monkeypatch):
+    home = tmp_path / "live"
+    home.mkdir()
+    db = home / "knowledge.db"
+    c = sqlite3.connect(str(db))
+    c.execute("CREATE TABLE nodes (id TEXT)")
+    c.executemany("INSERT INTO nodes VALUES (?)", [(f"n{i}",) for i in range(7)])
+    c.commit()
+    c.close()
+    monkeypatch.setenv("ENGRAM_HOME", str(home))
+    return db
+
+
+def test_main_measures_a_synthetic_cell_and_a_real_store_copy_per_layout_and_never_the_live_file(
+        tool, tmp_path, monkeypatch, capsys):
+    """Four measure calls (installed/source x synthetic/real-store). The real cell's `store` is a COPY (a different
+    path, a valid db with the live node count, existing during the call and removed after); the live file is
+    byte-identical after. Mutation: pass the live path itself, skip the synthetic cell, skip the real cell, or
+    leave the copy behind -> red."""
+    live = _live_home(tmp_path, monkeypatch)
+    before = hashlib.sha256(live.read_bytes()).hexdigest()
+    seen, copies = [], []
+    real_fake = _patch_cli(tool, monkeypatch, seen)
+
+    def spying(lay, **kw):
+        if kw.get("store") is not None:
+            p = Path(kw["store"])
+            c = sqlite3.connect(str(p))
+            copies.append((p, c.execute("SELECT count(*) FROM nodes").fetchone()[0]))
+            c.close()
+        return real_fake(lay, **kw)
+
+    monkeypatch.setattr(tool, "measure_in_layout", spying)
+    assert tool.main(["--hook", "surface"]) == 0
+    assert sorted((a, b) for a, b, _s, _h in seen) == [
+        ("installed", "real-store"), ("installed", "synthetic"), ("source", "real-store"), ("source", "synthetic")]
+    assert {h for *_x, h in seen} == {"surface"}
+    assert len(copies) == 2
+    for p, count in copies:
+        assert p.resolve() != live.resolve() and count == 7
+        assert not p.exists(), "the real-store copy must be removed after the run"
+    assert hashlib.sha256(live.read_bytes()).hexdigest() == before
+    out = capsys.readouterr().out
+    assert "GATE CELL" in out and "real-store" in out
+
+
+def test_main_prints_the_verdict_after_the_table_and_a_clear_gate_exits_0(tool, tmp_path, monkeypatch, capsys):
+    """Mutation: print the verdict before the table, or exit non-zero on a clear run -> red."""
+    _live_home(tmp_path, monkeypatch)
+    _patch_cli(tool, monkeypatch, [])
+    monkeypatch.setattr(tool, "format_layouts", lambda rs: "THE-TABLE")
+    assert tool.main(["--hook", "surface"]) == 0
+    out = capsys.readouterr().out
+    assert out.index("THE-TABLE") < out.index("GATE CELL") and "PASS" in out
+
+
+def test_main_a_gate_miss_or_a_lost_arm_is_a_stated_finding_not_an_exit_code(tool, tmp_path, monkeypatch, capsys):
+    """Exit codes are the tripwire arm's: 0 ok (a ratio above 1.0 is a finding on stdout), 3 only for a contract
+    violation. Mutation: exit 1/3 on a ratio miss, or print no finding -> red."""
+    _live_home(tmp_path, monkeypatch)
+    _patch_cli(tool, monkeypatch, [], ratios={"synthetic": 0.94, "real-store": 1.04})
+    assert tool.main(["--hook", "surface"]) == 0
+    out = capsys.readouterr().out
+    assert "FAIL" in out and "1.04x" in out and "FINDING" in out
+
+
+def test_main_a_synthetic_only_run_is_exit_3_and_says_not_a_pass(tool, tmp_path, monkeypatch, capsys):
+    """`--no-real-store` still measures (the numbers are reportable) but is never a pass. Mutation: exit 0 on a
+    synthetic-only run, or omit 'NOT A PASS' -> red."""
+    _live_home(tmp_path, monkeypatch)
+    seen = []
+    _patch_cli(tool, monkeypatch, seen)
+    assert tool.main(["--hook", "surface", "--no-real-store"]) == 3
+    assert {cell for _l, cell, _s, _h in seen} == {"synthetic"}
+    out = capsys.readouterr().out
+    assert "NO GATE CELL" in out and "NOT A PASS" in out
+
+
+def test_main_a_source_layout_only_run_has_no_gate_cell_and_exits_3(tool, tmp_path, monkeypatch, capsys):
+    """Mutation: treat the source-layout real-store cell as the gate -> exit 0 -> red."""
+    _live_home(tmp_path, monkeypatch)
+    _patch_cli(tool, monkeypatch, [])
+    assert tool.main(["--hook", "surface", "--layout", "source"]) == 3
+    assert "NOT A PASS" in capsys.readouterr().out
+
+
+def test_main_exits_3_and_names_the_layout_and_cell_on_a_per_cell_violation(tool, tmp_path, monkeypatch, capsys):
+    """A violation in only the real-store cell is reported with its layout and cell. Mutation: gate only the
+    first/synthetic cell -> exit 0 -> red."""
+    _live_home(tmp_path, monkeypatch)
+    fake = _patch_cli(tool, monkeypatch, [])
+
+    def bad_real(lay, **kw):
+        r = fake(lay, **kw)
+        if kw.get("store") is not None:
+            r["stdout_match"] = False
+        return r
+
+    monkeypatch.setattr(tool, "measure_in_layout", bad_real)
+    assert tool.main(["--hook", "surface"]) == 3
+    out = capsys.readouterr().out
+    assert "[installed layout, real-store cell]" in out and "stdout_match" in out
+
+
+def test_main_real_store_source_can_be_named_and_a_missing_one_is_exit_2(tool, tmp_path, monkeypatch, capsys):
+    """`--real-store PATH` is the copy source; an absent one (explicit or the default) is bad input, exit 2,
+    before anything is launched. Mutation: silently fall back to synthetic-only -> red."""
+    monkeypatch.setattr(tool, "measure_in_layout", lambda *a, **k: pytest.fail("measured"))
+    monkeypatch.setenv("ENGRAM_HOME", str(tmp_path / "nowhere"))
+    assert tool.main(["--hook", "surface"]) == 2
+    assert tool.main(["--hook", "surface", "--real-store", str(tmp_path / "absent.db")]) == 2
+    assert "real-store" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("argv", [
+    ["--hook", "surface", "--exclusion", "on"],
+    ["--hook", "surface", "--store", "x.db"],
+    ["--hook", "tripwire", "--real-store", "x.db"],
+    ["--real-store", "x.db"],
+    ["--hook", "stop", "--no-real-store"],
+    ["--hook", "surface", "--real-store", "x.db", "--no-real-store"],
+])
+def test_surface_only_switches_are_valid_only_with_the_surface_hook(tool, monkeypatch, argv):
+    """Argparse errors (exit 2) before anything is launched. Mutation: accept the surface switches for other
+    hooks, or accept --store/--exclusion for surface -> red."""
+    monkeypatch.setattr(tool, "launch_owner", lambda *a, **k: pytest.fail("launched"))
+    with pytest.raises(SystemExit) as exc:
+        tool.main(argv)
+    assert exc.value.code == 2
+
+
+def test_surface_keeps_the_n_floor_before_anything_is_launched(tool, tmp_path, monkeypatch):
+    """N below 300 is exit 2, with no copy made and no owner launched. Mutation: skip the floor on the surface
+    branch -> red."""
+    _live_home(tmp_path, monkeypatch)
+    monkeypatch.setattr(tool, "launch_owner", lambda *a, **k: pytest.fail("launched"))
+    monkeypatch.setattr(tool, "measure_in_layout", lambda *a, **k: pytest.fail("measured"))
+    assert tool.main(["--hook", "surface", "--n", "50"]) == 2
+
+
+def test_the_default_n_is_the_floor_for_the_surface_arm(tool, tmp_path, monkeypatch):
+    """N >= 300 by default: the n handed to every cell is at least N_FLOOR. Mutation: a smaller default -> red."""
+    _live_home(tmp_path, monkeypatch)
+    ns = []
+    fake = _patch_cli(tool, monkeypatch, [])
+    monkeypatch.setattr(tool, "measure_in_layout", lambda lay, **kw: (ns.append(kw["n"]), fake(lay, **kw))[1])
+    tool.main(["--hook", "surface"])
+    assert ns and min(ns) >= 300
+
+
+def test_format_layouts_labels_the_cell_and_leaves_cell_less_results_unchanged(tool, monkeypatch):
+    """A cell-tagged result's heading names the cell (the real-store one says it is the gate cell on installed);
+    an untagged result's output has no cell text. Mutation: drop the label, or add it to untagged -> red."""
+    def res(layout, cell):
+        r = {"layout": layout, "layout_root": "/r", "parent_walk_calls": 0}
+        if cell:
+            r["store_cell"] = cell
+        return r
+
+    monkeypatch.setattr(tool, "format_table", lambda r: "TBL")
+    plain = tool.format_layouts([res("installed", None)])
+    both = tool.format_layouts([res("installed", "synthetic"), res("installed", "real-store")])
+    assert "real-store" not in plain and "synthetic" not in plain
+    assert "real-store" in both and "synthetic" in both and both.index("real-store") > both.index("synthetic")
+    assert "gate" in both.split("real-store", 1)[1].lower()
+
+
+def test_surface_table_names_the_hook_and_the_stub_caveat_and_the_cell(tool, surface_run):
+    """Mutation: print the surface arm with the user-identity wording -> red."""
+    text = tool.format_table(surface_run)
+    assert "Surface hook" in text and "query_daemon" in text and "owed" in text.lower()
+    assert f"SQLite {sqlite3.sqlite_version}" in text

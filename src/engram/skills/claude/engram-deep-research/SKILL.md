@@ -58,7 +58,7 @@ For each sub-question, follow this cycle:
 - WebSearch for relevant sources
 - WebFetch to read promising results deeply
 - Read existing ENGRAM nodes and project files for internal evidence
-- **Primary-source discipline:** when a result is an AI-aggregator (EmergentMind, LLM-generated surveys, auto-summary blogs), track the primary papers before recording observations. Aggregators inherit hallucination risk from the agents that built them — empirically, the SRAF "formalism" attributed to a self-models cluster wasn't in any of the 10 primary papers (after the SRAF-falsification primary-contact audit). Depth-research is where this discipline compounds: one fabricated aggregator claim at the root of a reasoning chain corrupts every derivation downstream. If `engram_add_observation` returns a `yellow_card_warning`, that source is already flagged in `~/.engram/config.json` — drop to the primary before recording.
+- **Primary-source discipline:** when a result is an AI-aggregator (EmergentMind, LLM-generated surveys, auto-summary blogs), track the primary papers before recording observations. Aggregators inherit hallucination risk from the agents that built them — empirically, the SRAF "formalism" attributed to a self-models cluster wasn't in any of the 10 primary papers (after the SRAF-falsification primary-contact audit). Depth-research is where this discipline compounds: one fabricated aggregator claim at the root of a reasoning chain corrupts every derivation downstream. If `engram_add_observation` returns a `yellow_card_warning`, that source is already flagged in `~/.engram/config.json` (under `$ENGRAM_HOME`, default `~/.engram`) — drop to the primary before recording.
 - **Yellow-card incident recording:** when primary-contact reveals a mismatch between an aggregator's claim and its primary sources — fabricated formalism, misattributed quote, invented citation, or a claim absent from the papers the aggregator supposedly synthesized — record it as a **yellow-card incident observation**. One mismatch = one observation; cite the aggregator URL as the failing source and the primary as the truth-check. Do this even if the domain is already yellow-carded — the incident log is how per-domain failure-rate knowledge compounds across sessions. Once accumulated incidents cross a threshold (schema + threshold TBD as a separate design task), the domain graduates to **RED-CARD** and is banned as independent evidence: observations rooted there will require separate corroboration from outside the domain. In depth-research this matters doubly, because unrecorded incidents mean the next reasoning chain inherits the same corrupted root.
 
 ### 3b. Record observations and definitions immediately
@@ -122,7 +122,7 @@ When the research session is complete (user stops the loop or research question 
 
 **Remove the loop-mode marker** (if it exists) per **engram-loop** Step 3.
 
-**Write a verification report** to disk at `~/.engram/reports/`. Create the directory if it doesn't exist.
+**Write a verification report** to disk at `~/.engram/reports/` (under `$ENGRAM_HOME`, default `~/.engram`). Create the directory if it doesn't exist.
 
 **Filename:** `deep_research_YYYY-MM-DD_HHMMSS.md`
 
@@ -138,19 +138,19 @@ When the research session is complete (user stops the loop or research question 
 4. **New questions raised** — registered questions with IDs, ordered by research priority
 5. **Meta self-reflection** — see Step 7
 
-Tell the user: "Verification report written to `~/.engram/reports/<filename>`"
+Tell the user: "Verification report written to `~/.engram/reports/<filename>`" (under `$ENGRAM_HOME`, default `~/.engram`)
 
 This report is designed for human review — the reviewer should understand each finding's significance and provenance without manually traversing the graph.
 
 ### Session Briefing
 
-After the verification report, generate a **session briefing** for the user following the template at `~/.engram/reports/SESSION_BRIEFING_TEMPLATE.md`. Write it to `~/.engram/reports/briefing_YYYY-MM-DD_HHMMSS.md`.
+After the verification report, generate a **session briefing** for the user following the template at `~/.engram/reports/SESSION_BRIEFING_TEMPLATE.md` (under `$ENGRAM_HOME`, default `~/.engram`). Write it to `~/.engram/reports/briefing_YYYY-MM-DD_HHMMSS.md`.
 
 The briefing is the concise human-readable summary — what was found (layman language), self-reflection, metrics, goal mapping, decision forks, confidence map, and an "Ask {{USER_NAME}}" queue. The verification report has full provenance chains; the briefing has what the user needs for a 2-3 minute scan.
 
-During the research session, keep a running scratch log at `~/.engram/loop-scratch.md` — append decision forks, friction points, and surprise moments as they happen. This feeds the briefing at session end and is deleted during cleanup.
+During the research session, keep a running scratch log at `~/.engram/loop-scratch.md` (under `$ENGRAM_HOME`, default `~/.engram`) — append decision forks, friction points, and surprise moments as they happen. This feeds the briefing at session end and is deleted during cleanup.
 
-Tell the user: "Session briefing written to `~/.engram/reports/<filename>`"
+Tell the user: "Session briefing written to `~/.engram/reports/<filename>`" (under `$ENGRAM_HOME`, default `~/.engram`)
 
 ## Key behavioral differences from engram-curiosity
 

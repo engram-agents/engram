@@ -68,7 +68,7 @@ Identify the single critical-path piece. Spec it carefully — its quality casca
 
 ### Spec-vs-implementation separability
 
-Spec-writing is text. It has no conflict surface. Draft ALL specs upfront (even ones whose dependencies aren't ready yet) so they're queued for dispatch the moment deps clear. Save specs to `~/.engram/cohort-specs-<date>/` for durability across compaction.
+Spec-writing is text. It has no conflict surface. Draft ALL specs upfront (even ones whose dependencies aren't ready yet) so they're queued for dispatch the moment deps clear. Save specs to `~/.engram/cohort-specs-<date>/` (under `$ENGRAM_HOME`, default `~/.engram`) for durability across compaction.
 
 The failure mode this prevents: holding specs because their *implementation* would conflict with a running fairy. That conflates two different surfaces. Specs are text; only implementation has conflict.
 

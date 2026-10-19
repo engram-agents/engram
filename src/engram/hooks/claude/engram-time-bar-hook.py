@@ -39,6 +39,16 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863 6b): it would resolve against this process's cwd, a
+# different home than the daemon's or the server's. Fail open: one stderr line, nothing written, exit 0.
+# (Inline, not from _hooklib: this hook must still run when the sibling lib cannot import.)
+_ENGRAM_HOME_RAW = os.environ.get("ENGRAM_HOME") or ""
+if _ENGRAM_HOME_RAW and not os.path.isabs(os.path.expanduser(_ENGRAM_HOME_RAW)):
+    sys.stderr.write("engram hook: ENGRAM_HOME must be an absolute path, got %r; doing nothing\n" % (_ENGRAM_HOME_RAW,))
+    sys.exit(0)
+if _ENGRAM_HOME_RAW:
+    os.environ["ENGRAM_HOME"] = os.path.abspath(os.path.expanduser(_ENGRAM_HOME_RAW))  # `~/x` -> absolute for every raw reader
+
 # #3628: every read and write here is non-blocking and regular-file-only. This
 # file's own directory is sys.path[0] when run as a script; insert it so test
 # loaders (spec_from_file_location) resolve the sibling lib the same way.

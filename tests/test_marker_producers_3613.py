@@ -32,6 +32,8 @@ from pathlib import Path
 
 import pytest
 
+import _skill_block_runner as _runner
+
 _REPO = Path(__file__).resolve().parents[1]
 _SRC_TOOLS = _REPO / "src" / "engram" / "tools"
 _SKILLS = _REPO / "src" / "engram" / "skills" / "claude"
@@ -118,14 +120,33 @@ def test_L4_engram_loop_skill_stub_ends_with_empty_marker_and_arms_marker_first(
     assert armed.rstrip().split("\n")[-1] == EMPTY
 
 
-def test_L4_school_day_loop_prompt_field_leads_with_loop_wake_and_ends_with_empty_marker():
+def _school_day_written_marker(tmp_path, mode):
+    """Run the skill's printf marker-writing command AS PRINTED under a temp HOME and
+    parse the loop-mode.json it writes. -> (parsed dict, home Path)."""
     text = (_SKILLS / "engram-school-day" / "SKILL.md").read_text(encoding="utf-8")
-    m = re.search(r'"loop_prompt":("(?:[^"\\]|\\.)*")', text)
-    assert m, "loop_prompt field not found in school-day SKILL.md"
-    prompt = json.loads(m.group(1))
+    script = _runner.block_where(
+        text,
+        lambda b: b.startswith("printf '%s\\n' '{\"FIRST_ACTION\""),
+        label="school-day SKILL.md",
+    )
+    r, home = _runner.run_block(script, tmp_path, mode)
+    assert r.returncode == 0, r.stderr
+    return json.loads((home / "loop-mode.json").read_text(encoding="utf-8")), home
+
+
+@pytest.mark.parametrize("mode", ["default", "custom-with-space"])
+def test_L4_school_day_loop_prompt_field_leads_with_loop_wake_and_ends_with_empty_marker(tmp_path, mode):
+    # Runs the skill's own command and reads the file it writes (json.load), instead of a
+    # regex over the SKILL text: the printed text holds a quote break-out for the home
+    # expression, which no regex over the text reads the way the shell does.
+    data, home = _school_day_written_marker(tmp_path, mode)
+    prompt = data["loop_prompt"]
     assert prompt.lstrip().split()[0] == "<loop-wake>"
     assert prompt.split("\n")[-1] == EMPTY
     assert prompt.count(OPEN) == 1
+    # the home expression was expanded by the shell, not stored as literal text
+    assert "${" not in prompt, prompt[:200]
+    assert f"{home}/loop-mode.json" in prompt
 
 
 def test_L4_school_day_marker_write_is_shell_safe_for_the_newline():
@@ -184,7 +205,7 @@ def _run(script: Path, env_extra: dict, tmp_path: Path, port: int, seconds: floa
         json.dumps({"agent_name": "testagent", "forum": {"url": f"http://127.0.0.1:{port}"}})
     )
     env = os.environ.copy()
-    env.update(HOME=str(home), **env_extra)
+    env.update(HOME=str(home), ENGRAM_HOME=str(home / ".engram"), **env_extra)
     proc = subprocess.Popen(["bash", str(script)], stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, env=env)
     time.sleep(seconds)

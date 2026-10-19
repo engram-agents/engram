@@ -182,8 +182,9 @@ def test_healthy_loop_mode_banner_identical_to_dev(tmp_path, monkeypatch):
     t = _transcript(tmp_path, 950_000)
     new = _load_ct(_CT_PATH, home, monkeypatch)
     dev = _dev_ct(tmp_path, home, monkeypatch)
+    # alpha #3863 (6b): the banner's history path follows ENGRAM_HOME; dev spelled it ~/.engram
     assert new.format_drowsiness(new.estimate_usage(transcript_path=str(t))) == \
-        dev.format_drowsiness(dev.estimate_usage(transcript_path=str(t)))
+        dev.format_drowsiness(dev.estimate_usage(transcript_path=str(t))).replace("~/.engram", str(home))
 
 
 # --------------------------------------------------------------------------

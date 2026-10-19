@@ -33,6 +33,7 @@ export const DEFAULTS: Config = {
   extractModel: 'haiku',
   extractTimeoutMs: 6000,
   maxRatingChars: 1200,
+  /** The unconfigured default. record.ts defaultProbeDir follows ENGRAM_HOME when it is set. */
   probeDir: '~/.engram/probe/mods-recall',
 }
 

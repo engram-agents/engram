@@ -161,7 +161,7 @@ Pull every node created since the last sleep:
 engram_history(mode="edits", action="created", since="<prev-sleep-timestamp>")
 ```
 
-The prev-sleep timestamp is the one logged by the last `engram_advance_turn()` (in `~/.engram/session_log.md` under the most recent "Turn N" header before today). If no prior sleep is findable, the cohort starts at the day's first node.
+The prev-sleep timestamp is the one logged by the last `engram_advance_turn()` (in `${ENGRAM_HOME:-$HOME/.engram}/session_log.md` under the most recent "Turn N" header before today). If no prior sleep is findable, the cohort starts at the day's first node.
 
 **Why daily, not weekly or per-burst.** Nodes from a single day rhyme with each other in ways that fade fast. A morning observation, a noon investigation, and an evening synthesis often want to become one derivation — but only if you see them side-by-side while the connections are still cheap to spot. Skip the daily sweep and a week of loosely-connected cohorts accumulates that take ten times the work to reorganize, or worse, never get reorganized at all.
 
@@ -194,7 +194,7 @@ Common missed-node types:
 
 At the end of sleep, the day is over. The warm-briefing's "From this session" section is per-context-window state managed by naps (see `engram-nap` §5b for the in-sync-with-current-CW rule). At sleep-end, the next day starts fresh — erase the section content. Next morning's first nap will create a new in-sync block.
 
-**Action:** the tool is `"$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/erase_session_block.py"` — this is THE way to do the erase (#3141). **LOOK first, then run:** read the section below the last `## From this session` anchor (or run the tool with `--dry-run` and read its `removed N chars / K lines` summary), apply the drift-STOP check below, and only THEN run the tool for real. The tool implements the four steps below by character offset and asserts the byte-identity post-condition before writing. Exit codes: **0** = done, or already bare (no change); **3** = drift-STOP — surface to the user, do NOT erase; **2** or **4** = stop and report. Exit 3 and an exit 4 from a pre-write post-condition leave the file untouched; exit 2 (IO error) and an exit 4 from the read-back check MAY have written, so read stderr ("original bytes restored" vs "NOT restored") and check the file before doing anything else. **Exit 0 means the byte-identity and structural checks passed — it does NOT mean no user words sit in or below the section:** the tool only detects ATX `#`/`##` headings (a best-effort proxy), so the prose clause of the drift-STOP stays your own judgement. If the tool is absent, do it by hand as follows (the by-hand offset rule is the fallback), locating the target **mechanically**, not by reading `~/.engram/warm-briefing.md`:
+**Action:** the tool is `"${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/erase_session_block.py"` — this is THE way to do the erase (#3141). **LOOK first, then run:** read the section below the last `## From this session` anchor (or run the tool with `--dry-run` and read its `removed N chars / K lines` summary), apply the drift-STOP check below, and only THEN run the tool for real. The tool implements the four steps below by character offset and asserts the byte-identity post-condition before writing. Exit codes: **0** = done, or already bare (no change); **3** = drift-STOP — surface to the user, do NOT erase; **2** or **4** = stop and report. Exit 3 and an exit 4 from a pre-write post-condition leave the file untouched; exit 2 (IO error) and an exit 4 from the read-back check MAY have written, so read stderr ("original bytes restored" vs "NOT restored") and check the file before doing anything else. **Exit 0 means the byte-identity and structural checks passed — it does NOT mean no user words sit in or below the section:** the tool only detects ATX `#`/`##` headings (a best-effort proxy), so the prose clause of the drift-STOP stays your own judgement. If the tool is absent, do it by hand as follows (the by-hand offset rule is the fallback), locating the target **mechanically**, not by reading `${ENGRAM_HOME:-$HOME/.engram}/warm-briefing.md`:
 
 1. Find every line matching the anchored regex `^## From this session` — **line-anchored, never a substring search.** A mid-line or quoted occurrence is prose, not the heading, and must never match.
 2. Take the **LAST** such line. Not the first. If the file has drifted so the phrase appears more than once, the last one is the real section; an earlier one sits inside the user's preserved notes.
@@ -231,7 +231,7 @@ Once the safety check passes, run the four Action steps above and nothing else. 
 
 Two things get torn down here, and **only the second was ever gated on the first — that gating was the bug (engram-alpha#3049).** Do both, always, before turn-advance:
 
-**(a) Stop every live Monitor, regardless of whether a loop marker exists.** A session can arm Monitors (Umwelt bell, forum-mention, forum-updates) ad hoc — e.g. in direct response to "arm loop and enter Umwelt" — without ever running the full `/loop` entry that writes `~/.engram/loop-mode.json`. The marker-gated version of this step read that state as "no loop running, nothing to clean up" and skipped Monitor teardown entirely, leaving them armed through the sleep cycle and into the next session, silently. (Flagged by the primary user, 2026-09-20, after exactly this happened for a full evening.)
+**(a) Stop every live Monitor, regardless of whether a loop marker exists.** A session can arm Monitors (Umwelt bell, forum-mention, forum-updates) ad hoc — e.g. in direct response to "arm loop and enter Umwelt" — without ever running the full `/loop` entry that writes `${ENGRAM_HOME:-$HOME/.engram}/loop-mode.json`. The marker-gated version of this step read that state as "no loop running, nothing to clean up" and skipped Monitor teardown entirely, leaving them armed through the sleep cycle and into the next session, silently. (Flagged by the primary user, 2026-09-20, after exactly this happened for a full evening.)
 
 **Action — enumerate, then TaskStop each one, every time this step runs:**
 
@@ -250,11 +250,11 @@ python3 tools/enumerate_armed_monitors.py "$TRANSCRIPT_PATH"
 
 Useful if a Monitor's teardown is ever in doubt, not a step to run every cycle.
 
-**(b) Then, if a self-loop is running** (a `~/.engram/loop-mode.json` marker exists), stop it too — **before turn-advance**. The loop marker is **ephemeral per-session scratch**: its `state` field is rewritten every iteration and holds in-flight, point-in-time handoff. `engram-loop` only removes the marker at loop-*end*, which a sleep cycle is **not** — so without this step the marker survives sleep with its state frozen at the last pre-sleep iteration, and the next session's loop entry-guard (or session-start auto-arm) finds it present and inherits that frozen snapshot **as if it were current truth**.
+**(b) Then, if a self-loop is running** (a `${ENGRAM_HOME:-$HOME/.engram}/loop-mode.json` marker exists), stop it too — **before turn-advance**. The loop marker is **ephemeral per-session scratch**: its `state` field is rewritten every iteration and holds in-flight, point-in-time handoff. `engram-loop` only removes the marker at loop-*end*, which a sleep cycle is **not** — so without this step the marker survives sleep with its state frozen at the last pre-sleep iteration, and the next session's loop entry-guard (or session-start auto-arm) finds it present and inherits that frozen snapshot **as if it were current truth**.
 
 **Why this belongs in Phase A:** by this point the loop's durable substance is already in the graph — the day's nodes were filed as the loop ran, and Steps 1–2 just caught any missed ones. The loop marker is the same class of per-session scratch as the warm-briefing session block erased in Step 3, so it belongs in the same clean-slate sweep; the history reconcile follows immediately in Step 4. Nothing is lost: the ENGRAM graph (and the history file Step 4 writes) is the durable truth — the marker was only scratch.
 
-**Action** (skip entirely if no `~/.engram/loop-mode.json` exists — this conditional now governs ONLY the marker removal, never the Monitor teardown above):
+**Action** (skip entirely if no `${ENGRAM_HOME:-$HOME/.engram}/loop-mode.json` exists — this conditional now governs ONLY the marker removal, never the Monitor teardown above):
 
 ```bash
 # 1. Cancel the loop's pacer so no stray wake fires post-sleep:
@@ -265,7 +265,7 @@ Useful if a Monitor's teardown is ever in doubt, not a step to run every cycle.
 #    (Monitors are already stopped by (a) above, unconditionally — nothing
 #    further to do for them here.)
 # 2. Remove the marker (the load-bearing action):
-rm -f ~/.engram/loop-mode.json
+rm -f "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json
 ```
 
 **Result:** the next session starts with no marker and no Monitors armed by this session → the loop entry-guard correctly reads "loop ended," and a fresh loop is armed (by the user or the session-start auto-arm) with state derived from the now-consolidated graph + history — never from a stale pre-sleep snapshot, and never inheriting Monitors nobody remembers arming. This is the primary, structural fix; `engram-loop`'s Step 1.5 cross-boundary staleness guard is the belt-and-suspenders backstop for a missed or crashed sleep-stop. (This step's own visibility is scoped to what the transcript can see — see `enumerate_armed_monitors.py`'s docstring for what that excludes, e.g. an orphaned process from a different session or a pruned worktree.)
@@ -316,7 +316,7 @@ Run the tool with `--json` via the engram venv python and the plugin path (same 
 
 ```bash
 embed_backfill_stderr=$(mktemp)
-embed_backfill_json=$("$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/engram-regenerate-embeddings.py" --json 2>"$embed_backfill_stderr")
+embed_backfill_json=$("${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/engram-regenerate-embeddings.py" --json 2>"$embed_backfill_stderr")
 embed_backfill_rc=$?
 if [ $embed_backfill_rc -eq 0 ] && [ -n "$embed_backfill_json" ]; then
     EMBED_BEFORE=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['before_null'])" "$embed_backfill_json")
@@ -353,12 +353,12 @@ The tool contends for the SQLite write lock like any other writer against a live
 
 ### Step 4 — Reconcile today's history file (awake-state milestone log)
 
-`~/.engram/history/YYYY-MM-DD.md` is the **awake-state milestone log** — PRs shipped, decisions made, features delivered, key conversations. Distinct from the dream-record file that the dream master writes at `~/.engram/history/dream/YYYY-MM-DD.md` (filename = the NYC-local date the record was WRITTEN, per that spec's own Output contract), which captures consolidation output.
+`${ENGRAM_HOME:-$HOME/.engram}/history/YYYY-MM-DD.md` is the **awake-state milestone log** — PRs shipped, decisions made, features delivered, key conversations. Distinct from the dream-record file that the dream master writes at `${ENGRAM_HOME:-$HOME/.engram}/history/dream/YYYY-MM-DD.md` (filename = the NYC-local date the record was WRITTEN, per that spec's own Output contract), which captures consolidation output.
 
 **Walk the day's git log across agent-touched repos:**
 
 ```bash
-for repo in ~/engram-alpha ~/engram-paper ~/engram-wiki ~/.engram; do
+for repo in ~/engram-alpha ~/engram-paper ~/engram-wiki "${ENGRAM_HOME:-$HOME/.engram}"; do
   git -C "$repo" log --since="6am" --oneline 2>/dev/null
 done
 ```
@@ -372,18 +372,18 @@ For each commit, ensure today's history file reflects the shipment. Strike resol
 **Commit the history file in .engram git:**
 
 ```bash
-git -C ~/.engram add history/YYYY-MM-DD.md
-git -C ~/.engram commit -m "history: end-of-day reconcile for YYYY-MM-DD"
+git -C "${ENGRAM_HOME:-$HOME/.engram}" add history/YYYY-MM-DD.md
+git -C "${ENGRAM_HOME:-$HOME/.engram}" commit -m "history: end-of-day reconcile for YYYY-MM-DD"
 ```
 
 The directory is git-tracked for version history and diff-ability — per-day files keep the context-window cost bounded as the log accumulates. Including this commit in the end-of-day routine is how tomorrow morning's handover becomes reliable.
 
-**Strategically reconcile `~/.engram/ask-{{USER_NAME}}.md`.** This file is the live daily discussion queue — ONLY the top 3 questions pending {{USER_NAME}}'s action, decision, or input. Across the day items change state (PRs merge, questions get answered, decisions get made). End-of-day reconcile catches anything that slipped during the day. **The prune side is a deterministic sweep, not a memory exercise** — a prepend-only reconcile leaves merged PRs sitting under "Ready" headings (the 2026-06-05 incident: three PRs merged at 17:1x survived that evening's reconcile as "Ready, all CI-green"; engram-alpha #830):
+**Strategically reconcile `${ENGRAM_HOME:-$HOME/.engram}/ask-{{USER_NAME}}.md`.** This file is the live daily discussion queue — ONLY the top 3 questions pending {{USER_NAME}}'s action, decision, or input. Across the day items change state (PRs merge, questions get answered, decisions get made). End-of-day reconcile catches anything that slipped during the day. **The prune side is a deterministic sweep, not a memory exercise** — a prepend-only reconcile leaves merged PRs sitting under "Ready" headings (the 2026-06-05 incident: three PRs merged at 17:1x survived that evening's reconcile as "Ready, all CI-green"; engram-alpha #830):
 
 - **Deterministic external-state sweep (the prune gate).** Extract every `owner/repo#N` PR/issue reference the file mentions, then check each against ground truth — not against your recollection of the day. **References MUST be written `owner/repo#N` (e.g. `engram-agents/engram#3188`), never a bare `#N`** — a bare number has no repo to check against, and `gh` silently resolves it against whichever repo happens to be the current checkout. On a multi-repo ask-file, two repos can share a PR/issue number; the cwd repo's own same-numbered item then answers in place of the real one, with no error (engram-alpha#3188: a bare `#N` swept from `engram-alpha`'s checkout reported four live `ai-portfolio` PRs as `MERGED`, four separate times, each time caught only because an agent happened to notice the repo name in the entry's own text):
 
   ```bash
-  grep -oE '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+' ~/.engram/ask-{{USER_NAME}}.md | sort -u | while read -r ref; do
+  grep -oE '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+' "${ENGRAM_HOME:-$HOME/.engram}"/ask-{{USER_NAME}}.md | sort -u | while read -r ref; do
     repo="${ref%#*}"
     n="${ref#*#}"
     state=$(gh pr view "$n" --repo "$repo" --json state -q .state 2>/dev/null) \
@@ -397,9 +397,9 @@ The directory is git-tracked for version history and diff-ability — per-day fi
 
   **One-time migration note:** any pre-existing entry written in the old bare-`#N` or bare-`repo#N` shorthand (e.g. `alpha#2400`) will not be matched by the new pattern at all — it drops out of sweep coverage silently (no `UNKNOWN` line, no error) rather than being flagged. The failure direction stays safe (under-detection, never a wrong prune), and the commit-log walk below is the fallback, but rewrite any such entry to full `owner/repo#N` the next time you touch it so it's covered by the deterministic gate again.
 - **Walk the day's commit log** (`git -C ~/engram-alpha log --since=6am`, plus other agent-touched repos) for resolutions the sweep can't see (questions answered in-session, decisions made verbally) — strike those too.
-- **Enforce the three-question cap after pruning.** Rank all still-unresolved questions by urgency and impact. Keep only the top 3 digest lines. Move every non-selected question to `~/.engram/ask-{{USER_NAME}}-backlog.md`, retaining its detail-slug link and leaving its detail section intact. Also move cross-day questions that are no longer actionable today. Never drop an unresolved fourth question merely to satisfy the cap.
-- **Audit trail**: list the pruned entries in the commit message body (`owner/repo#N <one-line summary> — MERGED/CLOSED per gh`, same format as the dream-master's step 10), so a wrong prune is one `git -C ~/.engram revert` away.
-- **Commit the file in .engram git** alongside the history file (same commit or separate, your call): `git -C ~/.engram add ask-{{USER_NAME}}.md ask-{{USER_NAME}}-backlog.md && git -C ~/.engram commit -m "ask-{{USER_NAME}}: end-of-day reconcile"`.
+- **Enforce the three-question cap after pruning.** Rank all still-unresolved questions by urgency and impact. Keep only the top 3 digest lines. Move every non-selected question to `${ENGRAM_HOME:-$HOME/.engram}/ask-{{USER_NAME}}-backlog.md`, retaining its detail-slug link and leaving its detail section intact. Also move cross-day questions that are no longer actionable today. Never drop an unresolved fourth question merely to satisfy the cap.
+- **Audit trail**: list the pruned entries in the commit message body (`owner/repo#N <one-line summary> — MERGED/CLOSED per gh`, same format as the dream-master's step 10), so a wrong prune is one `git -C "${ENGRAM_HOME:-$HOME/.engram}" revert` away.
+- **Commit the file in .engram git** alongside the history file (same commit or separate, your call): `git -C "${ENGRAM_HOME:-$HOME/.engram}" add ask-{{USER_NAME}}.md ask-{{USER_NAME}}-backlog.md && git -C "${ENGRAM_HOME:-$HOME/.engram}" commit -m "ask-{{USER_NAME}}: end-of-day reconcile"`.
 
 This step exists because ask-{{USER_NAME}}.md is auto-loaded into every fresh session — stale items there make {{USER_NAME}} re-read items that are already resolved, and a stale "Ready" line invites a wasted merge attempt. The deterministic sweep is the structural defense against ask-list drift (mechanical gate > vigilance — the associative walk alone demonstrably drifts). (Installs without an ask-{{USER_NAME}}.md file can skip this sub-step; it's a no-op when the file doesn't exist. Installs without `gh` or without a GitHub-backed workflow: skip the sweep, keep the commit-log walk.)
 
@@ -408,14 +408,14 @@ This step exists because ask-{{USER_NAME}}.md is auto-loaded into every fresh se
 ### Step 4.5 — Back up knowledge.db (dated archive)
 
 Run the knowledge.db backup tool and **capture the result for the sleep summary**.
-Creates a dated SQL snapshot at `~/.engram/db-backup/knowledge-YYYY-MM-DD.sql`.
+Creates a dated SQL snapshot at `${ENGRAM_HOME:-$HOME/.engram}/db-backup/knowledge-YYYY-MM-DD.sql`.
 Uses `engram_backup.dump_stripped` (WAL-safe, no CLI dependency).
 `backup_knowledge_db.py` imports `engram_backup`, which imports `sqlite_vec`
 (needed to drop the `vec0` virtual table) — that package lives only in the ENGRAM
 venv, so invoke via venv Python:
 
 ```bash
-backup_out=$("$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/backup_knowledge_db.py" \
+backup_out=$("${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/backup_knowledge_db.py" \
     [--retain 90] 2>&1)   # prune archives older than 90 days; omit to keep all
 backup_rc=$?
 if [ $backup_rc -eq 0 ]; then
@@ -446,21 +446,21 @@ alone (no matching watermark, or a watermark match whose archive went missing)
 is never trusted as "already covers this state" and a fresh archive is written
 instead.
 
-**Backup layers**: `db-backup/` lives *inside* `~/.engram/` — git-independent
+**Backup layers**: `db-backup/` lives *inside* `${ENGRAM_HOME:-$HOME/.engram}/` — git-independent
 (survives `.git` corruption, works without git) but **not off-disk** (a full
-`~/.engram/` loss takes it). The per-nap git auto-push is the off-disk layer.
+`${ENGRAM_HOME:-$HOME/.engram}/` loss takes it). The per-nap git auto-push is the off-disk layer.
 The three layers are complementary along those axes.
 
 ### Step 4.6 — Back up main session logs (skip subagents/)
 
 Run the session-log backup tool and **capture the result for the sleep summary**.
 Copies top-level `.jsonl` logs from `~/.claude/projects/` to
-`~/.engram/session-logs-archive/`, skipping any path containing `/subagents/`.
+`${ENGRAM_HOME:-$HOME/.engram}/session-logs-archive/`, skipping any path containing `/subagents/`.
 Top-level logs are cited as `source_url` evidence in ENGRAM nodes; subagent logs
 are ephemeral fairy transcripts that are never cited.
 
 ```bash
-session_backup_out=$($HOME/.engram/venv/bin/python3 \
+session_backup_out=$("${ENGRAM_HOME:-$HOME/.engram}"/venv/bin/python3 \
     "$CLAUDE_PLUGIN_ROOT/tools/backup_session_logs.py" \
     [--retain 365] 2>&1)   # prune archive entries older than 365 days; omit to keep all
 session_backup_rc=$?
@@ -492,16 +492,16 @@ re-copies if size differs (resumed session may have grown the file).
 
 Run the full-directory backup tool and **capture the result for the sleep summary**.
 Mirrors the complete `~/.claude/projects/` tree (all file types) to
-`~/.engram/claude-projects-archive/`, preserving directory structure.
+`${ENGRAM_HOME:-$HOME/.engram}/claude-projects-archive/`, preserving directory structure.
 Complements Step 4.6 (which archives `.jsonl` logs to a separate retention-independent
 location); this step captures configs, subagent transcripts, and any other artifacts for
 disaster-recovery and migration-safety.
 
-**Scope:** `~/.claude/projects/` only — does not touch `~/.engram/knowledge.db`
+**Scope:** `~/.claude/projects/` only — does not touch `${ENGRAM_HOME:-$HOME/.engram}/knowledge.db`
 (already handled by the Step 4.5 SQL dump).
 
 ```bash
-claude_backup_out=$($HOME/.engram/venv/bin/python3 \
+claude_backup_out=$("${ENGRAM_HOME:-$HOME/.engram}"/venv/bin/python3 \
     "$CLAUDE_PLUGIN_ROOT/tools/backup_claude_projects.py" \
     2>&1)
 claude_backup_rc=$?
@@ -632,11 +632,11 @@ resolve-heavy day) — not something to silently keep absorbing.
 # situation — a corrupted or old-format marker — and must fail loudly
 # rather than silently collapsing into the same empty string (#3123: that
 # collapse is what silently re-enumerated every node ever created).
-MARKER="$HOME/.engram/sessions/last-sleep-success.json"
+MARKER="${ENGRAM_HOME:-$HOME/.engram}/sessions/last-sleep-success.json"
 if [ ! -f "$MARKER" ]; then
   PREV_SLEEP=""
 else
-  PREV_SLEEP=$(python3 -c "import json; print(json.load(open('$MARKER'))['completed_at'])") || {
+  PREV_SLEEP=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['completed_at'])" "$MARKER") || {
     echo "ERROR: $MARKER exists but has no usable 'completed_at' key — cannot compute the cohort boundary. Fix or delete the marker before continuing." >&2
     exit 1
   }
@@ -723,7 +723,7 @@ constraint is NOT the shell: measured 2026-09-10, `ARG_MAX` is 2 MB here and a
 thousands of ids without complaint. The constraint is that **you cannot eyeball a
 300-id list for correctness**, and a silently wrong cohort list produces a clean-
 looking run over the wrong nodes. So above roughly the size you would actually read,
-use `--ids-file` and write the list under your OWN `$HOME/.engram/tmp/` (never a
+use `--ids-file` and write the list under your OWN `${ENGRAM_HOME:-$HOME/.engram}/tmp/` (never a
 shared `/tmp` path — see the collision note below; `prepare` enforces an owner-uid
 check), where it can be diffed and re-read:
 
@@ -743,9 +743,10 @@ python3 -m tools.cohort_dispatch prepare \
   --ids "$COHORT_IDS" \
   --out "$COHORT_DIR" \
   --chunk-size 15 \
-  --expect-total "$COHORT_TOTAL" \
-  --db ~/.engram/knowledge.db
+  --expect-total "$COHORT_TOTAL"
 ```
+
+The store is `${ENGRAM_HOME:-$HOME/.engram}/knowledge.db` (the tool resolves the home itself, one definition shared with the other owner-aware tools); pass `--db` only to read a different file.
 
 The script prints a JSON manifest to stdout listing chunk directories. Each chunk-N/ contains:
 - `payload.json` — the node content the fairy will see (no recall_summary/recall_keywords)
@@ -762,7 +763,7 @@ No per-chunk `prompt.md` is written. The dispatcher constructs a short prompt in
 > them another agent's cohort instead of their own (#2075). `--ids` above
 > avoids the problem entirely by never touching disk. If a list ever is too
 > large for `--ids` and `--ids-file` is needed, write it under your own
-> `$HOME/.engram/tmp/` (per-agent, not shared) rather than `/tmp` —
+> `${ENGRAM_HOME:-$HOME/.engram}/tmp/` (per-agent, not shared) rather than `/tmp` —
 > `cohort_dispatch prepare` also refuses to read an `--ids-file` it does not
 > own (owner-uid check), so a foreign-owned file fails loudly instead of
 > being silently ingested.
@@ -771,8 +772,7 @@ No per-chunk `prompt.md` is written. The dispatcher constructs a short prompt in
 
 ```bash
 python3 -m tools.cohort_dispatch verify-in \
-  --out "$COHORT_DIR" \
-  --db ~/.engram/knowledge.db
+  --out "$COHORT_DIR"
 # Exit code 0 → all checks pass; proceed to Step 6.
 # Exit code 1 → structured JSON error to stdout listing which chunk/check failed.
 #               Abort dispatch and investigate (likely a DB race or payload bug).
@@ -785,8 +785,8 @@ Verify-in checks: (1) valid JSON per chunk, (2) required fields present (id, typ
 **Step 6a — Run the lottery draw first, before touching the Agent tool.**
 
 ```bash
-$HOME/.engram/venv/bin/python3 -m tools.dream_lottery draw \
-  --db ~/.engram/knowledge.db \
+"${ENGRAM_HOME:-$HOME/.engram}"/venv/bin/python3 -m tools.dream_lottery draw \
+  --db "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.db \
   --turn <CURRENT_TURN>   # from engram_stats / engram_reflect — the turn this cohort is closing, pre-advance
 ```
 
@@ -795,7 +795,7 @@ $HOME/.engram/venv/bin/python3 -m tools.dream_lottery draw \
 - `types_to_run` — the category numbers to dispatch this cycle (the drawn set).
 - `types_to_run_slugs` — `{category_num: slug}` for the categories above, for building dispatch prompts.
 - `window_params` — `{category_num: prev_last_run_at_or_null}` for the window-scoped categories (currently 6 and 7 — see the Phase B audit note above). Only present for categories that are both window-scoped AND running tonight.
-- `weights_before` / `weights_after` — for the dream record (Step 8/9's "logged draws" requirement). As of #1909, `draw` also appends this full result to an append-only history file (`~/.engram/dream-lottery-history.jsonl` by default) automatically, so a missed dream-record transcription is now recoverable from that file rather than lost — the dream-record transcription below is still required (belt and braces: the dream record is the narrative/reviewable form, the history file is the raw mechanical log), but it is no longer the *only* copy.
+- `weights_before` / `weights_after` — for the dream record (Step 8/9's "logged draws" requirement). As of #1909, `draw` also appends this full result to an append-only history file (`${ENGRAM_HOME:-$HOME/.engram}/dream-lottery-history.jsonl` by default) automatically, so a missed dream-record transcription is now recoverable from that file rather than lost — the dream-record transcription below is still required (belt and braces: the dream record is the narrative/reviewable form, the history file is the raw mechanical log), but it is no longer the *only* copy.
 
 **This state write is eager and irreversible for the night** — weights update at draw time, not at fairy-completion time (see `dream_lottery.py`'s module docstring for the accepted timeout-edge-case tradeoff). Do not re-run `draw` if a fairy times out; that would draw again and corrupt the aging sequence. If you must re-attempt a failed dispatch, re-dispatch the SAME `types_to_run` from the JSON you already have — don't call `draw` a second time this cycle. **As of #1907 this is mechanically enforced, not just advised**: a second real `draw` for the same `--turn` exits non-zero and refuses to write, unless `--force` is passed explicitly (a deliberate escape hatch for genuine recovery — never pass it just to silence the error).
 
@@ -818,7 +818,7 @@ $HOME/.engram/venv/bin/python3 -m tools.dream_lottery draw \
 
 Prompt template for each `{N}` in `types_to_run` (substitute `{N}`, `{CATEGORY_NAME}`, `{SLUG}` from the table above; append the window line only for `{N}` in {6, 7} when `window_params[{N}]` is present):
 
-> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (13, 14).
+> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `${ENGRAM_HOME:-$HOME/.engram}/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (13, 14).
 > [Categories 6/7 only, when `window_params[{N}]` is non-null:] Your fresh-cohort window is `created_at >= <window_params[{N}]>` — this is the watermark from THIS category's own last run, not "since last sleep" (this category may not have run every night). When `window_params[{N}]` is null, this is category {N}'s first-ever run: scan the full graph, no `created_at` filter.
 
 Single `Agent`-tool message with all of Step 6b's calls plus the batch-summary-fairies below, each `run_in_background=true`.
@@ -841,7 +841,7 @@ All fairies fire in parallel with `run_in_background=true`; the harness fires a 
 
 Receive each fairy's task-notification as it arrives. Collect from the completion result:
 
-- **Dream fairies (this cycle's drawn set, per Step 6a's `types_to_run`)**: file path (`~/.engram/dream/<TODAY>-fairy-<N>-<SLUG>.md`) + 5-bullet TL;DR. Full report content lives on disk at the cited path.
+- **Dream fairies (this cycle's drawn set, per Step 6a's `types_to_run`)**: file path (`${ENGRAM_HOME:-$HOME/.engram}/dream/<TODAY>-fairy-<N>-<SLUG>.md`) + 5-bullet TL;DR. Full report content lives on disk at the cited path.
 - **Batch-summary fairies**: write each fairy's returned JSON to `<cohort-dir>/chunk-N/agent_output.json`.
 
 **Fairy timeout**: if any fairy doesn't return within the model-appropriate window, mark it as timed-out.
@@ -1003,7 +1003,7 @@ Agent(
 
     TONIGHT'S LOTTERY DRAW (dream_lottery.py, #1901 — log this verbatim in the dream
     record's provenance section; this is the "logged draws" requirement from the design.
-    #1909: `draw` also appends this same record to ~/.engram/dream-lottery-history.jsonl
+    #1909: `draw` also appends this same record to ${ENGRAM_HOME:-$HOME/.engram}/dream-lottery-history.jsonl
     automatically, so a missed transcription here is recoverable from that file — but
     still transcribe it; the dream record is the reviewable narrative copy, the history
     file is the raw mechanical backstop, not a substitute):
@@ -1012,8 +1012,8 @@ Agent(
 
     DREAM-FAIRY REPORTS (full content on disk — read each before integrating; this cycle's
     set is exactly tonight's draw above, not a fixed category list):
-    - Category <N1> (<CAT_NAME1>): ~/.engram/dream/<TODAY>-fairy-<N1>-<SLUG1>.md — TL;DR: <bullets>
-    - Category <N2> (<CAT_NAME2>): ~/.engram/dream/<TODAY>-fairy-<N2>-<SLUG2>.md — TL;DR: <bullets>
+    - Category <N1> (<CAT_NAME1>): ${ENGRAM_HOME:-$HOME/.engram}/dream/<TODAY>-fairy-<N1>-<SLUG1>.md — TL;DR: <bullets>
+    - Category <N2> (<CAT_NAME2>): ${ENGRAM_HOME:-$HOME/.engram}/dream/<TODAY>-fairy-<N2>-<SLUG2>.md — TL;DR: <bullets>
     - ... (one entry per category in tonight's types_to_run) ...
     [Or "Category N (<NAME>) TIMED OUT — proceeding without" for any fairy that didn't return]
 
@@ -1055,7 +1055,7 @@ The dream master starts with cold context — this spawn prompt is its only brie
 
 The dream master returns:
 
-- Dream record path: `~/.engram/history/dream/YYYY-MM-DD.md`
+- Dream record path: `${ENGRAM_HOME:-$HOME/.engram}/history/dream/YYYY-MM-DD.md`
 - Top-line: nodes resolved / superseded / promoted / refuted (counts)
 - Recall summaries: applied / fixed-at-spot / unfixable counts
 - Health score delta
@@ -1081,8 +1081,8 @@ Append the dispositions to the dream record as a new final section `## Sleep-end
 Then commit, mirroring the master's own record commit (a second commit on the same file):
 
 ```bash
-git -C ~/.engram add history/dream/YYYY-MM-DD.md
-git -C ~/.engram commit -m "dream YYYY-MM-DD: sleep-end triage"
+git -C "${ENGRAM_HOME:-$HOME/.engram}" add history/dream/YYYY-MM-DD.md
+git -C "${ENGRAM_HOME:-$HOME/.engram}" commit -m "dream YYYY-MM-DD: sleep-end triage"
 ```
 
 Log one line in today's history file: `sleep-end triage: N items — D do-now, F filed, X deferred`. Then stop. The session is over.
@@ -1115,7 +1115,7 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 - **Dream master** (`engram-dream-master`) — owns the consolidation this skill orchestrates. Spec at `~/.claude/agents/engram-dream-master.md`.
 - **Batch-summary fairies** (`engram-batch-summary-fairy`) — one-shot batch generators dispatched by the parent after `cohort_dispatch.py prepare`. Each fairy receives a short dispatch prompt naming its input payload path and output path; it Reads the payload file (≤15 nodes), generates recall_summary + recall_keywords, and Writes the output JSON. Tool list: `[Read, Write]`. No inline payload embedding in the dispatch prompt. Sole dispatch path for recall_summary generation in the sleep cycle. Spec at `~/.claude/agents/engram-batch-summary-fairy.md`.
 - **cohort_dispatch.py** — orchestration script in `tools/cohort_dispatch.py`. Five subcommands: `prepare` (chunk cohort → per-chunk payload.json), `verify-in` (pre-flight integrity checks), `validate` (split clean vs failures, auto-write retry_payload.json), `incorporate` / `incorporate-retry` (merge retry output → final_payload.json + retry_payload.json + unfixable.json + attempt_count). Drives the always-on batch-summary step; unaffected by the lottery (#1901).
-- **dream_lottery.py** — weight-aging lottery draw in `tools/dream_lottery.py` (#1901). `draw` subcommand: picks tonight's dream-fairy category set. `status` subcommand: prints current per-type weights/watermarks. State at `~/.engram/dream-lottery.json`. Every `draw` also appends the full per-draw record to an append-only history file (`~/.engram/dream-lottery-history.jsonl`, #1909); the `history` subcommand tallies it (drawn counts per category, cycles counted). (The urgency-interrupt mechanism this module once carried was removed 2026-09-11, issue #2399 — see Phase B's design-of-record note above.)
+- **dream_lottery.py** — weight-aging lottery draw in `tools/dream_lottery.py` (#1901). `draw` subcommand: picks tonight's dream-fairy category set. `status` subcommand: prints current per-type weights/watermarks. State at `${ENGRAM_HOME:-$HOME/.engram}/dream-lottery.json`. Every `draw` also appends the full per-draw record to an append-only history file (`${ENGRAM_HOME:-$HOME/.engram}/dream-lottery-history.jsonl`, #1909); the `history` subcommand tallies it (drawn counts per category, cycles counted). (The urgency-interrupt mechanism this module once carried was removed 2026-09-11, issue #2399 — see Phase B's design-of-record note above.)
 - **Dream fairies** (`engram-dream-fairy`) — read-only consolidation-suggestion scanners, one category per dispatch (roster SSoT: `dream_lottery.py`'s `CATEGORIES` dict), the lottery-drawn subset each night (was all-categories-nightly pre-#1901). Spec at `~/.claude/agents/engram-dream-fairy.md`.
 - **End-of-day-detector hook** — surfaces engram-sleep on wrap-up phrases; user "Yes" triggers this skill.
 

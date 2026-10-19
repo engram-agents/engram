@@ -25,7 +25,7 @@ A loop diagnose is a **retrospective audit** of a completed autonomous curiosity
 
 The skill takes an optional date argument: `/loop-diagnose 2026-04-15`
 
-If no date is given, find the most recent set of curiosity loop iteration reports in `~/.engram/reports/`.
+If no date is given, find the most recent set of curiosity loop iteration reports in `~/.engram/reports/` (under `$ENGRAM_HOME`, default `~/.engram`).
 
 ---
 
@@ -34,7 +34,7 @@ If no date is given, find the most recent set of curiosity loop iteration report
 Find all iteration reports for the target session:
 
 ```bash
-stat --format='%n %Y %s' ~/.engram/reports/curiosity_loop_YYYY-MM-DD_iter*.md
+stat --format='%n %Y %s' "${ENGRAM_HOME:-$HOME/.engram}"/reports/curiosity_loop_YYYY-MM-DD_iter*.md
 ```
 
 Extract for each report:
@@ -194,7 +194,7 @@ Based on the remaining questions and the stopping behavior, what modes would hav
 
 ## Step 8 — Write Diagnostic Report
 
-Write the full diagnostic to `~/.engram/reports/loop_diagnose_YYYY-MM-DD.md`.
+Write the full diagnostic to `~/.engram/reports/loop_diagnose_YYYY-MM-DD.md` (under `$ENGRAM_HOME`, default `~/.engram`).
 
 Structure:
 1. **Session Overview** — date, iterations, wall clock, graph growth

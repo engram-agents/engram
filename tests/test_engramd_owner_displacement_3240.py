@@ -296,6 +296,7 @@ def test_D9_every_known_method_is_guarded_except_no_store_set(owner, home):
     assert eo.NO_STORE_METHODS == frozenset({"ping"})
     # A hypothetical future store method, registered WITHOUT any guard code.
     owner._methods["probe_store"] = lambda params, deadline: {"status": "ok", "result": {}}
+    owner._method_kinds["probe_store"] = "read"  # #3822: an unclassified method is default-deny at dispatch
     _displace(home, "-shm")
     probe = ec.read("probe_store", {}, timeout=3.0, socket_path=owner.socket_path)
     assert isinstance(probe, ec.Rejected) and probe.reason == "substrate_displaced", probe

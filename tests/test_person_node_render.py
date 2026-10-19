@@ -256,6 +256,7 @@ class HookMomentRotationTest(unittest.TestCase):
         self.server = fresh_server()
         self.hook = _load_hook_module()
         self.hook.ENGRAM_HOME = TEST_DIR
+        self.hook.CONFIG_PATH = os.path.join(self.hook.ENGRAM_HOME, "config.json")  # #3827: CONFIG_PATH is the hook's one config source
         self.hook.KNOWLEDGE_DB_PATH = os.path.join(TEST_DIR, "knowledge.db")
 
     def _special_entry_for(self, pid, meta=None):
@@ -542,6 +543,7 @@ class QueryInspectPersonFieldsTest(unittest.TestCase):
 
         hook = _load_hook_module()
         hook.ENGRAM_HOME = TEST_DIR
+        hook.CONFIG_PATH = os.path.join(hook.ENGRAM_HOME, "config.json")  # #3827: CONFIG_PATH is the hook's one config source
         hook.KNOWLEDGE_DB_PATH = os.path.join(TEST_DIR, "knowledge.db")
         meta = _person_meta(self.server, pid)
         hook_entry = {
@@ -581,6 +583,7 @@ class PersonMomentCooldownConfigTest(unittest.TestCase):
         self.query_mod = engram_query
         self.hook = _load_hook_module()
         self.hook.ENGRAM_HOME = TEST_DIR
+        self.hook.CONFIG_PATH = os.path.join(self.hook.ENGRAM_HOME, "config.json")  # #3827: CONFIG_PATH is the hook's one config source
         self.hook.KNOWLEDGE_DB_PATH = os.path.join(TEST_DIR, "knowledge.db")
 
     def _config_path(self):
@@ -668,6 +671,7 @@ class PersonMomentLedgerCrossImplementationParityTest(unittest.TestCase):
         self.query_mod = engram_query
         self.hook = _load_hook_module()
         self.hook.ENGRAM_HOME = TEST_DIR
+        self.hook.CONFIG_PATH = os.path.join(self.hook.ENGRAM_HOME, "config.json")  # #3827: CONFIG_PATH is the hook's one config source
         self.hook.KNOWLEDGE_DB_PATH = os.path.join(TEST_DIR, "knowledge.db")
 
     def _ledger_path(self):

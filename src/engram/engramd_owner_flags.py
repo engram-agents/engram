@@ -19,7 +19,8 @@ hook runs under a timeout). This module imports only the standard library, so it
 resolves wherever the plugin root is (never import hook code from here).
 
 CLI (used by hooks/start-engramd-owner.sh): `engramd_owner_flags.py <ENGRAM_HOME>`
-prints `on` or `off` on stdout and exits 0. A caller that gets anything else (a crash,
+prints `on` or `off` on stdout and exits 0; with `--names` it prints the comma-joined names of the
+ON flags instead (empty when none). A caller that gets anything else (a crash,
 no python) cannot tell, and must treat that as ambiguous rather than as off.
 
 U4d's `_owner_reads_enabled` (engram-user-identity-hook.py) calls `flag_on`. New readers
@@ -72,9 +73,21 @@ def any_owner_flag_on(config_path) -> bool:
     )
 
 
+def owner_flags_on(config_path) -> list[str]:
+    """The sorted names of every `engramd.*_via_owner` key that is the boolean `true` (#3823: a refusal
+    names the flags it is about).  Same rule as `any_owner_flag_on`, so the two cannot disagree."""
+    return sorted(
+        k for k, v in _load_engramd(config_path).items()
+        if isinstance(k, str) and k.endswith(OWNER_FLAG_SUFFIX) and v is True
+    )
+
+
 def main(argv: list[str]) -> int:
+    if len(argv) == 3 and argv[2] == "--names":
+        print(",".join(owner_flags_on(os.path.join(argv[1], "config.json"))))
+        return 0
     if len(argv) != 2:
-        print("usage: engramd_owner_flags.py <ENGRAM_HOME>", file=sys.stderr)
+        print("usage: engramd_owner_flags.py <ENGRAM_HOME> [--names]", file=sys.stderr)
         return 2
     print("on" if any_owner_flag_on(os.path.join(argv[1], "config.json")) else "off")
     return 0

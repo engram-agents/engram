@@ -110,7 +110,7 @@ def _cfg(*, enabled=None, extra=None):
 
 
 def _probe_root(tmp_path) -> Path:
-    return tmp_path / "home" / ".engram" / "probe" / "mods-recall"
+    return tmp_path / "engram" / "probe" / "mods-recall"
 
 
 def _live(tmp_path, session=SESSION) -> Path:

@@ -93,6 +93,16 @@ import sys
 import time
 from pathlib import Path
 
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863 6b): it would resolve against this process's cwd, a
+# different home than the daemon's or the server's. Fail open: one stderr line, nothing written, exit 0.
+# (Inline, not from _hooklib: this hook must still run when the sibling lib cannot import.)
+_ENGRAM_HOME_RAW = os.environ.get("ENGRAM_HOME") or ""
+if _ENGRAM_HOME_RAW and not os.path.isabs(os.path.expanduser(_ENGRAM_HOME_RAW)):
+    sys.stderr.write("engram hook: ENGRAM_HOME must be an absolute path, got %r; doing nothing\n" % (_ENGRAM_HOME_RAW,))
+    sys.exit(0)
+if _ENGRAM_HOME_RAW:
+    os.environ["ENGRAM_HOME"] = os.path.abspath(os.path.expanduser(_ENGRAM_HOME_RAW))  # `~/x` -> absolute for every raw reader
+
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
@@ -1932,6 +1942,7 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
                     source="daemon", default_cut="not_in_pool",
                     extra={"novel_terms": list(novel)},
                     read_conn=_rc,
+                    on_failure=lambda _e: _record_owner_failure("focused_ids", _e),
                 )
             except Exception as exc:  # e.g. an unserialisable tool_input: fail-open
                 print(f"route-ledger: {type(exc).__name__}: {exc}"[:300], file=sys.stderr)
@@ -1968,7 +1979,8 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None,
             _build, _rc = _focused_read_conn() if in_context_exclusion_enabled(ENGRAM_HOME) else (False, None)
             if _build:
                 _resolver = build_exclusion_resolver(
-                    hook_input.get("session_id") if hook_input else None, read_conn=_rc)
+                    hook_input.get("session_id") if hook_input else None, read_conn=_rc,
+                    on_failure=lambda _e: _record_owner_failure("focused_ids", _e))
                 _drop = in_context_drop_ids(
                     [n for n in pool if isinstance(n, dict)], _resolver,
                     exempt_types=("lesson", "cornerstone"))

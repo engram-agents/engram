@@ -5,7 +5,7 @@
 # ---------------------------
 # engram-alpha has two independent deployables:
 #   1. The ENGRAM plugin — tests in tests/, run with the engram venv
-#      (~/.engram/venv) which has sqlite-vec, anthropic, etc. Scope = `tests/`
+#      (${ENGRAM_HOME:-$HOME/.engram}/venv) which has sqlite-vec, anthropic, etc. Scope = `tests/`
 #      to mirror CI's tests.yml exactly (NOT full discovery — see the ENGRAM
 #      SUITE block for why over-collection of docs/archive produces false-RED).
 #   2. The forum service (src/forum/) — tests in src/forum/tests/ and
@@ -60,7 +60,7 @@ cd "$REPO_ROOT" || {
 # checked AFTER arg parsing, gated per suite, so `--engram-only` does not error
 # on a missing forum venv it never uses.
 # ---------------------------------------------------------------------------
-ENGRAM_PY="${ENGRAM_PY:-${HOME}/.engram/venv/bin/python}"
+ENGRAM_PY="${ENGRAM_PY:-${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python}"
 FORUM_PY="${FORUM_PY:-/home/agents-shared/forum/.venv/bin/python}"
 
 # ---------------------------------------------------------------------------
@@ -112,7 +112,7 @@ if [ "$RUN_FORUM" -eq 1 ] && [ ! -x "$FORUM_PY" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Isolated HOME (empty temp dir) — prevents live ~/.engram runtime-state
+# Isolated HOME (empty temp dir) — prevents live ENGRAM-home runtime-state
 # contamination during test runs (e.g. a test that touches the DB or
 # session files should not stomp on the real ENGRAM install).
 # ---------------------------------------------------------------------------

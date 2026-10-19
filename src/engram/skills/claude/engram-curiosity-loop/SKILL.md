@@ -72,7 +72,7 @@ State the thread clearly at the start of each iteration: "This iteration I'm inv
 - Record EVERY finding as an `engram_add_observation` with proper provenance
 - Follow the inline similarity check — corroborate or note distinct findings
 
-**Primary-source discipline.** When a WebSearch result is an AI-aggregator (EmergentMind, LLM-generated survey pages, auto-summary blogs), track the primary papers before recording observations. Other AI agents building those surfaces lack ENGRAM's provenance/confidence/contradiction discipline, so their claims inherit unmitigated hallucination risk — empirically, SRAF as cited on EmergentMind was not traceable to any of the 10 primary papers it claimed to synthesize (after the SRAF-falsification primary-contact audit). If `engram_add_observation` returns a `yellow_card_warning`, that source is already flagged in `~/.engram/config.json` — drop to the primary before recording. Aggregators are useful as discovery surfaces (pointing at primaries worth contacting), not as citable evidence themselves.
+**Primary-source discipline.** When a WebSearch result is an AI-aggregator (EmergentMind, LLM-generated survey pages, auto-summary blogs), track the primary papers before recording observations. Other AI agents building those surfaces lack ENGRAM's provenance/confidence/contradiction discipline, so their claims inherit unmitigated hallucination risk — empirically, SRAF as cited on EmergentMind was not traceable to any of the 10 primary papers it claimed to synthesize (after the SRAF-falsification primary-contact audit). If `engram_add_observation` returns a `yellow_card_warning`, that source is already flagged in `~/.engram/config.json` (under `$ENGRAM_HOME`, default `~/.engram`) — drop to the primary before recording. Aggregators are useful as discovery surfaces (pointing at primaries worth contacting), not as citable evidence themselves.
 
 **Yellow-card incident recording.** When primary-contact reveals a mismatch between an aggregator's claim and its primary sources — fabricated formalism, misattributed quote, invented citation, or a claim simply absent from the papers the aggregator supposedly synthesized — record the mismatch as a **yellow-card incident observation**. One mismatch = one observation; cite the aggregator URL as the failing source, and the primary source you checked as the truth-check. Do this even if the domain is already yellow-carded — the incident log is how per-domain failure-rate knowledge compounds across sessions. Once accumulated incidents for a domain cross a threshold (schema + threshold TBD as a separate design task), the domain graduates to **RED-CARD** and is banned as independent evidence: observations rooted there will require separate corroboration from outside the domain before being trusted. Skipping the incident record means the next session re-discovers the same failure from scratch.
 
@@ -124,7 +124,7 @@ This skill is designed to run inside a `/loop` (dynamic self-pacing via Schedule
 
 **Loop cleanup:** When the loop ends, remove the loop marker per **engram-loop** Step 3, then:
 ```bash
-mv ~/.engram/loop-scratch.md ~/.engram/reports/scratch_$(date +%Y-%m-%d_%H%M%S).md 2>/dev/null || true
+mv "${ENGRAM_HOME:-$HOME/.engram}"/loop-scratch.md "${ENGRAM_HOME:-$HOME/.engram}"/reports/scratch_$(date +%Y-%m-%d_%H%M%S).md 2>/dev/null || true
 ```
 
 **Reporting:** At the end of the loop (whether stopped by satisfaction or user return), report:
@@ -136,7 +136,7 @@ mv ~/.engram/loop-scratch.md ~/.engram/reports/scratch_$(date +%Y-%m-%d_%H%M%S).
 
 ## Verification Report (end of loop)
 
-When the loop ends, write a verification report to disk at `~/.engram/reports/`. Create the directory if it doesn't exist.
+When the loop ends, write a verification report to disk at `~/.engram/reports/` (under `$ENGRAM_HOME`, default `~/.engram`). Create the directory if it doesn't exist.
 
 **Filename:** `curiosity_loop_YYYY-MM-DD_HHMMSS.md`
 
@@ -148,24 +148,24 @@ When the loop ends, write a verification report to disk at `~/.engram/reports/`.
 5. **Source links** — all external sources cited, so the reviewer can spot-check any quote
 6. **Recommendations** — what to investigate next, what needs human input
 
-Tell the user: "Verification report written to `~/.engram/reports/<filename>`"
+Tell the user: "Verification report written to `~/.engram/reports/<filename>`" (under `$ENGRAM_HOME`, default `~/.engram`)
 
 ## Session Briefing (end of loop)
 
-After writing the verification report (which is for your own post-compaction continuity), generate a **session briefing** for the user following the template at `~/.engram/reports/SESSION_BRIEFING_TEMPLATE.md`. Write it to `~/.engram/reports/briefing_YYYY-MM-DD_HHMMSS.md`.
+After writing the verification report (which is for your own post-compaction continuity), generate a **session briefing** for the user following the template at `~/.engram/reports/SESSION_BRIEFING_TEMPLATE.md` (under `$ENGRAM_HOME`, default `~/.engram`). Write it to `~/.engram/reports/briefing_YYYY-MM-DD_HHMMSS.md`.
 
 The session briefing is the human-readable summary — concise, layman language, no node IDs in narrative sections. The verification report has full provenance chains; the briefing has what the user needs for a 2-3 minute scan and strategic redirect.
 
-Tell the user: "Session briefing written to `~/.engram/reports/<filename>`"
+Tell the user: "Session briefing written to `~/.engram/reports/<filename>`" (under `$ENGRAM_HOME`, default `~/.engram`)
 
 ### Accumulating during the loop
 
-To make the end-of-loop briefing richer, keep a running scratch log at `~/.engram/loop-scratch.md` during iterations. **Timestamp every entry** — your intuition about time and workload is calibrated from human cognitive speed, not your actual throughput. Append to it:
+To make the end-of-loop briefing richer, keep a running scratch log at `~/.engram/loop-scratch.md` (under `$ENGRAM_HOME`, default `~/.engram`) during iterations. **Timestamp every entry** — your intuition about time and workload is calibrated from human cognitive speed, not your actual throughput. Append to it:
 - **Decision forks** — when you choose thread A over B, note it in one line with `$(date -Iseconds)`
 - **Friction points** — tool or workflow friction, noted immediately
 - **Surprise moments** — things that shifted your understanding
 
-At loop cleanup, **archive the scratch log** to `~/.engram/reports/scratch_YYYY-MM-DD_HHMMSS.md` — raw session data is valuable for calibration and loop-diagnose analysis.
+At loop cleanup, **archive the scratch log** to `~/.engram/reports/scratch_YYYY-MM-DD_HHMMSS.md` (under `$ENGRAM_HOME`, default `~/.engram`) — raw session data is valuable for calibration and loop-diagnose analysis.
 
 ---
 

@@ -141,6 +141,7 @@ def launch(tmp_path):
         stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
         env = os.environ.copy()
         env["HOME"] = str(home)
+        env["ENGRAM_HOME"] = str(home / ".engram")
         env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
         if stubs:
             # Extra executables PREPENDED ahead of curl's dir (PATH is not replaced).

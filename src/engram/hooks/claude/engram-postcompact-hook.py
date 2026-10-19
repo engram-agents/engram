@@ -31,11 +31,9 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import find_active_jsonl
 from _hooklib import atomic_write_json, resolve_runtime_dir
+from _hooklib import engram_home_or_exit
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or os.path.expanduser("~/.engram")
-)
+ENGRAM_HOME = str(engram_home_or_exit())
 MARKER_PATH = os.path.join(ENGRAM_HOME, "last-compact-at.json")
 
 # Module-scope emitter resolve+insert (gh#2570 §1/§3): this hook previously

@@ -783,6 +783,10 @@ def _run_snippet(
     script = tmp_path / "runner.sh"  # name deliberately shares nothing with patterns
     script.write_text(snippet, encoding="utf-8")
     env = dict(os.environ)
+    # Hermetic against a seat that exports ENGRAM_HOME (#3863): the snippets
+    # resolve the home as ${ENGRAM_HOME:-$HOME/.engram}, and these tests plant
+    # their fake home through HOME unless they override ENGRAM_HOME themselves.
+    env.pop("ENGRAM_HOME", None)
     env.update(env_overrides or {})
     return subprocess.run(
         [shell, str(script)], capture_output=True, text=True, timeout=60, env=env
@@ -901,7 +905,8 @@ def _step0_snippet() -> str:
     # fail by "block not found" rather than by destroying $PATH — see the same
     # reasoning at _pgrep_snippet above.
     return _block_containing(
-        HEALTH_EXAM_SKILL, "test -d ~/.engram/marketplace/plugins/engram"
+        HEALTH_EXAM_SKILL,
+        'test -d "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram',
     )
 
 
@@ -954,6 +959,28 @@ def test_step0_PASSES_on_a_planted_healthy_symlink(
                 "PASS printed with a blank/garbled target",
                 line,
             )
+
+
+@pytest.mark.skipif(not _SHELLS, reason="no bash or zsh available")
+@pytest.mark.parametrize("shell", _SHELLS, ids=lambda s: Path(s).name)
+def test_step0_follows_ENGRAM_HOME_not_the_default_home(
+    shell: str, tmp_path: Path
+) -> None:
+    """#3863: with a custom ENGRAM_HOME the check must read THAT tree. The
+    default $HOME/.engram is planted as an EMPTY decoy, so a Step 0 that
+    hard-codes the default FAILs here instead of passing by luck."""
+    custom = _fake_engram_home(tmp_path / "custom", symlink=True) / ".engram"
+    decoy_home = tmp_path / "decoy"
+    (decoy_home / ".engram").mkdir(parents=True)
+    r = _run_snippet(
+        shell,
+        _step0_snippet(),
+        tmp_path,
+        {"HOME": str(decoy_home), "ENGRAM_HOME": str(custom)},
+    )
+
+    assert "FAIL:" not in r.stdout, (shell, r.stdout, r.stderr)
+    assert r.stdout.count("PASS:") == 2, (shell, r.stdout, r.stderr)
 
 
 @pytest.mark.skipif(not _SHELLS, reason="no bash or zsh available")

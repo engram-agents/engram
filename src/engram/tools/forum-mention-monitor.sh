@@ -107,7 +107,7 @@ Usage: forum-mention-monitor.sh [--purpose <key>]
                    stream) and lets the agent decide whether to `kill <pid>`
                    by hand.
 
-Resolves SELF (URL-encoded) and forum BASE URL from ~/.engram/config.json.
+Resolves SELF (URL-encoded) and forum BASE URL from ${ENGRAM_HOME:-$HOME/.engram}/config.json.
 URL resolution order: config.json forum.url > $FORUM_URL > http://localhost:5002
 
 Seeds on first successful poll (retries until forum is reachable). Never
@@ -146,10 +146,10 @@ esac
 # ---------------------------------------------------------------------------
 # resolve identity + forum URL
 # ---------------------------------------------------------------------------
-SELF="$(python3 -c 'import json,os,urllib.parse;print(urllib.parse.quote(json.load(open(os.path.expanduser("~/.engram/config.json"))).get("agent_name",""),safe=""))')"
-BASE="$(python3 -c 'import json,os
-c=json.load(open(os.path.expanduser("~/.engram/config.json")))
-print(((c.get("forum") or {}).get("url") or os.environ.get("FORUM_URL") or "http://localhost:5002").rstrip("/"))')"
+SELF="$(python3 -c 'import json,sys,urllib.parse;print(urllib.parse.quote(json.load(open(sys.argv[1])).get("agent_name",""),safe=""))' "${ENGRAM_HOME:-$HOME/.engram}/config.json")"
+BASE="$(python3 -c 'import json,os,sys
+c=json.load(open(sys.argv[1]))
+print(((c.get("forum") or {}).get("url") or os.environ.get("FORUM_URL") or "http://localhost:5002").rstrip("/"))' "${ENGRAM_HOME:-$HOME/.engram}/config.json")"
 URL="$BASE/api/agent/$SELF/mentions?kind=at_mention"   # #1040: at_mention only — a reply to a thread you authored is NOT a direct @-mention and must not over-fire this real-time wake
 
 # ---------------------------------------------------------------------------
@@ -281,7 +281,7 @@ fi
 # Note (#1040): appending ?kind=at_mention changed $URL, so the cksum changes —
 # the monitor reseeds its baseline once on the post-upgrade first run (harmless;
 # the seed-poll just re-establishes "current state" before emitting).
-SEEN="${FORUM_MENTION_SEEN_FILE:-$HOME/.engram/.forum-mention-seen.$(printf '%s' "$URL" | cksum | cut -d' ' -f1)}"
+SEEN="${FORUM_MENTION_SEEN_FILE:-${ENGRAM_HOME:-$HOME/.engram}/.forum-mention-seen.$(printf '%s' "$URL" | cksum | cut -d' ' -f1)}"
 
 # helper: extract "post_id\tthread_title" lines from JSON stdin
 #
@@ -326,7 +326,7 @@ POLL_SECONDS="${FORUM_MENTION_POLL_SECONDS:-30}"
 # state — same source as _status_derive._recently_engaged() in Python.
 # Declared ABOVE the seed (it used to sit between the seed and the poll loop)
 # because the seed's announce consults it too — see _engaged() below.
-LAST_USER_ACTIVITY="$HOME/.engram/last-user-activity"
+LAST_USER_ACTIVITY="${ENGRAM_HOME:-$HOME/.engram}/last-user-activity"
 # Engaged-window in seconds: matches _status_derive._DEFAULT_ENGAGED_WINDOW (360).
 # If cadence.engaged_window_seconds is customised in config.json, update this too.
 _ENGAGED_WINDOW=360

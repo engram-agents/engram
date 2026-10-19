@@ -140,14 +140,14 @@ Eleven well-supported categories you scan for (numbered 1–9, 11 and 12 — 10 
 
 9. **Cornerstone auto-load surface coverage gaps.** No server-side pattern — compose inline using `Bash` + read-only MCP tools.
 
-   **Why this matters:** A cornerstone's one job is to be recalled at the moment it's needed. Per the warm-briefing design (issue #61), warm-briefing IS the surfacing mechanism — a cornerstone you have to look up has already failed. The gap class: a `cs_*` node is active in ENGRAM but has zero entries in either of the two auto-load surfaces (`~/.engram/warm-briefing.md` and `~/.claude/CLAUDE.md`). This is mechanically checkable and should never require vigilance. (Origin: several mid-May cornerstones had no delivery channel for weeks; coverage drifted because anchor-section sync was vigilance-based, issue #931.)
+   **Why this matters:** A cornerstone's one job is to be recalled at the moment it's needed. Per the warm-briefing design (issue #61), warm-briefing IS the surfacing mechanism — a cornerstone you have to look up has already failed. The gap class: a `cs_*` node is active in ENGRAM but has zero entries in either of the two auto-load surfaces (`~/.engram/warm-briefing.md` (under `$ENGRAM_HOME`, default `~/.engram`) and `~/.claude/CLAUDE.md`). This is mechanically checkable and should never require vigilance. (Origin: several mid-May cornerstones had no delivery channel for weeks; coverage drifted because anchor-section sync was vigilance-based, issue #931.)
 
    **Inline methodology:**
 
    1. Enumerate all active cornerstones: `engram_list(node_type='cornerstone')` — `is_current=1` is applied by default and is what excludes retired ones (see category 7 on why a `status='active'` filter adds nothing).
    2. For each cornerstone `cs_XXXX`, grep both surfaces for the node ID and the cornerstone's handle (tag):
       ```bash
-      grep -l "cs_XXXX\|<handle>" ~/.engram/warm-briefing.md ~/.claude/CLAUDE.md 2>/dev/null
+      grep -l "cs_XXXX\|<handle>" "${ENGRAM_HOME:-$HOME/.engram}"/warm-briefing.md ~/.claude/CLAUDE.md 2>/dev/null
       ```
       A match in either file = covered. No match in either = coverage gap.
    3. Collect uncovered cornerstones. If the list is empty, note "all cornerstones covered" — do not manufacture findings.
@@ -309,13 +309,17 @@ needs to see), emit `"key_neighbors": []` rather than omitting the field.
   `check_snapshot_divergence` (from `tools/dream_master_batch.py`) before each
   MCP write and skips diverged findings — so accuracy at snapshot time is
   sufficient; you do not need to re-inspect at report-writing time.
+- **Never open `knowledge.db` yourself.**  The dream-master reads the guard's
+  current state through one CLI, `python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/dream_master_batch.py" safety-row <node_id>`
+  (it prints one JSON object, or `null` for a missing node).  You never run it
+  and never connect to the store: use `engram_inspect` for everything you read.
 
 # Output contract
 
 Write the dream-report to:
-`~/.engram/dream/YYYY-MM-DD-fairy-report.md`
+`~/.engram/dream/YYYY-MM-DD-fairy-report.md` (under `$ENGRAM_HOME`, default `~/.engram`)
 
-(If `~/.engram/dream/` does not exist, create it via Bash `mkdir -p`.)
+(If `${ENGRAM_HOME:-$HOME/.engram}/dream/` does not exist, create it via Bash `mkdir -p`.)
 
 Use this format:
 

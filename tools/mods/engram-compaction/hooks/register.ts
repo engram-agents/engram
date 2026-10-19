@@ -6,14 +6,14 @@ import { COMPACT_SHAPE, completeHook, compactHook, type Io } from './compaction.
  * at the end of the next answered turn this mod consumes it once and compacts, and the
  * resulting compaction carries the context the nap assembled.
  *
- * Off by default, and off registers NOTHING: no request is consumed, no compaction is
+ * On by default (Lei, 2026-10-18); switched off, it registers NOTHING: no request is consumed, no compaction is
  * started or answered, every classic behaviour is the engine's. Every registration
  * carries a `.catch` that replays `next`, so a failure here never changes what the
  * model or the person sees. The hooks do bounded `$.fs` work only: no `$.model`, no
  * `$.process`.
  */
 export const register: Register = (on, options) => {
-  // Anything but a real `true` is off (fail closed); the default in the manifest is false.
+  // Anything but a real `true` is off (fail closed); the default in the manifest is true.
   if (options.enabled !== true) return
 
   // The engine reads each hook as a function literal and follows `$` only into functions

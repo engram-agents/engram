@@ -145,6 +145,7 @@ class BudgetTestBase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="engram_budget_test_")
         self.hook = _load_hook_module()
         self.hook.ENGRAM_HOME = self.tmp
+        self.hook.CONFIG_PATH = os.path.join(self.hook.ENGRAM_HOME, "config.json")  # #3827: CONFIG_PATH is the hook's one config source
 
     def tearDown(self):
         import shutil
@@ -239,6 +240,7 @@ class TestBackwardCompatDefault(BudgetTestBase):
         nudge = self.hook.format_nudge(result, session_id="s3", stats={})
         no_config_hook = _load_hook_module()
         no_config_hook.ENGRAM_HOME = tempfile.mkdtemp(prefix="engram_budget_nocfg_")
+        no_config_hook.CONFIG_PATH = os.path.join(no_config_hook.ENGRAM_HOME, "config.json")  # #3827: CONFIG_PATH is the hook's one config source
         try:
             nudge_default = no_config_hook.format_nudge(result, session_id="s3", stats={})
             self.assertEqual(nudge, nudge_default)
@@ -547,6 +549,7 @@ class TestRenderSizeEmission(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="engram_budget_emission_test_")
         self.hook = _load_hook_module()
         self.hook.ENGRAM_HOME = self.tmp
+        self.hook.CONFIG_PATH = os.path.join(self.hook.ENGRAM_HOME, "config.json")  # #3827: CONFIG_PATH is the hook's one config source
         self.hook.COUNTER_PATH = os.path.join(self.tmp, "prompt-counter.json")
         self.hook.WRITE_REMINDER_PATH = os.path.join(self.tmp, "write-reminder.json")
         self.hook.REPAIR_MARKER_PATH = os.path.join(self.tmp, "toolcall-repair-pending.json")

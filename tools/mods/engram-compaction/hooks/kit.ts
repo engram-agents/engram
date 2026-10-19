@@ -110,7 +110,7 @@ export async function seedToken(seen: Seen, over: Record<string, unknown> = {}, 
   return digest
 }
 
-/** The test options that switch the mod on: its shipped default is off. */
+/** The test options that pin the mod on explicitly (its shipped default is also on). */
 export const ON = { options: { enabled: true } }
 
 export const START = { cwd: '/w', surface: null, isInteractive: false } as const

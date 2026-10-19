@@ -79,7 +79,20 @@ import engram_pidfile
 # engramd_owner takes ec.CONTRACT_VERSION, so there is exactly one copy).
 # "1.1" (U4d, #3197): the owner gained the client-facing `read` method -- an
 # added method is a MINOR change (docs/2652-engrammanager-design.md SS5.3).
-CONTRACT_VERSION = "1.1"
+# "1.2" (U11, #3822): the owner gained its first WRITE, the typed `use_reward` method -- again an added
+# method, so MINOR (`check_contract_version` tolerates minor skew; an older owner answers a
+# `use_reward` call with Rejected(unknown_operation), which the caller must treat as loud).
+# "1.3" (U13, #3856): the owner gained its second WRITE, the typed `advance_moment_cursor` method -- again an
+# added method, so MINOR (an older owner answers it with Rejected(unknown_operation), which the caller must treat
+# as loud). It takes no request_id: the compare-and-set makes a replay harmless.
+CONTRACT_VERSION = "1.3"
+# The `use_reward` write (#3822): the timeout a caller passes, and the slice of it reserved for the reply to
+# travel. The owner's total waiting budget (engramd_owner.OWNER_WRITE_LOCK_WAIT, 1.0 s) must stay strictly below
+# OWNER_WRITE_CLIENT_TIMEOUT - OWNER_WRITE_REPLY_RESERVE (1.5 s), so a `busy` refusal ARRIVES before the client
+# gives up; a test pins the inequality across the two modules. 2.0 s is DEFAULT_TIMEOUT; the 0.5 s reserve is a
+# judgement (loopback AF_UNIX reply plus a scheduler hiccup), not a measurement.
+OWNER_WRITE_CLIENT_TIMEOUT = 2.0
+OWNER_WRITE_REPLY_RESERVE = 0.5
 DEFAULT_TIMEOUT = 2.0  # seconds -- matches _query_recall_daemon's sock.settimeout(2) precedent.
 DEFAULT_SOCKET_NAME = "engramd.sock"  # distinct from the existing recall-daemon.sock (a different service).
 # The socket's containing subdirectory, relative to $ENGRAM_HOME (#3194,
@@ -1013,7 +1026,15 @@ def write(
     timeout: float = DEFAULT_TIMEOUT,
     socket_path: Path | None = None,
 ) -> EngramdResult:
-    """Always ensures a request_id exists before constructing the wire
+    """A WRITE that comes back `Unavailable` (reason `timeout` or `protocol`) is INDETERMINATE: the owner may have
+    committed before the reply was lost, so it is never "failed". The one remedy is ONE retry with the
+    SAME request_id (an owner-side dedupe store answers it with the stored outcome, `duplicate=True`, without a
+    second bump); the id is echoed on every result type for exactly this. A `Rejected` is determinate only up to the COMMIT:
+    before it nothing was committed; `readback_mismatch` (reason, `commit == "committed_unverified"`) is the one
+    refusal that comes AFTER it (any failure while verifying a committed write lands there too), and a retry with
+    the SAME request_id replays it without a second bump.
+
+    Always ensures a request_id exists before constructing the wire
     message -- caller-supplied (for an explicit retry of a specific prior
     attempt) or freshly generated (uuid4, as a string) otherwise. The
     request_id used is echoed back on EVERY returned result type (Ok,

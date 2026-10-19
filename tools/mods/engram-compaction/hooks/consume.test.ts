@@ -225,14 +225,13 @@ test('M9 a malformed request file is left alone and never breaks the turn', ON, 
   expect(seen.compactCalls.length).toBe(0)
 })
 
-test('M1 the shipped default is OFF: a request present is not consumed', async ($, on) => {
+test('M1 the shipped default is ON: with no options a request present is consumed once', async ($, on) => {
   const { seen } = rig(on)
-  await seedRequest(seen)
-  const before = seen.writes.get(REQUEST)
+  const digest = await seedRequest(seen)
   await $.session.start(START)
   await $.turn.complete(COMPLETE)
-  expect(seen.compactCalls.length).toBe(0)
-  expect(seen.writes.get(REQUEST)).toBe(before)
+  expect(seen.compactCalls.length).toBe(1)
+  expect(JSON.parse(seen.writes.get(REQUEST)!)).toEqual({ consumed: true, request_id: digest })
 })
 
 test('M2 without ENGRAM_HOME the data directory is $HOME/.engram', ON, async ($, on) => {

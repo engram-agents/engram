@@ -3,7 +3,7 @@
 
 engram-alpha#3049: engram-sleep's Phase A Step 3.5 only tears down live
 Monitors (Umwelt bell, forum-mention, forum-updates) when a
-``~/.engram/loop-mode.json`` marker exists. A session that armed Monitors ad
+``loop-mode.json`` marker (in the ENGRAM home, ``$ENGRAM_HOME``) exists. A session that armed Monitors ad
 hoc -- e.g. in response to "arm loop and enter Umwelt" without ever running
 the full ``/loop`` entry that writes the marker -- leaves those Monitors
 running through a sleep cycle undetected, because Step 3.5's own text reads

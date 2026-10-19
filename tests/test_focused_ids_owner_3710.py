@@ -19,6 +19,7 @@ The contract:
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 import sys
 import threading
@@ -69,9 +70,9 @@ def _hooklib():
     return _hooklib
 
 
-def _probe_live(user_home: Path) -> Path:
-    """The route probe is live for SESSION when its dir exists under $HOME (route_probe_dir)."""
-    d = user_home.joinpath(".engram", "probe", "mods-recall", SESSION)
+def _probe_live(engram_home: Path) -> Path:
+    """The route probe is live for SESSION when its dir exists under ENGRAM_HOME (route_probe_dir)."""
+    d = engram_home.joinpath("probe", "mods-recall", SESSION)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -94,7 +95,7 @@ def test_a_flag_on_exclusion_on_probe_live_a_full_fire_opens_the_store_zero_time
     set_config(home, flag=True, extra=EXCLUSION_ON)
     user_home = tmp_path / "userhome"
     monkeypatch.setenv("HOME", str(user_home))
-    probe = _probe_live(user_home)
+    probe = _probe_live(home)
     mod = load_hook(home, monkeypatch)
     with owner_of(owner_kind, home):
         seen = spying_read(monkeypatch)
@@ -263,7 +264,7 @@ def test_write_route_ledger_passes_the_connection_through(home, tmp_path, monkey
     monkeypatch.setenv("ENGRAM_HOME", str(home))
     user_home = tmp_path / "userhome"
     monkeypatch.setenv("HOME", str(user_home))
-    _probe_live(user_home)
+    _probe_live(home)
     hl = _hooklib()
     got = []
     monkeypatch.setattr(hl, "_focused_ids", lambda read_conn=None: (got.append(read_conn), (set(), True))[1])
@@ -340,3 +341,111 @@ def test_d_a_falsy_caller_connection_is_still_the_callers(home, monkeypatch):
         assert c.closed is False and opened == []
     finally:
         real.close()
+
+
+# =========================================================================================
+# (g) a failed focused read is REPORTED to the caller (Borges, #3827), fail-open unchanged
+# =========================================================================================
+
+def test_g_on_failure_hears_why_a_read_failed_and_the_contract_is_unchanged(home, monkeypatch):
+    """`_focused_ids(read_conn=..., on_failure=cb)`: a failing read calls cb(exc) ONCE with the
+    very exception and still returns (set(), False); a good read never calls it; with no cb the
+    behaviour is exactly as before; a cb that raises changes nothing (fail-open).
+    Mutation: no call -> `heard == []`; calling on success; letting the cb's raise escape."""
+    make_store(home)
+    monkeypatch.setenv("ENGRAM_HOME", str(home))
+    hl = _hooklib()
+    boom = ec.OwnerReadError("rejected")
+    heard = []
+    assert hl._focused_ids(read_conn=_FailingConn(boom), on_failure=heard.append) == (set(), False)
+    assert heard == [boom] and heard[0] is boom
+    assert hl._focused_ids(read_conn=_FailingConn(boom)) == (set(), False)
+    assert hl._focused_ids(read_conn=_FailingConn(boom), on_failure=lambda e: 1 / 0) == (set(), False)
+    ok = []
+    conn = sqlite3.connect(str(home / "knowledge.db"))
+    try:
+        assert hl._focused_ids(read_conn=conn, on_failure=ok.append)[1] is True
+    finally:
+        conn.close()
+    assert ok == []
+
+
+def test_g_on_failure_is_threaded_through_both_resolver_builders(home, tmp_path, monkeypatch):
+    """build_exclusion_resolver(..., on_failure=cb) and write_route_ledger(..., on_failure=cb) (the
+    probe live) both hand cb to the focused read: a failing connection reaches it from each.
+    The resolver is still built (fail-open). Mutation: drop the kwarg at any hop -> `heard` empty."""
+    make_store(home)
+    monkeypatch.setenv("ENGRAM_HOME", str(home))
+    user_home = tmp_path / "userhome"
+    monkeypatch.setenv("HOME", str(user_home))
+    _probe_live(home)
+    hl = _hooklib()
+    boom = ec.OwnerReadError("rejected")
+    heard = []
+    assert hl.build_exclusion_resolver(SESSION, read_conn=_FailingConn(boom), on_failure=heard.append) is not None
+    assert heard == [boom]
+    hl.write_route_ledger("tool_recall", SESSION, "k", "q", DAEMON_RESULT, [], {}, source="daemon",
+                          read_conn=_FailingConn(boom), on_failure=heard.append)
+    assert heard == [boom, boom]
+
+
+def test_g_without_on_failure_the_plumbing_passes_no_extra_kwarg(home, tmp_path, monkeypatch):
+    """Callers that never heard of on_failure see `_focused_ids` called exactly as before (the
+    existing plumbing cells replace it with a one-kwarg lambda). Mutation: always passing
+    on_failure=None -> TypeError inside the resolver -> red."""
+    monkeypatch.setenv("ENGRAM_HOME", str(home))
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    hl = _hooklib()
+    monkeypatch.setattr(hl, "_focused_ids", lambda read_conn=None: (set(), True))
+    assert hl.build_exclusion_resolver(SESSION, read_conn=object()) is not None
+
+
+@pytest.mark.parametrize("probe_live", [False, True], ids=["no-probe", "probe-live"])
+@pytest.mark.parametrize("reason", ["refused_at_load", "unregistered_template", "result_too_large"])
+def test_g_tripwire_flag_on_a_focused_template_refusal_is_recorded_once_and_the_fire_works(
+        reason, probe_live, home, tmp_path, monkeypatch):
+    """Tripwire hook, flag ON, exclusion ON, the owner refuses ONLY the focused-ids template:
+    exactly ONE owner-failure line at site `focused_ids` (the hook's own spelling, shared with
+    its build-failure record), kind rejected; the tripwire nudge is still delivered and the fire
+    exits 0 (fail-open unchanged). Mutation: no recording in the tripwire hook -> zero lines."""
+    make_store(home)
+    set_config(home, flag=True, extra=EXCLUSION_ON)
+    user_home = tmp_path / "userhome"
+    monkeypatch.setenv("HOME", str(user_home))
+    if probe_live:
+        _probe_live(home)
+    mod = load_hook(home, monkeypatch)
+    real = ec.read
+
+    def fake(method, params, **k):
+        if method == "read" and (params or {}).get("sql") == FOCUSED_SQL:
+            return ec.Rejected(reason=reason, detail="template-scoped", remedy="n/a")
+        return real(method, params, **k)
+    monkeypatch.setattr(ec, "read", fake)
+    with FakeOwner(home):
+        run = run_main(mod)
+    assert run.exc == "SystemExit(0)", run.exc
+    lines = re.findall(r"^engram-lesson-tripwire-hook: owner read failed: (\w+) at (\w+)$", run.stderr, re.M)
+    assert lines == [("rejected", "focused_ids")], (lines, run.stderr)
+    assert "Nudge for tripwire one" in run.ctx, run.ctx
+
+
+def test_g_tripwire_flag_off_a_failing_focused_read_records_nothing(home, tmp_path, monkeypatch):
+    """Tripwire hook, flag OFF: a failing direct focused read stays silent as before (no owner
+    line). Mutation: wiring the recorder on the flag-OFF path."""
+    make_store(home)
+    set_config(home, flag=False, extra=EXCLUSION_ON)
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    mod = load_hook(home, monkeypatch)
+    hl = _hooklib()
+    real = hl.connect_regular_ro
+
+    def selective(path, *a, **k):
+        if k.get("timeout") == 0.2:
+            raise sqlite3.OperationalError("focused read down (test)")
+        return real(path, *a, **k)
+    monkeypatch.setattr(hl, "connect_regular_ro", selective)
+    run = run_main(mod)
+    assert run.exc == "SystemExit(0)", run.exc
+    assert "owner read failed" not in run.stderr
+    assert "Nudge for tripwire one" in run.ctx

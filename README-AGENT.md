@@ -578,12 +578,14 @@ hand-edit; *(restart)* = takes effect after a Claude Code restart.
 | `self_lineage` | str | This install's own training lineage in the hard format `provider:model_family` (e.g. `"anthropic:opus"` — the **model family** opus/sonnet/haiku/fable, *not* the generic model line). Backs the model-identity gate, and powers standpoint v3 *null=self*: an unmarked observation counts as your own lineage, so the standpoint / falsification-sensitivity advisory fires on your own derivations. Empty = feature dark (safe). Pattern: `provider:family`. |
 | `counterparts` | list | Peer agents on this host. Set by `agentctl`. *(read-only)* |
 
-**Embedding** — *(read-only; changing would orphan existing nodes' embeddings):*
+**Embedding** — *(`enabled` and `model` are read-only; changing the model would orphan existing nodes' embeddings. `device` and `cpu_threads` are editable and safe: CPU and GPU vectors match):*
 
 | Field | Type | Description |
 |---|---|---|
 | `embedding.enabled` | bool | **Retired by #345** — embeddings are mandatory. If this key is present with any value other than true, the server refuses to start; delete the key to fix. |
 | `embedding.model` | str | Sentence-transformer model identifier. |
+| `embedding.device` | str | `cpu` (default), `cuda`, or `auto`. Where the embedder and the polarity model run. `cpu` never touches the GPU; `cuda` uses it if visible, else falls back to cpu with a notice; `auto` is the library default (GPU if present). An invalid value uses `cpu` with a notice. Editable; applies on the next model load. |
+| `embedding.cpu_threads` | int | Default `4`. Cap on torch CPU threads, applied whenever the model loads on CPU. Must be an integer >= 1. Editable; applies on the next model load. |
 
 **Drowsiness / cadence:**
 

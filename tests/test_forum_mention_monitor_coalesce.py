@@ -105,6 +105,7 @@ def _run_monitor(tmp_path: Path, port: int, poll_seconds: str, coalesce_seconds:
 
     env = os.environ.copy()
     env["HOME"] = str(home)
+    env["ENGRAM_HOME"] = str(home / ".engram")
     env["FORUM_MENTION_NO_REAP"] = "1"
     env["FORUM_MENTION_SEEN_FILE"] = str(seen_file)
     env["FORUM_MENTION_POLL_SECONDS"] = poll_seconds

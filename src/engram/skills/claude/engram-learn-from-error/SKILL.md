@@ -178,7 +178,7 @@ Verify **each layer you armed** — they fail independently, and passing one say
 Test that the incident matches a realistic future prompt:
 
 ```bash
-echo '{"prompt": "[realistic task prompt that should trigger]"}' | python3 ~/.engram/hooks/engram-surface-hook.py 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); ctx=d.get('hookSpecificOutput',{}).get('additionalContext',''); print('TRIPWIRE FIRED' if 'Tripwire' in ctx else 'no tripwire')"
+echo '{"prompt": "[realistic task prompt that should trigger]"}' | python3 "${ENGRAM_HOME:-$HOME/.engram}"/hooks/engram-surface-hook.py 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); ctx=d.get('hookSpecificOutput',{}).get('additionalContext',''); print('TRIPWIRE FIRED' if 'Tripwire' in ctx else 'no tripwire')"
 ```
 
 Test with:

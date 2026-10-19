@@ -21,10 +21,20 @@ Stdlib-only — no third-party deps.
 
 import json
 import os
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+# The ONE ENGRAM-home resolver for tools lives beside this file (U14, #3862); resolve the package root
+# through the symlink so `from tools import ...` works run as a script, loaded by path, or from the
+# flattened plugin layout (same shim as reconcile_lesson_demotions.py).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+
+from tools import _owner_read as owner_read  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # The ONE definition — mode → operational knobs. (2-state spine; flavors later.)
@@ -50,10 +60,7 @@ _DEFAULT_COOLDOWN_SECONDS: int = 600
 # Paths — mirrors _status_derive.py pattern exactly (both derive from ENGRAM_HOME).
 # ---------------------------------------------------------------------------
 
-ENGRAM_HOME: str = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+ENGRAM_HOME: str = str(owner_read.engram_home())
 
 # The same last-user-activity stamp that _status_derive._recently_engaged() reads.
 # Defined independently (not imported from _status_derive) to keep this module

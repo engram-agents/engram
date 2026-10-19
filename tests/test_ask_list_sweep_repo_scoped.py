@@ -185,7 +185,7 @@ def test_non_github_path_digits_caveat_is_present(which):
 
 # The ask-file path as each spec literally writes it.
 _ASK_PATH_PLACEHOLDERS = {
-    "sleep": "~/.engram/ask-{{USER_NAME}}.md",
+    "sleep": '"${ENGRAM_HOME:-$HOME/.engram}"/ask-{{USER_NAME}}.md',
     "dream-master": "~/.engram/ask-<primary_user>.md",
 }
 

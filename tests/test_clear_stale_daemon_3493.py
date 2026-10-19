@@ -209,6 +209,25 @@ def test_T6_wrong_kind_pidfile_refused_nothing_unlinked(home, kind):
         assert (home / "elsewhere.txt").read_text() == "precious"
 
 
+def _load_daemon_for_home_value(home_value, cwd):
+    """The daemon module for the home that ENGRAM_HOME=home_value names when
+    run from cwd. Since alpha #3863 6b the daemon REFUSES a relative
+    ENGRAM_HOME (one stderr line, exit 0) instead of resolving it against its
+    cwd, so the oracle is loaded with the ABSOLUTE spelling of that value
+    (os.getcwd() is the PHYSICAL cwd, as the daemon's old abspath saw it).
+    The shell script under test still resolves a relative value against its
+    own cwd until the launcher guards land in 6c; these cells pin that the
+    script agrees with the daemon about the home a value names."""
+    old = os.getcwd()
+    try:
+        os.chdir(cwd)
+        abs_home = os.path.abspath(os.path.expanduser(home_value))
+    finally:
+        os.chdir(old)
+    with unittest.mock.patch.dict(os.environ, {"ENGRAM_HOME": abs_home}):
+        return _load_daemon_module()
+
+
 def _load_daemon_module():
     spec = importlib.util.spec_from_file_location(
         "engram_surface_daemon_clear_3493", str(DAEMON_PY_PATH)
@@ -247,13 +266,7 @@ def test_T7b_parity_relative_and_default_home(home):
     )
     assert r.returncode == 0, _out(r)
     got = _parse_print_paths(r.stdout)
-    cwd = os.getcwd()
-    try:
-        os.chdir(rel_parent)
-        with unittest.mock.patch.dict(os.environ, {"ENGRAM_HOME": "sub"}):
-            mod = _load_daemon_module()
-    finally:
-        os.chdir(cwd)
+    mod = _load_daemon_for_home_value("sub", rel_parent)
     assert got["SOCKET_PATH"] == mod.SOCKET_PATH
     assert got["PID_PATH"] == mod.PID_PATH
     # unset ENGRAM_HOME -> ~/.engram under HOME
@@ -426,13 +439,7 @@ def test_S1_cdpath_does_not_leak_into_path_resolution(home):
     assert r.returncode == 0, _out(r)
     assert len(r.stdout.splitlines()) == 2, repr(r.stdout)
     got = _parse_print_paths(r.stdout)
-    cwd = os.getcwd()
-    try:
-        os.chdir(cwd_dir)
-        with unittest.mock.patch.dict(os.environ, {"ENGRAM_HOME": "rel"}):
-            mod = _load_daemon_module()
-    finally:
-        os.chdir(cwd)
+    mod = _load_daemon_for_home_value("rel", cwd_dir)
     assert got["SOCKET_PATH"] == mod.SOCKET_PATH
     assert got["PID_PATH"] == mod.PID_PATH
 
@@ -457,13 +464,7 @@ def test_S3_newline_in_engram_home_refused(home, shape, args):
 def _daemon_paths_for(home_value, cwd):
     """What the daemon computes for ENGRAM_HOME=home_value run from cwd
     (os.getcwd() is PHYSICAL, so abspath joins with the physical cwd)."""
-    old = os.getcwd()
-    try:
-        os.chdir(cwd)
-        with unittest.mock.patch.dict(os.environ, {"ENGRAM_HOME": home_value}):
-            mod = _load_daemon_module()
-    finally:
-        os.chdir(old)
+    mod = _load_daemon_for_home_value(home_value, cwd)
     return mod.SOCKET_PATH, mod.PID_PATH
 
 

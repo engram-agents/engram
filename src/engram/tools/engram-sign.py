@@ -24,6 +24,15 @@ import os
 import sys
 from pathlib import Path
 
+# The ONE ENGRAM-home resolver for tools lives beside this file (U14, #3862); resolve the package root
+# through the symlink so `from tools import ...` works run as a script, loaded by path, or from the
+# flattened plugin layout (same shim as reconcile_lesson_demotions.py).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+
+from tools import _owner_read as owner_read  # noqa: E402
+
 
 def _find_module_dir() -> Path | None:
     """Directory holding engram_signature.py: $CLAUDE_PLUGIN_ROOT first, then
@@ -58,8 +67,7 @@ def main(argv=None) -> int:
     sys.path.insert(0, str(mod_dir))
     import engram_signature
 
-    data_dir = Path(args.data_dir or os.environ.get("ENGRAM_HOME")
-                    or os.path.expanduser("~/.engram"))
+    data_dir = Path(args.data_dir or owner_read.engram_home())
     res = engram_signature.build_signature(
         data_dir, session_id=args.session_id,
         plugin_root=Path(args.plugin_root) if args.plugin_root else None)

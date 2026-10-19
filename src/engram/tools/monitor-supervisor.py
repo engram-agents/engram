@@ -175,6 +175,15 @@ from engram_regular_io import (
     write_regular_bytes_synced,
 )
 
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (U14, #3862; #3863). `tools` is
+# found one directory above this file in BOTH layouts (src/engram/ and the deployed plugin root).
+# APPENDED, not inserted first: this is a long-running supervisor launched by path, and the plugin
+# root must not shadow anything already importable.
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if _PKG_ROOT not in sys.path:
+    sys.path.append(_PKG_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
+
 EXIT_PIDFILE_NOT_REGULAR = 4
 
 TAGS = {
@@ -196,8 +205,9 @@ BACKOFF_CAP_SECONDS = 60.0
 # past restarts. Not named by the spec; a local judgment call (see handoff).
 BACKOFF_RESET_AFTER_UPTIME_SECONDS = 60.0
 
-DEFAULT_PIDFILE = str(Path.home() / ".engram" / ".monitor-supervisor.pid")
-DEFAULT_STATUS_FILE = str(Path.home() / ".engram" / ".monitor-supervisor-status.json")
+# Both the start path and --check default to these two, so under one ENGRAM_HOME they cannot disagree.
+DEFAULT_PIDFILE = str(owner_read.engram_home() / ".monitor-supervisor.pid")
+DEFAULT_STATUS_FILE = str(owner_read.engram_home() / ".monitor-supervisor-status.json")
 DEFAULT_STATUS_INTERVAL_SECONDS = 10.0
 DEFAULT_UMWELT_CONFIG = str(Path.home() / ".umwelt" / "config.json")
 DEFAULT_UMWELT_CURSOR_FILE = str(Path.home() / ".umwelt" / "bell-cursors.json")

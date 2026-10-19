@@ -250,9 +250,19 @@
       "tier": "essential"
     },
     {
+      "path": "engram_moment_cursor.py",
+      "tier": "essential",
+      "note": "The one shared compare-and-set advance of a person's moment-rotation cursor (#3856). Stdlib-only. Essential because the surface hook and engram_query import it (hard dependencies; the hook degrades to no cursor advance if it is missing)."
+    },
+    {
       "path": "engram_config_io.py",
       "tier": "essential",
       "note": "Atomic write + retrying read of config.json (#3607). Stdlib-only. Essential because engram_core and engram_restamp import it (hard dependencies)."
+    },
+    {
+      "path": "engram_home_registry.py",
+      "tier": "convenience",
+      "note": "Per-seat ENGRAM home registry (#3863 PR 5, ruling R3): the SessionStart hook records a non-default home, viz discovery and the viz-operator ACL tool read it before their glob. Stdlib-only. Every importer is fail-soft (hook swallows, viz and the ACL tool fall back to the glob), so a missing copy degrades to today's behaviour."
     },
     {
       "path": "engram_regular_io.py",
@@ -479,6 +489,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/_owner_read.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/dream_lottery.py",
       "tier": "essential"
     },
@@ -500,6 +514,10 @@
     },
     {
       "path": "tools/anchoring_report.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/weakest_load_bearing.py",
       "tier": "convenience"
     },
     {
@@ -564,7 +582,7 @@
       "path": "tools/mods",
       "tier": "convenience",
       "source": "tools/mods",
-      "note": "tools/mods/engram-compaction = agent-decided compaction at the nap boundary (#3640): a Claude Code mod (function-hook plugin, 2.1.289 early-access API), default off, that consumes the request tools/compact-request.py leaves after a nap and compacts carrying the context the nap assembled. T2: user-installable but opt-in. The manifest tags by first path component under tools/ (tests/test_tiers_manifest.py enumerates tools/<top-level item>), so the entry is tools/mods, which holds engram-compaction today and any later user-facing mod. Real directory directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/mods) would wrongly flag this as dangling (same pattern as tools/probes's entry above)."
+      "note": "tools/mods/engram-compaction = agent-decided compaction at the nap boundary (#3640): a Claude Code mod (function-hook plugin, 2.1.289 early-access API), default on once installed (Lei, 2026-10-18), that consumes the request tools/compact-request.py leaves after a nap and compacts carrying the context the nap assembled. T2: user-installable; installing it is the opt-in. The manifest tags by first path component under tools/ (tests/test_tiers_manifest.py enumerates tools/<top-level item>), so the entry is tools/mods, which holds engram-compaction today and any later user-facing mod. Real directory directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/mods) would wrongly flag this as dangling (same pattern as tools/probes's entry above)."
     },
     {
       "path": "tools/engram-regenerate-embeddings.py",
@@ -744,6 +762,18 @@
       "tier": "dev",
       "source": "tools/check_2652_ledger.py",
       "note": "completeness guard for docs/2652-migration-ledger.md (#2652): per-file count of Section-2 rows vs sqlite3.connect( lines in tracked src/engram. Developer tier (T3): a repo-maintenance gate run by pr-checks; no install ever needs it. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly, same as tools/claude_md_moves_check.py."
+    },
+    {
+      "path": "tools/home_path_gate.py",
+      "tier": "dev",
+      "source": "tools/home_path_gate.py",
+      "note": "engram-alpha#3863 (PR 1): the pr-checks gate that fails on a NEW hard-coded ENGRAM home path (`~/.engram`, `Path.home() / \".engram\"`, `$HOME/.engram`, ...) in tracked src/engram files that never read ENGRAM_HOME; today's violators sit in tools/home_path_baseline.json, which may only shrink. Developer tier (T3): a repo-maintenance gate for ENGRAM development, run by pr-checks over the source tree; no install ever needs it. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly, same as tools/check_2652_ledger.py."
+    },
+    {
+      "path": "tools/home_path_baseline.json",
+      "tier": "dev",
+      "source": "tools/home_path_baseline.json",
+      "note": "engram-alpha#3863 (PR 1): the checked-in baseline + (empty) allowlist read by tools/home_path_gate.py. Tiered with the gate it feeds (dev, T3): one inseparable unit. Real data file directly under repo-root tools/, so 'source' is set explicitly."
     },
     {
       "path": "tools/recall_repetition_analysis.py",

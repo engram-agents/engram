@@ -1,4 +1,4 @@
-"""Content-aware knowledge.db backup tool — create a WAL-safe SQL snapshot at ~/.engram/db-backup/.
+"""Content-aware knowledge.db backup tool — create a WAL-safe SQL snapshot at $ENGRAM_HOME/db-backup/.
 
 Produces knowledge-YYYY-MM-DD.sql for the first backup on a given local day, or
 knowledge-YYYY-MM-DD-2.sql, -3.sql, ... for the second/third/... backup on the
@@ -51,9 +51,34 @@ entirely and always takes a real backup.
 Uses engram_backup.dump_stripped (pure-Python, WAL-safe hot backup) — no sqlite3 CLI
 dependency.  Stdlib only; no external packages required.
 
-Backup layers: db-backup/ lives inside ~/.engram/ — git-independent (survives .git
-corruption; works without git) but NOT off-disk (a full ~/.engram/ loss takes it too).
+Backup layers: db-backup/ lives inside $ENGRAM_HOME — git-independent (survives .git
+corruption; works without git) but NOT off-disk (a full $ENGRAM_HOME loss takes it too).
 The per-nap git auto-push is the off-disk layer.  The three layers are complementary.
+
+Defaults follow $ENGRAM_HOME (else ~ plus the standard data directory): --db is
+$ENGRAM_HOME/knowledge.db and --out-dir is $ENGRAM_HOME/db-backup.
+
+Through the owner (U15 of #2652, #3872): behind `engramd.backup_reads_via_owner` in
+config.json (default OFF), and only when --db is this home's store, the tool never opens
+the live store. It asks the engramd owner for ONE quiesced snapshot into a 0700 temp dir
+inside --out-dir, reads the watermark from that snapshot, makes the skip decision on it,
+and feeds the same snapshot to dump_stripped, so the watermark and the archive describe the
+same state. The cost is one full-store copy per run, deleted at once (on success, on skip
+and on any error). Every owner failure — down, refusing, an INDETERMINATE answer (the
+connection dropped or the owner's deadline passed after a commit was reserved), or a
+malformed one — is an error: exit 1, no archive, no watermark change, never a fallback to
+reading the live store. With --dry-run the owner is pinged only; a dry run creates no files,
+so it cannot take the snapshot the skip decision needs. A --db naming another file keeps the
+direct read-only path whatever the flag says.
+
+A SIGKILL/SIGTERM mid-run skips the `finally`, leaving the 0700 `.engram-bk-owner-*` temp dir (a
+full store copy) in --out-dir, where neither --retain nor anything else removes it. So every run
+starts by sweeping stale ones, with three properties: prefix-exact (a plain string prefix, never a
+glob; only real directories owned by the running user, never a symlink or file), age-bound (older
+than 6 h, so a concurrent run's live temp dir is never touched), and failure-proof (the sweep's
+own error prints one warning and never fails the backup). It runs on both flag paths, since an
+orphan outlives a flag turned back OFF. The uid check cannot be pinned by a test cell on a
+single-uid seat (ownership cannot be faked without root).
 
 Usage:
     python3 backup_knowledge_db.py [--db PATH] [--out-dir DIR] [--retain DAYS] [--dry-run] [--force]
@@ -67,8 +92,13 @@ import glob
 import json
 import os
 import re
+import shutil
 import sqlite3
+import stat
 import sys
+import tempfile
+import time
+from pathlib import Path
 
 # append (not insert(0)) -- #2565: putting src/engram at sys.path
 # POSITION 0 outranks the repo-root tools/ package for the rest of the
@@ -78,10 +108,35 @@ import sys
 # top-level import rather than a test file's).
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 import engram_backup  # noqa: E402
+from tools import _owner_read as owner_read  # noqa: E402
 
 
 _WATERMARK_FILENAME = ".watermark.json"
 _ARCHIVE_RE = re.compile(r"^knowledge-(\d{4}-\d{2}-\d{2})(-\d+)?\.sql$")
+
+# --- owner snapshot (#3872) --------------------------------------------------
+OWNER_FLAG_KEY = "backup_reads_via_owner"
+_OWNER_TMP_PREFIX = ".engram-bk-owner-"
+_OWNER_SNAPSHOT_NAME = "knowledge.snap.db"
+# A JUDGEMENT, not a measurement: one run (snapshot <= 35 s + dump) takes on the order of a minute,
+# so 6 h cannot catch a live run. It is the bound that protects a CONCURRENT run's temp dir from
+# the sweep (deleting it would leave that run an indeterminate snapshot).
+_OWNER_TMP_STALE_SECONDS = 6 * 3600
+
+
+class BackupOwnerError(RuntimeError):
+    """The owner could not give the backup its snapshot (flag ON). Raised, never answered from a direct
+    read of the live store: a backup that silently came from somewhere else, or from a half-written
+    snapshot, is the failure this exists to prevent."""
+
+
+def _owner_spec() -> "owner_read.OwnerReadSpec":
+    return owner_read.OwnerReadSpec(
+        flag_key=OWNER_FLAG_KEY,
+        error_cls=BackupOwnerError,
+        home=owner_read.engram_home(),
+        never_empty="Did not fall back to reading the live store directly: no backup was taken.",
+    )
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -91,13 +146,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--db",
-        default="~/.engram/knowledge.db",
-        help="Source database path (default: ~/.engram/knowledge.db).",
+        default=str(owner_read.default_db_path()),
+        help="Source database path (default: $ENGRAM_HOME/knowledge.db).",
     )
     p.add_argument(
         "--out-dir",
-        default="~/.engram/db-backup/",
-        help="Destination directory for dated archives (default: ~/.engram/db-backup/).",
+        default=str(owner_read.engram_home() / "db-backup"),
+        help="Destination directory for dated archives (default: $ENGRAM_HOME/db-backup).",
     )
     p.add_argument(
         "--retain",
@@ -144,6 +199,40 @@ def _prune_old_archives(out_dir: str, retain_days: int, dry_run: bool) -> None:
             else:
                 os.unlink(path)
                 print(f"pruned: {path}")
+
+
+def _sweep_stale_owner_tmpdirs(out_dir: str, dry_run: bool, now: float | None = None) -> None:
+    """Remove `.engram-bk-owner-*` temp dirs a killed run left in out_dir (see module docstring).
+
+    Prefix-exact, age-bound (_OWNER_TMP_STALE_SECONDS), real dirs owned by this uid only. Never raises:
+    any failure prints one warning line to stderr and returns.
+    """
+    try:
+        if not os.path.isdir(out_dir):
+            return
+        if now is None:
+            now = time.time()
+        uid = os.getuid()
+        with os.scandir(out_dir) as it:
+            entries = list(it)
+        for entry in entries:
+            if not entry.name.startswith(_OWNER_TMP_PREFIX):
+                continue
+            path = os.path.join(out_dir, entry.name)
+            st = os.lstat(path)
+            if not stat.S_ISDIR(st.st_mode):
+                continue
+            if st.st_uid != uid:
+                continue
+            if not now - st.st_mtime > _OWNER_TMP_STALE_SECONDS:
+                continue
+            if dry_run:
+                print(f"[dry-run] would remove stale owner temp dir: {path}")
+            else:
+                shutil.rmtree(path)
+                print(f"removed stale owner temp dir: {path} (age {(now - st.st_mtime) / 3600:.0f}h)")
+    except Exception as exc:
+        print(f"warning: stale owner temp-dir sweep failed: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 def _watermark_path(out_dir: str) -> str:
@@ -320,11 +409,56 @@ def _next_available_archive_path(out_dir: str, today: str) -> str:
         n += 1
 
 
+def _main_via_owner(args: argparse.Namespace, spec: "owner_read.OwnerReadSpec", out_dir: str) -> int:
+    """The flag-ON path (#3872): the live store is never opened. ONE owner snapshot, in a 0700 temp dir
+    inside out_dir, feeds both the watermark and the archive, and is removed on every exit."""
+    today = datetime.date.today().isoformat()  # YYYY-MM-DD
+    try:
+        if args.dry_run:
+            owner_read.ping(spec)
+            if not os.path.exists(out_dir):
+                print(f"[dry-run] would create directory: {out_dir}")
+            target_path = _next_available_archive_path(out_dir, today)
+            print(
+                f"[dry-run] would snapshot via the engramd owner and write backup: {target_path} "
+                "(a dry run takes no snapshot, so it cannot tell whether the backup would be skipped)"
+            )
+            if args.retain > 0:
+                _prune_old_archives(out_dir, args.retain, args.dry_run)
+            return 0
+
+        os.makedirs(out_dir, exist_ok=True)
+        tmpdir = tempfile.mkdtemp(prefix=_OWNER_TMP_PREFIX, dir=out_dir)
+        try:
+            os.chmod(tmpdir, 0o700)
+            snap = owner_read.snapshot(spec, Path(os.path.abspath(tmpdir)) / _OWNER_SNAPSHOT_NAME)
+            try:
+                live_watermark = _read_live_watermark(str(snap))
+            except Exception as exc:
+                print(f"error: could not read watermark from the owner snapshot: {exc}", file=sys.stderr)
+                return 1
+            return _skip_or_backup(args, out_dir, today, live_watermark, str(snap))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    except BackupOwnerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
     db_path = os.path.expanduser(args.db)
     out_dir = os.path.expanduser(args.out_dir)
+
+    # Before the flag branch: an orphan outlives a flag turned back OFF. Before any mkdtemp: the run's
+    # own temp dir can never be swept mid-run.
+    _sweep_stale_owner_tmpdirs(out_dir, args.dry_run)
+
+    # Flag ON and --db is this home's store: the owner path. It checks no file and opens no store.
+    spec = _owner_spec()
+    if owner_read.flag_applies(spec, Path(db_path)):
+        return _main_via_owner(args, spec, out_dir)
 
     # Verify source database exists.
     if not os.path.exists(db_path):
@@ -349,6 +483,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: could not read watermark from {db_path}: {exc}", file=sys.stderr)
         return 1
 
+    return _skip_or_backup(args, out_dir, today, live_watermark, db_path)
+
+
+def _skip_or_backup(
+    args: argparse.Namespace, out_dir: str, today: str, live_watermark: dict, source_path: str
+) -> int:
+    """The skip decision and the backup itself, shared by the direct and the owner paths. `source_path` is
+    what dump_stripped reads: the live store (direct) or the owner's snapshot of it."""
     # Content-aware skip: only a genuine watermark match against the last
     # successful backup's sidecar, AND that backup's archive file still
     # being on disk, means "nothing new since the last backup, and it's
@@ -396,7 +538,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Perform the backup.
     try:
-        stats = engram_backup.dump_stripped(db_path, target_path)
+        stats = engram_backup.dump_stripped(source_path, target_path)
     except Exception as exc:
         print(f"error: backup failed: {exc}", file=sys.stderr)
         return 1

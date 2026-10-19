@@ -1,6 +1,6 @@
 # engram-pkg — Authoring CLI for engram-packages
 
-The toolkit for authoring and editing engram-package databases (e.g., `engram-wiki`). Operates on any package directory passed via `--pkg <dir>` or `$ENGRAM_PKG`. Wraps `EngramClient` (which atomically redirects all server paths to the package directory) so you can write into the package without touching your personal engram at `~/.engram/`.
+The toolkit for authoring and editing engram-package databases (e.g., `engram-wiki`). Operates on any package directory passed via `--pkg <dir>` or `$ENGRAM_PKG`. Wraps `EngramClient` (which atomically redirects all server paths to the package directory) so you can write into the package without touching your personal engram at `~/.engram/` (`$ENGRAM_HOME`, default `~/.engram`).
 
 ## What is an engram-package?
 

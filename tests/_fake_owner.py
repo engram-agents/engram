@@ -55,6 +55,14 @@ CHAIN_NODE_ID_MAX_BYTES = 256
 CHAIN_MAX_DEPTH_CAP = 4
 CHAIN_RESULT_MAX_BYTES = 8 * 1024 * 1024
 
+# #3833: the real owner's failure answers. Literal copies too (engramd_owner._read_failed and the
+# dispatch catch-all; pinned in tests/test_fake_owner_sqlite_failure_3833.py).
+READ_FAILED_REMEDY = (
+    "the statement was admitted but could not complete (an over-limit value, a locked or "
+    "damaged store); see the owner log"
+)
+INTERNAL_ERROR_REMEDY = "owner bug (an unexpected exception inside the owner, not an outage): see the owner log"
+
 _TEMPLATES = Path(__file__).resolve().parent.parent / "src" / "engram" / "engramd_read_templates.json"
 
 
@@ -79,6 +87,16 @@ def statement_of(method, params):
 
 def _rej(reason, detail, remedy="n/a"):
     return {"status": "rejected", "reason": reason, "detail": detail, "remedy": remedy}
+
+
+def _read_failed(exc):
+    """The real owner's `read_failed` rejection for a sqlite3.Error while serving a read."""
+    return _rej("read_failed", f"{type(exc).__name__}: {exc}"[:200], READ_FAILED_REMEDY)
+
+
+def _internal_error(exc):
+    """The real owner's `internal_error` rejection for an unexpected exception in a handler."""
+    return _rej("internal_error", f"{type(exc).__name__}: {exc}"[:200], INTERNAL_ERROR_REMEDY)
 
 
 def df_refusal(params):
@@ -135,6 +153,7 @@ class FakeOwner:
         self._srv = None
         self._thread = None
         self._stop = threading.Event()
+        self._handlers = []  # every handler thread started, so a test can wait for them to FINISH
         self._registered = registered_sql()
 
     def __enter__(self):
@@ -170,7 +189,17 @@ class FakeOwner:
                 continue
             except OSError:
                 return
-            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+            t = threading.Thread(target=self._handle, args=(conn,), daemon=True)
+            self._handlers.append(t)
+            t.start()
+
+    def join_handlers(self, timeout=5.0) -> bool:
+        """Wait for every handler thread started so far; True when all have finished. A dying
+        thread's `threading.excepthook` has run by the time its join returns, so a test reads
+        the hook's record after this, not after a sleep (#3833)."""
+        for t in list(self._handlers):
+            t.join(timeout)
+        return not any(t.is_alive() for t in self._handlers)
 
     def _handle(self, conn):
         try:
@@ -181,11 +210,29 @@ class FakeOwner:
                 if not chunk:
                     return
                 data += chunk
-            request = json.loads(data.decode("utf-8"))
+            try:  # parsing: the real owner DROPS a malformed request (closed, no answer, not dispatched)
+                request = json.loads(data.decode("utf-8").strip())
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return
+            if not isinstance(request, dict):
+                return
             self.requests.append(request)
-            conn.sendall((json.dumps(self._answer(request)) + "\n").encode("utf-8"))
+            # Answering. Like the real owner (its `except Exception` wraps ALL of `_dispatch`), any
+            # `Exception` -- an OSError included -- raised while answering is the typed
+            # `internal_error`; a BaseException that is not an Exception is NOT caught (SystemExit /
+            # KeyboardInterrupt propagate there too). Not a claim that nothing escapes the thread:
+            # a pathological REQUEST (a RecursionError from deeply nested JSON, an oversized-integer
+            # ValueError) still kills it, because the parse `try` above, like the real owner's,
+            # catches only JSONDecodeError / UnicodeDecodeError. One departure, on the lenient side:
+            # an unserialisable answer is an `internal_error` here (the real owner's `json.dumps`
+            # sits outside its catch-all, so it dies there).
+            try:
+                payload = (json.dumps(self._answer(request)) + "\n").encode("utf-8")
+            except Exception as exc:  # #3833
+                payload = (json.dumps(_internal_error(exc)) + "\n").encode("utf-8")
+            conn.sendall(payload)
         except OSError:
-            pass
+            pass  # the transport itself failing (recv, or the sendall above): closed, no answer
         finally:
             conn.close()
 
@@ -194,17 +241,20 @@ class FakeOwner:
         if refusal is not None:
             return refusal
         db = self.home / "knowledge.db"
-        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
-        try:
-            ddl = conn.execute(_DF_VOCAB_DDL_SQL).fetchall()
-            if not ddl:
-                return _rej("vocab_table_absent", "nodes_fts_vocab is not in this store's sqlite_master")
-            match = _DF_VOCAB_VARIANT_RE.search(_DF_SQL_COMMENT_RE.sub(" ", ddl[0][0] or ""))
-            if match is None or match.group(1).lower() != "row":
-                return _rej("unsupported_vocab_variant", "nodes_fts_vocab is not an fts5vocab(..., 'row') table")
-            rows = [list(r) for r in conn.execute(IDF_BATCH_SQL, (json.dumps(params["terms"]),))]
-        finally:
-            conn.close()
+        try:  # #3833: a sqlite error (the connect included) is the real owner's `read_failed`
+            conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
+            try:
+                ddl = conn.execute(_DF_VOCAB_DDL_SQL).fetchall()
+                if not ddl:
+                    return _rej("vocab_table_absent", "nodes_fts_vocab is not in this store's sqlite_master")
+                match = _DF_VOCAB_VARIANT_RE.search(_DF_SQL_COMMENT_RE.sub(" ", ddl[0][0] or ""))
+                if match is None or match.group(1).lower() != "row":
+                    return _rej("unsupported_vocab_variant", "nodes_fts_vocab is not an fts5vocab(..., 'row') table")
+                rows = [list(r) for r in conn.execute(IDF_BATCH_SQL, (json.dumps(params["terms"]),))]
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            return _read_failed(exc)
         return {"status": "ok", "result": rows}
 
     def _answer_chain(self, params) -> dict:
@@ -215,13 +265,14 @@ class FakeOwner:
             return refusal
         depth = min(params["max_depth"], CHAIN_MAX_DEPTH_CAP)
         db = self.home / "knowledge.db"
-        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
-        try:
-            result = engram_core.generalization_chain(conn, params["node_id"], depth)
+        try:  # #3833: the connect is inside the guard (a missing store file fails THERE)
+            conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
+            try:
+                result = engram_core.generalization_chain(conn, params["node_id"], depth)
+            finally:
+                conn.close()
         except sqlite3.Error as exc:
-            return _rej("read_failed", f"{type(exc).__name__}: {exc}"[:200])
-        finally:
-            conn.close()
+            return _read_failed(exc)
         if len('{"status": "ok", "result": ' + json.dumps(result) + "}") > CHAIN_RESULT_MAX_BYTES:
             return _rej("chain_result_too_large", "the chain is over the serialised-reply bound")
         return {"status": "ok", "result": result}
@@ -253,9 +304,12 @@ class FakeOwner:
                     "detail": "the statement is not in the committed read-template list",
                     "remedy": "register the template (tools/engramd_read_scan.py) and restart the owner"}
         db = self.home / "knowledge.db"
-        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
-        try:
-            rows = [list(r) for r in conn.execute(sql, tuple(params.get("args") or ()))]
-        finally:
-            conn.close()
+        try:  # #3833: a sqlite error (the connect included) is the real owner's `read_failed`
+            conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
+            try:
+                rows = [list(r) for r in conn.execute(sql, tuple(params.get("args") or ()))]
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            return _read_failed(exc)
         return {"status": "ok", "result": rows}

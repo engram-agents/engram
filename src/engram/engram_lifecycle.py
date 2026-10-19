@@ -95,7 +95,7 @@ def _append_nap_to_history(message: str) -> dict:
     clause (b) below for why this is a dict, not None).
 
     (a) Additive-only, and orthogonal to hand-editing. This does NOT replace
-    the existing hand-written discipline for `~/.engram/history/YYYY-MM-DD.md`
+    the existing hand-written discipline for `core.DATA_DIR/history/YYYY-MM-DD.md`
     (per each agent's own CLAUDE.md) — an agent can still hand-edit the file
     for touch-ups, corrections, or richer entries either before or after this
     call runs. This function only guarantees that *something* concise lands
@@ -171,7 +171,7 @@ def _append_nap_to_history(message: str) -> dict:
     in `engram-sleep`'s dream-report naming ("today's NYC-local date",
     SKILL.md), not a new one -- kept consistent with that sibling file's
     day-boundary rather than inventing a second, different definition of
-    "today" for `~/.engram/`. Naive host-OS local time was rejected
+    "today" for the ENGRAM home (`core.DATA_DIR`: `$ENGRAM_HOME`, default `~/.engram`). Naive host-OS local time was rejected
     deliberately: a server host's OS timezone is not guaranteed to match
     any particular agent's operational rhythm (frequently UTC by default),
     so `datetime.now()` without an explicit zone would silently reproduce

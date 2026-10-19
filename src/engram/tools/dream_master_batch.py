@@ -48,7 +48,11 @@ architecturally 1:1 with a single bucket, never as a probabilistic default.
 
 from __future__ import annotations
 
+import argparse
+import json
 import re
+import sys
+from pathlib import Path
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -425,6 +429,22 @@ def check_snapshot_divergence(
 # Safety-row fetch helper
 # ---------------------------------------------------------------------------
 
+# The one statement `fetch_safety_row` sends, registered byte for byte as a read template under the site
+# `tools/dream_master_batch.py:fetch_safety_row` (U17, #3880). `_SAFETY_FIELDS` is its column order: the owner
+# returns rows as positional lists with no `description`, so the mapping to names must come from here.
+_SAFETY_FIELDS = ("is_current", "status", "superseded_by")
+_SAFETY_ROW_SQL = "SELECT is_current, status, superseded_by FROM nodes WHERE id = ?"
+if _SAFETY_ROW_SQL != f"SELECT {', '.join(_SAFETY_FIELDS)} FROM nodes WHERE id = ?":
+    raise RuntimeError("dream_master_batch: _SAFETY_ROW_SQL and _SAFETY_FIELDS disagree")
+
+
+class DreamReadError(RuntimeError):
+    """A store read the dream master asked for could not be answered (U17, #3880).
+
+    Raised for every owner failure (flag ON) and for a malformed answer from either path. The CLI turns it
+    into a non-zero exit with EMPTY stdout: a failed read must never print `null` (a missing node), `0`, or
+    a coverage fraction."""
+
 
 def fetch_safety_row(conn: Any, node_id: str) -> "dict | None":
     """Cheap targeted read of just the fields check_snapshot_divergence compares.
@@ -463,13 +483,18 @@ def fetch_safety_row(conn: Any, node_id: str) -> "dict | None":
         failure this helper exists to avoid feeding into
         ``check_snapshot_divergence``.
     """
-    cursor = conn.execute(
-        "SELECT is_current, status, superseded_by FROM nodes WHERE id = ?",
-        (node_id,),
-    )
-    row = cursor.fetchone()
-    if row is None:
+    cursor = conn.execute(_SAFETY_ROW_SQL, (node_id,))
+    # A SELECT by the unique node id answers zero or one row. The owner's read cursor has only
+    # fetchone()/fetchall() (no fetchmany), so read them all: more than one is malformed and must never
+    # become a plausible pre-write safety result, whether the extra rows agree or not.
+    rows = cursor.fetchall()
+    if len(rows) > 1:
+        raise DreamReadError(
+            f"fetch_safety_row: expected zero or one row for node id {node_id!r}, got {len(rows)}"
+        )
+    if not rows:
         return None
+    row = rows[0]
     if isinstance(row, dict):
         # An exotic dict-returning row_factory: tuple(row) would yield the
         # KEYS, silently returning column names as pseudo-values — the exact
@@ -477,8 +502,16 @@ def fetch_safety_row(conn: Any, node_id: str) -> "dict | None":
         # dict as-is instead. (No in-repo caller uses such a factory today;
         # reviewer-constructed edge case, PR #2091.)
         return dict(row)
-    columns = [col[0] for col in cursor.description]
-    return dict(zip(columns, tuple(row)))
+    # The owner's read cursor has no `description` (U17, #3880): its columns are the SELECT list, in order.
+    description = getattr(cursor, "description", None)
+    columns = [col[0] for col in description] if description else list(_SAFETY_FIELDS)
+    cells = tuple(row)
+    if len(cells) != len(columns):
+        # zip() would silently truncate a short or wide row into a dict missing a key.
+        raise DreamReadError(
+            f"fetch_safety_row: the row has {len(cells)} cells, expected {len(columns)} ({', '.join(columns)})"
+        )
+    return dict(zip(columns, cells))
 
 
 # ---------------------------------------------------------------------------
@@ -525,3 +558,223 @@ class BatchResult:
             "skipped_other": len(self.skipped_other),
             "total": len(self.executed) + len(self.skipped_diverged) + len(self.skipped_other),
         }
+
+
+# ---------------------------------------------------------------------------
+# CLI: the dream master's three store reads, so no agent ever opens knowledge.db (U17, #3880 of #2652)
+# ---------------------------------------------------------------------------
+#
+#   safety-row <node_id>               one JSON object {"is_current","status","superseded_by"}, or `null`
+#                                      for a MISSING node (exit 0)
+#   coverage {recall_summary|recall_keywords}
+#                                      the fraction health.metrics.recall_*_coverage(conn) computes, for
+#                                      every value engram_core can write (see the note above the SQL)
+#                                      (the string "UNAVAILABLE" when no claim-bearing node is current,
+#                                      as health reports it)
+#   null-embeddings --population P     the count health.engine._count_null_embeddings(conn, P) computes
+#
+# ONE stdout/exit contract for all three: a successful read prints exactly one JSON line and exits 0; ANY
+# failure prints NOTHING on stdout, one `<ClassName>: <message>` line on stderr, and exits non-zero. A
+# failed read is never `null`, `0` or a fraction.
+#
+# Behind `engramd.dream_safety_reads_via_owner` (default OFF) every statement goes to the engramd owner as
+# one registered read template; flag ON with the owner down, refusing or answering malformed FAILS, with no
+# direct fallback. Flag OFF opens the store `mode=ro`. The two aggregates are computed IN SQL (counts, not
+# every summary and keyword list over the socket); a cell in tests/test_dream_safety_owner_read_3880.py holds
+# them equal to the health functions for every value engram_core can write (NULL, or the json.dumps of a list).
+# Five hand-written recall_keywords shapes engram_core cannot write DIVERGE and are pinned, not fixed, in
+# test_round1_keywords_shapes_engram_core_cannot_write_diverge_in_exactly_the_pinned_way: [NaN], [Infinity],
+# [-Infinity] and nesting past SQLite's depth limit (python: present, SQL: missing), and a NUL byte after the
+# list (python: missing, SQL: present). All five are unreachable through a normal write.
+
+OWNER_FLAG_KEY = "dream_safety_reads_via_owner"
+
+# engram_core.CLAIM_BEARING_TYPES, sorted, as a literal: this CLI must not import engram_core (on a host without
+# sqlite-vec the import prints a notice on stderr, and a successful call must leave stderr empty). A test pins
+# the literal equal to sorted(engram_core.CLAIM_BEARING_TYPES), so there is still no second list to drift.
+CLAIM_BEARING_TYPES_SORTED = (
+    "axiom",
+    "conjecture",
+    "derivation",
+    "observation_factual",
+    "observation_predictive",
+    "theory",
+)
+
+_COVERAGE_UNAVAILABLE = "UNAVAILABLE"
+_POPULATION_CLAIM_BEARING = "claim_bearing_nodes"
+
+# The three aggregate statements, each registered byte for byte under its own function's site. The claim-bearing
+# type list travels as ONE json parameter (the registry's admitted json_each form): the same set the health
+# functions read from engram_core.CLAIM_BEARING_TYPES (held here as CLAIM_BEARING_TYPES_SORTED, pinned by a test). The summary test
+# trims exactly the characters Python's str.strip() trims (health.metrics.recall_summary_coverage uses `.strip()`):
+# those with str.isspace() true, the list the session-start hook's registered statements use too.
+_RECALL_SUMMARY_COUNTS_SQL = (
+    "SELECT COUNT(*), COALESCE(SUM(CASE WHEN trim(coalesce(recall_summary, ''), '\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f \x85\xa0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') = '' "
+    "THEN 1 ELSE 0 END), 0) FROM nodes WHERE is_current = 1 AND type IN (SELECT value FROM json_each(?))"
+)
+_RECALL_KEYWORDS_COUNTS_SQL = (
+    "SELECT COUNT(*), COALESCE(SUM(CASE WHEN json_valid(recall_keywords) THEN CASE WHEN "
+    "json_type(recall_keywords) = 'array' AND json_array_length(recall_keywords) > 0 THEN 0 ELSE 1 END "
+    "ELSE 1 END), 0) FROM nodes WHERE is_current = 1 AND type IN (SELECT value FROM json_each(?))"
+)
+_NULL_EMBEDDINGS_SQL = (
+    "SELECT COUNT(*) FROM nodes WHERE is_current = 1 AND type IN (SELECT value FROM json_each(?)) "
+    "AND embedding IS NULL"
+)
+
+
+def _owner_read():
+    """The shared owner-read helper (tools/_owner_read.py), imported lazily so the library functions above
+    keep their import-time purity. Resolves the package root through the symlink, so it works run as a script,
+    loaded by path, or from the flattened plugin layout."""
+    pkg_root = str(Path(__file__).resolve().parent.parent)
+    if pkg_root not in sys.path:
+        sys.path.insert(0, pkg_root)
+    from tools import _owner_read as owner_read
+
+    return owner_read
+
+
+def _owner_spec(owner_read: Any) -> Any:
+    return owner_read.OwnerReadSpec(
+        flag_key=OWNER_FLAG_KEY,
+        error_cls=DreamReadError,
+        home=owner_read.engram_home(),
+        never_empty="Not answering from a default: a failed read must never read as a missing node, "
+                    "zero coverage or zero findings.",
+    )
+
+
+def _claim_bearing_types_json() -> str:
+    """The claim-bearing types, sorted, as the json_each parameter (the order health.metrics uses)."""
+    return json.dumps(list(CLAIM_BEARING_TYPES_SORTED))
+
+
+def _is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _one_row(rows: list, width: int, what: str) -> tuple:
+    """An aggregate statement returns exactly one row of `width` cells; anything else is malformed, never a
+    value (an empty answer would otherwise read as zero coverage)."""
+    if len(rows) != 1 or not isinstance(rows[0], (list, tuple)) or len(rows[0]) != width:
+        raise DreamReadError(f"{what}: expected exactly one row of {width} cells, got {str(rows)[:120]}")
+    return tuple(rows[0])
+
+
+def _checked_counts(rows: list, what: str) -> tuple[int, int]:
+    total, missing = _one_row(rows, 2, what)
+    if not (_is_count(total) and _is_count(missing) and missing <= total):
+        raise DreamReadError(f"{what}: counts are not 0 <= missing <= total integers: {str((total, missing))[:120]}")
+    return total, missing
+
+
+def recall_summary_counts(conn: Any) -> tuple[int, int]:
+    """(current claim-bearing nodes, of those with no recall_summary) -- the denominator and numerator
+    health.metrics.recall_summary_coverage works from, computed in SQL."""
+    rows = conn.execute(_RECALL_SUMMARY_COUNTS_SQL, (_claim_bearing_types_json(),)).fetchall()
+    return _checked_counts(rows, "recall_summary coverage")
+
+
+def recall_keywords_counts(conn: Any) -> tuple[int, int]:
+    """(current claim-bearing nodes, of those with no non-empty recall_keywords list)."""
+    rows = conn.execute(_RECALL_KEYWORDS_COUNTS_SQL, (_claim_bearing_types_json(),)).fetchall()
+    return _checked_counts(rows, "recall_keywords coverage")
+
+
+def coverage_value(total: int, missing: int) -> "float | str":
+    """health.metrics's own arithmetic: 1.0 - missing/total, or its UNAVAILABLE sentinel (named, never a
+    number) when there is no claim-bearing node to cover."""
+    return _COVERAGE_UNAVAILABLE if total == 0 else 1.0 - (missing / total)
+
+
+def _check_population(population: str) -> None:
+    if population != _POPULATION_CLAIM_BEARING:
+        raise ValueError(
+            f"null-embeddings only implements the '{_POPULATION_CLAIM_BEARING}' population, got {population!r}"
+        )
+
+
+def count_null_embeddings(conn: Any, population: str) -> int:
+    """Count of CURRENT claim-bearing nodes with a NULL embedding -- health.engine._count_null_embeddings."""
+    _check_population(population)
+    (count,) = _one_row(
+        conn.execute(_NULL_EMBEDDINGS_SQL, (_claim_bearing_types_json(),)).fetchall(), 1, "null-embeddings"
+    )
+    if not _is_count(count):
+        raise DreamReadError(f"null-embeddings: the count is not a non-negative integer: {str(count)[:120]}")
+    return count
+
+
+def _checked_safety_row(row: "dict | None") -> "dict | None":
+    """Types of a safety row, on BOTH paths: is_current an int or null, status and superseded_by text or null."""
+    if row is None:
+        return None
+    cur = row.get("is_current")
+    ok = (
+        list(row) == list(_SAFETY_FIELDS)
+        and (cur is None or (isinstance(cur, int) and not isinstance(cur, bool)))
+        and all(row[k] is None or isinstance(row[k], str) for k in ("status", "superseded_by"))
+    )
+    if not ok:
+        raise DreamReadError(f"safety-row: the row does not match the node schema: {str(row)[:200]}")
+    return row
+
+
+def _with_reader(read: Any) -> Any:
+    """Open the read connection the flag selects, call read(conn), close. Flag ON: the owner's answer replaces
+    the db_path.exists() precondition and nothing is opened directly; flag OFF: a `mode=ro` connection."""
+    owner_read = _owner_read()
+    spec = _owner_spec(owner_read)
+    db_path = owner_read.default_db_path()
+    use_owner = owner_read.flag_applies(spec, db_path)
+    if use_owner:
+        owner_read.ping(spec)
+    elif not db_path.exists():
+        raise FileNotFoundError(f"ENGRAM database not found: {db_path}")
+    conn = owner_read.open_reader(spec, db_path, use_owner)
+    try:
+        return read(conn)
+    finally:
+        conn.close()
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="dream_master_batch.py",
+        description="The dream master's store reads. One JSON line on stdout and exit 0, or NOTHING on stdout "
+                    "and a non-zero exit with the error class on stderr. Never open knowledge.db yourself.",
+    )
+    sub = ap.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("safety-row", help="is_current, status, superseded_by of one node (null if missing)")
+    p.add_argument("node_id")
+    p = sub.add_parser("coverage", help="fraction of current claim-bearing nodes with a summary / keywords")
+    p.add_argument("which", choices=["recall_summary", "recall_keywords"])
+    p = sub.add_parser("null-embeddings", help="count of current claim-bearing nodes with a NULL embedding")
+    p.add_argument("--population", required=True)
+    return ap
+
+
+def main(argv: "list[str] | None" = None) -> int:
+    args = _build_parser().parse_args(argv)
+    try:
+        if args.command == "safety-row":
+            result = _with_reader(lambda conn: _checked_safety_row(fetch_safety_row(conn, args.node_id)))
+        elif args.command == "coverage":
+            counts = recall_summary_counts if args.which == "recall_summary" else recall_keywords_counts
+            result = coverage_value(*_with_reader(counts))
+        else:
+            _check_population(args.population)
+            result = _with_reader(lambda conn: count_null_embeddings(conn, args.population))
+        line = json.dumps(result)
+    except Exception as exc:  # every failure is loud and empty on stdout; KeyboardInterrupt propagates
+        sys.stderr.write(f"{type(exc).__name__}: {' '.join(str(exc).split())}\n")
+        return 1
+    sys.stdout.write(line + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

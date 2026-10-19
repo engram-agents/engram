@@ -33,7 +33,8 @@ from .data.sqlite_ro import connect_ro
 # byte-identical served-output contract this PR's acceptance gates check.
 _disc_log = logging.getLogger("viz.agents.discover")
 
-DEFAULT_DB = str(Path.home() / ".engram" / "knowledge.db")
+_ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+DEFAULT_DB = str(Path(_ENGRAM_HOME) / "knowledge.db")
 DEFAULT_PORT = 5001
 
 # Agent registry — populated in main() from --config or --db.
@@ -123,6 +124,17 @@ def _load_config(path: str) -> tuple[dict, str]:
     return agents, default
 
 
+def _registered_homes(root) -> list:
+    """Trusted registry homes for a login-home root (engram_home_registry);
+    [] when the module is unavailable or the entry is absent / untrusted."""
+    try:
+        from engram_home_registry import homes_for
+        return list(homes_for(root))
+    except Exception as e:
+        _disc_log.debug("discover_agents: registry read failed for %s: %s", root, e)
+        return []
+
+
 def discover_agents(scan_roots=None) -> dict:
     """Auto-discover local ENGRAM agents by scanning home directories.
 
@@ -157,13 +169,34 @@ def discover_agents(scan_roots=None) -> dict:
             candidates = sorted(root.glob(".engram*"))
         except Exception as e:
             _disc_log.debug("discover_agents: glob failed for root %s: %s", root, e)
-            continue
+            candidates = []
+
+        # #3863 PR 5 (R3): the seat's registered home goes FIRST; the glob
+        # stays as the fallback.  A registered home need not be a .engram*
+        # directory.  Dedupe by realpath so a home found both ways counts once.
+        registered = [Path(h) for h in _registered_homes(root)]
+        registered_real = {os.path.realpath(str(h)) for h in registered}
+        seen_real: set = set()
+        ordered: list = []
+        for cand in registered + candidates:
+            try:
+                key = os.path.realpath(str(cand))
+            except Exception:
+                key = str(cand)
+            if key in seen_real:
+                continue
+            seen_real.add(key)
+            ordered.append(cand)
+        candidates = ordered
 
         for candidate in candidates:
             try:
                 name_part = candidate.name
-                # Skip backup and baseline dirs.
-                if name_part.endswith(".bak") or "baseline" in name_part:
+                # Skip backup and baseline dirs.  Only a GLOB guess gets this
+                # heuristic: a home the seat registered itself is trusted as
+                # named, whatever its basename (Mira, #3885).
+                if (os.path.realpath(str(candidate)) not in registered_real
+                        and (name_part.endswith(".bak") or "baseline" in name_part)):
                     continue
                 if not candidate.is_dir():
                     continue

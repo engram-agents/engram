@@ -1,15 +1,17 @@
 [Unit]
 Description=ENGRAM owner (engramd_owner), one per ENGRAM_HOME
-# Exit 1 = OwnerAlreadyRunning: another owner holds this seat. Restart=on-failure restarts
-# it, BOUNDED: RestartSec below plus at most StartLimitBurst starts per StartLimitIntervalSec
-# (5 starts in 300 s with RestartSec=10s, so a repeatedly failing owner is down for good
-# about 40-50 s after the first failure). After that the unit stays failed until
-# `systemctl --user reset-failed` or a manual start, and start-engramd-owner.sh then
-# reports `registered but failed` on each session start and launches nothing (it never
-# competes with a registered supervisor). StartLimit* belongs in [Unit] (systemd >= 230);
-# in [Service] it is ignored.
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# Exit 1 = OwnerAlreadyRunning: another owner holds this seat. Restart=on-failure restarts it
+# UNBOUNDED (#3831): StartLimitIntervalSec=0 disables systemd's start limit, so a crash loop
+# restarts forever instead of reaching the limit and going PERMANENTLY failed -- after which
+# every stop blocked until a human ran `systemctl --user reset-failed`. Unlike the pre-PR unit it
+# no longer reaches a permanent stop for the exits it restarts; exit 4, in
+# RestartPreventExitStatus, is still a permanent stop by design, before and after #3831 alike. The
+# retry rate is bounded by the backoff in [Service] only where systemd supports it
+# (RestartSteps/RestartMaxDelaySec, >= 254). The parity with macOS's launchd is LIVENESS -- no
+# permanent stop for the exits systemd restarts -- not the throttling rate: launchd holds a fixed
+# 60 s ThrottleInterval, and below systemd 254 this unit restarts with NO backoff at all.
+# StartLimit* belongs in [Unit] (systemd >= 230); in [Service] it is ignored.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -20,15 +22,16 @@ ExecStart={{PYTHON}} {{ENGRAM_OWNER_PY}}
 Environment=ENGRAM_HOME={{ENGRAM_HOME}}
 # Exit codes are supervised by meaning:
 #   0  clean stop            -> not restarted (on-failure does not restart a clean exit)
-#   1  OwnerAlreadyRunning   -> restarted, bounded (RestartSec + StartLimit* above)
-#   3  EXIT_DISPLACED       -> restarted by Restart=on-failure (until the start limit
-#                               trips, as for exit 1): the owner shut down on a displaced
-#                               substrate without closing the store, so it must never read
-#                               as a success. Hence deliberately NO SuccessExitStatus=, and
-#                               exits 1 and 3 are never in RestartPreventExitStatus=.
+#   1  OwnerAlreadyRunning   -> restarted, unbounded (StartLimitIntervalSec=0), with the
+#                               RestartSec/RestartSteps/RestartMaxDelaySec backoff below
+#   3  EXIT_DISPLACED       -> restarted by Restart=on-failure (same unbounded policy): the owner
+#                               shut down on a displaced substrate without closing the store, so
+#                               it must never read as a success. Hence deliberately NO
+#                               SuccessExitStatus=, and exits 1 and 3 are never in
+#                               RestartPreventExitStatus=.
 #   4  EXIT_PATH_NOT_REGULAR -> a pidfile or store path is not a regular file -> NOT restarted
 #                               (RestartPreventExitStatus=4): retrying cannot fix a planted path
-#   5  EXIT_STORE_BEHIND_SCHEMA (#3753) -> restarted, bounded as for exit 1: knowledge.db is
+#   5  EXIT_STORE_BEHIND_SCHEMA (#3753) -> restarted, unbounded as for exit 1: knowledge.db is
 #                               absent or behind this code's schema (the first migration has
 #                               not run yet); no SuccessExitStatus=/RestartPreventExitStatus=.
 #                               Not 2: CPython exits 2 itself when it cannot open the script
@@ -36,6 +39,17 @@ Environment=ENGRAM_HOME={{ENGRAM_HOME}}
 Restart=on-failure
 RestartPreventExitStatus=4
 RestartSec=10s
+# RestartSteps/RestartMaxDelaySec are systemd >= 254: the restart delay grows from RestartSec up
+# to RestartMaxDelaySec over RestartSteps steps, which caps the retry rate the removed start
+# limit used to bound. Below 254 they are UNKNOWN KEYS -- systemd warns and IGNORES them
+# (`Unknown key name ... ignoring.`; `systemd-analyze verify` still exits 0), so the unit degrades
+# to "restart forever, no backoff", never to a refused unit. BOUND on that claim: the
+# warn-and-ignore mechanism was measured on systemd 255 with a deliberately fabricated unknown
+# key, and it is 255's parser that warned and ignored -- so this establishes the MECHANISM (an
+# unknown key degrades to warn-and-ignore rather than to a refused unit), NOT the behaviour of any
+# version below 254.
+RestartSteps=5
+RestartMaxDelaySec=300s
 # `append:` log routing requires systemd >= 240 (same floor as the surface daemon unit).
 StandardOutput=append:{{ENGRAM_HOME}}/engramd-owner.log
 StandardError=append:{{ENGRAM_HOME}}/engramd-owner.log

@@ -21,6 +21,9 @@ name: pr-checks
 #      which installed fastmcp unconditionally and was parked on that cost.)
 #   7c. stdlib-only guards      (#2376 — 5 SSoT/sync/drift gates measured to need
 #      nothing beyond stdlib+pytest, same carve-out as manifest-gate above)
+#   7c-3. home-path gate        (#3863 — BLOCKING; a new hard-coded ENGRAM home
+#      path in src/engram fails, today's violators sit in a baseline that may
+#      only shrink)
 #   8. test-id-set-check         (#2350 — BLOCKING; a deleted test cannot fail, so a
 #      PR that removes coverage is exactly as green as a PR that adds it)
 #   8b. test-id-set-check-unit-tests (#2950/#2959 — BLOCKING; runs
@@ -991,6 +994,41 @@ jobs:
             tests/test_ci_wiring_guard.py \
             -q || rc=1
           python3 -m pytest src/engram/tools/test_tripwire.py -q || rc=1
+          exit $rc
+
+      # ── 7c-3. home-path gate (#3863) ───────────────────────────────────────
+      # Lei's ruling (2026-10-17): the deployment uses ENGRAM_HOME wherever
+      # possible, since the install allows a custom engram folder. This fails a
+      # PR that adds a hard-coded ENGRAM home path (`~/.engram`,
+      # `Path.home() / ".engram"`, `$HOME/.engram`, ...) to a tracked src/engram
+      # line that does not itself name ENGRAM_HOME or call engram_home() (the
+      # gate is LINE-level: the token on another line does not count). Today's
+      # violating lines sit in tools/home_path_baseline.json as per-file counts
+      # that may only shrink: a fixed line must lower its count (a lower count or
+      # a zero entry = red "stale"), and --base-sha makes a higher count or a new
+      # entry red (the PR that creates the baseline is the only seed; a schema-1
+      # base is the one-time transition). The allowlist (classed, with reasons)
+      # holds one resolver at most plus foreign-home files. BLOCKING, stdlib only (git + python, well under a
+      # second). Same merge-base line as test-id-set-check below. On a pull_request
+      # run HEAD is the merge commit, so the merge-base is the base branch's tip
+      # as of that merge ref, not the PR's branch point: a stricter, more current
+      # comparison. The gate's own tests run here too, since the full suite does
+      # not run on dev PRs, and so do the two line-level controls PR 2 added for
+      # what the file-level gate cannot see (test_skill_home_paths_3863.py: the
+      # health-exam, upgrade and sleep skills; test_walguard_home_path_3863.py:
+      # the walguard remedy text; test_tools_engram_home_3863.py, PR 3a: every
+      # tools/ default under the ENGRAM home follows ENGRAM_HOME, plus a
+      # code-position guard over the swept files; test_shell_engram_home_3863.py, PR 3b: the launcher,
+      # the forum monitors and two dev scripts, plus the docstring-only core files).
+      # tests/test_home_path_gate.py pins this step (the
+      # gate call with --base-sha from a merge-base, and the pytest call).
+      - name: home-path gate — fail on a new hard-coded ENGRAM home path (baseline may only shrink)
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
+        run: |
+          BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          rc=0
+          python3 tools/home_path_gate.py --base-sha "$BASE_SHA" || rc=1
+          python3 -m pytest tests/test_home_path_gate.py tests/test_skill_home_paths_3863.py tests/test_walguard_home_path_3863.py tests/test_tools_engram_home_3863.py tests/test_shell_engram_home_3863.py -q || rc=1
           exit $rc
 
       # ── 7d. cascade behaviour acceptance (playbox) ──────────────────────

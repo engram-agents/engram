@@ -86,7 +86,7 @@ fake.STOPWORDS = frozenset()
 fake.JUNK_STOPLIST = frozenset()
 sys.modules["engram_idf"] = fake
 if scen.get("probe"):
-    os.makedirs(os.path.join(os.environ["HOME"], ".engram", "probe", "mods-recall", scen["session"]), exist_ok=True)
+    os.makedirs(os.path.join(home, "probe", "mods-recall", scen["session"]), exist_ok=True)
 spec = importlib.util.spec_from_file_location("tripwire_under_test", hook_path)
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
@@ -215,7 +215,7 @@ class Run:
         return self.read_jsonl(f"sessions/{SESSION}.shown.jsonl")
 
     def routes(self):
-        p = self.home.parent / "home" / ".engram" / "probe" / "mods-recall" / SESSION / "routes" / "tool_recall.jsonl"
+        p = self.home / "probe" / "mods-recall" / SESSION / "routes" / "tool_recall.jsonl"
         return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
 
     def fires(self):

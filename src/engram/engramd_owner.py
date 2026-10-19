@@ -19,6 +19,9 @@ shape") and SS5 ("Rider 2 -- what a caller sees when the owner is down").
   call, per the design doc SS7. This module is a plain Python process; it
   does not write service files or register itself with anything.
 - Typed writes of any kind -- no manager, no domain engines, no cascade.
+  (Historical U3 scope. #3822 / U11 added the owner's first write, the typed
+  `use_reward` op: see "The owner's first write" below `_use_reward_param_refusal`
+  and docs/2652-migration-ledger.md section 6. Still no generic write verb.)
 - Wiring any real caller (hooks, the MCP server, viz, ...) to this owner.
   It exists standalone.
 
@@ -231,10 +234,13 @@ timer or module constant in its place.
 
 from __future__ import annotations
 
+import copy
 import errno
+import hashlib
 import itertools
 import json
 import logging
+import math
 import os
 import platform
 import queue
@@ -250,13 +256,16 @@ import sys
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import engram_pidfile
+import engram_moment_cursor as emc
+import engram_restamp as er
 import engram_walguard
 import engramd_client as ec
 import engramd_read_registry as rr
-from engram_regular_io import NotRegularFile, describe_file_kind, write_pidfile
+from engram_regular_io import NotRegularFile, describe_file_kind, read_regular_text, write_pidfile
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -529,6 +538,25 @@ ACCEPT_POLL_INTERVAL = 0.2  # seconds
 WORKER_THREAD_PREFIX = "engramd-worker"
 IDLE_WORKER_CAP = 4
 IDLE_WORKER_TIMEOUT = 60.0  # seconds
+
+# Peer-credential refusals (#3845). After the typed rejection the owner does
+# shutdown(SHUT_WR) and DRAINS the refused peer's request (never parsing it) before
+# closing: closing with unread bytes in the receive queue makes a client that reads to
+# EOF get ConnectionResetError after the (delivered) rejection. The drain is bounded by
+# min(REFUSAL_DRAIN_BUDGET, the remaining request deadline) and by max_request_bytes.
+# A refused peer that sends nothing is therefore held up to this budget instead of
+# being closed at once. Each refusal logs one WARNING, rate-limited per peer uid with a
+# lazy window (no timer): PEER_REFUSAL_LOG_WINDOW seconds, at most
+# PEER_REFUSAL_LOG_MAX_UIDS uids tracked (oldest evicted). At most MAX_REFUSAL_DRAINS
+# drains run at once, GLOBAL across peers, so a flood of silent foreign connections
+# cannot cost one held handler thread each. A refusal that finds no free slot sends the
+# rejection and closes at once -- no shutdown, no drain, no hold -- so only an
+# overflowing read-to-EOF send-first client loses the clean EOF (it gets
+# ConnectionResetError after the delivered rejection). The log line is written either way.
+REFUSAL_DRAIN_BUDGET = 0.5  # seconds
+MAX_REFUSAL_DRAINS = 8
+PEER_REFUSAL_LOG_WINDOW = 60  # seconds
+PEER_REFUSAL_LOG_MAX_UIDS = 64
 
 # Accept backlog (#3680). listen(5) let a burst of ~6+ simultaneous hook processes
 # overflow the kernel's accept queue: the client's connect() failed at once with EAGAIN
@@ -1164,9 +1192,12 @@ def _find_read_templates_path() -> "Path | None":
 
 def _read_install_tier(engram_home: Path) -> "str | None":
     """`install_tier` from `<ENGRAM_HOME>/config.json`; None if absent or
-    unreadable (which `resolve_dynamic_flag` treats as not-dev)."""
+    unreadable (which `resolve_dynamic_flag` treats as not-dev). Read through
+    `read_regular_text` (#3838): `start()` runs this before the owner serves, and
+    a FIFO at config.json would block a plain `read_text` until a writer appeared;
+    a non-regular file is an OSError here, i.e. None."""
     try:
-        cfg = json.loads((engram_home / "config.json").read_text(encoding="utf-8"))
+        cfg = json.loads(read_regular_text(engram_home / "config.json", encoding="utf-8"))
     except (OSError, ValueError):
         return None
     tier = cfg.get("install_tier") if isinstance(cfg, dict) else None
@@ -1758,6 +1789,586 @@ def _acl_leftovers(entries: list[str]) -> list[str]:
     return leftovers
 
 
+# ---------------------------------------------------------------------------
+# The owner's first write: the typed `use_reward` op (#3822, U11 of #2652, Stage A)
+# ---------------------------------------------------------------------------
+#
+# docs/2652-engrammanager-design.md SS3.1 (typed writes, never a generic write_sql) and SS5.4
+# (read-back acknowledgement + idempotency key). The client supplies ONLY {node_ids, action,
+# request_id}: no alpha, no config path, no value. alpha is owner-side
+# (`engram_restamp.USE_ALPHA[action]`); the memory config is the OWNER'S OWN
+# `ENGRAM_HOME/config.json`, read fresh on every call.
+
+# Every method in the table carries a kind. The write kinds are a DECLARED, CLOSED set: one constant, pinned
+# by tests/test_engramd_use_reward_3822.py to exactly the four below. An unclassified method is
+# default-deny at dispatch.
+METHOD_KINDS = frozenset({"read", "write"})
+# the 2nd write: #3856; the 3rd and 4th: #3879 (the regenerate-embeddings tool's `fill_embeddings` / `finish_embedding_regen`)
+WRITE_METHODS = frozenset({"use_reward", "advance_moment_cursor", "fill_embeddings", "finish_embedding_regen"})
+# Writes whose handler also receives the WIRE envelope's `request_id` (as a third argument): their params are a
+# closed key set that cannot carry one (`fill_embeddings`: exactly {model, items}). use_reward carries its own
+# request_id inside params and is not in this set.
+WIRE_REQUEST_ID_METHODS = frozenset({"fill_embeddings"})
+
+# The closed action enum (today one action). Anything else is refused before the store is touched.
+USE_REWARD_ACTIONS = frozenset({"mention"})
+USE_REWARD_MAX_IDS = 500  # per call; enforced before any SQL (an over-cap call opens no transaction)
+USE_REWARD_NODE_ID_MAX_BYTES = 256
+USE_REWARD_REQUEST_ID_MAX_BYTES = 128  # a uuid4 string is 36
+# In-memory, bounded (LRU) dedupe store. KNOWN BOUND: it dies with the process, so an owner restart between
+# COMMIT and ack followed by a client retry of the same request_id bumps a second time (a small monotone
+# over-credit, not corruption); and past this cap the oldest request_id is forgotten. Read at call time.
+USE_REWARD_DEDUPE_CAP = 1024
+# The TOTAL time one use_reward may spend WAITING (seconds): the `_owner_lock` acquire PLUS SQLite's busy wait
+# for a competing direct writer share this one budget (the busy timeout for the op is the REMAINING budget).
+# When it runs out the op answers the typed, DETERMINATE `busy` with nothing committed. It is pinned by a test to
+# be strictly less than `engramd_client.OWNER_WRITE_CLIENT_TIMEOUT - OWNER_WRITE_REPLY_RESERVE`, so that answer
+# arrives before the client gives up. Read at call time.
+OWNER_WRITE_LOCK_WAIT = 1.0
+USE_REWARD_MONOTONE_FLOOR = 0.99  # ids at or above this utility are exempt from the monotone read-back invariant
+USE_REWARD_BUSY_RETRY_SLEEP = 0.02  # seconds between attempts while a direct writer holds the store's write lock
+
+# The triggers on `nodes` in the real schema, MEASURED (7), pinned against sqlite_master by a test: a newly
+# added trigger fails that cell loudly. None of them fires on UPDATE of utility_score / importance_score /
+# recall_turn (each is AFTER INSERT / AFTER DELETE / BEFORE UPDATE OF metadata / AFTER UPDATE OF status,
+# is_current, claim-and-text columns), so the set whose statements the op admits BY NAME is empty.
+USE_REWARD_NODES_TRIGGERS_PINNED = frozenset({
+    "nodes_fts_insert", "nodes_fts_delete", "nodes_retract_remove_from_fts", "nodes_fts_supersede_remove",
+    "nodes_fts_rewrite_resync", "nodes_metadata_json_guard_insert", "nodes_metadata_json_guard_update",
+})
+USE_REWARD_ADMITTED_TRIGGERS: frozenset = frozenset()
+
+# Column-exact allowlist, MEASURED from one real use_reward on the real schema (the recording authorizer's
+# tuples are pinned in the test): reads of nodes.id / utility_score / importance_base / recall_count by the
+# shared function, plus importance_score / recall_turn by the read-back; updates of exactly the three columns.
+USE_REWARD_READ_COLUMNS = frozenset({
+    "id", "utility_score", "importance_base", "recall_count", "importance_score", "recall_turn",
+})
+USE_REWARD_UPDATE_COLUMNS = frozenset({"utility_score", "importance_score", "recall_turn"})
+USE_REWARD_SAVEPOINT = "engram_use_restamp"  # the shared function's own SAVEPOINT name
+
+
+def _use_reward_allows(action_code, arg1, arg2, db_name, trigger_or_view) -> bool:
+    """The op-scoped allowlist (pure): True iff this authorizer call is one use_reward needs. Everything else
+    (INSERT, DELETE, other columns / tables / attached dbs, PRAGMA, DDL, functions, other savepoints) is False.
+    A statement originating in a trigger or view is admitted only if that trigger is NAMED in
+    USE_REWARD_ADMITTED_TRIGGERS (empty today: none fires), and is then held to the same column rules."""
+    if trigger_or_view is not None and trigger_or_view not in USE_REWARD_ADMITTED_TRIGGERS:
+        return False
+    if action_code == sqlite3.SQLITE_SELECT:
+        return True
+    if action_code == sqlite3.SQLITE_READ:
+        return db_name == "main" and arg1 == "nodes" and arg2 in USE_REWARD_READ_COLUMNS
+    if action_code == sqlite3.SQLITE_UPDATE:
+        return db_name == "main" and arg1 == "nodes" and arg2 in USE_REWARD_UPDATE_COLUMNS
+    if action_code == sqlite3.SQLITE_TRANSACTION:
+        return arg1 in ("BEGIN", "COMMIT", "ROLLBACK")
+    if action_code == sqlite3.SQLITE_SAVEPOINT:
+        return arg1 in ("BEGIN", "RELEASE", "ROLLBACK") and arg2 == USE_REWARD_SAVEPOINT
+    return False
+
+
+class _UseRewardGuard:
+    """Per-op state for the authorizer: the denials seen, and the two phases in which a transaction COMMIT /
+    ROLLBACK is the handler's own (a COMMIT issued from inside the shared function would be a partial commit)."""
+
+    def __init__(self, allows=None, vec_allows=None) -> None:
+        # `vec_allows`: an optional extra pure predicate consulted ONLY while `vec_phase` is open (the fill op's vec
+        # mirror, #3879): the admissions that are legitimate inside the mirror and nowhere else.
+        self._vec_allows = vec_allows
+        self.vec_phase = False
+        # The op's pure allowlist: `_use_reward_allows` by default, `_moment_cursor_allows` for the second write
+        # (#3856). One guard, one set of COMMIT / ROLLBACK / busy-PRAGMA phases, two allowlists.
+        self._allows = allows if allows is not None else _use_reward_allows
+        self.denials: list = []
+        self.allow_commit = False
+        self.allow_rollback = False
+        self.allow_busy_pragma = False  # the handler's own busy_timeout restore, even if the permissive restore failed
+
+    def reset(self) -> None:
+        """A fresh attempt (after a busy rollback): no denials carried over, the handler's phases closed."""
+        self.denials.clear()
+        self.allow_commit = False
+        self.allow_rollback = False
+
+    def authorizer(self, action_code, arg1, arg2, db_name, trigger_or_view):
+        if self.allow_busy_pragma and action_code == sqlite3.SQLITE_PRAGMA and arg1 == "busy_timeout":
+            return sqlite3.SQLITE_OK
+        if action_code == sqlite3.SQLITE_TRANSACTION and (
+            (arg1 == "COMMIT" and not self.allow_commit) or (arg1 == "ROLLBACK" and not self.allow_rollback)
+        ):
+            self.denials.append((action_code, arg1, arg2, db_name, trigger_or_view))
+            return sqlite3.SQLITE_DENY
+        if self._allows(action_code, arg1, arg2, db_name, trigger_or_view):
+            return sqlite3.SQLITE_OK
+        if self.vec_phase and self._vec_allows is not None and self._vec_allows(
+                action_code, arg1, arg2, db_name, trigger_or_view):
+            return sqlite3.SQLITE_OK
+        self.denials.append((action_code, arg1, arg2, db_name, trigger_or_view))
+        return sqlite3.SQLITE_DENY
+
+
+# ---------------------------------------------------------------------------
+# The second write: the typed `advance_moment_cursor` op (#3856, U13 of #2652, phase 2)
+# ---------------------------------------------------------------------------
+#
+# The shared function `engram_moment_cursor.advance_moment_cursor` advances `metadata.special_moment_cursor` in ONE
+# compare-and-set UPDATE. NO request_id and no dedupe store: a replay is harmless (a retry after COMMIT finds
+# from + 1 and answers `stale`). The client supplies ONLY {person_id, from_cursor}; the owner computes the target.
+MOMENT_CURSOR_PERSON_ID_MAX_BYTES = 256
+
+# What U11's pinned property ("no column the op writes is one a trigger fires on") CANNOT be here: the metadata
+# JSON guard trigger fires on EVERY metadata update. So the property is a NAMED allow-set: every trigger on `nodes`
+# that can fire on `UPDATE nodes SET metadata` must be in it (pinned against sqlite_master by a test). A new trigger
+# on `metadata` is NOT admitted by editing this set to make a cell pass; it is reported to the design seat.
+MOMENT_CURSOR_ADMITTED_TRIGGERS = frozenset({"nodes_metadata_json_guard_update"})
+
+# Column-exact allowlist, MEASURED (authorizer-recorded) over real runs of the shared function on the real schema
+# (applied / stale / not_person / not_object and the read-back SELECT): reads of nodes.id / type / is_current /
+# metadata; ONE UPDATE target, nodes.metadata; the four json functions (json_valid arrives through the guard
+# trigger's WHEN clause and body; RAISE(ABORT) itself needs no authorization code).
+MOMENT_CURSOR_READ_COLUMNS = frozenset({"id", "type", "is_current", "metadata"})
+MOMENT_CURSOR_UPDATE_COLUMNS = frozenset({"metadata"})
+MOMENT_CURSOR_FUNCTIONS = frozenset({"json_set", "json_type", "json_extract", "json_valid"})
+
+
+def _moment_cursor_allows(action_code, arg1, arg2, db_name, trigger_or_view) -> bool:
+    """The op-scoped allowlist (pure) for `advance_moment_cursor`: True iff this authorizer call is one the op
+    needs. Everything else (INSERT, DELETE, other columns / tables / attached dbs, PRAGMA, DDL, other functions,
+    SAVEPOINT) is False. A statement originating in a trigger is admitted only if that trigger is NAMED in
+    MOMENT_CURSOR_ADMITTED_TRIGGERS (the metadata JSON guard), and is then held to the same rules."""
+    if trigger_or_view is not None and trigger_or_view not in MOMENT_CURSOR_ADMITTED_TRIGGERS:
+        return False
+    if action_code == sqlite3.SQLITE_SELECT:
+        return True
+    if action_code == sqlite3.SQLITE_READ:
+        return db_name == "main" and arg1 == "nodes" and arg2 in MOMENT_CURSOR_READ_COLUMNS
+    if action_code == sqlite3.SQLITE_UPDATE:
+        return db_name == "main" and arg1 == "nodes" and arg2 in MOMENT_CURSOR_UPDATE_COLUMNS
+    if action_code == sqlite3.SQLITE_FUNCTION:
+        return arg2 in MOMENT_CURSOR_FUNCTIONS
+    if action_code == sqlite3.SQLITE_TRANSACTION:
+        return arg1 in ("BEGIN", "COMMIT", "ROLLBACK")
+    return False
+
+
+def _moment_cursor_param_refusal(params) -> "dict | None":
+    """Validate an `advance_moment_cursor` request; None = valid, else the wire rejection. EACH violation has its
+    own named reason, checked in this order: (1) not a dict with exactly the keys 'person_id' and 'from_cursor'
+    (an extra key, `request_id` included, or a missing one); (2) person_id: not a str, empty, over
+    MOMENT_CURSOR_PERSON_ID_MAX_BYTES UTF-8 bytes (counted with surrogatepass), a lone surrogate (cannot be
+    bound); (3) from_cursor: not an int (a bool, float, str, null, list, dict), outside [-(2**53), 2**53).
+    Touches no connection, so a refused call executes no statement."""
+    p = "advance_moment_cursor_"
+    if not isinstance(params, dict) or set(params) != {"person_id", "from_cursor"}:
+        return _df_rejection(
+            p + "params_shape",
+            "advance_moment_cursor params must be a dict with exactly the keys 'person_id' and 'from_cursor'",
+            "send exactly {person_id, from_cursor}; there is no request_id and no target value")
+    person_id, from_cursor = params["person_id"], params["from_cursor"]
+    if not isinstance(person_id, str):
+        return _df_rejection(p + "person_id_not_str", f"'person_id' must be a string, got {type(person_id).__name__}",
+                             "send 'person_id' as a string")
+    if person_id == "":
+        return _df_rejection(p + "person_id_empty", "'person_id' is the empty string", "send a real person id")
+    if len(person_id.encode("utf-8", "surrogatepass")) > MOMENT_CURSOR_PERSON_ID_MAX_BYTES:
+        return _df_rejection(p + "person_id_too_long", f"'person_id' exceeds {MOMENT_CURSOR_PERSON_ID_MAX_BYTES} UTF-8 bytes",
+                             f"ids are capped at {MOMENT_CURSOR_PERSON_ID_MAX_BYTES} bytes; send the real id")
+    try:
+        person_id.encode("utf-8")
+    except UnicodeEncodeError:
+        return _df_rejection(p + "person_id_not_utf8", "'person_id' contains a lone surrogate, which cannot be bound as a SQL parameter",
+                             "send a well-formed string")
+    if isinstance(from_cursor, bool) or not isinstance(from_cursor, int):
+        return _df_rejection(p + "from_cursor_not_int", f"'from_cursor' must be an integer, got {type(from_cursor).__name__}",
+                             "send 'from_cursor' as the integer cursor you read")
+    if not (-(2 ** 53) <= from_cursor < 2 ** 53):
+        return _df_rejection(p + "from_cursor_out_of_range", "'from_cursor' is outside [-(2**53), 2**53)",
+                             "send the cursor you read; values outside the JSON-safe range are refused")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# The third and fourth writes: `fill_embeddings` and `finish_embedding_regen` (#3879, U16 of #2652)
+# ---------------------------------------------------------------------------
+#
+# The regenerate-embeddings tool keeps computing vectors (no owner path loads a model); the owner gets the WRITES.
+# `fill_embeddings` is a validated compare-and-set of `nodes.embedding` for up to 50 nodes (+ a reported best-effort
+# `vec_nodes` mirror); `finish_embedding_regen` rebuilds the FTS index on the owner's connection and runs today's
+# clear-or-finalize restore-flag branch through the SAME engram_core functions with `respect_lease=True`.
+FILL_EMBEDDINGS_MAX_ITEMS = 50  # per call; enforced before any SQL
+# The store's embedding dimension. engram_core has no single constant for it (the 384 is a literal in the vec0 DDL
+# `embedding float[384]` and in the vec mirror's `len(vector) == 384`): a test ties this constant to those literals.
+FILL_EMBEDDINGS_DIM = 384
+FILL_EMBEDDINGS_VEC_SAVEPOINT = "engram_fill_vec"  # the vec mirror's own SAVEPOINT: a vec failure never poisons the fill
+
+# MEASURED (authorizer-recorded over real runs on the real schema, which carries the seven pinned `nodes` triggers):
+# NO trigger or view fires on `UPDATE nodes SET embedding` (every trigger on `nodes` is on metadata / status /
+# is_current / claim-and-text columns), and none fires during the FTS rebuild or the restore-flag writes (the finish op
+# never writes `nodes`). So the set of triggers whose statements either op admits BY NAME is empty, pinned against
+# sqlite_master (USE_REWARD_NODES_TRIGGERS_PINNED) by a test, with a positive control that a claim UPDATE does fire one.
+FILL_EMBEDDINGS_ADMITTED_TRIGGERS: frozenset = frozenset()
+FINISH_EMBEDDING_REGEN_ADMITTED_TRIGGERS: frozenset = frozenset()
+
+# fill: column-exact allowlist, MEASURED: reads of nodes.id / is_current / embedding, ONE update target nodes.embedding.
+FILL_EMBEDDINGS_READ_COLUMNS = frozenset({"id", "is_current", "embedding"})
+FILL_EMBEDDINGS_UPDATE_COLUMNS = frozenset({"embedding"})
+# The vec0 table and its shadow tables. NOT measurable on a Python whose sqlite3 cannot load an extension (the macOS
+# framework Python): the names are vec0's documented shadow set for one TEXT-keyed vector column. A name missing here
+# is a denial INSIDE the vec savepoint, which degrades to `vec_mirrored: false` (reported, the nodes writes stand)
+# rather than failing the fill.
+_VEC_TABLE_NAME = re.compile(
+    r"^vec_nodes(_(chunks|rowids|info|auxiliary|vector_chunks\d{2}|metadatachunks\d{2}|metadatatext\d{2}))?$")
+
+# finish: MEASURED over the clear branch, the finalize branch (set and clear), a missing nodes_fts (the restore case: the
+# CREATE VIRTUAL TABLE and its shadow tables), a stale under-indexed nodes_fts (the DROP + CREATE repair) and a missing
+# embedding_restore_state table (the core function's CREATE TABLE IF NOT EXISTS).
+FINISH_NODES_READ_COLUMNS = frozenset({
+    "ROWID", "id", "type", "claim", "quoted_text", "interpretation", "trigger_text", "recall_summary", "recall_keywords",
+    "status", "is_current", "embedding", "source_title", "predicted_event",
+})
+FINISH_RESTORE_STATE_READ_COLUMNS = frozenset({"singleton_key", "not_fully_restored", "null_count", "cause", "updated_at"})
+FINISH_RESTORE_STATE_UPDATE_COLUMNS = frozenset({"not_fully_restored", "null_count", "cause", "updated_at"})
+FINISH_FUNCTIONS = frozenset({"coalesce", "count"})
+FINISH_PRAGMAS = frozenset({"user_version", "data_version"})
+
+
+def _is_vec_table(name) -> bool:
+    return isinstance(name, str) and _VEC_TABLE_NAME.match(name) is not None
+
+
+def _is_fts_table(name) -> bool:
+    """The `nodes_fts` family: the virtual table, its shadow tables (`nodes_fts_data` / `_idx` / `_docsize` / `_config`),
+    the optional `nodes_fts_vocab`, and the shadow tables' auto-indexes."""
+    return isinstance(name, str) and (
+        name == "nodes_fts" or name.startswith("nodes_fts_") or name.startswith("sqlite_autoindex_nodes_fts_"))
+
+
+def _fill_embeddings_allows(action_code, arg1, arg2, db_name, trigger_or_view) -> bool:
+    """The op-scoped allowlist (pure) for `fill_embeddings`: True iff this authorizer call is one the op needs.
+    Everything else (any other column / table / attached db, INSERT / DELETE on `nodes`, DDL, PRAGMA, other functions,
+    other savepoints) is False. A statement originating in a trigger or view is admitted only if that trigger is
+    NAMED in FILL_EMBEDDINGS_ADMITTED_TRIGGERS (empty: none fires). The vec mirror's statements run inside the op's
+    own savepoint and may touch only the vec0 table and its shadow tables."""
+    if trigger_or_view is not None and trigger_or_view not in FILL_EMBEDDINGS_ADMITTED_TRIGGERS:
+        return False
+    if action_code == sqlite3.SQLITE_SELECT:
+        return True
+    if action_code == sqlite3.SQLITE_READ:
+        return db_name == "main" and (
+            (arg1 == "nodes" and arg2 in FILL_EMBEDDINGS_READ_COLUMNS) or _is_vec_table(arg1))
+    if action_code == sqlite3.SQLITE_UPDATE:
+        return db_name == "main" and (
+            (arg1 == "nodes" and arg2 in FILL_EMBEDDINGS_UPDATE_COLUMNS) or _is_vec_table(arg1))
+    if action_code in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE):
+        return db_name == "main" and _is_vec_table(arg1)
+    if action_code == sqlite3.SQLITE_TRANSACTION:
+        return arg1 in ("BEGIN", "COMMIT", "ROLLBACK")
+    if action_code == sqlite3.SQLITE_SAVEPOINT:
+        return arg1 in ("BEGIN", "RELEASE", "ROLLBACK") and arg2 == FILL_EMBEDDINGS_VEC_SAVEPOINT
+    return False
+
+
+def _fill_vec_phase_allows(action_code, arg1, arg2, db_name, trigger_or_view) -> bool:
+    """The admissions that hold ONLY while the vec mirror runs (the guard's `vec_phase`; the guard consults this after
+    `_fill_embeddings_allows` has said no). MEASURED by Borges on Linux (PR #3900, SQLite 3.53.0, sqlite_vec 0.1.9) as
+    the complete set of authorizer calls outside the `vec_nodes` name family made by the mirror's exact sequence
+    (SAVEPOINT, DELETE, INSERT, ROLLBACK TO, RELEASE) on `vec0(node_id TEXT PRIMARY KEY, embedding float[384])`:
+      - SQLITE_READ on table `x`, column `node_id`: vec0's constructor declares its schema under the name `x`.
+      - SQLITE_FUNCTION `max`.
+    Nothing else: not column `embedding` of `x` (not requested in the census; this Mac cannot load vec0, so it was
+    not measured here and is left out), not another function (`load_extension` included), not a trigger-originated
+    statement. A request in the census that is missing here degrades the mirror to `vec_mirrored: false`."""
+    if trigger_or_view is not None:
+        return False
+    if action_code == sqlite3.SQLITE_READ:
+        return db_name == "main" and arg1 == "x" and arg2 == "node_id"
+    if action_code == sqlite3.SQLITE_FUNCTION:
+        return arg2 == "max"
+    return False
+
+
+def _finish_embedding_regen_allows(action_code, arg1, arg2, db_name, trigger_or_view) -> bool:
+    """The op-scoped allowlist (pure) for `finish_embedding_regen`. The op never writes `nodes`; it may read the
+    columns the restore-flag recount reads, write the FTS family and the restore-state row, and run the DDL the FTS
+    rebuild and the restore-state table's lazy create need (all confined to those names). A trigger-originated
+    statement is admitted only if NAMED in FINISH_EMBEDDING_REGEN_ADMITTED_TRIGGERS (empty)."""
+    if trigger_or_view is not None and trigger_or_view not in FINISH_EMBEDDING_REGEN_ADMITTED_TRIGGERS:
+        return False
+    if action_code == sqlite3.SQLITE_SELECT:
+        return True
+    if action_code == sqlite3.SQLITE_READ:
+        if _is_fts_table(arg1):  # `count(*)` over a shadow table reports db_name None and an empty column
+            return db_name in ("main", None)
+        return db_name == "main" and (
+            (arg1 == "nodes" and arg2 in FINISH_NODES_READ_COLUMNS)
+            or (arg1 == "embedding_restore_state" and arg2 in FINISH_RESTORE_STATE_READ_COLUMNS)
+            or arg1 == "sqlite_master")
+    if action_code == sqlite3.SQLITE_UPDATE:
+        return db_name == "main" and (
+            (arg1 == "embedding_restore_state" and arg2 in FINISH_RESTORE_STATE_UPDATE_COLUMNS) or arg1 == "sqlite_master")
+    if action_code == sqlite3.SQLITE_INSERT:
+        return db_name == "main" and (arg1 in ("embedding_restore_state", "sqlite_master") or _is_fts_table(arg1))
+    if action_code == sqlite3.SQLITE_DELETE:
+        return db_name == "main" and (arg1 == "sqlite_master" or _is_fts_table(arg1))
+    if action_code == sqlite3.SQLITE_CREATE_TABLE:
+        return db_name == "main" and (arg1 == "embedding_restore_state" or _is_fts_table(arg1))
+    if action_code in (sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_DROP_INDEX, sqlite3.SQLITE_DROP_TABLE):
+        return db_name == "main" and _is_fts_table(arg1)
+    if action_code in (sqlite3.SQLITE_CREATE_VTABLE, sqlite3.SQLITE_DROP_VTABLE):
+        return db_name == "main" and arg1 in ("nodes_fts", "nodes_fts_vocab") and arg2 in ("fts5", "fts5vocab")
+    if action_code == sqlite3.SQLITE_PRAGMA:
+        return (arg1 == "table_info" and arg2 in ("nodes", "nodes_fts")) or arg1 in FINISH_PRAGMAS
+    if action_code == sqlite3.SQLITE_FUNCTION:
+        return arg2 in FINISH_FUNCTIONS
+    if action_code == sqlite3.SQLITE_TRANSACTION:
+        return arg1 in ("BEGIN", "COMMIT", "ROLLBACK")
+    return False
+
+
+def _fill_rejection(token: str, detail: str, remedy: str, reason: str = "invalid_params") -> dict:
+    """A typed refusal. `reason` is the closed class (`invalid_params` | `bad_dimension` | `non_finite` |
+    `model_mismatch`); the detail BEGINS with a stable machine token naming the exact violation, so every violation is
+    its own refusal even inside the `invalid_params` class. Nothing the caller sent is echoed."""
+    return _df_rejection(reason, f"{token}: {detail}", remedy)
+
+
+def _fill_embeddings_param_refusal(params) -> "tuple[dict | None, list]":
+    """Validate a `fill_embeddings` request over ALL items; -> (refusal | None, items), where items is the list of
+    `(node_id, vector_as_list_of_float)` in call order. A refusal means NOTHING may be written. Check order (the first
+    violated wins): (1) params is a dict with exactly the keys {model, items}; (2) model is a str; (3) items is a list,
+    non-empty, at most FILL_EMBEDDINGS_MAX_ITEMS; then per item in order: (4) a dict with exactly {node_id, vector};
+    (5) node_id: a str, non-empty, at most USE_REWARD_NODE_ID_MAX_BYTES UTF-8 bytes (counted with surrogatepass), no
+    lone surrogate; (6) vector: a list of exactly FILL_EMBEDDINGS_DIM elements (`bad_dimension`), each an int or a float
+    and NOT a bool (`invalid_params`), each finite after conversion to float (`non_finite`: NaN, +-Infinity, or an int
+    too large to be a float). `model_mismatch` needs the store's config and is checked by the handler. Ints are
+    normalised to float so the stored text is what the embedder's floats serialise to. Touches no connection."""
+    p = "fill_embeddings params"
+    if not isinstance(params, dict) or set(params) != {"model", "items"}:
+        return _fill_rejection("params_shape", f"{p} must be a dict with exactly the keys 'model' and 'items'",
+                               "send exactly {model, items}; the request_id travels on the wire, not in params"), []
+    if not isinstance(params["model"], str):
+        return _fill_rejection("model_not_str", "'model' must be a string", "send the store's embedding model name as a string"), []
+    items = params["items"]
+    if not isinstance(items, list):
+        return _fill_rejection("items_not_list", f"'items' must be a list, got {type(items).__name__}", "send 'items' as a list"), []
+    if not items:
+        return _fill_rejection("items_empty", "'items' is empty", "send at least one item"), []
+    if len(items) > FILL_EMBEDDINGS_MAX_ITEMS:
+        return _fill_rejection("items_too_many", f"'items' has more than {FILL_EMBEDDINGS_MAX_ITEMS} entries",
+                               f"send at most {FILL_EMBEDDINGS_MAX_ITEMS} items per call; split the batch"), []
+    out: list = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict) or set(item) != {"node_id", "vector"}:
+            return _fill_rejection("item_shape", f"items[{i}] must be a dict with exactly the keys 'node_id' and 'vector'",
+                                   "send each item as {node_id, vector}"), []
+        nid, vector = item["node_id"], item["vector"]
+        if not isinstance(nid, str):
+            return _fill_rejection("node_id_not_str", f"items[{i}].node_id must be a string", "send every node id as a string"), []
+        if nid == "":
+            return _fill_rejection("node_id_empty", f"items[{i}].node_id is the empty string", "send real node ids"), []
+        if len(nid.encode("utf-8", "surrogatepass")) > USE_REWARD_NODE_ID_MAX_BYTES:
+            return _fill_rejection("node_id_too_long", f"items[{i}].node_id exceeds {USE_REWARD_NODE_ID_MAX_BYTES} UTF-8 bytes",
+                                   f"node ids are capped at {USE_REWARD_NODE_ID_MAX_BYTES} bytes; send the real id"), []
+        try:
+            nid.encode("utf-8")
+        except UnicodeEncodeError:
+            return _fill_rejection("node_id_not_utf8", f"items[{i}].node_id contains a lone surrogate, which cannot be bound",
+                                   "send node ids that are valid text"), []
+        if not isinstance(vector, list):
+            return _fill_rejection("vector_not_list", f"items[{i}].vector must be a list of numbers", "send 'vector' as a list"), []
+        if len(vector) != FILL_EMBEDDINGS_DIM:
+            return _fill_rejection(
+                "bad_dimension", f"items[{i}].vector must have exactly {FILL_EMBEDDINGS_DIM} elements",
+                f"send vectors of the store's dimension ({FILL_EMBEDDINGS_DIM}); the owner does not trust a client-supplied one",
+                reason="bad_dimension"), []
+        floats: list = []
+        for j, x in enumerate(vector):
+            if isinstance(x, bool) or not isinstance(x, (int, float)):
+                return _fill_rejection("vector_element_type", f"items[{i}].vector[{j}] must be an int or a float (not a bool)",
+                                       "send every element as a finite number"), []
+            try:
+                f = float(x)
+            except OverflowError:
+                f = math.inf  # an int too large to be a float: not a finite value
+            if not math.isfinite(f):
+                return _fill_rejection(
+                    "non_finite", f"items[{i}].vector[{j}] is not a finite number (NaN, Infinity or an int too large for a float)",
+                    "send finite numbers only; json.dumps emits NaN / Infinity by default, so a client must not pass them",
+                    reason="non_finite"), []
+            floats.append(f)
+        out.append((nid, floats))
+    return None, out
+
+
+def _fill_request_id_refusal(request_id) -> "dict | None":
+    """The wire envelope's request_id (the idempotency key): a non-empty str of at most USE_REWARD_REQUEST_ID_MAX_BYTES
+    UTF-8 bytes (a uuid4 string fits). A write always carries one on the wire (`engramd_client.write` generates it)."""
+    if (not isinstance(request_id, str) or request_id == ""
+            or len(request_id.encode("utf-8", "surrogatepass")) > USE_REWARD_REQUEST_ID_MAX_BYTES):
+        return _fill_rejection("request_id_invalid", "the write's request_id must be a non-empty string of at most "
+                               f"{USE_REWARD_REQUEST_ID_MAX_BYTES} UTF-8 bytes",
+                               "send the write through engramd_client.write, which always supplies one")
+    return None
+
+
+def _fill_embeddings_fingerprint(model: str, ids_and_texts) -> bytes:
+    """SHA-256 over (model, ids in order, sha256 of each vector's stored text): the idempotency payload identity.
+    The dedupe store keeps this 32-byte digest per request_id, never the vectors."""
+    body = [model, [[nid, hashlib.sha256(text.encode("utf-8")).hexdigest()] for nid, text in ids_and_texts]]
+    return hashlib.sha256(json.dumps(body, separators=(",", ":"), ensure_ascii=True).encode("ascii")).digest()
+
+
+def _finish_embedding_regen_param_refusal(params) -> "dict | None":
+    """Validate a `finish_embedding_regen` request: exactly {processed, embedded, skipped, failed, embedder_available},
+    the four counts non-negative ints (not bools) and `embedder_available` a real bool (not an int). None = valid.
+    Touches no connection."""
+    keys = ("processed", "embedded", "skipped", "failed")
+    if not isinstance(params, dict) or set(params) != set(keys) | {"embedder_available"}:
+        return _fill_rejection("params_shape", "finish_embedding_regen params must be a dict with exactly the keys "
+                               "'processed', 'embedded', 'skipped', 'failed' and 'embedder_available'",
+                               "send exactly the four counts of the pass and the tool's own embedder probe; there is "
+                               "no request_id and no path")
+    if not isinstance(params["embedder_available"], bool):
+        return _fill_rejection("embedder_available_not_bool", "'embedder_available' must be a bool",
+                               "send the result of the tool's own `_embedder.is_available()` as true or false")
+    for k in keys:
+        v = params[k]
+        if isinstance(v, bool) or not isinstance(v, int):
+            return _fill_rejection("count_not_int", f"'{k}' must be an integer", "send each count as a non-negative int")
+        if v < 0:
+            return _fill_rejection("count_negative", f"'{k}' is negative", "send each count as a non-negative int")
+    return None
+
+
+def _method_kind_refusal(method: str, kind) -> "dict | None":
+    """Default-deny dispatch gate (8a / 8a-default). None = the method may run."""
+    if not isinstance(kind, str) or kind not in METHOD_KINDS:
+        return _df_rejection(
+            "method_kind_missing",
+            f"method {method!r} has no kind: every method must be declared 'read' or 'write'",
+            "this is an owner build defect, not a caller error: the method is not client-reachable until it is classified",
+        )
+    if (kind == "write") != (method in WRITE_METHODS):
+        return _df_rejection(
+            "method_kind_mismatch",
+            f"method {method!r} is declared {kind!r}, which disagrees with the closed write set",
+            "owner build defect: update WRITE_METHODS and the kind together",
+        )
+    return None
+
+
+def _use_reward_fingerprint(node_ids, action: str) -> bytes:
+    """SHA-256 of a canonical encoding of the payload (ids in order, action). The dedupe store keeps this 32-byte
+    digest per request_id, never the ids themselves (500 ids x 256 bytes would be ~128 KB per entry)."""
+    return hashlib.sha256(json.dumps([list(node_ids), action], separators=(",", ":"), ensure_ascii=True).encode("ascii")).digest()
+
+
+def _displaced_rejection(exc) -> dict:
+    """The one wire form of a confirmed substrate displacement (used by `_dispatch` and by the in-lock re-check)."""
+    return {
+        "status": "rejected",
+        "reason": "substrate_displaced",
+        "detail": str(exc),
+        "remedy": exc.remedy,
+    }
+
+
+def _use_reward_busy(detail: str, remedy: "str | None" = None) -> dict:
+    """The determinate `busy` refusal: the wait budget ran out BEFORE the write got the lock (or the commit could
+    take it), so nothing was committed and the op was rolled back. Not recorded for dedupe: a retry runs.
+    Shared by every owner write (`remedy` overrides the use_reward wording for an op with no request_id)."""
+    return _df_rejection(
+        "busy", f"{detail}; nothing was committed",
+        remedy or "retry once with the SAME request_id (nothing was written, so the retry runs fresh)")
+
+
+def _write_abort(conn: sqlite3.Connection, guard: "_UseRewardGuard", op: str) -> None:
+    """Roll the op's transaction back (the guard's rollback phase is the handler's own)."""
+    guard.allow_rollback = True
+    try:
+        conn.rollback()
+    except sqlite3.Error:
+        logging.getLogger("engramd_owner").error("%s rollback failed", op, exc_info=True)
+
+
+def _write_denied(guard: "_UseRewardGuard", shared: str) -> dict:
+    """The one wire form of 'the op-scoped authorizer denied a statement' (the whole op was rolled back)."""
+    d = guard.denials[0]
+    return _df_rejection(
+        "write_denied",
+        f"the op-scoped authorizer denied a statement (action code {d[0]}, {d[1]!r}, {d[2]!r}); the whole op was rolled back",
+        f"owner build defect: the shared {shared} executed a statement outside the closed allowlist")
+
+
+def _write_sqlite_error(exc: sqlite3.Error, op: str, busy_remedy: "str | None", failed_remedy: str) -> dict:
+    """A sqlite3.Error BEFORE the commit: a locked/busy store is the typed determinate `busy` (carrying `_busy` so the
+    handler's retry loop retries it); anything else is `<op>_write_failed`. Both are rolled back already."""
+    text = str(exc).lower()
+    if "locked" in text or "busy" in text:
+        return {**_use_reward_busy("the store stayed locked by another writer for the whole lock-wait budget", busy_remedy),
+                "_busy": True}
+    return _df_rejection(f"{op}_write_failed", f"the store write failed ({type(exc).__name__}); the op was rolled back",
+                         failed_remedy)
+
+
+def _use_reward_param_refusal(params) -> "dict | None":
+    """Validate a `use_reward` request; None = valid, else the wire rejection. EACH violation has its own
+    named reason; nothing the caller sent is echoed. Check order (the first violated wins): (1) shape: not a
+    dict, any key outside {node_ids, action, request_id}, or node_ids / action absent; (2) request_id absent;
+    (3) node_ids: not a list, empty, longer than USE_REWARD_MAX_IDS, then per element in order: not a str,
+    empty, over USE_REWARD_NODE_ID_MAX_BYTES UTF-8 bytes (counted with surrogatepass), a lone surrogate (cannot
+    be bound); (4) action: not a str, not in USE_REWARD_ACTIONS; (5) request_id: not a str, empty, over
+    USE_REWARD_REQUEST_ID_MAX_BYTES. Touches no connection, so a refused call opens no transaction."""
+    if not isinstance(params, dict) or not set(params) <= {"node_ids", "action", "request_id"} or not {"node_ids", "action"} <= set(params):
+        return _df_rejection(
+            "use_reward_params_shape",
+            "use_reward params must be a dict with exactly the keys 'node_ids', 'action' and 'request_id'",
+            "send {'node_ids': [<str>, ...], 'action': 'mention', 'request_id': <str>} and no other key (no alpha, no value, no path)",
+        )
+    if "request_id" not in params:
+        return _df_rejection("use_reward_request_id_missing", "'request_id' is missing", "send a client-generated request_id")
+    node_ids, action, request_id = params["node_ids"], params["action"], params["request_id"]
+    if not isinstance(node_ids, list):
+        return _df_rejection("use_reward_node_ids_not_list", f"'node_ids' must be a list, got {type(node_ids).__name__}", "send 'node_ids' as a list of strings")
+    if not node_ids:
+        return _df_rejection("use_reward_node_ids_empty", "'node_ids' is empty", "send at least one node id")
+    if len(node_ids) > USE_REWARD_MAX_IDS:
+        return _df_rejection(
+            "use_reward_node_ids_too_many", f"'node_ids' has more than {USE_REWARD_MAX_IDS} entries",
+            f"send at most {USE_REWARD_MAX_IDS} ids per call; split the batch")
+    for i, nid in enumerate(node_ids):
+        if not isinstance(nid, str):
+            return _df_rejection("use_reward_node_id_not_str", f"node_ids[{i}] must be a string, got {type(nid).__name__}", "send every node id as a string")
+        if nid == "":
+            return _df_rejection("use_reward_node_id_empty", f"node_ids[{i}] is the empty string", "send real node ids")
+        if len(nid.encode("utf-8", "surrogatepass")) > USE_REWARD_NODE_ID_MAX_BYTES:
+            return _df_rejection(
+                "use_reward_node_id_too_long", f"node_ids[{i}] exceeds {USE_REWARD_NODE_ID_MAX_BYTES} UTF-8 bytes",
+                f"node ids are capped at {USE_REWARD_NODE_ID_MAX_BYTES} bytes; send the real id")
+        try:
+            nid.encode("utf-8")
+        except UnicodeEncodeError:
+            return _df_rejection(
+                "use_reward_node_id_not_utf8", f"node_ids[{i}] contains a lone surrogate, which cannot be bound as a SQL parameter",
+                "send node ids that are valid text")
+    if not isinstance(action, str):
+        return _df_rejection("use_reward_action_not_str", f"'action' must be a string, got {type(action).__name__}", "send 'action' as a string")
+    if action not in USE_REWARD_ACTIONS:
+        return _df_rejection(
+            "use_reward_action_unknown", "'action' is not in the closed action set",
+            f"supported actions: {', '.join(sorted(USE_REWARD_ACTIONS))}")
+    if not isinstance(request_id, str):
+        return _df_rejection("use_reward_request_id_not_str", f"'request_id' must be a string, got {type(request_id).__name__}", "send a client-generated request_id string")
+    if request_id == "":
+        return _df_rejection("use_reward_request_id_empty", "'request_id' is the empty string", "send a non-empty client-generated request_id")
+    if len(request_id.encode("utf-8", "surrogatepass")) > USE_REWARD_REQUEST_ID_MAX_BYTES:
+        return _df_rejection(
+            "use_reward_request_id_too_long", f"'request_id' exceeds {USE_REWARD_REQUEST_ID_MAX_BYTES} UTF-8 bytes",
+            f"request ids are capped at {USE_REWARD_REQUEST_ID_MAX_BYTES} bytes; a uuid4 string fits")
+    return None
+
+
 class EngramdOwner:
     """The owner process skeleton -- one per seat, sole PROCESS holding
     `knowledge.db` open within this build's scope (handshake + `ping` +
@@ -1814,6 +2425,12 @@ class EngramdOwner:
         self._idle = 0
         self._jobs: "queue.SimpleQueue" = queue.SimpleQueue()
         self._worker_seq = itertools.count(1)
+        # Peer-refusal log limiter (#3845): peer uid -> [window_start, suppressed].
+        self._peer_refusal_lock = threading.Lock()
+        self._peer_refusal_log: dict = {}
+        # Refusal drains in flight (#3845); the lock is never held across I/O.
+        self._refusal_drains_lock = threading.Lock()
+        self._refusal_drains = 0
 
         self._server: socket.socket | None = None
         # Owner-internal connection (was `_store_conn` in U3) -- serves
@@ -1871,7 +2488,30 @@ class EngramdOwner:
             "df": lambda params, deadline: self._handle_df(params, deadline),
             "chain": lambda params, deadline: self._handle_chain(params, deadline),
             "confidence_by_type": lambda params, deadline: self._handle_confidence_by_type(params, deadline),
+            "use_reward": lambda params, deadline: self._handle_use_reward(params, deadline),
+            "advance_moment_cursor": lambda params, deadline: self._handle_advance_moment_cursor(params, deadline),
+            # #3879. `fill_embeddings` is in WIRE_REQUEST_ID_METHODS: `_dispatch` passes it the envelope's request_id.
+            "fill_embeddings": lambda params, deadline, request_id=None: self._handle_fill_embeddings(params, deadline, request_id),
+            "finish_embedding_regen": lambda params, deadline: self._handle_finish_embedding_regen(params, deadline),
         }
+        # Every method carries a kind (8a). Kept ALONGSIDE `_methods` (tests replace handlers there). A method in
+        # `_methods` with no entry here is default-deny at dispatch (8a-default), never treated as a read.
+        # `snapshot` is `read`: it copies the store out and never writes into it.
+        self._method_kinds = {
+            "ping": "read", "snapshot": "read", "read": "read", "df": "read", "chain": "read",
+            "confidence_by_type": "read", "use_reward": "write", "advance_moment_cursor": "write",
+            "fill_embeddings": "write", "finish_embedding_regen": "write",
+        }
+        # use_reward's dedupe store: request_id -> {"fp": (ids, action), "response": <first wire dict>}.
+        # In-memory and LRU-bounded by USE_REWARD_DEDUPE_CAP; guarded by `_owner_lock`.
+        self._use_reward_seen: "OrderedDict[str, dict]" = OrderedDict()
+        # fill_embeddings' own dedupe store (a separate namespace: the same request_id string may appear on two
+        # different ops): request_id -> {"fp": sha256 digest, "response": <first wire dict>}. Same bound and the same
+        # KNOWN LIMIT as use_reward's (dies with the process; the oldest entry is forgotten past the cap).
+        self._fill_embeddings_seen: "OrderedDict[str, dict]" = OrderedDict()
+        # The vec mirror's capability, probed ONCE per owner connection on the first fill: None = not tried yet,
+        # False = this process cannot load vec0 (so every fill acks `vec_mirrored: false`), else the serializer.
+        self._fill_vec_state = None
 
     # -- lifecycle ------------------------------------------------------
 
@@ -1989,6 +2629,7 @@ class EngramdOwner:
         # says nothing about the connections opened here.
         self._displaced = False
         self._owner_conn = sqlite3.connect(str(self.store_path), check_same_thread=False)
+        self._fill_vec_state = None  # a fresh connection: the vec0 probe (#3879) starts over
         # Permissive by DESIGN, not authorizer-less -- see the module
         # docstring's "Two connections" section and
         # _owner_internal_authorizer's own docstring for why.
@@ -2775,6 +3416,86 @@ class EngramdOwner:
             }
         return None
 
+    def _refused_peer_uids(self, conn: socket.socket) -> tuple:
+        """(peer_uid, owner_uid) for the refusal log (#3845). Re-reads the kernel
+        credentials, so `_check_peer_credentials` keeps returning only the wire dict.
+        peer_uid is None if the re-read fails; this never raises."""
+        own_uid = os.getuid()
+        try:
+            if _owner_arm() == "darwin":
+                raw = conn.getsockopt(SOL_LOCAL, socket.LOCAL_PEERCRED, DARWIN_PEERCRED_STRUCT_SIZE)
+                return struct.unpack_from(DARWIN_PEERCRED_STRUCT_FORMAT, raw)[1], own_uid
+            raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, PEERCRED_STRUCT_SIZE)
+            return struct.unpack_from(PEERCRED_STRUCT_FORMAT, raw)[1], own_uid
+        except Exception:
+            return None, own_uid
+
+    def _log_peer_refusal(self, conn: socket.socket, rejection: dict) -> None:
+        """One bounded WARNING per refusal window per peer uid (#3845). Names the peer
+        uid, the owner uid and the reason; never any request bytes. The window is lazy
+        (no timer): the first refusal after a window expires carries "N suppressed in
+        the previous window". A burst followed by silence therefore never prints its
+        count."""
+        peer_uid, own_uid = self._refused_peer_uids(conn)
+        reason = rejection.get("reason")
+        now = time.monotonic()
+        with self._peer_refusal_lock:
+            entry = self._peer_refusal_log.get(peer_uid)
+            if entry is not None and now - entry[0] < PEER_REFUSAL_LOG_WINDOW:
+                entry[1] += 1
+                return
+            carried = entry[1] if entry is not None else 0
+            self._peer_refusal_log.pop(peer_uid, None)  # re-insert last: order = window start
+            while len(self._peer_refusal_log) >= PEER_REFUSAL_LOG_MAX_UIDS:
+                del self._peer_refusal_log[next(iter(self._peer_refusal_log))]
+            self._peer_refusal_log[peer_uid] = [now, 0]
+        tail = f"; {carried} suppressed in the previous window" if carried else ""
+        try:
+            logging.getLogger("engramd_owner").warning(
+                "peer refused: uid %s (owner uid %s), reason %s; further refusals from uid %s "
+                "suppressed for %ds%s",
+                peer_uid, own_uid, reason, peer_uid, PEER_REFUSAL_LOG_WINDOW, tail)
+        except Exception:
+            pass  # a raising logging.Filter must never cost the peer its typed rejection or the drain
+
+    def _take_refusal_drain_slot(self) -> bool:
+        """Non-blocking: True if a drain slot was free (and is now taken)."""
+        with self._refusal_drains_lock:
+            if self._refusal_drains >= MAX_REFUSAL_DRAINS:
+                return False
+            self._refusal_drains += 1
+            return True
+
+    def _release_refusal_drain_slot(self) -> None:
+        with self._refusal_drains_lock:
+            self._refusal_drains -= 1
+
+    def _drain_refused_request(self, conn: socket.socket, deadline: float) -> None:
+        """After the typed rejection: shutdown(SHUT_WR), then read and DISCARD the
+        refused peer's request until EOF, the drain budget, or max_request_bytes (#3845).
+        Never parses what it reads."""
+        try:
+            conn.shutdown(socket.SHUT_WR)
+        except OSError:
+            return
+        budget = min(REFUSAL_DRAIN_BUDGET, deadline - time.monotonic())
+        if budget <= 0:
+            return
+        end = time.monotonic() + budget
+        consumed = 0
+        while consumed < self.max_request_bytes:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return
+            conn.settimeout(remaining)
+            try:
+                chunk = conn.recv(min(65536, self.max_request_bytes - consumed))
+            except OSError:
+                return  # includes socket.timeout
+            if not chunk:
+                return  # EOF
+            consumed += len(chunk)
+
     def _check_peer_credentials_darwin(self, conn: socket.socket) -> dict | None:
         """Darwin arm of the peer check (#3666, design doc §2.2 + §2.5): same
         return contract as `_check_peer_credentials()` -- a §2.3 rejection wire
@@ -2835,6 +3556,7 @@ class EngramdOwner:
         try:
             rejection = self._check_peer_credentials(conn)
             if rejection is not None:
+                self._log_peer_refusal(conn, rejection)
                 # Bounded by the SAME remaining deadline as every other
                 # send in this method (reviewer-fairy catch on #3201: this
                 # send previously had no timeout at all, unlike the
@@ -2849,6 +3571,12 @@ class EngramdOwner:
                         conn.sendall((json.dumps(rejection) + "\n").encode("utf-8"))
                     except OSError:
                         pass
+                    else:
+                        if self._take_refusal_drain_slot():
+                            try:
+                                self._drain_refused_request(conn, deadline)
+                            finally:
+                                self._release_refusal_drain_slot()
                 return
             line = self._read_request_line(conn, deadline)
             if line is None:
@@ -2979,6 +3707,9 @@ class EngramdOwner:
 
         handler = self._methods.get(method) if isinstance(method, str) else None
         if handler is not None:
+            kind_refusal = _method_kind_refusal(method, self._method_kinds.get(method))
+            if kind_refusal is not None:
+                return kind_refusal
             if method not in NO_STORE_METHODS:
                 # #3240 item 2: the owner's own displacement self-check,
                 # for EVERY known store-touching method (guarded by
@@ -2989,12 +3720,10 @@ class EngramdOwner:
                     engram_walguard.assert_not_displaced(str(self.store_path))
                 except engram_walguard.SubstrateDisplaced as exc:
                     self._displaced = True
-                    return {
-                        "status": "rejected",
-                        "reason": "substrate_displaced",
-                        "detail": str(exc),
-                        "remedy": exc.remedy,
-                    }
+                    return _displaced_rejection(exc)
+            if method in WIRE_REQUEST_ID_METHODS:
+                # #3879: a write whose params cannot carry a request_id gets the envelope's (the idempotency key).
+                return handler(params, deadline, request.get("request_id"))
             return handler(params, deadline)
 
         return {
@@ -3015,6 +3744,700 @@ class EngramdOwner:
                 "store_path": str(self.store_path),
             },
         }
+
+    # -- the owner's first write (#3822) ---------------------------------------
+
+    def _use_reward_memory_config(self) -> dict:
+        """The `memory` block of THIS owner's own `ENGRAM_HOME/config.json`, read FRESH on every call (never cached
+        at start: `current_turn` moves at sleep). PARITY with the direct path (the hook reads the same file through
+        the same function): an absent file or one without a `memory` block yields the defaults (turn 0, not an
+        error); a torn / unparseable file, a FIFO or a directory raises, which the shared `use_reward` reports as
+        `restamp_error` with the bump standing."""
+        return er.read_memory_config(self.engram_home / "config.json")
+
+    def _use_reward_read_utility(self, conn: sqlite3.Connection, ids) -> dict:
+        """{id: utility_score or 0.0} for each of `ids` that has a row (NULL counts as 0.0, as the Q-update does)."""
+        out: dict = {}
+        for nid in ids:
+            r = conn.execute("SELECT utility_score FROM nodes WHERE id = ?", (nid,)).fetchone()
+            if r is not None:
+                out[nid] = r[0] if r[0] is not None else 0.0
+        return out
+
+    def _use_reward_read_rows(self, conn: sqlite3.Connection, ids) -> dict:
+        """{id: {utility_score, importance_score, recall_turn}} for each of `ids` that has a row, in the order
+        given. Used twice per op: inside the transaction (the EXPECTED values) and again after COMMIT (the ACTUAL
+        values, SS5.4 read-back). Both reads run on the owner connection under the op's allowlist."""
+        rows: dict = {}
+        for nid in ids:
+            r = conn.execute(
+                "SELECT utility_score, importance_score, recall_turn FROM nodes WHERE id = ?", (nid,)
+            ).fetchone()
+            if r is not None:
+                rows[nid] = {"utility_score": r[0], "importance_score": r[1], "recall_turn": r[2]}
+        return rows
+
+    def _handle_use_reward(self, params: dict, deadline: float) -> dict:
+        """The typed `use_reward` write (kind `write`). Wire: params exactly {node_ids, action, request_id}.
+
+        Order: (1) validate, touching no connection (`_use_reward_param_refusal`); (2) take `_owner_lock`, waiting
+        at most OWNER_WRITE_LOCK_WAIT (`busy` otherwise); the SQLite busy wait is the REMAINING part of that one budget; (3) UNDER THAT LOCK, dedupe check,
+        execution and recording, so two concurrent calls with one request_id cannot both bump; (4) install the
+        op-scoped restrictive authorizer on `_owner_conn` BEFORE the transaction opens and restore the permissive
+        placeholder in a `finally` on every exit path; (5) run the SHARED `engram_restamp.use_reward` (bump THEN
+        restamp, the restamp in its own SAVEPOINT) in ONE transaction; read the touched columns (EXPECTED); COMMIT;
+        re-read them from the committed store (ACTUAL); `ok` only if every compare matches exactly.
+
+        Outcomes: `ok` (ack fields: updated, bumped, restamped, restamp_error, rows, duplicate); `write_denied`
+        (the authorizer denied a statement: the whole op is rolled back, no partial bump -- including a denial the
+        shared function's restamp guard would otherwise absorb as `restamp_error`); `busy` (the one wait budget ran out: nothing committed, rolled back, determinate) /
+        `use_reward_write_failed` (any other sqlite3.Error, rolled back); `readback_mismatch` (COMMITTED but unverified:
+        the commit cannot be undone at that point, so it is reported loudly, naming the id(s), and recorded so a
+        replay re-reports instead of re-bumping). A bump committed with a failed restamp is an `ok` ack with
+        `restamp_error` set, never a silent success. Rejections before the commit are not recorded in the dedupe
+        store, so a retry of the same request_id runs."""
+        refusal = _use_reward_param_refusal(params)
+        if refusal is not None:
+            return refusal
+        node_ids: list = list(params["node_ids"])
+        action: str = params["action"]
+        request_id: str = params["request_id"]
+        fingerprint = _use_reward_fingerprint(node_ids, action)
+
+        def record(resp: dict) -> None:
+            """Remember a COMMITTED outcome (ok or committed_unverified) so a same-id retry replays it."""
+            self._use_reward_seen[request_id] = {"fp": fingerprint, "response": copy.deepcopy(resp)}
+            self._use_reward_seen.move_to_end(request_id)
+            while len(self._use_reward_seen) > USE_REWARD_DEDUPE_CAP:
+                self._use_reward_seen.popitem(last=False)
+
+        def dedupe_check() -> "dict | None":
+            prior = self._use_reward_seen.get(request_id)
+            if prior is None:
+                return None
+            self._use_reward_seen.move_to_end(request_id)
+            if prior["fp"] != fingerprint:
+                return _df_rejection(
+                    "use_reward_request_id_reused", "this request_id was already used for a different payload",
+                    "generate a fresh request_id per distinct operation; reuse one only to retry the SAME call")
+            replay = copy.deepcopy(prior["response"])
+            if replay.get("status") == "ok":
+                replay["result"]["duplicate"] = True
+            return replay
+
+        return self._owner_write(
+            "use_reward", deadline, _UseRewardGuard,
+            lambda conn, guard: self._use_reward_execute(conn, guard, node_ids, action, record),
+            intercept=dedupe_check, after=record)
+
+    def _owner_write(self, op: str, deadline: float, make_guard, attempt, *, intercept=None, after=None,
+                     busy_remedy: "str | None" = None) -> dict:
+        """The shared scaffold of every owner write (`WRITE_METHODS`); `_handle_use_reward` and
+        `_handle_advance_moment_cursor` both run through it (one definition of the wait budget, the lock, the
+        displacement re-check, the open-transaction refusal, the busy-timeout switch and the authorizer install /
+        restore). `op` names the op in the typed refusals (`<op>_owner_stopping`, `<op>_txn_open`).
+
+        Order: take `_owner_lock`, waiting at most OWNER_WRITE_LOCK_WAIT (`busy` otherwise; the SQLite busy wait is
+        the REMAINING part of that one budget); UNDER THAT LOCK, the optional `intercept()` (use_reward's dedupe
+        check: a non-None answer is returned as is), the in-lock displacement re-check, the open-transaction
+        refusal; then install the op-scoped restrictive authorizer (`make_guard()`) BEFORE the transaction opens
+        and `attempt(conn, guard)` it, retrying a `_busy` attempt every USE_REWARD_BUSY_RETRY_SLEEP until the
+        budget is spent; authorizer and busy_timeout are restored in a `finally` on every exit path. A response
+        carrying `_committed: True` is one whose COMMIT happened: the marker is stripped and `after(response)`
+        runs under the lock (use_reward records it for dedupe)."""
+        wait_started = time.monotonic()
+        budget = max(0.0, min(OWNER_WRITE_LOCK_WAIT, deadline - wait_started))
+        if not self._owner_lock.acquire(timeout=budget):
+            return _use_reward_busy("the owner's write lock was not free within the lock-wait budget", busy_remedy)
+        try:
+            conn = self._owner_conn
+            if conn is None or self._displaced:
+                return _df_rejection(f"{op}_owner_stopping", "the owner is stopping or its store handle is gone",
+                                     "retry once the owner is running again")
+            if intercept is not None:
+                answered = intercept()
+                if answered is not None:
+                    return answered
+
+            # The dispatch-time displacement check can be stale by the whole lock wait: re-check here, under the lock,
+            # before anything is executed, and handle it exactly as `_dispatch` does.
+            try:
+                engram_walguard.assert_not_displaced(str(self.store_path))
+            except engram_walguard.SubstrateDisplaced as exc:
+                self._displaced = True
+                return _displaced_rejection(exc)
+            # Never start on top of someone else's open transaction on the shared connection (every user holds
+            # `_owner_lock`, so this means a leaked transaction): nothing is executed, and it is left alone.
+            if conn.in_transaction:
+                return _df_rejection(
+                    f"{op}_txn_open", "the owner's store connection already has a transaction open",
+                    "owner defect: a previous user of the connection left a transaction open; see the owner log")
+            # SQLite's OWN busy wait is switched OFF for the op (busy_timeout = 0) and the wait is done here, as a
+            # retry loop against the one budget. MEASURED (macOS, SQLite 3.53.4, Python 3.12): SQLite's busy
+            # handler overshoots its timeout badly (busy_timeout = 1000 ms waited 2.4-2.6 s; 300 ms waited ~1.2 s;
+            # the same for connect(timeout=)), so it cannot enforce a TOTAL bound that a client deadline sits on.
+            # `PRAGMA busy_timeout` is the only way to change it after connect (python's sqlite3 has no setter) and
+            # the op authorizer denies PRAGMA, so it runs HERE, while the permissive authorizer is still installed;
+            # the previous value is restored in the same `finally` as the authorizer, after the permissive one is
+            # back. A busy attempt rolled back completely, so retrying the whole transaction is safe.
+            give_up_at = wait_started + budget
+            prev_busy_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+            # ONE try/finally opens here, before the first thing that changes the connection, and restores BOTH
+            # changes on every exit (authorizer first, then the PRAGMA), each in its own inner try so one failing
+            # cannot skip the other.
+            guard = None
+            try:
+                conn.execute("PRAGMA busy_timeout = 0")
+                guard = make_guard()
+                conn.set_authorizer(guard.authorizer)
+                while True:
+                    guard.reset()
+                    response = attempt(conn, guard)
+                    if not response.get("_busy"):
+                        break
+                    left = give_up_at - time.monotonic()
+                    if left <= 0:
+                        break
+                    time.sleep(min(USE_REWARD_BUSY_RETRY_SLEEP, left))
+                response.pop("_busy", None)
+            finally:
+                try:
+                    if conn.in_transaction:  # belt and braces: on ANY exit the connection is left transaction-free
+                        if guard is not None:
+                            guard.allow_rollback = True
+                        conn.rollback()
+                except Exception:
+                    logging.getLogger("engramd_owner").error("%s final rollback failed", op, exc_info=True)
+                try:
+                    conn.set_authorizer(_owner_internal_authorizer)
+                except Exception:
+                    logging.getLogger("engramd_owner").error("%s authorizer restore failed", op, exc_info=True)
+                try:
+                    if guard is not None:
+                        guard.allow_busy_pragma = True  # only matters if the permissive restore above failed
+                    conn.execute(f"PRAGMA busy_timeout = {int(prev_busy_ms)}")
+                except Exception:
+                    logging.getLogger("engramd_owner").error("%s busy_timeout restore failed", op, exc_info=True)
+            if response.pop("_committed", False) and after is not None:
+                after(response)
+            return response
+        finally:
+            self._owner_lock.release()
+
+    def _use_reward_execute(self, conn: sqlite3.Connection, guard: "_UseRewardGuard", node_ids: list, action: str, record) -> dict:
+        """The transaction body of `_handle_use_reward`; runs with the op allowlist installed and `_owner_lock` held.
+        A response carrying `_committed: True` is one whose COMMIT happened (the caller records it for dedupe and
+        strips the marker)."""
+        def abort() -> None:
+            _write_abort(conn, guard, "use_reward")
+
+        def denied() -> dict:
+            return _write_denied(guard, "use_reward")
+
+        unique_ids = list(dict.fromkeys(node_ids))
+        try:
+            # The write transaction is opened up front, so the pre-op reads below are INSIDE it and a competing
+            # direct writer is met here (busy) rather than half way through.
+            conn.execute("BEGIN IMMEDIATE")
+            # Independent of the shared function: each id's utility BEFORE the call (NULL = 0.0). Used only by the
+            # monotone invariant after the commit; it does not recompute the Q-update.
+            pre = self._use_reward_read_utility(conn, unique_ids)
+            result = er.use_reward(conn, node_ids, action, memory_config=self._use_reward_memory_config)
+            if guard.denials:
+                abort()
+                return denied()
+            expected = self._use_reward_read_rows(conn, unique_ids)
+            guard.allow_commit = True
+            conn.commit()
+            guard.allow_commit = False
+        except BaseException as exc:
+            guard.allow_commit = False
+            abort()
+            if not isinstance(exc, Exception):
+                raise  # SystemExit / GeneratorExit / injected async exceptions: rolled back, then propagated
+            if guard.denials:
+                return denied()
+            if isinstance(exc, sqlite3.Error):
+                return _write_sqlite_error(
+                    exc, "use_reward", None,
+                    "retry with the SAME request_id; if it persists check the store's disk and permissions")
+            raise
+        # COMMITTED. From here the write cannot be undone.
+        try:
+            actual = self._use_reward_read_rows(conn, unique_ids)
+            bad = [nid for nid in dict.fromkeys([*expected, *actual]) if expected.get(nid) != actual.get(nid)]
+            # The independent monotone invariant: a shared function that CLAIMS an update (bumped > 0) must have moved
+            # every id whose pre-op utility was below 0.99 strictly upward. (>= 0.99 is exempt: 6-dp rounding near 1.0
+            # may legitimately leave the value unchanged; the parity cells own that region.)
+            stalled = []
+            if result.bumped > 0:
+                stalled = [
+                    nid for nid, row in actual.items()
+                    if pre.get(nid, 0.0) < USE_REWARD_MONOTONE_FLOOR and (row["utility_score"] or 0.0) <= pre.get(nid, 0.0)
+                ]
+            if bad or stalled:
+                parts = []
+                if bad:
+                    parts.append(f"the committed row differs from the in-transaction one for id(s) {bad}")
+                if stalled:
+                    parts.append(f"write did not land for id(s) {stalled} (utility_score did not move up from its pre-op value)")
+                return {**_df_rejection(
+                    "readback_mismatch",
+                    "COMMITTED but UNVERIFIED: " + "; ".join(parts) + "; the commit cannot be undone",
+                    "do not retry with a new request_id (it would bump again); inspect the named nodes"),
+                    "commit": "committed_unverified", "_committed": True}
+            return {
+                "status": "ok",
+                "result": {
+                    "updated": list(expected),
+                    "bumped": result.bumped,
+                    "restamped": result.restamped,
+                    "restamp_error": result.restamp_error,
+                    "rows": actual,
+                    "duplicate": False,
+                },
+                "_committed": True,
+            }
+        except BaseException as exc:
+            # ANY failure after the commit (a verification bug, MemoryError, a sqlite error on the re-read, SystemExit):
+            # the commit stands, so the outcome is committed-but-UNVERIFIED, never a bare internal error and never a
+            # silent retry-bumps-again. Recorded BEFORE anything propagates; the caller's finally still restores the
+            # authorizer / busy_timeout and releases the lock.
+            unverified = {**_df_rejection(
+                "readback_mismatch",
+                f"COMMITTED but UNVERIFIED: the post-commit verification failed ({type(exc).__name__}); the commit stands and cannot be undone",
+                "do not retry with a new request_id (it would bump again); retry with the SAME request_id to replay this outcome, and inspect the nodes"),
+                "commit": "committed_unverified"}
+            record(unverified)
+            if not isinstance(exc, Exception):
+                raise
+            return {**unverified, "_committed": True}
+
+    # -- the owner's second write (#3856) --------------------------------------
+
+    def _handle_advance_moment_cursor(self, params: dict, deadline: float) -> dict:
+        """The typed `advance_moment_cursor` write (kind `write`). Wire: params exactly {person_id, from_cursor}; no
+        request_id (the shared compare-and-set makes a replay harmless: a retry after COMMIT finds from + 1 and
+        answers `stale` with it).
+
+        Order: validate, touching no connection (`_moment_cursor_param_refusal`); then the shared `_owner_write`
+        scaffold (the same wait budget, lock, displacement re-check, open-transaction refusal and busy-timeout
+        switch as use_reward) with the op's own restrictive authorizer (`_moment_cursor_allows`); BEGIN IMMEDIATE,
+        the SHARED `engram_moment_cursor.advance_moment_cursor`, COMMIT only when it applied (ROLLBACK otherwise:
+        there is nothing to write), then the read-back (design 5.4) from the committed store.
+
+        Outcomes: `ok` with {applied, cursor, reason} (an `applied: False` answer, `stale` / `not_person` /
+        `not_object`, is a typed ANSWER, not a refusal); `write_denied`; `busy` (nothing committed, determinate);
+        `advance_moment_cursor_write_failed` (rolled back); `readback_mismatch` (COMMITTED but unverified)."""
+        refusal = _moment_cursor_param_refusal(params)
+        if refusal is not None:
+            return refusal
+        person_id: str = params["person_id"]
+        from_cursor: int = params["from_cursor"]
+        return self._owner_write(
+            "advance_moment_cursor", deadline, lambda: _UseRewardGuard(allows=_moment_cursor_allows),
+            lambda conn, guard: self._advance_moment_cursor_execute(conn, guard, person_id, from_cursor),
+            busy_remedy="retry once with the same from_cursor (nothing was written, so the retry runs fresh)")
+
+    def _moment_cursor_readback(self, conn: sqlite3.Connection, person_id: str):
+        """The person's cursor under the ONE cursor rule, read from the store (None if there is no current person
+        row). Runs after COMMIT under the op allowlist; a test replaces it to perturb the post-commit value."""
+        row = conn.execute(
+            "SELECT " + emc.CURSOR_SQL_EXPR + " FROM nodes WHERE id = :id AND type = 'person' AND is_current = 1",
+            {"id": person_id},
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def _advance_moment_cursor_execute(self, conn: sqlite3.Connection, guard: "_UseRewardGuard", person_id: str,
+                                       from_cursor: int) -> dict:
+        """The transaction body of `_handle_advance_moment_cursor`; runs with the op allowlist installed and
+        `_owner_lock` held."""
+        op = "advance_moment_cursor"
+        try:
+            # Opened up front so a competing direct writer is met here (busy) rather than half way through.
+            conn.execute("BEGIN IMMEDIATE")
+            result = emc.advance_moment_cursor(conn, person_id, from_cursor)
+            if guard.denials:
+                _write_abort(conn, guard, op)
+                return _write_denied(guard, op)
+            if result["applied"]:
+                guard.allow_commit = True
+                conn.commit()
+                guard.allow_commit = False
+            else:
+                _write_abort(conn, guard, op)  # nothing to write: stale / not_person / not_object
+        except BaseException as exc:
+            guard.allow_commit = False
+            _write_abort(conn, guard, op)
+            if not isinstance(exc, Exception):
+                raise  # SystemExit / GeneratorExit / injected async exceptions: rolled back, then propagated
+            if guard.denials:
+                return _write_denied(guard, op)
+            if isinstance(exc, sqlite3.Error):
+                return _write_sqlite_error(
+                    exc, op, "retry once with the same from_cursor (nothing was written, so the retry runs fresh)",
+                    "retry once with the same from_cursor; if it persists check the store's disk and permissions")
+            raise
+        if not result["applied"]:
+            return {"status": "ok", "result": dict(result)}
+        # COMMITTED. From here the write cannot be undone: every failure below is committed-but-UNVERIFIED.
+        try:
+            # The committed value is read under the ONE cursor rule, so the comparison is against that rule applied
+            # to from + 1 too: at from = 2**53 - 1 the stored 2**53 is outside the window and reads as 0 (measured by
+            # the range-edge cell), and that is a verified commit, not a mismatch.
+            expected = emc.read_cursor(from_cursor + 1)
+            actual = self._moment_cursor_readback(conn, person_id)
+            if actual != expected:
+                return {**_df_rejection(
+                    "readback_mismatch",
+                    f"COMMITTED but UNVERIFIED: the committed cursor reads {actual!r}, expected {expected}; the commit cannot be undone",
+                    "do not blindly repeat; read the person's current cursor and decide (another writer may have advanced it)"),
+                    "commit": "committed_unverified"}
+            return {"status": "ok", "result": dict(result)}
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                raise
+            return {**_df_rejection(
+                "readback_mismatch",
+                f"COMMITTED but UNVERIFIED: the post-commit verification failed ({type(exc).__name__}); the commit stands and cannot be undone",
+                "do not blindly repeat; read the person's current cursor and decide"),
+                "commit": "committed_unverified"}
+
+    # -- the owner's third and fourth writes (#3879) ---------------------------------------------
+
+    def _handle_fill_embeddings(self, params: dict, deadline: float, request_id=None) -> dict:
+        """The typed `fill_embeddings` write (kind `write`). Wire: params exactly {model, items: [{node_id, vector}]},
+        at most FILL_EMBEDDINGS_MAX_ITEMS items; `request_id` is the envelope's (see WIRE_REQUEST_ID_METHODS).
+
+        Order: (1) validate EVERY item, touching no connection (`_fill_embeddings_param_refusal`): one bad item rejects
+        the whole call with nothing written; (2) the request_id; (3) the model, against the OWNER'S OWN home config read
+        through the same function the server uses (`engram_core._get_embedding_config`, the tool's exact expression):
+        `model_mismatch` if it differs, so two vector spaces can never mix; (4) the shared `_owner_write` scaffold (the
+        one wait budget, lock, displacement re-check, open-transaction refusal, busy-timeout switch) with this op's
+        restrictive authorizer; UNDER THE LOCK a dedupe check by request_id (a replay answers the stored outcome with
+        `duplicate: True`; the same id with a different payload is refused); BEGIN IMMEDIATE, the per-item
+        compare-and-set `UPDATE nodes SET embedding = ? WHERE id = ? AND is_current = 1 AND embedding IS NULL`, the
+        classification of every item, the best-effort vec mirror of the CHANGED rows only (own savepoint), COMMIT, then
+        the read-back of every changed row.
+
+        Outcomes: `ok` {filled, skipped_not_null, skipped_not_current_or_missing, vec_mirrored}; the four validation
+        refusals; `write_denied`; `busy` (nothing committed); `fill_embeddings_write_failed` (rolled back);
+        `readback_mismatch` (COMMITTED but unverified, recorded so a replay re-reports instead of re-writing)."""
+        refusal, items = _fill_embeddings_param_refusal(params)
+        if refusal is not None:
+            return refusal
+        refusal = _fill_request_id_refusal(request_id)
+        if refusal is not None:
+            return refusal
+        model: str = params["model"]
+        try:
+            core = _engram_core(self.engram_home)
+            store_model = core._get_embedding_config().get("model", core.DEFAULT_EMBEDDING_MODEL)
+        except Exception as exc:
+            return _fill_rejection(
+                "model_config_unreadable", f"the store's embedding model could not be determined ({type(exc).__name__})",
+                "fix the owner home's config.json (or the owner's runtime); nothing was written", reason="model_config_unreadable")
+        if not isinstance(store_model, str) or model != store_model:
+            return _fill_rejection(
+                "model_mismatch", "'model' is not the store's configured embedding model",
+                "embed with the model named in the owner home's config.json; two vector spaces must never mix",
+                reason="model_mismatch")
+        texts = [json.dumps(vector) for _nid, vector in items]
+        work = [(nid, text, vector) for (nid, vector), text in zip(items, texts)]
+        fingerprint = _fill_embeddings_fingerprint(model, [(nid, text) for nid, text, _v in work])
+
+        def record(resp: dict) -> None:
+            """Remember a COMMITTED outcome (ok or committed_unverified) so a same-id retry replays it."""
+            self._fill_embeddings_seen[request_id] = {"fp": fingerprint, "response": copy.deepcopy(resp)}
+            self._fill_embeddings_seen.move_to_end(request_id)
+            while len(self._fill_embeddings_seen) > USE_REWARD_DEDUPE_CAP:
+                self._fill_embeddings_seen.popitem(last=False)
+
+        def dedupe_check() -> "dict | None":
+            prior = self._fill_embeddings_seen.get(request_id)
+            if prior is None:
+                return None
+            self._fill_embeddings_seen.move_to_end(request_id)
+            if prior["fp"] != fingerprint:
+                return _fill_rejection(
+                    "request_id_reused", "this request_id was already used for a different payload",
+                    "generate a fresh request_id per distinct operation; reuse one only to retry the SAME call")
+            replay = copy.deepcopy(prior["response"])
+            if replay.get("status") == "ok":
+                replay["result"]["duplicate"] = True
+            return replay
+
+        return self._owner_write(
+            "fill_embeddings", deadline, lambda: _UseRewardGuard(allows=_fill_embeddings_allows, vec_allows=_fill_vec_phase_allows),
+            lambda conn, guard: self._fill_embeddings_execute(conn, guard, work, record),
+            intercept=dedupe_check, after=record)
+
+    def _fill_vec_ready(self, conn: sqlite3.Connection):
+        """The vec mirror's serializer (`sqlite_vec.serialize_float32`, what the direct path uses) if THIS connection
+        can write `vec_nodes`, else None. Probed once per owner connection: import `sqlite_vec` and load vec0 onto the
+        owner's connection (the one place this process loads an extension; the loader switches loading back off). A
+        Python whose sqlite3 cannot enable extension loading (the macOS framework build) or an install without
+        sqlite-vec yields None for the process lifetime, and every fill then acks `vec_mirrored: false`. A test
+        replaces this method."""
+        if self._fill_vec_state is None:
+            try:
+                import sqlite_vec
+                conn.enable_load_extension(True)  # absent on a Python built without it: AttributeError -> unavailable
+                try:
+                    sqlite_vec.load(conn)
+                finally:
+                    conn.enable_load_extension(False)
+                self._fill_vec_state = sqlite_vec.serialize_float32
+            except Exception as exc:
+                logging.getLogger("engramd_owner").info("fill_embeddings: vec0 unavailable on the owner connection (%s)",
+                                                        type(exc).__name__)
+                self._fill_vec_state = False
+        return self._fill_vec_state or None
+
+    def _fill_embeddings_readback(self, conn: sqlite3.Connection, ids) -> dict:
+        """{id: stored embedding text (None if NULL or the row is gone)} for each of `ids`, read from the committed
+        store (design 5.4). Runs after COMMIT under the op allowlist; a test replaces it to perturb the post-commit value."""
+        out: dict = {}
+        for nid in ids:
+            row = conn.execute("SELECT embedding FROM nodes WHERE id = ?", (nid,)).fetchone()
+            out[nid] = None if row is None else row[0]
+        return out
+
+    def _fill_vec_mirror(self, conn: sqlite3.Connection, guard: "_UseRewardGuard", changed, serialize) -> bool:
+        """Mirror the CHANGED rows into `vec_nodes` (DELETE + INSERT per row, as the direct path does) inside the op's
+        own SAVEPOINT. True iff every row was mirrored. ANY failure (the vec0 module or table missing, a locked
+        table, a serializer error, or an authorizer denial of a vec statement) rolls back to the savepoint, drops the
+        denials recorded since it opened (a vec denial degrades the mirror, it does not fail the fill) and returns
+        False: the `nodes` writes stand and the ack says `vec_mirrored: false` (today's direct path swallows this)."""
+        n_denied_before = len(guard.denials)
+        sp = FILL_EMBEDDINGS_VEC_SAVEPOINT
+        conn.execute(f"SAVEPOINT {sp}")
+        guard.vec_phase = True  # opens AFTER the savepoint statement and closes in the finally: only the mirror's own statements
+        try:
+            for nid, _text, vector in changed:
+                conn.execute("DELETE FROM vec_nodes WHERE node_id = ?", (nid,))
+                conn.execute("INSERT INTO vec_nodes(node_id, embedding) VALUES (?, ?)", (nid, serialize(vector)))
+            conn.execute(f"RELEASE {sp}")
+            return True
+        except Exception as exc:
+            logging.getLogger("engramd_owner").warning(
+                "fill_embeddings: vec mirror failed (%s: %s); the embeddings are written, vec_nodes is not", type(exc).__name__, exc)
+            conn.execute(f"ROLLBACK TO {sp}")
+            conn.execute(f"RELEASE {sp}")
+            del guard.denials[n_denied_before:]
+            return False
+        finally:
+            guard.vec_phase = False
+
+    def _fill_embeddings_execute(self, conn: sqlite3.Connection, guard: "_UseRewardGuard", work: list, record) -> dict:
+        """The transaction body of `_handle_fill_embeddings`; runs with the op allowlist installed and `_owner_lock`
+        held. `work` is [(node_id, stored text, vector)]. A response carrying `_committed: True` is one whose COMMIT
+        happened (the scaffold records it for dedupe and strips the marker)."""
+        op = "fill_embeddings"
+        changed: list = []
+        not_null = missing = 0
+        mirrored = False
+        try:
+            serialize = self._fill_vec_ready(conn)  # a Python-level probe: no SQL, before the transaction opens
+            # Opened up front so a competing direct writer is met here (busy) rather than half way through.
+            conn.execute("BEGIN IMMEDIATE")
+            for nid, text, vector in work:
+                cur = conn.execute(
+                    "UPDATE nodes SET embedding = ? WHERE id = ? AND is_current = 1 AND embedding IS NULL", (text, nid))
+                if cur.rowcount == 1:
+                    changed.append((nid, text, vector))
+                    continue
+                row = conn.execute("SELECT is_current, embedding IS NULL FROM nodes WHERE id = ?", (nid,)).fetchone()
+                if row is not None and row[0] == 1 and row[1] == 0:
+                    not_null += 1  # current, and the CAS refused it: something already holds an embedding
+                else:
+                    missing += 1  # no such row, or not current
+            mirrored = serialize is not None
+            if serialize is not None and changed:
+                mirrored = self._fill_vec_mirror(conn, guard, changed, serialize)
+            if guard.denials:
+                _write_abort(conn, guard, op)
+                return _write_denied(guard, op)
+            guard.allow_commit = True
+            conn.commit()
+            guard.allow_commit = False
+        except BaseException as exc:
+            guard.allow_commit = False
+            _write_abort(conn, guard, op)
+            if not isinstance(exc, Exception):
+                raise  # SystemExit / GeneratorExit / injected async exceptions: rolled back, then propagated
+            if guard.denials:
+                return _write_denied(guard, op)
+            if isinstance(exc, sqlite3.Error):
+                return _write_sqlite_error(
+                    exc, op, "retry once with the SAME request_id (nothing was written, so the retry runs fresh)",
+                    "retry with the SAME request_id; if it persists check the store's disk and permissions")
+            raise
+        # COMMITTED. From here the write cannot be undone: every failure below is committed-but-UNVERIFIED.
+        try:
+            ids = [nid for nid, _t, _v in changed]
+            actual = self._fill_embeddings_readback(conn, ids) if ids else {}
+            bad = [nid for nid, text, _v in changed if actual.get(nid) != text]
+            if bad:
+                resp = {**_df_rejection(
+                    "readback_mismatch",
+                    f"COMMITTED but UNVERIFIED: the committed embedding differs from the one written for id(s) {bad}; the commit cannot be undone",
+                    "do not retry with a new request_id; retry with the SAME request_id to replay this outcome, and inspect the named nodes"),
+                    "commit": "committed_unverified", "_committed": True}
+                return resp
+            return {
+                "status": "ok",
+                "result": {
+                    "filled": len(changed),
+                    "skipped_not_null": not_null,
+                    "skipped_not_current_or_missing": missing,
+                    "vec_mirrored": bool(mirrored),
+                },
+                "_committed": True,
+            }
+        except BaseException as exc:
+            unverified = {**_df_rejection(
+                "readback_mismatch",
+                f"COMMITTED but UNVERIFIED: the post-commit verification failed ({type(exc).__name__}); the commit stands and cannot be undone",
+                "do not retry with a new request_id; retry with the SAME request_id to replay this outcome, and inspect the nodes"),
+                "commit": "committed_unverified"}
+            record(unverified)
+            if not isinstance(exc, Exception):
+                raise
+            return {**unverified, "_committed": True}
+
+    def _handle_finish_embedding_regen(self, params: dict, deadline: float) -> dict:
+        """The typed `finish_embedding_regen` write (kind `write`). Wire: params exactly {processed, embedded, skipped,
+        failed, embedder_available}: four non-negative ints and a real bool. `embedder_available` is the TOOL's probe
+        of the embedder it just used; the owner passes it to the core finalize and NEVER probes an embedder itself
+        (that would import sentence_transformers / torch into this process, and could pick a different cause than the
+        direct path). No request_id: a replay re-runs an idempotent rebuild and flag write.
+
+        Validate (touching no connection); import `engram_core` / `engram_backup` lazily (they are large / only this op
+        needs them); then the shared `_owner_write` scaffold with this op's authorizer and ONE transaction: the FTS
+        rebuild on the owner's connection (`engram_backup.rebuild_fts_index_on_conn`, the one body the path-taking
+        function also runs), then exactly today's tool-tail branch through the SAME core functions with
+        `respect_lease=True` (no second copy of the lease logic): ALWAYS `_finalize_embedding_restore_flag`, whose fresh
+        skip-aware recount clears the flag when no embeddable NULL remains and sets it otherwise. The owner never
+        branches on the client's `processed` (a stale or lying `processed == 0` must not clear a flag over real
+        NULLs; in every honest case the tool's own count 0 means recount 0, so this equals the direct path). The core function's own COMMIT is the transaction's commit
+        (the only one the op allows). Read-back: the FTS doc count equals the count of indexable `nodes` rows, and the
+        `embedding_restore_state` row is what the branch can have written.
+
+        Outcomes: `ok` {fts_rows, restore_state}; `write_denied`; `busy`; `finish_embedding_regen_write_failed` (the
+        whole op rolled back, the FTS rebuild included); `readback_mismatch` (COMMITTED but unverified)."""
+        refusal = _finish_embedding_regen_param_refusal(params)
+        if refusal is not None:
+            return refusal
+        counts = {k: params[k] for k in ("processed", "embedded", "skipped", "failed")}
+        try:
+            core = _engram_core(self.engram_home)
+            import engram_backup
+        except ImportError as exc:
+            return _df_rejection(
+                "finish_embedding_regen_runtime_unavailable", f"the owner's runtime lacks a module this op needs ({type(exc).__name__})",
+                "owner install fault: the owner's runtime is incomplete")
+        return self._owner_write(
+            "finish_embedding_regen", deadline, lambda: _UseRewardGuard(allows=_finish_embedding_regen_allows),
+            lambda conn, guard: self._finish_embedding_regen_execute(
+                conn, guard, counts, core, engram_backup, embedder_available=params["embedder_available"]),
+            busy_remedy="retry once (nothing was written, so the retry runs fresh)")
+
+    def _finish_embedding_regen_readback(self, conn: sqlite3.Connection) -> dict:
+        """{fts_rows, state} read from the committed store: the FTS index's document count (None if there is no
+        `nodes_fts`) and the `embedding_restore_state` row (None if absent). A test replaces it to perturb either."""
+        has_fts = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_fts'").fetchone()
+        fts_rows = conn.execute("SELECT COUNT(*) FROM nodes_fts_docsize").fetchone()[0] if has_fts else None
+        row = conn.execute(
+            "SELECT not_fully_restored, null_count, cause, updated_at FROM embedding_restore_state WHERE singleton_key = 1"
+        ).fetchone()
+        return {"fts_rows": fts_rows, "state": None if row is None else tuple(row)}
+
+    @staticmethod
+    def _restore_state_is_what_the_branch_wrote(pre, actual) -> bool:
+        """The restore row after the branch is one the branch can have written: a fresh foreign lease left it
+        EXACTLY as it was; else the cleared shape; else the set shape with a real cause (the finalize recount decides
+        which; the client's `processed` never does)."""
+        if actual is None:
+            return False
+        if pre is not None and pre[2] == "regeneration-running" and tuple(actual) == tuple(pre):
+            return True  # respect_lease: a fresh lease held by someone else was not overwritten
+        cleared = actual[0] == 0 and actual[1] == 0 and actual[2] is None
+        return cleared or (actual[0] == 1 and actual[1] > 0 and actual[2] in ("per-node-failures", "embedder-unavailable"))
+
+    def _finish_embedding_regen_execute(self, conn: sqlite3.Connection, guard: "_UseRewardGuard", counts: dict, core, backup,
+                                        *, embedder_available: bool) -> dict:
+        """The transaction body of `_handle_finish_embedding_regen`; runs with the op allowlist installed and
+        `_owner_lock` held. `embedder_available` is the tool's probe, handed to the core finalize as given."""
+        op = "finish_embedding_regen"
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            backup.rebuild_fts_index_on_conn(conn, str(self.store_path))
+            # EXPECTED fts rows: an independent count of the rows the index must hold (the shared partition predicate).
+            expected_fts = None
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_fts'").fetchone():
+                node_cols = {r[1] for r in conn.execute("PRAGMA table_info(nodes)").fetchall()}
+                _exclude, indexable = backup._fts_row_predicates(node_cols)
+                expected_fts = conn.execute(
+                    "SELECT COUNT(*) FROM nodes" + (f" WHERE {indexable}" if indexable else "")).fetchone()[0]
+            core._ensure_embedding_restore_state_table(conn)
+            pre = conn.execute(
+                "SELECT not_fully_restored, null_count, cause, updated_at FROM embedding_restore_state WHERE singleton_key = 1"
+            ).fetchone()
+            # The core function COMMITS (its own write path): that commit is this transaction's, the FTS rebuild included.
+            guard.allow_commit = True
+            try:
+                # ALWAYS the recount path: `processed` is the client's claim and decides nothing here. The core finalize
+                # clears when its fresh skip-aware recount is 0 and sets the flag otherwise (cause from the tool's probe).
+                core._finalize_embedding_restore_flag(
+                    conn, dict(counts), respect_lease=True, embedder_available=embedder_available)
+            finally:
+                guard.allow_commit = False
+            if guard.denials:
+                _write_abort(conn, guard, op)
+                return _write_denied(guard, op)
+            if conn.in_transaction:
+                guard.allow_commit = True
+                try:
+                    conn.commit()
+                finally:
+                    guard.allow_commit = False
+        except BaseException as exc:
+            guard.allow_commit = False
+            _write_abort(conn, guard, op)
+            if not isinstance(exc, Exception):
+                raise  # SystemExit / GeneratorExit / injected async exceptions: rolled back, then propagated
+            if guard.denials:
+                return _write_denied(guard, op)
+            if isinstance(exc, sqlite3.Error):
+                return _write_sqlite_error(
+                    exc, op, "retry once (nothing was written, so the retry runs fresh)",
+                    "retry once; if it persists check the store's disk and permissions")
+            raise
+        # COMMITTED. From here the write cannot be undone: every failure below is committed-but-UNVERIFIED.
+        try:
+            actual = self._finish_embedding_regen_readback(conn)
+            problems = []
+            if actual["fts_rows"] != expected_fts:
+                problems.append(f"the FTS index holds {actual['fts_rows']} documents, expected {expected_fts}")
+            if not self._restore_state_is_what_the_branch_wrote(pre, actual["state"]):
+                problems.append("the embedding_restore_state row is not what the branch wrote")
+            if problems:
+                return {**_df_rejection(
+                    "readback_mismatch", "COMMITTED but UNVERIFIED: " + "; ".join(problems) + "; the commit cannot be undone",
+                    "inspect the FTS index and the restore-state row; re-running the op is safe (a rebuild and a flag write)"),
+                    "commit": "committed_unverified"}
+            state = actual["state"]
+            return {"status": "ok", "result": {"fts_rows": actual["fts_rows"] or 0, "restore_state": None if state is None else state[2]}}
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                raise
+            return {**_df_rejection(
+                "readback_mismatch",
+                f"COMMITTED but UNVERIFIED: the post-commit verification failed ({type(exc).__name__}); the commit stands and cannot be undone",
+                "inspect the FTS index and the restore-state row; re-running the op is safe"),
+                "commit": "committed_unverified"}
 
     def _read_deadline_rejection(self, detail: str) -> dict:
         return {

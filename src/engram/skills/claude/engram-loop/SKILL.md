@@ -2,7 +2,7 @@
 name: engram-loop
 description: >
   Generic self-paced loop convention and the SINGLE SOURCE OF TRUTH for loop
-  formality — the ~/.engram/loop-mode.json marker lifecycle (entry-guard /
+  formality — the ~/.engram/loop-mode.json (under $ENGRAM_HOME, default ~/.engram) marker lifecycle (entry-guard /
   write-on-start / remove-on-end) and the loop-aware drowsiness behavior
   (capture what the summary won't carry, then ride auto-compaction — don't
   slow down for a manual one). Use this for a harness-selected self-paced
@@ -17,7 +17,7 @@ description: >
 A "loop" is any self-paced sequence of work bursts the agent paces through
 via its harness's selected wake mechanism, rather than turn-by-turn with the
 user. The load-bearing convention is a single marker file:
-**`~/.engram/loop-mode.json`**.
+**`~/.engram/loop-mode.json`** (under `$ENGRAM_HOME`, default `~/.engram`).
 
 Its presence is the ONLY thing the drowsiness module (invoked via the surface hook)
 checks to switch from the normal nap-nudge to the loop-aware banner
@@ -77,9 +77,9 @@ cat > /tmp/arm-codex-loop.sh <<'BASH'
 set -Eeuo pipefail
 : "${CURRENT_THREAD:?}" "${END_AT:?}" "${LOOP_KIND:?}" "${TOPIC:?}" "${INSTRUCTIONS:?}" "${STATE:?}"
 CADENCE_SECONDS=${CADENCE_SECONDS:-1800}
-root="$HOME/.engram/codex-wake/loop-host-state"
-pending="$HOME/.engram/loop-mode.json.pending"
-marker="$HOME/.engram/loop-mode.json"
+root="${ENGRAM_HOME:-$HOME/.engram}/codex-wake/loop-host-state"
+pending="${ENGRAM_HOME:-$HOME/.engram}/loop-mode.json.pending"
+marker="${ENGRAM_HOME:-$HOME/.engram}/loop-mode.json"
 test ! -e "$marker" || { echo "an active loop marker already exists" >&2; exit 1; }
 wake_unit=$(systemctl --user list-unit-files --type=service --no-legend | awk '$1 ~ /codex-umwelt-wake\.service$/ {print $1; exit}')
 unit=$(systemctl --user list-unit-files --type=timer --no-legend | awk '$1 ~ /codex-loop-heartbeat\.timer$/ {print $1; exit}')
@@ -121,15 +121,15 @@ EOF
 agent=$(jq -er .agent "$HOME/.umwelt/config.json")
 jq -n --arg activated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg end_at "$END_AT" \
   --arg kind "$LOOP_KIND" --arg topic "$TOPIC" --arg instructions "$INSTRUCTIONS" --arg state "$STATE" \
-  --arg prompt "@$agent Loop heartbeat: read ~/.engram/loop-mode.json and continue the active bounded loop; remove the marker when end_at has passed." \
+  --arg prompt "@$agent Loop heartbeat: read ${ENGRAM_HOME:-$HOME/.engram}/loop-mode.json and continue the active bounded loop; remove the marker when end_at has passed." \
   --argjson cadence "$CADENCE_SECONDS" '{FIRST_ACTION:"FIRST: verify exact bridge thread and one timer trigger; check end_at; then work and update state.",activated:$activated,end_at:$end_at,kind:$kind,topic:$topic,instructions:$instructions,state:$state,cadence_seconds:$cadence,pacer:"codex-systemd-umwelt-self-wake",loop_prompt:$prompt}' > "$pending"
 
 systemctl --user daemon-reload
 systemctl --user restart "$wake_unit"
 systemctl --user enable --now "$unit"
 systemctl --user restart "$unit"
-WAKE="$HOME/.engram/marketplace/plugins/engram/tools/codex-umwelt-wake.py"
-status=$("$HOME/.engram/venv/bin/python" "$WAKE" status)
+WAKE="${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram/tools/codex-umwelt-wake.py"
+status=$("${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python" "$WAKE" status)
 test "$(jq -r .running <<<"$status")" = true
 test "$(jq -r .thread_id <<<"$status")" = "$CURRENT_THREAD"
 systemctl --user list-timers "$unit" --no-pager | grep -Fq "$unit"
@@ -156,9 +156,9 @@ wake, rederive unit names from the persisted host-state (never from old shell
 variables) and verify the shipped bridge plus timer:
 
 ```bash
-WAKE="$HOME/.engram/marketplace/plugins/engram/tools/codex-umwelt-wake.py"
-PY="$HOME/.engram/venv/bin/python"
-root="$HOME/.engram/codex-wake/loop-host-state"
+WAKE="${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram/tools/codex-umwelt-wake.py"
+PY="${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python"
+root="${ENGRAM_HOME:-$HOME/.engram}/codex-wake/loop-host-state"
 wake_unit=$(cat "$root/wake-unit"); unit=$(cat "$root/timer-unit")
 current_thread='<session id from the Active session banner>'
 status=$("$PY" "$WAKE" status)
@@ -183,11 +183,11 @@ drop-ins and the timer's prior enabled **and active** states:
 
 ```bash
 set -Eeuo pipefail
-root="$HOME/.engram/codex-wake/loop-host-state"
+root="${ENGRAM_HOME:-$HOME/.engram}/codex-wake/loop-host-state"
 wake_unit=$(cat "$root/wake-unit"); unit=$(cat "$root/timer-unit")
 thread_dropin="$HOME/.config/systemd/user/$wake_unit.d/thread.conf"
 cadence_dropin="$HOME/.config/systemd/user/$unit.d/cadence.conf"
-rm -f "$HOME/.engram/loop-mode.json" "$HOME/.engram/loop-mode.json.pending"
+rm -f "${ENGRAM_HOME:-$HOME/.engram}/loop-mode.json" "${ENGRAM_HOME:-$HOME/.engram}/loop-mode.json.pending"
 test -e "$root/thread.conf" && cp "$root/thread.conf" "$thread_dropin" || rm -f "$thread_dropin"
 test -e "$root/cadence.conf" && cp "$root/cadence.conf" "$cadence_dropin" || rm -f "$cadence_dropin"
 systemctl --user daemon-reload
@@ -219,12 +219,12 @@ decides whether you write the marker or check it:
   asked. → **Context-reset check first**: if warm-briefing is NOT already in your
   context (your context was just reset — you'll see a `[source=compact]` or
   `[source=startup]` session banner, or a compaction summary at the top of your
-  context), **read `~/.engram/warm-briefing.md` before anything else** — the same
+  context), **read `~/.engram/warm-briefing.md` (under `$ENGRAM_HOME`, default `~/.engram`) before anything else** — the same
   rule as any session start after a context reset. Normal same-session wakes skip
   this (warm-briefing is already in context). Then run the stale-check:
 
   ```bash
-  cat ~/.engram/loop-mode.json 2>/dev/null
+  cat "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json 2>/dev/null
   ```
 
   - **present** → the loop is live → run the **engaged-gate** (below) first, then continue the iteration via Step 1.5 (staleness sanity check) then Step 2 (loop body).
@@ -318,9 +318,9 @@ holds the loop's full state — topic, the per-iteration brief, and the live
 pending-work — not just an "I'm looping" flag:
 
 ```bash
-cat > ~/.engram/loop-mode.json <<JSON
+cat > "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json <<JSON
 {
-  "FIRST_ACTION": "THE RE-ARM NOW HAPPENS LAST, NOT FIRST — see Step 2 item 3 (arm-last ritual; if the turn carries a reply the human must see, item 3's reply-carrying split applies: batch the arm with a sibling tool call in one parallel block, reply as the turn's final text, #2098). Do the iteration's actual work first, using this marker's 'state' + 'instructions' fields. At the END of the turn — the FINAL action, after the work is done AND this marker's 'state' field is rewritten to reflect it: ask the helper for this turn's delay (\"${CLAUDE_PLUGIN_ROOT:-$HOME/.engram/marketplace/plugins/engram}/tools/loop_prompt.py\" --rearm-delay --wake-kind heartbeat|other, Step 2 item 3c) and ScheduleWakeup at the integer it prints, unconditionally (no CronList-before-arm check — replacement is unconditional, so a redundant arm is free, never stacks). For the prompt COPY THIS FILE'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word 'stub' invites paraphrasing, so don't. Then CronList again and confirm the armed prompt actually LEADS with the <loop-wake> marker — an ABSENT marker, or one that is present but not leading, makes the wake self-stamp as user activity and the loop defers perpetually. An escaped &lt;loop-wake&gt; is fine: the classifiers HTML-unescape before matching, so a mangled marker still classifies correctly; absence and position are what they cannot rescue.",
+  "FIRST_ACTION": "THE RE-ARM NOW HAPPENS LAST, NOT FIRST — see Step 2 item 3 (arm-last ritual; if the turn carries a reply the human must see, item 3's reply-carrying split applies: batch the arm with a sibling tool call in one parallel block, reply as the turn's final text, #2098). Do the iteration's actual work first, using this marker's 'state' + 'instructions' fields. At the END of the turn — the FINAL action, after the work is done AND this marker's 'state' field is rewritten to reflect it: ask the helper for this turn's delay (\"${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_prompt.py\" --rearm-delay --wake-kind heartbeat|other, Step 2 item 3c) and ScheduleWakeup at the integer it prints, unconditionally (no CronList-before-arm check — replacement is unconditional, so a redundant arm is free, never stacks). For the prompt COPY THIS FILE'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word 'stub' invites paraphrasing, so don't. Then CronList again and confirm the armed prompt actually LEADS with the <loop-wake> marker — an ABSENT marker, or one that is present but not leading, makes the wake self-stamp as user activity and the loop defers perpetually. An escaped &lt;loop-wake&gt; is fine: the classifiers HTML-unescape before matching, so a mangled marker still classifies correctly; absence and position are what they cannot rescue.",
   "activated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "kind": "work|research|autonomous|heartbeat",
   "topic": "<one-line loop topic>",
@@ -366,7 +366,7 @@ JSON
   from real user messages.
 - `next_due_at` — **never hand-written, and deliberately absent from the
   template above.** The helper
-  (`"${CLAUDE_PLUGIN_ROOT:-$HOME/.engram/marketplace/plugins/engram}/tools/loop_prompt.py" --rearm-delay`, Step 2 item 3c) creates it on the
+  (`"${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_prompt.py" --rearm-delay`, Step 2 item 3c) creates it on the
   FIRST arm (the heartbeat, R1) and is its **single writer** thereafter
   (#3005). Do not add it to this heredoc and do not hand-type a timestamp: a
   hand-typed value is exactly the silent full-cadence fallback the
@@ -402,7 +402,7 @@ required every iteration. Reconcile and move on; don't treat it as evidence
 something went badly wrong, and don't treat it as normal either.
 
 ```bash
-cat ~/.engram/loop-mode.json | jq -r .state | head -20
+cat "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json | jq -r .state | head -20
 ```
 
 The most likely cause of staleness is the previous iteration skipped Step 2
@@ -415,12 +415,12 @@ the marker's
 
 ```bash
 # portable mtime age in seconds (macOS || Linux)
-mtime=$(stat -f %m ~/.engram/loop-mode.json 2>/dev/null || stat -c %Y ~/.engram/loop-mode.json)
+mtime=$(stat -f %m "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json 2>/dev/null || stat -c %Y "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json)
 age=$(( $(date +%s) - mtime ))
 echo "marker age: $(( age / 3600 ))h"
 ```
 
-Calibrate the threshold to the loop's *own* cadence, not a fixed number: read `cadence_seconds` from the marker and treat an age beyond a small multiple (≈ 2×) as dormant — which for a sub-hourly loop means roughly `> 2h`. If the age exceeds that — especially across an overnight/sleep boundary — **do NOT trust the marker's `state` as current truth.** Re-derive fresh from the reconciled record (the latest `~/.engram/history/YYYY-MM-DD.md` rollup + live ENGRAM state) before continuing, and overwrite the marker's `state`; or, if a sleep ran since the marker was written, treat the loop as ended — `rm ~/.engram/loop-mode.json` and stop (a fresh start will re-arm), so a dormant loop doesn't leave a stale marker behind. This is the failure mode where a pre-sleep snapshot gets relayed as current work-status. `engram-sleep` Phase A should normally remove the marker at sleep so this never arises — this guard is the backstop for a missed or crashed sleep-stop.
+Calibrate the threshold to the loop's *own* cadence, not a fixed number: read `cadence_seconds` from the marker and treat an age beyond a small multiple (≈ 2×) as dormant — which for a sub-hourly loop means roughly `> 2h`. If the age exceeds that — especially across an overnight/sleep boundary — **do NOT trust the marker's `state` as current truth.** Re-derive fresh from the reconciled record (the latest `~/.engram/history/YYYY-MM-DD.md` rollup + live ENGRAM state) before continuing, and overwrite the marker's `state`; or, if a sleep ran since the marker was written, treat the loop as ended — `rm "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json` and stop (a fresh start will re-arm), so a dormant loop doesn't leave a stale marker behind. This is the failure mode where a pre-sleep snapshot gets relayed as current work-status. `engram-sleep` Phase A should normally remove the marker at sleep so this never arises — this guard is the backstop for a missed or crashed sleep-stop.
 
 *(Skip this step on a fresh START — the marker was just written in Step 1 and
 cannot be stale.)*
@@ -452,8 +452,8 @@ cannot be stale.)*
        it as a NUMBER, with `--argjson` (item 3b explains why):
 
        ```bash
-       tmp=$(mktemp ~/.engram/loop-mode.json.XXXXXX) && jq --argjson c 3300 '.cadence_seconds = $c' ~/.engram/loop-mode.json > "$tmp" \
-         && mv "$tmp" ~/.engram/loop-mode.json
+       tmp=$(mktemp "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json.XXXXXX) && jq --argjson c 3300 '.cadence_seconds = $c' "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json > "$tmp" \
+         && mv "$tmp" "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json
        ```
    (b) The loop is watching a long-period external signal the user has named
        (a CI run, a deploy ETA, a remote queue) — and the cadence matches
@@ -501,9 +501,9 @@ cannot be stale.)*
    > *Loop continuation. **If warm-briefing is not already in your context**
    > (your context was just reset — you'll see a `[source=compact]` or
    > `[source=startup]` session banner, or a compaction summary in your prior
-   > context), **read `~/.engram/warm-briefing.md` first** before proceeding.
+   > context), **read `~/.engram/warm-briefing.md` (under `$ENGRAM_HOME`, default `~/.engram`) first** before proceeding.
    >
-   > Then: read `~/.engram/loop-mode.json` for the loop topic, instructions, and
+   > Then: read `~/.engram/loop-mode.json` (under `$ENGRAM_HOME`, default `~/.engram`) for the loop topic, instructions, and
    > current state. **If the file is absent → the loop already ended; STOP, do
    > not execute.** If present → continue per its contents: do the iteration's
    > work, rewrite the marker's `state` to reflect what the burst produced,
@@ -572,9 +572,9 @@ cannot be stale.)*
       CANONICAL HANDOFF; the wake prompt is just a pointer.
 
       ```bash
-      tmp=$(mktemp ~/.engram/loop-mode.json.XXXXXX) \
-        && jq --arg s "<new state>" '.state = $s' ~/.engram/loop-mode.json > "$tmp" \
-        && mv "$tmp" ~/.engram/loop-mode.json
+      tmp=$(mktemp "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json.XXXXXX) \
+        && jq --arg s "<new state>" '.state = $s' "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json > "$tmp" \
+        && mv "$tmp" "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json
       ```
 
       `--arg` binds a **string** — right for `state`, wrong for any NUMERIC
@@ -585,7 +585,7 @@ cannot be stale.)*
    c. **Ask the helper for this turn's delay, then arm at it.** Run
 
       ```bash
-      python3 "${CLAUDE_PLUGIN_ROOT:-$HOME/.engram/marketplace/plugins/engram}/tools/loop_prompt.py" --rearm-delay --wake-kind <KIND>
+      python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_prompt.py" --rearm-delay --wake-kind <KIND>
       ```
 
       and pass the integer it prints to `ScheduleWakeup` — unconditionally (no
@@ -733,7 +733,7 @@ cannot be stale.)*
 Remove the marker the moment the loop ends:
 
 ```bash
-rm -f ~/.engram/loop-mode.json
+rm -f "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json
 ```
 
 **Triggers for removal:** the loop's work is genuinely done · the user takes
@@ -753,7 +753,7 @@ With the marker present, the hook tells you the right thing; the discipline is:
 
 - **At urgent drowsiness: capture the COMPLETED burst, before you start the
   next one.** Append the burst that just ended to today's
-  `~/.engram/history/YYYY-MM-DD.md`, and write the nodes for anything it
+  `~/.engram/history/YYYY-MM-DD.md` (under `$ENGRAM_HOME`, default `~/.engram`), and write the nodes for anything it
   decided or found. The compaction summary carries our custom instructions
   only ~12% of the time (engram-alpha#2026, measured: 16 of 135 summaries
   since May), so what crosses the boundary is whatever is already plain text

@@ -2,10 +2,24 @@
   "schema": 1,
   "templates": [
     {
+      "key": "0268e1aaf4c8ab7eb47f1f2727d2d8785bb56d5c155c532dd27e0c367894507e",
+      "sql": "SELECT claim, quote_type, evidence_id FROM nodes WHERE id = ?",
+      "sites": [
+        "tools/weakest_load_bearing.py:_node_detail"
+      ]
+    },
+    {
       "key": "0280b9b584a3522d55be45f09ec258c28ec2d8b8e0e3cf80267097f593c71462",
       "sql": "SELECT COUNT(*) FROM nodes WHERE created_at > ?",
       "sites": [
         "hooks/claude/engram-session-start-hook.py:sleep_status_block"
+      ]
+    },
+    {
+      "key": "05bd2f3941a89717b037e9d113acd015bd2dec4851c13fb120af5d781e56fedc",
+      "sql": "SELECT source_id, target_id FROM edges WHERE relation IN (SELECT value FROM json_each(?))",
+      "sites": [
+        "tools/weakest_load_bearing.py:_dependents_map"
       ]
     },
     {
@@ -23,6 +37,20 @@
       ]
     },
     {
+      "key": "33b7113738f7310b25d3b9c6e109b18c3a790ba8c54879c25e8a774757703e3e",
+      "sql": "SELECT json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.prevention_type') FROM nodes WHERE id = ? AND type = 'lesson' AND is_current = 1 AND memory_status = 'active'",
+      "sites": [
+        "tools/reconcile_lesson_demotions.py:find_candidates"
+      ]
+    },
+    {
+      "key": "3f93aa0253bf488bb49c711fe84f003f891e319b7d1ff110806fbfb50abeb035",
+      "sql": "SELECT COUNT(*) FROM nodes WHERE is_current = 1 AND type IN (SELECT value FROM json_each(?)) AND embedding IS NULL",
+      "sites": [
+        "tools/dream_master_batch.py:count_null_embeddings"
+      ]
+    },
+    {
       "key": "4795866d2d19b5085970ad79dd2705359930118747cd19d1ec6eb405627befb9",
       "sql": "SELECT id, type FROM nodes WHERE id = ?",
       "sites": [
@@ -37,6 +65,13 @@
       ]
     },
     {
+      "key": "52fbda88135f730c72dd9b99a25b49a5bdca690ec6afd99d44f0110251a3974c",
+      "sql": "SELECT node_id, cascade_event, root_node FROM cascade_markers WHERE status = 'pending' ORDER BY id",
+      "sites": [
+        "tools/weakest_load_bearing.py:_pending_markers"
+      ]
+    },
+    {
       "key": "5961b023ce8247394b6d859ca4d0959c3ae34d2e9be481a8fd726899c795ef8e",
       "sql": "SELECT not_fully_restored, null_count, cause FROM embedding_restore_state WHERE singleton_key = 1",
       "sites": [
@@ -45,10 +80,38 @@
       ]
     },
     {
+      "key": "5ae1d203ba0fc1fe6c359dffc2ee37c0be6d4b33cab8f8a8da24108c79c70d84",
+      "sql": "SELECT target_id FROM edges WHERE source_id = ? AND relation IN (SELECT value FROM json_each(?)) ORDER BY target_id",
+      "sites": [
+        "tools/weakest_load_bearing.py:_direct_premises"
+      ]
+    },
+    {
       "key": "5ca245030193bc0e9811e8af365843b66ab4c4d999bbf2d13b79eabc0df37ee8",
       "sql": "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'generalizes'",
       "sites": [
         "engram_core.py:generalization_chain"
+      ]
+    },
+    {
+      "key": "5d20068d948c7f26fbda3c1aba1bb024044429ca0fa87a888ebcf0e3bfbe8c1d",
+      "sql": "SELECT source_url, source_title FROM nodes WHERE id = ?",
+      "sites": [
+        "tools/weakest_load_bearing.py:_evidence_label"
+      ]
+    },
+    {
+      "key": "605333c4d1e12407862ff5f039a4a27289380a1f01469e87456170af0f921842",
+      "sql": "SELECT id FROM nodes WHERE is_current=1 AND embedding IS NULL ORDER BY id",
+      "sites": [
+        "tools/engram-regenerate-embeddings.py:_owner_null_ids"
+      ]
+    },
+    {
+      "key": "6b8a8373e14ff561366c89e57e0e982e4d416d952e467ae44ef2e13e9eb0cd42",
+      "sql": "SELECT id, type, claim, quoted_text, interpretation, recall_summary, predicted_event, resolution_timeframe FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
+      "sites": [
+        "tools/cohort_dispatch.py:_fetch_nodes"
       ]
     },
     {
@@ -88,6 +151,13 @@
       ]
     },
     {
+      "key": "99da5d73eb6250a34c5c08a053ca046d0c294cb82ac443558806325c570c66da",
+      "sql": "SELECT type, claim, source_title, predicted_event, recall_summary, recall_keywords FROM nodes WHERE id = ?",
+      "sites": [
+        "tools/engram-regenerate-embeddings.py:_owner_text_row"
+      ]
+    },
+    {
       "key": "9d938f92196ce5c30108d90b0c926ae6f8d10b89e963219bcf12415dce414a39",
       "sql": "SELECT term, doc FROM nodes_fts_vocab WHERE term IN (SELECT value FROM json_each(?))",
       "sites": [
@@ -109,13 +179,6 @@
       ]
     },
     {
-      "key": "a6822015a92b0414ca8b443bd623c4ce9be6f7637068d72f69e8711e2e6c1427",
-      "sql": "SELECT metadata FROM nodes WHERE id = ?",
-      "sites": [
-        "hooks/claude/engram-surface-hook.py:_advance_person_moment_cursor"
-      ]
-    },
-    {
       "key": "a81aff5ee1cfc444b6044abc808bcd8573b6e94d771e505c5119ca6678b91046",
       "sql": "SELECT COUNT(*) FROM nodes",
       "sites": [
@@ -130,10 +193,24 @@
       ]
     },
     {
+      "key": "b3a2d1ab2b1a718bce83ce77bb8362f0b59d94677d8c9026e49a1e957ca06e97",
+      "sql": "SELECT id, type, confidence, recall_turn FROM nodes WHERE is_current = 1 AND COALESCE(status, '') != 'retracted'",
+      "sites": [
+        "tools/weakest_load_bearing.py:_live_nodes"
+      ]
+    },
+    {
       "key": "bca59f0784091d50dfa65e9ee9d35288defe5503524b0e43437bb701e1dc7e80",
       "sql": "\nSELECT\n    id,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,\n    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.prevention_type')    AS prevention_type,\n    COALESCE(json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.scaffolding_nudge'), claim) AS nudge\nFROM nodes\nWHERE type = 'lesson'\n  AND is_current = 1\n  AND memory_status = 'active'\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') IS NOT NULL\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern') != ''\n  AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.prevention_type') IN ('shadow', 'blocking')\n",
       "sites": [
         "hooks/claude/engram-lesson-tripwire-hook.py:load_prevention_lessons"
+      ]
+    },
+    {
+      "key": "c4c336fb9802f92e244bed1ab36b75acd83db33fc04a07015a3e9c344893a1d7",
+      "sql": "SELECT DISTINCT e.target_id FROM edges e JOIN nodes ct ON ct.id = e.source_id WHERE e.relation = 'contradicts' AND ct.type = 'contradiction' AND ct.is_current = 1 AND ct.status IN (SELECT value FROM json_each(?))",
+      "sites": [
+        "tools/weakest_load_bearing.py:_contested_ids"
       ]
     },
     {
@@ -148,6 +225,13 @@
       "sql": "SELECT count(*) FROM nodes WHERE is_current = 1",
       "sites": [
         "hooks/claude/engram-stop-hook.py:_maturity_muted"
+      ]
+    },
+    {
+      "key": "d1307e3a9b89504f39d0a1d8d166c8537d1cda8e676008c74309aa5a7c83e762",
+      "sql": "SELECT COUNT(*), COALESCE(SUM(CASE WHEN json_valid(recall_keywords) THEN CASE WHEN json_type(recall_keywords) = 'array' AND json_array_length(recall_keywords) > 0 THEN 0 ELSE 1 END ELSE 1 END), 0) FROM nodes WHERE is_current = 1 AND type IN (SELECT value FROM json_each(?))",
+      "sites": [
+        "tools/dream_master_batch.py:recall_keywords_counts"
       ]
     },
     {
@@ -166,6 +250,20 @@
       ]
     },
     {
+      "key": "dc7290f0179bba722b17491571d6a68c5b113e0626d9af887f5b782da09e9ea7",
+      "sql": "SELECT COUNT(*), COALESCE(SUM(CASE WHEN trim(coalesce(recall_summary, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') = '' THEN 1 ELSE 0 END), 0) FROM nodes WHERE is_current = 1 AND type IN (SELECT value FROM json_each(?))",
+      "sites": [
+        "tools/dream_master_batch.py:recall_summary_counts"
+      ]
+    },
+    {
+      "key": "dd2e6cba6f21ce5e503ad4df8038b2ad0dd1373b9b78eb080db4f53f2969165f",
+      "sql": "SELECT is_current, status, superseded_by FROM nodes WHERE id = ?",
+      "sites": [
+        "tools/dream_master_batch.py:fetch_safety_row"
+      ]
+    },
+    {
       "key": "e3872e7780af9a2fb346d7019adb7f9bd36fd49794c534d74c2f96e364c9d129",
       "sql": "SELECT name, node_ids, description, created_at FROM focus_sets ORDER BY name ASC",
       "sites": [
@@ -177,6 +275,13 @@
       "sql": "SELECT COUNT(*) FROM nodes WHERE created_at >= ? AND (trim(coalesce(claim, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '' OR trim(coalesce(recall_summary, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '')",
       "sites": [
         "hooks/claude/engram-session-start-hook.py:session_checkpoint_block"
+      ]
+    },
+    {
+      "key": "f0cd101df2bf713d48b6fa7557bcfc2ac76f978ed1d552e3c94e4ca82359cfd5",
+      "sql": "SELECT COUNT(*) FROM nodes WHERE is_current=1 AND embedding IS NULL",
+      "sites": [
+        "tools/engram-regenerate-embeddings.py:_owner_null_count"
       ]
     },
     {
@@ -200,7 +305,6 @@
   ],
   "write_sites": [
     "engram_restamp.py:bump_utility",
-    "hooks/claude/engram-surface-hook.py:_advance_person_moment_cursor",
     "hooks/claude/engram-utility-credit-mention-stop.py:bump_utility"
   ],
   "declared_out_of_scope": [

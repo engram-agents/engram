@@ -236,6 +236,27 @@ a synthetic *template* of it, not the real file):
 `repos` is required: it binds a baton id's prefix (`PR` for `PR-9001`, `UMWELT-PR` for
 `UMWELT-PR-925`; compared case-insensitively) to the one repository its anchor may
 name. A missing or malformed `repos` fails the gate closed like any other map error.
+
+**Live prefixes (admin checklist).** The deployed map needs a `repos` row for every
+prefix whose batons are advanced (`advance`, or a `flip` to the merge seat) through the
+forum. A snapshot as of 2026-10-17 (active batons plus #3884); re-derive it when a new
+baton prefix appears: `PR`, `UMWELT-PR`, `PAPER-PR`, `WEBSITE-PR`, `LAB-PR`, `GPUB-PR`,
+`STUDIO-PR`.
+
+The repository each row must name is the one that prefix's batons anchor to; read it
+from an existing baton's `github:` field (e.g. `baton show <ID>`). The admin keeps the
+real slugs in the deployed map, never in this repository.
+
+`ISSUE-*` and `PR1-*` batons carry no PR anchor, so the table is never consulted for
+them (an unanchored `advance` is refused for lack of an anchor, not for a missing row).
+A missing row shows up as a 422 refusal: *baton id prefix `'STUDIO-PR'` (from
+`'STUDIO-PR-34'`) has no entry in the baton login map's 'repos' table ... The admin must
+add the prefix.* Only `advance` and a `flip` to the merge seat REFUSE on a missing row;
+`merge`, `close` and a flip to any other seat do not (pinned by
+`test_baton_prefix_table_3884.py`). The anchor-write paths (`init` with a qualified
+anchor, and `POST /anchor`) do not refuse a qualified anchor on an absent row; `init`
+with a bare `pr/<N>` anchor does, because it cannot qualify it without the row.
+
 A colleague with several mapped logins advances only if at least one login has a
 current approval and none has an objection (`changes_requested`), an unorderable
 pair of opinions (`ambiguous`: same `submittedAt`, different states) or an unreadable

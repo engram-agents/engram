@@ -93,10 +93,19 @@ from typing import Optional
 # Paths
 # ---------------------------------------------------------------------------
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+_HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOKS_DIR not in sys.path:
+    sys.path.insert(0, _HOOKS_DIR)
+# This hook's ONLY unconditional _hooklib import is emit_context (tests/test_forum_hook_unknown_state_3521.py
+# pins that a _hooklib without the probe helpers still loads), so its home comes from the prompt-hook layer's
+# resolver in _prompthooklib (#3863, parity-pinned), through its own guarded import. When that lib is
+# missing, main() reports the failure and exits before any use of this value.
+try:
+    from _prompthooklib import engram_home_or_exit as _engram_home
+    _HOME_LIB_OK = True
+except Exception:
+    _HOME_LIB_OK = False
+ENGRAM_HOME = str(_engram_home()) if _HOME_LIB_OK else ""
 
 SURFACED_CURSOR_PATH = os.path.join(ENGRAM_HOME, "forum-surfaced-cursor.txt")
 # READ_CURSOR_PATH is no longer consumed by this hook for mention queries.

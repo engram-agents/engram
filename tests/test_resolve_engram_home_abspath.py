@@ -52,11 +52,21 @@ Four things are verified:
      issue's own reproduction; (b) against the real, fixed module's
      absolute bind, the same comparison target finds the row -- the guard
      now correctly identifies the live holder.
+
+Since alpha #3863 6b (Borges's ruling) a RELATIVE ENGRAM_HOME is not resolved to
+an absolute path any more, it is REFUSED: _resolve_engram_home() goes through the
+hook layer's engram_home_or_exit(), which prints one stderr line and exits 0
+before anything binds. The invariant gh#2695 protects (never a relative bind)
+therefore holds structurally. The pre-fix control still reverts the function to
+its original shape (a relative-capable return) to reproduce the bug, and the
+real-bind cells now use an ABSOLUTE home spelled from the same cwd.
 """
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import os
 import socket as socket_mod
 import sys
@@ -73,12 +83,7 @@ DAEMON_PY_PATH = DAEMON_DIR / "engram-surface-daemon.py"
 # stripping it back to the pre-fix shape -- if this function's shape ever
 # changes, the falsification control fails loudly instead of silently
 # testing nothing.
-_POST_FIX_RETURN = (
-    "    return os.path.abspath(\n"
-    "        os.environ.get(\"ENGRAM_HOME\")\n"
-    "        or os.path.expanduser(\"~/.engram\")\n"
-    "    )\n"
-)
+_POST_FIX_RETURN = "    return str(engram_home_or_exit())\n"
 
 # The pre-fix body (byte-for-byte what shipped before gh#2695's fix --
 # verified against `git show origin/dev~1:.../engram-surface-daemon.py`
@@ -101,7 +106,7 @@ def _make_pre_fix_source_text() -> str:
     test's own assert rather than silently no-opping the falsification)."""
     source_text = DAEMON_PY_PATH.read_text()
     assert _POST_FIX_RETURN in source_text, (
-        "expected post-fix `return os.path.abspath(...)` body not found in "
+        "expected post-fix `return str(engram_home_or_exit())` body not found in "
         "engram-surface-daemon.py -- _resolve_engram_home()'s shape changed "
         "(update this test's _POST_FIX_RETURN to match)"
     )
@@ -123,6 +128,38 @@ def _load_module_from_text(source_text: str, dest_path: Path, module_name: str):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _load_prefix_control(copy_dir: Path, module_name: str):
+    """Load the pre-fix copy of the daemon (the refusal reverted) from copy_dir.
+
+    The copy imports _hooklib, which refuses a relative ENGRAM_HOME at import
+    (exit 0). So _hooklib is loaded FIRST, with an absolute ENGRAM_HOME, and
+    cached in sys.modules; the env is then restored (relative) for the exec of
+    the daemon copy itself, which is the thing under test."""
+    (copy_dir / "_hooklib.py").write_text((DAEMON_DIR / "_hooklib.py").read_text())
+    saved_env = os.environ.get("ENGRAM_HOME")
+    saved_mod = sys.modules.get("_hooklib")
+    os.environ["ENGRAM_HOME"] = str(copy_dir)
+    try:
+        spec = importlib.util.spec_from_file_location("_hooklib", str(copy_dir / "_hooklib.py"))
+        lib = importlib.util.module_from_spec(spec)
+        sys.modules["_hooklib"] = lib
+        spec.loader.exec_module(lib)
+    finally:
+        if saved_env is None:
+            os.environ.pop("ENGRAM_HOME", None)
+        else:
+            os.environ["ENGRAM_HOME"] = saved_env
+    try:
+        return _load_module_from_text(
+            _make_pre_fix_source_text(), copy_dir / "engram-surface-daemon.py", module_name
+        )
+    finally:
+        if saved_mod is None:
+            sys.modules.pop("_hooklib", None)
+        else:
+            sys.modules["_hooklib"] = saved_mod
 
 
 def _load_real_daemon_module():
@@ -182,14 +219,18 @@ class TestResolveEngramHomeDirectReturn(unittest.TestCase):
         else:
             os.environ["ENGRAM_HOME"] = self._orig_engram_home
 
-    def test_relative_engram_home_resolves_absolute(self):
+    def test_relative_engram_home_is_refused_not_resolved(self):
+        """#3863 6b: a relative ENGRAM_HOME is refused (one stderr line naming it,
+        exit 0), never turned into a path against this process's cwd."""
         os.environ["ENGRAM_HOME"] = "some/relative/home"
-        result = self.mod._resolve_engram_home()
-        self.assertTrue(
-            os.path.isabs(result),
-            f"expected an absolute path, got: {result!r}",
-        )
-        self.assertEqual(result, os.path.abspath("some/relative/home"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            self.mod._resolve_engram_home()
+        self.assertEqual(cm.exception.code, 0)
+        lines = [ln for ln in err.getvalue().splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 1, err.getvalue())
+        self.assertIn("some/relative/home", lines[0])
+        self.assertIn("must be an absolute path", lines[0])
 
     def test_already_absolute_engram_home_unchanged(self):
         """Spec item 4: the common (and only currently-shipped) case --
@@ -278,6 +319,10 @@ class TestRelativeEngramHomeBindRecordsAbsolutePath(_RealBindFixture):
     value)."""
 
     def test_bind_through_relative_home_records_absolute_path(self):
+        # #3863 6b: the relative spelling is refused now (see
+        # TestRelativeHomeIsRefusedBeforeAnyBind); the bind cell uses the ABSOLUTE
+        # form of the same directory, spelled from the same cwd.
+        os.environ["ENGRAM_HOME"] = str(self.tmp / self.RELATIVE_HOME_NAME)
         mod = _load_real_daemon_module()
 
         # Module-level ENGRAM_HOME/SOCKET_PATH were computed once, at
@@ -308,6 +353,61 @@ class TestRelativeEngramHomeBindRecordsAbsolutePath(_RealBindFixture):
         self.assertNotIn(relative_literal, recorded)
 
 
+class TestRelativeHomeIsRefusedBeforeAnyBind(unittest.TestCase):
+    """#3863 6b: with a RELATIVE ENGRAM_HOME the shipped daemon exits 0 at load,
+    before it computes SOCKET_PATH or binds anything. Runs on every platform
+    (no /proc needed)."""
+
+    def test_loading_the_daemon_under_a_relative_home_exits_zero_and_binds_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td).resolve()
+            orig_cwd = os.getcwd()
+            orig_env = os.environ.get("ENGRAM_HOME")
+            os.chdir(tmp)
+            os.environ["ENGRAM_HOME"] = "relhome"
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    _load_real_daemon_module()
+            finally:
+                os.chdir(orig_cwd)
+                if orig_env is None:
+                    os.environ.pop("ENGRAM_HOME", None)
+                else:
+                    os.environ["ENGRAM_HOME"] = orig_env
+            self.assertEqual(cm.exception.code, 0)
+            self.assertIn("relhome", err.getvalue())
+            self.assertEqual(sorted(p.name for p in tmp.iterdir()), [], "nothing may be created")
+
+
+class TestFalsificationPreFixStillComputesARelativePath(unittest.TestCase):
+    """Permanent falsification control, runs everywhere: with the refusal
+    mechanically reverted (see _make_pre_fix_source_text) the same relative
+    ENGRAM_HOME yields a RELATIVE ENGRAM_HOME and SOCKET_PATH - the root of
+    gh#2695 - so the refusal cell above would have gone red against it."""
+
+    def test_prefix_copy_has_a_relative_socket_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td).resolve()
+            copy_dir = tmp / "prefix_copy_text"
+            copy_dir.mkdir()
+            orig_cwd = os.getcwd()
+            orig_env = os.environ.get("ENGRAM_HOME")
+            os.chdir(tmp)
+            os.environ["ENGRAM_HOME"] = "relhome"
+            try:
+                mod = _load_prefix_control(copy_dir, "engram_surface_daemon_prefix_text_control")
+            finally:
+                os.chdir(orig_cwd)
+                if orig_env is None:
+                    os.environ.pop("ENGRAM_HOME", None)
+                else:
+                    os.environ["ENGRAM_HOME"] = orig_env
+            self.assertFalse(os.path.isabs(mod.ENGRAM_HOME), mod.ENGRAM_HOME)
+            self.assertEqual(mod.ENGRAM_HOME, "relhome")
+            self.assertFalse(os.path.isabs(mod.SOCKET_PATH), mod.SOCKET_PATH)
+
+
 class TestFalsificationPreFixRecordsRelativePath(_RealBindFixture):
     """Spec item 2 -- permanent falsification control: with the abspath()
     wrapping mechanically reverted (see _make_pre_fix_source_text), the
@@ -316,17 +416,9 @@ class TestFalsificationPreFixRecordsRelativePath(_RealBindFixture):
     modifying the shipped file."""
 
     def test_prefix_module_binds_relative_path(self):
-        pre_fix_source = _make_pre_fix_source_text()
-        # Written next to a copy of _hooklib.py so the pre-fix module's own
-        # `from _hooklib import resolve_runtime_dir` resolves identically
-        # to the real module's.
         copy_dir = self.tmp / "prefix_copy"
         copy_dir.mkdir()
-        (copy_dir / "_hooklib.py").write_text((DAEMON_DIR / "_hooklib.py").read_text())
-        dest = copy_dir / "engram-surface-daemon.py"
-        mod = _load_module_from_text(
-            pre_fix_source, dest, "engram_surface_daemon_prefix_control"
-        )
+        mod = _load_prefix_control(copy_dir, "engram_surface_daemon_prefix_control")
 
         self.assertFalse(
             os.path.isabs(mod.ENGRAM_HOME),
@@ -368,14 +460,9 @@ class TestGuardPathTextMatchIntegration(_RealBindFixture):
     the `rel.sock` (relative, "match FAILS") side."""
 
     def test_guard_fails_open_on_prefix_relative_bind(self):
-        pre_fix_source = _make_pre_fix_source_text()
         copy_dir = self.tmp / "prefix_copy_guard"
         copy_dir.mkdir()
-        (copy_dir / "_hooklib.py").write_text((DAEMON_DIR / "_hooklib.py").read_text())
-        dest = copy_dir / "engram-surface-daemon.py"
-        mod = _load_module_from_text(
-            pre_fix_source, dest, "engram_surface_daemon_prefix_guard_control"
-        )
+        mod = _load_prefix_control(copy_dir, "engram_surface_daemon_prefix_guard_control")
         self._bind(mod.SOCKET_PATH)
 
         # The guard's own comparison target: the ABSOLUTE form of the same
@@ -391,6 +478,7 @@ class TestGuardPathTextMatchIntegration(_RealBindFixture):
         )
 
     def test_guard_identifies_live_holder_on_fixed_absolute_bind(self):
+        os.environ["ENGRAM_HOME"] = str(self.tmp / self.RELATIVE_HOME_NAME)  # #3863 6b: absolute form
         mod = _load_real_daemon_module()
         self._bind(mod.SOCKET_PATH)
 

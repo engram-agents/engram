@@ -34,6 +34,7 @@ from typing import Optional
 
 import engram_core as core
 import engram_restamp
+import engram_moment_cursor
 from engram_log_emitter import Emitter, emit_if_initialized
 
 # alpha #2574 WS5: engram_telemetry_store.py ships at tier=convenience (WS1's
@@ -2260,20 +2261,15 @@ def _select_and_render_person_moment(
     record together, so the cursor only moves when the moment is ACTUALLY
     shown (per issue #1940 / Kepler's design comment).
 
-    Re-reads metadata fresh from the DB right before writing (rather than
-    trusting a caller-supplied snapshot, which may be stale relative to
-    special_moments' own FIFO capacity-rotation in _add_special_moment_impl —
-    a DIFFERENT mechanism this function does not touch) and writes back the
-    FULL metadata dict with only special_moment_cursor changed — never a
-    partial dict, which would silently clobber pronouns/relation/aliases/
-    field_traces/etc. This narrows but does not eliminate the read-modify-
-    write race against a concurrent engram_add_special_moment /
-    engram_update_person call (both of which do their own read-then-write of
-    the same metadata blob with no CAS) — judged low-risk in practice since
-    render and person-edit are different call paths that rarely race within
-    the same second; flagged in the PR body rather than solved with a
-    transaction, since ADD/UPDATE_PERSON's own existing writes have the same
-    non-atomic shape and this function is no worse than that precedent.
+    Re-reads metadata fresh from the DB (the moment list may be stale
+    relative to special_moments' own FIFO capacity-rotation in
+    _add_special_moment_impl — a DIFFERENT mechanism this function does not
+    touch), then advances the cursor with the shared compare-and-set
+    engram_moment_cursor.advance_moment_cursor FROM the cursor it read
+    (#3856): one SQL statement that touches only that key, so a concurrent
+    engram_add_special_moment / engram_update_person edit is not lost and two
+    concurrent fires never skip a moment. On `stale` (someone advanced
+    first) the moment still renders.
 
     special_moment_cursor is an ever-incrementing counter, modulo'd against
     the CURRENT list length at selection time rather than stored pre-wrapped,
@@ -2295,9 +2291,7 @@ def _select_and_render_person_moment(
         return None
     if _person_moment_in_cooldown(node_id):
         return None
-    cursor = meta.get("special_moment_cursor")
-    if not isinstance(cursor, int):
-        cursor = 0
+    cursor = engram_moment_cursor.read_cursor(meta.get("special_moment_cursor"))
     idx = cursor % len(moments)
     moment = moments[idx]
     if not isinstance(moment, dict):
@@ -2306,11 +2300,9 @@ def _select_and_render_person_moment(
     if not description:
         return None
     try:
-        meta["special_moment_cursor"] = cursor + 1
-        conn.execute(
-            "UPDATE nodes SET metadata = ? WHERE id = ?",
-            (json.dumps(meta), node_id),
-        )
+        # #3856: compare-and-set FROM the cursor this moment was selected at; `stale` (someone advanced
+        # first) is not an error -- the moment still renders, as before.
+        engram_moment_cursor.advance_moment_cursor(conn, node_id, cursor)
         conn.commit()
     except Exception:
         pass  # best-effort cursor persistence; moment still renders below
@@ -2572,7 +2564,7 @@ def _surface_impl(
                     _moments = _pmeta.get("special_moments")
                     if isinstance(_moments, list) and _moments:
                         entry["special_moments"] = _moments
-                        entry["special_moment_cursor"] = _pmeta.get("special_moment_cursor", 0)
+                        entry["special_moment_cursor"] = engram_moment_cursor.read_cursor(_pmeta.get("special_moment_cursor"))
                 special.append(entry)
         special = special[:3]
 

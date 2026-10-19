@@ -484,7 +484,31 @@ _LINE_KEY = _re.compile(r":\d+$")
 # idf template (cbfeed19...) is no longer reachable from any hook root and is gone.
 # #3742: the focused-ids read gained ORDER BY focused_at (087e3f55... -> 8fd6a2ad...); a SQL
 # change legitimately moves its own key.
+# #3824 (U12): the first tools/ template (33b71137...), tools/reconcile_lesson_demotions.py:find_candidates.
+# #3862 (U14): the second, tools/cohort_dispatch.py:_fetch_nodes (6b8a8373...), the registry's one json_each form.
+# #3879 (U16): the three regenerate-embeddings reads: the NULL count (f0cd101d...), the NULL id list (605333c4...)
+# and the per-node embedding-text row (99da5d73...), sites tools/engram-regenerate-embeddings.py:_owner_*.
+# #3880 (U17): the dream master CLI's four statements, tools/dream_master_batch.py (safety row, the two coverage
+# aggregates, the null-embedding count).
+# #3921: the weakest-load-bearing ranking's seven statements, tools/weakest_load_bearing.py (reached from the
+# root `rank`: live nodes, premise edges, contested, pending markers, direct premises, node detail, evidence).
 _FROZEN_TEMPLATE_KEYS = frozenset({
+    "b3a2d1ab2b1a718bce83ce77bb8362f0b59d94677d8c9026e49a1e957ca06e97",
+    "05bd2f3941a89717b037e9d113acd015bd2dec4851c13fb120af5d781e56fedc",
+    "c4c336fb9802f92e244bed1ab36b75acd83db33fc04a07015a3e9c344893a1d7",
+    "52fbda88135f730c72dd9b99a25b49a5bdca690ec6afd99d44f0110251a3974c",
+    "5ae1d203ba0fc1fe6c359dffc2ee37c0be6d4b33cab8f8a8da24108c79c70d84",
+    "0268e1aaf4c8ab7eb47f1f2727d2d8785bb56d5c155c532dd27e0c367894507e",
+    "5d20068d948c7f26fbda3c1aba1bb024044429ca0fa87a888ebcf0e3bfbe8c1d",
+    "f0cd101df2bf713d48b6fa7557bcfc2ac76f978ed1d552e3c94e4ca82359cfd5",
+    "605333c4d1e12407862ff5f039a4a27289380a1f01469e87456170af0f921842",
+    "99da5d73eb6250a34c5c08a053ca046d0c294cb82ac443558806325c570c66da",
+    "dd2e6cba6f21ce5e503ad4df8038b2ad0dd1373b9b78eb080db4f53f2969165f",
+    "dc7290f0179bba722b17491571d6a68c5b113e0626d9af887f5b782da09e9ea7",
+    "d1307e3a9b89504f39d0a1d8d166c8537d1cda8e676008c74309aa5a7c83e762",
+    "3f93aa0253bf488bb49c711fe84f003f891e319b7d1ff110806fbfb50abeb035",
+    "6b8a8373e14ff561366c89e57e0e982e4d416d952e467ae44ef2e13e9eb0cd42",
+    "33b7113738f7310b25d3b9c6e109b18c3a790ba8c54879c25e8a774757703e3e",
     "8fd6a2adcab8ffb85efcf1e3b22c7433632f94a0d820c60cf37d4ba22ebd154e",
     "0280b9b584a3522d55be45f09ec258c28ec2d8b8e0e3cf80267097f593c71462",
     "931a3e96f918cd7e53e396133a92bfb3330843c4041d026c78b99ce950be6ab7",
@@ -500,7 +524,6 @@ _FROZEN_TEMPLATE_KEYS = frozenset({
     "6fccf1c54a61e35899981e3f084277c3dbe091705d6609ab3abb46e73972551b",
     "9f6da2c7f988f5d2d40b7cdf6afe3d1fef5abb993b47a72b16fe9070cc0c3c05",
     "a3df78eb81c6fb751522f885a0748cd416c1e268e35b3669cf24f84da1591b65",
-    "a6822015a92b0414ca8b443bd623c4ce9be6f7637068d72f69e8711e2e6c1427",
     "a81aff5ee1cfc444b6044abc808bcd8573b6e94d771e505c5119ca6678b91046",
     "b1f125b644a0e5d0a8d1e81628d17e7b876b5dbce632cfbb7a4ba48732623765",
     "c7ebb686c91c35f89f5bff3b5f1e3b9a746e2568d35a35899fc868a0d8d99223",

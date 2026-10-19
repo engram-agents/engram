@@ -98,6 +98,119 @@ except Exception:  # pragma: no cover
 _VEC_BACKEND_AVAILABLE = _SQLITE_VEC_IMPORT_OK
 
 
+# #3898: where the embedder (and the polarity cross-encoder) run. SentenceTransformer
+# silently takes CUDA whenever a GPU exists (about 750 MB VRAM per process, no
+# latency gain for single-query recall), so the default is CPU. `auto` is exactly
+# the pre-#3898 behaviour. Read at LOAD time from the same accessor as
+# `embedding.model`, so a config edit applies on the next load.
+EMBEDDING_DEVICES = ("cpu", "cuda", "auto")
+EMBEDDING_DEFAULT_DEVICE = "cpu"
+EMBEDDING_DEFAULT_CPU_THREADS = 4
+
+
+def _embedding_device_settings() -> tuple:
+    """Return (device, cpu_threads) from `embedding.device` / `embedding.cpu_threads`.
+
+    An absent key takes its default silently. A present but invalid value takes
+    the default and prints ONE stderr line naming it; embeddings are never
+    disabled over a bad setting.
+    """
+    try:
+        cfg = _get_embedding_config()
+    except Exception:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    device = EMBEDDING_DEFAULT_DEVICE
+    if "device" in cfg:
+        raw = cfg["device"]
+        if isinstance(raw, str) and raw in EMBEDDING_DEVICES:
+            device = raw
+        else:
+            print(
+                f"[engram] embedding.device {raw!r} is not valid (allowed: "
+                f"{', '.join(EMBEDDING_DEVICES)}); using {EMBEDDING_DEFAULT_DEVICE}",
+                file=sys.stderr,
+            )
+    threads = EMBEDDING_DEFAULT_CPU_THREADS
+    if "cpu_threads" in cfg:
+        raw = cfg["cpu_threads"]
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
+            threads = raw
+        else:
+            print(
+                f"[engram] embedding.cpu_threads {raw!r} is not valid (an integer "
+                f">= 1); using {EMBEDDING_DEFAULT_CPU_THREADS}",
+                file=sys.stderr,
+            )
+    return device, threads
+
+
+def _cuda_available_or_notice() -> bool:
+    """For `embedding.device: cuda` ONLY: True if CUDA is visible; otherwise
+    print the one-line notice and return False (the caller loads on CPU)."""
+    try:
+        import torch  # noqa: WPS433
+    except Exception:
+        print(
+            "[engram] embedding.device is cuda but torch could not be imported; using cpu",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        ok = bool(torch.cuda.is_available())
+    except Exception:
+        ok = False
+    if not ok:
+        print(
+            "[engram] embedding.device is cuda but no CUDA device is visible; using cpu",
+            file=sys.stderr,
+        )
+    return ok
+
+
+def _sentence_transformer_device_kwargs(device: str) -> dict:
+    """kwargs for SentenceTransformer(...). `auto` passes none (library default,
+    the pre-#3898 behaviour). `cpu` never probes CUDA (the CUDA context is most
+    of the VRAM cost, so no probe may run before the model is on CPU)."""
+    if device == "auto":
+        return {}
+    if device == "cuda" and _cuda_available_or_notice():
+        return {"device": "cuda"}
+    return {"device": "cpu"}
+
+
+def _cross_encoder_device(device: str) -> str:
+    """Device string for the polarity CrossEncoder, from `embedding.device`."""
+    if device == "cpu":
+        return "cpu"
+    if device == "cuda":
+        return "cuda" if _cuda_available_or_notice() else "cpu"
+    import torch  # noqa: WPS433
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _cap_cpu_threads(model, threads: int) -> None:
+    """Apply torch.set_num_threads(threads) iff the LOADED model is on CPU.
+
+    Decided from the model itself, not a second CUDA probe. A model that does
+    not report a device is left alone. The cap is process-global.
+    """
+    dev = getattr(model, "device", None)
+    if dev is None:
+        dev = getattr(getattr(model, "model", None), "device", None)
+    if dev is None:
+        return
+    dev_type = getattr(dev, "type", None) or str(dev).split(":")[0]
+    if dev_type != "cpu":
+        return
+    try:
+        import torch  # noqa: WPS433
+        torch.set_num_threads(threads)
+    except Exception:
+        pass
+
+
 class EmbeddingManager:
     """Manages embedding model loading and computation.
 
@@ -160,6 +273,8 @@ class EmbeddingManager:
                 return
             try:
                 from sentence_transformers import SentenceTransformer
+                device, cpu_threads = _embedding_device_settings()
+                st_kwargs = _sentence_transformer_device_kwargs(device)
                 try:
                     # #1682: offline-first load. A cached model loads with
                     # ZERO HuggingFace Hub network traffic — no online
@@ -167,7 +282,9 @@ class EmbeddingManager:
                     # cannot happen on the common warm-cache path (every
                     # daemon warmup / MCP server restart after the first
                     # successful load).
-                    self._model = SentenceTransformer(model_name, local_files_only=True)
+                    self._model = SentenceTransformer(
+                        model_name, local_files_only=True, **st_kwargs
+                    )
                 except Exception:
                     # Cache-miss: this install does NOT pre-download the
                     # embedder model as a discrete install step (verified —
@@ -188,7 +305,8 @@ class EmbeddingManager:
                         f"subsequent loads are offline.",
                         file=_sys.stderr,
                     )
-                    self._model = SentenceTransformer(model_name)
+                    self._model = SentenceTransformer(model_name, **st_kwargs)
+                _cap_cpu_threads(self._model, cpu_threads)
                 self._model_name = model_name
             except ImportError:
                 self._model = None
@@ -280,7 +398,12 @@ class EmbeddingManager:
                 return
             try:
                 from sentence_transformers import SentenceTransformer
-                self._model = SentenceTransformer(model_name, local_files_only=True)
+                device, cpu_threads = _embedding_device_settings()
+                self._model = SentenceTransformer(
+                    model_name, local_files_only=True,
+                    **_sentence_transformer_device_kwargs(device),
+                )
+                _cap_cpu_threads(self._model, cpu_threads)
                 self._model_name = model_name
             except Exception as e:
                 import sys
@@ -7395,6 +7518,7 @@ def _get_embedding_restore_flag(conn: sqlite3.Connection) -> dict:
 
 def _finalize_embedding_restore_flag(
     conn: sqlite3.Connection, counts: dict, *, respect_lease: bool = False,
+    embedder_available: "bool | None" = None,
 ) -> None:
     """Clear/set the restore-completeness flag from a FRESH state re-count,
     not from the just-completed pass's own tally (#3075 C5 round 4,
@@ -7428,6 +7552,13 @@ def _finalize_embedding_restore_flag(
     _run_db_one_time_setup now shares). A state re-count can't be fooled
     by WHY a node stayed NULL, so neither round 2's nor round 3's
     failure mode is representable through this function any more.
+
+    `embedder_available` (#3879): who answers "is the embedder available?". `None` (the default; both existing
+    callers) probes `_embedder.is_available()` in THIS process, exactly as before. A bool is used as given and
+    `_embedder` is NOT touched: the engramd owner finishes a regeneration pass the tool ran, and the embedder the
+    cause is about is the TOOL's (the one it just used), not the owner's. Probing in the owner would import
+    sentence_transformers / torch into a process whose design keeps the model out (MEASURED ~4 s resident), and
+    could pick a different cause than the direct path when the two environments differ.
 
     `counts` is still accepted (both call sites already have it in scope
     from their own pass) and used only for a diagnostic WARNING when it
@@ -7473,7 +7604,9 @@ def _finalize_embedding_restore_flag(
     # explicit ~3477 instruction to this structurally identical branch --
     # same unreachable cause, same reasoning (the toggle is retired; the
     # startup gate already refuses to start with `enabled: false`).
-    if not _embedder.is_available():
+    if embedder_available is None:
+        embedder_available = _embedder.is_available()
+    if not embedder_available:
         _cause = "embedder-unavailable"
     else:
         _cause = "per-node-failures"
@@ -7783,9 +7916,10 @@ class _NLIClassifier:
             # systems (libnvrtc-builtins.so issue); set defensively.
             os.environ.setdefault("PYTORCH_JIT", "0")
             from sentence_transformers import CrossEncoder  # noqa: WPS433
-            import torch  # noqa: WPS433
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device_setting, cpu_threads = _embedding_device_settings()
+            device = _cross_encoder_device(device_setting)
             self._model = CrossEncoder(model_name, device=device)
+            _cap_cpu_threads(self._model, cpu_threads)
             # ModernCE-large + EttinX use this label order; assume same for
             # other cross-encoder/nli-* models (verified empirically in
             # the 2026-05-10 NLI polarity bake-off).

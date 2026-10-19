@@ -27,6 +27,13 @@ Subcommands (the shell switches on what they print; they never raise, and exit 0
       `parse_launchctl_print`. launchctl missing or timing out is ambiguous. `no_gui_domain`
       (#3780) means this uid has no launchd GUI domain at all (no GUI login session), so a
       bootstrap into it cannot work: the shell says so and launches nothing.
+  serving <home>               -> serving | notserving:<what was observed> | ambiguous:<why>
+      #3736: the owner is asked to answer a `ping` on its own socket, because "a pid is
+      alive" is not "the owner serves". The WHOLE probe is bounded by
+      PROBE_TOTAL_BOUND_SECONDS (a named constant; the helper owns the bound because stock
+      macOS has no GNU `timeout`), and `notserving:` is the budgeted claim "no healthy ping
+      answer within T" -- never "the owner does not serve". A bundle without an importable
+      engramd_client is `ambiguous:`, which claims nothing about the owner. Launches nothing.
   report <home> <message>      -> one JSON object on stdout
       Appends `[ts] [start-engramd-owner] <message>` (the FULL message) to
       `<home>/engramd-owner.log` when that is a regular file (silently skipped
@@ -42,8 +49,10 @@ Subcommands (the shell switches on what they print; they never raise, and exit 0
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -61,6 +70,16 @@ _MARKER = "engramd_owner"
 LAUNCHD_BOUND_SECONDS = 3.0  # `launchctl print` is killed past this (Linux's systemctl bound is 3 s too)
 _NO_GUI_DOMAIN_TEXT = "Domain does not support specified action"  # rc 125's stderr, measured (#3780)
 _HEAD_CLIP = 600  # chars of message injected; the full message always goes to the log
+
+# The serving probe (#3736). T is the WHOLE probe's budget and it is a named constant, because
+# every claim the probe makes is relative to it: it establishes "the owner did not answer a ping
+# within T", which is the distinction from the exited state (#3736 cell d) -- never "the owner
+# does not serve", which a bounded probe cannot establish. The helper owns the bound because
+# stock macOS has no GNU `timeout` and the shell must not do arithmetic on a deadline; the hook's
+# own timeout is 15 s and the launch watch already spends ~1.2 s of it, so T leaves room.
+PROBE_TOTAL_BOUND_SECONDS = 1.5
+PROBE_CALL_BOUND_SECONDS = 0.5  # one attempt; a bound-but-silent socket cannot eat the window
+PROBE_POLL_SECONDS = 0.25       # between attempts: an owner that is still binding gets the window
 
 
 def _kind_of(mode: int) -> str:
@@ -86,21 +105,36 @@ def _non_regular_kind(path: str):
     return f"symlink-to-{kind}" if stat.S_ISLNK(lst.st_mode) else kind
 
 
-def _import_pidfile():
-    """engram_pidfile, from the plugin root (the parent of hooks/ in the flattened bundle,
-    two up from hooks/claude/ in the source tree) when it is there, else wherever the
-    interpreter finds it. Raises ImportError when it cannot be found at all."""
+def _import_sibling(filename: str, module: str):
+    """A sibling module of this file, by the ONE walk-parents rule both importers use.
+
+    The plugin root is the parent of hooks/ in the flattened bundle and two up from hooks/claude/ in
+    the source tree; the first ancestor holding `filename` is inserted into sys.path (so the sibling
+    module's own imports resolve from there too). Never a fixed parents[N]: the build flattens
+    hooks/claude/* -> hooks/*, and a source-calibrated index overshoots in the deployed tree. Falls
+    back to wherever the interpreter finds it; raises ImportError when it cannot be found at all.
+    ONE copy, because a layout fix applied to one importer and not the other is the drift the
+    walk-parents rule exists to prevent (round-2 F5)."""
     for up in (1, 2):
         cand = _this_dir
         for _ in range(up):
             cand = os.path.dirname(cand)
-        if os.path.isfile(os.path.join(cand, "engram_pidfile.py")):
+        if os.path.isfile(os.path.join(cand, filename)):
             if cand not in sys.path:
                 sys.path.insert(0, cand)
             break
-    import engram_pidfile
+    return importlib.import_module(module)
 
-    return engram_pidfile
+
+def _import_pidfile():
+    """engram_pidfile, resolved by `_import_sibling` (which owns the walk-parents rule)."""
+    return _import_sibling("engram_pidfile.py", "engram_pidfile")
+
+
+def _import_client():
+    """engramd_client, resolved by `_import_sibling`. The client's own `import engram_pidfile`
+    resolves from the same directory, which is why the walk is the one that inserts into sys.path."""
+    return _import_sibling("engramd_client.py", "engramd_client")
 
 
 def live(home: str) -> str:
@@ -121,6 +155,75 @@ def live(home: str) -> str:
     except Exception as exc:
         return f"ambiguous:engram_pidfile failed ({type(exc).__name__})"
     return "alive" if pid is not None else "none"
+
+
+def _probe_why(ec, result) -> str:
+    """One short ASCII token for a ping that did not come back healthy: the client's own
+    Unavailable reason code (`down`, `timeout`, `protocol`, `busy`, `busy_or_stuck`, `local`,
+    `internal`), or `rejected-<reason>` when the owner answered and refused the ping. Sanitised:
+    this token lands in a one-line report, and a hostile or broken owner must not be able to
+    break the line."""
+    reason = getattr(result, "reason", None)
+    token = f"rejected-{reason or 'unknown'}" if isinstance(result, ec.Rejected) else str(reason or "unknown")
+    return re.sub(r"[^A-Za-z0-9_-]", "-", token)[:40] or "unknown"
+
+
+def serving(home: str) -> str:
+    """Does the owner for `home` actually SERVE? (#3736)
+
+    serving | notserving:<what was observed> | ambiguous:<why>
+
+    Asking the owner's own socket for a `ping` -- the method engramd_owner registers for exactly
+    this and the one method in its NO_STORE_METHODS (it touches no store, so it is exempt from the
+    displacement guard): a pid that exists is not an owner that serves, and only the socket can
+    tell the difference. NEVER RAISES and never launches anything (a second owner against a live
+    pid is the hazard this hook exists to avoid); the caller decides what to report.
+
+    The whole probe is bounded by PROBE_TOTAL_BOUND_SECONDS, structurally: the deadline is computed
+    once here and every attempt is armed with the remaining budget, so a silent or trickling peer
+    cannot extend the call. Attempts are repeated until the deadline, because an owner that has just
+    been launched may still be binding its socket -- a single immediate connect would misreport that
+    transient as "not serving". The loop runs its whole budget (it never gives up one poll early),
+    so the window this report names is the window the probe actually used (#3736 round-2 F2).
+
+    `notserving:` is a BUDGETED claim -- "no healthy ping answer within T" -- and can never be
+    "the owner does not serve". `ambiguous:` means the probe itself could not run (no importable
+    client): nothing is claimed about the owner, and the caller must not read it as not-serving.
+    """
+    try:
+        ec = _import_client()
+    except Exception as exc:  # a bundle without the client: say so, claim nothing about the owner
+        return f"ambiguous:engramd_client not importable ({type(exc).__name__})"
+    try:
+        sock = ec.socket_path_for_home(home)
+    except Exception as exc:
+        return f"ambiguous:engramd_client failed ({type(exc).__name__})"
+    deadline = time.monotonic() + PROBE_TOTAL_BOUND_SECONDS
+    why = "unknown"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # Armed with the remaining budget once less than one PROBE_CALL_BOUND_SECONDS is left, so
+        # the probe keeps ASKING to its deadline rather than sleeping past its last question. That
+        # is what makes "within PROBE_TOTAL_BOUND_SECONDS" true of the probe that ran: the earlier
+        # form broke out one poll early, realizing ~1.25 s of the 1.5 s it printed (#3736 F2).
+        try:
+            result = ec.read(
+                "ping", {}, timeout=min(remaining, PROBE_CALL_BOUND_SECONDS), socket_path=sock
+            )
+        except Exception as exc:  # `read` is raise-free by construction; this is the belt
+            return f"ambiguous:engramd_client raised ({type(exc).__name__})"
+        if isinstance(result, ec.Ok):
+            return "serving"
+        why = _probe_why(ec, result)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(PROBE_POLL_SECONDS, remaining))
+    return (
+        f"notserving:no healthy ping answer within {PROBE_TOTAL_BOUND_SECONDS:g}s (last: {why})"
+    )
 
 
 def parse_launchctl_print(rc: int, stdout: str, stderr: str) -> str:
@@ -248,6 +351,8 @@ def main(argv: list) -> int:
             print(live(argv[2]))
         elif cmd == "launchd_state" and len(argv) == 3:
             print(launchd_state(argv[2]))
+        elif cmd == "serving" and len(argv) == 3:
+            print(serving(argv[2]))
         elif cmd == "report" and len(argv) == 4:
             report(argv[2], argv[3])
         elif cmd == "launch" and len(argv) == 5:

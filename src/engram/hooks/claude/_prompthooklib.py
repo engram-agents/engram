@@ -87,6 +87,36 @@ from pathlib import Path
 from typing import Optional
 
 
+def engram_home() -> Path:
+    """The ENGRAM home for this layer: $ENGRAM_HOME (default ~/.engram) when set and non-empty,
+    expanded and absolute; a RELATIVE value is refused (ValueError naming it). A copy of
+    tools/_owner_read.engram_home() (the canonical body), kept
+    here because the prompt hooks must keep running when _hooklib cannot be imported;
+    tests/test_engram_home_parity_3863.py pins the copies AST-identical (the #3628 pattern)."""
+    raw = os.environ.get("ENGRAM_HOME") or "~/.engram"
+    home = os.path.expanduser(raw)
+    if not os.path.isabs(home):
+        raise ValueError("ENGRAM_HOME must be an absolute path, got %r" % (raw,))
+    return Path(os.path.abspath(home))
+
+
+def engram_home_or_exit() -> Path:
+    """engram_home() for a hook's import-time use: a refused (relative) ENGRAM_HOME is a fail-open
+    exit, not a traceback. The hook prints ONE stderr line naming the value, writes nothing and exits 0
+    (Claude Code reads any other non-zero exit as a non-blocking error and still shows the trace)."""
+    try:
+        home = engram_home()
+    except ValueError as exc:
+        sys.stderr.write("engram hook: %s; doing nothing\n" % (exc,))
+        sys.exit(0)
+    raw = os.environ.get("ENGRAM_HOME")
+    if raw and raw != str(home):
+        # `~/x` or `/a/../b`: modules that read the raw env var (the log emitter, the telemetry store)
+        # must see the same absolute home, not a literal `~` directory under the cwd.
+        os.environ["ENGRAM_HOME"] = str(home)
+    return home
+
+
 _JSON_TYPE_NAMES = (
     (bool, "boolean"), (int, "number"), (float, "number"),
     (str, "string"), (list, "array"), (type(None), "null"),

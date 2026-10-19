@@ -94,6 +94,9 @@ def _run_snippet(snippet: str, home: Path) -> subprocess.CompletedProcess:
     is observable on stdout."""
     script = snippet + '\necho "$PREV_SLEEP"\n'
     env = dict(os.environ)
+    # The snippet resolves the marker as ${ENGRAM_HOME:-$HOME/.engram} (#3863);
+    # drop any ENGRAM_HOME the test session exports so HOME is what plants it.
+    env.pop("ENGRAM_HOME", None)
     env["HOME"] = str(home)
     return subprocess.run(
         ["bash", "-c", script],
@@ -160,6 +163,28 @@ class TestBoundarySnippetExecution:
 
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == timestamp
+
+    def test_c1b_marker_is_read_from_ENGRAM_HOME_not_the_default_home(self, tmp_path):
+        """#3863: with a custom ENGRAM_HOME the snippet reads the marker THERE.
+        The default $HOME/.engram holds a DECOY marker with a different
+        timestamp, so a snippet that hard-codes the default reads the decoy."""
+        decoy_home = tmp_path / "decoy_home"
+        decoy_home.mkdir()
+        _write_marker(decoy_home, {"completed_at": "1999-01-01T00:00:00+00:00"})
+        custom = tmp_path / "custom_engram"
+        (custom / "sessions").mkdir(parents=True)
+        (custom / "sessions" / "last-sleep-success.json").write_text(
+            json.dumps({"completed_at": "2026-02-02T02:02:02+00:00"})
+        )
+        snippet = _extract_boundary_snippet(SKILL.read_text(encoding="utf-8"))
+        env = dict(os.environ, HOME=str(decoy_home), ENGRAM_HOME=str(custom))
+        result = subprocess.run(
+            ["bash", "-c", snippet + '\necho "$PREV_SLEEP"\n'],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "2026-02-02T02:02:02+00:00"
 
     def test_c2_marker_exists_but_missing_completed_at_fails_visibly(self, tmp_path):
         """C2 (discrimination control): a marker file EXISTS but does NOT

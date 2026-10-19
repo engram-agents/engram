@@ -223,6 +223,7 @@ def run_updates(tmp_path):
         cursor = tmp_path / "cursor"
         env = os.environ.copy()
         env["HOME"] = str(home)
+        env["ENGRAM_HOME"] = str(home / ".engram")
         env["FORUM_UPDATES_NO_REAP"] = "1"
         env["FORUM_UPDATES_CURSOR_FILE"] = str(cursor)
         env["FORUM_UPDATES_POLL_SECONDS"] = poll_seconds
@@ -245,6 +246,7 @@ def run_mention(tmp_path):
         seen = tmp_path / "seen"
         env = os.environ.copy()
         env["HOME"] = str(home)
+        env["ENGRAM_HOME"] = str(home / ".engram")
         env["FORUM_MENTION_NO_REAP"] = "1"
         env["FORUM_MENTION_SEEN_FILE"] = str(seen)
         env["FORUM_MENTION_POLL_SECONDS"] = poll_seconds

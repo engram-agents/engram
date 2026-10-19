@@ -9,6 +9,14 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+- **The compaction mod is on by default once installed (part of #3640).**
+  Lei ruled on 2026-10-18, after a one-day trial on one seat: 3 compactions
+  requested at nap boundaries, 3 fired 41 to 49 seconds later, none anywhere
+  else. `userConfig.enabled` in `tools/mods/engram-compaction` now defaults to
+  true; `enabled: false` still registers nothing. The mod remains a separate
+  user-installed plugin (convenience tier), so nothing changes for a seat that
+  has not installed it.
+
 ## [v0.5.3] - 2026-10-15
 
 ### Substrate (recall, forgetting, search, graph integrity)

@@ -320,14 +320,35 @@ def discover_seats(root_glob: str = DEFAULT_SEAT_GLOB) -> list[str]:
     return sorted(p for p in _glob.glob(root_glob) if os.path.isdir(p))
 
 
+def _engram_dir_for_seat(seat_home: str) -> str:
+    """The seat's ENGRAM dir: its trusted registry entry (#3863 PR 5, R3)
+    first, else the default ``<seat>/.engram``.  An absent or untrusted entry
+    falls back silently; this function never raises."""
+    try:
+        try:
+            from engram_home_registry import read_entry
+        except ImportError:
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            from engram_home_registry import read_entry
+        registered = read_entry(seat_home)
+        if registered:
+            return registered
+    except Exception:
+        pass
+    return os.path.join(seat_home, ".engram")
+
+
 def plan_for_seat(seat_home: str, viz_operator: str) -> SeatPlan:
-    """PURE: only ``os.path.isdir`` (a read-only existence check), no
-    subprocess calls, no writes. Mirrors the issue's own one-liner exactly:
+    """PURE: only read-only filesystem checks (``os.path.isdir``, ``os.lstat``,
+    ``os.stat``), no subprocess calls, no writes. Mirrors the issue's own one-liner exactly:
     a single recursive ``setfacl -R -m`` call carrying the named access
     entry, an explicit access mask, the named DEFAULT entry (inheritance
     for files created later), and an explicit default mask — see the
     module docstring's "Mask fix" section for what this buys and doesn't."""
-    snapshots_dir = os.path.join(seat_home, ".engram", "health-snapshots")
+    snapshots_dir = os.path.join(_engram_dir_for_seat(seat_home), "health-snapshots")
+    default_snapshots = os.path.join(seat_home, ".engram", "health-snapshots")
+    if not os.path.isdir(snapshots_dir) and os.path.isdir(default_snapshots):
+        snapshots_dir = default_snapshots  # the glob/default stays the fallback (R3)
     if not os.path.isdir(snapshots_dir):
         return SeatPlan(
             seat_home=seat_home,
@@ -336,6 +357,31 @@ def plan_for_seat(seat_home: str, viz_operator: str) -> SeatPlan:
                 "no .engram/health-snapshots directory (ENGRAM not "
                 "installed here, or no health checkpoint has run yet)"
             ),
+        )
+    # The grant is a recursive setfacl run as a privileged user, so the target
+    # must be the seat's own directory: a symlink (to anywhere) or a directory
+    # owned by someone else would turn the grant into a grant on a foreign tree.
+    # Applies to the registered and the default path alike (#3885 security read).
+    # BOUND, stated so nobody leans on this more than it gives: these are
+    # preflight checks at PLAN time. They do not make the later setfacl run
+    # race-safe (the directory or an ancestor can change between plan and apply)
+    # and they do not prove every descendant under the directory is seat-owned.
+    # A real privilege boundary would run the grant under the seat's identity.
+    try:
+        if stat.S_ISLNK(os.lstat(snapshots_dir).st_mode):
+            reason = f"{snapshots_dir} is a symlink"
+        else:
+            seat_uid = os.stat(seat_home).st_uid
+            dir_uid = os.stat(snapshots_dir).st_uid
+            reason = (None if dir_uid == seat_uid else
+                      f"{snapshots_dir} is owned by uid {dir_uid}, not the seat's uid {seat_uid}")
+    except OSError as e:
+        reason = f"cannot inspect {snapshots_dir} ({e.__class__.__name__})"
+    if reason:
+        return SeatPlan(
+            seat_home=seat_home,
+            snapshots_dir=snapshots_dir,
+            skip_reason=f"refusing to grant: {reason}",
         )
     entries = f"u:{viz_operator}:rX,m::rX,d:u:{viz_operator}:rX,d:m::rX"
     return SeatPlan(

@@ -3,7 +3,7 @@
 I'm in multi-agent mode (shared state under `/home/agents-shared/`). Pick the
 channel by the situation, then load its skill before using the CLI.
 
-Channel choice is governed by `comms_surface` in `~/.engram/config.json` (absent
+Channel choice is governed by `comms_surface` in `~/.engram/config.json` (under `$ENGRAM_HOME`, default `~/.engram`) (absent
 = `forum`). Check it before routing; do not route from memory.
 
 **Under `comms_surface: forum`** (the default; every install without the umwelt

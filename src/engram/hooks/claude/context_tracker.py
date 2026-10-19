@@ -40,11 +40,9 @@ from _hooklib import (
     split_probe_reason,
     write_probe_unknown_stderr,
 )
+from _hooklib import engram_home_or_exit
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or os.path.expanduser("~/.engram")
-)
+ENGRAM_HOME = str(engram_home_or_exit())
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")  # legacy; unused
 LAST_COMPACT_PATH = os.path.join(ENGRAM_HOME, "last-compact-at.json")
 LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
@@ -555,7 +553,7 @@ def format_drowsiness(usage: dict) -> str:
                 f"[Drowsiness: {pct:.0%} — loop mode: compaction is near and the summary "
                 f"will not carry your work across it. BEFORE starting this burst, capture "
                 f"the LAST one: (1) append its arc to today's "
-                f"~/.engram/history/YYYY-MM-DD.md, (2) write the nodes for anything you "
+                f"{ENGRAM_HOME}/history/YYYY-MM-DD.md, (2) write the nodes for anything you "
                 f"decided or found, (3) nap to checkpoint it. Anything left only in "
                 f"context is lost at the boundary, not deferred. The in-flight burst "
                 f"cannot be saved either way — so capture the completed one and keep "

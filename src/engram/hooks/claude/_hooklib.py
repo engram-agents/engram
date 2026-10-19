@@ -59,6 +59,36 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 
+def engram_home() -> Path:
+    """The ENGRAM home for this layer: $ENGRAM_HOME (default ~/.engram) when set and non-empty,
+    expanded and absolute; a RELATIVE value is refused (ValueError naming it). A copy of
+    tools/_owner_read.engram_home() (the canonical body), kept
+    here because this layer must stay self-contained; tests/test_engram_home_parity_3863.py pins
+    the two AST-identical (the #3628 pattern)."""
+    raw = os.environ.get("ENGRAM_HOME") or "~/.engram"
+    home = os.path.expanduser(raw)
+    if not os.path.isabs(home):
+        raise ValueError("ENGRAM_HOME must be an absolute path, got %r" % (raw,))
+    return Path(os.path.abspath(home))
+
+
+def engram_home_or_exit() -> Path:
+    """engram_home() for a hook's import-time use: a refused (relative) ENGRAM_HOME is a fail-open
+    exit, not a traceback. The hook prints ONE stderr line naming the value, writes nothing and exits 0
+    (Claude Code reads any other non-zero exit as a non-blocking error and still shows the trace)."""
+    try:
+        home = engram_home()
+    except ValueError as exc:
+        sys.stderr.write("engram hook: %s; doing nothing\n" % (exc,))
+        sys.exit(0)
+    raw = os.environ.get("ENGRAM_HOME")
+    if raw and raw != str(home):
+        # `~/x` or `/a/../b`: modules that read the raw env var (the log emitter, the telemetry store)
+        # must see the same absolute home, not a literal `~` directory under the cwd.
+        os.environ["ENGRAM_HOME"] = str(home)
+    return home
+
+
 def resolve_tools_dir(marker_filename: str) -> Optional[Path]:
     """Resolve `tools/` across both build topologies and add it to sys.path.
 
@@ -377,9 +407,7 @@ def atomic_write_json(path, data, *, indent=None, encoding=None):
 # `head_budget` numbers a caller passes in here as `budget` / uses to pick
 # its own `target`.
 
-_ENGRAM_HOME_FOR_OVERFLOW_PLACEHOLDER = os.environ.get("ENGRAM_HOME") or str(
-    Path.home() / ".engram"
-)
+_ENGRAM_HOME_FOR_OVERFLOW_PLACEHOLDER = str(engram_home_or_exit())
 
 
 def _placeholder_overflow_path() -> str:
@@ -909,12 +937,13 @@ def emit_context(
 #
 #   <probeDir>/<session_id>/routes/<route>.jsonl
 #
-# probeDir rule (matches the mod exactly: config.ts DEFAULTS.probeDir =
-# '~/.engram/probe/mods-recall', record.ts resolveProbeDir = HOME-relative):
-# `$HOME/.engram/probe/mods-recall`, via Path.home(). NOT $ENGRAM_HOME -- the
-# mod derives its root from the user's home directory, so ENGRAM_HOME (which
-# may point at another data dir) must not move the ledger away from the
-# directory the probe is actually reading.
+# probeDir rule (mirrors the mod's default: config.ts DEFAULTS.probeDir
+# '~/.engram/probe/mods-recall', resolved by record.ts defaultProbeDir against
+# ENGRAM_HOME when that is set): `<engram_home()>/probe/mods-recall`, via the
+# layer's engram_home(). The mod and this hook must name the same directory,
+# or the hook records nothing for a probe that is live (alpha #3863, 6b; the
+# mod side and the hook side are pinned together by
+# tests/test_route_probe_dir_parity_3863.py).
 #
 # Opt-in by presence: nothing is written unless `<probeDir>/<session_id>/`
 # already exists. Absence of that directory means "the probe is not live for
@@ -934,8 +963,6 @@ def emit_context(
 import hashlib as _hashlib
 import time as _time
 
-ROUTE_PROBE_SUBPATH = (".engram", "probe", "mods-recall")
-
 # Per-candidate signal fields read from the route's own response. A field the
 # response does not carry for a candidate is null, and its name is listed once
 # in the line's `missing_signals`.
@@ -949,8 +976,8 @@ _ROUTE_SIGNAL_ALIASES = {"utility": ("utility", "utility_score")}
 
 
 def route_probe_dir() -> Path:
-    """`$HOME/.engram/probe/mods-recall` (see the block comment above)."""
-    return Path.home().joinpath(*ROUTE_PROBE_SUBPATH)
+    """`<engram_home()>/probe/mods-recall` (see the block comment above)."""
+    return engram_home() / "probe" / "mods-recall"
 
 
 def prompt_fire_key(prompt_text: str) -> str:
@@ -1634,7 +1661,7 @@ def prune_shown_records(
     return deleted
 
 
-def _focused_ids(read_conn=None) -> tuple:
+def _focused_ids(read_conn=None, on_failure=None) -> tuple:
     """(ids, readable): ids currently focused, read-only, one query. Any DB
     problem (missing file, locked, no column) -> readable False.
 
@@ -1643,7 +1670,12 @@ def _focused_ids(read_conn=None) -> tuple:
     is used as-is and never closed here, and a failure on it reads False with
     no fallback to a direct open. Without it: one direct read-only open,
     closed in a `finally`, as before. One execute either way, so the read
-    registry keeps one site for this template."""
+    registry keeps one site for this template.
+
+    `on_failure` (#3827): an optional `cb(exc)` called ONCE with the exception when the read
+    fails, so a caller can record WHY (the owner hooks record an owner failure). It changes
+    nothing else: the return is still `(set(), False)`, and a callback that raises is ignored
+    (fail-open: the resolver drops nothing, only the silence goes)."""
     conn = None
     owned = read_conn is None
     try:
@@ -1662,7 +1694,12 @@ def _focused_ids(read_conn=None) -> tuple:
             "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1 ORDER BY focused_at"
         ).fetchall()
         return {r[0] for r in rows}, True
-    except Exception:
+    except Exception as exc:
+        if on_failure is not None:
+            try:
+                on_failure(exc)
+            except Exception:
+                pass
         return set(), False
     finally:
         if owned and conn is not None:
@@ -1696,7 +1733,8 @@ def _in_context_for(node_id, created_at, *, shown_ids, shown_ok, started,
     return False, None
 
 
-def make_in_context_resolver(session_id, routes_dir: Path, marker=None, read_conn=None):
+def make_in_context_resolver(session_id, routes_dir: Path, marker=None, read_conn=None,
+                             on_failure=None):
     """Build `resolve(node_id, created_at) -> (in_context, why)` for ONE ledger
     write. Reads the sources once, so call it BEFORE appending the line
     being written (a node is never "already shown" by the very fire being
@@ -1714,7 +1752,7 @@ def make_in_context_resolver(session_id, routes_dir: Path, marker=None, read_con
     marker is written. A session that has not compacted (count 0 or unknown)
     never opens the transcript. `marker` is the already-read marker dict (read
     here when omitted). `read_conn` is passed to `_focused_ids` (the only
-    source that reads the store; see there)."""
+    source that reads the store; see there); `on_failure` rides with it (only when given)."""
     if marker is None:
         marker = _read_session_marker(session_id)
     count = _marker_compaction_count(marker)
@@ -1725,7 +1763,8 @@ def make_in_context_resolver(session_id, routes_dir: Path, marker=None, read_con
     shown_ids = set(shown_ids) | rec_ids
     shown_ok = shown_ok and rec_ok
     started = _parse_iso_utc(marker.get("started_at")) if marker else None
-    focused, focused_ok = _focused_ids(read_conn=read_conn)
+    focused, focused_ok = (_focused_ids(read_conn=read_conn) if on_failure is None
+                           else _focused_ids(read_conn=read_conn, on_failure=on_failure))
     if count:
         summary_ids, summary_ok = _last_summary_ids(marker.get("transcript_path"))
     else:
@@ -1758,19 +1797,20 @@ def in_context_exclusion_enabled(engram_home=None) -> bool:
         return False
 
 
-def build_exclusion_resolver(session_id, read_conn=None):
+def build_exclusion_resolver(session_id, read_conn=None, on_failure=None):
     """`resolve(node_id, created_at) -> (in_context, why)` for the live
     exclusion, or None when it cannot be built (fail-open: None = drop nothing).
     Same resolver the probe ledger uses; the probe routes dir is read only when
-    the probe is live for this session. `read_conn`: see `_focused_ids`."""
+    the probe is live for this session. `read_conn`, `on_failure`: see `_focused_ids`."""
     try:
         sid = _safe_session_name(session_id)
         if sid is None:
             return None
         marker = _read_session_marker(sid)
+        kw = {} if on_failure is None else {"on_failure": on_failure}
         return make_in_context_resolver(
             sid, route_probe_dir() / sid / "routes", marker=marker,
-            read_conn=read_conn)
+            read_conn=read_conn, **kw)
     except Exception:
         return None
 
@@ -1864,11 +1904,12 @@ def write_route_ledger(
     default_cut: str = "cap",
     extra: Optional[dict] = None,
     read_conn=None,
+    on_failure=None,
 ) -> None:
     """Append one ledger line (see block comment). Never raises; at most one
     stderr line. `cut_reasons` maps id -> the route's own cut name; any
     candidate neither shown nor named gets `default_cut`. `read_conn`: passed
-    to the in-context resolver (see `_focused_ids`)."""
+    to the in-context resolver (see `_focused_ids`), `on_failure` likewise."""
     try:
         sid = session_id if isinstance(session_id, str) else ""
         # "unknown" is the hooks' own missing-session placeholder, and a
@@ -1885,8 +1926,9 @@ def write_route_ledger(
             return  # probe not live for this session: true optional, silent
         # Read the in_context sources BEFORE this line is appended (C4).
         marker = _read_session_marker(sid)
+        kw = {} if on_failure is None else {"on_failure": on_failure}
         resolver = make_in_context_resolver(sid, session_dir / "routes", marker=marker,
-                                            read_conn=read_conn)
+                                            read_conn=read_conn, **kw)
         candidates, missing = build_route_candidates(result, in_context=resolver)
         shown_set = set(shown)
         cut = {

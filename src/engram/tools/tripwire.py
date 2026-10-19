@@ -36,7 +36,8 @@ Config inference (when --approver is omitted):
   self_lineage contains "sonnet" → approver = peer field
   Otherwise or peer missing      → error, exit 2
 
-Config file: ~/.engram/config.json  (override: ENGRAM_CONFIG_PATH env var)
+Config file: config.json in the ENGRAM home, $ENGRAM_HOME/config.json (~/.engram when unset)
+  (override: ENGRAM_CONFIG_PATH env var)
 
 Exit codes:
   0 = falsifiable-grade  (traces found)
@@ -54,6 +55,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (U14, #3862; #3863). `tools` is
+# found one directory above this file in BOTH layouts (src/engram/ and the deployed plugin root).
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
+
 EXIT_OK = 0
 EXIT_SAY_SO = 1
 EXIT_ERROR = 2
@@ -65,11 +73,11 @@ EXIT_ERROR = 2
 
 def _get_config_path() -> Path:
     env = os.environ.get("ENGRAM_CONFIG_PATH")
-    return Path(env) if env else (Path.home() / ".engram" / "config.json")
+    return Path(env) if env else (owner_read.engram_home() / "config.json")
 
 
 def _load_config() -> dict:
-    """Load ~/.engram/config.json (or ENGRAM_CONFIG_PATH env var)."""
+    """Load config.json from the ENGRAM home (or ENGRAM_CONFIG_PATH env var)."""
     p = _get_config_path()
     try:
         return json.loads(p.read_text())
@@ -326,7 +334,7 @@ def main() -> None:
         metavar="login",
         help=(
             "GitHub username to check. If omitted, inferred from "
-            "~/.engram/config.json based on self_lineage."
+            "config.json in the ENGRAM home based on self_lineage."
         ),
     )
     check_p.add_argument(

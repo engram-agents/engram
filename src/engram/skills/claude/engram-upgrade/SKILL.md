@@ -7,16 +7,16 @@ description: Use when upgrading an existing plugin-mode ENGRAM install to newer 
 
 Upgrading a plugin-mode ENGRAM install is mechanically simple but keeps one well-known failure mode: **trusting context-impression that a step is done** instead of verifying its completion checkpoint. This skill codifies each step + its verification so nothing is silently skipped.
 
-**The architecture that makes plugin upgrades simple:** your *identity surfaces* (`~/.claude/CLAUDE.md`, warm-briefing) are **never touched** by a plugin upgrade. Your *data* (`~/.engram/knowledge.db`, history, diary, sessions) is preserved, but — as of #2170 — is **not guaranteed byte-identical**: the new `server.py` may run a one-shot schema migration on its first DB connection (gated by `PRAGMA user_version`, so each migration fires at most once) that rewrites rows in place. Concretely, #2170's rung 4 recomputes `claim` for every `feeling_report` node, drops and rebuilds the `nodes_fts` search index, and re-embeds every node in the graph. Before any such migration writes a single row, the server automatically takes a restore point at `~/.engram/db-backup/pre-migration-v<N>-<timestamp>.db` — alongside the pre-existing daily hot-copy ladder (`~/.engram/db-backup/knowledge-YYYYMMDD.db`, one per calendar day, 7-day window). See Step 5's restore procedure if anything looks wrong after reconnecting. The *code* (server, hooks, tools, skills, agents) lives in the plugin tree at `~/.engram/marketplace/plugins/engram/`. **For a Claude `directory`-source local marketplace — the standard plugin install — that source tree IS the live code**: `CLAUDE_PLUGIN_ROOT` resolves to it and Claude Code invokes hooks/skills/tools directly from it (verified 2026-06-28 by live hook-fire instrumentation). So once Step 3's `install-local-marketplace.sh` rebuilds the source tree, **new hook / tool / skill code is already live** (re-read per invocation) — there is no separate "pull into cache" step for them. The host plugin *cache* (`~/.claude/plugins/cache/...`) + `installed_plugins.json` are version bookkeeping for hooks/skills/tools — **but NOT for agents.** THREE code kinds need an explicit post-rebuild activation action (Step 4/5): (1) a changed **agent spec** (`agents/*.md`) — sub-agent/fairy definitions load from the plugin *cache* `installPath`, NOT the source tree, so they need a **cache refresh + `/reload-plugins`** (this is the #1639 fix — the mixed load-model is detailed in Step 4); (2) a changed **`server.py`** (the running MCP process is from session start → `/mcp` reconnect); (3) a changed **`hooks.json` registration** (read at session start → `/reload-plugins`, restart as fallback). **Codex differs:** `codex plugin add` copies the build into Codex's own cache (`~/.codex/plugins/cache/...`) — so the Codex flow is cache-refresh-based, and you use the installed cache for helper paths (e.g. `~/.codex/plugins/cache/.../tools/verify_quote.py`). For a session actually running **Codex 0.154.0+**, the activation behavior is no longer an inference: the official [0.154.0 release notes](https://github.com/openai/codex/releases/tag/rust-v0.154.0) state that existing sessions pick up newly installed plugin tools and refresh skills and hooks after external plugin upgrades or rollbacks. The narrower [openai/codex#42990](https://github.com/openai/codex/pull/42990) regression test specifically covers hook refresh at turn construction across an upgrade and rollback. On a managed seat, do not infer the running version from `codex --version` alone: a persistent app-server may still predate a newly installed CLI. Keep the boundary exact: this establishes in-session refresh for **tools, skills, and hooks**; it does **not** establish that an already-running MCP subprocess is replaced, nor that agent specs refresh. Older Codex versions retain the conservative restart/resume path. Note: **do not carry an answer about `~/.engram/hooks` and `~/.engram/tools` — carry a check.** Whether they are symlinks into the plugin tree or real directories depends on how your seat was installed. `bootstrap.py` creates those symlinks so scatter-era references to the paths keep resolving, and where they exist an upgrade does not touch them because it moves the *target*, not the link — which is exactly how a fix reaches them. But **bootstrap runs at bootstrap**: a seat that arrived by *migration* never executes it, so its `hooks` and `tools` are the pre-migration real directories that migration left in place — not a shadow that displaced a maintained symlink, because no symlink was ever maintained there. Either way that seat is pinned to whatever those directories last held (see #2557 / #2558). The trap is that on such a seat a flat "these are NOT symlinks" note reads as **accurate** — and that is the worse case, not the safer one: the reader checks, finds the note correct, and concludes the install is correctly shaped while it is in fact pinned. Where such a note is right, it is right for a reason unrelated to the install being right. **Check the state, not the history.** `test -L ~/.engram/tools` **and** `test -L ~/.engram/hooks` answer the only question that changes what you do, and they answer it directly. Check **both** — they are gated independently and can genuinely differ on one seat. Resist the urge to infer *whether bootstrap ever ran* from what is lying around — three successive revisions of this note got that inference wrong in three different ways, because the symlink step has more exits than it looks like: it is skipped **wholesale** when `ENGRAM_BOOTSTRAP_SKIP_SYMLINKS=1` (an intentional sandbox/benchmark mode, which gates both paths at once), and skipped **per-path** when the corresponding plugin directory is missing — `tools/` and `hooks/` are independently gated, so whichever plugin directory is missing, the other is still symlinked and the seat is left **mixed** (the same holds in either direction: a missing plugin `tools/` still symlinks `hooks/`, and a missing plugin `hooks/` still symlinks `tools/`). In every one of those cases the rest of bootstrap runs to completion while a pre-existing real directory is left untouched and no backup is written. The one direction that does hold, for either path: `~/.engram/tools.scatter-backup` **existing** proves the symlink step ran and displaced a real directory there, and `~/.engram/hooks.scatter-backup` proves the identical thing for `hooks` — `bootstrap.py` creates each backup with the same logic in its own path's branch, independently. Either backup's absence proves nothing at all about its own path. That check must be `test -L` and **not** an inode comparison: a symlink has its own inode, so `stat` without `-L` reports a different inode for a symlink and for an independent directory alike, which is true and cannot distinguish the two. (`stat -c` is GNU-only; it errors on macOS, where the form is `stat -f%i`. `test -L` is portable.) Note also that `test -L` on the directory is not the whole answer: a real directory can hold per-file symlinks into the plugin, so a seat can be partly current and partly pinned, and the two halves have to be checked separately.
+**The architecture that makes plugin upgrades simple:** your *identity surfaces* (`~/.claude/CLAUDE.md`, warm-briefing) are **never touched** by a plugin upgrade. Your *data* (`${ENGRAM_HOME:-$HOME/.engram}/knowledge.db`, history, diary, sessions) is preserved, but — as of #2170 — is **not guaranteed byte-identical**: the new `server.py` may run a one-shot schema migration on its first DB connection (gated by `PRAGMA user_version`, so each migration fires at most once) that rewrites rows in place. Concretely, #2170's rung 4 recomputes `claim` for every `feeling_report` node, drops and rebuilds the `nodes_fts` search index, and re-embeds every node in the graph. Before any such migration writes a single row, the server automatically takes a restore point at `${ENGRAM_HOME:-$HOME/.engram}/db-backup/pre-migration-v<N>-<timestamp>.db` — alongside the pre-existing daily hot-copy ladder (`${ENGRAM_HOME:-$HOME/.engram}/db-backup/knowledge-YYYYMMDD.db`, one per calendar day, 7-day window). See Step 5's restore procedure if anything looks wrong after reconnecting. The *code* (server, hooks, tools, skills, agents) lives in the plugin tree at `${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram/`. **For a Claude `directory`-source local marketplace — the standard plugin install — that source tree IS the live code**: `CLAUDE_PLUGIN_ROOT` resolves to it and Claude Code invokes hooks/skills/tools directly from it (verified 2026-06-28 by live hook-fire instrumentation). So once Step 3's `install-local-marketplace.sh` rebuilds the source tree, **new hook / tool / skill code is already live** (re-read per invocation) — there is no separate "pull into cache" step for them. The host plugin *cache* (`~/.claude/plugins/cache/...`) + `installed_plugins.json` are version bookkeeping for hooks/skills/tools — **but NOT for agents.** THREE code kinds need an explicit post-rebuild activation action (Step 4/5): (1) a changed **agent spec** (`agents/*.md`) — sub-agent/fairy definitions load from the plugin *cache* `installPath`, NOT the source tree, so they need a **cache refresh + `/reload-plugins`** (this is the #1639 fix — the mixed load-model is detailed in Step 4); (2) a changed **`server.py`** (the running MCP process is from session start → `/mcp` reconnect); (3) a changed **`hooks.json` registration** (read at session start → `/reload-plugins`, restart as fallback). **Codex differs:** `codex plugin add` copies the build into Codex's own cache (`~/.codex/plugins/cache/...`) — so the Codex flow is cache-refresh-based, and you use the installed cache for helper paths (e.g. `~/.codex/plugins/cache/.../tools/verify_quote.py`). For a session actually running **Codex 0.154.0+**, the activation behavior is no longer an inference: the official [0.154.0 release notes](https://github.com/openai/codex/releases/tag/rust-v0.154.0) state that existing sessions pick up newly installed plugin tools and refresh skills and hooks after external plugin upgrades or rollbacks. The narrower [openai/codex#42990](https://github.com/openai/codex/pull/42990) regression test specifically covers hook refresh at turn construction across an upgrade and rollback. On a managed seat, do not infer the running version from `codex --version` alone: a persistent app-server may still predate a newly installed CLI. Keep the boundary exact: this establishes in-session refresh for **tools, skills, and hooks**; it does **not** establish that an already-running MCP subprocess is replaced, nor that agent specs refresh. Older Codex versions retain the conservative restart/resume path. Note: **do not carry an answer about `${ENGRAM_HOME:-$HOME/.engram}/hooks` and `${ENGRAM_HOME:-$HOME/.engram}/tools` — carry a check.** Whether they are symlinks into the plugin tree or real directories depends on how your seat was installed. `bootstrap.py` creates those symlinks so scatter-era references to the paths keep resolving, and where they exist an upgrade does not touch them because it moves the *target*, not the link — which is exactly how a fix reaches them. But **bootstrap runs at bootstrap**: a seat that arrived by *migration* never executes it, so its `hooks` and `tools` are the pre-migration real directories that migration left in place — not a shadow that displaced a maintained symlink, because no symlink was ever maintained there. Either way that seat is pinned to whatever those directories last held (see #2557 / #2558). The trap is that on such a seat a flat "these are NOT symlinks" note reads as **accurate** — and that is the worse case, not the safer one: the reader checks, finds the note correct, and concludes the install is correctly shaped while it is in fact pinned. Where such a note is right, it is right for a reason unrelated to the install being right. **Check the state, not the history.** `test -L ${ENGRAM_HOME:-$HOME/.engram}/tools` **and** `test -L ${ENGRAM_HOME:-$HOME/.engram}/hooks` answer the only question that changes what you do, and they answer it directly. Check **both** — they are gated independently and can genuinely differ on one seat. Resist the urge to infer *whether bootstrap ever ran* from what is lying around — three successive revisions of this note got that inference wrong in three different ways, because the symlink step has more exits than it looks like: it is skipped **wholesale** when `ENGRAM_BOOTSTRAP_SKIP_SYMLINKS=1` (an intentional sandbox/benchmark mode, which gates both paths at once), and skipped **per-path** when the corresponding plugin directory is missing — `tools/` and `hooks/` are independently gated, so whichever plugin directory is missing, the other is still symlinked and the seat is left **mixed** (the same holds in either direction: a missing plugin `tools/` still symlinks `hooks/`, and a missing plugin `hooks/` still symlinks `tools/`). In every one of those cases the rest of bootstrap runs to completion while a pre-existing real directory is left untouched and no backup is written. The one direction that does hold, for either path: `${ENGRAM_HOME:-$HOME/.engram}/tools.scatter-backup` **existing** proves the symlink step ran and displaced a real directory there, and `${ENGRAM_HOME:-$HOME/.engram}/hooks.scatter-backup` proves the identical thing for `hooks` — `bootstrap.py` creates each backup with the same logic in its own path's branch, independently. Either backup's absence proves nothing at all about its own path. That check must be `test -L` and **not** an inode comparison: a symlink has its own inode, so `stat` without `-L` reports a different inode for a symlink and for an independent directory alike, which is true and cannot distinguish the two. (`stat -c` is GNU-only; it errors on macOS, where the form is `stat -f%i`. `test -L` is portable.) Note also that `test -L` on the directory is not the whole answer: a real directory can hold per-file symlinks into the plugin, so a seat can be partly current and partly pinned, and the two halves have to be checked separately.
 
 **The one residual hard gate:** the host identity surface is user-scope identity and is *not* plugin-owned. On Claude this is usually `~/.claude/CLAUDE.md` rendered from `templates/template.CLAUDE.md`; on Codex it may be `~/.codex/config.toml` instructions plus project `AGENTS.md` from `templates/template.AGENTS.md`. If the relevant upstream template changed, the live surface needs an inverse-merge (Step 7). That's the load-bearing judgment step of this skill.
 
 **When to use:**
-- The install is plugin-mode (`~/.engram/marketplace/plugins/engram/plugin.json` exists) and the user wants newer alpha code without losing data
+- The install is plugin-mode (`${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram/plugin.json` exists) and the user wants newer alpha code without losing data
 - A new alpha commit shipped a feature/fix the user wants
 
 **When NOT to use:**
-- Fresh install (no `~/.engram/knowledge.db`) — that's the plugin install path in the README, not an upgrade
+- Fresh install (no `${ENGRAM_HOME:-$HOME/.engram}/knowledge.db`) — that's the plugin install path in the README, not an upgrade
 - **Still on the scatter layout?** The scatter upgrade path (`tools/deploy.sh` rsync) is **retired**. The supported move is the one-time scatter→plugin migration: `tools/migrate-to-plugin.sh` (see its `--help`; needs the human present for the `/plugin install` + `/mcp` pauses)
 - The MCP server has been actively crashing and you suspect data corruption — that's an `engram-surgical` call, not a routine upgrade
 
@@ -25,15 +25,15 @@ Upgrading a plugin-mode ENGRAM install is mechanically simple but keeps one well
 ## Step 0 — Confirm plugin mode + existing data
 
 ```bash
-ls -la ~/.engram/knowledge.db
-ls ~/.engram/marketplace/plugins/engram/plugin.json
+ls -la "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.db
+ls "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram/plugin.json
 ```
 
 Both must exist. If `knowledge.db` exists but the plugin marker does NOT, this is a scatter install — **stop**; the right procedure is `tools/migrate-to-plugin.sh` (one-time migration), not this skill.
 
 Surface to the user:
 
-> You're on the plugin install with an existing graph at `~/.engram/`. I can rebuild the local marketplace from newer alpha code — on Claude that source rebuild makes new hook/skill/tool code live immediately; **agent-spec changes additionally need a cache refresh (`/plugin marketplace update` + `/reload-plugins`), and `server.py` needs a `/mcp` reconnect** (all quick, at the end). On Codex it refreshes the Codex cache via `codex plugin add`. Your history, diary, and sessions are untouched; your graph is preserved but may be rewritten in place by an automatic, one-shot schema migration on first reconnect (a restore point is taken automatically first — see Step 5). Want me to proceed?
+> You're on the plugin install with an existing graph in your ENGRAM home (the `.engram` folder in your home directory unless you installed elsewhere). I can rebuild the local marketplace from newer alpha code — on Claude that source rebuild makes new hook/skill/tool code live immediately; **agent-spec changes additionally need a cache refresh (`/plugin marketplace update` + `/reload-plugins`), and `server.py` needs a `/mcp` reconnect** (all quick, at the end). On Codex it refreshes the Codex cache via `codex plugin add`. Your history, diary, and sessions are untouched; your graph is preserved but may be rewritten in place by an automatic, one-shot schema migration on first reconnect (a restore point is taken automatically first — see Step 5). Want me to proceed?
 
 Wait for an affirmative before continuing — the upgrade changes the running server + hooks behavior.
 
@@ -44,7 +44,7 @@ Wait for an affirmative before continuing — the upgrade changes the running se
 ## Step 1 — Locate the source tree + pre-flight
 
 ```bash
-SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version 2>/dev/null | cut -d= -f2-)
+SOURCE_DIR=$(grep '^deployed_from=' "${ENGRAM_HOME:-$HOME/.engram}"/.deployed-version 2>/dev/null | cut -d= -f2-)
 echo "source tree: $SOURCE_DIR"
 ```
 
@@ -85,12 +85,12 @@ If the working tree has uncommitted changes you didn't mean to ship, stash or co
 Read what you're about to apply BEFORE any mutation, so you can flag concerns and abort cleanly.
 
 ```bash
-SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
-DEPLOYED=$(grep '^alpha_sha=' ~/.engram/.deployed-version | cut -d= -f2-)
+SOURCE_DIR=$(grep '^deployed_from=' "${ENGRAM_HOME:-$HOME/.engram}"/.deployed-version | cut -d= -f2-)
+DEPLOYED=$(grep '^alpha_sha=' "${ENGRAM_HOME:-$HOME/.engram}"/.deployed-version | cut -d= -f2-)
 # Save the pre-upgrade SHA before Step 3 overwrites .deployed-version.
 # Step 3's install-local-marketplace.sh refreshes the marker to the new SHA,
 # so a fresh read in Step 7 yields base==head → false "no drift" (#1194).
-echo "$DEPLOYED" > ~/.engram/.upgrade-pre-sha
+echo "$DEPLOYED" > "${ENGRAM_HOME:-$HOME/.engram}"/.upgrade-pre-sha
 UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
 git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH"
 ```
@@ -100,14 +100,14 @@ git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH"
 - You may `gh pr view <N>` on at most ONE PR for depth. Do NOT loop over all PRs fetching bodies (token budget).
 - Write a ≤4-bullet summary: what surfaces are touched, anything deploy-fragile (`server.py` / hooks / migrations), anything user-facing. Surface it; pause on anything concerning.
 
-**Also note here** whether the CLAUDE.md render source appears in the change set — that pre-announces Step 7's gate. The rendered `~/.claude/CLAUDE.md` is assembled from a **single** upstream source: `templates/template.CLAUDE.md`. (`templates/compact-instructions.md` still ships but is Codex-only as of engram-alpha#2067 — it feeds `~/.engram/codex-compact-prompt.md` and `~/.codex/config.toml`'s `experimental_compact_prompt_file`, not the Claude render; see `docs/compaction-continuity.md`. On Codex, check it too — Step 7 below.) Check:
+**Also note here** whether the CLAUDE.md render source appears in the change set — that pre-announces Step 7's gate. The rendered `~/.claude/CLAUDE.md` is assembled from a **single** upstream source: `templates/template.CLAUDE.md`. (`templates/compact-instructions.md` still ships but is Codex-only as of engram-alpha#2067 — it feeds `${ENGRAM_HOME:-$HOME/.engram}/codex-compact-prompt.md` and `~/.codex/config.toml`'s `experimental_compact_prompt_file`, not the Claude render; see `docs/compaction-continuity.md`. On Codex, check it too — Step 7 below.) Check:
 
 ```bash
 UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
 git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH" -- src/engram/templates/template.CLAUDE.md
 ```
 
-**Checkpoint**: change-set summary surfaced + user confirmed proceed (or concern resolved) + CLAUDE.md-template-changed noted yes/no + pre-upgrade SHA saved to `~/.engram/.upgrade-pre-sha`.
+**Checkpoint**: change-set summary surfaced + user confirmed proceed (or concern resolved) + CLAUDE.md-template-changed noted yes/no + pre-upgrade SHA saved to `${ENGRAM_HOME:-$HOME/.engram}/.upgrade-pre-sha`.
 
 ---
 
@@ -116,19 +116,19 @@ git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH" -- src/e
 First identify the host target. In Codex sessions, use `codex`; otherwise default to `claude-code`.
 
 ```bash
-SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
+SOURCE_DIR=$(grep '^deployed_from=' "${ENGRAM_HOME:-$HOME/.engram}"/.deployed-version | cut -d= -f2-)
 cd "$SOURCE_DIR"
 TARGET=claude-code   # or: TARGET=codex in Codex sessions
 bash tools/install-local-marketplace.sh --target "$TARGET"
 ```
 
-This single script is the whole agent-side upgrade: it **reads your `config.json`** (`multi_agent`, `install_tier`) and **builds the plugin with those flags** plus the explicit host target (via `tools/build-plugin.sh`), then re-assembles `~/.engram/marketplace/` from the fresh `build/plugin/`. For Codex, it also runs `codex plugin add engram@engram-local` when `codex` is on PATH. Idempotent — safe to re-run.
+This single script is the whole agent-side upgrade: it **reads your `config.json`** (`multi_agent`, `install_tier`) and **builds the plugin with those flags** plus the explicit host target (via `tools/build-plugin.sh`), then re-assembles `${ENGRAM_HOME:-$HOME/.engram}/marketplace/` from the fresh `build/plugin/`. For Codex, it also runs `codex plugin add engram@engram-local` when `codex` is on PATH. Idempotent — safe to re-run.
 
 **Watch the build log for the feature-set lines** — this is where a silent mis-build would happen:
 - The tier/multi-agent line must match your install (e.g. `Tier: dev …, multi-agent: yes`). A multi-agent install that builds single-agent **silently drops** baton/letters/forum surfaces (#704 class).
-- If your `install_tier` is null/unset, the build falls back to the manifest default (`convenience`) — a dev-tier install would silently lose its dev tools (#707). Set `install_tier` in `~/.engram/config.json` before building if it's unset.
+- If your `install_tier` is null/unset, the build falls back to the manifest default (`convenience`) — a dev-tier install would silently lose its dev tools (#707). Set `install_tier` in `${ENGRAM_HOME:-$HOME/.engram}/config.json` before building if it's unset.
 
-**Checkpoint**: script exited 0 + marketplace re-assembled + the logged target/tier/multi-agent flags match the host and `~/.engram/config.json` + `platform.json` in the marketplace has the intended target + the `Version marker refreshed` line shows the new `alpha_sha` (the script maintains `~/.engram/.deployed-version` so Steps 2 and 7 stay anchored).
+**Checkpoint**: script exited 0 + marketplace re-assembled + the logged target/tier/multi-agent flags match the host and `${ENGRAM_HOME:-$HOME/.engram}/config.json` + `platform.json` in the marketplace has the intended target + the `Version marker refreshed` line shows the new `alpha_sha` (the script maintains `${ENGRAM_HOME:-$HOME/.engram}/.deployed-version` so Steps 2 and 7 stay anchored).
 
 ---
 
@@ -158,7 +158,7 @@ This single script is the whole agent-side upgrade: it **reads your `config.json
 **Codex:** `tools/install-local-marketplace.sh --target codex` runs `codex plugin add engram@engram-local` itself when `codex` is on PATH, copying the build into Codex's cache. When the session's running Codex runtime is **0.154.0+**, the next turn construction detects the external plugin change and refreshes the existing session's installed tools, skills, and hooks (the official [release-note guarantee](https://github.com/openai/codex/releases/tag/rust-v0.154.0); [openai/codex#42990](https://github.com/openai/codex/pull/42990) specifically regression-tests the hook-refresh subset at turn construction). A newer CLI binary beside an older persistent app-server does not satisfy that version gate. This is an activation guarantee for those three surfaces, not proof of the cache's internal load semantics, agent-spec refresh, or MCP-process replacement. Verify the cache actually changed as an install-integrity checkpoint:
 
 ```bash
-sha1sum ~/.engram/marketplace/plugins/engram/hooks/engram-stop-hook.py
+sha1sum "${ENGRAM_HOME:-$HOME/.engram}"/marketplace/plugins/engram/hooks/engram-stop-hook.py
 sha1sum ~/.codex/plugins/cache/engram-local/engram/0.1.0/hooks/engram-stop-hook.py
 cat ~/.codex/plugins/cache/engram-local/engram/0.1.0/platform.json
 ```
@@ -175,14 +175,14 @@ The plugin tree/cache now has the new `server.py`, but the running MCP server ma
 
 **Do NOT** kill the MCP subprocess yourself — the stdio-MCP contract is user-restart only; killing it from an agent breaks the harness transport.
 
-**Migration + restore procedure (#2181).** Reconnecting starts the new `server.py` process, and its first DB connection is where a pending schema migration (gated by `PRAGMA user_version`, so it fires at most once) actually runs — if Step 2's change set bumps that gate, this is when it happens, not at rebuild time in Step 3. Before any such migration writes a single row, the server automatically takes a binary restore point at `~/.engram/db-backup/pre-migration-v<N>-<timestamp>.db` (its own 3-copy rotation, separate from the daily `knowledge-YYYYMMDD.db` ladder). If the backup itself cannot be written (e.g. a full or read-only disk), the migration is skipped entirely and `PRAGMA user_version` is left unchanged, so it safely retries on the next reconnect — nothing is silently half-migrated.
+**Migration + restore procedure (#2181).** Reconnecting starts the new `server.py` process, and its first DB connection is where a pending schema migration (gated by `PRAGMA user_version`, so it fires at most once) actually runs — if Step 2's change set bumps that gate, this is when it happens, not at rebuild time in Step 3. Before any such migration writes a single row, the server automatically takes a binary restore point at `${ENGRAM_HOME:-$HOME/.engram}/db-backup/pre-migration-v<N>-<timestamp>.db` (its own 3-copy rotation, separate from the daily `knowledge-YYYYMMDD.db` ladder). If the backup itself cannot be written (e.g. a full or read-only disk), the migration is skipped entirely and `PRAGMA user_version` is left unchanged, so it safely retries on the next reconnect — nothing is silently half-migrated.
 
 If anything looks wrong after reconnecting (missing nodes, a query that used to work no longer does, `engram_stats` looks implausible in Step 8), **the order below matters — do not reorder it, and do not skip straight to the `cp`.** `knowledge.db` runs in WAL mode: recent writes live in a `knowledge.db-wal` sidecar beside the main file until a checkpoint folds them in, and any live connection can recreate that sidecar out from under a restore in progress. Copy the backup over `knowledge.db` while the server is still running (or while a stale `-wal` is still sitting next to it) and the next connection replays that `-wal` over the data you just restored — the restore silently comes half-undone, with no error anywhere. (This class of bug is easy to miss: a bare-file copy of a live SQLite DB can be hours stale and still open clean.)
 
 1. **Stop the MCP server process — before touching any file.** Tell the user: "Something looks wrong post-migration; please quit or restart Claude Code (don't relaunch yet) so I can restore from backup." (Same **Do NOT kill the subprocess yourself** rule as above — stopping it is a user action, not an agent action.) This step is what makes the rest of the procedure safe: while the server is alive it holds an open WAL-mode connection to `knowledge.db`, and a clean stop checkpoints that connection's WAL and removes `knowledge.db-wal` for you — which is why step 2 below is normally a no-op. It is not optional cleanup; it is the step that prevents the replay described above.
-2. **Check for leftover WAL/SHM sidecars, and remove them if present:** `ls ~/.engram/knowledge.db-wal ~/.engram/knowledge.db-shm 2>/dev/null`. After a clean stop in step 1 there normally are none — the checkpoint already removed them. If either file **is** still present, the previous shutdown was unclean, and this is exactly the case where restoring without removing them would replay stale writes over the restored data: `rm -f ~/.engram/knowledge.db-wal ~/.engram/knowledge.db-shm`.
-3. Pick the restore point: the newest `~/.engram/db-backup/pre-migration-v*.db` if one exists (it is the copy taken immediately before this migration); otherwise the newest `~/.engram/db-backup/knowledge-YYYYMMDD.db`.
-4. Copy it over the live DB, now that the server is stopped and no sidecar can reappear underneath it: `cp ~/.engram/db-backup/<chosen-file> ~/.engram/knowledge.db`.
+2. **Check for leftover WAL/SHM sidecars, and remove them if present:** `ls "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.db-wal "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.db-shm 2>/dev/null`. After a clean stop in step 1 there normally are none — the checkpoint already removed them. If either file **is** still present, the previous shutdown was unclean, and this is exactly the case where restoring without removing them would replay stale writes over the restored data: `rm -f "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.db-wal "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.db-shm`.
+3. Pick the restore point: the newest `${ENGRAM_HOME:-$HOME/.engram}/db-backup/pre-migration-v*.db` if one exists (it is the copy taken immediately before this migration); otherwise the newest `${ENGRAM_HOME:-$HOME/.engram}/db-backup/knowledge-YYYYMMDD.db`.
+4. Copy it over the live DB, now that the server is stopped and no sidecar can reappear underneath it: `cp "${ENGRAM_HOME:-$HOME/.engram}"/db-backup/<chosen-file> "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.db`.
 5. Relaunch/reconnect the MCP server (`/mcp`, or however the user brought it back in step 1) and re-verify with `engram_stats` (Step 8).
 
 **If Step 2's change set touched `hooks/hooks.json`, a `/mcp` reconnect is NOT enough** — `/mcp` reloads only the MCP server process, not the hook registration. Step 4's **`/reload-plugins`** re-registers hooks in-session (it reloaded 19 hooks in the #1639 case), so running the full Step-4 sequence should pick up a registration change; a **full Claude Code restart** is the conservative fallback if a dangling-file error (removed hook) or a silently-not-firing added hook persists after `/reload-plugins`. (The in-session `/reload-plugins` path for a *registration* change was measured twice, in-session: for an addition (#1892, 2026-08-03: it reported the new 29-hook set and the new Stop hook fired) and for a removal (#3265, 2026-10-01: the new 28-hook set). One seat each, two dates (harness versions not recorded) — restart if a registration demonstrably does not take effect.) The `install-local-marketplace.sh` script will have printed an `⚠️  HOOK REGISTRATION CHANGED` banner if this applies.
@@ -213,7 +213,7 @@ systemctl --user restart engram-viz-user.service && echo "viz restarted" || echo
 
 **If not a systemd service** (manual-start install, or macOS): the old process is still running. Tell the user:
 > The viz server is serving pre-upgrade code. Kill the old process and restart:
-> `pkill -f viz.server; cd ${CLAUDE_PLUGIN_ROOT:-~/.engram/marketplace/plugins/engram} && python3 -m viz.server &`
+> `pkill -f viz.server; cd "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}" && python3 -m viz.server &`
 
 Verify the server is live with new code after the restart:
 ```bash
@@ -234,14 +234,14 @@ If Step 2 found the CLAUDE.md render source (`templates/template.CLAUDE.md`) cha
 Use the rendered-diff tool (catches changes to ALL render sources, not just the main template):
 
 ```bash
-SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
+SOURCE_DIR=$(grep '^deployed_from=' "${ENGRAM_HOME:-$HOME/.engram}"/.deployed-version | cut -d= -f2-)
 # Read the pre-upgrade SHA saved in Step 2.  Do NOT re-read .deployed-version here —
 # Step 3 already overwrote it with the new SHA, so base==head → false "no drift" (#1194).
-DEPLOYED=$(cat ~/.engram/.upgrade-pre-sha 2>/dev/null) || {
-  echo "ERROR: ~/.engram/.upgrade-pre-sha not found — re-run Step 2 to save the pre-upgrade SHA before proceeding."
+DEPLOYED=$(cat "${ENGRAM_HOME:-$HOME/.engram}"/.upgrade-pre-sha 2>/dev/null) || {
+  echo "ERROR: ${ENGRAM_HOME:-$HOME/.engram}/.upgrade-pre-sha not found — re-run Step 2 to save the pre-upgrade SHA before proceeding."
   exit 1
 }
-[[ -z "$DEPLOYED" ]] && { echo "ERROR: ~/.engram/.upgrade-pre-sha is empty — re-run Step 2 (check that .deployed-version has a valid alpha_sha= line)."; exit 1; }
+[[ -z "$DEPLOYED" ]] && { echo "ERROR: ${ENGRAM_HOME:-$HOME/.engram}/.upgrade-pre-sha is empty — re-run Step 2 (check that .deployed-version has a valid alpha_sha= line)."; exit 1; }
 UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
 # Claude — compare rendered output between the deployed commit and current upstream branch:
 python "$SOURCE_DIR/tools/check-claude-md-drift.py" \
@@ -253,17 +253,17 @@ python "$SOURCE_DIR/tools/check-claude-md-drift.py" \
 diff "$SOURCE_DIR"/src/engram/templates/template.AGENTS.md /path/to/live/AGENTS.md
 ```
 
-**Does my LIVE file carry everything the template carries?** The base-to-head diff above cannot answer that: it cannot see a hunk an earlier rebuild skipped without merging, because every later range starts after that hunk and the seat looks clean (engram-alpha#3604). The live mode checks the live file directly against the rendered template, in one direction: every rendered template unit (heading, paragraph, list item, table row) must be present in the live file; only the missing ones are printed (first line plus its line in the rendered template); extras are ignored. It finds absence only: text inside a comment, fence or quote still counts as present. It never edits the file. Expect some noise by design: a unit you deliberately reworded is printed as missing, and the output does not say which MISSING lines are real lag and which are your own rewrites (on two seats measured, about 14 of 169 units each); judge each line. A unit you extended at its END still matches; one with text inserted in the MIDDLE does not. The home path may be written `~/.engram` or in full in your file; either matches. If your `seed-manifest.json` predates a seed id the template now uses, the tool exits 2 and names the id: pass it with `--seed-id KEY=VALUE` (repeatable).
+**Does my LIVE file carry everything the template carries?** The base-to-head diff above cannot answer that: it cannot see a hunk an earlier rebuild skipped without merging, because every later range starts after that hunk and the seat looks clean (engram-alpha#3604). The live mode checks the live file directly against the rendered template, in one direction: every rendered template unit (heading, paragraph, list item, table row) must be present in the live file; only the missing ones are printed (first line plus its line in the rendered template); extras are ignored. It finds absence only: text inside a comment, fence or quote still counts as present. It never edits the file. Expect some noise by design: a unit you deliberately reworded is printed as missing, and the output does not say which MISSING lines are real lag and which are your own rewrites (on two seats measured, about 14 of 169 units each); judge each line. A unit you extended at its END still matches; one with text inserted in the MIDDLE does not. The home path may be written with a leading tilde (the default `.engram` folder) or in full in your file; either matches. If your `seed-manifest.json` predates a seed id the template now uses, the tool exits 2 and names the id: pass it with `--seed-id KEY=VALUE` (repeatable).
 
 ```bash
 # Each Bash call is a fresh shell: re-derive everything here.
-SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
-HEAD_REF=$(grep '^alpha_sha=' ~/.engram/.deployed-version | cut -d= -f2-)
+SOURCE_DIR=$(grep '^deployed_from=' "${ENGRAM_HOME:-$HOME/.engram}"/.deployed-version | cut -d= -f2-)
+HEAD_REF=$(grep '^alpha_sha=' "${ENGRAM_HOME:-$HOME/.engram}"/.deployed-version | cut -d= -f2-)
 # Needs a deploy whose tool has --live (engram-alpha#3604). An older tool does not say so: it fails with "the following arguments are required: --base".
 python3 "$SOURCE_DIR/tools/check-claude-md-drift.py" --help 2>&1 | grep -q -- '--live' || echo "STOP: the deployed check-claude-md-drift.py predates --live; rebuild from a tag that carries #3604 first"
 python3 "$SOURCE_DIR/tools/check-claude-md-drift.py" --repo "$SOURCE_DIR" --head "$HEAD_REF" \
     --live ~/.claude/CLAUDE.md --user-name "<your user>" --agent-name "<your name>" \
-    --self-node-id "<your pn_ id>" --engram-home ~/.engram --seed-manifest ~/.engram/seed-manifest.json
+    --self-node-id "<your pn_ id>" --engram-home "${ENGRAM_HOME:-$HOME/.engram}" --seed-manifest "${ENGRAM_HOME:-$HOME/.engram}"/seed-manifest.json
 # Exit 0 = nothing missing; exit 1 = MISSING lines (merge or consciously decline each); exit 2 = input/render error (never read as "0 missing").
 ```
 
@@ -284,15 +284,15 @@ Add `--multi-agent` to also check `template.CLAUDE.multi-agent.md` as its own pa
 ## Step 8 — Verify
 
 ```bash
-cat ~/.engram/.deployed-version          # marker SHA = the commit you built (forensics anchor)
-rm -f ~/.engram/.upgrade-pre-sha         # pre-upgrade SHA scratch file no longer needed
+cat "${ENGRAM_HOME:-$HOME/.engram}"/.deployed-version          # marker SHA = the commit you built (forensics anchor)
+rm -f "${ENGRAM_HOME:-$HOME/.engram}"/.upgrade-pre-sha         # pre-upgrade SHA scratch file no longer needed
 ```
 
 Then through the **plugin MCP** (after Step 5's reconnect): call `engram_stats` and confirm it returns your real node count. **Read carefully what that does and does not establish — the obvious reading is wrong, and it is the reading this step used to endorse.**
 
 **It establishes:** the DB is readable, and *some* server answered (your graph is preserved across the upgrade, though possibly migrated in place per Step 5). If `engram_stats` errors or the node count is implausible, stop and investigate before declaring the upgrade done — Step 5's restore procedure is the recovery path.
 
-**It does NOT establish that the new server is running.** A node count cannot discriminate a reconnected process from one that never restarted. And the `version` block in the same response is *worse* than merely silent about it: the `version` section of `engram_stats.py` does a `read_text` on `~/.engram/.deployed-version` **inside the request handler**, at call time, with no caching — and Step 3 rewrote that marker. **So a server that never reconnected reports the new `alpha_sha` identically.** (Finding: Mira, 2026-09-07, from correcting an over-confident upgrade certification; re-verified against the source 2026-09-10.)
+**It does NOT establish that the new server is running.** A node count cannot discriminate a reconnected process from one that never restarted. And the `version` block in the same response is *worse* than merely silent about it: the `version` section of `engram_stats.py` does a `read_text` on `${ENGRAM_HOME:-$HOME/.engram}/.deployed-version` **inside the request handler**, at call time, with no caching — and Step 3 rewrote that marker. **So a server that never reconnected reports the new `alpha_sha` identically.** (Finding: Mira, 2026-09-07, from correcting an over-confident upgrade certification; re-verified against the source 2026-09-10.)
 
 ### The check that DOES discriminate
 
@@ -407,7 +407,7 @@ engram_add_observation(payload_json=json.dumps({
 }))
 ```
 
-Do **not** cite `file://~/.engram/.deployed-version` directly unless it is committed/tracked evidence. ENGRAM's provenance guard may reject untracked files; use a verified transcript/log quote instead.
+Do **not** cite `file://<ENGRAM home>/.deployed-version` directly unless it is committed/tracked evidence. ENGRAM's provenance guard may reject untracked files; use a verified transcript/log quote instead.
 
 **Checkpoint**: obs filed; its SHA/target/cache claim matches Step 8's verified evidence.
 
@@ -421,7 +421,7 @@ Do **not** cite `file://~/.engram/.deployed-version` directly unless it is commi
 - **Building without checking the feature-set flags.** A wrong-flag build *succeeds* and silently drops surfaces (#704/#707 class). The Step 3 checkpoint exists for this.
 - **Re-bootstrapping (`FORCE=1`) to "refresh" anything.** `FORCE=1` (and `FORCE_RESEED_EMPTY=1`) now **refuse on a non-empty DB** — they are not bypass paths for live graphs. Never the upgrade path; a true fresh start requires manually deleting `knowledge.db` first.
 - **Killing the MCP subprocess to "restart" it.** User-restart only.
-- **Reaching for the retired scatter path** (`tools/deploy.sh` rsync into `~/.engram/`) on a plugin install — it does not serve the plugin layout and will not update the running plugin.
+- **Reaching for the retired scatter path** (`tools/deploy.sh` rsync into the ENGRAM home folder) on a plugin install — it does not serve the plugin layout and will not update the running plugin.
 
 ---
 
