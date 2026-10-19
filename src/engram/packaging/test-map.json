@@ -364,6 +364,13 @@
       "note": "engram-alpha#3921: the ranking core and its owner-read entry layer (flag weakest_load_bearing_reads_via_owner). The test loads the file by path (spec_from_file_location) and runs it as a subprocess, invisible to the layer-1 import graph; the seven registered read templates also tie it to tests/test_engramd_read_scan.py."
     },
     {
+      "path_prefix_or_glob": "tools/dream_pickup.py",
+      "test_globs": [
+        "tests/test_dream_pickup_3919.py"
+      ],
+      "note": "#3919 M6: the seat-side writer of the dream record's Morning pickup section. The test runs the file as a subprocess (and loads it by path), invisible to the layer-1 import graph. No store reads, so no registered read template."
+    },
+    {
       "path_prefix_or_glob": "tools/dream_master_batch.py",
       "test_globs": [
         "tests/test_dream_master_batch_flow.py",

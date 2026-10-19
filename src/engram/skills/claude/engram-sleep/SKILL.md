@@ -1060,7 +1060,7 @@ The dream master returns:
 - Recall summaries: applied / fixed-at-spot / unfixable counts
 - Health score delta
 - Flagged-for-user count
-- awake-seat items: N (count of numbered items in `## For the awake seat`; 0 when the block is `none`)
+- awake-seat items: N (count of numbered items in `## For the awake seat`: these are the heads, at most 3; 0 when the block is `none`)
 
 Relay this to the user in 3-6 short bullets. Surface the dream-record path so the user can read the "Flagged for the user" section in the morning review. Then go to Step 9.5.
 
@@ -1077,6 +1077,15 @@ Append the dispositions to the dream record as a new final section `## Sleep-end
 **Empty block.** If `## For the awake seat` is the literal line `none` and `## Open for tomorrow` is empty, still append `## Sleep-end triage (parent)` with the single line `none (0 items)` and log `sleep-end triage: 0 items`.
 
 **Partial return.** If the master returned partial and the `## For the awake seat` block is ABSENT, append the section with one line `master returned partial — block absent; triaged from the fairy reports instead:` followed by any dispositions. Step 9.5 triages only what the fairy reports already contain; it runs no master step. Anything unfinished still goes to the next cohort via the "Don't retry an interrupted dream" guardrail below.
+
+**Morning pickup (a different thing from the triage above).** The triage lines are the parent's sleep-end disposition. The pickup is the NEXT morning's account of what was actually done with each head (the at most 3 items under `## For the awake seat`). The awake seat, not the parent and not a reader tool, appends it to the dream record at its first routine-board tick, one head at a time, with `"$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/dream_pickup.py" --pick N "<what was done>"` or `--skip N "<reason>"` (quote the text; `--home` overrides the seat's home, `${ENGRAM_HOME:-$HOME/.engram}`). The tool edits the latest record's last `## Morning pickup` section, one line per head (`p1`, `p2`, `p3`), in one of two forms:
+
+```
+p1. picked up <what was done>
+p1. skipped (<reason>)
+```
+
+It does not commit; the seat commits the record as in the block below (`dream YYYY-MM-DD: morning pickup`). The next dream record quotes this section verbatim at its top, so a skipped head stays visible two mornings running. This text is read at night; the morning prompt for the step is the Morning Routine Board item (alpha #3919 M5), and until that item exists the seat runs it right after the morning dream-triage check.
 
 Then commit, mirroring the master's own record commit (a second commit on the same file):
 

@@ -521,6 +521,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/dream_pickup.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/backup_knowledge_db.py",
       "tier": "convenience"
     },

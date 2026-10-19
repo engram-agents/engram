@@ -575,7 +575,8 @@ You may call `engram_advance_turn` ONLY when ALL of these are true:
 - [ ] Repair-pass provenance record written — best-effort, never blocks `advance_turn`, but the record itself (a normal `status: "ran"` night, or a `status: "skipped"` night with its reason — round 2, engram-alpha#2519: a skip night writes the record too, it no longer just logs the reason) must exist, never silence
 - [ ] Truly-unfixable cases written to the dream record with specific node IDs + reason
 - [ ] Dream-review feeling-nudge handled (filed or null-reported, honestly)
-- [ ] "For the awake seat" written as a numbered block (empty block = the literal line "none")
+- [ ] "For the awake seat" written as a numbered block of at most 3 head items, each with a node id (empty block = the literal line "none")
+- [ ] "Previous morning pickup (quoted)" written (the previous record's `## Morning pickup` verbatim, or the single line `none`)
 - [ ] Dream record file written and committed in .engram git
 - [ ] Sleep-success marker written via `~/.engram/tools/write_sleep_marker.py` (under `$ENGRAM_HOME`, default `~/.engram`)
 - [ ] ask-<primary_user>.md updated with this cycle's flagged-for-user items (or skipped if surface not deployed) — post-advance, non-blocking
@@ -627,6 +628,10 @@ Format:
 **Cohort scope:** K nodes since prev sleep YYYY-MM-DD HH:MM EDT
 **Health score:** before X.XX → after Y.YY (delta +/-Z.ZZ)
 **Telemetry:** <the `telemetry` field's line from `engram_diagnose`, copied verbatim — issue #3137, WS8>
+
+## Previous morning pickup (quoted)
+*Quote the LINES of the previous record's `## Morning pickup` section VERBATIM here, WITHOUT its `## Morning pickup` heading (a copied heading would be mistaken for tonight's section) (the awake seat writes it the morning after a dream, with `tools/dream_pickup.py`). Find the previous record as the backfill-cap paragraph does: list `$ENGRAM_HOME/history/dream/` and take the last record that is NOT tonight's, sorting date-prefixed names (`YYYY-MM-DD*.md`) by name WITHOUT the `.md` extension, so `2026-10-02-turn110.md` is later than `2026-10-02.md` (the same rule `tools/dream_pickup.py` uses; mtime is arbitrary after a clone or a restore). If there is no previous record, or it has no `## Morning pickup` section, this section holds the single line `none`. A head that pickup marked `skipped` is the thing this makes visible: it stays in view a second morning.*
+<verbatim lines, e.g. `p1. skipped (<reason>)`, or `none`>
 
 ## Fairy contribution
 - Dispatched: <N>
@@ -702,9 +707,9 @@ Format:
 - ...
 
 ## For the awake seat
-*The PARENT triages this block at sleep-end (do now / file / defer) — you cannot: you file no observations and dispatch nothing. `## Open for tomorrow` below stays the research-direction list, whatever each bullet's prefix (a node id or plain text), and is triaged by the same step, which appends `## Sleep-end triage (parent)` to this record. What qualifies for THIS block: an action inside the awake agent's own authority that you saw and could not take — a fix, a close, a re-measure, a pin/unpin, a surface edit. This block is the one list: anything addressed to the parent anywhere in this record (a category's prose, a summary under Open for tomorrow) must also be a numbered item here. Items for the user's call belong in "Flagged for the user", not here.*
-1. <what> — <why / the one command or the size estimate>
-2. <what> — <why / the one command or the size estimate> (carried from YYYY-MM-DD)
+*The PARENT triages this block at sleep-end (do now / file / defer) — you cannot: you file no observations and dispatch nothing. `## Open for tomorrow` below stays the research-direction list, whatever each bullet's prefix (a node id or plain text), and is triaged by the same step, which appends `## Sleep-end triage (parent)` to this record. What qualifies for THIS block: an action inside the awake agent's own authority that you saw and could not take — a fix, a close, a re-measure, a pin/unpin, a surface edit. This block is the one list: anything addressed to the parent anywhere in this record (a category's prose, a summary under Open for tomorrow) must also be a numbered item here. Items for the user's call belong in "Flagged for the user", not here. **This block carries at most 3 ordered head items (most important first), each with a node id; a file reference is allowed only when no node exists, and an id missing where a node exists is a defect of the record, not of the parser. Put any further items in `## Open for tomorrow`.** The awake seat answers each head the next morning in `## Morning pickup` (`p1. picked up …` / `p1. skipped (…)`).*
+1. <node id, or a file ref only when no node exists> — <what> — <why / the one command or the size estimate>
+2. <node id> — <what> — <why / the one command or the size estimate> (carried from YYYY-MM-DD)
 (empty block = the literal line "none")
 
 ## Open for tomorrow
