@@ -374,7 +374,8 @@
     {
       "path_prefix_or_glob": "tools/inspect_raw.py",
       "test_globs": [
-        "tests/test_inspect_raw_owner_2652.py"
+        "tests/test_inspect_raw_owner_2652.py",
+        "tests/test_inspect_raw_unreadable_store_3954.py"
       ],
       "note": "engram-alpha#2652 (tools-7): the one-row read goes through tools/_owner_read.py behind engramd.inspect_raw_reads_via_owner (flag OFF opens the store mode=ro). The test loads the file by path (spec_from_file_location) and runs it as a subprocess, invisible to the layer-1 import graph; the registered read template also ties it to tests/test_engramd_read_scan.py."
     },

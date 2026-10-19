@@ -34,8 +34,8 @@ stdout and one stderr line (it never says "not found" and never falls back to a 
 codes: 0 ok, 1 node or store not found (or an unknown field), 2 usage (argparse), a RELATIVE ENGRAM_HOME
 (refused with one stderr line, as everywhere in the repo, alpha #3863) or a node id that is not valid UTF-8
 (it cannot name a node; refused before any read; the flag does not matter for either), 3 the row could
-not be read honestly (flag ON: owner down, refusing or answering malformed; either flag: a row that does not fit the node
-schema).
+not be read honestly (flag ON: owner down, refusing or answering malformed; flag OFF: a store that exists but cannot be read as a
+store, #3954; either flag: a row that does not fit the node schema).
 
 Examples:
     ENGRAM_HOME=/tmp/test-engram python inspect_raw.py ob_NNNN
@@ -46,6 +46,7 @@ Examples:
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -158,9 +159,28 @@ def read_row(db_path, node_id: str, use_owner: "bool | None" = None) -> "dict | 
     # on use_owner (flag OFF names neither the owner nor the flag).
     if use_owner:
         owner_read.ping(spec)  # the owner's answer replaces the db_path.exists() precondition
-    conn = owner_read.open_reader(spec, db_path, use_owner)
+    def _unreadable(exc: sqlite3.Error) -> InspectRawOwnerReadError:
+        # Flag OFF only: the store exists but sqlite cannot read it as a store (not a database, a directory,
+        # no `nodes` table). Not exit 1: that code means "node or store not found". Names neither the owner nor
+        # the flag, like the malformed-row message below.
+        return InspectRawOwnerReadError(
+            f"the store at {db_path} could not be read ({exc}); check the store, or retry if another process "
+            f"holds a lock on it. {spec.never_empty}"
+        )
+
     try:
-        rows = conn.execute(_ROW_SQL, (node_id,)).fetchall()
+        conn = owner_read.open_reader(spec, db_path, use_owner)
+    except sqlite3.Error as exc:
+        if use_owner:
+            raise
+        raise _unreadable(exc) from exc
+    try:
+        try:
+            rows = conn.execute(_ROW_SQL, (node_id,)).fetchall()
+        except sqlite3.Error as exc:
+            if use_owner:
+                raise
+            raise _unreadable(exc) from exc
         try:
             return _checked_row(rows, node_id)
         except ValueError as exc:
