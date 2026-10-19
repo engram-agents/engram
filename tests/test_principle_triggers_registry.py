@@ -702,7 +702,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     confidence REAL NOT NULL DEFAULT 0.5,
     created_at TEXT NOT NULL DEFAULT '',
     logical_chain TEXT NOT NULL DEFAULT '',
-    confidence_history TEXT NOT NULL DEFAULT '[]'
+    confidence_history TEXT NOT NULL DEFAULT '[]',
+    recall_summary TEXT
 )
 """
 

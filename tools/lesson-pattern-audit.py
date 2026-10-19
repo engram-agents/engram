@@ -298,6 +298,115 @@ def run_view_comparison(db_path=DEFAULT_DB, transcript_glob=DEFAULT_TRANSCRIPT_G
     return 0
 
 
+RANKS_FILENAME = "lesson-fire-ranks.json"
+
+
+def _default_ranks_path() -> str:
+    home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
+    return os.path.join(home, RANKS_FILENAME)
+
+
+def _preserve_acl(src: str, dst: str) -> None:
+    """Copy a POSIX ACL (the system.posix_acl_* xattrs) from src to dst when the platform has them.
+    No subprocess, no `getfacl`/`setfacl`: where xattrs or ACLs are unsupported this raises or is a
+    no-op, and the caller swallows the error (the ACL step must never fail the run)."""
+    if not hasattr(os, "listxattr"):
+        return
+    for name in os.listxattr(src):
+        if name.startswith("system.posix_acl"):
+            os.setxattr(dst, name, os.getxattr(src, name))
+
+
+def _write_whole_file_atomic(path: str, text: str) -> None:
+    """Write `text` as the WHOLE file at `path`: temp file in the same directory, then os.replace.
+    The temp file takes the existing file's mode (0o640 for a new file) and, best effort, its ACL (Linux
+    POSIX ACLs only, copied as `system.posix_acl*` xattrs; macOS ACLs are NOT preserved, measured by the
+    colleague review of PR 3948, so on macOS only the mode survives): a
+    bare mkstemp+rename leaves a 0o600 file with no ACL, which silently revokes another account's
+    read (and an ACL's mask). The ACL step's errors are swallowed; nothing else's are."""
+    import tempfile
+    path = os.path.realpath(path)  # a symlink at PATH is followed: the link stays, its target is rewritten
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        mode = 0o640
+        existing = False
+    else:
+        existing = True
+    fd, tmp = tempfile.mkstemp(prefix=".lesson-fire-ranks.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        if existing:
+            try:
+                _preserve_acl(path, tmp)
+            except Exception:
+                pass
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def run_write_ranks(db_path=DEFAULT_DB, transcript_glob=DEFAULT_TRANSCRIPT_GLOB,
+                    limit_files=DEFAULT_N_TRANSCRIPTS, session="", path=None, out=None, err=None):
+    """alpha#3924: for each armed lesson, fires per 1,000 targets over the replayed corpus, written as
+    the WHOLE rank file the tripwire hook reads to order a cluster block (rarest-firing lesson gets
+    the full nudge). A lesson is counted the way the hook matches it: on the `full` view, or on the
+    `command` view when its match_scope is "command". Armed = a non-empty, compilable
+    situation_pattern; a lesson that fires on nothing gets 0.0 (rated, rarest). Exit 0, or 2 on an
+    empty inventory (nothing is written then)."""
+    from datetime import datetime, timezone
+    if out is None:
+        out = sys.stdout
+    if err is None:
+        err = sys.stderr
+    path = path or _default_ranks_path()
+    cur, prior, srcs = collect_targets(transcript_glob=transcript_glob, limit_files=limit_files,
+                                       session=session, pairs=True)
+    pairs = cur + prior
+    if not pairs:
+        print("no transcript-derived targets; refusing to write ranks from an empty inventory", file=err)
+        return 2
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    rows = conn.execute("select id,claim,metadata from nodes "
+                        "where type='lesson' and is_current=1").fetchall()
+    conn.close()
+    ranks = {}
+    for nid, _claim, md in rows:
+        try:
+            m = json.loads(md) if md else {}
+        except Exception:
+            m = {}
+        if not isinstance(m, dict):
+            continue  # metadata 'null' or a JSON list: one bad row must not abort the whole file
+        pat = m.get("situation_pattern") or ""
+        if not isinstance(pat, str) or not pat:
+            continue
+        try:
+            rx = re.compile(pat, re.I)
+        except Exception:  # re.error, TypeError, RecursionError, OverflowError ...
+            continue
+        use_command = m.get("match_scope") == "command"
+        fires = sum(1 for f, c in pairs if rx.search(c if use_command else f))
+        ranks[nid] = round(fires * 1000.0 / len(pairs), 3)
+    doc = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "window": (f"{len(srcs)} transcripts: {len(cur)} current-session + {len(prior)} "
+                   f"prior-session targets"),
+        "targets": len(pairs),
+        "ranks": ranks,
+    }
+    _write_whole_file_atomic(path, json.dumps(doc, indent=1, sort_keys=True) + "\n")
+    print(f"wrote {len(ranks)} lesson rates over {len(pairs)} targets to {path}", file=out)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -334,7 +443,18 @@ def main() -> int:
              "list the matches that would be lost, to decide which lessons may opt "
              "into match_scope=command (all lost matches are prose). Reports only.",
     )
+    parser.add_argument(
+        "--write-ranks", nargs="?", const="", default=None, metavar="PATH",
+        help="alpha#3924: instead of the coverage audit, write each armed lesson's fires per 1,000 "
+             "targets (the whole file, mode and ACL preserved) to PATH (default: "
+             "$ENGRAM_HOME/lesson-fire-ranks.json). The tripwire hook reads it to choose which "
+             "co-firing lesson gets the full nudge.",
+    )
     args = parser.parse_args()
+    if args.write_ranks is not None:
+        return run_write_ranks(db_path=args.db, transcript_glob=args.transcript_glob,
+                               limit_files=args.transcripts, session=args.session,
+                               path=args.write_ranks or None)
     if args.compare_views:
         return run_view_comparison(db_path=args.db, transcript_glob=args.transcript_glob,
                                    limit_files=args.transcripts, session=args.session)

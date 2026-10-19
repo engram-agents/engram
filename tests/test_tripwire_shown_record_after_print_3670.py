@@ -105,8 +105,9 @@ def _load(tag, terms=("alphaterm", "betaterm"), enabled=True):
         {"auto_surface": {"in_turn_recall": {"enabled": enabled}}}))
     conn = sqlite3.connect(_eh() / "knowledge.db")
     conn.execute("""CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, type TEXT,
-        claim TEXT, is_current INT, memory_status TEXT, metadata TEXT)""")
-    conn.execute("INSERT OR REPLACE INTO nodes VALUES ('seed_1','observation','s',1,'active','{}')")
+        claim TEXT, is_current INT, memory_status TEXT, metadata TEXT, recall_summary TEXT)""")  # recall_summary: alpha#3924
+    conn.execute("INSERT OR REPLACE INTO nodes (id, type, claim, is_current, memory_status, metadata) "
+                 "VALUES ('seed_1','observation','s',1,'active','{}')")
     conn.commit()
     conn.close()
     fake = types.ModuleType("engram_idf")

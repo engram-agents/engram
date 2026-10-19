@@ -268,9 +268,10 @@ class TestPerLessonScope:
 def _db(tmp_path, rows):
     p = tmp_path / "knowledge.db"
     c = sqlite3.connect(p)
-    c.execute("CREATE TABLE nodes (id TEXT, type TEXT, claim TEXT, metadata TEXT, is_current INT, memory_status TEXT)")
+    c.execute("CREATE TABLE nodes (id TEXT, type TEXT, claim TEXT, metadata TEXT, is_current INT, memory_status TEXT, recall_summary TEXT)")  # recall_summary: alpha#3924
     for nid, meta in rows:
-        c.execute("INSERT INTO nodes VALUES (?, 'lesson', 'claim text', ?, 1, 'active')", (nid, json.dumps(meta)))
+        c.execute("INSERT INTO nodes (id, type, claim, metadata, is_current, memory_status) "
+                  "VALUES (?, 'lesson', 'claim text', ?, 1, 'active')", (nid, json.dumps(meta)))
     c.commit()
     c.close()
     return p

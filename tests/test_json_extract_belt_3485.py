@@ -66,7 +66,8 @@ GOOD_META = {
     "tripwire_priority": "high",
 }
 # alpha#3920: load_tripwires rows carry a 5th element, the lesson's match_scope ("full" when absent).
-GOOD_TRIPWIRE = ("git push --force", "do not force push", "ls_good", "high", "full")
+# alpha#3924: the 6th/7th elements are the lesson's recall_summary (None here) and claim.
+GOOD_TRIPWIRE = ("git push --force", "do not force push", "ls_good", "high", "full", None, "good claim")
 GOOD_PREVENTION = {
     "id": "ls_good",
     "pattern": "git push --force",
@@ -98,10 +99,10 @@ def _make_db(tmp_path, rows, name="k.db"):
     conn = sqlite3.connect(str(db))
     conn.execute(
         "CREATE TABLE nodes (id TEXT, type TEXT, is_current INTEGER, "
-        "memory_status TEXT, claim TEXT, metadata TEXT)"
+        "memory_status TEXT, claim TEXT, metadata TEXT, recall_summary TEXT)"  # recall_summary: alpha#3924, read by load_tripwires
     )
     for r in rows:
-        conn.execute("INSERT INTO nodes VALUES (?,?,?,?,?,?)", r)
+        conn.execute("INSERT INTO nodes (id, type, is_current, memory_status, claim, metadata) VALUES (?,?,?,?,?,?)", r)
     conn.commit()
     conn.close()
     return db
@@ -252,7 +253,9 @@ def test_c3_clean_data_loaders_are_identical_to_the_pre_change_sql(hook, tmp_pat
     monkeypatch.setattr(hook, "_QUERY", OLD_QUERY)
     monkeypatch.setattr(hook, "_PREVENTION_QUERY", OLD_PREVENTION_QUERY)
     old_t, old_p = hook.load_tripwires(db), hook.load_prevention_lessons(db)
-    assert new_t == old_t and new_p == old_p
+    # alpha#3924: the loader appends recall_summary + claim (6th/7th) from columns the OLD statement
+    # text does not select, so the old-shape comparison is over the first five elements.
+    assert [t[:5] for t in new_t] == [t[:5] for t in old_t] and new_p == old_p
     # Non-vacuity: the corpus exercises the branches (not two empty lists).
     by_id = {t[2]: t for t in new_t}
     assert by_id["c_high"][3] == "high" and by_id["c_norm"][3] == "normal"
@@ -423,7 +426,7 @@ def _owner_read(owner, sql):
 @requires_linux_owner
 @pytest.mark.parametrize("site,expected", [
     ("engram-lesson-tripwire-hook.py:load_tripwires",
-     [["ls_good", "do not force push", "git push --force", "high", None]]),  # 5th column: match_scope (#3920), NULL here
+     [["ls_good", "do not force push", "git push --force", "high", None, None, "good claim"]]),  # 5th column: match_scope (#3920), NULL here; 6th/7th: recall_summary, claim (#3924)
     ("engram-lesson-tripwire-hook.py:load_prevention_lessons",
      [["ls_good", "git push --force", "shadow", "do not force push"]]),
 ])

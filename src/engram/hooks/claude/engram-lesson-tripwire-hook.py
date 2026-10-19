@@ -91,6 +91,7 @@ import re
 import sqlite3
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 # A RELATIVE ENGRAM_HOME is refused (alpha #3863 6b): it would resolve against this process's cwd, a
@@ -343,7 +344,9 @@ SELECT
     ) AS nudge,
     json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,
     json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.tripwire_priority')  AS priority,
-    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.match_scope')  AS match_scope
+    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.match_scope')  AS match_scope,
+    recall_summary,
+    claim
 FROM nodes
 WHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')
   AND is_current = 1
@@ -575,9 +578,11 @@ def _coerce_match_scope(value) -> str:
 
 
 def load_tripwires(db_path: Path = DB_PATH):
-    """Return list of (pattern_str, nudge_str, node_id, priority_str, match_scope_str)
-    from active lessons with situation_pattern. (alpha#3920 added the 5th element,
-    "command" or "full"; callers unpack the tail variadically.)
+    """Return list of (pattern_str, nudge_str, node_id, priority_str, match_scope_str,
+    recall_summary, claim) from active lessons with situation_pattern. (alpha#3920 added the
+    5th element, "command" or "full"; alpha#3924 added the 6th and 7th, the node's own
+    recall_summary and claim, for the cluster block's one-liners; callers unpack the tail
+    variadically.)
 
     #2753 epic WS2: node_id was added (3rd tuple element, minimal extension
     of the pre-existing (pattern, nudge) shape) so check_command's hits can
@@ -604,7 +609,8 @@ def load_tripwires(db_path: Path = DB_PATH):
         if not owner:
             conn.close()
         return [
-            (row[2], row[1], row[0], row[3] or "normal", _coerce_match_scope(row[4] if len(row) > 4 else None))
+            (row[2], row[1], row[0], row[3] or "normal", _coerce_match_scope(row[4] if len(row) > 4 else None),
+             row[5] if len(row) > 5 else None, row[6] if len(row) > 6 else None)
             for row in rows if row[1] and row[2]
         ]
     except Exception as exc:
@@ -717,6 +723,119 @@ def write_tripwire_overflow(cut_hits: list, now: float | None = None) -> str:
         return str(overflow_path)
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# alpha#3924 (part of #3911) -- cluster block for co-firing lessons
+# ---------------------------------------------------------------------------
+# When MORE than CLUSTER_THRESHOLD lessons match one call (on 10-18 one publish call fired 19),
+# the inline budget showed about one nudge in full and cut the rest to an overflow filename. The
+# co-firing lessons share a MOMENT, not a subject, so the display is grouped, never the claims
+# merged: one header, ONE LINE PER MATCHED LESSON (id + recall_summary), and ONE full nudge. Every
+# full nudge still goes to the overflow file. At or below the threshold nothing changes.
+CLUSTER_THRESHOLD = 3
+LESSON_RANKS_PATH = Path(ENGRAM_HOME) / "lesson-fire-ranks.json"
+RANKS_MAX_AGE_DAYS = 7          # an older rank file is not trusted: length order for all
+RANKS_FUTURE_SKEW_DAYS = 1      # a generated_at this far ahead (clock skew) counts as age 0
+SUMMARY_CLAIM_CUT = 140
+SUMMARY_LINE_CAP = 200  # a legacy or hostile oversized recall_summary must not cut other lessons' lines
+NO_SUMMARY = "(no summary)"
+
+
+def _ranks_now() -> float:
+    """Injectable clock for the rank file's age (tests patch this; nothing sleeps)."""
+    return time.time()
+
+
+def _read_rank_table() -> tuple:
+    """Read $ENGRAM_HOME/lesson-fire-ranks.json ONCE. Returns (ranks, reason, age_days):
+    ranks = {lesson id: fires per 1,000 targets} and reason None when the file is usable;
+    otherwise ({}, reason, None) with reason one of "no file", "unreadable", "malformed",
+    "stale". Never raises: every failure means length order for all lessons, never a block."""
+    try:
+        text = read_regular_text(LESSON_RANKS_PATH, encoding="utf-8")
+    except FileNotFoundError:
+        return {}, "no file", None
+    except Exception:
+        return {}, "unreadable", None
+    try:
+        doc = json.loads(text)
+        if not isinstance(doc, dict) or not isinstance(doc.get("ranks"), dict):
+            return {}, "malformed", None
+        stamp = doc.get("generated_at")
+        if not isinstance(stamp, str):
+            return {}, "malformed", None
+        generated = datetime.fromisoformat(stamp.strip().replace("Z", "+00:00"))
+        if generated.tzinfo is None:
+            generated = generated.replace(tzinfo=timezone.utc)
+        age_s = _ranks_now() - generated.timestamp()
+    except Exception:
+        return {}, "malformed", None
+    if age_s < -RANKS_FUTURE_SKEW_DAYS * 86400:
+        return {}, "malformed", None
+    age_s = max(age_s, 0.0)
+    if age_s > RANKS_MAX_AGE_DAYS * 86400:
+        return {}, "stale", None
+    ranks = {}
+    for nid, rate in doc["ranks"].items():
+        if (isinstance(nid, str) and isinstance(rate, (int, float)) and not isinstance(rate, bool)
+                and math.isfinite(rate) and rate >= 0):
+            ranks[nid] = float(rate)
+    return ranks, None, int(age_s // 86400)
+
+
+def _cluster_key(h: dict, ranks: dict) -> tuple:
+    """Sort key for one hit of a cluster (see _cluster_order for the rule)."""
+    nid = h.get("node_id") or ""
+    rated = nid in ranks
+    return (
+        0 if h.get("priority") == "high" else 1,
+        0 if rated else 1,
+        ranks[nid] if rated else 0.0,
+        -len(h.get("pattern") or ""),
+        nid,
+    )
+
+
+def _cluster_order(hits: list) -> tuple:
+    """Order a cluster's hits and say how. Within one tripwire_priority ("high" first): ascending
+    fires-per-1,000 (a lesson that fires on almost every such call carries the least news per fire),
+    then longest situation_pattern, then lesson id, so ties are total. A lesson with no rate (absent
+    from the file, or the file unusable) sorts AFTER every rated peer of its priority, by length then
+    id. Returns (ordered hits, note) where note is the text after `order: `."""
+    ranks, reason, age_days = _read_rank_table()
+    ordered = sorted(hits, key=lambda h: _cluster_key(h, ranks))
+    if reason:
+        return ordered, f"length fallback ({reason})"
+    unrated = sum(1 for h in ordered if (h.get("node_id") or "") not in ranks)
+    return ordered, f"rarity (ranks {age_days}d old, {unrated} unrated)"
+
+
+def _cluster_summary(recall_summary, claim) -> str:
+    """One line: the lesson's recall_summary; else its claim cut to 140 characters; else a
+    placeholder. Never empty, never multi-line."""
+    summary = " ".join(str(recall_summary).split()) if recall_summary else ""
+    if summary:
+        return summary[:SUMMARY_LINE_CAP]
+    flat_claim = " ".join(str(claim).split()) if claim else ""
+    return flat_claim[:SUMMARY_CLAIM_CUT] if flat_claim else NO_SUMMARY
+
+
+def _cluster_trigger(hook_input: dict) -> str:
+    """The tool name (MCP) or the Bash verb (first word of the command) the cluster fired on."""
+    tool = hook_input.get("tool_name") or "tool"
+    if tool == "Bash":
+        ti = hook_input.get("tool_input") or hook_input.get("input") or {}
+        words = (ti.get("command") or "").split() if isinstance(ti, dict) else []
+        words = [w for w in words if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)]
+        return f"Bash `{words[0]}`" if words else "Bash"
+    return tool
+
+
+def _cluster_head(count: int, trigger: str, note: str, overflow_path: str) -> str:
+    tail = f"; all {count} full texts: {overflow_path}" if overflow_path else ""
+    return (f"[lesson-tripwire] {count} lessons matched {trigger} (order: {note}); "
+            f"one line each, full text of the first below{tail}:")
 
 
 # ---------------------------------------------------------------------------
@@ -2317,6 +2436,7 @@ def _main_impl() -> None:
         _chain_cut = False        # the chain block was dropped by the pass
         _chain_cut_lines = 0      # lines in the dropped chain block
         _chain_in_parts = False   # the chain block is currently in `parts`
+        _tripwire_head = TRIPWIRE_HEADER  # alpha#3924: the cluster block swaps in its own header line
 
         tripwires = load_tripwires()
         hits = check_command(match_target, tripwires, command_target=command_target) if tripwires else []
@@ -2345,7 +2465,7 @@ def _main_impl() -> None:
             owner_notice, owner_notice_key = text, key
             head_notice = "\n".join(x for x in (owner_notice, loader_notice) if x)
             if _block_call is not None:
-                head = f"{head_notice}\n{TRIPWIRE_HEADER}" if _block_call[1] else head_notice
+                head = f"{head_notice}\n{_tripwire_head}" if _block_call[1] else head_notice
                 _block_call = (head, _block_call[1], _block_call[2])
                 parts[0] = emit_context(_block_call[0], _block_call[1], **_block_call[2])
             else:
@@ -2420,6 +2540,32 @@ def _main_impl() -> None:
             # protection against at all).
             bullets = [_tripwire_bullet(h) for h in hits]
 
+            # alpha#3924: more than CLUSTER_THRESHOLD co-firing lessons render as ONE cluster block
+            # (a one-line summary per lesson + one full nudge) instead of K+ bullets. Prepared inside
+            # its own guard: any failure falls back to today's rendering, never to silence.
+            _cluster_kept: list = []
+            _cluster_nudge_idx = None
+            _cluster_path = ""
+            if len(hits) > CLUSTER_THRESHOLD:
+                try:
+                    _ordered, _note = _cluster_order(hits)
+                    _extras = {t[2]: (t[5] if len(t) > 5 else None, t[6] if len(t) > 6 else None)
+                               for t in tripwires}
+                    _lines = [
+                        f"  - {h.get('node_id', '?')}: "
+                        f"{_cluster_summary(*_extras.get(h.get('node_id'), (None, None)))}"
+                        for h in _ordered
+                    ]
+                    # Every clustered hit's full nudge goes to the overflow file (the inline block
+                    # shows one); its path rides in the header so the other nudges stay reachable.
+                    _path = write_tripwire_overflow(_ordered)
+                    _head = _cluster_head(len(_ordered), _cluster_trigger(hook_input), _note, _path)
+                    hits, _tripwire_head, _cluster_path = _ordered, _head, _path
+                    _cluster_nudge_idx = len(_lines)
+                    bullets = _lines + [_tripwire_bullet(_ordered[0])]
+                except Exception:
+                    _cluster_nudge_idx = None
+
             # emit_context() calls this ONLY with the item strings it
             # itself decided to cut/truncate -- always either a trailing
             # SUFFIX of `bullets` (the ordinary cut case), or, in the rare
@@ -2473,14 +2619,24 @@ def _main_impl() -> None:
                 # #3503: the failure line, when due, is part of the head (so it
                 # shares emit_context's target/budget accounting and sits above
                 # the bullets); unchanged TRIPWIRE_HEADER otherwise.
-                f"{head_notice}\n{TRIPWIRE_HEADER}" if head_notice else TRIPWIRE_HEADER,
+                f"{head_notice}\n{_tripwire_head}" if head_notice else _tripwire_head,
                 bullets,
-                dict(
+                (dict(
                     budget=budgets["budget"],
                     target=TRIPWIRE_BLOCK_CHAR_CEILING,
                     allow_single_overflow=True,
                     overflow_writer=_cached_overflow_writer,
-                ),
+                ) if _cluster_nudge_idx is None else dict(
+                    # alpha#3924: the one-liners alone can exceed the 1800-char inline ceiling
+                    # (19 x ~130), so the cluster block is bounded by the harness budget; if even
+                    # those do not fit, emit_context cuts whole lines from the tail and says so in
+                    # its trailer. Every full nudge is already in the overflow file (written above).
+                    budget=budgets["budget"],
+                    target=max(1, budgets["budget"] - _TAIL_CUT_RESERVE),
+                    allow_single_overflow=True,
+                    overflow_writer=lambda _items: _cluster_path,
+                    kept_out=_cluster_kept,
+                )),
             )
             parts.append(emit_context(_block_call[0], _block_call[1], **_block_call[2]))
 
@@ -2498,6 +2654,11 @@ def _main_impl() -> None:
             shown_hits = hits[: len(hits) - len(cut_hits)] if cut_hits else hits
             if not shown_hits and hits:
                 shown_hits = hits[:1]
+            if _cluster_nudge_idx is not None:
+                # alpha#3924: in cluster mode only the lesson whose FULL nudge is in the visible
+                # block counts as shown (a one-liner is not its nudge text); none if the budget
+                # cut that nudge. kept_out lists the body items emit_context rendered in full.
+                shown_hits = hits[:1] if _cluster_nudge_idx in _cluster_kept else []
         elif head_notice:
             # #3503: a loader failed and there are no hits, so the block would
             # otherwise be silent -- the line IS the block, still rendered by
@@ -2566,6 +2727,10 @@ def _main_impl() -> None:
                 # _append_ws4_fire_ledger, unchanged.
                 nudge_chars = len(parts[-1]) if parts else 0
                 raw_tool_use_id = None
+                # Known limit (PR 3948 review): in cluster mode only the full-nudge lesson is
+                # `shown`, and `cut_hits` stays empty (no hit was cut, the rest appear as
+                # one-liners), so the one-liner-only lessons are in NEITHER list here. They are
+                # not a hole in the WS4 denominator by accident: their full nudge was not shown.
                 cut_lesson_ids = []
                 arm = "na"
                 nonce = None

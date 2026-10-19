@@ -125,10 +125,11 @@ def _enable(hook, tmp: str, **overrides):
     conn.execute(
         """CREATE TABLE IF NOT EXISTS nodes (
                id TEXT PRIMARY KEY, type TEXT, claim TEXT, is_current INT,
-               memory_status TEXT, metadata TEXT)"""
+               memory_status TEXT, metadata TEXT, recall_summary TEXT)"""  # recall_summary: alpha#3924
     )
     conn.execute(
-        "INSERT INTO nodes VALUES ('seed_1', 'observation', 'seed node', 1, 'active', '{}')"
+        "INSERT INTO nodes (id, type, claim, is_current, memory_status, metadata) "
+        "VALUES ('seed_1', 'observation', 'seed node', 1, 'active', '{}')"
     )
     conn.commit()
     conn.close()
@@ -182,12 +183,13 @@ def _seed_node_count(db_path, n):
     conn.execute(
         """CREATE TABLE IF NOT EXISTS nodes (
                id TEXT PRIMARY KEY, type TEXT, claim TEXT, is_current INT,
-               memory_status TEXT, metadata TEXT)"""
+               memory_status TEXT, metadata TEXT, recall_summary TEXT)"""  # recall_summary: alpha#3924
     )
     conn.execute("DELETE FROM nodes")
     for i in range(n):
         conn.execute(
-            "INSERT INTO nodes VALUES (?, 'observation', 'seed', 1, 'active', '{}')",
+            "INSERT INTO nodes (id, type, claim, is_current, memory_status, metadata) "
+            "VALUES (?, 'observation', 'seed', 1, 'active', '{}')",
             (f"seed_{i}",),
         )
     conn.commit()
@@ -298,10 +300,11 @@ def test_tripwire_and_recall_compose(tmp_path, monkeypatch, capsys):
     conn.execute(
         """CREATE TABLE IF NOT EXISTS nodes (
                id TEXT PRIMARY KEY, type TEXT, claim TEXT, is_current INT,
-               memory_status TEXT, metadata TEXT)"""
+               memory_status TEXT, metadata TEXT, recall_summary TEXT)"""  # recall_summary: alpha#3924
     )
     conn.execute(
-        """INSERT INTO nodes VALUES ('ls_1', 'lesson', 'Placeholder lesson claim.', 1, 'active',
+        """INSERT INTO nodes (id, type, claim, is_current, memory_status, metadata)
+           VALUES ('ls_1', 'lesson', 'Placeholder lesson claim.', 1, 'active',
            json_object('situation_pattern', 'danger-cmd',
                        'scaffolding_nudge', 'Check the guard first.'))"""
     )
