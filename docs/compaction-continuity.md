@@ -243,6 +243,26 @@ moved out of the compact-instructions channel before this issue:
 | **6 — loop state** | `~/.engram/loop-mode.json` and the wake prompt, both read directly by the loop skill |
 | **1 — identity block** | (#2067) nowhere new — see "Redundant with the warm-briefing template" above. Not relocated; considered and withdrawn. |
 
+## Reading why a nap-requested compaction did or did not happen
+
+The `engram-compaction` mod (`tools/mods/engram-compaction`) compacts at the nap boundary and records
+its verdict in the tombstone it leaves in `$ENGRAM_HOME/compact/`. Read the `verdict` field of
+`inflight` for the compact call: `compacted`, `vetoed: <skip text>`, or `refused: <error text>`.
+`compacted` means ONLY that `$.session.compact` returned without a skip. It does not say the nap context
+landed: if the in-flight token was older than 60 seconds or the context failed its digest, the engine's own
+summary stands and the verdict is still `compacted`. `refused:` carries the text of whatever the call
+threw, which is the engine's error and can wrap the real reason (in the test harness a rejection beneath
+arrived as `HooksError: engram-compaction+test: next() passed an argument with messages that are not a
+list`): read it as "the call failed", and take the cause from the lines the engine itself reports. Read
+`request.json` for a request that was never acted on: `dropped: stale or malformed request`, or
+`not attempted: could not write the in-flight token`. A tombstone with no `verdict` was written by
+an older mod, by the answer-side guard spending a token, or is a request that was consumed normally (its
+outcome is in `inflight`); if the verdict write itself failed, the live token stays with no verdict. A
+`request.json` that is NOT a tombstone means nothing has acted on it yet, or it belongs to another session. A verdict is
+one line of at most 200 characters, and every guard still reads a tombstone as absent. Until this was
+recorded, a vetoed or refused compaction was logged only to the debug sink and could not be told
+from one that never ran.
+
 ## If you are about to touch this again
 
 Three cases, not two — Codex changed the shape:

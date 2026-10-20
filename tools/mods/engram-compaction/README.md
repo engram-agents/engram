@@ -10,6 +10,14 @@ compaction carries the assembled context (focus list, history arc, warm-briefing
 - `userConfig.enabled` (default true): false registers nothing.
 - The mods API has no file delete, so a consumed request (and the in-flight token) is overwritten with
   `{"consumed": true, "request_id": ...}`; a tombstone reads as absent.
+- A tombstone also says why it was written, in a `verdict` field (one line, at most 200 characters). The
+  `inflight` file holds the compact call's outcome: `compacted` (the call returned without a skip; it does NOT say the
+  nap context landed, since the engine's own summary stands when a guard fails), `vetoed: <skip text>` or
+  `refused: <first 160 characters of the error>` (the engine's error text, which can wrap the real reason). `request.json` holds the reason when nothing was attempted:
+  `dropped: stale or malformed request` or `not attempted: could not write the in-flight token`. A request
+  that was consumed normally keeps the plain two-field tombstone; read its outcome from `inflight`. If the
+  request cannot even be marked consumed there is no tombstone to write, and that exit is only logged.
+  Guards ignore the field: a tombstone is still absent.
 - The context message goes BESIDE the engine's own messages by default; `COMPACT_SHAPE` in
   `hooks/compaction.ts` is the one constant that flips it to REPLACE.
 - Only a `plugin`-triggered compaction with a fresh (60 s) matching token is answered; `manual` and `auto`
