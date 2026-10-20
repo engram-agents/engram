@@ -23,7 +23,15 @@ Field sources:
                                   attachment.type == "model"
                                   (attachment.identity.modelId + marketingName);
                                   fallback: newest row with message.model
-                                  (id only)
+                                  (id only).  Codex rollout (#3922): the newest
+                                  top-level type == "turn_context" record's
+                                  payload.model (id only; no nested model key
+                                  is read).  Claude + Codex evidence in one
+                                  transcript refuses ("mixed-harness").
+                                  This is a TURN claim: the newest turn record
+                                  of the bound transcript, not a statement
+                                  about the whole session (true of the Claude
+                                  path too).
   family check                    engram_core.model_id_to_lineage(model id)
                                   must equal self_lineage
   version                         <plugin root>/plugin.json "version"; plus
@@ -46,6 +54,9 @@ Plugin root: ``CLAUDE_PLUGIN_ROOT`` when set, else the nearest parent of this
 file holding BOTH ``plugin.json`` and ``server.py`` (never a fixed
 ``parents[N]``: the plugin build flattens the source layout, see CLAUDE.md).
 A source checkout has no ``plugin.json``, so it refuses -- accepted.
+
+Trust model: the transcript is a local file the user can edit, so the signature
+is DECLARED provenance, not attestation or cryptographic proof.
 """
 
 from __future__ import annotations
@@ -136,9 +147,43 @@ def _find_marker(data_dir: Path, session_id: str | None) -> dict:
     return marker
 
 
+def _has_claude_source(rows: list) -> bool:
+    """True when any row is a Claude model source (the two shapes the Claude
+    path reads): an attachment model row with a non-blank ``identity.modelId``,
+    or a ``message.model`` starting ``claude-``."""
+    for r in rows:
+        att = r.get("attachment")
+        if isinstance(att, dict) and att.get("type") == "model":
+            ident = att.get("identity")
+            mid = ident.get("modelId") if isinstance(ident, dict) else None
+            if isinstance(mid, str) and mid.strip():
+                return True
+        msg = r.get("message")
+        mid = msg.get("model") if isinstance(msg, dict) else None
+        if isinstance(mid, str) and mid.strip().startswith("claude-"):
+            return True
+    return False
+
+
 def _read_model(transcript: Path) -> tuple[str, str | None]:
-    """(model_id, marketing_name|None) from the newest model attachment row,
-    else the newest assistant ``message.model`` (marketing name None)."""
+    """(model_id, marketing_name|None) for the bound transcript.
+
+    Claude transcripts: the newest model attachment row, else the newest
+    assistant ``message.model`` (marketing name None).  Codex rollouts (#3922):
+    the newest top-level ``type == "turn_context"`` record's ``payload.model``
+    (marketing name None); ONLY that key is read -- never
+    ``payload.collaboration_mode.settings.model`` or any other nested ``model``
+    -- and a newest turn_context record with no usable model REFUSES rather
+    than falling back to an older turn.  A transcript holding BOTH a Claude
+    source and a Codex turn_context refuses ("mixed-harness"); no format is
+    preferred.
+
+    This is a TURN claim, not a session claim: the evidence is the newest turn
+    record of the bound transcript (a pre-existing property of the Claude path
+    too -- the newest attachment/assistant row), not a statement that the whole
+    session ran on that model.  The transcript is a user-editable local file;
+    the result is declared provenance, not attestation.
+    """
     try:
         raw = transcript.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
@@ -151,6 +196,23 @@ def _read_model(transcript: Path) -> tuple[str, str | None]:
             continue
         if isinstance(r, dict):
             rows.append(r)
+    turns = [r for r in rows if r.get("type") == "turn_context"]
+    if turns:
+        if _has_claude_source(rows):
+            raise _Refusal(
+                "model",
+                f"transcript {transcript} holds both Claude model evidence and "
+                "Codex turn_context records (mixed-harness): cannot determine "
+                "the running model, refusing rather than ranking the sources")
+        payload = turns[-1].get("payload")
+        mid = payload.get("model") if isinstance(payload, dict) else None
+        if isinstance(mid, str) and mid.strip():
+            return mid.strip(), None
+        raise _Refusal(
+            "model",
+            f"the newest turn_context record in {transcript} has no usable "
+            "payload.model (missing, non-string or blank): refusing rather "
+            "than falling back to an older turn or a nested model key")
     # Primary: harness model attachment (id + marketing name).
     for r in reversed(rows):
         att = r.get("attachment")

@@ -11298,23 +11298,31 @@ def model_id_to_lineage(model_id: str) -> str:
     family, compare against ``self_lineage``"): the gate stays a discipline,
     this helper only reads. Built on ``engram_trust._parse_model_id`` (not a
     second parser): a ``[...]`` suffix such as ``claude-opus-4-7[1m]`` is
-    stripped first, the parser must report a provider and a ``claude-`` family,
-    and the result must satisfy ``_LINEAGE_RE``. Fail-closed like
+    stripped first, the parser must report a provider and either a ``claude-``
+    family or an exact id in ``engram_trust._NON_CLAUDE_MODEL_TABLE`` (#3922,
+    e.g. ``gpt-6.1-sol`` -> ``openai:gpt``; no prefix/regex rule), and the
+    result must satisfy ``_LINEAGE_RE``. Fail-closed like
     ``_self_lineage()``: anything else is ``""``, never a guess.
     """
     if not isinstance(model_id, str):
         return ""
     # Lazy import: engram_trust imports engram_core at module level.
-    from engram_trust import _parse_model_id
+    from engram_trust import _NON_CLAUDE_MODEL_TABLE, _parse_model_id
 
     mid = re.sub(r"\[[^\]]*\]\s*$", "", model_id.strip()).strip()
     if not mid:
         return ""
     parsed = _parse_model_id(mid)
     family = parsed.get("family", "")
-    if not parsed.get("provider") or not family.startswith("claude-"):
+    if not parsed.get("provider"):
         return ""
-    value = f"{parsed['provider']}:{family[len('claude-'):]}"
+    if mid in _NON_CLAUDE_MODEL_TABLE:
+        # #3922: explicit supported-model table; family is already bare.
+        value = f"{parsed['provider']}:{family}"
+    elif family.startswith("claude-"):
+        value = f"{parsed['provider']}:{family[len('claude-'):]}"
+    else:
+        return ""
     return value if _LINEAGE_RE.fullmatch(value) else ""
 
 

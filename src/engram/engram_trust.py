@@ -789,6 +789,16 @@ def _backfill_special_moment_about_edges(conn: sqlite3.Connection) -> int:
 # Person lineage impl
 # ---------------------------------------------------------------------------
 
+# #3922: the supported non-Claude model list.  Exact id -> (provider, family,
+# version).  This table IS the supported-model list: to support another model,
+# add one row with its exact id (no prefix or regex rule exists or may be added)
+# and its provider/family/version.  Adding a row is a reviewed change: it lets
+# a seat running that model sign as ``provider:family`` (engram_sign).
+_NON_CLAUDE_MODEL_TABLE: dict[str, tuple[str, str, str]] = {
+    "gpt-6.1-sol": ("openai", "gpt", "6.1"),
+}
+
+
 def _parse_model_id(model_id: str) -> dict:
     """Parse a model ID string into provider, family, and version.
 
@@ -796,6 +806,9 @@ def _parse_model_id(model_id: str) -> dict:
       "claude-sonnet-4-6"      → provider=anthropic, family=claude-sonnet, version=4.6
       "claude-opus-4-8"        → provider=anthropic, family=claude-opus,   version=4.8
       "claude-haiku-4-5-20251001" → provider=anthropic, family=claude-haiku, version=4.5
+
+    Ids listed in ``_NON_CLAUDE_MODEL_TABLE`` (exact match) return the table's
+    provider/family/version, e.g. "gpt-6.1-sol" → openai / gpt / 6.1.
 
     For unrecognised formats, provider and version are empty; family=model_id.
 
@@ -805,6 +818,10 @@ def _parse_model_id(model_id: str) -> dict:
     Only pass IDs that match the {family}-{major}-{minor} scheme.
     """
     mid = model_id.strip()
+    entry = _NON_CLAUDE_MODEL_TABLE.get(mid)
+    if entry is not None:
+        provider, family, version = entry
+        return {"provider": provider, "family": family, "version": version}
     if not mid.startswith("claude-"):
         return {"provider": "", "family": mid, "version": ""}
 

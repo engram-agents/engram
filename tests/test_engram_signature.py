@@ -448,6 +448,25 @@ def test_model_id_to_lineage(mid, expected):
     assert engram_core.model_id_to_lineage(mid) == expected
 
 
+# #3922: explicit exact-id table of supported non-Claude models; the success
+# control lives in the SAME table as the refuse rows.
+@pytest.mark.parametrize("mid,expected", [
+    ("gpt-6.1-sol", "openai:gpt"),
+    ("gpt-6.1-sol ", "openai:gpt"),         # trimmed -> accepted
+    ("gpt-6.1-sol[1m]", "openai:gpt"),      # existing [...] suffix strip
+    ("gpt-9999", ""),
+    ("o5-preview", ""),
+    ("gpt-6.1-soltypo", ""),
+    ("GPT-6.1-SOL", ""),
+    ("", ""),
+    ("   ", ""),
+    (None, ""),
+    (61, ""),
+])
+def test_model_id_to_lineage_non_claude_table(mid, expected):
+    assert engram_core.model_id_to_lineage(mid) == expected
+
+
 # ---------------------------------------------------------------- MCP tool
 
 def _fresh_server(td):
