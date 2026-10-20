@@ -253,7 +253,8 @@ class StoreUncheckable(StoreUnusable):
 
 class StoreNotAStore(StoreUnusable):
     """The path resolves but is not a regular file (a FIFO, a directory, a socket, a device). The remedy is to
-    fix the path, never to create a store there."""
+    fix the path, never to create a store there. Carries the stat mode as `exc.st_mode` (an int), so a caller
+    that words its own refusal needs no second `stat`."""
 
 
 def _errno_symbol(exc: OSError) -> str:
@@ -307,10 +308,12 @@ def check_store_path(db_path) -> None:
     except OSError as exc:
         raise _uncheckable(db_path, exc) from exc
     if not stat.S_ISREG(st.st_mode):
-        raise StoreNotAStore(
+        refusal = StoreNotAStore(
             f"the store path {db_path} is {_file_type_words(st.st_mode)}, not a regular file; fix the path, do "
             f"not create a store there"
         )
+        refusal.st_mode = st.st_mode
+        raise refusal
 
 
 def open_reader(spec: OwnerReadSpec, db_path: Path, use_owner: bool):

@@ -58,6 +58,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from engram_regular_io import check_store_path
 from engram_telemetry_store import open_store
 
 __all__ = ["compute_verdicts", "brute_force_verdicts", "summary_line"]
@@ -605,13 +606,22 @@ def summary_line(db_path, window: Optional[str] = None) -> str:
     of zero counts.
 
     Never writes anything; always closes the connection it opens
-    (try/finally). May raise (a malformed `window`, or an unexpected sqlite
+    (try/finally). A path that is not a usable store (#3962: unsearchable,
+    a symlink loop, a dangling link, a FIFO, a directory) raises the
+    classifier's `StoreUnusable` rather than reading "not aggregated"; a
+    plainly missing path still reads "not aggregated". May raise (a malformed
+    `window`, or an unexpected sqlite
     error) -- callers that need a never-raises guarantee wrap the call
     themselves (see engram_stats.py's `_diagnose_impl`, which converts any
     exception here into a `"telemetry: unavailable (...)"` string).
     """
     conn: Optional[sqlite3.Connection] = None
     try:
+        try:
+            check_store_path(db_path)
+        except FileNotFoundError:
+            pass  # a missing store falls through to the connect below: it stays "not aggregated"
+        # (a StoreUnusable propagates: an unusable path is "unavailable" to the caller, not "not aggregated")
         try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         except sqlite3.OperationalError:

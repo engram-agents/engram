@@ -142,6 +142,11 @@ except ImportError:
     from health import version as health_version  # type: ignore[no-redef]
     from health.rows import named_rows  # type: ignore[no-redef]
 
+# The store-path classifier (#3962): `export` classifies the path before it opens it. A flat core
+# module, importable in both execution modes above (the package mode has src/engram on sys.path, and
+# the script mode inserted it just now).
+from engram_regular_io import StoreUnusable, check_store_path  # noqa: E402
+
 # Second alias to the SAME `health.version` module object as `health_version`
 # above -- used ONLY inside PR C1's `derive`/`export`, whose own PARAMETER is
 # named `health_version` (a string, per the spec'd signature) and would
@@ -3693,8 +3698,11 @@ def export(
       with ``scores_available: False``; see below.
     - ``signal_unknown`` -- ``signal`` is not a key of that version's
       ``signal_defs``.
-    - ``unreadable`` -- a ``sqlite3.Error`` occurred (corrupt file, etc.);
-      the error text is the ``error`` value.
+    - ``unreadable`` -- a ``sqlite3.Error`` occurred (corrupt file, etc.),
+      or the path is not a usable store (#3962: a parent that cannot be
+      searched, a symlink loop, a dangling link, a FIFO, a directory; the
+      path is classified before it is opened); the error text is the
+      ``error`` value.
 
     Shape (design doc §6, one point per commit -- prefers the ``stored``-
     derived row when both exist for a commit; a ``git_replay`` row is
@@ -3729,12 +3737,16 @@ def export(
     ``"UNAVAILABLE"`` (string) is a normal value for ``raw`` in that case,
     exactly as it already is in the normal derived path."""
     db_path = Path(db_path)
-    if not db_path.exists():
+    try:
+        check_store_path(db_path)
+    except FileNotFoundError:
         return {
             "error": f"series store not found at {db_path}",
             "reason": "no_db",
             "db_path": str(db_path),
         }
+    except StoreUnusable as e:
+        return {"error": str(e), "reason": "unreadable", "db_path": str(db_path)}
 
     effective_health_version = (
         health_version if health_version is not None else health_version_module.CURRENT

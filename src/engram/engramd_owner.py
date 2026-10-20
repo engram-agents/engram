@@ -265,7 +265,15 @@ import engram_restamp as er
 import engram_walguard
 import engramd_client as ec
 import engramd_read_registry as rr
-from engram_regular_io import NotRegularFile, describe_file_kind, read_regular_text, write_pidfile
+from engram_regular_io import (
+    NotRegularFile,
+    StoreNotAStore,
+    StoreUncheckable,
+    check_store_path,
+    describe_file_kind,
+    read_regular_text,
+    write_pidfile,
+)
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -778,18 +786,22 @@ def _refuse_non_regular_store(store_path) -> None:
     #3785). The ONE store-path predicate: `_connect_store_ro` (start) and
     `check_start_refusals` (`--preflight`) both call it.
 
-    `os.stat` FOLLOWS symlinks and does not block on a FIFO: a symlink to a regular file is
-    accepted, a symlink to a FIFO is refused. A missing or unstattable path passes (it is not
-    a blocking object; the caller reports it). Pure: one stat, no mutation."""
+    Classified by the core `check_store_path` (#3962): `lstat` then `stat`, which FOLLOWS
+    symlinks and does not block on a FIFO. A symlink to a regular file is accepted, a symlink
+    to a FIFO is refused. A missing or uncheckable path (an unsearchable parent, ENOTDIR, a
+    dangling link, a symlink loop) passes (it is not a blocking object; the caller reports it).
+    There is no `resolve()`: on Python <= 3.12 it raised RuntimeError on a symlink loop, which
+    escaped as a traceback at owner start; a loop now passes like every other uncheckable path
+    (as it already did on 3.14). Pure: no mutation."""
     try:
-        st = os.stat(Path(store_path).resolve())
-    except OSError:
-        return
-    if not stat.S_ISREG(st.st_mode):
+        check_store_path(store_path)
+    except StoreNotAStore as exc:
         raise OwnerStorePathNotRegular(
-            f"the store path {store_path} is not a regular file (it is a {_file_kind(st.st_mode)}); "
+            f"the store path {store_path} is not a regular file (it is a {_file_kind(exc.st_mode)}); "
             f"refusing to open it: a read-only open of a FIFO would block forever"
-        )
+        ) from None
+    except (FileNotFoundError, StoreUncheckable):
+        return
 
 
 def _connect_store_ro(store_path) -> "sqlite3.Connection":
@@ -803,7 +815,7 @@ def _connect_store_ro(store_path) -> "sqlite3.Connection":
     open here was read-write, which fails at once on a FIFO). A missing path is left to
     the caller's own 'no knowledge.db' branch (sqlite then fails fast on it)."""
     _refuse_non_regular_store(store_path)
-    return sqlite3.connect(Path(store_path).resolve().as_uri() + "?mode=ro", uri=True)
+    return sqlite3.connect(Path(store_path).absolute().as_uri() + "?mode=ro", uri=True)
 
 
 def _require_store_schema_current(store_path) -> None:
