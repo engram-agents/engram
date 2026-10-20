@@ -217,7 +217,8 @@
         "tests/test_stop_hook_maturity_gate.py",
         "tests/test_stop_hook_prose_gate.py",
         "tests/test_stop_hook_owner_read_3664.py",
-        "tests/test_codex_hook_envelopes.py"
+        "tests/test_codex_hook_envelopes.py",
+        "tests/test_sys_path_hygiene_2923.py"
       ],
       "note": "engram-alpha#3664 (U6a): test_stop_hook_owner_read_3664.py added -- the flagged owner-read path's differential harness (C1), flag-off (C0/C2), owner-down (C3), timeout-budget (C4), flattened-layout (C5) and launcher-gate (C6) cells; the hook is loaded via importlib (hyphenated name), invisible to the import graph."
     },
@@ -450,7 +451,8 @@
       "path_prefix_or_glob": "tools/engramd_stage_profile.py",
       "test_globs": [
         "tests/test_engramd_stage_profile_3678.py",
-        "tests/test_store_path_precheck_3962c.py"
+        "tests/test_store_path_precheck_3962c.py",
+        "tests/test_sys_path_hygiene_2923.py"
       ],
       "note": "engram-alpha#3678 (U7): loaded by tests/test_engramd_stage_profile_3678.py via importlib (file path), so it is invisible to the layer-1 import graph."
     },

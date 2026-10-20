@@ -305,6 +305,12 @@ def _fresh_core(tmp_path, monkeypatch):
             del sys.modules[key]
     src_engram = str(SRC)
     prior = list(sys.path)
+    # #2923: snapshot the cached `tools` package so the finally can put it
+    # back. A `tools` cached from src/engram during the engram_core import
+    # must not survive, but the repo-root `tools` this process already had
+    # must (the #2565 guard trusts that cache).
+    tools_before = {k: v for k, v in sys.modules.items()
+                    if k == "tools" or k.startswith("tools.")}
     if src_engram in sys.path:
         sys.path.remove(src_engram)
     sys.path.insert(0, src_engram)
@@ -314,8 +320,10 @@ def _fresh_core(tmp_path, monkeypatch):
     finally:
         sys.path[:] = prior
         for key in list(sys.modules):
-            if key == "tools" or key.startswith("tools."):
+            if (key == "tools" or key.startswith("tools.")) \
+                    and key not in tools_before:
                 del sys.modules[key]
+        sys.modules.update(tools_before)
     monkeypatch.setattr(core, "DATA_DIR", str(tmp_path))
     return core
 

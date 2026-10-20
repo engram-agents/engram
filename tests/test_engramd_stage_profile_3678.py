@@ -61,6 +61,20 @@ _TOOL = _load_tool() if TOOL_PATH.is_file() else None
 _INJECTABLE = list(_TOOL.INJECTABLE_STAGES) if _TOOL else ["<tool missing>"]
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _restore_sys_path():
+    """#2923: tests here run the stop hook in-process (through the tool's timing
+    wrappers), and the hook's `_import_engramd_client` moves src/engram to the
+    front of sys.path -- right in the hook's own process, a leak in this shared
+    one. Put sys.path back when the module ends (a plain restore, not
+    monkeypatch.syspath_prepend, which only undoes its own prepend). Module
+    scope, not per test: the module-scoped `plain` / `store` fixtures run the
+    hook too, and a function-scoped snapshot is taken only AFTER them."""
+    saved = list(sys.path)
+    yield
+    sys.path[:] = saved
+
+
 @pytest.fixture(scope="module")
 def tool():
     if _TOOL is None:
