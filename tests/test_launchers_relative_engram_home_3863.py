@@ -271,6 +271,15 @@ def _venv_stub(login_home):
     py.chmod(0o755)
 
 
+def _seat_run_py_stub(login_home):
+    """seat-run.sh runs $HOME/.engram/venv/bin/python (ENGRAM_PY's default) for a version and a pytest probe
+    before its first `git` call; a stub that prints a 3.x version lets it reach the stubbed git."""
+    py = login_home / ".engram" / "venv" / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text('#!/bin/sh\necho "3.12.0"\nexit 0\n')
+    py.chmod(0o755)
+
+
 def _mk(home):
     home.mkdir(parents=True, exist_ok=True)
 
@@ -320,6 +329,7 @@ PROBES = {
     "src/engram/tools/forum-mention-monitor.sh": Probe(args=("--help",), evidence=_stdout),
     "src/engram/tools/forum-updates-monitor.sh": Probe(args=("--help",), evidence=_stdout),
     "src/engram/tools/ghpr.sh": Probe(evidence=_log, env_proof=True),
+    "src/engram/tools/seat-run.sh": Probe(args=("--ref", "HEAD"), login_prep=_seat_run_py_stub, evidence=_log, env_proof=True),
     "src/engram/tools/run-all-tests.sh": Probe(evidence=_log, env_proof=True),
     "src/forum/deploy/install-forum-service.sh": Probe(args=("--help",), evidence=_stdout),
 }

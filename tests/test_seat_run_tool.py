@@ -1050,3 +1050,22 @@ def test_f5_header_documents_the_ref_trust_boundary():
     head = SCRIPT.read_text().split("ENGRAM_PY=${ENGRAM_PY", 1)[0]
     for needle in ("symlink", "-xc/abs", "--cov-config", "--opt=value"):
         assert needle in head, needle
+
+
+# ------------------------------------------- ENGRAM_HOME guard (alpha #3990) ---
+def test_g3_relative_engram_home_is_refused_with_no_side_effect(world):
+    repo, env, _ = world
+    r = run_tool(repo, env, ["--ref", "HEAD", "--", "tests/test_ok.py"], ENGRAM_HOME="rel/home")
+    assert r.returncode == 2, out(r)
+    assert r.stderr == "ENGRAM_HOME must be an absolute path, got 'rel/home'\n", repr(r.stderr)
+    assert r.stdout == "", r.stdout
+    assert list(env.root.iterdir()) == [], "the refusal created something under SEAT_RUN_ROOT"
+    assert env.scratch() == []
+
+
+def test_g3_absolute_engram_home_reaches_the_tools_own_usage_refusal(world, tmp_path):
+    repo, env, _ = world
+    r = run_tool(repo, env, [], ENGRAM_HOME=str(tmp_path / "abs-home"))
+    assert r.returncode == 2, out(r)
+    assert r.stderr.startswith("usage: seat-run.sh"), repr(r.stderr)
+    assert "must be an absolute path" not in out(r)
