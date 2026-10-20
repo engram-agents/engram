@@ -832,10 +832,72 @@ def _cluster_trigger(hook_input: dict) -> str:
     return tool
 
 
-def _cluster_head(count: int, trigger: str, note: str, overflow_path: str) -> str:
+def _cluster_head(count: int, trigger: str, note: str, overflow_path: str, nudge: str = "full") -> str:
+    """The cluster header. `nudge` says what follows the one-liners (alpha#3955): "full" (today's
+    wording, byte-identical), "truncated" (a prefix of the first nudge follows), or "absent" (no room
+    for even a prefix; the header must not say "below" then)."""
     tail = f"; all {count} full texts: {overflow_path}" if overflow_path else ""
+    what = {
+        "full": "full text of the first below",
+        "truncated": "first nudge truncated below",
+        "absent": "first nudge not shown",
+    }[nudge]
     return (f"[lesson-tripwire] {count} lessons matched {trigger} (order: {note}); "
-            f"one line each, full text of the first below{tail}:")
+            f"one line each, {what}{tail}:")
+
+
+CLUSTER_MIN_NUDGE_PREFIX = 40   # a nudge prefix shorter than this is noise: the one-liners win instead
+
+
+def _cluster_truncate_nudge(bullet: str, keep: int, overflow_path: str) -> str:
+    """The first `keep` characters of the head bullet, then ONE marker line. The cut is on a
+    character boundary that stays valid text (a lone high surrogate at the cut is dropped)."""
+    cut = bullet[:keep]
+    if cut and "\ud800" <= cut[-1] <= "\udbff":
+        cut = cut[:-1]
+    marker = (f"  \u2026[nudge truncated; rest in {overflow_path}]" if overflow_path
+              else "  \u2026[nudge truncated]")
+    return cut.rstrip("\n") + "\n" + marker
+
+
+def _with_notice(head, notice) -> str:
+    """The head as emit_context renders it: the notice line (when due) above the header line."""
+    return f"{notice}\n{head}" if notice else head
+
+
+def _cluster_fits(head, body, overflow_path, budget, target) -> bool:
+    """True iff emit_context (same kwargs main() uses) renders EVERY body item whole."""
+    kept: list = []
+    emit_context(head, body, budget=budget, target=target, allow_single_overflow=True,
+                 overflow_writer=lambda _items: overflow_path, kept_out=kept)
+    return len(kept) == len(body)
+
+
+def _cluster_plan(count, trigger, note, overflow_path, lines, bullet, notice, budget, target):
+    """Decide what the cluster block shows of the head nudge (alpha#3955). Returns
+    (head, body, nudge_state) with nudge_state "full" / "truncated" / "absent"; `head` is the cluster
+    header line WITHOUT `notice` (the caller prepends the notice when it renders; the planner only
+    counts it, so its fit matches the real render). The block is
+    measured by emit_context itself (same call, same kwargs main() makes), so the plan cannot drift
+    from the real render: a candidate is accepted only when EVERY body item comes back whole.
+    Order of preference: whole nudge, else the longest prefix that fits, else one-liners only."""
+    head = _cluster_head(count, trigger, note, overflow_path, "full")
+    if _cluster_fits(_with_notice(head, notice), lines + [bullet], overflow_path, budget, target):
+        return head, lines + [bullet], "full"
+    head = _cluster_head(count, trigger, note, overflow_path, "truncated")
+    lo, hi, best = CLUSTER_MIN_NUDGE_PREFIX, len(bullet) - 1, None
+    while lo <= hi:     # the fit is monotonic in the prefix length: the rendered length never shrinks
+        # as `keep` grows (a longer prefix is never shorter text) and "fits" means length <= target,
+        # so the fitting keeps form a prefix of the range and binary search finds its end.
+        mid = (lo + hi) // 2
+        body = lines + [_cluster_truncate_nudge(bullet, mid, overflow_path)]
+        if _cluster_fits(_with_notice(head, notice), body, overflow_path, budget, target):
+            best, lo = mid, mid + 1
+        else:
+            hi = mid - 1
+    if best is not None:
+        return head, lines + [_cluster_truncate_nudge(bullet, best, overflow_path)], "truncated"
+    return _cluster_head(count, trigger, note, overflow_path, "absent"), list(lines), "absent"
 
 
 # ---------------------------------------------------------------------------
@@ -2546,6 +2608,7 @@ def _main_impl() -> None:
             _cluster_kept: list = []
             _cluster_nudge_idx = None
             _cluster_path = ""
+            _cluster_nudge_partial = False
             if len(hits) > CLUSTER_THRESHOLD:
                 try:
                     _ordered, _note = _cluster_order(hits)
@@ -2559,10 +2622,17 @@ def _main_impl() -> None:
                     # Every clustered hit's full nudge goes to the overflow file (the inline block
                     # shows one); its path rides in the header so the other nudges stay reachable.
                     _path = write_tripwire_overflow(_ordered)
-                    _head = _cluster_head(len(_ordered), _cluster_trigger(hook_input), _note, _path)
-                    hits, _tripwire_head, _cluster_path = _ordered, _head, _path
+                    # alpha#3955: the head nudge is never dropped whole -- it is rendered truncated to
+                    # the room the one-liners leave, and the header says which of the three it is.
+                    _cb = get_harness_budgets(detect_harness())["budget"]
+                    _cluster_hdr, _bullets, _state = _cluster_plan(
+                        len(_ordered), _cluster_trigger(hook_input), _note, _path, _lines,
+                        _tripwire_bullet(_ordered[0]), head_notice, _cb, max(1, _cb - _TAIL_CUT_RESERVE))
+                    hits, _cluster_path = _ordered, _path
+                    _tripwire_head = _cluster_hdr
                     _cluster_nudge_idx = len(_lines)
-                    bullets = _lines + [_tripwire_bullet(_ordered[0])]
+                    _cluster_nudge_partial = _state != "full"
+                    bullets = _bullets
                 except Exception:
                     _cluster_nudge_idx = None
 
@@ -2658,7 +2728,9 @@ def _main_impl() -> None:
                 # alpha#3924: in cluster mode only the lesson whose FULL nudge is in the visible
                 # block counts as shown (a one-liner is not its nudge text); none if the budget
                 # cut that nudge. kept_out lists the body items emit_context rendered in full.
-                shown_hits = hits[:1] if _cluster_nudge_idx in _cluster_kept else []
+                # alpha#3955: a truncated or absent nudge also counts as not shown (under-report).
+                shown_hits = (hits[:1] if _cluster_nudge_idx in _cluster_kept
+                              and not _cluster_nudge_partial else [])
         elif head_notice:
             # #3503: a loader failed and there are no hits, so the block would
             # otherwise be silent -- the line IS the block, still rendered by
