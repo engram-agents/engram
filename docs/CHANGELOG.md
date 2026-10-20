@@ -747,6 +747,69 @@ with an `-alpha` suffix during the alpha phase.
   `active`, the unsupervised launch watch, the race re-check) asks the socket
   first.
 
+- **`inspect_raw` reads its one row through the owner behind
+  `engramd.inspect_raw_reads_via_owner`, default OFF (#3949, part of
+  #2652).** "The owner" here is the EngramManager owner process, the single
+  process that owns the database; it is off by default, and each tool's
+  `*_via_owner` flag opts that tool in. `tools/inspect_raw.py` used to open
+  the live store read-write for one `SELECT`. It now goes through the shared
+  read helper (`tools/_owner_read.py`, which sends reads to the owner when the
+  flag is ON) with one registered template (`id`, `type`, `embedding`, `confidence_history`,
+  `metadata` for one id), and on both flag values the direct path is
+  `mode=ro`, so the file has no write-capable handle and no `sqlite3.connect(`
+  line. The answer is validated before use (at most one row of five cells,
+  the id equals the one asked for, the types fit). With the flag ON and the
+  owner down, refusing or answering malformed, the tool exits 3 with empty
+  stdout and one stderr line, never "not found" and never a direct fallback.
+  A row that does not fit (for example a BLOB `embedding`) is refused with
+  exit 3 on both flag values; the flag-OFF message does not name the owner.
+  Exit 1 still means "node or store not found". Two inputs that used to
+  traceback now exit 2 with one line: a relative `ENGRAM_HOME` and a node id
+  that is not valid UTF-8. Known limit: with the flag OFF the read-only open leaves
+  `knowledge.db-wal` and `-shm` behind on a WAL store with no other open
+  handle, where the old read-write open cleaned them up.
+
+- **`inspect_raw`, flag OFF: an unreadable store is exit 3, not a traceback
+  with exit 1 (#3958, closes #3954, part of #2652).** With the flag OFF, a
+  store that exists but cannot be read as a store (a text file, a directory,
+  a valid SQLite file with no `nodes` table, a store with mode 000, a store
+  another process has locked) raised a `sqlite3` error and died with exit 1,
+  which is the tool's "node or store not found" code. It now exits 3 with
+  empty stdout and one stderr line naming the store path and sqlite's
+  message; the remedy names the lock case because a lock is usually
+  transient. The catch is `sqlite3.Error` only, at both the open and the
+  execute, and only with the flag OFF, so an unrelated failure is not
+  relabelled "unreadable store". A missing store still exits 1 with
+  `DB not found`, and every flag-ON path is unchanged. Known limit: the
+  stderr line starts with the error class name `InspectRawOwnerReadError`, so
+  the word "Owner" appears on flag-OFF lines too.
+
+- **One store-path precheck in the shared read helper, mapped per tool
+  (#3961, closes #3960, part of #2652).** Eight tools gated their flag-OFF
+  read on `not db_path.exists()` and then opened the store. On macOS that
+  failed three ways: `exists()` raises `PermissionError` when a parent
+  directory cannot be searched, returns False for a symlink loop or dangling
+  link (so the tool said "not found" and invited creating a store over a
+  link), and a FIFO at the store path made the `mode=ro` open block forever
+  (a regression for `inspect_raw` since #3949). `tools/_owner_read.py` gains
+  `check_store_path(db_path)`, which uses `lstat`, then `stat`, then a
+  regular-file check, never opens the path, and never picks an exit code. No
+  directory entry raises the built-in `FileNotFoundError` the callers already
+  handle; an uncheckable path raises `StoreUncheckable`; a path that is not a
+  regular file raises `StoreNotAStore`. Both new classes derive from
+  `StoreUnusable`, deliberately not from `OSError`, so no existing handler
+  swallows them. The flag-OFF branch of `open_reader` now runs the check
+  itself, so a FIFO cannot block any caller. Each tool keeps its own codes:
+  `inspect_raw` exits 3, `reconcile_lesson_demotions` keeps its JSON error
+  shape, `engram-regenerate-embeddings` prints a line without the "create the
+  store" remedy and never exits 3, `cohort_dispatch verify-in` records a
+  `db_access` error instead of skipping silently, and `cohort_dispatch
+  prepare` prints one `error:` line where it used to traceback on a missing
+  store. Known limits: a store that is a regular file but not a database
+  still tracebacks in `cohort_dispatch` (#3963), `backup_knowledge_db.py` can
+  still hang on a FIFO (#3962), and a path swapped for a FIFO between the
+  check and the open is out of scope. The flag-ON paths are untouched.
+
 ### Hooks, lessons, session start and agentctl
 
 - **"Forum configured" means `forum.url` is set, everywhere (closes #3546 via
@@ -906,6 +969,76 @@ with an `-alpha` suffix during the alpha phase.
 - **The lesson-tripwire hook reads through the owner behind
   `engramd.lesson_tripwire_reads_via_owner`, default off (#3725, part of
   #3665).** The shim routes the IDF lookup to the typed `df` op. U6b.
+
+- **Per-lesson `match_scope`: the command view hides heredoc bodies and MCP
+  prose (#3937, part of #3911, closes #3920).** Each tripwire lesson now has
+  a `match_scope`. With `command` (opt-in per lesson) the pattern is matched
+  against the command with heredoc bodies replaced by `<<HEREDOC>>`, and for
+  MCP calls with the prose fields (`body`, `claim`, `quoted_text` and the
+  like, including string arguments inside `payload_json`) replaced by a
+  placeholder. With `full`, the default, the whole call is matched, as
+  before; an unknown stored value counts as `full`. The default is `full`
+  rather than the `command` the issue asked for, because lessons are per-seat
+  data and a `command` default would silently blind any body-text lesson on a
+  seat that has not checked it. A heredoc fed to an interpreter or shell
+  (`bash`, `sh`, `python`, `ssh`, `sudo`, `node`, including path-qualified
+  forms and `cat <<EOF | bash`) stays visible, because it runs, and an
+  unterminated heredoc is never stripped. `engram_update_lesson` accepts
+  `match_scope`, and `tools/lesson-pattern-audit.py --compare-views` replays
+  a transcript under both views and reports the matches a lesson would lose
+  (it only reports). Known limits: the heredoc parser is not shell-aware (a
+  `<<EOF` inside a multi-line quoted string is not recognised, and a heredoc
+  inside double quotes is not stripped, which errs toward more matching), and
+  prevention lessons and the triggered-principles chain still match the full
+  target.
+
+- **The loop-arm Stop hook counts quiet wakes and nudges after 2 in a row
+  (#3947, part of #3919, the owner-and-study-mode work).** A quiet wake is a turn started by a loop-wake
+  prompt or a task notification in which every tool call is an observe or
+  re-arm tool (`Bash` only through a read-only allowlist: one simple command,
+  no redirects or `;`, at most three pipe stages), and whose transcript delta
+  parses; anything doubtful counts as not quiet, so the failure direction is a
+  missed nudge, never a spurious one. After 2 quiet wakes in a row the hook
+  injects one nudge: take a step you own from your project board (the
+  agent's board in the Umwelt world), or run one study unit. The nudge's
+  next act was first the latest dream report's awake-seat section; #3956
+  in this same release now provides `tools/study_queue.py` for that. The counter resets on any non-quiet
+  turn and after a nudge, runs before the "arm confirmed" early return, never
+  emits while the arm-check nudge is firing, and swallows its own exceptions.
+  It lives in `$ENGRAM_HOME/.quiet-wake-counter.json`, not in the loop
+  marker, so `loop_prompt.py` is untouched. The hook's own block-feedback
+  record and the compaction summary, which both quote the loop-wake marker,
+  are skipped when finding the trigger. Known limits: two sessions sharing one
+  `ENGRAM_HOME` overwrite each other's counter, and a skipped hook run makes
+  the next delta span several turns and count as one tick. Managed Codex and
+  other pacers are not covered.
+
+- **The tripwire hook renders more than 3 co-firing lessons as one cluster
+  block, rarity-ranked (#3948, part of #3911, closes #3924).** The tripwire
+  hook reminds the agent of its lessons when an action matches a lesson's
+  pattern; co-firing lessons are lessons that fire on the same action. When
+  more than three lessons match one tool call, the hook prints one block instead
+  of separate bullets with an overflow filename: a header naming the trigger,
+  the count, the order used and the overflow path that holds every full text;
+  one line per matched lesson (`- <id>: <recall_summary>`, the claim cut to
+  140 characters when there is no summary, each line capped at 200); and one
+  full nudge, for the first lesson in the ranking. At three hits or fewer the
+  output is byte-identical to before. Within one `tripwire_priority` the
+  order is ascending fires per 1,000 targets from
+  `$ENGRAM_HOME/lesson-fire-ranks.json` (the rank file: how often each lesson
+  fires per 1,000 actions, so rarer lessons come first), then the longest
+  `situation_pattern`, then the lesson id. The rank file is written offline
+  by `tools/lesson-pattern-audit.py --write-ranks [PATH]` (temp file and
+  rename, mode kept, POSIX ACLs copied on Linux only); the hook only reads
+  it. With no file, or an unreadable, malformed or stale (older than 7 days)
+  one, it falls back to the old length order, and the header says which
+  order it used. The loader query now also returns `recall_summary` and
+  `claim`. Known limits: the step that regenerates the rank file in the sleep
+  cycle is a separate issue (#3941); the audit's rates cover lessons only, so
+  other tripwire types rank last; a database older than the `recall_summary`
+  column makes the loader fail visibly until the server migrates it; and the
+  cluster block's size target is the harness budget, not the 1,800-character
+  single-lesson ceiling.
 
 ### Recall-measurement probes (developer tier)
 
@@ -1214,6 +1347,82 @@ with an `-alpha` suffix during the alpha phase.
   user-installed plugin (convenience tier), so nothing changes for a seat that
   has not installed it.
 
+- **The nap dump is atomic and verified, and the health backfill records and
+  skips an unrestorable commit (#3952, closes #3951).** A rare nap committed
+  a truncated `knowledge.sql`, and the health backfill then stopped at it.
+  `engram_backup.dump_stripped` now writes the dump to a temp file in the
+  same directory, fsyncs it, checks that it restores into `:memory:` with a
+  `nodes` count equal to the snapshot's and that it ends committed (a
+  `COMMIT;` and `PRAGMA user_version = N;` tail), gives it the old file's mode
+  (0644 if there was none), and only then `os.replace`s it onto the target.
+  On any failure the temp file is removed, the old file stays byte-identical
+  and the function raises as before; the sync nap path then stages the
+  previous good file, so a failed dump can no longer be committed. The check
+  also exposed an older defect: when dropping `vec_nodes` left
+  `sqlite_sequence` with no AUTOINCREMENT table, the dump held a
+  `DELETE FROM "sqlite_sequence"` that fails to restore, so that one
+  statement is now skipped in that case. On the health side, `replay_commit`
+  raises a typed `UnrestorableCommit` for a failed `git show` or a
+  `sqlite3.Error` while restoring the dump, and `backfill` records the commit
+  in a new `unrestorable_commits` table (keyed by commit, health major and
+  replay declaration hash), skips it on later runs for the same key and
+  carries on. The run record carries `unrestorable_count` and
+  `unrestorable_shas`, so a skip is never silent, and no `l0_points` row is
+  written for a skip. Measured by the author: about 0.9 s extra on a 74 MB,
+  11,590-node dump. Known limits: the directory is not fsynced after the
+  rename, the check reads the whole dump into memory, and a source database
+  with a negative `user_version` would fail the tail check loudly.
+
+- **`tools/study_queue.py`: the seat's top study targets (#3956, part of
+  #3919, the study-mode work; a rebase of #3950).** `study_queue.py [--n 3] [--json] [--db
+  PATH] [--home PATH] [--now ISO]` prints the top N study targets, each with a
+  node id or file reference, why it is listed and one fixed method sentence
+  for its kind. It is read-only, deterministic, and uses no network and no
+  LLM. Sources in priority order: the latest dream report's awake-seat and
+  open-for-tomorrow items (minus those its own triage marked `do now` or
+  `file`), the weakest load-bearing belief, open questions (including
+  `partially_resolved` ones, oldest recalled first, up to 3), active
+  conjectures (lowest confidence first, up to 3) and pending cascade markers
+  (up to 2). A candidate whose node ids an earlier one already names is
+  dropped, ids a dream item names are skipped before the per-source caps, and
+  ids are matched only for the store's real prefixes. The second output line
+  reminds the seat to check what is new in the world first, and the footer
+  says what is not built (goal tension, the syllabus and paper queue, unrun
+  measurements). The latest dream report is chosen by file stem among
+  date-prefixed names, so a same-day `-turn110` record beats the plain one.
+  A new flag, `engramd.study_queue_reads_via_owner` (default OFF), routes the
+  question, conjecture and cascade reads through the owner (the EngramManager
+  process that owns the database); with it ON and the
+  owner down, refusing or malformed, the tool raises `StudyQueueOwnerReadError`
+  and never prints an empty queue or falls back to a direct open. The
+  weakest-belief read still follows `weakest_load_bearing_reads_via_owner`.
+  Known limit: with `--home`, the weakness read's current turn still comes
+  from the launch home.
+
+- **Dream-to-awake pickup: at most 3 heads, a `Morning pickup` section written
+  by the seat, quoted the next night (#3953, part of #3919, the study-mode work).** The dream
+  master's `## For the awake seat` now carries at most 3 ordered head items,
+  each with a node id (a file reference only when no node exists); further
+  items go to `## Open for tomorrow`. The awake seat answers each head the
+  next morning in a `## Morning pickup` section at the end of the dream
+  record, one line per head (`p1. picked up <what was done>` or `p1. skipped
+  (<reason>)`), written with a new tool, `tools/dream_pickup.py (--pick N TEXT
+  | --skip N REASON) [--record PATH] [--home PATH]`. The tool edits the
+  latest record's final section, replaces a head's line in place (so it is
+  idempotent), keeps lines sorted, writes the whole file atomically with its
+  mode, caps the text at 300 characters on one line, strips control
+  characters, refuses a bad N, empty text or a missing or non-UTF-8 record
+  (exit 2, nothing written), and does not commit. Concurrent runs take an
+  exclusive lock on a hidden sidecar file with a 10 second wait limit, so
+  parallel `--pick` calls no longer lose lines. The next dream record quotes
+  the previous `## Morning pickup` lines at its top under `## Previous morning
+  pickup (quoted)`, or the single line `none`, so a skipped head shows two
+  mornings running. The latest record is chosen by file stem, so a same-day
+  second dream wins. `engram-dream-master.md` and `engram-sleep/SKILL.md` carry
+  the matching text. Known limit: `study_queue.py` does not yet treat a head
+  whose pickup line says `picked up` or `skipped` as handled; that is a
+  follow-up.
+
 ### ENGRAM home resolution (`ENGRAM_HOME`)
 
 - **A CI gate keeps new hard-coded ENGRAM home paths out of shipped files
@@ -1334,6 +1543,37 @@ with an `-alpha` suffix during the alpha phase.
   processes refuse a relative value only in a later PR of the series, not
   here.
 
+- **`ENGRAM_HOME` in the prose tail and the launchers, and a home-anchored
+  venv gate (#3931, part of #3863).** First, every
+  line in a shipped prose file, docstring or comment that spells the default
+  home now also names `ENGRAM_HOME` on the same line (58 files under `src/`);
+  in `.py` files only comments, docstrings and string literals changed. Four
+  shell scripts (`tools/ghpr.sh`, `tools/run-all-tests.sh`,
+  `tools/engram-fix-git-backup.sh`, `tools/install-local-marketplace.sh`) now
+  default the venv to `$HOME/.engram/venv` instead of a path derived from
+  `ENGRAM_HOME`, so a seat with a custom home that keeps its own venv there
+  must set the override (`GHPR_PYTHON`, `ENGRAM_PY`, `PYTHON_BIN`;
+  `install-local-marketplace.sh` has none). Second, 15 shipped shell scripts
+  that read `ENGRAM_HOME` now refuse a relative value instead of resolving it
+  against the cwd: 13 print one stderr line and exit 2, and the two session
+  hooks that must never block a session, `start-engram-daemon.sh` and
+  `start-engramd-owner.sh`, fail open with one line and exit 0. In all 15, a
+  value that starts with a literal tilde (`~` or `~/...`) is expanded to
+  `$HOME` and re-exported, and `~user/...` is refused. Third,
+  `tools/home_path_gate.py` now exempts the plugin venv only for a
+  home-anchored prefix (tilde, `$HOME`, `${HOME}`, or `Path.home` and
+  `expanduser` forms), with one shared definition that the shell scan in
+  `tests/test_shell_engram_home_3863.py` imports; a venv derived from
+  `ENGRAM_HOME` is now flagged. Five one-time tests that compared the
+  tree to fixed past commits are deleted after a recorded acceptance run (210
+  passed), because one harmless added line in a covered file turned them red;
+  `tests/test_first_session_bootstrap_home_3863.py` replaces the invariant
+  they pinned for the first-session bootstrap lookup. A launcher-test fixture
+  now supplies its own `timeout` stub, because macOS has no `timeout`. Known
+  limits: the gate does not scan `tools/` (a text guard covers
+  `tools/rc-upgrade-verify.py`), and an empty `ENGRAM_HOME` in the bootstrap
+  fence is unpinned by a test.
+
 ### Upgrade, release, monitors and docs
 
 - **`check-claude-md-drift.py --live FILE` (closes #3604 via PR #3605; fixes
@@ -1432,6 +1672,47 @@ with an `-alpha` suffix during the alpha phase.
   `ubuntu-latest`), and a real-socket test on Linux where a non-root foreign
   peer received a typed `peer_identity` refusal and nothing was served. Known
   limit: the real-socket test on Darwin has not been run.
+
+- **`engram-upgrade` Step 5.5 restarts the long-lived daemons after the
+  reload trio (#3940).** The reload trio (`/plugin marketplace update`,
+  `/reload-plugins`, `/mcp` reconnect) does not restart the surface daemon or
+  the owner (the EngramManager process that owns the database, if the seat
+  runs one), so a seat that followed the skill to the end still ran the old
+  daemons next to the new hooks; the gap measured on the rc1 to rc2 upgrade
+  was 1441 changed lines in the owner (+1432/-9) and 37 in the surface daemon
+  (+17/-20). The new step,
+  placed after the MCP reconnect and before the viz step so nothing is
+  renumbered, restarts (a) the surface daemon (check that it predates the
+  rebuild using `etimes`, restart through its user unit if there is one,
+  otherwise stop the pid in `recall-daemon.pid` and run the deployed
+  `start-engram-daemon.sh`, then verify the new pid, a fresh socket and the
+  new log line) and (b) the owner, only if the seat has a running one, in
+  three cases: a supervised unit (run `setup-surface-daemon-service.sh
+  --owner`, then restart the unit), a live `engramd.pid` with no unit
+  (stop the saved pid and let the SessionStart hook relaunch it, without
+  `--owner`), or neither (skip). A warning box notes that
+  `setup-surface-daemon-service.sh` ignores flags it does not know, so
+  `--help` runs its default action. The Step 4 checkpoint and the Step 9 claim
+  template gain a daemons field. Known limits: Codex seats are not covered;
+  measured only on two Linux seats (a unit-supervised one with no owner and a
+  WSL2 one with no unit and no owner); the macOS `launchctl kickstart` line,
+  the hook-launched owner branch and every owner command were not run and are
+  marked unverified in the step.
+
+- **`check_2652_ledger.py` derives more of the migration ledger's tallies from
+  its rows (#3959, part of #2652).** Until now the checker derived only
+  the `state` tally, so the `kind`, `target` and unit tally lines in
+  `docs/2652-migration-ledger.md` could drift unnoticed (they did once, until a
+  later PR recounted them by hand). It now reads the `kind`
+  column by header name, takes the target category from the cell's leading
+  text (`live store`, `parameter`, `other DB`, `n/a (prose)`, `unresolved`),
+  and checks the "call rows are N lines" number against the derived `call`
+  count. A disagreeing count fails with `section 1 kind: <value> says N, rows
+  give M` (the same shape for target); a value outside the set fails with
+  `row N: unknown kind` or `unknown target`; a missing or unparseable tally
+  fails with "could not parse section 1 tally". The connects number cannot be
+  derived from the rows and stays unchecked, as the docstring now says. State
+  and citation checks are unchanged. The ledger itself is unchanged.
 
 ### Viz
 
