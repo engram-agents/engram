@@ -19,8 +19,20 @@ DEPLOY_TAG_INIT = REPO_ROOT / "src" / "build" / "engine" / "__init__.py"
 DEPLOY_TAG_MODULE = REPO_ROOT / "src" / "build" / "engine" / "deploy_tag.py"
 
 
+def _login_home(tmp_path):
+    """A temp login HOME. The venv is always $HOME/.engram/venv, whatever ENGRAM_HOME is
+    (Borges' ruling on #3863), so the installer must never see the real HOME's venv."""
+    # a SIBLING of ENGRAM_HOME: some tests need ENGRAM_HOME itself to not exist yet
+    home = tmp_path.parent / (tmp_path.name + "-login-home")
+    home.mkdir(parents=True, exist_ok=True)
+    return home
+
+
 def _env(tmp_path, **overrides):
-    env = {**os.environ, "ENGRAM_HOME": str(tmp_path)}
+    real_gitconfig = Path(os.environ.get("HOME", "")) / ".gitconfig"
+    env = {**os.environ, "ENGRAM_HOME": str(tmp_path), "HOME": str(_login_home(tmp_path))}
+    if real_gitconfig.is_file() and "GIT_CONFIG_GLOBAL" not in env:
+        env["GIT_CONFIG_GLOBAL"] = str(real_gitconfig)  # git identity only; the temp HOME has none
     env.pop("ENGRAM_BUILD_DIR", None)
     env.update({key: str(value) for key, value in overrides.items()})
     return env
@@ -710,12 +722,13 @@ def test_install_local_marketplace_replaces_direct_child_symlink_not_external_ta
 
 
 def _fake_venv(tmp_path, log_file, *, exit_code=0):
-    """Create a fake $ENGRAM_HOME/venv/bin/python that logs every argv it sees.
+    """Create a fake $HOME/.engram/venv/bin/python (HOME = the temp login home, the venv is
+    never under ENGRAM_HOME: Borges' ruling on #3863) that logs every argv it sees.
 
     exit_code controls the fake python's exit status, so the failure-recovery
     path (pip install fails → install completes but exits non-zero) is testable.
     """
-    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin = _login_home(tmp_path) / ".engram" / "venv" / "bin"
     venv_bin.mkdir(parents=True)
     fake_py = venv_bin / "python"
     fake_py.write_text(
@@ -2125,3 +2138,23 @@ def test_shipped_shell_scripts_parse_under_macos_bash32():
             f"{len(failures)} of {len(scripts)} shipped script(s) failed "
             f"`bash -n` under macOS system bash 3.2.x:\n{detail}"
         )
+
+
+def test_install_local_marketplace_looks_for_the_venv_under_home_not_under_engram_home(tmp_path):
+    """Borges' ruling on #3863: the venv is always $HOME/.engram/venv. With ENGRAM_HOME at a
+    path holding a space (and a decoy venv there), the installer provisions the HOME one."""
+    eh = tmp_path / "my engram home"
+    eh.mkdir()
+    (eh / "config.json").write_text(json.dumps({"install_tier": "dev"}))
+    decoy_log, real_log = tmp_path / "decoy.log", tmp_path / "real.log"
+    decoy_bin = eh / "venv" / "bin"
+    decoy_bin.mkdir(parents=True)
+    (decoy_bin / "python").write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{decoy_log}"\n')
+    (decoy_bin / "python").chmod(0o755)
+    _fake_venv(tmp_path, real_log)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={"ENGRAM_HOME": eh})
+
+    assert f"Provisioning venv at {_login_home(tmp_path)}/.engram/venv" in result.stdout
+    assert "-m pip install --quiet -r" in real_log.read_text()
+    assert not decoy_log.exists(), "the installer used a venv under ENGRAM_HOME"

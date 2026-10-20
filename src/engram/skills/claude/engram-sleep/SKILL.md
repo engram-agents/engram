@@ -194,7 +194,7 @@ Common missed-node types:
 
 At the end of sleep, the day is over. The warm-briefing's "From this session" section is per-context-window state managed by naps (see `engram-nap` §5b for the in-sync-with-current-CW rule). At sleep-end, the next day starts fresh — erase the section content. Next morning's first nap will create a new in-sync block.
 
-**Action:** the tool is `"${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/erase_session_block.py"` — this is THE way to do the erase (#3141). **LOOK first, then run:** read the section below the last `## From this session` anchor (or run the tool with `--dry-run` and read its `removed N chars / K lines` summary), apply the drift-STOP check below, and only THEN run the tool for real. The tool implements the four steps below by character offset and asserts the byte-identity post-condition before writing. Exit codes: **0** = done, or already bare (no change); **3** = drift-STOP — surface to the user, do NOT erase; **2** or **4** = stop and report. Exit 3 and an exit 4 from a pre-write post-condition leave the file untouched; exit 2 (IO error) and an exit 4 from the read-back check MAY have written, so read stderr ("original bytes restored" vs "NOT restored") and check the file before doing anything else. **Exit 0 means the byte-identity and structural checks passed — it does NOT mean no user words sit in or below the section:** the tool only detects ATX `#`/`##` headings (a best-effort proxy), so the prose clause of the drift-STOP stays your own judgement. If the tool is absent, do it by hand as follows (the by-hand offset rule is the fallback), locating the target **mechanically**, not by reading `${ENGRAM_HOME:-$HOME/.engram}/warm-briefing.md`:
+**Action:** the tool is `"$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/erase_session_block.py"` — this is THE way to do the erase (#3141). **LOOK first, then run:** read the section below the last `## From this session` anchor (or run the tool with `--dry-run` and read its `removed N chars / K lines` summary), apply the drift-STOP check below, and only THEN run the tool for real. The tool implements the four steps below by character offset and asserts the byte-identity post-condition before writing. Exit codes: **0** = done, or already bare (no change); **3** = drift-STOP — surface to the user, do NOT erase; **2** or **4** = stop and report. Exit 3 and an exit 4 from a pre-write post-condition leave the file untouched; exit 2 (IO error) and an exit 4 from the read-back check MAY have written, so read stderr ("original bytes restored" vs "NOT restored") and check the file before doing anything else. **Exit 0 means the byte-identity and structural checks passed — it does NOT mean no user words sit in or below the section:** the tool only detects ATX `#`/`##` headings (a best-effort proxy), so the prose clause of the drift-STOP stays your own judgement. If the tool is absent, do it by hand as follows (the by-hand offset rule is the fallback), locating the target **mechanically**, not by reading `${ENGRAM_HOME:-$HOME/.engram}/warm-briefing.md`:
 
 1. Find every line matching the anchored regex `^## From this session` — **line-anchored, never a substring search.** A mid-line or quoted occurrence is prose, not the heading, and must never match.
 2. Take the **LAST** such line. Not the first. If the file has drifted so the phrase appears more than once, the last one is the real section; an earlier one sits inside the user's preserved notes.
@@ -316,7 +316,7 @@ Run the tool with `--json` via the engram venv python and the plugin path (same 
 
 ```bash
 embed_backfill_stderr=$(mktemp)
-embed_backfill_json=$("${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/engram-regenerate-embeddings.py" --json 2>"$embed_backfill_stderr")
+embed_backfill_json=$("$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/engram-regenerate-embeddings.py" --json 2>"$embed_backfill_stderr")
 embed_backfill_rc=$?
 if [ $embed_backfill_rc -eq 0 ] && [ -n "$embed_backfill_json" ]; then
     EMBED_BEFORE=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['before_null'])" "$embed_backfill_json")
@@ -415,7 +415,7 @@ Uses `engram_backup.dump_stripped` (WAL-safe, no CLI dependency).
 venv, so invoke via venv Python:
 
 ```bash
-backup_out=$("${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/backup_knowledge_db.py" \
+backup_out=$("$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/backup_knowledge_db.py" \
     [--retain 90] 2>&1)   # prune archives older than 90 days; omit to keep all
 backup_rc=$?
 if [ $backup_rc -eq 0 ]; then
@@ -460,7 +460,7 @@ Top-level logs are cited as `source_url` evidence in ENGRAM nodes; subagent logs
 are ephemeral fairy transcripts that are never cited.
 
 ```bash
-session_backup_out=$("${ENGRAM_HOME:-$HOME/.engram}"/venv/bin/python3 \
+session_backup_out=$("$HOME/.engram/venv/bin/python3" \
     "$CLAUDE_PLUGIN_ROOT/tools/backup_session_logs.py" \
     [--retain 365] 2>&1)   # prune archive entries older than 365 days; omit to keep all
 session_backup_rc=$?
@@ -501,7 +501,7 @@ disaster-recovery and migration-safety.
 (already handled by the Step 4.5 SQL dump).
 
 ```bash
-claude_backup_out=$("${ENGRAM_HOME:-$HOME/.engram}"/venv/bin/python3 \
+claude_backup_out=$("$HOME/.engram/venv/bin/python3" \
     "$CLAUDE_PLUGIN_ROOT/tools/backup_claude_projects.py" \
     2>&1)
 claude_backup_rc=$?
@@ -785,7 +785,7 @@ Verify-in checks: (1) valid JSON per chunk, (2) required fields present (id, typ
 **Step 6a — Run the lottery draw first, before touching the Agent tool.**
 
 ```bash
-"${ENGRAM_HOME:-$HOME/.engram}"/venv/bin/python3 -m tools.dream_lottery draw \
+"$HOME/.engram/venv/bin/python3" -m tools.dream_lottery draw \
   --db "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.db \
   --turn <CURRENT_TURN>   # from engram_stats / engram_reflect — the turn this cohort is closing, pre-advance
 ```
@@ -1060,7 +1060,7 @@ The dream master returns:
 - Recall summaries: applied / fixed-at-spot / unfixable counts
 - Health score delta
 - Flagged-for-user count
-- awake-seat items: N (count of numbered items in `## For the awake seat`; 0 when the block is `none`)
+- awake-seat items: N (count of numbered items in `## For the awake seat`: these are the heads, at most 3; 0 when the block is `none`)
 
 Relay this to the user in 3-6 short bullets. Surface the dream-record path so the user can read the "Flagged for the user" section in the morning review. Then go to Step 9.5.
 
@@ -1077,6 +1077,15 @@ Append the dispositions to the dream record as a new final section `## Sleep-end
 **Empty block.** If `## For the awake seat` is the literal line `none` and `## Open for tomorrow` is empty, still append `## Sleep-end triage (parent)` with the single line `none (0 items)` and log `sleep-end triage: 0 items`.
 
 **Partial return.** If the master returned partial and the `## For the awake seat` block is ABSENT, append the section with one line `master returned partial — block absent; triaged from the fairy reports instead:` followed by any dispositions. Step 9.5 triages only what the fairy reports already contain; it runs no master step. Anything unfinished still goes to the next cohort via the "Don't retry an interrupted dream" guardrail below.
+
+**Morning pickup (a different thing from the triage above).** The triage lines are the parent's sleep-end disposition. The pickup is the NEXT morning's account of what was actually done with each head (the at most 3 items under `## For the awake seat`). The awake seat, not the parent and not a reader tool, appends it to the dream record at its first routine-board tick, one head at a time, with `"$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/dream_pickup.py" --pick N "<what was done>"` or `--skip N "<reason>"` (quote the text; `--home` overrides the seat's home, `${ENGRAM_HOME:-$HOME/.engram}`). The tool edits the latest record's last `## Morning pickup` section, one line per head (`p1`, `p2`, `p3`), in one of two forms:
+
+```
+p1. picked up <what was done>
+p1. skipped (<reason>)
+```
+
+It does not commit; the seat commits the record as in the block below (`dream YYYY-MM-DD: morning pickup`). The next dream record quotes this section verbatim at its top, so a skipped head stays visible two mornings running. This text is read at night; the morning prompt for the step is the Morning Routine Board item (alpha #3919 M5), and until that item exists the seat runs it right after the morning dream-triage check.
 
 Then commit, mirroring the master's own record commit (a second commit on the same file):
 

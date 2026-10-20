@@ -2152,7 +2152,7 @@ def _get_person_moment_cooldown_seconds() -> float:
 
 def _person_moment_ledger_path() -> str:
     """Path to the SAME surfaced-recency ledger file the auto-surface hook
-    reads/writes (~/.engram/surface-ledger.json) — read live via
+    reads/writes (~/.engram/surface-ledger.json, under $ENGRAM_HOME) — read live via
     core.DATA_DIR (not cached) so test sandboxes (_configure_paths) redirect
     this correctly, same discipline as the hook's own dynamic ENGRAM_HOME read.
     """

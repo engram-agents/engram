@@ -489,3 +489,46 @@ def test_edit_history_entry_per_call_not_per_field():
     assert len(rows) == 1, rows
     details = json.loads(rows[0]["details"])
     assert set(details["updated_fields"].keys()) == {"situation_pattern", "scaffolding_nudge"}
+
+
+# ---------------------------------------------------------------------------
+# alpha#3920 (part of #3911): match_scope
+# ---------------------------------------------------------------------------
+
+def test_match_scope_full_is_stored_and_traced():
+    server = fresh_server()
+    lesson_id = _make_lesson(server, situation_pattern=_REGEX_PATTERN)
+
+    upd = json.loads(server.engram_update_lesson(payload_json=json.dumps({
+        "node_id": lesson_id,
+        "updates": {"match_scope": "full"},
+        "reason": "depends on body text (#3920)",
+    })))
+    assert "error" not in upd, upd
+    assert upd["updated_fields"]["match_scope"] == "full"
+    assert upd["field_traces_delta"]["match_scope"]["prior_value"] is None
+
+    meta = _lesson_metadata(server, lesson_id)
+    assert meta["match_scope"] == "full"
+    assert meta["situation_pattern"] == _REGEX_PATTERN  # untouched
+
+
+def test_match_scope_command_is_accepted():
+    server = fresh_server()
+    lesson_id = _make_lesson(server, situation_pattern=_REGEX_PATTERN)
+    upd = json.loads(server.engram_update_lesson(payload_json=json.dumps({
+        "node_id": lesson_id, "updates": {"match_scope": "command"},
+    })))
+    assert "error" not in upd, upd
+    assert _lesson_metadata(server, lesson_id)["match_scope"] == "command"
+
+
+def test_match_scope_unknown_value_is_rejected_and_nothing_is_stored():
+    server = fresh_server()
+    lesson_id = _make_lesson(server, situation_pattern=_REGEX_PATTERN)
+    upd = json.loads(server.engram_update_lesson(payload_json=json.dumps({
+        "node_id": lesson_id, "updates": {"match_scope": "cmd"},
+    })))
+    assert "Invalid match_scope" in upd.get("error", ""), upd
+    assert upd["valid_types"] == ["command", "full"]
+    assert "match_scope" not in _lesson_metadata(server, lesson_id)

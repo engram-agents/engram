@@ -84,11 +84,11 @@ def _make_db(tmp_path, with_row=True, name="k.db"):
     conn = sqlite3.connect(str(db))
     conn.execute(
         "CREATE TABLE nodes (id TEXT, type TEXT, is_current INTEGER, "
-        "memory_status TEXT, claim TEXT, metadata TEXT)"
+        "memory_status TEXT, claim TEXT, metadata TEXT, recall_summary TEXT)"  # recall_summary: alpha#3924, read by load_tripwires
     )
     if with_row:
         conn.execute(
-            "INSERT INTO nodes VALUES (?,?,?,?,?,?)",
+            "INSERT INTO nodes (id, type, is_current, memory_status, claim, metadata) VALUES (?,?,?,?,?,?)",
             ("ls_good", "lesson", 1, "active", "good claim", json.dumps(GOOD_META)),
         )
     conn.commit()
@@ -147,7 +147,7 @@ def _release_lock():
 
 def _expected_control(loader):
     if loader == "load_tripwires":
-        return [("git push --force", "do not force push", "ls_good", "high")]
+        return [("git push --force", "do not force push", "ls_good", "high", "full", None, "good claim")]  # 5th: match_scope (#3920); 6th/7th: recall_summary, claim (#3924)
     return [{"id": "ls_good", "pattern": "git push --force",
              "prevention_type": "shadow", "nudge": "do not force push"}]
 
@@ -496,6 +496,9 @@ def _near_ceiling_tripwires(hook, monkeypatch, capsys, notice_prev_db, tmp_path)
 def test_k6_near_ceiling_block_plus_line_stays_within_bound(hook, tmp_path, monkeypatch, capsys):
     """Red mutation (e): rendering the line outside emit_context (a bare
     append/print after the block) pushes the total past the ceiling."""
+    # alpha#3924: 40 co-firing hits is above CLUSTER_THRESHOLD; this cell pins the ORIGINAL bounded
+    # block (loader line + capped bullets under the 1800 ceiling), so the threshold is put out of reach.
+    monkeypatch.setattr(hook, "CLUSTER_THRESHOLD", 10 ** 6)
     trips, base_len = _near_ceiling_tripwires(hook, monkeypatch, capsys, None, tmp_path)
     bad = tmp_path / "junk.db"
     bad.write_bytes(b"not a database" * 100)

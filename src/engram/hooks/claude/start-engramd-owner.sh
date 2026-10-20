@@ -114,6 +114,26 @@
 # Sibling paths resolve via $CLAUDE_PLUGIN_ROOT first, then a walk-parents search for the
 # target file -- never a fixed parents[N] (hooks/claude/ in source, hooks/ when flattened).
 
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863): it would resolve against the calling process's cwd, a
+# different home for every process. Unset or empty means unset; a leading ~ is expanded against $HOME and
+# re-exported (~user is not expanded: it is not absolute, so it is refused). Checked before anything else
+# runs. A SessionStart hook fails open: one stderr line, nothing written, exit 0.
+if [ -n "${ENGRAM_HOME-}" ]; then
+    _eh_raw="$ENGRAM_HOME"
+    case "$ENGRAM_HOME" in
+        "~") ENGRAM_HOME="${HOME-}"; export ENGRAM_HOME ;;
+        "~/"*) ENGRAM_HOME="${HOME-}/${ENGRAM_HOME#"~/"}"; export ENGRAM_HOME ;;
+    esac
+    case "$ENGRAM_HOME" in
+        /*) ;;
+        *)
+            printf "engram hook: ENGRAM_HOME must be an absolute path, got '%s'; doing nothing\n" "$_eh_raw" >&2
+            unset _eh_raw
+            return 0 2>/dev/null || exit 0 ;;
+    esac
+    unset _eh_raw
+fi
+
 trap 'exit 0' EXIT
 
 : "${ENGRAM_HOME:=$HOME/.engram}"

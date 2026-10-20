@@ -7,7 +7,7 @@ function calling (Gemini, OpenAI, Ollama, Anthropic, etc.). No MCP needed.
 Usage:
     from engram_client import EngramClient
 
-    client = EngramClient(db_dir="~/.engram/eval-run-1")
+    client = EngramClient(db_dir="~/.engram/eval-run-1")  # ($ENGRAM_HOME)
     
     # Get tool declarations for your LLM
     gemini_tools = client.gemini_tool_declarations()
@@ -364,7 +364,7 @@ class EngramClient:
         """Initialize the client.
 
         Args:
-            db_dir: Path to the database directory. Defaults to ~/.engram.
+            db_dir: Path to the database directory. Defaults to ~/.engram ($ENGRAM_HOME).
                     Use different paths for isolated eval runs.
             server_module_path: Path to the directory containing server.py.
                                 If empty, assumes server.py is importable.

@@ -753,7 +753,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Show or set the DM read cursor. The cursor is an integer "
             "(the as_of watermark from /api/updates), stored locally at "
-            "~/.engram/inter-agent-read-cursor.txt."
+            "~/.engram/inter-agent-read-cursor.txt (under $ENGRAM_HOME)."
         ),
     )
     cursor_action = p_cursor.add_mutually_exclusive_group()

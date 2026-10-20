@@ -58,6 +58,11 @@ PREVENTION_TYPES = frozenset({"advisory", "shadow", "blocking"})
 # claim), and settable via engram_update_lesson same as prevention_type.
 TRIPWIRE_PRIORITIES = frozenset({"high", "normal"})
 
+# alpha#3920 (part of #3911): which view of a tool call the lesson-tripwire hook runs a lesson's
+# situation_pattern against. "full" (the default when the field is absent) is the raw target; "command" hides heredoc
+# bodies and MCP prose-field values and is opt-in per lesson. Settable via engram_update_lesson.
+MATCH_SCOPES = frozenset({"command", "full"})
+
 
 def _looks_like_prose(pattern: str) -> bool:
     """Discriminate a command-shape regex from a dead-prose situation_pattern.
@@ -1450,6 +1455,7 @@ def _add_lesson_impl(
 # epistemic content changes.
 _LESSON_MUTABLE_FIELDS = frozenset({
     "situation_pattern", "scaffolding_nudge", "prevention_type", "tripwire_priority",
+    "match_scope",
 })
 
 # #2000 — the subset of _LESSON_MUTABLE_FIELDS that error_incidents.json
@@ -1585,6 +1591,14 @@ def _update_lesson_impl(
             return json.dumps({
                 "error": f"Invalid tripwire_priority '{new_tripwire_priority}'.",
                 "valid_types": sorted(TRIPWIRE_PRIORITIES),
+            })
+
+    if "match_scope" in updates:
+        new_match_scope = updates["match_scope"]
+        if new_match_scope not in MATCH_SCOPES:
+            return json.dumps({
+                "error": f"Invalid match_scope '{new_match_scope}'.",
+                "valid_types": sorted(MATCH_SCOPES),
             })
 
     conn = core._get_db()

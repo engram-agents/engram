@@ -88,6 +88,8 @@ def flagged_lines(text):
     out = []
     for n, chunk in _code_chunks(text):
         for m in _HOME_PATH.finditer(chunk):
+            if chunk[m.end():].startswith("/venv"):
+                continue  # Borges' ruling on #3863: the venv is always ~/.engram/venv
             if not chunk[: m.start()].endswith(_ALLOWED_PREFIX):
                 out.append((n, chunk.strip()))
                 break

@@ -178,6 +178,8 @@ class TestHeadBoundarySpy(unittest.TestCase):
         mod = _load_hook()
         budgets = _load_harness_budgets("claude-code")
         unittest.mock.patch.object(mod, "detect_harness", lambda: "claude-code").start()
+        # alpha#3924: pins the original block's head bound; 60 hits must stay off the cluster path.
+        unittest.mock.patch.object(mod, "CLUSTER_THRESHOLD", 10 ** 6).start()
         self.addCleanup(unittest.mock.patch.stopall)
 
         n = 60
@@ -220,6 +222,8 @@ class TestSpecificityOrderingPreserved(unittest.TestCase):
     def test_20_match_seeded_case_preserves_specificity_order(self):
         mod = _load_hook()
         unittest.mock.patch.object(mod, "detect_harness", lambda: "claude-code").start()
+        # alpha#3924: pins the original capped-bullets order; keep 20 hits off the cluster path.
+        unittest.mock.patch.object(mod, "CLUSTER_THRESHOLD", 10 ** 6).start()
         self.addCleanup(unittest.mock.patch.stopall)
 
         n = 20
@@ -358,6 +362,8 @@ class TestNeverExceedsCeilingAfterFix(unittest.TestCase):
     def test_near_boundary_fixture_stays_within_documented_margin(self):
         mod = _load_hook()
         unittest.mock.patch.object(mod, "detect_harness", lambda: "claude-code").start()
+        # alpha#3924: pins the original 1800-char ceiling on capped bullets; off the cluster path.
+        unittest.mock.patch.object(mod, "CLUSTER_THRESHOLD", 10 ** 6).start()
         self.addCleanup(unittest.mock.patch.stopall)
 
         # Fixture chosen (by direct probe against this hook's own main(),

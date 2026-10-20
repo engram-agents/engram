@@ -581,8 +581,14 @@ class TestC4PinnedWording:
 
 # sha256 of each bash fence body of Step 5.7 on the base (0c5824b2); the prose
 # fold must not touch a fence.
+# STEP was re-pinned for #3863 6c: the fence now differs from the base ONLY in the
+# `TOOL=` marketplace-fallback line, which became the canonical
+# "${ENGRAM_HOME:-$HOME/.engram}" expression (shown once by the 6c acceptance run
+# recorded in the PR body; the one-time test that asserted it was then deleted).
+# The `PY=` venv line is the base text: the venv is ~/.engram/venv regardless of
+# ENGRAM_HOME (Borges' ruling on #3863). Old STEP hash: 4609926a...6519.
 FENCE_SHA256 = {
-    STEP: "4609926aca2b6637ef1c7d50790006429ecbcb7446aa549b76a2eb357f5f6519",
+    STEP: "eb20c5ba6b228d8934de793f2a670d162e483310d8f8f43c3a534ef99d2e63c3",
     FORCE: "9c8f94608ee593c063a718e35f806dff752bf5f1964a929cb0f15591fdc68525",
     CONSUME: "45e88966b4fcd9831e0a7210f18f65c983d83cdc1de0ce4150cddc5bfbd456a6",
 }

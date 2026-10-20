@@ -23,6 +23,26 @@
 # `sha256sum` nor `shasum`, is an error: nothing on stdout, a reason on stderr, exit 1.
 # The home is never created here.
 
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863): it would resolve against the calling process's cwd, a
+# different home for every process. Unset or empty means unset; a leading ~ is expanded against $HOME and
+# re-exported (~user is not expanded: it is not absolute, so it is refused). Checked before anything else
+# runs; `return` covers a script that is sourced, `exit` one that is executed.
+if [ -n "${ENGRAM_HOME-}" ]; then
+    _eh_raw="$ENGRAM_HOME"
+    case "$ENGRAM_HOME" in
+        "~") ENGRAM_HOME="${HOME-}"; export ENGRAM_HOME ;;
+        "~/"*) ENGRAM_HOME="${HOME-}/${ENGRAM_HOME#"~/"}"; export ENGRAM_HOME ;;
+    esac
+    case "$ENGRAM_HOME" in
+        /*) ;;
+        *)
+            printf "ENGRAM_HOME must be an absolute path, got '%s'\n" "$_eh_raw" >&2
+            unset _eh_raw
+            return 2 2>/dev/null || exit 2 ;;
+    esac
+    unset _eh_raw
+fi
+
 # engramd_owner_physical_path <absolute path>: print the PHYSICAL path of a path that may not exist
 # yet, creating nothing. Take the deepest EXISTING ancestor, resolve it (`cd && pwd -P`), and append
 # the not-yet-existing remainder. A dangling symlink among the remainder is followed (its target

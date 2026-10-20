@@ -492,7 +492,14 @@ _LINE_KEY = _re.compile(r":\d+$")
 # aggregates, the null-embedding count).
 # #3921: the weakest-load-bearing ranking's seven statements, tools/weakest_load_bearing.py (reached from the
 # root `rank`: live nodes, premise edges, contested, pending markers, direct premises, node detail, evidence).
+# #3919 (M3): the study queue's three statements, tools/study_queue.py (reached from the root
+# `store_candidates`: the question/conjecture nodes, the live-node brief, the pending cascade nodes).
+# #2652 (tools-7): the one-row read of tools/inspect_raw.py:read_row (f37b0a78...).
 _FROZEN_TEMPLATE_KEYS = frozenset({
+    "1f0642346288d91dd8ece6a13066919a24df7fdc305f365332735f83a606fbc5",
+    "4c297eed21620600e0366ba8d26aa74d052af13f9b2b449fbd82152edc7a21ff",
+    "dff01272150b1be18634be6118c7082e02eede13b65b66e6ec90a90426db3213",
+    "f37b0a7800a2cb0456683cb63b498d14c88d078aca4833d23107444d433c443d",
     "b3a2d1ab2b1a718bce83ce77bb8362f0b59d94677d8c9026e49a1e957ca06e97",
     "05bd2f3941a89717b037e9d113acd015bd2dec4851c13fb120af5d781e56fedc",
     "c4c336fb9802f92e244bed1ab36b75acd83db33fc04a07015a3e9c344893a1d7",
@@ -530,7 +537,7 @@ _FROZEN_TEMPLATE_KEYS = frozenset({
     "9d938f92196ce5c30108d90b0c926ae6f8d10b89e963219bcf12415dce414a39",
     "cefc616a2876d56a7b84ead98f75fa894f5a3678510f4d5c5bbac0b78061feb8",
     "d8ae87a01e31523ab8daab4fc634e227cfdb00339c30995e50a0fe82f6b67be8",
-    "755fd8686d5feac4204716df355f3c6656f9505332e06102735d02ab15135c23",
+    "de967ffd706ba857571dfddab267a9a2c911b4670b63f11c1fe0e7ba9d480c11",  # load_tripwires: +recall_summary, +claim columns (#3924; was b398ca83 with +match_scope #3920)
     "dc3d1b24f7b5d31cfb36abb9646c778d1dd42055b81cd0c99da5f206f23bc643",
     "e3872e7780af9a2fb346d7019adb7f9bd36fd49794c534d74c2f96e364c9d129",
     "f3fb3410d99851f0e833a131cbdc574e9e676b124dd85d9841250a21f8e05c0a",

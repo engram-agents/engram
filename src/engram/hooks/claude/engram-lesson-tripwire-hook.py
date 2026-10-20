@@ -91,6 +91,7 @@ import re
 import sqlite3
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 # A RELATIVE ENGRAM_HOME is refused (alpha #3863 6b): it would resolve against this process's cwd, a
@@ -342,7 +343,10 @@ SELECT
         claim
     ) AS nudge,
     json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.situation_pattern')  AS pattern,
-    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.tripwire_priority')  AS priority
+    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.tripwire_priority')  AS priority,
+    json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.match_scope')  AS match_scope,
+    recall_summary,
+    claim
 FROM nodes
 WHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')
   AND is_current = 1
@@ -557,9 +561,28 @@ def _write_owner_stderr_lines() -> None:
         pass
 
 
+# alpha#3920 (part of #3911): which view of the call a lesson's pattern runs against.
+#   "command"  the call with heredoc bodies / prose-field values hidden (opt-in, per lesson)
+#   "full"     today's raw target, byte for byte (the default, and what a lesson with NO
+#              match_scope gets: an unaudited seat must not silently lose a body-text lesson)
+# Anything else in the metadata is treated as "full" (a typo must not blind a lesson).
+MATCH_SCOPES = ("command", "full")
+DEFAULT_MATCH_SCOPE = "full"
+
+
+def _coerce_match_scope(value) -> str:
+    """NULL/absent -> the default view; a known value -> itself; anything else -> "full"."""
+    if value is None:
+        return DEFAULT_MATCH_SCOPE
+    return value if value in MATCH_SCOPES else "full"
+
+
 def load_tripwires(db_path: Path = DB_PATH):
-    """Return list of (pattern_str, nudge_str, node_id, priority_str) from
-    active lessons with situation_pattern.
+    """Return list of (pattern_str, nudge_str, node_id, priority_str, match_scope_str,
+    recall_summary, claim) from active lessons with situation_pattern. (alpha#3920 added the
+    5th element, "command" or "full"; alpha#3924 added the 6th and 7th, the node's own
+    recall_summary and claim, for the cluster block's one-liners; callers unpack the tail
+    variadically.)
 
     #2753 epic WS2: node_id was added (3rd tuple element, minimal extension
     of the pre-existing (pattern, nudge) shape) so check_command's hits can
@@ -586,7 +609,8 @@ def load_tripwires(db_path: Path = DB_PATH):
         if not owner:
             conn.close()
         return [
-            (row[2], row[1], row[0], row[3] or "normal")
+            (row[2], row[1], row[0], row[3] or "normal", _coerce_match_scope(row[4] if len(row) > 4 else None),
+             row[5] if len(row) > 5 else None, row[6] if len(row) > 6 else None)
             for row in rows if row[1] and row[2]
         ]
     except Exception as exc:
@@ -595,7 +619,7 @@ def load_tripwires(db_path: Path = DB_PATH):
         return []
 
 
-def check_command(match_target: str, tripwires) -> list:
+def check_command(match_target: str, tripwires, command_target: str | None = None) -> list:
     """Return list of {"nudge": str, "node_id": str, "pattern": str,
     "priority": str} dicts for every situation_pattern that matches
     match_target.
@@ -624,8 +648,13 @@ def check_command(match_target: str, tripwires) -> list:
     hits = []
     for pattern, nudge, node_id, *rest in tripwires:
         priority = rest[0] if rest else "normal"
+        # alpha#3920: 5th element = match_scope. A lesson runs on the command view only when the
+        # caller supplied one AND the lesson's scope is "command" (opt-in; a bare tuple gets "full");
+        # a caller that passes no command_target keeps today's behaviour for every lesson.
+        scope = rest[1] if len(rest) > 1 else DEFAULT_MATCH_SCOPE
+        target = command_target if (command_target is not None and scope == "command") else match_target
         try:
-            if re.search(pattern, match_target, re.IGNORECASE):
+            if re.search(pattern, target, re.IGNORECASE):
                 hits.append({
                     "nudge": nudge, "node_id": node_id, "pattern": pattern,
                     "priority": priority,
@@ -694,6 +723,119 @@ def write_tripwire_overflow(cut_hits: list, now: float | None = None) -> str:
         return str(overflow_path)
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# alpha#3924 (part of #3911) -- cluster block for co-firing lessons
+# ---------------------------------------------------------------------------
+# When MORE than CLUSTER_THRESHOLD lessons match one call (on 10-18 one publish call fired 19),
+# the inline budget showed about one nudge in full and cut the rest to an overflow filename. The
+# co-firing lessons share a MOMENT, not a subject, so the display is grouped, never the claims
+# merged: one header, ONE LINE PER MATCHED LESSON (id + recall_summary), and ONE full nudge. Every
+# full nudge still goes to the overflow file. At or below the threshold nothing changes.
+CLUSTER_THRESHOLD = 3
+LESSON_RANKS_PATH = Path(ENGRAM_HOME) / "lesson-fire-ranks.json"
+RANKS_MAX_AGE_DAYS = 7          # an older rank file is not trusted: length order for all
+RANKS_FUTURE_SKEW_DAYS = 1      # a generated_at this far ahead (clock skew) counts as age 0
+SUMMARY_CLAIM_CUT = 140
+SUMMARY_LINE_CAP = 200  # a legacy or hostile oversized recall_summary must not cut other lessons' lines
+NO_SUMMARY = "(no summary)"
+
+
+def _ranks_now() -> float:
+    """Injectable clock for the rank file's age (tests patch this; nothing sleeps)."""
+    return time.time()
+
+
+def _read_rank_table() -> tuple:
+    """Read $ENGRAM_HOME/lesson-fire-ranks.json ONCE. Returns (ranks, reason, age_days):
+    ranks = {lesson id: fires per 1,000 targets} and reason None when the file is usable;
+    otherwise ({}, reason, None) with reason one of "no file", "unreadable", "malformed",
+    "stale". Never raises: every failure means length order for all lessons, never a block."""
+    try:
+        text = read_regular_text(LESSON_RANKS_PATH, encoding="utf-8")
+    except FileNotFoundError:
+        return {}, "no file", None
+    except Exception:
+        return {}, "unreadable", None
+    try:
+        doc = json.loads(text)
+        if not isinstance(doc, dict) or not isinstance(doc.get("ranks"), dict):
+            return {}, "malformed", None
+        stamp = doc.get("generated_at")
+        if not isinstance(stamp, str):
+            return {}, "malformed", None
+        generated = datetime.fromisoformat(stamp.strip().replace("Z", "+00:00"))
+        if generated.tzinfo is None:
+            generated = generated.replace(tzinfo=timezone.utc)
+        age_s = _ranks_now() - generated.timestamp()
+    except Exception:
+        return {}, "malformed", None
+    if age_s < -RANKS_FUTURE_SKEW_DAYS * 86400:
+        return {}, "malformed", None
+    age_s = max(age_s, 0.0)
+    if age_s > RANKS_MAX_AGE_DAYS * 86400:
+        return {}, "stale", None
+    ranks = {}
+    for nid, rate in doc["ranks"].items():
+        if (isinstance(nid, str) and isinstance(rate, (int, float)) and not isinstance(rate, bool)
+                and math.isfinite(rate) and rate >= 0):
+            ranks[nid] = float(rate)
+    return ranks, None, int(age_s // 86400)
+
+
+def _cluster_key(h: dict, ranks: dict) -> tuple:
+    """Sort key for one hit of a cluster (see _cluster_order for the rule)."""
+    nid = h.get("node_id") or ""
+    rated = nid in ranks
+    return (
+        0 if h.get("priority") == "high" else 1,
+        0 if rated else 1,
+        ranks[nid] if rated else 0.0,
+        -len(h.get("pattern") or ""),
+        nid,
+    )
+
+
+def _cluster_order(hits: list) -> tuple:
+    """Order a cluster's hits and say how. Within one tripwire_priority ("high" first): ascending
+    fires-per-1,000 (a lesson that fires on almost every such call carries the least news per fire),
+    then longest situation_pattern, then lesson id, so ties are total. A lesson with no rate (absent
+    from the file, or the file unusable) sorts AFTER every rated peer of its priority, by length then
+    id. Returns (ordered hits, note) where note is the text after `order: `."""
+    ranks, reason, age_days = _read_rank_table()
+    ordered = sorted(hits, key=lambda h: _cluster_key(h, ranks))
+    if reason:
+        return ordered, f"length fallback ({reason})"
+    unrated = sum(1 for h in ordered if (h.get("node_id") or "") not in ranks)
+    return ordered, f"rarity (ranks {age_days}d old, {unrated} unrated)"
+
+
+def _cluster_summary(recall_summary, claim) -> str:
+    """One line: the lesson's recall_summary; else its claim cut to 140 characters; else a
+    placeholder. Never empty, never multi-line."""
+    summary = " ".join(str(recall_summary).split()) if recall_summary else ""
+    if summary:
+        return summary[:SUMMARY_LINE_CAP]
+    flat_claim = " ".join(str(claim).split()) if claim else ""
+    return flat_claim[:SUMMARY_CLAIM_CUT] if flat_claim else NO_SUMMARY
+
+
+def _cluster_trigger(hook_input: dict) -> str:
+    """The tool name (MCP) or the Bash verb (first word of the command) the cluster fired on."""
+    tool = hook_input.get("tool_name") or "tool"
+    if tool == "Bash":
+        ti = hook_input.get("tool_input") or hook_input.get("input") or {}
+        words = (ti.get("command") or "").split() if isinstance(ti, dict) else []
+        words = [w for w in words if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)]
+        return f"Bash `{words[0]}`" if words else "Bash"
+    return tool
+
+
+def _cluster_head(count: int, trigger: str, note: str, overflow_path: str) -> str:
+    tail = f"; all {count} full texts: {overflow_path}" if overflow_path else ""
+    return (f"[lesson-tripwire] {count} lessons matched {trigger} (order: {note}); "
+            f"one line each, full text of the first below{tail}:")
 
 
 # ---------------------------------------------------------------------------
@@ -1476,6 +1618,140 @@ def _append_prevention_ledger(now: float, hits: list) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# alpha#3920 (part of #3911): the two views of a call
+# ---------------------------------------------------------------------------
+# A pattern written for a COMMAND fired on prose that only mentions the command (a heredoc
+# body, an MCP `body`/`claim` field). Each call now has a `full` view (today's target) and a
+# `command` view with that prose hidden; a lesson's `match_scope` picks which one its pattern runs
+# on. Safe direction: anything that cannot be parsed falls back to the full text (a missed strip is
+# noise, a wrong strip is blindness).
+
+# MCP arguments whose VALUES are prose. One constant, so adding a field is a one-line change.
+PROSE_FIELDS = frozenset({
+    "body", "claim", "quoted_text", "interpretation", "logical_chain", "recall_summary",
+    "description", "text", "message", "content",
+})
+
+_HEREDOC_PLACEHOLDER = "<<HEREDOC>>"
+_PROSE_PLACEHOLDER = "<<TEXT>>"
+# A heredoc fed to an interpreter or a shell is a script, not prose: its body RUNS, so the command
+# view must not hide it (a wrong strip is blindness).
+_EXEC_WORDS = (r"(?:sudo|env|exec|xargs|eval|source|bash|sh|zsh|dash|ksh|fish|ssh|node|deno|bun|"
+               r"perl|ruby|php|lua|osascript|python[0-9.]*|pypy[0-9.]*|ipython[0-9.]*|"
+               r"sqlite3|psql|mysql|mariadb|sqlcmd|duckdb|redis-cli|mongosh)(?![\w-])")
+_EXEC_BEFORE_RE = re.compile(r"(?:^|[\s;&|(`/])" + _EXEC_WORDS)
+# `cat <<EOF | bash`: the consumer comes AFTER the operator.
+_EXEC_AFTER_RE = re.compile(r"\|\s*(?:[\w./=-]+\s+)*?" + _EXEC_WORDS)
+_HEREDOC_OP_RE = re.compile(r"""<<(-?)[ \t]*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Za-z_][A-Za-z0-9_]*)"|([A-Za-z_][A-Za-z0-9_]*))""")
+
+
+def _heredoc_ops_on_line(line: str) -> list:
+    """[(strip_tabs, delimiter, start, end)] for each heredoc operator on one line, in order. Operators inside
+    single or double quotes are ignored, and `<<<` (a here-string) is not a heredoc."""
+    ops = []
+    quote = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if line.startswith("<<<", i):
+            i += 3
+            continue
+        if line.startswith("<<", i):
+            m = _HEREDOC_OP_RE.match(line, i)
+            if m:
+                ops.append((m.group(1) == "-", m.group(2) or m.group(3) or m.group(4), i, m.end()))
+                i = m.end()
+                continue
+        i += 1
+    return ops
+
+
+def strip_heredoc_bodies(command: str) -> str:
+    """The command with each heredoc BODY replaced by `<<HEREDOC>>` (alpha#3920). The operator line
+    and the terminator line stay, and so does everything after the terminator. If any heredoc has no
+    terminator the original text is returned unchanged."""
+    if "<<" not in command:
+        return command
+    lines = command.split("\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        pending = _heredoc_ops_on_line(line)
+        for n, (strip_tabs, delim, op_start, op_end) in enumerate(pending):
+            # The operator's own consumer: text between the previous operator and this one, or
+            # after this one up to the next (`cat <<A; bash <<B`, `cat <<EOF | bash`).
+            before = line[(pending[n - 1][3] if n else 0):op_start]
+            after = line[op_end:(pending[n + 1][2] if n + 1 < len(pending) else len(line))]
+            runs = bool(_EXEC_BEFORE_RE.search(before) or _EXEC_AFTER_RE.search(after))
+            start = i
+            while i < len(lines):
+                cand = lines[i].lstrip("\t") if strip_tabs else lines[i]
+                if cand == delim:
+                    break
+                i += 1
+            else:
+                return command  # unterminated: never hide what cannot be parsed
+            out.extend(lines[start:i] if runs else [_HEREDOC_PLACEHOLDER])
+            out.append(lines[i])  # the terminator line stays
+            i += 1
+    return "\n".join(out)
+
+
+def _redact_prose(value, key=None):
+    if isinstance(value, dict):
+        return {k: _redact_prose(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_prose(v, key) for v in value]
+    if key in PROSE_FIELDS and isinstance(value, str):
+        return _PROSE_PLACEHOLDER
+    if key == "payload_json" and isinstance(value, str):
+        # ENGRAM's own tools take their arguments as one JSON-encoded string.
+        try:
+            inner = json.loads(value)
+        except Exception:
+            return value
+        if isinstance(inner, (dict, list)):
+            return json.dumps(_redact_prose(inner), separators=(",", ":"), ensure_ascii=False)
+    return value
+
+
+def build_match_views(hook_input: dict) -> tuple:
+    """(full, command) match targets for one call. `full` is exactly build_match_target's result."""
+    full = build_match_target(hook_input)
+    if not full:
+        return ("", "")
+    tool_name = hook_input.get("tool_name", "")
+    ti = hook_input.get("tool_input") or hook_input.get("input") or {}
+    if tool_name == "Bash":
+        return (full, strip_heredoc_bodies(full))
+    if tool_name.startswith("mcp__"):
+        try:
+            args_str = json.dumps(_redact_prose(ti), separators=(",", ":"), ensure_ascii=False)
+        except Exception:
+            return (full, full)
+        return (full, f"{tool_name} {args_str}")
+    return (full, full)
+
+
 def build_match_target(hook_input: dict) -> str:
     """Build the string to match situation_pattern against, or "" to skip.
 
@@ -2098,7 +2374,7 @@ def _main_impl() -> None:
     # patches them); the crash handler below flushes any still pending.
     _ws4_rows: list = []
     try:
-        match_target = build_match_target(hook_input)
+        match_target, command_target = build_match_views(hook_input)  # alpha#3920
         if not match_target or not match_target.strip():
             sys.exit(0)
 
@@ -2160,9 +2436,10 @@ def _main_impl() -> None:
         _chain_cut = False        # the chain block was dropped by the pass
         _chain_cut_lines = 0      # lines in the dropped chain block
         _chain_in_parts = False   # the chain block is currently in `parts`
+        _tripwire_head = TRIPWIRE_HEADER  # alpha#3924: the cluster block swaps in its own header line
 
         tripwires = load_tripwires()
-        hits = check_command(match_target, tripwires) if tripwires else []
+        hits = check_command(match_target, tripwires, command_target=command_target) if tripwires else []
         # #3503: at most one visible loader-failure line per window; "" when
         # nothing failed (clean path: head/body below stay byte-identical).
         loader_notice, loader_notice_now = _pending_loader_notice()
@@ -2188,7 +2465,7 @@ def _main_impl() -> None:
             owner_notice, owner_notice_key = text, key
             head_notice = "\n".join(x for x in (owner_notice, loader_notice) if x)
             if _block_call is not None:
-                head = f"{head_notice}\n{TRIPWIRE_HEADER}" if _block_call[1] else head_notice
+                head = f"{head_notice}\n{_tripwire_head}" if _block_call[1] else head_notice
                 _block_call = (head, _block_call[1], _block_call[2])
                 parts[0] = emit_context(_block_call[0], _block_call[1], **_block_call[2])
             else:
@@ -2263,6 +2540,32 @@ def _main_impl() -> None:
             # protection against at all).
             bullets = [_tripwire_bullet(h) for h in hits]
 
+            # alpha#3924: more than CLUSTER_THRESHOLD co-firing lessons render as ONE cluster block
+            # (a one-line summary per lesson + one full nudge) instead of K+ bullets. Prepared inside
+            # its own guard: any failure falls back to today's rendering, never to silence.
+            _cluster_kept: list = []
+            _cluster_nudge_idx = None
+            _cluster_path = ""
+            if len(hits) > CLUSTER_THRESHOLD:
+                try:
+                    _ordered, _note = _cluster_order(hits)
+                    _extras = {t[2]: (t[5] if len(t) > 5 else None, t[6] if len(t) > 6 else None)
+                               for t in tripwires}
+                    _lines = [
+                        f"  - {h.get('node_id', '?')}: "
+                        f"{_cluster_summary(*_extras.get(h.get('node_id'), (None, None)))}"
+                        for h in _ordered
+                    ]
+                    # Every clustered hit's full nudge goes to the overflow file (the inline block
+                    # shows one); its path rides in the header so the other nudges stay reachable.
+                    _path = write_tripwire_overflow(_ordered)
+                    _head = _cluster_head(len(_ordered), _cluster_trigger(hook_input), _note, _path)
+                    hits, _tripwire_head, _cluster_path = _ordered, _head, _path
+                    _cluster_nudge_idx = len(_lines)
+                    bullets = _lines + [_tripwire_bullet(_ordered[0])]
+                except Exception:
+                    _cluster_nudge_idx = None
+
             # emit_context() calls this ONLY with the item strings it
             # itself decided to cut/truncate -- always either a trailing
             # SUFFIX of `bullets` (the ordinary cut case), or, in the rare
@@ -2316,14 +2619,24 @@ def _main_impl() -> None:
                 # #3503: the failure line, when due, is part of the head (so it
                 # shares emit_context's target/budget accounting and sits above
                 # the bullets); unchanged TRIPWIRE_HEADER otherwise.
-                f"{head_notice}\n{TRIPWIRE_HEADER}" if head_notice else TRIPWIRE_HEADER,
+                f"{head_notice}\n{_tripwire_head}" if head_notice else _tripwire_head,
                 bullets,
-                dict(
+                (dict(
                     budget=budgets["budget"],
                     target=TRIPWIRE_BLOCK_CHAR_CEILING,
                     allow_single_overflow=True,
                     overflow_writer=_cached_overflow_writer,
-                ),
+                ) if _cluster_nudge_idx is None else dict(
+                    # alpha#3924: the one-liners alone can exceed the 1800-char inline ceiling
+                    # (19 x ~130), so the cluster block is bounded by the harness budget; if even
+                    # those do not fit, emit_context cuts whole lines from the tail and says so in
+                    # its trailer. Every full nudge is already in the overflow file (written above).
+                    budget=budgets["budget"],
+                    target=max(1, budgets["budget"] - _TAIL_CUT_RESERVE),
+                    allow_single_overflow=True,
+                    overflow_writer=lambda _items: _cluster_path,
+                    kept_out=_cluster_kept,
+                )),
             )
             parts.append(emit_context(_block_call[0], _block_call[1], **_block_call[2]))
 
@@ -2341,6 +2654,11 @@ def _main_impl() -> None:
             shown_hits = hits[: len(hits) - len(cut_hits)] if cut_hits else hits
             if not shown_hits and hits:
                 shown_hits = hits[:1]
+            if _cluster_nudge_idx is not None:
+                # alpha#3924: in cluster mode only the lesson whose FULL nudge is in the visible
+                # block counts as shown (a one-liner is not its nudge text); none if the budget
+                # cut that nudge. kept_out lists the body items emit_context rendered in full.
+                shown_hits = hits[:1] if _cluster_nudge_idx in _cluster_kept else []
         elif head_notice:
             # #3503: a loader failed and there are no hits, so the block would
             # otherwise be silent -- the line IS the block, still rendered by
@@ -2409,6 +2727,10 @@ def _main_impl() -> None:
                 # _append_ws4_fire_ledger, unchanged.
                 nudge_chars = len(parts[-1]) if parts else 0
                 raw_tool_use_id = None
+                # Known limit (PR 3948 review): in cluster mode only the full-nudge lesson is
+                # `shown`, and `cut_hits` stays empty (no hit was cut, the rest appear as
+                # one-liners), so the one-liner-only lessons are in NEITHER list here. They are
+                # not a hole in the WS4 denominator by accident: their full nudge was not shown.
                 cut_lesson_ids = []
                 arm = "na"
                 nonce = None

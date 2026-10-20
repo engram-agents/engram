@@ -209,15 +209,24 @@ def test_T6_wrong_kind_pidfile_refused_nothing_unlinked(home, kind):
         assert (home / "elsewhere.txt").read_text() == "precious"
 
 
+def _assert_relative_refused(r, value):
+    """alpha #3863 6c: a relative ENGRAM_HOME is refused by the script's launcher guard -- exit 2, the
+    one guard line on stderr, nothing on stdout -- instead of being resolved against the cwd."""
+    assert r.returncode == 2, _out(r)
+    assert r.stdout == "", repr(r.stdout)
+    assert r.stderr == "ENGRAM_HOME must be an absolute path, got '%s'\n" % value, repr(r.stderr)
+
+
 def _load_daemon_for_home_value(home_value, cwd):
     """The daemon module for the home that ENGRAM_HOME=home_value names when
     run from cwd. Since alpha #3863 6b the daemon REFUSES a relative
     ENGRAM_HOME (one stderr line, exit 0) instead of resolving it against its
     cwd, so the oracle is loaded with the ABSOLUTE spelling of that value
     (os.getcwd() is the PHYSICAL cwd, as the daemon's old abspath saw it).
-    The shell script under test still resolves a relative value against its
-    own cwd until the launcher guards land in 6c; these cells pin that the
-    script agrees with the daemon about the home a value names."""
+    Since the launcher guards (6c) the shell script under test refuses a
+    relative value too (see _assert_relative_refused); the cells that still
+    pin that the script agrees with the daemon about the home a value names
+    use an ABSOLUTE value."""
     old = os.getcwd()
     try:
         os.chdir(cwd)
@@ -256,7 +265,7 @@ def test_T7_parity_with_daemon_constants(home):
 
 
 def test_T7b_parity_relative_and_default_home(home):
-    # relative ENGRAM_HOME (daemon: abspath against cwd)
+    # relative ENGRAM_HOME: refused (alpha #3863 6c; the daemon refuses it since 6b), never resolved
     rel_parent = home
     (rel_parent / "sub").mkdir()
     env = dict(os.environ, ENGRAM_HOME="sub")
@@ -264,11 +273,7 @@ def test_T7b_parity_relative_and_default_home(home):
         ["bash", str(SCRIPT), "--print-paths"],
         capture_output=True, text=True, env=env, cwd=str(rel_parent), timeout=60,
     )
-    assert r.returncode == 0, _out(r)
-    got = _parse_print_paths(r.stdout)
-    mod = _load_daemon_for_home_value("sub", rel_parent)
-    assert got["SOCKET_PATH"] == mod.SOCKET_PATH
-    assert got["PID_PATH"] == mod.PID_PATH
+    _assert_relative_refused(r, "sub")
     # unset ENGRAM_HOME -> ~/.engram under HOME
     env = {k: v for k, v in os.environ.items() if k != "ENGRAM_HOME"}
     env["HOME"] = str(home)
@@ -426,7 +431,8 @@ def test_boot_charge_documents_the_remedy(name):
 
 def test_S1_cdpath_does_not_leak_into_path_resolution(home):
     """A relative ENGRAM_HOME plus CDPATH holding a same-named dir: `cd`
-    would resolve through CDPATH and print the dir to stdout."""
+    would resolve through CDPATH and print the dir to stdout. Since 6c the relative value is refused
+    before any `cd`: the refusal is the same with CDPATH set, and stdout stays empty."""
     cwd_dir = home / "A"
     cdp_dir = home / "B"
     (cwd_dir / "rel").mkdir(parents=True)
@@ -436,12 +442,7 @@ def test_S1_cdpath_does_not_leak_into_path_resolution(home):
         ["bash", str(SCRIPT), "--print-paths"],
         capture_output=True, text=True, env=env, cwd=str(cwd_dir), timeout=60,
     )
-    assert r.returncode == 0, _out(r)
-    assert len(r.stdout.splitlines()) == 2, repr(r.stdout)
-    got = _parse_print_paths(r.stdout)
-    mod = _load_daemon_for_home_value("rel", cwd_dir)
-    assert got["SOCKET_PATH"] == mod.SOCKET_PATH
-    assert got["PID_PATH"] == mod.PID_PATH
+    _assert_relative_refused(r, "rel")
 
 
 @pytest.mark.parametrize("shape", ["trailing", "embedded"])
@@ -468,31 +469,31 @@ def _daemon_paths_for(home_value, cwd):
     return mod.SOCKET_PATH, mod.PID_PATH
 
 
-def _print_paths_from(cwd, home_value, logical_pwd=None):
+def _run_print_paths_from(cwd, home_value, logical_pwd=None):
     env = dict(os.environ, ENGRAM_HOME=home_value)
     # a real shell exports PWD as the LOGICAL path it cd'd through
     env["PWD"] = str(logical_pwd or cwd)
-    r = subprocess.run(
+    return subprocess.run(
         ["bash", str(SCRIPT), "--print-paths"],
         capture_output=True, text=True, env=env, cwd=str(cwd), timeout=60,
     )
+
+
+def _print_paths_from(cwd, home_value, logical_pwd=None):
+    r = _run_print_paths_from(cwd, home_value, logical_pwd)
     assert r.returncode == 0, _out(r)
     assert len(r.stdout.splitlines()) == 2, repr(r.stdout)
     got = _parse_print_paths(r.stdout)
     return got["SOCKET_PATH"], got["PID_PATH"]
 
 
-def test_A1i_relative_home_under_symlinked_cwd_uses_physical_cwd(home):
+def test_A1i_relative_home_under_symlinked_cwd_is_refused(home):
+    """6c: was "uses the physical cwd"; a relative value is now refused whatever the cwd is."""
     real = home / "real"
     (real / "rel").mkdir(parents=True)
     link = home / "link"
     link.symlink_to(real)
-    got = _print_paths_from(link, "rel")
-    want = _daemon_paths_for("rel", link)
-    assert got == want
-    # the physical prefix, not the link
-    assert got[0].startswith(os.path.realpath(real)), got
-    assert "/link/" not in got[0]
+    _assert_relative_refused(_run_print_paths_from(link, "rel"), "rel")
 
 
 def test_A1ii_absolute_symlinked_home_stays_the_link_path(home):
@@ -506,16 +507,14 @@ def test_A1ii_absolute_symlinked_home_stays_the_link_path(home):
     assert got[0] == str(link) + "/recall-daemon.sock"
 
 
-def test_A1iii_dotdot_relative_home_under_symlinked_cwd(home):
+def test_A1iii_dotdot_relative_home_under_symlinked_cwd_is_refused(home):
+    """6c: was "resolves ../sibling against the physical cwd"; a relative value is now refused."""
     real = home / "real3"
     (real / "sub").mkdir(parents=True)
     (real / "sibling").mkdir()
     link = home / "link3"
     link.symlink_to(real)
-    got = _print_paths_from(link / "sub", "../sibling")
-    want = _daemon_paths_for("../sibling", link / "sub")
-    assert got == want
-    assert got[0].startswith(os.path.realpath(real) + "/sibling/")
+    _assert_relative_refused(_run_print_paths_from(link / "sub", "../sibling"), "../sibling")
 
 
 _FAKE_PGREP = """#!/bin/bash

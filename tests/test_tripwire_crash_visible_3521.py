@@ -133,7 +133,7 @@ def _make_matching_db(eh):
     conn = sqlite3.connect(str(db))
     conn.execute(
         "CREATE TABLE nodes (id TEXT, type TEXT, is_current INTEGER, "
-        "memory_status TEXT, claim TEXT, metadata TEXT)"
+        "memory_status TEXT, claim TEXT, metadata TEXT, recall_summary TEXT)"  # recall_summary: alpha#3924
     )
     meta = {
         "situation_pattern": "git push --force",
@@ -142,7 +142,7 @@ def _make_matching_db(eh):
         "tripwire_priority": "high",
     }
     conn.execute(
-        "INSERT INTO nodes VALUES (?,?,?,?,?,?)",
+        "INSERT INTO nodes (id, type, is_current, memory_status, claim, metadata) VALUES (?,?,?,?,?,?)",
         ("ls_fix1", "lesson", 1, "active", "fixture claim", json.dumps(meta)),
     )
     conn.commit()

@@ -33,10 +33,10 @@ fix: on startup the agent cross-checks pending-status claims
 ("MECH-N deferred", "still uncommitted") against the git log before
 reporting to the user.
 
-The per-session marker (~/.engram/sessions/<session_id>.json) is written
+The per-session marker (~/.engram/sessions/<session_id>.json, under $ENGRAM_HOME) is written
 on every SessionStart and carries session_id + transcript_path + cwd +
 started_at + role. Concurrent sessions own their own files — no clobber.
-Issue #140 retired the single shared ~/.engram/active-session.json marker
+Issue #140 retired the single shared ~/.engram/active-session.json (under $ENGRAM_HOME) marker
 that this replaces; agents and hooks read transcript_path either from
 SessionStart's injected additionalContext (preferred) or from the
 per-session file by session_id.
@@ -563,7 +563,7 @@ def _resolve_mcp_server_path(engram_home: str) -> str:
     Priority order:
       1. Hook-colocated server.py (works for BOTH install paths —
          scatter copies bootstrap.py + server.py + hooks together into
-         ~/.engram/; plugin assembles them together at <plugin>/).
+         ~/.engram/ (under $ENGRAM_HOME); plugin assembles them together at <plugin>/).
          This is the only candidate that works in plugin install — the
          MCP server runs from the plugin tree, not from ENGRAM_HOME.
       2. $ENGRAM_HOME/server.py (legacy scatter-install pattern in case
@@ -3330,7 +3330,7 @@ def _auto_sleep_settings() -> "tuple[str, str] | None":
     auto-sleep is on.
 
     Reads cadence.auto_sleep_enabled (default False) and cadence.auto_sleep_time
-    (default "03:00") from ~/.engram/config.json. Computes a stable per-install
+    (default "03:00") from ~/.engram/config.json (under $ENGRAM_HOME). Computes a stable per-install
     jitter so not every install fires on the same exact minute.
     """
     if _EFFECTIVE_SESSION_ROLE != "interactive":
@@ -3470,7 +3470,7 @@ def fairy_policy_block() -> str:
     hook must never block session start.
 
     Reads coder_fairy_policy and reviewer_fairy_policy (both default "auto")
-    from ~/.engram/config.json. Emits two lines describing the active mode
+    from ~/.engram/config.json (under $ENGRAM_HOME). Emits two lines describing the active mode
     for each policy so the agent knows which skill to load (if any) per decision.
 
     Returns:
@@ -3655,7 +3655,7 @@ def _apply_pending_viz_acl(engram_home: str) -> None:
     marker on the first SessionStart after ENGRAM is installed and applies the
     ACL so the viz dashboard can see the agent.
 
-    Scope note: finalize-name's Step 7 globs ~/.engram* (covers lineage variants
+    Scope note: finalize-name's Step 7 globs ~/.engram* (default $ENGRAM_HOME; covers lineage variants
     like .engram-gemini); this deferred helper only operates on the single
     ENGRAM_HOME dir, which is correct here — lineage dirs don't exist at first
     session, and Step 7 still covers them when finalize runs post-install.
@@ -3736,7 +3736,7 @@ def _apply_pending_viz_acl(engram_home: str) -> None:
         except Exception:
             return  # leave marker on getfacl failure; retry next session
 
-        # Apply ACL — the agent owns ~/.engram, so no sudo required.
+        # Apply ACL — the agent owns $ENGRAM_HOME (default ~/.engram), so no sudo required.
         #
         # engram-alpha#2720: each -m entry list also carries an explicit
         # `m::rX` mask alongside the named grant, not just `u:{op}:rX` on
@@ -4599,8 +4599,8 @@ def _main_impl() -> None:
 
     # ── Deferred viz-ACL application ──────────────────────────────────────
     # Pick up the pending marker written by agentctl finalize-name when
-    # ~/.engram didn't exist yet (agent installs ENGRAM post-finalize). Applies
-    # the ACL now that ~/.engram is present. Entirely advisory: _apply_pending_viz_acl
+    # $ENGRAM_HOME (default ~/.engram) didn't exist yet (agent installs ENGRAM post-finalize). Applies
+    # the ACL now that $ENGRAM_HOME (default ~/.engram) is present. Entirely advisory: _apply_pending_viz_acl
     # is internally wrapped in try/except and never raises; this outer guard is
     # belt-and-suspenders. Closes #1525.
     try:

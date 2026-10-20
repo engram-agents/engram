@@ -11,7 +11,7 @@ Usage::
     set_forum_url.py URL [--config PATH] [--force]
 
 ``--config`` defaults to ``$ENGRAM_HOME/config.json`` (``ENGRAM_HOME`` defaults
-to ``~/.engram``).
+to ``~/.engram`` unless ``ENGRAM_HOME`` is set).
 
 Exit codes:
     0  written, or already set to this value (unchanged)

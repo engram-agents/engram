@@ -3,7 +3,7 @@
 SSoT for the one concern duplicated, byte-for-byte, between
 engram-stale-tree-pull-hook.py (Layer 1, SessionStart) and
 engram-stale-tree-warn-hook.py (Layer 2, PreToolUse): reading + validating
-the `stale_tree_watch` field from ~/.engram/config.json. If that schema
+the `stale_tree_watch` field from ~/.engram/config.json (under $ENGRAM_HOME). If that schema
 ever changes, this is now the one place to change it -- round-2 fix after
 the two-hook build shipped with a copy-pasted `_load_watch_list()` in each.
 

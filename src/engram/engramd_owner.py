@@ -453,7 +453,7 @@ READ_RESPONSE_RESERVE = 0.25  # seconds
 # (engram_idf.IDF_BATCH_TERMS on U6b, where a cell pins the equality), so a
 # full hook batch is exactly one request. DF_TERM_MAX_BYTES caps one term in
 # UTF-8 BYTES. Measured 2026-10-12: the longest term in a real vocab
-# (~/.engram/knowledge.db nodes_fts_vocab, 15536 terms) is 64 bytes (a sha256
+# (~/.engram/knowledge.db under $ENGRAM_HOME, nodes_fts_vocab, 15536 terms) is 64 bytes (a sha256
 # hex token); engram_idf.tokenize (`[a-z]{2,}[a-z0-9_]*`) has NO upper bound on
 # token length, so the cap is a chosen bound: next power of two >= 2x the
 # measured max is 128, floored at 256.
@@ -1117,7 +1117,7 @@ def _owner_internal_authorizer(action_code, arg1, arg2, db_name, trigger_or_view
 PROGRESS_HANDLER_INSTRUCTION_COUNT = 1000
 
 # Measured (see the PR body / fairy handoff): the real, live
-# ~/.engram/knowledge.db (3,324 rows in `nodes`, per the fairy spec) has
+# ~/.engram/knowledge.db ($ENGRAM_HOME) (3,324 rows in `nodes`, per the fairy spec) has
 # max LENGTH(embedding)=8,474B, max LENGTH(metadata)=21,272B,
 # max LENGTH(claim)=2,462B. 2,000,000 gives ~94x headroom over the
 # largest of those (metadata) -- room for embedding-dimension growth and

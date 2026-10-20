@@ -26,6 +26,26 @@
 # stand-in we measure against.
 set -uo pipefail
 
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863): it would resolve against the calling process's cwd, a
+# different home for every process. Unset or empty means unset; a leading ~ is expanded against $HOME and
+# re-exported (~user is not expanded: it is not absolute, so it is refused). Checked before anything else
+# runs; `return` covers a script that is sourced, `exit` one that is executed.
+if [ -n "${ENGRAM_HOME-}" ]; then
+    _eh_raw="$ENGRAM_HOME"
+    case "$ENGRAM_HOME" in
+        "~") ENGRAM_HOME="${HOME-}"; export ENGRAM_HOME ;;
+        "~/"*) ENGRAM_HOME="${HOME-}/${ENGRAM_HOME#"~/"}"; export ENGRAM_HOME ;;
+    esac
+    case "$ENGRAM_HOME" in
+        /*) ;;
+        *)
+            printf "ENGRAM_HOME must be an absolute path, got '%s'\n" "$_eh_raw" >&2
+            unset _eh_raw
+            return 2 2>/dev/null || exit 2 ;;
+    esac
+    unset _eh_raw
+fi
+
 # Resolve the real script path (handles symlink invocation from tools/ghpr.sh),
 # then use git to find the repo root — robust regardless of script location.
 _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
@@ -35,7 +55,7 @@ LOG_DIR="${ENGRAM_HOME:-$HOME/.engram}/ci-cost-sim"
 # Resolve the test python BEFORE any HOME override (run_touched_tests runs pytest
 # via sys.executable, so it must be the venv that actually has pytest). Per-agent
 # venv via the real HOME; override with GHPR_PYTHON; fall back to system python3.
-PYTHON="${GHPR_PYTHON:-${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python}"
+PYTHON="${GHPR_PYTHON:-$HOME/.engram/venv/bin/python}"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
 # Proxy constants for the "implied CI minutes" estimate (rough — local wall != GitHub
 # runner wall, but the RATIO touched-vs-full is the decision-relevant signal):

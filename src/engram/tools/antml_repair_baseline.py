@@ -2,8 +2,8 @@
 """Baseline summary for the antml-prefix swallow-pattern failure mode.
 
 Reads two JSONL files written by the engram-toolcall-repair hook:
-  - ~/.engram/toolcall-invocations.jsonl  (every mcp__engram__* call)
-  - ~/.engram/toolcall-repairs.jsonl      (only calls that needed repair)
+  - ~/.engram/toolcall-invocations.jsonl  (every mcp__engram__* call, under $ENGRAM_HOME)
+  - ~/.engram/toolcall-repairs.jsonl      (only calls that needed repair, under $ENGRAM_HOME)
 
 Computes baseline repair rates per tool and per day so that a future
 migration (e.g. the telemetry-discipline lesson's antml-fix per-tool single-JSON reshape) can be

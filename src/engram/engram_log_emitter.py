@@ -6,7 +6,7 @@ Tracking: alpha #175
 This module is the single emit-side entry point for ENGRAM's append-only
 event log. Hooks and server.py call Emitter.init() once per process and
 emit() per interesting moment. Events are routed to per-session JSONL files
-at ~/.engram/logs/sessions/<session_id>.l{1,2}.jsonl, partitioned by
+at ~/.engram/logs/sessions/<session_id> ($ENGRAM_HOME).l{1,2}.jsonl, partitioned by
 privacy level (1 = stats-only / 2 = content, LOCAL ONLY).
 
 Failure-mode contract (load-bearing): emit() NEVER raises into the caller.
@@ -309,7 +309,7 @@ class Emitter:
         return self._turn
 
     def _read_turn_from_db(self) -> Optional[int]:
-        """One-shot read of current_turn from ~/.engram/config.json (mirrors
+        """One-shot read of current_turn from ~/.engram/config.json ($ENGRAM_HOME) (mirrors
         server.py:_get_current_turn — config.json is the canonical source of
         truth for the turn counter, NOT the nodes table). Returns None on
         any failure."""

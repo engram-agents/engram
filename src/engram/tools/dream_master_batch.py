@@ -732,8 +732,8 @@ def _with_reader(read: Any) -> Any:
     use_owner = owner_read.flag_applies(spec, db_path)
     if use_owner:
         owner_read.ping(spec)
-    elif not db_path.exists():
-        raise FileNotFoundError(f"ENGRAM database not found: {db_path}")
+    # Flag OFF: `open_reader` runs `check_store_path` first (#3960), so a missing, unusable or non-regular store
+    # raises its class here with nothing in between.
     conn = owner_read.open_reader(spec, db_path, use_owner)
     try:
         return read(conn)

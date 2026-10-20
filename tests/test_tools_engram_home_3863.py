@@ -297,6 +297,9 @@ def test_every_code_file_reaches_the_one_resolver():
 # ---- design-seat amendment (R1/R2): a line that names the default home also names ENGRAM_HOME -------
 
 PROSE_ONLY_FILES = ["config_schema.py", "enumerate_armed_monitors.py", "fairy_report.py"]
+# Borges' ruling on #3863: the venv lives at ~/.engram/venv REGARDLESS of ENGRAM_HOME, so the
+# HOME-relative venv spelling is the rule, not a leftover; it needs no ENGRAM_HOME on its line.
+_VENV_HOME = re.compile(r"(?:~|\$HOME)/\.engram/venv(?![\w-])")
 _HOME_MENTION = re.compile(r"(?:~|\$HOME|\$\{HOME\})/\.engram(?![\w-])|Path\.home\(\)\s*/\s*[\"']\.engram(?![\w-])")
 
 
@@ -305,7 +308,7 @@ def test_every_line_naming_the_home_names_engram_home(fname):
     bad = [
         (i, line.strip()[:90])
         for i, line in enumerate((TOOLS / fname).read_text().splitlines(), 1)
-        if _HOME_MENTION.search(line) and "ENGRAM_HOME" not in line and "engram_home()" not in line
+        if _HOME_MENTION.search(_VENV_HOME.sub("", line)) and "ENGRAM_HOME" not in line and "engram_home()" not in line
     ]
     assert not bad, f"{fname}: a line names the default home without ENGRAM_HOME: {bad}"
 

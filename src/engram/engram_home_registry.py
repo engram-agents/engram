@@ -1,8 +1,8 @@
 """Per-seat ENGRAM home registry (#3863 PR 5, ruling R3).
 
-A seat whose ENGRAM home is NOT ``<login home>/.engram`` records where it is,
+A seat whose ENGRAM home is NOT ``<login home>/.engram`` (the default ``$ENGRAM_HOME``) records where it is,
 so a tool that scans login homes (viz discovery, the viz-operator ACL tool)
-finds it without a ``.engram*`` name guess.  Seats on the default home need no
+finds it without a ``.engram*`` name guess (of ``$ENGRAM_HOME``).  Seats on the default home need no
 entry: a missing entry means "the default".
 
 Entry: ``<login home>/.engram-home.json`` = ``{"schema": 1, "engram_home": "<abs>"}``.

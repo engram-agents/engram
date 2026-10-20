@@ -24,7 +24,7 @@ repo paths in either hook:
       ...
     ]
 
-in ~/.engram/config.json. `path` may use `~` (expanded here). Absent, empty,
+in ~/.engram/config.json (under $ENGRAM_HOME). `path` may use `~` (expanded here). Absent, empty,
 or malformed `stale_tree_watch` -> silent no-op: this hook ships in the
 plugin for ALL installs, but only acts once an install opts in by populating
 this field (Lei's ruling — do not add auto-discovery of repos).

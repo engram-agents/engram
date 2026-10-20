@@ -20,11 +20,11 @@ the leading UTC field as the local time and confabulated 'it's 2am'; #721.)
 
 Signal sources:
   - UTC now: datetime.now(timezone.utc)
-  - Session start: ~/.engram/sessions/<session_id>.json 'started_at'
+  - Session start: ~/.engram/sessions/<session_id>.json (under $ENGRAM_HOME) 'started_at'
     (SessionStart hook writes per-session marker; session_id read from this
     hook's stdin payload per issue #140)
-  - Last user msg: ~/.engram/last-user-msg.json (self-maintained by this hook)
-  - User-local tz: ~/.engram/config.json 'user.timezone' (None when absent →
+  - Last user msg: ~/.engram/last-user-msg.json (under $ENGRAM_HOME; self-maintained by this hook)
+  - User-local tz: ~/.engram/config.json (under $ENGRAM_HOME) 'user.timezone' (None when absent →
     UTC shown with '(tz not configured)' label rather than a silently-wrong
     default coast; set user.timezone to an IANA name, e.g. 'America/New_York')
 

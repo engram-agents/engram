@@ -82,6 +82,26 @@
 # Part of #868 (forum as second deploy target).
 set -euo pipefail
 
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863): it would resolve against the calling process's cwd, a
+# different home for every process. Unset or empty means unset; a leading ~ is expanded against $HOME and
+# re-exported (~user is not expanded: it is not absolute, so it is refused). Checked before anything else
+# runs; `return` covers a script that is sourced, `exit` one that is executed.
+if [ -n "${ENGRAM_HOME-}" ]; then
+    _eh_raw="$ENGRAM_HOME"
+    case "$ENGRAM_HOME" in
+        "~") ENGRAM_HOME="${HOME-}"; export ENGRAM_HOME ;;
+        "~/"*) ENGRAM_HOME="${HOME-}/${ENGRAM_HOME#"~/"}"; export ENGRAM_HOME ;;
+    esac
+    case "$ENGRAM_HOME" in
+        /*) ;;
+        *)
+            printf "ENGRAM_HOME must be an absolute path, got '%s'\n" "$_eh_raw" >&2
+            unset _eh_raw
+            return 2 2>/dev/null || exit 2 ;;
+    esac
+    unset _eh_raw
+fi
+
 SERVICE_DIR=""   # no default (#3568): a flag, else the existing unit's FORUM_HOME
 PORT="5002"
 ADMIN_USER="$(whoami)"

@@ -2,7 +2,7 @@
 """Baseline summary for deference-detector hook fires.
 
 Reads the append-only text log written by the engram-deference-detector-stop
-hook (~/.engram/deference-detector.log) and reports per-fire rates over time
+hook (~/.engram/deference-detector.log, under $ENGRAM_HOME) and reports per-fire rates over time
 so the qu_NNNN longitudinal validation thread (~30-day window) has a
 queryable view of the wait-for-approval reflex's trajectory.
 

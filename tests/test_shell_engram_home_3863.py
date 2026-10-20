@@ -67,18 +67,36 @@ def _code_lines(text):
 # exempt from the canonical-expression rule and from the every-`.engram`-line rule,
 # as the gate exempts the venv by name; a trailing `# ...` comment on such a line is
 # exempt with it.
-_VENV_SPELLING = re.compile(r"(?:\$HOME|~)/\.engram/venv")
+import importlib.util as _ilu
+
+_gate_spec = _ilu.spec_from_file_location("home_path_gate", REPO / "tools" / "home_path_gate.py")
+_gate_mod = _ilu.module_from_spec(_gate_spec)
+_gate_spec.loader.exec_module(_gate_mod)
+# The ONE definition of the venv exemption and of the ENGRAM_HOME-derived venv class
+# is the gate's (#3863 6c); this scan has no regex of its own for either.
+_mask_venv = _gate_mod.mask_venv
+
+# The relative-home guard block (#3863 6c; tests/test_launchers_relative_engram_home_3863.py pins it) must
+# test and re-export the bare variable, so it cannot use the canonical expression. It is blanked out here,
+# line count preserved; a bare token ANYWHERE ELSE is still flagged.
+_GUARD_BLOCK = re.compile(r'^if \[ -n "\$\{ENGRAM_HOME-\}" \]; then\n.*?^fi$', re.S | re.M)
 
 
 def non_canonical_lines(text):
     """[(lineno, line)] of non-comment lines where `.engram` or `ENGRAM_HOME`
-    appears outside the canonical expression."""
+    appears outside the canonical expression (the guard block excepted)."""
+    text = _GUARD_BLOCK.sub(lambda m: "\n" * m.group(0).count("\n"), text)
     out = []
     for n, line in _code_lines(text):
         rest = line.replace(_CANONICAL, "")
-        if _VENV_SPELLING.search(rest):
-            rest = _VENV_SPELLING.sub("", rest).split("#", 1)[0]
-        if _ENGRAM_DIR.search(rest) or "ENGRAM_HOME" in rest:
+        masked = _mask_venv(rest)
+        if masked != rest:
+            rest = masked.split("#", 1)[0]
+        if (
+            _ENGRAM_DIR.search(rest)
+            or "ENGRAM_HOME" in rest
+            or _gate_mod.engram_home_derived_venv(line)
+        ):
             out.append((n, line.strip()))
     return out
 
@@ -91,7 +109,7 @@ def lines_naming_dot_engram_without_home(text):
     return [
         (n, line.strip())
         for n, line in enumerate(text.splitlines(), 1)
-        if _ENGRAM_DIR.search(_VENV_SPELLING.sub("", line)) and "ENGRAM_HOME" not in line
+        if _ENGRAM_DIR.search(_mask_venv(line)) and "ENGRAM_HOME" not in line
     ]
 
 
@@ -129,7 +147,8 @@ def test_shell_script_has_only_the_canonical_home_expression(rel):
     )
 
 
-@pytest.mark.parametrize("rel", SHELL_FILES)
+# run-all-tests.sh named the home only for its venv, which is HOME-relative now (the ruling above).
+@pytest.mark.parametrize("rel", [f for f in SHELL_FILES if f != "tools/run-all-tests.sh"])
 def test_shell_script_reads_engram_home_at_all(rel):
     # the file-level gate's condition, restated here so a mutation shows in both
     assert "ENGRAM_HOME" in (SRC / rel).read_text(encoding="utf-8")
@@ -162,6 +181,107 @@ class TestPlantedScan:
 
     def test_sibling_folder_names_and_labels_are_not_the_home(self):
         assert non_canonical_lines("ls ~/.engram-gemini/x ~/.engram_home com.engram.viz\n") == []
+
+    _GUARD = 'if [ -n "${ENGRAM_HOME-}" ]; then\n    export ENGRAM_HOME\nfi\n'
+
+    def test_the_relative_home_guard_block_is_exempt_and_nothing_else_is(self):
+        assert non_canonical_lines("set -u\n" + self._GUARD) == []
+        # the line right after the block is scanned again, and line numbers are preserved
+        assert non_canonical_lines("set -u\n" + self._GUARD + 'ls "$ENGRAM_HOME/x"\n') == [(5, 'ls "$ENGRAM_HOME/x"')]
+        # a lookalike that is not the exact opening line is not exempt
+        assert non_canonical_lines('if [ -n "$ENGRAM_HOME" ]; then\n    export ENGRAM_HOME\nfi\n')
+
+
+# --- the venv rule is the GATE's definition, not a second copy (#3863 6c) ---------------
+# Contract (written before the implementation): the shell scan and tools/home_path_gate.py
+# classify every venv spelling the same way, because the scan imports the gate's
+# definition. Before this, the scan kept its own `_VENV_SPELLING` regex and the two
+# disagreed: the ENGRAM_HOME-derived venv passed BOTH, and the absolute foreign venv was
+# flagged by the scan and accepted by the gate.
+
+_GATE_PATH = REPO / "tools" / "home_path_gate.py"
+
+
+def _gate():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("home_path_gate", _GATE_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+G4_SPELLINGS = [
+    "${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python3",
+    "${ENGRAM_HOME}/venv/bin/python3",
+    "$ENGRAM_HOME/venv/bin/python3",
+    '"$ENGRAM_HOME"/venv/bin/python3',
+    'engram_home() / "venv"',
+    'os.path.join(ENGRAM_HOME, "venv/bin/python3")',
+    'Path(os.environ["ENGRAM_HOME"]) / "venv"',
+]
+
+
+@pytest.mark.parametrize("spelling", G4_SPELLINGS)
+@pytest.mark.parametrize("shape", ["{s}", 'PY="{s}"', "PY={s}", "X=1 PY={s}"])
+def test_the_engram_home_derived_venv_is_flagged_by_the_shell_scan(spelling, shape):
+    assert non_canonical_lines(shape.format(s=spelling) + "\n"), (shape, spelling)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "PY=~/.engram/venv/bin/python3",
+        "PY=$HOME/.engram/venv/bin/python3",
+        'PY="$HOME/.engram/venv/bin/python3"',
+        "PY=${HOME}/.engram/venv/bin/python3",
+        'PY="$HOME"/.engram/venv/bin/python3',
+        "PY=$HOME/.engram/venv/bin/python3  # the plugin venv",
+    ],
+)
+def test_the_home_anchored_venv_stays_exempt_in_the_shell_scan(line):
+    assert non_canonical_lines(line + "\n") == [], line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "PY=/home/someone/.engram/venv/bin/python3",
+        'PY="/home/someone/.engram/venv/bin/python3"',
+        "/home/someone/.engram/venv/bin/python3",
+    ],
+)
+def test_the_absolute_venv_is_flagged_by_the_shell_scan(line):
+    assert non_canonical_lines(line + "\n"), line
+
+
+# One corpus, two verdict functions: they may not disagree. The corpus holds the
+# absolute venv, the HOME-form venv in every anchor spelling (including the two the old
+# private regex did not know: `${HOME}` and `"$HOME"`), the near-misses the gate refuses
+# (`venvs`, a `..` traversal) and each G4 spelling.
+VENV_CORPUS = (
+    [
+        "PY=/home/someone/.engram/venv/bin/python3",
+        '"/home/someone/.engram/venv/bin/python3"',
+        "PY=~/.engram/venv/bin/python3",
+        "PY=$HOME/.engram/venv/bin/python3",
+        "PY=${HOME}/.engram/venv/bin/python3",
+        'PY="$HOME"/.engram/venv/bin/python3',
+        "cat ~/.engram/venvs/bin/python3",
+        "cat ~/.engram/venv-old/bin/python3",
+        "cat ~/.engram/venv/../knowledge.db",
+        "cat $HOME/.engram/venv/bin/../../knowledge.db",
+    ]
+    + [f"PY={s}" for s in G4_SPELLINGS]
+    + [f'PY="{s}"' for s in G4_SPELLINGS]
+)
+
+
+@pytest.mark.parametrize("line", VENV_CORPUS)
+def test_the_shell_scan_and_the_gate_agree_on_every_venv_line(line):
+    gate_flags = bool(_gate().line_violations(line))
+    shell_flags = bool(non_canonical_lines(line + "\n"))
+    assert gate_flags == shell_flags, (line, gate_flags, shell_flags)
 
 
 # --- (b) behaviour -----------------------------------------------------------------
@@ -338,14 +458,22 @@ class TestScriptPathVariables:
         "rel,var,tail",
         [
             ("tools/ghpr.sh", "LOG_DIR", "ci-cost-sim"),
-            ("tools/ghpr.sh", "PYTHON", "venv/bin/python"),
-            ("tools/run-all-tests.sh", "ENGRAM_PY", "venv/bin/python"),
         ],
     )
     def test_custom_home_with_space_and_quote(self, tmp_path, rel, var, tail):
         home = tmp_path / "my 'custom' home"
         got = _eval_assignment(rel, var, _env(ENGRAM_HOME=home, HOME=tmp_path / "x"))
         assert got == f"{home}/{tail}"
+
+    @pytest.mark.parametrize(
+        "rel,var",
+        [("tools/ghpr.sh", "PYTHON"), ("tools/run-all-tests.sh", "ENGRAM_PY")],
+    )
+    def test_the_venv_python_is_under_home_whatever_engram_home_is(self, tmp_path, rel, var):
+        """Borges' ruling on #3863: the venv is always $HOME/.engram/venv."""
+        home = tmp_path / "my 'custom' home"
+        got = _eval_assignment(rel, var, _env(ENGRAM_HOME=home, HOME=tmp_path / "x"))
+        assert got == f"{tmp_path}/x/.engram/venv/bin/python"
 
     @pytest.mark.parametrize(
         "rel,var,tail",

@@ -346,3 +346,235 @@ class TestEmptyInventory(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# 7. alpha#3920: --compare-views
+# ---------------------------------------------------------------------------
+
+class TestCompareViews(unittest.TestCase):
+    """A lesson that matches a command still matches it on the command view; a lesson that only
+    matched prose inside a heredoc reports a lost match (REVIEW). Reports, never writes."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="engram_audit_views_"))
+        self.db = _make_db(self.tmp)
+        _insert_lesson(self.db, node_id="ls_slice", pattern=r"\bsed\s+-n\b")
+        _insert_lesson(self.db, node_id="ls_plain", pattern=r"\bgit\s+status\b")
+        _write_transcript(self.tmp / "s1.jsonl", [
+            _bash_entry("cat <<'EOF'\nuse sed -n to slice\nEOF"),
+            _bash_entry("sed -n 1,20p file"),
+            _bash_entry("git status"),
+        ])
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self):
+        buf = io.StringIO()
+        code = _audit.run_view_comparison(db_path=str(self.db),
+                                          transcript_glob=str(self.tmp / "*.jsonl"),
+                                          limit_files=3, out=buf)
+        return code, buf.getvalue()
+
+    def test_lost_match_is_reported_for_the_lesson_that_matched_prose(self):
+        code, out = self._run()
+        self.assertEqual(code, 0)
+        self.assertIn("[ls_slice] REVIEW", out)
+        self.assertIn("full=2 command=1 lost=1", out)
+
+    def test_lesson_without_match_scope_is_listed_as_full(self):
+        _, out = self._run()
+        self.assertIn("[ls_slice] REVIEW scope=full", out)
+
+    def test_a_lesson_with_no_lost_match_is_ok(self):
+        _, out = self._run()
+        self.assertIn("[ls_plain] ok", out)
+        self.assertIn("full=1 command=1 lost=0", out)
+
+    def test_collect_targets_pairs_gives_full_and_command(self):
+        cur, prior, _ = _audit.collect_targets(transcript_glob=str(self.tmp / "*.jsonl"),
+                                               limit_files=3, pairs=True)
+        pairs = cur + prior
+        self.assertTrue(all(isinstance(p, tuple) and len(p) == 2 for p in pairs))
+        heredoc = [p for p in pairs if "use sed -n to slice" in p[0]][0]
+        self.assertNotIn("use sed -n to slice", heredoc[1])
+
+    def test_default_collect_targets_is_unchanged(self):
+        cur, prior, _ = _audit.collect_targets(transcript_glob=str(self.tmp / "*.jsonl"), limit_files=3)
+        self.assertTrue(all(isinstance(t, str) for t in cur + prior))
+
+    def test_empty_inventory_exits_2(self):
+        buf, err = io.StringIO(), io.StringIO()
+        code = _audit.run_view_comparison(db_path=str(self.db),
+                                          transcript_glob=str(self.tmp / "none*.jsonl"),
+                                          out=buf, err=err)
+        self.assertEqual(code, 2)
+        self.assertIn("empty inventory", err.getvalue())
+
+
+class TestWriteRanks(unittest.TestCase):
+    """alpha#3924: --write-ranks writes fires-per-1,000 targets per armed lesson to the rank file
+    the tripwire hook reads for its cluster-block ordering."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="engram_audit_ranks_"))
+        self.db = _make_db(self.tmp)
+        _insert_lesson(self.db, node_id="lsx-001", pattern=r"gh pr create")
+        _insert_lesson(self.db, node_id="lsx-002", pattern=r"git status")
+        _insert_lesson(self.db, node_id="lsx-003", pattern=r"never-matches-anything")
+        _insert_lesson(self.db, node_id="lsx-004", pattern="[broken")
+        _insert_lesson(self.db, node_id="lsx-005", pattern="")
+        _write_transcript(self.tmp / "s1.jsonl", [
+            _bash_entry("gh pr create a"), _bash_entry("gh pr create b"),
+            _bash_entry("git status"), _bash_entry("ls"),
+        ])
+        self.out = self.tmp / "ranks.json"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, path=None):
+        err = io.StringIO()
+        code = _audit.run_write_ranks(db_path=str(self.db), transcript_glob=str(self.tmp / "s1.jsonl"),
+                                      limit_files=3, path=str(path or self.out), out=io.StringIO(), err=err)
+        return code, err.getvalue()
+
+    def test_rates_are_fires_per_thousand_targets(self):
+        code, _ = self._run()
+        self.assertEqual(code, 0)
+        doc = json.loads(self.out.read_text())
+        self.assertEqual(doc["targets"], 4)
+        self.assertEqual(doc["ranks"], {"lsx-001": 500.0, "lsx-002": 250.0, "lsx-003": 0.0})
+        self.assertIsInstance(doc["window"], str)
+        from datetime import datetime
+        datetime.fromisoformat(doc["generated_at"].replace("Z", "+00:00"))
+
+    def test_unarmed_and_broken_lessons_are_absent(self):
+        self._run()
+        ranks = json.loads(self.out.read_text())["ranks"]
+        self.assertNotIn("lsx-004", ranks)
+        self.assertNotIn("lsx-005", ranks)
+
+    def test_command_scope_lesson_is_counted_on_the_command_view(self):
+        conn = sqlite3.connect(str(self.db))
+        conn.execute("INSERT INTO nodes (id, type, is_current, memory_status, metadata, claim) "
+                     "VALUES ('lsx-006', 'lesson', 1, 'active', ?, 'c')",
+                     (json.dumps({"situation_pattern": r"\bsed\s+-n\b", "match_scope": "command"}),))
+        conn.execute("INSERT INTO nodes (id, type, is_current, memory_status, metadata, claim) "
+                     "VALUES ('lsx-007', 'lesson', 1, 'active', ?, 'c')",
+                     (json.dumps({"situation_pattern": r"\bsed\s+-n\b"}),))
+        conn.commit()
+        conn.close()
+        _write_transcript(self.tmp / "s1.jsonl", [
+            _bash_entry("cat <<'EOF'\nuse sed -n to slice\nEOF"), _bash_entry("sed -n 1,2p f"),
+            _bash_entry("ls"), _bash_entry("pwd"),
+        ])
+        self._run()
+        ranks = json.loads(self.out.read_text())["ranks"]
+        self.assertEqual(ranks["lsx-006"], 250.0)   # command view: the heredoc prose is hidden
+        self.assertEqual(ranks["lsx-007"], 500.0)   # full view: both match
+
+    def test_a_bad_metadata_row_is_skipped_not_fatal(self):
+        """Review round 1 (PR 3948): metadata 'null', a JSON list, or a non-string pattern used to
+        raise and abort the whole rank file (the hook then falls back to length order after 7d)."""
+        conn = sqlite3.connect(str(self.db))
+        for nid, md in (("lsx-bad1", "null"), ("lsx-bad2", "[1, 2]"),
+                        ("lsx-bad3", json.dumps({"situation_pattern": 7})),
+                        ("lsx-bad4", json.dumps({"situation_pattern": ["a"]})), ("lsx-bad5", "not json")):
+            conn.execute("INSERT INTO nodes (id, type, is_current, memory_status, metadata, claim) "
+                         "VALUES (?, 'lesson', 1, 'active', ?, 'c')", (nid, md))
+        conn.commit()
+        conn.close()
+        code, _ = self._run()
+        self.assertEqual(code, 0)
+        ranks = json.loads(self.out.read_text())["ranks"]
+        self.assertEqual(ranks["lsx-001"], 500.0)
+        self.assertFalse([k for k in ranks if k.startswith("lsx-bad")])
+
+    def test_a_symlink_at_the_target_is_followed_not_replaced(self):
+        real = self.tmp / "real.json"
+        real.write_text("{}")
+        link = self.tmp / "link.json"
+        os.symlink(real, link)
+        code, _ = self._run(path=link)
+        self.assertEqual(code, 0)
+        self.assertTrue(link.is_symlink(), "the link itself must survive")
+        self.assertIn("lsx-001", json.loads(real.read_text())["ranks"])
+
+    def test_whole_file_is_rewritten_not_merged(self):
+        self.out.write_text(json.dumps({"generated_at": "x", "ranks": {"lsx-gone": 9.0}, "extra": 1}))
+        self._run()
+        doc = json.loads(self.out.read_text())
+        self.assertNotIn("lsx-gone", doc["ranks"])
+        self.assertNotIn("extra", doc)
+
+    def test_new_file_mode_is_0o640(self):
+        self._run()
+        self.assertEqual(self.out.stat().st_mode & 0o777, 0o640)
+
+    def test_existing_mode_is_preserved(self):
+        for mode in (0o640, 0o664, 0o600):
+            self.out.write_text("{}")
+            os.chmod(self.out, mode)
+            self._run()
+            self.assertEqual(self.out.stat().st_mode & 0o777, mode, oct(mode))
+
+    def test_acl_step_failure_does_not_fail_the_run(self):
+        def boom(*a, **k):
+            raise OSError("ACLs unsupported")
+        orig = _audit._preserve_acl
+        _audit._preserve_acl = boom
+        try:
+            self.out.write_text("{}")
+            code, _ = self._run()
+        finally:
+            _audit._preserve_acl = orig
+        self.assertEqual(code, 0)
+        self.assertIn("lsx-001", json.loads(self.out.read_text())["ranks"])
+
+    def test_no_temp_files_left_behind(self):
+        self._run()
+        names = sorted(p.name for p in self.tmp.iterdir())
+        self.assertEqual(names, sorted(["knowledge.db", "s1.jsonl", "ranks.json"]))
+
+    def test_empty_inventory_exits_2_and_writes_nothing(self):
+        err = io.StringIO()
+        code = _audit.run_write_ranks(db_path=str(self.db), transcript_glob=str(self.tmp / "none*.jsonl"),
+                                      path=str(self.out), out=io.StringIO(), err=err)
+        self.assertEqual(code, 2)
+        self.assertIn("empty inventory", err.getvalue())
+        self.assertFalse(self.out.exists())
+
+    def test_cli_flag_with_explicit_path(self):
+        orig = sys.argv
+        sys.argv = ["lesson-pattern-audit", "--db", str(self.db), "--transcript-glob",
+                    str(self.tmp / "s1.jsonl"), "--write-ranks", str(self.out)]
+        try:
+            with redirect_stdout(io.StringIO()):
+                code = main()
+        finally:
+            sys.argv = orig
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(self.out.read_text())["targets"], 4)
+
+    def test_cli_flag_default_path_is_under_engram_home(self):
+        home = self.tmp / "home"
+        home.mkdir()
+        orig_argv, orig_env = sys.argv, os.environ.get("ENGRAM_HOME")
+        os.environ["ENGRAM_HOME"] = str(home)
+        sys.argv = ["lesson-pattern-audit", "--db", str(self.db), "--transcript-glob",
+                    str(self.tmp / "s1.jsonl"), "--write-ranks"]
+        try:
+            with redirect_stdout(io.StringIO()):
+                code = main()
+        finally:
+            sys.argv = orig_argv
+            if orig_env is None:
+                os.environ.pop("ENGRAM_HOME", None)
+            else:
+                os.environ["ENGRAM_HOME"] = orig_env
+        self.assertEqual(code, 0)
+        self.assertTrue((home / "lesson-fire-ranks.json").exists())

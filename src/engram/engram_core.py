@@ -13,7 +13,7 @@ Checkpoint/backup layers (both written in _commit_snapshot on every nap):
 - knowledge.sql — embedding-stripped SQL text dump, committed to git (line-diff friendly).
 - db-backup/knowledge-YYYYMMDD.db — binary hot-copy for fast point-in-time restore
   without re-running the full pipeline. 7-day rotating window (~84 MB). Best-effort;
-  never blocks the nap. db-backup/ should be listed in ~/.engram/.gitignore (binary,
+  never blocks the nap. db-backup/ should be listed in ~/.engram/.gitignore ($ENGRAM_HOME) (binary,
   large, not line-diff friendly).
 """
 
@@ -917,7 +917,7 @@ def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
         with server.engram_sandbox() as sandbox_dir:
             # All server functions now operate on sandbox_dir
             result = server.engram_add_observation(...)
-            # Production ~/.engram is completely untouched
+            # Production ~/.engram ($ENGRAM_HOME) is completely untouched
 
         # Paths automatically restored to production values
 
@@ -2339,7 +2339,7 @@ GIT_TIMEOUT = 15
 
 
 # `git gc` is far slower than any other git call this module makes — measured
-# 2026-08-15 against a 1.1 GB copy of a real ~/.engram/.git (1196 loose
+# 2026-08-15 against a 1.1 GB copy of a real ~/.engram/.git ($ENGRAM_HOME) (1196 loose
 # objects): ~14s for the first (non-incremental) run, ~1.4s on a repeat call
 # with nothing new to pack. GIT_TIMEOUT (15s) is sized for cheap plumbing
 # calls and would be a coin-flip timeout for a bigger/slower-disk repo, so gc
@@ -2393,7 +2393,7 @@ def _push_head_ensuring_upstream() -> subprocess.CompletedProcess:
     `git push -u` is the right primitive: it sets the upstream on success and is a
     no-op on every push after the first (an already-tracked branch is left alone), so
     it's safe to call unconditionally rather than gating this behind a one-time
-    install/enrollment step — which matters because a `~/.engram` repo's remote may
+    install/enrollment step — which matters because a `~/.engram` ($ENGRAM_HOME) repo's remote may
     predate this fix and simply never have had `-u` used against it.
     """
     if _has_upstream():
@@ -2972,7 +2972,7 @@ def _db_missing_message() -> str:
         "    (your agent will walk you through it in the next conversation).\n"
         "  - ENGRAM_HOME is pointing at the wrong directory — check the env var\n"
         f"    (current ENGRAM_HOME: {engram_home_env}).\n"
-        "  - You moved your install — symlink ~/.engram to your data directory.\n\n"
+        "  - You moved your install — symlink ~/.engram ($ENGRAM_HOME) to your data directory.\n\n"
         "If you intend to start fresh in a non-standard location, set ENGRAM_HOME\n"
         "explicitly and re-run the engram-first-session skill."
     )
@@ -3961,7 +3961,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
         ("intensity_hint", "REAL"),
         # Server-set tag for which trigger produced the report. One of:
         # voluntary, post_compact, nap_checkpoint, dream_review.
-        # Determined mechanically from ~/.engram/feeling-nudge-active.json
+        # Determined mechanically from ~/.engram/feeling-nudge-active.json ($ENGRAM_HOME)
         # at write time, NOT caller-supplied.
         ("nudge_source", "TEXT"),
         # Context fingerprint — captures the operating context the report
@@ -8525,9 +8525,9 @@ def _write_binary_backup(
         {"error": str}  — any failure (best-effort: never raises, never blocks nap)
 
     Note: backup_dir (DATA_DIR / "db-backup") should be listed in
-    ~/.engram/.gitignore so the binary files are never committed to the ENGRAM
+    ~/.engram/.gitignore ($ENGRAM_HOME) so the binary files are never committed to the ENGRAM
     git repo. The gitignore for the ENGRAM data dir lives at runtime
-    (~/.engram/.gitignore), not in the source tree.
+    (~/.engram/.gitignore, under $ENGRAM_HOME), not in the source tree.
     """
     dest_path: Path | None = None
     try:
@@ -8933,7 +8933,7 @@ def _commit_snapshot_sync(
     skip_checkpoint: bool = False,
 ) -> dict:
     """Synchronous snapshot + git commit (the pre-#1673 path, kept as the emergency
-    and fallback carrier). Generate the markdown snapshot, write it, and commit ~/.engram/.git.
+    and fallback carrier). Generate the markdown snapshot, write it, and commit ~/.engram/.git ($ENGRAM_HOME).
 
     This is the durable version-controlled record of the graph state. It is the
     safety net for schema migrations and other invasive operations: if anything
@@ -8954,7 +8954,7 @@ def _commit_snapshot_sync(
     The binary knowledge.db is NOT committed (excluded via .gitignore).
     Instead, the SQL text dump provides identical data in a format that
     produces tiny git diffs (linear storage growth vs quadratic for binary).
-    Restore: `sqlite3 ~/.engram/knowledge.db < knowledge.sql`
+    Restore: `sqlite3 ~/.engram/knowledge.db < knowledge.sql` ($ENGRAM_HOME)
 
     Ordering (#786 fix): dump_stripped runs BEFORE the WAL checkpoint.
     Connection.backup() (used inside dump_stripped) reads the live
@@ -9036,7 +9036,7 @@ def _commit_snapshot_sync(
     #     needs all active WAL readers gone to compact the log.  Read mark is
     #     held only for the duration of dump_stripped, then released.
     #
-    #     Restore path: `sqlite3 ~/.engram/knowledge.db < knowledge.sql`
+    #     Restore path: `sqlite3 ~/.engram/knowledge.db < knowledge.sql` ($ENGRAM_HOME)
     #     After restore: run `python tools/engram-regenerate-embeddings.py` to rebuild
     #     semantic search (embedding column is NULL in the dump, NULL in the restored DB).
     sql_dump_path = DATA_DIR / "knowledge.sql"
@@ -9085,7 +9085,7 @@ def _commit_snapshot_sync(
     # 2b. Binary backup: timestamped hot-copy of knowledge.db for fast point-in-time
     #     restore without re-running the full pipeline.  Best-effort (#1142): never
     #     raises, never blocks the nap.  7-day rotating window; one file per day.
-    #     Note: db-backup/ should be in ~/.engram/.gitignore — binary files, not
+    #     Note: db-backup/ should be in ~/.engram/.gitignore ($ENGRAM_HOME) — binary files, not
     #     line-diff friendly.  The .gitignore lives at runtime, not in the source tree.
     _db_backup_result = _write_binary_backup(str(DB_PATH), DATA_DIR / "db-backup")
 

@@ -146,8 +146,8 @@ def resolve_runtime_dir(engram_home: str, sentinel: str) -> str:
          __file__. `sentinel` lives at <plugin_root>/. The plugin bundle is
          the canonical runtime; when present it MUST win so a stale
          data-dir snapshot can never shadow it (fixes #1152: scatter cleanup
-         can leave ~/.engram/engram_client.py that does `import server`
-         against a removed ~/.engram/server.py, crash-looping the daemon).
+         can leave ~/.engram/engram_client.py (under $ENGRAM_HOME) that does `import server`
+         against a removed ~/.engram/server.py (under $ENGRAM_HOME), crash-looping the daemon).
       3. $ENGRAM_HOME if it bundles a snapshot (scatter-install fallback only
          -- reached only when there is no plugin bundle; covers scatter
          installs that copy `sentinel` into the data dir).

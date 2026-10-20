@@ -233,7 +233,7 @@ def _read_drowsiness_ceiling_tokens() -> int:
             "[engram] Notice: cadence.drowsiness_ceiling_tokens is not set. "
             "Falling back to 152,000 tokens. Run /context in Claude Code, note "
             "the auto-compaction limit, and set cadence.drowsiness_ceiling_tokens "
-            "in ~/.engram/config.json to the actual auto-compact threshold "
+            "in ~/.engram/config.json (under $ENGRAM_HOME) to the actual auto-compact threshold "
             "(e.g. 155_000 for 200K window, 950_000 for 1M window — see #1247).",
             file=__import__("sys").stderr,
         )
@@ -253,7 +253,7 @@ def compute_ceiling() -> int:
 def _last_compact_offset(jsonl_path: str) -> int | None:
     """Return the byte-offset where the last /compact fired, if known.
 
-    Reads ~/.engram/last-compact-at.json (written by the PostCompact hook).
+    Reads ~/.engram/last-compact-at.json (under $ENGRAM_HOME; written by the PostCompact hook).
     Returns None if the marker is missing, stale (records a different
     JSONL than the current session), or unreadable. As of ~2026-05-07
     Claude Code no longer writes a `compact_boundary` JSONL entry, so
@@ -281,7 +281,7 @@ def read_current_tokens(
 
     Two boundary-detection paths, in priority order:
 
-    1. ~/.engram/last-compact-at.json marker file written by the PostCompact
+    1. ~/.engram/last-compact-at.json (under $ENGRAM_HOME) marker file written by the PostCompact
        hook. If present and matches the current JSONL, only the post-marker
        portion of the file is scanned — pre-compact usage records are
        structurally invisible. This is the canonical path on Claude Code
@@ -369,7 +369,7 @@ def estimate_usage(transcript_path: str | None = None, session_id: str | None = 
     through means every path lookup resolves to THIS session — race-free
     even when other Claude sessions run concurrently. When either is
     missing, callers fall back to looking up the per-session marker at
-    ~/.engram/sessions/<session_id>.json by session_id.
+    ~/.engram/sessions/<session_id>.json (under $ENGRAM_HOME) by session_id.
 
     The ceiling is sourced from cadence.drowsiness_ceiling_tokens (see
     compute_ceiling / _read_drowsiness_ceiling_tokens). Mode is derived

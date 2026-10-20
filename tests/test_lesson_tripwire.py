@@ -99,7 +99,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     confidence REAL NOT NULL DEFAULT 0.5,
     created_at TEXT NOT NULL DEFAULT '',
     logical_chain TEXT NOT NULL DEFAULT '',
-    confidence_history TEXT NOT NULL DEFAULT '[]'
+    confidence_history TEXT NOT NULL DEFAULT '[]',
+    recall_summary TEXT
 )
 """
 
@@ -350,12 +351,12 @@ class TestSituationPatternStoredViaMcp(unittest.TestCase):
 
         # Also verify that load_tripwires returns this lesson
         tripwires = load_tripwires(db_path=db_path)
-        patterns_in_tripwires = [p for p, _nudge, _node_id, _priority in tripwires]
+        patterns_in_tripwires = [p for p, _nudge, _node_id, _priority, *_rest in tripwires]
         self.assertIn(pattern, patterns_in_tripwires, "Pattern must appear in load_tripwires output")
         # #2753 epic WS2: the 3rd tuple element is the firing node's own id
         # (the lesson_id minted above), so a caller can call
         # generalization_chain() on the actual hit.
-        node_ids_in_tripwires = [nid for _p, _nudge, nid, _priority in tripwires]
+        node_ids_in_tripwires = [nid for _p, _nudge, nid, _priority, *_rest in tripwires]
         self.assertIn(lesson_id, node_ids_in_tripwires, "load_tripwires must carry the lesson's own node id")
 
 
@@ -975,7 +976,12 @@ class TestTripwirePreviewCap(unittest.TestCase):
         hits = check_command(command, tripwires)
         self.assertEqual(len(hits), n, "sanity: all 20 seeded patterns must match the command")
 
-        with unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp):
+        # alpha#3924: 20 hits is above CLUSTER_THRESHOLD, so the hook would render ONE cluster block
+        # here; this cell pins the ORIGINAL preview-cap path (shown/cut by specificity), so it runs
+        # with the cluster threshold out of reach. The cluster path has its own cells in
+        # tests/test_tripwire_cluster_3924.py.
+        with unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp), \
+                unittest.mock.patch.object(_hook, "CLUSTER_THRESHOLD", 10 ** 6):
             out = _run_hook_main(
                 {"tool_name": "Bash", "tool_input": {"command": command}},
                 tripwires=[(patterns[i], nudges[i], node_ids[i]) for i in range(n)],

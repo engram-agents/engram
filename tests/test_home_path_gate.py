@@ -454,7 +454,6 @@ EXEMPT_VENV_LINES = [
     'p = Path.home() / ".engram" / "venv"',
     'p = Path.home() / ".engram" / \'venv\' / "bin"',
     'p = os.path.join(os.path.expanduser("~"), ".engram", "venv")',
-    "p = os.path.join(h, '.engram', 'venv')",
     'p = Path.home() / ".engram"/"venv"',
     # the character after `venv`
     "run ~/.engram/venv ",
@@ -497,6 +496,10 @@ NOT_VENV_FORMS = [
     'p = Path.home() / ".engram" / "venvs"',
     'p = Path.home() / ".engram" / "venv-old"',
     'p = os.path.join(os.path.expanduser("~"), ".engram", "venv_x")',
+    # moved here from EXEMPT_VENV_LINES (design seat, #3863): a variable-held home is
+    # not a home anchor; the gate cannot know what `h` holds. The checkable
+    # spelling is os.path.join(os.path.expanduser("~"), ".engram", "venv").
+    "p = os.path.join(h, '.engram', 'venv')",
 ]
 
 
@@ -606,6 +609,148 @@ def test_two_venv_paths_then_a_data_path_is_exactly_one_violating_line(tmp_path)
     mod = _load()
     root = _repo(tmp_path, {A: "cp ~/.engram/venv ~/.engram/venv ~/.engram/db\n"}, baseline={})
     assert mod.violation_counts(root) == {A: 1}
+
+
+# -- G (#3863 6c): the venv exemption needs a HOME-ANCHORED prefix ----------------
+# Contract (written before the implementation):
+#  G1 an exempt venv form is exempt only when `.engram/venv` (or the quoted chain)
+#     follows `~`, `$HOME`, `${HOME}`, `Path.home()` or `os.path.expanduser("~")`.
+#  G2 an absolute `/home/<user>/.engram/venv/...` is a violation, bare, quoted or as
+#     an assignment's second token.
+#  G3 the exempt forms are ONE public definition (mask_venv / VENV_EXEMPT_FORMS) that
+#     the shell scan imports (tests/test_shell_engram_home_3863.py pins that).
+#  G4 an ENGRAM_HOME-derived venv spelling is a violation EVEN THOUGH the line names
+#     ENGRAM_HOME: class `engram_home_derived_venv`.
+
+ABSOLUTE_VENV_LINES = [
+    "/home/someone/.engram/venv/bin/python3",
+    '"/home/someone/.engram/venv/bin/python3"',
+    "'/home/someone/.engram/venv/bin/python3'",
+    "PY=/home/someone/.engram/venv/bin/python3",
+    'PY="/home/someone/.engram/venv/bin/python3"',
+    "PY='/home/someone/.engram/venv/bin/python3'",
+    "run /home/someone/.engram/venv/bin/python3 -m x",
+    "PY=/Users/someone/.engram/venv/bin/python3",
+    "PY=/root/.engram/venv/bin/python3",
+    "PY=/opt/seat/.engram/venv/bin/python3",
+    'p = "/home/someone/.engram/venv"',
+]
+
+
+@pytest.mark.parametrize("line", ABSOLUTE_VENV_LINES)
+def test_g2_an_absolute_venv_path_is_a_violation(tmp_path, line):
+    mod = _load()
+    root = _repo(tmp_path, {A: line + "\n"}, baseline={})
+    assert A in mod.violations(root), line
+
+
+HOME_ANCHORED_VENV_LINES = [
+    # one cell per anchor (a mutation that drops an anchor reddens its own cell)
+    "PY=~/.engram/venv/bin/python3",
+    'PY="~/.engram/venv/bin/python3"',
+    "PY=$HOME/.engram/venv/bin/python3",
+    'PY="$HOME/.engram/venv/bin/python3"',
+    'PY="$HOME"/.engram/venv/bin/python3',
+    "PY=${HOME}/.engram/venv/bin/python3",
+    'PY="${HOME}/.engram/venv/bin/python3"',
+    'p = Path.home() / ".engram" / "venv" / "bin" / "python3"',
+    "p = Path.home() / '.engram' / 'venv'",
+    'p = Path.home().joinpath(".engram", "venv")',
+    'p = os.path.join(str(Path.home()), ".engram", "venv")',
+    'p = os.path.join(Path.home(), ".engram", "venv")',
+    'p = os.path.join(os.path.expanduser("~"), ".engram", "venv")',
+    "p = os.path.join(os.path.expanduser('~'), '.engram', 'venv')",
+    'p = os.path.expanduser("~/.engram/venv/bin/python3")',
+    # ENGRAM_HOME elsewhere on a line that spells the HOME venv does not make a
+    # derived venv of it
+    'cp "$ENGRAM_HOME/knowledge.db" ~/.engram/venv/x',
+    'DB="${ENGRAM_HOME:-$HOME/.engram}/k.db" PY=$HOME/.engram/venv/bin/python3',
+]
+
+
+@pytest.mark.parametrize("line", HOME_ANCHORED_VENV_LINES)
+def test_g1_a_home_anchored_venv_stays_exempt(tmp_path, line):
+    mod = _load()
+    root = _repo(tmp_path, {A: line + "\n"}, baseline={})
+    assert mod.violations(root) == {}, line
+    assert mod.check(root) == []
+
+
+ENGRAM_HOME_VENV_LINES = [
+    'PY="${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python3"',
+    'PY="${ENGRAM_HOME}/venv/bin/python3"',
+    "PY=$ENGRAM_HOME/venv/bin/python3",
+    'PY="$ENGRAM_HOME"/venv/bin/python3',
+    'p = engram_home() / "venv"',
+    'p = os.path.join(ENGRAM_HOME, "venv/bin/python3")',
+    'p = Path(os.environ["ENGRAM_HOME"]) / "venv"',
+    # bare forms (no assignment)
+    '${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python3 -m x',
+    '"$ENGRAM_HOME"/venv/bin/python3',
+]
+
+
+@pytest.mark.parametrize("line", ENGRAM_HOME_VENV_LINES)
+def test_g4_an_engram_home_derived_venv_is_a_violation(tmp_path, line):
+    mod = _load()
+    root = _repo(tmp_path, {A: line + "\n"}, baseline={})
+    assert "engram_home_derived_venv" in mod.violations(root).get(A, {}), line
+    assert mod.violation_counts(root) == {A: 1}, line
+    assert mod.check(root) != []
+
+
+@pytest.mark.parametrize("line", ENGRAM_HOME_VENV_LINES)
+def test_g4_the_public_predicate_agrees(line):
+    mod = _load()
+    assert mod.engram_home_derived_venv(line), line
+
+
+@pytest.mark.parametrize("line", HOME_ANCHORED_VENV_LINES + ABSOLUTE_VENV_LINES)
+def test_g4_the_public_predicate_does_not_fire_on_other_venv_lines(line):
+    mod = _load()
+    assert not mod.engram_home_derived_venv(line), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'ls "$ENGRAM_HOME/knowledge.db"',
+        'p = engram_home() / "knowledge.db"',
+        'p = os.path.join(REPO, ".venv/bin/python3")',
+        "# the plugin venv is not under ENGRAM_HOME",
+        'p = engram_home() / ".venv"',
+    ],
+)
+def test_g4_other_engram_home_lines_are_not_the_derived_venv_class(line):
+    mod = _load()
+    assert not mod.engram_home_derived_venv(line), line
+
+
+def test_g4_the_new_class_is_documented_next_to_the_venv_exemption():
+    mod = _load()
+    assert "engram_home_derived_venv" in mod.__doc__
+    assert mod.__doc__.index("engram_home_derived_venv") > mod.__doc__.index("THE VENV EXEMPTION")
+
+
+def test_g3_mask_venv_is_public_and_masks_only_anchored_forms():
+    mod = _load()
+    assert "_venv_" in mod.mask_venv("PY=$HOME/.engram/venv/bin/python3")
+    assert "_venv_" not in mod.mask_venv("PY=/home/someone/.engram/venv/bin/python3")
+
+
+RC_UPGRADE_VERIFY = REPO / "tools" / "rc-upgrade-verify.py"
+
+
+def test_rc_upgrade_verify_has_no_engram_home_derived_venv_path():
+    """tools/ is outside SCAN_PREFIXES, so the gate cannot see this file; the
+    shared definition is applied to it here, line by line."""
+    mod = _load()
+    bad = [
+        (n, l.strip())
+        for n, l in enumerate(RC_UPGRADE_VERIFY.read_text(encoding="utf-8").splitlines(), 1)
+        if mod.engram_home_derived_venv(l)
+    ]
+    assert bad == []
 
 
 def test_untracked_file_is_not_scanned(tmp_path):

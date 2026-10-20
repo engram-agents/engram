@@ -129,7 +129,7 @@ systemctl --user restart "$wake_unit"
 systemctl --user enable --now "$unit"
 systemctl --user restart "$unit"
 WAKE="${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram/tools/codex-umwelt-wake.py"
-status=$("${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python" "$WAKE" status)
+status=$("$HOME/.engram/venv/bin/python" "$WAKE" status)
 test "$(jq -r .running <<<"$status")" = true
 test "$(jq -r .thread_id <<<"$status")" = "$CURRENT_THREAD"
 systemctl --user list-timers "$unit" --no-pager | grep -Fq "$unit"
@@ -157,7 +157,7 @@ variables) and verify the shipped bridge plus timer:
 
 ```bash
 WAKE="${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram/tools/codex-umwelt-wake.py"
-PY="${ENGRAM_HOME:-$HOME/.engram}/venv/bin/python"
+PY="$HOME/.engram/venv/bin/python"
 root="${ENGRAM_HOME:-$HOME/.engram}/codex-wake/loop-host-state"
 wake_unit=$(cat "$root/wake-unit"); unit=$(cat "$root/timer-unit")
 current_thread='<session id from the Active session banner>'

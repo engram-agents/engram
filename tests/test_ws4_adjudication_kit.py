@@ -469,7 +469,7 @@ def _make_fixture_db(path, rows):
     hook's own _QUERY shape (nodes table, metadata JSON column)."""
     conn = sqlite3.connect(str(path))
     conn.execute(
-        "CREATE TABLE nodes (id TEXT, type TEXT, is_current INTEGER, memory_status TEXT, claim TEXT, metadata TEXT)"
+        "CREATE TABLE nodes (id TEXT, type TEXT, is_current INTEGER, memory_status TEXT, claim TEXT, metadata TEXT, recall_summary TEXT)"  # recall_summary: alpha#3924
     )
     for node_id, pattern in rows:
         metadata = json.dumps({"situation_pattern": pattern, "scaffolding_nudge": f"nudge for {node_id}"})

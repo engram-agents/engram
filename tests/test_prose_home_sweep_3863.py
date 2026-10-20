@@ -224,8 +224,13 @@ def _fresh_snapshot(rel, repo=REPO, base=BASE, sweep=SWEEP):
         pytest.skip(reason)
 
 
+# Borges' ruling on #3863: the venv lives at ~/.engram/venv REGARDLESS of ENGRAM_HOME, so the
+# HOME-relative venv spelling is the rule, not a leftover; it needs no ENGRAM_HOME on its line.
+_VENV_HOME = re.compile(r"(?:~|\$HOME)/\.engram/venv(?![\w-])")
+
+
 def has_spelling(line):
-    return any(rx.search(line) for _, rx in SPELLINGS)
+    return any(rx.search(_VENV_HOME.sub("", line)) for _, rx in SPELLINGS)
 
 
 # --- the detectors (planted controls below pin them) ---------------------------

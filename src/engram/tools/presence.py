@@ -10,7 +10,7 @@ States
 
 Resolution order (get_mode)
 ---------------------------
-1. Explicit override (``~/.engram/presence-mode.json``) if present and not expired.
+1. Explicit override (``~/.engram/presence-mode.json``, under ``$ENGRAM_HOME``) if present and not expired.
 2. Derived: ``user`` if ``last-user-activity`` is within the cooldown window; else ``auto``.
 3. Fail-open to ``auto`` on any error — a broken presence layer must never trap
    the agent in ``user`` (loop suspended, feed muted).  Same discipline as the
@@ -139,7 +139,7 @@ def active_override() -> Optional[dict]:
     """Return the parsed override dict if a non-expired explicit override is active.
 
     Returns the full dict (``{"mode", "since", "expires_at", ...}``) when
-    ``~/.engram/presence-mode.json`` exists, has a known mode, and is not
+    ``~/.engram/presence-mode.json`` (under ``$ENGRAM_HOME``) exists, has a known mode, and is not
     expired.  ``expires_at=None`` means permanent (no expiry) → valid.
     Any error (missing file, corrupt JSON, unknown mode, parse failure,
     expired TTL) → ``None``.  Fail-open to None — same spirit as get_mode's
@@ -205,7 +205,7 @@ def get_mode(override=_UNSET) -> tuple:
 
 
 def set_mode(name: str, *, ttl_seconds: Optional[int] = None) -> None:
-    """Write an explicit mode override to ``~/.engram/presence-mode.json``.
+    """Write an explicit mode override to ``~/.engram/presence-mode.json`` (under ``$ENGRAM_HOME``).
 
     Parameters
     ----------

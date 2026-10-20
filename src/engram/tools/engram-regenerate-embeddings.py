@@ -15,7 +15,7 @@ Usage:
 
 When to run:
     After restoring knowledge.db from the git-tracked SQL dump:
-        sqlite3 ~/.engram/knowledge.db < ~/.engram/knowledge.sql
+        sqlite3 "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.db < "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.sql
     The dump excludes embeddings (they are regenerable and their inclusion
     caused ~37 MB churn per commit). This script backfills them so semantic
     search works again.
@@ -34,7 +34,7 @@ Progress:
     Logs to stderr: total to backfill, count per batch, final summary.
 
 Restore procedure (full):
-    1. sqlite3 ~/.engram/knowledge.db < ~/.engram/knowledge.sql
+    1. sqlite3 "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.db < "${ENGRAM_HOME:-$HOME/.engram}"/knowledge.sql
     2. python tools/engram-regenerate-embeddings.py
     3. Restart the MCP server (so it reloads the fresh DB + vec index).
 
@@ -595,13 +595,23 @@ def backfill_embeddings(engram_home: Path, json_output: bool = False) -> None:
             owner_read.ping(spec)
         except RegenOwnerError as exc:
             _owner_fail(exc, 0)
-    elif not db_path.exists():
-        print(
-            f"ERROR: knowledge.db not found at {db_path}\n"
-            "  Run: sqlite3 \"${ENGRAM_HOME:-$HOME/.engram}/knowledge.db\" < \"${ENGRAM_HOME:-$HOME/.engram}/knowledge.sql\"  first.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    else:
+        # Kept: it must run before `_import_server` and the model load below, and it prints this tool's own
+        # remedy lines (the create-the-store line for not-found only).
+        try:
+            owner_read.check_store_path(db_path)
+        except FileNotFoundError:
+            print(
+                f"ERROR: knowledge.db not found at {db_path}\n"
+                "  Run: sqlite3 \"${ENGRAM_HOME:-$HOME/.engram}/knowledge.db\" < \"${ENGRAM_HOME:-$HOME/.engram}/knowledge.sql\"  first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except owner_read.StoreUnusable as exc:
+            # #3960: the remedy for these classes is to fix the path, never to create a store there, so no
+            # "Run: sqlite3" line. Exit 1, never EXIT_OWNER_FAILURE: the flag is OFF, the owner did not fail.
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     server = _import_server(engram_home)
 

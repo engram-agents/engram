@@ -24,12 +24,12 @@ Two-cursor state for threads (surfaced cursor is still hook-owned):
   - forum-read-cursor.txt: vestigial — no longer consumed by this hook for
     mention queries. The `cursor` subcommand stays for manual override/back-compat.
 
-Cache: 30s file-based cache at ~/.engram/forum-hook-cache.json to avoid
+Cache: 30s file-based cache at ~/.engram/forum-hook-cache.json (under $ENGRAM_HOME) to avoid
 hammering the server on rapid successive prompts. Cache stores both threads and
 inbox mentions together. Stale-cache fallback on server-unreachable (never break
 the hook chain if the forum is down).
 
-Publish state: separate ~/.engram/forum-status-publish.json tracks last-published
+Publish state: separate ~/.engram/forum-status-publish.json (under $ENGRAM_HOME) tracks last-published
 status with its own throttle interval (never shares the 30s-TTL cache).
 
 comms_surface gate (alpha#2019 slice A): config.json["comms_surface"] ("umwelt"

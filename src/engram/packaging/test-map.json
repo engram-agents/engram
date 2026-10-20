@@ -159,7 +159,9 @@
         "tests/test_principle_triggers_registry.py",
         "tests/test_lesson_tripwire_injection_bounds.py",
         "tests/test_loader_failure_visible_3503.py",
-        "tests/test_resolve_runtime_dir_plugin.py"
+        "tests/test_resolve_runtime_dir_plugin.py",
+        "tests/test_tripwire_match_scope_3920.py",
+        "tests/test_tripwire_cluster_3924.py"
       ],
       "note": "PreToolUse hook that surfaces lesson tripwires on Bash and MCP tool calls (issues #1203 + #1297). test_principle_triggers_registry.py added #1731 -- its own docstring (Coverage §6) already documented covering this hook's PreToolUse _QUERY broadening, but it was missing from this glob (found while fixing #1731, same completeness-gap class as this morning's tools/perf/*.py <-> test_in_turn_recall.py gap). engram-alpha#2863 WS2 (lesson-tripwire fold onto _hooklib.emit_context()): test_lesson_tripwire_injection_bounds.py added (bound/head/ordering coverage for the new emit_context() call site). test_resolve_runtime_dir_plugin.py added too -- it dynamically loads this hook file's own no-argument _resolve_runtime_dir (a different helper from the shared _hooklib one) via importlib against a synthetic worktree-nested copy, and this migration added a second module-scope dependency (`_harness`) that fixture now has to satisfy alongside the pre-existing `_hooklib` one."
     },
@@ -280,9 +282,10 @@
     {
       "path_prefix_or_glob": "hooks/claude/engram-loop-arm-stop-hook.py",
       "test_globs": [
-        "tests/test_loop_arm_stop_hook.py"
+        "tests/test_loop_arm_stop_hook.py",
+        "tests/test_quiet_wake_counter_3919.py"
       ],
-      "note": "2026-07-31-loop-arm-nudge-SPEC.md PR-B: new Stop hook, tested via direct subprocess invocation (same _run_hook pattern as test_stop_hook_prose_gate.py), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping."
+      "note": "2026-07-31-loop-arm-nudge-SPEC.md PR-B: new Stop hook, tested via direct subprocess invocation (same _run_hook pattern as test_stop_hook_prose_gate.py), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping. alpha #3919 M2: test_quiet_wake_counter_3919.py added -- the quiet-wake counter (classification, Bash read-only allowlist, counter/nudge interaction); the hook is loaded via importlib (hyphenated name) and run as a subprocess."
     },
     {
       "path_prefix_or_glob": "hooks/claude/clear-stale-engram-daemon.sh",
@@ -351,21 +354,48 @@
       "path_prefix_or_glob": "tools/cohort_dispatch.py",
       "test_globs": [
         "tests/test_cohort_dispatch.py",
-        "tests/test_cohort_owner_read_3862.py"
+        "tests/test_cohort_owner_read_3862.py",
+        "tests/test_store_path_precheck_3960.py"
       ]
     },
     {
       "path_prefix_or_glob": "tools/weakest_load_bearing.py",
       "test_globs": [
-        "tests/test_weakest_load_bearing.py"
+        "tests/test_weakest_load_bearing.py",
+        "tests/test_store_path_precheck_3960.py"
       ],
       "note": "engram-alpha#3921: the ranking core and its owner-read entry layer (flag weakest_load_bearing_reads_via_owner). The test loads the file by path (spec_from_file_location) and runs it as a subprocess, invisible to the layer-1 import graph; the seven registered read templates also tie it to tests/test_engramd_read_scan.py."
+    },
+    {
+      "path_prefix_or_glob": "tools/study_queue.py",
+      "test_globs": [
+        "tests/test_study_queue.py",
+        "tests/test_store_path_precheck_3960.py"
+      ],
+      "note": "engram-alpha#3919 M3: the study queue's three sources and its owner-read entry layer (flag study_queue_reads_via_owner). The test loads the file by path (spec_from_file_location) and runs it as a subprocess, invisible to the layer-1 import graph; the registered read templates also tie it to tests/test_engramd_read_scan.py."
+    },
+    {
+      "path_prefix_or_glob": "tools/inspect_raw.py",
+      "test_globs": [
+        "tests/test_inspect_raw_owner_2652.py",
+        "tests/test_inspect_raw_unreadable_store_3954.py",
+        "tests/test_store_path_precheck_3960.py"
+      ],
+      "note": "engram-alpha#2652 (tools-7): the one-row read goes through tools/_owner_read.py behind engramd.inspect_raw_reads_via_owner (flag OFF opens the store mode=ro). The test loads the file by path (spec_from_file_location) and runs it as a subprocess, invisible to the layer-1 import graph; the registered read template also ties it to tests/test_engramd_read_scan.py."
+    },
+    {
+      "path_prefix_or_glob": "tools/dream_pickup.py",
+      "test_globs": [
+        "tests/test_dream_pickup_3919.py"
+      ],
+      "note": "#3919 M6: the seat-side writer of the dream record's Morning pickup section. The test runs the file as a subprocess (and loads it by path), invisible to the layer-1 import graph. No store reads, so no registered read template."
     },
     {
       "path_prefix_or_glob": "tools/dream_master_batch.py",
       "test_globs": [
         "tests/test_dream_master_batch_flow.py",
-        "tests/test_dream_safety_owner_read_3880.py"
+        "tests/test_dream_safety_owner_read_3880.py",
+        "tests/test_store_path_precheck_3960.py"
       ],
       "note": "engram-alpha#3880 (U17): the CLI (safety-row, coverage, null-embeddings) and its owner-read flag. The new test runs the file as a subprocess and loads it by path (spec_from_file_location), invisible to the layer-1 import graph; it also sweeps the two dream agent specs, so a change to engram-dream-master.md / engram-dream-fairy.md must rerun it."
     },
@@ -377,9 +407,11 @@
         "tests/test_reconcile_lesson_demotions.py",
         "tests/test_backup_owner_snapshot_3872.py",
         "tests/test_regen_embeddings_owner_3879.py",
-        "tests/test_tools_engram_home_3863.py"
+        "tests/test_inspect_raw_owner_2652.py",
+        "tests/test_tools_engram_home_3863.py",
+        "tests/test_store_path_precheck_3960.py"
       ],
-      "note": "engram-alpha#3862, #3872, #3879. The shared owner-read helper for tools/: the tools that use it load by path (spec_from_file_location) in their cells, so the layer-1 import graph does not see it; a change here must rerun every consumer's cells."
+      "note": "engram-alpha#3862, #3872, #3879, #2652 (tools-7). The shared owner-read helper for tools/: the tools that use it load by path (spec_from_file_location) in their cells, so the layer-1 import graph does not see it; a change here must rerun every consumer's cells."
     },
     {
       "path_prefix_or_glob": "tools/backup_knowledge_db.py",
@@ -431,7 +463,8 @@
         "tests/test_regen_embeddings_owner_3879.py",
         "tests/test_345_pr1_backfill_json.py",
         "tests/test_3075_embedding_pipeline_restore.py",
-        "tests/test_3077_embedding_regen_lease.py"
+        "tests/test_3077_embedding_regen_lease.py",
+        "tests/test_store_path_precheck_3960.py"
       ]
     },
     {
@@ -554,7 +587,8 @@
       "path_prefix_or_glob": "tools/reconcile_lesson_demotions.py",
       "test_globs": [
         "tests/test_reconcile_lesson_demotions.py",
-        "tests/test_reconcile_owner_read_3824.py"
+        "tests/test_reconcile_owner_read_3824.py",
+        "tests/test_store_path_precheck_3960.py"
       ],
       "note": "engram-alpha#2544. test_reconcile_lesson_demotions.py loads the module via importlib.util.spec_from_file_location (not a static `import`), same reasoning as the hyphenated hook files above -- invisible to the layer-1 AST import graph despite having a valid module name, so it needs this layer-2 mapping."
     },
@@ -914,7 +948,7 @@
     },
     {
       "path": "tools/rc-upgrade-verify.py",
-      "reason": "rc1->rc2 upgrade operational tooling (#2411); no dedicated test file. Verified manually against a live graph (byte copy, never the live DB) and via a direct build-plugin.sh --tier dev dry run rather than an automated test, since it exercises the actual migration subprocess + a real knowledge.db copy end-to-end."
+      "reason": "rc1->rc2 upgrade operational tooling (#2411); no dedicated test file (its venv-path line has a text guard in tests/test_home_path_gate.py, #3863). Verified manually against a live graph (byte copy, never the live DB) and via a direct build-plugin.sh --tier dev dry run rather than an automated test, since it exercises the actual migration subprocess + a real knowledge.db copy end-to-end."
     },
     {
       "path": "tools/deference_baseline.py",

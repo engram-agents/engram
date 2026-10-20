@@ -32,7 +32,9 @@ nodes_fts or `iterdump` itself raises `no such fts5 table: main.nodes_fts`.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
+import stat
 import tempfile
 
 
@@ -113,6 +115,47 @@ def _derived_drop_plan(conn: sqlite3.Connection) -> tuple[list[str], list[str], 
     return triggers, vocab, base
 
 
+def _verify_dump_restores(sql_path: str, expected_nodes: "int | None") -> "int | None":
+    """Restore the SQL dump at ``sql_path`` into ``:memory:`` and, when
+    ``expected_nodes`` is not None, require the restored ``nodes`` count to
+    match it. Raises ``RuntimeError`` on a count mismatch (and lets the
+    ``sqlite3.Error`` from a dump that does not load propagate). Returns the
+    restored node count (None when the snapshot has no ``nodes`` table).
+
+    The dump must also end in a committed state: a dump cut before its final
+    ``COMMIT;`` loads and counts fine, but a real restore rolls the open
+    transaction back and the DB comes back empty. So after loading, the
+    connection must not be in a transaction, and the last two non-empty lines
+    must be ``COMMIT;`` then ``PRAGMA user_version = N;`` (the shape
+    ``dump_stripped`` writes); otherwise ``RuntimeError``."""
+    with open(sql_path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    tail = [ln.strip() for ln in text.splitlines() if ln.strip()][-2:]
+    mem = sqlite3.connect(":memory:")
+    try:
+        mem.executescript(text)
+        if mem.in_transaction:
+            raise RuntimeError("dump verification failed: dump leaves a transaction open (no final COMMIT)")
+        if (
+            len(tail) != 2
+            or tail[0] != "COMMIT;"
+            or not re.fullmatch(r"PRAGMA user_version = \d+;", tail[1])
+        ):
+            raise RuntimeError(
+                "dump verification failed: dump does not end in COMMIT; then PRAGMA user_version"
+            )
+        if expected_nodes is None:
+            return None
+        got = mem.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+    finally:
+        mem.close()
+    if got != expected_nodes:
+        raise RuntimeError(
+            f"dump verification failed: restored {got} nodes, snapshot had {expected_nodes}"
+        )
+    return got
+
+
 def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
     """Write a regenerable-stripped SQL text dump of ``src_db_path`` to ``out_sql_path``.
 
@@ -121,7 +164,15 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
     derived data on the COPY only (the source DB is never modified), then writes
     a restorable ``iterdump`` to ``out_sql_path``.
 
-    Returns a stats dict: ``{statements, bytes, fts_excluded, vec_excluded}``.
+    The write is atomic (#3951): the dump goes to a temp file beside
+    ``out_sql_path``, is fsynced, is verified (it must restore into ``:memory:``
+    with the same ``nodes`` count as the stripped snapshot), takes the existing
+    target's permission bits, and only then replaces ``out_sql_path``. On any
+    failure the temp is removed, the previous ``out_sql_path`` is left
+    byte-identical (or absent), and the error is raised.
+
+    Returns a stats dict: ``{statements, bytes, fts_excluded, vec_excluded,
+    verified_nodes}``.
     Raises on failure — callers MUST surface errors, never ``except: pass`` them
     (silent skip is the failure mode this module exists to eliminate).
     """
@@ -129,7 +180,7 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
     fd, snap = tempfile.mkstemp(
         suffix=".snap.db", dir=os.path.dirname(os.path.abspath(src_db_path)), prefix=".engram-bk-"
     )
-    os.close(fd)
+    os.close(fd)  # nothing between mkstemp and here can raise; the fd never leaks
     try:
         bk = sqlite3.connect(snap)
         try:
@@ -172,14 +223,67 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
         # source's migration state (#781).
         src_user_version = bk.execute("PRAGMA user_version").fetchone()[0]
 
-        statements = 0
-        with open(out_sql_path, "w", encoding="utf-8") as f:
-            for line in bk.iterdump():
-                f.write(line + "\n")
+        # Count the stripped snapshot's nodes so the written dump can be
+        # checked against it (a dump with no `nodes` table verifies by load only).
+        has_nodes = bk.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes'"
+        ).fetchone()
+        expected_nodes = (
+            bk.execute("SELECT COUNT(*) FROM nodes").fetchone()[0] if has_nodes else None
+        )
+
+        # Atomic write (#3951): dump to a temp file beside the target, verify it
+        # restores, and only then replace the target. A failure at any point
+        # leaves the previous out_sql_path untouched and no temp behind.
+        out_dir = os.path.dirname(os.path.abspath(out_sql_path))
+        tfd, tmp_sql = tempfile.mkstemp(
+            suffix=".sql.tmp", dir=out_dir, prefix=".engram-sql-"
+        )
+        try:
+            # Wrap the fd FIRST: from here a raise anywhere closes it (the
+            # `with` below), and the has_autoinc query no longer runs while the
+            # raw fd is unowned. If fdopen itself fails the fd is still ours.
+            try:
+                out_f = os.fdopen(tfd, "w", encoding="utf-8")
+            except BaseException:
+                os.close(tfd)
+                raise
+            # Dropping the derived tables can leave sqlite_sequence present but
+            # with no AUTOINCREMENT table left to recreate it on restore;
+            # iterdump still emits `DELETE FROM "sqlite_sequence"`, which then
+            # fails to load ("no such table"). Skip that one statement then.
+            has_autoinc = bk.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND sql LIKE '%AUTOINCREMENT%'"
+            ).fetchone()
+            statements = 0
+            with out_f as f:
+                for line in bk.iterdump():
+                    if not has_autoinc and line.startswith('DELETE FROM "sqlite_sequence"'):
+                        continue
+                    f.write(line + "\n")
+                    statements += 1
+                # Append user_version after the COMMIT so it executes on restore.
+                f.write(f"PRAGMA user_version = {src_user_version};\n")
                 statements += 1
-            # Append user_version after the COMMIT so it executes on restore.
-            f.write(f"PRAGMA user_version = {src_user_version};\n")
-            statements += 1
+                f.flush()
+                os.fsync(f.fileno())
+            verified_nodes = _verify_dump_restores(tmp_sql, expected_nodes)
+            # mkstemp creates 0600; in a directory with a default POSIX ACL that
+            # sets the ACL mask to `---` and nulls inherited named-user entries.
+            # Give the temp the old target's mode bits (chmod re-derives the mask).
+            try:
+                mode = stat.S_IMODE(os.stat(out_sql_path).st_mode)
+            except FileNotFoundError:
+                mode = 0o644
+            os.chmod(tmp_sql, mode)
+            os.replace(tmp_sql, out_sql_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_sql)
+            except OSError:
+                pass
+            raise
         bk.close()
     finally:
         try:
@@ -192,6 +296,7 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
         "bytes": os.path.getsize(out_sql_path),
         "fts_excluded": fts_excluded,
         "vec_excluded": vec_excluded,
+        "verified_nodes": verified_nodes,
     }
 
 

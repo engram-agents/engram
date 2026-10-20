@@ -114,7 +114,7 @@ def _run(tmp_path, config=None, answer=None, plugin_root="fake", extra_env=None,
          stderr_to_devnull=False):
     """Run the extracted block; return (proc, config_path, bytes_before)."""
     home = tmp_path / "engram-home"
-    home.mkdir()
+    home.mkdir(exist_ok=True)
     cfg = home / "config.json"
     before = None
     if config is not None:
@@ -277,14 +277,28 @@ class TestC7BlockRuns:
         assert cfg.read_bytes() == before
 
     def test_marketplace_fallback_path_is_used_when_plugin_root_is_unset(self, tmp_path):
-        # The fallback is the documented runtime location under HOME.
-        fake_home = tmp_path / "home"
-        tools = fake_home / ".engram" / "marketplace" / "plugins" / "engram" / "tools"
+        # The fallback is the runtime location under the ENGRAM home (#3863 6c): with
+        # ENGRAM_HOME set (as _run does) the fake tool lives under that home, and the
+        # hermetic HOME holds none.
+        tools = tmp_path / "engram-home" / "marketplace" / "plugins" / "engram" / "tools"
         tools.mkdir(parents=True)
         os.symlink(TOOL, tools / "set_forum_url.py")
-        proc, cfg, _ = _run(
-            tmp_path, BASE, answer=LOCAL, plugin_root=None,
-            extra_env={"HOME": str(fake_home)})
+        proc, cfg, _ = _run(tmp_path, BASE, answer=LOCAL, plugin_root=None)
+        assert proc.returncode == 0, proc.stderr
+        assert _url(cfg) == LOCAL
+
+    def test_marketplace_fallback_defaults_to_home_dot_engram_when_engram_home_is_unset(self, tmp_path):
+        fake_home = tmp_path / "home"
+        home = fake_home / ".engram"
+        tools = home / "marketplace" / "plugins" / "engram" / "tools"
+        tools.mkdir(parents=True)
+        os.symlink(TOOL, tools / "set_forum_url.py")
+        cfg = home / "config.json"
+        cfg.write_text(json.dumps(BASE, indent=2) + "\n")
+        (home / "forum-url.answer").write_text(LOCAL + "\n")
+        env = _hermetic_env(HOME=str(fake_home))  # ENGRAM_HOME and CLAUDE_PLUGIN_ROOT dropped
+        proc = subprocess.run(["bash", "-c", _block()], env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, timeout=60)
         assert proc.returncode == 0, proc.stderr
         assert _url(cfg) == LOCAL
 
