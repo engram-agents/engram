@@ -393,7 +393,8 @@
     {
       "path_prefix_or_glob": "tools/dream_pickup.py",
       "test_globs": [
-        "tests/test_dream_pickup_3919.py"
+        "tests/test_dream_pickup_3919.py",
+        "tests/test_study_queue.py"
       ],
       "note": "#3919 M6: the seat-side writer of the dream record's Morning pickup section. The test runs the file as a subprocess (and loads it by path), invisible to the layer-1 import graph. No store reads, so no registered read template."
     },

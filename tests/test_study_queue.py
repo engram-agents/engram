@@ -487,6 +487,203 @@ def test_d11_a_duplicated_heading_first_one_wins(empty_seat, monkeypatch):
 
 
 # ==========================================================================
+# Pickup lines (the M6 write half) hide an awake-seat item: engram-alpha#3919 M3 follow-up
+# ==========================================================================
+
+_PK_HEAD = (
+    "## For the awake seat\n"
+    "1. first item\n"
+    "2. second item\n"
+    "3. third item\n"
+    "4. fourth item\n\n"
+    "## Open for tomorrow\n- bullet one\n- bullet two\n\n"
+)
+
+
+def _pk_whys(mod, text):
+    return [c["why"] for c in mod.parse_dream_report(text, "2026-10-19.md")]
+
+
+def _pk_shown(mod, text):
+    """Which of the four numbered awake-seat items (by ordinal word) are still candidates."""
+    whys = " | ".join(_pk_whys(mod, text))
+    return [w for w in ("first", "second", "third", "fourth") if f"{w} item" in whys]
+
+
+def test_pk1_a_picked_up_line_hides_its_item_and_the_others_stay(empty_seat, monkeypatch):
+    mod = _load_tool(empty_seat, monkeypatch)
+    text = _PK_HEAD + "## Morning pickup\np2. picked up ran it, wrote the result\n"
+    assert _pk_shown(mod, text) == ["first", "third", "fourth"]
+
+
+def test_pk1_a_skipped_line_hides_its_item_and_the_others_stay(empty_seat, monkeypatch):
+    mod = _load_tool(empty_seat, monkeypatch)
+    text = _PK_HEAD + "## Morning pickup\np3. skipped (not worth it today)\n"
+    assert _pk_shown(mod, text) == ["first", "second", "fourth"]
+
+
+def test_pk1_both_forms_together_and_open_bullets_are_untouched(empty_seat, monkeypatch):
+    mod = _load_tool(empty_seat, monkeypatch)
+    text = _PK_HEAD + "## Morning pickup\np1. picked up done\np4. skipped (stale)\n"
+    whys = " | ".join(_pk_whys(mod, text))
+    assert _pk_shown(mod, text) == ["second", "third"]
+    assert "bullet one" in whys and "bullet two" in whys  # no pickup line ever covers a bullet
+
+
+def test_pk2_only_the_last_morning_pickup_heading_counts(empty_seat, monkeypatch):
+    mod = _load_tool(empty_seat, monkeypatch)
+    text = (_PK_HEAD + "## Morning pickup\np1. picked up in the first section\n\n"
+            "## Notes\nsome text\n\n## Morning pickup\np2. picked up in the last section\n")
+    assert _pk_shown(mod, text) == ["first", "third", "fourth"]
+
+
+def test_pk2_a_pickup_looking_line_in_a_fence_hides_nothing(empty_seat, monkeypatch):
+    mod = _load_tool(empty_seat, monkeypatch)
+    text = (_PK_HEAD + "## Morning pickup\n```\np1. picked up quoted\np2. skipped (quoted)\n```\n"
+            "p3. picked up real\n")
+    assert _pk_shown(mod, text) == ["first", "second", "fourth"]
+
+
+def test_pk2_a_pickup_looking_line_in_an_indented_fence_hides_nothing(empty_seat, monkeypatch):
+    # the writer's _scan strips leading whitespace before it looks for a fence, so this reader must too
+    mod = _load_tool(empty_seat, monkeypatch)
+    text = (_PK_HEAD + "## Morning pickup\n   ```\np2. picked up quoted\n   ```\n"
+            "p3. picked up real\n")
+    assert _pk_shown(mod, text) == ["first", "second", "fourth"]
+
+
+def test_pk2_a_fenced_morning_pickup_heading_is_not_a_section(empty_seat, monkeypatch):
+    mod = _load_tool(empty_seat, monkeypatch)
+    text = _PK_HEAD + "```\n## Morning pickup\np1. picked up quoted\n```\n"
+    assert _pk_shown(mod, text) == ["first", "second", "third", "fourth"]
+
+
+def test_pk2_a_pickup_line_under_another_heading_hides_nothing(empty_seat, monkeypatch):
+    mod = _load_tool(empty_seat, monkeypatch)
+    text = _PK_HEAD + "## Morning pickup\np1. picked up real\n\n## Later notes\np2. picked up elsewhere\n"
+    assert _pk_shown(mod, text) == ["second", "third", "fourth"]
+    text = _PK_HEAD + "## Some other section\np2. picked up elsewhere\n"
+    assert _pk_shown(mod, text) == ["first", "second", "third", "fourth"]
+
+
+def test_pk2_a_morning_pickup_copy_quoted_before_the_awake_block_hides_nothing(empty_seat, monkeypatch):
+    mod = _load_tool(empty_seat, monkeypatch)
+    text = ("# Dream record\n\n## Morning pickup\np1. picked up a quoted copy\np2. skipped (quoted)\n\n"
+            + _PK_HEAD)
+    assert _pk_shown(mod, text) == ["first", "second", "third", "fourth"]
+    # ... while a real section after the block still counts, and the quoted copy still does not
+    assert _pk_shown(mod, text + "## Morning pickup\np3. picked up real\n") == ["first", "second", "fourth"]
+
+
+@pytest.mark.parametrize("line", [
+    "p3 picked up done",        # no dot
+    "P3. picked up done",       # capital P
+    "p3. maybe",                # neither form
+    "p3. picked up",            # nothing recorded after the verb
+    "p3. skipped",              # no parenthesised reason
+    "p3. skipped ()",           # empty reason
+    "p0. picked up done",       # no item 0
+    "p.  picked up done",       # no number
+    "px. picked up done",
+    "p3.picked up done",        # no space after the dot
+    " - p3. picked up done",    # a bullet, not a pickup line
+])
+def test_pk3_a_malformed_line_hides_nothing(empty_seat, monkeypatch, line):
+    mod = _load_tool(empty_seat, monkeypatch)
+    text = _PK_HEAD + f"## Morning pickup\n{line}\n"
+    assert _pk_shown(mod, text) == ["first", "second", "third", "fourth"]
+
+
+def test_pk3_a_pickup_line_for_a_number_with_no_item_is_ignored(empty_seat, monkeypatch):
+    mod = _load_tool(empty_seat, monkeypatch)
+    text = _PK_HEAD + "## Morning pickup\np9. picked up nothing there\np12. skipped (no such item)\np2. picked up real\n"
+    assert _pk_shown(mod, text) == ["first", "third", "fourth"]
+
+
+_PK_GAPPED = (
+    "## For the awake seat\n"
+    "2. alpha item\n"
+    "3. beta item\n"
+    "5. gamma item\n\n"
+)
+
+
+def _pk_tags(mod, text):
+    """The printed item numbers (the ref tag) of the awake-seat candidates still shown."""
+    return [c["ref"].rsplit("#", 1)[1] for c in mod.parse_dream_report(text, "2026-10-19.md")]
+
+
+@pytest.mark.parametrize("line, gone, kept", [
+    ("p3. picked up x", "beta", ["2", "5"]),
+    ("p5. skipped (r)", "gamma", ["2", "3"]),
+])
+def test_pk1_a_pickup_matches_the_printed_number_not_the_list_position(
+        empty_seat, monkeypatch, line, gone, kept):
+    # numbered 2/3/5: position 3 is the printed 5, and printed 3 is position 2
+    mod = _load_tool(empty_seat, monkeypatch)
+    text = _PK_GAPPED + f"## Morning pickup\n{line}\n"
+    assert _pk_tags(mod, text) == kept
+    assert gone not in " | ".join(_pk_whys(mod, text))
+
+
+def test_pk4_triage_and_pickup_are_ored_either_hides(empty_seat, monkeypatch):
+    mod = _load_tool(empty_seat, monkeypatch)
+    text = (_PK_HEAD + "## Morning pickup\np1. picked up done\np3. skipped (later)\n\n"
+            "## Sleep-end triage (parent)\n2. do now - ran it\n3. defer - x\n4. defer - y\n")
+    # 1 by pickup, 2 by triage, 3 by pickup (its triage line is defer), 4 neither
+    assert _pk_shown(mod, text) == ["fourth"]
+    only_triage = _PK_HEAD + "## Sleep-end triage (parent)\n1. file (#1) - big\n"
+    assert _pk_shown(mod, only_triage) == ["second", "third", "fourth"]
+
+
+def test_pk4_a_deferred_item_with_no_pickup_line_stays(empty_seat, monkeypatch):
+    mod = _load_tool(empty_seat, monkeypatch)
+    text = _PK_HEAD + "## Morning pickup\np1. picked up done\n\n## Sleep-end triage (parent)\n2. defer - x\n"
+    assert _pk_shown(mod, text) == ["second", "third", "fourth"]
+
+
+def test_pk5_without_a_morning_pickup_section_the_output_is_the_triage_only_output(empty_seat, monkeypatch):
+    """REPORT carries a triage section (1 and 4 handled, 2 deferred, 3 untriaged, o2 handled) and no pickup
+    section: the candidates are pinned to the exact list the triage-only reader returned before the pickup
+    lines were read."""
+    mod = _load_tool(empty_seat, monkeypatch)
+    pinned_whys = [
+        "dream report 2026-10-17: Look at the second thing, which also mentions qux-102.",
+        "dream report 2026-10-17: Third thing has no node id at all.",
+        "dream report 2026-10-17 (open for tomorrow): qux-201 (one), qux-202 (two), qux-203 (three): "
+        "all need external evidence.",
+    ]
+    got = mod.parse_dream_report(REPORT, "2026-10-17.md")
+    assert [c["why"] for c in got] == pinned_whys
+    assert [c["ref"] for c in got] == ["qux-102", "history/dream/2026-10-17.md#3", "qux-201,qux-202,qux-203"]
+    # an empty Morning pickup heading (no lines) changes nothing either
+    assert mod.parse_dream_report(REPORT + "\n## Morning pickup\n", "2026-10-17.md") == got
+
+
+def test_pk6_the_real_dream_pickup_tool_and_this_reader_agree_on_the_format(empty_seat, monkeypatch, tmp_path):
+    """The writer (tools/dream_pickup.py, run for real on a copy of a record) and this reader must agree:
+    after --pick 2 and --skip 3 exactly items 2 and 3 are hidden."""
+    mod = _load_tool(empty_seat, monkeypatch)
+    rec = tmp_path / "2026-10-19.md"
+    rec.write_text("# Dream record\n\n" + _PK_HEAD, encoding="utf-8")
+    tool = Path(__file__).resolve().parent.parent / "src" / "engram" / "tools" / "dream_pickup.py"
+    env = {k: v for k, v in os.environ.items() if k != "ENGRAM_HOME"}
+
+    def run(*args):
+        r = subprocess.run([sys.executable, str(tool), *args, "--record", str(rec)],
+                           capture_output=True, text=True, env=env)
+        assert r.returncode == 0, r.stderr
+
+    assert _pk_shown(mod, rec.read_text(encoding="utf-8")) == ["first", "second", "third", "fourth"]
+    run("--pick", "2", "ran it; wrote the result")
+    run("--skip", "3", "not worth it today")
+    assert "## Morning pickup" in rec.read_text(encoding="utf-8")
+    assert _pk_shown(mod, rec.read_text(encoding="utf-8")) == ["first", "fourth"]
+    run("--pick", "1", "one more")  # a re-run on another item adds a line, still one section
+    assert _pk_shown(mod, rec.read_text(encoding="utf-8")) == ["fourth"]
+
+
+# ==========================================================================
 # Each store source's filter and order
 # ==========================================================================
 

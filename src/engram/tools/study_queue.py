@@ -11,8 +11,11 @@ Sources, in priority order (a candidate list; the first N after de-duplication b
 1. dream     the latest dream report ($ENGRAM_HOME/history/dream/YYYY-MM-DD*.md, by name without .md,
              last): the numbered items of ``## For the awake seat`` and the bullets of
              ``## Open for tomorrow`` that the ``## Sleep-end triage (parent)`` section has
-             not HANDLED (a disposition starting ``do now`` or ``file``).  ``defer``, or no
-             triage line at all, keeps the item.
+             not HANDLED.  An item is handled when its triage disposition starts ``do now`` or
+             ``file``, OR when the record's last ``## Morning pickup`` section (written by
+             tools/dream_pickup.py) carries ``pN. picked up ...`` or ``pN. skipped (...)`` for
+             awake-seat item N; either source hides it.  ``defer``, or neither source naming the
+             item, keeps it.  Open-for-tomorrow bullets have no pickup lines.
 2. weakest-belief   the top entry of ``weakest_load_bearing.read_ranking(db, n=1)`` (imported,
              not reimplemented; ITS owner-read flag governs that read).
 3. question  current, non-retracted ``question`` nodes whose status is ``open`` or
@@ -84,6 +87,7 @@ def _load_sibling(name: str):
 
 
 wlb = _load_sibling("weakest_load_bearing")
+dream_pickup = _load_sibling("dream_pickup")  # the writer's own section scan: one definition of "the Morning pickup section"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -177,6 +181,8 @@ _HEADING_RE = re.compile(r"^##\s+(.*?)\s*$")
 _NUMBERED_RE = re.compile(r"^(\d+)\.\s+(.*)$")
 _BULLET_RE = re.compile(r"^[-*]\s+(.*)$")
 _TRIAGE_RE = re.compile(r"^(o?)(\d+)\.\s*(.*)$")
+# the two line forms tools/dream_pickup.py writes; both need something recorded (an empty one is not ours)
+_PICKUP_DONE_RE = re.compile(r"^p(\d+)\.\s+(?:picked up\s+\S|skipped\s+\(\s*\S.*\))")
 
 
 def _sections(text: str) -> dict:
@@ -242,6 +248,30 @@ def _handled(disposition) -> bool:
     return disposition is not None and (disposition.startswith("do now") or disposition.startswith("file"))
 
 
+def _picked_up(text: str) -> set:
+    """Awake-seat item numbers the record's Morning pickup section marks ``picked up`` or ``skipped``.
+    The section is dream_pickup's own: its LAST heading after the awake-seat block (a copy quoted
+    before that block is never it), ended by the next heading; lines inside a fenced block are quoted
+    text and count for nothing.  Anything unrecognised hides nothing."""
+    lines = text.splitlines(keepends=True)
+    _seen, _numbers, start, end = dream_pickup._scan(lines)
+    out: set = set()
+    if start is None:
+        return out
+    in_fence = False
+    for raw in lines[start + 1:end]:
+        line = raw.rstrip("\r\n")
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = _PICKUP_DONE_RE.match(line)
+        if m:
+            out.add(int(m.group(1)))
+    return out
+
+
 def _dream_ref(text: str, report: str, tag: str) -> str:
     ids = _node_ids(text)
     return ",".join(ids) if ids else f"history/dream/{report}#{tag}"
@@ -253,11 +283,12 @@ def parse_dream_report(text: str, report_name: str) -> list:
     date = report_name[:-3] if report_name.endswith(".md") else report_name
     sections = _sections(text)
     triage = _triage(sections.get("triage", []))
+    picked = _picked_up(text)
     out = []
     numbered = _items(sections.get("awake", []), _NUMBERED_RE)
     for pos, (num, body) in enumerate(numbered, 1):
         n = int(num) if num is not None else pos
-        if _handled(triage.get(("", n))):
+        if _handled(triage.get(("", n))) or n in picked:
             continue
         out.append({
             "source": "dream",
