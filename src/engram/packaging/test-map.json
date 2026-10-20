@@ -355,7 +355,8 @@
       "test_globs": [
         "tests/test_cohort_dispatch.py",
         "tests/test_cohort_owner_read_3862.py",
-        "tests/test_store_path_precheck_3960.py"
+        "tests/test_store_path_precheck_3960.py",
+        "tests/test_cohort_dispatch_unusable_regular_store_3963.py"
       ]
     },
     {

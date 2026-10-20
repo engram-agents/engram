@@ -54,6 +54,7 @@ import argparse
 import functools
 import json
 import os
+import sqlite3
 import sys
 import textwrap
 import traceback
@@ -480,6 +481,11 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         # No traceback (#3960). 1 is prepare's error code here (no artifact is written before this point).
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    except sqlite3.Error as exc:
+        # #3963: a regular file that is not a usable store (text file, no `nodes` table, mode 000) passes
+        # `check_store_path` and fails inside SQLite. One named line, no traceback, no artifact written.
+        print(f"error: cannot read the store {db_path}: {exc}", file=sys.stderr)
+        return 1
 
     if not nodes:
         print(f"error: none of the requested nodes found in {db_path}", file=sys.stderr)
@@ -736,6 +742,15 @@ def cmd_verify_in(args: argparse.Namespace) -> int:
                 "chunk": "all",
                 "check": "db_access",
                 "error": str(exc),
+            })
+            db_nodes = None
+        except sqlite3.Error as exc:
+            # #3963: a regular file that is not a usable store. The same ONE named failure, and no answer
+            # (None), never an empty one: the per-node "not found in DB" checks below only run on a real answer.
+            errors.append({
+                "chunk": "all",
+                "check": "db_access",
+                "error": f"cannot read the store {db_path}: {exc}",
             })
             db_nodes = None
 
