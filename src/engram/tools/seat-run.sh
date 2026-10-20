@@ -21,8 +21,10 @@
 # Writes only under SEAT_RUN_ROOT (scratch worktree, removed on exit/INT/TERM).
 #
 # C8 covers the tool's OWN writes only. The pytest child inherits HOME and
-# ENGRAM_HOME unchanged (setting them for the child can make tests fail that
-# pass under plain pytest); only TMPDIR is redirected into the scratch dir.
+# ENGRAM_HOME as given, except that a leading ~ in ENGRAM_HOME is expanded
+# against $HOME first (see the ENGRAM_HOME guard below); setting either for
+# the child can make tests fail that pass under plain pytest. Only TMPDIR is
+# redirected into the scratch dir.
 # With no named test file in the pytest args (or none at all), the whole suite
 # runs from the repo root of the scratch worktree and is reported as "(all)".
 #
