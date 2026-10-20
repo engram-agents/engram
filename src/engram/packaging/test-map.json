@@ -721,6 +721,13 @@
       "note": "engram-alpha#3863 PR 3b: LOG_DIR and PYTHON resolve from ENGRAM_HOME (the assignments are extracted and evaluated; the CI sim is never run). Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
     },
     {
+      "path_prefix_or_glob": "tools/seat-run.sh",
+      "test_globs": [
+        "tests/test_seat_run_tool.py"
+      ],
+      "note": "engram-alpha#3974: contract cells C1-C8 run the script under /bin/bash against scratch git repos. Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
       "path_prefix_or_glob": "tools/run-all-tests.sh",
       "test_globs": [
         "tests/test_shell_engram_home_3863.py"

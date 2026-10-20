@@ -575,6 +575,11 @@
       "note": "Local diff-coverage helper (#2774) -- reports coverage of only the lines the current branch changes vs origin/dev, via diff-cover fed a coverage.xml from an affected-tests run. Dev tooling (T3): a developer convenience for local PR iteration, not part of any install path a shipped agent relies on. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/coverage-diff.sh) would wrongly flag this as dangling (same pattern as tools/rc-upgrade-verify.py's entry above)."
     },
     {
+      "path": "tools/seat-run.sh",
+      "tier": "dev",
+      "note": "engram-alpha#3974: Mac-safe test runner for colleague reads (scratch worktree, header naming the seat's configuration, -o flag read-back, zero-test guard, per-file results). ENGRAM-development tooling (T3); a developer convenience for review seats, never relied on by an installed agent."
+    },
+    {
       "path": "tools/recall_harness",
       "tier": "dev",
       "source": "tools/recall_harness",
