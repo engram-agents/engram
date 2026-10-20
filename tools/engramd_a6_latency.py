@@ -2317,6 +2317,21 @@ def format_table(result: Dict) -> str:
 
 # --- CLI -------------------------------------------------------------------------
 
+def _check_store_arg(path: Path) -> Optional[str]:
+    """The `--store` precheck (#3962): None for a usable store, else the classifier's one-line message.  It runs
+    BEFORE `_is_live_store` (whose `Path.resolve()` raises on a symlink loop) and before any build, layout child or
+    temp dir; a FIFO would otherwise hang the child's `mode=ro` connect.  The repo root is appended to sys.path
+    (never inserted, #2565) so `tools` resolves as it does under pytest."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.append(str(REPO_ROOT))
+    from tools import _owner_read as owner_read
+    try:
+        owner_read.check_store_path(path)
+    except (FileNotFoundError, owner_read.StoreUnusable) as exc:
+        return str(exc)
+    return None
+
+
 def _is_live_store(path: Path) -> bool:
     live = {Path(os.environ.get("ENGRAM_HOME") or (Path.home() / ".engram")) / "knowledge.db",
             Path.home() / ".engram" / "knowledge.db"}
@@ -2382,6 +2397,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.n < N_FLOOR:
         print(f"engramd_a6_latency: error -- N must be >= {N_FLOOR} (got {args.n})", file=sys.stderr)
         return 2
+    if args.store is not None:
+        store_problem = _check_store_arg(args.store)
+        if store_problem is not None:
+            print(f"engramd_a6_latency: error -- {store_problem}", file=sys.stderr)
+            return 2
     if args.store is not None and _is_live_store(args.store):
         print(f"engramd_a6_latency: error -- {args.store} is this seat's live store; "
               "refusing. Pass a COPY of a test store.", file=sys.stderr)
@@ -2399,7 +2419,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not args.no_real_store:
             real_src = args.real_store or (Path(os.environ.get("ENGRAM_HOME") or (Path.home() / ".engram"))
                                            / "knowledge.db")
-            if not real_src.is_file():
+            try:
+                real_is_file = real_src.is_file()
+            except OSError:   # an unsearchable parent: is_file() raises PermissionError on 3.12 (#3962)
+                print(f"engramd_a6_latency: error -- {_check_store_arg(real_src) or f'cannot check {real_src}'}",
+                      file=sys.stderr)
+                return 2
+            if not real_is_file:
                 print(f"engramd_a6_latency: error -- the real-store source {real_src} is not a file; the real-store "
                       "copy is the GATE cell. Name one with --real-store PATH (or --no-real-store for a synthetic-only "
                       "run, which is never a pass).", file=sys.stderr)

@@ -441,14 +441,16 @@
     {
       "path_prefix_or_glob": "tools/engramd_a6_latency.py",
       "test_globs": [
-        "tests/test_engramd_a6_latency.py"
+        "tests/test_engramd_a6_latency.py",
+        "tests/test_store_path_precheck_3962c.py"
       ],
       "note": "engram-alpha#3197 (U4d): loaded by tests/test_engramd_a6_latency.py via importlib (file path), so it is invisible to the layer-1 import graph."
     },
     {
       "path_prefix_or_glob": "tools/engramd_stage_profile.py",
       "test_globs": [
-        "tests/test_engramd_stage_profile_3678.py"
+        "tests/test_engramd_stage_profile_3678.py",
+        "tests/test_store_path_precheck_3962c.py"
       ],
       "note": "engram-alpha#3678 (U7): loaded by tests/test_engramd_stage_profile_3678.py via importlib (file path), so it is invisible to the layer-1 import graph."
     },
@@ -562,7 +564,8 @@
     {
       "path_prefix_or_glob": "tools/perf/*.py",
       "test_globs": [
-        "tests/test_replay_bench.py"
+        "tests/test_replay_bench.py",
+        "tests/test_store_path_precheck_3962c.py"
       ],
       "note": "tools/perf/ is the first subdirectory under tools/ \u2014 _discover_repo_modules() only globs tools/*.py non-recursively, so modules here aren't registered as repo module stems and the test file's bare `import replay_bench`/`import trace_from_telemetry` (via manual sys.path insertion, not `from tools.perf.X import`) never lands in the import graph either. Without this entry, an edit to either file gets a fast-CI subset that silently omits its own test, with no fail-open backstop (found by the reviewer-fairy on PR #1676)."
     },

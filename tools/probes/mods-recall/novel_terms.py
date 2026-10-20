@@ -90,7 +90,26 @@ def save_seen(state: Path, seen: set[str]) -> None:
         raise
 
 
+def check_db(db: Path) -> None:
+    """Refuse an unusable --db with one line and exit 1 (#3962), before anything opens it: a FIFO would hang the
+    `mode=ro` connect. The repo root is found by name (the nearest ancestor holding tools/_owner_read.py, never a
+    fixed parents[N]) and appended, never inserted (#2565)."""
+    here = Path(__file__).resolve()
+    repo_root = next((d for d in here.parents if (d / "tools" / "_owner_read.py").is_file()), None)
+    if repo_root is None:
+        raise SystemExit(f"novel_terms: cannot find tools/_owner_read.py above {here} (run it from the engram-alpha "
+                         "checkout)")
+    if str(repo_root) not in sys.path:
+        sys.path.append(str(repo_root))
+    from tools import _owner_read as owner_read
+    try:
+        owner_read.check_store_path(db)
+    except (FileNotFoundError, owner_read.StoreUnusable) as exc:
+        raise SystemExit(f"novel_terms: {exc}") from None
+
+
 def extract(text: str, db: Path, top_k: int) -> list[str]:
+    check_db(db)
     sys.path.insert(0, str(resolve_runtime_dir()))
     from engram_idf import JUNK_STOPLIST, STOPWORDS, extract_keywords  # noqa: E402
 

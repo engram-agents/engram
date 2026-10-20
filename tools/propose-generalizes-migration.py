@@ -124,6 +124,12 @@ for _candidate in (_HERE.parent / "src" / "engram", _HERE.parent):
 
 import engram_core as core  # noqa: E402
 
+# The store-path classifier (#3962). Repo-root tools/_owner_read.py is a symlink into src/engram/tools/; the repo
+# root is appended (never insert(0), #2565) so `tools` resolves the same way it does under pytest.
+if str(_HERE.parent) not in sys.path:
+    sys.path.append(str(_HERE.parent))
+from tools import _owner_read as owner_read  # noqa: E402
+
 
 # --- tiers ------------------------------------------------------------------
 
@@ -311,13 +317,18 @@ def open_readonly(db_path) -> sqlite3.Connection:
         nothing to propose.
     """
     db_path = Path(db_path).expanduser()
-    if not db_path.exists():
+    try:
+        # Classifies without opening: a FIFO would hang the mode=ro connect (#3962). Anything but a usable
+        # file raises; StoreUnusable (uncheckable / not a store) propagates to main, which names the cause.
+        owner_read.check_store_path(db_path)
+    except FileNotFoundError:
         raise FileNotFoundError(
             f"ENGRAM database not found: {db_path}\n"
             "Refusing to emit a report — an empty report and an unreadable "
             "database must not look alike."
-        )
-    uri = "file:" + urllib.parse.quote(str(db_path.resolve())) + "?mode=ro"
+        ) from None
+    # absolute(), not resolve(): resolve() raises RuntimeError on a symlink loop, and SQLite follows links itself.
+    uri = "file:" + urllib.parse.quote(str(db_path.absolute())) + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     return conn
@@ -686,7 +697,7 @@ def main(argv=None) -> int:
 
     try:
         conn = open_readonly(db_path)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, owner_read.StoreUnusable) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 

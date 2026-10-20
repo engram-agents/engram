@@ -39,7 +39,8 @@ that moves or renames a stage.
 
     python tools/engramd_stage_profile.py [--n 1000] [--nodes 5000] [--warmup 50]
                                           [--store PATH] [--hook stop|user-identity]
-Exit 0 ok; 2 bad input (N below the 1000 floor, or --store is the live store).
+Exit 0 ok; 2 bad input (N below the 1000 floor, --store is the live store, or --store is missing /
+unusable: a FIFO, directory, symlink loop or unsearchable parent; refused before any build or temp dir).
 """
 from __future__ import annotations
 
@@ -733,6 +734,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.n < N_FLOOR:
         print(f"--n must be >= {N_FLOOR} (#3678)", file=sys.stderr)
         return 2
+    if a.store is not None:
+        # #3962: classify the path BEFORE `_is_live_store` (its resolve() raises on a symlink loop) and before
+        # make_test_store (a FIFO hangs its mode=ro connect; a missing path leaves a temp dir). Reuses a6's helper.
+        store_problem = _load_a6()._check_store_arg(a.store)
+        if store_problem is not None:
+            print(f"refusing: {store_problem}", file=sys.stderr)
+            return 2
     if a.store is not None and _load_a6()._is_live_store(a.store):
         print(f"refusing: {a.store} is this seat's live store; pass a copy", file=sys.stderr)
         return 2
