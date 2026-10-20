@@ -606,6 +606,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/lesson-pattern-audit.py",
+      "tier": "essential"
+    },
+    {
       "path": "tool_capability_index.txt",
       "tier": "essential"
     },
@@ -1493,10 +1497,6 @@
     {
       "path": "src/engram/tools/migrate_person_nodes.py",
       "reason": "one-shot dry-run guide: extracts typed fields from legacy free-form person node prose; produces a human-review report, never auto-applies; not a recurring shipped mechanism"
-    },
-    {
-      "path": "tools/lesson-pattern-audit.py",
-      "reason": "maintainer-run functional audit of lesson situation_patterns against real transcript traffic (issue #2018); diagnostic tool run manually against an agent's own home directory to sanity-check pattern coverage, not a recurring shipped mechanism any install needs to run"
     },
     {
       "path": "tools/engram-backfill-special-moment-edges.py",

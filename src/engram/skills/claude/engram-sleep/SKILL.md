@@ -351,6 +351,44 @@ The tool contends for the SQLite write lock like any other writer against a live
 
 **Pass the same line to the dream master** — carry `$embed_backfill_status` forward to Step 8, which adds one line to the COHORT METADATA block of the spawn prompt (`- Embedding backfill (Phase A): <embed_backfill_status>`) and one instruction sentence telling the dream master to copy it into the dream record — see Step 8 below.
 
+### Step 3.95 — Refresh the lesson-fire ranks (engram-alpha#3941)
+
+The tripwire hook orders a cluster of co-firing lessons by how rarely each one fires, and reads that order from `${ENGRAM_HOME:-$HOME/.engram}/lesson-fire-ranks.json` (#3924). The file is seat-local (each seat has its own lessons and its own traffic) and the hook stops trusting it after 7 days, so a seat that never refreshes it silently loses the ordering. `tools/lesson-pattern-audit.py --write-ranks` replays the recent transcripts against the current lessons and rewrites that one file. This step is that routine run.
+
+**Scope: the tool is read-only on the graph and on the transcripts, and writes only the one rank file** (whole-file, temp file then replace, so an interrupted run leaves the old file). With no transcripts to replay it exits 0, says so, and leaves the existing file as it is (an empty file would read as "every lesson is rare"). With no tripwire hook installed (the hook is `convenience`, so an Essential-only install lacks it, and nothing would read the file) it does the same. A hook that is installed but broken, or a relative ENGRAM home path, is a loud non-zero, never a tick. The store is read through the shared owner-read helper, behind `engramd.lesson_pattern_audit_reads_via_owner` (default OFF).
+
+Same invocation shape as Step 3.9. stderr is captured to a `mktemp` file (never a fixed `/tmp` name) so a failure's reason survives, and the file is removed in every branch. The template names its directory (`$TMPDIR` when set, else the `tmp` folder under the ENGRAM home) because a bare `mktemp` ignores `TMPDIR` on macOS:
+
+```bash
+lesson_ranks_tmp="${ENGRAM_HOME:-$HOME/.engram}/tmp"
+mkdir -p "${TMPDIR:-$lesson_ranks_tmp}"
+lesson_ranks_stderr=$(mktemp "${TMPDIR:-$lesson_ranks_tmp}/lesson-ranks-XXXXXX")
+lesson_ranks_out=$("$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/lesson-pattern-audit.py" --write-ranks 2>"$lesson_ranks_stderr")
+lesson_ranks_rc=$?
+if [ $lesson_ranks_rc -eq 0 ]; then
+    case "$lesson_ranks_out" in
+        *"no transcripts found"*) lesson_ranks_status="✓ no transcripts found, rank file left as is" ;;
+        *"no tool-call targets in the transcripts"*) lesson_ranks_status="✓ no tool-call targets in the transcripts, rank file left as is" ;;
+        *"no tripwire hook installed"*) lesson_ranks_status="✓ no tripwire hook installed, rank file left as is" ;;
+        *) lesson_ranks_status="✓ lesson ranks written" ;;
+    esac
+else
+    lesson_ranks_last_line=$(tail -n 1 "$lesson_ranks_stderr")
+    lesson_ranks_status="⚠ lesson-ranks FAILED (exit $lesson_ranks_rc): $lesson_ranks_last_line"
+fi
+rm -f "$lesson_ranks_stderr"
+```
+
+**Non-blocking, like 3.9 and 4.5–4.7**: ANY non-zero exit is recorded as the loud `⚠ ... FAILED` line and never skipped, and a failure never aborts sleep — the day's nodes are already in the graph, and a stale rank file only costs the hook its ordering until the next run.
+
+**Record in today's history file (Step 4)**, in the exact shape `- lesson-fire ranks: $lesson_ranks_status`, e.g.:
+
+```
+- lesson-fire ranks: $lesson_ranks_status
+```
+
+`$lesson_ranks_status` is a SINGLE variable that already covers every branch (written, nothing to replay, failed), so this one template is the only history line this step emits.
+
 ### Step 4 — Reconcile today's history file (awake-state milestone log)
 
 `${ENGRAM_HOME:-$HOME/.engram}/history/YYYY-MM-DD.md` is the **awake-state milestone log** — PRs shipped, decisions made, features delivered, key conversations. Distinct from the dream-record file that the dream master writes at `${ENGRAM_HOME:-$HOME/.engram}/history/dream/YYYY-MM-DD.md` (filename = the NYC-local date the record was WRITTEN, per that spec's own Output contract), which captures consolidation output.

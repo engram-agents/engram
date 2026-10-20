@@ -23,6 +23,13 @@
       ]
     },
     {
+      "key": "1ce567fd44516865b873f2446cffb547b5b6a78bd6525662a91c6fcb49b8790a",
+      "sql": "select id,claim,metadata from nodes where type='lesson' and is_current=1",
+      "sites": [
+        "tools/lesson-pattern-audit.py:read_lesson_rows"
+      ]
+    },
+    {
       "key": "1f0642346288d91dd8ece6a13066919a24df7fdc305f365332735f83a606fbc5",
       "sql": "SELECT id, type, claim, confidence, recall_turn, status FROM nodes WHERE is_current = 1 AND COALESCE(status, '') != 'retracted' AND type IN (SELECT value FROM json_each(?))",
       "sites": [

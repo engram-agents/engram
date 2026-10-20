@@ -471,6 +471,16 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/lesson-pattern-audit.py",
+      "test_globs": [
+        "tests/test_lesson_pattern_audit.py",
+        "tests/test_lesson_pattern_audit_shipped_3941.py",
+        "tests/test_lesson_pattern_audit_owner_read_3941.py",
+        "tests/test_lesson_pattern_audit_sleep_step_3941.py"
+      ],
+      "note": "engram-alpha#3941: the tool ships (essential; its recurring caller is engram-sleep) and reads the store through the owner-read helper (flag lesson_pattern_audit_reads_via_owner), and engram-sleep Step 3.95 runs it (the sleep-step test extracts and runs that block). The tests load it by path and run it as a subprocess, invisible to the layer-1 import graph; the registered read template also ties it to tests/test_engramd_read_scan.py."
+    },
+    {
       "path_prefix_or_glob": "tools/engram-regenerate-embeddings.py",
       "test_globs": [
         "tests/test_git_backup_embeddings.py",

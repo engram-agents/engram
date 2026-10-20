@@ -566,6 +566,7 @@
   "tools/dream_master_batch.py:count_null_embeddings",
   "tools/weakest_load_bearing.py:rank",
   "tools/study_queue.py:store_candidates",
+  "tools/lesson-pattern-audit.py:read_lesson_rows",
   "tools/inspect_raw.py:read_row"
  ],
  "exclusions": [

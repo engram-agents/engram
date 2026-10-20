@@ -495,7 +495,9 @@ _LINE_KEY = _re.compile(r":\d+$")
 # #3919 (M3): the study queue's three statements, tools/study_queue.py (reached from the root
 # `store_candidates`: the question/conjecture nodes, the live-node brief, the pending cascade nodes).
 # #2652 (tools-7): the one-row read of tools/inspect_raw.py:read_row (f37b0a78...).
+# #3941 (tools-8): the one current-lessons read of tools/lesson-pattern-audit.py:read_lesson_rows (1ce567fd...).
 _FROZEN_TEMPLATE_KEYS = frozenset({
+    "1ce567fd44516865b873f2446cffb547b5b6a78bd6525662a91c6fcb49b8790a",
     "1f0642346288d91dd8ece6a13066919a24df7fdc305f365332735f83a606fbc5",
     "4c297eed21620600e0366ba8d26aa74d052af13f9b2b449fbd82152edc7a21ff",
     "dff01272150b1be18634be6118c7082e02eede13b65b66e6ec90a90426db3213",
