@@ -286,7 +286,19 @@ Verify: for a unit (b1), `MainPID` changed and `engramd.pid` matches it; for a h
 
 > **The setup script ignores flags it does not know.** `tools/setup-surface-daemon-service.sh` recognizes only `--owner` and `--allow-path`; any other argument, including `--help`, is silently skipped and the **default action runs** (re-renders the surface-daemon unit and enables and starts it). Measured 2026-10-19: calling it with `--help` to read the usage did exactly that. Read the usage from the header comment instead (`sed -n 1,60p`).
 
-**Checkpoint**: the surface daemon's pid is newer than the rebuild and matches `recall-daemon.pid`; the owner is restarted and verified, or confirmed absent by the check above (not assumed).
+### (c) Gate: no long-lived process may predate the deploy (#3938)
+
+Steps (a) and (b) are written steps, and a written step can be skipped. This one fails when they were. Run the gate in GATE mode (no `--informational`) and treat a non-zero exit as a FAIL of the upgrade:
+
+```bash
+python3 "${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram/tools/check_stale_processes.py"; echo "exit $?"
+```
+
+It prints one line per process (owner, surface-daemon, mcp-server) and a summary: four lines, always. Each process is `FRESH` (started at or after `deployed_at`), `STALE` (started before it; the line carries the restart command), `NOT_RUNNING` or `UNVERIFIED`. Exit 0 means every process is FRESH; **1** means a STALE one (restart it by (a), (b) or the `/mcp` reconnect of Step 5, then run the gate again); **3** means nothing is STALE but some process is `NOT_RUNNING` or `UNVERIFIED`; **2** means `.deployed-version` could not be read, so nothing was judged. A missing pidfile is never reported as clean.
+
+Exit 3 is the expected answer on a seat that legitimately has no engramd owner: the `owner:` line says `NOT_RUNNING` and (b) above confirmed there is none. Accept that one line, and only that line, after you have run (b)'s check; any other `NOT_RUNNING` or `UNVERIFIED` line is a FAIL to look into (a recycled pid shows as `UNVERIFIED`). The `mcp-server` line covers only the server named in `mcp-tools-ready.json` (the most recent session's); other concurrent sessions' servers are not checked. The tool compares two clocks, the process start time and the pidfile's mtime, and calls a process STALE if either is before `deployed_at`; the install script prints the same lines right after Step 3 with `--informational`, where every process reads STALE by construction.
+
+**Checkpoint**: the surface daemon's pid is newer than the rebuild and matches `recall-daemon.pid`; the owner is restarted and verified, or confirmed absent by the check above (not assumed); and the gate in (c) exits 0 (or 3 with only the owner line `NOT_RUNNING` on a seat confirmed to have none).
 
 ---
 

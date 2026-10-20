@@ -525,6 +525,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/check_stale_processes.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/dream_pickup.py",
       "tier": "convenience"
     },

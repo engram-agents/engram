@@ -2229,3 +2229,23 @@ def test_fake_venv_mkdir_stays_strict(tmp_path):
     _fake_venv(tmp_path, log)
     with pytest.raises(FileExistsError):
         _fake_venv(tmp_path, log)
+
+
+def test_installer_runs_the_stale_process_check_informationally_after_the_version_stamp():
+    """#3938.  Grep-level structural cell (it does not run the installer): the stale-process block
+    exists after the `.deployed-version` write, runs the tool with --informational inside an `if !`
+    guard so a non-zero exit (a broken tool is exit 4) cannot abort the install under `set -e`
+    (the pipeline is the guard's condition, and pipefail is on), and finds the tool through the
+    script's own location rather than a fixed path."""
+    text = INSTALLER.read_text()
+    stamp = text.index('> "$ENGRAM_HOME/.deployed-version"')
+    block_start = text.index("check_stale_processes.py", stamp)
+    assert block_start > stamp
+    assert re.search(r"^set -euo pipefail$", text, re.M)
+    assert re.search(r'^_stale_tool="\$\(dirname "\$_self"\)/check_stale_processes\.py"$', text, re.M)
+    assert text.index('_stale_tool="$(dirname "$_self")') > stamp
+    run = [ln for ln in text[stamp:].splitlines() if 'python3 "$_stale_tool"' in ln]
+    assert len(run) == 1, run
+    assert run[0].lstrip().startswith("if ! ")
+    assert "--informational" in run[0]
+    assert 'WARNING: check_stale_processes.py could not run' in text[stamp:]

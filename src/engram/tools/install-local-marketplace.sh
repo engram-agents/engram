@@ -491,6 +491,22 @@ fi
 } > "$ENGRAM_HOME/.deployed-version"
 log "Version marker refreshed: $ENGRAM_HOME/.deployed-version (alpha_sha=$ALPHA_SHA)"
 
+# ── Stale long-lived processes (#3938) ───────────────────────────────────────
+# The install restarts nothing: the engramd owner and the surface daemon keep running the code they
+# started with. Right after an install every running process is older than the deploy BY
+# CONSTRUCTION, so this is informational (exit 0 always) and can never fail the install; the gate
+# that fails is check_stale_processes.py without --informational, run by the engram-upgrade skill
+# after the restarts. A missing or crashing tool costs one warning line.
+_stale_tool="$(dirname "$_self")/check_stale_processes.py"
+if [[ -f "$_stale_tool" ]] && command -v python3 &>/dev/null; then
+  log "Long-lived processes that still run pre-deploy code (restart each one named STALE; see the engram-upgrade skill):"
+  if ! ENGRAM_HOME="$ENGRAM_HOME" python3 "$_stale_tool" --informational 2>&1 | sed 's/^/[install-local-marketplace]   /'; then
+    log "WARNING: check_stale_processes.py could not run; restart the engramd owner and the surface daemon by hand (engram-upgrade skill)."
+  fi
+else
+  log "WARNING: check_stale_processes.py not found beside this script; restart the engramd owner and the surface daemon by hand (engram-upgrade skill)."
+fi
+
 # ── Persist install choices to config.json (bug 4, #1244) ────────────────────
 # Write install_tier and multi_agent back to config.json so the next upgrade
 # can read them without the user needing to re-specify explicit flags.
