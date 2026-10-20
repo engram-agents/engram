@@ -48,6 +48,17 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent  # engram-alpha/
 
+
+def _load_owner_read():
+    """The shared store-path classifier, imported where it is used (scope-export, render) and not at module
+    top, so a foreign `tools` package earlier on sys.path cannot break the other subcommands at startup.
+    append (not insert(0)) -- #2565: REPO_ROOT at sys.path POSITION 0 would outrank the repo-root tools/ package."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.append(str(REPO_ROOT))
+    from tools import _owner_read
+    return _owner_read
+
+
 # Canonical ENGRAM node types — kept here as a static list (mirrors the server's
 # type vocabulary). Used as argparse `choices` for --node-type so a typo errors
 # loudly with the valid list, instead of silently returning empty results.
@@ -1087,11 +1098,16 @@ def cmd_scope_export(args):
         os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
     ).expanduser().resolve()
     source_db = source_home / "knowledge.db"
-    if not source_db.exists():
+    owner_read = _load_owner_read()
+    try:
+        owner_read.check_store_path(source_db)
+    except FileNotFoundError:
         sys.exit(
             f"ERROR: scope-export: source graph not found at {source_db}. "
             f"Set $ENGRAM_HOME to point at your ENGRAM data directory."
         )
+    except owner_read.StoreUnusable as exc:
+        sys.exit(f"ERROR: scope-export: {exc}")
 
     max_nodes = args.max_nodes if args.max_nodes is not None else _SCOPE_EXPORT_DEFAULT_MAX_NODES
     max_edges = args.max_edges if args.max_edges is not None else _SCOPE_EXPORT_DEFAULT_MAX_EDGES
@@ -1307,6 +1323,15 @@ def cmd_render(args):
     non-zero and writes nothing.
     """
     pkg_path = resolve_pkg(args)
+    owner_read = _load_owner_read()
+    # #3962: `_check_stale_build` stats <pkg>/knowledge.db and raises on an unsearchable path, so classify first.
+    # A missing store falls through: the not-found message keeps its place in render's validation order.
+    try:
+        owner_read.check_store_path(pkg_path / "knowledge.db")
+    except FileNotFoundError:
+        pass
+    except owner_read.StoreUnusable as exc:
+        sys.exit(f"ERROR: render: {exc}")
     _check_stale_build(pkg_path)
 
     # ------------------------------------------------------------------ #
@@ -1382,8 +1407,12 @@ def cmd_render(args):
     # 4. Strict validation                                                 #
     # ------------------------------------------------------------------ #
     pkg_db = pkg_path / "knowledge.db"
-    if not pkg_db.exists():
+    try:
+        owner_read.check_store_path(pkg_db)
+    except FileNotFoundError:
         sys.exit(f"ERROR: render: package DB not found at {pkg_db}. Run `engram-pkg build` first.")
+    except owner_read.StoreUnusable as exc:
+        sys.exit(f"ERROR: render: {exc}")
 
     # Single read pass — open one connection and read every manifest node once.
     # The result is reused for both validation (4c) and the render cache (step 6),

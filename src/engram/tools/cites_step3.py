@@ -149,6 +149,10 @@ import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
+# append (not insert(0)) -- #2565: src/engram at sys.path POSITION 0 would outrank the repo-root tools/ package.
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from tools import _owner_read as owner_read  # noqa: E402
+
 LABELS = ("correct-about", "mis-filed-premise", "other-relation", "unforeseen", "cannot-judge")
 PHASES = ("a", "b", "c", "d", "e", "f")
 STRUCTURAL_SOURCES = ("feeling_report", "question")
@@ -1429,7 +1433,15 @@ def _main(argv):
           f"report is for seat {rep['seat']!r} but this graph's agent_name is {agent!r}: own graph only")
     _need(rep["lineage"] == lineage,
           f"report lineage {rep['lineage']!r} differs from this graph's self_lineage {lineage!r}: own graph only")
-    _need((home / "knowledge.db").exists(), f"no knowledge.db under {home}")
+    # #3962: classify the store path without opening it (a `mode=ro` open of a FIFO blocks on macOS, and
+    # `exists()` calls a loop, a dangling link and an unsearchable parent "missing"). Every `_ro_uri` connect below
+    # reads `core.DB_PATH` (= this path after `_configure_paths(home)`) or a file this run made itself.
+    try:
+        owner_read.check_store_path(home / "knowledge.db")
+    except FileNotFoundError:
+        raise Refusal(f"no knowledge.db under {home}")
+    except owner_read.StoreUnusable as exc:
+        raise Refusal(str(exc))
 
     if args.apply:
         _need(labels is not None, "--apply requires --labels")

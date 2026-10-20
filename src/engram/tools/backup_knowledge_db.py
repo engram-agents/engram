@@ -460,9 +460,15 @@ def main(argv: list[str] | None = None) -> int:
     if owner_read.flag_applies(spec, Path(db_path)):
         return _main_via_owner(args, spec, out_dir)
 
-    # Verify source database exists.
-    if not os.path.exists(db_path):
+    # Verify the source store is a usable regular file (#3962). Never opens it: a `mode=ro` open of a FIFO blocks
+    # on macOS, and `os.path.exists` reports a loop, a dangling link and an unsearchable parent as "not found".
+    try:
+        owner_read.check_store_path(Path(db_path))
+    except FileNotFoundError:
         print(f"error: database not found: {db_path}", file=sys.stderr)
+        return 1
+    except owner_read.StoreUnusable as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
     # Create out-dir if absent.

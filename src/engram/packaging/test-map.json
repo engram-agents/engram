@@ -424,7 +424,8 @@
       "path_prefix_or_glob": "tools/backup_knowledge_db.py",
       "test_globs": [
         "tests/test_backup_knowledge_db.py",
-        "tests/test_backup_owner_snapshot_3872.py"
+        "tests/test_backup_owner_snapshot_3872.py",
+        "tests/test_store_path_precheck_3962b.py"
       ],
       "note": "engram-alpha#3872 (U15): flag ON (engramd.backup_reads_via_owner) reads one owner snapshot; flag OFF is test_backup_knowledge_db.py unedited."
     },
@@ -643,8 +644,19 @@
     {
       "path_prefix_or_glob": "tools/cites_step3.py",
       "test_globs": [
-        "tests/test_cites_step3_2243.py"
+        "tests/test_cites_step3_2243.py",
+        "tests/test_store_path_precheck_3962b.py"
       ]
+    },
+    {
+      "path_prefix_or_glob": "tools/engram-pkg/engram-pkg",
+      "test_globs": [
+        "tests/test_engram_pkg_render.py",
+        "tests/test_scope_export.py",
+        "tests/test_engram_pkg_json_payload.py",
+        "tests/test_store_path_precheck_3962b.py"
+      ],
+      "note": "engram-alpha#3962 PR-B: scope-export and render classify the store path with tools/_owner_read.check_store_path before opening it."
     },
     {
       "path_prefix_or_glob": "tools/build-plugin.sh",
