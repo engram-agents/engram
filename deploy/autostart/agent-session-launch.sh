@@ -55,6 +55,26 @@ RUNNER="/usr/local/lib/agentctl/autostart/agent-session-run.sh"
 # drops plain `VAR=value` / `export VAR=value` lines in, no root needed.
 # `set -a` auto-exports plain assignments; a sourcing failure aborts the
 # unit LOUDLY (set -e) rather than launching a half-configured session.
+#
+# A HOST-COMMON file (/home/agents-shared/autostart/boot-env.common, override
+# via AGENT_BOOT_ENV_COMMON in the inherited environment) is sourced
+# immediately BEFORE the per-agent file, so one file can carry settings common
+# to every seat on the host while a seat's own boot-env still wins. Absent is
+# normal and silent; present-but-unreadable is ONE stderr WARNING and the
+# launch continues (one permission slip on a shared file must not stop every
+# seat from booting, but must not be silent either); a sourcing failure
+# aborts exactly like a broken per-agent file.
+BOOT_ENV_COMMON_FILE="${AGENT_BOOT_ENV_COMMON:-/home/agents-shared/autostart/boot-env.common}"
+if [[ -e "$BOOT_ENV_COMMON_FILE" ]]; then
+    if [[ -r "$BOOT_ENV_COMMON_FILE" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "$BOOT_ENV_COMMON_FILE"
+        set +a
+    else
+        echo "WARNING: host-common boot-env '$BOOT_ENV_COMMON_FILE' exists but is not readable; launching without it" >&2
+    fi
+fi
 BOOT_ENV_FILE="$HOME/.engram/boot-env"
 if [[ -r "$BOOT_ENV_FILE" ]]; then
     set -a

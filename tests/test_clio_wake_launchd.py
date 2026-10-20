@@ -89,6 +89,8 @@ class TestLaunchQuietSkip:
         tmux_has_session_rc: int = 1,
         security_stub_body: str | None = None,
         boot_env_content: str | None = None,
+        boot_env_common_content: str | None = None,
+        boot_env_common_mode: int = 0o644,
     ) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
         home = _make_home(tmp_path)
         bin_dir = tmp_path / "bin"
@@ -101,6 +103,11 @@ class TestLaunchQuietSkip:
             boot_env_file = home / ".engram" / "boot-env"
             boot_env_file.parent.mkdir(parents=True, exist_ok=True)
             boot_env_file.write_text(boot_env_content, encoding="utf-8")
+        common_file = tmp_path / "shared" / "boot-env.common"
+        if boot_env_common_content is not None:
+            common_file.parent.mkdir()
+            common_file.write_text(boot_env_common_content, encoding="utf-8")
+            common_file.chmod(boot_env_common_mode)
 
         _write_stub(
             bin_dir / "ps",
@@ -112,6 +119,7 @@ class TestLaunchQuietSkip:
 if [[ "${{1:-}}" == has-session ]]; then exit {tmux_has_session_rc}; fi
 if [[ "${{1:-}}" == new-session ]]; then
   printf '%s\\0' "$@" > "{new_session_marker}"
+  env > "{new_session_marker}.env"
   exit 0
 fi
 echo "unexpected tmux invocation: $*" >&2
@@ -148,6 +156,7 @@ exit 0
         env = dict(os.environ)
         env["HOME"] = str(home)
         env["PATH"] = f"{bin_dir}:{os.environ['PATH']}"
+        env["AGENT_BOOT_ENV_COMMON"] = str(common_file)
 
         result = subprocess.run(
             ["/bin/bash", str(LAUNCH)],
@@ -735,6 +744,68 @@ class TestBootEnvCannotTriggerTestHook:
         assert result.returncode == 0, result.stderr
         assert log.exists()
         assert "skip:" in log.read_text(encoding="utf-8")
+
+
+class TestHostCommonBootEnv:
+    """The host-common env file (default /Users/Shared/autostart/boot-env.common,
+    override AGENT_BOOT_ENV_COMMON) is sourced immediately BEFORE the per-agent
+    ~/.engram/boot-env, so the per-agent value wins. Observed through the tmux
+    stub's `env` dump on the real cold-launch path."""
+
+    @staticmethod
+    def _child_env(marker: Path) -> list[str]:
+        return Path(str(marker) + ".env").read_text(encoding="utf-8").splitlines()
+
+    def test_per_agent_value_wins_and_common_only_value_is_exported(self, tmp_path: Path) -> None:
+        result, marker, _, _ = TestLaunchQuietSkip()._run_launch(
+            tmp_path,
+            claude_process_live=False,
+            boot_env_content="SHARED_VAR=agent\n",
+            boot_env_common_content="SHARED_VAR=common\nCOMMON_ONLY=yes\n",
+        )
+        assert result.returncode == 0, result.stderr
+        child = self._child_env(marker)
+        assert "SHARED_VAR=agent" in child
+        assert "SHARED_VAR=common" not in child
+        assert "COMMON_ONLY=yes" in child
+
+    def test_absent_common_file_is_silent(self, tmp_path: Path) -> None:
+        result, marker, log, _ = TestLaunchQuietSkip()._run_launch(
+            tmp_path, claude_process_live=False, boot_env_content="OTHER=1\n",
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == ""
+        assert "OTHER=1" in self._child_env(marker)
+        # No log line about the common file (the log may not exist at all).
+        assert not log.exists() or "boot-env.common" not in log.read_text(encoding="utf-8")
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
+    def test_unreadable_common_file_logs_warning_and_launch_continues(self, tmp_path: Path) -> None:
+        result, marker, log, _ = TestLaunchQuietSkip()._run_launch(
+            tmp_path,
+            claude_process_live=False,
+            boot_env_content="OTHER=1\n",
+            boot_env_common_content="COMMON_ONLY=yes\n",
+            boot_env_common_mode=0o000,
+        )
+        (tmp_path / "shared" / "boot-env.common").chmod(0o644)
+        assert result.returncode == 0, result.stderr
+        assert log.exists()
+        warnings = [l for l in log.read_text(encoding="utf-8").splitlines() if "boot-env.common" in l]
+        assert len(warnings) == 1 and "WARNING" in warnings[0]
+        child = self._child_env(marker)
+        assert "OTHER=1" in child
+        assert "COMMON_ONLY=yes" not in child
+
+    def test_broken_common_file_aborts_loudly(self, tmp_path: Path) -> None:
+        result, marker, _, _ = TestLaunchQuietSkip()._run_launch(
+            tmp_path,
+            claude_process_live=False,
+            boot_env_content="OTHER=1\n",
+            boot_env_common_content="false\n",
+        )
+        assert result.returncode != 0
+        assert not marker.exists()
 
 
 class TestTmuxMissingFailsLoud:

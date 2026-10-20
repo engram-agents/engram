@@ -24,7 +24,7 @@ them** — that's the reason `tools/agentctl session` grew an `--as-self` mode
 | `agent-session@.service` | per-agent template unit (`User=agent-%i`); runs `agent-session-launch.sh %i` |
 | `agent-sessions.timer` | daily 09:30 America/New_York trigger, `Persistent=false` (see the unit's own comment for why) |
 | `agent-sessions.target` | grouping target the timer triggers; `Wants=` each Claude agent's instance |
-| `agent-session-launch.sh` | wrapper: sources optional per-agent `~/.engram/boot-env` first, passes the installed charge directory + session cwd to the runner, prepends `~/.local/bin` to PATH, pre-checks the CLI + agentctl `--charge-file` support, starts detached tmux running `agent-session-run.sh` |
+| `agent-session-launch.sh` | wrapper: sources the optional host-common `boot-env.common`, then optional per-agent `~/.engram/boot-env`, first, passes the installed charge directory + session cwd to the runner, prepends `~/.local/bin` to PATH, pre-checks the CLI + agentctl `--charge-file` support, starts detached tmux running `agent-session-run.sh` |
 | `agent-session-run.sh` | runs INSIDE tmux: detects the platform as the target agent, selects and renders a harness-valid charge, then invokes `agentctl session <name> -d [-r for Claude] --as-self --cd <dir> --charge-file <file>`; logs every launch/exit and holds a failed pane open for autopsy |
 | `boot-charge-default.md` / `boot-charge-quiet.md` | common default / quiet charge framing, each with a harness-instruction placeholder |
 | `boot-charge-default-claude.md` / `boot-charge-quiet-claude.md` | Claude-specific heartbeat components for the matching common profile |
@@ -81,6 +81,31 @@ sessions.
    systemd environment lacks (e.g. zephyr's non-Anthropic backend needs his
    `ANTHROPIC_*`/Ollama variables — normally set in `.bash_profile`, which
    nothing in the boot chain reads). Keep it owned by the agent (`0640`).
+
+   Optional host-common environment: a second file, sourced immediately
+   BEFORE the per-agent `boot-env`, carries settings common to every seat on
+   the host (first planned use: a `CLAUDE_CODE_PLUGIN_DIRS=...` line).
+   - **Path:** `/home/agents-shared/autostart/boot-env.common` on Linux,
+     `/Users/Shared/autostart/boot-env.common` on macOS. Set
+     `AGENT_BOOT_ENV_COMMON` (full path) in the launcher's environment to
+     override (tests, operators). Nothing ships at this path; create it by hand.
+   - **Precedence:** common first, per-agent second, so a variable set in both
+     ends up with the **per-agent** value.
+   - **Ownership:** operator-owned, group-readable by the agent seats, not
+     agent-writable (it affects every seat on the host). The **directory**
+     must be searchable (`x`) by the seats, e.g. `chmod 755`. If it is not,
+     the file reads as ABSENT, silently, with no warning and no values,
+     because every site tests `-e` first.
+   - **Failure policy:** absent is normal and silent. Present but unreadable
+     gives one WARNING line (stderr; the macOS wrapper writes it to its log)
+     and the launch continues, still sourcing the per-agent file, so one
+     permission slip cannot stop every seat from booting. A sourcing error in
+     the file aborts the launch scripts exactly like a broken per-agent file;
+     `agentctl session` ignores such errors, as it does for the
+     per-agent file.
+   - **Sourced by all three launch paths:** `agent-session-launch.sh` (Linux
+     autostart), `macos/clio-wake-launch.sh` (macOS wake wrapper), and the
+     shared `agentctl session` prologue (manual launches).
 
 2. **Install the systemd units:**
 

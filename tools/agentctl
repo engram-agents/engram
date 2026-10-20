@@ -980,13 +980,18 @@ _codex_managed_session() {
 # environment as a booted one. umask 022 matches the autostart status quo (the
 # `sudo -i` login shell inherits 0002). boot-env ABSENT is the normal state for
 # most seats: a true optional, silent. Present-but-unreadable is loud (one
-# stderr line) and not fatal. Printed by `agentctl __session-prologue` so the
+# stderr line) and not fatal. The HOST-COMMON file (default
+# /home/agents-shared/autostart/boot-env.common, /Users/Shared/autostart/ when
+# /Users/Shared exists; override AGENT_BOOT_ENV_COMMON) is sourced just BEFORE
+# the per-agent boot-env with the same absent/unreadable/error policy, so the
+# per-agent value wins. No `${}` or `$()` in the text: `sudo -i` backslash-
+# escapes braces and parens, which would break them. Printed by `agentctl __session-prologue` so the
 # tests run the exact text the launch branches use.
 # ONE line on purpose: `sudo -i <cmd>` backslash-escapes a newline in the command
 # string, which the login shell reads as a line continuation (joining lines).
 session_prologue_text() {
     cat <<'PROLOGUE'
-umask 022; if [ -e "$HOME/.engram/boot-env" ]; then if [ -r "$HOME/.engram/boot-env" ]; then set -a; . "$HOME/.engram/boot-env"; set +a; else echo "agentctl: WARNING: $HOME/.engram/boot-env exists but is not readable; launching without it" >&2; fi; fi
+umask 022; _ec="$AGENT_BOOT_ENV_COMMON"; if [ -z "$_ec" ]; then if [ -d /Users/Shared ]; then _ec=/Users/Shared/autostart/boot-env.common; else _ec=/home/agents-shared/autostart/boot-env.common; fi; fi; if [ -e "$_ec" ]; then if [ -r "$_ec" ]; then set -a; . "$_ec"; set +a; else echo "agentctl: WARNING: host-common boot-env $_ec exists but is not readable; launching without it" >&2; fi; fi; unset _ec; if [ -e "$HOME/.engram/boot-env" ]; then if [ -r "$HOME/.engram/boot-env" ]; then set -a; . "$HOME/.engram/boot-env"; set +a; else echo "agentctl: WARNING: $HOME/.engram/boot-env exists but is not readable; launching without it" >&2; fi; fi
 PROLOGUE
 }
 

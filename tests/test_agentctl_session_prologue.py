@@ -81,6 +81,75 @@ def test_boot_env_unreadable_warns_once_and_launch_proceeds(tmp_path):
     assert "FOO_FROM_BOOT_ENV" not in proc.stdout
 
 
+# --- Host-common boot-env (sourced BEFORE the per-agent boot-env) ----------
+
+def _launch_common(home: Path, child: str, common: Path):
+    """Like _launch, with AGENT_BOOT_ENV_COMMON pointing at `common`."""
+    script = f"umask 0002\n{_prologue_text()}\n{child}\n"
+    env = {"PATH": os.environ["PATH"], "HOME": str(home),
+           "AGENT_BOOT_ENV_COMMON": str(common)}
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+
+
+def _common(tmp_path: Path, content: str, mode: int = 0o644) -> Path:
+    f = tmp_path / "shared" / "boot-env.common"
+    f.parent.mkdir(exist_ok=True)
+    f.write_text(content)
+    f.chmod(mode)
+    return f
+
+
+def test_common_per_agent_value_wins(tmp_path):
+    home = tmp_path / "home"
+    _boot_env(home, "SHARED_VAR=agent\n")
+    common = _common(tmp_path, "SHARED_VAR=common\nCOMMON_ONLY=yes\n")
+    proc = _launch_common(home, "env", common)
+    assert proc.returncode == 0, proc.stderr
+    lines = proc.stdout.splitlines()
+    assert "SHARED_VAR=agent" in lines
+    assert "SHARED_VAR=common" not in lines
+    # Common-only value is exported to the child.
+    assert "COMMON_ONLY=yes" in lines
+
+
+def test_common_absent_is_silent_and_unchanged(tmp_path):
+    home = tmp_path / "home"
+    _boot_env(home, "FOO_FROM_BOOT_ENV=bar\n")
+    proc = _launch_common(home, "env", tmp_path / "does-not-exist")
+    assert proc.returncode == 0
+    assert proc.stderr == ""
+    assert "FOO_FROM_BOOT_ENV=bar" in proc.stdout.splitlines()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
+def test_common_unreadable_warns_once_and_per_agent_still_sourced(tmp_path):
+    home = tmp_path / "home"
+    _boot_env(home, "FOO_FROM_BOOT_ENV=bar\n")
+    common = _common(tmp_path, "COMMON_ONLY=yes\n", mode=0o000)
+    try:
+        proc = _launch_common(home, "env", common)
+    finally:
+        common.chmod(0o644)
+    assert proc.returncode == 0
+    err = [l for l in proc.stderr.splitlines() if l]
+    assert len(err) == 1
+    assert "WARNING" in err[0] and str(common) in err[0] and "not readable" in err[0]
+    lines = proc.stdout.splitlines()
+    assert "FOO_FROM_BOOT_ENV=bar" in lines
+    assert "COMMON_ONLY=yes" not in lines
+
+
+def test_common_hostile_content_does_not_abort_launch(tmp_path):
+    # Mirrors the per-agent policy: a failing command / unset reference in the
+    # sourced file must not stop the launch (the prologue runs without set -e).
+    home = tmp_path / "home"
+    _boot_env(home, "SURVIVOR_FROM_BOOT_ENV=yes\n")
+    common = _common(tmp_path, "B=$NOPE_UNSET\nfalse\n")
+    proc = _launch_common(home, "env", common)
+    assert proc.returncode == 0, proc.stderr
+    assert "SURVIVOR_FROM_BOOT_ENV=yes" in proc.stdout.splitlines()
+
+
 @needs_gnu_stat
 def test_umask_forced_to_022_from_0002(tmp_path):
     proc = _launch(tmp_path, "sh -c umask", start_umask="0002")
