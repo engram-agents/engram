@@ -19,13 +19,36 @@ DEPLOY_TAG_INIT = REPO_ROOT / "src" / "build" / "engine" / "__init__.py"
 DEPLOY_TAG_MODULE = REPO_ROOT / "src" / "build" / "engine" / "deploy_tag.py"
 
 
+def _login_home_path(tmp_path):
+    """Where a test's login HOME lives (not created). The one place the formula is written."""
+    # a SIBLING of ENGRAM_HOME: some tests need ENGRAM_HOME itself to not exist yet
+    return tmp_path.parent / (tmp_path.name + "-login-home")
+
+
 def _login_home(tmp_path):
     """A temp login HOME. The venv is always $HOME/.engram/venv, whatever ENGRAM_HOME is
     (Borges' ruling on #3863), so the installer must never see the real HOME's venv."""
-    # a SIBLING of ENGRAM_HOME: some tests need ENGRAM_HOME itself to not exist yet
-    home = tmp_path.parent / (tmp_path.name + "-login-home")
+    home = _login_home_path(tmp_path)
     home.mkdir(parents=True, exist_ok=True)
     return home
+
+
+def _login_home_guard(tmp_path):
+    """Remove the sibling login home before and after a test (#3966).
+
+    The sibling is not pytest's, so pytest never deletes it. Under
+    `-o tmp_path_retention_policy=failed` a passing test's tmp_path IS deleted and its number
+    reused by the next test whose name truncates to the same prefix, while the old sibling
+    survives holding .engram/venv/bin, and the next _fake_venv() mkdir raises FileExistsError.
+    """
+    shutil.rmtree(_login_home_path(tmp_path), ignore_errors=True)
+    yield
+    shutil.rmtree(_login_home_path(tmp_path), ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_login_home(tmp_path):
+    yield from _login_home_guard(tmp_path)
 
 
 def _env(tmp_path, **overrides):
@@ -2158,3 +2181,51 @@ def test_install_local_marketplace_looks_for_the_venv_under_home_not_under_engra
     assert f"Provisioning venv at {_login_home(tmp_path)}/.engram/venv" in result.stdout
     assert "-m pip install --quiet -r" in real_log.read_text()
     assert not decoy_log.exists(), "the installer used a venv under ENGRAM_HOME"
+
+
+# --- login-home isolation (#3966) -------------------------------------------------------
+# These cells drive _login_home_guard() directly instead of leaning on two tests running one
+# after the other: test order is not stable under pytest-xdist, and a cell that only fails
+# when a particular earlier test happened to run first is not a control. Driving the guard
+# by hand plants the stale sibling itself, so the result is the same on every run.
+
+
+def _plant_stale_venv(tmp_path):
+    stale = _login_home_path(tmp_path) / ".engram" / "venv" / "bin"
+    stale.mkdir(parents=True)
+    (stale / "python").write_text("stale")
+    return stale
+
+
+def test_login_home_guard_removes_a_stale_sibling_before_the_body(tmp_path):
+    """Pre-clean half: a sibling left by an earlier test that held this same tmp_path number
+    (tmp_path_retention_policy=failed deletes passing tmp_paths but not their siblings)."""
+    stale = _plant_stale_venv(tmp_path)
+    guard = _login_home_guard(tmp_path)
+    next(guard)  # the point where the test body would run
+    assert not stale.exists()
+    assert not _login_home_path(tmp_path).exists()
+    guard.close()
+
+
+def test_login_home_guard_removes_the_sibling_after_the_body(tmp_path):
+    """Post-clean half: what the body created must not outlive the test."""
+    guard = _login_home_guard(tmp_path)
+    next(guard)
+    stale = _plant_stale_venv(tmp_path)  # what a _fake_venv caller leaves behind
+    with pytest.raises(StopIteration):
+        next(guard)
+    assert not stale.exists()
+    assert not _login_home_path(tmp_path).exists()
+
+
+def test_login_home_guard_is_wired_as_an_autouse_fixture(request):
+    assert "_isolate_login_home" in request.fixturenames
+
+
+def test_fake_venv_mkdir_stays_strict(tmp_path):
+    """_fake_venv must keep failing loudly on a leaked venv, not paper over it (#3966)."""
+    log = tmp_path / "log"
+    _fake_venv(tmp_path, log)
+    with pytest.raises(FileExistsError):
+        _fake_venv(tmp_path, log)
