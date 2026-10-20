@@ -794,8 +794,17 @@ def _backfill_special_moment_about_edges(conn: sqlite3.Connection) -> int:
 # add one row with its exact id (no prefix or regex rule exists or may be added)
 # and its provider/family/version.  Adding a row is a reviewed change: it lets
 # a seat running that model sign as ``provider:family`` (engram_sign).
+# The three deepseek rows were added for the DeepSeek seat (part of #3976), not
+# as a rule: they are the ids measured across 56 of that seat's transcripts
+# (attachment ids ``deepseek-flash[1m]`` and ``deepseek-v4.1-flash:cloud[1m]``,
+# assistant ids ``deepseek-flash`` and ``deepseek-v4.1-flash``; the ``[1m]``
+# suffix is stripped before lookup).  ``deepseek-flash`` carries no version
+# component, so its version is "" -- never a guessed value.
 _NON_CLAUDE_MODEL_TABLE: dict[str, tuple[str, str, str]] = {
     "gpt-6.1-sol": ("openai", "gpt", "6.1"),
+    "deepseek-flash": ("deepseek", "flash", ""),
+    "deepseek-v4.1-flash": ("deepseek", "flash", "4.1"),
+    "deepseek-v4.1-flash:cloud": ("deepseek", "flash", "4.1"),
 }
 
 

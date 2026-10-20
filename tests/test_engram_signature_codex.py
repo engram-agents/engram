@@ -394,8 +394,13 @@ def test_parse_model_id_non_table_unchanged(mid):
 
 
 def test_supported_model_table_is_exactly_gpt_6_1_sol():
+    # Table grew for the DeepSeek seat (part of #3976); equality is deliberate
+    # so a stray row still fails.
     assert engram_trust._NON_CLAUDE_MODEL_TABLE == {
-        SOL: ("openai", "gpt", "6.1")}
+        SOL: ("openai", "gpt", "6.1"),
+        "deepseek-flash": ("deepseek", "flash", ""),
+        "deepseek-v4.1-flash": ("deepseek", "flash", "4.1"),
+        "deepseek-v4.1-flash:cloud": ("deepseek", "flash", "4.1")}
 
 
 # ----------------------------------------------- CLI / MCP parity, no side fx

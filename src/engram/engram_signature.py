@@ -165,6 +165,11 @@ def _has_claude_source(rows: list) -> bool:
     return False
 
 
+def _lineage_of(model_id: str) -> str:
+    import engram_core as core
+    return core.model_id_to_lineage(model_id)
+
+
 def _read_model(transcript: Path) -> tuple[str, str | None]:
     """(model_id, marketing_name|None) for the bound transcript.
 
@@ -223,18 +228,38 @@ def _read_model(transcript: Path) -> tuple[str, str | None]:
                 name = ident.get("marketingName")
                 name = name.strip() if isinstance(name, str) else ""
                 return mid.strip(), (name or None)
-    # Fallback: newest assistant row's message.model (id only).  Rows whose id
-    # does not start with "claude-" (e.g. a harness-synthetic "<synthetic>"
-    # row) are skipped HERE ONLY, so an older real assistant row is used
-    # instead of refusing a healthy seat.  The attachment pass above does not
-    # skip: that row is the harness's own identity statement, so a synthetic
-    # id there would be a real anomaly worth refusing.
+    # Fallback: newest assistant row's message.model (id only).  Walk newest to
+    # oldest and skip ONLY a non-string, blank or exactly "<synthetic>" (the
+    # harness's own placeholder) model; the first remaining id is the running
+    # model and decides.  An unmapped real id refuses -- an older row never
+    # signs for a model that is no longer running.  The attachment pass above
+    # does not skip: that row is the harness's own identity statement, so a
+    # synthetic id there would be a real anomaly worth refusing.
+    saw_assistant = False
     for r in reversed(rows):
         msg = r.get("message")
+        if isinstance(msg, dict) and "model" in msg:
+            saw_assistant = True
         mid = msg.get("model") if isinstance(msg, dict) else None
-        if (isinstance(mid, str) and mid.strip()
-                and mid.strip().startswith("claude-")):
-            return mid.strip(), None
+        if not isinstance(mid, str):
+            continue
+        mid = mid.strip()
+        if not mid or mid == "<synthetic>":
+            continue
+        if mid.startswith("claude-") or _lineage_of(mid):
+            return mid, None
+        raise _Refusal(
+            "model",
+            f"the newest assistant row with a usable model id in {transcript} "
+            f"has model id {mid!r}, "
+            "which does not map to a lineage: refusing rather than signing "
+            "with an older row's model")
+    if saw_assistant:
+        raise _Refusal(
+            "model",
+            f"every assistant row in {transcript} has a placeholder, blank or "
+            "non-string model (no usable model id): cannot determine the "
+            "running model")
     raise _Refusal(
         "model",
         f"transcript {transcript} has neither a model attachment row nor an "
