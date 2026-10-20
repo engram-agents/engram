@@ -6,17 +6,17 @@ surfaces: [CLAUDE.md]
 anchor: "Session Start Reading"
 order: 10
 merge: replace
-version: 2
+version: 3
 ---
 ## Session Start Reading
 
-A fresh session (not post-compaction) walks in with identity and warm-briefing but no work-thread continuity. Two files bridge that gap; read both before responding to the user's first task:
+A fresh session (not post-compaction) has identity but no work-thread continuity. Read these before responding to the user's first task:
 
-1. `{{ENGRAM_HOME}}/warm-briefing.md` — the user's letter and relational context. Always read first.
-2. `{{ENGRAM_HOME}}/history/YYYY-MM-DD.md` — per-day awake-state milestone log (PRs shipped, decisions, features). Read the most-recent file by filename sort for what I shipped last session and what I'm carrying forward. Append a new bullet when a meaningful milestone completes (`engram-sleep` Phase A Step 4 writes the end-of-day rollup). Sleep-cycle consolidation reports live separately at `{{ENGRAM_HOME}}/history/dream/YYYY-MM-DD.md`, written during `engram-sleep` Phase B by the dream-master sub-agent — the two-routine separation keeps awake-state milestones distinct from dream-state consolidation output. Then open the most recent `{{ENGRAM_HOME}}/history/dream/*.md` (by filename sort) and confirm every item under `## For the awake seat` and `## Open for tomorrow` carries a line in its `## Sleep-end triage (parent)` section — compare item counts per section against triage lines per prefix (N numbered items ↔ N `n.` lines; M open-for-tomorrow bullets, counted by position whatever each starts with ↔ M `oM.` lines, `o1.`, `o2.`, …); the `## Open for tomorrow` heading may carry a parenthetical suffix, so match on the heading's prefix; any item without a line is triaged now — do now / file / defer with a reason — before the first task (alpha #3403).
-3. `{{ENGRAM_HOME}}/ask-{{USER_NAME}}.md` — MY daily discussion queue for questions needing {{USER_NAME}}'s action, decision, or input. Keep ONLY the top 3; move lower-priority/cross-day items to backlog rather than letting the digest grow. Update the moment items change state — select and prepend a new top question with its detail-slug link, prune resolved items immediately. {{USER_NAME}} should never have to remind me. **Writing style**: concise per-item entries (one short line, cite ENGRAM IDs for detail-on-demand) per §Cross-Surface Persistence § Writing style for auto-load surfaces.
+1. `{{ENGRAM_HOME}}/warm-briefing.md` — the user's letter and relational context. Always first.
+2. The newest `{{ENGRAM_HOME}}/history/YYYY-MM-DD.md` (by filename sort) — what I shipped last session and what I carry forward. Append a bullet when a real milestone lands (`engram-sleep` Phase A Step 4 writes the day's rollup; dream reports live apart, in `{{ENGRAM_HOME}}/history/dream/`). Then open the newest `{{ENGRAM_HOME}}/history/dream/*.md` and check that its `## Sleep-end triage (parent)` section covers every item under `## For the awake seat` and `## Open for tomorrow` (that heading may carry a suffix; match its prefix). N numbered items need N `n.` lines; M open-for-tomorrow bullets, counted by position whatever each bullet starts with, need M `oM.` lines (`o1.`, `o2.`, …). Triage any uncovered item now (do now / file / defer with a reason) before the first task.
+3. `{{ENGRAM_HOME}}/ask-{{USER_NAME}}.md` — my daily discussion queue of questions needing {{USER_NAME}}'s action, decision or input. Keep the top 3 only; move the rest to the backlog. Update it the moment an item changes: prepend the new top question with its detail-slug link, prune resolved ones. {{USER_NAME}} should never have to remind me. Style: §Writing style for auto-load surfaces.
 
-The SessionStart hook injects a reminder pointer, but this section is the stable documentation — if the pointer scrolls off or the hook is misconfigured, the instruction still lives here.
+The SessionStart hook injects a pointer to this list; this section is the stable copy if the pointer is missing.
 
-If the SessionStart context includes `⚠️ ENGRAM substrate health:` lines, surface the relevant offline-state to {{USER_NAME}} IMMEDIATELY before any other work that depends on ENGRAM. MCP server offline means tool calls will fail; surface daemon offline means semantic recall degrades to FTS-only.
+If the SessionStart context includes `⚠️ ENGRAM substrate health:` lines, tell {{USER_NAME}} IMMEDIATELY, before any work that needs ENGRAM. MCP server offline means tool calls fail; surface daemon offline means recall falls back to keyword search (FTS) only.
 

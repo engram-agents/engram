@@ -59,10 +59,11 @@ def test_t3_sleep_skill_has_step_9_5():
         assert token in body, f"Step 9.5 body lacks {token!r}"
 
 
-def test_t4_component_version_2_and_morning_check():
+def test_t4_component_revised_and_morning_check():
     text = _read(COMPONENT)
     fm = text.split("---")[1]
-    assert re.search(r"^version: 2$", fm, re.M)
+    m = re.search(r"^version: (\d+)$", fm, re.M)
+    assert m and int(m.group(1)) >= 2
     assert "history/dream/" in text
     assert "Sleep-end triage" in text
 
