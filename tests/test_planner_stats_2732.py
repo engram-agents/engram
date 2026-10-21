@@ -24,7 +24,7 @@ Contract (written before the implementation; every cell is a stated behaviour):
   S2/S3 also assert "unscoped": a NON-nodes table's index gets a full stat1 row (A and C).
   S7  contract D: ANALYZE precedes `PRAGMA optimize` (nap where gate B fires; advance_turn).
   S8  a nap whose only stat-less indexes belong to EMPTY tables runs NO full ANALYZE.
-  S9  (round 3, G) 10x growth then a NAP leaves is_current stats full (optimize trigger b).
+  S9  (round 3, G) 20x growth then a NAP leaves is_current stats full (optimize trigger b).
   S10 (round 3, G) every PRAGMA optimize is issued with the one constant _OPTIMIZE_MASK = 0xffee.
 
 Discriminating controls (recorded in the handoff): (a) drop C -> S3 advance cell only;
@@ -383,15 +383,19 @@ _NEEDS_346 = pytest.mark.skipif(
 
 
 @_NEEDS_346
-def test_s9_ten_fold_growth_then_nap_keeps_is_current_stats_full(env):
+def test_s9_large_growth_then_nap_keeps_is_current_stats_full(env):
     """Trigger (b): optimize re-analyzes a table whose row count grew 10-fold. Without G that
     ANALYZE runs under a temporary analysis_limit and writes SAMPLED stats. Every index of a
-    non-empty table has a stat row, so gate B stays quiet and only optimize can act."""
+    non-empty table has a stat row, so gate B stays quiet and only optimize can act.
+    S9 grows the table 20x, not 10x, because SQLite 3.49.1's 10-fold check did not fire on this
+    schema at 10x or 12x and did at 15x (#4040). If optimize ever does not re-analyze, the vacuity
+    guard fails loudly rather than passing."""
     lc, core = env
     c = _seeded(core)  # full stats, N_ROWS rows, ~N_ROWS/2 rows per is_current key
     assert int(_stat(c, "idx_nodes_current").split()[1]) == N_ROWS // 2
-    _fill(c, N_ROWS, 9 * N_ROWS)  # 10x growth
-    total = 10 * N_ROWS
+    growth = 20
+    total = growth * N_ROWS
+    _fill(c, N_ROWS, total - N_ROWS)
     assert _rows_in_stats(c) == N_ROWS  # precondition: stats are stale
     c.close()
     _nap(lc)
@@ -401,7 +405,7 @@ def test_s9_ten_fold_growth_then_nap_keeps_is_current_stats_full(env):
         avg = int(_stat(c, "idx_nodes_current").split()[1])
     finally:
         c.close()
-    assert nrows == total, f"optimize never re-analyzed (stat rows {nrows}); the test is vacuous"
+    assert nrows == total, f"optimize never re-analyzed (stat rows {nrows}); the test is vacuous: raise growth (#4040)"
     assert avg > 0.4 * (total // 2), f"is_current stats are sampled (avg rows/key {avg}, true {total // 2})"
 
 
