@@ -564,3 +564,16 @@ class TestBuildCommandBranchGuard:
         # Guard skipped; 794 error must NOT appear
         captured = capsys.readouterr()
         assert "794" not in captured.err
+
+
+class TestBuildCtxFromEnvEmptyHome3863:
+    """ENGRAM_HOME set but empty means unset: ctx['engram_home'] is the default."""
+
+    def test_empty_engram_home_falls_back_to_the_absolute_default(self, monkeypatch):
+        import os
+        from tools.engine.cli import _build_ctx_from_env
+
+        monkeypatch.setenv("ENGRAM_HOME", "")
+        ctx = _build_ctx_from_env()
+        assert ctx["engram_home"], ctx["engram_home"]
+        assert os.path.isabs(ctx["engram_home"]), ctx["engram_home"]

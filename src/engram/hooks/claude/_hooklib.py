@@ -960,7 +960,7 @@ def emit_context(
 #   <probeDir>/<session_id>/routes/<route>.jsonl
 #
 # probeDir rule (mirrors the mod's default: config.ts DEFAULTS.probeDir
-# '~/.engram/probe/mods-recall', resolved by record.ts defaultProbeDir against
+# '$ENGRAM_HOME/probe/mods-recall', resolved by record.ts defaultProbeDir against
 # ENGRAM_HOME when that is set): `<engram_home()>/probe/mods-recall`, via the
 # layer's engram_home(). The mod and this hook must name the same directory,
 # or the hook records nothing for a probe that is live (alpha #3863, 6b; the

@@ -69,10 +69,13 @@ sys.path.insert(0, str(_TOOLS_DIR))
 # Environment + paths
 # ---------------------------------------------------------------------------
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+from _owner_read import engram_home  # noqa: E402  (the ONE tools resolver; _TOOLS_DIR is on sys.path above)
+
+try:
+    ENGRAM_HOME = str(engram_home())
+except ValueError as _home_exc:
+    print(f"engram-snapshot: {_home_exc}", file=sys.stderr)
+    sys.exit(1)  # EXIT_VALIDATION (defined below this block)
 
 EVIDENCE_ARCHIVE_ROOT = (
     os.environ.get("ENGRAM_EVIDENCE_ARCHIVE")

@@ -1534,3 +1534,67 @@ def test_ci_step_runs_the_gate_with_a_merge_base_sha():
 
 def test_ci_step_runs_the_gates_own_tests():
     assert "pytest tests/test_home_path_gate.py" in _gate_step_text()
+
+
+# ---------------------------------------------------------------------------
+# The baseline is EMPTY (#3863 last step): default-deny, no swap-blindness.
+# ---------------------------------------------------------------------------
+
+def test_the_repos_own_baseline_is_empty_and_green():
+    mod = _load()
+    _schema, baseline, _allow, _prefixes = mod.load_baseline(REPO)
+    assert baseline == {}, f"the repo baseline must be empty, holds {baseline}"
+    assert mod.check(REPO) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "see ~/.engram/knowledge.db for the data",
+        'p = Path.home() / ".engram" / "x"',
+        'db = "/home/someone/.engram/knowledge.db"',
+    ],
+)
+def test_regrowth_on_an_empty_baseline_is_red_naming_the_file(tmp_path, line):
+    rel = "src/engram/clean_before.py"
+    root = _repo(tmp_path, {rel: "x = 1\n" + line + "\n"}, baseline={})
+    problems = _load().check(root)
+    assert problems and any(rel in p for p in problems), problems
+
+
+def test_a_swap_is_red_on_an_empty_baseline(tmp_path):
+    """Empty-baseline default-deny after a line swap: the file ends with one
+    violating line and nothing budgeted, so it is red. This checks the
+    default-deny branch only; it does not exercise the base_sha path (the next
+    cell documents what the empty baseline removed)."""
+    rel = "src/engram/swapped.py"
+    before = 'a = Path.home() / ".engram" / "one"\n'
+    after = 'a = 1\nb = "~/.engram/two"\n'
+    root = _repo(tmp_path, {rel: before}, baseline={rel: 1})
+    base = _commit(root)
+    (root / rel).write_text(after, encoding="utf-8")
+    _write_baseline(root, {})
+    _git(root, "add", "-A")
+    problems = _load().check(root, base_sha=base)
+    assert problems and any(rel in p for p in problems), problems
+
+
+def test_swap_blindness_exists_only_while_a_baseline_entry_exists(tmp_path):
+    """What the empty baseline REMOVED: with the old budgeted shape
+    (baseline={rel: 1}) swapping the one violating line for a different
+    violating line stays green (the documented swap-blindness bound); with
+    baseline={} the same swapped file is red."""
+    rel = "src/engram/swapped2.py"
+    before = 'a = Path.home() / ".engram" / "one"\n'
+    after = 'a = 1\nb = "~/.engram/two"\n'
+    root = _repo(tmp_path, {rel: before}, baseline={rel: 1})
+    base = _commit(root)
+    (root / rel).write_text(after, encoding="utf-8")
+    _git(root, "add", "-A")
+    mod = _load()
+    assert mod.violation_counts(root) == {rel: 1}
+    assert mod.check(root, base_sha=base) == []  # budgeted: the swap hides
+    _write_baseline(root, {})
+    _git(root, "add", "-A")
+    problems = mod.check(root, base_sha=base)
+    assert problems and any(rel in p for p in problems), problems

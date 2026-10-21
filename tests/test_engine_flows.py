@@ -878,7 +878,7 @@ class TestSubstrateHealthStep:
         marker = _read_substrate_marker(engram_home)
         # Malformed: _read_substrate_marker returns a sentinel dict, not None
         assert marker is not None, "Malformed marker should return sentinel, not None"
-        instruction = _substrate_health_instruction(marker)
+        instruction = _substrate_health_instruction(marker, engram_home)
         # Must not raise and must include the degraded header
         assert "SUBSTRATE DEGRADED" in instruction
         # Should mention the fallback reason
@@ -1020,3 +1020,45 @@ class TestSubstrateHealthStep:
         from engram_walguard import _MARKER_FILENAME
         from tools.engine import flows
         assert flows._SUBSTRATE_MARKER_FILENAME == _MARKER_FILENAME
+
+
+class TestSubstrateHealthInstructionHome3863:
+    """_substrate_health_instruction renders the marker path from the home it is
+    given, never from a literal; the home is a required argument (#3863)."""
+
+    def test_renders_marker_path_from_the_given_home_with_no_default_literal(self):
+        from tools.engine.flows import _substrate_health_instruction
+        out = _substrate_health_instruction(None, "/x/h")
+        assert "/x/h/.substrate-degraded.json" in out
+        assert "~/.engram" not in out
+
+    def test_engram_home_is_required(self):
+        from tools.engine.flows import _substrate_health_instruction
+        with pytest.raises(TypeError):
+            _substrate_health_instruction(None)
+
+
+class TestEmptyEngramHomeIsUnset3863:
+    """ENGRAM_HOME set but EMPTY means unset (the resolver's rule): the rendered
+    operator hints must carry an absolute directory, never a bare filename."""
+
+    def _step(self, steps, step_id):
+        return next(s for s in steps if s.id == step_id)
+
+    def test_substrate_health_marker_path_is_absolute_on_an_empty_home(self, monkeypatch):
+        monkeypatch.setenv("ENGRAM_HOME", "")
+        step = self._step(upgrade_flow(), "substrate-health")
+        import re
+        m = re.search(r"rm (\S+)", step.instruction)
+        assert m, step.instruction
+        assert os.path.isabs(m.group(1)), step.instruction
+        assert m.group(1).endswith("/.substrate-degraded.json"), step.instruction
+
+    def test_stats_verify_cat_path_is_absolute_on_an_empty_home(self, monkeypatch):
+        monkeypatch.setenv("ENGRAM_HOME", "")
+        step = self._step(upgrade_flow(), "stats-verify-instruction")
+        import re
+        m = re.search(r"cat (\S+)", step.instruction)
+        assert m, step.instruction
+        assert os.path.isabs(m.group(1)), step.instruction
+        assert m.group(1).endswith("/.deployed-version"), step.instruction

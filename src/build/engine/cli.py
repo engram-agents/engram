@@ -314,7 +314,7 @@ def _build_ctx_from_env() -> dict:
 
     Used by the CLI when no --ctx-file is provided.  Callers may augment.
     """
-    engram_home = os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
+    engram_home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
     # source_dir: try .deployed-version first, fallback to cwd
     source_dir = os.getcwd()
     dv_path = os.path.join(engram_home, ".deployed-version")

@@ -4,12 +4,7 @@
     "src/engram/",
     "src/build/"
   ],
-  "baseline": {
-    "src/build/engine/flows.py": 7,
-    "src/engram/hooks/claude/_hooklib.py": 1,
-    "src/engram/templates/agents.json.example": 1,
-    "src/engram/tools/engram-snapshot": 1
-  },
+  "baseline": {},
   "allowlist": {
     "src/engram/tools/grant_viz_operator_acl.py": {
       "class": "foreign-home",
