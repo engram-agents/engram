@@ -9,6 +9,46 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+## [v0.5.4] - 2026-10-21
+
+A patch release. The reason for it is one v0.5.3 feature: agent-decided
+compaction at the nap boundary. Everything else merged on `dev` since v0.5.3
+ships in v0.6.0.
+
+### Fixed
+
+- **The compaction mod records why a nap did or did not compact (#3982, PR
+  #3984).** A tombstone it leaves in `$ENGRAM_HOME/compact/` can now carry a
+  one-line `verdict` field. The `inflight` file holds the compact call's
+  outcome: `compacted`, `vetoed: …` or `refused: …`. `request.json` holds the
+  reason when nothing was attempted. A request consumed normally keeps the
+  plain tombstone; read its outcome from `inflight`. `compacted` means the call
+  returned without a skip, not that the nap's context was used.
+
+- **Query-planner statistics stay full (#2732, PR #4031).** On SQLite 3.46.0
+  and later, a new index followed by the checkpoint's `PRAGMA optimize`
+  replaced full statistics with sampled ones. The planner could then pick a
+  slower index for the lesson-tripwire hook's query. Full `ANALYZE` now runs
+  after a migration, when an index of a non-empty table has no statistics row,
+  and once per `advance_turn` (each sleep). The checkpoint's optimize no longer
+  samples. A store that already carries sampled statistics is repaired at its
+  next sleep, not its next nap. On SQLite 3.45.1 the optimize change has no
+  effect; the sleep-time `ANALYZE` still refreshes statistics as the store
+  grows. Do not run `ANALYZE` by hand on a live store.
+
+- **Atomic writers keep a file's mode and group (part of #4013, PR #4024).**
+  Several writers under `$ENGRAM_HOME` replaced a file through `mkstemp` and
+  `os.replace`. That reset it to 0600 and dropped a default-ACL group entry,
+  so a second account reading through the group lost access. They now share
+  one writer that keeps the old mode and group. Each writer treats a symlink
+  as it did before. A test fails when a new plain `mkstemp` + `os.replace`
+  writer appears without a stated reason. Behaviour change: a NEW file written
+  by the hooks' JSON writer now gets the umask mode (0644 under umask 022),
+  like a plain `open()`, instead of 0600. Not fixed here: the two hand-written
+  marker updates in the `engram-loop` skill.
+
+<!-- #4012 / PR #4018 entry goes here once its squash commit is picked; check each sentence against the merged code. -->
+
 ## [v0.5.3] - 2026-10-15
 
 ### Substrate (recall, forgetting, search, graph integrity)
