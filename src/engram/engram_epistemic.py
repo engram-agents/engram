@@ -250,7 +250,7 @@ def _add_axiom_impl(
                confidence, confidence_history, status, metadata)
                VALUES (?, 'axiom', ?, ?, ?, 1.0, ?, 'active', '{}')""",
             (node_id, claim, now, basis,
-             json.dumps([{"confidence": 1.0, "reason": "axiom — assumed true", "timestamp": now}])),
+             json.dumps([{"timestamp": now, "value": 1.0, "reason": "axiom — assumed true"}])),
         )
 
         context = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
@@ -541,7 +541,7 @@ def _add_conjecture_impl(
                recall_keywords, needs_tightening, summary_missing)
                VALUES (?, 'conjecture', ?, ?, ?, ?, ?, 'active', '{}', ?, ?, ?, ?)""",
             (node_id, claim, now, basis, conf,
-             json.dumps([{"confidence": conf, "reason": f"conjecture — initial hypothesis", "timestamp": now}]),
+             json.dumps([{"timestamp": now, "value": conf, "reason": f"conjecture — initial hypothesis"}]),
              _recall_summary or None,
              json.dumps(_recall_keywords) if _recall_keywords else None,
              1 if _needs_tightening else 0,

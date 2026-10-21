@@ -19,6 +19,8 @@ Usage:
 Available stripped fields:
     embedding          384-float JSON array (cosine similarity target)
     confidence_history List of {timestamp, value, reason} dicts
+                       (first entries written before #3994 for conjectures
+                       and axioms use the key `confidence` instead of `value`)
     content_hash       SHA-256 of the source file content (file:// obs only)
     git_sha            Git commit SHA when the file was read (file:// obs only)
     parsed_metadata    Full parsed metadata dict (superset of metadata string)
