@@ -46,11 +46,13 @@ requires temporarily un-fixing shipped code).
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -141,6 +143,53 @@ def _build_real_deployed_layout(hook_name: str, root: Path) -> Path:
         shutil.copy(lib, root / "hooks" / lib.name)
     shutil.copy(SRC_ENGRAM / "tools" / "loop_prompt.py", root / "tools" / "loop_prompt.py")
     return hook_dest
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+# Names the temp-tree hook import can leave behind with no `__file__`.
+_TEMP_TREE_NAMES = frozenset({"_hooklib", "_harness", "_stophooklib"})
+
+
+def _pop_roots(tmp_path_factory) -> tuple:
+    """The only directories an added module may come from and still be popped at
+    teardown: pytest's basetemp (the temp deployed tree) and `<repo>/src/engram`."""
+    return tuple(os.path.realpath(str(p)) + os.sep for p in (
+        tmp_path_factory.getbasetemp(), REPO_ROOT / "src" / "engram"))
+
+
+@pytest.fixture(autouse=True)
+def _restore_sys_modules_and_path(tmp_path_factory):
+    """#4021: the fallback test below imports a hook and its sibling `_hooklib`
+    from a temporary deployed tree. Left cached, that temp `_hooklib` makes the
+    A6 parent-walk cell fail when it runs later in the same process. At
+    teardown, put `sys.modules` and `sys.path` back as found: restore the exact
+    object for every key the test replaced or removed, and pop an ADDED key
+    only if it came from pytest's basetemp or `<repo>/src/engram` (or is one of
+    the `__file__`-less names the temp-tree import uses). The roots are
+    deliberately not the whole repo or the system temp dir: a `.venv` inside
+    the repo, or a checkout under the system temp dir, would sweep in
+    third-party modules. Any other added key (a
+    stdlib or third-party module first imported during the test) stays: a later
+    re-import would build a second object while earlier importers keep the
+    first."""
+    modules_before = dict(sys.modules)
+    path_before = sys.path[:]
+    roots = _pop_roots(tmp_path_factory)
+    try:
+        yield
+    finally:
+        for key in [k for k in sys.modules if k not in modules_before]:
+            f = getattr(sys.modules[key], "__file__", None)
+            if isinstance(f, str):
+                ours = os.path.realpath(f).startswith(roots)
+            else:
+                ours = key in _TEMP_TREE_NAMES or key.startswith("_test_2671_")
+            if ours:
+                del sys.modules[key]
+        for key, mod in modules_before.items():
+            if sys.modules.get(key) is not mod:
+                sys.modules[key] = mod
+        sys.path[:] = path_before
 
 
 def _load_hook_fresh(hook_path: Path, module_name: str):
@@ -307,3 +356,73 @@ def test_find_indexer_dir_resolves_past_nearer_unreadable_ancestor(tmp_path):
         "unreadable nearer candidate aborted the whole walk instead of "
         "being skipped"
     )
+
+# ---------------------------------------------------------------------------
+# #4021 round 2/3: the teardown restore must not pop a module that merely got
+# imported during a test and lives outside the roots it owns (pytest's basetemp
+# and <repo>/src/engram). Re-importing it later would build a second object
+# while earlier importers still hold the first. A pair, because a test cannot
+# observe its own teardown: the first plants two tiny modules the test creates
+# itself (so they can never be pre-imported and the cell can never skip) --
+# one under the system temp dir but outside basetemp, one under the repo but
+# outside src/engram -- and imports them, plus the temp-tree `_hooklib`; the
+# second (it runs right after, in definition order) checks what survived.
+# ---------------------------------------------------------------------------
+
+_TEARDOWN_PROBE: dict = {}
+
+
+def test_4021_teardown_probe_imports_outside_modules_and_temp_hooklib(tmp_path, monkeypatch):
+    import uuid
+
+    monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
+    # With a `_hooklib` already cached the hook reuses it and never loads the temp
+    # copy; drop it so the import really comes from the temp tree (the autouse
+    # fixture puts the original back at teardown).
+    sys.modules.pop("_hooklib", None)
+    hook_path = _build_real_deployed_layout("engram-deference-detector-prompt.py", tmp_path / "deployed")
+    _load_hook_fresh(hook_path, "_test_4021_probe_hook")
+    temp_lib = sys.modules.get("_hooklib")
+    assert temp_lib is not None and str(tmp_path) in str(getattr(temp_lib, "__file__", "")), (
+        "control: the hook import must have cached a temp-tree _hooklib")
+
+    planted: dict = {}
+    made = []
+    try:
+        # Outside basetemp, under the system temp dir. Nothing is planted inside the
+        # checkout (#2126: the suite never writes into the repo it runs from); the
+        # repo-root arm is pinned by the roots cell below instead.
+        d = tempfile.mkdtemp(prefix="tmp_4021_")
+        made.append(d)
+        name = f"_probe4021_systemtmp_{uuid.uuid4().hex}"
+        (Path(d) / f"{name}.py").write_text("VALUE = 1\n")
+        sys.path.insert(0, d)  # restored by the autouse fixture
+        assert name not in sys.modules, "control: a fresh name cannot be pre-imported"
+        planted[name] = importlib.import_module(name)
+    finally:
+        for d in made:
+            shutil.rmtree(d, ignore_errors=True)
+    assert len(planted) == 1
+    _TEARDOWN_PROBE.update(planted=planted, temp_lib=temp_lib)
+
+
+def test_4021_teardown_keeps_outside_modules_and_drops_the_temp_hooklib():
+    if not _TEARDOWN_PROBE:
+        pytest.skip("the probe test did not run (deselected or skipped)")
+    for name, mod in _TEARDOWN_PROBE["planted"].items():
+        assert sys.modules.get(name) is mod, (
+            f"{name!r} (outside basetemp and src/engram) was popped at teardown "
+            "(identity split for any earlier importer)")
+    assert sys.modules.get("_hooklib") is not _TEARDOWN_PROBE["temp_lib"], (
+        "the temp-tree _hooklib survived teardown")
+
+
+def test_4021_pop_roots_are_exactly_basetemp_and_src_engram(tmp_path_factory):
+    """#4021: the teardown may pop only modules from these two roots. Adding the
+    whole repo (a `.venv` inside it) or the system temp dir (a checkout under it)
+    would sweep in third-party modules and split their identity."""
+    expected = (
+        os.path.realpath(str(tmp_path_factory.getbasetemp())) + os.sep,
+        os.path.realpath(str(REPO_ROOT / "src" / "engram")) + os.sep,
+    )
+    assert _pop_roots(tmp_path_factory) == expected
