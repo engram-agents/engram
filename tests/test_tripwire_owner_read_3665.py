@@ -328,7 +328,7 @@ def sql_set_of(sites) -> set:
 
 
 CHAIN_SITES = ("engram_core.py:generalization_chain", "engram_core.py:_resolve_to_current",
-               "engram_core.py:_current_successor")
+               "engram_core.py:_current_successor", "engram_core.py:dag_edge_set")
 # #3740 Cut A: with the flag ON the chain walk travels as ONE typed `chain` request per hit
 # (recorded by `statement_of` at method level as "chain"); the per-hop statements of CHAIN_SITES
 # are sent only by the direct path.
@@ -1697,7 +1697,13 @@ def test_chain_a_fire_with_two_hits_sends_exactly_two_chain_requests_and_no_per_
     sent_sql = {s for m, s, _a in seen_m if m == "read"}
     assert not sent_sql & per_hop, sorted(sent_sql & per_hop)
     for needle in ("SELECT id, type FROM nodes WHERE id = ?", "SELECT is_current FROM nodes WHERE id = ?",
-                   "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'generalizes'",
+                   # #3542: the parent read is dag_edge_set's live/target template
+                   ("SELECT e.source_id AS source_id, e.target_id AS target_id, "
+                    "e.relation AS relation FROM edges e JOIN nodes s ON s.id = e.source_id "
+                    "JOIN nodes t ON t.id = e.target_id WHERE e.relation IN "
+                    "(SELECT value FROM json_each(?)) AND (s.is_current = 1 AND s.status != "
+                    "'retracted') AND (t.is_current = 1 AND t.status != 'retracted') AND "
+                    "e.target_id = ? ORDER BY e.source_id, e.target_id, e.relation"),
                    "SELECT id, recall_summary FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
                    "SELECT id, claim FROM nodes WHERE id IN (SELECT value FROM json_each(?))"):
         assert needle in per_hop, needle  # the list above really is the old per-hop set

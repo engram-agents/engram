@@ -714,6 +714,27 @@ jobs:
           "tests/test_engramd_read_scan.py::test_r10_roots_config_covers_every_hook_function_and_no_module_level_execute_site"
           "tests/test_engramd_read_scan.py::test_r12_committed_file_equals_a_fresh_scan_of_the_real_tree"
 
+      - name: "invariant-checks — edge-liveness single source: template pins + drift guard (#3542)"
+        if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
+        env:
+          ENGRAM_HOME: ${{ runner.temp }}/engram-home-edge-liveness
+        # dag_edge_set's six SQL templates are string LITERALS (the owner read
+        # registry's scanner admits nothing built at import time), so three of
+        # them restate the live-node predicate by necessity. The only thing that
+        # keeps them equal to _CURRENT_EDGE_PREDICATE is
+        # test_each_dag_edge_template_equals_what_the_one_predicate_generates.
+        # Edit the predicate alone and the literals and the committed registry do
+        # NOT change, so read-scan r12 above stays green: without this step that
+        # pin would first run at the dev->main release (dev PRs run only this
+        # workflow). The whole drift-guard file runs because the pin lives in it
+        # next to the guard that flags a second definition or a raw DAG-edge read,
+        # plus #3586's one-source check of the live-node text. Measured in a
+        # fresh venv with ONLY pytest installed: 19 tests in ~2.5 s wall.
+        run: >-
+          python3 -m pytest -q
+          tests/test_edge_liveness_ssot_3542.py
+          "tests/test_supersede_resolution_recompute_3586.py::test_live_node_predicate_has_one_source"
+
       - name: invariant-checks — forum-service process-spawn ratchet (#3518)
         if: (success() || failure()) && steps.setup-python-invariant.outcome == 'success' && steps.install-deps-invariant.outcome == 'success'
         # Enumerates every process spawn on the forum service's executable surface

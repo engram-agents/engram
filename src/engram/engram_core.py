@@ -1810,6 +1810,118 @@ def dag_family_relations(family: str) -> "frozenset[str]":
 
 
 # ---------------------------------------------------------------------------
+# The FIXED SQL templates behind ``dag_edge_set`` (#3542, owner-read registry).
+#
+# Six, one per live_only {True, False} x filter {none, source_id, target_id}; a
+# source_id AND target_id together is refused (no caller needs it). They are
+# string LITERALS, not built at import time, because the build-time read scanner
+# (tools/engramd_read_scan.py, #3196) admits only a call-site literal or a
+# module-level string Constant and the owner process executes only the templates
+# it registered: a ``.format()``-built constant is a scanner ``variable``
+# failure. The relation set is a bound parameter (``json_each(?)``, the #3324
+# form), never string-built. The liveness clause is NOT a second definition:
+# tests/test_edge_liveness_ssot_3542.py pins every live template, character for
+# character, to what ``_CURRENT_EDGE_PREDICATE`` generates, so editing either
+# side alone reddens it. Regenerate the registry with the scanner after any edit
+# here (src/engram/engramd_read_templates.json).
+# ---------------------------------------------------------------------------
+_DAG_EDGES_LIVE_ALL_SQL = (
+    'SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS r'
+    'elation FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.'
+    'id = e.target_id WHERE e.relation IN (SELECT value FROM json_each(?)) AND '
+    "(s.is_current = 1 AND s.status != 'retracted') AND (t.is_current = 1 AND t"
+    ".status != 'retracted') ORDER BY e.source_id, e.target_id, e.relation"
+)
+_DAG_EDGES_LIVE_SOURCE_SQL = (
+    'SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS r'
+    'elation FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.'
+    'id = e.target_id WHERE e.relation IN (SELECT value FROM json_each(?)) AND '
+    "(s.is_current = 1 AND s.status != 'retracted') AND (t.is_current = 1 AND t"
+    ".status != 'retracted') AND e.source_id = ? ORDER BY e.source_id, e.target"
+    '_id, e.relation'
+)
+_DAG_EDGES_LIVE_TARGET_SQL = (
+    'SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS r'
+    'elation FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.'
+    'id = e.target_id WHERE e.relation IN (SELECT value FROM json_each(?)) AND '
+    "(s.is_current = 1 AND s.status != 'retracted') AND (t.is_current = 1 AND t"
+    ".status != 'retracted') AND e.target_id = ? ORDER BY e.source_id, e.target"
+    '_id, e.relation'
+)
+_DAG_EDGES_ALL_STORED_ALL_SQL = (
+    'SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS r'
+    'elation FROM edges e WHERE e.relation IN (SELECT value FROM json_each(?)) '
+    'ORDER BY e.source_id, e.target_id, e.relation'
+)
+_DAG_EDGES_ALL_STORED_SOURCE_SQL = (
+    'SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS r'
+    'elation FROM edges e WHERE e.relation IN (SELECT value FROM json_each(?)) '
+    'AND e.source_id = ? ORDER BY e.source_id, e.target_id, e.relation'
+)
+_DAG_EDGES_ALL_STORED_TARGET_SQL = (
+    'SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS r'
+    'elation FROM edges e WHERE e.relation IN (SELECT value FROM json_each(?)) '
+    'AND e.target_id = ? ORDER BY e.source_id, e.target_id, e.relation'
+)
+
+
+def dag_edge_set(
+    conn: sqlite3.Connection, relations: "Iterable[str] | None" = None, *,
+    live_only: bool = True, source_id: "str | None" = None,
+    target_id: "str | None" = None,
+) -> "list[tuple[str, str, str]]":
+    """THE ONE definition of the DAG-relation edge set of a graph (#3542, Lei
+    2026-10-21: "ONE definition, no drift ever"). Returns ``(source_id,
+    target_id, relation)`` triples, deterministically ordered, for every edge on
+    ``relations`` (default ``DAG_RELATIONS``; callers pass a family, or
+    ``CASCADE_RELATIONS`` for a cascade walk), optionally narrowed to one
+    ``source_id`` and/or ``target_id`` (the per-node step of a walk).
+
+    ``live_only=True`` (the default, and what every cycle JUDGE and every
+    liveness-bounded walk uses: the downstream cascade, ``_cascade_reaches``):
+    only LIVE STRUCTURE -- an edge counts iff BOTH raw endpoints are live
+    (``_CURRENT_EDGE_PREDICATE``). Non-current nodes and their edges are
+    provenance, not structure. No resolution through supersede chains.
+
+    ``live_only=False``: the provenance-inclusive set (every stored edge on the
+    relations, whatever its endpoints). Used (a) by the informational
+    frozen-closed line of ``check_dag_conformance`` so both numbers come from one
+    function, (b) by the first hop of a cascade from a node that has JUST stopped
+    being live (a retract / supersede root, whose own edges are by construction
+    provenance), and (c) by readers whose SUBJECT is the provenance itself (the
+    supersedes chain, an acknowledged-dead premise, the stored premise list of a
+    recompute), and (d) by provenance traversals whose subject is the ancestor
+    chain (``_walk_cascade_upstream``: terminates by its visited set and budget,
+    not by liveness). A cycle judge or a liveness-bounded walk must not use it.
+
+    Every reader calls this; none restates the endpoint filter. The drift guard
+    tests/test_edge_liveness_ssot_3542.py enforces that."""
+    rels = sorted(DAG_RELATIONS if relations is None else relations)
+    if not rels:
+        return []
+    if source_id is not None and target_id is not None:
+        raise ValueError("dag_edge_set: pass source_id or target_id, not both")
+    rels_json = json.dumps(rels)
+    # One execute call per template, each naming its module constant directly:
+    # the read scanner resolves only a bare module-level literal at a call site.
+    if live_only:
+        if source_id is not None:
+            rows = conn.execute(_DAG_EDGES_LIVE_SOURCE_SQL, (rels_json, source_id))
+        elif target_id is not None:
+            rows = conn.execute(_DAG_EDGES_LIVE_TARGET_SQL, (rels_json, target_id))
+        else:
+            rows = conn.execute(_DAG_EDGES_LIVE_ALL_SQL, (rels_json,))
+    else:
+        if source_id is not None:
+            rows = conn.execute(_DAG_EDGES_ALL_STORED_SOURCE_SQL, (rels_json, source_id))
+        elif target_id is not None:
+            rows = conn.execute(_DAG_EDGES_ALL_STORED_TARGET_SQL, (rels_json, target_id))
+        else:
+            rows = conn.execute(_DAG_EDGES_ALL_STORED_ALL_SQL, (rels_json,))
+    return [(r[0], r[1], r[2]) for r in rows.fetchall()]
+
+
+# ---------------------------------------------------------------------------
 # engram_retype_edge's allowed-move table (issue #2265, epic #2252).
 # docs/2265-2347-edge-correction-design.md sec.2: "a re-type may only move an
 # edge to a relation that claims LESS" -- supported_by/derives_from/cites are
@@ -1854,10 +1966,9 @@ RETYPE_ALLOWED_MOVES: "dict[tuple[str, str], tuple[str, ...] | None]" = {
 
 def _dag_cycle_path(
     conn: sqlite3.Connection, relation: str, source_id: str, target_id: str,
-    *, resolve: bool = True,
 ) -> "list[str] | None":
     """Would inserting ``source_id --relation--> target_id`` close a cycle
-    among LIVE edges of ``relation``'s acyclicity FAMILY? Returns the cycle
+    among CURRENT edges of ``relation``'s acyclicity FAMILY? Returns the cycle
     (list of node ids, first == last) if so, else None. A relation with no
     family (``dag_family is None``) has no walk: always None.
 
@@ -1875,77 +1986,44 @@ def _dag_cycle_path(
     BATCH audit over the same families; this is the TARGETED check that stops
     a cycle landing in the first place.
 
-    BFS from ``target_id`` over existing edges of the family (source->target):
-    if ``source_id`` is reachable FROM ``target_id``, the candidate edge would
-    close ``target_id -> ... -> source_id -> target_id``.
+    #3542 (Lei, 2026-10-21): the walk ranges over CURRENT nodes and CURRENT
+    edges only (``_CURRENT_EDGE_PREDICATE``: both RAW endpoints live), the same
+    predicate the gate uses, so the guard and the audit judge one graph. Nothing
+    is resolved through supersede chains. If either endpoint of the edge being
+    written is itself non-current, the edge is provenance and cannot close a
+    live cycle: None, no refusal on cycle grounds (other guards are unchanged).
+    This removes the earlier ``resolve=True`` chain resolution (#2812/#2813): a
+    cycle that closes only through a superseded node is a frozen-closed
+    component, reported informationally by the audit, never a refusal.
 
-    ``resolve`` (default True) puts every endpoint through the supersedes
-    chain, as the ``generalizes`` guard and the conformance audit do. The
-    acknowledgement writer passes ``resolve=False`` -- it keeps the raw-edge
-    semantics of the cascade guard it sits beside (``_cascade_reaches``); see
-    its call site for why.
+    BFS from ``target_id`` over existing current edges of the family
+    (source->target): if ``source_id`` is reachable FROM ``target_id``, the
+    candidate edge would close ``target_id -> ... -> source_id -> target_id``.
     """
     family = EDGE_CLASSIFICATIONS.get(relation, {}).get("dag_family")
     if family is None:
         return None
+    if not _edge_is_current(conn, source_id, target_id):
+        return None  # provenance: cannot close a live cycle
     if source_id == target_id:
         return [source_id, target_id]
-    relations = sorted(dag_family_relations(family))
-    placeholders = ",".join("?" * len(relations))
-
-    # Walk the RESOLVED graph -- every edge's endpoints put through
-    # _resolve_to_current, exactly as generalization_chain resolves them on
-    # the read side (and as engram_dag_conformance resolves them).
-    #
-    # The earlier shape filtered on `s.is_current = 1 AND t.is_current = 1`
-    # instead, and that was a real hole (found in #2812 review). An edge
-    # whose endpoint is superseded through the GENERIC engram_supersede --
-    # which carries no generalizes edges, and is the ONLY supersede path
-    # that exists for lesson/axiom/goal, engram_outgrow_cornerstone being
-    # cornerstone-only -- became invisible HERE while the read-side walk
-    # still traversed it via resolution. So the guard would pass an edge
-    # that generalization_chain then rendered as a live cycle, and rendered
-    # it as `heads: []` + `truncated: False`, which is indistinguishable
-    # from a clean complete walk. Guard and walk must see the same graph or
-    # one can admit exactly what the other reports.
-    _resolved: "dict[str, str | None]" = {}
-
-    def _res(nid: str) -> "str | None":
-        if not resolve:
-            return nid
-        if nid not in _resolved:
-            _resolved[nid] = _resolve_to_current(conn, nid)
-        return _resolved[nid]
+    relations = dag_family_relations(family)
 
     adjacency: "dict[str, set]" = {}
-    for row in conn.execute(
-        f"SELECT source_id, target_id FROM edges "
-        f"WHERE relation IN ({placeholders})",
-        tuple(relations),
-    ):
-        r_src = _res(row["source_id"])
-        r_tgt = _res(row["target_id"])
-        if r_src is None or r_tgt is None:
-            continue  # dead-ended chain: no live node to attribute the edge to
-        adjacency.setdefault(r_src, set()).add(r_tgt)
+    for sid, tid, _rel in dag_edge_set(conn, relations, live_only=True):
+        adjacency.setdefault(sid, set()).add(tid)
 
-    start = _res(target_id) or target_id
-    goal = _res(source_id) or source_id
-    if start == goal:
-        # target resolves onto source itself -- a self-cycle once written
-        return [source_id, target_id]
-
-    parent: "dict[str, str | None]" = {start: None}
-    queue = [start]
+    parent: "dict[str, str | None]" = {target_id: None}
+    queue = [target_id]
     while queue:
         current = queue.pop(0)
-        if current == goal:
+        if current == source_id:
             path = []
             node = current
             while node is not None:
                 path.append(node)
                 node = parent[node]
-            path.reverse()  # (resolved) target -> ... -> source
+            path.reverse()  # target -> ... -> source
             return [source_id] + path
         for nxt in sorted(adjacency.get(current, ())):
             if nxt not in parent:
@@ -1958,7 +2036,7 @@ def _generalizes_cycle_path(
     conn: sqlite3.Connection, source_id: str, target_id: str
 ) -> "list[str] | None":
     """Would inserting ``source_id --generalizes--> target_id`` close a
-    cycle among LIVE ``generalizes`` edges? Returns the cycle (list of node
+    cycle among CURRENT ``generalizes`` edges? Returns the cycle (list of node
     ids, first == last) if so, else None.
 
     #2753 epic WS1 (D1): the write-time cycle guard, called from every
@@ -1966,9 +2044,9 @@ def _generalizes_cycle_path(
     ``generalized_by`` mint-time wiring on ``engram_add_lesson``/
     ``engram_add_cornerstone``). #3210: now a thin caller of
     ``_dag_cycle_path`` -- ``generalizes`` is the sole member of the
-    ``abstraction`` family, so the walk is the same ``generalizes``-only,
-    resolve-through-supersedes walk as before (#2812/#2813), but the walked
-    set is read from ``EDGE_CLASSIFICATIONS`` rather than hard-coded.
+    ``abstraction`` family, so the walk is the ``generalizes``-only walk, over
+    current edges only (#3542; it no longer resolves through supersedes), and
+    the walked set is read from ``EDGE_CLASSIFICATIONS`` rather than hard-coded.
     Deliberately NOT walked over the grounding family: see ``_dag_cycle_path``.
     """
     return _dag_cycle_path(conn, "generalizes", source_id, target_id)
@@ -2141,45 +2219,40 @@ def generalization_chain(
             frontier.append(resolved)
             roots.append(resolved)
 
+    # #3542 (reviewer round 1 on #4010): this walk is a cycle JUDGE
+    # (``cycle_detected`` below, consumed by both surface hooks), so it reads
+    # the parent edges through the one edge-set definition, over CURRENT edges
+    # only (``live_only=True``: both raw endpoints live) and resolves nothing
+    # through supersede chains. A cycle that closes only through a superseded
+    # node is provenance: the gate and the write guard call it clean, and so
+    # must this. Resolution survives ONLY at the entry point (the start node
+    # and the exemplifies/instantiates roots above, so a caller holding a
+    # retired id still starts from its current successor); everything the walk
+    # reaches after that is a raw live node, so resolution can never be what
+    # produces ``cycle_detected``. A node with no live parent edge is a head
+    # (a parent that was retracted or superseded is simply not an edge).
     depth = 0
     while frontier and depth < max_depth:
         next_frontier: "list[str]" = []
         for current in frontier:
-            parent_edges = conn.execute(
-                "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'generalizes'",
-                (current,),
-            ).fetchall()
-            if not parent_edges:
+            parent_ids = sorted({
+                src for src, _t, _r in dag_edge_set(
+                    conn, ("generalizes",), live_only=True, target_id=current)
+            })
+            if not parent_ids:
                 if current not in heads:
                     heads.append(current)
                 continue
-            # A head is a node with no LIVE parent -- not merely one with no
-            # parent-edge ROWS. A node whose every generalizes parent
-            # dead-ends (retracted with no replacement, so
-            # _resolve_to_current returns None) has no live parent and is a
-            # head by the same definition, reached by a different route.
-            # Before #2812 round 2 such a node was neither appended to heads
-            # nor connected to anything: the walk fell out of both branches
-            # silently, and the cycle_detected inference added in that round
-            # then fired on it -- a false positive on a graph with no cycle.
-            resolved_any_parent = False
-            for pe in parent_edges:
-                raw_parent = pe[0]  # SELECT source_id
-                resolved_parent = _resolve_to_current(conn, raw_parent)
-                if resolved_parent is None:
-                    continue
-                resolved_any_parent = True
-                if resolved_parent not in nodes[current]["parents"]:
-                    nodes[current]["parents"].append(resolved_parent)
-                if resolved_parent not in nodes:
-                    nodes[resolved_parent] = {
-                        "original_id": raw_parent,
+            for parent in parent_ids:
+                if parent not in nodes[current]["parents"]:
+                    nodes[current]["parents"].append(parent)
+                if parent not in nodes:
+                    nodes[parent] = {
+                        "original_id": parent,
                         "parents": [],
                         "depth": depth + 1,
                     }
-                    next_frontier.append(resolved_parent)
-            if not resolved_any_parent and current not in heads:
-                heads.append(current)
+                    next_frontier.append(parent)
         frontier = next_frontier
         depth += 1
 
@@ -2881,6 +2954,31 @@ def _is_live_node(conn: sqlite3.Connection, node_id) -> bool:
         + _LIVE_NODE_PREDICATE.format(a="n"),
         (node_id,),
     ).fetchone() is not None
+
+
+# ONE source for "this edge counts for acyclicity" (#3542, Lei 2026-10-21): the
+# DAG requirement ranges over CURRENT nodes and CURRENT edges only; a non-current
+# node and its edges are provenance, not live structure. An edge counts iff BOTH
+# RAW endpoints are live (``_LIVE_NODE_PREDICATE`` on source and target; retracted
+# is already non-current). NO resolution through supersede chains when judging a
+# cycle. Format with the aliases of the source and target node rows, e.g.
+# ``_CURRENT_EDGE_PREDICATE.format(s="s", t="t")`` over ``edges e JOIN nodes s ON
+# s.id = e.source_id JOIN nodes t ON t.id = e.target_id``.
+#
+# This predicate is applied in ONE place, ``dag_edge_set`` (next to
+# EDGE_CLASSIFICATIONS above), and every reader of DAG / cascade edges calls that
+# function instead of restating the filter; tests/test_edge_liveness_ssot_3542.py
+# sweeps ``src/engram`` and fails on a second definition or a raw DAG-edge read
+# outside its reviewed allowlist.
+_CURRENT_EDGE_PREDICATE = (
+    "(" + _LIVE_NODE_PREDICATE.format(a="{s}") + ") AND ("
+    + _LIVE_NODE_PREDICATE.format(a="{t}") + ")"
+)
+
+
+def _edge_is_current(conn: sqlite3.Connection, source_id, target_id) -> bool:
+    """True iff both raw endpoints of an edge are live (``_CURRENT_EDGE_PREDICATE``)."""
+    return _is_live_node(conn, source_id) and _is_live_node(conn, target_id)
 
 
 def _best_resolver_for(conn: sqlite3.Connection, target_id: str):
@@ -10181,9 +10279,11 @@ def _acknowledged_superseded_premises(conn: sqlite3.Connection,
     back, so mutually-superseding ack targets never drop each other and the
     premise set is never emptied by a cycle.
     """
-    acked = [r["target_id"] for r in conn.execute(
-        "SELECT target_id FROM edges WHERE source_id = ? "
-        "AND relation = 'acknowledged_derives_from'", (node_id,)).fetchall()]
+    # live_only=False: an acknowledged premise is by definition one whose
+    # replacement exists, so it is usually non-current (#3542).
+    acked = [t for _s, t, _r in dag_edge_set(
+        conn, ("acknowledged_derives_from",), live_only=False,
+        source_id=node_id)]
     if not acked:
         return set()
     memo: dict = {}
@@ -10197,19 +10297,20 @@ def _acknowledged_superseded_premises(conn: sqlite3.Connection,
         frontier = [start]
         while frontier:
             cur = frontier.pop()
-            for r in conn.execute(
-                    "SELECT target_id FROM edges WHERE source_id = ? "
-                    "AND relation = 'supersedes'", (cur,)).fetchall():
-                if r["target_id"] not in found:
-                    found.add(r["target_id"])
-                    frontier.append(r["target_id"])
+            # live_only=False: the supersedes chain IS provenance -- its
+            # targets are non-current by definition (#3542).
+            for _s, tgt, _r in dag_edge_set(
+                    conn, ("supersedes",), live_only=False, source_id=cur):
+                if tgt not in found:
+                    found.add(tgt)
+                    frontier.append(tgt)
         memo[start] = found
         return found
 
-    _rels = sorted(CASCADE_RELATIONS)
-    targets = {r["target_id"] for r in conn.execute(
-        f"SELECT target_id FROM edges WHERE source_id = ? AND relation IN "
-        f"({','.join('?' for _ in _rels)})", (node_id, *_rels)).fetchall()}
+    # live_only=False: the premise whose replacement was acknowledged is by
+    # definition non-current; this reader's subject is that dead premise (#3542).
+    targets = {t for _s, t, _r in dag_edge_set(
+        conn, CASCADE_RELATIONS, live_only=False, source_id=node_id)}
     dropped: set = set()
     for a in acked:
         for x in _ancestors(a) & targets:
@@ -10229,17 +10330,14 @@ def _recompute_premise_ids(conn: sqlite3.Connection, node_id: str) -> list:
     and tools/surgical.py::_compute_confidence_for_node so the two copies of
     the confidence arithmetic cannot disagree about which premises count.
     """
-    _rels = sorted(CASCADE_RELATIONS)
     _superseded = _acknowledged_superseded_premises(conn, node_id)
+    # live_only=False: a recompute reads every stored premise edge (a premise
+    # that went non-current still carries its confidence; #3531 owns which are
+    # excluded). Not a cycle judgement or a reachability walk (#3542).
     return [
-        r["target_id"] for r in conn.execute(
-            f"SELECT DISTINCT target_id FROM edges "
-            f"WHERE source_id = ? AND relation IN "
-            f"({','.join('?' for _ in _rels)}) "
-            f"ORDER BY target_id",
-            (node_id, *_rels),
-        ).fetchall()
-        if r["target_id"] not in _superseded
+        t for t in sorted({t for _s, t, _r in dag_edge_set(
+            conn, CASCADE_RELATIONS, live_only=False, source_id=node_id)})
+        if t not in _superseded
     ]
 
 
@@ -10809,12 +10907,12 @@ def _direct_premise_ids(conn: sqlite3.Connection, node_id: str) -> list:
     are engram_revision.py's `_immediate_cause`, `_dead_premises`,
     `_cascade_frontier_node_summary`, and `_cascade_affected_premises`.
     """
-    rows = conn.execute(
-        f"SELECT target_id FROM edges WHERE source_id = ? "
-        f"AND relation IN ({_CITATION_SUPPORT_RELATION_PLACEHOLDERS})",
-        (node_id, *_CITATION_SUPPORT_RELATIONS_SORTED),
-    ).fetchall()
-    return [r["target_id"] for r in rows]
+    # live_only=False: a node's stored premises include the dead ones (that is
+    # what `_dead_premises` and the cascade frontier read); one definition of
+    # the edge set, no liveness filter here (#3542). All three relations are in
+    # the grounding family.
+    return [t for _s, t, _r in dag_edge_set(
+        conn, CITATION_SUPPORT_RELATIONS, live_only=False, source_id=node_id)]
 
 
 def _pending_markers_for_node(conn: sqlite3.Connection, node_id: str) -> list:
@@ -11339,13 +11437,12 @@ def _trace_evidence_roots(conn: sqlite3.Connection, node_id: str, max_depth: int
         # Follow citation edges backward. #2252 Stage 1.0b: walked-relation
         # set DERIVED from PROVENANCE_RELATIONS (the `provenance` flag in
         # EDGE_CLASSIFICATIONS) instead of hardcoded.
-        edges = conn.execute(
-            "SELECT target_id FROM edges WHERE source_id = ? "
-            f"AND relation IN ({_PROVENANCE_RELATION_PLACEHOLDERS})",
-            (current, *_PROVENANCE_RELATIONS_SORTED),
-        ).fetchall()
-        for e in edges:
-            queue.append(e["target_id"])
+        # live_only=False (#3542): a provenance traversal toward the evidence
+        # roots, not a cycle judge; it terminates by its visited set and budget.
+        for _src, tgt, _rel in dag_edge_set(
+                conn, _PROVENANCE_RELATIONS_SORTED, live_only=False,
+                source_id=current):
+            queue.append(tgt)
 
     return roots
 
@@ -11462,13 +11559,15 @@ def _walk_cascade_upstream(
         if not descend_if(node):
             continue
 
-        edges = conn.execute(
-            "SELECT target_id FROM edges WHERE source_id = ? "
-            f"AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
-            (current, *_CASCADE_RELATIONS_SORTED),
-        ).fetchall()
-        for e in edges:
-            queue.append(e["target_id"])
+        # live_only=False (#3542 ruling): this is a provenance traversal, not
+        # a cycle judge. The cascade frontier must see a pending ancestor
+        # through a superseded intermediate (test_cascade_frontier::
+        # test_transitive_catches_out_of_order_...). It terminates by its
+        # visited set and budget (#2339), not by liveness.
+        for _src, tgt, _rel in dag_edge_set(
+                conn, _CASCADE_RELATIONS_SORTED, live_only=False,
+                source_id=current):
+            queue.append(tgt)
 
     # Truncated iff the budget is out AND the queue still holds a node never
     # visited. Entries that are already-visited duplicates (a diamond's

@@ -103,8 +103,8 @@ The DAG audit gates every phase. It aborts the run (exit 3, status
 non-trivial strongly connected component of one family's graph after the phase
 and on none before it (a genuinely new cyclic component). The components are
 computed by this tool from the graph itself, over the same edges the audit walks
-(each family's relations, endpoints resolved through the supersedes chain to
-their current node), so neither rule reads the audit's cycle listing and the
+(each family's relations, current edges only since #3542: both raw endpoints live,
+no supersedes-chain resolution), so neither rule reads the audit's cycle listing and the
 listing's cap (MAX_CYCLES_PER_FAMILY, 20 per family) does not matter. The run
 does NOT abort because the listed back-edge path differs while the count did not
 rise and every node was already cyclic: the audit lists one cycle per DFS back
@@ -712,7 +712,7 @@ class Run:
             cyclic = {}
             for fam in self.core.DAG_FAMILIES:
                 # the audit's own scope: the family's relations within DAG_RELATIONS,
-                # endpoints resolved through the supersedes chain to current nodes
+                # current edges only (#3542): both raw endpoints live, no resolution
                 walked = self.core.dag_family_relations(fam) & self.core.DAG_RELATIONS
                 cyclic[fam] = frozenset(cyclic_nodes(self.dagc._live_dag_edges(conn, walked)))
         finally:

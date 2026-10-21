@@ -1200,13 +1200,15 @@ def _retype_edge_impl(
         # itself cascade-bearing (supported_by/cites never are, so this is a
         # no-op for those two moves).
         if relation in core.CASCADE_RELATIONS:
-            cascade_rels = sorted(core.CASCADE_RELATIONS)
-            remaining = conn.execute(
-                f"SELECT COUNT(*) AS c FROM edges WHERE source_id = ? "
-                f"AND relation IN ({','.join('?' for _ in cascade_rels)}) "
-                f"AND NOT (target_id = ? AND relation = ?)",
-                (source_id, *cascade_rels, target_id, relation),
-            ).fetchone()["c"]
+            # live_only=False: counts every STORED premise edge (#3542 -- the
+            # one edge-set function; this is a count of stored premises, not a
+            # cycle judgement or a walk).
+            remaining = sum(
+                1 for _s, t, r in core.dag_edge_set(
+                    conn, core.CASCADE_RELATIONS, live_only=False,
+                    source_id=source_id)
+                if not (t == target_id and r == relation)
+            )
             if remaining == 0:
                 return json.dumps({
                     "error": (

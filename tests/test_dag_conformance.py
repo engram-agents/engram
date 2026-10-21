@@ -38,6 +38,11 @@ Coverage:
      chain dead-ends (retracted, no replacement) must be dropped safely —
      no crash, no false cycle.
 
+#3542 (Lei, 2026-10-21): the gate now ranges over CURRENT edges only (both raw
+endpoints live, no supersede-chain resolution). Item 7's two tests keep their
+names but assert the new semantics: gate 0, plus the informational
+``frozen_closed_components`` 1 for the resolved-only cycle.
+
 (Two more tests exist below — test_deep_chain_no_recursion_error and
 test_deep_chain_with_cycle_still_found — pre-existing at #2813 time and
 not enumerated in this list before this file was touched; left as found,
@@ -109,6 +114,7 @@ def _new_conn() -> sqlite3.Connection:
             id TEXT PRIMARY KEY,
             type TEXT NOT NULL,
             is_current INTEGER DEFAULT 1,
+            status TEXT DEFAULT 'active',
             superseded_by TEXT,
             created_at TEXT
         )"""
@@ -230,16 +236,21 @@ def test_cycle_through_superseded_endpoint_is_caught():
     _add_edge(conn, "b", "a2", "derives_from")  # b -> a2, closing a2 -> b -> a2
     conn.commit()
 
+    # #3542 (Lei, 2026-10-21): the gate ranges over CURRENT edges only -- the
+    # a->b edge touches the superseded `a`, so it is provenance. The cycle that
+    # exists only in the resolved graph is reported INFORMATIONALLY, not gated.
     out = dagconf.check_dag_conformance(conn)
-    assert out["cycle_found"] is True, (
-        "resolving a's supersede chain onto a2 turns a->b into a2->b, which "
-        "closes a2 -> b -> a2 via the existing b->a2 edge; this must be caught"
+    assert out["cycle_found"] is False, (
+        "a2 -> b -> a2 closes only through the superseded a; the gate must not "
+        "count it (#3542)"
     )
-    assert {"a2", "b"}.issubset(set(out["cycle_path"])), (
-        f"cycle path {out['cycle_path']} should include both a2 and b"
+    assert out["frozen_closed_components"] == 1, out
+    path = out["frozen_closed_example_path"]
+    assert {"a2", "b"}.issubset(set(path)), (
+        f"informational path {path} should include both a2 and b"
     )
-    assert "a" not in out["cycle_path"], (
-        "the superseded node a must never appear in a resolved cycle path -- "
+    assert "a" not in path, (
+        "the superseded node a must never appear in the resolved path -- "
         "only its current successor a2 should"
     )
 
@@ -265,18 +276,20 @@ def test_cycle_through_superseded_endpoint_as_target_is_caught():
     _add_edge(conn, "q", "p_old", "derives_from")   # q -> p_old (p_old superseded by p)
     conn.commit()
 
+    # #3542: current-only gate; the resolved-only cycle is informational.
     out = dagconf.check_dag_conformance(conn)
-    assert out["cycle_found"] is True, (
-        "resolving p_old's supersede chain onto p turns q->p_old into q->p, "
-        "which closes p -> q -> p via the existing p->q edge; this must be "
-        "caught"
+    assert out["cycle_found"] is False, (
+        "p -> q -> p closes only through the superseded p_old; the gate must "
+        "not count it (#3542)"
     )
-    assert {"p", "q"}.issubset(set(out["cycle_path"])), (
-        f"cycle path {out['cycle_path']} should include both p and q"
+    assert out["frozen_closed_components"] == 1, out
+    path = out["frozen_closed_example_path"]
+    assert {"p", "q"}.issubset(set(path)), (
+        f"informational path {path} should include both p and q"
     )
-    assert "p_old" not in out["cycle_path"], (
-        "the superseded node p_old must never appear in a resolved cycle "
-        "path -- only its current successor p should"
+    assert "p_old" not in path, (
+        "the superseded node p_old must never appear in the resolved path -- "
+        "only its current successor p should"
     )
 
 

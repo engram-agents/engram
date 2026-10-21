@@ -218,13 +218,8 @@ def _cascade_reaches(conn, ancestor_id: str, candidate_id: str) -> bool:
     frontier = [candidate_id]
     while frontier:
         current = frontier.pop()
-        rows = conn.execute(
-            f"SELECT target_id FROM edges WHERE source_id = ? "
-            f"AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
-            (current, *_CASCADE_RELATIONS_SORTED),
-        ).fetchall()
-        for r in rows:
-            t = r["target_id"]
+        for _s, t, _r in core.dag_edge_set(
+                conn, _CASCADE_RELATIONS_SORTED, live_only=True, source_id=current):
             if t == ancestor_id:
                 return True
             if t not in seen:
@@ -1126,14 +1121,12 @@ def _cascade_recompute_confidence_transitive(conn, node_id: str) -> dict:
         seen.add(node_id)
         order.append(node_id)
 
-    dependents = conn.execute(
-        "SELECT source_id FROM edges "
-        f"WHERE target_id = ? AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
-        (node_id, *_CASCADE_RELATIONS_SORTED),
-    ).fetchall()
+    # live_only=False: the subject may already be non-live (a retract / supersede
+    # root), and its own edges are then provenance by construction (#3542).
     visited = {node_id}
-    for d in dependents:
-        _walk_cascade_downstream(conn, d["source_id"],
+    for dep_id, _t, _r in core.dag_edge_set(
+            conn, _CASCADE_RELATIONS_SORTED, live_only=False, target_id=node_id):
+        _walk_cascade_downstream(conn, dep_id,
                                  visited=visited, on_live_node=_collect)
 
     changes = []
@@ -1330,26 +1323,18 @@ def _cascade_record_acknowledgement_edges(conn, node_id: str,
             # and cannot see a loop that closes through a non-cascade
             # grounding edge (`cites`, `supported_by`, ...) -- admitted here,
             # then reported by conformance. So ALSO check the whole grounding
-            # family. RAW edges, not resolved through supersedes (resolve=
-            # False): that keeps this check's semantics identical to the
-            # cascade guard it sits beside, so everything the cascade guard
-            # admitted or refused before is unchanged except for paths that
-            # use a non-cascade grounding edge.
-            # WHY resolve=False (measured in review): an ack edge X -> R,
-            # where R replaced X's premise P, resolves to the SAME edge as
-            # the existing X -> P. So under resolution the ack adds no edge
-            # to the resolved graph, and a resolved check here could only
-            # re-report a cycle that ALREADY exists -- and would then refuse
-            # every ack inside an existing cycle. The audit sees that cycle
-            # from the second supersede on, before any ack. The remaining
-            # guard/audit gap is at the supersede and retract writers, which
-            # are guarded only by the cascade-scoped `_cascade_reaches`, by
-            # §12.4 design; it is not this writer's to close.
+            # family, over CURRENT edges only (#3542: the same
+            # `core.dag_edge_set(live_only=True)` the cascade guard and the
+            # audit read; nothing is resolved through supersedes). The earlier
+            # `resolve=False` argument is gone with the resolve mode itself: an
+            # ack edge X -> R, where R replaced X's premise P, used to resolve
+            # onto the existing X -> P and could only re-report an old cycle;
+            # on raw current edges X -> P is non-current provenance (P is
+            # superseded) and the ack edge is judged for what it is.
             # The grounding family contains CASCADE_RELATIONS, so everything
             # the check above refuses is still refused (it runs first).
             g_cycle = core._dag_cycle_path(
                 conn, "acknowledged_derives_from", node_id, replacement,
-                resolve=False,
             )
             if g_cycle is not None:
                 raise _GroundingCycleError(node_id, replacement, g_cycle)
@@ -1444,14 +1429,12 @@ def _cascade_auto_resolve_trivial(conn, node_id: str, now: str) -> list:
             seen.add(row["id"])
             candidates.append(row["id"])
 
-    dependents = conn.execute(
-        "SELECT source_id FROM edges "
-        f"WHERE target_id = ? AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
-        (node_id, *_CASCADE_RELATIONS_SORTED),
-    ).fetchall()
+    # live_only=False: the subject may already be non-live (a retract / supersede
+    # root), and its own edges are then provenance by construction (#3542).
     visited = {node_id}
-    for d in dependents:
-        _walk_cascade_downstream(conn, d["source_id"],
+    for dep_id, _t, _r in core.dag_edge_set(
+            conn, _CASCADE_RELATIONS_SORTED, live_only=False, target_id=node_id):
+        _walk_cascade_downstream(conn, dep_id,
                                  visited=visited, on_live_node=_collect)
 
     auto = []
@@ -2005,13 +1988,9 @@ def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
 
     on_live_node(node)
 
-    dependents = conn.execute(
-        "SELECT source_id FROM edges "
-        f"WHERE target_id = ? AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
-        (node_id, *_CASCADE_RELATIONS_SORTED),
-    ).fetchall()
-    for d in dependents:
-        _walk_cascade_downstream(conn, d["source_id"],
+    for dep_id, _tgt, _rel in core.dag_edge_set(
+            conn, _CASCADE_RELATIONS_SORTED, target_id=node_id):
+        _walk_cascade_downstream(conn, dep_id,
                                  visited=visited, on_live_node=on_live_node)
 
 
@@ -2274,15 +2253,17 @@ def _bears_on_replacement_of(conn, node_id):
         nexts = []
         if row["superseded_by"]:
             nexts.append(row["superseded_by"])
-        nexts += [
-            r["id"] for r in conn.execute(
-                "SELECT e.source_id AS id FROM edges e "
-                "JOIN nodes n ON n.id = e.source_id "
-                "WHERE e.target_id = ? AND e.relation = 'retracts' "
-                "ORDER BY n.is_current DESC, e.source_id",
-                (cur,),
-            ).fetchall()
-        ]
+        # live_only=False: this chain-follow starts FROM a retired node, so its
+        # `retracts` edges are provenance by construction; a current source is
+        # preferred by the ordering below, not required (#3542: the one edge-set
+        # function, no hand-built endpoint filter here).
+        _srcs = sorted({sid for sid, _t, _r in core.dag_edge_set(
+            conn, ("retracts",), live_only=False, target_id=cur)})
+        nexts += sorted(
+            _srcs,
+            key=lambda sid: (
+                0 if core._is_live_node(conn, sid) else 1, sid),
+        )
         for nxt in nexts:
             if nxt in seen:
                 continue
@@ -3174,13 +3155,12 @@ def _supersede_impl(
                 })
 
             # Walk direct dependents of the superseded node.
-            direct = conn.execute(
-                "SELECT source_id FROM edges "
-                f"WHERE target_id = ? AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
-                (old_node_id, *_CASCADE_RELATIONS_SORTED),
-            ).fetchall()
-            for d in direct:
-                _walk_cascade_downstream(conn, d["source_id"],
+            # live_only=False: old_node_id has just stopped being live, so its
+            # own edges are provenance by construction (#3542).
+            for dep_id, _t, _r in core.dag_edge_set(
+                    conn, _CASCADE_RELATIONS_SORTED, live_only=False,
+                    target_id=old_node_id):
+                _walk_cascade_downstream(conn, dep_id,
                                          visited=visited,
                                          on_live_node=_on_live_for_supersede)
 
@@ -3986,13 +3966,12 @@ def _retract_impl(
                 })
 
             # Walk direct dependents of the retracted node.
-            direct = conn.execute(
-                "SELECT source_id FROM edges "
-                f"WHERE target_id = ? AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
-                (node_id, *_CASCADE_RELATIONS_SORTED),
-            ).fetchall()
-            for d in direct:
-                _walk_cascade_downstream(conn, d["source_id"],
+            # live_only=False: node_id has just stopped being live, so its own
+            # edges are provenance by construction (#3542).
+            for dep_id, _t, _r in core.dag_edge_set(
+                    conn, _CASCADE_RELATIONS_SORTED, live_only=False,
+                    target_id=node_id):
+                _walk_cascade_downstream(conn, dep_id,
                                          visited=visited,
                                          on_live_node=_on_live_for_retract)
 

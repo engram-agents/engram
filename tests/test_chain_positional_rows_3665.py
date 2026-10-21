@@ -31,7 +31,17 @@ EXPECTED_STATEMENTS = frozenset({
     "SELECT superseded_by, is_current FROM nodes WHERE id = ?",
     """SELECT target_id FROM edges
                WHERE source_id = ? AND relation IN ('exemplifies', 'instantiates')""",
-    "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'generalizes'",
+    # #3542: the parent read goes through dag_edge_set's LIVE/target template
+    # (relations bound via json_each); the literal is pasted from what the Recorder
+    # observed, not computed from the module constant.
+    (
+        "SELECT e.source_id AS source_id, e.target_id AS target_id, "
+        "e.relation AS relation FROM edges e JOIN nodes s ON s.id = e.source_id "
+        "JOIN nodes t ON t.id = e.target_id WHERE e.relation IN "
+        "(SELECT value FROM json_each(?)) AND (s.is_current = 1 AND s.status != "
+        "'retracted') AND (t.is_current = 1 AND t.status != 'retracted') AND "
+        "e.target_id = ? ORDER BY e.source_id, e.target_id, e.relation"
+    ),
     "SELECT id, recall_summary FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
     "SELECT id, claim FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
 })
@@ -43,7 +53,7 @@ def _new_conn(row_factory):
     conn.execute(
         """CREATE TABLE nodes (
             id TEXT PRIMARY KEY, type TEXT NOT NULL, is_current INTEGER DEFAULT 1,
-            superseded_by TEXT, claim TEXT, recall_summary TEXT, created_at TEXT
+            status TEXT DEFAULT 'active', superseded_by TEXT, claim TEXT, recall_summary TEXT, created_at TEXT
         )"""
     )
     conn.execute(

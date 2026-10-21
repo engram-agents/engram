@@ -37,6 +37,13 @@
       ]
     },
     {
+      "key": "22897ccbda600c30894be5229ec07d812a7eac2d88169d52051096157f505cd3",
+      "sql": "SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS relation FROM edges e WHERE e.relation IN (SELECT value FROM json_each(?)) ORDER BY e.source_id, e.target_id, e.relation",
+      "sites": [
+        "engram_core.py:dag_edge_set"
+      ]
+    },
+    {
       "key": "2743db24b60c27d0ad4e70e440219d2904a12aa08d4fdca11760b8445b3fdc9c",
       "sql": "SELECT id, recall_summary FROM nodes WHERE id IN (SELECT value FROM json_each(?))",
       "sites": [
@@ -69,6 +76,13 @@
       "sql": "SELECT id, type FROM nodes WHERE id = ?",
       "sites": [
         "engram_core.py:generalization_chain"
+      ]
+    },
+    {
+      "key": "48a7753209f6ac179505f3ac955bf00ed42a4b55c16b0fbe6aef1a81c710f4c4",
+      "sql": "SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS relation FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id WHERE e.relation IN (SELECT value FROM json_each(?)) AND (s.is_current = 1 AND s.status != 'retracted') AND (t.is_current = 1 AND t.status != 'retracted') AND e.source_id = ? ORDER BY e.source_id, e.target_id, e.relation",
+      "sites": [
+        "engram_core.py:dag_edge_set"
       ]
     },
     {
@@ -108,13 +122,6 @@
       ]
     },
     {
-      "key": "5ca245030193bc0e9811e8af365843b66ab4c4d999bbf2d13b79eabc0df37ee8",
-      "sql": "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'generalizes'",
-      "sites": [
-        "engram_core.py:generalization_chain"
-      ]
-    },
-    {
       "key": "5d20068d948c7f26fbda3c1aba1bb024044429ca0fa87a888ebcf0e3bfbe8c1d",
       "sql": "SELECT source_url, source_title FROM nodes WHERE id = ?",
       "sites": [
@@ -126,6 +133,13 @@
       "sql": "SELECT id FROM nodes WHERE is_current=1 AND embedding IS NULL ORDER BY id",
       "sites": [
         "tools/engram-regenerate-embeddings.py:_owner_null_ids"
+      ]
+    },
+    {
+      "key": "63284cb7557117ca4923d3cf3f77dfaeaffa7b6dc889937f86890b9b38dbc198",
+      "sql": "SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS relation FROM edges e WHERE e.relation IN (SELECT value FROM json_each(?)) AND e.source_id = ? ORDER BY e.source_id, e.target_id, e.relation",
+      "sites": [
+        "engram_core.py:dag_edge_set"
       ]
     },
     {
@@ -151,6 +165,13 @@
       ]
     },
     {
+      "key": "85980984a9c48cb2fcc9b9b4f1e4495a5cec0a9818f6f95212bf9c503825779e",
+      "sql": "SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS relation FROM edges e WHERE e.relation IN (SELECT value FROM json_each(?)) AND e.target_id = ? ORDER BY e.source_id, e.target_id, e.relation",
+      "sites": [
+        "engram_core.py:dag_edge_set"
+      ]
+    },
+    {
       "key": "8fd6a2adcab8ffb85efcf1e3b22c7433632f94a0d820c60cf37d4ba22ebd154e",
       "sql": "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1 ORDER BY focused_at",
       "sites": [
@@ -162,6 +183,13 @@
       "sql": "SELECT id, type, substr(trim(coalesce(claim, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000'), 1, 100), recall_summary, created_at, is_current, status FROM nodes WHERE created_at >= ? AND (trim(coalesce(claim, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '' OR trim(coalesce(recall_summary, ''), '\t\n\u000b\f\r\u001c\u001d\u001e\u001f \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000') <> '') ORDER BY created_at ASC, rowid ASC LIMIT 200",
       "sites": [
         "hooks/claude/engram-session-start-hook.py:session_checkpoint_block"
+      ]
+    },
+    {
+      "key": "937e74dc33b2fc633f14c8dac8e35b4205852ef048846787374d3195a81f6d35",
+      "sql": "SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS relation FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id WHERE e.relation IN (SELECT value FROM json_each(?)) AND (s.is_current = 1 AND s.status != 'retracted') AND (t.is_current = 1 AND t.status != 'retracted') AND e.target_id = ? ORDER BY e.source_id, e.target_id, e.relation",
+      "sites": [
+        "engram_core.py:dag_edge_set"
       ]
     },
     {
@@ -232,6 +260,13 @@
       "sql": "SELECT id, claim, logical_chain, metadata FROM nodes WHERE type = 'person' AND is_current = 1",
       "sites": [
         "hooks/claude/engram-user-identity-hook.py:get_person_nodes"
+      ]
+    },
+    {
+      "key": "ca8b4ed636fff6ff5a852689b4eb0bfe6bbc730f98931ab0d6ef69285651d0a2",
+      "sql": "SELECT e.source_id AS source_id, e.target_id AS target_id, e.relation AS relation FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id WHERE e.relation IN (SELECT value FROM json_each(?)) AND (s.is_current = 1 AND s.status != 'retracted') AND (t.is_current = 1 AND t.status != 'retracted') ORDER BY e.source_id, e.target_id, e.relation",
+      "sites": [
+        "engram_core.py:dag_edge_set"
       ]
     },
     {

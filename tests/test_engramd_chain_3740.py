@@ -239,8 +239,11 @@ def _concrete_instantiates(c):
 
 
 def _superseded_rung(c):
-    assert "cs_new" in c["nodes"] and "cs_old" not in c["nodes"]
-    assert c["nodes"]["cs_new"]["original_id"] == "cs_old" and c["heads"] == ["cs_new"]
+    # #3542 (Lei, 2026-10-21): the walk reads LIVE edges only and resolves nothing, so the
+    # edge from the superseded cs_old is provenance: ls_s is its own head and neither
+    # cs_old (retired text) nor cs_new is reached.
+    assert set(c["nodes"]) == {"ls_s"} and c["heads"] == ["ls_s"]
+    assert "cs_old" not in c["nodes"] and "cs_new" not in c["nodes"]
     assert "RETIRED" not in json.dumps(c)
 
 

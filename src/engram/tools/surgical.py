@@ -54,7 +54,7 @@ from engram_confidence import (
     ABDUCTIVE_CONFIDENCE_CAP,
 )
 from engram_core import (
-    CITATION_SUPPORT_RELATIONS, EDGE_CLASSIFICATIONS,
+    CITATION_SUPPORT_RELATIONS, EDGE_CLASSIFICATIONS, dag_edge_set,
     _pending_markers_for_node, _recompute_premise_ids,
 )
 
@@ -469,13 +469,11 @@ def _get_downstream_nodes(conn: sqlite3.Connection, node_id: str) -> list[str]:
     and including it walked into nodes whose confidence formula never reads
     the changed node at all.
     """
-    _rels = sorted(CITATION_SUPPORT_RELATIONS)
-    rows = conn.execute(
-        "SELECT source_id FROM edges WHERE target_id = ? AND relation IN "
-        f"({','.join('?' for _ in _rels)})",
-        (node_id, *_rels),
-    ).fetchall()
-    return [r["source_id"] for r in rows]
+    # live_only=False: a stored dependent counts whether or not it is still
+    # live (the recompute preview and execute walk the stored graph); one
+    # definition of the edge set, no liveness filter here (#3542).
+    return [s for s, _t, _r in dag_edge_set(
+        conn, CITATION_SUPPORT_RELATIONS, live_only=False, target_id=node_id)]
 
 
 def recompute_confidence(phase: str, node_id: str,

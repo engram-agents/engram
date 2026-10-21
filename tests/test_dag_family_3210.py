@@ -60,7 +60,8 @@ def _mem():
     conn.row_factory = sqlite3.Row
     conn.execute(
         "CREATE TABLE nodes (id TEXT PRIMARY KEY, type TEXT NOT NULL, "
-        "is_current INTEGER DEFAULT 1, superseded_by TEXT, created_at TEXT)"
+        "is_current INTEGER DEFAULT 1, status TEXT DEFAULT 'active', "
+        "superseded_by TEXT, created_at TEXT)"
     )
     conn.execute(
         "CREATE TABLE edges (id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -507,9 +508,11 @@ def test_population_counts_report_dropped_edges():
     _e(conn, "n", "o", "derives_from")       # resolves to n -> n: manufactured
     _e(conn, "n", "dead", "derives_from")    # dead-ended chain
     g = dagconf.check_dag_conformance(conn)["families"]["grounding"]
+    # #3542: the gate counts current edges only -- both edges touch a
+    # non-current endpoint (o superseded, dead retired), so both are dropped as
+    # provenance; the resolution-specific counters no longer exist on the gate.
     assert g["raw_edges"] == 2 and g["edges"] == 0, g
-    assert g["dropped_manufactured_self_loops"] == 1, g
-    assert g["dropped_dead_ended"] == 1, g
+    assert g["dropped_non_current"] == 2, g
 
 
 # ---------------------------------------------------------------------------

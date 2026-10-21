@@ -544,7 +544,22 @@ def test_live_node_predicate_has_one_source():
     import re
     src_dir = Path(engram_core.__file__).resolve().parent
     pat = re.compile(r"is_current\s*=\s*1\s+AND\s+[\w{}.]*status\s*!=\s*'retracted'")
-    core_hits = pat.findall((src_dir / "engram_core.py").read_text())
+    core_text = (src_dir / "engram_core.py").read_text()
+    # #3542: the six fixed dag_edge_set SQL templates are LITERALS (the owner read
+    # registry's scanner admits nothing built at import time), so three of them
+    # carry the live-node text by necessity. They are exempt here ONLY because
+    # tests/test_edge_liveness_ssot_3542.py pins each, character for character, to
+    # what _CURRENT_EDGE_PREDICATE (built on _LIVE_NODE_PREDICATE) generates.
+    import ast
+    original_text = core_text
+    tree = ast.parse(core_text)
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id.startswith("_DAG_EDGES_")
+                and node.targets[0].id.endswith("_SQL")):
+            core_text = core_text.replace(ast.get_source_segment(original_text, node), "")
+    core_hits = pat.findall(core_text)
     rev_hits = pat.findall((src_dir / "engram_revision.py").read_text())
     assert len(core_hits) == 1, core_hits
     assert rev_hits == [], rev_hits
