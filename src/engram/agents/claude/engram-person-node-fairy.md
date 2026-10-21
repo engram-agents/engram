@@ -206,23 +206,40 @@ master keeps at `~/.engram/dream/person-fairy-known.json` (under `$ENGRAM_HOME`,
   {"key": "P1:<canonical person>", "variants": ["<author key>", "..."],
    "status": "awaiting-ruling", "count_at_ruling": 12,
    "reason": "<one line>", "ruling_ref": "<free text: where the pending ruling lives on this seat>",
-   "since": "<ISO date>"}
+   "since": "<ISO date>"},
+  {"key": "P2:<author key>", "status": "declined", "count_at_ruling": 5,
+   "reason": "<one line>", "ruling_ref": "<free text>", "since": "<ISO date>"}
 ]}
 ```
 
-- `key` is `P1:<canonical person>` or `P3:<dangling pn_ id>` (the category,
-  then the thing the finding is about). A P3 key carries the `pn_` id the
-  stamps point to, never the id of a stamped node. Matching is exact-string, not case- or
-  whitespace-normalised. `status` is `awaiting-ruling` or `declined`. Node ids
-  are install-local, so the ledger lives on the seat, never in this spec.
-  `count_at_ruling` is the int number of stamps (P1) or stamped nodes (P3) the
-  finding had when the master ruled.
+- `key` is `P1:<canonical person>`, `P2:<author key>` or `P3:<dangling pn_ id>`
+  (the category, then the thing the finding is about). A P3 key carries the
+  `pn_` id the stamps point to, never the id of a stamped node. Matching is
+  exact-string, not case- or whitespace-normalised. `status` is
+  `awaiting-ruling` or `declined`. Node ids are install-local, so the ledger
+  lives on the seat, never in this spec. `count_at_ruling` is an int, counted
+  per category as the P1, P2 and P3 bullets below say.
 - **P1 keys name a CLUSTER, not one variant.** The canonical person is the
   `pn_` id or, when there is none, the most-stamped key. The entry's
   `variants` list holds the cluster's author keys, sorted. A current P1 finding
   matches an entry only if the finding's variant set is a SUBSET of the stored
   `variants`. A new variant makes it a fresh finding, reported normally with a
   note that a ledger entry exists for the rest of the cluster.
+  For a P1 entry, `count_at_ruling` is the number of stamps whose author key is
+  in the entry's `variants` and is NOT the canonical key, where the canonical
+  key is the `pn_` id or, when there is none, the most-stamped key. The stored
+  `variants` list includes the canonical key, so it is not the counted set by
+  itself. You compute the current N for a P1 entry exactly as the writer
+  computes `count_at_ruling` (stamps under the entry's non-canonical variants
+  only), so growth means a new mis-keyed stamp.
+- **P2 keys name a personless recurring author.** A P2 key is `P2:<author key>`,
+  and its `count_at_ruling` is the number of stamped nodes for that author key.
+  `status` works as for the other categories, and `declined` is the expected
+  common case, for example a cited outside author for whom minting a person
+  node is declined. A ledgered P2 is listed under `## Known, awaiting ruling`
+  instead of being re-reported.
+- A P3 entry's `count_at_ruling` is the number of stamped nodes whose stamp
+  points at the dangling `pn_` id.
 - **P5 is never ledgered.** P5 reports a rate, not per-mention findings, so
   there is nothing per-mention to re-adjudicate; its rate line is a measurement
   printed every run.
