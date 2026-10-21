@@ -57,11 +57,19 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # CPU torch first (#4004, same shape as nightly.yml): the runner has no GPU,
+          # and the CUDA stack that sentence-transformers pulls in through torch is
+          # ~3G of downloads. Only torch comes from the PyTorch CPU index; the -r
+          # install below, from PyPI alone, finds torch already satisfied.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements/requirements-dev.txt
           # src/forum/tests/ imports forum.server (Flask + bleach + markdown-it-py
           # + beautifulsoup4 + html5lib); those deps live in src/forum/requirements.txt.
           # Without this, forum-touching PRs select forum tests but fail on import.
           pip install -r src/forum/requirements.txt
+          # Guard (#4004): CPU torch is the repo rule (requirements-lock.txt header);
+          # fail loudly if a CUDA stack came back.
+          python3 tools/check_no_cuda_wheels.py
 
       - name: Run affected tests
         run: |
