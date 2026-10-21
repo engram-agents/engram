@@ -224,6 +224,58 @@ def _append_nap_to_history(message: str) -> dict:
         return {"written": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
+# #2732 (G): the ONE mask every `PRAGMA optimize` ENGRAM issues uses. 0xffee is SQLite's
+# default 0xfffe minus bit 0x00010. From https://www.sqlite.org/pragma.html#pragma_optimize,
+# bit 0x00010: "When running ANALYZE, set a temporary PRAGMA analysis_limit to prevent excess
+# run-time. On by default." That bit makes the ANALYZE that optimize triggers write SAMPLED
+# statistics. Measured 2026-10-21 (60k rows, index on a 2-value column, true 30000 rows/key):
+# SQLite 3.53.0, new index: default optimize -> idx_cur '60000 2001', 0xffee -> stays
+# '60000 30000'; after 10x growth with stats present: default '66000 2001', 0xffee
+# '66000 33000'. No-op on SQLite < 3.46.0 (measured 3.45.1: no sampling either way, and
+# 10x growth is not refreshed by optimize at all -- step C is the only fix there).
+# PRECONDITION of the 10-fold trigger (https://www.sqlite.org/pragma.html#pragma_optimize,
+# "Determination Of When To Run Analyze"): optimize re-analyzes a table only if (i) mask bit
+# 0x02 is set, (ii) it is an ordinary table, (iii) at least one of: bit 0x10000 is set, an
+# index of the table has no sqlite_stat1 row, or the query planner used sqlite_stat1 for one
+# of its indexes during the current connection, and (iv) at least one of: an index has no
+# stat1 row, or the row count changed 10-fold since the last ANALYZE. So optimize never acts
+# on a connection that has not first planned a query over the table. The nap checkpoint's
+# connection does so before its optimize: many statements on it plan a nodes query through an
+# index, which makes the planner use that index's stat1 row (traced 2026-10-21 on SQLite
+# 3.53.0: the stats block's two `WHERE is_current = 1` counts at the top of _checkpoint_internal
+# are the first of about 27 such statements, each of which arms it alone; full-scan statements
+# like `COUNT(*) FROM nodes` and `WHERE recall_turn = ?` do NOT). tests/test_planner_stats_2732.py
+# S9 fails loudly only if NONE of them does any longer (it asserts the stat row count equals the
+# grown total); it does not pin any one statement. Measured only on 4k-to-40k-row tables; a nap that crosses 10x growth on a much larger table
+# now pays a full ANALYZE (G removes sampling from the trigger, it does not remove the trigger).
+_OPTIMIZE_MASK = 0xFFEE
+
+
+def _index_lacks_stats_on_nonempty_table(conn) -> bool:
+    """#2732 gate B: does any explicit index of a NON-EMPTY table have no sqlite_stat1 row?
+
+    Requires sqlite_stat1 to exist (the caller checks that first; the seed gate
+    covers its absence). Indexes are read from sqlite_master, never listed by
+    hand. ``sql IS NOT NULL`` keeps explicit indexes only: sqlite_autoindex_*
+    (PK/UNIQUE autoindexes, and the fts5/vec0 shadow tables' own) have
+    ``sql IS NULL`` and never change after table creation. ANALYZE writes no
+    row for an EMPTY table's indexes at all, so a gate over every index would
+    fire on every nap forever (measured on a real-shaped store: 17 explicit
+    indexes of empty tables lack a row after a full ANALYZE) -- hence the
+    per-table non-empty probe.
+    """
+    for tbl, _name in conn.execute(
+        "SELECT m.tbl_name, m.name FROM sqlite_master m "
+        "WHERE m.type='index' AND m.sql IS NOT NULL "
+        "AND NOT EXISTS (SELECT 1 FROM sqlite_stat1 s "
+        "WHERE s.tbl = m.tbl_name AND s.idx = m.name)"
+    ).fetchall():
+        quoted = '"' + str(tbl).replace('"', '""') + '"'
+        if conn.execute(f"SELECT 1 FROM {quoted} LIMIT 1").fetchone():
+            return True
+    return False
+
+
 def _checkpoint_internal(message: str, advance_turn: bool) -> str:
     """Internal checkpoint logic shared by engram_checkpoint (formerly
     engram_nap) and engram_advance_turn.
@@ -432,22 +484,53 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
         # is NOT true on 3.45.1: after a 16x row growth the seeded stats stayed
         # frozen under all three variants (table queried first, fresh
         # connection, explicit 0xfffe mask), while an explicit ANALYZE on the
-        # same data updated them. Tracked as #2732; what bounds the drift today
-        # is nothing in this block, only whatever cadence re-seeds after a
-        # sqlite_stat1-absent state. The seed fixes "no statistics at all";
-        # it does not promise "statistics that stay current".
+        # same data updated them. #2732 closes that gap (below): A-C are explicit full-ANALYZE
+        # triggers, and G removes sampling from optimize's own trigger.
+        #
+        # #2732, the OTHER half (measured on SQLite 3.53.0, an 11.7k-node
+        # store): since SQLite 3.46.0 a plain PRAGMA optimize after ANY new
+        # index re-analyzes the WHOLE table under a temporary analysis limit
+        # and overwrites full statistics with SAMPLED ones (nodes.is_current
+        # ~1001 rows/key vs a true ~5854), after which the planner picks
+        # idx_nodes_current for type-filtered queries (tripwire load_tripwires
+        # 6.25 ms vs ~1 ms). Fleet roll-call 2026-10-21: 3.49.1, 3.53.0 and
+        # 3.53.4 seats sampled; five 3.45.1 seats stayed full -- so this code
+        # is deliberately NOT version-gated (the same per-process-linkage
+        # argument as above). Three explicit full, unscoped ANALYZE triggers, all run
+        # BEFORE the optimize, so in the cases they cover it finds fresh full statistics:
+        #   (A) after any migration rung -- in engram_core's ladder, not here;
+        #   (B) the seed gate, widened: sqlite_stat1 absent OR any explicit index
+        #       of a non-empty table has no stat1 row (an index created outside
+        #       the ladder). Indexes are read from sqlite_master, never listed
+        #       by hand. sqlite_autoindex_* (sql IS NULL: PK/UNIQUE autoindexes
+        #       and the fts5/vec0 shadow tables' own) are excluded -- they never
+        #       change after table creation, and ANALYZE writes no row for an
+        #       EMPTY table's indexes at all, so a gate over every index fires on
+        #       every nap forever (measured on a real-shaped store: 17 explicit
+        #       indexes of empty tables lack a row after a full ANALYZE). Hence
+        #       the non-empty-table condition;
+        #   (C) once per advance_turn (sleep, ~daily), refreshing rows-grown
+        #       drift. The nap path (advance_turn=False) stays cheap and runs a
+        #       full ANALYZE only when (B) fires.
+        # (G) Not a trigger but the removal of sampling from optimize's own: the optimize runs
+        # with _OPTIMIZE_MASK (0xffee, above), so its own 10-fold re-analysis (nap path) writes
+        # FULL statistics. That trigger needs the planner to have used stat1 for `nodes` on this
+        # connection first (precondition at _OPTIMIZE_MASK); about 27 statements on this
+        # connection do, each alone, the stats block at the top of this function (`WHERE
+        # is_current = 1`, idx_nodes_current) first among them. S9 in
+        # tests/test_planner_stats_2732.py fails loudly only if none of them does any longer; it
+        # does not pin any one statement. Measured only
+        # on 4k-to-40k-row tables; a nap crossing 10x growth on a very large table pays a full
+        # ANALYZE.
         #
         # The seed is a plain, unscoped ANALYZE (deliberate -- analyzes the
         # whole schema, not just the nodes table the composite index above
-        # targets) run exactly once, gated on sqlite_stat1 not existing yet;
-        # PRAGMA optimize is SQLite's own documented low-cost maintenance
-        # form and still runs every checkpoint after the gate, unconditionally
-        # (unlike a full ANALYZE on every open, which would be wasteful at
-        # nap frequency). Best-effort as a single unit, mirrors the health
-        # snapshot block just above: a failure in the seed check or the
-        # ANALYZE must not prevent PRAGMA optimize from at least being
-        # attempted, and neither may ever break the underlying nap/
-        # advance_turn checkpoint tool this is piggybacked onto.
+        # targets); PRAGMA optimize is SQLite's own documented low-cost
+        # maintenance form and still runs every checkpoint after the gates,
+        # unconditionally. Best-effort: a failure in a gate or an ANALYZE must
+        # not prevent PRAGMA optimize from at least being attempted, and
+        # neither may ever break the underlying nap/advance_turn checkpoint
+        # tool this is piggybacked onto.
         # Two separate try/except blocks, not one -- #2685 reviewer-fairy
         # finding: a single shared block let a seed-check/ANALYZE failure
         # silently skip PRAGMA optimize too, contradicting the comment above.
@@ -457,12 +540,17 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
             _stat1_exists = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'"
             ).fetchone()
-            if not _stat1_exists:
+            # (C) advance_turn / seed (stat1 absent) / (B) a stat-less index of a non-empty table
+            _needs_full_analyze = (
+                bool(advance_turn) or not _stat1_exists
+                or _index_lacks_stats_on_nonempty_table(conn)
+            )
+            if _needs_full_analyze:
                 conn.execute("ANALYZE")
         except Exception:
             pass
         try:
-            conn.execute("PRAGMA optimize")
+            conn.execute(f"PRAGMA optimize({_OPTIMIZE_MASK:#x})")
         except Exception:
             pass
 

@@ -5511,6 +5511,31 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
                 file=sys.stderr,
             )
 
+    # #2732 (A): a rung that landed leaves its new index (or any DDL) with no
+    # planner statistics, and the next plain `PRAGMA optimize` -- which every
+    # checkpoint runs -- then re-analyzes that WHOLE table under SQLite's
+    # temporary analysis limit (>= 3.46.0), replacing full statistics with
+    # sampled ones (nodes.is_current: ~1001 rows/key vs a true ~5854 on a 11.7k
+    # store). So run one full, unscoped ANALYZE on this connection before the
+    # ladder returns. "A rung landed" = the LIVE version moved off the cached one
+    # read at the top; a run that applies no rung runs no ANALYZE, so an
+    # up-to-date open stays cheap. An EMPTY nodes table is skipped: there is
+    # nothing to sample and a never-analyzed fresh store is a stated state
+    # (the first checkpoint seeds it). Best-effort: a failure here must never
+    # break startup (the checkpoint's own gate B re-covers it).
+    try:
+        if (conn.execute("PRAGMA user_version").fetchone()[0] != current_user_version
+                and conn.execute("SELECT 1 FROM nodes LIMIT 1").fetchone() is not None):
+            conn.commit()
+            conn.execute("ANALYZE")
+            conn.commit()
+    except sqlite3.DatabaseError as _analyze_err:
+        print(
+            "[_run_db_one_time_setup] post-migration ANALYZE (#2732) FAILED, "
+            f"the next checkpoint re-covers it: {_analyze_err!r}",
+            file=sys.stderr,
+        )
+
     # Self-heal: at user_version >= 7 the guard must exist. Re-created every
     # startup (IF NOT EXISTS) so a trigger lost to a hand edit is restored.
     if conn.execute("PRAGMA user_version").fetchone()[0] >= 7:
