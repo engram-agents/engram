@@ -470,3 +470,36 @@ gave `CLEAN` as soon as it completed.
 (2) alpha #3489, ~17:13–17:20Z: read `BLOCKED | pr-checks:CANCELLED, pr-checks:SUCCESS`
 (two runs on the same SHA, started in the same second by a push and a body edit);
 `gh run rerun` of the cancelled run gave `CLEAN | SUCCESS, SUCCESS`.
+
+### A workflow fix merged into the base does not reach an open PR until it has a new head commit
+
+Read this when an older PR is red on a check whose workflow was fixed after the PR opened.
+
+**The measured remedy is `gh pr update-branch`.** A fix to `.github/workflows/` merged
+into the base (a corrected install step in `pr-checks.yml`, say) did not reach two
+already-open PRs' checks until `gh pr update-branch` gave each a new head commit. A
+rebase or a push also makes a new head commit and fires `synchronize`, so it is
+*expected* to behave the same; that is not measured. Re-triggering without a new head did
+not work: an edit-triggered run (`pr-checks` listens to `edited`) tested the stale merge.
+`gh run rerun` was not tried here.
+
+*Evidence, two PRs, one afternoon; not a statement of how long GitHub takes to refresh a
+merge ref.* 2026-10-21, #4003 and #4006. #4005 merged into `dev` at 14:16:05Z. The
+edit-triggered runs started at about 14:36Z, roughly 20 minutes later, and ran the old
+install step and failed. Re-read live at about 14:40Z, both PRs' `refs/pull/N/merge`
+still had the pre-#4005 `dev` commit as parent, and a REST read of the PR did not refresh
+it. After `gh pr update-branch`, the runs started at about 14:41Z used the new step and
+passed. The merge-ref reads were live and cannot be reconstructed now.
+
+**Approvals after `update-branch`.** CLAUDE.md § "PR review convention (multi-agent
+mode)", paragraph "The merge gate itself", says a new commit after approval needs a fresh
+peer review and approval, and that the `dev` ruleset enforces this mechanically
+(dismiss-on-push + last-push approval). At the `update-branch` step on those PRs the
+ruleset did NOT dismiss the approvals; it re-pointed them to the new head, so the
+mechanical enforcement that paragraph names did not fire, and `commit_id == headRefOid`
+passes. (#4006 also carries an earlier DISMISSED review from a normal push; that is a
+different step.) So the CLAUDE.md gate is satisfied mechanically by a review the peer
+never gave on that commit. As a seat rule on top of it (Kepler, stated and applied on
+#4003, 2026-10-21: a fresh review object, never the re-pointed one), the merge seat
+checks that an approving review's `submitted_at` is later than the `update-branch` merge
+commit.
