@@ -8,6 +8,7 @@
   "hooks/claude/_hooklib.py:import_owner_flags",
   "hooks/claude/_hooklib.py:resolve_own_server_py_path",
   "hooks/claude/_hooklib.py:is_own_server_py_running",
+  "hooks/claude/_hooklib.py:atomic_write_text",
   "hooks/claude/_hooklib.py:atomic_write_json",
   "hooks/claude/_hooklib.py:_placeholder_overflow_path",
   "hooks/claude/_hooklib.py:_build_context_trailer",

@@ -808,9 +808,11 @@ _HELPER_DEFS = {
     # tmp is created O_EXCL|O_NOFOLLOW after an unlink (it cannot be a FIFO), and the file
     # is 0o600. Like write_route_ledger it is deliberately NOT routed through the append /
     # write helpers, which would change the mode and drop the no-follow create.
+    # atomic_write_text (#4013): its one os.open is O_CREAT|O_EXCL on a fresh random temp name
+    # beside the target, so it cannot be a FIFO; the target itself is only stat'd and replaced.
     "_hooklib.py": {"_open_regular_fd", "open_regular_text", "open_regular_text_write",
                     "open_regular_text_append", "write_route_ledger",
-                    "append_shown_record"},
+                    "append_shown_record", "atomic_write_text"},
     "engram-loop-arm-stop-hook.py": {"open_regular_text"},
     # #3658: the utility hook's byte-identical copy of the state-lock helper (its one
     # os.open is the O_CREAT lock-file open; the surface hook is allowed the same one

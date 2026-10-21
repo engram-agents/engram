@@ -40,7 +40,6 @@ import html
 import json
 import os
 import sys
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Mapping, Optional
@@ -373,26 +372,18 @@ def _write_next_due_at(path: str, marker: dict, next_due_at: str) -> None:
     """
     payload = dict(marker)
     payload["next_due_at"] = next_due_at
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    # `mkstemp` creates the temp 0600 and `os.replace` carries that mode onto
-    # the marker (so a first write moves it 644 -> 600); acceptable — 0600 is
-    # tighter, and the marker is single-user (#3005 review nit).
-    fd, tmp_path = tempfile.mkstemp(
-        dir=directory, prefix=".loop-mode.", suffix=".tmp"
+    # The shared mode- and group-preserving writer (#4013).  Core modules sit at the package root
+    # in BOTH layouts (src/engram/ and the deployed plugin root); imported lazily, as in
+    # default_marker_path, so importing this module (the hooks do) never gains a failure point.
+    pkg_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if pkg_root not in sys.path:
+        sys.path.insert(0, pkg_root)
+    from engram_config_io import atomic_write_text
+
+    atomic_write_text(
+        path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+        follow_symlinks=False,
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, indent=2, ensure_ascii=False))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
 
 
 def _rearm_main(args: argparse.Namespace) -> int:
