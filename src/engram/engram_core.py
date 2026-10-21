@@ -2519,6 +2519,30 @@ def _init_git():
         GIT_TIMEOUT = saved_timeout
 
 
+# The canonical .gitignore lines for an ENGRAM_HOME (see _ensure_engram_gitignore for the rationale of each).
+# Public: tests and tools import it rather than keep a copy.
+ENGRAM_GITIGNORE_PATTERNS = [
+    "*.db",
+    "*.db-shm",
+    "*.db-wal",
+    "*.db-journal",
+    "*?mode=*",
+    "*.bak",
+    "*.bak.*",
+    "config.json.bak*",
+    "*.backfill-snapshot-*",
+    "*.log",
+    "marketplace/",
+    "venv/",
+    "__pycache__/",
+    "*.pyc",
+    "db-backup/",
+    "claude-projects-archive/",
+    "session-logs-archive/",
+    "session_log.md",
+]
+
+
 def _ensure_engram_gitignore(data_dir: "Path") -> None:
     """Write (or refresh) DATA_DIR/.gitignore with the canonical ENGRAM patterns.
 
@@ -2571,7 +2595,7 @@ def _ensure_engram_gitignore(data_dir: "Path") -> None:
     diary/diary.db negation — NOT in this canonical list, investigated 2026-08-15:
     at least one deployed .gitignore hand-adds `!diary/diary.db` (a 32K static
     derived store _commit_snapshot stages alongside the diary entries) to un-ignore
-    it against the *.db rule above. That negation is NOT part of _GITIGNORE_PATTERNS
+    it against the *.db rule above. That negation is NOT part of ENGRAM_GITIGNORE_PATTERNS
     and was never meant to be canonical — see the comment on that negation for why
     (a structural fix in _commit_snapshot's own staging, landed separately, makes
     the negation no longer load-bearing: gitignored files are filtered out of
@@ -2585,35 +2609,15 @@ def _ensure_engram_gitignore(data_dir: "Path") -> None:
     `!`-prefixed lines across a rewrite (see above) closes that gap generically rather
     than hardcoding this one filename.
     """
-    _GITIGNORE_PATTERNS = [
-        "*.db",
-        "*.db-shm",
-        "*.db-wal",
-        "*.db-journal",
-        "*?mode=*",
-        "*.bak",
-        "*.bak.*",
-        "config.json.bak*",
-        "*.backfill-snapshot-*",
-        "*.log",
-        "marketplace/",
-        "venv/",
-        "__pycache__/",
-        "*.pyc",
-        "db-backup/",
-        "claude-projects-archive/",
-        "session-logs-archive/",
-        "session_log.md",
-    ]
     gitignore_path = data_dir / ".gitignore"
-    canonical = "\n".join(_GITIGNORE_PATTERNS) + "\n"
+    canonical = "\n".join(ENGRAM_GITIGNORE_PATTERNS) + "\n"
     try:
         existing = ""
         if gitignore_path.exists():
             existing = gitignore_path.read_text(encoding="utf-8")
             # Check if ALL required patterns are present (exact-line match)
             existing_lines = {l.strip() for l in existing.splitlines()}
-            if all(p in existing_lines for p in _GITIGNORE_PATTERNS):
+            if all(p in existing_lines for p in ENGRAM_GITIGNORE_PATTERNS):
                 return  # Already complete — leave it alone
         # Preserve any hand-added negation lines (e.g. `!diary/diary.db`) that
         # aren't already part of the canonical set — a wholesale overwrite would
@@ -2621,7 +2625,7 @@ def _ensure_engram_gitignore(data_dir: "Path") -> None:
         # hand. See the diary/diary.db note above.
         negations = [
             l.strip() for l in existing.splitlines()
-            if l.strip().startswith("!") and l.strip() not in _GITIGNORE_PATTERNS
+            if l.strip().startswith("!") and l.strip() not in ENGRAM_GITIGNORE_PATTERNS
         ]
         content = canonical
         if negations:
@@ -2639,7 +2643,7 @@ def _ensure_engram_gitignore(data_dir: "Path") -> None:
                 file=sys.stderr,
             )
         gitignore_path.write_text(content, encoding="utf-8")
-        _untrack_gitignored_paths(data_dir, _GITIGNORE_PATTERNS)
+        _untrack_gitignored_paths(data_dir, ENGRAM_GITIGNORE_PATTERNS)
     except OSError:
         pass  # Best-effort — if we can't write it, git init still proceeds
 
