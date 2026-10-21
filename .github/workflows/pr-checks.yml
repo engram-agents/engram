@@ -1052,6 +1052,25 @@ jobs:
           python3 -m pytest tests/test_home_path_gate.py tests/test_skill_home_paths_3863.py tests/test_walguard_home_path_3863.py tests/test_tools_engram_home_3863.py tests/test_shell_engram_home_3863.py -q || rc=1
           exit $rc
 
+      # ── raw-read gate (#3863 step 1) ─────────────────────────────────────
+      # A relative ENGRAM_HOME resolves against each process's own cwd, so the one
+      # resolver (five pinned copies, AST-identical, refusing a relative value) is
+      # the only place the variable may be read raw. This step fails on a raw read
+      # (os.environ get/subscript, os.getenv) of ENGRAM_HOME in a tracked non-test,
+      # non-docs .py file under src/ or tools/, outside those five files. Today's
+      # sites sit in tools/raw_home_read_baseline.json as per-file counts that may
+      # only shrink; a fixed site is reported "shrinkable" and does not fail, and
+      # --base-sha makes a new entry or a higher count red. BLOCKING, stdlib only:
+      # one file listing plus a regex pass, well under a second, and NO pytest here
+      # (the gate's tests run in the full suite and locally), so it adds no billed
+      # minute. Ruling: Borges's ruling on #3863, 2026-10-21.
+      # tests/test_raw_home_read_gate_3863.py pins this step.
+      - name: raw ENGRAM_HOME read gate — fail on a new raw read outside the pinned resolvers (baseline may only shrink)
+        if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
+        run: |
+          BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          python3 tools/raw_home_read_gate.py --base-sha "$BASE_SHA"
+
       # ── 7d. cascade behaviour acceptance (playbox) ──────────────────────
       # The #2013 cascade machine is accepted by BEHAVIOUR: tests/cascade_
       # scenarios/ drives supersede / retract / frontier / resolve through the

@@ -5,11 +5,15 @@ AST-identical to the canonical body, `tools/_owner_read.engram_home()`, exactly 
 I/O helpers. Layers: tools (the canonical), hooks (`_hooklib.py`, which must stay self-contained),
 prompt hooks (`_prompthooklib.py`, which must keep running when `_hooklib` cannot import), and the
 shared-bin flat copies (`forum_api.py`: ia and forum run as copies in /home/agents-shared/bin with
-only that module beside them, so they cannot import `_owner_read`).
+only that module beside them, so they cannot import `_owner_read`), and (#3863 6c) the build engine
+(`src/build/engine/flows.py`, which ships as tools/engine and does not import from src/engram): five layers.
 
-  (a) TEXTUAL: the function body (docstring dropped) is AST-identical in all three files.
-  (b) BEHAVIOURAL: one cell set over all three: env set, unset, empty (= unset), relative
+  (a) TEXTUAL: the function body (docstring dropped) is AST-identical in all five files.
+  (b) BEHAVIOURAL: one cell set over all five layers: env set, unset, empty (= unset), relative
       (-> refused, naming the value), tilde (-> expanded).
+  (c) IDENTICAL REFUSAL (#3863 step 1): one relative value fed to every refusing entry point
+      (the five resolvers, the engine's ctx and upgrade_flow, the engine CLI line, engram-snapshot's line)
+      gets the same refusal text.
 """
 
 from __future__ import annotations
@@ -29,6 +33,9 @@ LAYERS = {
     "hooks": SRC / "hooks" / "claude" / "_hooklib.py",
     "prompt-hooks": SRC / "hooks" / "claude" / "_prompthooklib.py",
     "shared-bin": SRC / "tools" / "forum_api.py",
+    # #3863 6c: the build engine is its own self-contained layer (src/build/engine ships as tools/engine and
+    # does not import from src/engram), so it carries one pinned copy, in flows.py (cli.py imports it from there).
+    "build-engine": REPO / "src" / "build" / "engine" / "flows.py",
 }
 
 
@@ -62,6 +69,10 @@ def test_p2_bodies_are_ast_identical_to_the_canonical():
 
 def _load(layer: str):
     path = LAYERS[layer]
+    if layer == "build-engine":
+        # flows.py uses package-relative imports, so it cannot be exec'd by path; import it as the package
+        # tests/conftest.py already aliases (tools.engine), the way the engine's own tests do.
+        return importlib.import_module("tools.engine.flows")
     name = f"_p3863_{layer.replace('-', '_')}"
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
@@ -125,3 +136,96 @@ def test_b4_tilde_is_expanded(layer, monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("ENGRAM_HOME", "~/elsewhere")
     assert _load(layer).engram_home() == tmp_path / "elsewhere"
+
+
+# ---------------------------------------------------------------------------
+# The identical-refusal cell (#3863 step 1, round 2). Ruling:
+# Borges's ruling on #3863, 2026-10-21.
+#
+# ONE relative value goes to EVERY refusing entry point and each must refuse with the SAME text, naming
+# the value. Only the surrounding stderr prefix (a per-entry-point constant below) is normalised away; the
+# prefix is asserted too, so a path that drops or invents a prefix is also red. Each entry point is its own
+# parametrised cell, so a path that accepts the relative value reddens ONLY its own cell.
+# ---------------------------------------------------------------------------
+
+REFUSED_VALUE = "rel/dir"
+REFUSAL_TEXT = "ENGRAM_HOME must be an absolute path, got 'rel/dir'"  # the one text, pinned verbatim
+_ENGINE = "[engine] ERROR: "
+
+
+def _refusal_resolver(layer):
+    def run(monkeypatch, tmp_path, capsys):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("ENGRAM_HOME", raising=False)
+        mod = _load(layer)  # load first: _hooklib resolves the home at import (and exits 0 on a refused one)
+        monkeypatch.setenv("ENGRAM_HOME", REFUSED_VALUE)
+        with pytest.raises(ValueError) as e:
+            mod.engram_home()
+        return "", str(e.value)
+    return run
+
+
+def _refusal_cli_ctx(monkeypatch, tmp_path, capsys):
+    from tools.engine import cli
+    monkeypatch.setenv("ENGRAM_HOME", REFUSED_VALUE)
+    with pytest.raises(ValueError) as e:
+        cli._build_ctx_from_env()
+    return "", str(e.value)
+
+
+def _refusal_upgrade_flow(monkeypatch, tmp_path, capsys):
+    from tools.engine import flows
+    monkeypatch.setenv("ENGRAM_HOME", REFUSED_VALUE)
+    with pytest.raises(ValueError) as e:
+        flows.upgrade_flow()
+    return "", str(e.value)
+
+
+def _refusal_cli_main(monkeypatch, tmp_path, capsys):
+    from tools.engine import cli
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ENGRAM_HOME", REFUSED_VALUE)
+    assert cli.main(["plan", "upgrade"]) == 1
+    err = capsys.readouterr().err
+    lines = [l for l in err.splitlines() if l.strip()]
+    assert len(lines) == 1, err
+    return _ENGINE, lines[0]
+
+
+def _refusal_snapshot(monkeypatch, tmp_path, capsys):
+    import subprocess
+    env = {**os.environ, "ENGRAM_HOME": REFUSED_VALUE}
+    r = subprocess.run([sys.executable, str(SRC / "tools" / "engram-snapshot"), "--help"],
+                       cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    lines = [l for l in r.stderr.splitlines() if l.strip()]
+    assert len(lines) == 1, r.stderr
+    return "engram-snapshot: ", lines[0]
+
+
+REFUSING_ENTRY_POINTS = {
+    "tools._owner_read.engram_home": _refusal_resolver("tools"),
+    "hooks._hooklib.engram_home": _refusal_resolver("hooks"),
+    "prompt-hooks._prompthooklib.engram_home": _refusal_resolver("prompt-hooks"),
+    "shared-bin.forum_api.engram_home": _refusal_resolver("shared-bin"),
+    "build-engine.flows.engram_home": _refusal_resolver("build-engine"),
+    "build-engine.cli._build_ctx_from_env": _refusal_cli_ctx,
+    "build-engine.flows.upgrade_flow": _refusal_upgrade_flow,
+    "build-engine.cli.main (stderr line)": _refusal_cli_main,
+    "engram-snapshot (stderr line)": _refusal_snapshot,
+}
+
+
+@pytest.mark.parametrize("entry", list(REFUSING_ENTRY_POINTS))
+def test_r1_every_refusing_entry_point_gives_the_identical_refusal(entry, monkeypatch, tmp_path, capsys):
+    """Mutation (run in the round-2 report): make ONE path accept the relative value -> only that entry's
+    cell is red, every other cell stays green."""
+    prefix, text = REFUSING_ENTRY_POINTS[entry](monkeypatch, tmp_path, capsys)
+    assert text.startswith(prefix), (entry, text)
+    assert text[len(prefix):] == REFUSAL_TEXT, (entry, text)
+    assert REFUSED_VALUE in text[len(prefix):]
+
+
+def test_r2_the_cell_covers_every_layer_in_the_parity_table():
+    covered = {name.split(".")[0] for name in REFUSING_ENTRY_POINTS}
+    assert set(LAYERS) <= covered, set(LAYERS) - covered

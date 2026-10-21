@@ -58,6 +58,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from .deploy_tag import refresh_and_check_deployable_tag_at
@@ -82,6 +83,19 @@ def _substrate_marker_path(engram_home: str) -> str:
     used by _load_engram_config below.
     """
     return os.path.join(engram_home, _SUBSTRATE_MARKER_FILENAME)
+
+
+def engram_home() -> Path:
+    """The build engine's ENGRAM_HOME resolution (#3863 6c): $ENGRAM_HOME (default ~/.engram) when set and
+    non-empty, expanded and absolute; a RELATIVE value is refused (ValueError naming it). A copy of the
+    canonical src/engram/tools/_owner_read.engram_home() body, pinned AST-identical by
+    tests/test_engram_home_parity_3863.py (the build engine ships as tools/engine and does not import
+    from src/engram, so it is its own self-contained layer)."""
+    raw = os.environ.get("ENGRAM_HOME") or "~/.engram"
+    home = os.path.expanduser(raw)
+    if not os.path.isabs(home):
+        raise ValueError("ENGRAM_HOME must be an absolute path, got %r" % (raw,))
+    return Path(os.path.abspath(home))
 
 
 def _read_substrate_marker(engram_home: str) -> "dict | None":
@@ -272,7 +286,7 @@ def upgrade_flow() -> list[Step]:
     # or the ENGRAM_HOME default — the same resolution _build_ctx_from_env uses.
     # Tests override this by passing a fake engram_home in ctx; the check/verify
     # lambdas inside the step always use ctx["engram_home"], so fake dirs work.
-    _default_engram_home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
+    _default_engram_home = str(engram_home())  # a RELATIVE env value raises ValueError (#3863 6c)
 
     return [
         # ── Step substrate-health [operator] ─────────────────────────────

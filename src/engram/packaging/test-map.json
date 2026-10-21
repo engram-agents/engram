@@ -352,6 +352,11 @@
       "note": "standalone stdlib CLI (not import-reachable); dedicated test plants each enumerated hard-coded-home spelling in scratch git repos (line-level: the token on another line does not rescue) and checks the schema-2 baseline rules (new violator, count above/below, stale, dangling, growth vs a base commit, classed allowlist, schema 1 on the head); the only real-tree test asserts the ratchet is green (#3863)"
     },
     {
+      "path_prefix_or_glob": "tools/raw_home_read_gate.py",
+      "test_globs": ["tests/test_raw_home_read_gate_3863.py", "tests/test_engram_home_parity_3863.py"],
+      "note": "standalone stdlib CLI (not import-reachable); #3863 step 1 round 2. The dedicated test loads it by path and plants raw ENGRAM_HOME reads in scratch git repos (new site, above/below baseline, growth vs a base commit, the five pinned resolver files exempt, tests/docs/markdown/symlinks not scanned, abspath/resolve lines still red), and pins the pr-checks step and the tiers entries. The parity test pins the five resolver files the gate exempts."
+    },
+    {
       "path_prefix_or_glob": "tools/cohort_dispatch.py",
       "test_globs": [
         "tests/test_cohort_dispatch.py",

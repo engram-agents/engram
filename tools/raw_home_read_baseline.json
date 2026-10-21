@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "scan_prefixes": [
+    "src/",
+    "tools/"
+  ],
+  "baseline": {
+    "src/engram/bootstrap.py": 1,
+    "src/engram/engram_client.py": 1,
+    "src/engram/engram_core.py": 2,
+    "src/engram/engram_log_emitter.py": 2,
+    "src/engram/engram_log_indexer.py": 1,
+    "src/engram/engram_telemetry_store.py": 1,
+    "src/engram/engram_telemetry_verdicts.py": 1,
+    "src/engram/engramd_client.py": 1,
+    "src/engram/engramd_owner.py": 1,
+    "src/engram/hooks/claude/_stale_tree_hooklib.py": 1,
+    "src/engram/hooks/claude/_stophooklib.py": 1,
+    "src/engram/hooks/claude/engram-lesson-tripwire-hook.py": 2,
+    "src/engram/hooks/claude/engram-loop-arm-stop-hook.py": 2,
+    "src/engram/hooks/claude/engram-stale-tree-warn-hook.py": 2,
+    "src/engram/hooks/claude/engram-time-bar-hook.py": 2,
+    "src/engram/server.py": 1,
+    "src/engram/tools/ack_recompute_sweep.py": 1,
+    "src/engram/tools/baton-migrate-to-coord-store.py": 1,
+    "src/engram/tools/baton_gate.py": 1,
+    "src/engram/tools/cites_step3.py": 1,
+    "src/engram/tools/codex-umwelt-wake.py": 1,
+    "src/engram/tools/compact-request.py": 1,
+    "src/engram/tools/dream_pickup.py": 1,
+    "src/engram/tools/erase_session_block.py": 1,
+    "src/engram/tools/inspect_raw.py": 1,
+    "src/engram/tools/set_forum_url.py": 1,
+    "src/engram/tools/supervision_probe.py": 1,
+    "src/engram/tools/surgical.py": 1,
+    "src/engram/tools/write_sleep_marker.py": 1,
+    "src/engram/viz/agents.py": 2,
+    "src/engram/viz/version_info.py": 1,
+    "tools/borges_session_eval.py": 1,
+    "tools/engram-backfill-special-moment-edges.py": 1,
+    "tools/engramd_a6_latency.py": 3,
+    "tools/home_path_gate.py": 1,
+    "tools/perf/bench_in_turn_recall.py": 2,
+    "tools/probes/mods-recall/novel_terms.py": 1,
+    "tools/propose-generalizes-migration.py": 1,
+    "tools/rc-upgrade-verify.py": 1,
+    "tools/recall_measurement_harness.py": 1,
+    "tools/recall_repetition_analysis.py": 1,
+    "tools/ws4/extract_spans.py": 1
+  },
+  "allowlist": {
+    "src/engram/tools/_owner_read.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/hooks/claude/_hooklib.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/hooks/claude/_prompthooklib.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/tools/forum_api.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/build/engine/flows.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    }
+  }
+}

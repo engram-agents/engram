@@ -314,7 +314,9 @@ def _build_ctx_from_env() -> dict:
 
     Used by the CLI when no --ctx-file is provided.  Callers may augment.
     """
-    engram_home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
+    from .flows import engram_home as _resolve_engram_home
+
+    engram_home = str(_resolve_engram_home())  # a RELATIVE env value raises ValueError (#3863 6c)
     # source_dir: try .deployed-version first, fallback to cwd
     source_dir = os.getcwd()
     dv_path = os.path.join(engram_home, ".deployed-version")
@@ -337,6 +339,23 @@ def _build_ctx_from_env() -> dict:
 # ---------------------------------------------------------------------------
 # plan subcommand
 # ---------------------------------------------------------------------------
+
+
+def _steps_and_ctx(flow_name: str):
+    """(steps, ctx) for a flow, or None after ONE stderr line when ENGRAM_HOME is a relative path (#3863 6c).
+
+    Both env reads of ENGRAM_HOME (upgrade_flow and _build_ctx_from_env) raise ValueError for a relative
+    value. The catch is `except ValueError`, so ANY ValueError from either call prints one `[engine] ERROR:`
+    line and returns None, not only that refusal (a `.deployed-version` with invalid UTF-8 raises
+    UnicodeDecodeError, a ValueError subclass, and takes the same path). Other exceptions are not caught.
+    """
+    try:
+        steps = _resolve_flow(flow_name)
+        ctx = _build_ctx_from_env()
+    except ValueError as exc:
+        print(f"[engine] ERROR: {exc}", file=sys.stderr)
+        return None
+    return steps, ctx
 
 
 def plan_command(args: list[str]) -> int:
@@ -367,8 +386,10 @@ def plan_command(args: list[str]) -> int:
         )
         return 1
 
-    steps = _resolve_flow(parsed.flow)
-    ctx = _build_ctx_from_env()
+    resolved = _steps_and_ctx(parsed.flow)
+    if resolved is None:
+        return 1
+    steps, ctx = resolved
 
     from .flows import plan_flow
 
@@ -448,8 +469,10 @@ def run_command(args: list[str]) -> int:
         )
         return 1
 
-    steps = _resolve_flow(parsed.flow)
-    ctx = _build_ctx_from_env()
+    resolved = _steps_and_ctx(parsed.flow)
+    if resolved is None:
+        return 1
+    steps, ctx = resolved
     ctx["ack_changeset"] = bool(parsed.ack_changeset)
     ctx["allow_branch"] = bool(parsed.allow_branch)
     ctx["allow_untagged"] = bool(parsed.allow_untagged)
@@ -522,8 +545,10 @@ def doctor_command(args: list[str]) -> int:
         )
         return 1
 
-    steps = _resolve_flow(parsed.flow)
-    ctx = _build_ctx_from_env()
+    resolved = _steps_and_ctx(parsed.flow)
+    if resolved is None:
+        return 1
+    steps, ctx = resolved
 
     from .steps import run_doctor
 

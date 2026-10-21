@@ -797,6 +797,18 @@
       "note": "engram-alpha#3863 (PR 1): the checked-in baseline + (empty) allowlist read by tools/home_path_gate.py. Tiered with the gate it feeds (dev, T3): one inseparable unit. Real data file directly under repo-root tools/, so 'source' is set explicitly."
     },
     {
+      "path": "tools/raw_home_read_gate.py",
+      "tier": "dev",
+      "source": "tools/raw_home_read_gate.py",
+      "note": "engram-alpha#3863 (step 1, round 2): the pr-checks gate that fails on a NEW raw ENGRAM_HOME environment read (environ get, subscript or getenv) in tracked src/ and tools/ .py files outside the five pinned resolver files; today's sites sit in tools/raw_home_read_baseline.json, which may only shrink. Developer tier (T3): a repo-maintenance gate for ENGRAM development, run by pr-checks over the source tree; no install ever needs it, same reasoning as tools/home_path_gate.py. Real file directly under repo-root tools/, so 'source' is set explicitly."
+    },
+    {
+      "path": "tools/raw_home_read_baseline.json",
+      "tier": "dev",
+      "source": "tools/raw_home_read_baseline.json",
+      "note": "engram-alpha#3863 (step 1, round 2): the checked-in per-file baseline + pinned-resolver allowlist read by tools/raw_home_read_gate.py. Tiered with the gate it feeds (dev, T3): one inseparable unit. Real data file directly under repo-root tools/, so 'source' is set explicitly."
+    },
+    {
       "path": "tools/recall_repetition_analysis.py",
       "tier": "dev",
       "source": "tools/recall_repetition_analysis.py",
