@@ -7,7 +7,7 @@ function calling (Gemini, OpenAI, Ollama, Anthropic, etc.). No MCP needed.
 Usage:
     from engram_client import EngramClient
 
-    client = EngramClient(db_dir="~/.engram/eval-run-1")
+    client = EngramClient(db_dir="~/.engram/eval-run-1")  # ($ENGRAM_HOME)
     
     # Get tool declarations for your LLM
     gemini_tools = client.gemini_tool_declarations()
@@ -59,17 +59,17 @@ def is_multi_agent_mode() -> bool:
 
 
 def is_forum_configured() -> bool:
-    """Return True if forum is explicitly configured (url or agent_name set).
+    """Return True if a forum is configured: ``forum.url`` is a non-empty string.
 
     Baton/letter/forum are symmetric for any agent, alone on its host or not,
-    once a forum is configured — this is the check that actually gates them,
-    independent of the (separate, topology-only) mode field above.
+    once a forum is configured; independent of the (topology-only) mode field.
+    ``agent_name`` alone is identity, not configuration; any other shape (non-dict
+    config/forum, non-string or blank url) is "not configured". As ia/baton/hooks.
     """
     config = _load_engram_config()
-    forum_cfg = config.get("forum", {})
-    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
-    has_agent = bool(config.get("agent_name", "").strip())
-    return has_url or has_agent
+    forum_cfg = config.get("forum") if isinstance(config, dict) else None
+    url = forum_cfg.get("url") if isinstance(forum_cfg, dict) else None
+    return isinstance(url, str) and bool(url.strip())
 
 
 def get_counterparts() -> list[str]:
@@ -117,7 +117,7 @@ TOOL_SCHEMAS = {
     "engram_query": {
         "description": "First-class voluntary semantic-recall (autonoetic intentional-search complement to engram_surface's ambient/noetic auto-surfacing). Use when you want to recall something specifically. Combines FTS5 keyword + semantic similarity; returns tiered {id,summary}/{id,keywords} shape; refreshes recall on matched nodes. Use engram_inspect for full content on any result.",
         "parameters": {
-            "payload_json": {"type": "string", "description": "JSON object (as a string) with query fields. Required: query (str — natural language search query). Optional: types (str — comma-separated node types to filter, e.g. 'derivation,observation_factual'; empty = all types), min_confidence (float — minimum confidence threshold 0.0–1.0, default 0.0), include_superseded (bool — include non-current/superseded nodes, default False), top_k (int — max results to return, default 10), summary_top_k (int — top-N results returned with recall_summary (Tier 1); remainder get recall_keywords only (Tier 2); default 3; ignored when return_debug=True), return_debug (bool — if True, return full legacy shape with composite_score and ranking internals for eval/harness use; suppresses tiered render; default False).", "required": True},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with query fields. Required: query (str — natural language search query). Optional: types (str — comma-separated node types to filter, e.g. 'derivation,observation_factual'; empty = all types; evidence nodes are never search results, use engram_list with node_type=evidence to list them), min_confidence (float — minimum confidence threshold 0.0–1.0, default 0.0), include_superseded (bool — include non-current/superseded nodes, default False), top_k (int — max results to return, default 10), summary_top_k (int — top-N results returned with recall_summary (Tier 1); remainder get recall_keywords only (Tier 2); default 3; ignored when return_debug=True), return_debug (bool — if True, return full legacy shape with composite_score and ranking internals for eval/harness use; suppresses tiered render; default False), refresh_recall (bool — default True; False = measurement mode: results and ranking identical, but surfaced nodes are NOT re-stamped; a person node's special_moment render is also skipped, since it writes; for probes and harnesses, never for ordinary recall).", "required": True},
         },
     },
     "engram_query_pattern": {
@@ -142,7 +142,7 @@ TOOL_SCHEMAS = {
     "engram_derive": {
         "description": "Create a derived claim by combining evidence from existing nodes. You MUST specify reasoning_type to classify the argument. Types: deductive_modus_ponens (0.98), deductive_modus_tollens (0.98), deductive_hypothetical_syllogism (0.98), deductive_disjunctive (0.98), deductive_reductio (0.98), deductive_conjunction (0.98), inductive_generalization (0.95, corroborative), inductive_enumeration (0.93, corroborative), inductive_statistical (0.90), inductive_causal (0.85), inductive_analogy (0.70), abductive_best_explanation (cap 0.80), abductive_elimination (cap 0.90), authority_expert (0.95), authority_consensus (0.98, corroborative). Single-payload signature — pass all fields as one JSON object string in payload_json. Required: claim, supporting_ids, logical_chain.",
         "parameters": {
-            "payload_json": {"type": "string", "description": "JSON object (as a string) with derive fields. Required: claim (the atomic falsifiable claim), supporting_ids (comma-separated claim-bearing node IDs), logical_chain (explicit reasoning connecting premises to conclusion). Optional: reasoning_type (one of deductive_modus_ponens/deductive_modus_tollens/deductive_hypothetical_syllogism/deductive_disjunctive/deductive_reductio/deductive_conjunction/inductive_generalization/inductive_enumeration/inductive_statistical/inductive_analogy/inductive_causal/abductive_best_explanation/abductive_elimination/authority_expert/authority_consensus — determines confidence computation), derivation_mode (LEGACY — use reasoning_type instead; chain or corroboration), context_ids (comma-separated 'cites' edges for definitions etc., not derives_from), use_stale (bool — RETIRED per #2324: accepted but INERT, stale premises block unconditionally; passing it only returns a use_stale_retired notice), use_contested (bool — opt-in MECH-5 contradicted-premise override, #1654; set True only when deliberately building on a premise under an open unresolved contradiction, e.g. the derivation that will resolve it; auto-stamps metadata.built_on_contested, never author-supplied), warrant (str — optional Toulmin bridging principle; the general principle that licenses this inference — why do these premises support this claim? Leave blank if logical_chain fully captures it).", "required": True},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with derive fields. Required: claim (the atomic falsifiable claim), supporting_ids (comma-separated claim-bearing node IDs), logical_chain (explicit reasoning connecting premises to conclusion). Optional: reasoning_type (one of deductive_modus_ponens/deductive_modus_tollens/deductive_hypothetical_syllogism/deductive_disjunctive/deductive_reductio/deductive_conjunction/inductive_generalization/inductive_enumeration/inductive_statistical/inductive_analogy/inductive_causal/abductive_best_explanation/abductive_elimination/authority_expert/authority_consensus — determines confidence computation), derivation_mode (LEGACY — use reasoning_type instead; chain or corroboration), context_ids (comma-separated context references written as 'about' edges for definitions etc., not derives_from; cites is observation->evidence only), use_stale (bool — RETIRED per #2324: accepted but INERT, stale premises block unconditionally; passing it only returns a use_stale_retired notice), use_contested (bool — opt-in MECH-5 contradicted-premise override, #1654; set True only when deliberately building on a premise under an open unresolved contradiction, e.g. the derivation that will resolve it; auto-stamps metadata.built_on_contested, never author-supplied), warrant (str — optional Toulmin bridging principle; the general principle that licenses this inference — why do these premises support this claim? Leave blank if logical_chain fully captures it).", "required": True},
         },
     },
     "engram_add_axiom": {
@@ -200,9 +200,9 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_remove_edge": {
-        "description": "Remove a non-cascade edge between two nodes — typically for correcting over-applied `about` edges without engram-surgical. Safe whitelist: about, tensions, subtask_of, serves, exemplifies. Blocked: cites, derives_from, acknowledged_derives_from, predicted_by, supported_by, supersedes, retracts, contradicts, resolves — cites/derives_from/acknowledged_derives_from/predicted_by/supported_by are provenance-bearing (derives_from and acknowledged_derives_from are the two of the five that still carry cascade — #2357 added acknowledged_derives_from as a second cascade-bearing provenance edge; #2252 Stage 1.3 flipped supported_by's cascade flag to False and predicted_by was minted cascade:False from the start, W6 — this module doesn't import engram_core, so this list is hand-maintained, not derived from EDGE_CLASSIFICATIONS' provenance flag like server.py's; keep it in sync with core.PROVENANCE_RELATIONS by hand), supersedes/retracts are structural mutations, contradicts/resolves are structural commitments. Idempotent: removing a non-existent edge returns success. Audit-logged in edit_history. Single-payload signature.",
+        "description": "Remove a non-cascade edge between two nodes — typically for correcting over-applied `about` edges without engram-surgical. Safe whitelist: about, tensions, subtask_of, serves, exemplifies, instantiates, generalizes, bears_on. Blocked: cites, derives_from, acknowledged_derives_from, predicted_by, supported_by, supersedes, retracts, contradicts, resolves — cites/derives_from/acknowledged_derives_from/predicted_by/supported_by are provenance-bearing (derives_from and acknowledged_derives_from are the two of the five that still carry cascade — #2357 added acknowledged_derives_from as a second cascade-bearing provenance edge; #2252 Stage 1.3 flipped supported_by's cascade flag to False and predicted_by was minted cascade:False from the start, W6 — this module doesn't import engram_core, so this list is hand-maintained, not derived from EDGE_CLASSIFICATIONS' provenance flag like server.py's; keep it in sync with core.PROVENANCE_RELATIONS by hand), supersedes/retracts are structural mutations, contradicts/resolves are structural commitments. Idempotent: removing a non-existent edge returns success. Audit-logged in edit_history. Single-payload signature.",
         "parameters": {
-            "payload_json": {"type": "string", "description": "JSON object (as a string) with remove_edge fields. Required: source_id (source node of the edge), target_id (target node of the edge), relation (one of: about, tensions, subtask_of, serves, exemplifies).", "required": True},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with remove_edge fields. Required: source_id (source node of the edge), target_id (target node of the edge), relation (one of: about, tensions, subtask_of, serves, exemplifies, instantiates, generalizes, bears_on).", "required": True},
         },
     },
     "engram_add_task": {
@@ -230,7 +230,7 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_resolve": {
-        "description": "Wire a 'resolves' edge from an existing claim-bearing node to a target (question, contradiction, prediction, conjecture, or goal_tension). Pure-wire as of issue #229 — does NOT create a derivation. Two-step workflow: compose the resolving derivation via engram_derive first, then call engram_resolve to wire it. When an existing canonical node already resolves the target, pass it directly. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: target_id, resolving_node_id.",
+        "description": "Wire a 'resolves' edge from an existing claim-bearing node to a target (question, contradiction, prediction, conjecture, or goal_tension). Pure-wire as of issue #229 — does NOT create a derivation. Two-step workflow: compose the resolving derivation via engram_derive first, then call engram_resolve to wire it. When an existing canonical node already resolves the target, pass it directly. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: target_id, resolving_node_id. When the target is a question wired with `bears_on` edges (#3615), the return also lists its LIVE DIRECT targets (`bears_on`) with a prompt (`bears_on_prompt`, worded as partial when the question is only partially resolved) asking whether the answer supports or weakens each; a target that is superseded, or retracted with a replacement, is never listed, but when its live replacement is a legal target the question is not yet wired to, it appears under `bears_on_hints` (+ `bears_on_hint_prompt`, #3625) with the exact engram_add_edge call, and the old edge stays as provenance; declining a hint leaves no trace, so resolving the question again re-hints the same replacement; the replacement is found by following supersede or retract chains, with one hint per replacement; non-current targets that produced no hint are counted in `bears_on_omitted_noncurrent`; if computing the surfacing fails after the resolve committed, the resolve still succeeds and the return carries `bears_on_hint_error` instead; engram_resolve itself changes none of their confidence.",
         "parameters": {
             "payload_json": {"type": "string", "description": "JSON object (as a string) with resolve fields. Required: target_id (qu_/ct_/pr_/cj_/gt_ node ID), resolving_node_id (a claim-bearing node ID — observation, derivation, theory, axiom, or conjecture — that resolves the target; must be is_current=1). Optional: prediction_outcome (confirmed/partially_confirmed/refuted/partially_refuted for predictions; supported/refuted/inconclusive for conjectures).", "required": True},
         },
@@ -238,17 +238,17 @@ TOOL_SCHEMAS = {
     "engram_ask": {
         "description": "Register an open research question. Questions are NOT claim-bearing — no node can cite them as premises. Use for open-ended gaps to investigate. For specific claims to build on before proving, use kg_add_conjecture instead. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: question.",
         "parameters": {
-            "payload_json": {"type": "string", "description": "JSON object (as a string) with ask fields. Required: question (the specific, answerable question to investigate). Optional: context_ids (comma-separated relevant but insufficient node IDs), category (research / design / implementation / planning / meta), lacks (external_evidence / empirical_data / human_decision / implementation / synthesis / prerequisite).", "required": True},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with ask fields. Required: question (the specific, answerable question to investigate). Optional: context_ids (comma-separated relevant but insufficient node IDs), category (research / design / implementation / planning / meta), lacks (external_evidence / empirical_data / human_decision / implementation / synthesis / prerequisite), bears_on (comma-separated claim-bearing or contradiction node IDs the eventual answer will count for or against; STRICT unlike context_ids — any invalid id refuses the whole call and creates no question).", "required": True},
         },
     },
     "engram_supersede": {
-        "description": "Mark new_node_id as the successor of old_node_id. Purely relational — does NOT create a new node (caller creates replacement via type's canonical creation tool first). Single-payload signature — pass all fields as one JSON object string in payload_json. Required: old_node_id, new_node_id.",
+        "description": "Mark new_node_id as the successor of old_node_id. Purely relational — does NOT create a new node (caller creates replacement via type's canonical creation tool first). Single-payload signature — pass all fields as one JSON object string in payload_json. Required: old_node_id, new_node_id. When a current question has a `bears_on` edge to old_node_id, the return may carry `bears_on_hints` (+ `bears_on_hint_prompt`, #3625): read-only hints that the question may still bear on the replacement, each with the exact engram_add_edge call; the old edge stays as provenance; declining leaves no trace, so engram_resolve re-hints it each time the question is resolved. If computing them fails after the supersede committed, the supersede still succeeds and the return carries `bears_on_hint_error` instead.",
         "parameters": {
             "payload_json": {"type": "string", "description": "JSON object (as a string) with supersede fields. Required: old_node_id (the node being superseded), new_node_id (the replacement, already created via its type's canonical creation tool). Optional: supersede_reason (short rationale for the revision; lands in supersedes-edge metadata).", "required": True},
         },
     },
     "engram_retract": {
-        "description": "Retract an erroneous node and flag downstream dependents as tainted. Unlike engram_supersede (opinion evolved due to new evidence), engram_retract is for ERROR CORRECTION — the node was never valid. Retracting an observation_predictive also TERMINALLY RETRACTS (not merely taints) any prediction whose sole live evidential basis it was (#2281) — a destructive side-effect distinct from the taint the docstring describes elsewhere. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: node_id, error_type, reason, and a replacement decision (#2613).",
+        "description": "Retract an erroneous node and flag downstream dependents as tainted. Unlike engram_supersede (opinion evolved due to new evidence), engram_retract is for ERROR CORRECTION — the node was never valid. Retracting an observation_predictive also TERMINALLY RETRACTS (not merely taints) any prediction whose sole live evidential basis it was (#2281) — a destructive side-effect distinct from the taint the docstring describes elsewhere. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: node_id, error_type, reason, and a replacement decision (#2613). With a replacement_id, the return may carry `bears_on_hints` (+ `bears_on_hint_prompt`, #3625) for questions that bore on the retracted node: read-only, the agent decides whether to add the edge (declining leaves no trace, so engram_resolve re-hints it each time the question is resolved); if computing them fails after the retraction committed, the retraction still succeeds and the return carries `bears_on_hint_error` instead.",
         "parameters": {
             "payload_json": {"type": "string", "description": "JSON object (as a string) with retract fields. Required: node_id (the node to retract), error_type (one of fabricated_quote/wrong_citation/wrong_evidence/hallucinated_claim/duplicate/other), reason (human-readable explanation). A replacement decision is required-always (#2613) — supply EXACTLY ONE of: replacement_id (the replacement node's id, already created via its type's canonical creation tool — e.g. engram_add_observation for observations — before calling engram_retract; purely relational, does NOT create a new node; must be claim-bearing iff node_id is) or replacement_absent_because (one of NONE_BECAUSE_NO_SUCCESSOR/NONE_BECAUSE_DUPLICATE/NONE_BECAUSE_SUPERSEDED_ELSEWHERE/NONE_BECAUSE_UNKNOWN — the last requires replacement_absent_note).", "required": True},
         },
@@ -266,7 +266,7 @@ TOOL_SCHEMAS = {
     "engram_history": {
         "description": "Browse edit history and diagnostic snapshots. Side-effect-free.",
         "parameters": {
-            "payload_json": {"type": "string", "description": "JSON object (as a string) with history fields. All optional: mode (str — 'edits' (default) or 'diagnostics'; edits = chronological audit trail of mutations; diagnostics = metric snapshots at each checkpoint), node_id (str — filter edits to a specific node; edits mode only), action (str — filter by action type: created, reopened, resolved, retracted, stale_flagged, superseded, tainted, trust_tier_set; edits mode only), since (str — ISO timestamp — return only entries after this time), limit (int — max entries to return, default 50, max 200).", "required": True},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with history fields. All optional: mode (str — 'edits' (default) or 'diagnostics'; edits = chronological audit trail of mutations; diagnostics = metric snapshots at each checkpoint), node_id (str — filter edits to a specific node; edits mode only), action (str — filter by action type: created, prediction_decomposed, reopened, resolved, retracted, stale_flagged, superseded, tainted, trust_tier_set; edits mode only), since (str — ISO timestamp — return only entries after this time), limit (int — max entries to return, default 50, max 200).", "required": True},
         },
     },
     "engram_list_focused": {
@@ -274,9 +274,9 @@ TOOL_SCHEMAS = {
         "parameters": {},
     },
     "engram_list": {
-        "description": "List nodes in compact triage format. The `claim` key carries recall_summary when populated (truncated to 200 chars with an ellipsis if longer), falling back to the claim truncated to 130 chars. No neighbor data, no memory refresh. Supports structured filters via filters_json (recursive AND/OR/NOT with contains/starts_with/ends_with operators). Default scans current-revision only; set include_superseded=True to scan the historical layer (text-layer leak audits).",
+        "description": "List nodes in compact triage format. The `claim` key carries recall_summary when populated (truncated to 200 chars with an ellipsis if longer), falling back to the claim truncated to 130 chars. Question rows also carry `bears_on_count` and `bears_on_weight` (live bears_on targets and their summed importance; #3615). No neighbor data, no memory refresh. Supports structured filters via filters_json (recursive AND/OR/NOT with contains/starts_with/ends_with operators). Default scans current-revision only; set include_superseded=True to scan the historical layer (text-layer leak audits).",
         "parameters": {
-            "payload_json": {"type": "string", "description": "JSON object (as a string) with list fields. All optional: node_type (str — filter by node type, e.g. 'question', 'observation_factual'; empty = all types; conflicts with 'type' field in filters_json), status (str — filter by status, e.g. 'open', 'resolved', 'active'; conflicts with 'status' field in filters_json), sort_by (str — sort order: 'id' (default), 'created' (newest first), 'importance' (highest first), 'recalls' (most recalled first)), sort_order (str — direction override: 'asc' or 'desc', case-insensitive; empty = use sort_by's own default direction), limit (int — max results, default 100; set 0 for metadata-only; ignored if unlimited=True; hard ceiling 500 in single-field mode), filters_json (str — JSON-encoded recursive condition tree with AND/OR/NOT logic and eq/ne/gt/gte/lt/lte/in/not_in/between/contains/starts_with/ends_with/is_null/is_not_null operators; empty string = use single-field mode), fields_json (str — JSON-encoded list of column names to project; empty = default compact triage shape), unlimited (bool — if True, return all matched rows regardless of limit), include_superseded (bool — if True, scan non-current/superseded nodes too; default False).", "required": True},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with list fields. All optional: node_type (str — filter by node type, e.g. 'question', 'observation_factual'; empty = all types; conflicts with 'type' field in filters_json), status (str — filter by status, e.g. 'open', 'resolved', 'active'; conflicts with 'status' field in filters_json), sort_by (str — sort order: 'id' (default), 'created' (newest first), 'importance' (highest first), 'recalls' (most recalled first), 'bears_on' (questions only in effect: most live bears_on targets first, then summed target importance; #3615)), sort_order (str — direction override: 'asc' or 'desc', case-insensitive; empty = use sort_by's own default direction), limit (int — max results, default 100; set 0 for metadata-only; ignored if unlimited=True; hard ceiling 500 in single-field mode), filters_json (str — JSON-encoded recursive condition tree with AND/OR/NOT logic and eq/ne/gt/gte/lt/lte/in/not_in/between/contains/starts_with/ends_with/is_null/is_not_null operators; empty string = use single-field mode), fields_json (str — JSON-encoded list of column names to project; empty = default compact triage shape), unlimited (bool — if True, return all matched rows regardless of limit), include_superseded (bool — if True, scan non-current/superseded nodes too; default False).", "required": True},
         },
     },
     "engram_stats": {
@@ -359,14 +359,24 @@ class EngramClient:
     parallel evaluations with isolated graphs.
     """
 
-    def __init__(self, db_dir: Optional[str] = None, server_module_path: str = ""):
+    def __init__(self, db_dir: Optional[str] = None, server_module_path: str = "",
+                 setup_wait: Optional[str] = None):
         """Initialize the client.
-        
+
         Args:
-            db_dir: Path to the database directory. Defaults to ~/.engram.
+            db_dir: Path to the database directory. Defaults to ~/.engram ($ENGRAM_HOME).
                     Use different paths for isolated eval runs.
             server_module_path: Path to the directory containing server.py.
                                 If empty, assumes server.py is importable.
+            setup_wait: (#3767) caller class for the cross-process one-time DB
+                        setup lock. None (default) = lazy: the first tool call
+                        runs the setup as the server class (waits up to
+                        engram_core.SETUP_LOCK_SERVER_WAIT_S). "hook" = a
+                        harness-budgeted hook: the setup runs NOW, here, with
+                        the short hook wait, and engram_core.DbSetupLockBusy
+                        propagates from this constructor if another process
+                        holds the lock (so no later tool call can fall into
+                        the long server-class wait).
         """
         if server_module_path and server_module_path not in sys.path:
             sys.path.insert(0, server_module_path)
@@ -428,6 +438,19 @@ class EngramClient:
 
         self._server = _server
         self._server._ensure_data_dir()
+
+        if setup_wait is not None:
+            # #3767: run the one-time DB setup now, under the caller's class.
+            # Setup-lock failures propagate (the hook degrades on them); any
+            # other error is left for the first tool call to raise as it
+            # always has, so construction semantics are otherwise unchanged.
+            _core = _server.core
+            try:
+                _core._get_db(setup_wait=setup_wait).close()
+            except _core.DbSetupLockError:
+                raise
+            except Exception:
+                pass
 
         # Build function dispatch table
         self._tools = {}

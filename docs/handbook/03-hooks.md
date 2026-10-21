@@ -327,21 +327,23 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 ### **4.3 engram-utility-credit-mention-stop.py**
 
-**what** — Stop hook companion to server.py's derive-based credit. Scrapes last assistant message for ENGRAM node-id mentions (prose + inline citation) and bumps utility_score for every mentioned node. Pure Q-update: `Q_new = Q_old + alpha * (1 - Q_old)` with ALPHA_MENTION=0.10 (matches USE_ALPHA["mention"] in server.py). Independent from derive's recall-window credit path: both can fire same turn for same ID (citation + prose = stronger engagement signal). Idempotency: same node mentioned twice in same response = single bump (find_node_ids dedupes in order). Mentioned across turns = separate bumps per turn.
+**what** — Stop hook companion to server.py's derive-based credit. Scrapes last assistant message for ENGRAM node-id mentions (prose + inline citation) and, for every mentioned node, bumps utility_score and restamps `recall_turn` + `importance_score` (NOT `recall_count`), so a node used by id in prose stops aging. The whole "bump, then restamp" sequence is the shared `engram_restamp.use_reward(conn, ids, "mention", config_path=...)`; the bump is the Q-update `Q_new = Q_old + alpha * (1 - Q_old)` with alpha read from the shared `USE_ALPHA["mention"]` table (0.10 today; the table lives in `engram_restamp.py`, `engram_core` re-exports it) -- no private constant in the hook. Independent from derive's recall-window credit path: both can fire same turn for same ID (citation + prose = stronger engagement signal). Idempotency: same node mentioned twice in same response = single bump (find_node_ids dedupes in order). Mentioned across turns = separate bumps per turn.
 
-**how** — Entry point: main() (248–312). Key operations:
-- Stdin read: last_assistant_message (line 261), guard against double-fire (stop_hook_active check, line 259).
-- Turn-text collection: collect_turn_text() (150–201) walks JSONL backwards, concatenates assistant text blocks, stops on real user message, appends stdin's last_message.
-- Node extraction: engram_ids.find_node_ids() (line 233) regex-based ID extraction from turn_text.
-- Q-update: bump_utility() (77–110) applies alpha to each mentioned node's utility_score in knowledge.db.
-- Logging: _log() (113–118) appends session/mentioned/updated counts to utility-credit-mention.log (best-effort).
-- Event logging: engram.hook.fire (288–306) carries mentioned_count + updated_count + alpha_mention metadata.
+**failure handling** — The restamp runs in a SAVEPOINT inside `use_reward` and is decoration: on a config-read or restamp failure only the restamp is rolled back, the bump is kept and committed, and the hook logs `restamp failed: <stage>: …` to `utility-credit-mention.log` (visible, never silent). If the shared `engram_restamp` module fails to import, `bump_utility()` raises, `credit_mentions` logs `bump_utility failed: …`, and the bump is lost (no silent skip).
+
+**how** — Entry point: main(). Key operations:
+- Stdin read: last_assistant_message, guard against double-fire (stop_hook_active check).
+- Turn-text collection: collect_turn_text() walks JSONL backwards, concatenates assistant text blocks, stops on real user message, appends stdin's last_message.
+- Node extraction: engram_ids.find_node_ids() regex-based ID extraction from turn_text, inside credit_mentions().
+- Credit: bump_utility() opens knowledge.db and calls engram_restamp.use_reward for the mentioned nodes, then commits.
+- Logging: _log() appends session/mentioned/updated counts, and restamp/bump failures, to utility-credit-mention.log (best-effort).
+- Event logging: engram.hook.fire in main() carries mentioned_count + updated_count + alpha_mention metadata (alpha_mention now read from the shared table).
 
 **status-candidate** — **PROD-VERIFIED** (DB-write + log design, no model-visible output by design; test_hooks_json_stdout_audit.py parametrized; #792/#805 isolated the test suite's ENGRAM_HOME surface). **LIVE VERIFIED (2026-06-09, ob_2389)**: controlled end-to-end test moved dv_0073 utility_score 0.0→0.1 on exact α=0.10 Q-update — confirms DB write path fully operational after week-long silent non-enrollment (ob_2237/2238 closed).
 
-**files** — engram-utility-credit-mention-stop.py (343 lines).
+**files** — engram-utility-credit-mention-stop.py (~600 lines); shared logic in engram_restamp.py (`use_reward`, `bump_utility`, `USE_ALPHA`, `RESTAMP_ACTIONS`).
 
-**key constants** — KNOWLEDGE_DB, LOG_PATH, ALPHA_MENTION=0.10.
+**key constants** — KNOWLEDGE_DB, LOG_PATH, CONFIG_PATH, `_ACTION="mention"` (the hook's key in the shared `engram_restamp.USE_ALPHA` / `RESTAMP_ACTIONS`).
 
 **tests** — test_hooks_json_stdout_audit.py (parametrized Stop/engram-utility-credit-mention-stop.py).
 

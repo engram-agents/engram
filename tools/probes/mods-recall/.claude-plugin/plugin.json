@@ -1,0 +1,74 @@
+{
+  "name": "engram-probe",
+  "version": "0.1.1",
+  "author": {
+    "name": "ENGRAM project (dev probe)"
+  },
+  "description": "Dev probe (part of #3362): measures what thinking-keyed ENGRAM recall would surface at each model step. Observe-only; changes nothing the model reads during the turn.",
+  "userConfig": {
+    "enabled": {
+      "type": "boolean",
+      "title": "Enabled",
+      "description": "Master switch. false registers nothing.",
+      "default": true
+    },
+    "topK": {
+      "type": "number",
+      "title": "Candidates per arm",
+      "description": "1..20",
+      "default": 5
+    },
+    "minQueryChars": {
+      "type": "number",
+      "title": "Min query chars",
+      "description": "Thinking-proxy arms (A, B, C, E) run only when the proxy material (thinking, or the answer text in visible mode) has at least this many chars; a step with no proxy material and no tool arguments, or a terminal step, gets a skipped row and no arm runs.",
+      "default": 0
+    },
+    "minThinkingChars": {
+      "type": "number",
+      "title": "Min thinking chars (deprecated alias)",
+      "description": "Old name of minQueryChars; used when minThinkingChars is set and minQueryChars is at its default (0)."
+    },
+    "querySource": {
+      "type": "string",
+      "title": "Query material",
+      "description": "thinking | visible (proxy arms use the answer text only; arm D keeps the tool arguments) | auto (thinking when long enough, else visible).",
+      "default": "auto",
+      "options": [
+        "thinking",
+        "visible",
+        "auto"
+      ]
+    },
+    "arms": {
+      "type": "string",
+      "title": "Arms",
+      "description": "Comma list of arms to run.",
+      "default": "thinking_full,thinking_tail,extract_model,tool_input,novel_terms"
+    },
+    "extractModel": {
+      "type": "string",
+      "title": "Arm C model",
+      "description": "Model for the extract_model arm, the only arm that sends text to a side model: its input is the thinking text (thinking mode) or the step's answer text (visible mode), never tool-call arguments.",
+      "default": "haiku"
+    },
+    "extractTimeoutMs": {
+      "type": "number",
+      "title": "Arm C timeout (ms)",
+      "description": "Time limit for the extract_model completion.",
+      "default": 6000
+    },
+    "maxRatingChars": {
+      "type": "number",
+      "title": "Rating request cap",
+      "description": "Hard cap of the end-of-turn rating request row.",
+      "default": 1200
+    },
+    "probeDir": {
+      "type": "string",
+      "title": "Probe directory",
+      "description": "Where step/rating files go; ~ is the HOME directory.",
+      "default": "~/.engram/probe/mods-recall"
+    }
+  }
+}

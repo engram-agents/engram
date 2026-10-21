@@ -133,12 +133,14 @@ from pathlib import Path
 try:  # pragma: no cover -- exercised by both execution modes in practice
     from . import measurements as health_measurements
     from . import version as health_version
+    from .rows import named_rows
 except ImportError:
     _src_engram = str(Path(__file__).resolve().parent.parent)
     if _src_engram not in sys.path:
         sys.path.insert(0, _src_engram)
     from health import measurements as health_measurements  # type: ignore[no-redef]
     from health import version as health_version  # type: ignore[no-redef]
+    from health.rows import named_rows  # type: ignore[no-redef]
 
 # Second alias to the SAME `health.version` module object as `health_version`
 # above -- used ONLY inside PR C1's `derive`/`export`, whose own PARAMETER is
@@ -170,6 +172,18 @@ __all__ = [
     "export",
     "checkpoint_hook",
 ]
+
+
+class UnrestorableCommit(Exception):
+    """``replay_commit`` could not restore a commit's ``knowledge.sql`` (``git
+    show`` failed, or the dump does not load). ``backfill`` records the commit
+    and carries on; the original error is chained as ``__cause__``."""
+
+    def __init__(self, commit_sha: str, cause: BaseException):
+        self.commit_sha = commit_sha
+        self.error_class = type(cause).__name__
+        self.error_message = str(cause)
+        super().__init__(f"{commit_sha}: {self.error_class}: {self.error_message}")
 
 
 class SeriesIntegrityError(Exception):
@@ -206,6 +220,24 @@ CREATE TABLE IF NOT EXISTS l0_points (
     measurements TEXT NOT NULL,
     unreplayable TEXT NOT NULL,
     PRIMARY KEY (commit_sha, health_major, source, replay_decl_hash)
+);
+
+-- Commits whose knowledge.sql could not be restored (truncated / unreadable).
+-- A dedicated table, NOT an l0_points row: l0_points feeds the health series,
+-- and a skip must contribute no point to any reader of it.
+-- Clearing a skip: delete its row. A row is keyed by (commit_sha,
+-- health_major, replay_decl_hash), so it is re-queued automatically when
+-- health_major or replay_decl_hash changes. A TRANSIENT failure reading the
+-- file from the repository is recorded too and stays skipped for that key
+-- until the row is deleted.
+CREATE TABLE IF NOT EXISTS unrestorable_commits (
+    commit_sha TEXT NOT NULL,
+    health_major INTEGER NOT NULL,
+    replay_decl_hash TEXT NOT NULL DEFAULT '',
+    error_class TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (commit_sha, health_major, replay_decl_hash)
 );
 
 CREATE TABLE IF NOT EXISTS derived_points (
@@ -304,7 +336,7 @@ def _unresolved_snapshots_needs_migration(conn: sqlite3.Connection) -> bool:
     migration -- see ``open_store``'s docstring). ``PRAGMA table_info``
     cannot see CHECK constraints, so the literal text of the constraint is
     read off ``sqlite_master.sql`` instead."""
-    row = conn.execute(
+    row = named_rows(conn,
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'unresolved_snapshots'"
     ).fetchone()
     if row is None or row["sql"] is None:
@@ -347,7 +379,7 @@ def _equality_checks_needs_migration(conn: sqlite3.Connection) -> bool:
     columns) is sufficient here -- no need to read ``sqlite_master.sql``."""
     cols = {
         r["name"]
-        for r in conn.execute("PRAGMA table_info(equality_checks)").fetchall()
+        for r in named_rows(conn, "PRAGMA table_info(equality_checks)").fetchall()
     }
     return "replay_decl_hash" not in cols
 
@@ -375,7 +407,7 @@ def _derived_points_needs_migration(conn: sqlite3.Connection) -> bool:
     column (this store's THIRD schema migration, PR C1) -- a plain column,
     so ``PRAGMA table_info`` suffices."""
     cols = {
-        r["name"] for r in conn.execute("PRAGMA table_info(derived_points)").fetchall()
+        r["name"] for r in named_rows(conn, "PRAGMA table_info(derived_points)").fetchall()
     }
     return "l0_source" not in cols
 
@@ -391,7 +423,7 @@ def _migrate_derived_points(conn: sqlite3.Connection) -> None:
     NON-empty (meaning something, somehow, wrote to it under the old
     schema -- should never happen), raise ``SeriesIntegrityError`` naming
     the table rather than silently dropping rows."""
-    count = conn.execute("SELECT COUNT(*) AS c FROM derived_points").fetchone()["c"]
+    count = named_rows(conn, "SELECT COUNT(*) AS c FROM derived_points").fetchone()["c"]
     if count != 0:
         raise SeriesIntegrityError(
             "derived_points migration (PR C1): the table is on the pre-C1 "
@@ -425,7 +457,7 @@ def _declarations_needs_model_defs_migration(conn: sqlite3.Connection) -> bool:
     column (this store's FOURTH schema migration, PR C1 / D4.1) -- a plain
     column, so ``PRAGMA table_info`` suffices."""
     cols = {
-        r["name"] for r in conn.execute("PRAGMA table_info(declarations)").fetchall()
+        r["name"] for r in named_rows(conn, "PRAGMA table_info(declarations)").fetchall()
     }
     return "model_defs" not in cols
 
@@ -448,7 +480,7 @@ def _replay_runs_needs_migration(conn: sqlite3.Connection) -> bool:
     PR C1) -- same ``sqlite_master.sql`` literal-text check as
     ``_unresolved_snapshots_needs_migration`` above, since ``PRAGMA
     table_info`` cannot see CHECK constraints."""
-    row = conn.execute(
+    row = named_rows(conn,
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'replay_runs'"
     ).fetchone()
     if row is None or row["sql"] is None:
@@ -571,7 +603,7 @@ def _declarations_needs_prefix_heal(conn: sqlite3.Connection) -> bool:
     ``LIKE`` against a NULL column is NULL (falsy), never a match, so the
     explicit ``IS NOT NULL`` guards are belt-and-suspenders, not strictly
     required -- kept for readability."""
-    row = conn.execute(
+    row = named_rows(conn,
         "SELECT COUNT(*) AS c FROM declarations WHERE "
         "(signal_defs IS NOT NULL AND signal_defs LIKE '%engram.health.%') OR "
         "(curve_defs IS NOT NULL AND curve_defs LIKE '%engram.health.%') OR "
@@ -608,7 +640,7 @@ def _migrate_declarations_prefix_heal(conn: sqlite3.Connection) -> None:
     should-fix 2) -- a check that used to reject this content now silently
     accepts it, and a silent acceptance of something that used to be
     rejected should leave a mark."""
-    rows = conn.execute(
+    rows = named_rows(conn,
         "SELECT health_version, signal_defs, curve_defs, config, model_defs "
         "FROM declarations"
     ).fetchall()
@@ -800,7 +832,7 @@ def _find_plugin_tree_data_dir(start_dir: Path) -> Path | None:
     ENDS in ``marketplace/plugins/engram`` -- the deployed-plugin-tree shape
     -- AND that directly contains ``.engram-build-manifest.json``. Returns
     the parent of that directory's ``marketplace`` segment (i.e. the DATA
-    dir, e.g. ``~/.engram``), or ``None`` if no such ancestor exists.
+    dir, e.g. ``$ENGRAM_HOME``, default ``~/.engram``), or ``None`` if no such ancestor exists.
 
     The suffix check comes first deliberately: a bare
     ``.engram-build-manifest.json`` sitting somewhere unrelated must not be
@@ -818,7 +850,7 @@ def _find_code_repo_toplevel(start_dir: Path) -> Path | None:
     returned if that toplevel is a CODE checkout -- i.e. it contains
     ``src/engram/health/measurements.py``. Returns ``None`` on any git
     failure, or when the toplevel is some OTHER git work tree (notably the
-    DATA repo, e.g. ``~/.engram``, which has no ``src/`` at all). Never
+    DATA repo, e.g. ``$ENGRAM_HOME`` (default ``~/.engram``), which has no ``src/`` at all). Never
     raises."""
     try:
         result = subprocess.run(
@@ -901,8 +933,8 @@ def detect_engine_build(module_path: str | Path | None = None) -> str:
     WHY step 2 must run before step 3, and why this is not merely an
     ordering preference: the deployed plugin tree is NESTED INSIDE the data
     repo's own git work tree (measured on two seats --
-    ``git -C ~/.engram/marketplace/plugins/engram rev-parse --show-toplevel``
-    returns ``~/.engram`` itself, a real directory nesting, not a symlink).
+    ``git -C ~/.engram/marketplace/plugins/engram rev-parse --show-toplevel`` (default $ENGRAM_HOME)
+    returns ``~/.engram`` (``$ENGRAM_HOME``) itself, a real directory nesting, not a symlink).
     So a rule that asks the git question first, for a module executing from
     the deployed tree, returns the DATA repo's HEAD -- the exact #2600
     defect, reached through a principled-looking door. Only the
@@ -1562,7 +1594,7 @@ def ingest(
 def _dump_table_rows(conn: sqlite3.Connection, table: str) -> list[dict]:
     pk_cols = _PRIMARY_KEYS[table]
     order_by = ", ".join(pk_cols)
-    rows = conn.execute(f"SELECT * FROM {table} ORDER BY {order_by}").fetchall()
+    rows = named_rows(conn, f"SELECT * FROM {table} ORDER BY {order_by}").fetchall()
     return [dict(row) for row in rows]
 
 
@@ -1768,7 +1800,7 @@ def _default_regenerate_under_build(
     build``'s rule step 1 always wins, so the guard never fires on a
     scratch path) and ``ENGRAM_HOME`` pointed at a second, unrelated fresh
     temp dir as a belt-and-braces measure (``series.py`` never reads it,
-    but nothing here should risk resolving a real ``~/.engram``).
+    but nothing here should risk resolving a real ``~/.engram`` (``$ENGRAM_HOME``)).
 
     Never imports the scratch tree's code into THIS process -- the
     ``sys.executable`` subprocess call is the whole point (module docstring
@@ -2467,7 +2499,7 @@ def replay_commit(
     Mechanism: ``git show <commit_sha>:knowledge.sql`` (a ``subprocess.run``
     ARGUMENT LIST -- never ``shell=True``, never a piped string) reads the
     dump's text straight from git's object store, without ever checking out
-    a working tree or touching the live ``~/.engram/knowledge.db`` (design
+    a working tree or touching the live ``~/.engram/knowledge.db`` (under ``$ENGRAM_HOME``) (design
     doc §4: "it never opens the live knowledge.db, never writes a temp DB,
     never touches the WAL"); ``sqlite3.connect(':memory:')`` +
     ``executescript`` restores it into an in-memory database that is
@@ -2502,21 +2534,32 @@ def replay_commit(
     key set matches what ``health.measurements.compute_all_measurements``
     puts in a ``stored`` row's ``measurements`` block. ``unreplayable`` is
     ``{name: {"reason": ..., "class": "declared"|"discovered"}}`` for every
-    measurement NOT computed this way (D2's class shape)."""
+    measurement NOT computed this way (D2's class shape).
+
+    Raises ``UnrestorableCommit`` when the commit's ``knowledge.sql`` cannot
+    be restored (``git show`` fails, or ``executescript`` raises any
+    ``sqlite3.Error`` -- e.g. a truncated dump). Only that restore step is
+    translated; an error inside a measurement's own SQL still propagates."""
     registry = registry if registry is not None else health_measurements.MEASUREMENTS
 
-    result = subprocess.run(
-        ["git", "show", f"{commit_sha}:knowledge.sql"],
-        check=True,
-        capture_output=True,
-        text=True,
-        cwd=str(repo_dir),
-    )
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{commit_sha}:knowledge.sql"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(repo_dir),
+        )
+    except subprocess.CalledProcessError as e:
+        raise UnrestorableCommit(commit_sha, e) from e
 
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     try:
-        conn.executescript(result.stdout)
+        try:
+            conn.executescript(result.stdout)
+        except sqlite3.Error as e:
+            raise UnrestorableCommit(commit_sha, e) from e
 
         measurements: "dict[str, object]" = {
             "raw_schema_version": _current_health_major()
@@ -2652,11 +2695,20 @@ def backfill(
 
     Returns the run record dict (``reason``, ``started_at``, ``finished_
     at``, ``health_major``, ``commits_total`` (missing-commit count),
-    ``commits_done`` (rows actually inserted -- always equal to
-    ``commits_total`` today, since every missing commit is unconditionally
-    replayed and inserted), ``engine_build``, ``detail`` (``{per_reason_
+    ``commits_done`` (rows actually inserted --
+    ``commits_total - commits_done`` is the number of commits newly recorded
+    in ``unrestorable_commits`` this run, i.e. skipped rather than replayed), ``engine_build``, ``detail`` (``{per_reason_
     counts_of_unreplayable, decl_hash, disagreements}``)); the same record
-    (JSON-encoded ``detail``) is inserted into ``replay_runs``."""
+    (JSON-encoded ``detail``) is inserted into ``replay_runs``.
+
+    Skipped commits: a commit whose ``knowledge.sql`` cannot be restored
+    (``UnrestorableCommit``) gets a row in ``unrestorable_commits`` for the
+    current ``(health_major, replay_decl_hash)`` and is not retried on later
+    runs. To clear a recorded skip, delete its row; it is also re-queued
+    automatically when ``health_major`` or ``replay_decl_hash`` changes (the
+    key no longer matches). A TRANSIENT failure of the underlying file read
+    from the repository is recorded the same way, so it too stays skipped for
+    that key until its row is deleted."""
     registry = registry if registry is not None else health_measurements.MEASUREMENTS
 
     conn = open_store(db_path)
@@ -2702,13 +2754,46 @@ def backfill(
                 (effective_health_major, current_hash),
             ).fetchall()
         }
+        # Commits already recorded as unrestorable under this (health_major,
+        # replay_decl_hash) are not retried every run (#3951).
+        skipped_shas = {
+            r["commit_sha"]
+            for r in conn.execute(
+                "SELECT commit_sha FROM unrestorable_commits WHERE health_major = ? "
+                "AND replay_decl_hash = ?",
+                (effective_health_major, current_hash),
+            ).fetchall()
+        }
         all_commits = knowledge_commits(repo_dir)
-        missing = [(sha, ts) for sha, ts in all_commits if sha not in existing_shas]
+        missing = [
+            (sha, ts)
+            for sha, ts in all_commits
+            if sha not in existing_shas and sha not in skipped_shas
+        ]
 
         commits_done = 0
+        unrestorable_shas: "list[str]" = []
         per_reason_counts: "dict[str, int]" = {}
         for sha, committer_iso in missing:
-            measurements, unreplayable = replay_commit(repo_dir, sha, registry=registry)
+            try:
+                measurements, unreplayable = replay_commit(repo_dir, sha, registry=registry)
+            except UnrestorableCommit as e:
+                conn.execute(
+                    "INSERT OR IGNORE INTO unrestorable_commits "
+                    "(commit_sha, health_major, replay_decl_hash, error_class, "
+                    "error_message, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        sha,
+                        effective_health_major,
+                        current_hash,
+                        e.error_class,
+                        e.error_message,
+                        _utc_now_iso(now),
+                    ),
+                )
+                conn.commit()
+                unrestorable_shas.append(sha)
+                continue
             turn = parse_turn_from_message(_commit_message(repo_dir, sha))
             computed_at = _utc_now_iso(now)
             conn.execute(
@@ -2783,6 +2868,8 @@ def backfill(
             "per_reason_counts_of_unreplayable": per_reason_counts,
             "decl_hash": current_hash,
             "disagreements": disagreements,
+            "unrestorable_count": len(unrestorable_shas),
+            "unrestorable_shas": unrestorable_shas,
         }
         run_record = {
             "reason": reason,
@@ -2791,6 +2878,8 @@ def backfill(
             "health_major": effective_health_major,
             "commits_total": len(missing),
             "commits_done": commits_done,
+            "unrestorable_count": len(unrestorable_shas),
+            "unrestorable_shas": unrestorable_shas,
             "engine_build": build,
             "detail": detail,
         }

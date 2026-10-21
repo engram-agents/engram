@@ -221,7 +221,7 @@ def _add_cornerstone_impl(
         # _stamp_new_node writes the anchor in one pass instead of computing
         # an interim value from confidence=0.5 and then overwriting it
         # [alpha#2250].
-        core._stamp_new_node(conn, node_id, importance_base=2.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=2.0)
         if linked:
             core._utility_reward(conn, linked, action="citation")
         conn.commit()
@@ -274,6 +274,9 @@ def _add_cornerstone_impl(
             result["non_current_supporting_ids"] = non_current
         if generalizing_parents:
             result["generalized_by"] = generalizing_parents
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            result["embedding_failure"] = _emb_block  # R1: renamed key
         return json.dumps(result)
     finally:
         conn.close()
@@ -347,7 +350,7 @@ def _outgrow_cornerstone_impl(
                          "Use engram_supersede for other node types."
             })
 
-        old_meta = json.loads(old["metadata"]) if old["metadata"] else {}
+        old_meta = core._metadata_dict(old["metadata"])
         tag = old_meta.get("tag", "")
         title = new_title if new_title else old_meta.get("title", old["claim"])
         # The growth-cycle roll: predecessor's new_frame becomes successor's prior_frame.
@@ -519,7 +522,7 @@ def _outgrow_cornerstone_impl(
         # _stamp_new_node writes the anchor in one pass instead of computing
         # an interim value from confidence=0.5 and then overwriting it
         # [alpha#2250].
-        core._stamp_new_node(conn, new_id, importance_base=2.0)
+        _emb_outcome = core._stamp_new_node(conn, new_id, importance_base=2.0)
 
         core._log_edit(conn, "superseded", old_cornerstone_id, "cornerstone",
                   {"replaced_by": new_id, "via": "engram_outgrow_cornerstone",
@@ -566,7 +569,7 @@ def _outgrow_cornerstone_impl(
                 ),
             })
 
-        return json.dumps({
+        _result = {
             "status": "outgrown",
             "old_cornerstone_id": old_cornerstone_id,
             "new_cornerstone_id": new_id,
@@ -584,7 +587,11 @@ def _outgrow_cornerstone_impl(
             **({"non_current_supporting_ids": non_current_supports} if non_current_supports else {}),
             **({"non_current_about_ids": non_current_about_ids} if non_current_about_ids else {}),
             **({"missing_about_ids": missing_about_ids} if missing_about_ids else {}),
-        })
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        return json.dumps(_result)
     finally:
         conn.close()
 
@@ -641,7 +648,7 @@ def _link_about_impl(
 
         if not person_id:
             self_row = conn.execute(
-                "SELECT id FROM nodes WHERE type = 'person' AND json_extract(metadata, '$.is_self') = 1 AND is_current = 1"
+                "SELECT id FROM nodes WHERE type = 'person' AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.is_self') = 1 AND is_current = 1"
             ).fetchone()
             if not self_row:
                 return json.dumps({
@@ -691,7 +698,7 @@ def _link_about_impl(
 
         # Stage 2 auto-suggest: only for newly-created edges (not redundant re-links).
         if created and person:
-            person_meta = json.loads(person["metadata"] or "{}")
+            person_meta = core._metadata_dict(person["metadata"])
             person_name = person_meta.get("name", person_id)
             result["special_moment_suggestion"] = {
                 "person_id": person_id,
@@ -833,6 +840,11 @@ def _remove_edge_impl(
         conn.close()
 
 
+# #3631: the helper lives in engram_core (so engram_derive / engram_revision need
+# not import this module); same object, never a copy.
+_relation_endpoint_error = core._relation_endpoint_error
+
+
 def _add_edge_impl(
     source_id: str = "",
     target_id: str = "",
@@ -907,60 +919,19 @@ def _add_edge_impl(
                 )
             })
 
-        # `instantiates` boundary gates (#530): the exemplifies/serves/instantiates
-        # three-way boundary is enforced mechanically here, not just documented
-        # (mechanical gate > vigilance — the redundant-near-synonym failure mode).
-        if relation == "instantiates":
-            if target["type"] == "lesson":
-                return json.dumps({
-                    "error": (
-                        f"'instantiates' does not accept lesson targets — an "
-                        f"incident that is an instance of a lesson's pattern is "
-                        f"wired via `exemplifies` (engram_register_exemplar / "
-                        f"engram_lesson_register_incident), which feeds the "
-                        f"tripwire engine. Target '{target_id}' is a lesson."
-                    )
-                })
-            if target["type"] not in core.INSTANTIATES_TARGET_TYPES:
-                return json.dumps({
-                    "error": (
-                        f"'instantiates' targets must be one of "
-                        f"{sorted(core.INSTANTIATES_TARGET_TYPES)} — the "
-                        f"principle-family node the source realizes. Target "
-                        f"'{target_id}' is type '{target['type']}'. For "
-                        f"intent-shaped task→goal contribution use `serves`; "
-                        f"for incident→lesson membership use `exemplifies`."
-                    )
-                })
-            if not core._is_claim_bearing(source["type"]):
-                return json.dumps({
-                    "error": (
-                        f"'instantiates' sources must be claim-bearing "
-                        f"({sorted(core.CLAIM_BEARING_TYPES)}); source "
-                        f"'{source_id}' is type '{source['type']}'."
-                    )
-                })
+        # Relation-specific endpoint gates (`instantiates` #530, `generalizes`
+        # #2753 WS1 D1) live in ONE helper shared with engram_retype_edge
+        # (#2243 step 3 part A): the three-way exemplifies/serves/instantiates
+        # boundary and the generalizes pair rule are enforced mechanically,
+        # not just documented, and a re-type is held to the same rules.
+        endpoint_err = _relation_endpoint_error(relation, source, target)
+        if endpoint_err is not None:
+            return json.dumps({"error": endpoint_err})
 
-        # `generalizes` boundary gates (#2753 epic, WS1, D1): endpoint-pair
-        # gate + write-time cycle guard, mechanically enforced here — not
-        # just documented — same discipline as the `instantiates` gate
-        # above (#530).
+        # `generalizes` write-time cycle guard (#2753 epic, WS1, D1). The
+        # endpoint-pair rule is in _relation_endpoint_error above; the cycle
+        # walk stays here (retype applies its own family-aware cycle check).
         if relation == "generalizes":
-            pair = (source["type"], target["type"])
-            if pair not in core.GENERALIZES_ALLOWED_PAIRS:
-                return json.dumps({
-                    "error": (
-                        f"'generalizes' does not accept a "
-                        f"{source['type']} -> {target['type']} pair. "
-                        f"Allowed: {sorted(core.GENERALIZES_ALLOWED_PAIRS)}. "
-                        f"Concrete nodes keep `exemplifies` (incident -> "
-                        f"lesson) / `instantiates` (claim -> principle) — "
-                        f"`generalizes` is reserved for principle -> "
-                        f"principle abstraction (source '{source_id}' is "
-                        f"type '{source['type']}', target '{target_id}' is "
-                        f"type '{target['type']}')."
-                    )
-                })
             cycle_path = core._generalizes_cycle_path(conn, source_id, target_id)
             if cycle_path is not None:
                 return json.dumps({
@@ -984,15 +955,16 @@ def _add_edge_impl(
         #
         # UPDATE (#2753 epic, WS1): the gap this TODO named is now live.
         # `generalizes` is the first addable-after-creation relation with
-        # dag=True and temporal_causal=False (acknowledged_derives_from has
+        # a dag_family and temporal_causal=False (acknowledged_derives_from has
         # the same profile but is never addable via this generic tool — see
         # its EDGE_CLASSIFICATIONS entry). Its real reachability check is
         # the `generalizes`-specific cycle guard ABOVE
-        # (`core._generalizes_cycle_path`) — deliberately scoped to the
-        # `generalizes` relation only, not a general `dag: True`
-        # reachability check for every relation reaching this generic tool
-        # (see that helper's docstring for why). A future second
-        # dag=True/temporal_causal=False addable relation would need its
+        # (`core._generalizes_cycle_path`, a thin caller of the family-keyed
+        # `core._dag_cycle_path`, #3210) — deliberately scoped to the
+        # `generalizes` relation's own family, not a general reachability
+        # check for every relation reaching this generic tool (see that
+        # helper's docstring for why). A future second
+        # dag_family/temporal_causal=False addable relation would need its
         # own equivalent guard here, following this one's shape.
         classification = core.EDGE_CLASSIFICATIONS.get(relation, {})
         if classification.get("temporal_causal", False):
@@ -1091,6 +1063,10 @@ def _retype_edge_impl(
     public payload schema. Kept callable with named kwargs for in-server
     callers.
 
+    A `cites` edge between an observation and its evidence (the pair
+    core._cites_pair_error accepts) is provenance and is refused for every
+    new relation; only a loose cites is retypable.
+
     Corrects a wrong edge by making it WEAKER, never stronger (issue #2265,
     design doc docs/2265-2347-edge-correction-design.md sec.2). One
     transaction: refuse on a pending cascade marker on either endpoint,
@@ -1154,6 +1130,29 @@ def _retype_edge_impl(
         ).fetchone()
         if not target:
             return json.dumps({"error": f"Target node '{target_id}' not found."})
+
+        # Provenance guard: a `cites` between an observation and its evidence
+        # (the pair core._cites_pair_error accepts) is the observation's
+        # evidence link and is never retypable, whatever the new relation.
+        # It runs before every check below that could name a different
+        # error, so this pair always gets this text. It fires only when the
+        # edge exists (a missing edge keeps its "nothing to retype" error,
+        # which the order below would otherwise have produced).
+        if relation == "cites" and core._cites_pair_error(
+                conn, source_id, target_id) is None:
+            cites_row = conn.execute(
+                "SELECT id FROM edges WHERE source_id = ? AND target_id = ? "
+                "AND relation = 'cites'", (source_id, target_id),
+            ).fetchone()
+            if cites_row:
+                return json.dumps({
+                    "error": (
+                        f"'cites' edge {source_id} -> {target_id} is an "
+                        f"observation's link to its evidence: it is provenance "
+                        f"and is not retypable. Only a loose cites (one that "
+                        f"is not observation -> evidence) can be retyped."
+                    )
+                })
 
         required_target_types = core.RETYPE_ALLOWED_MOVES[move]
         if required_target_types is not None and target["type"] not in required_target_types:
@@ -1221,12 +1220,21 @@ def _retype_edge_impl(
                     )
                 })
 
-        # Step 2: new_relation's own add-time checks. Currently a no-op for
-        # every move in RETYPE_ALLOWED_MOVES (both 'about' and 'exemplifies'
-        # are temporal_causal=False, dag=False) -- implemented generically,
-        # against core.EDGE_CLASSIFICATIONS, so a future table addition
-        # targeting a dag=True/temporal_causal=True relation is caught
-        # correctly rather than silently skipped.
+        # Step 2: new_relation's own add-time checks. #2243 step 3 part A:
+        # the relation-specific endpoint rules come from the SAME helper
+        # engram_add_edge uses (never copied), so a re-type to X is refused
+        # exactly when add_edge to X would be for these node types. (That
+        # holds for the node-type endpoint rules only: a retype to subtask_of
+        # ALSO runs the grounding-family cycle check, which add_edge does
+        # not, so a retype can be refused where add_edge would not be.) Current-
+        # ness is deliberately NOT required (a loose cites on superseded or
+        # retracted history is retyped with its stratum). The generic
+        # temporal_causal and acyclicity-family checks follow, against
+        # core.EDGE_CLASSIFICATIONS, so any relation is covered by its own
+        # classification rather than silently skipped.
+        endpoint_err = _relation_endpoint_error(new_relation, source, target)
+        if endpoint_err is not None:
+            return json.dumps({"error": endpoint_err})
         new_class = core.EDGE_CLASSIFICATIONS.get(new_relation, {})
         if new_class.get("temporal_causal"):
             src_created = conn.execute(
@@ -1243,16 +1251,20 @@ def _retype_edge_impl(
                         f"'{source_id}' predates '{target_id}'."
                     )
                 })
-        if new_class.get("dag"):
-            import engram_dag_conformance as dagc
-            edges = set(dagc._live_dag_edges(conn))
-            edges.discard((source_id, target_id))  # the edge being retyped away
-            edges.add((source_id, target_id))
-            if dagc._find_cycle(sorted(edges)) is not None:
+        if new_class.get("dag_family") is not None:
+            # #3210: family-aware -- retyping to relation R is checked against
+            # R's OWN acyclicity family (core._dag_cycle_path), not the union
+            # of every family: a deduction-shaped pair retyped to `generalizes`
+            # is legal, while a grounding relation closing a grounding cycle
+            # is refused. The edge being retyped away cannot create a path
+            # target -> ... -> source by itself, so no discard step is needed.
+            cyc = core._dag_cycle_path(conn, new_relation, source_id, target_id)
+            if cyc is not None:
                 return json.dumps({
                     "error": (
                         f"Retyping to '{new_relation}' would close a cycle "
-                        f"through {source_id} -> {target_id}."
+                        f"through {source_id} -> {target_id}: "
+                        f"{' -> '.join(cyc)}."
                     )
                 })
 
@@ -1333,6 +1345,30 @@ def _retype_edge_impl(
 
         conn.commit()
 
+        # Post-commit side effects, same surface as _add_edge_impl (#2243
+        # step 3 part A) and equally best-effort: outside the transaction, so
+        # a cache/registry failure can never fail or roll back the retype.
+        # Applies to EVERY move into these relations, including the older
+        # derives_from -> exemplifies. Deliberately NO
+        # _reset_principle_enactments: that is add_edge's "new trigger edge
+        # = new evidence" reset, and a relabel of an EXISTING edge is not new
+        # evidence (same reasoning as _remove_edge_impl's note on its own case).
+        cache_rebuild = None
+        if new_relation == "exemplifies":
+            try:
+                cache_rebuild = core._rebuild_incidents_cache()
+            except Exception as exc:
+                cache_rebuild = {"status": "error", "detail": str(exc)}
+            try:
+                core._rebuild_cornerstone_anchors_cache()
+            except Exception:
+                pass  # best-effort; anchor staleness is non-fatal
+        if new_relation in ("exemplifies", "instantiates", "serves", "tensions"):
+            try:
+                core._rebuild_principle_triggers()
+            except Exception:
+                pass  # best-effort
+
         result = {
             "status": "retyped",
             "source_id": source_id,
@@ -1349,6 +1385,8 @@ def _retype_edge_impl(
                 "new": old_confidence,
                 "disposition": "no_op_not_cascade_bearing",
             }
+        if cache_rebuild is not None:
+            result["cache_rebuild"] = cache_rebuild
         return json.dumps(result)
     except Exception as exc:
         # Atomicity (design doc sec.2, step 5's failure case; Ariadne's test

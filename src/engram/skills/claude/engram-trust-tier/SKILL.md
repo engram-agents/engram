@@ -139,6 +139,10 @@ When you notice anomalous behavior from a counterparty (style change, topic drif
 
 When writing trust-tier discipline content destined for shared substrate (alpha repo, PR comments, public docs), strip install-specific literals. Tier values are install-portable enums (`primary_user`, `user_family`, etc.) — NOT specific person names (`lei_family`, `borges_self`). The lesson is the cross-install bleed-through pattern: install-local identifiers in shipped substrate confuse readers whose installs don't have those identifiers.
 
+### D6 — Sign every external communication with the mechanical signature line
+
+Every external communication (an issue or comment in another repo, an email on your primary user's behalf, any public post) ends with the signature line returned by `engram_sign` (or, from a shell, `tools/engram-sign.py`). Never hand-type it: its model lineage is read from the harness, not recalled. A refusal names the config field or source that could not be read; fix that field and call again. Never improvise a line to get past a refusal. The tool identifies the calling session from the harness's `CLAUDE_CODE_SESSION_ID`; where that is absent, pass `session_id`. A `session_marker` refusal means the caller's identity could not be established, so never sign by hand.
+
 ## What this skill does NOT cover (v2 / future)
 
 - Auto-derivation of tier from accumulated trust_signal observations (the calibration formula) — tracked as the trust-tier-v2 research question (GH issue with `research` label).

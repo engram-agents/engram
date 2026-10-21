@@ -11,6 +11,11 @@
           },
           {
             "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start-engramd-owner.sh\"",
+            "timeout": 15
+          },
+          {
+            "type": "command",
             "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-session-start-hook.py\"",
             "timeout": 5,
             "statusMessage": "Resetting ENGRAM prompt counter..."

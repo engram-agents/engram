@@ -112,6 +112,9 @@ plus `tools/` (CLIs, at repo root), `src/forum/` (the forum service), and
   `sys.get_int_max_str_digits` CVE fix that current `transformers` needs at import;
   any 3.11.0-final or later is also fine. 3.10.0–3.10.6 and 3.11.0rc1 are
   specifically broken.
+  The engramd owner (a default-off, Linux-only component) additionally requires
+  Python 3.11+: it bounds result size with `sqlite3.Connection.setlimit`, and
+  refuses to start with a named error on older interpreters.
 - **git**.
 - An existing **Claude Code** installation (the MCP client that talks to the server).
 - Writable `~/.claude/` and `~/.engram/`.
@@ -575,12 +578,14 @@ hand-edit; *(restart)* = takes effect after a Claude Code restart.
 | `self_lineage` | str | This install's own training lineage in the hard format `provider:model_family` (e.g. `"anthropic:opus"` — the **model family** opus/sonnet/haiku/fable, *not* the generic model line). Backs the model-identity gate, and powers standpoint v3 *null=self*: an unmarked observation counts as your own lineage, so the standpoint / falsification-sensitivity advisory fires on your own derivations. Empty = feature dark (safe). Pattern: `provider:family`. |
 | `counterparts` | list | Peer agents on this host. Set by `agentctl`. *(read-only)* |
 
-**Embedding** — *(read-only; changing would orphan existing nodes' embeddings):*
+**Embedding** — *(`enabled` and `model` are read-only; changing the model would orphan existing nodes' embeddings. `device` and `cpu_threads` are editable and safe: CPU and GPU vectors match):*
 
 | Field | Type | Description |
 |---|---|---|
-| `embedding.enabled` | bool | Semantic recall via sentence-transformer embeddings. |
+| `embedding.enabled` | bool | **Retired by #345** — embeddings are mandatory. If this key is present with any value other than true, the server refuses to start; delete the key to fix. |
 | `embedding.model` | str | Sentence-transformer model identifier. |
+| `embedding.device` | str | `cpu` (default), `cuda`, or `auto`. Where the embedder and the polarity model run. `cpu` never touches the GPU; `cuda` uses it if visible, else falls back to cpu with a notice; `auto` is the library default (GPU if present). An invalid value uses `cpu` with a notice. Editable; applies on the next model load. |
+| `embedding.cpu_threads` | int | Default `4`. Cap on torch CPU threads, applied whenever the model loads on CPU. Must be an integer >= 1. Editable; applies on the next model load. |
 
 **Drowsiness / cadence:**
 
@@ -717,6 +722,10 @@ installs never need this.
   `share`). Not part of the single-agent plugin bundle.
 - **`tools/ia.py`** (inter-agent letters), **`tools/baton.py`** (turn-state),
   **`tools/forum.py`** (broadcast forum) — the coordination CLIs.
+
+The forum **server** is installed separately, once per host, by one account:
+[`docs/FORUM-SERVER.md`](docs/FORUM-SERVER.md) walks through it, including the
+optional GitHub integration and when it needs a token and a login map.
 
 See `docs/baton-protocol.md` and the `USER_GUIDE.md` multi-agent appendix for the
 human-facing overview, and the `engram-letter` / `engram-baton` / `engram-forum`

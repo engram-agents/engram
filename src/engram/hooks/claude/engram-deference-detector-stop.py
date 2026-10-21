@@ -68,16 +68,19 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+_HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOKS_DIR not in sys.path:
+    sys.path.insert(0, _HOOKS_DIR)
+from _hooklib import engram_home_or_exit  # noqa: E402
+ENGRAM_HOME = str(engram_home_or_exit())
 SESSIONS_DIR = os.path.join(ENGRAM_HOME, "sessions")
 
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import atomic_write_json, resolve_runtime_dir
+# #3628: every read and the log append are non-blocking and regular-file-only.
+from _hooklib import open_regular_text, open_regular_text_append, read_regular_text
 try:
     from _stophooklib import (
         resolve_transcript_path as _resolve_transcript_path,
@@ -178,7 +181,7 @@ _INTENT_RULES = [
 def _cooldown_minutes() -> float:
     """Return configured cooldown window in minutes (default 10)."""
     try:
-        with open(CONFIG_PATH) as f:
+        with open_regular_text(CONFIG_PATH) as f:
             cfg = json.load(f)
         val = cfg.get("deference_detector", {}).get("cooldown_minutes")
         if isinstance(val, (int, float)) and val >= 0:
@@ -205,7 +208,7 @@ def _last_assistant_structure(jsonl_path: str | None = None, session_id: str | N
     Resolution order for the JSONL path (Issue #140 fix):
       1. `jsonl_path` argument — from this hook's own stdin payload, which
          is race-free per-caller even when multiple Claude sessions run.
-      2. Per-session marker `~/.engram/sessions/<session_id>.json` by
+      2. Per-session marker `~/.engram/sessions/<session_id>.json` (under $ENGRAM_HOME) by
          session_id from stdin — same race-free guarantee.
     """
     if not _STOPHOOKLIB_OK:
@@ -221,7 +224,7 @@ def _last_assistant_structure(jsonl_path: str | None = None, session_id: str | N
     # Find the last assistant message in the JSONL.
     last_msg_content = None
     try:
-        with open(jsonl) as f:
+        with open_regular_text(jsonl) as f:
             for line in f:
                 try:
                     obj = json.loads(line)
@@ -309,7 +312,7 @@ def _scan(text: str, rules: list = None) -> list[dict]:
 
 def _log(msg: str) -> None:
     try:
-        with open(LOG_PATH, "a") as f:
+        with open_regular_text_append(LOG_PATH) as f:
             f.write(f"[{datetime.now(timezone.utc).isoformat()}] {msg}\n")
     except Exception:
         pass
@@ -422,7 +425,7 @@ def main() -> None:
     cooldown_mins = _cooldown_minutes()
     if cooldown_mins > 0 and os.path.exists(DEFERENCE_COOLDOWN_PATH):
         try:
-            ts_str = Path(DEFERENCE_COOLDOWN_PATH).read_text().strip()
+            ts_str = read_regular_text(DEFERENCE_COOLDOWN_PATH).strip()
             last_user_at = datetime.fromisoformat(ts_str)
             if datetime.now(timezone.utc) - last_user_at < timedelta(minutes=cooldown_mins):
                 _log(f"Scanned: 0 hits (suppressed — user message within {cooldown_mins:.0f}min cooldown)")

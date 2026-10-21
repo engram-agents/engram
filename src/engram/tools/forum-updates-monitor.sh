@@ -75,6 +75,26 @@
 set -u
 # NOT -e: a transient failure must not kill a session-length watch.
 
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863): it would resolve against the calling process's cwd, a
+# different home for every process. Unset or empty means unset; a leading ~ is expanded against $HOME and
+# re-exported (~user is not expanded: it is not absolute, so it is refused). Checked before anything else
+# runs; `return` covers a script that is sourced, `exit` one that is executed.
+if [ -n "${ENGRAM_HOME-}" ]; then
+    _eh_raw="$ENGRAM_HOME"
+    case "$ENGRAM_HOME" in
+        "~") ENGRAM_HOME="${HOME-}"; export ENGRAM_HOME ;;
+        "~/"*) ENGRAM_HOME="${HOME-}/${ENGRAM_HOME#"~/"}"; export ENGRAM_HOME ;;
+    esac
+    case "$ENGRAM_HOME" in
+        /*) ;;
+        *)
+            printf "ENGRAM_HOME must be an absolute path, got '%s'\n" "$_eh_raw" >&2
+            unset _eh_raw
+            return 2 2>/dev/null || exit 2 ;;
+    esac
+    unset _eh_raw
+fi
+
 # ---------------------------------------------------------------------------
 # argument parsing: --help, --purpose <key>, --kinds <csv>
 # ---------------------------------------------------------------------------
@@ -101,7 +121,7 @@ Usage: forum-updates-monitor.sh [--purpose <key>] [--kinds dm,baton]
                    <pid>` by hand.
   --kinds <csv>    Comma-separated update kinds to watch (default: dm,baton).
 
-Resolves SELF and forum BASE URL from ~/.engram/config.json.
+Resolves SELF and forum BASE URL from ${ENGRAM_HOME:-$HOME/.engram}/config.json.
 URL resolution order: config.json forum.url > $FORUM_URL > http://localhost:5002
 
 Cursor-based on GET /api/updates (since,as_of] — baselines to the current as_of
@@ -144,10 +164,10 @@ esac
 # ---------------------------------------------------------------------------
 # resolve identity + forum URL (same precedence as forum-mention-monitor)
 # ---------------------------------------------------------------------------
-SELF="$(python3 -c 'import json,os,urllib.parse;print(urllib.parse.quote(json.load(open(os.path.expanduser("~/.engram/config.json"))).get("agent_name",""),safe=""))')"
-BASE="$(python3 -c 'import json,os
-c=json.load(open(os.path.expanduser("~/.engram/config.json")))
-print(((c.get("forum") or {}).get("url") or os.environ.get("FORUM_URL") or "http://localhost:5002").rstrip("/"))')"
+SELF="$(python3 -c 'import json,sys,urllib.parse;print(urllib.parse.quote(json.load(open(sys.argv[1])).get("agent_name",""),safe=""))' "${ENGRAM_HOME:-$HOME/.engram}/config.json")"
+BASE="$(python3 -c 'import json,os,sys
+c=json.load(open(sys.argv[1]))
+print(((c.get("forum") or {}).get("url") or os.environ.get("FORUM_URL") or "http://localhost:5002").rstrip("/"))' "${ENGRAM_HOME:-$HOME/.engram}/config.json")"
 URL_BASE="$BASE/api/updates?agent=$SELF&kinds=$KINDS"
 
 # ---------------------------------------------------------------------------
@@ -264,7 +284,7 @@ fi
 # cursor file — keyed to the polled URL so concurrent instances never share
 # state. Override with $FORUM_UPDATES_CURSOR_FILE (tests).
 # ---------------------------------------------------------------------------
-CURSOR="${FORUM_UPDATES_CURSOR_FILE:-$HOME/.engram/.forum-updates-cursor.$(printf '%s' "$URL_BASE" | cksum | cut -d' ' -f1)}"
+CURSOR="${FORUM_UPDATES_CURSOR_FILE:-${ENGRAM_HOME:-$HOME/.engram}/.forum-updates-cursor.$(printf '%s' "$URL_BASE" | cksum | cut -d' ' -f1)}"
 
 # helper: read /api/updates JSON on stdin, print one wake line per update.
 # Python uses ONLY double-quoted strings so the whole program can sit inside
@@ -276,20 +296,29 @@ try:
     d = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
+# #3613: wrap the meaningful payload (DM body, baton title) in the ENGRAM
+# marker; a line with no meaningful text carries the EMPTY marker. \u escapes
+# keep this source ASCII (bash 3.2 / LC_ALL=C safe).
+def clean(x):
+    # Delete EVERY U+27E6/U+27E7 from forum-supplied text before it is wrapped:
+    # a single-pass token strip can be rebuilt by split tokens.
+    return str(x).replace("\u27e6", "").replace("\u27e7", "")
+OPEN = "\u27e6ENGRAM\u27e7"
+CLOSE = "\u27e6/ENGRAM\u27e7"
 for u in d.get("updates", []):
     k = u.get("kind")
     if k == "dm":
-        body = (u.get("body") or "").replace("\n", " ").strip()
+        body = clean(u.get("body") or "").replace("\n", " ").strip()
         if len(body) > 90:
             body = body[:90] + "…"
-        print("✉️  new DM from " + str(u.get("sender", "?")) + ": " + body)
+        print("✉️  new DM from " + clean(u.get("sender", "?")) + ": " + OPEN + body + CLOSE)
     elif k == "baton":
-        title = (u.get("title") or "").strip()
+        title = clean(u.get("title") or "").strip()
         if len(title) > 50:
             title = title[:50] + "…"
-        print("\U0001f3be baton " + str(u.get("project_id", "?")) + " → turn: " + str(u.get("turn", "?")) + " (" + title + ")")
+        print("\U0001f3be baton " + clean(u.get("project_id", "?")) + " → turn: " + clean(u.get("turn", "?")) + " (" + OPEN + title + CLOSE + ")")
     else:
-        print("\U0001f514 new " + str(k) + " update (seq " + str(u.get("seq", "?")) + ")")
+        print("\U0001f514 new " + clean(k) + " update (seq " + clean(u.get("seq", "?")) + ") " + OPEN + CLOSE)
 '
 }
 
@@ -368,7 +397,7 @@ POLL_SECONDS="${FORUM_UPDATES_POLL_SECONDS:-30}"
 # mention-monitor / _status_derive._recently_engaged(). Declared ABOVE the seed
 # (it used to sit between the seed and the poll loop) because the seed's
 # announce consults it too — see _engaged() below.
-LAST_USER_ACTIVITY="$HOME/.engram/last-user-activity"
+LAST_USER_ACTIVITY="${ENGRAM_HOME:-$HOME/.engram}/last-user-activity"
 _ENGAGED_WINDOW=360  # matches _status_derive._DEFAULT_ENGAGED_WINDOW
 
 # True (exit 0) while the user is actively conversing. No stamp file means
@@ -470,9 +499,113 @@ _engaged() {
 # suppressed line (swallowed forever, above). It also only ever CLOSES a
 # warning the operator has already received.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# curl exit code + time_total on the failure lines (#3441)
+# 2026-10-05 ~22:05Z a "forum unreachable" announce fired while the forum's own
+# log showed every poll answered 200 on rhythm: the failure was client-side,
+# and the one datum that classifies it — curl's exit code — had been thrown
+# away by `if ! RESP="$(curl ...)"`. _curl_fetch keeps it, plus time_total, so
+# the edge line can say `curl 28: timed out, 10.00s` (28 = --max-time hit,
+# 7 = connect failed, 6 = resolve failed, 52 = empty reply, 56 = recv failure,
+# 35 = TLS handshake, 22 = HTTP >= 400 under --fail).
+#
+# Shell-semantics notes: the script runs under `set -u` only (no -e, no
+# pipefail at this level), so reading $? straight after the assignment is safe.
+# The status is captured from the ASSIGNMENT, never from inside an `if !`
+# (where $? is already negated). time_total rides on the same stdout via
+# `-w '\n%{time_total}'` and is split off the END so it can never reach the
+# parsed body: RESP is exactly what curl returned before the write-out.
+# Only the OUTPUT of the failure lines changes: cadence, --max-time, retry,
+# seed and cursor handling are untouched.
+# #3443: the write-out also carries namelookup/connect/appconnect/starttransfer
+# (space-separated after time_total) for the phase named on rc 28.
+# Sets RESP, _CURL_RC, _CURL_T and the phase fields; returns curl's own status.
+# ---------------------------------------------------------------------------
+_curl_fetch() {
+    local _out _w
+    _out="$(curl -s --fail --max-time "$1" -w '\n%{time_total} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' "$2" 2>/dev/null)"
+    _CURL_RC=$?
+    case "$_out" in
+        *$'\n'*) RESP="${_out%$'\n'*}"; _w="${_out##*$'\n'}" ;;
+        *)       RESP="$_out"; _w="" ;;
+    esac
+    _CURL_T=""; _CURL_DNS=""; _CURL_TCP=""; _CURL_TLS=""; _CURL_TTFB=""
+    read -r _CURL_T _CURL_DNS _CURL_TCP _CURL_TLS _CURL_TTFB <<< "$_w"
+    case "$2" in https://*) _CURL_HTTPS=1 ;; *) _CURL_HTTPS=0 ;; esac
+    [ "$_CURL_RC" -eq 0 ] || RESP=""
+    return "$_CURL_RC"
+}
+
+# Phase curl was in when --max-time hit (#3443, mirrors umwelt#1007). curl
+# reports 0 for a phase it never reached, so the phase that ate the time is
+# the first one still at 0. TRAP: on a plain-http URL time_appconnect is ALWAYS
+# 0 (no TLS), so it is consulted for https:// only -- otherwise every http stall
+# would read `tls`. A zero namelookup with a non-zero connect is just a fast
+# lookup (IP literal), so `resolve` needs connect == 0 too. On https, connect == 0
+# (namelookup > 0) is labelled `connect or tls`: measured on macOS curl 8.7.1
+# (SecureTransport) time_connect stays 0 until the TLS handshake completes, so a
+# TCP stall and a TLS stall cannot be told apart there; builds that record connect
+# at TCP completion reach the `tls` branch instead. Any field missing
+# or non-numeric -> prints nothing (no guessing).
+_curl_zero() {  # 0 = numeric, all zeros; 1 = numeric, non-zero; 2 = invalid
+    case "$1" in
+        ''|*[!0-9.]*) return 2 ;;
+        *[!0.]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+_curl_phase() {
+    local _f
+    for _f in "$_CURL_DNS" "$_CURL_TCP" "$_CURL_TTFB"; do
+        _curl_zero "$_f"; [ $? -eq 2 ] && return 0
+    done
+    if [ "$_CURL_HTTPS" = 1 ]; then
+        _curl_zero "$_CURL_TLS"; [ $? -eq 2 ] && return 0
+    fi
+    if _curl_zero "$_CURL_TCP"; then
+        if _curl_zero "$_CURL_DNS"; then printf 'resolve'
+        elif [ "$_CURL_HTTPS" = 1 ]; then printf 'connect or tls'
+        else printf 'connect'; fi
+    elif [ "$_CURL_HTTPS" = 1 ] && _curl_zero "$_CURL_TLS"; then
+        printf 'tls'
+    elif _curl_zero "$_CURL_TTFB"; then
+        printf 'first byte'
+    else
+        printf 'body'
+    fi
+}
+
+# "curl 28: timed out in first byte, 10.00s" — unknown codes say `error`; a missing or
+# non-numeric time_total prints `?s` rather than a made-up number.
+_curl_detail() {
+    local _m _t _p=""
+    case "$_CURL_RC" in
+        6)  _m="could not resolve host" ;;
+        7)  _m="connect failed" ;;
+        22) _m="HTTP error" ;;
+        28) _m="timed out" ;;
+        35) _m="TLS handshake failed" ;;
+        52) _m="empty reply" ;;
+        56) _m="receive failure" ;;
+        *)  _m="error" ;;
+    esac
+    # `env` forces the EXTERNAL printf: bash 3.2's builtin ignores a per-command LC_ALL=C
+    # and rejects curl's dot decimal under a comma locale (de_DE, fr_FR) -> "?s" (#3469).
+    case "$_CURL_T" in
+        ''|*[!0-9.]*) _t="?s" ;;
+        *) _t="$(env LC_ALL=C printf '%.2fs' "$_CURL_T" 2>/dev/null)" || _t="?s" ;;
+    esac
+    # Phase only for rc 28: every other rc already names where it failed.
+    if [ "$_CURL_RC" = 28 ]; then
+        _p="$(_curl_phase)"
+        [ -n "$_p" ] && _p=" in $_p"
+    fi
+    printf 'curl %s: %s%s, %s' "$_CURL_RC" "$_m" "$_p" "$_t"
+}
+
 _SEED_ANNOUNCED=0
 while true; do
-    if RESP="$(curl -s --fail --max-time 60 "$URL_BASE&since=0" 2>/dev/null)" \
+    if _curl_fetch 60 "$URL_BASE&since=0" \
        && _seed="$(printf '%s' "$RESP" | as_of)"; then
         printf '%s\n' "$_seed" > "$CURSOR"
         if [ "$_SEED_ANNOUNCED" = 1 ]; then
@@ -483,7 +616,9 @@ while true; do
     # Note the latch is set INSIDE the not-engaged branch, never beside it:
     # see the defer-not-swallow paragraph above.
     if [ "$_SEED_ANNOUNCED" = 0 ] && ! _engaged; then
-        echo "⚠️  forum-updates-monitor.sh: armed, but cannot seed from the forum — not yet seeded and not receiving; will report when it can"
+        _seed_why=""
+        [ "$_CURL_RC" -ne 0 ] && _seed_why=" (last attempt: $(_curl_detail))"
+        echo "⚠️  forum-updates-monitor.sh: armed, but cannot seed from the forum — not yet seeded and not receiving; will report when it can${_seed_why}"
         _SEED_ANNOUNCED=1
     fi
     sleep "$POLL_SECONDS"
@@ -524,9 +659,9 @@ while true; do
     # #3062: the `continue` itself is unchanged (cursor still preserved,
     # exactly as before) — only the EDGE is now announced, once on entry and
     # once on recovery, via $_FORUM_REACHABLE (declared above the loop).
-    if ! RESP="$(curl -s --fail --max-time 60 "$URL_BASE&since=$_cur" 2>/dev/null)"; then
+    if ! _curl_fetch 60 "$URL_BASE&since=$_cur"; then
         if [ "$_FORUM_REACHABLE" = 1 ]; then
-            echo "⚠️  forum-updates-monitor.sh: forum unreachable — still armed, not receiving; will report when it returns"
+            echo "⚠️  forum-updates-monitor.sh: forum unreachable ($(_curl_detail)) — still armed, not receiving; will report when it returns"
             _FORUM_REACHABLE=0
         fi
         continue

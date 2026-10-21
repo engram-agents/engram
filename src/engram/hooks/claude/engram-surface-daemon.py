@@ -153,30 +153,27 @@ def _indexer_loop(interval_s: int, shutdown_event: threading.Event) -> None:
         shutdown_event.wait(timeout=1.0)
 
 
+_HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOKS_DIR not in sys.path:
+    sys.path.insert(0, _HOOKS_DIR)
+from _hooklib import engram_home_or_exit  # noqa: E402
+
+
 def _resolve_engram_home() -> str:
     """Per-install data dir: knowledge.db, sockets, briefing, history.
 
-    Always returns an ABSOLUTE path (gh#2695): a relative ENGRAM_HOME would
-    make this process bind its AF_UNIX socket with a relative path string,
-    so /proc/net/unix records the bind exactly as passed to bind() --
-    relative text. start-engram-daemon.sh's unit-2 ownership guard
-    (#2652 phase-0) always compares against its own absolute $SOCKET_PATH
-    (built from whatever ENGRAM_HOME the HOOK resolved, which may differ in
-    absolute-vs-relative form and cwd from this process), so a relative
-    bind means the guard's path-text match finds zero rows, the guard
-    concludes "no live holder", and fails OPEN -- allowing exactly the
-    delete it exists to prevent. abspath() (not realpath()) is used
-    deliberately: it makes the path absolute relative to cwd without
-    resolving symlinks, which matches the existing expanduser-only
-    behavior for the already-absolute common case (an intermediate
-    symlinked ENGRAM_HOME component would keep resolving the same way it
-    always has -- realpath would be a second, unrelated behavior change
-    bundled into this fix).
+    Always an ABSOLUTE path, or this process exits: a RELATIVE ENGRAM_HOME is
+    REFUSED (alpha #3863 6b; engram_home_or_exit() prints one stderr line and
+    exits 0 before anything binds). Why it matters (gh#2695): a relative home
+    would make this process bind its AF_UNIX socket with a relative path
+    string, so /proc/net/unix records relative text, while
+    start-engram-daemon.sh's unit-2 ownership guard (#2652 phase-0) compares an
+    absolute $SOCKET_PATH, finds zero rows, concludes "no live holder" and
+    fails OPEN, allowing the delete it exists to prevent. Refusing the value
+    makes that structurally impossible; tests/test_resolve_engram_home_abspath.py
+    pins both the refusal and the pre-fix control that reproduces the bug.
     """
-    return os.path.abspath(
-        os.environ.get("ENGRAM_HOME")
-        or os.path.expanduser("~/.engram")
-    )
+    return str(engram_home_or_exit())
 
 
 ENGRAM_HOME = _resolve_engram_home()
@@ -200,10 +197,17 @@ _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import resolve_runtime_dir
+# #3628: the daemon's file opens are non-blocking and regular-file-only (a FIFO
+# planted at a daemon-owned path must not hang it); the helpers live in _hooklib.
+from _hooklib import open_regular_text, open_regular_text_write
 
 PROJECT_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
+_PIDFILE_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_pidfile.py")
 SOCKET_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.sock")
 PID_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.pid")
+# argv substring of a live daemon (its script name): the program-identity
+# guard in engram_pidfile (#3240).
+_PIDFILE_PROGRAM_MARKER = "engram-surface-daemon"
 
 # Bridge for downstream callers: ensure ENGRAM_HOME is set so any sibling process inherits it.
 os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
@@ -277,6 +281,17 @@ def handle_client(conn, client):
         conn.close()
 
 
+def _is_non_regular(path) -> bool:
+    """True only when `path` exists and is not a regular file (a FIFO, a
+    directory...). #3628: the daemon's file opens log-and-skip ONLY for such a
+    target; an OSError on a regular or missing file keeps its previous
+    handling. Same predicate as engram-surface-hook.py's _is_non_regular; the
+    two private copies are pinned by tests/test_hooks_sqlite_regular_3628s2d.py
+    (test_is_non_regular_copies_have_identical_ast and
+    test_is_non_regular_behaviour_is_the_same_in_both_copies)."""
+    return os.path.exists(path) and not os.path.isfile(path)
+
+
 def idle_watchdog(idle_timeout: int):
     """Exit if no queries received within idle_timeout seconds.
 
@@ -296,10 +311,18 @@ def idle_watchdog(idle_timeout: int):
             # alarm on next startup rather than a generic CRITICAL (#1260).
             tombstone_path = os.path.join(ENGRAM_HOME, "daemon-idle-shutdown")
             try:
-                with open(tombstone_path, "w") as f:
+                with open_regular_text_write(tombstone_path) as f:
                     f.write(str(int(time.time())))
             except OSError:
-                pass
+                # A regular-file error (read-only dir, ENOSPC...) is still
+                # swallowed silently. A FIFO/directory at the path is logged
+                # once and skipped: the tombstone is advisory, shutdown goes on.
+                if _is_non_regular(tombstone_path):
+                    print(
+                        f"[engram-daemon] {tombstone_path} is not a regular "
+                        f"file; skipping the idle-shutdown tombstone.",
+                        file=sys.stderr,
+                    )
             _shutdown.set()
             break
         _shutdown.wait(timeout=60)  # check every minute
@@ -335,7 +358,7 @@ def cleanup(*args):
     _shutdown.set()
     still_ours = False
     try:
-        with open(PID_PATH) as f:
+        with open_regular_text(PID_PATH) as f:
             still_ours = int(f.read().strip()) == os.getpid()
     except (OSError, ValueError):
         # No pidfile, or unreadable/garbage content -- nothing to protect
@@ -343,6 +366,15 @@ def cleanup(*args):
         # unconditional behavior for this case). Says nothing about the
         # socket -- see _bound_socket above.
         still_ours = True
+        # #3628: a FIFO/directory at PID_PATH is NOT a file this process wrote,
+        # so it is never unlinked: log once, leave it, keep going.
+        if _is_non_regular(PID_PATH):
+            still_ours = False
+            print(
+                f"[engram-daemon] {PID_PATH} is not a regular file; "
+                f"leaving it in place.",
+                file=sys.stderr,
+            )
     if still_ours:
         try:
             os.unlink(PID_PATH)
@@ -357,26 +389,251 @@ def cleanup(*args):
 
 
 def _recorded_pid_is_alive() -> bool:
-    """Return True if PID_PATH names a process that is still running.
-
-    False for: PID_PATH absent, unreadable, non-integer content, or a PID
-    that signal 0 confirms is dead. Best-effort -- any error means "assume
-    dead" so a corrupt pidfile never blocks a fresh daemon from starting.
+    """Return True if PID_PATH names a live process that could have written
+    it. Delegates to engram_pidfile.recorded_pid_is_alive() -- the single
+    source shared with engramd_owner.py (#3240 item 1): a pid reused by an
+    unrelated process after the instance crashed no longer reads as a live
+    daemon. False for PID_PATH absent, unreadable, or non-integer content.
     """
+    # Resolved via the runtime-dir mechanism (never a fixed parents[N]; the
+    # plugin build flattens hooks/claude/ -> hooks/). PROJECT_DIR is put on
+    # sys.path later in main() for engram_client; do it here too, since this
+    # check runs first.
+    if _PIDFILE_DIR not in sys.path:
+        sys.path.insert(0, _PIDFILE_DIR)
+    import engram_pidfile
+
+    return engram_pidfile.recorded_pid_is_alive(
+        PID_PATH, program_marker=_PIDFILE_PROGRAM_MARKER
+    )
+
+
+# #3361: startup gate exit codes (sysexits 75 = "temporary failure"), so a
+# supervisor log reads "refused, did not start" rather than a crash. Distinct
+# so a reader can tell "a live holder was positively identified" from "could
+# not prove the path unheld". Never 0: exit 0 tells a supervisor all is well.
+EXIT_SOCKET_HELD = 75       # another live process holds SOCKET_PATH
+EXIT_SOCKET_UNPROVEN = 76   # could not prove SOCKET_PATH is unheld (fail closed)
+
+# #3361: a refusal waits this long BEFORE exiting. Under systemd
+# (Restart=always) and launchd (KeepAlive true) an immediate exit would
+# relaunch at once and hot-loop; with the wait the refusal repeats about once a
+# minute and still self-heals the moment the holder goes away. Deliberately a
+# daemon-side wait, not RestartPreventExitStatus / ThrottleInterval: a
+# prevented restart leaves the unit `failed`, which start-engram-daemon.sh
+# reads as registered-failing and never relaunches, so the refusal would stick
+# even after the holder died.
+REFUSAL_BACKOFF_S = 60
+_REFUSAL_BACKOFF_MAX_S = 3600
+
+
+def _refusal_backoff_s() -> float:
+    """Seconds to wait before a refusal exit.
+
+    ENGRAM_DAEMON_REFUSAL_BACKOFF_S (float seconds) overrides REFUSAL_BACKOFF_S.
+    Missing, empty, non-numeric, negative or non-finite falls back to the
+    default silently (no extra log line). 0 means no wait. Capped at 3600.
+    """
+    raw = os.environ.get("ENGRAM_DAEMON_REFUSAL_BACKOFF_S", "")
     try:
-        with open(PID_PATH) as f:
-            pid = int(f.read().strip())
-    except (OSError, ValueError):
-        return False
+        val = float(raw)
+    except (ValueError, TypeError):
+        return REFUSAL_BACKOFF_S
+    if not (val >= 0) or val == float("inf"):  # negative, nan, inf
+        return REFUSAL_BACKOFF_S
+    return min(val, _REFUSAL_BACKOFF_MAX_S)
+
+
+def _wait_refusal_backoff(seconds: float) -> None:
+    """Sleep `seconds` before a refusal exit.
+
+    No signal handler is installed at the refusal point (the daemon's
+    SIGTERM/SIGINT handlers come after the bind), so SIGTERM's default action
+    ends a plain sleep at once and `systemctl stop` / a launchd unload are not
+    delayed. SIGINT surfaces as KeyboardInterrupt; end the wait quietly so the
+    refusal exit code is still returned rather than a traceback.
+    """
+    if seconds <= 0:
+        return
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
+        time.sleep(seconds)
+    except KeyboardInterrupt:
+        pass
+
+
+_LSOF_TIMEOUT_S = 5
+
+
+def _pids_holding_inode(inode, proc_root):
+    """Pids (ints) with an fd link `socket:[inode]` under proc_root/<pid>/fd.
+    Unreadable pid dirs are skipped (permissions), so [] means "none we
+    could see", never "none exist"."""
+    target = "socket:[" + inode + "]"
+    pids = set()
+    try:
+        names = os.listdir(proc_root)
     except OSError:
-        # Any other errno (e.g. EPERM on a reused PID owned by someone
-        # else) -- treat as "not confirmably ours", same as dead.
-        return False
-    return True
+        return []
+    for name in names:
+        if not name.isdigit():
+            continue
+        fd_dir = os.path.join(proc_root, name, "fd")
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                link = os.readlink(os.path.join(fd_dir, fd))
+            except OSError:
+                continue
+            if link == target:
+                pids.add(int(name))
+                break
+    return sorted(pids)
+
+
+def _holder_cwds(inode, proc_root):
+    """cwd paths of every pid holding `inode`, or None when that cannot be
+    established (no visible pid, or any holder's cwd unreadable): the caller
+    must then treat a relative-path row as UNKNOWN, not as another file."""
+    pids = _pids_holding_inode(inode, proc_root)
+    if not pids:
+        return None
+    cwds = []
+    for pid in pids:
+        try:
+            cwds.append(os.readlink(os.path.join(proc_root, str(pid), "cwd")))
+        except OSError:
+            return None
+    return cwds
+
+
+def _socket_holder_state(socket_path, proc_net_unix="/proc/net/unix", proc_root="/proc"):
+    """Who holds `socket_path`? Returns (state, pids), state in HELD / FREE /
+    UNKNOWN, pids a sorted list of ints (may be empty even when HELD).
+
+    Positive identification only, fail CLOSED (#3361). Mirrors the shell
+    guard in start-engram-daemon.sh (#3359):
+
+    * Where `proc_net_unix` exists: each named row's PATH-TEXT column is
+      classified against `socket_path` (see the comment above the loop:
+      aliased and relative spellings are resolved, never compared as bare
+      text; never by inode against stat(), never by substring). HELD even if
+      no pid can be resolved (permissions); UNKNOWN when a row cannot be
+      shown to be another file; FREE only when every row is provably not ours.
+    * Else (macOS/BSD): `lsof -t -- <path>`. rc 0 with pid lines is HELD;
+      every other outcome (rc 1, other rc, timeout, no lsof, no parsable pid)
+      is UNKNOWN. `-U` is deliberately NOT passed: with a path argument lsof
+      ORs the selections and would list every unix-socket holder on the host.
+
+    A connect() attempt is never proof of absence: a socket that is bound but
+    not listening answers ECONNREFUSED and is still a live holder.
+    """
+    if os.path.exists(proc_net_unix):
+        try:
+            with open(proc_net_unix, errors="replace") as f:
+                lines = f.readlines()
+        except OSError:
+            return ("UNKNOWN", [])
+        # The kernel lists the BIND-TIME path text, which can be a different
+        # spelling of our file (a symlinked parent directory, or a relative
+        # bind). So each named row is CLASSIFIED against our file, never
+        # just compared as text (#3361, #3490 security review):
+        #   absolute P: P == socket_path or realpath(P) == realpath(ours)
+        #     -> HELD. Else if P's directory resolves to a real directory
+        #     and the realpaths differ, the row cannot be our file -> ignore
+        #     (a same-basename decoy elsewhere). Else (directory missing,
+        #     dangling symlink, unresolvable) and the basename matches ->
+        #     UNKNOWN: we cannot show the row is not our file.
+        #   relative P: a different basename -> ignore. Same basename: the
+        #     meaning depends on the binder's cwd, so read
+        #     /proc/<pid>/cwd of the pid(s) holding the row's inode;
+        #     realpath(cwd/P) == realpath(ours) -> HELD, different ->
+        #     ignore, no pid or an unreadable cwd -> UNKNOWN.
+        #   Aggregate: any HELD -> HELD; else any UNKNOWN -> UNKNOWN; else
+        #     FREE. Unnamed and abstract ('@') rows are skipped. Matching is
+        #     exact path equality, never substring, and never a comparison of
+        #     filesystem inodes against sockfs inodes.
+        # Remaining limits, stated precisely (not claimed solved): the
+        # kernel text is whatever the binder passed, so (1) a holder that
+        # bound through a symlink that was RETARGETED after the bind, or a
+        # relative-bind holder that chdir()ed afterwards, is classified by
+        # where the text points NOW; (2) a hard link (link() on a socket
+        # file) or a bind mount can make our path reach a socket whose row
+        # text has a different directory AND basename. All three need a
+        # local process that deliberately re-plumbs paths after binding.
+        ours_real = os.path.realpath(socket_path)
+        ours_base = os.path.basename(socket_path)
+        held_inodes = set()
+        unknown = False
+        for line in lines:
+            # 7 fixed columns then the path text (which may contain spaces).
+            parts = line.rstrip("\n").split(None, 7)
+            if len(parts) != 8:
+                continue
+            inode, text = parts[6], parts[7]
+            if text.startswith("@"):
+                continue
+            if os.path.isabs(text):
+                if text == socket_path or os.path.realpath(text) == ours_real:
+                    held_inodes.add(inode)
+                elif os.path.isdir(os.path.realpath(os.path.dirname(text))):
+                    continue  # provably another file (a decoy)
+                elif os.path.basename(text) == ours_base:
+                    unknown = True
+            elif os.path.basename(text) == ours_base:
+                cwds = _holder_cwds(inode, proc_root)
+                if not cwds:
+                    unknown = True
+                    continue
+                for cwd in cwds:
+                    if os.path.realpath(os.path.join(cwd, text)) == ours_real:
+                        held_inodes.add(inode)
+                        break
+        if not held_inodes:
+            return ("UNKNOWN" if unknown else "FREE", [])
+        pids = set()
+        for inode in held_inodes:
+            pids.update(_pids_holding_inode(inode, proc_root))
+        return ("HELD", sorted(pids))
+
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            ["lsof", "-t", "--", socket_path],
+            capture_output=True,
+            text=True,
+            timeout=_LSOF_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ("UNKNOWN", [])
+    if r.returncode != 0:
+        return ("UNKNOWN", [])
+    pids = sorted({int(t) for t in (r.stdout or "").split() if t.isdigit()})
+    if not pids:
+        return ("UNKNOWN", [])
+    return ("HELD", pids)
+
+
+def _write_pidfile():
+    """Write this process's pid to PID_PATH. #3628: a FIFO/directory already at
+    PID_PATH is logged once and the daemon runs without a pidfile (no crash, no
+    hang); any other OSError -- e.g. a PermissionError on a regular file --
+    propagates exactly as it did before."""
+    os.makedirs(os.path.dirname(PID_PATH), exist_ok=True)
+    try:
+        with open_regular_text_write(PID_PATH) as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        if not _is_non_regular(PID_PATH):
+            raise
+        print(
+            f"[engram-daemon] {PID_PATH} is not a regular file; "
+            f"running without a pidfile.",
+            file=sys.stderr,
+        )
 
 
 def main():
@@ -405,6 +662,47 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(0)
+        # #3361: the recorded pid is dead, but that does not mean nobody
+        # holds the path (pidfile stale / missing / names another process).
+        # Unlink only when the path is positively known to be unheld; a live
+        # holder or an unprovable answer refuses loudly rather than steal.
+        state, holders = _socket_holder_state(SOCKET_PATH)
+        # Defensive: HELD with only our own pid is effectively unreachable
+        # here, since we have not bound yet at gate time.
+        others = [p for p in holders if p != os.getpid()]
+        if state == "HELD" and (others or not holders):
+            who = ",".join(str(p) for p in others) if others else "unknown"
+            print(
+                f"[engram-daemon] socket {SOCKET_PATH} is held by live "
+                f"process(es) pid={who} -- refusing to steal it (exit "
+                f"{EXIT_SOCKET_HELD})",
+                file=sys.stderr,
+                flush=True,
+            )
+            _wait_refusal_backoff(_refusal_backoff_s())
+            sys.exit(EXIT_SOCKET_HELD)
+        if state == "UNKNOWN":
+            print(
+                f"[engram-daemon] could not prove socket {SOCKET_PATH} is "
+                "unheld (no /proc/net/unix answer and no usable lsof "
+                "answer) -- refusing to remove it; if you know it is stale, "
+                f"remove it by hand (exit {EXIT_SOCKET_UNPROVEN})",
+                file=sys.stderr,
+                flush=True,
+            )
+            _wait_refusal_backoff(_refusal_backoff_s())
+            sys.exit(EXIT_SOCKET_UNPROVEN)
+        # Two race windows, which are NOT the same:
+        # (a) FREE -> os.unlink (microseconds): a non-daemon process that
+        #     binds a path just proven stale can have its live socket
+        #     unlinked here, after which our own bind() succeeds -- a steal.
+        #     This gate narrows that window; it does not close it, and
+        #     nothing short of an atomic bind-or-fail can.
+        # (b) os.unlink -> our bind() (the model load, seconds): a process
+        #     that binds in this window wins, and our bind() fails loudly
+        #     with EADDRINUSE. bind() never unlinks: the only server.bind
+        #     is the one in main(), and SOCKET_PATH is unlinked only in
+        #     cleanup() and in this gate.
         try:
             os.unlink(SOCKET_PATH)
         except OSError:
@@ -420,10 +718,7 @@ def main():
     # Force-load the embedding model now so first query is fast
     _client.call("engram_surface", {"query": "warmup", "top_k": 1, "semantic": True})
 
-    # Write PID file
-    os.makedirs(os.path.dirname(PID_PATH), exist_ok=True)
-    with open(PID_PATH, "w") as f:
-        f.write(str(os.getpid()))
+    _write_pidfile()
 
     # Set up signal handlers
     signal.signal(signal.SIGTERM, cleanup)

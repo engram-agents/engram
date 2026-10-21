@@ -208,7 +208,23 @@ def write_durable_snapshot(conn: sqlite3.Connection, turn: int, seq: int) -> dic
 
     MUST be called while the caller holds the #786 WAL read-mark on ``conn`` so the
     temporary destination connection is never seen as the last WAL reader (R5).
+    The caller keeps ``conn`` (and its read-mark) open for the whole call; the fresh
+    read-only source connection and the destination connection opened here are
+    temporaries opened and closed inside that window.
     write-to-tmp → fsync file → atomic rename → fsync dir.
+
+    The backup is taken from a FRESH ``mode=ro`` connection on the file behind
+    ``conn`` (path read from the ``main`` row of ``PRAGMA database_list``), never
+    from ``conn`` itself: ``conn.backup()`` on a connection holding an uncommitted
+    WRITE transaction hangs forever (#3232). ``conn`` is left untouched (no commit,
+    no rollback).
+
+    Trade-off: the snapshot is the COMMITTED state. Rows the caller has not
+    committed are left out without any error. Callers commit before snapshotting.
+
+    If ``conn`` has no file behind it (``:memory:`` / temp DB) a fresh connection
+    would open a different, empty DB, so that is a failure, not a silent empty
+    snapshot.
 
     Returns {"path", "bytes", "fsynced": True} on success or {"error": str}.
     """
@@ -216,11 +232,26 @@ def write_durable_snapshot(conn: sqlite3.Connection, turn: int, seq: int) -> dic
     final = pending / _snapshot_name(turn, seq)
     tmp = pending / (_snapshot_name(turn, seq) + ".tmp")
     try:
-        dest = sqlite3.connect(str(tmp))
+        db_path = ""
+        for row in conn.execute("PRAGMA database_list").fetchall():
+            if row[1] == "main":
+                db_path = row[2] or ""
+                break
+        if not db_path:
+            raise RuntimeError(
+                "cannot snapshot: caller connection has no file behind it "
+                "(empty main path: :memory: or temp DB); a fresh connection would "
+                "open a different, empty database"
+            )
+        src = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
         try:
-            conn.backup(dest)  # consistent hot copy of the live main+WAL view
+            dest = sqlite3.connect(str(tmp))
+            try:
+                src.backup(dest)  # consistent hot copy of the committed main+WAL view
+            finally:
+                dest.close()
         finally:
-            dest.close()
+            src.close()
         _fsync_file(tmp)
         os.replace(str(tmp), str(final))
         _fsync_dir(pending)

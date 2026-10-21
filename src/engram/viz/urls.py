@@ -8,7 +8,7 @@ so the dependency has to run shell -> urls (never the reverse), or the two
 modules would import each other. Keeping this module leaf-level (only
 stdlib) avoids that entirely.
 
-Route names ("graph"/"health"/"stats"/"config") match ``shell._NAV_TABS``'s
+Route names ("graph"/"health"/"stats"/"config"/"moments") match ``shell._NAV_TABS``'s
 tab keys 1:1, and the paths match ``routes.PAGE_ROUTES``'s keys 1:1. No
 single shared registry object binds all three together (a deliberate
 choice, not an oversight: the three name/path pairs are short, and this
@@ -36,13 +36,14 @@ _ROUTE_PATHS: dict[str, str] = {
     "health": "/health",
     "stats": "/stats",
     "config": "/config",
+    "moments": "/moments",
 }
 
 
 def url_for(name: str, **params) -> str:
     """Build an internal URL for route *name*.
 
-    *name* is one of "graph"/"health"/"stats"/"config", or the special
+    *name* is one of "graph"/"health"/"stats"/"config"/"moments", or the special
     value "static" (which additionally requires a ``filename=`` kwarg and
     ignores any other kwargs).
 

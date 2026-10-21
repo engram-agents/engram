@@ -12,7 +12,7 @@ Usage:
                                 [--similarity] [--format human|json]
 
     --db PATH         Path to knowledge.db. Default: ENGRAM_HOME (or
-                       ~/.engram)/knowledge.db, via engram_core.DATA_DIR.
+                       ~/.engram)/knowledge.db, via engram_core.DATA_DIR ($ENGRAM_HOME).
     --quote-type T    Restrict to one quote_type (e.g. hard_data).
     --top N           Worst-N list size. Default 20.
     --similarity      Also compute cosine(embed(quoted_text), embed(claim))

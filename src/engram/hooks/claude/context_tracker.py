@@ -23,11 +23,26 @@ Every call reads the JSONL and config.json fresh.
 import glob
 import json
 import os
+import sys
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or os.path.expanduser("~/.engram")
+# _hooklib.py sits beside this file in both build topologies, so -- as
+# _stophooklib does -- make that directory importable before importing it: a
+# loader such as spec_from_file_location (every test that loads this module by
+# path) does not add it, and no hook bootstrap has run in that process.
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+# #3628: every open() here is non-blocking and regular-file-only (a FIFO at a
+# marker / config / transcript path must raise OSError, not hang the hook).
+from _hooklib import (
+    open_regular_text,
+    sanitize_probe_text,
+    split_probe_reason,
+    write_probe_unknown_stderr,
 )
+from _hooklib import engram_home_or_exit
+
+ENGRAM_HOME = str(engram_home_or_exit())
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")  # legacy; unused
 LAST_COMPACT_PATH = os.path.join(ENGRAM_HOME, "last-compact-at.json")
 LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
@@ -112,7 +127,7 @@ def find_active_jsonl(session_id: str | None = None) -> str | None:
         return None
     marker_path = os.path.join(ENGRAM_HOME, "sessions", f"{session_id}.json")
     try:
-        with open(marker_path) as f:
+        with open_regular_text(marker_path) as f:
             marker = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
         return None
@@ -180,7 +195,7 @@ def _read_drowsiness_ceiling_tokens() -> int:
 
     config_path = os.path.join(ENGRAM_HOME, "config.json")
     try:
-        with open(config_path) as f:
+        with open_regular_text(config_path) as f:
             config = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
         config = {}
@@ -218,7 +233,7 @@ def _read_drowsiness_ceiling_tokens() -> int:
             "[engram] Notice: cadence.drowsiness_ceiling_tokens is not set. "
             "Falling back to 152,000 tokens. Run /context in Claude Code, note "
             "the auto-compaction limit, and set cadence.drowsiness_ceiling_tokens "
-            "in ~/.engram/config.json to the actual auto-compact threshold "
+            "in ~/.engram/config.json (under $ENGRAM_HOME) to the actual auto-compact threshold "
             "(e.g. 155_000 for 200K window, 950_000 for 1M window — see #1247).",
             file=__import__("sys").stderr,
         )
@@ -238,7 +253,7 @@ def compute_ceiling() -> int:
 def _last_compact_offset(jsonl_path: str) -> int | None:
     """Return the byte-offset where the last /compact fired, if known.
 
-    Reads ~/.engram/last-compact-at.json (written by the PostCompact hook).
+    Reads ~/.engram/last-compact-at.json (under $ENGRAM_HOME; written by the PostCompact hook).
     Returns None if the marker is missing, stale (records a different
     JSONL than the current session), or unreadable. As of ~2026-05-07
     Claude Code no longer writes a `compact_boundary` JSONL entry, so
@@ -247,7 +262,7 @@ def _last_compact_offset(jsonl_path: str) -> int | None:
     and rely on the legacy fallback path in read_current_tokens.
     """
     try:
-        with open(LAST_COMPACT_PATH) as f:
+        with open_regular_text(LAST_COMPACT_PATH) as f:
             marker = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
         return None
@@ -259,12 +274,14 @@ def _last_compact_offset(jsonl_path: str) -> int | None:
     return offset
 
 
-def read_current_tokens(transcript_path: str | None = None) -> int | None:
+def read_current_tokens(
+    transcript_path: str | None = None, *, _unknown_sink: list | None = None
+) -> int | None:
     """Input-token count of the most recent post-compact assistant usage record.
 
     Two boundary-detection paths, in priority order:
 
-    1. ~/.engram/last-compact-at.json marker file written by the PostCompact
+    1. ~/.engram/last-compact-at.json (under $ENGRAM_HOME) marker file written by the PostCompact
        hook. If present and matches the current JSONL, only the post-marker
        portion of the file is scanned — pre-compact usage records are
        structurally invisible. This is the canonical path on Claude Code
@@ -280,12 +297,25 @@ def read_current_tokens(transcript_path: str | None = None) -> int | None:
     the correct behavior in the turn between /compact and the first
     post-compact assistant message (which prevents the bogus drowsiness
     spike documented in ob_NNNN and ob_NNNN).
+
+    Also returns None -- publicly unchanged -- when the RESOLVED transcript
+    cannot be opened (OSError: mode 000, a FIFO, EIO). That one case is UNKNOWN,
+    not "no data" (#3521 row 8): the private keyword-only `_unknown_sink`, when
+    a list is passed, receives one "<Type>: <msg>" string for it, which is how
+    estimate_usage tells it apart from the three legitimate None paths. A
+    transcript that _resolve_jsonl resolved but that is deleted before the open
+    (FileNotFoundError) is UNKNOWN by design too: resolved, then unreadable --
+    unlike the unresolved path, which is decided earlier and stays None.
     """
     jsonl_path = _resolve_jsonl(transcript_path)
     if not jsonl_path:
         return None
     try:
-        with open(jsonl_path, "rb") as f:
+        # open_regular_text is a text-mode wrapper; the transcript is read as
+        # raw bytes through its .buffer (the same BufferedReader open(.., "rb")
+        # returns), so seek/tell/read are unchanged.
+        with open_regular_text(jsonl_path) as _tf:
+            f = _tf.buffer
             f.seek(0, 2)
             size = f.tell()
             # Path 1: if a post-compact marker exists for this JSONL, start
@@ -302,7 +332,9 @@ def read_current_tokens(transcript_path: str | None = None) -> int | None:
                 start = max(0, size - TAIL_SCAN_BYTES)
             f.seek(start)
             tail = f.read()
-    except OSError:
+    except OSError as exc:
+        if _unknown_sink is not None:
+            _unknown_sink.append(f"{type(exc).__name__}: {exc}")
         return None
 
     for line in reversed(tail.split(b"\n")):
@@ -337,7 +369,7 @@ def estimate_usage(transcript_path: str | None = None, session_id: str | None = 
     through means every path lookup resolves to THIS session — race-free
     even when other Claude sessions run concurrently. When either is
     missing, callers fall back to looking up the per-session marker at
-    ~/.engram/sessions/<session_id>.json by session_id.
+    ~/.engram/sessions/<session_id>.json (under $ENGRAM_HOME) by session_id.
 
     The ceiling is sourced from cadence.drowsiness_ceiling_tokens (see
     compute_ceiling / _read_drowsiness_ceiling_tokens). Mode is derived
@@ -345,8 +377,16 @@ def estimate_usage(transcript_path: str | None = None, session_id: str | None = 
     format_drowsiness picks per-mode display thresholds correctly rather
     than always defaulting to the "1m" band (which silently ignores
     drowsiness_display.200k config for low-ceiling users).
+
+    Returns {"unknown": "<Type>: <msg>"} -- and only that key -- when the
+    resolved transcript could not be read (#3521 row 8); format_drowsiness
+    renders it. The legitimate no-data cases (no resolvable path, empty
+    post-compact window, no usage record yet) still return None.
     """
-    current = read_current_tokens(transcript_path)
+    unknown: list = []
+    current = read_current_tokens(transcript_path, _unknown_sink=unknown)
+    if unknown:
+        return {"unknown": unknown[0]}
     if current is None:
         return None
     ceiling = compute_ceiling()
@@ -412,7 +452,7 @@ def _load_drowsiness_thresholds(mode: str) -> dict:
     )
     config_path = os.path.join(ENGRAM_HOME, "config.json")
     try:
-        with open(config_path) as f:
+        with open_regular_text(config_path) as f:
             config = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
         return defaults
@@ -471,7 +511,24 @@ def format_drowsiness(usage: dict) -> str:
     Stop path carried a loop-risk defect (no stop_hook_active guard, plus a
     lowered prose threshold that made re-fire more likely exactly when turns
     are most expensive).
+
+    UNKNOWN (#3521 row 8): a usage of {"unknown": "<Type>: <msg>"} -- the
+    transcript could not be read -- is handled FIRST, before any key the
+    percentage arithmetic indexes, and renders one bounded line
+    `[Drowsiness: unknown (<Type>)]` (class only, never the raw message). One
+    sanitized stderr line and the injected line are both emitted on EVERY
+    call: there is deliberately NO rate limit. The healthy banner already
+    renders on every prompt, so an unknown banner every prompt adds no noise;
+    and with no stamp written at render time, the race "stamped, then the line
+    is dropped under the injection budget, silent for a whole window" cannot
+    happen.
     """
+    if "unknown" in usage:
+        reason = usage["unknown"]
+        write_probe_unknown_stderr("context_tracker", "drowsiness", reason)
+        cls, _ = split_probe_reason(reason)
+        return f"[Drowsiness: unknown ({sanitize_probe_text(cls, 40)})]"
+
     pct = usage["usage_pct"]
     est_tokens = usage["estimated_tokens"]
     limit = usage["context_limit"]
@@ -496,7 +553,7 @@ def format_drowsiness(usage: dict) -> str:
                 f"[Drowsiness: {pct:.0%} — loop mode: compaction is near and the summary "
                 f"will not carry your work across it. BEFORE starting this burst, capture "
                 f"the LAST one: (1) append its arc to today's "
-                f"~/.engram/history/YYYY-MM-DD.md, (2) write the nodes for anything you "
+                f"{ENGRAM_HOME}/history/YYYY-MM-DD.md, (2) write the nodes for anything you "
                 f"decided or found, (3) nap to checkpoint it. Anything left only in "
                 f"context is lost at the boundary, not deferred. The in-flight burst "
                 f"cannot be saved either way — so capture the completed one and keep "

@@ -7,7 +7,7 @@ compactMetadata: preTokens, postTokens, durationMs) at /compact time; the
 context_tracker scans the JSONL for that marker to locate the post-compact
 window. The marker was transiently absent ~2026-05-07 but is confirmed back
 in live sessions (live-verified 2026-06-09). The PostCompact hook writes the
-JSONL byte offset at compact time into ~/.engram/last-compact-at.json as a
+JSONL byte offset at compact time into ~/.engram/last-compact-at.json (under $ENGRAM_HOME) as a
 correctness backstop — for sessions where compact_boundary is absent or
 stale the tracker falls back to the marker; for normal sessions it is a
 belt-and-suspenders efficiency hedge (avoids rescanning from the top).
@@ -31,11 +31,9 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import find_active_jsonl
 from _hooklib import atomic_write_json, resolve_runtime_dir
+from _hooklib import engram_home_or_exit
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or os.path.expanduser("~/.engram")
-)
+ENGRAM_HOME = str(engram_home_or_exit())
 MARKER_PATH = os.path.join(ENGRAM_HOME, "last-compact-at.json")
 
 # Module-scope emitter resolve+insert (gh#2570 §1/§3): this hook previously

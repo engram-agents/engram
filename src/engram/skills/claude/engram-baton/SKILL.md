@@ -38,7 +38,7 @@ A **Project** (bunch) is a topic-coherent or defect-class-coherent unit of work 
 ### PR layer — `flip`
 
 A **PR-baton** (e.g., `PR-487`) tracks the per-PR turn cursor through the review pipeline:
-1. Coder-fairy opens PR → `baton init PR-N --title "<short>" --participants alice,bob --turn alice --status in-progress`
+1. Coder-fairy opens PR → `baton init PR-N --title "<short>" --participants alice,bob --turn alice --status in-progress --repo <owner>/<repo>`
 2. Reviewer-fairy converges → `baton flip PR-N bob "fairy-converged; colleague request"`
 3. Colleague review → `baton flip PR-N {{USER_NAME}} "colleague-APPROVED"`
 4. Maintainer merge → eventual `baton close PR-N --status merged`
@@ -46,6 +46,12 @@ A **PR-baton** (e.g., `PR-487`) tracks the per-PR turn cursor through the review
 Frequent passes between agents. Don't use `claim`/`release` here — `flip` is the right verb for "I'm passing the next action."
 
 **The verb tells the reader the genre**: `flip` = transient cursor; `claim`/`release` = persistent ownership.
+
+### The `peer → merge` edge — `advance` (#3039 U2b)
+
+When the colleague has approved, hand the PR to the merge seat with `baton advance <PR-N> [--to <merge-seat>]` (or the old spelling `baton flip <PR-N> <merge-seat> "<reason>"` — it resolves as the same transition and is held to the same gate). The **server** decides: the baton needs a repo-qualified PR anchor, phase `peer`, a `colleague`, and a **current** GitHub `APPROVED` review on the head by that colleague's mapped login (their latest opinionated review — a later `CHANGES_REQUESTED`/`DISMISSED` revokes it, a later `COMMENTED` doesn't). CI red/pending refuses; CI `unknown` only warns; an `unknown`/`incomplete` approval verdict **refuses**. The output prints the CI verdict and the approval verdict on separate lines. Re-running it once the baton is at `merge` changes nothing. There is no force or skip option; if it refuses, fix the cause (re-request review, wait for CI, ask the admin to add the colleague to the login map), don't look for a way around it.
+
+**Know its limit.** It proves an authenticated non-author GitHub approval by a mapped account on the current head; it does not prove that the assigned colleague approved (`colleague` and `agent` are caller-declared and mutable), nor who ran the command. And the GitHub check and the forum write are not one cross-system transaction: a `CHANGES_REQUESTED` landing in that one-round-trip window still advances. Don't describe `advance` as "verified by the colleague" or "atomic." Full detail: `docs/baton-protocol.md`.
 
 ### Naming a colleague
 
@@ -78,10 +84,11 @@ The auto-pull hook surfaces live GitHub status only when a baton has a resolvabl
 2. **Explicit anchor required**: all other ids (e.g. `PR-env-home`, `pool-data-correctness`) — the hook resolves to None and skips the live-status clause unless you set a `github:` field.
 
 To set the anchor:
-- **At init time**: `baton init <id> --title "..." --participants <a,b> --github pr/<N>`
-- **On an existing baton**: `baton anchor <id> --github pr/<N>` (or `--github project/<N>`)
+- **At init time**: `baton init <id> --title "..." --participants <a,b> --github pr/<owner>/<repo>/<N>` (`baton init` refuses a bare `pr/<N>`: there is no default repo; the server later refuses a bare anchor at gc/flip/merge)
+- **PR-shaped id with no number** (e.g. `PR-autopull`): `baton init` refuses it unless `--github` is given. Pass `--github pr/<owner>/<repo>/<N>` if it is a PR, or `--github project/<N>` (a bunch) / a non-PR-shaped id if it is not.
+- **On an existing baton**: `baton anchor <id> --github pr/<owner>/<repo>/<N>` (or `--github project/<owner>/<N>` / `--github project/<N>`)
 
-Valid anchor formats: `pr/<N>` for PRs, `project/<N>` for GitHub Projects. Malformed values (e.g. `xyz`, `pr/abc`) are rejected with `EXIT_VALIDATION`.
+Valid anchor formats: `pr/<owner>/<repo>/<N>` for PRs (bare `pr/<N>` parses but is refused downstream), `project/<owner>/<N>` for GitHub Projects (the owner is the GitHub user or org that owns the project; the prompt hook's live tally needs it, from the anchor or from `BATON_GH_OWNER` -- a bare `project/<N>` with neither shows a "no owner" notice instead of a tally). Malformed values (e.g. `xyz`, `pr/abc`) are rejected with `EXIT_VALIDATION`.
 
 ---
 
@@ -115,9 +122,10 @@ Three genres of inter-agent communication, only one of which baton-grab replaces
 | Release a Project back to pool (done) | `baton release <pool-X> --done` |
 | Release a Project back to pool (abandoned) | `baton release <pool-X> --reason "<why>"` |
 | Pass a PR's turn forward | `baton flip <PR-N> <to-agent> "<reason>"` |
-| Open a new PR baton | `baton init <PR-N> --title "<short>" --participants <a,b> --turn <self> --status in-progress` |
-| Open a new PR baton with GitHub anchor | `baton init <id> ... --github pr/<N>` |
-| Set/update GitHub anchor on existing baton | `baton anchor <id> --github pr/<N>` |
+| Colleague approved → hand to the merge seat (strict, server-gated) | `baton advance <PR-N> [--to <merge-seat>]` |
+| Open a new PR baton | `baton init <PR-N> --title "<short>" --participants <a,b> --turn <self> --status in-progress --repo <owner>/<repo>` |
+| Open a new PR baton with GitHub anchor | `baton init <id> ... --github pr/<owner>/<repo>/<N>` |
+| Set/update GitHub anchor on existing baton | `baton anchor <id> --github pr/<owner>/<repo>/<N>` |
 | Set/change the expected colleague reviewer | `baton set-colleague <id> <agent>` |
 | Add a participant to an existing baton | `baton add-participant <id> <agent>` |
 | Rename a Project's title | `baton rename <id> --title "<new>"` |
@@ -149,4 +157,4 @@ Pass `--help` to any subcommand for the full flag list.
 - **Hook integration**: `hooks/claude/engram-baton-prompt-hook.py` — surfaces in-court batons + live GitHub status every prompt
 - **Project files**: `/home/agents-shared/forum/projects/<id>.md` (YAML frontmatter + audit-log body)
 - **Auto-pull cache**: `$ENGRAM_HOME/baton-status-cache.json` (30s TTL)
-- **Marker for self-paced loops**: `~/.engram/loop-mode.json` (see `engram-loop` skill for lifecycle)
+- **Marker for self-paced loops**: `~/.engram/loop-mode.json` (under `$ENGRAM_HOME`, default `~/.engram`; see `engram-loop` skill for lifecycle)

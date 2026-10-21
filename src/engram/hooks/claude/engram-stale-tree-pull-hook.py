@@ -24,7 +24,7 @@ repo paths in either hook:
       ...
     ]
 
-in ~/.engram/config.json. `path` may use `~` (expanded here). Absent, empty,
+in ~/.engram/config.json (under $ENGRAM_HOME). `path` may use `~` (expanded here). Absent, empty,
 or malformed `stale_tree_watch` -> silent no-op: this hook ships in the
 plugin for ALL installs, but only acts once an install opts in by populating
 this field (Lei's ruling — do not add auto-discovery of repos).
@@ -57,10 +57,11 @@ import os
 import subprocess
 import sys
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or os.path.expanduser("~/.engram")
-)
+_HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOKS_DIR not in sys.path:
+    sys.path.insert(0, _HOOKS_DIR)
+from _hooklib import engram_home_or_exit  # noqa: E402
+ENGRAM_HOME = str(engram_home_or_exit())
 
 # Caps every individual git subprocess call (fetch included) — keeps a dead
 # network or a hung git process from blocking SessionStart.

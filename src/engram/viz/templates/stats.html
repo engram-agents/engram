@@ -61,7 +61,7 @@
   function fmtMs(v) { return (v === null || v === undefined) ? '—' : v + 'ms'; }
   function fmtN(v) { return (v === null || v === undefined) ? '—' : v; }
   // HTML-escape DB-sourced strings before innerHTML concatenation. The
-  // indexer accepts arbitrary JSONL from ~/.engram/logs/sessions/; while
+  // indexer accepts arbitrary JSONL from ~/.engram/logs/sessions/ ($ENGRAM_HOME, default ~/.engram); while
   // emitter-produced fields are well-controlled, externally crafted event
   // files could land arbitrary content in hook_name/tool_name/result_status/
   // event_type/ts/detail and into the dashboard via innerHTML. Per round-1

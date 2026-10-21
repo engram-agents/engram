@@ -16,7 +16,7 @@ version: 1
 |-----------|------|
 | ENGRAM data (graph, history, diary, sessions, config, warm-briefing) | `{{ENGRAM_HOME}}/` |
 | Plugin runtime (`server.py`, runtime modules, `hooks/`, `skills/`, `agents/`, `tools/`, `templates/`) | `{{ENGRAM_HOME}}/marketplace/plugins/engram/` (`CLAUDE_PLUGIN_ROOT`) |
-| Plugin venv (canonical python for the MCP server + daemon) | `{{ENGRAM_HOME}}/venv/` |
+| Plugin venv (canonical python for the MCP server + daemon) | `~/.engram/venv/`, always here, independent of `ENGRAM_HOME` |
 | MCP server config | plugin `.mcp.json` at `CLAUDE_PLUGIN_ROOT` (launches via `launch-engram-server.sh`) — registered through the plugin marketplace, not `~/.claude.json` |
 | Hook config | plugin `hooks/hooks.json` at `CLAUDE_PLUGIN_ROOT` (loaded by the plugin system, not `~/.claude/settings.json`) |
 | Plugin marketplace + enable state | marketplace `engram-local` registered in `~/.claude/settings.json`; Claude-managed plugin data/cache in `~/.claude/plugins/` |

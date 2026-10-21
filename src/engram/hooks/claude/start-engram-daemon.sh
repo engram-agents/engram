@@ -43,6 +43,40 @@
 # entirely absent; a systemd host whose call fails or answers
 # ambiguously still reads "unavailable" (report loudly, no launch),
 # unchanged.
+#
+# RECOVERY -- the hook banner says the daemon is offline but a daemon process
+# is alive:
+#   1. `pgrep -fl engram-surface-daemon.py`, then `lsof -p <pid> | grep unix`:
+#      does the live process hold a socket whose path no longer exists?
+#   2. `launchctl list | grep engram` and
+#      `launchctl print gui/$(id -u)/com.engram.surface-daemon`; compare
+#      ProgramArguments with the real daemon path. A job pointing at a deleted
+#      worktree or a temp ENGRAM_HOME is a zombie:
+#      `launchctl bootout gui/$(id -u)/com.engram.surface-daemon`. (This script
+#      never reads launchd: its supervisor check is Linux-only.)
+#   3. SIGTERM the orphaned holder: `kill <pid>`.
+#   4. Run this script.
+#   5. Confirm $ENGRAM_HOME/recall-daemon.sock and recall-daemon.pid exist.
+
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863): it would resolve against the calling process's cwd, a
+# different home for every process. Unset or empty means unset; a leading ~ is expanded against $HOME and
+# re-exported (~user is not expanded: it is not absolute, so it is refused). Checked before anything else
+# runs. A SessionStart hook fails open: one stderr line, nothing written, exit 0.
+if [ -n "${ENGRAM_HOME-}" ]; then
+    _eh_raw="$ENGRAM_HOME"
+    case "$ENGRAM_HOME" in
+        "~") ENGRAM_HOME="${HOME-}"; export ENGRAM_HOME ;;
+        "~/"*) ENGRAM_HOME="${HOME-}/${ENGRAM_HOME#"~/"}"; export ENGRAM_HOME ;;
+    esac
+    case "$ENGRAM_HOME" in
+        /*) ;;
+        *)
+            printf "engram hook: ENGRAM_HOME must be an absolute path, got '%s'; doing nothing\n" "$_eh_raw" >&2
+            unset _eh_raw
+            return 0 2>/dev/null || exit 0 ;;
+    esac
+    unset _eh_raw
+fi
 
 : "${ENGRAM_HOME:=$HOME/.engram}"
 
@@ -128,7 +162,7 @@ _log_supervision() {
 # End-anchored (colleague-review fold, Kepler): ENGRAM_HOME is the LAST
 # argv, so an unanchored pattern would also match a DIFFERENT, longer
 # ENGRAM_HOME that merely has this one as a string prefix (e.g. this
-# agent's real `~/.engram` vs. some other checkout's `~/.engram-backup`)
+# agent's real ENGRAM_HOME (default `~/.engram`) vs. some other checkout's `~/.engram-backup`)
 # -- the shorter path is a substring of the longer one's command line.
 # Named so tests/test_pgrep_liveness_reap_patterns.py can import the exact
 # pattern under test instead of re-typing a copy that could drift (#2029).
@@ -477,33 +511,27 @@ case "$_supervisor_state" in
         #       unheld by anyone -- a plain orphan). Any live holder NOT in
         #       this run's killed-pid set is UNKNOWN OWNER.
         #
-        # On UNKNOWN OWNER (either question), skip the socket delete and
-        # write one report line to $LOG_PATH -- never abort the script; the
-        # launch attempt below still proceeds unchanged, so a
-        # genuinely-occupied socket makes the new daemon's own bind() fail
-        # loudly, which is the correct, visible failure mode.
+        # On UNKNOWN OWNER (either question), the hook keeps the socket AND
+        # the pidfile, does NOT launch a daemon, does NOT stamp
+        # daemon-launch-attempt, logs one loud `socket-guard:` line to
+        # $LOG_PATH, and exits 0 (C8, below). It does not launch because the
+        # daemon's own startup gate (engram-surface-daemon.py: socket
+        # exists and the recorded pid is not alive -> unlink) would steal
+        # the socket from the live holder this guard just declined to
+        # touch (tracked as #3361). A missing daemon is loud and
+        # recoverable; a duplicate risks silent WAL loss.
         #
         # $PID_PATH IS also gated by this SAME guard verdict (fold onto
-        # this unit, reviewer-fairy finding on PR #2687):
-        # engram-surface-daemon.py's own second-layer defense (main()'s
-        # _recorded_pid_is_alive() check, added in #1874) reads $PID_PATH
-        # at the next daemon's startup to decide whether to back off from
-        # $SOCKET_PATH (a confirmably-live prior instance owns it) or steal
-        # it (the prior owner reads as dead). A stale-but-present pidfile
-        # pointing at a dead pid is harmless -- _recorded_pid_is_alive()
-        # correctly reads it as dead via os.kill(pid, 0) ->
-        # ProcessLookupError -- but a MISSING pidfile is read as "not
-        # confirmably ours" and causes a steal. Unconditionally removing
-        # $PID_PATH here, regardless of the guard's own verdict on
-        # $SOCKET_PATH, would silently defeat this guard on its most
-        # realistic trigger path: the very next process this same
-        # invocation launches would see no pidfile, conclude the live,
-        # unmatched holder is dead, and unlink $SOCKET_PATH itself --
-        # reproducing the exact incident this guard exists to prevent, one
-        # function call later. Removing $PID_PATH only when
-        # $_allow_socket_rm == 1 (an orphan, or a pid this run's own kill
-        # loop just killed) keeps both files' lifecycles coupled to the
-        # same ownership determination.
+        # this unit, reviewer-fairy finding on PR #2687): removing it would
+        # leave the live, unmatched holder with no recorded owner. It is
+        # removed only when $_allow_socket_rm == 1 (an orphan, or a pid this
+        # run's own kill loop just killed), which keeps both files'
+        # lifecycles coupled to the same ownership determination. A
+        # stale-but-present pidfile pointing at a dead pid is NOT harmless
+        # on UNKNOWN OWNER: that daemon startup gate reads the dead pid as
+        # "not alive" and unlinks the socket, so on UNKNOWN OWNER no daemon
+        # is launched at all (C8) rather than relying on that gate to back
+        # off.
         _stat_identity() {
             # dev:inode:birthtime, or empty (nonzero exit) if the path
             # doesn't exist. Birth-time (%W) is GNU-coreutils-specific
@@ -511,11 +539,48 @@ case "$_supervisor_state" in
             # expose it, which is harmless here -- a constant field can
             # never itself manufacture a mismatch between two calls, it
             # just adds no discriminating value when unsupported.
-            stat -c '%d:%i:%W' "$1" 2>/dev/null
+            #
+            # Portable (#3333 follow-up): GNU `stat -c` first; where that
+            # yields nothing (BSD/macOS stat has no -c: "illegal option",
+            # rc 1) fall back to BSD `stat -f '%d:%i'` (dev:inode; no birth
+            # time, still a fine race discriminator -- a rebound socket gets
+            # a new inode). The fallback is tried only after -c has already
+            # produced nothing, and a path that does not exist fails both,
+            # so GNU hosts never see a -f (filesystem-status) reading. If
+            # BOTH yield nothing the output is empty -- which the caller must
+            # NOT conflate with "nothing on disk"; it re-checks the path.
+            _si_out="$(stat -c '%d:%i:%W' "$1" 2>/dev/null)"
+            if [ -z "$_si_out" ]; then
+                _si_out="$(stat -f '%d:%i' "$1" 2>/dev/null)"
+                # GNU `stat -f '%d:%i'` is a filesystem-status query that
+                # prints multi-line info (rc 0): accept the fallback only
+                # if it is exactly dev:inode, else treat it as unreadable
+                # (the caller's C1 check then refuses).
+                case "$_si_out" in
+                    *[!0-9:]*|*:*:*|:*|*:|"") _si_out="" ;;
+                    *:*) ;;
+                    *) _si_out="" ;;
+                esac
+            fi
+            printf '%s' "$_si_out"
         }
         _log_socket_guard() {
             printf '[%s] [start-engram-daemon] socket-guard: %s\n' \
-                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$LOG_PATH" 2>/dev/null || true
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(printf '%s' "$1" | tr '\r\n' '  ')" >> "$LOG_PATH" 2>/dev/null || true
+        }
+        # Holder text (a process cmdline: may be multi-line, may be huge) is
+        # normalized to single-spaced text and hard-capped BEFORE it is
+        # composed into the sentence, so the template's restore instruction
+        # is never cut. (The embedded python already caps the cmdline itself
+        # at 300 chars; this 1000-char cap is the backstop for the rest of
+        # its output.) The line-flatten above is the chokepoint for every
+        # reason. bash 3.2-safe.
+        _flatten_holder_text() {
+            _fh="$(printf '%s' "$1" | tr '[:cntrl:]' ' ' | tr -s ' ')"
+            if [ "${#_fh}" -gt 1000 ]; then
+                _fh="${_fh:0:1000}..."
+            fi
+            printf '%s' "$_fh"
         }
         _socket_pre_stat="$(_stat_identity "$SOCKET_PATH")"
 
@@ -525,7 +590,15 @@ case "$_supervisor_state" in
 
         _socket_post_stat="$(_stat_identity "$SOCKET_PATH")"
         _allow_socket_rm=1
-        if [ -z "$_socket_post_stat" ]; then
+        _refusal_reason=""
+        if [ -z "$_socket_post_stat" ] && { [ -e "$SOCKET_PATH" ] || [ -L "$SOCKET_PATH" ]; }; then
+            # (C1) the path IS on disk but no stat dialect could read its
+            # identity. An empty snapshot must never be read as "nothing on
+            # disk" (that is how this guard failed OPEN on macOS, where
+            # `stat -c` does not exist) -- fail closed: keep both files.
+            _allow_socket_rm=0
+            _refusal_reason="it exists but its on-disk identity could not be read (no usable stat), so ownership cannot be established"
+        elif [ -z "$_socket_post_stat" ]; then
             : # nothing on disk any more -- rm -f would be a no-op either
               # way, nothing here for the guard to protect.
         elif [ "$_socket_pre_stat" != "$_socket_post_stat" ]; then
@@ -535,13 +608,14 @@ case "$_supervisor_state" in
             # socket hasn't started listening) is still correctly "don't
             # delete".
             _allow_socket_rm=0
-            _log_socket_guard "refusing to remove ${SOCKET_PATH} -- on-disk identity changed since first observation (race: pre=[${_socket_pre_stat:-none}] post=[${_socket_post_stat}]), another process may have just (re)bound this path"
+            _refusal_reason="on-disk identity changed since first observation (race: pre=[${_socket_pre_stat:-none}] post=[${_socket_post_stat}]), another process may have just (re)bound this path"
         else
             # (B) live-holder identification. Path-TEXT match against
             # /proc/net/unix (never its Inode column against stat() -- see
-            # above), then /proc/<pid>/fd/* to resolve which pid (if any)
-            # holds it, and whether that pid is one this run's kill loop
-            # just killed.
+            # above), then /proc/<pid>/fd/* to resolve EVERY pid that holds
+            # it (not just the first). Removal is authorized only if each
+            # holder is a pid this run's kill loop just killed AND has
+            # exited; any other holder refuses.
             _holder_output="$({{PYTHON}} -c "
 import os, sys
 
@@ -564,6 +638,26 @@ def pid_holds_inode(pid, inode):
             return True
     return False
 
+def clean_cmd(text):
+    # Single-spaced, capped at 300 chars: a cmdline can be multi-line or huge,
+    # and the message that embeds it must stay one bounded log line.
+    text = ' '.join(text.split())
+    return text[:300] + '...' if len(text) > 300 else text
+
+def exited_within(pid, seconds=3.0):
+    # Signaled is not killed: a holder may ignore SIGTERM. True only once the
+    # pid has actually exited (poll up to ~3s).
+    import time
+    for _ in range(int(seconds * 10)):
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            pass  # e.g. EPERM: it exists
+        time.sleep(0.1)
+    return False
+
 def read_cmdline(pid):
     try:
         with open('/proc/' + pid + '/cmdline', 'rb') as f:
@@ -571,20 +665,95 @@ def read_cmdline(pid):
     except OSError:
         return '(cmdline unavailable)'
     parts = [p.decode(errors='replace') for p in raw.split(b'\0') if p]
-    return ' '.join(parts) if parts else '(empty cmdline)'
+    return clean_cmd(' '.join(parts)) if parts else '(empty cmdline)'
 
-def find_holder(inode):
-    for pid in killed_pids:
-        if pid_holds_inode(pid, inode):
-            return pid, True
+def wait_all_exited(pids, seconds=3.0):
+    # One shared budget (not per pid) for every reap-killed pid to exit.
+    # Returns the set of pids still answering kill(pid, 0) when it runs out.
+    import time
+    deadline = time.time() + seconds
+    alive = set(pids)
+    while True:
+        for pid in list(alive):
+            try:
+                os.kill(int(pid), 0)
+            except ProcessLookupError:
+                alive.discard(pid)
+            except (OSError, ValueError):
+                pass  # e.g. EPERM: it exists
+        if not alive or time.time() >= deadline:
+            return alive
+        time.sleep(0.1)
+
+def find_holders(inode):
+    # EVERY pid holding the inode, not the first one found: a listening
+    # socket fd can be inherited by an exec'd child whose argv the reap
+    # pattern does not match, so proving one holder exited proves nothing
+    # about the others. Returns None when /proc cannot be listed.
     try:
         all_pids = [p for p in os.listdir('/proc') if p.isdigit()]
     except OSError:
-        return None, False
-    for pid in all_pids:
-        if pid_holds_inode(pid, inode):
-            return pid, False
-    return None, False
+        return None
+    return [pid for pid in sorted(all_pids, key=int) if pid_holds_inode(pid, inode)]
+
+def lsof_main():
+    # No /proc/net/unix (macOS, BSD): ask lsof who holds the path. rc 0 +
+    # pids = holders (each must be a reap-killed pid that has exited); every
+    # other outcome, rc 1 included, or no lsof at all, fails CLOSED.
+    import shutil, subprocess
+    if shutil.which('lsof') is None:
+        print('this host has no /proc/net/unix and no lsof, so the live holder of the socket cannot be determined -- refusing to delete without a live-holder check')
+        sys.exit(1)
+    try:
+        r = subprocess.run(['lsof', '-t', '--', SOCKET_PATH], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print('the guard could not run lsof (' + str(exc) + ') -- refusing to delete without a live-holder check')
+        sys.exit(1)
+    pids = [p for p in r.stdout.split() if p.isdigit()]
+    if r.returncode not in (0, 1) or (r.returncode == 1 and r.stdout.strip()):
+        print('lsof exited ' + str(r.returncode) + ' -- refusing to delete without a live-holder check')
+        sys.exit(1)
+    if r.returncode == 0 and not pids:
+        print('lsof exited 0 with no holder pid -- refusing to delete without a live-holder check')
+        sys.exit(1)
+    if r.returncode == 1:
+        # rc 1 is UNKNOWN, never "orphan": lsof also exits 1 on a failed or
+        # incomplete search (a holder it cannot inspect), -t can hide the
+        # warning, and no independent probe can prove absence (a socket
+        # bound but not yet listening refuses connect() and may listen
+        # later). Without positive evidence this branch only authorizes
+        # removal when every reported holder is a reap-killed pid that has
+        # exited (below). Orphan cleanup is therefore unavailable here: on
+        # hosts with no /proc the guard is refuse-only, and a refusal means
+        # the hook does NOT launch (C8): a launched daemon's own startup
+        # gate could steal the socket from a holder lsof could not see
+        # (#3361).
+        print('lsof exited 1 (no holder reported, but that is not proof of absence: its search may have been incomplete) -- refusing to delete without positive evidence of who holds the socket')
+        sys.exit(1)
+    for pid in pids:
+        if pid in killed_pids:
+            # Exempt only once it has actually exited.
+            if exited_within(pid):
+                continue
+            print('holder pid ' + pid + ' was signaled but is still alive')
+            sys.exit(1)
+        try:
+            cmd = clean_cmd(subprocess.run(['ps', '-o', 'command=', '-p', pid], capture_output=True, text=True, timeout=5).stdout)
+        except (OSError, subprocess.SubprocessError):
+            cmd = ''
+        print('held by pid ' + pid + ' (' + (cmd or '(cmdline unavailable)') + '), not matched by the reap loop for this invocation')
+        sys.exit(1)
+    sys.exit(0)
+
+if not os.path.exists('/proc/net/unix'):
+    lsof_main()
+
+# /proc branch: removal is authorized only if EVERY process holding EVERY
+# matching inode is a reap-killed pid that has exited. First give all killed
+# pids one shared ~3s budget to exit (signaled is not killed, #3360), THEN
+# read /proc/net/unix: whatever still holds the path after that is, by
+# definition, either an unmatched process or a killed pid still alive.
+still_alive = wait_all_exited(killed_pids)
 
 try:
     with open('/proc/net/unix') as f:
@@ -603,53 +772,68 @@ if not inodes:
     sys.exit(0)
 
 for inode in inodes:
-    holder_pid, was_killed = find_holder(inode)
-    if holder_pid is None:
+    holders = find_holders(inode)
+    if not holders:
         print('held by an unresolved process (sockfs inode=' + inode + '; holder pid not determinable -- permission boundary or process already exited)')
         sys.exit(1)
-    if not was_killed:
-        cmdline = read_cmdline(holder_pid)
-        print('(inode=' + inode + ') held by pid ' + holder_pid + ' (' + cmdline + '), not matched by the reap loop for this invocation')
-        sys.exit(1)
+    # Every holder is judged, none is skipped: an unmatched holder refuses
+    # outright; a reap-killed holder must have exited (#3360).
+    for holder_pid in holders:
+        if holder_pid not in killed_pids:
+            cmdline = read_cmdline(holder_pid)
+            print('(inode=' + inode + ') held by pid ' + holder_pid + ' (' + cmdline + '), not matched by the reap loop for this invocation')
+            sys.exit(1)
+    for holder_pid in holders:
+        if holder_pid in still_alive or not exited_within(holder_pid, 0.3):
+            print('holder pid ' + holder_pid + ' was signaled but is still alive')
+            sys.exit(1)
 
 sys.exit(0)
 " $_stale_pids)"
             _holder_rc=$?
             if [ "$_holder_rc" -ne 0 ]; then
                 _allow_socket_rm=0
-                _log_socket_guard "refusing to remove ${SOCKET_PATH} -- ${_holder_output}"
+                _refusal_reason="$(_flatten_holder_text "${_holder_output:-holder check exited rc=${_holder_rc} with no output}")"
             fi
         fi
 
         if [ "$_allow_socket_rm" -eq 1 ]; then
             rm -f "$PID_PATH" "$SOCKET_PATH"
         else
-            : # UNKNOWN OWNER: leave both files untouched. Removing
-              # PID_PATH here would defeat engram-surface-daemon.py's own
-              # second-layer defense (_recorded_pid_is_alive()), which
-              # reads PID_PATH to decide whether to back off from or steal
-              # SOCKET_PATH -- exactly the incident this guard exists to
-              # prevent, one layer down. See PR #2687's reviewer findings
-              # for the full reproduction.
+            : # UNKNOWN OWNER: leave both files untouched (the C8 block
+              # below then refuses to launch). Removing PID_PATH would
+              # also discard the recorded owner of a live holder. See PR
+              # #2687's reviewer findings for the original reproduction.
         fi
 
-        # Start daemon in background. The trailing $ENGRAM_HOME argv is
-        # unused by the script (ENGRAM_HOME is still resolved from the env
-        # var as before) -- it exists solely so pgrep -f above can scope on
-        # it.
-        mkdir -p "$ENGRAM_HOME"
-        env ENGRAM_HOME="$ENGRAM_HOME" {{PYTHON}} "$DAEMON_SCRIPT" "$ENGRAM_HOME" >> "$LOG_PATH" 2>&1 < /dev/null &
+        if [ "$_allow_socket_rm" -ne 1 ]; then
+            # (C8) UNKNOWN OWNER, any branch: do NOT launch and do NOT
+            # stamp a launch attempt. A launched daemon's own startup gate
+            # (engram-surface-daemon.py: socket exists and recorded pid not
+            # alive -> unlink) would steal the socket from the live holder.
+            # A missing daemon is loud and recoverable; a duplicate risks
+            # silent WAL loss. Exactly one loud line, naming the holder
+            # (when known) and the restore path.
+            _log_socket_guard "refusing to remove ${SOCKET_PATH} and NOT launching a daemon -- ${_refusal_reason}. A missing daemon is loud and recoverable; a duplicate risks silent WAL loss. To restore: stop that process or remove the socket by hand, then re-run the hook"
+        else
+            # Start daemon in background. The trailing $ENGRAM_HOME argv is
+            # unused by the script (ENGRAM_HOME is still resolved from the env
+            # var as before) -- it exists solely so pgrep -f above can scope on
+            # it.
+            mkdir -p "$ENGRAM_HOME"
+            env ENGRAM_HOME="$ENGRAM_HOME" {{PYTHON}} "$DAEMON_SCRIPT" "$ENGRAM_HOME" >> "$LOG_PATH" 2>&1 < /dev/null &
 
-        # Fire-and-forget: the daemon warms asynchronously (cold model-load
-        # routinely exceeds any fixed wait); the per-turn UserPromptSubmit
-        # surface hook is the liveness check and emits a CRITICAL warning
-        # only on a genuine daemon-down. No blocking wait here -> no
-        # cold-start-race false alarm.
+            # Fire-and-forget: the daemon warms asynchronously (cold model-load
+            # routinely exceeds any fixed wait); the per-turn UserPromptSubmit
+            # surface hook is the liveness check and emits a CRITICAL warning
+            # only on a genuine daemon-down. No blocking wait here -> no
+            # cold-start-race false alarm.
 
-        # Stamp the launch attempt so the per-turn surface hook can tell a
-        # cold-start warmup (recent stamp → SOFT "warming up") from a
-        # genuinely down daemon (stale/absent stamp → CRITICAL).
-        date +%s > "$ENGRAM_HOME/daemon-launch-attempt" 2>/dev/null || true
+            # Stamp the launch attempt so the per-turn surface hook can tell a
+            # cold-start warmup (recent stamp → SOFT "warming up") from a
+            # genuinely down daemon (stale/absent stamp → CRITICAL).
+            date +%s > "$ENGRAM_HOME/daemon-launch-attempt" 2>/dev/null || true
+        fi
         ;;
     *)
         # unavailable (or any other value this function should never

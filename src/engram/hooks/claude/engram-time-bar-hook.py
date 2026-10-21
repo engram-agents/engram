@@ -20,11 +20,11 @@ the leading UTC field as the local time and confabulated 'it's 2am'; #721.)
 
 Signal sources:
   - UTC now: datetime.now(timezone.utc)
-  - Session start: ~/.engram/sessions/<session_id>.json 'started_at'
+  - Session start: ~/.engram/sessions/<session_id>.json (under $ENGRAM_HOME) 'started_at'
     (SessionStart hook writes per-session marker; session_id read from this
     hook's stdin payload per issue #140)
-  - Last user msg: ~/.engram/last-user-msg.json (self-maintained by this hook)
-  - User-local tz: ~/.engram/config.json 'user.timezone' (None when absent →
+  - Last user msg: ~/.engram/last-user-msg.json (under $ENGRAM_HOME; self-maintained by this hook)
+  - User-local tz: ~/.engram/config.json (under $ENGRAM_HOME) 'user.timezone' (None when absent →
     UTC shown with '(tz not configured)' label rather than a silently-wrong
     default coast; set user.timezone to an IANA name, e.g. 'America/New_York')
 
@@ -38,6 +38,24 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863 6b): it would resolve against this process's cwd, a
+# different home than the daemon's or the server's. Fail open: one stderr line, nothing written, exit 0.
+# (Inline, not from _hooklib: this hook must still run when the sibling lib cannot import.)
+_ENGRAM_HOME_RAW = os.environ.get("ENGRAM_HOME") or ""
+if _ENGRAM_HOME_RAW and not os.path.isabs(os.path.expanduser(_ENGRAM_HOME_RAW)):
+    sys.stderr.write("engram hook: ENGRAM_HOME must be an absolute path, got %r; doing nothing\n" % (_ENGRAM_HOME_RAW,))
+    sys.exit(0)
+if _ENGRAM_HOME_RAW:
+    os.environ["ENGRAM_HOME"] = os.path.abspath(os.path.expanduser(_ENGRAM_HOME_RAW))  # `~/x` -> absolute for every raw reader
+
+# #3628: every read and write here is non-blocking and regular-file-only. This
+# file's own directory is sys.path[0] when run as a script; insert it so test
+# loaders (spec_from_file_location) resolve the sibling lib the same way.
+_this_dir = str(Path(__file__).resolve().parent)
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+from _hooklib import read_regular_text, open_regular_text_write
 
 try:
     from zoneinfo import ZoneInfo
@@ -123,7 +141,7 @@ def _read_json(path: Path):
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text())
+        return json.loads(read_regular_text(path))
     except Exception:
         return None
 
@@ -259,7 +277,8 @@ def _is_human_prompt(payload: dict) -> bool:
 def _stamp_user_activity(now_epoch: float) -> None:
     """Write epoch seconds to LAST_USER_ACTIVITY. Fail-safe: swallow all errors."""
     try:
-        LAST_USER_ACTIVITY.write_text(str(int(now_epoch)))
+        with open_regular_text_write(LAST_USER_ACTIVITY) as f:
+            f.write(str(int(now_epoch)))
     except Exception:
         pass
 
@@ -292,7 +311,8 @@ def main():
     # bug where loop-wakes reset the clock, making it always show 'this msg').
     if _is_human_prompt(payload):
         try:
-            LAST_USER_MSG.write_text(json.dumps({"ts": utc_iso}))
+            with open_regular_text_write(LAST_USER_MSG) as f:
+                f.write(json.dumps({"ts": utc_iso}))
         except Exception:
             pass
 

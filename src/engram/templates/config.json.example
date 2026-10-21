@@ -33,7 +33,8 @@
 
   "embedding": {
     "model": "all-MiniLM-L6-v2",
-    "enabled": true
+    "device": "cpu",
+    "cpu_threads": 4
   },
 
   "user": {

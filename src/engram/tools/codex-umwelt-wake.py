@@ -26,6 +26,15 @@ Environment overrides:
   UMWELT_CONFIG                     default ~/.umwelt/config.json
   CODEX_UMWELT_WAKE_INTERVAL        default 2.0 seconds
   CODEX_UMWELT_WAKE_NO_REAP         non-empty => skip single-instance reap
+  CODEX_UMWELT_WAKE_REFUSAL_RECHECK_S
+                                    default 60 seconds between rechecks while
+                                    the pidfile path is not a regular file
+
+A pidfile path that is not a single regular file (a FIFO, symlink, hard link,
+directory, socket ...) is never read through a blocking open and never written
+through. `run` reports the refusal ONCE and idles, rechecking slowly, starting
+normally the moment the path is acceptable; it never exits on it, because a
+supervising unit that restarts on exit would relaunch it every few seconds.
 """
 from __future__ import annotations
 
@@ -33,13 +42,17 @@ import argparse
 import base64
 from collections import deque
 import contextlib
+import errno
 import hashlib
 import json
+import math
 import os
 import select
 import secrets
+import shlex
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -52,6 +65,50 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+
+def _find_helper_dir() -> Path | None:
+    """The directory holding engram_regular_io.py: CLAUDE_PLUGIN_ROOT first,
+    then a walk of this file's parents (the installed plugin has the helper at
+    the plugin root with tools/ beside it; the source tree has it in
+    src/engram/). Never a fixed parents[N]: the build flattens the layout."""
+    cands: list[Path] = []
+    root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if root:
+        cands.append(Path(root))
+    here = Path(__file__).resolve()
+    for p in (here.parent, *here.parents):
+        cands.append(p)
+        cands.append(p / "src" / "engram")
+    for c in cands:
+        if (c / "engram_regular_io.py").exists():
+            return c
+    return None
+
+
+try:
+    import engram_regular_io  # noqa: F401
+except ImportError:
+    _helper_dir = _find_helper_dir()
+    if _helper_dir is not None:
+        sys.path.append(str(_helper_dir))
+    try:
+        import engram_regular_io  # noqa: F401
+    except ImportError:
+        print("codex-umwelt-wake: cannot import engram_regular_io (the shared "
+              "pidfile helper, installed beside the engram plugin); set "
+              "CLAUDE_PLUGIN_ROOT or reinstall", file=sys.stderr)
+        sys.exit(1)
+from engram_regular_io import (
+    NotRegularFile,
+    append_regular_line,
+    kind_of_path,
+    open_regular_append_strict,
+    read_regular_text,
+    read_regular_text_strict,
+    write_pidfile,
+    write_regular_bytes_synced,
+)
+
 from websockets.sync.client import connect as ws_connect
 
 ENGRAM_HOME = Path(os.environ.get("ENGRAM_HOME", Path.home() / ".engram"))
@@ -61,6 +118,8 @@ DEFAULT_INTERVAL = float(os.environ.get("CODEX_UMWELT_WAKE_INTERVAL", "2.0"))
 DEFAULT_UMWELT_CONFIG = Path(os.environ.get("UMWELT_CONFIG", Path.home() / ".umwelt" / "config.json"))
 DEFAULT_THREAD_OVERRIDE = os.environ.get("CODEX_THREAD_ID")
 STATUS_VERSION = 2
+DEFAULT_REFUSAL_RECHECK_S = 60.0
+EXIT_LOG_NOT_REGULAR = 4  # `start` on a non-regular watcher.log (#3781)
 STATE_VERSION = 6
 MAX_RECENT_DELIVERED = 256
 MAX_MONITOR_RECOVERY_TURNS = 32
@@ -143,13 +202,46 @@ class Logger:
         self.path = path
         self.stdout = stdout
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # #3781: the log is a DIAGNOSTIC sink. A watcher.log that is a FIFO /
+        # directory / socket / symlink / hard link degrades to stderr and keeps
+        # running; the refusal is reported once per transition, never per line.
+        self.degraded = False  # True when the last line went to stderr
+        self._refusal_reported = False
 
     def log(self, message: str) -> None:
         line = f"{utc_now()} {message}"
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        try:
+            append_regular_line(self.path, line)
+            self.degraded = False
+            self._refusal_reported = False
+        except NotRegularFile as exc:
+            self._degrade(f"codex-umwelt-wake: log file {exc}; writing log lines to stderr instead", line)
+        except OSError as exc:
+            # #3793: ANY other failure of the append (EACCES, ENOSPC, EROFS, EDQUOT,
+            # EIO ...) degrades the same way: a log is never a kill switch.
+            if exc.errno is None:
+                what = type(exc).__name__
+            else:
+                what = errno.errorcode.get(exc.errno, f"errno {exc.errno}")
+            self._degrade(f"codex-umwelt-wake: log write failed: {what} on {self.path}; "
+                          f"writing log lines to stderr instead", line)
         if self.stdout:
-            print(line, flush=True)
+            try:
+                print(line, flush=True)
+            except (OSError, ValueError):
+                pass  # a broken stdout must not end the watcher either
+
+    def _degrade(self, refusal: str, line: str) -> None:
+        """Send `line` to stderr and report `refusal` once per transition. The
+        stderr fallback never raises: a closed or broken stderr drops the line."""
+        self.degraded = True
+        try:
+            if not self._refusal_reported:
+                self._refusal_reported = True
+                print(refusal, file=sys.stderr, flush=True)
+            print(line, file=sys.stderr, flush=True)
+        except (OSError, ValueError):
+            pass
 
 
 def utc_now() -> str:
@@ -170,18 +262,95 @@ def bounded_meta(value: Any, limit: int = 72) -> str:
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    # #3781: the temp file must be ONE regular file; NotRegularFile otherwise,
+    # nothing touched. Same bytes as json.dump(indent=2, sort_keys=True) + "\n",
+    # fsynced before the replace as before.
+    data = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    write_regular_bytes_synced(tmp, data.encode("utf-8"))
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        # The tmp was written by us (the strict write above succeeded), so a
+        # failed replace (e.g. the destination is a directory) must not leave it
+        # behind. Never reached when the strict write refused the tmp path.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class StateRefused(BaseException):
+    """The state file, or the temp file its atomic write goes through, is not ONE
+    regular file (#3781). A state INVARIANT, so the watcher reports and idles
+    (cmd_run); it never falls back to default_state() and never exits.
+
+    A BaseException on purpose: attempt_delivery and the persist callbacks sit
+    under many `except Exception` handlers that would turn this into a logged
+    delivery error and a retry on the next cycle, i.e. a wake delivered again
+    every cycle because its state could not be saved. Only cmd_run catches it.
+    .op is "read" or "write"; .exc is the NotRegularFile."""
+
+    def __init__(self, op: str, exc: NotRegularFile) -> None:
+        super().__init__(op, str(exc))
+        self.op = op
+        self.exc = exc
+
+
+def _resolves_to_regular_file(path: str) -> bool:
+    """True only when `path` (following the whole symlink chain) is a regular file.
+    os.stat never opens the target, so a link to a FIFO cannot block here (#3795);
+    a dangling link, a loop or an unreadable link is not a regular file."""
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+def state_refusal_advice(refused: "StateRefused") -> str:
+    """The operator's next step for a refused state file, by what the path IS.
+
+    A symlink or hard link to a regular file IS the state (queue, inflight batch,
+    cursors): removing it reads as default_state(), the next poll re-seeds every
+    cursor to now, and everything queued or missed meanwhile is lost. So a READ
+    refusal of those two kinds gets a ready-to-run copy-and-replace command (one
+    line; 'run: ' to '; removing it instead' is the command, for tests and
+    operators alike). A FIFO, directory, socket (nothing to keep) and any WRITE
+    refusal (the .tmp path holds no state) keep 'Remove it to resume'.
+
+    A symlink gets the copy advice ONLY when it resolves (the whole chain) to a
+    regular file. A dangling link, a link loop, or a link to a FIFO, directory or
+    other non-regular target gets 'Remove it to resume' like the other non-regular
+    kinds: there is no state behind it to copy."""
+    if refused.op == "read" and (
+            refused.exc.kind == "hard-linked file"
+            or (refused.exc.kind == "symlink" and _resolves_to_regular_file(refused.exc.path))):
+        p = shlex.quote(refused.exc.path)
+        new = shlex.quote(refused.exc.path + ".new")
+        return (f"Replace it with a regular copy of its content, run: "
+                f"cp -- {p} {new} && mv -- {new} {p}; "
+                f"removing it instead restarts from now and LOSES the queue and any "
+                f"crossings missed meanwhile (if the link target is gone the state is gone)")
+    return "Remove it to resume"
+
+
+def write_state(paths: "RuntimePaths", state: dict[str, Any]) -> None:
+    try:
+        atomic_write_json(paths.state_path, state)
+    except NotRegularFile as exc:
+        raise StateRefused("write", exc) from exc
 
 
 def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+    """The state-file read. A path that is not ONE regular file (FIFO, directory,
+    socket, symlink, hard link) raises NotRegularFile (#3781): falling back to the
+    default there would silently reset persisted state. Absent, unreadable, or
+    corrupt JSON still read as the default (corrupt JSON is #3786, unchanged)."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(read_regular_text_strict(path, encoding="utf-8"))
         return data if isinstance(data, dict) else dict(default)
+    except NotRegularFile:
+        raise
     except Exception:
         return dict(default)
 
@@ -738,8 +907,18 @@ def has_non_heartbeat_event(events: list[dict[str, Any]]) -> bool:
 
 
 def load_umwelt_context(path: Path) -> UmweltContext | None:
+    # #3796: a FIFO config would block a plain read forever. One os.stat (follows
+    # symlinks, never opens) decides: an unstat-able path is "not configured"; a
+    # non-regular one is raised (not folded into None) so run_cycle can report it
+    # once, from that same result (a second stat could race a vanished path).
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        raise NotRegularFile(path, st.st_mode)
+    try:
+        data = json.loads(read_regular_text(path, encoding="utf-8"))
     except Exception:
         return None
     if not isinstance(data, dict):
@@ -978,7 +1157,7 @@ def list_session_candidates(sessions_dir: Path) -> list[SessionCandidate]:
     candidates: list[SessionCandidate] = []
     for path in sessions_dir.glob("*.json"):
         try:
-            marker = json.loads(path.read_text(encoding="utf-8"))
+            marker = json.loads(read_regular_text(path, encoding="utf-8"))
         except Exception:
             continue
         if not isinstance(marker, dict):
@@ -996,12 +1175,16 @@ def list_session_candidates(sessions_dir: Path) -> list[SessionCandidate]:
             transcript_mtime = transcript.stat().st_mtime
         except OSError:
             transcript_mtime = 0.0
+        try:
+            marker_mtime = path.stat().st_mtime
+        except OSError:
+            continue  # the marker itself vanished after the read: nothing to list
         candidates.append(
             SessionCandidate(
                 thread_id=session_id,
                 marker_path=path,
                 transcript_path=transcript,
-                recency=(parse_started_at(marker), transcript_mtime, path.stat().st_mtime),
+                recency=(parse_started_at(marker), transcript_mtime, marker_mtime),
             )
         )
     candidates.sort(key=lambda item: item.recency, reverse=True)
@@ -2222,8 +2405,17 @@ def reap_prior(paths: RuntimePaths, logger: Logger | None = None) -> None:
     if os.environ.get("CODEX_UMWELT_WAKE_NO_REAP"):
         return
     try:
-        old = int(paths.pid_path.read_text(encoding="utf-8").strip())
+        old = int(read_regular_text(paths.pid_path, encoding="utf-8").strip())
     except Exception:
+        # #3773: a pidfile that is a FIFO / directory / socket is named once
+        # and nothing is killed.
+        kind = kind_of_path(paths.pid_path)
+        if kind is not None:
+            note = f"pidfile {paths.pid_path} is a {kind}, not a regular file; not reaping"
+            if logger is not None:
+                logger.log(note)
+            else:
+                print(f"codex-umwelt-wake: {note}", file=sys.stderr)
         return
     if old == os.getpid():
         return
@@ -2240,15 +2432,52 @@ def reap_prior(paths: RuntimePaths, logger: Logger | None = None) -> None:
 
 
 def write_pid(paths: RuntimePaths) -> None:
+    """Write this pid through the shared non-blocking, symlink- and hard-link-
+    refusing write (#3773). Lets NotRegularFile propagate."""
     paths.state_dir.mkdir(parents=True, exist_ok=True)
-    paths.pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    write_pidfile(paths.pid_path, f"{os.getpid()}\n".encode("ascii"))
+
+
+def _refusal_recheck_seconds() -> float:
+    """Seconds between rechecks while the pidfile path is refused; read at call
+    time so a test can shorten it. Unparseable or non-positive -> the default."""
+    try:
+        value = float(os.environ.get("CODEX_UMWELT_WAKE_REFUSAL_RECHECK_S", DEFAULT_REFUSAL_RECHECK_S))
+    except ValueError:
+        return DEFAULT_REFUSAL_RECHECK_S
+    # time.sleep(inf) raises OverflowError: a non-finite value is a bad value.
+    return value if math.isfinite(value) and value > 0 else DEFAULT_REFUSAL_RECHECK_S
+
+
+def wait_for_acceptable_pidfile(paths: RuntimePaths, logger: Logger | None, sleep=time.sleep) -> None:
+    """write_pid, and while the pidfile path is refused: report ONCE (stderr and
+    the log), then sleep and try again, forever. Never exits on its own: the
+    watcher's unit restarts on exit, so an exit would be relaunched every few
+    seconds. Returns once write_pid succeeds."""
+    reported = False
+    while True:
+        try:
+            write_pid(paths)
+            return
+        except NotRegularFile as exc:
+            interval = _refusal_recheck_seconds()
+            if not reported:
+                line = (f"codex-umwelt-wake: refusing to start: the pidfile path {exc}; "
+                        f"will recheck every {interval:g}s. Remove it to start")
+                if logger is not None:
+                    logger.log(line)
+                # A degraded logger already put the line on stderr (#3781).
+                if logger is None or not getattr(logger, "degraded", False):
+                    print(line, file=sys.stderr, flush=True)
+                reported = True
+            sleep(interval)
 
 
 def remove_pid(paths: RuntimePaths) -> None:
     try:
-        pid = int(paths.pid_path.read_text(encoding="utf-8").strip())
+        pid = int(read_regular_text(paths.pid_path, encoding="utf-8").strip())
     except Exception:
-        return
+        return  # absent, unreadable, or not a regular file: leave the path alone
     if pid == os.getpid():
         try:
             paths.pid_path.unlink()
@@ -2256,14 +2485,50 @@ def remove_pid(paths: RuntimePaths) -> None:
             pass
 
 
+_STATUS_REFUSAL_REPORTED = False
+
+
 def update_status(paths: RuntimePaths, payload: dict[str, Any]) -> None:
-    atomic_write_json(paths.status_path, payload)
+    """status.json is a DIAGNOSTIC sink (#3781): any OSError writing it (a temp
+    path that is not ONE regular file, a directory at the destination, EACCES,
+    ENOSPC) skips the write and reports once per transition on stderr; it never
+    ends the watcher."""
+    global _STATUS_REFUSAL_REPORTED
+    try:
+        atomic_write_json(paths.status_path, payload)
+        _STATUS_REFUSAL_REPORTED = False
+    except OSError as exc:
+        if not _STATUS_REFUSAL_REPORTED:
+            _STATUS_REFUSAL_REPORTED = True
+            print(f"codex-umwelt-wake: status not written: {exc}", file=sys.stderr, flush=True)
+
+
+def _read_regular_or_note(path: Path, what: str) -> str | None:
+    """The text of a regular file, or None; when the path is a FIFO / directory /
+    socket, ONE stderr line names it (#3773) instead of blocking on it."""
+    try:
+        return read_regular_text(path, encoding="utf-8")
+    except Exception:
+        kind = kind_of_path(path)
+        if kind is not None:
+            print(f"codex-umwelt-wake: {what} {path} is a {kind}, not a regular file",
+                  file=sys.stderr)
+        return None
 
 
 def current_status(paths: RuntimePaths) -> dict[str, Any]:
-    status = load_json(paths.status_path, default_status(paths))
+    status = default_status(paths)
+    status_text = _read_regular_or_note(paths.status_path, "status file")
+    if status_text is not None:
+        try:
+            data = json.loads(status_text)
+            if isinstance(data, dict):
+                status = data
+        except Exception:
+            pass
     try:
-        pid = int(paths.pid_path.read_text(encoding="utf-8").strip())
+        pid_text = _read_regular_or_note(paths.pid_path, "pidfile")
+        pid = int(pid_text.strip()) if pid_text is not None else None
     except Exception:
         pid = None
     running = False
@@ -2285,8 +2550,17 @@ def run_cycle(
     logger: Logger,
     started_at: str,
     codex_monitor: CodexItemCompletedMonitor | None = None,
+    refusal_flags: set[str] | None = None,
 ) -> dict[str, Any]:
-    state = normalize_state(load_json(paths.state_path, default_state()))
+    # refusal_flags: per-SUBJECT "already reported" marks, carried across cycles by
+    # cmd_run; None (a one-off call) reports on every call.
+    if refusal_flags is None:
+        refusal_flags = set()
+    try:
+        loaded_state = load_json(paths.state_path, default_state())
+    except NotRegularFile as exc:
+        raise StateRefused("read", exc) from exc
+    state = normalize_state(loaded_state)
     base_status = default_status(paths)
     try:
         transport = resolve_transport_target(app_server)
@@ -2308,8 +2582,19 @@ def run_cycle(
         }
     )
 
-    context = load_umwelt_context(umwelt_config)
-    umwelt_detail = None if context is not None else f"missing or invalid {umwelt_config}"
+    try:
+        context = load_umwelt_context(umwelt_config)
+    except NotRegularFile as exc:
+        # #3796: a non-regular umwelt config is "umwelt not configured", reported
+        # once per transition; the cycle continues as for a missing config.
+        context = None
+        umwelt_detail = f"umwelt config {exc.path} is not a regular file ({exc.kind})"
+        if "umwelt_config" not in refusal_flags:
+            refusal_flags.add("umwelt_config")
+            logger.log(f"codex-umwelt-wake: {umwelt_detail}; treating umwelt as not configured")
+    else:
+        refusal_flags.discard("umwelt_config")
+        umwelt_detail = None if context is not None else f"missing or invalid {umwelt_config}"
 
     try:
         if codex_monitor is not None:
@@ -2317,7 +2602,7 @@ def run_cycle(
                 state=state,
                 sessions_dir=sessions_dir,
                 thread_override=thread_override,
-                persist_state=lambda current_state: atomic_write_json(paths.state_path, current_state),
+                persist_state=lambda current_state: write_state(paths, current_state),
             )
         if context is not None:
             try:
@@ -2325,17 +2610,17 @@ def run_cycle(
             except Exception as exc:
                 umwelt_detail = f"poll failed: {exc}"
                 logger.log(f"umwelt poll failed: {exc}")
-        atomic_write_json(paths.state_path, state)
+        write_state(paths, state)
         result = attempt_delivery(
             state,
             app_server=app_server,
             sessions_dir=sessions_dir,
             thread_override=thread_override,
             logger=logger,
-            persist_state=lambda current_state: atomic_write_json(paths.state_path, current_state),
-            after_inflight_persist=lambda current_state, _inflight: atomic_write_json(paths.state_path, current_state),
+            persist_state=lambda current_state: write_state(paths, current_state),
+            after_inflight_persist=lambda current_state, _inflight: write_state(paths, current_state),
         )
-        atomic_write_json(paths.state_path, state)
+        write_state(paths, state)
         status_mode = result.status
         status_detail = result.detail
         if umwelt_detail is not None:
@@ -2405,6 +2690,17 @@ def build_paths(state_dir: Path) -> RuntimePaths:
     )
 
 
+def _idle_wait(seconds: float) -> None:
+    """Sleep up to `seconds`, returning early once a stop is requested (the
+    signal handlers only set a flag, and time.sleep resumes after one)."""
+    deadline = time.monotonic() + seconds
+    while not _STOP_REQUESTED:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.2, remaining))
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     global _STOP_REQUESTED
     _STOP_REQUESTED = False
@@ -2414,23 +2710,49 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if not args.once:
         reap_prior(paths, logger)
-        write_pid(paths)
+        try:
+            wait_for_acceptable_pidfile(paths, logger)
+        except KeyboardInterrupt:
+            return 130  # SIGINT while idling on a refused pidfile: no traceback
         install_signal_handlers(paths, started_at)
 
     codex_monitor = CodexItemCompletedMonitor(app_server=args.app_server, logger=logger)
 
+    exit_code = 0
+    state_refusal_reported = False
+    refusal_flags: set[str] = set()
     try:
         while True:
-            run_cycle(
-                paths=paths,
-                umwelt_config=args.umwelt_config,
-                app_server=args.app_server,
-                sessions_dir=args.sessions_dir,
-                thread_override=args.thread_id,
-                logger=logger,
-                started_at=started_at,
-                codex_monitor=codex_monitor,
-            )
+            try:
+                run_cycle(
+                    paths=paths,
+                    umwelt_config=args.umwelt_config,
+                    app_server=args.app_server,
+                    sessions_dir=args.sessions_dir,
+                    thread_override=args.thread_id,
+                    logger=logger,
+                    started_at=started_at,
+                    codex_monitor=codex_monitor,
+                    refusal_flags=refusal_flags,
+                )
+                state_refusal_reported = False
+            except StateRefused as refused:
+                # #3781: the state file (or its temp file) is not ONE regular
+                # file. Report ONCE through the (degraded-safe) logger, then idle
+                # and recheck; never fall back to default_state(), never exit.
+                interval = _refusal_recheck_seconds()
+                if not state_refusal_reported:
+                    logger.log(f"codex-umwelt-wake: refusing to {refused.op} the state file: "
+                               f"{refused.exc}; idling, will recheck every {interval:g}s. "
+                               f"{state_refusal_advice(refused)}")
+                    state_refusal_reported = True
+                if args.once:
+                    exit_code = 1
+                    break
+                _idle_wait(interval)
+                if _STOP_REQUESTED:
+                    break
+                continue
             if args.once or _STOP_REQUESTED:
                 break
             time.sleep(args.interval)
@@ -2451,7 +2773,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 }
             )
             update_status(paths, stopped)
-    return 0
+    return exit_code
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -2475,14 +2797,26 @@ def cmd_start(args: argparse.Namespace) -> int:
     ]
     if args.thread_id:
         cmd.extend(["--thread-id", args.thread_id])
-    log_handle = paths.log_path.open("a", encoding="utf-8")
-    subprocess.Popen(
-        cmd,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    # #3781: an interactive one-shot. A watcher.log that is not ONE regular file
+    # is refused LOUDLY before anything is spawned (the same strict open gives
+    # the handle Popen takes as the child's stdout).
+    try:
+        log_handle = open_regular_append_strict(paths.log_path)
+    except NotRegularFile as exc:
+        print(f"codex-umwelt-wake: refusing to start: the log path {exc}; "
+              f"nothing was started. Remove it and start again",
+              file=sys.stderr, flush=True)
+        return EXIT_LOG_NOT_REGULAR
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    finally:
+        log_handle.close()
     logger.log("spawned background watcher")
     return 0
 
@@ -2490,8 +2824,12 @@ def cmd_start(args: argparse.Namespace) -> int:
 def cmd_stop(args: argparse.Namespace) -> int:
     paths = build_paths(args.state_dir)
     try:
-        pid = int(paths.pid_path.read_text(encoding="utf-8").strip())
+        pid = int(read_regular_text(paths.pid_path, encoding="utf-8").strip())
     except Exception:
+        kind = kind_of_path(paths.pid_path)
+        if kind is not None:
+            print(f"codex-umwelt-wake: pidfile is a {kind}, not a regular file", file=sys.stderr)
+            return 1
         print("codex-umwelt-wake: no pidfile", file=sys.stderr)
         return 1
     status, cmdline = proc_cmdline(pid)

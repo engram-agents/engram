@@ -38,16 +38,55 @@ loop-wake-marker logic already has its own SSoT module (`tools/loop_prompt.py`,
 extracted for the deference-detector/time-bar hook pair, unrelated to these
 three). Bundling them here would be solving problems these three hooks
 don't have -- exactly the "big bang" gh#1657 explicitly asks to avoid.
+
+_hooklib is self-contained (stdlib-only, importable alone): tests copy it by
+itself into synthetic hooks/ layouts, and every hook imports it, so a missed
+import here would fail every hook at once. Do not import ENGRAM core modules
+from it. The non-blocking regular-file helpers are deliberately duplicated in
+engram_regular_io.py (core) and pinned identical by
+tests/test_regular_io_parity_3628.py.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import os
+import stat
 import sys
 import tempfile
 from pathlib import Path
 from typing import Callable, Iterable, Optional
+
+
+def engram_home() -> Path:
+    """The ENGRAM home for this layer: $ENGRAM_HOME (default ~/.engram) when set and non-empty,
+    expanded and absolute; a RELATIVE value is refused (ValueError naming it). A copy of
+    tools/_owner_read.engram_home() (the canonical body), kept
+    here because this layer must stay self-contained; tests/test_engram_home_parity_3863.py pins
+    the two AST-identical (the #3628 pattern)."""
+    raw = os.environ.get("ENGRAM_HOME") or "~/.engram"
+    home = os.path.expanduser(raw)
+    if not os.path.isabs(home):
+        raise ValueError("ENGRAM_HOME must be an absolute path, got %r" % (raw,))
+    return Path(os.path.abspath(home))
+
+
+def engram_home_or_exit() -> Path:
+    """engram_home() for a hook's import-time use: a refused (relative) ENGRAM_HOME is a fail-open
+    exit, not a traceback. The hook prints ONE stderr line naming the value, writes nothing and exits 0
+    (Claude Code reads any other non-zero exit as a non-blocking error and still shows the trace)."""
+    try:
+        home = engram_home()
+    except ValueError as exc:
+        sys.stderr.write("engram hook: %s; doing nothing\n" % (exc,))
+        sys.exit(0)
+    raw = os.environ.get("ENGRAM_HOME")
+    if raw and raw != str(home):
+        # `~/x` or `/a/../b`: modules that read the raw env var (the log emitter, the telemetry store)
+        # must see the same absolute home, not a literal `~` directory under the cwd.
+        os.environ["ENGRAM_HOME"] = str(home)
+    return home
 
 
 def resolve_tools_dir(marker_filename: str) -> Optional[Path]:
@@ -107,8 +146,8 @@ def resolve_runtime_dir(engram_home: str, sentinel: str) -> str:
          __file__. `sentinel` lives at <plugin_root>/. The plugin bundle is
          the canonical runtime; when present it MUST win so a stale
          data-dir snapshot can never shadow it (fixes #1152: scatter cleanup
-         can leave ~/.engram/engram_client.py that does `import server`
-         against a removed ~/.engram/server.py, crash-looping the daemon).
+         can leave ~/.engram/engram_client.py (under $ENGRAM_HOME) that does `import server`
+         against a removed ~/.engram/server.py (under $ENGRAM_HOME), crash-looping the daemon).
       3. $ENGRAM_HOME if it bundles a snapshot (scatter-install fallback only
          -- reached only when there is no plugin bundle; covers scatter
          installs that copy `sentinel` into the data dir).
@@ -155,6 +194,51 @@ def resolve_runtime_dir(engram_home: str, sentinel: str) -> str:
     except OSError:
         pass
     return os.path.expanduser("~/engram-alpha")  # last-ditch, unchanged
+
+
+def import_owner_flags(engram_home: str):
+    """Lazy import of the plugin-root module engramd_owner_flags (#3663), resolved
+    like _import_engramd_client: the shared resolver, never a fixed parents[N]. An
+    explicit ENGRAM_RUNTIME_DIR that does not hold the module (it exists to redirect
+    the CLIENT import) is retried once without the override, so redirecting the
+    client can never make a flag that is ON read as OFF.
+
+    Hoisted once from the byte-similar copies in engram-stop-hook.py and
+    engram-user-identity-hook.py (#3665); each hook keeps a thin `_import_owner_flags`
+    alias that passes its own ENGRAM_HOME.
+
+    Each candidate dir (the explicit one first, then the resolved one) is tried in turn
+    and any `Exception` from a candidate is remembered, not raised, so a bad copy in one
+    candidate does not hide a good copy in the next. After the loop: if nothing failed,
+    or the last failure is a plain "module not found" for this module, raises
+    ImportError("... not found ..."); otherwise re-raises the LAST failure (its own
+    class, so the visible report names it). KNOWN LIMITS: (a) a SystemExit from an
+    explicit-dir copy is not an Exception; it propagates at once and a good copy in
+    the resolved dir is not tried (the caller still reads OFF -- its catch takes
+    SystemExit -- and reports the class); (b) a resolved dir already on sys.path
+    behind a bad explicit copy is not retried.
+
+    The ENGRAM_RUNTIME_DIR pop/restore and the sys.path insert are process-global
+    side effects and stay inside this one function: after a call, success or raise,
+    ENGRAM_RUNTIME_DIR is exactly what it was before."""
+    explicit = os.environ.pop("ENGRAM_RUNTIME_DIR", None)
+    try:
+        resolved = resolve_runtime_dir(engram_home, "engramd_owner_flags.py")
+    finally:
+        if explicit is not None:
+            os.environ["ENGRAM_RUNTIME_DIR"] = explicit
+    last = None
+    for runtime_dir in ([explicit] if explicit else []) + [resolved]:
+        if runtime_dir not in sys.path:
+            sys.path.insert(0, runtime_dir)
+        try:
+            import engramd_owner_flags
+            return engramd_owner_flags
+        except Exception as exc:  # a bad copy in one candidate must not hide a good one in the next
+            last = exc
+    if last is None or (isinstance(last, ModuleNotFoundError) and last.name == "engramd_owner_flags"):
+        raise ImportError("engramd_owner_flags.py not found under the runtime dir")
+    raise last  # the class of the LAST failure, so the visible report names it
 
 
 def resolve_own_server_py_path(engram_home: str) -> str:
@@ -323,9 +407,7 @@ def atomic_write_json(path, data, *, indent=None, encoding=None):
 # `head_budget` numbers a caller passes in here as `budget` / uses to pick
 # its own `target`.
 
-_ENGRAM_HOME_FOR_OVERFLOW_PLACEHOLDER = os.environ.get("ENGRAM_HOME") or str(
-    Path.home() / ".engram"
-)
+_ENGRAM_HOME_FOR_OVERFLOW_PLACEHOLDER = str(engram_home_or_exit())
 
 
 def _placeholder_overflow_path() -> str:
@@ -466,6 +548,7 @@ def emit_context(
     target: int,
     allow_single_overflow: bool = False,
     overflow_writer: "Callable[[list], str] | None" = None,
+    kept_out: "list | None" = None,
 ) -> str:
     """Render a bounded additionalContext block: trailer FIRST (survives the
     harness's tail truncation), then `head`, then as many `body` items as
@@ -511,6 +594,15 @@ def emit_context(
         valid, distinct choice from a writer that itself fails at runtime;
         both end up with an empty path, and the trailer reads identically
         either way (see `_build_context_trailer`'s docstring).
+    kept_out:
+        Optional OUT-parameter (#3621). When a `list` is passed it is
+        EXTENDED with the 0-based indices (into `body` as the caller passed
+        it) of the body items rendered IN FULL in the returned string. A body
+        item that was cut, or truncated in-band (the `truncated_first`
+        shape), is NOT listed; neither is any item if the final `budget`
+        backstop had to shorten the render. The returned string is
+        byte-identical with and without it. Anything that is not a `list`
+        (including the default `None`) is ignored.
 
     Contract
     --------
@@ -563,6 +655,20 @@ def emit_context(
        if even a single item's render doesn't fit `target` against the real
        path (subject to the same `allow_single_overflow`/`budget` exception
        as the placeholder-sized determination below).
+       Within that `truncated_first` shape the in-band marker is part of the
+       render too (engram-alpha#2899): Stage 1 sizes the head without it, so
+       when trailer + head + marker would exceed the ceiling,
+       `_render_truncated_first()` re-trims a local copy of the head on a
+       line boundary (trailer says `head trimmed`) until it fits. If trailer
+       + marker alone exceed the ceiling the head is dropped entirely and the
+       overshoot of `target` is unavoidable -- it is never an overshoot of
+       `budget`.
+
+    6. `kept_out` (#3621) reports what the model can actually see: the indices
+       of the items present whole in the returned string. It errs toward
+       UNDER-reporting (a caller that records "shown" ids from it would rather
+       repeat a display than record an id the model never saw). It never
+       changes the returned string and never makes this function raise.
 
     Never raises on well-typed inputs. A caller-supplied `overflow_writer`
     that raises is caught and treated as a failed write (empty path),
@@ -649,13 +755,39 @@ def emit_context(
             if overflow_path_
             else "…[truncated]"
         )
-        trailer = _build_context_trailer(1, cut_n_for_marker, overflow_path_, head_cut)
-        overhead = len(trailer) + (len(head_text) + 1 if head_text else 0) + 1 + len(marker)
+        local_head = head_text
+        local_head_cut = head_cut
+        trailer = _build_context_trailer(1, cut_n_for_marker, overflow_path_, local_head_cut)
+        overhead = len(trailer) + (len(local_head) + 1 if local_head else 0) + 1 + len(marker)
+        if overhead > ceiling and local_head:
+            # engram-alpha#2899: Stage 1 sized the head against the trailer
+            # only and never reserved this marker, so trailer + head +
+            # marker alone can exceed the ceiling -- and the item_room
+            # clamp below would then hide the shortfall. Re-trim a LOCAL
+            # copy of the head (head_text/head_cut stay untouched: the
+            # Stage-3 degrade call site calls this function again) on a
+            # line boundary so trailer + head + marker fits. The trailer is
+            # rebuilt with head_cut=True so the cut is never silent; that
+            # clause is already reserved by Stage 1's worst_trailer.
+            # Layout: trailer \n head \n item+marker, hence the two joins.
+            local_head_cut = True
+            trailer = _build_context_trailer(
+                1, cut_n_for_marker, overflow_path_, local_head_cut
+            )
+            head_room_local = ceiling - len(trailer) - len(marker) - 2
+            local_head = _trim_to_line_boundary(local_head, head_room_local)
+            overhead = (
+                len(trailer) + (len(local_head) + 1 if local_head else 0) + 1 + len(marker)
+            )
+        # Unavoidable overshoot (documented in emit_context()'s contract
+        # item 5): if trailer + marker alone exceed the ceiling, the head is
+        # already empty here and the render stays over `target` (never over
+        # `budget` -- the final backstop clamps).
         item_room = max(ceiling - overhead, 0)
         item_text = body_list[0][:item_room]
         parts = [trailer]
-        if head_text:
-            parts.append(head_text)
+        if local_head:
+            parts.append(local_head)
         parts.append((item_text + marker) if item_text else marker)
         return "\n".join(parts)
 
@@ -776,8 +908,1282 @@ def emit_context(
     # (Kepler's Amendment 1). Every path above is already designed to stay
     # within `budget`; this is a defensive backstop, not the primary
     # mechanism -- it should not trigger in normal operation.
+    backstop_hit = False
     if len(rendered) > budget:
+        backstop_hit = True
         safe = _trim_to_line_boundary(rendered, budget)
         rendered = safe if safe else rendered[:budget]
 
+    # #3621: report which body items are present IN FULL. A truncated_first
+    # item is not; if the backstop above shortened the render we cannot say
+    # what survived, so under-report (nothing kept).
+    if isinstance(kept_out, list):
+        try:
+            if not truncated_first and not backstop_hit:
+                kept_out.extend(range(shown_n if n > 0 else 0))
+        except Exception:
+            pass
+
     return rendered
+
+
+# ---------------------------------------------------------------------------
+# Route ledger (#3458 section A)
+#
+# The probe mod (tools/probes/mods-recall) rates what the recall ARMS surface.
+# #3458 widens its ratings to the two LIVE recall routes, so each route records
+# -- at fire time, because signals such as utility change on use and cannot be
+# recovered from the live graph later -- one JSON line per fire:
+#
+#   <probeDir>/<session_id>/routes/<route>.jsonl
+#
+# probeDir rule (mirrors the mod's default: config.ts DEFAULTS.probeDir
+# '~/.engram/probe/mods-recall', resolved by record.ts defaultProbeDir against
+# ENGRAM_HOME when that is set): `<engram_home()>/probe/mods-recall`, via the
+# layer's engram_home(). The mod and this hook must name the same directory,
+# or the hook records nothing for a probe that is live (alpha #3863, 6b; the
+# mod side and the hook side are pinned together by
+# tests/test_route_probe_dir_parity_3863.py).
+#
+# Opt-in by presence: nothing is written unless `<probeDir>/<session_id>/`
+# already exists. Absence of that directory means "the probe is not live for
+# this session", which is a true optional (not an error): the hook changes
+# nothing -- no file, no directory, no log line. Fail-open: any other ledger
+# error costs one stderr line `route-ledger: <reason>`; the hook's own stdout
+# is never touched. The ledger OBSERVES: it records what the route's own
+# response carried and never recomputes or approximates a ranking signal.
+# Two fields are not read from the response (#3551): `ranked` is PRODUCER-
+# computed (engram_query sets it per row: True = composite-ranked, False =
+# special-type bypass row, whose null composite_score is by design and is not
+# listed in missing_signals) and `in_context` / `in_context_why` are HOOK-
+# computed at write time from three sources (shown earlier this session,
+# created since session start, currently focused). The rest are read as-is.
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib
+import time as _time
+
+# Per-candidate signal fields read from the route's own response. A field the
+# response does not carry for a candidate is null, and its name is listed once
+# in the line's `missing_signals`.
+ROUTE_SIGNALS = (
+    "type", "similarity", "importance_score", "utility", "ranked", "composite_score",
+    "match_type", "recall_turn", "created_at", "in_context",
+)
+# Response-key aliases: the debug shape of engram_query names utility
+# `utility_score`. Same value under another key, not an approximation.
+_ROUTE_SIGNAL_ALIASES = {"utility": ("utility", "utility_score")}
+
+
+def route_probe_dir() -> Path:
+    """`<engram_home()>/probe/mods-recall` (see the block comment above)."""
+    return engram_home() / "probe" / "mods-recall"
+
+
+def prompt_fire_key(prompt_text: str) -> str:
+    """prompt_surface fire_key: sha256(prompt_text)[:16]."""
+    return _hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+
+
+def tool_fire_key(tool_name, tool_input) -> str:
+    """tool_recall fire_key: `<tool_name>:` + sha256 of the canonical
+    (sort_keys) JSON of tool_input, first 16 hex."""
+    canon = json.dumps(tool_input, sort_keys=True)
+    return f"{tool_name}:{_hashlib.sha256(canon.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _signal_from(entry: dict, name: str):
+    """Nested `entry["signals"]` first (the surface response shape, #3462),
+    then the flat key (legacy / debug shapes). No default: absent -> None."""
+    nested = entry.get("signals")
+    sources = (nested, entry) if isinstance(nested, dict) else (entry,)
+    for src in sources:
+        for key in _ROUTE_SIGNAL_ALIASES.get(name, (name,)):
+            if key in src and src[key] is not None:
+                return src[key]
+    return None
+
+
+def _parse_iso_utc(text):
+    """ISO timestamp (naive = UTC, trailing Z ok) -> aware datetime, or None."""
+    from datetime import datetime, timezone
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _open_regular_fd(path):
+    """An O_RDONLY fd for `path`, or None when it cannot be opened or is not a
+    regular file. O_NONBLOCK makes open() on a FIFO return at once instead of
+    waiting for a writer; the fstat then rejects it before any read. The ledger
+    reads run in a hook before its response is printed, and a try/except is
+    fail-open for an exception, not for a hang."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            return fd
+    except OSError:
+        pass
+    os.close(fd)
+    return None
+
+
+def _not_regular_error(fd, path):
+    """The OSError for a path that opened but is not a regular file. A
+    directory keeps the IsADirectoryError a plain open() raises for it; any
+    other kind (FIFO, socket, device) is an EINVAL OSError. Does not close fd:
+    the caller's except clause does, once."""
+    import errno
+    try:
+        is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+    except OSError:
+        is_dir = False
+    code = errno.EISDIR if is_dir else errno.EINVAL
+    return OSError(code, os.strerror(code) + " (not a regular file)", str(path))
+
+
+def open_regular_text(path, encoding=None):
+    """`open(path, encoding=encoding)` for a read that must never block (#3591).
+
+    A plain open() of a FIFO waits for a writer; a hook under a 5 s timeout
+    hangs and is killed. This opens O_NONBLOCK (returns at once on a FIFO),
+    fstat-checks that the target is a regular file, and returns a text file
+    object over the fd. Anything else raises OSError (IsADirectoryError for a
+    directory, EINVAL otherwise), so a call site that already treats an
+    unreadable file as absent -- `except OSError` or broader -- needs only
+    `open(p)` -> `open_regular_text(p)`. FileNotFoundError / PermissionError
+    come from os.open exactly as from open(). For a regular file the result is
+    the same text wrapper open() returns."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise _not_regular_error(fd, path)
+        return os.fdopen(fd, "r", encoding=encoding)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def read_regular_text(path, encoding=None):
+    """`Path(path).read_text(encoding=encoding)` that must never block on a
+    FIFO (#3591): the whole text of a regular file, OSError otherwise (see
+    open_regular_text)."""
+    with open_regular_text(path, encoding=encoding) as f:
+        return f.read()
+
+
+def read_state_json_classified(path):
+    """Read a JSON-object state file and CLASSIFY the outcome (#3521 row 40).
+
+    Returns `(state, unknown_reason, movable)`; never raises:
+
+      * ABSENT (FileNotFoundError)              -> `({}, None, False)`
+      * a SYMLINK (even to a valid file, even
+        dangling)                               -> `({}, "SymlinkStatePath: ...", False)`
+      * a JSON object (dict)                    -> `(state, None, False)`
+      * bad JSON / undecodable bytes / absurd
+        nesting (the bytes WERE read)           -> `({}, "<Class>: <msg>", True)`
+      * valid JSON that is not an object        -> `({}, "NotADict: <type> ...", True)`
+      * ANY OSError (PermissionError, EMFILE,
+        EIO, a FIFO / directory ...)            -> `({}, "<Class>: <msg>", False)`
+
+    `movable` is True ONLY when the file was actually READ and found unusable:
+    the maintainer's ruling moves aside the UNPARSEABLE file, and an unreadable
+    file has not been shown unparseable. A transient OSError (an fd limit, an
+    I/O hiccup) on a perfectly valid file must never cost its history, so every
+    OSError is UNKNOWN and never movable: the caller neither moves nor writes
+    it, and the bytes stay where they are. The reason string is
+    `"<ExceptionClass>: <message>"`, the shape `split_probe_reason` /
+    `probe_unknown_line` already consume. The read never blocks (see
+    open_regular_text).
+
+    A symlinked path is UNKNOWN and never movable (maintainer ruling 5): the
+    read follows a link and fstat-checks its TARGET, so a link to a regular
+    file would read as regular, and the move-aside `os.replace` would rename
+    the LINK and leave the corrupt target in place behind a `.corrupt` link.
+    `os.lstat` runs first; a dangling link is still a link (UNKNOWN, not
+    absent). Kept AST-identical with `engram_regular_io.read_state_json_classified`
+    (pinned by tests/test_regular_io_parity_3628.py)."""
+    try:
+        try:
+            lst = os.lstat(path)
+        except FileNotFoundError:
+            return {}, None, False
+        except OSError as exc:
+            return {}, f"{type(exc).__name__}: {exc}", False
+        if stat.S_ISLNK(lst.st_mode):
+            return {}, (
+                "SymlinkStatePath: state path is a symlink; replace the link "
+                "with a regular file to restore cooldowns"
+            ), False
+        try:
+            data = json.loads(read_regular_text(path))
+        except FileNotFoundError:
+            return {}, None, False
+        except (ValueError, RecursionError) as exc:  # bad JSON, bad bytes, absurd nesting
+            return {}, f"{type(exc).__name__}: {exc}", True
+        except OSError as exc:
+            return {}, f"{type(exc).__name__}: {exc}", False
+        if not isinstance(data, dict):
+            return {}, f"NotADict: state is a {type(data).__name__}, not an object", True
+        return data, None, False
+    except Exception as exc:  # defensive: the contract is "never raises"
+        return {}, f"{type(exc).__name__}: {exc}", False
+
+
+def open_regular_text_write(path, encoding=None):
+    """`open(path, "w", encoding=encoding)` that must never block (#3591).
+
+    A write-open of a FIFO waits for a reader. O_WRONLY|O_NONBLOCK makes that
+    fail at once with ENXIO when no reader exists (an OSError); and when a
+    reader does exist the fstat still rejects the FIFO before anything is
+    written. O_CREAT|O_TRUNC with mode 0o666 (umask applies) matches what
+    open(path, "w") does, so a regular file is created / truncated and written
+    exactly as before. Raises OSError for a non-regular target."""
+    fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_CREAT | os.O_TRUNC, 0o666)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise _not_regular_error(fd, path)
+        return os.fdopen(fd, "w", encoding=encoding)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def open_regular_text_append(path, encoding=None):
+    """`open(path, "a", encoding=encoding)` that must never block (#3628).
+
+    Same shape as open_regular_text_write, with O_APPEND|O_CREAT (no O_TRUNC)
+    and mode 0o666 (umask applies), matching open(path, "a"). A reader-less
+    FIFO fails at os.open with ENXIO; a FIFO that has a reader is rejected by
+    the fstat before any byte is written. Raises OSError for a non-regular
+    target."""
+    fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_APPEND | os.O_CREAT, 0o666)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise _not_regular_error(fd, path)
+        return os.fdopen(fd, "a", encoding=encoding)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+_NOT_REGULAR_DB_ERROR_CLS = None
+
+
+def _not_regular_db_error_cls():
+    """The refusal class for connect_regular_ro, built once per process.
+
+    It subclasses sqlite3.OperationalError (so a handler that classifies a
+    sqlite failure -- e.g. surface-hook._check_db_liveness's
+    `except sqlite3.DatabaseError -> unhealthy` -- keeps the branch a
+    directory already took on dev) AND OSError (so a handler written for
+    "could not open the file" also matches). A plain OSError would be caught
+    by the later broad `except Exception` there and report a FIFO DB healthy.
+    sqlite3 is imported here, not at module level: every hook imports this
+    module, and the class cannot be declared without sqlite3 in hand, so it is
+    built on first use and cached in a module global (one class object)."""
+    global _NOT_REGULAR_DB_ERROR_CLS
+    if _NOT_REGULAR_DB_ERROR_CLS is None:
+        import sqlite3
+
+        class NotRegularDatabaseError(sqlite3.OperationalError, OSError):
+            """The database path exists but is not a regular file."""
+
+        _NOT_REGULAR_DB_ERROR_CLS = NotRegularDatabaseError
+    return _NOT_REGULAR_DB_ERROR_CLS
+
+
+def connect_regular_ro(db_path, uri_params="mode=ro", **connect_kwargs):
+    """`sqlite3.connect(f"file:{db_path}?{uri_params}", uri=True, **kwargs)`
+    that refuses a non-regular file instead of blocking on it (#3628).
+
+    A `mode=ro` connect to a FIFO hangs (measured: > 5 s), so a hook under a
+    5 s timeout is killed. This stats first (os.stat follows symlinks and does
+    not block on a FIFO) and, when the path exists and is not a regular file,
+    raises NotRegularDatabaseError -- a sqlite3.OperationalError AND an
+    OSError, message "not a regular file: <path>". A path that cannot be
+    statted (missing, dangling symlink, unreadable parent) falls through to
+    the raw connect, so sqlite raises exactly what it raised before. Extra
+    keyword arguments (timeout=...) pass through untouched; a timeout bounds
+    lock waits, not a FIFO open, so it is not part of this defence.
+    `uri_params` is the URI query, e.g. "mode=ro&immutable=1".
+
+    Residual, NOT closed here. #3577 states it: "The pair is check-then-act:
+    measured by two people independently, with the file regular at the `stat`
+    and swapped for a FIFO before the connect, `sqlite3.connect` hung until
+    killed at 6 s." SQLite takes a path, not a descriptor, so the fd+fstat
+    route the other helpers in this module use is not available here; the
+    race-free /proc/self/fd/N route is unverified and not portable (see
+    #3577). This helper narrows the window to stat-then-connect; it does not
+    close it."""
+    import sqlite3
+    try:
+        st = os.stat(db_path)
+    except OSError:
+        st = None
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        raise _not_regular_db_error_cls()(f"not a regular file: {db_path}")
+    return sqlite3.connect(
+        f"file:{db_path}?{uri_params}", uri=True, **connect_kwargs)
+
+
+def session_started_at(session_id):
+    """This session's `started_at` from `$ENGRAM_HOME/sessions/<sid>.json`
+    (aware datetime), or None when the marker is missing/malformed. Shared
+    helper for the route ledger's `created` source; mirrors the surface hook's
+    `_get_session_started_at` (left untouched: that script is not importable)."""
+    if not session_id:
+        return None
+    try:
+        home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+        with open_regular_text(Path(home) / "sessions" / f"{session_id}.json", encoding="utf-8") as f:
+            marker = json.load(f)
+        return _parse_iso_utc(marker.get("started_at"))
+    except Exception:
+        return None
+
+
+def _read_session_marker(session_id):
+    """The session marker dict from `$ENGRAM_HOME/sessions/<sid>.json`, or None
+    when it is missing, malformed or not an object."""
+    if not session_id:
+        return None
+    try:
+        home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+        fd = _open_regular_fd(Path(home) / "sessions" / f"{session_id}.json")
+        if fd is None:
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            marker = json.load(f)
+        return marker if isinstance(marker, dict) else None
+    except Exception:
+        return None
+
+
+def _marker_compaction_count(marker):
+    """The marker's `compaction_count` as an int, or None when the marker is
+    absent or lacks a usable value (a bool is not a count)."""
+    if not isinstance(marker, dict):
+        return None
+    n = marker.get("compaction_count")
+    if isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+        return n
+    return None
+
+
+_SUMMARY_MARK = b'"isCompactSummary":true'
+_BOUNDARY_MARK = b'"subtype":"compact_boundary"'
+# A real summary line is tens of KB (12 KB measured); json.loads of a matched
+# line costs about 3.5x the line in peak memory, so a line above this is skipped.
+_SUMMARY_LINE_CAP = 1_000_000
+_NODE_ID_RE = None  # compiled lazily: `_re` is imported further down the module
+
+
+def _summary_text(record):
+    """The text of a parsed compaction-summary record, or None when `record` is
+    not one: it must carry a top-level `isCompactSummary` that `is True` and a
+    `message.content` that is a string or a list of text blocks."""
+    if not isinstance(record, dict) or record.get("isCompactSummary") is not True:
+        return None
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            b["text"] for b in content
+            if isinstance(b, dict) and isinstance(b.get("text"), str))
+    return None
+
+
+def _last_summary_ids(transcript_path) -> tuple:
+    """(ids, readable): node ids that appear as text in the LAST compaction
+    summary of the session transcript. Found from the END of the file by a
+    backwards bytes search (mmap `rfind`); a hit that does not parse, or whose
+    record is not a real summary (`_summary_text`), is skipped and the search
+    continues backwards, so a record that merely quotes the phrase inside an
+    escaped string never matches (its quotes are escaped, so the bytes differ).
+    No transcript path, an unreadable file, or no summary record at all ->
+    readable False (unknown, never an empty set)."""
+    global _NODE_ID_RE
+    import mmap
+    try:
+        if not isinstance(transcript_path, str) or not transcript_path:
+            return set(), False
+        if _NODE_ID_RE is None:
+            _NODE_ID_RE = _re.compile(r"\b[a-z]{2}_\d{4,}(?:_[A-Za-z0-9]+)?\b")
+        # O_NONBLOCK: open() on a FIFO would block until a writer appears, and
+        # this runs in a hook that fires on every prompt and tool call. Only a
+        # regular file is ever mapped.
+        fd = _open_regular_fd(transcript_path)
+        if fd is None:
+            return set(), False
+        try:
+            with mmap.mmap(fd, 0, access=mmap.ACCESS_READ) as m:
+                end = len(m)
+                while end > 0:
+                    hit = m.rfind(_SUMMARY_MARK, 0, end)
+                    if hit < 0:
+                        return set(), False
+                    start = m.rfind(b"\n", 0, hit) + 1
+                    stop = m.find(b"\n", hit)
+                    if stop < 0:
+                        stop = len(m)
+                    if stop - start > _SUMMARY_LINE_CAP:
+                        # Treated like an unparseable hit. The cap is on the
+                        # LINE, not the file: a backward-scan window or a file
+                        # size cap would make a far-back summary read unknown,
+                        # a behaviour change this code deliberately does not take.
+                        end = start
+                        continue
+                    try:
+                        text = _summary_text(json.loads(m[start:stop]))
+                    except ValueError:
+                        text = None
+                    if text is not None:
+                        # A compact_boundary record AFTER this summary means a
+                        # newer compaction has begun and its own summary is not
+                        # written yet: this one is stale, so unreadable. File
+                        # order, not timestamps: on a real session the summary's
+                        # `timestamp` is about 2 minutes BEFORE the marker's
+                        # `started_at`, so a "newer than started_at" test would
+                        # reject the right summary. Measured on one real
+                        # transcript, in 5 of 5 compactions the boundary record
+                        # precedes its summary, and the summary precedes the
+                        # next boundary.
+                        if m.find(_BOUNDARY_MARK, hit) >= 0:
+                            return set(), False
+                        return set(_NODE_ID_RE.findall(text)), True
+                    end = start
+        finally:
+            os.close(fd)
+        return set(), False
+    except Exception:  # empty file (mmap ValueError), permissions, anything
+        return set(), False
+
+
+def _earlier_shown_ids(routes_dir: Path, compaction_count=None) -> tuple:
+    """(ids, readable): every id in the `shown` list of the lines already in
+    `routes_dir/*.jsonl` (both routes) that were written in the CURRENT context
+    window (#3556). `compaction_count` unknown (None) or 0: every earlier line
+    counts, as before. N > 0: a line counts only when its `compaction_count`
+    equals N; a lower count, or no `compaction_count` key (written by older
+    code), does not. Dropping old-format lines is the conservative direction:
+    it under-reports in_context and never over-reports it. A malformed line is
+    skipped; a file that cannot be read makes `readable` False. A routes dir
+    that does not exist yet is readable-and-empty (nothing has been shown).
+    A missing, corrupt or count-less marker makes the count None, so every
+    earlier line counts again and `shown` can over-report in that case."""
+    windowed = isinstance(compaction_count, int) and compaction_count > 0
+    ids: set = set()
+    readable = True
+    try:
+        files = sorted(routes_dir.glob("*.jsonl")) if routes_dir.is_dir() else []
+    except Exception:
+        return ids, False
+    for path in files:
+        try:
+            fd = _open_regular_fd(path)
+            if fd is None:
+                readable = False
+                continue
+            with os.fdopen(fd, "r", encoding="utf-8") as f:
+                for raw in f:
+                    try:
+                        row = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    if windowed and row.get("compaction_count") != compaction_count:
+                        continue
+                    shown = row.get("shown")
+                    if isinstance(shown, list):
+                        ids.update(i for i in shown if isinstance(i, str))
+        except Exception:
+            readable = False
+    return ids, readable
+
+
+# ---------------------------------------------------------------------------
+# Shown record (#3613 S1): what the two LIVE recall routes actually rendered
+# ---------------------------------------------------------------------------
+# Both hooks append ONE JSON line per fire to `<ENGRAM_HOME>/sessions/
+# <session_id>.shown.jsonl` -- OUTSIDE the probe dir, so it exists on every seat
+# (the probe ledger's `shown` is only written when the probe dir is live).
+# Line: {ts, route, compaction_count, prompt_index, ids}. `ids` are the own-graph
+# ids actually rendered (never the cap-cut ones). `prompt_index` is a per-session
+# monotonically increasing integer, shared by both routes (last line's + 1).
+# The in-context resolver reads this record as part of its `shown` source,
+# windowed by compaction_count exactly like `_earlier_shown_ids`.
+#
+# Bounds: at most SHOWN_RECORD_MAX_IDS ids per line (head kept) and at most
+# SHOWN_RECORD_MAX_BYTES per file. Past the byte bound the OLDEST lines are
+# dropped (the file is rewritten to about half the bound), which loses only
+# older context windows' lines. The write is fail-open: any error is silent
+# apart from at most one stderr line, and never changes a hook's output. It is
+# written whatever the exclusion kill switch says.
+#
+# Retention (#3622): `prune_shown_records` (called once per SessionStart) deletes
+# records whose mtime is older than SHOWN_RECORD_RETENTION_DAYS; an append
+# refreshes mtime, so a session written to within that window is never pruned.
+# No-follow: the append opens with O_NOFOLLOW, and the prune lstat()s -- a symlink
+# at a record path is neither written through nor unlinked-as-a-file.
+#
+# Final cut (#3621): the recall block is ONE atomic body item that emit_context
+# may still cut or truncate, so the surface hook records the fire's ids all-or-
+# nothing -- only if the block was rendered IN FULL (`emit_context(kept_out=)`),
+# else an EMPTY-ids line, after the response was printed. Under-record, never over.
+
+SHOWN_RECORD_MAX_IDS = 64
+SHOWN_RECORD_MAX_BYTES = 262144
+SHOWN_RECORD_RETENTION_DAYS = 14
+SHOWN_RECORD_PRUNE_MAX_ENTRIES = 5000
+
+
+def _safe_session_name(session_id):
+    """`session_id` when it is usable as ONE file-name component, else None
+    (the same guard `write_route_ledger` applies to its probe-dir key)."""
+    sid = session_id if isinstance(session_id, str) else ""
+    if (
+        not sid or sid == "unknown" or "/" in sid or "\\" in sid or ".." in sid
+        or sid in {".", ".."} or sid != Path(sid).name
+    ):
+        return None
+    return sid
+
+
+def shown_record_path(session_id):
+    """`<ENGRAM_HOME>/sessions/<session_id>.shown.jsonl`, or None for an unsafe id."""
+    sid = _safe_session_name(session_id)
+    if sid is None:
+        return None
+    home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+    return Path(home) / "sessions" / f"{sid}.shown.jsonl"
+
+
+def _shown_record_ids(session_id, compaction_count=None) -> tuple:
+    """(ids, readable) from the shown record, windowed exactly as
+    `_earlier_shown_ids` windows the probe ledger: count unknown/0 -> every line;
+    N > 0 -> only lines whose `compaction_count` == N. A missing record is
+    readable-and-empty; a record that cannot be read as a regular file makes
+    `readable` False."""
+    path = shown_record_path(session_id)
+    ids: set = set()
+    if path is None:
+        return ids, True
+    try:
+        if not os.path.lexists(path):
+            return ids, True
+        fd = _open_regular_fd(path)
+        if fd is None:
+            return ids, False
+        windowed = isinstance(compaction_count, int) and compaction_count > 0
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            for raw in f:
+                try:
+                    row = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                if windowed and row.get("compaction_count") != compaction_count:
+                    continue
+                rec = row.get("ids")
+                if isinstance(rec, list):
+                    ids.update(i for i in rec if isinstance(i, str))
+        return ids, True
+    except Exception:
+        return set(), False
+
+
+def append_shown_record(route: str, session_id, ids) -> None:
+    """Append this fire's line to the shown record (see the block comment).
+    Never raises; at most one stderr line. Call it AFTER the resolver for this
+    fire was built, so a node is never "already shown" by the fire being
+    written.
+
+    `prompt_index` is best-effort: it is read from the last parseable line + 1
+    with no lock, so it may duplicate under concurrent fires, or reset to 0 on
+    an unparseable file. Consumers must not treat it as a strict sequence."""
+    try:
+        path = shown_record_path(session_id)
+        if path is None or not path.parent.is_dir():
+            return  # no session dir: nothing to record into
+        marker = _read_session_marker(session_id)
+        kept: list = []
+        for i in ids or ():
+            if isinstance(i, str) and i not in kept:
+                kept.append(i)
+        kept = kept[:SHOWN_RECORD_MAX_IDS]
+        lines: list = []
+        fd = _open_regular_fd(path)
+        if fd is not None:
+            with os.fdopen(fd, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        elif os.path.lexists(path):
+            raise OSError(f"{path.name} is not a regular file")
+        last = -1
+        for raw in reversed(lines):
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                continue
+            n = row.get("prompt_index") if isinstance(row, dict) else None
+            if isinstance(n, int) and not isinstance(n, bool):
+                last = n
+                break
+        line = {
+            "ts": int(_time.time() * 1000), "route": route,
+            "compaction_count": _marker_compaction_count(marker),
+            "prompt_index": last + 1, "ids": kept,
+        }
+        text = json.dumps(line) + "\n"
+        text_bytes = len(text.encode("utf-8"))
+        if sum(len(x.encode("utf-8")) for x in lines) + text_bytes > SHOWN_RECORD_MAX_BYTES:
+            keep: list = []
+            size = text_bytes
+            for raw in reversed(lines):
+                size += len(raw.encode("utf-8"))
+                if size > SHOWN_RECORD_MAX_BYTES // 2:
+                    break
+                keep.append(raw)
+            keep.reverse()
+            tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+            try:
+                os.unlink(tmp)  # a stale tmp (or a symlink planted there): remove, never follow
+            except FileNotFoundError:
+                pass
+            tfd = os.open(
+                tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                os.write(tfd, "".join(keep).encode("utf-8"))
+            finally:
+                os.close(tfd)
+            os.replace(tmp, path)
+        # O_NONBLOCK: a write-open of a FIFO blocks until a reader appears.
+        # O_NOFOLLOW: a symlink planted at the record path is refused (ELOOP), never written through.
+        wfd = os.open(
+            path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(wfd).st_mode):
+                return
+            os.write(wfd, text.encode("utf-8"))
+        finally:
+            os.close(wfd)
+    except Exception as exc:  # fail-open
+        try:
+            msg = f"shown-record: {type(exc).__name__}: {exc}".replace("\r", " ").replace("\n", " ")
+            print(msg[:300], file=sys.stderr)
+        except Exception:
+            pass
+
+
+def _shown_record_candidate_session(name):
+    """The session name when `name` is a shown-record candidate (`<sid>.shown.jsonl`
+    or a stale trim leftover `<sid>.shown.jsonl.<digits>.tmp`), else None."""
+    suffix = ".shown.jsonl"
+    sid = None
+    if name.endswith(suffix):
+        sid = name[: -len(suffix)]
+    elif name.endswith(".tmp"):
+        head, sep, pid = name[: -len(".tmp")].rpartition(suffix + ".")
+        if sep and pid.isascii() and pid.isdigit():
+            sid = head
+    # An empty session name is never ours: append cannot create one.
+    return sid or None
+
+
+def prune_shown_records(
+    keep_session_id=None, max_age_days=SHOWN_RECORD_RETENTION_DAYS, now=None
+) -> int:
+    """Delete shown records (and stale trim tmp leftovers) older than
+    `max_age_days` from `<ENGRAM_HOME>/sessions/`; return how many were deleted.
+
+    Only direct entries named `<sid>.shown.jsonl` / `<sid>.shown.jsonl.<digits>.tmp`
+    are candidates. A candidate goes only if it is a regular file by `lstat` (a
+    symlink, directory, FIFO or socket is never followed or unlinked), its mtime is
+    strictly older than the cutoff (a future mtime stays), and its session is not
+    `keep_session_id`. A `max_age_days <= 0` deletes every non-keep record, fresh
+    ones included (the only caller uses the default). Scans at most SHOWN_RECORD_PRUNE_MAX_ENTRIES entries. Never
+    raises; at most one stderr line."""
+    deleted = 0
+    first_err = None
+    try:
+        home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+        sessions = Path(home) / "sessions"
+        cutoff = (_time.time() if now is None else now) - max_age_days * 86400
+        with os.scandir(sessions) as it:
+            for scanned, entry in enumerate(it):
+                if scanned >= SHOWN_RECORD_PRUNE_MAX_ENTRIES:
+                    break
+                try:
+                    sid = _shown_record_candidate_session(entry.name)
+                    if sid is None or (keep_session_id is not None and sid == keep_session_id):
+                        continue
+                    st = os.lstat(entry.path)
+                    if not stat.S_ISREG(st.st_mode) or not st.st_mtime < cutoff:
+                        continue
+                    os.unlink(entry.path)
+                    deleted += 1
+                except FileNotFoundError:
+                    continue  # raced with a concurrent unlink: not ours to count
+                except Exception as exc:
+                    if first_err is None:
+                        first_err = exc
+    except Exception as exc:
+        if first_err is None:
+            first_err = exc
+    if first_err is not None:
+        try:
+            msg = f"shown-record prune: {type(first_err).__name__}: {first_err}"
+            msg = "".join(c if c.isprintable() else " " for c in msg)
+            print(msg[:300], file=sys.stderr)
+        except Exception:
+            pass
+    return deleted
+
+
+def _focused_ids(read_conn=None, on_failure=None) -> tuple:
+    """(ids, readable): ids currently focused, read-only, one query. Any DB
+    problem (missing file, locked, no column) -> readable False.
+
+    `read_conn` (#3710, U8): a connection the CALLER owns, e.g. the tripwire
+    hook's engramd owner shim, so a flag-ON fire never opens knowledge.db. It
+    is used as-is and never closed here, and a failure on it reads False with
+    no fallback to a direct open. Without it: one direct read-only open,
+    closed in a `finally`, as before. One execute either way, so the read
+    registry keeps one site for this template.
+
+    `on_failure` (#3827): an optional `cb(exc)` called ONCE with the exception when the read
+    fails, so a caller can record WHY (the owner hooks record an owner failure). It changes
+    nothing else: the return is still `(set(), False)`, and a callback that raises is ignored
+    (fail-open: the resolver drops nothing, only the silence goes)."""
+    conn = None
+    owned = read_conn is None
+    try:
+        if owned:
+            home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+            # Short lock wait: this source is optional and an unreadable result is
+            # already handled (readable False -> in_context None), so a locked DB
+            # must not cost the surface hook a full second.
+            db_path = Path(home) / "knowledge.db"
+            # timeout bounds lock waits, not a FIFO open, so it is not part of the
+            # FIFO defence; connect_regular_ro refuses a non-regular file.
+            conn = connect_regular_ro(db_path, timeout=0.2)
+        else:
+            conn = read_conn
+        rows = conn.execute(
+            "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1 ORDER BY focused_at"
+        ).fetchall()
+        return {r[0] for r in rows}, True
+    except Exception as exc:
+        if on_failure is not None:
+            try:
+                on_failure(exc)
+            except Exception:
+                pass
+        return set(), False
+    finally:
+        if owned and conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _in_context_for(node_id, created_at, *, shown_ids, shown_ok, started,
+                    focused, focused_ok, summary_ids=frozenset(), summary_ok=True):
+    """`(in_context, why)` for one candidate against the pre-read sources
+    (see `make_in_context_resolver`). First source that fired wins, in the order
+    summary, shown, created, focused. That order is a decision to align with
+    the offline recompute tool so live and offline rows compare; it is not a
+    measured fact. None fired -> (False, None); a source that cannot be read and
+    no readable source fired -> (None, None). `summary_ok` is True with an empty
+    `summary_ids` when the summary source is off (no compaction yet)."""
+    if node_id in summary_ids:
+        return True, "summary"
+    if node_id in shown_ids:
+        return True, "shown"
+    created_dt = _parse_iso_utc(created_at)
+    created_known = started is not None and created_dt is not None
+    if created_known and created_dt >= started:
+        return True, "created"
+    if node_id in focused:
+        return True, "focused"
+    if not (shown_ok and created_known and focused_ok and summary_ok):
+        return None, None
+    return False, None
+
+
+def make_in_context_resolver(session_id, routes_dir: Path, marker=None, read_conn=None,
+                             on_failure=None):
+    """Build `resolve(node_id, created_at) -> (in_context, why)` for ONE ledger
+    write. Reads the sources once, so call it BEFORE appending the line
+    being written (a node is never "already shown" by the very fire being
+    written). `why` is the FIRST source that fired, in the order summary,
+    shown, created, focused. None fired -> (False, None). A source that cannot
+    be read and no readable source fired -> (None, None): unknown, not false.
+
+    Compaction (#3556): `shown` counts only ledger lines of the current context
+    window, and once the session has compacted (marker `compaction_count` > 0)
+    the ids in the LAST compaction summary are a fourth source, read lazily here
+    from the marker's transcript. The summary is read now rather than at
+    SessionStart because on the one session measured (n=1) SessionStart ran
+    about 1.2 s BEFORE the transcript's compact_boundary record, with the
+    summary a few lines after it, so it is probably not in the file yet when the
+    marker is written. A session that has not compacted (count 0 or unknown)
+    never opens the transcript. `marker` is the already-read marker dict (read
+    here when omitted). `read_conn` is passed to `_focused_ids` (the only
+    source that reads the store; see there); `on_failure` rides with it (only when given)."""
+    if marker is None:
+        marker = _read_session_marker(session_id)
+    count = _marker_compaction_count(marker)
+    shown_ids, shown_ok = _earlier_shown_ids(routes_dir, count)
+    # #3613 S1: the live routes' own shown record, present on every seat (the
+    # probe ledger above exists only while the probe is live). Union of both.
+    rec_ids, rec_ok = _shown_record_ids(session_id, count)
+    shown_ids = set(shown_ids) | rec_ids
+    shown_ok = shown_ok and rec_ok
+    started = _parse_iso_utc(marker.get("started_at")) if marker else None
+    focused, focused_ok = (_focused_ids(read_conn=read_conn) if on_failure is None
+                           else _focused_ids(read_conn=read_conn, on_failure=on_failure))
+    if count:
+        summary_ids, summary_ok = _last_summary_ids(marker.get("transcript_path"))
+    else:
+        summary_ids, summary_ok = set(), True
+    return functools.partial(
+        _in_context_for, shown_ids=shown_ids, shown_ok=shown_ok,
+        started=started, focused=focused, focused_ok=focused_ok,
+        summary_ids=summary_ids, summary_ok=summary_ok)
+
+
+# ---------------------------------------------------------------------------
+# Live in-context exclusion (#3613 Part 2)
+# ---------------------------------------------------------------------------
+# Config `recall_in_context_exclusion.enabled` in $ENGRAM_HOME/config.json,
+# default OFF: only a JSON `true` turns it on (anything else, or an unreadable
+# config, is off). Everything below is fail-open: a resolver that cannot be
+# built or called drops NOTHING.
+
+def in_context_exclusion_enabled(engram_home=None) -> bool:
+    """True only when config.json has `recall_in_context_exclusion.enabled: true`."""
+    try:
+        home = engram_home or os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+        # open_regular_text: a FIFO at config.json fails fast (OSError -> off)
+        # instead of blocking the hook (#3628).
+        with open_regular_text(Path(home) / "config.json", encoding="utf-8") as f:
+            config = json.load(f)
+        section = config.get("recall_in_context_exclusion")
+        return isinstance(section, dict) and section.get("enabled") is True
+    except Exception:
+        return False
+
+
+def build_exclusion_resolver(session_id, read_conn=None, on_failure=None):
+    """`resolve(node_id, created_at) -> (in_context, why)` for the live
+    exclusion, or None when it cannot be built (fail-open: None = drop nothing).
+    Same resolver the probe ledger uses; the probe routes dir is read only when
+    the probe is live for this session. `read_conn`, `on_failure`: see `_focused_ids`."""
+    try:
+        sid = _safe_session_name(session_id)
+        if sid is None:
+            return None
+        marker = _read_session_marker(sid)
+        kw = {} if on_failure is None else {"on_failure": on_failure}
+        return make_in_context_resolver(
+            sid, route_probe_dir() / sid / "routes", marker=marker,
+            read_conn=read_conn, **kw)
+    except Exception:
+        return None
+
+
+def in_context_drop_ids(candidates, resolver, exempt_types=()) -> set:
+    """The ids among `candidates` (dicts with `id`, optionally `created_at` /
+    `type`) to drop as already in the model's context: those the resolver
+    answers `in_context is True` for, whatever the `why`. `None` (unknown) and
+    `False` keep the candidate. A candidate whose `type` is in `exempt_types`
+    is never dropped. Any exception -> an empty set (all-or-nothing: a
+    half-applied exclusion would make the output depend on where it failed)."""
+    try:
+        if resolver is None:
+            return set()
+        drop: set = set()
+        for c in candidates:
+            if not isinstance(c, dict):
+                continue
+            nid = c.get("id")
+            if not nid or nid in drop:
+                continue
+            if exempt_types and c.get("type") in exempt_types:
+                continue
+            in_context, _why = resolver(nid, c.get("created_at"))
+            if in_context is True:
+                drop.add(nid)
+        return drop
+    except Exception:
+        return set()
+
+
+def build_route_candidates(result: Optional[dict], in_context=None) -> tuple:
+    """(candidates, missing_signals) from a daemon/query response, BEFORE any
+    route-side cut. `in_context`, when given, is the resolver from
+    `make_in_context_resolver`: it sets `in_context` / `in_context_why` per
+    candidate (the response never carries them); without it `in_context` is
+    null and named missing, as before. Every candidate carries
+    `in_context_why` (None unless a resolver sets it). A candidate with
+    `ranked is False` does not list its null composite_score as missing
+    (bypass rows are never composite-ranked, by design). Ranking = the
+    response's own `matched_ids` order (falling back to matched_meta /
+    top_claims / special_nodes order when the response carries no
+    matched_ids). Each signal is read from whichever of
+    matched_meta / top_claims / special_nodes carries it for that id; absent
+    -> None, and the name is added once to missing_signals."""
+    result = result if isinstance(result, dict) else {}
+    sources: dict = {}
+    pool = (
+        list(result.get("matched_meta") or [])
+        + list(result.get("top_claims") or [])
+        + list(result.get("special_nodes") or [])
+    )
+    order = [i for i in (result.get("matched_ids") or []) if i]
+    for e in pool:
+        if not isinstance(e, dict) or not e.get("id"):
+            continue
+        sources.setdefault(e["id"], []).append(e)
+        if not result.get("matched_ids") and e["id"] not in order:
+            order.append(e["id"])
+    candidates, missing = [], []
+    for rank, nid in enumerate(order, start=1):
+        cand = {"id": nid, "rank": rank, "in_context_why": None}
+        for name in ROUTE_SIGNALS:
+            val = None
+            for e in sources.get(nid, ()):
+                val = _signal_from(e, name)
+                if val is not None:
+                    break
+            if name == "in_context" and in_context is not None:
+                val, why = in_context(nid, cand.get("created_at"))
+                cand["in_context_why"] = why
+            cand[name] = val
+            if val is None and name not in missing:
+                if name == "composite_score" and cand.get("ranked") is False:
+                    continue  # bypass row: null composite is by design (#3551)
+                missing.append(name)
+        candidates.append(cand)
+    return candidates, missing
+
+
+def write_route_ledger(
+    route: str,
+    session_id,
+    fire_key: str,
+    query,
+    result: Optional[dict],
+    shown: list,
+    cut_reasons: dict,
+    *,
+    source: str,
+    default_cut: str = "cap",
+    extra: Optional[dict] = None,
+    read_conn=None,
+    on_failure=None,
+) -> None:
+    """Append one ledger line (see block comment). Never raises; at most one
+    stderr line. `cut_reasons` maps id -> the route's own cut name; any
+    candidate neither shown nor named gets `default_cut`. `read_conn`: passed
+    to the in-context resolver (see `_focused_ids`), `on_failure` likewise."""
+    try:
+        sid = session_id if isinstance(session_id, str) else ""
+        # "unknown" is the hooks' own missing-session placeholder, and a
+        # separator / dot-dot would escape the probe dir: never a ledger key.
+        # "." would resolve to the probe root itself (`probeDir/.`), so a line
+        # would land in `<probeDir>/routes/`: it must be a plain single name.
+        if (
+            not sid or sid == "unknown" or "/" in sid or "\\" in sid or ".." in sid
+            or sid in {".", ".."} or sid != Path(sid).name
+        ):
+            return
+        session_dir = route_probe_dir() / sid
+        if not session_dir.is_dir():
+            return  # probe not live for this session: true optional, silent
+        # Read the in_context sources BEFORE this line is appended (C4).
+        marker = _read_session_marker(sid)
+        kw = {} if on_failure is None else {"on_failure": on_failure}
+        resolver = make_in_context_resolver(sid, session_dir / "routes", marker=marker,
+                                            read_conn=read_conn, **kw)
+        candidates, missing = build_route_candidates(result, in_context=resolver)
+        shown_set = set(shown)
+        cut = {
+            c["id"]: cut_reasons.get(c["id"], default_cut)
+            for c in candidates if c["id"] not in shown_set
+        }
+        line = {
+            "ts": int(_time.time() * 1000),
+            "route": route,
+            "session_id": sid,
+            "compaction_count": _marker_compaction_count(marker),
+            "fire_key": fire_key,
+            "source": source,
+            "query": query,
+        }
+        if extra:
+            line.update(extra)
+        line.update({
+            "candidates": candidates,
+            "missing_signals": missing,
+            "shown": list(shown),
+            "cut": cut,
+        })
+        text = json.dumps(line) + "\n"
+        routes_dir = session_dir / "routes"
+        if not routes_dir.is_dir():
+            os.mkdir(routes_dir, 0o700)
+            os.chmod(routes_dir, 0o700)  # mkdir's mode is masked by umask
+        # O_NONBLOCK: a write-open of a FIFO blocks until a reader appears, and
+        # nothing in this hook's response is printed until this function returns.
+        fd = os.open(routes_dir / f"{route}.jsonl",
+                     os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return  # a FIFO with a reader would otherwise accept the write
+            os.fchmod(fd, 0o600)
+            os.write(fd, text.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception as exc:  # fail-open: the route's own output is never affected
+        try:
+            msg = f"route-ledger: {type(exc).__name__}: {exc}".replace("\r", " ").replace("\n", " ")
+            print(msg[:300], file=sys.stderr)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Advisory-probe `unknown` state (part of #3521, rows 1-4)
+# ---------------------------------------------------------------------------
+# A probe that cannot measure must say so. "Never block" means the probe never
+# blocks the tool call; it never meant a probe may REPORT HEALTHY on a failure.
+# Each probe's result is tri-state -- True healthy / False confirmed not-ok /
+# None UNKNOWN -- and UNKNOWN renders ONE bounded line (the #3504 loader notice
+# in engram-lesson-tripwire-hook.py is the template), rate-limited for the
+# per-prompt / per-tool-call hooks. This is the ONE shared implementation of
+# sanitize + line-building + the stamp-file rate limit; the tripwire hook's own
+# copies are deliberately not refactored onto it here (a follow-up).
+#
+# Reason convention: an unknown probe returns `(None, "<class>: <message>")`
+# where <class> is an exception type name or a short reason class
+# (`git-missing`, `timeout`, `nonzero`, `unparsable`, `pgrep-unknown`, ...).
+# The raw <message> goes ONLY to the sanitized stderr line; the injected line
+# carries the <class> alone.
+
+import re as _re
+
+PROBE_NOTICE_WINDOW_SECONDS = 1800
+PROBE_NOTICE_STAMP_NAME = "probe-unknown-notice.json"
+_PROBE_CONTROL_CHARS_RE = _re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def sanitize_probe_text(text, limit: int) -> str:
+    """Each control character (newline included) -> one space, then cut to
+    `limit` characters, so a message is always one bounded line. Never raises."""
+    try:
+        return _PROBE_CONTROL_CHARS_RE.sub(" ", str(text))[:limit]
+    except Exception:
+        return "<unprintable>"[:limit]
+
+
+def split_probe_reason(reason) -> tuple:
+    """`"<class>: <message>"` -> (class, message). A reason with no colon is
+    all class. Never raises."""
+    try:
+        cls, _sep, msg = str(reason).partition(":")
+        return cls.strip(), msg.strip()
+    except Exception:
+        return "unknown", ""
+
+
+def write_probe_unknown_stderr(hook_name: str, probe: str, reason) -> None:
+    """Write exactly one stderr line:
+    `<hook_name>: <probe> unknown: <class>: <message>` (message sanitized,
+    <= 200 chars; whole line <= 300). Never raises."""
+    try:
+        cls, msg = split_probe_reason(reason)
+        line = (
+            f"{sanitize_probe_text(hook_name, 60)}: {sanitize_probe_text(probe, 60)} unknown: "
+            f"{sanitize_probe_text(cls, 80)}: {sanitize_probe_text(msg, 200)}"
+        )
+        sys.stderr.write(line[:300] + "\n")
+    except Exception:
+        pass
+
+
+def probe_unknown_line(label: str, reason, suffix: str, prefix: str = "[probe] ") -> str:
+    """The ONE injected line for an unknown probe, <= 200 chars:
+    `[probe] <label> state UNKNOWN (<class>); <suffix>`. Carries the exception
+    type / reason class only, never the raw message. Never raises."""
+    try:
+        cls, _ = split_probe_reason(reason)
+        line = (
+            f"{prefix}{sanitize_probe_text(label, 90)} state UNKNOWN "
+            f"({sanitize_probe_text(cls, 40)}); {sanitize_probe_text(suffix, 60)}"
+        )
+        return line[:200]
+    except Exception:
+        return f"{prefix}probe state UNKNOWN"[:200]
+
+
+def _probe_stamp_path(engram_home) -> Path:
+    return Path(engram_home) / PROBE_NOTICE_STAMP_NAME
+
+
+def _probe_stamp_read(engram_home) -> dict:
+    """The `shown_at` map from the stamp file, or {} when the file is absent,
+    unreadable, corrupt or wrongly shaped. Never raises."""
+    try:
+        data = json.loads(read_regular_text(_probe_stamp_path(engram_home), encoding="utf-8"))
+        shown = data["shown_at"]
+        return shown if isinstance(shown, dict) else {}
+    except Exception:
+        return {}
+
+
+def probe_notice_due(engram_home, key: str, now=None) -> bool:
+    """True unless a notice for `key` was shown within the last window. An
+    absent, unreadable, corrupt, wrongly-shaped or future-dated stamp is "due":
+    the rate limit fails VISIBLE, never silent. Never raises."""
+    try:
+        now = _time.time() if now is None else now
+        ts = _probe_stamp_read(engram_home).get(str(key)[:300])
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            return True
+        return not (0 <= now - ts < PROBE_NOTICE_WINDOW_SECONDS)
+    except Exception:
+        return True
+
+
+def mark_probe_notice(engram_home, key: str, now=None) -> None:
+    """Start a new rate-limit window for `key` (call only AFTER the response
+    carrying the line was produced). Expired and malformed entries are dropped
+    so the file stays small. Never raises: an unwritable stamp just means the
+    next unknown shows the line again."""
+    try:
+        now = _time.time() if now is None else now
+        kept = {
+            k: v for k, v in _probe_stamp_read(engram_home).items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+            and 0 <= now - v < PROBE_NOTICE_WINDOW_SECONDS
+        }
+        kept[str(key)[:300]] = now
+        path = _probe_stamp_path(engram_home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, {"shown_at": kept})
+    except Exception:
+        pass
+
+
+def probe_own_server_py(engram_home: str) -> tuple:
+    """Tri-state twin of is_own_server_py_running (which is unchanged and still
+    folds every failure into False). Returns (state, reason):
+
+        (True, None)      pgrep matched (rc 0)
+        (False, None)     pgrep ran and found no match (rc 1)
+        (None, reason)    pgrep could not answer: not installed, timed out,
+                          exited with an error rc >= 2, or the path could not
+                          be resolved. Never evidence of absence.
+
+    Never raises."""
+    import subprocess
+
+    try:
+        server_path = resolve_own_server_py_path(engram_home)
+        result = subprocess.run(
+            ["pgrep", "-f", server_path], capture_output=True, timeout=2
+        )
+        if result.returncode == 0:
+            return True, None
+        if result.returncode == 1:
+            return False, None
+        return None, f"pgrep-unknown: pgrep exited {result.returncode}"
+    except subprocess.TimeoutExpired:
+        return None, "pgrep-unknown: pgrep timed out"
+    except Exception as exc:
+        return None, f"pgrep-unknown: {type(exc).__name__}: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Meaningful-span marker (#3613 Part 1A, consumer side)
+# ---------------------------------------------------------------------------
+# Producers (loop stub, probe rating request, monitors, bell) wrap the
+# meaningful text of a notification in OPEN..CLOSE so recall consumers can
+# search only that text instead of the fixed wrapper that dominates the match.
+
+ENGRAM_MARKER_OPEN = "⟦ENGRAM⟧"
+ENGRAM_MARKER_CLOSE = "⟦/ENGRAM⟧"
+
+
+def marker_recall_query(text):
+    """Return ``(state, query)`` for a recall consumer; ``state`` is one of
+    ``"none"`` (no marker: ``query is text``), ``"marked"`` (``query`` is the
+    marked span text, several top-level spans joined by ``"\\n"``) or
+    ``"empty"`` (markers present but nothing meaningful inside; ``query`` is
+    ``""``).
+
+    Balanced markers yield their top-level spans (nesting by depth count).
+    Unbalanced markers (an unclosed opener, or a closer at depth 0 after the
+    first opener) fall back to ONE span from the first opener to the LAST
+    closer after it (or to the end of the text when none follows). Marker
+    tokens inside a span are removed, spans are stripped, empties dropped.
+    Never raises: any unexpected input is ``("none", text)``."""
+    try:
+        if not isinstance(text, str) or ENGRAM_MARKER_OPEN not in text:
+            return ("none", text)
+        opener, closer = ENGRAM_MARKER_OPEN, ENGRAM_MARKER_CLOSE
+        spans: list = []
+        depth = 0
+        start = 0
+        stray = False
+        seen_open = False
+        for m in _re.finditer(_re.escape(opener) + "|" + _re.escape(closer), text):
+            if m.group(0) == opener:
+                if depth == 0:
+                    start = m.end()
+                depth += 1
+                seen_open = True
+            elif depth > 0:
+                depth -= 1
+                if depth == 0:
+                    spans.append(text[start:m.start()])
+            elif seen_open:
+                stray = True  # closer at depth 0 after the first opener
+        if depth > 0 or stray:
+            begin = text.index(opener) + len(opener)
+            last_close = text.rfind(closer)
+            spans = [text[begin:last_close] if last_close >= begin else text[begin:]]
+        cleaned = []
+        for span in spans:
+            span = span.replace(opener, "").replace(closer, "").strip()
+            if span:
+                cleaned.append(span)
+        if not cleaned:
+            return ("empty", "")
+        return ("marked", "\n".join(cleaned))
+    except Exception:
+        return ("none", text)

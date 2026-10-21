@@ -22,8 +22,8 @@ issue #2760's own account) so recovery is cheap and repeatable instead of
 
 ## Usage
 
-    ~/.engram/venv/bin/python3 tools/fairy_report.py --task <task-id> [--session <id>]
-    ~/.engram/venv/bin/python3 tools/fairy_report.py --grep <pattern> [--session <id>]
+    "$HOME/.engram/venv/bin/python3" tools/fairy_report.py --task <task-id> [--session <id>]
+    "$HOME/.engram/venv/bin/python3" tools/fairy_report.py --grep <pattern> [--session <id>]
 
 `--task <task-id>` extracts the verbatim text between `<result>` and
 `</result>` for that task's notification and prints ONLY that text to

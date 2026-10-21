@@ -6,7 +6,7 @@ Tracking: alpha #175
 This module is the single emit-side entry point for ENGRAM's append-only
 event log. Hooks and server.py call Emitter.init() once per process and
 emit() per interesting moment. Events are routed to per-session JSONL files
-at ~/.engram/logs/sessions/<session_id>.l{1,2}.jsonl, partitioned by
+at ~/.engram/logs/sessions/<session_id> ($ENGRAM_HOME).l{1,2}.jsonl, partitioned by
 privacy level (1 = stats-only / 2 = content, LOCAL ONLY).
 
 Failure-mode contract (load-bearing): emit() NEVER raises into the caller.
@@ -26,6 +26,8 @@ import uuid as _uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+from engram_regular_io import open_regular_text, open_regular_text_append
 
 # Module-level singleton — first init() call wins; subsequent calls return
 # the existing instance bound to the same session context. This matches
@@ -259,7 +261,7 @@ class Emitter:
         # warned about once per process, not once per event.
         with self._write_lock:
             file_existed = target.exists()
-            with open(target, "a", encoding="utf-8") as f:
+            with open_regular_text_append(target, encoding="utf-8") as f:
                 f.write(line + "\n")
                 # NOT wrapped in the not-a-drop carve-out below (round-1
                 # review, PR #3168): a flush() failure means the bytes
@@ -307,7 +309,7 @@ class Emitter:
         return self._turn
 
     def _read_turn_from_db(self) -> Optional[int]:
-        """One-shot read of current_turn from ~/.engram/config.json (mirrors
+        """One-shot read of current_turn from ~/.engram/config.json ($ENGRAM_HOME) (mirrors
         server.py:_get_current_turn — config.json is the canonical source of
         truth for the turn counter, NOT the nodes table). Returns None on
         any failure."""
@@ -315,7 +317,7 @@ class Emitter:
             config_path = self._engram_home / "config.json"
             if not config_path.exists():
                 return None
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open_regular_text(config_path, encoding="utf-8") as f:
                 config = json.load(f)
             turn = config.get("memory", {}).get("current_turn")
             if turn is not None:

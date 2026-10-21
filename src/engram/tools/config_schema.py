@@ -5,8 +5,8 @@ viz_server config tab, which tier they belong to (A=daily / B=advanced),
 what control to render, tooltip text, and restart-required semantics.
 
 Tier C (ENGRAM protocol-level params) is explicitly absent — those params
-exist in config.json but are not rendered. See ~/.engram/config.json
-directly for the protocol-level surface; the README/docs explain what
+exist in config.json but are not rendered. See config.json in the ENGRAM
+home ($ENGRAM_HOME/config.json, ``~/.engram`` by default) directly for the protocol-level surface; the README/docs explain what
 each does.
 
 The schema is decoupled from physical config storage: a key with dot
@@ -56,12 +56,21 @@ SCHEMA: list[dict] = [
     # Embedding (read-only)
     {"key": "embedding.enabled", "section": "embedding", "tier": TIER_B, "type": "boolean",
      "control": "checkbox", "label": "Embedding enabled",
-     "tooltip": "Semantic recall via sentence-transformer embeddings. Read-only here — disable/enable would orphan existing nodes' embeddings.",
+     "tooltip": "Retired by #345 -- embeddings are mandatory. If this key is present with any value other than true, the server refuses to start; delete the key to fix.",
      "editable": False, "restart_required": False, "alert_when_false": True},
     {"key": "embedding.model", "section": "embedding", "tier": TIER_B, "type": "string",
      "control": "text", "label": "Embedding model",
      "tooltip": "Sentence-transformer model identifier. Read-only — switching models would invalidate existing embeddings.",
      "editable": False, "restart_required": False},
+    {"key": "embedding.device", "section": "embedding", "tier": TIER_B, "type": "string",
+     "control": "select", "label": "Embedding device", "default": "cpu",
+     "allowed_values": ["cpu", "cuda", "auto"],
+     "tooltip": "Where the embedder and the polarity model run. 'cpu' (default) never touches the GPU, so no VRAM is used. 'cuda' uses the GPU when one is visible and falls back to cpu with a notice otherwise. 'auto' is the library default (GPU if present). CPU and GPU vectors match, so stored embeddings stay valid. Applies on the next model load.",
+     "editable": True, "restart_required": False},
+    {"key": "embedding.cpu_threads", "section": "embedding", "tier": TIER_B, "type": "integer",
+     "control": "int", "min": 1, "label": "Embedding CPU threads", "default": 4,
+     "tooltip": "Cap on torch intra-op threads, applied whenever the model loads on CPU (explicit cpu, a cuda fallback, or auto with no GPU). Without a cap torch uses every core, which can make a recall take over a second on a busy host. Default 4. Applies on the next model load.",
+     "editable": True, "restart_required": False},
 
     # Drowsiness
     # Note: the legacy `drowsiness_ceiling_max` field is intentionally omitted

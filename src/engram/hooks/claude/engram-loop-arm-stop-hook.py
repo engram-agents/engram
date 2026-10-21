@@ -126,7 +126,7 @@ agent nudged mid-conversation doesn't swallow its next reply. Measured
 on 2.1.235, not asserted universal.
 
 Fire condition -- for Claude, emit the normal nudge iff ALL of:
-  (a) `~/.engram/loop-mode.json` exists (never nag a non-loop session), AND
+  (a) `~/.engram/loop-mode.json` (under $ENGRAM_HOME) exists (never nag a non-loop session), AND
   (b) its `pacer` field identifies a `scheduleWakeup`-paced loop (see
       2026-07-31 round-6 note below), AND
   (c) this turn's transcript delta contains NO `tool_use` block that BOTH
@@ -303,9 +303,22 @@ crash the session.
 import html
 import json
 import os
+import re
+import shlex
+import stat
 import sys
 import time
 from pathlib import Path
+
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863 6b): it would resolve against this process's cwd, a
+# different home than the daemon's or the server's. Fail open: one stderr line, nothing written, exit 0.
+# (Inline, not from _hooklib: this hook must still run when the sibling lib cannot import.)
+_ENGRAM_HOME_RAW = os.environ.get("ENGRAM_HOME") or ""
+if _ENGRAM_HOME_RAW and not os.path.isabs(os.path.expanduser(_ENGRAM_HOME_RAW)):
+    sys.stderr.write("engram hook: ENGRAM_HOME must be an absolute path, got %r; doing nothing\n" % (_ENGRAM_HOME_RAW,))
+    sys.exit(0)
+if _ENGRAM_HOME_RAW:
+    os.environ["ENGRAM_HOME"] = os.path.abspath(os.path.expanduser(_ENGRAM_HOME_RAW))  # `~/x` -> absolute for every raw reader
 
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
@@ -317,6 +330,15 @@ LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
 # engram-stop-hook.py's `.write-nudge-last-fire.json` or
 # engram-deference-detector-stop.py's `deference-detected.json`.
 _LOOP_ARM_STATE_FILE = os.path.join(ENGRAM_HOME, ".loop-arm-nudge-last-fire.json")
+
+# alpha #3919 M2: the quiet-wake counter's OWN state file. Deliberately NOT the
+# loop marker: `loop_prompt.py --rearm-delay` rewrites the marker, and a second
+# writer there would race it.
+# Known limits (PR 3947 review): (1) two sessions sharing one ENGRAM_HOME overwrite each other's
+# counter (last writer wins, keyed by transcript path, like the offset file beside it): the
+# failure is a missed nudge, never a spurious one. (2) If this hook is skipped for a turn
+# (marker absent, stop_hook_active) the next delta spans several turns and counts as ONE tick.
+_QUIET_WAKE_STATE_FILE = os.path.join(ENGRAM_HOME, ".quiet-wake-counter.json")
 
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
@@ -379,6 +401,60 @@ try:
 except Exception:
     _STOPHOOKLIB_OK = False
 
+# #3628: the two marker reads below (platform.json, loop-mode.json) must be
+# non-blocking and regular-file-only. They use _hooklib's helper when it can be
+# imported. This hook's contract (see the emitter resolver note above, and
+# test_emits_via_fallback_when_stophooklib_import_fails) is that it must still
+# work, and still emit its nudge, when it runs with NO sibling lib at all, so it
+# cannot hard-import _hooklib: on ImportError it defines the same two helpers
+# itself. The fallback bodies are pinned identical to _hooklib's by
+# tests/test_regular_io_parity_3628.py (AST + behavioural) -- never edit one
+# without the other.
+try:
+    from _hooklib import atomic_write_json as _atomic_write_json
+except Exception:
+    _atomic_write_json = None
+
+try:
+    from _hooklib import open_regular_text
+except Exception:
+    def _not_regular_error(fd, path):
+        """The OSError for a path that opened but is not a regular file. A
+        directory keeps the IsADirectoryError a plain open() raises for it; any
+        other kind (FIFO, socket, device) is an EINVAL OSError. Does not close fd:
+        the caller's except clause does, once."""
+        import errno
+        try:
+            is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+        except OSError:
+            is_dir = False
+        code = errno.EISDIR if is_dir else errno.EINVAL
+        return OSError(code, os.strerror(code) + " (not a regular file)", str(path))
+
+    def open_regular_text(path, encoding=None):
+        """`open(path, encoding=encoding)` for a read that must never block (#3591).
+
+        A plain open() of a FIFO waits for a writer; a hook under a 5 s timeout
+        hangs and is killed. This opens O_NONBLOCK (returns at once on a FIFO),
+        fstat-checks that the target is a regular file, and returns a text file
+        object over the fd. Anything else raises OSError (IsADirectoryError for a
+        directory, EINVAL otherwise), so a call site that already treats an
+        unreadable file as absent -- `except OSError` or broader -- needs only
+        `open(p)` -> `open_regular_text(p)`. FileNotFoundError / PermissionError
+        come from os.open exactly as from open(). For a regular file the result is
+        the same text wrapper open() returns."""
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise _not_regular_error(fd, path)
+            return os.fdopen(fd, "r", encoding=encoding)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+
 # ---------------------------------------------------------------------------
 # loop_prompt import — SSoT for the loop-wake marker (same pattern as
 # engram-time-bar-hook.py / engram-deference-detector-prompt.py). Resolve
@@ -429,6 +505,39 @@ try:
 except Exception:
     _LOOP_WAKE_MARKER = _LOOP_WAKE_MARKER_FALLBACK
 
+# ---------------------------------------------------------------------------
+# The helper command the nudge PRINTS must RUN AS PRINTED.  The resolution
+# above already found the real tools/ dir (`_LP_TOOLS_DIR`), so print THAT:
+# a static guess is copied from one deploy layout and broken in the other —
+# the bare `tools/loop_prompt.py` this replaced resolved in NO cwd, not even
+# the repo root, because the source tree keeps the file at `src/engram/tools/`.
+# Only when the import resolution FAILED does the printed command fall back
+# to a sh form whose `:-` default covers a plugin-topology seat with the
+# variable set AND one that has the plugin installed but
+# `$CLAUDE_PLUGIN_ROOT` unset in its shell (measured: unset in an agent's
+# Bash env, login shell included).
+# ---------------------------------------------------------------------------
+
+_LOOP_PROMPT_FALLBACK_PATH = (
+    '"${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}'
+    '/tools/loop_prompt.py"'
+)
+
+
+def _loop_prompt_rearm_command() -> str:
+    """The `loop_prompt.py --rearm-delay` command the nudge prints.
+
+    Names the path RESOLVED at import when resolution succeeded, so the
+    printed command is correct in whichever layout this hook runs from;
+    falls back to the `${CLAUDE_PLUGIN_ROOT:-…}` sh form otherwise.
+    """
+    if _LP_TOOLS_DIR is not None:
+        helper = f'"{_LP_TOOLS_DIR / "loop_prompt.py"}"'
+    else:
+        helper = _LOOP_PROMPT_FALLBACK_PATH
+    return f"python3 {helper} --rearm-delay --wake-kind other"
+
+
 # The wake-arming tool's name(s), as they appear in a tool_use block's
 # "name" field. A small literal/alias set, deliberately -- see invariant 5
 # in the module docstring: a rename should cause over-firing (this set no
@@ -465,7 +574,7 @@ def _runtime_platform() -> str | None:
             candidates.append(Path(value))
     for runtime_dir in candidates:
         try:
-            with open(runtime_dir / "platform.json", encoding="utf-8") as f:
+            with open_regular_text(runtime_dir / "platform.json", encoding="utf-8") as f:
                 data = json.load(f)
             platform = data.get("platform")
             if isinstance(platform, str):
@@ -486,7 +595,11 @@ def _is_managed_codex_runtime() -> bool:
 _NUDGE_TEXT = (
     "[Loop Arm Check: a loop marker is active and this turn shows no "
     "ScheduleWakeup call. Arm now — ScheduleWakeup with this file's "
-    "loop_prompt copied verbatim — then run CronList to verify the armed "
+    "loop_prompt copied verbatim — after asking the helper for this turn's "
+    f"delay: run `{_loop_prompt_rearm_command()}` and "
+    "pass the integer it prints to ScheduleWakeup (a nudge-driven arm "
+    "PRESERVES the deadline; do NOT arm the bare full cadence — that pushes "
+    "the due moment out, #3005). Then run CronList to verify the armed "
     "prompt leads with "
     f"{_LOOP_WAKE_MARKER}. CronList alone never satisfies this check, only "
     "verifies after the real arming action. Arming is idempotent: a "
@@ -524,7 +637,7 @@ def _pacer_is_schedule_wakeup(loop_marker_path: str) -> bool:
     fail-toward-emitting policy.
     """
     try:
-        with open(loop_marker_path, encoding="utf-8") as f:
+        with open_regular_text(loop_marker_path, encoding="utf-8") as f:
             marker = json.load(f)
     except Exception:
         return False
@@ -634,6 +747,384 @@ def _delta_has_arm_confirmation(transcript_path: str) -> bool:
     return _delta_matches_arm_confirmation(delta)
 
 
+# ---------------------------------------------------------------------------
+# alpha #3919 M2 -- quiet-wake counter.
+#
+# A QUIET WAKE is one turn (the transcript delta this hook already computes)
+# such that ALL hold:
+#   1. it was STARTED by a wake-class trigger: the delta's FIRST user-role text
+#      record carries `<loop-wake>` (after HTML-unescape) or `<task-notification>`;
+#   2. every tool_use is in the observe-or-arm ALLOWLIST below, and every Bash
+#      tool_use passes `_bash_is_read_only`;
+#   3. the delta parses (unparseable / empty -> NOT quiet; fail toward not nudging).
+# Transcript-only: no regex over assistant prose, no network.
+# Codex managed path and non-scheduleWakeup pacers are out of scope here.
+# ---------------------------------------------------------------------------
+
+# Consecutive quiet wakes before the nudge fires.
+QUIET_TICKS_THRESHOLD = 2
+
+# A REVIEWED constant: adding a verb is a deliberate change (a contract cell
+# pins the exact membership). Plain harness tools, plus umwelt's MCP READ verbs
+# (matched by the part after the last `__`, on an umwelt server only -- see
+# `_tool_name_is_observe_or_arm`). `checklist` (can mutate) and `open` (not
+# verified read-only) are deliberately NOT here. `Bash` is handled separately,
+# under the read-only command check.
+_UMWELT_READ_VERBS = frozenset({
+    "whats_new", "hear", "look_around", "look_at", "look_in",
+    "crossings_here", "crossings_for_agent", "search_crossings",
+    "thread", "map", "where_can_i_go", "inventory",
+})
+QUIET_WAKE_OBSERVE_OR_ARM_TOOLS = frozenset({
+    "ScheduleWakeup", "CronList", "Monitor", "TaskStop", "ToolSearch",
+    "Read", "Glob", "Grep",
+}) | _UMWELT_READ_VERBS
+
+_QUIET_NUDGE_TEXT = (
+    "[Quiet Wake Check: {n} quiet wakes in a row (no work done, only looking "
+    "and re-arming). Take an OWNER step from your board, or run ONE study unit: "
+    "one target, one method, one written ENGRAM result. Next act: run "
+    "`python3 tools/study_queue.py` once it exists (alpha #3919 M3); until "
+    "then read the latest dream report's `For the awake seat` section "
+    "(`~/.engram/history/dream/`, most recent file).]"
+)
+
+_BASH_PIPE_SINKS = frozenset({"head", "tail", "wc", "grep", "sort", "uniq", "cut"})
+_BASH_PLAIN_READERS = frozenset({"pgrep", "ps", "ls", "cat", "head", "tail", "wc", "grep", "pwd"})
+_BASH_GH_READ_VERBS = frozenset({"view", "list", "checks", "status"})
+_BASH_GH_API_WRITE_SHORT = ("-X", "-f", "-F")  # also matched attached, e.g. -XPOST
+_BASH_GH_API_WRITE_LONG = ("--method", "--field", "--raw-field", "--input")
+_BASH_GIT_READ_VERBS = frozenset({"status", "log", "diff", "show", "rev-parse"})  # `fetch` has its own rule
+_BASH_GIT_BRANCH_FLAGS = frozenset({"-a", "-r", "-v", "-vv", "--all", "--remotes", "--verbose", "--list", "-l", "--show-current"})
+# The re-arm helper the loop skill and the nudge itself prescribe: it prints a delay and stamps the
+# loop marker's next_due_at, so it is an ARM action, and a heartbeat turn that calls it is quiet.
+# Whole-command match only, so `python3 loop_prompt.py --rearm-delay; rm x` does not pass.
+_LOOP_PROMPT_HELPER_RE = re.compile(
+    r"(?:(?P<w>[A-Za-z_]\w*=\$\()|)"
+    r"python3?\s+[\"']?(?:[\w./~$-]*/)?loop_prompt\.py[\"']?\s+--rearm-delay"
+    r"(?:\s+--wake-kind\s+(?:heartbeat|other))?"
+    r"(?:\s+--marker\s+[\w./~-]+)?"
+    r"(?(w)\))"
+)
+# The standard supervisor/bell arm commands (a Monitor whose command is anything else is not an arm).
+_MONITOR_ARM_COMMAND_RE = re.compile(
+    r"(?:UMWELT_BELL_QUIET_ARM=1\s+)?"
+    r"(?:python3?\s+[\w./~$-]*(?:monitor-supervisor|umwelt-bell)\.py"
+    r"|bash\s+[\w./~$-]*(?:forum-updates-monitor|forum-mention-monitor)\.sh)"
+    r"(?:\s+[\w./~:@=,$-]+)*"
+)
+_BASH_CD_PREFIX = re.compile(r"^\s*cd\s+[^\s;&|<>$`()]+\s*&&\s*")
+
+
+def _short_cluster(a: str) -> str | None:
+    """The letters of a single-dash short-flag cluster (`-iXPOST` -> `iXPOST`), else None."""
+    return a[1:] if len(a) > 1 and a[0] == "-" and a[1] != "-" else None
+
+
+def _gh_api_args_have_write_flag(args: list) -> bool:
+    for a in args:
+        cluster = _short_cluster(a)
+        # gh/pflag accept clustered shorthand and an attached value: -XPOST, -iXPOST, -ifa=b
+        if cluster is not None and any(c in cluster for c in "XfF"):
+            return True
+        if any(a == f or a.startswith(f + "=") for f in _BASH_GH_API_WRITE_LONG):
+            return True
+    return False
+
+
+def _simple_command_is_read_only(tokens: list, *, piped_sink: bool) -> bool:
+    """One already-tokenised simple command against the read-only allowlist."""
+    if not tokens:
+        return False
+    first, rest = tokens[0], tokens[1:]
+    if piped_sink:
+        if first not in _BASH_PIPE_SINKS:
+            return False
+        if first == "sort":
+            # `-o FILE` writes a file (also clustered: -uo, -ro); --compress-program runs a program
+            return not any(
+                (_short_cluster(a) is not None and "o" in _short_cluster(a))
+                or a.startswith("--output") or a.startswith("--compress-program")
+                for a in rest
+            )
+        if first == "uniq":
+            return all(a.startswith("-") for a in rest)  # a 2nd positional is an OUTPUT file
+        return True
+    if first == "baton":
+        return bool(rest) and rest[0] in ("mine", "status", "show")
+    if first == "gh":
+        # `gh -R owner/repo pr list`: the repo flag may come before the noun
+        while len(rest) >= 2 and rest[0] in ("-R", "--repo"):
+            rest = rest[2:]
+        if any(a in ("--web", "-w") for a in rest):
+            return False  # opens a browser
+        if rest and rest[0] == "api":
+            return not _gh_api_args_have_write_flag(rest[1:])
+        return len(rest) >= 2 and rest[1] in _BASH_GH_READ_VERBS
+    if first == "git":
+        if not rest:
+            return False
+        while len(rest) >= 2 and rest[0] == "-C":  # `git -C <path> log ...`
+            rest = rest[2:]
+        if not rest:
+            return False
+        verb, args = rest[0], rest[1:]
+        if any(a.startswith("--output") or a in ("--ext-diff", "--textconv", "--open-files-in-pager") or a == "-O"
+               for a in args):
+            return False  # `git diff --output=FILE` writes a file; --ext-diff runs a program
+        if verb == "fetch":
+            # bare `git fetch` / `git fetch <remote>` only: a refspec (`a:b`) or --prune writes or deletes refs
+            return len(args) <= 1 and all(not a.startswith("-") and ":" not in a for a in args)
+        if verb in _BASH_GIT_READ_VERBS:
+            return True
+        if verb == "branch":  # bare listing only; any other arg could create/delete/rename
+            return all(a in _BASH_GIT_BRANCH_FLAGS for a in args)
+        if verb == "worktree":
+            return bool(args) and args[0] == "list"
+        if verb == "tag":
+            return bool(args) and args[0] == "--points-at"
+        return False
+    if first == "date":
+        # `date -s` sets the clock (also clustered: -us)
+        # (and a bare positional like `date 101914302026` sets it on BSD: only +FORMAT is allowed)
+        return not any(
+            (_short_cluster(a) is not None and "s" in _short_cluster(a)) or a.startswith("--set")
+            or (not a.startswith("-") and not a.startswith("+"))
+            for a in rest
+        )
+    return first in _BASH_PLAIN_READERS
+
+
+def _split_pipes(cmd: str) -> list:
+    """Split on `|` outside single/double quotes (`grep -E 'a|b' f` is one stage)."""
+    parts, cur, quote = [], [], None
+    for ch in cmd:
+        if quote:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+            cur.append(ch)
+        elif ch == "|":
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
+def _bash_is_read_only(command: str) -> bool:
+    """ALLOWLIST, whole-command: True only for a single simple read-only command
+    (optionally after one leading `cd <path> &&`, optionally one pipe into
+    head/tail/wc/grep/sort/uniq/cut). Anything else, or anything unparseable,
+    is False. Conservative on purpose: a quoted `;` or `>` also refuses."""
+    try:
+        if not isinstance(command, str):
+            return False
+        cmd = _BASH_CD_PREFIX.sub("", command, count=1).strip()
+        if not cmd:
+            return False
+        if _LOOP_PROMPT_HELPER_RE.fullmatch(cmd):
+            return True
+        if any(ch in cmd for ch in (";", "`", ">", "<", "&", "\n", "\r")) or "$(" in cmd or "||" in cmd:
+            return False
+        parts = _split_pipes(cmd)
+        if len(parts) > 3:
+            return False
+        for i, part in enumerate(parts):
+            if not _simple_command_is_read_only(shlex.split(part), piped_sink=(i >= 1)):
+                return False
+        return True
+    except Exception:  # noqa: BLE001 -- anything we cannot parse is not provably read-only
+        return False
+
+
+def _tool_name_is_observe_or_arm(name: object) -> bool:
+    if not isinstance(name, str) or not name:
+        return False
+    if "__" in name:
+        # mcp__<server>__<verb>: an umwelt server's read verb only. A same-named
+        # verb on some other server is not assumed read-only.
+        parts = name.split("__")
+        return (
+            parts[0] == "mcp"
+            and len(parts) >= 3
+            and "umwelt" in parts[1]
+            and parts[-1] in _UMWELT_READ_VERBS
+            and parts[-1] in QUIET_WAKE_OBSERVE_OR_ARM_TOOLS
+        )
+    return name in QUIET_WAKE_OBSERVE_OR_ARM_TOOLS and name not in _UMWELT_READ_VERBS
+
+
+_STOP_HOOK_FEEDBACK_PREFIX = "Stop hook feedback"
+# The compaction summary is a user-role record too, and it quotes the marker in its prose.
+_COMPACTION_SUMMARY_PREFIX = "This session is being continued from a previous conversation"
+_NOT_A_TRIGGER_PREFIXES = (_STOP_HOOK_FEEDBACK_PREFIX, _COMPACTION_SUMMARY_PREFIX)
+
+
+def _record_user_text(rec: dict) -> str | None:
+    """Text of a user-role record, or None when it carries no text (e.g. a
+    tool_result-only record)."""
+    if rec.get("type") != "user":
+        return None
+    msg = rec.get("message")
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = [
+            b.get("text") for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+        ]
+        return "\n".join(texts) if texts else None
+    return None
+
+
+def _delta_is_quiet_wake(delta_bytes: bytes) -> bool:
+    """True iff this turn's delta is a QUIET WAKE (definition above)."""
+    if not delta_bytes or not delta_bytes.strip():
+        return False
+    records, any_parsed = _parse_jsonl_records(delta_bytes)
+    if not any_parsed or not records:
+        return False
+    # Strict: a delta with ANY unparseable non-blank line is "unparseable".
+    nonblank = [ln for ln in delta_bytes.decode("utf-8", errors="replace").split("\n") if ln.strip()]
+    if len(records) != len(nonblank):
+        return False
+
+    first_text = None
+    for rec in records:
+        text = _record_user_text(rec)
+        if text is None:
+            continue
+        # (Also the compaction summary, see _COMPACTION_SUMMARY_PREFIX.)
+        # A Stop-hook block arrives as a user-role record ("Stop hook feedback: ...") and, for
+        # this very hook, quotes the loop-wake marker. It is a continuation, not a trigger: the
+        # hook's offset is written at the block, so the NEXT fire's delta still carries it (and
+        # the continuation turn) ahead of the real trigger. Skip it.
+        if text.lstrip().startswith(_NOT_A_TRIGGER_PREFIXES):
+            continue
+        first_text = text
+        break
+    if first_text is None:
+        return False
+    unescaped = html.unescape(first_text)
+    if _LOOP_WAKE_MARKER not in unescaped and "<task-notification>" not in unescaped:
+        return False
+
+    for rec in records:
+        if rec.get("type") != "assistant":
+            continue
+        message = rec.get("message")
+        content = message.get("content", []) if isinstance(message, dict) else []
+        if not isinstance(content, list):
+            return False
+        for block in _walk_content_blocks(content):
+            if block.get("type") != "tool_use":
+                continue
+            name = block.get("name")
+            if name == "Bash":
+                input_ = block.get("input")
+                command = input_.get("command") if isinstance(input_, dict) else None
+                if not _bash_is_read_only(command):
+                    return False
+            elif name == "Monitor":
+                input_ = block.get("input")
+                mcmd = input_.get("command") if isinstance(input_, dict) else None
+                # an arm is the standard supervisor/bell command (or a websocket watch, no command);
+                # any other Monitor command could do anything, so it is not quiet
+                if mcmd is not None and not (
+                    isinstance(mcmd, str)
+                    and (_MONITOR_ARM_COMMAND_RE.fullmatch(mcmd.strip()) or _bash_is_read_only(mcmd))
+                ):
+                    return False
+            elif not _tool_name_is_observe_or_arm(name):
+                return False
+    return True
+
+
+def _read_turn_delta(transcript_path: str) -> bytes | None:
+    """The transcript bytes since this hook's own last fire (same boundary as
+    `_delta_has_arm_confirmation`), or None when unreadable."""
+    if not transcript_path or not _STOPHOOKLIB_OK:
+        return None
+    try:
+        current_size = os.path.getsize(transcript_path)
+    except OSError:
+        return None
+    stored_offset = 0
+    try:
+        stored_path, offset = _read_offset_state(_LOOP_ARM_STATE_FILE)
+        if stored_path == transcript_path and 0 <= offset <= current_size:
+            stored_offset = offset
+    except Exception:  # noqa: BLE001
+        pass
+    if stored_offset >= current_size:
+        return b""
+    try:
+        return _read_delta(transcript_path, stored_offset, current_size)
+    except OSError:
+        return None
+
+
+def _read_quiet_ticks(transcript_path: str) -> int:
+    """Stored count for THIS transcript; missing/corrupt/other-transcript -> 0."""
+    try:
+        with open_regular_text(_QUIET_WAKE_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        ticks = data.get("quiet_ticks")
+        if (
+            data.get("transcript_path") == transcript_path
+            and isinstance(ticks, int)
+            and not isinstance(ticks, bool)
+            and ticks >= 0
+        ):
+            return ticks
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
+
+
+def _write_quiet_ticks(transcript_path: str, ticks: int) -> None:
+    data = {"transcript_path": transcript_path, "quiet_ticks": ticks}
+    if _atomic_write_json is not None:
+        _atomic_write_json(_QUIET_WAKE_STATE_FILE, data, encoding="utf-8")
+        return
+    import tempfile  # fallback when _hooklib cannot import: same-dir temp + rename
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(_QUIET_WAKE_STATE_FILE) or ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, _QUIET_WAKE_STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _quiet_wake_step(transcript_path: str, can_nudge: bool) -> int | None:
+    """Classify this turn, update + persist the counter. Returns the tick count
+    the nudge should name when a quiet-wake nudge is due AND may be emitted
+    (`can_nudge`: the arm-check nudge is not itself firing this turn), else None.
+    On a due nudge the stored count resets to 0. Additive: never raises."""
+    try:
+        delta = _read_turn_delta(transcript_path)
+        if delta is None:
+            return None  # unreadable: leave the counter alone
+        ticks = _read_quiet_ticks(transcript_path) + 1 if _delta_is_quiet_wake(delta) else 0
+        due = ticks >= QUIET_TICKS_THRESHOLD and can_nudge
+        _write_quiet_ticks(transcript_path, 0 if due else ticks)
+        return ticks if due else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def main() -> None:
     # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
     # return in this function.
@@ -698,9 +1189,16 @@ def main() -> None:
     except Exception:  # noqa: BLE001
         confirmed = False  # fail-open: nudge fires
 
+    # alpha #3919 M2: runs BEFORE the confirmed-early-return (a quiet turn
+    # normally DOES contain the re-arm) and BEFORE the offset write (it reads
+    # the same delta). It never emits when the arm-check nudge is firing.
+    quiet_due = _quiet_wake_step(transcript_path, can_nudge=confirmed)
+
     if confirmed:
         if _STOPHOOKLIB_OK:
             _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path)
+        if quiet_due is not None:
+            print(json.dumps({"decision": "block", "reason": _QUIET_NUDGE_TEXT.format(n=quiet_due)}))
         return
 
     # Single, lib-independent emission path (2026-08-12 blocking-decision

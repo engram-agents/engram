@@ -25,7 +25,8 @@ group-summarize with a "+ N older from <senders>" line.
 
 Anti-patterns guarded:
   - Forum-configured gate is the first check (#2857 step 1) — installs with
-    no forum.url/agent_name set see exactly zero behavior change.
+    forum.url set (agent_name alone does not count) see exactly zero
+    behavior change.
     (Previously gated on config.json mode == 'multi' — the DM feed is
     symmetric for any agent once a forum is configured, regardless of host
     topology.)
@@ -53,13 +54,6 @@ from typing import Optional
 # `import pwd` always binds the same singleton sys.modules['pwd'] object,
 # patching it here also patches what _prompthooklib.get_agent_name() sees.
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
-
-SURFACED_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-surfaced-cursor.txt")
-READ_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-read-cursor.txt")
 
 # If "new since last prompt" exceeds this, group-summarize instead of listing.
 LIST_CAP = 10
@@ -89,22 +83,28 @@ LIST_CAP = 10
 # prologue previously inlined here now lives in the shared _prompthooklib
 # module (same directory, same sys.path bootstrap used for _hooklib above).
 # _PROMPTHOOKLIB_OK gates main() -- if the shared module somehow fails to
-# import, the hook degrades to a silent no-op rather than crashing, same
-# discipline as every other best-effort import in this prologue.
+# import, the hook reports the exception class (one stderr line, one injected
+# context line; #3521) and exits 0 rather than crashing.
 # ---------------------------------------------------------------------------
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 try:
     from _prompthooklib import (
-        load_config as _load_config_impl,
+        load_config_checked as _load_config_checked_impl,
+        report_config_unknown as _report_config_unknown,
         get_agent_name as _get_agent_name_impl,
         emit_context as _emit_context,
         bootstrap_tools_dir as _bootstrap_tools_dir,
+        # #3628: the cursor read/write are non-blocking and regular-file-only.
+        hooklib_io as _hooklib_io,
+        engram_home_or_exit as _engram_home,
     )
     _PROMPTHOOKLIB_OK = True
-except Exception:
+except Exception as _lib_exc:
+    # #3521: remember the CLASS only (never the message); main() reports it.
     _PROMPTHOOKLIB_OK = False
+    _PROMPTHOOKLIB_IMPORT_ERROR = type(_lib_exc).__name__
 _TOOLS_DIR = _bootstrap_tools_dir("forum_api.py") if _PROMPTHOOKLIB_OK else None
 try:
     from forum_api import (
@@ -117,6 +117,13 @@ try:
 except Exception:
     _FORUM_API_OK = False
 
+# The prompt-hook layer's own resolver (a parity-pinned copy in _prompthooklib, #3863). When that lib failed
+# to import, main() reports the class and exits before any use of this value.
+ENGRAM_HOME = str(_engram_home()) if _PROMPTHOOKLIB_OK else ""
+
+SURFACED_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-surfaced-cursor.txt")
+READ_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-read-cursor.txt")
+
 
 # ---------------------------------------------------------------------------
 # Config helpers -- delegate to _prompthooklib (gh#1680 slice 1). Thin
@@ -127,9 +134,21 @@ except Exception:
 # import time" ENGRAM_HOME timing the pre-extraction inline code had.
 # ---------------------------------------------------------------------------
 
+# #3521 row 6: why the last _load_config() could not read config.json, or None
+# when it could (or the file is simply absent). main() reads this right after
+# _load_config() so an unreadable file is reported as UNKNOWN instead of being
+# treated as "not configured". Kept as module state, not a changed return
+# type, so _load_config() keeps its zero-arg dict contract for every existing
+# caller and test monkeypatch.
+_config_unknown_reason: Optional[str] = None
+
+
 def _load_config() -> dict:
-    """Load $ENGRAM_HOME/config.json. Returns {} on any failure."""
-    return _load_config_impl(ENGRAM_HOME)
+    """Load $ENGRAM_HOME/config.json. Returns {} on any failure (and records
+    the reason in _config_unknown_reason when the file is present but unusable)."""
+    global _config_unknown_reason
+    cfg, _config_unknown_reason = _load_config_checked_impl(ENGRAM_HOME)
+    return cfg or {}
 
 
 def _get_agent_name(config: Optional[dict] = None) -> str:
@@ -138,17 +157,23 @@ def _get_agent_name(config: Optional[dict] = None) -> str:
 
 
 def _is_forum_configured(config: Optional[dict] = None) -> bool:
-    """Return True if forum is explicitly configured (url or agent_name set).
+    """Return True if a forum is configured: ``forum.url`` is a non-empty string.
 
-    Silent no-op gate: if neither forum.url nor agent_name is in config, skip
-    the hook to avoid noise on non-forum installs.
+    Silent no-op gate: no ``forum.url`` -> skip the hook, so an install with no
+    forum server never reports one as unreachable. ``agent_name`` alone is this
+    agent's identity, not forum configuration, and does not pass the gate;
+    neither does the ``FORUM_URL`` env var by itself. Total: any other shape
+    (non-dict ``forum``, non-string or blank ``url``) is "not configured".
     """
     if config is None:
         config = _load_config()
-    forum_cfg = config.get("forum", {})
-    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
-    has_agent = bool(config.get("agent_name", "").strip())
-    return has_url or has_agent
+    if not isinstance(config, dict):
+        return False
+    forum_cfg = config.get("forum")
+    if not isinstance(forum_cfg, dict):
+        return False
+    url = forum_cfg.get("url")
+    return isinstance(url, str) and bool(url.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +183,7 @@ def _is_forum_configured(config: Optional[dict] = None) -> bool:
 def _read_cursor_int(path: str) -> int:
     """Read the cursor file; return int or 0 if absent/invalid."""
     try:
-        raw = Path(path).read_text().strip()
+        raw = _hooklib_io().read_regular_text(path).strip()
         return int(raw)
     except (OSError, ValueError):
         return 0
@@ -174,7 +199,8 @@ def _write_cursor_int(path: str, value: int) -> None:
     dest = Path(path)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     try:
-        tmp.write_text(str(value) + "\n")
+        with _hooklib_io().open_regular_text_write(tmp) as f:
+            f.write(str(value) + "\n")
         os.replace(tmp, dest)
     except OSError as e:
         try:
@@ -276,12 +302,59 @@ def _fetch_dm_updates(config: dict, agent_name: str, since: int) -> dict:
 # _emit_context now lives in _prompthooklib (gh#1680 slice 1); imported above.
 
 
+def _report_prompthooklib_import_failed() -> None:
+    """#3521: a failed `_prompthooklib` import is VISIBLE, not a silent no-op.
+
+    One class-only stderr line plus one class-only injected context line, on
+    every run (deliberately no rate limit: a broken install is rare and
+    severe). The lib -- and its `emit_context` -- is the thing that failed, so
+    the envelope is built here with `json` alone. Each emission is separately
+    guarded: this function never raises, and if a write fails the hook falls
+    back to the silent exit 0 it had before.
+    """
+    try:
+        cls = "".join(
+            ch if ch.isprintable() else "?" for ch in _PROMPTHOOKLIB_IMPORT_ERROR
+        )[:80]
+        line = f"engram-inter-agent-prompt-hook: _prompthooklib import failed: {cls}"
+    except Exception:
+        return
+    try:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": line,
+        }}))
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def main() -> None:
     # ── Prologue-lib gate (gh#1680 slice 1) ───────────────────────────────────
     # If _prompthooklib somehow failed to import, _load_config/_get_agent_name/
-    # _emit_context are unavailable -- degrade to a silent no-op, matching
-    # every other best-effort import in this hook's prologue.
+    # _emit_context are unavailable. Report the failure (class-only stderr
+    # line + injected context line, #3521) and exit 0 without doing any other
+    # work. When run as a script the exit is os._exit(0), not sys.exit(0):
+    # the reporter swallows a failed write on a closed pipe, which leaves
+    # data buffered, and the interpreter's shutdown flush would then fail and
+    # turn the exit code into 120. When the module is loaded in-process (as
+    # the tests do), it raises SystemExit(0) instead, because os._exit would
+    # end the host process.
     if not _PROMPTHOOKLIB_OK:
+        _report_prompthooklib_import_failed()
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        # Only a hook run as a script may skip shutdown: an in-process caller
+        # (such as a test) must get a catchable SystemExit, never a killed process.
+        if __name__ == "__main__":
+            os._exit(0)
         sys.exit(0)
 
     # ── Read stdin payload (session_id for drift throttle) ────────────────────
@@ -293,6 +366,13 @@ def main() -> None:
 
     # ── Config (single load) ──────────────────────────────────────────────────
     config = _load_config()
+    if _config_unknown_reason is not None:
+        # #3521 row 6: unreadable config.json is UNKNOWN, never "not configured".
+        _report_config_unknown(
+            "engram-inter-agent-prompt-hook", "config:inter-agent-prompt-hook",
+            ENGRAM_HOME, _config_unknown_reason, _emit_context, "DM check skipped",
+        )
+        sys.exit(0)
 
     # ── Forum-configured gate (FIRST check) ───────────────────────────────────
     # No forum configured (or forum_api import failure) see zero output and

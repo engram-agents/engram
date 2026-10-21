@@ -57,7 +57,7 @@
 
 ## Secondary CLI-capable tools (tiered)
 
-engram-pkg (convenience — package authoring, isolated namespace) · inspect_raw.py, verify_quote.py, recall_summary_validator.py, cohort_dispatch.py, dream_master_batch.py, write_sleep_marker.py, engram-regenerate-embeddings.py (essential) · compute_task_time.py (convenience).
+engram-pkg (convenience — package authoring, isolated namespace) · inspect_raw.py, verify_quote.py, recall_summary_validator.py, cohort_dispatch.py, dream_master_batch.py, write_sleep_marker.py, erase_session_block.py, engram-regenerate-embeddings.py (essential) · compute_task_time.py (convenience).
 
 ## Manifest gaps (dispatcher-verified)
 
@@ -120,6 +120,7 @@ Imported by runtime processes (hooks, server, sleep cycle scripts). Never invoke
 | `tools/recall_summary_prompts.py` | summary-fairy (prompt templates) | T1 |
 | `tools/recall_summary_validator.py` | summary-fairy, CI (validation) | T1 |
 | `tools/write_sleep_marker.py` | `engram-sleep` Phase A step 2 (writes the marker) | T1 |
+| `tools/erase_session_block.py` | `engram-sleep` Step 3 (erases the warm-briefing session block) | T1 |
 | `tools/engram-regenerate-embeddings.py` | post-upgrade repair (embeddings) | T1 |
 | `tools/verify_quote.py` | `engram-observe` (quote provenance checker) | T1 |
 | `tools/inspect_raw.py` | DB inspection (called by hooks + surgical flows) | T1 |

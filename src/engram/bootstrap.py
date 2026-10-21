@@ -30,8 +30,8 @@ its own knowledge.db):
   - goal: epistemic humility                      → {{GL_EPISTEMIC_HUMILITY}}
 
 Edges:
-  - axiom (honesty ⊥ discretion) cites axiom (honesty) [via context_ids]
-  - goal (epistemic humility) cites axiom (honesty)    [via context_ids]
+  - axiom (honesty ⊥ discretion) about axiom (honesty) [via context_ids]
+  - goal (epistemic humility) about axiom (honesty)    [via context_ids]
 """
 
 import json
@@ -64,7 +64,7 @@ CODEX_HOME = Path(os.environ["CODEX_HOME"]) if TARGET == "codex" else None
 #   - Plugin install: tools/build-plugin.sh assembles bootstrap.py + server.py
 #     + engram_*.py into the plugin tree under $CLAUDE_PLUGIN_ROOT.
 # Using __file__'s dirname keeps the import self-contained without depending
-# on env-var conventions (in plugin mode the venv data dir at ~/.engram/ never
+# on env-var conventions (in plugin mode the venv data dir at ~/.engram/ (its data part: $ENGRAM_HOME) never
 # gets server.py copied into it).
 # ENGRAM_HOME is still read by server.py at module import (line 145) to
 # resolve DATA_DIR — that's a separate concern from where server.py lives.
@@ -287,7 +287,7 @@ def merge_codex_config_toml(
 def _render_codex_target(substitutions: dict[str, str]) -> None:
     """Render the three Codex identity surfaces.
 
-    1. ~/.engram/codex-compact-prompt.md  — compact instructions (standalone)
+    1. ~/.engram/codex-compact-prompt.md ($ENGRAM_HOME)  — compact instructions (standalone)
     2. ~/.codex/config.toml               — identity keys (merge-not-clobber)
     3. ~/.codex/AGENTS.md                 — project conventions placeholder
 
@@ -472,8 +472,8 @@ def main() -> None:
                 "  - For a true fresh start, delete the file first."
             )
 
-    # In plugin mode, symlink ~/.engram/tools -> <plugin-root>/tools so that
-    # existing skill/agent references to ~/.engram/tools/<file> (which were
+    # In plugin mode, symlink ~/.engram/tools ($ENGRAM_HOME/tools) -> <plugin-root>/tools so that
+    # existing skill/agent references to ~/.engram/tools/<file> ($ENGRAM_HOME) (which were
     # written for the scatter install path) keep resolving via the symlink
     # to the plugin's bundled runtime tools. Plugin upgrades auto-propagate
     # because the symlink target is the plugin cache dir.
@@ -542,7 +542,7 @@ def main() -> None:
         # plugin_marker.is_file() is already False, would announce a skip
         # that never had anything to do.
         print(
-            "  ENGRAM_BOOTSTRAP_SKIP_SYMLINKS=1 — skipping ~/.engram/tools and "
+            "  ENGRAM_BOOTSTRAP_SKIP_SYMLINKS=1 — skipping ~/.engram/tools ($ENGRAM_HOME/tools) and "
             "~/.engram/hooks plugin symlinks (this ENGRAM_HOME is not a real "
             "plugin install)",
             flush=True,
@@ -564,28 +564,28 @@ def main() -> None:
                         backup = ENGRAM_HOME / "tools.scatter-backup"
                         engram_tools_link.rename(backup)
                         print(
-                            f"  ~/.engram/tools (existing dir) → moved to {backup}"
+                            f"  ~/.engram/tools ($ENGRAM_HOME/tools) (existing dir) → moved to {backup}"
                             f" before replacing with plugin-tools symlink",
                             flush=True,
                         )
                 engram_tools_link.symlink_to(plugin_tools)
                 print(
-                    f"  ~/.engram/tools → symlink → {plugin_tools}",
+                    f"  ~/.engram/tools ($ENGRAM_HOME/tools) → symlink → {plugin_tools}",
                     flush=True,
                 )
             except OSError as e:
                 print(
-                    f"  WARN: could not create ~/.engram/tools symlink: {e}",
+                    f"  WARN: could not create ~/.engram/tools ($ENGRAM_HOME/tools) symlink: {e}",
                     flush=True,
                 )
         else:
             print(
                 f"  WARN: plugin tools dir not found at {plugin_tools} —"
-                " skill references to ~/.engram/tools/* will not resolve",
+                " skill references to ~/.engram/tools/* ($ENGRAM_HOME) will not resolve",
                 flush=True,
             )
 
-        # Same symlink shape for ~/.engram/hooks/ — many existing surfaces
+        # Same symlink shape for ~/.engram/hooks/ ($ENGRAM_HOME) — many existing surfaces
         # (README troubleshooting, learn-from-error diagnostic command,
         # template.CLAUDE.md hook-path table, etc.) reference the scatter
         # path. The symlink lets those references resolve through to the
@@ -602,24 +602,24 @@ def main() -> None:
                         backup = ENGRAM_HOME / "hooks.scatter-backup"
                         engram_hooks_link.rename(backup)
                         print(
-                            f"  ~/.engram/hooks (existing dir) → moved to {backup}"
+                            f"  ~/.engram/hooks ($ENGRAM_HOME/hooks) (existing dir) → moved to {backup}"
                             f" before replacing with plugin-hooks symlink",
                             flush=True,
                         )
                 engram_hooks_link.symlink_to(plugin_hooks)
                 print(
-                    f"  ~/.engram/hooks → symlink → {plugin_hooks}",
+                    f"  ~/.engram/hooks ($ENGRAM_HOME/hooks) → symlink → {plugin_hooks}",
                     flush=True,
                 )
             except OSError as e:
                 print(
-                    f"  WARN: could not create ~/.engram/hooks symlink: {e}",
+                    f"  WARN: could not create ~/.engram/hooks ($ENGRAM_HOME/hooks) symlink: {e}",
                     flush=True,
                 )
         else:
             print(
                 f"  WARN: plugin hooks dir not found at {plugin_hooks} —"
-                " skill references to ~/.engram/hooks/* will not resolve",
+                " skill references to ~/.engram/hooks/* ($ENGRAM_HOME) will not resolve",
                 flush=True,
             )
 

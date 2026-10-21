@@ -62,6 +62,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from engram_regular_io import read_regular_text
+
 
 # ---------------------------------------------------------------------------
 # Recovery guidance (#1947)
@@ -84,9 +86,9 @@ _RECOVERY_CONDITION = (
 
 _RECOVERY_STEPS: list[str] = [
     "restart the MCP server (/mcp reconnect)",
-    "stop the surface daemon: kill -TERM $(cat ~/.engram/recall-daemon.pid)",
+    'stop the surface daemon: kill -TERM $(cat "${ENGRAM_HOME:-$HOME/.engram}/recall-daemon.pid")',
     'restart it: bash "$CLAUDE_PLUGIN_ROOT/hooks/start-engram-daemon.sh"',
-    'VERIFY before believing it worked: sqlite3 ~/.engram/knowledge.db '
+    'VERIFY before believing it worked: sqlite3 "${ENGRAM_HOME:-$HOME/.engram}/knowledge.db" '
     '"select count(*) from nodes" must succeed -- a reconnect that reports '
     'success is NOT evidence the index recovered',
 ]
@@ -749,7 +751,9 @@ def read_degraded_marker(data_dir: str | Path) -> Optional[dict]:
     """
     p = _marker_path(data_dir)
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        # Non-blocking, regular-file-only read (#3628): a FIFO here must not
+        # hang the caller; it is "unreadable", i.e. treated as absent.
+        return json.loads(read_regular_text(p, encoding="utf-8"))
     except FileNotFoundError:
         return None
     except Exception:

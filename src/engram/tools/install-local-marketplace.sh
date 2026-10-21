@@ -54,6 +54,26 @@
 
 set -euo pipefail
 
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863): it would resolve against the calling process's cwd, a
+# different home for every process. Unset or empty means unset; a leading ~ is expanded against $HOME and
+# re-exported (~user is not expanded: it is not absolute, so it is refused). Checked before anything else
+# runs; `return` covers a script that is sourced, `exit` one that is executed.
+if [ -n "${ENGRAM_HOME-}" ]; then
+    _eh_raw="$ENGRAM_HOME"
+    case "$ENGRAM_HOME" in
+        "~") ENGRAM_HOME="${HOME-}"; export ENGRAM_HOME ;;
+        "~/"*) ENGRAM_HOME="${HOME-}/${ENGRAM_HOME#"~/"}"; export ENGRAM_HOME ;;
+    esac
+    case "$ENGRAM_HOME" in
+        /*) ;;
+        *)
+            printf "ENGRAM_HOME must be an absolute path, got '%s'\n" "$_eh_raw" >&2
+            unset _eh_raw
+            return 2 2>/dev/null || exit 2 ;;
+    esac
+    unset _eh_raw
+fi
+
 log() { printf '[install-local-marketplace] %s\n' "$*"; }
 die() { printf '[install-local-marketplace] ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -442,14 +462,14 @@ fi
 log "Marketplace assembled at $MARKETPLACE_ROOT"
 
 # ── Version marker ─────────────────────────────────────────────────────────────
-# Refresh ~/.engram/.deployed-version so the plugin path maintains the same
+# Refresh ~/.engram/.deployed-version (under $ENGRAM_HOME) so the plugin path maintains the same
 # forensics anchor the retired scatter upgrader (deploy.sh) kept (which commit
 # is my running code from?). Without this the marker goes stale after every
 # plugin upgrade — the engram-upgrade skill's change-set review
 # (deployed..target) and post-upgrade verification both anchor on it. Same
 # format the scatter-era writer used.
 # Capture the OLD sha BEFORE overwriting the marker — used below to detect
-# whether src/engram/hooks/hooks.json changed in this upgrade (requires a full restart).
+# whether src/engram/hooks/hooks.json changed in this upgrade (/reload-plugins re-reads it; #3268).
 OLD_ALPHA_SHA="$(grep '^alpha_sha=' "$ENGRAM_HOME/.deployed-version" 2>/dev/null | cut -d= -f2- || true)"
 ALPHA_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 ALPHA_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
@@ -520,7 +540,7 @@ fi
 # satisfy the spec, so re-running on every upgrade is cheap and safe. Runs
 # for --skip-build callers too: a venv kept in sync is independent of whether
 # this run rebuilt the plugin tree.
-_ENGRAM_VENV_PY="$ENGRAM_HOME/venv/bin/python"
+_ENGRAM_VENV_PY="$HOME/.engram/venv/bin/python"
 if [[ -f "$_ENGRAM_VENV_PY" ]] && command -v python3 &>/dev/null; then
   # #2951: these two reads used to swallow ANY parse failure and silently
   # resolve to convenience/not-multi-agent, dropping the dev/forum
@@ -587,7 +607,7 @@ except Exception as e:
   [[ -z "$_eff_multi_agent" ]] && _eff_multi_agent="false"
   _runtime_req="$REPO_ROOT/requirements/requirements.txt"
   if [[ -f "$_runtime_req" ]]; then
-    log "Provisioning venv at $ENGRAM_HOME/venv (tier: $_eff_tier)"
+    log "Provisioning venv at $HOME/.engram/venv (tier: $_eff_tier)"
     # A failed RUNTIME-requirements install leaves the MCP server unable to
     # start — the exact "broken venv after upgrade" this block exists to
     # prevent. We let the rest of the install complete (marketplace + hooks
@@ -600,7 +620,7 @@ except Exception as e:
   if [[ "$_eff_tier" == "dev" ]]; then
     _dev_req="$REPO_ROOT/requirements/requirements-dev.txt"
     if [[ -f "$_dev_req" ]]; then
-      log "Dev tier: installing test dependencies into $ENGRAM_HOME/venv"
+      log "Dev tier: installing test dependencies into $HOME/.engram/venv"
       # A failed DEV-requirements install (pytest etc.) only breaks the local
       # test runner — the server still runs on the runtime reqs above. Failing
       # the whole install over a missing test dep would block a working
@@ -612,7 +632,7 @@ except Exception as e:
   if [[ "$_eff_multi_agent" == "true" ]]; then
     _forum_req="$REPO_ROOT/src/forum/requirements.txt"
     if [[ -f "$_forum_req" ]]; then
-      log "Multi-agent: installing forum package dependencies into $ENGRAM_HOME/venv"
+      log "Multi-agent: installing forum package dependencies into $HOME/.engram/venv"
       # A failed FORUM-requirements install (Flask, bleach, beautifulsoup4,
       # html5lib, markdown-it-py, sentence-transformers, huggingface_hub,
       # sqlite-vec) only affects local forum-test collection (src/forum/tests/)
@@ -634,17 +654,19 @@ except Exception as e:
 fi
 
 # ── Hook-registration-change detection ────────────────────────────────────────
-# Claude Code only reloads the hook set on a FULL restart — /mcp reconnect
-# reloads the MCP server but NOT the hook registration.  If
-# src/engram/hooks/hooks.json changed in this upgrade, a removed hook will
-# throw a dangling-file error and an added hook won't fire until Claude Code
-# is restarted.
+# /mcp reconnect reloads the MCP server but NOT the hook registration;
+# /reload-plugins re-reads it in-session (measured for an addition, #1892,
+# and a removal, #3265 — one seat each).  A full Claude Code restart is the
+# fallback only if a registration demonstrably does not take effect (a
+# removed hook that still errors on a dangling file, an added hook that does
+# not fire).  Wording corrected by #3268; the old banner said MUST restart.
 if [[ -n "$OLD_ALPHA_SHA" ]] && git -C "$REPO_ROOT" cat-file -e "${OLD_ALPHA_SHA}^{commit}" 2>/dev/null && ! git -C "$REPO_ROOT" diff --quiet "$OLD_ALPHA_SHA" HEAD -- src/engram/hooks/hooks.json 2>/dev/null; then
   echo ""
   echo "  ⚠️  HOOK REGISTRATION CHANGED in this upgrade."
-  echo "      You MUST fully RESTART Claude Code (not just /mcp) to reload the hook set —"
-  echo "      otherwise removed hooks will error and added hooks won't fire."
-  echo "      (/mcp reconnect reloads the MCP server, not the hook registration.)"
+  echo "      Run /reload-plugins (after /plugin marketplace update) to re-read the hook set;"
+  echo "      /mcp reconnect alone reloads the MCP server, not the hook registration."
+  echo "      Restart Claude Code fully only if a hook demonstrably does not take effect"
+  echo "      (a removed hook still erroring, or an added hook not firing)."
   echo ""
 fi
 

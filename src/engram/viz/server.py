@@ -8,8 +8,10 @@ Serves a D3.js force-directed graph of an ENGRAM knowledge graph in the
 browser. Stdlib-only. Three operating modes:
 
 * Auto-detect (default — no flags): scan accessible /home/* dirs + running
-  user's home for .engram*/ folders; read agent_name from each config.json.
-  If nothing found, falls back to single-agent default (~/.engram/knowledge.db).
+  user's home for .engram*/ folders ($ENGRAM_HOME's default is one); read agent_name from each config.json.
+  If nothing found, falls back to the single-agent default (``DEFAULT_DB`` in viz/agents.py:
+  knowledge.db under $ENGRAM_HOME, default ~/.engram, resolved once when viz/agents.py is
+  imported, see engram-alpha#3863; agent_name lookup in viz/agents.py reads it too).
   An optional --config layered on top overrides labels/default/exclude and can
   add agents that weren't auto-detected (back-compat with explicit-db entries).
 * Single-agent (--db PATH): register one anonymous 'default' agent at PATH
@@ -90,6 +92,7 @@ from .data import config as viz_config_data
 from .data import graph as viz_graph_data
 from .data import health as viz_health_data
 from .data import health_v2 as viz_health_v2_data
+from .data import moments as viz_moments_data
 from .data import schema as viz_schema_data
 from .data import stats as viz_stats_data
 
@@ -318,7 +321,30 @@ class Handler(BaseHTTPRequestHandler):
                 f"{path!r} is a known page route but url_for's registry "
                 f"doesn't know its route name"
             )
-            nav_html = shell._render_nav(active_tab, agent=agent_param)
+            # Moments tab + page are hidden when the resolved agent has no
+            # moments (engram-alpha#3511). Read-only; a failing read hides
+            # the tab rather than breaking every page's nav.
+            has_moments = False
+            if page_db_path:
+                try:
+                    # Short timeout: a locked DB must not stall every page's
+                    # render for SQLite's default 5 s.
+                    has_moments = viz_moments_data.has_moments(
+                        page_db_path, timeout=0.5)
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        "moments read failed for %r", agent_param, exc_info=True)
+            if path == "/moments" and not has_moments:
+                # Preserve an EXPLICIT ?agent= only (same as the nav's
+                # carry-through for a request that named one).
+                explicit = parse_qs(parsed.query or "").get("agent", [None])[0]
+                self.send_response(302)
+                self.send_header("Location", viz_urls.url_for("graph", agent=explicit))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            nav_html = shell._render_nav(active_tab, agent=agent_param,
+                                         show_moments=has_moments)
             # Footer's data-provenance half needs the SELECTED agent's own
             # data directory (the parent of its knowledge.db), not the
             # process's default -- same resolved-agent value the nav just
@@ -402,6 +428,16 @@ class Handler(BaseHTTPRequestHandler):
                 resp = viz_health_data.get_health_data(db_path)
                 resp["agent"] = agent_name
                 self._json(resp)
+        elif path == "/api/moments":
+            # engram-alpha#3511: read-only; same agent resolution and
+            # unknown-agent convention as /api/graph (200 + error body).
+            if not db_path:
+                self._json({"groups": [],
+                            "error": f"Unknown agent: {agent_name!r}",
+                            "agent": agent_name})
+            else:
+                self._json({"groups": viz_moments_data.load_moments(db_path),
+                            "agent": agent_name})
         elif path == "/api/stats":
             if not db_path:
                 self._json({"error": f"Unknown agent: {agent_name!r}",

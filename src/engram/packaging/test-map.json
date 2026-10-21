@@ -25,7 +25,9 @@
         "tests/test_user_identity_hook_injection_bounds.py",
         "tests/test_lesson_tripwire_injection_bounds.py",
         "tests/test_deference_detector_injection_bounds.py",
-        "tests/test_forum_hook_injection_bounds.py"
+        "tests/test_forum_hook_injection_bounds.py",
+        "tests/test_probe_unknown_state_3521.py",
+        "tests/test_forum_hook_unknown_state_3521.py"
       ],
       "note": "gh#1657 SSoT for tools/-resolution shared by the baton/inter-agent/forum prompt hooks. Each hook dynamically imports it via a runtime sys.path insert (not a static `import` statement), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping. Consumed by all three hooks as of slice 3 (baton, inter-agent, forum) -- gh#1657 complete. engram-alpha#2863 WS2 review round 1: test_surface_hook_injection_bounds.py added -- it drives engram-surface-hook.py's emit_context() call end-to-end (same dynamic-load invisibility as the other consumers here). engram-alpha#2863 WS2 batch B: test_stale_tree_pull_hook_injection_bounds.py added -- it drives engram-stale-tree-pull-hook.py's emit_context() call end-to-end, same dynamic-load invisibility. engram-alpha#2863 WS2 batch A: test_user_identity_hook_injection_bounds.py added -- it drives engram-user-identity-hook.py's own emit_context() call end-to-end, same dynamic-load invisibility. engram-alpha#2863 WS2 (lesson-tripwire fold): test_lesson_tripwire_injection_bounds.py added -- same reasoning, for engram-lesson-tripwire-hook.py's own emit_context() call site. engram-alpha#2863 WS2 batch C: test_toolcall_repair_injection_bounds.py and test_deference_detector_injection_bounds.py added -- they drive engram-toolcall-repair.py's and engram-deference-detector-prompt.py's own emit_context() calls end-to-end (same dynamic-load invisibility as the other consumers here). WS2 forum-hook migration: test_forum_hook_injection_bounds.py added -- same dynamic-load invisibility, driving engram-forum-prompt-hook.py's own emit_context() call end-to-end."
     },
@@ -89,6 +91,7 @@
       "path_prefix_or_glob": "hooks/claude/engram-baton-prompt-hook.py",
       "test_globs": [
         "tests/test_baton_hook.py",
+        "tests/test_baton_hook_project_owner_3568.py",
         "tests/test_baton_autopull.py",
         "tests/test_build_plugin_hooks_consistency.py",
         "tests/test_engine_phase3.py",
@@ -132,6 +135,7 @@
       "test_globs": [
         "tests/test_forum_hook.py",
         "tests/test_forum_hook_injection_bounds.py",
+        "tests/test_forum_hook_unknown_state_3521.py",
         "tests/test_engine_phase3.py",
         "tests/test_tiers_manifest.py"
       ]
@@ -154,7 +158,10 @@
         "tests/test_in_turn_recall.py",
         "tests/test_principle_triggers_registry.py",
         "tests/test_lesson_tripwire_injection_bounds.py",
-        "tests/test_resolve_runtime_dir_plugin.py"
+        "tests/test_loader_failure_visible_3503.py",
+        "tests/test_resolve_runtime_dir_plugin.py",
+        "tests/test_tripwire_match_scope_3920.py",
+        "tests/test_tripwire_cluster_3924.py"
       ],
       "note": "PreToolUse hook that surfaces lesson tripwires on Bash and MCP tool calls (issues #1203 + #1297). test_principle_triggers_registry.py added #1731 -- its own docstring (Coverage §6) already documented covering this hook's PreToolUse _QUERY broadening, but it was missing from this glob (found while fixing #1731, same completeness-gap class as this morning's tools/perf/*.py <-> test_in_turn_recall.py gap). engram-alpha#2863 WS2 (lesson-tripwire fold onto _hooklib.emit_context()): test_lesson_tripwire_injection_bounds.py added (bound/head/ordering coverage for the new emit_context() call site). test_resolve_runtime_dir_plugin.py added too -- it dynamically loads this hook file's own no-argument _resolve_runtime_dir (a different helper from the shared _hooklib one) via importlib against a synthetic worktree-nested copy, and this migration added a second module-scope dependency (`_harness`) that fixture now has to satisfy alongside the pre-existing `_hooklib` one."
     },
@@ -178,7 +185,8 @@
         "tests/test_fairy_policy.py",
         "tests/test_resolve_runtime_dir_plugin.py",
         "tests/test_engine_phase3.py",
-        "tests/test_engine_unit.py"
+        "tests/test_engine_unit.py",
+        "tests/test_probe_unknown_state_3521.py"
       ],
       "note": "focus_block() moved here from engram-postcompact-hook.py (#1732, 2026-07-09) -- test_focus_block.py and the new test_session_start_hook_focus_render.py added accordingly."
     },
@@ -197,7 +205,8 @@
       "test_globs": [
         "tests/test_stale_tree_hooks.py",
         "tests/test_build_plugin_hooks_consistency.py",
-        "tests/test_hooks_json_stdout_audit.py"
+        "tests/test_hooks_json_stdout_audit.py",
+        "tests/test_probe_unknown_state_3521.py"
       ],
       "note": "#1203 stale-tree tripwire, Layer 2 (PreToolUse behind-count, CATCH). Same import-graph-invisibility reasoning as engram-stale-tree-pull-hook.py above."
     },
@@ -207,8 +216,10 @@
         "tests/test_stop_hook_idle_suppression.py",
         "tests/test_stop_hook_maturity_gate.py",
         "tests/test_stop_hook_prose_gate.py",
+        "tests/test_stop_hook_owner_read_3664.py",
         "tests/test_codex_hook_envelopes.py"
-      ]
+      ],
+      "note": "engram-alpha#3664 (U6a): test_stop_hook_owner_read_3664.py added -- the flagged owner-read path's differential harness (C1), flag-off (C0/C2), owner-down (C3), timeout-budget (C4), flattened-layout (C5) and launcher-gate (C6) cells; the hook is loaded via importlib (hyphenated name), invisible to the import graph."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-surface-daemon.py",
@@ -230,7 +241,8 @@
         "tests/test_tiers_manifest.py",
         "tests/test_recall_injection_budget.py",
         "tests/test_principle_triggers_registry.py",
-        "tests/test_surface_hook_injection_bounds.py"
+        "tests/test_surface_hook_injection_bounds.py",
+        "tests/test_probe_unknown_state_3521.py"
       ],
       "note": "test_principle_triggers_registry.py added #1731 -- its own docstring (Coverage §5) already documented covering this hook's unified check_principle_triggers consumer, but it was missing from this glob (found while fixing #1731, same completeness-gap class as this morning's tools/perf/*.py <-> test_in_turn_recall.py gap). engram-alpha#2863 WS2 review round 1: test_surface_hook_injection_bounds.py added -- reviewer-fairy found it exercises this hook's main() end-to-end but was invisible to run_touched_tests.py's selection (dynamic importlib load, same reasoning as the other entries here)."
     },
@@ -253,23 +265,41 @@
       "path_prefix_or_glob": "hooks/claude/engram-user-identity-hook.py",
       "test_globs": [
         "tests/test_codex_hook_envelopes.py",
-        "tests/test_user_identity_hook_injection_bounds.py"
+        "tests/test_user_identity_hook_injection_bounds.py",
+        "tests/test_user_identity_owner_read_3197.py"
       ],
-      "note": "engram-alpha#2863 WS2 batch A: migrated onto _hooklib.emit_context(); test_user_identity_hook_injection_bounds.py added as this hook's own injection-bounds gate (worst-case oversized Role/Profile metadata, common-case sanity, nothing-fires)."
+      "note": "engram-alpha#2863 WS2 batch A: migrated onto _hooklib.emit_context(); test_user_identity_hook_injection_bounds.py added as this hook's own injection-bounds gate (worst-case oversized Role/Profile metadata, common-case sanity, nothing-fires). engram-alpha#3197 (U4d): test_user_identity_owner_read_3197.py added -- the flagged owner-read path's differential harness (C1), flag-off (C2), owner-down (C3) and timeout-budget (C4) cells; the hook is loaded via importlib (hyphenated name), invisible to the import graph."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-utility-credit-mention-stop.py",
       "test_globs": [
         "tests/test_engram_utility_credit_mention_stop.py",
-        "tests/test_utility_use_action.py"
-      ]
+        "tests/test_utility_use_action.py",
+        "tests/test_utility_credit_owner_write_3822.py"
+      ],
+      "note": "engram-alpha#3822 (U11 Stage B): test_utility_credit_owner_write_3822.py added -- the flagged owner-write path (differential at the write, zero opens, owner-down / skew / readback / indeterminate-retry cells); the hook is loaded via importlib (hyphenated name), invisible to the import graph."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-loop-arm-stop-hook.py",
       "test_globs": [
-        "tests/test_loop_arm_stop_hook.py"
+        "tests/test_loop_arm_stop_hook.py",
+        "tests/test_quiet_wake_counter_3919.py"
       ],
-      "note": "2026-07-31-loop-arm-nudge-SPEC.md PR-B: new Stop hook, tested via direct subprocess invocation (same _run_hook pattern as test_stop_hook_prose_gate.py), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping."
+      "note": "2026-07-31-loop-arm-nudge-SPEC.md PR-B: new Stop hook, tested via direct subprocess invocation (same _run_hook pattern as test_stop_hook_prose_gate.py), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping. alpha #3919 M2: test_quiet_wake_counter_3919.py added -- the quiet-wake counter (classification, Bash read-only allowlist, counter/nudge interaction); the hook is loaded via importlib (hyphenated name) and run as a subprocess."
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/clear-stale-engram-daemon.sh",
+      "test_globs": [
+        "tests/test_clear_stale_daemon_3493.py"
+      ],
+      "note": "Operator-invoked clear verb (#3493); the test runs the real script as a subprocess in a temp ENGRAM_HOME."
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/_engramd_owner_hook_io.py",
+      "test_globs": [
+        "tests/test_owner_launcher_3663.py"
+      ],
+      "note": "engram-alpha#3663 round 8: the I/O helper of start-engramd-owner.sh. The bash hook runs it as a script (python <path> live|report|launch), not an import, so the layer-1 AST import graph cannot see it; convention mapping to the launcher suite."
     },
     {
       "path_prefix_or_glob": "hooks/claude/start-engram-daemon.sh",
@@ -295,6 +325,7 @@
       "path_prefix_or_glob": "tools/baton_gate.py",
       "test_globs": [
         "tests/test_baton_gate.py",
+        "tests/test_baton_gate_service_identity_3283.py",
         "tests/test_baton.py"
       ],
       "note": "#2884 (second half): CI-green / post-approval-freshness / colleague-approval gate helpers shared between tools/baton.py's cmd_flip and src/forum/server.py's api_project_flip. tests/test_baton_gate.py covers the module directly (including the TestSentinelPredicateParity anti-drift check); tests/test_baton.py exercises _parse_github_anchor/_pr_ci_state/_pr_approval_state/_dedupe_checks_by_latest indirectly via tools/baton.py's own import of them. The server-side endpoint tests live in src/forum/tests/test_projects_api.py, outside this test-map's src/engram-scoped surface."
@@ -305,27 +336,135 @@
       "note": "standalone subprocess CLI (not import-reachable); dedicated CLI test covers arg handling + exit codes 0/1/2 + drift-diff output"
     },
     {
+      "path_prefix_or_glob": "tools/claude_md_moves_check.py",
+      "test_globs": ["tests/test_claude_md_moves.py"],
+      "note": "standalone stdlib CLI (not import-reachable); dedicated test runs the real-repo mapping plus fixture controls (sentence still in CLAUDE.md, duplicated in the doc, absent, malformed entry)"
+    },
+    {
+      "path_prefix_or_glob": "tools/check_2652_ledger.py",
+      "test_globs": ["tests/test_2652_ledger_completeness.py"],
+      "note": "standalone stdlib CLI (not import-reachable); dedicated test runs it as a subprocess on the real ledger and on temp git repos (added connect, removed connect, line drift, untracked file, unparseable Section 2)"
+    },
+    {
+      "path_prefix_or_glob": "tools/home_path_gate.py",
+      "test_globs": ["tests/test_home_path_gate.py"],
+      "note": "standalone stdlib CLI (not import-reachable); dedicated test plants each enumerated hard-coded-home spelling in scratch git repos (line-level: the token on another line does not rescue) and checks the schema-2 baseline rules (new violator, count above/below, stale, dangling, growth vs a base commit, classed allowlist, schema 1 on the head); the only real-tree test asserts the ratchet is green (#3863)"
+    },
+    {
       "path_prefix_or_glob": "tools/cohort_dispatch.py",
       "test_globs": [
-        "tests/test_cohort_dispatch.py"
+        "tests/test_cohort_dispatch.py",
+        "tests/test_cohort_owner_read_3862.py",
+        "tests/test_store_path_precheck_3960.py"
       ]
+    },
+    {
+      "path_prefix_or_glob": "tools/weakest_load_bearing.py",
+      "test_globs": [
+        "tests/test_weakest_load_bearing.py",
+        "tests/test_store_path_precheck_3960.py"
+      ],
+      "note": "engram-alpha#3921: the ranking core and its owner-read entry layer (flag weakest_load_bearing_reads_via_owner). The test loads the file by path (spec_from_file_location) and runs it as a subprocess, invisible to the layer-1 import graph; the seven registered read templates also tie it to tests/test_engramd_read_scan.py."
+    },
+    {
+      "path_prefix_or_glob": "tools/study_queue.py",
+      "test_globs": [
+        "tests/test_study_queue.py",
+        "tests/test_store_path_precheck_3960.py"
+      ],
+      "note": "engram-alpha#3919 M3: the study queue's three sources and its owner-read entry layer (flag study_queue_reads_via_owner). The test loads the file by path (spec_from_file_location) and runs it as a subprocess, invisible to the layer-1 import graph; the registered read templates also tie it to tests/test_engramd_read_scan.py."
+    },
+    {
+      "path_prefix_or_glob": "tools/inspect_raw.py",
+      "test_globs": [
+        "tests/test_inspect_raw_owner_2652.py",
+        "tests/test_inspect_raw_unreadable_store_3954.py",
+        "tests/test_store_path_precheck_3960.py"
+      ],
+      "note": "engram-alpha#2652 (tools-7): the one-row read goes through tools/_owner_read.py behind engramd.inspect_raw_reads_via_owner (flag OFF opens the store mode=ro). The test loads the file by path (spec_from_file_location) and runs it as a subprocess, invisible to the layer-1 import graph; the registered read template also ties it to tests/test_engramd_read_scan.py."
+    },
+    {
+      "path_prefix_or_glob": "tools/dream_pickup.py",
+      "test_globs": [
+        "tests/test_dream_pickup_3919.py"
+      ],
+      "note": "#3919 M6: the seat-side writer of the dream record's Morning pickup section. The test runs the file as a subprocess (and loads it by path), invisible to the layer-1 import graph. No store reads, so no registered read template."
+    },
+    {
+      "path_prefix_or_glob": "tools/dream_master_batch.py",
+      "test_globs": [
+        "tests/test_dream_master_batch_flow.py",
+        "tests/test_dream_safety_owner_read_3880.py",
+        "tests/test_store_path_precheck_3960.py"
+      ],
+      "note": "engram-alpha#3880 (U17): the CLI (safety-row, coverage, null-embeddings) and its owner-read flag. The new test runs the file as a subprocess and loads it by path (spec_from_file_location), invisible to the layer-1 import graph; it also sweeps the two dream agent specs, so a change to engram-dream-master.md / engram-dream-fairy.md must rerun it."
+    },
+    {
+      "path_prefix_or_glob": "tools/_owner_read.py",
+      "test_globs": [
+        "tests/test_cohort_owner_read_3862.py",
+        "tests/test_reconcile_owner_read_3824.py",
+        "tests/test_reconcile_lesson_demotions.py",
+        "tests/test_backup_owner_snapshot_3872.py",
+        "tests/test_regen_embeddings_owner_3879.py",
+        "tests/test_inspect_raw_owner_2652.py",
+        "tests/test_tools_engram_home_3863.py",
+        "tests/test_store_path_precheck_3960.py"
+      ],
+      "note": "engram-alpha#3862, #3872, #3879, #2652 (tools-7). The shared owner-read helper for tools/: the tools that use it load by path (spec_from_file_location) in their cells, so the layer-1 import graph does not see it; a change here must rerun every consumer's cells."
+    },
+    {
+      "path_prefix_or_glob": "tools/backup_knowledge_db.py",
+      "test_globs": [
+        "tests/test_backup_knowledge_db.py",
+        "tests/test_backup_owner_snapshot_3872.py"
+      ],
+      "note": "engram-alpha#3872 (U15): flag ON (engramd.backup_reads_via_owner) reads one owner snapshot; flag OFF is test_backup_knowledge_db.py unedited."
+    },
+    {
+      "path_prefix_or_glob": "tools/engramd_read_scan.py",
+      "test_globs": [
+        "tests/test_engramd_read_scan.py"
+      ],
+      "note": "engram-alpha#3196 (U4c): loaded by tests/test_engramd_read_scan.py via importlib (file path), so it is invisible to the layer-1 import graph."
+    },
+    {
+      "path_prefix_or_glob": "tools/engramd_a6_latency.py",
+      "test_globs": [
+        "tests/test_engramd_a6_latency.py"
+      ],
+      "note": "engram-alpha#3197 (U4d): loaded by tests/test_engramd_a6_latency.py via importlib (file path), so it is invisible to the layer-1 import graph."
+    },
+    {
+      "path_prefix_or_glob": "tools/engramd_stage_profile.py",
+      "test_globs": [
+        "tests/test_engramd_stage_profile_3678.py"
+      ],
+      "note": "engram-alpha#3678 (U7): loaded by tests/test_engramd_stage_profile_3678.py via importlib (file path), so it is invisible to the layer-1 import graph."
     },
     {
       "path_prefix_or_glob": "tools/dream_lottery.py",
       "test_globs": [
-        "tests/test_dream_lottery.py"
+        "tests/test_dream_lottery.py",
+        "tests/test_tools_engram_home_3863.py"
       ]
     },
     {
       "path_prefix_or_glob": "tools/config_schema.py",
       "test_globs": [
-        "tests/test_config_schema.py"
+        "tests/test_config_schema.py",
+        "tests/test_3898_embedding_device.py"
       ]
     },
     {
       "path_prefix_or_glob": "tools/engram-regenerate-embeddings.py",
       "test_globs": [
-        "tests/test_git_backup_embeddings.py"
+        "tests/test_git_backup_embeddings.py",
+        "tests/test_regen_embeddings_owner_3879.py",
+        "tests/test_345_pr1_backfill_json.py",
+        "tests/test_3075_embedding_pipeline_restore.py",
+        "tests/test_3077_embedding_regen_lease.py",
+        "tests/test_store_path_precheck_3960.py"
       ]
     },
     {
@@ -333,6 +472,15 @@
       "test_globs": [
         "tests/test_loop_gate.py"
       ]
+    },
+    {
+      "path_prefix_or_glob": "tools/loop_prompt.py",
+      "test_globs": [
+        "tests/test_loop_prompt.py",
+        "tests/test_loop_rearm_3005.py",
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3005: the loop wake-prompt builder and, from round 1, the --rearm-delay helper (the single writer of next_due_at). It had no entry before round 2 (pre-existing gap). It is a tools/ file with no repo-root symlink yet, so _shipped_path_candidates de-prefixes a change to src/engram/tools/loop_prompt.py to this bare path."
     },
     {
       "path_prefix_or_glob": "tools/_status_derive.py",
@@ -438,7 +586,9 @@
     {
       "path_prefix_or_glob": "tools/reconcile_lesson_demotions.py",
       "test_globs": [
-        "tests/test_reconcile_lesson_demotions.py"
+        "tests/test_reconcile_lesson_demotions.py",
+        "tests/test_reconcile_owner_read_3824.py",
+        "tests/test_store_path_precheck_3960.py"
       ],
       "note": "engram-alpha#2544. test_reconcile_lesson_demotions.py loads the module via importlib.util.spec_from_file_location (not a static `import`), same reasoning as the hyphenated hook files above -- invisible to the layer-1 AST import graph despite having a valid module name, so it needs this layer-2 mapping."
     },
@@ -464,6 +614,13 @@
       "note": "engram-alpha#3095. test_write_op_census.py loads the module via importlib.util.spec_from_file_location (not a static `import`), same reasoning as tools/reconcile_lesson_demotions.py's own mapping -- invisible to the layer-1 AST import graph despite having a valid module name, so it needs this layer-2 mapping."
     },
     {
+      "path_prefix_or_glob": "tools/compact-request.py",
+      "test_globs": [
+        "tests/test_compact_request_3640.py"
+      ],
+      "note": "Request half of agent-decided compaction (#3640): rider, atomic write order, size cap, no wake token, hook lookup in both layouts."
+    },
+    {
       "path_prefix_or_glob": "tools/worktree-gc.py",
       "test_globs": [
         "tests/test_worktree_gc.py"
@@ -474,6 +631,12 @@
       "path_prefix_or_glob": "tools/surgical.py",
       "test_globs": [
         "tests/test_engine_unit.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/cites_step3.py",
+      "test_globs": [
+        "tests/test_cites_step3_2243.py"
       ]
     },
     {
@@ -508,18 +671,76 @@
       "path_prefix_or_glob": "tools/forum-mention-monitor.sh",
       "test_globs": [
         "tests/test_forum_mention_monitor_coalesce.py",
-        "tests/test_forum_monitor_malformed_200.py"
+        "tests/test_forum_monitor_malformed_200.py",
+        "tests/test_shell_engram_home_3863.py"
       ],
-      "note": "Both spawn the real script as a subprocess against a mock HTTP server. test_forum_mention_monitor_coalesce.py covers the cross-cycle coalesce window (#1616); test_forum_monitor_malformed_200.py covers ids()'s reported-vs-failed-to-report boundary and the seed/poll seen-set guards (#2225)."
+      "note": "Both spawn the real script as a subprocess against a mock HTTP server. test_forum_mention_monitor_coalesce.py covers the cross-cycle coalesce window (#1616); test_forum_monitor_malformed_200.py covers ids()'s reported-vs-failed-to-report boundary and the seed/poll seen-set guards (#2225). engram-alpha#3863 PR 3b adds test_shell_engram_home_3863.py: the monitor is run against a scratch config under a custom ENGRAM_HOME (and under the default) with a stub curl, to show which config.json it read."
     },
     {
       "path_prefix_or_glob": "tools/forum-updates-monitor.sh",
       "test_globs": [
         "tests/test_forum_monitor_duplicate_warn.py",
         "tests/test_pgrep_liveness_reap_patterns.py",
-        "tests/test_forum_monitor_malformed_200.py"
+        "tests/test_forum_monitor_malformed_200.py",
+        "tests/test_shell_engram_home_3863.py"
       ],
       "note": "test_forum_monitor_duplicate_warn.py spawns the real script as a subprocess (duplicate-instance warn behavior against real processes); test_pgrep_liveness_reap_patterns.py does not spawn it, instead extracting its _pgrep_pattern literal from the script text and matching it in pure Python against a synthetic process table; test_forum_monitor_malformed_200.py spawns it against a mock HTTP server for as_of()'s usable-watermark boundary and the seed/poll cursor guards (#2225)."
+    },
+    {
+      "path_prefix_or_glob": "launch-engram-server.sh",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: the MCP launcher resolves its venv from ENGRAM_HOME (behaviour cells run it against a stub venv python). Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
+      "path_prefix_or_glob": "tools/ghpr.sh",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: LOG_DIR and PYTHON resolve from ENGRAM_HOME (the assignments are extracted and evaluated; the CI sim is never run). Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
+      "path_prefix_or_glob": "tools/run-all-tests.sh",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: ENGRAM_PY resolves from ENGRAM_HOME (the assignment is extracted and evaluated; the suite is never run). Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
+      "path_prefix_or_glob": "engram_lifecycle.py",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: docstring/comment-only change; guard asserts the file names ENGRAM_HOME and holds no .engram string outside a docstring. Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
+      "path_prefix_or_glob": "engram_tasks.py",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: docstring/comment-only change; same guard. Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
+      "path_prefix_or_glob": "health/engine.py",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: docstring/comment-only change; same guard. Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/context_tracker_hook.py",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: docstring/comment-only change; same guard. Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
+    },
+    {
+      "path_prefix_or_glob": "viz/server.py",
+      "test_globs": [
+        "tests/test_shell_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3b: docstring/comment-only change; same guard. Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
     },
     {
       "path_prefix_or_glob": "tools/codex-umwelt-wake.py",
@@ -533,9 +754,10 @@
         "tests/test_agent_session_run.py",
         "tests/test_boot_charge_template_glob.py",
         "tests/test_pgrep_liveness_reap_patterns.py",
-        "tests/test_tool_policy_sync.py"
+        "tests/test_tool_policy_sync.py",
+        "tests/test_loop_rearm_3005.py"
       ],
-      "note": "Autostart charge composition is selected at runtime after platform detection; these subprocess and source-template tests pin its harness separation and Claude monitor safety text."
+      "note": "Autostart charge composition is selected at runtime after platform detection; these subprocess and source-template tests pin its harness separation and Claude monitor safety text. engram-alpha#3005 round 3 adds test_loop_rearm_3005.py: it widened its arm-instruction sweep to walk deploy/autostart/ (the boot charges name a cadence and arm the heartbeat at session start), so a boot-charge edit must select it."
     },
     {
       "path_prefix_or_glob": "skills/claude/engram-loop/SKILL.md",
@@ -544,9 +766,10 @@
         "tests/test_skill_frontmatter_lint.py",
         "tests/test_skill_server_sync.py",
         "tests/test_tiers_manifest.py",
-        "tests/test_health_exam_skill.py"
+        "tests/test_health_exam_skill.py",
+        "tests/test_loop_rearm_3005.py"
       ],
-      "note": "The loop skill has a harness-routing order invariant in addition to the generic skill lint gates. The health-exam gate is listed here as well as on the broader skills/claude/ entry because selection is FIRST-MATCH-WINS: this entry shadows that one for this path, so a gate omitted here simply never runs for this doc."
+      "note": "The loop skill has a harness-routing order invariant in addition to the generic skill lint gates. The health-exam gate is listed here as well as on the broader skills/claude/ entry because selection is FIRST-MATCH-WINS: this entry shadows that one for this path, so a gate omitted here simply never runs for this doc. engram-alpha#3005 round 2 adds test_loop_rearm_3005.py: its sweep cell walks EVERY skill doc for the retired full-cadence arm phrase, and this doc is the primary carrier of that instruction."
     },
     {
       "path_prefix_or_glob": "skills/claude/",
@@ -554,17 +777,20 @@
         "tests/test_skill_frontmatter_lint.py",
         "tests/test_skill_server_sync.py",
         "tests/test_tiers_manifest.py",
-        "tests/test_health_exam_skill.py"
+        "tests/test_health_exam_skill.py",
+        "tests/test_loop_rearm_3005.py",
+        "tests/test_skill_home_paths_3863.py"
       ],
-      "note": "Any change to a skill directory triggers skill lint + tiers manifest, plus the health-exam shell-pattern gate, whose population is EVERY shipped skill doc rather than the health-exam one. Adding a more specific skills/claude/<name>/ entry above this one shadows it (first-match-wins), so such an entry must repeat this gate."
+      "note": "Any change to a skill directory triggers skill lint + tiers manifest, plus the health-exam shell-pattern gate, whose population is EVERY shipped skill doc rather than the health-exam one. Adding a more specific skills/claude/<name>/ entry above this one shadows it (first-match-wins), so such an entry must repeat this gate. engram-alpha#3005 round 3 adds test_loop_rearm_3005.py: its sweep cell walks EVERY swept root for the retired full-cadence arm phrase, and any skill doc (not only engram-loop's) is a carrier of that instruction. engram-alpha#3863 PR 2 adds test_skill_home_paths_3863.py: a line-level check that engram-health-exam, engram-upgrade and engram-sleep carry no command-position hard-coded ENGRAM home path (the file-level home-path gate cannot see a skill that names ENGRAM_HOME once and pastes ~/.engram elsewhere)."
     },
     {
       "path_prefix_or_glob": "templates/",
       "test_globs": [
         "tests/test_tiers_manifest.py",
-        "tests/test_bootstrap_codex.py"
+        "tests/test_bootstrap_codex.py",
+        "tests/test_3898_embedding_device.py"
       ],
-      "note": "Template changes trigger manifest gate and bootstrap codex tests"
+      "note": "Template changes trigger manifest gate and bootstrap codex tests; test_3898_embedding_device.py reads config.json.example for the embedding.device / cpu_threads keys"
     },
     {
       "path_prefix_or_glob": "packaging/tiers.json",
@@ -587,6 +813,22 @@
         "tests/test_tiers_manifest.py"
       ],
       "note": "Agent document changes trigger tiers manifest check only"
+    },
+    {
+      "path_prefix_or_glob": "agents/claude/engram-dream-master.md",
+      "test_globs": [
+        "tests/test_tiers_manifest.py",
+        "tests/test_dream_safety_owner_read_3880.py"
+      ],
+      "note": "engram-alpha#3880 (U17): the spec is swept for any call that passes a connection and must name the CLI"
+    },
+    {
+      "path_prefix_or_glob": "agents/claude/engram-dream-fairy.md",
+      "test_globs": [
+        "tests/test_tiers_manifest.py",
+        "tests/test_dream_safety_owner_read_3880.py"
+      ],
+      "note": "engram-alpha#3880 (U17): same sweep as the dream master spec"
     },
     {
       "path_prefix_or_glob": "tools/release_gates.py",
@@ -629,13 +871,65 @@
         "tests/test_health_engine_fresh_server_order.py"
       ],
       "note": "engram-alpha#2609: carries the identical health.* sys.modules-clearing fresh_server() pattern as test_health_engine_checkpoint_wiring.py -- the same ordering regression class applies to this file too."
+    },
+    {
+      "path_prefix_or_glob": "tools/backup_claude_projects.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "tools/backup_session_logs.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "tools/compute_task_time.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "tools/migrate_person_nodes.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "tools/migrate_prediction_pairing_edges.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "tools/migrate_stranded_supported_by.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "tools/monitor-supervisor.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
+    },
+    {
+      "path_prefix_or_glob": "tools/tripwire.py",
+      "test_globs": [
+        "tests/test_tools_engram_home_3863.py"
+      ],
+      "note": "engram-alpha#3863 PR 3a: the tools sweep. tests/test_tools_engram_home_3863.py loads the tool by path (spec_from_file_location) and pins that its default under the ENGRAM home follows ENGRAM_HOME (unset/empty -> ~/.engram unchanged), plus a code-position guard over the group."
     }
   ],
   "unmapped": [
-    {
-      "path": "hooks/claude/context_tracker_hook.py",
-      "reason": "Superseded by context_tracker.py per tiers.json excluded list; no dedicated test"
-    },
     {
       "path": "tools/_channel.py",
       "reason": "Internal multi-agent transport helper; no dedicated test file. Changes covered by ia.py test suite indirectly."
@@ -653,20 +947,12 @@
       "reason": "Dev-tier measurement/acceptance-metric CLI (recall-triggering blueprint #1688 P1/#1689); no dedicated test file. Its core repeat-fraction formula is exercised indirectly by tests/test_surface_ledger_suppression.py's synthetic-verification test, which reuses the same trailing-k-window definition."
     },
     {
-      "path": "tools/compute_task_time.py",
-      "reason": "No dedicated test file found"
-    },
-    {
       "path": "tools/rc-upgrade-verify.py",
-      "reason": "rc1->rc2 upgrade operational tooling (#2411); no dedicated test file. Verified manually against a live graph (byte copy, never the live DB) and via a direct build-plugin.sh --tier dev dry run rather than an automated test, since it exercises the actual migration subprocess + a real knowledge.db copy end-to-end."
+      "reason": "rc1->rc2 upgrade operational tooling (#2411); no dedicated test file (its venv-path line has a text guard in tests/test_home_path_gate.py, #3863). Verified manually against a live graph (byte copy, never the live DB) and via a direct build-plugin.sh --tier dev dry run rather than an automated test, since it exercises the actual migration subprocess + a real knowledge.db copy end-to-end."
     },
     {
       "path": "tools/deference_baseline.py",
       "reason": "Dev-tier baseline tool; no dedicated test file"
-    },
-    {
-      "path": "tools/dream_master_batch.py",
-      "reason": "No dedicated unit test file; tested as part of integration flows"
     },
     {
       "path": "tools/dump_mcp_schema.py",
@@ -703,14 +989,6 @@
     {
       "path": "tools/uninstall-local-marketplace.sh",
       "reason": "Uninstall script; no dedicated test file. Inverse of install-local-marketplace.sh; covered by manual verification."
-    },
-    {
-      "path": "tools/run-all-tests.sh",
-      "reason": "Unified test runner script; no dedicated test file. Verified manually by running it end-to-end against both suites."
-    },
-    {
-      "path": "tools/ghpr.sh",
-      "reason": "Local CI-cost simulator (git+gh wrapper bundling touched-test selection, cost logging, and gated PR push); no dedicated test file. Verified manually."
     }
   ],
   "server_import_allowlist": [

@@ -24,7 +24,8 @@ USAGE
 -----
     python3 migrate_prediction_pairing_edges.py [--db PATH] [--apply]
 
-    --db PATH     Path to knowledge.db (default: ~/.engram/knowledge.db)
+    --db PATH     Path to knowledge.db (default: $ENGRAM_HOME/knowledge.db,
+                  i.e. ~/.engram/knowledge.db when ENGRAM_HOME is unset)
     --apply       Actually write the parallel predicted_by edges. Without
                   this flag, the script only prints a human-readable report
                   — no writes.
@@ -56,6 +57,13 @@ import os
 import sqlite3
 import sys
 from datetime import datetime, timezone
+
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (U14, #3862; #3863). `tools` is
+# found one directory above this file in BOTH layouts (src/engram/ and the deployed plugin root).
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
 
 
 def _now() -> str:
@@ -174,8 +182,8 @@ def main():
     )
     parser.add_argument(
         "--db",
-        default=os.path.expanduser("~/.engram/knowledge.db"),
-        help="Path to knowledge.db (default: ~/.engram/knowledge.db)",
+        default=str(owner_read.default_db_path()),
+        help="Path to knowledge.db (default: %(default)s)",
     )
     parser.add_argument(
         "--apply",

@@ -9,11 +9,11 @@
 #
 # What it does, on `push`:
 #   1. diff the branch vs its base (default origin/dev)
-#   2. run run_touched_tests.py on that diff, in an ISOLATED HOME (a live ~/.engram
+#   2. run run_touched_tests.py on that diff, in an ISOLATED HOME (a live ENGRAM home
 #      contaminates ~180 tests with false failures — empty HOME avoids that),
 #      timed.  Fail-open to the full suite is inherited from run_touched_tests
 #      (conftest/pytest.ini/requirements/test-map changes -> full).
-#   3. append a cost record to ~/.engram/ci-cost-sim/YYYY-MM-DD.jsonl
+#   3. append a cost record to ${ENGRAM_HOME:-$HOME/.engram}/ci-cost-sim/YYYY-MM-DD.jsonl
 #   4. GATE: if tests failed, abort the push (override with --no-gate)
 #   5. git push (--force-with-lease optional).  NOT merge — Lei merges via UI.
 #
@@ -26,16 +26,36 @@
 # stand-in we measure against.
 set -uo pipefail
 
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863): it would resolve against the calling process's cwd, a
+# different home for every process. Unset or empty means unset; a leading ~ is expanded against $HOME and
+# re-exported (~user is not expanded: it is not absolute, so it is refused). Checked before anything else
+# runs; `return` covers a script that is sourced, `exit` one that is executed.
+if [ -n "${ENGRAM_HOME-}" ]; then
+    _eh_raw="$ENGRAM_HOME"
+    case "$ENGRAM_HOME" in
+        "~") ENGRAM_HOME="${HOME-}"; export ENGRAM_HOME ;;
+        "~/"*) ENGRAM_HOME="${HOME-}/${ENGRAM_HOME#"~/"}"; export ENGRAM_HOME ;;
+    esac
+    case "$ENGRAM_HOME" in
+        /*) ;;
+        *)
+            printf "ENGRAM_HOME must be an absolute path, got '%s'\n" "$_eh_raw" >&2
+            unset _eh_raw
+            return 2 2>/dev/null || exit 2 ;;
+    esac
+    unset _eh_raw
+fi
+
 # Resolve the real script path (handles symlink invocation from tools/ghpr.sh),
 # then use git to find the repo root — robust regardless of script location.
 _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(git -C "$(dirname "$_self")" rev-parse --show-toplevel 2>/dev/null)"
 [ -n "$REPO_ROOT" ] || { echo "ghpr: ERROR — could not resolve repo root via git" >&2; exit 1; }
-LOG_DIR="${HOME}/.engram/ci-cost-sim"
+LOG_DIR="${ENGRAM_HOME:-$HOME/.engram}/ci-cost-sim"
 # Resolve the test python BEFORE any HOME override (run_touched_tests runs pytest
 # via sys.executable, so it must be the venv that actually has pytest). Per-agent
 # venv via the real HOME; override with GHPR_PYTHON; fall back to system python3.
-PYTHON="${GHPR_PYTHON:-${HOME}/.engram/venv/bin/python}"
+PYTHON="${GHPR_PYTHON:-$HOME/.engram/venv/bin/python}"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
 # Proxy constants for the "implied CI minutes" estimate (rough — local wall != GitHub
 # runner wall, but the RATIO touched-vs-full is the decision-relevant signal):
@@ -106,7 +126,7 @@ cmd_push() {
   # ---- run touched-tests against the COMMITTED tip, in a clean worktree +
   #      isolated HOME, timed.  The worktree means we test EXACTLY the commits we
   #      push (no untracked scratch files inflating the change-set to a full-suite
-  #      fail-open, no dirty-tree drift); isolated HOME means the live ~/.engram
+  #      fail-open, no dirty-tree drift); isolated HOME means the live ENGRAM home
   #      can't shadow modules or leak runtime state into the run. --------------
   local wt="" clean_home="" out="" start end wall rc subset_line sel tot full_flag="false"
   # Clean up the worktree + tmp dirs on ANY exit (incl. a die before explicit cleanup).

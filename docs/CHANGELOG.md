@@ -9,6 +9,1592 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+## [v0.5.3] - 2026-10-15
+
+### Substrate (recall, forgetting, search, graph integrity)
+
+- **Write tools say so when a recall_summary runs over the target (#3726, part
+  of #3537).** When the stripped summary is over 140 chars (and under the hard
+  reject), the write response carries `recall_summary_overrun` naming the
+  length; it is absent at or under 140. `engram_add_observation` (and
+  `engram_add_observation_batch`, per item), `engram_derive`,
+  `engram_add_definition`, `engram_add_conjecture` and `engram_add_lesson`
+  all attach it. Advisory only: the node is still created, flagged
+  `needs_tightening`. Known limit: it is not attached on the post-commit
+  durability-failure responses.
+
+- **The remaining `json_extract(metadata, ...)` read sites now guard with
+  `json_valid` too (#3485, follow-up to #3425).** Measured: one non-JSON blob
+  in `nodes.metadata` made BOTH lesson-tripwire loaders (`load_tripwires`,
+  `load_prevention_lessons`) return `[]`, because the query aborted with
+  `malformed JSON` and the loaders' `except Exception: return []` swallowed it
+  — so one bad row silenced the tripwire layer for every lesson on every
+  prompt. Both hook queries and the `reconcile_lesson_demotions` lookup now
+  read through `json_extract(CASE WHEN json_valid(metadata) THEN metadata END,
+  ...)`: a bad blob reads as NULL and only that row drops out (the reconcile
+  tool skips it like a missing row). `engramd_read_templates.json` was
+  regenerated with `tools/engramd_read_scan.py` (the two hook entries; it is
+  generated from the hook source, not a separate site). A new drift guard,
+  `tests/test_json_extract_metadata_guard_3485.py`, fails on any SQL JSON
+  function or `->` / `->>` applied to an unguarded `metadata` column anywhere
+  under `src/engram/`, repo-root `tools/`, or the templates file.
+
+- **`nodes.metadata` must now be valid JSON or NULL (#3425).** Migration rung
+  7 first quarantines every existing non-JSON blob (raw copy into the new
+  `metadata_quarantine` table, the node's `metadata` set to NULL, nothing else
+  on the node changed), then installs two triggers that refuse a non-JSON
+  `INSERT` / `UPDATE OF metadata` with `nodes.metadata must be valid JSON or
+  NULL`. Valid JSON of any shape (including non-objects) is still allowed.
+  `engram_diagnose` reports a `metadata_quarantine` finding (count, 0 when
+  none) plus `live_invalid_count` (rows invalid right now); either being
+  non-zero flares, and is the signal to read the raw blobs. The six SQL
+  `json_extract(metadata, ...)` read sites also guard with `json_valid`, so a
+  blob that slips past the triggers (restore of an old dump, a hand edit) reads
+  as NULL instead of aborting the query. The whole rung is one transaction
+  (the quarantine INSERT/UPDATE open it, so the `CREATE TRIGGER`s join it); a
+  fault rolls back to user_version 6. Only the empty `metadata_quarantine`
+  table can survive a failed rung (`CREATE TABLE IF NOT EXISTS` autocommits;
+  harmless, diagnose reports 0).
+  Known limits:
+  - `engram-pkg scope-export` on a PRE-rung-7 source DB that still holds an
+    invalid row aborts with an uncaught `IntegrityError` (the `INSERT OR
+    REPLACE` hits the guard), after `cmd_init` already created the package
+    directory.
+  - Metadata containing NaN/Infinity floats (`json.dumps` emits them,
+    `json_valid` rejects them) is now refused at write; no current writer was
+    found to produce one.
+  - `json_valid` accepts invalid UTF-8 text, which the guard and the read
+    belt cannot see (pre-existing; unreachable through Python writers).
+
+- **Evidence nodes are out of search and out of the tier-2 budget (PR #3610,
+  part of #2005).** Lei's ruling: once evidence is out of search results there
+  is no reason to count it toward a budget that exists purely for search
+  efficiency. One rule in `engram_core` (`SEARCH_EXCLUDED_TYPES`) now drives
+  the tier threshold, the FTS and semantic search legs, the similarity hints
+  and the attached-pack search. Measured on one graph near the cap:
+  `tier2_max_nodes` was 10000 with about 20 nodes of headroom, 2,248 nodes were
+  evidence, 27.5% of them ever recalled against 61% of other nodes, mean
+  utility 0.002 against 0.166; the searchable tier-2 population drops to about
+  7,734. `engram_inspect`, `engram_get_subgraph`, `engram_list` (including
+  `types=evidence`), cascade walks and quote verification are unchanged, and
+  `engram_query(types="evidence")` now returns nothing, with a note saying
+  evidence is excluded from search. The first checkpoint after deploy shows a
+  one-time continuity dip as evidence ids leave the set.
+
+- **Every in-mind, shown-relevant use of a memory now refreshes it (PR #3606,
+  part of #2005).** The forgetting formula stays recency-only (Lei's ruling);
+  a new stdlib module, `engram_restamp.py`, holds the one restamp, the use
+  alpha table and `RESTAMP_ACTIONS` (derive, supersede, contradict, resolve,
+  register_exemplar, lesson_incident, citation, focus, focus_load, history,
+  mention). The
+  mention stop hook restamps the ids it credits. Behaviour changes to note:
+  dream-cycle writes now refresh their premises, and if the shared module
+  fails to import in the hook the mention bump is lost for that turn (logged
+  as `bump_utility failed`, never silent).
+
+- **`engram_sign` / `tools/engram-sign.py`: one lineage-transparent signature
+  line for every external communication (closes #3450 via PR #3454).** Every
+  field is read mechanically, never typed (name, model and its id, ENGRAM
+  version and deploy tag, whose agent). It refuses, exit 2, naming the field,
+  when an identity key such as `signature_emoji` is unset.
+
+- **`cites` now means observation -> evidence only (PR #3460 and PR #3470,
+  part of #2243).** One guarded writer, `_insert_cites_edge`, is the only code
+  that can write `cites`; it refuses a non-`ev_` target and a non-observation
+  source. Every writer that took `context_ids` / `implements_ids` now writes
+  `about`. `engram_retype_edge` can move a loose `cites` to every relation that
+  can be added after creation (`about`, `exemplifies`, `generalizes`,
+  `instantiates`, `serves`, `subtask_of`, `tensions`) under one shared
+  endpoint guard; moves into provenance relations stay refused.
+
+- **`tools/cites_step3.py`: a per-seat migration of loose `cites` edges (PRs
+  #3476, #3487, #3532, part of #2243).** Dry run is the default and writes
+  nothing; `--apply` needs the seat's sampling report, per-edge labels and a
+  hand check. Phase f retypes every loose `cites` whose source is non-current
+  to `about` with reason `frozen-history` (a colleague's run on a copy of her
+  graph measured 139 such edges no phase selected). A generalization or
+  corroboration derivation source is listed as hand-only, never refiled by
+  the tool: wiring a non-case premise into one inflated a derivation from
+  0.777 to 0.941 on one graph. Developer tier.
+
+- **DAG acyclicity is checked per relation family (closes #3210 via PR
+  #3444).** `EDGE_CLASSIFICATIONS` carries `dag_family` (`grounding` or
+  `abstraction`); `check_dag_conformance` walks each family separately and
+  reports one cycle per back edge, the ack writer guards grounding, and the
+  audit reports all cycles. A substrate change that Lei reads before merge.
+
+- **`engram_list` reaches `nodes.metadata` (closes #3402 via PR #3409), and
+  `engram_query` takes `refresh_recall=false` (PR #3367, part of #3362).**
+  `metadata.<key>` is a filter field and a projection (top-level key, pattern
+  `^[A-Za-z_][A-Za-z0-9_]{0,63}$`, read through the guarded `json_extract`);
+  `engram_inspect` gains a `support_lost` recall view. With `refresh_recall`
+  false the call ranks and returns as usual but writes no `importance_score`
+  / `recall_turn` / `recall_count`, so a probe cannot inflate what it
+  surfaces; the default response shape is byte-identical.
+
+- **`cornerstone_candidate` ranks by citations gained in a recent window
+  (closes #3154 via PR #3370, docs in PR #3373).** The old score was
+  age-biased twice (a saturated `importance_base`, plus a storage-order
+  `LIMIT 50` that kept the oldest rows). It now uses `recent_window_days`
+  per preset (30 / 60 / 120) with a gate of at least 3 recent citations, and
+  a deterministic order. One colleague's graph measured 1 result against 15
+  before; the dream-fairy spec now says a thin result is normal and must not
+  be padded.
+
+- **A rejected observation or evidence entry leaves nothing behind.** A
+  rejected observation no longer leaves an evidence row (closes #3399 via PR
+  #3401, single and batch paths). `file://` evidence must name a regular file
+  at every entry path: directories, devices, FIFOs and a cross-repo tree are
+  rejected by name, including on `engram_add_evidence`, which used to accept
+  a directory outside any repo (closes #3393 via PR #3397). The
+  committed-file check resolves symlinks, so a committed file cited through a
+  symlinked path (macOS `/var` to `/private/var`) is no longer rejected (PR
+  #3386, part of #3292). `tools/verify_quote.py` rejects a non-regular file
+  before `open()`: a directory no longer crashes it and a FIFO no longer
+  hangs it; exit 2 (closes #3400 via PR #3407).
+
+- **Contradiction and FTS fixes.** The obsolescence scan, reflect and the
+  dream-fairy fallback agree on one set of unsettled contradiction statuses;
+  before, the fallback filtered on `open` and returned 0 rows on a live
+  graph (closes #3355 via PR #3408). `rebuild_fts_index` excludes superseded
+  rows, matching the sync triggers, and migration rung 4 stops double
+  deleting (closes #2746 via PR #3515).
+
+- **Embeddings are mandatory and failures are loud (#345).** The server
+  refuses to start, exit 1 with a message naming the key, when
+  `embedding.enabled` is falsy, and the toggle is retired (PR #3339). The
+  `ENGRAM_NO_EMBEDDINGS=1` bypass now prints one stderr WARNING and its
+  docstring says it is test/dev scaffolding (part of #3350, PR #3351). A
+  write-time embed failure stores the node, flags it, reports it in the
+  response (`embedding_failure`, plus `prediction_embedding_failure` for a
+  prediction) and revives the model once in-process (PR #3343, PR #3352).
+  Sleep gains a backfill step and `tools/engram-regenerate-embeddings.py
+  --json` prints `{before_null, embedded, failed, after_null}` (PR #3332).
+  Each observation is stamped once instead of twice, which also removes an
+  extra embed and a duplicate "created" `edit_history` row per write (closes
+  #3353 via PR #3354).
+
+- **`nodes.metadata` parse sites go through one helper (closes #3413 and
+  #3424 via PR #3423), with follow-ups in PR #3449 and PR #3484.** An AST
+  census of every `json.loads` over a metadata value in `src/engram/**` found
+  62 sites, 49 of them reachable crashes on valid-but-non-object JSON; all go
+  through `_metadata_dict` now and an AST drift guard holds the line. PR
+  #3449 tightens that guard's LOCAL check and makes `detect_speaker` survive
+  `None` / invalid / empty person metadata. PR #3484 adds the write guard
+  (`nodes.metadata` must be valid JSON or NULL) with migration rung 7
+  quarantining existing invalid values (part of #3425); PR #3502 guards the
+  remaining `json_extract(metadata, ...)` read sites with `json_valid`
+  (closes #3485). Those two changes are the entries that open this section,
+  which cite them by issue number.
+
+- **One path for trust-tier changes (PR #3297, part of #1825).**
+  `engram_set_trust_tier` is the only writer: `update_person` and `add_person`
+  with `trust_tier="primary_user"` are refused, as is `trust_tier="self"` on a
+  node without `is_self`. Measured before the fix: four bypasses on dev.
+
+- **Smaller substrate fixes.** A durable goal tension now rebuilds
+  `principle_triggers.json` (closes #1721 via PR #3260). Nested `*_json`
+  sub-fields sent as a real array or object return a structured error instead
+  of an uncaught `TypeError` (measured: `{"observations_json": []}` on
+  `engram_add_observation_batch`; closes #1753 via PR #3262).
+  `migrate_person_nodes` checks `is_self` before tier inference and flags the
+  legacy `role` key (closes #1665 via PR #3259). `write_durable_snapshot`
+  backs up from a fresh read-only connection, so an uncommitted write on the
+  caller's connection can no longer make the backup hang silently (closes
+  #3232 via PR #3273).
+
+- **`recall_summary_overrun` is documented in the write-tool descriptions,
+  observe skill and changelog (#3731, part of #3537).** Docs and docstrings
+  only.
+
+- **`idx_nodes_created_at` via migration rung 8 (closes #3766 via PR #3770).**
+  The two U9b checkpoint statements now SEARCH an index instead of scanning
+  every row.
+
+- **A cross-process `flock` guards the one-time DB setup (closes #3771 via PR
+  #3774, part of #3767).** Two processes starting together could run
+  migrations and backfills at once.
+
+- **The setup lock rechecks its inode after the `flock` (#3798, part of
+  #3791).** A waiter whose lock file was deleted under it re-opens instead of
+  holding a dead lock.
+
+- **The DB setup lock is a `0700` directory, not a file (closes #3791 via PR
+  #3800).** `<db>.setup.lockdir` replaces `<db>.setup.lock`; the hard-link
+  refusal and its delete remedy are gone.
+
+- **`bears_on`, a question-to-claim relation (#3618, part of #3615).** A
+  non-cascade edge saying that once a question is answered, the answer counts
+  for or against a claim; ask, resolve and list surface it.
+
+- **`bears_on` hints whether it still holds toward a replacement (#3641, part
+  of #3625).** On supersede, retract-with-replacement and resolve, the agent
+  is prompted to re-point the relation.
+
+- **`_relation_endpoint_error` moves into `engram_core` (closes #3631 via PR
+  #3649).** One shared endpoint-type rule for `instantiates`, `generalizes`
+  and `bears_on`; three doc notes from the #3641 review are folded in.
+
+- **A confidence recompute after an acknowledgement no longer double-counts
+  the superseded premise (closes #3531 via PR #3662).** It read both the
+  original and the `acknowledged_derives_from` edge.
+
+- **`config.json` writes are atomic, and node creation fails loud on an
+  unreadable config (closes #3607 via PR #3623).** `_set_current_turn` used to
+  truncate the file on every turn advance.
+
+- **Health reads no longer depend on the caller's `row_factory` (closes #3128
+  via PR #3617).** Functions in `src/engram/health/` read columns by name and
+  broke on a plain `sqlite3.connect`.
+
+- **`embedding.device` (default `cpu`) and `embedding.cpu_threads` (default 4)
+  apply at every model load (#3905, closes #3898).** ENGRAM loads
+  `all-MiniLM-L6-v2` through `SentenceTransformer`, which silently took CUDA
+  whenever a CUDA device existed (about 750 MB of VRAM per process, no latency
+  gain for single-query recall). `embedding.device` is `cpu`, `cuda` or
+  `auto`; `auto` is exactly the old behaviour. On `cpu` the load path never
+  touches CUDA (the roughly 610 MB is the CUDA context itself). `cuda` with no
+  visible CUDA device loads on CPU and prints one stderr line, and an invalid
+  value also loads on CPU with one stderr line naming the value and the
+  allowed ones; embeddings never turn off silently. `embedding.cpu_threads`
+  (an integer of at least 1) is applied after any load that ends on CPU; an
+  invalid runtime value falls back to 4 with one stderr line. Both keys are
+  read at load time through the same accessor as `embedding.model`, so a
+  config edit applies on the next load, and both are registered in
+  `tools/config_schema.py` (editable, no restart, tier B), listed in
+  `README-AGENT.md` and in `templates/config.json.example`. The polarity
+  cross-encoder follows `embedding.device`; no `polarity.device` key exists.
+  Behaviour change on Apple silicon: under `auto` the library loaded on
+  `mps:0`, so the new default moves a Mac seat to CPU. Measured by the
+  colleague on a Mac: single query 2.4 ms on cpu against 5.2 ms on mps, batch
+  of 50 13.9 ms against 20.8 ms, parity minimum cosine 0.99999994 over 20
+  sentences. Known limits: there are no CPU numbers for the polarity
+  cross-encoder (its model was not cached on the builder's seat), and
+  `src/forum/embeddings.py` still loads on whatever device the library picks
+  (sibling issue #3899).
+
+### Daemon, owner and read registry (EngramManager)
+
+- **The surface daemon's startup gate no longer unlinks a socket another live
+  process holds (closes #3361 via PR #3490), and a refusal waits before
+  exiting (PR #3491).** When the recorded pid is dead the gate asks who holds
+  the path (`/proc/net/unix` path-text match, never substring) and unlinks
+  only on a positive "nobody": exit 75 means held, 76 means unproven. A
+  socket-holder refusal sleeps 60 s so supervisors do not hot-loop. The new
+  operator verb `clear-stale-engram-daemon.sh` clears a crash-stale socket the
+  gate refuses to unlink, as a deliberate human decision with no heuristic
+  (closes #3493 via PR #3517). A later test fix replaces `select()` with
+  `selectors` in the backoff test, which failed above fd 1023 (closes #3529
+  via PR #3530).
+
+- **The daemon-hook socket-ownership guard fails closed on macOS (PR #3359,
+  part of #3333).** BSD `stat` has no `-c`, so both identity snapshots came
+  back empty and `rm -f` removed the socket and pidfile despite a live
+  holder. It now tries GNU then BSD `stat`, treats an empty snapshot for an
+  existing path as not-nothing-on-disk, and falls back to `lsof` for the
+  holder check where `/proc/net/unix` is absent.
+
+- **`setup-surface-daemon-service.sh` refuses a temp-dir or worktree daemon
+  path (PR #3545, part of #3519).** On 2026-10-03 a test run from a fairy
+  worktree registered a real launchd job under the production label whose
+  program was a deleted worktree's script; it respawned 27,605 times.
+
+- **Owner hardening (closes #3240 via PR #3285).** Pid identity survives pid
+  reuse and clock drift through one shared `engram_pidfile.py` helper, the
+  owner checks whether it has been displaced, and the destination-rights
+  check is pinned. `EngramdOwner.start()` fails closed on Python older than
+  3.11 with a named `OwnerPythonTooOld` (closes #3349 via PR #3369), and one
+  `platform_unsupported_reason()` is shared by the refusal and the test
+  marker (PR #3375, part of #3292).
+
+- **Read-template registry, tier 1 (closes #3196 via PR #3321, part of
+  #2652).** The owner admits a client read only if the statement's exact
+  bytes were registered at build time. `generalization_chain` hydration
+  moved to fixed `json_each` templates (closes #3324 via PR #3326); the
+  committed scan keys sites on `file:qualname` instead of `file:LINE` (closes
+  #3342 via PR #3345); the two auto-sleep hook functions are registered in
+  the scan roots (PR #3385); session start gains a named JSON1 probe in
+  substrate health (closes #3327 via PR #3329); the design doc's U4 scope
+  note was corrected after a re-measure (PR #3293). The user-identity hook can
+  read person nodes through the owner behind a default-off flag (PR #3341,
+  part of #3197); the cross-uid rejection control behind its ship gate
+  became a real test later (PR #3421, see Tests and CI).
+
+- **The owner serves document frequencies as a typed `df` op (#3733, part of
+  #3665).** `df` reads `nodes_fts_vocab`; the client-read floor now allows
+  `PRAGMA data_version` in its read form only.
+
+- **The generalization chain walk is one typed `chain` owner op (#3744, part
+  of #3740).** The lesson-tripwire hook sends one op per hit instead of
+  walking the chain itself, to pass the A6 latency gate on the production
+  build.
+
+- **The owner refuses to start on a store behind the schema (closes #3753 and
+  #3785 via PR #3776).** One `LATEST_SCHEMA_VERSION` constant replaces the
+  function-local copy, and a refused load is recorded as `refused_at_load`.
+
+- **A FIFO at the pidfile path reads as no live pid instead of hanging (#3772,
+  part of #3768).** `recorded_live_pid` no longer blocks on a plain `open()`
+  of a non-regular file.
+
+- **The owner refuses to start on a non-regular pidfile and never writes
+  through a symlink (#3777, part of #3768).** A FIFO at `engramd.pid` used to
+  hang `start()` at the pidfile write.
+
+- **One shared pidfile write serves the owner and both collab tools (#3779,
+  part of #3768, addresses #3773).** `monitor-supervisor.py` and
+  `codex-umwelt-wake.py` no longer hang on a FIFO pidfile or status file, and
+  no longer truncate a symlink or hard link.
+
+- **The owner launcher's macOS refusals give the true reason (#3769, part of
+  #3709).** They no longer blame the permission layer (#3194); the real cause
+  was that no macOS launcher existed yet.
+
+- **A macOS launchd launcher for the owner (closes #3709 via PR #3778).** One
+  LaunchAgent per `ENGRAM_HOME`; `setup-surface-daemon-service.sh --owner` now
+  works on a Mac instead of refusing.
+
+- **The launcher names rc 125 as `no_gui_domain` and refuses control bytes as
+  a class (closes #3780 via PR #3789).** A Mac account with no GUI login
+  session now reports its own state instead of a generic failure.
+
+- **The launcher handles non-ASCII paths under stock macOS bash 3.2 (closes
+  #3790 and #3794 via PR #3799).** Path captures, the `printf -v` name guard
+  and `LC_ALL=C sed` are fixed, and the test harness decodes UTF-8.
+
+- **`codex-wake` and `monitor-supervisor` refuse non-regular paths by class
+  (closes #3781 via PR #3792).** A FIFO, directory, socket, symlink or hard
+  link at the log, state file, status temp or `start` path is refused instead
+  of blocking or truncating a target.
+
+- **The `codex-umwelt-wake` watcher survives bad paths (closes #3793, #3795
+  and #3796 via PR #3803).** It no longer dies on a log write error, no longer
+  prints a `cp` that blocks, and no longer blocks on a FIFO config or session
+  marker.
+
+- **A `systemd --user` launcher for the owner, a gated SessionStart fallback
+  and one owner-flag helper (closes #3663 via PR #3672, part of #2652).**
+  Until now nothing started the owner except by hand; no flag is turned on by
+  this unit.
+
+- **Owner per-call floor: stage profiler, A6 installed layout, thread reuse
+  and serialize-once (closes #3678 via PR #3686, part of #2652).** U7 of the
+  epic: profile the round trip, then cut what the profile names.
+
+- **The owner's accept backlog is `SOMAXCONN`, and a full backlog reads as
+  busy-retry (closes #3680 via PR #3690).** More than 5 simultaneous connects
+  used to read as "restart the owner".
+
+- **An over-long socket path is refused before any mutation, with the same
+  reason on client and owner (closes #3696 via PR #3699, part of #2652).**
+  Linux half.
+
+- **The owner reads the `run/` ACL back and refuses to start if any entry
+  remains (closes #3698 via PR #3701, part of #2652).** Linux half.
+
+- **Darwin arm of the owner permission layer (closes #3666 via PR #3703, part
+  of #2652).** The owner starts on a Mac instead of refusing with
+  `OwnerPermissionUnsupported`.
+
+- **One helper decides the owner's permission arm (closes #3708 via PR #3711,
+  part of #2652).** `main()` exits cleanly on an unsupported seat, and a hung
+  `setfacl` refuses by name.
+
+- **`platform_arm()` is the one platform discriminator for owner and client
+  (closes #3712 via PR #3713, part of #2652).** The client's socket-path limit
+  no longer keys off `sys.platform`.
+
+- **Darwin arm for the pid-identity check (closes #3714 via PR #3715, part of
+  #2652).** `recorded_pid_is_alive` reads libproc start time and
+  `KERN_PROCARGS2` argv, so a reused pid no longer reads as a live owner on a
+  Mac.
+
+- **On Darwin a refused `connect()` with a live owner is `busy_or_stuck`, not
+  down (closes #3707 via PR #3716, part of #2652).** Reason codes are now by
+  meaning on every `Unavailable`.
+
+- **`engramd_client._call` never raises (closes #3717 via PR #3718, part of
+  #2652).** Socket-creation failure is `local` and an unserializable request
+  is `Rejected`.
+
+- **The owner launcher asks the socket before it calls a live pid a serving
+  owner (#3825, part of #3736).** `start-engramd-owner.sh` judged health from
+  `engramd.pid` alone, so "alive" meant only that the process existed, and a
+  fresh launch printed `UNSUPERVISED: engramd_owner launched (pid N)` without
+  checking. A new `serving` subcommand in `_engramd_owner_hook_io.py` sends a
+  `ping` (the one method that touches no store) and answers `serving`,
+  `notserving:<what was observed>` or `ambiguous:<why>`. The whole probe is
+  bounded: 1.5 s in total, 0.5 s per call, 0.25 s between polls. On
+  `notserving` the launcher reports and launches nothing, because a second
+  owner against a live pid is the hazard; it re-reads liveness first, so a
+  process that died during the probe never gets the not-serving line. Every
+  path still exits 0. Known limit: `notserving:` is a budgeted claim ("no
+  healthy ping answer within the window"), not proof that the owner does not
+  serve.
+
+- **No GUI login session on a Mac: the owner launcher launches unsupervised or
+  refuses loudly (#3826, closes #3823, part of #2652).** On a Mac where
+  launchd has no `gui/<uid>` domain and an owner flag is ON,
+  `start-engramd-owner.sh` now launches the owner unsupervised, as on Linux
+  without a user bus, and prints one `UNSUPERVISED:` line with the reason
+  `launchd: no GUI domain`. If that launch fails (it cannot spawn, the owner
+  dies within about a second, or `engramd_owner.py` is missing) it prints one
+  line led by `OWNER REFUSED: no launchd GUI domain`. That line names every ON
+  owner flag, the recovery (set those flags false in `config.json`, or log in
+  to a GUI session) and that the flagged readers will block. The old "not used
+  on this seat" line, which launched nothing, is gone. With every flag OFF, or
+  with a GUI domain, nothing changes. `engramd_owner_flags.py` gains
+  `--names`, a sorted comma list of the ON flags. Known limit: the launchd
+  user-domain alternative was not tried; it is a separate unit.
+
+- **The surface hook reads through the owner behind
+  `engramd.surface_reads_via_owner`, default OFF (U10 of #2652; #3827, closes
+  #3821).** Seven of the hook's eight store sites move: the embedding-restore
+  flag, the dormant focus-set candidates, the triggered-principles section
+  (the typed `chain` op), the keyword-prepend check (a COUNT template plus the
+  typed `df` op), the focused ids, the FTS fallback and the liveness check.
+  The eighth, the person-moment cursor advance (the only read-write open),
+  stays direct on both flag values. With the flag ON the FTS fallback is not
+  taken (a down owner gives the existing daemon-down notice and no recall
+  block), and liveness is derived from the fire's own restore-flag read, so
+  there is no extra round trip: after a failed read one `ping` tells "owner
+  down" from "owner up but the store did not serve the read", and each refusal
+  kind names itself (owner older than the hook, schema skew, unreadable
+  store). Owner down is a typed `Unavailable`, never a stale or empty default,
+  and there is no direct fallback. `CONFIG_PATH` is now the surface hook's
+  single config source, and a `_focused_ids` failure is no longer silent: with
+  the flag ON the surface and lesson-tripwire hooks each record one
+  owner-failure line (fail-open is unchanged). Measured on a copy of a real
+  store (N=300, sequential p50, owner over direct): 0.93x to 0.94x; a
+  synthetic store read 1.14x (#3834).
+
+- **`reconcile_lesson_demotions` reads through the owner behind
+  `engramd.reconcile_demotions_reads_via_owner`, default OFF (U12 of #2652;
+  #3828, closes #3824).** With the flag ON the per-lesson `prevention_type`
+  read goes to the owner and the tool opens the store zero times; the owner's
+  `ping` replaces the `db_path.exists()` check. Owner down is an error, never
+  `[]`, and the three owner-side refusals get three messages because the
+  remedies differ: down (start the owner), `unregistered_template` (the
+  running owner is older than the tool; restart it on the current build) and
+  `refused_at_load` (the store failed classification; migrate it). Flag ON
+  never falls back to a direct open. An explicit `--db` naming another store
+  keeps the direct path. Flag OFF is unchanged. This is the first `tools/`
+  unit.
+
+- **The owner unit restarts without limit, with bounded backoff, and never
+  lands in a permanent `failed` (#3835, closes #3831, part of #2652).**
+  `engramd-owner.service.template` shipped `StartLimitIntervalSec=300` with
+  `StartLimitBurst=5`, so on a seat with any `engramd.*_via_owner` flag ON a
+  crash loop hit the start limit and the unit went permanently `failed`, after
+  which every stop blocked until someone ran `systemctl --user reset-failed`.
+  Measured on Linux with systemd 255: the owner was down for good about 40 to
+  50 s after the first failure. The template now sets
+  `StartLimitIntervalSec=0`, drops `StartLimitBurst`, and adds
+  `RestartSteps=5` and `RestartMaxDelaySec=300s`; `RestartPreventExitStatus=4`
+  is unchanged, so a planted non-regular path is still never retried. macOS
+  had no such limit (launchd's `KeepAlive` throttles and keeps trying), so
+  this was also a platform-parity defect. Because a persistent fault now reads
+  `activating (auto-restart)` forever, a quieter failure than `failed`,
+  `start-engramd-owner.sh` reads the unit state in one `systemctl show` call
+  and prints one bounded line with the restart count, the exit the record
+  actually holds, what it means and the remedy. The line is chosen by state
+  first and restart count second, so a unit that is merely starting is not
+  told it has restarted, and a failed state read falls back to the previous
+  message.
+
+- **A supervised owner unit is probed too when no live owner is recorded
+  (#3854, closes #3849, part of #3736).** Step 4 of `start-engramd-owner.sh`
+  used to exit 0 for a Linux `active` unit or a macOS `running` job without
+  asking the socket. This is a residual gap, not the common case: an owner
+  that wrote its pidfile is already probed in step 3. These arms are reached
+  only when the unit or job is up but no live owner is recorded (the owner is
+  still starting, the pidfile is removed or stale, or the unit's process is
+  not an `engramd_owner`). Both arms now ask the existing `_probe_serving`
+  through one helper. On `notserving:`, with a liveness re-read that says
+  exactly `none`, the launcher prints one line and launches nothing. The line
+  never says "alive", says the socket did not serve within the probe window
+  and the owner may still be starting, and names the restart remedy
+  (`systemctl --user restart <unit>` or `launchctl kickstart -k
+  gui/<uid>/<label>`) only if this persists across session starts. A `serving`
+  or `ambiguous:` answer, or a re-read that finds the owner alive, keeps
+  today's behaviour.
+
+- **The owner's first write: a typed `use_reward` op (U11 Stage A; #3839, part
+  of #3822).** Owner side only; the hook that calls it is #3847. The op takes
+  `{node_ids, action, request_id}`, where `action` is a closed enum (today
+  `mention`). The client supplies no alpha and no config path: the owner
+  derives alpha from its own `config.json` and runs the shared
+  `engram_restamp.use_reward`, so the bump and the recall restamp both happen
+  (the issue's original bump-only op would have silently stopped the restamp).
+  The op runs as one transaction under the owner's lock, then compares the
+  values it expected with a re-read after COMMIT for all three columns; a
+  difference answers `readback_mismatch` with `commit:
+  "committed_unverified"`. `request_id` dedupes in memory (LRU, capped at
+  1024), and the same id with a different payload is refused. Every owner
+  method now carries a kind, `read` or `write`; the write set is
+  `{use_reward}` and an unclassified method is refused by default. A
+  restrictive, column-exact authorizer is installed for the op, and a denial
+  refuses the whole op (`write_denied`, rolled back, no partial bump). The
+  contract version moves 1.1 to 1.2 (additive). One total wait budget
+  (`USE_REWARD_LOCK_WAIT`, 1.0 s) covers the owner lock plus a competing
+  direct writer, and when it runs out the owner answers a typed
+  `Rejected(busy)` with nothing committed. SQLite's own busy handler
+  overshoots its timeout (measured on macOS, SQLite 3.53.4: `busy_timeout` 100
+  ms waited 633 ms, 300 ms waited 1391 ms, 1000 ms waited 2796 ms), so the op
+  sets `busy_timeout` to 0 and retries every 20 ms against its own budget.
+  Known limits: `Unavailable(timeout|protocol)` on a write is indeterminate,
+  not failed, and the remedy is one retry with the same `request_id`; an owner
+  restart between COMMIT and the reply, followed by a retry, can double-bump
+  (a small monotone over-credit); past the cap of 1024 the oldest id is
+  forgotten.
+
+- **The utility-credit Stop hook writes through the owner's `use_reward`,
+  behind `engramd.utility_credit_writes_via_owner`, default OFF (U11 Stage B;
+  #3847, part of #3822).** With the flag OFF the hook is today's code path.
+  With it ON the hook sends exactly `{node_ids, action: "mention",
+  request_id}`, never opens the store and never falls back to it; every
+  non-success is a loud, logged loss. The time budget fits the hook's `timeout
+  5`: 3.5 s for the owner write plus a 1.5 s reserve. A first attempt that
+  comes back `Unavailable(timeout|protocol)` is indeterminate, so it is
+  retried once with the same `request_id` if enough time is left, and the log
+  then says the first attempt may have been applied once, never "not applied".
+  `readback_mismatch` means committed but unverified and is not repeated
+  blindly; an older owner gets a typed message naming the contract skew; an
+  owner-reported `restamp_error` is logged and the bump stands. An explicit
+  `alpha=` or `restamp=False` with the flag ON raises `ValueError` rather than
+  write something else.
+
+- **A refused peer's request is drained before the owner closes, and each
+  refusal logs one line (#3857, closes #3845, part of #2652).** When the owner
+  refuses a peer on its credentials it used to send the typed rejection and
+  close at once, with the request unread. Measured on Linux, forced to refuse
+  (30 trials each): the rejection is delivered, but a client that sends first
+  and then reads to EOF gets the reply and then `ConnectionResetError`
+  (30/30), while the shipped client, which stops at the newline, is
+  unaffected. `shutdown(SHUT_WR)` alone did not remove the error; shutdown
+  plus a bounded drain gave a clean read (30/30). Now the owner sends the
+  typed rejection (wire shape unchanged), shuts down its write side, reads the
+  peer's request until EOF, a time budget or the request-size cap, discarding
+  it without ever parsing it, then closes. It also logs one WARNING per peer
+  uid per window naming the peer uid, the owner uid and the reason, never any
+  request bytes. The credential check, the rejection and the same-uid path are
+  unchanged.
+
+- **`advance_moment_cursor`: one shared compare-and-set for hook, server and
+  owner, behind `engramd.surface_writes_via_owner`, default OFF (U13 of #2652;
+  #3859, part of #3856).** `metadata.special_moment_cursor` had two writers,
+  the surface hook and `engram_query`, each rewriting the whole metadata dict,
+  so a concurrent `engram_update_person` or `engram_add_special_moment` edit
+  could be lost, or the advance could. Both copies are replaced by one
+  statement in the new `engram_moment_cursor.py` that sets only
+  `special_moment_cursor` through `json_set` and never rewrites another key.
+  The same statement is the owner's second write op (kind `write`, contract
+  1.2 to 1.3; an older owner answers `Rejected(unknown_operation)`). The
+  cursor rule has a range window (an int, not a bool, in `[-(2**53), 2**53)`,
+  else 0), because SQLite's `json_type` and `json_extract` disagree on a
+  stored `2**63`. The `USE_REWARD_*` timeout constants were renamed
+  `OWNER_WRITE_*`, values unchanged. With the flag ON the hook makes one
+  attempt and does not retry: the cursor write comes after render, and a lost
+  advance only means the same moment may repeat sooner. The flag stays OFF on
+  every seat until it is switched on deliberately. Known limit: a direct
+  writer advancing between the owner's COMMIT and its read-back reads as
+  `readback_mismatch`; the reply tells the caller to re-read before repeating.
+
+- **The moment-cursor SQL uses the one guard idiom, and the metadata-guard
+  gate sees a cut-off first argument (#3866, closes #3865; #3868, closes
+  #3867).** The nightly went red because five `json_*` sites in
+  `engram_moment_cursor.py` used a nested guard that the #3485 gate does not
+  recognise. `CURSOR_SQL_EXPR` and `_IS_OBJECT_SQL` now take `CASE WHEN
+  json_valid(metadata) THEN metadata END` as the first argument of every
+  `json_*` call, and `CURSOR_GUARDED_SQL_EXPR` is deleted, leaving one cursor
+  definition. The UPDATE's `json_set` is wrapped too; for the rows the WHERE
+  clause admits (valid objects) nothing changes, and the object test is now
+  the only term that excludes non-objects, so it must stay. A variant
+  whose first argument was spliced in by string concatenation and came out
+  bare passed the gate while 19 behavioural cells went red, so the gate gains
+  one rule: a json-function call whose first
+  argument runs to the end of its string piece is a site ("first argument not
+  visible in the literal"), and the module spells the wrap literally at its
+  five call sites. The ratchet stays 0 with no allow-list entry.
+
+- **`cohort_dispatch` reads through the owner behind
+  `engramd.cohort_dispatch_reads_via_owner`, default OFF; one shared
+  owner-read helper; one `ENGRAM_HOME` resolution (U14 of #2652; #3869, closes
+  #3862).** `_fetch_nodes` (it runs in every sleep, via `prepare` and
+  `verify-in`) now uses the registry's one admitted form, `WHERE id IN (SELECT
+  value FROM json_each(?))`, which also removes the 999-variable ceiling (a
+  1,200-id cell shows it). With the flag ON, an owner that is down, refusing
+  or malformed raises `CohortOwnerReadError`: no empty list, no partial list,
+  no direct fallback. `prepare` exits non-zero and writes no chunk, and
+  `verify-in` reports one `db_access` error naming the owner instead of one
+  "not found in DB" per node. The direct path now opens `mode=ro` on both flag
+  values (the old open had no `mode=ro`, so the docstring's "read-only" was
+  untrue). The flag applies only when `--db` is this home's store; any other
+  `--db` stays direct. Two root-cause fixes ride along. `tools/_owner_read.py`
+  now holds the owner-read machinery that the lesson-demotion tool kept
+  privately: a tool describes itself with one `OwnerReadSpec` (flag key, typed
+  error, home, and what an empty answer would have meant). And the store path
+  has one definition: `--db` defaults to `engram_home()/knowledge.db`, and the
+  sleep skill no longer passes `--db ~/.engram/knowledge.db`. Known limit: it
+  is not measured whether any seat runs with `ENGRAM_HOME` other than
+  `~/.engram`; if none does, the path bug was latent.
+
+- **`cohort_dispatch verify-in` reads the owner flag once (#3877, closes
+  #3871, part of #2652).** It read the flag twice per run, so the flags-bundle
+  stderr line from #3869 printed twice, and the two reads of one decision
+  could disagree if `config.json` changed between them. `_fetch_nodes` takes
+  an optional `use_owner`; `verify-in` passes the decision it already made,
+  and `prepare` is unchanged.
+
+- **The nightly `knowledge.db` backup reads one owner snapshot behind
+  `engramd.backup_reads_via_owner`, default OFF (U15 of #2652; #3876, closes
+  #3872).** With the flag ON, `tools/backup_knowledge_db.py` never opens the
+  live store. It asks the owner's `snapshot()` for one quiesced copy in a
+  private `0700` temp dir inside `--out-dir`, reads the watermark from that
+  copy, decides whether to skip, and feeds the same copy to `dump_stripped`,
+  so the watermark and the archive describe one state (today they are two
+  reads at two times). Every non-success from `snapshot()` is an error: exit
+  1, no archive, `.watermark.json` untouched, no fallback to the live store.
+  That covers an owner that is down or refusing, an indeterminate answer
+  (`Unavailable`, or `Rejected(commit="indeterminate")`; the tool never looks
+  at the destination after one), and a malformed `Ok`. The temp dir is removed
+  on success, on skip and on any error. The flag applies only when `--db` is
+  this home's store. `tools/_owner_read.py` gains `snapshot(spec, dest_path)`
+  with its own `snapshot_timeout`, default 35 s; the owner's
+  `SNAPSHOT_REQUEST_DEADLINE` is 30 s and the client waits past it so the
+  owner's typed timeout reply arrives. Known limit: the 35 s is a judgement,
+  not a measurement. `--db` now defaults to `$ENGRAM_HOME/knowledge.db` and
+  `--out-dir` to `$ENGRAM_HOME/db-backup`; the second is a change, since it
+  moves where archives land for anyone running with a non-default
+  `ENGRAM_HOME`. With the flag ON a run briefly holds two full-store copies in
+  the temp dir (the owner's snapshot, embeddings included, and
+  `dump_stripped`'s own working copy), and `--dry-run` pings the owner and
+  takes no snapshot.
+
+- **`_read_install_tier` no longer blocks on a FIFO at `config.json` (#3878,
+  closes #3838, part of #2652).** `EngramdOwner.start()` called it before
+  serving, and it read `<ENGRAM_HOME>/config.json` with a plain
+  `Path.read_text`, which blocks on a FIFO until a writer appears. Measured:
+  with a FIFO at `config.json`, a whole-`start()` cell run in a child with a
+  30 s timeout does not return on the old code. It now uses the non-blocking
+  `engram_regular_io.read_regular_text`, with the same `(OSError, ValueError)`
+  to `None` fallback.
+
+- **The dream master's safety, coverage and null-embedding reads go through
+  the owner behind `engramd.dream_safety_reads_via_owner`, default OFF (U17 of
+  #2652; #3886, part of #2652).** No agent opens `knowledge.db` for these
+  reads any more. `tools/dream_master_batch.py` gets a CLI with three
+  subcommands and one contract: one JSON line and exit 0, or empty stdout, a
+  stderr line naming the error class, and a non-zero exit. A failed read is
+  never `null`, `0` or a fraction. `safety-row <node_id>` returns
+  `{"is_current","status","superseded_by"}`, or `null` for a missing node.
+  `coverage {recall_summary|recall_keywords}` returns the fraction that the
+  health metrics compute, or the string `"UNAVAILABLE"` when no claim-bearing
+  node is current. `null-embeddings --population claim_bearing_nodes` returns
+  the count the health engine computes. With the flag ON each statement goes
+  to the owner as one registered read template (four registered) and an owner
+  that is down, refusing or malformed fails with no direct fallback; with it
+  OFF the store is opened `mode=ro`. Both dream agent specs now say never to
+  open `knowledge.db` yourself and to call the CLI, and the master spec adds
+  that a CLI failure is not a missing node: skip the action and log `safety
+  read failed`. The two coverage aggregates are computed in SQL so the owner
+  returns two numbers, not every summary and keyword list. Known limit: five
+  metadata shapes that `engram_core` cannot write diverge from the health
+  functions, and are pinned as documented divergences.
+
+- **`engram-regenerate-embeddings` writes through the owner behind
+  `engramd.regen_embeddings_via_owner`, default OFF (U16 of #2652; #3900,
+  closes #3879).** The restore-path backfill that sleep Step 3.9 runs every
+  night is the first `tools/` write to move. With the flag ON the tool never
+  opens the live store; it still loads the embedder and computes the vectors
+  itself, so the model stays out of the owner. The owner gains two write ops,
+  so the write set is now `use_reward`, `advance_moment_cursor`,
+  `fill_embeddings` and `finish_embedding_regen`. `fill_embeddings` takes
+  `{model, items: [{node_id, vector}]}`, 1 to 50 items, vectors of exactly 384
+  numbers (finite, not bool), the model must equal the store's configured
+  model, and all items are validated before any write. It writes with a
+  compare-and-set per item (`... WHERE id = ? AND is_current = 1 AND embedding
+  IS NULL`), stores `nodes.embedding` text byte-identical to the direct
+  path's, mirrors changed rows into `vec_nodes` (if the owner cannot load vec0
+  the fill still succeeds with `vec_mirrored: false`) and reads every changed
+  row back. This is the owner's first extension load, of `sqlite_vec`.
+  `finish_embedding_regen` rebuilds the FTS index and recounts the embeddable
+  NULLs itself, clearing the restore flag only when that fresh count is 0, in
+  one transaction; it takes `embedder_available` from the tool so the owner
+  never imports the embedder (measured: about 4 s, then resident). Tool side:
+  reads go through three registered templates, writes in batches of up to 50,
+  and `after_null` is a fresh read, never `before - embedded`. An owner
+  failure (down, refusing, indeterminate, malformed answer or
+  `readback_mismatch`) exits **3**, distinct from exit 1 for per-node
+  failures, with the reason on the last stderr line, no JSON on stdout and no
+  direct connect, so sleep records `embedding backfill FAILED (exit 3):
+  <reason>`. There is no retry after an indeterminate write; the fill is a
+  compare-and-set, so re-running is safe. Known limit: a flag-write failure
+  now rolls back the FTS rebuild and is reported, where the direct tool
+  swallowed it, so the two paths differ there.
+
+- **The launcher's race-winner path reports a live owner that is not serving
+  (#3915, closes #3736).** When the launcher's own launch dies inside its
+  watch, it assumes it may have lost an `OwnerAlreadyRunning` race and
+  re-checks for a live pidfile for about a second. That re-check used to exit
+  0 silently the moment it saw `alive`. Now it probes the socket, and if the
+  answer is `notserving:` while a liveness re-read still says alive, it prints
+  one budgeted line containing "alive but NOT SERVING", the observed text, the
+  race provenance and the probe window; nothing is launched. A winner that
+  serves stays silent, a winner that dies during the probe gets no not-serving
+  line, and an `ambiguous:` answer claims nothing. With this, every launcher
+  path that observes a live owner (recorded pid, launchd `running`, systemd
+  `active`, the unsupervised launch watch, the race re-check) asks the socket
+  first.
+
+### Hooks, lessons, session start and agentctl
+
+- **"Forum configured" means `forum.url` is set, everywhere (closes #3546 via
+  PR #3550, closes #3552 via PR #3559).** The forum, baton and inter-agent
+  prompt hooks and the `ia`, `baton` and `engram_client` CLIs used to accept
+  `forum.url` OR `agent_name`, so an install with no forum server reported the
+  forum as unreachable. `agent_name` is identity only now and no message
+  recommends it.
+
+- **`forum.url` has one writer and a bring-up path.** `set_forum_url.py` is
+  the one tested writer, called by `install-forum-service.sh` (PR #3561, part
+  of #3557). First-session Step 5.7 asks for the URL and writes it only
+  through that tool (PR #3565, part of #3563); the answer reaches the block as
+  a file read, never shell source, after a forged heredoc delimiter was shown
+  to run lines as shell (PR #3573, part of #3571). `agentctl spawn
+  --forum-url` leaves a one-line hint that Step 5.7 offers as the default
+  (PR #3569, part of #3563).
+
+- **Advisory probes say unknown, never healthy, when they could not
+  measure (PR #3524, PR #3534, PR #3544; part of #3521).** Four probes return
+  a tri-state and render one bounded line when unknown; the forum prompt hook
+  says so when it could not read the forum or the inbox, instead of reporting
+  "nothing new"; an unreadable or corrupt `config.json` is unknown, not "forum
+  not configured".
+
+- **Lesson tripwire and lessons.** The tripwire loaders still return `[]` and
+  never raise, but now record a visible notice instead of silencing every
+  lesson (closes #3503 via PR #3504). A new `tripwire_priority` field ranks
+  the display-cap sort key, which used to rank by pattern length (a 15-char
+  guard on `git stash` lost its slot to a 119-char broad reminder; closes #3270
+  and #3112 via PR #3278). `engram_add_lesson` returns an advisory
+  `unarmed_warning` for a command-shaped lesson with no `situation_pattern`
+  (closes #3209 via PR #3420).
+
+- **Session start.** SessionStart reads an existing session marker through
+  the non-blocking regular-file open, so a FIFO at the marker path no longer
+  hangs it (closes #3576 via PR #3589). The auto-sleep cron instruction gets a
+  must-not-miss line so overflow cannot drop it (closes #3336 via PR #3371).
+
+- **`agentctl` and the loop prompt.** `agentctl session` runs a shared
+  prologue (umask 022 plus `~/.engram/boot-env`) in the target user's shell at
+  every Claude launch site (closes #3451 via PR #3452; PR #3472 pins the order
+  at each site). It fails loudly on a Codex resume permission override
+  (PR #3281). `format_loop_prompt` keeps the caller's meta on already-marked
+  input (PR #3310, part of #3309) and returns the stripped core from its
+  idempotency branch (PR #3301, part of #1847).
+
+- **`_focused_ids` reads through the caller's connection (#3737, part of
+  #2652).** Closes the zero-opens hole in the tripwire owner path: a fire used
+  to open `knowledge.db` directly, twice, even with the owner read flag on.
+
+- **`vocab_table_absent` maps to the empty df result in the tripwire shim
+  (#3738, part of #3665).** Adds two cells for mutants that survived the
+  earlier review, before the owner-read flag is turned on.
+
+- **`extract_keywords` takes `n_docs` (#3743, part of #3740).** The tripwire
+  passes the count it already computed, so a fire runs one `COUNT` instead of
+  two.
+
+- **The six SessionStart store readers go through the owner behind
+  `engramd.session_start_reads_via_owner`, default off (#3746, part of
+  #3735).**
+
+- **The session-start calibration block reads through one typed
+  `confidence_by_type` owner op (closes #3741 via PR #3759).** With the flag
+  on it no longer builds a server-runtime client and calls `engram_stats`
+  twice.
+
+- **`session_checkpoint_block` fetches only what it renders (#3763, part of
+  #3761).** One statement returned every row of the window (about 4.8 MB
+  through the owner on a real store); it is now a `COUNT(*)` plus a capped
+  list.
+
+- **The five unordered focused reads now `ORDER BY focused_at` (#3760, part of
+  #3613).** They plan on `idx_nodes_focused` instead of scanning.
+
+- **Live in-context exclusion on the prompt and tool recall routes, default
+  off (#3620, part of #3613).** Recall stops re-showing nodes already in the
+  model's context.
+
+- **`⟦ENGRAM⟧` meaningful-span marker, consumer side (#3626, part of #3613).**
+  A shared helper plus the surface and tripwire hooks understand the marker; a
+  message without one behaves as before.
+
+- **`⟦ENGRAM⟧` marker, producer side (#3632, part of #3613).** The loop stub,
+  probe rating request and forum monitors emit it; an empty marker means skip
+  recall.
+
+- **SessionStart opens every path non-blocking and regular-file-only (closes
+  #3591 via PR #3627).** A FIFO at a path used to hang the hook until its 5 s
+  timeout killed it.
+
+- **A whole SessionStart survives a FIFO at `config.json` or `knowledge.db`
+  (#3633, part of #3628).**
+
+- **Shared hook libs and small hooks open paths non-blocking and
+  regular-file-only (closes #3572 via PR #3636, part of #3628).**
+
+- **The surface hook's file opens are non-blocking and regular-file-only
+  (#3637, part of #3628).**
+
+- **The lesson-tripwire hook's file opens are non-blocking and
+  regular-file-only (#3639, part of #3628).**
+
+- **Hook `mode=ro` sqlite connects and the surface daemon's file opens never
+  block on a FIFO (#3642, part of #3628).** Completes section 3 of the issue.
+
+- **A lesson-tripwire crash is visible, not "nothing matched" (#3643, part of
+  #3521, row 9).**
+
+- **A broken principle-trigger registry reads as UNKNOWN, not "nothing fired"
+  (#3644, part of #3521, row 7).**
+
+- **The drowsiness banner says unknown when the transcript cannot be read
+  (#3645, part of #3521, row 8).**
+
+- **The forum prompt hook reports a failed `_prompthooklib` import (#3646,
+  part of #3521).** It was a silent exit 0.
+
+- **The baton and inter-agent prompt hooks report a failed `_prompthooklib`
+  import (#3647, part of #3521).**
+
+- **The import-failure gate comment matches the `__main__`-gated exit (#3652,
+  part of #3521).** Comment only.
+
+- **A corrupt `principle-trigger-state.json` is UNKNOWN and moved aside in the
+  surface hook (#3654, part of #3521, row 40).** It was silently overwritten.
+
+- **Core and the utility-credit hook never overwrite an unusable
+  `principle-trigger-state.json` (#3659, part of #3521, row 40).** A
+  three-reader parity test pins it.
+
+- **The utility-credit hook takes `_with_state_lock` for its trigger-state
+  read-modify-write (closes #3658 via PR #3661).**
+
+- **Shown records are pruned after 14 days and the append never follows a
+  symlink (closes #3622 via PR #3668).** Session `*.shown.jsonl` files used to
+  accumulate forever.
+
+- **The shown record is all-or-nothing on `emit_context`'s final cut (closes
+  #3621 via PR #3671).**
+
+- **The tripwire's shown record is appended only after the response was
+  written out (closes #3670 via PR #3674).**
+
+- **The Stop hook's maturity read goes through the owner behind
+  `engramd.stop_reads_via_owner`, default off (closes #3664 via PR #3675, part
+  of #2652).** U6a.
+
+- **Lesson-tripwire total-budget pass: recall then chain are cut, never the
+  block, and the first line says so (closes #3677 via PR #3681).** The joined
+  `additionalContext` had no bound.
+
+- **`_render_truncated_first` re-trims the head so the in-band marker cannot
+  push past the target (closes #2899 via PR #3692).**
+
+- **The lesson-tripwire hook reads through the owner behind
+  `engramd.lesson_tripwire_reads_via_owner`, default off (#3725, part of
+  #3665).** The shim routes the IDF lookup to the typed `df` op. U6b.
+
+### Recall-measurement probes (developer tier)
+
+- **The mods-recall probe v0 and its fixes (part of #3362).** A Claude Code
+  mod under `tools/probes/mods-recall/` measures what thinking-keyed recall
+  would surface at each model step without changing what the model reads
+  (PR #3368). Live-run fixes: the MCP result envelope is unwrapped one level
+  (PR #3376), thinking-proxy arms use answer text in visible mode and arm C
+  skips a blank input (closes #3398 via PR #3406; measured on 418 live step
+  rows, 163 `api-error` all had empty input), the query floor drops to 0 with
+  a narration fallback (PR #3453), and arm C's cache is keyed by the prompt,
+  closing a flake that failed 38 of 80 runs at 16-way parallelism (closes
+  #3378 via PR #3412).
+
+- **A route ledger records what the live recall hooks surfaced (part of
+  #3458, #3362).** The surface response exposes per-candidate ranking signals
+  (PR #3462); the two live hooks append one ledger line per fire when the
+  probe is live (PR #3459); the probe joins the ledger into its rating
+  request and adds an offline floor and formula sweep (PR #3461). `in_context`
+  was null on every candidate because nothing produced it; the hooks now do,
+  and `ranked` is a flag (closes #3551 via PR #3554). The live `in_context`
+  flag now handles compaction: `shown` counts only the current window, and ids
+  in the last compaction summary count as in context (PR #3566, part of #3556).
+
+- **Offline readers.** `recompute_in_context.py` recomputes `in_context`
+  from the transcript with a compaction-aware definition, as a sidecar that
+  never writes the ledger (PR #3567). `probe_fleet_report.py` renders one
+  table across seats and days (PR #3553). `probe_eval` and the fleet report
+  read the offline sidecar; before, the route arms' in-context rate always
+  read `0.000` (PR #3575).
+
+- **Recall-harness fixes.** `signals["composite"]` is populated from
+  `composite_score`; the old branch never fired (closes #3464 via PR #3474).
+  Offset-less ISO timestamps are UTC, not local time: measured +4.0 h under
+  `TZ=America/New_York` (closes #1801 via PR #3263).
+
+- **`engramd_a6_latency.py --hook tripwire` (#3739, part of #3665).** The
+  installed-layout A6 arm for the lesson-tripwire hook, with an `--exclusion
+  on|off` switch, a U8 contract gate (exit 3) and a ledger row.
+
+- **`engramd_a6_latency.py --hook session-start` (#3754, part of #3747).** An
+  A6 arm for the SessionStart hook: fresh-process fires, an allow-list on the
+  flag-on store opens, and a cold row.
+
+- **`--layout-timeout` and a named exit 5 for a layout child that outruns it
+  (closes #3755 via PR #3756).** The fixed 1800 s timeout used to end in a raw
+  `TimeoutExpired` traceback on a real-size store.
+
+- **An ambiguous `killpg` `ProcessLookupError` falls back to killing the
+  child, and every timeout wait is bounded (closes #3757 via PR #3758).** A
+  non-leader child used to leave the final `wait()` unbounded.
+
+### Forum server and installer
+
+- **The forum's GitHub integration is an explicit server-side switch (PR
+  #3578, part of #3568).** `FORUM_GITHUB_INTEGRATION=on|off`, read once at
+  startup: `on` with a token behaves as before byte for byte; `on` without a
+  token refuses to start (one stderr line, exit 78); `off` is advisory and
+  never a refusal; an unset legacy unit with a token stays ON. The installer
+  gained `--github-integration off` for an existing install (closes #3583 via
+  PR #3592) and now reads drop-ins, so a token supplied only in
+  `engram-forum.service.d/*.conf` no longer renders `=off` on a re-run with
+  no flag (closes #3593 via PR #3596). PR #3599 closes the findings deferred
+  from those two (a plain, quoted or multi-word `Environment=GH_TOKEN=` in a
+  drop-in counts as a token; an empty switch value is refused). The install
+  verify probe no longer reports the admin shell's GitHub state and shows the
+  service's own line (closes #3597 via PR #3601). PR #3594 adds non-dry-run
+  refusal cells so "nothing was written" binds to the check's position, not
+  just its presence. `docs/FORUM-SERVER.md` is the user guide (PR #3582).
+
+- **The installer refuses what it cannot render, before writing anything.**
+  A flag whose value is another flag, and a `--service-dir` with `;`, `$` or
+  `%`, are refused (closes #3590 via PR #3598). `--service-dir` is now an
+  allowlist, `[A-Za-z0-9/._+=,@:-]`, absolute, no leading dash, with the same
+  check on a reused `FORUM_HOME` (closes #3600 via PR #3602). `--port` must
+  be a plain decimal 1-65535, and `--group` and `--admin-user` are validated
+  at the flag (closes #3603 via PR #3611). A kept unit may contain only the
+  shapes the installer renders; anything else is a loud exit 2 naming the
+  line and the remedy (closes #3579 via PR #3588).
+
+- **Deploy files carry no one host's layout (PR #3574, part of #3568).** The
+  backup and backup-alarm units are templates rendered with the service dir,
+  and a dead-target check runs before any restart. The installer keeps the
+  baton login map on re-install and requires an explicit `--group` (closes
+  #3312 via PR #3314). The backup writes `.last-success.json`; `/health`
+  reports backup age and an `OnFailure` alarm fires, after the nightly backup
+  failed for 12 days unnoticed (closes #3276 via PR #3277).
+
+- **The forum service reads GitHub under a dedicated read-only token (part of
+  #3283).** The baton gate calls `gh` with an explicit minimal env
+  (`GH_TOKEN`, an empty service-owned `GH_CONFIG_DIR`, `PATH`) and returns
+  unknown when the token is missing (PR #3507). The board's PR-state read runs
+  under the same identity (PR #3512, part of #3509). Under a fine-grained
+  token, CI is read through workflow runs (PR #3538, addresses #3533) and
+  approvals through REST reviews plus `gh pr view` instead of GraphQL
+  `commit{oid}` (PR #3547, addresses #3541). A test enumerates every process
+  spawn on the forum service surface and fails on any that is not allow-listed
+  or lacks the identity kwargs (closes #3518 via PR #3520).
+
+- **Request hardening on the non-baton routes.** A lone surrogate or other
+  non-UTF-8-encodable string is a 422 naming the field, not a 500 (closes
+  #3294 via PR #3317, extended to the other routes by PR #3431, closes
+  #3318). A non-string value in a JSON field is a 422 (closes #3436 via PR
+  #3437). An integer outside SQLite's signed 64-bit range is a 422 before any
+  read or write (closes #3438 via PR #3439). `POST /api/projects` holds
+  `project_id` to the CLI's rule and guards the store path, so `../../escape`
+  can no longer create a file outside the store (closes #3286 via PR #3288).
+
+- **Forum monitors name what failed.** The unreachable and cannot-seed lines
+  carry curl's exit code and `time_total` (closes #3441 via PR #3442) and the
+  phase curl timed out in (closes #3443 via PR #3463). The elapsed time no
+  longer reads `?s` under a comma-decimal locale on bash 3.2 (closes #3469
+  via PR #3475).
+
+- **The forum's fairy-phase 409 names the way out (#3916, closes #3914).** A
+  PR baton created with `baton init ... --turn <colleague>` stays in phase
+  `fairy`, because only a flip to the colleague writes the fairy-to-peer
+  transition. A later flip to the merge seat, or `baton advance`, then got a
+  409 that was correct but did not say how to reach `peer`. For a baton in
+  phase `fairy` that has a colleague, the one 409 branch in `_advance_gate`
+  now appends a hint naming the baton id and the colleague: flip it to its
+  colleague first, which writes the fairy-to-peer transition, then advance. A
+  `fairy` baton with no colleague, and every other phase that reaches the
+  branch, keep exactly today's text. The status stays 409 and the phase
+  machine is untouched.
+
+### Baton and coordination
+
+- **A strict, server-authoritative gate for `phase: peer` to `phase: merge`
+  (PR #3284, part of #3039).** `baton advance <PR>` passes only when GitHub
+  shows an `APPROVED` review on the exact current head by a login mapped to
+  the baton's colleague; the server derives phases and the same check applies
+  to the old flip spelling. The PR also closes four bypasses found after the
+  first build. `POST /colleague` is refused (422) on a PR baton at phase
+  `merge` (closes #3296 via PR #3298).
+
+- **Closing a baton is gated on the server.** `/status` close and reopen need
+  a participant (403) and refuse overwriting a terminal status with 409, the
+  10-03 `merged -> cancelled` incident (PR #3415, part of #3313). `/gc` and
+  `/merge` derive PR state server-side for repo-qualified anchors, and the
+  client's `new_status` no longer decides (closes #3416 and #3478 via PR
+  #3471). `/merge` on an unanchored baton needs a participant (closes #3477
+  via PR #3486). `merge()` refuses an already-closed baton (closes #3488 via
+  PR #3492), and the CLI prints the right hint for that 409 (closes #3494 via
+  PR #3505).
+
+- **Anchors fail closed.** `baton init` derives the PR anchor from prefixed
+  and slugged ids such as `UMWELT-PR-959` (closes #2916 via PR #3363), refuses
+  a PR-shaped id that resolves no anchor (closes #3364 via PR #3365), and
+  `POST /api/projects` does the same server-side with no bypass (closes #3366
+  via PR #3374) and refuses a present `github` that does not parse, for every
+  id (closes #3377 via PR #3384). Both refusals read the accepted-forms text
+  from one constant (closes #3390 via PR #3392), pinned by a test (closes
+  #3394 via PR #3404). A project anchor carries its GitHub owner,
+  `project/<owner>/<N>`, so the prompt hook no longer hardcodes one (PR #3595,
+  part of #3568). No default repo is assumed for a bare `pr/<N>` in the
+  prompt hook's auto-archive or the board (closes #1919 and #1650 via PR
+  #3510).
+
+- **`baton init` and writes.** `init` refuses a case-variant of an existing
+  id and names both spellings (closes #3432 via PR #3433). Every
+  `projects.py` write body reads, decides and writes under the allocator
+  lock, ending lost updates (closes #3255 via PR #3434). The frontmatter
+  field separator can no longer cross a newline, in all five copies of the
+  parser: `turn_by: ` followed by `participants: [borges]` used to swallow
+  the next field (closes #1813 via PR #3264).
+
+- **`baton init` refuses a PR baton whose PR does not exist or is not the
+  participants' (closes #3638 via PR #3657).** A mistyped `PR-3637` had
+  blocked another agent's PR from its canonical id.
+
+- **After a cross-agent `baton flip` or `advance`, the CLI says the hand-off
+  is a crossing when `comms_surface` is not `forum` (#3846, closes #3843, part
+  of #3039).** After a successful flip or advance that moves the turn to an
+  agent other than the caller, if the caller's `$ENGRAM_HOME/config.json` has
+  a `comms_surface` other than `forum`, the CLI prints one bounded line to
+  stderr saying the turn moved, that under that surface a baton carries
+  whose-turn only, and that the hand-off is an addressed crossing
+  (`send_crossing` or `wake`) to the new holder, whose seat may be down.
+  Stdout and the exit status are exactly as before. The hint (`_handoff_hint`)
+  never raises and is capped at 300 characters. There is no hint for a `forum`
+  surface (key absent, null, empty, not a string), a flip to the caller itself
+  or to the pool sentinel, an `advance` that did nothing, a failed write, or
+  `release` and `close`.
+
+- **The baton login map's `repos` prefix gate is pinned on a non-PR prefix,
+  with an admin checklist (#3902, part of #3884).** A flip or advance on a
+  baton such as `STUDIO-PR-34` was refused with 422 because the forum's baton
+  login map had no row for that prefix. That table is admin config on the
+  forum host, read from a root-owned file, so a PR cannot add the rows; this
+  change pins and documents the behaviour. Measured before writing the cells:
+  `advance` and a flip to the merge seat are refused with the `'repos' table`
+  message when the row is absent and succeed when present; a flip to a
+  non-merge seat and `close` succeed either way; and `merge` succeeds either
+  way, because that route never reads the table (whether it should bind is
+  tracked as #3901). `docs/baton-protocol.md` gains an admin checklist next to
+  the `repos` section. Tests and docs only; no server code changes.
+
+### Dream, sleep, skills and tools
+
+- **Sleep.** The warm-briefing erase is offset-based with a byte-identity
+  post-condition (closes #3141 via PR #3414), written in place so the inode,
+  ACL and xattrs survive, with a read-back that restores on mismatch (closes
+  #3419 via PR #3422). Sleep-end triage gives every dream finding addressed
+  to the awake seat a written disposition (do, file, defer), after one
+  question sat in all 36 dream records since 2026-08-26 (closes #3403 via PR
+  #3405). The `## From this session` anchor must survive every warm-briefing
+  write: stated once in nap Step 5 (closes #3266 via PR #3269) and asserted at
+  first-session Step 6 (closes #3274 via PR #3358).
+
+- **Ask-list and task sweeps resolve refs by `owner/repo`, never the cwd
+  checkout.** Same bug in three places: `engram-sleep` Step 4 (closes #3188
+  via PR #3275), the dream master's step 8a (closes #3418 via PR #3426), and
+  the dream-fairy's Category 8 (closes #3427 via PR #3429). A bare `#N` is
+  never prune-eligible.
+
+- **Dream spec fixes.** `engram-dream-master.md` shipped 22 occurrences of
+  an unsubstituted `{{USER_NAME}}`; it now reads `<primary_user>` (closes
+  #3121 via PR #3417). The person-node fairy spec gains a known-awaiting-ruling
+  ledger and P5 measures a rate instead of a top-10 sample (closes #3445 and
+  #3447 via PR #3465); PR #3489 pins the "re-keyed entry is not gone"
+  carry-over.
+
+- **Tools.** `check_stubbed_signatures.py` gives its NARROW lane the
+  noise-fallback the WIDE lane has; two bare names had selected about 255 of
+  280 test files (closes #3334 via PR #3468).
+
+- **Agent-decided compaction at the nap boundary, default off (#3700, part of
+  #3640).** A Python request half (`compact-request.py`) and a skill half
+  joined by files under `$ENGRAM_HOME/compact/`.
+
+- **Loop re-arm preserves the pending deadline (closes #3005 via PR #3724).**
+  A Monitor expiry notice used to replace the pending wake at full cadence, so
+  the declared heartbeat never came due.
+
+- **The `engram-pr-reviewer` spec reads back every comment it posts (#3852,
+  closes #3851).** A reviewer round once posted a week-old review of a
+  different PR under a "round 2" heading: it wrote its body to a fixed-name
+  file that already held the old review, its own write never landed, and its
+  report to the parent described the right PR, so nothing signalled the wrong
+  post. The spec now has the signature line name its PR (`PR #<N>`), has body
+  files come from `mktemp`, and reads back every posted comment, printing
+  `READ-BACK OK: comment <id> on PR #<N>: <first line>` or `READ-BACK
+  MISMATCH` for a wrong PR, a wrong first line, a truncated body with no `##
+  Verdict` section, or a failed fetch.
+  `tests/test_pr_reviewer_readback_3851.py` extracts the snippets from the
+  spec file itself and runs them with bash against fixtures, so a renamed
+  heading fails the test instead of passing it vacuously. A seat loads agent
+  specs from its plugin cache snapshot, so this reaches a seat only after
+  `/plugin marketplace update` and `/reload-plugins`.
+
+- **The reviewer's post is gated on its first line, and the brief's expected
+  line wins (#3858, part of #3853).** The pre-post check and the read-back are
+  now one gated block, with `gh pr comment` inside the gate. When the body
+  file's first line does not match the expected one, or the fresh body file is
+  empty, the block prints `NOT POSTED`, naming both lines, and the comment is
+  never posted. When the dispatch brief gives the exact first line, the
+  reviewer copies it verbatim and never takes it from the file or from the
+  posted comment. Only body files are allowed, since an inline body cannot be
+  checked before it is posted, and a substitute for the block in a sandbox
+  must keep the gate a gate. Known limit: #3853 stays open for the owed live
+  check, one real reviewer dispatch from the installed spec that prints
+  `READ-BACK OK`.
+
+- **The `engram-meta-loop` scratch-log date step is portable (#3892, closes
+  #3889).** The step used `sed -i` with no backup suffix, which is GNU-only;
+  on macOS (BSD `sed`) it failed with "invalid command code". It now writes to
+  a temp file beside the log and `mv`s it over, and uses `date +%F`. A new
+  scan in `tests/test_prose_home_sweep_3863.py` fails on any GNU-only in-place
+  `sed` (`sed -i` or `--in-place` without an attached suffix, and `-i ''`) in
+  a fenced block of the shipped skills, agents and templates, and a test runs
+  the skill's block as printed with BSD-style `sed` and `date` stand-ins, in
+  the default home and in a home with a space. Side effect: `mktemp` creates
+  the file with mode 0600, so the scratch log is now private to its owner
+  after the step. Known limit: the BSD behaviour is simulated by stand-ins; a
+  Mac seat then ran the test file on macOS 27.0.1 (BSD `sed`, `date`,
+  `mktemp`) with 176 passed and 4 skipped, and the two cells that failed on
+  bare `dev` passed.
+
+- **`tools/weakest_load_bearing.py`: a read-only ranking of weak load-bearing
+  beliefs (#3927, closes #3921, part of #3919).** Load-bearing means a
+  current, claim-bearing, non-retracted node with dependents; load is the
+  number of distinct transitive dependents over current nodes (a diamond
+  counts each dependent once). Weakness is 1 minus confidence, and is 1.0 when
+  the node is contested (in an active or partially resolved contradiction),
+  stale (it has a `pending` cascade marker), or has a NULL confidence, which
+  the output says. Score is load times weakness, ties broken by id. Axioms,
+  lessons and cornerstones are excluded by type. The output is the top N, each
+  with a one-line claim, confidence, load, weakness and its reason, turns
+  since last recall (the store has no per-node recall timestamp, so never
+  days) and the cheapest falsifier its own evidence suggests. It is not the
+  `stale_load_bearing` preset, which ranks importance times low recall over
+  nodes in general. It reads only through the owner (`open_reader` /
+  `snapshot`, behind `weakest_load_bearing_reads_via_owner`, seven registered
+  read templates, no new `sqlite3.connect(`), and with the flag ON and the
+  owner down, refusing or malformed it exits non-zero with a typed error,
+  never an empty answer. On a copy of one seat's graph of about 3,500 nodes,
+  the flag-ON run through a real owner gave byte-identical JSON to the
+  flag-OFF run, and with the owner stopped it exited 1 with empty stdout.
+
+- **The compaction mod is on by default once installed (#3923, part of #3640).**
+  Lei ruled on 2026-10-18, after a one-day trial on one seat: 3 compactions
+  requested at nap boundaries, 3 fired 41 to 49 seconds later, none anywhere
+  else. `userConfig.enabled` in `tools/mods/engram-compaction` now defaults to
+  true; `enabled: false` still registers nothing. The mod remains a separate
+  user-installed plugin (convenience tier), so nothing changes for a seat that
+  has not installed it.
+
+### ENGRAM home resolution (`ENGRAM_HOME`)
+
+- **A CI gate keeps new hard-coded ENGRAM home paths out of shipped files
+  (#3870, #3896, #3904 and #3906, all part of #3863).** Lei's ruling: the
+  deployment uses `ENGRAM_HOME` wherever possible, because the install allows
+  a custom folder. `tools/home_path_gate.py` (stdlib only, a blocking
+  `pr-checks` step, tiered `dev`) is a ratchet:
+  `tools/home_path_baseline.json` lists today's violators and may only shrink.
+  #3870 started it at file level with 15 named spellings of the default home
+  (`Path.home() / ".engram"`, `os.path.expanduser("~/.engram")`, `~/.engram`
+  in strings and prose, `$HOME/.engram`, an absolute `/home/<user>/.engram`,
+  and others). #3896 made it line-level: a line with a spelling is clean only
+  if the same physical line contains `ENGRAM_HOME` or calls the shared
+  resolver, or the file is allowlisted by class (`resolver`, `foreign-home`,
+  `self-contained-no-lib`); the baseline is a count per file and the ratchet
+  is exact in both directions, so a stale or padded count is red. #3904
+  widened the scan to `src/build/` (10 lines in 2 files entered), and #3906
+  exempts the plugin venv by name, because it lives at `~/.engram/venv`
+  regardless of `ENGRAM_HOME`, by design. Known limits: for the one step from
+  the file-level to the line-level baseline, the growth check against the old
+  base was skipped (the exactness rule bounds padding there, not new
+  violations; that PR's `src/` diff added none), and `src/forum` is not
+  scanned.
+
+- **The health-exam, upgrade and sleep skills and the walguard remedy take the
+  home from `ENGRAM_HOME` (#3874 and #3875, both part of #3863).** In those
+  three skills every `~/.engram`, `$HOME/.engram` and `${HOME}/.engram` in a
+  fenced block or inline code span is now `${ENGRAM_HOME:-$HOME/.engram}`, and
+  the remedy text in `engram_walguard.py` names the pidfile and db the same
+  way. #3875 passes the path to Python snippets as `sys.argv[1]`: splicing it
+  into a Python literal broke on a quote in the path (measured: two
+  `SyntaxError`s and one `agent=$(...)` that returned empty with rc 0; the
+  default `$HOME` hits it too, for a home like `/Users/O'Brien`). The
+  line-level test `tests/test_skill_home_paths_3863.py` now accepts only the
+  canonical expression, and a runtime pin runs the 7 home-touching snippets
+  under a home containing a quote and a space. Known limit: the test does not
+  see indented code blocks, link targets or unbackticked prose.
+
+- **Ten tools resolve the home through the one shared resolver (#3883, part of
+  #3863).** `backup_claude_projects.py`, `backup_session_logs.py`,
+  `compute_task_time.py`, `dream_lottery.py`, `migrate_person_nodes.py`,
+  `migrate_prediction_pairing_edges.py`, `migrate_stranded_supported_by.py`,
+  `monitor-supervisor.py`, `tripwire.py` and `loop_prompt.py` now use
+  `tools/_owner_read.engram_home()`, with no second copy and no inline
+  fallback. With `ENGRAM_HOME` unset or empty every default is the old path;
+  set, every default follows it, and an explicit flag or env override (`--db`,
+  `--marker`, `ENGRAM_CONFIG_PATH`) keeps priority. `loop_prompt.py` changes
+  shape: `DEFAULT_MARKER_PATH` is replaced by `default_marker_path()`,
+  resolved only on `--rearm-delay`, so hooks that import the module cannot
+  fail on it. Three tools (`config_schema.py`, `enumerate_armed_monitors.py`,
+  `fairy_report.py`) change prose only. Known limit: a supervisor started from
+  a tree that lacks `tools/_owner_read.py` now fails loudly; the
+  deployed-layout claim rests on a fixture, not a live deploy.
+
+- **A per-seat ENGRAM home registry for viz discovery and the ACL tool (#3885,
+  part of #3863).** A seat whose home is not `<login home>/.engram` records it
+  in `<login home>/.engram-home.json` (`{"schema":1,"engram_home":"<abs>"}`,
+  mode 0644, written atomically); its own SessionStart hook writes it, prints
+  nothing and never raises. Viz `discover_agents` and the viz-operator ACL
+  tool read the registry first and keep the `/home/*` glob as the fallback. A
+  reader trusts an entry only if it is a single-link regular file of at most
+  4096 bytes with schema 1, an absolute path with no `..` naming a directory,
+  and an owner uid equal to both the login home's uid and the named
+  directory's uid; anything else is ignored. In the same change
+  `plan_for_seat` in the ACL tool refuses a `health-snapshots` symlink and a
+  directory whose uid differs from the seat home's, on the registered and the
+  default path alike (the symlink-follow already existed on the default path).
+  Known limit: the guard covers the static child target; it does not make a
+  root `setfacl` run path-race-safe, since the directory or an ancestor can
+  change between plan and apply.
+
+- **The monitors and shell scripts resolve the home from `ENGRAM_HOME`
+  (#3887, part of #3863).** `tools/forum-mention-monitor.sh`,
+  `tools/forum-updates-monitor.sh`, `tools/ghpr.sh` and
+  `tools/run-all-tests.sh` use the quoted `${ENGRAM_HOME:-$HOME/.engram}`.
+  Both monitors read `config.json` from there and pass the path to their
+  Python snippets as `sys.argv[1]`. With `ENGRAM_HOME` unset behaviour is
+  unchanged. The MCP launcher `launch-engram-server.sh` is deliberately not
+  in this list: the PR changed it too, but #3903 put it back to
+  `$HOME/.engram/venv` (the venv stays there whatever `ENGRAM_HOME` says), so
+  in this release it does not follow `ENGRAM_HOME`. Five core files
+  (`engram_lifecycle.py`, `engram_tasks.py`, `health/engine.py`,
+  `context_tracker_hook.py`, `viz/server.py`) change docstrings and comments
+  only. Known limits: the default in `viz/server.py` is still hard-coded, as
+  its docstring now says; and `tools/ghpr.sh` and `tools/run-all-tests.sh`
+  isolate a test run only with `HOME=...`, so a user who has `ENGRAM_HOME`
+  set would still point those tests at the live home.
+
+- **Skills, agent specs, templates, viz html and the README name `ENGRAM_HOME`
+  wherever they spell the default home (#3888, part of #3863).** Agents run
+  skill and template prose as commands, so a gate cannot tell an instruction
+  from a description. A fenced command now uses the canonical
+  `${ENGRAM_HOME:-$HOME/.engram}`, and a descriptive line carries
+  `$ENGRAM_HOME` (default `~/.engram`) on the same line. The sweep covers 13
+  skills, nine other files (two agent specs, `compact-instructions`, the
+  model-identity-gate component, templates and viz html pages), and the
+  `engram-pkg` README, plus the one-line twin `template.CLAUDE.md`, which a test pins
+  byte-identical to the model-identity-gate component. A new test,
+  `tests/test_prose_home_sweep_3863.py`, was written before the sweep. Open
+  question left in the PR: whether fairy-read paths should instead carry a
+  `<ENGRAM_HOME>` placeholder that the parent resolves, rather than the
+  `${...}` expression.
+
+- **One parity-pinned `engram_home()` per layer, and a relative `ENGRAM_HOME`
+  is refused (#3903, part of #3863).** The code lines that reach the store now
+  follow `ENGRAM_HOME`. Four self-contained copies of `engram_home()` (tools
+  `_owner_read.py`, hooks `_hooklib.py`, prompt hooks `_prompthooklib.py`,
+  shared-bin `forum_api.py`) are AST-identical to the canonical one, pinned by
+  `tests/test_engram_home_parity_3863.py`; the body is absolute, and an empty
+  `ENGRAM_HOME` counts as unset. A relative value is refused, because it
+  resolves against each process's cwd and a hook, the owner and the MCP server
+  would silently land in different homes. The resolver raises `ValueError`
+  naming the value; every shipped Python hook exits 0, writes nothing and
+  prints one stderr line (fail open); tools that resolve the home at import
+  exit non-zero; and the probe mod stays off. `route_probe_dir()` is now
+  `engram_home() / "probe" / "mods-recall"`. The venv stays at
+  `~/.engram/venv`. Known limit: the shell launchers that start long-lived
+  processes refuse a relative value only in a later PR of the series, not
+  here.
+
+### Upgrade, release, monitors and docs
+
+- **`check-claude-md-drift.py --live FILE` (closes #3604 via PR #3605; fixes
+  #3608 and #3609 via PR #3612).** Checks that every unit of the rendered
+  `template.CLAUDE.md` is present in a seat's live `~/.claude/CLAUDE.md`: one
+  direction, missing units only, exit 2 on any error. It exists because a
+  rebuild that skips a hunk makes every later base-to-head range look clean.
+  The follow-up accepts `~` or the absolute home, whichever the flag used (15
+  false hits on one seat), adds a `--seed-id` override, and names a missing id.
+
+- **Installer and release docs.** The hook-registration banner says
+  `/reload-plugins` first (closes #3268 via PR #3271), and the docs replace
+  "a changed `hooks.json` needs a full restart" with the measured rule (closes
+  #3265 via PR #3267). `docs/RELEASING.md` gains the website Versions entry and
+  the announcement email as release steps, and `release-cutover --push` prints
+  the two remaining public steps (PR #3290); the newsletter postal address is
+  described as set, with the delivered footer as the check (closes #3319 via
+  PR #3320). The tool capability index was regenerated after PR #3278 (closes
+  #3287 via PR #3289).
+
+- **Monitors.** Linux seats run one supervised Monitor through
+  `monitor-supervisor.py` with a read-only `--check` (closes #3311 via PR
+  #3316); Mac seats join it, `--check` gets a ps/lsof backend (closes #3330
+  via PR #3338). The boot charges treat `--check` exit 2 as ambiguous when
+  the deployed supervisor predates the flag (closes #3356 via PR #3357).
+
+- **Project docs.** `CLAUDE.md` goes from 118,448 to 71,948 bytes by moving
+  dated measurement histories into `docs/`, with a budget gate (PR #3323, part
+  of #3322). The which-colleague section is re-rendered from team-practice
+  (PR #3315), merge-ready reads `phase = merge` with `turn` kept as the cursor
+  (PR #3295, part of #3039), and the merge-seat test rules are written down
+  and then tightened (closes #3479 via PR #3496, closes #3500 via PR #3501).
+
+- **`compact-request.py --clear` exit 4 and every-run removal are documented
+  and pinned (closes #3719 via PR #3728, part of #3640).** Docstring only, no
+  behaviour change; four P11 cells pin the contract.
+
+- **The U9 real-store gate result is recorded in the migration ledger (#3762,
+  part of #3761).** Docs only: the cell failed at 1.092x on an 11,270-node
+  store copy, localized to the checkpoint read that #3763 then fixed.
+
+- **`release-cutover.py` gains `--scan-leaks PATH` and warns loudly when the
+  name roster did not run (#3723, part of umwelt#1034).**
+
+- **Cross-release hook-availability CI gate (closes #3253 via PR #3688).**
+  Fails when a script a prior release registered is absent from the rebuilt
+  plugin, since sessions hold their start-time registrations.
+
+- **`docs/CHANGELOG.md` `[Unreleased]` written from every dev merge since the
+  v0.5.2 base (#3616).** 189 PRs grouped by theme.
+
+- **gh-stack: a retarget without auto-rebase is recorded in `docs/GH-STACK.md`
+  (#3653).** A dated measurement.
+
+- **Migration ledger v1 for EngramManager (#3667, part of #2652).** Every
+  `sqlite3.connect` line into the store, its state, the measured delta and the
+  macOS bound.
+
+- **Mechanical completeness guard for the migration ledger (#3669, part of
+  #2652).** `tools/check_2652_ledger.py` compares per-file connect counts and
+  runs in pr-checks.
+
+- **The ledger guard also checks Section-1 tallies and function-plus-anchor
+  citations (closes #3704 via PR #3693, part of #2652).** Stale ledger, design
+  and brief lines are corrected.
+
+- **Design doc names A6's instrument axes: build, layout, store, host (#3679,
+  part of #2652).** The criterion is unchanged.
+
+- **As-built EngramManager brief, one page (#3687, part of #2652).**
+
+- **Darwin arm build notes for the owner permission layer (#3695, part of
+  #3666).** A delta to the security-slice design doc.
+
+- **The 2652 ledger states a template's `sites` as CI-verified provenance, not
+  permission (#3834, closes #3832, part of #2652).** Docs only. Ledger section
+  3 said a registered template's `sites` are "the `file:function` callers
+  allowed to use it", which was false: `sites` records the exact shipped call
+  sites that issue the statement, regenerated by `tools/engramd_read_scan.py`
+  and checked on every PR, and it decides which statements are registered,
+  never who may send one. At runtime admission is by template bytes alone, for
+  any process at the owner's uid; the only caller boundary is the socket's
+  same-uid peer-credential check. The `engramd_read_registry.py` module
+  docstring now states that caller-blind rule, and the surface-hook row
+  records the measured gate figures (see #3827).
+
+- **The 2652 security-slice design doc states what the cross-uid control now
+  runs, and what it cannot show (#3850, closes #3842, part of #2652).** Docs
+  only. Section 6 still said the cross-uid rejection test "has not been run".
+  It now names the CI cell `test_peer_uid_mismatch_is_rejected` (a real uid-0
+  peer after a same-uid control, seen to pass on `main` and to fail on a
+  scratch mutant branch) and its bound: uid 0 is also refused by a second
+  branch, so that cell alone cannot show the mismatch rule works. It names the
+  unit cells on both arms that hand the check a manufactured non-root foreign
+  credential (the Darwin cell runs on Mac seats only, since CI is all
+  `ubuntu-latest`), and a real-socket test on Linux where a non-root foreign
+  peer received a typed `peer_identity` refusal and nothing was served. Known
+  limit: the real-socket test on Darwin has not been run.
+
+### Viz
+
+- **A read-only Moments page (closes #3511 via PR #3513).** Shows the special
+  moments an agent keeps on its person nodes, grouped by person, newest first,
+  hidden when empty. It opens the graph `mode=ro` and never touches
+  `special_moment_cursor`, which recall rotates.
+
+### Tests and CI
+
+- **Nightly (closes #3539 via PR #3558).** Every nightly from 09-26 to 10-07
+  (9 runs) ran out of disk at the pip-cache save, and on 10-07 a 17547-passed
+  suite read RED (PR #3548). The runner had 4.7G free before the suite and
+  2.7G after; the fix drops the pip cache (`--no-cache-dir`) and passing
+  tests' tmp dirs, and installs torch from the CPU index, since 2993 of the
+  3115 MB downloaded was the CUDA stack (PR #3584).
+
+- **`pr-checks` gates.** Gates run independently, so one red step no longer
+  skips the rest (PR #3306, part of #3304). A `[part of #N]` PR whose body
+  would auto-close #N now fails (closes #3344 via PR #3347). The two
+  artifact-staleness guards run on dev PRs (PR #3302, part of #2340). Twelve
+  test files that ran in no CI job are wired or retired, two dead baton-gate
+  files (34 tests) among them (closes #3346 via PR #3372). The affected-tests
+  dispatch falls back to the default branch when `base_ref` is empty; it used
+  to be a vacuous green (closes #3410 via PR #3428). `test-id-set-check` says
+  when a backtick-wrapped `Removed-test:` line did not parse (closes #3244
+  via PR #3430). The name-leak test pattern is live (its `\b` compiled as a
+  backspace) and its handle roster is current (PR #3305, PR #3308).
+
+- **Mac portability (#3292, #3333).** Tests are gated by the missing
+  primitive, never by OS name (PR #3340); fixes for `setfacl`, POSIX-sh mocks,
+  real paths, the `AF_UNIX` 104-byte limit, forum deps and a fake-ssh pid race
+  are PR #3380, #3379, #3391, #3387, #3381, #3382, #3388 and #3383. The
+  `BlockingIOError` branch of `start-engram-daemon.sh` is exercised by
+  injection (PR #3411).
+
+- **Test isolation.** Suite-wide guards refuse mutating `launchctl` and
+  `systemctl` calls, after a test run registered a zombie launchd job that
+  respawned 27,605 times (PR #3522, PR #3540, part of #3519). A conftest
+  fixture restores `ENGRAM_HOME`, `ENGRAM_SESSION_ROLE` and
+  `ENGRAM_RUNTIME_DIR` per test (closes #3328 via PR #3331), and a forum
+  module is dropped only when it is a shadow (closes #3335 via PR #3337).
+
+- **Repairs and pins.** Dev red from a full-suite-only guard was repaired in
+  PR #3526 (closes #3525), #3528 (closes #3527), #3482 (part of #3481) and
+  #3483 (refs #3481). The cross-uid rejection control is a real test where `sudo -n`
+  works (closes #3197 via PR #3421, PR #3341's ship gate). Pins and contract
+  tests: PR #3480 (bash 3.2 locale behaviour, refs #3469), #3581 (host
+  paths, closes #3580), and the installer's "nothing written" cells in PR
+  #3594.
+
+- **Stage-accounting test retries are spaced about 10 s and report the judged
+  pairs (#3787, part of #3784).** Part (a) of the nightly miss in
+  `test_stages_account_for_the_end_to_end_call`.
+
+- **A timing marker, tracer guard and no-coverage timing step for the
+  stage-accounting cells (#3788, part of #3784).** The nightly's coverage run
+  inflated the measured ratio past its 10% bound.
+
+- **The setup lock's `0600` refusal is pinned (#3797, part of #3791).**
+  Swallowing a failed `os.fchmod` in `_acquire_db_setup_lock` kept every
+  contract cell green before.
+
+- **The setup-surface-daemon wrapper cells drive the real installer (closes
+  #3801 via PR #3802).** Four cells ran a hand-copied render, so a change to
+  the real script could not turn them red.
+
+- **The k14 owner-launcher cell binds its socket by relative path (closes
+  #3808 via PR #3809).** The absolute path hit the `AF_UNIX` length limit when
+  the pytest temp prefix was a few characters deeper.
+
+- **conftest releases memo caches that pinned replaced server copies (#3810,
+  part of #3807).** Pytest parent memory fell from 10.1 GB to 1.7 GB; whether
+  this ends the hosted-runner nightly deaths is not yet shown.
+
+- **conftest pre-imports `tracemalloc` (#3811, part of #3784).** A
+  `sys.modules` clear no longer breaks pytest's thread-exception report, so
+  the next recurrence of item (b) is readable.
+
+- **Window-operator and bool `current_turn` mutants are pinned (#3764,
+  follow-up to #3759, part of #3741).** Two mutants survived the earlier
+  cells.
+
+- **GNU-`stat` test cells are gated on the primitive, not the platform (closes
+  #3614 via PR #3619; the last cell in PR #3629).**
+
+- **The W3 config-write positive control is deterministic (closes #3634 via PR
+  #3635).** The race-based control failed 6 of 6 on one Mac account.
+
+- **The row-9 dev-silence control decides by behaviour (#3650, part of
+  #3521).** It failed on dev once the fix merged.
+
+- **`test_c2` compares against the merge-base only when there is an old
+  version (#3660, part of #3521).**
+
+- **The K15 long-home owner cells skip on `ENAMETOOLONG`, with a helper-level
+  bound cell (#3682).** They failed on a Mac.
+
+- **The U5 K10 pin reads a frozen fixture, not a git SHA the squash merge
+  dropped (closes #3684 via PR #3685).** It had turned the nightly red.
+
+- **U7 stage accounting is judged on the best of up to 3 profiles (closes
+  #3721 via PR #3722).**
+
+- **The service-manager guard is keyed on the class, not two tool names
+  (#3837, part of #3519).** The suite-wide guard stated its invariant as "no
+  test may mutate the real service manager" but shimmed only `launchctl` and
+  `systemctl`; `systemd-run --user` from a test created real transient units
+  (12 leaked over four suite runs, two of them looping) with no refusal. Two
+  more shims, with the same refusal message: `systemd-run` refuses everything
+  except exactly one argument that is `--version`, `--help` or `-h`, and
+  `loginctl` passes the read-only verbs through and refuses the rest, failing
+  closed on unknown dash options. `SERVICE_MANAGER_TOOL_CANDIDATES` in
+  `conftest.py` lists nine tools, and a scan cell goes red when a candidate is
+  invoked anywhere under `src/`, `tests/`, `tools/` or `deploy/` without a shim, so the
+  next mutator shows up as a red test instead of a leaked unit. Known limits:
+  a real tool called by absolute path, unit files written under
+  `~/.config/systemd/user/`, and D-Bus calls from Python bindings are not
+  covered.
+
+- **The fake owner answers a sqlite failure as `read_failed` and never dies in
+  its handler thread (#3841, closes #3833, part of #2652).** Test-only. A
+  sqlite failure while serving a read (a garbled store, a missing table or
+  file) killed the fake's handler thread, so the fake closed the connection
+  where the real owner answers a typed `read_failed`, and every such run
+  emitted a `PytestUnhandledThreadExceptionWarning`. On unmodified `dev` the
+  U10 `test_c6_...[fake-owner]` cells emitted 3 warnings; on the fix, 0.
+  `read`, `df` and `chain` now answer any `sqlite3.Error` as the real owner's
+  `read_failed` (with the real remedy string, pinned equal to production), and
+  a malformed request is dropped without a thread exception, as the real owner
+  drops one.
+
+- **The school-day L4 marker cell runs the printed line instead of regexing
+  the skill (#3894, closes #3893).**
+  `test_L4_school_day_loop_prompt_field_leads_with_loop_wake_and_ends_with_empty_marker`
+  went red on `dev` after the prose sweep put a double quote inside the
+  skill's `printf`, which ended the test's regex match early; it escaped CI
+  because dev PRs run `pr-checks` and the full suite runs at release cuts. The
+  cell now extracts the skill's own marker-writing line, runs it under a temp
+  `HOME` in the default home and in a home with a space, and parses the file
+  it writes with `json.load`. A small shared helper,
+  `tests/_skill_block_runner.py`, extracts and runs fenced blocks. The skill
+  is not touched.
+
+- **The one-time sweep scope guards are retired, then made to retire by
+  content, not by history shape (#3910, part of #3863; #3926, closes #3925).**
+  Three guards in `tests/test_prose_home_sweep_3863.py` kept two sibling PRs
+  off each other's files and then blocked every later PR that edited a swept
+  file; #3910 skips them once the sweep is on `dev`. The v0.5.3-rc2 release
+  PR's first full-suite run then went red on three of the sweep's snapshot
+  checks (3 failed, 27265 passed, 425 skipped). The likely cause, not an
+  established one: they decided to retire by counting commits (`git rev-list
+  --count BASE..HEAD -- <file>`), which is a well-formed wrong number on a
+  partial history, and #3910's check keyed on an `origin/dev` ref that a
+  merge-ref checkout lacks. The PR did not reconstruct CI's exact checkout, and
+  why CI's history was partial is not established. The snapshot guards now
+  run only if the base and the sweep commit are both available and the file at
+  HEAD equals the file at the sweep commit; anything else skips, decided by
+  one pure function, `retire_reason`. The three frozen-fact scope guards are
+  retired permanently. Known limit: retiring a guard is a coverage loss that
+  stays green; after this nothing in the suite asserts that a later PR stays
+  inside the sweep's file set, and the PR's own diff is the only scope check.
+
 ## [v0.5.2] - 2026-09-25
 
 ### rc4 round — 2026-09-30 (fixes, the telemetry ingest, and inert EngramManager units)
@@ -34,6 +1620,17 @@ with an `-alpha` suffix during the alpha phase.
   it repaired can no longer occur. `tools/borges_session_eval.py` drops
   its `T2_antml_repair_rate` metric, whose only source logs this hook
   wrote (#3216, part of #3215).
+
+  > **Correction, 2026-10-01 (#3265; the tag's text above stays as cut).**
+  > The claim that `/reload-plugins` is not enough is measured false. On the
+  > rc4 upgrade, `/reload-plugins` (after `/plugin marketplace update
+  > engram-local`) reported 28 hooks, which is the new set (20 engram + 8
+  > umwelt; the old set would read 30), with no restart. Upgrade with the
+  > `/plugin marketplace update` → `/reload-plugins` → `/mcp` sequence; restart
+  > fully only if a registration demonstrably does not take effect. Measured
+  > once for a removal (#3265, this release) and once for an addition (#1892,
+  > Ariadne, 2026-08-03: 29 = 22 + 7, the new Stop hook fired, no restart); one
+  > seat each, two dates (harness versions not recorded).
 - **The telemetry verdict line is real for the first time.** Until now
   nothing called `engram_telemetry_store.ingest()`, so no seat had a
   `records.db`, and the telemetry line in `engram_diagnose` and the dream

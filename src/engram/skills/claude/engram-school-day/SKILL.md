@@ -33,7 +33,7 @@ Each cycle is exactly **7 iterations** in a fixed order:
 | 4 | **Research-breadth** | Third research pass. Can continue or start topic 3. |
 | 5 | **Consolidation** | Skim the cycle's fresh cohort for emergent derivations. Promote, resolve, contradict, supersede as patterns surface. Null result valid. See consolidation protocol below. |
 | 6 | **Review/Audit** | Run `engram_diagnose`. Check stale nodes, tainted chains, open conjectures. Review friction log. Systematic graph quality pass. |
-| 7 | **Debrief** | Compile cycle report. Write to `~/.engram/reports/school-day/`. See debrief protocol below. |
+| 7 | **Debrief** | Compile cycle report. Write to `~/.engram/reports/school-day/` (under `$ENGRAM_HOME`, default `~/.engram`). See debrief protocol below. |
 
 **Ratio:** 3 research : 1 consolidation : 1 audit : 1 aspiration : 1 debrief.
 This is the Phase 1 hypothesis. Phase 2 tunes it based on accumulated data.
@@ -44,12 +44,12 @@ This is the Phase 1 hypothesis. Phase 2 tunes it based on accumulated data.
 
 ## Staleness check (every wake-up)
 
-See `engram-loop` SKILL.md Step 0 — On entry / stale-loop detection. That's the SSoT for the on-every-wake check (`cat ~/.engram/loop-mode.json`, absent → stale re-fire → stop, present → live).
+See `engram-loop` SKILL.md Step 0 — On entry / stale-loop detection. That's the SSoT for the on-every-wake check (`cat "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json`, absent → stale re-fire → stop, present → live).
 
 **School-day's additional check** on top of the generic one: after confirming the marker is present, also verify it names this skill:
 
 ```bash
-cat ~/.engram/loop-mode.json | grep '"skill":"school-day"' && echo "OK live school-day" || echo "Wrong-loop marker — stop"
+cat "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json | grep '"skill":"school-day"' && echo "OK live school-day" || echo "Wrong-loop marker — stop"
 ```
 
 - Generic stale-check (engram-loop Step 0): file absent → "Stale loop detected — loop-mode.json absent, skipping" → stop
@@ -66,14 +66,14 @@ Both checks must pass before proceeding to the iteration body.
 This is engram-loop's Step 1 marker write (see engram-loop SKILL.md). School-day extends the generic schema with skill-identification + per-iteration state:
 
 ```bash
-echo '{"FIRST_ACTION":"THE RE-ARM NOW HAPPENS LAST, NOT FIRST — see engram-loop SKILL.md Step 2 item 3 (arm-last ritual). Do the actual iteration work first, using the state and instructions fields already in this marker. At the END of the turn — the FINAL action, after the work is done AND the state field is rewritten to reflect it: ScheduleWakeup at cadence_seconds, unconditionally (no CronList-before-arm check — replacement is unconditional, so a redundant arm is free, never stacks). For the prompt COPY THIS FILE'"'"'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word '"'"'stub'"'"' invites paraphrasing, so don'"'"'t. Then CronList again and confirm the armed prompt actually LEADS with the <loop-wake> marker — an ABSENT marker, or one that is present but not leading, makes the wake self-stamp as user activity and the loop defers perpetually. An escaped &lt;loop-wake&gt; is fine: the classifiers HTML-unescape before matching, so a mangled marker still classifies correctly; absence and position are what they cannot rescue.","activated":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","kind":"research","topic":"school-day Phase 1 curriculum","instructions":"7-iteration fixed rotation (aspiration, research ×3, consolidation, audit, debrief); baseline data collection","state":"Cycle 1, Iteration 1 — starting","cadence_seconds":1800,"pacer":"scheduleWakeup","loop_prompt":"<loop-wake> school-day continuation. Read ~/.engram/loop-mode.json for cycle and iteration, then continue the rotation. At the END of this iteration, after the work is done and the state field is rewritten: ScheduleWakeup at cadence_seconds with this same stub, then CronList to confirm it leads with <loop-wake> (see FIRST_ACTION / engram-loop Step 2 item 3).","skill":"school-day","cycle":1,"iteration":1}' > ~/.engram/loop-mode.json
+printf '%s\n' '{"FIRST_ACTION":"THE RE-ARM NOW HAPPENS LAST, NOT FIRST — see engram-loop SKILL.md Step 2 item 3 (arm-last ritual). Do the actual iteration work first, using the state and instructions fields already in this marker. At the END of the turn — the FINAL action, after the work is done AND the state field is rewritten to reflect it: ask the helper for this turn'"'"'s delay (\"'"${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}"'/tools/loop_prompt.py\" --rearm-delay --wake-kind heartbeat|other, see engram-loop SKILL.md Step 2 item 3c) and ScheduleWakeup at the integer it prints, unconditionally (no CronList-before-arm check — replacement is unconditional, so a redundant arm is free, never stacks). For the prompt COPY THIS FILE'"'"'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word '"'"'stub'"'"' invites paraphrasing, so don'"'"'t. Then CronList again and confirm the armed prompt actually LEADS with the <loop-wake> marker — an ABSENT marker, or one that is present but not leading, makes the wake self-stamp as user activity and the loop defers perpetually. An escaped &lt;loop-wake&gt; is fine: the classifiers HTML-unescape before matching, so a mangled marker still classifies correctly; absence and position are what they cannot rescue.","activated":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","kind":"research","topic":"school-day Phase 1 curriculum","instructions":"7-iteration fixed rotation (aspiration, research ×3, consolidation, audit, debrief); baseline data collection","state":"Cycle 1, Iteration 1 — starting","cadence_seconds":1800,"pacer":"scheduleWakeup","loop_prompt":"<loop-wake> school-day continuation. Read '"${ENGRAM_HOME:-$HOME/.engram}"'/loop-mode.json for cycle and iteration, then continue the rotation. At the END of this iteration, after the work is done and the state field is rewritten: ask the helper for this turn\u0027s delay (engram-loop Step 2 item 3c) and ScheduleWakeup at it with this same stub, then CronList to confirm it leads with <loop-wake> (see FIRST_ACTION / engram-loop Step 2 item 3).\n⟦ENGRAM⟧⟦/ENGRAM⟧","skill":"school-day","cycle":1,"iteration":1}' > "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json
 ```
 
 The base fields (`FIRST_ACTION`, `activated`, `kind`, `topic`, `instructions`, `state`, `cadence_seconds`, `pacer`, `loop_prompt`) match engram-loop's Step 1 contract; `skill`, `cycle`, `iteration` are school-day extras that the Step 0 stale-check (above) keys off of.
 
 `FIRST_ACTION` must stay **first** and verbatim — it is the arm-LAST guarantee (engram-loop Step 2 item 3, 2026-08-12 revision, #1973/#1987): the arm itself now happens at the END of the iteration, but this field is still kept first in the marker so its instruction is the first thing read on wake, before `state` pulls attention into the work. School-day's fixed 7-iteration rotation makes this *more* load-bearing, not less: a rotation that loses its wake mid-cycle strands the remaining iterations with no external trigger to resume them.
 
-`loop_prompt` is **required, not optional**, because `FIRST_ACTION` tells the reader to copy it verbatim — a marker without it silently forces the hand-typing that store-and-copy exists to eliminate.
+`loop_prompt` is **required, not optional**, because `FIRST_ACTION` tells the reader to copy it verbatim — a marker without it silently forces the hand-typing that store-and-copy exists to eliminate. The field's last line (the `\n` escape then `⟦ENGRAM⟧⟦/ENGRAM⟧`) is the empty ENGRAM marker (#3613): a loop-wake has no meaningful text to recall on, so the recall hooks skip it — copy it too. The write uses `printf '%s\n'`, not `echo`, because zsh's `echo` turns that `\n` escape into a raw newline and breaks the JSON.
 
 ### 2. Record session start health
 
@@ -83,7 +83,7 @@ engram_diagnose  # save health score as baseline
 
 ### 3. Initialize scratch log
 
-Write to `~/.engram/loop-scratch.md`:
+Write to `~/.engram/loop-scratch.md` (under `$ENGRAM_HOME`, default `~/.engram`):
 
 ```markdown
 # School Day — [date]
@@ -195,7 +195,7 @@ Append to scratch log:
 
 The debrief produces a lightweight report — {{USER_NAME}}'s growth-tracking artifact. One file per cycle.
 
-**Write to:** `~/.engram/reports/school-day/cycle_[N]_[YYYY-MM-DD]_[HHMMSS].md`
+**Write to:** `~/.engram/reports/school-day/cycle_[N]_[YYYY-MM-DD]_[HHMMSS].md` (under `$ENGRAM_HOME`, default `~/.engram`)
 
 **Template:**
 
@@ -262,8 +262,8 @@ Triggered by: 42 iterations reached, user return, step-back stop decision, or in
 - Include in session briefing
 
 ### 2. Final session briefing
-Generate using the template at `~/.engram/reports/SESSION_BRIEFING_TEMPLATE.md`.
-Write to `~/.engram/reports/briefing_[YYYY-MM-DD]_[HHMMSS].md`.
+Generate using the template at `~/.engram/reports/SESSION_BRIEFING_TEMPLATE.md` (under `$ENGRAM_HOME`, default `~/.engram`).
+Write to `~/.engram/reports/briefing_[YYYY-MM-DD]_[HHMMSS].md` (under `$ENGRAM_HOME`, default `~/.engram`).
 
 **Additional school-day-specific section at the end:**
 
@@ -290,8 +290,8 @@ Write to `~/.engram/reports/briefing_[YYYY-MM-DD]_[HHMMSS].md`.
 This is engram-loop's Step 3 loop END — never leave the marker behind (a stranded marker makes the next non-loop session falsely read as in-loop and can cause a post-compaction self to re-execute a dead loop — the stale-marker misfire failure mode).
 
 ```bash
-rm -f ~/.engram/loop-mode.json
-mv ~/.engram/loop-scratch.md ~/.engram/reports/scratch_$(date +%Y-%m-%d_%H%M%S).md 2>/dev/null || true
+rm -f "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json
+mv "${ENGRAM_HOME:-$HOME/.engram}"/loop-scratch.md "${ENGRAM_HOME:-$HOME/.engram}"/reports/scratch_$(date +%Y-%m-%d_%H%M%S).md 2>/dev/null || true
 ```
 
 ### 4. Checkpoint
@@ -305,8 +305,8 @@ engram_checkpoint(
 ### 5. Report to user
 
 Tell {{USER_NAME}}:
-- Cycle debrief reports: `~/.engram/reports/school-day/cycle_*.md`
-- Session briefing: `~/.engram/reports/briefing_[filename]`
+- Cycle debrief reports: `~/.engram/reports/school-day/cycle_*.md` (under `$ENGRAM_HOME`, default `~/.engram`)
+- Session briefing: `~/.engram/reports/briefing_[filename]` (under `$ENGRAM_HOME`, default `~/.engram`)
 - Key "Ask {{USER_NAME}}" items across all cycles
 
 ---

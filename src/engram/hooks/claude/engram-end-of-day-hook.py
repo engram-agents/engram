@@ -33,10 +33,16 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+# #3628: the sleep-marker read is non-blocking and regular-file-only. This
+# file's own directory is sys.path[0] when run as a script; insert it so test
+# loaders (spec_from_file_location) resolve the sibling lib the same way.
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+from _hooklib import open_regular_text
+from _hooklib import engram_home_or_exit
+
+ENGRAM_HOME = str(engram_home_or_exit())
 SLEEP_MARKER = os.path.join(ENGRAM_HOME, "sessions", "last-sleep-success.json")
 
 # Hours since last successful sleep below which the nudge is suppressed.
@@ -72,7 +78,7 @@ def sleep_recently() -> tuple[bool, str]:
     if not os.path.exists(SLEEP_MARKER):
         return False, ""
     try:
-        with open(SLEEP_MARKER) as f:
+        with open_regular_text(SLEEP_MARKER) as f:
             marker = json.load(f)
         completed_at_str = marker["completed_at"]
         completed_at = datetime.fromisoformat(

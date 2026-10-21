@@ -3,7 +3,7 @@
 
 A stdlib CLI in the ia.py/forum.py/baton.py family.  Archives evidence sources
 (forum threads, JSONL session spans) into a content-addressed flat-file store at
-~/.engram/evidence-archive/ and emits a JSON record designed to feed
+~/.engram/evidence-archive/ (under $ENGRAM_HOME) and emits a JSON record designed to feed
 engram_add_observation directly.
 
 Usage:
@@ -21,7 +21,7 @@ Sources (P2):
 
 Output (JSON to stdout, designed to feed engram_add_observation):
     {
-      "file_url":       "file:///home/<agent>/.engram/evidence-archive/ab/ab3f…d2.txt",
+      "file_url":       "file://<ENGRAM_HOME>/evidence-archive/ab/ab3f…d2.txt",
       "content_hash":   "ab3f…d2",
       "captured_at":    "2026-06-21T14:31:07Z",
       "git_sha":        null,               // always null in deferred mode (P1 only)
@@ -1305,7 +1305,7 @@ def _snapshot_forum(
 def _find_session_transcript(session_id: Optional[str]) -> Optional[str]:
     """Resolve the JSONL transcript path for a session.
 
-    Uses the per-session marker at ~/.engram/sessions/<session_id>.json
+    Uses the per-session marker at ~/.engram/sessions/<session_id>.json (under $ENGRAM_HOME)
     (written by the SessionStart hook).  When session_id is None or empty,
     searches for the most recently modified .json marker file.
 

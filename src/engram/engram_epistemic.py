@@ -37,6 +37,32 @@ _VALID_EXEMPLAR_TARGET_TYPES = frozenset({"lesson", "cornerstone"})
 # declared at mint.
 PREVENTION_TYPES = frozenset({"advisory", "shadow", "blocking"})
 
+# alpha#3270/#3112 — the PreToolUse tripwire hook's display-cap sort key was
+# `-len(situation_pattern)` alone (longer regex = shown first), a proxy for
+# specificity that is uncorrelated with how much the lesson's AUTHOR wants
+# it to win a scarce display slot. Measured twice independently: a 15-char
+# pattern guarding `git stash` (a destructive, cross-worktree footgun) lost
+# its slot to a 119-char broad "you are reading the ambient working tree"
+# reminder; a narrow `gh pr comment`-vs-review-state pattern lost to a
+# broad node-ID-scrub reminder that didn't even apply to the call. Kepler's
+# ruling (2026-10-01): an explicit, author-set field named by what it
+# measures rather than by severity — "high" means "the author would rather
+# be interrupted for this than for any broad reminder" — covers both
+# incidents without having to classify either one as "destructive." Default
+# "normal" so every pre-existing lesson (no tripwire_priority key in its
+# metadata at all) sorts exactly as before: high first, `-len(pattern)`
+# tiebreak unchanged within a tier, so an all-normal hit set reduces to
+# today's pure length order byte-for-byte. Mintable directly (unlike
+# "blocking", there is no earn-it-via-shadow-window gate here — the author
+# is asserting their own interruption preference, not a measured safety
+# claim), and settable via engram_update_lesson same as prevention_type.
+TRIPWIRE_PRIORITIES = frozenset({"high", "normal"})
+
+# alpha#3920 (part of #3911): which view of a tool call the lesson-tripwire hook runs a lesson's
+# situation_pattern against. "full" (the default when the field is absent) is the raw target; "command" hides heredoc
+# bodies and MCP prose-field values and is opt-in per lesson. Settable via engram_update_lesson.
+MATCH_SCOPES = frozenset({"command", "full"})
+
 
 def _looks_like_prose(pattern: str) -> bool:
     """Discriminate a command-shape regex from a dead-prose situation_pattern.
@@ -55,6 +81,49 @@ def _looks_like_prose(pattern: str) -> bool:
     one-function edit.
     """
     return pattern.count(" ") > 8
+
+
+_CMD_TOOL_WORDS = (
+    "git", "gh", "ia", "forum", "baton", "python", "python3", "pytest", "bash",
+    "sh", "npm", "uv", "pip", "curl", "make", "docker", "rm", "cd", "ls",
+    "grep", "sed", "tar", "ssh",
+)
+_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+_CMD_SPAN_RE = re.compile(
+    r"^(?:(?:" + "|".join(_CMD_TOOL_WORDS) + r")\s+\S"  # CLI word + an arg
+    r"|tools/\S"                                          # repo tool path
+    r"|engram_\w+)"                                       # named MCP tool call
+)
+_CMD_FLAG_RE = re.compile(r"(?:^|[\s`(])--[a-z][a-z0-9-]+")
+_CMD_SCRIPT_RE = re.compile(r"\b[\w-]+\.(?:py|sh)\b")
+
+
+def _is_command_shaped(claim: str) -> bool:
+    """Heuristic: is this lesson claim about running a specific command/tool?
+
+    Matches (any one is enough):
+      1. a backtick code span that starts with a known CLI word (git, gh, ia,
+         forum, baton, python, pytest, bash, ...) followed by whitespace and
+         at least one more token, a `tools/...` path, or an `engram_*` MCP
+         tool name. A lone CLI word in backticks (`ia`, `make`, `forum`) does
+         NOT match, deliberately: short words like these are often nouns;
+      2. a long flag (`--body-file`) anywhere, in or out of backticks;
+      3. a script filename (`foo.py`, `foo.sh`) anywhere.
+    Does NOT match prose that merely discusses a concept, a bare CLI word
+    outside backticks, or a code span that is not a command (a regex, an ID
+    format). Known limits: it is a shape guess, not a parse. It misses
+    commands written without backticks or flags, and a semantic claim that
+    happens to cite a script or flag as an example will be flagged. It is
+    deliberately conservative (prefers a miss to nagging a semantic lesson);
+    it only feeds an advisory, never a refusal. Non-string or empty input
+    returns False.
+    """
+    if not isinstance(claim, str) or not claim.strip():
+        return False
+    for m in _CODE_SPAN_RE.finditer(claim):
+        if _CMD_SPAN_RE.match(m.group(1).strip()):
+            return True
+    return bool(_CMD_FLAG_RE.search(claim) or _CMD_SCRIPT_RE.search(claim))
 
 
 def _validate_situation_pattern(pattern: str, bypass_prose_check: bool) -> tuple:
@@ -160,7 +229,7 @@ def _add_axiom_impl(
     Args:
         claim: The axiom statement (e.g. "Honesty is non-negotiable in graph construction").
         basis: Why this axiom is adopted — not a proof, but a justification.
-        context_ids: Optional comma-separated node IDs for context. Creates cites edges.
+        context_ids: Optional comma-separated node IDs for context. Creates about edges.
 
     Returns:
         JSON with the new axiom node ID and confidence (always 1.0).
@@ -189,10 +258,7 @@ def _add_axiom_impl(
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, cid, now)
                 except sqlite3.IntegrityError:
                     pass
 
@@ -202,7 +268,7 @@ def _add_axiom_impl(
         # _stamp_new_node writes the anchor in one pass instead of computing
         # an interim value from confidence/surprise and then overwriting it
         # [alpha#2266, alpha#2268].
-        core._stamp_new_node(conn, node_id, importance_base=2.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=2.0)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
@@ -243,13 +309,17 @@ def _add_axiom_impl(
                 ),
             })
 
-        return json.dumps({
+        _result = {
             "status": "created",
             "axiom_id": node_id,
             "claim": claim,
             "confidence": 1.0,
             "context_nodes": context,
-        })
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        return json.dumps(_result)
     finally:
         conn.close()
 
@@ -274,7 +344,7 @@ def _add_definition_impl(
     Args:
         term: The term being defined (e.g. "recession").
         definition: What the term means (e.g. "Two consecutive quarters of negative GDP growth").
-        context_ids: Optional comma-separated node IDs for context. Creates cites edges.
+        context_ids: Optional comma-separated node IDs for context. Creates about edges.
         recall_summary: Always provide when you can — ≤140-char recall scent (#1952 PR1).
             Omission clean-accepts as 0 chars; soft-accepted up to 279 chars
             (flagged needs_tightening); rejected at 280+ chars.
@@ -322,10 +392,7 @@ def _add_definition_impl(
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, cid, now)
                 except sqlite3.IntegrityError:
                     pass
 
@@ -335,7 +402,7 @@ def _add_definition_impl(
         # _stamp_new_node writes the anchor in one pass instead of computing
         # an interim value from confidence/surprise and then overwriting it
         # [alpha#2266, alpha#2268].
-        core._stamp_new_node(conn, node_id, importance_base=2.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=2.0)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
@@ -376,13 +443,20 @@ def _add_definition_impl(
                 ),
             })
 
-        return json.dumps({
+        _result = {
             "status": "created",
             "definition_id": node_id,
             "term": term,
             "definition": definition,
             "context_nodes": context,
-        })
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        _overrun = core._recall_summary_overrun_note(len(_recall_summary or ""))
+        if _overrun:  # #3537
+            _result["recall_summary_overrun"] = _overrun
+        return json.dumps(_result)
     finally:
         conn.close()
 
@@ -420,7 +494,7 @@ def _add_conjecture_impl(
         claim: The hypothesis (e.g. "Structured memory substitutes for model scale").
         basis: Why this conjecture is worth investigating.
         initial_confidence: Starting confidence, default 0.40, range [0.10, 0.60].
-        context_ids: Optional comma-separated node IDs for context. Creates cites edges.
+        context_ids: Optional comma-separated node IDs for context. Creates about edges.
         recall_summary: Always provide when you can — ≤140-char recall scent (#1952 PR1).
             Omission clean-accepts as 0 chars; soft-accepted up to 279 chars
             (flagged needs_tightening); rejected at 280+ chars.
@@ -479,14 +553,11 @@ def _add_conjecture_impl(
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, cid, now)
                 except sqlite3.IntegrityError:
                     pass
 
-        core._stamp_new_node(conn, node_id, confidence=conf, surprise=0.5)
+        _emb_outcome = core._stamp_new_node(conn, node_id, confidence=conf, surprise=0.5)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
@@ -499,13 +570,20 @@ def _add_conjecture_impl(
             return json.dumps(core.durability_failure_response(
                 _verdict, _durability, "conjecture_id", node_id, "#2097"))
 
-        return json.dumps({
+        _result = {
             "status": "created",
             "conjecture_id": node_id,
             "claim": claim,
             "confidence": conf,
             "context_nodes": context,
-        })
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        _overrun = core._recall_summary_overrun_note(len(_recall_summary or ""))
+        if _overrun:  # #3537
+            _result["recall_summary_overrun"] = _overrun
+        return json.dumps(_result)
     finally:
         conn.close()
 
@@ -569,7 +647,7 @@ def _scan_emergence_impl(
         self_id = None
         scope_person_id = None
         self_row = conn.execute(
-            "SELECT id FROM nodes WHERE type = 'person' AND json_extract(metadata, '$.is_self') = 1 AND is_current = 1"
+            "SELECT id FROM nodes WHERE type = 'person' AND json_extract(CASE WHEN json_valid(metadata) THEN metadata END, '$.is_self') = 1 AND is_current = 1"
         ).fetchone()
         if self_row:
             self_id = self_row["id"]
@@ -829,7 +907,7 @@ def _goal_tension_impl(
             (node_id, goal_id_b, now),
         )
 
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=1.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, confidence=0.5, surprise=1.0)
         conn.commit()
 
         # Durability dual read-back (alpha#2193; supersedes the single
@@ -868,7 +946,12 @@ def _goal_tension_impl(
                 ),
             })
 
-        return json.dumps({
+        try:
+            core._rebuild_principle_triggers()  # unified registry (#1698); tensions spec entry
+        except Exception:
+            pass  # best-effort
+
+        _result = {
             "status": "created",
             "tension_id": node_id,
             "goals": {
@@ -877,7 +960,11 @@ def _goal_tension_impl(
             },
             "description": description,
             "analysis": analysis or "Not analyzed yet",
-        })
+        }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            _result["embedding_failure"] = _emb_block  # R1: renamed key
+        return json.dumps(_result)
     finally:
         conn.close()
 
@@ -892,6 +979,7 @@ def _add_lesson_impl(
     situation_pattern: str = "",
     bypass_prose_check: bool = False,
     prevention_type: str = "advisory",
+    tripwire_priority: str = "normal",
     recall_summary: str = "",
     recall_keywords: list = None,
     generalized_by: str = "",
@@ -941,7 +1029,7 @@ def _add_lesson_impl(
         reasoning_type: The type of reasoning (default: inductive_generalization).
             Most lessons are inductive: multiple incidents → general pattern.
         context_ids: Optional comma-separated node IDs for context references
-            (e.g., definitions, related derivations). Creates cites edges.
+            (e.g., definitions, related derivations). Creates about edges.
         situation_pattern: Optional regex matched against the pending Bash
             command / MCP call at action-moment by the PreToolUse tripwire
             hook (see engram_add_lesson's docstring for the exact matched
@@ -957,6 +1045,15 @@ def _add_lesson_impl(
             No lesson may be minted directly as "blocking"; promotion is
             earned via engram_update_lesson after a measured
             zero-false-positive shadow window.
+        tripwire_priority: One of "normal" (default) or "high" (alpha#3270/
+            #3112). The PreToolUse tripwire hook's display cap ranks "high"
+            lessons before "normal" ones, then falls back to the existing
+            `-len(situation_pattern)` tiebreak within a tier — so a lesson
+            with no tripwire_priority set (every lesson minted before this
+            field existed) sorts exactly as before. "high" means the author
+            would rather be interrupted for this lesson than for any broad
+            reminder, not a measured safety claim — mintable directly, no
+            shadow-window gate (unlike prevention_type's "blocking").
         recall_summary: Always provide when you can — ≤140-char recall scent (#1952 PR1).
             Omission clean-accepts as 0 chars; soft-accepted up to 279 chars
             (flagged needs_tightening); rejected at 280+ chars.
@@ -996,6 +1093,11 @@ def _add_lesson_impl(
         return json.dumps({
             "error": f"Invalid prevention_type '{prevention_type}'.",
             "valid_types": sorted(PREVENTION_TYPES),
+        })
+    if tripwire_priority not in TRIPWIRE_PRIORITIES:
+        return json.dumps({
+            "error": f"Invalid tripwire_priority '{tripwire_priority}'.",
+            "valid_types": sorted(TRIPWIRE_PRIORITIES),
         })
     # #1944 — eligibility to block is earned, never declared at mint. A
     # fresh lesson has zero fires and therefore zero measured precision;
@@ -1143,6 +1245,7 @@ def _add_lesson_impl(
             "reasoning_class": rclass,
             "scaffolding_nudge": scaffolding_nudge,
             "prevention_type": prevention_type,
+            "tripwire_priority": tripwire_priority,
         }
         if situation_pattern:
             meta["situation_pattern"] = situation_pattern
@@ -1184,16 +1287,13 @@ def _add_lesson_impl(
                 (sid, node_id, now),
             )
 
-        # Create cites edges for context
+        # Create about edges for context (#2243: cites is observation->evidence only)
         ctx = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
         for cid in ctx:
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
                 try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
+                    core._insert_context_edge(conn, node_id, cid, now)
                 except sqlite3.IntegrityError:
                     pass
 
@@ -1227,7 +1327,7 @@ def _add_lesson_impl(
         # so _stamp_new_node writes the anchor in one pass instead of
         # computing an interim value from confidence/surprise and then
         # overwriting it [alpha#2266, alpha#2268].
-        core._stamp_new_node(conn, node_id, importance_base=2.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, importance_base=2.0)
         conn.commit()
 
         # Durability dual read-back (alpha#2193; supersedes the single
@@ -1277,12 +1377,27 @@ def _add_lesson_impl(
             "reasoning_class": rclass,
             "scaffolding_nudge": scaffolding_nudge,
             "prevention_type": prevention_type,
+            "tripwire_priority": tripwire_priority,
             "incident_nodes": ids,
             "context_nodes": ctx,
             "importance_anchored": True,
         }
         if generalizing_parents:
             result["generalized_by"] = generalizing_parents
+
+        # #3209 — advisory only: a command-shaped lesson minted with no
+        # situation_pattern has no action-moment arming. Never refuses.
+        if not situation_pattern and _is_command_shaped(claim):
+            result["unarmed_warning"] = (
+                "This lesson has no action-moment pattern "
+                "(situation_pattern), so it will surface through recall or "
+                "the incident-match tripwire, not at the action moment when "
+                "a matching command is about to run. Its "
+                "claim reads as command-shaped; add one with "
+                "engram_update_lesson if you want it to fire at the "
+                "action moment. That is fine to skip if the lesson is "
+                "meant to be recall-only."
+            )
 
         if similar_lessons:
             result["similar_existing_lessons"] = core._strip_similar_block(similar_lessons)
@@ -1292,7 +1407,20 @@ def _add_lesson_impl(
                 "More incidents = more matching surface area."
             )
 
-        return json.dumps(core._strip_agent_facing(result))
+        # #345 PR3 B4: _strip_agent_facing globally removes any key LITERALLY
+        # named "embedding" (it exists to drop a node's raw vector payload
+        # elsewhere in the codebase -- see _AGENT_STRIP_KEYS). R1 (round 2):
+        # the B4 block's key is now "embedding_failure", which never
+        # collides with that strip list, so the earlier strip-then-add
+        # ordering workaround is no longer needed -- order doesn't matter.
+        _stripped = core._strip_agent_facing(result)
+        _emb_block = core._embedding_response_block(_emb_outcome)
+        if _emb_block:
+            _stripped["embedding_failure"] = _emb_block
+        _overrun = core._recall_summary_overrun_note(len(_recall_summary or ""))
+        if _overrun:  # #3537
+            _stripped["recall_summary_overrun"] = _overrun
+        return json.dumps(_stripped)
     finally:
         conn.close()
 
@@ -1318,7 +1446,17 @@ def _add_lesson_impl(
 # on a measured override-rate threshold) are both in-place transitions on
 # the SAME lesson, not a new epistemic claim — mechanical/actionability
 # metadata, same class as situation_pattern.
-_LESSON_MUTABLE_FIELDS = frozenset({"situation_pattern", "scaffolding_nudge", "prevention_type"})
+#
+# tripwire_priority joined the mutable set with alpha#3270/#3112: an
+# author's read of "how much I want this interrupting someone" can change
+# after real firing experience (a lesson that turns out to fire constantly
+# with low value, or one that turns out to guard something sharper than
+# first realized) — same mechanical-metadata class as prevention_type, no
+# epistemic content changes.
+_LESSON_MUTABLE_FIELDS = frozenset({
+    "situation_pattern", "scaffolding_nudge", "prevention_type", "tripwire_priority",
+    "match_scope",
+})
 
 # #2000 — the subset of _LESSON_MUTABLE_FIELDS that error_incidents.json
 # actually carries a copy of (see core._rebuild_incidents_cache: it stores
@@ -1347,14 +1485,17 @@ def _update_lesson_impl(
     to an existing node still shows up as a graph-mutation event, distinct
     from node creation, without minting a new node.
 
-    Mutable fields (#1826, widened 2026-08-03; #1944 widened again to add
-    prevention_type): situation_pattern, scaffolding_nudge, prevention_type
+    Mutable fields (#1826, widened 2026-08-03; #1944 widened to add
+    prevention_type; #3270/#3112 widened to add tripwire_priority):
+    situation_pattern, scaffolding_nudge, prevention_type, tripwire_priority
     — all mechanical/actionability metadata tunable from real firing
     experience, not the lesson's epistemic content (claim, logical_chain,
     reasoning_type stay supersede-only). prevention_type is the sole field
     where an update MAY promote a lesson to "blocking" (minting cannot);
     engram_add_lesson refuses "blocking" at creation for exactly this
-    reason.
+    reason. tripwire_priority ("normal"/"high") has no such earn-it gate in
+    either direction — it is the author's own interruption preference, not
+    a measured safety claim.
 
     situation_pattern, when set to a non-empty value, runs the SAME #1864
     validation _add_lesson_impl runs at creation time — must compile as a
@@ -1367,8 +1508,8 @@ def _update_lesson_impl(
     Args:
         node_id: Lesson node ID (ls_NNNN). Must be type='lesson', is_current=1.
         updates: Dict of field → new_value. Mutable fields: situation_pattern,
-                 scaffolding_nudge, prevention_type. Unknown-field updates are
-                 rejected with a clear error.
+                 scaffolding_nudge, prevention_type, tripwire_priority.
+                 Unknown-field updates are rejected with a clear error.
         reason: Optional human-readable explanation for the change.
         bypass_prose_check: Default False. Overrides the prose-shape gate on
             a new situation_pattern value — see engram_add_lesson's docstring
@@ -1444,6 +1585,22 @@ def _update_lesson_impl(
                 "valid_types": sorted(PREVENTION_TYPES),
             })
 
+    if "tripwire_priority" in updates:
+        new_tripwire_priority = updates["tripwire_priority"]
+        if new_tripwire_priority not in TRIPWIRE_PRIORITIES:
+            return json.dumps({
+                "error": f"Invalid tripwire_priority '{new_tripwire_priority}'.",
+                "valid_types": sorted(TRIPWIRE_PRIORITIES),
+            })
+
+    if "match_scope" in updates:
+        new_match_scope = updates["match_scope"]
+        if new_match_scope not in MATCH_SCOPES:
+            return json.dumps({
+                "error": f"Invalid match_scope '{new_match_scope}'.",
+                "valid_types": sorted(MATCH_SCOPES),
+            })
+
     conn = core._get_db()
     try:
         row = conn.execute(
@@ -1467,7 +1624,10 @@ def _update_lesson_impl(
                 )
             })
 
-        meta = json.loads(row["metadata"] or "{}")
+        # #3413: a non-object blob is replaced by a dict on write; the helper
+        # logs it (this tool's response has no `warnings` field).
+        meta, _ = core._metadata_dict_for_write(
+            row["metadata"], node_id.strip(), "engram_update_lesson")
         if "field_traces" not in meta:
             meta["field_traces"] = {}
 
@@ -1656,7 +1816,10 @@ def _register_exemplar_impl(
         # 'instantiates'->lesson) — a third exemplar-creation surface
         # alongside this one and the initial-creation path in
         # _add_lesson_impl, neither of which routes through this hook.
-        target_meta = json.loads(target_row["metadata"] or "{}")
+        # #3413: read helper, deliberately not the write one: a non-object
+        # blob reads as {} (no support_lost), so nothing is written back and
+        # nothing on disk is replaced.
+        target_meta = core._metadata_dict(target_row["metadata"])
         if target_meta.get("support_lost") and exemplar_count > 0:
             target_meta.pop("support_lost", None)
             conn.execute(

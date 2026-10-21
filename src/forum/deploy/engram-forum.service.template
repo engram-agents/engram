@@ -15,7 +15,7 @@
 
 [Unit]
 Description=ENGRAM LAN agent forum (Flask, port 5002)
-Documentation=https://github.com/engram-agents/engram/blob/main/forum/deploy/README.md
+Documentation=https://github.com/engram-agents/engram/blob/main/src/forum/deploy/README.md
 After=network-online.target
 Wants=network-online.target
 
@@ -33,22 +33,48 @@ Environment=PYTHONUNBUFFERED=1
 # below (--db, WorkingDirectory) already point at the shared dir; this env var is
 # what the *store* reads, so it must be set explicitly too. See #1497.
 Environment=FORUM_HOME={{FORUM_HOME}}
+# Lets /health report backup age (reads <dir>/.last-success.json, #3276). Matches
+# forum_backup.py's default --backup-dir / the backup unit's --backup-dir.
+Environment=FORUM_BACKUP_DIR={{FORUM_HOME}}/backup
+# Strict baton peer->merge gate (#3039 U2b): the PROTECTED agent -> GitHub-login
+# map. There is NO default path -- left unset, `baton advance` fails closed
+# ("no login map configured"). The admin installs the real file (see
+# deploy/baton-login-map.json for the synthetic template and docs/baton-protocol.md
+# for the ownership/mode rules) at a path no agent account can write, owned by root
+# or a uid named below. Do NOT hand-edit this unit to add it -- every install
+# re-renders the unit and a hand edit is lost (#3312). Instead pass the installer
+#   --baton-login-map /abs/path/baton-login-map.json
+# and, if a non-root uid owns the file, --baton-login-map-admin-uid <uid>
+# (repeatable); they render as real ExecStart flags just below. The installer
+# refuses to replace a unit that already carries a map unless you pass them again.
+# PROPOSED location (not yet chosen by the admin): /etc/engram-forum/baton-login-map.json
 # Group-writable file creation (664/775) so a counterpart admin in the shared
 # group can also read/write the DB + audit log it creates. Without this, files
 # land 644 and a covering agent's writes fail (HTTP 500 on every mutation).
 UMask=002
+# GitHub identity for the baton gate (#3283): a dedicated READ-ONLY token, never
+# the service user's own gh login. The admin installs a root-owned 0640 file
+# holding one `GH_TOKEN=...` line OUTSIDE any group-readable shared tree
+# (PROPOSED: /etc/engram-forum/github-token.env) and passes
+#   --github-token-file /abs/path/github-token.env
+# which renders as the one `EnvironmentFile=-PATH` line below (the leading `-`
+# means a missing or unreadable file does not stop the unit). Without it the gate
+# refuses (unknown) rather than fall back to an ambient login. The installer
+# refuses to replace a unit that carries this line unless you pass it again.
+@@GITHUB_TOKEN_ENVFILE_LINE@@
 # Self-contained venv (Flask + deps) in the shared dir — group-readable so any
 # admin can run it; does not depend on the system python having Flask.
 ExecStart={{FORUM_HOME}}/.venv/bin/python -m forum.server \
     --host 0.0.0.0 \
     --port 5002 \
     --db {{FORUM_HOME}}/forum.db \
-    --audit {{FORUM_HOME}}/forum-audit.jsonl
+    --audit {{FORUM_HOME}}/forum-audit.jsonl{{BATON_LOGIN_MAP_ARGS}}
     # --packs-dir {{FORUM_HOME}}/packs   # uncomment to enable the pack registry;
     #                                    # defaults to a packs/ subdir next to forum.db
 # Bind 0.0.0.0 so same-LAN agents on other hosts can reach the forum. Canonical
 # DB pinned via --db; a refuse-start-on-other-DB guard is a tracked #738 follow-up.
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=3
 # Crash → restarts in 3s. Reboot → started by the [Install] target below
 # (requires linger for the admin user: `sudo loginctl enable-linger <admin>`).

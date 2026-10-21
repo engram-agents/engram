@@ -20,10 +20,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+_HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOKS_DIR not in sys.path:
+    sys.path.insert(0, _HOOKS_DIR)
+from _hooklib import engram_home_or_exit  # noqa: E402
+ENGRAM_HOME = str(engram_home_or_exit())
 DEFERENCE_MARKER_PATH = os.path.join(ENGRAM_HOME, "deference-detected.json")
 LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
 DEFERENCE_COOLDOWN_PATH = os.path.join(ENGRAM_HOME, "deference-cooldown-at.txt")
@@ -44,6 +45,8 @@ _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import resolve_runtime_dir, emit_context
+# #3628: every marker read and the cooldown write are non-blocking and regular-file-only.
+from _hooklib import open_regular_text, open_regular_text_write
 from _harness import detect_harness, get_harness_budgets
 
 _RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
@@ -146,7 +149,7 @@ def _is_cron_prompt(prompt: str, loop_marker_path: str) -> bool:
     # Compare against stored loop_prompt in loop-mode.json (present if loop started
     # with the updated engram-loop skill that writes loop_prompt to the marker)
     try:
-        with open(loop_marker_path) as f:
+        with open_regular_text(loop_marker_path) as f:
             marker = json.load(f)
         stored = marker.get("loop_prompt", "")
         if stored and stripped == stored.strip():
@@ -247,9 +250,8 @@ def main() -> None:
     # Guard: empty/absent prompt (headless or older CC) must not trigger cooldown.
     if prompt_text and not _is_cron_prompt(prompt_text, LOOP_MARKER_PATH):
         try:
-            Path(DEFERENCE_COOLDOWN_PATH).write_text(
-                datetime.now(timezone.utc).isoformat()
-            )
+            with open_regular_text_write(DEFERENCE_COOLDOWN_PATH) as f:
+                f.write(datetime.now(timezone.utc).isoformat())
         except Exception:
             pass
 
@@ -258,7 +260,7 @@ def main() -> None:
         sys.exit(0)
 
     try:
-        with open(DEFERENCE_MARKER_PATH) as f:
+        with open_regular_text(DEFERENCE_MARKER_PATH) as f:
             marker = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
         # Stale or corrupt marker — clean up and bail.

@@ -16,11 +16,12 @@ This slice lands ``flip`` (the most-used op) and the shared pattern; ``claim``,
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 from . import markdown as md
 from .seq import SeqAllocator
 from .store import CoordinationStore
+from .store_file import CLOSED_STATUSES
 
 # Participants list format: [alice, bob] or alice,bob — the same on-disk
 # grammar tools/baton.py and store_file.py already parse. A third private copy
@@ -37,14 +38,11 @@ def _maybe_stamp_phase(fields: dict, phase: Optional[str], now: str) -> tuple[di
 
     Calling this repeatedly/sequentially on the same baton is idempotent: a
     second call sees the first call's already-committed stamp (via its own
-    fresh `store.read_project` read) and no-ops. This does NOT protect
-    against genuinely overlapping concurrent callers — `read_project`
-    happens before the allocator lock is acquired in every write-body, so
-    two truly concurrent writers can each decide to stamp from stale reads;
-    the second writer's full-document write then clobbers the first's, the
-    same pre-existing lost-update exposure every other field in this store
-    already has. See issue #3255 for tracking genuine concurrent-write
-    safety across `projects.py`.
+    fresh `store.read_project` read) and no-ops. Since #3255 every write-body
+    (including this helper's callers) reads the baton INSIDE ``allocator.locked()``, in the same critical section as the
+    write, so the stamp decision is made on the state actually being overwritten
+    -- safe against overlapping callers within ONE forum process (the allocator
+    lock is a ``threading.Lock``; no cross-process protection).
     """
     if not phase:
         return {}, ""
@@ -70,7 +68,18 @@ class ProjectAlreadyExists(Exception):
 
     The CLI/route layer maps this to its own already-exists error + exit code;
     the write-fn does not assume how the caller reports it.
+
+    ``existing_ids`` lists every existing project id that collided with the
+    requested ``project_id`` (#3432): the exact id, or one or more CASE
+    VARIANTS of it (``.casefold()`` equal). ``[project_id]`` means an exact
+    duplicate. It lets the route name the colliding spelling(s) so a seat can
+    tell which one is live.
     """
+
+    def __init__(self, project_id, existing_ids=None):
+        super().__init__(project_id)
+        self.project_id = project_id
+        self.existing_ids = list(existing_ids) if existing_ids else [project_id]
 
 
 class NotAParticipant(Exception):
@@ -89,6 +98,62 @@ class NotAParticipant(Exception):
     not-authorized error + exit code (typically HTTP 403); the write-fn does
     not assume how the caller reports it.
     """
+
+
+class AnchorChanged(Exception):
+    """Raised by ``close`` / ``merge`` when the baton's ``github`` anchor is no longer
+    the one the caller's authorising read was made against (#3416 round 3).
+
+    The server's PR-state read happens OUTSIDE the allocator lock (it is gh I/O), so
+    the baton can be re-anchored while it is outstanding. The write binds itself to
+    the anchor that was actually queried and refuses, before claiming a seq or
+    touching a byte, if it moved. ``expected`` / ``actual`` are the normalised
+    (stripped, lowercased) anchors; ``""`` means unanchored.
+    """
+
+    def __init__(self, project_id: str, expected: str, actual: str):
+        super().__init__(
+            f"the github anchor of {project_id} changed from {expected!r} to {actual!r}")
+        self.project_id = project_id
+        self.expected = expected
+        self.actual = actual
+
+
+def _log_note_suffix(now: str, log_note: str) -> str:
+    """The optional one-line turn-log note (#3568) as a suffix for a log entry.
+
+    Empty when there is no note (so the log is byte-for-byte what it was). The note
+    is collapsed to one line, whatever the caller passed, and sits on its own
+    ``- {ts} `` line, the same shape ``advance`` uses.
+    """
+    note = " ".join((log_note or "").split())
+    return f"\n- {now} {note}" if note else ""
+
+
+def _check_expected_anchor(project_id: str, fields: dict, expected_anchor: Optional[str]) -> None:
+    """Under-lock anchor binding. ``expected_anchor=None`` = don't check; ``""`` = the
+    caller read the baton as unanchored. Same normalisation the server read uses."""
+    if expected_anchor is None:
+        return
+    actual = (fields.get("github") or "").strip().lower()
+    expected = expected_anchor.strip().lower()
+    if actual != expected:
+        raise AnchorChanged(project_id, expected, actual)
+
+
+class AlreadyClosed(Exception):
+    """Raised by ``close`` when the baton is ALREADY in a closed status (#3313).
+
+    A close-direction write on a closed baton is an overwrite (``merged ->
+    cancelled`` is not a transition). ``status`` carries the current closed
+    status so the route/CLI can name it. The legal way back to an active
+    status is ``reopen``, which never raises this.
+    """
+
+    def __init__(self, project_id: str, status: str):
+        super().__init__(f"project {project_id} is already {status}")
+        self.project_id = project_id
+        self.status = status
 
 
 def _parse_participants(participants_str: str) -> list:
@@ -132,6 +197,7 @@ def flip(
     phase: Optional[str] = None,
     transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
+    log_note: str = "",
 ) -> int:
     """Flip a baton's turn to ``to_agent``; return the module-assigned seq.
 
@@ -170,6 +236,9 @@ def flip(
             (conversion-only) alone. ``None`` (default) means this flip is
             not a transition.
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+        log_note: (#3568, default empty = the log is byte-for-byte unchanged) a
+            one-line note appended to this flip's turn-log entries; the server
+            passes it only when GitHub integration is off.
 
     Returns:
         The seq assigned to this mutation.
@@ -177,51 +246,191 @@ def flip(
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # #3255: read, decide and write in ONE allocator critical section. Before this,
+    # the read ran BEFORE the lock and the write was a blind whole-document
+    # overwrite, so two overlapping callers could both decide on the same pre-state
+    # and the second write clobbered the first (lost update). Every write-body in
+    # this module now follows this shape (advance/close/reopen/init already did).
+    # ASSUMES one forum process: the allocator lock is a threading.Lock, so this
+    # serializes writers within this process only -- it does NOT guard a second
+    # PROCESS or a hand edit (the file store has no cross-process lock). ``locked()``
+    # claims the seq only after the read/decisions, so a refusal burns no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    now = ts or md.now_iso()
-    fields, _ = md.parse_frontmatter(content)
-    # `from` is the baton's current holder; matches cmd_flip's
-    # fields.get("turn", ...).strip().lower(). Fallback fires on a malformed baton
-    # with no turn field OR an empty one (a valid baton always carries a real one);
-    # `or "unknown"` yields "unknown" for both, friendlier than cmd_flip's "".
-    from_agent = (fields.get("turn") or "unknown").strip().lower()
-    to = to_agent.strip().lower()
-    turn_by = (by_agent or "").strip().lower()
-    # Step 1 (conversion, unchanged _maybe_stamp_phase logic) then Step 2
-    # (transition, NEW #3039 U2a round 3): transition unconditionally
-    # overwrites whatever step 1 just did, regardless of its outcome -- see
-    # the design note's two-step architecture (Kepler's U2a-round-3 ruling).
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        now = ts or md.now_iso()
+        fields, _ = md.parse_frontmatter(content)
+        # `from` is the baton's current holder; matches cmd_flip's
+        # fields.get("turn", ...).strip().lower(). Fallback fires on a malformed baton
+        # with no turn field OR an empty one (a valid baton always carries a real one);
+        # `or "unknown"` yields "unknown" for both, friendlier than cmd_flip's "".
+        from_agent = (fields.get("turn") or "unknown").strip().lower()
+        to = to_agent.strip().lower()
+        turn_by = (by_agent or "").strip().lower()
+        # Step 1 (conversion, unchanged _maybe_stamp_phase logic) then Step 2
+        # (transition, NEW #3039 U2a round 3): transition unconditionally
+        # overwrites whatever step 1 just did, regardless of its outcome -- see
+        # the design note's two-step architecture (Kepler's U2a-round-3 ruling).
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        phase_log_suffix += _log_note_suffix(now, log_note)
 
-    updated = md.update_frontmatter(
-        content,
-        # turn_by is quoted like turn_reason (not bare like turn/turn_since):
-        # unlike turn, turn_by can legitimately be "" (actor unknown), and an
-        # UNQUOTED empty value written mid-block corrupts the frontmatter
-        # parser — its `\s*` separator is greedy across the newline and eats
-        # the NEXT field's entire line as this field's "value" (verified: an
-        # empty turn_by followed by, e.g., `participants:` silently absorbs
-        # it). Quoting keeps a non-whitespace char right after the separator,
-        # so the parser never crosses the line boundary. Unquoted on read by
-        # store_file.read_projects, mirroring its existing turn_reason unquote.
-        {
-            "turn": to, "turn_since": now, "turn_reason": f'"{reason}"',
-            "turn_by": f'"{turn_by}"', **phase_updates,
-        },
-    )
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f"- {now} {from_agent} → {to}: {reason}" + phase_log_suffix)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(
+            content,
+            # turn_by is quoted like turn_reason (not bare like turn/turn_since):
+            # unlike turn, turn_by can legitimately be "" (actor unknown), and an
+            # UNQUOTED empty value written mid-block corrupts the frontmatter
+            # parser — its `\s*` separator is greedy across the newline and eats
+            # the NEXT field's entire line as this field's "value" (verified: an
+            # empty turn_by followed by, e.g., `participants:` silently absorbs
+            # it). Quoting keeps a non-whitespace char right after the separator,
+            # so the parser never crosses the line boundary. Unquoted on read by
+            # store_file.read_projects, mirroring its existing turn_reason unquote.
+            {
+                "turn": to, "turn_since": now, "turn_reason": f'"{reason}"',
+                "turn_by": f'"{turn_by}"', **phase_updates,
+            },
+        )
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, f"- {now} {from_agent} → {to}: {reason}" + phase_log_suffix)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
+
+
+class AdvanceRefused(Exception):
+    """Raised by :func:`advance` when the baton, re-read under the lock, is no
+    longer in the state the (pre-lock) gate verified. Carries the actual
+    ``phase`` so the route layer can name it in the refusal."""
+
+    def __init__(self, message: str, phase: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.phase = phase
+
+
+class AdvanceResult:
+    """Outcome of :func:`advance`: ``advanced`` False is the idempotent no-op
+    (the baton was already at ``merge``): no seq consumed, no log line."""
+
+    __slots__ = ("advanced", "seq", "reason")
+
+    def __init__(self, advanced: bool, seq: int, reason: str = "") -> None:
+        self.advanced = advanced
+        self.seq = seq
+        self.reason = reason
+
+
+def advance(
+    store: CoordinationStore,
+    allocator: SeqAllocator,
+    project_id: str,
+    *,
+    to_agent: str,
+    reason: str,
+    by_agent: str = "",
+    expected_anchor: str,
+    expected_colleague: str,
+    resolve_phase: Callable[[dict], str],
+    ts: Optional[str] = None,
+    log_note: str = "",
+) -> AdvanceResult:
+    """Check-and-set write for the single edge ``phase: peer -> phase: merge``
+    (#3039 U2b).
+
+    The GitHub verdict was obtained BEFORE this call (never a network call
+    under the allocator lock). Inside the lock this RE-READS the baton and
+    requires: the ``github`` anchor and ``colleague`` are the ones the verdict
+    was for, the baton is not closed, and the resolved phase is ``peer`` (a
+    legacy baton with no explicit ``phase:`` resolves to ``""`` and is treated
+    as ``peer``, exactly as ``cmd_flip`` does for the merge-seat flip). Else
+    :class:`AdvanceRefused` naming the actual phase.
+
+    If the phase is already ``merge`` this is an idempotent no-op:
+    ``AdvanceResult(advanced=False)`` with NO seq consumed, NO turn-log line and
+    NO write (so no wake). Otherwise it writes ``phase: merge`` and the turn
+    hand-off to ``to_agent`` -- one turn-log line, one seq -- in that single
+    critical section. Two simultaneous callers therefore produce exactly one
+    transition.
+
+    ``resolve_phase(fields)`` returns the baton's resolved phase (``""`` when
+    unresolvable); it is supplied by the caller (it needs the pool-sentinel
+    machinery that lives in the gate module) and may raise
+    :class:`AdvanceRefused` itself.
+
+    ``log_note`` (#3568, default empty = no change to the log): a one-line note
+    appended to this advance's turn-log entries; the server passes it only when
+    GitHub integration is off, so the log records that the gate's verdicts were
+    ``unknown`` rather than leaving the advance looking verified.
+
+    Known, stated limit: the GitHub verdict and this write are not one
+    cross-system transaction -- a ``CHANGES_REQUESTED`` landing between them
+    still advances. The window is one HTTP round trip.
+
+    Raises:
+        ProjectNotFound: no such baton.
+        AdvanceRefused: the re-read state no longer matches the gate's.
+    """
+    to = (to_agent or "").strip().lower()
+    turn_by = (by_agent or "").strip().lower()
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
+        fields, _ = md.parse_frontmatter(content)
+
+        status = (fields.get("status") or "").strip().lower()
+        if status in ("merged", "cancelled"):
+            raise AdvanceRefused(f"baton is {status}; cannot advance a closed baton", phase=None)
+        phase = (resolve_phase(fields) or "").strip().lower()
+        if phase == "merge":
+            return AdvanceResult(False, _coerce_seq(fields.get("seq", "")), "already merge")
+        if phase not in ("peer", ""):
+            raise AdvanceRefused(
+                f"baton is in phase {phase!r}, not 'peer'; nothing to advance", phase=phase
+            )
+        if (fields.get("github") or "").strip().lower() != (expected_anchor or "").strip().lower():
+            raise AdvanceRefused(
+                "github anchor changed while the approval was being checked; re-run advance",
+                phase=phase,
+            )
+        if (fields.get("colleague") or "").strip().lower() != (expected_colleague or "").strip().lower():
+            raise AdvanceRefused(
+                "colleague changed while the approval was being checked; re-run advance",
+                phase=phase,
+            )
+
+        now = ts or md.now_iso()
+        from_agent = (fields.get("turn") or "unknown").strip().lower()
+        # Same two-step phase write as flip(): conversion of a still-legacy baton
+        # first (stamp-if-absent, logged), then the unconditional transition.
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, "peer", now)
+        phase_updates["phase"] = "merge"
+        phase_log_suffix += f"\n- {now} phase: 'merge' (transition)"
+        note = " ".join((log_note or "").split())  # one line, whatever the caller passed
+        if note:
+            # #3568: when the gate could not read GitHub (integration off), the log
+            # says so on its own line. Absent for an ordinary (verdict-bearing) advance.
+            phase_log_suffix += f"\n- {now} {note}"
+        updated = md.update_frontmatter(
+            content,
+            {
+                "turn": to, "turn_since": now, "turn_reason": f'"{reason}"',
+                "turn_by": f'"{turn_by}"', **phase_updates,
+            },
+        )
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, f"- {now} {from_agent} → {to}: {reason}" + phase_log_suffix)
+        final = md.reattach_frontmatter(updated, body)
+
+        seq = claim_seq()
+        store.write_project(project_id, final, seq=seq)
+    return AdvanceResult(True, seq, "advanced")
 
 
 def claim(
@@ -266,35 +475,37 @@ def claim(
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    now = ts or md.now_iso()
-    self_name = claimer.strip().lower()
-    sentinel = pool_sentinel.strip().lower()
-    fields, _ = md.parse_frontmatter(content)
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        now = ts or md.now_iso()
+        self_name = claimer.strip().lower()
+        sentinel = pool_sentinel.strip().lower()
+        fields, _ = md.parse_frontmatter(content)
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(
-        content,
-        # turn_by quoted like turn_reason — see flip()'s comment for why (the
-        # empty-value parser-corruption case doesn't arise here since
-        # self_name is never empty, but quoting is applied uniformly across
-        # every turn_by write site so the on-disk format is consistent).
-        {
-            "turn": self_name, "turn_since": now, "turn_reason": '"claimed"',
-            "turn_by": f'"{self_name}"', **phase_updates,
-        },
-    )
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f"- {now} {sentinel} → {self_name}: claimed" + phase_log_suffix)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(
+            content,
+            # turn_by quoted like turn_reason — see flip()'s comment for why (the
+            # empty-value parser-corruption case doesn't arise here since
+            # self_name is never empty, but quoting is applied uniformly across
+            # every turn_by write site so the on-disk format is consistent).
+            {
+                "turn": self_name, "turn_since": now, "turn_reason": '"claimed"',
+                "turn_by": f'"{self_name}"', **phase_updates,
+            },
+        )
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, f"- {now} {sentinel} → {self_name}: claimed" + phase_log_suffix)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
 
@@ -347,50 +558,52 @@ def release(
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    now = ts or md.now_iso()
-    self_name = holder.strip().lower()
-    sentinel = pool_sentinel.strip().lower()
-    # Parsed unconditionally (not just inside `if done:` as before #3039 U2a)
-    # so _maybe_stamp_phase always has this write's freshly-read fields to
-    # check the current `phase:` value against, regardless of whether --done
-    # was passed.
-    fields, _ = md.parse_frontmatter(content)
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        now = ts or md.now_iso()
+        self_name = holder.strip().lower()
+        sentinel = pool_sentinel.strip().lower()
+        # Parsed unconditionally (not just inside `if done:` as before #3039 U2a)
+        # so _maybe_stamp_phase always has this write's freshly-read fields to
+        # check the current `phase:` value against, regardless of whether --done
+        # was passed.
+        fields, _ = md.parse_frontmatter(content)
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updates: dict = {
-        "turn": sentinel,
-        "turn_since": now,
-        "turn_reason": f'"{reason}"',
-        # quoted like turn_reason — see flip()'s comment for why.
-        "turn_by": f'"{self_name}"',
-        **phase_updates,
-    }
+        updates: dict = {
+            "turn": sentinel,
+            "turn_since": now,
+            "turn_reason": f'"{reason}"',
+            # quoted like turn_reason — see flip()'s comment for why.
+            "turn_by": f'"{self_name}"',
+            **phase_updates,
+        }
 
-    title_renamed = False
-    if done:
-        current_title = fields.get("title", "").strip()
-        if not current_title.endswith("(done)"):
-            updates["title"] = current_title + " (done)"
-            title_renamed = True
+        title_renamed = False
+        if done:
+            current_title = fields.get("title", "").strip()
+            if not current_title.endswith("(done)"):
+                updates["title"] = current_title + " (done)"
+                title_renamed = True
 
-    updated = md.update_frontmatter(content, updates)
-    _, body = md.parse_frontmatter(updated)
+        updated = md.update_frontmatter(content, updates)
+        _, body = md.parse_frontmatter(updated)
 
-    log_entry = f"- {now} {self_name} → {sentinel}: {reason}"
-    if title_renamed:
-        log_entry += f"\n- {now} title marked (done)"
-    log_entry += phase_log_suffix
-    body = md.append_turn_log(body, log_entry)
-    final = md.reattach_frontmatter(updated, body)
+        log_entry = f"- {now} {self_name} → {sentinel}: {reason}"
+        if title_renamed:
+            log_entry += f"\n- {now} title marked (done)"
+        log_entry += phase_log_suffix
+        body = md.append_turn_log(body, log_entry)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
 
@@ -440,23 +653,25 @@ def set_status(
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    now = ts or md.now_iso()
-    fields, _ = md.parse_frontmatter(content)
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        now = ts or md.now_iso()
+        fields, _ = md.parse_frontmatter(content)
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f"- {now} {caller}: {new_status} — {reason}" + phase_log_suffix)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, f"- {now} {caller}: {new_status} — {reason}" + phase_log_suffix)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
 
@@ -466,13 +681,34 @@ def close(
     allocator: SeqAllocator,
     project_id: str,
     *,
+    invoker: str,
     new_status: str,
     reason: str,
     phase: Optional[str] = None,
     transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
+    require_participant: bool = True,
+    expected_anchor: Optional[str] = None,
+    log_note: str = "",
 ) -> int:
-    """Pure write body of baton cmd_close / gc. Validation (new_status ∈ CLOSED_STATUSES, not already closed) is the caller's job.
+    """Pure write body of baton cmd_close / gc.
+
+    Server-side gates (#3313, LOAD-BEARING -- they live HERE so a call into
+    the write-fn cannot skip them; ``invoker`` is caller-declared, so the 403
+    stops a mistaken or misdirected write, not a caller who names a
+    participant; checked in this order, BEFORE any write, so a refusal
+    consumes no seq and touches no byte):
+
+    1. ``ProjectNotFound`` -- no such baton.
+    2. ``NotAParticipant`` -- ``invoker`` (case-insensitive) is not in the
+       baton's ``participants`` list (same predicate as ``add_participant``).
+       Skipped only when ``require_participant=False``, an in-process kwarg
+       (never wire-exposed) used by the ``/gc`` route on an ANCHORED baton only
+       (#3416: the server derives the PR state there); on an unanchored baton
+       ``/gc`` keeps the gate.
+    3. ``AlreadyClosed`` -- the baton's current status is already in
+       ``CLOSED_STATUSES``; a close on top of a closed baton is an overwrite.
+       Applies to every close-direction write regardless of ``new_status``.
 
     Updates ``status`` in frontmatter (turn fields are NOT touched), appends a
     close turn-log entry, and writes atomically under the allocator lock (fork-4).
@@ -484,6 +720,8 @@ def close(
     ``status: cancelled`` recording the terminal state.
 
     Args:
+        invoker: agent performing the close (normalised to lowercase); must
+            be a current participant (gate 2).
         new_status: the target closed-status string (e.g. ``"merged"``, ``"abandoned"``).
         reason: human-readable explanation logged in the turn-log entry.
         phase: the caller-computed CONVERSION phase for this close -- see
@@ -495,30 +733,51 @@ def close(
             this for ``close`` (it defines no transition; see class docstring
             above).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+        require_participant: in-process only; ``False`` skips gate 2.
+        expected_anchor: in-process only (#3416 round 3). ``None`` (default) = no
+            check. Otherwise the normalised ``github`` anchor the caller's
+            authorising read was made against (``""`` = unanchored); compared under
+            the lock, before a seq is claimed, and a mismatch raises
+            :class:`AnchorChanged` (nothing written).
 
     Returns:
         The seq assigned to this mutation.
 
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
+        NotAParticipant: if ``invoker`` is not a current participant.
+        AlreadyClosed: if the baton is already in a closed status.
+        AnchorChanged: if ``expected_anchor`` is given and the stored anchor differs.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
-
     now = ts or md.now_iso()
-    fields, _ = md.parse_frontmatter(content)
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+    invoker_n = invoker.strip().lower()
+    # Read, gates and write all inside ONE critical section (the check-and-set
+    # pattern `advance` uses), so two concurrent closes cannot both pass the
+    # closed-state check on a stale read. The seq is claimed only after the
+    # gates pass, so a refusal consumes none.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
+        fields, _ = md.parse_frontmatter(content)
+        if require_participant and invoker_n not in _parse_participants(fields.get("participants", "")):
+            raise NotAParticipant(invoker_n)
+        current_status = fields.get("status", "").strip().lower()
+        if current_status in CLOSED_STATUSES:
+            raise AlreadyClosed(project_id, current_status)
+        _check_expected_anchor(project_id, fields, expected_anchor)
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        phase_log_suffix += _log_note_suffix(now, log_note)
 
-    updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f"- {now} close: {new_status} — {reason}" + phase_log_suffix)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, f"- {now} close: {new_status} — {reason}" + phase_log_suffix)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
 
@@ -533,12 +792,20 @@ def merge(
     phase: Optional[str] = None,
     transition_phase: Optional[str] = None,
     ts: Optional[str] = None,
+    require_participant: bool = True,
+    expected_anchor: Optional[str] = None,
+    log_note: str = "",
 ) -> int:
     """Mark a project baton as merged and archive it; return the assigned seq.
 
     Pure write body of baton cmd_merge (the post-gh-merge FS-write only). The
     gh-orchestration (PR-state queries, CI/approval gates, the gh pr merge call)
     stays client-side in baton.py — only this post-merge write lives here.
+
+    Gates (#3477, #3488; under the lock, BEFORE any write, so a refusal consumes
+    no seq): ``ProjectNotFound``, then ``NotAParticipant`` (``require_participant``,
+    default ``True``), then ``AlreadyClosed`` (the baton is already in
+    ``CLOSED_STATUSES``), then the ``expected_anchor`` binding.
 
     Log formats:
       - Normal: ``- {ts} merged via baton merge by {merged_by}``
@@ -571,40 +838,71 @@ def merge(
             this for ``merge`` (it defines no transition; see class
             docstring above).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+        require_participant: in-process only (#3477); never wire-exposed. ``True``
+            (the default, like :func:`close`; #3488 -- secure by default, so a
+            caller that forgets the flag cannot reopen #3477) makes ``merged_by``
+            (case-insensitive) have to be in the baton's ``participants`` -- the
+            same predicate and position as :func:`close`'s gate 2: under the lock,
+            after not-found, before the closed-state check, the anchor binding and
+            before a seq is claimed. The ``/merge`` route passes ``True`` on an
+            UNANCHORED baton only (on an anchored one GitHub decides); pass
+            ``False`` explicitly to skip the gate.
+        expected_anchor: in-process only (#3416 round 3). ``None`` (default) = no
+            check. Otherwise the normalised ``github`` anchor the caller's
+            authorising read was made against (``""`` = unanchored); compared under
+            the lock, before a seq is claimed, and a mismatch raises
+            :class:`AnchorChanged` (nothing written).
 
     Returns:
         The seq assigned to this mutation.
 
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
+        NotAParticipant: if ``require_participant`` and ``merged_by`` is not a
+            current participant.
+        AlreadyClosed: if the baton is already in a closed status (#3488).
+        AnchorChanged: if ``expected_anchor`` is given and the stored anchor differs.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    now = ts or md.now_iso()
-    merged_by_n = merged_by.strip().lower()
-    fields, _ = md.parse_frontmatter(content)
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        now = ts or md.now_iso()
+        merged_by_n = merged_by.strip().lower()
+        fields, _ = md.parse_frontmatter(content)
+        if require_participant and merged_by_n not in _parse_participants(fields.get("participants", "")):
+            raise NotAParticipant(merged_by_n)
+        # #3488 (mirrors close(), #3313): a merge on top of a closed baton is an
+        # overwrite of a terminal state. Every closed status refuses alike,
+        # ``merged`` included (a re-merge is not a no-op). Under the lock, before
+        # the anchor binding and before a seq is claimed.
+        current_status = fields.get("status", "").strip().lower()
+        if current_status in CLOSED_STATUSES:
+            raise AlreadyClosed(project_id, current_status)
+        _check_expected_anchor(project_id, fields, expected_anchor)
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    if forced:
-        log_line = (
-            f"- {now} merged via baton merge by {merged_by_n} "
-            "(FORCED past gates 3-4)"
-        )
-    else:
-        log_line = f"- {now} merged via baton merge by {merged_by_n}"
-    log_line += phase_log_suffix
+        if forced:
+            log_line = (
+                f"- {now} merged via baton merge by {merged_by_n} "
+                "(FORCED past gates 3-4)"
+            )
+        else:
+            log_line = f"- {now} merged via baton merge by {merged_by_n}"
+        log_line += phase_log_suffix
+        log_line += _log_note_suffix(now, log_note)
 
-    updated = md.update_frontmatter(content, {"status": "merged", **phase_updates})
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, log_line)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, {"status": "merged", **phase_updates})
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, log_line)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
 
     # OQ-4 archive relocation (outside lock — seq-bearing write is complete)
@@ -624,6 +922,14 @@ def reopen(
     ts: Optional[str] = None,
 ) -> int:
     """Pure write body of baton cmd_reopen. Validation (new_status ∈ ACTIVE_STATUSES, current_status ∈ CLOSED_STATUSES) is the caller's job. Reads current status internally for the log entry.
+
+    Server-side gate (#3313, LOAD-BEARING): ``invoker`` must be a current
+    participant of the baton (case-insensitive, same predicate as
+    ``add_participant``), else ``NotAParticipant`` is raised BEFORE any write
+    (no byte changed, no seq consumed). ``ProjectNotFound`` is checked first.
+    Reopen has no already-closed refusal -- reopening a closed baton is the
+    legal path; a reopen of an already-ACTIVE baton keeps its pre-#3313
+    behaviour (it overwrites no terminal state).
 
     Updates ``status`` in frontmatter (turn fields are NOT touched), appends a
     reopened turn-log entry recording the prior status, and writes atomically
@@ -651,29 +957,36 @@ def reopen(
 
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
+        NotAParticipant: if ``invoker`` is not a current participant.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
-
     now = ts or md.now_iso()
     invoker_name = invoker.strip().lower()
-    fields, _ = md.parse_frontmatter(content)
-    current_status = fields.get("status", "")
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+    # Read, gate and write all inside ONE critical section (the check-and-set
+    # pattern `advance` uses): a read taken before the lock could be stale by
+    # the time the lock is acquired. The seq is claimed only after the gates
+    # pass, so a refusal consumes none.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
+        fields, _ = md.parse_frontmatter(content)
+        if invoker_name not in _parse_participants(fields.get("participants", "")):
+            raise NotAParticipant(invoker_name)
+        current_status = fields.get("status", "")
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(
-        body,
-        f"- {now} reopened → {invoker_name}: status was {current_status} → {new_status}" + phase_log_suffix,
-    )
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, {"status": new_status, **phase_updates})
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(
+            body,
+            f"- {now} reopened → {invoker_name}: status was {current_status} → {new_status}" + phase_log_suffix,
+        )
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
 
@@ -717,24 +1030,26 @@ def rename(
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    now = ts or md.now_iso()
-    fields, _ = md.parse_frontmatter(content)
-    old_title = fields.get("title", "").strip()
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        now = ts or md.now_iso()
+        fields, _ = md.parse_frontmatter(content)
+        old_title = fields.get("title", "").strip()
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(content, {"title": new_title, **phase_updates})
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f'- {now} renamed: title from "{old_title}" to "{new_title}"' + phase_log_suffix)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, {"title": new_title, **phase_updates})
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, f'- {now} renamed: title from "{old_title}" to "{new_title}"' + phase_log_suffix)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
 
@@ -781,29 +1096,31 @@ def anchor(
     Raises:
         ProjectNotFound: if ``project_id`` has no existing baton file.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    now = ts or md.now_iso()
-    fields, _ = md.parse_frontmatter(content)
-    old_anchor = fields.get("github", "").strip()
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        now = ts or md.now_iso()
+        fields, _ = md.parse_frontmatter(content)
+        old_anchor = fields.get("github", "").strip()
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
 
-    updated = md.update_frontmatter(content, {"github": github_anchor, **phase_updates})
-    _, body = md.parse_frontmatter(updated)
-    if old_anchor:
-        log_entry = f'- {now} anchor updated: github from "{old_anchor}" to "{github_anchor}"'
-    else:
-        log_entry = f"- {now} anchor set: github → {github_anchor}"
-    log_entry += phase_log_suffix
-    body = md.append_turn_log(body, log_entry)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, {"github": github_anchor, **phase_updates})
+        _, body = md.parse_frontmatter(updated)
+        if old_anchor:
+            log_entry = f'- {now} anchor updated: github from "{old_anchor}" to "{github_anchor}"'
+        else:
+            log_entry = f"- {now} anchor set: github → {github_anchor}"
+        log_entry += phase_log_suffix
+        body = md.append_turn_log(body, log_entry)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq
 
@@ -871,35 +1188,37 @@ def add_participant(
         ProjectNotFound: if ``project_id`` has no existing baton file.
         NotAParticipant: if ``agent`` is not a current participant of the baton.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    fields, _ = md.parse_frontmatter(content)
-    current_participants = _parse_participants(fields.get("participants", ""))
+        fields, _ = md.parse_frontmatter(content)
+        current_participants = _parse_participants(fields.get("participants", ""))
 
-    agent_n = agent.strip().lower()
-    if agent_n not in current_participants:
-        raise NotAParticipant(agent_n)
+        agent_n = agent.strip().lower()
+        if agent_n not in current_participants:
+            raise NotAParticipant(agent_n)
 
-    participant_n = participant.strip().lower()
-    if participant_n in current_participants:
-        return _coerce_seq(fields.get("seq", "")), False
+        participant_n = participant.strip().lower()
+        if participant_n in current_participants:
+            return _coerce_seq(fields.get("seq", "")), False
 
-    now = ts or md.now_iso()
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
-    new_participants = list(current_participants) + [participant_n]
-    participants_str = _format_participants(new_participants)
+        now = ts or md.now_iso()
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        new_participants = list(current_participants) + [participant_n]
+        participants_str = _format_participants(new_participants)
 
-    updated = md.update_frontmatter(content, {"participants": participants_str, **phase_updates})
-    _, body = md.parse_frontmatter(updated)
-    body = md.append_turn_log(body, f"- {now} {agent_n} added participant: {participant_n}" + phase_log_suffix)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, {"participants": participants_str, **phase_updates})
+        _, body = md.parse_frontmatter(updated)
+        body = md.append_turn_log(body, f"- {now} {agent_n} added participant: {participant_n}" + phase_log_suffix)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq, True
 
@@ -998,50 +1317,76 @@ def set_colleague(
         NotAParticipant: if ``agent`` is neither a current participant nor
             the current turn holder of the baton.
     """
-    content = store.read_project(project_id)
-    if content is None:
-        raise ProjectNotFound(project_id)
+    # Read, decide and write in ONE critical section (#3255; see flip()). A refusal claims no seq.
+    with allocator.locked() as claim_seq:
+        content = store.read_project(project_id)
+        if content is None:
+            raise ProjectNotFound(project_id)
 
-    fields, _ = md.parse_frontmatter(content)
-    current_turn = fields.get("turn", "").strip().lower()
-    current_participants = _parse_participants(fields.get("participants", ""))
+        fields, _ = md.parse_frontmatter(content)
+        current_turn = fields.get("turn", "").strip().lower()
+        current_participants = _parse_participants(fields.get("participants", ""))
 
-    agent_n = agent.strip().lower()
-    if agent_n != current_turn and agent_n not in current_participants:
-        raise NotAParticipant(agent_n)
+        agent_n = agent.strip().lower()
+        if agent_n != current_turn and agent_n not in current_participants:
+            raise NotAParticipant(agent_n)
 
-    colleague_n = colleague.strip().lower()
-    old_colleague = fields.get("colleague", "").strip()
+        colleague_n = colleague.strip().lower()
+        old_colleague = fields.get("colleague", "").strip()
 
-    updates = {"colleague": colleague_n}
-    participant_added = colleague_n not in current_participants
-    if participant_added:
-        new_participants = list(current_participants) + [colleague_n]
-        updates["participants"] = _format_participants(new_participants)
+        updates = {"colleague": colleague_n}
+        participant_added = colleague_n not in current_participants
+        if participant_added:
+            new_participants = list(current_participants) + [colleague_n]
+            updates["participants"] = _format_participants(new_participants)
 
-    now = ts or md.now_iso()
-    phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
-    if transition_phase is not None:
-        phase_updates["phase"] = transition_phase
-        phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
-    updates.update(phase_updates)
+        now = ts or md.now_iso()
+        phase_updates, phase_log_suffix = _maybe_stamp_phase(fields, phase, now)
+        if transition_phase is not None:
+            phase_updates["phase"] = transition_phase
+            phase_log_suffix += f"\n- {now} phase: {transition_phase!r} (transition)"
+        updates.update(phase_updates)
 
-    updated = md.update_frontmatter(content, updates)
-    _, body = md.parse_frontmatter(updated)
-    if old_colleague:
-        log_entry = (
-            f'- {now} {agent_n} changed colleague from "{old_colleague}" '
-            f'to "{colleague_n}"'
-        )
-    else:
-        log_entry = f"- {now} {agent_n} set colleague → {colleague_n}"
-    log_entry += phase_log_suffix
-    body = md.append_turn_log(body, log_entry)
-    final = md.reattach_frontmatter(updated, body)
+        updated = md.update_frontmatter(content, updates)
+        _, body = md.parse_frontmatter(updated)
+        if old_colleague:
+            log_entry = (
+                f'- {now} {agent_n} changed colleague from "{old_colleague}" '
+                f'to "{colleague_n}"'
+            )
+        else:
+            log_entry = f"- {now} {agent_n} set colleague → {colleague_n}"
+        log_entry += phase_log_suffix
+        body = md.append_turn_log(body, log_entry)
+        final = md.reattach_frontmatter(updated, body)
 
-    with allocator.allocate() as seq:
+        seq = claim_seq()
         store.write_project(project_id, final, seq=seq)
     return seq, participant_added
+
+
+def _refuse_existing_id(store: CoordinationStore, project_id: str) -> None:
+    """Raise ``ProjectAlreadyExists`` if ``project_id`` exists, exact OR case variant (#3432).
+
+    The case comparison is an explicit ``.casefold()`` over the enumerated ids,
+    NOT a filesystem path probe: the default macOS filesystem is case-insensitive
+    and the Linux prod host is not, so relying on path behaviour would make the
+    refusal platform-dependent. Closed/merged batons still in the store block
+    too (as an exact duplicate of a closed id already did). Ids already moved
+    to ``archive/`` (e.g. merged) do not block, same as the exact check
+    today. No migration:
+    existing ids -- including any case-variant pairs already present -- are
+    never touched, and every other verb keeps exact-id lookup.
+    """
+    folded = project_id.casefold()
+    matches = sorted(
+        r.project_id for r in store.read_projects(active_only=False)
+        if r.project_id.casefold() == folded
+    )
+    if not matches and store.read_project(project_id) is not None:
+        matches = [project_id]
+    if matches:
+        raise ProjectAlreadyExists(project_id, matches)
 
 
 def init(
@@ -1148,9 +1493,8 @@ def init(
     Raises:
         ProjectAlreadyExists: if ``project_id`` already has a baton file.
     """
-    existing = store.read_project(project_id)
-    if existing is not None:
-        raise ProjectAlreadyExists(project_id)
+    # Fast-path refusal (no lock); re-checked under the allocator lock below.
+    _refuse_existing_id(store, project_id)
 
     now = ts or md.now_iso()
     turn_by = (by_agent or "").strip().lower()
@@ -1193,18 +1537,42 @@ def init(
     fm_lines.append("---")
     fm_lines.append("")
 
+    heading = f"# {project_id} — {title}"
+    log_line = f"- {now} initialized → {turn}: {turn_reason}" + phase_log_suffix
+    # Last-resort backstop (#3039 U2b round 4): ``init`` builds the file from
+    # f-strings, not through ``update_frontmatter`` / ``append_turn_log``, so it
+    # carries its own copy of the "no line break / control character from client
+    # text" check -- before the allocator lock, so a refusal consumes no seq.
+    for ln in fm_lines:
+        md.assert_single_line(ln, "frontmatter line")
+    md.assert_single_line(heading, "heading")
+    md.check_log_entry(log_line)
+
     body_lines = [
         "",
-        f"# {project_id} — {title}",
+        heading,
         "",
         "## Turn log",
         "",
-        f"- {now} initialized → {turn}: {turn_reason}" + phase_log_suffix,
+        log_line,
         "",
     ]
 
     content = "\n".join(fm_lines) + "\n".join(body_lines)
 
-    with allocator.allocate() as seq:
+    # Check-and-create under the allocator lock (#3432). Before this, the exact
+    # duplicate check ran OUTSIDE any lock (check-then-write): two concurrent
+    # inits of the same id could both pass and the second would overwrite the
+    # first. Re-checking exact + case-variant here, in the same critical section
+    # as the write, serializes concurrent inits of ``x`` / ``X`` within this
+    # process (ASSUMES one forum process; the allocator lock is a
+    # threading.Lock). Residual race: it does NOT guard against a second
+    # PROCESS (or a hand edit) creating a variant file between the check and
+    # the write; the file store has no cross-process lock or O_EXCL create.
+    # ``locked()`` claims a seq only after the check passes, so a refusal burns
+    # no seq.
+    with allocator.locked() as claim:
+        _refuse_existing_id(store, project_id)
+        seq = claim()
         store.write_project(project_id, content, seq=seq)
     return seq

@@ -32,7 +32,7 @@ REPO = _first([os.environ.get("ENGRAM_REPO"),
                os.path.expanduser("~/GitHub/engram-alpha")], "the engram-alpha checkout")
 LIVE = _first([os.path.join(ENGRAM_HOME, "knowledge.db")], "your knowledge.db")
 PY   = _first([os.environ.get("ENGRAM_PY"),
-               os.path.join(ENGRAM_HOME, "venv/bin/python3"),
+               os.path.join(os.path.expanduser("~"), ".engram", "venv", "bin", "python3"),
                os.path.join(REPO, ".venv/bin/python3"),
                os.path.join(REPO, "venv/bin/python3")], "a python3 with the repo deps")
 

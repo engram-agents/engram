@@ -66,6 +66,7 @@ Caller (server.py) uses the alias form::
 from __future__ import annotations
 
 import difflib
+import errno
 import hashlib
 import json
 import logging
@@ -146,7 +147,7 @@ def _get_polarity_config() -> dict:
     Disabled if `ENGRAM_NO_POLARITY` env var is set (test-mode escape
     hatch so tests don't have to download a 1.5GB model).
 
-    To enable: set `polarity.enabled = true` in `~/.engram/config.json`.
+    To enable: set `polarity.enabled = true` in `~/.engram/config.json` ($ENGRAM_HOME).
     """
     defaults = {
         "enabled": False,
@@ -159,13 +160,13 @@ def _get_polarity_config() -> dict:
         return defaults
     if core.CONFIG_PATH.exists():
         try:
-            config = json.loads(core.CONFIG_PATH.read_text())
+            config = core._config_io.read_config_json(core.CONFIG_PATH)
             user = config.get("polarity", {})
             if isinstance(user, dict):
                 merged = dict(defaults)
                 merged.update(user)
                 return merged
-        except (json.JSONDecodeError, OSError):
+        except (core._config_io.ConfigUnreadableError, OSError):
             pass
     return defaults
 
@@ -189,13 +190,13 @@ def _get_standpoint_config() -> dict:
     defaults = {"author_id_hard_gate": True}
     if core.CONFIG_PATH.exists():
         try:
-            config = json.loads(core.CONFIG_PATH.read_text())
+            config = core._config_io.read_config_json(core.CONFIG_PATH)
             user = config.get("standpoint", {})
             if isinstance(user, dict):
                 merged = dict(defaults)
                 merged.update(user)
                 return merged
-        except (json.JSONDecodeError, OSError):
+        except (core._config_io.ConfigUnreadableError, OSError):
             pass
     return defaults
 
@@ -225,10 +226,7 @@ def _find_person_repair_hint(conn: sqlite3.Connection, offending: str) -> Option
     candidates: dict[str, str] = {}  # name/alias (lowercase) -> person_id
     display: dict[str, str] = {}  # name/alias (lowercase) -> original-case name for display
     for prow in person_rows:
-        try:
-            pmeta = json.loads(prow["metadata"] or "{}")
-        except json.JSONDecodeError:
-            continue
+        pmeta = core._metadata_dict(prow["metadata"])
         pname = pmeta.get("name", "")
         paliases = pmeta.get("aliases", [])
         vocab = [pname] + (paliases if isinstance(paliases, list) else [])
@@ -342,14 +340,14 @@ def _check_yellow_card(domain: str):
 
     Yellow-carded domains are sources we've judged unreliable as independent
     evidence (AI-aggregators, content farms, known-hallucinating surfaces).
-    Populated in ~/.engram/config.json under `yellow_domains` as a list of
+    Populated in ~/.engram/config.json ($ENGRAM_HOME) under `yellow_domains` as a list of
     {domain, reason, engram_node} entries. Suffix-matched like trust_pool so
     subdomains inherit the flag.
     """
     if not domain:
         return None
     try:
-        config = json.loads(core.CONFIG_PATH.read_text()) if core.CONFIG_PATH.exists() else {}
+        config = core._config_io.read_config_json(core.CONFIG_PATH)
     except Exception:
         return None
     for entry in config.get("yellow_domains", []):
@@ -543,6 +541,57 @@ def _content_addressed_archive_hash(abs_file: str) -> str:
         return ""
 
 
+_MAX_SYMLINK_EXPANSIONS = 40
+
+
+def _resolve_with_trace(path: str) -> "tuple[str, list[str]]":
+    """Resolve `path` exactly as the OS does, recording every symlink crossed.
+
+    Returns (physical_path, links). `path` is made absolute by joining the cwd
+    if relative, WITHOUT normpath/abspath: `..` is applied to the PHYSICAL path
+    built so far (so `repo/link/../f.md` is the parent of what `link` points at,
+    not `repo/f.md`). Each component that is a symlink is recorded as the
+    absolute physical path of the LINK itself, then replaced by its target and
+    the walk continues (a relative target resolves against the link's
+    directory). A missing FINAL component is kept as written (the caller's
+    existence check reports it); anything the OS would refuse earlier raises as
+    the OS does: OSError(ENOENT) when a component that must be a directory is
+    missing, OSError(ENOTDIR) when it exists but is not a directory (a trailing
+    slash, `/.` or `/..` after a regular file, or a path continuing past one).
+    More than _MAX_SYMLINK_EXPANSIONS links raises OSError(ELOOP), so a loop is
+    a clean rejection rather than a hang.
+    """
+    if not os.path.isabs(path):
+        path = os.path.join(os.getcwd(), path)
+    pending = path.split(os.sep)[::-1]  # a stack: next component is pending[-1]
+    resolved = os.sep
+    links: list = []
+    while pending:
+        comp = pending.pop()
+        # Consuming ANY further component (even "", "." or "..") means `resolved`
+        # is being used as a directory; the OS refuses when it is not one.
+        if not os.path.isdir(resolved):
+            code = errno.ENOTDIR if os.path.lexists(resolved) else errno.ENOENT
+            raise OSError(code, os.strerror(code), path)
+        if comp in ("", "."):
+            continue
+        if comp == "..":
+            resolved = os.path.dirname(resolved)
+            continue
+        candidate = os.path.join(resolved, comp)
+        if os.path.islink(candidate):
+            if len(links) >= _MAX_SYMLINK_EXPANSIONS:
+                raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), path)
+            links.append(candidate)
+            target = os.readlink(candidate)
+            if os.path.isabs(target):
+                resolved = os.sep
+            pending.extend(target.split(os.sep)[::-1])
+        else:
+            resolved = candidate
+    return resolved, links
+
+
 def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", source_repo: str = "", repo_path: str = "") -> dict:
     """Validate a file:// URL is citable and capture its version state.
 
@@ -589,7 +638,37 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
             "content_hash": "",
             "git_sha": "",
         }
-    if not os.path.exists(file_path):
+    try:
+        physical, links = _resolve_with_trace(file_path)
+    except OSError as e:
+        if e.errno in (errno.ENOENT, errno.ENOTDIR):
+            # The OS cannot open this path either: same rejection as a missing file.
+            return {
+                "ok": False,
+                "error": (
+                    f"File not found: '{file_path}'. Evidence URLs with file:// must "
+                    "point to existing files. If citing a conversation, use the "
+                    "JSONL transcript file path instead." + _HONESTY_REMINDER
+                ),
+                "content_hash": "",
+                "git_sha": "",
+            }
+        return {
+            "ok": False,
+            "error": (
+                f"Cannot resolve the symlinks in '{file_path}': {e.strerror or e} "
+                "(a symlink loop, or more than "
+                f"{_MAX_SYMLINK_EXPANSIONS} links on the path). Cite a path that resolves."
+                + _HONESTY_REMINDER
+            ),
+            "content_hash": "",
+            "git_sha": "",
+        }
+    # Both halves: the cited path as the OS opens it, and the physical path the
+    # walk reached. The walk fails where the OS fails; the cited-path check is
+    # defense in depth, because _verify_quote_in_source skips the quote check
+    # for a cited path that does not exist.
+    if not (os.path.exists(file_path) and os.path.exists(physical)):
         return {
             "ok": False,
             "error": (
@@ -601,12 +680,28 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
             "git_sha": "",
         }
 
-    file_dir = os.path.dirname(os.path.abspath(file_path))
+    # Evidence is bytes: the physical path must be a regular file. A directory
+    # (or anything else that is not a file) has no content to hash or quote, and
+    # `git cat-file -e <sha>:<dir>` would succeed for it (a tree object) — so this
+    # fires before any content_hash / open() / git logic, for every caller (#3393).
+    if not os.path.isfile(physical):
+        return {
+            "ok": False,
+            "error": (
+                f"Evidence must be a file: '{file_path}' is not a regular file "
+                f"(it resolves to '{physical}'). Cite a file inside it instead."
+                + _HONESTY_REMINDER
+            ),
+            "content_hash": "",
+            "git_sha": "",
+        }
+
+    cross_repo = bool(source_repo and repo_path)
     # When source_repo is provided, run git operations from that repo root
     # instead of the directory inferred from the file path. This lets the
     # caller verify a file against a secondary repo (e.g. the plugin source
     # tree) when the file's containing directory resolves to a different repo
-    # (e.g. the ~/.engram data repo where plugin files are untracked).
+    # (e.g. the ~/.engram ($ENGRAM_HOME) data repo where plugin files are untracked).
     if source_repo:
         git_cwd = os.path.abspath(source_repo)
         if not os.path.isdir(git_cwd):
@@ -617,10 +712,95 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
                 "git_sha": "",
             }
     else:
-        git_cwd = file_dir
-    _file_git = lambda *args: subprocess.run(
-        [core.GIT_EXE, *args], cwd=git_cwd, capture_output=True, text=True, timeout=core.GIT_TIMEOUT
+        # The PHYSICAL directory of the file: the one place the bytes live.
+        git_cwd = os.path.dirname(physical)
+    _git_at = lambda cwd, *args, env=None: subprocess.run(
+        [core.GIT_EXE, *args], cwd=cwd, capture_output=True, text=True, timeout=core.GIT_TIMEOUT,
+        env=env,
     )
+    # Link classification matches git's English "not a git repository", so it
+    # runs under the C locale; the rest of the environment is inherited.
+    _c_locale_env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    _file_git = lambda *args: _git_at(git_cwd, *args)
+
+    def _reject(message: str) -> dict:
+        return {"ok": False, "error": message + _HONESTY_REMINDER, "content_hash": "", "git_sha": ""}
+
+    def _outside_repo_rejection(real_file: str) -> dict:
+        # A committed in-repo symlink whose target lies outside the repo: git
+        # cannot vouch for the target, so name the cause rather than let
+        # `git status` (exit 128) and cat-file fail on a '../' path.
+        return _reject(
+            f"File '{file_path}' resolves outside the repository "
+            f"(to '{real_file}'). File-based evidence must live inside "
+            "the git repository so it is verifiable at the claimed revision. "
+            "Cite a file that is committed inside the repo."
+        )
+
+    # Link check (#3292). The cited path was resolved ONCE, physically, above;
+    # every symlink that resolution crossed is in `links`. A link outside every
+    # git work tree is environment (macOS /var -> /private/var, a ~/link) and
+    # is ignored. A link inside a work tree W is part of what the citation
+    # relies on, so it must be tracked in W and clean there: an untracked or
+    # retargeted link could otherwise vouch for committed bytes it merely
+    # points at.
+    in_tree_links = []  # (link path, work tree root, link path relative to it)
+    if not cross_repo:
+        for link in links:
+            link_dir = os.path.dirname(link)
+            try:
+                top = _git_at(link_dir, "rev-parse", "--show-toplevel", env=_c_locale_env)
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+                # Fail closed: an unanswered classification is not "environment".
+                return _reject(
+                    f"Cannot classify the symlink '{link}' on the cited path: git "
+                    f"could not be run ({type(e).__name__}). A link that cannot be "
+                    "classified cannot be trusted to vouch for the file it points "
+                    "at, so the citation cannot be accepted."
+                )
+            if top.returncode != 0:
+                # Only git's genuine "not a git repository" answer makes a link
+                # environment; any other failure must not read as one.
+                if "not a git repository" in (top.stderr or "").lower():
+                    continue
+                git_err = (top.stderr or "").strip()[:300] or "no stderr output"
+                return _reject(
+                    f"Cannot classify the symlink '{link}' on the cited path: "
+                    f"git rev-parse --show-toplevel failed (exit {top.returncode}): "
+                    f"{git_err}. A link that cannot be classified cannot be trusted "
+                    "to vouch for the file it points at, so the citation cannot be "
+                    "accepted."
+                )
+            work_tree = os.path.realpath(top.stdout.strip())
+            real_dir = os.path.realpath(link_dir)
+            if os.path.commonpath([work_tree, real_dir]) != work_tree:
+                continue
+            rel_link = os.path.relpath(os.path.join(real_dir, os.path.basename(link)), work_tree)
+            tracked = _git_at(work_tree, "ls-files", "--error-unmatch", "--", rel_link)
+            if tracked.returncode != 0:
+                return _reject(
+                    f"The cited path goes through the symlink '{link}', which is "
+                    f"untracked (not yet added to git) in '{work_tree}'. An uncommitted "
+                    "symlink cannot vouch for the file it points at. Commit the "
+                    "symlink first, or cite the file's real path."
+                )
+            link_status = _git_at(work_tree, "status", "--porcelain", "--", rel_link)
+            if link_status.returncode != 0:
+                git_err = (link_status.stderr or "").strip()[:300] or "no stderr output"
+                return _reject(
+                    f"git status failed (exit {link_status.returncode}) for symlink "
+                    f"'{rel_link}': {git_err}. Cannot confirm the symlink is committed, "
+                    "so the citation cannot be accepted."
+                )
+            if link_status.stdout.strip():
+                return _reject(
+                    f"The cited path goes through the symlink '{link}', which is "
+                    f"modified but not committed (status: {link_status.stdout[:2].strip()}). "
+                    "A changed symlink cannot vouch for the file it points at. "
+                    "Commit the symlink first, then retry."
+                )
+            in_tree_links.append((link, work_tree, rel_link))
+
     try:
         repo_check = _file_git("rev-parse", "--is-inside-work-tree")
         file_in_git_repo = repo_check.returncode == 0
@@ -628,6 +808,10 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
         file_in_git_repo = False
 
     if not file_in_git_repo:
+        if in_tree_links:
+            # Reached through a link that lives in a work tree, but the bytes
+            # are in none: no repository can vouch for them.
+            return _outside_repo_rejection(physical)
         return {"ok": True, "error": None, "content_hash": "", "git_sha": ""}
 
     # Deferred-commit relaxation (#1253): a content-addressed evidence-archive
@@ -644,42 +828,55 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
 
     repo_root_result = _file_git("rev-parse", "--show-toplevel")
     repo_root = repo_root_result.stdout.strip()
-    abs_file = os.path.abspath(file_path)
 
-    if source_repo and repo_path:
+    # Each entry is (label, repo-relative path); label "" = the only check.
+    # Every path must be clean in `git status` AND present at the revision.
+    if cross_repo:
         # Cross-repo citation: the cited file lives outside source_repo at abs_file,
         # but the canonical committed copy is at repo_path within source_repo.
         # Use repo_path for all git tree operations; abs_file only for content_hash.
-        rel_path = repo_path
-        git_status_path = repo_path
+        abs_file = os.path.abspath(file_path)
+        path_checks = [("", repo_path)]
+        check_git = _file_git
     else:
-        rel_path = os.path.relpath(abs_file, repo_root)
-        git_status_path = abs_file  # absolute path works in same-repo context
+        # Same-repo citation (#3292): the bytes are the PHYSICAL file, checked in
+        # the repository that contains it (link checks ran above).
+        abs_file = physical
+        real_root = os.path.realpath(repo_root)
+        rel_target = os.path.relpath(physical, real_root)
+        if rel_target == ".." or rel_target.startswith(".." + os.sep):
+            return _outside_repo_rejection(physical)
+        path_checks = [("resolved target " if links else "", rel_target)]
+        # Repo-relative paths need the repo root as cwd.
+        check_git = lambda *args: _git_at(real_root, *args)
 
-    status_result = _file_git("status", "--porcelain", "--", git_status_path)
-    file_status = status_result.stdout.strip()
-    if file_status:
-        status_code = file_status[:2]
-        if status_code == "??":
-            status_desc = "untracked (not yet added to git)"
-        elif "M" in status_code:
-            status_desc = "modified but not committed"
-        elif "A" in status_code:
-            status_desc = "staged but not committed"
-        else:
-            status_desc = f"uncommitted (status: {status_code.strip()})"
-        return {
-            "ok": False,
-            "error": (
-                f"File is {status_desc}: '{rel_path}'. "
+    for label, rel_path in path_checks:
+        status_result = check_git("status", "--porcelain", "--", rel_path)
+        if status_result.returncode != 0:
+            # Fail closed: an empty stdout from a failed `git status` is not "clean".
+            git_err = (status_result.stderr or "").strip()[:300] or "no stderr output"
+            return _reject(
+                f"git status failed (exit {status_result.returncode}) for "
+                f"{label}'{rel_path}': {git_err}. Cannot confirm the file is committed, "
+                "so it cannot be cited."
+            )
+        file_status = status_result.stdout.strip()
+        if file_status:
+            status_code = file_status[:2]
+            if status_code == "??":
+                status_desc = "untracked (not yet added to git)"
+            elif "M" in status_code:
+                status_desc = "modified but not committed"
+            elif "A" in status_code:
+                status_desc = "staged but not committed"
+            else:
+                status_desc = f"uncommitted (status: {status_code.strip()})"
+            return _reject(
+                f"File is {status_desc}: {label}'{rel_path}'. "
                 "File-based evidence must be committed to git before it can be cited. "
                 "This ensures the evidence is verifiable at the claimed revision. "
                 "Commit the file first, then retry with the new git SHA."
-                + _HONESTY_REMINDER
-            ),
-            "content_hash": "",
-            "git_sha": "",
-        }
+            )
 
     if not content_hash:
         with open(abs_file, "rb") as f:
@@ -691,19 +888,39 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", s
             git_sha = head_result.stdout.strip()
 
     if git_sha:
-        verify_result = _file_git("cat-file", "-e", f"{git_sha}:{rel_path}")
-        if verify_result.returncode != 0:
-            return {
-                "ok": False,
-                "error": (
-                    f"File '{rel_path}' does not exist at git revision {git_sha[:8]}. "
+        for label, rel_path in path_checks:
+            verify_result = check_git("cat-file", "-e", f"{git_sha}:{rel_path}")
+            if verify_result.returncode != 0:
+                return _reject(
+                    f"File {label}'{rel_path}' does not exist at git revision {git_sha[:8]}. "
                     "The git_sha must point to a commit that contains this file. "
                     "Check that you committed the file before this revision."
-                    + _HONESTY_REMINDER
-                ),
-                "content_hash": "",
-                "git_sha": "",
-            }
+                )
+            if cross_repo:
+                # The isfile check above only inspects the cited abs_file. The
+                # object repo_path names in source_repo must be a blob too: for a
+                # directory `cat-file -e` succeeds on the tree (a symlink entry
+                # is also a blob, which is fine) (#3393).
+                type_result = check_git("cat-file", "-t", f"{git_sha}:{rel_path}")
+                obj_type = (type_result.stdout or "").strip()
+                if type_result.returncode != 0 or obj_type != "blob":
+                    return _reject(
+                        f"repo_path '{rel_path}' must name a file (a blob) at git "
+                        f"revision {git_sha[:8]} in source_repo, but it is "
+                        f"{('a ' + obj_type) if obj_type else 'not readable'}. "
+                        "Cite a committed file's path, not a directory."
+                    )
+        if not cross_repo:
+            for link, work_tree, rel_link in in_tree_links:
+                if work_tree != real_root:
+                    continue
+                verify_result = _git_at(real_root, "cat-file", "-e", f"{git_sha}:{rel_link}")
+                if verify_result.returncode != 0:
+                    return _reject(
+                        f"The symlink '{link}' ('{rel_link}') does not exist at git "
+                        f"revision {git_sha[:8]}. The git_sha must point to a commit "
+                        "that contains every symlink the cited path goes through."
+                    )
 
     return {"ok": True, "error": None, "content_hash": content_hash, "git_sha": git_sha}
 
@@ -740,6 +957,13 @@ def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
         )
     if not os.path.exists(file_path):
         return None  # File existence is checked separately
+    # A FIFO (or any non-regular file) blocks read_text() forever; an evidence row
+    # created for a regular file can have its path replaced later (#3393).
+    if not os.path.isfile(file_path):
+        return (
+            f"Evidence must be a file: '{file_path}' is not a regular file. "
+            "Cite a file inside it instead."
+        )
 
     try:
         content = Path(file_path).read_text(encoding="utf-8", errors="replace")
@@ -788,7 +1012,7 @@ def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
             "BEFORE RETRYING: check the engram-observe skill (Step A.4) for the "
             "pre-verification script. For JSONL files, messages may not have flushed "
             "yet — verify the quote exists in the file BEFORE calling this tool. "
-            "Run: ~/.engram/tools/verify_quote.py <file> <phrase>"
+            'Run: "${ENGRAM_HOME:-$HOME/.engram}"/tools/verify_quote.py <file> <phrase>'
         )
     # Near-matches are computed against `content` -- for a PDF that's raw
     # bytes decoded as UTF-8 with errors="replace", i.e. noise. Suggesting
@@ -812,6 +1036,117 @@ def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # A-family impls
 # ---------------------------------------------------------------------------
+
+def _evidence_fields_error(url: str, title: str) -> Optional[str]:
+    """Required-field check of an evidence write (item-independent, no writes).
+    Returns the bare error text, or None."""
+    if not url or not url.strip():
+        return "url is required and cannot be empty."
+    if not title or not title.strip():
+        return "title is required and cannot be empty."
+    return None
+
+
+def _evidence_row_id_for_url(url: str) -> Optional[str]:
+    """Id of the evidence row already registered for this raw url, else None.
+    The same lookup _add_evidence_impl's reuse short-circuit makes."""
+    conn = core._get_db()
+    try:
+        row = conn.execute(
+            "SELECT id FROM nodes WHERE source_url = ? AND type = 'evidence'"
+            " ORDER BY created_at DESC LIMIT 1", (url,)).fetchone()
+        return row["id"] if row else None
+    finally:
+        conn.close()
+
+
+def _evidence_url_error(url: str, source_repo: str = "", repo_path: str = "") -> Optional[str]:
+    """Every rejection an evidence write makes about the url alone (#3399): the
+    file:// committed-before-cite capture check, and for web urls the hostname /
+    TLD / localhost / DNS checks, and the unrecognized-scheme check.
+
+    ITEM-INDEPENDENT and write-free: no DB, no observation input. Returns the
+    bare error text (no "Failed to create evidence node:" prefix), or None when
+    the url may be cited. Called by _add_evidence_impl itself, after its
+    existing-row reuse short-circuit, and by the batch's up-front check, so a
+    url the evidence write would refuse is refused once at batch level instead
+    of once per item (and one DNS lookup instead of one per item).
+    """
+    RECOGNIZED_SCHEMES = ("http://", "https://", "file://")
+    _HONESTY_REMINDER = (
+        "\n\nRemember: cheating blinds you. A fabricated URL corrupts your own memory "
+        "and every future step built on it. If the real source is hard to find, "
+        "raise the problem transparently — never solve it with a shortcut. (the provenance axiom)"
+    )
+    if url.startswith("file://"):
+        # File:// URLs: enforce the committed-before-cite guard. Do NOT
+        # store the version state on the evidence — that lives on each
+        # citing observation now.
+        ver = _capture_file_version(url, source_repo=source_repo, repo_path=repo_path)
+        if not ver["ok"]:
+            return ver["error"]
+    elif url.startswith("http://") or url.startswith("https://"):
+        # --- Validation for web URLs ---
+        parsed_url = urlparse(url)
+        hostname = parsed_url.hostname or ""
+
+        # Check 1: Structural — must have a valid hostname
+        if not hostname:
+            return (
+                f"Malformed URL '{url}' — no hostname found. "
+                "Evidence URLs must point to real, resolvable web addresses."
+                + _HONESTY_REMINDER
+            )
+
+        # Check 2: TLD — hostname must contain a dot (rejects fabricated
+        # single-label hosts like 'session-transcript', 'conversation')
+        if "." not in hostname:
+            if hostname == "localhost":
+                return (
+                    f"Cannot cite a localhost URL directly — local/LAN addresses are not "
+                    "stable evidence sources. To cite a forum post or local file, archive it first: "
+                    "`engram-snapshot forum:<thread_id>` (forum thread) or "
+                    "`engram-snapshot file:<path>` (local file), then cite the resulting "
+                    "file:// evidence record returned by the snapshot tool."
+                    + _HONESTY_REMINDER
+                )
+            return (
+                f"Invalid hostname '{hostname}' in URL — no TLD found. "
+                "This looks like a fabricated domain. Real web URLs have a domain "
+                "with a TLD (e.g., 'arxiv.org', 'reuters.com')."
+                + _HONESTY_REMINDER
+            )
+
+        # Check 3: DNS resolution — verify the domain actually exists.
+        # If the agent is citing an online source, network should be available.
+        # A DNS failure almost certainly means a fabricated or hallucinated domain.
+        try:
+            socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        except socket.gaierror as e:
+            # Only block on definitive name-not-found errnos.
+            # EAI_NONAME / EAI_NODATA = the domain truly doesn't exist.
+            # EAI_AGAIN / EAI_FAIL = transient DNS infra; treat like timeout (pass).
+            if e.errno in NXDOMAIN_ERRNOS:
+                return (
+                    f"DNS resolution failed for '{hostname}' — this domain does not exist. "
+                    "The URL may be fabricated or hallucinated. Verify you have the correct URL "
+                    "from a real source before citing it as evidence."
+                    + _HONESTY_REMINDER
+                )
+            # Transient — fall through to silent pass (same as the OSError branch).
+        except (socket.timeout, OSError):
+            # Network issues — warn but don't block, since the domain might be real
+            pass
+
+    elif not any(url.startswith(s) for s in RECOGNIZED_SCHEMES):
+        return (
+            f"Unrecognized URL scheme in '{url}'. Evidence URLs must be resolvable — "
+            "use file:// for local files or https:// for web sources. "
+            "Do not invent synthetic schemes (e.g., conversation://, measurement://)."
+            + _HONESTY_REMINDER
+        )
+    return None
+
 
 def _add_evidence_impl(
     url: str = "",
@@ -849,10 +1184,9 @@ def _add_evidence_impl(
     Returns:
         JSON with the evidence node ID and trust pool status.
     """
-    if not url or not url.strip():
-        return json.dumps({"error": "url is required and cannot be empty."})
-    if not title or not title.strip():
-        return json.dumps({"error": "title is required and cannot be empty."})
+    _fields_err = _evidence_fields_error(url, title)
+    if _fields_err:
+        return json.dumps({"error": _fields_err})
     conn = core._get_db()
     try:
         # Compute domain + yellow-card match early so every success return path
@@ -879,83 +1213,14 @@ def _add_evidence_impl(
                 reuse["yellow_card_warning"] = _format_yellow_warning(_yellow_match)
             return json.dumps(reuse)
 
-        # Validate evidence URL resolvability
-        RECOGNIZED_SCHEMES = ("http://", "https://", "file://")
-        _HONESTY_REMINDER = (
-            "\n\nRemember: cheating blinds you. A fabricated URL corrupts your own memory "
-            "and every future step built on it. If the real source is hard to find, "
-            "raise the problem transparently — never solve it with a shortcut. (the provenance axiom)"
-        )
-        if url.startswith("file://"):
-            # File:// URLs: enforce the committed-before-cite guard. Do NOT
-            # store the version state on the evidence — that lives on each
-            # citing observation now.
-            ver = _capture_file_version(url, source_repo=source_repo, repo_path=repo_path)
-            if not ver["ok"]:
-                return json.dumps({"error": ver["error"]})
-        elif url.startswith("http://") or url.startswith("https://"):
-            # --- Validation for web URLs ---
-            parsed_url = urlparse(url)
-            hostname = parsed_url.hostname or ""
-
-            # Check 1: Structural — must have a valid hostname
-            if not hostname:
-                return json.dumps({
-                    "error": f"Malformed URL '{url}' — no hostname found. "
-                    "Evidence URLs must point to real, resolvable web addresses."
-                    + _HONESTY_REMINDER
-                })
-
-            # Check 2: TLD — hostname must contain a dot (rejects fabricated
-            # single-label hosts like 'session-transcript', 'conversation')
-            if "." not in hostname:
-                if hostname == "localhost":
-                    return json.dumps({
-                        "error": f"Cannot cite a localhost URL directly — local/LAN addresses are not "
-                        "stable evidence sources. To cite a forum post or local file, archive it first: "
-                        "`engram-snapshot forum:<thread_id>` (forum thread) or "
-                        "`engram-snapshot file:<path>` (local file), then cite the resulting "
-                        "file:// evidence record returned by the snapshot tool."
-                        + _HONESTY_REMINDER
-                    })
-                return json.dumps({
-                    "error": f"Invalid hostname '{hostname}' in URL — no TLD found. "
-                    "This looks like a fabricated domain. Real web URLs have a domain "
-                    "with a TLD (e.g., 'arxiv.org', 'reuters.com')."
-                    + _HONESTY_REMINDER
-                })
-
-            # Check 3: DNS resolution — verify the domain actually exists.
-            # If the agent is citing an online source, network should be available.
-            # A DNS failure almost certainly means a fabricated or hallucinated domain.
-            try:
-                socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-            except socket.gaierror as e:
-                # Only block on definitive name-not-found errnos.
-                # EAI_NONAME / EAI_NODATA = the domain truly doesn't exist.
-                # EAI_AGAIN / EAI_FAIL = transient DNS infra; treat like timeout (pass).
-                if e.errno in NXDOMAIN_ERRNOS:
-                    return json.dumps({
-                        "error": f"DNS resolution failed for '{hostname}' — this domain does not exist. "
-                        "The URL may be fabricated or hallucinated. Verify you have the correct URL "
-                        "from a real source before citing it as evidence."
-                        + _HONESTY_REMINDER
-                    })
-                # Transient — fall through to silent pass (same as the OSError branch).
-            except (socket.timeout, OSError):
-                # Network issues — warn but don't block, since the domain might be real
-                pass
-
-        elif not any(url.startswith(s) for s in RECOGNIZED_SCHEMES):
-            return json.dumps({
-                "error": f"Unrecognized URL scheme in '{url}'. Evidence URLs must be resolvable — "
-                "use file:// for local files or https:// for web sources. "
-                "Do not invent synthetic schemes (e.g., conversation://, measurement://)."
-                + _HONESTY_REMINDER
-            })
+        # Item-independent url validation (no writes): one helper, shared with
+        # the batch's up-front check.
+        _url_err = _evidence_url_error(url, source_repo=source_repo, repo_path=repo_path)
+        if _url_err:
+            return json.dumps({"error": _url_err})
 
         # Check trust pool (domain already computed above for yellow-card)
-        config = json.loads(core.CONFIG_PATH.read_text()) if core.CONFIG_PATH.exists() else {}
+        config = core._config_io.read_config_json(core.CONFIG_PATH)
         trust_pool = config.get("trust_pool", [])
         in_trust_pool = any(domain.endswith(tp) for tp in trust_pool)
 
@@ -977,7 +1242,7 @@ def _add_evidence_impl(
              source_type),
         )
 
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
         conn.commit()
 
         # Durability dual read-back (alpha#2193; supersedes the single
@@ -1001,6 +1266,9 @@ def _add_evidence_impl(
             "source_date": source_date or None,
             "in_trust_pool": in_trust_pool,
         }
+        _emb_block = core._embedding_response_block(_emb_outcome)  # #345 PR3 B4
+        if _emb_block:
+            result["embedding_failure"] = _emb_block  # R1: renamed key
         if trust_pool and not in_trust_pool:
             result["warning"] = (
                 f"Domain '{domain}' is NOT in the trusted source pool. "
@@ -1186,6 +1454,53 @@ def _build_anchoring_advisory(
         return {"status": "unavailable", "reason": str(exc)[:200]}
 
 
+def _evidence_capture_error(url: str, source_repo: str = "", repo_path: str = "") -> Optional[str]:
+    """The item-independent first check an evidence write makes (#3399), with
+    the "Failed to create evidence node:" prefix the single and batch paths
+    both report. Returns the prefixed error text, or None when the url may be
+    cited."""
+    err = _evidence_url_error(url, source_repo=source_repo, repo_path=repo_path)
+    return f"Failed to create evidence node: {err}" if err else None
+
+
+def _preflight_item_checks(url: str, quoted_text: str, *, content_hash: str = "",
+                           git_sha: str = "", source_repo: str = "",
+                           repo_path: str = ""):
+    """The per-observation rejections that depend only on the cited file (#3399).
+
+    Returns (error_json_or_None, ver_or_None); ver is the version capture to
+    reuse after the evidence write. Quote check first, then the caller
+    content_hash / git_sha version check -- the order the evidence_id path uses.
+    """
+    quote_error = _verify_quote_in_source(url, quoted_text)
+    if quote_error:
+        return json.dumps({"error": quote_error}), None
+    ver = _capture_file_version(
+        url, content_hash=content_hash, git_sha=git_sha,
+        source_repo=source_repo, repo_path=repo_path)
+    if not ver["ok"]:
+        return json.dumps({"error": ver["error"]}), None
+    return None, ver
+
+
+def _preflight_file_evidence(url: str, quoted_text: str, *, content_hash: str = "",
+                             git_sha: str = "", source_repo: str = "",
+                             repo_path: str = ""):
+    """Every rejection decided before a file:// evidence write (#3399): the
+    evidence-capture check, then the per-observation checks. The single source
+    of truth for the url path of the single-observation impl, which the batch
+    also goes through (it passes url+title per item).
+
+    Returns (error_json_or_None, ver_or_None).
+    """
+    cap_error = _evidence_capture_error(url, source_repo=source_repo, repo_path=repo_path)
+    if cap_error:
+        return json.dumps({"error": cap_error}), None
+    return _preflight_item_checks(
+        url, quoted_text, content_hash=content_hash, git_sha=git_sha,
+        source_repo=source_repo, repo_path=repo_path)
+
+
 def _add_observation_impl(
     quoted_text: str = "",
     interpretation: str = "",
@@ -1215,6 +1530,7 @@ def _add_observation_impl(
     recall_keywords: Optional[list] = None,
     evidence_type: str = "",
     original_url: str = "",
+    _evidence_created_out: Optional[dict] = None,
 ) -> str:
     """Internal implementation — see engram_add_observation MCP tool for the
     public payload schema. Kept callable with named kwargs for in-server
@@ -1230,6 +1546,10 @@ def _add_observation_impl(
     default is restored just below when session_id is not the source.
     Callers that always pass source_class explicitly (the batch impl) are
     unaffected either way.
+
+    ``_evidence_created_out`` is a private out-parameter for the batch impl: when
+    a dict is passed, ``["created"]`` is set True iff THIS call wrote a new
+    evidence row (False when it reused one). It is never part of the response.
     """
     # Per the bool-string-truthy lesson: bool-string truthy trap at wrapper boundary. JSON-string
     # "false" is truthy in Python, so an `is_predictive: "false"` payload
@@ -1451,6 +1771,28 @@ def _add_observation_impl(
             {"error": "'title' is required when providing 'url' for auto-creating an evidence node."}
         )
 
+    # Every rejection that depends only on the cited file is decided HERE,
+    # before the evidence write (#3399). _add_evidence_impl commits its row on
+    # its own connection (and reads it back on a second one), so the evidence
+    # write cannot share a transaction with the observation insert below: a
+    # rejection decided after it would leave an orphan evidence row. The same
+    # checks used to run after it; their results are reused further down.
+    #
+    # Invariant this relies on: on this path ev["source_url"] == url byte for
+    # byte. _add_evidence_impl's reuse lookup is `source_url = ?` on the raw
+    # url, with no normalisation, and it INSERTs that same raw url when it
+    # creates the row. So verifying the quote against `url` here, before the
+    # write, is identical to verifying it against the row's source_url after.
+    _pre_quote_checked = False
+    _pre_ver = None
+    if not evidence_id and url and url.startswith("file://"):
+        _pre_err, _pre_ver = _preflight_file_evidence(
+            url, quoted_text, content_hash=content_hash, git_sha=git_sha,
+            source_repo=source_repo, repo_path=repo_path)
+        if _pre_err:
+            return _pre_err
+        _pre_quote_checked = True
+
     _yellow_forward = None
     if not evidence_id and url:
         # Auto-create or reuse evidence node
@@ -1462,6 +1804,8 @@ def _add_observation_impl(
             return json.dumps({"error": f"Failed to create evidence node: {ev_result['error']}"})
         evidence_id = ev_result["evidence_id"]
         _yellow_forward = ev_result.get("yellow_card_warning")
+        if _evidence_created_out is not None:
+            _evidence_created_out["created"] = ev_result.get("status") == "created"
 
     conn = core._get_db()
     try:
@@ -1484,7 +1828,10 @@ def _add_observation_impl(
         # than silently resolving one way or the other. Absent/empty
         # arguments never touch the evidence node -- an evidence node created
         # without a snapshot must not grow a spurious key.
-        _ev_metadata = json.loads(ev["metadata"] or "{}")
+        # #3413: parse silently here (an early return below discards the
+        # write); the replacement of a non-object blob is logged and warned
+        # at the WRITE, where it actually happens.
+        _ev_metadata = core._metadata_dict(ev["metadata"])
         _ev_metadata_changed = False
         _evidence_type_conflict = None
         _original_url_conflict = None
@@ -1513,14 +1860,20 @@ def _add_observation_impl(
 
         # Verify quoted_text exists in the evidence source (file:// only)
         ev_url = ev["source_url"] or ""
-        quote_error = _verify_quote_in_source(ev_url, quoted_text)
-        if quote_error:
-            return json.dumps({"error": quote_error})
+        # (The url path already ran both this and the version capture below
+        # before the evidence write — #3399 — and reuses their results.)
+        if not _pre_quote_checked:
+            quote_error = _verify_quote_in_source(ev_url, quoted_text)
+            if quote_error:
+                return json.dumps({"error": quote_error})
 
         # Capture per-observation file version (the evidence-block refactor derivation). For file:// URLs
         # in a git repo: enforce committed-before-cite + record the specific
         # revision read on this observation. For other URLs: no-op.
-        ver = _capture_file_version(ev_url, content_hash=content_hash, git_sha=git_sha, source_repo=source_repo, repo_path=repo_path)
+        if _pre_quote_checked:
+            ver = _pre_ver
+        else:
+            ver = _capture_file_version(ev_url, content_hash=content_hash, git_sha=git_sha, source_repo=source_repo, repo_path=repo_path)
         if not ver["ok"]:
             return json.dumps({"error": ver["error"]})
         captured_content_hash = ver["content_hash"]
@@ -1596,13 +1949,10 @@ def _add_observation_impl(
         )
 
         # Edge: observation cites evidence
-        conn.execute(
-            "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-            (node_id, evidence_id, now),
-        )
+        core._insert_cites_edge(conn, node_id, evidence_id, now)
 
         # Stamp importance
-        core._stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
+        _emb_outcome = core._stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
 
         result = {
             "status": "created",
@@ -1645,8 +1995,14 @@ def _add_observation_impl(
             source_class, confidence,
         )
 
+        # recall_summary over the 140 target (#3537) — say so in the response.
+        _overrun = core._recall_summary_overrun_note(len(_recall_summary or ""))
+        if _overrun:
+            result["recall_summary_overrun"] = _overrun
+
         # Handle prediction decomposition
         prediction_id = None
+        _pred_emb_outcome = None
         if is_predictive and predicted_event:
             # Check if a prediction node for this event already exists
             existing_pred = conn.execute(
@@ -1668,8 +2024,23 @@ def _add_observation_impl(
                     (prediction_id, predicted_event, resolution_timeframe or None, now),
                 )
                 result["prediction_status"] = "created"
-                core._log_edit(conn, "created", prediction_id, "prediction",
-                          {"predicted_event": predicted_event[:200]})
+                # #3348: the prediction node now goes through _stamp_new_node
+                # (importance stamp + write-time embed + #3343 write-path
+                # contract), same as every other node-creating INSERT.
+                # _stamp_new_node writes its OWN "created" edit_history row
+                # (details: {"confidence": ...}, read fresh off the node
+                # after its importance UPDATE) -- the manual _log_edit call
+                # that used to be the ONLY "created" row here is removed so
+                # there is exactly one, not two. _stamp_new_node's own row
+                # does not carry predicted_event (it only ever logs
+                # confidence; not touched here per #3348's DO NOT), so that
+                # detail is preserved under a separate, non-"created" action
+                # instead of being silently dropped.
+                _pred_emb_outcome = core._stamp_new_node(
+                    conn, prediction_id, confidence=0.5, surprise=0.5,
+                )
+                core._log_edit(conn, "prediction_decomposed", prediction_id,
+                          "prediction", {"predicted_event": predicted_event[:200]})
 
             # Edge: prediction predicted_by observation (#2252 W6 — split
             # out of supported_by; prediction is still the SOURCE, the
@@ -1685,7 +2056,17 @@ def _add_observation_impl(
 
             result["prediction_id"] = prediction_id
 
-        core._stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
+        # #3353: the observation node is stamped exactly ONCE -- the
+        # `_stamp_new_node` call right after the evidence `cites` edge
+        # above (the one that feeds `_emb_outcome` into the response
+        # below). A second, duplicate call used to run here, after the
+        # prediction-decomposition block: nothing between the two call
+        # sites reassigns `confidence` or runs `UPDATE nodes` on this
+        # observation's own row, so the second call re-stamped the exact
+        # same importance/embedding inputs -- one wasted embed, and a
+        # second "created" edit_history row for every observation ever
+        # written (issue #3353). Removed; `_emb_outcome` from the FIRST
+        # call above is the one that reaches the response unchanged.
 
         # Attach similarity results with decision guidance.
         #
@@ -1823,6 +2204,13 @@ def _add_observation_impl(
         # un-committed together, so the evidence node's metadata never
         # changes for an observation that itself was never created.
         if _ev_metadata_changed:
+            # A non-object blob read as {} above, so the dict being written
+            # REPLACES it: the write-side helper logs that and hands back the
+            # warning for this tool's `warnings` list (#3413).
+            _, _ev_replaced_warning = core._metadata_dict_for_write(
+                ev["metadata"], evidence_id, "engram_add_observation")
+            if _ev_replaced_warning:
+                result["warnings"] = result.get("warnings", []) + [_ev_replaced_warning]
             conn.execute(
                 "UPDATE nodes SET metadata = ? WHERE id = ?",
                 (json.dumps(_ev_metadata), evidence_id),
@@ -1858,7 +2246,7 @@ def _add_observation_impl(
             person_mentions = []
             claim_lower = claim.lower()
             for prow in person_rows:
-                pmeta = json.loads(prow["metadata"] or "{}")
+                pmeta = core._metadata_dict(prow["metadata"])
                 pname = pmeta.get("name", "")
                 paliases = pmeta.get("aliases", [])
                 vocab = [pname] + (paliases if isinstance(paliases, list) else [])
@@ -1954,7 +2342,54 @@ def _add_observation_impl(
                 )
             except Exception:
                 pass
-        return json.dumps(core._strip_agent_facing(result))
+        # #345 PR3 B4: R1 (round 2) renamed this block's key to
+        # "embedding_failure", which never collides with _AGENT_STRIP_KEYS'
+        # literal "embedding" entry (the raw vector payload strip) -- the
+        # earlier strip-then-add ordering workaround is no longer needed.
+        _stripped = core._strip_agent_facing(result)
+        _emb_block = core._embedding_response_block(_emb_outcome)
+        # #3348 round 2 (Kepler's ruling on PR #3352, option B + rider):
+        # "embedding_failure" keeps EXACTLY its
+        # #3343 meaning -- the OBSERVATION node's outcome, always a dict,
+        # never a list. The prediction node's outcome (when the prediction
+        # was CREATED this call, not linked_to_existing, and its embed
+        # failed) goes in its OWN separate key, "prediction_embedding_
+        # failure", same shape. A key whose type depends on how many
+        # things failed is a reader hazard (Kepler's ruling); one key, one
+        # meaning, one shape, per node -- the round-1 dict-or-list shape
+        # this replaced is gone.
+        #
+        # Rider: both dicts carry "node_id" -- including "embedding_
+        # failure" ALWAYS, with or without a prediction node in play (an
+        # additive key, harmless to every existing dict reader that never
+        # expected it). Each dict's own "message" names its own node id in
+        # the text (no new top-level response line; #3343's reason for
+        # nesting "message" inside the block, rather than a new top-level
+        # key, still stands): message = f"{node_id}: " + <the message
+        # _embedding_response_block returned>, applied uniformly to both
+        # keys in every case (single-failure or both-fail).
+        #
+        # _pred_emb_outcome is None on the linked_to_existing path (no
+        # stamp call ran) and whenever is_predictive/predicted_event are
+        # absent -- _embedding_response_block requires a real
+        # EmbeddingOutcome, so it must not be called with None.
+        _pred_emb_block = (
+            core._embedding_response_block(_pred_emb_outcome)
+            if _pred_emb_outcome is not None else None
+        )
+        if _emb_block:
+            _emb_block = dict(_emb_block)
+            _emb_block["node_id"] = node_id
+            _emb_block["message"] = f"{node_id}: " + _emb_block["message"]
+            _stripped["embedding_failure"] = _emb_block
+        if _pred_emb_block:
+            _pred_emb_block = dict(_pred_emb_block)
+            _pred_emb_block["node_id"] = prediction_id
+            _pred_emb_block["message"] = (
+                f"{prediction_id}: " + _pred_emb_block["message"]
+            )
+            _stripped["prediction_embedding_failure"] = _pred_emb_block
+        return json.dumps(_stripped)
     finally:
         conn.close()
 
@@ -2019,26 +2454,50 @@ def _add_observation_batch_impl(
         observations = json.loads(observations_json)
     except json.JSONDecodeError as e:
         return json.dumps({"error": f"Invalid JSON: {e}"})
+    except TypeError:
+        return json.dumps({
+            "error": f"observations_json must be a JSON string, got "
+                     f"{type(observations_json).__name__}"
+        })
 
     if not isinstance(observations, list):
         return json.dumps({"error": "observations_json must be a JSON array."})
 
-    # Resolve evidence node once for the whole batch
+    # The shared evidence row is NOT written here (#3399). A url batch hands
+    # url+title to the single-observation path per item; that path decides every
+    # rejection before ITS evidence write and reuses the row by source_url, so
+    # the only writer of the row is an item that passed. No per-item rejection,
+    # present or future, can orphan it. A caller-supplied evidence_id is cited
+    # as-is and never written or deleted here.
     resolved_evidence_id = evidence_id
     evidence_created = False
     _batch_yellow = None
+    _use_url = False
     if not resolved_evidence_id and url:
         if not title:
             return json.dumps({"error": "'title' is required when providing 'url'."})
-        ev_result = json.loads(_add_evidence_impl(
-            url=url, title=title, domain=domain, source_date=source_date,
-            source_repo=source_repo, repo_path=repo_path,
-        ))
-        if ev_result.get("error"):
-            return json.dumps({"error": f"Failed to create evidence node: {ev_result['error']}"})
-        resolved_evidence_id = ev_result["evidence_id"]
-        evidence_created = ev_result["status"] == "created"
-        _batch_yellow = ev_result.get("yellow_card_warning")
+        # BATCH-LEVEL (item-independent, no write, decided once, one top-level
+        # error with dev's text): a blank title, and everything
+        # _evidence_url_error checks -- file:// capture, unrecognized scheme,
+        # localhost / no-TLD host, NXDOMAIN. They depend on url/title alone, so
+        # N items would only repeat them (and repeat the DNS lookup).
+        # PER-ITEM (decided by the single path for each item, before ITS
+        # evidence write): required fields, quote vs the file, version
+        # (content_hash / git_sha), recall_summary, standpoint_*, fs_class, ...
+        _fields_err = _evidence_fields_error(url, title)
+        if _fields_err:
+            return json.dumps({"error": f"Failed to create evidence node: {_fields_err}"})
+        # The evidence write reuses an existing row for the url BEFORE it
+        # validates the url, so a non-file url whose row exists is not
+        # re-validated here either (same as dev). file:// is always checked: the
+        # single path's preflight does the same, row or no row.
+        _row_exists = (not url.startswith("file://")) and _evidence_row_id_for_url(url)
+        if not _row_exists:
+            _cap_error = _evidence_capture_error(url, source_repo=source_repo, repo_path=repo_path)
+            if _cap_error:
+                return json.dumps({"error": _cap_error})
+        _use_url = True
+        resolved_evidence_id = None
     elif not resolved_evidence_id:
         return json.dumps({"error": "Provide either 'url' (+ 'title') or 'evidence_id'."})
 
@@ -2054,8 +2513,12 @@ def _add_observation_batch_impl(
             results.append({"index": i, "error": f"Missing required fields: {', '.join(missing)}"})
             continue
 
+        _ev_out = {}
         r = json.loads(_add_observation_impl(
-            evidence_id=resolved_evidence_id,
+            evidence_id=resolved_evidence_id or "",
+            **({"url": url, "title": title, "domain": domain,
+                "source_date": source_date, "_evidence_created_out": _ev_out}
+               if _use_url else {}),
             quoted_text=obs["quoted_text"],
             interpretation=obs["interpretation"],
             claim=obs["claim"],
@@ -2078,6 +2541,21 @@ def _add_observation_batch_impl(
             recall_keywords=obs.get("recall_keywords"),
         ))
         r["index"] = i
+        if _use_url and r.get("status") == "created":
+            # Every created item cites the same url-keyed row: the first one
+            # wrote it (or reused a pre-existing one), the rest reuse it.
+            if resolved_evidence_id and r.get("evidence_id") != resolved_evidence_id:
+                raise RuntimeError(
+                    f"batch items disagree on the shared evidence row: "
+                    f"{resolved_evidence_id!r} vs {r.get('evidence_id')!r} (#3399)")
+            resolved_evidence_id = r.get("evidence_id")
+            if _ev_out.get("created"):
+                evidence_created = True
+        # The batch reports the evidence warning once, at batch level; the
+        # per-item shape stays what the evidence_id path always returned.
+        _item_yellow = r.pop("yellow_card_warning", None) if _use_url else None
+        if _item_yellow and not _batch_yellow:
+            _batch_yellow = _item_yellow
         results.append(r)
 
     created = [r for r in results if r.get("status") == "created"]

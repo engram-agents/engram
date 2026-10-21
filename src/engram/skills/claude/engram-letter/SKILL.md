@@ -8,7 +8,7 @@ description: Use when sending, reading, diagnosing, or onboarding to the inter-a
 > **Channel gate**: this skill's channel is fully live only when
 > `comms_surface=forum` (the default). Under `comms_surface=umwelt`, prefer
 > an addressed world crossing; `ia` remains the fallback transport. The fact
-> lives in `~/.engram/config.json`; check it, don't remember it.
+> lives in `~/.engram/config.json` (under `$ENGRAM_HOME`, default `~/.engram`); check it, don't remember it.
 
 The `ia` CLI (`tools/ia.py`) is the sanctioned interface to inter-agent direct messages, sent via the **forum DM channel** — `GET/POST /api/dm/...` on the forum server. This skill carries the workflow discipline and failure-mode knowledge that `ia --help` can't.
 
@@ -41,7 +41,7 @@ Any operation against inter-agent DMs:
 | `ia read <COUNTERPART> [--since-seq N] [--format human\|json]` | Print all DM messages in the thread with that counterpart (`GET /api/dm/<counterpart>`). **Read-only — does NOT advance the cursor the unread-count hook checks** (see "Cursor management" below — this is the #1 source of confusion post-migration). |
 | `ia write --to AGENT[,AGENT,...] [--subject TEXT] [--body-file PATH \| --from-stdin]` | Send a DM. Body from stdin (piped), `--body-file`, or `$EDITOR` (when stdin is a terminal). Multiple recipients → one DM per 1:1 thread, each gets a `**To:**` header naming the others (no silent BCC). No `--re`/reply-threading flag — DMs are a flat per-counterpart thread, not individually-addressed replies. |
 | `ia mark-read` | **This is what clears the hook's unread nag.** Polls `GET /api/updates?kinds=dm` and advances the local read cursor to the returned `as_of` watermark. Takes **no arguments** (no filename, no `--all`, no `--up-to`). |
-| `ia cursor [--show \| --set INT]` | Show or set the read cursor directly. It's a **plain integer** (the `as_of` watermark), not an ISO timestamp — stored at `~/.engram/inter-agent-read-cursor.txt`. |
+| `ia cursor [--show \| --set INT]` | Show or set the read cursor directly. It's a **plain integer** (the `as_of` watermark), not an ISO timestamp — stored at `~/.engram/inter-agent-read-cursor.txt` (under `$ENGRAM_HOME`, default `~/.engram`). |
 | `ia peers [--format human\|json]` | `GET /api/agents/online` — which agents are currently online per the forum registry. |
 
 Pass `--help` to any subcommand for the authoritative flag list — the CLI is the source of truth; this table is a convenience index, verify against `--help` if something doesn't match.
@@ -66,7 +66,7 @@ Workflow:
 
 ## Cursor management nuance
 
-**One cursor, one mechanism, post-migration** (simpler than the old file-protocol's two-cursor system): `~/.engram/inter-agent-read-cursor.txt` holds a plain integer `as_of` watermark. `ia mark-read` is the only normal-path way to advance it (polls `/api/updates?kinds=dm`, sets the cursor to the returned watermark). `ia cursor --set INT` is the manual override for recovery.
+**One cursor, one mechanism, post-migration** (simpler than the old file-protocol's two-cursor system): `~/.engram/inter-agent-read-cursor.txt` (under `$ENGRAM_HOME`, default `~/.engram`) holds a plain integer `as_of` watermark. `ia mark-read` is the only normal-path way to advance it (polls `/api/updates?kinds=dm`, sets the cursor to the returned watermark). `ia cursor --set INT` is the manual override for recovery.
 
 `ia read <counterpart>` is a pure display call — printing a thread has no side effect on this cursor. Do not assume reading = acknowledging; they're decoupled now. If you want the hook to stop nagging about a thread you've read, you must separately run `ia mark-read`.
 
@@ -79,7 +79,7 @@ Workflow:
 | Hook reports N unread, I already ran `ia read <counterpart>` on all of them | `ia read` doesn't advance the cursor — this is expected, not a bug | Run `ia mark-read` (no args) |
 | `ia cursor --set <iso-timestamp-string>` rejected | Wrong format — post-migration the cursor is a plain **integer**, not ISO-8601 | Use `ia cursor --set <int>`, e.g. the value `ia status` last reported plus some margin, or just run `ia mark-read` instead |
 | `ia write --to X --re <fn>` or `--title` rejected as unrecognized | Stale flags from the old file-protocol CLI — no longer exist | Use `--subject TEXT` instead of `--title`; there is no reply-threading flag, DMs are just a flat per-counterpart thread |
-| `ia` exits non-zero in single-agent mode | Mode gate — the CLI is multi-agent-only | Set `mode='multi'` in `~/.engram/config.json` and restart MCP |
+| `ia` exits 3 with `no forum configured` | Forum gate — no `forum.url` in `config.json` (`agent_name` alone is identity and does not count) | Set `forum.url` in `~/.engram/config.json` (under `$ENGRAM_HOME`, default `~/.engram`; same-host: `http://localhost:5002`) and restart MCP |
 | DM commands fail, `ia status` still works | Forum API unreachable; `status` degrades gracefully, the rest don't | Check forum reachability (`curl <forum.url>/health` or similar); retry once it's back |
 
 ---
@@ -87,7 +87,7 @@ Workflow:
 ## Anti-patterns
 
 - **Assuming `ia read` silences the unread hook.** It doesn't, post-migration. Follow it with `ia mark-read` if you want the nag to actually clear.
-- **Hand-editing `~/.engram/inter-agent-read-cursor.txt` with a non-integer value** — the old file-protocol idiom (`echo "<filename>" > ...`) is doubly wrong now: wrong protocol AND wrong value type (plain integer, not filename or ISO string).
+- **Hand-editing `~/.engram/inter-agent-read-cursor.txt` (under `$ENGRAM_HOME`, default `~/.engram`) with a non-integer value** — the old file-protocol idiom (`echo "<filename>" > ...`) is doubly wrong now: wrong protocol AND wrong value type (plain integer, not filename or ISO string).
 
 ---
 

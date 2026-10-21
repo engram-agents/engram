@@ -39,7 +39,7 @@ def main() -> int:
         return 2
     cohort_start = sys.argv[3]
 
-    # Default to ~/.engram regardless of where this script is installed.
+    # Default to ~/.engram (ENGRAM_HOME overrides) regardless of where this script is installed.
     # Path(__file__).resolve() would follow symlinks (tools/ is a symlink in
     # plugin topology) and land in the plugin root, not the data home. ENGRAM_HOME
     # env override remains for sandbox / multi-agent testing.

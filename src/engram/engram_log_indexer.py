@@ -4,8 +4,8 @@ Spec: alpha #175 (two-level logging architecture)
 Tracking: alpha #175
 
 This module reads per-session JSONL event files from
-~/.engram/logs/sessions/*.l{1,2}.jsonl and projects them into a
-read-optimised SQLite index at ~/.engram/logs/index.db.
+~/.engram/logs/sessions/*.l{1,2}.jsonl ($ENGRAM_HOME) and projects them into a
+read-optimised SQLite index at ~/.engram/logs/index.db ($ENGRAM_HOME).
 
 Design principles:
   - index.db is a DERIVED PROJECTION. Truth lives in JSONL files.

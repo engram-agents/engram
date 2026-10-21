@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{LABEL}}</string>
+
+    <!-- Every launch path's argv MUST contain `engramd_owner` (engram_pidfile's program
+         marker): the script path below carries it. ENGRAM_HOME is read from
+         EnvironmentVariables, as for the surface daemon.
+
+         Exit codes are supervised by meaning, matching engramd-owner.service.template:
+           0  clean stop            -> NOT restarted. KeepAlive {SuccessfulExit: false}
+                                       restarts only after a NON-zero exit.
+           1  OwnerAlreadyRunning
+              (and every refusal)   -> restarted, once per ThrottleInterval.
+           3  EXIT_DISPLACED        -> restarted: the owner shut down on a displaced
+                                       substrate without closing the store, so it must
+                                       never read as a success.
+         launchd has NO start limit: a persistent non-zero exit (a refusal the install-time
+         preflight cannot see, or an owner already running unsupervised) retries once every
+         ThrottleInterval (60 s) indefinitely. The systemd unit no longer reaches a permanent
+         stop for such exits either; like launchd it keeps retrying them, with a backoff
+         (RestartSec rising to RestartMaxDelaySec over RestartSteps) only where systemd supports
+         it (>= 254), and with no backoff below that. Exit 4, in RestartPreventExitStatus, is the
+         exception: not restarted, so it still stops for good, by design. Liveness, not the retry
+         interval, is what the two share. launchd shows that as `spawn scheduled`, and the line
+         start-engramd-owner.sh prints names the exit the record holds. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PYTHON}}</string>
+        <string>{{ENGRAM_OWNER_PY}}</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ENGRAM_HOME</key>
+        <string>{{ENGRAM_HOME}}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>{{ENGRAM_HOME}}/engramd-owner.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{ENGRAM_HOME}}/engramd-owner.log</string>
+</dict>
+</plist>

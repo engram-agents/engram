@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # engram-fix-git-backup.sh — ONE-TIME cleanup for existing ENGRAM installs
 #
-# Existing installs may have a bloated ~/.engram/.git from:
+# Existing installs may have a bloated ~/.engram/.git (under $ENGRAM_HOME) from:
 #   (a) Binary files tracked: knowledge.db, *.db-wal, *.db-shm, *.bak, diary.db
 #   (b) knowledge.sql containing full ~384-float embedding vectors per node
 #       (~79 MB per commit, no delta compression → .git balloons to GBs)
@@ -15,7 +15,7 @@
 #
 # Env vars:
 #   ENGRAM_HOME   ENGRAM data directory (default: ~/.engram)
-#   PYTHON_BIN    Python interpreter (default: $ENGRAM_HOME/venv/bin/python if
+#   PYTHON_BIN    Python interpreter (default: $HOME/.engram/venv/bin/python if
 #                 present, else python3 with a warning about sqlite_vec)
 #
 # Steps:
@@ -36,6 +36,26 @@
 
 set -euo pipefail
 
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863): it would resolve against the calling process's cwd, a
+# different home for every process. Unset or empty means unset; a leading ~ is expanded against $HOME and
+# re-exported (~user is not expanded: it is not absolute, so it is refused). Checked before anything else
+# runs; `return` covers a script that is sourced, `exit` one that is executed.
+if [ -n "${ENGRAM_HOME-}" ]; then
+    _eh_raw="$ENGRAM_HOME"
+    case "$ENGRAM_HOME" in
+        "~") ENGRAM_HOME="${HOME-}"; export ENGRAM_HOME ;;
+        "~/"*) ENGRAM_HOME="${HOME-}/${ENGRAM_HOME#"~/"}"; export ENGRAM_HOME ;;
+    esac
+    case "$ENGRAM_HOME" in
+        /*) ;;
+        *)
+            printf "ENGRAM_HOME must be an absolute path, got '%s'\n" "$_eh_raw" >&2
+            unset _eh_raw
+            return 2 2>/dev/null || exit 2 ;;
+    esac
+    unset _eh_raw
+fi
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -43,11 +63,11 @@ ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
 # Resolve python: honour explicit $PYTHON_BIN override; else prefer the ENGRAM
 # venv (which has sqlite_vec); else fall back to system python3 with a warning.
 if [[ -z "${PYTHON_BIN:-}" ]]; then
-    if [[ -x "$ENGRAM_HOME/venv/bin/python" ]]; then
-        PYTHON_BIN="$ENGRAM_HOME/venv/bin/python"
+    if [[ -x "$HOME/.engram/venv/bin/python" ]]; then
+        PYTHON_BIN="$HOME/.engram/venv/bin/python"
     else
         PYTHON_BIN="python3"
-        echo "[engram-fix-git-backup] WARNING: venv python not found at $ENGRAM_HOME/venv/bin/python; falling back to system python3 — the SQL dump may fail on vec0 tables if sqlite_vec is missing." >&2
+        echo "[engram-fix-git-backup] WARNING: venv python not found at $HOME/.engram/venv/bin/python; falling back to system python3 — the SQL dump may fail on vec0 tables if sqlite_vec is missing." >&2
     fi
 fi
 DRY_RUN=0

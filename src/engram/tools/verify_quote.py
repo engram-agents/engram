@@ -16,7 +16,8 @@ Exit codes:
     0 — quote FOUND (verbatim substring match).
     1 — quote NOT FOUND (including an empty/unflushed file) — the check ran,
         the quote is absent.
-    2 — could not check at all (bad usage, file does not exist).
+    2 — could not check at all (bad usage, file does not exist, path is not a
+        regular file — a directory, FIFO or device).
 
 Callers relying on the shell idiom `verify_quote.py f q && next_step` can
 trust exit 0 as "verified"; any nonzero exit means do not proceed as if
@@ -36,6 +37,13 @@ def main():
 
     if not os.path.exists(file_path):
         print(f"FILE NOT FOUND: {file_path}")
+        sys.exit(2)
+
+    # Before any open(): a directory would raise IsADirectoryError (exit 1 =
+    # "quote absent", the wrong code) and a FIFO would block forever (#3400).
+    if not os.path.isfile(file_path):
+        print(f"Evidence must be a file: '{file_path}' is not a regular file. "
+              f"Cite a file inside it instead.")
         sys.exit(2)
 
     with open(file_path, encoding="utf-8", errors="replace") as f:

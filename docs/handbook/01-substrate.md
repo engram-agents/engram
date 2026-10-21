@@ -128,13 +128,13 @@ Columns: `nodes.importance_base`, `nodes.importance_score`, `nodes.recall_turn`,
 
 **what** — Reinforcement-learning-inspired utility bump: each node's `utility_score` increases when the node is surfaced in a tool result and later cited as a premise. Uses Q-learning formula `Q_new = Q_old + α(1 - Q_old)` where α is determined by the action's "intensity of impression" (deeper cognitive load = higher α). Three tiers: 0.15 (derive/supersede/contradict), 0.10 (focus), 0.05 (loose touch). Utility_score is composited with semantic similarity in the retrieval ranking formula (multiplicative blend in `engram_query.py:1506–1522`).
 
-**how** — `_utility_reward()` in `engram_core.py:1980` bumps utility for a list of nodes given an action key. `USE_ALPHA` dict in `engram_core.py:215` maps action→α. Reward applied in observation/derivation/supersede/retract/contradiction/focus operations (callers in `engram_derive.py`, `engram_revision.py`, `engram_focus.py`, `engram_observation.py`, etc.). Composited in retrieval via multiplicative amplifiers in `engram_query.py:1506–1522`: `composite = relevance × (1 + UTIL_BETA × utility_score) × (1 + IMP_BETA × normalized_importance)`.
+**how** — `_utility_reward()` in `engram_core.py` bumps utility for a list of nodes given an action key; it delegates the whole sequence to the shared `engram_restamp.use_reward`, which bumps utility and then, for actions in `RESTAMP_ACTIONS` (e.g. "mention", used by the mention Stop hook), also restamps `recall_turn` + `importance_score` (not `recall_count`) in a SAVEPOINT -- so `_utility_reward` is no longer utility-only. The `USE_ALPHA` dict lives in `engram_restamp.py` and maps action→α (`engram_core.py` re-exports it). Reward applied in observation/derivation/supersede/retract/contradiction/focus operations (callers in `engram_derive.py`, `engram_revision.py`, `engram_focus.py`, `engram_observation.py`, etc.). Composited in retrieval via multiplicative amplifiers in `engram_query.py:1506–1522`: `composite = relevance × (1 + UTIL_BETA × utility_score) × (1 + IMP_BETA × normalized_importance)`.
 
 **status-candidate** — **prod-presumed** (active in retrieve/search but effects are subtle; observability poor without utility_score instrumentation).
 
-**files** — `engram_core.py` (`USE_ALPHA` :215; `_utility_reward()` :1980; `UTIL_BETA` :239; `IMP_BETA` :242; `MMR_LAMBDA` :251). `engram_query.py` (composite formula :1506–1522; reward call sites distributed across tool modules).
+**files** — `engram_restamp.py` (`USE_ALPHA`, `USE_ALPHA_DEFAULT`, `RESTAMP_ACTIONS`, `use_reward()`). `engram_core.py` (`USE_ALPHA` re-export; `_utility_reward()`; `UTIL_BETA` :239; `IMP_BETA` :242; `MMR_LAMBDA` :251). `engram_query.py` (composite formula :1506–1522; reward call sites distributed across tool modules).
 
-**key constants** — `USE_ALPHA`: {"derive": 0.15, "supersede": 0.15, "contradict": 0.15, "focus": 0.10, "focus_load": 0.05, "unfocus": 0.05}. `USE_ALPHA_DEFAULT=0.10` (`engram_core.py:236`). `UTIL_BETA=0.10` (`engram_core.py:239`). `IMP_BETA=0.005` (`engram_core.py:242`). (The old UTILITY_AMPLIFIER=0.50 constant was replaced by the UTIL_BETA/IMP_BETA dual-amplifier model in the #872 refactor.)
+**key constants** — `USE_ALPHA`: {"derive": 0.15, "supersede": 0.15, "contradict": 0.15, "mention": 0.10, "focus": 0.10, "focus_load": 0.05, "unfocus": 0.05, ...} (abridged; full table in `engram_restamp.py`). `USE_ALPHA_DEFAULT=0.10` (`engram_restamp.py`, re-exported by `engram_core.py`). `UTIL_BETA=0.10` (`engram_core.py:239`). `IMP_BETA=0.005` (`engram_core.py:242`). (The old UTILITY_AMPLIFIER=0.50 constant was replaced by the UTIL_BETA/IMP_BETA dual-amplifier model in the #872 refactor.)
 
 **tests** — test_utility_use_action.py.
 
@@ -211,7 +211,7 @@ Validation: `engram_add_edge()` (server.py wrapper :4454 → `_add_edge_impl()` 
 
 **files** — `engram_core.py` (`EDGE_CLASSIFICATIONS` :551; derived constants `DAG_EXEMPT_RELATIONS` :709, `_ADDABLE_AFTER_CREATION_RELATIONS` :714, `_REMOVABLE_EDGE_RELATIONS` :4858). `engram_cornerstone.py` (`_add_edge_impl()` :571; `_remove_edge_impl()` :465). `engram_query.py` (`_get_neighbors()` :782). server.py (wrappers: `engram_add_edge` :4454; `engram_remove_edge` :4367).
 
-**key constants** — All 13 relation types defined in EDGE_CLASSIFICATIONS (and mirrored in VALID_RELATIONS): `about`, `cites`, `contradicts`, `derives_from`, `exemplifies`, `instantiates`, `resolves`, `retracts`, `serves`, `subtask_of`, `supersedes`, `supported_by`, `tensions`.
+**key constants** — All 17 relation types defined in EDGE_CLASSIFICATIONS (and mirrored in VALID_RELATIONS): `about`, `acknowledged_derives_from`, `bears_on`, `cites`, `contradicts`, `derives_from`, `exemplifies`, `generalizes`, `instantiates`, `predicted_by`, `resolves`, `retracts`, `serves`, `subtask_of`, `supersedes`, `supported_by`, `tensions`.
 
 **tests** — test_link_about_payload.py, test_add_edge_*.py (in test directory), test_remove_edge_payload.py.
 
@@ -346,8 +346,8 @@ Marker protocol: written at checkpoint (nap 7757–7767); read by engram_report_
 **how** — Columns added via migration (`engram_core.py:2091–2094`): trust_tier (TEXT), trust_signal_kind, trust_signal_polarity, trust_signal_weight. Backfill (`engram_core.py:2129–2131`): UPDATE nodes SET trust_tier='unknown' WHERE type='person' AND trust_tier IS NULL.
 
 Entry points:
-- `engram_add_person()` (server.py:3587–3642) creates pn_* with trust_tier param.
-- `engram_set_trust_tier()` (server.py:3855–3907) updates tier on existing node.
+- `engram_add_person()` (server.py:3587–3642) creates pn_* with an optional trust_tier, accepted only below the internal-circle threshold (known_external, unknown, suspect). our_side and above, and self, are refused at creation (#1825).
+- `engram_set_trust_tier()` (server.py:3855–3907) is the one path that changes a tier on an existing node, and the only way to reach our_side or above (primary-user approval + justification; the is_self gate for self). `engram_update_person` refuses trust_tier (#1825).
 - `engram_add_trust_signal()` (server.py:4010–4068) creates ts_* node linking to person.
 
 **status-candidate** — **prod-presumed** (infrastructure in place; trust-tier filtering in agent recalls not yet implemented as of current snapshot).
@@ -436,7 +436,7 @@ Core search: `_search_nodes()` (6118–6570) implements FTS + semantic search, t
 
 **how** — Entry point: `engram_reflect()` (17143–17890) computes full briefing, optional slim via `_slim_reflect_briefing()` (17012–17088). Uses queries for:
 - Active goals/tasks (status='open' or 'in_progress')
-- Contradictions (status='active' or 'unresolved')
+- Contradictions (status IN ('active', 'partially_resolved'); `active` alone means no resolves closure yet, #1654)
 - Tainted nodes (has both current version AND superseding version in a contradiction)
 - Stale nodes (importance_score near decay floor)
 - Support-lost (had supporting edges, now none)

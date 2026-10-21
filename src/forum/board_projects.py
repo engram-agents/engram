@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import os
 import re
 import subprocess
 import sys
@@ -49,35 +48,19 @@ VALID_STATUSES = {"planning", "in-progress", "in-review", "merged", "cancelled"}
 _FILE_DONE_STATUSES = {"merged", "cancelled"}
 
 # GitHub anchor parsing: pr/<N> or pr/<owner>/<repo>/<N> (#1715 -- vendored
-# from tools/baton.py's _parse_github_anchor/DEFAULT_GITHUB_REPO; kept in
-# sync by hand since this is server-side code and baton.py is the client
-# CLI, same cross-boundary-vendoring precedent as compression_fidelity's own
-# constants.py. A bare pr/<N> anchor (no repo) is matched against
-# DEFAULT_GITHUB_REPO explicitly -- NOT gh's ambient-cwd resolution, which
-# is what let a repo-unqualified anchor silently reconcile against whatever
-# repo the forum server process happened to be rooted in (#1715's root
-# cause: PR-22 in engram-paper reconciled against engram-alpha's own #22).
-_PR_ANCHOR_RE = re.compile(r"^pr/(?:([\w.-]+)/([\w.-]+)/)?(\d+)$", re.IGNORECASE)
-
-# Read from $ENGRAM_DEFAULT_GITHUB_REPO, NOT hardcoded as a private-repo
-# literal -- this source tree is scanned pre-release (tools/scan-leaks.py)
-# for exactly this shape of leak (a private dev-repo name baked into shipped
-# code).
+# from tools/baton.py's _parse_github_anchor; kept in sync by hand since
+# this is server-side code and baton.py is the client CLI, same
+# cross-boundary-vendoring precedent as compression_fidelity's own
+# constants.py.
 #
-# #1918 update: this constant no longer has a counterpart in tools/baton.py
-# -- that module removed its own default entirely (an unqualified pr/<N>
-# anchor there now refuses/skips rather than resolving a guessed repo; see
-# baton.py's own comment for why). This module's default is intentionally
-# left as-is here: board_projects.py is read-only/display-only (it renders
-# a computed status, never writes one back -- see umwelt's
-# src/umwelt/gh_reconcile.py docstring, which already supersedes this
-# module for write-back reconciliation), so the DEFAULT_GITHUB_REPO's
-# stakes here are lower than baton.py's -- baton.py's own gc/merge can
-# take a real, sometimes irreversible action on the resolved repo, this
-# module cannot. Porting the same refuse-and-count fix here is real
-# follow-up work, deliberately left as a sibling change (see #1918) rather
-# than folded into that fix to keep the diff reviewable.
-DEFAULT_GITHUB_REPO = os.environ.get("ENGRAM_DEFAULT_GITHUB_REPO", "engram-agents/engram")
+# #1918 / #1919: there is NO default repo for a bare pr/<N> anchor,
+# deliberately -- do not revisit (same rule as tools/baton.py). A bare
+# anchor is never looked up on GitHub (neither a default repo nor gh's
+# ambient-cwd resolution -- #1715's root cause: PR-22 in engram-paper
+# reconciled against engram-alpha's own #22); it keeps its stored status and
+# is flagged gh_state='unqualified' / gh_unknown=True. Only a repo-qualified
+# pr/<owner>/<repo>/<N> anchor is reconciled.
+_PR_ANCHOR_RE = re.compile(r"^pr/(?:([\w.-]+)/([\w.-]+)/)?(\d+)$", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +120,23 @@ def _infer_kind(project_id: str, github_ref: str) -> str:
 # gh PR state reconciliation
 # ---------------------------------------------------------------------------
 
+# Injection point for the GitHub identity of the board's `gh` read (#3509). The
+# forum server sets it from main() to the baton gate's public `gh_call_identity`
+# helper, so this read runs under the SAME explicit minimal env as the gate. A
+# provider is a zero-arg callable returning ``(extra_run_kwargs, refusal)`` where
+# ``refusal`` is None or a non-None "do not call gh" verdict. None (the default:
+# tests, anything not configured) keeps today's behaviour exactly: gh inherits
+# the process environment and no `env` kwarg is passed. Deliberately not an
+# import of the gate -- board_projects must not locate it by path.
+_GH_IDENTITY_PROVIDER = None
+
+
+def configure_gh_identity(provider) -> None:
+    """Set (or, with None, clear) the gh identity provider for `_gh_pr_state`."""
+    global _GH_IDENTITY_PROVIDER
+    _GH_IDENTITY_PROVIDER = provider
+
+
 def _gh_pr_state(pr_number: str, repo: str) -> str:
     """Query GitHub for a PR's state via `gh pr view --repo <repo>`.
 
@@ -152,12 +152,19 @@ def _gh_pr_state(pr_number: str, repo: str) -> str:
     cwd) -- that ambient-cwd fallback is exactly what let a PR-baton for one
     repo silently reconcile against a same-numbered PR in a different repo.
     """
+    gh_kw: dict = {}
+    provider = _GH_IDENTITY_PROVIDER
+    if provider is not None:
+        gh_kw, refusal = provider()
+        if refusal is not None:
+            return "unknown"  # no identity: never call gh under an ambient login
     try:
         result = subprocess.run(
             ["gh", "pr", "view", pr_number, "--repo", repo, "--json", "state"],
             capture_output=True,
             text=True,
             timeout=10,
+            **gh_kw,
         )
     except FileNotFoundError:
         return "unknown"
@@ -303,8 +310,10 @@ def _effective_status(
     Returns:
         (effective_status, gh_state)
         effective_status is 'done' when file says done OR gh says merged/closed.
-        gh_state is 'merged'/'closed'/'open'/'unknown'/'skipped'/'' (empty
-        when no ref). 'skipped' (#2007) means the record's file status was
+        gh_state is 'merged'/'closed'/'open'/'unknown'/'skipped'/'unqualified'/''
+        (empty when no ref). 'unqualified' (#1918/#1919) means the anchor is a
+        bare pr/<N> with no repo: no gh lookup is ever made for it and the
+        stored status is kept as-is (there is NO default repo). 'skipped' (#2007) means the record's file status was
         already file-done (_FILE_DONE_STATUSES), so gh reconciliation was
         deliberately never attempted for it — distinct from 'unknown', which
         means a lookup was attempted and failed. A ref shared with another,
@@ -314,9 +323,9 @@ def _effective_status(
     # File-level done detection
     file_done = file_status in _FILE_DONE_STATUSES
 
-    # Extract (repo, PR number) from github ref. #1715: an unqualified
-    # pr/<N> anchor resolves against DEFAULT_GITHUB_REPO explicitly here,
-    # never gh's ambient cwd.
+    # Extract (repo, PR number) from github ref. #1918: an unqualified
+    # pr/<N> anchor has NO repo (no default, no ambient cwd) -- it is never
+    # looked up and keeps its stored status.
     m = _PR_ANCHOR_RE.match(github_ref.strip())
     if not m:
         # No PR ref — use file status directly.
@@ -324,8 +333,9 @@ def _effective_status(
         return eff, ""
 
     owner, repo_name, pr_num = m.group(1), m.group(2), m.group(3)
-    repo = f"{owner}/{repo_name}" if owner and repo_name else DEFAULT_GITHUB_REPO
-    ref = (repo, pr_num)
+    if not (owner and repo_name):
+        return ("done" if file_done else file_status), "unqualified"
+    ref = (f"{owner}/{repo_name}", pr_num)
     if ref in gh_states:
         # Resolved this call (whether because the record itself is active, or
         # because another record sharing this ref is) — report the real state.
@@ -425,9 +435,10 @@ def read_project_board(store) -> list[dict[str, Any]]:
 
         kind = _infer_kind(project_id, github_ref)
 
-        # Collect (repo, PR number) for batch gh resolution. #1715: an
-        # unqualified pr/<N> anchor resolves against DEFAULT_GITHUB_REPO
-        # explicitly, never gh's ambient cwd.
+        # Collect (repo, PR number) for batch gh resolution. #1918: only a
+        # repo-qualified pr/<owner>/<repo>/<N> anchor is collected; a bare
+        # pr/<N> has no repo (no default, never gh's ambient cwd), so it gets
+        # no gh lookup at all (_pr_ref stays None).
         #
         # #2007: skip adding the ref to the resolve set when this record's
         # file status is already file-done (_FILE_DONE_STATUSES). This is not
@@ -443,10 +454,8 @@ def read_project_board(store) -> list[dict[str, Any]]:
         # record sharing a ref does not matter.
         pr_m = _PR_ANCHOR_RE.match(github_ref)
         pr_ref = None
-        if pr_m:
-            _owner, _repo_name, pr_num = pr_m.group(1), pr_m.group(2), pr_m.group(3)
-            pr_repo = f"{_owner}/{_repo_name}" if _owner and _repo_name else DEFAULT_GITHUB_REPO
-            pr_ref = (pr_repo, pr_num)
+        if pr_m and pr_m.group(1) and pr_m.group(2):
+            pr_ref = (f"{pr_m.group(1)}/{pr_m.group(2)}", pr_m.group(3))
             if file_status not in _FILE_DONE_STATUSES and pr_ref not in _seen_pr:
                 _seen_pr.add(pr_ref)
                 pr_refs_to_resolve.append(pr_ref)
@@ -494,7 +503,11 @@ def read_project_board(store) -> list[dict[str, Any]]:
         )
 
         # gh_unknown flag: set when we have a PR ref but couldn't resolve state.
-        gh_unknown = bool(pr_ref and gh_states.get(pr_ref) == "unknown")
+        # #1918: a bare (unqualified) anchor is likewise unresolvable -- flag
+        # it, except on an already-file-done record (nothing to warn about).
+        gh_unknown = bool(pr_ref and gh_states.get(pr_ref) == "unknown") or (
+            gh_state == "unqualified" and file_status not in _FILE_DONE_STATUSES
+        )
 
         age = _age_str(raw["turn_since"])
 

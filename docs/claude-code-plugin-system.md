@@ -31,7 +31,7 @@ run, useful only for one-off testing.) Consequences (full table in §5):
 | hook / tool / skill code | **immediately** (re-read per invocation; no `/plugin update`) |
 | **agent spec (`agents/*.md`)** | after **`/plugin marketplace update` + `/reload-plugins`** (agents load from the cache snapshot, not source — #1639) |
 | `server.py` (MCP) | after a `/mcp` reconnect or restart (process is from session start) |
-| `hooks.json` *registration* (add/remove a hook) | after a **full Claude Code restart** |
+| `hooks.json` *registration* (add/remove a hook) | after **`/reload-plugins`** (measured for an addition, #1892, and a removal, #3265); full restart only as fallback |
 
 And the meta-rule that produced all of this: **to know which code is live,
 instrument the live artifact — never infer from a version string, a JSON file, or
@@ -128,7 +128,7 @@ are out of scope for the source-loading mechanism above.)
 | Tool code (`tools/*.py`) | next call | next call | No |
 | `server.py` / MCP code | — | next `/mcp` reconnect or session | **Yes** — `/mcp` reconnect (lighter) or restart; the process is from session start, so its path is source but it doesn't hot-reload |
 | `.mcp.json` launcher | session start | next session | Yes — restart |
-| **`hooks.json` registration** (add/remove a hook) | **session start** | **next session** | **Yes — full Claude Code restart.** This is the v0.1.4 lever (§10) |
+| **`hooks.json` registration** (add/remove a hook) | **session start** | **Session start / `/reload-plugins`** (measured for an addition, #1892, and a removal, #3265) | **`/reload-plugins`; full restart only if a registration demonstrably doesn't take effect.** |
 | Shared-bin CLIs (`/home/agents-shared/bin/{baton,ia,forum}`) | — | on refresh | **Separate copies** — not the plugin tree; refresh independently |
 
 **`/reload-plugins`** applies plugin changes without a full restart. For **agents**
@@ -136,8 +136,11 @@ it is **required** (paired with `/plugin marketplace update`, which refreshes th
 cache snapshot agents load from — §4/§6), not merely a forcing function. For
 skills/tools (source-live) it is only a forcing function if a hot-reload ever fails.
 It does **not** substitute for the MCP reconnect; for a `hooks.json` *registration*
-change it reloaded hooks in-session in the #1639 case, but a full restart remains
-the conservative fallback (that specific case is not independently re-verified).
+change it reloaded hooks in-session: 19 in the #1639 case, and on the rc4 upgrade
+(#3265) it reported 28 = 20 engram + 8 umwelt, the NEW set (the old would read 30),
+with no restart. The addition case was measured on another seat (#1892, 2026-08-03:
+29 = 22 + 7, the new Stop hook fired). One seat each, two dates (harness versions not recorded); a full
+restart remains the fallback if a registration demonstrably doesn't take effect.
 
 ## 6. The cache & `installed_plugins.json` — bookkeeping for MOST, live for AGENTS
 
@@ -202,7 +205,7 @@ forum thread #189.
   snapshot, NOT source (§4/§6), so a rebuild alone is inert. Verify by dispatching the
   agent and confirming its tools; a stale-cache agent fails *silently* (#1639).
 - **Shipped a `server.py` change?** → rebuild, then `/mcp` reconnect (or restart).
-- **Added/removed a hook (touched `hooks.json`)?** → rebuild, then **full restart**.
+- **Added/removed a hook (touched `hooks.json`)?** → rebuild, then `/reload-plugins` (measured for an addition, #1892, and a removal, #3265); full restart only if a registration demonstrably doesn't take effect.
   `install-local-marketplace.sh` prints a `⚠️ HOOK REGISTRATION CHANGED` banner.
 - **Multi-agent shared CLIs changed?** → refresh `/home/agents-shared/bin/*`
   separately (they are copies, not the plugin tree).
@@ -235,3 +238,76 @@ forum thread #189.
   placeholder; `/plugin marketplace add <dir>`; `/reload-plugins`. The docs do
   **not** cover the directory-vs-git load distinction, the per-component lifecycle,
   or MCP re-spawn semantics — those are the gaps this doc fills empirically.
+
+## Moved from CLAUDE.md § Plugin deploy: for our LOCAL (directory) marketplace, the SOURCE tree is live (moved 2026-10-03, #3322)
+
+*Verbatim; moved, not edited. CLAUDE.md keeps the rule and a pointer here.*
+
+For our **`directory`-source local marketplace**, Claude Code invokes hooks / the
+MCP server / skills **directly from the marketplace SOURCE tree**
+(`~/.engram/marketplace/plugins/engram/`), and `CLAUDE_PLUGIN_ROOT` resolves to
+that path. (`~/.claude/plugins/known_marketplaces.json` sets `installLocation` to
+the source dir itself for a directory source.) The
+`~/.claude/plugins/cache/.../<version>/` snapshots + `installed_plugins.json`
+`installPath` are version **bookkeeping, NOT the live load path — for hooks /
+skills / tools.** **The one exception is AGENTS (sub-agents / fairies): they load
+from the `installPath` cache snapshot, NOT the source tree** (live-verified #1639,
+2026-07-02) — so for agents the cache IS the live path, and `installPath` points at
+a `.../cache/.../<version>/` snapshot, not the source dir. Mind the two distinct
+fields: marketplace `installLocation` (`known_marketplaces.json`) = source; plugin
+`installPath` (`installed_plugins.json`) = cache snapshot. Hooks/skills/tools follow
+`installLocation`; agents follow `installPath`. **Verified 2026-06-28** by
+instrumenting every hook copy and watching which fires in the live session: only the
+marketplace-tree copy fired, with `CLAUDE_PLUGIN_ROOT` = the source (that test
+covered hooks; the agent path was separately verified in #1639).
+
+**What this means for deploys/upgrades (the OPPOSITE of the official-marketplace
+model):**
+
+- **`tools/install-local-marketplace.sh` makes new HOOK / TOOL / SKILL code LIVE
+  immediately** — it rebuilds the source tree, which IS the live path. **No
+  `/plugin update` is needed** for hooks/tools/skills on a directory install
+  (hooks hot-reload: re-read from the source file per prompt).
+- **AGENTS are an exception (like the official-marketplace model):** sub-agent /
+  fairy specs (`agents/*.md`) load from the `installPath` **cache snapshot**, not the
+  source tree — so a rebuilt source is inert for agents until you **`/plugin
+  marketplace update engram-local` + `/reload-plugins`** (a full restart also works,
+  but is heavier). This failed silently in #1639: the #1551 dual-prefix MCP-tool fix
+  lived in source but never reached dispatched dream-fairies, which ran with zero
+  ENGRAM MCP access until the cache was refreshed. Verify an agent change by
+  dispatching one and confirming its tools (a stale-cache agent fails *silently*).
+- **MCP server is also an exception:** it launches from
+  `${CLAUDE_PLUGIN_ROOT}/launch-engram-server.sh` (= the source), but the running
+  *process* is from session start — a changed `server.py` needs a `/mcp` reconnect
+  or a restart to reload the process. The path is the source; the process does not
+  hot-reload.
+- **A changed `hooks.json` registration is re-read by `/reload-plugins` (measured
+  for an addition, #1892, and for a removal, #3265); a full Claude Code restart is
+  the fallback only if a registration demonstrably does not take effect.** Measured 2026-10-01 on the v0.5.2-rc4 upgrade (#3265): rc3's
+  deployed `hooks.json` had 22 entries, rc4's has 20, umwelt's has 8; after
+  `/plugin marketplace update engram-local` → `/reload-plugins` → `/mcp`
+  reconnect, with no restart, `/reload-plugins` reported 28 hooks (20 + 8, the
+  NEW set; the old set would read 30). The addition case was measured
+  in-session on another seat (#1892, Ariadne, 2026-08-03: three hooks added,
+  `/reload-plugins` reported 29 = 22 + 7, the new Stop hook fired, no restart).
+  One seat each, two dates (harness versions not recorded) — not a guarantee for every version. History: an
+  earlier version of this bullet said a full restart was required; the v0.1.4
+  four-day silent-hook outage that motivated it was a guard on
+  marketplace-path-invoked hooks killing all live hooks, *because our live hooks
+  ARE invoked from the marketplace path* — a different cause from registration
+  timing.
+
+**To know which code is actually running, instrument the live artifact — never
+infer from a proxy.** A version string, `installed_plugins.json`, or a bash-env
+test will mislead you (each misled me in turn on 2026-06-28 — a stale
+`BATON_PROJECTS_DIR` even made an old hook *look* migrated). The settling test:
+add a stderr/file sentinel to the top of each candidate hook copy, fire a REAL
+prompt (a self-wake counts), and read which copy logged — that, plus
+`CLAUDE_PLUGIN_ROOT` read from *inside* a live hook, are the only ground truth.
+
+*Full system model — why directory-source loads in-place, the per-component scope
+(verified vs inferred), the complete edit-takes-effect table, and the
+verify-the-live-artifact method — lives in
+[`docs/claude-code-plugin-system.md`](docs/claude-code-plugin-system.md) (read
+on-demand; not loaded every session). This behavior is **undocumented upstream** —
+re-verify after any Claude Code version bump.*

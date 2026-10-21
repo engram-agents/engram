@@ -173,10 +173,10 @@ entries on Linux, and `chmod -N` on Darwin. It does this through a directory fd 
 `O_DIRECTORY|O_NOFOLLOW` and `fstat`-checked, never by path. It then **sets the socket's own mode
 explicitly** rather than inheriting it from the umask.
 
-**Build scope.** The U4a build (#3194, #3201) implements the **Linux arm only**. On any other platform,
-or on a Linux seat without `setfacl` or `SO_PEERCRED`, the owner **refuses to start** (§2.2's posture)
-rather than running without the strip. The Darwin `chmod -N` step above specifies what a later Darwin
-build must do; no Darwin build does it today.
+**Build scope.** The U4a build (#3194, #3201) implemented the **Linux arm**, and the Darwin arm followed
+in #3666 (PR #3703), with build notes in §2.5. On any other platform, on a Linux seat without `setfacl`,
+`getfacl` or `SO_PEERCRED`, or on a Darwin seat without `socket.LOCAL_PEERCRED`, `/bin/chmod` or
+`/dev/fd`, the owner **refuses to start** (§2.2's posture) rather than running without the strip.
 
 ### 2.2 Peer credentials — defence in depth, and the assertion that makes it real
 
@@ -252,6 +252,117 @@ costs the one thing §5.5 requires.
 Before unlinking, the owner confirms the path is a socket (`stat.S_ISSOCK`) and **not a symlink**,
 then unlinks and binds. Replacing whatever sits at the path, sight unseen, turns crash recovery into
 "write a file anywhere the owner can reach".
+
+### 2.5 Darwin arm — build notes measured for #3666 (2026-10-10/11)
+
+§2.1 and §2.2 already decide the Darwin mechanisms: `chmod -N` for the `run/` strip and `LOCAL_PEERCRED`
+for the peer check. This section adds only what the Darwin build needs and those sections do not say.
+Every new row was measured on one seat: macOS 26.6.2, Apple M4, the plugin venv's Python 3.12.10, on
+2026-10-10/11. Rows that restate §2.1/§2.2 come from that section's own 09-26/09-28 measurements on the
+same Mac. Nothing here was measured on another Mac.
+
+**The fd-relative strip on Darwin is `chmod -N /dev/fd/<fd>`.** §2.1 requires the strip to go through the
+`O_DIRECTORY|O_NOFOLLOW` fd, never the path. Linux does that with `setfacl -b /proc/self/fd/<fd>`.
+Darwin has no `/proc`, but `/dev/fd/<fd>` serves the same purpose. With the fd passed via
+`pass_fds`, `chmod -N /dev/fd/<fd>` returned 0 and removed both explicit and inherited entries.
+- **Swap control (the property the Linux code relies on):** open `run/` (A), rename it away, create a new
+  `run/` (B) with its own entry, then strip through the fd. A was stripped and B was untouched, so the
+  strip acts on the fd's target, not on what the path names now. The test could have shown the
+  opposite, and was built to tell the two apart.
+- `O_DIRECTORY|O_NOFOLLOW` on a symlink to a directory refuses with `ENOTDIR` (errno 20), the same errno
+  the Linux docstring records.
+- **Open for the build: verify the strip by reading the ACL back.** `chmod -N` returned 0 in every case
+  above, and nothing in the Linux arm re-reads the ACL after `setfacl -b`. A strip that reports success
+  without verification is the silent-gap shape §2.2 refuses elsewhere. `acl_get_fd_np` and `acl_free`
+  are present in libc via ctypes (an fd-native read-back), but that call was NOT exercised. The build
+  must measure it, or use `ls -led /dev/fd/<fd>`, and refuse if any entry remains.
+  *Resolved in the build (#3666, PR #3703):* `acl_get_fd_np` works as the read-back, and NULL with ENOENT
+  means no ACL. `ls -led /dev/fd/<fd>` does NOT show a directory's ACL entry, so it cannot serve. The
+  build reads the ACL and the mode back through the strip's fd and refuses with `OwnerAclNotStripped`.
+  Measured: `chmod -N` leaves mode bits alone. The Linux arm reads back too since #3698.
+
+**Peer check: two facts §2.2's assertions already cover, stated so the build tests them.**
+- With a buffer length of 8, `getsockopt(0, LOCAL_PEERCRED, 8)` returned 8 bytes with no error, so the
+  kernel truncates silently rather than refusing. §2.2's "exactly 76 bytes" assertion and the
+  `unpack_from` parse form are what catch this; the build's test should pass a short buffer and
+  require a refusal.
+- **`cr_version == 0` is an added requirement, not in §2.2.** `XUCRED_VERSION` is 0 and the measured
+  buffers carried 0. A parser that ignores the field would read a future layout as this one, so the
+  Darwin parser must assert `cr_version == 0` alongside the length, and refuse otherwise.
+- `cr_ngroups` is capped at 16: this account has 20 groups and `xucred` carried the first 16. The owner
+  uses only the uid, so nothing is lost today. **Bound:** no future rule may rely on the group list
+  being complete on Darwin.
+- `getsockopt(0, LOCAL_PEERPID=2, 4)` returns the peer pid if a later unit wants it for logging. Python
+  exports neither `SOL_LOCAL` nor `LOCAL_PEERPID`, so they are literals with a comment.
+- Control: the same call on an unconnected socket fails with `ENOTCONN` (errno 57).
+
+**Socket path length: a gap on BOTH arms, found while measuring Darwin.**
+- On macOS `bind()` on a 129-byte path fails with `OSError: AF_UNIX path too long`. That failure is
+  the only measurement. The Darwin `sun_path` is 104 bytes **per the platform header, not measured
+  here**, and the usable boundary (103 vs 104) was not measured. Linux's 108 was not measured either.
+  *Measured since:* Darwin's usable limit is 103 bytes (103 binds, 104 fails; macOS 26.6.2, #3666),
+  and Linux's is 107 (107 binds, 108 fails; Linux 6.6, #3696).
+- The owner has no length check. `_bind_socket_or_raise` translates only `EADDRINUSE`; any other
+  `OSError` is re-raised raw. And `start()` runs `_harden_run_dir()` before the bind, so an over-long
+  path leaves `run/` created and hardened, then a bare traceback.
+- Reach: the owner builds the path only from `engram_home` (`self.socket_path = self.engram_home /
+  SOCKET_DIR_NAME / DEFAULT_SOCKET_NAME`, set in `__init__`). The default
+  `$HOME/.engram/run/engramd.sock` is 37 bytes on my seat, so only a long `ENGRAM_HOME` hits it.
+- **Requirement:** a length pre-check against the platform's limit, with a named refusal, placed
+  right after `_check_platform_support()` and computed from `self.socket_path`. It must precede the
+  FIRST filesystem mutation in `start()`, which is `self.engram_home.mkdir(...)`, not
+  `_harden_run_dir()`. The Darwin build includes it; the Linux half is #3696, against the same
+  contract. *As built:* #3696 landed first and holds the one check for both platforms
+  (`engramd_client.SOCKET_PATH_MAX_BYTES` plus one reason text, shared by owner and client); #3666
+  adds Darwin's measured 103 to that constant rather than a second check.
+
+**The refusal gains a Darwin branch, and the test marker must move with it.** Today
+`platform_unsupported_reason()` refuses anything that is not Linux, then checks for `setfacl`, then for
+`socket.SO_PEERCRED`. The Darwin branch checks the Darwin prerequisites instead:
+`socket.LOCAL_PEERCRED` present, `/bin/chmod` present (called by absolute path, never found through
+`PATH`: a GNU-coreutils-first `PATH` resolves a `chmod` that may lack `-N`), and `/dev/fd` present.
+It refuses, naming the
+missing one, if any is absent. An unrecognised platform still refuses. The `requires_linux_owner` marker
+keys on the same function (#3375), and that shared function is what keeps the refusal and the skip in
+agreement. The marker should still be renamed (to something like "owner-supported platform"), so the
+label says what it now means. It must never be re-keyed on `platform.system()`: #3375 showed a
+simulated-Darwin run that patched only `platform.system` missing the `SO_PEERCRED` absence a real
+Mac run found.
+
+**Consequence the build must handle: every marked test starts running on a Mac.** Once Darwin passes
+the refusal check, the marker no longer skips there. Some marked tests name Linux APIs directly, for
+example `tests/test_engramd_owner.py` reads `socket.SO_PEERCRED`. So the build needs a per-test audit
+of the marked tests, and a second marker for tests that are genuinely Linux-only (Linux API, `/proc`,
+`setfacl`). Tests with their own module-level Linux skip are already safe.
+
+**What Darwin adds nothing to, stated so a reader does not re-derive it.**
+- **File flags and xattrs.** `~/.engram` and `knowledge.db` carry no BSD flags, no ACL entries and no
+  xattrs on my seat (control: `ls -ldO /` shows `restricted`, so the column can report a flag).
+  Darwin's flags (`uchg`, `uappnd`, ...) only restrict, and a different uid cannot set them on this
+  directory. That is reasoning, not a measurement of every flag, but no flag grants access.
+- **launchd and TCC.** A temporary user LaunchAgent (parent pid 1, the plugin venv's python) listed
+  `~/.engram` and read `knowledge.db`'s header with no TCC prompt and no denial. It was unloaded and
+  removed after the run. **Bound, not measured:** an `ENGRAM_HOME` under a TCC-protected folder
+  (`~/Documents`, `~/Desktop`). Probing it would raise a consent dialog on the person's screen. The
+  launcher unit should refuse such a home, or document the Full Disk Access requirement, rather than
+  hang on an unanswerable prompt.
+
+**What the Darwin build must be tested against, on a real Mac** (beside §5's cells, which apply as
+written):
+1. Strip through the fd, with the swap control above: the fd's target is stripped, a replacement at
+   the path is not.
+2. A strip that leaves an entry behind is refused (read-back), not reported as success. A real
+   `chmod -N` never leaves one, so the fixture replaces the strip command with a no-op on a `run/`
+   that carries an entry. This cell is mutation-shaped by necessity; say so in the test.
+3. Short `LOCAL_PEERCRED` buffer → refusal. Wrong `cr_version` → refusal. Wrong level (`SOL_SOCKET`)
+   → refusal, never uid 0 accepted.
+4. An over-long socket path → named refusal, with NEITHER `engram_home` NOR `run/` created by this
+   start. A test that checks only `run/` would pass with the check wrongly placed between the two
+   mkdirs.
+5. The refusal and the test marker agree on a host missing each Darwin prerequisite in turn. On one
+   Mac this can only be simulated, and per #3375 the simulation must patch EACH primitive the
+   function reads (`socket.LOCAL_PEERCRED`, `shutil.which("chmod")`, the `/dev/fd` check), never
+   `platform.system` alone.
 
 ---
 
@@ -380,11 +491,30 @@ this moved in the opposite direction before their sensitivity check corrected it
 
 ### The scope finding that shrinks this section
 
-**For U4 — the unit this whole design blocks — the read surface is 19 literal, 0 f-string, and 2
-unclassifiable, both of which are module-level literals. 21 of 21 byte-stable.** (Reviewer's
-measurement over the hooks; I have not re-run it.)
+⚠ **Corrected after Sol's U4c re-measure (engram-alpha#3196, dev `8c52a989`).** Revision 3 said:
+*"For U4 — the unit this whole design blocks — the read surface is 19 literal, 0 f-string, and 2
+unclassifiable, both of which are module-level literals. 21 of 21 byte-stable."* That figure counted statements written **inside the hook files**,
+and I had relayed it without re-running it. As a statement of U4's read surface it was wrong in three
+ways:
 
-**So tier 2 is not on U4's path.** It was revision 2's largest new surface and the unit that needs it
+- **The 21 are 19 SELECTs + 2 PRAGMAs.** One PRAGMA is `journal_mode=WAL`
+  (`engram-utility-credit-mention-stop.py:153`), a mode *write* on a read-write connection. One
+  SELECT (`engram-surface-hook.py:1573`) reads the package DB, which §3.5 rules out of scope.
+- **A read registry governs what the hooks REACH, not what the hook files contain.**
+  `engram-lesson-tripwire-hook.py` imports `engram_core.generalization_chain` (`:324`) and calls it
+  on the hook's own connection (`:460`). Walking U2's call graph from the hook entry points, the hooks reach **30 SELECTs, 2 of
+  them f-strings** (`engram_core.py:1530` and `:1541`, both `WHERE id IN ({_ph})`).
+- **That 30 is "found by this instrument", neither an upper nor a lower bound.** U2's edges match
+  calls by bare name (which over-reaches) and produce no edge for attribute calls (which
+  under-reaches). Which effect dominates is not measured.
+
+**What survives:** both f-strings are variable-arity `IN`, which this section already assigns to
+tier 1 through `json_each` (below). **What does not:** "0 f-string" and "21 of 21". The two sites
+must be rewritten before U4c's real-tree scan can pass. That rewrite is its own precursor unit
+(U4c-0), not folded into U4c, because `engram_core` is shared with the write path and the change
+needs its own equivalence test, the empty list included (#3196).
+
+**So tier 2 is still not on U4's path.** It was revision 2's largest new surface and the unit that needs it
 does not exist yet. It is specified below in outline because the shape matters for whether tier 1's
 boundary is drawn correctly — but it is **deferred to the unit that actually needs it**, and U4 should
 build tier 1 plus §3.5's constraint and nothing else. A design that specifies speculatively is worse
@@ -647,6 +777,10 @@ and revision 2 named none of them.
 Row-level / per-caller result scoping remains out of scope, and is a *different* limitation from the
 one above — revision 1 conflated the two.
 
+### 3.6 Typed-op input bounds
+
+**Typed-op input bounds.** An owner op may **clamp** an out-of-range input only when it is an upper bound on magnitude **and the reply already reports what the clamp cut off**: the chain op's `max_depth` above `CHAIN_MAX_DEPTH_CAP` qualifies, because any cut it causes comes back as `truncated: true`. Every other out-of-range input is **refused by name**, before any statement: a wrong type, a negative value, an unknown enum member, a duplicate, and **any over-limit list**, because clamping a list silently drops an item the caller asked for and nothing in the reply says so. A new op that wants to clamp names the reply field that reports the cut; if it can't, it refuses.
+
 ---
 
 ## 4. The attacks — four named by #3097, plus a fifth
@@ -750,7 +884,11 @@ mistake as treating a fixture list as a specification.
 Contract-first — each test names the mutation that must turn it red.
 
 1. **Peer-uid mismatch → `Rejected(peer_identity)`.** *Mutation: make the uid check a no-op.*
-   ⚠ **Needs a second uid; cannot run on the author's seat — §6.**
+   ⚠ **Built twice (§6).** The real-socket cell
+   `tests/test_engramd_owner.py::test_peer_uid_mismatch_is_rejected` uses a uid-0 peer (passwordless
+   `sudo`: Linux CI runners only), and a uid-0 peer cannot tell the mismatch rule from the uid-0
+   clause, so **that cell alone** does not kill the stated mutation. **The suite does**, through the
+   fake-credential cells on each arm that feed a non-root foreign uid (`own + 1`) — named in §6.
 2. **The peer struct is parsed by `unpack_from`, and a 4-byte buffer RAISES.** *Mutation: replace the
    parse with the slice form `int.from_bytes(raw[4:8], "little")` — the test must go red because the
    slice returns 0 rather than raising.* **Runs anywhere, no privileges.** ⚠ Revision 1's version of
@@ -858,10 +996,54 @@ are entangled and the design was not built.
 
 ---
 
-## 6. The control this design cannot run, named rather than omitted
+## 6. The cross-uid control — what now runs, and what it cannot show
 
-**The cross-uid rejection test (test 1) has not been run, so the peer-credential read is unverified
-in the only direction that matters.**
+**Status, 2026-10-16 (this section was stale; corrected here, #3842).** The text below, from
+revision 5, said the cross-uid rejection test "has not been run". That stopped being true when the
+build landed. What runs, and what it can and cannot show:
+
+- **The CI cell.** `tests/test_engramd_owner.py::test_peer_uid_mismatch_is_rejected` (added by
+  PR #3201 as an unconditional skip; made to run where `sudo -n` works by PR #3421, closing #3197)
+  connects a real foreign peer, **uid 0 via passwordless `sudo`**, after a same-uid control that is
+  served. It PASSED in the main full suite (`tests.yml` run 38829935115 on `main`, 2026-10-16), and
+  it FAILED on the scratch branch `scratch/3197-crossuid-mutant` on 2026-10-05 (run 37316689182: the
+  uid-0 client was served `Ok`), so it has been seen to fail. It runs on Linux CI runners only;
+  agent seats skip it (no passwordless `sudo`).
+- **A live run.** Lei ran a uid-0 control against a live owner on 2026-09-29 (`Rejected
+  peer_identity`, recorded on #3201).
+- **The bound, documented at the cell.** `_check_peer_credentials` has two rejection branches: the
+  uid **mismatch**, and **uid 0 with a non-root owner**, with identical `peer_identity` reason and
+  `detail`. So a uid-0 peer is refused even if the mismatch rule is deleted, and the uid-0 cell
+  **cannot show that the mismatch rule works**. This is already stated in the comment above
+  `test_peer_uid_mismatch_is_rejected` (written 2026-10-05). The Darwin arm folds both conditions
+  into one `if`, so the same holds there.
+- **The mismatch rule IS tested, at unit level, on both arms**, by cells that hand the check a
+  manufactured credential carrying a non-root foreign uid (`own + 1`) and require `peer_identity`:
+  Linux — `tests/test_engramd_owner_displacement_3240.py::test_snapshot_dest_rights_premise_peer_uid_equals_owner`
+  (Linux-only file); Darwin — `tests/test_engramd_owner_darwin_3666.py::test_peercred_uid_mismatch_is_rejected_peer_identity`.
+  The Darwin file is skipped unless `sys.platform == "darwin"`, and every CI workflow runs on
+  `ubuntu-latest`, so the Darwin cell runs on Mac seats only, never in CI. These exercise the parse
+  and the decision; they do **not** exercise the kernel supplying a
+  foreign peer over a real socket.
+- **Real socket, non-root foreign peer, Linux: REJECTED (2026-10-16, recorded on #3097).** Borges ran
+  an owner as uid 1002 on a throwaway home at dev `3191ab3c` (Linux 6.6.87.2, WSL2), with `run/` at
+  0711 and the socket at 0777, so file permissions are not what refuses. Control: the owner's own uid
+  was served (`contract_version 1.1`). Arm: Zephyr connected as uid 1008 and got
+  `{"status": "rejected", "reason": "peer_identity", "detail": "connecting uid 1008 is not this
+  owner's uid 1002", "remedy": "connect to the socket under your own $ENGRAM_HOME"}`. Nothing was
+  served, and the listener stayed alive (`ss -xl`). Two runs each; Kepler accepted the result on
+  #3097. This is the discriminating control: a non-root peer is refused only by the mismatch rule.
+  Two things the run surfaced, both tracked on #3845 and neither a security weakness: the owner closes
+  with the request unread, so a client that sends first and then reads to EOF receives the typed
+  refusal and then a `ConnectionResetError` on its next read (the shipped client stops at the newline
+  and is unaffected); and the owner logs no line on a refusal.
+- **Real socket, any foreign peer, Darwin: not run.** The author's Mac has a second account (Clio's);
+  a probe from her own session waits for the user's go-ahead (#3097).
+
+The rest of this section is revision 5's reasoning, kept because it is still the reason the parse
+form (§2.2) and test 2 matter. Read its present tense as Darwin-only: the second-uid control it asks
+for ran on Linux on 2026-10-16 (above), and "until one runs" below now applies to the Darwin arm
+alone.
 
 P2 returned `uid=501` and the process's own uid is 501 — consistent with reading the peer *and* with
 reading ourselves. P4 exercises the **option** axis; P3 shows the **level** axis is the one that fails
@@ -894,10 +1076,10 @@ important thing the review produced.
 | **vec0 detection at registration** (§3.5) | The rule is decided. Detection is measured for FTS5 (author, Darwin) and for vec0 on one runtime (Mira: Linux, SQLite 3.45.1, sqlite-vec 0.1.9 — direct, alias and view all surface). Not established for every module or platform. The schema route is authoritative; the token-match backstop can miss quoting or view indirection, so it is not a never-under-deny guarantee, and incomplete classification fails closed. |
 | **How incomplete classification is DETECTED** (§3.5) | Owed by U4, and it must be **measured**, not asserted. "Fails closed" is only as good as the check that notices a classification is incomplete; the build must show a template whose reads the audit cannot fully account for, and show that registration denies it. (Mira, at approval.) |
 | **Two new budgets with no number** (§4) | `SQLITE_LIMIT_LENGTH` and the end-to-end request deadline — including its per-method variant for `snapshot` — both need values chosen against the owner contract (§8). |
-| **Tier 2 is DEFERRED, not designed** (§3.2) | U4's own surface is 21/21 byte-stable, so tier 2 is off its path. Outline only; it gets specified by the unit that needs it. Deferring it is deliberate — revision 2 specified it speculatively and that was the larger error of the two in §3.2. |
+| **Tier 2 is DEFERRED, not designed** (§3.2) | U4's reached reads that are not literals are the two variable-arity `IN` f-strings, which are tier-1 `json_each` cases (§3.2, corrected after #3196), so tier 2 is off its path. Outline only; it gets specified by the unit that needs it. Deferring it is deliberate — revision 2 specified it speculatively and that was the larger error of the two in §3.2. |
 | **The authorizer's action allowlist is an OBLIGATION, not a finished list** (§3.1) | Owed by U4: derive it from the census plus the owner's operations, and check every denied action for a caller that swallows the denial. `SQLITE_TRANSACTION` is the first known member, not the last. |
-| **The Linux peer-credential arm is UNMEASURED by me** (§2.2) | **Partly measured by the reviewer in revision 5** — a same-uid `SO_PEERCRED` read, 12 bytes, correct decode (§6). The foreign-uid rejection is measured by no one. Needs a first-hand run on a Linux seat before U4 builds. Documented is not measured — the whole of §1 exists because that distinction has cost this fleet real rounds. |
-| **Cross-uid rejection control** (§6) | Not run. Needs a second uid; the host-account route needs the user's OK. |
+| **The Linux peer-credential arm is UNMEASURED by me** (§2.2) | **Partly measured by the reviewer in revision 5** — a same-uid `SO_PEERCRED` read, 12 bytes, correct decode (§6). ~~The foreign-uid rejection is measured by no one.~~ **Corrected 2026-10-16:** a uid-0 foreign peer is rejected in CI and was rejected live on 09-29 (§6), but uid 0 cannot discriminate the mismatch rule; a manufactured non-root credential is rejected in a unit cell on each arm, and a real-socket non-root foreign peer was rejected on Linux on 2026-10-16 (§6). Darwin's real-socket arm is still unrun. Documented is not measured — the whole of §1 exists because that distinction has cost this fleet real rounds. |
+| **Cross-uid rejection control** (§6) | **Updated 2026-10-16:** a uid-0 real-socket control runs in CI (`test_peer_uid_mismatch_is_rejected`) and ran live on 09-29, but uid 0 cannot discriminate the mismatch rule (§6). The mismatch rule is unit-tested on both arms with a manufactured non-root foreign credential (§6). Real-socket non-root foreign peer on Linux: **rejected** (uid 1008 against a uid-1002 owner, 2026-10-16, #3097; §6). Real-socket foreign peer on Darwin: not run; waits for the user's go-ahead. |
 | **The 37 unclassifiable census sites** (§3.2) | Unresolved by a call-site instrument. Each must be classified by hand or by a call-path walk before tier 1's registry is called complete. |
 | Row-level / per-caller result scoping | Out of scope, named in §3.5 so it is not read as covered. |
 | Supervision per platform | Already Kepler's, already open in the parent §7. Untouched here. |
@@ -917,6 +1099,18 @@ important thing the review produced.
 ## 9. What changed, revision by revision, and who found it
 
 Recorded because a reader should be able to see which parts survived attack.
+
+### Follow-up — Darwin arm build notes (Aleph, #3666)
+
+| § | change | found by |
+|---|---|---|
+| §2.5 (new), §2.1 | **Darwin build notes, measured on one Mac.** The fd-relative strip is `chmod -N /dev/fd/<fd>` (swap control passed); the strip must be read back, not trusted from its exit code; short `LOCAL_PEERCRED` buffers truncate silently and groups cap at 16; the refusal gains a Darwin branch and the test marker moves with it; a launchd agent reads the store with no TCC barrier. Also found a **socket-path length gap on both arms**: no check, and `run/` is hardened before the failing bind. §2.1 and §2.2 were NOT changed: they already specified the Darwin mechanisms on 2026-09-28, which #3666 at first failed to notice. | Aleph (measurements; the #3666 scope miss is also mine). Round 1 review (reviewer fairy) corrected two over-claims (`ENGRAM_RUNTIME_DIR` never feeds the socket path; 104 is the header value, not measured), placed the length check before `engram_home.mkdir`, added `cr_version`, and made cells 2/4/5 testable as written. |
+
+### Follow-up — U4c re-measure (Sol, #3196)
+
+| § | change | found by |
+|---|---|---|
+| §3.2 | **The U4 scope finding corrected.** "21 of 21 byte-stable, 0 f-string" counted statements inside the hook files only, and included a WAL-mode PRAGMA write and a package-DB read. By call path the hooks reach 30 SELECTs, 2 of them f-string variable-arity `IN` reads in `engram_core`; that count is an instrument's finding, not a bound. Tier 2 stays off U4's path because both f-strings are tier-1 `json_each` cases; their rewrite becomes precursor unit U4c-0. | Sol (re-measure); Aleph (design owner, correction) |
 
 ### Follow-up — U4a build findings (Borges, #3194)
 

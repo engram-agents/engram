@@ -38,7 +38,14 @@ import sys
 from datetime import datetime
 from typing import Any
 
-SESSIONS_DIR = os.path.expanduser("~/.engram/sessions")
+# The ENGRAM home has ONE definition: tools/_owner_read.engram_home() (U14, #3862; #3863). `tools` is
+# found one directory above this file in BOTH layouts (src/engram/ and the deployed plugin root).
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+from tools import _owner_read as owner_read  # noqa: E402
+
+SESSIONS_DIR = str(owner_read.engram_home() / "sessions")
 PROJECTS_GLOB = os.path.expanduser("~/.claude/projects/*/")
 
 

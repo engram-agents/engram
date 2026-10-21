@@ -278,6 +278,7 @@ from . import metrics
 from . import model as health_engine_model
 from . import signals as health_signals
 from . import version as health_version
+from .rows import named_rows
 from .config import (
     AspectDef,
     EngineConfig,
@@ -873,7 +874,7 @@ if _config_metric_names != _signals_names or _signals_names != _verification_nam
 
 
 def _anchor_commit_sha() -> str | None:
-    """The ``.engram`` git commit SHA (design doc §4.1/§4.3 "anchor").
+    """The ENGRAM home's git commit SHA (design doc §4.1/§4.3 "anchor").
 
     Precedent: engram_snapshot_worker.py's ``_commit_snapshot`` reads the
     post-commit HEAD sha the same way — ``core._git("rev-parse", "HEAD")``,
@@ -1103,9 +1104,12 @@ _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
             "Fraction of current claim-bearing nodes with a NON-NULL embedding "
             "column (literal coverage, same convention). UNAVAILABLE — not a "
             "real coverage number — when the embedder is structurally "
-            "unavailable in this install (ENGRAM_NO_EMBEDDINGS=1, "
-            "sentence-transformers not installed, or embeddings disabled "
-            "in config): that state is a CONFIGURATION fact, not a HEALTH "
+            "unavailable in this install (ENGRAM_NO_EMBEDDINGS=1, or "
+            "sentence-transformers not installed; the `embedding.enabled: "
+            "false` config toggle was retired by #345 and is now fatal at "
+            "startup, so a running server can no longer reach this "
+            "UNAVAILABLE reason that way — a REPLAYED pre-#345 snapshot "
+            "still can): that state is a CONFIGURATION fact, not a HEALTH "
             "fact, and scoring it as a coverage number would make the "
             "composed score swing on whether a Python package happens to "
             "be installed. Test fixtures run with ENGRAM_NO_EMBEDDINGS=1, "
@@ -1210,7 +1214,7 @@ def _cascade_marker_age_diagnostics(conn: sqlite3.Connection, current_turn: int)
     docstring, matching the same current-node scoping every Aspect A/B/C
     signal function already uses.
     """
-    rows = conn.execute(
+    rows = named_rows(conn,
         """SELECT m.created_at AS created_at FROM cascade_markers m
            JOIN nodes n ON n.id = m.node_id
            WHERE m.status = 'pending' AND n.is_current = 1"""
@@ -1268,13 +1272,13 @@ def _activity_diagnostics(conn: sqlite3.Connection) -> dict:
     computed at.
     """
     def _resolution_rate(node_type: str, resolved_statuses: tuple[str, ...]) -> dict:
-        total = conn.execute(
+        total = named_rows(conn,
             "SELECT COUNT(*) as c FROM nodes WHERE type = ?", (node_type,)
         ).fetchone()["c"]
         if total == 0:
             return {"total": 0, "resolved": 0, "rate": None}
         status_placeholders = ",".join("?" * len(resolved_statuses))
-        resolved = conn.execute(
+        resolved = named_rows(conn,
             f"SELECT COUNT(*) as c FROM nodes WHERE type = ? AND status IN ({status_placeholders})",
             (node_type, *resolved_statuses),
         ).fetchone()["c"]
@@ -1283,10 +1287,10 @@ def _activity_diagnostics(conn: sqlite3.Connection) -> dict:
     cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
-    nodes_created_last_24h = conn.execute(
+    nodes_created_last_24h = named_rows(conn,
         "SELECT COUNT(*) as c FROM nodes WHERE created_at >= ?", (cutoff_iso,)
     ).fetchone()["c"]
-    supersede_edges_last_24h = conn.execute(
+    supersede_edges_last_24h = named_rows(conn,
         "SELECT COUNT(*) as c FROM edges WHERE relation = 'supersedes' AND created_at >= ?",
         (cutoff_iso,),
     ).fetchone()["c"]
@@ -1626,7 +1630,7 @@ def build_snapshot(
 # engram-alpha#2720: explicit, umask-independent permissions for
 # health-snapshots/ and everything written into it, so the operator viz
 # (spt, cross-user) can read snapshots without depending on a seat's
-# ~/.engram ACL having been set up (or set up with `-d`, or set up at all
+# ENGRAM-home ACL having been set up (or set up with `-d`, or set up at all
 # before this directory first existed) -- see the module docstring's
 # "The multi-tenant viz" framing in the issue for the failure this fixes.
 # Group-read, NOT group-write or world-anything: spt is a member of every
@@ -2147,7 +2151,7 @@ def write_snapshot(
     ``os.chmod`` right after each ``write_text`` call, rather than relying
     on the process umask -- a restrictive umask (or none at all) previously
     left snapshots unreadable by the cross-user, multi-tenant operator viz
-    on seats whose ``~/.engram`` never got a `default:user:spt:r-x` ACL (or
+    on seats whose ENGRAM home (``$ENGRAM_HOME``, default ``~/.engram``) never got a `default:user:spt:r-x` ACL (or
     got one before ``health-snapshots/`` existed). Group-read is
     sufficient because the operator viz account is a member of every
     seat's private group; this is belt-and-suspenders with, not a
@@ -2163,7 +2167,7 @@ def write_snapshot(
     discarded dict — but the PR2 spec explicitly scopes this PR to "produce
     the in-memory snapshot structure correctly" and leaves the concrete
     format/location open. This picks a location consistent with the rest of
-    ~/.engram's on-disk layout. It is deliberately NOT added to
+    the ENGRAM home's (``core.DATA_DIR``) on-disk layout. It is deliberately NOT added to
     engram_snapshot_worker.py's ``_COMMIT_FILES`` git-commit whitelist in
     this PR — that would be an async-snapshot-worker behavior change beyond
     "wire the checkpoint calls", and is flagged for the parent to decide
@@ -2624,7 +2628,7 @@ def _count_null_embeddings(conn: sqlite3.Connection, population: str) -> int:
 
     claim_bearing_types = tuple(sorted(core.CLAIM_BEARING_TYPES))
     placeholders = ",".join("?" * len(claim_bearing_types))
-    return conn.execute(
+    return named_rows(conn,
         f"SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND type IN "
         f"({placeholders}) AND embedding IS NULL",
         claim_bearing_types,

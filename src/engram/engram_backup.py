@@ -20,7 +20,7 @@ grow linearly instead of churning a fresh multi-MB blob every nap:
 Restore contract (all three regenerable layers rebuilt, none shipped):
   1. sqlite3 new.db < knowledge.sql          # base rows; embedding NULL; no FTS/vec
   2. backfill embeddings (needs the embed model — lives in the regen tool)
-  3. rebuild_fts_index(db)                    # rebuild + exclude retracted rows (#727)
+  3. rebuild_fts_index(db)                    # rebuild + exclude retracted AND superseded rows (#727, #2746)
   4. vec backfill (server _backfill_vec_nodes at first _get_db, if ext loads)
 
 Verified round-trip (2026-06-03, Ariadne): base-table parity exact, embeddings
@@ -32,7 +32,9 @@ nodes_fts or `iterdump` itself raises `no such fts5 table: main.nodes_fts`.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
+import stat
 import tempfile
 
 
@@ -113,6 +115,47 @@ def _derived_drop_plan(conn: sqlite3.Connection) -> tuple[list[str], list[str], 
     return triggers, vocab, base
 
 
+def _verify_dump_restores(sql_path: str, expected_nodes: "int | None") -> "int | None":
+    """Restore the SQL dump at ``sql_path`` into ``:memory:`` and, when
+    ``expected_nodes`` is not None, require the restored ``nodes`` count to
+    match it. Raises ``RuntimeError`` on a count mismatch (and lets the
+    ``sqlite3.Error`` from a dump that does not load propagate). Returns the
+    restored node count (None when the snapshot has no ``nodes`` table).
+
+    The dump must also end in a committed state: a dump cut before its final
+    ``COMMIT;`` loads and counts fine, but a real restore rolls the open
+    transaction back and the DB comes back empty. So after loading, the
+    connection must not be in a transaction, and the last two non-empty lines
+    must be ``COMMIT;`` then ``PRAGMA user_version = N;`` (the shape
+    ``dump_stripped`` writes); otherwise ``RuntimeError``."""
+    with open(sql_path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    tail = [ln.strip() for ln in text.splitlines() if ln.strip()][-2:]
+    mem = sqlite3.connect(":memory:")
+    try:
+        mem.executescript(text)
+        if mem.in_transaction:
+            raise RuntimeError("dump verification failed: dump leaves a transaction open (no final COMMIT)")
+        if (
+            len(tail) != 2
+            or tail[0] != "COMMIT;"
+            or not re.fullmatch(r"PRAGMA user_version = \d+;", tail[1])
+        ):
+            raise RuntimeError(
+                "dump verification failed: dump does not end in COMMIT; then PRAGMA user_version"
+            )
+        if expected_nodes is None:
+            return None
+        got = mem.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+    finally:
+        mem.close()
+    if got != expected_nodes:
+        raise RuntimeError(
+            f"dump verification failed: restored {got} nodes, snapshot had {expected_nodes}"
+        )
+    return got
+
+
 def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
     """Write a regenerable-stripped SQL text dump of ``src_db_path`` to ``out_sql_path``.
 
@@ -121,7 +164,15 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
     derived data on the COPY only (the source DB is never modified), then writes
     a restorable ``iterdump`` to ``out_sql_path``.
 
-    Returns a stats dict: ``{statements, bytes, fts_excluded, vec_excluded}``.
+    The write is atomic (#3951): the dump goes to a temp file beside
+    ``out_sql_path``, is fsynced, is verified (it must restore into ``:memory:``
+    with the same ``nodes`` count as the stripped snapshot), takes the existing
+    target's permission bits, and only then replaces ``out_sql_path``. On any
+    failure the temp is removed, the previous ``out_sql_path`` is left
+    byte-identical (or absent), and the error is raised.
+
+    Returns a stats dict: ``{statements, bytes, fts_excluded, vec_excluded,
+    verified_nodes}``.
     Raises on failure — callers MUST surface errors, never ``except: pass`` them
     (silent skip is the failure mode this module exists to eliminate).
     """
@@ -129,7 +180,7 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
     fd, snap = tempfile.mkstemp(
         suffix=".snap.db", dir=os.path.dirname(os.path.abspath(src_db_path)), prefix=".engram-bk-"
     )
-    os.close(fd)
+    os.close(fd)  # nothing between mkstemp and here can raise; the fd never leaks
     try:
         bk = sqlite3.connect(snap)
         try:
@@ -172,14 +223,67 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
         # source's migration state (#781).
         src_user_version = bk.execute("PRAGMA user_version").fetchone()[0]
 
-        statements = 0
-        with open(out_sql_path, "w", encoding="utf-8") as f:
-            for line in bk.iterdump():
-                f.write(line + "\n")
+        # Count the stripped snapshot's nodes so the written dump can be
+        # checked against it (a dump with no `nodes` table verifies by load only).
+        has_nodes = bk.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes'"
+        ).fetchone()
+        expected_nodes = (
+            bk.execute("SELECT COUNT(*) FROM nodes").fetchone()[0] if has_nodes else None
+        )
+
+        # Atomic write (#3951): dump to a temp file beside the target, verify it
+        # restores, and only then replace the target. A failure at any point
+        # leaves the previous out_sql_path untouched and no temp behind.
+        out_dir = os.path.dirname(os.path.abspath(out_sql_path))
+        tfd, tmp_sql = tempfile.mkstemp(
+            suffix=".sql.tmp", dir=out_dir, prefix=".engram-sql-"
+        )
+        try:
+            # Wrap the fd FIRST: from here a raise anywhere closes it (the
+            # `with` below), and the has_autoinc query no longer runs while the
+            # raw fd is unowned. If fdopen itself fails the fd is still ours.
+            try:
+                out_f = os.fdopen(tfd, "w", encoding="utf-8")
+            except BaseException:
+                os.close(tfd)
+                raise
+            # Dropping the derived tables can leave sqlite_sequence present but
+            # with no AUTOINCREMENT table left to recreate it on restore;
+            # iterdump still emits `DELETE FROM "sqlite_sequence"`, which then
+            # fails to load ("no such table"). Skip that one statement then.
+            has_autoinc = bk.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND sql LIKE '%AUTOINCREMENT%'"
+            ).fetchone()
+            statements = 0
+            with out_f as f:
+                for line in bk.iterdump():
+                    if not has_autoinc and line.startswith('DELETE FROM "sqlite_sequence"'):
+                        continue
+                    f.write(line + "\n")
+                    statements += 1
+                # Append user_version after the COMMIT so it executes on restore.
+                f.write(f"PRAGMA user_version = {src_user_version};\n")
                 statements += 1
-            # Append user_version after the COMMIT so it executes on restore.
-            f.write(f"PRAGMA user_version = {src_user_version};\n")
-            statements += 1
+                f.flush()
+                os.fsync(f.fileno())
+            verified_nodes = _verify_dump_restores(tmp_sql, expected_nodes)
+            # mkstemp creates 0600; in a directory with a default POSIX ACL that
+            # sets the ACL mask to `---` and nulls inherited named-user entries.
+            # Give the temp the old target's mode bits (chmod re-derives the mask).
+            try:
+                mode = stat.S_IMODE(os.stat(out_sql_path).st_mode)
+            except FileNotFoundError:
+                mode = 0o644
+            os.chmod(tmp_sql, mode)
+            os.replace(tmp_sql, out_sql_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_sql)
+            except OSError:
+                pass
+            raise
         bk.close()
     finally:
         try:
@@ -192,6 +296,7 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
         "bytes": os.path.getsize(out_sql_path),
         "fts_excluded": fts_excluded,
         "vec_excluded": vec_excluded,
+        "verified_nodes": verified_nodes,
     }
 
 
@@ -445,14 +550,72 @@ def check_fts_integrity(conn: sqlite3.Connection, probe_k: int | None = None) ->
         return {"status": "unavailable", "reason": str(e)}
 
 
-def rebuild_fts_index(db_path: str) -> bool:
+# Per-column spec for which ``nodes`` rows are kept OUT of ``nodes_fts`` (#2746):
+# (column, exclude predicate, indexable predicate). Order is the SQL order.
+_FTS_ROW_SPEC: tuple = (
+    ("status", "status = 'retracted'", "status IS NOT 'retracted'"),
+    ("is_current", "is_current = 0", "is_current IS NOT 0"),
+)
+
+
+def _fts_row_predicates(columns) -> tuple:
+    """Return ``(exclude_sql, indexable_sql)`` for the ``nodes`` columns present.
+
+    Single source of the FTS row contract shared by ``rebuild_fts_index``
+    (step 2 deletes the ``exclude_sql`` rows from the index) and
+    ``verify_roundtrip`` (its parity count is the ``indexable_sql`` rows), so
+    the two cannot drift apart (#2746). Each condition is included only if its
+    column exists (minimal fixtures omit either); with neither column both
+    values are None (nothing to exclude; every row is indexable).
+
+    The two forms are deliberately NOT mechanical negations of each other:
+    ``NOT (a OR b)`` is NULL for a row whose status or is_current is NULL, so
+    such a row would fall out of BOTH sets. ``exclude_sql`` uses ``=`` (NULL ->
+    not excluded, matching the sync triggers' ``NEW.is_current = 0``) and
+    ``indexable_sql`` uses the null-safe ``IS NOT``, so the two are an exact
+    partition of the rows even with NULLs.
+    """
+    present = [(ex, ix) for col, ex, ix in _FTS_ROW_SPEC if col in columns]
+    if not present:
+        return (None, None)
+    return (
+        " OR ".join(ex for ex, _ in present),
+        " AND ".join(ix for _, ix in present),
+    )
+
+
+def rebuild_fts_index_on_conn(conn: sqlite3.Connection, label: str = "<connection>") -> bool:
+    """``rebuild_fts_index`` on a connection the CALLER owns (#3879): the same
+    rebuild, but it neither opens, commits nor closes anything. Every change stays
+    in the caller's open transaction until the caller commits or rolls back.
+    ``label`` only names the store in the repair log line (and must be non-empty).
+    There is ONE body: this is ``rebuild_fts_index(label, conn=conn)``.
+    """
+    return rebuild_fts_index(label, conn=conn)
+
+
+def rebuild_fts_index(db_path: str, *, conn: "sqlite3.Connection | None" = None) -> bool:
     """Rebuild the FTS5 index from the current rows of ``nodes`` (post-restore).
+
+    ``conn`` (keyword-only, #3879): rebuild on this caller-owned connection
+    instead of opening ``db_path``; nothing is committed or closed here, the
+    caller's transaction holds the change. ``db_path`` is then only a label.
+    Without ``conn`` the behaviour is exactly the original: open, rebuild,
+    commit, close.
 
     Self-contained restore-path fix (#781): creates the FTS table if absent,
     rebuilds from all current ``nodes`` rows (so retracted rows are present in
     the index immediately after rebuild), then 'delete'-inserts each retracted
-    row to exclude it from the index (this succeeds only because rebuild just
-    populated them — delete-on-empty is the crash).  Finally restores
+    row AND each superseded row (``is_current=0``, #2746) to exclude it from
+    the index (this succeeds only because rebuild just populated them —
+    delete-on-empty is the crash).  Superseded rows are excluded because the
+    live sync trigger ``nodes_fts_supersede_remove`` removes a row from the
+    index the moment it goes ``is_current=0``; a rebuilt graph must agree with
+    a live-written one.  Both conditions are selected in ONE query / ONE
+    delete pass (``status='retracted' OR is_current=0``): a retracted row is
+    usually also non-current, and a second 'delete' on an already-excluded
+    rowid raises SQLITE_CORRUPT_VTAB (#2742).  Each condition is applied only
+    if its column exists in ``nodes`` (legacy fixtures).  Finally restores
     PRAGMA user_version to the value it had on entry (#2087): the incoming
     version is read before the rebuild and written back after, so a
     already-migrated live DB (user_version 2 or 3) is not silently downgraded
@@ -485,8 +648,9 @@ def rebuild_fts_index(db_path: str) -> bool:
     exist (the DB is not ENGRAM-shaped — nothing to do).
 
     Note: nodes_fts uses content='nodes' (external-content FTS5) with
-    deliberate index-side deletion of retracted rows.  FTS5's 'integrity-check'
-    therefore always reports "malformed" on a graph with retractions — this is
+    deliberate index-side deletion of retracted and superseded rows (matching
+    the live sync triggers, #2746).  FTS5's 'integrity-check' therefore always
+    reports "malformed" on a graph with retractions or supersessions — this is
     expected by design (#781).
 
     Guard (#2186): SQLite treats an empty string ``db_path`` as "open a
@@ -509,7 +673,9 @@ def rebuild_fts_index(db_path: str) -> bool:
             "unattached temp DB). Pass a real file path, or skip the "
             "rebuild entirely for in-memory connections."
         )
-    conn = sqlite3.connect(db_path)
+    owns_conn = conn is None
+    if owns_conn:
+        conn = sqlite3.connect(db_path)
     try:
         # Bail early if this isn't an ENGRAM-shaped DB.
         has_nodes = conn.execute(
@@ -570,16 +736,22 @@ def rebuild_fts_index(db_path: str) -> bool:
         # split the transaction and let a mid-repair crash strand the version.
         conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
 
-        # Step 2: delete-insert retracted rows — succeeds because they were just
-        # populated by the rebuild above.  On an empty index this would raise
+        # Step 2: delete-insert retracted AND superseded rows — succeeds because
+        # they were just populated by the rebuild above.  On an empty index this would raise
         # sqlite3.DatabaseError ("database disk image is malformed") — the exact
         # crash that step 1 prevents.
-        # Guard: only query status='retracted' if the status column exists
-        # (minimal test fixtures may omit it; real ENGRAM DBs always have it).
-        if "status" in node_cols:
+        # #2746: superseded rows (is_current=0) are excluded too, matching the
+        # nodes_fts_supersede_remove trigger. ONE query / ONE delete pass: a row
+        # can be retracted AND non-current, and a second 'delete' on an
+        # already-excluded rowid raises SQLITE_CORRUPT_VTAB (#2742).
+        # Guard: each condition is used only if its column exists (minimal test
+        # fixtures may omit either; real ENGRAM DBs always have both). If
+        # neither exists, step 2 is skipped.
+        exclude_sql, _indexable_sql = _fts_row_predicates(node_cols)
+        if exclude_sql is not None:
             select_cols_sql = ", ".join(f"COALESCE({c}, '')" for c in target_cols)
             retracted = conn.execute(
-                f"SELECT rowid, {select_cols_sql} FROM nodes WHERE status='retracted'"
+                f"SELECT rowid, {select_cols_sql} FROM nodes WHERE {exclude_sql}"
             ).fetchall()
             insert_cols_sql = ", ".join(target_cols)
             placeholders_sql = ", ".join(["?"] * (len(target_cols) + 1))
@@ -605,10 +777,12 @@ def rebuild_fts_index(db_path: str) -> bool:
         restored_user_version = max(incoming_user_version, 1)
         conn.execute(f"PRAGMA user_version = {restored_user_version}")
 
-        conn.commit()
+        if owns_conn:
+            conn.commit()
         return True
     finally:
-        conn.close()
+        if owns_conn:
+            conn.close()
 
 
 def verify_roundtrip(src_db_path: str) -> dict:
@@ -682,9 +856,10 @@ def verify_roundtrip(src_db_path: str) -> dict:
             rebuild_fts_index(recon_path)
             rc = sqlite3.connect(recon_path)
 
-            # Structural parity assertion: every current (non-retracted) row must
-            # be in the index, and every retracted row must be excluded.  This is
-            # the invariant rebuild_fts_index actually guarantees.
+            # Structural parity assertion: every indexable row (neither retracted
+            # nor superseded, #2746) must be in the index, and every retracted or
+            # superseded row must be excluded.  This is the invariant
+            # rebuild_fts_index actually guarantees.
             #
             # #727: the old assertion (hits >= fts_hits_orig) is INVERTED under
             # index pollution — a CLEAN rebuild on the recon legitimately returns
@@ -696,21 +871,21 @@ def verify_roundtrip(src_db_path: str) -> dict:
                 row[1]
                 for row in rc.execute("PRAGMA table_info(nodes)").fetchall()
             }
-            if "status" in recon_cols:
-                # IS NOT is SQLite's null-safe complement of IS: a NULL-status row
-                # evaluates to TRUE here (counted as non-retracted), matching what
-                # rebuild_fts_index actually guarantees — it only removes rows where
-                # status='retracted', so NULL-status rows remain in the index.
-                # Using != 'retracted' would give NULL (not TRUE) for NULL-status rows,
-                # undercounting expected_fts_count and causing a false AssertionError.
-                expected_fts_count = rc.execute(
-                    "SELECT count(*) FROM nodes WHERE status IS NOT 'retracted'"
-                ).fetchone()[0]
-            else:
-                # No status column — all nodes are indexable (minimal fixture).
-                expected_fts_count = rc.execute(
-                    "SELECT count(*) FROM nodes"
-                ).fetchone()[0]
+            # Indexable = NOT retracted AND NOT superseded (is_current=0): the
+            # contract rebuild_fts_index (step 2) and the live sync triggers
+            # share (#2746). Each condition applies only if its column exists
+            # (minimal fixtures omit either); with neither, all nodes count.
+            # IS NOT is SQLite's null-safe complement of IS: a NULL status or
+            # NULL is_current row evaluates TRUE (counted as indexed), matching
+            # rebuild_fts_index, which only excludes status='retracted' or
+            # is_current=0 -- NULL rows stay in the index. Using != would give
+            # NULL (not TRUE) for them, undercounting expected_fts_count and
+            # causing a false AssertionError.
+            _exclude_sql, indexable_sql = _fts_row_predicates(recon_cols)
+            expected_sql = "SELECT count(*) FROM nodes"
+            if indexable_sql is not None:
+                expected_sql += f" WHERE {indexable_sql}"
+            expected_fts_count = rc.execute(expected_sql).fetchone()[0]
             # FTS5 external-content note: SELECT count(*) FROM nodes_fts returns the
             # total rows in the content table (including tombstoned/retracted rows),
             # not the indexed-document count.  nodes_fts_docsize has exactly one row
@@ -720,7 +895,7 @@ def verify_roundtrip(src_db_path: str) -> dict:
             ).fetchone()[0]
             assert actual_fts_count == expected_fts_count, (
                 f"FTS structural parity failed: nodes_fts_docsize has {actual_fts_count} rows, "
-                f"expected {expected_fts_count} (non-retracted nodes); "
+                f"expected {expected_fts_count} (non-retracted, non-superseded nodes); "
                 f"source fts_hits_orig={fts_ok_orig}"
             )
 

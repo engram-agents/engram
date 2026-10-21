@@ -5,7 +5,8 @@ Reads `session_id` and `transcript_path` from this hook's stdin payload
 (Claude Code emits both on every hook event) and threads them through to
 estimate_usage(). This is the Issue #140 fix: when multiple Claude
 sessions run concurrently, each hook fire reads its OWN session's
-transcript and per-session marker (~/.engram/sessions/<session_id>.json),
+transcript and per-session marker (<ENGRAM home>/sessions/<session_id>.json; the home is
+$ENGRAM_HOME, default ~/.engram),
 not a single shared global marker. No clobber possible.
 
 Falls back gracefully (estimate_usage handles None for either arg) if

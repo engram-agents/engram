@@ -14,11 +14,11 @@ explicit current-state field in the file, read fresh each prompt. No
 surfaced/read cursor mechanism needed; the baton file IS the state.
 
 Anti-patterns guarded:
-  - Forum-configured guard (#2857 step 1): if no forum.url/agent_name is set
-    in config.json, exits silently. Installs with no forum configured see
-    zero behavior change. (Previously gated on config.json mode == 'multi' —
-    baton is symmetric for any agent once a forum is configured, regardless
-    of host topology.)
+  - Forum-configured guard (#2857 step 1): if no forum.url is set in
+    config.json (agent_name alone does not count), exits silently. Installs
+    with no forum configured see zero behavior change. (Previously gated on
+    config.json mode == 'multi' — baton is symmetric for any agent once a
+    forum is configured, regardless of host topology.)
   - No LLM calls, no DB — one forum API call (+ optional gh calls) only.
     Per-gh-call timeout 4s; worst case one gh call per in-court baton on a
     full cache miss (N_batons calls). The 30s-TTL status cache makes the
@@ -72,21 +72,27 @@ from typing import Optional
 # prologue previously inlined here now lives in the shared _prompthooklib
 # module (same directory, same sys.path bootstrap as _hooklib below).
 # _PROMPTHOOKLIB_OK gates main() -- if the shared module somehow fails to
-# import, the hook degrades to a silent no-op rather than crashing, same
-# discipline as every other best-effort import in this prologue.
+# import, the hook reports the exception class (one stderr line, one injected
+# context line; #3521) and exits 0 rather than crashing.
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 try:
     from _prompthooklib import (
-        load_config as _load_config_impl,
+        load_config_checked as _load_config_checked_impl,
+        report_config_unknown as _report_config_unknown,
         get_agent_name as _get_agent_name_impl,
         emit_context as _emit_context,
         bootstrap_tools_dir as _bootstrap_tools_dir,
+        # #3628: the cache read/write are non-blocking and regular-file-only.
+        hooklib_io as _hooklib_io,
+        engram_home_or_exit as _engram_home,
     )
     _PROMPTHOOKLIB_OK = True
-except Exception:
+except Exception as _lib_exc:
+    # #3521: remember the CLASS only (never the message); main() reports it.
     _PROMPTHOOKLIB_OK = False
+    _PROMPTHOOKLIB_IMPORT_ERROR = type(_lib_exc).__name__
 _TOOLS_DIR = _bootstrap_tools_dir("forum_api.py") if _PROMPTHOOKLIB_OK else None
 try:
     from forum_api import (
@@ -99,10 +105,9 @@ try:
 except Exception:
     _FORUM_API_OK = False
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+# The prompt-hook layer's own resolver (a parity-pinned copy in _prompthooklib, #3863). When that lib failed
+# to import, main() reports the class and exits before any use of this value.
+ENGRAM_HOME = str(_engram_home()) if _PROMPTHOOKLIB_OK else ""
 
 # Statuses that mean "closed" — these projects don't surface
 CLOSED_STATUSES = {"merged", "cancelled"}
@@ -113,38 +118,91 @@ _CACHE_TTL = 30
 # Per-gh-call timeout in seconds — quick-fail so the hook stays fast
 _GH_TIMEOUT = 4
 
-# GitHub Project owner (used for project-anchor queries)
-_GH_OWNER = os.environ.get("BATON_GH_OWNER", "engram-agents")
+# #3568 F1: the GitHub owner of a project anchor comes from the anchor itself
+# (project/<owner>/<N>), else from $BATON_GH_OWNER if set and non-empty, else there is
+# NO owner: no gh call, and the render says so. There is deliberately NO hardcoded
+# default org -- a released feature must not name a team (same rule as the bare pr/<N>
+# anchor below). Resolved at call time, not import time.
+_NO_OWNER_NOTICE = "project anchor has no owner: re-anchor as project/<owner>/<N>"
 
-# #1715: default repo a BARE pr/<N> anchor resolves against. Same variable
-# name as tools/baton.py's own DEFAULT_GITHUB_REPO / board_projects.py's own
-# copy -- read here too (self-contained; this hook is a standalone deployed
-# script and must not assume it can import a sibling module post-plugin-
-# restructure, per this repo's CLAUDE.md). Public-safe fallback, not the
-# private dev-repo literal (tools/scan-leaks.py flags that shape of leak).
-_DEFAULT_GITHUB_REPO = os.environ.get("ENGRAM_DEFAULT_GITHUB_REPO", "engram-agents/engram")
+# #1918 / #1650 / #1919: there is NO default repo for a bare pr/<N> anchor,
+# deliberately -- do not revisit (same rule as tools/baton.py and
+# tools/baton_gate.py). This hook used to resolve a bare anchor against
+# $ENGRAM_DEFAULT_GITHUB_REPO (falling back to the public repo) and then
+# AUTO-ARCHIVE the baton from the cached result, so on a seat that set the
+# variable, a legacy bare PR-<N> baton belonging to another repo was closed
+# from the wrong repo's #N (#1650's 07-03 incident). A bare anchor is now
+# never fetched, never cached and never auto-archived, whatever the
+# environment says; the render says it needs a qualified anchor and the
+# auto-archive pass counts what it skipped.
 
 # #1715: pr/<N> (bare) or pr/<owner>/<repo>/<N> (repo-qualified) -- mirrors
 # tools/baton.py's _GITHUB_ANCHOR_RE / _parse_github_anchor.
 _PR_ANCHOR_RE = re.compile(r"^pr/(?:([\w.-]+)/([\w.-]+)/)?(\d+)$", re.IGNORECASE)
 
 
-def _parse_pr_anchor(anchor: str) -> Optional[tuple]:
-    """Parse a pr/<N> or pr/<owner>/<repo>/<N> anchor into (repo, pr_number).
+# #3568: project/<N> (bare) or project/<owner>/<N>. MIRRORS baton_gate.py's
+# _PROJECT_OWNER_PATTERN / _PROJECT_OWNER_ANCHOR_RE (the source of truth; kept in sync
+# by hand like _PR_ANCHOR_RE above). Owner = GitHub login rule: 1-39 chars, alnum or
+# hyphen, not starting with a hyphen. Anchors are lowercased before parsing, and
+# GitHub logins are case-insensitive, so re.IGNORECASE changes nothing real.
+_PROJECT_OWNER_PATTERN = r"[A-Za-z0-9][A-Za-z0-9-]{0,38}"
+_PROJECT_ANCHOR_RE = re.compile(
+    r"^project/(?:(" + _PROJECT_OWNER_PATTERN + r")/)?([0-9]{1,15})$", re.IGNORECASE
+)
 
-    repo defaults to _DEFAULT_GITHUB_REPO for a bare anchor. Returns None if
-    the anchor isn't PR-shaped at all.
+
+def _parse_project_anchor(anchor: str) -> Optional[tuple]:
+    """Parse project/<N> or project/<owner>/<N> into (owner_or_None, number).
+
+    Returns None if the anchor is not a well-formed project anchor.
+    """
+    m = _PROJECT_ANCHOR_RE.match(anchor.strip().lower())
+    if not m:
+        return None
+    return (m.group(1), m.group(2))
+
+
+def _project_anchor_owner(anchor: Optional[str]) -> Optional[str]:
+    """The owner carried by a project/<owner>/<N> anchor, else None (bare or malformed)."""
+    if not anchor:
+        return None
+    parsed = _parse_project_anchor(anchor)
+    return parsed[0] if parsed else None
+
+
+def _parse_pr_anchor(anchor: str) -> Optional[tuple]:
+    """Parse a pr/<owner>/<repo>/<N> anchor into (repo, pr_number).
+
+    Returns None if the anchor isn't PR-shaped at all, AND for a bare pr/<N>
+    anchor (#1918: no default repo -- a bare anchor has no repo to return).
     """
     m = _PR_ANCHOR_RE.match(anchor.strip().lower())
     if not m:
         return None
     owner, repo_name, pr_num = m.groups()
-    repo = f"{owner}/{repo_name}" if owner and repo_name else _DEFAULT_GITHUB_REPO
-    return (repo, pr_num)
+    if not (owner and repo_name):
+        return None
+    return (f"{owner}/{repo_name}", pr_num)
+
+
+def _is_bare_pr_anchor(anchor: Optional[str]) -> bool:
+    """True for an unqualified pr/<N> anchor (PR-shaped, but no repo).
+
+    Derived from _parse_pr_anchor so there is ONE place that decides whether
+    an anchor carries a repo: PR-shaped yet unparseable == bare.
+    """
+    if not anchor:
+        return False
+    return bool(_PR_ANCHOR_RE.match(anchor.strip().lower())) and _parse_pr_anchor(anchor) is None
+
+
+# Render text for an in-court baton whose anchor is a bare pr/<N>.
+_NEEDS_QUALIFIED_ANCHOR = "needs a qualified anchor: pr/<owner>/<repo>/<N>"
 
 # Frontmatter parsing (same regex as ia.py / inter-agent hook)
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
+_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):[ \t]*(.*)$", re.MULTILINE)
 
 # PR-ID fallback pattern: "PR-NNN"
 _PR_ID_RE = re.compile(r"^PR-(\d+)$")
@@ -184,9 +242,21 @@ _PR_BATON_NAME_RE = re.compile(r"^(?:[A-Z][A-Z0-9]*-)?PR-")
 # around exec_module) actually does.
 # ---------------------------------------------------------------------------
 
+# #3521 row 6: why the last _load_config() could not read config.json, or None
+# when it could (or the file is simply absent). main() reads this right after
+# _load_config() so an unreadable file is reported as UNKNOWN instead of being
+# treated as "not configured". Kept as module state, not a changed return
+# type, so _load_config() keeps its zero-arg dict contract for every existing
+# caller and test monkeypatch.
+_config_unknown_reason: Optional[str] = None
+
+
 def _load_config() -> dict:
-    """Load $ENGRAM_HOME/config.json. Returns {} on any failure."""
-    return _load_config_impl(ENGRAM_HOME)
+    """Load $ENGRAM_HOME/config.json. Returns {} on any failure (and records
+    the reason in _config_unknown_reason when the file is present but unusable)."""
+    global _config_unknown_reason
+    cfg, _config_unknown_reason = _load_config_checked_impl(ENGRAM_HOME)
+    return cfg or {}
 
 
 def _get_agent_name(config: Optional[dict] = None) -> str:
@@ -287,7 +357,7 @@ def _load_cache() -> dict:
     path = _cache_path()
     try:
         if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(_hooklib_io().read_regular_text(path, encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         pass
     return {}
@@ -297,7 +367,8 @@ def _save_cache(cache: dict) -> None:
     """Write cache to disk. Silently ignores write failures."""
     path = _cache_path()
     try:
-        path.write_text(json.dumps(cache), encoding="utf-8")
+        with _hooklib_io().open_regular_text_write(path, encoding="utf-8") as f:
+            f.write(json.dumps(cache))
     except OSError:
         pass
 
@@ -374,8 +445,11 @@ def _fetch_pr_status(pr_num: str, repo: Optional[str] = None) -> Optional[str]:
         return None
 
 
-def _fetch_project_status(project_num: str) -> Optional[str]:
+def _fetch_project_status(project_num: str, owner: str) -> Optional[str]:
     """Call ``gh project item-list`` and return a tally render string, or None.
+
+    ``owner`` is required (#3568): the caller resolves it from the anchor or the
+    environment and never calls this without one.
 
     Returns strings like ``"2 Done · 1 In Progress · 2 Blocked"``.
     """
@@ -383,7 +457,7 @@ def _fetch_project_status(project_num: str) -> Optional[str]:
         result = subprocess.run(
             [
                 "gh", "project", "item-list", project_num,
-                "--owner", _GH_OWNER,
+                "--owner", owner,
                 "--format", "json",
             ],
             capture_output=True,
@@ -431,6 +505,12 @@ def _get_live_status(anchor: str, cache: dict) -> str:
     This function NEVER raises — all exceptions are swallowed.
     """
     try:
+        # #1918: a bare pr/<N> anchor has no repo -- never consult the cache
+        # (a stale/poisoned entry under that key must not render), never
+        # fetch, never cache. Say what it needs instead of a status.
+        if _is_bare_pr_anchor(anchor):
+            return _NEEDS_QUALIFIED_ANCHOR
+
         # Check cache first
         cached = _cache_get(cache, anchor)
         if cached is not None:
@@ -445,13 +525,24 @@ def _get_live_status(anchor: str, cache: dict) -> str:
                 # slice -- the slice produced "owner/repo/N" verbatim for a
                 # repo-qualified anchor, which gh would reject as a garbage
                 # PR-number argument.
+                # #1918: a bare anchor parses to None (no default repo) and
+                # was already handled above; only a qualified one fetches.
                 parsed = _parse_pr_anchor(anchor)
                 if parsed is not None:
                     pr_repo, pr_num = parsed
                     render = _fetch_pr_status(pr_num, repo=pr_repo)
             elif anchor.startswith("project/"):
-                project_num = anchor[8:]
-                render = _fetch_project_status(project_num)
+                parsed_proj = _parse_project_anchor(anchor)
+                if parsed_proj is not None:
+                    anchor_owner, project_num = parsed_proj
+                    # #3568: anchor owner -> $BATON_GH_OWNER (non-empty) -> none.
+                    owner = anchor_owner or os.environ.get("BATON_GH_OWNER", "").strip()
+                    if not owner:
+                        # No owner anywhere: make no gh call, cache nothing (the
+                        # stale-cache fallback below is keyed on the same anchor),
+                        # and say so.
+                        return _NO_OWNER_NOTICE
+                    render = _fetch_project_status(project_num, owner)
         except Exception:
             render = None  # fall through to stale-cache check
 
@@ -471,15 +562,21 @@ def _get_live_status(anchor: str, cache: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _is_forum_configured(config: dict) -> bool:
-    """Return True if forum is explicitly configured (url or agent_name set).
+    """Return True if a forum is configured: ``forum.url`` is a non-empty string.
 
-    Silent no-op gate: if neither forum.url nor agent_name is in config, skip
-    the hook to avoid noise on non-forum installs.
+    Silent no-op gate: no ``forum.url`` -> skip the hook, so an install with no
+    forum server never reports one as unreachable. ``agent_name`` alone is this
+    agent's identity, not forum configuration, and does not pass the gate;
+    neither does the ``FORUM_URL`` env var by itself. Total: any other shape
+    (non-dict ``forum``, non-string or blank ``url``) is "not configured".
     """
-    forum_cfg = config.get("forum", {})
-    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
-    has_agent = bool(config.get("agent_name", "").strip())
-    return has_url or has_agent
+    if not isinstance(config, dict):
+        return False
+    forum_cfg = config.get("forum")
+    if not isinstance(forum_cfg, dict):
+        return False
+    url = forum_cfg.get("url")
+    return isinstance(url, str) and bool(url.strip())
 
 
 def _fetch_active_projects(config: dict) -> list:
@@ -572,26 +669,27 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
     Detection order is ANCHOR-FIRST (#2010 rider 1, Kepler DM 2026-09-21),
     mirroring tools/baton.py's cmd_gc: a project whose ``github:`` field
     resolves to a repo-qualified PR anchor is a PR-baton unconditionally,
-    whatever its ``project_id`` looks like -- the name shape
-    (_PR_BATON_NAME_RE) is never consulted for such a baton, at any point.
-    The name gate is consulted only as a FALLBACK, for batons with no
-    qualified anchor (an unqualified bare ``pr/<N>``, a non-PR anchor, or
-    no anchor at all).
+    whatever its ``project_id`` looks like.
+
+    #1918 (closes #1650/#1919): there is NO default repo. A baton whose
+    anchor is a bare ``pr/<N>`` -- explicit, or the ``PR-<N>`` id-fallback --
+    is NEVER closed here, whatever the cache holds or the environment says;
+    the skips are counted and reported in one stderr line per run. A
+    non-PR anchor or no anchor at all is ignored silently, as before. The
+    old name-shape fallback (_PR_BATON_NAME_RE) only ever applied to
+    unqualified anchors, so it can no longer make anything closable and is
+    not consulted.
 
     Two DISTINCT skip reasons exist past this point, and rider 2 requires
     they stay distinguishable rather than conflated into one "skipped"
     bucket:
-      1. NO-QUALIFIED-ANCHOR-AND-NAME-MISMATCH -- the baton has no
-         qualified PR anchor, and its project_id also doesn't match the
-         name-gate fallback (or matched but produced no anchor at all).
-         This is an ID/anchor-shape decision, made before the cache is
-         ever consulted.
-      2. UNCACHED-ANCHOR -- the baton IS an anchored, qualified (or
-         name-fallback-resolved) PR-baton, but its anchor's live status
-         hasn't been fetched into the 30s-TTL cache yet. This is a
-         cache-BUDGET decision, made only after the baton has already
-         cleared reason 1 -- an anchored PR-baton is never skipped on name
-         shape merely because it happens to be uncached.
+      1. NO-QUALIFIED-ANCHOR -- the baton has no repo-qualified PR anchor
+         (bare, non-PR, or absent). An anchor-shape decision, made before
+         the cache is ever consulted; the bare case is counted.
+      2. UNCACHED-ANCHOR -- the baton IS a repo-qualified PR-baton, but its
+         anchor's live status hasn't been fetched into the 30s-TTL cache
+         yet. This is a cache-BUDGET decision, made only after the baton
+         has already cleared reason 1.
     """
     # Resolve the baton binary; skip if not in PATH.
     _baton_which = shutil.which("baton")
@@ -601,6 +699,8 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
             file=sys.stderr,
         )
         return
+
+    skipped_bare = 0  # #1918: batons with an unqualified pr/<N> anchor
 
     for p in projects:
         # Skip already-closed batons (idempotency gate). The fetched list is
@@ -617,22 +717,20 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
         # "UMWELT-PR-572") or any id shape at all, an explicit github:
         # field produces the anchor directly, independent of project_id.
         anchor = _resolve_anchor(project_id, p.get("github", ""))
-        _anchor_m = _PR_ANCHOR_RE.match(anchor) if anchor else None
-        qualified = bool(_anchor_m and _anchor_m.group(1) and _anchor_m.group(2))
 
-        if not qualified:
-            # No qualified PR anchor -- fall back to the name-shape gate
-            # (skip reason 1, above), exactly as this pass behaved before
-            # the anchor-first redesign. #2010: matched by SUFFIX
-            # (_PR_BATON_NAME_RE), not prefix, so both bare "PR-<N>" and
-            # repo-qualified "<REPO>-PR-<N>" batons reach this pass.
-            # (_PR_ID_RE is a narrower, separate pattern used only inside
-            # _resolve_anchor's id-based anchor fallback -- do not conflate
-            # the two.)
-            if not _PR_BATON_NAME_RE.match(project_id.upper()):
-                continue
-            if not anchor:
-                continue
+        # #1918: a bare pr/<N> anchor (explicit, or the "PR-<N>" id-fallback)
+        # has no repo and there is NO default repo -- it is never closed
+        # from a cached status, whatever any cache or environment says.
+        # Counted, and reported once per run after the loop.
+        if _is_bare_pr_anchor(anchor):
+            skipped_bare += 1
+            continue
+
+        # Only a repo-qualified PR anchor can reach the cache lookup below.
+        # Everything else (a non-PR anchor such as project/<N>, or no anchor
+        # at all) is not a PR-baton this pass can close.
+        if not (anchor and _parse_pr_anchor(anchor)):
+            continue
 
         # Cache-only (skip reason 2, above): skip uncached anchors to stay
         # within the hook's 5s timeout. With 430+ baton files, uncached gh
@@ -683,6 +781,15 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
                 file=sys.stderr,
             )
 
+    # #1918: ONE counted line per run for the batons refused above.
+    if skipped_bare:
+        print(
+            f"baton auto-archive: skipped {skipped_bare} baton(s) with an "
+            f"unqualified pr/<N> anchor (run baton anchor <id> --github "
+            f"pr/<owner>/<repo>/<N>)",
+            file=sys.stderr,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -690,21 +797,75 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
 # _emit_context now lives in _prompthooklib (gh#1680 slice 1); imported above.
 
 
+def _report_prompthooklib_import_failed() -> None:
+    """#3521: a failed `_prompthooklib` import is VISIBLE, not a silent no-op.
+
+    One class-only stderr line plus one class-only injected context line, on
+    every run (deliberately no rate limit: a broken install is rare and
+    severe). The lib -- and its `emit_context` -- is the thing that failed, so
+    the envelope is built here with `json` alone. Each emission is separately
+    guarded: this function never raises, and if a write fails the hook falls
+    back to the silent exit 0 it had before.
+    """
+    try:
+        cls = "".join(
+            ch if ch.isprintable() else "?" for ch in _PROMPTHOOKLIB_IMPORT_ERROR
+        )[:80]
+        line = f"engram-baton-prompt-hook: _prompthooklib import failed: {cls}"
+    except Exception:
+        return
+    try:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": line,
+        }}))
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def main() -> None:
     # ── Prologue-lib gate (gh#1680 slice 1) ───────────────────────────────────
     # If _prompthooklib somehow failed to import, _load_config/_get_agent_name/
-    # _emit_context are unavailable -- degrade to a silent no-op, matching
-    # every other best-effort import in this hook's prologue.
+    # _emit_context are unavailable. Report the failure (class-only stderr
+    # line + injected context line, #3521) and exit 0 without doing any other
+    # work. When run as a script the exit is os._exit(0), not sys.exit(0):
+    # the reporter swallows a failed write on a closed pipe, which leaves
+    # data buffered, and the interpreter's shutdown flush would then fail and
+    # turn the exit code into 120. When the module is loaded in-process (as
+    # the tests do), it raises SystemExit(0) instead, because os._exit would
+    # end the host process.
     if not _PROMPTHOOKLIB_OK:
+        _report_prompthooklib_import_failed()
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        # Only a hook run as a script may skip shutdown: an in-process caller
+        # (such as a test) must get a catchable SystemExit, never a killed process.
+        if __name__ == "__main__":
+            os._exit(0)
         sys.exit(0)
 
     # ── Config + agent name ───────────────────────────────────────────────────
     config = _load_config()
+    if _config_unknown_reason is not None:
+        # #3521 row 6: unreadable config.json is UNKNOWN, never "not configured".
+        _report_config_unknown(
+            "engram-baton-prompt-hook", "config:baton-prompt-hook", ENGRAM_HOME,
+            _config_unknown_reason, _emit_context, "baton check skipped",
+        )
+        sys.exit(0)
     agent_name = _get_agent_name(config)
     # Even if agent_name is empty, filtering returns nothing (no turn match).
 
     # ── Forum-configured gate ────────────────────────────────────────────────
-    # Pure-API: no forum configured (no forum.url, no agent_name), or a missing
+    # Pure-API: no forum configured (no forum.url), or a missing
     # forum_api import, exit silently — zero behavior change, and no local-FS
     # fallback.
     if not _FORUM_API_OK or not _is_forum_configured(config):

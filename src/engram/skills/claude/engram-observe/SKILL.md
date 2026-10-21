@@ -188,7 +188,7 @@ Before calling `engram_add_observation`, verify the quote exists in the
 source file:
 
 ```
-~/.engram/tools/verify_quote.py <jsonl-path-or-file-path> "<exact quote>"
+"${ENGRAM_HOME:-$HOME/.engram}"/tools/verify_quote.py <jsonl-path-or-file-path> "<exact quote>"
 ```
 
 - **Exit 0** — quote FOUND (verbatim substring match). Copy the printed
@@ -202,8 +202,9 @@ source file:
     moment and re-read the file rather than assuming the quote is wrong.
   - Otherwise, re-check for paraphrase drift: did you reconstruct the quote
     from memory instead of copying it? Re-read the source and copy exactly.
-- **Exit 2** — could not check at all (bad usage, file does not exist). Fix
-  the path before proceeding; this is not a verification result.
+- **Exit 2** — could not check at all (bad usage, file does not exist, or the
+  path is not a regular file — a directory, FIFO or device). Fix the path
+  before proceeding; this is not a verification result.
 
 Only after a confirmed match should you call the filing tool. If a filing
 call still fails the server's own verbatim check after this pre-verification
@@ -302,8 +303,9 @@ cost for any of its other clauses that stay unextracted.
 
 ## 6. Response keys that carry their own remedy
 
-Two keys come back on every `engram_add_observation` response and need nothing from you at call
-time — which is why they are documented here and not in the tool description:
+Three advisory keys can come back on an `engram_add_observation` response, and none needs anything
+from you at call time. The first two are documented only here, not in the tool description; the
+third is also named in the description of each write tool that returns it:
 
 - **`anchoring_advisory`** — measures how many of the claim's hard facts (node ids, issue/PR refs,
   hex shas, 3+-digit numbers, dates/times) are literal substrings of `quoted_text`. When
@@ -314,3 +316,8 @@ time — which is why they are documented here and not in the tool description:
   conditional rather than a permanent guarantee.
 - **`predictive_hint`** — appears when `predicted_event`/`resolution_timeframe` were passed without
   `is_predictive`. Advisory only; suppressed whenever `is_predictive` is true.
+- **`recall_summary_overrun`** — appears only when the stripped `recall_summary` is over the 140
+  target (soft-accepted, `needs_tightening` set); it names the length. Advisory only; the node is
+  created. The same key comes back from `engram_derive`, `engram_add_definition`,
+  `engram_add_conjecture` and `engram_add_lesson`. The remedy is to write the next summary at or
+  under 140, or tighten this one; the sleep cycle's summary pass also picks it up.

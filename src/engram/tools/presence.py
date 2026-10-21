@@ -10,7 +10,7 @@ States
 
 Resolution order (get_mode)
 ---------------------------
-1. Explicit override (``~/.engram/presence-mode.json``) if present and not expired.
+1. Explicit override (``~/.engram/presence-mode.json``, under ``$ENGRAM_HOME``) if present and not expired.
 2. Derived: ``user`` if ``last-user-activity`` is within the cooldown window; else ``auto``.
 3. Fail-open to ``auto`` on any error — a broken presence layer must never trap
    the agent in ``user`` (loop suspended, feed muted).  Same discipline as the
@@ -21,10 +21,20 @@ Stdlib-only — no third-party deps.
 
 import json
 import os
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+# The ONE ENGRAM-home resolver for tools lives beside this file (U14, #3862); resolve the package root
+# through the symlink so `from tools import ...` works run as a script, loaded by path, or from the
+# flattened plugin layout (same shim as reconcile_lesson_demotions.py).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+
+from tools import _owner_read as owner_read  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # The ONE definition — mode → operational knobs. (2-state spine; flavors later.)
@@ -50,10 +60,7 @@ _DEFAULT_COOLDOWN_SECONDS: int = 600
 # Paths — mirrors _status_derive.py pattern exactly (both derive from ENGRAM_HOME).
 # ---------------------------------------------------------------------------
 
-ENGRAM_HOME: str = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+ENGRAM_HOME: str = str(owner_read.engram_home())
 
 # The same last-user-activity stamp that _status_derive._recently_engaged() reads.
 # Defined independently (not imported from _status_derive) to keep this module
@@ -132,7 +139,7 @@ def active_override() -> Optional[dict]:
     """Return the parsed override dict if a non-expired explicit override is active.
 
     Returns the full dict (``{"mode", "since", "expires_at", ...}``) when
-    ``~/.engram/presence-mode.json`` exists, has a known mode, and is not
+    ``~/.engram/presence-mode.json`` (under ``$ENGRAM_HOME``) exists, has a known mode, and is not
     expired.  ``expires_at=None`` means permanent (no expiry) → valid.
     Any error (missing file, corrupt JSON, unknown mode, parse failure,
     expired TTL) → ``None``.  Fail-open to None — same spirit as get_mode's
@@ -198,7 +205,7 @@ def get_mode(override=_UNSET) -> tuple:
 
 
 def set_mode(name: str, *, ttl_seconds: Optional[int] = None) -> None:
-    """Write an explicit mode override to ``~/.engram/presence-mode.json``.
+    """Write an explicit mode override to ``~/.engram/presence-mode.json`` (under ``$ENGRAM_HOME``).
 
     Parameters
     ----------

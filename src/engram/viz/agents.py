@@ -26,12 +26,15 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs
 
+from .data.sqlite_ro import connect_ro
+
 # Renamed from the original "viz_server.discover" to match this module's
 # new home -- a diagnostic-only name (log filtering), not part of the
 # byte-identical served-output contract this PR's acceptance gates check.
 _disc_log = logging.getLogger("viz.agents.discover")
 
-DEFAULT_DB = str(Path.home() / ".engram" / "knowledge.db")
+_ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+DEFAULT_DB = str(Path(_ENGRAM_HOME) / "knowledge.db")
 DEFAULT_PORT = 5001
 
 # Agent registry — populated in main() from --config or --db.
@@ -121,11 +124,22 @@ def _load_config(path: str) -> tuple[dict, str]:
     return agents, default
 
 
+def _registered_homes(root) -> list:
+    """Trusted registry homes for a login-home root (engram_home_registry);
+    [] when the module is unavailable or the entry is absent / untrusted."""
+    try:
+        from engram_home_registry import homes_for
+        return list(homes_for(root))
+    except Exception as e:
+        _disc_log.debug("discover_agents: registry read failed for %s: %s", root, e)
+        return []
+
+
 def discover_agents(scan_roots=None) -> dict:
     """Auto-discover local ENGRAM agents by scanning home directories.
 
     For each root in scan_roots (default: every /home/* entry plus the running
-    user's own home), glob '<root>/.engram*', skip backup/baseline dirs, and
+    user's own home), glob '<root>/.engram*' (the default $ENGRAM_HOME name), skip backup/baseline dirs, and
     for each candidate require both knowledge.db and config.json. Read
     agent_name from config.json (the canonical field). Register the agent under
     that name with its db path.
@@ -155,13 +169,34 @@ def discover_agents(scan_roots=None) -> dict:
             candidates = sorted(root.glob(".engram*"))
         except Exception as e:
             _disc_log.debug("discover_agents: glob failed for root %s: %s", root, e)
-            continue
+            candidates = []
+
+        # #3863 PR 5 (R3): the seat's registered home goes FIRST; the glob
+        # stays as the fallback.  A registered home need not be a .engram*
+        # directory.  Dedupe by realpath so a home found both ways counts once.
+        registered = [Path(h) for h in _registered_homes(root)]
+        registered_real = {os.path.realpath(str(h)) for h in registered}
+        seen_real: set = set()
+        ordered: list = []
+        for cand in registered + candidates:
+            try:
+                key = os.path.realpath(str(cand))
+            except Exception:
+                key = str(cand)
+            if key in seen_real:
+                continue
+            seen_real.add(key)
+            ordered.append(cand)
+        candidates = ordered
 
         for candidate in candidates:
             try:
                 name_part = candidate.name
-                # Skip backup and baseline dirs.
-                if name_part.endswith(".bak") or "baseline" in name_part:
+                # Skip backup and baseline dirs.  Only a GLOB guess gets this
+                # heuristic: a home the seat registered itself is trusted as
+                # named, whatever its basename (Mira, #3885).
+                if (os.path.realpath(str(candidate)) not in registered_real
+                        and (name_part.endswith(".bak") or "baseline" in name_part)):
                     continue
                 if not candidate.is_dir():
                     continue
@@ -458,7 +493,7 @@ def get_agents_meta() -> list:
             entry["current_node_count"] = 0
         else:
             try:
-                conn = sqlite3.connect(f"file:{info['db']}?mode=ro", uri=True)
+                conn = connect_ro(info['db'])
                 cnt = conn.execute(
                     "SELECT COUNT(*) FROM nodes WHERE is_current = 1"
                 ).fetchone()[0]

@@ -92,18 +92,21 @@ def _derive_cascade() -> "tuple[frozenset, frozenset]":
     """(cascade, cascade_ndc). ``cascade`` is core.CASCADE_RELATIONS itself
     (already derived from EDGE_CLASSIFICATIONS at import time in
     engram_core.py). ``cascade_ndc`` is the subset of cascade relations whose
-    EDGE_CLASSIFICATIONS entry does NOT carry ``dag`` (real edge-walk
-    acyclicity, #2357) — recomputed here from EDGE_CLASSIFICATIONS at call
+    EDGE_CLASSIFICATIONS entry has no ``dag_family`` (real edge-walk
+    acyclicity, #2357; #3210 turned the bool ``dag`` into ``dag_family``) —
+    recomputed here from EDGE_CLASSIFICATIONS at call
     time (not cached), so a future edit to that declaration is picked up with
     no edit to this module.
 
-    #2357 note: this checks ``dag``, not the (renamed) ``temporal_causal``
+    #2357 note: this checks ``dag_family``, not the (renamed) ``temporal_causal``
     flag. A cascade relation deliberately backwards in creation time (e.g.
     ``acknowledged_derives_from``) is exactly the case this module exists to
     NOT flag, as long as it's still dag-safe — that's the whole point of
     splitting the two properties apart."""
     cascade = core.CASCADE_RELATIONS
-    non_dag = {r for r, c in core.EDGE_CLASSIFICATIONS.items() if not c["dag"]}
+    non_dag = {
+        r for r, c in core.EDGE_CLASSIFICATIONS.items() if c["dag_family"] is None
+    }
     return cascade, cascade & non_dag
 
 
@@ -260,12 +263,12 @@ def _invariant_4(conn: sqlite3.Connection) -> "tuple[dict, set]":
 
 
 def _invariant_5(conn: sqlite3.Connection, cascade_ndc: frozenset) -> "tuple[dict, set]":
-    """5 — cascade-causing edge that is not dag-safe (#2357: checks ``dag``,
+    """5 — cascade-causing edge that is not dag-safe (#2357: checks ``dag_family``,
     real edge-walk acyclicity — not the renamed ``temporal_causal`` creation-
     order flag; see ``_derive_cascade``'s docstring for why the two diverge).
 
     Derives to the empty set today by construction (every relation in
-    CASCADE_RELATIONS also has dag:True in EDGE_CLASSIFICATIONS) — do
+    CASCADE_RELATIONS also has a dag_family in EDGE_CLASSIFICATIONS) — do
     NOT special-case; the empty result falling out of the derivation is the
     evidence that the derivation works (#2300).
 

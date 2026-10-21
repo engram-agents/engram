@@ -3,17 +3,17 @@ engram_add_axiom: Records a TERMINAL principle (confidence always 1.0, no premis
 engram_add_conjecture: Files a speculative hypothesis (confidence capped [0.10, 0.60]). Promote via engram_resolve, NOT engram_supersede — cross-type promotion is rejected.
 engram_add_cornerstone: Records an identity-forming dispositional pivot (prior_frame -> new_frame). Distinct from axioms (terminal) and goals (directional).
 engram_add_definition: Anchors what a TERM means in this graph — vocabulary grounding, not a claim about the world. Refine via engram_supersede, not re-filing.
-engram_add_edge: Adds ONLY a whitelisted non-cascade edge between EXISTING nodes (about, exemplifies, serves, subtask_of, tensions, instantiates, generalizes). Idempotent.
+engram_add_edge: Adds ONLY a whitelisted non-cascade edge between EXISTING nodes (about, exemplifies, serves, subtask_of, tensions, instantiates, generalizes, bears_on). Idempotent.
 engram_add_goal: Records a directional aspiration — no completion state. motivation is REQUIRED. Discuss-first; not a task (use engram_add_task).
 engram_add_lesson: Creates a tripwire pattern generalized from incident observations, with a nudge injected on situation-pattern match. Not for a one-off note.
 engram_add_observation: Files ONE claim with verified provenance (quote checked verbatim against the source/session). Not for several claims from one source — use engram_add_observation_batch.
 engram_add_observation_batch: Bulk variant: files MULTIPLE observations sharing one source's evidence in one call. Same verbatim-quote rules per item; not a multi-source batch.
-engram_add_person: Records a person node with typed relational fields only — NOT free-form facts (those are observations via engram_link_about). At most one is_self=true node per graph.
+engram_add_person: Records a person node with typed relational fields only — NOT free-form facts (those are observations via engram_link_about). At most one is_self=true node per graph. trust_tier our_side and above (and self) is refused at creation — create, then engram_set_trust_tier.
 engram_add_special_moment: Appends a highlight to a person's special_moments list (cap 100, loud refusal at cap, never silently evicts). Not idempotent — repeats append duplicates.
 engram_add_task: Records a concrete, completable work item — distinct from goals (no completion state) and conjectures (hypotheses).
 engram_add_trust_signal: Records an INTERPRETIVE trust signal derived from an observation about a person — non-claim-bearing, never usable as a derivation premise.
 engram_advance_turn: [Sleep/first-session only] IRREVERSIBLE turn-advance checkpoint — at most once/24h, no self-guard against double-call. Mid-session saves should use engram_checkpoint instead.
-engram_ask: Registers a persistent open question that survives across sessions via recall/dream scans. Pair with engram_resolve for the answer.
+engram_ask: Registers a persistent open question that survives across sessions via recall/dream scans. Pair with engram_resolve for the answer. Optional bears_on names the claims the answer will count for or against.
 engram_cascade_frontier: Read-only: which cascade-marked nodes are ready to adjudicate right now (no pending cascade-ancestor blocking them). Recomputed fresh from marker state every call — no queue, no stored cursor. Mode B: whole-graph frontier. Mode C (node_id given): minimal pending-ancestor slice for one target, plus a labeled blast-radius estimate.
 engram_cascade_resolve: Record your adjudication of ONE cascade-marked node that is on the frontier: retract it, supersede it with an already-created replacement, or acknowledge that the upstream change does not touch its claim. Stamps the decision on ALL that node's pending markers, recomputes confidence transitively, and auto-resolves any dependent the decision renders trivial. Never creates a node.
 engram_checkpoint: Lossless checkpoint usable ANY time — no turn advance, no forgetting-curve effect. Use engram_advance_turn for the once-daily irreversible sleep checkpoint.
@@ -42,19 +42,20 @@ engram_query: Semantic+keyword search returning ranked (tiered) nodes; REFRESHES
 engram_query_pattern: Runs ONE of a fixed named library of graph-pattern scans (dream-fairy primitives) — pattern_name must be a registered preset.
 engram_reflect: [Sleep-cycle] Heavyweight categorized self-audit that opens the dream cycle. Awake-callable but wasteful — use engram_diagnose for awake-state health checks.
 engram_register_exemplar: Wires ONE exemplifies edge (claim-bearing node -> lesson OR cornerstone); refreshes the lesson tripwire cache. Doesn't create the exemplar node.
-engram_remove_edge: Deletes ONLY a whitelisted non-cascade edge (about, tensions, subtask_of, serves, exemplifies, instantiates, generalizes). Cascade/provenance edges blocked — use engram-surgical.
+engram_remove_edge: Deletes ONLY a whitelisted non-cascade edge (about, tensions, subtask_of, serves, exemplifies, instantiates, generalizes, bears_on). Cascade/provenance edges blocked — use engram-surgical.
 engram_report_feeling: Non-claim-bearing first-person self-report (only reports, never verifies own state) — dedup-exempt, always creates a new node.
 engram_resolve: Pure-wire: wires a resolves edge from an EXISTING claim-bearing node to a target and flips its status. Does NOT create the resolving derivation.
 engram_retract: Error correction (never-was-valid) — node preserved for audit, downstream TAINTED not deleted. Not for a valid-then claim — use engram_supersede.
-engram_retype_edge: Corrects a wrong edge relation by making it WEAKER (never stronger) in one audited transaction — e.g. a supported_by/derives_from/cites edge that was really only 'about' or an 'exemplifies' case. Refuses moves outside a fixed allowed-move table, a pending-marker endpoint, or a missing reason.
+engram_retype_edge: Corrects a wrong edge relation by making it WEAKER (never stronger) in one audited transaction — e.g. a supported_by/derives_from/loose-cites edge (never an observation's cites to its evidence) that was really only an 'about', 'bears_on', 'exemplifies', 'generalizes', 'instantiates', 'serves', 'subtask_of' or 'tensions' case. Refuses moves outside a fixed allowed-move table, a pending-marker endpoint, or a missing reason.
 engram_scan_emergence: [Sleep-cycle] Scans for clusters that could seed a new cornerstone — surfaces candidates only, creates nothing. Wasteful awake, not destructive.
 engram_set_person_lineage: Parses a model_id into provider/family/version onto a person node — a narrow patch, not a general field updater (use engram_update_person).
 engram_set_recall_summaries: Batch-writes recall_summary + recall_keywords onto EXISTING nodes — best-effort, partial failures don't roll back the batch. Accepts either inline 'summaries' or an absolute-path 'summaries_file' pointing at a JSON file of the same shape.
 engram_set_trust_tier: Sets a person's persistent trust tier. primary_user/user_family/our_side are approval-gated (requires justification + an attestation the server cannot itself verify); tier='self' is exempt via its own is_self structural attestation, not this gate.
+engram_sign: Return the signature line (emoji, name, model lineage, ENGRAM version, accountable human) to append to external communications; refuses naming the field if any is unreadable.
 engram_stats: Fixed graph-level sections (counts, confidence distribution, memory tiers) — NOT arbitrary group-bys. mode= restricts to a recent creation-time window.
 engram_supersede: Pure-wire epistemic-evolution link (old was valid-at-the-time). Does NOT create the replacement node. Not error correction — use engram_retract.
 engram_surface: Lossy 'sounds familiar' scan — IDs + compact summary only, NO full content, NO memory refresh. Use engram_query/inspect to actually read a hit.
 engram_unfocus: Releases node ids from the active focus list. Idempotent — already-unfocused ids report success.
-engram_update_lesson: In-place edit of ONLY situation_pattern + scaffolding_nudge — claim/confidence stay supersede-only. Prose-shaped patterns rejected unless overridden.
-engram_update_person: In-place edit of MUTABLE person fields only (relation, pronouns, trust_tier, aliases, location_contact). Immutable fields rejected — use engram_supersede.
+engram_update_lesson: In-place edit of situation_pattern, scaffolding_nudge, prevention_type, tripwire_priority, match_scope — claim/confidence stay supersede-only. Prose-shaped patterns rejected unless overridden.
+engram_update_person: In-place edit of MUTABLE person fields only (relation, pronouns, aliases, location_contact). Immutable fields rejected — use engram_supersede. trust_tier is rejected too — use engram_set_trust_tier.
 engram_update_task: Transitions a task's status and auto-rebalances importance per a fixed status map — not a free-form field editor.

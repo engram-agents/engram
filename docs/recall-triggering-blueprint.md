@@ -27,7 +27,7 @@ Same living-doc pattern as the perf blueprint (#1667).
 |---|---|
 | `UserPromptSubmit` | **The only general recall trigger.** `engram-surface-hook.py` → recall-daemon (Unix socket, semantic+FTS) → `_search_nodes` 3-tier ranking → rendered nudge (specials ≤3, top claims ≤3, Others ≤15 keyword-only). Also: incident tripwire (surfaced IDs ∩ `error_incidents.json`), error-pattern keyword fallback, short-prompt prev-response-tail prepend (IDF-gated) for the *embedding* query only. |
 | `PreToolUse` (Bash + `mcp__.*`) | `engram-lesson-tripwire-hook.py` — regex `situation_pattern` match against the pending command / tool-call → injects `scaffolding_nudge`. **Lessons only**; no general recall; not wired for Read/Edit/Write/Grep/WebFetch. |
-| `Stop` | No recall. Write-check flag + `engram-utility-credit-mention-stop.py` (bumps `utility_score` of node IDs mentioned in the agent's turn — positive feedback only). |
+| `Stop` | No recall. Write-check flag + `engram-utility-credit-mention-stop.py` (bumps `utility_score` of node IDs mentioned in the agent's turn — positive feedback only — and restamps their `recall_turn` + importance, not `recall_count`). |
 | `SessionStart` / `PostCompact` | No recall (counter reset, briefing pointer). |
 
 ### Ranking (engram_query.py `_search_nodes`)

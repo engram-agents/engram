@@ -24,12 +24,14 @@ from pathlib import Path
 HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+if HOOK_DIR not in sys.path:
+    sys.path.insert(0, HOOK_DIR)
+from _hooklib import engram_home_or_exit  # noqa: E402
+
+
 def _resolve_engram_home() -> str:
     """Per-install data dir: knowledge.db, sockets, briefing, history."""
-    return (
-        os.environ.get("ENGRAM_HOME")
-        or os.path.expanduser("~/.engram")
-    )
+    return str(engram_home_or_exit())
 
 
 ENGRAM_HOME = _resolve_engram_home()
@@ -39,16 +41,39 @@ os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 
 if HOOK_DIR not in sys.path:
     sys.path.insert(0, HOOK_DIR)
-from _hooklib import resolve_runtime_dir, emit_context
+from _hooklib import resolve_runtime_dir, emit_context, write_route_ledger, prompt_fire_key
+from _hooklib import (
+    append_shown_record, build_exclusion_resolver, in_context_drop_ids,
+    in_context_exclusion_enabled,
+)
+# #3521: shared advisory-probe `unknown` rendering (sanitize + stderr line + the
+# one injected line + the stamp-file rate limit) and the tri-state pgrep probe.
+from _hooklib import (
+    probe_unknown_line, write_probe_unknown_stderr,
+    probe_notice_due, mark_probe_notice, probe_own_server_py,
+    read_state_json_classified,
+)
+# #3628: every file open here is non-blocking and regular-file-only (a FIFO at
+# a state path must not hang the hook); the helpers live in _hooklib.
+from _hooklib import open_regular_text, open_regular_text_write
+# #3628: every mode=ro sqlite connect refuses a FIFO / directory (raising a
+# sqlite3.OperationalError + OSError) instead of hanging.
+from _hooklib import connect_regular_ro
+# U10 (#3821): the flag helper's lazy importer, shared with the other owner-backed hooks.
+from _hooklib import import_owner_flags as _hooklib_import_owner_flags
 from _harness import detect_harness, get_harness_budgets
 try:
-    from _hooklib import (
-        is_own_server_py_running as _is_own_server_py_running_impl,
-        atomic_write_json,
-    )
+    from _hooklib import atomic_write_json
     _HOOKLIB_OK = True
 except Exception:
     _HOOKLIB_OK = False
+# #3613: meaningful-span marker. Fail-open: an older/absent helper degrades to
+# "no marker" (the pre-change behaviour), never an import crash.
+try:
+    from _hooklib import marker_recall_query
+except Exception:
+    def marker_recall_query(text):
+        return ("none", text)
 
 # Locate where engram_client.py lives for import (gh#2570: local
 # _resolve_runtime_dir hoisted to _hooklib.resolve_runtime_dir; this hook's
@@ -83,6 +108,48 @@ except Exception:
     def write_telemetry_record(manifest_id, event_type, fields=None):  # pragma: no cover -- import-failure fallback
         return False
 
+# Evidence-out-of-search (Lei 2026-10-08): the attached-pack FTS below is a
+# search path, so it applies the ONE definition of "not searchable" from the
+# stdlib-only engram_search_rules module (never a hand-copied literal). Its own
+# sentinel, per the one-call-per-module rule above. If the module cannot be
+# imported the pack query FAILS CLOSED (returns no pack results) rather than
+# risk returning evidence nodes.
+# #3856: the ONE shared compare-and-set cursor advance (stdlib-only). Own sentinel, per the one-call-per-module
+# rule above. An import failure leaves _advance_moment_cursor None: _advance_person_moment_cursor then returns
+# False (best effort) -- it never falls back to rewriting the whole metadata dict.
+_MOMENT_CURSOR_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_moment_cursor.py")
+if _MOMENT_CURSOR_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _MOMENT_CURSOR_RUNTIME_DIR)
+try:
+    from engram_moment_cursor import advance_moment_cursor as _advance_moment_cursor
+    from engram_moment_cursor import read_cursor as _read_moment_cursor
+except Exception:
+    _advance_moment_cursor = None
+    _read_moment_cursor = None
+
+_SEARCH_RULES_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_search_rules.py")
+if _SEARCH_RULES_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _SEARCH_RULES_RUNTIME_DIR)
+try:
+    from engram_search_rules import not_search_excluded_sql as _not_search_excluded_sql
+except Exception:
+    # An explicit ENGRAM_RUNTIME_DIR override is returned by resolve_runtime_dir
+    # without checking the sentinel, so it can point at a dir that lacks this
+    # module. Fall back to walking this file's parents for the nearest dir (or
+    # its src/engram) that actually holds it -- never a fixed parents[N].
+    _not_search_excluded_sql = None
+    try:
+        for _parent in Path(__file__).resolve().parents:
+            for _cand in (_parent, _parent / "src" / "engram"):
+                if (_cand / "engram_search_rules.py").exists():
+                    sys.path.insert(0, str(_cand))
+                    from engram_search_rules import not_search_excluded_sql as _not_search_excluded_sql
+                    break
+            if _not_search_excluded_sql is not None:
+                break
+    except Exception:  # pragma: no cover -- fail closed (pack query returns [])
+        _not_search_excluded_sql = None
+
 # alpha #2574 WS3: this hook's TRIGGER-ENTRY site literal (participation
 # manifest_id) for engram.telemetry.reached -- see main()'s first line. All
 # three of this file's emit sites share this one `main` dispatch target
@@ -93,6 +160,480 @@ _SURFACE_FIRE_SITE = "surface-hook.surface_fire"
 _TRIGGER_FIRE_SITE = "surface-hook.trigger_fire"
 _RENDER_SIZE_SITE = "surface-hook.render_size"
 
+# ---------------------------------------------------------------------------
+# U10 (#3821, part of #2652) -- the flagged read through the engramd owner
+# ---------------------------------------------------------------------------
+# With `engramd.surface_reads_via_owner` true in $ENGRAM_HOME/config.json (read ONLY through
+# engramd_owner_flags.flag_on), the hook's store reads go through ONE
+# engramd_client.OwnerReadConnection shared by the whole fire and never open knowledge.db:
+#   row 1  _check_embedding_restore_flag     the `read` op (registered template)
+#   row 2  _dormant_focus_set_candidates     the `read` op (two registered templates)
+#   row 3  _render_triggered_principles_section   the typed `chain` op
+#   row 4  main -> _should_prepend -> engram_idf.extract_keywords   COUNT template + typed `df`
+#   row 5  in-context exclusion / route ledger -> _hooklib._focused_ids   via the shim
+#   row 6  _check_db_liveness                DERIVED from row 1's read (amended 13:56Z; fold 3): the
+#                                            fire's own store read answers Ok -> healthy, no extra trip;
+#                                            only when it FAILS is one `ping` sent, to tell owner-down
+#                                            from 'owner up, store unreadable'. `ping` alone is
+#                                            store-free (blind to a store that broke AFTER the owner
+#                                            started, #1218), which is why the verdict rides a store read
+#   row 7  query_fts_fallback                NOT TAKEN (an in-hook server runtime, the #3741
+#                                            class): the recall daemon down renders the hook's
+#                                            existing daemon-down notice and no recall block
+#   row 8  _advance_person_moment_cursor     NOT a read, so NOT behind the reads flag: it sits behind its
+#                                            own, INDEPENDENT flag `engramd.surface_writes_via_owner`
+#                                            (U13, #3856; default OFF; see "The write" below). This was
+#                                            the named U10 remainder; with it moved, every store access
+#                                            of this hook goes through the owner behind a flag.
+# Flag OFF is today's direct path, unchanged. Modelled on U6b (engram-lesson-tripwire-hook.py)
+# and U9 (engram-session-start-hook.py).
+#
+# Registry of this hook's owner sites (reads flag: rows 1-6; writes flag: row 8):
+#   reads  -> the `read` / `chain` / `df` / `ping` ops (rows 1-6, above)
+#   writes -> the typed `advance_moment_cursor` op (row 8): ONE call per rendered person moment,
+#             `write("advance_moment_cursor", {person_id, from_cursor})`, params exactly those two keys.
+#
+# The write (U13, #3856). `engramd.surface_writes_via_owner` is read ONLY through
+# engramd_owner_flags.flag_on, independent of `engramd.surface_reads_via_owner` (all four on/off
+# combinations are legal). Flag OFF: the phase-1 direct path (this process's own RW connection running
+# the shared compare-and-set `engram_moment_cursor.advance_moment_cursor`; it still never rewrites
+# another key). Flag ON: the advance goes ONLY to the owner, the hook makes ZERO direct connects to the
+# store for it, and NO owner outcome falls back to a direct write. Best effort, ONE attempt, no retry:
+# True only when the owner answered Ok with applied true; stale / not_person / not_object are quiet
+# Falses; Unavailable, Rejected (unknown_operation, busy, readback_mismatch, ...) and a client import
+# failure are False AND recorded loud (the first one per fire) under the existing `surface-owner` notice
+# kind, rate-limited by the shared probe-notice stamp. The moment still renders either way; a lost
+# advance only means the SAME moment may repeat sooner, the safe direction. The call gets
+# min(remaining hook budget, engramd_client.OWNER_WRITE_CLIENT_TIMEOUT): the hook is registered with a
+# 10 s timeout, and the write happens after render, so the remaining budget is the timeout minus a tail
+# reserve minus the time since this process started (see HOOK_TIMEOUT_S below). After one owner failure
+# the rest of the fire makes no further owner write.
+#
+# Owner failure (any OwnerReadError, or the client failing to import): the failing site returns
+# the degraded value it returns for a failed direct read (never a stale value presented as an
+# answer, never a fallback to a direct open, never row 7's in-hook fallback), the FIRST failure is
+# recorded whole (kind, the typed Unavailable/Rejected result), and main() adds ONE loud line at
+# the head, rate-limited through the shared probe-notice stamp under kind `surface-owner`. A
+# failed flag helper reads OFF and is reported (stderr line every run; the same line once per
+# window under `surface-owner-flag`).
+
+# The hook is registered with a 10 s timeout (hooks/hooks.json). Owner time for the whole fire is
+# bounded at 3.0 s, each read at 1.0 s (the liveness store read rides the fire's connection and
+# budget); the liveness ping is bounded at 1.0 s on top.
+OWNER_FIRE_BUDGET_S = 3.0
+OWNER_READ_TIMEOUT_S = 1.0
+
+# U13 (#3856): the owner WRITE (the person-moment cursor advance) happens after render, in the same 10 s hook.
+# HOOK_TIMEOUT_S mirrors the registered timeout (pinned against hooks.json by a test). The write's call timeout is
+# min(HOOK_TIMEOUT_S - OWNER_WRITE_TAIL_RESERVE_S - (seconds since this process started),
+# engramd_client.OWNER_WRITE_CLIENT_TIMEOUT); under OWNER_WRITE_MIN_TIMEOUT_S left, the owner is not called.
+# Worst case with the owner slow: reads <= OWNER_FIRE_BUDGET_S (3.0) + the liveness ping (1.0), then ONE write
+# <= 2.0, so owner time <= 6.0 of 10 s; after the first owner failure no further write is attempted.
+HOOK_TIMEOUT_S = 10.0
+OWNER_WRITE_TAIL_RESERVE_S = 1.5
+OWNER_WRITE_MIN_TIMEOUT_S = 0.25
+_HOOK_STARTED = time.monotonic()  # a hook is one process per fire, so import time is the fire's start
+
+_OWNER_FLAG_KEY = "surface_reads_via_owner"
+_OWNER_WRITE_FLAG_KEY = "surface_writes_via_owner"
+CONFIG_PATH = os.path.join(ENGRAM_HOME, "config.json")  # module-level so the A6 arm can re-point it (as the stop and tripwire hooks)
+OWNER_NOTICE_KEY = "surface-owner"
+OWNER_FLAG_NOTICE_KEY = "surface-owner-flag"
+# The shared cursor module (engram_moment_cursor) failing to import is not an owner failure but would leave the SAME
+# first person moment rendering forever with no sign: it gets its own notice KIND through the same shared stamp.
+MOMENT_CURSOR_NOTICE_KEY = "surface-moment-cursor"
+_MOMENT_CURSOR_UNAVAILABLE_SEEN = False  # set when a person moment is selected while the module is missing; reset per fire
+_OWNER_NOTICE_CAP = 700
+
+# Set by main() for ONE run (None outside main(): standalone callers of the sites stay on the
+# direct path). {"on": bool, "conn": shim or None, "failure": dict or None, "degraded": [sites]}.
+_OWNER_RUN = None
+
+# Set by _owner_reads_enabled() when the flag helper fails at import or at `flag_on` (class NAME
+# only, never the message); reset at the top of every call.
+_OWNER_FLAGS_FAILURE = None
+
+# The block each site's failure takes out of this fire, as the notice names it.
+_OWNER_BLOCK_NAMES = {
+    "_check_embedding_restore_flag": "embedding restore check",
+    "_dormant_focus_set_candidates": "saved focus-set pointers",
+    "_render_triggered_principles_section": "triggered principles",
+    "_should_prepend": "keyword gate",
+    "_focused_ids": "in-context exclusion",
+    "_check_db_liveness": "DB liveness",
+}
+# Row 6 results the owner path distinguishes (kept on _OWNER_RUN["liveness_stage"]).
+_LIVENESS_OWNER_DOWN = "owner_down"
+_LIVENESS_STORE_UNREADABLE = "store_unreadable"
+# Within store_unreadable (the owner answers `ping`, the read did not serve), two refusals are BUILD
+# conditions, not a damaged store: their remedy is not disk health. Kept on _OWNER_RUN["liveness_skew"].
+_SKEW_VERSION = "version"   # `unregistered_template`: the owner's build does not know this template
+_SKEW_SCHEMA = "schema"     # `refused_at_load` (not the missing-table detail): re-classification against the live store failed
+_OWNER_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+class _ClientImportFailure(Exception):
+    """engramd_client could not be imported. args = (cause class name,)."""
+
+
+def _import_owner_flags():
+    """Thin alias: the body lives once in `_hooklib.import_owner_flags`; the name stays a module
+    attribute because callers and tests patch it."""
+    return _hooklib_import_owner_flags(ENGRAM_HOME)
+
+
+def _owner_flags_failure_line():
+    """The one report line for a failed flag helper, or None. Class name only."""
+    if _OWNER_FLAGS_FAILURE is None:
+        return None
+    try:
+        cls = "".join(ch if ch.isprintable() else "?" for ch in str(_OWNER_FLAGS_FAILURE))[:80]
+        return f"engram-surface-hook: owner flag helper failed: {cls}"
+    except Exception:
+        return None
+
+
+def _owner_reads_enabled() -> bool:
+    """`engramd.surface_reads_via_owner`, read ONLY through engramd_owner_flags.flag_on (one
+    definition shared with the owner launcher); anything but the boolean `true` is OFF, the
+    direct path. ANY exception (and a SystemExit) importing the helper or calling `flag_on`
+    reads OFF -- the hook cannot know the flag is ON -- and its CLASS NAME (never the message) is
+    recorded in `_OWNER_FLAGS_FAILURE` (reset on every call) for main() to report.
+    KeyboardInterrupt is not caught."""
+    global _OWNER_FLAGS_FAILURE
+    _OWNER_FLAGS_FAILURE = None
+    try:
+        engramd_owner_flags = _import_owner_flags()
+        # `is True`: only the JSON boolean true is ON; a truthy non-bool must not read as ON.
+        return engramd_owner_flags.flag_on(
+            _OWNER_FLAG_KEY, CONFIG_PATH) is True
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 -- see docstring
+        try:
+            _OWNER_FLAGS_FAILURE = type(exc).__name__
+        except Exception:
+            _OWNER_FLAGS_FAILURE = "unknown"
+        return False
+
+
+def _owner_writes_enabled() -> bool:
+    """`engramd.surface_writes_via_owner` (U13, #3856), read ONLY through engramd_owner_flags.flag_on over the
+    module-level CONFIG_PATH, exactly like `_owner_reads_enabled` and independent of it. Anything but the
+    JSON boolean `true` is OFF; ANY exception (and a SystemExit) importing the helper or calling `flag_on`
+    reads OFF and its CLASS NAME is recorded in `_OWNER_FLAGS_FAILURE` for main() to report under the
+    existing `surface-owner-flag` notice. The slot is shared with the reads flag, so this does NOT reset it
+    (the reads call, which runs first, does) and keeps the FIRST failure. KeyboardInterrupt is not caught."""
+    global _OWNER_FLAGS_FAILURE
+    try:
+        engramd_owner_flags = _import_owner_flags()
+        return engramd_owner_flags.flag_on(
+            _OWNER_WRITE_FLAG_KEY, CONFIG_PATH) is True
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 -- see docstring
+        if _OWNER_FLAGS_FAILURE is None:
+            try:
+                _OWNER_FLAGS_FAILURE = type(exc).__name__
+            except Exception:
+                _OWNER_FLAGS_FAILURE = "unknown"
+        return False
+
+
+def _new_owner_run() -> dict:
+    """The owner state of ONE fire: both flags read once, each only through flag_on."""
+    reads = _owner_reads_enabled()      # resets the shared flag-failure slot
+    writes = _owner_writes_enabled()
+    return {"on": reads, "writes_on": writes, "conn": None, "failure": None, "write_failure": None, "degraded": []}
+
+
+def _owner_write_timeout(ec):
+    """The call timeout for the owner write: min(remaining hook budget, OWNER_WRITE_CLIENT_TIMEOUT), or None when
+    less than OWNER_WRITE_MIN_TIMEOUT_S is left (the owner is then not called)."""
+    remaining = HOOK_TIMEOUT_S - OWNER_WRITE_TAIL_RESERVE_S - (time.monotonic() - _HOOK_STARTED)
+    timeout = min(remaining, ec.OWNER_WRITE_CLIENT_TIMEOUT)
+    return timeout if timeout >= OWNER_WRITE_MIN_TIMEOUT_S else None
+
+
+def _record_owner_write_failure(run: dict, kind: str, result=None, cause=None) -> None:
+    """Keep the FIRST owner-write failure of this run (kind, the typed Unavailable/Rejected result, the cause CLASS
+    name only)."""
+    if run.get("write_failure") is None:
+        run["write_failure"] = {"kind": kind, "result": result, "cause": cause}
+
+
+def _advance_via_owner(run: dict, person_id: str, from_cursor: int) -> bool:
+    """The flag-ON cursor advance: ONLY the owner, never a direct write, whatever it answers. ONE attempt, NO
+    retry (best effort: a lost advance only means the same moment may repeat sooner, the safe direction). True
+    only for Ok with applied true; stale / not_person / not_object are quiet Falses; every other outcome is False
+    and recorded (the first one per fire). After one owner failure the fire makes no further owner write."""
+    try:
+        if run.get("write_failure") is not None:
+            return False
+        try:
+            ec = _owner_client()
+        except _ClientImportFailure as exc:
+            _record_owner_write_failure(run, "client_import", cause=(exc.args[0] if exc.args else "unknown"))
+            return False
+        timeout = _owner_write_timeout(ec)
+        if timeout is None:
+            _record_owner_write_failure(run, "budget_exhausted")
+            return False
+        try:
+            res = ec.write("advance_moment_cursor", {"person_id": person_id, "from_cursor": from_cursor}, timeout=timeout)
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 -- a client crash is a typed failure; KeyboardInterrupt is not caught
+            _record_owner_write_failure(run, "client_failure", cause=type(exc).__name__)
+            return False
+        if isinstance(res, ec.Ok):
+            result = res.result
+            if isinstance(result, dict) and isinstance(result.get("applied"), bool):
+                return result["applied"] is True        # a stale answer is normal and quiet
+            _record_owner_write_failure(run, "unusable_answer")
+            return False
+        if isinstance(res, ec.Unavailable):
+            _record_owner_write_failure(run, "unavailable", res)
+        elif isinstance(res, ec.Rejected):
+            _record_owner_write_failure(run, "rejected", res)
+        else:
+            _record_owner_write_failure(run, "unusable_answer")
+        return False
+    except Exception:  # noqa: BLE001 -- best effort: the moment still renders
+        return False
+
+
+def _owner_write_failure_text(run: dict) -> str:
+    """The ONE loud line for a recorded owner-write failure. It says the cursor did NOT advance (so the same
+    moment may repeat) -- except where the owner may have committed (a timeout, a readback_mismatch), where it says
+    so. `Rejected(unknown_operation)` names the contract skew and the remedy. Bounded; dynamic text is
+    control-character-free; never SQL, row data or an exception message."""
+    f = run["write_failure"]
+    reason = getattr(f.get("result"), "reason", None) if f.get("result") is not None else None
+    flag_hint = ("To write directly meanwhile, set engramd.surface_writes_via_owner to false "
+                 "in $ENGRAM_HOME/config.json.")
+    if f["kind"] == "rejected" and reason == "unknown_operation":
+        line = (
+            "⚠️  ENGRAM: the engramd owner is older than this hook (contract skew: it does not know "
+            "advance_moment_cursor). The person moment cursor was NOT advanced, so the same moment may repeat; "
+            f"restart or upgrade the owner. {flag_hint}"
+        )
+        return line[:_OWNER_NOTICE_CAP]
+    detail = f" (reason: {_sanitize_owner_text(reason, 40)})" if reason else ""
+    if f["kind"] == "client_import" and f.get("cause"):
+        detail = f" (cause: {_sanitize_owner_text(f['cause'], 40)})"
+    if f["kind"] == "rejected" and reason == "readback_mismatch":
+        outcome = ("The owner committed the advance but could NOT verify it, so the cursor may have advanced; "
+                   "do not assume either way.")
+    elif f["kind"] == "unavailable" and reason in ("timeout", "protocol"):
+        outcome = "The owner did not answer in time, so the cursor may or may not have advanced."
+    else:
+        outcome = "The person moment was shown, but its rotation did NOT advance, so the same moment may repeat."
+    line = (
+        f"⚠️  ENGRAM: the engramd owner could not advance a person moment cursor "
+        f"({_sanitize_owner_text(f['kind'], 40)}{detail}). {outcome} "
+        f"Do not write knowledge.db directly. {flag_hint}"
+    )
+    return line[:_OWNER_NOTICE_CAP]
+
+
+def _import_engramd_client():
+    """Lazy import (flag OFF must never import it), resolved layout-agnostically via the shared
+    resolver -- plugin root first, then a walk-parents search; never a fixed parents[N] (project
+    CLAUDE.md, "Plugin build restructures code paths")."""
+    runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engramd_client.py")
+    # Position 0 even if already present further down: an earlier insertion must not let another
+    # directory win this import.
+    sys.path[:] = [runtime_dir] + [p for p in sys.path if p != runtime_dir]
+    import engramd_client
+    return engramd_client
+
+
+def _owner_active() -> bool:
+    return _OWNER_RUN is not None and bool(_OWNER_RUN.get("on"))
+
+
+def _owner_client():
+    """The engramd_client module for this fire. Raises _ClientImportFailure."""
+    try:
+        return _import_engramd_client()
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 -- any import failure is an owner failure; KeyboardInterrupt is not caught
+        raise _ClientImportFailure(type(exc).__name__) from exc
+
+
+def _owner_conn():
+    """The ONE OwnerReadConnection of this fire, created lazily at first use and shared by every
+    site (none of them closes it). Raises _ClientImportFailure when the client cannot be
+    imported."""
+    run = _OWNER_RUN
+    if run["conn"] is None:
+        ec = _owner_client()
+        run["conn"] = ec.OwnerReadConnection(
+            total_budget=OWNER_FIRE_BUDGET_S, per_call_timeout=OWNER_READ_TIMEOUT_S)
+    return run["conn"]
+
+
+def _focused_read_conn():
+    """(build, conn) for the in-context resolver's one store read, `_hooklib._focused_ids`
+    (#3710, U8) -- for BOTH callers in main (the live exclusion resolver and the route ledger's).
+    Flag OFF: (True, None), the direct path as before. Flag ON: (True, the fire's owner
+    connection). Flag ON but the client cannot be imported: the failure is recorded (one loud
+    owner line) and (False, None): the caller builds NO resolver and writes no ledger line,
+    because the alternative is a direct open on a flag-ON fire. (A read that fails INSIDE
+    `_focused_ids` is recorded through the `on_failure` callback the callers pass (#3827; `_hooklib` ignores a callback that raises): a
+    refusal scoped to that one template reaches no other site of the fire.)"""
+    if not _owner_active():
+        return True, None
+    try:
+        return True, _owner_conn()
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 -- KeyboardInterrupt is not caught
+        _record_owner_failure("_focused_ids", exc)
+        return False, None
+
+
+def _is_owner_exc(exc: BaseException) -> bool:
+    return isinstance(exc, _ClientImportFailure) or (
+        type(exc).__name__ == "OwnerReadError" and hasattr(exc, "kind"))
+
+
+def _record_owner_failure(site: str, exc: BaseException) -> bool:
+    """Record an owner failure of this run: the site joins `degraded`, and the FIRST failure is
+    kept whole (kind, the typed Unavailable/Rejected result, the cause CLASS name only). Returns
+    True when `exc` was an owner failure; False leaves the caller to treat it as it always did
+    (a sqlite3 error, a bug)."""
+    if not _owner_active() or not _is_owner_exc(exc):
+        return False
+    run = _OWNER_RUN
+    if site not in run["degraded"]:
+        run["degraded"].append(site)
+    if run["failure"] is None:
+        if isinstance(exc, _ClientImportFailure):
+            kind, result, cause = "client_import", None, (exc.args[0] if exc.args else "unknown")
+        else:
+            kind, result = exc.kind, getattr(exc, "result", None)
+            cause = type(exc.__cause__).__name__ if exc.__cause__ is not None else None
+        run["failure"] = {"site": site, "kind": kind, "result": result, "cause": cause}
+    return True
+
+
+def _sanitize_owner_text(text, limit: int) -> str:
+    """Each control character -> one space, then cut to `limit` characters."""
+    try:
+        return _OWNER_CONTROL_RE.sub(" ", str(text))[:limit]
+    except Exception:
+        return "<unprintable>"[:limit]
+
+
+def _owner_failure_text(run: dict) -> str:
+    """The ONE loud line for a recorded owner failure: the failing site, the failure kind (and
+    the Unavailable/Rejected reason code), every degraded block, and the remedy. It says the
+    reads could NOT be read -- the failed read is not an empty answer. Bounded; dynamic text is
+    control-character-free; never SQL text, row data or an exception message."""
+    f = run["failure"]
+    detail = ""
+    reason = getattr(f.get("result"), "reason", None) if f.get("result") is not None else None
+    if reason:
+        detail = f", reason: {_sanitize_owner_text(reason, 40)}"
+    elif f["kind"] == "client_import" and f.get("cause"):
+        detail = f", cause: {_sanitize_owner_text(f['cause'], 40)}"
+    blocks = ", ".join(_OWNER_BLOCK_NAMES.get(s, s) for s in run["degraded"])
+    line = (
+        f"⚠️  ENGRAM UNAVAILABLE: the engramd owner read failed at "
+        f"{_sanitize_owner_text(f['site'], 60)} ({_sanitize_owner_text(f['kind'], 40)}{detail}). "
+        f"This prompt's {blocks} could NOT be read (the read failed; it is NOT empty). "
+        f"Do not open knowledge.db directly to work around this. "
+        f"To read the store directly meanwhile, set engramd.surface_reads_via_owner to false "
+        f"in $ENGRAM_HOME/config.json."
+    )
+    return line[:_OWNER_NOTICE_CAP]
+
+
+def _pending_owner_notice():
+    """Return (text, kind): the one owner-side line to inject this run, or ("", None). A recorded
+    owner failure -> the loud line under `surface-owner`; a failed flag helper -> its report line
+    under `surface-owner-flag` (the two cannot co-occur: a failed helper reads the flag OFF). Both
+    ride the shared probe-notice window, so a repeat inside the window is silent on stdout. The
+    caller stamps the window only after the response was printed. Never raises.
+
+    Priority (U13): when a read failure and a write failure occur in the SAME fire only the read failure reaches
+    this function's result; the write failure then reaches stderr only (`_write_owner_stderr_lines`)."""
+    try:
+        run = _OWNER_RUN
+        if run is not None and run.get("failure") is not None:
+            text, key = _owner_failure_text(run), OWNER_NOTICE_KEY
+        elif run is not None and run.get("write_failure") is not None:
+            text, key = _owner_write_failure_text(run), OWNER_NOTICE_KEY
+        elif _MOMENT_CURSOR_UNAVAILABLE_SEEN:
+            text, key = _moment_cursor_unavailable_text(), MOMENT_CURSOR_NOTICE_KEY
+        else:
+            text, key = _owner_flags_failure_line(), OWNER_FLAG_NOTICE_KEY
+        if not text or not probe_notice_due(ENGRAM_HOME, key):
+            return "", None
+        return text, key
+    except Exception:
+        return "", None
+
+
+def _moment_cursor_unavailable_text() -> str:
+    """The one notice line when `engram_moment_cursor` could not be imported: no owner text, no exception message."""
+    return (
+        "⚠️  ENGRAM: moment cursor module unavailable: the rotation will not advance, so the same person moment "
+        "may repeat on every prompt. The surface hook could not import engram_moment_cursor; reinstall or "
+        "upgrade the plugin."
+    )[:_OWNER_NOTICE_CAP]
+
+
+def _note_moment_cursor_unavailable() -> None:
+    """A person moment was selected while the cursor module is missing: remember it for the notice (once per fire)
+    and write ONE stderr line. Never raises."""
+    global _MOMENT_CURSOR_UNAVAILABLE_SEEN
+    try:
+        if not _MOMENT_CURSOR_UNAVAILABLE_SEEN:
+            _MOMENT_CURSOR_UNAVAILABLE_SEEN = True
+            sys.stderr.write("engram-surface-hook: moment cursor module unavailable: the rotation will not advance\n")
+            sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _write_owner_stderr_lines() -> None:
+    """The per-run stderr lines (every run, class/kind only): the failed flag helper, and the
+    first owner failure. Never raises."""
+    try:
+        line = _owner_flags_failure_line()
+        if line is not None:
+            sys.stderr.write(line + "\n")
+        run = _OWNER_RUN
+        if run is not None and run.get("failure") is not None:
+            f = run["failure"]
+            sys.stderr.write(
+                f"engram-surface-hook: owner read failed: {f['kind']} at {f['site']}\n"[:300])
+        wf = run.get("write_failure") if run is not None else None
+        if wf is not None:
+            sys.stderr.write(f"engram-surface-hook: owner write failed: {wf['kind']}\n"[:300])
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _owner_ping_failure():
+    """None when the owner answers `ping` (the owner IS alive: the liveness answer, row 6);
+    else the OwnerReadError / _ClientImportFailure describing why it did not. One round trip,
+    bounded at OWNER_READ_TIMEOUT_S; never raises."""
+    try:
+        ec = _owner_client()
+        try:
+            res = ec.read("ping", {}, timeout=OWNER_READ_TIMEOUT_S)
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 -- a client crash is a typed failure
+            err = ec.OwnerReadError("client_failure")
+            err.__cause__ = exc
+            return err
+        if isinstance(res, ec.Ok):
+            return None
+        if isinstance(res, ec.Unavailable):
+            return ec.OwnerReadError("unavailable", res)
+        if isinstance(res, ec.Rejected):
+            return ec.OwnerReadError("rejected", res)
+        return ec.OwnerReadError("unusable_answer")
+    except _ClientImportFailure as exc:
+        return exc
+    except Exception as exc:  # noqa: BLE001 -- never raises
+        return exc
+
 
 def _check_db_liveness(db_path: str) -> tuple[bool, str]:
     """Lightweight SQLite probe. Returns (True, 'ok') or (False, reason).
@@ -101,12 +642,83 @@ def _check_db_liveness(db_path: str) -> tuple[bool, str]:
     Catches SQLite I/O errors and DatabaseError (corrupt WAL, not-a-database).
     Fail-open on unexpected exceptions so probe bugs never break the hook.
     See #1218 (surface serves stale daemon cache under complete DB failure).
+
+    Owner flag ON (#3821, row 6, amended 13:56Z; derived in fold 3 so it costs NO extra trip):
+    liveness is read off the outcome of the fire's OWN store read, `_check_embedding_restore_flag`
+    (a registered template read every fire makes; it runs once here and its value is cached for
+    main()'s later call). The local file is neither consulted nor opened.
+
+    SCOPE of 'healthy': the owner SERVED A READ OF THE RESTORE TABLE (`embedding_restore_state`), or
+    reported that one table absent. It does NOT assert the rest of the store is intact: a store with
+    `nodes` / `edges` dropped still reads liveness-healthy. That fire is loud elsewhere -- the other
+    owner reads fail and main() leads the context with the `ENGRAM UNAVAILABLE` owner line (pinned by
+    a real-owner cell). The flag-OFF probe (`PRAGMA user_version`) has the same scope.
+      read Ok                                  -> (True, 'ok'): the owner answered a read of the
+                                                  restore table; NO `ping`.
+      read answered that table absent          -> (True, 'ok') too: `read_failed` naming exactly
+        `no such table: embedding_restore_state` (any OTHER missing table is a failed read), or
+        `refused_at_load` with the registry's `classification_incomplete` (how a store lacking the
+        table reads at the client; its detail names no table); the restore flag itself stays
+        UNKNOWN through its own path.
+      read failed                              -> ONE `ping` tells the two failures apart:
+        ping fails -> (False, 'engramd owner did not answer ping: <kind>')            [owner_down]
+        ping Ok    -> owner up, the read did not serve                                  [store_unreadable]
+          with its own reason per refusal: `unregistered_template` (version skew: the owner's build
+          does not know the template), any other `refused_at_load` (schema skew), otherwise 'the
+          store is unreadable: <kind>' (the only text that carries the disk-health advice).
+      read `budget_exhausted`                  -> nothing was learned about the store: owner side,
+        (False, 'engramd owner did not answer the liveness read: budget_exhausted'), no ping.
+    Every failure is recorded (typed, one loud owner line) and the stage is kept on _OWNER_RUN for
+    main(). A read that answers with something unusable (not a list, a row that is not a row, a row
+    too short) is a failed read, never healthy. This path never inherits the
+    `except Exception: return True, 'ok'` fail-open below. Flag OFF: today's probe, unchanged.
     """
+    if _owner_active():
+        _check_embedding_restore_flag(db_path, True)
+        exc = _OWNER_RUN["restore"]["exc"]
+        if exc is None:
+            return True, "ok"
+        rej = getattr(exc, "result", None) if getattr(exc, "kind", None) == "rejected" else None
+        rej_reason = getattr(rej, "reason", "") if rej is not None else ""
+        rej_detail = str(getattr(rej, "detail", "")) if rej is not None else ""
+        if (rej_reason == "refused_at_load" and rej_detail == "classification_incomplete") or (
+                rej_reason == "read_failed" and "no such table: embedding_restore_state" in rej_detail.lower()):
+            return True, "ok"
+        if not _is_owner_exc(exc):
+            # a bug-shaped failure on the owner path (e.g. a short row): a failed read, typed
+            try:
+                err = _owner_client().OwnerReadError("client_failure")
+                err.__cause__ = exc
+                exc = err
+            except _ClientImportFailure as cie:
+                exc = cie
+        kind = getattr(exc, "kind", "client_import" if isinstance(exc, _ClientImportFailure) else "failure")
+        if kind == "budget_exhausted":
+            _record_owner_failure("_check_db_liveness", exc)
+            _OWNER_RUN["liveness_stage"] = _LIVENESS_OWNER_DOWN
+            return False, f"engramd owner did not answer the liveness read: {kind}"
+        ping_failure = _owner_ping_failure()
+        if ping_failure is not None:
+            _record_owner_failure("_check_db_liveness", ping_failure)
+            _OWNER_RUN["liveness_stage"] = _LIVENESS_OWNER_DOWN
+            pkind = getattr(ping_failure, "kind", "client_import" if isinstance(ping_failure, _ClientImportFailure) else "failure")
+            return False, f"engramd owner did not answer ping: {pkind}"
+        _record_owner_failure("_check_db_liveness", exc)
+        _OWNER_RUN["liveness_stage"] = _LIVENESS_STORE_UNREADABLE
+        if rej_reason == "unregistered_template":
+            _OWNER_RUN["liveness_skew"] = _SKEW_VERSION
+            return False, ("engramd owner is up but does not know the liveness read "
+                           "(unregistered_template: the owner's build is older than this hook)")
+        if rej_reason == "refused_at_load":
+            _OWNER_RUN["liveness_skew"] = _SKEW_SCHEMA
+            return False, ("engramd owner is up but dropped the liveness read at load "
+                           f"(refused_at_load: {_sanitize_owner_text(rej_detail, 40)})")
+        return False, f"engramd owner is up but the store is unreadable: {kind}"
     if not os.path.exists(db_path):
         return False, "knowledge.db not found"
     conn = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn = connect_regular_ro(db_path, timeout=1.0)
         conn.execute("PRAGMA user_version")
         return True, "ok"
     except sqlite3.DatabaseError as e:
@@ -121,9 +733,12 @@ def _check_db_liveness(db_path: str) -> tuple[bool, str]:
                 pass
 
 
-def _is_any_server_py_running() -> bool:
-    """Return True if THIS agent's own server.py process is running (pgrep
-    secondary check) -- scoped, not a bare "server.py" substring match.
+def _is_any_server_py_running() -> "bool | None":
+    """Tri-state (#3521): True if THIS agent's own server.py process is running
+    (pgrep secondary check), False if pgrep ran and found no match, and None if
+    pgrep could not answer (not installed, timed out, errored rc >= 2, or the
+    shared helper failed to import) -- unknown, never evidence of absence.
+    Scoped, not a bare "server.py" substring match.
 
     Used by _check_mcp_write_tool_marker to distinguish a truly dead server
     from a post-restart race where the marker PID is stale but the server is
@@ -131,16 +746,17 @@ def _is_any_server_py_running() -> bool:
     (see its docstring for the unscoped-pgrep regression this replaced --
     PR #1839's colleague review) -- an unscoped `pgrep -f server.py`
     matches every agent's own server process on a shared multi-agent host,
-    permanently reporting healthy. Best-effort: returns False on any error,
-    including a failed _hooklib import, so the caller degrades to the
-    conservative (unhealthy) path rather than a false positive.
+    permanently reporting healthy. Before #3521 this returned False on ANY
+    error (pgrep missing / timed out / errored), conflating "could not look"
+    with "no server running"; it now returns None for those, via the
+    tri-state _hooklib.probe_own_server_py.
     """
     if not _HOOKLIB_OK:
-        return False
-    return _is_own_server_py_running_impl(ENGRAM_HOME)
+        return None
+    return probe_own_server_py(ENGRAM_HOME)[0]
 
 
-def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
+def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool | None, str | None]:
     """Check whether the MCP server wrote its initialization-complete marker.
 
     Deferred from SessionStart to here (UserPromptSubmit) to avoid a timing
@@ -168,8 +784,14 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
     Known ceiling: the marker attests "init complete + about to serve," not
     "serving." A hang inside mcp.run()'s serve-setup would still false-confirm.
 
-    Returns (True, None) if marker exists and its PID is still running, or on
-    any unexpected error (advisory probe — never block).
+    Returns (True, None) if marker exists and its PID is still running (or the
+    PID exists but EPERM forbids signalling it).
+    Returns (None, "<class>: <message>") -- UNKNOWN (#3521) -- when the probe
+    could not measure: a corrupt / torn / wrongly-shaped marker, an unreadable
+    marker file, a non-integer pid, the pgrep secondary check being unable to
+    answer, or any other exception. Never evidence of a dead server and never
+    reported as healthy; the caller renders one bounded, rate-limited line and
+    the hook still never blocks.
     Returns (True, note) if a dead marker PID is offset by a live server.py
     found via the secondary check -- healthy, but NOT silent: per
     PR #1839's colleague review, a suppressed condition must still surface
@@ -183,9 +805,17 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
         marker_path = os.path.join(engram_home, "mcp-tools-ready.json")
         if not os.path.exists(marker_path):
             return False, "mcp-tools-ready.json absent (server may not have completed initialization)"
-        with open(marker_path) as f:
+        with open_regular_text(marker_path) as f:
             data = json.load(f)
-        pid = int(data.get("pid", 0))
+        raw_pid = data.get("pid", 0)
+        if isinstance(raw_pid, bool) or (isinstance(raw_pid, float) and raw_pid != 0.0):
+            # A bool or a non-integer JSON number is not a pid: int() would
+            # coerce it (True -> 1, 1.5 -> 1) and os.kill(1, 0) then reads healthy.
+            return None, f"invalid-pid: marker pid is {type(raw_pid).__name__}, not an integer"
+        pid = int(raw_pid)
+        if pid < 0:
+            # os.kill(-1, 0) succeeds for any caller; a negative pid is never a server.
+            return None, f"invalid-pid: marker pid {pid} is negative"
         if not pid:
             return False, "mcp-tools-ready.json has no valid pid field"
         try:
@@ -197,7 +827,11 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
             # Marker PID is dead — server may have restarted and not yet refreshed
             # the marker (race between restart and this hook). Secondary check: is
             # any server.py actually running right now?
-            if _is_any_server_py_running():
+            server_running = _is_any_server_py_running()
+            if server_running is None:
+                # #3521: pgrep could not answer -- unknown, NOT "no server".
+                return None, "pgrep-unknown: could not run pgrep (missing, timed out or errored)"
+            if server_running:
                 # A live server.py found — stale marker, not a dead server.
                 # Return healthy WITH a note; server will refresh the marker
                 # on its next startup write (or already has — hook just
@@ -206,11 +840,13 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
                 # surfaces instead of being permanently absorbed.
                 return True, f"marker stale (PID {pid} no longer running); live server found"
             return False, f"mcp-tools-ready.json stale (server PID {pid} no longer running)"
-    except Exception:
-        return True, None  # advisory — never block
+    except Exception as exc:
+        # #3521: still never raises and never blocks, but a probe that could
+        # not read the marker is UNKNOWN -- it must not report "writes alive".
+        return None, f"{type(exc).__name__}: {exc}"
 
 
-def _check_embedding_restore_flag(db_path: str) -> tuple[bool, str | None]:
+def _check_embedding_restore_flag(db_path: str, _for_liveness: bool = False) -> tuple[bool | None, str | None]:
     """Check the embedding restore-completeness flag (#3075 C5 round 2,
     Borges's design ruling).
 
@@ -221,57 +857,116 @@ def _check_embedding_restore_flag(db_path: str) -> tuple[bool, str | None]:
     hook/server process boundary" precedent; engram_core.py's own
     _get_embedding_restore_flag is the server-side twin of this read).
 
-    Returns (True, None) when the flag is unset/clear, the DB is absent, the
-    table doesn't exist yet (a DB that predates this feature), or on any
-    other read failure — fail-open, same posture as _check_db_liveness
-    above: an advisory probe must never block the hook.
+    Returns (True, None) when the flag is unset/clear, the DB is absent, or
+    the table doesn't exist yet (a DB that predates this feature) -- the
+    latter two healthy BY DESIGN (nothing to restore).
+
+    Returns (None, "<ExcType>: <message>") -- UNKNOWN (#3521) -- on any other
+    read failure: a file that is not a database, a locked database, a table
+    missing a queried column, any other exception. The probe still never
+    raises and never blocks the hook, but it no longer REPORTS HEALTHY for a
+    state it could not read (the caller renders one bounded, rate-limited
+    line).
 
     Returns (False, message) when the flag IS SET — message names the
     count, cause, and remedy, ready for direct injection into
     additionalContext (per Borges's ruling: "the hooks are the load-bearing
     channel, because they reach the agent without it calling anything").
     """
-    if not os.path.exists(db_path):
+    # #3821 (row 1): with the owner flag ON the local store file is NOT consulted -- the store
+    # belongs to the owner -- and the row is read through the fire's owner connection.
+    owner = _owner_active()
+    if owner:
+        # ONE read per fire (fold 3): `_check_db_liveness` derives row 6 from this very read, so
+        # whichever of the two asks first performs it and the other takes the cached answer.
+        cached = _OWNER_RUN.get("restore")
+        if cached is not None:
+            if cached["exc"] is not None and not cached["recorded"]:
+                cached["recorded"] = True
+                _record_owner_failure("_check_embedding_restore_flag", cached["exc"])
+            return cached["result"]
+    if not owner and not os.path.exists(db_path):
         return True, None
     conn = None
+    failed = None
+    result = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn = _owner_conn() if owner else connect_regular_ro(db_path, timeout=1.0)
         row = conn.execute(
             "SELECT not_fully_restored, null_count, cause FROM "
             "embedding_restore_state WHERE singleton_key = 1"
         ).fetchone()
         if not row or not row[0]:
-            return True, None
+            result = (True, None)
+            return result
         null_count, cause = row[1], row[2]
         if cause and cause.startswith("detection-failed"):
             # ROUND 4 (Borges's colleague pass, PR#3076 finding A):
             # null_count=-1 here is a SENTINEL — detection itself raised,
             # so the real count is unknown, not zero. A distinct message
             # avoids a nonsensical "-1 node(s) lack embeddings" line.
-            return False, (
+            result = (False, (
                 f"ENGRAM DB restore-completeness state UNKNOWN ({cause}) "
                 f"— recall may be degraded; remedy: run "
                 f"tools/engram-regenerate-embeddings.py to check/repair."
-            )
-        return False, (
+            ))
+            return result
+        result = (False, (
             f"ENGRAM DB NOT FULLY RESTORED: {null_count} node(s) lack "
             f"embeddings, recall degraded/blocked; cause: {cause}; "
             f"remedy: run tools/engram-regenerate-embeddings.py once an "
             f"embedder is available (or wait — a regeneration may already "
             f"be running in the background)."
-        )
-    except sqlite3.OperationalError:
-        # embedding_restore_state doesn't exist yet (DB predates this
-        # feature) — treat as clear, same as "no flag ever set."
-        return True, None
-    except Exception:
-        return True, None  # fail-open — advisory probe, never block
+        ))
+        return result
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            # embedding_restore_state doesn't exist yet (DB predates this
+            # feature) — healthy BY DESIGN, same as "no flag ever set."
+            result = (True, None)
+            return result
+        # #3521: a locked database, a missing queried column, an I/O error:
+        # also OperationalError, but NOT "nothing to restore" -- UNKNOWN.
+        result = (None, f"{type(exc).__name__}: {exc}")
+        return result
+    except Exception as exc:
+        # #3521: never raises and never blocks, but cannot report healthy for
+        # a state it could not read (garbage file, any other failure). #3821: an OWNER
+        # failure to serve the statement is this same UNKNOWN (never "healthy": it is not a
+        # sqlite3 "no such table"), and is recorded for the one loud owner line. Under the
+        # flag a table the owner dropped is refused, hence UNKNOWN too (as in the
+        # session-start hook; the ON/OFF divergence is by design).
+        failed = exc
+        if not (owner and _for_liveness):
+            _record_owner_failure("_check_embedding_restore_flag", exc)
+        # (asked by `_check_db_liveness`: recorded by main()'s own later call instead, after
+        # liveness has recorded its verdict first)
+        result = (None, f"{type(exc).__name__}: {exc}")
+        return result
     finally:
-        if conn is not None:
+        if conn is not None and not owner:
             try:
                 conn.close()
             except Exception:
                 pass
+        if owner:
+            _OWNER_RUN["restore"] = {"result": result, "exc": failed,
+                                     "recorded": not (_for_liveness and failed is not None)}
+
+
+def _probe_unknown_notice(pending: list, probe: str, label: str, suffix: str, reason) -> str:
+    """Render an UNKNOWN probe (#3521): always ONE sanitized stderr line; the
+    one bounded injected line only when the per-probe rate-limit window is due
+    (else ""). A due line registers `probe` in `pending` so main() stamps the
+    window only AFTER the response carrying it was printed. Never raises."""
+    try:
+        write_probe_unknown_stderr("engram-surface-hook", probe, reason)
+        if not probe_notice_due(ENGRAM_HOME, probe):
+            return ""
+        pending.append(probe)
+        return probe_unknown_line(label, reason, suffix)
+    except Exception:
+        return ""
 
 
 SOCKET_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.sock")
@@ -312,7 +1007,7 @@ RETIREMENT_CEILING_PROMPTS = 160  # design doc §4: "effectively retired"
 def get_user_name() -> str:
     """Read primary_user from $ENGRAM_HOME/config.json; fall back to 'the human'."""
     try:
-        with open(os.path.join(ENGRAM_HOME, "config.json"), "r", encoding="utf-8") as f:
+        with open_regular_text(CONFIG_PATH, encoding="utf-8") as f:
             config = json.load(f)
         return str(config.get("primary_user") or "the human")
     except (OSError, json.JSONDecodeError, AttributeError, TypeError):
@@ -369,7 +1064,7 @@ def _get_auto_surface_config() -> dict:
     with defaults if config absent / malformed / section missing. Never raises.
     Cheap (one file read per hook fire — sub-ms typically).
     """
-    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    config_path = CONFIG_PATH
     defaults = {
         "short_prompt_threshold_chars": DEFAULT_SHORT_PROMPT_THRESHOLD_CHARS,
         "prev_response_tail_chars": DEFAULT_PREV_RESPONSE_TAIL_CHARS,
@@ -378,7 +1073,7 @@ def _get_auto_surface_config() -> dict:
         "idf_gate_short_prompt_floor_chars": DEFAULT_IDF_GATE_SHORT_PROMPT_FLOOR_CHARS,
     }
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
         section = config.get("auto_surface", {})
         return {
@@ -421,7 +1116,7 @@ DEFAULT_SUPPRESSION_M = 3   # repeat-count threshold before full suppression
 # this field existed) fall back exactly to the count-only classification.
 DEFAULT_PROMPT_SIMILARITY_THRESHOLD = 0.75
 
-# Ledger retention (~/.engram/surface-ledger.json). Two independent bounds,
+# Ledger retention (~/.engram/surface-ledger.json, under $ENGRAM_HOME). Two independent bounds,
 # applied together (belt-and-suspenders — either alone would bound growth,
 # combining them tolerates occasional gaps without losing the trailing-k
 # signal): per-session entries older than DEFAULT_LEDGER_ENTRY_MAX_AGE_HOURS
@@ -443,14 +1138,14 @@ def _get_suppression_config() -> dict:
     absent / malformed / section missing. Never raises. Same read pattern
     as _get_auto_surface_config.
     """
-    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    config_path = CONFIG_PATH
     defaults = {
         "k": DEFAULT_SUPPRESSION_K,
         "m": DEFAULT_SUPPRESSION_M,
         "prompt_similarity_threshold": DEFAULT_PROMPT_SIMILARITY_THRESHOLD,
     }
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
         section = config.get("recall_suppression", {})
         return {
@@ -479,10 +1174,10 @@ def _get_echo_guard_config() -> dict:
     section missing. Never raises. Same read pattern as
     _get_suppression_config.
     """
-    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    config_path = CONFIG_PATH
     defaults = {"minutes": DEFAULT_ECHO_GUARD_MINUTES}
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
         section = config.get("same_session_echo", {})
         return {"minutes": float(section.get("minutes", defaults["minutes"]))}
@@ -492,7 +1187,7 @@ def _get_echo_guard_config() -> dict:
 
 def _get_session_started_at(session_id: str | None) -> "datetime | None":
     """Read this session's started_at from its per-session marker file
-    (~/.engram/sessions/<session_id>.json, written by the SessionStart hook).
+    (~/.engram/sessions/<session_id>.json under $ENGRAM_HOME, written by the SessionStart hook).
 
     None on any failure (missing session_id, missing/malformed marker file,
     missing/malformed started_at) — the echo guard treats None as "can't
@@ -503,7 +1198,7 @@ def _get_session_started_at(session_id: str | None) -> "datetime | None":
         return None
     try:
         path = os.path.join(ENGRAM_HOME, "sessions", f"{session_id}.json")
-        with open(path, "r", encoding="utf-8") as f:
+        with open_regular_text(path, encoding="utf-8") as f:
             marker = json.load(f)
         started_at = marker.get("started_at")
         if not started_at:
@@ -559,7 +1254,7 @@ def _read_surface_ledger() -> dict:
     an advisory cache for render-layer suppression, never a source of truth).
     """
     try:
-        with open(_surface_ledger_path(), "r", encoding="utf-8") as f:
+        with open_regular_text(_surface_ledger_path(), encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
@@ -574,7 +1269,7 @@ def _write_surface_ledger(ledger: dict) -> None:
         if _HOOKLIB_OK:
             atomic_write_json(path, ledger, encoding="utf-8")
         else:
-            with open(path, "w", encoding="utf-8") as f:
+            with open_regular_text_write(path, encoding="utf-8") as f:
                 json.dump(ledger, f)
     except Exception:
         pass
@@ -872,10 +1567,10 @@ def _get_person_moment_cooldown_config() -> dict:
     above), so both sides implement this read separately, same as every
     other primitive shared only by value in this file.
     """
-    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    config_path = CONFIG_PATH
     defaults = {"seconds": float(_PERSON_MOMENT_COOLDOWN_SECONDS)}
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
         section = config.get("person_moment_cooldown", {})
         return {"seconds": float(section.get("seconds", defaults["seconds"]))}
@@ -968,7 +1663,8 @@ def _select_person_moment_candidate(entry: dict) -> "tuple[str, int] | None":
     """Read-only selection: given a full-tier person special entry (carrying
     special_moments / special_moment_cursor from _surface_impl's response —
     see engram_query.py), decide whether a moment is eligible to render this
-    prompt. Returns (description, new_cursor) on eligibility, else None.
+    prompt. Returns (description, from_cursor) on eligibility, else None, where
+    from_cursor is the (rule-normalised) cursor the moment was selected at.
 
     Deliberately has NO side effects (no DB write, no cooldown record) —
     those only commit once the caller confirms the rendered line actually
@@ -986,9 +1682,7 @@ def _select_person_moment_candidate(entry: dict) -> "tuple[str, int] | None":
         return None
     if _person_moment_in_cooldown(person_id):
         return None
-    cursor = entry.get("special_moment_cursor")
-    if not isinstance(cursor, int):
-        cursor = 0
+    cursor = _read_moment_cursor(entry.get("special_moment_cursor")) if _read_moment_cursor else 0
     idx = cursor % len(moments)
     moment = moments[idx]
     if not isinstance(moment, dict):
@@ -996,57 +1690,38 @@ def _select_person_moment_candidate(entry: dict) -> "tuple[str, int] | None":
     description = moment.get("description")
     if not description:
         return None
-    return description, cursor + 1
+    if _read_moment_cursor is None:
+        _note_moment_cursor_unavailable()
+    return description, cursor
 
 
-def _advance_person_moment_cursor(person_id: str, new_cursor: int) -> bool:
-    """Persist the advanced moment-rotation cursor for person_id.
+def _advance_person_moment_cursor(person_id: str, from_cursor: int) -> bool:
+    """Advance the moment-rotation cursor for person_id FROM the value it was rendered at (#3856).
 
-    This is a NEW capability for this hook process: every other DB access in
-    this file is read-only (mode=ro liveness probes — see
-    _check_db_liveness). This is a single narrow, targeted write (bump one
-    JSON key on one row), matching the pattern _add_special_moment_impl /
-    _update_person_impl already use server-side (read current metadata,
-    mutate one key, write back the full dict — never a partial dict, which
-    would silently clobber pronouns/relation/aliases/field_traces/etc).
+    Runs the shared compare-and-set `engram_moment_cursor.advance_moment_cursor` on this hook's own RW
+    connection and commits. One SQL statement that touches only `special_moment_cursor`, so a concurrent
+    `engram_update_person` / `engram_add_special_moment` edit is never lost and two concurrent fires never
+    skip a moment (the loser reports `stale`). The old read-modify-write of the whole dict is gone.
 
-    Architectural precedent shift, named explicitly here for future readers
-    tracing this file's history: this is the FIRST write to knowledge.db
-    from the hook process (#1940). It's safe under the existing WAL mode +
-    this function's own best-effort/fail-open posture (any failure just
-    returns False, never raises past this function), but it establishes a
-    new capability class for this file — prior to this, "hook process" and
-    "DB writer" were mutually exclusive; they no longer are.
+    This is the FIRST (and, with the flag OFF, still direct) write to knowledge.db from the hook process
+    (#1940); it stays direct on the flag-OFF path (design 6).
 
-    Re-reads metadata fresh right before writing (narrows, does not
-    eliminate, the read-modify-write race against a concurrent
-    engram_add_special_moment / engram_update_person call — same
-    non-atomic-write precedent as those functions themselves; see PR body).
-
-    Best-effort: True on success, False on ANY failure (missing row, locked
-    DB, malformed JSON, ...) — fail-open, since a persistence hiccup here
-    must never prevent the moment from being shown this once (the caller
-    still renders the line regardless of this return value; only the
-    cooldown record — _record_person_moment_render, called separately by the
-    caller — and the cursor advance are at risk, and both failing just means
-    the SAME moment may repeat sooner than intended, the safe direction).
+    Best-effort: True only when the advance applied; False on ANY failure (stale, missing row, locked DB,
+    shared module not importable, ...). Fail-open: a persistence hiccup must never prevent the moment from
+    being shown this once. An import failure is False, never a fallback to a whole-dict rewrite.
     """
+    run = _OWNER_RUN
+    if run is not None and run.get("writes_on"):
+        # Flag ON (U13): ONLY the owner. No outcome of it, and no failure, ever reaches the direct code below.
+        return _advance_via_owner(run, person_id, from_cursor)
+    if _advance_moment_cursor is None:
+        return False
     conn = None
     try:
         conn = sqlite3.connect(KNOWLEDGE_DB_PATH, timeout=2.0)
-        row = conn.execute(
-            "SELECT metadata FROM nodes WHERE id = ?", (person_id,)
-        ).fetchone()
-        if not row or not row[0]:
-            return False
-        meta = json.loads(row[0])
-        meta["special_moment_cursor"] = new_cursor
-        conn.execute(
-            "UPDATE nodes SET metadata = ? WHERE id = ?",
-            (json.dumps(meta), person_id),
-        )
+        result = _advance_moment_cursor(conn, person_id, from_cursor)
         conn.commit()
-        return True
+        return bool(result.get("applied"))
     except Exception:
         return False
     finally:
@@ -1057,13 +1732,13 @@ def _advance_person_moment_cursor(person_id: str, new_cursor: int) -> bool:
                 pass
 
 
-def _commit_person_moment_render(person_id: str, new_cursor: int) -> None:
+def _commit_person_moment_render(person_id: str, from_cursor: int) -> None:
     """Side effects for an ACTUALLY-rendered person moment: advance the
     rotation cursor (DB write, best-effort) and record the cross-surface
     cooldown event (ledger write, best-effort). Called only after the
     caller's budget check confirms the line survives — see format_nudge.
     """
-    _advance_person_moment_cursor(person_id, new_cursor)
+    _advance_person_moment_cursor(person_id, from_cursor)
     _record_person_moment_render(person_id)
 
 
@@ -1167,13 +1842,13 @@ def _get_budget_config() -> dict:
     / section missing. Never raises. Same read pattern as
     _get_auto_surface_config / _get_suppression_config.
     """
-    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    config_path = CONFIG_PATH
     defaults = {
         "total_chars": DEFAULT_RECALL_BUDGET_TOTAL_CHARS,
         "enabled": DEFAULT_RECALL_BUDGET_ENABLED,
     }
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
         section = config.get("recall_budget", {})
         return {
@@ -1283,20 +1958,28 @@ def _dormant_focus_set_candidates(rendered_ids: set) -> tuple[list[dict], int]:
     _DORMANT_FOCUS_SET_LINES_CAP top-N cut and the shared render budget.
     """
     conn = None
+    # #3821 (row 2): flag ON reads both statements through the fire's owner connection. Its rows
+    # are tuples, so the columns are read by index on both paths (`active_set_name`; then
+    # `name, node_ids, last_loaded_at`).
+    owner = _owner_active()
     try:
-        conn = sqlite3.connect(f"file:{KNOWLEDGE_DB_PATH}?mode=ro", uri=True, timeout=1.0)
-        conn.row_factory = sqlite3.Row
+        conn = _owner_conn() if owner else connect_regular_ro(KNOWLEDGE_DB_PATH, timeout=1.0)
+        if not owner:
+            conn.row_factory = sqlite3.Row
         active_row = conn.execute(
             "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
         ).fetchone()
-        active_name = active_row["active_set_name"] if active_row else None
+        active_name = active_row[0] if active_row else None
         rows = conn.execute(
             "SELECT name, node_ids, last_loaded_at FROM focus_sets"
         ).fetchall()
-    except Exception:
+    except Exception as exc:
+        # An OWNER failure is recorded for the loud owner line: an empty list read off an
+        # outage must not pass for "no dormant set matches".
+        _record_owner_failure("_dormant_focus_set_candidates", exc)
         return [], 0
     finally:
-        if conn is not None:
+        if conn is not None and not owner:
             try:
                 conn.close()
             except Exception:
@@ -1305,11 +1988,11 @@ def _dormant_focus_set_candidates(rendered_ids: set) -> tuple[list[dict], int]:
     sets_checked = len(rows)
     candidates: list[dict] = []
     for row in rows:
-        name = row["name"]
+        name = row[0]
         if name == active_name:
             continue
         try:
-            ids = json.loads(row["node_ids"])
+            ids = json.loads(row[1])
             if not isinstance(ids, list):
                 continue
         except (json.JSONDecodeError, TypeError):
@@ -1320,7 +2003,7 @@ def _dormant_focus_set_candidates(rendered_ids: set) -> tuple[list[dict], int]:
         candidates.append({
             "name": name,
             "matched": matched,
-            "last_loaded_at": row["last_loaded_at"] or "",
+            "last_loaded_at": row[2] or "",
         })
 
     # Stable two-pass sort: secondary key (most-recent last_loaded_at) first,
@@ -1418,14 +2101,21 @@ def _render_triggered_principles_section(ordered_ids: list, db_path: "str | None
         return ""
     if db_path is None:
         db_path = KNOWLEDGE_DB_PATH
-    generalization_chain = _import_generalization_chain()
-    if generalization_chain is None:
-        return ""
+    # #3821 (row 3): flag ON sends each walk as ONE typed `chain` request through the fire's owner
+    # connection (the owner runs engram_core.generalization_chain itself); this process then
+    # neither imports engram_core nor opens the store. `db_path` is not consulted.
+    owner = _owner_active()
+    generalization_chain = None
+    if not owner:
+        generalization_chain = _import_generalization_chain()
+        if generalization_chain is None:
+            return ""
 
     conn = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
-        conn.row_factory = sqlite3.Row
+        conn = _owner_conn() if owner else connect_regular_ro(db_path, timeout=1.0)
+        if not owner:
+            conn.row_factory = sqlite3.Row
         head_order: list = []
         head_summaries: dict = {}  # head_id -> recall_summary (from its own chain entry)
         # #2753 WS2 round 2 -- candidate ids whose own chain() call reported
@@ -1442,7 +2132,7 @@ def _render_triggered_principles_section(ordered_ids: list, db_path: "str | None
         # tripwire-hook function.
         truncated_ids: list = []
         for nid in ordered_ids:
-            chain = generalization_chain(conn, nid)
+            chain = conn.generalization_chain(nid) if owner else generalization_chain(conn, nid)
             nodes = chain.get("nodes") or {}
             start_resolved = chain.get("start_resolved_id")
             heads = chain.get("heads") or []
@@ -1463,10 +2153,11 @@ def _render_triggered_principles_section(ordered_ids: list, db_path: "str | None
                     head_entry = nodes.get(head_id, {})
                     head_summaries[head_id] = head_entry.get("recall_summary") or ""
                     head_order.append(head_id)
-    except Exception:
+    except Exception as exc:
+        _record_owner_failure("_render_triggered_principles_section", exc)
         return ""
     finally:
-        if conn is not None:
+        if conn is not None and not owner:
             try:
                 conn.close()
             except Exception:
@@ -1503,8 +2194,8 @@ def _get_attached_packs() -> list[dict]:
     Only entries with enabled=True and non-empty id+path are returned.
     """
     try:
-        config_path = os.path.join(ENGRAM_HOME, "config.json")
-        with open(config_path, "r", encoding="utf-8") as f:
+        config_path = CONFIG_PATH
+        with open_regular_text(config_path, encoding="utf-8") as f:
             config = json.load(f)
         packs = config.get("attached_packs", [])
         if not isinstance(packs, list):
@@ -1543,6 +2234,19 @@ def _query_attached_packs(prompt: str, quota: int = _PACK_SURFACE_QUOTA) -> list
         packs = _get_attached_packs()
         if not packs:
             return []
+        if _not_search_excluded_sql is None:
+            # Fail closed (cannot apply the evidence exclusion) but VISIBLE:
+            # without this line a broken install makes attached-pack results
+            # vanish with no trace. One stderr line per call (hook stderr goes
+            # to logs, not the model), same channel as the other degrade tells.
+            try:
+                sys.stderr.write(
+                    "engram-surface-hook: engram_search_rules unavailable; attached-pack "
+                    "search disabled (fail closed) -- check the plugin install\n"
+                )
+            except Exception:
+                pass
+            return []
 
         # Build FTS MATCH expression: tokenize to alphanumeric words ≥3 chars,
         # take up to 8, quote-wrap each to prevent FTS5 syntax errors.
@@ -1567,16 +2271,18 @@ def _query_attached_packs(prompt: str, quota: int = _PACK_SURFACE_QUOTA) -> list
                 # re-authored in place, immutable reads may be stale; attached packs
                 # are static downloads, and re-authoring an attached pack in place is
                 # out of contract.
-                conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+                conn = connect_regular_ro(
+                    db_path, uri_params="mode=ro&immutable=1")
                 conn.row_factory = sqlite3.Row
                 try:
                     rows = conn.execute(
-                        """
+                        f"""
                         SELECT n.id, n.type, n.claim, n.confidence,
                                n.recall_summary, n.recall_keywords
                         FROM nodes_fts f
                         JOIN nodes n ON n.rowid = f.rowid
                         WHERE f.nodes_fts MATCH ? AND n.is_current = 1
+                          AND {_not_search_excluded_sql("n")}
                         ORDER BY rank
                         LIMIT ?
                         """,
@@ -1631,7 +2337,7 @@ def _read_prev_assistant_tail(transcript_path: str | None, tail_chars: int) -> s
     if not transcript_path or not os.path.exists(transcript_path):
         return ""
     try:
-        with open(transcript_path, "r", encoding="utf-8") as f:
+        with open_regular_text(transcript_path, encoding="utf-8") as f:
             lines = f.readlines()
     except OSError:
         return ""
@@ -1766,10 +2472,13 @@ def _should_prepend(prompt: str, conn: sqlite3.Connection, cfg: dict) -> bool:
         if keywords:
             return False  # prompt has self-anchoring keywords
         return True  # no high-IDF keywords — prepend for context
-    except Exception:
+    except Exception as exc:
         # Fallback to legacy char-length heuristic if engram_idf unavailable
         # (ImportError) or any DB error occurs (vocab table missing, mode=ro
         # conflict, etc). Preserves previous behavior on infra failure.
+        # #3821: an OWNER failure is also recorded, so the heuristic stands in for a read
+        # that failed LOUDLY (the one owner line), never as a silent plausible answer.
+        _record_owner_failure("_should_prepend", exc)
         return len(scored_prompt) < cfg["short_prompt_threshold_chars"]
 
 
@@ -1818,7 +2527,11 @@ def query_fts_fallback(prompt: str, top_k: int = 10) -> dict | None:
         if PROJECT_DIR not in sys.path:
             sys.path.insert(0, PROJECT_DIR)
         from engram_client import EngramClient
-        client = EngramClient()
+        # #3767: hook class -- if another process is running the one-time DB
+        # setup, EngramClient raises DbSetupLockBusy after ~2 s instead of
+        # waiting minutes; the except below degrades to None (no surface this
+        # prompt), the same as every other failure here.
+        client = EngramClient(setup_wait="hook")
         return client.call("engram_surface", {"query": prompt, "top_k": top_k, "semantic": False})
     except Exception:
         return None
@@ -1954,11 +2667,50 @@ def render_one_node_line(
     return f"- {warn_marker}[{nid}] {prefix}{age_tag}{kw_prefix}{body}{person_suffix}{moment_suffix}"
 
 
+def _apply_in_context_exclusion(result: dict, resolver) -> tuple:
+    """(result', dropped_ids) for the live in-context exclusion (#3613 C1-C5).
+
+    Removes every candidate the resolver says is already in the model's context
+    (`in_context is True`, any `why`) from `special_nodes`, `top_claims`,
+    `matched_meta` and `matched_ids` -- on a COPY, `result` itself is untouched
+    (the route ledger still reads the full candidate list). Runs before any of
+    format_nudge's caps, so an excluded id never takes a slot. `match_count` is
+    left as the daemon sent it. Fail-open: no resolver, or any exception ->
+    (result, empty set), i.e. the switch-off render."""
+    try:
+        if resolver is None:
+            return result, set()
+        pool = (
+            list(result.get("special_nodes") or [])
+            + list(result.get("top_claims") or [])
+            + list(result.get("matched_meta") or [])
+            + [{"id": i} for i in (result.get("matched_ids") or [])]
+        )
+        drop = in_context_drop_ids(pool, resolver)
+        if not drop:
+            return result, set()
+
+        def _keep(entries):
+            return [e for e in entries if not (isinstance(e, dict) and e.get("id") in drop)]
+
+        out = dict(result)
+        for key in ("special_nodes", "top_claims", "matched_meta"):
+            if key in out:
+                out[key] = _keep(out[key] or [])
+        if "matched_ids" in out:
+            out["matched_ids"] = [i for i in (out["matched_ids"] or []) if i not in drop]
+        return out, drop
+    except Exception:
+        return result, set()
+
+
 def format_nudge(
     result: dict,
     pack_results: list[dict] | None = None,
     session_id: str | None = None,
     stats: dict | None = None,
+    route_out: dict | None = None,
+    in_context_resolver=None,
 ) -> str:
     """Format engram_surface result into a compact nudge string.
 
@@ -2041,7 +2793,22 @@ def format_nudge(
     the dict shape unconditionally. None (the default) skips telemetry
     entirely — no behavior change, matches the pack_results / session_id
     optional-param precedent above.
+
+    route_out: optional caller-owned dict, mutated in place (out-parameter),
+    for the route ledger (#3458 section A, `_hooklib.write_route_ledger`):
+    {shown: own-graph ids in render order, cut_reasons: {id: this function's
+    own cut name}}. Cut names are the ones already in this function:
+    "budget" (the recall_budget gate), "suppress" (the #1689 suppress tier),
+    "echo" (the #257 same-session-echo drop), plus "no_keywords" (an Others
+    candidate with no recall_keywords, dropped by the keyword filter). Ids
+    absent from cut_reasons that were neither shown are cut by a count cap
+    (the [:3] specials/top_claims slices or the [:15] Others slice) -- the
+    ledger writer defaults those to "cap". Observation only: nothing here
+    changes what renders. None (the default) records nothing.
     """
+    if route_out is not None:
+        route_out.clear()
+        route_out.update({"shown": [], "cut_reasons": {}})
     budget_cfg = _get_budget_config()
     if stats is not None:
         stats.clear()
@@ -2061,6 +2828,23 @@ def format_nudge(
     total = result.get("match_count", 0)
     if total == 0:
         return ""
+
+    # --- Live in-context exclusion (#3613): drop candidates already in the
+    # model's context BEFORE any cap below, so the next candidates backfill.
+    # `in_context_resolver` is None when the kill switch is off (the default),
+    # so nothing in this block runs and the render is byte-identical.
+    _in_context_dropped: set = set()
+    if in_context_resolver is not None:
+        result, _in_context_dropped = _apply_in_context_exclusion(result, in_context_resolver)
+        if _in_context_dropped:
+            if route_out is not None:
+                route_out["cut_reasons"].update({i: "in_context" for i in _in_context_dropped})
+            _left = (
+                (result.get("special_nodes") or []) + (result.get("top_claims") or [])
+                + (result.get("matched_meta") or []) + (result.get("matched_ids") or [])
+            )
+            if not _left:
+                return ""  # everything was in context: no recall block (C8)
 
     # --- Suppression setup ---------------------------------------------
     suppression_active = session_id is not None
@@ -2147,6 +2931,10 @@ def format_nudge(
     lines.append(f"[ENGRAM Recall: {total} nodes match your query]")
 
     rendered_ids_this_prompt: set = set()
+    # route ledger (#3458 A): render-order record of own-graph ids, and the
+    # ids the Others pass cut that no existing set records. Observation only.
+    _shown_order: list = []
+    _others_budget_cut: set = set()
     suppressed_ids: set = set()
     demoted_candidates: list[dict] = []
     # Nodes that were eligible (full-tier or Others-tier) in one section but
@@ -2215,6 +3003,7 @@ def format_nudge(
                 if _budget_try_spend(rendered_line, budget_state):
                     special_lines.append(rendered_line)
                     rendered_ids_this_prompt.add(nid)
+                    _shown_order.append(nid)
                     special_rendered_count += 1
                     if moment_candidate is not None:
                         # Cursor + cooldown only commit once the line
@@ -2262,6 +3051,7 @@ def format_nudge(
                 if _budget_try_spend(rendered_line, budget_state):
                     top_claim_lines.append(rendered_line)
                     rendered_ids_this_prompt.add(nid)
+                    _shown_order.append(nid)
                     top_claims_rendered_count += 1
                 else:
                     # eligible (full-tier) but budget-cut — dropped, not
@@ -2384,6 +3174,7 @@ def format_nudge(
                         continue
                     reserved_lines.append(reserved_line)
                     rendered_ids_this_prompt.add(nid)
+                    _shown_order.append(nid)
                     already_placed.add(nid)
         if reserved_lines:
             lines.append("  Worth revisiting (not recalled recently):")
@@ -2478,9 +3269,11 @@ def format_nudge(
         others_marker = f"⚠ {'/'.join(tags)} " if tags else ""
         others_line = f"    - {others_marker}[{mid}] {kw_str}"
         if not _budget_try_spend(others_line, budget_state):
+            _others_budget_cut.add(mid)
             continue
         others_rendered_lines.append(others_line)
         others_rendered_ids.add(mid)
+        _shown_order.append(mid)
     if others_rendered_lines:
         lines.append("  Others:")
         lines.extend(others_rendered_lines)
@@ -2606,6 +3399,27 @@ def format_nudge(
             decay_events=decay_events,
         )
 
+    # --- Route ledger out-parameter (#3458 A): what rendered, in order, and
+    # the cut names this function already uses. Read-only over local state.
+    # `shown` is the render BEFORE `emit_context` applies its final whole-block
+    # budget cut -- the ROUTE's render. The shown RECORD is gated on that cut
+    # separately (#3621, see main()).
+    if route_out is not None:
+        _reasons: dict = {}
+        for _m in others_candidates:
+            if not (isinstance(_m.get("recall_keywords"), list) and _m.get("recall_keywords")):
+                _reasons[_m.get("id")] = "no_keywords"
+        for _i in suppressed_ids:
+            _reasons[_i] = "suppress"
+        for _i in suppressed_echo_ids:
+            _reasons[_i] = "echo"
+        for _i in budget_cut_ids | _others_budget_cut:
+            _reasons[_i] = "budget"
+        for _i in _in_context_dropped:
+            _reasons[_i] = "in_context"  # #3613: dropped before the caps
+        route_out["shown"] = [i for i in _shown_order if i]
+        route_out["cut_reasons"] = {k: v for k, v in _reasons.items() if k}
+
     # --- Stats out-parameter: final telemetry for engram.surface.render_size
     # (issue #1692). chars_rendered/nodes_shown/nodes_cut_budget come from
     # budget_state (populated as lines were gated above); nodes_suppressed
@@ -2623,13 +3437,28 @@ def format_nudge(
     return "\n".join(lines)
 
 
+def _is_non_regular(path) -> bool:
+    """True only when `path` exists and is not a regular file (a FIFO, a
+    directory...). #3628: the read handlers below swallow an OSError ONLY for
+    such a target; an OSError on a regular file propagates exactly as on dev.
+    engram-surface-daemon.py carries a private copy; the two are pinned by
+    tests/test_hooks_sqlite_regular_3628s2d.py
+    (test_is_non_regular_copies_have_identical_ast and
+    test_is_non_regular_behaviour_is_the_same_in_both_copies)."""
+    return os.path.exists(path) and not os.path.isfile(path)
+
+
 def read_prompt_counter() -> dict:
     """Read the prompt counter state."""
     try:
-        with open(COUNTER_PATH, "r") as f:
+        with open_regular_text(COUNTER_PATH) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {"prompts_since_compaction": 0, "last_reset": ""}
+    except OSError:
+        if _is_non_regular(COUNTER_PATH):
+            return {"prompts_since_compaction": 0, "last_reset": ""}
+        raise
 
 
 def write_prompt_counter(state: dict):
@@ -2638,23 +3467,49 @@ def write_prompt_counter(state: dict):
     if _HOOKLIB_OK:
         atomic_write_json(COUNTER_PATH, state)
     else:
-        with open(COUNTER_PATH, "w") as f:
+        # #3628: main() calls this unguarded, so a non-regular target (the
+        # helper raises OSError) is skipped here rather than crashing the hook;
+        # a failure on a regular file still raises exactly as before.
+        try:
+            f = open_regular_text_write(COUNTER_PATH)
+        except OSError:
+            if os.path.exists(COUNTER_PATH) and not os.path.isfile(COUNTER_PATH):
+                return
+            raise
+        with f:
             json.dump(state, f)
 
 
 def check_write_reminder() -> str:
     """Check if the Stop hook flagged a pending write reminder."""
+    # An OSError on the read is swallowed ONLY for a non-regular target (a
+    # FIFO); on a regular file it propagates as on dev. The clear-write below
+    # likewise keeps its pre-#3628 exception behaviour for regular files.
     try:
-        with open(WRITE_REMINDER_PATH, "r") as f:
+        with open_regular_text(WRITE_REMINDER_PATH) as f:
             marker = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return ""
+    except OSError:
+        if _is_non_regular(WRITE_REMINDER_PATH):
+            return ""
+        raise
+    try:
         if marker.get("pending"):
             # Clear the marker so it doesn't repeat
             marker["pending"] = False
-            if _HOOKLIB_OK:
-                atomic_write_json(WRITE_REMINDER_PATH, marker)
-            else:
-                with open(WRITE_REMINDER_PATH, "w") as f:
-                    json.dump(marker, f)
+            try:
+                if _HOOKLIB_OK:
+                    atomic_write_json(WRITE_REMINDER_PATH, marker)
+                else:
+                    with open_regular_text_write(WRITE_REMINDER_PATH) as f:
+                        json.dump(marker, f)
+            except OSError:
+                # Only a non-regular target (swapped in after the read) is
+                # tolerated; any other OSError propagates as before.
+                if os.path.exists(WRITE_REMINDER_PATH) and not os.path.isfile(WRITE_REMINDER_PATH):
+                    return ""
+                raise
             return (
                 "[ENGRAM Write Check: Did your last response contain a decision, insight, "
                 "or design choice worth recording? If so, write to ENGRAM now (observation, "
@@ -2679,10 +3534,14 @@ def check_feeling_nudge_marker() -> str:
     engram_reflect, not via UserPromptSubmit).
     """
     try:
-        with open(FEELING_NUDGE_MARKER, "r") as f:
+        with open_regular_text(FEELING_NUDGE_MARKER) as f:
             marker = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return ""
+    except OSError:
+        if _is_non_regular(FEELING_NUDGE_MARKER):
+            return ""
+        raise
 
     source = marker.get("source")
     if source != "post_compact":
@@ -2706,18 +3565,31 @@ def check_feeling_nudge_marker() -> str:
 
 def check_repair_marker() -> str:
     """Check if the PreToolUse repair hook fixed a malformed tool call."""
+    # OSError handling on the read: see check_write_reminder.
     try:
-        with open(REPAIR_MARKER_PATH, "r") as f:
+        with open_regular_text(REPAIR_MARKER_PATH) as f:
             marker = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return ""
+    except OSError:
+        if _is_non_regular(REPAIR_MARKER_PATH):
+            return ""
+        raise
+    try:
         if not marker.get("pending"):
             return ""
         # Clear the marker so it doesn't repeat
         marker["pending"] = False
-        if _HOOKLIB_OK:
-            atomic_write_json(REPAIR_MARKER_PATH, marker)
-        else:
-            with open(REPAIR_MARKER_PATH, "w") as f:
-                json.dump(marker, f)
+        try:
+            if _HOOKLIB_OK:
+                atomic_write_json(REPAIR_MARKER_PATH, marker)
+            else:
+                with open_regular_text_write(REPAIR_MARKER_PATH) as f:
+                    json.dump(marker, f)
+        except OSError:
+            if os.path.exists(REPAIR_MARKER_PATH) and not os.path.isfile(REPAIR_MARKER_PATH):
+                return ""
+            raise
         tool_name = marker.get("tool_name", "?")
         repairs = marker.get("repairs", [])
         lines = [
@@ -2764,10 +3636,14 @@ def check_error_patterns(prompt: str) -> str:
     then [action]' creates strategic automaticity. See dv_NNNN, dv_NNNN.
     """
     try:
-        with open(ERROR_PATTERNS_PATH, "r") as f:
+        with open_regular_text(ERROR_PATTERNS_PATH) as f:
             patterns = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return ""
+    except OSError:
+        if _is_non_regular(ERROR_PATTERNS_PATH):
+            return ""
+        raise
 
     if not patterns:
         return ""
@@ -2813,21 +3689,49 @@ def check_principle_triggers(matched_ids: list, prompt_count: int) -> str:
     return text
 
 
-def check_principle_triggers_full(matched_ids: list, prompt_count: int) -> tuple[str, list]:
+def check_principle_triggers_full(
+    matched_ids: list, prompt_count: int, unknown: "list | None" = None,
+    state_unknown: "list | None" = None,
+) -> tuple[str, list]:
     """Same check as `check_principle_triggers`, but also returns the
     `rendered` list (`[(kind, principle_id, entry, matched_trigger_id), ...]`)
     of everything that actually fired this call -- the #1698 slice-3 caller
     (`main()`) uses this to emit one `engram.trigger.fire` telemetry event
     per rendered firing without re-deriving the cap/cooldown decision.
+
+    #3521 row 7: `unknown` is an optional list. A registry that could not be
+    read or used (anything but an ABSENT file) still returns `("", [])`, but
+    appends one `"<ExceptionClass>: <message>"` reason to `unknown` so the
+    caller can tell "the registry is broken" from "nothing fired". With
+    `unknown=None` (the default) behaviour is exactly as before.
+
+    #3521 row 40: `state_unknown` is a SEPARATE optional list (own probe key,
+    `principle-trigger-state`) for the cooldown STATE file. When the state
+    read is UNKNOWN (bad JSON, a non-dict, an unreadable file, a non-regular
+    target -- anything but ABSENT), one `{"reason": "<Class>: <msg>",
+    "moved_to": None}` is appended; `moved_to` is set to the `.corrupt` path
+    if the write-back then moved the unparseable file aside. The firing
+    decision is unchanged (state is treated as empty). `None` (default) ->
+    nothing is reported, behaviour otherwise identical.
+
+    Move-aside bound: an unparseable regular state file is renamed to
+    `principle-trigger-state.json.corrupt` (ONE fixed name) under the same
+    lock the write-back holds, before fresh state is written. Evidence is kept
+    for the latest corruption only: a newer corruption replaces an older copy.
+    A non-regular target is neither moved nor written.
     """
     if not matched_ids:
         return "", []
     try:
-        return _check_principle_triggers_inner(matched_ids, prompt_count)
-    except Exception:
+        return _check_principle_triggers_inner(
+            matched_ids, prompt_count, unknown, state_unknown
+        )
+    except Exception as exc:
         # Runs on every prompt — a malformed cache must degrade to
         # silence, never break the hook (same contract as the function
-        # this replaces).
+        # this replaces). #3521: but the degrade is reported, not hidden.
+        if isinstance(unknown, list):
+            unknown.append(f"{type(exc).__name__}: {exc}")
         return "", []
 
 
@@ -2892,23 +3796,33 @@ def _with_state_lock(lock_path, fn):
     one blocks -- the critical section is a fast local file read+write (no
     daemon round-trip), so a brief wait is cheap and correctness (no lost
     update) matters more than never-block here. Degrades to running fn()
-    unlocked if fcntl/lockfile-open fails (non-POSIX, permissions) -- same
+    unlocked if fcntl, the lockfile open, or the flock call itself fails
+    (non-POSIX, permissions, a file type or filesystem without flock
+    support) -- same
     never-crash contract as #1709's degrade path, just without the
     non-blocking contention branch (there's nothing to suppress; fn() still
     runs, just unprotected).
 
-    #1720: this exact ~15-line helper is duplicated in engram_core.py
-    (the MCP server process) rather than shared -- this hook script (a
-    separate subprocess invoked by Claude Code) and engram_core.py have no
+    #1720: this exact ~15-line helper is duplicated rather than shared, in
+    THREE files (#3658): this one, engram_core.py (the MCP server process),
+    and engram-utility-credit-mention-stop.py (the Stop hook). Hook scripts
+    are separate subprocesses invoked by Claude Code, hooks do not import each
+    other, and engram_core.py may not be imported by a hook, so there is no
     shared import surface today, and a new shared module for ~15 lines isn't
-    worth the engineering (see spec
-    docs/specs/1720-principle-state-write-race.md). If either copy changes,
-    check the other.
+    worth the engineering (see spec docs/specs/1720-principle-state-write-race.md).
+    If any copy changes, change the other two; tests/test_utility_state_lock_3658.py
+    pins all three AST-identical (docstring dropped).
     """
+    fd = None
     try:
         import fcntl
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)  # blocking -- no LOCK_NB
     except Exception as exc:
+        # #3658 review: BOTH setup steps (the open and the flock) degrade here;
+        # flock can raise on a file the open accepted (EOPNOTSUPP on a FIFO on
+        # macOS). The lock was never taken, so it is never unlocked: just close
+        # the fd and run fn() unlocked.
         # #1743: this degrade was silent -- nothing distinguished "locked and
         # protected" from "running unlocked," the same diagnosis-costing gap
         # #1737/#1742 fixed for the non-blocking cooldown lock. Emit one
@@ -2931,9 +3845,13 @@ def _with_state_lock(lock_path, fn):
             )
         except Exception:
             pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
         return fn()  # degrade: run unlocked rather than crash or skip
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)  # blocking -- no LOCK_NB
         return fn()
     finally:
         try:
@@ -2946,11 +3864,19 @@ def _with_state_lock(lock_path, fn):
             pass
 
 
-def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tuple[str, list]:
+def _check_principle_triggers_inner(
+    matched_ids: list, prompt_count: int, unknown: "list | None" = None,
+    state_unknown: "list | None" = None,
+) -> tuple[str, list]:
     try:
-        with open(PRINCIPLE_TRIGGERS_PATH, "r") as f:
+        with open_regular_text(PRINCIPLE_TRIGGERS_PATH) as f:
             registry = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except json.JSONDecodeError as exc:
+        # #3521 row 7: a corrupt registry is UNKNOWN, not "nothing fired".
+        if isinstance(unknown, list):
+            unknown.append(f"{type(exc).__name__}: {exc}")
+        return "", []
+    except FileNotFoundError:
         # Deviation from design doc §2's literal "fallback to legacy":
         # slice 1's rebuild is additive and runs at the same 3 sites the
         # legacy caches already rebuild from, so this file is realistically
@@ -2962,7 +3888,21 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tup
         # explicitly for reviewer/Kepler to confirm or override, since the
         # design doc's literal words say "fallback to legacy."
         return "", []
-    if not registry or not isinstance(registry, dict):
+    except OSError as exc:
+        # #3628: swallowed only for a non-regular target (a FIFO); on a
+        # regular file it propagates as on dev (and the outer wrapper in
+        # check_principle_triggers_full records it, #3521 row 7).
+        if _is_non_regular(PRINCIPLE_TRIGGERS_PATH):
+            if isinstance(unknown, list):
+                unknown.append(f"{type(exc).__name__}: {exc}")
+            return "", []
+        raise
+    if not isinstance(registry, dict):
+        # #3521 row 7: a registry that is not an object cannot be used.
+        if isinstance(unknown, list):
+            unknown.append("ValueError: registry is not an object")
+        return "", []
+    if not registry:
         return "", []
 
     # Reverse view: a matched ID that IS a principle's own node ID (not a
@@ -2995,13 +3935,17 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tup
             if pid:
                 by_principle.setdefault(pid, entry)
 
-    try:
-        with open(PRINCIPLE_TRIGGER_STATE_PATH, "r") as f:
-            state = json.load(f)
-        if not isinstance(state, dict):
-            state = {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        state = {}
+    # #3521 row 40: one read rule (_hooklib.read_state_json_classified). ABSENT
+    # and a JSON object behave exactly as before; anything else (bad JSON, a
+    # non-dict, an unreadable regular file, a non-regular target) is UNKNOWN:
+    # the cooldown decision still treats state as empty (an extra nudge, never
+    # a missing one), but the UNKNOWN is reported and the write-back below
+    # moves an unparseable regular file aside instead of overwriting it.
+    state, _state_reason, _ = read_state_json_classified(PRINCIPLE_TRIGGER_STATE_PATH)
+    _state_report = None
+    if _state_reason is not None and isinstance(state_unknown, list):
+        _state_report = {"reason": _state_reason, "moved_to": None}
+        state_unknown.append(_state_report)
 
     # #1698 slice 3 §1.1 — migration on read: a bare int entry is the
     # slice-2 shape (last_fired_prompt only). Upconvert in memory here;
@@ -3132,13 +4076,46 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tup
     # exclusivity with the other writer (see spec's "Why NOT #1709's
     # non-blocking-suppress pattern").
     def _write_back():
-        try:
-            with open(PRINCIPLE_TRIGGER_STATE_PATH, "r") as f:
-                fresh_state = json.load(f)
-            if not isinstance(fresh_state, dict):
-                fresh_state = {}
-        except (FileNotFoundError, json.JSONDecodeError):
-            fresh_state = {}
+        # #3521 row 40: the FRESH in-lock read decides the move (the snapshot
+        # above may be stale: a file repaired since is merged into, not moved).
+        # A file that was READ and found unparseable (bad JSON, a non-dict) is
+        # renamed to ONE fixed sidecar name BEFORE fresh state is written --
+        # evidence is kept for the latest corruption only (a newer corruption
+        # replaces an older copy). Any OSError (unreadable file, fd limit, a
+        # FIFO / directory) is UNKNOWN but never movable: an unreadable file has
+        # not been shown unparseable, and a transient error must never cost
+        # valid history, so it is neither moved nor written (#3628: the hook
+        # never opens, and does not rename, a non-regular target). If the move
+        # itself fails, the file is NOT overwritten.
+        # Known bound: the utility-credit stop hook rewrites this state file
+        # WITHOUT this lock (until the core-side follow-up). If its write lands
+        # between the fresh read below and the rename, a just-written valid file
+        # could be moved aside. The window is tiny, the bytes are preserved in
+        # the sidecar, and that cross-writer clobbering predates this change.
+        fresh_state, fresh_reason, fresh_movable = read_state_json_classified(
+            PRINCIPLE_TRIGGER_STATE_PATH
+        )
+        if fresh_reason is not None:
+            if not fresh_movable:
+                return
+            sidecar = str(PRINCIPLE_TRIGGER_STATE_PATH) + ".corrupt"
+            try:
+                os.replace(str(PRINCIPLE_TRIGGER_STATE_PATH), sidecar)
+            except OSError:
+                return  # cannot preserve the evidence -> do not overwrite it
+            if _state_report is not None:
+                _state_report["moved_to"] = sidecar
+            elif isinstance(state_unknown, list):
+                state_unknown.append({"reason": fresh_reason, "moved_to": sidecar})
+            try:
+                print(
+                    f"[engram principle-trigger-state] unparseable state file "
+                    f"moved aside to {sidecar} ({fresh_reason[:200]}) -- cooldown "
+                    f"history reset; only the latest corrupt copy is kept",
+                    file=sys.stderr,
+                )
+            except Exception:
+                pass
 
         # Re-apply the same bare-int-entry upconversion (§1.1) done on the
         # snapshot read above -- that migrated copy isn't reused here (it may
@@ -3174,7 +4151,7 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tup
                 atomic_write_json(str(PRINCIPLE_TRIGGER_STATE_PATH), fresh_state)
             else:
                 tmp = str(PRINCIPLE_TRIGGER_STATE_PATH) + ".tmp"
-                with open(tmp, "w") as f:
+                with open_regular_text_write(tmp) as f:
                     json.dump(fresh_state, f)
                 os.replace(tmp, str(PRINCIPLE_TRIGGER_STATE_PATH))
         except OSError:
@@ -3204,7 +4181,7 @@ def format_nap_warning(count: int) -> str:
     return ""
 
 
-def _assemble_response(head_blocks: list, body_blocks: list) -> dict:
+def _assemble_response(head_blocks: list, body_blocks: list, kept_out=None) -> dict:
     """Build the UserPromptSubmit response dict from this prompt's fired
     head/body blocks, routed through the shared bounded renderer
     `_hooklib.emit_context()` (engram-alpha#2863 WS2).
@@ -3220,6 +4197,10 @@ def _assemble_response(head_blocks: list, body_blocks: list) -> dict:
     `if not parts:` early exit) -- `emit_context()` is never called with
     two empty inputs. Otherwise returns the full
     `{"hookSpecificOutput": {...}}` response dict, ready for `json.dumps()`.
+
+    `kept_out` (#3621): optional list, passed straight through to
+    `emit_context(kept_out=)` -- extended with the indices (into
+    `body_blocks`) of the blocks rendered in full. The return is unchanged.
     """
     head = "\n\n".join(head_blocks)
     body = list(body_blocks)
@@ -3247,6 +4228,7 @@ def _assemble_response(head_blocks: list, body_blocks: list) -> dict:
         # <path>" pointer. A shared overflow-writer helper is a clean
         # fast-follow, not built here.
         overflow_writer=None,
+        kept_out=kept_out,
     )
     return {
         "hookSpecificOutput": {
@@ -3257,6 +4239,21 @@ def _assemble_response(head_blocks: list, body_blocks: list) -> dict:
 
 
 def main():
+    """One fire. The owner state (#3821) lives for exactly this call: set by `_main_impl` and
+    reset here on every way out, so a later standalone caller of a site is never left reading
+    through a stale shim."""
+    global _OWNER_RUN
+    global _MOMENT_CURSOR_UNAVAILABLE_SEEN
+    _MOMENT_CURSOR_UNAVAILABLE_SEEN = False
+    try:
+        _main_impl()
+    finally:
+        _OWNER_RUN = None
+        _MOMENT_CURSOR_UNAVAILABLE_SEEN = False
+
+
+def _main_impl():
+    global _OWNER_RUN
     # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
     # return/exit in this function.
     write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})
@@ -3270,6 +4267,23 @@ def main():
     if not prompt or prompt.startswith("/") or prompt.startswith("!"):
         print(json.dumps({}))
         sys.exit(0)
+
+    # #3821: the owner state of THIS fire (the flag is read once, only through flag_on). Flag
+    # OFF: {"on": False}, every site on its direct path.
+    _OWNER_RUN = _new_owner_run()
+
+    # #3613: producers wrap the meaningful text of a notification in an
+    # ENGRAM marker; the recall QUERY is built from that text only. `prompt`
+    # stays the raw text for everything that is not the recall query
+    # (telemetry, counters, loop-wake detection, keyword-pattern fallback).
+    #   none   -> recall_query is prompt (identical object): unchanged behaviour
+    #   marked -> recall_query is the extracted span text
+    #   empty  -> the recall stage is skipped; every other output still runs
+    try:
+        _recall_state, recall_query = marker_recall_query(prompt)
+    except Exception:
+        _recall_state, recall_query = "none", prompt
+    _recall_skipped = _recall_state == "empty"
 
     # Increment prompt counter
     counter = read_prompt_counter()
@@ -3286,14 +4300,19 @@ def main():
     embed_query: str | None = None
     conn = None
     try:
-        if _as_cfg["idf_gate_enabled"]:
+        if _recall_skipped:
+            # No recall query this prompt: nothing to prepend context to.
+            should_prepend = False
+        elif _as_cfg["idf_gate_enabled"]:
             # IDF-based gate: open a read-only DB connection for keyword lookup.
             # extract_keywords doesn't use sqlite-vec, so skip the extension load.
-            conn = sqlite3.connect(f"file:{KNOWLEDGE_DB_PATH}?mode=ro", uri=True)
-            should_prepend = _should_prepend(prompt, conn, _as_cfg)
+            # #3821 (row 4): flag ON, the fire's shared owner connection stands in (never
+            # closed here: it belongs to the whole fire).
+            conn = _owner_conn() if _owner_active() else connect_regular_ro(KNOWLEDGE_DB_PATH)
+            should_prepend = _should_prepend(recall_query, conn, _as_cfg)
         else:
             # Feature flag off — legacy char-length heuristic.
-            should_prepend = len(prompt) < _as_cfg["short_prompt_threshold_chars"]
+            should_prepend = len(recall_query) < _as_cfg["short_prompt_threshold_chars"]
 
         if should_prepend:
             prev_tail = _read_prev_assistant_tail(
@@ -3301,20 +4320,27 @@ def main():
                 _as_cfg["prev_response_tail_chars"],
             )
             if prev_tail:
-                embed_query = f"{prev_tail}\n\n{prompt}"
-    except Exception:
+                embed_query = f"{prev_tail}\n\n{recall_query}"
+    except Exception as exc:
         # Any unexpected failure in gate logic must not break the hook.
-        # Degrade to no-prepend (embed_query stays None).
+        # Degrade to no-prepend (embed_query stays None). #3821: an unimportable owner client
+        # (raised by _owner_conn above) is recorded for the loud owner line.
+        _record_owner_failure("_should_prepend", exc)
         embed_query = None
     finally:
-        if conn is not None:
+        if conn is not None and not _owner_active():
             conn.close()
 
     # Try daemon first (fast, semantic), fall back to FTS-only
     used_daemon = False
     _daemon_t0 = time.perf_counter()
-    result = query_daemon(prompt, embed_query=embed_query)
-    if result is not None:
+    # Empty marker (#3613): no recall query at all. `result` stays None and
+    # `used_daemon` False, but the daemon-down warning below is gated on
+    # `_recall_skipped` so this is not misreported as an outage.
+    result = None if _recall_skipped else query_daemon(recall_query, embed_query=embed_query)
+    if _recall_skipped:
+        pass
+    elif result is not None:
         used_daemon = True
     else:
         # FTS-only fallback path. We intentionally do NOT forward embed_query
@@ -3323,7 +4349,16 @@ def main():
         # the raw prompt. Prepending prev-response-tail to a keyword search
         # would pollute results with arbitrary prior-context tokens — exactly
         # what the design intentionally avoided in the daemon path.
-        result = query_fts_fallback(prompt)
+        # #3821 (row 7): with the owner flag ON this path is NOT TAKEN -- it runs the server
+        # runtime inside the hook (the #3741 class), a degraded read of the store (design
+        # 5.5). `result` stays None: the daemon-down notice below is the existing, honest
+        # signal, and no recall block is rendered.
+        # Telemetry caveat: `fallback_to_fts` below is `not used_daemon`, so it still reads True
+        # when the daemon is down with the flag ON although the fallback is NOT taken here; read
+        # it as "the daemon did not answer", not "FTS ran". (Kept as is: flag-OFF telemetry must
+        # stay byte-identical.)
+        if not _owner_active():
+            result = query_fts_fallback(recall_query)
     _daemon_latency_ms = int((time.perf_counter() - _daemon_t0) * 1000)
 
     # Emit engram.surface.fire event for the structured event log.
@@ -3350,7 +4385,7 @@ def main():
             fields={"outcome": "init_failed"},
         )
 
-    if _emitter is not None:
+    if _emitter is not None and not _recall_skipped:
         _surface_matched = result.get("matched_ids", []) if result else []
         _uid = _emitter.emit(
             event_type="engram.surface.fire",
@@ -3383,13 +4418,17 @@ def main():
     # this prompt; only WHERE the resulting string goes has changed.
     head_blocks: list = []
     body_blocks: list = []
+    _nudge_index = None  # #3621: index of the recall block in body_blocks, if any
 
     # Unified principle-trigger check (#1698 slice 2) — one registry, four
     # kinds (lesson/cornerstone/axiom/goal), replacing the separate
     # check_incident_tripwire + check_cornerstone_anchor calls.
     matched_ids = result.get("matched_ids", []) if result else []
+    _principle_unknown: list = []  # #3521 row 7: rendered below with the other probes
+    _principle_state_unknown: list = []  # #3521 row 40: own probe key
     principle_triggers, _principle_rendered = check_principle_triggers_full(
-        matched_ids, counter["prompts_since_compaction"]
+        matched_ids, counter["prompts_since_compaction"], _principle_unknown,
+        _principle_state_unknown,
     )
     if not principle_triggers:
         # Preserve the semantic-keyword fallback for lessons specifically --
@@ -3462,15 +4501,15 @@ def main():
     # genuinely-down daemon. The daemon writes its PID + binds its socket
     # only AFTER the ~7s model load, so during warmup neither exists; the
     # start script stamps daemon-launch-attempt at launch, before warmup.
-    if not used_daemon:
+    if not used_daemon and not _recall_skipped:
         user_name = get_user_name()
         # Resolve the daemon script path relative to this hook's own location.
         # Works for both install paths:
-        #   - Scatter: hook is at ~/.engram/hooks/engram-surface-hook.py
-        #     → daemon at ~/.engram/hooks/start-engram-daemon.sh
+        #   - Scatter: hook is at ~/.engram/hooks/engram-surface-hook.py (under $ENGRAM_HOME)
+        #     → daemon at ~/.engram/hooks/start-engram-daemon.sh (under $ENGRAM_HOME)
         #   - Plugin: hook is at ${plugin}/hooks/engram-surface-hook.py
         #     → daemon at ${plugin}/hooks/start-engram-daemon.sh
-        # Without this, the recovery path would point at ~/.engram/hooks/
+        # Without this, the recovery path would point at ~/.engram/hooks/ (under $ENGRAM_HOME)
         # which doesn't exist in plugin installs.
         daemon_script = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
@@ -3479,7 +4518,7 @@ def main():
         warming_up = False
         try:
             marker = os.path.join(ENGRAM_HOME, "daemon-launch-attempt")
-            with open(marker) as _f:
+            with open_regular_text(marker) as _f:
                 launched_at = int(_f.read().strip())
             if 0 <= (int(time.time()) - launched_at) < _DAEMON_WARMUP_WINDOW_SECONDS:
                 warming_up = True
@@ -3498,7 +4537,7 @@ def main():
             _idle_tombstone = os.path.join(ENGRAM_HOME, "daemon-idle-shutdown")
             _is_idle_shutdown = False
             try:
-                with open(_idle_tombstone) as _tf:
+                with open_regular_text(_idle_tombstone) as _tf:
                     _shutdown_at = int(_tf.read().strip())
                 # Valid for up to 48h (2 idle-timeout cycles); stale after that.
                 if 0 <= (int(time.time()) - _shutdown_at) <= 172800:
@@ -3534,8 +4573,19 @@ def main():
     # server.py detectable yet. That case is indistinguishable from a real outage
     # by this check alone, so the warning below is worded to surface both
     # possibilities and point at a reality-test rather than alarming unconditionally.
+    # #3521: probes that could not measure return None (UNKNOWN). Each renders
+    # one bounded, rate-limited line; the stamp that starts the window is
+    # written only after the response carrying the line has been printed.
+    probe_stamps_pending: list = []
     write_ok, write_reason = _check_mcp_write_tool_marker(ENGRAM_HOME)
-    if not write_ok:
+    if write_ok is None:
+        _line = _probe_unknown_notice(
+            probe_stamps_pending, "mcp-write-marker", "MCP write-tool marker",
+            "write-tool liveness not confirmed", write_reason,
+        )
+        if _line:
+            head_blocks.append(_line)
+    elif write_ok is False:
         head_blocks.append(
             f"⚠️  ENGRAM substrate health:\n"
             f"  MCP write-tool liveness: UNCONFIRMED ({write_reason})\n"
@@ -3561,7 +4611,37 @@ def main():
     # in-memory cache nodes while the SQLite file itself is inaccessible
     # (WAL failure, disk I/O error, corruption). See #1218 / #786.
     db_ok, db_reason = _check_db_liveness(KNOWLEDGE_DB_PATH)
-    if not db_ok:
+    # #3821 (row 6), flag ON: a failed PING is an OWNER failure, reported by the one loud owner
+    # line below; the "check disk health / WAL" text would blame the wrong thing, so that block
+    # stays suppressed for it. A ping that answered with the STORE READ failing is the opposite:
+    # the owner is fine and the store is what to check, so it gets its own distinct block that
+    # keeps the disk-health / WAL advice (and points the restart at the owner).
+    if not db_ok and _owner_active():
+        if (_OWNER_RUN or {}).get("liveness_stage") == _LIVENESS_STORE_UNREADABLE:
+            _skew = (_OWNER_RUN or {}).get("liveness_skew")
+            if _skew == _SKEW_VERSION:
+                # a BUILD condition: the disk-health / WAL advice cannot help
+                head_blocks.append(
+                    f"⚠️  ENGRAM substrate health:\n"
+                    f"  DB liveness: FAILED (the engramd owner is up but its build does not know this read: version skew)\n"
+                    f"  → Reads through the owner may fail. Surface nodes above may be stale pre-failure cache.\n"
+                    f"  Recovery: redeploy / restart the engramd owner so it matches this plugin."
+                )
+            elif _skew == _SKEW_SCHEMA:
+                head_blocks.append(
+                    f"⚠️  ENGRAM substrate health:\n"
+                    f"  DB liveness: FAILED (the engramd owner is up but dropped this read at load: the store lacks something it needs)\n"
+                    f"  → Reads through the owner may fail. Surface nodes above may be stale pre-failure cache.\n"
+                    f"  Recovery: migrate the store to the schema this plugin expects, then restart the engramd owner."
+                )
+            else:
+                head_blocks.append(
+                    f"⚠️  ENGRAM substrate health:\n"
+                    f"  DB liveness: FAILED (the engramd owner is up but the store is unreadable: {_sanitize_owner_text(db_reason.rsplit(': ', 1)[-1], 40)})\n"
+                    f"  → Reads through the owner will fail. Surface nodes above may be stale pre-failure cache.\n"
+                    f"  Recovery: check disk health / WAL integrity of knowledge.db, then restart the engramd owner."
+                )
+    elif not db_ok:
         head_blocks.append(
             f"⚠️  ENGRAM substrate health:\n"
             f"  DB liveness: FAILED ({db_reason})\n"
@@ -3574,14 +4654,46 @@ def main():
     # channel for "fail loud": a stderr print nobody reads (round 1) is
     # replaced by a durable flag the hooks re-check on every prompt.
     embed_restore_ok, embed_restore_msg = _check_embedding_restore_flag(KNOWLEDGE_DB_PATH)
-    if not embed_restore_ok:
+    if embed_restore_ok is None:
+        _line = _probe_unknown_notice(
+            probe_stamps_pending, "embedding-restore", "embedding-restore",
+            "recall may be degraded", embed_restore_msg,
+        )
+        if _line:
+            head_blocks.append(_line)
+    elif embed_restore_ok is False:
         head_blocks.append(f"⚠️  {embed_restore_msg}")
+
+    # #3521 row 7: a registry that could not be read or used is UNKNOWN, not
+    # "no principle fired". Same render + stamp path as the probes above.
+    if _principle_unknown:
+        _line = _probe_unknown_notice(
+            probe_stamps_pending, "principle-triggers", "principle triggers",
+            "trigger nudges skipped this prompt", _principle_unknown[0],
+        )
+        if _line:
+            head_blocks.append(_line)
+
+    # #3521 row 40: a corrupt / unreadable cooldown STATE file is UNKNOWN too
+    # (own probe key). The suffix is cut to 60 chars by probe_unknown_line, so
+    # both wordings fit whole.
+    if _principle_state_unknown:
+        _rec = _principle_state_unknown[0]
+        _line = _probe_unknown_notice(
+            probe_stamps_pending, "principle-trigger-state", "principle cooldown",
+            "cooldown reset; kept as principle-trigger-state.json.corrupt"
+            if _rec.get("moved_to") else "cooldowns ignored this prompt",
+            _rec.get("reason"),
+        )
+        if _line:
+            head_blocks.append(_line)
 
     # Attached-pack surfacing — queried AFTER own-graph result, guarded
     # fail-open so any pack error never breaks the hook.
     pack_results: list[dict] = []
     try:
-        pack_results = _query_attached_packs(prompt)
+        if not _recall_skipped:
+            pack_results = _query_attached_packs(recall_query)
     except Exception:
         pack_results = []
 
@@ -3590,14 +4702,37 @@ def main():
     # not None) — see the engram.surface.render_size emission below, which
     # gates on this dict being non-empty.
     _render_stats: dict = {}
+    _route_out: dict = {}
     if result is not None:
+        # #3613 live in-context exclusion: the resolver is built BEFORE this
+        # fire's shown-record line is appended (below), and only when the
+        # kill switch (`recall_in_context_exclusion.enabled`, default off) is
+        # on. None => format_nudge renders exactly as before.
+        _in_context_resolver = None
+        try:
+            if in_context_exclusion_enabled(os.path.dirname(CONFIG_PATH)):
+                if _owner_active():
+                    # #3821 (row 5): the focused-ids read goes through the owner (U8's
+                    # read_conn), never a direct open; no connection -> no resolver.
+                    _build, _rc = _focused_read_conn()
+                    if _build:
+                        _in_context_resolver = build_exclusion_resolver(
+                            hook_input.get("session_id"), read_conn=_rc,
+                            on_failure=lambda _e: _record_owner_failure("_focused_ids", _e))
+                else:
+                    _in_context_resolver = build_exclusion_resolver(hook_input.get("session_id"))
+        except Exception:
+            _in_context_resolver = None
         nudge = format_nudge(
             result,
             pack_results=pack_results,
             session_id=hook_input.get("session_id", "unknown"),
             stats=_render_stats,
+            route_out=_route_out,
+            in_context_resolver=_in_context_resolver,
         )
         if nudge:
+            _nudge_index = len(body_blocks)  # #3621: where the recall block sits
             body_blocks.append(nudge)
         elif pack_results:
             # Own-graph returned 0 matches (match_count=0) but we have pack hits
@@ -3713,12 +4848,77 @@ def main():
         if nap_warning:
             body_blocks.append(nap_warning)
 
-    response = _assemble_response(head_blocks, body_blocks)
+    _record_shown = False  # #3621: set True where the old append used to run
+    # Route ledger (#3458 A): one line per fire when the probe is live for
+    # this session (opt-in by presence, fail-open -- see _hooklib). `query` is
+    # the text sent to the daemon/FTS (the recall query; embed_query, when set,
+    # only widens the semantic side and is recorded separately).
+    if not _recall_skipped:  # empty marker: no recall ran, nothing to record
+        # #3821 (row 5): the ledger builds its own in-context resolver when the probe is live for
+        # this session -- the same `_focused_ids` read, through the owner when the flag is ON
+        # (without it this is the second direct open of a flag-ON fire, U8's hole).
+        _ledger_kw, _ledger_build = {}, True
+        if _owner_active():
+            _ledger_build, _rc = _focused_read_conn()
+            _ledger_kw = {"read_conn": _rc, "on_failure": lambda _e: _record_owner_failure("_focused_ids", _e)}
+        if _ledger_build:  # False only for an unimportable owner client (recorded): never a direct open
+            write_route_ledger(
+                "prompt_surface", hook_input.get("session_id"), prompt_fire_key(prompt),
+                recall_query, result, _route_out.get("shown", []), _route_out.get("cut_reasons", {}),
+                source="daemon" if used_daemon else "fallback",
+                extra={"embed_query": embed_query} if embed_query is not None else None,
+                **_ledger_kw,
+            )
+        # #3613 S1 / #3621: the shown record is written below, after the response
+        # was printed, once we know whether the recall block survived emit_context's
+        # final cut. (Still after the in-context resolver was built above.)
+        _record_shown = True
+
+    # #3821: the owner-side line (a recorded owner failure, or a failed flag helper), at the head,
+    # once per rate-limit window; the stamp is written below only after the response was printed.
+    # Every read has run by now, so a failure at any of them is known here.
+    _owner_notice, _owner_notice_key = _pending_owner_notice()
+    if _owner_notice:
+        head_blocks.insert(0, _owner_notice)
+        probe_stamps_pending.append(_owner_notice_key)
+    _write_owner_stderr_lines()
+
+    _kept_blocks: list = []
+    response = _assemble_response(head_blocks, body_blocks, _kept_blocks)
+    print(json.dumps(response if response else {}))
+    # #3621: the ALL-OR-NOTHING shown record, written only now that the response
+    # was printed (a print that raised never reaches this). The fire's shown ids
+    # are recorded only if the recall block (body index `_nudge_index`) was
+    # rendered IN FULL (`_kept_blocks`, from emit_context); otherwise an EMPTY-ids
+    # line still lands, so prompt_index and the compaction window stay continuous.
+    # Fail-open, same style as the probe-stamp handling below. (Inline, not a
+    # helper: the read-scan root config lists every hook function.)
+    if _record_shown:
+        try:
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
+            _shown_ids = (
+                _route_out.get("shown", [])
+                if isinstance(_nudge_index, int) and _nudge_index in _kept_blocks
+                else []
+            )
+            append_shown_record("prompt_surface", hook_input.get("session_id"), _shown_ids)
+        except Exception:
+            pass
     if not response:
-        print(json.dumps({}))
         sys.exit(0)
 
-    print(json.dumps(response))
+    if probe_stamps_pending:
+        # #3521: the rate-limit window is consumed only once the response
+        # carrying the line has been written out (mirrors #3504).
+        try:
+            sys.stdout.flush()
+            for _probe in probe_stamps_pending:
+                mark_probe_notice(ENGRAM_HOME, _probe)
+        except Exception:
+            pass
     sys.exit(0)
 
 

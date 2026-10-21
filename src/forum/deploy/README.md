@@ -53,14 +53,94 @@ is in place.
 install-forum-service.sh --src <engram-alpha checkout> \
     --service-dir <shared dir, e.g. /home/agents-shared/forum> \
     --port 5002 \
-    --group <co-admin group, e.g. agents> \
+    --group agents \
+    --baton-login-map <abs path of the baton login map> \
     --no-start
 ```
 
+`--group` is **required in practice**: pass the shared group your forum seats
+belong to. With `--group` omitted the installer refuses (exit 2) unless your
+primary group is literally `agents` (our own deployment's group, and only an
+example for yours) — it never silently adopts whatever your primary group
+happens to be.
+
+`--service-dir` has no default. On a first install it is required (the installer
+exits 2 without it). On a re-install you may omit it: the installer reuses the
+`FORUM_HOME` of the existing `engram-forum.service`, so a re-run can never start a
+second, empty forum somewhere new. An existing unit with no readable `FORUM_HOME`
+is refused, never guessed at. `forum-drift-check.sh` follows the same rule.
+
+`--baton-login-map PATH` (and, if a non-root uid owns the file, repeatable
+`--baton-login-map-admin-uid UID`) render as real `ExecStart` flags for the
+strict baton peer->merge gate (#3039 U2b); omit them and the gate fails closed
+("no login map configured"). **Pass them on every re-install**: the unit is
+re-rendered from the template each run, so a map added by hand to the unit is
+lost — the installer now refuses (exit 2, nothing written) to replace a unit that
+already carries a map unless `--baton-login-map` is given again (#3312).
+
+`--github-token-file PATH` (#3283) renders one `EnvironmentFile=-PATH` line into the
+unit's `[Service]` section. The leading `-` is added by the installer, not by PATH
+(PATH must be absolute, so it can never start with `-`), and the file name must
+contain `github-token`. The file is the gate's dedicated **read-only** GitHub
+identity: a single `GH_TOKEN=...` line, installed by root/the host admin, never under
+the group-readable shared tree (PROPOSED: `/etc/engram-forum/github-token.env`).
+Permissions are either `0640 root:<a group the service user is in>` or
+`0600 <service-user>`. **`root:root 0640` cannot work**: the service user could not
+read it. The installer never reads or dereferences the path.
+
+The server reads `GH_TOKEN` once at startup, so **rotating the token needs a service
+restart**. It runs every `gh` call of the baton gate under that token plus an empty
+`GH_CONFIG_DIR` (`$FORUM_HOME/gh-config`, 0700). With **no token the gate refuses
+(`unknown`) instead of falling back to the service user's own `gh` login**. Because of
+the leading `-`, a missing or unreadable token file lets the unit start, and then every
+gate-checked `baton advance` refuses until the file is installed; server startup prints
+a token-free warning line saying so.
+
+Like the login map, pass the flag on every re-install: the installer refuses (exit 2,
+nothing written) to replace a unit that already carries a github-token
+`EnvironmentFile=` line unless the flag is given again.
+
+The board's PR-state read (`src/forum/board_projects.py`) runs under the same identity
+as the gate (#3509): the same explicit environment, the same empty `GH_CONFIG_DIR`.
+With no token it returns `unknown`: board rows keep their baton status, and nothing is
+cached. Once the server has captured `GH_TOKEN` it removes the variable from the process
+environment, so no child process inherits it. Only `GH_TOKEN` is removed: a
+`GITHUB_TOKEN` supplied in the unit stays, which is inert today because nothing in
+`src/forum` spawns a child other than the `gh` calls, and those get an explicit
+environment. If the baton gate module cannot be loaded, the board read also returns
+`unknown` instead of using an ambient `gh` login. The token's repository list must
+cover every repo a board PR anchor points at; for any repo it does not cover, those
+rows degrade to `unknown`.
+
+**This read also feeds the forum's `/gc` and `/merge` routes** (they derive an anchored
+baton's PR state through the same function, uncached), and there an `unknown` is a
+refusal, not a degrade: both routes answer 503 ("could not read the state of PR ...
+nothing written ... Retry later"). So, once this change is deployed, **without the token installed, or for an
+anchored baton whose repo is outside the token's list, closing and merging that baton
+through the forum is refused** where it used to work on the ambient login. Deploy order:
+(1) create the token and check its repository list against EVERY repo any anchored baton
+points at; (2) install the token file and re-run the installer with `--github-token-file`;
+(3) restart the service; only then rely on `/gc` and `/merge`. Host verification adds one
+real anchored-baton read through the forum, beside the gate checks above. Neither route
+has a dry-run option, and `/gc` or `/merge` on a baton whose PR is already merged or closed
+WRITES (it closes the baton), so the safe positive check is `POST /gc` on an anchored baton
+whose PR is still OPEN: a working identity answers 409 ("still OPEN ... refusing to close")
+before anything is written, and a 503 means the identity cannot read that PR.
+
 `--no-start` for the first install so the DB cutover (below) happens before the
 service comes up. On later code upgrades, re-run **without** `--no-start` to
-re-snapshot + restart. (Defaults: `--service-dir /home/agents-shared/forum`,
-`--port 5002`, `--group` = your primary group. The script checks you're in `--group`.)
+re-snapshot + restart. (Default `--port 5002`; `--service-dir` and `--group` have
+no default — see above. The script checks you're in `--group`.)
+
+**`forum.url` (#3557).** Hooks and CLIs treat a forum as configured only when
+`config.json` `forum.url` is a non-empty string. After a successful install the
+script runs `src/engram/tools/set_forum_url.py` on the admin seat's config
+(`${ENGRAM_HOME:-~/.engram}/config.json`) with `http://localhost:<port>`; a refusal
+(different existing url, missing config) only warns and prints the manual command, and
+`--dry-run` prints the step without writing. It then prints the command for other
+seats: `python3 <checkout>/src/engram/tools/set_forum_url.py http://localhost:<port>`
+on the same host, or `http://<this-host-address>:<port>` for a seat on another host
+(the installer cannot know the LAN address).
 
 **One-time sudo step — enable linger** (so the service survives reboot, not just
 logout). The script attempts it; a plain user usually can't, so run once:
@@ -174,7 +254,11 @@ Same shared data, their own systemd. ONE service at a time:
 ```bash
 ss -tlnp | grep 5002          # MUST be empty before you start yours
 <your engram-alpha checkout>/forum/deploy/install-forum-service.sh \
-    --src <your engram-alpha checkout> --service-dir <shared dir> --group <group>
+    --src <your engram-alpha checkout> --service-dir <shared dir> --group <group> \
+    --baton-login-map <absolute path of the protected login map>
+# Without --baton-login-map the unit has no login map and the baton peer->merge
+# gate fails closed ("no login map configured"). If a unit with a map already
+# exists the installer refuses to replace it unless you pass the flag again (#3312).
 # (the installer reuses the existing shared venv — it won't try to rewrite it)
 # Stop again when the admin is back, so there's only ever one running.
 ```
@@ -209,20 +293,37 @@ to a later slice (remote repo decision is the user's call).
 
 | File | Role |
 |------|------|
-| `engram-forum-backup.service` | systemd `--user` oneshot unit (runs the backup tool) |
+| `engram-forum-backup.service.template` | systemd `--user` oneshot unit template (`{{FORUM_HOME}}`); the installer renders it to `engram-forum-backup.service` (runs the backup tool) |
 | `engram-forum-backup.timer` | Daily timer (OnCalendar=daily + OnBootSec=10min, Persistent=true) |
-| `tools/forum_backup.py` (repo root) | The backup script (stdlib only) |
+| `engram-forum-backup-alarm.service.template` | template for `engram-forum-backup-alarm.service` (`{{FORUM_HOME}}`), rendered on every install: oneshot started only by the backup unit's `OnFailure=`; posts a forum thread (last 20 journal lines + @mentions) when a backup fails. No `[Install]` section: never enable it. Mentions/poster/category via `FORUM_BACKUP_ALARM_MENTION` / `_AGENT` / `_CATEGORY` (quote assignments with spaces) |
+| `engram-forum-backup-alarm.service.d/mention.conf` | drop-in written by `install-forum-service.sh` on every run: `Environment="FORUM_BACKUP_ALARM_MENTION=<agents>"`, the forum agent names the alarm @mentions. Value = the installer's own `$FORUM_BACKUP_ALARM_MENTION` if set, else your agent name (`$USER` minus a leading `agent-`), else empty (the alarm still posts, without a mention). Only letters, digits, `_`, `-`, `,` and spaces are accepted; anything else aborts the install |
+| `engram-forum-backup.service.d/alarm.conf` | drop-in (`OnFailure=engram-forum-backup-alarm.service`) written by `install-forum-service.sh` on every run, so a hand-edited backup unit still gains the alarm |
+| `tools/forum_backup.py` (repo root) | The backup script (stdlib only); the installer snapshots it to `<service-dir>/app/tools/forum_backup.py` and both units run that snapshot, never a checkout; writes `<backup-dir>/.last-success.json` on every successful run, which `/health` and `forum status` report as backup age |
+
+To page specific agents when a backup fails, set the knob when you install
+(placeholder names; use your own agents' forum names):
+
+```bash
+FORUM_BACKUP_ALARM_MENTION="admin1 admin2" ./install-forum-service.sh --src <checkout> ...
+```
+
+`install-forum-service.sh` renders the backup service and the alarm unit from
+their templates (`{{FORUM_HOME}}` becomes your `--service-dir`), so they name this
+install's own paths and no checkout. It installs the backup service and timer only
+if absent (a reinstall never reverts your `ExecStart` edits; a kept unit that
+differs from what the installer would install gets one `NOTE:` line), always
+reinstalls the alarm unit, and always rewrites the drop-in. It does not enable the
+timer. Before it restarts anything it reads the backup service that will be live
+and refuses (exit 2, naming the path) if the interpreter or the script is missing,
+or the parent directory of `--db`, `--backup-dir` or `--audit` is — a dead timer is
+never installed silently. For `/health` to show backup age the forum service needs
+`FORUM_BACKUP_DIR` (set in the unit template).
 
 ## Enable
 
 ```bash
-# Copy the units into your systemd --user directory
-mkdir -p ~/.config/systemd/user
-cp forum/deploy/engram-forum-backup.service ~/.config/systemd/user/
-cp forum/deploy/engram-forum-backup.timer   ~/.config/systemd/user/
-
-# Edit the service ExecStart path to match your engram-alpha checkout location
-# (the shipped unit uses %h/engram-alpha/tools/forum_backup.py as a default)
+# install-forum-service.sh has already rendered the backup service, the alarm unit
+# and the timer into ~/.config/systemd/user/ (it never enables the timer):
 systemctl --user daemon-reload
 systemctl --user enable --now engram-forum-backup.timer
 ```
@@ -272,7 +373,7 @@ vec-bearing `forum.db` backup under an interpreter without sqlite_vec fails with
 `no such module: vec0` (#1057). The timer unit uses the same interpreter.
 
 ```bash
-/home/agents-shared/forum/.venv/bin/python <engram-alpha checkout>/tools/forum_backup.py --verify
+<service-dir>/.venv/bin/python <service-dir>/app/tools/forum_backup.py --verify
 ```
 
 `--verify` restores the just-written dump into a temp DB and asserts row-counts

@@ -50,6 +50,16 @@ Output: JSON to stdout —
   indistinguishable in the nightly ritual, which is exactly the failure
   class that left engram-alpha#2570's hook telemetry dark for months on
   more than one seat without anyone noticing.
+
+Owner read (engram-alpha#3824, U12 of #2652). With `engramd.reconcile_demotions_reads_via_owner`
+true in $ENGRAM_HOME/config.json (read only through engramd_owner_flags.flag_on; default OFF) the
+tool's ONE statement -- the per-ledgered-lesson `prevention_type` read -- goes to the engramd owner
+instead of opening knowledge.db, and the tool opens the store ZERO times. The same invariant holds
+there: the owner being down, older than this tool, or unable to classify the read against the live
+store RAISES ReconcileError (exit 1), each with its own message, because `{"candidates": []}` means
+"nothing to demote" and the sleep cycle acts on it. Flag ON never falls back to a direct open.
+`db_path.exists()` is replaced by a `ping` to the owner. An explicit `--db` naming a store other than
+this home's keeps the direct path: the owner serves one store, and the caller asked for that file.
 """
 
 from __future__ import annotations
@@ -62,6 +72,14 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+
+# The owner-read helper lives beside this file (U14, #3862); resolve the package root through the symlink
+# so `from tools import ...` works run as a script, loaded by path, or from the flattened plugin layout.
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+
+from tools import _owner_read as owner_read  # noqa: E402
 
 # Two independent path hazards have already hit this exact computation, so
 # resolution can assume neither a fixed distance from the repo root NOR a
@@ -120,9 +138,16 @@ def _resolve_hook_path() -> Path | None:
 
 HOOK_PATH = _resolve_hook_path()
 
-DEFAULT_ENGRAM_HOME = Path(os.environ.get("ENGRAM_HOME") or Path.home() / ".engram")
+DEFAULT_ENGRAM_HOME = owner_read.engram_home()
 DEFAULT_DB_PATH = DEFAULT_ENGRAM_HOME / "knowledge.db"
 DEFAULT_LEDGER_PATH = DEFAULT_ENGRAM_HOME / "lesson-prevention-ledger.jsonl"
+
+# --- owner read (#3824) ------------------------------------------------------
+OWNER_FLAG_KEY = "reconcile_demotions_reads_via_owner"
+# One run reads once per ledgered lesson id (a handful), once per sleep: no latency gate, but a bound so
+# a stuck owner is an error and not a hang. A JUDGEMENT, not a measurement.
+OWNER_READ_TOTAL_BUDGET_SECONDS = 60.0
+OWNER_READ_PER_CALL_SECONDS = 10.0
 
 
 class ReconcileError(RuntimeError):
@@ -190,6 +215,44 @@ def _read_ledger_lesson_ids(ledger_path: Path) -> set[str]:
     return lesson_ids
 
 
+def _runtime_dir() -> Path | None:
+    """The directory holding engramd_client.py: the shared helper's one resolution (U14, #3862)."""
+    return owner_read.runtime_dir()
+
+
+def _import_runtime(name: str):
+    """Import a runtime module (engramd_client, engramd_owner_flags) from _runtime_dir()."""
+    return owner_read.import_runtime(name)
+
+
+def _owner_spec() -> "owner_read.OwnerReadSpec":
+    """This tool's description for the shared owner-read helper, built per call (the constants it reads
+    are module-level and a test may move them)."""
+    return owner_read.OwnerReadSpec(
+        flag_key=OWNER_FLAG_KEY,
+        error_cls=ReconcileError,
+        home=DEFAULT_ENGRAM_HOME,
+        never_empty="Not answering from an empty list: that would read as 'nothing to demote'.",
+        total_budget=OWNER_READ_TOTAL_BUDGET_SECONDS,
+        per_call=OWNER_READ_PER_CALL_SECONDS,
+    )
+
+
+def _owner_flag_applies(db_path: Path) -> bool:
+    """True iff the owner flag is ON and `db_path` is THIS home's store (the shared helper's rule)."""
+    return owner_read.flag_applies(_owner_spec(), db_path)
+
+
+def _owner_ping() -> None:
+    """Flag ON replaces `db_path.exists()`: the owner must answer. Raises ReconcileError if it does not."""
+    owner_read.ping(_owner_spec())
+
+
+def _open_reader(db_path: Path, use_owner: bool):
+    """The read connection: the owner shim under the flag, else a `mode=ro` sqlite connection."""
+    return owner_read.open_reader(_owner_spec(), db_path, use_owner)
+
+
 def find_candidates(
     db_path: Path = DEFAULT_DB_PATH,
     ledger_path: Path = DEFAULT_LEDGER_PATH,
@@ -202,16 +265,29 @@ def find_candidates(
 
     Raises ReconcileError (never returns silently) if knowledge.db is
     missing or the ledger exists but can't be read -- see the module
-    docstring and ReconcileError for why this distinction is load-bearing."""
+    docstring and ReconcileError for why this distinction is load-bearing.
+    With engramd.reconcile_demotions_reads_via_owner on, the same holds for
+    the owner: down, older than this tool, or refusing the read raises."""
     if now is None:
         now = time.time()
-    if not db_path.exists():
-        raise ReconcileError(f"knowledge.db not found at {db_path}")
+    use_owner = _owner_flag_applies(db_path)
+    if use_owner:
+        _owner_ping()  # the owner's answer replaces the db_path.exists() precondition (#3824)
+    else:
+        # Kept: it wraps the classes in ReconcileError, and must run before the empty-ledger early return below,
+        # which never opens the store.
+        try:
+            owner_read.check_store_path(db_path)
+        except FileNotFoundError:
+            raise ReconcileError(f"knowledge.db not found at {db_path}") from None
+        except owner_read.StoreUnusable as exc:
+            # exit 1 is this tool's documented "genuine failure to check"; never an empty candidate list
+            raise ReconcileError(str(exc)) from exc
     hook = hook_module or _load_hook_module()
     # hook._count_recent_overrides reads the hook module's own
     # PREVENTION_LEDGER_PATH global, not a parameter -- point it at the
     # same ledger this function was asked to use (matters for tests, which
-    # pass a temp-file ledger distinct from the real ~/.engram one).
+    # pass a temp-file ledger distinct from the real ~/.engram ($ENGRAM_HOME) one).
     hook.PREVENTION_LEDGER_PATH = ledger_path
 
     lesson_ids = _read_ledger_lesson_ids(ledger_path)  # raises ReconcileError, doesn't swallow
@@ -220,11 +296,15 @@ def find_candidates(
 
     cfg = hook._demotion_config()
     candidates: list[dict] = []
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+    conn = _open_reader(db_path, use_owner)
     try:
         for lesson_id in sorted(lesson_ids):
+            # #3485: json_valid-guarded, so a non-JSON metadata blob on one
+            # ledgered lesson reads as NULL (skipped below, like a missing
+            # row) instead of raising "malformed JSON" out of the whole run.
             row = conn.execute(
-                "SELECT json_extract(metadata, '$.prevention_type') FROM nodes "
+                "SELECT json_extract(CASE WHEN json_valid(metadata) THEN metadata END, "
+                "'$.prevention_type') FROM nodes "
                 "WHERE id = ? AND type = 'lesson' AND is_current = 1 "
                 "AND memory_status = 'active'",
                 (lesson_id,),

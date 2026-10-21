@@ -52,7 +52,7 @@ def _get_focus_sets_cap() -> int:
     """
     if core.CONFIG_PATH.exists():
         try:
-            config = json.loads(core.CONFIG_PATH.read_text())
+            config = core._config_io.read_config_json(core.CONFIG_PATH)
             section = config.get("focus", {})
             if isinstance(section, dict) and "focus_sets_cap" in section:
                 return int(section["focus_sets_cap"])
@@ -149,7 +149,7 @@ def _clear_active_set_name_if_diverged(conn):
     saved_set = set(resolved)
 
     active_rows = conn.execute(
-        "SELECT id FROM nodes WHERE focused_at IS NOT NULL"
+        "SELECT id FROM nodes WHERE focused_at IS NOT NULL ORDER BY focused_at"
     ).fetchall()
     active_set = {r["id"] for r in active_rows}
 
@@ -206,7 +206,7 @@ def _focus_impl(node_ids: str, reason: str) -> str:
         missing = [i for i in ids if i not in found_map]
 
         current_focus_rows = conn.execute(
-            "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
+            "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1 ORDER BY focused_at"
         ).fetchall()
         current_focus_ids = {r["id"] for r in current_focus_rows}
 
@@ -253,7 +253,7 @@ def _focus_impl(node_ids: str, reason: str) -> str:
         conn.commit()
 
         focused_now = conn.execute(
-            "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
+            "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1 ORDER BY focused_at"
         ).fetchall()
         state_now = conn.execute(
             "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
@@ -322,7 +322,7 @@ def _unfocus_impl(node_ids: str) -> str:
             conn.commit()
 
         remaining = conn.execute(
-            "SELECT COUNT(*) as n FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
+            "SELECT COUNT(*) as n FROM nodes WHERE focused_at >= '' AND is_current = 1"
         ).fetchone()["n"]
         state_now = conn.execute(
             "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
@@ -826,10 +826,16 @@ def _focus_swap_impl(save_as: str, load: str = "", description: str = "") -> str
             (now, load),
         )
         _set_active_set_name(load, conn)
-        # Bump both the outgoing and incoming node sets — swap is focus on both
-        swap_bump_ids = list(dict.fromkeys(active_ids + loaded))
-        if swap_bump_ids:
-            core._utility_reward(conn, swap_bump_ids, action="focus")
+        # Utility credit for both sets, but only the INCOMING (loaded / kept in
+        # focus) set restamps: "focus" restamps, "unfocus" does not -- removing
+        # a node from mind is not use.  An id in both sets is incoming.
+        incoming_ids = list(dict.fromkeys(loaded))
+        incoming_set = set(incoming_ids)
+        outgoing_ids = [n for n in dict.fromkeys(active_ids) if n not in incoming_set]
+        if outgoing_ids:
+            core._utility_reward(conn, outgoing_ids, action="unfocus")
+        if incoming_ids:
+            core._utility_reward(conn, incoming_ids, action="focus")
         conn.commit()
 
         return json.dumps({

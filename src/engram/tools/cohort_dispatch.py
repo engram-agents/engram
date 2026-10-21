@@ -54,7 +54,6 @@ import argparse
 import functools
 import json
 import os
-import sqlite3
 import sys
 import textwrap
 import traceback
@@ -72,14 +71,15 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools.recall_summary_validator import validate_summary_entry  # noqa: E402
 from tools.recall_summary_payload import PayloadBuilder  # noqa: E402
+from tools import _owner_read as owner_read  # noqa: E402
 # (recall_summary_prompts TYPE_GUIDANCE/KEYWORD_GUIDANCE no longer needed in
 # dispatch prompts — guidance now lives exclusively in the fairy's agent spec)
 
 # ---------------------------------------------------------------------------
-# Default ENGRAM DB path (overridable via --db)
+# The store path has ONE definition: the shared owner-read helper's ENGRAM_HOME
+# resolution (U14, #3862). `--db` overrides it; there is no module-level default
+# to go stale, because the home is resolved when the parser is built.
 # ---------------------------------------------------------------------------
-
-DEFAULT_DB = Path.home() / ".engram" / "knowledge.db"
 
 # ---------------------------------------------------------------------------
 # Node fields fetched from SQLite (read-only)
@@ -89,10 +89,43 @@ DEFAULT_DB = Path.home() / ".engram" / "knowledge.db"
 # nodes (an existing over-limit summary flagged for review), not just
 # summary-absent stragglers — the fairy needs to SEE the existing summary to
 # tighten it rather than regenerate blind. See _build_payload_entry below.
-_NODE_COLUMNS = (
-    "id, type, claim, quoted_text, interpretation, recall_summary, "
-    "predicted_event, resolution_timeframe"
+# ONE column tuple builds both the SELECT list and the positional-to-dict mapping: the owner returns
+# rows as positional lists, so the two must never disagree (U14, #3862).
+_NODE_FIELDS = (
+    "id", "type", "claim", "quoted_text", "interpretation", "recall_summary",
+    "predicted_event", "resolution_timeframe",
 )
+_NODE_COLUMNS = ", ".join(_NODE_FIELDS)
+
+# The one statement `_fetch_nodes` sends: the registry's admitted variable-list form (R7), the id list as
+# ONE json parameter. Registered under the site `tools/cohort_dispatch.py:_fetch_nodes`; the text is pinned
+# byte for byte in tests/test_cohort_owner_read_3862.py. No per-id placeholder, so no 999-variable ceiling.
+# A plain literal (the read-template scanner resolves literals, not f-strings); the import-time check below
+# is what keeps its SELECT list and `_NODE_FIELDS` from ever disagreeing.
+_FETCH_NODES_SQL = (
+    "SELECT id, type, claim, quoted_text, interpretation, recall_summary, predicted_event, "
+    "resolution_timeframe FROM nodes WHERE id IN (SELECT value FROM json_each(?))"
+)
+if _FETCH_NODES_SQL != f"SELECT {_NODE_COLUMNS} FROM nodes WHERE id IN (SELECT value FROM json_each(?))":
+    raise RuntimeError("cohort_dispatch: _FETCH_NODES_SQL and _NODE_FIELDS disagree")
+
+# --- owner read (#3862) ------------------------------------------------------
+OWNER_FLAG_KEY = "cohort_dispatch_reads_via_owner"
+
+
+class CohortOwnerReadError(RuntimeError):
+    """The owner could not give the cohort's rows (flag ON). Raised instead of returning an empty or short
+    list: `_fetch_nodes` skips missing ids silently, so an empty answer would read downstream as "these
+    nodes do not exist" and the cohort would shrink without an error (the #3045 silent-drop class)."""
+
+
+def _owner_spec() -> "owner_read.OwnerReadSpec":
+    return owner_read.OwnerReadSpec(
+        flag_key=OWNER_FLAG_KEY,
+        error_cls=CohortOwnerReadError,
+        home=owner_read.engram_home(),
+        never_empty="Not answering from an empty list: that would read as 'these nodes do not exist'.",
+    )
 
 
 class ForeignOwnedFileError(RuntimeError):
@@ -130,29 +163,67 @@ def _check_file_owner(path: Path) -> None:
             f"this process is uid {my_uid}. This looks like a shared-/tmp "
             f"scratch-filename collision with another agent (see #2075) -- "
             f"the file may contain another agent's data, not yours. "
-            f"Use a per-agent path under $HOME/.engram/tmp/ instead of a "
+            f"Use a per-agent path under $ENGRAM_HOME/tmp/ (default $HOME/.engram/tmp/) instead of a "
             f"shared, predictable /tmp path."
         )
 
 
-def _fetch_nodes(db_path: Path, node_ids: list[str]) -> list[dict]:
-    """Read node content from ENGRAM SQLite. Read-only; no MCP access."""
-    if not db_path.exists():
-        raise FileNotFoundError(f"ENGRAM database not found: {db_path}")
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
+def _check_owner_rows(spec: "owner_read.OwnerReadSpec", rows: list, node_ids: list[str]) -> None:
+    """The owner's rows are positional lists whose cells the client has checked only as scalars; this query's
+    schema is checked HERE, because `dict(zip(...))` would silently truncate a short row and a row of nulls
+    would read as "no such node". A row is: exactly len(_NODE_FIELDS) cells, a string id that was asked for,
+    a string type, and every other cell a string or null. Anything else raises: a malformed answer is an
+    error, never a manufactured missing-node result."""
+    wanted = set(node_ids)
+    for row in rows:
+        ok = (
+            isinstance(row, (list, tuple))
+            and len(row) == len(_NODE_FIELDS)
+            and isinstance(row[0], str) and row[0] in wanted
+            and isinstance(row[1], str)
+            and all(c is None or isinstance(c, str) for c in row[2:])
+        )
+        if not ok:
+            raise CohortOwnerReadError(
+                "the engramd owner answered a row that does not match the node schema "
+                f"({len(_NODE_FIELDS)} text cells, an id that was asked for); retry once the owner is "
+                f"healthy, or set engramd.{spec.flag_key} to false to read the store directly. {spec.never_empty}"
+            )
+
+
+def _owner_applies(db_path: Path) -> bool:
+    """True iff the owner flag is ON and `db_path` is THIS home's store."""
+    return owner_read.flag_applies(_owner_spec(), db_path)
+
+
+def _fetch_nodes(db_path: Path, node_ids: list[str], use_owner: bool | None = None) -> list[dict]:
+    """Read node content from ENGRAM SQLite. Read-only (the direct path opens mode=ro).
+
+    Behind engramd.cohort_dispatch_reads_via_owner (default OFF) the read goes to the engramd owner when
+    `db_path` is this home's store. Flag ON and the owner down, refusing or answering malformed RAISES
+    CohortOwnerReadError: never `[]`, never a partial list, never a direct fallback.
+
+    `use_owner`: None (default) reads the flag here, once. A caller that has already decided (verify-in
+    needs the answer for its own db_path.exists() precondition) passes that decision so the flag is read
+    ONCE per run (#3871); then this function does not read it. The caller already decided, via
+    `owner_read.flag_applies` (which also applies the this-home's-store rule): never pass a value computed
+    any other way."""
+    spec = _owner_spec()
+    if use_owner is None:
+        use_owner = owner_read.flag_applies(spec, db_path)
+    if use_owner:
+        owner_read.ping(spec)  # the owner's answer replaces the db_path.exists() precondition
+    # Flag OFF: `open_reader` runs `check_store_path` first (#3960); nothing happens in between.
+    conn = owner_read.open_reader(spec, db_path, use_owner)
     try:
-        placeholders = ",".join("?" * len(node_ids))
-        rows = conn.execute(
-            f"SELECT {_NODE_COLUMNS} FROM nodes WHERE id IN ({placeholders})",
-            node_ids,
-        ).fetchall()
+        rows = conn.execute(_FETCH_NODES_SQL, (json.dumps(node_ids),)).fetchall()
     finally:
         conn.close()
-    by_id = {r["id"]: dict(r) for r in rows}
+    if use_owner:
+        _check_owner_rows(spec, rows, node_ids)
+    by_id = {r[0]: dict(zip(_NODE_FIELDS, r)) for r in rows}
     # Return in the same order as input IDs; skip silently if not found
     return [by_id[nid] for nid in node_ids if nid in by_id]
-
 
 
 # Safely-degrading type map for claim fallback (#1966): some node types store
@@ -403,7 +474,12 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         return 1
 
     db_path = Path(args.db)
-    nodes = _fetch_nodes(db_path, node_ids)
+    try:
+        nodes = _fetch_nodes(db_path, node_ids)
+    except (FileNotFoundError, owner_read.StoreUnusable) as exc:
+        # No traceback (#3960). 1 is prepare's error code here (no artifact is written before this point).
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     if not nodes:
         print(f"error: none of the requested nodes found in {db_path}", file=sys.stderr)
@@ -632,24 +708,38 @@ def cmd_verify_in(args: argparse.Namespace) -> int:
                 seen_in_chunk.add(nid)
 
     # Check 3: content integrity — every id resolves to a DB row with matching claim
-    if all_ids_seen and not db_path.exists():
-        print(
-            f"warning: DB path {db_path} not found — content-integrity check skipped",
-            file=sys.stderr,
-        )
-    if all_ids_seen and db_path.exists():
+    # With the owner flag ON the owner's answer replaces the db_path.exists() precondition.
+    owner_serves = bool(all_ids_seen) and _owner_applies(db_path)
+    store_present = owner_serves
+    if all_ids_seen and not owner_serves:
+        try:
+            # Kept here: the not-found skip warning and the db_access error are decided on this one result.
+            owner_read.check_store_path(db_path)
+            store_present = True
+        except FileNotFoundError:
+            print(
+                f"warning: DB path {db_path} not found — content-integrity check skipped",
+                file=sys.stderr,
+            )
+        except owner_read.StoreUnusable as exc:
+            # #3960: an uncheckable store must NEVER silently skip the integrity check: record the one db_access
+            # failure here and skip the read (`store_present` stays False; no answer, so no per-node verdicts).
+            errors.append({"chunk": "all", "check": "db_access", "error": str(exc)})
+    if all_ids_seen and store_present:
         id_list = list(all_ids_seen.keys())
         try:
-            db_nodes = _fetch_nodes(db_path, id_list)
-        except FileNotFoundError as exc:
+            db_nodes = _fetch_nodes(db_path, id_list, use_owner=owner_serves)
+        except (FileNotFoundError, CohortOwnerReadError, owner_read.StoreUnusable) as exc:
+            # ONE named failure. An owner that could not answer must not become "every id is absent":
+            # the per-node "not found in DB" checks below only run on a real answer.
             errors.append({
                 "chunk": "all",
                 "check": "db_access",
                 "error": str(exc),
             })
-            db_nodes = []
+            db_nodes = None
 
-        db_by_id = {n["id"]: n for n in db_nodes}
+        db_by_id = {n["id"]: n for n in (db_nodes or [])}
 
         # Build payload claim lookup: node_id -> (chunk, claim)
         payload_claims: dict[str, tuple[str, str]] = {}
@@ -669,7 +759,8 @@ def cmd_verify_in(args: argparse.Namespace) -> int:
                 if isinstance(entry, dict) and "id" in entry and "claim" in entry:
                     payload_claims[entry["id"]] = (chunk_label, entry.get("claim", ""))
 
-        for node_id, (chunk_label, payload_claim) in payload_claims.items():
+        # db_nodes is None only when the read itself failed (named above): no answer, so no per-node verdicts.
+        for node_id, (chunk_label, payload_claim) in (payload_claims.items() if db_nodes is not None else ()):
             if node_id not in db_by_id:
                 # Row genuinely absent from the fetch. After the #1966 fix
                 # above (id-registration decoupled from required-fields),
@@ -1505,7 +1596,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--chunk-size", type=int, default=15, help="Max nodes per chunk (default 15)"
     )
     p_prepare.add_argument(
-        "--db", default=str(DEFAULT_DB), help="Path to ENGRAM SQLite database"
+        "--db", default=str(owner_read.default_db_path()),
+        help="Path to ENGRAM SQLite database (default: $ENGRAM_HOME/knowledge.db)",
     )
     p_prepare.add_argument(
         "--expect-total",
@@ -1528,7 +1620,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out", required=True, help="Directory containing manifest.json + chunk-N/payload.json"
     )
     p_verify.add_argument(
-        "--db", default=str(DEFAULT_DB), help="Path to ENGRAM SQLite database"
+        "--db", default=str(owner_read.default_db_path()),
+        help="Path to ENGRAM SQLite database (default: $ENGRAM_HOME/knowledge.db)",
     )
 
     # --- validate ---
@@ -1565,7 +1658,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.command == "prepare":
         try:
             return cmd_prepare(args)
-        except ForeignOwnedFileError as exc:
+        except (ForeignOwnedFileError, CohortOwnerReadError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
     elif args.command == "verify-in":

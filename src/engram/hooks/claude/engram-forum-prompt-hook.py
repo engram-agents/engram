@@ -24,12 +24,12 @@ Two-cursor state for threads (surfaced cursor is still hook-owned):
   - forum-read-cursor.txt: vestigial — no longer consumed by this hook for
     mention queries. The `cursor` subcommand stays for manual override/back-compat.
 
-Cache: 30s file-based cache at ~/.engram/forum-hook-cache.json to avoid
+Cache: 30s file-based cache at ~/.engram/forum-hook-cache.json (under $ENGRAM_HOME) to avoid
 hammering the server on rapid successive prompts. Cache stores both threads and
 inbox mentions together. Stale-cache fallback on server-unreachable (never break
 the hook chain if the forum is down).
 
-Publish state: separate ~/.engram/forum-status-publish.json tracks last-published
+Publish state: separate ~/.engram/forum-status-publish.json (under $ENGRAM_HOME) tracks last-published
 status with its own throttle interval (never shares the 30s-TTL cache).
 
 comms_surface gate (alpha#2019 slice A): config.json["comms_surface"] ("umwelt"
@@ -40,17 +40,34 @@ umwelt plugin's own hooks already surface world state) EXCEPT a single
 compact 📪 advisory line when pending ADDRESSED items (mentions) exist --
 the anti-black-hole clause: a world-preferring seat must never silently miss
 an addressed forum item pre-bridge (umwelt#599 slice 4 will bridge these).
-The guarantee is bounded by cache availability: a first-contact outage with
-no prior cache is still silent, matching the existing forum-mode outage
-contract above -- the advisory's absence is not proof of an empty inbox
-during an outage. Broadcast-only counts (new threads, no mention) are fully
-suppressed under "umwelt".
+An outage (or an unreadable inbox) is NOT silent under "umwelt" either: the
+unknown line below is injected, so the advisory's absence is evidence of an
+empty inbox only when no `⚠️ forum ...` line accompanies it. Broadcast-only
+counts (new threads, no mention) are fully suppressed under "umwelt".
+
+Unknown state (#3521 row 5; Kepler's ruling, 2026-10-06): "never block" means
+this hook never blocks the prompt -- not that it may say "nothing new" when it
+could not look. Each fetch is tri-state (ok / unknown / for the inbox also
+`unsupported` = HTTP 404, an old server, healthy by design) and an unknown
+state renders ONE bounded (<= 200 char) line carrying the reason CLASS only
+(never a raw exception message; that goes to one sanitized stderr line):
+  - forum unreachable, no cache  -> `⚠️ forum unreachable (<class>) ...`
+  - forum unreachable, stale cache -> the stale output PLUS the same line,
+    worded `showing cached counts`.
+  - threads ok but inbox unreadable -> `⚠️ forum inbox unreadable (<class>) ...`;
+    the cache stores `"mentions": null` (NOT `[]`) so the next prompt inside
+    the TTL retries the inbox once (threads and cursor untouched).
+Rate limit (deliberately unlike the baton hook, which prints its banner on
+every prompt): this hook fires on every prompt for the whole length of an
+outage, so each line (keys `forum-threads`, `forum-inbox`) is shown at most
+once per 1800 s via the shared stamp (_hooklib.probe_notice_due /
+mark_probe_notice); it reappears after the window while the condition lasts.
 
 Silent no-op conditions:
-  - forum.url and agent_name not configured.
-  - Server unreachable (uses cached data if available, else silent skip).
-  - No new threads since last prompt and no pending @mentions.
-  - Inbox endpoint absent / error -> no mention line; generic behavior unchanged.
+  - forum.url not configured (agent_name alone does not count).
+  - No new threads since last prompt and no pending @mentions (and no unknown
+    state to report inside its rate-limit window).
+  - Inbox endpoint absent (HTTP 404) -> known-empty, no line.
   - Status publish failure (forum-status-publish.json) -> silently swallowed;
     existing output unaffected.
   - comms_surface=umwelt with no pending addressed items -> fully silent
@@ -76,10 +93,19 @@ from typing import Optional
 # Paths
 # ---------------------------------------------------------------------------
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or str(Path.home() / ".engram")
-)
+_HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOKS_DIR not in sys.path:
+    sys.path.insert(0, _HOOKS_DIR)
+# This hook's ONLY unconditional _hooklib import is emit_context (tests/test_forum_hook_unknown_state_3521.py
+# pins that a _hooklib without the probe helpers still loads), so its home comes from the prompt-hook layer's
+# resolver in _prompthooklib (#3863, parity-pinned), through its own guarded import. When that lib is
+# missing, main() reports the failure and exits before any use of this value.
+try:
+    from _prompthooklib import engram_home_or_exit as _engram_home
+    _HOME_LIB_OK = True
+except Exception:
+    _HOME_LIB_OK = False
+ENGRAM_HOME = str(_engram_home()) if _HOME_LIB_OK else ""
 
 SURFACED_CURSOR_PATH = os.path.join(ENGRAM_HOME, "forum-surfaced-cursor.txt")
 # READ_CURSOR_PATH is no longer consumed by this hook for mention queries.
@@ -203,8 +229,8 @@ def _remaining_budget(deadline: float) -> float:
 # previously inlined here now lives in the shared _prompthooklib module
 # (same directory, same sys.path bootstrap used below). _PROMPTHOOKLIB_OK
 # gates main() -- if the shared module somehow fails to import, the hook
-# degrades to a silent no-op rather than crashing, same discipline as every
-# other best-effort import in this prologue.
+# reports the exception class (one stderr line, one injected context line;
+# #3521) and exits 0 rather than crashing.
 #
 # engram-alpha#2863 WS2: this hook's own response-dict construction at the
 # end of main() now routes through _assemble_response() below, which calls
@@ -231,16 +257,36 @@ if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 from _hooklib import emit_context
 from _harness import detect_harness, get_harness_budgets
+# #3521 row 5: shared advisory-probe `unknown` rendering (sanitize + stderr
+# line + the stamp-file rate limit). Imported separately from emit_context
+# above so a failure here degrades to a plain, unlimited, bounded line --
+# never to silence (see _unknown_line / _notice_due).
+try:
+    from _hooklib import (
+        sanitize_probe_text, split_probe_reason, write_probe_unknown_stderr,
+        probe_notice_due, mark_probe_notice,
+    )
+    _PROBE_LIB_OK = True
+except Exception:
+    _PROBE_LIB_OK = False
 try:
     from _prompthooklib import (
-        load_config as _load_config_impl,
+        load_config_checked as _load_config_checked_impl,
+        report_config_unknown as _report_config_unknown,
         get_agent_name as _get_agent_name_impl,
         get_comms_surface as _get_comms_surface_impl,
         bootstrap_tools_dir as _bootstrap_tools_dir,
+        # #3628: every cursor / cache / publish-state read and temp write is
+        # non-blocking and regular-file-only (the temp names are predictable:
+        # <dest>.tmp). Reached through _prompthooklib so a missing _hooklib
+        # helper degrades to OSError at the site, not to an import crash.
+        hooklib_io as _hooklib_io,
     )
     _PROMPTHOOKLIB_OK = True
-except Exception:
+except Exception as _lib_exc:
+    # #3521: remember the CLASS only (never the message); main() reports it.
     _PROMPTHOOKLIB_OK = False
+    _PROMPTHOOKLIB_IMPORT_ERROR = type(_lib_exc).__name__
 _tools_dir = _bootstrap_tools_dir("_status_derive.py") if _PROMPTHOOKLIB_OK else None
 try:
     from _status_derive import derive_own_status, _read_loop_mode
@@ -304,15 +350,25 @@ def _ipv4_only_connect(conn) -> None:
         socket.getaddrinfo = real_getaddrinfo
 
 
-def _fetch_with_deadline(
+def _fetch_classified(
     url: str,
     deadline: float,
     per_op_cap: float,
     method: str = "GET",
     headers: Optional[dict] = None,
     body: Optional[bytes] = None,
-) -> Optional[bytes]:
-    """GET/POST `url`, bounded by a SHARED end-to-end deadline (gh#3107), not
+) -> tuple:
+    """The fetch core: returns `(body, None)` on a 2xx within budget, or
+    `(None, "<class>: <message>")` on every failure (#3521 row 5). The class
+    is one of `deadline` (shared budget spent), `timeout` (a socket timed
+    out), `connect` (the connection could not be made), `http-<code>` (a
+    non-2xx status) or `error` (anything else after connecting); the message
+    is for the sanitized stderr line only and never reaches the injected line.
+
+    `_fetch_with_deadline` below is the bytes-or-None view of this function
+    that the publish POST and the pre-existing tests use unchanged.
+
+    GET/POST `url`, bounded by a SHARED end-to-end deadline (gh#3107), not
     a flat per-call timeout. See HOOK_TOTAL_BUDGET_SECONDS's own comment
     above for the measured reason a flat timeout= does not bound a request
     against a server that keeps trickling data.
@@ -335,18 +391,21 @@ def _fetch_with_deadline(
     error, non-2xx status, or budget exhaustion mid-read -- matching the
     existing bare-except-return-None contract every caller here already
     relies on (a stalled/failed fetch is indistinguishable from any other
-    failure to fall back to cache).
+    failure to fall back to cache) -- except that the failure now carries its
+    reason class for the callers that render an `unknown` state.
     """
     remaining = _remaining_budget(deadline)
     if remaining <= 0:
-        return None
+        return None, "deadline: shared budget already spent"
     parsed = urllib.parse.urlsplit(url)
     conn_cls = (
         http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
     )
     conn = conn_cls(parsed.hostname, parsed.port, timeout=min(per_op_cap, remaining))
+    stage = "connect"
     try:
         _ipv4_only_connect(conn)
+        stage = "error"
         path = parsed.path or "/"
         if parsed.query:
             path += "?" + parsed.query
@@ -368,12 +427,12 @@ def _fetch_with_deadline(
         sock = conn.sock
         resp = conn.getresponse()
         if resp.status < 200 or resp.status >= 300:
-            return None
+            return None, f"http-{resp.status}: HTTP {resp.status}"
         out = bytearray()
         while True:
             remaining = _remaining_budget(deadline)
             if remaining <= 0:
-                return None
+                return None, "deadline: shared budget spent mid-read"
             # The captured `sock` re-arms the timeout for as long as the
             # underlying fd is genuinely still open -- including mid-stall
             # on a `Connection: close` response, where the server hasn't
@@ -412,16 +471,42 @@ def _fetch_with_deadline(
             if not chunk:
                 break
             out.extend(chunk)
-        return bytes(out)
-    except Exception:
-        return None
+        return bytes(out), None
+    except Exception as exc:
+        cls = "timeout" if isinstance(exc, (TimeoutError, socket.timeout)) else stage
+        return None, f"{cls}: {type(exc).__name__}: {exc}"
     finally:
         conn.close()
 
 
+def _fetch_with_deadline(
+    url: str,
+    deadline: float,
+    per_op_cap: float,
+    method: str = "GET",
+    headers: Optional[dict] = None,
+    body: Optional[bytes] = None,
+) -> Optional[bytes]:
+    """Bytes on a 2xx within budget, None on any failure -- the original
+    contract (see _fetch_classified for the reason-carrying core)."""
+    return _fetch_classified(url, deadline, per_op_cap, method, headers, body)[0]
+
+
+# #3521 row 6: why the last _load_config() could not read config.json, or None
+# when it could (or the file is simply absent). main() reads this right after
+# _load_config() so an unreadable file is reported as UNKNOWN instead of being
+# treated as "not configured". Kept as module state, not a changed return
+# type, so _load_config() keeps its zero-arg dict contract for every existing
+# caller and test monkeypatch.
+_config_unknown_reason: Optional[str] = None
+
+
 def _load_config() -> dict:
-    """Load $ENGRAM_HOME/config.json. Returns {} on any failure."""
-    return _load_config_impl(ENGRAM_HOME)
+    """Load $ENGRAM_HOME/config.json. Returns {} on any failure (and records
+    the reason in _config_unknown_reason when the file is present but unusable)."""
+    global _config_unknown_reason
+    cfg, _config_unknown_reason = _load_config_checked_impl(ENGRAM_HOME)
+    return cfg or {}
 
 
 def _get_agent_name(config: dict) -> str:
@@ -452,15 +537,21 @@ def _get_forum_url(config: dict) -> str:
 
 
 def _is_forum_configured(config: dict) -> bool:
-    """Return True if forum is explicitly configured (url or agent_name set).
+    """Return True if a forum is configured: ``forum.url`` is a non-empty string.
 
-    Silent no-op gate: if neither forum.url nor agent_name is in config, skip
-    the hook to avoid noise on non-forum installs.
+    Silent no-op gate: no ``forum.url`` -> skip the hook, so an install with no
+    forum server never reports one as unreachable. ``agent_name`` alone is this
+    agent's identity, not forum configuration, and does not pass the gate;
+    neither does the ``FORUM_URL`` env var by itself. Total: any other shape
+    (non-dict ``forum``, non-string or blank ``url``) is "not configured".
     """
-    forum_cfg = config.get("forum", {})
-    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
-    has_agent = bool(config.get("agent_name", "").strip())
-    return has_url or has_agent
+    if not isinstance(config, dict):
+        return False
+    forum_cfg = config.get("forum")
+    if not isinstance(forum_cfg, dict):
+        return False
+    url = forum_cfg.get("url")
+    return isinstance(url, str) and bool(url.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +561,7 @@ def _is_forum_configured(config: dict) -> bool:
 def _read_cursor(path: str) -> Optional[datetime]:
     """Read a cursor file; return UTC datetime or None if absent/invalid."""
     try:
-        raw = Path(path).read_text().strip()
+        raw = _hooklib_io().read_regular_text(path).strip()
     except (OSError, ValueError):
         return None
     if not raw:
@@ -488,7 +579,8 @@ def _write_cursor(path: str, ts: datetime) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     try:
-        tmp.write_text(ts_str + "\n")
+        with _hooklib_io().open_regular_text_write(tmp) as f:
+            f.write(ts_str + "\n")
         os.replace(tmp, dest)
     except OSError:
         try:
@@ -504,7 +596,7 @@ def _write_cursor(path: str, ts: datetime) -> None:
 def _load_cache() -> Optional[dict]:
     """Load the hook cache. Returns None if absent, expired, or invalid."""
     try:
-        raw = Path(HOOK_CACHE_PATH).read_text()
+        raw = _hooklib_io().read_regular_text(HOOK_CACHE_PATH)
         data = json.loads(raw)
         age = time.time() - data.get("fetched_at", 0)
         if age > CACHE_TTL_SECONDS:
@@ -514,14 +606,28 @@ def _load_cache() -> Optional[dict]:
         return None
 
 
-def _save_cache(threads: list, mentions: list) -> None:
-    """Save fetched threads and mentions to the hook cache."""
+def _save_cache(threads: list, mentions: Optional[list],
+                fetched_at: Optional[float] = None) -> None:
+    """Save fetched threads and mentions to the hook cache.
+
+    `mentions=None` is written as JSON `null`: the marker for "the inbox could
+    not be read" (#3521 row 5). It is NOT the same as `[]` ("read, none
+    waiting"); a reader must retry the inbox rather than serve it. A cache
+    written by older code has the key absent or a list, and keeps its old
+    meaning. `fetched_at` lets a mentions-only refresh keep the original
+    threads fetch time, so it never extends the TTL.
+    """
     dest = Path(HOOK_CACHE_PATH)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     try:
-        payload = {"fetched_at": time.time(), "threads": threads, "mentions": mentions}
-        tmp.write_text(json.dumps(payload))
+        payload = {
+            "fetched_at": time.time() if fetched_at is None else fetched_at,
+            "threads": threads,
+            "mentions": mentions,
+        }
+        with _hooklib_io().open_regular_text_write(tmp) as f:
+            f.write(json.dumps(payload))
         os.replace(tmp, dest)
     except OSError:
         try:
@@ -537,7 +643,7 @@ def _save_cache(threads: list, mentions: list) -> None:
 def _load_publish_state() -> Optional[dict]:
     """Load the last-published status state. Returns None if absent/invalid."""
     try:
-        return json.loads(Path(STATUS_PUBLISH_PATH).read_text())
+        return json.loads(_hooklib_io().read_regular_text(STATUS_PUBLISH_PATH))
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -557,7 +663,8 @@ def _save_publish_state(state: str, activity: Optional[str],
             "cadence": cadence,
             "published_at": published_at,
         }
-        tmp.write_text(json.dumps(payload))
+        with _hooklib_io().open_regular_text_write(tmp) as f:
+            f.write(json.dumps(payload))
         os.replace(tmp, dest)
     except OSError:
         try:
@@ -665,10 +772,12 @@ def _apply_sleep_guard(
 
 def _fetch_threads(
     forum_url: str, since: Optional[str], agent_name: str, deadline: float
-) -> Optional[list]:
+) -> tuple:
     """GET /api/threads?since=<cursor>&agent=<name>.
 
-    Returns thread list on success, None on any error (caller uses cache).
+    Returns `(threads, None)` on success (a list, possibly empty) and
+    `(None, "<class>: <message>")` on any error -- the state is UNKNOWN, and
+    the caller falls back to the cache AND says so (#3521 row 5).
     Timeout: min(FETCH_TIMEOUT_SECONDS, remaining budget under `deadline`) --
     see HOOK_TOTAL_BUDGET_SECONDS's module-header comment for the budget math
     (gh#3107).
@@ -685,28 +794,35 @@ def _fetch_threads(
     else:
         url = f"{forum_url}/api/threads"
 
-    body = _fetch_with_deadline(
+    body, reason = _fetch_classified(
         url, deadline, FETCH_TIMEOUT_SECONDS, headers={"Accept": "application/json"}
     )
     if body is None:
-        return None
+        return None, reason
     try:
         data = json.loads(body.decode("utf-8"))
-        return data.get("threads", [])
-    except Exception:
-        return None
+        threads = data.get("threads", [])
+        if not isinstance(threads, list):
+            raise TypeError("threads is not a list")
+        return threads, None
+    except Exception as exc:
+        return None, f"unparsable: {type(exc).__name__}: {exc}"
 
 
-def _fetch_inbox(forum_url: str, agent_name: str, deadline: float) -> Optional[list]:
+def _fetch_inbox(forum_url: str, agent_name: str, deadline: float) -> tuple:
     """GET /api/agent/<name>/inbox — returns at_mention items only.
 
     The inbox endpoint uses server-side per-thread read marks so "reading the
     thread clears the mention" — no local cursor needed.
 
-    Returns a list of inbox items filtered to kind=at_mention on success,
-    None on any error (advisory; never breaks the hook chain). Swallows ALL
-    errors including 404 (old server without the inbox endpoint) — same
-    bare-except discipline as _fetch_threads. Timeout: min(FETCH_TIMEOUT_SECONDS,
+    Returns `(value, reason)` (#3521 row 5), three states:
+      * `(items, None)`          -- read OK; items filtered to kind=at_mention
+                                    (possibly empty).
+      * `([], "unsupported")`    -- HTTP 404: an old server without the inbox
+                                    endpoint. Known-empty by design: no line,
+                                    cached as `[]`.
+      * `(None, "<class>: <msg>")` -- UNKNOWN: anything else (never raises).
+    Timeout: min(FETCH_TIMEOUT_SECONDS,
     remaining budget under `deadline`) — see HOOK_TOTAL_BUDGET_SECONDS's
     module-header comment (gh#3107). URL-quotes the agent name for safety.
 
@@ -716,19 +832,21 @@ def _fetch_inbox(forum_url: str, agent_name: str, deadline: float) -> Optional[l
     quoted_name = urllib.parse.quote(agent_name, safe="")
     url = f"{forum_url}/api/agent/{quoted_name}/inbox"
 
-    body = _fetch_with_deadline(
+    body, reason = _fetch_classified(
         url, deadline, FETCH_TIMEOUT_SECONDS, headers={"Accept": "application/json"}
     )
     if body is None:
-        return None
+        if reason is not None and reason.startswith("http-404"):
+            return [], "unsupported"
+        return None, reason
     try:
         data = json.loads(body.decode("utf-8"))
         inbox = data.get("inbox", [])
         # Filter to at_mention only — reply_on_my_thread items are out of scope
         # for the banner (they are a different notification class).
-        return [item for item in inbox if item.get("kind") == "at_mention"]
-    except Exception:
-        return None
+        return [item for item in inbox if item.get("kind") == "at_mention"], None
+    except Exception as exc:
+        return None, f"unparsable: {type(exc).__name__}: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +943,105 @@ def _format_umwelt_advisory_line(mentions: list) -> Optional[str]:
     )
 
 
+# ---------------------------------------------------------------------------
+# Unknown-state rendering (#3521 row 5)
+# ---------------------------------------------------------------------------
+
+_HOOK_NAME = "engram-forum-prompt-hook"
+_UNKNOWN_LINE_MAX = 200
+_NOTICE_KEY_THREADS = "forum-threads"
+_NOTICE_KEY_INBOX = "forum-inbox"
+
+
+def _plain_clean(text, limit: int) -> str:
+    """Fallback for sanitize_probe_text when _hooklib's helpers are missing:
+    each control character -> one space, then cut. Never raises."""
+    try:
+        return "".join(
+            " " if (ord(c) < 32 or 127 <= ord(c) <= 159) else c for c in str(text)
+        )[:limit]
+    except Exception:
+        return "<unprintable>"[:limit]
+
+
+def _reason_class(reason) -> str:
+    """The reason CLASS only (`connect`, `http-500`, ...), sanitized and <= 40
+    chars -- the raw message never reaches the injected line. Never raises."""
+    try:
+        if _PROBE_LIB_OK:
+            cls, _msg = split_probe_reason(reason)
+            return sanitize_probe_text(cls, 40).strip() or "unknown"
+        return _plain_clean(str(reason).partition(":")[0].strip(), 40) or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _unknown_line(probe: str, reason, cached: bool = False) -> str:
+    """The ONE injected line for an unknown state, <= 200 chars. Never raises."""
+    cls = _reason_class(reason)
+    if probe == "inbox":
+        line = f"⚠️ forum inbox unreadable ({cls}) — @mentions may be waiting"
+    elif cached:
+        line = (
+            f"⚠️ forum unreachable ({cls}) — showing cached counts;"
+            " new posts and @mentions may be missing"
+        )
+    else:
+        line = (
+            f"⚠️ forum unreachable ({cls}) — new posts and @mentions"
+            " cannot be read; recheck when it is back"
+        )
+    return line[:_UNKNOWN_LINE_MAX]
+
+
+def _unknown_notice(probe: str, key: str, reason, cached: bool = False) -> tuple:
+    """Report an unknown state: ALWAYS one sanitized stderr line; returns
+    `(line, key)` when the injected line is due (not shown within the last
+    window), else `(None, None)`. If the shared helpers are unavailable the
+    line is simply always due (a plain, bounded one-liner, never silence).
+    Never raises."""
+    try:
+        if _PROBE_LIB_OK:
+            write_probe_unknown_stderr(_HOOK_NAME, f"forum-{probe}", reason)
+            due = probe_notice_due(ENGRAM_HOME, key)
+        else:
+            sys.stderr.write(
+                f"{_HOOK_NAME}: forum-{probe} unknown: {_plain_clean(reason, 250)}"[:300] + "\n"
+            )
+            due = True
+    except Exception:
+        due = True
+    if not due:
+        return None, None
+    try:
+        return _unknown_line(probe, reason, cached), key
+    except Exception:
+        return "⚠️ forum state unknown", key
+
+
+def _mark_notices(keys: list) -> None:
+    """Start a new rate-limit window for each key. Call ONLY after the
+    response carrying the lines was printed and flushed. Never raises."""
+    if not _PROBE_LIB_OK:
+        return
+    for key in keys:
+        try:
+            mark_probe_notice(ENGRAM_HOME, key)
+        except Exception:
+            pass
+
+
+def _cached_mentions(data: dict) -> Optional[list]:
+    """The mentions out of a cache payload: a list, or None = UNKNOWN (the
+    `"mentions": null` marker, or any non-list). A cache written by older
+    code has the key ABSENT (-> []) or a list (-> as is): both keep their old
+    meaning."""
+    if "mentions" not in data:
+        return []
+    value = data["mentions"]
+    return value if isinstance(value, list) else None
+
+
 def _assemble_response(head_blocks: list, body_blocks: list) -> dict:
     """Build the UserPromptSubmit response dict from this prompt's fired
     head/body blocks, routed through the shared bounded renderer
@@ -916,19 +1133,78 @@ def _assemble_response(head_blocks: list, body_blocks: list) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
+def _report_prompthooklib_import_failed() -> None:
+    """#3521: a failed `_prompthooklib` import is VISIBLE, not a silent no-op.
+
+    One class-only stderr line plus one class-only injected context line, on
+    every run (deliberately no rate limit: a broken install is rare and
+    severe). The lib -- and its `emit_context` -- is the thing that failed, so
+    the envelope is built here with `json` alone. Each emission is separately
+    guarded: this function never raises, and if a write fails the hook falls
+    back to the silent exit 0 it had before.
+    """
+    try:
+        cls = "".join(
+            ch if ch.isprintable() else "?" for ch in _PROMPTHOOKLIB_IMPORT_ERROR
+        )[:80]
+        line = f"{_HOOK_NAME}: _prompthooklib import failed: {cls}"
+    except Exception:
+        return
+    try:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": line,
+        }}))
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def main() -> None:
     # ── Prologue-lib gate (gh#1680 slice 1) ───────────────────────────────────
     # If _prompthooklib somehow failed to import, _load_config/_get_agent_name
-    # are unavailable -- degrade to a silent no-op, matching every other
-    # best-effort import in this hook's prologue.
+    # are unavailable. Report the failure (class-only stderr line + injected
+    # context line, #3521) and exit 0 without doing any other work. When run
+    # as a script the exit is os._exit(0), not sys.exit(0): the reporter
+    # swallows a failed write on a closed pipe, which leaves data buffered,
+    # and the interpreter's shutdown flush would then fail and turn the exit
+    # code into 120. When the module is loaded in-process (as the tests do),
+    # it raises SystemExit(0) instead, because os._exit would end the host
+    # process.
     if not _PROMPTHOOKLIB_OK:
+        _report_prompthooklib_import_failed()
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        # Only a hook run as a script may skip shutdown: an in-process caller
+        # (such as a test) must get a catchable SystemExit, never a killed process.
+        if __name__ == "__main__":
+            os._exit(0)
         sys.exit(0)
 
     # ── Config ────────────────────────────────────────────────────────────────
     config = _load_config()
+    if _config_unknown_reason is not None:
+        # #3521 row 6: a config.json that is there but unusable is UNKNOWN,
+        # never "forum not configured". One stderr line + one rate-limited
+        # injected line, then exit: nothing below can run without a config.
+        _report_config_unknown(
+            _HOOK_NAME, "config:forum-prompt-hook", ENGRAM_HOME,
+            _config_unknown_reason,
+            lambda text: print(json.dumps(_assemble_response([text], []))),
+            "forum check skipped",
+        )
+        sys.exit(0)
 
     # ── Silent no-op gate ────────────────────────────────────────────────────
-    # If forum isn't configured (neither url nor agent_name in config), skip.
+    # If forum isn't configured (no forum.url in config), skip: no output, no
+    # file, no connection.
     if not _is_forum_configured(config):
         sys.exit(0)
 
@@ -952,7 +1228,10 @@ def main() -> None:
     # per-call timeout alone does not bound a trickling connection.
     _hook_deadline = time.monotonic() + HOOK_TOTAL_BUDGET_SECONDS
     threads: Optional[list] = None
-    mentions: Optional[list] = None
+    mentions: Optional[list] = None  # None = unknown (see _cached_mentions)
+    threads_unknown = None   # reason string when the live threads fetch failed
+    inbox_unknown = None     # reason string when the inbox could not be read
+    cache_served = False     # True when a stale cache stood in for the forum
 
     cached = _load_cache()
     if cached is not None:
@@ -963,19 +1242,37 @@ def main() -> None:
         # the next live fetch's since=cursor would exclude them and they'd
         # never surface. (Twin of the unreachable-no-cache guard below.)
         threads = cached.get("threads", [])
-        # Backward-compat: old cache files have no "mentions" key → default [].
-        mentions = cached.get("mentions", [])
+        # Backward-compat: old cache files have no "mentions" key → [].
+        # `"mentions": null` is the #3521 marker for "the inbox failed".
+        mentions = _cached_mentions(cached)
+        if mentions is None:
+            if agent_name:
+                # ONE live inbox retry, inside the shared deadline. Threads are
+                # NOT refetched and the cursor is NOT touched: the cached
+                # threads are still the answer for this window.
+                mentions, retry_reason = _fetch_inbox(forum_url, agent_name, _hook_deadline)
+                if mentions is not None:
+                    # Write the resolved mentions back, keeping the ORIGINAL
+                    # fetched_at so this never extends the TTL.
+                    _save_cache(threads, mentions, fetched_at=cached.get("fetched_at"))
+                else:
+                    inbox_unknown = retry_reason
+            else:
+                mentions = []
     else:
         # Live fetch with since=current surfaced cursor.
-        threads = _fetch_threads(forum_url, since_str, agent_name, _hook_deadline)
+        threads, threads_reason = _fetch_threads(forum_url, since_str, agent_name, _hook_deadline)
         if threads is not None:
-            # Also fetch inbox mentions (advisory; failure → None, not a blocker).
-            # Filtered to kind=at_mention inside _fetch_inbox.
+            # Also fetch inbox mentions (advisory; failure → unknown, not a
+            # blocker). Filtered to kind=at_mention inside _fetch_inbox.
             if agent_name:
-                mentions = _fetch_inbox(forum_url, agent_name, _hook_deadline)
+                mentions, inbox_reason = _fetch_inbox(forum_url, agent_name, _hook_deadline)
+                if mentions is None:
+                    inbox_unknown = inbox_reason
             else:
-                mentions = None
-            _save_cache(threads, mentions if mentions is not None else [])
+                mentions = []
+            # mentions=None is persisted as null (unknown), never as [].
+            _save_cache(threads, mentions)
             # Only here did we query the server with the current cursor, so
             # only here is it safe to advance: everything up to `now` is now
             # covered by a real since=cursor query.
@@ -984,12 +1281,15 @@ def main() -> None:
         else:
             # Server unreachable — stale-cache fallback (any age); do NOT
             # advance, so the next reachable query re-checks the same window.
+            # The fallback is no longer silent: see unknown_blocks below.
+            threads_unknown = threads_reason
             try:
-                raw = Path(HOOK_CACHE_PATH).read_text()
+                raw = _hooklib_io().read_regular_text(HOOK_CACHE_PATH)
                 stale = json.loads(raw)
                 threads = stale.get("threads", [])
-                mentions = stale.get("mentions", [])
-            except (OSError, json.JSONDecodeError):
+                mentions = _cached_mentions(stale)
+                cache_served = True
+            except (OSError, ValueError, AttributeError):
                 threads = None
                 mentions = None
 
@@ -1074,16 +1374,35 @@ def main() -> None:
     # the single actionable/addressed-item fact for this prompt (an
     # @mention, or its umwelt-mode equivalent); body_blocks carries the
     # lower-priority broadcast-only new-threads count, forum mode only.
+    #
+    # #3521 row 5: an UNKNOWN state (forum unreachable / inbox unreadable) is
+    # reported by one bounded line per window and lands in head_blocks AFTER
+    # the actionable mention line; it counts as "something to report" for the
+    # silent-exit checks below, in both modes.
+    unknown_blocks: list = []
+    notice_keys: list = []
+    if threads_unknown is not None:
+        line, key = _unknown_notice(
+            "threads", _NOTICE_KEY_THREADS, threads_unknown, cached=cache_served)
+        if line:
+            unknown_blocks.append(line)
+            notice_keys.append(key)
+    if inbox_unknown is not None:
+        line, key = _unknown_notice("inbox", _NOTICE_KEY_INBOX, inbox_unknown)
+        if line:
+            unknown_blocks.append(line)
+            notice_keys.append(key)
+
     head_blocks: list = []
     body_blocks: list = []
     if comms_surface == "umwelt":
         advisory_line = _format_umwelt_advisory_line(mentions or [])
-        if advisory_line is None:
+        if advisory_line is None and not unknown_blocks:
             sys.exit(0)
-        head_blocks = [advisory_line]
+        head_blocks = ([advisory_line] if advisory_line else []) + unknown_blocks
     else:
         # ── Exit silently if nothing to report ──────────────────────────────
-        if not threads and not mention_line:
+        if not threads and not mention_line and not unknown_blocks:
             sys.exit(0)
 
         # ── Count new threads since the surfaced cursor ─────────────────────
@@ -1092,6 +1411,7 @@ def main() -> None:
         # 🔔 mention line first (if any) -- head: the actionable fact.
         if mention_line:
             head_blocks.append(mention_line)
+        head_blocks.extend(unknown_blocks)
 
         # 📢 generic threads line (if any) -- body: broadcast-only, lower priority.
         if new_count > 0:
@@ -1113,6 +1433,14 @@ def main() -> None:
         sys.exit(0)
 
     print(json.dumps(response))
+    if notice_keys:
+        # Stamp ONLY after the response was printed and flushed: a print that
+        # failed must not start a rate-limit window for a line nobody saw.
+        try:
+            sys.stdout.flush()
+            _mark_notices(notice_keys)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

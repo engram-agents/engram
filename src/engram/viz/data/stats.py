@@ -43,6 +43,7 @@ import sqlite3
 from pathlib import Path
 
 from .. import agents as viz_agents
+from .sqlite_ro import connect_ro
 
 try:
     from engram_log_indexer import Indexer as _Indexer  # noqa: E402
@@ -169,7 +170,7 @@ def get_stats_data(index_db_path: str) -> dict:
         #    open per request" -- per-request lifetime is what makes
         #    immutable=1 correct here, and pooling this connection later
         #    would break it invisibly.
-        conn = sqlite3.connect(f"file:{index_db_path}?mode=ro&immutable=1", uri=True)
+        conn = connect_ro(index_db_path, immutable=True)
         conn.row_factory = sqlite3.Row
     except sqlite3.Error as exc:
         return {"empty": True, "reason": f"Could not open index.db: {exc}"}

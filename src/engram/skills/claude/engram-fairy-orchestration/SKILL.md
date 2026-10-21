@@ -44,7 +44,7 @@ Fairies are contractors, not colleagues. The spec is the contract. A fairy has n
 - **Suggest branch name.** Spec should name the branch. Anticipate collisions — if your suggested name might exist remote, note that the fairy can use a `-v2` fallback.
 - **Output contract.** Reference the fairy's `# Output contract` section. Demand verification (test results, syntax check, `git diff --stat` scope check) + ambiguous-decision log. Without verification claims, the report can't be trusted.
 - **Post-creation handoff** (AFTER `gh pr create` returns the PR number — the **dispatching agent** runs this, not the fairy; fairies don't have shared-projects access). Open a baton for the PR — this is the channel by which the counterpart and the user see your PR is in flight; skipping it means the auto-pull hook can't surface the work.
-    - `baton init PR-N --title "<short>" --participants <list> --turn <next-actor> --status in-progress --github pr/N`
+    - `baton init PR-N --title "<short>" --participants <list> --turn <next-actor> --status in-progress --repo <owner>/<repo>`
     - See the `engram-baton` skill (§"PR layer — `flip`") for the full PR-cursor lifecycle.
     - Single-agent mode: the baton is still useful as a per-PR cursor through fairy → maintainer, but the multi-agent coord surface is absent.
 
@@ -68,7 +68,7 @@ Identify the single critical-path piece. Spec it carefully — its quality casca
 
 ### Spec-vs-implementation separability
 
-Spec-writing is text. It has no conflict surface. Draft ALL specs upfront (even ones whose dependencies aren't ready yet) so they're queued for dispatch the moment deps clear. Save specs to `~/.engram/cohort-specs-<date>/` for durability across compaction.
+Spec-writing is text. It has no conflict surface. Draft ALL specs upfront (even ones whose dependencies aren't ready yet) so they're queued for dispatch the moment deps clear. Save specs to `~/.engram/cohort-specs-<date>/` (under `$ENGRAM_HOME`, default `~/.engram`) for durability across compaction.
 
 The failure mode this prevents: holding specs because their *implementation* would conflict with a running fairy. That conflates two different surfaces. Specs are text; only implementation has conflict.
 
