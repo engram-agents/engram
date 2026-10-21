@@ -144,6 +144,92 @@ def _sys_path_collision_guard():
     yield
 
 
+# #4023 -- modules that left `sys.path[0]` inside src/engram. NON-FAILING in this
+# PR (29 other modules do it today; they are tracked separately): the leaks are
+# collected here and printed as ONE line at session end by
+# `pytest_terminal_summary`. WHAT THE LIST COVERS: only leaks made AFTER a
+# module's setup (the module-scope fixture below compares against `sys.path` at
+# that point). It does NOT attribute (a) a module that leaks at IMPORT time
+# (during collection, before any module fixture runs: the entry is already in
+# front when the fixture snapshots, so nothing differs), nor (b) a module that
+# re-inserts an entry another module already left in front. The list is a lower
+# bound on polluters, not an inventory (import-time detection: #4029).
+# Single-process only: this repo does not use xdist (not in pytest.ini or any
+# CI config); under xdist each worker would hold its own set and the controller
+# would print nothing.
+_PATH_LEAKS: set = set()
+
+
+def _path_leak_problem(path_before):
+    """`sys.path[0]` now inside `src/engram` and different from what it was at
+    the module's setup, else None. A leak made before setup (import time) or a
+    re-insert of the entry already in front is NOT reported."""
+    front = sys.path[0] if sys.path else None
+    before = path_before[0] if path_before else None
+    if (front is not None and front != before
+            and os.path.abspath(front).startswith(SRC_ENGRAM)):
+        return f"sys.path[0] now points inside src/engram ({front!r}); it was {before!r}"
+    return None
+
+
+def _tools_problem(module_name, tools_before):
+    """The HARD half: the cached `tools` evicted or replaced (identity, not
+    equality) relative to module setup -- only when one was cached then."""
+    if tools_before is None or sys.modules.get("tools") is tools_before:
+        return None
+    now = sys.modules.get("tools")
+    what = ("evicted from sys.modules" if now is None
+            else f"replaced (now {getattr(now, '__file__', None)!r})")
+    return (
+        f"test module {module_name!r} leaked process state (#4023): the cached "
+        f"`tools` package was {what}. The #2565 guard trusts a cached `tools` "
+        "and scans sys.path only when none is cached, so an eviction lets a "
+        "leaked sys.path entry resolve `tools` to src/engram/tools and fails "
+        "an unrelated later module. Restore sys.modules in this module (a "
+        "module-scope fixture that snapshots and restores)."
+    )
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _polluter_side_state_check(request):
+    """#4023: name a polluter at its OWN module. Records `sys.path` and the
+    cached `tools` at module setup. At teardown: a `tools` eviction/replacement
+    is a hard error naming the module (a teardown error on its last test,
+    attributable per module) -- `tools` / `tools.*` is restored EXACTLY to its
+    setup state FIRST (entries added since are dropped, captured ones put back), so the error names the polluter without
+    cascading into later modules. A `sys.path[0]` leak into src/engram made
+    after setup is recorded for the session-end summary line and does not fail
+    (see the coverage limits above `_PATH_LEAKS`). The #2565 guard above fires
+    at the VICTIM, which can be far from the polluter."""
+    path_before = list(sys.path)
+    tools_before = sys.modules.get("tools")
+    tools_snapshot = {k: v for k, v in sys.modules.items()
+                      if k == "tools" or k.startswith("tools.")}
+    yield
+    if _path_leak_problem(path_before) is not None:
+        _PATH_LEAKS.add(request.module.__name__)
+    message = _tools_problem(request.module.__name__, tools_before)
+    if message is not None:
+        # Restore EXACTLY, THEN raise: drop every tools / tools.* key added
+        # after setup (a stale copy from the polluted window must not survive
+        # for a later `import tools.X`), then put the setup entries back.
+        for key in [k for k in sys.modules
+                    if (k == "tools" or k.startswith("tools.")) and k not in tools_snapshot]:
+            del sys.modules[key]
+        sys.modules.update(tools_snapshot)
+        raise RuntimeError(message)
+
+
+def pytest_terminal_summary(terminalreporter) -> None:
+    """One line, only when N > 0, names sorted. Covers post-setup leaks only
+    (see `_PATH_LEAKS`). Printed by the terminal reporter, so `-p no:terminal`
+    prints nothing."""
+    if _PATH_LEAKS:
+        terminalreporter.write_line(
+            f"#4023 sys.path[0] leaks: {len(_PATH_LEAKS)} module(s): "
+            + ", ".join(sorted(_PATH_LEAKS)))
+
+
 def pytest_collectstart(collector) -> None:
     """Runs BEFORE a module is imported/collected -- catches a collision
     left over from an earlier file's own top-level sys.path mistake

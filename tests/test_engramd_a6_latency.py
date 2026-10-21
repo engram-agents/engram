@@ -35,6 +35,28 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TOOL_PATH = REPO_ROOT / "tools" / "engramd_a6_latency.py"
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _restore_sys_path_and_tools():
+    """#4023: the stop-measurement cells run the stop hook in-process, and the
+    hook's module-level `sys.path.insert(0, ...)` calls (right in a hook's own
+    short-lived process) stay in this shared one -- silent until another test
+    evicts the cached `tools` and the #2565 guard falls back to scanning
+    `sys.path`. Put `sys.path` back when the module ends, and drop any `tools` /
+    `tools.*` the module cached. Module scope, not per test: the module-scoped
+    `smoke` / `tripwire_runs` fixtures run the hook too, and a function-scoped
+    snapshot would be taken only AFTER them (same recipe as #2923 in
+    test_engramd_stage_profile_3678.py)."""
+    saved_path = list(sys.path)
+    saved_tools = {k: v for k, v in sys.modules.items()
+                   if k == "tools" or k.startswith("tools.")}
+    yield
+    sys.path[:] = saved_path
+    for key in list(sys.modules):
+        if (key == "tools" or key.startswith("tools.")) and key not in saved_tools:
+            del sys.modules[key]
+    sys.modules.update(saved_tools)
+
+
 @pytest.fixture(scope="module")
 def tool():
     spec = importlib.util.spec_from_file_location("engramd_a6_latency", TOOL_PATH)

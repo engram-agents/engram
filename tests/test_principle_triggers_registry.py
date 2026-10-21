@@ -41,11 +41,26 @@ import types
 import unittest.mock as mock
 from pathlib import Path
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_principle_triggers_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _restore_sys_path():
+    """#4023: tests here load the surface hook in-process, whose module-level
+    `sys.path.insert(0, ...)` calls leave `src/engram/hooks/claude` (and
+    friends) ahead of the repo root in this shared process -- right in a hook's
+    own process, a leak here, silent until another test evicts the cached
+    `tools`. Put `sys.path` back when the module ends (a plain restore; module
+    scope because a function-scoped snapshot would miss module-scoped users)."""
+    saved = list(sys.path)
+    yield
+    sys.path[:] = saved
 
 
 def fresh_server():
@@ -1215,6 +1230,14 @@ def _fresh_core_with_data_dir(tmp_path, monkeypatch):
             del sys.modules[key]
     src_engram = str(PROJECT_ROOT / "src" / "engram")
     _prior_sys_path = list(sys.path)
+    # #4023: snapshot the cached `tools` package so the finally can put it
+    # back. What was cached DURING the polluted window must not survive, but
+    # the repo-root `tools` this process already had must (the #2565 guard
+    # trusts that cache; evicting it silences the guard's cached-tools branch
+    # and lets a leaked sys.path entry resolve `tools` to src/engram/tools).
+    # Same recipe as #2923 in test_principle_trigger_state_writers_3521.py.
+    _tools_before = {k: v for k, v in sys.modules.items()
+                     if k == "tools" or k.startswith("tools.")}
     if src_engram in sys.path:
         sys.path.remove(src_engram)
     sys.path.insert(0, src_engram)
@@ -1227,8 +1250,9 @@ def _fresh_core_with_data_dir(tmp_path, monkeypatch):
     finally:
         sys.path[:] = _prior_sys_path
         for key in list(sys.modules):
-            if key == "tools" or key.startswith("tools."):
+            if (key == "tools" or key.startswith("tools.")) and key not in _tools_before:
                 del sys.modules[key]
+        sys.modules.update(_tools_before)
     monkeypatch.setattr(core, "DATA_DIR", str(tmp_path))
     return core
 
