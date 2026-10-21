@@ -2582,14 +2582,18 @@ def _resolve_impl(
             (resolving_node_id, target_id),
         ).fetchone()
         if existing_edge:
-            # Self-heal: if resolved_by is NULL (pre-#759 state or any prior
+            # Self-heal: if resolved_by is NULL or non-live (pre-#759 state or any prior
             # gap), compute and write it now. This makes re-calling engram_resolve
             # on an already-resolved contradiction idempotent AND corrective.
-            # Only run if NULL — skip recomputation when already set.
+            # Skipped when it already names a live resolver.
             current_resolved_by = conn.execute(
                 "SELECT resolved_by FROM nodes WHERE id = ?", (target_id,)
             ).fetchone()
-            if current_resolved_by and current_resolved_by["resolved_by"] is None:
+            # #3586: also re-point a resolved_by that names a NON-live node
+            # (superseded / retracted / non-current) while a live resolver
+            # exists. Pointer only; status is untouched, as before.
+            rb = current_resolved_by["resolved_by"] if current_resolved_by else None
+            if current_resolved_by and not core._is_live_node(conn, rb):
                 best = core._best_resolver_for(conn, target_id)
                 if best is not None:
                     conn.execute(
@@ -2998,6 +3002,29 @@ def _supersede_impl(
             (new_node_id, old_node_id),
         )
 
+        # #3586: the old node's `resolves` edges stay (audit trail: it did
+        # resolve the target while valid) but it is no longer a LIVE resolver,
+        # so recompute each target it resolved. The edge is NOT carried to the
+        # successor: whether the successor answers the target is a judgement
+        # (the response surfaces it below).
+        resolution_targets = []
+        _resolved_edges = conn.execute(
+            "SELECT DISTINCT target_id FROM edges "
+            "WHERE source_id = ? AND relation = 'resolves'",
+            (old_node_id,),
+        ).fetchall()
+        # Config is read only when there is something to recompute.
+        sup_threshold = (
+            core._config_io.read_config_json(core.CONFIG_PATH).get(
+                "resolution_confidence_threshold", core.DEFAULT_RESOLUTION_THRESHOLD)
+            if _resolved_edges else core.DEFAULT_RESOLUTION_THRESHOLD)
+        for _re in _resolved_edges:
+            _res = core._recompute_resolution_target(
+                conn, _re["target_id"], sup_threshold,
+                cause=f"supersede:{old_node_id}->{new_node_id}")
+            if _res["action"] != "unchanged":
+                resolution_targets.append(_res)
+
         # Person-supersede: migrate incoming `about` edges to the new node.
         # When superseding a person node, any observation (or other node)
         # linked about→old_node becomes stranded after old is marked non-current.
@@ -3260,6 +3287,16 @@ def _supersede_impl(
             "stale_contradictions": stale_contradictions,
             "stale_contradiction_count": len(stale_contradictions),
         }
+        if resolution_targets:
+            result["resolution_targets"] = resolution_targets
+            _tids = ", ".join(t["id"] for t in resolution_targets)
+            result["resolution_hint"] = (
+                f"Superseding {old_node_id} changed the resolution state of "
+                f"{_tids} (the old resolves edge is kept as audit trail; nothing "
+                f"was carried to {new_node_id}). Call engram_resolve with "
+                f"resolving_node_id={new_node_id} and target_id=<target> only "
+                f"if the successor answers it."
+            )
         # Surfaced, not merely done: the caller needs to see that this
         # supersede also CLEARED the old node's own pending markers, because
         # that is now the primary way an agent gets a hard-blocked node
@@ -3728,55 +3765,21 @@ def _retract_impl(
             "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'resolves'",
             (node_id,),
         ).fetchall()
+        # The retracted node is already is_current = 0 / status 'retracted' (the
+        # UPDATE above), so the helper's live-resolver filter excludes it
+        # exactly as the old inline `n.id != ?` did. One shared recompute
+        # (#3586): reopen when no live resolver remains, else re-point
+        # resolved_by (+ threshold status; categorical keeps its status).
         for re in resolution_edges:
             tid = re["target_id"]
-            # Check if there's another non-retracted resolution for this target.
-            # Also fetch confidence to find the strongest remaining resolver for
-            # the resolved_by column update (issue #762).
-            other_resolutions = conn.execute(
-                """SELECT e.source_id, n.confidence FROM edges e
-                   JOIN nodes n ON e.source_id = n.id
-                   WHERE e.target_id = ? AND e.relation = 'resolves'
-                   AND n.id != ? AND n.status != 'retracted' AND n.is_current = 1
-                   ORDER BY n.confidence DESC""",
-                (tid, node_id),
-            ).fetchall()
-            if not other_resolutions:
-                # No other valid resolution — reopen the target and clear resolved_by.
-                conn.execute(
-                    "UPDATE nodes SET status = 'open', resolved_by = NULL WHERE id = ?",
-                    (tid,),
-                )
-                target_node = conn.execute(
-                    "SELECT type, claim FROM nodes WHERE id = ?", (tid,)
-                ).fetchone()
+            res = core._recompute_resolution_target(
+                conn, tid, retract_threshold, cause=f"retract:{node_id}")
+            if res["action"] == "reopened":
                 reopened_targets.append({
                     "id": tid,
-                    "type": target_node["type"] if target_node else "unknown",
-                    "claim": target_node["claim"] if target_node else "",
+                    "type": res["type"],
+                    "claim": res["claim"],
                 })
-            else:
-                # Other resolvers remain — update resolved_by to the strongest one
-                # and recompute status vs threshold (issue #762 coherence fix).
-                # Predictions/conjectures use categorical outcome as status, so their
-                # status is not recomputed — only the resolved_by pointer is updated.
-                strongest = other_resolutions[0]
-                target_type_row = conn.execute(
-                    "SELECT type FROM nodes WHERE id = ?", (tid,)
-                ).fetchone()
-                target_type = target_type_row["type"] if target_type_row else ""
-                if target_type in ("prediction", "conjecture"):
-                    conn.execute(
-                        "UPDATE nodes SET resolved_by = ? WHERE id = ?",
-                        (strongest["source_id"], tid),
-                    )
-                else:
-                    max_remaining = strongest["confidence"] if strongest["confidence"] is not None else 0.0
-                    new_status = "resolved" if max_remaining >= retract_threshold else "partially_resolved"
-                    conn.execute(
-                        "UPDATE nodes SET resolved_by = ?, status = ? WHERE id = ?",
-                        (strongest["source_id"], new_status, tid),
-                    )
 
         # Audit trail: log each edge removal before the DELETE so the
         # deletions are visible via engram_history mode=edits.

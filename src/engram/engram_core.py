@@ -2865,6 +2865,24 @@ def _backfill_vec_nodes(conn: sqlite3.Connection) -> int:
     return inserted
 
 
+# ONE source for "this node is live" (#3586): current and not retracted. Every
+# resolution-state query (best resolver, reconciler, resolve self-heal) goes
+# through this template, formatted with the table alias, so the notion cannot
+# drift between them. tests/test_supersede_resolution_recompute_3586.py pins it.
+_LIVE_NODE_PREDICATE = "{a}.is_current = 1 AND {a}.status != 'retracted'"
+
+
+def _is_live_node(conn: sqlite3.Connection, node_id) -> bool:
+    """True iff node_id names a live node (see _LIVE_NODE_PREDICATE)."""
+    if node_id is None:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM nodes n WHERE n.id = ? AND "
+        + _LIVE_NODE_PREDICATE.format(a="n"),
+        (node_id,),
+    ).fetchone() is not None
+
+
 def _best_resolver_for(conn: sqlite3.Connection, target_id: str):
     """Return the argmax-confidence current, non-retracted resolver for target_id.
 
@@ -2881,7 +2899,7 @@ def _best_resolver_for(conn: sqlite3.Connection, target_id: str):
         """SELECT n.id, n.confidence FROM edges e
            JOIN nodes n ON e.source_id = n.id
            WHERE e.target_id = ? AND e.relation = 'resolves'
-           AND n.is_current = 1 AND n.status != 'retracted'
+           AND """ + _LIVE_NODE_PREDICATE.format(a="n") + """
            ORDER BY n.confidence DESC LIMIT 1""",
         (target_id,),
     ).fetchone()
@@ -2925,6 +2943,173 @@ def _backfill_resolved_by(conn: sqlite3.Connection) -> int:
     if updated:
         conn.commit()
     return updated
+
+
+# Types whose resolution status is a categorical outcome (supported / refuted /
+# confirmed ...), not a confidence projection. The recompute never rewrites
+# their status except to reopen them when no live resolver remains.
+_CATEGORICAL_RESOLUTION_TYPES = ("prediction", "conjecture")
+
+
+_SUCCESSOR_WALK_CAP = 50
+
+
+def _stale_resolver_successors(conn: sqlite3.Connection, target_id: str) -> list:
+    """For each NON-live resolver with a `resolves` edge into target_id, the
+    head of its superseded_by chain when that head is current (#3586).
+
+    Surfaced so a re-wire is one look instead of a hunt; never acted on (no
+    resolves edge is carried: whether the successor answers the target is a
+    judgement). Stops on a cycle, a dead end (no superseded_by) or after
+    _SUCCESSOR_WALK_CAP hops; those resolvers contribute nothing.
+    """
+    stale = conn.execute(
+        "SELECT DISTINCT e.source_id FROM edges e JOIN nodes n ON e.source_id = n.id "
+        "WHERE e.target_id = ? AND e.relation = 'resolves' AND NOT ("
+        + _LIVE_NODE_PREDICATE.format(a="n") + ") ORDER BY e.source_id",
+        (target_id,),
+    ).fetchall()
+    heads: list = []
+    for r in stale:
+        seen = {r["source_id"]}
+        cur = r["source_id"]
+        for _ in range(_SUCCESSOR_WALK_CAP):
+            row = conn.execute(
+                "SELECT superseded_by, is_current FROM nodes WHERE id = ?", (cur,)
+            ).fetchone()
+            if row is None:
+                break
+            if row["is_current"] and cur != r["source_id"]:
+                if cur not in heads:
+                    heads.append(cur)
+                break
+            nxt = row["superseded_by"]
+            if not nxt or nxt in seen:
+                break
+            seen.add(nxt)
+            cur = nxt
+    return heads
+
+
+def _recompute_resolution_target(conn: sqlite3.Connection, target_id: str,
+                                 threshold: float, cause: str = "") -> dict:
+    """Recompute ONE target's resolution state from its LIVE resolvers (#3586).
+
+    Single source of truth for "what is this target's resolution state right
+    now". A live resolver is the source of a ``resolves`` edge into the target
+    satisfying ``_LIVE_NODE_PREDICATE`` (``_best_resolver_for``).
+    Used by retract (step 1b), supersede, and the startup reconciler.
+
+      - no live resolver            -> status 'open', resolved_by NULL ("reopened")
+      - live resolvers, ordinary    -> resolved_by = argmax-confidence resolver;
+                                       status 'resolved' if its confidence (NULL
+                                       counts as 0.0) >= threshold, else
+                                       'partially_resolved' ("repointed")
+      - live resolvers, categorical -> only resolved_by moves; status untouched
+      - already consistent, or the target is not current -> writes nothing
+                                       ("unchanged")
+
+    Does NOT commit; the caller owns the transaction. Logs one
+    ``resolution_recomputed`` edit_history row (before/after status and
+    resolved_by, ``cause`` and ``stale_resolver_successors``) when it changes anything.
+    """
+    row = conn.execute(
+        "SELECT id, type, claim, status, resolved_by, is_current, recall_summary "
+        "FROM nodes WHERE id = ?",
+        (target_id,),
+    ).fetchone()
+    if row is None:
+        return {"id": target_id, "type": "unknown", "claim": "",
+                "action": "unchanged", "before_status": None,
+                "after_status": None, "before_resolved_by": None,
+                "after_resolved_by": None, "stale_resolver_successors": []}
+    before_status = row["status"]
+    before_rb = row["resolved_by"]
+    after_status, after_rb = before_status, before_rb
+    if row["is_current"]:
+        best = _best_resolver_for(conn, target_id)
+        if best is None:
+            after_status, after_rb = "open", None
+        else:
+            after_rb = best["id"]
+            if row["type"] not in _CATEGORICAL_RESOLUTION_TYPES:
+                conf = best["confidence"] if best["confidence"] is not None else 0.0
+                after_status = "resolved" if conf >= threshold else "partially_resolved"
+    successors: list = []
+    if (after_status, after_rb) == (before_status, before_rb):
+        action = "unchanged"
+    else:
+        successors = _stale_resolver_successors(conn, target_id)
+        action = "reopened" if (after_status == "open" and after_rb is None) else "repointed"
+        # #1777 (as _resolve_impl): a recall_summary written for the old
+        # status is now stale, so flag it for the batch-summary fairy. Only on
+        # a STATUS change; a pointer-only move leaves the summary valid.
+        # A target with no summary is left as it was (summary_missing tracks it).
+        if after_status != before_status and row["recall_summary"]:
+            conn.execute(
+                "UPDATE nodes SET status = ?, resolved_by = ?, needs_tightening = 1 "
+                "WHERE id = ?", (after_status, after_rb, target_id))
+        else:
+            conn.execute(
+                "UPDATE nodes SET status = ?, resolved_by = ? WHERE id = ?",
+                (after_status, after_rb, target_id))
+        _log_edit(conn, "resolution_recomputed", target_id, row["type"], {
+            "before_status": before_status, "after_status": after_status,
+            "before_resolved_by": before_rb, "after_resolved_by": after_rb,
+            "cause": cause,
+            "stale_resolver_successors": successors,
+        })
+    return {"id": target_id, "type": row["type"], "claim": row["claim"],
+            "action": action, "before_status": before_status,
+            "after_status": after_status, "before_resolved_by": before_rb,
+            "after_resolved_by": after_rb,
+            "stale_resolver_successors": successors}
+
+
+def _reconcile_resolution_targets(conn: sqlite3.Connection) -> list:
+    """Startup pass (#3586): recompute every current target whose resolution
+    state names no live resolver. Idempotent; returns the helper results that
+    changed something. Commits only if it changed something.
+
+    Candidates (current targets only):
+      (a) resolved_by is non-NULL and does not name a live node;
+      (b) status resolved / partially_resolved, a non-categorical resolvable
+          type, at least one `resolves` edge (from any node: a target that
+          never had one is a different defect, not #3586's) and no live
+          resolver (covers resolved_by NULL);
+      (c) categorical with a non-live resolved_by (subsumed by (a)).
+    """
+    live = ("SELECT 1 FROM edges e JOIN nodes n ON e.source_id = n.id "
+            "WHERE e.target_id = t.id AND e.relation = 'resolves' AND "
+            + _LIVE_NODE_PREDICATE.format(a="n"))
+    any_edge = ("SELECT 1 FROM edges e WHERE e.target_id = t.id "
+                "AND e.relation = 'resolves'")
+    live_pointer = ("SELECT 1 FROM nodes r WHERE r.id = t.resolved_by AND "
+                    + _LIVE_NODE_PREDICATE.format(a="r"))
+    rows = conn.execute(
+        f"""SELECT t.id FROM nodes t
+            WHERE t.is_current = 1 AND (
+              (t.resolved_by IS NOT NULL AND NOT EXISTS ({live_pointer}))
+              OR
+              (t.status IN ('resolved', 'partially_resolved')
+               AND t.type IN ('question', 'contradiction', 'goal_tension')
+               AND EXISTS ({any_edge}) AND NOT EXISTS ({live}))
+            )
+            ORDER BY t.id""",
+    ).fetchall()
+    if not rows:
+        return []
+    config = _config_io.read_config_json(CONFIG_PATH)
+    threshold = config.get("resolution_confidence_threshold", DEFAULT_RESOLUTION_THRESHOLD)
+    changed = []
+    for r in rows:
+        res = _recompute_resolution_target(
+            conn, r["id"], threshold, cause="startup_reconcile")
+        if res["action"] != "unchanged":
+            changed.append(res)
+    if changed:
+        conn.commit()
+    return changed
 
 
 def _load_vec_extension(conn: sqlite3.Connection) -> bool:
@@ -5328,6 +5513,15 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     # resolved before the resolved_by column was written. Idempotent — guarded
     # by the NULL check inside _backfill_resolved_by (skips immediately if 0 rows).
     _backfill_resolved_by(conn)
+
+    # #3586: bring resolution state back in line with LIVE resolvers (targets
+    # whose only resolver was superseded). Runs AFTER the NULL backfill above.
+    # One stderr line (never stdout: MCP stdio) when it changed anything.
+    _reconciled = _reconcile_resolution_targets(conn)
+    if _reconciled:
+        print(f"[engram] reconciled {len(_reconciled)} resolution target(s) "
+              f"left without a live resolver (see engram_history mode=edits, "
+              f"action resolution_recomputed)", file=sys.stderr)
 
     # Backfill focus_state singleton row if missing. active_set_name stays
     # NULL until the first engram_focus_load / engram_focus_save call.
