@@ -463,7 +463,7 @@ def test_persist_injected_through_mid_write_failure_leaves_original_intact(engra
     """The property atomicity actually buys: if the write is interrupted,
     the marker on disk is still the OLD one, not a torn/partial one.
 
-    Simulates interruption by making json.dump raise partway through
+    Simulates interruption by making json.dumps raise through
     _persist_injected_through's call into atomic_write_json. Asserts:
       1. _persist_injected_through itself does not raise (fail-soft, per its
          own docstring -- the outer except Exception: pass must still hold).
@@ -488,7 +488,7 @@ def test_persist_injected_through_mid_write_failure_leaves_original_intact(engra
     original_bytes = marker_path.read_bytes()
 
     mod = _load_hook_module(engram_home)
-    with patch("_hooklib.json.dump", side_effect=RuntimeError("simulated mid-write kill")):
+    with patch("_hooklib.json.dumps", side_effect=RuntimeError("simulated mid-write kill")):
         mod._persist_injected_through(str(engram_home), session_id, "2026-08-15T99:99:99Z")
         # must not raise -- if it does, the fail-soft contract is broken
 
