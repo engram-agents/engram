@@ -41,6 +41,7 @@ from urllib.parse import urlparse
 import engram_restamp as _restamp  # noqa: E402
 import engram_config_io as _config_io  # noqa: E402
 import engram_regular_io as _regular_io  # noqa: E402
+import engram_home_resolver as _home_resolver  # noqa: E402  (#3863 step 2)
 from engram_confidence import (  # noqa: E402
     CONFIDENCE_MAP,
     PREDICTIVE_CONFIDENCE_CAP,
@@ -479,7 +480,10 @@ _embedder = EmbeddingManager()
 DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 
-DATA_DIR = Path(os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram"))
+# #3863 step 2 (Borges's step-2 rulings on #3863, 2026-10-21): engram_core is a process entry point, so a
+# RELATIVE ENGRAM_HOME fails this import with a ValueError naming the value (the MCP server and every CLI that
+# imports it fail loudly). _configure_paths(data_dir) below is unchanged for explicit redirect callers.
+DATA_DIR = _home_resolver.engram_home()
 
 
 DB_PATH = DATA_DIR / "knowledge.db"
@@ -3251,7 +3255,7 @@ def _db_missing_message() -> str:
     DATA_DIR/knowledge.db. The plugin packaging has no installer-script step,
     so this is the user's signal that engram-first-session needs to bootstrap.
     """
-    engram_home_env = os.environ.get("ENGRAM_HOME", "<unset; default ~/.engram>")
+    engram_home_env = str(DATA_DIR)  # the resolved home (display only; no raw env read, #3863 step 2)
     return (
         f"ENGRAM cannot start: knowledge.db not found at {DB_PATH}\n\n"
         "This usually means one of:\n"

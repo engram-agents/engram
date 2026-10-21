@@ -69,6 +69,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import engram_home_resolver
 import engram_pidfile
 
 # ---------------------------------------------------------------------------
@@ -335,8 +336,9 @@ def _resolve_socket_path(socket_path: Path | None) -> Path:
     src/engram/hooks/claude/engram-lesson-tripwire-hook.py:77)."""
     if socket_path is not None:
         return socket_path
-    engram_home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
-    return socket_path_for_home(Path(engram_home))
+    # #3863 step 2: a process entry point, so a RELATIVE ENGRAM_HOME raises ValueError (Borges's step-2 rulings
+    # on #3863, 2026-10-21).
+    return socket_path_for_home(engram_home_resolver.engram_home())
 
 
 def socket_path_for_home(home: Path) -> Path:

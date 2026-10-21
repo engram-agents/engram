@@ -259,6 +259,7 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
+import engram_home_resolver
 import engram_pidfile
 import engram_moment_cursor as emc
 import engram_restamp as er
@@ -989,8 +990,10 @@ def _resolve_engram_home(engram_home: str | Path | None) -> Path:
     symlinks) bundled into this fix."""
     if engram_home is not None:
         return Path(os.path.abspath(str(engram_home)))
-    raw = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
-    return Path(os.path.abspath(raw))
+    # #3863 step 2 (Borges's step-2 rulings on #3863, 2026-10-21): the env branch REFUSES a relative value (a
+    # ValueError naming it) instead of anchoring it at the cwd: "one owner per seat" is met only by refusal,
+    # since abspath still gives two sockets for two launch cwds.
+    return engram_home_resolver.engram_home()
 
 
 def _rejected_wire(rejected: ec.Rejected) -> dict:

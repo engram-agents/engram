@@ -49,6 +49,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from engram_home_resolver import engram_home_or_none
+
 __all__ = [
     "write_telemetry_record",
     "open_store",
@@ -92,16 +94,17 @@ def _stderr(msg: str) -> None:
         pass
 
 
-def _data_dir() -> Path:
+def _data_dir() -> Optional[Path]:
     """Resolve DATA_DIR the same way engram_log_emitter.py does -- read
     ENGRAM_HOME directly rather than importing engram_core, so this store
     never depends on knowledge.db's own init/config path (design doc §3's
     #2652 exception)."""
-    return Path(os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram"))
+    return engram_home_or_none()
 
 
-def _telemetry_dir() -> Path:
-    return _data_dir() / "telemetry"
+def _telemetry_dir() -> Optional[Path]:
+    data_dir = _data_dir()
+    return None if data_dir is None else data_dir / "telemetry"
 
 
 def _new_disambiguator() -> str:
@@ -287,6 +290,11 @@ def write_telemetry_record(
     between them, and mechanism 2 correctly reports a larger total if
     further drops occur between two successful writes.
     """
+    # #3863 step 2 (Borges's step-2 rulings on #3863, 2026-10-21): this module is imported by hooks, so a
+    # refused (relative) ENGRAM_HOME DISABLES its writes: no file, no atexit hook, no drop count, never a
+    # raise. The resolver prints the one stderr line.
+    if _telemetry_dir() is None:
+        return False
     try:
         # _ensure_atexit_registered() belongs INSIDE this try (round-1
         # review, #2847): the function's whole contract is "never raises

@@ -5,8 +5,8 @@ Ruling: Borges's ruling on #3863, 2026-10-21.
 
 A relative ENGRAM_HOME resolves against the CALLING process's cwd, so a hook, the owner daemon and the
 MCP server would each land in a different home. The ONE resolution that refuses a relative value lives in
-five pinned files (PINNED_RESOLVERS: the tools, hooks, prompt-hooks and shared-bin layers, plus the build
-engine's flows.py), each AST-identical to tools/_owner_read.engram_home() (tests/test_engram_home_parity_3863.py).
+six pinned files (PINNED_RESOLVERS: the tools, hooks, prompt-hooks and shared-bin layers, the build
+engine's flows.py, and the runtime layer's src/engram/engram_home_resolver.py), each AST-identical to tools/_owner_read.engram_home() (tests/test_engram_home_parity_3863.py).
 Every OTHER module that reads the variable raw (the get, the subscript or getenv forms, see RAW_READ_RE)
 takes the value as given and can silently use a relative one. This gate stops the number of those sites
 growing.
@@ -20,7 +20,7 @@ assigned to (a write), `setdefault`, `pop`, `dict(os.environ, ENGRAM_HOME=...)`,
 A line that abspaths, expands or resolves the raw value is STILL a site: that is the silent version of the
 defect (it turns a relative value into a cwd-dependent absolute one), never an exemption.
 
-EXEMPT. The five PINNED_RESOLVERS files, as whole files. A pinned file is never in the baseline.
+EXEMPT. The six PINNED_RESOLVERS files, as whole files. A pinned file is never in the baseline.
 
 KNOWN BOUNDS (an instrument with edges, not a proof):
   * One physical line: a call split so the literal sits on another line is invisible.
@@ -76,7 +76,7 @@ from pathlib import Path
 BASELINE_REL = "tools/raw_home_read_baseline.json"
 SCAN_PREFIXES = ("src/", "tools/")
 _SCHEMA = 1
-# The five files that carry the ONE resolver body (four layers + the build engine's flows.py). They are
+# The six files that carry the ONE resolver body (four layers + the build engine's flows.py + the runtime layer). They are
 # exempt whole. Adding one is a deliberate act here and in tests/test_engram_home_parity_3863.py.
 PINNED_RESOLVERS = (
     "src/engram/tools/_owner_read.py",
@@ -84,6 +84,7 @@ PINNED_RESOLVERS = (
     "src/engram/hooks/claude/_prompthooklib.py",
     "src/engram/tools/forum_api.py",
     "src/build/engine/flows.py",
+    "src/engram/engram_home_resolver.py",  # #3863 step 2: the runtime layer (Borges's step-2 rulings on #3863)
 )
 _Q = r"""["']"""
 # environ.get( / getenv( with the literal as the first argument, or the subscript form unless it is only

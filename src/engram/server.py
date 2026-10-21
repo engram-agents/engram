@@ -8569,6 +8569,14 @@ def _embedding_startup_gate() -> None:
     ).start()
 
 
+def _mcp_ready_marker_path() -> str:
+    """The marker path under the resolved ENGRAM_HOME. Raises ValueError on a relative value (#3863 step 2;
+    the server process has already failed at the engram_core import, so this is the same rule, not a second
+    gate). `_write_mcp_ready_marker` swallows it: a relative value never becomes a file under the cwd."""
+    import engram_home_resolver
+    return os.path.join(str(engram_home_resolver.engram_home()), "mcp-tools-ready.json")
+
+
 def _write_mcp_ready_marker() -> None:
     """Write ~/.engram/mcp-tools-ready.json ($ENGRAM_HOME) before mcp.run().
 
@@ -8585,8 +8593,7 @@ def _write_mcp_ready_marker() -> None:
     try:
         import datetime
         # Canonical pattern: $ENGRAM_HOME > ~/.engram (matches engram_core.DATA_DIR).
-        engram_home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
-        marker_path = os.path.join(engram_home, "mcp-tools-ready.json")
+        marker_path = _mcp_ready_marker_path()
         data = {
             "pid": os.getpid(),
             "registered_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),

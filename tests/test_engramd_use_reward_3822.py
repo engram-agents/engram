@@ -1271,6 +1271,7 @@ def test_skew_an_older_owner_without_use_reward_answers_unknown_operation_typed(
 _FLAT_MODULES = [
     "engramd_owner.py", "engramd_client.py", "engramd_read_registry.py", "engram_pidfile.py", "engram_walguard.py",
     "engram_regular_io.py", "engram_restamp.py", "engram_config_io.py", "engram_moment_cursor.py",
+    "engram_home_resolver.py",  # #3863 step 2: engramd_client and engramd_owner import it
 ]
 
 

@@ -1194,28 +1194,24 @@ def cmd_scope_export(args):
 
     out_path = Path(args.out).expanduser().resolve()
 
-    # Locate the source DB (agent's personal graph, read-only).
-    source_home = Path(
-        os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
-    ).expanduser().resolve()
-    source_db = source_home / "knowledge.db"
+    # Locate the source DB (agent's personal graph, read-only). The ONE shared resolver: a RELATIVE
+    # $ENGRAM_HOME is refused (never anchored to the cwd), flag ON or OFF, before anything is read or created.
     owner_read = _load_owner_read()
     try:
         spec = _owner_spec()
-    except ValueError:
-        # engram_home() refuses a RELATIVE $ENGRAM_HOME. The owner path cannot apply to it, and flag OFF
-        # must stay today's path (which resolves a relative home): no spec, no sweep (no valid home).
-        spec = None
+    except ValueError as exc:
+        sys.exit(f"ERROR: scope-export: {exc}")
+    source_home = spec.home.resolve()
+    source_db = source_home / "knowledge.db"
 
-    if spec is not None:
-        # Before the flag branch: an orphan outlives a flag turned back OFF. Before any mkdtemp: the run's
-        # own temp dir can never be swept mid-run.
-        _sweep_stale_owner_tmpdirs(spec.home)
+    # Before the flag branch: an orphan outlives a flag turned back OFF. Before any mkdtemp: the run's
+    # own temp dir can never be swept mid-run.
+    _sweep_stale_owner_tmpdirs(spec.home)
 
     max_nodes = args.max_nodes if args.max_nodes is not None else _SCOPE_EXPORT_DEFAULT_MAX_NODES
     max_edges = args.max_edges if args.max_edges is not None else _SCOPE_EXPORT_DEFAULT_MAX_EDGES
 
-    use_owner = spec is not None and owner_read.flag_applies(spec, source_db)
+    use_owner = owner_read.flag_applies(spec, source_db)
     try:
         with contextlib.ExitStack() as stack:
             if use_owner:

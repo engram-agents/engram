@@ -276,11 +276,12 @@ def test_c_a_base_with_no_baseline_file_is_the_seed(tmp_path, gate):
 
 # -- (d) the pinned resolver files are exempt ----------------------------------------------------
 
-def test_d_the_pinned_resolvers_are_the_four_layers_plus_the_build_engine(gate):
+def test_d_the_pinned_resolvers_are_the_four_layers_plus_the_build_engine_plus_the_runtime_layer(gate):
     home = _load(HOME_GATE, "home_path_gate_for_pins")
     four = {layer["path"] for layer in home.RESOLVER_LAYERS}
     assert len(four) == 4
-    assert set(gate.PINNED_RESOLVERS) == four | {"src/build/engine/flows.py"}
+    # #3863 step 2 added the runtime layer (Borges's step-2 rulings on #3863, 2026-10-21)
+    assert set(gate.PINNED_RESOLVERS) == four | {"src/build/engine/flows.py", "src/engram/engram_home_resolver.py"}
 
 
 @pytest.mark.parametrize("rel", [
@@ -289,6 +290,7 @@ def test_d_the_pinned_resolvers_are_the_four_layers_plus_the_build_engine(gate):
     "src/engram/hooks/claude/_prompthooklib.py",
     "src/engram/tools/forum_api.py",
     "src/build/engine/flows.py",
+    "src/engram/engram_home_resolver.py",
 ])
 def test_d_a_pinned_resolver_file_is_exempt(tmp_path, gate, rel):
     root = _repo(tmp_path, gate, {rel: RAW + RAW}, baseline={})

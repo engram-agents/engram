@@ -858,35 +858,34 @@ def test_silent_peer_is_dropped_within_deadline_and_owner_stays_up(owner_running
 
 
 # ---------------------------------------------------------------------------
-# Test 17 -- _resolve_engram_home() returns an absolute path (#3152 item
-# 2). Two different launch CWDs with the SAME relative ENGRAM_HOME string
-# resolve to the identical absolute path.
+# Test 17 -- a RELATIVE ENGRAM_HOME is REFUSED (#3863 step 2; was: returns an
+# absolute path, #3152 item 2). Borges's step-2 rulings on #3863, 2026-10-21:
+# the owner's goal, one owner per seat, is met only by refusal -- abspath still
+# gives two sockets for two launch cwds, so cwd-anchoring is NOT an exception.
+# Two launchers with the SAME relative string both fail, naming the value, and
+# nothing is bound or created under either cwd.
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_engram_home_returns_absolute_path_across_cwds(tmp_path, monkeypatch):
-    # launcher-a and launcher-b are SIBLING directories under a shared
-    # parent, so the SAME relative string "../engramhome" reaches the
-    # SAME absolute target from either one -- this is the realistic case
-    # #3152 item 2 names: two launchers at the same depth relative to a
-    # shared seat home, each launched from a different CWD.
+def test_resolve_engram_home_refuses_a_relative_value_across_cwds(tmp_path, monkeypatch):
     launcher_a = tmp_path / "launcher-a"
     launcher_b = tmp_path / "launcher-b"
     launcher_a.mkdir()
     launcher_b.mkdir()
-    expected_target = Path(os.path.abspath(str(tmp_path / "engramhome")))
 
     monkeypatch.setenv("ENGRAM_HOME", "../engramhome")
 
-    monkeypatch.chdir(launcher_a)
-    resolved_a = eo._resolve_engram_home(None)
+    for launcher in (launcher_a, launcher_b):
+        monkeypatch.chdir(launcher)
+        with pytest.raises(ValueError) as e:
+            eo._resolve_engram_home(None)
+        assert "../engramhome" in str(e.value)
+        # the owner itself refuses at construction: no socket path is ever derived, so nothing can be bound
+        with pytest.raises(ValueError):
+            eo.EngramdOwner()
 
-    monkeypatch.chdir(launcher_b)
-    resolved_b = eo._resolve_engram_home(None)
-
-    assert resolved_a.is_absolute()
-    assert resolved_b.is_absolute()
-    assert resolved_a == resolved_b == expected_target
+    assert not (tmp_path / "engramhome").exists()
+    assert list(launcher_a.iterdir()) == [] and list(launcher_b.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------

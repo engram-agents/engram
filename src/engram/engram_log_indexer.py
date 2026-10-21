@@ -28,12 +28,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from engram_home_resolver import engram_home_or_none
+
 
 # Default logs directory — can be overridden by environment variable or
 # by passing logs_dir explicitly to run_once() / full_rebuild().
-def _default_logs_dir() -> Path:
-    engram_home = Path(os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram"))
-    return engram_home / "logs"
+def _default_logs_dir() -> Optional[Path]:
+    """None when ENGRAM_HOME is refused (relative): #3863 step 2 (Borges's step-2 rulings on #3863,
+    2026-10-21). The daemon process imports this module, so it never raises; run_once/full_rebuild then do
+    nothing."""
+    engram_home = engram_home_or_none()
+    return None if engram_home is None else engram_home / "logs"
 
 
 # DDL — must match DESIGN.md §6 exactly. Column order matches the spec table.
@@ -603,6 +608,9 @@ class Indexer:
         """
         if logs_dir is None:
             logs_dir = _default_logs_dir()
+            if logs_dir is None:  # refused home: nothing indexed, nothing written
+                return {"files_processed": 0, "files_skipped": 0, "rows_inserted": 0,
+                        "file_state_pruned": 0, "verdict_rows_written": 0}
         logs_dir = Path(logs_dir)
 
         sessions_dir = logs_dir / "sessions"
@@ -797,6 +805,8 @@ class Indexer:
         """
         if logs_dir is None:
             logs_dir = _default_logs_dir()
+            if logs_dir is None:  # refused home: nothing to drop or rebuild
+                return Indexer.run_once(logs_dir=None)
         logs_dir = Path(logs_dir)
 
         db_path = logs_dir / "index.db"

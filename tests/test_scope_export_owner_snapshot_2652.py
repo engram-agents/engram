@@ -48,6 +48,7 @@ import os
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -701,25 +702,48 @@ def test_s9_an_owner_serving_another_home_is_never_contacted(home, monkeypatch):
     assert (home / "out-b" / "knowledge.sql").read_bytes() == (home / "out-b-off" / "knowledge.sql").read_bytes()
 
 
-# ---- B1: a relative ENGRAM_HOME with the flag OFF is today's path, byte for byte -----------------------
+# ---- B1: a relative ENGRAM_HOME is refused, flag OFF and flag ON --------------------------------------
 
-def test_b1_a_relative_engram_home_takes_the_flag_off_path_with_dev_s_exact_message(home, monkeypatch):
-    """Dev resolves a relative ENGRAM_HOME and reports a missing store in the tool's own words. The owner path
-    refuses a relative home (ValueError); that must never surface when the flag cannot apply."""
+@pytest.mark.parametrize("mode", ["off", "on"])
+def test_b1_a_relative_engram_home_is_refused_flag_off_and_on(home, monkeypatch, mode):
+    """A relative ENGRAM_HOME is refused with the shared resolver's words, whatever the flag says: it is never
+    anchored to the cwd (even when a store sits at that cwd-relative path). Nothing is read, opened or created."""
     cwd = home / "cwd"
     cwd.mkdir()
     (cwd / "relhome").mkdir()
+    make_store(cwd / "relhome")  # a store a cwd-anchored resolution WOULD find: the refusal must not use it
+    set_flag(home, mode == "on")
     mod = load_tool(home, monkeypatch)
     monkeypatch.chdir(cwd)
     monkeypatch.setenv("ENGRAM_HOME", "relhome")
+    spy = Spy().install(monkeypatch)
+    out = home / "out"
     with SnapshotOwner(home) as owner:
-        rc, so, se, msg = scope_export(mod, home / "out")
+        rc, so, se, msg = scope_export(mod, out)
+    assert rc != 0
     assert owner.requests == [] and owner.snapshot_requests == []
-    assert rc == 1
-    assert msg == (f"ERROR: scope-export: source graph not found at {cwd.resolve()}/relhome/knowledge.db. "
-                   f"Set $ENGRAM_HOME to point at your ENGRAM data directory."), msg
+    assert msg == "ERROR: scope-export: ENGRAM_HOME must be an absolute path, got 'relhome'", msg
+    assert "\n" not in msg
     assert so == "" and se == ""
-    assert not (home / "out").exists()
+    assert not out.exists()
+    assert spy.connects == [] and [m for m in spy.mkdtemps if m[2] == TMP_PREFIX] == []
+    assert sorted(p.name for p in cwd.iterdir()) == ["relhome"]
+    assert tmpdirs(cwd / "relhome") == []
+
+
+def test_b1b_the_real_process_refuses_a_relative_engram_home_with_one_stderr_line(home):
+    """The same refusal through the real entry point: one `ERROR: scope-export:` stderr line, no traceback,
+    nothing on stdout, nothing created."""
+    cwd = home / "cwd"
+    cwd.mkdir()
+    out = home / "out"
+    env = {**os.environ, "ENGRAM_HOME": "relhome", "HOME": os.environ["HOME"]}
+    r = subprocess.run([sys.executable, str(TOOL_PATH), "scope-export", "--nodes", "a", "--out", str(out)],
+                       cwd=cwd, env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0
+    assert r.stdout == ""
+    assert r.stderr.splitlines() == ["ERROR: scope-export: ENGRAM_HOME must be an absolute path, got 'relhome'"], r.stderr
+    assert not out.exists() and list(cwd.iterdir()) == []
 
 
 # ---- S-b: an unwritable ENGRAM_HOME under the flag is a typed error ------------------------------------

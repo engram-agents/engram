@@ -763,6 +763,15 @@
       "note": "engram-alpha#3863 PR 3b: docstring/comment-only change; guard asserts the file names ENGRAM_HOME and holds no .engram string outside a docstring. Convention mapping (the test reads the file by path, so the layer-1 import graph cannot see it)."
     },
     {
+      "path_prefix_or_glob": "engram_home_resolver.py",
+      "test_globs": [
+        "tests/test_engram_home_parity_3863.py",
+        "tests/test_relative_engram_home_step2_3863.py",
+        "tests/test_raw_home_read_gate_3863.py"
+      ],
+      "note": "engram-alpha#3863 step 2: the runtime-layer ENGRAM_HOME resolver. Pinned AST-identical to the canonical body by the parity test (the LAYERS table loads it by path, so the layer-1 import graph cannot see that edge); the step-2 test is its behaviour; the gate test pins it as an exempt resolver."
+    },
+    {
       "path_prefix_or_glob": "engram_tasks.py",
       "test_globs": [
         "tests/test_shell_engram_home_3863.py"

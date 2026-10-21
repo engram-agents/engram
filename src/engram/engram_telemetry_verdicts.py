@@ -58,6 +58,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+import engram_home_resolver
 from engram_regular_io import check_store_path
 from engram_telemetry_store import open_store
 
@@ -719,7 +720,9 @@ def _default_data_dir() -> Path:
     ENGRAM_HOME directly, no engram_core import (this module stays outside
     the #2652 one-owner boundary telemetry is a stated exception to, same as
     its sibling store module)."""
-    return Path(os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram"))
+    # #3863 step 2: reached from the MCP server (engram_stats), so it is an entry point: a RELATIVE ENGRAM_HOME
+    # raises ValueError (Borges's step-2 rulings on #3863, 2026-10-21).
+    return engram_home_resolver.engram_home()
 
 
 def _default_db_path() -> Path:

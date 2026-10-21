@@ -36,6 +36,10 @@ LAYERS = {
     # #3863 6c: the build engine is its own self-contained layer (src/build/engine ships as tools/engine and
     # does not import from src/engram), so it carries one pinned copy, in flows.py (cli.py imports it from there).
     "build-engine": REPO / "src" / "build" / "engine" / "flows.py",
+    # #3863 step 2: the runtime layer (the flat modules engram_core, the owner/client, the server and the
+    # hook-imported emitter/store/indexer import) is one shared module, not a copy per module.
+    # Ruling: Borges's step-2 rulings on #3863, 2026-10-21.
+    "runtime": SRC / "engram_home_resolver.py",
 }
 
 
@@ -73,7 +77,7 @@ def _load(layer: str):
         # flows.py uses package-relative imports, so it cannot be exec'd by path; import it as the package
         # tests/conftest.py already aliases (tools.engine), the way the engine's own tests do.
         return importlib.import_module("tools.engine.flows")
-    name = f"_p3863_{layer.replace('-', '_')}"
+    name = f"_p3863_{layer.replace('-', '_')}"  # the runtime layer is a flat module with no sibling imports
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
@@ -165,6 +169,21 @@ def _refusal_resolver(layer):
     return run
 
 
+def _refusal_runtime_or_none(monkeypatch, tmp_path, capsys):
+    """The hook-imported modules' variant: engram_home_or_none() never raises, prints ONE stderr line
+    carrying the same refusal text, and returns None."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ENGRAM_HOME", raising=False)
+    mod = _load("runtime")
+    monkeypatch.setenv("ENGRAM_HOME", REFUSED_VALUE)
+    capsys.readouterr()
+    assert mod.engram_home_or_none() is None
+    assert mod.engram_home_or_none() is None
+    lines = [l for l in capsys.readouterr().err.splitlines() if l.strip()]
+    assert len(lines) == 1, lines
+    return "engram_home_resolver: ", lines[0].removesuffix("; writes disabled in this process")
+
+
 def _refusal_cli_ctx(monkeypatch, tmp_path, capsys):
     from tools.engine import cli
     monkeypatch.setenv("ENGRAM_HOME", REFUSED_VALUE)
@@ -209,6 +228,8 @@ REFUSING_ENTRY_POINTS = {
     "prompt-hooks._prompthooklib.engram_home": _refusal_resolver("prompt-hooks"),
     "shared-bin.forum_api.engram_home": _refusal_resolver("shared-bin"),
     "build-engine.flows.engram_home": _refusal_resolver("build-engine"),
+    "runtime.engram_home_resolver.engram_home": _refusal_resolver("runtime"),
+    "runtime.engram_home_resolver.engram_home_or_none (stderr line)": _refusal_runtime_or_none,
     "build-engine.cli._build_ctx_from_env": _refusal_cli_ctx,
     "build-engine.flows.upgrade_flow": _refusal_upgrade_flow,
     "build-engine.cli.main (stderr line)": _refusal_cli_main,
