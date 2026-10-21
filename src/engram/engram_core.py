@@ -9278,7 +9278,8 @@ def _strip_agent_facing(obj: object) -> object:
     return obj
 
 
-def _count_live_exemplars(conn: sqlite3.Connection, target_id: str, target_type: str) -> int:
+def _count_live_exemplars(conn: sqlite3.Connection, target_id: str, target_type: str,
+                          live_only: bool = True) -> int:
     """Count live exemplars supporting a cornerstone or lesson.
 
     Live = source/target node with is_current=1.
@@ -9291,14 +9292,21 @@ def _count_live_exemplars(conn: sqlite3.Connection, target_id: str, target_type:
         - Count outgoing `supported_by` edges where target.is_current=1
           (the pre-PR-#431 cornerstone exemplar wiring pattern, kept by
           Lei's 2026-05-28 design call: coexisting schemas, both counted).
+
+    ``live_only=False`` (#3782) counts the SAME edges without the currency
+    filter: how many support edges the node has EVER had (to a node that still
+    exists), so "support was lost" can be told from "never had any". One
+    function parametrized, not two, so the relation set cannot drift between
+    the live count and the ever count.
     """
+    currency = "AND n.is_current = 1" if live_only else ""
     exemplifies_live = conn.execute(
-        """SELECT COUNT(*) AS c
+        f"""SELECT COUNT(*) AS c
            FROM edges e
            JOIN nodes n ON n.id = e.source_id
            WHERE e.target_id = ?
              AND e.relation = 'exemplifies'
-             AND n.is_current = 1""",
+             {currency}""",
         (target_id,),
     ).fetchone()["c"]
 
@@ -9306,16 +9314,65 @@ def _count_live_exemplars(conn: sqlite3.Connection, target_id: str, target_type:
         return exemplifies_live
 
     supported_by_live = conn.execute(
-        """SELECT COUNT(*) AS c
+        f"""SELECT COUNT(*) AS c
            FROM edges e
            JOIN nodes n ON n.id = e.target_id
            WHERE e.source_id = ?
              AND e.relation = 'supported_by'
-             AND n.is_current = 1""",
+             {currency}""",
         (target_id,),
     ).fetchone()["c"]
 
     return exemplifies_live + supported_by_live
+
+
+def _apply_support_state(conn: sqlite3.Connection, node_id: str, node_type: str,
+                         metadata_raw, live_count: int, *, trigger: str, tool: str,
+                         warnings_out: "list | None" = None,
+                         flagged: "bool | None" = None,
+                         details_extra: "dict | None" = None) -> "str | None":
+    """The ONE rule that writes `metadata.support_lost` (#3782).
+
+    Given a current cornerstone/lesson's live-support count:
+      - live_count == 0 and not flagged -> mark: set the flag, log
+        'support_lost'; returns "marked".
+      - live_count > 0 and flagged -> clear the flag, log
+        'support_lost_cleared'; returns "cleared".
+      - otherwise nothing is written; returns None.
+
+    Whether a never-supported node should be marked is the CALLER's call (the
+    detector only runs on a node that had an edge; reflect checks the ever
+    count). The caller commits.
+
+    ``flagged`` defaults to the parsed metadata's `support_lost`; reflect
+    passes its SQL-text pre-filter verdict so a non-object blob that merely
+    CONTAINS the marker text is still discharged as before (#3413).
+    ``trigger`` lands in the edit row; ``details_extra`` adds keys to it.
+    ``warnings_out`` collects the #3413 replaced-blob warning text.
+    """
+    if flagged is None:
+        flagged = bool(_metadata_dict(metadata_raw).get("support_lost"))
+    details = dict(details_extra or {})
+    details["trigger"] = trigger
+    if live_count == 0 and not flagged:
+        meta, replaced = _metadata_dict_for_write(metadata_raw, node_id, tool)
+        if replaced and warnings_out is not None:
+            warnings_out.append(replaced)
+        meta["support_lost"] = True
+        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?",
+                     (json.dumps(meta), node_id))
+        _log_edit(conn, "support_lost", node_id, node_type, details)
+        return "marked"
+    if live_count > 0 and flagged:
+        meta, replaced = _metadata_dict_for_write(metadata_raw, node_id, tool)
+        if replaced and warnings_out is not None:
+            warnings_out.append(replaced)
+        meta.pop("support_lost", None)
+        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?",
+                     (json.dumps(meta), node_id))
+        _log_edit(conn, "support_lost_cleared", node_id, node_type, details)
+        return "cleared"
+    return None
 
 
 def _current_successor(conn, node_id: str) -> "str | None":

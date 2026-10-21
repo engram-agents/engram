@@ -1977,47 +1977,23 @@ def _detect_zero_support(
             continue  # Only count live cs/ls nodes
 
         total_live = core._count_live_exemplars(conn, cs_ls_id, cs_ls_node["type"])
-        meta = core._metadata_dict(cs_ls_node["metadata"])
-
-        if total_live == 0:
-            # Mark support_lost in metadata.
-            if not meta.get("support_lost"):
-                # #3413: a non-object blob reads as {} and is REPLACED by the
-                # dict written below; the write-side helper logs that.
-                meta, _replaced = core._metadata_dict_for_write(
-                    cs_ls_node["metadata"], cs_ls_id, tool)
-                if _replaced and warnings_out is not None:
-                    warnings_out.append(_replaced)
-                meta["support_lost"] = True
-                conn.execute(
-                    "UPDATE nodes SET metadata = ? WHERE id = ?",
-                    (json.dumps(meta), cs_ls_id),
-                )
-                core._log_edit(conn, "support_lost", cs_ls_id, cs_ls_node["type"],
-                          {"trigger": affected_node_id})
-                newly_support_lost.append({
-                    "id": cs_ls_id,
-                    "type": cs_ls_node["type"],
-                    "claim": cs_ls_node["claim"],
-                })
-        elif meta.get("support_lost"):
-            # #2252 Stage 1.1 Part 2 — cheap write-time clear: this retract/
-            # supersede settling happened to touch cs_ls_id's neighborhood
-            # again and support is live again. See the module-level note in
-            # this function's docstring for why this is a convenience, not
-            # the load-bearing discharge.
-            meta.pop("support_lost", None)
-            conn.execute(
-                "UPDATE nodes SET metadata = ? WHERE id = ?",
-                (json.dumps(meta), cs_ls_id),
-            )
-            core._log_edit(conn, "support_lost_cleared", cs_ls_id, cs_ls_node["type"],
-                      {"trigger": affected_node_id})
-            newly_support_restored.append({
-                "id": cs_ls_id,
-                "type": cs_ls_node["type"],
-                "claim": cs_ls_node["claim"],
-            })
+        # #3782: the mark/clear rule lives in core._apply_support_state, shared
+        # with engram_reflect. The clear here is a write-time CONVENIENCE (see
+        # the docstring): this retract/supersede settling happened to touch
+        # cs_ls_id's neighborhood again.
+        outcome = core._apply_support_state(
+            conn, cs_ls_id, cs_ls_node["type"], cs_ls_node["metadata"],
+            total_live, trigger=affected_node_id, tool=tool,
+            warnings_out=warnings_out)
+        entry = {
+            "id": cs_ls_id,
+            "type": cs_ls_node["type"],
+            "claim": cs_ls_node["claim"],
+        }
+        if outcome == "marked":
+            newly_support_lost.append(entry)
+        elif outcome == "cleared":
+            newly_support_restored.append(entry)
 
     return newly_support_lost, newly_support_restored
 

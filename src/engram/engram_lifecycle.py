@@ -55,6 +55,7 @@ _REFLECT_TOP_N = {
     "stale_nodes": 5,
     "support_lost_nodes": 5,
     "support_lost_cleared": 5,
+    "support_lost_marked": 5,
     "overdue_predictions": 5,
     "open_conjectures": 5,
     "recent_feeling_reports": 5,
@@ -76,7 +77,7 @@ _REFLECT_LIST_ORDER = [
     "active_goals", "active_tasks", "active_lessons",
     "unresolved_goal_tensions", "unresolved_contradictions",
     "tainted_nodes", "stale_nodes", "support_lost_nodes", "support_lost_cleared",
-    "overdue_predictions", "open_conjectures",
+    "support_lost_marked", "overdue_predictions", "open_conjectures",
     "recent_feeling_reports",
     "weakly_grounded", "thin_support_derivations", "open_questions",
     "uncited_observations", "same_source_review", "retracted_nodes",
@@ -1111,41 +1112,57 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         # backfill migration — it needs no one-time pass because every run
         # re-evaluates state from scratch, and it stays correct as new
         # edge-writing surfaces get added without anyone updating a list.
+        # #3782: walk EVERY current cornerstone/lesson, not only flagged ones,
+        # so the flag is also SET from state (a node whose support hit zero
+        # without the transform-time detector running stays unflagged
+        # otherwise). `flagged` keeps the old SQL-text pre-filter's verdict so
+        # a non-object blob that merely contains the marker text is still
+        # discharged. The mark/clear rule itself is core._apply_support_state.
         support_lost_rows = conn.execute(
             # Anchor to serialized boolean — metadata written with default json.dumps separators.
-            """SELECT id, type, claim, metadata FROM nodes
+            """SELECT id, type, claim, metadata,
+                      (metadata LIKE '%"support_lost": true%') AS flagged
+               FROM nodes
                WHERE is_current = 1
-                 AND type IN ('cornerstone', 'lesson')
-                 AND metadata LIKE '%"support_lost": true%'"""
+                 AND type IN ('cornerstone', 'lesson')"""
         ).fetchall()
         report["support_lost_nodes"] = []
         report["support_lost_cleared"] = []
-        support_lost_discharged_any = False
+        report["support_lost_marked"] = []
+        support_lost_changed_any = False
         for r in support_lost_rows:
             live_count = core._count_live_exemplars(conn, r["id"], r["type"])
-            if live_count > 0:
-                # #3413: the LIKE pre-filter can match a non-object blob that
-                # merely CONTAINS the marker text (`[{"support_lost": true}]`);
-                # the re-dump then replaces it with a dict, so say so. The
-                # report has no `warnings` field; stderr is the signal.
-                meta, _ = core._metadata_dict_for_write(
-                    r["metadata"], r["id"], "engram_reflect")
-                meta.pop("support_lost", None)
-                conn.execute(
-                    "UPDATE nodes SET metadata = ? WHERE id = ?",
-                    (json.dumps(meta), r["id"]),
-                )
-                core._log_edit(conn, "support_lost_cleared", r["id"], r["type"],
-                          {"live_exemplars": live_count, "trigger": "reflect_recompute"})
-                report["support_lost_cleared"].append(
-                    {"id": r["id"], "type": r["type"], "claim": r["claim"]}
-                )
-                support_lost_discharged_any = True
-            else:
-                report["support_lost_nodes"].append(
-                    {"id": r["id"], "type": r["type"], "claim": r["claim"]}
-                )
-        if support_lost_discharged_any:
+            # The SQL LIKE verdict is a positive OVERRIDE only (keeps the #3413
+            # list-blob discharge); otherwise the helper reads the PARSED
+            # metadata, so `{"support_lost":true}` / `{"support_lost": 1}`
+            # (LIKE-miss, parsed-flagged) are neither re-marked nor left stuck.
+            flagged = bool(r["flagged"]) or bool(
+                core._metadata_dict(r["metadata"]).get("support_lost"))
+            entry = {"id": r["id"], "type": r["type"], "claim": r["claim"]}
+            if (live_count == 0 and not flagged and core._count_live_exemplars(
+                    conn, r["id"], r["type"], live_only=False) == 0):
+                continue  # never had support: nothing to lose
+            # #3413: a non-object blob that merely CONTAINS the marker text
+            # (`[{"support_lost": true}]`) is replaced by a dict on the clear;
+            # the helper says so on stderr (the report has no `warnings`).
+            outcome = core._apply_support_state(
+                conn, r["id"], r["type"], r["metadata"], live_count,
+                trigger="reflect_recompute", tool="engram_reflect",
+                flagged=True if r["flagged"] else None,
+                details_extra={"live_exemplars": live_count})
+            if outcome == "cleared":
+                report["support_lost_cleared"].append(entry)
+                support_lost_changed_any = True
+            elif outcome == "marked":
+                # Marked this run = support-lost now: it belongs in
+                # support_lost_nodes too (count + recommended action);
+                # support_lost_marked is the "new this run" subset.
+                report["support_lost_marked"].append(entry)
+                report["support_lost_nodes"].append(entry)
+                support_lost_changed_any = True
+            elif live_count == 0:
+                report["support_lost_nodes"].append(entry)
+        if support_lost_changed_any:
             conn.commit()
 
         # Summary counts (two-tier: queryable vs faded; tier-1 retired)
@@ -1176,6 +1193,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
             "retracted_nodes": len(report["retracted_nodes"]),
             "support_lost_nodes": len(report["support_lost_nodes"]),
             "support_lost_cleared": len(report["support_lost_cleared"]),
+            "support_lost_marked": len(report["support_lost_marked"]),
             "recent_feeling_reports": len(report["recent_feeling_reports"]),
         }
         report["memory_tiers"] = {
