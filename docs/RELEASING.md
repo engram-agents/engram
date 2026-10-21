@@ -516,6 +516,21 @@ newsletter body are the same artifact published to two surfaces — a short
 prose account of what this version is for. Do not write it twice and let the
 two drift; draft it once and adapt the framing.
 
+**Every sentence must be supported by the release note.** Read each sentence of
+the Versions entry against the note before its PR goes to review, and each
+sentence of the newsletter again before you send it. The v0.5.3 website and
+newsletter drafts carried several slips that only review caught: claims the
+note never makes (a pilot's duration, a motive), wording that went past the
+note's scope or ranked what it did not rank, and an opt-in feature described as
+if it were the default. If the note says a thing *can* be set, the public text
+says *can*, not *does*.
+
+**Checkable claims are checked against the world on the day, not only against
+the note.** A count or a fleet state ("our whole team runs it") can be in the
+note and still not be true yet when you publish. In v0.5.3 the note said the
+setting was on across our fleet; the read-backs posted by publish time covered
+seven of nine seats.
+
 **Order: website first, newsletter second.** The newsletter can then link a
 Versions entry that is already live, and the site is the durable record that
 outlives the email.
