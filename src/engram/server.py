@@ -2596,6 +2596,12 @@ def engram_cascade_frontier(payload_json: str) -> str:
             presence is the signal. A mode-B sweep (frontier -> resolve,
             looped) MUST NOT treat a response carrying this field as a
             completed/clean sweep.
+          cascade_walk_truncated (str, both modes): present ONLY when the
+            ancestor walk behind a frontier blocked-check ran out of node
+            budget (#2339) — those nodes are withheld from the frontier
+            (treated as blocked, since a pending ancestor cannot be ruled
+            out), so the frontier may be SHORT. ABSENT on the healthy path.
+            A mode-B sweep MUST NOT treat a response carrying it as complete.
         On payload-parsing failure or unknown node_id, returns
         {"error": "..."}.
 

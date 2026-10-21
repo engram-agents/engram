@@ -11156,13 +11156,41 @@ def _trace_evidence_roots(conn: sqlite3.Connection, node_id: str, max_depth: int
     return roots
 
 
+# Default node budget for the cascade walks (see _walk_cascade_upstream).
+_CASCADE_WALK_DEFAULT_BUDGET = 4096
+
+
+class CascadeWalkTruncated(Exception):
+    """Raised by ``_walk_cascade_upstream(strict=True)`` when the per-dequeue
+    budget ran out while nodes were still queued (#2339): the walk did NOT
+    reach every ancestor, so its result is not a complete ancestor set.
+
+    ``visited``: nodes dequeued before the budget ran out.
+    ``remaining_queue``: queued entries not yet visited at that point.
+    """
+
+    def __init__(self, visited: int, remaining_queue: int, budget: int = 0,
+                 partial: set | None = None):
+        self.visited = visited
+        self.remaining_queue = remaining_queue
+        self.budget = budget
+        # What the walk collected before it was cut off — for a caller that
+        # must still answer best-effort, flagged incomplete. Never a result.
+        self.partial = set(partial) if partial is not None else set()
+        super().__init__(
+            f"cascade upstream walk truncated: budget {budget} exhausted after "
+            f"{visited} node(s) with {remaining_queue} still queued"
+        )
+
+
 def _walk_cascade_upstream(
     conn: sqlite3.Connection,
     node_id: str,
     *,
     collect_if,
     descend_if,
-    max_depth: int = 4096,
+    max_depth: int = _CASCADE_WALK_DEFAULT_BUDGET,
+    strict: bool = False,
 ) -> set:
     """Shared upstream (premise-direction) walk over ``CASCADE_RELATIONS``:
     follows each visited node's own outgoing cascade edges back toward its
@@ -11207,10 +11235,22 @@ def _walk_cascade_upstream(
     Python list is O(n) per dequeue. Fine at leaf-trace scale; worth
     revisiting (indexed deque, batched node lookups) if slice-3's
     ``ancestors(X)`` runs hot over large subgraphs.
+
+    **``max_depth`` is a node budget, not a depth limit, and exhausting it is
+    not the same as finishing (#2339).** Exhaustion = the budget ran out
+    while the queue still held a node NOT yet visited; a walk whose queue is
+    empty, or holds only already-visited duplicates (a diamond's second path
+    to a node), when the budget hits 0 is complete. A caller whose correctness needs
+    the COMPLETE set (``engram_revision._cascade_blocked``) passes
+    ``strict=True`` and gets ``CascadeWalkTruncated`` instead of a quietly
+    understated set. ``strict=False`` (the default, best-effort consumers)
+    keeps the historical return value but writes one line to stderr (never
+    stdout: MCP stdio) so the truncation is at least visible.
     """
     visited: set = set()
     queue = [node_id]
     collected: set = set()
+    budget = max_depth
 
     while queue and max_depth > 0:
         max_depth -= 1
@@ -11235,6 +11275,22 @@ def _walk_cascade_upstream(
         ).fetchall()
         for e in edges:
             queue.append(e["target_id"])
+
+    # Truncated iff the budget is out AND the queue still holds a node never
+    # visited. Entries that are already-visited duplicates (a diamond's
+    # second path to a node) are a complete walk, not a truncated one.
+    unvisited_left = sum(1 for q in queue if q not in visited)
+    if unvisited_left:
+        if strict:
+            raise CascadeWalkTruncated(
+                len(visited), unvisited_left, budget, partial=collected
+            )
+        print(
+            f"[_walk_cascade_upstream] WARNING: node budget {budget} exhausted "
+            f"after {len(visited)} node(s) with {unvisited_left} unvisited still queued; "
+            f"the returned set is incomplete (#2339)",
+            file=sys.stderr,
+        )
 
     return collected
 

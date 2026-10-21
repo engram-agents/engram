@@ -34,8 +34,10 @@ House rules (wave pattern):
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
+import sys
 import uuid
 
 import engram_core as core
@@ -393,7 +395,8 @@ _CASCADE_FRONTIER_DEFAULT_LIMIT = 5
 _CASCADE_FRONTIER_CLAIM_GIST_LEN = 160
 
 
-def _cascade_ancestors(conn, node_id: str) -> set:
+def _cascade_ancestors(conn, node_id: str, *, strict: bool = False,
+                       max_depth: int = core._CASCADE_WALK_DEFAULT_BUDGET) -> set:
     """ancestors(node_id): the full transitive closure over CASCADE_RELATIONS
     via the shared core._walk_cascade_upstream primitive (full-ancestor mode:
     collect_if=descend_if=lambda row: True). INCLUDES node_id itself — this
@@ -405,18 +408,62 @@ def _cascade_ancestors(conn, node_id: str) -> set:
     (here) deciding what "ancestors(X)" means, and every call site is
     explicit about whether it wants the self-inclusive or self-exclusive
     reading.
+
+    ``strict=True`` raises ``core.CascadeWalkTruncated`` instead of returning
+    a set understated by an exhausted walk budget (#2339); ``max_depth`` is
+    that node budget (a parameter so a test can exhaust it on a small graph).
     """
     return core._walk_cascade_upstream(
         conn, node_id,
         collect_if=lambda row: True,
         descend_if=lambda row: True,
+        max_depth=max_depth,
+        strict=strict,
     )
 
 
-def _cascade_blocked(conn, node_id: str, pending_node_ids: set) -> bool:
-    """True iff node_id has a cascade-ancestor (excluding itself) that
-    currently carries >=1 PENDING marker, for ANY cascade_event and ANY
-    root_node — the frontier-blocking check. ``pending_node_ids`` is the
+# #2339: the blocked-decision is three-valued. UNKNOWN_TRUNCATED is not a
+# kind of BLOCKED or CLEAR: the ancestor walk ran out of budget, so whether
+# a pending ancestor exists cannot be said.
+BLOCKED = "BLOCKED"
+CLEAR = "CLEAR"
+UNKNOWN_TRUNCATED = "UNKNOWN_TRUNCATED"
+
+
+@dataclasses.dataclass(frozen=True)
+class BlockedResult:
+    """The one answer to "is this node blocked by a pending ancestor".
+
+    ``state``: BLOCKED / CLEAR / UNKNOWN_TRUNCATED.
+    ``blocking``: sorted pending ancestors (non-empty only when BLOCKED).
+    ``truncated``: the ``core.CascadeWalkTruncated`` (budget, visited,
+    remaining_queue, partial) when UNKNOWN_TRUNCATED, else None.
+
+    Deliberately NOT truthy/falsy: ``if _cascade_blocked(...)`` would read
+    UNKNOWN_TRUNCATED as one of the other two, so ``__bool__`` raises.
+    """
+
+    state: str
+    blocking: tuple = ()
+    truncated: "core.CascadeWalkTruncated | None" = None
+
+    def __bool__(self):
+        raise TypeError(
+            "BlockedResult has three states; branch on .state, not truthiness"
+        )
+
+
+def _cascade_blocked(conn, node_id: str, pending_node_ids: set, *,
+                     warnings: list | None = None,
+                     max_depth: int = core._CASCADE_WALK_DEFAULT_BUDGET
+                     ) -> BlockedResult:
+    """The ONLY place that decides whether node_id has a cascade-ancestor
+    (excluding itself) that currently carries >=1 PENDING marker, for ANY
+    cascade_event and ANY root_node — the frontier-blocking check. Returns a
+    ``BlockedResult`` (BLOCKED / CLEAR / UNKNOWN_TRUNCATED). The frontier,
+    the resolve refusal and the auto-resolve loop all branch on its state;
+    none of them walks ancestors for a blocked-decision themselves
+    (tests/test_cascade_walk_truncation_2339.py::T9 enforces this). ``pending_node_ids`` is the
     pre-computed set of every node_id in the graph with >=1 pending marker
     (one query, shared across every candidate this call is made for) rather
     than a fresh query per candidate.
@@ -459,9 +506,37 @@ def _cascade_blocked(conn, node_id: str, pending_node_ids: set) -> bool:
     imply a clean spine above it. (Regression fixture:
     test_transitive_catches_out_of_order_resolution_direct_premises_would_miss
     in tests/test_cascade_frontier.py.)
+
+    **Completeness is required (#2339).** The answer is "is ANY ancestor
+    pending", so an ancestor set understated by an exhausted walk budget would
+    answer CLEAR where the truth is BLOCKED — a node presented as ready to
+    adjudicate when it is not. The walk therefore runs ``strict=True``; on
+    ``CascadeWalkTruncated`` the state is UNKNOWN_TRUNCATED (callers withhold
+    the node: the safe direction) with the exception's details on
+    ``.truncated``. When the caller passed a ``warnings`` list a message
+    naming the node is appended for its response; with no ``warnings`` list
+    the same message goes to stderr (strict mode raises rather than printing,
+    so without this a caller that cannot carry a warning would see nothing).
     """
-    ancestors = _cascade_ancestors(conn, node_id) - {node_id}
-    return any(a in pending_node_ids for a in ancestors)
+    try:
+        ancestors = _cascade_ancestors(
+            conn, node_id, strict=True, max_depth=max_depth
+        ) - {node_id}
+    except core.CascadeWalkTruncated as exc:
+        msg = (
+            f"{node_id}: cascade-ancestor walk truncated (budget "
+            f"{exc.budget} exhausted after {exc.visited} node(s), "
+            f"{exc.remaining_queue} still queued) — treated as BLOCKED, "
+            f"not on the frontier, because its pending ancestors cannot be "
+            f"ruled out."
+        )
+        if warnings is not None:
+            warnings.append(msg)
+        else:
+            print(f"[_cascade_blocked] WARNING: {msg}", file=sys.stderr)
+        return BlockedResult(UNKNOWN_TRUNCATED, truncated=exc)
+    blocking = tuple(sorted(a for a in ancestors if a in pending_node_ids))
+    return BlockedResult(BLOCKED if blocking else CLEAR, blocking=blocking)
 
 
 def _cascade_event_creation_time(conn, cascade_event: str) -> str:
@@ -689,15 +764,32 @@ def _cascade_frontier_impl(node_id: str = None, limit: int = None) -> str:
         ).fetchall()
         pending_node_ids = {r["node_id"] for r in pending_rows}
 
+        # #2339: truncated ancestor walks (a blocked-check withholds its node
+        # from the frontier, never offers it; the mode-C candidate walk below
+        # falls back to its partial set); collected here and surfaced below
+        # as `cascade_walk_truncated`.
+        walk_warnings: list = []
+
         if node_id is None:
             candidates = set(pending_node_ids)
         else:
-            ancestors = _cascade_ancestors(conn, node_id)
+            try:
+                ancestors = _cascade_ancestors(conn, node_id, strict=True)
+            except core.CascadeWalkTruncated as exc:
+                # Best effort on the partial set, never presented as complete.
+                ancestors = exc.partial
+                walk_warnings.append(
+                    f"{node_id}: the mode-C ancestor walk was cut short "
+                    f"(budget {exc.budget} exhausted after {exc.visited} "
+                    f"node(s), {exc.remaining_queue} unvisited still queued) "
+                    f"— the pending-ancestor set below is PARTIAL."
+                )
             candidates = ancestors & pending_node_ids
 
         frontier_ids = [
             nid for nid in candidates
-            if not _cascade_blocked(conn, nid, pending_node_ids)
+            if _cascade_blocked(conn, nid, pending_node_ids,
+                                warnings=walk_warnings).state == CLEAR
         ]
 
         # Ordering (Lei's ruling, settles §9.4 item 3): event-grouped first
@@ -789,6 +881,24 @@ def _cascade_frontier_impl(node_id: str = None, limit: int = None) -> str:
                 "sweep — Invariant 1 (no pending marker survives a "
                 "completed mode-B run) is not satisfied while this field "
                 "is present."
+            )
+
+        # Truncated-walk signal (#2339). Same shape as the field above:
+        # present ONLY when it applies, absent (never null/false) on the
+        # healthy path, so its mere presence is the signal.
+        if walk_warnings:
+            shown = "; ".join(walk_warnings[:3])
+            more = (
+                f" (+{len(walk_warnings) - 3} more)" if len(walk_warnings) > 3 else ""
+            )
+            response["cascade_walk_truncated"] = (
+                f"{len(walk_warnings)} cascade-ancestor walk(s) ran out of "
+                f"budget before reaching every ancestor, so a pending ancestor "
+                f"cannot be ruled out: a blocked-check walk withholds its node "
+                f"from the frontier, and a mode-C candidate walk falls back to "
+                f"a PARTIAL set. Machine assessment, not a directive. "
+                f"The frontier above is therefore possibly SHORT, and a mode-B "
+                f"sweep MUST NOT treat it as complete. {shown}{more}"
             )
 
         if node_id is not None:
@@ -1358,8 +1468,8 @@ def _cascade_auto_resolve_trivial(conn, node_id: str, now: str) -> list:
                 continue
             if not core._pending_markers_for_node(conn, child):
                 continue
-            if _cascade_blocked(conn, child, pending_node_ids):
-                continue
+            if _cascade_blocked(conn, child, pending_node_ids).state != CLEAR:
+                continue  # BLOCKED, or UNKNOWN_TRUNCATED (never auto-resolved)
 
             # #2406 — never auto-resolve an identity-layer node's markers;
             # leave it pending so it surfaces on the frontier instead.
@@ -1522,10 +1632,28 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
             "SELECT DISTINCT node_id FROM cascade_markers WHERE status = 'pending'"
         ).fetchall()
         pending_node_ids = {r["node_id"] for r in pending_rows}
-        if _cascade_blocked(conn, node_id, pending_node_ids):
-            blocking = sorted(
-                (_cascade_ancestors(conn, node_id) - {node_id}) & pending_node_ids
-            )
+        # The one blocked-decision (#2339): _cascade_blocked says BLOCKED /
+        # CLEAR / UNKNOWN_TRUNCATED and, for BLOCKED, who blocks.
+        walk_warnings: list = []
+        blocked = _cascade_blocked(conn, node_id, pending_node_ids,
+                                   warnings=walk_warnings)
+        if blocked.state == UNKNOWN_TRUNCATED:
+            exc = blocked.truncated
+            return json.dumps({
+                "error": f"Node '{node_id}' cannot be resolved: the walk over "
+                         f"its cascade-ancestors was cut short at its node "
+                         f"budget ({exc.budget}), so whether any ancestor "
+                         f"still carries a pending marker is UNKNOWN. "
+                         f"Refusing, because invariant 6 cannot be checked.",
+                "next_call": "none — this is a walk-budget limit "
+                             "(_CASCADE_WALK_DEFAULT_BUDGET), not an "
+                             "upstream-resolution problem; the frontier "
+                             "withholds this node for the same reason. "
+                             "Report it as an issue.",
+                "cascade_walk_truncated": walk_warnings[0],
+            })
+        if blocked.state == BLOCKED:
+            blocking = list(blocked.blocking)
             return json.dumps({
                 "error": f"Node '{node_id}' is NOT on the frontier — "
                          f"{len(blocking)} of its cascade-ancestors still carry "
