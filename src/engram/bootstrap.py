@@ -400,10 +400,16 @@ def _db_node_count(db_path: Path) -> int:
     Raises SystemExit on connection-level failures (PermissionError, locked DB,
     etc.) so FORCE=1 / FORCE_RESEED_EMPTY=1 refuse rather than silently
     treating an unreadable DB as empty and proceeding to seed live data.
+
+    Opens the store read-only (`mode=ro`): bootstrap runs before any owner can
+    exist and only counts rows. On a cleanly closed WAL store SQLite may still
+    create a `-shm` (a shared-memory index, not data); the main file and the
+    `-wal` are left unchanged. `immutable=1` is deliberately not used: it tells
+    SQLite no other writer exists, which is false whenever a seat is live.
     """
     import sqlite3
     try:
-        conn = sqlite3.connect(str(db_path), timeout=0)
+        conn = sqlite3.connect(f"{Path(db_path).absolute().as_uri()}?mode=ro", uri=True, timeout=0)
         try:
             row = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()
             return row[0] if row else 0

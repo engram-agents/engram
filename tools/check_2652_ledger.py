@@ -25,11 +25,18 @@ above it does not. The old `path:LINE` form is rejected ("line-number
 citation"). A cited file that is a `.py` or has a python shebang must parse; a
 parse failure fails loudly, never skips.
 
-It also derives the per-state tally (owner, direct, behind-flag, flag-on,
-retired, out of scope) from the Section-2 rows, reading the `state` column BY
+It also derives the per-state tally (owner, direct, direct-by-design,
+behind-flag, flag-on, retired, out of scope) from the Section-2 rows, reading the `state` column BY
 HEADER NAME, and compares it with the two places Section 1 states it: the bold
 "State of the N live-store lines" sentence (which must also sum to N) and the
 `- **state:**` line. A state value outside the known set fails, naming the row.
+
+`direct-by-design` is a live-store state whose cell names its PHASE after a
+colon, from a CLOSED set: `pre-owner` (bootstrap/install, before any owner can
+exist) or `exclusive-maintenance` (needs the store with no owner running).
+Nothing else qualifies. A `direct-by-design` cell with no phase, or with a phase
+outside the set, fails naming the row (`row N: direct-by-design needs a phase
+...`). The row still tallies under `direct-by-design`.
 
 It derives the `kind` (call, prose) and `target` (live store, parameter, other
 DB, n/a (prose), unresolved) tallies the same way, each column read BY HEADER
@@ -88,13 +95,19 @@ CITE = re.compile(r"^`([^`]+)`\s+`([^`]+)`\s+`([^`]+)`$")
 OLD_CITE = re.compile(r"^`([^`]+:\d+)`")
 MODULE = "<module>"
 NO_FUNC = "—"
-LIVE_STATES = ("owner", "direct", "behind-flag", "flag-on", "retired")
+DIRECT_BY_DESIGN = "direct-by-design"
+DBD_PHASES = ("pre-owner", "exclusive-maintenance")
+LIVE_STATES = ("owner", "direct", DIRECT_BY_DESIGN, "behind-flag", "flag-on", "retired")
 OUT_OF_SCOPE = "out of scope"
 ALL_STATES = LIVE_STATES + (OUT_OF_SCOPE,)
 STATE_LINE = re.compile(r"^\s*-\s+\*\*state:\*\*(.*)$")
 SUMMARY_LINE = re.compile(r"State of the\s+(\d+)\s+live-store lines")
-BOLD_STATE = re.compile(r"\*\*(owner|direct|behind-flag|flag-on|retired)\s+(\d+)\*\*")
-PLAIN_STATE = re.compile(r"(owner|direct|behind-flag|flag-on|retired|out of scope)\s+(\d+)")
+BOLD_STATE = re.compile(
+    r"\*\*(owner|direct-by-design|direct|behind-flag|flag-on|retired)\s+(\d+)\*\*"
+)
+PLAIN_STATE = re.compile(
+    r"(owner|direct-by-design|direct|behind-flag|flag-on|retired|out of scope)\s+(\d+)"
+)
 OTHER_OOS = re.compile(r"The other\s+(\d+)\s+lines are out of scope")
 KINDS = ("call", "prose")
 TARGETS = ("live store", "parameter", "other DB", "n/a (prose)", "unresolved")
@@ -237,7 +250,16 @@ def derived_tally(states):
     tally = Counter()
     problems = []
     for num, value in states:
-        if value in ALL_STATES:
+        base, _, phase = value.partition(":")
+        if base.strip() == DIRECT_BY_DESIGN:
+            tally[DIRECT_BY_DESIGN] += 1
+            if not (":" in value and phase.strip() in DBD_PHASES):
+                problems.append(
+                    f"row {num}: direct-by-design needs a phase, one of: "
+                    + ", ".join(DBD_PHASES)
+                    + f" (got '{phase.strip()}')"
+                )
+        elif value in ALL_STATES:
             tally[value] += 1
         else:
             problems.append(f"row {num}: unknown state '{value}'")
