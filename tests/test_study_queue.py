@@ -516,18 +516,22 @@ def test_pk1_a_picked_up_line_hides_its_item_and_the_others_stay(empty_seat, mon
     assert _pk_shown(mod, text) == ["first", "third", "fourth"]
 
 
-def test_pk1_a_skipped_line_hides_its_item_and_the_others_stay(empty_seat, monkeypatch):
+def test_pk1_a_skipped_line_annotates_its_item_and_the_others_stay(empty_seat, monkeypatch):
     mod = _load_tool(empty_seat, monkeypatch)
     text = _PK_HEAD + "## Morning pickup\np3. skipped (not worth it today)\n"
-    assert _pk_shown(mod, text) == ["first", "second", "fourth"]
+    # skipped items surface with the reason annotated in why (not dropped)
+    assert _pk_shown(mod, text) == ["first", "second", "third", "fourth"]
+    assert "skipped" in " | ".join(w for w in _pk_whys(mod, text) if "third" in w)
 
 
 def test_pk1_both_forms_together_and_open_bullets_are_untouched(empty_seat, monkeypatch):
     mod = _load_tool(empty_seat, monkeypatch)
     text = _PK_HEAD + "## Morning pickup\np1. picked up done\np4. skipped (stale)\n"
     whys = " | ".join(_pk_whys(mod, text))
-    assert _pk_shown(mod, text) == ["second", "third"]
+    # p1 picked_up → dropped; p4 skipped → surfaces with annotation
+    assert _pk_shown(mod, text) == ["second", "third", "fourth"]
     assert "bullet one" in whys and "bullet two" in whys  # no pickup line ever covers a bullet
+    assert "stale" in whys  # the skipped reason appears in the fourth item's why
 
 
 def test_pk2_only_the_last_morning_pickup_heading_counts(empty_seat, monkeypatch):
@@ -615,7 +619,8 @@ def _pk_tags(mod, text):
 
 @pytest.mark.parametrize("line, gone, kept", [
     ("p3. picked up x", "beta", ["2", "5"]),
-    ("p5. skipped (r)", "gamma", ["2", "3"]),
+    # skipped surfaces rather than hides: gamma (item 5) is still present, annotated
+    ("p5. skipped (r)", None, ["2", "3", "5"]),
 ])
 def test_pk1_a_pickup_matches_the_printed_number_not_the_list_position(
         empty_seat, monkeypatch, line, gone, kept):
@@ -623,15 +628,17 @@ def test_pk1_a_pickup_matches_the_printed_number_not_the_list_position(
     mod = _load_tool(empty_seat, monkeypatch)
     text = _PK_GAPPED + f"## Morning pickup\n{line}\n"
     assert _pk_tags(mod, text) == kept
-    assert gone not in " | ".join(_pk_whys(mod, text))
+    if gone is not None:
+        assert gone not in " | ".join(_pk_whys(mod, text))
 
 
 def test_pk4_triage_and_pickup_are_ored_either_hides(empty_seat, monkeypatch):
     mod = _load_tool(empty_seat, monkeypatch)
     text = (_PK_HEAD + "## Morning pickup\np1. picked up done\np3. skipped (later)\n\n"
             "## Sleep-end triage (parent)\n2. do now - ran it\n3. defer - x\n4. defer - y\n")
-    # 1 by pickup, 2 by triage, 3 by pickup (its triage line is defer), 4 neither
-    assert _pk_shown(mod, text) == ["fourth"]
+    # 1 dropped by picked_up; 2 dropped by triage (do now); 3 has defer triage + skipped pickup
+    # → skipped does not drop, so item 3 surfaces with annotation; 4 neither → surfaces
+    assert _pk_shown(mod, text) == ["third", "fourth"]
     only_triage = _PK_HEAD + "## Sleep-end triage (parent)\n1. file (#1) - big\n"
     assert _pk_shown(mod, only_triage) == ["second", "third", "fourth"]
 
@@ -662,7 +669,7 @@ def test_pk5_without_a_morning_pickup_section_the_output_is_the_triage_only_outp
 
 def test_pk6_the_real_dream_pickup_tool_and_this_reader_agree_on_the_format(empty_seat, monkeypatch, tmp_path):
     """The writer (tools/dream_pickup.py, run for real on a copy of a record) and this reader must agree:
-    after --pick 2 and --skip 3 exactly items 2 and 3 are hidden."""
+    after --pick 2 item 2 is dropped; after --skip 3 item 3 surfaces with annotation (not dropped)."""
     mod = _load_tool(empty_seat, monkeypatch)
     rec = tmp_path / "2026-10-19.md"
     rec.write_text("# Dream record\n\n" + _PK_HEAD, encoding="utf-8")
@@ -678,9 +685,11 @@ def test_pk6_the_real_dream_pickup_tool_and_this_reader_agree_on_the_format(empt
     run("--pick", "2", "ran it; wrote the result")
     run("--skip", "3", "not worth it today")
     assert "## Morning pickup" in rec.read_text(encoding="utf-8")
-    assert _pk_shown(mod, rec.read_text(encoding="utf-8")) == ["first", "fourth"]
+    # item 2 dropped (picked up); item 3 surfaces with skipped annotation
+    assert _pk_shown(mod, rec.read_text(encoding="utf-8")) == ["first", "third", "fourth"]
     run("--pick", "1", "one more")  # a re-run on another item adds a line, still one section
-    assert _pk_shown(mod, rec.read_text(encoding="utf-8")) == ["fourth"]
+    # item 1 dropped (picked up); item 3 still surfaces (skipped)
+    assert _pk_shown(mod, rec.read_text(encoding="utf-8")) == ["third", "fourth"]
 
 
 # ==========================================================================
@@ -1110,3 +1119,99 @@ def test_l6_cli_home_flag_overrides_the_environment(seat, tmp_path):
     r = _cli(tmp_path, ["--home", str(seat), "--db", str(seat / "knowledge.db"), "--json", "--now", NOW])
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout)["targets"][0]["ref"] == "ob-801"
+
+
+# ==========================================================================
+# Contract tests: read_pickup_dispositions drives parse_dream_report (alpha #4000)
+# These four cells match the contract clauses from issue #4000.
+# ==========================================================================
+
+def test_4000_c1_no_pickup_section_all_heads_surface(empty_seat, monkeypatch):
+    """No Morning pickup section: both triage-passing heads surface unchanged."""
+    mod = _load_tool(empty_seat, monkeypatch)
+    record = (
+        "\n## For the awake seat\n"
+        "1. first item\n"
+        "2. second item\n\n"
+        "## Sleep-end triage (parent)\n"
+        "1. defer\n"
+        "2. defer\n"
+    )
+    result = mod.parse_dream_report(record, "2026-10-21.md")
+    assert len(result) == 2
+
+
+def test_4000_c2_picked_up_head_absent_others_unchanged(empty_seat, monkeypatch):
+    """pickup marks head 1 as 'picked up': head 1 absent, head 2 still present."""
+    mod = _load_tool(empty_seat, monkeypatch)
+    record = (
+        "\n## For the awake seat\n"
+        "1. first item\n"
+        "2. second item\n\n"
+        "## Sleep-end triage (parent)\n"
+        "1. defer\n"
+        "2. defer\n\n"
+        "## Morning pickup\n"
+        "p1. picked up first item\n"
+    )
+    result = mod.parse_dream_report(record, "2026-10-21.md")
+    refs = [r["ref"] for r in result]
+    assert len(result) == 1
+    assert result[0]["ref"].endswith("#2")
+    # head 2 still present
+    assert any("2" in r["ref"] for r in result)
+
+
+def test_4000_c3_skipped_head_surfaces_with_reason_in_why(empty_seat, monkeypatch):
+    """pickup marks head 1 as 'skipped (reason)': head surfaces and why contains the reason."""
+    mod = _load_tool(empty_seat, monkeypatch)
+    record = (
+        "\n## For the awake seat\n"
+        "1. some node ob_0001\n\n"
+        "## Sleep-end triage (parent)\n"
+        "1. defer\n\n"
+        "## Morning pickup\n"
+        "p1. skipped (needs external data)\n"
+    )
+    result = mod.parse_dream_report(record, "2026-10-21.md")
+    assert len(result) == 1
+    assert "skipped" in result[0]["why"]
+    assert "needs external data" in result[0]["why"]
+
+
+def test_4000_c4_pickup_section_above_awake_seat_is_ignored(empty_seat, monkeypatch):
+    """A Morning pickup section quoted BEFORE the awake-seat block is not the target."""
+    mod = _load_tool(empty_seat, monkeypatch)
+    record = (
+        "\n## Morning pickup\n"
+        "p1. picked up old thing\n\n"
+        "## For the awake seat\n"
+        "1. today's item\n\n"
+        "## Sleep-end triage (parent)\n"
+        "1. defer\n"
+    )
+    result = mod.parse_dream_report(record, "2026-10-21.md")
+    assert len(result) == 1   # today's item still surfaces (above-section ignored)
+
+
+def test_4000_c5_skipped_reason_survives_long_head(empty_seat, monkeypatch):
+    """Skip reason must survive _clip even when the head body exceeds WHY_CHARS (160).
+
+    Luria's blocker: appending [skipped: reason] AFTER a 200-char body clips the
+    reason away entirely.  The fix puts the note before the body.
+    """
+    mod = _load_tool(empty_seat, monkeypatch)
+    long_body = "x" * 200  # well over WHY_CHARS=160
+    record = (
+        "\n## For the awake seat\n"
+        f"1. {long_body}\n\n"
+        "## Sleep-end triage (parent)\n"
+        "1. defer\n\n"
+        "## Morning pickup\n"
+        "p1. skipped (needs Lei)\n"
+    )
+    result = mod.parse_dream_report(record, "2026-10-21.md")
+    assert len(result) == 1
+    assert "needs Lei" in result[0]["why"], (
+        f"skip reason clipped from why: {result[0]['why']!r}"
+    )
