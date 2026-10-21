@@ -330,7 +330,7 @@ def test_seed_check_failure_does_not_prevent_pragma_optimize(monkeypatch):
     r = json.loads(server._nap_impl(message="checkpoint-wiring test seed-check failure isolation"))
     assert "error" not in r, f"_nap_impl should still succeed despite a seed-check failure: {r}"
 
-    optimize_calls = [sql for sql in recorded_sql if sql.strip().upper() == "PRAGMA OPTIMIZE"]
+    optimize_calls = [sql for sql in recorded_sql if sql.strip().upper().startswith("PRAGMA OPTIMIZE")]
     assert optimize_calls, (
         f"expected PRAGMA optimize to still be attempted even though the "
         f"seed check raised -- found no PRAGMA optimize call; recorded "
@@ -357,7 +357,7 @@ def test_pragma_optimize_failure_does_not_break_nap(monkeypatch):
             self._real = real
 
         def execute(self, sql, *args, **kwargs):
-            if sql.strip().upper() == "PRAGMA OPTIMIZE":
+            if sql.strip().upper().startswith("PRAGMA OPTIMIZE"):
                 raise RuntimeError("simulated PRAGMA optimize failure")
             return self._real.execute(sql, *args, **kwargs)
 
