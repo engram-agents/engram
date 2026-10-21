@@ -1447,6 +1447,10 @@
       "reason": "repo-CI infrastructure consumed only by .github/workflows/pr-checks.yml's check-stubbed-signatures step (#3118, blocking bare-name-stub-affected-tests gate); runs in GitHub Actions, not shipped in any install tier"
     },
     {
+      "path": "tools/check_no_cuda_wheels.py",
+      "reason": "repo-CI infrastructure consumed only by the dev-requirements install steps in .github/workflows/{pr-checks,tests,affected-tests,nightly}.yml (#4004, blocking CPU-torch guard); runs in GitHub Actions, not shipped in any install tier"
+    },
+    {
       "path": "src/forum/",
       "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; ships via its own build path, not through build-plugin.sh (issue #868)"
     },
