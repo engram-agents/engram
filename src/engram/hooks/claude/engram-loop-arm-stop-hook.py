@@ -547,20 +547,6 @@ _LOOP_PROMPT_FALLBACK_PATH = (
 )
 
 
-def _loop_prompt_rearm_command() -> str:
-    """The `loop_prompt.py --rearm-delay` command the nudge prints.
-
-    Names the path RESOLVED at import when resolution succeeded, so the
-    printed command is correct in whichever layout this hook runs from;
-    falls back to the `${CLAUDE_PLUGIN_ROOT:-…}` sh form otherwise.
-    """
-    if _LP_TOOLS_DIR is not None:
-        helper = f'"{_LP_TOOLS_DIR / "loop_prompt.py"}"'
-    else:
-        helper = _LOOP_PROMPT_FALLBACK_PATH
-    return f"python3 {helper} --rearm-delay --wake-kind other"
-
-
 # The wake-arming tool's name(s), as they appear in a tool_use block's
 # "name" field. A small literal/alias set, deliberately -- see invariant 5
 # in the module docstring: a rename should cause over-firing (this set no
@@ -617,21 +603,21 @@ def _is_managed_codex_runtime() -> bool:
 
 _NUDGE_TEXT = (
     "[Loop Arm Check: a loop marker is active and this turn shows no "
-    "ScheduleWakeup call. Arm now — ScheduleWakeup with this file's "
-    "loop_prompt copied verbatim — after asking the helper for this turn's "
-    f"delay: run `{_loop_prompt_rearm_command()}` and "
-    "pass the integer it prints to ScheduleWakeup (a nudge-driven arm "
-    "PRESERVES the deadline; do NOT arm the bare full cadence — that pushes "
-    "the due moment out, #3005). Then run CronList to verify the armed "
-    "prompt leads with "
-    f"{_LOOP_WAKE_MARKER}. CronList alone never satisfies this check, only "
-    "verifies after the real arming action. Arming is idempotent: a "
-    "redundant arm replaces, never stacks. If your NEXT turn will carry a "
-    "user-facing reply: batch the arm with a sibling tool call in one "
-    "parallel block and put the reply after it as the turn's final text — "
-    "a solo arm ends the turn, a trailing arm swallows the reply (engram-"
-    "loop Step 2 item 3, #2098). If a reply already rendered this turn, "
-    "arm now and add nothing after.]"
+    "verified re-arm (ScheduleWakeup + CronList in the same parallel block). "
+    "Arm now — read `cadence_seconds` from the marker (it is already in your "
+    "context) and batch `ScheduleWakeup(delay=cadence_seconds)` and `CronList` "
+    "in ONE parallel block — the ONLY documented arm shape; a solo "
+    "`ScheduleWakeup` without a `CronList` sibling in the same parallel block "
+    "IS the defect (#4007). Use this file's own `loop_prompt` field verbatim "
+    "for the ScheduleWakeup prompt — never paraphrase. The CronList result is "
+    "your verify step: confirm the prompt leads with "
+    f"{_LOOP_WAKE_MARKER}. "
+    "Arming is idempotent: a redundant arm replaces, never stacks. If your "
+    "NEXT turn will carry a user-facing reply: batch the arm with a sibling "
+    "tool call in one parallel block and put the reply after it as the turn's "
+    "final text — a solo arm ends the turn, a trailing arm swallows the reply "
+    "(engram-loop Step 2 item 3, #2098). If a reply already rendered this "
+    "turn, arm now and add nothing after.]"
 )
 
 _CODEX_PACER_NUDGE_TEXT = (
@@ -688,43 +674,56 @@ def _tool_use_prompt_text(block: dict) -> str:
 
 
 def _delta_matches_arm_confirmation(delta_bytes: bytes) -> bool:
-    """Scan the delta's tool_use blocks for a ScheduleWakeup call whose
-    `input.prompt` carries the loop-wake marker.
+    """Scan the delta for a batched arm: ScheduleWakeup + CronList in ONE
+    parallel block (same message.id group of consecutive assistant records).
 
-    A `tool_use` block counts as confirmation iff ALL of:
-      1. Its `name` is in `_WAKE_ARMING_TOOL_NAMES` (i.e. "ScheduleWakeup").
-      2. Its (HTML-unescaped, per #1649) `input.prompt` text contains the
-         literal `<loop-wake>` marker.
-    Unlike the old CronList-result gate, a tool_use block carries its own
-    `name` directly -- no tool_use_id correlation to a separate result is
-    needed, because the call itself IS the evidence (its mere presence in
-    this turn's delta proves ScheduleWakeup was invoked THIS turn, which is
-    exactly the "armed from now" fact #1973 needs and a CronList result can
-    never prove: a job armed an hour ago and one armed this second are
-    byte-identical in CronList output). If no tool_use block in the delta
-    satisfies both conditions, the nudge fires.
+    Real Claude Code parallel blocks: each tool_use is written as its own
+    assistant record sharing the same `message.id`. Confirmed iff some
+    message.id group contains BOTH a loop-wake ScheduleWakeup AND a CronList.
+
+    Records without a `message.id` are treated as isolated singleton groups
+    (backward compat with synthetic fixtures that write multiple tool_use
+    blocks in one record's content array — the single-record shape with both
+    SW and CronList in the same content still confirms correctly).
+
+    A solo ScheduleWakeup (no CronList in its group) is the defect (#4007).
     """
     if not delta_bytes:
         return False
     records, _any_record_parsed = _parse_jsonl_records(delta_bytes)
+
+    # groups: group_key -> {"has_sw": bool, "has_cronlist": bool}
+    groups: dict[object, dict[str, bool]] = {}
+    _unique_counter = 0
+
     for rec in records:
         if rec.get("type") != "assistant":
             continue
-        content = rec.get("message", {}).get("content", [])
+        msg = rec.get("message", {})
+        content = msg.get("content", [])
         if not isinstance(content, list):
             continue
+        msg_id = msg.get("id")
+        if msg_id is None:
+            _unique_counter += 1
+            group_key: object = f"_solo_{_unique_counter}"
+        else:
+            group_key = msg_id
+
+        if group_key not in groups:
+            groups[group_key] = {"has_sw": False, "has_cronlist": False}
+
         for block in _walk_content_blocks(content):
             if block.get("type") != "tool_use":
                 continue
-            if block.get("name") not in _WAKE_ARMING_TOOL_NAMES:
-                continue  # not a ScheduleWakeup call -> doesn't confirm
-            text = _tool_use_prompt_text(block)
-            if not text:
-                continue
-            unescaped = html.unescape(text)
-            if _LOOP_WAKE_MARKER in unescaped:
-                return True
-    return False
+            if block.get("name") in _WAKE_ARMING_TOOL_NAMES:
+                text = _tool_use_prompt_text(block)
+                if text and _LOOP_WAKE_MARKER in html.unescape(text):
+                    groups[group_key]["has_sw"] = True
+            elif block.get("name") == "CronList":
+                groups[group_key]["has_cronlist"] = True
+
+    return any(g["has_sw"] and g["has_cronlist"] for g in groups.values())
 
 
 def _delta_has_arm_confirmation(transcript_path: str) -> bool:
@@ -819,9 +818,9 @@ _BASH_GH_API_WRITE_SHORT = ("-X", "-f", "-F")  # also matched attached, e.g. -XP
 _BASH_GH_API_WRITE_LONG = ("--method", "--field", "--raw-field", "--input")
 _BASH_GIT_READ_VERBS = frozenset({"status", "log", "diff", "show", "rev-parse"})  # `fetch` has its own rule
 _BASH_GIT_BRANCH_FLAGS = frozenset({"-a", "-r", "-v", "-vv", "--all", "--remotes", "--verbose", "--list", "-l", "--show-current"})
-# The re-arm helper the loop skill and the nudge itself prescribe: it prints a delay and stamps the
-# loop marker's next_due_at, so it is an ARM action, and a heartbeat turn that calls it is quiet.
-# Whole-command match only, so `python3 loop_prompt.py --rearm-delay; rm x` does not pass.
+# The re-arm helper (--rearm-delay flag): prints cadence_seconds and is an ARM action, so a
+# heartbeat turn that calls it is quiet. Whole-command match only.
+# Nudge no longer prescribes the helper (#4007 — arm reads cadence_seconds directly).
 _LOOP_PROMPT_HELPER_RE = re.compile(
     r"(?:(?P<w>[A-Za-z_]\w*=\$\()|)"
     r"python3?\s+[\"']?(?:[\w./~$-]*/)?loop_prompt\.py[\"']?\s+--rearm-delay"

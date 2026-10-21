@@ -23,15 +23,13 @@ CLI (compose with shell tools):
 
     echo "Loop tick — checking new work." | python -m engram.tools.loop_prompt
 
-CLI — preserve-deadline re-arm (#3005):
+CLI — re-arm delay (#3005, #4007):
 
     delay=$(python3 loop_prompt.py --rearm-delay --wake-kind other)
 
-Prints the integer seconds to pass to ``ScheduleWakeup`` and (when the marker
-needs it) stamps ``next_due_at`` into the marker.  A wake that is NOT the
-heartbeat re-arms for the REMAINING time to the original due moment instead of
-a fresh full cadence — see ``compute_rearm``.  This helper is the single writer
-of ``next_due_at``.
+Prints the integer seconds to pass to ``ScheduleWakeup``.  As of #4007 the
+sliding-window contract is in effect: every wake re-arms at the full
+``cadence_seconds``; ``next_due_at`` is never written.
 
 Stdlib-only — no third-party deps.  Mirrors the style of tools/presence.py and
 tools/_status_derive.py.
@@ -228,8 +226,7 @@ class RearmDecision:
     ``next_due_at`` is the ISO-8601 UTC due moment ("YYYY-MM-DDTHH:MM:SSZ") —
     preserved byte-identically when the deadline is kept.
     ``write_next_due_at`` is True iff the helper must stamp the marker.
-    ``reason`` is one of ``heartbeat`` / ``preserved`` / ``migrated_absent`` /
-    ``migrated_invalid``.
+    ``reason`` is ``"sliding_window"`` for all wakes (#4007).
     """
 
     delay_seconds: int
@@ -313,62 +310,28 @@ def compute_rearm(
     is_heartbeat: bool,
     default_cadence: int = DEFAULT_CADENCE_SECONDS,
 ) -> RearmDecision:
-    """Decide the re-arm delay for one loop wake (the #3005 contract table).
+    """Return the delay for the next ScheduleWakeup arm.
+
+    Sliding-window contract (#4007): every wake re-arms at the full cadence_seconds
+    regardless of wake kind. `next_due_at` is never written.
+
+    The `is_heartbeat` parameter is retained for call-site backward compatibility
+    but is ignored — the return value is identical for both values.
 
     ``now`` MUST be timezone-aware (a naive one raises ``ValueError`` — fail
     loud, never guess).  This function MUST NOT read the clock itself: ``now``
     is passed in, which is what makes every cell of the table testable.
-
-    - heartbeat            → full cadence, stamp ``next_due_at``
-    - non-heartbeat, due in the future → remaining seconds (min 60), PRESERVE
-    - non-heartbeat, due already past  → 60 (the clamp), PRESERVE
-    - non-heartbeat, key absent        → cadence, stamp (``migrated_absent``)
-    - non-heartbeat, key corrupt       → cadence, stamp (``migrated_invalid``)
-
-    ``migrated_absent`` and ``migrated_invalid`` stay distinct on purpose: a
-    corrupt value must not be indistinguishable from a pre-upgrade marker.
-    A preserved ``next_due_at`` is returned byte-identical — never re-formatted.
     """
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("compute_rearm: `now` must be timezone-aware")
 
     cadence = _resolve_cadence(marker, default_cadence)
 
-    if is_heartbeat:
-        return RearmDecision(
-            delay_seconds=cadence,
-            next_due_at=_format_ts(now + timedelta(seconds=cadence)),
-            write_next_due_at=True,
-            reason="heartbeat",
-        )
-
-    if not (isinstance(marker, Mapping) and "next_due_at" in marker):
-        # R4 — a pre-upgrade marker (or no marker at all): write the field once.
-        return RearmDecision(
-            delay_seconds=cadence,
-            next_due_at=_format_ts(now + timedelta(seconds=cadence)),
-            write_next_due_at=True,
-            reason="migrated_absent",
-        )
-
-    raw = marker["next_due_at"]
-    due = _parse_due(raw)
-    if due is None:
-        # R5 — a corrupt value is a real error, not a pre-upgrade marker.
-        return RearmDecision(
-            delay_seconds=cadence,
-            next_due_at=_format_ts(now + timedelta(seconds=cadence)),
-            write_next_due_at=True,
-            reason="migrated_invalid",
-        )
-
-    # R2/R3 — preserve the deadline; re-arm for what remains, clamped at 60.
-    remaining = int((due - now).total_seconds())
     return RearmDecision(
-        delay_seconds=max(_MIN_DELAY_SECONDS, remaining),
-        next_due_at=raw,
+        delay_seconds=cadence,
+        next_due_at=_format_ts(now + timedelta(seconds=cadence)),
         write_next_due_at=False,
-        reason="preserved",
+        reason="sliding_window",
     )
 
 
@@ -455,21 +418,6 @@ def _rearm_main(args: argparse.Namespace) -> int:
         is_heartbeat=(args.wake_kind == "heartbeat"),
     )
 
-    if decision.write_next_due_at:
-        _write_next_due_at(marker_path, marker, decision.next_due_at)
-
-    if decision.reason in ("migrated_absent", "migrated_invalid"):
-        detail = (
-            "absent"
-            if decision.reason == "migrated_absent"
-            else "present but invalid"
-        )
-        sys.stderr.write(
-            f"loop_prompt: {decision.reason}: next_due_at is {detail} in "
-            f"{marker_path} — migrating the loop deadline now; later arms "
-            f"preserve it.\n"
-        )
-
     # stdout carries the integer and NOTHING else, so `delay=$(...)` composes.
     sys.stdout.write(f"{decision.delay_seconds}\n")
     return 0
@@ -484,7 +432,7 @@ def _main() -> None:
             "Example:\n"
             "  echo 'Checking for new work.' | python loop_prompt.py --kind working\n"
             "\n"
-            "Or compute a preserve-deadline re-arm delay (#3005):\n"
+            "Or compute a sliding-window re-arm delay (#4007):\n"
             "  python loop_prompt.py --rearm-delay --wake-kind other\n"
         ),
     )
@@ -500,7 +448,7 @@ def _main() -> None:
         action="store_true",
         help=(
             "Print the integer seconds to pass to ScheduleWakeup for this wake "
-            "(preserve-deadline re-arm, #3005) and stamp the marker if needed."
+            "(sliding-window re-arm, #4007)."
         ),
     )
     parser.add_argument(

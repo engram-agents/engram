@@ -38,6 +38,8 @@ from test_loop_arm_stop_hook import (  # noqa: E402
     _run_hook,
     _schedule_wakeup_call,
     _tool_use_record,
+    _tool_use_record_with_msg_id,
+    _batched_arm_records,
     _write_loop_marker,
 )
 
@@ -364,11 +366,13 @@ class Seat:
     def quiet(self, *, rearm=True):
         lines = [WAKE, _tu("mcp__umwelt__whats_new")]
         if rearm:
-            lines.append(REARM)
+            sw, cl = _batched_arm_records("t_sw", "t_cl", _REAL_LOOP_PROMPT, "msg_quiet_rearm")
+            lines.extend([sw, cl])
         return self.fire(*lines)
 
     def busy(self):
-        return self.fire(WAKE, _tu("mcp__umwelt__send_crossing", {"to": "x"}), REARM)
+        sw, cl = _batched_arm_records("t_sw", "t_cl", _REAL_LOOP_PROMPT, "msg_busy_rearm")
+        return self.fire(WAKE, _tu("mcp__umwelt__send_crossing", {"to": "x"}), sw, cl)
 
 
 def _decision(out: str):
@@ -425,7 +429,8 @@ def test_different_transcript_path_resets(tmp_path):
     s.quiet()
     other = tmp_path / "other.jsonl"
     other.write_text("")
-    assert s.fire(WAKE, _tu("mcp__umwelt__whats_new"), REARM, transcript=other) == ""
+    sw, cl = _batched_arm_records("t_sw", "t_cl", _REAL_LOOP_PROMPT, "msg_other_rearm")
+    assert s.fire(WAKE, _tu("mcp__umwelt__whats_new"), sw, cl, transcript=other) == ""
     assert s.ticks() == 1  # restarted from 0 on the new transcript, not 2
     assert json.loads(s.state_path.read_text())["transcript_path"] == str(other)
 
@@ -499,7 +504,8 @@ def test_unwritable_state_path_never_breaks_hook(tmp_path):
 def test_human_turn_resets_via_subprocess(tmp_path):
     s = Seat(tmp_path)
     s.quiet()
-    assert s.fire(HUMAN, REARM) == ""
+    sw, cl = _batched_arm_records("t_sw", "t_cl", _REAL_LOOP_PROMPT, "msg_human_rearm")
+    assert s.fire(HUMAN, sw, cl) == ""
     assert s.ticks() == 0
 
 

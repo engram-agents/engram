@@ -509,7 +509,11 @@ def test_marker_block_writes_valid_json_with_the_real_absolute_path(tmp_path, na
     assert not leaked, f"{name}: a string field holds an unexpanded shell expression: {leaked}"
     if name.startswith("school"):
         assert f"Read {home}/loop-mode.json for" in data["loop_prompt"], data["loop_prompt"][:200]
-    assert f"{home}/marketplace/plugins/engram/tools/loop_prompt.py" in data["FIRST_ACTION"]
+    if name.startswith("school"):
+        assert f"{home}/marketplace/plugins/engram/tools/loop_prompt.py" in data["FIRST_ACTION"]
+    else:
+        # after #4007 the loop heredoc arms directly at cadence_seconds; no helper path in FIRST_ACTION
+        assert "cadence_seconds" in data["FIRST_ACTION"], data["FIRST_ACTION"][:200]
 
 
 @pytest.mark.parametrize("mode", MODES)
