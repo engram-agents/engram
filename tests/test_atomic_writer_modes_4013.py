@@ -455,7 +455,7 @@ MODE_AWARE = {
     "src/engram/tools/set_forum_url.py": "copies the old mode onto the temp",
     "src/engram/tools/dream_pickup.py": "copies the old mode onto the temp",
     "src/engram/tools/engram-pkg/engram-pkg": "explicit chmod 0o644 on both outputs",
-    "src/engram/tools/lesson-pattern-audit.py": "old mode (0o640 new) and best-effort ACL",
+    "tools/lesson-pattern-audit.py": "old mode (0o640 new) and best-effort ACL",
 }
 
 # Private on purpose: only the owner reads it, and the file says so.
