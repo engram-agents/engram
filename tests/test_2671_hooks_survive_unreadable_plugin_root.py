@@ -263,6 +263,8 @@ def test_find_tools_parent_resolves_past_nearer_unreadable_ancestor(tmp_path):
     outer = tmp_path / "outer"
     (outer / "tools").mkdir(parents=True)
     (outer / "tools" / "config_schema.py").write_text("# stub\n")
+    # #3983: `outer` is the tree root (the walk is bounded at the nearest engram_core.py).
+    (outer / "engram_core.py").write_text("")
 
     blocked = outer / "blocked"
     blocked.mkdir()
@@ -288,6 +290,8 @@ def test_find_indexer_dir_resolves_past_nearer_unreadable_ancestor(tmp_path):
     outer = tmp_path / "outer"
     outer.mkdir()
     (outer / "engram_log_indexer.py").write_text("# stub\n")
+    # #3983: `outer` is the tree root (the walk is bounded at the nearest engram_core.py).
+    (outer / "engram_core.py").write_text("")
 
     blocked = outer / "blocked"
     blocked.mkdir()

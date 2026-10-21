@@ -66,6 +66,28 @@ from pathlib import Path
 from typing import Any
 
 
+# Inline copy, not an import: this file imports nothing from the `tools` package, so no shared module is guaranteed importable here.
+# Pinned identical to every other copy by tests/test_bounded_sibling_lookups_3983.py.
+def _bounded_parents(here):
+    """Directories to search for a sibling runtime file: `here`'s own directory
+    up to and INCLUDING its own tree root, nearest first, never above it (#3983).
+    The tree root is the nearest ancestor holding engram_core.py (the plugin root
+    installed, src/engram/ in a source checkout; an essential-tier file, so every
+    build ships it).  server.py is no marker: viz/server.py exists.  With no
+    engram_core.py above, only the own directory and its parent are searched
+    (the conservative case).  An unreadable directory is skipped
+    (never taken for the root), so the walk still ends at the first readable root."""
+    chain = []
+    for d in here.parents:
+        chain.append(d)
+        try:
+            if (d / "engram_core.py").exists():
+                return chain
+        except OSError:
+            continue  # unreadable: not a root we can see; keep climbing
+    return chain[:2]
+
+
 def _find_helper_dir() -> Path | None:
     """The directory holding engram_regular_io.py: CLAUDE_PLUGIN_ROOT first,
     then a walk of this file's parents (the installed plugin has the helper at
@@ -76,7 +98,7 @@ def _find_helper_dir() -> Path | None:
     if root:
         cands.append(Path(root))
     here = Path(__file__).resolve()
-    for p in (here.parent, *here.parents):
+    for p in _bounded_parents(here):  # own tree only, never above its root (#3983)
         cands.append(p)
         cands.append(p / "src" / "engram")
     for c in cands:

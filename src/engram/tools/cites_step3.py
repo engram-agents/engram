@@ -201,13 +201,21 @@ def _ro_uri(path):
 # engine loading
 # ---------------------------------------------------------------------------
 
+def _own_tree_window(here):
+    """Directories to search for engram_core.py (#3983): this file's own directory
+    and its parent, nothing above.  engram_core.py is the tree-root marker itself,
+    so it cannot bound its own search; tools/ sits directly under the tree root in
+    the installed plugin and in src/engram/ alike, so the root IS the parent."""
+    return list(here.parents)[:2]
+
+
 def _find_engine_dir() -> Path:
     cands = []
     root = os.environ.get("CLAUDE_PLUGIN_ROOT")
     if root:
         cands.append(Path(root))
     here = Path(__file__).resolve()
-    for p in (here.parent, *here.parents):
+    for p in _own_tree_window(here):  # own tree only, never above its root (#3983)
         cands.append(p)
         cands.append(p / "src" / "engram")
     for c in cands:

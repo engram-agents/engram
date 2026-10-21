@@ -80,6 +80,10 @@ def _scratch(tmp_path: Path, name: str, lib_mode: str, hook_name: str,
     for src in HOOK_DIR.glob("*.py"):
         shutil.copy2(src, hooks / src.name)
     (root / "engram" / "tools").symlink_to(TOOLS_DIR, target_is_directory=True)
+    # #3983: the bounded sibling-file walk anchors on the tree-root marker
+    # `engram_core.py` (every real source/plugin tree has one). Without it the
+    # walk falls back to two levels and never reaches `engram/tools`.
+    (root / "engram" / "engram_core.py").write_text("")
     lib = hooks / "_prompthooklib.py"
     if lib_mode == "raise":
         lib.write_text(f"raise RuntimeError({SECRET!r})\n")

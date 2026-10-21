@@ -32,7 +32,7 @@
       },
       {
         "file": "tools/codex-umwelt-wake.py",
-        "line": 684,
+        "line": 706,
         "reason": "Codex RPC notification-drain dispatch (getattr(rpc, 'drain_buffered_notifications', None)); this file contains zero emit()/emit_if_initialized() calls and is not on any site's backward-walk path.",
         "zero_emit_file": true
       }

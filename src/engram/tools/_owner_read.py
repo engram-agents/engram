@@ -99,15 +99,38 @@ class OwnerReadSpec:
     write_timeout: float = DEFAULT_WRITE_SECONDS
 
 
+def bounded_parents(here):
+    """Directories to search for a sibling runtime file: `here`'s own directory
+    up to and INCLUDING its own tree root, nearest first, never above it (#3983).
+    The tree root is the nearest ancestor holding engram_core.py (the plugin root
+    installed, src/engram/ in a source checkout; an essential-tier file, so every
+    build ships it).  server.py is no marker: viz/server.py exists.  With no
+    engram_core.py above, only the own directory and its parent are searched
+    (the conservative case).  An unreadable directory is skipped
+    (never taken for the root), so the walk still ends at the first readable root.
+    The tools that already import this module (engram-sign, reconcile_lesson_demotions)
+    use this one; tests/test_bounded_sibling_lookups_3983.py pins every copy identical."""
+    chain = []
+    for d in here.parents:
+        chain.append(d)
+        try:
+            if (d / "engram_core.py").exists():
+                return chain
+        except OSError:
+            continue  # unreadable: not a root we can see; keep climbing
+    return chain[:2]
+
+
 def runtime_dir() -> Path | None:
     """The directory holding engramd_client.py (the plugin root when deployed, src/engram/ in the source
-    tree): $CLAUDE_PLUGIN_ROOT first, then a walk of ALL parent directories of this file (never a fixed
-    parents[N] -- the path hazards _resolve_hook_path in reconcile_lesson_demotions documents)."""
+    tree): $CLAUDE_PLUGIN_ROOT first, then this file's own directory up to and including its tree root
+    (#3983; never a fixed parents[N] -- the path hazards _resolve_hook_path in reconcile_lesson_demotions
+    documents -- and never above the tree root)."""
     roots: list[Path] = []
     plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
     if plugin_root:
         roots.append(Path(plugin_root))
-    roots.extend(Path(__file__).resolve().parents)
+    roots.extend(bounded_parents(Path(__file__).resolve()))  # own tree only (#3983)
     for root in roots:
         try:
             if (root / "engramd_client.py").exists():
@@ -121,7 +144,7 @@ def import_runtime(name: str):
     """Import a runtime module (engramd_client, engramd_owner_flags) from runtime_dir()."""
     runtime = runtime_dir()
     if runtime is None:
-        raise ImportError(f"{name}: no engramd_client.py found via CLAUDE_PLUGIN_ROOT or a walk of this file's parents")
+        raise ImportError(f"{name}: no engramd_client.py found via CLAUDE_PLUGIN_ROOT or this file's own tree")
     if str(runtime) not in sys.path:
         sys.path.insert(0, str(runtime))
     return importlib.import_module(name)

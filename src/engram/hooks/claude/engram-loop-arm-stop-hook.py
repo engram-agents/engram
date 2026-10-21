@@ -469,11 +469,34 @@ except Exception:
 
 _LOOP_WAKE_MARKER_FALLBACK: str = "<loop-wake>"
 
+# Inline copy, not _hooklib's: every _hooklib import in this hook is guarded, so it cannot be assumed here.
+# Pinned identical to every other copy by tests/test_bounded_sibling_lookups_3983.py.
+def _bounded_parents(here):
+    """Directories to search for a sibling runtime file: `here`'s own directory
+    up to and INCLUDING its own tree root, nearest first, never above it (#3983).
+    The tree root is the nearest ancestor holding engram_core.py (the plugin root
+    installed, src/engram/ in a source checkout; an essential-tier file, so every
+    build ships it).  server.py is no marker: viz/server.py exists.  With no
+    engram_core.py above, only the own directory and its parent are searched
+    (the conservative case).  An unreadable directory is skipped
+    (never taken for the root), so the walk still ends at the first readable root."""
+    chain = []
+    for d in here.parents:
+        chain.append(d)
+        try:
+            if (d / "engram_core.py").exists():
+                return chain
+        except OSError:
+            continue  # unreadable: not a root we can see; keep climbing
+    return chain[:2]
+
+
 _lp_candidates = []
 _lp_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
 if _lp_plugin_root:
     _lp_candidates.append(Path(_lp_plugin_root) / "tools")
-for _lp_parent in Path(__file__).resolve().parents:
+# Own tree only: up to and including the tree root, never above it (#3983).
+for _lp_parent in _bounded_parents(Path(__file__).resolve()):
     _lp_candidates.append(_lp_parent / "tools")
 # (c / "loop_prompt.py").exists() raises OSError -- not False -- on an
 # unreadable candidate directory, and this whole block runs at bare

@@ -139,7 +139,9 @@ except Exception:
     # its src/engram) that actually holds it -- never a fixed parents[N].
     _not_search_excluded_sql = None
     try:
-        for _parent in Path(__file__).resolve().parents:
+        from _hooklib import bounded_parents as _bounded_parents
+        # Own tree only: up to and including the tree root, never above it (#3983).
+        for _parent in _bounded_parents(Path(__file__).resolve()):
             for _cand in (_parent, _parent / "src" / "engram"):
                 if (_cand / "engram_search_rules.py").exists():
                     sys.path.insert(0, str(_cand))

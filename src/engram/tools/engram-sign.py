@@ -36,13 +36,13 @@ from tools import _owner_read as owner_read  # noqa: E402
 
 def _find_module_dir() -> Path | None:
     """Directory holding engram_signature.py: $CLAUDE_PLUGIN_ROOT first, then
-    the nearest parent of this file that has it (never a fixed parents[N]: the
-    plugin build flattens the source layout)."""
+    the nearest directory from this file's own up to its tree root that has it
+    (#3983; never a fixed parents[N]: the plugin build flattens the source layout)."""
     roots = []
     env = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
     if env:
         roots.append(Path(env))
-    roots.extend(Path(__file__).resolve().parents)
+    roots.extend(owner_read.bounded_parents(Path(__file__).resolve()))  # own tree only (#3983)
     for r in roots:
         try:
             if (r / "engram_signature.py").is_file():
@@ -62,7 +62,7 @@ def main(argv=None) -> int:
     mod_dir = _find_module_dir()
     if mod_dir is None:
         print("engram-sign refused [module]: engram_signature.py not found via "
-              "CLAUDE_PLUGIN_ROOT or any parent of this script", file=sys.stderr)
+              "CLAUDE_PLUGIN_ROOT or this script's own tree", file=sys.stderr)
         return 2
     sys.path.insert(0, str(mod_dir))
     import engram_signature

@@ -44,7 +44,7 @@ DEFERENCE_COOLDOWN_PATH = os.path.join(ENGRAM_HOME, "deference-cooldown-at.txt")
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import resolve_runtime_dir, emit_context
+from _hooklib import resolve_runtime_dir, emit_context, bounded_parents
 # #3628: every marker read and the cooldown write are non-blocking and regular-file-only.
 from _hooklib import open_regular_text, open_regular_text_write
 from _harness import detect_harness, get_harness_budgets
@@ -94,7 +94,8 @@ _lp_candidates = []
 _lp_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
 if _lp_plugin_root:
     _lp_candidates.append(Path(_lp_plugin_root) / "tools")
-for _lp_parent in Path(__file__).resolve().parents:
+# Own tree only: up to and including the tree root, never above it (#3983).
+for _lp_parent in bounded_parents(Path(__file__).resolve()):
     _lp_candidates.append(_lp_parent / "tools")
 # (c / "loop_prompt.py").exists() raises OSError -- not False -- on an
 # unreadable candidate directory, and this whole block runs at bare

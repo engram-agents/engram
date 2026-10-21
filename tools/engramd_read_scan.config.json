@@ -2,6 +2,7 @@
  "roots": [
   "hooks/claude/_harness.py:get_harness_budgets",
   "hooks/claude/_harness.py:detect_harness",
+  "hooks/claude/_hooklib.py:bounded_parents",
   "hooks/claude/_hooklib.py:resolve_tools_dir",
   "hooks/claude/_hooklib.py:resolve_runtime_dir",
   "hooks/claude/_hooklib.py:import_owner_flags",
@@ -266,6 +267,7 @@
   "hooks/claude/engram-lesson-tripwire-hook.py:_ledger_entry",
   "hooks/claude/engram-lesson-tripwire-hook.py:_tripwire_overflow_writer",
   "hooks/claude/engram-lesson-tripwire-hook.py:_cached_overflow_writer",
+  "hooks/claude/engram-loop-arm-stop-hook.py:_bounded_parents",
   "hooks/claude/engram-loop-arm-stop-hook.py:_not_regular_error",
   "hooks/claude/engram-loop-arm-stop-hook.py:open_regular_text",
   "hooks/claude/engram-lesson-tripwire-hook.py:marker_recall_query",

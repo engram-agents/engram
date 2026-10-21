@@ -194,6 +194,40 @@ _report() {
     fi
 }
 
+# Where a sibling runtime file may be looked for (#3983): this script's own directory, then each
+# parent up to and INCLUDING its tree root, never above it. The tree root is the nearest directory
+# holding engram_core.py (the installed plugin root and src/engram/ both do). Walking on to "/" would
+# let a tier-filtered build that omits the file pick up a stale copy from an ancestor (a scatter-era
+# ENGRAM home folder (ENGRAM_HOME) is an ancestor of the plugin root). With no engram_core.py above, only the own directory
+# and its parent are offered. One directory per line, nearest first. bash 3.2-safe: no arrays, no bash 4.
+_bounded_dirs() {
+    local start d
+    start="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")"
+    d="$start"
+    while [ -n "$d" ] && [ "$d" != "." ]; do
+        if [ -f "$d/engram_core.py" ]; then
+            d="$start"
+            while :; do
+                printf '%s\n' "$d"
+                if [ -f "$d/engram_core.py" ]; then
+                    return 0
+                fi
+                d="$(dirname "$d")"
+            done
+        fi
+        if [ "$d" = "/" ]; then
+            break
+        fi
+        d="$(dirname "$d")"
+    done
+    printf '%s\n' "$start"
+    d="$(dirname "$start")"
+    if [ "$d" != "$start" ]; then
+        printf '%s\n' "$d"
+    fi
+    return 0
+}
+
 # The I/O helper is a sibling of this script (hooks/ when flattened, hooks/claude/ in source).
 _find_io_helper() {
     local d f="_engramd_owner_hook_io.py"
@@ -201,8 +235,7 @@ _find_io_helper() {
         printf '%s' "$CLAUDE_PLUGIN_ROOT/hooks/$f"
         return 0
     fi
-    d="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")"
-    while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
+    while IFS= read -r d; do
         if [ -f "$d/$f" ]; then
             printf '%s' "$d/$f"
             return 0
@@ -211,8 +244,9 @@ _find_io_helper() {
             printf '%s' "$d/hooks/$f"
             return 0
         fi
-        d="$(dirname "$d")"
-    done
+    done <<EOF
+$(_bounded_dirs)
+EOF
     return 1
 }
 
@@ -222,14 +256,14 @@ _find_plugin_root() {
         printf '%s' "$CLAUDE_PLUGIN_ROOT"
         return 0
     fi
-    d="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")"
-    while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
+    while IFS= read -r d; do
         if [ -f "$d/engramd_owner_flags.py" ]; then
             printf '%s' "$d"
             return 0
         fi
-        d="$(dirname "$d")"
-    done
+    done <<EOF
+$(_bounded_dirs)
+EOF
     return 1
 }
 

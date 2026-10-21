@@ -198,8 +198,16 @@ resolves to *a* path, just the wrong one.
 
 - **Do:** resolve via `$CLAUDE_PLUGIN_ROOT` first (reliably set when hooks/tools
   run — `hooks.json` invokes every hook as `${CLAUDE_PLUGIN_ROOT}/...`), then fall
-  back to a **walk-parents search for the actual target file** (the nearest
-  ancestor dir that contains what you need), never a fixed `parents[N]`. See
+  back to a **walk-parents search for the actual target file, stopping at the
+  file's own tree root** (the nearest ancestor containing `engram_core.py`: the
+  plugin root installed, `src/engram/` in source); never search above it, or a
+  tier-filtered build can match a stale copy in an ancestor (#3983). Never a
+  fixed `parents[N]` (the one exception: a file looking for `engram_core.py`
+  itself uses a fixed window of its own directory and its parent). The defect is
+  any upward walk, in any spelling: `.parents` however used (`roots.extend(...)`
+  counts), a `.parent`/`dirname` loop, in Python or shell (`start-engramd-owner.sh`
+  had two). A new one fails `tests/test_no_unbounded_upward_walks_3983.py`
+  unless bounded or classified there. See
   `engram-baton-prompt-hook.py` / `engram-forum-prompt-hook.py` for the pattern.
 - **Verify against the DEPLOYED tree, not just `src/`.** This bug class is
   invisible to CI and unit tests — they run in the `src/` layout, where the

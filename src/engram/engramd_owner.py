@@ -1177,12 +1177,34 @@ def _arm_read_deadline(
 READ_TEMPLATES_FILENAME = "engramd_read_templates.json"
 
 
+# Inline copy, not an import: no existing tree-root module can host it (engram_core is imported lazily on purpose, see _engram_core), and a new one is a new shippable for one caller.
+# Pinned identical to every other copy by tests/test_bounded_sibling_lookups_3983.py.
+def _bounded_parents(here):
+    """Directories to search for a sibling runtime file: `here`'s own directory
+    up to and INCLUDING its own tree root, nearest first, never above it (#3983).
+    The tree root is the nearest ancestor holding engram_core.py (the plugin root
+    installed, src/engram/ in a source checkout; an essential-tier file, so every
+    build ships it).  server.py is no marker: viz/server.py exists.  With no
+    engram_core.py above, only the own directory and its parent are searched
+    (the conservative case).  An unreadable directory is skipped
+    (never taken for the root), so the walk still ends at the first readable root."""
+    chain = []
+    for d in here.parents:
+        chain.append(d)
+        try:
+            if (d / "engram_core.py").exists():
+                return chain
+        except OSError:
+            continue  # unreadable: not a root we can see; keep climbing
+    return chain[:2]
+
+
 def _find_read_templates_path() -> "Path | None":
     """Locate the committed template list WITHOUT assuming the source
     layout (project CLAUDE.md, "Plugin build restructures code paths"):
     the file BESIDE this module first, then `$CLAUDE_PLUGIN_ROOT`, then the
-    nearest ancestor of this module that actually contains the file -- never
-    a fixed `parents[N]`. The data file ships beside the module in both the
+    nearest ancestor of this module that actually contains the file, stopping
+    at this module's own tree root (#3983) -- never a fixed `parents[N]`. The data file ships beside the module in both the
     source and the flattened plugin layouts, so a stale CLAUDE_PLUGIN_ROOT
     must not override it. None if it cannot be found (the registry is then
     EMPTY: everything refused)."""
@@ -1195,7 +1217,7 @@ def _find_read_templates_path() -> "Path | None":
         if cand.is_file():
             return cand
     here = Path(__file__).resolve()
-    for d in here.parents:
+    for d in _bounded_parents(here):  # own tree only, never above its root (#3983)
         cand = d / READ_TEMPLATES_FILENAME
         if cand.is_file():
             return cand

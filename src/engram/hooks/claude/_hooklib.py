@@ -89,11 +89,32 @@ def engram_home_or_exit() -> Path:
     return home
 
 
+def bounded_parents(here):
+    """Directories to search for a sibling runtime file: `here`'s own directory
+    up to and INCLUDING its own tree root, nearest first, never above it (#3983).
+    The tree root is the nearest ancestor holding engram_core.py (the plugin root
+    installed, src/engram/ in a source checkout; an essential-tier file, so every
+    build ships it).  server.py is no marker: viz/server.py exists.  With no
+    engram_core.py above, only the own directory and its parent are searched
+    (the conservative case).  An unreadable directory is skipped
+    (never taken for the root), so the walk still ends at the first readable root."""
+    chain = []
+    for d in here.parents:
+        chain.append(d)
+        try:
+            if (d / "engram_core.py").exists():
+                return chain
+        except OSError:
+            continue  # unreadable: not a root we can see; keep climbing
+    return chain[:2]
+
+
 def resolve_tools_dir(marker_filename: str) -> Optional[Path]:
     """Resolve `tools/` across both build topologies and add it to sys.path.
 
-    Prefers `$CLAUDE_PLUGIN_ROOT/tools` when set, else walks ALL parent
-    directories of this file (never a fixed-depth `parents[N]` -- see module
+    Prefers `$CLAUDE_PLUGIN_ROOT/tools` when set, else walks the parent
+    directories of this file from its own up to and including its tree root,
+    never above it (#3983; never a fixed-depth `parents[N]` -- see module
     docstring) and takes the first `tools/` candidate that actually contains
     `marker_filename`. This file (`_hooklib.py`) lives in the SAME directory
     as the hooks that call it in both topologies (source: `hooks/claude/`;
@@ -110,7 +131,8 @@ def resolve_tools_dir(marker_filename: str) -> Optional[Path]:
     plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
     if plugin_root:
         candidates.append(Path(plugin_root) / "tools")
-    for parent in Path(__file__).resolve().parents:
+    # Own tree only: up to and including the tree root, never above it (#3983).
+    for parent in bounded_parents(Path(__file__).resolve()):
         candidates.append(parent / "tools")
 
     tools_dir = next(

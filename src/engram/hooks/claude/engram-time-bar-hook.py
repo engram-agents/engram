@@ -55,7 +55,7 @@ if _ENGRAM_HOME_RAW:
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import read_regular_text, open_regular_text_write
+from _hooklib import read_regular_text, open_regular_text_write, bounded_parents
 
 try:
     from zoneinfo import ZoneInfo
@@ -92,7 +92,8 @@ _lp_candidates = []
 _lp_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
 if _lp_plugin_root:
     _lp_candidates.append(Path(_lp_plugin_root) / "tools")
-for _lp_parent in Path(__file__).resolve().parents:
+# Own tree only: up to and including the tree root, never above it (#3983).
+for _lp_parent in bounded_parents(Path(__file__).resolve()):
     _lp_candidates.append(_lp_parent / "tools")
 # (c / "loop_prompt.py").exists() raises OSError -- not False -- on an
 # unreadable candidate directory, and this whole block runs at bare
