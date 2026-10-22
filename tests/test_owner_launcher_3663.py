@@ -1121,6 +1121,7 @@ def _short_home_for_socket(seat: Seat) -> Path:
     eh = d / "eh"
     eh.mkdir()
     shutil.copy(SRC / "engramd_client.py", seat.plugin / "engramd_client.py")
+    shutil.copy(SRC / "engram_home_resolver.py", seat.plugin / "engram_home_resolver.py")  # #3863 step 2: the client imports it
     seat.eh = eh
     return d
 
@@ -1184,6 +1185,7 @@ def test_f5_a_loser_whose_launch_died_reports_a_live_owner_that_is_not_serving(s
     seat.systemctl("nobus")
     # the probe must be able to run, or its answer would be `ambiguous:` and nothing is claimed
     shutil.copy(SRC / "engramd_client.py", seat.plugin / "engramd_client.py")
+    shutil.copy(SRC / "engram_home_resolver.py", seat.plugin / "engram_home_resolver.py")  # #3863 step 2: the client imports it
     seat.fail_flag.write_text("x")
     winner = _race_winner(seat, order)
     try:
