@@ -1,7 +1,7 @@
 """Nothing-lost gate for the CLAUDE.md prune (#3322).
 
 CLAUDE.md states rules; dated measurement history lives in docs/. Every block
-moved out of CLAUDE.md is listed in docs/claude-md-moves.json with its first and
+moved out of CLAUDE.md is listed in tools/claude_md_moves.json with its first and
 last sentence. tools/claude_md_moves_check.py asserts each of those appears
 exactly once in the named doc and zero times in CLAUDE.md.
 
@@ -28,9 +28,10 @@ def _load():
 
 def _fixture(tmp_path, claude, doc, moves):
     (tmp_path / "docs").mkdir()
+    (tmp_path / "tools").mkdir()
     (tmp_path / "CLAUDE.md").write_text(claude, encoding="utf-8")
     (tmp_path / "docs" / "MOVED.md").write_text(doc, encoding="utf-8")
-    (tmp_path / "docs" / "claude-md-moves.json").write_text(
+    (tmp_path / "tools" / "claude_md_moves.json").write_text(
         json.dumps({"moves": moves}), encoding="utf-8"
     )
     return tmp_path
@@ -51,7 +52,7 @@ def test_real_repo_mapping_is_satisfied():
 
 
 def test_real_repo_mapping_is_nonempty():
-    data = json.loads((REPO / "docs" / "claude-md-moves.json").read_text(encoding="utf-8"))
+    data = json.loads((REPO / "tools" / "claude_md_moves.json").read_text(encoding="utf-8"))
     assert len(data["moves"]) > 0
 
 

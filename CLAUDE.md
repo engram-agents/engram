@@ -8,7 +8,7 @@ origin (date + who ruled), and a pointer to where the evidence lives. Dated
 measurement history lives in `docs/`, not here. Budget: at most 75,000 bytes
 today (CI step `claude-md-budget`; 40,000 is the round-2 target of #3322, reached by
 tightening rule wording, not by moving more); moved blocks are listed in
-`docs/claude-md-moves.json` and checked by `tools/claude_md_moves_check.py`.
+`tools/claude_md_moves.json` and checked by `tools/claude_md_moves_check.py`.
 
 ## MCP tool parameter style
 

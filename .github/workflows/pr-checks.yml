@@ -829,11 +829,11 @@ jobs:
         # to ~115 KB of mostly dated measurement history. Rules stay in CLAUDE.md;
         # evidence lives in docs/. One `wc` — stdlib, well inside the under-one-
         # minute cost rule (Branching convention). The nothing-lost half of the
-        # contract is tests/test_claude_md_moves.py (docs/claude-md-moves.json).
+        # contract is tests/test_claude_md_moves.py (tools/claude_md_moves.json).
         run: |
           size="$(wc -c < CLAUDE.md)"
           if [ "$size" -gt 75000 ]; then
-            echo "::error::CLAUDE.md is $size bytes; the budget is 75000 (round 1 of #3322; round 2 lowers it to 40000). Move dated measurement history to docs/ (rules stay) and list the move in docs/claude-md-moves.json."
+            echo "::error::CLAUDE.md is $size bytes; the budget is 75000 (round 1 of #3322; round 2 lowers it to 40000). Move dated measurement history to docs/ (rules stay) and list the move in tools/claude_md_moves.json."
             exit 1
           fi
           echo "CLAUDE.md is $size bytes (budget 75000)."

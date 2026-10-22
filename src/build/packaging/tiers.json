@@ -789,7 +789,13 @@
       "path": "tools/claude_md_moves_check.py",
       "tier": "dev",
       "source": "tools/claude_md_moves_check.py",
-      "note": "nothing-lost check for the CLAUDE.md prune (#3322): reads docs/claude-md-moves.json and asserts each moved block's first and last sentence appears exactly once in its target doc and zero times in CLAUDE.md. Developer tier (T3): a repo-maintenance gate for ENGRAM development, run by tests/test_claude_md_moves.py in pr-checks; no install ever needs it. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly, same as tools/recall_repetition_analysis.py."
+      "note": "nothing-lost check for the CLAUDE.md prune (#3322): reads tools/claude_md_moves.json and asserts each moved block's first and last sentence appears exactly once in its target doc and zero times in CLAUDE.md. Developer tier (T3): a repo-maintenance gate for ENGRAM development, run by tests/test_claude_md_moves.py in pr-checks; no install ever needs it. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly, same as tools/recall_repetition_analysis.py."
+    },
+    {
+      "path": "tools/claude_md_moves.json",
+      "tier": "dev",
+      "source": "tools/claude_md_moves.json",
+      "note": "#3322: the mapping of blocks moved out of CLAUDE.md, read by tools/claude_md_moves_check.py. Tiered with the gate it feeds (dev, T3): one inseparable unit. Real data file directly under repo-root tools/, so 'source' is set explicitly."
     },
     {
       "path": "tools/check_2652_ledger.py",
