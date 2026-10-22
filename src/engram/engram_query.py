@@ -44,7 +44,7 @@ from engram_log_emitter import Emitter, emit_if_initialized
 # Essential-only build (tests/test_tiers_manifest.py's
 # test_import_dep_tier_consistency enforces exactly this). Guarded import +
 # no-op stub keeps this module's own tool functions gating-nothing-T1
-# (docs/2574-telemetry-design.md §8) even if the store ships without it.
+# (docs/internal/2574-telemetry-design.md §8) even if the store ships without it.
 try:
     from engram_telemetry_store import write_telemetry_record
 except Exception:  # pragma: no cover -- import-failure fallback
@@ -2077,7 +2077,7 @@ def _search_nodes(
 # and server.py's own comment on the emitter states the MCP server process
 # has no single session_id binding) — the DEFAULT_SUPPRESSION_K/M scoped
 # per-session ledger the general per-node suppression already uses (see
-# docs/recall-triggering-blueprint.md §3-P1) cannot be reused verbatim for
+# docs/internal/recall-triggering-blueprint.md §3-P1) cannot be reused verbatim for
 # these two surfaces, so a dedicated non-session-scoped bucket key is used
 # instead, deliberately shared across ALL sessions/surfaces rather than
 # keyed per-session.
@@ -3011,7 +3011,7 @@ def _query_impl(
         # source_class_filter is not a parameter of engram_query (only type
         # filter exists); emitted as None. Noted in phase-3 F1 handoff.
         # alpha #2574 WS5: site attestation + outcome recording +
-        # protection (docs/2574-telemetry-design.md §1/§4/§5) -- new,
+        # protection (docs/internal/2574-telemetry-design.md §1/§4/§5) -- new,
         # narrowly-scoped try/except; see engram_derive.py's _derive_impl
         # blocked-path site for the full rationale. This function's own
         # try/finally has no except, so an uncaught raise here would

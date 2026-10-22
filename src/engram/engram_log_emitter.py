@@ -193,7 +193,7 @@ class Emitter:
         ``None``, no behavior change for any existing caller that omits it.
         It exists so ``tools/telemetry_manifest_gate.py``'s AST scan (which
         looks for a ``site="..."`` keyword literal at `emit`/
-        `emit_if_initialized` call sites, per docs/2574-telemetry-design.md
+        `emit_if_initialized` call sites, per docs/internal/2574-telemetry-design.md
         §1/§4a) can find it directly at the call. It is NOT threaded into
         this module's own L1/L2 session-log JSONL schema (a different, older
         system — see this module's own docstring); a caller that wants the

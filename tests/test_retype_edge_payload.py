@@ -1,6 +1,6 @@
 """Tests for engram_retype_edge (issue #2265, epic #2252).
 
-Design of record: docs/2265-2347-edge-correction-design.md sec.2. Contract
+Design of record: docs/internal/2265-2347-edge-correction-design.md sec.2. Contract
 (write these tests first, per this repo's contract-first convention):
 Ariadne's comment on issue #2265 ("Build unit cut..."), quoted here so the
 seven numbered tests below map to it one-to-one:

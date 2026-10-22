@@ -1,7 +1,7 @@
 """ENGRAM telemetry store — per-process JSONL writer + sqlite aggregator.
 
 Spec: alpha #2574 (telemetry redesign), epic #2013, WS1 slice.
-Design doc: docs/2574-telemetry-design.md (§3, as amended by this module's
+Design doc: docs/internal/2574-telemetry-design.md (§3, as amended by this module's
 own PR — see that section for the store-shape rationale).
 
 This module is the **store mechanism only** — a new, self-contained module

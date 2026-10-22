@@ -1,5 +1,5 @@
 """Contract-first tests for #2613 — the retraction replacement contract
-(docs/2613-retraction-replacement-contract.md).
+(docs/internal/2613-retraction-replacement-contract.md).
 
 Written before the implementation review lands, per this repo's own
 "CONTRACT-FIRST tests, written before the impl" convention (a stateable

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Completeness guard for docs/2652-migration-ledger.md [part of #2652].
+"""Completeness guard for docs/internal/2652-migration-ledger.md [part of #2652].
 
 The ledger's Section 2 holds one row per line matching `sqlite3\\.connect\\(` in
 TRACKED files under `src/engram`. This check compares, PER FILE, the number of
@@ -86,7 +86,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-LEDGER = "docs/2652-migration-ledger.md"
+LEDGER = "docs/internal/2652-migration-ledger.md"
 SRC = "src/engram"
 CONNECT = re.compile(r"sqlite3\.connect\(")
 # A Section-2 row: `| 12 | `path` `function()` `anchor` | ...`
@@ -129,16 +129,16 @@ SECTION2 = re.compile(r"^##\s+2\.")
 ANY_SECTION = re.compile(r"^##\s")
 
 TALLY_REMEDY = (
-    "make the Section-1 tally lines in docs/2652-migration-ledger.md equal "
+    "make the Section-1 tally lines in docs/internal/2652-migration-ledger.md equal "
     "the counts of the Section-2 `state`, `kind` and `target` columns "
     "(or fix the row)"
 )
 REMEDY = (
-    "add/remove a Section-2 row in docs/2652-migration-ledger.md "
+    "add/remove a Section-2 row in docs/internal/2652-migration-ledger.md "
     "for each connect line you added/removed"
 )
 CITE_REMEDY = (
-    "cite each row as `path` `function()` `anchor` in docs/2652-migration-ledger.md "
+    "cite each row as `path` `function()` `anchor` in docs/internal/2652-migration-ledger.md "
     "(anchor: a substring of the connect line, unique inside the function)"
 )
 

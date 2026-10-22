@@ -1,7 +1,7 @@
 """Contract tests for #3742 (part of #3613): the five unordered focused reads plan on
 `idx_nodes_focused`, not on `idx_nodes_current` (nearly the whole table) or a full SCAN.
 
-Written BEFORE the implementation (docs/CONTRACT-FIRST-TESTS.md). Design seat: Ariadne
+Written BEFORE the implementation (docs/internal/CONTRACT-FIRST-TESTS.md). Design seat: Ariadne
 (build spec, issue comment 6150180014); fix shape ruled by Kepler (comment 6150142362):
 `ORDER BY focused_at` on the id-list reads, the range form `focused_at >= ''` on the COUNT.
 Not `INDEXED BY`, not a partial index, not a schema change.

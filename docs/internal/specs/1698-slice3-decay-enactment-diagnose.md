@@ -2,8 +2,8 @@
 
 **Author:** Sol · **Date:** 2026-07-08 · **Driver role:** spec-fidelity, not
 authorship — Kepler reviews against his own design, does not build.
-**Design source:** `docs/principle-triggers-design.md` §4, §5, §6 (PR 3 of 3),
-§8 open question 2. Depends on slice 2 (`docs/specs/1698-slice2-unified-hook-check.md`)
+**Design source:** `docs/internal/principle-triggers-design.md` §4, §5, §6 (PR 3 of 3),
+§8 open question 2. Depends on slice 2 (`docs/internal/specs/1698-slice2-unified-hook-check.md`)
 having merged — this spec upgrades the flat `{principle_id: last_fired_prompt}`
 state shape slice 2 ships into the richer per-principle record §4 describes.
 **Do not dispatch a fairy against this spec until slice 2 is merged to dev** —

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """tools/engramd_a6_latency.py -- the A6 latency-delta measurement for U4d
-(#3197, part of #2652; docs/2652-engrammanager-design.md SS6.1).
+(#3197, part of #2652; docs/internal/2652-engrammanager-design.md SS6.1).
 
 Measures the user-identity hook's person-node read two ways, in ONE run, on ONE
 store copy, on one host, at the same N:
@@ -1620,7 +1620,7 @@ def _cold_row(rig: SessionStartRig, home: Path, n_cold: int, state: Dict) -> Dic
 # in-hook server runtime, the #3741 class), so no path pays a daemon or a fallback. Honest because the daemon is not
 # an owner read and sits on neither path's store access; a common cost removed makes the owner/baseline ratio LARGER.
 #
-# THE GATE CELL. The design's A6 gate is one warm-cache delta (docs/2652-engrammanager-design.md SS6.1), and the store
+# THE GATE CELL. The design's A6 gate is one warm-cache delta (docs/internal/2652-engrammanager-design.md SS6.1), and the store
 # axis flipped it on two hooks (the stop hook, #3675; the tripwire, #3740: 0.94x on a synthetic store, 1.03-1.04x on a
 # real copy). So the arm measures TWO cells -- a synthetic store and a COPY of a real store -- and the verdict is the
 # REAL-STORE cell on the INSTALLED layout; a synthetic-only result is never a pass (surface_gate).

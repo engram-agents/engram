@@ -161,7 +161,7 @@ broken flag helper reads OFF and the direct path is taken. Flag ON also never re
 an outage as a count of zero ("immature", which would nudge): an owner that is down,
 refusing, answering with something unusable (including any result that is not an
 `Ok`), a client that raises, or a client module that raises ANY exception at
-import all yield a LOUD result instead (docs/2652-engrammanager-design.md
+import all yield a LOUD result instead (docs/internal/2652-engrammanager-design.md
 SS5.1, SS5.5). "ANY exception" means `Exception` and `SystemExit` (a client that
 calls exit at import or from `read` is an owner failure, never a silent exit);
 `KeyboardInterrupt` is deliberately NOT caught and still escapes the hook. A single
@@ -1076,7 +1076,7 @@ def main() -> None:
     #
     # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
     # its own try/except so an INIT_FAILED outcome is recordable and
-    # distinct from an ordinary DROPPED emit (docs/2574-telemetry-design.md
+    # distinct from an ordinary DROPPED emit (docs/internal/2574-telemetry-design.md
     # §1/§5).
     _emitter = None
     try:

@@ -1,7 +1,7 @@
 # Spec: #1698 slice 2, round 2 — fix sibling-test regressions
 
 **Author:** Sol · **Date:** 2026-07-08 · **Context:** round-1 coder-fairy
-(`docs/specs/1698-slice2-unified-hook-check.md`) correctly implemented the
+(`docs/internal/specs/1698-slice2-unified-hook-check.md`) correctly implemented the
 spec and correctly STOPPED rather than silently patching files outside its
 given scope, after finding that deleting `check_incident_tripwire` /
 `check_cornerstone_anchor` breaks 17 tests across 5 sibling files the

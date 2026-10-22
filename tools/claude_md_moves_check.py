@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Nothing-lost check for blocks moved out of CLAUDE.md into docs/ (#3322).
+"""Nothing-lost check for blocks moved out of CLAUDE.md into docs/internal/ (#3322).
 
 Reads tools/claude_md_moves.json: {"moves": [{"from_section", "to_doc",
 "first_sentence", "last_sentence"}, ...]}. For each moved block, its first and

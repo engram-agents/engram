@@ -7,7 +7,7 @@
 #   1. The ENGRAM plugin — tests in tests/, run with the engram venv
 #      ($HOME/.engram/venv) which has sqlite-vec, anthropic, etc. Scope = `tests/`
 #      to mirror CI's tests.yml exactly (NOT full discovery — see the ENGRAM
-#      SUITE block for why over-collection of docs/archive produces false-RED).
+#      SUITE block for why over-collection of docs/internal/archive produces false-RED).
 #   2. The forum service (src/forum/) — tests in src/forum/tests/ and
 #      tools/test_forum_cli.py, run with the forum venv
 #      (/home/agents-shared/forum/.venv) which has flask, bs4, etc.
@@ -154,7 +154,7 @@ if [ "$RUN_ENGRAM" -eq 1 ]; then
     echo "================================================================"
     # Explicit `tests/` — NOT full discovery. CI (.github/workflows/tests.yml)
     # runs `pytest tests/ src/forum/tests/`, so full discovery would over-collect
-    # archived/orphan tests (e.g. docs/archive/) that CI never sees, producing
+    # archived/orphan tests (e.g. docs/internal/archive/) that CI never sees, producing
     # false-RED that doesn't reflect CI's verdict. ENGRAM_NO_EMBEDDINGS=1 matches
     # CI's env (skips the optional sentence-transformers path). The result is the
     # load-bearing property: this suite green <=> CI's engram suite green.

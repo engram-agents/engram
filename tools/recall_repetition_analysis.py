@@ -11,7 +11,7 @@ session" (max, p95) -- the worst-offender view -- and a rough wasted-context-
 chars estimate.
 
 This is the acceptance-metric measurement tool for the recall-triggering
-blueprint's §4 acceptance criteria (docs/recall-triggering-blueprint.md) --
+blueprint's §4 acceptance criteria (docs/internal/recall-triggering-blueprint.md) --
 run it before and after landing #1689's render-layer suppression to confirm
 the repeat fraction at k=5 actually drops.
 

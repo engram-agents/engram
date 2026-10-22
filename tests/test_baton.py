@@ -6070,7 +6070,7 @@ class TestApprovalStateParsing:
 #      transition (U2's job -- out of scope here, so untested), and the
 #      accept-both path logs that it took the legacy path.
 #
-# See docs/design/3039-baton-phase-turn.md for the full design (the two-tier
+# See docs/internal/design/3039-baton-phase-turn.md for the full design (the two-tier
 # resolution: explicit `phase:` wins outright and is seat-independent; no
 # explicit field falls back to the pre-#3039 turn==pool-sentinel comparison,
 # seat-DEPENDENT, logged when it fires).

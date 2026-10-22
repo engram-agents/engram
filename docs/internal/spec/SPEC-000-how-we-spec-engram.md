@@ -208,7 +208,7 @@ substrate-policy (Lei reads before merge).
 
 Sequencing: 001 → 002 are mostly extraction (fairy-assistable once 000 is
 ratified); 003 is the judgment-laden one and the reason 000 exists; 004 is
-cheap and mostly already written in `docs/claude-code-plugin-system.md`.
+cheap and mostly already written in `docs/internal/claude-code-plugin-system.md`.
 
 ## 7. Formerly-open questions — all four resolved or parked (Lei's 2026-08-21 read)
 
@@ -229,7 +229,7 @@ cheap and mostly already written in `docs/claude-code-plugin-system.md`.
   while every stored graph stays valid; an L2 change moves a behavioral guarantee
   with graphs and verbs both still valid. One number cannot say which of those
   happened, and that is the only thing an implementer needs from a version.
-  Full treatment, including the scheme, in **SPEC-005** (`docs/spec/SPEC-005-versioning-DRAFT.md`)
+  Full treatment, including the scheme, in **SPEC-005** (`docs/internal/spec/SPEC-005-versioning-DRAFT.md`)
   — its own document rather than a section of SPEC-001, settled by Kepler as §6's
   owner in the #2206 colleague pass: the scheme is cross-layer by construction, so no
   single-layer document can own it, and SPEC-000 deliberately carries no

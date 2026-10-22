@@ -51,7 +51,7 @@ from engram_log_emitter import Emitter, emit_if_initialized
 # Essential-only build (tests/test_tiers_manifest.py's
 # test_import_dep_tier_consistency enforces exactly this). Guarded import +
 # no-op stub keeps this module's own tool functions gating-nothing-T1
-# (docs/2574-telemetry-design.md §8) even if the store ships without it.
+# (docs/internal/2574-telemetry-design.md §8) even if the store ships without it.
 try:
     from engram_telemetry_store import write_telemetry_record
 except Exception:  # pragma: no cover -- import-failure fallback
@@ -94,7 +94,7 @@ VALID_ERROR_TYPES = {
 VALID_INITIATION_TYPES = frozenset({"user_prompted", "gate_prompted", "unprompted"})
 
 # #2613: the retraction replacement contract. A closed set, deliberately with
-# no free-text sibling (docs/2613-retraction-replacement-contract.md §4) — the
+# no free-text sibling (docs/internal/2613-retraction-replacement-contract.md §4) — the
 # set exists to be scanned ("which retractions had no replacement, and why?"),
 # and a closed-set-plus-note splits the answer across two fields. Members are
 # founded on distinct epistemic situations, not frequency data:
@@ -3216,7 +3216,7 @@ def _supersede_impl(
 
         # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
         # alpha #2574 WS5: site attestation + outcome recording +
-        # protection (docs/2574-telemetry-design.md §1/§4/§5) -- new,
+        # protection (docs/internal/2574-telemetry-design.md §1/§4/§5) -- new,
         # narrowly-scoped try/except; see engram_derive.py's _derive_impl
         # blocked-path site for the full rationale. This function's own
         # try/finally has no except, so an uncaught raise here would
@@ -3558,7 +3558,7 @@ def _retract_impl(
         # #2613: the replacement decision is required-always — every
         # author-initiated retraction must record either the node that
         # replaces the claim, or a stated reason why nothing does. This is
-        # the ONE chokepoint (docs/2613-retraction-replacement-contract.md
+        # the ONE chokepoint (docs/internal/2613-retraction-replacement-contract.md
         # §3): both engram_retract and engram_cascade_resolve's retracted
         # branch delegate here, so enforcing it in this one place gives both
         # paths the obligation by construction. NOT gated on

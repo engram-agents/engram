@@ -1,4 +1,4 @@
-"""Completeness guard for docs/2652-migration-ledger.md [part of #2652].
+"""Completeness guard for docs/internal/2652-migration-ledger.md [part of #2652].
 
 The ledger lists every `sqlite3.connect(` line in tracked `src/engram`, one
 Section-2 row per line. tools/check_2652_ledger.py compares, PER FILE, the
@@ -130,8 +130,8 @@ def _make_repo(tmp_path, files, rows, untracked=None, ledger_text=None):
         p = tmp_path / "src" / "engram" / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, encoding="utf-8")
-    (tmp_path / "docs").mkdir()
-    (tmp_path / "docs" / "2652-migration-ledger.md").write_text(
+    (tmp_path / "docs" / "internal").mkdir(parents=True)
+    (tmp_path / "docs" / "internal" / "2652-migration-ledger.md").write_text(
         ledger_text if ledger_text is not None else _ledger(rows), encoding="utf-8"
     )
     _git(tmp_path, "add", "-A")
@@ -166,7 +166,7 @@ def test_clause2_added_connect_without_row_fails_naming_file_and_counts(tmp_path
     assert r.returncode == 1
     assert "a.py: ledger 1 rows, tree 2 lines" in r.stdout
     assert "b.py" not in r.stdout.split("add/remove")[0]
-    assert "add/remove a Section-2 row in docs/2652-migration-ledger.md" in r.stdout
+    assert "add/remove a Section-2 row in docs/internal/2652-migration-ledger.md" in r.stdout
 
 
 def test_clause3_row_for_file_without_connect_fails(tmp_path):
@@ -258,8 +258,8 @@ def test_clause8_section3_row_naming_a_file_is_not_counted(tmp_path):
 
 
 def test_clause9_outside_a_checkout_exits_1_with_one_line(tmp_path):
-    (tmp_path / "docs").mkdir()
-    (tmp_path / "docs" / "2652-migration-ledger.md").write_text(
+    (tmp_path / "docs" / "internal").mkdir(parents=True)
+    (tmp_path / "docs" / "internal" / "2652-migration-ledger.md").write_text(
         _ledger([C("a.py", 1)]), encoding="utf-8"
     )
     r = _run(tmp_path)

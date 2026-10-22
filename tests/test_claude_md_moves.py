@@ -1,6 +1,6 @@
 """Nothing-lost gate for the CLAUDE.md prune (#3322).
 
-CLAUDE.md states rules; dated measurement history lives in docs/. Every block
+CLAUDE.md states rules; dated measurement history lives in docs/internal/. Every block
 moved out of CLAUDE.md is listed in tools/claude_md_moves.json with its first and
 last sentence. tools/claude_md_moves_check.py asserts each of those appears
 exactly once in the named doc and zero times in CLAUDE.md.

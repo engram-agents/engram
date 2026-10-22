@@ -1,7 +1,7 @@
 """RED-FIRST contract cells for #3741: the session-start calibration block reads through the owner.
 
 Spec: the #3741 contract (cells C1..C11), Borges's ruling and his revised item 4 on the issue, and
-`docs/2652-security-slice-design.md` section 3.6 (typed-op input bounds: REFUSE, never clamp).
+`docs/internal/2652-security-slice-design.md` section 3.6 (typed-op input bounds: REFUSE, never clamp).
 
 The calibration block of `engram-session-start-hook.py` (`EngramClient().call("engram_stats", ...)`)
 moves, behind U9's flag `engramd.session_start_reads_via_owner`, to a new typed owner op

@@ -353,7 +353,7 @@ def _emit_hook_fire(session_id: str | None, transcript_path: str | None, duratio
 
     alpha #2574 WS3: construction (import + Emitter.init) is narrowed to its
     own try/except so an INIT_FAILED outcome is recordable and distinct from
-    an ordinary DROPPED emit (docs/2574-telemetry-design.md §1/§5).
+    an ordinary DROPPED emit (docs/internal/2574-telemetry-design.md §1/§5).
     """
     _emitter = None
     try:

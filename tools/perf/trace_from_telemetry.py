@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate a synthetic-but-realistic MCP replay trace from a target ENGRAM graph.
 
-Part of the replay-bench harness (blueprint §6, docs/perf/optimization-blueprint.md,
+Part of the replay-bench harness (blueprint §6, docs/internal/perf/optimization-blueprint.md,
 umbrella #1668). Produces a JSONL trace of `{"tool_name": ..., "params": {...},
 "ts": ...}` calls that `replay_bench.py` replays against a sandboxed copy of the
 same graph.
@@ -22,7 +22,7 @@ trace. Real node IDs are structural identifiers (safe to reuse); real claim/quot
 text is never touched. Only `id` and `type` are selected from the `nodes` table.
 
 v1 tool scope (READ_TOOLS below) is deliberately read-only — see
-docs/perf/optimization-blueprint.md §1: reads are ~10x the cost of writes in the
+docs/internal/perf/optimization-blueprint.md §1: reads are ~10x the cost of writes in the
 current telemetry, so that's where today's perf story lives. Write-tool payload
 synthesis (engram_add_observation, engram_derive, ...) is out of scope for v1 —
 fabricating a realistic claim/quote is a different, harder problem.

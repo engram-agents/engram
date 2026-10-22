@@ -1,9 +1,9 @@
 """Tests for WS5 (alpha #2574 epic #2013, issue #2574's server-side
-telemetry protection + resolver) -- docs/2574-telemetry-design.md §9 tests 1
+telemetry protection + resolver) -- docs/internal/2574-telemetry-design.md §9 tests 1
 and 3b, plus the gate round-trip. Server-side twin of
 tests/test_ws3_telemetry_resolver.py: same discipline, structurally
 different half -- fan-out present, no per-call emitter construction (see
-that file's own module docstring, and docs/2574-telemetry-design.md §10, for
+that file's own module docstring, and docs/internal/2574-telemetry-design.md §10, for
 why these are two separate workstreams).
 
 Covers the 9 server-side ``emit_if_initialized()`` sites (engram_derive.py,
@@ -136,7 +136,7 @@ def _make_always_raises():
 class TestSuppressor:
     def test_no_emitter_outcome_and_caller_returns_normally(self, monkeypatch):
         """No Emitter.init() call at all -- the permanent pre-Part-1 state
-        for every one of these 9 sites (docs/2574-telemetry-design.md §0.1)."""
+        for every one of these 9 sites (docs/internal/2574-telemetry-design.md §0.1)."""
         server = fresh_server()
         eq = _live("engram_query")
         calls: list = []
@@ -215,7 +215,7 @@ class TestProtection:
     def test_try_finally_no_except_site_survives_outcome_recording_failure(self, monkeypatch):
         """engram_query.py:2921 (server.engram_query) sat inside a
         pre-existing try/finally with NO except clause
-        (docs/2574-telemetry-design.md §0.1) -- this workstream's own new,
+        (docs/internal/2574-telemetry-design.md §0.1) -- this workstream's own new,
         narrowly-scoped try/except around the new code is what must catch
         this raise, not the pre-existing try/finally (which this workstream
         deliberately never widens)."""
@@ -237,7 +237,7 @@ class TestProtection:
     def test_no_try_at_all_site_survives_outcome_recording_failure(self, monkeypatch):
         """engram_observation.py:2053 (server.engram_add_observation_batch)
         had NO surrounding try at all before this workstream
-        (docs/2574-telemetry-design.md §0.1) -- a brand-new try wraps it."""
+        (docs/internal/2574-telemetry-design.md §0.1) -- a brand-new try wraps it."""
         server = fresh_server()
         eo = _live("engram_observation")
         raiser, counter = _make_always_raises()
@@ -278,7 +278,7 @@ class TestProtection:
 #    it does not depend on the site's own code running at all; calling each
 #    target once independently is what naturally produces "one reached row
 #    per target" (the union-over-targets semantics falls out of placement,
-#    not special-case logic -- docs/2574-telemetry-design.md §1/§10).
+#    not special-case logic -- docs/internal/2574-telemetry-design.md §1/§10).
 # ---------------------------------------------------------------------------
 
 

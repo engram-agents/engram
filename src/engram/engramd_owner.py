@@ -10,7 +10,7 @@ only thing that speaks its wire protocol, and even that isn't wired to any
 real caller yet -- see `tests/test_engramd_owner.py` for the fixtures that
 exercise this module directly, standing in for the not-yet-built callers.
 
-Full design context: docs/2652-engrammanager-design.md SS3 ("The ownership
+Full design context: docs/internal/2652-engrammanager-design.md SS3 ("The ownership
 shape") and SS5 ("Rider 2 -- what a caller sees when the owner is down").
 
 ## What this deliberately is NOT (out of scope for this build)
@@ -21,7 +21,7 @@ shape") and SS5 ("Rider 2 -- what a caller sees when the owner is down").
 - Typed writes of any kind -- no manager, no domain engines, no cascade.
   (Historical U3 scope. #3822 / U11 added the owner's first write, the typed
   `use_reward` op: see "The owner's first write" below `_use_reward_param_refusal`
-  and docs/2652-migration-ledger.md section 6. Still no generic write verb.)
+  and docs/internal/2652-migration-ledger.md section 6. Still no generic write verb.)
 - Wiring any real caller (hooks, the MCP server, viz, ...) to this owner.
   It exists standalone.
 
@@ -32,7 +32,7 @@ shape (newline-delimited JSON over AF_UNIX/SOCK_STREAM; two response
 states, `ok`/`rejected` -- `unavailable` is purely the CLIENT's own
 conclusion and is never sent by this module). This module calls
 `engramd_client.check_contract_version()` directly on every request rather
-than reimplementing version comparison (docs/2652-engrammanager-design.md
+than reimplementing version comparison (docs/internal/2652-engrammanager-design.md
 SS5.3), and reuses `engramd_client.CONTRACT_VERSION` and
 `engramd_client.DEFAULT_SOCKET_NAME` as the single shared source of truth
 for those values -- see "Socket path resolution" below for why this
@@ -93,7 +93,7 @@ duplicated here as a second string literal.
 
 Contract item 8 requires an end-to-end deadline per request, measured from
 ACCEPT, not per-recv -- the mirror image of the bug U1's own round 5 fixed
-client-side (docs/2652-engrammanager-design.md SS5.1: "a per-operation
+client-side (docs/internal/2652-engrammanager-design.md SS5.1: "a per-operation
 timeout restarts on every byte, so a peer that trickles data never trips
 it"). `_read_request_line()` below computes `deadline` once per
 connection (at accept) and recomputes `remaining = deadline -
@@ -164,7 +164,7 @@ takes this lock -- must then fail/hang).
 
 ## Two connections, not one (#2652 Phase-1 Unit 4b, issue #3195)
 
-Per Mira's ruling in revision 5 of docs/2652-security-slice-design.md SS3.1
+Per Mira's ruling in revision 5 of docs/internal/2652-security-slice-design.md SS3.1
 ("(b), two connections inside the one owner process"), this module holds
 TWO sqlite3 connections against the same `store_path`, never one:
 
@@ -181,7 +181,7 @@ TWO sqlite3 connections against the same `store_path`, never one:
   -- that this authorizer exists "for testability" -- which Mira's
   review of PR #3221 measured false: removing the `set_authorizer` call
   entirely leaves every test green. See
-  docs/2652-security-slice-design.md SS3.1 revision 6.)
+  docs/internal/2652-security-slice-design.md SS3.1 revision 6.)
 - `self._client_read_conn` -- the permanently restrictive connection.
   Its authorizer (`_client_read_authorizer` below) is the measured
   baseline floor (SS3.1, SS4) and is set ONCE at connection-open time in
@@ -536,7 +536,7 @@ CHAIN_RESULT_MAX_BYTES = MAX_READ_RESPONSE_BYTES
 
 # #3741: the typed `confidence_by_type` method. At most this many modes per request (the
 # four window modes of engram_stats); a longer list is REFUSED by name, never clamped
-# (docs/2652-security-slice-design.md section 3.6, typed-op input bounds).
+# (docs/internal/2652-security-slice-design.md section 3.6, typed-op input bounds).
 CBT_MAX_MODES = 4
 # The mode names (equal to engram_stats.STATS_MODES; a cell pins the equality). Held here so
 # validation, which runs before any runtime import, needs no import.
@@ -1052,7 +1052,7 @@ def _rejected_wire(rejected: ec.Rejected) -> dict:
 
 # ---------------------------------------------------------------------------
 # The client-read connection's authorizer floor (#2652 Phase-1 Unit 4b,
-# issue #3195) -- docs/2652-security-slice-design.md SS3.1, SS4.
+# issue #3195) -- docs/internal/2652-security-slice-design.md SS3.1, SS4.
 # ---------------------------------------------------------------------------
 
 # Baseline allowlist, DERIVED by measurement rather than copied verbatim
@@ -1098,7 +1098,7 @@ CLIENT_READ_PRAGMA_ALLOWLIST = frozenset({"user_version", "data_version"})
 def _client_read_authorizer(action_code, arg1, arg2, db_name, trigger_or_view):
     """The restrictive floor -- set ONCE on `_client_read_conn` at
     connection-open time in `start()` and NEVER swapped, toggled, or reset
-    for any operation (docs/2652-security-slice-design.md SS3.1, Mira's
+    for any operation (docs/internal/2652-security-slice-design.md SS3.1, Mira's
     revision-5 ruling: "no authorizer swapping"). Allows the measured
     baseline read action set; denies everything else, with two explicit,
     measured exceptions for PRAGMA and TRANSACTION below."""
@@ -1106,7 +1106,7 @@ def _client_read_authorizer(action_code, arg1, arg2, db_name, trigger_or_view):
         return sqlite3.SQLITE_OK
 
     if action_code == sqlite3.SQLITE_PRAGMA:
-        # P16 (docs/2652-security-slice-design.md SS4, quoted in the fairy
+        # P16 (docs/internal/2652-security-slice-design.md SS4, quoted in the fairy
         # spec): a naive "allow by name at arg1" lets a PRAGMA WRITE
         # through, because arg1 carries the pragma's NAME for both a read
         # and a write -- only arg2 (the assigned value) distinguishes
@@ -1127,7 +1127,7 @@ def _client_read_authorizer(action_code, arg1, arg2, db_name, trigger_or_view):
         # with the owner-internal connection allowing SQLITE_TRANSACTION
         # for snapshot()'s BEGIN DEFERRED read-mark -- that read-mark
         # never existed on this build's snapshot() RPC; see
-        # docs/2652-security-slice-design.md SS3.1 revision 6.)
+        # docs/internal/2652-security-slice-design.md SS3.1 revision 6.)
         return sqlite3.SQLITE_DENY
 
     return sqlite3.SQLITE_DENY
@@ -1149,7 +1149,7 @@ def _owner_internal_authorizer(action_code, arg1, arg2, db_name, trigger_or_view
     docstring claimed the opposite -- that this authorizer was needed to
     make test 17 falsifiable -- which was true only under the design
     doc's now-retracted BEGIN/READ/COMMIT requirement; see
-    docs/2652-security-slice-design.md SS3.1 revision 6.)"""
+    docs/internal/2652-security-slice-design.md SS3.1 revision 6.)"""
     return sqlite3.SQLITE_OK
 
 
@@ -1197,7 +1197,7 @@ def _arm_read_deadline(
     stored timer or a module constant: this is designed to accept
     whatever deadline the eventual client-dispatch path passes in (U4a's
     end-to-end request deadline, issue #3194 / PR #3201, once wired --
-    see docs/2652-security-slice-design.md SS4's own wording: "the
+    see docs/internal/2652-security-slice-design.md SS4's own wording: "the
     progress_handler must stop against the SAME request deadline, passed
     in -- not an independent timer or constant"). No caller exists yet in
     this build (no operation in `_dispatch()` reaches `_client_read_conn`
@@ -1869,7 +1869,7 @@ def _acl_leftovers(entries: list[str]) -> list[str]:
 # The owner's first write: the typed `use_reward` op (#3822, U11 of #2652, Stage A)
 # ---------------------------------------------------------------------------
 #
-# docs/2652-engrammanager-design.md SS3.1 (typed writes, never a generic write_sql) and SS5.4
+# docs/internal/2652-engrammanager-design.md SS3.1 (typed writes, never a generic write_sql) and SS5.4
 # (read-back acknowledgement + idempotency key). The client supplies ONLY {node_ids, action,
 # request_id}: no alpha, no config path, no value. alpha is owner-side
 # (`engram_restamp.USE_ALPHA[action]`); the memory config is the OWNER'S OWN
@@ -2449,7 +2449,7 @@ class EngramdOwner:
     """The owner process skeleton -- one per seat, sole PROCESS holding
     `knowledge.db` open within this build's scope (handshake + `ping` +
     `snapshot()` only). Per Mira's revision-5 ruling
-    (docs/2652-security-slice-design.md SS3.1), this process holds TWO
+    (docs/internal/2652-security-slice-design.md SS3.1), this process holds TWO
     connections against that one store, never one: `_owner_conn`
     (permissive, owner-internal -- serves `snapshot()`) and
     `_client_read_conn` (the permanently restrictive floor -- see the
@@ -2811,7 +2811,7 @@ class EngramdOwner:
         self._check_stale_socket_or_raise()
 
         # One process, TWO open connections on the store (design doc SS3;
-        # docs/2652-security-slice-design.md SS3.1) -- opened once here
+        # docs/internal/2652-security-slice-design.md SS3.1) -- opened once here
         # and held for this owner's lifetime; snapshot() backs up FROM
         # the owner-internal connection object (contract item 5). No
         # domain-engine/manager machinery sits on top of either in this
@@ -3828,7 +3828,7 @@ class EngramdOwner:
             # one of the 10 numbered contract items (which name the READ
             # side), but a direct extension of the same "one deadline per
             # request, end to end, on both sides of the socket" principle
-            # (docs/2652-engrammanager-design.md SS5.1) -- flagged in the
+            # (docs/internal/2652-engrammanager-design.md SS5.1) -- flagged in the
             # fairy handoff. This is ALSO the mechanism by which a
             # deadline-aborted snapshot's own {"status": "rejected", ...}
             # wire dict USED to never reach the wire (round 5: it was
@@ -4922,7 +4922,7 @@ class EngramdOwner:
         """Contract item 5: writes a quiesced, consistent copy of the
         store to a caller-named destination path, using SQLite's backup
         API (sqlite3.Connection.backup(), stdlib) FROM the owner-internal
-        connection (`_owner_conn` -- docs/2652-security-slice-design.md
+        connection (`_owner_conn` -- docs/internal/2652-security-slice-design.md
         SS3.1: snapshot() runs on the owner-internal path, never the
         client-read one). A client-facing service, not a manager
         mechanism -- no domain-engine machinery here, just a direct

@@ -19,11 +19,11 @@ import sqlite3
 import sys
 import tempfile
 
-# Add src/engram/ (for `import server`) and docs/archive/migration/ (for
+# Add src/engram/ (for `import server`) and docs/internal/archive/migration/ (for
 # `from migrate_trust_tier_self_backfill import plan`) to sys.path.
-# File is at docs/archive/ — repo root is two dirname() levels up.
+# File is at docs/internal/archive/ — repo root is three dirname() levels up.
 _ARCHIVE_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_ARCHIVE_DIR))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_ARCHIVE_DIR)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "src", "engram"))
 sys.path.insert(0, os.path.join(_ARCHIVE_DIR, "migration"))
 

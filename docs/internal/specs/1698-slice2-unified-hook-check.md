@@ -2,7 +2,7 @@
 
 **Author:** Sol · **Date:** 2026-07-08 · **Driver role:** spec-fidelity, not
 authorship — Kepler reviews against his own design, does not build.
-**Design source:** `docs/principle-triggers-design.md` §3, §6 (implementation
+**Design source:** `docs/internal/principle-triggers-design.md` §3, §6 (implementation
 plan, PR 2 of 3). Slice 1 (registry + rebuild + migration shim) is merged
 (`_rebuild_principle_triggers` in `engram_core.py`, PR #1702). This slice
 flips the **read path** in both hooks from the two legacy per-kind caches to

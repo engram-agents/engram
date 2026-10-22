@@ -41,33 +41,13 @@ tests/
 #     any-depth semantics for unanchored directory entries (#2516). ---
 /deploy/
 
-# --- Dev-process docs (the procedures for DEVELOPING and RELEASING ENGRAM, run
-#     from engram-alpha/dev; a public release USER never cuts a release or contributes
-#     from the snapshot, so these are dev-internal and stay in the private repo). ---
-docs/RELEASING.md
-docs/DEVELOPMENT.md
-
-# v0.5.0 cut (2026-09-02): internal fleet runbook naming a superseded rc tag; no public reader (Ariadne, roster scan)
-docs/rc-upgrade-runbook.md
-
-# --- Team-process and dev-convention docs (merge policy, review conventions, CI
-#     cost, lane rubric, internal design briefs). Their audience is contributors
-#     on the private repo, not users of the release. Chosen 2026-10-22 for Seed 3
-#     (public docs root cleanup) after checking that no file the snapshot keeps
-#     links to them. Two kinds of mention remain, and neither is a link: path
-#     mentions in old docs/CHANGELOG.md entries (same precedent as
-#     docs/RELEASING.md above), and `to_doc` values in the dev-only CLAUDE.md-prune
-#     mapping read by tools/claude_md_moves_check.py (which cannot run in the
-#     snapshot anyway, since CLAUDE.md is excluded). The two directory entries
-#     are root-anchored because each contains a slash that is not trailing. ---
-docs/PR-MERGE-POLICY.md
-docs/PR-REVIEW-CONVENTION.md
-docs/PR-ISSUE-CLOSURE.md
-docs/GH-STACK.md
-docs/CONTRACT-FIRST-TESTS.md
-docs/CI-COST-MODEL.md
-docs/LANE-PRIORITIZATION.md
-docs/conclusion-warrant-falsifier-log.md
-docs/2652-as-built-brief.md
-docs/spec/
-docs/983-review/
+# --- Internal docs: everything about BUILDING ENGRAM (design notes, specs,
+#     research, team process and merge policy, the release procedure). docs/ keeps
+#     only the docs that a shipped surface sends users or their agents to;
+#     tests/test_docs_layout_guard.py holds that allowlist, with the reason for each
+#     file. One directory entry replaces the old per-file lines, so a new internal
+#     doc needs no edit here. (Chosen 2026-10-22 for Seed 3, the public docs root
+#     cleanup.) The entry is root-anchored because it contains a slash that is not
+#     trailing. Old docs/CHANGELOG.md entries still name the paths that were true
+#     then; those are history, not links. ---
+docs/internal/

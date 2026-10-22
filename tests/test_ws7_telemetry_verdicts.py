@@ -1,7 +1,7 @@
 """Tests for engram_telemetry_verdicts.py -- WS7 (issue #3136, epic #2574
 phase 2): the section-1 VERDICTS runtime report.
 
-Design doc: docs/2574-telemetry-design.md §1 (the VERDICTS block, quoted
+Design doc: docs/internal/2574-telemetry-design.md §1 (the VERDICTS block, quoted
 condition-for-condition in engram_telemetry_verdicts.py's own
 `_VERDICT_CONDITIONS` -- see that module's docstring). Contract-first per
 issue #3136's own explicit test list and this repo's CLAUDE.md

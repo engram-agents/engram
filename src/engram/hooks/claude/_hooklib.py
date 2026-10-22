@@ -16,7 +16,7 @@ SSoT for three concerns genuinely duplicated, byte-for-byte, across hooks:
    atomic_write_json below. Hooks run under a 5s harness timeout and are
    killed on overrun, and are also fail-soft by design, so a torn write is
    read as an absent file and the hook silently reseeds rather than erroring.
-   See docs/DEVELOPMENT.md's "Writing JSON state in a hook" section for the
+   See docs/internal/DEVELOPMENT.md's "Writing JSON state in a hook" section for the
    full convention text.
 
 Why this exists (CLAUDE.md "Plugin build restructures code paths"): the
@@ -456,7 +456,7 @@ def atomic_write_json(path, data, *, indent=None, encoding=None, follow_symlinks
     mismatch with a post-write patch.
 
     NOT for every write in this codebase. Two documented exceptions exist
-    and must NOT be converted to this helper (see docs/DEVELOPMENT.md /
+    and must NOT be converted to this helper (see docs/internal/DEVELOPMENT.md /
     the module docstrings at their call sites for why):
       - src/engram/viz/data/config.py's write_config_key() (os.replace()
         there would strip the agent's ownership of its own config -- #372).

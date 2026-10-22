@@ -1,7 +1,7 @@
 """Contract tests for U10 (#3821, part of #2652): engram-surface-hook.py reads the store
 through the engramd owner behind `engramd.surface_reads_via_owner` (default OFF).
 
-Written BEFORE the implementation (docs/CONTRACT-FIRST-TESTS.md). Design seat: Borges (issue
+Written BEFORE the implementation (docs/internal/CONTRACT-FIRST-TESTS.md). Design seat: Borges (issue
 #3821). Modelled on U9's tests/test_session_start_owner_read_3735.py and U6b/U8's
 tests/test_tripwire_owner_read_3665.py + tests/test_focused_ids_owner_3710.py.
 
@@ -1651,10 +1651,10 @@ def test_statements_sent_to_the_owner_are_registered_templates_or_typed_ops(home
 
 
 def test_ledger_row_4_is_behind_flag_with_the_true_site_table_and_the_row_8_remainder():
-    """docs/2652-migration-ledger.md section 3, the surface hook's row: `behind-flag`, the flag
+    """docs/internal/2652-migration-ledger.md section 3, the surface hook's row: `behind-flag`, the flag
     name, and `_advance_person_moment_cursor` named as the remainder that stays direct.
     Mutation: leaving the row 'direct' -> red."""
-    text = (REPO_ROOT / "docs" / "2652-migration-ledger.md").read_text()
+    text = (REPO_ROOT / "docs" / "internal" / "2652-migration-ledger.md").read_text()
     row = next(ln for ln in text.splitlines() if ln.startswith("| 4 |") and "engram-surface-hook.py" in ln)
     assert "behind-flag" in row and "engramd.surface_reads_via_owner" in row
     assert "_advance_person_moment_cursor" in row and "remainder" in row.lower()

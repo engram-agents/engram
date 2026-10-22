@@ -24,7 +24,7 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "src" / "engram"
 TOOLS = SRC / "tools"
-LEDGER = REPO / "docs" / "2652-migration-ledger.md"
+LEDGER = REPO / "docs" / "internal" / "2652-migration-ledger.md"
 
 _spec = importlib.util.spec_from_file_location("check_2652_ledger_c6", REPO / "tools" / "check_2652_ledger.py")
 chk = importlib.util.module_from_spec(_spec)

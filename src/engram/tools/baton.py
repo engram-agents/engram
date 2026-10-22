@@ -1268,7 +1268,7 @@ def _resolve_phase(fields: dict, *, is_bunch: bool) -> tuple[str, bool]:
          turn == pool-sentinel comparison (_is_legacy_pool_sentinel, exactly
          today's pre-#3039 _is_pool_sentinel(), seat-DEPENDENT), and log
          that the legacy path fired so the transition window (design note
-         docs/design/3039-baton-phase-turn.md §7) can be watched and
+         docs/internal/design/3039-baton-phase-turn.md §7) can be watched and
          eventually retired. A bunch baton at the sentinel resolves to
          "pool" (free to claim); a PR baton at the sentinel resolves to
          "merge" (presented for merge) -- same sentinel value, two

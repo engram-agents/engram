@@ -1,7 +1,7 @@
 """Contract tests for tools/engramd_stage_profile.py, the U7 stage profiler for
 the engramd owner round trip (#3678, part of #2652).
 
-Written BEFORE the tool (contract-first, docs/CONTRACT-FIRST-TESTS.md). The
+Written BEFORE the tool (contract-first, docs/internal/CONTRACT-FIRST-TESTS.md). The
 profiler ATTRIBUTES time across the stages of one `engramd_client.read`; it does
 not set the level. The level -- each cut's before/after and the target -- is
 judged by the UNWRAPPED A6 run (tools/engramd_a6_latency.py). Borges's design

@@ -308,6 +308,6 @@ prompt (a self-wake counts), and read which copy logged — that, plus
 *Full system model — why directory-source loads in-place, the per-component scope
 (verified vs inferred), the complete edit-takes-effect table, and the
 verify-the-live-artifact method — lives in
-[`docs/claude-code-plugin-system.md`](docs/claude-code-plugin-system.md) (read
+[`docs/internal/claude-code-plugin-system.md`](docs/internal/claude-code-plugin-system.md) (read
 on-demand; not loaded every session). This behavior is **undocumented upstream** —
 re-verify after any Claude Code version bump.*

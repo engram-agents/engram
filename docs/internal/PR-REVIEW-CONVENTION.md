@@ -44,7 +44,7 @@ not the gate.
 **A quiet week is not confirmation.** A preventive gate's successes are invisible
 by construction, so the falsifier can fire and the corresponding confirmation
 cannot. Read the falsifier log —
-engram-alpha's `docs/conclusion-warrant-falsifier-log.md`
+engram-alpha's `docs/internal/conclusion-warrant-falsifier-log.md`
 — not the silence. The log deliberately **does not start clean**: its first
 entry is a case where the box would have been filled in honestly — every claim
 enumerated, the unmeasured half named explicitly — and the claim sentence two

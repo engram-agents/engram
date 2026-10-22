@@ -222,7 +222,7 @@ def _forbid_sqlite3_connect(monkeypatch):
     def _raise(*_args, **_kwargs):
         raise AssertionError(
             "sqlite3.connect must never be called by engramd_client -- "
-            "no fallback, ever (docs/2652-engrammanager-design.md SS5.1)."
+            "no fallback, ever (docs/internal/2652-engrammanager-design.md SS5.1)."
         )
 
     monkeypatch.setattr(sqlite3, "connect", _raise)

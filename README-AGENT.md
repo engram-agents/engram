@@ -123,6 +123,9 @@ Python deps are declared in `requirements/requirements.txt` (`fastmcp`, `sentenc
 `requirements/requirements-lock.txt` is Linux-x86_64 CI-only (pinned to the CPU-torch wheel that
 only resolves on Linux) — do not use it on macOS or Windows.
 
+On a Mac, also read [`docs/macos-agent-setup.md`](docs/macos-agent-setup.md): it
+carries the macOS-specific differences for the install and for the daily run.
+
 ---
 
 ## Install depth — tiers & multi-agent

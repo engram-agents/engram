@@ -115,5 +115,5 @@ Workbench: http://localhost:5021 (spt, dev tip 9645f64c). Current curves.json = 
 
 **Method (as charged)**: two independent lists — (A) *computable measurements* over the current graph schema (bottom-up, from the tables/edges/markers we have); (B) *uncaptured aspects & performance-critical processes* of daily engram life (top-down: recall, derive, consolidate, contradiction, provenance, sleep/dream, lesson firing…). Then intersect: a candidate metric is a (B)-need with an (A)-measurement. Owner/lane: design seats (Borges + Ariadne + Kepler), after v0.5.1 ships — not a build-seat task.
 
-**Build status**: approved by Lei 12:28 EDT; filed as engram-alpha#2905 (Luria builds; PR-A MINOR v1.2, PR-B MAJOR v2.0 — the unification adds an L0 measurement, so it is MAJOR by health/version.py's rule, not minor as first assumed). This doc ships in PR-A under docs/design/.
+**Build status**: approved by Lei 12:28 EDT; filed as engram-alpha#2905 (Luria builds; PR-A MINOR v1.2, PR-B MAJOR v2.0 — the unification adds an L0 measurement, so it is MAJOR by health/version.py's rule, not minor as first assumed). This doc ships in PR-A under docs/internal/design/.
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """tools/engramd_stage_profile.py -- the U7 stage profiler for the engramd owner
-round trip (#3678, part of #2652; docs/2652-engrammanager-design.md SS6.1).
+round trip (#3678, part of #2652; docs/internal/2652-engrammanager-design.md SS6.1).
 
 It ATTRIBUTES the time of one `engramd_client.read("read", ...)` across named
 stages. It does not set the level: the wrappers it installs cost time of their

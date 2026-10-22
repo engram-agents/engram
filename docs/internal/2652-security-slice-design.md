@@ -1,6 +1,6 @@
 # EngramManager security slice — read-template registry + socket permission model
 
-**engram-alpha#3097**, the slice `docs/2652-engrammanager-design.md` §3.1 names as its own:
+**engram-alpha#3097**, the slice `docs/internal/2652-engrammanager-design.md` §3.1 names as its own:
 *"The socket's permission model is a capability-channel question → **security slice: Aleph designs,
 Mira reviews**."* Blocks phase-1 unit 4 (the first hook migration). Does not block U1 (#3094),
 U2 (#3095) or U3 (#3096).
@@ -445,7 +445,7 @@ failure direction is the bad one — left permissive, the floor is gone and noth
 
 **The parent's wording, and what is and is not settled about it.** The invariant this depends on is one
 *process* holding the live store. But the parent's inventory row at
-`docs/2652-engrammanager-design.md:677` literally says `SqliteEngramStore` holds *"the only open handle
+`docs/internal/2652-engrammanager-design.md:677` literally says `SqliteEngramStore` holds *"the only open handle
 on `knowledge.db`"*, and two connections are two handles. Revision 3 read that as process-scoped and
 called the reading "mine, and the part I am least sure of". Mira's ruling adopts the same reading, so it
 is no longer mine alone — but the parent's words still say *handle*, and **that document is not this
@@ -483,7 +483,7 @@ the direction. The honest form: **87% of classifiable reads, with 37 sites uncla
 measured reason to expect them to break either way.**
 
 **And the population matters more than the percentage.** Partitioned on the parent document's own
-owner/client table (`docs/2652-engrammanager-design.md:677`), the reviewer found **most of the 498 is
+owner/client table (`docs/internal/2652-engrammanager-design.md:677`), the reviewer found **most of the 498 is
 owner-internal reads the registry never governs at all**; the client-side share lands in an interval
 (≈83–91% depending on whether `health/` is counted) rather than on a point. I am reporting the
 interval rather than picking its convenient end, and noting that the reviewer's own first reading of
@@ -746,7 +746,7 @@ on the strength of that.** Revision 3 pointed at `hooks/claude/engram-surface-ho
 text reaching an FTS5 expression inside a hook. The scope half of that is wrong: the connection that
 query runs on is opened at `:1570` against `os.path.join(pack["path"], "knowledge.db")` with
 `mode=ro&immutable=1` — an attached **package** DB, which the parent's own table at
-`docs/2652-engrammanager-design.md:849` rules **out of scope**. So that site is not a read this socket
+`docs/internal/2652-engrammanager-design.md:849` rules **out of scope**. So that site is not a read this socket
 would ever mediate, and the sanitizer-must-move-with-the-boundary warning does not apply to it.
 
 What I then wrote into my own plan was "so none of the 7 sites is a client-issued live-store read —
@@ -1072,7 +1072,7 @@ important thing the review produced.
 | **How an FTS5 `MATCH` parameter is authorised** (§3.5) | **The safe-set half is DECIDED in revision 5** — a template touching a virtual table has no implicit safety. **Still open, and still a blocker: which owner-side policy authorises an FTS5 expression** — on a different site than revision 3 said. Three divergent sanitizers ship — `engram_core.py:4724` and `:4772`, `viz/data/graph.py:39-45` which does **not** quote, and `engram-surface-hook.py:1549`. Any answer has to reconcile those or declare which wins; revision 2 named none of them. The load-bearing site is **`viz/data/graph.py:54`** — caller-supplied `db_path`, live store, HTTP query string, non-quoting sanitizer. The hook site is a **package**-DB read and is out of scope per the parent's table at `:849`; revision 3 had these the wrong way round. |
 | **Which connection serves `snapshot()`** (§3.1) | **Answered in revision 5 (Mira).** An owner-internal serialized/quiesced path, not the client-read path; preserves `BEGIN`/`READ`/`COMMIT`, fails loudly, never toggles the client-read authorizer. The concrete lifecycle is owed to §5 test 17. |
 | **One connection with a swapped authorizer, or two in the one owner process** (§3.1) | **DECIDED — (b), Mira's ruling.** Client-read connection permanently restrictive; no authorizer swapping. |
-| **The parent's "only open handle" wording** (§3.1) | `docs/2652-engrammanager-design.md:677` literally says one handle; (b) is two. Read as process-scoped by both author and reviewer — but **the words need clarifying by that document's owner**, and this slice does not edit it. |
+| **The parent's "only open handle" wording** (§3.1) | `docs/internal/2652-engrammanager-design.md:677` literally says one handle; (b) is two. Read as process-scoped by both author and reviewer — but **the words need clarifying by that document's owner**, and this slice does not edit it. |
 | **vec0 detection at registration** (§3.5) | The rule is decided. Detection is measured for FTS5 (author, Darwin) and for vec0 on one runtime (Mira: Linux, SQLite 3.45.1, sqlite-vec 0.1.9 — direct, alias and view all surface). Not established for every module or platform. The schema route is authoritative; the token-match backstop can miss quoting or view indirection, so it is not a never-under-deny guarantee, and incomplete classification fails closed. |
 | **How incomplete classification is DETECTED** (§3.5) | Owed by U4, and it must be **measured**, not asserted. "Fails closed" is only as good as the check that notices a classification is incomplete; the build must show a template whose reads the audit cannot fully account for, and show that registration denies it. (Mira, at approval.) |
 | **Two new budgets with no number** (§4) | `SQLITE_LIMIT_LENGTH` and the end-to-end request deadline — including its per-method variant for `snapshot` — both need values chosen against the owner contract (§8). |

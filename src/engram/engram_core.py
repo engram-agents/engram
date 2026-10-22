@@ -2207,7 +2207,7 @@ def dag_edge_set(
 
 # ---------------------------------------------------------------------------
 # engram_retype_edge's allowed-move table (issue #2265, epic #2252).
-# docs/2265-2347-edge-correction-design.md sec.2: "a re-type may only move an
+# docs/internal/2265-2347-edge-correction-design.md sec.2: "a re-type may only move an
 # edge to a relation that claims LESS" -- supported_by/derives_from/cites are
 # all provenance-bearing; about/exemplifies are not. Any move not in this
 # table is refused, including every move in the opposite (stronger)
@@ -11018,7 +11018,7 @@ def _with_state_lock(lock_path, fn):
     scripts, each a separate subprocess invoked by Claude Code). Hooks do not
     import each other and may not import this module, so there is no shared
     import surface today, and a new shared module for ~15 lines isn't worth
-    the engineering (see spec docs/specs/1720-principle-state-write-race.md).
+    the engineering (see spec docs/internal/specs/1720-principle-state-write-race.md).
     If any copy changes, change the other two; tests/test_utility_state_lock_3658.py
     pins all three AST-identical (docstring dropped).
     """
@@ -11098,7 +11098,7 @@ def _reset_principle_enactments(principle_id: str) -> None:
     TORN READS, not a concurrent hook-side read-modify-write silently
     dropping whichever side loses (last-writer-wins on the whole file). Same
     TOCTOU class #1709 fixed with flock, but blocking rather than
-    non-blocking-suppress -- see docs/specs/1720-principle-state-write-race.md
+    non-blocking-suppress -- see docs/internal/specs/1720-principle-state-write-race.md
     "Why NOT #1709's non-blocking-suppress pattern" for why this path can't
     use #1709's shape (this call site is not on the render-decision path, so
     blocking briefly here is safe).

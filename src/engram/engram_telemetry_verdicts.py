@@ -1,7 +1,7 @@
 """engram_telemetry_verdicts.py — §1 VERDICTS block, the READ side (issue
 #3136, epic #2574 WS7).
 
-Design doc: docs/2574-telemetry-design.md §1 (the "THE PARTICIPATION
+Design doc: docs/internal/2574-telemetry-design.md §1 (the "THE PARTICIPATION
 DEFINITION" block). Per issue #3136: "The spec is §1 itself. Implement the
 VERDICTS block as written and do not paraphrase it here or in code comments.
 Quote its conditions or cite the section." `_VERDICT_CONDITIONS` below quotes
@@ -71,7 +71,7 @@ _WINDOW_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # ---------------------------------------------------------------------------
 # §1 VERDICTS -- quoted condition-for-condition from
-# docs/2574-telemetry-design.md §1's own predicate block (the "after round
+# docs/internal/2574-telemetry-design.md §1's own predicate block (the "after round
 # 10" version, brute-force-verified there: unmatched=0, multi-match=0 over
 # {0,1,2}^5). Do not paraphrase; if that block ever changes, update the
 # conditions below to match it line-for-line and re-run
@@ -135,14 +135,14 @@ def _classify(R: int, D: int, X: int, N: int, I: int, thr: float) -> str:
         shape = "unmatched" if not matches else f"multi-matched {matches}"
         raise ValueError(
             f"§1 VERDICTS table {shape} for (R={R}, D={D}, X={X}, N={N}, I={I}, thr={thr}) "
-            f"-- see docs/2574-telemetry-design.md §1's own brute-force block and "
+            f"-- see docs/internal/2574-telemetry-design.md §1's own brute-force block and "
             f"this module's `brute_force_verdicts`"
         )
     return matches[0]
 
 
 def brute_force_verdicts(thr: float, domain=(0, 1, 2), conditions=None) -> dict:
-    """§12's brute-force control (docs/2574-telemetry-design.md §1's own
+    """§12's brute-force control (docs/internal/2574-telemetry-design.md §1's own
     "THIS LIST IS NOT REVIEWED AS PROSE ANY MORE" block), reusable rather
     than a one-off script: range every (R,D,X,N,I) over `domain`^5 (243
     states for the doc's own {0,1,2} domain) and report `unmatched` (zero

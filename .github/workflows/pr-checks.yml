@@ -295,7 +295,7 @@ jobs:
           #   paper_draft/, active-work/ — ephemeral drafting/scratch
           #     surfaces; any node-ID text there is a working note for the
           #     author's own session, not a citation offered to a reader.
-          #   docs/cycle/ — self-improvement-cycle process docs (charter,
+          #   docs/internal/cycle/ — self-improvement-cycle process docs (charter,
           #     chronicle, review packages, dream-pass protocol). These are
           #     process artifacts whose whole value IS author-graph
           #     provenance — the record of which claim drove which decision —
@@ -303,10 +303,12 @@ jobs:
           #     against) the graph the docs were written from. A dangling ID
           #     here is expected background for that audience, not a hollow
           #     citation offered to an uninformed reader.
-          #   docs/handbook/ — dev-internal developer handbook (accuracy-pass
-          #     reference docs assembled by agents auditing the substrate
-          #     against their own graph, with observation- and derivation-
-          #     level provenance citations throughout, e.g. 03-hooks.md).
+          #   docs/handbook/ — developer handbook (public: the READMEs link
+          #     it; excluded from this gate by a pre-existing choice, tracked
+          #     in issue #4084). Accuracy-pass reference docs assembled by
+          #     agents auditing the substrate against their own graph, with
+          #     observation- and derivation-level provenance citations
+          #     throughout, e.g. 03-hooks.md.
           #     Same reasoning as cycle/: the IDs are load-bearing provenance
           #     for a reader who holds the graph, not a citation offered to a
           #     general shared-repo reader.
@@ -329,7 +331,7 @@ jobs:
             ':(exclude)src/forum/tests/'
             ':(exclude)paper_draft/'
             ':(exclude)active-work/'
-            ':(exclude)docs/cycle/'
+            ':(exclude)docs/internal/cycle/'
             ':(exclude)docs/handbook/'
             ':(exclude)README.md'
             ':(exclude)docs/CHANGELOG.md'
@@ -355,7 +357,7 @@ jobs:
           if [ -n "$VIOLATIONS" ]; then
             echo "::error::New concrete ENGRAM node IDs introduced in alpha-released files."
             echo ""
-            echo "Issue #51 policy (DEVELOPMENT.md §Shipped files): concrete node"
+            echo "Issue #51 policy (docs/internal/DEVELOPMENT.md §Shipped files): concrete node"
             echo "IDs (regex: ${PATTERN}) reference the developer's graph, which"
             echo "doesn't exist in any user's install. Substitute with concept"
             echo "words; cite by claim, not by ID."
@@ -827,13 +829,13 @@ jobs:
         if: success() || failure()
         # CLAUDE.md loads into every session started from this repo, and had grown
         # to ~115 KB of mostly dated measurement history. Rules stay in CLAUDE.md;
-        # evidence lives in docs/. One `wc` — stdlib, well inside the under-one-
+        # evidence lives in docs/internal/. One `wc` — stdlib, well inside the under-one-
         # minute cost rule (Branching convention). The nothing-lost half of the
         # contract is tests/test_claude_md_moves.py (tools/claude_md_moves.json).
         run: |
           size="$(wc -c < CLAUDE.md)"
           if [ "$size" -gt 75000 ]; then
-            echo "::error::CLAUDE.md is $size bytes; the budget is 75000 (round 1 of #3322; round 2 lowers it to 40000). Move dated measurement history to docs/ (rules stay) and list the move in tools/claude_md_moves.json."
+            echo "::error::CLAUDE.md is $size bytes; the budget is 75000 (round 1 of #3322; round 2 lowers it to 40000). Move dated measurement history to docs/internal/ (rules stay) and list the move in tools/claude_md_moves.json."
             exit 1
           fi
           echo "CLAUDE.md is $size bytes (budget 75000)."
@@ -996,7 +998,14 @@ jobs:
       # (SKILL.md retired, all 4 tests unconditionally skipped) — wiring a
       # step that runs, does nothing, and can never fail would read as
       # coverage that isn't there.
-      - name: stdlib-only guards — claude-md-drift, plugin-manifest-import-sync, tool-policy-sync, upgrade-drift-sources, build-plugin-hooks-consistency, claude-md-moves, prev-release-hooks-gate
+      # docs-layout-guard: a new file directly under docs/ must be on the
+      # allowlist in tests/test_docs_layout_guard.py (a shipped surface sends
+      # readers to it), else it belongs in docs/internal/, which the one
+      # docs/internal/ line in release-minus-set.txt keeps out of the public
+      # snapshot. Pure stdlib (git ls-files + the cutover tool's own matcher),
+      # well under a second. Without this line the guard would gate nothing:
+      # dev PRs do not run tests/.
+      - name: stdlib-only guards — claude-md-drift, plugin-manifest-import-sync, tool-policy-sync, upgrade-drift-sources, build-plugin-hooks-consistency, claude-md-moves, prev-release-hooks-gate, docs-layout-guard
         if: (success() || failure()) && steps.setup-python-manifest.outcome == 'success' && steps.install-pytest-manifest.outcome == 'success'
         run: |
           python3 -m pytest \
@@ -1007,10 +1016,11 @@ jobs:
             tests/test_build_plugin_hooks_consistency.py \
             tests/test_claude_md_moves.py \
             tests/test_prev_release_hooks_gate.py \
+            tests/test_docs_layout_guard.py \
             -q
 
       # ── 7c-1. 2652 migration-ledger completeness (#2652) ──────────────────
-      # docs/2652-migration-ledger.md lists every `sqlite3.connect(` line in
+      # docs/internal/2652-migration-ledger.md lists every `sqlite3.connect(` line in
       # tracked src/engram, one Section-2 row each. Dev PRs do not run the
       # pytest suite, so a test alone would not gate them: this runs the
       # stdlib-only check directly (git + python, ~0.1s). Three checks: per-file

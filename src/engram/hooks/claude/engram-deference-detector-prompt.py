@@ -168,7 +168,7 @@ def _emit_hook_fire(session_id: str, transcript_path: str, duration_ms: int, std
 
     alpha #2574 WS3: construction (import + Emitter.init) is narrowed to its
     own try/except so an INIT_FAILED outcome is recordable and distinct from
-    an ordinary DROPPED emit (docs/2574-telemetry-design.md §1/§5) -- the
+    an ordinary DROPPED emit (docs/internal/2574-telemetry-design.md §1/§5) -- the
     previous single wide try made a failure after a successful emit
     indistinguishable from a construction failure.
     """
@@ -209,7 +209,7 @@ def _emit_hook_fire(session_id: str, transcript_path: str, duration_ms: int, std
 
 def main() -> None:
     # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
-    # return in this function (docs/2574-telemetry-design.md §1 NEGATIVE
+    # return in this function (docs/internal/2574-telemetry-design.md §1 NEGATIVE
     # EVIDENCE / TRIGGER ENTRY).
     write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})
 

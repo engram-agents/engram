@@ -92,7 +92,7 @@ from engram_log_emitter import Emitter, emit_if_initialized
 # Essential-only build (tests/test_tiers_manifest.py's
 # test_import_dep_tier_consistency enforces exactly this). Guarded import +
 # no-op stub keeps this module's own tool functions gating-nothing-T1
-# (docs/2574-telemetry-design.md §8) even if the store ships without it.
+# (docs/internal/2574-telemetry-design.md §8) even if the store ships without it.
 try:
     from engram_telemetry_store import write_telemetry_record
 except Exception:  # pragma: no cover -- import-failure fallback
@@ -2297,7 +2297,7 @@ def _add_observation_impl(
                 _highest_sim = max(sims)
             _first_hint = similar_matches[0].get("action_hint")
         # alpha #2574 WS5: site attestation + outcome recording +
-        # protection (docs/2574-telemetry-design.md §1/§4/§5). New,
+        # protection (docs/internal/2574-telemetry-design.md §1/§4/§5). New,
         # narrowly-scoped try/except around this new code only -- see
         # engram_derive.py's _derive_impl blocked-path site for the full
         # rationale (identical shape: this function's own try/finally has

@@ -1,5 +1,5 @@
 """Tests for WS3 (alpha #2574 epic #2013, issue #2574's hook-side telemetry
-resolver) -- docs/2574-telemetry-design.md §9 tests 1 and 3b, plus the gate
+resolver) -- docs/internal/2574-telemetry-design.md §9 tests 1 and 3b, plus the gate
 round-trip.
 
 Covers two structurally distinct targets, per the WS3 spec:

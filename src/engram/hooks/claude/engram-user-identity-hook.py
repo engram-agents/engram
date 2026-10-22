@@ -22,7 +22,7 @@ $ENGRAM_HOME/config.json the person-node read goes through the engramd owner
 (`engramd_client.read("read", ...)`) instead of this hook opening knowledge.db
 itself. Flag ON never falls back to the store and never reads an outage as
 "zero people": an owner that is down or refusing yields a loud
-additionalContext block instead (docs/2652-engrammanager-design.md SS5.1, SS5.5).
+additionalContext block instead (docs/internal/2652-engrammanager-design.md SS5.1, SS5.5).
 So does a client module that cannot be imported.
 
 Upgrade note: after an upgrade, RESTART the engramd owner BEFORE turning the flag

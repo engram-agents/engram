@@ -1,6 +1,6 @@
 # EngramManager — as built, 2026-10-11
 
-One page for Lei's re-read. What is on `dev` today (`97f2a499`), what is switched on, what is not, and the next three steps. The design is `docs/2652-engrammanager-design.md`; the channel-by-channel state is `docs/2652-migration-ledger.md`. Numbers here are copied from those two files and from the cited PR bodies, not re-measured for this page.
+One page for Lei's re-read. What is on `dev` today (`97f2a499`), what is switched on, what is not, and the next three steps. The design is `docs/internal/2652-engrammanager-design.md`; the channel-by-channel state is `docs/internal/2652-migration-ledger.md`. Numbers here are copied from those two files and from the cited PR bodies, not re-measured for this page.
 
 ## In one paragraph
 

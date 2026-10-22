@@ -5,7 +5,7 @@ Contract-first (this repo's CLAUDE.md "Contract-first tests" convention, and
 the issue's own instruction: "write these tests FIRST ... never against the
 live tree"): written BEFORE tools/write_op_census.py's implementation exists,
 against small synthetic fixture packages this file constructs itself. NEVER
-run against the real src/engram tree — see docs/2652-engrammanager-design.md
+run against the real src/engram tree — see docs/internal/2652-engrammanager-design.md
 §3.1/§7 and the dispatch spec's "Scope of THIS build" paragraph for why: this
 build proves the WALKER correct on fixtures; enumerating engram-alpha's real
 production roots/tables is a separate, later concern.

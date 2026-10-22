@@ -1,7 +1,7 @@
 """Tests for engram-alpha#2575 PR C0: ``health.model.model_defs_jsonable``,
 ``health.model.model_from_defs``, and ``health.engine.score_signals``.
 
-Design of record: ``docs/health-series-design.md`` D4.1 ("Versions must be
+Design of record: ``docs/internal/health-series-design.md`` D4.1 ("Versions must be
 executable, not merely recorded"). Before this PR, a stored snapshot's
 SIGNALS could be re-derived as of the snapshot's own version (via the
 already-shipped ``signal_defs``/``curve_defs`` blobs), but its SCORES could

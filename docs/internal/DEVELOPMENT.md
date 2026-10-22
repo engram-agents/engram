@@ -399,7 +399,7 @@ than missed leaks):
 ```bash
 git diff --no-color "origin/dev...HEAD" -- \
   ':(exclude)tests/' ':(exclude)src/forum/tests/' ':(exclude)paper_draft/' \
-  ':(exclude)active-work/' ':(exclude)docs/cycle/' ':(exclude)docs/handbook/' \
+  ':(exclude)active-work/' ':(exclude)docs/internal/cycle/' ':(exclude)docs/handbook/' \
   ':(exclude)README.md' ':(exclude)docs/CHANGELOG.md' \
   ':(exclude).github/workflows/pr-checks.yml' ':(exclude)src/engram/engram_ids.py' \
   | grep -E '^\+[^+].*\b[a-z]{2}_[0-9]{4,}\b' && echo "FAIL: new node-ID references introduced" || echo "PASS: no new node-IDs"
@@ -414,12 +414,14 @@ workflow's own `EXCLUDES` comment block; if you change one, change both):
   has no git history and no `.gitignore` entry as of 2026-09-06 — possibly
   a named-but-unused convention; harmless to the gate either way, since an
   exclude pathspec for a nonexistent directory is a no-op.)
-- `docs/cycle/` — self-improvement-cycle process docs (charter, chronicle,
+- `docs/internal/cycle/` — self-improvement-cycle process docs (charter, chronicle,
   review packages, dream-pass protocol); node IDs are load-bearing
   provenance there by design, and `build-plugin.sh` does not bundle it.
-- `docs/handbook/` — dev-internal developer handbook (accuracy-pass
-  reference docs); same rationale as `docs/cycle/` — node IDs are
-  load-bearing provenance and the build engine doesn't bundle `docs/`.
+- `docs/handbook/` — developer handbook (public: the READMEs link it;
+  excluded from this gate by a pre-existing choice, tracked in issue #4084;
+  accuracy-pass reference docs); same rationale as `docs/internal/cycle/` —
+  node IDs are load-bearing provenance and the build engine doesn't bundle
+  `docs/`.
 - `README.md` — documents the seed-graph IDs (the ones present in
   **every** install, listed there as the install-state mapping); these
   are install state, not developer citations.

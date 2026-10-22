@@ -6,7 +6,7 @@ on knowledge.db, speaking U1's already-built wire contract
 (src/engram/engramd_client.py) -- handshake (contract-version check on
 every request) + `ping` + `snapshot()`. **No domain operations of any
 kind** (no create_node, no retract) -- those are out of scope for this
-build; see docs/2652-engrammanager-design.md SS3 and SS5, and the U3 fairy
+build; see docs/internal/2652-engrammanager-design.md SS3 and SS5, and the U3 fairy
 spec, for the full reasoning this file's tests are checked against.
 
 The 10 numbered contract items below are issue #3096's body PLUS its
@@ -54,7 +54,7 @@ the actual mutated-run pytest output):
 Tests 11-18 below are #3194 (P1-U4a, "the owner socket permission layer" --
 0700 dir, peer credentials, stale-socket safety, end-to-end deadline),
 which builds on top of this file's original 10. See
-docs/2652-security-slice-design.md SS2 for the full design and SS5 for its
+docs/internal/2652-security-slice-design.md SS2 for the full design and SS5 for its
 own numbered test list (tests 1-5 and 20 there map onto tests 11-18 here;
 the mapping is noted per test below):
 
@@ -2481,7 +2481,7 @@ def test_snapshot_runs_on_owner_internal_path_and_error_is_not_swallowed(engram_
          swallow the error (e.g. `except sqlite3.Error: pass`, falling
          through to the success response) -- this test must go red.
       3. The client-read connection's authorizer is never touched by a
-         snapshot() call (docs/2652-security-slice-design.md SS3.1: "no
+         snapshot() call (docs/internal/2652-security-slice-design.md SS3.1: "no
          authorizer swapping").
     """
     store_path = engram_home / eo.DEFAULT_STORE_NAME

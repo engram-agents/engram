@@ -756,7 +756,7 @@ def test_c5_every_cli_command_in_a_spec_uses_the_canonical_home_expression(spec)
 
 # ---- C6: the ledger -----------------------------------------------------------------------------------
 
-LEDGER = REPO_ROOT / "docs" / "2652-migration-ledger.md"
+LEDGER = REPO_ROOT / "docs" / "internal" / "2652-migration-ledger.md"
 
 
 def _section_2b() -> str:

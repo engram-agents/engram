@@ -325,7 +325,7 @@ seat can run it and any other seat can check that it ran.
    presses on a tree it never tested (the 2026-09-13 jointly-broken case, Borges).
    Every PR into `main`
    (release cut, hotfix, reconcile) and a `main`→`dev` reconcile merge as a **merge
-   commit** (`docs/RELEASING.md`); every other PR into `dev` squashes; a member of a
+   commit** (`docs/internal/RELEASING.md`); every other PR into `dev` squashes; a member of a
    linked stack merges with `gh stack merge` (plain `gh pr merge` is refused there).
 9. **On umwelt, merge does not promote** (Ariadne): prod promotion stays a separate,
    tested-first step by the deploy seat.

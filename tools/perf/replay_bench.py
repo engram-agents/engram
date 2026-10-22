@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replay-bench runner + reporter for the ENGRAM MCP tool surface.
 
-Part of the replay-bench harness (blueprint §6, docs/perf/optimization-blueprint.md,
+Part of the replay-bench harness (blueprint §6, docs/internal/perf/optimization-blueprint.md,
 umbrella #1668). Reads a trace JSONL (from trace_from_telemetry.py, or hand-authored),
 executes each `{tool_name, params}` call against `server.engram_<tool_name>` inside
 an isolated sandbox copy of a target graph, and reports p50/p90/p99 + total + call

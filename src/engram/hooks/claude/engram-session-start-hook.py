@@ -4752,7 +4752,7 @@ def _main_impl() -> None:
     #
     # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
     # its own try/except so an INIT_FAILED outcome is recordable and
-    # distinct from an ordinary DROPPED emit (docs/2574-telemetry-design.md
+    # distinct from an ordinary DROPPED emit (docs/internal/2574-telemetry-design.md
     # §1/§5) -- the session_id/transcript_path extraction below is data
     # prep, not construction, so it sits outside the narrowed try.
     _session_id = hook_input.get("session_id", "unknown") or "unknown"

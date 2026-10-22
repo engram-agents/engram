@@ -678,7 +678,7 @@ this table warns about.
 
 | side | members |
 |---|---|
-| **owner process hosts** | **concept** (the epistemic vocabulary) · **domain engines** (cascade, confidence, retrieval fusion) · **manager** (`EngramManager` and §2.7's inventory) · **impl** (`SqliteEngramStore`, in the one process that holds `knowledge.db` open; that process may hold more than one connection, and does: the security slice's permanently-restrictive client-read connection plus an owner-internal one, `docs/2652-security-slice-design.md` §3.1) |
+| **owner process hosts** | **concept** (the epistemic vocabulary) · **domain engines** (cascade, confidence, retrieval fusion) · **manager** (`EngramManager` and §2.7's inventory) · **impl** (`SqliteEngramStore`, in the one process that holds `knowledge.db` open; that process may hold more than one connection, and does: the security slice's permanently-restrictive client-read connection plus an owner-internal one, `docs/internal/2652-security-slice-design.md` §3.1) |
 | **clients, over the socket** | the MCP tool bodies (`src/engram/server.py`) · the hooks (`src/engram/hooks/claude/*`) · the dream master and dispatched fairies · the `tools/*` CLIs · the sleep skill's cohort tooling · viz, the health snapshots and the sleep backup (readers, through `snapshot()`) |
 
 **Why this has to be written down rather than left implied.** A builder who reads §2.0's *"mechanisms
@@ -1293,7 +1293,7 @@ with the file actually opened.
   measurement that criterion actually requires.** The delta is stated and the
   direct-connect baseline is measured. The owner exists (U3, #3151), and
   owner-side arms were measured for the user-identity hook (U4d, #3341); the
-  ledger's A6 section (`docs/2652-migration-ledger.md` §4) records which arms
+  ledger's A6 section (`docs/internal/2652-migration-ledger.md` §4) records which arms
   and under which SQLite build, and is the one place for the numbers. The
   stop hook's cells were measured after the ledger's anchor (#3675, #3686) and
   are due to enter the ledger with #3686 (as of 2026-10-11). The ledger records contended and

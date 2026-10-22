@@ -2,7 +2,7 @@
 
 The root src/engram/SKILL.md was the canonical tool index for MCP tools. It
 has been retired (#1149) in favor of the MCP tool docstrings, the engram-*
-skills, and the CLAUDE.md disciplines. The file was moved to docs/archive/SKILL.md
+skills, and the CLAUDE.md disciplines. The file was moved to docs/internal/archive/SKILL.md
 for historical reference and is no longer shipped.
 
 Prior incidents this test existed to prevent:
@@ -28,7 +28,7 @@ import pytest
 
 pytestmark = pytest.mark.skip(
     reason=(
-        "SKILL.md retired in #1149 — moved to docs/archive/SKILL.md, "
+        "SKILL.md retired in #1149 — moved to docs/internal/archive/SKILL.md, "
         "no longer shipped. Tool documentation now lives in MCP tool "
         "docstrings and the engram-* skills."
     )

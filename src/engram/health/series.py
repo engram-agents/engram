@@ -1,7 +1,7 @@
 """health.series -- the health-score series store: ingest + rebuild + status
 + replay + backfill + verify.
 
-Design of record: ``docs/health-series-design.md`` (design v1 sections 0-10,
+Design of record: ``docs/internal/health-series-design.md`` (design v1 sections 0-10,
 amended by deltas D1-D5; the deltas win over the sections they amend). This
 module implements **PR A, PR B1, and PR B2** ("#2575 PR A", "#2575 PR B") of
 the three-PR slicing named in that document's "Slicing after the deltas"

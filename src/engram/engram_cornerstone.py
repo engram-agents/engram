@@ -1068,7 +1068,7 @@ def _retype_edge_impl(
     new relation; only a loose cites is retypable.
 
     Corrects a wrong edge by making it WEAKER, never stronger (issue #2265,
-    design doc docs/2265-2347-edge-correction-design.md sec.2). One
+    design doc docs/internal/2265-2347-edge-correction-design.md sec.2). One
     transaction: refuse on a pending cascade marker on either endpoint,
     refuse if this would retype away a derivation's LAST cascade premise
     (Ariadne's design ruling on #2265 — a premise-less derivation would keep

@@ -639,7 +639,7 @@ def test_the_hook_header_no_longer_says_row_8_stays_direct_and_lists_the_write_s
 
 
 def _ledger() -> str:
-    return (REPO_ROOT / "docs" / "2652-migration-ledger.md").read_text()
+    return (REPO_ROOT / "docs" / "internal" / "2652-migration-ledger.md").read_text()
 
 
 def test_ledger_row_37_is_behind_flag_and_names_the_writes_flag():

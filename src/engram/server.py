@@ -47,7 +47,7 @@ from engram_log_emitter import Emitter, emit_if_initialized  # noqa: E402
 # breaking an Essential-only build
 # (tests/test_tiers_manifest.py::test_import_dep_tier_consistency enforces
 # exactly this). Guarded import + no-op stub keeps every MCP tool call
-# gating-nothing-T1 (docs/2574-telemetry-design.md §8) even if the store
+# gating-nothing-T1 (docs/internal/2574-telemetry-design.md §8) even if the store
 # ships without it -- same pattern as the four engram_*.py impl modules
 # this workstream also touches (engram_derive.py, engram_observation.py,
 # engram_query.py, engram_revision.py).
@@ -1848,7 +1848,7 @@ def engram_add_observation(payload_json: str) -> str:
         On payload-parsing failure, returns {"error": "..."} with no node created.
     """
     # alpha #2574 WS5: `reached` -- unconditional, before any argument
-    # validation/guard/early-return, per docs/2574-telemetry-design.md §1's
+    # validation/guard/early-return, per docs/internal/2574-telemetry-design.md §1's
     # TRIGGER ENTRY / NEGATIVE EVIDENCE. write_telemetry_record() never
     # raises (WS1's contract) so this needs no protective try.
     write_telemetry_record(manifest_id="server.py:engram_add_observation", event_type="engram.telemetry.reached", fields={})
@@ -5514,7 +5514,7 @@ _RETYPE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation", "new_rela
 # DESIGN INTENT — engram_retype_edge
 # -----------------------------------
 # Corrects a provably-wrong edge by making it WEAKER, never stronger (issue
-# #2265, design doc docs/2265-2347-edge-correction-design.md sec.2). Neither
+# #2265, design doc docs/internal/2265-2347-edge-correction-design.md sec.2). Neither
 # engram_remove_edge nor engram_add_edge can do this: supported_by,
 # derives_from and cites are all removable=False/addable_after_creation=False,
 # so today the only routes are ad-hoc SQL (banned) or engram-surgical (dev
@@ -6693,7 +6693,7 @@ def engram_derive(payload_json: str) -> str:
     # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
     # full rationale. This target is reached from BOTH of engram_derive.py's
     # _derive_impl sites (:283 blocked-path, :365 success-path -- see
-    # docs/2574-telemetry-design.md §1's OUTCOME/dispatch-target paragraph);
+    # docs/internal/2574-telemetry-design.md §1's OUTCOME/dispatch-target paragraph);
     # this single `reached` write covers both.
     write_telemetry_record(manifest_id="server.py:engram_derive", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
@@ -7171,7 +7171,7 @@ _RETRACT_FIELDS = frozenset({
 # reason nothing replaces the claim). Mutually exclusive; exactly one
 # required. The obligation attaches to the retraction EVENT (edit_history),
 # not just the optional `retracts` edge, so it is checkable even when no
-# replacement exists. See docs/2613-retraction-replacement-contract.md.
+# replacement exists. See docs/internal/2613-retraction-replacement-contract.md.
 #
 # Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
@@ -8633,7 +8633,7 @@ if __name__ == "__main__":
     # deferred to): initialize the server-side telemetry emitter singleton,
     # so the 9 engram.tool.engram_call emit_if_initialized() sites in
     # engram_derive.py/engram_observation.py/engram_query.py/engram_revision.py
-    # stop being permanently NO_EMITTER (docs/2574-telemetry-design.md §0.1).
+    # stop being permanently NO_EMITTER (docs/internal/2574-telemetry-design.md §0.1).
     # Best-effort, same shape as the snapshot worker start above and the
     # embedding gate below: a failure here must never block server boot
     # (§8 "telemetry gates nothing T1" -- server.py is the literal T1 MCP
