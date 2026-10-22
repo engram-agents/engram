@@ -341,7 +341,7 @@ JSON
   letting it degrade into something to remember. **This is the BACKSTOP; the
   wake prompt (Step 2 §2) is the primary channel** — the prompt is written
   once per arm and consumed immediately, whereas the marker's `state` field
-  is rewritten every iteration (the `jq` patch — Step 2 item 3b), so an
+  is rewritten every iteration (the helper write — Step 2 item 3b), so an
   invariant parked in `state` can be silently lost. Keep both: they fail
   differently
   (a hand-armed wake missing the stub is caught by this field; a first arm
@@ -441,11 +441,11 @@ cannot be stale.)*
        **Record that cadence in the marker's `cadence_seconds`** — that
        field is the value the helper (item 3c) prints and the arm obeys, so
        it is the one path by which a named cadence reaches the wake. Write
-       it as a NUMBER, with `--argjson` (item 3b explains why):
+       it as a NUMBER: the helper's value is JSON, so `3300` is a number and
+       `"3300"` would be a string (item 3b says why that matters):
 
        ```bash
-       tmp=$(mktemp "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json.XXXXXX) && jq --argjson c 3300 '.cadence_seconds = $c' "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json > "$tmp" \
-         && mv "$tmp" "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json
+       python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_marker_set.py" cadence_seconds 3300
        ```
    (b) The loop is watching a long-period external signal the user has named
        (a CI run, a deploy ETA, a remote queue) — and the cadence matches
@@ -522,7 +522,7 @@ cannot be stale.)*
    not the marker.** Two reasons, and the first is the load-bearing one:
 
    - **The marker's `state` field is rewritten every iteration** (Step 2 item
-     3b's `jq` patch). An invariant stored inside mutable per-iteration state
+     3b's helper write). An invariant stored inside mutable per-iteration state
      is one careless edit away from vanishing, and its absence is silent. The
      prompt is written once per arm and consumed immediately — nothing
      rewrites it.
@@ -555,22 +555,28 @@ cannot be stale.)*
    the marker's `state` is rewritten:
 
    a. *…do the iteration's actual work…*
-   b. **Rewrite the marker's `state`** with a **`jq` patch** — required for
+   b. **Rewrite the marker's `state`** with the **`loop_marker_set.py` helper** — required for
       iterations, not a `cat > … <<JSON` wholesale rewrite: pending work,
       in-flight fairies, key node IDs, next step. (Step 1's FIRST write is
       the one place the heredoc is correct.) The marker is the CANONICAL
       HANDOFF; the wake prompt is just a pointer.
 
       ```bash
-      tmp=$(mktemp "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json.XXXXXX) \
-        && jq --arg s "<new state>" '.state = $s' "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json > "$tmp" \
-        && mv "$tmp" "${ENGRAM_HOME:-$HOME/.engram}"/loop-mode.json
+      python3 "${CLAUDE_PLUGIN_ROOT:-${ENGRAM_HOME:-$HOME/.engram}/marketplace/plugins/engram}/tools/loop_marker_set.py" --string state "<new state>"
       ```
 
-      `--arg` binds a **string** — right for `state`, wrong for any NUMERIC
-      field: a numeric patch (e.g. `cadence_seconds`) must use `--argjson`,
-      because `--arg c 3300` writes the string `"3300"`, which the helper
-      rejects and falls back to the 1800 default.
+      The helper changes only that one key (every other key keeps its value
+      and its position), keeps the file's mode and group, and needs no `jq`.
+      `--string KEY TEXT` stores TEXT literally (the shell still applies to
+      the quoted text: `"`, `$` and backticks inside double quotes are
+      expanded by bash BEFORE the helper sees them, so text containing them
+      goes in single quotes), right for `state` and any
+      free text. Without `--string` the value is JSON: `3300` stores a
+      number, `"3300"` a string, so a NUMERIC field such as `cadence_seconds`
+      takes no `--string` — a string there is rejected by the re-arm helper,
+      which falls back to the 1800 default. It prints `loop_marker_set: <KEY>
+      set` on success and refuses (exit 1, one stderr line) on a missing or
+      unparseable marker; it never creates one.
 
    c. **Arm at `cadence_seconds` from the marker, batched with `CronList` in ONE parallel block.**
 

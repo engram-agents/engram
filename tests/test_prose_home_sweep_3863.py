@@ -455,9 +455,12 @@ MARKER_BLOCKS = {
     "school-day printf JSON": (SCHOOL_SKILL, lambda b: b.startswith("printf '%s\\n' '{\"FIRST_ACTION\"")),
     "loop heredoc JSON": (LOOP_SKILL, lambda b: "/loop-mode.json <<JSON" in b),
 }
-EDIT_BLOCKS = {  # edit an existing marker with jq
-    "loop jq cadence edit": (LOOP_SKILL, lambda b: "cadence_seconds = $c" in b),
-    "loop jq state edit": (LOOP_SKILL, lambda b: "jq --arg s" in b),
+# Edit an existing marker through tools/loop_marker_set.py (#4025; the recipes were mktemp + jq + mv).
+# The dict keys keep their old "jq" wording: they are parametrize ids, and renaming them would
+# remove two test ids from the suite.
+EDIT_BLOCKS = {
+    "loop jq cadence edit": (LOOP_SKILL, lambda b: "loop_marker_set.py" in b and "cadence_seconds 3300" in b),
+    "loop jq state edit": (LOOP_SKILL, lambda b: "loop_marker_set.py" in b and "--string state" in b),
 }
 SCRATCH_BLOCK = (META_SKILL, lambda b: "<< 'SCRATCH'" in b)
 # Blocks that need systemd/Codex to run; they are only syntax-checked here.
@@ -519,27 +522,33 @@ def test_marker_block_writes_valid_json_with_the_real_absolute_path(tmp_path, na
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("name", list(EDIT_BLOCKS))
 def test_marker_edit_blocks_work_in_the_chosen_home(tmp_path, name, mode):
-    if shutil.which("jq") is None:
-        pytest.skip("jq is not installed")
     rel, pred = EDIT_BLOCKS[name]
-    r, home = run_block(SEED_MARKER + block_where(rel, pred), tmp_path, mode)
+    r, home = run_block(SEED_MARKER + block_where(rel, pred), tmp_path, mode,
+                        extra_env={"CLAUDE_PLUGIN_ROOT": str(REPO / SRC)})
     assert r.returncode == 0, r.stderr
     data = json.loads((home / "loop-mode.json").read_text())
     assert data["cadence_seconds"] == 3300 or data["state"] == "<new state>", data
-    assert sorted(os.listdir(home)) == ["loop-mode.json"], os.listdir(home)  # tmp file was moved
+    assert sorted(os.listdir(home)) == ["loop-mode.json"], os.listdir(home)  # no temp file left
 
 
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("name", list(EDIT_BLOCKS))
 def test_marker_edit_blocks_path_handling_with_a_passthrough_jq(tmp_path, name, mode):
-    """Path handling only (mktemp, redirect, mv), for a machine without jq: `jq` is a
-    shell function that copies its last argument (the marker file) to stdout."""
+    """The recipes need no jq (#4025): with a `jq` on PATH that always fails they still run
+    and still change their key. (Before #4025 this test stubbed jq as a passthrough, to check
+    the mktemp / redirect / mv path handling on a machine without jq.)"""
     rel, pred = EDIT_BLOCKS[name]
-    stub = 'jq() { local f; for f in "$@"; do :; done; cat "$f"; }\n'
-    r, home = run_block(stub + SEED_MARKER + block_where(rel, pred), tmp_path, mode)
+    bindir = tmp_path / "failing-jq-bin"
+    bindir.mkdir()
+    jq = bindir / "jq"
+    jq.write_text("#!/bin/sh\necho 'jq must not be called' >&2\nexit 97\n")
+    jq.chmod(0o755)
+    env = {"CLAUDE_PLUGIN_ROOT": str(REPO / SRC), "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}
+    r, home = run_block(SEED_MARKER + block_where(rel, pred), tmp_path, mode, extra_env=env)
     assert r.returncode == 0, r.stderr
-    assert json.loads((home / "loop-mode.json").read_text())["state"] == "old"
-    assert sorted(os.listdir(home)) == ["loop-mode.json"], os.listdir(home)  # tmp file was moved
+    data = json.loads((home / "loop-mode.json").read_text())
+    assert data["cadence_seconds"] == 3300 or data["state"] == "<new state>", data
+    assert sorted(os.listdir(home)) == ["loop-mode.json"], os.listdir(home)  # no temp file left
 
 
 @pytest.mark.parametrize("mode", MODES)

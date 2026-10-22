@@ -734,6 +734,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/loop_marker_set.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/engram-mode.py",
       "tier": "convenience"
     },

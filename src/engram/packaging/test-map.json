@@ -519,6 +519,14 @@
       "note": "engram-alpha#3005: the loop wake-prompt builder and, from round 1, the --rearm-delay helper (the single writer of next_due_at). It had no entry before round 2 (pre-existing gap). It is a tools/ file with no repo-root symlink yet, so _shipped_path_candidates de-prefixes a change to src/engram/tools/loop_prompt.py to this bare path."
     },
     {
+      "path_prefix_or_glob": "tools/loop_marker_set.py",
+      "test_globs": [
+        "tests/test_loop_marker_set_4025.py",
+        "tests/test_prose_home_sweep_3863.py"
+      ],
+      "note": "engram-alpha#4025: the one writer of a loop-marker key (the engram-loop skill's cadence and state recipes call it), built on engram_config_io.atomic_write_text so the marker keeps its mode and group. test_prose_home_sweep_3863.py runs the skill's recipes as printed against it. It is a tools/ file with no repo-root symlink yet, so _shipped_path_candidates de-prefixes a change to src/engram/tools/loop_marker_set.py to this bare path."
+    },
+    {
       "path_prefix_or_glob": "tools/_status_derive.py",
       "test_globs": [
         "tests/test_loop_gate.py",
