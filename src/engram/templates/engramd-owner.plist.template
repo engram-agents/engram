@@ -18,6 +18,20 @@
            3  EXIT_DISPLACED        -> restarted: the owner shut down on a displaced
                                        substrate without closing the store, so it must
                                        never read as a success.
+           4  EXIT_PATH_NOT_REGULAR -> a pidfile or store path is not a regular file, or the
+                                       store-maintenance lock directory (<store>.maint.lockdir)
+                                       is unusable (planted symlink, foreign owner, ...).
+                                       launchd restarts it like any non-zero exit (it has no
+                                       RestartPreventExitStatus). start-engramd-owner.sh's
+                                       preflight refuses first instead of looping, but ONLY for an
+                                       owner launched through that hook script: a job registered
+                                       directly through setup-surface-daemon-service.sh in owner mode
+                                       starts the owner without the preflight, so an exit-4 owner
+                                       loops every ThrottleInterval (60 s) until the path is fixed.
+           6  EXIT_STORE_MAINTENANCE -> restarted, once per ThrottleInterval: an offline repair
+                                       tool holds the store (or another holder does), or taking the
+                                       lock hit a transient resource error (EMFILE, ENFILE, ENOSPC,
+                                       ENOLCK, EAGAIN); the owner starts once that has cleared.
          launchd has NO start limit: a persistent non-zero exit (a refusal the install-time
          preflight cannot see, or an owner already running unsupervised) retries once every
          ThrottleInterval (60 s) indefinitely. The systemd unit no longer reaches a permanent

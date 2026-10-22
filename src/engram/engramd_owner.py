@@ -295,8 +295,12 @@ EXIT_DISPLACED = 3
 
 # #3768, #3753: exit status of an owner that REFUSED TO START because its pidfile path
 # or its store path exists and is not a regular file (FIFO, symlink, directory,
-# socket, device, ...). Retrying cannot fix a planted path, so the unit does not
-# restart it. For the pidfile it is its own code, not the surface daemon's
+# socket, device, ...), or (#3882) the store-maintenance lock directory
+# (`<store>.maint.lockdir`) is unusable: a planted symlink or non-directory, a foreign
+# owner, a mode that cannot be tightened, permission denied or a read-only filesystem creating it, or
+# any other unrecognised error (fail closed; the message names the errno). A resource error
+# (EMFILE, ENFILE, ENOSPC, ENOLCK, EAGAIN on create/open) is NOT this: it is exit 6.
+# Retrying cannot fix a planted path, so the unit does not restart it. For the pidfile it is its own code, not the surface daemon's
 # run-without-pidfile fallback: the owner's pidfile carries liveness, so an owner
 # without one reads as down while it holds the socket. main() returns it (nothing
 # was bound or left behind).
@@ -312,6 +316,16 @@ EXIT_PATH_NOT_REGULAR = 4
 # code must not share a value with the interpreter's own failure codes (1 and 2); 1 stays
 # only as OwnerAlreadyRunning's historic code (main() returns the literal).
 EXIT_STORE_BEHIND_SCHEMA = 5
+# #3882 (U19 of #2652): exit status of an owner that refused to start because the store-maintenance
+# lock (`<store>.maint.lockdir`) is held by something other than an owner: an offline repair tool is
+# running against the store, or the lock directory hit a transient resource error (the retryable errno
+# set in engram_core); a lock directory that is unusable for a cause a retry cannot clear is exit 4, above. Distinct from
+# 0/1/3/4/5 so a supervisor and the log can tell it apart. Non-zero and not in RestartPreventExitStatus, so
+# Restart=on-failure / launchd retry it with back-off: the repair ends, the lock drops, the owner starts.
+# A held lock whose holder file says `owner` is OwnerAlreadyRunning (exit 1) instead; a holder that has
+# the lock but has not written its holder file yet reads as unreadable and gets 6, and the retry then
+# sees the role (the flock stays the only exclusion; the file only chooses the message and the code).
+EXIT_STORE_MAINTENANCE = 6
 
 # #3240 item 2: methods that never touch the store and so are exempt from the
 # displacement self-check. Every OTHER registered method is guarded by
@@ -761,6 +775,24 @@ class OwnerStoreBehindSchema(RuntimeError):
     creates them for any connection to a WAL database, `mode=ro` included
     (measured: -wal 0 bytes, -shm a 32 KiB wal-index, the database file
     unchanged)."""
+
+
+class OwnerStoreMaintenance(RuntimeError):
+    """Raised by EngramdOwner.start() when the store-maintenance lock (#3882) is held by something other
+    than an owner (an offline repair tool; or its holder file is unreadable), or (round 3) when taking the
+    lock hit a retryable resource errno (engram_core.STORE_MAINT_RETRYABLE_ERRNOS; the message names it).
+    Raised before the store is probed, so nothing is created, bound or written. main() maps it to EXIT_STORE_MAINTENANCE (6), which
+    the supervisor retries with back-off. A distinct class from OwnerAlreadyRunning (another OWNER holds
+    the store) and from OwnerStoreLockDirUnusable (the lock directory itself cannot be used)."""
+
+
+class OwnerStoreLockDirUnusable(RuntimeError):
+    """Raised by EngramdOwner.start() when the store-maintenance lock directory (`<store>.maint.lockdir`)
+    cannot be used for a cause a retry cannot clear: a planted symlink or non-directory at the name, a
+    foreign owner, a mode that cannot be tightened, permission denied or a read-only filesystem creating
+    it, or any other unrecognised error (the message names the errno). A retryable resource errno is
+    OwnerStoreMaintenance (6) instead. Nothing is held; retrying cannot fix these. main() maps it to EXIT_PATH_NOT_REGULAR (4), which the unit does not restart; the
+    message carries the lock directory's path. A held lock is OwnerStoreMaintenance (6) instead."""
 
 
 class OwnerStorePathNotRegular(RuntimeError):
@@ -2497,6 +2529,8 @@ class EngramdOwner:
         self._client_read_lock = threading.Lock()
         self._shutdown = threading.Event()
         self._bound_socket = False
+        # #3882: the fd of the store-maintenance flock, held from start() to the end of _cleanup().
+        self._maint_lock_fd: int | None = None
         self._accept_thread: threading.Thread | None = None
         # #3194 round 5: bounds concurrent finalize (fsync + os.replace)
         # work across every snapshot() call this owner serves -- shared
@@ -2551,7 +2585,92 @@ class EngramdOwner:
     # -- lifecycle ------------------------------------------------------
 
     def start(self, *, install_signal_handlers: bool = True) -> None:
-        """Bind the socket, open the store, and begin serving in a
+        """Bind the socket, open the store, and begin serving in a background thread. Returns once the
+        accept loop is running. The ordered refusals and their exceptions are documented on
+        `_start_inner`. #3882: the first thing past the pure refusals is the store-maintenance lock,
+        held for this owner's whole lifetime; a start that fails after taking it releases it on the way
+        out, and `stop()` releases it after both connections are closed. A start that fails AFTER the store
+        connections are open closes them first (through `_cleanup()`, the same path `stop()` takes: it only
+        removes a socket this owner bound and a pidfile that does not name another process) and only then
+        releases the lock: the lock is never released while an owner connection is open. A failure before any
+        connection exists just releases, as before."""
+        try:
+            self._start_inner(install_signal_handlers=install_signal_handlers)
+        except BaseException:
+            had_connections = self._owner_conn is not None or self._client_read_conn is not None
+            if had_connections:
+                self._cleanup()  # closes both connections, then releases the lock itself (unless displaced)
+            if not self._displaced:
+                # A displaced owner never releases here, on any path (including the pidfile refusal, where
+                # _cleanup() has already parked the connections and nulled the attributes): its connections
+                # stay OPEN, so its lock stays held with them and the kernel drops it when main() ends the
+                # process with os._exit. Every other path releases here, idempotently.
+                self._release_maint_lock()
+            raise
+
+    def _take_maint_lock(self) -> None:
+        """#3882: take the store-maintenance flock for THIS owner's own store (`self.store_path`, never
+        the DB_PATH of engram_core, which this process points at its home), non-blocking. A held lock
+        reads the holder file: role `owner` -> OwnerAlreadyRunning (exit 1, unchanged); anything else or
+        unreadable -> OwnerStoreMaintenance (exit 6). A lock directory that cannot be used at all ->
+        OwnerStoreLockDirUnusable (exit 4). Nothing is created, bound or written in any case.
+
+        Idempotent (a held fd is kept). Two deliberate gaps, both fail-through to the checks that follow:
+        a store path that does not exist yet is not locked (there is nothing to maintain, and creating
+        the lock directory would break the schema gate's "a refusal creates nothing" for an absent
+        store; start() takes the lock again right after the gate in case the store appeared between
+        the two), and an engram_core that cannot be imported is left to the schema gate, which refuses
+        it by name."""
+        if self._maint_lock_fd is not None:
+            return
+        try:
+            import engram_core
+        except ImportError:
+            return  # _require_store_schema_current reports it (OwnerStoreBehindSchema)
+        if not os.path.lexists(self.store_path):
+            return
+        try:
+            fd = engram_core.acquire_store_maint_lock(str(self.store_path), engram_core.STORE_MAINT_OWNER_ROLE)
+        except engram_core.StoreMaintLockHeld as exc:
+            if exc.holder_role == engram_core.STORE_MAINT_OWNER_ROLE:
+                raise OwnerAlreadyRunning(
+                    f"refusing to start: another owner holds the store (pid {exc.holder_pid or 'unknown'}, "
+                    f"{exc.lock_path}); it is unaffected and nothing was created or bound"
+                ) from exc
+            raise OwnerStoreMaintenance(
+                f"refusing to start: {exc}; nothing was created or bound. The supervisor retries with "
+                f"back-off; the owner starts once that process has exited"
+            ) from exc
+        except engram_core.StoreMaintLockUnusable as exc:
+            if exc.retryable:  # a resource limit (engram_core.STORE_MAINT_RETRYABLE_ERRNOS): a retry can clear it
+                raise OwnerStoreMaintenance(
+                    f"refusing to start: {exc}; this is transient; nothing was created or bound. The "
+                    f"supervisor retries with back-off"
+                ) from exc
+            raise OwnerStoreLockDirUnusable(
+                f"refusing to start: {exc}; nothing was created or bound. Fix or remove that path, then start "
+                f"the owner again"
+            ) from exc
+        self._maint_lock_fd = fd
+
+    def _release_maint_lock(self) -> None:
+        """Release the maintenance flock if this owner holds it (idempotent). Called by stop()/_cleanup()
+        AFTER both store connections are closed, and by start() on a failed start."""
+        fd, self._maint_lock_fd = self._maint_lock_fd, None
+        if fd is None:
+            return
+        try:
+            import engram_core
+
+            engram_core.release_store_maint_lock(fd)
+        except Exception:
+            try:
+                os.close(fd)  # the kernel drops the flock with the fd either way
+            except OSError:
+                pass
+
+    def _start_inner(self, *, install_signal_handlers: bool = True) -> None:
+        """The body of start(): bind the socket, open the store, and begin serving in a
         background thread. Returns once the accept loop is running.
 
         Raises OwnerAlreadyRunning if a confirmably-live owner already
@@ -2614,6 +2733,12 @@ class EngramdOwner:
             os.environ, _read_install_tier(self.engram_home)
         )
 
+        # #3882: the store-maintenance lock comes FIRST among everything that touches the store, before
+        # the schema probe below, so an owner never probes a store an offline repair is in the middle
+        # of changing. Held for this owner's whole lifetime (released in _cleanup(), after both
+        # connections close; the kernel releases it if this process dies).
+        self._take_maint_lock()
+
         # #3753: refuse a store that is behind this code's schema (or absent) BEFORE the
         # first filesystem mutation (the mkdir below) and so before any connect() to it:
         # a read-only probe, so a refusal creates no knowledge.db and no run/ (a WAL-mode
@@ -2622,6 +2747,9 @@ class EngramdOwner:
         # dynamic flag), which touch nothing, and ahead of the live-owner check below:
         # a second launch against a behind store is told about the store, not the seat.
         _require_store_schema_current(self.store_path)
+        # The store passed the gate, so it exists: if it did not when the lock was first tried (it was
+        # created in between), take the lock now, before anything below opens it.
+        self._take_maint_lock()
 
         self.engram_home.mkdir(parents=True, exist_ok=True)
 
@@ -3314,6 +3442,15 @@ class EngramdOwner:
                     pass
                 self._client_read_conn = None
         self._client_read_gate = None
+        # #3882: the maintenance lock goes LAST -- after both connections are closed, so a repair tool that
+        # takes it next never meets an open owner connection. NOT on a displaced substrate: there the two
+        # connections are parked still OPEN, so the lock stays held with them and the kernel drops the flock
+        # when main() ends the process with os._exit(EXIT_DISPLACED). (_cleanup() is also called before
+        # raising, by the pidfile refusal in _write_pidfile and by start()'s failure handler once connections
+        # are open; in both, start()'s handler releases the lock only when the owner is NOT displaced.) An embedder or test that calls stop() on a displaced owner and keeps
+        # running holds the lock until the process exits, so the next repair tool refuses until then.
+        if not self._displaced:
+            self._release_maint_lock()
 
     def wait_forever(self) -> None:
         """Block the calling thread until shutdown (a signal, or .stop()
@@ -5274,8 +5411,8 @@ class EngramdOwner:
 # planted pidfile 1, start() gave it 4). Looked up with isinstance, in order; none of these
 # classes subclasses another (all are direct RuntimeError subclasses), so the order carries no
 # meaning today, but a future subclass must be listed BEFORE its base. `--preflight` only ever
-# raises the classes `check_start_refusals` raises; OwnerAlreadyRunning, OwnerAclNotStripped and
-# OwnerStoreBehindSchema are start()-only.
+# raises the classes `check_start_refusals` raises; OwnerAlreadyRunning, OwnerAclNotStripped,
+# OwnerStoreBehindSchema, OwnerStoreMaintenance and OwnerStoreLockDirUnusable are start()-only.
 # Owner* classes deliberately absent (OwnerStalePathUnsafe, OwnerPeerCredentialsMalformed,
 # OwnerPythonTooOld) are not mapped and propagate.
 _REFUSAL_EXIT: tuple[tuple[type[RuntimeError], int], ...] = (
@@ -5289,6 +5426,10 @@ _REFUSAL_EXIT: tuple[tuple[type[RuntimeError], int], ...] = (
     # Its own code (not 1, not os._exit): non-zero, so the supervisor retries while the first
     # migration finishes.
     (OwnerStoreBehindSchema, EXIT_STORE_BEHIND_SCHEMA),
+    # #3882: its own code, retried with back-off while an offline repair holds the store.
+    (OwnerStoreMaintenance, EXIT_STORE_MAINTENANCE),
+    # #3882: an unusable lock directory is a planted path, the class exit 4 already names; not retried.
+    (OwnerStoreLockDirUnusable, EXIT_PATH_NOT_REGULAR),
 )
 
 

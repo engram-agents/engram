@@ -1042,60 +1042,71 @@ def main():
         print(json.dumps({"error": "Bug ref must be an ENGRAM node ID (qu_, ob_, ls_, or dv_)"}))
         sys.exit(1)
 
-    if args.operation == "recompute_confidence":
-        if not args.node_id:
-            print(json.dumps({"error": "recompute_confidence requires --node-id"}))
-            sys.exit(1)
-        result = recompute_confidence(
-            args.phase, args.node_id,
-            args.reason, args.bug_ref, args.token,
-            args.override_invariant,
-        )
+    # #3882: an offline repair tool. The store-maintenance lock is taken BEFORE the first open of the
+    # store (preview included: a read against a store being repaired is still a hazard) and held to the
+    # end of the run, so an owner and this tool exclude each other. (This file already imports names from
+    # engram_core at module level; importing it opens nothing, and the lock is taken here, in main.)
+    import engram_core as _lock_core
+    lock_fd = _lock_core.acquire_store_maint_lock_or_report(DB_PATH, "surgical")
+    if lock_fd is None:
+        sys.exit(_lock_core.STORE_MAINT_REFUSED_EXIT)
+    try:
+        if args.operation == "recompute_confidence":
+            if not args.node_id:
+                print(json.dumps({"error": "recompute_confidence requires --node-id"}))
+                sys.exit(1)
+            result = recompute_confidence(
+                args.phase, args.node_id,
+                args.reason, args.bug_ref, args.token,
+                args.override_invariant,
+            )
 
-    elif args.operation == "metadata_patch":
-        if not args.node_id or not args.value:
-            print(json.dumps({"error": "metadata_patch requires --node-id and --value (JSON)"}))
-            sys.exit(1)
-        try:
-            patch = json.loads(args.value)
-        except json.JSONDecodeError as e:
-            print(json.dumps({"error": f"--value must be valid JSON: {e}"}))
-            sys.exit(1)
-        result = metadata_patch(
-            args.phase, args.node_id, patch,
-            args.reason, args.bug_ref, args.token,
-            args.override_invariant,
-        )
+        elif args.operation == "metadata_patch":
+            if not args.node_id or not args.value:
+                print(json.dumps({"error": "metadata_patch requires --node-id and --value (JSON)"}))
+                sys.exit(1)
+            try:
+                patch = json.loads(args.value)
+            except json.JSONDecodeError as e:
+                print(json.dumps({"error": f"--value must be valid JSON: {e}"}))
+                sys.exit(1)
+            result = metadata_patch(
+                args.phase, args.node_id, patch,
+                args.reason, args.bug_ref, args.token,
+                args.override_invariant,
+            )
 
-    elif args.operation == "field_patch":
-        if not args.node_id or not args.field or args.value is None:
-            print(json.dumps({"error": "field_patch requires --node-id, --field, and --value"}))
-            sys.exit(1)
-        result = field_patch(
-            args.phase, args.node_id, args.field, args.value,
-            args.reason, args.bug_ref, args.token,
-            args.override_invariant,
-        )
+        elif args.operation == "field_patch":
+            if not args.node_id or not args.field or args.value is None:
+                print(json.dumps({"error": "field_patch requires --node-id, --field, and --value"}))
+                sys.exit(1)
+            result = field_patch(
+                args.phase, args.node_id, args.field, args.value,
+                args.reason, args.bug_ref, args.token,
+                args.override_invariant,
+            )
 
-    elif args.operation == "edge_add":
-        if not args.source_id or not args.target_id or not args.relation:
-            print(json.dumps({"error": "edge_add requires --source-id, --target-id, --relation"}))
-            sys.exit(1)
-        result = edge_add(
-            args.phase, args.source_id, args.target_id, args.relation,
-            args.reason, args.bug_ref, args.token,
-            args.override_invariant,
-        )
+        elif args.operation == "edge_add":
+            if not args.source_id or not args.target_id or not args.relation:
+                print(json.dumps({"error": "edge_add requires --source-id, --target-id, --relation"}))
+                sys.exit(1)
+            result = edge_add(
+                args.phase, args.source_id, args.target_id, args.relation,
+                args.reason, args.bug_ref, args.token,
+                args.override_invariant,
+            )
 
-    elif args.operation == "edge_remove":
-        if not args.source_id or not args.target_id or not args.relation:
-            print(json.dumps({"error": "edge_remove requires --source-id, --target-id, --relation"}))
-            sys.exit(1)
-        result = edge_remove(
-            args.phase, args.source_id, args.target_id, args.relation,
-            args.reason, args.bug_ref, args.token,
-            args.override_invariant,
-        )
+        elif args.operation == "edge_remove":
+            if not args.source_id or not args.target_id or not args.relation:
+                print(json.dumps({"error": "edge_remove requires --source-id, --target-id, --relation"}))
+                sys.exit(1)
+            result = edge_remove(
+                args.phase, args.source_id, args.target_id, args.relation,
+                args.reason, args.bug_ref, args.token,
+                args.override_invariant,
+            )
+    finally:
+        _lock_core.release_store_maint_lock(lock_fd)
 
     print(json.dumps(result, indent=2))
 

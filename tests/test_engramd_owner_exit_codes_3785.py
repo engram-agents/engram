@@ -50,6 +50,8 @@ START_CODES = {
     "OwnerPidfileNotRegular": 4,
     "OwnerStorePathNotRegular": 4,
     "OwnerStoreBehindSchema": 5,
+    "OwnerStoreMaintenance": 6,  # #3882: the store-maintenance lock is held by a repair tool
+    "OwnerStoreLockDirUnusable": 4,  # #3882: the lock directory is a planted path; not retried
 }
 # What check_start_refusals() (so --preflight) can raise: read off the method and the two
 # helpers it calls (_check_platform_support, _check_darwin_home_not_tcc_protected).
@@ -104,7 +106,7 @@ def test_start_code_is_pinned(name, home, monkeypatch, capsys):
 
 
 def test_exit_constants_are_the_values_the_pins_assume():
-    assert (eo.EXIT_PATH_NOT_REGULAR, eo.EXIT_STORE_BEHIND_SCHEMA) == (4, 5)
+    assert (eo.EXIT_PATH_NOT_REGULAR, eo.EXIT_STORE_BEHIND_SCHEMA, eo.EXIT_STORE_MAINTENANCE) == (4, 5, 6)
 
 
 def _table():

@@ -338,6 +338,19 @@ case "$_verdict" in
         ;;
 esac
 
+# ---- 3b. the store-maintenance lock directory is usable (#3882) -----------------------
+# The owner exits 4 on a planted symlink / non-directory / foreign-owned `knowledge.db.maint.lockdir`
+# and systemd does not restart 4, but launchd restarts every non-zero exit: only this refusal, before
+# anything is launched, stops that loop. One lstat in the helper; it never creates the directory (the
+# owner does). `ambiguous:` claims nothing and proceeds: the owner refuses by itself, closed.
+_maintlock="$("$PYTHON_BIN" "$IO_PY" maintlock "$ENGRAM_HOME" 2>/dev/null)"
+case "$_maintlock" in
+    bad:*)
+        _report "ENGRAM owner not launched: the store-maintenance lock directory $ENGRAM_HOME/knowledge.db.maint.lockdir is not a real directory owned by this user (${_maintlock#bad:}); the owner would refuse it (exit 4). Remove or fix that path, then start a session again. Launching nothing. ENGRAM_HOME=$ENGRAM_HOME"
+        exit 0
+        ;;
+esac
+
 # #3849: step 3 probes a LIVE RECORDED owner; the supervised arms below are reached only when no
 # live owner is recorded (the owner is still before its engramd.pid write, the pidfile is missing or
 # stale, or the unit's process is not an engramd_owner). When the unit / job is UP, ask the same
@@ -566,8 +579,9 @@ else
             0) printf '%s' "clean stop" ;;
             1) printf '%s' "another owner holds this seat" ;;
             3) printf '%s' "the owner shut down on a displaced substrate" ;;
-            4) printf '%s' "a planted non-regular path (fix the path, then reset-failed)" ;;
+            4) printf '%s' "a planted non-regular path, or an unusable store-maintenance lock directory (fix the path, then reset-failed)" ;;
             5) printf '%s' "the store is behind this code's schema (the first migration has not run)" ;;
+            6) printf '%s' "a store-maintenance tool (or another holder) holds the store; the owner retries once it has exited" ;;
             *) printf '%s' "unrecognized exit status" ;;
         esac
     }

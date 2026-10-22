@@ -29,13 +29,18 @@ Environment=ENGRAM_HOME={{ENGRAM_HOME}}
 #                               it must never read as a success. Hence deliberately NO
 #                               SuccessExitStatus=, and exits 1 and 3 are never in
 #                               RestartPreventExitStatus=.
-#   4  EXIT_PATH_NOT_REGULAR -> a pidfile or store path is not a regular file -> NOT restarted
+#   4  EXIT_PATH_NOT_REGULAR -> a pidfile or store path is not a regular file, or the
+#                               store-maintenance lock directory (<store>.maint.lockdir) is
+#                               unusable (planted symlink, foreign owner, ...) -> NOT restarted
 #                               (RestartPreventExitStatus=4): retrying cannot fix a planted path
 #   5  EXIT_STORE_BEHIND_SCHEMA (#3753) -> restarted, unbounded as for exit 1: knowledge.db is
 #                               absent or behind this code's schema (the first migration has
 #                               not run yet); no SuccessExitStatus=/RestartPreventExitStatus=.
 #                               Not 2: CPython exits 2 itself when it cannot open the script
 #                               (a deleted ExecStart), and that must not read as this refusal.
+#   6  EXIT_STORE_MAINTENANCE (#3882) -> restarted, unbounded as for exit 1: an offline repair tool
+#                               (or another holder) holds the store; the owner starts once it has
+#                               exited. Not in RestartPreventExitStatus=.
 Restart=on-failure
 RestartPreventExitStatus=4
 RestartSec=10s

@@ -342,7 +342,12 @@ def test_wal_store_below_latest_is_refused_and_the_probe_leaves_only_sidecars(ho
     with pytest.raises(eo.OwnerStoreBehindSchema):
         _try_start(home)
     after = _listing(home)
-    assert set(after) - set(before) <= {"knowledge.db-wal", "knowledge.db-shm"}, after
+    # #3882: the owner takes the store-maintenance lock before the probe, so the lock directory (and the
+    # holder file in it) is the one further new entry a refusal against an EXISTING store leaves.
+    assert set(after) - set(before) <= {
+        "knowledge.db-wal", "knowledge.db-shm",
+        "knowledge.db.maint.lockdir", "knowledge.db.maint.lockdir/holder",
+    }, after
     assert set(before) <= set(after)
     assert not (home / "run").exists()
     assert db.read_bytes() == image  # no NEW knowledge.db and no change to the old one

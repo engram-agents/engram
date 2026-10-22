@@ -216,8 +216,11 @@ class World:
         return e, h
 
     def files(self):
+        # #3882: the store-maintenance lock directory (and its holder file) is a sidecar of the store, like
+        # -wal/-shm: the tool creates it beside the store and it stays; it is not an output of the run.
         return sorted(str(p.relative_to(self.home)) for p in self.home.rglob("*")
-                      if p.is_file() and not p.name.endswith(("-wal", "-shm", "-journal")))
+                      if p.is_file() and not p.name.endswith(("-wal", "-shm", "-journal"))
+                      and ".maint.lockdir" not in p.relative_to(self.home).parts[0])
 
     # -- input files / invocation ----------------------------------------
     def write(self, name, obj):

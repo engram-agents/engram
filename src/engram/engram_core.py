@@ -17,6 +17,7 @@ Checkpoint/backup layers (both written in _commit_snapshot on every nap):
   large, not line-diff friendly).
 """
 
+import errno
 import functools
 import hashlib
 import json
@@ -583,6 +584,32 @@ _SETUP_LOCK_POLL_S = 0.05
 SETUP_WAIT_HOOK = "hook"
 SETUP_WAIT_SERVER = "server"
 
+# ── #3882 (U19 of #2652): the store-MAINTENANCE lock ────────────────────────
+# The same primitive under a second name: `<db>.maint.lockdir`. The engramd owner holds it for its whole
+# lifetime, and each offline repair tool (the exclusive-maintenance class of the 2652 ledger) holds it for
+# its whole run, so the two exclude each other: "offline" is enforced, not a word in a docstring. It is
+# taken NON-BLOCKING (one attempt plus the inode recheck, no wait loop): a held lock is the answer.
+# The holder file inside the directory carries "<pid> <role>\n", role = `owner` or the tool's name. It is
+# informational ONLY (it picks the refusal's message and exit code); the flock is the sole exclusion.
+# Its typed errors subclass StoreMaintLockError, NOT DbSetupLockError, so a handler written for the setup
+# lock never swallows a maintenance refusal.
+STORE_MAINT_LOCK_SUFFIX = ".maint.lockdir"
+STORE_MAINT_OWNER_ROLE = "owner"
+# The exit status of a tool (and of the owner, as EXIT_STORE_MAINTENANCE) refused by a held maintenance
+# lock. Not 0, 1 or 2; the owner's supervisor retries it with back-off while a repair runs.
+STORE_MAINT_REFUSED_EXIT = 6
+# The OSError numbers that mean "a retry can clear this", for a maintenance lock directory that could not
+# be created, opened or flocked. The owner (exit 6, the supervisor retries with back-off) and the offline
+# tools (a "transient, retry later" refusal) both read THIS set, through StoreMaintLockUnusable.retryable;
+# nothing else spells it. Resource limits only. EAGAIN is here for the create/open path; at flock EAGAIN
+# means "held" (BlockingIOError) and never reaches the unusable path at all.
+STORE_MAINT_RETRYABLE_ERRNOS = frozenset({
+    errno.EMFILE, errno.ENFILE, errno.ENOSPC, errno.ENOLCK, errno.EAGAIN,
+})
+# A permission or creation failure the operator works around with a writable copy of the store: permission
+# denied, a read-only filesystem, a missing parent directory. (Used for the refusal's remedy only.)
+STORE_MAINT_PERMISSION_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOENT})
+
 
 class DbSetupLockError(RuntimeError):
     """Base for the setup-lock failures. The setup did NOT run."""
@@ -600,15 +627,47 @@ class DbSetupLockUnusable(DbSetupLockError):
     """The lock directory could not be opened, validated or flocked; setup refused to run unlocked."""
 
 
-def _read_setup_lock_holder_pid(dir_fd: int) -> str:
-    """Best-effort holder pid, from the `holder` file inside the lock directory
-    (opened relative to the directory fd we hold). Informational only -- never
-    liveness and never exclusion (the flock on the directory is the truth).
+class StoreMaintLockError(RuntimeError):
+    """Base for the store-maintenance lock failures (#3882). The caller did NOT touch the store."""
 
-    Never blocks: O_NONBLOCK, so a FIFO planted at that name cannot stall the
-    waiter, and a non-regular file is not read at all. "unknown" on ANY
-    failure (absent, unreadable, garbage, not a regular file).
-    """
+
+class StoreMaintLockHeld(StoreMaintLockError):
+    """The maintenance lock is held by another process. `holder_pid` / `holder_role` come from the
+    informational holder file (None when it is absent, unreadable or malformed); `lock_path` is the lock
+    directory."""
+
+    def __init__(self, message, *, lock_path, holder_pid=None, holder_role=None):
+        super().__init__(message)
+        self.lock_path = lock_path
+        self.holder_pid = holder_pid
+        self.holder_role = holder_role
+
+
+class StoreMaintLockUnusable(StoreMaintLockError):
+    """The maintenance lock directory could not be opened, validated or flocked; the caller refused to
+    touch the store without it. `kind` says whether a retry can clear it: "retryable" (an errno in
+    STORE_MAINT_RETRYABLE_ERRNOS), or one a retry cannot fix -- "planted" (a symlink, a non-directory, a
+    foreign owner, a mode that cannot be tightened), "permission" (permission denied, read-only
+    filesystem, missing parent) or "unknown" (any other error, failed closed). `errno_code` is the
+    OSError's errno when it had one."""
+
+    def __init__(self, message, *, kind="unknown", errno_code=None):
+        super().__init__(message)
+        self.kind = kind
+        self.errno_code = errno_code
+
+    @property
+    def retryable(self) -> bool:
+        return self.kind == "retryable"
+
+
+def _read_lock_holder_words(dir_fd: int):
+    """The whitespace-split words of the `holder` file inside the lock directory (opened relative to the
+    directory fd we hold), or None on ANY failure (absent, unreadable, not a regular file). Informational
+    only -- never liveness and never exclusion (the flock on the directory is the truth).
+
+    Never blocks: O_NONBLOCK, so a FIFO planted at that name cannot stall the waiter, and a non-regular
+    file is not read at all. Shared by the setup lock (pid word) and the maintenance lock (pid + role)."""
     fd = None
     try:
         import stat as _stat
@@ -619,13 +678,10 @@ def _read_setup_lock_holder_pid(dir_fd: int) -> str:
             dir_fd=dir_fd,
         )
         if not _stat.S_ISREG(os.fstat(fd).st_mode):
-            return "unknown"
-        parts = os.read(fd, 64).decode("ascii", "replace").split()
-        if parts and parts[0].isascii() and parts[0].isdigit():
-            return parts[0]
-        return "unknown"
+            return None
+        return os.read(fd, 64).decode("ascii", "replace").split()
     except Exception:
-        return "unknown"
+        return None
     finally:
         if fd is not None:
             try:
@@ -634,7 +690,28 @@ def _read_setup_lock_holder_pid(dir_fd: int) -> str:
                 pass
 
 
-def _open_db_setup_lock_dir(lock_path: str) -> int:
+def _read_setup_lock_holder_pid(dir_fd: int) -> str:
+    """Best-effort holder pid, from the `holder` file inside the lock directory.
+    Informational only -- never liveness and never exclusion (the flock on the
+    directory is the truth). "unknown" on ANY failure (absent, unreadable,
+    garbage, not a regular file)."""
+    parts = _read_lock_holder_words(dir_fd)
+    if parts and parts[0].isascii() and parts[0].isdigit():
+        return parts[0]
+    return "unknown"
+
+
+def _setup_lock_unusable(lock_path: str, exc: BaseException, stage: str) -> "DbSetupLockUnusable":
+    """The setup lock's typed error and its exact wording. `stage` is "use" (open/validate/import) or
+    "flock" (the flock call itself)."""
+    verb = "flock" if stage == "flock" else "use"
+    return DbSetupLockUnusable(
+        f"cannot {verb} setup lock directory {lock_path}: {type(exc).__name__}: {exc}; "
+        f"refusing to run the one-time DB setup without it"
+    )
+
+
+def _open_db_setup_lock_dir(lock_path: str, unusable=None) -> int:
     """Create (if absent) + open + validate the setup lock DIRECTORY; return the
     open fd (not yet flocked).
 
@@ -646,8 +723,9 @@ def _open_db_setup_lock_dir(lock_path: str) -> int:
     The owner check compares against the EFFECTIVE uid, so a lock directory
     owned by another account is refused even when running as root.
 
-    Every failure raises DbSetupLockUnusable naming the path. Called again by
-    _acquire_db_setup_lock when the post-flock inode recheck finds the name no
+    Every failure raises DbSetupLockUnusable naming the path (#3882: or, for another lock built on this
+    primitive, the typed error `unusable(lock_path, exc, "use")` returns). Called again by
+    _acquire_lock_dir when the post-flock inode recheck finds the name no
     longer refers to the locked directory (#3791).
     """
     fd = None
@@ -698,10 +776,7 @@ def _open_db_setup_lock_dir(lock_path: str) -> int:
                 os.close(fd)
             except Exception:
                 pass
-        raise DbSetupLockUnusable(
-            f"cannot use setup lock directory {lock_path}: {type(exc).__name__}: {exc}; "
-            f"refusing to run the one-time DB setup without it"
-        ) from exc
+        raise (unusable or _setup_lock_unusable)(lock_path, exc, "use") from exc
     return fd
 
 
@@ -716,45 +791,33 @@ def _lock_fd_names_path(fd: int, lock_path: str) -> bool:
     return (st.st_dev, st.st_ino) == (cur.st_dev, cur.st_ino)
 
 
-def _acquire_db_setup_lock(setup_wait: str) -> int:
-    """Take the exclusive cross-process setup lock; return the open fd.
+class _LockPolicy(NamedTuple):
+    """What differs between the locks built on `_acquire_lock_dir`: the wait budget, the typed errors and
+    their wording, how the holder is read and what it writes, and whether a waiter logs. The mechanics (the
+    0700 directory, LOCK_EX|LOCK_NB, the inode recheck, the retry inside the deadline) are shared."""
 
-    The caller MUST pass the fd to _release_db_setup_lock in a finally. Raises
-    DbSetupLockBusy / DbSetupLockTimeout / DbSetupLockUnusable (all
-    DbSetupLockError) and NEVER degrades to running unlocked -- deliberately
-    NOT _with_state_lock's degrade-to-unlocked path: proceeding without the
-    lock IS the race this lock exists to close.
-    """
-    if setup_wait == SETUP_WAIT_HOOK:
-        wait_s, is_hook = SETUP_LOCK_HOOK_WAIT_S, True
-    elif setup_wait == SETUP_WAIT_SERVER:
-        wait_s, is_hook = SETUP_LOCK_SERVER_WAIT_S, False
-    else:
-        raise ValueError(
-            f"setup_wait must be {SETUP_WAIT_HOOK!r} or {SETUP_WAIT_SERVER!r}, got {setup_wait!r}"
-        )
-    lock_path = str(DB_PATH) + SETUP_LOCK_SUFFIX
+    wait_s: float
+    error_base: type            # re-raised as is (its subclasses are the policy's typed errors)
+    unusable: object            # (lock_path, exc, stage) -> exception; stage "use" | "flock"
+    read_holder: object         # (dir_fd) -> opaque holder, handed to expired / log_wait
+    expired: object             # (lock_path, holder) -> exception, raised when wait_s runs out
+    log_wait: object            # (lock_path, holder) -> None, or None for a lock that never logs
+    holder_payload: bytes       # written into `holder` once the flock is held
+
+
+def _acquire_lock_dir(lock_path: str, policy: _LockPolicy) -> int:
+    """The ONE implementation of the directory flock (#3791, generalised in place by #3882): create/open/
+    validate the 0700 lock directory at `lock_path`, take LOCK_EX|LOCK_NB, recheck the inode, retry inside
+    `policy.wait_s`, then write the holder file. Returns the open fd; the caller MUST release it. Raises
+    the policy's typed errors and NEVER degrades to running unlocked -- deliberately NOT
+    _with_state_lock's degrade-to-unlocked path: proceeding without the lock IS the race it closes."""
     try:
         import fcntl
     except Exception as exc:
-        raise DbSetupLockUnusable(
-            f"cannot use setup lock directory {lock_path}: {type(exc).__name__}: {exc}; "
-            f"refusing to run the one-time DB setup without it"
-        ) from exc
-    fd = _open_db_setup_lock_dir(lock_path)
-    deadline = time.monotonic() + wait_s
+        raise policy.unusable(lock_path, exc, "use") from exc
+    fd = _open_db_setup_lock_dir(lock_path, policy.unusable)
+    deadline = time.monotonic() + policy.wait_s
     next_log = 0.0
-
-    def _expired(holder):
-        if is_hook:
-            return DbSetupLockBusy(
-                f"ENGRAM is upgrading its store in another process (pid {holder}); "
-                f"memory blocks skipped this time"
-            )
-        return DbSetupLockTimeout(
-            f"timed out after {wait_s}s waiting for setup lock {lock_path} held by "
-            f"pid {holder}; the store was left untouched"
-        )
 
     try:
         while True:
@@ -778,46 +841,87 @@ def _acquire_db_setup_lock(setup_wait: str) -> int:
                 if _lock_fd_names_path(fd, lock_path):
                     break
                 if time.monotonic() >= deadline:
-                    raise _expired(_read_setup_lock_holder_pid(fd))
+                    raise policy.expired(lock_path, policy.read_holder(fd))
                 os.close(fd)
                 fd = None
                 time.sleep(min(_SETUP_LOCK_POLL_S, max(deadline - time.monotonic(), 0.001)))
-                fd = _open_db_setup_lock_dir(lock_path)
+                fd = _open_db_setup_lock_dir(lock_path, policy.unusable)
                 continue
             now = time.monotonic()
-            holder = _read_setup_lock_holder_pid(fd)
+            holder = policy.read_holder(fd)
             if now >= deadline:
-                raise _expired(holder)
-            if not is_hook and now >= next_log:
-                print(
-                    f"[engram] waiting for setup lock held by pid {holder} ({lock_path})",
-                    file=sys.stderr,
-                )
+                raise policy.expired(lock_path, holder)
+            if policy.log_wait is not None and now >= next_log:
+                policy.log_wait(lock_path, holder)
                 next_log = now + SETUP_LOCK_LOG_INTERVAL_S
             time.sleep(min(_SETUP_LOCK_POLL_S, max(deadline - now, 0.001)))
-    except DbSetupLockError:
+    except policy.error_base:
         if fd is not None:
             os.close(fd)
         raise
     except Exception as exc:
         if fd is not None:
             os.close(fd)
-        raise DbSetupLockUnusable(
-            f"cannot flock setup lock directory {lock_path}: {type(exc).__name__}: {exc}; "
-            f"refusing to run the one-time DB setup without it"
-        ) from exc
-    # Holder pid: informational only (both wait messages name it). Written only
+        raise policy.unusable(lock_path, exc, "flock") from exc
+    # Holder: informational only (the wait / refusal messages name it). Written only
     # now that the flock is HELD, so a waiter can never overwrite the holder's
     # file. A strict regular-file write (refuses FIFO / symlink / hard link);
-    # any failure just leaves the pid unknown to waiters.
+    # any failure just leaves the holder unknown to waiters.
     try:
         _regular_io.write_pidfile(
             os.path.join(lock_path, SETUP_LOCK_HOLDER_NAME),
-            f"{os.getpid()}\n".encode("ascii"),
+            policy.holder_payload,
         )
     except Exception:
         pass
     return fd
+
+
+def _acquire_db_setup_lock(setup_wait: str) -> int:
+    """Take the exclusive cross-process setup lock; return the open fd.
+
+    The caller MUST pass the fd to _release_db_setup_lock in a finally. Raises
+    DbSetupLockBusy / DbSetupLockTimeout / DbSetupLockUnusable (all
+    DbSetupLockError) and NEVER degrades to running unlocked -- deliberately
+    NOT _with_state_lock's degrade-to-unlocked path: proceeding without the
+    lock IS the race this lock exists to close.
+    """
+    if setup_wait == SETUP_WAIT_HOOK:
+        wait_s, is_hook = SETUP_LOCK_HOOK_WAIT_S, True
+    elif setup_wait == SETUP_WAIT_SERVER:
+        wait_s, is_hook = SETUP_LOCK_SERVER_WAIT_S, False
+    else:
+        raise ValueError(
+            f"setup_wait must be {SETUP_WAIT_HOOK!r} or {SETUP_WAIT_SERVER!r}, got {setup_wait!r}"
+        )
+    lock_path = str(DB_PATH) + SETUP_LOCK_SUFFIX
+
+    def _expired(lock_path, holder):
+        if is_hook:
+            return DbSetupLockBusy(
+                f"ENGRAM is upgrading its store in another process (pid {holder}); "
+                f"memory blocks skipped this time"
+            )
+        return DbSetupLockTimeout(
+            f"timed out after {wait_s}s waiting for setup lock {lock_path} held by "
+            f"pid {holder}; the store was left untouched"
+        )
+
+    def _log_wait(lock_path, holder):
+        print(
+            f"[engram] waiting for setup lock held by pid {holder} ({lock_path})",
+            file=sys.stderr,
+        )
+
+    return _acquire_lock_dir(lock_path, _LockPolicy(
+        wait_s=wait_s,
+        error_base=DbSetupLockError,
+        unusable=_setup_lock_unusable,
+        read_holder=_read_setup_lock_holder_pid,
+        expired=_expired,
+        log_wait=None if is_hook else _log_wait,
+        holder_payload=f"{os.getpid()}\n".encode("ascii"),
+    ))
 
 
 def _release_db_setup_lock(fd: int) -> None:
@@ -830,6 +934,182 @@ def _release_db_setup_lock(fd: int) -> None:
         os.close(fd)
     except Exception:
         pass
+
+
+# ── #3882: the store-maintenance lock, built on the primitive above ─────────
+
+_STORE_MAINT_ROLE_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
+def store_maint_lock_path(db_path) -> str:
+    """The maintenance lock directory for the store at `db_path`: `<db>.maint.lockdir`. Derived from the
+    PATH THE CALLER OPENS, never from engram_core.DB_PATH (the owner re-points that at its home)."""
+    return str(db_path) + STORE_MAINT_LOCK_SUFFIX
+
+
+def _read_store_maint_holder(dir_fd: int):
+    """(pid, role) from the holder file, each None when absent, unreadable or malformed. Informational:
+    it chooses a refusal's message and exit code, and is never exclusion. A role that is not a short
+    plain word is treated as unreadable, so nothing odd reaches a terminal or a decision."""
+    words = _read_lock_holder_words(dir_fd)
+    if not words:
+        return (None, None)
+    pid = words[0] if words[0].isascii() and words[0].isdigit() else None
+    role = words[1] if len(words) >= 2 and _STORE_MAINT_ROLE_RE.fullmatch(words[1]) else None
+    return (pid, role)
+
+
+def _classify_store_maint_unusable(exc: BaseException):
+    """(kind, errno_code) for the error that made the lock directory unusable. An OSError WITH an errno came
+    from the system: a resource limit is retryable, a permission or read-only failure is "permission", any
+    other is "unknown" (fail closed). An OSError WITHOUT an errno is one the primitive raised itself for a
+    path it refuses (symlink, not a directory, foreign owner, mode): "planted". Anything else (a failed
+    fcntl import) is "unknown"."""
+    if not isinstance(exc, OSError):
+        return ("unknown", None)
+    code = exc.errno
+    if code is None:
+        return ("planted", None)
+    if code in STORE_MAINT_RETRYABLE_ERRNOS:
+        return ("retryable", code)
+    if code in STORE_MAINT_PERMISSION_ERRNOS:
+        return ("permission", code)
+    return ("unknown", code)
+
+
+def _store_maint_unusable(lock_path: str, exc: BaseException, stage: str) -> "StoreMaintLockUnusable":
+    verb = "flock" if stage == "flock" else "use"
+    kind, code = _classify_store_maint_unusable(exc)
+    named = f" [{errno.errorcode.get(code, code)}]" if code is not None else ""
+    return StoreMaintLockUnusable(
+        f"cannot {verb} store-maintenance lock directory {lock_path}: {type(exc).__name__}: {exc}{named}; "
+        f"refusing to touch the store without it",
+        kind=kind, errno_code=code,
+    )
+
+
+def _store_maint_held(lock_path: str, holder) -> "StoreMaintLockHeld":
+    pid, role = holder
+    if pid is None and role is None:
+        who = "another process (its holder file is absent or unreadable)"
+    else:
+        who = f"pid {pid or 'unknown'}" + (f" ({role})" if role else "")
+    return StoreMaintLockHeld(
+        f"the store is held for maintenance: lock {lock_path} is held by {who}",
+        lock_path=lock_path, holder_pid=pid, holder_role=role,
+    )
+
+
+def acquire_store_maint_lock(db_path, role: str) -> int:
+    """Take the exclusive store-maintenance lock for the store at `db_path`; return the open fd.
+
+    NON-BLOCKING: one attempt plus the inode recheck, never a wait loop. A held lock raises
+    StoreMaintLockHeld (holder pid and role from the informational holder file); an unusable lock
+    directory raises StoreMaintLockUnusable. The caller MUST release the fd (release_store_maint_lock)
+    or hold it to process exit: the kernel drops the flock when the holder dies, so a crash leaves no
+    stale lock. `role` is `owner` or the tool's name; it is written as "<pid> <role>\n" into the holder
+    file, for messages only."""
+    if not _STORE_MAINT_ROLE_RE.fullmatch(role or ""):
+        role = re.sub(r"[^A-Za-z0-9_.-]", "_", role or "")[:64] or "tool"
+    return _acquire_lock_dir(store_maint_lock_path(db_path), _LockPolicy(
+        wait_s=0,
+        error_base=StoreMaintLockError,
+        unusable=_store_maint_unusable,
+        read_holder=_read_store_maint_holder,
+        expired=_store_maint_held,
+        log_wait=None,
+        holder_payload=f"{os.getpid()} {role}\n".encode("ascii"),
+    ))
+
+
+def release_store_maint_lock(fd: int) -> None:
+    """Release a lock taken by acquire_store_maint_lock (the one release the setup lock uses too)."""
+    _release_db_setup_lock(fd)
+
+
+def _owner_service_commands(db_path):
+    """(stop, start) shell commands for THIS seat's owner, built from the strings the repo already uses:
+    Linux `engramd-owner-<key>.service` under `systemctl --user`, macOS the launchd label
+    `com.engram.engramd-owner.<key>` with `setup-surface-daemon-service.sh --owner` (its bootout +
+    bootstrap is the start). `<key>` is the one derivation, tools/engramd-owner-home-key.sh."""
+    import platform
+    import shlex
+
+    q = shlex.quote
+    tools = Path(__file__).resolve().parent / "tools"
+    home = str(Path(db_path).resolve().parent)
+    key = "$(bash %s %s)" % (q(str(tools / "engramd-owner-home-key.sh")), q(home))
+    if platform.system() == "Darwin":
+        return (
+            "launchctl bootout gui/$(id -u)/com.engram.engramd-owner." + key,
+            "bash %s --owner" % q(str(tools / "setup-surface-daemon-service.sh")),
+        )
+    unit = '"engramd-owner-%s.service"' % key
+    return ("systemctl --user stop " + unit, "systemctl --user start " + unit)
+
+
+def store_maint_refusal_text(exc: "StoreMaintLockError", db_path=None) -> str:
+    """The text a refused tool prints: what held the lock, that nothing was touched, and how to proceed.
+    When the holder is an owner (or unknown), the platform's command to stop the owner and the one to
+    start it again afterwards; when it is another maintenance tool, wait for it.
+
+    A lock directory that cannot be used at all (StoreMaintLockUnusable) is a different problem: no
+    owner is involved, so the text names the directory and the cause (the exception's own message, which
+    names the errno), says nothing was touched, and keys the remedy on the cause: a resource limit
+    (retryable) is transient, retry later; a permission or creation failure (denied, read-only, missing
+    parent) gets a copy of the store (with any -wal and -shm) to run against; a planted path (symlink,
+    non-directory, foreign owner, mode) gets "fix or remove that path"; an unrecognised error gets no
+    guessed remedy. No stop/start owner commands."""
+    if isinstance(exc, StoreMaintLockUnusable) and exc.retryable:
+        return "\n".join([
+            str(exc),
+            "This looks transient (a resource limit, not a planted path); this tool touched nothing. "
+            "Retry later: no path needs fixing.",
+        ])
+    if isinstance(exc, StoreMaintLockUnusable) and exc.kind == "planted":
+        return "\n".join([
+            str(exc),
+            "This tool needs a usable lock directory beside the store; it touched nothing.",
+            "Fix or remove that path, then run again.",
+        ])
+    if isinstance(exc, StoreMaintLockUnusable) and exc.kind == "unknown":
+        # Neither remedy is known to apply: name the cause (the message carries the errno) and stop.
+        return "\n".join([
+            str(exc),
+            "This tool needs a usable lock directory beside the store; it touched nothing. The cause above "
+            "is not one this tool recognises, so no remedy is suggested.",
+        ])
+    if isinstance(exc, StoreMaintLockUnusable):  # kind "permission": cannot create the lock where it must live
+        return "\n".join([
+            str(exc),
+            "This tool needs a writable directory beside the store for its lock; it touched nothing.",
+            "To report on a read-only copy, copy the store, with any -wal and -shm files, to a writable "
+            "directory and run against the copy.",
+        ])
+    lines = [
+        str(exc),
+        "This tool needs the store with no owner and no other repair running; it touched nothing.",
+    ]
+    role = getattr(exc, "holder_role", None)
+    if role is not None and role != STORE_MAINT_OWNER_ROLE:
+        lines.append(f"Another maintenance tool ({role}) holds the store. Wait for it to finish, then run this again.")
+    elif isinstance(exc, StoreMaintLockHeld) and db_path is not None:
+        stop, start = _owner_service_commands(db_path)
+        lines.append("To proceed: stop the owner, run this tool again, then start the owner:")
+        lines.append("  stop:  " + stop)
+        lines.append("  start: " + start)
+    return "\n".join(lines)
+
+
+def acquire_store_maint_lock_or_report(db_path, role: str, *, file=None):
+    """The tools' entry point: the lock's fd, or None after printing store_maint_refusal_text to `file`
+    (default stderr). A tool that gets None exits STORE_MAINT_REFUSED_EXIT without touching the store."""
+    try:
+        return acquire_store_maint_lock(db_path, role)
+    except StoreMaintLockError as exc:
+        print("REFUSED: " + store_maint_refusal_text(exc, db_path),
+              file=file if file is not None else sys.stderr)
+        return None
 
 
 def _configure_paths(data_dir: str | Path) -> None:

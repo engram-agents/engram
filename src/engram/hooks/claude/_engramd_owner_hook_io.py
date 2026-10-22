@@ -20,6 +20,12 @@ Subcommands (the shell switches on what they print; they never raise, and exit 0
       a planted special file can neither block the open nor reach it. If engram_pidfile
       cannot be imported the answer is `ambiguous:<why>` (never `none`: the shell then
       launches nothing).
+  maintlock <home>             -> ok | bad:<why> | ambiguous:<why>
+      #3882: the store-maintenance lock directory `<home>/knowledge.db.maint.lockdir`. The owner
+      exits 4 on an unusable one (launchd restarts that, so the hook refuses first, as it does for a
+      non-regular engramd.pid). `bad:` = it exists and is a symlink, not a directory, or owned by
+      another uid. Absent is `ok` (the owner creates it; this never does). One lstat, nothing opened,
+      so a planted special file cannot block it. Any other stat failure is `ambiguous:` and claims nothing.
   launchd_state <label>        -> running | registered:<state>:<last exit or none> | notfound
                                   | no_gui_domain | ambiguous:<why>
       Runs `launchctl print gui/<uid>/<label>` under a Python-side timeout
@@ -155,6 +161,25 @@ def live(home: str) -> str:
     except Exception as exc:
         return f"ambiguous:engram_pidfile failed ({type(exc).__name__})"
     return "alive" if pid is not None else "none"
+
+
+def maintlock(home: str) -> str:
+    """ok | bad:<why> | ambiguous:<why> for `<home>/knowledge.db.maint.lockdir` (see the module docstring).
+    Never creates, opens or modifies anything."""
+    path = os.path.join(home, "knowledge.db.maint.lockdir")
+    try:
+        st = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return "ok"
+    except OSError as exc:
+        return f"ambiguous:lstat failed ({type(exc).__name__})"
+    if stat.S_ISLNK(st.st_mode):
+        return "bad:a symbolic link"
+    if not stat.S_ISDIR(st.st_mode):
+        return "bad:not a real directory"
+    if st.st_uid != os.geteuid():
+        return f"bad:owned by uid {st.st_uid}, not uid {os.geteuid()}"
+    return "ok"
 
 
 def _probe_why(ec, result) -> str:
@@ -351,6 +376,8 @@ def main(argv: list) -> int:
         cmd = argv[1]
         if cmd == "live" and len(argv) == 3:
             print(live(argv[2]))
+        elif cmd == "maintlock" and len(argv) == 3:
+            print(maintlock(argv[2]))
         elif cmd == "launchd_state" and len(argv) == 3:
             print(launchd_state(argv[2]))
         elif cmd == "serving" and len(argv) == 3:

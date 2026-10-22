@@ -82,6 +82,7 @@
   "hooks/claude/_engramd_owner_hook_io.py:_kind_of",
   "hooks/claude/_engramd_owner_hook_io.py:_non_regular_kind",
   "hooks/claude/_engramd_owner_hook_io.py:live",
+  "hooks/claude/_engramd_owner_hook_io.py:maintlock",
   "hooks/claude/_engramd_owner_hook_io.py:_probe_why",
   "hooks/claude/_engramd_owner_hook_io.py:serving",
   "hooks/claude/_engramd_owner_hook_io.py:_clip_middle",

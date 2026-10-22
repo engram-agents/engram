@@ -192,6 +192,20 @@ class HelpShown(Exception):
     """--help was printed; a clean exit (0), not a refusal."""
 
 
+# #3882: the store-maintenance lock this run holds ({"core": engram_core, "fd": int}, or empty). Taken by
+# _main before its first store open (the `mode=ro` report path, the label check, the backup and the
+# --apply writes all go under it), released by main()'s finally so a caller that runs main() twice in one
+# process never meets its own earlier lock; a killed process drops it through the kernel.
+_MAINT_LOCK: dict = {}
+
+
+def _release_maint_lock():
+    held = dict(_MAINT_LOCK)
+    _MAINT_LOCK.clear()
+    if held:
+        held["core"].release_store_maint_lock(held["fd"])
+
+
 def _ro_uri(path):
     """A read-only SQLite URI for `path`, with `#`, `?`, `%` and spaces escaped."""
     return f"file:{urllib.parse.quote(str(path))}?mode=ro"
@@ -1472,6 +1486,14 @@ def _main(argv):
     core, cornerstone, dagc = _load_engine()
     core._configure_paths(home)
 
+    # #3882: an offline repair tool. The lock comes BEFORE the first open of the store, and every open
+    # below (the labels check, the backup, the run's own connections) sits under it. A held lock (an owner
+    # is running, or another repair) refuses here, before the store is touched.
+    try:
+        _MAINT_LOCK.update(core=core, fd=core.acquire_store_maint_lock(str(core.DB_PATH), "cites_step3"))
+    except core.StoreMaintLockError as exc:
+        raise Refusal(core.store_maint_refusal_text(exc, core.DB_PATH))
+
     if labels is not None:
         conn = sqlite3.connect(_ro_uri(core.DB_PATH), uri=True)
         try:
@@ -1569,6 +1591,8 @@ def main(argv=None) -> int:
     except Exception as exc:  # unexpected
         print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
+    finally:
+        _release_maint_lock()
 
 
 if __name__ == "__main__":

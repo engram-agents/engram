@@ -564,6 +564,9 @@ class Seat:
               # does not occur. Retaining it keeps C8f's exit-3 meaning pin green under the B1 gate.
               loud-exit3) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
                         printf 'LoadState=loaded\\nActiveState=activating\\nSubState=auto-restart\\nNRestarts=1\\nExecMainStatus=3\\nExecMainCode=1\\n'; else nf; fi;;
+              # #3882: exit 6 (EXIT_STORE_MAINTENANCE), the same record shape as loud-exit3.
+              loud-exit6) if [ "$unit" = "$(cat "{self.sysunit}")" ]; then
+                        printf 'LoadState=loaded\\nActiveState=activating\\nSubState=auto-restart\\nNRestarts=1\\nExecMainStatus=6\\nExecMainCode=1\\n'; else nf; fi;;
               # ---- round 6 (#3835, B2/B3): records Sol measured on systemd 255.4 that no fixture
               # above reaches --
               # B2: the FIRST failure, waiting for the first retry. The exit IS recorded (code 1)
@@ -2605,6 +2608,60 @@ def test_c8f_the_loud_line_names_the_meaning_of_a_displaced_substrate_exit_three
     assert "auto-restart" in line and "NRestarts=1" in line, line
     assert "last exit 3" in line, line
     assert "displaced substrate" in line, line
+
+
+def test_the_loud_line_names_the_meaning_of_a_store_maintenance_exit_six(seat):
+    """#3882: a unit whose last exit was 6 (EXIT_STORE_MAINTENANCE: an offline repair holds the store, the
+    unit retries) is the line an operator reads while a repair legitimately runs. It must say so, not
+    `unrecognized exit status`.
+
+    Mutation: delete the `6)` arm of `_owner_exit_meaning` -> THIS cell reddens, the exit-3 and exit-5 cells stay green."""
+    seat.config(FLAG_ON)
+    seat.systemctl("loud-exit6", seat.unit_name())
+    r = seat.run()
+    assert r.returncode == 0 and seat.launched() == []
+    (line,) = context_lines(r)
+    assert "last exit 6" in line, line
+    assert "unrecognized exit status" not in line, line
+    assert "store-maintenance" in line and "retries" in line, line
+
+
+# ---- #3882 R7: an unusable maintenance-lock directory is refused by the preflight ---------------------------
+# The owner exits 4 on it, launchd restarts every non-zero exit, so only a preflight that refuses first stops the loop.
+
+@pytest.mark.parametrize("kind", ["symlink", "regular-file"])
+def test_a_planted_maintenance_lock_directory_launches_nothing_and_says_so_once(seat, kind):
+    seat.config(FLAG_ON)
+    seat.systemctl("nobus")
+    lockdir = seat.eh / "knowledge.db.maint.lockdir"
+    if kind == "symlink":
+        target = seat.eh / "elsewhere"
+        target.mkdir(mode=0o700)
+        lockdir.symlink_to(target)
+    else:
+        lockdir.write_text("squatting")
+    rc, out, err, elapsed = seat.run_timed()
+    assert rc == 0 and elapsed < 3, (rc, elapsed, err[-200:])
+    assert seat.launched() == [], "an owner was launched over an unusable maintenance-lock directory"
+    lines = context_lines(subprocess.CompletedProcess([], rc, out, err))
+    assert len(lines) == 1, out
+    assert "store-maintenance lock directory" in lines[0] and "knowledge.db.maint.lockdir" in lines[0], lines[0]
+    assert "not a real directory" in lines[0], lines[0]
+    assert lockdir.is_symlink() or lockdir.is_file(), "the preflight must not touch the planted path"
+
+
+@pytest.mark.parametrize("state", ["absent", "real-directory"])
+def test_a_real_maintenance_lock_directory_and_an_absent_one_do_not_stop_the_launch(seat, state):
+    """Control: the preflight refuses only an unusable directory. A real directory we own (and no directory at
+    all) launches as before; the preflight creates nothing."""
+    seat.config(FLAG_ON)
+    seat.systemctl("nobus")
+    lockdir = seat.eh / "knowledge.db.maint.lockdir"
+    if state == "real-directory":
+        lockdir.mkdir(mode=0o700)
+    r = seat.run()
+    assert r.returncode == 0 and len(seat.launched()) == 1, (r.stdout, r.stderr)
+    assert lockdir.is_dir() == (state == "real-directory"), "the preflight created or removed the lock directory"
 
 
 # ---- C9 (round 5, #3835): no line may assert an exit the record does not hold -----------------
