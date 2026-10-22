@@ -522,6 +522,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/quote_quality_survey.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/weakest_load_bearing.py",
       "tier": "convenience"
     },
