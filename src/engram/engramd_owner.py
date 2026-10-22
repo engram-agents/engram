@@ -2598,8 +2598,21 @@ class EngramdOwner:
             self._start_inner(install_signal_handlers=install_signal_handlers)
         except BaseException:
             had_connections = self._owner_conn is not None or self._client_read_conn is not None
+            cleanup_failed = False
             if had_connections:
-                self._cleanup()  # closes both connections, then releases the lock itself (unless displaced)
+                try:
+                    self._cleanup()  # closes both connections, then releases the lock itself (unless displaced)
+                except Exception as cleanup_exc:
+                    # #4073: a failing cleanup must not replace the start error, and must NOT release the lock:
+                    # a connection may still be open, so holding is the safe side (main()'s exit drops it).
+                    # The cleanup error is logged, not chained; the ORIGINAL exception is re-raised below
+                    # (a bare `raise` here would re-raise the cleanup error instead).
+                    cleanup_failed = True
+                    logging.getLogger("engramd_owner").warning(
+                        "cleanup after a failed start itself failed (%s: %s); the maintenance lock stays held "
+                        "until this process exits", type(cleanup_exc).__name__, cleanup_exc)
+            if cleanup_failed:
+                raise
             if not self._displaced:
                 # A displaced owner never releases here, on any path (including the pidfile refusal, where
                 # _cleanup() has already parked the connections and nulled the attributes): its connections

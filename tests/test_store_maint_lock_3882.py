@@ -32,6 +32,7 @@ import errno
 import fcntl
 import inspect
 import json
+import logging
 import os
 import platform
 import shutil
@@ -1012,6 +1013,79 @@ def test_a_displaced_owner_never_releases_the_lock_in_the_failed_start_handler_e
         for conn in eo._DISPLACED_CONNECTIONS_KEEPALIVE[keep_before:]:
             conn.close()
         del eo._DISPLACED_CONNECTIONS_KEEPALIVE[keep_before:]
+        owner._release_maint_lock()
+
+
+@requires_linux_owner
+def test_a_failing_cleanup_in_the_failed_start_handler_neither_replaces_the_start_error_nor_releases_the_lock(
+    inproc_home, monkeypatch, caplog
+):
+    """#4073: the handler's `_cleanup()` raising (here a PermissionError unlinking our own pidfile) must
+    not replace the start error and must not release the lock: a connection may still be open, so the
+    lock is held until main()'s exit drops it. The cleanup error is logged."""
+    db = str(inproc_home / "knowledge.db")
+    owner = eo.EngramdOwner(inproc_home)
+    _fail_bind(monkeypatch, OSError(errno.EACCES, "planted bind failure"))
+    owner.pid_path.parent.mkdir(parents=True, exist_ok=True)
+    owner.pid_path.write_text(f"{os.getpid()}\n")
+    real_unlink = Path.unlink
+
+    def unlink(self, *a, **kw):
+        if str(self) == str(owner.pid_path):
+            raise PermissionError(errno.EACCES, "planted unlink failure")
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    seen = _capture_conns(monkeypatch)
+    try:
+        with caplog.at_level("WARNING", logger="engramd_owner"):
+            with pytest.raises(OSError) as ei:
+                owner.start(install_signal_handlers=False)
+        assert "planted bind failure" in str(ei.value), f"the start error was replaced by: {ei.value!r}"
+        assert "planted unlink failure" not in str(ei.value)
+        assert seen["owner"] is not None and seen["client"] is not None, "the failure came before the connections opened"
+        with pytest.raises(core.StoreMaintLockHeld):
+            core.acquire_store_maint_lock(db, "x")
+        warned = [r for r in caplog.records if r.name == "engramd_owner" and "planted unlink failure" in r.getMessage()]
+        assert len(warned) == 1 and warned[0].levelno == logging.WARNING, [r.getMessage() for r in caplog.records]
+    finally:
+        monkeypatch.setattr(Path, "unlink", real_unlink)
+        owner._cleanup()  # the real close path, now that the unlink works: frees the lock for the next test
+        owner._release_maint_lock()
+
+
+@requires_linux_owner
+def test_a_cleanup_failing_with_a_non_oserror_in_the_failed_start_handler_still_keeps_the_start_error_and_the_lock(
+    inproc_home, monkeypatch, caplog
+):
+    """#4073: the handler must catch every `Exception` from `_cleanup()`, not only OSError: a connection close
+    can raise other types. Here `_cleanup()` raises a RuntimeError; the bind error still leaves start(), the lock
+    stays held, and one warning names the cleanup failure."""
+    db = str(inproc_home / "knowledge.db")
+    owner = eo.EngramdOwner(inproc_home)
+    _fail_bind(monkeypatch, OSError(errno.EACCES, "planted bind failure"))
+
+    def failing_cleanup():
+        raise RuntimeError("planted cleanup failure")
+
+    monkeypatch.setattr(owner, "_cleanup", failing_cleanup)
+    seen = _capture_conns(monkeypatch)
+    try:
+        with caplog.at_level("WARNING", logger="engramd_owner"):
+            with pytest.raises(OSError) as ei:
+                owner.start(install_signal_handlers=False)
+        # OSError(EACCES, ...) is built as its PermissionError subclass; it must not be the RuntimeError.
+        assert type(ei.value) is PermissionError and "planted bind failure" in str(ei.value), (
+            f"the start error was replaced by: {ei.value!r}")
+        assert "planted cleanup failure" not in str(ei.value)
+        assert seen["owner"] is not None and seen["client"] is not None, "the failure came before the connections opened"
+        with pytest.raises(core.StoreMaintLockHeld):
+            core.acquire_store_maint_lock(db, "x")
+        warned = [r for r in caplog.records if r.name == "engramd_owner" and "planted cleanup failure" in r.getMessage()]
+        assert len(warned) == 1 and warned[0].levelno == logging.WARNING, [r.getMessage() for r in caplog.records]
+    finally:
+        monkeypatch.undo()  # puts the real _cleanup back
+        owner._cleanup()  # the real close path: frees the lock for the next test
         owner._release_maint_lock()
 
 
