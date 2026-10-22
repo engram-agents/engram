@@ -154,7 +154,7 @@ by this ruling.
 of "code evidence" and of its scope, the same status as the two merge-seat steps
 above.)*
 
-## Scope — this policy governs **engram-alpha only**
+## Scope — the substrate gate is **engram-alpha only**
 
 The substrate-feature gate below is **engram-alpha-specific**. Other repos in the org carry their own **delegated** merge authority, set by Lei per project:
 
@@ -185,7 +185,10 @@ mechanism, not luck:
 
 - **Default repo lanes**: Borges holds engram-alpha's queue, Kepler holds
   umwelt's. Crossing into the other's lane is fine and takes **one line saying
-  so first** — never a silent concurrent merge into the same tip.
+  so first** — never a silent concurrent merge into the same tip. *(Amended
+  2026-10-22 by *Owner merge* below: for project owners the lanes are suspended
+  and the one-line rule applies to every merge into a shared tip until the dev
+  merge queue is on.)*
 - **Whoever starts a multi-PR stack finishes it.** A stacked series lands
   bottom-up under one hand (live example at adoption: the health-score series
   #2187 → #2189 → PR3 → PR4 — PR3/PR4 not yet opened when this was written,
@@ -208,6 +211,154 @@ mechanism, not luck:
   review scope.
 
 So "flip to Lei for substrate" is an **engram-alpha** rule. Do not extend it to a delegated-authority repo; do not relax it inside engram-alpha beyond what the 2026-09-27 delegation above grants. When you're unsure which repo's rule applies, the repo you're merging *into* decides.
+
+## Owner merge (Lei, 2026-10-21 and 2026-10-22) — every project owner merges converged non-substrate PRs under the written gate
+
+**Provenance.** Lei, 2026-10-21 23:31Z, in session, verbatim: *"do you think it's still
+needed for EVERY PR to go through you if it's been fairy and peer converged?"* — his
+proposal that converged PRs be merged by seats other than the merge seat under a test
+gate, so that seat leads on design instead of spending itself on test runs. The same
+evening he ruled the dev merge queue goes ahead with Kepler drafting the owner-merge
+rule (Meeting 18, 2026-10-22 00:23Z, in the Square, carried its nine additions). On
+2026-10-22 09:59 AM NY he asked, verbatim, *"And all owners can merge now?"* — read by
+the drafting seat as setting the scope to every project owner, not only the Opus seats
+named in the first proposal. **The ruling** came at 10:03 AM NY the same day, in
+session, verbatim: *"You move ahead to allow owner merge when merge gates are met, and
+we practice to see if anything will slip through. Don't be afraid of mistakes and
+errors, as long as we can catch them and learn from them."* On the PR that adds this
+section he ruled it merges as the team's consensus text without his read (*"No need to
+bring it to me, just merge as your concensus version."*). So owner merge is **in force
+from 2026-10-22 14:03Z**, on his word, not from the merge of this PR; the dev merge
+queue switches on separately (see *Serialization* below). The stance he asked the team
+to carry is the one in the quote: practise, catch the slips, learn from them.
+
+**Who.** The **owner of the project the PR belongs to** (the Project Register in the
+Workshop, an in-world surface, not a file in this repo) merges it. Not the colleague
+who approved it, and not a seat that merely holds the baton. **Scope:** owner merge
+applies on every org repo whose merge authority is the team's (engram-alpha under this
+policy, umwelt, local-model-lab, gpu-broker and the rest under the 2026-08-22 grant);
+soma stays Ariadne's as principal approver and merger (*Scope* above). Three groups go
+to the **merge seats** instead (Kepler and Borges on all org repos, with Ariadne on
+umwelt and soma, per *Scope* and *Who presses the button* above):
+
+- a PR with **no project owner**, a **release cut** (a `dev`→`main` release PR or a
+  hotfix PR into `main`), and a **reconcile** PR;
+- a PR whose **author is its project owner**: the owner runs the gate below and posts
+  the record, and a merge seat presses the button on that record, so no seat merges its
+  own PR;
+- a seat whose **own user's authority table does not grant merge clicks** (as of
+  2026-10-22, Aleph and Clio, whose user has not granted it, so a merge click is a
+  destructive action outside this repo's delegation for them): that seat runs the
+  gate and posts the record; a merge seat presses.
+
+**Nothing below widens the ⛔ list or touches the security read.** An owner never
+merges a ⛔-list (substrate-concept) PR: it goes to Lei first, or, when it implements a
+design he already read, through the 2026-09-27 delegation's two steps (the PR links the
+read design; the merging seat writes the conformance check), and those two steps stay
+with the merge seats. A security PR carries Mira's exact-head approval as its gate and
+is merged by the merge seats under the two directions in *Who presses the button*; an
+owner does not click it. The owner merges exactly what the merge seats could already
+merge on a fix or non-substrate PR, by exactly the same gate.
+
+**The gate the owner runs, in full, before pressing the button.** The merge seat's
+gate did not get easier because more seats hold it; it got written down so that any
+seat can run it and any other seat can check that it ran.
+
+1. **A reviewer-fairy round is on the PR's own record, and it preceded the peer
+   pass** (the order is a rule, not a diagram — CLAUDE.md § PR review convention).
+2. **A non-author peer APPROVE whose commit is the PR's current `headRefOid`, and
+   whose `submitted_at` is not earlier than the head commit's committer date.**
+   Compare the oid and the two timestamps; never trust `reviewDecision` alone. The
+   second check exists because an `update-branch` can re-point an older approval at a
+   newer head (see *Merge-seat test rules*, last subsection). Any later commit needs a
+   fresh approval.
+3. **`pr-checks` green on the EXACT head** (Luria, Aleph): mandatory, because a
+   scratch merge on a Mac cannot see what the Linux runner's SQLite does. Read
+   `mergeStateStatus` first; `CLEAN` ends it; anything else goes through the
+   deduped rollup and the cancelled-same-SHA rule in *Merge-seat test rules* below.
+4. **The seat's own run, on a scratch merge of the base tip plus the head** (rules 1
+   and 2 of *Merge-seat test rules*), with the repo's **guard set** — and the guard set
+   now **names the whole-tree scanners that no changed file names** (Luria):
+   `tools/scan-leaks.py`, `tools/test_id_set_check.py`, and the whole-tree
+   guards (`tests/test_syspath_shadow_guard.py`, `tests/test_tiers_manifest.py`,
+   `tests/test_run_touched_tests.py`, `tests/test_ci_wiring_guard.py`,
+   `tests/test_engramd_read_scan.py`'s real-tree cells). Verify the list with
+   `git ls-files` before pasting it; a guard that moved is not a guard that ran.
+   **Record the base SHA the scratch merge used** (`git rev-parse origin/<base>` at
+   the time of the run, after a fetch); item 8 asserts against it and item 10 names
+   it (Borges, 2026-10-22).
+5. **The PR's changed or added tests appear EXECUTED BY NAME in the saved output**
+   (Borges; #4041's S9, which skipped on the seat's SQLite and passed only on CI's).
+   For a `dev` PR that output is the scratch run's, since the full suite does not run
+   on dev PRs; for a `merge_group` or `main` run it is the CI log. A selective green
+   proves nothing about tests it never ran. Save the full runner output to a file and
+   read the names from it.
+6. **One mutation, and it names the dimension it varies** (Sol, Zephyr): a mutant that
+   reddens a neighbour by crashing is not a control. Locate the target from the test's
+   own asserted text, print the mutated line, assert a non-empty diff, predict the red
+   set, and judge against the prediction (none red = bad aim; too many = a neighbour
+   broke). Run the mutation and publish its result in **separate commands**.
+   - **No-CI repos** (local-model-lab, gpu-broker): the scratch run plus the mutation
+     **is** the gate, and the merge record says so (Clio, Sol, Borges).
+   - **CI-only or docs PRs:** there is no mutation target; the substitute is a
+     red-first run of the guard the change touches, or the stated line
+     "no mutation applicable" (Ariadne).
+7. **The baton's peer→merge advance stays the readiness signal** (Zephyr): the
+   **author** runs `baton advance` once the colleague has approved, the server gates it
+   on GitHub's own approval, and the owner merges only from `phase: merge`. The phase
+   keeps its meaning because the gate reads GitHub, not the caller.
+8. **The merge command pins the head, and the seat pins the base:**
+   `--match-head-commit <full 40-char headRefOid>` read from
+   `gh pr view --json headRefOid` in the same step, and **in that same step** a
+   re-fetch and an assertion that `origin/<base>` still equals the base SHA item 4
+   recorded. If the base moved, re-run item 4's scratch merge on the new tip before
+   pressing: `--match-head-commit` pins only the head, never the base, so without
+   this check two owners can each pass a scratch run on the same base and the second
+   presses on a tree it never tested (the 2026-09-13 jointly-broken case, Borges).
+   Every PR into `main`
+   (release cut, hotfix, reconcile) and a `main`→`dev` reconcile merge as a **merge
+   commit** (`docs/RELEASING.md`); every other PR into `dev` squashes; a member of a
+   linked stack merges with `gh stack merge` (plain `gh pr merge` is refused there).
+9. **On umwelt, merge does not promote** (Ariadne): prod promotion stays a separate,
+   tested-first step by the deploy seat.
+10. **The merge record, posted on the PR as the merge comment, names:** the merge
+    SHA, this gate's items 1–3 with times and oids, **the base SHA the scratch run
+    used and that it still held at the press** (items 4 and 8), **which suite ran and
+    on which platform** (Aleph), the counts read from the saved output, the mutation and its
+    red set, any fairy-cap note, and the read-back of every closed issue (the
+    post-merge completeness read of CLAUDE.md § PR — issue closure). The commander
+    samples merge records at day-end; a record missing an item is the finding,
+    whatever the merge's outcome.
+
+**Serialization — the property two holders kept by hand, now kept by the queue.**
+On engram-alpha the **dev merge queue** (`merge_group` runs of `pr-checks`) replaces
+the "one holder per repo lane" rule: every merge waits its turn and re-runs the
+checks on the queued tree, which closes the jointly-broken case (two owners each
+passing a scratch merge that omits the other's PR; Borges, 2026-09-13). **In the
+interim, and on repos without a queue, the default-lane rule of *Who presses the
+button* is suspended for owners** and replaced by two things. The correctness
+mechanism is the **base-SHA assertion of items 4 and 8**: a press on a base the
+seat's own run never saw is refused by the seat's own check, and the re-run on the
+moved tip is what the queue will later do for everyone. The courtesy is **one line in
+the Square before merging into a tip another owner may be merging into**, so a
+moved-tip re-run is expected rather than a surprise. *Whoever starts a multi-PR stack
+finishes it* (unchanged). The assertion also covers repos that will never get a
+queue (local-model-lab, gpu-broker). The queue switches on after
+the v0.5.4-rc1 cut (done 2026-10-22 13:08Z) and after the `merge_group` workflow PR
+lands; the switch itself is a repo setting Lei or the repo admin flips. **The
+commander records the switch date on the next line when it happens.**
+*Queue status: OFF as of 2026-10-22.*
+
+**What the merge seats still do.** Kepler and Borges (Ariadne on umwelt) keep the
+seat for ownerless PRs, release cuts, reconciles, the three groups under *Who* above,
+⛔-list and security PRs, and any merge an owner declines ("I'd rather a second pair
+of eyes" is always allowed and never a demerit); the commander keeps the day-end
+sample of merge records. The seat is no longer the serial point; the written gate is.
+
+*Origin: Lei's 2026-10-21 23:31Z proposal and 23:53Z–00:02Z rulings, Meeting 18's
+nine additions (2026-10-22 00:23Z, Square), Lei's 2026-10-22 09:59 AM NY question
+and 10:03 AM NY ruling, both in session with Kepler. Drafted by Kepler 2026-10-22;
+reviewer-fairy round 1 folded the same day.*
 
 ## ⛔ Lei reads before merge — SUBSTRATE FEATURES
 
