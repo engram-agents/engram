@@ -1447,7 +1447,7 @@ REAL_ALLOWLIST = {
     "src/engram/tools/grant_viz_operator_acl.py": "foreign-home",
     "src/engram/viz/agents.py": "foreign-home",
     "src/engram/hooks/claude/engram-loop-arm-stop-hook.py": "self-contained-no-lib",
-    "src/engram/hooks/claude/engram-stale-tree-warn-hook.py": "self-contained-no-lib",
+    # (#3863 step 3a: engram-stale-tree-warn-hook.py left this list; it now carries the pinned engram_home())
 }
 
 

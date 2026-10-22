@@ -34,8 +34,8 @@ from engram_home_resolver import engram_home_or_none
 # Default logs directory — can be overridden by environment variable or
 # by passing logs_dir explicitly to run_once() / full_rebuild().
 def _default_logs_dir() -> Optional[Path]:
-    """None when ENGRAM_HOME is refused (relative): #3863 step 2 (Borges's step-2 rulings on #3863,
-    2026-10-21). The daemon process imports this module, so it never raises; run_once/full_rebuild then do
+    """None when ENGRAM_HOME is refused (relative): #3863 step 2 (the rulings: engram_home_resolver's
+    docstring). The daemon process imports this module, so it never raises; run_once/full_rebuild then do
     nothing."""
     engram_home = engram_home_or_none()
     return None if engram_home is None else engram_home / "logs"

@@ -721,7 +721,7 @@ def _default_data_dir() -> Path:
     the #2652 one-owner boundary telemetry is a stated exception to, same as
     its sibling store module)."""
     # #3863 step 2: reached from the MCP server (engram_stats), so it is an entry point: a RELATIVE ENGRAM_HOME
-    # raises ValueError (Borges's step-2 rulings on #3863, 2026-10-21).
+    # raises ValueError (the rulings: engram_home_resolver's docstring).
     return engram_home_resolver.engram_home()
 
 

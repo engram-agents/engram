@@ -974,23 +974,21 @@ class _FinalizeOutcome:
 
 
 def _resolve_engram_home(engram_home: str | Path | None) -> Path:
-    """Always returns an ABSOLUTE path (#3152 item 2, mirroring
-    engram-surface-daemon.py's own gh#2695 hardening -- see that module's
-    `_resolve_engram_home()` docstring). A relative ENGRAM_HOME from two
-    different launch CWDs would otherwise bind two different sockets --
-    "one owner per seat" (contract item 1) fails silently, since the
-    liveness/staleness check in start() compares socket PATHS, not
-    resolved identities.
+    """Returns an ABSOLUTE path (#3152 item 2, mirroring engram-surface-daemon.py's own gh#2695 hardening --
+    see that module's `_resolve_engram_home()` docstring), by two different rules (#3863 step 2):
 
-    `os.path.abspath()`, not `Path.resolve()`, deliberately -- same
-    reasoning as the surface daemon: it makes the path absolute relative
-    to cwd WITHOUT resolving symlinks. An intermediate symlinked
-    ENGRAM_HOME component keeps resolving the way it always has; using
-    `.resolve()` would be a second, unrelated behavior change (following
-    symlinks) bundled into this fix."""
+      * the ENVIRONMENT branch (`engram_home` is None) REFUSES a RELATIVE ENGRAM_HOME: it raises ValueError
+        naming the value, via engram_home_resolver.engram_home(). A relative value from two different launch
+        CWDs would bind two different sockets -- "one owner per seat" (contract item 1) fails silently, since
+        the liveness/staleness check in start() compares socket PATHS, not resolved identities -- and
+        anchoring it at the cwd (abspath) still gives two sockets, so refusal is the only fix;
+      * the EXPLICIT-ARGUMENT branch is a programmatic caller's own path and is unchanged: it is made
+        absolute against the cwd with `os.path.abspath()`, not `Path.resolve()`, deliberately (it does NOT
+        resolve symlinks, so an intermediate symlinked ENGRAM_HOME component keeps resolving the way it always
+        has; `.resolve()` would be a second, unrelated behavior change)."""
     if engram_home is not None:
         return Path(os.path.abspath(str(engram_home)))
-    # #3863 step 2 (Borges's step-2 rulings on #3863, 2026-10-21): the env branch REFUSES a relative value (a
+    # #3863 step 2 (the rulings: engram_home_resolver's docstring): the env branch REFUSES a relative value (a
     # ValueError naming it) instead of anchoring it at the cwd: "one owner per seat" is met only by refusal,
     # since abspath still gives two sockets for two launch cwds.
     return engram_home_resolver.engram_home()

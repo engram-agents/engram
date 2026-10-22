@@ -99,7 +99,7 @@ class Emitter:
         initial_turn: Optional[int],
         logs_dir: Optional[Path],
     ) -> None:
-        # #3863 step 2 (Borges's step-2 rulings on #3863, 2026-10-21): this module is imported by hooks, so it
+        # #3863 step 2 (the rulings: engram_home_resolver's docstring): this module is imported by hooks, so it
         # NEVER raises on a relative ENGRAM_HOME. `logs_dir=None` is the DISABLED emitter (init() builds it when
         # the home is refused): no directory, no file, every emit() returns None.
         self._disabled = logs_dir is None

@@ -44,21 +44,31 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
-# A RELATIVE ENGRAM_HOME is refused (alpha #3863 6b): it would resolve against this process's cwd, a
+# A RELATIVE ENGRAM_HOME is refused (alpha #3863 6b, step 3a): it would resolve against this process's cwd, a
 # different home than the daemon's or the server's. Fail open: one stderr line, nothing written, exit 0.
-# (Inline, not from _hooklib: this hook must still run when the sibling lib cannot import.)
-_ENGRAM_HOME_RAW = os.environ.get("ENGRAM_HOME") or ""
-if _ENGRAM_HOME_RAW and not os.path.isabs(os.path.expanduser(_ENGRAM_HOME_RAW)):
-    sys.stderr.write("engram hook: ENGRAM_HOME must be an absolute path, got %r; doing nothing\n" % (_ENGRAM_HOME_RAW,))
-    sys.exit(0)
-if _ENGRAM_HOME_RAW:
-    os.environ["ENGRAM_HOME"] = os.path.abspath(os.path.expanduser(_ENGRAM_HOME_RAW))  # `~/x` -> absolute for every raw reader
+# (Inline, not from _hooklib: this hook must still run when the sibling lib cannot import. engram_home() is a
+# VERBATIM copy of tools/_owner_read.engram_home(), pinned by tests/test_engram_home_parity_3863.py.)
+def engram_home() -> Path:
+    """The ENGRAM home: $ENGRAM_HOME (default ~/.engram) when set and non-empty, expanded and absolute;
+    a RELATIVE value is refused (ValueError naming it). Verbatim pinned copy (see the comment above)."""
+    raw = os.environ.get("ENGRAM_HOME") or "~/.engram"
+    home = os.path.expanduser(raw)
+    if not os.path.isabs(home):
+        raise ValueError("ENGRAM_HOME must be an absolute path, got %r" % (raw,))
+    return Path(os.path.abspath(home))
 
-ENGRAM_HOME = (
-    os.environ.get("ENGRAM_HOME")
-    or os.path.expanduser("~/.engram")
-)
+
+try:
+    _ENGRAM_HOME_PATH = engram_home()
+except ValueError as _exc:
+    sys.stderr.write("engram hook: %s; doing nothing\n" % (_exc,))
+    sys.exit(0)
+if os.environ.get("ENGRAM_HOME"):
+    os.environ["ENGRAM_HOME"] = str(_ENGRAM_HOME_PATH)  # `~/x` -> absolute for every raw reader
+
+ENGRAM_HOME = str(_ENGRAM_HOME_PATH)
 
 # Cheap + local only — no network. This is a `rev-list --count` against
 # already-fetched refs, not a fetch; the cap is a hang guard, not a

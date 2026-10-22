@@ -50,7 +50,14 @@ def _now_iso() -> str:
 
 ALPHA_DIR = Path(os.environ["ALPHA_DIR"])
 TEMPLATES_DIR = Path(os.environ["ALPHA_TEMPLATES_DIR"])
-ENGRAM_HOME = Path(os.environ["ENGRAM_HOME"])
+# ENGRAM_HOME is REQUIRED here (unset stays a KeyError, as before). #3863 step 3a: this is an entry point, so a
+# RELATIVE value raises ValueError naming it (the resolver sits beside this file in both layouts), never cwd-anchored.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import engram_home_resolver  # noqa: E402
+
+if "ENGRAM_HOME" not in os.environ:
+    raise KeyError("ENGRAM_HOME")
+ENGRAM_HOME = engram_home_resolver.engram_home()
 TARGET = os.environ.get("TARGET", "claude").lower()
 
 if TARGET not in ("claude", "codex"):

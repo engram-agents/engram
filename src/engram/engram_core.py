@@ -480,7 +480,7 @@ _embedder = EmbeddingManager()
 DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 
-# #3863 step 2 (Borges's step-2 rulings on #3863, 2026-10-21): engram_core is a process entry point, so a
+# #3863 step 2 (the rulings: engram_home_resolver's docstring): engram_core is a process entry point, so a
 # RELATIVE ENGRAM_HOME fails this import with a ValueError naming the value (the MCP server and every CLI that
 # imports it fail loudly). _configure_paths(data_dir) below is unchanged for explicit redirect callers.
 DATA_DIR = _home_resolver.engram_home()

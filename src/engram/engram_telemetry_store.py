@@ -290,7 +290,7 @@ def write_telemetry_record(
     between them, and mechanism 2 correctly reports a larger total if
     further drops occur between two successful writes.
     """
-    # #3863 step 2 (Borges's step-2 rulings on #3863, 2026-10-21): this module is imported by hooks, so a
+    # #3863 step 2 (the rulings: engram_home_resolver's docstring): this module is imported by hooks, so a
     # refused (relative) ENGRAM_HOME DISABLES its writes: no file, no atexit hook, no drop count, never a
     # raise. The resolver prints the one stderr line.
     if _telemetry_dir() is None:

@@ -17,10 +17,6 @@
     "src/engram/hooks/claude/engram-loop-arm-stop-hook.py": {
       "class": "self-contained-no-lib",
       "reason": "A stop hook that by contract keeps running with no sibling lib; it cannot import a resolver."
-    },
-    "src/engram/hooks/claude/engram-stale-tree-warn-hook.py": {
-      "class": "self-contained-no-lib",
-      "reason": "States its home before any sys.path bootstrap and guards its _hooklib import, so it cannot rely on a resolver being importable."
     }
   }
 }

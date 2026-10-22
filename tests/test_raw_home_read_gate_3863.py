@@ -281,7 +281,11 @@ def test_d_the_pinned_resolvers_are_the_four_layers_plus_the_build_engine_plus_t
     four = {layer["path"] for layer in home.RESOLVER_LAYERS}
     assert len(four) == 4
     # #3863 step 2 added the runtime layer (Borges's step-2 rulings on #3863, 2026-10-21)
-    assert set(gate.PINNED_RESOLVERS) == four | {"src/build/engine/flows.py", "src/engram/engram_home_resolver.py"}
+    # #3863 step 3a added the four standalone hooks that carry an inline verbatim copy
+    hooks = {"src/engram/hooks/claude/" + h for h in (
+        "engram-lesson-tripwire-hook.py", "engram-loop-arm-stop-hook.py",
+        "engram-stale-tree-warn-hook.py", "engram-time-bar-hook.py")}
+    assert set(gate.PINNED_RESOLVERS) == four | {"src/build/engine/flows.py", "src/engram/engram_home_resolver.py"} | hooks
 
 
 @pytest.mark.parametrize("rel", [
@@ -368,12 +372,16 @@ def test_f_a_read_that_abspaths_or_resolves_the_value_is_still_red(tmp_path, gat
     assert len(problems) == 1 and f"{A}:2" in problems[0], (line, problems)
 
 
-def test_f_the_real_baseline_carries_the_hooks_that_abspath_the_raw_value(gate):
-    base = json.loads((REPO / gate.BASELINE_REL).read_text())["baseline"]
+# Removed-test: tests/test_raw_home_read_gate_3863.py::test_f_the_real_baseline_carries_the_hooks_that_abspath_the_raw_value — inverted by #3863 step 3a: the four hooks left the baseline (they carry the pinned copy now); the replacement below asserts the new state.
+def test_f_the_hooks_that_abspathed_the_raw_value_are_now_pinned_not_baselined(gate):
+    """#3863 step 3a moved the four inline-guard hooks from the baseline to the pinned allowlist (each now
+    carries the verbatim engram_home() copy, AST-pinned by the parity test)."""
+    doc = json.loads((REPO / gate.BASELINE_REL).read_text())
     hooks = "src/engram/hooks/claude/"
     for name in ("engram-lesson-tripwire-hook.py", "engram-loop-arm-stop-hook.py",
                  "engram-stale-tree-warn-hook.py", "engram-time-bar-hook.py"):
-        assert hooks + name in base, name
+        assert hooks + name not in doc["baseline"], name
+        assert hooks + name in doc["allowlist"], name
 
 
 # -- the real tree and the baseline ---------------------------------------------------------------

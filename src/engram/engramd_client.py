@@ -336,8 +336,8 @@ def _resolve_socket_path(socket_path: Path | None) -> Path:
     src/engram/hooks/claude/engram-lesson-tripwire-hook.py:77)."""
     if socket_path is not None:
         return socket_path
-    # #3863 step 2: a process entry point, so a RELATIVE ENGRAM_HOME raises ValueError (Borges's step-2 rulings
-    # on #3863, 2026-10-21).
+    # #3863 step 2: a process entry point, so a RELATIVE ENGRAM_HOME raises ValueError (the rulings:
+    # engram_home_resolver's docstring).
     return socket_path_for_home(engram_home_resolver.engram_home())
 
 
@@ -996,6 +996,9 @@ def read(
     without a request_id' true (the other half is write()'s own guarantee
     below).
 
+    Raises ValueError (naming the value) when socket_path=None and ENGRAM_HOME is RELATIVE: the
+    default socket path is resolved from the environment (#3863 step 2), and nothing else here raises.
+
     `snapshot()` (there is no separate wrapper: it is `read("snapshot",
     {"dest_path": ...})`): an `Unavailable` result -- a dropped connection --
     must be read as INDETERMINATE, never as "nothing happened" and never as
@@ -1041,7 +1044,10 @@ def write(
     attempt) or freshly generated (uuid4, as a string) otherwise. The
     request_id used is echoed back on EVERY returned result type (Ok,
     Unavailable, AND Rejected) so a caller that got Unavailable can retry
-    by passing that same id back in."""
+    by passing that same id back in.
+
+    Raises ValueError (naming the value) when socket_path=None and ENGRAM_HOME is RELATIVE (#3863 step 2),
+    before any request_id is minted or any byte is sent."""
     rid = request_id or str(uuid.uuid4())
     return _call(
         method,

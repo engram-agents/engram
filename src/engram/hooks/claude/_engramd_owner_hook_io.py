@@ -212,7 +212,9 @@ def serving(home: str) -> str:
             result = ec.read(
                 "ping", {}, timeout=min(remaining, PROBE_CALL_BOUND_SECONDS), socket_path=sock
             )
-        except Exception as exc:  # `read` is raise-free by construction; this is the belt
+        # `read` is raise-free by construction EXCEPT a ValueError for a relative ENGRAM_HOME when
+        # socket_path=None (#3863 step 2); `sock` is passed here, so that path is not reachable. This is the belt.
+        except Exception as exc:
             return f"ambiguous:engramd_client raised ({type(exc).__name__})"
         if isinstance(result, ec.Ok):
             return "serving"

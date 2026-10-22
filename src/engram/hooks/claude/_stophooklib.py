@@ -118,7 +118,7 @@ from typing import Optional
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import atomic_write_json, open_regular_text
+from _hooklib import atomic_write_json, engram_home, open_regular_text
 
 
 def resolve_transcript_path(
@@ -138,7 +138,7 @@ def resolve_transcript_path(
       3. Else `None`.
 
     `sessions_dir` defaults to `$ENGRAM_HOME/sessions` (`$ENGRAM_HOME` or
-    `~/.engram` when $ENGRAM_HOME is unset) -- the same formula every consumer of this module already
+    `~/.engram` when $ENGRAM_HOME is unset; a RELATIVE $ENGRAM_HOME is refused and yields `None`) -- the same formula every consumer of this module already
     computes for its own module-level `SESSIONS_DIR` constant. Callers that
     already have their own `SESSIONS_DIR` constant should pass it explicitly
     rather than rely on this default, to avoid any risk of the two diverging.
@@ -152,8 +152,13 @@ def resolve_transcript_path(
         return transcript_path
     if session_id:
         if sessions_dir is None:
-            engram_home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
-            sessions_dir = os.path.join(engram_home, "sessions")
+            try:
+                home = engram_home()
+            except ValueError:
+                # #3863 step 3a: a RELATIVE ENGRAM_HOME is refused; this is a library a hook imports, so it
+                # DEGRADES to the documented "unresolvable" result instead of raising into the hook.
+                return None
+            sessions_dir = os.path.join(str(home), "sessions")
         marker_path = os.path.join(sessions_dir, f"{session_id}.json")
         try:
             with open_regular_text(marker_path, encoding="utf-8") as f:

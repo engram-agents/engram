@@ -5,14 +5,6 @@
     "tools/"
   ],
   "baseline": {
-    "src/engram/bootstrap.py": 1,
-    "src/engram/engram_client.py": 1,
-    "src/engram/hooks/claude/_stale_tree_hooklib.py": 1,
-    "src/engram/hooks/claude/_stophooklib.py": 1,
-    "src/engram/hooks/claude/engram-lesson-tripwire-hook.py": 2,
-    "src/engram/hooks/claude/engram-loop-arm-stop-hook.py": 2,
-    "src/engram/hooks/claude/engram-stale-tree-warn-hook.py": 2,
-    "src/engram/hooks/claude/engram-time-bar-hook.py": 2,
     "src/engram/tools/ack_recompute_sweep.py": 1,
     "src/engram/tools/baton-migrate-to-coord-store.py": 1,
     "src/engram/tools/baton_gate.py": 1,
@@ -62,6 +54,22 @@
       "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
     },
     "src/engram/engram_home_resolver.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/hooks/claude/engram-lesson-tripwire-hook.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/hooks/claude/engram-loop-arm-stop-hook.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/hooks/claude/engram-stale-tree-warn-hook.py": {
+      "class": "resolver",
+      "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
+    },
+    "src/engram/hooks/claude/engram-time-bar-hook.py": {
       "class": "resolver",
       "reason": "one of the pinned resolver files: carries the ONE engram_home() body, AST-pinned by tests/test_engram_home_parity_3863.py"
     }

@@ -1,6 +1,7 @@
 """The ONE ENGRAM_HOME resolution for the runtime layer [part of #3863 step 2].
 
-Ruling: Borges's step-2 rulings on #3863, 2026-10-21.
+Ruling: Borges's step-2 rulings on #3863, 2026-10-21. This is the ONE place they are cited; every module
+that applies them points here ("the rulings: engram_home_resolver's docstring") instead of repeating them.
 
 `engram_home()` is the canonical body, AST-identical to `tools/_owner_read.engram_home()` and pinned by
 tests/test_engram_home_parity_3863.py as the "runtime" layer. A RELATIVE ENGRAM_HOME resolves against the
@@ -11,7 +12,12 @@ The failure rule depends on the layer (the ruling):
   * a PROCESS ENTRY POINT (engram_core at import, engramd_client, engramd_owner, the server marker,
     engram_telemetry_verdicts) calls `engram_home()` and lets the ValueError propagate;
   * a module a HOOK IMPORTS (the log emitter, the telemetry store, the log indexer) must never raise into the
-    hook: it calls `engram_home_or_none()`, and on None disables its own writes.
+    hook: it calls `engram_home_or_none()`, and on None disables its own writes;
+  * a HOOK itself refuses then exits 0 (one stderr line naming the value, nothing written). The four hooks
+    that must run when `_hooklib` cannot import carry a VERBATIM pinned copy of `engram_home()` inline
+    (step 3a, pinned by the parity test); the hook-side libraries (`_stophooklib`, `_stale_tree_hooklib`)
+    degrade through `_hooklib.engram_home()`, which they already import (this flat module is not on a hook's
+    sys.path until the runtime dir is resolved).
 
 Flat module: siblings import it as `import engram_home_resolver` (the runtime dir is on sys.path in both the
 source layout and the deployed plugin layout), so it imports nothing from the package.
