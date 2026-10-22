@@ -284,7 +284,7 @@ Read from the owner's code and the hook's header, not run: the owner removes its
 
 Verify: for a unit (b1), `MainPID` changed and `engramd.pid` matches it; for a hook-launched owner (b2), the pid now in `engramd.pid` differs from `$OLD`; in both cases `engramd-owner.log` has a new `listening on ... (pid N)` line.
 
-> **The setup script ignores flags it does not know.** `tools/setup-surface-daemon-service.sh` recognizes only `--owner` and `--allow-path`; any other argument, including `--help`, is silently skipped and the **default action runs** (re-renders the surface-daemon unit and enables and starts it). Measured 2026-10-19: calling it with `--help` to read the usage did exactly that. Read the usage from the header comment instead (`sed -n 1,60p`).
+> **The setup script rejects flags it does not know, and has a help mode (alpha #3939).** `tools/setup-surface-daemon-service.sh` recognizes `--owner`, `--allow-path` and `-h`/`--help`; `--help` prints the usage and exits 0 having changed nothing, and any other argument exits 2 naming it before anything is written. (A script from before #3939 silently skipped unknown flags and ran its **default action** — re-rendered the surface-daemon unit and enabled and started it; measured 2026-10-19 with `--help`. On a seat still running such a script, read the usage from the header comment instead: `sed -n 1,60p`.)
 
 ### (c) Gate: no long-lived process may predate the deploy (#3938)
 
@@ -532,7 +532,7 @@ Do **not** cite `file://<ENGRAM home>/.deployed-version` directly unless it is c
 - **Building without checking the feature-set flags.** A wrong-flag build *succeeds* and silently drops surfaces (#704/#707 class). The Step 3 checkpoint exists for this.
 - **Re-bootstrapping (`FORCE=1`) to "refresh" anything.** `FORCE=1` (and `FORCE_RESEED_EMPTY=1`) now **refuse on a non-empty DB** — they are not bypass paths for live graphs. Never the upgrade path; a true fresh start requires manually deleting `knowledge.db` first.
 - **Killing the MCP subprocess to "restart" it.** User-restart only.
-- **Stopping at Step 5 and calling the upgrade done.** The reload trio leaves the surface daemon (and an owner, if the seat has one) running the old code; Step 5.5 is what restarts them. And do not probe `tools/setup-surface-daemon-service.sh` with `--help`: it has no help mode and runs its default action.
+- **Stopping at Step 5 and calling the upgrade done.** The reload trio leaves the surface daemon (and an owner, if the seat has one) running the old code; Step 5.5 is what restarts them. `tools/setup-surface-daemon-service.sh --help` is safe on a script with #3939 (usage, exit 0, nothing written) but runs the default action on an older one: check the header comment for `--help` before probing.
 - **Reaching for the retired scatter path** (`tools/deploy.sh` rsync into the ENGRAM home folder) on a plugin install — it does not serve the plugin layout and will not update the running plugin.
 
 ---

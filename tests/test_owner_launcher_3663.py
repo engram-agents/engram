@@ -110,6 +110,11 @@ def _seconds(value: str) -> float:
 # Installer sandbox
 # ---------------------------------------------------------------------------
 
+# #3939: the installer now polls `launchctl print` after bootout and retries a failed bootstrap; keep
+# every cell that reaches launchctl fast (the defaults wait up to 10 s / sleep 1 s between attempts).
+_TINY_LAUNCHD_ENV = {"ENGRAM_SETUP_LAUNCHD_POLL_S": "0.01", "ENGRAM_SETUP_LAUNCHD_RETRY_S": "0.01",
+                     "ENGRAM_SETUP_LAUNCHD_WAIT_S": "1"}
+
 class Sandbox:
     """A tmp plugin layout (tools/, templates/, engramd_owner.py, hooks/claude/...) holding a COPY
     of the installer, a tmp HOME, and recording stubs for uname / systemctl / launchctl."""
@@ -138,14 +143,17 @@ class Sandbox:
         _stub(self.stubs, "systemctl",
               f'#!/usr/bin/env bash\necho "$@" >> "{self.syslog}"\n'
               'if [ "$2" = "is-active" ]; then echo active; fi\nexit 0\n')
+        # #3939: `print` answers 113 (service not found = gone) so the installer's post-bootout wait ends at once
         _stub(self.stubs, "launchctl",
-              f'#!/usr/bin/env bash\necho "$@" >> "{self.launchlog}"\nexit 0\n')
+              f'#!/usr/bin/env bash\necho "$@" >> "{self.launchlog}"\n'
+              'if [ "$1" = print ]; then exit 113; fi\nexit 0\n')
 
     def run(self, *args: str, engram_home: str | None = None, allow_path: bool = True):
         env = {k: v for k, v in os.environ.items()
                if k not in ("ENGRAM_HOME", "ENGRAM_HOOKS_DIR", "ENGRAM_SETUP_ALLOW_PATH")}
         env["HOME"] = str(self.home)
         env["PATH"] = f"{self.stubs}:{os.environ['PATH']}"
+        env.update(_TINY_LAUNCHD_ENV)
         if engram_home is not None:
             env["ENGRAM_HOME"] = engram_home
         argv = ["bash", str(self.installer), *args]
