@@ -83,6 +83,48 @@ def test_window_drops_an_added_module_whose_file_is_under_src_engram():
     assert "planted_core_4029" not in sys.modules
 
 
+def test_window_makes_the_entry_list_object_sys_path_again_after_a_rebind_inside_it():
+    """Contract (a), list identity: the list that was `sys.path` at entry is
+    `sys.path` again on exit, not merely a list with equal contents. No monkeypatch
+    here, and the assertions run right after the `with`, so neither pytest's nor a
+    fixture's sys.path handling can stand in for the window.
+    Mutation: drop the final `sys.path = path_obj` rebind -> this cell is red."""
+    entry = sys.path
+    snapshot = list(entry)
+    try:
+        with hook_load_window():
+            sys.path = list(sys.path) + ["/nonexistent-4069-w1"]
+            assert sys.path is not entry, "control: the window body rebound sys.path"
+        rebound_back = sys.path is entry
+        contents_equal = list(entry) == snapshot
+    finally:
+        sys.path = entry
+        entry[:] = snapshot
+    assert rebound_back, "sys.path is not the entry list object after the window"
+    assert contents_equal
+
+
+def test_window_pops_a_src_engram_file_but_not_a_sibling_dir_that_merely_starts_with_engram():
+    """The `src/engram` prefix needs the separator: `src/engramX/` is not ours.
+    Control in the same cell: a file directly under `src/engram/` IS popped.
+    Mutation: drop `+ os.sep` in `_under_src_engram` -> the sibling is popped, red."""
+    sibling = types.ModuleType("planted_w2_sibling_4069")
+    sibling.__file__ = str(REPO_ROOT / "src" / "engramX" / "mod.py")
+    ours = types.ModuleType("planted_w2_ours_4069")
+    ours.__file__ = str(SRC_ENGRAM / "mod_w2.py")
+    try:
+        with hook_load_window():
+            sys.modules["planted_w2_sibling_4069"] = sibling
+            sys.modules["planted_w2_ours_4069"] = ours
+        sibling_kept = sys.modules.get("planted_w2_sibling_4069") is sibling
+        ours_present = "planted_w2_ours_4069" in sys.modules
+    finally:
+        sys.modules.pop("planted_w2_sibling_4069", None)
+        sys.modules.pop("planted_w2_ours_4069", None)
+    assert not ours_present, "control: a module under src/engram is popped"
+    assert sibling_kept, "a module under src/engramX was popped"
+
+
 def test_window_puts_back_the_exact_object_of_a_replaced_entry():
     original = types.ModuleType("tools.replaced_4029")
     sys.modules["tools.replaced_4029"] = original
