@@ -34,6 +34,9 @@ HOOKS_DIR = Path(__file__).parent.parent / "src" / "engram" / "hooks" / "claude"
 HOOK_PATH = HOOKS_DIR / "engram-stop-hook.py"
 PYTHON = sys.executable
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_hook_module():
     """Load engram-stop-hook.py as a fresh in-process module instance.

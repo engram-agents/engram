@@ -49,6 +49,9 @@ from test_idf_batch_3665 import _SMALL_CORPUS, _make_db  # noqa: E402
 
 COUNT_SQL = "SELECT count(*) FROM nodes WHERE is_current = 1"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 # --- helpers -----------------------------------------------------------------
 

@@ -47,6 +47,10 @@ HOOKS_DIR = Path(__file__).parent.parent / "src" / "engram" / "hooks" / "claude"
 HOOK_PATH = HOOKS_DIR / "engram-loop-arm-stop-hook.py"
 PYTHON = sys.executable
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _make_stop_payload(
     transcript_path: str,

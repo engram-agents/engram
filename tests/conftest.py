@@ -144,16 +144,21 @@ def _sys_path_collision_guard():
     yield
 
 
-# #4023 -- modules that left `sys.path[0]` inside src/engram. NON-FAILING in this
-# PR (29 other modules do it today; they are tracked separately): the leaks are
-# collected here and printed as ONE line at session end by
-# `pytest_terminal_summary`. WHAT THE LIST COVERS: only leaks made AFTER a
-# module's setup (the module-scope fixture below compares against `sys.path` at
-# that point). It does NOT attribute (a) a module that leaks at IMPORT time
-# (during collection, before any module fixture runs: the entry is already in
-# front when the fixture snapshots, so nothing differs), nor (b) a module that
-# re-inserts an entry another module already left in front. The list is a lower
-# bound on polluters, not an inventory (import-time detection: #4029).
+# #4023 / #4029 -- modules that left `sys.path[0]` inside src/engram. HARD since
+# #4029: the module-scope fixture below raises at that module's teardown, naming
+# it, after restoring `sys.path` exactly. The name is also collected here and
+# printed as ONE line at session end by `pytest_terminal_summary` (only when N > 0,
+# so a clean run prints nothing). The way to be clean is the shared window in
+# tests/_hook_load_window.py (fixtures `isolate_hook_loads` /
+# `isolate_hook_loads_module` below) around an in-process hook or tools load.
+# WHAT THE CHECK COVERS: only leaks made AFTER a module's setup (the module-scope
+# fixture compares against `sys.path` at that point). It does NOT attribute (a) a
+# module that leaks at IMPORT time (during collection, before any module fixture
+# runs: the entry is already in front when the fixture snapshots, so nothing
+# differs), nor (b) a module that re-inserts an entry another module already left
+# in front -- which is also why a many-module run names far fewer modules than
+# running each alone. The result is a lower bound on polluters, not an inventory.
+# Import-time attribution is NOT part of #4029 (it needs a collection-time hook).
 # Single-process only: this repo does not use xdist (not in pytest.ini or any
 # CI config); under xdist each worker would hold its own set and the controller
 # would print nothing.
@@ -173,7 +178,7 @@ def _path_leak_problem(path_before):
 
 
 def _tools_problem(module_name, tools_before):
-    """The HARD half: the cached `tools` evicted or replaced (identity, not
+    """The `tools` half: the cached `tools` evicted or replaced (identity, not
     equality) relative to module setup -- only when one was cached then."""
     if tools_before is None or sys.modules.get("tools") is tools_before:
         return None
@@ -192,37 +197,72 @@ def _tools_problem(module_name, tools_before):
 
 @pytest.fixture(autouse=True, scope="module")
 def _polluter_side_state_check(request):
-    """#4023: name a polluter at its OWN module. Records `sys.path` and the
-    cached `tools` at module setup. At teardown: a `tools` eviction/replacement
-    is a hard error naming the module (a teardown error on its last test,
-    attributable per module) -- `tools` / `tools.*` is restored EXACTLY to its
-    setup state FIRST (entries added since are dropped, captured ones put back), so the error names the polluter without
-    cascading into later modules. A `sys.path[0]` leak into src/engram made
-    after setup is recorded for the session-end summary line and does not fail
-    (see the coverage limits above `_PATH_LEAKS`). The #2565 guard above fires
-    at the VICTIM, which can be far from the polluter."""
+    """#4023 / #4029: name a polluter at its OWN module. Records `sys.path` and the
+    cached `tools` at module setup. At teardown, BOTH halves are hard errors naming
+    the module (a teardown error on its last test, attributable per module): a
+    `tools` eviction/replacement, and a `sys.path[0]` leak into src/engram made
+    after setup (see the coverage limits above `_PATH_LEAKS`). State is restored
+    EXACTLY first -- `tools` / `tools.*` (entries added since are dropped, captured
+    ones put back) and `sys.path` (to its setup list) -- and only then raised, so
+    the error names the polluter without cascading into later modules. Both
+    problems in one module raise ONE error. The #2565 guard above fires at the
+    VICTIM, which can be far from the polluter."""
     path_before = list(sys.path)
     tools_before = sys.modules.get("tools")
     tools_snapshot = {k: v for k, v in sys.modules.items()
                       if k == "tools" or k.startswith("tools.")}
     yield
-    if _path_leak_problem(path_before) is not None:
-        _PATH_LEAKS.add(request.module.__name__)
-    message = _tools_problem(request.module.__name__, tools_before)
-    if message is not None:
-        # Restore EXACTLY, THEN raise: drop every tools / tools.* key added
-        # after setup (a stale copy from the polluted window must not survive
-        # for a later `import tools.X`), then put the setup entries back.
-        for key in [k for k in sys.modules
-                    if (k == "tools" or k.startswith("tools.")) and k not in tools_snapshot]:
-            del sys.modules[key]
-        sys.modules.update(tools_snapshot)
-        raise RuntimeError(message)
+    name = request.module.__name__
+    path_message = _path_leak_problem(path_before)
+    if path_message is not None:
+        _PATH_LEAKS.add(name)
+    tools_message = _tools_problem(name, tools_before)
+    if path_message is None and tools_message is None:
+        return
+    # Restore EXACTLY, THEN raise: drop every tools / tools.* key added
+    # after setup (a stale copy from the polluted window must not survive
+    # for a later `import tools.X`), then put the setup entries back; and put
+    # sys.path back to its setup list, in place.
+    for key in [k for k in sys.modules
+                if (k == "tools" or k.startswith("tools.")) and k not in tools_snapshot]:
+        del sys.modules[key]
+    sys.modules.update(tools_snapshot)
+    sys.path[:] = path_before
+    problems = []
+    if path_message is not None:
+        problems.append(
+            f"test module {name!r} leaked process state (#4029): {path_message}. "
+            "An in-process load of a hook or src/engram/tools module runs its "
+            "module-level sys.path.insert in the pytest process; open the shared "
+            "window around it (fixtures `isolate_hook_loads` / "
+            "`isolate_hook_loads_module`, tests/_hook_load_window.py).")
+    if tools_message is not None:
+        problems.append(tools_message)
+    raise RuntimeError(" ".join(problems))
+
+
+@pytest.fixture
+def isolate_hook_loads():
+    """#4029: function-scope window around whatever a test loads in process (a hook,
+    a src/engram/tools module): `sys.path` and the src/engram + `tools*` entries of
+    `sys.modules` are put back when the test ends. See tests/_hook_load_window.py."""
+    from _hook_load_window import hook_load_window
+    with hook_load_window():
+        yield
+
+
+@pytest.fixture(scope="module")
+def isolate_hook_loads_module():
+    """#4029: module-scope form of `isolate_hook_loads`, for a module whose later
+    tests rely on the loaded module staying imported. Restores when the module ends."""
+    from _hook_load_window import hook_load_window
+    with hook_load_window():
+        yield
 
 
 def pytest_terminal_summary(terminalreporter) -> None:
-    """One line, only when N > 0, names sorted. Covers post-setup leaks only
-    (see `_PATH_LEAKS`). Printed by the terminal reporter, so `-p no:terminal`
+    """One line, only when N > 0, names sorted (a clean run prints nothing). Covers
+    post-setup leaks only (see `_PATH_LEAKS`). Printed by the terminal reporter, so `-p no:terminal`
     prints nothing."""
     if _PATH_LEAKS:
         terminalreporter.write_line(

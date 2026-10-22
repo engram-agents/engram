@@ -22,6 +22,9 @@ sys.path.append(str(REPO_ROOT / "src" / "engram"))  # append, not insert(0)
 import engram_home_registry as reg  # noqa: E402
 from viz import agents as viz_agents  # noqa: E402
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _acl_module():
     spec = importlib.util.spec_from_file_location(

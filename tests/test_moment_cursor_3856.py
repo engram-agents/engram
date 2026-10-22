@@ -36,6 +36,9 @@ import engram_core  # noqa: E402
 LO, HI = -(2 ** 53), 2 ** 53  # [LO, HI)
 HOOK_PATH = Path(_SRC_ENGRAM) / "hooks" / "claude" / "engram-surface-hook.py"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _mod():
     import engram_moment_cursor

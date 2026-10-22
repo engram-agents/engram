@@ -38,6 +38,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 _SURFACE_HOOK_PATH = PROJECT_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py"
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_surface_hook_without_hooklib(engram_home, monkeypatch):
     """Import the surface hook against a scratch ENGRAM_HOME, then simulate

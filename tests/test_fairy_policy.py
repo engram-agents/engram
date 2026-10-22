@@ -44,6 +44,10 @@ _HOOK_PATH = REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session
 
 from tools.config_schema import SCHEMA, TIER_A  # noqa: E402
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _schema_by_key() -> dict[str, dict]:
     return {row["key"]: row for row in SCHEMA}

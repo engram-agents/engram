@@ -77,6 +77,9 @@ CAP = 200
 OLD_SQL = ("SELECT id, type, claim, recall_summary, created_at, is_current, status FROM nodes "
            "WHERE created_at >= ? ORDER BY created_at ASC")
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def old_block(mod, home: Path, injected_through: str) -> str:
     if not injected_through:

@@ -45,6 +45,10 @@ from test_loop_arm_stop_hook import (  # noqa: E402
 
 STATE_NAME = ".quiet-wake-counter.json"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored);
+# module scope: the load happens in module-scope fixtures or at import, which a function-scope window does not cover.
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads_module")
+
 
 # ---------------------------------------------------------------------------
 # module loader (hyphenated hook name)

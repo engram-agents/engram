@@ -34,6 +34,9 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SESSION_START_HOOK_PATH = _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 # ---------------------------------------------------------------------------
 # Module-load helpers

@@ -67,6 +67,9 @@ _STAMP = "probe-unknown-notice.json"
 _COUNTER = 0
 IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 # --------------------------------------------------------------------------
 # helpers

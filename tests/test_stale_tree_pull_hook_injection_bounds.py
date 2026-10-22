@@ -41,6 +41,9 @@ _HARNESS_PATH = PROJECT_ROOT / "src" / "engram" / "hooks" / "claude" / "_harness
 
 _LOAD_COUNTER = 0
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_pull_hook(engram_home, monkeypatch):
     """Import the pull hook as a fresh module instance against a scratch

@@ -29,6 +29,9 @@ MODULE_PATH = (
     Path(__file__).parent.parent / "tools" / "_status_derive.py"
 )
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_module():
     """Load _status_derive as a fresh module instance."""

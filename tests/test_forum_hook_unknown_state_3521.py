@@ -56,6 +56,9 @@ THREADS_LINE_2 = (
     " — run `forum read <id>` or `forum status` to catch up."
 )
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 # ---------------------------------------------------------------------------
 # A local forum: records requests, serves configurable (status, body) per path

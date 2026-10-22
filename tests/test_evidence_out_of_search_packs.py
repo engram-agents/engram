@@ -36,6 +36,10 @@ _ROWS = [
      "claim": "epistemology studies the nature of knowledge and belief"},
 ]
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 class TestPackFtsExcludesEvidence(unittest.TestCase):
     def setUp(self):

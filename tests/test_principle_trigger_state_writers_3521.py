@@ -81,6 +81,9 @@ UNKNOWN_CASES = [
 
 _COUNTER = 0
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _is_root():
     return hasattr(os, "geteuid") and os.geteuid() == 0

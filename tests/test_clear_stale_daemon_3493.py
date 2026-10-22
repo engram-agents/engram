@@ -47,6 +47,9 @@ WARNING_SUBSTR = (
     "decision, never automatic cleanup"
 )
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _dead_pid() -> int:
     p = subprocess.Popen([sys.executable, "-c", "pass"])

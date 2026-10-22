@@ -19,6 +19,10 @@ MIGRATE_PATH = (
     / "src" / "engram" / "tools" / "baton-migrate-to-coord-store.py"
 )
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_migrate_module():
     """Import the migration script as a live module (hyphenated filename)."""

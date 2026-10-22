@@ -56,6 +56,9 @@ IDX = "idx_nodes_created_at"
 INDEX_LIST_SQL = "SELECT name, sql FROM sqlite_master WHERE type='index' ORDER BY name"
 _BASE = datetime(2026, 10, 12, 1, 0, 0)
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def ts(i: int) -> str:
     return (_BASE + timedelta(seconds=i)).strftime("%Y-%m-%dT%H:%M:%SZ")

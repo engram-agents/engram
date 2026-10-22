@@ -58,6 +58,9 @@ WRITE_KEY = "surface_writes_via_owner"
 READ_KEY = "surface_reads_via_owner"
 PID = "pn_0001"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 # =========================================================================================
 # helpers

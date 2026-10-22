@@ -70,6 +70,9 @@ _CANNED_CONF_7D = {
     "by_source_class": {},
 }
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_hook_module(engram_home: Path):
     """Load engram-session-start-hook.py fresh, ENGRAM_HOME pointed at

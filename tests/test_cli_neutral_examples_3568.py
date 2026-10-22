@@ -32,6 +32,10 @@ if str(_TOOLS) not in sys.path:
 
 BANNED = ("borges", "ariadne", "engram-agents", "agents-shared")
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored);
+# module scope: the hook is loaded in module-scope fixtures, which a function-scope window does not cover.
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads_module")
+
 
 def _load(name: str):
     spec = importlib.util.spec_from_file_location(f"{name}_under_test_3568", _TOOLS / f"{name}.py")

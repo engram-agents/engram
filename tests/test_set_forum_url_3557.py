@@ -72,6 +72,9 @@ URL = "http://localhost:5002"
 _HERMETIC_HOME = tempfile.mkdtemp(prefix="set-forum-url-home-")
 atexit.register(shutil.rmtree, _HERMETIC_HOME, ignore_errors=True)
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _hermetic_env(**extra):
     env = dict(os.environ)

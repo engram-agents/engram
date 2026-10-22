@@ -93,6 +93,9 @@ UID = os.getuid()
 OWNER_RUN_TIMEOUT = 8.0  # a preflight must exit by itself; an owner that is SERVING never does
 IS_DARWIN = sys.platform == "darwin"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 # ---------------------------------------------------------------------------
 # #3519 guard: nothing here may register a production-shaped owner label with a real launchctl

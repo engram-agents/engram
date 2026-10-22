@@ -49,6 +49,9 @@ HOOK_PATH = (
     / "src" / "engram" / "hooks" / "claude" / "engram-forum-prompt-hook.py"
 )
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 # ---------------------------------------------------------------------------
 # Module loader

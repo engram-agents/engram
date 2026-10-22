@@ -28,6 +28,9 @@ _HOOK_PATH = (
     _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
 )
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_hook_module(monkeypatch, engram_home: Path):
     """Load the session-start hook as a module, stubbing context_tracker."""

@@ -64,6 +64,9 @@ COUNT_SQL = "SELECT count(*) FROM nodes WHERE is_current = 1"
 THRESHOLD = 10
 NUDGE_PREFIX = "[ENGRAM Write Check:"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 # --- fixtures / helpers --------------------------------------------------------
 

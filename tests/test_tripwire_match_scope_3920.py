@@ -37,6 +37,10 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _HOOK_PATH = PROJECT_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-lesson-tripwire-hook.py"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored);
+# module scope: the load happens in module-scope fixtures or at import, which a function-scope window does not cover.
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads_module")
+
 
 @pytest.fixture(scope="module")
 def hook():

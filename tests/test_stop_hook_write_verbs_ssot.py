@@ -53,6 +53,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ENGRAM = REPO_ROOT / "src" / "engram"
 HOOK_PATH = SRC_ENGRAM / "hooks" / "claude" / "engram-stop-hook.py"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored);
+# module scope: the load happens in module-scope fixtures or at import, which a function-scope window does not cover.
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads_module")
+
 
 def _fresh_server_module():
     """Import server.py fresh (mirrors test_mcp_tool_capability_enforcement.py's

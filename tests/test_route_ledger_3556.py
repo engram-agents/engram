@@ -51,6 +51,9 @@ STARTED = "2026-10-05T00:00:00+00:00"
 OLD = "2026-10-01T00:00:00+00:00"
 NEW = "2026-10-06T00:00:00+00:00"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _id(n):
     # built, never spelled: the repo's no-new-shipped-node-ids gate scans tests too

@@ -50,6 +50,9 @@ DEAD_PID = 9999999
 
 _COUNTER = 0
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load(path: Path, name: str):
     global _COUNTER

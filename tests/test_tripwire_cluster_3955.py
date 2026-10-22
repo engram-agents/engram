@@ -37,6 +37,9 @@ LINE_RE = re.compile(r"^  - (lsx-\d{3}): (.*)$", re.M)
 FLOOR_BUDGET = 4000   # UNMEASURED_HARNESS_FLOOR["budget"]: what an unmeasured harness gets
 MARKER_RE = re.compile(r"^  …\[nudge truncated[^\n]*\]$", re.M)
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 @pytest.fixture()
 def hook(tmp_path, monkeypatch):

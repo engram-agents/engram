@@ -45,6 +45,10 @@ from tools.ws4.transcript import (
     redact_chain_block,
 )
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _write_jsonl(path, records):
     with open(path, "w", encoding="utf-8") as f:

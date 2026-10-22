@@ -76,6 +76,9 @@ FULL_CMD = "echo tripwirepat zebrafoo " + LONG_WORDS
 BLOCK_CMD = "echo tripwirepat blockpat zebrafoo"
 DAEMON_RESULT = {"match_count": 1, "top_claims": [{"id": "ob_0001", "recall_summary": "stub recall line"}]}
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 # --- fixtures / helpers --------------------------------------------------------------
 

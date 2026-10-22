@@ -45,6 +45,9 @@ DEAD_PID = 9_999_999  # above any Linux pid_max default; never a live process
 OFFLINE = "MCP server: OFFLINE"
 TELL_USER = "Tell the user immediately"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load(monkeypatch, engram_home: Path, path: Path, name: str):
     monkeypatch.setenv("ENGRAM_HOME", str(engram_home))

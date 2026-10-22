@@ -43,6 +43,9 @@ if str(SRC_ROOT) not in sys.path:
 import engram_log_emitter  # noqa: E402 -- shared module the hooks late-import Emitter from
 from tools import telemetry_manifest_gate  # noqa: E402
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 # ---------------------------------------------------------------------------
 # Module-loading + Emitter-patching helpers

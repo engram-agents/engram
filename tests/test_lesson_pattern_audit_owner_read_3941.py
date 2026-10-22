@@ -50,6 +50,9 @@ TIMEOUT = 20
 _SCHEMA = """CREATE TABLE nodes (id TEXT PRIMARY KEY, type TEXT NOT NULL, is_current INTEGER NOT NULL DEFAULT 1,
  metadata TEXT NOT NULL DEFAULT '{}', claim TEXT NOT NULL DEFAULT '')"""
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 @pytest.fixture
 def seat():

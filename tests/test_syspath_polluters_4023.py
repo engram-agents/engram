@@ -11,8 +11,9 @@ The contract these cells state:
         `tools.*`) reports no errors, and the victim's tests actually ran.
     C4. A module-scope autouse fixture in `tests/conftest.py`: (hard) raises an
         error NAMING THE MODULE when a module evicts / replaces the `tools` that
-        was cached at its setup; (non-failing) records a module that leaves
-        `sys.path[0]` inside `src/engram` and prints ONE session-end line
+        was cached at its setup; (hard since #4029) the same for a module that
+        leaves `sys.path[0]` inside `src/engram`, with `sys.path` restored
+        exactly first; it also still prints ONE session-end line
         `#4023 sys.path[0] leaks: N module(s): a, b` (sorted, only when N > 0).
         A clean module gets neither.
 
@@ -212,18 +213,23 @@ def _run_modules(tmp_path, modules):
         {"PYTHONPATH": pypath, "REPO_ROOT_4023": str(REPO_ROOT)}, cwd=d)
 
 
-def test_a_path_leaking_module_is_named_in_one_summary_line_and_the_run_passes(tmp_path):
-    """C4, path half: non-failing, but it leaves a suite-produced trace. Two
-    planted leakers plus a clean module: the line appears once, N=2, names both,
-    sorted, and not the clean one. Mutation: make the half failing again -> the
-    returncode assert is red; suppress the summary -> the line assert is red."""
+def test_a_path_leaking_module_errors_at_its_teardown_and_is_named_in_one_summary_line(tmp_path):
+    """C4, path half: hard since #4029 (it was non-failing in #4023), and it still
+    leaves the suite-produced trace. Two planted leakers plus a clean module: each
+    leaker errors at its own teardown, the summary line appears once with N=2,
+    names both, sorted, and not the clean one. Mutation: make the half
+    non-failing again -> the returncode / error asserts are red; suppress the
+    summary -> the line assert is red."""
     proc = _run_modules(tmp_path, {
         # distinct entries: a module that re-inserts the entry already in front is no delta
         "test_plant_path_b.py": _PLANT_PATH.replace("SUBDIR_4023", "tools"),
         "test_plant_path_a.py": _PLANT_PATH.replace("SUBDIR_4023", "hooks"),
         "test_ok.py": _CLEAN})
     out = proc.stdout + proc.stderr
-    assert proc.returncode == 0, out[-3000:]
+    assert proc.returncode != 0, out[-3000:]
+    assert re.search(r"\b2 errors\b", out), out[-3000:]
+    assert out.count("ERROR at teardown of test_pollutes_path") == 2, out[-3000:]
+    assert "ERROR at teardown of test_clean" not in out, out[-3000:]
     lines = [ln for ln in out.splitlines() if ln.startswith("#4023 sys.path[0] leaks:")]
     assert lines == [
         "#4023 sys.path[0] leaks: 2 module(s): test_plant_path_a, test_plant_path_b"], out[-3000:]

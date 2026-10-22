@@ -64,6 +64,9 @@ FOCUS_REASON = "compaction thread"
 ARC = "Today we built the request half.\nSecond paragraph of the arc."
 HISTORY = "# 2026-10-11\n- shipped the thing\n"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_tool():
     spec = importlib.util.spec_from_file_location("compact_request_under_test", TOOL_PATH)

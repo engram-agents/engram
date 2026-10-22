@@ -66,6 +66,9 @@ print("RESULT:" + json.dumps(ns["result"]))
 
 _ENV_DROP = ("ENGRAM_RUNTIME_DIR", "CLAUDE_PLUGIN_ROOT", "CODEX_PLUGIN_ROOT", "PYTHONPATH")
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 class Ctx:
     def __init__(self, tmp: Path, kind: str, hook_file: str):

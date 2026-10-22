@@ -57,6 +57,9 @@ import _hooklib  # noqa: E402
 OPEN = "⟦ENGRAM⟧"
 CLOSE = "⟦/ENGRAM⟧"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _q(text):
     # Resolve the helper at call time so a missing function is a per-cell red.

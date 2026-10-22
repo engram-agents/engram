@@ -44,6 +44,10 @@ SRC_ENGRAM = PROJECT_ROOT / "src" / "engram"
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.append(str(SRC_ENGRAM))
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_hook_module():
     """Import the surface hook as a module despite the hyphenated filename

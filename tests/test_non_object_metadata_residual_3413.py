@@ -22,6 +22,9 @@ sys.path.insert(0, ROOT)
 
 NON_OBJECT_BLOBS = ["[1,2]", '"str"', "5", "null"]
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_pkg_cli():
     cli_path = os.path.join(ROOT, "src", "engram", "tools", "engram-pkg", "engram-pkg")

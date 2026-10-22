@@ -67,6 +67,10 @@ HOOK_PATH = (
     / "src" / "engram" / "hooks" / "claude" / "engram-inter-agent-prompt-hook.py"
 )
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored);
+# module scope: the load happens in module-scope fixtures or at import, which a function-scope window does not cover.
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads_module")
+
 
 # ---------------------------------------------------------------------------
 # Data helpers

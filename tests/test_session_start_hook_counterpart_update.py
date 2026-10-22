@@ -33,6 +33,9 @@ _HOOK_PATH = (
 OWN_HOSTNAME = socket.gethostname()
 OTHER_HOSTNAME = "other-host-xyz"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 # ---------------------------------------------------------------------------
 # Module loader helper (mirrors test_session_start_hook_agent_registration.py)

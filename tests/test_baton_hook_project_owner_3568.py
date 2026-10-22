@@ -26,6 +26,9 @@ from test_baton_hook import (  # noqa: E402
 OWNER = "engram-agents"
 GH_JSON = json.dumps({"items": [{"status": "Done"}, {"status": "Done"}, {"status": "Todo"}]})
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 @pytest.fixture
 def engram_home(tmp_path):

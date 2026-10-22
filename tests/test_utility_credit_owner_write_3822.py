@@ -72,6 +72,9 @@ FLAG = "utility_credit_writes_via_owner"
 TEXT = "credit ob_0001 and ob_0002 then again ob_0002, plus ob_0099 (no row), ob_0004 and ob_0005."
 MENTIONED = ["ob_0001", "ob_0002", "ob_0099", "ob_0004", "ob_0005"]  # first-occurrence order, deduped
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 # --- scratch fixtures -------------------------------------------------------------------------
 

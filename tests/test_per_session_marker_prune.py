@@ -16,6 +16,10 @@ import sys
 import time
 from pathlib import Path
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_hook(engram_home: Path):
     """Load hooks/claude/engram-session-start-hook.py with ENGRAM_HOME overridden.

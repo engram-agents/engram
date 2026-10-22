@@ -55,6 +55,9 @@ STDIN = json.dumps({"session_id": "t1", "prompt": "hello",
                     "hook_event_name": "UserPromptSubmit", "cwd": "/tmp"})
 AGENT = "testbot"
 
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 @pytest.fixture(params=list(HOOKS))
 def hook(request):

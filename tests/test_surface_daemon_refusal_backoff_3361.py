@@ -52,6 +52,10 @@ HAS_PROC_NET_UNIX = os.path.exists("/proc/net/unix")
 HAS_LSOF = shutil.which("lsof") is not None
 ENV_VAR = "ENGRAM_DAEMON_REFUSAL_BACKOFF_S"
 
+import pytest  # noqa: E402
+# #4029: in-process hook/tools loads run inside this window (sys.path / sys.modules restored).
+pytestmark = pytest.mark.usefixtures("isolate_hook_loads")
+
 
 def _load_daemon_module():
     spec = importlib.util.spec_from_file_location(
