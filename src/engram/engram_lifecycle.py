@@ -26,9 +26,11 @@ Wave-3 structural note — diagnostic snapshot and calibration snapshot:
 import datetime
 import json
 import os
+import sys
 import zoneinfo
 from pathlib import Path
 
+import engram_config_io
 import engram_core as core
 
 
@@ -276,7 +278,41 @@ def _index_lacks_stats_on_nonempty_table(conn) -> bool:
     return False
 
 
-def _checkpoint_internal(message: str, advance_turn: bool) -> str:
+def _backup_ok(version_control: dict | None) -> bool:
+    """The backup verdict, defined once: neither ``db_backup`` nor ``binary_backup`` carries an
+    ``"error"`` key. A skipped or fresh write is healthy; only an error is not. The engram-nap
+    skill's Step 3 and ``compact-request.py`` read this verdict from ``compact/last-checkpoint.json``
+    instead of restating the rule."""
+    vc = version_control or {}
+    return all("error" not in (vc.get(key) or {}) for key in ("db_backup", "binary_backup"))
+
+
+def _write_last_checkpoint_record(checkpoint_at: str, session_id, version_control) -> None:
+    """Persist the nap's verdict at ``$ENGRAM_HOME/compact/last-checkpoint.json`` (#4012).
+
+    ``checkpoint_at`` is the same string as the session_log.md nap header's timestamp, so the
+    reader can match the record to that header. Written through ``engram_config_io.write_config_json``
+    (a new file gets the umask/default-ACL mode; an existing one keeps its mode and group), so the
+    record never revokes an ACL'd account's access. Never raises: a failed write leaves the
+    checkpoint's result untouched and costs one stderr line (the reader then finds no record and refuses).
+    """
+    try:
+        directory = core.DATA_DIR / "compact"
+        directory.mkdir(parents=True, exist_ok=True)
+        engram_config_io.write_config_json(
+            directory / "last-checkpoint.json",
+            {
+                "checkpoint_at": checkpoint_at,
+                "session_id": session_id if isinstance(session_id, str) else None,
+                "backup_ok": _backup_ok(version_control),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - never fails the checkpoint
+        print(f"engram checkpoint: could not write compact/last-checkpoint.json: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+
+def _checkpoint_internal(message: str, advance_turn: bool, session_id=None) -> str:
     """Internal checkpoint logic shared by engram_checkpoint (formerly
     engram_nap) and engram_advance_turn.
 
@@ -617,17 +653,21 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
             )
             core._write_feeling_nudge("nap_checkpoint")
             result["history_write"] = _append_nap_to_history(message)
+            # The same `now[:19]` as the nap header and the record's checkpoint_at, so the skill can
+            # tell this nap's record from the previous nap's (a failed record write leaves the old one).
+            result["checkpoint_at"] = now[:19]
+            _write_last_checkpoint_record(result["checkpoint_at"], session_id, version_control)
 
         return json.dumps(result)
     finally:
         conn.close()
 
 
-def _nap_impl(message: str) -> str:
+def _nap_impl(message: str, session_id=None) -> str:
     """Impl for engram_checkpoint (formerly engram_nap; also used by the
     engram_nap deprecated alias) — callable with named kwargs for in-server
-    callers."""
-    return _checkpoint_internal(message, advance_turn=False)
+    callers. ``session_id`` is only recorded in compact/last-checkpoint.json (#4012)."""
+    return _checkpoint_internal(message, advance_turn=False, session_id=session_id)
 
 
 def _advance_turn_impl(message: str) -> str:

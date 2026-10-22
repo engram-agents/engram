@@ -281,6 +281,13 @@
       "note": "engram-alpha#3822 (U11 Stage B): test_utility_credit_owner_write_3822.py added -- the flagged owner-write path (differential at the write, zero opens, owner-down / skew / readback / indeterminate-retry cells); the hook is loaded via importlib (hyphenated name), invisible to the import graph."
     },
     {
+      "path_prefix_or_glob": "hooks/claude/engram-nap-compact-backstop-stop.py",
+      "test_globs": [
+        "tests/test_nap_compact_backstop_4012.py"
+      ],
+      "note": "#4012 nap-compaction backstop Stop hook: run as a subprocess against a temp ENGRAM_HOME (source and flattened deployed layouts), so the layer-1 AST import graph cannot trace it to a test."
+    },
+    {
       "path_prefix_or_glob": "hooks/claude/engram-loop-arm-stop-hook.py",
       "test_globs": [
         "tests/test_loop_arm_stop_hook.py",
@@ -646,7 +653,8 @@
     {
       "path_prefix_or_glob": "tools/compact-request.py",
       "test_globs": [
-        "tests/test_compact_request_3640.py"
+        "tests/test_compact_request_3640.py",
+        "tests/test_nap_compact_backstop_4012.py"
       ],
       "note": "Request half of agent-decided compaction (#3640): rider, atomic write order, size cap, no wake token, hook lookup in both layouts."
     },
