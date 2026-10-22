@@ -461,7 +461,7 @@ def _step_block(name_fragment):
 
 def test_pr_checks_runs_the_gate_with_a_merge_base_and_no_pytest():
     block = _step_block("raw ENGRAM_HOME read")
-    assert 'git merge-base "origin/${{ github.base_ref }}" HEAD' in block
+    assert 'git merge-base "${{ env.BASE_REF }}" HEAD' in block
     assert 'python3 tools/raw_home_read_gate.py --base-sha "$BASE_SHA"' in block
     run = block[block.index("run:"):]
     code_lines = [l for l in run.splitlines() if l.strip() and not l.strip().startswith("#")]

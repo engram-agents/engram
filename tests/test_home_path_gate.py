@@ -1525,8 +1525,8 @@ def _gate_step_text():
 def test_ci_step_runs_the_gate_with_a_merge_base_sha():
     step = _gate_step_text()
     assert re.search(
-        r'^\s*BASE_SHA=\$\(git merge-base "origin/[^"]+" HEAD\)\s*$', step, re.M
-    ), f"BASE_SHA must come from `git merge-base origin/<base> HEAD`:\n{step}"
+        r'^\s*BASE_SHA=\$\(git merge-base "(?:origin/[^"]+|\$\{\{ env\.BASE_REF \}\})" HEAD\)\s*$', step, re.M
+    ), f"BASE_SHA must come from `git merge-base origin/<base> HEAD` or `git merge-base ${{ env.BASE_REF }} HEAD`:\n{step}"
     call = re.search(r"python3 tools/home_path_gate\.py[^\n]*", step)
     assert call, f"the step does not run tools/home_path_gate.py:\n{step}"
     assert '--base-sha "$BASE_SHA"' in call.group(0), call.group(0)
